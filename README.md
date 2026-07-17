@@ -58,11 +58,15 @@ for with `--with`.
 | # | phase | cost | what it does |
 |---|-------|------|--------------|
 | 1 | `import` | offline | Import the seed corpus (canonical source + fallback) |
+| 1.1 | `sec-import`\* | offline | Import the fable-secure security corpus (catalog + held-out keys) |
+| 1.2 | `sec-fetch`\* | offline | Hydrate the pinned security-review repositories |
 | 2 | `audit` | offline | Audit seed integrity, fail-closed |
 | 2.5 | `validate`\* | offline | Prove each seed is solvable, with no model calls |
 | 3 | `generate` | **metered** | Drive the teacher to produce candidate traces |
+| 3.1 | `sec-generate`\* | **metered** | Drive the teacher over the security corpus (rejection-sampled) |
 | 4 | `screen` | **metered** | Screen traces: deterministic gates, then the judge |
 | 4.5 | `retry`\* | **metered** | Retrace + rescreen standing rejections |
+| 4.9 | `sec-build`\* | offline | Build the security SFT partition (folds into `build`) |
 | 5 | `build` | offline | Build the SFT dataset from accepted traces |
 | 6 | `expand` | offline | Expand cumulative next-step prefixes |
 | 7 | `export` | offline | Export the whole-session HF dataset |
@@ -71,7 +75,9 @@ for with `--with`.
 | 10 | `prepare` | offline | Render rows with the student's chat template for local training |
 | 11 | `verify-export` | offline | Validate the export against provenance + privacy gates |
 
-`\*` optional — folded in only via `--with validate` / `--with retry`.
+`\*` optional — folded in only via `--with` (e.g. `--with validate`, `--with retry`,
+or the security lane `--with sec-import --with sec-fetch --with sec-generate
+--with sec-build`). See [The security lane](#the-security-lane-optional).
 
 Run selection:
 
@@ -208,6 +214,49 @@ found, then rescreened.
 
 ---
 
+## The security lane (optional)
+
+A parallel, opt-in lane distills **defensive** security ability — finding and
+classifying vulnerabilities — from the sibling `../fable-secure` corpus. It is
+off by default; fold it in with `--with sec-import --with sec-fetch --with
+sec-generate --with sec-build`, or run any phase on its own
+(`python3 moonshiner.py sec-generate --only sec-answer-42`).
+
+Two case kinds, each with its own held-out grader:
+
+- **Answer cases** — a blind question (classify a snippet by CWE/OWASP, explain
+  an attacker primitive, review a diff). The teacher never sees the reference
+  answer; a separate low-effort judge grades against it, behind a deterministic
+  label-shape gate that requires well-formed `CWE-###` / `A##:20##` labels for
+  classification tasks.
+- **Repo reviews** — a whole, pinned vulnerable repository. The teacher writes
+  `findings.json`; a deterministic path/line-recall oracle scores it against the
+  planted findings (recall floor, spray cap, line window). No model is in the
+  grading loop.
+
+Three properties make the lane safe to run:
+
+- **Firewall.** The teacher only ever sees `security/catalog/`; the reference
+  answers and planted-finding keys live in `security/keys/` and are opened only
+  by the host-side grader, never copied into a teacher workspace.
+- **Rejection sampling.** Each case is retried a few times and only a *passing*
+  attempt is exposed to the dataset builder.
+- **Sandbox.** The security teacher runs inside a Bubblewrap namespace that hides
+  the real home (repositories and saved auth) and re-binds only a disposable
+  workspace plus a short-lived `CODEX_HOME`; the copied credential is unlinked at
+  `thread.started`, before any model-generated command can run. This requires
+  `bwrap` and refuses to run without it.
+
+`sec-build` renders passing traces into `data/security/{train,val}.jsonl` using
+the same row schema as the coding lane (and the same full-tool-list contract —
+every row lists the sandboxed teacher's whole `exec`/`apply_patch`/`update_plan`
+surface). The main `build` phase folds those files in automatically when they are
+present, so the security rows ride the same expand/export/prepare path as
+everything else. The corpus, keys, traces, and ephemeral runtime are all
+gitignored.
+
+---
+
 ## Dataset outputs
 
 Accepted traces are assembled into training data, with secrets redacted and
@@ -289,6 +338,11 @@ src/
   prepare_local.py     Render rows with the student chat template
   validate_hf_export.py      Provenance + privacy export gate
   normalize.py         trace_format -> the adapter that parses it
+  import_security_cases.py   Import the fable-secure security corpus (catalog + keys)
+  fetch_security_corpus.py   Hydrate the 18 pinned security-review repositories
+  security_runtime.py  Bubblewrap-sandboxed Codex runner for the security lane
+  generate_security_traces.py   Blind-solve + grade security cases (rejection-sampled)
+  build_security_dataset.py     Passing security traces -> data/security partition
   runtimes/
     __init__.py        Registry: select teacher/judge adapter from config
     base.py            Runtime-agnostic interfaces (trace generation, review)
