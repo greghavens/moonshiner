@@ -48,6 +48,11 @@ TOOL_REGISTRY = {
              {"path": {"type": "string"}}, ["path"]),
 }
 
+# The full Pi coding-agent tool surface. Declared so every exported row lists the
+# complete action space the teacher had, not just the tools a trace happened to
+# call.
+OFFERED_TOOLS = ("read", "write", "edit", "bash", "grep", "find", "ls")
+
 # A tiny extension that fails any bash call still running past the ceiling, so a
 # hung command cannot consume the whole turn budget.
 BASH_TIMEOUT_GUARD = """export default function (pi) {
@@ -265,7 +270,10 @@ class PiRuntime(Runtime):
 
     @staticmethod
     def tool_schemas(messages: list[dict]) -> list[dict]:
-        names: list[str] = []
+        # Start from the full offered surface, then fold in any other tool
+        # actually observed in the stream, so the row always carries the
+        # complete tool list — not only what this trace happened to call.
+        names: list[str] = list(OFFERED_TOOLS)
         for message in messages:
             for call in message.get("tool_calls") or []:
                 name = call.get("function", {}).get("name")

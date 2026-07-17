@@ -106,4 +106,11 @@ class Runtime(abc.ABC):
     @staticmethod
     @abc.abstractmethod
     def tool_schemas(messages: list[dict]) -> list[dict]:
-        """Declare OpenAI-style schemas for the tools used in ``messages``."""
+        """Declare OpenAI-style schemas for the full tool surface of a trace.
+
+        Returns the complete action space the teacher was offered — the
+        adapter's ``OFFERED_TOOLS`` — unioned with any additional tool actually
+        observed in ``messages``. A row's ``tools`` therefore always lists what
+        the teacher *could* have called, not only what this trace happened to
+        call, so the exported dataset preserves the true action space.
+        """

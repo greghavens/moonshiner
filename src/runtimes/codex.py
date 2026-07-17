@@ -42,6 +42,11 @@ TOOL_REGISTRY = {
     "image_generation": stub("image_generation", "Generate an image."),
 }
 
+# The full tool surface a Codex teacher is offered (config runs web_search live).
+# Declared so every exported row lists the complete action space the teacher had,
+# not just the tools a given trace happened to call.
+OFFERED_TOOLS = ("exec", "apply_patch", "update_plan", "web_search")
+
 
 def _scrub_env() -> dict:
     """Drop OpenAI API keys so codex uses its own ~/.codex account auth."""
@@ -261,7 +266,10 @@ class CodexRuntime(Runtime):
 
     @staticmethod
     def tool_schemas(messages: list[dict]) -> list[dict]:
-        names: list[str] = []
+        # Start from the full offered surface, then fold in any other tool
+        # actually observed in the stream, so the row always carries the
+        # complete tool list — not only what this trace happened to call.
+        names: list[str] = list(OFFERED_TOOLS)
         for message in messages:
             for call in message.get("tool_calls") or []:
                 name = call.get("function", {}).get("name")
