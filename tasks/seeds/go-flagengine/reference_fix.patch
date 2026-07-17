@@ -1,0 +1,236 @@
+diff --git a/bucket.go b/bucket.go
+new file mode 100644
+index 0000000..c4f5f7c
+--- /dev/null
++++ b/bucket.go
+@@ -0,0 +1,12 @@
++package flagengine
++
++import "hash/fnv"
++
++// Bucket maps a (flag, unit) pair onto [0, 10000) basis points using
++// FNV-1a 64 over "<flagKey>:<unitID>". This is the cross-SDK contract:
++// every SDK must place a given user in the same bucket for a given flag.
++func Bucket(key, id string) int {
++	h := fnv.New64a()
++	h.Write([]byte(key + ":" + id))
++	return int(h.Sum64() % 10000)
++}
+diff --git a/engine.go b/engine.go
+new file mode 100644
+index 0000000..5dbfe58
+--- /dev/null
++++ b/engine.go
+@@ -0,0 +1,106 @@
++package flagengine
++
++import (
++	"errors"
++	"fmt"
++	"sync"
++)
++
++// ErrFlagNotFound is returned by Eval when no environment on the chain
++// defines the requested flag.
++var ErrFlagNotFound = errors.New("flagengine: flag not found")
++
++type environment struct {
++	parent string
++	flags  map[string]Flag
++}
++
++// Engine holds environments and their flag definitions.
++// It is safe for concurrent use.
++type Engine struct {
++	mu   sync.RWMutex
++	envs map[string]*environment
++}
++
++// New returns an empty engine.
++func New() *Engine {
++	return &Engine{envs: make(map[string]*environment)}
++}
++
++// AddEnv registers an environment. parent "" makes it a root; otherwise the
++// parent must already exist, which keeps the env graph a tree.
++func (e *Engine) AddEnv(name, parent string) error {
++	if name == "" {
++		return fmt.Errorf("flagengine: environment name must not be empty")
++	}
++	e.mu.Lock()
++	defer e.mu.Unlock()
++	if _, ok := e.envs[name]; ok {
++		return fmt.Errorf("flagengine: environment %q already exists", name)
++	}
++	if parent != "" {
++		if _, ok := e.envs[parent]; !ok {
++			return fmt.Errorf("flagengine: parent environment %q does not exist", parent)
++		}
++	}
++	e.envs[name] = &environment{parent: parent, flags: make(map[string]Flag)}
++	return nil
++}
++
++// SetFlag upserts a flag definition into env.
++func (e *Engine) SetFlag(env string, f Flag) error {
++	if err := validateFlag(f); err != nil {
++		return err
++	}
++	e.mu.Lock()
++	defer e.mu.Unlock()
++	en, ok := e.envs[env]
++	if !ok {
++		return fmt.Errorf("flagengine: unknown environment %q", env)
++	}
++	en.flags[f.Key] = f
++	return nil
++}
++
++// Eval resolves key from env (walking to ancestors for the nearest
++// definition) and evaluates it for u.
++func (e *Engine) Eval(env, key string, u User) (Result, error) {
++	e.mu.RLock()
++	f, foundIn, err := e.resolveLocked(env, key)
++	e.mu.RUnlock()
++	if err != nil {
++		return Result{}, err
++	}
++
++	if !f.On {
++		return Result{Value: false, Reason: "off", Env: foundIn}, nil
++	}
++	for i, r := range f.Rules {
++		if ruleMatches(r, u) {
++			return Result{Value: r.Value, Reason: fmt.Sprintf("rule:%d", i), Env: foundIn}, nil
++		}
++	}
++	if Bucket(f.Key, u.ID) < f.RolloutBPS {
++		return Result{Value: true, Reason: "rollout", Env: foundIn}, nil
++	}
++	return Result{Value: false, Reason: "fallthrough", Env: foundIn}, nil
++}
++
++// resolveLocked walks the environment chain looking for key.
++// Callers must hold at least the read lock.
++func (e *Engine) resolveLocked(env, key string) (Flag, string, error) {
++	en, ok := e.envs[env]
++	if !ok {
++		return Flag{}, "", fmt.Errorf("flagengine: unknown environment %q", env)
++	}
++	for {
++		if f, ok := en.flags[key]; ok {
++			return f, env, nil
++		}
++		if en.parent == "" {
++			return Flag{}, "", fmt.Errorf("%w: %q (from env %q)", ErrFlagNotFound, key, env)
++		}
++		env = en.parent
++		en = e.envs[env]
++	}
++}
+diff --git a/flag.go b/flag.go
+new file mode 100644
+index 0000000..bf9a604
+--- /dev/null
++++ b/flag.go
+@@ -0,0 +1,59 @@
++package flagengine
++
++import "fmt"
++
++// Clause is one attribute predicate. Supported ops: "in", "not_in".
++type Clause struct {
++	Attr   string
++	Op     string
++	Values []string
++}
++
++// Rule serves Value when all of its clauses match.
++type Rule struct {
++	Clauses []Clause
++	Value   bool
++}
++
++// Flag is one feature flag definition inside an environment.
++type Flag struct {
++	Key        string
++	On         bool
++	Rules      []Rule
++	RolloutBPS int // basis points in [0, 10000]
++}
++
++// User is the evaluation subject.
++type User struct {
++	ID    string
++	Attrs map[string]string
++}
++
++// Result explains an evaluation: the served value, why it was served
++// ("off", "rule:<i>", "rollout", "fallthrough"), and which environment's
++// definition was used.
++type Result struct {
++	Value  bool
++	Reason string
++	Env    string
++}
++
++func validateFlag(f Flag) error {
++	if f.Key == "" {
++		return fmt.Errorf("flagengine: flag key must not be empty")
++	}
++	if f.RolloutBPS < 0 || f.RolloutBPS > 10000 {
++		return fmt.Errorf("flagengine: flag %q: RolloutBPS %d out of range [0,10000]", f.Key, f.RolloutBPS)
++	}
++	for i, r := range f.Rules {
++		for j, c := range r.Clauses {
++			if c.Attr == "" {
++				return fmt.Errorf("flagengine: flag %q rule %d clause %d: empty attribute", f.Key, i, j)
++			}
++			if c.Op != "in" && c.Op != "not_in" {
++				return fmt.Errorf("flagengine: flag %q rule %d clause %d: unknown op %q", f.Key, i, j, c.Op)
++			}
++		}
++	}
++	return nil
++}
+diff --git a/rules.go b/rules.go
+new file mode 100644
+index 0000000..dd92462
+--- /dev/null
++++ b/rules.go
+@@ -0,0 +1,35 @@
++package flagengine
++
++// clauseMatches reports whether a single clause holds for the user.
++// An absent attribute satisfies neither "in" nor "not_in".
++func clauseMatches(c Clause, u User) bool {
++	v, ok := u.Attrs[c.Attr]
++	if !ok {
++		return false
++	}
++	found := false
++	for _, want := range c.Values {
++		if v == want {
++			found = true
++			break
++		}
++	}
++	switch c.Op {
++	case "in":
++		return found
++	case "not_in":
++		return !found
++	default:
++		return false
++	}
++}
++
++// ruleMatches reports whether every clause of the rule holds.
++func ruleMatches(r Rule, u User) bool {
++	for _, c := range r.Clauses {
++		if !clauseMatches(c, u) {
++			return false
++		}
++	}
++	return true
++}

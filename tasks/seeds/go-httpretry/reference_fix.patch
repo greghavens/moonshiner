@@ -1,0 +1,169 @@
+diff --git a/httpretry.go b/httpretry.go
+index 911b306..cbd242e 100644
+--- a/httpretry.go
++++ b/httpretry.go
+@@ -1,19 +1,41 @@
+ // Package httpretry wraps an *http.Client with retry logic for GETs
+ // against our internal APIs. The service mesh restarts pods all day,
+ // so a transient 5xx or a torn connection should not bubble up to
+-// callers; a real client error (4xx) should, immediately.
++// callers; a real client error (4xx) should, immediately. Retries are
++// paced with exponential backoff, honor Retry-After, and each attempt
++// can run under its own deadline.
+ package httpretry
+ 
+ import (
+ 	"context"
+ 	"io"
+ 	"net/http"
++	"strconv"
++	"strings"
++	"time"
+ )
+ 
+ // Client retries idempotent GET requests.
+ type Client struct {
+ 	HTTP        *http.Client
+ 	MaxAttempts int
++
++	// BaseDelay is the wait before the first retry; it doubles on
++	// each further retry. Zero keeps the legacy immediate-retry
++	// behavior (no sleeping at all, unless the server sends
++	// Retry-After).
++	BaseDelay time.Duration
++	// MaxDelay caps every wait, including server-provided Retry-After
++	// values. Zero means uncapped.
++	MaxDelay time.Duration
++	// PerAttemptTimeout, when positive, runs each individual attempt
++	// under its own timeout derived from the caller's context. The
++	// caller's context itself is never cancelled by this.
++	PerAttemptTimeout time.Duration
++	// Sleep performs all waiting between attempts. Nil means a real
++	// timer-backed sleep abortable by the context. If Sleep returns
++	// an error, Get stops immediately and returns it.
++	Sleep func(ctx context.Context, d time.Duration) error
+ }
+ 
+ // New returns a Client issuing at most maxAttempts tries per Get.
+@@ -30,8 +52,9 @@ func New(hc *http.Client, maxAttempts int) *Client {
+ }
+ 
+ // retryable reports whether a response status is worth another try.
++// 429 counts: the server is explicitly asking us to come back later.
+ func retryable(status int) bool {
+-	return status >= 500
++	return status >= 500 || status == http.StatusTooManyRequests
+ }
+ 
+ // Get issues GET requests to url until one succeeds with a
+@@ -44,23 +67,105 @@ func (c *Client) Get(ctx context.Context, url string) (*http.Response, error) {
+ 		attempts = 1
+ 	}
+ 	for i := 0; ; i++ {
+-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+-		if err != nil {
+-			return nil, err
+-		}
+-		resp, derr := c.HTTP.Do(req)
++		resp, derr := c.attempt(ctx, url)
+ 		if derr == nil && !retryable(resp.StatusCode) {
+ 			return resp, nil
+ 		}
+ 		if i == attempts-1 {
+ 			return resp, derr
+ 		}
++		delay := c.retryDelay(i, resp)
+ 		if derr == nil {
+ 			io.Copy(io.Discard, resp.Body)
+ 			resp.Body.Close()
+ 		}
++		if delay > 0 {
++			if serr := c.sleep(ctx, delay); serr != nil {
++				return nil, serr
++			}
++		}
+ 		if ctx.Err() != nil {
+ 			return nil, ctx.Err()
+ 		}
+ 	}
+ }
++
++// cancelBody ties a per-attempt context's cancel func to the response
++// body so the context is released when the caller closes the body.
++type cancelBody struct {
++	io.ReadCloser
++	cancel context.CancelFunc
++}
++
++func (b *cancelBody) Close() error {
++	err := b.ReadCloser.Close()
++	b.cancel()
++	return err
++}
++
++// attempt performs one request, applying PerAttemptTimeout if set.
++func (c *Client) attempt(ctx context.Context, url string) (*http.Response, error) {
++	cancel := context.CancelFunc(func() {})
++	if c.PerAttemptTimeout > 0 {
++		ctx, cancel = context.WithTimeout(ctx, c.PerAttemptTimeout)
++	}
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
++	if err != nil {
++		cancel()
++		return nil, err
++	}
++	resp, err := c.HTTP.Do(req)
++	if err != nil {
++		cancel()
++		return nil, err
++	}
++	resp.Body = &cancelBody{ReadCloser: resp.Body, cancel: cancel}
++	return resp, nil
++}
++
++// retryDelay computes the wait after attempt i (0-based). A parseable
++// Retry-After on the response wins over the computed backoff; both
++// are clamped to MaxDelay.
++func (c *Client) retryDelay(i int, resp *http.Response) time.Duration {
++	if resp != nil {
++		if ra := strings.TrimSpace(resp.Header.Get("Retry-After")); ra != "" {
++			if secs, err := strconv.Atoi(ra); err == nil && secs >= 0 {
++				return c.clamp(time.Duration(secs) * time.Second)
++			}
++		}
++	}
++	if c.BaseDelay <= 0 {
++		return 0
++	}
++	d := c.BaseDelay
++	for k := 0; k < i; k++ {
++		d *= 2
++		if c.MaxDelay > 0 && d >= c.MaxDelay {
++			return c.MaxDelay
++		}
++	}
++	return c.clamp(d)
++}
++
++func (c *Client) clamp(d time.Duration) time.Duration {
++	if c.MaxDelay > 0 && d > c.MaxDelay {
++		return c.MaxDelay
++	}
++	return d
++}
++
++// sleep waits for d via the injected Sleep hook, or a real timer when
++// none is set.
++func (c *Client) sleep(ctx context.Context, d time.Duration) error {
++	if c.Sleep != nil {
++		return c.Sleep(ctx, d)
++	}
++	t := time.NewTimer(d)
++	defer t.Stop()
++	select {
++	case <-t.C:
++		return nil
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++}

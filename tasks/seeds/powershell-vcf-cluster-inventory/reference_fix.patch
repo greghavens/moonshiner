@@ -1,0 +1,273 @@
+diff --git a/VcfInventory.psm1 b/VcfInventory.psm1
+new file mode 100644
+index 0000000..db196f9
+--- /dev/null
++++ b/VcfInventory.psm1
+@@ -0,0 +1,267 @@
++# VcfInventory — SDDC Manager cluster inventory exporter.
++# Speaks the SDDC Manager REST API 9.1 contract pinned in docs/contract.json:
++# token pair via POST /v1/tokens, refresh via PATCH with the refresh id as a
++# bare JSON string, paged domain/cluster enumeration, and a byte-stable JSON
++# export sorted independently of API response order.
++Set-StrictMode -Version Latest
++
++class VcfApiError : System.Exception {
++    [int]$StatusCode
++    [string]$ErrorCode
++    [string]$ReferenceToken
++    VcfApiError([string]$message, [int]$statusCode, [string]$errorCode, [string]$referenceToken) : base($message) {
++        $this.StatusCode = $statusCode
++        $this.ErrorCode = $errorCode
++        $this.ReferenceToken = $referenceToken
++    }
++}
++
++class VcfAuthError : VcfApiError {
++    VcfAuthError([string]$message, [int]$statusCode, [string]$errorCode, [string]$referenceToken) `
++        : base($message, $statusCode, $errorCode, $referenceToken) {}
++}
++
++class VcfForbiddenError : VcfApiError {
++    VcfForbiddenError([string]$message, [int]$statusCode, [string]$errorCode, [string]$referenceToken) `
++        : base($message, $statusCode, $errorCode, $referenceToken) {}
++}
++
++class VcfServerError : VcfApiError {
++    VcfServerError([string]$message, [int]$statusCode, [string]$errorCode, [string]$referenceToken) `
++        : base($message, $statusCode, $errorCode, $referenceToken) {}
++}
++
++function ConvertFrom-VcfErrorEnvelope {
++    param($Response)
++    $code = $null
++    $message = $null
++    $token = $null
++    try {
++        $envelope = $Response.Content | ConvertFrom-Json
++        if ($null -ne $envelope) {
++            $props = @($envelope.PSObject.Properties.Name)
++            if ($props -contains 'errorCode') { $code = $envelope.errorCode }
++            if ($props -contains 'message') { $message = $envelope.message }
++            if ($props -contains 'referenceToken') { $token = $envelope.referenceToken }
++        }
++    } catch {
++        # non-JSON error body: report the status alone
++    }
++    [pscustomobject]@{ ErrorCode = $code; Message = $message; ReferenceToken = $token }
++}
++
++function New-VcfStatusError {
++    param($Response)
++    $status = [int]$Response.StatusCode
++    $envelope = ConvertFrom-VcfErrorEnvelope -Response $Response
++    $text = "SDDC Manager returned $status ($($envelope.ErrorCode)): $($envelope.Message)"
++    if ($status -eq 401) {
++        return [VcfAuthError]::new($text, $status, $envelope.ErrorCode, $envelope.ReferenceToken)
++    }
++    if ($status -eq 403) {
++        return [VcfForbiddenError]::new($text, $status, $envelope.ErrorCode, $envelope.ReferenceToken)
++    }
++    if ($status -ge 500) {
++        return [VcfServerError]::new($text, $status, $envelope.ErrorCode, $envelope.ReferenceToken)
++    }
++    return [VcfApiError]::new($text, $status, $envelope.ErrorCode, $envelope.ReferenceToken)
++}
++
++function Connect-VcfSddcManager {
++    param(
++        [Parameter(Mandatory)][string]$BaseUrl,
++        [Parameter(Mandatory)][string]$Username,
++        [Parameter(Mandatory)][string]$Password
++    )
++    $base = $BaseUrl.TrimEnd('/')
++    $spec = [ordered]@{ username = $Username; password = $Password }
++    $response = Invoke-WebRequest -Uri "$base/v1/tokens" -Method Post `
++        -Body (ConvertTo-Json -InputObject $spec -Compress) `
++        -ContentType 'application/json' `
++        -Headers @{ Accept = 'application/json' } `
++        -SkipHttpErrorCheck
++    if ([int]$response.StatusCode -ne 201) {
++        $envelope = ConvertFrom-VcfErrorEnvelope -Response $response
++        # never place the password in the thrown message
++        throw [VcfAuthError]::new(
++            "token pair creation was rejected with status $([int]$response.StatusCode) ($($envelope.ErrorCode)): $($envelope.Message)",
++            [int]$response.StatusCode, $envelope.ErrorCode, $envelope.ReferenceToken)
++    }
++    $pair = $response.Content | ConvertFrom-Json
++    [pscustomobject]@{
++        BaseUrl        = $base
++        AccessToken    = $pair.accessToken
++        RefreshTokenId = $pair.refreshToken.id
++    }
++}
++
++function Update-VcfAccessToken {
++    param([Parameter(Mandatory)]$Session)
++    $response = Invoke-WebRequest -Uri "$($Session.BaseUrl)/v1/tokens/access-token/refresh" `
++        -Method Patch `
++        -Body (ConvertTo-Json -InputObject $Session.RefreshTokenId -Compress) `
++        -ContentType 'application/json' `
++        -Headers @{ Accept = 'application/json' } `
++        -SkipHttpErrorCheck
++    if ([int]$response.StatusCode -ne 200) {
++        $envelope = ConvertFrom-VcfErrorEnvelope -Response $response
++        throw [VcfAuthError]::new(
++            "access token refresh was rejected with status $([int]$response.StatusCode) ($($envelope.ErrorCode)): $($envelope.Message)",
++            [int]$response.StatusCode, $envelope.ErrorCode, $envelope.ReferenceToken)
++    }
++    $Session.AccessToken = $response.Content | ConvertFrom-Json
++    $Session
++}
++
++function Invoke-VcfApi {
++    param(
++        [Parameter(Mandatory)]$Session,
++        [Parameter(Mandatory)][string]$Path,
++        [hashtable]$Query
++    )
++    $uri = $Session.BaseUrl + $Path
++    if ($Query -and $Query.Count -gt 0) {
++        $parts = foreach ($key in ($Query.Keys | Sort-Object)) {
++            [uri]::EscapeDataString($key) + '=' + [uri]::EscapeDataString([string]$Query[$key])
++        }
++        $uri += '?' + ($parts -join '&')
++    }
++    $send = {
++        Invoke-WebRequest -Uri $uri -Method Get `
++            -Headers @{ Authorization = "Bearer $($Session.AccessToken)"; Accept = 'application/json' } `
++            -SkipHttpErrorCheck
++    }
++    $response = & $send
++    if ([int]$response.StatusCode -eq 401) {
++        # refresh once, retry the original request once
++        Update-VcfAccessToken -Session $Session > $null
++        $response = & $send
++        if ([int]$response.StatusCode -eq 401) {
++            throw (New-VcfStatusError -Response $response)
++        }
++    }
++    if ([int]$response.StatusCode -lt 200 -or [int]$response.StatusCode -ge 300) {
++        throw (New-VcfStatusError -Response $response)
++    }
++    $response.Content | ConvertFrom-Json
++}
++
++function Get-VcfPagedElements {
++    param(
++        [Parameter(Mandatory)]$Session,
++        [Parameter(Mandatory)][string]$Path,
++        [hashtable]$Query,
++        [int]$PageSize = 100
++    )
++    $elements = [System.Collections.Generic.List[object]]::new()
++    $pageNumber = 0
++    do {
++        $pageQuery = @{}
++        if ($Query) { foreach ($key in $Query.Keys) { $pageQuery[$key] = $Query[$key] } }
++        $pageQuery['pageNumber'] = $pageNumber
++        $pageQuery['pageSize'] = $PageSize
++        $page = Invoke-VcfApi -Session $Session -Path $Path -Query $pageQuery
++        foreach ($element in @($page.elements)) { $elements.Add($element) }
++        $totalPages = [int]$page.pageMetadata.totalPages
++        $pageNumber++
++    } while ($pageNumber -lt $totalPages)
++    $elements.ToArray()
++}
++
++function Get-VcfDomains {
++    param(
++        [Parameter(Mandatory)]$Session,
++        [string]$Type,
++        [int]$PageSize = 100
++    )
++    $query = @{}
++    if ($Type) { $query['type'] = $Type }
++    Get-VcfPagedElements -Session $Session -Path '/v1/domains' -Query $query -PageSize $PageSize
++}
++
++function Get-VcfClusters {
++    param(
++        [Parameter(Mandatory)]$Session,
++        [string]$DomainId,
++        [object]$IsStretched = $null,
++        [int]$PageSize = 100
++    )
++    $query = @{}
++    if ($DomainId) { $query['domainId'] = $DomainId }
++    if ($null -ne $IsStretched) {
++        # the API takes lowercase literals, not PowerShell's True/False
++        $query['isStretched'] = if ([bool]$IsStretched) { 'true' } else { 'false' }
++    }
++    Get-VcfPagedElements -Session $Session -Path '/v1/clusters' -Query $query -PageSize $PageSize
++}
++
++function Get-VcfClusterDatastores {
++    param(
++        [Parameter(Mandatory)]$Session,
++        [Parameter(Mandatory)][string]$ClusterId
++    )
++    @(Invoke-VcfApi -Session $Session -Path "/v1/clusters/$ClusterId/datastores")
++}
++
++function Export-VcfClusterInventory {
++    param(
++        [Parameter(Mandatory)]$Session,
++        [Parameter(Mandatory)][string]$Path,
++        [int]$PageSize = 100
++    )
++    $domainDocs = [System.Collections.Generic.List[object]]::new()
++    $domains = @(Get-VcfDomains -Session $Session -PageSize $PageSize | Sort-Object { $_.name })
++    foreach ($domain in $domains) {
++        $clusterDocs = [System.Collections.Generic.List[object]]::new()
++        $clusters = @(Get-VcfClusters -Session $Session -DomainId $domain.id -PageSize $PageSize |
++            Sort-Object { $_.name })
++        foreach ($cluster in $clusters) {
++            $hostDocs = [System.Collections.Generic.List[object]]::new()
++            foreach ($vmHost in @($cluster.hosts | Sort-Object { $_.fqdn })) {
++                $hostDocs.Add([ordered]@{
++                    id        = $vmHost.id
++                    fqdn      = $vmHost.fqdn
++                    ipAddress = $vmHost.ipAddress
++                    azName    = $vmHost.azName
++                })
++            }
++            $datastoreDocs = [System.Collections.Generic.List[object]]::new()
++            foreach ($datastore in @(Get-VcfClusterDatastores -Session $Session -ClusterId $cluster.id |
++                    Sort-Object { $_.name })) {
++                $datastoreDocs.Add([ordered]@{
++                    id              = $datastore.id
++                    name            = $datastore.name
++                    datastoreType   = $datastore.datastoreType
++                    totalCapacityGB = $datastore.totalCapacityGB
++                    freeCapacityGB  = $datastore.freeCapacityGB
++                    vmCount         = $datastore.vmCount
++                })
++            }
++            $clusterDocs.Add([ordered]@{
++                id                   = $cluster.id
++                name                 = $cluster.name
++                status               = $cluster.status
++                isDefault            = [bool]$cluster.isDefault
++                isStretched          = [bool]$cluster.isStretched
++                primaryDatastoreName = $cluster.primaryDatastoreName
++                primaryDatastoreType = $cluster.primaryDatastoreType
++                hosts                = $hostDocs.ToArray()
++                datastores           = $datastoreDocs.ToArray()
++            })
++        }
++        $domainDocs.Add([ordered]@{
++            id       = $domain.id
++            name     = $domain.name
++            type     = $domain.type
++            status   = $domain.status
++            clusters = $clusterDocs.ToArray()
++        })
++    }
++    $inventory = [ordered]@{ domains = $domainDocs.ToArray() }
++    $json = ConvertTo-Json -InputObject $inventory -Depth 12
++    $resolved = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
++    [System.IO.File]::WriteAllText($resolved, $json)
++}
++
++Export-ModuleMember -Function Connect-VcfSddcManager, Update-VcfAccessToken, `
++    Get-VcfDomains, Get-VcfClusters, Get-VcfClusterDatastores, Export-VcfClusterInventory

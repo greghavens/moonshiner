@@ -1,0 +1,219 @@
+diff --git a/backoff.ts b/backoff.ts
+new file mode 100644
+index 0000000..9909dfa
+--- /dev/null
++++ b/backoff.ts
+@@ -0,0 +1,15 @@
++export type BackoffOpts = {
++  baseMs?: number;
++  factor?: number;
++  maxMs?: number;
++};
++
++export function backoffDelay(attempt: number, opts: BackoffOpts = {}): number {
++  if (!Number.isInteger(attempt) || attempt < 1) {
++    throw new RangeError(`attempt must be an integer >= 1, got ${attempt}`);
++  }
++  const baseMs = opts.baseMs ?? 1000;
++  const factor = opts.factor ?? 2;
++  const maxMs = opts.maxMs ?? Infinity;
++  return Math.min(baseMs * factor ** (attempt - 1), maxMs);
++}
+diff --git a/job.ts b/job.ts
+new file mode 100644
+index 0000000..2680518
+--- /dev/null
++++ b/job.ts
+@@ -0,0 +1,48 @@
++import type { BackoffOpts } from './backoff.ts';
++
++export type JobState = 'waiting' | 'active' | 'done' | 'dead';
++
++export type JobError = { attempt: number; reason: string; at: number };
++
++export type Job = {
++  id: string;
++  seq: number;
++  type: string;
++  payload: unknown;
++  state: JobState;
++  priority: number;
++  readyAt: number;
++  attempts: number;
++  maxAttempts: number;
++  backoff: BackoffOpts;
++  errors: JobError[];
++};
++
++export type JobSnapshot = {
++  id: string;
++  type: string;
++  payload: unknown;
++  state: JobState;
++  attempts: number;
++  priority: number;
++  readyAt: number;
++  errors: JobError[];
++};
++
++export function snapshot(job: Job): JobSnapshot {
++  return {
++    id: job.id,
++    type: job.type,
++    payload: job.payload,
++    state: job.state,
++    attempts: job.attempts,
++    priority: job.priority,
++    readyAt: job.readyAt,
++    errors: job.errors.map((e) => ({ ...e })),
++  };
++}
++
++/** Claim order: highest priority, then earliest readyAt, then enqueue order. */
++export function compareReady(a: Job, b: Job): number {
++  return (b.priority - a.priority) || (a.readyAt - b.readyAt) || (a.seq - b.seq);
++}
+diff --git a/queue.ts b/queue.ts
+new file mode 100644
+index 0000000..6b2a58e
+--- /dev/null
++++ b/queue.ts
+@@ -0,0 +1,138 @@
++import { backoffDelay, type BackoffOpts } from './backoff.ts';
++import { compareReady, snapshot, type Job, type JobSnapshot } from './job.ts';
++
++export type EnqueueOpts = {
++  priority?: number;
++  delayMs?: number;
++  maxAttempts?: number;
++  backoff?: BackoffOpts;
++};
++
++export type ClaimedJob = { id: string; type: string; payload: unknown; attempt: number };
++
++export type DeadLetter = { id: string; type: string; payload: unknown; errors: Job['errors'] };
++
++export class JobQueue {
++  private clock: number;
++  private nextSeq = 1;
++  private jobs = new Map<string, Job>();
++  private dead: Job[] = [];
++
++  constructor(opts: { now?: number } = {}) {
++    this.clock = opts.now ?? 0;
++  }
++
++  now(): number {
++    return this.clock;
++  }
++
++  advance(ms: number): void {
++    if (!Number.isFinite(ms) || ms < 0) {
++      throw new RangeError(`advance() needs a non-negative number of ms, got ${ms}`);
++    }
++    this.clock += ms;
++  }
++
++  enqueue(type: string, payload: unknown = null, opts: EnqueueOpts = {}): string {
++    if (typeof type !== 'string' || type.trim() === '') {
++      throw new Error('job type must be a non-empty string');
++    }
++    const delayMs = opts.delayMs ?? 0;
++    if (!Number.isFinite(delayMs) || delayMs < 0) {
++      throw new RangeError(`delayMs must be non-negative, got ${delayMs}`);
++    }
++    const maxAttempts = opts.maxAttempts ?? 3;
++    if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
++      throw new RangeError(`maxAttempts must be an integer >= 1, got ${maxAttempts}`);
++    }
++    const seq = this.nextSeq++;
++    const job: Job = {
++      id: `job-${seq}`,
++      seq,
++      type,
++      payload,
++      state: 'waiting',
++      priority: opts.priority ?? 0,
++      readyAt: this.clock + delayMs,
++      attempts: 0,
++      maxAttempts,
++      backoff: opts.backoff ?? {},
++      errors: [],
++    };
++    this.jobs.set(job.id, job);
++    return job.id;
++  }
++
++  claim(): ClaimedJob | null {
++    let best: Job | null = null;
++    for (const job of this.jobs.values()) {
++      if (job.state !== 'waiting' || job.readyAt > this.clock) continue;
++      if (best === null || compareReady(job, best) < 0) best = job;
++    }
++    if (best === null) return null;
++    best.state = 'active';
++    best.attempts += 1;
++    return { id: best.id, type: best.type, payload: best.payload, attempt: best.attempts };
++  }
++
++  complete(id: string): void {
++    const job = this.mustBeActive(id);
++    job.state = 'done';
++  }
++
++  fail(id: string, reason: string): void {
++    const job = this.mustBeActive(id);
++    job.errors.push({ attempt: job.attempts, reason, at: this.clock });
++    if (job.attempts >= job.maxAttempts) {
++      job.state = 'dead';
++      this.dead.push(job);
++    } else {
++      job.state = 'waiting';
++      job.readyAt = this.clock + backoffDelay(job.attempts, job.backoff);
++    }
++  }
++
++  requeue(id: string): void {
++    const job = this.mustExist(id);
++    if (job.state !== 'dead') {
++      throw new Error(`job ${id} is not dead`);
++    }
++    this.dead.splice(this.dead.indexOf(job), 1);
++    job.state = 'waiting';
++    job.attempts = 0;
++    job.readyAt = this.clock;
++  }
++
++  job(id: string): JobSnapshot {
++    return snapshot(this.mustExist(id));
++  }
++
++  deadLetters(): DeadLetter[] {
++    return this.dead.map((job) => ({
++      id: job.id,
++      type: job.type,
++      payload: job.payload,
++      errors: job.errors.map((e) => ({ ...e })),
++    }));
++  }
++
++  stats(): { waiting: number; active: number; done: number; dead: number } {
++    const counts = { waiting: 0, active: 0, done: 0, dead: 0 };
++    for (const job of this.jobs.values()) counts[job.state] += 1;
++    return counts;
++  }
++
++  private mustExist(id: string): Job {
++    const job = this.jobs.get(id);
++    if (!job) throw new Error(`unknown job ${id}`);
++    return job;
++  }
++
++  private mustBeActive(id: string): Job {
++    const job = this.mustExist(id);
++    if (job.state !== 'active') {
++      throw new Error(`job ${id} is not active (state: ${job.state})`);
++    }
++    return job;
++  }
++}

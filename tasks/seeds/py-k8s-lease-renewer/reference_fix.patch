@@ -1,0 +1,144 @@
+diff --git a/lease_renewer.py b/lease_renewer.py
+new file mode 100644
+index 0000000..b524beb
+--- /dev/null
++++ b/lease_renewer.py
+@@ -0,0 +1,138 @@
++"""Leader-lease renewer over coordination.k8s.io/v1.
++
++Acquire, reclaim, take over expired leases and renew ours, using
++metadata.resourceVersion optimistic concurrency: every write echoes the
++version of the GET that preceded it, and a 409 means we re-read.
++"""
++
++from datetime import datetime, timezone
++
++from k8s_client import ApiError
++
++API_VERSION = "coordination.k8s.io/v1"
++_MICRO_FMT = "%Y-%m-%dT%H:%M:%S.%fZ"
++
++
++class LeadershipLost(Exception):
++    """The lease we thought we held names another holder."""
++
++
++def format_micro_time(dt):
++    """Serialize an aware UTC datetime as a MicroTime: RFC3339 with exactly
++    six fractional digits and a trailing Z."""
++    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
++
++
++def parse_micro_time(value):
++    return datetime.strptime(value, _MICRO_FMT).replace(tzinfo=timezone.utc)
++
++
++class LeaseRenewer:
++    def __init__(self, client, namespace, name, identity,
++                 lease_duration_seconds=15, clock=None):
++        self._client = client
++        self._namespace = namespace
++        self._name = name
++        self._identity = identity
++        self._duration = lease_duration_seconds
++        self._clock = clock or (lambda: datetime.now(timezone.utc))
++        self.is_leader = False
++
++    # ------------------------------------------------------------ helpers
++
++    def _body(self, spec, resource_version=None):
++        metadata = {"name": self._name, "namespace": self._namespace}
++        if resource_version is not None:
++            metadata["resourceVersion"] = resource_version
++        return {"apiVersion": API_VERSION, "kind": "Lease",
++                "metadata": metadata, "spec": spec}
++
++    def _expired(self, spec, now):
++        renew_time = spec.get("renewTime")
++        if not renew_time:
++            return True
++        duration = spec.get("leaseDurationSeconds") or self._duration
++        age = (now - parse_micro_time(renew_time)).total_seconds()
++        return age >= duration
++
++    # ------------------------------------------------------------ acquire
++
++    def acquire(self):
++        now = self._clock()
++        now_str = format_micro_time(now)
++        try:
++            lease = self._client.get_lease(self._namespace, self._name)
++        except ApiError as err:
++            if err.status_code != 404:
++                raise
++            spec = {
++                "holderIdentity": self._identity,
++                "leaseDurationSeconds": self._duration,
++                "acquireTime": now_str,
++                "renewTime": now_str,
++                "leaseTransitions": 0,
++            }
++            self._client.create_lease(self._namespace, self._body(spec))
++            self.is_leader = True
++            return True
++
++        spec = dict(lease.get("spec") or {})
++        holder = spec.get("holderIdentity")
++        resource_version = lease["metadata"]["resourceVersion"]
++
++        if holder == self._identity:
++            # Reclaiming our own lease: a renewal, not a transition.
++            spec["renewTime"] = now_str
++            spec["leaseDurationSeconds"] = self._duration
++            self._client.replace_lease(self._namespace, self._name,
++                                       self._body(spec, resource_version))
++            self.is_leader = True
++            return True
++
++        if not self._expired(spec, now):
++            self.is_leader = False
++            return False
++
++        takeover = {
++            "holderIdentity": self._identity,
++            "leaseDurationSeconds": self._duration,
++            "acquireTime": now_str,
++            "renewTime": now_str,
++            "leaseTransitions": (spec.get("leaseTransitions") or 0) + 1,
++        }
++        try:
++            self._client.replace_lease(self._namespace, self._name,
++                                       self._body(takeover, resource_version))
++        except ApiError as err:
++            if err.status_code != 409:
++                raise
++            self.is_leader = False
++            return False
++        self.is_leader = True
++        return True
++
++    # ------------------------------------------------------------- renew
++
++    def renew(self):
++        now_str = format_micro_time(self._clock())
++
++        def attempt():
++            lease = self._client.get_lease(self._namespace, self._name)
++            spec = dict(lease.get("spec") or {})
++            if spec.get("holderIdentity") != self._identity:
++                self.is_leader = False
++                raise LeadershipLost(
++                    f"lease {self._name} is now held by "
++                    f"{spec.get('holderIdentity')!r}")
++            spec["renewTime"] = now_str
++            self._client.replace_lease(
++                self._namespace, self._name,
++                self._body(spec, lease["metadata"]["resourceVersion"]))
++
++        try:
++            attempt()
++        except ApiError as err:
++            if err.status_code != 409:
++                raise
++            attempt()  # exactly one retry through a fresh GET
++        self.is_leader = True

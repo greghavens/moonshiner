@@ -1,0 +1,289 @@
+diff --git a/supervisor.go b/supervisor.go
+new file mode 100644
+index 0000000..7f31e74
+--- /dev/null
++++ b/supervisor.go
+@@ -0,0 +1,283 @@
++// Package supervisor implements a process-supervision state machine.
++//
++// The supervisor never spawns goroutines and never sleeps: callers report
++// process exits via ProcessExited and drive time by calling Tick, and all
++// timestamps come from the injected Clock. That makes the whole restart
++// lifecycle — backoff, budgets, give-up — deterministic and testable.
++package supervisor
++
++import (
++	"errors"
++	"fmt"
++	"sync"
++	"time"
++)
++
++// Clock supplies the current time. Production code passes a real clock;
++// tests inject a fake one and advance it by hand.
++type Clock interface {
++	Now() time.Time
++}
++
++// Process is the supervised unit. Start launches it and returns an error if
++// the launch itself fails; the process's later exit is reported to the
++// supervisor by the caller via ProcessExited.
++type Process interface {
++	Start() error
++}
++
++// Policy selects when an exited process is restarted.
++type Policy string
++
++const (
++	// Always restarts the process no matter how it exited.
++	Always Policy = "always"
++	// OnFailure restarts only after a non-zero exit code or a failed launch.
++	OnFailure Policy = "on-failure"
++	// Never lets the process stay down once it exits.
++	Never Policy = "never"
++)
++
++// State is the supervisor's current lifecycle phase.
++type State string
++
++const (
++	StateIdle    State = "idle"     // created, Start not yet called
++	StateRunning State = "running"  // process launched and not yet exited
++	StateBackoff State = "backoff"  // waiting for a scheduled restart
++	StateStopped State = "stopped"  // Stop was called; supervision over
++	StateDone    State = "done"     // process exited and policy says stay down
++	StateGivenUp State = "given-up" // restart budget exhausted
++)
++
++// Event is one entry in the supervisor's event log. Only the fields relevant
++// to the Kind are set; the rest stay at their zero values.
++type Event struct {
++	At    time.Time     // when it happened, per the injected clock
++	Kind  string        // "started", "start-failed", "exited", "restart-scheduled", "gave-up", "stopped"
++	Code  int           // exit code, for "exited"
++	Delay time.Duration // backoff delay, for "restart-scheduled"
++	Err   string        // launch error, for "start-failed"
++}
++
++// Config describes one supervised process.
++type Config struct {
++	Process Process
++	Policy  Policy
++
++	// BackoffBase is the delay before the first restart. Each subsequent
++	// restart doubles it, up to BackoffCap (if set). A zero base restarts
++	// immediately and never grows.
++	BackoffBase time.Duration
++	BackoffCap  time.Duration
++
++	// StableAfter, when positive, resets the backoff sequence to
++	// BackoffBase once a run has survived at least this long.
++	StableAfter time.Duration
++
++	// MaxRestarts, when positive, caps how many restarts may fire within
++	// the trailing Window. Exceeding it moves the supervisor to
++	// StateGivenUp. MaxRestarts requires a positive Window.
++	MaxRestarts int
++	Window      time.Duration
++}
++
++// Supervisor drives one process through its restart lifecycle.
++type Supervisor struct {
++	mu  sync.Mutex
++	cfg Config
++	clk Clock
++
++	state        State
++	events       []Event
++	nextDelay    time.Duration // delay the next restart will use
++	pendingAt    time.Time     // when the pending restart is due (StateBackoff)
++	runStartedAt time.Time     // launch time of the current run (StateRunning)
++	restartTimes []time.Time   // when past restarts fired, for the budget window
++}
++
++// New validates cfg and returns a supervisor in StateIdle.
++func New(cfg Config, clk Clock) (*Supervisor, error) {
++	if cfg.Process == nil {
++		return nil, errors.New("supervisor: Config.Process must not be nil")
++	}
++	if clk == nil {
++		return nil, errors.New("supervisor: clock must not be nil")
++	}
++	switch cfg.Policy {
++	case Always, OnFailure, Never:
++	default:
++		return nil, fmt.Errorf("supervisor: unknown Policy %q", cfg.Policy)
++	}
++	if cfg.BackoffBase < 0 || cfg.BackoffCap < 0 || cfg.StableAfter < 0 || cfg.Window < 0 || cfg.MaxRestarts < 0 {
++		return nil, errors.New("supervisor: durations and MaxRestarts must not be negative")
++	}
++	if cfg.BackoffCap > 0 && cfg.BackoffCap < cfg.BackoffBase {
++		return nil, fmt.Errorf("supervisor: BackoffCap %v is below BackoffBase %v", cfg.BackoffCap, cfg.BackoffBase)
++	}
++	if cfg.MaxRestarts > 0 && cfg.Window <= 0 {
++		return nil, errors.New("supervisor: MaxRestarts requires a positive Window")
++	}
++	return &Supervisor{
++		cfg:       cfg,
++		clk:       clk,
++		state:     StateIdle,
++		nextDelay: cfg.BackoffBase,
++	}, nil
++}
++
++// Start begins supervision. It returns an error only if supervision cannot
++// begin (already started or stopped); a failing launch is not an error here —
++// it is logged as "start-failed" and handed to the restart policy.
++func (s *Supervisor) Start() error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.state != StateIdle {
++		return fmt.Errorf("supervisor: Start called in state %q", s.state)
++	}
++	s.launch()
++	return nil
++}
++
++// ProcessExited reports that the running process exited with code. The
++// restart policy decides what happens next.
++func (s *Supervisor) ProcessExited(code int) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.state != StateRunning {
++		return fmt.Errorf("supervisor: ProcessExited called in state %q", s.state)
++	}
++	now := s.clk.Now()
++	s.events = append(s.events, Event{At: now, Kind: "exited", Code: code})
++
++	restart := false
++	switch s.cfg.Policy {
++	case Always:
++		restart = true
++	case OnFailure:
++		restart = code != 0
++	case Never:
++		restart = false
++	}
++	if !restart {
++		s.state = StateDone
++		return nil
++	}
++	// A run that survived long enough resets the backoff sequence.
++	if s.cfg.StableAfter > 0 && now.Sub(s.runStartedAt) >= s.cfg.StableAfter {
++		s.nextDelay = s.cfg.BackoffBase
++	}
++	s.scheduleRestart(now)
++	return nil
++}
++
++// Tick fires the pending restart if its due time has arrived. It is safe to
++// call at any time; outside StateBackoff (or before the due time) it does
++// nothing.
++func (s *Supervisor) Tick() {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.state != StateBackoff {
++		return
++	}
++	now := s.clk.Now()
++	if now.Before(s.pendingAt) {
++		return
++	}
++	s.restartTimes = append(s.restartTimes, now)
++	s.launch()
++}
++
++// Stop ends supervision from StateRunning or StateBackoff, cancelling any
++// pending restart. Stopping a supervisor that is not supervising is an error.
++func (s *Supervisor) Stop() error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.state != StateRunning && s.state != StateBackoff {
++		return fmt.Errorf("supervisor: Stop called in state %q", s.state)
++	}
++	s.pendingAt = time.Time{}
++	s.state = StateStopped
++	s.events = append(s.events, Event{At: s.clk.Now(), Kind: "stopped"})
++	return nil
++}
++
++// PendingRestartAt reports when the scheduled restart is due. ok is false
++// unless the supervisor is in StateBackoff.
++func (s *Supervisor) PendingRestartAt() (time.Time, bool) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.state != StateBackoff {
++		return time.Time{}, false
++	}
++	return s.pendingAt, true
++}
++
++// State returns the current lifecycle state.
++func (s *Supervisor) State() State {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return s.state
++}
++
++// Events returns a copy of the event log, oldest first.
++func (s *Supervisor) Events() []Event {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	out := make([]Event, len(s.events))
++	copy(out, s.events)
++	return out
++}
++
++// launch attempts to start the process at the current clock time. A failed
++// launch is logged and handed to the restart policy: under Never the
++// supervisor is done; otherwise another restart is scheduled (budget
++// permitting). Budget accounting happens at the Tick call site, where a
++// restart actually fires.
++func (s *Supervisor) launch() {
++	now := s.clk.Now()
++	if err := s.cfg.Process.Start(); err != nil {
++		s.events = append(s.events, Event{At: now, Kind: "start-failed", Err: err.Error()})
++		if s.cfg.Policy == Never {
++			s.state = StateDone
++			return
++		}
++		s.scheduleRestart(now)
++		return
++	}
++	s.events = append(s.events, Event{At: now, Kind: "started"})
++	s.state = StateRunning
++	s.runStartedAt = now
++	s.pendingAt = time.Time{}
++}
++
++// scheduleRestart either schedules the next restart with the current backoff
++// delay or, if the restart budget for the trailing window is spent, gives up.
++func (s *Supervisor) scheduleRestart(now time.Time) {
++	if s.cfg.MaxRestarts > 0 {
++		kept := s.restartTimes[:0]
++		for _, at := range s.restartTimes {
++			if now.Sub(at) < s.cfg.Window {
++				kept = append(kept, at)
++			}
++		}
++		s.restartTimes = kept
++		if len(s.restartTimes) >= s.cfg.MaxRestarts {
++			s.pendingAt = time.Time{}
++			s.state = StateGivenUp
++			s.events = append(s.events, Event{At: now, Kind: "gave-up"})
++			return
++		}
++	}
++	delay := s.nextDelay
++	s.events = append(s.events, Event{At: now, Kind: "restart-scheduled", Delay: delay})
++	s.pendingAt = now.Add(delay)
++	s.state = StateBackoff
++	if delay > 0 {
++		next := delay * 2
++		if s.cfg.BackoffCap > 0 && next > s.cfg.BackoffCap {
++			next = s.cfg.BackoffCap
++		}
++		s.nextDelay = next
++	}
++}

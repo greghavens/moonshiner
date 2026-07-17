@@ -1,0 +1,427 @@
+diff --git a/ArmLroClient.cs b/ArmLroClient.cs
+new file mode 100644
+index 0000000..32eda53
+--- /dev/null
++++ b/ArmLroClient.cs
+@@ -0,0 +1,255 @@
++using System.Net;
++using System.Net.Http.Headers;
++using System.Text;
++using System.Text.Json;
++
++namespace ArmLro;
++
++/// <summary>
++/// Drives an ARM create-or-update through the documented asynchronous-operation
++/// protocol: monitor-header precedence Azure-AsyncOperation, then
++/// Operation-Location, then Location; Retry-After between polls; terminal states
++/// Succeeded/Failed/Canceled (case-insensitive).
++/// </summary>
++public sealed class ArmLroClient
++{
++    private static readonly string[] MonitorHeaderPrecedence =
++    {
++        "Azure-AsyncOperation",
++        "Operation-Location",
++        "Location",
++    };
++
++    private readonly HttpClient _http;
++    private readonly EntraTokenProvider _tokens;
++    private readonly ArmLroClientOptions _options;
++
++    public ArmLroClient(HttpClient http, EntraTokenProvider tokens, ArmLroClientOptions options)
++    {
++        _http = http;
++        _tokens = tokens;
++        _options = options;
++    }
++
++    public async Task<ArmOperationResult> CreateOrUpdateAsync(
++        string resourcePath, string apiVersion, string requestBodyJson, CancellationToken ct = default)
++    {
++        var resourceUri = BuildResourceUri(resourcePath, apiVersion);
++        using var request = new HttpRequestMessage(HttpMethod.Put, resourceUri)
++        {
++            Content = new StringContent(requestBodyJson, Encoding.UTF8, "application/json"),
++        };
++        request.Headers.Authorization = await BearerAsync(ct);
++        using var response = await _http.SendAsync(request, ct);
++        var body = await response.Content.ReadAsStringAsync(ct);
++
++        if (response.StatusCode is HttpStatusCode.OK)
++        {
++            return CompletedResult(body);
++        }
++
++        if (response.StatusCode is HttpStatusCode.Created or HttpStatusCode.Accepted)
++        {
++            var (monitorHeader, monitorUrl) = FindMonitor(response);
++            if (monitorUrl is null)
++            {
++                if (response.StatusCode == HttpStatusCode.Created)
++                {
++                    // 201 with no monitor header: the operation completed synchronously.
++                    return CompletedResult(body);
++                }
++                throw new ArmProtocolException(
++                    "202 Accepted carried no Azure-AsyncOperation, Operation-Location, or Location header");
++            }
++            return await PollAsync(monitorHeader!, monitorUrl, resourceUri, RetryAfter(response), ct);
++        }
++
++        throw new ArmRequestException(response.StatusCode, ParseArmError(body));
++    }
++
++    private async Task<ArmOperationResult> PollAsync(
++        string monitorHeader, Uri monitorUrl, Uri resourceUri, TimeSpan? initialWait, CancellationToken ct)
++    {
++        var locationStyle = string.Equals(monitorHeader, "Location", StringComparison.OrdinalIgnoreCase);
++        var wait = initialWait ?? _options.DefaultPollDelay;
++
++        for (var poll = 0; poll < _options.MaxPolls; poll++)
++        {
++            await _options.Delay(wait, ct);
++
++            using var request = new HttpRequestMessage(HttpMethod.Get, monitorUrl);
++            request.Headers.Authorization = await BearerAsync(ct);
++            using var response = await _http.SendAsync(request, ct);
++            var body = await response.Content.ReadAsStringAsync(ct);
++            wait = RetryAfter(response) ?? _options.DefaultPollDelay;
++
++            if (locationStyle)
++            {
++                // A Location monitor answers 202 while running and 200 with the final body when done.
++                if (response.StatusCode == HttpStatusCode.Accepted)
++                {
++                    continue;
++                }
++                if (response.StatusCode == HttpStatusCode.OK)
++                {
++                    return CompletedResult(body);
++                }
++                throw new ArmRequestException(response.StatusCode, ParseArmError(body));
++            }
++
++            // Azure-AsyncOperation / Operation-Location monitors answer 200 with a status document.
++            if (!response.IsSuccessStatusCode)
++            {
++                throw new ArmRequestException(response.StatusCode, ParseArmError(body));
++            }
++            var (status, error) = ParseStatusDocument(body);
++            if (Terminal(status, "Succeeded"))
++            {
++                using var finalRequest = new HttpRequestMessage(HttpMethod.Get, resourceUri);
++                finalRequest.Headers.Authorization = await BearerAsync(ct);
++                using var finalResponse = await _http.SendAsync(finalRequest, ct);
++                var finalBody = await finalResponse.Content.ReadAsStringAsync(ct);
++                if (!finalResponse.IsSuccessStatusCode)
++                {
++                    throw new ArmRequestException(finalResponse.StatusCode, ParseArmError(finalBody));
++                }
++                return new ArmOperationResult
++                {
++                    Succeeded = true,
++                    Status = status,
++                    Resource = ParseJson(finalBody),
++                };
++            }
++            if (Terminal(status, "Failed") || Terminal(status, "Canceled"))
++            {
++                return new ArmOperationResult
++                {
++                    Succeeded = false,
++                    Status = status,
++                    Error = error,
++                };
++            }
++        }
++
++        throw new ArmProtocolException(
++            $"operation did not reach a terminal state within {_options.MaxPolls} polls");
++    }
++
++    private Uri BuildResourceUri(string resourcePath, string apiVersion)
++    {
++        var baseAddress = _http.BaseAddress
++            ?? throw new ArmProtocolException("HttpClient.BaseAddress must be set to the ARM endpoint");
++        return new Uri(baseAddress, $"{resourcePath}?api-version={Uri.EscapeDataString(apiVersion)}");
++    }
++
++    private async Task<AuthenticationHeaderValue> BearerAsync(CancellationToken ct)
++        => new("Bearer", await _tokens.GetTokenAsync(ct));
++
++    private (string? Header, Uri? Url) FindMonitor(HttpResponseMessage response)
++    {
++        foreach (var header in MonitorHeaderPrecedence)
++        {
++            if (response.Headers.TryGetValues(header, out var values))
++            {
++                var raw = values.FirstOrDefault();
++                if (string.IsNullOrEmpty(raw))
++                {
++                    continue;
++                }
++                var url = new Uri(raw, UriKind.Absolute);
++                RequireArmHost(header, url);
++                return (header, url);
++            }
++        }
++        return (null, null);
++    }
++
++    private void RequireArmHost(string header, Uri monitorUrl)
++    {
++        var expectedHost = _http.BaseAddress?.Host;
++        if (!string.Equals(monitorUrl.Host, expectedHost, StringComparison.OrdinalIgnoreCase))
++        {
++            throw new ArmProtocolException(
++                $"{header} monitor points at untrusted host {monitorUrl.Host}; refusing to send credentials off {expectedHost}");
++        }
++    }
++
++    private static TimeSpan? RetryAfter(HttpResponseMessage response)
++    {
++        var delta = response.Headers.RetryAfter?.Delta;
++        return delta is null ? null : delta.Value;
++    }
++
++    private static ArmOperationResult CompletedResult(string body)
++        => new()
++        {
++            Succeeded = true,
++            Status = "Succeeded",
++            Resource = ParseJson(body),
++        };
++
++    private static (string Status, ArmError? Error) ParseStatusDocument(string body)
++    {
++        JsonDocument doc;
++        try
++        {
++            doc = JsonDocument.Parse(body);
++        }
++        catch (JsonException)
++        {
++            throw new ArmProtocolException("status monitor returned a non-JSON body");
++        }
++        using (doc)
++        {
++            if (!doc.RootElement.TryGetProperty("status", out var statusProp)
++                || statusProp.ValueKind != JsonValueKind.String)
++            {
++                throw new ArmProtocolException("status monitor body is missing the required status property");
++            }
++            ArmError? error = null;
++            if (doc.RootElement.TryGetProperty("error", out var errorProp)
++                && errorProp.ValueKind == JsonValueKind.Object)
++            {
++                error = ReadError(errorProp);
++            }
++            return (statusProp.GetString()!, error);
++        }
++    }
++
++    private static ArmError? ParseArmError(string body)
++    {
++        try
++        {
++            using var doc = JsonDocument.Parse(body);
++            if (doc.RootElement.TryGetProperty("error", out var errorProp)
++                && errorProp.ValueKind == JsonValueKind.Object)
++            {
++                return ReadError(errorProp);
++            }
++        }
++        catch (JsonException)
++        {
++        }
++        return null;
++    }
++
++    private static ArmError ReadError(JsonElement errorProp)
++        => new()
++        {
++            Code = errorProp.TryGetProperty("code", out var code) ? code.GetString() ?? "" : "",
++            Message = errorProp.TryGetProperty("message", out var message) ? message.GetString() ?? "" : "",
++        };
++
++    private static JsonElement? ParseJson(string body)
++    {
++        if (string.IsNullOrWhiteSpace(body))
++        {
++            return null;
++        }
++        using var doc = JsonDocument.Parse(body);
++        return doc.RootElement.Clone();
++    }
++
++    private static bool Terminal(string status, string expected)
++        => string.Equals(status, expected, StringComparison.OrdinalIgnoreCase);
++}
+diff --git a/EntraTokenProvider.cs b/EntraTokenProvider.cs
+new file mode 100644
+index 0000000..b1f6b8f
+--- /dev/null
++++ b/EntraTokenProvider.cs
+@@ -0,0 +1,93 @@
++using System.Text.Json;
++
++namespace ArmLro;
++
++/// <summary>
++/// Acquires and caches app-only bearer tokens via the OAuth 2.0 client-credentials
++/// flow (POST {tenant}/oauth2/v2.0/token, application/x-www-form-urlencoded).
++/// </summary>
++public sealed class EntraTokenProvider
++{
++    private readonly HttpClient _http;
++    private readonly Uri _tokenEndpoint;
++    private readonly string _clientId;
++    private readonly string _clientSecret;
++    private readonly string _scope;
++    private readonly Func<DateTimeOffset> _now;
++    private readonly SemaphoreSlim _gate = new(1, 1);
++
++    private string? _cachedToken;
++    private DateTimeOffset _expiresAt = DateTimeOffset.MinValue;
++
++    public EntraTokenProvider(
++        HttpClient http,
++        Uri tokenEndpoint,
++        string clientId,
++        string clientSecret,
++        string scope,
++        Func<DateTimeOffset> now)
++    {
++        _http = http;
++        _tokenEndpoint = tokenEndpoint;
++        _clientId = clientId;
++        _clientSecret = clientSecret;
++        _scope = scope;
++        _now = now;
++    }
++
++    public async Task<string> GetTokenAsync(CancellationToken ct = default)
++    {
++        await _gate.WaitAsync(ct);
++        try
++        {
++            if (_cachedToken is not null && _now() < _expiresAt)
++            {
++                return _cachedToken;
++            }
++
++            using var content = new FormUrlEncodedContent(new Dictionary<string, string>
++            {
++                ["grant_type"] = "client_credentials",
++                ["client_id"] = _clientId,
++                ["client_secret"] = _clientSecret,
++                ["scope"] = _scope,
++            });
++            using var response = await _http.PostAsync(_tokenEndpoint, content, ct);
++            var body = await response.Content.ReadAsStringAsync(ct);
++
++            if (!response.IsSuccessStatusCode)
++            {
++                // Surface only the OAuth error code: error_description may echo request
++                // parameters and must never travel with the secret into logs.
++                var code = "unknown_error";
++                try
++                {
++                    using var doc = JsonDocument.Parse(body);
++                    if (doc.RootElement.TryGetProperty("error", out var errorProp))
++                    {
++                        code = errorProp.GetString() ?? code;
++                    }
++                }
++                catch (JsonException)
++                {
++                }
++                throw new ArmAuthException(
++                    $"token request failed with status {(int)response.StatusCode}: {code}");
++            }
++
++            using var okDoc = JsonDocument.Parse(body);
++            var root = okDoc.RootElement;
++            var token = root.GetProperty("access_token").GetString()
++                ?? throw new ArmAuthException("token response had no access_token");
++            var expiresIn = root.GetProperty("expires_in").GetInt32();
++
++            _cachedToken = token;
++            _expiresAt = _now().AddSeconds(expiresIn);
++            return token;
++        }
++        finally
++        {
++            _gate.Release();
++        }
++    }
++}
+diff --git a/Exceptions.cs b/Exceptions.cs
+new file mode 100644
+index 0000000..fd0b71c
+--- /dev/null
++++ b/Exceptions.cs
+@@ -0,0 +1,30 @@
++using System.Net;
++
++namespace ArmLro;
++
++/// <summary>Token acquisition against the Microsoft Entra endpoint failed.</summary>
++public sealed class ArmAuthException : Exception
++{
++    public ArmAuthException(string message) : base(message) { }
++}
++
++/// <summary>The service violated the documented async-operation protocol,
++/// or the poll budget ran out before a terminal state.</summary>
++public sealed class ArmProtocolException : Exception
++{
++    public ArmProtocolException(string message) : base(message) { }
++}
++
++/// <summary>ARM rejected a request outright (non-LRO error response).</summary>
++public sealed class ArmRequestException : Exception
++{
++    public HttpStatusCode StatusCode { get; }
++    public ArmError? Error { get; }
++
++    public ArmRequestException(HttpStatusCode statusCode, ArmError? error)
++        : base($"ARM request failed with {(int)statusCode}: {error?.Code ?? "no error body"}")
++    {
++        StatusCode = statusCode;
++        Error = error;
++    }
++}
+diff --git a/Models.cs b/Models.cs
+new file mode 100644
+index 0000000..282570d
+--- /dev/null
++++ b/Models.cs
+@@ -0,0 +1,25 @@
++using System.Text.Json;
++
++namespace ArmLro;
++
++public sealed class ArmError
++{
++    public string Code { get; init; } = "";
++    public string Message { get; init; } = "";
++}
++
++public sealed class ArmOperationResult
++{
++    public bool Succeeded { get; init; }
++    public string Status { get; init; } = "";
++    public JsonElement? Resource { get; init; }
++    public ArmError? Error { get; init; }
++}
++
++public sealed class ArmLroClientOptions
++{
++    public int MaxPolls { get; set; } = 20;
++    public TimeSpan DefaultPollDelay { get; set; } = TimeSpan.FromSeconds(5);
++    public Func<TimeSpan, CancellationToken, Task> Delay { get; set; } =
++        (wait, ct) => Task.Delay(wait, ct);
++}

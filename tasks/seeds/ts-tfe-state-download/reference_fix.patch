@@ -1,0 +1,221 @@
+diff --git a/client.ts b/client.ts
+new file mode 100644
+index 0000000..9c943d9
+--- /dev/null
++++ b/client.ts
+@@ -0,0 +1,92 @@
++// Terraform Enterprise /api/v2 JSON:API client: workspace resolution and
++// state-version metadata.
++
++export interface JsonApiErrorObject {
++  status: string;
++  title: string;
++  detail: string;
++}
++
++// Any non-2xx /api/v2 response. Note TFE answers 404 both for resources
++// that do not exist and for resources the token is not authorized to see.
++export class ApiError extends Error {
++  statusCode: number;
++  errors: JsonApiErrorObject[];
++
++  constructor(statusCode: number, errors: JsonApiErrorObject[]) {
++    const detail = errors.map((e) => `${e.status} ${e.title}: ${e.detail}`).join('; ')
++      || `HTTP ${statusCode}`;
++    super(`TFE API error: ${detail}`);
++    this.name = 'ApiError';
++    this.statusCode = statusCode;
++    this.errors = errors;
++  }
++}
++
++export interface WorkspaceRef {
++  id: string;
++  currentStateVersionId: string | null;
++}
++
++export interface StateVersion {
++  id: string;
++  status: string;
++  serial: number;
++  size: number | null;
++  resourcesProcessed: boolean;
++  downloadUrl: string;
++  jsonDownloadUrl: string | null;
++}
++
++export class TfeClient {
++  readonly baseUrl: string;
++  readonly token: string;
++
++  constructor(baseUrl: string, token: string) {
++    this.baseUrl = baseUrl.replace(/\/+$/, '');
++    this.token = token;
++  }
++
++  get origin(): string {
++    return new URL(this.baseUrl).origin;
++  }
++
++  async getJson(apiPath: string): Promise<any> {
++    const resp = await fetch(this.baseUrl + apiPath, {
++      headers: { authorization: `Bearer ${this.token}` },
++    });
++    const raw = await resp.text();
++    if (!resp.ok) {
++      let errors: JsonApiErrorObject[] = [];
++      try {
++        errors = JSON.parse(raw).errors ?? [];
++      } catch {
++        // non-JSON error body: keep the empty errors array
++      }
++      throw new ApiError(resp.status, errors);
++    }
++    return JSON.parse(raw);
++  }
++
++  async resolveWorkspace(org: string, name: string): Promise<WorkspaceRef> {
++    const doc = await this.getJson(
++      `/api/v2/organizations/${encodeURIComponent(org)}/workspaces/${encodeURIComponent(name)}`,
++    );
++    const linkage = doc.data?.relationships?.['current-state-version']?.data ?? null;
++    return { id: doc.data.id, currentStateVersionId: linkage === null ? null : linkage.id };
++  }
++
++  async getStateVersion(id: string): Promise<StateVersion> {
++    const doc = await this.getJson(`/api/v2/state-versions/${encodeURIComponent(id)}`);
++    const attrs = doc.data.attributes;
++    return {
++      id: doc.data.id,
++      status: attrs.status,
++      serial: attrs.serial,
++      size: attrs.size ?? null,
++      resourcesProcessed: attrs['resources-processed'] ?? false,
++      downloadUrl: attrs['hosted-state-download-url'],
++      jsonDownloadUrl: attrs['hosted-json-state-download-url'] ?? null,
++    };
++  }
++}
+diff --git a/download.ts b/download.ts
+new file mode 100644
+index 0000000..b7321ca
+--- /dev/null
++++ b/download.ts
+@@ -0,0 +1,117 @@
++// Hosted-state download: pre-signed URL fetching with a strict cross-origin
++// credential policy, integrity verification, and atomic writes.
++
++import crypto from 'node:crypto';
++import fs from 'node:fs';
++import path from 'node:path';
++
++import { TfeClient } from './client.ts';
++
++export class NoStateError extends Error {
++  constructor(message: string) {
++    super(message);
++    this.name = 'NoStateError';
++  }
++}
++
++export class StateNotReadyError extends Error {
++  constructor(message: string) {
++    super(message);
++    this.name = 'StateNotReadyError';
++  }
++}
++
++export class IntegrityError extends Error {
++  constructor(message: string) {
++    super(message);
++    this.name = 'IntegrityError';
++  }
++}
++
++const MAX_REDIRECTS = 3;
++
++// GET the hosted-state-download-url. The bearer token is attached only when
++// the request origin is exactly the TFE API origin; redirects are followed
++// manually (at most MAX_REDIRECTS) with the auth decision remade per hop, so
++// the token never travels to a foreign origin.
++export async function downloadHostedState(client: TfeClient, url: string): Promise<Buffer> {
++  let current = url;
++  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
++    const headers: Record<string, string> = {};
++    if (new URL(current).origin === client.origin) {
++      headers.authorization = `Bearer ${client.token}`;
++    }
++    const resp = await fetch(current, { headers, redirect: 'manual' });
++    if (resp.status >= 300 && resp.status < 400) {
++      const location = resp.headers.get('location');
++      if (location === null) {
++        throw new Error(`redirect response ${resp.status} without a Location header`);
++      }
++      await resp.arrayBuffer().catch(() => undefined);
++      current = new URL(location, current).toString();
++      continue;
++    }
++    if (!resp.ok) {
++      throw new Error(`hosted state download failed: HTTP ${resp.status}`);
++    }
++    return Buffer.from(await resp.arrayBuffer());
++  }
++  throw new Error(`too many redirects (more than ${MAX_REDIRECTS}) downloading hosted state`);
++}
++
++export interface DownloadResult {
++  stateVersionId: string;
++  serial: number;
++  bytesWritten: number;
++  path: string;
++}
++
++// Resolve the workspace's current state version, verify it, and write the
++// raw state atomically to destPath.
++export async function downloadCurrentState(
++  client: TfeClient,
++  org: string,
++  name: string,
++  destPath: string,
++): Promise<DownloadResult> {
++  const ws = await client.resolveWorkspace(org, name);
++  if (ws.currentStateVersionId === null) {
++    throw new NoStateError(`workspace ${org}/${name} has never stored state`);
++  }
++  const sv = await client.getStateVersion(ws.currentStateVersionId);
++  if (sv.status !== 'finalized') {
++    throw new StateNotReadyError(`state version ${sv.id} has status ${sv.status}, not finalized`);
++  }
++
++  const bytes = await downloadHostedState(client, sv.downloadUrl);
++  if (sv.size !== null && bytes.length !== sv.size) {
++    throw new IntegrityError(
++      `size mismatch: downloaded ${bytes.length} bytes but the state version reports ${sv.size}`,
++    );
++  }
++  let payloadSerial: unknown;
++  try {
++    payloadSerial = JSON.parse(bytes.toString('utf8')).serial;
++  } catch {
++    throw new IntegrityError('downloaded state is not valid JSON');
++  }
++  if (payloadSerial !== sv.serial) {
++    throw new IntegrityError(
++      `serial mismatch: payload carries ${String(payloadSerial)} but the state version reports ${sv.serial}`,
++    );
++  }
++
++  const dir = path.dirname(destPath);
++  const tmp = path.join(
++    dir,
++    `.${path.basename(destPath)}.tmp-${crypto.randomBytes(6).toString('hex')}`,
++  );
++  fs.writeFileSync(tmp, bytes);
++  try {
++    fs.renameSync(tmp, destPath);
++  } catch (err) {
++    fs.rmSync(tmp, { force: true });
++    throw err;
++  }
++  return { stateVersionId: sv.id, serial: sv.serial, bytesWritten: bytes.length, path: destPath };
++}

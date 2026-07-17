@@ -1,0 +1,184 @@
+diff --git a/staticfiles.py b/staticfiles.py
+new file mode 100644
+index 0000000..021810b
+--- /dev/null
++++ b/staticfiles.py
+@@ -0,0 +1,178 @@
++"""staticfiles.py — socket-free static-file core for the appliance gateway.
++
++The gateway hands us the method, the raw request-target, and the request
++headers; we hand back status/headers/body. All path resolution is strictly
++lexical and confined to the docroot.
++"""
++import hashlib
++import os
++import urllib.parse
++from datetime import timezone
++from email.utils import formatdate, parsedate_to_datetime
++
++CONTENT_TYPES = {
++    ".html": "text/html",
++    ".txt": "text/plain",
++    ".css": "text/css",
++    ".js": "text/javascript",
++    ".json": "application/json",
++    ".png": "image/png",
++}
++DEFAULT_TYPE = "application/octet-stream"
++
++
++class Response:
++    __slots__ = ("status", "headers", "body")
++
++    def __init__(self, status, headers, body=b""):
++        self.status = status
++        self.headers = headers
++        self.body = body
++
++
++def _error(status, reason, extra=None):
++    body = (reason + "\n").encode("utf-8")
++    headers = {"Content-Type": "text/plain", "Content-Length": str(len(body))}
++    if extra:
++        headers.update(extra)
++    return Response(status, headers, body)
++
++
++def _parse_http_date(value):
++    """IMF-fixdate (and friends) -> epoch seconds, or None when unparseable."""
++    try:
++        dt = parsedate_to_datetime(value)
++    except (TypeError, ValueError, IndexError):
++        return None
++    if dt is None:
++        return None
++    if dt.tzinfo is None:
++        dt = dt.replace(tzinfo=timezone.utc)
++    return int(dt.timestamp())
++
++
++def _etag_matches(header_value, etag):
++    """RFC 7232 If-None-Match: comma list, `*`, weak comparison."""
++    if header_value.strip() == "*":
++        return True
++    for candidate in header_value.split(","):
++        candidate = candidate.strip()
++        if candidate.startswith("W/"):
++            candidate = candidate[2:]
++        if candidate == etag:
++            return True
++    return False
++
++
++def _parse_range(value, size):
++    """Single byte-range -> (start, end), 'unsatisfiable', or None (= ignore)."""
++    value = value.strip()
++    if not value.startswith("bytes="):
++        return None
++    spec = value[len("bytes="):].strip()
++    if not spec or "," in spec or "-" not in spec:
++        return None
++    first, _, last = spec.partition("-")
++    first, last = first.strip(), last.strip()
++    try:
++        if first == "":
++            n = int(last)  # suffix form: final n bytes
++            if n < 0:
++                return None
++            if n == 0 or size == 0:
++                return "unsatisfiable"
++            return (max(size - n, 0), size - 1)
++        start = int(first)
++        if start < 0:
++            return None
++        if last == "":
++            end = size - 1
++        else:
++            end = int(last)
++            if end < start:
++                return None  # syntactically invalid: ignore the header
++            end = min(end, size - 1)
++    except ValueError:
++        return None
++    if start >= size:
++        return "unsatisfiable"
++    return (start, end)
++
++
++class StaticFiles:
++    def __init__(self, root):
++        self.root = os.path.abspath(os.fspath(root))
++
++    def _resolve(self, target):
++        """Raw request-target -> absolute file path under root, or None."""
++        path = target.split("?", 1)[0].split("#", 1)[0]
++        decoded = urllib.parse.unquote(path)
++        if "\x00" in decoded:
++            return None
++        parts = []
++        for segment in decoded.replace("\\", "/").split("/"):
++            if segment in ("", "."):
++                continue
++            if segment == "..":
++                return None  # refuse dot-dot outright, even if it stays inside
++            parts.append(segment)
++        if not parts:
++            return None
++        full = os.path.join(self.root, *parts)
++        if os.path.commonpath([self.root, os.path.abspath(full)]) != self.root:
++            return None  # belt and suspenders; lexical containment only
++        return full
++
++    def handle(self, method, target, headers=None):
++        hdrs = {str(k).lower(): v for k, v in (headers or {}).items()}
++        if method not in ("GET", "HEAD"):
++            return _error(405, "method not allowed", {"Allow": "GET, HEAD"})
++        full = self._resolve(target)
++        if full is None or not os.path.isfile(full):
++            return _error(404, "not found")
++
++        st = os.stat(full)
++        size = st.st_size
++        mtime = int(st.st_mtime)
++        rel = os.path.relpath(full, self.root)
++        fingerprint = f"{rel}:{st.st_mtime_ns}:{size}".encode("utf-8")
++        etag = '"%s"' % hashlib.sha256(fingerprint).hexdigest()[:20]
++
++        # Conditionals come before Range; If-None-Match silences If-Modified-Since.
++        inm = hdrs.get("if-none-match")
++        if inm is not None:
++            if _etag_matches(inm, etag):
++                return Response(304, {"ETag": etag}, b"")
++        else:
++            ims = hdrs.get("if-modified-since")
++            if ims is not None:
++                since = _parse_http_date(ims)
++                if since is not None and mtime <= since:
++                    return Response(304, {"ETag": etag}, b"")
++
++        with open(full, "rb") as f:
++            data = f.read()
++        base = {
++            "Content-Type": CONTENT_TYPES.get(os.path.splitext(full)[1].lower(),
++                                              DEFAULT_TYPE),
++            "ETag": etag,
++            "Last-Modified": formatdate(mtime, usegmt=True),
++        }
++
++        rng = hdrs.get("range")
++        if method == "GET" and rng is not None:
++            parsed = _parse_range(rng, size)
++            if parsed == "unsatisfiable":
++                return _error(416, "range not satisfiable",
++                              {"Content-Range": "bytes */%d" % size})
++            if parsed is not None:
++                start, end = parsed
++                chunk = data[start:end + 1]
++                part = dict(base)
++                part["Content-Range"] = "bytes %d-%d/%d" % (start, end, size)
++                part["Content-Length"] = str(len(chunk))
++                return Response(206, part, chunk)
++
++        base["Content-Length"] = str(size)
++        base["Accept-Ranges"] = "bytes"
++        return Response(200, base, b"" if method == "HEAD" else data)

@@ -1,0 +1,130 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 06de916..6eb52d9 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,123 @@
+ //! rs-mpscpipe: mpsc worker pipeline with submission-order reassembly.
+-//! Implementation pending — see tests/mpscpipe.rs for the acceptance
+-//! contract.
++//!
++//! Fan-out: submitted jobs go into one shared queue that `workers` threads
++//! consume competitively. Fan-in: every worker reports `(index, outcome)`
++//! over a single results channel. `finish()` reassembles by submission
++//! index, so completion order never leaks into the output. Job panics are
++//! caught inside the worker — the worker survives, the job is reported as
++//! a typed error, and shutdown still joins every thread.
++
++use std::any::Any;
++use std::panic::{catch_unwind, AssertUnwindSafe};
++use std::sync::mpsc::{channel, Receiver, Sender};
++use std::sync::{Arc, Mutex};
++use std::thread::JoinHandle;
++
++#[derive(Debug, PartialEq, Eq)]
++pub enum PipeError {
++    /// The pipeline was asked for zero worker threads.
++    ZeroWorkers,
++    /// The job at `index` panicked; `message` is the stringified payload.
++    JobPanicked { index: u64, message: String },
++}
++
++pub struct Pipeline<T, R> {
++    job_tx: Option<Sender<(u64, T)>>,
++    result_rx: Receiver<(u64, Result<R, String>)>,
++    workers: Vec<JoinHandle<()>>,
++    next_index: u64,
++}
++
++impl<T: Send + 'static, R: Send + 'static> Pipeline<T, R> {
++    /// Spawn `workers` threads that run `job_fn(index, item)` for each
++    /// submitted job.
++    pub fn new<F>(workers: usize, job_fn: F) -> Result<Self, PipeError>
++    where
++        F: Fn(u64, T) -> R + Send + Sync + 'static,
++    {
++        if workers == 0 {
++            return Err(PipeError::ZeroWorkers);
++        }
++        let (job_tx, job_rx) = channel::<(u64, T)>();
++        let (result_tx, result_rx) = channel::<(u64, Result<R, String>)>();
++        let job_rx = Arc::new(Mutex::new(job_rx));
++        let job_fn = Arc::new(job_fn);
++
++        let mut handles = Vec::with_capacity(workers);
++        for _ in 0..workers {
++            let job_rx = Arc::clone(&job_rx);
++            let job_fn = Arc::clone(&job_fn);
++            let result_tx = result_tx.clone();
++            handles.push(std::thread::spawn(move || loop {
++                // Hold the queue lock only for the dequeue itself — never
++                // while running user code.
++                let job = job_rx.lock().expect("queue lock is never poisoned").recv();
++                let (index, item) = match job {
++                    Ok(job) => job,
++                    Err(_) => break, // input closed and drained: clean exit
++                };
++                let outcome = catch_unwind(AssertUnwindSafe(|| job_fn(index, item)))
++                    .map_err(panic_message);
++                if result_tx.send((index, outcome)).is_err() {
++                    break;
++                }
++            }));
++        }
++        // `result_tx` clones now live only in the workers; dropping the
++        // original lets finish() detect "all workers done" as disconnection.
++        Ok(Pipeline { job_tx: Some(job_tx), result_rx, workers: handles, next_index: 0 })
++    }
++
++    /// Queue one job; returns its submission index (0, 1, 2, ...).
++    pub fn submit(&mut self, item: T) -> u64 {
++        let index = self.next_index;
++        self.next_index += 1;
++        self.job_tx
++            .as_ref()
++            .expect("input stays open until finish()")
++            .send((index, item))
++            .expect("workers outlive the input channel");
++        index
++    }
++
++    /// Close the input, wait for every job, join every worker, and return
++    /// the results in submission order. If any jobs panicked, reports the
++    /// one with the lowest submission index.
++    pub fn finish(mut self) -> Result<Vec<R>, PipeError> {
++        // Closing the input is what lets idle workers exit their loop.
++        drop(self.job_tx.take());
++
++        let total = self.next_index as usize;
++        let mut slots: Vec<Option<Result<R, String>>> = Vec::with_capacity(total);
++        slots.resize_with(total, || None);
++        // Ends when every worker has exited and dropped its sender.
++        while let Ok((index, outcome)) = self.result_rx.recv() {
++            slots[index as usize] = Some(outcome);
++        }
++        for handle in self.workers.drain(..) {
++            handle.join().expect("workers catch job panics and never die");
++        }
++
++        let mut results = Vec::with_capacity(total);
++        for (index, slot) in slots.into_iter().enumerate() {
++            match slot.expect("every submitted job reports exactly once") {
++                Ok(value) => results.push(value),
++                Err(message) => {
++                    return Err(PipeError::JobPanicked { index: index as u64, message })
++                }
++            }
++        }
++        Ok(results)
++    }
++}
++
++/// Render a panic payload: &str and String verbatim, anything else a marker.
++fn panic_message(payload: Box<dyn Any + Send>) -> String {
++    if let Some(text) = payload.downcast_ref::<&str>() {
++        (*text).to_string()
++    } else if let Some(text) = payload.downcast_ref::<String>() {
++        text.clone()
++    } else {
++        "<non-string panic>".to_string()
++    }
++}

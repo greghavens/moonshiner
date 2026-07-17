@@ -1,0 +1,331 @@
+diff --git a/client.go b/client.go
+new file mode 100644
+index 0000000..cf72dc1
+--- /dev/null
++++ b/client.go
+@@ -0,0 +1,182 @@
++package ddmon
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++)
++
++// defaultPageSize matches the official datadog-api-client-go pager.
++const defaultPageSize = 100
++
++type Config struct {
++	BaseURL    string
++	APIKey     string
++	AppKey     string
++	PageSize   int                 // 0 -> defaultPageSize
++	MaxRetries int                 // 0 -> 2
++	Sleep      func(time.Duration) // nil -> time.Sleep
++	HTTPClient *http.Client
++}
++
++type Client struct {
++	cfg  Config
++	mu   sync.Mutex
++	wait time.Duration // pending pause from an exhausted rate-limit window
++}
++
++func NewClient(cfg Config) *Client {
++	if cfg.PageSize <= 0 {
++		cfg.PageSize = defaultPageSize
++	}
++	if cfg.MaxRetries <= 0 {
++		cfg.MaxRetries = 2
++	}
++	if cfg.Sleep == nil {
++		cfg.Sleep = time.Sleep
++	}
++	if cfg.HTTPClient == nil {
++		cfg.HTTPClient = http.DefaultClient
++	}
++	cfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/")
++	return &Client{cfg: cfg}
++}
++
++// APIError is a decoded Datadog {"errors": [...]} envelope. It never carries
++// request headers, so credentials cannot leak through error text.
++type APIError struct {
++	StatusCode int
++	Errors     []string
++}
++
++func (e *APIError) Error() string {
++	return fmt.Sprintf("datadog API error %d: %s", e.StatusCode, strings.Join(e.Errors, "; "))
++}
++
++// ListMonitors pages through GET /api/v1/monitor until a short page.
++func (c *Client) ListMonitors(ctx context.Context, f Filter) ([]Monitor, error) {
++	var all []Monitor
++	for page := 0; ; page++ {
++		q := url.Values{}
++		q.Set("page", strconv.Itoa(page))
++		q.Set("page_size", strconv.Itoa(c.cfg.PageSize))
++		if f.Name != "" {
++			q.Set("name", f.Name)
++		}
++		if len(f.MonitorTags) > 0 {
++			q.Set("monitor_tags", strings.Join(f.MonitorTags, ","))
++		}
++		data, err := c.do(ctx, http.MethodGet, "/api/v1/monitor", q, nil)
++		if err != nil {
++			return nil, err
++		}
++		var batch []Monitor
++		if err := json.Unmarshal(data, &batch); err != nil {
++			return nil, fmt.Errorf("decoding monitor page %d: %w", page, err)
++		}
++		all = append(all, batch...)
++		if len(batch) < c.cfg.PageSize {
++			return all, nil
++		}
++	}
++}
++
++func (c *Client) do(ctx context.Context, method, path string, query url.Values, body any) ([]byte, error) {
++	var payload []byte
++	if body != nil {
++		var err error
++		if payload, err = json.Marshal(body); err != nil {
++			return nil, err
++		}
++	}
++	for attempts := 1; ; attempts++ {
++		c.pauseIfThrottled()
++		target := c.cfg.BaseURL + path
++		if len(query) > 0 {
++			target += "?" + query.Encode()
++		}
++		req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(payload))
++		if err != nil {
++			return nil, err
++		}
++		req.Header.Set("DD-API-KEY", c.cfg.APIKey)
++		req.Header.Set("DD-APPLICATION-KEY", c.cfg.AppKey)
++		req.Header.Set("Accept", "application/json")
++		if body != nil {
++			req.Header.Set("Content-Type", "application/json")
++		}
++		resp, err := c.cfg.HTTPClient.Do(req)
++		if err != nil {
++			return nil, fmt.Errorf("datadog request failed: %w", err)
++		}
++		data, readErr := io.ReadAll(resp.Body)
++		resp.Body.Close()
++		if readErr != nil {
++			return nil, readErr
++		}
++		c.noteRateLimit(resp.Header)
++		if resp.StatusCode == http.StatusTooManyRequests && attempts <= c.cfg.MaxRetries {
++			c.cfg.Sleep(retryWait(resp.Header))
++			continue
++		}
++		if resp.StatusCode >= 400 {
++			return nil, &APIError{StatusCode: resp.StatusCode, Errors: decodeErrors(data)}
++		}
++		return data, nil
++	}
++}
++
++// pauseIfThrottled consumes a pending wait recorded from a response whose
++// X-RateLimit-Remaining hit 0, delaying the NEXT request by the window reset.
++func (c *Client) pauseIfThrottled() {
++	c.mu.Lock()
++	wait := c.wait
++	c.wait = 0
++	c.mu.Unlock()
++	if wait > 0 {
++		c.cfg.Sleep(wait)
++	}
++}
++
++func (c *Client) noteRateLimit(h http.Header) {
++	if h.Get("X-RateLimit-Remaining") != "0" {
++		return
++	}
++	secs, err := strconv.Atoi(h.Get("X-RateLimit-Reset"))
++	if err != nil || secs <= 0 {
++		return
++	}
++	c.mu.Lock()
++	c.wait = time.Duration(secs) * time.Second
++	c.mu.Unlock()
++}
++
++// retryWait picks the 429 backoff: Retry-After, then X-RateLimit-Reset, then 1s.
++func retryWait(h http.Header) time.Duration {
++	for _, name := range []string{"Retry-After", "X-RateLimit-Reset"} {
++		if v := h.Get(name); v != "" {
++			if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
++				return time.Duration(secs) * time.Second
++			}
++		}
++	}
++	return time.Second
++}
++
++func decodeErrors(data []byte) []string {
++	var envelope struct {
++		Errors []string `json:"errors"`
++	}
++	if err := json.Unmarshal(data, &envelope); err == nil && len(envelope.Errors) > 0 {
++		return envelope.Errors
++	}
++	return []string{strings.TrimSpace(string(data))}
++}
+diff --git a/ddmon.go b/ddmon.go
+new file mode 100644
+index 0000000..79033b1
+--- /dev/null
++++ b/ddmon.go
+@@ -0,0 +1,46 @@
++// Package ddmon inventories and reconciles Datadog monitors over the
++// documented v1 monitor operations (GET /api/v1/monitor and
++// PUT /api/v1/monitor/{monitor_id}). Monitor CRUD is a v1 surface: the v2
++// monitor namespace only holds configuration policies, notification rules,
++// and templates, so this package intentionally stays on v1.
++package ddmon
++
++import "encoding/json"
++
++// Monitor is the subset of the v1 monitor object this reconciler reads.
++// Options stays raw JSON so option keys we don't model survive round-trips.
++type Monitor struct {
++	ID              int64           `json:"id"`
++	Name            string          `json:"name"`
++	Type            string          `json:"type"`
++	Query           string          `json:"query"`
++	Message         string          `json:"message"`
++	Tags            []string        `json:"tags"`
++	Priority        *int64          `json:"priority"`
++	RestrictedRoles []string        `json:"restricted_roles"`
++	Options         json.RawMessage `json:"options"`
++}
++
++// Filter narrows the monitor list call with the documented query params.
++type Filter struct {
++	Name        string
++	MonitorTags []string
++}
++
++// Desired is the reconciler-owned projection of a monitor: query, message,
++// tags, and priority. A nil Priority means priority is unmanaged.
++type Desired struct {
++	Name     string
++	Query    string
++	Message  string
++	Tags     []string
++	Priority *int64
++}
++
++// Report summarizes one reconcile pass, in desired order.
++type Report struct {
++	Updated   []int64
++	Unchanged []int64
++	Missing   []string
++	Failed    map[int64]string
++}
+diff --git a/reconcile.go b/reconcile.go
+new file mode 100644
+index 0000000..dc8fc4e
+--- /dev/null
++++ b/reconcile.go
+@@ -0,0 +1,85 @@
++package ddmon
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"sort"
++	"strconv"
++)
++
++// Reconcile matches desired monitors to the live inventory by name and
++// updates only the fields this tool owns (query, message, tags, priority).
++// Everything else — options, restricted_roles — is echoed back verbatim so
++// an edit never resets fields owned by humans. An unrestricted monitor's
++// restricted_roles key is omitted entirely: sending null would open the
++// monitor to every user with Monitor Write.
++func (c *Client) Reconcile(ctx context.Context, f Filter, desired []Desired) (Report, error) {
++	report := Report{Failed: map[int64]string{}}
++	monitors, err := c.ListMonitors(ctx, f)
++	if err != nil {
++		return report, err
++	}
++	byName := make(map[string]*Monitor, len(monitors))
++	for i := range monitors {
++		byName[monitors[i].Name] = &monitors[i]
++	}
++	for _, d := range desired {
++		monitor, found := byName[d.Name]
++		if !found {
++			report.Missing = append(report.Missing, d.Name)
++			continue
++		}
++		if !hasDrift(monitor, d) {
++			report.Unchanged = append(report.Unchanged, monitor.ID)
++			continue
++		}
++		body := map[string]any{
++			"query":   d.Query,
++			"message": d.Message,
++			"tags":    d.Tags,
++		}
++		if d.Priority != nil {
++			body["priority"] = *d.Priority
++		}
++		if len(monitor.Options) > 0 {
++			body["options"] = json.RawMessage(monitor.Options)
++		}
++		if len(monitor.RestrictedRoles) > 0 {
++			body["restricted_roles"] = monitor.RestrictedRoles
++		}
++		path := "/api/v1/monitor/" + strconv.FormatInt(monitor.ID, 10)
++		if _, err := c.do(ctx, http.MethodPut, path, nil, body); err != nil {
++			report.Failed[monitor.ID] = err.Error()
++			continue
++		}
++		report.Updated = append(report.Updated, monitor.ID)
++	}
++	return report, nil
++}
++
++func hasDrift(m *Monitor, d Desired) bool {
++	if m.Query != d.Query || m.Message != d.Message {
++		return true
++	}
++	if d.Priority != nil && (m.Priority == nil || *m.Priority != *d.Priority) {
++		return true
++	}
++	return !sameTagSet(m.Tags, d.Tags)
++}
++
++func sameTagSet(a, b []string) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	as := append([]string(nil), a...)
++	bs := append([]string(nil), b...)
++	sort.Strings(as)
++	sort.Strings(bs)
++	for i := range as {
++		if as[i] != bs[i] {
++			return false
++		}
++	}
++	return true
++}

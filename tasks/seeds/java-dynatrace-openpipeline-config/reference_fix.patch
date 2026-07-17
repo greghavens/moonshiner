@@ -1,0 +1,248 @@
+diff --git a/PipelineReconciler.java b/PipelineReconciler.java
+new file mode 100644
+index 0000000..3b9d30e
+--- /dev/null
++++ b/PipelineReconciler.java
+@@ -0,0 +1,242 @@
++import java.net.URI;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++/**
++ * Reconciles owned OpenPipeline processors into
++ * builtin:openpipeline.*.pipelines settings objects.
++ *
++ * Owned processors (ids under the owned prefix) are replaced in place by
++ * id, owned processors absent from the desired set are removed, new owned
++ * processors are appended to the end of the processing stage, and unowned
++ * processors plus every other value field are preserved verbatim. Every
++ * write is dry-run validated (validateOnly=true) first and then applied
++ * with the object's updateToken; a 409 triggers exactly one
++ * refetch-and-retry against the fresh object state.
++ */
++public class PipelineReconciler {
++
++    private final SettingsClient client;
++    private final String ownedPrefix;
++
++    public PipelineReconciler(SettingsClient client, String ownedPrefix) {
++        this.client = client;
++        this.ownedPrefix = ownedPrefix;
++    }
++
++    public List<Map<String, Object>> reconcile(String schemaId,
++                                               List<Map<String, Object>> desiredPipelines) {
++        for (Map<String, Object> desired : desiredPipelines) {
++            for (Map<String, Object> processor : desiredProcessors(desired)) {
++                String id = (String) processor.get("id");
++                if (id == null || !id.startsWith(ownedPrefix)) {
++                    throw new IllegalArgumentException(
++                        "desired processor '" + id + "' is outside the owned prefix '"
++                        + ownedPrefix + "'");
++                }
++            }
++        }
++        List<Map<String, Object>> objects = client.listObjects(
++            schemaId, "objectId,value,scope,schemaVersion,updateToken", 100);
++        Map<String, Map<String, Object>> byCustomId = new LinkedHashMap<>();
++        for (Map<String, Object> object : objects) {
++            Object value = object.get("value");
++            if (value instanceof Map<?, ?> v && v.get("customId") instanceof String id) {
++                byCustomId.put(id, object);
++            }
++        }
++        List<Map<String, Object>> outcomes = new ArrayList<>();
++        for (Map<String, Object> desired : desiredPipelines) {
++            String customId = (String) desired.get("customId");
++            Map<String, Object> object = byCustomId.get(customId);
++            if (object == null) {
++                outcomes.add(outcome(customId, "missing", null));
++            } else {
++                outcomes.add(reconcileOne(customId, object, desiredProcessors(desired)));
++            }
++        }
++        return outcomes;
++    }
++
++    @SuppressWarnings("unchecked")
++    private static List<Map<String, Object>> desiredProcessors(Map<String, Object> desired) {
++        Object processors = desired.get("processors");
++        return processors == null ? List.of() : (List<Map<String, Object>>) processors;
++    }
++
++    @SuppressWarnings("unchecked")
++    private Map<String, Object> reconcileOne(String customId,
++                                             Map<String, Object> object,
++                                             List<Map<String, Object>> desired) {
++        String objectId = (String) object.get("objectId");
++        Map<String, Object> currentValue = (Map<String, Object>) object.get("value");
++        Map<String, Object> merged = merge(currentValue, desired);
++        if (merged.equals(currentValue)) {
++            return outcome(customId, "unchanged", objectId);
++        }
++        Map<String, Object> body = putBody(merged, object);
++        Map<String, Object> failed = writeValidated(customId, objectId, body);
++        if (failed != null) {
++            return failed;
++        }
++        return outcome(customId, "updated", objectId);
++    }
++
++    /**
++     * Validates then applies one PUT; retries once on 409 against the
++     * refetched object. Returns null on success, or the invalid/conflict
++     * outcome.
++     */
++    @SuppressWarnings("unchecked")
++    private Map<String, Object> writeValidated(String customId, String objectId,
++                                               Map<String, Object> body) {
++        Map<String, Object> invalid = validate(customId, objectId, body);
++        if (invalid != null) {
++            return invalid;
++        }
++        HttpResponse<String> applied = put(objectId, body, false);
++        if (applied.statusCode() == 409) {
++            Map<String, Object> fresh = client.getObject(objectId);
++            Map<String, Object> freshValue = (Map<String, Object>) fresh.get("value");
++            Map<String, Object> retryBody = putBody(
++                merge(freshValue, ownedOf(body)), fresh);
++            invalid = validate(customId, objectId, retryBody);
++            if (invalid != null) {
++                return invalid;
++            }
++            HttpResponse<String> retried = put(objectId, retryBody, false);
++            if (retried.statusCode() == 409) {
++                return outcome(customId, "conflict", objectId);
++            }
++            requireSuccess(retried);
++            return null;
++        }
++        requireSuccess(applied);
++        return null;
++    }
++
++    /** The desired owned processors embedded in an already-built body. */
++    @SuppressWarnings("unchecked")
++    private List<Map<String, Object>> ownedOf(Map<String, Object> body) {
++        Map<String, Object> value = (Map<String, Object>) body.get("value");
++        List<Map<String, Object>> out = new ArrayList<>();
++        Map<String, Object> processing = (Map<String, Object>) value.get("processing");
++        if (processing == null) {
++            return out;
++        }
++        for (Map<String, Object> processor
++                : (List<Map<String, Object>>) processing.get("processors")) {
++            String id = (String) processor.get("id");
++            if (id != null && id.startsWith(ownedPrefix)) {
++                out.add(processor);
++            }
++        }
++        return out;
++    }
++
++    private Map<String, Object> validate(String customId, String objectId,
++                                         Map<String, Object> body) {
++        HttpResponse<String> response = put(objectId, body, true);
++        if (response.statusCode() == 400) {
++            SettingsApiException error =
++                SettingsApiException.fromBody(400, response.body());
++            Map<String, Object> out = outcome(customId, "invalid", objectId);
++            out.put("violations", error.violations());
++            return out;
++        }
++        requireSuccess(response);
++        return null;
++    }
++
++    @SuppressWarnings("unchecked")
++    private Map<String, Object> merge(Map<String, Object> currentValue,
++                                      List<Map<String, Object>> desired) {
++        Map<String, Object> merged =
++            (Map<String, Object>) Json.parse(Json.write(currentValue));
++        Map<String, Object> processing = (Map<String, Object>) merged.get("processing");
++        if (processing == null) {
++            processing = new LinkedHashMap<>();
++            merged.put("processing", processing);
++        }
++        List<Map<String, Object>> current = processing.get("processors") == null
++            ? List.of()
++            : (List<Map<String, Object>>) processing.get("processors");
++        Map<String, Map<String, Object>> desiredById = new LinkedHashMap<>();
++        for (Map<String, Object> processor : desired) {
++            Map<String, Object> copy =
++                (Map<String, Object>) Json.parse(Json.write(processor));
++            desiredById.put((String) copy.get("id"), copy);
++        }
++        List<Map<String, Object>> result = new ArrayList<>();
++        Set<String> placed = new LinkedHashSet<>();
++        for (Map<String, Object> processor : current) {
++            String id = (String) processor.get("id");
++            if (id != null && id.startsWith(ownedPrefix)) {
++                Map<String, Object> replacement = desiredById.get(id);
++                if (replacement != null) {
++                    result.add(replacement);
++                    placed.add(id);
++                }
++                // owned but no longer desired: drop it
++            } else {
++                result.add(processor);
++            }
++        }
++        for (Map.Entry<String, Map<String, Object>> entry : desiredById.entrySet()) {
++            if (!placed.contains(entry.getKey())) {
++                result.add(entry.getValue());
++            }
++        }
++        processing.put("processors", result);
++        return merged;
++    }
++
++    private static Map<String, Object> putBody(Map<String, Object> value,
++                                               Map<String, Object> object) {
++        Map<String, Object> body = new LinkedHashMap<>();
++        body.put("value", value);
++        body.put("updateToken", object.get("updateToken"));
++        body.put("schemaVersion", object.get("schemaVersion"));
++        return body;
++    }
++
++    private static Map<String, Object> outcome(String customId, String action,
++                                               String objectId) {
++        Map<String, Object> out = new LinkedHashMap<>();
++        out.put("customId", customId);
++        out.put("action", action);
++        if (objectId != null) {
++            out.put("objectId", objectId);
++        }
++        return out;
++    }
++
++    private HttpResponse<String> put(String objectId, Map<String, Object> body,
++                                     boolean validateOnly) {
++        String url = client.baseUrl() + SettingsClient.OBJECTS_PATH + "/"
++            + SettingsClient.encode(objectId)
++            + (validateOnly ? "?validateOnly=true" : "");
++        HttpRequest request = HttpRequest.newBuilder()
++            .uri(URI.create(url))
++            .header("Authorization", "Api-Token " + client.apiToken())
++            .header("Content-Type", "application/json")
++            .PUT(HttpRequest.BodyPublishers.ofString(
++                Json.write(body), StandardCharsets.UTF_8))
++            .build();
++        return client.send(request);
++    }
++
++    private static void requireSuccess(HttpResponse<String> response) {
++        if (response.statusCode() / 100 != 2) {
++            throw SettingsApiException.fromBody(
++                response.statusCode(), response.body());
++        }
++    }
++}

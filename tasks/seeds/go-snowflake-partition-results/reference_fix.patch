@@ -1,0 +1,339 @@
+diff --git a/client.go b/client.go
+new file mode 100644
+index 0000000..87ed91a
+--- /dev/null
++++ b/client.go
+@@ -0,0 +1,131 @@
++// Package sfresults reads partitioned query results from the Snowflake SQL
++// API v2 (/api/v2/statements), preserving values exactly as string-encoded
++// by the server.
++package sfresults
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++)
++
++const statementsPath = "/api/v2/statements"
++
++// Config wires the client. NewRequestID supplies the requestId query value
++// for submissions; HTTPClient defaults to http.DefaultClient.
++type Config struct {
++	BaseURL      string
++	Token        string
++	TokenType    string
++	UserAgent    string
++	HTTPClient   *http.Client
++	NewRequestID func() string
++}
++
++// Statement is one SQL statement plus its execution context. Zero-valued
++// optional fields stay out of the request body.
++type Statement struct {
++	SQL       string
++	Timeout   int
++	Database  string
++	Schema    string
++	Warehouse string
++	Role      string
++}
++
++type Client struct {
++	cfg Config
++}
++
++func NewClient(cfg Config) *Client {
++	if cfg.HTTPClient == nil {
++		cfg.HTTPClient = http.DefaultClient
++	}
++	return &Client{cfg: cfg}
++}
++
++func (c *Client) submitURL() string {
++	q := url.Values{"requestId": {c.cfg.NewRequestID()}}
++	return c.cfg.BaseURL + statementsPath + "?" + q.Encode()
++}
++
++func (c *Client) partitionURL(handle string, partition int) string {
++	q := url.Values{"partition": {fmt.Sprint(partition)}}
++	return c.cfg.BaseURL + statementsPath + "/" + url.PathEscape(handle) + "?" + q.Encode()
++}
++
++func (st Statement) body() ([]byte, error) {
++	body := map[string]any{"statement": st.SQL}
++	if st.Timeout != 0 {
++		body["timeout"] = st.Timeout
++	}
++	if st.Database != "" {
++		body["database"] = st.Database
++	}
++	if st.Schema != "" {
++		body["schema"] = st.Schema
++	}
++	if st.Warehouse != "" {
++		body["warehouse"] = st.Warehouse
++	}
++	if st.Role != "" {
++		body["role"] = st.Role
++	}
++	return json.Marshal(body)
++}
++
++// roundTrip performs one request with the documented header set and returns
++// the status plus raw body.
++func (c *Client) roundTrip(ctx context.Context, method, rawURL string, payload []byte) (int, []byte, error) {
++	var reader io.Reader
++	if payload != nil {
++		reader = bytes.NewReader(payload)
++	}
++	req, err := http.NewRequestWithContext(ctx, method, rawURL, reader)
++	if err != nil {
++		return 0, nil, err
++	}
++	req.Header.Set("Authorization", "Bearer "+c.cfg.Token)
++	req.Header.Set("X-Snowflake-Authorization-Token-Type", c.cfg.TokenType)
++	req.Header.Set("Accept", "application/json")
++	req.Header.Set("User-Agent", c.cfg.UserAgent)
++	if payload != nil {
++		req.Header.Set("Content-Type", "application/json")
++	}
++	resp, err := c.cfg.HTTPClient.Do(req)
++	if err != nil {
++		return 0, nil, fmt.Errorf("sql api %s request failed: %w", method, err)
++	}
++	defer resp.Body.Close()
++	raw, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return 0, nil, fmt.Errorf("sql api response read failed: %w", err)
++	}
++	return resp.StatusCode, raw, nil
++}
++
++// apiError decodes an error body into an APIError, tolerating bodies that
++// carry only a message.
++func apiError(status int, raw []byte) *APIError {
++	var body struct {
++		Code            string `json:"code"`
++		SQLState        string `json:"sqlState"`
++		Message         string `json:"message"`
++		StatementHandle string `json:"statementHandle"`
++	}
++	_ = json.Unmarshal(raw, &body)
++	if body.Message == "" {
++		body.Message = "no error message in response body"
++	}
++	return &APIError{
++		Status:          status,
++		Code:            body.Code,
++		SQLState:        body.SQLState,
++		Message:         body.Message,
++		StatementHandle: body.StatementHandle,
++	}
++}
+diff --git a/errors.go b/errors.go
+new file mode 100644
+index 0000000..b07e4b6
+--- /dev/null
++++ b/errors.go
+@@ -0,0 +1,35 @@
++package sfresults
++
++import "fmt"
++
++// APIError is any SQL API failure with an HTTP identity. For 422 responses
++// the Snowflake QueryFailureStatus fields are preserved. Error text is built
++// only from response data — never from request headers, so the bearer token
++// cannot leak.
++type APIError struct {
++	Status          int
++	Code            string
++	SQLState        string
++	Message         string
++	StatementHandle string
++}
++
++func (e *APIError) Error() string {
++	if e.Code != "" {
++		return fmt.Sprintf("sql api HTTP %d (code %s, sqlState %s): %s",
++			e.Status, e.Code, e.SQLState, e.Message)
++	}
++	return fmt.Sprintf("sql api HTTP %d: %s", e.Status, e.Message)
++}
++
++// HandleExpiredError reports a 404 from the statements endpoint: the handle
++// is unknown or its results have expired. The read stops immediately.
++type HandleExpiredError struct {
++	StatementHandle string
++	Partition       int
++}
++
++func (e *HandleExpiredError) Error() string {
++	return fmt.Sprintf("statement handle %s is unknown or expired (fetching partition %d)",
++		e.StatementHandle, e.Partition)
++}
+diff --git a/reader.go b/reader.go
+new file mode 100644
+index 0000000..a1212bd
+--- /dev/null
++++ b/reader.go
+@@ -0,0 +1,155 @@
++package sfresults
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++)
++
++// Column mirrors one rowType entry.
++type Column struct {
++	Name      string
++	Type      string
++	Precision int
++	Scale     int
++	Nullable  bool
++}
++
++// PartitionInfo mirrors one partitionInfo entry.
++type PartitionInfo struct {
++	RowCount         int
++	UncompressedSize int64
++	CompressedSize   int64
++}
++
++// Value is one cell: the exact string the server sent, or SQL NULL.
++type Value struct {
++	Valid bool
++	Raw   string
++}
++
++// ResultSet is a fully assembled result: metadata plus every partition's
++// rows concatenated in partition order.
++type ResultSet struct {
++	StatementHandle string
++	NumRows         int64
++	Columns         []Column
++	Partitions      []PartitionInfo
++	Rows            [][]Value
++}
++
++type submitResponse struct {
++	Code              string `json:"code"`
++	SQLState          string `json:"sqlState"`
++	Message           string `json:"message"`
++	StatementHandle   string `json:"statementHandle"`
++	ResultSetMetaData struct {
++		NumRows int64 `json:"numRows"`
++		RowType []struct {
++			Name      string `json:"name"`
++			Type      string `json:"type"`
++			Precision int    `json:"precision"`
++			Scale     int    `json:"scale"`
++			Nullable  bool   `json:"nullable"`
++		} `json:"rowType"`
++		PartitionInfo []struct {
++			RowCount         int   `json:"rowCount"`
++			UncompressedSize int64 `json:"uncompressedSize"`
++			CompressedSize   int64 `json:"compressedSize"`
++		} `json:"partitionInfo"`
++	} `json:"resultSetMetaData"`
++	Data [][]*string `json:"data"`
++}
++
++type partitionResponse struct {
++	Data [][]*string `json:"data"`
++}
++
++func toValues(data [][]*string) [][]Value {
++	rows := make([][]Value, len(data))
++	for i, row := range data {
++		cells := make([]Value, len(row))
++		for j, cell := range row {
++			if cell != nil {
++				cells[j] = Value{Valid: true, Raw: *cell}
++			}
++		}
++		rows[i] = cells
++	}
++	return rows
++}
++
++// ReadAll submits the statement and retrieves every partition. The inline
++// data of the 200 response is partition 0; partitions 1..N-1 are fetched
++// strictly in ascending order, each row count validated against
++// partitionInfo, and the grand total against numRows.
++func (c *Client) ReadAll(ctx context.Context, st Statement) (*ResultSet, error) {
++	payload, err := st.body()
++	if err != nil {
++		return nil, err
++	}
++	status, raw, err := c.roundTrip(ctx, http.MethodPost, c.submitURL(), payload)
++	if err != nil {
++		return nil, err
++	}
++	if status != http.StatusOK {
++		return nil, apiError(status, raw)
++	}
++	var submit submitResponse
++	if err := json.Unmarshal(raw, &submit); err != nil {
++		return nil, fmt.Errorf("unparseable ResultSet body: %w", err)
++	}
++
++	rs := &ResultSet{
++		StatementHandle: submit.StatementHandle,
++		NumRows:         submit.ResultSetMetaData.NumRows,
++	}
++	for _, rt := range submit.ResultSetMetaData.RowType {
++		rs.Columns = append(rs.Columns, Column(rt))
++	}
++	for _, pi := range submit.ResultSetMetaData.PartitionInfo {
++		rs.Partitions = append(rs.Partitions, PartitionInfo(pi))
++	}
++
++	rows := toValues(submit.Data)
++	if len(rs.Partitions) > 0 && len(rows) != rs.Partitions[0].RowCount {
++		return nil, fmt.Errorf("partition 0 returned %d rows, partitionInfo promised %d",
++			len(rows), rs.Partitions[0].RowCount)
++	}
++	for i := 1; i < len(rs.Partitions); i++ {
++		batch, err := c.fetchPartition(ctx, rs.StatementHandle, i)
++		if err != nil {
++			return nil, err
++		}
++		if len(batch) != rs.Partitions[i].RowCount {
++			return nil, fmt.Errorf("partition %d returned %d rows, partitionInfo promised %d",
++				i, len(batch), rs.Partitions[i].RowCount)
++		}
++		rows = append(rows, batch...)
++	}
++	if int64(len(rows)) != rs.NumRows {
++		return nil, fmt.Errorf("assembled %d rows, result set promised %d", len(rows), rs.NumRows)
++	}
++	rs.Rows = rows
++	return rs, nil
++}
++
++func (c *Client) fetchPartition(ctx context.Context, handle string, partition int) ([][]Value, error) {
++	status, raw, err := c.roundTrip(ctx, http.MethodGet, c.partitionURL(handle, partition), nil)
++	if err != nil {
++		return nil, err
++	}
++	switch status {
++	case http.StatusOK:
++		var body partitionResponse
++		if err := json.Unmarshal(raw, &body); err != nil {
++			return nil, fmt.Errorf("unparseable partition %d body: %w", partition, err)
++		}
++		return toValues(body.Data), nil
++	case http.StatusNotFound:
++		return nil, &HandleExpiredError{StatementHandle: handle, Partition: partition}
++	default:
++		return nil, apiError(status, raw)
++	}
++}

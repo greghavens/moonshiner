@@ -1,0 +1,397 @@
+diff --git a/src/SloApiUrls.cs b/src/SloApiUrls.cs
+new file mode 100644
+index 0000000..ed9b3c7
+--- /dev/null
++++ b/src/SloApiUrls.cs
+@@ -0,0 +1,23 @@
++namespace Acme.Dynatrace.Slo;
++
++/// <summary>
++/// The two Dynatrace SLO URL families. The latest SLO service is a
++/// platform API on the apps.dynatrace.com host; classic SLOs are the
++/// older environment API on live.dynatrace.com.
++/// </summary>
++public static class SloApiUrls
++{
++    public const string LatestBasePath = "/platform/slo/v1/slos";
++    public const string ClassicBasePath = "/api/v2/slo";
++
++    public static string Latest(string environmentId) =>
++        $"https://{environmentId}.apps.dynatrace.com{LatestBasePath}";
++
++    public static string Classic(string environmentId) =>
++        $"https://{environmentId}.live.dynatrace.com{ClassicBasePath}";
++
++    /// <summary>True when a configured URL points at the classic API.</summary>
++    public static bool IsClassic(Uri url) =>
++        url.Host.EndsWith(".live.dynatrace.com", StringComparison.OrdinalIgnoreCase)
++        || url.AbsolutePath.Contains(ClassicBasePath, StringComparison.OrdinalIgnoreCase);
++}
+diff --git a/src/SloClient.cs b/src/SloClient.cs
+new file mode 100644
+index 0000000..144278f
+--- /dev/null
++++ b/src/SloClient.cs
+@@ -0,0 +1,317 @@
++using System.Net.Http.Headers;
++using System.Text;
++using System.Text.Json;
++using System.Text.Json.Nodes;
++
++namespace Acme.Dynatrace.Slo;
++
++/// <summary>
++/// Client for the latest Dynatrace SLO service (/platform/slo/v1/slos on
++/// the apps.dynatrace.com platform host, OAuth bearer auth). Updates use
++/// the optimistic-locking-version query parameter sourced from the
++/// immediately preceding GET; evaluations follow the asynchronous
++/// evaluation:start / evaluation:poll flow.
++/// </summary>
++public sealed class SloClient
++{
++    const string BasePath = SloApiUrls.LatestBasePath;
++    const int ListPageSize = 200;
++
++    readonly HttpClient _http;
++    readonly string _baseUrl;
++    readonly string _bearerToken;
++    readonly Func<TimeSpan, Task> _delay;
++
++    public SloClient(
++        string environmentUrl,
++        string bearerToken,
++        HttpMessageHandler handler,
++        Func<TimeSpan, Task>? delay = null)
++    {
++        var parsed = new Uri(environmentUrl);
++        if (SloApiUrls.IsClassic(parsed))
++        {
++            throw new ArgumentException(
++                $"'{parsed.Host}{parsed.AbsolutePath}' points at the classic SLO API; " +
++                $"the latest SLO service is served from " +
++                $"https://{{environment-id}}.apps.dynatrace.com{SloApiUrls.LatestBasePath}",
++                nameof(environmentUrl));
++        }
++        _baseUrl = environmentUrl.TrimEnd('/');
++        _bearerToken = bearerToken;
++        _delay = delay ?? (_ => Task.CompletedTask);
++        _http = new HttpClient(handler, disposeHandler: false);
++    }
++
++    public async Task<SloRecord> CreateOrUpdateAsync(SloDefinition definition)
++    {
++        var existingId = await FindIdByNameAsync(definition.Name);
++        var body = Serialize(definition);
++        if (existingId is null)
++        {
++            var (status, text) = await SendAsync(HttpMethod.Post, BasePath, body);
++            if (status != 201)
++            {
++                throw ApiError(status, text);
++            }
++            return ParseRecord(text);
++        }
++        return await UpdateAsync(existingId, body);
++    }
++
++    async Task<SloRecord> UpdateAsync(string id, JsonObject body)
++    {
++        var version = await FetchVersionAsync(id);
++        var (status, text) = await PutAsync(id, version, body);
++        if (status == 409)
++        {
++            // Concurrent edit: fetch the fresh version and retry exactly once.
++            version = await FetchVersionAsync(id);
++            (status, text) = await PutAsync(id, version, body);
++            if (status == 409)
++            {
++                throw new SloConflictException(id);
++            }
++        }
++        EnsureSuccess(status, text);
++        return ParseRecord(text);
++    }
++
++    async Task<(int Status, string Text)> PutAsync(string id, string version, JsonObject body)
++    {
++        var path = $"{BasePath}/{Uri.EscapeDataString(id)}" +
++            $"?optimistic-locking-version={Uri.EscapeDataString(version)}";
++        return await SendAsync(HttpMethod.Put, path, body);
++    }
++
++    async Task<string> FetchVersionAsync(string id)
++    {
++        var (status, text) = await SendAsync(
++            HttpMethod.Get, $"{BasePath}/{Uri.EscapeDataString(id)}");
++        EnsureSuccess(status, text);
++        using var doc = JsonDocument.Parse(text);
++        return doc.RootElement.GetProperty("version").GetString()
++            ?? throw ApiError(status, text);
++    }
++
++    async Task<string?> FindIdByNameAsync(string name)
++    {
++        var path = $"{BasePath}?page-size={ListPageSize}";
++        while (true)
++        {
++            var (status, text) = await SendAsync(HttpMethod.Get, path);
++            EnsureSuccess(status, text);
++            using var doc = JsonDocument.Parse(text);
++            if (doc.RootElement.TryGetProperty("slos", out var slos))
++            {
++                foreach (var slo in slos.EnumerateArray())
++                {
++                    if (slo.GetProperty("name").GetString() == name)
++                    {
++                        return slo.GetProperty("id").GetString();
++                    }
++                }
++            }
++            if (!doc.RootElement.TryGetProperty("nextPageKey", out var next)
++                || next.ValueKind != JsonValueKind.String)
++            {
++                return null;
++            }
++            // Follow-up pages carry the cursor and nothing else.
++            path = $"{BasePath}?page-key={Uri.EscapeDataString(next.GetString()!)}";
++        }
++    }
++
++    public async Task<EvaluationReport> EvaluateAsync(
++        string sloId, TimeSpan pollInterval, int maxPolls)
++    {
++        var start = new JsonObject { ["id"] = sloId };
++        var (status, text) = await SendAsync(
++            HttpMethod.Post, $"{BasePath}/evaluation:start", start);
++        EnsureSuccess(status, text);
++        var (entries, token) = ParseEvaluation(text);
++
++        var polls = 0;
++        while (IsPending(entries, token))
++        {
++            if (token is null)
++            {
++                throw ApiError(status, "evaluation pending but no evaluationToken returned");
++            }
++            if (polls >= maxPolls)
++            {
++                throw new SloEvaluationTimeoutException(token, polls);
++            }
++            polls++;
++            await _delay(pollInterval);
++            (status, text) = await SendAsync(HttpMethod.Get,
++                $"{BasePath}/evaluation:poll?evaluation-token={Uri.EscapeDataString(token)}");
++            EnsureSuccess(status, text);
++            string? freshToken;
++            (entries, freshToken) = ParseEvaluation(text);
++            token = freshToken ?? token;
++        }
++        return Normalize(sloId, entries);
++    }
++
++    static bool IsPending(IReadOnlyList<RawResult> entries, string? token) =>
++        (entries.Count == 0 && token is not null)
++        || entries.Any(e => e.Status == "PENDING");
++
++    sealed record RawResult(
++        string Criteria, string Status, double? Value, double? ErrorBudget, string? Message);
++
++    static (IReadOnlyList<RawResult>, string?) ParseEvaluation(string text)
++    {
++        using var doc = JsonDocument.Parse(text);
++        var root = doc.RootElement;
++        string? token = null;
++        if (root.TryGetProperty("evaluationToken", out var t)
++            && t.ValueKind == JsonValueKind.String)
++        {
++            token = t.GetString();
++        }
++        var entries = new List<RawResult>();
++        if (root.TryGetProperty("evaluationResults", out var results))
++        {
++            foreach (var row in results.EnumerateArray())
++            {
++                entries.Add(new RawResult(
++                    row.GetProperty("criteria").GetString()!,
++                    row.GetProperty("status").GetString()!,
++                    OptionalDouble(row, "value"),
++                    OptionalDouble(row, "errorBudget"),
++                    row.TryGetProperty("message", out var m) ? m.GetString() : null));
++            }
++        }
++        return (entries, token);
++    }
++
++    static double? OptionalDouble(JsonElement row, string name) =>
++        row.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Number
++            ? value.GetDouble()
++            : null;
++
++    static EvaluationReport Normalize(string sloId, IReadOnlyList<RawResult> raw)
++    {
++        var entries = raw
++            .OrderBy(e => e.Criteria, StringComparer.Ordinal)
++            .Select(e => new EvaluationEntry(
++                e.Criteria, ParseStatus(e.Status), e.Value, e.ErrorBudget, e.Message))
++            .ToArray();
++        var overall = SloStatus.Success;
++        foreach (var entry in entries)
++        {
++            if (Severity(entry.Status) > Severity(overall))
++            {
++                overall = entry.Status;
++            }
++        }
++        return new EvaluationReport(sloId, entries, overall);
++    }
++
++    static int Severity(SloStatus status) => status switch
++    {
++        SloStatus.Failure => 3,
++        SloStatus.Warning => 2,
++        SloStatus.Pending => 1,
++        _ => 0,
++    };
++
++    static SloStatus ParseStatus(string status) => status switch
++    {
++        "SUCCESS" => SloStatus.Success,
++        "WARNING" => SloStatus.Warning,
++        "FAILURE" => SloStatus.Failure,
++        "PENDING" => SloStatus.Pending,
++        _ => throw new FormatException($"unknown SLO evaluation status '{status}'"),
++    };
++
++    static JsonObject Serialize(SloDefinition definition)
++    {
++        var criteria = new JsonArray();
++        foreach (var c in definition.Criteria)
++        {
++            var row = new JsonObject { ["timeframeFrom"] = c.TimeframeFrom };
++            if (c.TimeframeTo is not null)
++            {
++                row["timeframeTo"] = c.TimeframeTo;
++            }
++            row["target"] = c.Target;
++            if (c.Warning is not null)
++            {
++                row["warning"] = c.Warning;
++            }
++            criteria.Add(row);
++        }
++        var body = new JsonObject { ["name"] = definition.Name };
++        if (definition.Description is not null)
++        {
++            body["description"] = definition.Description;
++        }
++        body["customSli"] = new JsonObject { ["indicator"] = definition.CustomSliIndicator };
++        body["criteria"] = criteria;
++        if (definition.Tags.Count > 0)
++        {
++            body["tags"] = new JsonArray(definition.Tags.Select(t => JsonValue.Create(t)).ToArray());
++        }
++        if (definition.ExternalId is not null)
++        {
++            body["externalId"] = definition.ExternalId;
++        }
++        return body;
++    }
++
++    static SloRecord ParseRecord(string text)
++    {
++        using var doc = JsonDocument.Parse(text);
++        var root = doc.RootElement;
++        return new SloRecord(
++            root.GetProperty("id").GetString()!,
++            root.GetProperty("name").GetString()!,
++            root.GetProperty("version").GetString()!);
++    }
++
++    async Task<(int Status, string Text)> SendAsync(
++        HttpMethod method, string pathAndQuery, JsonObject? body = null)
++    {
++        using var request = new HttpRequestMessage(method, _baseUrl + pathAndQuery);
++        request.Headers.Authorization =
++            new AuthenticationHeaderValue("Bearer", _bearerToken);
++        if (body is not null)
++        {
++            request.Content = new StringContent(
++                body.ToJsonString(), Encoding.UTF8, "application/json");
++        }
++        using var response = await _http.SendAsync(request);
++        var text = await response.Content.ReadAsStringAsync();
++        return ((int)response.StatusCode, text);
++    }
++
++    void EnsureSuccess(int status, string text)
++    {
++        if (status is < 200 or >= 300)
++        {
++            throw ApiError(status, text);
++        }
++    }
++
++    static SloApiException ApiError(int status, string text)
++    {
++        var message = text;
++        try
++        {
++            using var doc = JsonDocument.Parse(text);
++            if (doc.RootElement.TryGetProperty("error", out var error)
++                && error.TryGetProperty("message", out var m))
++            {
++                message = m.GetString() ?? text;
++            }
++        }
++        catch (JsonException)
++        {
++            // non-JSON error body: keep the raw text
++        }
++        return new SloApiException(status, message);
++    }
++}
+diff --git a/src/SloExceptions.cs b/src/SloExceptions.cs
+new file mode 100644
+index 0000000..bb6937f
+--- /dev/null
++++ b/src/SloExceptions.cs
+@@ -0,0 +1,39 @@
++namespace Acme.Dynatrace.Slo;
++
++/// <summary>A non-2xx platform response, decoded from the error envelope.</summary>
++public class SloApiException : Exception
++{
++    public int Status { get; }
++
++    public SloApiException(int status, string message)
++        : base($"Dynatrace SLO API error {status}: {message}")
++    {
++        Status = status;
++    }
++}
++
++/// <summary>
++/// The optimistic-locking retry also hit a concurrent modification.
++/// </summary>
++public sealed class SloConflictException : Exception
++{
++    public string SloId { get; }
++
++    public SloConflictException(string sloId)
++        : base($"SLO {sloId} was modified concurrently twice; giving up after one retry")
++    {
++        SloId = sloId;
++    }
++}
++
++/// <summary>An evaluation stayed pending past maxPolls.</summary>
++public sealed class SloEvaluationTimeoutException : Exception
++{
++    public string EvaluationToken { get; }
++
++    public SloEvaluationTimeoutException(string evaluationToken, int polls)
++        : base($"SLO evaluation still pending after {polls} polls")
++    {
++        EvaluationToken = evaluationToken;
++    }
++}

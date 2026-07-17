@@ -1,0 +1,223 @@
+diff --git a/freshness.ts b/freshness.ts
+new file mode 100644
+index 0000000..e16730b
+--- /dev/null
++++ b/freshness.ts
+@@ -0,0 +1,217 @@
++// HTTP caching decision tables: Cache-Control parsing, freshness lifetime,
++// age accounting, cached-entry evaluation, and conditional-request evaluation.
++// Pure functions over plain data — every clock is a parameter.
++
++export interface CacheControl {
++  maxAge: number | null;
++  sMaxage: number | null;
++  noCache: boolean;
++  noStore: boolean;
++  public: boolean;
++  private: boolean;
++  mustRevalidate: boolean;
++  immutable: boolean;
++  extensions: Record<string, string | true>;
++}
++
++export interface StoredResponse {
++  status: number;
++  headers: Record<string, string>;
++  /** When this response entered the cache (ms since epoch). */
++  storedAtMs: number;
++}
++
++export interface FreshnessOptions {
++  shared?: boolean;
++  /** Fraction of (Date - Last-Modified) used for heuristic freshness. Default 0.10. */
++  heuristicFraction?: number;
++}
++
++export type CacheDecision =
++  | { action: 'serve' }
++  | { action: 'revalidate'; conditionalHeaders: Record<string, string> }
++  | { action: 'fetch' };
++
++export interface ConditionalResult {
++  status: 200 | 304 | 412;
++}
++
++const HEURISTIC_STATUSES = new Set([200, 203, 301, 404, 410]);
++const DAY_MS = 24 * 60 * 60 * 1000;
++
++const SECONDS_DIRECTIVES: Record<string, 'maxAge' | 'sMaxage'> = {
++  'max-age': 'maxAge',
++  's-maxage': 'sMaxage',
++};
++
++const FLAG_DIRECTIVES: Record<string, 'noCache' | 'noStore' | 'public' | 'private' | 'mustRevalidate' | 'immutable'> = {
++  'no-cache': 'noCache',
++  'no-store': 'noStore',
++  public: 'public',
++  private: 'private',
++  'must-revalidate': 'mustRevalidate',
++  immutable: 'immutable',
++};
++
++function parseHttpDate(value: string | undefined): number | null {
++  if (value === undefined) return null;
++  const t = Date.parse(value);
++  return Number.isNaN(t) ? null : t;
++}
++
++export function parseCacheControl(value?: string): CacheControl {
++  const cc: CacheControl = {
++    maxAge: null,
++    sMaxage: null,
++    noCache: false,
++    noStore: false,
++    public: false,
++    private: false,
++    mustRevalidate: false,
++    immutable: false,
++    extensions: {},
++  };
++  if (!value) return cc;
++  const seen = new Set<string>();
++  for (const rawPart of value.split(',')) {
++    const part = rawPart.trim();
++    if (!part) continue;
++    const eq = part.indexOf('=');
++    const name = (eq === -1 ? part : part.slice(0, eq)).trim().toLowerCase();
++    if (!name || seen.has(name)) continue; // first occurrence wins
++    seen.add(name);
++    let val: string | null = eq === -1 ? null : part.slice(eq + 1).trim();
++    if (val !== null && val.length >= 2 && val.startsWith('"') && val.endsWith('"')) {
++      val = val.slice(1, -1);
++    }
++    if (name in SECONDS_DIRECTIVES) {
++      if (val !== null && /^\d+$/.test(val)) cc[SECONDS_DIRECTIVES[name]] = parseInt(val, 10);
++      continue; // malformed seconds → directive dropped
++    }
++    if (name in FLAG_DIRECTIVES) {
++      cc[FLAG_DIRECTIVES[name]] = true;
++      continue;
++    }
++    cc.extensions[name] = val === null ? true : val;
++  }
++  return cc;
++}
++
++export function freshnessLifetimeMs(resp: StoredResponse, opts: FreshnessOptions = {}): number {
++  const cc = parseCacheControl(resp.headers['cache-control']);
++  if (opts.shared && cc.sMaxage !== null) return cc.sMaxage * 1000;
++  if (cc.maxAge !== null) return cc.maxAge * 1000;
++
++  const dateValue = parseHttpDate(resp.headers['date']) ?? resp.storedAtMs;
++  if (resp.headers['expires'] !== undefined) {
++    const expires = parseHttpDate(resp.headers['expires']);
++    if (expires === null) return 0; // unparseable Expires means already stale
++    return Math.max(0, expires - dateValue);
++  }
++
++  const lastModified = parseHttpDate(resp.headers['last-modified']);
++  if (lastModified !== null && HEURISTIC_STATUSES.has(resp.status)) {
++    const fraction = opts.heuristicFraction ?? 0.1;
++    const heuristic = Math.max(0, (dateValue - lastModified) * fraction);
++    return Math.min(heuristic, DAY_MS);
++  }
++  return 0;
++}
++
++export function currentAgeMs(resp: StoredResponse, nowMs: number): number {
++  const dateValue = parseHttpDate(resp.headers['date']) ?? resp.storedAtMs;
++  const apparentAge = Math.max(0, resp.storedAtMs - dateValue);
++  let correctedAge = apparentAge;
++  const ageHeader = resp.headers['age'];
++  if (ageHeader !== undefined && /^\d+$/.test(ageHeader.trim())) {
++    correctedAge = Math.max(correctedAge, parseInt(ageHeader.trim(), 10) * 1000);
++  }
++  return correctedAge + (nowMs - resp.storedAtMs);
++}
++
++export function evaluateCached(
++  resp: StoredResponse,
++  requestHeaders: Record<string, string>,
++  nowMs: number,
++  opts: FreshnessOptions = {},
++): CacheDecision {
++  const respCC = parseCacheControl(resp.headers['cache-control']);
++  const reqCC = parseCacheControl(requestHeaders['cache-control']);
++
++  const etag = resp.headers['etag'];
++  const lastModified = resp.headers['last-modified'];
++  const lastModifiedOk = lastModified !== undefined && parseHttpDate(lastModified) !== null;
++
++  const revalidateOrFetch = (): CacheDecision => {
++    if (etag === undefined && !lastModifiedOk) return { action: 'fetch' };
++    const conditionalHeaders: Record<string, string> = {};
++    if (etag !== undefined) conditionalHeaders['if-none-match'] = etag;
++    if (lastModifiedOk) conditionalHeaders['if-modified-since'] = lastModified;
++    return { action: 'revalidate', conditionalHeaders };
++  };
++
++  if (respCC.noStore || reqCC.noStore) return { action: 'fetch' };
++  if (opts.shared && respCC.private) return { action: 'fetch' };
++  if (respCC.noCache || reqCC.noCache) return revalidateOrFetch();
++
++  const lifetime = freshnessLifetimeMs(resp, opts);
++  const age = currentAgeMs(resp, nowMs);
++  if (lifetime > age) return { action: 'serve' };
++  return revalidateOrFetch();
++}
++
++/** Split an If-None-Match list on commas that sit outside quoted etags. */
++function splitETagList(value: string): string[] {
++  const tags: string[] = [];
++  let current = '';
++  let inQuotes = false;
++  for (const ch of value) {
++    if (ch === '"') {
++      inQuotes = !inQuotes;
++      current += ch;
++    } else if (ch === ',' && !inQuotes) {
++      if (current.trim()) tags.push(current.trim());
++      current = '';
++    } else {
++      current += ch;
++    }
++  }
++  if (current.trim()) tags.push(current.trim());
++  return tags;
++}
++
++/** Weak comparison: strip a W/ prefix from either side. */
++function opaqueTag(tag: string): string {
++  return tag.startsWith('W/') ? tag.slice(2) : tag;
++}
++
++export function evaluateConditional(
++  requestHeaders: Record<string, string>,
++  current: { etag?: string; lastModifiedMs?: number },
++  method: string = 'GET',
++): ConditionalResult {
++  const upper = method.toUpperCase();
++  const isRead = upper === 'GET' || upper === 'HEAD';
++
++  const inm = requestHeaders['if-none-match'];
++  if (inm !== undefined) {
++    // If-None-Match is authoritative: If-Modified-Since is ignored entirely.
++    const trimmed = inm.trim();
++    let matched = false;
++    if (trimmed === '*') {
++      matched = current.etag !== undefined;
++    } else if (current.etag !== undefined) {
++      const target = opaqueTag(current.etag.trim());
++      matched = splitETagList(trimmed).some((tag) => opaqueTag(tag) === target);
++    }
++    if (matched) return { status: isRead ? 304 : 412 };
++    return { status: 200 };
++  }
++
++  const ims = requestHeaders['if-modified-since'];
++  if (ims !== undefined && isRead && current.lastModifiedMs !== undefined) {
++    const imsTime = parseHttpDate(ims);
++    if (imsTime !== null && current.lastModifiedMs <= imsTime) return { status: 304 };
++  }
++  return { status: 200 };
++}

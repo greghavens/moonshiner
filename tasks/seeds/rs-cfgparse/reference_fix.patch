@@ -1,0 +1,468 @@
+diff --git a/src/lib.rs b/src/lib.rs
+new file mode 100644
+index 0000000..74d9000
+--- /dev/null
++++ b/src/lib.rs
+@@ -0,0 +1,462 @@
++//! Two-layer INI-ish config loader with positioned, typed errors.
++//!
++//! Layer 1 ([`RawConfig::parse`]) turns text into sections of raw string
++//! values, each tagged with its 1-based (line, col). Layer 2
++//! ([`load_server_config`]) hand-extracts the `[server]` section into a
++//! typed [`ServerConfig`], reporting every problem as a structured error
++//! that always carries a position. No serde, no dependencies — the
++//! extraction layer is plain `?` over `From` conversions.
++
++use std::collections::BTreeMap;
++use std::fmt;
++
++const BLANK: &[char] = &[' ', '\t'];
++
++fn is_blank(c: char) -> bool {
++    c == ' ' || c == '\t'
++}
++
++// ------------------------------------------------------------ parse layer
++
++/// A raw value with the position of its first character.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct RawValue {
++    pub text: String,
++    pub line: usize,
++    pub col: usize,
++}
++
++#[derive(Debug, Clone)]
++struct Section {
++    line: usize,
++    col: usize,
++    values: BTreeMap<String, RawValue>,
++}
++
++/// Parsed-but-untyped config: sections of key → positioned raw value.
++#[derive(Debug, Clone, Default)]
++pub struct RawConfig {
++    sections: BTreeMap<String, Section>,
++}
++
++/// What went wrong at the text level.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum ParseKind {
++    /// Not a header, comment, blank, or key=value line (or the key is empty).
++    BadLine,
++    /// A `[` header with no closing `]`.
++    UnclosedSection,
++    /// Non-blank characters after a header's `]`.
++    TrailingChars,
++    /// `key =` with nothing after the `=`.
++    MissingValue,
++    /// The same key twice in one section (position = second occurrence).
++    DuplicateKey(String),
++    /// A key=value line before any section header.
++    KeyOutsideSection,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct ParseError {
++    pub line: usize,
++    pub col: usize,
++    pub kind: ParseKind,
++}
++
++impl fmt::Display for ParseError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "line {}, col {}: ", self.line, self.col)?;
++        match &self.kind {
++            ParseKind::BadLine => write!(f, "malformed line"),
++            ParseKind::UnclosedSection => write!(f, "unclosed section header"),
++            ParseKind::TrailingChars => {
++                write!(f, "unexpected characters after section header")
++            }
++            ParseKind::MissingValue => write!(f, "missing value"),
++            ParseKind::DuplicateKey(key) => write!(f, "duplicate key \"{key}\""),
++            ParseKind::KeyOutsideSection => write!(f, "key outside any section"),
++        }
++    }
++}
++
++impl std::error::Error for ParseError {}
++
++impl RawConfig {
++    /// Parse the INI-ish format. Columns are 1-based and count characters
++    /// (a tab is one column). Lines may end in `\r\n`.
++    pub fn parse(src: &str) -> Result<RawConfig, ParseError> {
++        let mut config = RawConfig::default();
++        let mut current: Option<String> = None;
++
++        for (i, raw_line) in src.split('\n').enumerate() {
++            let line_no = i + 1;
++            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
++            let chars: Vec<char> = line.chars().collect();
++
++            let first = match chars.iter().position(|&c| !is_blank(c)) {
++                None => continue, // blank line
++                Some(idx) => idx,
++            };
++            let first_col = first + 1;
++
++            match chars[first] {
++                '#' => continue, // comment line
++                '[' => {
++                    let close = match chars.iter().position(|&c| c == ']') {
++                        None => {
++                            return Err(ParseError {
++                                line: line_no,
++                                col: first_col,
++                                kind: ParseKind::UnclosedSection,
++                            })
++                        }
++                        Some(idx) => idx,
++                    };
++                    let name: String = chars[first + 1..close].iter().collect();
++                    let name = name.trim_matches(BLANK).to_string();
++                    if name.is_empty() {
++                        return Err(ParseError {
++                            line: line_no,
++                            col: first_col,
++                            kind: ParseKind::BadLine,
++                        });
++                    }
++                    if let Some(extra) = chars[close + 1..].iter().position(|&c| !is_blank(c)) {
++                        return Err(ParseError {
++                            line: line_no,
++                            col: close + 1 + extra + 1,
++                            kind: ParseKind::TrailingChars,
++                        });
++                    }
++                    // reopening a section accumulates keys; the header
++                    // position stays at the first opening
++                    config.sections.entry(name.clone()).or_insert(Section {
++                        line: line_no,
++                        col: first_col,
++                        values: BTreeMap::new(),
++                    });
++                    current = Some(name);
++                }
++                _ => {
++                    let eq = match chars.iter().position(|&c| c == '=') {
++                        None => {
++                            return Err(ParseError {
++                                line: line_no,
++                                col: first_col,
++                                kind: ParseKind::BadLine,
++                            })
++                        }
++                        Some(idx) => idx,
++                    };
++                    let key: String = chars[first..eq.max(first)].iter().collect();
++                    let key = key.trim_matches(BLANK).to_string();
++                    if key.is_empty() {
++                        return Err(ParseError {
++                            line: line_no,
++                            col: first_col,
++                            kind: ParseKind::BadLine,
++                        });
++                    }
++                    let section_name = match &current {
++                        None => {
++                            return Err(ParseError {
++                                line: line_no,
++                                col: first_col,
++                                kind: ParseKind::KeyOutsideSection,
++                            })
++                        }
++                        Some(name) => name.clone(),
++                    };
++                    let value_off = chars[eq + 1..].iter().position(|&c| !is_blank(c));
++                    let value_off = match value_off {
++                        None => {
++                            return Err(ParseError {
++                                line: line_no,
++                                col: eq + 1, // 1-based col of '='
++                                kind: ParseKind::MissingValue,
++                            })
++                        }
++                        Some(off) => off,
++                    };
++                    let text: String = chars[eq + 1..].iter().collect();
++                    let text = text.trim_matches(BLANK).to_string();
++                    let value = RawValue {
++                        text,
++                        line: line_no,
++                        col: eq + 1 + value_off + 1,
++                    };
++                    let section = config
++                        .sections
++                        .get_mut(&section_name)
++                        .expect("current section exists");
++                    if section.values.contains_key(&key) {
++                        return Err(ParseError {
++                            line: line_no,
++                            col: first_col,
++                            kind: ParseKind::DuplicateKey(key),
++                        });
++                    }
++                    section.values.insert(key, value);
++                }
++            }
++        }
++        Ok(config)
++    }
++
++    /// Look up a raw value.
++    pub fn get(&self, section: &str, key: &str) -> Option<&RawValue> {
++        self.sections.get(section)?.values.get(key)
++    }
++
++    /// Position of a section's `[` in its (first) header line.
++    pub fn section_pos(&self, name: &str) -> Option<(usize, usize)> {
++        self.sections.get(name).map(|s| (s.line, s.col))
++    }
++}
++
++// ------------------------------------------------------------ field layer
++
++/// What went wrong with one typed field.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum FieldKind {
++    /// A required key is absent (position = the section header, or (1,1)
++    /// when the whole section is missing).
++    Missing,
++    /// The raw text does not have the expected shape at all.
++    WrongType {
++        expected: &'static str,
++        got: String,
++    },
++    /// The shape was right but the value is unacceptable.
++    BadValue(String),
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct FieldError {
++    pub line: usize,
++    pub col: usize,
++    pub section: String,
++    pub key: String,
++    pub kind: FieldKind,
++}
++
++impl fmt::Display for FieldError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(
++            f,
++            "line {}, col {}: {}.{}: ",
++            self.line, self.col, self.section, self.key
++        )?;
++        match &self.kind {
++            FieldKind::Missing => write!(f, "missing required key"),
++            FieldKind::WrongType { expected, got } => {
++                write!(f, "expected {expected}, got \"{got}\"")
++            }
++            FieldKind::BadValue(msg) => write!(f, "{msg}"),
++        }
++    }
++}
++
++impl std::error::Error for FieldError {}
++
++/// Either layer's failure, unified for callers.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum ConfigError {
++    Parse(ParseError),
++    Field(FieldError),
++}
++
++impl ConfigError {
++    pub fn line(&self) -> usize {
++        match self {
++            ConfigError::Parse(e) => e.line,
++            ConfigError::Field(e) => e.line,
++        }
++    }
++
++    pub fn col(&self) -> usize {
++        match self {
++            ConfigError::Parse(e) => e.col,
++            ConfigError::Field(e) => e.col,
++        }
++    }
++}
++
++impl From<ParseError> for ConfigError {
++    fn from(e: ParseError) -> ConfigError {
++        ConfigError::Parse(e)
++    }
++}
++
++impl From<FieldError> for ConfigError {
++    fn from(e: FieldError) -> ConfigError {
++        ConfigError::Field(e)
++    }
++}
++
++impl fmt::Display for ConfigError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            ConfigError::Parse(e) => e.fmt(f),
++            ConfigError::Field(e) => e.fmt(f),
++        }
++    }
++}
++
++impl std::error::Error for ConfigError {}
++
++// ------------------------------------------------------------ typed config
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum LogLevel {
++    Error,
++    Warn,
++    Info,
++    Debug,
++}
++
++/// The `[server]` section, typed.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct ServerConfig {
++    pub host: String,
++    pub port: u16,
++    pub tls: bool,
++    pub workers: u32,
++    pub log_level: LogLevel,
++    pub allow: Vec<String>,
++}
++
++const SECTION: &str = "server";
++
++fn field_error(value: &RawValue, key: &str, kind: FieldKind) -> FieldError {
++    FieldError {
++        line: value.line,
++        col: value.col,
++        section: SECTION.to_string(),
++        key: key.to_string(),
++        kind,
++    }
++}
++
++fn require<'a>(
++    raw: &'a RawConfig,
++    header: (usize, usize),
++    key: &str,
++) -> Result<&'a RawValue, FieldError> {
++    raw.get(SECTION, key).ok_or(FieldError {
++        line: header.0,
++        col: header.1,
++        section: SECTION.to_string(),
++        key: key.to_string(),
++        kind: FieldKind::Missing,
++    })
++}
++
++/// optional `-`, then one or more ASCII digits
++fn is_integer_shape(s: &str) -> bool {
++    let body = s.strip_prefix('-').unwrap_or(s);
++    !body.is_empty() && body.chars().all(|c| c.is_ascii_digit())
++}
++
++fn int_in_range(value: &RawValue, key: &str, lo: i64, hi: i64) -> Result<i64, FieldError> {
++    if !is_integer_shape(&value.text) {
++        return Err(field_error(
++            value,
++            key,
++            FieldKind::WrongType {
++                expected: "integer",
++                got: value.text.clone(),
++            },
++        ));
++    }
++    let range_msg = || FieldKind::BadValue(format!("{key} must be between {lo} and {hi}"));
++    // a digits-only value too large for i64 gets the range message too
++    let parsed: i64 = match value.text.parse() {
++        Err(_) => return Err(field_error(value, key, range_msg())),
++        Ok(v) => v,
++    };
++    if parsed < lo || parsed > hi {
++        return Err(field_error(value, key, range_msg()));
++    }
++    Ok(parsed)
++}
++
++fn parse_bool(value: &RawValue, key: &str) -> Result<bool, FieldError> {
++    match value.text.as_str() {
++        "true" => Ok(true),
++        "false" => Ok(false),
++        other => Err(field_error(
++            value,
++            key,
++            FieldKind::WrongType {
++                expected: "boolean",
++                got: other.to_string(),
++            },
++        )),
++    }
++}
++
++fn parse_level(value: &RawValue) -> Result<LogLevel, FieldError> {
++    match value.text.as_str() {
++        "error" => Ok(LogLevel::Error),
++        "warn" => Ok(LogLevel::Warn),
++        "info" => Ok(LogLevel::Info),
++        "debug" => Ok(LogLevel::Debug),
++        other => Err(field_error(
++            value,
++            "log_level",
++            FieldKind::BadValue(format!("unknown log level \"{other}\"")),
++        )),
++    }
++}
++
++fn parse_list(value: &RawValue) -> Result<Vec<String>, FieldError> {
++    let mut items = Vec::new();
++    for piece in value.text.split(',') {
++        let item = piece.trim_matches(BLANK);
++        if item.is_empty() {
++            return Err(field_error(
++                value,
++                "allow",
++                FieldKind::BadValue("empty entry in allow list".to_string()),
++            ));
++        }
++        items.push(item.to_string());
++    }
++    Ok(items)
++}
++
++/// Load and type the `[server]` section. Field order: host, port, tls,
++/// workers, log_level, allow.
++pub fn load_server_config(src: &str) -> Result<ServerConfig, ConfigError> {
++    let raw = RawConfig::parse(src)?;
++    let header = raw.section_pos(SECTION).unwrap_or((1, 1));
++
++    let host = require(&raw, header, "host")?.text.clone();
++    let port = int_in_range(require(&raw, header, "port")?, "port", 1, 65_535)? as u16;
++    let tls = match raw.get(SECTION, "tls") {
++        None => false,
++        Some(v) => parse_bool(v, "tls")?,
++    };
++    let workers = match raw.get(SECTION, "workers") {
++        None => 4,
++        Some(v) => int_in_range(v, "workers", 1, 512)? as u32,
++    };
++    let log_level = match raw.get(SECTION, "log_level") {
++        None => LogLevel::Info,
++        Some(v) => parse_level(v)?,
++    };
++    let allow = match raw.get(SECTION, "allow") {
++        None => Vec::new(),
++        Some(v) => parse_list(v)?,
++    };
++
++    Ok(ServerConfig {
++        host,
++        port,
++        tls,
++        workers,
++        log_level,
++        allow,
++    })
++}

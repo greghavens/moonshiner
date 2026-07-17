@@ -1,0 +1,331 @@
+diff --git a/api.go b/api.go
+new file mode 100644
+index 0000000..a65c4b3
+--- /dev/null
++++ b/api.go
+@@ -0,0 +1,155 @@
++package ghauth
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"strings"
++	"time"
++)
++
++// APIError is a decoded GitHub REST error response. Its text carries the
++// status and GitHub's message but never any credential material.
++type APIError struct {
++	StatusCode       int
++	Message          string
++	DocumentationURL string
++}
++
++func (e *APIError) Error() string {
++	return fmt.Sprintf("ghauth: github api error %d: %s", e.StatusCode, e.Message)
++}
++
++// doJWT performs an app-JWT-authenticated request and decodes the response
++// into out (when out is non-nil) or returns a typed APIError.
++func (c *Client) doJWT(ctx context.Context, method, url string, out any) error {
++	jwt, err := c.AppJWT()
++	if err != nil {
++		return err
++	}
++	req, err := http.NewRequestWithContext(ctx, method, url, nil)
++	if err != nil {
++		return fmt.Errorf("ghauth: building request: %w", err)
++	}
++	req.Header.Set("Authorization", "Bearer "+jwt)
++	req.Header.Set("Accept", acceptMedia)
++	req.Header.Set("X-GitHub-Api-Version", apiVersion)
++	req.Header.Set("User-Agent", userAgent)
++
++	resp, err := c.http.Do(req)
++	if err != nil {
++		return fmt.Errorf("ghauth: %s %s: %w", method, req.URL.Path, err)
++	}
++	defer resp.Body.Close()
++	body, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return fmt.Errorf("ghauth: reading response: %w", err)
++	}
++	if resp.StatusCode < 200 || resp.StatusCode > 299 {
++		ae := &APIError{StatusCode: resp.StatusCode}
++		var ghErr struct {
++			Message          string `json:"message"`
++			DocumentationURL string `json:"documentation_url"`
++		}
++		if json.Unmarshal(body, &ghErr) == nil {
++			ae.Message = ghErr.Message
++			ae.DocumentationURL = ghErr.DocumentationURL
++		}
++		if ae.Message == "" {
++			ae.Message = http.StatusText(resp.StatusCode)
++		}
++		return ae
++	}
++	if out == nil {
++		return nil
++	}
++	if err := json.Unmarshal(body, out); err != nil {
++		return fmt.Errorf("ghauth: decoding response: %w", err)
++	}
++	return nil
++}
++
++type wireInstallation struct {
++	ID                  int64 `json:"id"`
++	AppID               int64 `json:"app_id"`
++	RepositorySelection string `json:"repository_selection"`
++	Account             struct {
++		Login string `json:"login"`
++	} `json:"account"`
++}
++
++// InstallationFor finds the app installation covering org (matched against
++// account.login case-insensitively).
++func (c *Client) InstallationFor(ctx context.Context, org string) (*Installation, error) {
++	var page []wireInstallation
++	url := c.baseURL + "/app/installations?per_page=100"
++	if err := c.doJWT(ctx, http.MethodGet, url, &page); err != nil {
++		return nil, err
++	}
++	for _, in := range page {
++		if strings.EqualFold(in.Account.Login, org) {
++			return &Installation{
++				ID:                  in.ID,
++				AppID:               in.AppID,
++				AccountLogin:        in.Account.Login,
++				RepositorySelection: in.RepositorySelection,
++			}, nil
++		}
++	}
++	return nil, fmt.Errorf("ghauth: app has no installation for org %q", org)
++}
++
++type wireToken struct {
++	Token               string            `json:"token"`
++	ExpiresAt           time.Time         `json:"expires_at"`
++	Permissions         map[string]string `json:"permissions"`
++	RepositorySelection string            `json:"repository_selection"`
++}
++
++// InstallationToken returns a cached installation token for org, exchanging
++// a fresh app JWT when the cache is empty or within the refresh margin of
++// expiry. Concurrent callers share a single exchange.
++func (c *Client) InstallationToken(ctx context.Context, org string) (*Token, error) {
++	key := strings.ToLower(org)
++
++	// The critical section covers the exchange itself so simultaneous
++	// callers can't race a second POST for the same org.
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	if tok, ok := c.tokens[key]; ok && c.Now().Before(tok.ExpiresAt.Add(-refreshMargin)) {
++		return tok, nil
++	}
++
++	id, ok := c.installations[key]
++	if !ok {
++		inst, err := c.installationForLocked(ctx, org)
++		if err != nil {
++			return nil, err
++		}
++		id = inst.ID
++		c.installations[key] = id
++	}
++
++	var wire wireToken
++	url := fmt.Sprintf("%s/app/installations/%d/access_tokens", c.baseURL, id)
++	if err := c.doJWT(ctx, http.MethodPost, url, &wire); err != nil {
++		return nil, err
++	}
++	tok := &Token{
++		Value:               wire.Token,
++		ExpiresAt:           wire.ExpiresAt,
++		Permissions:         wire.Permissions,
++		RepositorySelection: wire.RepositorySelection,
++	}
++	c.tokens[key] = tok
++	return tok, nil
++}
++
++// installationForLocked mirrors InstallationFor for callers already holding
++// c.mu (the HTTP layer itself never touches client state).
++func (c *Client) installationForLocked(ctx context.Context, org string) (*Installation, error) {
++	return c.InstallationFor(ctx, org)
++}
+diff --git a/ghauth.go b/ghauth.go
+new file mode 100644
+index 0000000..162ac0e
+--- /dev/null
++++ b/ghauth.go
+@@ -0,0 +1,112 @@
++// Package ghauth authenticates as a GitHub App installation against GitHub
++// Enterprise Cloud: it mints the app's RS256 JWT, discovers installations,
++// exchanges the JWT for short-lived installation access tokens, and caches
++// those tokens until shortly before expiry.
++package ghauth
++
++import (
++	"crypto/rsa"
++	"crypto/x509"
++	"encoding/pem"
++	"errors"
++	"fmt"
++	"net/http"
++	"strings"
++	"sync"
++	"time"
++)
++
++const (
++	acceptMedia = "application/vnd.github+json"
++	apiVersion  = "2026-03-10"
++	userAgent   = "shop-floor-ci-ghauth/1.0"
++
++	// jwtBackdate is the documented clock-drift allowance for iat.
++	jwtBackdate = 60 * time.Second
++	// jwtLifetime keeps exp comfortably inside the documented 10-minute cap.
++	jwtLifetime = 9 * time.Minute
++	// refreshMargin is how long before expires_at a cached token is retired.
++	refreshMargin = 60 * time.Second
++)
++
++// Config carries everything needed to authenticate as a GitHub App.
++type Config struct {
++	BaseURL       string // e.g. https://api.github.com
++	ClientID      string // the app's client ID (preferred JWT issuer)
++	PrivateKeyPEM []byte // the app's RSA private key (PKCS#1 or PKCS#8 PEM)
++	HTTPClient    *http.Client
++}
++
++// Client mints app JWTs and manages cached installation tokens.
++type Client struct {
++	baseURL  string
++	clientID string
++	key      *rsa.PrivateKey
++	http     *http.Client
++
++	// Now is the clock; overridable in tests.
++	Now func() time.Time
++
++	mu            sync.Mutex
++	installations map[string]int64  // lowercased org login -> installation id
++	tokens        map[string]*Token // lowercased org login -> cached token
++}
++
++// Token is an installation access token with its exchange metadata.
++type Token struct {
++	Value               string
++	ExpiresAt           time.Time
++	Permissions         map[string]string
++	RepositorySelection string
++}
++
++// Installation identifies where the app is installed.
++type Installation struct {
++	ID                  int64
++	AppID               int64
++	AccountLogin        string
++	RepositorySelection string
++}
++
++// New parses the app key and returns a ready client.
++func New(cfg Config) (*Client, error) {
++	key, err := parsePrivateKey(cfg.PrivateKeyPEM)
++	if err != nil {
++		return nil, err
++	}
++	if cfg.ClientID == "" {
++		return nil, errors.New("ghauth: client ID is required")
++	}
++	hc := cfg.HTTPClient
++	if hc == nil {
++		hc = http.DefaultClient
++	}
++	return &Client{
++		baseURL:       strings.TrimRight(cfg.BaseURL, "/"),
++		clientID:      cfg.ClientID,
++		key:           key,
++		http:          hc,
++		Now:           time.Now,
++		installations: make(map[string]int64),
++		tokens:        make(map[string]*Token),
++	}, nil
++}
++
++func parsePrivateKey(pemBytes []byte) (*rsa.PrivateKey, error) {
++	block, _ := pem.Decode(pemBytes)
++	if block == nil {
++		return nil, errors.New("ghauth: private key is not PEM-encoded")
++	}
++	if key, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
++		return key, nil
++	}
++	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
++	if err != nil {
++		return nil, fmt.Errorf("ghauth: parsing private key: unsupported or corrupt key")
++	}
++	key, ok := parsed.(*rsa.PrivateKey)
++	if !ok {
++		return nil, errors.New("ghauth: private key is not RSA; GitHub App JWTs require RS256")
++	}
++	return key, nil
++}
+diff --git a/jwt.go b/jwt.go
+new file mode 100644
+index 0000000..0bb9496
+--- /dev/null
++++ b/jwt.go
+@@ -0,0 +1,46 @@
++package ghauth
++
++import (
++	"crypto"
++	"crypto/rand"
++	"crypto/rsa"
++	"crypto/sha256"
++	"encoding/base64"
++	"encoding/json"
++	"fmt"
++)
++
++// AppJWT mints the app's short-lived JWT: RS256, issued by the client ID,
++// backdated 60s against clock drift, expiring inside the 10-minute cap.
++func (c *Client) AppJWT() (string, error) {
++	now := c.Now()
++	header := map[string]string{"alg": "RS256", "typ": "JWT"}
++	claims := map[string]any{
++		"iss": c.clientID,
++		"iat": now.Add(-jwtBackdate).Unix(),
++		"exp": now.Add(jwtLifetime).Unix(),
++	}
++	h, err := jwtSegment(header)
++	if err != nil {
++		return "", err
++	}
++	p, err := jwtSegment(claims)
++	if err != nil {
++		return "", err
++	}
++	signingInput := h + "." + p
++	sum := sha256.Sum256([]byte(signingInput))
++	sig, err := rsa.SignPKCS1v15(rand.Reader, c.key, crypto.SHA256, sum[:])
++	if err != nil {
++		return "", fmt.Errorf("ghauth: signing app JWT: %w", err)
++	}
++	return signingInput + "." + base64.RawURLEncoding.EncodeToString(sig), nil
++}
++
++func jwtSegment(v any) (string, error) {
++	raw, err := json.Marshal(v)
++	if err != nil {
++		return "", fmt.Errorf("ghauth: encoding JWT segment: %w", err)
++	}
++	return base64.RawURLEncoding.EncodeToString(raw), nil
++}

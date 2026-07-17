@@ -1,0 +1,276 @@
+diff --git a/JobStatus.java b/JobStatus.java
+new file mode 100644
+index 0000000..7429802
+--- /dev/null
++++ b/JobStatus.java
+@@ -0,0 +1,3 @@
++/** Terminal status of a completed search job. */
++public record JobStatus(String dispatchState, int resultCount) {
++}
+diff --git a/SplunkJobFailedException.java b/SplunkJobFailedException.java
+new file mode 100644
+index 0000000..7c5d323
+--- /dev/null
++++ b/SplunkJobFailedException.java
+@@ -0,0 +1,7 @@
++/** A search job reached isFailed=true; the message carries splunkd's text. */
++public class SplunkJobFailedException extends RuntimeException {
++
++    public SplunkJobFailedException(String message) {
++        super(message);
++    }
++}
+diff --git a/SplunkRestException.java b/SplunkRestException.java
+new file mode 100644
+index 0000000..5463dbd
+--- /dev/null
++++ b/SplunkRestException.java
+@@ -0,0 +1,29 @@
++/**
++ * A splunkd REST failure decoded from the documented error envelope
++ * {"messages":[{"type":...,"text":...}]}. Never carries credentials.
++ */
++public class SplunkRestException extends RuntimeException {
++
++    private final int status;
++    private final String type;
++    private final String messageText;
++
++    public SplunkRestException(int status, String type, String messageText) {
++        super("splunkd " + status + " [" + type + "] " + messageText);
++        this.status = status;
++        this.type = type;
++        this.messageText = messageText;
++    }
++
++    public int getStatus() {
++        return status;
++    }
++
++    public String getType() {
++        return type;
++    }
++
++    public String getMessageText() {
++        return messageText;
++    }
++}
+diff --git a/SplunkSearchClient.java b/SplunkSearchClient.java
+new file mode 100644
+index 0000000..d577c04
+--- /dev/null
++++ b/SplunkSearchClient.java
+@@ -0,0 +1,213 @@
++import java.io.IOException;
++import java.net.URI;
++import java.net.URLEncoder;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.function.LongConsumer;
++
++/**
++ * Client for splunkd search jobs on the management REST API.
++ *
++ * Job creation, status and results use the search/v2 endpoints; job
++ * control (finalize/cancel) exists only on the v1 path. Auth is an
++ * Authorization: Bearer token header. All waiting goes through the
++ * injected sleeper.
++ */
++public final class SplunkSearchClient {
++
++    private static final String JOBS_V2 = "/services/search/v2/jobs";
++    private static final String JOBS_V1 = "/services/search/jobs";
++
++    private final String baseUrl;
++    private final String token;
++    private final LongConsumer sleeper;
++    private final HttpClient http = HttpClient.newHttpClient();
++
++    public SplunkSearchClient(String baseUrl, String token, LongConsumer sleeper) {
++        this.baseUrl = baseUrl.endsWith("/")
++            ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
++        this.token = token;
++        this.sleeper = sleeper;
++    }
++
++    // ---- job lifecycle --------------------------------------------------
++
++    public String createJob(String spl, String earliestTime, String latestTime) {
++        Map<String, String> form = new LinkedHashMap<>();
++        form.put("search", normalizeSpl(spl));
++        form.put("earliest_time", earliestTime);
++        form.put("latest_time", latestTime);
++        form.put("exec_mode", "normal");
++        form.put("output_mode", "json");
++        Map<String, Object> doc = send(post(JOBS_V2, form));
++        return String.valueOf(doc.get("sid"));
++    }
++
++    public JobStatus pollUntilDone(String sid, long pollMillis, int maxPolls) {
++        for (int poll = 0; poll < maxPolls; poll++) {
++            if (poll > 0) {
++                sleeper.accept(pollMillis);
++            }
++            Map<String, Object> content = jobContent(sid);
++            if (Boolean.TRUE.equals(content.get("isFailed"))) {
++                throw new SplunkJobFailedException(
++                    "search job " + sid + " failed: " + failureText(content));
++            }
++            if (Boolean.TRUE.equals(content.get("isDone"))) {
++                return new JobStatus(
++                    String.valueOf(content.get("dispatchState")),
++                    ((Number) content.getOrDefault("resultCount", 0)).intValue());
++            }
++        }
++        throw new IllegalStateException(
++            "search job " + sid + " still running after " + maxPolls + " polls");
++    }
++
++    public List<Map<String, Object>> results(String sid, int pageSize) {
++        List<Map<String, Object>> rows = new ArrayList<>();
++        int offset = 0;
++        while (true) {
++            Map<String, String> query = new LinkedHashMap<>();
++            query.put("output_mode", "json");
++            query.put("count", Integer.toString(pageSize));
++            query.put("offset", Integer.toString(offset));
++            HttpResponse<String> resp = raw(get(
++                JOBS_V2 + "/" + sid + "/results", query));
++            if (resp.statusCode() == 204) {
++                throw new IllegalStateException(
++                    "search job " + sid + " is not done; results are not ready");
++            }
++            Map<String, Object> doc = decode(resp);
++            List<?> page = (List<?>) doc.getOrDefault("results", List.of());
++            for (Object row : page) {
++                @SuppressWarnings("unchecked")
++                Map<String, Object> typed = (Map<String, Object>) row;
++                rows.add(typed);
++            }
++            if (page.size() < pageSize) {
++                return rows;
++            }
++            offset += pageSize;
++        }
++    }
++
++    public void finalizeJob(String sid) {
++        control(sid, "finalize");
++    }
++
++    public void cancel(String sid) {
++        control(sid, "cancel");
++    }
++
++    private void control(String sid, String action) {
++        // control is v1-only; splunkd exposes no search/v2 control endpoint
++        send(post(JOBS_V1 + "/" + sid + "/control",
++            Map.of("action", action, "output_mode", "json")));
++    }
++
++    // ---- helpers ---------------------------------------------------------
++
++    static String normalizeSpl(String spl) {
++        String trimmed = spl.strip();
++        if (trimmed.startsWith("|") || trimmed.startsWith("search ")
++                || trimmed.equals("search")) {
++            return trimmed;
++        }
++        return "search " + trimmed;
++    }
++
++    private Map<String, Object> jobContent(String sid) {
++        Map<String, Object> doc = send(get(
++            JOBS_V2 + "/" + sid, Map.of("output_mode", "json")));
++        List<?> entries = (List<?>) doc.getOrDefault("entry", List.of());
++        if (entries.isEmpty()) {
++            throw new SplunkRestException(200, "ERROR",
++                "job entity for " + sid + " carried no entry");
++        }
++        @SuppressWarnings("unchecked")
++        Map<String, Object> entry = (Map<String, Object>) entries.get(0);
++        @SuppressWarnings("unchecked")
++        Map<String, Object> content = (Map<String, Object>) entry.get("content");
++        return content;
++    }
++
++    private static String failureText(Map<String, Object> content) {
++        Object messages = content.get("messages");
++        if (messages instanceof List<?> list) {
++            for (Object m : list) {
++                if (m instanceof Map<?, ?> msg) {
++                    return String.valueOf(msg.get("text"));
++                }
++            }
++        }
++        return "no failure detail reported";
++    }
++
++    private static String encodeForm(Map<String, String> form) {
++        StringBuilder sb = new StringBuilder();
++        for (Map.Entry<String, String> e : form.entrySet()) {
++            if (sb.length() > 0) {
++                sb.append('&');
++            }
++            sb.append(URLEncoder.encode(e.getKey(), StandardCharsets.UTF_8));
++            sb.append('=');
++            sb.append(URLEncoder.encode(e.getValue(), StandardCharsets.UTF_8));
++        }
++        return sb.toString();
++    }
++
++    private HttpRequest post(String path, Map<String, String> form) {
++        return HttpRequest.newBuilder(URI.create(baseUrl + path))
++            .header("Authorization", "Bearer " + token)
++            .header("Content-Type", "application/x-www-form-urlencoded")
++            .POST(HttpRequest.BodyPublishers.ofString(encodeForm(form)))
++            .build();
++    }
++
++    private HttpRequest get(String path, Map<String, String> query) {
++        return HttpRequest.newBuilder(
++                URI.create(baseUrl + path + "?" + encodeForm(query)))
++            .header("Authorization", "Bearer " + token)
++            .GET()
++            .build();
++    }
++
++    private HttpResponse<String> raw(HttpRequest request) {
++        try {
++            return http.send(request, HttpResponse.BodyHandlers.ofString());
++        } catch (IOException e) {
++            throw new SplunkRestException(-1, "ERROR",
++                "transport failure talking to splunkd: " + e.getClass().getSimpleName());
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++            throw new SplunkRestException(-1, "ERROR", "interrupted");
++        }
++    }
++
++    private Map<String, Object> send(HttpRequest request) {
++        return decode(raw(request));
++    }
++
++    private Map<String, Object> decode(HttpResponse<String> resp) {
++        Map<String, Object> doc = resp.body() == null || resp.body().isEmpty()
++            ? Map.of() : Json.parseObject(resp.body());
++        if (resp.statusCode() / 100 != 2) {
++            String type = "ERROR";
++            String text = "splunkd returned HTTP " + resp.statusCode();
++            Object messages = doc.get("messages");
++            if (messages instanceof List<?> list && !list.isEmpty()
++                    && list.get(0) instanceof Map<?, ?> msg) {
++                type = String.valueOf(msg.get("type"));
++                text = String.valueOf(msg.get("text"));
++            }
++            throw new SplunkRestException(resp.statusCode(), type, text);
++        }
++        return doc;
++    }
++}

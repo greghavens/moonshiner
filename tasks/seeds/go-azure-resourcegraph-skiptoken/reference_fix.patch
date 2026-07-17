@@ -1,0 +1,306 @@
+diff --git a/client.go b/client.go
+new file mode 100644
+index 0000000..40c7d7c
+--- /dev/null
++++ b/client.go
+@@ -0,0 +1,137 @@
++package rgexport
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"time"
++)
++
++// Client executes paginated Resource Graph queries.
++type Client struct {
++	baseURL            string
++	token              string
++	http               *http.Client
++	sleep              func(time.Duration)
++	maxThrottleRetries int
++}
++
++func NewClient(cfg Config) *Client {
++	httpClient := cfg.HTTPClient
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++	sleep := cfg.Sleep
++	if sleep == nil {
++		sleep = time.Sleep
++	}
++	return &Client{
++		baseURL:            cfg.BaseURL,
++		token:              cfg.Token,
++		http:               httpClient,
++		sleep:              sleep,
++		maxThrottleRetries: cfg.MaxThrottleRetries,
++	}
++}
++
++// QueryAll runs the query and follows $skipToken until the listing is
++// complete. On ErrRepeatedSkipToken the partial Report is returned alongside
++// the error so callers keep what was already fetched.
++func (c *Client) QueryAll(ctx context.Context, q Query) (*Report, error) {
++	report := &Report{}
++	sentToken := ""
++
++	for {
++		request := queryRequest{
++			Query:         q.Query,
++			Subscriptions: q.Subscriptions,
++			Options: queryRequestOptions{
++				Top:          q.PageSize,
++				SkipToken:    sentToken,
++				ResultFormat: resultFormat,
++			},
++		}
++		page, header, err := c.postPage(ctx, request)
++		if err != nil {
++			return nil, err
++		}
++
++		report.Rows = append(report.Rows, page.Data...)
++		report.Pages++
++		report.TotalRecords = page.TotalRecords
++		if page.ResultTruncated == "true" {
++			report.Truncated = true
++		}
++
++		if page.SkipToken == "" {
++			return report, nil
++		}
++		if page.SkipToken == sentToken {
++			return report, fmt.Errorf("after page %d: %w", report.Pages, ErrRepeatedSkipToken)
++		}
++		sentToken = page.SkipToken
++
++		// More pages coming: honor the documented quota headers before the
++		// next call instead of burning the window into a 429.
++		if quotaExhausted(header) {
++			if reset, ok := quotaResetDelay(header); ok {
++				c.sleep(reset)
++				report.QuotaWaits++
++			}
++		}
++	}
++}
++
++func (c *Client) postPage(ctx context.Context, request queryRequest) (*queryResponse, http.Header, error) {
++	body, err := json.Marshal(request)
++	if err != nil {
++		return nil, nil, fmt.Errorf("encoding query request: %w", err)
++	}
++
++	throttleRetries := 0
++	for {
++		status, header, raw, err := c.roundTrip(ctx, body)
++		if err != nil {
++			return nil, nil, err
++		}
++		if status == http.StatusOK {
++			var page queryResponse
++			if err := json.Unmarshal(raw, &page); err != nil {
++				return nil, nil, fmt.Errorf("decoding query response: %w", err)
++			}
++			return &page, header, nil
++		}
++
++		graphErr := parseGraphError(status, raw)
++		if status == http.StatusTooManyRequests && throttleRetries < c.maxThrottleRetries {
++			throttleRetries++
++			c.sleep(throttleDelay(header))
++			continue
++		}
++		return nil, nil, graphErr
++	}
++}
++
++func (c *Client) roundTrip(ctx context.Context, body []byte) (int, http.Header, []byte, error) {
++	url := c.baseURL + resourcePath + "?api-version=" + apiVersion
++	request, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
++	if err != nil {
++		return 0, nil, nil, fmt.Errorf("building request: %w", err)
++	}
++	request.Header.Set("Authorization", "Bearer "+c.token)
++	request.Header.Set("Content-Type", "application/json")
++
++	response, err := c.http.Do(request)
++	if err != nil {
++		return 0, nil, nil, fmt.Errorf("calling resource graph: %w", err)
++	}
++	defer response.Body.Close()
++	raw, err := io.ReadAll(response.Body)
++	if err != nil {
++		return 0, nil, nil, fmt.Errorf("reading response: %w", err)
++	}
++	return response.StatusCode, response.Header, raw, nil
++}
+diff --git a/types.go b/types.go
+new file mode 100644
+index 0000000..793e4c6
+--- /dev/null
++++ b/types.go
+@@ -0,0 +1,57 @@
++// Package rgexport exports Azure Resource Graph query results with full
++// $skipToken pagination, quota-aware pacing, and bounded 429 retries.
++package rgexport
++
++import (
++	"errors"
++	"fmt"
++	"net/http"
++	"time"
++)
++
++// ErrRepeatedSkipToken reports a continuation loop: the service (or something
++// between us and it) handed back the same $skipToken we just sent.
++var ErrRepeatedSkipToken = errors.New("resource graph returned the $skipToken that was just sent")
++
++// Config wires the client. Sleep is injected so tests never really wait.
++type Config struct {
++	BaseURL            string
++	Token              string
++	HTTPClient         *http.Client
++	Sleep              func(time.Duration)
++	MaxThrottleRetries int
++}
++
++// Query is one export request.
++type Query struct {
++	Query         string
++	Subscriptions []string
++	PageSize      int // options.$top per page; 0 leaves the service default
++}
++
++// Report accumulates every page of a query.
++type Report struct {
++	Rows         []map[string]any
++	TotalRecords int64
++	Truncated    bool
++	Pages        int
++	QuotaWaits   int
++}
++
++// GraphErrorDetail is one entry of the documented error details list.
++type GraphErrorDetail struct {
++	Code    string `json:"code"`
++	Message string `json:"message"`
++}
++
++// GraphError is a non-200 Resource Graph response.
++type GraphError struct {
++	StatusCode int
++	Code       string
++	Message    string
++	Details    []GraphErrorDetail
++}
++
++func (e *GraphError) Error() string {
++	return fmt.Sprintf("resource graph request failed with %d %s: %s", e.StatusCode, e.Code, e.Message)
++}
+diff --git a/wire.go b/wire.go
+new file mode 100644
+index 0000000..2a42b4a
+--- /dev/null
++++ b/wire.go
+@@ -0,0 +1,94 @@
++package rgexport
++
++import (
++	"encoding/json"
++	"net/http"
++	"strconv"
++	"strings"
++	"time"
++)
++
++const (
++	apiVersion   = "2024-04-01"
++	resourcePath = "/providers/Microsoft.ResourceGraph/resources"
++	resultFormat = "objectArray"
++
++	headerQuotaRemaining  = "x-ms-user-quota-remaining"
++	headerQuotaResetsAfter = "x-ms-user-quota-resets-after"
++)
++
++type queryRequestOptions struct {
++	Top          int    `json:"$top,omitempty"`
++	SkipToken    string `json:"$skipToken,omitempty"`
++	ResultFormat string `json:"resultFormat"`
++}
++
++type queryRequest struct {
++	Query         string              `json:"query"`
++	Subscriptions []string            `json:"subscriptions"`
++	Options       queryRequestOptions `json:"options"`
++}
++
++type queryResponse struct {
++	Count           int64            `json:"count"`
++	TotalRecords    int64            `json:"totalRecords"`
++	Data            []map[string]any `json:"data"`
++	ResultTruncated string           `json:"resultTruncated"` // string enum "true"/"false"
++	SkipToken       string           `json:"$skipToken"`
++}
++
++type errorEnvelope struct {
++	Error struct {
++		Code    string             `json:"code"`
++		Message string             `json:"message"`
++		Details []GraphErrorDetail `json:"details"`
++	} `json:"error"`
++}
++
++func parseGraphError(status int, raw []byte) *GraphError {
++	var envelope errorEnvelope
++	_ = json.Unmarshal(raw, &envelope)
++	return &GraphError{
++		StatusCode: status,
++		Code:       envelope.Error.Code,
++		Message:    envelope.Error.Message,
++		Details:    envelope.Error.Details,
++	}
++}
++
++// quotaExhausted reports whether the response says the caller's query quota
++// for the current window is used up.
++func quotaExhausted(header http.Header) bool {
++	return header.Get(headerQuotaRemaining) == "0"
++}
++
++// quotaResetDelay parses the hh:mm:ss x-ms-user-quota-resets-after header.
++func quotaResetDelay(header http.Header) (time.Duration, bool) {
++	raw := header.Get(headerQuotaResetsAfter)
++	parts := strings.Split(raw, ":")
++	if len(parts) != 3 {
++		return 0, false
++	}
++	var total time.Duration
++	units := []time.Duration{time.Hour, time.Minute, time.Second}
++	for i, part := range parts {
++		n, err := strconv.Atoi(part)
++		if err != nil || n < 0 {
++			return 0, false
++		}
++		total += time.Duration(n) * units[i]
++	}
++	return total, true
++}
++
++// throttleDelay picks the wait before retrying a 429: Retry-After seconds
++// when present, otherwise the quota reset window, otherwise one second.
++func throttleDelay(header http.Header) time.Duration {
++	if seconds, err := strconv.Atoi(header.Get("Retry-After")); err == nil && seconds >= 0 {
++		return time.Duration(seconds) * time.Second
++	}
++	if reset, ok := quotaResetDelay(header); ok {
++		return reset
++	}
++	return time.Second
++}

@@ -1,0 +1,159 @@
+diff --git a/composite_writer.ts b/composite_writer.ts
+new file mode 100644
+index 0000000..fa562c6
+--- /dev/null
++++ b/composite_writer.ts
+@@ -0,0 +1,153 @@
++// Cross-record Composite writer.
++//
++// Compiles ordered steps into one POST /services/data/v67.0/composite call
++// per the contract pinned in docs/contract.json: per-step POST subrequests,
++// @{refId.id} reference expressions, a 25-subrequest ceiling enforced
++// locally, and per-subrequest httpStatusCode decoding — the top-level call
++// answers HTTP 200 even when subrequests fail.
++
++import { SalesforceApiError, SalesforceOrg } from './tree_client.ts';
++
++export interface RecordRef {
++  $ref: string;
++}
++
++export interface CompositeStep {
++  refId: string;
++  sobject: string;
++  fields: Record<string, unknown>;
++}
++
++export interface CompositeError {
++  errorCode: string;
++  message: string;
++}
++
++export interface CompositeWriteResult {
++  ok: boolean;
++  ids: Record<string, string>;
++  errors: Record<string, CompositeError[]>;
++}
++
++export class CompositeLimitError extends Error {
++  constructor(message: string) {
++    super(message);
++    this.name = 'CompositeLimitError';
++  }
++}
++
++export class CompositeRefError extends Error {
++  constructor(message: string) {
++    super(message);
++    this.name = 'CompositeRefError';
++  }
++}
++
++const MAX_SUBREQUESTS = 25;
++const REF_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_]*$/;
++
++function isRecordRef(value: unknown): value is RecordRef {
++  return typeof value === 'object' && value !== null
++    && typeof (value as RecordRef).$ref === 'string';
++}
++
++function compileBody(
++  step: CompositeStep,
++  earlier: ReadonlySet<string>,
++): Record<string, unknown> {
++  const body: Record<string, unknown> = {};
++  for (const [field, value] of Object.entries(step.fields)) {
++    if (isRecordRef(value)) {
++      if (!earlier.has(value.$ref)) {
++        throw new CompositeRefError(
++          `step "${step.refId}" field "${field}" references "${value.$ref}", `
++          + 'which is not an earlier step in this call',
++        );
++      }
++      body[field] = `@{${value.$ref}.id}`;
++    } else {
++      body[field] = value;
++    }
++  }
++  return body;
++}
++
++interface CompositeSubresponse {
++  body: unknown;
++  httpHeaders: Record<string, string>;
++  httpStatusCode: number;
++  referenceId: string;
++}
++
++/**
++ * Create the stepped records in one composite call. `ok` is true only when
++ * every subrequest landed 2xx; an HTTP 200 top-level response with failed
++ * subrequests is a failure, and after an allOrNone rollback no ids survive.
++ */
++export async function writeLinked(
++  org: SalesforceOrg,
++  steps: CompositeStep[],
++  opts: { allOrNone?: boolean } = {},
++): Promise<CompositeWriteResult> {
++  if (steps.length > MAX_SUBREQUESTS) {
++    throw new CompositeLimitError(
++      `composite calls allow up to ${MAX_SUBREQUESTS} subrequests, `
++      + `got ${steps.length}`,
++    );
++  }
++
++  const earlier = new Set<string>();
++  const compositeRequest = steps.map((step) => {
++    if (!REF_ID_PATTERN.test(step.refId)) {
++      throw new CompositeRefError(
++        `referenceId "${step.refId}" must start with a letter or number and `
++        + 'contain only letters, numbers, or underscores',
++      );
++    }
++    if (earlier.has(step.refId)) {
++      throw new CompositeRefError(`duplicate referenceId "${step.refId}"`);
++    }
++    const body = compileBody(step, earlier);
++    earlier.add(step.refId);
++    return {
++      method: 'POST',
++      url: org.restPath(`sobjects/${step.sobject}`),
++      referenceId: step.refId,
++      body,
++    };
++  });
++
++  const { status, body } = await org.request('POST', org.restPath('composite'), {
++    allOrNone: opts.allOrNone ?? true,
++    compositeRequest,
++  });
++
++  if (Array.isArray(body)) {
++    // top-level REST error envelope (401, 404, ...)
++    throw new SalesforceApiError(
++      status,
++      body as { errorCode: string; message: string }[],
++    );
++  }
++
++  const entries = (body as { compositeResponse: CompositeSubresponse[] })
++    .compositeResponse;
++  const result: CompositeWriteResult = { ok: true, ids: {}, errors: {} };
++  for (const entry of entries) {
++    if (entry.httpStatusCode >= 200 && entry.httpStatusCode < 300) {
++      const created = entry.body as { id: string };
++      result.ids[entry.referenceId] = created.id;
++    } else {
++      result.ok = false;
++      const failures = (Array.isArray(entry.body) ? entry.body : []) as {
++        errorCode: string;
++        message: string;
++      }[];
++      result.errors[entry.referenceId] = failures.map((f) => ({
++        errorCode: f.errorCode,
++        message: f.message,
++      }));
++    }
++  }
++  return result;
++}

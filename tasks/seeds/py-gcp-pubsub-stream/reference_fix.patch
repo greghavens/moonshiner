@@ -1,0 +1,199 @@
+diff --git a/pubstream/__init__.py b/pubstream/__init__.py
+new file mode 100644
+index 0000000..c3af2a2
+--- /dev/null
++++ b/pubstream/__init__.py
+@@ -0,0 +1,8 @@
++"""Streaming pull subscriber toolkit built on google-cloud-pubsub."""
++
++from .lease import LeaseHandle
++from .runner import StreamRunner
++from .settings import StreamSettings
++from .worker import StreamWorker
++
++__all__ = ["LeaseHandle", "StreamRunner", "StreamSettings", "StreamWorker"]
+diff --git a/pubstream/lease.py b/pubstream/lease.py
+new file mode 100644
+index 0000000..38c2013
+--- /dev/null
++++ b/pubstream/lease.py
+@@ -0,0 +1,28 @@
++"""Explicit lease extension for messages whose processing outlives the
++acknowledgment deadline."""
++
++# The service caps modifyAckDeadline at 600 seconds. Below 10 seconds the
++# library docs advise against extending (network latency), and 0 makes the
++# message immediately redeliverable — a nack in effect — so the whole
++# sub-10 range is rejected as an extension value.
++_MIN_EXTENSION = 10
++_MAX_EXTENSION = 600
++
++
++class LeaseHandle:
++    """Lets a handler push out its message's ack deadline while it works."""
++
++    def __init__(self, message):
++        self._message = message
++        self.extensions = []
++
++    def extend(self, seconds):
++        if isinstance(seconds, bool) or not isinstance(seconds, int):
++            raise ValueError("lease extension must be an integer number of seconds")
++        if not _MIN_EXTENSION <= seconds <= _MAX_EXTENSION:
++            raise ValueError(
++                f"lease extension must be between {_MIN_EXTENSION} and "
++                f"{_MAX_EXTENSION} seconds"
++            )
++        self._message.modify_ack_deadline(seconds)
++        self.extensions.append(seconds)
+diff --git a/pubstream/runner.py b/pubstream/runner.py
+new file mode 100644
+index 0000000..6a87ce0
+--- /dev/null
++++ b/pubstream/runner.py
+@@ -0,0 +1,42 @@
++"""Lifecycle around SubscriberClient.subscribe: start once, stop cleanly.
++
++The subscriber client is injected — production code owns credential and
++channel configuration; this package never constructs one.
++"""
++
++
++class StreamRunner:
++    def __init__(self, subscriber, project, subscription, settings, worker,
++                 await_callbacks_on_shutdown=False):
++        self._subscriber = subscriber
++        self._project = project
++        self._subscription = subscription
++        self._settings = settings
++        self._worker = worker
++        self._await_callbacks_on_shutdown = await_callbacks_on_shutdown
++        self._future = None
++
++    @property
++    def is_running(self):
++        return self._future is not None
++
++    def start(self):
++        if self._future is not None:
++            raise RuntimeError("stream is already running")
++        path = self._subscriber.subscription_path(self._project, self._subscription)
++        self._future = self._subscriber.subscribe(
++            path,
++            callback=self._worker,
++            flow_control=self._settings.flow_control(),
++            await_callbacks_on_shutdown=self._await_callbacks_on_shutdown,
++        )
++        return self._future
++
++    def stop(self, timeout=None):
++        if self._future is None:
++            raise RuntimeError("stream is not running")
++        future, self._future = self._future, None
++        # The documented clean shutdown for a streaming pull: cancel the
++        # future first, then block on result() until the stream wound down.
++        future.cancel()
++        future.result(timeout=timeout)
+diff --git a/pubstream/settings.py b/pubstream/settings.py
+new file mode 100644
+index 0000000..fceedfe
+--- /dev/null
++++ b/pubstream/settings.py
+@@ -0,0 +1,59 @@
++"""Flow-control settings for the streaming pull subscriber.
++
++Defaults mirror the documented google.cloud.pubsub_v1.types.FlowControl
++defaults so an unconfigured stream behaves exactly like an unconfigured
++library subscriber.
++"""
++
++from dataclasses import dataclass
++
++from google.cloud.pubsub_v1 import types
++
++# Documented legal range for the per-extension duration knobs when set.
++_EXTENSION_MIN = 10
++_EXTENSION_MAX = 600
++
++
++@dataclass(frozen=True)
++class StreamSettings:
++    max_messages: int = 1000
++    max_bytes: int = 104857600
++    max_lease_duration: float = 3600
++    min_duration_per_lease_extension: float = 0
++    max_duration_per_lease_extension: float = 0
++
++    def __post_init__(self):
++        if self.max_messages <= 0:
++            raise ValueError("max_messages must be positive")
++        if self.max_bytes <= 0:
++            raise ValueError("max_bytes must be positive")
++        if self.max_lease_duration <= 0:
++            raise ValueError("max_lease_duration must be positive")
++        for label, value in (
++            ("min_duration_per_lease_extension", self.min_duration_per_lease_extension),
++            ("max_duration_per_lease_extension", self.max_duration_per_lease_extension),
++        ):
++            if value != 0 and not _EXTENSION_MIN <= value <= _EXTENSION_MAX:
++                raise ValueError(
++                    f"{label} must be between {_EXTENSION_MIN} and {_EXTENSION_MAX} "
++                    "seconds (inclusive) when set"
++                )
++        if (
++            self.min_duration_per_lease_extension
++            and self.max_duration_per_lease_extension
++            and self.min_duration_per_lease_extension > self.max_duration_per_lease_extension
++        ):
++            raise ValueError(
++                "min_duration_per_lease_extension cannot exceed "
++                "max_duration_per_lease_extension"
++            )
++
++    def flow_control(self) -> types.FlowControl:
++        """Build the real library FlowControl for subscribe()."""
++        return types.FlowControl(
++            max_bytes=self.max_bytes,
++            max_messages=self.max_messages,
++            max_lease_duration=self.max_lease_duration,
++            min_duration_per_lease_extension=self.min_duration_per_lease_extension,
++            max_duration_per_lease_extension=self.max_duration_per_lease_extension,
++        )
+diff --git a/pubstream/worker.py b/pubstream/worker.py
+new file mode 100644
+index 0000000..71831e7
+--- /dev/null
++++ b/pubstream/worker.py
+@@ -0,0 +1,32 @@
++"""The subscribe() callback: dispatches messages to a handler and settles
++each one — ack only after the handler finished, nack on failure."""
++
++from .lease import LeaseHandle
++
++
++class StreamWorker:
++    """Callable passed to SubscriberClient.subscribe as the callback.
++
++    Acks are best-effort unless exactly-once delivery is enabled, so the
++    handler must be idempotent; what this class guarantees is ordering — a
++    message is never acked before its handler completed, and a failed
++    handler produces exactly one nack.
++    """
++
++    def __init__(self, handler):
++        self._handler = handler
++        self.acked = []
++        self.nacked = []
++        self.failures = []
++
++    def __call__(self, message):
++        lease = LeaseHandle(message)
++        try:
++            self._handler(message.data, dict(message.attributes), lease)
++        except Exception as exc:  # never let a handler error escape the callback
++            message.nack()
++            self.nacked.append(message.message_id)
++            self.failures.append((message.message_id, exc))
++            return
++        message.ack()
++        self.acked.append(message.message_id)

@@ -1,0 +1,155 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 1ebac7e..051c8d5 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,148 @@
+ //! rs-rategate: channel-backed token gate on an injectable logical clock.
+-//! Implementation pending — see tests/rategate.rs for the acceptance
+-//! contract.
++//!
++//! Permits live in a bounded channel whose capacity IS the burst cap.
++//! Settlement is lazy integer accounting against a `Clock` trait: one
++//! permit per elapsed `period`, remainder ticks carried forward, and
++//! anything minted past the cap is forfeited (`try_send` into a full
++//! channel). Blocked acquirers park on the channel itself — no sleeps,
++//! no polling — and `close()` wakes them all by dropping the sender.
++
++use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
++use std::sync::{Arc, Mutex};
++
++/// Logical time source. Ticks are opaque and must never go backward.
++pub trait Clock: Send + Sync {
++    fn now(&self) -> u64;
++}
++
++#[derive(Debug, PartialEq, Eq)]
++pub enum GateError {
++    /// The gate was asked for a zero-permit burst.
++    ZeroBurst,
++    /// The gate was asked for a zero-tick mint period.
++    ZeroPeriod,
++    /// The gate has been closed.
++    Closed,
++    /// No permit is available; the next one is due at `ready_at` ticks.
++    NoPermit { ready_at: u64 },
++}
++
++struct Account {
++    /// Ticks are settled through this instant; advances in whole periods.
++    epoch: u64,
++    /// Sender half of the permit channel. `None` once closed — dropping it
++    /// is what wakes parked acquirers with a disconnection.
++    mint_tx: Option<SyncSender<()>>,
++    closed: bool,
++}
++
++pub struct RateGate {
++    period: u64,
++    clock: Arc<dyn Clock>,
++    account: Mutex<Account>,
++    /// Receiver half of the permit channel. Parked acquirers hold this lock
++    /// while they wait, which is exactly why `try_acquire` uses `try_lock`.
++    permits: Mutex<Receiver<()>>,
++}
++
++impl RateGate {
++    /// A gate holding at most `burst` permits, minting one per `period`
++    /// ticks. Starts full, with the account settled at `clock.now()`.
++    pub fn new(burst: usize, period: u64, clock: Arc<dyn Clock>) -> Result<RateGate, GateError> {
++        if burst == 0 {
++            return Err(GateError::ZeroBurst);
++        }
++        if period == 0 {
++            return Err(GateError::ZeroPeriod);
++        }
++        let (mint_tx, permit_rx) = mpsc::sync_channel::<()>(burst);
++        for _ in 0..burst {
++            mint_tx.try_send(()).expect("a fresh channel holds the full burst");
++        }
++        Ok(RateGate {
++            period,
++            clock: Arc::clone(&clock),
++            account: Mutex::new(Account { epoch: clock.now(), mint_tx: Some(mint_tx), closed: false }),
++            permits: Mutex::new(permit_rx),
++        })
++    }
++
++    /// Settle the token account against the clock: mint one permit per
++    /// elapsed period, forfeit what the burst cap rejects, and advance the
++    /// epoch by whole periods so remainder ticks carry forward.
++    fn settle(&self) -> usize {
++        let mut account = self.account.lock().expect("account lock never poisoned");
++        if account.closed {
++            return 0;
++        }
++        let owed = self.clock.now().saturating_sub(account.epoch) / self.period;
++        if owed == 0 {
++            return 0;
++        }
++        let mut minted = 0;
++        if let Some(tx) = &account.mint_tx {
++            for _ in 0..owed {
++                if tx.try_send(()).is_ok() {
++                    minted += 1;
++                } else {
++                    break; // bucket full: the rest of this settlement is forfeited
++                }
++            }
++        }
++        account.epoch += owed * self.period;
++        minted
++    }
++
++    fn status(&self) -> (bool, u64) {
++        let account = self.account.lock().expect("account lock never poisoned");
++        (account.closed, account.epoch + self.period)
++    }
++
++    /// Take a permit without ever blocking — not on the clock, and not on
++    /// other threads parked in `acquire`.
++    pub fn try_acquire(&self) -> Result<(), GateError> {
++        self.settle();
++        let (closed, ready_at) = self.status();
++        if closed {
++            return Err(GateError::Closed);
++        }
++        match self.permits.try_lock() {
++            Ok(permits) => match permits.try_recv() {
++                Ok(()) => Ok(()),
++                Err(TryRecvError::Empty) => Err(GateError::NoPermit { ready_at }),
++                Err(TryRecvError::Disconnected) => Err(GateError::Closed),
++            },
++            // Someone is parked in acquire(), which means the bucket is
++            // spoken for; report when the next permit is due.
++            Err(_) => Err(GateError::NoPermit { ready_at }),
++        }
++    }
++
++    /// Take a permit, parking on the permit channel until one is pumped in
++    /// or the gate closes. Never returns `NoPermit`.
++    pub fn acquire(&self) -> Result<(), GateError> {
++        self.settle();
++        if self.account.lock().expect("account lock never poisoned").closed {
++            return Err(GateError::Closed);
++        }
++        let permits = self.permits.lock().expect("permit lock never poisoned");
++        match permits.recv() {
++            Ok(()) => Ok(()),
++            Err(_) => Err(GateError::Closed), // sender dropped by close()
++        }
++    }
++
++    /// Settle now and report how many permits were minted. Call this after
++    /// advancing the logical clock to wake parked acquirers.
++    pub fn pump(&self) -> usize {
++        self.settle()
++    }
++
++    /// Close the gate: forfeit buffered permits, mint nothing further, and
++    /// wake every parked acquirer with `Closed`. Idempotent.
++    pub fn close(&self) {
++        let mut account = self.account.lock().expect("account lock never poisoned");
++        account.closed = true;
++        account.mint_tx = None; // drop the sender: parked recv() disconnects
++    }
++}

@@ -1,0 +1,312 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 33ebf0e..a440797 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -14,6 +14,15 @@
+ //!
+ //! There is no CRLF special-casing: `'\r'` is an ordinary whitespace
+ //! character and lands in the length of its line.
++//!
++//! Accumulators are *mergeable*: shard a file on UTF-8 boundaries, feed each
++//! shard into its own [`TextStats`], and [`TextStats::merge`] the partial
++//! states in order. The state is a monoid — the pieces that touch a shard
++//! edge (the open first/last line, the partial first/last token) are kept
++//! unresolved until `merge` or `summary` glues them, so any fold shape gives
++//! the same answer as one accumulator that saw the whole stream.
++
++use std::collections::HashMap;
+ 
+ /// Totals for everything fed so far.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -29,19 +38,55 @@ pub struct Summary {
+ }
+ 
+ /// Streaming accumulator: create, `feed` any number of chunks, `summary`.
+-#[derive(Debug, Clone, Default)]
++/// Partial accumulators over adjacent ranges combine with [`merge`].
++///
++/// [`merge`]: TextStats::merge
++#[derive(Debug, Clone)]
+ pub struct TextStats {
+     bytes: usize,
+     chars: usize,
+     words: usize,
+     newlines: usize,
+-    /// Chars in the line currently being read.
+-    cur_line: usize,
+-    /// True while the last char seen was part of a word.
+-    in_word: bool,
+-    /// Extremes over lines already closed by a newline.
+-    closed_min: Option<usize>,
+-    closed_max: Option<usize>,
++    /// Chars of the segment before the first newline. Only meaningful once
++    /// `newlines > 0`; before that the sole segment lives in `last_seg`.
++    first_seg: usize,
++    /// Chars since the last newline (the open segment).
++    last_seg: usize,
++    /// Extremes over *interior* segments: lines closed by a newline that are
++    /// not the first segment. The first and last segments stay out of here
++    /// because a merge can still grow them.
++    inner_min: Option<usize>,
++    inner_max: Option<usize>,
++    /// True until the first whitespace char is seen: the whole content is at
++    /// most one token, held in `tail_word`, touching both edges.
++    single: bool,
++    /// Partial token touching the left edge (empty when the input starts
++    /// with whitespace). Unused while `single`.
++    head_word: String,
++    /// Partial token touching the right edge — also the running token while
++    /// feeding (empty when the input ends with whitespace).
++    tail_word: String,
++    /// Frequencies of interior complete tokens (whitespace on both sides).
++    mid: HashMap<String, usize>,
++}
++
++impl Default for TextStats {
++    fn default() -> TextStats {
++        TextStats {
++            bytes: 0,
++            chars: 0,
++            words: 0,
++            newlines: 0,
++            first_seg: 0,
++            last_seg: 0,
++            inner_min: None,
++            inner_max: None,
++            single: true,
++            head_word: String::new(),
++            tail_word: String::new(),
++            mid: HashMap::new(),
++        }
++    }
+ }
+ 
+ impl TextStats {
+@@ -57,44 +102,208 @@ impl TextStats {
+         for ch in chunk.chars() {
+             self.chars += 1;
+             if ch == '\n' {
+-                self.close_line();
++                if self.newlines == 0 {
++                    self.first_seg = self.last_seg;
++                } else {
++                    self.fold_inner(self.last_seg);
++                }
++                self.newlines += 1;
++                self.last_seg = 0;
+             } else {
+-                self.cur_line += 1;
++                self.last_seg += 1;
+             }
+             if ch.is_whitespace() {
+-                self.in_word = false;
+-            } else if !self.in_word {
+-                self.in_word = true;
+-                self.words += 1;
++                if self.single {
++                    // First whitespace ever: whatever token was running is
++                    // the token that touches the left edge.
++                    self.single = false;
++                    self.head_word = std::mem::take(&mut self.tail_word);
++                } else if !self.tail_word.is_empty() {
++                    let token = std::mem::take(&mut self.tail_word);
++                    *self.mid.entry(token).or_insert(0) += 1;
++                }
++            } else {
++                if self.tail_word.is_empty() {
++                    self.words += 1; // entering a word
++                }
++                self.tail_word.push(ch);
++            }
++        }
++    }
++
++    fn fold_inner(&mut self, len: usize) {
++        self.inner_min = Some(self.inner_min.map_or(len, |m| m.min(len)));
++        self.inner_max = Some(self.inner_max.map_or(len, |m| m.max(len)));
++    }
++
++    fn ends_in_word(&self) -> bool {
++        !self.tail_word.is_empty()
++    }
++
++    fn starts_in_word(&self) -> bool {
++        if self.single {
++            !self.tail_word.is_empty()
++        } else {
++            !self.head_word.is_empty()
++        }
++    }
++
++    /// Combine two partial states, where `later` saw the text immediately
++    /// after `self`'s text. Equivalent to one accumulator having fed both
++    /// ranges in order; associative; `TextStats::new()` is the identity.
++    pub fn merge(self, later: TextStats) -> TextStats {
++        if self.chars == 0 {
++            return later;
++        }
++        if later.chars == 0 {
++            return self;
++        }
++        let (l, r) = (self, later);
++        let mut out = TextStats::new();
++        out.bytes = l.bytes + r.bytes;
++        out.chars = l.chars + r.chars;
++        out.words = l.words + r.words - usize::from(l.ends_in_word() && r.starts_in_word());
++        out.newlines = l.newlines + r.newlines;
++
++        // Line segments: glue l's open tail onto r's first segment.
++        match (l.newlines > 0, r.newlines > 0) {
++            (false, false) => {
++                out.last_seg = l.last_seg + r.last_seg;
++            }
++            (false, true) => {
++                out.first_seg = l.last_seg + r.first_seg;
++                out.last_seg = r.last_seg;
++                out.inner_min = r.inner_min;
++                out.inner_max = r.inner_max;
++            }
++            (true, false) => {
++                out.first_seg = l.first_seg;
++                out.last_seg = l.last_seg + r.last_seg;
++                out.inner_min = l.inner_min;
++                out.inner_max = l.inner_max;
++            }
++            (true, true) => {
++                out.first_seg = l.first_seg;
++                out.last_seg = r.last_seg;
++                out.inner_min = l.inner_min;
++                out.inner_max = l.inner_max;
++                if let Some(m) = r.inner_min {
++                    out.fold_inner(m);
++                }
++                if let Some(m) = r.inner_max {
++                    out.fold_inner(m);
++                }
++                // The glued segment is closed by r's first newline and is
++                // interior (l's first newline precedes it).
++                out.fold_inner(l.last_seg + r.first_seg);
++            }
++        }
++
++        // Tokens: glue l's right-edge partial onto r's left-edge partial.
++        match (l.single, r.single) {
++            (true, true) => {
++                out.single = true;
++                out.tail_word = l.tail_word + &r.tail_word;
++            }
++            (true, false) => {
++                out.single = false;
++                out.head_word = l.tail_word + &r.head_word;
++                out.tail_word = r.tail_word;
++                out.mid = r.mid;
++            }
++            (false, true) => {
++                out.single = false;
++                out.head_word = l.head_word;
++                out.tail_word = l.tail_word + &r.tail_word;
++                out.mid = l.mid;
++            }
++            (false, false) => {
++                out.single = false;
++                out.head_word = l.head_word;
++                out.tail_word = r.tail_word;
++                let mut mid = l.mid;
++                for (word, n) in r.mid {
++                    *mid.entry(word).or_insert(0) += n;
++                }
++                let glue = l.tail_word + &r.head_word;
++                if !glue.is_empty() {
++                    *mid.entry(glue).or_insert(0) += 1;
++                }
++                out.mid = mid;
+             }
+         }
++        out
+     }
+ 
+-    fn close_line(&mut self) {
+-        let len = self.cur_line;
+-        self.closed_min = Some(self.closed_min.map_or(len, |m| m.min(len)));
+-        self.closed_max = Some(self.closed_max.map_or(len, |m| m.max(len)));
+-        self.newlines += 1;
+-        self.cur_line = 0;
++    /// Frequencies of every word seen so far, edge tokens included.
++    fn token_counts(&self) -> HashMap<String, usize> {
++        let mut counts = self.mid.clone();
++        if self.single {
++            if !self.tail_word.is_empty() {
++                *counts.entry(self.tail_word.clone()).or_insert(0) += 1;
++            }
++        } else {
++            if !self.head_word.is_empty() {
++                *counts.entry(self.head_word.clone()).or_insert(0) += 1;
++            }
++            if !self.tail_word.is_empty() {
++                *counts.entry(self.tail_word.clone()).or_insert(0) += 1;
++            }
++        }
++        counts
++    }
++
++    /// The `k` most frequent words: count descending, ties broken by
++    /// lexicographic (byte) order ascending. Deterministic by construction —
++    /// the full order is sorted before truncation.
++    pub fn top_words(&self, k: usize) -> Vec<(String, usize)> {
++        let mut all: Vec<(String, usize)> = self.token_counts().into_iter().collect();
++        all.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
++        all.truncate(k);
++        all
+     }
+ 
+     /// Snapshot of the totals so far. Does not consume the accumulator; more
+     /// chunks may be fed afterwards.
+     pub fn summary(&self) -> Summary {
+-        let open_tail = self.cur_line > 0;
++        if self.chars == 0 {
++            return Summary {
++                lines: 0,
++                words: 0,
++                chars: 0,
++                bytes: self.bytes,
++                max_line_len: 0,
++                min_line_len: 0,
++            };
++        }
++        let open_tail = self.last_seg > 0;
+         let lines = self.newlines + usize::from(open_tail);
+-        let (mut min, mut max) = (self.closed_min, self.closed_max);
+-        if open_tail {
+-            min = Some(min.map_or(self.cur_line, |m| m.min(self.cur_line)));
+-            max = Some(max.map_or(self.cur_line, |m| m.max(self.cur_line)));
++        let (mut min, mut max);
++        if self.newlines == 0 {
++            // The sole segment lives in last_seg.
++            min = self.last_seg;
++            max = self.last_seg;
++        } else {
++            min = self.first_seg;
++            max = self.first_seg;
++            if let Some(m) = self.inner_min {
++                min = min.min(m);
++            }
++            if let Some(m) = self.inner_max {
++                max = max.max(m);
++            }
++            if open_tail {
++                min = min.min(self.last_seg);
++                max = max.max(self.last_seg);
++            }
+         }
+         Summary {
+             lines,
+             words: self.words,
+             chars: self.chars,
+             bytes: self.bytes,
+-            max_line_len: max.unwrap_or(0),
+-            min_line_len: min.unwrap_or(0),
++            max_line_len: max,
++            min_line_len: min,
+         }
+     }
+ }

@@ -1,0 +1,308 @@
+diff --git a/splunk_hec/__init__.py b/splunk_hec/__init__.py
+new file mode 100644
+index 0000000..a5c65cb
+--- /dev/null
++++ b/splunk_hec/__init__.py
+@@ -0,0 +1,6 @@
++"""Splunk HTTP Event Collector sender with indexer acknowledgment."""
++
++from .client import HecAckTimeout, HecSender
++from .transport import HecServerError
++
++__all__ = ["HecAckTimeout", "HecSender", "HecServerError"]
+diff --git a/splunk_hec/client.py b/splunk_hec/client.py
+new file mode 100644
+index 0000000..b770916
+--- /dev/null
++++ b/splunk_hec/client.py
+@@ -0,0 +1,103 @@
++"""HecSender: batched HEC sends with indexer acknowledgment.
++
++Flow (per the official indexer-acknowledgment docs): send a batch with a
++request channel, keep the returned ackId, then poll /services/collector/ack
++until it reports true. Once an ackId reports true HEC deletes its status —
++querying it again always returns false — so acked ids are dropped from
++every later poll.
++"""
++
++import json
++import urllib.parse
++
++from .envelope import serialize_batch, validate_channel
++from .transport import HecServerError, Transport
++
++EVENT_PATH = "/services/collector/event"
++RAW_PATH = "/services/collector/raw"
++ACK_PATH = "/services/collector/ack"
++HEALTH_PATH = "/services/collector/health"
++
++CHANNEL_HEADER = "X-Splunk-Request-Channel"
++
++
++class HecAckTimeout(Exception):
++    """Raised when ackIds stay unacknowledged after max_polls polls."""
++
++    def __init__(self, unacked):
++        self.unacked = frozenset(unacked)
++        super().__init__(
++            "no acknowledgment after polling for ackIds: %s"
++            % ", ".join(str(i) for i in sorted(self.unacked)))
++
++
++class HecSender:
++    def __init__(self, base_url, token, channel, sleeper, gzip=False):
++        self.channel = validate_channel(channel)
++        self._transport = Transport(base_url, token, use_gzip=gzip)
++        self._sleeper = sleeper
++
++    # -- sending ---------------------------------------------------------
++
++    def _ack_id(self, resp):
++        ack_id = resp.doc.get("ackId")
++        if ack_id is None:
++            raise HecServerError(
++                resp.status, resp.doc.get("code", -1),
++                "response carried no ackId - indexer acknowledgment is not "
++                "enabled for this token")
++        return int(ack_id)
++
++    def send_events(self, events):
++        body = serialize_batch(events)
++        resp = self._transport.request(
++            "POST", EVENT_PATH, body=body,
++            headers={CHANNEL_HEADER: self.channel}, compress=True)
++        return self._ack_id(resp)
++
++    def send_events_with_retry(self, events, max_attempts, backoff):
++        body = serialize_batch(events)
++        resp = self._transport.request_with_retry(
++            "POST", EVENT_PATH, body,
++            {CHANNEL_HEADER: self.channel},
++            self._sleeper, max_attempts, backoff, compress=True)
++        return self._ack_id(resp)
++
++    def send_raw(self, text):
++        path = RAW_PATH + "?" + urllib.parse.urlencode({"channel": self.channel})
++        resp = self._transport.request(
++            "POST", path, body=text.encode("utf-8"), compress=True)
++        return self._ack_id(resp)
++
++    # -- acknowledgment --------------------------------------------------
++
++    def poll_acks(self, ack_ids):
++        body = json.dumps({"acks": list(ack_ids)}).encode("utf-8")
++        resp = self._transport.request(
++            "POST", ACK_PATH, body=body,
++            headers={CHANNEL_HEADER: self.channel})
++        return {int(k): bool(v) for k, v in resp.doc.get("acks", {}).items()}
++
++    def wait_until_acked(self, ack_ids, poll_interval, max_polls):
++        pending = set(ack_ids)
++        for poll in range(max_polls):
++            if poll:
++                self._sleeper(poll_interval)
++            statuses = self.poll_acks(sorted(pending))
++            # drop confirmed ids: HEC deletes a status after reporting
++            # true, so a re-query would falsely read as unacked
++            pending -= {ack_id for ack_id, done in statuses.items() if done}
++            if not pending:
++                return
++        raise HecAckTimeout(pending)
++
++    # -- health ----------------------------------------------------------
++
++    def health(self):
++        try:
++            self._transport.request("GET", HEALTH_PATH)
++            return True
++        except HecServerError as err:
++            if err.status == 503:
++                return False
++            raise
+diff --git a/splunk_hec/envelope.py b/splunk_hec/envelope.py
+new file mode 100644
+index 0000000..0119109
+--- /dev/null
++++ b/splunk_hec/envelope.py
+@@ -0,0 +1,73 @@
++"""Envelope building and validation for the HEC JSON event protocol.
++
++Reference: "Format events for HTTP Event Collector" (help.splunk.com).
++An envelope may carry exactly the documented keys; ``event`` is required,
++``time`` is epoch seconds with millisecond precision, and ``fields`` must
++be a flat object of index-time fields (scalars or arrays of scalars).
++"""
++
++import json
++import re
++
++ALLOWED_KEYS = {"event", "time", "host", "source", "sourcetype", "index", "fields"}
++
++# Channels must be GUID-shaped (8-4-4-4-12 hex); they may be random.
++CHANNEL_RE = re.compile(
++    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
++    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
++)
++
++_SCALARS = (str, int, float, bool)
++
++
++def validate_channel(channel):
++    if not isinstance(channel, str) or not CHANNEL_RE.match(channel):
++        raise ValueError(
++            "HEC request channels must be GUID-shaped, got %r" % (channel,))
++    return channel
++
++
++def _validate_fields(fields):
++    if not isinstance(fields, dict):
++        raise ValueError("fields must be a flat JSON object")
++    for name, value in fields.items():
++        if isinstance(value, _SCALARS) or value is None:
++            continue
++        if isinstance(value, list):
++            if all(isinstance(v, _SCALARS) for v in value):
++                continue
++            raise ValueError(
++                "fields.%s: multivalue entries must be scalars" % name)
++        raise ValueError(
++            "fields.%s: nested objects are not indexable at index time" % name)
++
++
++def validate_envelope(envelope):
++    if not isinstance(envelope, dict):
++        raise ValueError("each event must be a dict envelope")
++    unknown = set(envelope) - ALLOWED_KEYS
++    if unknown:
++        raise ValueError("unknown envelope keys: %s" % ", ".join(sorted(unknown)))
++    if "event" not in envelope:
++        raise ValueError("the event key is required in every envelope")
++    if "time" in envelope and (
++            isinstance(envelope["time"], bool)
++            or not isinstance(envelope["time"], (int, float))):
++        raise ValueError("time must be epoch seconds (int or float)")
++    if "fields" in envelope:
++        _validate_fields(envelope["fields"])
++
++
++def serialize_batch(events):
++    """One compact JSON object per event, newline-separated."""
++    if not events:
++        raise ValueError("refusing to send an empty batch")
++    lines = []
++    for envelope in events:
++        validate_envelope(envelope)
++        out = dict(envelope)
++        if "time" in out:
++            # epoch seconds at millisecond precision, per the format docs
++            out["time"] = round(float(out["time"]), 3)
++        lines.append(json.dumps(out, separators=(",", ":")))
++    return "\n".join(lines).encode("utf-8")
+diff --git a/splunk_hec/transport.py b/splunk_hec/transport.py
+new file mode 100644
+index 0000000..477a00b
+--- /dev/null
++++ b/splunk_hec/transport.py
+@@ -0,0 +1,102 @@
++"""HTTP transport for HEC with token auth, gzip and retry policy.
++
++Auth is the ``Authorization: Splunk <token>`` header — never a URL
++parameter. Retryable outcomes are transport failures (no readable
++response) and the 429/500/503 statuses from the official HEC response
++code table; other 4xx are terminal.
++"""
++
++import gzip
++import json
++import urllib.error
++import urllib.request
++
++RETRYABLE_STATUSES = {429, 500, 503}
++
++
++class HecServerError(Exception):
++    """A decoded HEC error body: {"text": ..., "code": ...}."""
++
++    def __init__(self, status, code, text):
++        super().__init__("HEC %d (code %s): %s" % (status, code, text))
++        self.status = status
++        self.code = code
++        self.text = text
++
++
++class Response:
++    def __init__(self, status, doc):
++        self.status = status
++        self.doc = doc
++
++
++class Transport:
++    def __init__(self, base_url, token, use_gzip=False):
++        self.base_url = base_url.rstrip("/")
++        self._token = token
++        self.use_gzip = use_gzip
++
++    def _request(self, method, path, body=None, headers=None, compress=False):
++        url = self.base_url + path
++        all_headers = {"Authorization": "Splunk " + self._token}
++        if headers:
++            all_headers.update(headers)
++        if body is not None and compress and self.use_gzip:
++            body = gzip.compress(body)
++            all_headers["Content-Encoding"] = "gzip"
++        req = urllib.request.Request(url, data=body, method=method,
++                                     headers=all_headers)
++        try:
++            with urllib.request.urlopen(req) as resp:
++                return Response(resp.status, self._decode(resp.read()))
++        except urllib.error.HTTPError as err:
++            return Response(err.code, self._decode(err.read()))
++
++    @staticmethod
++    def _decode(raw):
++        if not raw:
++            return {}
++        try:
++            return json.loads(raw.decode("utf-8"))
++        except ValueError:
++            return {}
++
++    def request(self, method, path, body=None, headers=None, compress=False):
++        """Single attempt; raises HecServerError on any non-2xx."""
++        resp = self._request(method, path, body, headers, compress)
++        if resp.status // 100 != 2:
++            raise self._error(resp)
++        return resp
++
++    def request_with_retry(self, method, path, body, headers, sleeper,
++                           max_attempts, backoff, compress=False):
++        """Retry ambiguous transport failures and retryable statuses.
++
++        The body is resent byte-identical: with indexer acknowledgment the
++        worst case is a duplicate the ack poll confirms (at-least-once).
++        """
++        last_transport_error = None
++        for attempt in range(max_attempts):
++            if attempt:
++                sleeper(backoff)
++            try:
++                resp = self._request(method, path, body, headers, compress)
++            except OSError as err:
++                last_transport_error = err
++                continue
++            if resp.status // 100 == 2:
++                return resp
++            if resp.status in RETRYABLE_STATUSES:
++                last_transport_error = None
++                last_response = resp
++                continue
++            raise self._error(resp)
++        if last_transport_error is not None:
++            raise last_transport_error
++        raise self._error(last_response)
++
++    @staticmethod
++    def _error(resp):
++        return HecServerError(resp.status,
++                              resp.doc.get("code", -1),
++                              resp.doc.get("text", "unknown HEC failure"))

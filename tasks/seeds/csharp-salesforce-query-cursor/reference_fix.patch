@@ -1,0 +1,261 @@
+diff --git a/Errors.cs b/Errors.cs
+new file mode 100644
+index 0000000..30d139d
+--- /dev/null
++++ b/Errors.cs
+@@ -0,0 +1,28 @@
++namespace SoqlExport;
++
++/// <summary>
++/// A Salesforce REST error envelope: a JSON array of message/errorCode
++/// objects. Exception text never includes the access token.
++/// </summary>
++public class SalesforceApiException : Exception
++{
++    public int StatusCode { get; }
++
++    public string ErrorCode { get; }
++
++    public SalesforceApiException(int statusCode, string errorCode, string message)
++        : base($"Salesforce request failed with {statusCode} ({errorCode}): {message}")
++    {
++        StatusCode = statusCode;
++        ErrorCode = errorCode;
++    }
++}
++
++/// <summary>The session was still invalid after the one allowed refresh.</summary>
++public sealed class SalesforceSessionException : SalesforceApiException
++{
++    public SalesforceSessionException(int statusCode, string errorCode, string message)
++        : base(statusCode, errorCode, message)
++    {
++    }
++}
+diff --git a/Models.cs b/Models.cs
+new file mode 100644
+index 0000000..9c16ffa
+--- /dev/null
++++ b/Models.cs
+@@ -0,0 +1,43 @@
++namespace SoqlExport;
++
++/// <summary>One record from a query batch, attributes metadata retained.</summary>
++public sealed class ExportedRecord
++{
++    public string Type { get; }
++
++    public string Url { get; }
++
++    public string Id { get; }
++
++    public IReadOnlyDictionary<string, string?> Fields { get; }
++
++    public ExportedRecord(string type, string url,
++        IReadOnlyDictionary<string, string?> fields)
++    {
++        Type = type;
++        Url = url;
++        Fields = fields;
++        Id = fields.TryGetValue("Id", out var id) && id != null ? id : "";
++    }
++}
++
++/// <summary>The result of a complete cursor scan.</summary>
++public sealed class QueryExport
++{
++    public int TotalSize { get; }
++
++    public int Pages { get; }
++
++    public bool SessionRefreshed { get; }
++
++    public IReadOnlyList<ExportedRecord> Records { get; }
++
++    public QueryExport(int totalSize, int pages, bool sessionRefreshed,
++        IReadOnlyList<ExportedRecord> records)
++    {
++        TotalSize = totalSize;
++        Pages = pages;
++        SessionRefreshed = sessionRefreshed;
++        Records = records;
++    }
++}
+diff --git a/SessionSource.cs b/SessionSource.cs
+new file mode 100644
+index 0000000..fb55bbd
+--- /dev/null
++++ b/SessionSource.cs
+@@ -0,0 +1,12 @@
++namespace SoqlExport;
++
++/// <summary>
++/// Supplies and refreshes the Salesforce access token. Implemented by the
++/// caller's token broker; the exporter refreshes at most once per run.
++/// </summary>
++public interface ISessionSource
++{
++    Task<string> GetTokenAsync();
++
++    Task<string> RefreshTokenAsync();
++}
+diff --git a/SoqlExporter.cs b/SoqlExporter.cs
+new file mode 100644
+index 0000000..0c504fc
+--- /dev/null
++++ b/SoqlExporter.cs
+@@ -0,0 +1,154 @@
++using System.Text.Json;
++
++namespace SoqlExport;
++
++/// <summary>
++/// SOQL exporter over the Salesforce REST query resource, per
++/// docs/contract.json: q-encoded SOQL, then the server-issued nextRecordsUrl
++/// verbatim until done. One session refresh per run on 401; one Retry-After
++/// wait per page on 503; retried pages contribute their records exactly once.
++/// </summary>
++public sealed class SoqlExporter
++{
++    private static readonly HttpClient Http = new();
++
++    private readonly string _instanceUrl;
++    private readonly string _apiVersion;
++    private readonly ISessionSource _session;
++    private readonly Func<TimeSpan, Task> _delay;
++
++    public SoqlExporter(string instanceUrl, string apiVersion,
++        ISessionSource session, Func<TimeSpan, Task>? delay = null)
++    {
++        _instanceUrl = instanceUrl.TrimEnd('/');
++        _apiVersion = apiVersion;
++        _session = session;
++        _delay = delay ?? (span => Task.Delay(span));
++    }
++
++    public async Task<QueryExport> RunAsync(string soql)
++    {
++        string token = await _session.GetTokenAsync();
++        bool refreshed = false;
++
++        var records = new List<ExportedRecord>();
++        int totalSize = 0;
++        int pages = 0;
++        string url = $"{_instanceUrl}/services/data/{_apiVersion}/query"
++            + $"?q={Uri.EscapeDataString(soql)}";
++
++        while (true)
++        {
++            var (page, newToken, didRefresh) =
++                await FetchPageAsync(url, token, refreshed);
++            token = newToken;
++            refreshed |= didRefresh;
++
++            pages++;
++            totalSize = page.GetProperty("totalSize").GetInt32();
++            foreach (var element in page.GetProperty("records").EnumerateArray())
++            {
++                records.Add(Decode(element));
++            }
++
++            if (page.GetProperty("done").GetBoolean()) break;
++            // The cursor URL is opaque: use it exactly as issued.
++            url = _instanceUrl + page.GetProperty("nextRecordsUrl").GetString();
++        }
++
++        return new QueryExport(totalSize, pages, refreshed, records);
++    }
++
++    private async Task<(JsonElement Page, string Token, bool Refreshed)>
++        FetchPageAsync(string url, string token, bool alreadyRefreshed)
++    {
++        bool refreshedNow = false;
++        bool retriedThrottle = false;
++        while (true)
++        {
++            using var request = new HttpRequestMessage(HttpMethod.Get, url);
++            request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {token}");
++            request.Headers.TryAddWithoutValidation("Accept", "application/json");
++            using var response = await Http.SendAsync(request);
++            string body = await response.Content.ReadAsStringAsync();
++
++            if (response.IsSuccessStatusCode)
++            {
++                var page = JsonDocument.Parse(body).RootElement.Clone();
++                return (page, token, refreshedNow);
++            }
++
++            var (errorCode, message) = DecodeEnvelope(body);
++            int status = (int)response.StatusCode;
++
++            if (status == 401)
++            {
++                if (alreadyRefreshed || refreshedNow)
++                {
++                    throw new SalesforceSessionException(status, errorCode, message);
++                }
++                token = await _session.RefreshTokenAsync();
++                refreshedNow = true;
++                continue; // identical URL, new token
++            }
++
++            if (status == 503 && !retriedThrottle)
++            {
++                int seconds = 0;
++                if (response.Headers.TryGetValues("Retry-After", out var values))
++                {
++                    int.TryParse(values.FirstOrDefault(), out seconds);
++                }
++                await _delay(TimeSpan.FromSeconds(seconds));
++                retriedThrottle = true;
++                continue; // identical URL, records land once because the failed
++                          // attempt returned no page to decode
++            }
++
++            throw new SalesforceApiException(status, errorCode, message);
++        }
++    }
++
++    private static ExportedRecord Decode(JsonElement element)
++    {
++        string type = "";
++        string url = "";
++        var fields = new Dictionary<string, string?>();
++        foreach (var property in element.EnumerateObject())
++        {
++            if (property.Name == "attributes")
++            {
++                type = property.Value.GetProperty("type").GetString() ?? "";
++                url = property.Value.GetProperty("url").GetString() ?? "";
++                continue;
++            }
++            fields[property.Name] = property.Value.ValueKind switch
++            {
++                JsonValueKind.Null => null,
++                JsonValueKind.String => property.Value.GetString(),
++                _ => property.Value.GetRawText(),
++            };
++        }
++        return new ExportedRecord(type, url, fields);
++    }
++
++    private static (string ErrorCode, string Message) DecodeEnvelope(string body)
++    {
++        try
++        {
++            using var doc = JsonDocument.Parse(body);
++            var first = doc.RootElement.EnumerateArray().FirstOrDefault();
++            if (first.ValueKind == JsonValueKind.Object)
++            {
++                return (
++                    first.GetProperty("errorCode").GetString() ?? "UNKNOWN",
++                    first.GetProperty("message").GetString() ?? "");
++            }
++        }
++        catch (JsonException)
++        {
++            // non-JSON error body; fall through
++        }
++        return ("UNKNOWN", "");
++    }
++}

@@ -1,0 +1,202 @@
+diff --git a/tail.go b/tail.go
+new file mode 100644
+index 0000000..99dfe29
+--- /dev/null
++++ b/tail.go
+@@ -0,0 +1,196 @@
++// Package logtail follows a log file across the ways log files actually
++// move: appends, logrotate-style rename+recreate, copytruncate, and in-place
++// rewrites. The follower is strictly pull-based — nothing happens except
++// inside Poll — and it keeps a byte offset so a restarted process can resume
++// exactly where the previous one stopped.
++package logtail
++
++import (
++	"bytes"
++	"errors"
++	"io"
++	"os"
++)
++
++// State is the follower's persistable position: the byte offset of the first
++// byte that has not been delivered as a complete line. An unterminated final
++// line is not consumed, so resuming re-reads it and delivers it exactly once,
++// completed.
++type State struct {
++	Offset int64
++}
++
++// Follower tails one path. It is not safe for concurrent use.
++type Follower struct {
++	path   string
++	file   *os.File // currently tailed file, nil until first successful open
++	offset int64    // committed offset: end of the last delivered newline
++}
++
++// New follows path from the beginning. The file does not need to exist yet;
++// Poll waits quietly until it appears.
++func New(path string) *Follower {
++	return &Follower{path: path}
++}
++
++// Resume follows path starting from a previously saved State. An offset that
++// no longer fits the file (it shrank or was replaced) restarts from the top.
++func Resume(path string, st State) *Follower {
++	return &Follower{path: path, offset: st.Offset}
++}
++
++// Poll reports every line that has become complete since the previous call.
++// A trailing line with no newline yet is held back — except when its file has
++// been rotated away, in which case it can never be completed and is delivered
++// as-is. After a rotation the same Poll also reads the replacement file from
++// the top, so no call is wasted.
++func (f *Follower) Poll() ([]string, error) {
++	if f.file == nil {
++		if err := f.open(); err != nil {
++			return nil, err
++		}
++		if f.file == nil {
++			return nil, nil // still waiting for the file to exist
++		}
++	}
++
++	pathInfo, statErr := os.Stat(f.path)
++	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
++		return nil, statErr
++	}
++	fileInfo, err := f.file.Stat()
++	if err != nil {
++		return nil, err
++	}
++
++	if statErr == nil && os.SameFile(fileInfo, pathInfo) {
++		// Same file as last time. A size below our offset means it was
++		// truncated (copytruncate) or rewritten shorter: start over.
++		if pathInfo.Size() < f.offset {
++			f.offset = 0
++		}
++		lines, next, err := readComplete(f.file, f.offset)
++		if err != nil {
++			return nil, err
++		}
++		f.offset = next
++		return lines, nil
++	}
++
++	// The path is gone or now names a different file: the one we hold was
++	// rotated away. Drain it fully — including an unterminated tail, which
++	// can never be completed now — then pick up the replacement, if any.
++	lines, err := drain(f.file, f.offset)
++	if err != nil {
++		return nil, err
++	}
++	f.file.Close()
++	f.file = nil
++	f.offset = 0
++	if statErr != nil {
++		return lines, nil // rotated away, nothing new in its place yet
++	}
++	if err := f.open(); err != nil {
++		return lines, err
++	}
++	if f.file != nil {
++		more, next, err := readComplete(f.file, 0)
++		if err != nil {
++			return lines, err
++		}
++		f.offset = next
++		lines = append(lines, more...)
++	}
++	return lines, nil
++}
++
++// State returns the follower's current resumable position.
++func (f *Follower) State() State {
++	return State{Offset: f.offset}
++}
++
++// Close releases the underlying file, if one is open.
++func (f *Follower) Close() error {
++	if f.file == nil {
++		return nil
++	}
++	err := f.file.Close()
++	f.file = nil
++	return err
++}
++
++// open attempts to open the followed path. A missing file is not an error —
++// the follower just keeps waiting. If the file is smaller than the resumed
++// offset, the offset no longer refers to this content and is reset.
++func (f *Follower) open() error {
++	file, err := os.Open(f.path)
++	if errors.Is(err, os.ErrNotExist) {
++		return nil
++	}
++	if err != nil {
++		return err
++	}
++	info, err := file.Stat()
++	if err != nil {
++		file.Close()
++		return err
++	}
++	if info.Size() < f.offset {
++		f.offset = 0
++	}
++	f.file = file
++	return nil
++}
++
++// readComplete reads from offset to EOF and returns only the complete lines,
++// along with the offset just past the last newline consumed. Bytes after the
++// final newline stay unconsumed.
++func readComplete(file *os.File, offset int64) ([]string, int64, error) {
++	data, err := readFrom(file, offset)
++	if err != nil {
++		return nil, offset, err
++	}
++	last := bytes.LastIndexByte(data, '\n')
++	if last < 0 {
++		return nil, offset, nil // nothing terminated yet: hold the partial
++	}
++	return splitLines(data[:last+1]), offset + int64(last) + 1, nil
++}
++
++// drain reads from offset to EOF and returns every line, delivering a
++// trailing unterminated line as-is.
++func drain(file *os.File, offset int64) ([]string, error) {
++	data, err := readFrom(file, offset)
++	if err != nil {
++		return nil, err
++	}
++	if len(data) == 0 {
++		return nil, nil
++	}
++	return splitLines(data), nil
++}
++
++func readFrom(file *os.File, offset int64) ([]byte, error) {
++	if _, err := file.Seek(offset, io.SeekStart); err != nil {
++		return nil, err
++	}
++	return io.ReadAll(file)
++}
++
++// splitLines splits on '\n' and strips one trailing '\r' per line, so CRLF
++// logs read the same as LF logs. A trailing chunk without a newline becomes
++// a final line (callers that must hold partials cut the data beforehand).
++func splitLines(data []byte) []string {
++	var lines []string
++	for len(data) > 0 {
++		i := bytes.IndexByte(data, '\n')
++		var line []byte
++		if i < 0 {
++			line, data = data, nil
++		} else {
++			line, data = data[:i], data[i+1:]
++		}
++		lines = append(lines, string(bytes.TrimSuffix(line, []byte("\r"))))
++	}
++	return lines
++}

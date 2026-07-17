@@ -1,0 +1,577 @@
+diff --git a/nodes.py b/nodes.py
+new file mode 100644
+index 0000000..7aa3b8e
+--- /dev/null
++++ b/nodes.py
+@@ -0,0 +1,79 @@
++"""Node serialization: leaves hold (key, value) pairs, internal nodes hold
++separator keys and child page ids. Keys are UTF-8 bytes; UTF-8 byte order
++equals codepoint order, so byte comparison matches Python str comparison.
++
++Leaf:     b"L" | u16 count | count * (u16 klen, key, u16 vlen, value)
++Internal: b"I" | u16 nkeys | u32 child0 | nkeys * (u16 klen, key, u32 child)
++"""
++import struct
++
++_U16 = struct.Struct("<H")
++_U32 = struct.Struct("<I")
++
++
++class Leaf:
++    __slots__ = ("keys", "vals")
++
++    def __init__(self, keys=None, vals=None):
++        self.keys = keys or []
++        self.vals = vals or []
++
++    def size(self):
++        return 3 + sum(4 + len(k) + len(v) for k, v in zip(self.keys, self.vals))
++
++    def encode(self):
++        parts = [b"L", _U16.pack(len(self.keys))]
++        for k, v in zip(self.keys, self.vals):
++            parts += [_U16.pack(len(k)), k, _U16.pack(len(v)), v]
++        return b"".join(parts)
++
++
++class Internal:
++    __slots__ = ("keys", "children")
++
++    def __init__(self, keys=None, children=None):
++        self.keys = keys or []
++        self.children = children or []  # len(children) == len(keys) + 1
++
++    def size(self):
++        return 3 + 4 + sum(6 + len(k) for k in self.keys)
++
++    def encode(self):
++        parts = [b"I", _U16.pack(len(self.keys)), _U32.pack(self.children[0])]
++        for k, child in zip(self.keys, self.children[1:]):
++            parts += [_U16.pack(len(k)), k, _U32.pack(child)]
++        return b"".join(parts)
++
++
++def decode(data):
++    tag = data[:1]
++    (count,) = _U16.unpack_from(data, 1)
++    off = 3
++    if tag == b"L":
++        node = Leaf()
++        for _ in range(count):
++            (klen,) = _U16.unpack_from(data, off)
++            off += 2
++            key = bytes(data[off:off + klen])
++            off += klen
++            (vlen,) = _U16.unpack_from(data, off)
++            off += 2
++            node.keys.append(key)
++            node.vals.append(bytes(data[off:off + vlen]))
++            off += vlen
++        return node
++    if tag == b"I":
++        node = Internal()
++        (child0,) = _U32.unpack_from(data, off)
++        off += 4
++        node.children.append(child0)
++        for _ in range(count):
++            (klen,) = _U16.unpack_from(data, off)
++            off += 2
++            node.keys.append(bytes(data[off:off + klen]))
++            off += klen
++            (child,) = _U32.unpack_from(data, off)
++            off += 4
++            node.children.append(child)
++        return node
++    raise ValueError(f"unknown node tag {tag!r}")
+diff --git a/pagedb.py b/pagedb.py
+new file mode 100644
+index 0000000..bc3ecf4
+--- /dev/null
++++ b/pagedb.py
+@@ -0,0 +1,104 @@
++"""Public facade for the pagedb B-tree page store.
++
++    from pagedb import PageStore, CorruptError
++    st = PageStore.open("data.db", page_size=512)
++    st.put("key", b"value"); st.flush(); st.close()
++
++Durability contract: flush() is the commit point — dirty pages are written
++first, the header (with its checksum) last. open() truncates uncommitted
++trailing bytes and raises CorruptError for a bad header or a file shorter
++than the committed page count.
++"""
++from pager import CorruptError, Pager
++from tree import BTree
++
++__all__ = ["PageStore", "CorruptError"]
++
++
++class PageStore:
++    def __init__(self, pager, tree):
++        self._pager = pager
++        self._tree = tree
++
++    @classmethod
++    def open(cls, path, page_size=4096):
++        """Open or create a store. page_size only applies at creation; an
++        existing file's stored page size always wins."""
++        if page_size < 128:
++            raise ValueError("page_size must be at least 128 bytes")
++        pager = Pager(path, page_size)
++        return cls(pager, BTree(pager))
++
++    # ---- internals ---------------------------------------------------------
++    def _check_open(self):
++        if self._pager is None:
++            raise ValueError("store is closed")
++
++    def _encode_key(self, key):
++        if not isinstance(key, str):
++            raise ValueError("key must be str")
++        kb = key.encode("utf-8")
++        if not 1 <= len(kb) <= self._pager.page_size // 8:
++            raise ValueError(
++                f"key must be 1..{self._pager.page_size // 8} UTF-8 bytes")
++        return kb
++
++    # ---- mutations ---------------------------------------------------------
++    def put(self, key, value):
++        self._check_open()
++        kb = self._encode_key(key)
++        if not isinstance(value, (bytes, bytearray)):
++            raise ValueError("value must be bytes")
++        if len(value) > self._pager.page_size // 4:
++            raise ValueError(
++                f"value exceeds {self._pager.page_size // 4} bytes")
++        if self._tree.put(kb, bytes(value)):
++            self._pager.entries += 1
++
++    def delete(self, key):
++        self._check_open()
++        kb = self._encode_key(key)
++        if self._tree.delete(kb):
++            self._pager.entries -= 1
++            return True
++        return False
++
++    # ---- reads -------------------------------------------------------------
++    def get(self, key):
++        self._check_open()
++        return self._tree.get(self._encode_key(key))
++
++    def scan(self, lo=None, hi=None):
++        """Yield (key, value) in key order; lo inclusive, hi exclusive."""
++        self._check_open()
++        lob = None if lo is None else lo.encode("utf-8")
++        hib = None if hi is None else hi.encode("utf-8")
++        for k, v in self._tree.scan(lob, hib):
++            yield k.decode("utf-8"), v
++
++    def __len__(self):
++        self._check_open()
++        return self._pager.entries
++
++    def stats(self):
++        self._check_open()
++        height, node_count = self._tree.measure()
++        return {
++            "page_size": self._pager.page_size,
++            "pages": self._pager.pages,
++            "height": height,
++            "nodes": node_count,
++            "entries": self._pager.entries,
++            "free_pages": self._pager.free_count(),
++        }
++
++    # ---- durability --------------------------------------------------------
++    def flush(self):
++        self._check_open()
++        self._pager.flush()
++
++    def close(self):
++        if self._pager is None:
++            return
++        self._pager.close()
++        self._pager = None
+diff --git a/pager.py b/pager.py
+new file mode 100644
+index 0000000..d986eb9
+--- /dev/null
++++ b/pager.py
+@@ -0,0 +1,135 @@
++"""Page file layer: header, page cache, and the persistent free list.
++
++File layout: fixed-size pages, page 0 is the header. Header fields are
++packed at the start of page 0 and covered by a CRC32:
++
++    magic  6s   b"PGDB1\\n"
++    page_size  u32
++    pages      u32   committed page count (including the header page)
++    root       u32   root page id, 0 = empty tree
++    free_head  u32   first page of the free list, 0 = empty
++    entries    u64   live key count
++    crc        u32   crc32 over everything above
++
++Free pages form a singly linked list: the first 4 bytes of a free page hold
++the id of the next free page (0 terminates).
++"""
++import os
++import struct
++import zlib
++
++
++class CorruptError(Exception):
++    """The file on disk is not a valid committed pagedb image."""
++
++
++MAGIC = b"PGDB1\n"
++_HEADER = struct.Struct("<6sIIIIQ")
++_CRC = struct.Struct("<I")
++_NEXT = struct.Struct("<I")
++HEADER_SIZE = _HEADER.size + _CRC.size
++
++
++class Pager:
++    def __init__(self, path, page_size):
++        exists = os.path.exists(path) and os.path.getsize(path) > 0
++        self._f = open(path, "r+b" if exists else "w+b")
++        self._cache = {}
++        self._dirty = set()
++        if exists:
++            self._load_header()
++        else:
++            self.page_size = page_size
++            self.pages = 1
++            self.root = 0
++            self.free_head = 0
++            self.entries = 0
++            self.flush()
++
++    # ---- header ----------------------------------------------------------
++    def _load_header(self):
++        self._f.seek(0)
++        raw = self._f.read(HEADER_SIZE)
++        if len(raw) < HEADER_SIZE:
++            raise CorruptError("file too small for a header")
++        magic, page_size, pages, root, free_head, entries = _HEADER.unpack(
++            raw[:_HEADER.size])
++        (crc,) = _CRC.unpack(raw[_HEADER.size:])
++        if magic != MAGIC:
++            raise CorruptError("bad magic: not a pagedb file")
++        if crc != zlib.crc32(raw[:_HEADER.size]):
++            raise CorruptError("header checksum mismatch")
++        if page_size < HEADER_SIZE:
++            raise CorruptError("implausible page size")
++        self.page_size = page_size
++        self.pages = pages
++        self.root = root
++        self.free_head = free_head
++        self.entries = entries
++
++        self._f.seek(0, os.SEEK_END)
++        size = self._f.tell()
++        committed = pages * page_size
++        if size < committed:
++            raise CorruptError(
++                f"file is {size} bytes but header commits {committed}")
++        if size > committed:
++            # a writer died after extending the file but before committing
++            self._f.truncate(committed)
++
++    def _header_bytes(self):
++        body = _HEADER.pack(MAGIC, self.page_size, self.pages, self.root,
++                            self.free_head, self.entries)
++        return body + _CRC.pack(zlib.crc32(body))
++
++    # ---- page IO ---------------------------------------------------------
++    def read_page(self, pid):
++        if pid in self._cache:
++            return self._cache[pid]
++        self._f.seek(pid * self.page_size)
++        data = self._f.read(self.page_size)
++        if len(data) < self.page_size:
++            data = data.ljust(self.page_size, b"\x00")
++        self._cache[pid] = data
++        return data
++
++    def write_page(self, pid, data):
++        assert len(data) <= self.page_size, "page overflow"
++        self._cache[pid] = data.ljust(self.page_size, b"\x00")
++        self._dirty.add(pid)
++
++    # ---- allocation ------------------------------------------------------
++    def alloc(self):
++        if self.free_head:
++            pid = self.free_head
++            (self.free_head,) = _NEXT.unpack_from(self.read_page(pid))
++            return pid
++        pid = self.pages
++        self.pages += 1
++        return pid
++
++    def free(self, pid):
++        self.write_page(pid, _NEXT.pack(self.free_head))
++        self.free_head = pid
++
++    def free_count(self):
++        n, pid = 0, self.free_head
++        while pid:
++            n += 1
++            (pid,) = _NEXT.unpack_from(self.read_page(pid))
++        return n
++
++    # ---- durability ------------------------------------------------------
++    def flush(self):
++        for pid in sorted(self._dirty):
++            self._f.seek(pid * self.page_size)
++            self._f.write(self._cache[pid])
++        self._dirty.clear()
++        page0 = self._header_bytes().ljust(self.page_size, b"\x00")
++        self._f.seek(0)
++        self._f.write(page0)
++        self._f.flush()
++
++    def close(self):
++        self.flush()
++        self._f.close()
+diff --git a/tree.py b/tree.py
+new file mode 100644
+index 0000000..88cc139
+--- /dev/null
++++ b/tree.py
+@@ -0,0 +1,235 @@
++"""B-tree logic: search, insert with splits, delete with borrow/merge,
++in-order range scans. Values live in leaves; internal nodes route with
++separator keys (separator = first key of its right subtree).
++
++A node underflows when its serialized size drops below page_size // 4.
++Rebalancing prefers merging (fewer pages) and falls back to borrowing when
++the combined node would not fit a page. Pages emptied by merges or the root
++collapse are returned to the pager's free list.
++"""
++from bisect import bisect_left, bisect_right
++
++from nodes import Internal, Leaf, decode
++
++
++class BTree:
++    def __init__(self, pager):
++        self.pg = pager
++
++    # ---- helpers -----------------------------------------------------------
++    def _load(self, pid):
++        return decode(self.pg.read_page(pid))
++
++    def _store(self, pid, node):
++        self.pg.write_page(pid, node.encode())
++
++    def _threshold(self):
++        return self.pg.page_size // 4
++
++    # ---- lookup ------------------------------------------------------------
++    def get(self, key):
++        pid = self.pg.root
++        if not pid:
++            return None
++        while True:
++            node = self._load(pid)
++            if isinstance(node, Leaf):
++                i = bisect_left(node.keys, key)
++                if i < len(node.keys) and node.keys[i] == key:
++                    return node.vals[i]
++                return None
++            pid = node.children[bisect_right(node.keys, key)]
++
++    # ---- insert ------------------------------------------------------------
++    def put(self, key, val):
++        """Insert or replace. Returns True when the key is new."""
++        if not self.pg.root:
++            pid = self.pg.alloc()
++            self._store(pid, Leaf([key], [val]))
++            self.pg.root = pid
++            return True
++        added, split = self._insert(self.pg.root, key, val)
++        if split:
++            sep, right = split
++            pid = self.pg.alloc()
++            self._store(pid, Internal([sep], [self.pg.root, right]))
++            self.pg.root = pid
++        return added
++
++    def _insert(self, pid, key, val):
++        node = self._load(pid)
++        if isinstance(node, Leaf):
++            i = bisect_left(node.keys, key)
++            if i < len(node.keys) and node.keys[i] == key:
++                node.vals[i] = val
++                added = False
++            else:
++                node.keys.insert(i, key)
++                node.vals.insert(i, val)
++                added = True
++        else:
++            i = bisect_right(node.keys, key)
++            added, split = self._insert(node.children[i], key, val)
++            if split:
++                sep, right = split
++                node.keys.insert(i, sep)
++                node.children.insert(i + 1, right)
++
++        if node.size() > self.pg.page_size:
++            result = self._split(node)
++            self._store(pid, node)
++            return added, result
++        self._store(pid, node)
++        return added, None
++
++    def _split(self, node):
++        """Split an oversized node in place; returns (separator, new right pid)."""
++        mid = self._size_midpoint(node)
++        if isinstance(node, Leaf):
++            right = Leaf(node.keys[mid:], node.vals[mid:])
++            del node.keys[mid:], node.vals[mid:]
++            sep = right.keys[0]
++        else:
++            mid = min(mid, len(node.keys) - 2)  # both halves keep >= 1 key
++            sep = node.keys[mid]
++            right = Internal(node.keys[mid + 1:], node.children[mid + 1:])
++            del node.keys[mid:], node.children[mid + 1:]
++        right_pid = self.pg.alloc()
++        self._store(right_pid, right)
++        return sep, right_pid
++
++    @staticmethod
++    def _size_midpoint(node):
++        """Index that splits the node's entries into halves of similar bytes."""
++        if isinstance(node, Leaf):
++            weights = [4 + len(k) + len(v) for k, v in zip(node.keys, node.vals)]
++        else:
++            weights = [6 + len(k) for k in node.keys]
++        half, acc = sum(weights) / 2, 0
++        for i, w in enumerate(weights):
++            acc += w
++            if acc >= half:
++                return min(max(i, 1), len(weights) - 1)
++        return len(weights) - 1
++
++    # ---- delete ------------------------------------------------------------
++    def delete(self, key):
++        if not self.pg.root:
++            return False
++        removed = self._delete(self.pg.root, key)
++        if removed:
++            root = self._load(self.pg.root)
++            if isinstance(root, Internal) and not root.keys:
++                old = self.pg.root
++                self.pg.root = root.children[0]
++                self.pg.free(old)
++            elif isinstance(root, Leaf) and not root.keys:
++                self.pg.free(self.pg.root)
++                self.pg.root = 0
++        return removed
++
++    def _delete(self, pid, key):
++        node = self._load(pid)
++        if isinstance(node, Leaf):
++            i = bisect_left(node.keys, key)
++            if i < len(node.keys) and node.keys[i] == key:
++                del node.keys[i], node.vals[i]
++                self._store(pid, node)
++                return True
++            return False
++        i = bisect_right(node.keys, key)
++        removed = self._delete(node.children[i], key)
++        if removed:
++            child = self._load(node.children[i])
++            if child.size() < self._threshold() and len(node.children) > 1:
++                self._rebalance(node, i)
++            self._store(pid, node)
++        return removed
++
++    def _rebalance(self, parent, i):
++        if i > 0 and self._merge(parent, i - 1):
++            return
++        if i + 1 < len(parent.children) and self._merge(parent, i):
++            return
++        if i > 0:
++            self._borrow(parent, i, from_left=True)
++        elif i + 1 < len(parent.children):
++            self._borrow(parent, i, from_left=False)
++
++    def _merge(self, parent, li):
++        """Merge children li and li+1 into li when the result fits a page."""
++        left_pid, right_pid = parent.children[li], parent.children[li + 1]
++        left, right = self._load(left_pid), self._load(right_pid)
++        if isinstance(left, Leaf):
++            merged = Leaf(left.keys + right.keys, left.vals + right.vals)
++        else:
++            merged = Internal(left.keys + [parent.keys[li]] + right.keys,
++                              left.children + right.children)
++        if merged.size() > self.pg.page_size:
++            return False
++        self._store(left_pid, merged)
++        del parent.keys[li], parent.children[li + 1]
++        self.pg.free(right_pid)
++        return True
++
++    def _borrow(self, parent, i, from_left):
++        """Move entries from a rich sibling until child leaves underflow."""
++        j = i - 1 if from_left else i + 1
++        child_pid, donor_pid = parent.children[i], parent.children[j]
++        child, donor = self._load(child_pid), self._load(donor_pid)
++        sep_i = i - 1 if from_left else i
++        while child.size() < self._threshold() and donor.size() > self._threshold():
++            if isinstance(child, Leaf):
++                if from_left:
++                    child.keys.insert(0, donor.keys.pop())
++                    child.vals.insert(0, donor.vals.pop())
++                    parent.keys[sep_i] = child.keys[0]
++                else:
++                    child.keys.append(donor.keys.pop(0))
++                    child.vals.append(donor.vals.pop(0))
++                    parent.keys[sep_i] = donor.keys[0]
++            else:
++                if from_left:
++                    child.keys.insert(0, parent.keys[sep_i])
++                    child.children.insert(0, donor.children.pop())
++                    parent.keys[sep_i] = donor.keys.pop()
++                else:
++                    child.keys.append(parent.keys[sep_i])
++                    child.children.append(donor.children.pop(0))
++                    parent.keys[sep_i] = donor.keys.pop(0)
++        self._store(child_pid, child)
++        self._store(donor_pid, donor)
++
++    # ---- scans and measurement ----------------------------------------------
++    def scan(self, lo, hi):
++        if self.pg.root:
++            yield from self._scan(self.pg.root, lo, hi)
++
++    def _scan(self, pid, lo, hi):
++        node = self._load(pid)
++        if isinstance(node, Leaf):
++            start = 0 if lo is None else bisect_left(node.keys, lo)
++            for k, v in zip(node.keys[start:], node.vals[start:]):
++                if hi is not None and k >= hi:
++                    return
++                yield k, v
++            return
++        start = 0 if lo is None else bisect_right(node.keys, lo)
++        for ci in range(start, len(node.children)):
++            if hi is not None and ci > 0 and node.keys[ci - 1] >= hi:
++                return
++            yield from self._scan(node.children[ci], lo, hi)
++
++    def measure(self):
++        """Returns (height, node count) by walking the tree."""
++        if not self.pg.root:
++            return 0, 0
++
++        def walk(pid):
++            node = self._load(pid)
++            if isinstance(node, Leaf):
++                return 1, 1
++            parts = [walk(c) for c in node.children]
++            return max(h for h, _ in parts) + 1, sum(n for _, n in parts) + 1
++
++        return walk(self.pg.root)

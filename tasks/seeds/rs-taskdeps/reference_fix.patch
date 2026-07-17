@@ -1,0 +1,277 @@
+diff --git a/src/lib.rs b/src/lib.rs
+new file mode 100644
+index 0000000..111d69b
+--- /dev/null
++++ b/src/lib.rs
+@@ -0,0 +1,271 @@
++//! Deterministic artifact-graph task planner and runner.
++//!
++//! Tasks are connected only through named artifacts: a task may run once
++//! every artifact it `needs` exists, and a successful task contributes the
++//! artifacts it `produces`. Planning groups tasks into topological batches;
++//! execution walks those batches, propagating failures to dependents with
++//! root-cause attribution. Every observable ordering is deterministic.
++
++use std::collections::{BTreeMap, HashMap, HashSet};
++use std::fmt;
++
++/// One task in a pipeline: an id plus its artifact edges.
++#[derive(Debug, Clone)]
++pub struct TaskSpec {
++    id: String,
++    needs: Vec<String>,
++    produces: Vec<String>,
++}
++
++impl TaskSpec {
++    pub fn new(id: &str, needs: &[&str], produces: &[&str]) -> TaskSpec {
++        TaskSpec {
++            id: id.to_string(),
++            needs: needs.iter().map(|s| s.to_string()).collect(),
++            produces: produces.iter().map(|s| s.to_string()).collect(),
++        }
++    }
++}
++
++/// Why a pipeline cannot be planned. Payload ordering is deterministic:
++/// every `Vec` in here is lexicographically sorted.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum PlanError {
++    DuplicateTask {
++        id: String,
++    },
++    DuplicateProducer {
++        artifact: String,
++        producers: Vec<String>,
++    },
++    UnknownArtifact {
++        task: String,
++        artifact: String,
++    },
++    Cycle {
++        tasks: Vec<String>,
++    },
++}
++
++impl fmt::Display for PlanError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            PlanError::DuplicateTask { id } => write!(f, "duplicate task id '{id}'"),
++            PlanError::DuplicateProducer {
++                artifact,
++                producers,
++            } => write!(
++                f,
++                "artifact '{artifact}' has multiple producers: {}",
++                producers.join(", ")
++            ),
++            PlanError::UnknownArtifact { task, artifact } => {
++                write!(f, "task '{task}' needs unknown artifact '{artifact}'")
++            }
++            PlanError::Cycle { tasks } => {
++                write!(f, "dependency cycle among tasks: {}", tasks.join(", "))
++            }
++        }
++    }
++}
++
++impl std::error::Error for PlanError {}
++
++/// Outcome of one task in an [`execute`] run.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum TaskStatus {
++    Succeeded,
++    Failed,
++    /// Not invoked because a producer upstream failed; `because` is the id of
++    /// the root-cause failed task (lexicographically smallest when several
++    /// roots apply).
++    Skipped {
++        because: String,
++    },
++}
++
++/// What actually happened during an [`execute`] run.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct RunReport {
++    /// Task ids in the order they were handed to the runner.
++    pub invoked: Vec<String>,
++    /// One entry per task, sorted by task id.
++    pub statuses: Vec<(String, TaskStatus)>,
++}
++
++/// Validate the pipeline. Check order is part of the public contract:
++/// duplicate ids, then duplicate producers, then unknown artifacts.
++/// (Cycles are detected during batching, after this passes.)
++fn validate(tasks: &[TaskSpec], given: &[&str]) -> Result<(), PlanError> {
++    // 1. Duplicate task ids, in declaration order.
++    let mut seen: HashSet<&str> = HashSet::new();
++    for task in tasks {
++        if !seen.insert(task.id.as_str()) {
++            return Err(PlanError::DuplicateTask {
++                id: task.id.clone(),
++            });
++        }
++    }
++
++    // 2. Duplicate producers. `given` participates as the pseudo-producer
++    //    "(given)". BTreeMap iteration yields the lexicographically smallest
++    //    conflicting artifact first.
++    let mut producers: BTreeMap<&str, Vec<String>> = BTreeMap::new();
++    let mut given_seen: HashSet<&str> = HashSet::new();
++    for g in given {
++        if given_seen.insert(g) {
++            producers.entry(g).or_default().push("(given)".to_string());
++        }
++    }
++    for task in tasks {
++        for artifact in &task.produces {
++            producers
++                .entry(artifact.as_str())
++                .or_default()
++                .push(task.id.clone());
++        }
++    }
++    for (artifact, who) in &producers {
++        if who.len() > 1 {
++            let mut who = who.clone();
++            who.sort();
++            return Err(PlanError::DuplicateProducer {
++                artifact: artifact.to_string(),
++                producers: who,
++            });
++        }
++    }
++
++    // 3. Unknown artifacts: tasks in lexicographic id order, needs in
++    //    declaration order.
++    let mut by_id: Vec<&TaskSpec> = tasks.iter().collect();
++    by_id.sort_by(|a, b| a.id.cmp(&b.id));
++    for task in by_id {
++        for need in &task.needs {
++            if !producers.contains_key(need.as_str()) {
++                return Err(PlanError::UnknownArtifact {
++                    task: task.id.clone(),
++                    artifact: need.clone(),
++                });
++            }
++        }
++    }
++    Ok(())
++}
++
++/// Compute topological batches. Within a batch ids sort lexicographically;
++/// a batch's products only become available to *later* batches.
++pub fn plan(tasks: &[TaskSpec], given: &[&str]) -> Result<Vec<Vec<String>>, PlanError> {
++    validate(tasks, given)?;
++
++    let mut available: HashSet<&str> = given.iter().copied().collect();
++    let mut remaining: Vec<&TaskSpec> = tasks.iter().collect();
++    remaining.sort_by(|a, b| a.id.cmp(&b.id));
++
++    let mut batches: Vec<Vec<String>> = Vec::new();
++    while !remaining.is_empty() {
++        let (ready, blocked): (Vec<&TaskSpec>, Vec<&TaskSpec>) = remaining
++            .into_iter()
++            .partition(|t| t.needs.iter().all(|n| available.contains(n.as_str())));
++        if ready.is_empty() {
++            // No progress possible: report everything still unscheduled
++            // (cycle members plus tasks wedged behind them). `blocked` is
++            // already sorted because `remaining` was.
++            return Err(PlanError::Cycle {
++                tasks: blocked.iter().map(|t| t.id.clone()).collect(),
++            });
++        }
++        for task in &ready {
++            for artifact in &task.produces {
++                available.insert(artifact.as_str());
++            }
++        }
++        batches.push(ready.iter().map(|t| t.id.clone()).collect());
++        remaining = blocked;
++    }
++    Ok(batches)
++}
++
++/// Dry-run rendering: `batch 1: a, b` per line, joined with `\n`, no
++/// trailing newline; an empty plan renders as the empty string.
++pub fn render_plan(batches: &[Vec<String>]) -> String {
++    batches
++        .iter()
++        .enumerate()
++        .map(|(i, batch)| format!("batch {}: {}", i + 1, batch.join(", ")))
++        .collect::<Vec<_>>()
++        .join("\n")
++}
++
++/// Plan, then run. `run(task_id) -> bool` reports task success. Tasks with a
++/// failed or skipped producer are recorded [`TaskStatus::Skipped`] with the
++/// root-cause failed task id and are never handed to the runner.
++pub fn execute(
++    tasks: &[TaskSpec],
++    given: &[&str],
++    run: &mut dyn FnMut(&str) -> bool,
++) -> Result<RunReport, PlanError> {
++    let batches = plan(tasks, given)?;
++
++    let by_id: HashMap<&str, &TaskSpec> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
++    let mut producer_of: HashMap<&str, &str> = HashMap::new();
++    for task in tasks {
++        for artifact in &task.produces {
++            producer_of.insert(artifact.as_str(), task.id.as_str());
++        }
++    }
++
++    let mut available: HashSet<&str> = given.iter().copied().collect();
++    let mut status: HashMap<&str, TaskStatus> = HashMap::new();
++    let mut invoked: Vec<String> = Vec::new();
++
++    for batch in &batches {
++        for id in batch {
++            let spec = by_id[id.as_str()];
++            // Collect root causes for every unavailable need. A need can only
++            // be unavailable here if its producer failed or was skipped —
++            // planning guaranteed a producer exists and runs in an earlier
++            // batch.
++            let mut causes: Vec<String> = Vec::new();
++            for need in &spec.needs {
++                if available.contains(need.as_str()) {
++                    continue;
++                }
++                let producer = producer_of[need.as_str()];
++                match &status[producer] {
++                    TaskStatus::Failed => causes.push(producer.to_string()),
++                    TaskStatus::Skipped { because } => causes.push(because.clone()),
++                    TaskStatus::Succeeded => {
++                        unreachable!("succeeded producer left its artifact unavailable")
++                    }
++                }
++            }
++            if causes.is_empty() {
++                invoked.push(id.clone());
++                if run(id) {
++                    status.insert(id.as_str(), TaskStatus::Succeeded);
++                    for artifact in &spec.produces {
++                        available.insert(artifact.as_str());
++                    }
++                } else {
++                    status.insert(id.as_str(), TaskStatus::Failed);
++                }
++            } else {
++                causes.sort();
++                status.insert(
++                    id.as_str(),
++                    TaskStatus::Skipped {
++                        because: causes.remove(0),
++                    },
++                );
++            }
++        }
++    }
++
++    let mut statuses: Vec<(String, TaskStatus)> = status
++        .into_iter()
++        .map(|(id, st)| (id.to_string(), st))
++        .collect();
++    statuses.sort_by(|a, b| a.0.cmp(&b.0));
++    Ok(RunReport { invoked, statuses })
++}

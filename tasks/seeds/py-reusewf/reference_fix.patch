@@ -1,0 +1,315 @@
+diff --git a/reusewf.py b/reusewf.py
+new file mode 100644
+index 0000000..c4674db
+--- /dev/null
++++ b/reusewf.py
+@@ -0,0 +1,309 @@
++"""reusewf.py — sub-workflow composition runner for the ops workflow DSL.
++
++This module owns the composition layer only: ``run: workflow:`` tasks that
++invoke other workflows from a registry by name + exact version, callee-side
++input contracts, output exports, cycle detection over the active call stack,
++and a depth cap. Data-flow transforms and control loops live in sibling
++modules; the expression engine here is deliberately tiny.
++"""
++
++import re
++
++import yaml
++
++
++class LoadError(Exception):
++    """Document or registry validation failed."""
++
++
++class NotFoundError(Exception):
++    """A run task named a workflow the registry cannot resolve."""
++
++
++class InputContractError(Exception):
++    """An input mapping violated the callee's declared contract."""
++
++
++class CycleError(Exception):
++    """A workflow is already an active frame on the call stack."""
++
++
++class DepthError(Exception):
++    """Entering a child would exceed the active-frame cap."""
++
++
++class UnknownHandlerError(Exception):
++    """A call task named a handler nobody registered."""
++
++
++# ------------------------------------------------------------- expressions
++
++_EXPR_RE = re.compile(r"^\$\{\s*(\.[A-Za-z0-9_.]*)\s*\}$")
++
++
++def _resolve(context, path):
++    if path == ".":
++        return context
++    current = context
++    for segment in path[1:].split("."):
++        if isinstance(current, dict) and segment in current:
++            current = current[segment]
++        else:
++            return None
++    return current
++
++
++def _evaluate(value, context):
++    if isinstance(value, str):
++        match = _EXPR_RE.match(value)
++        if match:
++            return _resolve(context, match.group(1))
++        return value  # literals only — rich interpolation is data-flow's job
++    if isinstance(value, dict):
++        return {k: _evaluate(v, context) for k, v in value.items()}
++    if isinstance(value, list):
++        return [_evaluate(v, context) for v in value]
++    return value
++
++
++# ----------------------------------------------------------------- loading
++
++
++class _Task:
++    __slots__ = ("name", "kind", "set", "call", "with_", "wf_name",
++                 "wf_version", "input_map")
++
++    def __init__(self, name, kind):
++        self.name = name
++        self.kind = kind
++        self.set = None
++        self.call = None
++        self.with_ = {}
++        self.wf_name = None
++        self.wf_version = None
++        self.input_map = {}
++
++
++class _Workflow:
++    __slots__ = ("name", "version", "required", "optional", "tasks",
++                 "exports")
++
++    def __init__(self, name, version):
++        self.name = name
++        self.version = version
++        self.required = set()
++        self.optional = set()
++        self.tasks = []
++        self.exports = None  # None = no output declaration
++
++    @property
++    def label(self):
++        return f"{self.name}@{self.version}"
++
++
++def _require_string(value, what):
++    if not isinstance(value, str) or not value:
++        raise LoadError(f"{what} must be a non-empty string")
++    return value
++
++
++def _load_name_list(value, what):
++    if not isinstance(value, list) or any(
++            not isinstance(n, str) or not n for n in value):
++        raise LoadError(f"{what} must be a list of key names")
++    return value
++
++
++def _load_task(name, body, where):
++    if not isinstance(body, dict):
++        raise LoadError(f"{where}: task body must be a map")
++    type_keys = [k for k in ("set", "call", "run") if k in body]
++    if len(type_keys) != 1:
++        raise LoadError(
++            f"{where}: task needs exactly one of set/call/run, "
++            f"got {len(type_keys)}")
++    kind = type_keys[0]
++    allowed = {kind}
++    if kind == "call":
++        allowed.add("with")
++    for key in body:
++        if key not in allowed:
++            raise LoadError(f"{where}: unknown key {key!r} on a {kind} task")
++
++    task = _Task(name, kind)
++    if kind == "set":
++        if not isinstance(body["set"], dict):
++            raise LoadError(f"{where}: set must be a map")
++        task.set = body["set"]
++    elif kind == "call":
++        task.call = _require_string(body["call"], f"{where}: call")
++        with_ = body.get("with", {})
++        if not isinstance(with_, dict):
++            raise LoadError(f"{where}: with must be a map")
++        task.with_ = with_
++    else:  # run
++        run = body["run"]
++        if not isinstance(run, dict) or set(run) != {"workflow"}:
++            raise LoadError(
++                f"{where}: run must be exactly run: {{workflow: ...}}")
++        spec = run["workflow"]
++        if not isinstance(spec, dict):
++            raise LoadError(f"{where}: run.workflow must be a map")
++        extra = set(spec) - {"name", "version", "input"}
++        if extra:
++            raise LoadError(
++                f"{where}: unknown run.workflow key(s): "
++                f"{', '.join(sorted(extra))}")
++        if "name" not in spec or "version" not in spec:
++            raise LoadError(f"{where}: run.workflow requires name and version")
++        task.wf_name = _require_string(spec["name"],
++                                       f"{where}: run.workflow.name")
++        task.wf_version = _require_string(spec["version"],
++                                          f"{where}: run.workflow.version")
++        input_map = spec.get("input", {})
++        if not isinstance(input_map, dict):
++            raise LoadError(f"{where}: run.workflow.input must be a map")
++        task.input_map = input_map
++    return task
++
++
++def _load(source):
++    try:
++        doc = yaml.safe_load(source)
++    except yaml.YAMLError as exc:
++        raise LoadError(f"invalid YAML: {exc}") from exc
++    if not isinstance(doc, dict):
++        raise LoadError("workflow must be a YAML map")
++    unknown = set(doc) - {"document", "input", "do", "output"}
++    if unknown:
++        raise LoadError(
++            f"unknown top-level key(s): {', '.join(sorted(unknown))}")
++
++    header = doc.get("document")
++    if not isinstance(header, dict):
++        raise LoadError("missing document header")
++    if header.get("dsl") != "1.0":
++        raise LoadError(f"unsupported dsl version {header.get('dsl')!r}")
++    for field in ("namespace", "name", "version"):
++        _require_string(header.get(field), f"document.{field}")
++    wf = _Workflow(header["name"], header["version"])
++
++    if "input" in doc:
++        decl = doc["input"]
++        if not isinstance(decl, dict) or set(decl) - {"required", "optional"}:
++            raise LoadError(
++                "input declaration must be a map of required/optional lists")
++        wf.required = set(_load_name_list(decl.get("required", []),
++                                          "input.required"))
++        wf.optional = set(_load_name_list(decl.get("optional", []),
++                                          "input.optional"))
++
++    tasks = doc.get("do")
++    if not isinstance(tasks, list) or not tasks:
++        raise LoadError("do must be a non-empty list")
++    seen = set()
++    for entry in tasks:
++        if not isinstance(entry, dict) or len(entry) != 1:
++            raise LoadError("each do entry must be a single-key map")
++        (name, body), = entry.items()
++        if name == "input":
++            raise LoadError('task name "input" is reserved')
++        if name in seen:
++            raise LoadError(f"duplicate task name {name!r}")
++        seen.add(name)
++        wf.tasks.append(_load_task(name, body, f"do/{name}"))
++
++    if "output" in doc:
++        exports = _load_name_list(doc["output"], "output")
++        for name in exports:
++            if name not in seen:
++                raise LoadError(
++                    f"output exports unknown task {name!r}")
++        wf.exports = exports
++    return wf
++
++
++# --------------------------------------------------------------- execution
++
++
++def _check_contract(wf, mapping):
++    if not isinstance(mapping, dict):
++        raise InputContractError(
++            f"workflow {wf.label}: input must be a mapping")
++    keys = set(mapping)
++    missing = wf.required - keys
++    if missing:
++        raise InputContractError(
++            f"workflow {wf.label} requires input key(s): "
++            f"{', '.join(sorted(missing))}")
++    extra = keys - wf.required - wf.optional
++    if extra:
++        raise InputContractError(
++            f"workflow {wf.label} does not accept input key(s): "
++            f"{', '.join(sorted(extra))}")
++
++
++def _output_of(wf, context):
++    if wf.exports is None:
++        return {k: v for k, v in context.items() if k != "input"}
++    return {name: context[name] for name in wf.exports}
++
++
++def _execute(wf, input_value, registry, handlers, stack, max_depth):
++    context = {"input": input_value}
++    for task in wf.tasks:
++        if task.kind == "set":
++            context[task.name] = _evaluate(task.set, context)
++        elif task.kind == "call":
++            handler = handlers.get(task.call)
++            if handler is None:
++                raise UnknownHandlerError(
++                    f"no handler registered for {task.call!r}")
++            context[task.name] = handler(_evaluate(task.with_, context))
++        else:  # run
++            key = (task.wf_name, task.wf_version)
++            label = f"{key[0]}@{key[1]}"
++            if key in stack:
++                chain = stack[stack.index(key):] + [key]
++                raise CycleError(
++                    "sub-workflow cycle: "
++                    + " -> ".join(f"{n}@{v}" for n, v in chain))
++            if len(stack) >= max_depth:
++                raise DepthError(
++                    f"sub-workflow depth cap {max_depth} exceeded "
++                    f"entering {label}")
++            child = registry.get(key)
++            if child is None:
++                versions = sorted(v for (n, v) in registry if n == key[0])
++                if versions:
++                    raise NotFoundError(
++                        f"workflow {label} not found; registered versions "
++                        f"of {key[0]}: {', '.join(versions)}")
++                raise NotFoundError(f"workflow {label} not found")
++            mapped = _evaluate(task.input_map, context)
++            _check_contract(child, mapped)
++            child_context = _execute(child, mapped, registry, handlers,
++                                     stack + [key], max_depth)
++            context[task.name] = _output_of(child, child_context)
++    return context
++
++
++# ------------------------------------------------------------------- entry
++
++
++def run_workflow(source, registry=None, input=None, handlers=None,
++                 max_depth=8):
++    root = _load(source)
++    resolved = {}
++    for entry in registry or []:
++        wf = _load(entry)
++        key = (wf.name, wf.version)
++        if key in resolved:
++            raise LoadError(f"duplicate registry entry {wf.label}")
++        resolved[key] = wf
++
++    input_value = {} if input is None else input
++    _check_contract(root, input_value)
++    context = _execute(root, input_value, resolved, handlers or {},
++                       [(root.name, root.version)], max_depth)
++    return {"context": context, "output": _output_of(root, context)}

@@ -1,0 +1,278 @@
+diff --git a/ConnectClient.cs b/ConnectClient.cs
+new file mode 100644
+index 0000000..c481a1e
+--- /dev/null
++++ b/ConnectClient.cs
+@@ -0,0 +1,143 @@
++using System.Net.Http.Headers;
++using System.Text;
++using System.Text.Json;
++
++namespace ConnectMonitor;
++
++/// <summary>
++/// Client for the Kafka Connect REST interface (application/json only).
++/// Enumerates the fleet with a single expanded list call and restarts failed
++/// instances via the documented includeTasks/onlyFailed query parameters.
++/// Redirects are never followed: a 3xx surfaces as ConnectApiException so
++/// credentials cannot travel to another host. See docs/contract.json.
++/// </summary>
++public sealed class ConnectClient
++{
++    private readonly string _baseUrl;
++    private readonly string _auth;
++    private readonly HttpClient _http;
++
++    public ConnectClient(string baseUrl, string username, string password, HttpClient http)
++    {
++        _baseUrl = baseUrl.TrimEnd('/');
++        _auth = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{username}:{password}"));
++        _http = http;
++    }
++
++    public async Task<IReadOnlyList<ConnectorStatus>> ListConnectorsAsync(CancellationToken ct)
++    {
++        string body = await GetAsync("/connectors?expand=status&expand=info", ct);
++        using var doc = JsonDocument.Parse(body);
++        var fleet = new List<ConnectorStatus>();
++        foreach (var property in doc.RootElement.EnumerateObject())
++        {
++            fleet.Add(ParseStatus(property.Value.GetProperty("status")));
++        }
++        fleet.Sort((a, b) => string.CompareOrdinal(a.Name, b.Name));
++        return fleet;
++    }
++
++    public async Task<ConnectorStatus> GetStatusAsync(string name, CancellationToken ct)
++    {
++        string body = await GetAsync(
++            $"/connectors/{Uri.EscapeDataString(name)}/status", ct);
++        using var doc = JsonDocument.Parse(body);
++        return ParseStatus(doc.RootElement);
++    }
++
++    public async Task<RestartOutcome> RestartFailedAsync(string name, CancellationToken ct)
++    {
++        using var request = NewRequest(HttpMethod.Post,
++            $"/connectors/{Uri.EscapeDataString(name)}/restart?includeTasks=true&onlyFailed=true");
++        var (status, body) = await SendAsync(request, ct);
++        if (status == 202 && body.Length > 0)
++        {
++            using var doc = JsonDocument.Parse(body);
++            var root = doc.RootElement;
++            string? state = root.GetProperty("connector").GetProperty("state").GetString();
++            return new RestartOutcome(status, state, ParseTasks(root));
++        }
++        if (status is 200 or 202 or 204)
++        {
++            return new RestartOutcome(status, null, Array.Empty<ConnectTaskStatus>());
++        }
++        throw EnvelopeError(status, body);
++    }
++
++    private async Task<string> GetAsync(string path, CancellationToken ct)
++    {
++        using var request = NewRequest(HttpMethod.Get, path);
++        var (status, body) = await SendAsync(request, ct);
++        if (status != 200)
++        {
++            throw EnvelopeError(status, body);
++        }
++        return body;
++    }
++
++    private HttpRequestMessage NewRequest(HttpMethod method, string path)
++    {
++        var request = new HttpRequestMessage(method, _baseUrl + path);
++        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
++        request.Headers.Authorization = new AuthenticationHeaderValue("Basic", _auth);
++        return request;
++    }
++
++    private async Task<(int Status, string Body)> SendAsync(
++        HttpRequestMessage request, CancellationToken ct)
++    {
++        using var response = await _http.SendAsync(request, ct);
++        string body = await response.Content.ReadAsStringAsync(ct);
++        int status = (int)response.StatusCode;
++        if (status is >= 300 and < 400)
++        {
++            throw new ConnectApiException(status, "redirect refused: the Connect API never redirects");
++        }
++        return (status, body);
++    }
++
++    private static ConnectApiException EnvelopeError(int status, string body)
++    {
++        string message = body;
++        try
++        {
++            using var doc = JsonDocument.Parse(body);
++            if (doc.RootElement.TryGetProperty("message", out var m)
++                && m.ValueKind == JsonValueKind.String)
++            {
++                message = m.GetString()!;
++            }
++        }
++        catch (JsonException)
++        {
++            // keep the raw body as the message
++        }
++        return new ConnectApiException(status, message);
++    }
++
++    private static ConnectorStatus ParseStatus(JsonElement root)
++    {
++        var connector = root.GetProperty("connector");
++        return new ConnectorStatus(
++            root.GetProperty("name").GetString()!,
++            connector.GetProperty("state").GetString()!,
++            connector.GetProperty("worker_id").GetString()!,
++            root.TryGetProperty("type", out var type) ? type.GetString()! : "",
++            ParseTasks(root));
++    }
++
++    private static IReadOnlyList<ConnectTaskStatus> ParseTasks(JsonElement root)
++    {
++        var tasks = new List<ConnectTaskStatus>();
++        foreach (var task in root.GetProperty("tasks").EnumerateArray())
++        {
++            tasks.Add(new ConnectTaskStatus(
++                task.GetProperty("id").GetInt32(),
++                task.GetProperty("state").GetString()!,
++                task.GetProperty("worker_id").GetString()!,
++                task.TryGetProperty("trace", out var trace) ? trace.GetString() : null));
++        }
++        tasks.Sort((a, b) => a.Id.CompareTo(b.Id));
++        return tasks;
++    }
++}
+diff --git a/Models.cs b/Models.cs
+new file mode 100644
+index 0000000..817e292
+--- /dev/null
++++ b/Models.cs
+@@ -0,0 +1,36 @@
++namespace ConnectMonitor;
++
++/// <summary>One task from a connector status; Trace is set for FAILED tasks.</summary>
++public sealed record ConnectTaskStatus(int Id, string State, string WorkerId, string? Trace);
++
++/// <summary>A connector's status subresource, flattened.</summary>
++public sealed record ConnectorStatus(
++    string Name, string State, string WorkerId, string Type,
++    IReadOnlyList<ConnectTaskStatus> Tasks);
++
++/// <summary>Result of a restart request: 202 carries the echoed status.</summary>
++public sealed record RestartOutcome(
++    int HttpStatus, string? ConnectorState, IReadOnlyList<ConnectTaskStatus> Tasks);
++
++/// <summary>One flattened task state line of the remediation report.</summary>
++public sealed record TaskLine(string Connector, int TaskId, string State, string WorkerId);
++
++/// <summary>One remediation attempt and how it ended.</summary>
++public sealed record RemediationAction(string Connector, string Action, int Attempts, string Result);
++
++/// <summary>The deterministic sweep report.</summary>
++public sealed record RemediationReport(
++    IReadOnlyList<TaskLine> Tasks,
++    IReadOnlyList<RemediationAction> Actions,
++    IReadOnlyList<string> Healthy);
++
++/// <summary>A Connect REST failure: the HTTP status plus the envelope message.</summary>
++public sealed class ConnectApiException : Exception
++{
++    public int HttpStatus { get; }
++
++    public ConnectApiException(int httpStatus, string message) : base(message)
++    {
++        HttpStatus = httpStatus;
++    }
++}
+diff --git a/RemediationMonitor.cs b/RemediationMonitor.cs
+new file mode 100644
+index 0000000..b14eb95
+--- /dev/null
++++ b/RemediationMonitor.cs
+@@ -0,0 +1,81 @@
++namespace ConnectMonitor;
++
++/// <summary>
++/// One sweep: flatten every task state, restart exactly the connectors that
++/// are FAILED or own a FAILED task, retry rebalance conflicts through the
++/// injected backoff, and keep going past vanished connectors. Output is
++/// deterministic for identical cluster state.
++/// </summary>
++public sealed class RemediationMonitor
++{
++    private readonly ConnectClient _client;
++    private readonly int _maxConflictRetries;
++    private readonly Func<int, CancellationToken, Task> _conflictBackoff;
++
++    public RemediationMonitor(ConnectClient client, int maxConflictRetries,
++        Func<int, CancellationToken, Task> conflictBackoff)
++    {
++        _client = client;
++        _maxConflictRetries = maxConflictRetries;
++        _conflictBackoff = conflictBackoff;
++    }
++
++    public async Task<RemediationReport> RunAsync(CancellationToken ct)
++    {
++        var fleet = await _client.ListConnectorsAsync(ct);
++        var tasks = new List<TaskLine>();
++        var actions = new List<RemediationAction>();
++        var healthy = new List<string>();
++
++        foreach (var connector in fleet)
++        {
++            foreach (var task in connector.Tasks)
++            {
++                tasks.Add(new TaskLine(connector.Name, task.Id, task.State, task.WorkerId));
++            }
++        }
++
++        foreach (var connector in fleet)
++        {
++            bool failed = connector.State == "FAILED"
++                || connector.Tasks.Any(t => t.State == "FAILED");
++            if (!failed)
++            {
++                healthy.Add(connector.Name);
++                continue;
++            }
++            var (attempts, result) = await RestartWithConflictRetryAsync(connector.Name, ct);
++            actions.Add(new RemediationAction(
++                connector.Name, "RESTART_FAILED_TASKS", attempts, result));
++        }
++
++        return new RemediationReport(tasks, actions, healthy);
++    }
++
++    private async Task<(int Attempts, string Result)> RestartWithConflictRetryAsync(
++        string name, CancellationToken ct)
++    {
++        int attempts = 0;
++        while (true)
++        {
++            attempts++;
++            try
++            {
++                var outcome = await _client.RestartFailedAsync(name, ct);
++                return (attempts, outcome.HttpStatus == 204 ? "NO_CONTENT" : "ACCEPTED");
++            }
++            catch (ConnectApiException ex) when (ex.HttpStatus == 409)
++            {
++                if (attempts > _maxConflictRetries)
++                {
++                    return (attempts, "REBALANCE_DEFERRED");
++                }
++                await _conflictBackoff(attempts, ct);
++            }
++            catch (ConnectApiException ex) when (ex.HttpStatus == 404)
++            {
++                return (attempts, "NOT_FOUND");
++            }
++        }
++    }
++}

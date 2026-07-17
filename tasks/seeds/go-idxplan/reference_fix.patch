@@ -1,0 +1,403 @@
+diff --git a/exec.go b/exec.go
+new file mode 100644
+index 0000000..dd149b1
+--- /dev/null
++++ b/exec.go
+@@ -0,0 +1,53 @@
++package idxplan
++
++import "slices"
++
++// Search plans q via Explain and executes the plan, returning matching
++// record ids in ascending id order.
++func (h *Heap) Search(q Query) ([]uint64, error) {
++	plan, err := h.Explain(q)
++	if err != nil {
++		return nil, err
++	}
++	switch plan.Kind {
++	case "hash":
++		idx := h.indexes[plan.Index].(*hashIndex)
++		return idx.lookup(*plan.Eq), nil
++	case "ordered":
++		idx := h.indexes[plan.Index].(*orderedIndex)
++		if plan.Eq != nil {
++			return idx.lookup(*plan.Eq), nil
++		}
++		return idx.scan(plan.Lo, plan.Hi), nil
++	default:
++		return h.fullScan(plan), nil
++	}
++}
++
++// fullScan walks every live record; it is the fallback the planner tries to
++// avoid, and the only path that bumps ScanCount.
++func (h *Heap) fullScan(plan Plan) []uint64 {
++	h.scanCount++
++	var ids []uint64
++	for id, rec := range h.records {
++		value, ok := rec[plan.Field]
++		if !ok {
++			continue // records without the field never match
++		}
++		if plan.Eq != nil {
++			if value != *plan.Eq {
++				continue
++			}
++		} else {
++			if plan.Lo != nil && value < *plan.Lo {
++				continue
++			}
++			if plan.Hi != nil && value >= *plan.Hi {
++				continue
++			}
++		}
++		ids = append(ids, id)
++	}
++	slices.Sort(ids)
++	return ids
++}
+diff --git a/heap.go b/heap.go
+new file mode 100644
+index 0000000..65d657f
+--- /dev/null
++++ b/heap.go
+@@ -0,0 +1,123 @@
++// Package idxplan is an in-memory record heap with secondary indexes and a
++// tiny planner/executor in front of them.
++package idxplan
++
++import (
++	"errors"
++	"fmt"
++	"maps"
++)
++
++// ErrNotFound reports an id that is not (or no longer) in the heap.
++var ErrNotFound = errors.New("record not found")
++
++// Heap stores map[string]string records under uint64 ids and keeps every
++// registered index in sync with mutations.
++type Heap struct {
++	nextID    uint64
++	records   map[uint64]map[string]string
++	indexes   map[string]index // by index name
++	scanCount int
++}
++
++func NewHeap() *Heap {
++	return &Heap{
++		nextID:  1,
++		records: make(map[uint64]map[string]string),
++		indexes: make(map[string]index),
++	}
++}
++
++// Insert stores a copy of rec and returns its id. Ids are never reused.
++func (h *Heap) Insert(rec map[string]string) uint64 {
++	id := h.nextID
++	h.nextID++
++	stored := maps.Clone(rec)
++	if stored == nil {
++		stored = map[string]string{}
++	}
++	h.records[id] = stored
++	for _, idx := range h.indexes {
++		indexAdd(idx, stored, id)
++	}
++	return id
++}
++
++// Get returns a copy of the record, or false when the id is not live.
++func (h *Heap) Get(id uint64) (map[string]string, bool) {
++	rec, ok := h.records[id]
++	if !ok {
++		return nil, false
++	}
++	return maps.Clone(rec), true
++}
++
++// Update replaces the whole record and re-indexes it.
++func (h *Heap) Update(id uint64, rec map[string]string) error {
++	old, ok := h.records[id]
++	if !ok {
++		return fmt.Errorf("update id %d: %w", id, ErrNotFound)
++	}
++	stored := maps.Clone(rec)
++	if stored == nil {
++		stored = map[string]string{}
++	}
++	h.records[id] = stored
++	for _, idx := range h.indexes {
++		indexRemove(idx, old, id)
++		indexAdd(idx, stored, id)
++	}
++	return nil
++}
++
++// Delete removes the record from the heap and every index.
++func (h *Heap) Delete(id uint64) error {
++	old, ok := h.records[id]
++	if !ok {
++		return fmt.Errorf("delete id %d: %w", id, ErrNotFound)
++	}
++	delete(h.records, id)
++	for _, idx := range h.indexes {
++		indexRemove(idx, old, id)
++	}
++	return nil
++}
++
++// Len is the number of live records.
++func (h *Heap) Len() int { return len(h.records) }
++
++// ScanCount reports how many Searches fell back to a full heap scan.
++func (h *Heap) ScanCount() int { return h.scanCount }
++
++func (h *Heap) registerIndex(name string, idx index) error {
++	if _, dup := h.indexes[name]; dup {
++		return fmt.Errorf("index %q already exists", name)
++	}
++	for id, rec := range h.records { // backfill
++		indexAdd(idx, rec, id)
++	}
++	h.indexes[name] = idx
++	return nil
++}
++
++// CreateHashIndex registers an equality index over field.
++func (h *Heap) CreateHashIndex(name, field string) error {
++	return h.registerIndex(name, newHashIndex(field))
++}
++
++// CreateOrderedIndex registers a byte-ordered index over field.
++func (h *Heap) CreateOrderedIndex(name, field string) error {
++	return h.registerIndex(name, newOrderedIndex(field))
++}
++
++func indexAdd(idx index, rec map[string]string, id uint64) {
++	if v, ok := rec[idx.fieldName()]; ok {
++		idx.add(v, id)
++	}
++}
++
++func indexRemove(idx index, rec map[string]string, id uint64) {
++	if v, ok := rec[idx.fieldName()]; ok {
++		idx.remove(v, id)
++	}
++}
+diff --git a/index.go b/index.go
+new file mode 100644
+index 0000000..c3dc550
+--- /dev/null
++++ b/index.go
+@@ -0,0 +1,123 @@
++package idxplan
++
++import (
++	"slices"
++	"sort"
++)
++
++// index is the maintenance surface shared by both index kinds.
++type index interface {
++	fieldName() string
++	kind() string // "hash" | "ordered"
++	add(value string, id uint64)
++	remove(value string, id uint64)
++}
++
++// idSet is a tiny multi-map bucket: ids holding one value.
++type idSet map[uint64]struct{}
++
++func (s idSet) sorted() []uint64 {
++	ids := make([]uint64, 0, len(s))
++	for id := range s {
++		ids = append(ids, id)
++	}
++	slices.Sort(ids)
++	return ids
++}
++
++// ---- hash index -----------------------------------------------------------
++
++type hashIndex struct {
++	field   string
++	buckets map[string]idSet
++}
++
++func newHashIndex(field string) *hashIndex {
++	return &hashIndex{field: field, buckets: make(map[string]idSet)}
++}
++
++func (x *hashIndex) fieldName() string { return x.field }
++func (x *hashIndex) kind() string      { return "hash" }
++
++func (x *hashIndex) add(value string, id uint64) {
++	set, ok := x.buckets[value]
++	if !ok {
++		set = make(idSet)
++		x.buckets[value] = set
++	}
++	set[id] = struct{}{}
++}
++
++func (x *hashIndex) remove(value string, id uint64) {
++	if set, ok := x.buckets[value]; ok {
++		delete(set, id)
++		if len(set) == 0 {
++			delete(x.buckets, value)
++		}
++	}
++}
++
++func (x *hashIndex) lookup(value string) []uint64 {
++	return x.buckets[value].sorted()
++}
++
++// ---- ordered index ----------------------------------------------------------
++
++type orderedIndex struct {
++	field   string
++	keys    []string // sorted, unique
++	buckets map[string]idSet
++}
++
++func newOrderedIndex(field string) *orderedIndex {
++	return &orderedIndex{field: field, buckets: make(map[string]idSet)}
++}
++
++func (x *orderedIndex) fieldName() string { return x.field }
++func (x *orderedIndex) kind() string      { return "ordered" }
++
++func (x *orderedIndex) add(value string, id uint64) {
++	set, ok := x.buckets[value]
++	if !ok {
++		set = make(idSet)
++		x.buckets[value] = set
++		at, _ := slices.BinarySearch(x.keys, value)
++		x.keys = slices.Insert(x.keys, at, value)
++	}
++	set[id] = struct{}{}
++}
++
++func (x *orderedIndex) remove(value string, id uint64) {
++	set, ok := x.buckets[value]
++	if !ok {
++		return
++	}
++	delete(set, id)
++	if len(set) == 0 {
++		delete(x.buckets, value)
++		if at, found := slices.BinarySearch(x.keys, value); found {
++			x.keys = slices.Delete(x.keys, at, at+1)
++		}
++	}
++}
++
++func (x *orderedIndex) lookup(value string) []uint64 {
++	return x.buckets[value].sorted()
++}
++
++// scan collects ids for lo <= key < hi (nil bound = unbounded), id order.
++func (x *orderedIndex) scan(lo, hi *string) []uint64 {
++	start := 0
++	if lo != nil {
++		start = sort.SearchStrings(x.keys, *lo)
++	}
++	var ids []uint64
++	for _, key := range x.keys[start:] {
++		if hi != nil && key >= *hi {
++			break
++		}
++		ids = append(ids, x.buckets[key].sorted()...)
++	}
++	slices.Sort(ids)
++	return ids
++}
+diff --git a/plan.go b/plan.go
+new file mode 100644
+index 0000000..ab6eb65
+--- /dev/null
++++ b/plan.go
+@@ -0,0 +1,80 @@
++package idxplan
++
++import (
++	"errors"
++	"sort"
++)
++
++// Query is a single-field predicate: either an equality or a half-open
++// range (lo <= value < hi in byte order, nil = unbounded).
++type Query struct {
++	Field string
++	Eq    *string
++	Lo    *string
++	Hi    *string
++}
++
++// Eq builds an equality query.
++func Eq(field, value string) Query {
++	return Query{Field: field, Eq: &value}
++}
++
++// Range builds a range query over lo <= value < hi.
++func Range(field string, lo, hi *string) Query {
++	return Query{Field: field, Lo: lo, Hi: hi}
++}
++
++// Plan is the pinned explain output: exactly what Search will execute.
++type Plan struct {
++	Kind  string  // "hash" | "ordered" | "scan"
++	Index string  // chosen index name, "" for a scan
++	Field string
++	Eq    *string
++	Lo    *string
++	Hi    *string
++}
++
++// Explain picks the access path for q without executing it.
++//
++// Rules: Eq prefers hash over ordered over scan; Range can only use an
++// ordered index, else scan. Among eligible indexes of the winning kind the
++// lexicographically smallest name wins, so plans are stable.
++func (h *Heap) Explain(q Query) (Plan, error) {
++	if q.Field == "" {
++		return Plan{}, errors.New("query has no field")
++	}
++	plan := Plan{Field: q.Field, Eq: q.Eq, Lo: q.Lo, Hi: q.Hi}
++	if q.Eq != nil {
++		if name := h.bestIndex(q.Field, "hash"); name != "" {
++			plan.Kind, plan.Index = "hash", name
++			return plan, nil
++		}
++		if name := h.bestIndex(q.Field, "ordered"); name != "" {
++			plan.Kind, plan.Index = "ordered", name
++			return plan, nil
++		}
++	} else {
++		if name := h.bestIndex(q.Field, "ordered"); name != "" {
++			plan.Kind, plan.Index = "ordered", name
++			return plan, nil
++		}
++	}
++	plan.Kind = "scan"
++	return plan, nil
++}
++
++// bestIndex returns the lexicographically smallest index name of the given
++// kind covering field, or "".
++func (h *Heap) bestIndex(field, kind string) string {
++	var names []string
++	for name, idx := range h.indexes {
++		if idx.fieldName() == field && idx.kind() == kind {
++			names = append(names, name)
++		}
++	}
++	if len(names) == 0 {
++		return ""
++	}
++	sort.Strings(names)
++	return names[0]
++}

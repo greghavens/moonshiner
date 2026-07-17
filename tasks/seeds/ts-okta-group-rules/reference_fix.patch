@@ -1,0 +1,211 @@
+diff --git a/okta/client.ts b/okta/client.ts
+index 304f08a..2b03dd0 100644
+--- a/okta/client.ts
++++ b/okta/client.ts
+@@ -51,6 +51,18 @@ export interface OktaResponse {
+   headers: Headers;
+ }
+ 
++/** Extracts the rel="next" href from a (possibly comma-combined) Link header. */
++export function nextLinkOf(linkHeader: string | null): string | null {
++  if (linkHeader === null) return null;
++  for (const segment of linkHeader.split(",")) {
++    const open = segment.indexOf("<");
++    const close = segment.indexOf(">");
++    if (open < 0 || close < open) continue;
++    if (/rel="next"/i.test(segment.slice(close + 1))) return segment.slice(open + 1, close);
++  }
++  return null;
++}
++
+ export class GroupRulesClient {
+   private readonly baseUrl: string;
+   private readonly apiToken: string;
+@@ -96,4 +108,47 @@ export class GroupRulesClient {
+     const { json, headers } = await this.request("GET", path);
+     return { rules: json as GroupRule[], linkHeader: headers.get("link") };
+   }
++
++  /**
++   * Every group rule in the org. Follows the Link rel="next" URLs verbatim,
++   * per the Core API pagination contract — the server owns the cursor and
++   * query format, so rebuilding URLs client-side is off the table.
++   */
++  async listAllRules(limit = 50): Promise<GroupRule[]> {
++    const rules: GroupRule[] = [];
++    let { json, headers } = await this.request("GET", `/api/v1/groups/rules?limit=${limit}`);
++    rules.push(...(json as GroupRule[]));
++    let next = nextLinkOf(headers.get("link"));
++    while (next !== null) {
++      ({ json, headers } = await this.request("GET", next));
++      rules.push(...(json as GroupRule[]));
++      next = nextLinkOf(headers.get("link"));
++    }
++    return rules;
++  }
++
++  /** POST /api/v1/groups/rules — the rule is created INACTIVE. */
++  async createRule(rule: GroupRule): Promise<GroupRule> {
++    const { json } = await this.request("POST", "/api/v1/groups/rules", rule);
++    return json as GroupRule;
++  }
++
++  /** PUT /api/v1/groups/rules/{id} — only legal while the rule is INACTIVE. */
++  async replaceRule(ruleId: string, rule: GroupRule): Promise<GroupRule> {
++    const { json } = await this.request("PUT", `/api/v1/groups/rules/${encodeURIComponent(ruleId)}`, rule);
++    return json as GroupRule;
++  }
++
++  async deleteRule(ruleId: string): Promise<void> {
++    await this.request("DELETE", `/api/v1/groups/rules/${encodeURIComponent(ruleId)}`);
++  }
++
++  /** Lifecycle POSTs answer 204 with an empty body. */
++  async activateRule(ruleId: string): Promise<void> {
++    await this.request("POST", `/api/v1/groups/rules/${encodeURIComponent(ruleId)}/lifecycle/activate`);
++  }
++
++  async deactivateRule(ruleId: string): Promise<void> {
++    await this.request("POST", `/api/v1/groups/rules/${encodeURIComponent(ruleId)}/lifecycle/deactivate`);
++  }
+ }
+diff --git a/okta/reconcile.ts b/okta/reconcile.ts
+new file mode 100644
+index 0000000..5ef9bb2
+--- /dev/null
++++ b/okta/reconcile.ts
+@@ -0,0 +1,134 @@
++// Desired-state reconciler for Okta group rules.
++//
++// The wire contract forces a specific choreography (see docs/contract.json):
++// rules are created INACTIVE, PUT only works on INACTIVE rules and cannot
++// touch the actions section, and status moves exclusively through the
++// lifecycle endpoints. Assignment (actions) changes therefore require a
++// delete + recreate. Specs using anything the current API reference doesn't
++// support are rejected before any traffic is generated.
++
++import type { GroupRule, GroupRulesClient } from "./client.ts";
++
++export const EXPRESSION_TYPE = "urn:okta:expression:1.0";
++
++export interface ReconcileReport {
++  created: string[];
++  updated: string[];
++  recreated: string[];
++  statusChanged: string[];
++  unchanged: string[];
++  rejected: { name: string; reason: string }[];
++}
++
++function validate(spec: GroupRule): string | null {
++  const exprType = spec.conditions.expression.type;
++  if (exprType !== undefined && exprType !== EXPRESSION_TYPE) {
++    return `conditions.expression.type must be ${EXPRESSION_TYPE} (got ${exprType})`;
++  }
++  const groupsExclude = spec.conditions.people?.groups?.exclude;
++  if (groupsExclude !== undefined && groupsExclude.length > 0) {
++    return "conditions.people.groups.exclude is not supported by the current Group Rules API";
++  }
++  if (spec.status !== "ACTIVE" && spec.status !== "INACTIVE") {
++    return `status must be ACTIVE or INACTIVE (got ${spec.status})`;
++  }
++  return null;
++}
++
++function sameIdSet(a: string[], b: string[]): boolean {
++  if (a.length !== b.length) return false;
++  const set = new Set(a);
++  return b.every((id) => set.has(id));
++}
++
++function sameExpression(current: GroupRule, spec: GroupRule): boolean {
++  const cur = current.conditions.expression;
++  const want = spec.conditions.expression;
++  return cur.value === want.value && (cur.type ?? EXPRESSION_TYPE) === (want.type ?? EXPRESSION_TYPE);
++}
++
++/** The writable projection of a rule: everything server-owned stripped. */
++function writableBody(spec: GroupRule, actions: GroupRule["actions"]): GroupRule {
++  return {
++    type: "group_rule",
++    name: spec.name,
++    conditions: spec.conditions,
++    actions,
++  };
++}
++
++async function createAndMaybeActivate(
++  client: GroupRulesClient,
++  spec: GroupRule,
++): Promise<void> {
++  const created = await client.createRule(writableBody(spec, spec.actions));
++  if (spec.status === "ACTIVE") await client.activateRule(created.id!);
++}
++
++export async function reconcileGroupRules(
++  client: GroupRulesClient,
++  desired: GroupRule[],
++): Promise<ReconcileReport> {
++  const report: ReconcileReport = {
++    created: [],
++    updated: [],
++    recreated: [],
++    statusChanged: [],
++    unchanged: [],
++    rejected: [],
++  };
++
++  const existing = new Map<string, GroupRule>();
++  for (const rule of await client.listAllRules()) existing.set(rule.name, rule);
++
++  for (const spec of desired) {
++    const problem = validate(spec);
++    if (problem !== null) {
++      report.rejected.push({ name: spec.name, reason: problem });
++      continue;
++    }
++
++    const current = existing.get(spec.name);
++    if (current === undefined) {
++      await createAndMaybeActivate(client, spec);
++      report.created.push(spec.name);
++      continue;
++    }
++
++    const actionsMatch = sameIdSet(
++      current.actions.assignUserToGroups.groupIds,
++      spec.actions.assignUserToGroups.groupIds,
++    );
++    const expressionMatches = sameExpression(current, spec);
++    const statusMatches = current.status === spec.status;
++
++    if (!actionsMatch) {
++      // Actions can't be edited through PUT; replace the rule wholesale.
++      if (current.status === "ACTIVE") await client.deactivateRule(current.id!);
++      await client.deleteRule(current.id!);
++      await createAndMaybeActivate(client, spec);
++      report.recreated.push(spec.name);
++      continue;
++    }
++
++    if (!expressionMatches) {
++      // PUT is INACTIVE-only and must carry the actions section unchanged.
++      if (current.status === "ACTIVE") await client.deactivateRule(current.id!);
++      await client.replaceRule(current.id!, writableBody(spec, current.actions));
++      if (spec.status === "ACTIVE") await client.activateRule(current.id!);
++      report.updated.push(spec.name);
++      continue;
++    }
++
++    if (!statusMatches) {
++      if (spec.status === "ACTIVE") await client.activateRule(current.id!);
++      else await client.deactivateRule(current.id!);
++      report.statusChanged.push(spec.name);
++      continue;
++    }
++
++    report.unchanged.push(spec.name);
++  }
++
++  return report;
++}

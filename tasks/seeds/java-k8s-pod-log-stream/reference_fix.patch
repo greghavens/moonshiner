@@ -1,0 +1,173 @@
+diff --git a/PodLogCollector.java b/PodLogCollector.java
+new file mode 100644
+index 0000000..505696e
+--- /dev/null
++++ b/PodLogCollector.java
+@@ -0,0 +1,167 @@
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.time.Instant;
++import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.List;
++import java.util.function.Function;
++
++/**
++ * Collects pod logs through the core v1 log subresource: byte-accurate UTF-8
++ * line reassembly across chunk boundaries, callback-driven cancellation for
++ * follow streams, and deterministic multi-pod merging by parsed timestamp.
++ */
++public final class PodLogCollector {
++
++    private final PodClient client;
++
++    public PodLogCollector(PodClient client) {
++        this.client = client;
++    }
++
++    /** Log request options; unset fields stay off the wire. */
++    public static final class Options {
++        public String container;
++        public Integer tailLines;
++        public boolean timestamps;
++        public boolean follow;
++    }
++
++    /** One log line attributed to its pod, timestamp token kept verbatim. */
++    public static final class MergedLine {
++        public final String pod;
++        public final String timestamp;
++        public final String message;
++
++        MergedLine(String pod, String timestamp, String message) {
++            this.pod = pod;
++            this.timestamp = timestamp;
++            this.message = message;
++        }
++    }
++
++    // Query parameters in alphabetical order per docs/contract.json:
++    // container, follow, tailLines, timestamps — present only when set.
++    static String logPathAndQuery(String namespace, String pod, Options o) {
++        StringBuilder query = new StringBuilder();
++        if (o.container != null) {
++            append(query, "container", o.container);
++        }
++        if (o.follow) {
++            append(query, "follow", "true");
++        }
++        if (o.tailLines != null) {
++            append(query, "tailLines", o.tailLines.toString());
++        }
++        if (o.timestamps) {
++            append(query, "timestamps", "true");
++        }
++        String path = "/api/v1/namespaces/" + PodClient.encode(namespace)
++                + "/pods/" + PodClient.encode(pod) + "/log";
++        return query.length() == 0 ? path : path + "?" + query;
++    }
++
++    private static void append(StringBuilder query, String name, String value) {
++        if (query.length() > 0) {
++            query.append('&');
++        }
++        query.append(name).append('=').append(PodClient.encode(value));
++    }
++
++    private HttpResponse<InputStream> openLog(String namespace, String pod, Options o)
++            throws IOException, InterruptedException {
++        HttpResponse<InputStream> resp = client.open(logPathAndQuery(namespace, pod, o));
++        if (resp.statusCode() != 200) {
++            // Even the text/plain log endpoint reports failures as JSON Status.
++            String body;
++            try (InputStream in = resp.body()) {
++                body = new String(in.readAllBytes(), StandardCharsets.UTF_8);
++            }
++            throw KubeStatusException.fromStatusBody(resp.statusCode(), body);
++        }
++        return resp;
++    }
++
++    /** Fetch the whole log and return its decoded lines. */
++    public List<String> fetch(String namespace, String pod, Options o)
++            throws IOException, InterruptedException {
++        List<String> out = new ArrayList<>();
++        streamLines(openLog(namespace, pod, o), line -> {
++            out.add(line);
++            return true;
++        });
++        return out;
++    }
++
++    /**
++     * Deliver lines to onLine as they arrive; stop reading and close the
++     * stream the moment the callback returns false. Returns lines delivered.
++     */
++    public int follow(String namespace, String pod, Options o, Function<String, Boolean> onLine)
++            throws IOException, InterruptedException {
++        int[] delivered = {0};
++        streamLines(openLog(namespace, pod, o), line -> {
++            delivered[0]++;
++            return onLine.apply(line);
++        });
++        return delivered[0];
++    }
++
++    /**
++     * Fetch every pod's log with timestamps forced on, then merge all lines
++     * ordered by parsed timestamp, pod name, original per-pod order.
++     */
++    public List<MergedLine> collect(String namespace, List<String> pods, Options o)
++            throws IOException, InterruptedException {
++        Options per = new Options();
++        per.container = o.container;
++        per.tailLines = o.tailLines;
++        per.timestamps = true; // merging is impossible without timestamps
++
++        List<MergedLine> all = new ArrayList<>();
++        for (String pod : pods) {
++            for (String line : fetch(namespace, pod, per)) {
++                int space = line.indexOf(' ');
++                String timestamp = space < 0 ? line : line.substring(0, space);
++                String message = space < 0 ? "" : line.substring(space + 1);
++                all.add(new MergedLine(pod, timestamp, message));
++            }
++        }
++        // Fractional seconds vary (RFC3339 vs RFC3339Nano), so raw string
++        // order is wrong; parse. List.sort is stable, preserving per-pod order.
++        all.sort(Comparator.comparing((MergedLine m) -> Instant.parse(m.timestamp))
++                .thenComparing(m -> m.pod));
++        return all;
++    }
++
++    // Buffer raw bytes and split on 0x0A before decoding, so a chunk boundary
++    // inside a multi-byte UTF-8 sequence cannot corrupt the line.
++    private void streamLines(HttpResponse<InputStream> resp, Function<String, Boolean> onLine)
++            throws IOException {
++        ByteArrayOutputStream buf = new ByteArrayOutputStream();
++        try (InputStream in = resp.body()) {
++            byte[] chunk = new byte[8192];
++            int n;
++            while ((n = in.read(chunk)) != -1) {
++                for (int i = 0; i < n; i++) {
++                    byte b = chunk[i];
++                    if (b != '\n') {
++                        buf.write(b);
++                        continue;
++                    }
++                    boolean keepGoing = onLine.apply(buf.toString(StandardCharsets.UTF_8));
++                    buf.reset();
++                    if (!keepGoing) {
++                        return; // try-with-resources closes the open stream
++                    }
++                }
++            }
++        }
++        if (buf.size() > 0) {
++            onLine.apply(buf.toString(StandardCharsets.UTF_8));
++        }
++    }
++}

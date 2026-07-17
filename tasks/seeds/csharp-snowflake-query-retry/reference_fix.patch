@@ -1,0 +1,129 @@
+diff --git a/RetryOptions.cs b/RetryOptions.cs
+new file mode 100644
+index 0000000..791a4c7
+--- /dev/null
++++ b/RetryOptions.cs
+@@ -0,0 +1,18 @@
++namespace SnowflakeSql;
++
++/// <summary>
++/// Retry/polling policy for <see cref="SnowflakeStatementExecutor"/>.
++/// Defaults mirror docs/contract.json.
++/// </summary>
++public sealed record RetryOptions
++{
++    /// <summary>Total submit attempts, the first one included.</summary>
++    public int MaxAttempts { get; init; } = 4;
++
++    /// <summary>Fallback backoff when no Retry-After header is present.</summary>
++    public IReadOnlyList<int> BackoffSeconds { get; init; } = new[] { 1, 2, 4 };
++
++    public int PollIntervalSeconds { get; init; } = 1;
++
++    public int MaxPolls { get; init; } = 10;
++}
+diff --git a/SnowflakeStatementExecutor.cs b/SnowflakeStatementExecutor.cs
+new file mode 100644
+index 0000000..76522a1
+--- /dev/null
++++ b/SnowflakeStatementExecutor.cs
+@@ -0,0 +1,75 @@
++namespace SnowflakeSql;
++
++/// <summary>
++/// Policy layer above <see cref="SnowflakeSqlClient"/>: bounded retries for
++/// transient responses, requestId reuse so retried DML never runs twice, and
++/// status polling for nominally synchronous queries that come back 202.
++/// Every wait is routed through the injected delay function.
++/// </summary>
++public sealed class SnowflakeStatementExecutor
++{
++    private readonly SnowflakeSqlClient _client;
++    private readonly RetryOptions _options;
++    private readonly Func<string> _requestIds;
++    private readonly Func<TimeSpan, CancellationToken, Task> _delay;
++
++    public SnowflakeStatementExecutor(
++        SnowflakeSqlClient client,
++        RetryOptions options,
++        Func<string> requestIds,
++        Func<TimeSpan, CancellationToken, Task> delay)
++    {
++        _client = client;
++        _options = options;
++        _requestIds = requestIds;
++        _delay = delay;
++    }
++
++    public async Task<StatementResult> ExecuteAsync(SqlStatement stmt, CancellationToken ct = default)
++    {
++        // one requestId per logical statement; every retry reuses it with
++        // retry=true so the server can answer from the original execution
++        var requestId = _requestIds();
++        var lastStatus = 0;
++        for (var attempt = 1; attempt <= _options.MaxAttempts; attempt++)
++        {
++            var outcome = await _client.SubmitAsync(stmt, requestId, retry: attempt > 1, ct)
++                .ConfigureAwait(false);
++            switch (outcome.StatusCode)
++            {
++                case 200:
++                    return outcome.Result!;
++                case 202:
++                    return await PollAsync(outcome.Pending!, ct).ConfigureAwait(false);
++                default:
++                    lastStatus = outcome.StatusCode;
++                    if (attempt == _options.MaxAttempts)
++                        break;
++                    var backoffIndex = Math.Min(attempt - 1, _options.BackoffSeconds.Count - 1);
++                    var seconds = outcome.RetryAfterSeconds
++                        ?? _options.BackoffSeconds[backoffIndex];
++                    await _delay(TimeSpan.FromSeconds(seconds), ct).ConfigureAwait(false);
++                    break;
++            }
++        }
++        throw new SnowflakeTransportException(
++            "SQL API submission exhausted its retry budget", _options.MaxAttempts, lastStatus);
++    }
++
++    private async Task<StatementResult> PollAsync(PendingStatement pending, CancellationToken ct)
++    {
++        var lastStatus = 202;
++        for (var poll = 0; poll < _options.MaxPolls; poll++)
++        {
++            await _delay(TimeSpan.FromSeconds(_options.PollIntervalSeconds), ct).ConfigureAwait(false);
++            var outcome = await _client.CheckStatusAsync(pending.StatementStatusUrl, ct)
++                .ConfigureAwait(false);
++            if (outcome.StatusCode == 200)
++                return outcome.Result!;
++            lastStatus = outcome.StatusCode;
++        }
++        throw new SnowflakeTransportException(
++            $"statement {pending.StatementHandle} still running after {_options.MaxPolls} polls",
++            _options.MaxPolls, lastStatus);
++    }
++}
+diff --git a/SnowflakeTransportException.cs b/SnowflakeTransportException.cs
+new file mode 100644
+index 0000000..b0739e0
+--- /dev/null
++++ b/SnowflakeTransportException.cs
+@@ -0,0 +1,18 @@
++namespace SnowflakeSql;
++
++/// <summary>
++/// The retry or poll budget ran out without a terminal answer. Carries the
++/// attempt count and the last HTTP status observed; never any credentials.
++/// </summary>
++public sealed class SnowflakeTransportException : Exception
++{
++    public int Attempts { get; }
++    public int LastStatusCode { get; }
++
++    public SnowflakeTransportException(string message, int attempts, int lastStatusCode)
++        : base($"{message} (attempts {attempts}, last HTTP status {lastStatusCode})")
++    {
++        Attempts = attempts;
++        LastStatusCode = lastStatusCode;
++    }
++}

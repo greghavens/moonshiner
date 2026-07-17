@@ -1,0 +1,317 @@
+diff --git a/cli.py b/cli.py
+new file mode 100644
+index 0000000..d17eefe
+--- /dev/null
++++ b/cli.py
+@@ -0,0 +1,81 @@
++"""Warehouse CLI. Usage: python3 cli.py --db PATH <command> ..."""
++import argparse
++import sys
++
++import store
++import warehouse
++
++
++def build_parser():
++    parser = argparse.ArgumentParser(prog="cli.py")
++    parser.add_argument("--db", required=True)
++    sub = parser.add_subparsers(dest="command", required=True)
++
++    p = sub.add_parser("add-bin")
++    p.add_argument("bin_id")
++    p.add_argument("--volume", type=int, required=True)
++    p.add_argument("--max-weight", type=int, required=True)
++    p.add_argument("--hazmat", action="store_true")
++
++    p = sub.add_parser("add-sku")
++    p.add_argument("sku_id")
++    p.add_argument("--volume", type=int, required=True)
++    p.add_argument("--weight", type=int, required=True)
++    p.add_argument("--hazmat", action="store_true")
++    p.add_argument("--min-stock", type=int, default=0)
++
++    for name in ("putaway", "pick"):
++        p = sub.add_parser(name)
++        p.add_argument("sku_id")
++        p.add_argument("--qty", type=int, required=True)
++
++    p = sub.add_parser("find")
++    p.add_argument("sku_id")
++
++    sub.add_parser("alerts")
++    return parser
++
++
++def run(args, state):
++    """Execute one command; return (lines_to_print, db_changed)."""
++    if args.command == "add-bin":
++        warehouse.add_bin(state, args.bin_id, args.volume, args.max_weight,
++                          args.hazmat)
++        return [], True
++    if args.command == "add-sku":
++        warehouse.add_sku(state, args.sku_id, args.volume, args.weight,
++                          args.hazmat, args.min_stock)
++        return [], True
++    if args.command == "putaway":
++        plan = warehouse.putaway(state, args.sku_id, args.qty)
++        return [f"{bin_id}\t{qty}" for bin_id, qty in plan], True
++    if args.command == "pick":
++        plan = warehouse.pick(state, args.sku_id, args.qty)
++        return [f"{bin_id}\t{qty}" for bin_id, qty in plan], True
++    if args.command == "find":
++        holdings, total = warehouse.find(state, args.sku_id)
++        lines = [f"{bin_id}\t{qty}" for bin_id, qty in holdings]
++        return lines + [f"total={total}"], False
++    if args.command == "alerts":
++        return [f"{sku}\thave={have}\twant={want}"
++                for sku, have, want in warehouse.alerts(state)], False
++    raise AssertionError(args.command)
++
++
++def main(argv=None):
++    args = build_parser().parse_args(argv)
++    state = store.load(args.db)
++    try:
++        lines, changed = run(args, state)
++    except warehouse.WarehouseError as exc:
++        print(f"error: {exc}", file=sys.stderr)
++        return 1
++    if changed:
++        store.save(args.db, state)
++    for line in lines:
++        print(line)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/packing.py b/packing.py
+new file mode 100644
+index 0000000..670d9c8
+--- /dev/null
++++ b/packing.py
+@@ -0,0 +1,95 @@
++"""Put-away planning and pick-path math. Pure functions, no IO."""
++
++
++class PackingError(Exception):
++    """A placement or pick that cannot be satisfied legally."""
++
++
++def aisle_position(bin_id):
++    aisle, _, pos = bin_id.partition("-")
++    return aisle, int(pos)
++
++
++def pick_path(bin_ids):
++    """Serpentine walk: aisles in letter order; odd aisles (A, C, ...) walk
++    positions ascending, even aisles (B, D, ...) descending."""
++    def key(bin_id):
++        aisle, pos = aisle_position(bin_id)
++        descending = (ord(aisle) - ord("A")) % 2 == 1
++        return (aisle, -pos if descending else pos)
++    return sorted(bin_ids, key=key)
++
++
++def _bin_contents_qty(contents):
++    return sum(contents.values())
++
++
++def _fits(bin_info, contents, skus, sku_id):
++    """How many units of sku_id this bin can still take (capacity only)."""
++    used_volume = sum(skus[s]["volume"] * q for s, q in contents.items())
++    used_weight = sum(skus[s]["weight"] * q for s, q in contents.items())
++    sku = skus[sku_id]
++    by_volume = (bin_info["volume"] - used_volume) // sku["volume"]
++    by_weight = (bin_info["max_weight"] - used_weight) // sku["weight"]
++    return max(0, min(by_volume, by_weight))
++
++
++def _eligible(bin_info, contents, skus, sku_id):
++    """Sharing rules: haz only in hazmat bins; haz and non-haz never mix."""
++    hazardous = skus[sku_id]["hazmat"]
++    if hazardous and not bin_info["hazmat"]:
++        return False
++    for held in contents:
++        if skus[held]["hazmat"] != hazardous:
++            return False
++    return True
++
++
++def plan_putaway(bins, stock, skus, sku_id, qty):
++    """[(bin_id, qty), ...] allocations, or raise PackingError.
++
++    bins: {bin_id: {volume, max_weight, hazmat}}
++    stock: {bin_id: {sku_id: qty}} current contents
++    Preference: bins already holding the SKU (ascending id), then the rest
++    ascending, hazmat bins last for non-haz SKUs. Greedy fill at each stop.
++    """
++    hazardous = skus[sku_id]["hazmat"]
++
++    def rank(bin_id):
++        contents = stock.get(bin_id, {})
++        holds = contents.get(sku_id, 0) > 0
++        last_resort = bins[bin_id]["hazmat"] and not hazardous
++        return (0 if holds else 1, 1 if last_resort else 0, bin_id)
++
++    remaining = qty
++    plan = []
++    for bin_id in sorted(bins, key=rank):
++        if remaining == 0:
++            break
++        contents = stock.get(bin_id, {})
++        if not _eligible(bins[bin_id], contents, skus, sku_id):
++            continue
++        take = min(remaining, _fits(bins[bin_id], contents, skus, sku_id))
++        if take > 0:
++            plan.append((bin_id, take))
++            remaining -= take
++    if remaining:
++        raise PackingError(
++            f"no legal space for {remaining} of {qty} unit(s) of {sku_id}")
++    return plan
++
++
++def plan_pick(stock, sku_id, qty):
++    """[(bin_id, qty), ...] in pick-path order, or raise PackingError."""
++    holding = [b for b, contents in stock.items() if contents.get(sku_id, 0) > 0]
++    remaining = qty
++    plan = []
++    for bin_id in pick_path(holding):
++        if remaining == 0:
++            break
++        take = min(remaining, stock[bin_id][sku_id])
++        plan.append((bin_id, take))
++        remaining -= take
++    if remaining:
++        raise PackingError(f"only {qty - remaining} unit(s) of {sku_id} on hand")
++    return plan
+diff --git a/store.py b/store.py
+new file mode 100644
+index 0000000..e3c9e5a
+--- /dev/null
++++ b/store.py
+@@ -0,0 +1,22 @@
++"""JSON persistence. A missing db file is simply an empty warehouse."""
++import json
++import os
++
++
++def empty_state():
++    return {"bins": {}, "skus": {}, "stock": {}}
++
++
++def load(path):
++    if not os.path.exists(path):
++        return empty_state()
++    with open(path, encoding="utf-8") as fh:
++        return json.load(fh)
++
++
++def save(path, state):
++    tmp = path + ".tmp"
++    with open(tmp, "w", encoding="utf-8") as fh:
++        json.dump(state, fh, indent=2, sort_keys=True)
++        fh.write("\n")
++    os.replace(tmp, path)
+diff --git a/warehouse.py b/warehouse.py
+new file mode 100644
+index 0000000..a3af638
+--- /dev/null
++++ b/warehouse.py
+@@ -0,0 +1,95 @@
++"""Warehouse operations tying registration, packing, and stock together."""
++import re
++
++import packing
++
++BIN_ID_RE = re.compile(r"^[A-Z]-\d{2}$")
++
++
++class WarehouseError(Exception):
++    pass
++
++
++def add_bin(state, bin_id, volume, max_weight, hazmat):
++    if not BIN_ID_RE.fullmatch(bin_id):
++        raise WarehouseError(
++            f"bad bin id {bin_id!r}: expected AISLE-POSITION like A-01")
++    if bin_id in state["bins"]:
++        raise WarehouseError(f"bin {bin_id} already exists")
++    if volume <= 0 or max_weight <= 0:
++        raise WarehouseError("bin volume and max weight must be positive")
++    state["bins"][bin_id] = {
++        "volume": volume, "max_weight": max_weight, "hazmat": hazmat}
++
++
++def add_sku(state, sku_id, volume, weight, hazmat, min_stock):
++    if sku_id in state["skus"]:
++        raise WarehouseError(f"sku {sku_id} already exists")
++    if volume <= 0 or weight <= 0:
++        raise WarehouseError("sku volume and weight must be positive")
++    if min_stock < 0:
++        raise WarehouseError("min-stock cannot be negative")
++    state["skus"][sku_id] = {
++        "volume": volume, "weight": weight, "hazmat": hazmat,
++        "min_stock": min_stock}
++
++
++def _require_sku(state, sku_id):
++    if sku_id not in state["skus"]:
++        raise WarehouseError(f"unknown sku {sku_id}")
++
++
++def _require_qty(qty):
++    if qty < 1:
++        raise WarehouseError("qty must be at least 1")
++
++
++def putaway(state, sku_id, qty):
++    _require_sku(state, sku_id)
++    _require_qty(qty)
++    try:
++        plan = packing.plan_putaway(
++            state["bins"], state["stock"], state["skus"], sku_id, qty)
++    except packing.PackingError as exc:
++        raise WarehouseError(str(exc)) from exc
++    for bin_id, take in plan:
++        contents = state["stock"].setdefault(bin_id, {})
++        contents[sku_id] = contents.get(sku_id, 0) + take
++    return plan
++
++
++def pick(state, sku_id, qty):
++    _require_sku(state, sku_id)
++    _require_qty(qty)
++    try:
++        plan = packing.plan_pick(state["stock"], sku_id, qty)
++    except packing.PackingError as exc:
++        raise WarehouseError(str(exc)) from exc
++    for bin_id, take in plan:
++        contents = state["stock"][bin_id]
++        contents[sku_id] -= take
++        if contents[sku_id] == 0:
++            del contents[sku_id]
++        if not contents:
++            del state["stock"][bin_id]
++    return plan
++
++
++def find(state, sku_id):
++    _require_sku(state, sku_id)
++    holdings = sorted(
++        (bin_id, contents[sku_id])
++        for bin_id, contents in state["stock"].items()
++        if contents.get(sku_id, 0) > 0)
++    total = sum(q for _, q in holdings)
++    return holdings, total
++
++
++def alerts(state):
++    low = []
++    for sku_id in sorted(state["skus"]):
++        want = state["skus"][sku_id]["min_stock"]
++        have = sum(c.get(sku_id, 0) for c in state["stock"].values())
++        if have < want:
++            low.append((sku_id, have, want))
++    return low

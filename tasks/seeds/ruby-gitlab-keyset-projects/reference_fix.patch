@@ -1,0 +1,203 @@
+diff --git a/gitlab_client.rb b/gitlab_client.rb
+new file mode 100644
+index 0000000..e10b41f
+--- /dev/null
++++ b/gitlab_client.rb
+@@ -0,0 +1,85 @@
++# frozen_string_literal: true
++
++require "json"
++require "net/http"
++require "uri"
++
++# Thin GitLab REST v4 transport. Every request carries the documented
++# PRIVATE-TOKEN header; moved-resource responses are followed through their
++# Location header with a bounded hop count. Error messages carry the
++# server's message document but never the token.
++class GitlabClient
++  class ApiError < StandardError
++    attr_reader :status
++
++    def initialize(status, message)
++      super(message)
++      @status = status
++    end
++  end
++
++  class AuthError < ApiError; end
++
++  class RedirectLoopError < StandardError; end
++
++  REDIRECT_CODES = %w[301 302 303 307 308].freeze
++  MAX_REDIRECTS = 5
++
++  def initialize(base_url:, token:)
++    @base_url = base_url.sub(%r{/+\z}, "")
++    @token = token
++  end
++
++  # GET a path (or an absolute URL handed back by the server, e.g. a keyset
++  # Link target or a moved-resource Location). Returns [parsed_body, response].
++  def get(path_or_url)
++    url = path_or_url.start_with?("http") ? path_or_url : @base_url + path_or_url
++    hops = 0
++    loop do
++      response = perform(url)
++      if REDIRECT_CODES.include?(response.code)
++        hops += 1
++        if hops > MAX_REDIRECTS
++          raise RedirectLoopError,
++                "gave up after #{hops} redirect hops following moved resources"
++        end
++        url = response["Location"]
++        next
++      end
++      return decode(response)
++    end
++  end
++
++  private
++
++  def perform(url)
++    uri = URI.parse(url)
++    request = Net::HTTP::Get.new(uri)
++    request["PRIVATE-TOKEN"] = @token
++    request["Accept"] = "application/json"
++    Net::HTTP.start(uri.hostname, uri.port) { |http| http.request(request) }
++  end
++
++  def decode(response)
++    status = response.code.to_i
++    body = parse_body(response.body)
++    if status == 401
++      raise AuthError.new(status, "GitLab answered 401: #{message_of(body)}")
++    elsif status >= 400
++      raise ApiError.new(status, "GitLab answered #{status}: #{message_of(body)}")
++    end
++    [body, response]
++  end
++
++  def parse_body(raw)
++    return nil if raw.nil? || raw.empty?
++
++    JSON.parse(raw)
++  rescue JSON::ParserError
++    raw
++  end
++
++  def message_of(body)
++    body.is_a?(Hash) ? body.fetch("message", body.to_s) : body.to_s
++  end
++end
+diff --git a/project_inventory.rb b/project_inventory.rb
+new file mode 100644
+index 0000000..d3ba532
+--- /dev/null
++++ b/project_inventory.rb
+@@ -0,0 +1,106 @@
++# frozen_string_literal: true
++
++require "cgi"
++require "uri"
++
++# Project inventory over the documented GitLab v4 projects surface.
++# Keyset mode follows the Link header's rel="next" URL verbatim (the
++# documented rule — never rebuild it); offset mode walks x-next-page.
++class ProjectInventory
++  PROJECTS_PATH = "/api/v4/projects"
++
++  def initialize(client)
++    @client = client
++  end
++
++  def fetch_all(per_page:, mode: :keyset)
++    case mode
++    when :keyset then fetch_keyset(per_page)
++    when :offset then fetch_offset(per_page)
++    else raise ArgumentError, "unknown pagination mode #{mode.inspect}"
++    end
++  end
++
++  # Single project by namespaced path; / travels URL-encoded per the docs.
++  # Moved-resource redirects are handled by the client transport.
++  def fetch_project(namespaced_path)
++    body, = @client.get("#{PROJECTS_PATH}/#{CGI.escape(namespaced_path)}")
++    body
++  end
++
++  # rows sorted by id; null booleans stay null (never collapsed to false)
++  # and are tallied separately as "unknown" in the summary.
++  def report(projects)
++    rows = projects.sort_by { |p| p["id"] }.map do |p|
++      {
++        "id" => p["id"],
++        "path_with_namespace" => p["path_with_namespace"],
++        "visibility" => p["visibility"],
++        "archived" => p["archived"],
++        "emails_disabled" => p["emails_disabled"],
++      }
++    end
++    counts = { "true" => 0, "false" => 0, "unknown" => 0 }
++    rows.each do |row|
++      key = case row["emails_disabled"]
++            when true then "true"
++            when false then "false"
++            else "unknown"
++            end
++      counts[key] += 1
++    end
++    {
++      "rows" => rows,
++      "summary" => { "total" => rows.length, "emails_disabled_counts" => counts },
++    }
++  end
++
++  private
++
++  def fetch_keyset(per_page)
++    projects = []
++    query = URI.encode_www_form(
++      "pagination" => "keyset",
++      "order_by" => "id",
++      "sort" => "asc",
++      "per_page" => per_page
++    )
++    url = "#{PROJECTS_PATH}?#{query}"
++    while url
++      body, response = @client.get(url)
++      projects.concat(body)
++      url = next_link(response["Link"])
++    end
++    projects
++  end
++
++  def fetch_offset(per_page)
++    projects = []
++    page = "1"
++    while page && !page.empty?
++      query = URI.encode_www_form(
++        "order_by" => "id",
++        "sort" => "asc",
++        "per_page" => per_page,
++        "page" => page
++      )
++      body, response = @client.get("#{PROJECTS_PATH}?#{query}")
++      projects.concat(body)
++      page = response["x-next-page"]
++    end
++    projects
++  end
++
++  # Extract the rel="next" target from a Link header, or nil when the
++  # collection is exhausted (Link absent on the final page).
++  def next_link(link_header)
++    return nil if link_header.nil? || link_header.strip.empty?
++
++    link_header.split(",").each do |entry|
++      target, *params = entry.split(";").map(&:strip)
++      next unless params.any? { |param| param.match?(/\Arel="?next"?\z/) }
++      return target.delete_prefix("<").delete_suffix(">")
++    end
++    nil
++  end
++end

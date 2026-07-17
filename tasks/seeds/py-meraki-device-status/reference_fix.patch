@@ -1,0 +1,280 @@
+diff --git a/merakiinv/__init__.py b/merakiinv/__init__.py
+new file mode 100644
+index 0000000..879272f
+--- /dev/null
++++ b/merakiinv/__init__.py
+@@ -0,0 +1,13 @@
++"""merakiinv: Cisco Meraki Dashboard API v1 inventory client."""
++
++from .errors import MerakiAPIError
++from .inventory import collect_inventory
++from .transport import GLOBAL_BASE_URL, MerakiSession, base_url_for_region
++
++__all__ = [
++    "GLOBAL_BASE_URL",
++    "MerakiAPIError",
++    "MerakiSession",
++    "base_url_for_region",
++    "collect_inventory",
++]
+diff --git a/merakiinv/errors.py b/merakiinv/errors.py
+new file mode 100644
+index 0000000..a56906e
+--- /dev/null
++++ b/merakiinv/errors.py
+@@ -0,0 +1,16 @@
++"""Error types for the Meraki Dashboard API v1 client."""
++
++
++class MerakiAPIError(Exception):
++    """A non-success Dashboard API response.
++
++    Carries the HTTP status and the messages from the documented
++    ``{"errors": [...]}`` envelope. The API key is never included.
++    """
++
++    def __init__(self, status, errors):
++        self.status = status
++        self.errors = list(errors)
++        super().__init__(
++            "Meraki API error %d: %s" % (status, "; ".join(self.errors))
++        )
+diff --git a/merakiinv/inventory.py b/merakiinv/inventory.py
+new file mode 100644
+index 0000000..609ea4d
+--- /dev/null
++++ b/merakiinv/inventory.py
+@@ -0,0 +1,71 @@
++"""Whole-estate Meraki inventory traversal.
++
++Walks organizations -> networks -> device availabilities (the current
++replacement for the deprecated device statuses operation) and produces a
++deterministic, sorted snapshot suitable for diffing.
++"""
++
++
++def _network_entry(network):
++    return {
++        "id": network["id"],
++        "name": network["name"],
++        "productTypes": sorted(network.get("productTypes", [])),
++    }
++
++
++def _device_entry(device):
++    return {
++        "serial": device["serial"],
++        "name": device.get("name"),
++        "mac": device.get("mac"),
++        "productType": device["productType"],
++        "status": device["status"],
++        "networkId": (device.get("network") or {}).get("id"),
++    }
++
++
++def collect_inventory(session, product_types=None, statuses=None,
++                      per_page=None):
++    """Snapshot every API-enabled organization the key can see.
++
++    Organizations are fully paginated first, then traversed in ascending id
++    order; for each org the networks are listed before device availabilities
++    so a partial failure leaves a coherent prefix.
++    """
++    organizations = session.get_paginated("/organizations", per_page=per_page)
++    snapshot = []
++    for org in sorted(organizations, key=lambda o: o["id"]):
++        if not (org.get("api") or {}).get("enabled", False):
++            continue
++        networks = session.get_paginated(
++            "/organizations/%s/networks" % org["id"], per_page=per_page
++        )
++        filters = {}
++        if product_types:
++            filters["productTypes"] = list(product_types)
++        if statuses:
++            filters["statuses"] = list(statuses)
++        devices = session.get_paginated(
++            "/organizations/%s/devices/availabilities" % org["id"],
++            params=filters,
++            per_page=per_page,
++        )
++        snapshot.append(
++            {
++                "id": org["id"],
++                "name": org["name"],
++                "region": ((org.get("cloud") or {}).get("region") or {}).get(
++                    "name"
++                ),
++                "networks": sorted(
++                    (_network_entry(n) for n in networks),
++                    key=lambda n: n["id"],
++                ),
++                "devices": sorted(
++                    (_device_entry(d) for d in devices),
++                    key=lambda d: d["serial"],
++                ),
++            }
++        )
++    return {"organizations": snapshot}
+diff --git a/merakiinv/pagination.py b/merakiinv/pagination.py
+new file mode 100644
+index 0000000..f340714
+--- /dev/null
++++ b/merakiinv/pagination.py
+@@ -0,0 +1,36 @@
++"""RFC 5988 Link header parsing for Dashboard API pagination.
++
++Meraki answers paginated collections with a Link header carrying up to
++first/prev/next/last relations. The rel parameter appears both quoted and
++unquoted in the wild; both forms are accepted. The relation URLs are meant
++to be followed verbatim.
++"""
++
++
++def parse_link_header(value):
++    """Return a dict of rel -> URL from a Link header value."""
++    links = {}
++    if not value:
++        return links
++    for part in value.split(","):
++        part = part.strip()
++        if ";" not in part:
++            continue
++        target, params = part.split(";", 1)
++        target = target.strip()
++        if not (target.startswith("<") and target.endswith(">")):
++            continue
++        url = target[1:-1]
++        for param in params.split(";"):
++            name, _, raw = param.partition("=")
++            if name.strip().lower() != "rel":
++                continue
++            rel = raw.strip().strip('"').lower()
++            if rel:
++                links[rel] = url
++    return links
++
++
++def next_link(value):
++    """Return the rel=next URL from a Link header, or None."""
++    return parse_link_header(value).get("next")
+diff --git a/merakiinv/transport.py b/merakiinv/transport.py
+new file mode 100644
+index 0000000..d514887
+--- /dev/null
++++ b/merakiinv/transport.py
+@@ -0,0 +1,114 @@
++"""HTTP transport for the Cisco Meraki Dashboard API v1.
++
++Implements the documented v1 contract: bearer authorization, regional base
++URLs, the ``name[]`` array query convention, Link-header pagination, the
++429/Retry-After rate-limit dance, and the ``{"errors": [...]}`` envelope.
++"""
++
++import json
++import time
++import urllib.error
++import urllib.request
++from urllib.parse import urlencode
++
++from .errors import MerakiAPIError
++from .pagination import next_link
++
++GLOBAL_BASE_URL = "https://api.meraki.com/api/v1"
++
++_REGION_BASE_URLS = {
++    "global": GLOBAL_BASE_URL,
++    "canada": "https://api.meraki.ca/api/v1",
++    "china": "https://api.meraki.cn/api/v1",
++    "india": "https://api.meraki.in/api/v1",
++    "us-fedramp": "https://api.gov-meraki.com/api/v1",
++}
++
++
++def base_url_for_region(region):
++    """Return the documented versioned base URL for a dashboard region."""
++    try:
++        return _REGION_BASE_URLS[region]
++    except KeyError:
++        raise ValueError("unknown Meraki dashboard region: %r" % (region,))
++
++
++def _encode_query(params, per_page):
++    pairs = []
++    if per_page is not None:
++        pairs.append(("perPage", str(per_page)))
++    for key, value in (params or {}).items():
++        if isinstance(value, (list, tuple)):
++            # Meraki's documented array convention: repeated name[] pairs.
++            pairs.extend(("%s[]" % key, str(item)) for item in value)
++        else:
++            pairs.append((key, str(value)))
++    return urlencode(pairs)
++
++
++class MerakiSession:
++    """A Dashboard API v1 session bound to one API key and base URL."""
++
++    def __init__(self, api_key, base_url=GLOBAL_BASE_URL, sleep=None,
++                 max_retries=3):
++        self._api_key = api_key
++        self.base_url = base_url.rstrip("/")
++        self._sleep = sleep if sleep is not None else time.sleep
++        self.max_retries = max_retries
++
++    def _url(self, path, params=None, per_page=None):
++        url = self.base_url + path
++        query = _encode_query(params, per_page)
++        if query:
++            url += "?" + query
++        return url
++
++    def _request(self, url):
++        """GET a URL, honoring Retry-After on 429 a bounded number of times."""
++        retries = 0
++        while True:
++            request = urllib.request.Request(
++                url,
++                headers={
++                    "Authorization": "Bearer %s" % self._api_key,
++                    "Accept": "application/json",
++                },
++            )
++            try:
++                with urllib.request.urlopen(request) as response:
++                    data = json.loads(response.read().decode("utf-8"))
++                    return data, response.headers
++            except urllib.error.HTTPError as exc:
++                errors = self._decode_errors(exc)
++                if exc.code == 429 and retries < self.max_retries:
++                    retries += 1
++                    retry_after = float(exc.headers.get("Retry-After", "1"))
++                    self._sleep(retry_after)
++                    continue
++                raise MerakiAPIError(exc.code, errors) from None
++
++    @staticmethod
++    def _decode_errors(exc):
++        try:
++            payload = json.loads(exc.read().decode("utf-8"))
++            errors = payload.get("errors")
++            if isinstance(errors, list) and errors:
++                return [str(e) for e in errors]
++        except (ValueError, AttributeError):
++            pass
++        return ["HTTP %d" % exc.code]
++
++    def get_json(self, path, params=None):
++        """GET one resource and return its decoded JSON body."""
++        data, _ = self._request(self._url(path, params))
++        return data
++
++    def get_paginated(self, path, params=None, per_page=None):
++        """GET a collection, following Link rel=next URLs verbatim."""
++        url = self._url(path, params, per_page)
++        items = []
++        while url:
++            data, headers = self._request(url)
++            items.extend(data)
++            url = next_link(headers.get("Link"))
++        return items

@@ -1,0 +1,751 @@
+diff --git a/incidents/__init__.py b/incidents/__init__.py
+new file mode 100644
+index 0000000..377c94f
+--- /dev/null
++++ b/incidents/__init__.py
+@@ -0,0 +1 @@
++"""incidentctl: incident management on logical time, one JSON state file."""
+diff --git a/incidents/cli.py b/incidents/cli.py
+new file mode 100644
+index 0000000..5efc3eb
+--- /dev/null
++++ b/incidents/cli.py
+@@ -0,0 +1,333 @@
++"""argv dispatch for incidentctl. Parsing and printing only — the domain
++logic lives in the sibling modules. main() never touches the wall clock."""
++import os
++import sys
++
++from . import escalation, grouping, ingest, rotation, store, timeline
++
++
++class UsageError(Exception):
++    """Bad invocation: unknown command, missing/malformed arguments. Exit 2."""
++
++
++class DomainError(Exception):
++    """Valid invocation refused by the domain rules. Exit 1."""
++
++
++def _err(msg):
++    print("error: %s" % msg, file=sys.stderr)
++
++
++def _parse_flags(args, value_flags, bool_flags=(), multi_flags=()):
++    """Split args into (positionals, flags). Repeated multi_flags collect."""
++    positionals, flags = [], {}
++    i = 0
++    while i < len(args):
++        arg = args[i]
++        if arg.startswith("--"):
++            if arg in bool_flags:
++                flags[arg] = True
++            elif arg in value_flags or arg in multi_flags:
++                if i + 1 >= len(args):
++                    raise UsageError("missing value for %s" % arg)
++                if arg in multi_flags:
++                    flags.setdefault(arg, []).append(args[i + 1])
++                else:
++                    flags[arg] = args[i + 1]
++                i += 1
++            else:
++                raise UsageError("unknown flag %s" % arg)
++        else:
++            positionals.append(arg)
++        i += 1
++    return positionals, flags
++
++
++def _ts(text, what):
++    try:
++        return rotation.parse_ts(text)
++    except (ValueError, TypeError):
++        raise UsageError("bad %s timestamp: %r" % (what, text))
++
++
++def _int(text, what, minimum=1):
++    try:
++        value = int(text)
++    except (ValueError, TypeError):
++        raise UsageError("bad %s: %r" % (what, text))
++    if value < minimum:
++        raise UsageError("bad %s: %r" % (what, text))
++    return value
++
++
++def _need(positionals, count, usage):
++    if len(positionals) != count:
++        raise UsageError("usage: %s" % usage)
++    return positionals
++
++
++def _rotation_or_fail(state, name):
++    if name not in state["rotations"]:
++        raise DomainError("unknown rotation: %s" % name)
++    return state["rotations"][name]
++
++
++def _incident_or_fail(state, incident_id):
++    inc = grouping.find(state, incident_id)
++    if inc is None:
++        raise DomainError("unknown incident: %s" % incident_id)
++    return inc
++
++
++# ---- command handlers: return True when state must be saved ----------------
++
++def _cmd_rotation_add(state, args, now_min):
++    pos, flags = _parse_flags(args, ("--people", "--start", "--shift-hours"))
++    (name,) = _need(pos, 1, "rotation add NAME --people A,B --start T --shift-hours H")
++    for flag in ("--people", "--start", "--shift-hours"):
++        if flag not in flags:
++            raise UsageError("rotation add needs %s" % flag)
++    people = [p for p in flags["--people"].split(",") if p]
++    if not people:
++        raise UsageError("empty people list")
++    start = _ts(flags["--start"], "--start")
++    hours = _int(flags["--shift-hours"], "--shift-hours")
++    if name in state["rotations"]:
++        raise DomainError("rotation %s already exists" % name)
++    rotation.add_rotation(state, name, people, start, hours)
++    print("added rotation %s" % name)
++    return True
++
++
++def _cmd_override_add(state, args, now_min):
++    pos, flags = _parse_flags(args, ("--from", "--until"))
++    name, person = _need(pos, 2, "override add ROTATION PERSON --from T --until U")
++    if "--from" not in flags or "--until" not in flags:
++        raise UsageError("override add needs --from and --until")
++    frm = _ts(flags["--from"], "--from")
++    until = _ts(flags["--until"], "--until")
++    if frm >= until:
++        raise UsageError("--from must be before --until")
++    _rotation_or_fail(state, name)
++    rotation.add_override(state, name, person, frm, until)
++    print("added override on %s" % name)
++    return True
++
++
++def _cmd_oncall(state, args, now_min):
++    pos, flags = _parse_flags(args, ("--at",))
++    (name,) = _need(pos, 1, "oncall ROTATION [--at T]")
++    at = _ts(flags["--at"], "--at") if "--at" in flags else now_min
++    _rotation_or_fail(state, name)
++    print(rotation.on_call(state, name, at))
++    return False
++
++
++def _cmd_handoffs(state, args, now_min):
++    pos, flags = _parse_flags(args, ("--at", "--count"))
++    (name,) = _need(pos, 1, "handoffs ROTATION --count N [--at T]")
++    if "--count" not in flags:
++        raise UsageError("handoffs needs --count")
++    count = _int(flags["--count"], "--count")
++    at = _ts(flags["--at"], "--at") if "--at" in flags else now_min
++    _rotation_or_fail(state, name)
++    for boundary, person in rotation.handoffs(state, name, at, count):
++        print("%s %s" % (rotation.fmt_ts(boundary), person))
++    return False
++
++
++def _cmd_policy_add(state, args, now_min):
++    pos, flags = _parse_flags(args, (), multi_flags=("--step",))
++    (name,) = _need(pos, 1, "policy add NAME --step TARGET@MIN ... --step TARGET")
++    raw_steps = flags.get("--step", [])
++    if not raw_steps:
++        raise UsageError("policy add needs at least one --step")
++    steps = []
++    for idx, raw in enumerate(raw_steps):
++        try:
++            target, wait = escalation.parse_step(raw)
++        except ValueError as exc:
++            raise UsageError(str(exc))
++        last = idx == len(raw_steps) - 1
++        if wait is None and not last:
++            raise UsageError("step %r needs @minutes (only the last step may omit it)" % raw)
++        kind, _, rot_name = target.partition(":")
++        if kind == "rotation":
++            _rotation_or_fail(state, rot_name)
++        steps.append({"target": target, "wait": wait})
++    if name in state["policies"]:
++        raise DomainError("policy %s already exists" % name)
++    state["policies"][name] = {"steps": steps}
++    print("added policy %s" % name)
++    return True
++
++
++def _cmd_route_add(state, args, now_min):
++    pos, _ = _parse_flags(args, ())
++    service, policy = _need(pos, 2, "route add SERVICE POLICY")
++    if policy not in state["policies"]:
++        raise DomainError("unknown policy: %s" % policy)
++    state["routes"][service] = policy
++    print("routed %s to %s" % (service, policy))
++    return True
++
++
++def _cmd_ingest(state, args, now_min):
++    pos, flags = _parse_flags(args, ("--window",), bool_flags=("--strict",))
++    (path,) = _need(pos, 1, "ingest FILE [--strict] [--window N]")
++    window = _int(flags["--window"], "--window") if "--window" in flags \
++        else grouping.DEFAULT_WINDOW
++    strict = flags.get("--strict", False)
++    if not os.path.exists(path):
++        raise UsageError("alerts file not found: %s" % path)
++
++    rows = list(ingest.read_batch(path))
++    if strict:
++        for lineno, _alert, reason in rows:
++            if reason is not None:
++                print("line %d: %s" % (lineno, reason), file=sys.stderr)
++                raise DomainError("")  # abort: nothing ingested, exit 1
++    accepted = new = grouped = rejected = 0
++    for lineno, alert, reason in rows:
++        if reason is not None:
++            rejected += 1
++            print("line %d: %s" % (lineno, reason), file=sys.stderr)
++            continue
++        accepted += 1
++        inc, opened = grouping.place_alert(state, alert, window)
++        if opened:
++            new += 1
++            escalation.open_paging(state, inc)
++        else:
++            grouped += 1
++    print("ingested %d alert(s): %d new, %d grouped, %d rejected"
++          % (accepted, new, grouped, rejected))
++    return True
++
++
++def _cmd_ack(state, args, now_min):
++    pos, flags = _parse_flags(args, ("--by",))
++    (incident_id,) = _need(pos, 1, "ack INC-n --by PERSON")
++    if "--by" not in flags:
++        raise UsageError("ack needs --by")
++    inc = _incident_or_fail(state, incident_id)
++    if inc["resolved_at"] is not None:
++        raise DomainError("%s is resolved" % incident_id)
++    if inc["acked_at"] is not None:
++        raise DomainError("%s already acked" % incident_id)
++    inc["acked_at"] = rotation.fmt_ts(now_min)
++    inc["acked_at_min"] = now_min
++    inc["acked_by"] = flags["--by"]
++    print("acked %s" % incident_id)
++    return True
++
++
++def _cmd_resolve(state, args, now_min):
++    pos, _ = _parse_flags(args, ())
++    (incident_id,) = _need(pos, 1, "resolve INC-n")
++    inc = _incident_or_fail(state, incident_id)
++    if inc["resolved_at"] is not None:
++        raise DomainError("%s is resolved" % incident_id)
++    inc["resolved_at"] = rotation.fmt_ts(now_min)
++    inc["resolved_at_min"] = now_min
++    print("resolved %s" % incident_id)
++    return True
++
++
++def _cmd_tick(state, args, now_min):
++    _need(_parse_flags(args, ())[0], 0, "tick")
++    fired = escalation.tick(state, now_min)
++    if not fired:
++        print("no pages due")
++        return True
++    for page in fired:
++        print("page %s level %d -> %s (%s)"
++              % (page["incident"], page["level"], page["target"], page["at"]))
++    return True
++
++
++def _cmd_list(state, args, now_min):
++    _, flags = _parse_flags(args, (), bool_flags=("--all",))
++    show_all = flags.get("--all", False)
++    lines = []
++    for inc in state["incidents"]:
++        status = timeline.status_of(inc)
++        if status == "resolved" and not show_all:
++            continue
++        lines.append("%s %s %s %s alerts=%d last=%s"
++                     % (inc["id"], status, inc["severity"], inc["fingerprint"],
++                        len(inc["alerts"]), inc["last_seen"]))
++    if not lines:
++        print("no incidents")
++    else:
++        for line in lines:
++            print(line)
++    return False
++
++
++def _cmd_timeline(state, args, now_min):
++    pos, flags = _parse_flags(args, ("--format",))
++    (incident_id,) = _need(pos, 1, "timeline INC-n [--format text|json]")
++    fmt = flags.get("--format", "text")
++    if fmt not in ("text", "json"):
++        raise UsageError("bad --format: %r" % fmt)
++    inc = _incident_or_fail(state, incident_id)
++    if fmt == "json":
++        print(timeline.render_json(inc))
++    else:
++        print(timeline.render_text(inc))
++    return False
++
++
++_COMMANDS = {
++    ("rotation", "add"): _cmd_rotation_add,
++    ("override", "add"): _cmd_override_add,
++    ("oncall",): _cmd_oncall,
++    ("handoffs",): _cmd_handoffs,
++    ("policy", "add"): _cmd_policy_add,
++    ("route", "add"): _cmd_route_add,
++    ("ingest",): _cmd_ingest,
++    ("ack",): _cmd_ack,
++    ("resolve",): _cmd_resolve,
++    ("tick",): _cmd_tick,
++    ("list",): _cmd_list,
++    ("timeline",): _cmd_timeline,
++}
++
++
++def main(argv, *, now, state_path):
++    try:
++        now_min = rotation.parse_ts(now)
++    except (ValueError, TypeError):
++        _err("bad now timestamp: %r" % (now,))
++        return 2
++    try:
++        state = store.load(state_path)
++    except store.CorruptState:
++        _err("state file is corrupt: %s" % state_path)
++        return 2
++
++    if not argv:
++        _err("usage: incidentctl COMMAND ...")
++        return 2
++    handler = _COMMANDS.get((argv[0],))
++    rest = argv[1:]
++    if handler is None and len(argv) >= 2:
++        handler = _COMMANDS.get((argv[0], argv[1]))
++        rest = argv[2:]
++    if handler is None:
++        _err("unknown command: %s" % argv[0])
++        return 2
++
++    try:
++        must_save = handler(state, rest, now_min)
++    except UsageError as exc:
++        _err(str(exc))
++        return 2
++    except DomainError as exc:
++        if str(exc):
++            _err(str(exc))
++        return 1
++    if must_save:
++        store.save(state_path, state)
++    return 0
+diff --git a/incidents/escalation.py b/incidents/escalation.py
+new file mode 100644
+index 0000000..339e1f0
+--- /dev/null
++++ b/incidents/escalation.py
+@@ -0,0 +1,77 @@
++"""Escalation ladders: level-0 paging at open, tick materializes the rest."""
++from . import rotation
++
++
++def parse_step(text):
++    """'kind:name@minutes' or 'kind:name' -> (target, wait_or_None).
++
++    Raises ValueError for malformed syntax (kind, name, minutes).
++    """
++    wait = None
++    target = text
++    if "@" in text:
++        target, _, raw = text.partition("@")
++        if not raw.isdigit() or int(raw) < 1:
++            raise ValueError("bad step minutes: %s" % text)
++        wait = int(raw)
++    kind, sep, name = target.partition(":")
++    if not sep or kind not in ("user", "rotation") or not name:
++        raise ValueError("bad step target: %s" % text)
++    return target, wait
++
++
++def resolve_target(state, target, at_min):
++    kind, _, name = target.partition(":")
++    if kind == "user":
++        return name
++    return rotation.on_call(state, name, at_min)
++
++
++def open_paging(state, inc):
++    """Fire level 0 for a freshly opened incident, if its service is routed."""
++    policy_name = state["routes"].get(inc["service"])
++    if policy_name is None:
++        return
++    inc["policy"] = policy_name
++    steps = state["policies"][policy_name]["steps"]
++    target = resolve_target(state, steps[0]["target"], inc["opened_at_min"])
++    inc["pages"].append({"at": inc["opened_at"], "at_min": inc["opened_at_min"],
++                         "level": 0, "target": target})
++    inc["fired_levels"].append(0)
++
++
++def _cutoff(inc):
++    """Minute at which the ladder was cut (ack or resolve), or None."""
++    marks = [m for m in (inc.get("acked_at_min"), inc.get("resolved_at_min"))
++             if m is not None]
++    return min(marks) if marks else None
++
++
++def tick(state, now_min):
++    """Fire every level that fell due by now and wasn't cut. Returns the
++    fired pages ordered by (due, incident number, level)."""
++    fired = []
++    for inc in state["incidents"]:
++        if inc["policy"] is None:
++            continue
++        steps = state["policies"][inc["policy"]]["steps"]
++        cutoff = _cutoff(inc)
++        due = inc["opened_at_min"]
++        for level in range(1, len(steps)):
++            due += steps[level - 1]["wait"]
++            if due > now_min:
++                break
++            if cutoff is not None and due >= cutoff:
++                break
++            if level in inc["fired_levels"]:
++                continue
++            target = resolve_target(state, steps[level]["target"], due)
++            page = {"at": rotation.fmt_ts(due), "at_min": due,
++                    "level": level, "target": target}
++            inc["pages"].append(page)
++            inc["fired_levels"].append(level)
++            fired.append((due, inc["num"], level, inc["id"], target))
++    fired.sort()
++    return [{"incident": inc_id, "level": level, "target": target,
++             "at": rotation.fmt_ts(due)}
++            for due, _num, level, inc_id, target in fired]
+diff --git a/incidents/grouping.py b/incidents/grouping.py
+new file mode 100644
+index 0000000..e059528
+--- /dev/null
++++ b/incidents/grouping.py
+@@ -0,0 +1,75 @@
++"""Fingerprint + window rules: attach an alert or open a new incident."""
++
++SEVERITY_RANK = {"low": 0, "high": 1, "critical": 2}
++
++DEFAULT_WINDOW = 15
++
++
++def fingerprint(alert):
++    return "%s/%s" % (alert["service"], alert["check"])
++
++
++def _candidate(state, fp):
++    """The open incident with this fingerprint that saw activity most
++    recently (ties go to the most recently opened)."""
++    best = None
++    for inc in state["incidents"]:
++        if inc["resolved_at"] is not None or inc["fingerprint"] != fp:
++            continue
++        if best is None or (inc["last_seen_min"], inc["num"]) > (
++                best["last_seen_min"], best["num"]):
++            best = inc
++    return best
++
++
++def place_alert(state, alert, window):
++    """Attach `alert` to an incident or open a new one.
++
++    Returns (incident, opened) where opened says a new incident was created.
++    Grouping rule: join the candidate iff the gap from its newest alert is at
++    most `window` minutes; late alerts (negative gap) always join, and the
++    incident's last-seen never moves backwards.
++    """
++    fp = fingerprint(alert)
++    inc = _candidate(state, fp)
++    if inc is not None and alert["at_min"] - inc["last_seen_min"] <= window:
++        inc["alerts"].append(_event(alert))
++        inc["last_seen_min"] = max(inc["last_seen_min"], alert["at_min"])
++        inc["last_seen"] = max(inc["last_seen"], alert["at"])
++        if SEVERITY_RANK[alert["severity"]] > SEVERITY_RANK[inc["severity"]]:
++            inc["severity"] = alert["severity"]
++        return inc, False
++    state["counter"] += 1
++    num = state["counter"]
++    inc = {
++        "id": "INC-%d" % num,
++        "num": num,
++        "fingerprint": fp,
++        "service": alert["service"],
++        "opened_at": alert["at"],
++        "opened_at_min": alert["at_min"],
++        "last_seen": alert["at"],
++        "last_seen_min": alert["at_min"],
++        "severity": alert["severity"],
++        "alerts": [_event(alert)],
++        "pages": [],
++        "fired_levels": [],
++        "policy": None,
++        "acked_at": None,
++        "acked_by": None,
++        "resolved_at": None,
++    }
++    state["incidents"].append(inc)
++    return inc, True
++
++
++def _event(alert):
++    return {"at": alert["at"], "at_min": alert["at_min"],
++            "severity": alert["severity"], "message": alert["message"]}
++
++
++def find(state, incident_id):
++    for inc in state["incidents"]:
++        if inc["id"] == incident_id:
++            return inc
++    return None
+diff --git a/incidents/ingest.py b/incidents/ingest.py
+new file mode 100644
+index 0000000..c59eb0f
+--- /dev/null
++++ b/incidents/ingest.py
+@@ -0,0 +1,53 @@
++"""Alert-line parsing and schema validation for JSON-lines batches."""
++import json
++
++from .rotation import parse_ts
++
++SEVERITIES = ("low", "high", "critical")
++_FIELDS = ("at", "service", "check", "severity", "message")
++
++
++def validate_line(raw):
++    """Return (alert, None) for a good line or (None, reason) for a bad one.
++
++    Reason strings are part of the CLI contract; check order is fixed.
++    """
++    try:
++        obj = json.loads(raw)
++    except ValueError:
++        return None, "invalid json"
++    if not isinstance(obj, dict):
++        return None, "not an object"
++    for field in _FIELDS:
++        if field not in obj:
++            return None, "missing field '%s'" % field
++        if not isinstance(obj[field], str):
++            return None, "wrong type for field '%s'" % field
++    try:
++        at_min = parse_ts(obj["at"])
++    except ValueError:
++        return None, "bad timestamp '%s'" % obj["at"]
++    for field in ("service", "check"):
++        if obj[field] == "":
++            return None, "empty field '%s'" % field
++    if obj["severity"] not in SEVERITIES:
++        return None, "bad severity '%s'" % obj["severity"]
++    alert = {
++        "at": obj["at"],
++        "at_min": at_min,
++        "service": obj["service"],
++        "check": obj["check"],
++        "severity": obj["severity"],
++        "message": obj["message"],
++    }
++    return alert, None
++
++
++def read_batch(path):
++    """Yield (line_number, alert_or_None, reason_or_None) per non-blank line."""
++    with open(path, encoding="utf-8") as f:
++        for lineno, raw in enumerate(f.read().splitlines(), start=1):
++            if raw.strip() == "":
++                continue
++            alert, reason = validate_line(raw)
++            yield lineno, alert, reason
+diff --git a/incidents/rotation.py b/incidents/rotation.py
+new file mode 100644
+index 0000000..6ae94ea
+--- /dev/null
++++ b/incidents/rotation.py
+@@ -0,0 +1,67 @@
++"""On-call schedule math over logical minutes. No wall clock, ever."""
++from datetime import datetime, timedelta
++
++_FMT = "%Y-%m-%dT%H:%M"
++_EPOCH = datetime(2000, 1, 1)
++
++NOBODY = "nobody"
++
++
++def parse_ts(text):
++    """'YYYY-MM-DDTHH:MM' -> minutes since a fixed epoch. ValueError if bad."""
++    if not isinstance(text, str):
++        raise ValueError(text)
++    dt = datetime.strptime(text, _FMT)
++    return int((dt - _EPOCH).total_seconds()) // 60
++
++
++def fmt_ts(minutes):
++    return (_EPOCH + timedelta(minutes=minutes)).strftime(_FMT)
++
++
++def add_rotation(state, name, people, start_min, shift_hours):
++    if name in state["rotations"]:
++        raise KeyError(name)
++    state["rotations"][name] = {
++        "people": list(people),
++        "start": start_min,
++        "shift_hours": shift_hours,
++        "overrides": [],
++    }
++
++
++def add_override(state, name, person, from_min, until_min):
++    rot = state["rotations"][name]
++    rot["overrides"].append({"person": person, "from": from_min, "until": until_min})
++
++
++def on_call(state, name, at_min):
++    """Who holds the pager at at_min: overrides first (last added wins)."""
++    rot = state["rotations"][name]
++    holder = None
++    for ov in rot["overrides"]:
++        if ov["from"] <= at_min < ov["until"]:
++            holder = ov["person"]
++    if holder is not None:
++        return holder
++    if at_min < rot["start"]:
++        return NOBODY
++    shift_len = rot["shift_hours"] * 60
++    idx = (at_min - rot["start"]) // shift_len
++    return rot["people"][idx % len(rot["people"])]
++
++
++def handoffs(state, name, after_min, count):
++    """The next `count` base-schedule boundaries strictly after after_min."""
++    rot = state["rotations"][name]
++    shift_len = rot["shift_hours"] * 60
++    people = rot["people"]
++    if after_min < rot["start"]:
++        k = 0
++    else:
++        k = (after_min - rot["start"]) // shift_len + 1
++    out = []
++    for i in range(count):
++        boundary = rot["start"] + (k + i) * shift_len
++        out.append((boundary, people[(k + i) % len(people)]))
++    return out
+diff --git a/incidents/store.py b/incidents/store.py
+new file mode 100644
+index 0000000..3af42e1
+--- /dev/null
++++ b/incidents/store.py
+@@ -0,0 +1,38 @@
++"""State persistence: one JSON document on disk."""
++import json
++import os
++
++
++class CorruptState(Exception):
++    """Raised when the state file exists but is not a JSON object."""
++
++
++def fresh_state():
++    return {
++        "rotations": {},
++        "policies": {},
++        "routes": {},
++        "incidents": [],
++        "counter": 0,
++    }
++
++
++def load(path):
++    if not os.path.exists(path):
++        return fresh_state()
++    try:
++        with open(path, encoding="utf-8") as f:
++            doc = json.load(f)
++    except ValueError as exc:
++        raise CorruptState(path) from exc
++    if not isinstance(doc, dict):
++        raise CorruptState(path)
++    base = fresh_state()
++    base.update(doc)
++    return base
++
++
++def save(path, state):
++    with open(path, "w", encoding="utf-8") as f:
++        json.dump(state, f, indent=1)
++        f.write("\n")
+diff --git a/incidents/timeline.py b/incidents/timeline.py
+new file mode 100644
+index 0000000..09e4cc5
+--- /dev/null
++++ b/incidents/timeline.py
+@@ -0,0 +1,59 @@
++"""Postmortem timeline export: merged event stream, text and JSON shapes."""
++import json
++
++_KIND_RANK = {"alert": 0, "page": 1, "ack": 2, "resolve": 3}
++
++
++def status_of(inc):
++    if inc["resolved_at"] is not None:
++        return "resolved"
++    if inc["acked_at"] is not None:
++        return "acked"
++    return "open"
++
++
++def events_of(inc):
++    """All events, ordered by time; ties alert < page < ack < resolve,
++    then insertion order (the sort is stable)."""
++    events = []
++    for a in inc["alerts"]:
++        events.append((a["at_min"], {"at": a["at"], "kind": "alert",
++                                     "severity": a["severity"],
++                                     "message": a["message"]}))
++    for p in inc["pages"]:
++        events.append((p["at_min"], {"at": p["at"], "kind": "page",
++                                     "level": p["level"],
++                                     "target": p["target"]}))
++    if inc["acked_at"] is not None:
++        events.append((inc["acked_at_min"], {"at": inc["acked_at"],
++                                             "kind": "ack",
++                                             "by": inc["acked_by"]}))
++    if inc["resolved_at"] is not None:
++        events.append((inc["resolved_at_min"], {"at": inc["resolved_at"],
++                                                "kind": "resolve"}))
++    events.sort(key=lambda pair: (pair[0], _KIND_RANK[pair[1]["kind"]]))
++    return [e for _, e in events]
++
++
++def render_text(inc):
++    lines = ["timeline %s (%s)" % (inc["id"], inc["fingerprint"])]
++    for e in events_of(inc):
++        if e["kind"] == "alert":
++            lines.append("%s alert %s %s" % (e["at"], e["severity"], e["message"]))
++        elif e["kind"] == "page":
++            lines.append("%s page level=%d %s" % (e["at"], e["level"], e["target"]))
++        elif e["kind"] == "ack":
++            lines.append("%s ack %s" % (e["at"], e["by"]))
++        else:
++            lines.append("%s resolve" % e["at"])
++    return "\n".join(lines)
++
++
++def render_json(inc):
++    doc = {
++        "incident": inc["id"],
++        "fingerprint": inc["fingerprint"],
++        "status": status_of(inc),
++        "events": events_of(inc),
++    }
++    return json.dumps(doc)

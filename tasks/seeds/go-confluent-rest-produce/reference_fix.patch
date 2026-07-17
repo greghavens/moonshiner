@@ -1,0 +1,279 @@
+diff --git a/produce.go b/produce.go
+new file mode 100644
+index 0000000..6f5ac63
+--- /dev/null
++++ b/produce.go
+@@ -0,0 +1,273 @@
++// Package restproduce is a batch producer for the Confluent REST Proxy v2
++// produce API (POST /topics/{topic_name}). See docs/contract.json for the
++// pinned contract and docs/official_sources.json for provenance.
++package restproduce
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++)
++
++// Format selects the v2 embedded format and therefore the Content-Type.
++type Format string
++
++const (
++	FormatJSON       Format = "json"
++	FormatAvro       Format = "avro"
++	FormatBinary     Format = "binary"
++	FormatJSONSchema Format = "jsonschema"
++	FormatProtobuf   Format = "protobuf"
++)
++
++const acceptMedia = "application/vnd.kafka.v2+json"
++
++// schemaFormats are the embedded formats that carry key/value schemas.
++var schemaFormats = map[Format]bool{
++	FormatAvro:       true,
++	FormatJSONSchema: true,
++	FormatProtobuf:   true,
++}
++
++func (f Format) contentType() string {
++	return fmt.Sprintf("application/vnd.kafka.%s.v2+json", string(f))
++}
++
++// Record is one record to produce. Nil members are omitted from the wire:
++// a nil Key is a null key, a nil Value a tombstone, a nil Partition lets
++// the proxy choose.
++type Record struct {
++	Key       json.RawMessage
++	Value     json.RawMessage
++	Partition *int32
++}
++
++// BatchRequest carries the batch-level settings.
++type BatchRequest struct {
++	Format      Format
++	KeySchema   string
++	ValueSchema string
++}
++
++// RecordResult is the outcome for one record, aligned with its request
++// position. Partition/Offset are nil for failed records.
++type RecordResult struct {
++	Partition *int32
++	Offset    *int64
++	ErrorCode *int64
++	Error     string
++}
++
++// Succeeded reports whether the proxy accepted the record.
++func (r RecordResult) Succeeded() bool { return r.ErrorCode == nil }
++
++// Retriable reports the documented retriable per-record failure (code 2).
++func (r RecordResult) Retriable() bool {
++	return r.ErrorCode != nil && *r.ErrorCode == 2
++}
++
++// BatchResult is the decoded produce response.
++type BatchResult struct {
++	KeySchemaID   *int32
++	ValueSchemaID *int32
++	Results       []RecordResult
++}
++
++// APIError is a request-level REST Proxy failure ({error_code, message})
++// or a refused redirect.
++type APIError struct {
++	HTTPStatus int
++	ErrorCode  int64
++	Message    string
++}
++
++func (e *APIError) Error() string {
++	return fmt.Sprintf("rest proxy: HTTP %d / %d: %s",
++		e.HTTPStatus, e.ErrorCode, e.Message)
++}
++
++// Client produces to one REST Proxy endpoint with Basic auth.
++type Client struct {
++	baseURL  string
++	http     *http.Client
++	username string
++	password string
++}
++
++// NewClient wraps hc with a no-redirect policy: credentials must never
++// follow a Location header to another host.
++func NewClient(baseURL string, hc *http.Client, username, password string) *Client {
++	guarded := *hc
++	guarded.CheckRedirect = func(req *http.Request, via []*http.Request) error {
++		return http.ErrUseLastResponse
++	}
++	return &Client{
++		baseURL:  baseURL,
++		http:     &guarded,
++		username: username,
++		password: password,
++	}
++}
++
++type wireRecord struct {
++	Key       json.RawMessage `json:"key,omitempty"`
++	Value     json.RawMessage `json:"value,omitempty"`
++	Partition *int32          `json:"partition,omitempty"`
++}
++
++type wireResponse struct {
++	KeySchemaID   *int32 `json:"key_schema_id"`
++	ValueSchemaID *int32 `json:"value_schema_id"`
++	Offsets       []struct {
++		Partition *int32 `json:"partition"`
++		Offset    *int64 `json:"offset"`
++		ErrorCode *int64 `json:"error_code"`
++		Error     *string `json:"error"`
++	} `json:"offsets"`
++}
++
++func buildBody(req BatchRequest, records []Record) map[string]any {
++	body := map[string]any{}
++	if schemaFormats[req.Format] {
++		// The documented rule: when every key (or value) is null the
++		// corresponding schema fields must be excluded from the request.
++		anyKey, anyValue := false, false
++		for _, r := range records {
++			anyKey = anyKey || r.Key != nil
++			anyValue = anyValue || r.Value != nil
++		}
++		if anyKey && req.KeySchema != "" {
++			body["key_schema"] = req.KeySchema
++		}
++		if anyValue && req.ValueSchema != "" {
++			body["value_schema"] = req.ValueSchema
++		}
++	}
++	wire := make([]wireRecord, len(records))
++	for i, r := range records {
++		wire[i] = wireRecord{Key: r.Key, Value: r.Value, Partition: r.Partition}
++	}
++	body["records"] = wire
++	return body
++}
++
++// Produce sends one batch. HTTP 200 with failed records is not an error;
++// inspect the per-record results.
++func (c *Client) Produce(ctx context.Context, topic string, req BatchRequest,
++	records []Record) (*BatchResult, error) {
++	if len(records) == 0 {
++		return nil, errors.New("restproduce: empty batch")
++	}
++	payload, err := json.Marshal(buildBody(req, records))
++	if err != nil {
++		return nil, err
++	}
++	endpoint := c.baseURL + "/topics/" + url.PathEscape(topic)
++	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
++		endpoint, bytes.NewReader(payload))
++	if err != nil {
++		return nil, err
++	}
++	httpReq.Header.Set("Content-Type", req.Format.contentType())
++	httpReq.Header.Set("Accept", acceptMedia)
++	httpReq.SetBasicAuth(c.username, c.password)
++
++	resp, err := c.http.Do(httpReq)
++	if err != nil {
++		return nil, err
++	}
++	defer resp.Body.Close()
++	raw, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return nil, err
++	}
++	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
++		return nil, &APIError{HTTPStatus: resp.StatusCode,
++			Message: "redirect refused"}
++	}
++	if resp.StatusCode != http.StatusOK {
++		var envelope struct {
++			ErrorCode int64  `json:"error_code"`
++			Message   string `json:"message"`
++		}
++		if err := json.Unmarshal(raw, &envelope); err != nil {
++			return nil, &APIError{HTTPStatus: resp.StatusCode,
++				Message: string(raw)}
++		}
++		return nil, &APIError{HTTPStatus: resp.StatusCode,
++			ErrorCode: envelope.ErrorCode, Message: envelope.Message}
++	}
++	var wire wireResponse
++	if err := json.Unmarshal(raw, &wire); err != nil {
++		return nil, fmt.Errorf("restproduce: malformed response: %w", err)
++	}
++	result := &BatchResult{
++		KeySchemaID:   wire.KeySchemaID,
++		ValueSchemaID: wire.ValueSchemaID,
++		Results:       make([]RecordResult, len(wire.Offsets)),
++	}
++	for i, o := range wire.Offsets {
++		r := RecordResult{Partition: o.Partition, Offset: o.Offset,
++			ErrorCode: o.ErrorCode}
++		if o.Error != nil {
++			r.Error = *o.Error
++		}
++		result.Results[i] = r
++	}
++	return result, nil
++}
++
++// ProduceWithRetry re-sends only records the proxy marked retriable
++// (error_code 2), merging outcomes back into their original positions.
++// backoff runs between attempts; ctx cancellation between attempts returns
++// the partial result together with the context error.
++func (c *Client) ProduceWithRetry(ctx context.Context, topic string,
++	req BatchRequest, records []Record, maxAttempts int,
++	backoff func(attempt int)) (*BatchResult, error) {
++	result, err := c.Produce(ctx, topic, req, records)
++	if err != nil {
++		return nil, err
++	}
++	for attempt := 1; attempt < maxAttempts; attempt++ {
++		var pending []int
++		for i, r := range result.Results {
++			if r.Retriable() {
++				pending = append(pending, i)
++			}
++		}
++		if len(pending) == 0 {
++			return result, nil
++		}
++		if backoff != nil {
++			backoff(attempt)
++		}
++		if err := ctx.Err(); err != nil {
++			return result, err
++		}
++		retry := make([]Record, len(pending))
++		for i, idx := range pending {
++			retry[i] = records[idx]
++		}
++		next, err := c.Produce(ctx, topic, req, retry)
++		if err != nil {
++			return result, err
++		}
++		if next.KeySchemaID != nil {
++			result.KeySchemaID = next.KeySchemaID
++		}
++		if next.ValueSchemaID != nil {
++			result.ValueSchemaID = next.ValueSchemaID
++		}
++		for i, idx := range pending {
++			if i < len(next.Results) {
++				result.Results[idx] = next.Results[i]
++			}
++		}
++	}
++	return result, nil
++}

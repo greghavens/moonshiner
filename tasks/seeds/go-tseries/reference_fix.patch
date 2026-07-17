@@ -1,0 +1,242 @@
+diff --git a/downsample.go b/downsample.go
+new file mode 100644
+index 0000000..6da82a9
+--- /dev/null
++++ b/downsample.go
+@@ -0,0 +1,58 @@
++package tseries
++
++import (
++	"errors"
++	"time"
++)
++
++// Bucket is one downsampled aggregate over [Start, Start+bucket).
++type Bucket struct {
++	Start         time.Time
++	Min, Max, Avg float64
++	Count         int
++}
++
++var errBadBucket = errors.New("tseries: bucket duration must be positive")
++
++// Downsample aggregates the live samples of series in [from, to) into
++// fixed-width buckets aligned to from. Empty buckets are omitted.
++func (s *Store) Downsample(series string, from, to time.Time, bucket time.Duration) ([]Bucket, error) {
++	if bucket <= 0 {
++		return nil, errBadBucket
++	}
++	cut, has := s.cutoff()
++	s.mu.RLock()
++	defer s.mu.RUnlock()
++
++	var out []Bucket
++	var cur *Bucket
++	var sum float64
++	flush := func() {
++		if cur != nil {
++			cur.Avg = sum / float64(cur.Count)
++			out = append(out, *cur)
++			cur = nil
++			sum = 0
++		}
++	}
++	for _, smp := range s.window(series, from, to) {
++		if expired(smp.T, cut, has) {
++			continue
++		}
++		start := from.Add(smp.T.Sub(from) / bucket * bucket)
++		if cur == nil || !cur.Start.Equal(start) {
++			flush()
++			cur = &Bucket{Start: start, Min: smp.V, Max: smp.V}
++		}
++		if smp.V < cur.Min {
++			cur.Min = smp.V
++		}
++		if smp.V > cur.Max {
++			cur.Max = smp.V
++		}
++		cur.Count++
++		sum += smp.V
++	}
++	flush()
++	return out, nil
++}
+diff --git a/retention.go b/retention.go
+new file mode 100644
+index 0000000..ba2fc33
+--- /dev/null
++++ b/retention.go
+@@ -0,0 +1,29 @@
++package tseries
++
++import "sort"
++
++// Sweep drops every expired sample and returns how many were evicted.
++// Series left with no samples are removed entirely.
++func (s *Store) Sweep() int {
++	cut, has := s.cutoff()
++	if !has {
++		return 0
++	}
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	dropped := 0
++	for name, ss := range s.series {
++		// Samples are sorted, so everything expired is a prefix.
++		i := sort.Search(len(ss), func(i int) bool { return ss[i].T.After(cut) })
++		if i == 0 {
++			continue
++		}
++		dropped += i
++		if i == len(ss) {
++			delete(s.series, name)
++			continue
++		}
++		s.series[name] = append(ss[:0:0], ss[i:]...)
++	}
++	return dropped
++}
+diff --git a/store.go b/store.go
+new file mode 100644
+index 0000000..4710fb9
+--- /dev/null
++++ b/store.go
+@@ -0,0 +1,137 @@
++package tseries
++
++import (
++	"errors"
++	"sort"
++	"sync"
++	"time"
++)
++
++// Sample is one recorded point of a series.
++type Sample struct {
++	T time.Time
++	V float64
++}
++
++// Store is an in-memory time-series store with optional retention.
++// It is safe for concurrent use.
++type Store struct {
++	mu        sync.RWMutex
++	retention time.Duration
++	now       func() time.Time
++	series    map[string][]Sample // each slice sorted ascending by T
++}
++
++// NewStore returns a store. retention <= 0 keeps samples forever.
++// A nil now falls back to time.Now.
++func NewStore(retention time.Duration, now func() time.Time) *Store {
++	if now == nil {
++		now = time.Now
++	}
++	return &Store{
++		retention: retention,
++		now:       now,
++		series:    make(map[string][]Sample),
++	}
++}
++
++var (
++	errEmptySeries = errors.New("tseries: empty series name")
++	errExpired     = errors.New("tseries: sample is outside the retention window")
++)
++
++// cutoff returns the expiry boundary and whether retention applies.
++// A sample is expired when its timestamp is <= the cutoff.
++func (s *Store) cutoff() (time.Time, bool) {
++	if s.retention <= 0 {
++		return time.Time{}, false
++	}
++	return s.now().Add(-s.retention), true
++}
++
++func expired(t time.Time, cut time.Time, has bool) bool {
++	return has && !t.After(cut)
++}
++
++// Append records v for series at time t. Appending the same series and
++// timestamp again overwrites the value in place.
++func (s *Store) Append(series string, t time.Time, v float64) error {
++	if series == "" {
++		return errEmptySeries
++	}
++	cut, has := s.cutoff()
++	if expired(t, cut, has) {
++		return errExpired
++	}
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	ss := s.series[series]
++	i := sort.Search(len(ss), func(i int) bool { return !ss[i].T.Before(t) })
++	if i < len(ss) && ss[i].T.Equal(t) {
++		ss[i].V = v
++		return nil
++	}
++	ss = append(ss, Sample{})
++	copy(ss[i+1:], ss[i:])
++	ss[i] = Sample{T: t, V: v}
++	s.series[series] = ss
++	return nil
++}
++
++// Query returns live samples with from <= T < to, ascending by time.
++func (s *Store) Query(series string, from, to time.Time) []Sample {
++	cut, has := s.cutoff()
++	s.mu.RLock()
++	defer s.mu.RUnlock()
++	var out []Sample
++	for _, smp := range s.window(series, from, to) {
++		if !expired(smp.T, cut, has) {
++			out = append(out, smp)
++		}
++	}
++	return out
++}
++
++// window slices the sorted samples of series to [from, to).
++// Callers must hold at least the read lock.
++func (s *Store) window(series string, from, to time.Time) []Sample {
++	ss := s.series[series]
++	if len(ss) == 0 || !from.Before(to) {
++		return nil
++	}
++	lo := sort.Search(len(ss), func(i int) bool { return !ss[i].T.Before(from) })
++	hi := sort.Search(len(ss), func(i int) bool { return !ss[i].T.Before(to) })
++	return ss[lo:hi]
++}
++
++// Len reports the number of live samples in series.
++func (s *Store) Len(series string) int {
++	cut, has := s.cutoff()
++	s.mu.RLock()
++	defer s.mu.RUnlock()
++	n := 0
++	for _, smp := range s.series[series] {
++		if !expired(smp.T, cut, has) {
++			n++
++		}
++	}
++	return n
++}
++
++// Series lists, in ascending order, every series with at least one live sample.
++func (s *Store) Series() []string {
++	cut, has := s.cutoff()
++	s.mu.RLock()
++	defer s.mu.RUnlock()
++	var names []string
++	for name, ss := range s.series {
++		for _, smp := range ss {
++			if !expired(smp.T, cut, has) {
++				names = append(names, name)
++				break
++			}
++		}
++	}
++	sort.Strings(names)
++	return names
++}

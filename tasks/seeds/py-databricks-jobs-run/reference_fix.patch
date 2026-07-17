@@ -1,0 +1,179 @@
+diff --git a/dbxjobs/__init__.py b/dbxjobs/__init__.py
+new file mode 100644
+index 0000000..c3fac4c
+--- /dev/null
++++ b/dbxjobs/__init__.py
+@@ -0,0 +1 @@
++"""Databricks Jobs API 2.2 one-time run integration."""
+diff --git a/dbxjobs/client.py b/dbxjobs/client.py
+new file mode 100644
+index 0000000..7ed5bd7
+--- /dev/null
++++ b/dbxjobs/client.py
+@@ -0,0 +1,84 @@
++"""Thin Jobs API 2.2 client: Bearer auth, envelope decoding, bounded retry."""
++
++import json
++import time
++import urllib.error
++import urllib.parse
++import urllib.request
++
++from .errors import DbxApiError, RateLimitError
++
++SUBMIT = "/api/2.2/jobs/runs/submit"
++GET_RUN = "/api/2.2/jobs/runs/get"
++GET_OUTPUT = "/api/2.2/jobs/runs/get-output"
++CANCEL = "/api/2.2/jobs/runs/cancel"
++
++TRANSIENT = (500, 503)
++
++
++class JobsClient:
++    def __init__(self, base_url, token, sleep=time.sleep, max_retries=2,
++                 backoff_seconds=1.0):
++        self.base_url = base_url.rstrip("/")
++        self._token = token
++        self._sleep = sleep
++        self.max_retries = max_retries
++        self.backoff_seconds = backoff_seconds
++
++    def _request(self, method, path, query=None, body=None):
++        url = self.base_url + path
++        if query:
++            url += "?" + urllib.parse.urlencode(query)
++        data = json.dumps(body).encode() if body is not None else None
++        last_exc = None
++        for attempt in range(self.max_retries + 1):
++            req = urllib.request.Request(url, data=data, method=method)
++            req.add_header("Authorization", "Bearer " + self._token)
++            req.add_header("Accept", "application/json")
++            if data is not None:
++                req.add_header("Content-Type", "application/json")
++            try:
++                with urllib.request.urlopen(req) as resp:
++                    payload = resp.read()
++                    return json.loads(payload) if payload else {}
++            except urllib.error.HTTPError as exc:
++                raw = exc.read()
++                try:
++                    env = json.loads(raw)
++                except ValueError:
++                    env = {}
++                code = env.get("error_code", "UNKNOWN")
++                message = env.get("message", "")
++                if exc.code == 429:
++                    retry_after = int(exc.headers.get("Retry-After") or 1)
++                    last_exc = RateLimitError(exc.code, code, message, retry_after)
++                    if attempt < self.max_retries:
++                        self._sleep(retry_after)
++                        continue
++                    raise last_exc from None
++                if exc.code in TRANSIENT and attempt < self.max_retries:
++                    self._sleep(self.backoff_seconds)
++                    continue
++                raise DbxApiError(exc.code, code, message) from None
++        raise last_exc  # pragma: no cover - loop always returns or raises
++
++    def submit_run(self, tasks, run_name=None, idempotency_token=None,
++                   timeout_seconds=None):
++        body = {}
++        if run_name is not None:
++            body["run_name"] = run_name
++        body["tasks"] = tasks
++        if idempotency_token is not None:
++            body["idempotency_token"] = idempotency_token
++        if timeout_seconds is not None:
++            body["timeout_seconds"] = timeout_seconds
++        return self._request("POST", SUBMIT, body=body)["run_id"]
++
++    def get_run(self, run_id):
++        return self._request("GET", GET_RUN, query={"run_id": run_id})
++
++    def get_run_output(self, run_id):
++        return self._request("GET", GET_OUTPUT, query={"run_id": run_id})
++
++    def cancel_run(self, run_id):
++        return self._request("POST", CANCEL, body={"run_id": run_id})
+diff --git a/dbxjobs/errors.py b/dbxjobs/errors.py
+new file mode 100644
+index 0000000..d01425a
+--- /dev/null
++++ b/dbxjobs/errors.py
+@@ -0,0 +1,15 @@
++"""Typed errors decoded from the Databricks {error_code, message} envelope."""
++
++
++class DbxApiError(Exception):
++    def __init__(self, status_code, error_code, message):
++        self.status_code = status_code
++        self.error_code = error_code
++        self.message = message
++        super().__init__(f"{error_code} (HTTP {status_code}): {message}")
++
++
++class RateLimitError(DbxApiError):
++    def __init__(self, status_code, error_code, message, retry_after):
++        super().__init__(status_code, error_code, message)
++        self.retry_after = retry_after
+diff --git a/dbxjobs/runner.py b/dbxjobs/runner.py
+new file mode 100644
+index 0000000..1626ca3
+--- /dev/null
++++ b/dbxjobs/runner.py
+@@ -0,0 +1,55 @@
++"""One-time run orchestration: submit idempotently, poll, collect, cancel."""
++
++import uuid
++from dataclasses import dataclass, field
++
++
++@dataclass
++class RunReport:
++    run_id: int
++    life_cycle_state: str
++    result_state: str
++    termination: dict
++    canceled: bool = False
++    task_outputs: dict = field(default_factory=dict)
++    task_errors: dict = field(default_factory=dict)
++
++
++class OneTimeRunner:
++    def __init__(self, client, poll_interval=5):
++        self.client = client
++        self.poll_interval = poll_interval
++
++    def run(self, tasks, run_name=None, idempotency_token=None, cancel=None):
++        token = idempotency_token or uuid.uuid4().hex
++        run_id = self.client.submit_run(tasks, run_name=run_name,
++                                        idempotency_token=token)
++        cancel_sent = False
++        run = self.client.get_run(run_id)
++        while run["status"]["state"] != "TERMINATED":
++            if cancel is not None and not cancel_sent and cancel():
++                self.client.cancel_run(run_id)
++                cancel_sent = True
++            self.client._sleep(self.poll_interval)
++            run = self.client.get_run(run_id)
++
++        termination = run["status"].get("termination_details", {})
++        result_state = run.get("state", {}).get("result_state", "")
++        report = RunReport(
++            run_id=run_id,
++            life_cycle_state=run["status"]["state"],
++            result_state=result_state,
++            termination=termination,
++            canceled=result_state == "CANCELED",
++        )
++        if not report.canceled:
++            for task in run.get("tasks", []):
++                output = self.client.get_run_output(task["run_id"])
++                if "error" in output:
++                    report.task_errors[task["task_key"]] = {
++                        "error": output.get("error"),
++                        "error_trace": output.get("error_trace"),
++                    }
++                else:
++                    report.task_outputs[task["task_key"]] = output
++        return report

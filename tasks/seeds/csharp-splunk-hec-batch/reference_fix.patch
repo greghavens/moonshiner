@@ -1,0 +1,232 @@
+diff --git a/src/Splunk/HecRequestException.cs b/src/Splunk/HecRequestException.cs
+new file mode 100644
+index 0000000..415a045
+--- /dev/null
++++ b/src/Splunk/HecRequestException.cs
+@@ -0,0 +1,22 @@
++namespace Foundry.Telemetry.Splunk;
++
++/// <summary>
++/// A HEC request that failed terminally, carrying the decoded HEC error
++/// body ({"text": ..., "code": ...}). Never contains the token.
++/// </summary>
++public sealed class HecRequestException : Exception
++{
++    public int Status { get; }
++
++    public int HecCode { get; }
++
++    public string HecText { get; }
++
++    public HecRequestException(int status, int hecCode, string hecText)
++        : base($"Splunk HEC returned {status} (code {hecCode}): {hecText}")
++    {
++        Status = status;
++        HecCode = hecCode;
++        HecText = hecText;
++    }
++}
+diff --git a/src/Splunk/HecSinkOptions.cs b/src/Splunk/HecSinkOptions.cs
+new file mode 100644
+index 0000000..11375de
+--- /dev/null
++++ b/src/Splunk/HecSinkOptions.cs
+@@ -0,0 +1,24 @@
++namespace Foundry.Telemetry.Splunk;
++
++/// <summary>
++/// Configuration for the Splunk HEC sink. ToString is overridden because
++/// records render every member by default — options get logged, tokens
++/// must not.
++/// </summary>
++public sealed record HecSinkOptions(
++    string BaseUrl,
++    string Token,
++    string Host,
++    string Source,
++    string Sourcetype,
++    int MaxBatchBytes,
++    int MaxAttempts,
++    TimeSpan RetryDelay,
++    string? Index = null)
++{
++    public override string ToString() =>
++        $"HecSinkOptions {{ BaseUrl = {BaseUrl}, Token = ***, Host = {Host}, " +
++        $"Source = {Source}, Sourcetype = {Sourcetype}, Index = {Index}, " +
++        $"MaxBatchBytes = {MaxBatchBytes}, MaxAttempts = {MaxAttempts}, " +
++        $"RetryDelay = {RetryDelay} }}";
++}
+diff --git a/src/Splunk/SplunkHecSink.cs b/src/Splunk/SplunkHecSink.cs
+new file mode 100644
+index 0000000..753956f
+--- /dev/null
++++ b/src/Splunk/SplunkHecSink.cs
+@@ -0,0 +1,168 @@
++using System.Text;
++using System.Text.Json;
++
++namespace Foundry.Telemetry.Splunk;
++
++/// <summary>
++/// Structured-log sink for the Splunk HTTP Event Collector JSON event
++/// protocol: one compact envelope per event, newline-delimited batches
++/// bounded by UTF-8 byte size, Splunk token auth, and bounded retries of
++/// the transient HEC statuses. Flushing is explicit — no timers.
++/// </summary>
++public sealed class SplunkHecSink : ILogSink, IDisposable
++{
++    private const string EventPath = "/services/collector/event";
++    private static readonly int[] RetryableStatuses = { 429, 500, 503 };
++
++    private readonly HecSinkOptions _options;
++    private readonly Action<TimeSpan> _delay;
++    private readonly HttpClient _http;
++    private readonly List<byte[]> _buffer = new();
++    private int _bufferedBytes;
++    private bool _disposed;
++
++    public SplunkHecSink(HecSinkOptions options, Action<TimeSpan> delay)
++    {
++        _options = options;
++        _delay = delay;
++        _http = new HttpClient { BaseAddress = new Uri(options.BaseUrl) };
++    }
++
++    public void Emit(LogEvent evt)
++    {
++        ObjectDisposedException.ThrowIf(_disposed, this);
++        byte[] envelope = Encode(evt);
++        if (envelope.Length > _options.MaxBatchBytes)
++        {
++            throw new ArgumentException(
++                $"a single envelope of {envelope.Length} bytes exceeds " +
++                $"MaxBatchBytes={_options.MaxBatchBytes}", nameof(evt));
++        }
++        int separator = _buffer.Count > 0 ? 1 : 0;
++        if (_bufferedBytes + separator + envelope.Length > _options.MaxBatchBytes)
++        {
++            SendBuffered();
++        }
++        _buffer.Add(envelope);
++        _bufferedBytes += (_buffer.Count > 1 ? 1 : 0) + envelope.Length;
++    }
++
++    public void Flush()
++    {
++        ObjectDisposedException.ThrowIf(_disposed, this);
++        SendBuffered();
++    }
++
++    public void Dispose()
++    {
++        if (_disposed)
++        {
++            return;
++        }
++        SendBuffered();
++        _disposed = true;
++        _http.Dispose();
++    }
++
++    private byte[] Encode(LogEvent evt)
++    {
++        using var stream = new MemoryStream();
++        using (var json = new Utf8JsonWriter(stream))
++        {
++            json.WriteStartObject();
++            json.WriteNumber("time",
++                evt.Timestamp.ToUnixTimeMilliseconds() / 1000.0);
++            json.WriteString("host", _options.Host);
++            json.WriteString("source", _options.Source);
++            json.WriteString("sourcetype", _options.Sourcetype);
++            if (_options.Index is not null)
++            {
++                json.WriteString("index", _options.Index);
++            }
++            json.WriteStartObject("event");
++            json.WriteString("level", evt.Level);
++            json.WriteString("message", evt.Message);
++            json.WriteEndObject();
++            if (evt.Fields is { Count: > 0 })
++            {
++                json.WriteStartObject("fields");
++                foreach (var (name, value) in evt.Fields)
++                {
++                    json.WritePropertyName(name);
++                    JsonSerializer.Serialize(json, value);
++                }
++                json.WriteEndObject();
++            }
++            json.WriteEndObject();
++        }
++        return stream.ToArray();
++    }
++
++    private void SendBuffered()
++    {
++        if (_buffer.Count == 0)
++        {
++            return;
++        }
++        byte[] body = JoinLines(_buffer);
++        _buffer.Clear();
++        _bufferedBytes = 0;
++        Post(body);
++    }
++
++    private static byte[] JoinLines(List<byte[]> envelopes)
++    {
++        using var stream = new MemoryStream();
++        for (int i = 0; i < envelopes.Count; i++)
++        {
++            if (i > 0)
++            {
++                stream.WriteByte((byte)'\n');
++            }
++            stream.Write(envelopes[i]);
++        }
++        return stream.ToArray();
++    }
++
++    private void Post(byte[] body)
++    {
++        for (int attempt = 1; ; attempt++)
++        {
++            using var request = new HttpRequestMessage(HttpMethod.Post, EventPath);
++            request.Headers.TryAddWithoutValidation(
++                "Authorization", "Splunk " + _options.Token);
++            request.Content = new ByteArrayContent(body);
++            using HttpResponseMessage response = _http.Send(request);
++            int status = (int)response.StatusCode;
++            if (status == 200)
++            {
++                return;
++            }
++            var (code, text) = DecodeError(response);
++            bool retryable = Array.IndexOf(RetryableStatuses, status) >= 0;
++            if (!retryable || attempt >= _options.MaxAttempts)
++            {
++                throw new HecRequestException(status, code, text);
++            }
++            _delay(_options.RetryDelay);
++        }
++    }
++
++    private static (int Code, string Text) DecodeError(HttpResponseMessage response)
++    {
++        try
++        {
++            using var stream = response.Content.ReadAsStream();
++            using var doc = JsonDocument.Parse(stream);
++            int code = doc.RootElement.TryGetProperty("code", out var c)
++                ? c.GetInt32() : -1;
++            string text = doc.RootElement.TryGetProperty("text", out var t)
++                ? t.GetString() ?? "" : "";
++            return (code, text);
++        }
++        catch (JsonException)
++        {
++            return (-1, "undecodable HEC error body");
++        }
++    }
++}

@@ -1,0 +1,232 @@
+diff --git a/outbox.go b/outbox.go
+new file mode 100644
+index 0000000..ec7aa08
+--- /dev/null
++++ b/outbox.go
+@@ -0,0 +1,226 @@
++// Package outbox drains an outbox table of side-effect intents toward a
++// delivery sink with per-key ordering, exponential retry, and poison-pill
++// parking. Delivery is at-least-once: a record is only marked delivered on a
++// nil sink return, so ambiguous failures are retried and may deliver twice.
++package outbox
++
++import (
++	"errors"
++	"fmt"
++	"sync"
++	"time"
++)
++
++// Record states.
++const (
++	StatePending   = "pending"
++	StateDelivered = "delivered"
++	StateParked    = "parked"
++)
++
++// Record is one row of the outbox table.
++type Record struct {
++	ID            string
++	Key           string
++	Payload       string
++	Attempts      int
++	State         string
++	Reason        string
++	NextAttemptAt time.Time
++	Seq           int
++}
++
++// Sink receives records. Tests inject scripted fakes.
++type Sink interface {
++	Deliver(r Record) error
++}
++
++// Options configures a Dispatcher. Zero values pick the documented defaults.
++type Options struct {
++	Now         func() time.Time
++	MaxAttempts int
++	BaseDelay   time.Duration
++	MaxDelay    time.Duration
++}
++
++// Result reports one Dispatch pass, ids in processing order.
++type Result struct {
++	Delivered []string
++	Retried   []string
++	Parked    []string
++}
++
++// Dispatcher owns the record table and the draining logic.
++type Dispatcher struct {
++	mu          sync.Mutex
++	sink        Sink
++	now         func() time.Time
++	maxAttempts int
++	baseDelay   time.Duration
++	maxDelay    time.Duration
++	records     []*Record // ascending Seq
++	byID        map[string]*Record
++	nextSeq     int
++}
++
++// New builds an empty dispatcher over the given sink.
++func New(sink Sink, opts Options) *Dispatcher {
++	d := &Dispatcher{
++		sink:        sink,
++		now:         opts.Now,
++		maxAttempts: opts.MaxAttempts,
++		baseDelay:   opts.BaseDelay,
++		maxDelay:    opts.MaxDelay,
++		byID:        make(map[string]*Record),
++		nextSeq:     1,
++	}
++	if d.now == nil {
++		d.now = time.Now
++	}
++	if d.maxAttempts <= 0 {
++		d.maxAttempts = 5
++	}
++	if d.baseDelay <= 0 {
++		d.baseDelay = time.Second
++	}
++	if d.maxDelay <= 0 {
++		d.maxDelay = time.Minute
++	}
++	return d
++}
++
++// Load adopts a snapshot from a previous process. Seq is reassigned in slice
++// order; pending records will simply be attempted again (at-least-once).
++func Load(records []Record, sink Sink, opts Options) (*Dispatcher, error) {
++	d := New(sink, opts)
++	for _, r := range records {
++		switch r.State {
++		case StatePending, StateDelivered, StateParked:
++		default:
++			return nil, fmt.Errorf("record %q has unknown state %q", r.ID, r.State)
++		}
++		if _, ok := d.byID[r.ID]; ok {
++			return nil, fmt.Errorf("duplicate record id %q", r.ID)
++		}
++		rec := r
++		rec.Seq = d.nextSeq
++		d.nextSeq++
++		d.records = append(d.records, &rec)
++		d.byID[rec.ID] = &rec
++	}
++	return d, nil
++}
++
++// Add appends a new pending record, due immediately.
++func (d *Dispatcher) Add(id, key, payload string) error {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	if id == "" {
++		return errors.New("record id must not be empty")
++	}
++	if key == "" {
++		return errors.New("record key must not be empty")
++	}
++	if _, ok := d.byID[id]; ok {
++		return fmt.Errorf("duplicate record id %q", id)
++	}
++	rec := &Record{ID: id, Key: key, Payload: payload, State: StatePending, Seq: d.nextSeq}
++	d.nextSeq++
++	d.records = append(d.records, rec)
++	d.byID[id] = rec
++	return nil
++}
++
++// Dispatch performs one draining pass: every due record is attempted at most
++// once, in Seq order, with per-key ordering enforced (only the oldest pending
++// record of a key is eligible). A success or a parking unblocks the key's
++// next record within the same call.
++func (d *Dispatcher) Dispatch() Result {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++
++	now := d.now()
++	res := Result{Delivered: []string{}, Retried: []string{}, Parked: []string{}}
++	attempted := make(map[int]bool)
++
++	for {
++		progressed := false
++		blocked := make(map[string]bool)
++		for _, rec := range d.records {
++			if rec.State != StatePending {
++				continue
++			}
++			if blocked[rec.Key] {
++				continue
++			}
++			blocked[rec.Key] = true // rec is its key's head; younger records wait
++			if attempted[rec.Seq] || rec.NextAttemptAt.After(now) {
++				continue
++			}
++			attempted[rec.Seq] = true
++			progressed = true
++
++			err := d.sink.Deliver(*rec)
++			rec.Attempts++
++			switch {
++			case err == nil:
++				rec.State = StateDelivered
++				res.Delivered = append(res.Delivered, rec.ID)
++			case rec.Attempts >= d.maxAttempts:
++				rec.State = StateParked
++				rec.Reason = err.Error()
++				res.Parked = append(res.Parked, rec.ID)
++			default:
++				rec.NextAttemptAt = now.Add(d.backoff(rec.Attempts))
++				res.Retried = append(res.Retried, rec.ID)
++			}
++		}
++		if !progressed {
++			return res
++		}
++	}
++}
++
++// backoff returns BaseDelay*2^(attempts-1) capped at MaxDelay.
++func (d *Dispatcher) backoff(attempts int) time.Duration {
++	delay := d.baseDelay
++	for i := 1; i < attempts; i++ {
++		delay *= 2
++		if delay >= d.maxDelay {
++			return d.maxDelay
++		}
++	}
++	if delay > d.maxDelay {
++		return d.maxDelay
++	}
++	return delay
++}
++
++// Snapshot returns copies of every record, ascending Seq.
++func (d *Dispatcher) Snapshot() []Record {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	out := make([]Record, len(d.records))
++	for i, rec := range d.records {
++		out[i] = *rec
++	}
++	return out
++}
++
++// Retry resubmits a parked record: pending again, attempts reset, due now.
++func (d *Dispatcher) Retry(id string) error {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	rec, ok := d.byID[id]
++	if !ok {
++		return fmt.Errorf("unknown record id %q", id)
++	}
++	if rec.State != StateParked {
++		return fmt.Errorf("record %q is %s, not parked", id, rec.State)
++	}
++	rec.State = StatePending
++	rec.Attempts = 0
++	rec.Reason = ""
++	rec.NextAttemptAt = time.Time{}
++	return nil
++}

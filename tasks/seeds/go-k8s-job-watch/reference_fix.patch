@@ -1,0 +1,389 @@
+diff --git a/client.go b/client.go
+new file mode 100644
+index 0000000..6454cfd
+--- /dev/null
++++ b/client.go
+@@ -0,0 +1,189 @@
++// Package jobwatch is a minimal Kubernetes batch/v1 Job list+watch client.
++// It speaks the documented raw protocol: bearer-authenticated JSON requests,
++// newline-delimited watch frames, bookmark handling and 410 relist recovery.
++package jobwatch
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
++)
++
++// Condition is one entry of a Job's status.conditions.
++type Condition struct {
++	Type    string `json:"type"`
++	Status  string `json:"status"`
++	Reason  string `json:"reason"`
++	Message string `json:"message"`
++}
++
++// Job is the flattened view of a batch/v1 Job this package exposes.
++type Job struct {
++	Name            string
++	Namespace       string
++	UID             string
++	ResourceVersion string
++	Active          int
++	Succeeded       int
++	Failed          int
++	Conditions      []Condition
++}
++
++// TerminalCondition reports the condition that finished the Job. Only the
++// Complete and Failed condition types with status "True" are terminal;
++// Suspended and SuccessCriteriaMet never are.
++func (j Job) TerminalCondition() (string, bool) {
++	for _, c := range j.Conditions {
++		if (c.Type == "Complete" || c.Type == "Failed") && c.Status == "True" {
++			return c.Type, true
++		}
++	}
++	return "", false
++}
++
++// JobList is the result of listing a namespace's Jobs.
++type JobList struct {
++	Items           []Job
++	ResourceVersion string
++}
++
++// APIError is a decoded Kubernetes meta/v1 Status failure.
++type APIError struct {
++	Code    int
++	Reason  string
++	Message string
++}
++
++func (e *APIError) Error() string {
++	return fmt.Sprintf("kubernetes API error %d %s: %s", e.Code, e.Reason, e.Message)
++}
++
++// Client issues authenticated requests against one API server.
++type Client struct {
++	baseURL string
++	token   string
++	hc      *http.Client
++}
++
++// NewClient returns a client for baseURL using the given bearer token.
++func NewClient(baseURL, token string, hc *http.Client) *Client {
++	if hc == nil {
++		hc = http.DefaultClient
++	}
++	return &Client{baseURL: strings.TrimRight(baseURL, "/"), token: token, hc: hc}
++}
++
++// wire shapes -----------------------------------------------------------
++
++type wireMeta struct {
++	Name            string `json:"name"`
++	Namespace       string `json:"namespace"`
++	UID             string `json:"uid"`
++	ResourceVersion string `json:"resourceVersion"`
++}
++
++type wireStatus struct {
++	Active     int         `json:"active"`
++	Succeeded  int         `json:"succeeded"`
++	Failed     int         `json:"failed"`
++	Conditions []Condition `json:"conditions"`
++}
++
++type wireJob struct {
++	Metadata wireMeta   `json:"metadata"`
++	Status   wireStatus `json:"status"`
++}
++
++func (w wireJob) toJob() Job {
++	return Job{
++		Name:            w.Metadata.Name,
++		Namespace:       w.Metadata.Namespace,
++		UID:             w.Metadata.UID,
++		ResourceVersion: w.Metadata.ResourceVersion,
++		Active:          w.Status.Active,
++		Succeeded:       w.Status.Succeeded,
++		Failed:          w.Status.Failed,
++		Conditions:      w.Status.Conditions,
++	}
++}
++
++type wireList struct {
++	Metadata struct {
++		ResourceVersion string `json:"resourceVersion"`
++	} `json:"metadata"`
++	Items []wireJob `json:"items"`
++}
++
++type wireStatusObj struct {
++	Kind    string `json:"kind"`
++	Status  string `json:"status"`
++	Message string `json:"message"`
++	Reason  string `json:"reason"`
++	Code    int    `json:"code"`
++}
++
++func jobsPath(namespace string) string {
++	return "/apis/batch/v1/namespaces/" + url.PathEscape(namespace) + "/jobs"
++}
++
++func (c *Client) get(ctx context.Context, path string, q url.Values) (*http.Response, error) {
++	u := c.baseURL + path
++	if len(q) > 0 {
++		u += "?" + q.Encode()
++	}
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("Authorization", "Bearer "+c.token)
++	req.Header.Set("Accept", "application/json")
++	return c.hc.Do(req)
++}
++
++func decodeStatusError(resp *http.Response) *APIError {
++	defer resp.Body.Close()
++	var st wireStatusObj
++	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
++	if err := json.Unmarshal(body, &st); err != nil || st.Code == 0 {
++		st.Code = resp.StatusCode
++	}
++	if st.Reason == "" {
++		st.Reason = http.StatusText(resp.StatusCode)
++	}
++	return &APIError{Code: st.Code, Reason: st.Reason, Message: st.Message}
++}
++
++// ListJobs lists the namespace's Jobs with Most Recent semantics (no
++// resourceVersion parameter) and returns them with the list's version.
++func (c *Client) ListJobs(ctx context.Context, namespace string) (JobList, error) {
++	resp, err := c.get(ctx, jobsPath(namespace), nil)
++	if err != nil {
++		return JobList{}, err
++	}
++	if resp.StatusCode != http.StatusOK {
++		return JobList{}, decodeStatusError(resp)
++	}
++	defer resp.Body.Close()
++	var wl wireList
++	if err := json.NewDecoder(resp.Body).Decode(&wl); err != nil {
++		return JobList{}, fmt.Errorf("decoding JobList: %w", err)
++	}
++	out := JobList{ResourceVersion: wl.Metadata.ResourceVersion}
++	for _, wj := range wl.Items {
++		out.Items = append(out.Items, wj.toJob())
++	}
++	return out, nil
++}
++
++// watchJobs opens a watch stream from resourceVersion with bookmarks enabled.
++func (c *Client) watchJobs(ctx context.Context, namespace, resourceVersion string) (*http.Response, error) {
++	q := url.Values{}
++	q.Set("watch", "true")
++	q.Set("allowWatchBookmarks", "true")
++	q.Set("resourceVersion", resourceVersion)
++	return c.get(ctx, jobsPath(namespace), q)
++}
+diff --git a/watcher.go b/watcher.go
+new file mode 100644
+index 0000000..34ff1e7
+--- /dev/null
++++ b/watcher.go
+@@ -0,0 +1,188 @@
++package jobwatch
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"io"
++	"net/http"
++	"sort"
++)
++
++// Event is one change delivered to a Watcher sink.
++type Event struct {
++	Type string // ADDED, MODIFIED or DELETED
++	Job  Job
++}
++
++// Watcher maintains a live view of one namespace's Jobs.
++type Watcher struct {
++	c         *Client
++	namespace string
++	known     map[string]Job // by metadata.uid
++}
++
++// NewWatcher returns a watcher for the namespace's Jobs.
++func NewWatcher(c *Client, namespace string) *Watcher {
++	return &Watcher{c: c, namespace: namespace, known: make(map[string]Job)}
++}
++
++// errExpired signals that the watch resourceVersion was compacted away.
++var errExpired = errors.New("watch resourceVersion expired")
++
++// Run lists, reports initial state, then watches until ctx is cancelled or a
++// non-recoverable API error occurs. Expired versions (410) recover by
++// relisting and diffing against the known set.
++func (w *Watcher) Run(ctx context.Context, sink func(Event)) error {
++	rv, err := w.relist(ctx, sink)
++	if err != nil {
++		return err
++	}
++	for {
++		if err := ctx.Err(); err != nil {
++			return err
++		}
++		resp, err := w.c.watchJobs(ctx, w.namespace, rv)
++		if err != nil {
++			if ctx.Err() != nil {
++				return ctx.Err()
++			}
++			return err
++		}
++		if resp.StatusCode == http.StatusGone {
++			io.Copy(io.Discard, resp.Body)
++			resp.Body.Close()
++			if rv, err = w.relist(ctx, sink); err != nil {
++				return err
++			}
++			continue
++		}
++		if resp.StatusCode != http.StatusOK {
++			return decodeStatusError(resp)
++		}
++		rv, err = w.consume(resp.Body, rv, sink)
++		resp.Body.Close()
++		switch {
++		case errors.Is(err, errExpired):
++			if rv, err = w.relist(ctx, sink); err != nil {
++				return err
++			}
++		case err != nil:
++			if ctx.Err() != nil {
++				return ctx.Err()
++			}
++			return err
++		}
++	}
++}
++
++type wireFrame struct {
++	Type   string          `json:"type"`
++	Object json.RawMessage `json:"object"`
++}
++
++// consume decodes one watch stream. It returns the resume version on clean
++// EOF, errExpired on an in-stream 410, or the fatal error.
++func (w *Watcher) consume(body io.Reader, rv string, sink func(Event)) (string, error) {
++	dec := json.NewDecoder(body)
++	for {
++		var fr wireFrame
++		if err := dec.Decode(&fr); err != nil {
++			if errors.Is(err, io.EOF) {
++				return rv, nil
++			}
++			return rv, err
++		}
++		switch fr.Type {
++		case "ADDED", "MODIFIED", "DELETED":
++			var wj wireJob
++			if err := json.Unmarshal(fr.Object, &wj); err != nil {
++				return rv, err
++			}
++			job := wj.toJob()
++			if fr.Type == "DELETED" {
++				delete(w.known, job.UID)
++			} else {
++				w.known[job.UID] = job
++			}
++			sink(Event{Type: fr.Type, Job: job})
++			rv = job.ResourceVersion
++		case "BOOKMARK":
++			var wj wireJob
++			if err := json.Unmarshal(fr.Object, &wj); err != nil {
++				return rv, err
++			}
++			rv = wj.Metadata.ResourceVersion
++		case "ERROR":
++			var st wireStatusObj
++			if err := json.Unmarshal(fr.Object, &st); err != nil {
++				return rv, err
++			}
++			if st.Code == http.StatusGone {
++				return rv, errExpired
++			}
++			return rv, &APIError{Code: st.Code, Reason: st.Reason, Message: st.Message}
++		}
++	}
++}
++
++// relist fetches a fresh list and reconciles it against the known set:
++// new UIDs -> ADDED and changed versions -> MODIFIED in fresh-list order,
++// then vanished UIDs -> DELETED ordered by name.
++func (w *Watcher) relist(ctx context.Context, sink func(Event)) (string, error) {
++	list, err := w.c.ListJobs(ctx, w.namespace)
++	if err != nil {
++		return "", err
++	}
++	fresh := make(map[string]Job, len(list.Items))
++	for _, j := range list.Items {
++		fresh[j.UID] = j
++		old, seen := w.known[j.UID]
++		switch {
++		case !seen:
++			sink(Event{Type: "ADDED", Job: j})
++		case old.ResourceVersion != j.ResourceVersion:
++			sink(Event{Type: "MODIFIED", Job: j})
++		}
++	}
++	var vanished []Job
++	for uid, old := range w.known {
++		if _, ok := fresh[uid]; !ok {
++			vanished = append(vanished, old)
++		}
++	}
++	sort.Slice(vanished, func(i, k int) bool { return vanished[i].Name < vanished[k].Name })
++	for _, old := range vanished {
++		sink(Event{Type: "DELETED", Job: old})
++	}
++	w.known = fresh
++	return list.ResourceVersion, nil
++}
++
++// WaitForJob watches the namespace until the named Job reaches a terminal
++// condition and returns that Job. A failed Job is a result, not an error.
++func WaitForJob(ctx context.Context, c *Client, namespace, name string) (Job, error) {
++	wctx, cancel := context.WithCancel(ctx)
++	defer cancel()
++	var (
++		found Job
++		done  bool
++	)
++	w := NewWatcher(c, namespace)
++	err := w.Run(wctx, func(e Event) {
++		if done || e.Type == "DELETED" || e.Job.Name != name {
++			return
++		}
++		if _, terminal := e.Job.TerminalCondition(); terminal {
++			found, done = e.Job, true
++			cancel()
++		}
++	})
++	if done {
++		return found, nil
++	}
++	if err != nil {
++		return Job{}, err
++	}
++	return Job{}, ctx.Err()
++}

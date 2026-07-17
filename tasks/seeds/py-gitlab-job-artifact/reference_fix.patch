@@ -1,0 +1,270 @@
+diff --git a/glartifacts/__init__.py b/glartifacts/__init__.py
+new file mode 100644
+index 0000000..82e7c6c
+--- /dev/null
++++ b/glartifacts/__init__.py
+@@ -0,0 +1,19 @@
++"""GitLab CI job-artifact downloader speaking the documented REST v4 surface."""
++
++from .client import (
++    GitLabAPIError,
++    GitLabClient,
++    NotFoundMaskedError,
++    TruncatedDownloadError,
++)
++from .downloader import ArtifactDownloader, ArtifactLookupError, ArtifactsExpiredError
++
++__all__ = [
++    "ArtifactDownloader",
++    "ArtifactLookupError",
++    "ArtifactsExpiredError",
++    "GitLabAPIError",
++    "GitLabClient",
++    "NotFoundMaskedError",
++    "TruncatedDownloadError",
++]
+diff --git a/glartifacts/client.py b/glartifacts/client.py
+new file mode 100644
+index 0000000..786205d
+--- /dev/null
++++ b/glartifacts/client.py
+@@ -0,0 +1,152 @@
++"""Minimal GitLab REST v4 client for artifact retrieval.
++
++Auth follows the documented PRIVATE-TOKEN header. Redirects are followed
++manually and the token is only ever attached to requests aimed at the
++configured API origin — a redirect onto any other scheme/host/port is
++fetched anonymously so credentials never leak to object storage or a CDN.
++"""
++
++import hashlib
++import http.client
++import json
++import os
++import urllib.error
++import urllib.parse
++import urllib.request
++
++from .errors import GitLabAPIError, NotFoundMaskedError, TruncatedDownloadError
++
++_REDIRECT_CODES = (301, 302, 303, 307, 308)
++_MAX_REDIRECTS = 5
++_CHUNK = 8192
++
++
++class _NoRedirect(urllib.request.HTTPRedirectHandler):
++    def redirect_request(self, req, fp, code, msg, headers, newurl):
++        return None
++
++
++_OPENER = urllib.request.build_opener(_NoRedirect())
++
++
++def _origin(url):
++    parts = urllib.parse.urlsplit(url)
++    return (parts.scheme, parts.hostname, parts.port)
++
++
++class GitLabClient:
++    def __init__(self, base_url, token):
++        self.base_url = base_url.rstrip("/")
++        self._token = token
++        self._api_origin = _origin(self.base_url)
++
++    # -- transport -------------------------------------------------------
++
++    def _open(self, url):
++        headers = {"Accept": "*/*"}
++        if _origin(url) == self._api_origin:
++            headers["PRIVATE-TOKEN"] = self._token
++        request = urllib.request.Request(url, headers=headers, method="GET")
++        try:
++            return _OPENER.open(request)
++        except urllib.error.HTTPError as err:
++            if err.code in _REDIRECT_CODES:
++                return err
++            message = self._server_message(err)
++            if err.code == 404:
++                raise NotFoundMaskedError(
++                    404,
++                    "GitLab answered 404 (%s): the resource does not exist or "
++                    "the token lacks permission to see it" % message,
++                ) from None
++            raise GitLabAPIError(
++                err.code, "GitLab answered %d: %s" % (err.code, message)
++            ) from None
++
++    @staticmethod
++    def _server_message(err):
++        try:
++            payload = json.loads(err.read().decode("utf-8"))
++            return str(payload.get("message", payload))
++        except (ValueError, UnicodeDecodeError):
++            return "no parseable error body"
++
++    def _fetch(self, url):
++        """GET, following at most _MAX_REDIRECTS Location hops."""
++        current = url
++        for _ in range(_MAX_REDIRECTS + 1):
++            response = self._open(current)
++            status = response.status if hasattr(response, "status") else response.code
++            if status in _REDIRECT_CODES:
++                location = response.headers.get("Location")
++                response.read()
++                if not location:
++                    raise GitLabAPIError(status, "redirect without a Location header")
++                current = urllib.parse.urljoin(current, location)
++                continue
++            return response
++        raise GitLabAPIError(0, "too many redirects while downloading artifacts")
++
++    def _get_json(self, path, params=None):
++        url = self.base_url + path
++        if params:
++            url += "?" + urllib.parse.urlencode(params)
++        response = self._fetch(url)
++        data = json.loads(response.read().decode("utf-8"))
++        return data, response.headers
++
++    # -- documented operations -------------------------------------------
++
++    def list_pipelines(self, project_id, **params):
++        data, _ = self._get_json("/api/v4/projects/%d/pipelines" % project_id, params)
++        return data
++
++    def list_pipeline_jobs(self, project_id, pipeline_id, per_page=100):
++        jobs = []
++        page = "1"
++        while page:
++            data, headers = self._get_json(
++                "/api/v4/projects/%d/pipelines/%d/jobs" % (project_id, pipeline_id),
++                {"per_page": per_page, "page": page},
++            )
++            jobs.extend(data)
++            page = (headers.get("x-next-page") or "").strip()
++        return jobs
++
++    def download_artifacts(self, project_id, job_id, dest_path):
++        url = "%s/api/v4/projects/%d/jobs/%d/artifacts" % (
++            self.base_url,
++            project_id,
++            job_id,
++        )
++        response = self._fetch(url)
++        digest = hashlib.sha256()
++        size = 0
++        try:
++            with open(dest_path, "wb") as out:
++                while True:
++                    chunk = response.read(_CHUNK)
++                    if not chunk:
++                        break
++                    out.write(chunk)
++                    digest.update(chunk)
++                    size += len(chunk)
++        except (http.client.IncompleteRead, ConnectionError):
++            self._discard(dest_path)
++            raise TruncatedDownloadError(
++                "connection closed before the full artifact payload arrived"
++            ) from None
++        expected = response.headers.get("Content-Length")
++        if expected is not None and int(expected) != size:
++            self._discard(dest_path)
++            raise TruncatedDownloadError(
++                "expected %s bytes per Content-Length, received %d" % (expected, size)
++            )
++        return {"sha256": digest.hexdigest(), "size": size}
++
++    @staticmethod
++    def _discard(path):
++        try:
++            os.remove(path)
++        except OSError:
++            pass
+diff --git a/glartifacts/downloader.py b/glartifacts/downloader.py
+new file mode 100644
+index 0000000..7f30af1
+--- /dev/null
++++ b/glartifacts/downloader.py
+@@ -0,0 +1,50 @@
++"""Selects the newest successful pipeline/job and downloads its artifacts."""
++
++from datetime import datetime
++
++from .errors import ArtifactLookupError, ArtifactsExpiredError
++
++
++def _parse_expiry(value):
++    return datetime.fromisoformat(value.replace("Z", "+00:00"))
++
++
++class ArtifactDownloader:
++    def __init__(self, client, now):
++        self._client = client
++        self._now = now
++
++    def fetch_latest(self, project_id, job_name, dest_path):
++        pipelines = self._client.list_pipelines(
++            project_id, status="success", order_by="id", sort="desc"
++        )
++        if not pipelines:
++            raise ArtifactLookupError(
++                "project %s has no successful pipelines" % project_id
++            )
++        newest = pipelines[0]
++        jobs = self._client.list_pipeline_jobs(project_id, newest["id"], per_page=100)
++        match = next(
++            (j for j in jobs if j["name"] == job_name and j["status"] == "success"),
++            None,
++        )
++        if match is None:
++            raise ArtifactLookupError(
++                "no successful job named %r in pipeline %s of project %s"
++                % (job_name, newest["id"], project_id)
++            )
++        expire_at = match.get("artifacts_expire_at")
++        if expire_at is not None and _parse_expiry(expire_at) <= self._now():
++            raise ArtifactsExpiredError(
++                "artifacts of job %s expired at %s and were removed by GitLab"
++                % (match["id"], expire_at)
++            )
++        result = self._client.download_artifacts(project_id, match["id"], dest_path)
++        return {
++            "project_id": project_id,
++            "pipeline_id": newest["id"],
++            "job_id": match["id"],
++            "sha256": result["sha256"],
++            "size": result["size"],
++            "path": dest_path,
++        }
+diff --git a/glartifacts/errors.py b/glartifacts/errors.py
+new file mode 100644
+index 0000000..d4ad249
+--- /dev/null
++++ b/glartifacts/errors.py
+@@ -0,0 +1,25 @@
++"""Exception types for the GitLab job-artifact downloader."""
++
++
++class GitLabAPIError(Exception):
++    """A GitLab API request failed. Carries the HTTP status, never the token."""
++
++    def __init__(self, status, message):
++        super().__init__(message)
++        self.status = status
++
++
++class NotFoundMaskedError(GitLabAPIError):
++    """GitLab answered 404, which covers both 'missing' and 'no permission'."""
++
++
++class TruncatedDownloadError(Exception):
++    """The artifact body ended before the advertised Content-Length."""
++
++
++class ArtifactLookupError(Exception):
++    """No pipeline or job matched the requested selection."""
++
++
++class ArtifactsExpiredError(Exception):
++    """The selected job's artifacts_expire_at lies in the past."""

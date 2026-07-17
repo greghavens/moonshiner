@@ -1,0 +1,321 @@
+diff --git a/ReferenceTablesClient.java b/ReferenceTablesClient.java
+new file mode 100644
+index 0000000..7718294
+--- /dev/null
++++ b/ReferenceTablesClient.java
+@@ -0,0 +1,315 @@
++import java.io.IOException;
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.function.LongConsumer;
++
++/**
++ * Datadog Reference Tables v2 client.
++ *
++ * Local-file tables follow the documented three-step flow: create an upload
++ * (POST /api/v2/reference-tables/uploads) to obtain presigned part URLs, PUT
++ * the CSV chunks to those URLs (no Datadog auth headers — they are storage
++ * URLs), then create or PATCH the table referencing the upload id in
++ * file_metadata. Table processing is asynchronous and observed through the
++ * table's status attribute.
++ */
++public final class ReferenceTablesClient {
++
++    private static final String TABLES = "/api/v2/reference-tables/tables";
++    private static final String UPLOADS = "/api/v2/reference-tables/uploads";
++    private static final Set<String> FIELD_TYPES = Set.of("STRING", "INT32");
++    private static final long MIN_PART_SIZE = 5_000_000L; // all parts but the last
++    private static final int MAX_PARTS = 20;
++
++    public record UploadPlan(int partCount, long partSize) {
++    }
++
++    public record TableStatus(String status, long rowCount) {
++    }
++
++    public record TableSummary(String id, String tableName, String status, long rowCount) {
++    }
++
++    public static final class DatadogApiException extends RuntimeException {
++        private final int statusCode;
++        private final List<String> errors;
++
++        public DatadogApiException(int statusCode, List<String> errors) {
++            super("Datadog API error " + statusCode + ": " + String.join("; ", errors));
++            this.statusCode = statusCode;
++            this.errors = List.copyOf(errors);
++        }
++
++        public int statusCode() {
++            return statusCode;
++        }
++
++        public List<String> errors() {
++            return errors;
++        }
++    }
++
++    public static final class TableProcessingException extends RuntimeException {
++        private final String errorMessage;
++        private final long errorRowCount;
++        private final String errorType;
++
++        public TableProcessingException(String errorMessage, long errorRowCount, String errorType) {
++            super("reference table processing failed (" + errorType + ", "
++                    + errorRowCount + " rows): " + errorMessage);
++            this.errorMessage = errorMessage;
++            this.errorRowCount = errorRowCount;
++            this.errorType = errorType;
++        }
++
++        public String errorMessage() {
++            return errorMessage;
++        }
++
++        public long errorRowCount() {
++            return errorRowCount;
++        }
++
++        public String errorType() {
++            return errorType;
++        }
++    }
++
++    private final String baseUrl;
++    private final String apiKey;
++    private final String appKey;
++    private final LongConsumer sleeper;
++    private final HttpClient http = HttpClient.newHttpClient();
++
++    public ReferenceTablesClient(String baseUrl, String apiKey, String appKey, LongConsumer sleeper) {
++        this.baseUrl = baseUrl.replaceAll("/+$", "");
++        this.apiKey = apiKey;
++        this.appKey = appKey;
++        this.sleeper = sleeper;
++    }
++
++    /** Split a file by the documented limits: 20 parts max, 5MB minimum non-final parts. */
++    public static UploadPlan planUploadParts(long totalBytes) {
++        if (totalBytes <= 0) {
++            throw new IllegalArgumentException("upload must not be empty");
++        }
++        if (totalBytes <= MIN_PART_SIZE) {
++            return new UploadPlan(1, totalBytes);
++        }
++        long parts = (totalBytes + MIN_PART_SIZE - 1) / MIN_PART_SIZE;
++        if (parts > MAX_PARTS) {
++            throw new IllegalArgumentException("file needs " + parts
++                    + " parts of " + MIN_PART_SIZE + " bytes; the API allows at most " + MAX_PARTS);
++        }
++        return new UploadPlan((int) parts, MIN_PART_SIZE);
++    }
++
++    public String createTable(String tableName, String description, List<String> tags,
++                              LinkedHashMap<String, String> fields, String primaryKey,
++                              String csv) {
++        for (Map.Entry<String, String> field : fields.entrySet()) {
++            if (!FIELD_TYPES.contains(field.getValue())) {
++                throw new IllegalArgumentException("field " + field.getKey()
++                        + " has unsupported type " + field.getValue()
++                        + "; documented types are " + FIELD_TYPES);
++            }
++        }
++        if (!fields.containsKey(primaryKey)) {
++            throw new IllegalArgumentException("primary key " + primaryKey
++                    + " is not one of the schema fields " + fields.keySet());
++        }
++        List<String> headers = new ArrayList<>(fields.keySet());
++        String uploadId = upload(tableName, headers, csv);
++
++        List<Object> fieldDocs = new ArrayList<>();
++        for (Map.Entry<String, String> field : fields.entrySet()) {
++            Map<String, Object> doc = new LinkedHashMap<>();
++            doc.put("name", field.getKey());
++            doc.put("type", field.getValue());
++            fieldDocs.add(doc);
++        }
++        Map<String, Object> schema = new LinkedHashMap<>();
++        schema.put("fields", fieldDocs);
++        schema.put("primary_keys", List.of(primaryKey)); // only one primary key is supported
++
++        Map<String, Object> attrs = new LinkedHashMap<>();
++        attrs.put("table_name", tableName);
++        attrs.put("source", "LOCAL_FILE");
++        attrs.put("schema", schema);
++        attrs.put("file_metadata", Map.of("upload_id", uploadId));
++        if (description != null) {
++            attrs.put("description", description);
++        }
++        if (tags != null && !tags.isEmpty()) {
++            attrs.put("tags", tags);
++        }
++        String response = request("POST", TABLES,
++                Json.write(Map.of("data", Map.of("type", "reference_table", "attributes", attrs))));
++        return (String) data(response).get("id");
++    }
++
++    public TableStatus waitUntilReady(String tableId, long pollIntervalMillis, int maxPolls) {
++        for (int poll = 1; poll <= maxPolls; poll++) {
++            Map<String, Object> attrs = attributes(request("GET", TABLES + "/" + tableId, null));
++            String status = (String) attrs.get("status");
++            if ("DONE".equals(status)) {
++                return new TableStatus(status, asLong(attrs.get("row_count")));
++            }
++            if ("ERROR".equals(status)) {
++                @SuppressWarnings("unchecked")
++                Map<String, Object> meta = (Map<String, Object>) attrs.getOrDefault(
++                        "file_metadata", Map.of());
++                throw new TableProcessingException(
++                        (String) meta.get("error_message"),
++                        asLong(meta.get("error_row_count")),
++                        (String) meta.get("error_type"));
++            }
++            if (poll < maxPolls) {
++                sleeper.accept(pollIntervalMillis);
++            }
++        }
++        throw new IllegalStateException("table " + tableId
++                + " is still processing after " + maxPolls + " polls");
++    }
++
++    /** Replace the table's rows: fresh upload, then PATCH referencing it.
++     *  The source type cannot change after creation, so neither source nor
++     *  schema is resent. */
++    public void replaceRows(String tableId, String tableName, List<String> headers, String csv) {
++        String uploadId = upload(tableName, headers, csv);
++        Map<String, Object> data = new LinkedHashMap<>();
++        data.put("id", tableId);
++        data.put("type", "reference_table");
++        data.put("attributes", Map.of("file_metadata", Map.of("upload_id", uploadId)));
++        request("PATCH", TABLES + "/" + tableId, Json.write(Map.of("data", data)));
++    }
++
++    public List<TableSummary> listTables(int pageLimit) {
++        List<TableSummary> out = new ArrayList<>();
++        long offset = 0;
++        while (true) {
++            String query = "?page%5Blimit%5D=" + pageLimit + "&page%5Boffset%5D=" + offset;
++            String response = request("GET", TABLES + query, null);
++            @SuppressWarnings("unchecked")
++            List<Object> page = (List<Object>) Json.parseObject(response).get("data");
++            for (Object entry : page) {
++                @SuppressWarnings("unchecked")
++                Map<String, Object> doc = (Map<String, Object>) entry;
++                @SuppressWarnings("unchecked")
++                Map<String, Object> attrs = (Map<String, Object>) doc.get("attributes");
++                out.add(new TableSummary(
++                        (String) doc.get("id"),
++                        (String) attrs.get("table_name"),
++                        (String) attrs.get("status"),
++                        asLong(attrs.get("row_count"))));
++            }
++            if (page.size() < pageLimit) {
++                return out;
++            }
++            offset += pageLimit;
++        }
++    }
++
++    private String upload(String tableName, List<String> headers, String csv) {
++        byte[] bytes = csv.getBytes(StandardCharsets.UTF_8);
++        UploadPlan plan = planUploadParts(bytes.length);
++        Map<String, Object> attrs = new LinkedHashMap<>();
++        attrs.put("table_name", tableName);
++        attrs.put("headers", headers);
++        attrs.put("part_count", plan.partCount());
++        attrs.put("part_size", plan.partSize());
++        String response = request("POST", UPLOADS,
++                Json.write(Map.of("data", Map.of("type", "upload", "attributes", attrs))));
++        Map<String, Object> data = data(response);
++        @SuppressWarnings("unchecked")
++        Map<String, Object> respAttrs = (Map<String, Object>) data.get("attributes");
++        @SuppressWarnings("unchecked")
++        List<Object> partUrls = (List<Object>) respAttrs.get("part_urls");
++        for (int i = 0; i < partUrls.size(); i++) {
++            long from = i * plan.partSize();
++            long to = Math.min(bytes.length, from + plan.partSize());
++            putPart((String) partUrls.get(i), Arrays.copyOfRange(bytes, (int) from, (int) to));
++        }
++        return (String) data.get("id");
++    }
++
++    private void putPart(String url, byte[] part) {
++        // Presigned storage URL: no Datadog headers must ever reach it.
++        HttpRequest request = HttpRequest.newBuilder(URI.create(url))
++                .PUT(HttpRequest.BodyPublishers.ofByteArray(part))
++                .build();
++        HttpResponse<String> response = send(request);
++        if (response.statusCode() >= 400) {
++            throw new DatadogApiException(response.statusCode(),
++                    List.of("part upload failed"));
++        }
++    }
++
++    private String request(String method, String pathAndQuery, String jsonBody) {
++        HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(baseUrl + pathAndQuery))
++                .header("DD-API-KEY", apiKey)
++                .header("DD-APPLICATION-KEY", appKey)
++                .header("Accept", "application/json");
++        if (jsonBody != null) {
++            builder.header("Content-Type", "application/json")
++                    .method(method, HttpRequest.BodyPublishers.ofString(jsonBody));
++        } else {
++            builder.method(method, HttpRequest.BodyPublishers.noBody());
++        }
++        HttpResponse<String> response = send(builder.build());
++        if (response.statusCode() >= 400) {
++            throw new DatadogApiException(response.statusCode(), decodeErrors(response.body()));
++        }
++        return response.body();
++    }
++
++    private HttpResponse<String> send(HttpRequest request) {
++        try {
++            return http.send(request, HttpResponse.BodyHandlers.ofString());
++        } catch (IOException e) {
++            throw new RuntimeException("Datadog request failed: " + e.getMessage(), e);
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++            throw new RuntimeException("Datadog request interrupted");
++        }
++    }
++
++    private static List<String> decodeErrors(String body) {
++        try {
++            Object errors = Json.parseObject(body).get("errors");
++            if (errors instanceof List<?> list && !list.isEmpty()) {
++                List<String> out = new ArrayList<>();
++                for (Object item : list) {
++                    out.add(String.valueOf(item));
++                }
++                return out;
++            }
++        } catch (RuntimeException ignored) {
++            // fall through to the generic message
++        }
++        return List.of("unrecognized error body");
++    }
++
++    @SuppressWarnings("unchecked")
++    private static Map<String, Object> data(String responseBody) {
++        return (Map<String, Object>) Json.parseObject(responseBody).get("data");
++    }
++
++    @SuppressWarnings("unchecked")
++    private static Map<String, Object> attributes(String responseBody) {
++        return (Map<String, Object>) data(responseBody).get("attributes");
++    }
++
++    private static long asLong(Object value) {
++        return value == null ? 0L : Math.round(((Number) value).doubleValue());
++    }
++}

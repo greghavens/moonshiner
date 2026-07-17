@@ -1,0 +1,217 @@
+diff --git a/bulkship.ts b/bulkship.ts
+new file mode 100644
+index 0000000..22e06e9
+--- /dev/null
++++ b/bulkship.ts
+@@ -0,0 +1,211 @@
++/**
++ * Bulk-upload client with per-item 207-style partial-failure handling,
++ * retry of failed items only, and capped exponential backoff.
++ */
++import * as http from 'node:http';
++import * as https from 'node:https';
++import { URL } from 'node:url';
++
++// ---------------------------------------------------------------------------
++// Public types
++// ---------------------------------------------------------------------------
++
++export interface Item {
++  id: string;
++  [key: string]: unknown;
++}
++
++export interface ItemReport {
++  id: string;
++  ok: boolean;
++  error?: string;
++}
++
++export interface BulkClientOptions {
++  /** Endpoint to POST batches to. */
++  url: string;
++  /** Maximum number of items per batch request. */
++  batchSize: number;
++  /** Injectable sleeper: called before each retry with the backoff duration. */
++  sleep: (ms: number) => Promise<void>;
++  /** Backoff for the first retry in milliseconds (default 1000). */
++  initialBackoffMs?: number;
++  /** Backoff ceiling in milliseconds (default 30000). */
++  maxBackoffMs?: number;
++  /** Maximum number of retry attempts per item (default 3). */
++  maxRetries?: number;
++}
++
++// ---------------------------------------------------------------------------
++// Internal helpers
++// ---------------------------------------------------------------------------
++
++interface BatchResult {
++  id: string;
++  ok: boolean;
++  error?: string;
++}
++
++interface BatchResponse {
++  results: BatchResult[];
++}
++
++function postBatch(
++  endpointUrl: string,
++  items: Item[],
++): Promise<BatchResponse> {
++  return new Promise((resolve, reject) => {
++    const parsed = new URL(endpointUrl);
++    const body = Buffer.from(JSON.stringify({ items }), 'utf8');
++    const options: http.RequestOptions = {
++      hostname: parsed.hostname,
++      port: parsed.port ? Number(parsed.port) : (parsed.protocol === 'https:' ? 443 : 80),
++      path: parsed.pathname + (parsed.search ?? ''),
++      method: 'POST',
++      headers: {
++        'Content-Type': 'application/json',
++        'Content-Length': String(body.length),
++      },
++    };
++
++    const transport = parsed.protocol === 'https:' ? https : http;
++    const req = transport.request(options, (res) => {
++      const chunks: Buffer[] = [];
++      res.on('data', (c: Buffer) => chunks.push(c));
++      res.on('end', () => {
++        const raw = Buffer.concat(chunks).toString('utf8');
++        const status = res.statusCode ?? 0;
++        if (status < 200 || status >= 300) {
++          reject(new Error(
++            `BulkClient: server returned HTTP ${status}: ${raw.slice(0, 200)}`,
++          ));
++          return;
++        }
++        let parsed2: BatchResponse;
++        try {
++          parsed2 = JSON.parse(raw) as BatchResponse;
++        } catch {
++          reject(new Error(`BulkClient: could not parse response as JSON: ${raw.slice(0, 200)}`));
++          return;
++        }
++        resolve(parsed2);
++      });
++      res.on('error', reject);
++    });
++
++    req.on('error', reject);
++    req.end(body);
++  });
++}
++
++// ---------------------------------------------------------------------------
++// BulkClient
++// ---------------------------------------------------------------------------
++
++export class BulkClient {
++  private readonly url: string;
++  private readonly batchSize: number;
++  private readonly sleep: (ms: number) => Promise<void>;
++  private readonly initialBackoffMs: number;
++  private readonly maxBackoffMs: number;
++  private readonly maxRetries: number;
++
++  constructor(opts: BulkClientOptions) {
++    this.url = opts.url;
++    this.batchSize = opts.batchSize;
++    this.sleep = opts.sleep;
++    this.initialBackoffMs = opts.initialBackoffMs ?? 1000;
++    this.maxBackoffMs = opts.maxBackoffMs ?? 30_000;
++    this.maxRetries = opts.maxRetries ?? 3;
++  }
++
++  /**
++   * Upload a list of items.  Returns a report in the same order as the
++   * input, with ok/error status for each item after all retries.
++   */
++  async upload(items: Item[]): Promise<ItemReport[]> {
++    if (items.length === 0) return [];
++
++    // Build an index of original positions so we can restore order later.
++    // finalResults is pre-sized to the total number of items.
++    const finalResults: (ItemReport | undefined)[] = new Array(items.length);
++
++    // pending: [{originalIndex, item}]
++    type Pending = { originalIndex: number; item: Item };
++
++    // Initial pass: all items are pending, group into first-pass batches.
++    let pending: Pending[] = items.map((item, i) => ({ originalIndex: i, item }));
++
++    let attempt = 0;
++    let backoffMs = this.initialBackoffMs;
++
++    // Retry loop.  attempt=0 is the initial send; attempt 1..maxRetries are
++    // retries.  We stop when there are no more failures or we hit maxRetries.
++    while (pending.length > 0) {
++      if (attempt > 0) {
++        // Sleep before each retry
++        await this.sleep(backoffMs);
++        backoffMs = Math.min(backoffMs * 2, this.maxBackoffMs);
++      }
++
++      // Chunk pending into batches of at most batchSize
++      const batches: Pending[][] = [];
++      for (let i = 0; i < pending.length; i += this.batchSize) {
++        batches.push(pending.slice(i, i + this.batchSize));
++      }
++
++      const nextPending: Pending[] = [];
++
++      for (const batch of batches) {
++        const batchItems = batch.map((p) => p.item);
++        // postBatch throws on non-2xx; propagate to the caller
++        const response = await postBatch(this.url, batchItems);
++
++        // Build a lookup from id -> result for this batch response
++        const resultById = new Map<string, BatchResult>();
++        for (const r of response.results) {
++          resultById.set(r.id, r);
++        }
++
++        for (const { originalIndex, item } of batch) {
++          const result = resultById.get(item.id);
++          if (!result) {
++            // Server didn't return a result for this item; treat as failure
++            // if we still have retry budget; otherwise mark failed.
++            if (attempt < this.maxRetries) {
++              nextPending.push({ originalIndex, item });
++            } else {
++              finalResults[originalIndex] = {
++                id: item.id,
++                ok: false,
++                error: 'no result returned by server',
++              };
++            }
++          } else if (result.ok) {
++            finalResults[originalIndex] = {
++              id: item.id,
++              ok: true,
++            };
++          } else {
++            // Failed item
++            if (attempt < this.maxRetries) {
++              nextPending.push({ originalIndex, item });
++            } else {
++              finalResults[originalIndex] = {
++                id: item.id,
++                ok: false,
++                error: result.error,
++              };
++            }
++          }
++        }
++      }
++
++      pending = nextPending;
++      attempt += 1;
++    }
++
++    // Return in original index order (all slots must be filled)
++    return finalResults as ItemReport[];
++  }
++}

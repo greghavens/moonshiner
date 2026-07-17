@@ -1,0 +1,162 @@
+diff --git a/team_access_reconciler.rb b/team_access_reconciler.rb
+new file mode 100644
+index 0000000..8270934
+--- /dev/null
++++ b/team_access_reconciler.rb
+@@ -0,0 +1,156 @@
++# frozen_string_literal: true
++
++# Team-access reconciler for the Terraform Enterprise /api/v2 API.
++#
++# Pages the workspace's team-workspaces relationships, plans the minimum
++# add/change/remove set against a desired team => access map, and applies
++# it. TFE masks authorization behind 404s, so a vanished-or-invisible
++# record mid-reconcile is skipped rather than fatal, while a masked list
++# or create is fatal.
++
++require "json"
++require "uri"
++
++module TeamAccess
++  ACCESS_LEVELS = %w[read plan write admin custom].freeze
++  LIST_PATH = "/api/v2/team-workspaces"
++
++  # Any unexpected non-2xx response, with the decoded JSON:API errors.
++  class APIError < StandardError
++    attr_reader :status, :errors
++
++    def initialize(status, errors)
++      @status = status
++      @errors = errors || []
++      detail = @errors.map { |e| "#{e['status']} #{e['title']}: #{e['detail']}" }.join("; ")
++      detail = "HTTP #{status}" if detail.empty?
++      super("TFE API error: #{detail}")
++    end
++  end
++
++  # TFE answers 404 both for records that do not exist and for records the
++  # token is not authorized to see; callers cannot tell which.
++  class NotFoundOrUnauthorized < APIError; end
++
++  module_function
++
++  def raise_for(status, body)
++    errors = body.is_a?(Hash) ? body["errors"] : nil
++    klass = status == 404 ? NotFoundOrUnauthorized : APIError
++    raise klass.new(status, errors)
++  end
++
++  def fetch(client, workspace_id, page_size: 20)
++    out = []
++    page = 1
++    loop do
++      query = URI.encode_www_form(
++        "filter[workspace][id]" => workspace_id,
++        "page[number]" => page,
++        "page[size]" => page_size,
++      )
++      status, body = client.request("GET", "#{LIST_PATH}?#{query}")
++      raise_for(status, body) unless (200..299).cover?(status)
++      body.fetch("data", []).each do |item|
++        out << {
++          "id" => item["id"],
++          "team_id" => item.dig("relationships", "team", "data", "id"),
++          "access" => item.dig("attributes", "access"),
++        }
++      end
++      next_page = body.dig("meta", "pagination", "next-page")
++      break if next_page.nil?
++
++      page = next_page
++    end
++    out
++  end
++
++  def plan(current, desired)
++    desired.each do |team_id, access|
++      unless ACCESS_LEVELS.include?(access)
++        raise ArgumentError, "unknown access level #{access.inspect} for #{team_id}"
++      end
++    end
++    current_by_team = current.to_h { |c| [c["team_id"], c] }
++
++    add = []
++    change = []
++    desired.each do |team_id, access|
++      cur = current_by_team[team_id]
++      if cur.nil?
++        add << { "team_id" => team_id, "access" => access }
++      elsif cur["access"] != access
++        change << { "id" => cur["id"], "team_id" => team_id,
++                    "from" => cur["access"], "to" => access }
++      end
++    end
++    remove = current
++             .reject { |c| desired.key?(c["team_id"]) }
++             .map { |c| { "id" => c["id"], "team_id" => c["team_id"], "access" => c["access"] } }
++
++    {
++      "add" => add.sort_by { |e| e["team_id"] },
++      "change" => change.sort_by { |e| e["team_id"] },
++      "remove" => remove.sort_by { |e| e["team_id"] },
++    }
++  end
++
++  def format_plan(planned)
++    planned["add"].map { |e| "+ #{e['team_id']} #{e['access']}" } +
++      planned["change"].map { |e| "~ #{e['team_id']} #{e['from']} -> #{e['to']} (#{e['id']})" } +
++      planned["remove"].map { |e| "- #{e['team_id']} #{e['access']} (#{e['id']})" }
++  end
++
++  def apply(client, workspace_id, planned)
++    report = []
++
++    planned["add"].each do |e|
++      body = { "data" => {
++        "type" => "team-workspaces",
++        "attributes" => { "access" => e["access"] },
++        "relationships" => {
++          "team" => { "data" => { "type" => "teams", "id" => e["team_id"] } },
++          "workspace" => { "data" => { "type" => "workspaces", "id" => workspace_id } },
++        },
++      } }
++      status, resp = client.request("POST", LIST_PATH, body: body)
++      raise_for(status, resp) unless (200..299).cover?(status)
++      report << "add #{e['team_id']} #{e['access']}"
++    end
++
++    planned["change"].each do |e|
++      body = { "data" => { "type" => "team-workspaces", "id" => e["id"],
++                           "attributes" => { "access" => e["to"] } } }
++      status, resp = client.request("PATCH", "#{LIST_PATH}/#{e['id']}", body: body)
++      if status == 404
++        report << "skip #{e['team_id']} (missing or unauthorized)"
++        next
++      end
++      raise_for(status, resp) unless (200..299).cover?(status)
++      report << "change #{e['team_id']} #{e['from']}->#{e['to']}"
++    end
++
++    planned["remove"].each do |e|
++      status, resp = client.request("DELETE", "#{LIST_PATH}/#{e['id']}")
++      if status == 404
++        report << "skip #{e['team_id']} (missing or unauthorized)"
++        next
++      end
++      raise_for(status, resp) unless (200..299).cover?(status)
++      report << "remove #{e['team_id']}"
++    end
++
++    report
++  end
++
++  def reconcile(client, workspace_id, desired, dry_run: false)
++    current = fetch(client, workspace_id)
++    planned = plan(current, desired)
++    {
++      "plan" => planned,
++      "lines" => format_plan(planned),
++      "report" => dry_run ? [] : apply(client, workspace_id, planned),
++    }
++  end
++end

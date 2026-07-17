@@ -1,0 +1,213 @@
+diff --git a/Inventory.ps1 b/Inventory.ps1
+new file mode 100644
+index 0000000..ce0ef83
+--- /dev/null
++++ b/Inventory.ps1
+@@ -0,0 +1,32 @@
++# Paged snapshot inventory following HAL _links.next.
++
++Set-StrictMode -Version Latest
++
++function Get-OntapSnapshotInventory {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] [object] $Session,
++        [Parameter(Mandatory)] [string] $VolumeUuid,
++        [Parameter(Mandatory)] [string[]] $Fields,
++        [Parameter(Mandatory)] [int] $MaxRecords,
++        [Parameter(Mandatory)] [string] $OrderBy
++    )
++    $records = [System.Collections.Generic.List[object]]::new()
++    $pages = 0
++    $query = "fields=$($Fields -join ',')&max_records=$MaxRecords&order_by=$([uri]::EscapeDataString($OrderBy))"
++    $next = "/api/storage/volumes/$VolumeUuid/snapshots?$query"
++    while ($null -ne $next) {
++        $page = (Invoke-OntapRequest -Session $Session -Method GET -PathAndQuery $next).Body
++        $pages++
++        foreach ($record in @($page.records)) { $records.Add($record) }
++        $next = $null
++        if ($page.PSObject.Properties['_links'] -and $page._links.PSObject.Properties['next']) {
++            $next = $page._links.next.href
++        }
++    }
++    [pscustomobject]@{
++        Records    = $records.ToArray()
++        Pages      = $pages
++        NumRecords = $records.Count
++    }
++}
+diff --git a/Jobs.ps1 b/Jobs.ps1
+new file mode 100644
+index 0000000..7d2ee97
+--- /dev/null
++++ b/Jobs.ps1
+@@ -0,0 +1,60 @@
++# Asynchronous deletion through the documented 202-plus-job flow.
++
++Set-StrictMode -Version Latest
++
++function Wait-OntapJob {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] [object] $Session,
++        [Parameter(Mandatory)] [string] $JobHref,
++        [Parameter(Mandatory)] [int] $PollLimit,
++        [Parameter(Mandatory)] [scriptblock] $Sleep
++    )
++    for ($poll = 1; $poll -le $PollLimit; $poll++) {
++        $job = (Invoke-OntapRequest -Session $Session -Method GET -PathAndQuery $JobHref).Body
++        switch ([string]$job.state) {
++            'success' { return [pscustomobject]@{ Outcome = 'success'; ErrorCode = $null; ErrorMessage = $null } }
++            'failure' {
++                $code = $null
++                $message = 'job failed'
++                if ($job.PSObject.Properties['error'] -and $null -ne $job.error) {
++                    if ($job.error.PSObject.Properties['code']) { $code = [string]$job.error.code }
++                    if ($job.error.PSObject.Properties['message']) { $message = [string]$job.error.message }
++                }
++                return [pscustomobject]@{ Outcome = 'failure'; ErrorCode = $code; ErrorMessage = $message }
++            }
++        }
++        if ($poll -lt $PollLimit) { & $Sleep 1 }
++    }
++    [pscustomobject]@{
++        Outcome      = 'timeout'
++        ErrorCode    = $null
++        ErrorMessage = "job still not terminal after poll limit of $PollLimit polls"
++    }
++}
++
++function Remove-OntapSnapshots {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] [object] $Session,
++        [Parameter(Mandatory)] [string] $VolumeUuid,
++        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Snapshots,
++        [Parameter(Mandatory)] [int] $PollLimit,
++        [Parameter(Mandatory)] [scriptblock] $Sleep
++    )
++    $results = [System.Collections.Generic.List[object]]::new()
++    foreach ($snap in $Snapshots) {
++        $path = "/api/storage/volumes/$VolumeUuid/snapshots/$($snap.uuid)?return_timeout=0"
++        $resp = Invoke-OntapRequest -Session $Session -Method DELETE -PathAndQuery $path
++        $verdict = Wait-OntapJob -Session $Session -JobHref $resp.Body.job._links.self.href `
++            -PollLimit $PollLimit -Sleep $Sleep
++        $results.Add([pscustomobject]@{
++            Uuid         = $snap.uuid
++            Name         = $snap.name
++            Deleted      = ($verdict.Outcome -ceq 'success')
++            ErrorCode    = $verdict.ErrorCode
++            ErrorMessage = $verdict.ErrorMessage
++        })
++    }
++    $results.ToArray()
++}
+diff --git a/OntapSnapshots.psm1 b/OntapSnapshots.psm1
+new file mode 100644
+index 0000000..e1ade69
+--- /dev/null
++++ b/OntapSnapshots.psm1
+@@ -0,0 +1,11 @@
++# OntapSnapshots — ONTAP REST snapshot inventory and retention over /api.
++
++Set-StrictMode -Version Latest
++
++. (Join-Path $PSScriptRoot 'Transport.ps1')
++. (Join-Path $PSScriptRoot 'Inventory.ps1')
++. (Join-Path $PSScriptRoot 'Retention.ps1')
++. (Join-Path $PSScriptRoot 'Jobs.ps1')
++
++Export-ModuleMember -Function New-OntapSession, Get-OntapSnapshotInventory,
++    Select-OntapSnapshotsForDeletion, Remove-OntapSnapshots
+diff --git a/Retention.ps1 b/Retention.ps1
+new file mode 100644
+index 0000000..0d32cba
+--- /dev/null
++++ b/Retention.ps1
+@@ -0,0 +1,31 @@
++# Conservative retention selection: expired, unowned, label-matched only.
++
++Set-StrictMode -Version Latest
++
++function Select-OntapSnapshotsForDeletion {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]] $Snapshots,
++        [Parameter(Mandatory)] [datetime] $AsOf,
++        [string] $SnapmirrorLabel
++    )
++    $asOfUtc = $AsOf.ToUniversalTime()
++    $eligible = foreach ($snap in $Snapshots) {
++        $expiryProp = $snap.PSObject.Properties['expiry_time']
++        if ($null -eq $expiryProp -or [string]::IsNullOrEmpty([string]$expiryProp.Value)) { continue }
++        $expiry = [datetimeoffset]::Parse([string]$expiryProp.Value, [cultureinfo]::InvariantCulture)
++        if ($expiry.UtcDateTime -gt $asOfUtc) { continue }
++        $ownersProp = $snap.PSObject.Properties['owners']
++        if ($null -ne $ownersProp -and @($ownersProp.Value).Count -gt 0) { continue }
++        if ($PSBoundParameters.ContainsKey('SnapmirrorLabel')) {
++            $labelProp = $snap.PSObject.Properties['snapmirror_label']
++            if ($null -eq $labelProp -or -not ([string]$labelProp.Value).Equals($SnapmirrorLabel, [System.StringComparison]::Ordinal)) {
++                continue
++            }
++        }
++        $snap
++    }
++    @($eligible | Sort-Object -Property `
++        @{ Expression = { [datetimeoffset]::Parse([string]$_.create_time, [cultureinfo]::InvariantCulture).UtcTicks } },
++        @{ Expression = { $_.name } })
++}
+diff --git a/Transport.ps1 b/Transport.ps1
+new file mode 100644
+index 0000000..5bdaa1a
+--- /dev/null
++++ b/Transport.ps1
+@@ -0,0 +1,49 @@
++# HTTP transport for the ONTAP cluster-management /api endpoint.
++
++Set-StrictMode -Version Latest
++
++function Invoke-OntapRequest {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] [object] $Session,
++        [Parameter(Mandatory)] [string] $Method,
++        [Parameter(Mandatory)] [string] $PathAndQuery
++    )
++    $uri = $Session.BaseUri + $PathAndQuery
++    $headers = @{ Authorization = $Session.AuthHeader; Accept = 'application/hal+json' }
++    $resp = Invoke-WebRequest -Uri $uri -Method $Method -Headers $headers -SkipHttpErrorCheck
++    $doc = $null
++    if ($null -ne $resp.Content -and $resp.Content.Length -gt 0) {
++        # pwsh hands application/hal+json back as raw bytes, not text
++        $text = if ($resp.Content -is [byte[]]) {
++            [System.Text.Encoding]::UTF8.GetString($resp.Content)
++        } else {
++            [string]$resp.Content
++        }
++        $doc = $text | ConvertFrom-Json
++    }
++    if ([int]$resp.StatusCode -ge 400) {
++        $code = 'unknown'
++        $message = 'no error body'
++        if ($null -ne $doc -and $doc.PSObject.Properties['error']) {
++            if ($doc.error.PSObject.Properties['code']) { $code = $doc.error.code }
++            if ($doc.error.PSObject.Properties['message']) { $message = $doc.error.message }
++        }
++        throw "ONTAP API error $([int]$resp.StatusCode) (code $code): $message"
++    }
++    [pscustomobject]@{ Status = [int]$resp.StatusCode; Body = $doc }
++}
++
++function New-OntapSession {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] [string] $BaseUri,
++        [Parameter(Mandatory)] [pscredential] $Credential
++    )
++    $plain = $Credential.GetNetworkCredential().Password
++    $token = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("$($Credential.UserName):$plain"))
++    [pscustomobject]@{
++        BaseUri    = $BaseUri.TrimEnd('/')
++        AuthHeader = "Basic $token"
++    }
++}

@@ -1,0 +1,207 @@
+diff --git a/atlas_clusters/__init__.py b/atlas_clusters/__init__.py
+new file mode 100644
+index 0000000..33d2d64
+--- /dev/null
++++ b/atlas_clusters/__init__.py
+@@ -0,0 +1,6 @@
++"""Atlas Administration API v2 cluster reconciler."""
++from .client import AtlasClient
++from .errors import AtlasApiError, ClusterStateError
++from .reconcile import ClusterReconciler
++
++__all__ = ["AtlasClient", "AtlasApiError", "ClusterReconciler", "ClusterStateError"]
+diff --git a/atlas_clusters/client.py b/atlas_clusters/client.py
+new file mode 100644
+index 0000000..e5ec185
+--- /dev/null
++++ b/atlas_clusters/client.py
+@@ -0,0 +1,77 @@
++"""Minimal Atlas Administration API v2 client for the clusters resource.
++
++Wire contract researched from the official MongoDB documentation:
++  - https://www.mongodb.com/docs/api/doc/atlas-admin-api-v2/operation/operation-createcluster
++  - https://www.mongodb.com/docs/api/doc/atlas-admin-api-v2/operation/operation-getcluster
++  - https://www.mongodb.com/docs/atlas/api/versioned-api-overview/
++
++Atlas versions operations independently: the current GET media type for a
++cluster is 2024-08-05 while create/update use 2024-10-23.
++"""
++import json
++import urllib.error
++import urllib.request
++
++from .errors import AtlasApiError
++
++GET_MEDIA = "application/vnd.atlas.2024-08-05+json"
++WRITE_MEDIA = "application/vnd.atlas.2024-10-23+json"
++
++
++class AtlasClient:
++    def __init__(self, base_url, token):
++        if not base_url or not token:
++            raise ValueError("base_url and token are required")
++        self._base = base_url.rstrip("/")
++        self._token = token
++
++    # -- clusters resource -------------------------------------------------
++
++    def get_cluster(self, group_id, name):
++        return self._request("GET", self._cluster_path(group_id, name), accept=GET_MEDIA)
++
++    def create_cluster(self, group_id, spec):
++        return self._request(
++            "POST", f"/api/atlas/v2/groups/{group_id}/clusters",
++            accept=WRITE_MEDIA, body=spec,
++        )
++
++    def update_cluster(self, group_id, name, patch):
++        return self._request(
++            "PATCH", self._cluster_path(group_id, name),
++            accept=WRITE_MEDIA, body=patch,
++        )
++
++    # -- plumbing ----------------------------------------------------------
++
++    @staticmethod
++    def _cluster_path(group_id, name):
++        return f"/api/atlas/v2/groups/{group_id}/clusters/{name}"
++
++    def _request(self, method, path, accept, body=None):
++        data = json.dumps(body).encode() if body is not None else None
++        req = urllib.request.Request(self._base + path, data=data, method=method)
++        req.add_header("Authorization", "Bearer " + self._token)
++        req.add_header("Accept", accept)
++        if data is not None:
++            # Writes carry the dated media type as Content-Type too.
++            req.add_header("Content-Type", accept)
++        try:
++            with urllib.request.urlopen(req) as resp:
++                return json.loads(resp.read().decode() or "null")
++        except urllib.error.HTTPError as exc:
++            raise self._decode_error(exc) from None
++
++    @staticmethod
++    def _decode_error(exc):
++        try:
++            doc = json.loads(exc.read().decode())
++        except (ValueError, OSError):
++            doc = {}
++        return AtlasApiError(
++            status=exc.code,
++            error_code=doc.get("errorCode", ""),
++            detail=doc.get("detail", ""),
++            parameters=doc.get("parameters"),
++            reason=doc.get("reason", ""),
++        )
+diff --git a/atlas_clusters/errors.py b/atlas_clusters/errors.py
+new file mode 100644
+index 0000000..bae13e5
+--- /dev/null
++++ b/atlas_clusters/errors.py
+@@ -0,0 +1,25 @@
++"""Errors for the Atlas cluster reconciler."""
++
++
++class AtlasApiError(Exception):
++    """Documented Atlas Administration API error envelope
++    (application/json: detail, error, errorCode, parameters, reason)."""
++
++    def __init__(self, status, error_code, detail="", parameters=None, reason=""):
++        self.status = status
++        self.error_code = error_code
++        self.detail = detail
++        self.parameters = list(parameters or [])
++        self.reason = reason
++        super().__init__(f"atlas: {status} {reason} ({error_code}): {detail}")
++
++
++class ClusterStateError(Exception):
++    """A watched cluster reached a state the reconcile can never recover
++    from (DELETING, or the cluster vanished mid-poll)."""
++
++    def __init__(self, cluster_name, state_name):
++        self.cluster_name = cluster_name
++        self.state_name = state_name
++        what = state_name if state_name is not None else "gone (404)"
++        super().__init__(f"cluster {cluster_name!r} reached terminal state: {what}")
+diff --git a/atlas_clusters/reconcile.py b/atlas_clusters/reconcile.py
+new file mode 100644
+index 0000000..e610388
+--- /dev/null
++++ b/atlas_clusters/reconcile.py
+@@ -0,0 +1,75 @@
++"""Create-or-update reconciliation with asynchronous state polling.
++
++stateName lifecycle per the official docs: IDLE means every requested
++change has been applied; CREATING/UPDATING/REPAIRING are in-flight;
++DELETING can never converge back to a present cluster, so it is terminal
++for this reconciler.
++"""
++from .errors import AtlasApiError, ClusterStateError
++
++_DONE = "IDLE"
++_TERMINAL = "DELETING"
++
++# The slice of the cluster document this reconciler owns and compares.
++_OWNED_TOP = ("clusterType", "mongoDBMajorVersion")
++_OWNED_REGION = ("providerName", "regionName", "priority")
++_OWNED_HARDWARE = ("instanceSize", "nodeCount", "diskSizeGB")
++
++
++class ClusterReconciler:
++    def __init__(self, client, sleep, poll_interval=2.0):
++        self._client = client
++        self._sleep = sleep
++        self._poll_interval = poll_interval
++
++    def reconcile(self, group_id, desired):
++        name = desired["name"]
++        try:
++            current = self._client.get_cluster(group_id, name)
++        except AtlasApiError as exc:
++            if exc.status != 404:
++                raise
++            created = self._client.create_cluster(group_id, desired)
++            final = self._await_idle(group_id, name, created)
++            return {"action": "created", "final": final}
++
++        if _projection(desired) == _projection(current):
++            return {"action": "unchanged", "final": current}
++
++        patched = self._client.update_cluster(
++            group_id, name, {"replicationSpecs": desired["replicationSpecs"]}
++        )
++        final = self._await_idle(group_id, name, patched)
++        return {"action": "updated", "final": final}
++
++    def _await_idle(self, group_id, name, cluster):
++        while True:
++            state = cluster.get("stateName")
++            if state == _DONE:
++                return cluster
++            if state == _TERMINAL:
++                raise ClusterStateError(name, state)
++            self._sleep(self._poll_interval)
++            try:
++                cluster = self._client.get_cluster(group_id, name)
++            except AtlasApiError as exc:
++                if exc.status == 404:
++                    # Vanished out from under us — terminal.
++                    raise ClusterStateError(name, None) from None
++                raise
++
++
++def _projection(cluster):
++    """The owned fields only — server-added ids/state/links are ignored."""
++    specs = []
++    for spec in cluster.get("replicationSpecs") or []:
++        regions = []
++        for rc in spec.get("regionConfigs") or []:
++            hw = rc.get("electableSpecs") or {}
++            regions.append((
++                tuple((k, rc.get(k)) for k in _OWNED_REGION),
++                tuple((k, hw.get(k)) for k in _OWNED_HARDWARE),
++            ))
++        specs.append((spec.get("zoneName"), tuple(regions)))
++    top = tuple((k, cluster.get(k)) for k in _OWNED_TOP)
++    return top, tuple(specs)

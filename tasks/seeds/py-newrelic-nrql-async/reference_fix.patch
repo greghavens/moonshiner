@@ -1,0 +1,314 @@
+diff --git a/nrql_client/__init__.py b/nrql_client/__init__.py
+new file mode 100644
+index 0000000..116d969
+--- /dev/null
++++ b/nrql_client/__init__.py
+@@ -0,0 +1,24 @@
++"""Stdlib NerdGraph NRQL client with safe parameter rendering and the
++documented asynchronous query workflow."""
++
++from .client import ENDPOINTS, NerdGraphClient, QueryResult
++from .errors import (
++    CancelRejectedError,
++    NerdGraphHttpError,
++    NerdGraphQueryError,
++    QueryDeadlineError,
++    UnsafeParameterError,
++)
++from .params import render_nrql
++
++__all__ = [
++    "ENDPOINTS",
++    "NerdGraphClient",
++    "QueryResult",
++    "render_nrql",
++    "UnsafeParameterError",
++    "NerdGraphHttpError",
++    "NerdGraphQueryError",
++    "QueryDeadlineError",
++    "CancelRejectedError",
++]
+diff --git a/nrql_client/client.py b/nrql_client/client.py
+new file mode 100644
+index 0000000..dfc9dd2
+--- /dev/null
++++ b/nrql_client/client.py
+@@ -0,0 +1,161 @@
++"""NerdGraph NRQL client with the documented asynchronous query workflow."""
++
++import json
++import urllib.error
++import urllib.request
++
++from .errors import (
++    CancelRejectedError,
++    NerdGraphHttpError,
++    NerdGraphQueryError,
++    QueryDeadlineError,
++)
++from .params import render_nrql
++
++ENDPOINTS = {
++    "US": "https://api.newrelic.com/graphql",
++    "EU": "https://api.eu.newrelic.com/graphql",
++}
++
++_PROGRESS_SELECTION = (
++    "results\n"
++    "        metadata { eventTypes facets messages "
++    "timeWindow { begin end compareWith since until } }\n"
++    "        queryProgress { queryId completed retryAfter "
++    "retryDeadline resultExpiration }"
++)
++
++# One reusable submit document; the rendered NRQL travels as a variable.
++# The variable types mirror the official newrelic-client-go declarations.
++SUBMIT_DOCUMENT = """query RunNrql($accountId: Int!, $query: Nrql!, $timeout: Seconds, $async: Boolean) {
++  actor {
++    account(id: $accountId) {
++      nrql(query: $query, timeout: $timeout, async: $async) {
++        %s
++      }
++    }
++  }
++}""" % _PROGRESS_SELECTION
++
++
++class QueryResult:
++    """A completed NRQL query with its metadata preserved untouched."""
++
++    def __init__(self, results, metadata, polls, query_id):
++        self.results = results
++        self.metadata = metadata
++        self.polls = polls
++        self.query_id = query_id
++
++
++def _opaque_token(value, what):
++    if not isinstance(value, str) or not value:
++        raise ValueError("%s must be a non-empty string" % what)
++    if '"' in value or "\\" in value or any(ord(c) < 32 for c in value):
++        raise ValueError("%s contains characters that never appear in one" % what)
++    return value
++
++
++class NerdGraphClient:
++    def __init__(self, endpoint_url, api_key, sleeper, clock):
++        self.endpoint_url = endpoint_url
++        self._api_key = api_key
++        self._sleeper = sleeper
++        self._clock = clock
++
++    # -- transport ---------------------------------------------------------
++
++    def _post(self, query, variables):
++        body = json.dumps({"query": query, "variables": variables}).encode("utf-8")
++        request = urllib.request.Request(
++            self.endpoint_url,
++            data=body,
++            headers={
++                "API-Key": self._api_key,
++                "Content-Type": "application/json",
++            },
++            method="POST",
++        )
++        try:
++            with urllib.request.urlopen(request) as response:
++                text = response.read().decode("utf-8")
++        except urllib.error.HTTPError as exc:
++            raise NerdGraphHttpError(
++                exc.code, exc.read().decode("utf-8", errors="replace")) from None
++        return json.loads(text)
++
++    @staticmethod
++    def _data_or_raise(envelope, *keys):
++        node = envelope.get("data")
++        for key in keys:
++            if not isinstance(node, dict) or node.get(key) is None:
++                raise NerdGraphQueryError(envelope.get("errors") or [])
++            node = node[key]
++        return node
++
++    # -- the async workflow ------------------------------------------------
++
++    def run(self, account_id, template, params=None, timeout=None):
++        nrql = render_nrql(template, params or {})
++        variables = {"accountId": account_id, "query": nrql, "async": True}
++        if timeout is not None:
++            variables["timeout"] = timeout
++        envelope = self._post(SUBMIT_DOCUMENT, variables)
++        node = self._data_or_raise(envelope, "actor", "account", "nrql")
++        if node.get("results") is not None:
++            return QueryResult(node["results"], node.get("metadata"), 0, None)
++
++        progress = node.get("queryProgress") or {}
++        query_id = _opaque_token(progress.get("queryId"), "queryId")
++        poll_document = self._poll_document(account_id, query_id)
++        polls = 0
++        while True:
++            deadline = progress.get("retryDeadline")
++            if deadline is not None and self._clock() >= deadline:
++                self._cancel_quietly(query_id)
++                raise QueryDeadlineError(query_id)
++            self._sleeper(progress.get("retryAfter") or 0)
++            envelope = self._post(poll_document, {})
++            node = self._data_or_raise(
++                envelope, "actor", "account", "nrqlQueryProgress")
++            polls += 1
++            progress = node.get("queryProgress") or {}
++            if node.get("results") is not None:
++                return QueryResult(
++                    node["results"], node.get("metadata"), polls, query_id)
++
++    @staticmethod
++    def _poll_document(account_id, query_id):
++        # The docs say the poll "can be repeated verbatim until results or
++        # an error are returned": one document, reused byte-identically.
++        return (
++            "query {\n"
++            "  actor {\n"
++            "    account(id: %d) {\n"
++            '      nrqlQueryProgress(queryId: "%s") {\n'
++            "        %s\n"
++            "      }\n"
++            "    }\n"
++            "  }\n"
++            "}" % (int(account_id), query_id, _PROGRESS_SELECTION)
++        )
++
++    # -- cancellation ------------------------------------------------------
++
++    def cancel(self, query_id):
++        query_id = _opaque_token(query_id, "queryId")
++        document = (
++            'mutation { nrqlCancelQuery(queryId: "%s") '
++            "{ queryId requestStatus rejectionReason } }" % query_id
++        )
++        envelope = self._post(document, {})
++        node = self._data_or_raise(envelope, "nrqlCancelQuery")
++        if node.get("requestStatus") == "REJECTED":
++            raise CancelRejectedError(node.get("rejectionReason"))
++        return node
++
++    def _cancel_quietly(self, query_id):
++        try:
++            self.cancel(query_id)
++        except (CancelRejectedError, NerdGraphHttpError, NerdGraphQueryError):
++            pass
+diff --git a/nrql_client/errors.py b/nrql_client/errors.py
+new file mode 100644
+index 0000000..fe19813
+--- /dev/null
++++ b/nrql_client/errors.py
+@@ -0,0 +1,47 @@
++"""Typed failures for the NerdGraph NRQL client."""
++
++
++class UnsafeParameterError(ValueError):
++    """A parameter value or template that must never reach the wire."""
++
++
++class NerdGraphHttpError(RuntimeError):
++    """Non-2xx NerdGraph response. Carries status and body, never the key."""
++
++    def __init__(self, status, body):
++        super().__init__("NerdGraph request failed with HTTP %d" % status)
++        self.status = status
++        self.body = body
++
++
++class NerdGraphQueryError(RuntimeError):
++    """A GraphQL response with errors and no usable data."""
++
++    def __init__(self, errors):
++        self.errors = list(errors or [])
++        self.messages = [e.get("message") for e in self.errors]
++        self.error_classes = [
++            e["extensions"]["errorClass"]
++            for e in self.errors
++            if isinstance(e.get("extensions"), dict)
++            and "errorClass" in e["extensions"]
++        ]
++        super().__init__("NerdGraph query failed: %s" % "; ".join(
++            m for m in self.messages if m))
++
++
++class QueryDeadlineError(RuntimeError):
++    """The async query passed its documented retryDeadline."""
++
++    def __init__(self, query_id):
++        super().__init__(
++            "async NRQL query passed its retryDeadline before completing")
++        self.query_id = query_id
++
++
++class CancelRejectedError(RuntimeError):
++    """nrqlCancelQuery answered REJECTED."""
++
++    def __init__(self, rejection_reason):
++        super().__init__("query cancellation rejected: %s" % rejection_reason)
++        self.rejection_reason = rejection_reason
+diff --git a/nrql_client/params.py b/nrql_client/params.py
+new file mode 100644
+index 0000000..6073840
+--- /dev/null
++++ b/nrql_client/params.py
+@@ -0,0 +1,58 @@
++"""Safe NRQL parameter rendering.
++
++NerdGraph has no server-side NRQL parameter binding: the NRQL string is
++assembled client-side, so this renderer is the only path values may take.
++Strings are single-quoted and hostile content (quotes, backslashes,
++control characters) is rejected outright rather than escaped.
++"""
++
++import math
++import re
++
++from .errors import UnsafeParameterError
++
++_PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
++_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
++
++
++def _render_scalar(value):
++    if isinstance(value, bool):
++        return "true" if value else "false"
++    if isinstance(value, str):
++        if "'" in value or "\\" in value or _CONTROL.search(value):
++            raise UnsafeParameterError(
++                "string parameters must not contain quotes, backslashes, "
++                "or control characters")
++        return "'" + value + "'"
++    if isinstance(value, int):
++        return str(value)
++    if isinstance(value, float):
++        if not math.isfinite(value):
++            raise UnsafeParameterError("numeric parameters must be finite")
++        return repr(value)
++    raise UnsafeParameterError(
++        "unsupported parameter type: %s" % type(value).__name__)
++
++
++def _render_value(value):
++    if isinstance(value, (list, tuple)):
++        if not value:
++            raise UnsafeParameterError("list parameters must not be empty")
++        return "(" + ", ".join(_render_scalar(item) for item in value) + ")"
++    return _render_scalar(value)
++
++
++def render_nrql(template, params):
++    """Substitutes {name} placeholders with safely rendered values."""
++    params = dict(params or {})
++    placeholders = _PLACEHOLDER.findall(template)
++    missing = [name for name in placeholders if name not in params]
++    if missing:
++        raise UnsafeParameterError(
++            "placeholders with no parameter: %s" % ", ".join(sorted(set(missing))))
++    unused = [name for name in params if name not in placeholders]
++    if unused:
++        raise UnsafeParameterError(
++            "parameters with no placeholder: %s" % ", ".join(sorted(unused)))
++    rendered = {name: _render_value(params[name]) for name in set(placeholders)}
++    return _PLACEHOLDER.sub(lambda m: rendered[m.group(1)], template)

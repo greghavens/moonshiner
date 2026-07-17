@@ -1,0 +1,395 @@
+diff --git a/client.go b/client.go
+new file mode 100644
+index 0000000..51f95a5
+--- /dev/null
++++ b/client.go
+@@ -0,0 +1,86 @@
++package cgrecon
++
++import (
++	"bytes"
++	"context"
++	"encoding/base64"
++	"encoding/json"
++	"io"
++	"net/http"
++	"strings"
++	"time"
++)
++
++// Client is a thin transport for the ONTAP cluster-management /api endpoint.
++type Client struct {
++	base  string
++	auth  string
++	hc    *http.Client
++	sleep func(time.Duration)
++}
++
++func NewClient(baseURL, username, password string, hc *http.Client, sleep func(time.Duration)) *Client {
++	token := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
++	return &Client{
++		base:  strings.TrimRight(baseURL, "/"),
++		auth:  "Basic " + token,
++		hc:    hc,
++		sleep: sleep,
++	}
++}
++
++// do sends one request; pathAndQuery is used verbatim after the host.
++func (c *Client) do(ctx context.Context, method, pathAndQuery string, body any) (map[string]any, error) {
++	var payload io.Reader
++	if body != nil {
++		data, err := json.Marshal(body)
++		if err != nil {
++			return nil, err
++		}
++		payload = bytes.NewReader(data)
++	}
++	req, err := http.NewRequestWithContext(ctx, method, c.base+pathAndQuery, payload)
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("Authorization", c.auth)
++	req.Header.Set("Accept", "application/hal+json")
++	if body != nil {
++		req.Header.Set("Content-Type", "application/json")
++	}
++	resp, err := c.hc.Do(req)
++	if err != nil {
++		return nil, err
++	}
++	defer resp.Body.Close()
++	data, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return nil, err
++	}
++	var doc map[string]any
++	if len(data) > 0 {
++		if err := json.Unmarshal(data, &doc); err != nil {
++			doc = nil
++		}
++	}
++	if resp.StatusCode >= 400 {
++		return nil, decodeAPIError(resp.StatusCode, doc)
++	}
++	return doc, nil
++}
++
++func decodeAPIError(status int, doc map[string]any) *APIError {
++	apiErr := &APIError{Status: status, Code: "unknown", Message: "no error body"}
++	if errObj, ok := doc["error"].(map[string]any); ok {
++		if code, ok := errObj["code"].(string); ok {
++			apiErr.Code = code
++		}
++		if message, ok := errObj["message"].(string); ok {
++			apiErr.Message = message
++		}
++		if target, ok := errObj["target"].(string); ok {
++			apiErr.Target = target
++		}
++	}
++	return apiErr
++}
+diff --git a/jobs.go b/jobs.go
+new file mode 100644
+index 0000000..49fa4fe
+--- /dev/null
++++ b/jobs.go
+@@ -0,0 +1,51 @@
++package cgrecon
++
++import (
++	"context"
++	"fmt"
++	"time"
++)
++
++// waitJob polls the job on exactly its _links.self.href until a terminal
++// state, pacing with the injected sleep. It returns the number of polls.
++func (c *Client) waitJob(ctx context.Context, job map[string]any, maxPolls int) (int, error) {
++	href := jobHref(job)
++	if href == "" {
++		return 0, fmt.Errorf("asynchronous response carried no job link")
++	}
++	uuid, _ := job["uuid"].(string)
++	polls := 0
++	for polls < maxPolls {
++		if polls > 0 {
++			c.sleep(time.Second)
++		}
++		doc, err := c.do(ctx, "GET", href, nil)
++		if err != nil {
++			return polls, err
++		}
++		polls++
++		switch doc["state"] {
++		case "success":
++			return polls, nil
++		case "failure":
++			jobErr := &JobError{UUID: uuid, Code: "unknown", Message: "job failed"}
++			if errObj, ok := doc["error"].(map[string]any); ok {
++				if code, ok := errObj["code"].(string); ok {
++					jobErr.Code = code
++				}
++				if message, ok := errObj["message"].(string); ok {
++					jobErr.Message = message
++				}
++			}
++			return polls, jobErr
++		}
++	}
++	return polls, fmt.Errorf("poll budget exhausted after %d polls; job %s still not terminal", maxPolls, uuid)
++}
++
++func jobHref(job map[string]any) string {
++	links, _ := job["_links"].(map[string]any)
++	self, _ := links["self"].(map[string]any)
++	href, _ := self["href"].(string)
++	return href
++}
+diff --git a/reconcile.go b/reconcile.go
+new file mode 100644
+index 0000000..59e5a3d
+--- /dev/null
++++ b/reconcile.go
+@@ -0,0 +1,183 @@
++package cgrecon
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net/url"
++)
++
++const (
++	cgCollection = "/api/application/consistency-groups"
++
++	codeIdentifierExists = "53411860" // create race: same identifier already exists
++	codeGroupGone        = "53411842" // consistency group vanished between list and read
++)
++
++// Reconciler converges one consistency group to a Spec.
++type Reconciler struct {
++	Client   *Client
++	MaxPolls int
++}
++
++func (r *Reconciler) Reconcile(ctx context.Context, spec Spec) (*Report, error) {
++	restarts := 0
++	jobPolls := 0
++	for {
++		uuid, err := r.lookup(ctx, spec)
++		if err != nil {
++			return nil, err
++		}
++
++		if uuid == "" {
++			polls, err := r.create(ctx, spec)
++			jobPolls += polls
++			if err != nil {
++				var jobErr *JobError
++				if errors.As(err, &jobErr) && jobErr.Code == codeIdentifierExists {
++					// Another writer created the group; adopt it instead.
++					if restarts >= 1 {
++						return nil, fmt.Errorf("restart budget exhausted reconciling %q: %w", spec.Name, err)
++					}
++					restarts++
++					continue
++				}
++				return nil, err
++			}
++			uuid, err = r.lookup(ctx, spec)
++			if err != nil {
++				return nil, err
++			}
++			final, err := r.readInstance(ctx, uuid)
++			if err != nil {
++				return nil, err
++			}
++			return &Report{UUID: uuid, Created: true, Restarts: restarts, JobPolls: jobPolls, Final: final}, nil
++		}
++
++		current, err := r.readInstance(ctx, uuid)
++		if err != nil {
++			var apiErr *APIError
++			if errors.As(err, &apiErr) && apiErr.Status == 404 && apiErr.Code == codeGroupGone {
++				if restarts >= 1 {
++					return nil, fmt.Errorf("restart budget exhausted reconciling %q: %w", spec.Name, err)
++				}
++				restarts++
++				continue
++			}
++			return nil, err
++		}
++
++		patch := buildPatch(spec, current)
++		if len(patch) == 0 {
++			return &Report{UUID: uuid, NoChange: true, Restarts: restarts, JobPolls: jobPolls, Final: current}, nil
++		}
++
++		doc, err := r.Client.do(ctx, "PATCH", cgCollection+"/"+uuid+"?return_timeout=0", patch)
++		if err != nil {
++			return nil, err
++		}
++		job, _ := doc["job"].(map[string]any)
++		polls, err := r.Client.waitJob(ctx, job, r.MaxPolls)
++		jobPolls += polls
++		if err != nil {
++			return nil, err
++		}
++		final, err := r.readInstance(ctx, uuid)
++		if err != nil {
++			return nil, err
++		}
++		return &Report{UUID: uuid, Updated: true, Restarts: restarts, JobPolls: jobPolls, Final: final}, nil
++	}
++}
++
++// lookup resolves the group's UUID by name and SVM; "" means absent.
++func (r *Reconciler) lookup(ctx context.Context, spec Spec) (string, error) {
++	params := url.Values{}
++	params.Set("name", spec.Name)
++	params.Set("svm.name", spec.SVM)
++	params.Set("fields", "uuid")
++	doc, err := r.Client.do(ctx, "GET", cgCollection+"?"+params.Encode(), nil)
++	if err != nil {
++		return "", err
++	}
++	records, _ := doc["records"].([]any)
++	if len(records) == 0 {
++		return "", nil
++	}
++	record, _ := records[0].(map[string]any)
++	uuid, _ := record["uuid"].(string)
++	return uuid, nil
++}
++
++func (r *Reconciler) readInstance(ctx context.Context, uuid string) (map[string]any, error) {
++	params := url.Values{}
++	params.Set("fields", "**")
++	return r.Client.do(ctx, "GET", cgCollection+"/"+uuid+"?"+params.Encode(), nil)
++}
++
++func (r *Reconciler) create(ctx context.Context, spec Spec) (int, error) {
++	body := map[string]any{
++		"name":    spec.Name,
++		"svm":     map[string]any{"name": spec.SVM},
++		"volumes": volumeAdds(spec.Volumes),
++	}
++	if spec.QoSPolicy != "" {
++		body["qos"] = map[string]any{"policy": map[string]any{"name": spec.QoSPolicy}}
++	}
++	doc, err := r.Client.do(ctx, "POST", cgCollection+"?return_timeout=0", body)
++	if err != nil {
++		return 0, err
++	}
++	job, _ := doc["job"].(map[string]any)
++	return r.Client.waitJob(ctx, job, r.MaxPolls)
++}
++
++// buildPatch diffs only the owned fields: member volumes and the QoS policy.
++// Unknown fields in the current document are never echoed into the patch, and
++// volumes outside the spec are left alone (PATCH cannot remove elements).
++func buildPatch(spec Spec, current map[string]any) map[string]any {
++	present := map[string]bool{}
++	if volumes, ok := current["volumes"].([]any); ok {
++		for _, entry := range volumes {
++			if volume, ok := entry.(map[string]any); ok {
++				if name, ok := volume["name"].(string); ok {
++					present[name] = true
++				}
++			}
++		}
++	}
++	var missing []VolumeSpec
++	for _, volume := range spec.Volumes {
++		if !present[volume.Name] {
++			missing = append(missing, volume)
++		}
++	}
++
++	patch := map[string]any{}
++	if len(missing) > 0 {
++		patch["volumes"] = volumeAdds(missing)
++	}
++	if spec.QoSPolicy != "" && currentQoSPolicy(current) != spec.QoSPolicy {
++		patch["qos"] = map[string]any{"policy": map[string]any{"name": spec.QoSPolicy}}
++	}
++	return patch
++}
++
++func currentQoSPolicy(current map[string]any) string {
++	qos, _ := current["qos"].(map[string]any)
++	policy, _ := qos["policy"].(map[string]any)
++	name, _ := policy["name"].(string)
++	return name
++}
++
++func volumeAdds(volumes []VolumeSpec) []any {
++	out := make([]any, 0, len(volumes))
++	for _, volume := range volumes {
++		out = append(out, map[string]any{
++			"name":                 volume.Name,
++			"provisioning_options": map[string]any{"action": "add"},
++		})
++	}
++	return out
++}
+diff --git a/types.go b/types.go
+new file mode 100644
+index 0000000..4e48cf8
+--- /dev/null
++++ b/types.go
+@@ -0,0 +1,51 @@
++package cgrecon
++
++import "fmt"
++
++// APIError is a non-2xx ONTAP REST response carrying the documented error object.
++type APIError struct {
++	Status  int
++	Code    string
++	Message string
++	Target  string
++}
++
++func (e *APIError) Error() string {
++	return fmt.Sprintf("ontap api error %d (code %s): %s", e.Status, e.Code, e.Message)
++}
++
++// JobError is an asynchronous job that reached the failure state.
++type JobError struct {
++	UUID    string
++	Code    string
++	Message string
++}
++
++func (e *JobError) Error() string {
++	return fmt.Sprintf("ontap job %s failed (code %s): %s", e.UUID, e.Code, e.Message)
++}
++
++// VolumeSpec names a member volume of the consistency group.
++type VolumeSpec struct {
++	Name string
++}
++
++// Spec is the desired state of one consistency group.
++type Spec struct {
++	SVM       string
++	Name      string
++	Volumes   []VolumeSpec
++	QoSPolicy string // empty means the QoS policy is unmanaged
++}
++
++// Report describes how a reconcile converged.
++type Report struct {
++	UUID     string
++	Created  bool
++	Updated  bool
++	NoChange bool
++	Restarts int
++	JobPolls int
++	// Final is the last full instance document, unknown fields preserved.
++	Final map[string]any
++}

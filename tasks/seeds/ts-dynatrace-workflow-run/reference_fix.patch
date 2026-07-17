@@ -1,0 +1,327 @@
+diff --git a/src/auth.ts b/src/auth.ts
+new file mode 100644
+index 0000000..f976188
+--- /dev/null
++++ b/src/auth.ts
+@@ -0,0 +1,61 @@
++export type Clock = () => number;
++
++export interface OAuthOptions {
++  tokenUrl: string;
++  clientId: string;
++  clientSecret: string;
++  scopes: string[];
++  clock: Clock;
++}
++
++// Platform bearer tokens live 300 seconds; refresh this many seconds early
++// so an in-flight request never rides an expiring token.
++const REFRESH_SKEW_SECONDS = 30;
++
++/**
++ * Client-credentials token provider for the Dynatrace SSO
++ * (https://sso.dynatrace.com/sso/oauth2/token in production). Tokens are
++ * cached against the injected clock and re-fetched once inside the skew
++ * window of their expiry.
++ */
++export class OAuthTokenProvider {
++  private readonly opts: OAuthOptions;
++  private cached: { token: string; refreshAt: number } | null = null;
++
++  constructor(opts: OAuthOptions) {
++    this.opts = opts;
++  }
++
++  async getToken(): Promise<string> {
++    const now = this.opts.clock();
++    if (this.cached !== null && now < this.cached.refreshAt) {
++      return this.cached.token;
++    }
++    const form = new URLSearchParams({
++      grant_type: "client_credentials",
++      client_id: this.opts.clientId,
++      client_secret: this.opts.clientSecret,
++      scope: this.opts.scopes.join(" "),
++    });
++    const response = await fetch(this.opts.tokenUrl, {
++      method: "POST",
++      headers: { "content-type": "application/x-www-form-urlencoded" },
++      body: form.toString(),
++    });
++    if (!response.ok) {
++      // Never echo the request body here: it carries the client secret.
++      throw new Error(`token request failed with status ${response.status}`);
++    }
++    const doc = (await response.json()) as { access_token: string; expires_in?: number };
++    const lifetime = doc.expires_in ?? 300;
++    this.cached = {
++      token: doc.access_token,
++      refreshAt: now + (lifetime - REFRESH_SKEW_SECONDS) * 1000,
++    };
++    return doc.access_token;
++  }
++
++  invalidate(): void {
++    this.cached = null;
++  }
++}
+diff --git a/src/client.ts b/src/client.ts
+new file mode 100644
+index 0000000..4e7128d
+--- /dev/null
++++ b/src/client.ts
+@@ -0,0 +1,204 @@
++import { AutomationApiError, ExecutionTimeoutError } from "./errors.ts";
++import type { OAuthTokenProvider } from "./auth.ts";
++
++const AUTOMATION_BASE = "/platform/automation/v1";
++const TERMINAL_STATES = new Set(["CANCELLED", "ERROR", "SUCCESS"]);
++const RESULT_BEARING_STATES = new Set(["SUCCESS", "ERROR"]);
++
++export type Sleeper = (ms: number) => Promise<void>;
++
++export interface RunnerOptions {
++  environmentUrl: string;
++  tokenProvider: OAuthTokenProvider;
++  sleeper: Sleeper;
++}
++
++export interface RunOptions {
++  input?: Record<string, unknown>;
++  params?: Record<string, unknown>;
++  uniqueQualifier?: string;
++}
++
++export interface Execution {
++  id: string;
++  workflow: string;
++  state: string;
++  stateInfo?: string | null;
++  [key: string]: unknown;
++}
++
++export interface RunOutcome {
++  execution: Execution;
++  duplicate: boolean;
++}
++
++export interface TaskResult {
++  name: string;
++  state: string;
++  result: unknown;
++}
++
++export interface ListOptions {
++  workflow?: string;
++  states?: string[];
++  limit: number;
++}
++
++/**
++ * Runner for the Dynatrace AutomationEngine (/platform/automation/v1).
++ * Platform APIs are served from the {env}.apps.dynatrace.com environment
++ * URL; classic {env}.live.dynatrace.com URLs are rejected up front.
++ */
++export class WorkflowRunner {
++  private readonly baseUrl: string;
++  private readonly tokens: OAuthTokenProvider;
++  private readonly sleeper: Sleeper;
++
++  constructor(opts: RunnerOptions) {
++    const host = new URL(opts.environmentUrl).hostname;
++    if (host.endsWith(".live.dynatrace.com")) {
++      throw new Error(
++        `${host} is a classic environment host; platform APIs like the ` +
++        "AutomationEngine are served from https://{environment-id}.apps.dynatrace.com",
++      );
++    }
++    this.baseUrl = opts.environmentUrl.replace(/\/+$/, "");
++    this.tokens = opts.tokenProvider;
++    this.sleeper = opts.sleeper;
++  }
++
++  async runWorkflow(workflowId: string, options: RunOptions = {}): Promise<RunOutcome> {
++    const body: Record<string, unknown> = {};
++    if (options.input !== undefined) body.input = options.input;
++    if (options.params !== undefined) body.params = options.params;
++    if (options.uniqueQualifier !== undefined) body.uniqueQualifier = options.uniqueQualifier;
++    const response = await this.request(
++      "POST",
++      `${AUTOMATION_BASE}/workflows/${encodeURIComponent(workflowId)}/run`,
++      body,
++    );
++    if (response.status === 201 || response.status === 202) {
++      const execution = (await response.json()) as Execution;
++      return { execution, duplicate: response.status === 202 };
++    }
++    throw await toApiError(response);
++  }
++
++  async getExecution(executionId: string): Promise<Execution> {
++    const response = await this.request(
++      "GET",
++      `${AUTOMATION_BASE}/executions/${encodeURIComponent(executionId)}`,
++    );
++    if (!response.ok) throw await toApiError(response);
++    return (await response.json()) as Execution;
++  }
++
++  async waitForExecution(
++    executionId: string,
++    opts: { pollIntervalMs: number; maxPolls: number },
++  ): Promise<Execution> {
++    let lastState = "UNKNOWN";
++    for (let poll = 0; poll < opts.maxPolls; poll++) {
++      const execution = await this.getExecution(executionId);
++      lastState = execution.state;
++      if (TERMINAL_STATES.has(execution.state)) {
++        return execution;
++      }
++      if (poll < opts.maxPolls - 1) {
++        await this.sleeper(opts.pollIntervalMs);
++      }
++    }
++    throw new ExecutionTimeoutError(executionId, lastState, opts.maxPolls);
++  }
++
++  async getTaskExecutions(executionId: string): Promise<Record<string, { state: string }>> {
++    const response = await this.request(
++      "GET",
++      `${AUTOMATION_BASE}/executions/${encodeURIComponent(executionId)}/tasks`,
++    );
++    if (!response.ok) throw await toApiError(response);
++    // The tasks listing is an object keyed by task name, not an array.
++    return (await response.json()) as Record<string, { state: string }>;
++  }
++
++  async collectTaskResults(executionId: string): Promise<TaskResult[]> {
++    const tasks = await this.getTaskExecutions(executionId);
++    const names = Object.keys(tasks)
++      .filter((name) => RESULT_BEARING_STATES.has(tasks[name].state))
++      .sort();
++    const results: TaskResult[] = [];
++    for (const name of names) {
++      const response = await this.request(
++        "GET",
++        `${AUTOMATION_BASE}/executions/${encodeURIComponent(executionId)}` +
++          `/tasks/${encodeURIComponent(name)}/result`,
++      );
++      if (!response.ok) throw await toApiError(response);
++      results.push({ name, state: tasks[name].state, result: await response.json() });
++    }
++    return results;
++  }
++
++  async listExecutions(opts: ListOptions): Promise<Execution[]> {
++    const all: Execution[] = [];
++    let offset = 0;
++    for (;;) {
++      const query = new URLSearchParams();
++      if (opts.workflow !== undefined) query.set("workflow", opts.workflow);
++      if (opts.states !== undefined && opts.states.length > 0) {
++        query.set("state", opts.states.join(","));
++      }
++      query.set("limit", String(opts.limit));
++      query.set("offset", String(offset));
++      const response = await this.request(
++        "GET",
++        `${AUTOMATION_BASE}/executions?${query.toString()}`,
++      );
++      if (!response.ok) throw await toApiError(response);
++      const page = (await response.json()) as { count: number; results: Execution[] };
++      all.push(...page.results);
++      if (page.results.length === 0 || all.length >= page.count) {
++        return all;
++      }
++      offset += page.results.length;
++    }
++  }
++
++  /** One authenticated request with a single refresh-and-retry on 401. */
++  private async request(method: string, pathAndQuery: string, body?: unknown): Promise<Response> {
++    let response = await this.send(method, pathAndQuery, body);
++    if (response.status === 401) {
++      this.tokens.invalidate();
++      response = await this.send(method, pathAndQuery, body);
++      if (response.status === 401) {
++        throw await toApiError(response);
++      }
++    }
++    return response;
++  }
++
++  private async send(method: string, pathAndQuery: string, body?: unknown): Promise<Response> {
++    const token = await this.tokens.getToken();
++    const headers: Record<string, string> = { authorization: `Bearer ${token}` };
++    let payload: string | undefined;
++    if (body !== undefined) {
++      headers["content-type"] = "application/json";
++      payload = JSON.stringify(body);
++    }
++    return fetch(this.baseUrl + pathAndQuery, { method, headers, body: payload });
++  }
++}
++
++async function toApiError(response: Response): Promise<AutomationApiError> {
++  const text = await response.text();
++  let detail: string | null = null;
++  try {
++    const doc = JSON.parse(text) as { detail?: unknown };
++    if (typeof doc.detail === "string") {
++      detail = doc.detail;
++    }
++  } catch {
++    // non-JSON error body: keep the raw text only
++  }
++  return new AutomationApiError(response.status, detail, text);
++}
+diff --git a/src/errors.ts b/src/errors.ts
+new file mode 100644
+index 0000000..383ec7c
+--- /dev/null
++++ b/src/errors.ts
+@@ -0,0 +1,25 @@
++export class AutomationApiError extends Error {
++  readonly status: number;
++  readonly detail: string | null;
++  readonly body: string;
++
++  constructor(status: number, detail: string | null, body: string) {
++    super(`Dynatrace automation API error ${status}${detail ? `: ${detail}` : ""}`);
++    this.name = "AutomationApiError";
++    this.status = status;
++    this.detail = detail;
++    this.body = body;
++  }
++}
++
++export class ExecutionTimeoutError extends Error {
++  readonly executionId: string;
++  readonly lastState: string;
++
++  constructor(executionId: string, lastState: string, polls: number) {
++    super(`execution ${executionId} still ${lastState} after ${polls} polls`);
++    this.name = "ExecutionTimeoutError";
++    this.executionId = executionId;
++    this.lastState = lastState;
++  }
++}
+diff --git a/src/index.ts b/src/index.ts
+new file mode 100644
+index 0000000..bc9e96c
+--- /dev/null
++++ b/src/index.ts
+@@ -0,0 +1,13 @@
++export { OAuthTokenProvider } from "./auth.ts";
++export type { Clock, OAuthOptions } from "./auth.ts";
++export { WorkflowRunner } from "./client.ts";
++export type {
++  Execution,
++  ListOptions,
++  RunOptions,
++  RunOutcome,
++  RunnerOptions,
++  Sleeper,
++  TaskResult,
++} from "./client.ts";
++export { AutomationApiError, ExecutionTimeoutError } from "./errors.ts";

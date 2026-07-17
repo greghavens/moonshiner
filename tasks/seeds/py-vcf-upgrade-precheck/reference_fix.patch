@@ -1,0 +1,257 @@
+diff --git a/vcf_precheck/__init__.py b/vcf_precheck/__init__.py
+new file mode 100644
+index 0000000..d529a1c
+--- /dev/null
++++ b/vcf_precheck/__init__.py
+@@ -0,0 +1,20 @@
++"""Upgrade-precheck client for the SDDC Manager REST API (check-sets surface)."""
++
++from .client import SddcClient
++from .errors import (
++    InventoryNotReadyError,
++    SpecError,
++    TaskTimeoutError,
++    VcfApiError,
++)
++from .precheck import flatten_errors, run_upgrade_precheck
++
++__all__ = [
++    "SddcClient",
++    "VcfApiError",
++    "InventoryNotReadyError",
++    "TaskTimeoutError",
++    "SpecError",
++    "flatten_errors",
++    "run_upgrade_precheck",
++]
+diff --git a/vcf_precheck/client.py b/vcf_precheck/client.py
+new file mode 100644
+index 0000000..b167f9f
+--- /dev/null
++++ b/vcf_precheck/client.py
+@@ -0,0 +1,138 @@
++"""HTTP client for the SDDC Manager check-sets, upgradables and tasks APIs."""
++
++import json
++import time
++import urllib.error
++import urllib.request
++
++from .errors import InventoryNotReadyError, SpecError, TaskTimeoutError, VcfApiError
++
++TERMINAL_STATUSES = frozenset({
++    "SUCCESSFUL", "FAILED", "CANCELLED",
++    "COMPLETED_WITH_WARNING", "SKIPPED", "TIMED_OUT",
++})
++NON_TERMINAL_STATUSES = frozenset({"PENDING", "QUEUED", "IN_PROGRESS"})
++
++# The current Resource model identifies resources by fqdn; the legacy
++# 'address' key from pre-9.x API releases no longer exists.
++ALLOWED_DESCRIPTOR_KEYS = frozenset({
++    "resourceType", "resourceId", "resourceTargetVersion", "fqdn",
++})
++REQUIRED_DESCRIPTOR_KEYS = frozenset({"resourceType", "resourceId"})
++
++
++def _wire_resource(descriptor):
++    unknown = set(descriptor) - ALLOWED_DESCRIPTOR_KEYS
++    if unknown:
++        key = sorted(unknown)[0]
++        raise SpecError(
++            f"unsupported resource field {key!r}: the current SDDC Manager API "
++            "identifies resources by 'fqdn' and no longer accepts legacy "
++            "address fields"
++        )
++    missing = REQUIRED_DESCRIPTOR_KEYS - set(descriptor)
++    if missing:
++        raise SpecError(
++            "resource descriptor requires 'resourceType' and 'resourceId' "
++            f"(missing: {', '.join(sorted(missing))})"
++        )
++    wire = {
++        "resourceType": descriptor["resourceType"],
++        "resourceId": descriptor["resourceId"],
++    }
++    if "resourceTargetVersion" in descriptor:
++        wire["resourceTargetVersion"] = descriptor["resourceTargetVersion"]
++    return wire
++
++
++class SddcClient:
++    """Bearer-authenticated client bound to one SDDC Manager instance."""
++
++    def __init__(self, base_url, access_token, sleep=time.sleep,
++                 poll_interval=2.0, max_polls=60):
++        self.base_url = base_url.rstrip("/")
++        self.access_token = access_token
++        self.sleep = sleep
++        self.poll_interval = poll_interval
++        self.max_polls = max_polls
++
++    # ------------------------------------------------------------ transport
++
++    def _request(self, method, path, body=None):
++        headers = {
++            "Authorization": f"Bearer {self.access_token}",
++            "Accept": "application/json",
++        }
++        data = None
++        if body is not None:
++            data = json.dumps(body).encode("utf-8")
++            headers["Content-Type"] = "application/json"
++        request = urllib.request.Request(
++            self.base_url + path, data=data, headers=headers, method=method)
++        try:
++            with urllib.request.urlopen(request) as response:
++                raw = response.read().decode("utf-8")
++                return response.status, json.loads(raw) if raw else None
++        except urllib.error.HTTPError as exc:
++            raise self._decode_error(exc) from None
++
++    @staticmethod
++    def _decode_error(exc):
++        envelope = {}
++        try:
++            envelope = json.loads(exc.read().decode("utf-8"))
++        except (ValueError, UnicodeDecodeError):
++            pass
++        cls = InventoryNotReadyError if exc.code == 409 else VcfApiError
++        return cls(
++            exc.code,
++            error_code=envelope.get("errorCode"),
++            message=envelope.get("message"),
++            remediation=envelope.get("remediationMessage"),
++            reference_token=envelope.get("referenceToken"),
++            nested=envelope.get("nestedErrors"),
++        )
++
++    # ------------------------------------------------------------ operations
++
++    def list_upgradables(self):
++        _, page = self._request("GET", "/v1/system/upgradables")
++        return page["elements"]
++
++    def query_check_sets(self, domain_id, resources, check_set_type="UPGRADE"):
++        wire = [_wire_resource(descriptor) for descriptor in resources]
++        body = {
++            "checkSetType": check_set_type,
++            "domains": [{"domainId": domain_id, "resources": wire}],
++        }
++        _, result = self._request("POST", "/v1/system/check-sets/queries", body)
++        return result
++
++    def start_precheck(self, query_result, target_version):
++        body = {
++            "queryId": query_result["queryId"],
++            "resources": query_result["resources"],
++            "metadata": {"targetVersion": target_version},
++        }
++        status, task = self._request("POST", "/v1/system/check-sets", body)
++        if status != 202:
++            raise VcfApiError(
++                status,
++                message="expected 202 Accepted when triggering a check-set run")
++        return task
++
++    def wait_for_task(self, task_id):
++        for attempt in range(self.max_polls):
++            if attempt:
++                self.sleep(self.poll_interval)
++            _, task = self._request("GET", f"/v1/tasks/{task_id}")
++            if task["status"] in TERMINAL_STATUSES:
++                return task
++        raise TaskTimeoutError(
++            None,
++            message=(f"task {task_id} did not reach a terminal state "
++                     f"within {self.max_polls} status reads"))
++
++    def get_assessment(self, run_id):
++        _, assessment = self._request("GET", f"/v1/system/check-sets/{run_id}")
++        return assessment
+diff --git a/vcf_precheck/errors.py b/vcf_precheck/errors.py
+new file mode 100644
+index 0000000..26a9945
+--- /dev/null
++++ b/vcf_precheck/errors.py
+@@ -0,0 +1,32 @@
++"""Exception types for the SDDC Manager precheck client."""
++
++
++class VcfApiError(Exception):
++    """A non-2xx (or contract-violating) answer from SDDC Manager."""
++
++    def __init__(self, status_code, error_code=None, message=None,
++                 remediation=None, reference_token=None, nested=None):
++        self.status_code = status_code
++        self.error_code = error_code
++        self.message = message
++        self.remediation = remediation
++        self.reference_token = reference_token
++        self.nested = list(nested) if nested else []
++        text = f"SDDC Manager returned {status_code}"
++        if error_code:
++            text += f" ({error_code})"
++        if message:
++            text += f": {message}"
++        super().__init__(text)
++
++
++class InventoryNotReadyError(VcfApiError):
++    """409: the SDDC Manager inventory cache is not seeded yet."""
++
++
++class TaskTimeoutError(VcfApiError):
++    """The polled task never reached a terminal state within max_polls reads."""
++
++
++class SpecError(ValueError):
++    """A locally-refused resource descriptor; nothing was sent on the wire."""
+diff --git a/vcf_precheck/precheck.py b/vcf_precheck/precheck.py
+new file mode 100644
+index 0000000..ba2b611
+--- /dev/null
++++ b/vcf_precheck/precheck.py
+@@ -0,0 +1,43 @@
++"""End-to-end upgrade precheck flow and error-report flattening."""
++
++
++def flatten_errors(task):
++    """Flatten a task's composite errors depth-first for the ops report.
++
++    Order: each task-level error followed by its nested errors, then every
++    subTask in list order with its errors flattened the same way. Reference
++    tokens and remediation text survive verbatim; absent fields become None.
++    """
++    flat = []
++
++    def walk(error, source):
++        flat.append({
++            "source": source,
++            "errorCode": error.get("errorCode"),
++            "message": error.get("message"),
++            "remediationMessage": error.get("remediationMessage"),
++            "referenceToken": error.get("referenceToken"),
++        })
++        for nested in error.get("nestedErrors") or []:
++            walk(nested, source)
++
++    for error in task.get("errors") or []:
++        walk(error, "task")
++    for sub_task in task.get("subTasks") or []:
++        for error in sub_task.get("errors") or []:
++            walk(error, sub_task.get("name"))
++    return flat
++
++
++def run_upgrade_precheck(client, domain_id, resources, target_version):
++    """Query check-sets, trigger the run, follow the task, fetch the result."""
++    query_result = client.query_check_sets(domain_id, resources)
++    accepted = client.start_precheck(query_result, target_version=target_version)
++    task = client.wait_for_task(accepted["id"])
++    assessment = client.get_assessment(accepted["id"])
++    return {
++        "run_id": accepted["id"],
++        "task": task,
++        "assessment": assessment,
++        "errors": flatten_errors(task),
++    }

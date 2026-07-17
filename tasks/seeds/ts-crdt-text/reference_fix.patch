@@ -1,0 +1,308 @@
+diff --git a/doc.ts b/doc.ts
+new file mode 100644
+index 0000000..6d2bd53
+--- /dev/null
++++ b/doc.ts
+@@ -0,0 +1,79 @@
++// The character store: an anchor tree with tombstones and per-character
++// last-writer-wins visibility. Document order = pre-order walk, children of
++// each anchor sorted by id descending (newest hugs the anchor).
++
++import { compareIds, idKey } from './ids.ts';
++import type { OpId, InsertOp, DeleteOp, RestoreOp } from './ids.ts';
++
++type CharNode = {
++  id: OpId;
++  char: string;
++  visible: boolean;
++  writer: OpId;        // id of the op that last decided visibility
++  children: CharNode[]; // kept sorted descending by id
++};
++
++export type SnapshotEntry = { id: string; char: string; visible: boolean };
++
++export class Doc {
++  nodes = new Map<string, CharNode>();
++  roots: CharNode[] = [];
++
++  has(id: OpId): boolean {
++    return this.nodes.has(idKey(id));
++  }
++
++  addChar(op: InsertOp): void {
++    if (this.nodes.has(idKey(op.id))) return;
++    const node: CharNode = {
++      id: op.id,
++      char: op.char,
++      visible: true,
++      writer: op.id,
++      children: [],
++    };
++    this.nodes.set(idKey(op.id), node);
++    const siblings = op.after === null
++      ? this.roots
++      : (this.nodes.get(idKey(op.after)) as CharNode).children;
++    let i = 0;
++    while (i < siblings.length && compareIds(siblings[i].id, node.id) > 0) i++;
++    siblings.splice(i, 0, node);
++  }
++
++  setVisibility(op: DeleteOp | RestoreOp): void {
++    const node = this.nodes.get(idKey(op.target)) as CharNode;
++    if (compareIds(op.id, node.writer) > 0) {
++      node.visible = op.kind === 'restore';
++      node.writer = op.id;
++    }
++  }
++
++  walk(): CharNode[] {
++    const out: CharNode[] = [];
++    const stack: CharNode[] = [];
++    for (let i = this.roots.length - 1; i >= 0; i--) stack.push(this.roots[i]);
++    while (stack.length > 0) {
++      const node = stack.pop() as CharNode;
++      out.push(node);
++      for (let i = node.children.length - 1; i >= 0; i--) stack.push(node.children[i]);
++    }
++    return out;
++  }
++
++  visibleChars(): CharNode[] {
++    return this.walk().filter((n) => n.visible);
++  }
++
++  text(): string {
++    return this.visibleChars().map((n) => n.char).join('');
++  }
++
++  snapshot(): SnapshotEntry[] {
++    return this.walk().map((n) => ({
++      id: idKey(n.id),
++      char: n.char,
++      visible: n.visible,
++    }));
++  }
++}
+diff --git a/ids.ts b/ids.ts
+new file mode 100644
+index 0000000..fbc0bee
+--- /dev/null
++++ b/ids.ts
+@@ -0,0 +1,17 @@
++// Op identity: (clock, site) pairs, totally ordered. Bigger means later.
++
++export type OpId = { clock: number; site: number };
++
++export type InsertOp = { kind: 'insert'; id: OpId; after: OpId | null; char: string };
++export type DeleteOp = { kind: 'delete'; id: OpId; target: OpId };
++export type RestoreOp = { kind: 'restore'; id: OpId; target: OpId };
++export type Op = InsertOp | DeleteOp | RestoreOp;
++
++export function compareIds(a: OpId, b: OpId): number {
++  if (a.clock !== b.clock) return a.clock - b.clock;
++  return a.site - b.site;
++}
++
++export function idKey(id: OpId): string {
++  return `${id.clock}@${id.site}`;
++}
+diff --git a/oplog.ts b/oplog.ts
+new file mode 100644
+index 0000000..79074ec
+--- /dev/null
++++ b/oplog.ts
+@@ -0,0 +1,50 @@
++// Per-site bookkeeping: which op ids have been seen (applied or buffered),
++// the ops this site generated, and the buffer for ops whose dependencies
++// have not arrived yet.
++
++import { idKey } from './ids.ts';
++import type { Op } from './ids.ts';
++
++export class OpLog {
++  seen = new Set<string>();
++  generated: Op[] = [];
++  buffered: Op[] = [];
++
++  isNew(op: Op): boolean {
++    return !this.seen.has(idKey(op.id));
++  }
++
++  markSeen(op: Op): void {
++    this.seen.add(idKey(op.id));
++  }
++
++  record(op: Op): void {
++    this.generated.push(op);
++  }
++
++  buffer(op: Op): void {
++    this.buffered.push(op);
++  }
++
++  pendingCount(): number {
++    return this.buffered.length;
++  }
++
++  // Repeatedly apply every buffered op whose dependencies are satisfied,
++  // until a full pass makes no progress.
++  drain(ready: (op: Op) => boolean, apply: (op: Op) => void): void {
++    let progress = true;
++    while (progress) {
++      progress = false;
++      for (let i = 0; i < this.buffered.length; i++) {
++        const op = this.buffered[i];
++        if (ready(op)) {
++          this.buffered.splice(i, 1);
++          i--;
++          apply(op);
++          progress = true;
++        }
++      }
++    }
++  }
++}
+diff --git a/site.ts b/site.ts
+new file mode 100644
+index 0000000..c44b9bc
+--- /dev/null
++++ b/site.ts
+@@ -0,0 +1,138 @@
++// A replication site: local editing, an undo stack over local actions, and
++// apply() as the only way ops ever move between sites.
++
++import { Doc } from './doc.ts';
++import { OpLog } from './oplog.ts';
++import type { Op, OpId, InsertOp, DeleteOp, RestoreOp } from './ids.ts';
++import type { SnapshotEntry } from './doc.ts';
++
++export class Site {
++  siteId: number;
++  clock = 0;
++  doc = new Doc();
++  oplog = new OpLog();
++  undoable: Op[][] = []; // one entry per not-yet-undone local action
++
++  constructor(siteId: number) {
++    if (!Number.isInteger(siteId) || siteId < 1) {
++      throw new RangeError('site id must be a positive integer');
++    }
++    this.siteId = siteId;
++  }
++
++  nextId(): OpId {
++    this.clock += 1;
++    return { clock: this.clock, site: this.siteId };
++  }
++
++  insert(index: number, text: string): Op[] {
++    const visible = this.doc.visibleChars();
++    if (!Number.isInteger(index) || index < 0 || index > visible.length) {
++      throw new RangeError('insert index out of range');
++    }
++    const chars = Array.from(text);
++    if (chars.length === 0) return [];
++    let after: OpId | null = index === 0 ? null : visible[index - 1].id;
++    const ops: Op[] = [];
++    for (const char of chars) {
++      const op: InsertOp = { kind: 'insert', id: this.nextId(), after, char };
++      this.emitLocal(op);
++      ops.push(op);
++      after = op.id;
++    }
++    this.undoable.push(ops);
++    return ops;
++  }
++
++  delete(index: number, count: number = 1): Op[] {
++    const visible = this.doc.visibleChars();
++    if (!Number.isInteger(index) || !Number.isInteger(count) || index < 0 ||
++        count < 0 || index + count > visible.length) {
++      throw new RangeError('delete range out of range');
++    }
++    if (count === 0) return [];
++    const targets = visible.slice(index, index + count).map((n) => n.id);
++    const ops: Op[] = [];
++    for (const target of targets) {
++      const op: DeleteOp = { kind: 'delete', id: this.nextId(), target };
++      this.emitLocal(op);
++      ops.push(op);
++    }
++    this.undoable.push(ops);
++    return ops;
++  }
++
++  undo(): Op[] | null {
++    const action = this.undoable.pop();
++    if (action === undefined) return null;
++    const ops: Op[] = [];
++    for (const original of action) {
++      let op: Op;
++      if (original.kind === 'insert') {
++        op = { kind: 'delete', id: this.nextId(), target: original.id };
++      } else {
++        op = {
++          kind: 'restore',
++          id: this.nextId(),
++          target: (original as DeleteOp).target,
++        };
++      }
++      this.emitLocal(op);
++      ops.push(op);
++    }
++    return ops;
++  }
++
++  apply(ops: Op[]): void {
++    for (const op of ops) {
++      if (!this.oplog.isNew(op)) continue;
++      this.oplog.markSeen(op);
++      this.clock = Math.max(this.clock, op.id.clock);
++      if (this.ready(op)) {
++        this.applyOp(op);
++      } else {
++        this.oplog.buffer(op);
++      }
++    }
++    this.oplog.drain((op) => this.ready(op), (op) => this.applyOp(op));
++  }
++
++  pending(): number {
++    return this.oplog.pendingCount();
++  }
++
++  text(): string {
++    return this.doc.text();
++  }
++
++  snapshot(): SnapshotEntry[] {
++    return this.doc.snapshot();
++  }
++
++  log(): Op[] {
++    return this.oplog.generated.slice();
++  }
++
++  // ---- internals ----------------------------------------------------------
++
++  emitLocal(op: Op): void {
++    this.oplog.markSeen(op);
++    this.oplog.record(op);
++    this.applyOp(op);
++  }
++
++  ready(op: Op): boolean {
++    if (op.kind === 'insert') {
++      return op.after === null || this.doc.has(op.after);
++    }
++    return this.doc.has(op.target);
++  }
++
++  applyOp(op: Op): void {
++    if (op.kind === 'insert') {
++      this.doc.addChar(op);
++    } else {
++      this.doc.setVisibility(op as DeleteOp | RestoreOp);
++    }
++  }
++}

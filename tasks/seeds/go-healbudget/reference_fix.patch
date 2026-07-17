@@ -1,0 +1,465 @@
+diff --git a/healbudget.go b/healbudget.go
+new file mode 100644
+index 0000000..3c6419a
+--- /dev/null
++++ b/healbudget.go
+@@ -0,0 +1,459 @@
++// Package healbudget executes linear set/call workflow documents and owns
++// the self-healing retry policy around handler failures: per-task healing
++// metadata, a shared run-wide healing budget, an approval gate, and a
++// deterministic attempt timeline with exponential backoff on an injected
++// clock.
++//
++// There is deliberately no expression engine here — the data-flow layer
++// resolves values before documents reach this module, so every YAML value
++// passes through verbatim. The engine never reads wall-clock time and never
++// really sleeps: the only clock is the injected one (or an internal logical
++// clock with identical semantics).
++package healbudget
++
++import (
++	"errors"
++	"fmt"
++	"time"
++
++	"gopkg.in/yaml.v3"
++)
++
++// Handler executes one call task attempt.
++type Handler func(args map[string]any) (any, error)
++
++// ApprovalRequest is what the approver sees before a healing retry.
++type ApprovalRequest struct {
++	Task    string
++	Attempt int    // attempt number being requested; 2 = first retry
++	Reason  string // last failure's error text
++}
++
++// Approver decides whether a healing retry may proceed.
++type Approver func(ApprovalRequest) bool
++
++// Clock is the run's only notion of time.
++type Clock interface {
++	Now() time.Duration
++	Sleep(time.Duration)
++}
++
++// logicalClock is the default when Options.Clock is nil: pure bookkeeping,
++// no real sleeping.
++type logicalClock struct{ t time.Duration }
++
++func (c *logicalClock) Now() time.Duration    { return c.t }
++func (c *logicalClock) Sleep(d time.Duration) { c.t += d }
++
++// Options injects everything the engine may touch.
++type Options struct {
++	Handlers map[string]Handler
++	Approver Approver
++	Clock    Clock
++}
++
++// LoadError reports document validation problems.
++type LoadError struct{ Msg string }
++
++func (e *LoadError) Error() string { return e.Msg }
++
++func loadErrf(format string, args ...any) *LoadError {
++	return &LoadError{Msg: fmt.Sprintf(format, args...)}
++}
++
++// ErrUnknownHandler is wrapped by the up-front handler registry check.
++var ErrUnknownHandler = errors.New("unknown handler")
++
++// Attempt is one handler invocation in the run's timeline.
++type Attempt struct {
++	Task   string
++	Number int           // 1-based per task
++	At     time.Duration // clock reading when the attempt started
++	OK     bool
++	Detail string // error text for failed attempts, empty for successes
++}
++
++// ErrorInfo describes why a run failed.
++type ErrorInfo struct {
++	Task   string
++	Kind   string // handler | task-budget | shared-budget | approval-denied | no-approver
++	Detail string
++}
++
++// Result is the outcome of a run.
++type Result struct {
++	Status   string // "completed" | "failed"
++	Context  map[string]any
++	Timeline []Attempt
++	Healed   int // shared-budget units consumed
++	Error    *ErrorInfo
++}
++
++// ----------------------------------------------------------------- loading
++
++type healPolicy struct {
++	enabled          bool
++	retryBudget      int
++	approvalRequired bool
++}
++
++type task struct {
++	name string
++	kind string // "set" | "call"
++	set  map[string]any
++	call string
++	args map[string]any
++	heal healPolicy
++}
++
++type sharedConfig struct {
++	budget    int
++	baseDelay time.Duration
++}
++
++type workflow struct {
++	shared *sharedConfig
++	tasks  []task
++}
++
++func asMap(v any) (map[string]any, bool) {
++	m, ok := v.(map[string]any)
++	return m, ok
++}
++
++func nonEmptyString(v any) (string, bool) {
++	s, ok := v.(string)
++	return s, ok && s != ""
++}
++
++func positiveInt(v any) (int, bool) {
++	n, ok := v.(int)
++	return n, ok && n > 0
++}
++
++func checkKeys(m map[string]any, where string, allowed ...string) error {
++	ok := make(map[string]bool, len(allowed))
++	for _, k := range allowed {
++		ok[k] = true
++	}
++	for k := range m {
++		if !ok[k] {
++			return loadErrf("%s: unknown key %q", where, k)
++		}
++	}
++	return nil
++}
++
++func loadShared(v any) (*sharedConfig, error) {
++	block, ok := asMap(v)
++	if !ok {
++		return nil, loadErrf("self_healing must be a map")
++	}
++	if err := checkKeys(block, "self_healing",
++		"budget", "base_delay_seconds"); err != nil {
++		return nil, err
++	}
++	budget, ok := positiveInt(block["budget"])
++	if !ok {
++		return nil, loadErrf("self_healing.budget must be a positive integer")
++	}
++	base := 1
++	if raw, present := block["base_delay_seconds"]; present {
++		base, ok = positiveInt(raw)
++		if !ok {
++			return nil, loadErrf(
++				"self_healing.base_delay_seconds must be a positive integer")
++		}
++	}
++	return &sharedConfig{
++		budget:    budget,
++		baseDelay: time.Duration(base) * time.Second,
++	}, nil
++}
++
++func loadPolicy(name string, kind string, meta map[string]any) (healPolicy, error) {
++	var policy healPolicy
++	raw, present := meta["self_healing"]
++	if !present {
++		return policy, nil
++	}
++	block, ok := asMap(raw)
++	if !ok {
++		return policy, loadErrf("task %q: self_healing must be a map", name)
++	}
++	if err := checkKeys(block, fmt.Sprintf("task %q: self_healing", name),
++		"enabled", "retry_budget", "approval_required"); err != nil {
++		return policy, err
++	}
++	if raw, present := block["enabled"]; present {
++		enabled, ok := raw.(bool)
++		if !ok {
++			return policy, loadErrf("task %q: enabled must be a bool", name)
++		}
++		policy.enabled = enabled
++	}
++	if raw, present := block["approval_required"]; present {
++		required, ok := raw.(bool)
++		if !ok {
++			return policy, loadErrf(
++				"task %q: approval_required must be a bool", name)
++		}
++		policy.approvalRequired = required
++	}
++	if !policy.enabled {
++		return policy, nil
++	}
++	if kind != "call" {
++		return policy, loadErrf(
++			"task %q: self-healing is only valid on call tasks", name)
++	}
++	budget, ok := positiveInt(block["retry_budget"])
++	if !ok {
++		return policy, loadErrf(
++			"task %q: retry_budget must be a positive integer when "+
++				"healing is enabled", name)
++	}
++	policy.retryBudget = budget
++	for _, field := range []string{"description", "expects", "produces"} {
++		if _, ok := nonEmptyString(meta[field]); !ok {
++			return policy, loadErrf(
++				"task %q: healing-enabled tasks need complete metadata — "+
++					"%s is missing", name, field)
++		}
++	}
++	return policy, nil
++}
++
++func loadTask(name string, body any) (task, error) {
++	tk := task{name: name}
++	m, ok := asMap(body)
++	if !ok {
++		return tk, loadErrf("task %q: body must be a map", name)
++	}
++	var kinds []string
++	for _, k := range []string{"set", "call"} {
++		if _, present := m[k]; present {
++			kinds = append(kinds, k)
++		}
++	}
++	if len(kinds) != 1 {
++		return tk, loadErrf(
++			"task %q: needs exactly one of set/call, got %d", name, len(kinds))
++	}
++	tk.kind = kinds[0]
++	allowed := []string{tk.kind, "metadata"}
++	if tk.kind == "call" {
++		allowed = append(allowed, "with")
++	}
++	if err := checkKeys(m, fmt.Sprintf("task %q", name), allowed...); err != nil {
++		return tk, err
++	}
++
++	if tk.kind == "set" {
++		set, ok := asMap(m["set"])
++		if !ok {
++			return tk, loadErrf("task %q: set must be a map", name)
++		}
++		tk.set = set
++	} else {
++		call, ok := nonEmptyString(m["call"])
++		if !ok {
++			return tk, loadErrf("task %q: call must be a non-empty string", name)
++		}
++		tk.call = call
++		tk.args = map[string]any{}
++		if raw, present := m["with"]; present {
++			args, ok := asMap(raw)
++			if !ok {
++				return tk, loadErrf("task %q: with must be a map", name)
++			}
++			tk.args = args
++		}
++	}
++
++	meta := map[string]any{}
++	if raw, present := m["metadata"]; present {
++		meta, ok = asMap(raw)
++		if !ok {
++			return tk, loadErrf("task %q: metadata must be a map", name)
++		}
++		if err := checkKeys(meta, fmt.Sprintf("task %q: metadata", name),
++			"description", "expects", "produces", "self_healing"); err != nil {
++			return tk, err
++		}
++		for _, field := range []string{"description", "expects", "produces"} {
++			if raw, present := meta[field]; present {
++				if _, ok := nonEmptyString(raw); !ok {
++					return tk, loadErrf(
++						"task %q: metadata.%s must be a non-empty string",
++						name, field)
++				}
++			}
++		}
++	}
++	policy, err := loadPolicy(name, tk.kind, meta)
++	if err != nil {
++		return tk, err
++	}
++	tk.heal = policy
++	return tk, nil
++}
++
++func load(source string) (*workflow, error) {
++	var doc map[string]any
++	if err := yaml.Unmarshal([]byte(source), &doc); err != nil {
++		return nil, loadErrf("invalid YAML: %v", err)
++	}
++	if err := checkKeys(doc, "workflow",
++		"document", "self_healing", "do"); err != nil {
++		return nil, err
++	}
++	header, ok := asMap(doc["document"])
++	if !ok {
++		return nil, loadErrf("missing document header")
++	}
++	if err := checkKeys(header, "document",
++		"dsl", "namespace", "name"); err != nil {
++		return nil, err
++	}
++	if dsl, _ := header["dsl"].(string); dsl != "1.0" {
++		return nil, loadErrf("unsupported dsl version %v", header["dsl"])
++	}
++	for _, field := range []string{"namespace", "name"} {
++		if _, ok := nonEmptyString(header[field]); !ok {
++			return nil, loadErrf(
++				"document.%s must be a non-empty string", field)
++		}
++	}
++
++	wf := &workflow{}
++	if raw, present := doc["self_healing"]; present {
++		shared, err := loadShared(raw)
++		if err != nil {
++			return nil, err
++		}
++		wf.shared = shared
++	}
++
++	list, ok := doc["do"].([]any)
++	if !ok || len(list) == 0 {
++		return nil, loadErrf("do must be a non-empty list")
++	}
++	seen := map[string]bool{}
++	for _, entry := range list {
++		m, ok := asMap(entry)
++		if !ok || len(m) != 1 {
++			return nil, loadErrf("each do entry must be a single-key map")
++		}
++		for name, body := range m {
++			if seen[name] {
++				return nil, loadErrf("duplicate task name %q", name)
++			}
++			seen[name] = true
++			tk, err := loadTask(name, body)
++			if err != nil {
++				return nil, err
++			}
++			if tk.heal.enabled && wf.shared == nil {
++				return nil, loadErrf(
++					"task %q enables self-healing but the workflow declares "+
++						"no shared self_healing budget", name)
++			}
++			wf.tasks = append(wf.tasks, tk)
++		}
++	}
++	return wf, nil
++}
++
++// --------------------------------------------------------------- execution
++
++// Run loads and executes a workflow document. The returned error covers
++// load/config problems only; runtime failures come back inside Result.
++func Run(source string, opts Options) (*Result, error) {
++	wf, err := load(source)
++	if err != nil {
++		return nil, err
++	}
++	// Every handler name is checked before ANY handler runs.
++	for _, tk := range wf.tasks {
++		if tk.kind == "call" {
++			if _, ok := opts.Handlers[tk.call]; !ok {
++				return nil, fmt.Errorf(
++					"task %q: %w %q", tk.name, ErrUnknownHandler, tk.call)
++			}
++		}
++	}
++
++	clock := opts.Clock
++	if clock == nil {
++		clock = &logicalClock{}
++	}
++	res := &Result{Status: "completed", Context: map[string]any{}}
++
++	fail := func(tk task, kind, detail string) *Result {
++		res.Status = "failed"
++		res.Error = &ErrorInfo{Task: tk.name, Kind: kind, Detail: detail}
++		return res
++	}
++
++	for _, tk := range wf.tasks {
++		if tk.kind == "set" {
++			res.Context[tk.name] = tk.set
++			continue
++		}
++		handler := opts.Handlers[tk.call]
++		retries := 0 // this task's own healing retries so far
++		for {
++			value, err := handler(tk.args)
++			attempt := Attempt{
++				Task:   tk.name,
++				Number: retries + 1,
++				At:     clock.Now(),
++				OK:     err == nil,
++			}
++			if err != nil {
++				attempt.Detail = err.Error()
++			}
++			res.Timeline = append(res.Timeline, attempt)
++			if err == nil {
++				res.Context[tk.name] = value
++				break
++			}
++
++			// The handler failed — apply the healing policy, in order.
++			if !tk.heal.enabled {
++				return fail(tk, "handler", err.Error()), nil
++			}
++			next := retries + 1 // the retry being requested, 1-based
++			if next > tk.heal.retryBudget {
++				return fail(tk, "task-budget", fmt.Sprintf(
++					"retry budget %d exhausted: %v",
++					tk.heal.retryBudget, err)), nil
++			}
++			if res.Healed >= wf.shared.budget {
++				return fail(tk, "shared-budget", fmt.Sprintf(
++					"shared healing budget %d exhausted: %v",
++					wf.shared.budget, err)), nil
++			}
++			if tk.heal.approvalRequired {
++				if opts.Approver == nil {
++					return fail(tk, "no-approver",
++						"approval required but no approver configured"), nil
++				}
++				granted := opts.Approver(ApprovalRequest{
++					Task:    tk.name,
++					Attempt: next + 1,
++					Reason:  err.Error(),
++				})
++				if !granted {
++					return fail(tk, "approval-denied", fmt.Sprintf(
++						"approver declined attempt %d: %v", next+1, err)), nil
++				}
++			}
++			clock.Sleep(wf.shared.baseDelay << (next - 1))
++			res.Healed++
++			retries = next
++		}
++	}
++	return res, nil
++}

@@ -1,0 +1,245 @@
+diff --git a/cli.py b/cli.py
+new file mode 100644
+index 0000000..98002a4
+--- /dev/null
++++ b/cli.py
+@@ -0,0 +1,78 @@
++"""Garage kiosk CLI. Usage: python3 cli.py --db PATH <command> ..."""
++import argparse
++import sys
++
++import garage
++import pricing
++import store
++
++
++def build_parser():
++    parser = argparse.ArgumentParser(prog="cli.py")
++    parser.add_argument("--db", required=True)
++    sub = parser.add_subparsers(dest="command", required=True)
++
++    p = sub.add_parser("init")
++    p.add_argument("--compact", type=int, required=True)
++    p.add_argument("--standard", type=int, required=True)
++    p.add_argument("--oversize", type=int, required=True)
++
++    p = sub.add_parser("enter")
++    p.add_argument("plate")
++    p.add_argument("--size", required=True)
++    p.add_argument("--time", required=True)
++
++    p = sub.add_parser("exit")
++    p.add_argument("plate")
++    p.add_argument("--time", required=True)
++
++    p = sub.add_parser("find")
++    p.add_argument("plate")
++
++    sub.add_parser("report")
++    return parser
++
++
++def load_db(path):
++    if not store.exists(path):
++        raise garage.GarageError(f"no garage db at {path}; run init first")
++    return store.load(path)
++
++
++def run(args):
++    if args.command == "init":
++        if store.exists(args.db):
++            raise garage.GarageError(
++                f"db {args.db} already exists; refusing to re-init over live tickets")
++        state = garage.new_state(args.compact, args.standard, args.oversize)
++        store.save(args.db, state)
++        return
++
++    state = load_db(args.db)
++    if args.command == "enter":
++        spot = garage.enter(state, args.plate, args.size, args.time)
++        store.save(args.db, state)
++        print(f"spot {spot}")
++    elif args.command == "exit":
++        fee = garage.exit_(state, args.plate, args.time)
++        store.save(args.db, state)
++        print(f"fee {pricing.format_dollars(fee)}")
++    elif args.command == "find":
++        ticket = garage.find(state, args.plate)
++        print(f"spot={ticket['spot']}\tsince={ticket['since']}")
++    elif args.command == "report":
++        print("\n".join(garage.report_lines(state)))
++
++
++def main(argv=None):
++    args = build_parser().parse_args(argv)
++    try:
++        run(args)
++    except (garage.GarageError, ValueError) as exc:
++        print(f"error: {exc}", file=sys.stderr)
++        return 1
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/garage.py b/garage.py
+new file mode 100644
+index 0000000..44af368
+--- /dev/null
++++ b/garage.py
+@@ -0,0 +1,76 @@
++"""Spot inventory and ticket logic. Operates on the plain-dict db state."""
++import pricing
++
++CLASS_ORDER = ["compact", "standard", "oversize"]
++CLASS_LETTER = {"compact": "C", "standard": "S", "oversize": "O"}
++
++
++class GarageError(Exception):
++    """A rule violation the CLI reports as a nonzero exit."""
++
++
++def new_state(compact, standard, oversize):
++    counts = {"compact": compact, "standard": standard, "oversize": oversize}
++    if any(n < 0 for n in counts.values()):
++        raise GarageError("spot counts cannot be negative")
++    if not any(counts.values()):
++        raise GarageError("a garage needs at least one spot")
++    spots = {}
++    for cls in CLASS_ORDER:
++        for i in range(1, counts[cls] + 1):
++            spots[f"{CLASS_LETTER[cls]}{i:02d}"] = cls
++    return {"spots": spots, "tickets": {}, "revenue_cents": 0}
++
++
++def _free_spot(state, cls):
++    """Lowest-numbered free spot of class cls, or None."""
++    taken = {t["spot"] for t in state["tickets"].values()}
++    candidates = [sid for sid, c in state["spots"].items()
++                  if c == cls and sid not in taken]
++    return min(candidates, key=lambda sid: int(sid[1:])) if candidates else None
++
++
++def enter(state, plate, size, time):
++    if size not in CLASS_ORDER:
++        raise GarageError(f"unknown size class: {size!r}")
++    pricing.parse_time(time)  # validate before mutating anything
++    if plate in state["tickets"]:
++        raise GarageError(f"plate {plate} is already inside")
++    for cls in CLASS_ORDER[CLASS_ORDER.index(size):]:
++        spot = _free_spot(state, cls)
++        if spot is not None:
++            state["tickets"][plate] = {"spot": spot, "size": size, "since": time}
++            return spot
++    raise GarageError(f"no spot available for a {size} vehicle")
++
++
++def exit_(state, plate, time):
++    ticket = state["tickets"].get(plate)
++    if ticket is None:
++        raise GarageError(f"plate {plate} is not in the garage")
++    try:
++        fee = pricing.fee_cents(ticket["since"], time, ticket["size"])
++    except ValueError as exc:
++        raise GarageError(str(exc)) from exc
++    del state["tickets"][plate]
++    state["revenue_cents"] += fee
++    return fee
++
++
++def find(state, plate):
++    ticket = state["tickets"].get(plate)
++    if ticket is None:
++        raise GarageError(f"plate {plate} is not in the garage")
++    return ticket
++
++
++def report_lines(state):
++    used = {cls: 0 for cls in CLASS_ORDER}
++    total = {cls: 0 for cls in CLASS_ORDER}
++    for cls in state["spots"].values():
++        total[cls] += 1
++    for ticket in state["tickets"].values():
++        used[state["spots"][ticket["spot"]]] += 1
++    lines = [f"{cls}\tused={used[cls]}/{total[cls]}" for cls in CLASS_ORDER]
++    lines.append(f"revenue={pricing.format_dollars(state['revenue_cents'])}")
++    return lines
+diff --git a/pricing.py b/pricing.py
+new file mode 100644
+index 0000000..284bcf5
+--- /dev/null
++++ b/pricing.py
+@@ -0,0 +1,46 @@
++"""Fee math for the garage. Pure functions, integer cents, no file IO."""
++from datetime import datetime
++
++TIME_FMT = "%Y-%m-%dT%H:%M"
++GRACE_MINUTES = 15
++MINUTES_PER_DAY = 24 * 60
++
++HOURLY_CENTS = {"compact": 200, "standard": 300, "oversize": 500}
++DAILY_MAX_CENTS = {"compact": 1200, "standard": 1800, "oversize": 3000}
++
++SIZES = tuple(HOURLY_CENTS)
++
++
++def parse_time(text):
++    """Parse a kiosk timestamp; raises ValueError on anything malformed."""
++    return datetime.strptime(text, TIME_FMT)
++
++
++def fee_cents(entry, exit_, size):
++    """Fee in integer cents for a stay from entry to exit_ (YYYY-MM-DDTHH:MM).
++
++    Raises ValueError for unknown sizes, malformed times, or exit before entry.
++    """
++    if size not in HOURLY_CENTS:
++        raise ValueError(f"unknown size class: {size!r}")
++    start = parse_time(entry)
++    end = parse_time(exit_)
++    if end < start:
++        raise ValueError("exit time is before entry time")
++
++    minutes = int((end - start).total_seconds()) // 60
++    if minutes <= GRACE_MINUTES:
++        return 0
++
++    rate = HOURLY_CENTS[size]
++    daily_max = DAILY_MAX_CENTS[size]
++    full_days, remainder = divmod(minutes, MINUTES_PER_DAY)
++    total = full_days * daily_max
++    if remainder:
++        hours = -(-remainder // 60)  # ceil division: fractions bill a full hour
++        total += min(daily_max, hours * rate)
++    return total
++
++
++def format_dollars(cents):
++    return f"${cents // 100}.{cents % 100:02d}"
+diff --git a/store.py b/store.py
+new file mode 100644
+index 0000000..ed6c24f
+--- /dev/null
++++ b/store.py
+@@ -0,0 +1,21 @@
++"""JSON persistence for the garage db. store owns the on-disk format."""
++import json
++import os
++
++
++def exists(path):
++    return os.path.exists(path)
++
++
++def load(path):
++    """Load the db. Raises FileNotFoundError if it doesn't exist."""
++    with open(path, encoding="utf-8") as fh:
++        return json.load(fh)
++
++
++def save(path, state):
++    tmp = path + ".tmp"
++    with open(tmp, "w", encoding="utf-8") as fh:
++        json.dump(state, fh, indent=2, sort_keys=True)
++        fh.write("\n")
++    os.replace(tmp, path)

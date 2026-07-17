@@ -1,0 +1,413 @@
+diff --git a/app.ts b/app.ts
+new file mode 100644
+index 0000000..bc1f9ac
+--- /dev/null
++++ b/app.ts
+@@ -0,0 +1,185 @@
++// HTTP layer for the bookmarks service. Routing, body intake, status
++// mapping, and — because this sits behind a keep-alive-heavy proxy —
++// explicit connection discipline on every error path.
++
++import * as http from 'node:http';
++import { BookmarkStore, ValidationError, DuplicateUrlError } from './store.ts';
++import { readBody, PayloadTooLarge } from './body.ts';
++
++export interface AppOptions {
++  store?: BookmarkStore;
++  maxBodyBytes?: number;
++}
++
++const DEFAULT_MAX_BODY_BYTES = 65536;
++
++const COLLECTION = /^\/bookmarks$/;
++const MEMBER = /^\/bookmarks\/([^/]+)$/;
++
++interface Ctx {
++  store: BookmarkStore;
++  limit: number;
++}
++
++function sendJson(
++  res: http.ServerResponse,
++  status: number,
++  payload: unknown,
++  extraHeaders: Record<string, string> = {},
++): void {
++  const body = Buffer.from(JSON.stringify(payload));
++  res.writeHead(status, {
++    'content-type': 'application/json',
++    'content-length': body.length,
++    ...extraHeaders,
++  });
++  res.end(body);
++}
++
++function sendEmpty(res: http.ServerResponse, status: number): void {
++  res.writeHead(status);
++  res.end();
++}
++
++/**
++ * Read and parse a JSON object body. Returns undefined when a response has
++ * already been written (the caller just returns). Connection rules:
++ * - declared or streamed body over the cap → 413 + Connection: close;
++ * - anything found wrong AFTER a full in-cap read (415 with the body
++ *   drained, bad JSON, non-object) answers normally and keeps the socket.
++ */
++async function readJsonObject(
++  req: http.IncomingMessage,
++  res: http.ServerResponse,
++  limit: number,
++): Promise<Record<string, unknown> | undefined> {
++  let raw: Buffer;
++  try {
++    raw = await readBody(req, limit);
++  } catch (err) {
++    if (err instanceof PayloadTooLarge) {
++      sendJson(res, 413, { error: 'payload_too_large', limit }, { connection: 'close' });
++      return undefined;
++    }
++    throw err;
++  }
++  const contentType = req.headers['content-type'];
++  const mediaType = typeof contentType === 'string' ? contentType.split(';')[0].trim().toLowerCase() : '';
++  if (mediaType !== 'application/json') {
++    sendJson(res, 415, { error: 'unsupported_media_type' });
++    return undefined;
++  }
++  let parsed: unknown;
++  try {
++    parsed = JSON.parse(raw.toString('utf8'));
++  } catch {
++    sendJson(res, 400, { error: 'invalid_json' });
++    return undefined;
++  }
++  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
++    sendJson(res, 400, { error: 'invalid_body' });
++    return undefined;
++  }
++  return parsed as Record<string, unknown>;
++}
++
++function sendStoreError(res: http.ServerResponse, err: unknown): void {
++  if (err instanceof ValidationError) {
++    sendJson(res, 400, { error: 'validation', fields: err.fields });
++    return;
++  }
++  if (err instanceof DuplicateUrlError) {
++    sendJson(res, 409, { error: 'duplicate_url', url: err.url });
++    return;
++  }
++  throw err;
++}
++
++async function handleList(ctx: Ctx, url: URL, res: http.ServerResponse): Promise<void> {
++  const tag = url.searchParams.get('tag');
++  const items = ctx.store.list(tag !== null && tag !== '' ? { tag } : {});
++  sendJson(res, 200, { items, count: items.length });
++}
++
++async function handleCreate(ctx: Ctx, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
++  const body = await readJsonObject(req, res, ctx.limit);
++  if (!body) return;
++  try {
++    const record = ctx.store.create(body);
++    sendJson(res, 201, record, { location: `/bookmarks/${record.id}` });
++  } catch (err) {
++    sendStoreError(res, err);
++  }
++}
++
++async function handleGet(ctx: Ctx, id: string, res: http.ServerResponse): Promise<void> {
++  const record = ctx.store.get(id);
++  if (!record) {
++    sendJson(res, 404, { error: 'not_found' });
++    return;
++  }
++  sendJson(res, 200, record);
++}
++
++async function handlePatch(ctx: Ctx, id: string, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
++  const body = await readJsonObject(req, res, ctx.limit);
++  if (!body) return;
++  try {
++    const updated = ctx.store.update(id, body); // checks existence before validating
++    if (!updated) {
++      sendJson(res, 404, { error: 'not_found' });
++      return;
++    }
++    sendJson(res, 200, updated);
++  } catch (err) {
++    sendStoreError(res, err);
++  }
++}
++
++async function handleDelete(ctx: Ctx, id: string, res: http.ServerResponse): Promise<void> {
++  if (!ctx.store.remove(id)) {
++    sendJson(res, 404, { error: 'not_found' });
++    return;
++  }
++  sendEmpty(res, 204);
++}
++
++async function dispatch(ctx: Ctx, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
++  const url = new URL(req.url ?? '/', 'http://bookmarks.local');
++  const path = url.pathname;
++
++  if (COLLECTION.test(path)) {
++    if (req.method === 'GET') return handleList(ctx, url, res);
++    if (req.method === 'POST') return handleCreate(ctx, req, res);
++    sendJson(res, 405, { error: 'method_not_allowed' }, { allow: 'GET, POST' });
++    return;
++  }
++
++  const member = MEMBER.exec(path);
++  if (member) {
++    const id = member[1];
++    if (req.method === 'GET') return handleGet(ctx, id, res);
++    if (req.method === 'PATCH') return handlePatch(ctx, id, req, res);
++    if (req.method === 'DELETE') return handleDelete(ctx, id, res);
++    sendJson(res, 405, { error: 'method_not_allowed' }, { allow: 'GET, PATCH, DELETE' });
++    return;
++  }
++
++  sendJson(res, 404, { error: 'not_found' });
++}
++
++export function createApp(options: AppOptions = {}): http.Server {
++  const ctx: Ctx = {
++    store: options.store ?? new BookmarkStore(),
++    limit: options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES,
++  };
++  return http.createServer((req, res) => {
++    dispatch(ctx, req, res).catch(() => {
++      if (res.headersSent) {
++        res.destroy();
++        return;
++      }
++      sendJson(res, 500, { error: 'internal' }, { connection: 'close' });
++    });
++  });
++}
+diff --git a/body.ts b/body.ts
+new file mode 100644
+index 0000000..9b3a223
+--- /dev/null
++++ b/body.ts
+@@ -0,0 +1,53 @@
++// Request-body intake with a hard byte cap. The cap is enforced twice:
++// against a declared Content-Length before reading anything, and against
++// the running total while the stream flows (chunked bodies).
++
++import type { IncomingMessage } from 'node:http';
++
++export class PayloadTooLarge extends Error {
++  limit: number;
++  constructor(limit: number) {
++    super(`request body exceeds the ${limit}-byte cap`);
++    this.name = 'PayloadTooLarge';
++    this.limit = limit;
++  }
++}
++
++export function readBody(req: IncomingMessage, limit: number): Promise<Buffer> {
++  return new Promise((resolve, reject) => {
++    const declared = Number(req.headers['content-length']);
++    if (Number.isFinite(declared) && declared > limit) {
++      // Refuse up front: never wait for a body we already know is too big.
++      reject(new PayloadTooLarge(limit));
++      return;
++    }
++    const chunks: Buffer[] = [];
++    let total = 0;
++    const onData = (chunk: Buffer): void => {
++      total += chunk.length;
++      if (total > limit) {
++        cleanup();
++        req.pause();
++        reject(new PayloadTooLarge(limit));
++        return;
++      }
++      chunks.push(chunk);
++    };
++    const onEnd = (): void => {
++      cleanup();
++      resolve(Buffer.concat(chunks));
++    };
++    const onError = (err: Error): void => {
++      cleanup();
++      reject(err);
++    };
++    function cleanup(): void {
++      req.off('data', onData);
++      req.off('end', onEnd);
++      req.off('error', onError);
++    }
++    req.on('data', onData);
++    req.on('end', onEnd);
++    req.on('error', onError);
++  });
++}
+diff --git a/store.ts b/store.ts
+new file mode 100644
+index 0000000..acf1eba
+--- /dev/null
++++ b/store.ts
+@@ -0,0 +1,157 @@
++// In-memory bookmark store: validation, duplicate-url policy, and defensive
++// copies on every lookup. No HTTP concerns in this module.
++
++export interface Bookmark {
++  id: string;
++  url: string;
++  title: string;
++  tags: string[];
++}
++
++export class ValidationError extends Error {
++  fields: Record<string, string>;
++  constructor(fields: Record<string, string>) {
++    super(`invalid bookmark: ${Object.keys(fields).sort().join(', ')}`);
++    this.name = 'ValidationError';
++    this.fields = fields;
++  }
++}
++
++export class DuplicateUrlError extends Error {
++  url: string;
++  constructor(url: string) {
++    super(`a bookmark for ${url} already exists`);
++    this.name = 'DuplicateUrlError';
++    this.url = url;
++  }
++}
++
++const KNOWN_FIELDS = new Set(['url', 'title', 'tags']);
++
++function isHttpUrl(value: string): boolean {
++  let parsed: URL;
++  try {
++    parsed = new URL(value);
++  } catch {
++    return false;
++  }
++  return parsed.protocol === 'http:' || parsed.protocol === 'https:';
++}
++
++function normalizeTag(tag: string): string {
++  return tag.trim().toLowerCase();
++}
++
++interface Cleaned {
++  url?: string;
++  title?: string;
++  tags?: string[];
++}
++
++/** Validate an input object, collecting EVERY problem before throwing. */
++function validate(input: Record<string, unknown>, partial: boolean): Cleaned {
++  const fields: Record<string, string> = {};
++  const cleaned: Cleaned = {};
++
++  for (const key of Object.keys(input)) {
++    if (!KNOWN_FIELDS.has(key)) fields[key] = 'unknown field';
++  }
++
++  const url = input.url;
++  if (url === undefined) {
++    if (!partial) fields.url = 'url is required';
++  } else if (typeof url !== 'string' || !isHttpUrl(url.trim())) {
++    fields.url = 'url must be an absolute http(s) url';
++  } else {
++    cleaned.url = url.trim();
++  }
++
++  const title = input.title;
++  if (title === undefined) {
++    if (!partial) fields.title = 'title is required';
++  } else if (typeof title !== 'string' || title.trim() === '') {
++    fields.title = 'title must be a non-blank string';
++  } else {
++    cleaned.title = title.trim();
++  }
++
++  const tags = input.tags;
++  if (tags !== undefined) {
++    if (!Array.isArray(tags) || tags.some((t) => typeof t !== 'string' || t.trim() === '')) {
++      fields.tags = 'tags must be an array of non-blank strings';
++    } else {
++      const seen = new Set<string>();
++      const normalized: string[] = [];
++      for (const tag of tags as string[]) {
++        const norm = normalizeTag(tag);
++        if (!seen.has(norm)) {
++          seen.add(norm);
++          normalized.push(norm);
++        }
++      }
++      cleaned.tags = normalized;
++    }
++  }
++
++  if (Object.keys(fields).length > 0) throw new ValidationError(fields);
++  return cleaned;
++}
++
++function copyOf(record: Bookmark): Bookmark {
++  return { id: record.id, url: record.url, title: record.title, tags: [...record.tags] };
++}
++
++export class BookmarkStore {
++  private records = new Map<string, Bookmark>();
++  private nextId = 1;
++
++  create(input: object): Bookmark {
++    const cleaned = validate(input as Record<string, unknown>, false);
++    this.assertUrlFree(cleaned.url as string, null);
++    const record: Bookmark = {
++      id: `bm-${this.nextId++}`,
++      url: cleaned.url as string,
++      title: cleaned.title as string,
++      tags: cleaned.tags ?? [],
++    };
++    this.records.set(record.id, record);
++    return copyOf(record);
++  }
++
++  get(id: string): Bookmark | undefined {
++    const record = this.records.get(id);
++    return record ? copyOf(record) : undefined;
++  }
++
++  list(filter: { tag?: string } = {}): Bookmark[] {
++    let records = [...this.records.values()];
++    if (filter.tag !== undefined) {
++      const tag = normalizeTag(filter.tag);
++      records = records.filter((r) => r.tags.includes(tag));
++    }
++    return records.map(copyOf);
++  }
++
++  /** Patch only the provided fields. Missing id → undefined, no validation. */
++  update(id: string, patch: object): Bookmark | undefined {
++    const existing = this.records.get(id);
++    if (!existing) return undefined;
++    const cleaned = validate(patch as Record<string, unknown>, true);
++    if (cleaned.url !== undefined) this.assertUrlFree(cleaned.url, id);
++    const next: Bookmark = { ...existing, ...cleaned, tags: cleaned.tags ?? existing.tags };
++    this.records.set(id, next);
++    return copyOf(next);
++  }
++
++  remove(id: string): boolean {
++    return this.records.delete(id);
++  }
++
++  private assertUrlFree(url: string, selfId: string | null): void {
++    for (const record of this.records.values()) {
++      if (record.url === url && record.id !== selfId) {
++        throw new DuplicateUrlError(url);
++      }
++    }
++  }
++}

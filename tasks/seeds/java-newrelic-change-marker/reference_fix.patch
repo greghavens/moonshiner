@@ -1,0 +1,385 @@
+diff --git a/ChangeMarker.java b/ChangeMarker.java
+new file mode 100644
+index 0000000..ca5be91
+--- /dev/null
++++ b/ChangeMarker.java
+@@ -0,0 +1,119 @@
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++/**
++ * One deployment change marker to record. The changeId is OUR stable change
++ * identifier from the pipeline (New Relic always generates its own
++ * changeTrackingId); it rides along as customAttributes.change_id so a
++ * duplicate produced by an ambiguous retry is exactly identifiable.
++ */
++public final class ChangeMarker {
++
++    private final String entityGuid;
++    private final String version;
++    private final String changeId;
++    private final Map<String, Object> customAttributes = new LinkedHashMap<>();
++    private String commit;
++    private String changelog;
++    private String deepLink;
++    private String user;
++    private String groupId;
++    private Long timestampOverride;
++
++    public ChangeMarker(String entityGuid, String version, String changeId) {
++        this.entityGuid = requireToken(entityGuid, "entityGuid");
++        this.version = requireText(version, "version");
++        this.changeId = requireText(changeId, "changeId");
++    }
++
++    public ChangeMarker commit(String value) {
++        this.commit = value;
++        return this;
++    }
++
++    public ChangeMarker changelog(String value) {
++        this.changelog = value;
++        return this;
++    }
++
++    public ChangeMarker deepLink(String value) {
++        this.deepLink = value;
++        return this;
++    }
++
++    public ChangeMarker user(String value) {
++        this.user = value;
++        return this;
++    }
++
++    public ChangeMarker groupId(String value) {
++        this.groupId = value;
++        return this;
++    }
++
++    public ChangeMarker customAttribute(String key, Object value) {
++        customAttributes.put(requireText(key, "attribute key"), value);
++        return this;
++    }
++
++    public ChangeMarker timestamp(long epochMillis) {
++        this.timestampOverride = epochMillis;
++        return this;
++    }
++
++    public String entityGuid() {
++        return entityGuid;
++    }
++
++    public String version() {
++        return version;
++    }
++
++    public String changeId() {
++        return changeId;
++    }
++
++    public String commit() {
++        return commit;
++    }
++
++    public String changelog() {
++        return changelog;
++    }
++
++    public String deepLink() {
++        return deepLink;
++    }
++
++    public String user() {
++        return user;
++    }
++
++    public String groupId() {
++        return groupId;
++    }
++
++    public Long timestampOverride() {
++        return timestampOverride;
++    }
++
++    public Map<String, Object> customAttributes() {
++        return customAttributes;
++    }
++
++    private static String requireText(String value, String what) {
++        if (value == null || value.isBlank()) {
++            throw new IllegalArgumentException(what + " must not be empty");
++        }
++        return value;
++    }
++
++    private static String requireToken(String value, String what) {
++        requireText(value, what);
++        if (value.indexOf('\'') >= 0 || value.indexOf('\\') >= 0) {
++            throw new IllegalArgumentException(
++                what + " must not contain quotes or backslashes");
++        }
++        return value;
++    }
++}
+diff --git a/ChangeMarkerService.java b/ChangeMarkerService.java
+new file mode 100644
+index 0000000..5545135
+--- /dev/null
++++ b/ChangeMarkerService.java
+@@ -0,0 +1,212 @@
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.function.LongConsumer;
++import java.util.function.LongSupplier;
++
++/**
++ * Records deployment change markers through the current NerdGraph mutation,
++ * changeTrackingCreateEvent, with idempotent retries hung off the caller's
++ * stable change identifier:
++ *
++ * - a changeId already in the ledger is replayed without any HTTP;
++ * - transient failures (429/5xx) retry with byte-identical bodies (the
++ *   timestamp is computed once per record() call) and doubling backoff
++ *   through the injected sleeper;
++ * - mutation-level GraphQL errors are permanent and never retried;
++ * - the ledger records changeId -> changeTrackingId only after a confirmed
++ *   success on the requested entity.
++ */
++public final class ChangeMarkerService {
++
++    /** Retry policy: total attempt budget, base delay, injected sleeper. */
++    public record Retry(int maxAttempts, long baseDelayMillis, LongConsumer sleeper) {
++        public Retry {
++            if (maxAttempts < 1) {
++                throw new IllegalArgumentException("maxAttempts must be >= 1");
++            }
++        }
++    }
++
++    // Variable declarations mirror the official newrelic-client-go operation.
++    static final String MUTATION = """
++        mutation($changeTrackingEvent: ChangeTrackingCreateEventInput!, $dataHandlingRules: ChangeTrackingDataHandlingRules) {
++          changeTrackingCreateEvent(changeTrackingEvent: $changeTrackingEvent, dataHandlingRules: $dataHandlingRules) {
++            changeTrackingEvent {
++              changeTrackingId
++              category
++              type
++              categoryAndType
++              timestamp
++              entity {
++                guid
++                name
++              }
++            }
++          }
++        }""";
++
++    static final long TIMESTAMP_WINDOW_MS = 24L * 3600L * 1000L;
++
++    private final NerdGraphClient client;
++    private final Map<String, String> ledger;
++    private final LongSupplier clock;
++    private final Retry retry;
++
++    public ChangeMarkerService(NerdGraphClient client, Map<String, String> ledger,
++            LongSupplier clock, Retry retry) {
++        this.client = client;
++        this.ledger = ledger;
++        this.clock = clock;
++        this.retry = retry;
++    }
++
++    public MarkerResult record(ChangeMarker marker)
++            throws IOException, InterruptedException {
++        String known = ledger.get(marker.changeId());
++        if (known != null) {
++            return new MarkerResult(known, true);
++        }
++
++        long now = clock.getAsLong();
++        long timestamp = marker.timestampOverride() != null
++            ? marker.timestampOverride() : now;
++        if (Math.abs(timestamp - now) > TIMESTAMP_WINDOW_MS) {
++            throw new IllegalArgumentException(
++                "timestamp must be within 24 hours of the current time");
++        }
++
++        Map<String, Object> variables = buildVariables(marker, timestamp);
++        Map<String, Object> envelope = executeWithRetry(variables);
++
++        Map<String, Object> event = dig(envelope,
++            "data", "changeTrackingCreateEvent", "changeTrackingEvent");
++        if (event == null) {
++            throw graphQlFailure(envelope);
++        }
++        Map<String, Object> entity = child(event, "entity");
++        Object guid = entity == null ? null : entity.get("guid");
++        if (!marker.entityGuid().equals(guid)) {
++            throw new ChangeTrackingException(
++                "change marker was recorded on an unexpected entity",
++                List.of(), List.of());
++        }
++        String changeTrackingId = (String) event.get("changeTrackingId");
++        ledger.put(marker.changeId(), changeTrackingId);
++        return new MarkerResult(changeTrackingId, false);
++    }
++
++    // -- request construction ------------------------------------------------
++
++    private static Map<String, Object> buildVariables(ChangeMarker marker,
++            long timestamp) {
++        Map<String, Object> deployment = new LinkedHashMap<>();
++        deployment.put("version", marker.version());
++        putIfPresent(deployment, "commit", marker.commit());
++        putIfPresent(deployment, "changelog", marker.changelog());
++        putIfPresent(deployment, "deepLink", marker.deepLink());
++
++        Map<String, Object> kind = new LinkedHashMap<>();
++        kind.put("category", "deployment");
++        kind.put("type", "basic");
++
++        Map<String, Object> categoryAndTypeData = new LinkedHashMap<>();
++        categoryAndTypeData.put("kind", kind);
++        categoryAndTypeData.put("categoryFields",
++            Map.of("deployment", deployment));
++
++        Map<String, Object> event = new LinkedHashMap<>();
++        event.put("categoryAndTypeData", categoryAndTypeData);
++        event.put("entitySearch",
++            Map.of("query", "id = '" + marker.entityGuid() + "'"));
++        putIfPresent(event, "user", marker.user());
++        putIfPresent(event, "groupId", marker.groupId());
++
++        Map<String, Object> attributes =
++            new LinkedHashMap<>(marker.customAttributes());
++        attributes.put("change_id", marker.changeId());
++        event.put("customAttributes", attributes);
++        event.put("timestamp", timestamp);
++
++        Map<String, Object> variables = new LinkedHashMap<>();
++        variables.put("changeTrackingEvent", event);
++        // deployment/basic is a standard kind: never ALLOW_CUSTOM_CATEGORY_OR_TYPE;
++        // FAIL_ON_FIELD_LENGTH makes oversized fields fail instead of truncating.
++        variables.put("dataHandlingRules",
++            Map.of("validationFlags", List.of("FAIL_ON_FIELD_LENGTH")));
++        return variables;
++    }
++
++    private static void putIfPresent(Map<String, Object> map, String key,
++            String value) {
++        if (value != null) {
++            map.put(key, value);
++        }
++    }
++
++    // -- transport with idempotent retries ------------------------------------
++
++    private Map<String, Object> executeWithRetry(Map<String, Object> variables)
++            throws IOException, InterruptedException {
++        for (int attempt = 1; ; attempt++) {
++            try {
++                return client.execute(MUTATION, variables);
++            } catch (NerdGraphClient.NerdGraphHttpException e) {
++                boolean transientFailure = e.status() == 429 || e.status() >= 500;
++                if (!transientFailure || attempt >= retry.maxAttempts()) {
++                    throw e;
++                }
++                retry.sleeper().accept(
++                    retry.baseDelayMillis() << (attempt - 1));
++            }
++        }
++    }
++
++    // -- response handling -----------------------------------------------------
++
++    private static ChangeTrackingException graphQlFailure(
++            Map<String, Object> envelope) {
++        List<String> messages = new ArrayList<>();
++        List<String> errorClasses = new ArrayList<>();
++        Object errors = envelope.get("errors");
++        if (errors instanceof List<?> list) {
++            for (Object item : list) {
++                if (item instanceof Map<?, ?> error) {
++                    Object message = error.get("message");
++                    if (message != null) {
++                        messages.add(String.valueOf(message));
++                    }
++                    Object extensions = error.get("extensions");
++                    if (extensions instanceof Map<?, ?> ext
++                            && ext.get("errorClass") != null) {
++                        errorClasses.add(String.valueOf(ext.get("errorClass")));
++                    }
++                }
++            }
++        }
++        return new ChangeTrackingException(
++            "changeTrackingCreateEvent failed: " + String.join("; ", messages),
++            messages, errorClasses);
++    }
++
++    @SuppressWarnings("unchecked")
++    private static Map<String, Object> dig(Map<String, Object> doc,
++            String... keys) {
++        Object cur = doc;
++        for (String key : keys) {
++            if (!(cur instanceof Map)) {
++                return null;
++            }
++            cur = ((Map<String, Object>) cur).get(key);
++        }
++        return cur instanceof Map ? (Map<String, Object>) cur : null;
++    }
++
++    @SuppressWarnings("unchecked")
++    private static Map<String, Object> child(Map<String, Object> map, String key) {
++        Object value = map.get(key);
++        return value instanceof Map ? (Map<String, Object>) value : null;
++    }
++}
+diff --git a/ChangeTrackingException.java b/ChangeTrackingException.java
+new file mode 100644
+index 0000000..6332901
+--- /dev/null
++++ b/ChangeTrackingException.java
+@@ -0,0 +1,26 @@
++import java.util.List;
++
++/**
++ * A permanent change-tracking failure: mutation-level GraphQL errors or a
++ * response that does not match the requested marker. Never retried.
++ */
++public final class ChangeTrackingException extends RuntimeException {
++
++    private final List<String> messages;
++    private final List<String> errorClasses;
++
++    public ChangeTrackingException(String summary, List<String> messages,
++            List<String> errorClasses) {
++        super(summary);
++        this.messages = List.copyOf(messages);
++        this.errorClasses = List.copyOf(errorClasses);
++    }
++
++    public List<String> messages() {
++        return messages;
++    }
++
++    public List<String> errorClasses() {
++        return errorClasses;
++    }
++}
+diff --git a/MarkerResult.java b/MarkerResult.java
+new file mode 100644
+index 0000000..bdbcc77
+--- /dev/null
++++ b/MarkerResult.java
+@@ -0,0 +1,4 @@
++/** Outcome of recording one marker: the server-generated id, and whether it
++ * was replayed from the ledger instead of hitting the wire. */
++public record MarkerResult(String changeTrackingId, boolean replayed) {
++}

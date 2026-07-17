@@ -1,0 +1,320 @@
+diff --git a/src/batch.ts b/src/batch.ts
+new file mode 100644
+index 0000000..4242535
+--- /dev/null
++++ b/src/batch.ts
+@@ -0,0 +1,37 @@
++// Client-side batch_save splitting.
++//
++// splunkd bounds one batch_save request at 1000 documents
++// (limits.conf [kvstore] max_documents_per_batch_save) and 50 MB
++// (max_size_per_batch_save_mb); larger saves go out as ordered chunks.
++
++export const MAX_DOCS_PER_BATCH_SAVE = 1000;
++export const MAX_BYTES_PER_BATCH_SAVE = 50 * 1024 * 1024;
++
++export type KvDocument = Record<string, unknown>;
++
++export function splitBatches(
++  docs: KvDocument[],
++  maxDocs: number = MAX_DOCS_PER_BATCH_SAVE,
++  maxBytes: number = MAX_BYTES_PER_BATCH_SAVE,
++): KvDocument[][] {
++  const chunks: KvDocument[][] = [];
++  let current: KvDocument[] = [];
++  let currentBytes = 2; // "[]"
++  for (const doc of docs) {
++    const docBytes = Buffer.byteLength(JSON.stringify(doc), "utf8");
++    const separator = current.length > 0 ? 1 : 0;
++    const wouldBe = currentBytes + separator + docBytes;
++    if (current.length > 0 &&
++        (current.length >= maxDocs || wouldBe > maxBytes)) {
++      chunks.push(current);
++      current = [];
++      currentBytes = 2;
++    }
++    current.push(doc);
++    currentBytes += (current.length > 1 ? 1 : 0) + docBytes;
++  }
++  if (current.length > 0) {
++    chunks.push(current);
++  }
++  return chunks;
++}
+diff --git a/src/client.ts b/src/client.ts
+new file mode 100644
+index 0000000..c263d53
+--- /dev/null
++++ b/src/client.ts
+@@ -0,0 +1,196 @@
++// KV Store collection-data client over splunkd's management REST API.
++//
++// Paths are app/owner namespaced (shared collections live under the
++// nobody owner). Auth is a bearer authentication token. Updates POST the
++// complete replacement document to the record path — KV Store has no
++// ETag/If-Match for collection data; the _key in the URL is the identity.
++
++import { BatchSaveError, SplunkKvError } from "./errors.ts";
++import { splitBatches, type KvDocument } from "./batch.ts";
++
++export type KvClientOptions = {
++  baseUrl: string;
++  token: string;
++  app: string;
++  owner?: string;
++};
++
++export type QueryOptions = {
++  query?: Record<string, unknown>;
++  sort?: string;
++  skip?: number;
++  limit?: number;
++  fields?: string;
++};
++
++export type BatchSaveOptions = {
++  maxDocs?: number;
++  maxBytes?: number;
++};
++
++export type ExportOptions = {
++  pageSize: number;
++  checkpoint?: string;
++};
++
++export type ExportResult = {
++  docs: KvDocument[];
++  checkpoint: string | undefined;
++};
++
++export class KvStoreClient {
++  private readonly baseUrl: string;
++  private readonly token: string;
++  private readonly dataRoot: string;
++
++  constructor(options: KvClientOptions) {
++    this.baseUrl = options.baseUrl.replace(/\/$/, "");
++    this.token = options.token;
++    const owner = options.owner ?? "nobody";
++    this.dataRoot =
++      `/servicesNS/${encodeURIComponent(owner)}/` +
++      `${encodeURIComponent(options.app)}/storage/collections/data`;
++  }
++
++  // ---- single-record operations ---------------------------------------
++
++  async query(collection: string, options: QueryOptions): Promise<KvDocument[]> {
++    const params = new URLSearchParams();
++    if (options.query !== undefined) params.set("query", JSON.stringify(options.query));
++    if (options.sort !== undefined) params.set("sort", options.sort);
++    if (options.skip !== undefined) params.set("skip", String(options.skip));
++    if (options.limit !== undefined) params.set("limit", String(options.limit));
++    if (options.fields !== undefined) params.set("fields", options.fields);
++    const suffix = params.size > 0 ? `?${params}` : "";
++    const doc = await this.send("GET", `${this.collectionPath(collection)}${suffix}`);
++    return doc as KvDocument[];
++  }
++
++  async insert(collection: string, doc: KvDocument): Promise<string> {
++    const saved = await this.send("POST", this.collectionPath(collection), doc);
++    return (saved as { _key: string })._key;
++  }
++
++  async update(collection: string, key: string, doc: KvDocument): Promise<string> {
++    const saved = await this.send("POST", this.recordPath(collection, key), doc);
++    return (saved as { _key: string })._key;
++  }
++
++  async remove(collection: string, key: string): Promise<void> {
++    await this.send("DELETE", this.recordPath(collection, key));
++  }
++
++  // ---- batch save -------------------------------------------------------
++
++  async batchSave(
++    collection: string,
++    docs: KvDocument[],
++    options: BatchSaveOptions = {},
++  ): Promise<string[]> {
++    const chunks = splitBatches(docs, options.maxDocs, options.maxBytes);
++    const saved: string[] = [];
++    let attempted = 0;
++    for (const chunk of chunks) {
++      let keys: string[];
++      try {
++        keys = (await this.send(
++          "POST",
++          `${this.collectionPath(collection)}/batch_save`,
++          chunk,
++        )) as string[];
++      } catch (err) {
++        if (err instanceof SplunkKvError) {
++          throw new BatchSaveError(
++            saved, attempted, docs.length - attempted, err.status, err.text);
++        }
++        throw err;
++      }
++      saved.push(...keys);
++      attempted += chunk.length;
++    }
++    return saved;
++  }
++
++  // ---- checkpointed export ---------------------------------------------
++
++  async exportAll(collection: string, options: ExportOptions): Promise<ExportResult> {
++    const docs: KvDocument[] = [];
++    let checkpoint = options.checkpoint;
++    for (;;) {
++      // sort by _key and continue strictly after the checkpoint: stable
++      // under concurrent writes, unlike skip-based paging
++      const page = await this.queryPage(collection, options.pageSize, checkpoint)
++        .catch((err: unknown) => {
++          if (err instanceof SplunkKvError) {
++            err.checkpoint = checkpoint;
++          }
++          throw err;
++        });
++      docs.push(...page);
++      if (page.length > 0) {
++        checkpoint = String(page[page.length - 1]._key);
++      }
++      if (page.length < options.pageSize) {
++        return { docs, checkpoint };
++      }
++    }
++  }
++
++  private queryPage(
++    collection: string,
++    pageSize: number,
++    afterKey: string | undefined,
++  ): Promise<KvDocument[]> {
++    const options: QueryOptions = { sort: "_key", limit: pageSize };
++    if (afterKey !== undefined) {
++      options.query = { _key: { $gt: afterKey } };
++    }
++    return this.query(collection, options);
++  }
++
++  // ---- transport ---------------------------------------------------------
++
++  private collectionPath(collection: string): string {
++    return `${this.dataRoot}/${encodeURIComponent(collection)}`;
++  }
++
++  private recordPath(collection: string, key: string): string {
++    return `${this.collectionPath(collection)}/${encodeURIComponent(key)}`;
++  }
++
++  private async send(
++    method: string,
++    path: string,
++    body?: unknown,
++  ): Promise<unknown> {
++    const headers: Record<string, string> = {
++      authorization: `Bearer ${this.token}`,
++    };
++    const init: RequestInit = { method, headers };
++    if (body !== undefined) {
++      headers["content-type"] = "application/json";
++      init.body = JSON.stringify(body);
++    }
++    const response = await fetch(this.baseUrl + path, init);
++    const raw = await response.text();
++    let doc: unknown = undefined;
++    if (raw.length > 0) {
++      try {
++        doc = JSON.parse(raw);
++      } catch {
++        doc = undefined;
++      }
++    }
++    if (!response.ok) {
++      const messages = (doc as { messages?: Array<{ type?: string; text?: string }> })
++        ?.messages;
++      const first = Array.isArray(messages) ? messages[0] : undefined;
++      throw new SplunkKvError(
++        response.status,
++        first?.type ?? "ERROR",
++        first?.text ?? `splunkd returned HTTP ${response.status}`,
++      );
++    }
++    return doc;
++  }
++}
+diff --git a/src/errors.ts b/src/errors.ts
+new file mode 100644
+index 0000000..547a82b
+--- /dev/null
++++ b/src/errors.ts
+@@ -0,0 +1,48 @@
++// Error types decoded from splunkd's {"messages":[{type,text}]} envelope.
++
++export class SplunkKvError extends Error {
++  status: number;
++  type: string;
++  text: string;
++  /** Last verifiably delivered _key when an export fails mid-run. */
++  checkpoint?: string;
++
++  constructor(status: number, type: string, text: string, checkpoint?: string) {
++    super(`splunkd ${status} [${type}] ${text}`);
++    this.name = "SplunkKvError";
++    this.status = status;
++    this.type = type;
++    this.text = text;
++    this.checkpoint = checkpoint;
++  }
++}
++
++export class BatchSaveError extends Error {
++  /** Keys from chunks splunkd accepted before the failure. */
++  savedKeys: string[];
++  /** Index (into the submitted docs) of the first document in the failed chunk. */
++  failedAt: number;
++  /** Documents not saved: the failed chunk plus never-attempted ones. */
++  remaining: number;
++  status: number;
++  text: string;
++
++  constructor(
++    savedKeys: string[],
++    failedAt: number,
++    remaining: number,
++    status: number,
++    text: string,
++  ) {
++    super(
++      `batch_save failed at document ${failedAt} (splunkd ${status}: ${text}); ` +
++      `${savedKeys.length} saved, ${remaining} not saved`,
++    );
++    this.name = "BatchSaveError";
++    this.savedKeys = savedKeys;
++    this.failedAt = failedAt;
++    this.remaining = remaining;
++    this.status = status;
++    this.text = text;
++  }
++}
+diff --git a/src/index.ts b/src/index.ts
+new file mode 100644
+index 0000000..d8e9599
+--- /dev/null
++++ b/src/index.ts
+@@ -0,0 +1,15 @@
++export { KvStoreClient } from "./client.ts";
++export type {
++  KvClientOptions,
++  QueryOptions,
++  BatchSaveOptions,
++  ExportOptions,
++  ExportResult,
++} from "./client.ts";
++export { SplunkKvError, BatchSaveError } from "./errors.ts";
++export {
++  splitBatches,
++  MAX_DOCS_PER_BATCH_SAVE,
++  MAX_BYTES_PER_BATCH_SAVE,
++} from "./batch.ts";
++export type { KvDocument } from "./batch.ts";

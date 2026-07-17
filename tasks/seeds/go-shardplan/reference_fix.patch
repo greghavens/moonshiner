@@ -1,0 +1,261 @@
+diff --git a/shardplan.go b/shardplan.go
+new file mode 100644
+index 0000000..96e4d12
+--- /dev/null
++++ b/shardplan.go
+@@ -0,0 +1,255 @@
++// Package shardplan computes deterministic bulk migration plans for a shard
++// fleet: given the current assignment table, the node set to plan for, and a
++// replica count, it emits the minimal ordered move list that repairs, spreads
++// and balances the assignment while keeping a shard's replicas on distinct
++// nodes.
++package shardplan
++
++import (
++	"fmt"
++	"sort"
++)
++
++// Move relocates one replica slot. From "" means the slot was previously
++// unassigned; To "" means the slot is dropped (replica shrink).
++type Move struct {
++	Shard   string
++	Replica int
++	From    string
++	To      string
++}
++
++// Plan is the rebalance outcome: the resulting assignment plus the moves that
++// take the current assignment there.
++type Plan struct {
++	Target map[string][]string
++	Moves  []Move
++}
++
++// Diff renders the plan's moves, one line per move, in move order.
++func (p *Plan) Diff() []string {
++	out := make([]string, 0, len(p.Moves))
++	for _, m := range p.Moves {
++		switch {
++		case m.From == "":
++			out = append(out, fmt.Sprintf("%s/%d: + %s", m.Shard, m.Replica, m.To))
++		case m.To == "":
++			out = append(out, fmt.Sprintf("%s/%d: - %s", m.Shard, m.Replica, m.From))
++		default:
++			out = append(out, fmt.Sprintf("%s/%d: %s -> %s", m.Shard, m.Replica, m.From, m.To))
++		}
++	}
++	return out
++}
++
++type hole struct {
++	shard   string
++	replica int
++	from    string
++}
++
++// Rebalance plans the migration from current to a clean assignment over the
++// given nodes. The algorithm and its tie-breaks are fixed so that any two
++// runs over the same inputs produce byte-identical plans.
++func Rebalance(current map[string][]string, nodes []string, replicas int) (*Plan, error) {
++	if replicas < 1 {
++		return nil, fmt.Errorf("replicas must be >= 1, got %d", replicas)
++	}
++	nodeSet := make(map[string]bool, len(nodes))
++	for _, n := range nodes {
++		if n == "" {
++			return nil, fmt.Errorf("empty node name")
++		}
++		if nodeSet[n] {
++			return nil, fmt.Errorf("duplicate node name %q", n)
++		}
++		nodeSet[n] = true
++	}
++	if replicas > len(nodes) {
++		return nil, fmt.Errorf("replicas %d exceeds node count %d", replicas, len(nodes))
++	}
++
++	sortedNodes := append([]string(nil), nodes...)
++	sort.Strings(sortedNodes)
++	shards := make([]string, 0, len(current))
++	for shard := range current {
++		shards = append(shards, shard)
++	}
++	sort.Strings(shards)
++
++	// Step 1: keep valid slots, collect holes and dropped slots.
++	target := make(map[string][]string, len(shards))
++	load := make(map[string]int, len(nodes))
++	var holes []hole
++	var drops []Move
++	for _, shard := range shards {
++		slots := current[shard]
++		kept := make([]string, replicas)
++		used := make(map[string]bool, replicas)
++		for i := 0; i < replicas; i++ {
++			prev := ""
++			if i < len(slots) {
++				prev = slots[i]
++			}
++			if prev != "" && nodeSet[prev] && !used[prev] {
++				kept[i] = prev
++				used[prev] = true
++				load[prev]++
++			} else {
++				holes = append(holes, hole{shard, i, prev})
++			}
++		}
++		for i := replicas; i < len(slots); i++ {
++			drops = append(drops, Move{Shard: shard, Replica: i, From: slots[i], To: ""})
++		}
++		target[shard] = kept
++	}
++
++	// Step 2: per-node target loads. Loaded nodes keep the surplus.
++	totalSlots := len(shards) * replicas
++	base := totalSlots / len(nodes)
++	extra := totalSlots % len(nodes)
++	ranked := append([]string(nil), sortedNodes...)
++	sort.Slice(ranked, func(i, j int) bool {
++		if load[ranked[i]] != load[ranked[j]] {
++			return load[ranked[i]] > load[ranked[j]]
++		}
++		return ranked[i] < ranked[j]
++	})
++	targetLoad := make(map[string]int, len(nodes))
++	for idx, n := range ranked {
++		if idx < extra {
++			targetLoad[n] = base + 1
++		} else {
++			targetLoad[n] = base
++		}
++	}
++
++	// Step 3: evict overflow, preferring shards that have no hole pending yet
++	// so no shard loses two replicas in a single plan unless unavoidable.
++	holedShards := make(map[string]bool, len(holes))
++	for _, h := range holes {
++		holedShards[h.shard] = true
++	}
++	for _, node := range sortedNodes {
++		for load[node] > targetLoad[node] {
++			var candidates []hole
++			for _, shard := range shards {
++				for i, n := range target[shard] {
++					if n == node {
++						candidates = append(candidates, hole{shard, i, node})
++					}
++				}
++			}
++			pick := 0
++			for ci, c := range candidates {
++				if !holedShards[c.shard] {
++					pick = ci
++					break
++				}
++			}
++			victim := candidates[pick]
++			target[victim.shard][victim.replica] = ""
++			load[node]--
++			holes = append(holes, victim)
++			holedShards[victim.shard] = true
++		}
++	}
++
++	// Step 4: fill holes, least-loaded eligible node first.
++	sort.Slice(holes, func(i, j int) bool {
++		if holes[i].shard != holes[j].shard {
++			return holes[i].shard < holes[j].shard
++		}
++		return holes[i].replica < holes[j].replica
++	})
++	moves := []Move{}
++	for _, h := range holes {
++		best := ""
++		for _, node := range sortedNodes {
++			if load[node] >= targetLoad[node] {
++				continue
++			}
++			if holdsShard(target[h.shard], node) {
++				continue
++			}
++			if best == "" || load[node] < load[best] {
++				best = node
++			}
++		}
++		if best == "" {
++			return nil, fmt.Errorf("cannot place shard %q replica %d", h.shard, h.replica)
++		}
++		target[h.shard][h.replica] = best
++		load[best]++
++		moves = append(moves, Move{Shard: h.shard, Replica: h.replica, From: h.from, To: best})
++	}
++
++	moves = append(moves, drops...)
++	sort.Slice(moves, func(i, j int) bool {
++		if moves[i].Shard != moves[j].Shard {
++			return moves[i].Shard < moves[j].Shard
++		}
++		return moves[i].Replica < moves[j].Replica
++	})
++	return &Plan{Target: target, Moves: moves}, nil
++}
++
++func holdsShard(slots []string, node string) bool {
++	for _, n := range slots {
++		if n == node {
++			return true
++		}
++	}
++	return false
++}
++
++// Check is the invariant gate run after applying a plan: slot counts, known
++// nodes, replica anti-affinity, and a load spread of at most one.
++func Check(assign map[string][]string, nodes []string, replicas int) error {
++	nodeSet := make(map[string]bool, len(nodes))
++	for _, n := range nodes {
++		nodeSet[n] = true
++	}
++	shards := make([]string, 0, len(assign))
++	for shard := range assign {
++		shards = append(shards, shard)
++	}
++	sort.Strings(shards)
++
++	load := make(map[string]int, len(nodes))
++	for _, shard := range shards {
++		slots := assign[shard]
++		if len(slots) != replicas {
++			return fmt.Errorf("shard %q has %d slots, want %d", shard, len(slots), replicas)
++		}
++		seen := make(map[string]bool, len(slots))
++		for _, n := range slots {
++			if !nodeSet[n] {
++				return fmt.Errorf("shard %q is assigned to unknown node %q", shard, n)
++			}
++			if seen[n] {
++				return fmt.Errorf("shard %q has two replicas on node %q", shard, n)
++			}
++			seen[n] = true
++			load[n]++
++		}
++	}
++
++	minLoad, maxLoad := -1, -1
++	minNode, maxNode := "", ""
++	for _, n := range nodes {
++		l := load[n]
++		if minLoad == -1 || l < minLoad {
++			minLoad, minNode = l, n
++		}
++		if l > maxLoad {
++			maxLoad, maxNode = l, n
++		}
++	}
++	if len(nodes) > 0 && maxLoad-minLoad > 1 {
++		return fmt.Errorf("load spread is %d: node %q carries %d, node %q carries %d",
++			maxLoad-minLoad, maxNode, maxLoad, minNode, minLoad)
++	}
++	return nil
++}

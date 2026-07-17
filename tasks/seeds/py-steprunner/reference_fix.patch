@@ -1,0 +1,221 @@
+diff --git a/steprunner.py b/steprunner.py
+new file mode 100644
+index 0000000..e3e3ab2
+--- /dev/null
++++ b/steprunner.py
+@@ -0,0 +1,215 @@
++"""Data-flow runner for our workflow DSL.
++
++This module owns how data moves through a workflow: the workflow-level
++input/output transforms, per-task input views and output reshaping, and
++the ``${ ... }`` interpolation rules. Sequencing is strictly linear here —
++branching/looping live in a different layer.
++"""
++import re
++
++import yaml
++
++_ABSENT = object()  # a path that resolved to nothing (distinct from None)
++
++
++class LoadError(Exception):
++    """The workflow document is structurally invalid."""
++
++
++class ExpressionError(Exception):
++    """An expression is malformed, or a structure was spliced into text."""
++
++
++class UnknownHandlerError(Exception):
++    """A call task names a handler that was never registered."""
++
++
++# --------------------------------------------------------------- expressions
++
++_IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
++_SEGMENT_RE = re.compile(r"\.(%s)|\[(\d+)\]" % _IDENT)
++_EXPR_RE = re.compile(r"\$\{(.*?)\}", re.DOTALL)
++
++
++def _parse_path(text, raw):
++    """Parse the inside of ``${ ... }`` into a list of path segments."""
++    body = text.strip()
++    if body == ".":
++        return []
++    if not body.startswith("."):
++        raise ExpressionError("expression must start with '.': %r" % raw)
++    segments = []
++    pos = 0
++    # allow the leading-dot-then-bracket form: .[0].sku
++    if body.startswith(".["):
++        pos = 1
++    while pos < len(body):
++        m = _SEGMENT_RE.match(body, pos)
++        if m is None:
++            raise ExpressionError("malformed expression: %r" % raw)
++        segments.append(m.group(1) if m.group(1) is not None else int(m.group(2)))
++        pos = m.end()
++    if not segments:
++        raise ExpressionError("malformed expression: %r" % raw)
++    return segments
++
++
++def _resolve(view, segments):
++    cur = view
++    for seg in segments:
++        if isinstance(seg, int):
++            if isinstance(cur, list) and 0 <= seg < len(cur):
++                cur = cur[seg]
++            else:
++                return _ABSENT
++        else:
++            if isinstance(cur, dict) and seg in cur:
++                cur = cur[seg]
++            else:
++                return _ABSENT
++    return cur
++
++
++def _splice(value, raw):
++    """Convert one expression value for use inside mixed text."""
++    if value is _ABSENT or value is None:
++        return ""
++    if value is True:
++        return "true"
++    if value is False:
++        return "false"
++    if isinstance(value, (dict, list)):
++        raise ExpressionError(
++            "cannot splice a structure into text: %r" % raw)
++    return str(value)
++
++
++def _eval_string(s, view):
++    """Apply the interpolation rules to one string value."""
++    if "${" not in s:
++        return s
++    matches = list(_EXPR_RE.finditer(s))
++    tail = s[matches[-1].end():] if matches else s
++    if "${" in (tail if matches else s):
++        # an opener without a closer somewhere after the last full match
++        raise ExpressionError("unterminated expression in %r" % s)
++    # single-expression form: the entire string is one ${ ... }
++    if len(matches) == 1 and matches[0].span() == (0, len(s)):
++        value = _resolve(view, _parse_path(matches[0].group(1), s))
++        return None if value is _ABSENT else value
++    out = []
++    pos = 0
++    for m in matches:
++        out.append(s[pos:m.start()])
++        value = _resolve(view, _parse_path(m.group(1), s))
++        out.append(_splice(value, s))
++        pos = m.end()
++    out.append(s[pos:])
++    return "".join(out)
++
++
++def _evaluate(node, view):
++    """Evaluate a YAML value recursively against a view."""
++    if isinstance(node, str):
++        return _eval_string(node, view)
++    if isinstance(node, dict):
++        return {k: _evaluate(v, view) for k, v in node.items()}
++    if isinstance(node, list):
++        return [_evaluate(v, view) for v in node]
++    return node
++
++
++# ------------------------------------------------------------------- loading
++
++_TYPE_KEYS = ("set", "call")
++
++
++def _load(source):
++    try:
++        doc = yaml.safe_load(source)
++    except yaml.YAMLError as exc:
++        raise LoadError("invalid YAML: %s" % exc) from exc
++    if not isinstance(doc, dict):
++        raise LoadError("workflow document must be a mapping")
++    header = doc.get("document")
++    if not isinstance(header, dict) or header.get("dsl") != "1.0":
++        raise LoadError('document.dsl must be "1.0"')
++    for field in ("namespace", "name"):
++        value = header.get(field)
++        if not isinstance(value, str) or not value:
++            raise LoadError("document.%s is required" % field)
++    tasks_raw = doc.get("do")
++    if not isinstance(tasks_raw, list) or not tasks_raw:
++        raise LoadError("do: must be a non-empty list of tasks")
++
++    tasks = []
++    seen = set()
++    for i, entry in enumerate(tasks_raw):
++        if not isinstance(entry, dict) or len(entry) != 1:
++            raise LoadError("do[%d]: each entry must be a single-key map" % i)
++        (name, body), = entry.items()
++        if name == "input":
++            raise LoadError('"input" is a reserved name and cannot be a task')
++        if name in seen:
++            raise LoadError("duplicate task name %r" % name)
++        seen.add(name)
++        if not isinstance(body, dict):
++            raise LoadError("task %r: body must be a map" % name)
++        kinds = [k for k in _TYPE_KEYS if k in body]
++        if len(kinds) != 1:
++            raise LoadError(
++                "task %r: needs exactly one of set/call, got %d" % (name, len(kinds)))
++        tasks.append((name, kinds[0], body))
++    return doc, tasks
++
++
++def _transform_from(block, label):
++    """Pull the `from` value out of an input:/output: transform block."""
++    if not isinstance(block, dict) or "from" not in block:
++        raise LoadError("%s must be a map with a 'from' key" % label)
++    return block["from"]
++
++
++# ------------------------------------------------------------------- running
++
++def run_workflow(source, input=None, handlers=None):
++    """Run a workflow document and return {"context": ..., "output": ...}."""
++    doc, tasks = _load(source)
++    handlers = handlers or {}
++    effective_input = {} if input is None else input
++    if "input" in doc:
++        expr = _transform_from(doc["input"], "workflow input")
++        effective_input = _evaluate(expr, effective_input)
++
++    context = {"input": effective_input}
++    for name, kind, body in tasks:
++        view = context
++        if "input" in body:
++            expr = _transform_from(body["input"], "task %r input" % name)
++            view = _evaluate(expr, context)
++
++        if kind == "set":
++            spec = body["set"]
++            if not isinstance(spec, dict):
++                raise LoadError("task %r: set must be a map" % name)
++            result = _evaluate(spec, view)
++        else:
++            target = body["call"]
++            if not isinstance(target, str) or not target:
++                raise LoadError("task %r: call must name a handler" % name)
++            if target not in handlers:
++                raise UnknownHandlerError(
++                    "task %r calls unknown handler %r" % (name, target))
++            args = _evaluate(body.get("with", {}), view)
++            result = handlers[target](args)
++
++        if "output" in body:
++            expr = _transform_from(body["output"], "task %r output" % name)
++            result = _evaluate(expr, result)
++        context[name] = result
++
++    output = context
++    if "output" in doc:
++        expr = _transform_from(doc["output"], "workflow output")
++        output = _evaluate(expr, context)
++    return {"context": context, "output": output}

@@ -1,0 +1,300 @@
+diff --git a/Inventory.ps1 b/Inventory.ps1
+new file mode 100644
+index 0000000..b739ef9
+--- /dev/null
++++ b/Inventory.ps1
+@@ -0,0 +1,63 @@
++# Deterministic organization inventory export: networks + devices with
++# ordinal sorting and pinned key order so downstream diffs stay quiet.
++
++Set-StrictMode -Version Latest
++
++function Get-MerakiInventory {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]$Context,
++        [Parameter(Mandatory)][string]$OrganizationId,
++        [int]$PerPage
++    )
++    $pagedArgs = @{ Context = $Context }
++    if ($PSBoundParameters.ContainsKey('PerPage')) { $pagedArgs['PerPage'] = $PerPage }
++    $networks = Get-MerakiPaged @pagedArgs -Path ('/organizations/{0}/networks' -f $OrganizationId)
++    $devices = Get-MerakiPaged @pagedArgs -Path ('/organizations/{0}/devices' -f $OrganizationId)
++    return [pscustomobject]@{
++        OrganizationId = $OrganizationId
++        Networks       = @($networks)
++        Devices        = @($devices)
++    }
++}
++
++function Sort-OrdinalBy {
++    param([object[]]$Items, [string]$Property)
++    $sorted = @($Items)
++    [Array]::Sort($sorted, [System.Comparison[object]] {
++            param($a, $b)
++            [string]::CompareOrdinal([string]$a.$Property, [string]$b.$Property)
++        })
++    return ,$sorted
++}
++
++function ConvertTo-MerakiInventoryJson {
++    [CmdletBinding()]
++    param([Parameter(Mandatory)]$Inventory)
++    $networks = foreach ($network in (Sort-OrdinalBy -Items @($Inventory.Networks) -Property 'id')) {
++        $productTypes = [string[]]@(@($network.productTypes) | ForEach-Object { [string]$_ })
++        [Array]::Sort($productTypes, [System.Comparison[string]] {
++                param($a, $b) [string]::CompareOrdinal($a, $b)
++            })
++        [ordered]@{
++            id           = [string]$network.id
++            name         = [string]$network.name
++            productTypes = $productTypes
++        }
++    }
++    $devices = foreach ($device in (Sort-OrdinalBy -Items @($Inventory.Devices) -Property 'serial')) {
++        [ordered]@{
++            serial      = [string]$device.serial
++            name        = [string]$device.name
++            model       = [string]$device.model
++            networkId   = [string]$device.networkId
++            productType = [string]$device.productType
++        }
++    }
++    $document = [ordered]@{
++        organizationId = [string]$Inventory.OrganizationId
++        networks       = @($networks)
++        devices        = @($devices)
++    }
++    return ($document | ConvertTo-Json -Depth 8 -Compress)
++}
+diff --git a/MerakiPages.psm1 b/MerakiPages.psm1
+new file mode 100644
+index 0000000..7d03d6c
+--- /dev/null
++++ b/MerakiPages.psm1
+@@ -0,0 +1,19 @@
++# MerakiPages: Cisco Meraki Dashboard API v1 organization inventory module.
++# Transport (bearer auth, trusted-redirect handling, Retry-After), Link
++# pagination, and deterministic inventory JSON export.
++
++Set-StrictMode -Version Latest
++
++. (Join-Path $PSScriptRoot 'Transport.ps1')
++. (Join-Path $PSScriptRoot 'Paging.ps1')
++. (Join-Path $PSScriptRoot 'Inventory.ps1')
++
++Export-ModuleMember -Function @(
++    'New-MerakiContext',
++    'Test-MerakiTrustedHost',
++    'Invoke-MerakiApi',
++    'ConvertFrom-LinkHeader',
++    'Get-MerakiPaged',
++    'Get-MerakiInventory',
++    'ConvertTo-MerakiInventoryJson'
++)
+diff --git a/Paging.ps1 b/Paging.ps1
+new file mode 100644
+index 0000000..0e64295
+--- /dev/null
++++ b/Paging.ps1
+@@ -0,0 +1,50 @@
++# RFC 5988/8288 Link-header pagination for the Meraki Dashboard API v1.
++
++Set-StrictMode -Version Latest
++
++function ConvertFrom-LinkHeader {
++    [CmdletBinding()]
++    param([string]$Value)
++    $links = @{}
++    if ([string]::IsNullOrWhiteSpace($Value)) { return $links }
++    foreach ($part in $Value.Split(',')) {
++        $piece = $part.Trim()
++        if (-not $piece.StartsWith('<')) { continue }
++        $close = $piece.IndexOf('>')
++        if ($close -lt 1) { continue }
++        $url = $piece.Substring(1, $close - 1)
++        foreach ($param in $piece.Substring($close + 1).Split(';')) {
++            $trimmed = $param.Trim()
++            if ($trimmed -match '^(?i)rel\s*=\s*"?([A-Za-z]+)"?$') {
++                $links[$Matches[1].ToLowerInvariant()] = $url
++            }
++        }
++    }
++    return $links
++}
++
++function Get-MerakiPaged {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]$Context,
++        [Parameter(Mandatory)][string]$Path,
++        [int]$PerPage
++    )
++    $items = [System.Collections.Generic.List[object]]::new()
++    $uri = '{0}{1}' -f $Context.BaseUri, $Path
++    if ($PSBoundParameters.ContainsKey('PerPage')) {
++        $separator = if ($Path.Contains('?')) { '&' } else { '?' }
++        $uri = '{0}{1}perPage={2}' -f $uri, $separator, $PerPage
++    }
++    while ($uri) {
++        $page = Invoke-MerakiApi -Context $Context -Uri $uri
++        foreach ($item in @($page.Body)) { $null = $items.Add($item) }
++        # Follow the documented next relation verbatim; never rebuild it.
++        $uri = $null
++        if ($page.LinkHeader) {
++            $links = ConvertFrom-LinkHeader -Value $page.LinkHeader
++            if ($links.ContainsKey('next')) { $uri = $links['next'] }
++        }
++    }
++    return ,$items.ToArray()
++}
+diff --git a/Transport.ps1 b/Transport.ps1
+new file mode 100644
+index 0000000..560692e
+--- /dev/null
++++ b/Transport.ps1
+@@ -0,0 +1,144 @@
++# Transport layer for the Cisco Meraki Dashboard API v1: bearer auth,
++# manual redirect handling with Meraki-host trust, and Retry-After honoring.
++
++Set-StrictMode -Version Latest
++
++$script:MerakiDefaultTrustedHosts = @(
++    '.meraki.com', '.meraki.ca', '.meraki.cn', '.meraki.in', '.gov-meraki.com'
++)
++
++function New-MerakiContext {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)][string]$BaseUri,
++        [Parameter(Mandatory)][string]$ApiKey,
++        [string[]]$TrustedHosts,
++        [int]$RetryLimit = 3,
++        [scriptblock]$SleepAction
++    )
++    if (-not $PSBoundParameters.ContainsKey('TrustedHosts')) {
++        $TrustedHosts = $script:MerakiDefaultTrustedHosts
++    }
++    return [pscustomobject]@{
++        BaseUri      = $BaseUri.TrimEnd('/')
++        ApiKey       = $ApiKey
++        TrustedHosts = @($TrustedHosts)
++        RetryLimit   = $RetryLimit
++        SleepAction  = $SleepAction
++    }
++}
++
++function Test-MerakiTrustedHost {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]$Context,
++        [Parameter(Mandatory)][uri]$Target
++    )
++    $authority = '{0}:{1}' -f $Target.Host, $Target.Port
++    foreach ($entry in @($Context.TrustedHosts)) {
++        if ($entry.StartsWith('.')) {
++            if ($Target.Host.EndsWith($entry, [System.StringComparison]::OrdinalIgnoreCase)) {
++                return $true
++            }
++        }
++        elseif ($authority -ceq $entry -or $Target.Host -ceq $entry) {
++            return $true
++        }
++    }
++    return $false
++}
++
++function Invoke-MerakiApi {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]$Context,
++        [string]$Path,
++        [string]$Uri
++    )
++    $target = if ($PSBoundParameters.ContainsKey('Uri') -and $Uri) { $Uri }
++              else { '{0}{1}' -f $Context.BaseUri, $Path }
++    $sendAuth = $true
++    $redirects = 0
++    $retries = 0
++
++    $handler = [System.Net.Http.HttpClientHandler]::new()
++    $handler.AllowAutoRedirect = $false
++    $client = [System.Net.Http.HttpClient]::new($handler)
++    try {
++        while ($true) {
++            $request = [System.Net.Http.HttpRequestMessage]::new(
++                [System.Net.Http.HttpMethod]::Get, $target)
++            if ($sendAuth) {
++                $null = $request.Headers.TryAddWithoutValidation(
++                    'Authorization', ('Bearer {0}' -f $Context.ApiKey))
++            }
++            $null = $request.Headers.TryAddWithoutValidation('Accept', 'application/json')
++            $response = $client.Send($request)
++            try {
++                $status = [int]$response.StatusCode
++
++                if ($status -in 301, 302, 307, 308) {
++                    $redirects++
++                    if ($redirects -gt 8) { throw 'Meraki API error: too many redirects' }
++                    $location = $response.Headers.Location
++                    if ($null -eq $location) { throw 'Meraki API error: redirect without a Location header' }
++                    $next = if ($location.IsAbsoluteUri) { $location }
++                            else { [uri]::new([uri]$target, $location) }
++                    # Authorization survives only trusted Meraki redirect targets.
++                    $sendAuth = Test-MerakiTrustedHost -Context $Context -Target $next
++                    $target = $next.AbsoluteUri
++                    continue
++                }
++
++                $bodyText = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
++
++                if ($status -eq 429 -and $retries -lt $Context.RetryLimit) {
++                    $retries++
++                    $wait = 1
++                    $values = $null
++                    if ($response.Headers.TryGetValues('Retry-After', [ref]$values)) {
++                        $wait = [int](@($values)[0])
++                    }
++                    if ($null -ne $Context.SleepAction) { & $Context.SleepAction $wait }
++                    else { Start-Sleep -Seconds $wait }
++                    continue
++                }
++
++                if ($status -lt 200 -or $status -ge 300) {
++                    $messages = @()
++                    if (-not [string]::IsNullOrWhiteSpace($bodyText)) {
++                        try {
++                            $parsed = $bodyText | ConvertFrom-Json
++                            if ($parsed.PSObject.Properties['errors']) {
++                                $messages = @($parsed.errors | ForEach-Object { [string]$_ })
++                            }
++                        }
++                        catch { }
++                    }
++                    if ($messages.Count -eq 0) { $messages = @('no error detail') }
++                    throw ('Meraki API error {0}: {1}' -f $status, ($messages -join '; '))
++                }
++
++                $link = $null
++                $values = $null
++                if ($response.Headers.TryGetValues('Link', [ref]$values)) {
++                    $link = (@($values) -join ', ')
++                }
++                $body = if ([string]::IsNullOrWhiteSpace($bodyText)) { $null }
++                        else { $bodyText | ConvertFrom-Json }
++                return [pscustomobject]@{
++                    StatusCode = $status
++                    Body       = $body
++                    LinkHeader = $link
++                }
++            }
++            finally {
++                $response.Dispose()
++            }
++        }
++    }
++    finally {
++        $client.Dispose()
++        $handler.Dispose()
++    }
++}

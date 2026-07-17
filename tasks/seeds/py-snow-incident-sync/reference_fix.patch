@@ -1,0 +1,237 @@
+diff --git a/snow_sync/__init__.py b/snow_sync/__init__.py
+new file mode 100644
+index 0000000..f799015
+--- /dev/null
++++ b/snow_sync/__init__.py
+@@ -0,0 +1,13 @@
++"""Minimal ServiceNow Table API client and incident synchronizer."""
++
++from snow_sync.client import TableClient
++from snow_sync.errors import RateLimitError, SnowApiError
++from snow_sync.sync import IncidentSyncer, SyncReport
++
++__all__ = [
++    "TableClient",
++    "SnowApiError",
++    "RateLimitError",
++    "IncidentSyncer",
++    "SyncReport",
++]
+diff --git a/snow_sync/client.py b/snow_sync/client.py
+new file mode 100644
+index 0000000..a4facc2
+--- /dev/null
++++ b/snow_sync/client.py
+@@ -0,0 +1,124 @@
++"""ServiceNow Table API client (stdlib only).
++
++Contract per the current Table API docs (see docs/official_sources.json):
++  - endpoints under /api/now/table/{table}, JSON in a {"result": ...} envelope
++  - list pagination via sysparm_limit / sysparm_offset
++  - errors arrive as {"error": {"message", "detail"}, "status": "failure"}
++  - rate limiting answers 429 with a Retry-After header in seconds
++"""
++
++import base64
++import json
++import time
++import urllib.error
++import urllib.parse
++import urllib.request
++
++from snow_sync.errors import RateLimitError, SnowApiError
++
++
++class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
++    """Never auto-follow redirects: following one would re-send our Basic
++    credentials to whatever origin the Location header names."""
++
++    def redirect_request(self, req, fp, code, msg, headers, newurl):
++        return None
++
++
++class TableClient:
++    def __init__(self, instance_url, username, password, sleep=time.sleep,
++                 max_retries=3):
++        self.base_url = instance_url.rstrip("/")
++        self.max_retries = max_retries
++        self._sleep = sleep
++        token = base64.b64encode(f"{username}:{password}".encode()).decode()
++        self._auth_header = f"Basic {token}"
++        self._opener = urllib.request.build_opener(_RefuseRedirects())
++
++    # -- low level -----------------------------------------------------
++
++    def _request(self, method, path, params=None, body=None):
++        url = self.base_url + path
++        if params:
++            url += "?" + urllib.parse.urlencode(params)
++        data = json.dumps(body).encode() if body is not None else None
++        retries = 0
++        while True:
++            req = urllib.request.Request(url, data=data, method=method)
++            req.add_header("Accept", "application/json")
++            req.add_header("Authorization", self._auth_header)
++            if data is not None:
++                req.add_header("Content-Type", "application/json")
++            try:
++                with self._opener.open(req) as resp:
++                    payload = json.loads(resp.read() or b"{}")
++                    return payload, dict(resp.headers)
++            except urllib.error.HTTPError as exc:
++                status = exc.code
++                message, detail = self._parse_error(exc)
++                if status == 429:
++                    retry_after = self._retry_after(exc)
++                    if retries < self.max_retries:
++                        retries += 1
++                        self._sleep(retry_after)
++                        continue
++                    raise RateLimitError(status, message, detail,
++                                         retry_after=retry_after) from None
++                if 300 <= status < 400:
++                    raise SnowApiError(
++                        status, "refused to follow cross-origin redirect",
++                        exc.headers.get("Location", "")) from None
++                raise SnowApiError(status, message, detail) from None
++
++    @staticmethod
++    def _parse_error(exc):
++        try:
++            body = json.loads(exc.read() or b"")
++        except ValueError:
++            body = {}
++        err = body.get("error", {}) if isinstance(body, dict) else {}
++        message = err.get("message") or f"HTTP {exc.code}"
++        detail = err.get("detail") or ""
++        return message, detail
++
++    @staticmethod
++    def _retry_after(exc):
++        raw = exc.headers.get("Retry-After", "1")
++        try:
++            return int(raw)
++        except ValueError:
++            return 1
++
++    # -- Table API operations -------------------------------------------
++
++    def get_records(self, table, query=None, fields=None, page_size=100):
++        records = []
++        offset = 0
++        while True:
++            params = {}
++            if query:
++                params["sysparm_query"] = query
++            if fields:
++                params["sysparm_fields"] = ",".join(fields)
++            params["sysparm_limit"] = str(page_size)
++            params["sysparm_offset"] = str(offset)
++            payload, headers = self._request(
++                "GET", f"/api/now/table/{table}", params=params)
++            page = payload.get("result", [])
++            records.extend(page)
++            if len(page) < page_size:
++                break
++            total = headers.get("X-Total-Count")
++            if total is not None and offset + page_size >= int(total):
++                break
++            offset += page_size
++        return records
++
++    def create_record(self, table, data):
++        payload, _ = self._request("POST", f"/api/now/table/{table}", body=data)
++        return payload["result"]
++
++    def update_record(self, table, sys_id, data):
++        payload, _ = self._request(
++            "PATCH", f"/api/now/table/{table}/{sys_id}", body=data)
++        return payload["result"]
+diff --git a/snow_sync/errors.py b/snow_sync/errors.py
+new file mode 100644
+index 0000000..84261a1
+--- /dev/null
++++ b/snow_sync/errors.py
+@@ -0,0 +1,21 @@
++"""Errors raised by the ServiceNow client.
++
++ServiceNow's REST error envelope is
++{"error": {"message": ..., "detail": ...}, "status": "failure"}; both
++exception types carry those fields. Exception text must stay free of
++credentials, so only status/message/detail ever go into str().
++"""
++
++
++class SnowApiError(Exception):
++    def __init__(self, status_code, message, detail=""):
++        super().__init__(f"ServiceNow API error {status_code}: {message}")
++        self.status_code = status_code
++        self.message = message
++        self.detail = detail or ""
++
++
++class RateLimitError(SnowApiError):
++    def __init__(self, status_code, message, detail="", retry_after=None):
++        super().__init__(status_code, message, detail)
++        self.retry_after = retry_after
+diff --git a/snow_sync/sync.py b/snow_sync/sync.py
+new file mode 100644
+index 0000000..73393d5
+--- /dev/null
++++ b/snow_sync/sync.py
+@@ -0,0 +1,55 @@
++"""Idempotent incident synchronization on top of the Table API client."""
++
++from dataclasses import dataclass, field
++
++from snow_sync.client import TableClient
++
++
++@dataclass
++class SyncReport:
++    created: int = 0
++    updated: int = 0
++    skipped: int = 0
++    sys_ids: dict = field(default_factory=dict)
++
++
++class IncidentSyncer:
++    TABLE = "incident"
++
++    def __init__(self, client: TableClient, key_field="correlation_id"):
++        self.client = client
++        self.key_field = key_field
++
++    def sync(self, desired):
++        report = SyncReport()
++        if not desired:
++            return report
++        keys = [d[self.key_field] for d in desired]
++        value_fields = sorted(
++            {f for d in desired for f in d if f != self.key_field})
++        lookup_fields = ["sys_id", self.key_field] + value_fields
++        query = f"{self.key_field}IN{','.join(keys)}^ORDERBYsys_id"
++        existing = {
++            rec[self.key_field]: rec
++            for rec in self.client.get_records(
++                self.TABLE, query=query, fields=lookup_fields)
++        }
++        for want in desired:
++            key = want[self.key_field]
++            current = existing.get(key)
++            if current is None:
++                created = self.client.create_record(self.TABLE, dict(want))
++                report.created += 1
++                report.sys_ids[key] = created["sys_id"]
++                continue
++            changes = {
++                f: v for f, v in want.items()
++                if f != self.key_field and str(current.get(f, "")) != str(v)
++            }
++            if changes:
++                self.client.update_record(self.TABLE, current["sys_id"], changes)
++                report.updated += 1
++            else:
++                report.skipped += 1
++            report.sys_ids[key] = current["sys_id"]
++        return report

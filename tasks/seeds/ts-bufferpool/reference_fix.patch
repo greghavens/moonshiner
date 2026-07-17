@@ -1,0 +1,335 @@
+diff --git a/disk.ts b/disk.ts
+new file mode 100644
+index 0000000..547feeb
+--- /dev/null
++++ b/disk.ts
+@@ -0,0 +1,50 @@
++import { PageError } from './errors.ts';
++
++/**
++ * MemoryDisk is the fake backing store: fixed-size pages addressed by
++ * sequential ids, with a journal of every read/write so tests (and the
++ * pool's callers) can audit I/O ordering. Allocation is not I/O.
++ */
++export class MemoryDisk {
++  readonly pageSize: number;
++  readonly journal: string[] = [];
++  private readonly pages = new Map<number, Uint8Array>();
++  private nextId = 1;
++
++  constructor(pageSize: number) {
++    if (!Number.isInteger(pageSize) || pageSize < 1) {
++      throw new PageError('pageSize must be a positive integer');
++    }
++    this.pageSize = pageSize;
++  }
++
++  /** Allocates a fresh zero-filled page and returns its id. */
++  allocate(): number {
++    const id = this.nextId++;
++    this.pages.set(id, new Uint8Array(this.pageSize));
++    return id;
++  }
++
++  /** Returns a copy of the page's bytes. */
++  read(id: number): Uint8Array {
++    const page = this.pages.get(id);
++    if (page === undefined) {
++      throw new PageError(`read: unknown page ${id}`);
++    }
++    this.journal.push(`read ${id}`);
++    return page.slice();
++  }
++
++  /** Stores a copy of exactly pageSize bytes. */
++  write(id: number, bytes: Uint8Array): void {
++    const page = this.pages.get(id);
++    if (page === undefined) {
++      throw new PageError(`write: unknown page ${id}`);
++    }
++    if (bytes.length !== this.pageSize) {
++      throw new PageError(`write: page ${id} expects ${this.pageSize} bytes, got ${bytes.length}`);
++    }
++    this.journal.push(`write ${id}`);
++    this.pages.set(id, bytes.slice());
++  }
++}
+diff --git a/errors.ts b/errors.ts
+new file mode 100644
+index 0000000..4489677
+--- /dev/null
++++ b/errors.ts
+@@ -0,0 +1,15 @@
++/** Base error for every disk and pool misuse. */
++export class PageError extends Error {
++  constructor(message: string) {
++    super(message);
++    this.name = 'PageError';
++  }
++}
++
++/** Thrown when a frame is needed but every frame is pinned. */
++export class PoolFullError extends PageError {
++  constructor(capacity: number) {
++    super(`pool is full: all ${capacity} frames are pinned`);
++    this.name = 'PoolFullError';
++  }
++}
+diff --git a/pool.ts b/pool.ts
+new file mode 100644
+index 0000000..fb83c44
+--- /dev/null
++++ b/pool.ts
+@@ -0,0 +1,166 @@
++import { MemoryDisk } from './disk.ts';
++import { PageError, PoolFullError } from './errors.ts';
++import { Lru2Replacer } from './replacer.ts';
++
++export { MemoryDisk } from './disk.ts';
++export { PageError, PoolFullError } from './errors.ts';
++
++export interface BufferPoolOptions {
++  capacity: number;
++  /** Accesses within this many ticks of a page's previous access are
++   *  correlated (one burst, one distinct reference). Default 0. */
++  correlatedPeriod?: number;
++}
++
++export interface PoolStats {
++  capacity: number;
++  resident: number;
++  pinned: number;
++  dirty: number;
++  hits: number;
++  misses: number;
++  evictions: number;
++}
++
++interface Frame {
++  buffer: Uint8Array;
++  pins: number;
++  dirty: boolean;
++}
++
++/**
++ * BufferPool caches disk pages in a bounded set of frames with pin
++ * counting, dirty tracking, and LRU-2 eviction (see replacer.ts for the
++ * policy). All ordering-sensitive I/O goes through the disk journal:
++ * dirty evictions write back before the replacement read; clean evictions
++ * never write.
++ */
++export class BufferPool {
++  private readonly disk: MemoryDisk;
++  private readonly capacity: number;
++  private readonly replacer: Lru2Replacer;
++  private readonly frames = new Map<number, Frame>();
++  private tick = 0;
++  private hits = 0;
++  private misses = 0;
++  private evictions = 0;
++
++  constructor(disk: MemoryDisk, options: BufferPoolOptions) {
++    if (!Number.isInteger(options.capacity) || options.capacity < 1) {
++      throw new PageError('capacity must be a positive integer');
++    }
++    this.disk = disk;
++    this.capacity = options.capacity;
++    this.replacer = new Lru2Replacer(options.correlatedPeriod ?? 0);
++  }
++
++  /**
++   * Allocates a fresh zero-filled page, pinned. Frame space is secured
++   * BEFORE the disk allocation so a full pool burns no page id.
++   */
++  newPage(): { id: number; buffer: Uint8Array } {
++    this.ensureFrame();
++    const id = this.disk.allocate();
++    this.replacer.access(id, ++this.tick);
++    const frame: Frame = { buffer: new Uint8Array(this.disk.pageSize), pins: 1, dirty: false };
++    this.frames.set(id, frame);
++    return { id, buffer: frame.buffer };
++  }
++
++  /** Pins and returns the page's frame buffer, loading it on a miss. */
++  fetch(id: number): Uint8Array {
++    const resident = this.frames.get(id);
++    if (resident !== undefined) {
++      this.replacer.access(id, ++this.tick);
++      this.hits++;
++      resident.pins++;
++      return resident.buffer;
++    }
++    this.ensureFrame();
++    // The read may throw (unknown page); nothing is registered yet, so a
++    // failed fetch leaks no frame, consumes no tick, records no history.
++    const buffer = this.disk.read(id);
++    this.replacer.access(id, ++this.tick);
++    this.misses++;
++    this.frames.set(id, { buffer, pins: 1, dirty: false });
++    return buffer;
++  }
++
++  /** Drops one pin; dirty=true marks the page for write-back. */
++  unpin(id: number, dirty: boolean): void {
++    const frame = this.frames.get(id);
++    if (frame === undefined) {
++      throw new PageError(`unpin: page ${id} is not resident`);
++    }
++    if (frame.pins === 0) {
++      throw new PageError(`unpin: page ${id} is not pinned`);
++    }
++    frame.pins--;
++    frame.dirty = frame.dirty || dirty;
++  }
++
++  /** Pure observer: no pin, no tick, no history effect. */
++  contains(id: number): boolean {
++    return this.frames.has(id);
++  }
++
++  /** Writes the page back if dirty and clears the flag; no-op when clean. */
++  flush(id: number): void {
++    const frame = this.frames.get(id);
++    if (frame === undefined) {
++      throw new PageError(`flush: page ${id} is not resident`);
++    }
++    if (frame.dirty) {
++      this.disk.write(id, frame.buffer);
++      frame.dirty = false;
++    }
++  }
++
++  /** Flushes every dirty page in ascending page-id order. */
++  flushAll(): void {
++    const dirtyIds: number[] = [];
++    for (const [id, frame] of this.frames) {
++      if (frame.dirty) dirtyIds.push(id);
++    }
++    dirtyIds.sort((a, b) => a - b);
++    for (const id of dirtyIds) this.flush(id);
++  }
++
++  stats(): PoolStats {
++    let pinned = 0;
++    let dirty = 0;
++    for (const frame of this.frames.values()) {
++      if (frame.pins > 0) pinned++;
++      if (frame.dirty) dirty++;
++    }
++    return {
++      capacity: this.capacity,
++      resident: this.frames.size,
++      pinned,
++      dirty,
++      hits: this.hits,
++      misses: this.misses,
++      evictions: this.evictions,
++    };
++  }
++
++  /** Guarantees a free frame, evicting the LRU-2 victim if needed. */
++  private ensureFrame(): void {
++    if (this.frames.size < this.capacity) return;
++    const candidates: number[] = [];
++    for (const [id, frame] of this.frames) {
++      if (frame.pins === 0) candidates.push(id);
++    }
++    const victim = this.replacer.victim(candidates);
++    if (victim === undefined) {
++      throw new PoolFullError(this.capacity);
++    }
++    const frame = this.frames.get(victim)!;
++    if (frame.dirty) {
++      this.disk.write(victim, frame.buffer); // write-back precedes any reload
++    }
++    this.frames.delete(victim);
++    this.replacer.drop(victim);
++    this.evictions++;
++  }
++}
+diff --git a/replacer.ts b/replacer.ts
+new file mode 100644
+index 0000000..1c46985
+--- /dev/null
++++ b/replacer.ts
+@@ -0,0 +1,80 @@
++/**
++ * LRU-2 replacement policy with a correlated-reference period.
++ *
++ * Time is a global tick the POOL advances (one per successful access).
++ * Per tracked page the replacer keeps:
++ *   last — tick of the most recent access of any kind, and
++ *   hist — ticks of the most recent DISTINCT references, newest first,
++ *          at most two.
++ * An access within `period` ticks of `last` is correlated: it extends the
++ * burst (last = t) without touching hist. Bursts chain — each access only
++ * has to be close to the previous one, not to the burst's start.
++ *
++ * Victim order (unpinned pages only, pinning is the pool's business):
++ *   1. pages with fewer than two distinct references, oldest hist[0] first
++ *      (their backward 2-distance is infinite);
++ *   2. then the page with the smallest hist[1].
++ * Ticks are unique, so selection is total and deterministic.
++ */
++
++interface History {
++  last: number;
++  hist: number[]; // newest first, length <= 2
++}
++
++export class Lru2Replacer {
++  private readonly period: number;
++  private readonly entries = new Map<number, History>();
++
++  constructor(period: number) {
++    this.period = period;
++  }
++
++  /** Records an access to id at the given tick. */
++  access(id: number, tick: number): void {
++    const entry = this.entries.get(id);
++    if (entry === undefined) {
++      this.entries.set(id, { last: tick, hist: [tick] });
++      return;
++    }
++    if (tick - entry.last <= this.period) {
++      entry.last = tick; // correlated: the burst absorbs it
++      return;
++    }
++    entry.hist.unshift(tick);
++    if (entry.hist.length > 2) entry.hist.length = 2;
++    entry.last = tick;
++  }
++
++  /** Forgets a page entirely (called on eviction). */
++  drop(id: number): void {
++    this.entries.delete(id);
++  }
++
++  /**
++   * Picks the victim among the given candidate ids, or undefined when the
++   * candidate list is empty. Candidates must all be tracked.
++   */
++  victim(candidates: number[]): number | undefined {
++    let best: number | undefined;
++    let bestEntry: History | undefined;
++    for (const id of candidates) {
++      const entry = this.entries.get(id);
++      if (entry === undefined) continue;
++      if (bestEntry === undefined || Lru2Replacer.worse(entry, bestEntry)) {
++        best = id;
++        bestEntry = entry;
++      }
++    }
++    return best;
++  }
++
++  /** Returns true when a is a better eviction victim than b. */
++  private static worse(a: History, b: History): boolean {
++    const aInf = a.hist.length < 2;
++    const bInf = b.hist.length < 2;
++    if (aInf !== bInf) return aInf; // infinite distance evicts first
++    if (aInf) return a.hist[0] < b.hist[0]; // oldest first touch loses
++    return a.hist[1] < b.hist[1]; // oldest second-most-recent reference loses
++  }
++}

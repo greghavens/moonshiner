@@ -1,0 +1,220 @@
+diff --git a/Lease.java b/Lease.java
+new file mode 100644
+index 0000000..f407042
+--- /dev/null
++++ b/Lease.java
+@@ -0,0 +1,23 @@
++/**
++ * Single-owner handle to one pooled resource. Dies exactly once: close()
++ * returns the resource to the pool, discard() retires a broken resource on
++ * the spot. Whichever happens first wins; the loser is a silent no-op.
++ */
++public interface Lease<R> extends AutoCloseable {
++
++    /** The leased resource. Throws IllegalStateException once the lease is dead. */
++    R get();
++
++    /** Acquisition-ordered id, starting at 1. */
++    int id();
++
++    /** True until the lease is closed, discarded, or annulled by pool close. */
++    boolean active();
++
++    /** Retires the resource immediately (broken kernel session) and frees the seat. */
++    void discard();
++
++    /** Returns the resource to the pool. No-op if the lease is already dead. */
++    @Override
++    void close();
++}
+diff --git a/LeasePool.java b/LeasePool.java
+new file mode 100644
+index 0000000..048e80d
+--- /dev/null
++++ b/LeasePool.java
+@@ -0,0 +1,172 @@
++import java.util.ArrayDeque;
++import java.util.ArrayList;
++import java.util.Deque;
++import java.util.List;
++import java.util.function.Consumer;
++import java.util.function.Supplier;
++
++/**
++ * Deterministic single-threaded lease pool over expensive resources
++ * (floating-license kernel sessions). Lazily creates up to maxSize
++ * resources, reuses idle ones LIFO, tracks outstanding leases for leak
++ * reports, and on close() annuls whatever is still checked out.
++ */
++public final class LeasePool<R> implements AutoCloseable {
++
++    private enum LeaseState { ACTIVE, CLOSED, DISCARDED, ANNULLED }
++
++    private final class LeaseImpl implements Lease<R> {
++        private final int id;
++        private final R resource;
++        private LeaseState state = LeaseState.ACTIVE;
++
++        LeaseImpl(int id, R resource) {
++            this.id = id;
++            this.resource = resource;
++        }
++
++        @Override
++        public R get() {
++            switch (state) {
++                case ACTIVE:
++                    return resource;
++                case CLOSED:
++                    throw new IllegalStateException("lease " + id + " is closed");
++                case DISCARDED:
++                    throw new IllegalStateException("lease " + id + " was discarded");
++                default:
++                    throw new IllegalStateException("lease " + id + " was annulled by pool close");
++            }
++        }
++
++        @Override
++        public int id() {
++            return id;
++        }
++
++        @Override
++        public boolean active() {
++            return state == LeaseState.ACTIVE;
++        }
++
++        @Override
++        public void close() {
++            if (state != LeaseState.ACTIVE) {
++                return; // already dead — double return must not fabricate an idle entry
++            }
++            state = LeaseState.CLOSED;
++            outstanding.remove(this);
++            idle.push(resource);
++        }
++
++        @Override
++        public void discard() {
++            if (state != LeaseState.ACTIVE) {
++                return;
++            }
++            state = LeaseState.DISCARDED;
++            outstanding.remove(this);
++            doRetire(resource);
++        }
++    }
++
++    private final int maxSize;
++    private final Supplier<? extends R> factory;
++    private final Consumer<? super R> retire;
++    private final Deque<R> idle = new ArrayDeque<>();
++    private final List<LeaseImpl> outstanding = new ArrayList<>(); // ascending lease id
++    private boolean closed;
++    private int nextId = 1;
++    private int created;
++    private int retired;
++
++    public LeasePool(int maxSize, Supplier<? extends R> factory, Consumer<? super R> retire) {
++        if (maxSize < 1) {
++            throw new IllegalArgumentException("maxSize must be >= 1");
++        }
++        if (factory == null) {
++            throw new IllegalArgumentException("factory must not be null");
++        }
++        if (retire == null) {
++            throw new IllegalArgumentException("retire must not be null");
++        }
++        this.maxSize = maxSize;
++        this.factory = factory;
++        this.retire = retire;
++    }
++
++    /** Checks out a resource: idle LIFO first, then lazy creation, else exhausted. */
++    public Lease<R> acquire() {
++        if (closed) {
++            throw new IllegalStateException("pool is closed");
++        }
++        R resource;
++        if (!idle.isEmpty()) {
++            resource = idle.pop();
++        } else if (outstanding.size() < maxSize) {
++            resource = factory.get(); // a throw here must leave the pool untouched
++            if (resource == null) {
++                throw new IllegalStateException("factory returned null");
++            }
++            created++;
++        } else {
++            throw new PoolExhaustedException("pool exhausted: all " + maxSize + " permits leased");
++        }
++        LeaseImpl lease = new LeaseImpl(nextId++, resource);
++        outstanding.add(lease);
++        return lease;
++    }
++
++    public int idleCount() {
++        return idle.size();
++    }
++
++    public int outstandingCount() {
++        return outstanding.size();
++    }
++
++    /** Ascending ids of every lease still checked out — the leak report. */
++    public List<Integer> outstandingIds() {
++        List<Integer> ids = new ArrayList<>(outstanding.size());
++        for (LeaseImpl lease : outstanding) {
++            ids.add(lease.id);
++        }
++        return List.copyOf(ids);
++    }
++
++    /** Factory successes ever. */
++    public int createdCount() {
++        return created;
++    }
++
++    /** Retire calls ever. */
++    public int retiredCount() {
++        return retired;
++    }
++
++    /**
++     * Annuls-and-drains: retires idle resources (LIFO), then outstanding
++     * resources in ascending lease-id order, flipping their leases to the
++     * annulled state. Idempotent.
++     */
++    @Override
++    public void close() {
++        if (closed) {
++            return;
++        }
++        closed = true;
++        while (!idle.isEmpty()) {
++            doRetire(idle.pop());
++        }
++        for (LeaseImpl lease : new ArrayList<>(outstanding)) {
++            lease.state = LeaseState.ANNULLED;
++            doRetire(lease.resource);
++        }
++        outstanding.clear();
++    }
++
++    private void doRetire(R resource) {
++        retire.accept(resource);
++        retired++;
++    }
++}
+diff --git a/PoolExhaustedException.java b/PoolExhaustedException.java
+new file mode 100644
+index 0000000..21a749f
+--- /dev/null
++++ b/PoolExhaustedException.java
+@@ -0,0 +1,7 @@
++/** Thrown when every licensed seat is checked out and none is idle. */
++public class PoolExhaustedException extends RuntimeException {
++
++    public PoolExhaustedException(String message) {
++        super(message);
++    }
++}

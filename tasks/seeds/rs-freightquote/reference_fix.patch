@@ -1,0 +1,1007 @@
+diff --git a/src/audit.rs b/src/audit.rs
+index c97505f..1723d2c 100644
+--- a/src/audit.rs
++++ b/src/audit.rs
+@@ -1,3 +1,116 @@
+ //! Audit-trail export: renders a `Quote` as the fixed plaintext format the
+ //! rating desk files with each quote — one line per applied rule, each with
+ //! the running total.
++
++use std::fmt::Write;
++
++use crate::quote::Quote;
++
++/// Basis points as the shortest exact decimal: 1250 -> "12.5", 400 -> "4",
++/// 25 -> "0.25".
++fn percent(bp: u32) -> String {
++    let whole = bp / 100;
++    let frac = bp % 100;
++    if frac == 0 {
++        format!("{}", whole)
++    } else if frac % 10 == 0 {
++        format!("{}.{}", whole, frac / 10)
++    } else {
++        format!("{}.{:02}", whole, frac)
++    }
++}
++
++pub fn render(q: &Quote) -> String {
++    let mut out = String::new();
++    let _ = writeln!(
++        out,
++        "quote {} {} -> {} {} lb",
++        q.reference, q.origin, q.dest, q.weight_lbs
++    );
++    let _ = writeln!(
++        out,
++        "lane: zone {} -> zone {}, scale {}",
++        q.origin_zone, q.dest_zone, q.scale
++    );
++
++    let lh = &q.linehaul;
++    let _ = writeln!(
++        out,
++        "linehaul: {} cwt @ {}/cwt = {} | total {}",
++        lh.cwt, lh.rate, lh.base, lh.base
++    );
++    if let Some(r) = &lh.rebill {
++        let _ = writeln!(
++            out,
++            "deficit-weight: rebill at {} lb, {} cwt @ {}/cwt = {} | total {}",
++            r.lbs, r.cwt, r.rate, r.cost, r.cost
++        );
++    }
++    if lh.minimum_applied {
++        let _ = writeln!(
++            out,
++            "minimum-charge: raised to {} | total {}",
++            lh.total, lh.total
++        );
++    }
++
++    let mut running = lh.total;
++    for a in &q.surcharges {
++        if a.waived {
++            let _ = writeln!(
++                out,
++                "surcharge {}: waived by contract | total {}",
++                a.code, running
++            );
++            continue;
++        }
++        running = running.plus(a.amount);
++        match (a.percent, a.base) {
++            (Some(bp), Some(base)) => {
++                if a.capped {
++                    let _ = writeln!(
++                        out,
++                        "surcharge {} ({}% of {}, capped at {}): +{} | total {}",
++                        a.code,
++                        percent(bp),
++                        base,
++                        a.cap.expect("capped implies a cap"),
++                        a.amount,
++                        running
++                    );
++                } else {
++                    let _ = writeln!(
++                        out,
++                        "surcharge {} ({}% of {}): +{} | total {}",
++                        a.code,
++                        percent(bp),
++                        base,
++                        a.amount,
++                        running
++                    );
++                }
++            }
++            _ => {
++                if a.capped {
++                    let _ = writeln!(
++                        out,
++                        "surcharge {} (flat, capped at {}): +{} | total {}",
++                        a.code,
++                        a.cap.expect("capped implies a cap"),
++                        a.amount,
++                        running
++                    );
++                } else {
++                    let _ = writeln!(
++                        out,
++                        "surcharge {} (flat): +{} | total {}",
++                        a.code, a.amount, running
++                    );
++                }
++            }
++        }
++    }
++
++    let _ = writeln!(out, "total: {}", q.total);
++    out
++}
+diff --git a/src/brackets.rs b/src/brackets.rs
+index 13ec247..89cde38 100644
+--- a/src/brackets.rs
++++ b/src/brackets.rs
+@@ -1,2 +1,98 @@
+ //! Weight-break rate scales: billed hundredweight, bracket selection
+ //! (floors inclusive), deficit-weight rebilling, and the scale minimum.
++
++use crate::money::Money;
++
++/// A rate scale: bracket floors in lbs (inclusive) -> rate per cwt, plus a
++/// minimum charge. Floors are multiples of 100; `from_0` always exists.
++#[derive(Debug, Clone)]
++pub struct RateScale {
++    pub minimum: Money,
++    brackets: Vec<(u32, Money)>,
++}
++
++/// A deficit-weight rebill: the shipment was billed as if it weighed `lbs`.
++#[derive(Debug, Clone)]
++pub struct Rebill {
++    pub lbs: u32,
++    pub cwt: u32,
++    pub rate: Money,
++    pub cost: Money,
++}
++
++/// The full linehaul story for one shipment on one scale.
++#[derive(Debug, Clone)]
++pub struct Linehaul {
++    pub weight_lbs: u32,
++    /// Natural billed hundredweight: weight rounded up to the next 100 lb.
++    pub cwt: u32,
++    /// Natural bracket rate (largest floor <= weight).
++    pub rate: Money,
++    /// Natural cost: cwt * rate.
++    pub base: Money,
++    pub rebill: Option<Rebill>,
++    pub minimum_applied: bool,
++    /// After rebill and minimum.
++    pub total: Money,
++}
++
++impl RateScale {
++    pub fn new(minimum: Money, mut brackets: Vec<(u32, Money)>) -> RateScale {
++        brackets.sort_by_key(|(floor, _)| *floor);
++        RateScale { minimum, brackets }
++    }
++
++    pub fn price(&self, weight_lbs: u32) -> Linehaul {
++        let cwt = (weight_lbs + 99) / 100;
++        let (_, rate) = self
++            .brackets
++            .iter()
++            .rev()
++            .find(|(floor, _)| *floor <= weight_lbs)
++            .copied()
++            .expect("from_0 guarantees a bracket");
++        let base = Money::from_cents(cwt as i64 * rate.cents());
++
++        // Deficit-weight: price the shipment at every higher floor; a
++        // STRICTLY cheaper alternative wins (ties keep the natural bracket,
++        // and among tied alternatives the lower floor wins).
++        let mut rebill: Option<Rebill> = None;
++        for (floor, alt_rate) in self.brackets.iter().copied() {
++            if floor <= weight_lbs {
++                continue;
++            }
++            let alt_cwt = floor / 100;
++            let cost = Money::from_cents(alt_cwt as i64 * alt_rate.cents());
++            let beats = match &rebill {
++                None => cost.cents() < base.cents(),
++                Some(r) => cost.cents() < r.cost.cents(),
++            };
++            if beats {
++                rebill = Some(Rebill {
++                    lbs: floor,
++                    cwt: alt_cwt,
++                    rate: alt_rate,
++                    cost,
++                });
++            }
++        }
++
++        let after_rebill = rebill.as_ref().map(|r| r.cost).unwrap_or(base);
++        let minimum_applied = after_rebill.cents() < self.minimum.cents();
++        let total = if minimum_applied {
++            self.minimum
++        } else {
++            after_rebill
++        };
++
++        Linehaul {
++            weight_lbs,
++            cwt,
++            rate,
++            base,
++            rebill,
++            minimum_applied,
++            total,
++        }
++    }
++}
+diff --git a/src/money.rs b/src/money.rs
+index edd9f4e..d7cbfdc 100644
+--- a/src/money.rs
++++ b/src/money.rs
+@@ -1,2 +1,35 @@
+ //! Money as integer cents. Display renders `$D.CC`; `percent_of` applies a
+ //! basis-point percentage with half-up rounding. No floats anywhere.
++
++use std::fmt;
++
++/// An amount in integer cents. Percentages are basis points (12.5% = 1250).
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
++pub struct Money {
++    cents: i64,
++}
++
++impl Money {
++    pub fn from_cents(cents: i64) -> Money {
++        Money { cents }
++    }
++
++    pub fn cents(self) -> i64 {
++        self.cents
++    }
++
++    /// `bp` basis points of this amount, rounded half-up in integer math.
++    pub fn percent_of(self, bp: u32) -> Money {
++        Money::from_cents((self.cents * bp as i64 + 5000) / 10000)
++    }
++
++    pub fn plus(self, other: Money) -> Money {
++        Money::from_cents(self.cents + other.cents)
++    }
++}
++
++impl fmt::Display for Money {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "${}.{:02}", self.cents / 100, self.cents % 100)
++    }
++}
+diff --git a/src/quote.rs b/src/quote.rs
+index 3c30c12..e37e6ac 100644
+--- a/src/quote.rs
++++ b/src/quote.rs
+@@ -1,2 +1,96 @@
+ //! The quote pipeline: resolve zones and lane, price the linehaul on the
+ //! lane's scale, stack surcharges in sheet order, produce a `Quote`.
++
++use std::collections::BTreeSet;
++use std::fmt;
++
++use crate::brackets::Linehaul;
++use crate::money::Money;
++use crate::surcharge::Applied;
++use crate::tariff::Tariff;
++
++#[derive(Debug, Clone)]
++pub struct Shipment {
++    pub reference: String,
++    pub origin: String,
++    pub dest: String,
++    pub weight_lbs: u32,
++    /// Service flags matched against surcharge `requires` values.
++    pub flags: BTreeSet<String>,
++    /// Surcharge codes waived by contract.
++    pub waivers: BTreeSet<String>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum QuoteError {
++    BadWeight,
++    UnknownStation(String),
++    NoLane(u8, u8),
++}
++
++impl fmt::Display for QuoteError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            QuoteError::BadWeight => write!(f, "weight must be at least 1 lb"),
++            QuoteError::UnknownStation(s) => write!(f, "unknown station '{}'", s),
++            QuoteError::NoLane(o, d) => write!(f, "no lane from zone {} to zone {}", o, d),
++        }
++    }
++}
++
++#[derive(Debug, Clone)]
++pub struct Quote {
++    pub reference: String,
++    pub origin: String,
++    pub dest: String,
++    pub weight_lbs: u32,
++    pub origin_zone: u8,
++    pub dest_zone: u8,
++    pub scale: String,
++    pub linehaul: Linehaul,
++    pub surcharges: Vec<Applied>,
++    pub total: Money,
++}
++
++pub fn quote(tariff: &Tariff, shipment: &Shipment) -> Result<Quote, QuoteError> {
++    if shipment.weight_lbs == 0 {
++        return Err(QuoteError::BadWeight);
++    }
++    let origin_zone = tariff
++        .zones
++        .zone(&shipment.origin)
++        .ok_or_else(|| QuoteError::UnknownStation(shipment.origin.clone()))?;
++    let dest_zone = tariff
++        .zones
++        .zone(&shipment.dest)
++        .ok_or_else(|| QuoteError::UnknownStation(shipment.dest.clone()))?;
++    let scale_name = tariff
++        .lanes
++        .scale(origin_zone, dest_zone)
++        .ok_or(QuoteError::NoLane(origin_zone, dest_zone))?
++        .to_string();
++    let scale = &tariff.scales[&scale_name];
++
++    let linehaul = scale.price(shipment.weight_lbs);
++    let mut running = linehaul.total;
++    let mut surcharges = Vec::new();
++    for def in &tariff.surcharges {
++        if let Some(applied) = def.apply(running, &shipment.flags, &shipment.waivers) {
++            running = running.plus(applied.amount);
++            surcharges.push(applied);
++        }
++    }
++
++    Ok(Quote {
++        reference: shipment.reference.clone(),
++        origin: shipment.origin.clone(),
++        dest: shipment.dest.clone(),
++        weight_lbs: shipment.weight_lbs,
++        origin_zone,
++        dest_zone,
++        scale: scale_name,
++        linehaul,
++        surcharges,
++        total: running,
++    })
++}
+diff --git a/src/ratefile.rs b/src/ratefile.rs
+index 037f5d1..306c42b 100644
+--- a/src/ratefile.rs
++++ b/src/ratefile.rs
+@@ -2,3 +2,227 @@
+ //! headers, `key = value` entries, typed values (int / $money / percent% /
+ //! "string" / bool), `#` comments, and parse errors carrying 1-based line
+ //! numbers. No external crates — this parser is part of the deliverable.
++
++use std::fmt;
++
++use crate::money::Money;
++
++/// A typed sheet value. There is deliberately no float type: money carries
++/// a `$` and exactly two decimals, percentages carry a `%`.
++#[derive(Debug, Clone, PartialEq)]
++pub enum Value {
++    Str(String),
++    Int(i64),
++    Money(Money),
++    Percent(u32),
++    Bool(bool),
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct ParseError {
++    pub line: usize,
++    pub message: String,
++}
++
++impl fmt::Display for ParseError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "rates:{}: {}", self.line, self.message)
++    }
++}
++
++#[derive(Debug, Clone)]
++struct Section {
++    name: String,
++    entries: Vec<(String, Value)>,
++}
++
++/// A parsed sheet: sections and keys in document order, values typed.
++#[derive(Debug, Clone)]
++pub struct RateFile {
++    sections: Vec<Section>,
++}
++
++fn is_key_char(c: char) -> bool {
++    c.is_ascii_alphanumeric() || c == '_' || c == '-'
++}
++
++fn is_section_char(c: char) -> bool {
++    c.is_ascii_alphanumeric() || c == '_'
++}
++
++fn parse_int(token: &str) -> Option<i64> {
++    let body = token.strip_prefix('-').unwrap_or(token);
++    if body.is_empty() || !body.bytes().all(|b| b.is_ascii_digit()) {
++        return None;
++    }
++    token.parse().ok()
++}
++
++fn parse_money(token: &str) -> Option<Money> {
++    let body = token.strip_prefix('$')?;
++    let (whole, frac) = body.split_once('.')?;
++    if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) {
++        return None;
++    }
++    if frac.len() != 2 || !frac.bytes().all(|b| b.is_ascii_digit()) {
++        return None;
++    }
++    let dollars: i64 = whole.parse().ok()?;
++    let cents: i64 = frac.parse().ok()?;
++    Some(Money::from_cents(dollars * 100 + cents))
++}
++
++fn parse_percent(token: &str) -> Option<u32> {
++    let body = token.strip_suffix('%')?;
++    let (whole, frac) = match body.split_once('.') {
++        Some((w, f)) => (w, Some(f)),
++        None => (body, None),
++    };
++    if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) {
++        return None;
++    }
++    let mut bp: u32 = whole.parse::<u32>().ok()?.checked_mul(100)?;
++    if let Some(f) = frac {
++        if f.is_empty() || f.len() > 2 || !f.bytes().all(|b| b.is_ascii_digit()) {
++            return None;
++        }
++        let scale = if f.len() == 1 { 10 } else { 1 };
++        bp = bp.checked_add(f.parse::<u32>().ok()? * scale)?;
++    }
++    Some(bp)
++}
++
++impl RateFile {
++    pub fn parse(src: &str) -> Result<RateFile, ParseError> {
++        let mut sections: Vec<Section> = Vec::new();
++
++        for (idx, raw) in src.lines().enumerate() {
++            let line = idx + 1;
++            let fail = |message: &str| ParseError {
++                line,
++                message: message.to_string(),
++            };
++            let trimmed = raw.trim();
++            if trimmed.is_empty() || trimmed.starts_with('#') {
++                continue;
++            }
++
++            if trimmed.starts_with('[') {
++                // No strings can appear in a header, so '#' always starts a comment.
++                let head = match trimmed.find('#') {
++                    Some(p) => trimmed[..p].trim_end(),
++                    None => trimmed,
++                };
++                let close = match head.find(']') {
++                    Some(p) => p,
++                    None => return Err(fail("malformed section header")),
++                };
++                let name = head[1..close].trim();
++                if !head[close + 1..].trim().is_empty()
++                    || name.is_empty()
++                    || !name.chars().all(is_section_char)
++                {
++                    return Err(fail("malformed section header"));
++                }
++                if sections.iter().any(|s| s.name == name) {
++                    return Err(ParseError {
++                        line,
++                        message: format!("duplicate section '{}'", name),
++                    });
++                }
++                sections.push(Section {
++                    name: name.to_string(),
++                    entries: Vec::new(),
++                });
++                continue;
++            }
++
++            let eq = match trimmed.find('=') {
++                Some(p) => p,
++                None => return Err(fail("expected '=' after key")),
++            };
++            let key = trimmed[..eq].trim_end();
++            if key.is_empty() || !key.chars().all(is_key_char) {
++                return Err(fail("malformed key"));
++            }
++            if sections.is_empty() {
++                return Err(fail("key before any section"));
++            }
++
++            let vraw = trimmed[eq + 1..].trim();
++            let (value, tail) = if let Some(inner) = vraw.strip_prefix('"') {
++                match inner.find('"') {
++                    None => return Err(fail("unterminated string")),
++                    Some(p) => (Value::Str(inner[..p].to_string()), inner[p + 1..].trim()),
++                }
++            } else {
++                let visible = match vraw.find('#') {
++                    Some(p) => vraw[..p].trim_end(),
++                    None => vraw,
++                };
++                let (token, rest) = match visible.split_once(char::is_whitespace) {
++                    Some((t, r)) => (t, r.trim()),
++                    None => (visible, ""),
++                };
++                if token.is_empty() {
++                    return Err(fail("unrecognized value"));
++                }
++                let value = if token.starts_with('$') {
++                    Value::Money(parse_money(token).ok_or_else(|| fail("bad money amount"))?)
++                } else if token.ends_with('%') {
++                    Value::Percent(parse_percent(token).ok_or_else(|| fail("bad percent"))?)
++                } else if token == "true" {
++                    Value::Bool(true)
++                } else if token == "false" {
++                    Value::Bool(false)
++                } else if let Some(n) = parse_int(token) {
++                    Value::Int(n)
++                } else {
++                    return Err(fail("unrecognized value"));
++                };
++                (value, rest)
++            };
++
++            // After a complete value only whitespace or a comment may follow.
++            let tail = if tail.starts_with('#') { "" } else { tail };
++            if !tail.is_empty() {
++                return Err(fail("trailing characters after value"));
++            }
++
++            let section = sections.last_mut().expect("checked above");
++            if section.entries.iter().any(|(k, _)| k == key) {
++                return Err(ParseError {
++                    line,
++                    message: format!("duplicate key '{}' in section '{}'", key, section.name),
++                });
++            }
++            section.entries.push((key.to_string(), value));
++        }
++
++        Ok(RateFile { sections })
++    }
++
++    /// Section names in document order.
++    pub fn sections(&self) -> Vec<&str> {
++        self.sections.iter().map(|s| s.name.as_str()).collect()
++    }
++
++    /// Keys of one section in document order; empty for an unknown section.
++    pub fn keys(&self, section: &str) -> Vec<&str> {
++        self.sections
++            .iter()
++            .find(|s| s.name == section)
++            .map(|s| s.entries.iter().map(|(k, _)| k.as_str()).collect())
++            .unwrap_or_default()
++    }
++
++    pub fn get(&self, section: &str, key: &str) -> Option<&Value> {
++        self.sections
++            .iter()
++            .find(|s| s.name == section)?
++            .entries
++            .iter()
++            .find(|(k, _)| k == key)
++            .map(|(_, v)| v)
++    }
++}
+diff --git a/src/surcharge.rs b/src/surcharge.rs
+index 829a3cf..3ef0206 100644
+--- a/src/surcharge.rs
++++ b/src/surcharge.rs
+@@ -1,2 +1,84 @@
+ //! Surcharge definitions and ordered application to a running total:
+ //! percent-vs-flat kinds, caps, `requires` flags, and contract waivers.
++
++use std::collections::BTreeSet;
++
++use crate::money::Money;
++
++#[derive(Debug, Clone)]
++pub enum SurchargeKind {
++    /// Basis points of the running total at application time.
++    Percent(u32),
++    Flat(Money),
++}
++
++#[derive(Debug, Clone)]
++pub struct Surcharge {
++    pub code: String,
++    pub label: String,
++    pub kind: SurchargeKind,
++    pub cap: Option<Money>,
++    pub requires: Option<String>,
++}
++
++/// One surcharge application on a quote.
++#[derive(Debug, Clone)]
++pub struct Applied {
++    pub code: String,
++    /// Basis points for a percent surcharge, None for flat.
++    pub percent: Option<u32>,
++    /// The running total a percent was computed on, None for flat.
++    pub base: Option<Money>,
++    pub amount: Money,
++    pub cap: Option<Money>,
++    pub capped: bool,
++    pub waived: bool,
++}
++
++impl Surcharge {
++    /// None: the `requires` flag is absent — the surcharge is skipped
++    /// silently. Some(waived): the code is waived by contract, $0.00.
++    pub fn apply(
++        &self,
++        running: Money,
++        flags: &BTreeSet<String>,
++        waivers: &BTreeSet<String>,
++    ) -> Option<Applied> {
++        if let Some(required) = &self.requires {
++            if !flags.contains(required) {
++                return None;
++            }
++        }
++        if waivers.contains(&self.code) {
++            return Some(Applied {
++                code: self.code.clone(),
++                percent: None,
++                base: None,
++                amount: Money::from_cents(0),
++                cap: self.cap,
++                capped: false,
++                waived: true,
++            });
++        }
++        let (percent, base, mut amount) = match &self.kind {
++            SurchargeKind::Percent(bp) => (Some(*bp), Some(running), running.percent_of(*bp)),
++            SurchargeKind::Flat(m) => (None, None, *m),
++        };
++        let mut capped = false;
++        if let Some(cap) = self.cap {
++            if amount.cents() > cap.cents() {
++                amount = cap;
++                capped = true;
++            }
++        }
++        Some(Applied {
++            code: self.code.clone(),
++            percent,
++            base,
++            amount,
++            cap: self.cap,
++            capped,
++            waived: false,
++        })
++    }
++}
+diff --git a/src/tariff.rs b/src/tariff.rs
+index 1313902..5f3c2b2 100644
+--- a/src/tariff.rs
++++ b/src/tariff.rs
+@@ -1,3 +1,276 @@
+ //! Schema layer: interprets a parsed rate sheet into a `Tariff` (zones,
+ //! lanes, rate scales, ordered surcharges), rejecting structural problems
+ //! with exact schema error messages. Also owns loading from a file path.
++
++use std::collections::BTreeMap;
++use std::fmt;
++use std::path::Path;
++
++use crate::brackets::RateScale;
++use crate::money::Money;
++use crate::ratefile::{ParseError, RateFile, Value};
++use crate::surcharge::{Surcharge, SurchargeKind};
++use crate::zones::{LaneTable, ZoneMap};
++
++#[derive(Debug)]
++pub enum TariffError {
++    Parse(ParseError),
++    Schema(String),
++    Io(String),
++}
++
++impl fmt::Display for TariffError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            TariffError::Parse(e) => write!(f, "{}", e),
++            TariffError::Schema(m) => write!(f, "schema: {}", m),
++            TariffError::Io(m) => write!(f, "io: {}", m),
++        }
++    }
++}
++
++fn schema(message: String) -> TariffError {
++    TariffError::Schema(message)
++}
++
++/// A validated tariff, ready to rate against. Surcharges keep sheet order.
++#[derive(Debug, Clone)]
++pub struct Tariff {
++    pub name: String,
++    pub zones: ZoneMap,
++    pub lanes: LaneTable,
++    pub scales: BTreeMap<String, RateScale>,
++    pub surcharges: Vec<Surcharge>,
++}
++
++impl Tariff {
++    pub fn load(path: impl AsRef<Path>) -> Result<Tariff, TariffError> {
++        let src =
++            std::fs::read_to_string(path).map_err(|e| TariffError::Io(e.to_string()))?;
++        Tariff::parse(&src)
++    }
++
++    pub fn parse(src: &str) -> Result<Tariff, TariffError> {
++        let file = RateFile::parse(src).map_err(TariffError::Parse)?;
++        Tariff::from_ratefile(&file)
++    }
++
++    fn from_ratefile(file: &RateFile) -> Result<Tariff, TariffError> {
++        let present = file.sections();
++        for required in ["meta", "zones", "lanes"] {
++            if !present.contains(&required) {
++                return Err(schema(format!("missing section [{}]", required)));
++            }
++        }
++
++        let mut name: Option<String> = None;
++        let mut zones = ZoneMap::default();
++        let mut lane_entries: Vec<(String, String)> = Vec::new();
++        let mut scales: BTreeMap<String, RateScale> = BTreeMap::new();
++        let mut surcharges: Vec<Surcharge> = Vec::new();
++
++        for section in file.sections() {
++            match section {
++                "meta" => {
++                    for key in file.keys(section) {
++                        match key {
++                            "name" => match file.get(section, key) {
++                                Some(Value::Str(s)) => name = Some(s.clone()),
++                                _ => return Err(schema("[meta] name: expected string".into())),
++                            },
++                            other => {
++                                return Err(schema(format!("[meta] {}: unknown key", other)))
++                            }
++                        }
++                    }
++                    if name.is_none() {
++                        return Err(schema("[meta]: missing key 'name'".into()));
++                    }
++                }
++                "zones" => {
++                    for key in file.keys(section) {
++                        if key.len() != 3 || !key.chars().all(|c| c.is_ascii_uppercase()) {
++                            return Err(schema(format!("[zones] {}: bad station code", key)));
++                        }
++                        match file.get(section, key) {
++                            Some(Value::Int(z)) if (1..=9).contains(z) => {
++                                zones.insert(key, *z as u8)
++                            }
++                            Some(Value::Int(_)) => {
++                                return Err(schema(format!("[zones] {}: zone must be 1..9", key)))
++                            }
++                            _ => return Err(schema(format!("[zones] {}: expected int", key))),
++                        }
++                    }
++                }
++                "lanes" => {
++                    for key in file.keys(section) {
++                        let b = key.as_bytes();
++                        let well_formed = b.len() == 3
++                            && b[1] == b'-'
++                            && (b'1'..=b'9').contains(&b[0])
++                            && (b'1'..=b'9').contains(&b[2]);
++                        if !well_formed {
++                            return Err(schema(format!("[lanes] {}: bad lane", key)));
++                        }
++                        match file.get(section, key) {
++                            Some(Value::Str(s)) => lane_entries.push((key.to_string(), s.clone())),
++                            _ => return Err(schema(format!("[lanes] {}: expected string", key))),
++                        }
++                    }
++                }
++                s if s.starts_with("scale_") => {
++                    let scale_name = &s["scale_".len()..];
++                    if scale_name.is_empty()
++                        || !scale_name
++                            .chars()
++                            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
++                    {
++                        return Err(schema(format!("[{}]: bad scale name", s)));
++                    }
++                    let mut minimum: Option<Money> = None;
++                    let mut brackets: Vec<(u32, Money)> = Vec::new();
++                    for key in file.keys(s) {
++                        if key == "minimum" {
++                            match file.get(s, key) {
++                                Some(Value::Money(m)) => minimum = Some(*m),
++                                _ => {
++                                    return Err(schema(format!("[{}] {}: expected money", s, key)))
++                                }
++                            }
++                        } else if let Some(digits) = key.strip_prefix("from_") {
++                            let floor: u32 = match digits.parse() {
++                                Ok(n) => n,
++                                Err(_) => {
++                                    return Err(schema(format!(
++                                        "[{}] {}: bad bracket key",
++                                        s, key
++                                    )))
++                                }
++                            };
++                            if floor % 100 != 0 {
++                                return Err(schema(format!(
++                                    "[{}] {}: floor must be a multiple of 100",
++                                    s, key
++                                )));
++                            }
++                            match file.get(s, key) {
++                                Some(Value::Money(m)) => brackets.push((floor, *m)),
++                                _ => {
++                                    return Err(schema(format!("[{}] {}: expected money", s, key)))
++                                }
++                            }
++                        } else {
++                            return Err(schema(format!("[{}] {}: unknown key", s, key)));
++                        }
++                    }
++                    let minimum =
++                        minimum.ok_or_else(|| schema(format!("[{}]: missing key 'minimum'", s)))?;
++                    if !brackets.iter().any(|(floor, _)| *floor == 0) {
++                        return Err(schema(format!("[{}]: missing key 'from_0'", s)));
++                    }
++                    scales.insert(scale_name.to_string(), RateScale::new(minimum, brackets));
++                }
++                s if s.starts_with("surcharge_") => {
++                    let code = &s["surcharge_".len()..];
++                    if code.is_empty()
++                        || !code
++                            .chars()
++                            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
++                    {
++                        return Err(schema(format!("[{}]: bad surcharge code", s)));
++                    }
++                    let mut label: Option<String> = None;
++                    let mut kind_name: Option<String> = None;
++                    let mut amount: Option<&Value> = None;
++                    let mut cap: Option<Money> = None;
++                    let mut requires: Option<String> = None;
++                    for key in file.keys(s) {
++                        match key {
++                            "label" => match file.get(s, key) {
++                                Some(Value::Str(v)) => label = Some(v.clone()),
++                                _ => {
++                                    return Err(schema(format!("[{}] label: expected string", s)))
++                                }
++                            },
++                            "kind" => match file.get(s, key) {
++                                Some(Value::Str(v)) if v == "percent" || v == "flat" => {
++                                    kind_name = Some(v.clone())
++                                }
++                                Some(Value::Str(_)) => {
++                                    return Err(schema(format!(
++                                        "[{}] kind: must be 'percent' or 'flat'",
++                                        s
++                                    )))
++                                }
++                                _ => return Err(schema(format!("[{}] kind: expected string", s))),
++                            },
++                            "amount" => amount = file.get(s, key),
++                            "cap" => match file.get(s, key) {
++                                Some(Value::Money(m)) => cap = Some(*m),
++                                _ => return Err(schema(format!("[{}] cap: expected money", s))),
++                            },
++                            "requires" => match file.get(s, key) {
++                                Some(Value::Str(v)) => requires = Some(v.clone()),
++                                _ => {
++                                    return Err(schema(format!(
++                                        "[{}] requires: expected string",
++                                        s
++                                    )))
++                                }
++                            },
++                            other => return Err(schema(format!("[{}] {}: unknown key", s, other))),
++                        }
++                    }
++                    let label =
++                        label.ok_or_else(|| schema(format!("[{}]: missing key 'label'", s)))?;
++                    let kind_name =
++                        kind_name.ok_or_else(|| schema(format!("[{}]: missing key 'kind'", s)))?;
++                    let amount =
++                        amount.ok_or_else(|| schema(format!("[{}]: missing key 'amount'", s)))?;
++                    let kind = if kind_name == "percent" {
++                        match amount {
++                            Value::Percent(bp) => SurchargeKind::Percent(*bp),
++                            _ => return Err(schema(format!("[{}] amount: expected percent", s))),
++                        }
++                    } else {
++                        match amount {
++                            Value::Money(m) => SurchargeKind::Flat(*m),
++                            _ => return Err(schema(format!("[{}] amount: expected money", s))),
++                        }
++                    };
++                    surcharges.push(Surcharge {
++                        code: code.to_string(),
++                        label,
++                        kind,
++                        cap,
++                        requires,
++                    });
++                }
++                other => return Err(schema(format!("[{}]: unknown section", other))),
++            }
++        }
++
++        // Lanes can reference scales declared later in the sheet, so resolve
++        // them once every section has been walked.
++        let mut lanes = LaneTable::default();
++        for (key, scale_name) in &lane_entries {
++            if !scales.contains_key(scale_name) {
++                return Err(schema(format!(
++                    "[lanes] {}: unknown scale '{}'",
++                    key, scale_name
++                )));
++            }
++            let b = key.as_bytes();
++            lanes.insert(b[0] - b'0', b[2] - b'0', scale_name);
++        }
++
++        Ok(Tariff {
++            name: name.expect("validated above"),
++            zones,
++            lanes,
++            scales,
++            surcharges,
++        })
++    }
++}
+diff --git a/src/zones.rs b/src/zones.rs
+index fda65d5..501646d 100644
+--- a/src/zones.rs
++++ b/src/zones.rs
+@@ -1,2 +1,35 @@
+ //! Station-to-zone map and the directional lane table (origin zone, dest
+ //! zone) -> rate scale name.
++
++use std::collections::BTreeMap;
++
++#[derive(Debug, Clone, Default)]
++pub struct ZoneMap {
++    stations: BTreeMap<String, u8>,
++}
++
++impl ZoneMap {
++    pub fn insert(&mut self, station: &str, zone: u8) {
++        self.stations.insert(station.to_string(), zone);
++    }
++
++    pub fn zone(&self, station: &str) -> Option<u8> {
++        self.stations.get(station).copied()
++    }
++}
++
++/// Directional: a 1-2 lane says nothing about 2-1.
++#[derive(Debug, Clone, Default)]
++pub struct LaneTable {
++    lanes: BTreeMap<(u8, u8), String>,
++}
++
++impl LaneTable {
++    pub fn insert(&mut self, origin: u8, dest: u8, scale: &str) {
++        self.lanes.insert((origin, dest), scale.to_string());
++    }
++
++    pub fn scale(&self, origin: u8, dest: u8) -> Option<&str> {
++        self.lanes.get(&(origin, dest)).map(|s| s.as_str())
++    }
++}

@@ -1,0 +1,448 @@
+diff --git a/log.go b/log.go
+new file mode 100644
+index 0000000..3f58df1
+--- /dev/null
++++ b/log.go
+@@ -0,0 +1,146 @@
++package txnredo
++
++// Redo-log format: one record per committed transaction.
++//
++//	u32 LE  payload length
++//	u32 LE  CRC-32 (IEEE) of the payload
++//	payload: ops back to back —
++//	    u8      kind (1 = set, 2 = delete)
++//	    u16 LE  key length, then the key bytes
++//	    set only: u32 LE value length, then the value bytes
++//
++// The record is the atomicity unit: recovery either applies all of a
++// record's ops or, if the record is torn, corrupt, or garbage, none.
++
++import (
++	"encoding/binary"
++	"errors"
++	"hash/crc32"
++	"io"
++)
++
++const (
++	opSet byte = 1
++	opDel byte = 2
++)
++
++var errBadPayload = errors.New("txnredo: malformed record payload")
++
++// replay applies every valid record in order, then truncates the file back
++// to the end of the last valid record so the log is immediately writable.
++func (db *DB) replay() error {
++	data, err := io.ReadAll(db.f)
++	if err != nil {
++		return err
++	}
++	valid := int64(0)
++	off := 0
++	for {
++		payload, n, ok := parseRecord(data[off:])
++		if !ok {
++			break // torn header, torn payload, or checksum mismatch
++		}
++		ops, err := decodeOps(payload)
++		if err != nil {
++			break // structurally invalid: drop the whole record
++		}
++		for _, o := range ops {
++			if o.del {
++				delete(db.data, o.key)
++			} else {
++				db.data[o.key] = o.val
++			}
++		}
++		off += n
++		valid = int64(off)
++	}
++	if valid < int64(len(data)) {
++		if err := db.f.Truncate(valid); err != nil {
++			return err
++		}
++	}
++	db.size = valid
++	return nil
++}
++
++// parseRecord frames one record off the front of b. ok is false when the
++// bytes cannot be a complete, checksum-clean record.
++func parseRecord(b []byte) (payload []byte, consumed int, ok bool) {
++	if len(b) < 8 {
++		return nil, 0, false
++	}
++	length := binary.LittleEndian.Uint32(b[0:4])
++	sum := binary.LittleEndian.Uint32(b[4:8])
++	if uint64(length) > uint64(len(b)-8) {
++		return nil, 0, false // declared payload runs past EOF: torn
++	}
++	payload = b[8 : 8+int(length)]
++	if crc32.ChecksumIEEE(payload) != sum {
++		return nil, 0, false
++	}
++	return payload, 8 + int(length), true
++}
++
++// encodeRecord serializes a transaction's ops into one framed record.
++func encodeRecord(ops []op) []byte {
++	var payload []byte
++	var u16 [2]byte
++	var u32 [4]byte
++	for _, o := range ops {
++		if o.del {
++			payload = append(payload, opDel)
++		} else {
++			payload = append(payload, opSet)
++		}
++		binary.LittleEndian.PutUint16(u16[:], uint16(len(o.key)))
++		payload = append(payload, u16[:]...)
++		payload = append(payload, o.key...)
++		if !o.del {
++			binary.LittleEndian.PutUint32(u32[:], uint32(len(o.val)))
++			payload = append(payload, u32[:]...)
++			payload = append(payload, o.val...)
++		}
++	}
++	rec := make([]byte, 8+len(payload))
++	binary.LittleEndian.PutUint32(rec[0:4], uint32(len(payload)))
++	binary.LittleEndian.PutUint32(rec[4:8], crc32.ChecksumIEEE(payload))
++	copy(rec[8:], payload)
++	return rec
++}
++
++// decodeOps parses a checksum-clean payload back into ops. Values are
++// copied so replayed data is owned by the store.
++func decodeOps(p []byte) ([]op, error) {
++	var ops []op
++	for len(p) > 0 {
++		if len(p) < 3 {
++			return nil, errBadPayload
++		}
++		kind := p[0]
++		klen := int(binary.LittleEndian.Uint16(p[1:3]))
++		p = p[3:]
++		if len(p) < klen {
++			return nil, errBadPayload
++		}
++		key := string(p[:klen])
++		p = p[klen:]
++		switch kind {
++		case opSet:
++			if len(p) < 4 {
++				return nil, errBadPayload
++			}
++			vlen := int(binary.LittleEndian.Uint32(p[0:4]))
++			p = p[4:]
++			if len(p) < vlen {
++				return nil, errBadPayload
++			}
++			ops = append(ops, op{key: key, val: clone(p[:vlen])})
++			p = p[vlen:]
++		case opDel:
++			ops = append(ops, op{del: true, key: key})
++		default:
++			return nil, errBadPayload
++		}
++	}
++	return ops, nil
++}
+diff --git a/txnredo.go b/txnredo.go
+new file mode 100644
+index 0000000..d10a90a
+--- /dev/null
++++ b/txnredo.go
+@@ -0,0 +1,290 @@
++// Package txnredo is a transactional key/value store backed by a redo log
++// with group commit.
++//
++// Concurrency model: there is NO conflict detection — transactions buffer
++// their writes privately and the last committer wins on overlapping keys.
++package txnredo
++
++import (
++	"errors"
++	"os"
++	"sort"
++	"sync"
++)
++
++var (
++	// ErrTxDone is returned by every method of a committed or aborted Tx.
++	ErrTxDone = errors.New("txnredo: transaction already finished")
++	// ErrClosed is returned by commits attempted after Close.
++	ErrClosed = errors.New("txnredo: db is closed")
++)
++
++// Options configures Open.
++type Options struct {
++	// Sync is the durability barrier, called exactly once per flushed
++	// batch after the batch's bytes have been written to the file.
++	// nil means fsync the log file itself.
++	Sync func() error
++}
++
++// op is one buffered mutation. val is always a private copy.
++type op struct {
++	del bool
++	key string
++	val []byte
++}
++
++// commitReq is one transaction's record travelling through the commit
++// pipeline. done is buffered so the flusher never blocks handing results.
++type commitReq struct {
++	record []byte
++	ops    []op
++	done   chan error
++}
++
++// DB is a redo-logged key/value store. Safe for concurrent use.
++type DB struct {
++	mu    sync.Mutex
++	quiet *sync.Cond // signalled when flushing drops to false
++
++	f    *os.File
++	size int64 // durable end of the log; only the active flusher moves it
++
++	data map[string][]byte
++
++	syncFn   func() error
++	flushing bool         // a batch flush is in flight
++	queue    []*commitReq // commits waiting behind the in-flight flush
++	closed   bool
++}
++
++// Open opens or creates the redo log at path and replays it, truncating
++// any torn or corrupt tail so the log is immediately writable.
++func Open(path string, opts *Options) (*DB, error) {
++	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
++	if err != nil {
++		return nil, err
++	}
++	db := &DB{f: f, data: make(map[string][]byte)}
++	db.quiet = sync.NewCond(&db.mu)
++	if opts != nil {
++		db.syncFn = opts.Sync
++	}
++	if err := db.replay(); err != nil {
++		f.Close()
++		return nil, err
++	}
++	return db, nil
++}
++
++// Begin starts a transaction. Transactions are the only write path.
++func (db *DB) Begin() *Tx {
++	return &Tx{db: db}
++}
++
++// Get returns a copy of the committed value for key.
++func (db *DB) Get(key string) ([]byte, bool) {
++	db.mu.Lock()
++	defer db.mu.Unlock()
++	v, ok := db.data[key]
++	if !ok {
++		return nil, false
++	}
++	return clone(v), true
++}
++
++// Keys returns all live keys in sorted order.
++func (db *DB) Keys() []string {
++	db.mu.Lock()
++	defer db.mu.Unlock()
++	keys := make([]string, 0, len(db.data))
++	for k := range db.data {
++		keys = append(keys, k)
++	}
++	sort.Strings(keys)
++	return keys
++}
++
++// Pending reports how many commits are queued behind the in-flight flush.
++func (db *DB) Pending() int {
++	db.mu.Lock()
++	defer db.mu.Unlock()
++	return len(db.queue)
++}
++
++// Close waits for any in-flight flush, then closes the log. Idempotent.
++func (db *DB) Close() error {
++	db.mu.Lock()
++	if db.closed {
++		db.mu.Unlock()
++		return nil
++	}
++	for db.flushing {
++		db.quiet.Wait()
++	}
++	db.closed = true
++	f := db.f
++	db.mu.Unlock()
++	return f.Close()
++}
++
++// commit pushes one request through the group-commit pipeline.
++//
++// The first committer to find no flush in flight becomes the leader: it
++// writes and syncs its own batch, then keeps draining the queue — each
++// drain writes every queued record and pays exactly one Sync for the lot.
++// Followers enqueue and wait; their commit returns only after the sync
++// covering their record has succeeded.
++func (db *DB) commit(req *commitReq) error {
++	db.mu.Lock()
++	if db.closed {
++		db.mu.Unlock()
++		return ErrClosed
++	}
++	if db.flushing {
++		db.queue = append(db.queue, req)
++		db.mu.Unlock()
++		return <-req.done
++	}
++	db.flushing = true
++	batch := []*commitReq{req}
++	for {
++		db.mu.Unlock()
++		err := db.flushBatch(batch) // Sync may block; never hold mu here
++		db.mu.Lock()
++		if err == nil {
++			for _, r := range batch {
++				for _, o := range r.ops {
++					if o.del {
++						delete(db.data, o.key)
++					} else {
++						db.data[o.key] = o.val
++					}
++				}
++			}
++		}
++		for _, r := range batch {
++			r.done <- err
++		}
++		if len(db.queue) == 0 {
++			db.flushing = false
++			db.quiet.Broadcast()
++			break
++		}
++		batch = db.queue
++		db.queue = nil
++	}
++	db.mu.Unlock()
++	return <-req.done
++}
++
++// flushBatch appends every record in the batch and runs the durability
++// barrier once. On any failure the batch's bytes are taken back off the
++// file so a crash or reopen can never resurrect an unacknowledged commit.
++func (db *DB) flushBatch(batch []*commitReq) error {
++	var buf []byte
++	for _, r := range batch {
++		buf = append(buf, r.record...)
++	}
++	if _, err := db.f.WriteAt(buf, db.size); err != nil {
++		db.f.Truncate(db.size)
++		return err
++	}
++	if err := db.barrier(); err != nil {
++		db.f.Truncate(db.size)
++		return err
++	}
++	db.size += int64(len(buf))
++	return nil
++}
++
++func (db *DB) barrier() error {
++	if db.syncFn != nil {
++		return db.syncFn()
++	}
++	return db.f.Sync()
++}
++
++// Tx buffers writes until Commit. It reads its own writes layered over
++// committed state; nothing is visible elsewhere until Commit returns nil.
++type Tx struct {
++	db   *DB
++	ops  []op
++	done bool
++}
++
++// Set buffers a write of a private copy of value under key.
++func (tx *Tx) Set(key string, value []byte) error {
++	if tx.done {
++		return ErrTxDone
++	}
++	if key == "" {
++		return errors.New("txnredo: empty key")
++	}
++	tx.ops = append(tx.ops, op{key: key, val: clone(value)})
++	return nil
++}
++
++// Delete buffers a tombstone for key.
++func (tx *Tx) Delete(key string) error {
++	if tx.done {
++		return ErrTxDone
++	}
++	if key == "" {
++		return errors.New("txnredo: empty key")
++	}
++	tx.ops = append(tx.ops, op{del: true, key: key})
++	return nil
++}
++
++// Get reads through the transaction's own writes first (latest op for the
++// key wins, deletes included), then falls back to committed state.
++func (tx *Tx) Get(key string) ([]byte, bool) {
++	if tx.done {
++		return nil, false
++	}
++	for i := len(tx.ops) - 1; i >= 0; i-- {
++		if tx.ops[i].key == key {
++			if tx.ops[i].del {
++				return nil, false
++			}
++			return clone(tx.ops[i].val), true
++		}
++	}
++	return tx.db.Get(key)
++}
++
++// Commit makes every buffered op durable and visible atomically. An empty
++// transaction commits without touching the log or calling Sync.
++func (tx *Tx) Commit() error {
++	if tx.done {
++		return ErrTxDone
++	}
++	tx.done = true
++	if len(tx.ops) == 0 {
++		return nil
++	}
++	req := &commitReq{
++		record: encodeRecord(tx.ops),
++		ops:    tx.ops,
++		done:   make(chan error, 1),
++	}
++	tx.ops = nil
++	return tx.db.commit(req)
++}
++
++// Abort discards every buffered op.
++func (tx *Tx) Abort() error {
++	if tx.done {
++		return ErrTxDone
++	}
++	tx.done = true
++	tx.ops = nil
++	return nil
++}
++
++func clone(b []byte) []byte {
++	out := make([]byte, len(b))
++	copy(out, b)
++	return out
++}

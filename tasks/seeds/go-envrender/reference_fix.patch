@@ -1,0 +1,329 @@
+diff --git a/render.go b/render.go
+new file mode 100644
+index 0000000..2895d89
+--- /dev/null
++++ b/render.go
+@@ -0,0 +1,323 @@
++// Package envrender renders configuration text by substituting variable
++// references of the form ${VAR}, ${VAR:-default} and ${VAR-default}, and (for
++// files) by splicing @include "path" directives.
++//
++// The environment always comes from the caller-supplied map — this package
++// never reads the process environment — so rendering is fully deterministic.
++package envrender
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++)
++
++// Options controls rendering behaviour.
++type Options struct {
++	// Strict makes a well-formed reference to a variable that is absent
++	// from the environment an error. Lenient mode substitutes the empty
++	// string instead. Syntax errors are errors in both modes.
++	Strict bool
++}
++
++// Expand substitutes variable references in src using env and returns the
++// result. It performs no file access and leaves @include lines untouched —
++// include processing belongs to RenderFile.
++//
++// Grammar:
++//
++//	${VAR}          value of VAR; absent VAR is an error (strict) or "" (lenient)
++//	${VAR:-def}     def when VAR is absent or empty
++//	${VAR-def}      def only when VAR is absent
++//	$$              one literal $
++//
++// A $ not followed by { or $ is ordinary text. Default text is taken
++// verbatim; no substitution happens inside it. Positions in errors are
++// 1-based line:col of the $ that started the reference.
++func Expand(src string, env map[string]string, opts Options) (string, error) {
++	return expand(src, env, opts, "", 1, 1)
++}
++
++// RenderFile renders the file at path: variables are substituted as in
++// Expand, and each line of the form
++//
++//	@include "other/file.conf"
++//
++// (optionally indented) is replaced by the rendered content of that file,
++// resolved relative to the directory of the file containing the directive.
++// The include path itself is variable-substituted first. Spliced content
++// always ends with a newline so following lines keep their own line; an
++// empty include contributes nothing. Including a file that is currently
++// being rendered is an include cycle and is reported with the full chain.
++// File names in error positions are shown relative to the root file's
++// directory.
++func RenderFile(path string, env map[string]string, opts Options) (string, error) {
++	r := &renderer{env: env, opts: opts, rootDir: filepath.Dir(path)}
++	return r.renderFile(path)
++}
++
++type renderer struct {
++	env     map[string]string
++	opts    Options
++	rootDir string
++	stack   []stackEntry // files currently being rendered, root first
++}
++
++type stackEntry struct {
++	abs   string // cleaned absolute path, for cycle identity
++	label string // path relative to the root file's directory, for messages
++}
++
++func (r *renderer) renderFile(path string) (string, error) {
++	abs, err := filepath.Abs(filepath.Clean(path))
++	if err != nil {
++		return "", err
++	}
++	content, err := os.ReadFile(path)
++	if err != nil {
++		return "", err
++	}
++	label := r.label(abs)
++	r.stack = append(r.stack, stackEntry{abs: abs, label: label})
++	defer func() { r.stack = r.stack[:len(r.stack)-1] }()
++
++	src := string(content)
++	hadFinalNewline := strings.HasSuffix(src, "\n")
++	lines := strings.Split(src, "\n")
++	if hadFinalNewline {
++		lines = lines[:len(lines)-1]
++	}
++
++	var out strings.Builder
++	for i, line := range lines {
++		lineNo := i + 1
++		if dir, ok := parseIncludeLine(line); ok {
++			spliced, err := r.include(path, label, lineNo, line, dir)
++			if err != nil {
++				return "", err
++			}
++			out.WriteString(spliced)
++			continue
++		}
++		rendered, err := expand(line, r.env, r.opts, label, lineNo, 1)
++		if err != nil {
++			return "", err
++		}
++		out.WriteString(rendered)
++		if i < len(lines)-1 || hadFinalNewline {
++			out.WriteByte('\n')
++		}
++	}
++	return out.String(), nil
++}
++
++// includeDirective describes one @include line as found in the source.
++type includeDirective struct {
++	atCol    int    // 1-based column of the @
++	pathCol  int    // 1-based column of the first path character
++	pathText string // raw text between the quotes (may be empty or malformed)
++	valid    bool   // false when the line starts a directive but is malformed
++}
++
++// parseIncludeLine reports whether line is an @include directive line: only
++// whitespace may precede @include, and it must be the line's first word. A
++// mid-line "@include" is ordinary text.
++func parseIncludeLine(line string) (includeDirective, bool) {
++	trimmed := strings.TrimLeft(line, " \t")
++	if !strings.HasPrefix(trimmed, "@include") {
++		return includeDirective{}, false
++	}
++	rest := trimmed[len("@include"):]
++	if rest != "" && rest[0] != ' ' && rest[0] != '\t' && rest[0] != '"' {
++		return includeDirective{}, false // some other word, e.g. @included
++	}
++	d := includeDirective{atCol: len(line) - len(trimmed) + 1}
++	body := strings.TrimLeft(rest, " \t")
++	if !strings.HasPrefix(body, `"`) {
++		return d, true // directive line, but path is not double-quoted
++	}
++	end := strings.IndexByte(body[1:], '"')
++	if end < 0 {
++		return d, true // unclosed quote
++	}
++	if strings.TrimRight(body[end+2:], " \t") != "" {
++		return d, true // trailing junk after the closing quote
++	}
++	d.pathText = body[1 : end+1]
++	d.pathCol = d.atCol + (len(trimmed) - len(body)) + 1
++	d.valid = d.pathText != ""
++	return d, true
++}
++
++// include renders one directive found in the file at includerPath and
++// returns the text to splice in place of the directive line.
++func (r *renderer) include(includerPath, label string, lineNo int, line string, dir includeDirective) (string, error) {
++	if !dir.valid {
++		return "", posErr(label, lineNo, dir.atCol, "malformed @include directive: expected @include \"path\"")
++	}
++	relPath, err := expand(dir.pathText, r.env, r.opts, label, lineNo, dir.pathCol)
++	if err != nil {
++		return "", err
++	}
++	target := relPath
++	if !filepath.IsAbs(target) {
++		target = filepath.Join(filepath.Dir(includerPath), target)
++	}
++	abs, err := filepath.Abs(filepath.Clean(target))
++	if err != nil {
++		return "", err
++	}
++	for _, entry := range r.stack {
++		if entry.abs == abs {
++			chain := make([]string, 0, len(r.stack)+1)
++			for _, e := range r.stack {
++				chain = append(chain, e.label)
++			}
++			chain = append(chain, r.label(abs))
++			return "", posErr(label, lineNo, dir.atCol, "include cycle: %s", strings.Join(chain, " -> "))
++		}
++	}
++	if _, statErr := os.Stat(target); statErr != nil {
++		return "", posErr(label, lineNo, dir.atCol, "include not found: %q", relPath)
++	}
++	content, err := r.renderFile(target)
++	if err != nil {
++		return "", err
++	}
++	if content != "" && !strings.HasSuffix(content, "\n") {
++		content += "\n"
++	}
++	return content, nil
++}
++
++// label shows abs relative to the root file's directory when possible.
++func (r *renderer) label(abs string) string {
++	rootAbs, err := filepath.Abs(r.rootDir)
++	if err != nil {
++		return abs
++	}
++	rel, err := filepath.Rel(rootAbs, abs)
++	if err != nil || strings.HasPrefix(rel, "..") {
++		return abs
++	}
++	return filepath.ToSlash(rel)
++}
++
++// expand is the substitution core shared by Expand and RenderFile. file may
++// be empty (positions are then bare line:col); line and col locate src's
++// first character, so callers expanding a fragment of a larger file report
++// exact positions.
++func expand(src string, env map[string]string, opts Options, file string, line, col int) (string, error) {
++	var b strings.Builder
++	i := 0
++	for i < len(src) {
++		c := src[i]
++		if c == '\n' {
++			b.WriteByte(c)
++			i++
++			line, col = line+1, 1
++			continue
++		}
++		if c != '$' {
++			b.WriteByte(c)
++			i++
++			col++
++			continue
++		}
++		// $$ is one literal $; $ not followed by { is ordinary text.
++		if i+1 < len(src) && src[i+1] == '$' {
++			b.WriteByte('$')
++			i += 2
++			col += 2
++			continue
++		}
++		if i+1 >= len(src) || src[i+1] != '{' {
++			b.WriteByte('$')
++			i++
++			col++
++			continue
++		}
++
++		refLine, refCol := line, col // position of the $ for error reports
++		j := i + 2
++		if j >= len(src) {
++			return "", posErr(file, refLine, refCol, "unterminated variable reference")
++		}
++		if !isNameStart(src[j]) {
++			return "", posErr(file, refLine, refCol, "invalid variable name")
++		}
++		nameStart := j
++		for j < len(src) && isNameChar(src[j]) {
++			j++
++		}
++		name := src[nameStart:j]
++		if j >= len(src) {
++			return "", posErr(file, refLine, refCol, "unterminated variable reference")
++		}
++
++		var value string
++		switch src[j] {
++		case '}':
++			v, ok := env[name]
++			if !ok {
++				if opts.Strict {
++					return "", posErr(file, refLine, refCol, "undefined variable %q", name)
++				}
++				v = ""
++			}
++			value = v
++			j++ // past }
++		case ':', '-':
++			emptyFallsBack := src[j] == ':'
++			if emptyFallsBack {
++				if j+1 >= len(src) || src[j+1] != '-' {
++					return "", posErr(file, refLine, refCol, "invalid variable reference")
++				}
++				j++ // past :
++			}
++			j++ // past -
++			end := strings.IndexByte(src[j:], '}')
++			if end < 0 {
++				return "", posErr(file, refLine, refCol, "unterminated variable reference")
++			}
++			def := src[j : j+end] // taken verbatim, never re-expanded
++			v, ok := env[name]
++			if !ok || (emptyFallsBack && v == "") {
++				v = def
++			}
++			value = v
++			j += end + 1 // past }
++		default:
++			return "", posErr(file, refLine, refCol, "invalid variable reference")
++		}
++
++		b.WriteString(value)
++		// Advance the position over the whole ${...} reference, minding
++		// newlines that a default value might contain.
++		for ; i < j; i++ {
++			if src[i] == '\n' {
++				line, col = line+1, 1
++			} else {
++				col++
++			}
++		}
++	}
++	return b.String(), nil
++}
++
++func isNameStart(c byte) bool {
++	return c == '_' || ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z')
++}
++
++func isNameChar(c byte) bool {
++	return isNameStart(c) || ('0' <= c && c <= '9')
++}
++
++func posErr(file string, line, col int, format string, args ...any) error {
++	pos := fmt.Sprintf("%d:%d", line, col)
++	if file != "" {
++		pos = file + ":" + pos
++	}
++	return fmt.Errorf("%s: %s", pos, fmt.Sprintf(format, args...))
++}

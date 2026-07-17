@@ -1,0 +1,237 @@
+diff --git a/lzrle.go b/lzrle.go
+new file mode 100644
+index 0000000..041e8a3
+--- /dev/null
++++ b/lzrle.go
+@@ -0,0 +1,231 @@
++// Package lzrle implements the LZR1 telemetry frame codec: a byte-oriented
++// compressor combining run-length encoding with sliding-window
++// backreferences, framed with a raw passthrough mode for incompressible
++// payloads.
++package lzrle
++
++import (
++	"encoding/binary"
++	"errors"
++	"fmt"
++)
++
++var (
++	// ErrBadMagic reports a frame that does not start with the LZR1 magic.
++	ErrBadMagic = errors.New("lzrle: bad magic")
++	// ErrTruncated reports a frame or token stream that ends prematurely.
++	ErrTruncated = errors.New("lzrle: truncated frame")
++	// ErrCorrupt reports a structurally invalid frame or token stream.
++	ErrCorrupt = errors.New("lzrle: corrupt frame")
++)
++
++const (
++	headerSize = 9
++	window     = 4096
++	minEmit    = 3   // encoder never emits runs/matches shorter than this
++	maxCount   = 255 // u8 token counts
++
++	modeRaw        = 0
++	modeCompressed = 1
++
++	tagLiterals = 0x01
++	tagRun      = 0x02
++	tagMatch    = 0x03
++)
++
++var magic = [4]byte{'L', 'Z', 'R', '1'}
++
++// Compress frames data. The output is deterministic: identical input always
++// yields an identical frame. If the token stream would not beat the raw
++// size, the data ships in mode 0 (raw) instead.
++func Compress(data []byte) []byte {
++	body := encode(data)
++	mode := byte(modeCompressed)
++	if len(body) >= len(data) {
++		mode = modeRaw
++		body = data
++	}
++	f := make([]byte, headerSize, headerSize+len(body))
++	copy(f, magic[:])
++	f[4] = mode
++	binary.BigEndian.PutUint32(f[5:9], uint32(len(data)))
++	return append(f, body...)
++}
++
++// encode produces the mode-1 token stream for data using a greedy scan:
++// prefer the longest of an RLE run or the most recent window match at each
++// position, falling back to buffered literals.
++func encode(data []byte) []byte {
++	var out []byte
++	var litStart, litLen int
++
++	flushLits := func(end int) {
++		for litLen > 0 {
++			n := litLen
++			if n > maxCount {
++				n = maxCount
++			}
++			out = append(out, tagLiterals, byte(n))
++			out = append(out, data[litStart:litStart+n]...)
++			litStart += n
++			litLen -= n
++		}
++		litStart = end
++	}
++
++	// heads maps a 3-byte key to the most recent position it occurred at.
++	heads := make(map[uint32]int, 1024)
++	key := func(i int) uint32 {
++		return uint32(data[i])<<16 | uint32(data[i+1])<<8 | uint32(data[i+2])
++	}
++
++	i := 0
++	for i < len(data) {
++		// Run length at i.
++		runLen := 1
++		for i+runLen < len(data) && data[i+runLen] == data[i] && runLen < maxCount {
++			runLen++
++		}
++		// Window match at i (needs at least 3 bytes left to key).
++		matchLen, matchDist := 0, 0
++		if i+minEmit <= len(data) {
++			if prev, ok := heads[key(i)]; ok && i-prev <= window {
++				l := 0
++				for i+l < len(data) && data[prev+l] == data[i+l] && l < maxCount {
++					l++
++				}
++				if l >= minEmit {
++					matchLen, matchDist = l, i-prev
++				}
++			}
++		}
++
++		advance := 1
++		switch {
++		case runLen >= minEmit && runLen >= matchLen:
++			flushLits(i)
++			out = append(out, tagRun, byte(runLen), data[i])
++			advance = runLen
++			litStart = i + runLen
++		case matchLen >= minEmit:
++			flushLits(i)
++			out = append(out, tagMatch, byte(matchDist>>8), byte(matchDist), byte(matchLen))
++			advance = matchLen
++			litStart = i + matchLen
++		default:
++			litLen++
++		}
++
++		// Index every position we consume so later matches can find it.
++		for j := i; j < i+advance && j+minEmit <= len(data); j++ {
++			heads[key(j)] = j
++		}
++		i += advance
++	}
++	flushLits(len(data))
++	return out
++}
++
++// Decompress validates and unpacks a frame produced by Compress (or any
++// frame honoring the LZR1 wire contract).
++func Decompress(frame []byte) ([]byte, error) {
++	if len(frame) < headerSize {
++		return nil, fmt.Errorf("%w: %d bytes is smaller than the %d-byte header", ErrTruncated, len(frame), headerSize)
++	}
++	if [4]byte(frame[:4]) != magic {
++		return nil, fmt.Errorf("%w: got % x", ErrBadMagic, frame[:4])
++	}
++	declared := int(binary.BigEndian.Uint32(frame[5:9]))
++	body := frame[headerSize:]
++
++	switch frame[4] {
++	case modeRaw:
++		if len(body) < declared {
++			return nil, fmt.Errorf("%w: raw body has %d of %d declared bytes", ErrTruncated, len(body), declared)
++		}
++		if len(body) > declared {
++			return nil, fmt.Errorf("%w: raw body has %d bytes, declared %d", ErrCorrupt, len(body), declared)
++		}
++		out := make([]byte, declared)
++		copy(out, body)
++		return out, nil
++	case modeCompressed:
++		return decodeTokens(body, declared)
++	default:
++		return nil, fmt.Errorf("%w: unknown mode byte %d", ErrCorrupt, frame[4])
++	}
++}
++
++func decodeTokens(body []byte, declared int) ([]byte, error) {
++	out := make([]byte, 0, declared)
++	grow := func(n int) error {
++		if len(out)+n > declared {
++			return fmt.Errorf("%w: output exceeds declared length %d", ErrCorrupt, declared)
++		}
++		return nil
++	}
++	p := 0
++	for p < len(body) {
++		tag := body[p]
++		p++
++		switch tag {
++		case tagLiterals:
++			if p >= len(body) {
++				return nil, fmt.Errorf("%w: literal token cut off", ErrTruncated)
++			}
++			n := int(body[p])
++			p++
++			if n == 0 {
++				return nil, fmt.Errorf("%w: zero-count literal token", ErrCorrupt)
++			}
++			if p+n > len(body) {
++				return nil, fmt.Errorf("%w: literal token promises %d bytes, stream has %d", ErrTruncated, n, len(body)-p)
++			}
++			if err := grow(n); err != nil {
++				return nil, err
++			}
++			out = append(out, body[p:p+n]...)
++			p += n
++		case tagRun:
++			if p+2 > len(body) {
++				return nil, fmt.Errorf("%w: run token cut off", ErrTruncated)
++			}
++			n, v := int(body[p]), body[p+1]
++			p += 2
++			if n == 0 {
++				return nil, fmt.Errorf("%w: zero-count run token", ErrCorrupt)
++			}
++			if err := grow(n); err != nil {
++				return nil, err
++			}
++			for j := 0; j < n; j++ {
++				out = append(out, v)
++			}
++		case tagMatch:
++			if p+3 > len(body) {
++				return nil, fmt.Errorf("%w: match token cut off", ErrTruncated)
++			}
++			d := int(body[p])<<8 | int(body[p+1])
++			l := int(body[p+2])
++			p += 3
++			if l == 0 {
++				return nil, fmt.Errorf("%w: zero-length match token", ErrCorrupt)
++			}
++			if d == 0 || d > len(out) {
++				return nil, fmt.Errorf("%w: match distance %d with only %d bytes produced", ErrCorrupt, d, len(out))
++			}
++			if err := grow(l); err != nil {
++				return nil, err
++			}
++			for j := 0; j < l; j++ {
++				out = append(out, out[len(out)-d])
++			}
++		default:
++			return nil, fmt.Errorf("%w: unknown token tag 0x%02x", ErrCorrupt, tag)
++		}
++	}
++	if len(out) != declared {
++		return nil, fmt.Errorf("%w: stream decoded to %d bytes, declared %d", ErrCorrupt, len(out), declared)
++	}
++	return out, nil
++}

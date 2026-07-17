@@ -1,0 +1,202 @@
+diff --git a/src/downtime.ts b/src/downtime.ts
+new file mode 100644
+index 0000000..1fed2ef
+--- /dev/null
++++ b/src/downtime.ts
+@@ -0,0 +1,196 @@
++// Datadog v2 downtime scheduler.
++//
++// Speaks the documented v2 downtime operations: POST /api/v2/downtime with a
++// JSON:API resource document, DELETE /api/v2/downtime/{id} (204, no body).
++// Auth is the DD-API-KEY / DD-APPLICATION-KEY header pair. Errors arrive in
++// the {errors: [string]} envelope.
++
++import { validateWindow, type MaintenanceWindow } from "./windows.ts";
++
++const DOWNTIME_PATH = "/api/v2/downtime";
++
++export type CreatedDowntime = {
++  name: string;
++  id: string;
++  scope: string;
++  status: string;
++  monitorId: string | null;
++  createdBy: string | null;
++};
++
++export type FailedWindow = {
++  name: string;
++  status: number | null;
++  errors: string[];
++};
++
++export type ScheduleResult = {
++  created: CreatedDowntime[];
++  failed: FailedWindow[];
++};
++
++export type CancelBatchResult = {
++  canceled: string[];
++  alreadyGone: string[];
++  failed: { id: string; status: number; errors: string[] }[];
++};
++
++export class DowntimeApiError extends Error {
++  status: number;
++  errors: string[];
++
++  constructor(status: number, errors: string[]) {
++    super(`Datadog downtime API error ${status}: ${errors.join("; ")}`);
++    this.status = status;
++    this.errors = errors;
++  }
++}
++
++type ApiOutcome = {
++  ok: boolean;
++  status: number;
++  body: any;
++  errors: string[];
++};
++
++export class DowntimeClient {
++  private baseUrl: string;
++  private apiKey: string;
++  private appKey: string;
++  private fetchImpl: typeof fetch;
++
++  constructor(opts: {
++    baseUrl: string;
++    apiKey: string;
++    appKey: string;
++    fetchImpl?: typeof fetch;
++  }) {
++    this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
++    this.apiKey = opts.apiKey;
++    this.appKey = opts.appKey;
++    this.fetchImpl = opts.fetchImpl ?? fetch;
++  }
++
++  // The exact v2 create document for one window. Invalid windows throw so a
++  // malformed request can never reach the wire.
++  buildCreateDocument(w: MaintenanceWindow): object {
++    const problems = validateWindow(w);
++    if (problems.length > 0) {
++      throw new Error(`invalid window ${w.name}: ${problems.join("; ")}`);
++    }
++    const attributes: Record<string, unknown> = {
++      scope: w.scope,
++      monitor_identifier:
++        typeof w.monitorId === "number"
++          ? { monitor_id: w.monitorId }
++          : { monitor_tags: [...(w.monitorTags ?? [])] },
++    };
++    if (w.message !== undefined) {
++      attributes.message = w.message;
++    }
++    if (w.muteFirstRecovery !== undefined) {
++      attributes.mute_first_recovery_notification = w.muteFirstRecovery;
++    }
++    if (w.rrule) {
++      const recurrence: Record<string, unknown> = {
++        rrule: w.rrule,
++        duration: w.duration,
++      };
++      if (w.start) recurrence.start = w.start; // local datetime, no offset
++      const schedule: Record<string, unknown> = { recurrences: [recurrence] };
++      if (w.timezone) schedule.timezone = w.timezone;
++      attributes.schedule = schedule;
++    } else if (w.start || w.end) {
++      const schedule: Record<string, unknown> = {};
++      if (w.start) schedule.start = w.start; // zero-offset datetimes
++      if (w.end) schedule.end = w.end;
++      attributes.schedule = schedule;
++    }
++    // no schedule at all = starts immediately, continues forever
++    return { data: { type: "downtime", attributes } };
++  }
++
++  async scheduleDowntimes(windows: MaintenanceWindow[]): Promise<ScheduleResult> {
++    const created: CreatedDowntime[] = [];
++    const failed: FailedWindow[] = [];
++    for (const w of windows) {
++      const problems = validateWindow(w);
++      if (problems.length > 0) {
++        failed.push({ name: w.name, status: null, errors: problems });
++        continue;
++      }
++      const outcome = await this.request("POST", DOWNTIME_PATH, this.buildCreateDocument(w));
++      if (!outcome.ok) {
++        failed.push({ name: w.name, status: outcome.status, errors: outcome.errors });
++        continue;
++      }
++      const data = outcome.body?.data ?? {};
++      created.push({
++        name: w.name,
++        id: data.id,
++        scope: data.attributes?.scope,
++        status: data.attributes?.status,
++        monitorId: data.relationships?.monitor?.data?.id ?? null,
++        createdBy: data.relationships?.created_by?.data?.id ?? null,
++      });
++    }
++    return { created, failed };
++  }
++
++  async cancelDowntime(id: string): Promise<"canceled" | "already_gone"> {
++    const outcome = await this.request(
++      "DELETE",
++      `${DOWNTIME_PATH}/${encodeURIComponent(id)}`
++    );
++    if (outcome.ok) return "canceled"; // documented success is 204, no body
++    if (outcome.status === 404) return "already_gone";
++    throw new DowntimeApiError(outcome.status, outcome.errors);
++  }
++
++  async cancelDowntimes(ids: string[]): Promise<CancelBatchResult> {
++    const result: CancelBatchResult = { canceled: [], alreadyGone: [], failed: [] };
++    for (const id of ids) {
++      const outcome = await this.request(
++        "DELETE",
++        `${DOWNTIME_PATH}/${encodeURIComponent(id)}`
++      );
++      if (outcome.ok) {
++        result.canceled.push(id);
++      } else if (outcome.status === 404) {
++        result.alreadyGone.push(id);
++      } else {
++        result.failed.push({ id, status: outcome.status, errors: outcome.errors });
++      }
++    }
++    return result;
++  }
++
++  private async request(method: string, path: string, body?: object): Promise<ApiOutcome> {
++    const headers: Record<string, string> = {
++      "DD-API-KEY": this.apiKey,
++      "DD-APPLICATION-KEY": this.appKey,
++      Accept: "application/json",
++    };
++    const init: RequestInit = { method, headers };
++    if (body !== undefined) {
++      headers["Content-Type"] = "application/json";
++      init.body = JSON.stringify(body);
++    }
++    const response = await this.fetchImpl(this.baseUrl + path, init);
++    const text = await response.text(); // 204 cancel: empty, nothing to parse
++    let parsed: any;
++    if (text) {
++      try {
++        parsed = JSON.parse(text);
++      } catch {
++        parsed = undefined;
++      }
++    }
++    const errors = response.ok
++      ? []
++      : Array.isArray(parsed?.errors)
++        ? parsed.errors.map(String)
++        : [`HTTP ${response.status}`];
++    return { ok: response.ok, status: response.status, body: parsed, errors };
++  }
++}

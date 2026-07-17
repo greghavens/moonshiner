@@ -1,0 +1,376 @@
+diff --git a/client.go b/client.go
+new file mode 100644
+index 0000000..6243b9e
+--- /dev/null
++++ b/client.go
+@@ -0,0 +1,86 @@
++// Package vaultkv is a zero-dependency client for Vault's KV version 2
++// secrets engine: mount-aware data/metadata paths, namespace-relative
++// routing, versioned reads, check-and-set writes, and the soft
++// delete/undelete/destroy lifecycle.
++package vaultkv
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"io"
++	"net/http"
++	"strings"
++)
++
++// Config carries the connection settings for one KV v2 mount.
++type Config struct {
++	BaseURL   string // e.g. https://vault.internal:8200
++	Token     string // client token, sent as X-Vault-Token
++	Namespace string // e.g. "team-eng/"; empty targets the root namespace
++	Mount     string // KV v2 mount name, e.g. "kv-app"
++}
++
++// Client talks to a single KV v2 mount.
++type Client struct {
++	cfg Config
++	hc  *http.Client
++}
++
++// New builds a Client; a nil http.Client falls back to http.DefaultClient.
++func New(cfg Config, hc *http.Client) *Client {
++	if hc == nil {
++		hc = http.DefaultClient
++	}
++	cfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/")
++	cfg.Mount = strings.Trim(cfg.Mount, "/")
++	return &Client{cfg: cfg, hc: hc}
++}
++
++// do sends one request to /v1/<mount>/<op>/<path> and returns the raw
++// status and body; every request carries the token header and, when a
++// namespace is configured, the namespace header.
++func (c *Client) do(ctx context.Context, method, op, path, rawQuery string, body any) (int, []byte, error) {
++	url := c.cfg.BaseURL + "/v1/" + c.cfg.Mount + "/" + op + "/" + strings.TrimLeft(path, "/")
++	if rawQuery != "" {
++		url += "?" + rawQuery
++	}
++	var payload io.Reader
++	if body != nil {
++		raw, err := json.Marshal(body)
++		if err != nil {
++			return 0, nil, err
++		}
++		payload = bytes.NewReader(raw)
++	}
++	req, err := http.NewRequestWithContext(ctx, method, url, payload)
++	if err != nil {
++		return 0, nil, err
++	}
++	req.Header.Set("X-Vault-Token", c.cfg.Token)
++	if c.cfg.Namespace != "" {
++		req.Header.Set("X-Vault-Namespace", c.cfg.Namespace)
++	}
++	if body != nil {
++		req.Header.Set("Content-Type", "application/json")
++	}
++	resp, err := c.hc.Do(req)
++	if err != nil {
++		return 0, nil, err
++	}
++	defer resp.Body.Close()
++	raw, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return 0, nil, err
++	}
++	return resp.StatusCode, raw, nil
++}
++
++// expectNoContent maps the 204 success of the delete/undelete/destroy
++// endpoints, turning anything else into a decoded error.
++func (c *Client) expectNoContent(status int, body []byte) error {
++	if status == 204 || (status >= 200 && status < 300) {
++		return nil
++	}
++	return decodeError(status, body)
++}
+diff --git a/errors.go b/errors.go
+new file mode 100644
+index 0000000..6079848
+--- /dev/null
++++ b/errors.go
+@@ -0,0 +1,54 @@
++package vaultkv
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"strings"
++)
++
++// ErrNotFound reports a 404 with an empty errors array. Vault deliberately
++// answers this way both for paths that do not exist and for paths the token
++// is not permitted to view.
++var ErrNotFound = errors.New("vaultkv: path not found or unauthorized")
++
++// APIError is any non-2xx Vault response carrying a non-empty errors array.
++type APIError struct {
++	StatusCode int
++	Errors     []string
++}
++
++func (e *APIError) Error() string {
++	return fmt.Sprintf("vault: HTTP %d: %s", e.StatusCode, strings.Join(e.Errors, "; "))
++}
++
++// IsCASMismatch reports whether err is Vault's 400 check-and-set conflict —
++// the write's cas value did not match the key's current version.
++func IsCASMismatch(err error) bool {
++	var ae *APIError
++	if !errors.As(err, &ae) || ae.StatusCode != 400 {
++		return false
++	}
++	for _, msg := range ae.Errors {
++		if strings.Contains(msg, "check-and-set") {
++			return true
++		}
++	}
++	return false
++}
++
++// decodeError turns a non-2xx body into ErrNotFound (404, empty errors) or
++// an *APIError preserving the decoded messages.
++func decodeError(status int, body []byte) error {
++	var doc struct {
++		Errors []string `json:"errors"`
++	}
++	_ = json.Unmarshal(body, &doc)
++	if len(doc.Errors) == 0 {
++		if status == 404 {
++			return ErrNotFound
++		}
++		doc.Errors = []string{"(no error detail)"}
++	}
++	return &APIError{StatusCode: status, Errors: doc.Errors}
++}
+diff --git a/kv.go b/kv.go
+new file mode 100644
+index 0000000..c0b3879
+--- /dev/null
++++ b/kv.go
+@@ -0,0 +1,115 @@
++package vaultkv
++
++import (
++	"context"
++	"encoding/json"
++	"strconv"
++)
++
++// VersionMetadata describes one stored version of a secret.
++type VersionMetadata struct {
++	Version      int
++	CreatedTime  string
++	DeletionTime string
++	Destroyed    bool
++}
++
++// Secret is one read KV v2 version: its payload plus version metadata. A
++// soft-deleted or destroyed version has a nil Data with real metadata.
++type Secret struct {
++	Data     map[string]any
++	Metadata VersionMetadata
++}
++
++type versionMetaJSON struct {
++	Version      int    `json:"version"`
++	CreatedTime  string `json:"created_time"`
++	DeletionTime string `json:"deletion_time"`
++	Destroyed    bool   `json:"destroyed"`
++}
++
++func (m versionMetaJSON) metadata() VersionMetadata {
++	return VersionMetadata{
++		Version:      m.Version,
++		CreatedTime:  m.CreatedTime,
++		DeletionTime: m.DeletionTime,
++		Destroyed:    m.Destroyed,
++	}
++}
++
++// Get reads the latest version of the secret at path.
++func (c *Client) Get(ctx context.Context, path string) (*Secret, error) {
++	return c.read(ctx, path, "")
++}
++
++// GetVersion reads one specific version of the secret at path.
++func (c *Client) GetVersion(ctx context.Context, path string, version int) (*Secret, error) {
++	return c.read(ctx, path, "version="+strconv.Itoa(version))
++}
++
++func (c *Client) read(ctx context.Context, path, rawQuery string) (*Secret, error) {
++	status, body, err := c.do(ctx, "GET", "data", path, rawQuery, nil)
++	if err != nil {
++		return nil, err
++	}
++	var envelope struct {
++		Data *struct {
++			Data     map[string]any  `json:"data"`
++			Metadata versionMetaJSON `json:"metadata"`
++		} `json:"data"`
++	}
++	switch {
++	case status >= 200 && status < 300:
++		if err := json.Unmarshal(body, &envelope); err != nil {
++			return nil, err
++		}
++		return &Secret{Data: envelope.Data.Data, Metadata: envelope.Data.Metadata.metadata()}, nil
++	case status == 404:
++		// A 404 that still carries a data object is a soft-deleted or
++		// destroyed version: surface the metadata, not an error.
++		if json.Unmarshal(body, &envelope) == nil && envelope.Data != nil {
++			return &Secret{Data: envelope.Data.Data, Metadata: envelope.Data.Metadata.metadata()}, nil
++		}
++		return nil, decodeError(status, body)
++	default:
++		return nil, decodeError(status, body)
++	}
++}
++
++type writeOptions struct {
++	CAS int `json:"cas"`
++}
++
++type writeRequest struct {
++	Options *writeOptions  `json:"options,omitempty"`
++	Data    map[string]any `json:"data"`
++}
++
++// Put writes a new version without check-and-set; the options object is
++// omitted so engine/key cas_required config decides whether that is legal.
++func (c *Client) Put(ctx context.Context, path string, data map[string]any) (VersionMetadata, error) {
++	return c.write(ctx, path, writeRequest{Data: data})
++}
++
++// PutCAS writes a new version if and only if cas matches the current
++// version (0 = the key must not exist yet).
++func (c *Client) PutCAS(ctx context.Context, path string, data map[string]any, cas int) (VersionMetadata, error) {
++	return c.write(ctx, path, writeRequest{Options: &writeOptions{CAS: cas}, Data: data})
++}
++
++func (c *Client) write(ctx context.Context, path string, req writeRequest) (VersionMetadata, error) {
++	status, body, err := c.do(ctx, "POST", "data", path, "", req)
++	if err != nil {
++		return VersionMetadata{}, err
++	}
++	if status < 200 || status >= 300 {
++		return VersionMetadata{}, decodeError(status, body)
++	}
++	var envelope struct {
++		Data versionMetaJSON `json:"data"`
++	}
++	if err := json.Unmarshal(body, &envelope); err != nil {
++		return VersionMetadata{}, err
++	}
++	return envelope.Data.metadata(), nil
++}
+diff --git a/lifecycle.go b/lifecycle.go
+new file mode 100644
+index 0000000..4bb8803
+--- /dev/null
++++ b/lifecycle.go
+@@ -0,0 +1,97 @@
++package vaultkv
++
++import (
++	"context"
++	"encoding/json"
++	"strconv"
++)
++
++type versionsBody struct {
++	Versions []int `json:"versions"`
++}
++
++// DeleteLatest soft-deletes the latest version of the secret at path.
++func (c *Client) DeleteLatest(ctx context.Context, path string) error {
++	status, body, err := c.do(ctx, "DELETE", "data", path, "", nil)
++	if err != nil {
++		return err
++	}
++	return c.expectNoContent(status, body)
++}
++
++// DeleteVersions soft-deletes the given versions; the data stays recoverable.
++func (c *Client) DeleteVersions(ctx context.Context, path string, versions []int) error {
++	status, body, err := c.do(ctx, "POST", "delete", path, "", versionsBody{Versions: versions})
++	if err != nil {
++		return err
++	}
++	return c.expectNoContent(status, body)
++}
++
++// Undelete restores previously soft-deleted versions.
++func (c *Client) Undelete(ctx context.Context, path string, versions []int) error {
++	status, body, err := c.do(ctx, "POST", "undelete", path, "", versionsBody{Versions: versions})
++	if err != nil {
++		return err
++	}
++	return c.expectNoContent(status, body)
++}
++
++// Destroy permanently removes the given versions' data. The endpoint is
++// documented as PUT, unlike delete/undelete.
++func (c *Client) Destroy(ctx context.Context, path string, versions []int) error {
++	status, body, err := c.do(ctx, "PUT", "destroy", path, "", versionsBody{Versions: versions})
++	if err != nil {
++		return err
++	}
++	return c.expectNoContent(status, body)
++}
++
++// Metadata describes a key's version history and write configuration.
++type Metadata struct {
++	CurrentVersion int
++	OldestVersion  int
++	MaxVersions    int
++	CASRequired    bool
++	Versions       map[int]VersionMetadata
++}
++
++// Metadata reads /v1/<mount>/metadata/<path>.
++func (c *Client) Metadata(ctx context.Context, path string) (*Metadata, error) {
++	status, body, err := c.do(ctx, "GET", "metadata", path, "", nil)
++	if err != nil {
++		return nil, err
++	}
++	if status < 200 || status >= 300 {
++		return nil, decodeError(status, body)
++	}
++	var envelope struct {
++		Data struct {
++			CurrentVersion int                        `json:"current_version"`
++			OldestVersion  int                        `json:"oldest_version"`
++			MaxVersions    int                        `json:"max_versions"`
++			CASRequired    bool                       `json:"cas_required"`
++			Versions       map[string]versionMetaJSON `json:"versions"`
++		} `json:"data"`
++	}
++	if err := json.Unmarshal(body, &envelope); err != nil {
++		return nil, err
++	}
++	meta := &Metadata{
++		CurrentVersion: envelope.Data.CurrentVersion,
++		OldestVersion:  envelope.Data.OldestVersion,
++		MaxVersions:    envelope.Data.MaxVersions,
++		CASRequired:    envelope.Data.CASRequired,
++		Versions:       make(map[int]VersionMetadata, len(envelope.Data.Versions)),
++	}
++	for key, v := range envelope.Data.Versions {
++		n, err := strconv.Atoi(key)
++		if err != nil {
++			continue // not a version entry
++		}
++		vm := v.metadata()
++		vm.Version = n // the entry omits its own version; the map key is it
++		meta.Versions[n] = vm
++	}
++	return meta, nil
++}

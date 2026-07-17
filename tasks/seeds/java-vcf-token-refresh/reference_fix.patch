@@ -1,0 +1,163 @@
+diff --git a/TokenManager.java b/TokenManager.java
+new file mode 100644
+index 0000000..3c5bc3d
+--- /dev/null
++++ b/TokenManager.java
+@@ -0,0 +1,157 @@
++import java.io.IOException;
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.util.Map;
++import java.util.function.Consumer;
++
++/**
++ * Authentication layer for the SDDC Manager Tokens API (9.x contract):
++ * creates the token pair, attaches bearer tokens, refreshes once on 401,
++ * serializes concurrent refreshes, and invalidates the refresh token on
++ * shutdown. No token material or password ever reaches logs or exceptions.
++ */
++public final class TokenManager implements VcfTransport, AutoCloseable {
++
++    private final String baseUrl;
++    private final HttpClient http;
++    private final Consumer<String> log;
++
++    private final Object refreshLock = new Object();
++    private volatile String accessToken;
++    private String refreshTokenId;
++    private volatile boolean closed;
++
++    private TokenManager(String baseUrl, HttpClient http, Consumer<String> log) {
++        this.baseUrl = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
++        this.http = http;
++        this.log = log;
++    }
++
++    /** Logs in via POST /v1/tokens and returns a ready manager. */
++    public static TokenManager connect(String baseUrl, String username, String password,
++                                       HttpClient http, Consumer<String> log) {
++        TokenManager manager = new TokenManager(baseUrl, http, log);
++        manager.login(username, password);
++        return manager;
++    }
++
++    private void login(String username, String password) {
++        Map<String, Object> spec = new java.util.LinkedHashMap<>();
++        spec.put("username", username);
++        spec.put("password", password);
++        HttpResponse<String> response = send(HttpRequest.newBuilder(URI.create(baseUrl + "/v1/tokens"))
++                .header("Content-Type", "application/json")
++                .header("Accept", "application/json")
++                .POST(HttpRequest.BodyPublishers.ofString(Json.write(spec)))
++                .build());
++        if (response.statusCode() != 201) {
++            log.accept("token pair creation failed with status " + response.statusCode());
++            throw SddcHttpClient.decodeError(response);
++        }
++        Map<String, Object> pair = Json.object(Json.parse(response.body()));
++        accessToken = (String) pair.get("accessToken");
++        refreshTokenId = (String) Json.object(pair.get("refreshToken")).get("id");
++        log.accept("created token pair for user " + username);
++    }
++
++    @Override
++    public Object get(String path) {
++        requireOpen();
++        String used = accessToken;
++        HttpResponse<String> response = authorizedGet(path, used);
++        if (response.statusCode() == 401) {
++            String rotated = refreshFor(used);
++            response = authorizedGet(path, rotated);
++            if (response.statusCode() == 401) {
++                log.accept("request still unauthorized after a token refresh");
++                throw SddcHttpClient.decodeError(response);
++            }
++        }
++        if (response.statusCode() / 100 != 2) {
++            throw SddcHttpClient.decodeError(response);
++        }
++        return Json.parse(response.body());
++    }
++
++    /**
++     * Rotates the access token unless another thread already did it for the
++     * same stale token; exactly one refresh reaches the wire per rotation.
++     */
++    private String refreshFor(String staleToken) {
++        synchronized (refreshLock) {
++            requireOpen();
++            String current = accessToken;
++            if (!current.equals(staleToken)) {
++                return current; // someone else already rotated it
++            }
++            HttpResponse<String> response = send(HttpRequest.newBuilder(
++                            URI.create(baseUrl + "/v1/tokens/access-token/refresh"))
++                    .header("Content-Type", "application/json")
++                    .header("Accept", "application/json")
++                    .method("PATCH", HttpRequest.BodyPublishers.ofString(Json.write(refreshTokenId)))
++                    .build());
++            if (response.statusCode() != 200) {
++                log.accept("access token refresh failed with status " + response.statusCode());
++                VcfApiException decoded = SddcHttpClient.decodeError(response);
++                throw new VcfAuthException(decoded.statusCode(), decoded.errorCode(),
++                        "access token refresh was rejected", decoded.referenceToken());
++            }
++            Object body = Json.parse(response.body());
++            if (!(body instanceof String rotated) || rotated.isEmpty()) {
++                throw new VcfAuthException(200, null, "refresh answer was not a JSON string", null);
++            }
++            accessToken = rotated;
++            log.accept("access token refreshed");
++            return rotated;
++        }
++    }
++
++    @Override
++    public void close() {
++        synchronized (refreshLock) {
++            if (closed) {
++                return;
++            }
++            closed = true;
++            HttpResponse<String> response = send(HttpRequest.newBuilder(
++                            URI.create(baseUrl + "/v1/tokens/refresh-token"))
++                    .header("Content-Type", "application/json")
++                    .method("DELETE", HttpRequest.BodyPublishers.ofString(Json.write(refreshTokenId)))
++                    .build());
++            if (response.statusCode() != 204) {
++                log.accept("refresh token invalidation answered status " + response.statusCode());
++            } else {
++                log.accept("refresh token invalidated on shutdown");
++            }
++            accessToken = null;
++            refreshTokenId = null;
++        }
++    }
++
++    private HttpResponse<String> authorizedGet(String path, String token) {
++        return send(HttpRequest.newBuilder(URI.create(baseUrl + path))
++                .header("Authorization", "Bearer " + token)
++                .header("Accept", "application/json")
++                .GET()
++                .build());
++    }
++
++    private HttpResponse<String> send(HttpRequest request) {
++        try {
++            return http.send(request, HttpResponse.BodyHandlers.ofString());
++        } catch (IOException e) {
++            throw new RuntimeException("SDDC Manager request failed: " + e.getMessage(), e);
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++            throw new RuntimeException("SDDC Manager request interrupted", e);
++        }
++    }
++
++    private void requireOpen() {
++        if (closed) {
++            throw new IllegalStateException("TokenManager is closed; its refresh token was invalidated");
++        }
++    }
++}

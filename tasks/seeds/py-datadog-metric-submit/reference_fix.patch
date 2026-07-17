@@ -1,0 +1,339 @@
+diff --git a/ddmetrics/__init__.py b/ddmetrics/__init__.py
+new file mode 100644
+index 0000000..99bf5a7
+--- /dev/null
++++ b/ddmetrics/__init__.py
+@@ -0,0 +1,9 @@
++"""Datadog Metrics API v2 submitter (stdlib only).
++
++Implements the documented POST /api/v2/series contract: site-aware base
++URLs, DD-API-KEY header auth, v2 series schema, payload-limit batching,
++optional deflate/gzip compression, per-payload error reporting, and
++Retry-After driven 429 retries with injected time.
++"""
++
++from . import batch, client, series, sites  # noqa: F401
+diff --git a/ddmetrics/batch.py b/ddmetrics/batch.py
+new file mode 100644
+index 0000000..b06739e
+--- /dev/null
++++ b/ddmetrics/batch.py
+@@ -0,0 +1,66 @@
++"""Payload batching against the documented intake limits.
++
++A payload on the wire may be at most 500KB (512000 bytes); a compressed
++payload must additionally decompress to less than 5MB (5242880 bytes).
++"""
++
++import json
++
++MAX_PAYLOAD_BYTES = 512000
++MAX_DECOMPRESSED_BYTES = 5242880
++
++
++def encode_payload(payload):
++    """Compact wire serialization; byte limits apply to exactly these bytes."""
++    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
++
++
++def split_series(series, max_bytes=MAX_PAYLOAD_BYTES):
++    """Pack series, in order, into as few payloads as fit uncompressed."""
++    batches = []
++    current = []
++    for doc in series:
++        candidate = current + [doc]
++        if len(encode_payload({"series": candidate})) <= max_bytes:
++            current = candidate
++            continue
++        if not current:
++            raise ValueError("series %r alone exceeds the %d byte payload "
++                             "limit" % (doc.get("metric"), max_bytes))
++        batches.append({"series": current})
++        current = [doc]
++        if len(encode_payload({"series": current})) > max_bytes:
++            raise ValueError("series %r alone exceeds the %d byte payload "
++                             "limit" % (doc.get("metric"), max_bytes))
++    if current:
++        batches.append({"series": current})
++    return batches
++
++
++def split_series_compressed(series, compress, max_bytes=MAX_PAYLOAD_BYTES,
++                            max_decompressed=MAX_DECOMPRESSED_BYTES):
++    """Pack series for compressed submission.
++
++    Each payload's decompressed JSON must stay under max_decompressed and
++    its compressed bytes within max_bytes.
++    """
++    batches = []
++    current = []
++    for doc in series:
++        candidate = current + [doc]
++        raw = encode_payload({"series": candidate})
++        if len(raw) < max_decompressed and len(compress(raw)) <= max_bytes:
++            current = candidate
++            continue
++        if not current:
++            raise ValueError("series %r alone exceeds the compressed payload "
++                             "limits" % (doc.get("metric"),))
++        batches.append({"series": current})
++        current = [doc]
++        raw = encode_payload({"series": current})
++        if not (len(raw) < max_decompressed and len(compress(raw)) <= max_bytes):
++            raise ValueError("series %r alone exceeds the compressed payload "
++                             "limits" % (doc.get("metric"),))
++    if current:
++        batches.append({"series": current})
++    return batches
+diff --git a/ddmetrics/client.py b/ddmetrics/client.py
+new file mode 100644
+index 0000000..4559077
+--- /dev/null
++++ b/ddmetrics/client.py
+@@ -0,0 +1,136 @@
++"""Datadog Metrics API v2 client (POST /api/v2/series)."""
++
++import gzip
++import json
++import time
++import urllib.error
++import urllib.request
++import zlib
++
++from . import batch as batching
++from .sites import resolve_api_base
++
++SERIES_PATH = "/api/v2/series"
++
++# Documented point freshness window relative to submission time.
++MAX_PAST_SECONDS = 3600
++MAX_FUTURE_SECONDS = 600
++
++# The API documents deflate, gzip, and zstd1; the stdlib gives us the
++# first two, so zstd1 is refused rather than silently mis-encoded.
++_COMPRESSORS = {
++    "deflate": zlib.compress,
++    "gzip": gzip.compress,
++}
++
++
++class MetricsClient:
++    def __init__(self, api_key, site="datadoghq.com", base_url=None,
++                 compression=None, now=None, sleep=None, max_retries=2):
++        if not api_key:
++            raise ValueError("api_key is required")
++        if compression is not None and compression not in _COMPRESSORS:
++            raise ValueError(
++                "unsupported Content-Encoding %r: this client implements "
++                "deflate and gzip; the API also documents zstd1, which the "
++                "Python stdlib cannot produce portably" % (compression,)
++            )
++        self._api_key = api_key
++        self._base = (base_url or resolve_api_base(site)).rstrip("/")
++        self._compression = compression
++        self._now = now if now is not None else time.time
++        self._sleep = sleep if sleep is not None else time.sleep
++        self._max_retries = int(max_retries)
++
++    def submit(self, series):
++        """Submit series in documented-limit batches; one outcome per payload."""
++        series = list(series)
++        self._check_freshness(series)
++        if self._compression:
++            compress = _COMPRESSORS[self._compression]
++            payloads = batching.split_series_compressed(series, compress)
++        else:
++            compress = None
++            payloads = batching.split_series(series)
++
++        batches = []
++        accepted = 0
++        for payload in payloads:
++            body = batching.encode_payload(payload)
++            if compress:
++                body = compress(body)
++            outcome = self._post(body)
++            outcome["series_count"] = len(payload["series"])
++            if outcome["status"] == 202 and not outcome["errors"]:
++                accepted += outcome["series_count"]
++            batches.append({
++                "status": outcome["status"],
++                "series_count": outcome["series_count"],
++                "errors": outcome["errors"],
++                "attempts": outcome["attempts"],
++            })
++        return {
++            "submitted": len(series),
++            "accepted": accepted,
++            "ok": all(b["status"] == 202 and not b["errors"] for b in batches),
++            "batches": batches,
++        }
++
++    def _check_freshness(self, series):
++        now = float(self._now())
++        for doc in series:
++            for point in doc.get("points", ()):
++                ts = point["timestamp"]
++                if ts < now - MAX_PAST_SECONDS or ts > now + MAX_FUTURE_SECONDS:
++                    raise ValueError(
++                        "point for metric %r at %d is outside the accepted "
++                        "window (at most 1h past, 10min future)"
++                        % (doc.get("metric"), ts)
++                    )
++
++    def _post(self, body):
++        headers = {
++            "DD-API-KEY": self._api_key,
++            "Content-Type": "application/json",
++            "Accept": "application/json",
++        }
++        if self._compression:
++            headers["Content-Encoding"] = self._compression
++
++        attempts = 0
++        while True:
++            attempts += 1
++            request = urllib.request.Request(
++                self._base + SERIES_PATH, data=body, headers=headers,
++                method="POST",
++            )
++            retry_after = None
++            try:
++                with urllib.request.urlopen(request) as response:
++                    status = response.getcode()
++                    raw = response.read()
++            except urllib.error.HTTPError as err:
++                status = err.code
++                raw = err.read()
++                retry_after = err.headers.get("Retry-After")
++            except urllib.error.URLError as err:
++                # Never let the request object (which holds the key header)
++                # escape through the exception chain.
++                raise RuntimeError("Datadog intake request failed: %s"
++                                   % (getattr(err, "reason", err),)) from None
++
++            errors = self._decode_errors(raw)
++            if status == 429 and attempts <= self._max_retries:
++                wait = float(retry_after) if retry_after is not None else 1.0
++                self._sleep(wait)
++                continue
++            return {"status": status, "errors": errors, "attempts": attempts}
++
++    @staticmethod
++    def _decode_errors(raw):
++        try:
++            doc = json.loads(raw.decode("utf-8"))
++        except (ValueError, UnicodeDecodeError):
++            return []
++        errors = doc.get("errors", [])
++        return list(errors) if isinstance(errors, list) else [str(errors)]
+diff --git a/ddmetrics/series.py b/ddmetrics/series.py
+new file mode 100644
+index 0000000..21c38cd
+--- /dev/null
++++ b/ddmetrics/series.py
+@@ -0,0 +1,73 @@
++"""v2 series construction and validation.
++
++The v2 schema types metrics with an integer enum and carries points as
++{timestamp, value} objects; resources replace the old v1 host string.
++"""
++
++UNSPECIFIED = 0
++COUNT = 1
++RATE = 2
++GAUGE = 3
++
++_VALID_TYPES = frozenset({UNSPECIFIED, COUNT, RATE, GAUGE})
++_NEEDS_INTERVAL = frozenset({COUNT, RATE})
++
++
++def _normalize_point(point):
++    if isinstance(point, dict):
++        if "timestamp" not in point or "value" not in point:
++            raise ValueError("a point dict needs 'timestamp' and 'value'")
++        ts, value = point["timestamp"], point["value"]
++    else:
++        try:
++            ts, value = point
++        except (TypeError, ValueError):
++            raise ValueError("a point must be a (timestamp, value) pair "
++                             "or a {'timestamp', 'value'} dict")
++    return {"timestamp": int(ts), "value": float(value)}
++
++
++def make_series(metric, mtype, points, tags=None, resources=None, unit=None,
++                interval=None, source_type_name=None):
++    """Build one series dict in the documented v2 shape.
++
++    Unset optional fields are omitted entirely rather than sent as null.
++    """
++    if not isinstance(metric, str) or not metric:
++        raise ValueError("metric must be a non-empty string")
++    if isinstance(mtype, bool) or not isinstance(mtype, int) \
++            or mtype not in _VALID_TYPES:
++        raise ValueError(
++            "metric type must be one of the v2 integer enum values "
++            "0 (unspecified), 1 (count), 2 (rate), 3 (gauge); got %r" % (mtype,)
++        )
++    normalized = [_normalize_point(p) for p in points]
++    if not normalized:
++        raise ValueError("a series needs at least one point")
++    if mtype in _NEEDS_INTERVAL and interval is None:
++        raise ValueError("count and rate series need the corresponding "
++                         "interval in seconds")
++    if interval is not None:
++        if isinstance(interval, bool) or not isinstance(interval, int) \
++                or interval <= 0:
++            raise ValueError("interval must be a positive number of seconds")
++
++    doc = {"metric": metric, "type": mtype, "points": normalized}
++    if interval is not None:
++        doc["interval"] = interval
++    if tags is not None:
++        if not all(isinstance(t, str) for t in tags):
++            raise ValueError("tags must be strings")
++        doc["tags"] = list(tags)
++    if resources is not None:
++        cleaned = []
++        for res in resources:
++            if not isinstance(res, dict) or "name" not in res or "type" not in res:
++                raise ValueError("each resource needs 'name' and 'type'")
++            cleaned.append({"name": res["name"], "type": res["type"]})
++        doc["resources"] = cleaned
++    if unit is not None:
++        doc["unit"] = unit
++    if source_type_name is not None:
++        doc["source_type_name"] = source_type_name
++    return doc
+diff --git a/ddmetrics/sites.py b/ddmetrics/sites.py
+new file mode 100644
+index 0000000..37dd496
+--- /dev/null
++++ b/ddmetrics/sites.py
+@@ -0,0 +1,25 @@
++"""Datadog site selection.
++
++Each Datadog site is a fully independent instance; data cannot be shared
++across sites. The API host for a site parameter is https://api.<site>.
++"""
++
++KNOWN_SITES = frozenset({
++    "datadoghq.com",       # US1
++    "us3.datadoghq.com",   # US3
++    "us5.datadoghq.com",   # US5
++    "datadoghq.eu",        # EU1
++    "ap1.datadoghq.com",   # AP1
++    "ap2.datadoghq.com",   # AP2
++    "ddog-gov.com",        # US1-FED
++})
++
++
++def resolve_api_base(site):
++    """Map a documented site parameter to its API base URL."""
++    if site not in KNOWN_SITES:
++        raise ValueError(
++            "unknown Datadog site %r; expected one of the documented site "
++            "parameters such as datadoghq.com or datadoghq.eu" % (site,)
++        )
++    return "https://api." + site

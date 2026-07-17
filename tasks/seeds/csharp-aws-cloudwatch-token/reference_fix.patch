@@ -1,0 +1,278 @@
+diff --git a/Errors.cs b/Errors.cs
+new file mode 100644
+index 0000000..9594065
+--- /dev/null
++++ b/Errors.cs
+@@ -0,0 +1,63 @@
++using Amazon.CloudWatchLogs;
++using Amazon.CloudWatchLogs.Model;
++
++namespace CloudWatchTokenExport;
++
++public enum LogErrorKind
++{
++    /// <summary>Retryable request-rate errors.</summary>
++    Throttled,
++
++    /// <summary>
++    /// Legacy write-path pair (InvalidSequenceTokenException /
++    /// DataAlreadyAcceptedException). Current PutLogEvents docs state
++    /// sequence tokens are ignored and these are never returned anymore;
++    /// they are terminal and must never be treated as throttling.
++    /// </summary>
++    InvalidSequenceToken,
++
++    /// <summary>Malformed request, e.g. a corrupted or expired page token.</summary>
++    InvalidParameter,
++
++    NotFound,
++
++    Unknown,
++}
++
++public static class LogErrorClassifier
++{
++    // Matches both the SDK's typed exception classes and the service
++    // ErrorCode, because generic AmazonCloudWatchLogsException instances can
++    // carry the code without the typed class.
++    public static LogErrorKind Classify(Exception exception) => exception switch
++    {
++        InvalidSequenceTokenException or DataAlreadyAcceptedException => LogErrorKind.InvalidSequenceToken,
++        InvalidParameterException => LogErrorKind.InvalidParameter,
++        ResourceNotFoundException => LogErrorKind.NotFound,
++        AmazonCloudWatchLogsException e => e.ErrorCode switch
++        {
++            "ThrottlingException" or "Throttling" or "LimitExceededException" => LogErrorKind.Throttled,
++            "InvalidSequenceTokenException" or "DataAlreadyAcceptedException" => LogErrorKind.InvalidSequenceToken,
++            "InvalidParameterException" => LogErrorKind.InvalidParameter,
++            "ResourceNotFoundException" => LogErrorKind.NotFound,
++            _ => LogErrorKind.Unknown,
++        },
++        _ => LogErrorKind.Unknown,
++    };
++}
++
++/// <summary>A failed export step with its service context preserved.</summary>
++public sealed class ExportException : Exception
++{
++    public string LogGroup { get; }
++    public string? StreamName { get; }
++    public LogErrorKind Kind { get; }
++
++    public ExportException(string logGroup, string? streamName, LogErrorKind kind, Exception inner)
++        : base($"export of {logGroup}{(streamName is null ? "" : "/" + streamName)} failed ({kind})", inner)
++    {
++        LogGroup = logGroup;
++        StreamName = streamName;
++        Kind = kind;
++    }
++}
+diff --git a/ExporterOptions.cs b/ExporterOptions.cs
+new file mode 100644
+index 0000000..201b0e6
+--- /dev/null
++++ b/ExporterOptions.cs
+@@ -0,0 +1,15 @@
++namespace CloudWatchTokenExport;
++
++/// <summary>Tuning for the exporter's bounded throttle retries.</summary>
++public sealed class ExporterOptions
++{
++    public int MaxThrottleRetries { get; init; } = 3;
++
++    public TimeSpan BaseDelay { get; init; } = TimeSpan.FromMilliseconds(200);
++
++    public TimeSpan MaxDelay { get; init; } = TimeSpan.FromSeconds(5);
++
++    /// <summary>Injected delay so tests never really sleep.</summary>
++    public Func<TimeSpan, CancellationToken, Task> DelayAsync { get; init; } =
++        (delay, ct) => Task.Delay(delay, ct);
++}
+diff --git a/LogExporter.cs b/LogExporter.cs
+new file mode 100644
+index 0000000..27d127d
+--- /dev/null
++++ b/LogExporter.cs
+@@ -0,0 +1,163 @@
++using Amazon.CloudWatchLogs;
++using Amazon.CloudWatchLogs.Model;
++
++namespace CloudWatchTokenExport;
++
++public sealed class LogExporter
++{
++    /// <summary>Documented DescribeLogStreams per-call page maximum.</summary>
++    public const int DescribeLimit = 50;
++
++    private readonly IAmazonCloudWatchLogs _client;
++    private readonly ExporterOptions _options;
++
++    public LogExporter(IAmazonCloudWatchLogs client, ExporterOptions options)
++    {
++        _client = client;
++        _options = options;
++    }
++
++    public async Task<IReadOnlyList<string>> ListStreamNamesAsync(
++        string logGroup, CancellationToken ct = default)
++    {
++        var names = new List<string>();
++        string? token = null;
++        do
++        {
++            ct.ThrowIfCancellationRequested();
++            var request = new DescribeLogStreamsRequest
++            {
++                LogGroupName = logGroup,
++                Limit = DescribeLimit,
++                OrderBy = OrderBy.LogStreamName,
++                NextToken = token,
++            };
++            var response = await CallAsync(logGroup, null,
++                () => _client.DescribeLogStreamsAsync(request, ct), ct);
++            foreach (var stream in response.LogStreams ?? new List<LogStream>())
++            {
++                names.Add(stream.LogStreamName);
++            }
++            token = response.NextToken;
++        } while (token != null);
++        return names;
++    }
++
++    public async Task<StreamExport> ReadStreamAsync(
++        string logGroup, string streamName, long startMs, long endMs,
++        CancellationToken ct = default)
++    {
++        var events = new List<ExportedEvent>();
++        int pages = await ReadPagesAsync(logGroup, streamName, startMs, endMs,
++            page => events.AddRange(page), ct);
++        return new StreamExport(streamName, events, pages);
++    }
++
++    public async Task<ExportReport> ExportAsync(
++        string logGroup, long startMs, long endMs, ILogSink sink,
++        CancellationToken ct = default)
++    {
++        var streams = await ListStreamNamesAsync(logGroup, ct);
++        int totalEvents = 0;
++        int totalPages = 0;
++        foreach (var stream in streams)
++        {
++            totalPages += await ReadPagesAsync(logGroup, stream, startMs, endMs, page =>
++            {
++                totalEvents += page.Count;
++                sink.Append(stream, page);
++            }, ct);
++        }
++        return new ExportReport(streams.Count, totalEvents, totalPages);
++    }
++
++    // Pages forward from the head; the documented termination signal is the
++    // service repeating the token we sent. Empty pages with a fresh token
++    // keep the walk going. onPage fires only for non-empty pages.
++    private async Task<int> ReadPagesAsync(
++        string logGroup, string streamName, long startMs, long endMs,
++        Action<IReadOnlyList<ExportedEvent>> onPage, CancellationToken ct)
++    {
++        int pages = 0;
++        string? token = null;
++        while (true)
++        {
++            ct.ThrowIfCancellationRequested();
++            // The .NET SDK models these wire timestamps (epoch milliseconds)
++            // as DateTime values.
++            var request = new GetLogEventsRequest
++            {
++                LogGroupName = logGroup,
++                LogStreamName = streamName,
++                StartTime = FromEpochMs(startMs),
++                EndTime = FromEpochMs(endMs),
++                StartFromHead = true,
++                NextToken = token,
++            };
++            var response = await CallAsync(logGroup, streamName,
++                () => _client.GetLogEventsAsync(request, ct), ct);
++            pages++;
++            var page = new List<ExportedEvent>();
++            foreach (var e in response.Events ?? new List<OutputLogEvent>())
++            {
++                page.Add(new ExportedEvent(ToEpochMs(e.Timestamp), e.Message, ToEpochMs(e.IngestionTime)));
++            }
++            if (page.Count > 0)
++            {
++                onPage(page);
++            }
++            var next = response.NextForwardToken;
++            if (next is null || next == token)
++            {
++                return pages;
++            }
++            token = next;
++        }
++    }
++
++    private static DateTime FromEpochMs(long ms) =>
++        DateTimeOffset.FromUnixTimeMilliseconds(ms).UtcDateTime;
++
++    private static long ToEpochMs(DateTime? value)
++    {
++        if (value is null)
++        {
++            return 0;
++        }
++        var v = value.Value;
++        v = v.Kind switch
++        {
++            DateTimeKind.Utc => v,
++            DateTimeKind.Local => v.ToUniversalTime(),
++            _ => DateTime.SpecifyKind(v, DateTimeKind.Utc),
++        };
++        return new DateTimeOffset(v).ToUnixTimeMilliseconds();
++    }
++
++    // Retries only throttling, with min(MaxDelay, BaseDelay * 2^attempt);
++    // everything else surfaces immediately with its context and cause.
++    private async Task<T> CallAsync<T>(
++        string logGroup, string? streamName, Func<Task<T>> operation, CancellationToken ct)
++    {
++        for (int attempt = 0; ; attempt++)
++        {
++            try
++            {
++                return await operation();
++            }
++            catch (AmazonCloudWatchLogsException ex)
++            {
++                var kind = LogErrorClassifier.Classify(ex);
++                if (kind == LogErrorKind.Throttled && attempt < _options.MaxThrottleRetries)
++                {
++                    double ms = Math.Min(
++                        _options.MaxDelay.TotalMilliseconds,
++                        _options.BaseDelay.TotalMilliseconds * Math.Pow(2, attempt));
++                    await _options.DelayAsync(TimeSpan.FromMilliseconds(ms), ct);
++                    continue;
++                }
++                throw new ExportException(logGroup, streamName, kind, ex);
++            }
++        }
++    }
++}
+diff --git a/Records.cs b/Records.cs
+new file mode 100644
+index 0000000..da1232f
+--- /dev/null
++++ b/Records.cs
+@@ -0,0 +1,13 @@
++namespace CloudWatchTokenExport;
++
++public sealed record ExportedEvent(long TimestampMs, string Message, long IngestionMs);
++
++public sealed record StreamExport(string StreamName, IReadOnlyList<ExportedEvent> Events, int Pages);
++
++public sealed record ExportReport(int Streams, int Events, int Pages);
++
++/// <summary>Receives events per non-empty page so partial progress survives.</summary>
++public interface ILogSink
++{
++    void Append(string streamName, IReadOnlyList<ExportedEvent> events);
++}

@@ -1,0 +1,274 @@
+diff --git a/order.go b/order.go
+index 49e7595..c6433ea 100644
+--- a/order.go
++++ b/order.go
+@@ -2,6 +2,10 @@
+ // state machine: a transition table plus business guards, with an
+ // append-only history of every transition the order takes.
+ //
++// Beyond the happy path the machine carries the compensation flows agreed
++// with finance: cancelling before or after payment, returns after delivery,
++// and refunds that must balance captured money before an order may close.
++//
+ // Money amounts are integer cents. The package is a pure decision core:
+ // no payment gateway calls, no clocks, no storage — callers own all of that.
+ package order
+@@ -20,6 +24,9 @@ const (
+ 	StatePaid      State = "paid"
+ 	StateShipped   State = "shipped"
+ 	StateDelivered State = "delivered"
++	StateCancelled State = "cancelled"
++	StateReturned  State = "returned"
++	StateClosed    State = "closed"
+ )
+ 
+ // Event is a lifecycle transition trigger.
+@@ -30,15 +37,29 @@ const (
+ 	EventPay     Event = "pay"
+ 	EventShip    Event = "ship"
+ 	EventDeliver Event = "deliver"
++	EventCancel  Event = "cancel"
++	EventReturn  Event = "return"
++	EventRefund  Event = "refund"
++)
++
++// Role identifies who is asking for a gated transition.
++type Role string
++
++const (
++	RoleCustomer Role = "customer"
++	RoleAgent    Role = "agent"
+ )
+ 
+ // transitions is the machine: which event is legal in which state, and
+ // where it goes.
+ var transitions = map[State]map[Event]State{
+-	StateCart:    {EventPlace: StatePlaced},
+-	StatePlaced:  {EventPay: StatePaid},
+-	StatePaid:    {EventShip: StateShipped},
+-	StateShipped: {EventDeliver: StateDelivered},
++	StateCart:      {EventPlace: StatePlaced},
++	StatePlaced:    {EventPay: StatePaid, EventCancel: StateClosed},
++	StatePaid:      {EventShip: StateShipped, EventCancel: StateCancelled},
++	StateShipped:   {EventDeliver: StateDelivered},
++	StateDelivered: {EventReturn: StateReturned},
++	StateCancelled: {EventRefund: StateClosed},
++	StateReturned:  {EventRefund: StateClosed},
+ }
+ 
+ // TransitionError reports an event that is not legal in the current state.
+@@ -62,12 +83,31 @@ func (e *GuardError) Error() string {
+ 	return fmt.Sprintf("guard refused %q: %s", e.Event, e.Reason)
+ }
+ 
++// PermissionError reports a role that may not trigger a gated transition.
++type PermissionError struct {
++	Role  Role
++	Event Event
++}
++
++func (e *PermissionError) Error() string {
++	return fmt.Sprintf("role %q may not trigger %q", e.Role, e.Event)
++}
++
++// InvariantError reports a history that violates the audit rules.
++type InvariantError struct {
++	Reason string
++}
++
++func (e *InvariantError) Error() string {
++	return fmt.Sprintf("history invariant violated: %s", e.Reason)
++}
++
+ // ErrNotEditable is returned when the line items of an order are changed
+ // after it left the cart stage.
+ var ErrNotEditable = errors.New("line items can only change while the order is a cart")
+ 
+ // Entry is one record in the order's transition history. Amount is the
+-// cents moved by money events (pay), zero for everything else.
++// cents moved by money events (pay, refund), zero for everything else.
+ type Entry struct {
+ 	Event  Event
+ 	From   State
+@@ -83,10 +123,11 @@ type Item struct {
+ 
+ // Order is a single order walking the lifecycle machine.
+ type Order struct {
+-	state   State
+-	items   []Item
+-	paid    int
+-	history []Entry
++	state    State
++	items    []Item
++	paid     int
++	refunded int
++	history  []Entry
+ }
+ 
+ // New returns an order in the cart stage with no items.
+@@ -109,6 +150,9 @@ func (o *Order) Total() int {
+ // Paid returns the cents captured so far.
+ func (o *Order) Paid() int { return o.paid }
+ 
++// Refunded returns the cents handed back so far.
++func (o *Order) Refunded() int { return o.refunded }
++
+ // History returns a copy of the transition history in order.
+ func (o *Order) History() []Entry {
+ 	out := make([]Entry, len(o.history))
+@@ -127,6 +171,23 @@ func (o *Order) apply(ev Event, amount int) error {
+ 	return nil
+ }
+ 
++// legal reports whether ev may fire from the current state.
++func (o *Order) legal(ev Event) bool {
++	_, ok := transitions[o.state][ev]
++	return ok
++}
++
++// checkRole enforces the role gate for ev. The transition table has
++// already been consulted by the caller.
++func checkRole(role Role, ev Event, allowed ...Role) error {
++	for _, ok := range allowed {
++		if role == ok {
++			return nil
++		}
++	}
++	return &PermissionError{Role: role, Event: ev}
++}
++
+ // AddItem appends a line item. Orders are only editable in the cart stage.
+ func (o *Order) AddItem(sku string, price int) error {
+ 	if o.state != StateCart {
+@@ -141,7 +202,7 @@ func (o *Order) AddItem(sku string, price int) error {
+ 
+ // Place moves cart -> placed. An empty order cannot be placed.
+ func (o *Order) Place() error {
+-	if _, ok := transitions[o.state][EventPlace]; ok && len(o.items) == 0 {
++	if o.legal(EventPlace) && len(o.items) == 0 {
+ 		return &GuardError{Event: EventPlace, Reason: "cannot place an empty order"}
+ 	}
+ 	return o.apply(EventPlace, 0)
+@@ -150,7 +211,7 @@ func (o *Order) Place() error {
+ // Pay captures payment and moves placed -> paid. The captured amount must
+ // equal the order total exactly; partial capture is not supported.
+ func (o *Order) Pay(amount int) error {
+-	if _, ok := transitions[o.state][EventPay]; ok && amount != o.Total() {
++	if o.legal(EventPay) && amount != o.Total() {
+ 		return &GuardError{
+ 			Event:  EventPay,
+ 			Reason: fmt.Sprintf("amount %d does not match order total %d", amount, o.Total()),
+@@ -168,3 +229,113 @@ func (o *Order) Ship() error { return o.apply(EventShip, 0) }
+ 
+ // Deliver moves shipped -> delivered.
+ func (o *Order) Deliver() error { return o.apply(EventDeliver, 0) }
++
++// Cancel abandons the order. From placed either role may cancel and the
++// order closes directly (nothing was captured). From paid only an agent
++// may cancel, and the order parks in cancelled until the money is
++// refunded. The table is checked before the role.
++func (o *Order) Cancel(role Role) error {
++	if !o.legal(EventCancel) {
++		return &TransitionError{From: o.state, Event: EventCancel}
++	}
++	allowed := []Role{RoleCustomer, RoleAgent}
++	if o.state == StatePaid {
++		allowed = []Role{RoleAgent}
++	}
++	if err := checkRole(role, EventCancel, allowed...); err != nil {
++		return err
++	}
++	return o.apply(EventCancel, 0)
++}
++
++// Return starts the return flow for a delivered order. Either role may
++// request it; the order parks in returned until the money is refunded.
++func (o *Order) Return(role Role) error {
++	if !o.legal(EventReturn) {
++		return &TransitionError{From: o.state, Event: EventReturn}
++	}
++	if err := checkRole(role, EventReturn, RoleCustomer, RoleAgent); err != nil {
++		return err
++	}
++	return o.apply(EventReturn, 0)
++}
++
++// Refund hands captured money back and closes the order. Like Pay it is
++// exact: the amount must equal the outstanding captured cents.
++func (o *Order) Refund(amount int) error {
++	if o.legal(EventRefund) && amount != o.paid-o.refunded {
++		return &GuardError{
++			Event: EventRefund,
++			Reason: fmt.Sprintf("amount %d does not match outstanding %d",
++				amount, o.paid-o.refunded),
++		}
++	}
++	if err := o.apply(EventRefund, amount); err != nil {
++		return err
++	}
++	o.refunded += amount
++	return nil
++}
++
++// Audit runs the history invariants against this order.
++func (o *Order) Audit() error {
++	return AuditHistory(o.History(), o.state)
++}
++
++// AuditHistory validates an order history (possibly imported from the
++// legacy system) against the ledger invariants. It judges chain and money
++// rules only — it does not re-check transition-table legality, because
++// legacy flows used routes the current table no longer has.
++func AuditHistory(entries []Entry, final State) error {
++	if len(entries) == 0 {
++		if final != StateCart {
++			return &InvariantError{Reason: fmt.Sprintf(
++				"empty history cannot end in %q", final)}
++		}
++		return nil
++	}
++	if entries[0].From != StateCart {
++		return &InvariantError{Reason: fmt.Sprintf(
++			"history starts at %q, not %q", entries[0].From, StateCart)}
++	}
++	paid, refunded := 0, 0
++	for i, entry := range entries {
++		if i > 0 && entry.From != entries[i-1].To {
++			return &InvariantError{Reason: fmt.Sprintf(
++				"entry %d leaves %q but the previous entry ended in %q",
++				i, entry.From, entries[i-1].To)}
++		}
++		switch entry.Event {
++		case EventPay:
++			if entry.Amount <= 0 {
++				return &InvariantError{Reason: fmt.Sprintf(
++					"entry %d: pay must move a positive amount, got %d", i, entry.Amount)}
++			}
++			paid += entry.Amount
++		case EventRefund:
++			if entry.Amount <= 0 {
++				return &InvariantError{Reason: fmt.Sprintf(
++					"entry %d: refund must move a positive amount, got %d", i, entry.Amount)}
++			}
++			refunded += entry.Amount
++		default:
++			if entry.Amount != 0 {
++				return &InvariantError{Reason: fmt.Sprintf(
++					"entry %d: event %q must not carry an amount", i, entry.Event)}
++			}
++		}
++		if refunded > paid {
++			return &InvariantError{Reason: fmt.Sprintf(
++				"entry %d: refunds (%d) exceed payments (%d)", i, refunded, paid)}
++		}
++	}
++	if last := entries[len(entries)-1]; last.To != final {
++		return &InvariantError{Reason: fmt.Sprintf(
++			"history ends in %q but the order is %q", last.To, final)}
++	}
++	if final == StateClosed && paid != refunded {
++		return &InvariantError{Reason: fmt.Sprintf(
++			"closed order must balance: paid %d, refunded %d", paid, refunded)}
++	}
++	return nil
++}

@@ -1,0 +1,191 @@
+diff --git a/sessionclient.py b/sessionclient.py
+new file mode 100644
+index 0000000..32dca14
+--- /dev/null
++++ b/sessionclient.py
+@@ -0,0 +1,185 @@
++"""Session-cookie portal client — explicit state machine, stdlib only."""
++import enum
++import json
++import time
++import urllib.error
++import urllib.parse
++import urllib.request
++
++
++class ClientState(enum.Enum):
++    ANONYMOUS = "anonymous"
++    AUTHENTICATED = "authenticated"
++    EXPIRED = "expired"
++
++
++class LoginError(Exception):
++    """Credentials or configuration trouble; not an in-flight request error."""
++
++
++class ApiError(Exception):
++    def __init__(self, message, *, status):
++        super().__init__(message)
++        self.status = status
++
++
++class AuthError(ApiError):
++    """A 401 that survived the single replay."""
++
++
++class SessionClient:
++    """Stateful API client that manages a cookie-jar session with the portal.
++
++    State machine:
++      ANONYMOUS --> login() --> AUTHENTICATED
++      AUTHENTICATED --> clock >= deadline --> EXPIRED
++      AUTHENTICATED/EXPIRED --> 401 on a request --> login() --> AUTHENTICATED
++      AUTHENTICATED/EXPIRED --> 2nd 401 in one call --> ANONYMOUS
++      any --> logout() --> ANONYMOUS
++    """
++
++    def __init__(self, base_url: str, username: str, password: str, *,
++                 clock=time.monotonic):
++        self._base_url = base_url.rstrip("/")
++        self._username = username
++        self._password = password
++        self._clock = clock
++        self._token: str | None = None
++        self._deadline: float | None = None  # None = no proactive expiry
++
++    @property
++    def state(self) -> ClientState:
++        if self._token is None:
++            return ClientState.ANONYMOUS
++        if self._deadline is not None and self._clock() >= self._deadline:
++            return ClientState.EXPIRED
++        return ClientState.AUTHENTICATED
++
++    def login(self) -> None:
++        """POST /session; raise LoginError on any failure."""
++        body = json.dumps({
++            "username": self._username,
++            "password": self._password,
++        }).encode("utf-8")
++        req = urllib.request.Request(
++            self._base_url + "/session",
++            data=body,
++            method="POST",
++            headers={"Content-Type": "application/json"},
++        )
++        try:
++            resp = urllib.request.urlopen(req)
++        except urllib.error.HTTPError as exc:
++            detail = _read_detail(exc)
++            raise LoginError("login rejected (%d): %s" % (exc.code, detail)) from exc
++
++        # Extract Set-Cookie
++        cookie = _extract_portal_sid(resp)
++        if cookie is None:
++            raise LoginError("login 200 but no portal_sid Set-Cookie in response")
++
++        # Parse optional expires_in from body
++        data = _parse_body(resp)
++        expires_in = data.get("expires_in") if isinstance(data, dict) else None
++        deadline = (self._clock() + int(expires_in)) if isinstance(expires_in, (int, float)) else None
++
++        # Commit
++        self._token = cookie
++        self._deadline = deadline
++
++    def logout(self) -> None:
++        """DELETE /session; no-op if ANONYMOUS."""
++        if self._token is None:
++            return
++        req = urllib.request.Request(
++            self._base_url + "/session",
++            method="DELETE",
++            headers={"Cookie": "portal_sid=" + self._token},
++        )
++        try:
++            urllib.request.urlopen(req)
++        except urllib.error.HTTPError:
++            pass  # best-effort; we're clearing the session regardless
++        self._token = None
++        self._deadline = None
++
++    def get_json(self, path: str) -> dict:
++        """GET path, return parsed JSON body.
++
++        Lazily logs in if ANONYMOUS; proactively re-logins if EXPIRED;
++        replays exactly once on a 401.
++        """
++        if self.state in (ClientState.ANONYMOUS, ClientState.EXPIRED):
++            self.login()
++        result, _rotated = self._do_get(path)
++        if result is not None:
++            return result
++
++        # Got a 401 — re-login and replay once
++        self.login()
++        result, _rotated = self._do_get(path)
++        if result is not None:
++            return result
++
++        # Second 401
++        self._token = None
++        self._deadline = None
++        raise AuthError("session rejected after re-login (401)", status=401)
++
++    def _do_get(self, path: str):
++        """Perform one GET; return (parsed_body, rotated) or (None, None) on 401."""
++        req = urllib.request.Request(
++            self._base_url + path,
++            method="GET",
++            headers={"Cookie": "portal_sid=" + (self._token or "")},
++        )
++        try:
++            resp = urllib.request.urlopen(req)
++        except urllib.error.HTTPError as exc:
++            if exc.code == 401:
++                return None, None
++            raise ApiError("request failed (%d)" % exc.code, status=exc.code) from exc
++
++        # A resource response may rotate the session id
++        new_sid = _extract_portal_sid(resp)
++        if new_sid is not None:
++            self._token = new_sid
++            # don't update deadline — the resource doesn't give us expires_in
++
++        data = _parse_body(resp)
++        return data, new_sid
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++def _extract_portal_sid(resp) -> str | None:
++    """Return the portal_sid cookie value from the first matching Set-Cookie, or None."""
++    # HTTPResponse has info() which returns the email.message.Message headers
++    headers = resp.info()
++    for header in headers.get_all("Set-Cookie") or []:
++        for part in header.split(";"):
++            part = part.strip()
++            if part.lower().startswith("portal_sid="):
++                return part[len("portal_sid="):]
++    return None
++
++
++def _parse_body(resp) -> dict:
++    try:
++        raw = resp.read()
++        return json.loads(raw.decode("utf-8")) if raw else {}
++    except Exception:
++        return {}
++
++
++def _read_detail(exc: urllib.error.HTTPError) -> str:
++    try:
++        raw = exc.read()
++        data = json.loads(raw.decode("utf-8"))
++        if isinstance(data, dict):
++            return str(data.get("error") or data)
++        return str(data)
++    except Exception:
++        return str(exc)

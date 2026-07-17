@@ -1,0 +1,309 @@
+diff --git a/cycles.go b/cycles.go
+new file mode 100644
+index 0000000..9c3643e
+--- /dev/null
++++ b/cycles.go
+@@ -0,0 +1,52 @@
++package modcycles
++
++import "sort"
++
++// Cycles enumerates every elementary cycle in the import graph.
++//
++// Each cycle starts at its alphabetically smallest member (so it is found
++// exactly once: the search from a start node only travels through nodes
++// that sort after it) and consecutive elements follow import edges, the
++// last importing the first. The outer list is sorted element-by-element.
++func (g *Graph) Cycles() [][]string {
++	starts := g.Modules() // sorted
++	var cycles [][]string
++
++	var path []string
++	onPath := map[string]bool{}
++
++	var dfs func(start, node string)
++	dfs = func(start, node string) {
++		path = append(path, node)
++		onPath[node] = true
++		for _, dep := range g.declaredImports(node) {
++			if dep == start {
++				cycle := make([]string, len(path))
++				copy(cycle, path)
++				cycles = append(cycles, cycle)
++				continue
++			}
++			if dep < start || onPath[dep] {
++				continue
++			}
++			dfs(start, dep)
++		}
++		onPath[node] = false
++		path = path[:len(path)-1]
++	}
++
++	for _, start := range starts {
++		dfs(start, start)
++	}
++
++	sort.Slice(cycles, func(i, j int) bool {
++		a, b := cycles[i], cycles[j]
++		for k := 0; k < len(a) && k < len(b); k++ {
++			if a[k] != b[k] {
++				return a[k] < b[k]
++			}
++		}
++		return len(a) < len(b)
++	})
++	return cycles
++}
+diff --git a/graph.go b/graph.go
+new file mode 100644
+index 0000000..35749a7
+--- /dev/null
++++ b/graph.go
+@@ -0,0 +1,61 @@
++package modcycles
++
++import "sort"
++
++// Graph is the declared-module import graph. Read-only after Load.
++type Graph struct {
++	imports map[string][]string // declared module -> imports, declaration order
++}
++
++func newGraph() *Graph {
++	return &Graph{imports: map[string][]string{}}
++}
++
++func (g *Graph) add(m *manifest) {
++	g.imports[m.name] = m.imports
++}
++
++// Modules lists every declared module, sorted.
++func (g *Graph) Modules() []string {
++	names := make([]string, 0, len(g.imports))
++	for name := range g.imports {
++		names = append(names, name)
++	}
++	sort.Strings(names)
++	return names
++}
++
++// Imports reports a module's imports in declaration order.
++func (g *Graph) Imports(name string) ([]string, bool) {
++	imports, ok := g.imports[name]
++	return imports, ok
++}
++
++// Missing lists imported-but-undeclared names, sorted and deduplicated.
++func (g *Graph) Missing() []string {
++	set := map[string]bool{}
++	for _, imports := range g.imports {
++		for _, dep := range imports {
++			if _, declared := g.imports[dep]; !declared {
++				set[dep] = true
++			}
++		}
++	}
++	missing := make([]string, 0, len(set))
++	for name := range set {
++		missing = append(missing, name)
++	}
++	sort.Strings(missing)
++	return missing
++}
++
++// declaredImports yields only edges whose target is a declared module.
++func (g *Graph) declaredImports(name string) []string {
++	var out []string
++	for _, dep := range g.imports[name] {
++		if _, ok := g.imports[dep]; ok {
++			out = append(out, dep)
++		}
++	}
++	return out
++}
+diff --git a/order.go b/order.go
+new file mode 100644
+index 0000000..60c592f
+--- /dev/null
++++ b/order.go
+@@ -0,0 +1,53 @@
++package modcycles
++
++import (
++	"errors"
++	"sort"
++)
++
++// Order returns a dependency-first topological order over declared
++// modules. When several modules are ready at once the alphabetically
++// smallest goes next, so the order is fully deterministic. Returns an
++// error if the graph contains any import cycle.
++func (g *Graph) Order() ([]string, error) {
++	pending := map[string]int{} // unmet declared dependencies
++	dependents := map[string][]string{}
++	for _, name := range g.Modules() {
++		deps := g.declaredImports(name)
++		pending[name] = len(deps)
++		for _, dep := range deps {
++			dependents[dep] = append(dependents[dep], name)
++		}
++	}
++
++	var ready []string
++	for name, n := range pending {
++		if n == 0 {
++			ready = append(ready, name)
++		}
++	}
++	sort.Strings(ready)
++
++	order := make([]string, 0, len(pending))
++	for len(ready) > 0 {
++		next := ready[0]
++		ready = ready[1:]
++		order = append(order, next)
++		var unlocked []string
++		for _, dependent := range dependents[next] {
++			pending[dependent]--
++			if pending[dependent] == 0 {
++				unlocked = append(unlocked, dependent)
++			}
++		}
++		if len(unlocked) > 0 {
++			ready = append(ready, unlocked...)
++			sort.Strings(ready)
++		}
++	}
++
++	if len(order) != len(pending) {
++		return nil, errors.New("import cycle detected: topological order impossible")
++	}
++	return order, nil
++}
+diff --git a/parse.go b/parse.go
+new file mode 100644
+index 0000000..aba51ac
+--- /dev/null
++++ b/parse.go
+@@ -0,0 +1,119 @@
++package modcycles
++
++import (
++	"bufio"
++	"fmt"
++	"io/fs"
++	"os"
++	"path/filepath"
++	"strings"
++)
++
++// manifest is one parsed .mod file.
++type manifest struct {
++	path    string
++	name    string
++	imports []string
++}
++
++func validName(s string) bool {
++	if s == "" {
++		return false
++	}
++	for _, r := range s {
++		switch {
++		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z',
++			r >= '0' && r <= '9', r == '-', r == '_':
++		default:
++			return false
++		}
++	}
++	return true
++}
++
++func parseManifest(path string) (*manifest, error) {
++	f, err := os.Open(path)
++	if err != nil {
++		return nil, err
++	}
++	defer f.Close()
++
++	m := &manifest{path: path}
++	seen := map[string]bool{}
++	scanner := bufio.NewScanner(f)
++	lineNo := 0
++	for scanner.Scan() {
++		lineNo++
++		line := strings.TrimSpace(scanner.Text())
++		if line == "" || strings.HasPrefix(line, "#") {
++			continue
++		}
++		fields := strings.Fields(line)
++		switch fields[0] {
++		case "module":
++			if len(fields) != 2 || !validName(fields[1]) {
++				return nil, fmt.Errorf("%s:%d: malformed module line %q", path, lineNo, line)
++			}
++			if m.name != "" {
++				return nil, fmt.Errorf("%s:%d: second module line", path, lineNo)
++			}
++			if len(m.imports) > 0 {
++				return nil, fmt.Errorf("%s:%d: module line must come first", path, lineNo)
++			}
++			m.name = fields[1]
++		case "import":
++			if m.name == "" {
++				return nil, fmt.Errorf("%s:%d: import before module line", path, lineNo)
++			}
++			if len(fields) != 2 || !validName(fields[1]) {
++				return nil, fmt.Errorf("%s:%d: malformed import line %q", path, lineNo, line)
++			}
++			if seen[fields[1]] {
++				return nil, fmt.Errorf("%s:%d: duplicate import %q", path, lineNo, fields[1])
++			}
++			seen[fields[1]] = true
++			m.imports = append(m.imports, fields[1])
++		default:
++			return nil, fmt.Errorf("%s:%d: unknown directive %q", path, lineNo, fields[0])
++		}
++	}
++	if err := scanner.Err(); err != nil {
++		return nil, fmt.Errorf("%s: %w", path, err)
++	}
++	if m.name == "" {
++		return nil, fmt.Errorf("%s: no module line", path)
++	}
++	return m, nil
++}
++
++// Load walks root for .mod manifests and builds the import graph.
++func Load(root string) (*Graph, error) {
++	var paths []string
++	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++		if !d.IsDir() && strings.HasSuffix(d.Name(), ".mod") {
++			paths = append(paths, path)
++		}
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	g := newGraph()
++	declaredIn := map[string]string{}
++	for _, path := range paths {
++		m, err := parseManifest(path)
++		if err != nil {
++			return nil, err
++		}
++		if other, ok := declaredIn[m.name]; ok {
++			return nil, fmt.Errorf("module %q declared in both %s and %s", m.name, other, path)
++		}
++		declaredIn[m.name] = path
++		g.add(m)
++	}
++	return g, nil
++}

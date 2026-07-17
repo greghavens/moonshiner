@@ -1,0 +1,193 @@
+diff --git a/upload.go b/upload.go
+new file mode 100644
+index 0000000..2fc28f1
+--- /dev/null
++++ b/upload.go
+@@ -0,0 +1,187 @@
++// Package upload is the streaming multipart intake handler: limits and the
++// type allowlist are enforced while the bytes arrive, and a failed request
++// never leaves a file behind.
++package upload
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"mime"
++	"mime/multipart"
++	"net/http"
++	"os"
++	"path/filepath"
++)
++
++// Policy is the intake contract for one handler instance.
++type Policy struct {
++	MaxPartBytes  int64 // per file part
++	MaxTotalBytes int64 // sum over all file parts in the request
++	AllowedTypes  []string
++}
++
++type storedFile struct {
++	Field     string `json:"field"`
++	Filename  string `json:"filename"`
++	MediaType string `json:"media_type"`
++	Size      int64  `json:"size"`
++	SHA256    string `json:"sha256"`
++	Path      string `json:"path"`
++}
++
++// Handler accepts POST multipart/form-data uploads into dir under p.
++func Handler(dir string, p Policy) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Method != http.MethodPost {
++			writeErr(w, http.StatusMethodNotAllowed, "POST only", "")
++			return
++		}
++		mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
++		if err != nil || mediaType != "multipart/form-data" {
++			writeErr(w, http.StatusUnsupportedMediaType, "expected multipart/form-data", "")
++			return
++		}
++		boundary := params["boundary"]
++		if boundary == "" {
++			writeErr(w, http.StatusBadRequest, "multipart boundary missing", "")
++			return
++		}
++
++		in := &intake{dir: dir, policy: p}
++		files, status, msg, field := in.run(multipart.NewReader(r.Body, boundary))
++		if status != 0 {
++			in.cleanup()
++			writeErr(w, status, msg, field)
++			return
++		}
++		if len(files) == 0 {
++			in.cleanup()
++			writeErr(w, http.StatusBadRequest, "no file parts in upload", "")
++			return
++		}
++		w.Header().Set("Content-Type", "application/json")
++		w.WriteHeader(http.StatusCreated)
++		json.NewEncoder(w).Encode(files)
++	})
++}
++
++// intake tracks everything written so far so any failure can undo it.
++type intake struct {
++	dir     string
++	policy  Policy
++	total   int64
++	created []string
++}
++
++func (in *intake) cleanup() {
++	for _, p := range in.created {
++		os.Remove(p)
++	}
++	in.created = nil
++}
++
++// run walks the parts. A zero status means success.
++func (in *intake) run(mr *multipart.Reader) (files []storedFile, status int, msg, field string) {
++	for {
++		part, err := mr.NextPart()
++		if errors.Is(err, io.EOF) {
++			return files, 0, "", ""
++		}
++		if err != nil {
++			return nil, http.StatusBadRequest, "malformed multipart body", ""
++		}
++		if part.FileName() == "" {
++			continue // plain form field: ignored, costs nothing
++		}
++		f, status, msg := in.storePart(part)
++		if status != 0 {
++			return nil, status, msg, part.FormName()
++		}
++		files = append(files, f)
++	}
++}
++
++// storePart streams one file part to disk while hashing it, enforcing the
++// type allowlist and both byte limits as the bytes arrive.
++func (in *intake) storePart(part *multipart.Part) (storedFile, int, string) {
++	mediaType := "application/octet-stream"
++	if ct := part.Header.Get("Content-Type"); ct != "" {
++		mt, _, err := mime.ParseMediaType(ct)
++		if err != nil {
++			return storedFile{}, http.StatusBadRequest, "unparsable part Content-Type"
++		}
++		mediaType = mt
++	}
++	if !in.allowed(mediaType) {
++		return storedFile{}, http.StatusUnsupportedMediaType,
++			fmt.Sprintf("media type %s not allowed", mediaType)
++	}
++
++	// The tightest remaining budget decides how much this part may carry.
++	budget := in.policy.MaxPartBytes
++	overMsg := "file part exceeds the per-part limit"
++	if rest := in.policy.MaxTotalBytes - in.total; rest < budget {
++		budget = rest
++		overMsg = "upload exceeds the total size limit"
++	}
++
++	dst, err := os.CreateTemp(in.dir, "*-"+safeName(part.FileName()))
++	if err != nil {
++		return storedFile{}, http.StatusInternalServerError, "cannot store upload"
++	}
++	in.created = append(in.created, dst.Name())
++
++	h := sha256.New()
++	// Read one byte past the budget: hitting it means the part is too big.
++	n, err := io.Copy(io.MultiWriter(dst, h), io.LimitReader(part, budget+1))
++	dst.Close()
++	if err != nil {
++		return storedFile{}, http.StatusBadRequest, "upload interrupted"
++	}
++	if n > budget {
++		return storedFile{}, http.StatusRequestEntityTooLarge, overMsg
++	}
++	in.total += n
++
++	return storedFile{
++		Field:     part.FormName(),
++		Filename:  part.FileName(),
++		MediaType: mediaType,
++		Size:      n,
++		SHA256:    hex.EncodeToString(h.Sum(nil)),
++		Path:      dst.Name(),
++	}, 0, ""
++}
++
++func (in *intake) allowed(mediaType string) bool {
++	for _, t := range in.policy.AllowedTypes {
++		if t == mediaType {
++			return true
++		}
++	}
++	return false
++}
++
++// safeName reduces a client-supplied filename to a bare name so the stored
++// file always lands inside the upload dir.
++func safeName(name string) string {
++	base := filepath.Base(name)
++	if base == "" || base == "." || base == ".." || base == string(filepath.Separator) {
++		return "upload"
++	}
++	return base
++}
++
++func writeErr(w http.ResponseWriter, status int, msg, field string) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(status)
++	body := map[string]string{"error": msg}
++	if field != "" {
++		body["field"] = field
++	}
++	json.NewEncoder(w).Encode(body)
++}

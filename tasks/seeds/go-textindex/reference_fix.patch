@@ -1,0 +1,525 @@
+diff --git a/index.go b/index.go
+new file mode 100644
+index 0000000..d28a4d2
+--- /dev/null
++++ b/index.go
+@@ -0,0 +1,119 @@
++// Package textindex is a small in-memory inverted index with a boolean
++// query language (AND/OR/NOT, parentheses, quoted phrases) and simple
++// term-frequency ranking. It is safe for concurrent use.
++package textindex
++
++import (
++	"errors"
++	"sync"
++)
++
++// Result is one search hit: a document id and its tf score for the query.
++type Result struct {
++	ID    string
++	Score int
++}
++
++// Index maps tokens to the documents (and positions) they occur in.
++type Index struct {
++	mu sync.RWMutex
++	// postings[token][docID] = ascending token positions within the doc.
++	postings map[string]map[string][]int
++	// docTokens remembers each doc's token set so Add/Remove can unindex it.
++	docTokens map[string][]string
++}
++
++// NewIndex returns an empty index.
++func NewIndex() *Index {
++	return &Index{
++		postings:  make(map[string]map[string][]int),
++		docTokens: make(map[string][]string),
++	}
++}
++
++// Add indexes text under docID, replacing any previous document with the
++// same id. An empty id is an error.
++func (ix *Index) Add(docID, text string) error {
++	if docID == "" {
++		return errors.New("textindex: empty doc id")
++	}
++	tokens := tokenize(text)
++
++	ix.mu.Lock()
++	defer ix.mu.Unlock()
++	ix.unindex(docID)
++	ix.docTokens[docID] = tokens
++	for pos, tok := range tokens {
++		docs := ix.postings[tok]
++		if docs == nil {
++			docs = make(map[string][]int)
++			ix.postings[tok] = docs
++		}
++		docs[docID] = append(docs[docID], pos)
++	}
++	return nil
++}
++
++// Remove deletes docID from the index, reporting whether it was present.
++func (ix *Index) Remove(docID string) bool {
++	ix.mu.Lock()
++	defer ix.mu.Unlock()
++	if _, ok := ix.docTokens[docID]; !ok {
++		return false
++	}
++	ix.unindex(docID)
++	return true
++}
++
++// unindex strips docID's postings. Caller holds the write lock.
++func (ix *Index) unindex(docID string) {
++	tokens, ok := ix.docTokens[docID]
++	if !ok {
++		return
++	}
++	for _, tok := range tokens {
++		if docs := ix.postings[tok]; docs != nil {
++			delete(docs, docID)
++			if len(docs) == 0 {
++				delete(ix.postings, tok)
++			}
++		}
++	}
++	delete(ix.docTokens, docID)
++}
++
++// Len reports the number of indexed documents.
++func (ix *Index) Len() int {
++	ix.mu.RLock()
++	defer ix.mu.RUnlock()
++	return len(ix.docTokens)
++}
++
++// positions returns the ascending positions of token in doc (nil if absent).
++// Caller holds at least the read lock.
++func (ix *Index) positions(token, docID string) []int {
++	if docs := ix.postings[token]; docs != nil {
++		return docs[docID]
++	}
++	return nil
++}
++
++// docsWithToken returns the set of doc ids containing token.
++// Caller holds at least the read lock.
++func (ix *Index) docsWithToken(token string) map[string]struct{} {
++	out := make(map[string]struct{})
++	for id := range ix.postings[token] {
++		out[id] = struct{}{}
++	}
++	return out
++}
++
++// allDocs returns the set of every indexed doc id.
++// Caller holds at least the read lock.
++func (ix *Index) allDocs() map[string]struct{} {
++	out := make(map[string]struct{}, len(ix.docTokens))
++	for id := range ix.docTokens {
++		out[id] = struct{}{}
++	}
++	return out
++}
+diff --git a/query.go b/query.go
+new file mode 100644
+index 0000000..353062a
+--- /dev/null
++++ b/query.go
+@@ -0,0 +1,209 @@
++package textindex
++
++import (
++	"fmt"
++	"strings"
++)
++
++// Query grammar (loosest to tightest binding):
++//
++//	orExpr  := andExpr (OR andExpr)*
++//	andExpr := notExpr (AND notExpr)*
++//	notExpr := NOT notExpr | primary
++//	primary := '(' orExpr ')' | term | phrase
++//
++// AND/OR/NOT are case-sensitive keywords; lowercase and/or/not are ordinary
++// search terms. Adjacent operands with no operator between them are a
++// syntax error.
++
++type tokKind int
++
++const (
++	tokOperand tokKind = iota // bare term or quoted phrase
++	tokAnd
++	tokOr
++	tokNot
++	tokLParen
++	tokRParen
++)
++
++type queryTok struct {
++	kind   tokKind
++	tokens []string // for tokOperand: the tokenized term/phrase
++	text   string   // original spelling, for error messages
++}
++
++func lexQuery(q string) ([]queryTok, error) {
++	var out []queryTok
++	rs := []rune(q)
++	i := 0
++	for i < len(rs) {
++		r := rs[i]
++		switch {
++		case r == ' ' || r == '\t' || r == '\n' || r == '\r':
++			i++
++		case r == '(':
++			out = append(out, queryTok{kind: tokLParen, text: "("})
++			i++
++		case r == ')':
++			out = append(out, queryTok{kind: tokRParen, text: ")"})
++			i++
++		case r == '"':
++			end := -1
++			for j := i + 1; j < len(rs); j++ {
++				if rs[j] == '"' {
++					end = j
++					break
++				}
++			}
++			if end < 0 {
++				return nil, fmt.Errorf("textindex: unterminated phrase in query %q", q)
++			}
++			body := string(rs[i+1 : end])
++			toks := tokenize(body)
++			if len(toks) == 0 {
++				return nil, fmt.Errorf("textindex: phrase %q contains no tokens", body)
++			}
++			out = append(out, queryTok{kind: tokOperand, tokens: toks, text: `"` + body + `"`})
++			i = end + 1
++		default:
++			j := i
++			for j < len(rs) && !strings.ContainsRune(" \t\n\r()\"", rs[j]) {
++				j++
++			}
++			word := string(rs[i:j])
++			i = j
++			switch word {
++			case "AND":
++				out = append(out, queryTok{kind: tokAnd, text: word})
++			case "OR":
++				out = append(out, queryTok{kind: tokOr, text: word})
++			case "NOT":
++				out = append(out, queryTok{kind: tokNot, text: word})
++			default:
++				toks := tokenize(word)
++				if len(toks) == 0 {
++					return nil, fmt.Errorf("textindex: term %q contains no tokens", word)
++				}
++				out = append(out, queryTok{kind: tokOperand, tokens: toks, text: word})
++			}
++		}
++	}
++	return out, nil
++}
++
++// AST
++
++type node interface{}
++
++type termNode struct{ tokens []string } // len > 1 means phrase semantics
++type notNode struct{ child node }
++type andNode struct{ left, right node }
++type orNode struct{ left, right node }
++
++type parser struct {
++	toks []queryTok
++	pos  int
++}
++
++func parseQuery(q string) (node, error) {
++	toks, err := lexQuery(q)
++	if err != nil {
++		return nil, err
++	}
++	if len(toks) == 0 {
++		return nil, fmt.Errorf("textindex: empty query")
++	}
++	p := &parser{toks: toks}
++	n, err := p.parseOr()
++	if err != nil {
++		return nil, err
++	}
++	if p.pos != len(p.toks) {
++		return nil, fmt.Errorf("textindex: unexpected %q in query (missing operator?)", p.toks[p.pos].text)
++	}
++	return n, nil
++}
++
++func (p *parser) peek() (queryTok, bool) {
++	if p.pos < len(p.toks) {
++		return p.toks[p.pos], true
++	}
++	return queryTok{}, false
++}
++
++func (p *parser) parseOr() (node, error) {
++	left, err := p.parseAnd()
++	if err != nil {
++		return nil, err
++	}
++	for {
++		t, ok := p.peek()
++		if !ok || t.kind != tokOr {
++			return left, nil
++		}
++		p.pos++
++		right, err := p.parseAnd()
++		if err != nil {
++			return nil, err
++		}
++		left = orNode{left: left, right: right}
++	}
++}
++
++func (p *parser) parseAnd() (node, error) {
++	left, err := p.parseNot()
++	if err != nil {
++		return nil, err
++	}
++	for {
++		t, ok := p.peek()
++		if !ok || t.kind != tokAnd {
++			return left, nil
++		}
++		p.pos++
++		right, err := p.parseNot()
++		if err != nil {
++			return nil, err
++		}
++		left = andNode{left: left, right: right}
++	}
++}
++
++func (p *parser) parseNot() (node, error) {
++	if t, ok := p.peek(); ok && t.kind == tokNot {
++		p.pos++
++		child, err := p.parseNot()
++		if err != nil {
++			return nil, err
++		}
++		return notNode{child: child}, nil
++	}
++	return p.parsePrimary()
++}
++
++func (p *parser) parsePrimary() (node, error) {
++	t, ok := p.peek()
++	if !ok {
++		return nil, fmt.Errorf("textindex: query ends where an operand was expected")
++	}
++	switch t.kind {
++	case tokOperand:
++		p.pos++
++		return termNode{tokens: t.tokens}, nil
++	case tokLParen:
++		p.pos++
++		inner, err := p.parseOr()
++		if err != nil {
++			return nil, err
++		}
++		close, ok := p.peek()
++		if !ok || close.kind != tokRParen {
++			return nil, fmt.Errorf("textindex: unclosed parenthesis")
++		}
++		p.pos++
++		return inner, nil
++	default:
++		return nil, fmt.Errorf("textindex: unexpected %q where an operand was expected", t.text)
++	}
++}
+diff --git a/search.go b/search.go
+new file mode 100644
+index 0000000..3d2ddf4
+--- /dev/null
++++ b/search.go
+@@ -0,0 +1,144 @@
++package textindex
++
++import (
++	"sort"
++	"strings"
++)
++
++// Search parses query, evaluates it against the index, and returns matches
++// ranked by term-frequency score (descending), ties broken by doc id
++// (ascending). Malformed queries return an error; terms absent from the
++// corpus simply match nothing.
++func (ix *Index) Search(query string) ([]Result, error) {
++	root, err := parseQuery(query)
++	if err != nil {
++		return nil, err
++	}
++
++	ix.mu.RLock()
++	defer ix.mu.RUnlock()
++
++	matched := ix.eval(root)
++	positive := dedupeOperands(collectPositive(root))
++
++	results := make([]Result, 0, len(matched))
++	for id := range matched {
++		score := 0
++		for _, op := range positive {
++			score += ix.occurrences(op.tokens, id)
++		}
++		results = append(results, Result{ID: id, Score: score})
++	}
++	sort.Slice(results, func(i, j int) bool {
++		if results[i].Score != results[j].Score {
++			return results[i].Score > results[j].Score
++		}
++		return results[i].ID < results[j].ID
++	})
++	return results, nil
++}
++
++// eval computes the set of doc ids matching n. Caller holds the read lock.
++func (ix *Index) eval(n node) map[string]struct{} {
++	switch v := n.(type) {
++	case termNode:
++		if len(v.tokens) == 1 {
++			return ix.docsWithToken(v.tokens[0])
++		}
++		out := make(map[string]struct{})
++		for id := range ix.postings[v.tokens[0]] {
++			if ix.phraseCount(v.tokens, id) > 0 {
++				out[id] = struct{}{}
++			}
++		}
++		return out
++	case notNode:
++		child := ix.eval(v.child)
++		out := ix.allDocs()
++		for id := range child {
++			delete(out, id)
++		}
++		return out
++	case andNode:
++		left, right := ix.eval(v.left), ix.eval(v.right)
++		out := make(map[string]struct{})
++		for id := range left {
++			if _, ok := right[id]; ok {
++				out[id] = struct{}{}
++			}
++		}
++		return out
++	case orNode:
++		out := ix.eval(v.left)
++		for id := range ix.eval(v.right) {
++			out[id] = struct{}{}
++		}
++		return out
++	default:
++		return map[string]struct{}{}
++	}
++}
++
++// occurrences counts how often the term/phrase occurs in doc.
++// Caller holds the read lock.
++func (ix *Index) occurrences(tokens []string, docID string) int {
++	if len(tokens) == 1 {
++		return len(ix.positions(tokens[0], docID))
++	}
++	return ix.phraseCount(tokens, docID)
++}
++
++// phraseCount counts starting positions in doc where tokens appear
++// consecutively. Caller holds the read lock.
++func (ix *Index) phraseCount(tokens []string, docID string) int {
++	count := 0
++	for _, start := range ix.positions(tokens[0], docID) {
++		ok := true
++		for i := 1; i < len(tokens); i++ {
++			if !containsPos(ix.positions(tokens[i], docID), start+i) {
++				ok = false
++				break
++			}
++		}
++		if ok {
++			count++
++		}
++	}
++	return count
++}
++
++// containsPos reports whether sorted holds v (positions are ascending).
++func containsPos(sorted []int, v int) bool {
++	i := sort.SearchInts(sorted, v)
++	return i < len(sorted) && sorted[i] == v
++}
++
++// collectPositive gathers the term/phrase operands that are not under a NOT;
++// only those contribute to scoring.
++func collectPositive(n node) []termNode {
++	switch v := n.(type) {
++	case termNode:
++		return []termNode{v}
++	case andNode:
++		return append(collectPositive(v.left), collectPositive(v.right)...)
++	case orNode:
++		return append(collectPositive(v.left), collectPositive(v.right)...)
++	default: // notNode: nothing under it scores
++		return nil
++	}
++}
++
++// dedupeOperands drops repeated operands so a term typed twice counts once.
++func dedupeOperands(ops []termNode) []termNode {
++	seen := make(map[string]struct{}, len(ops))
++	out := ops[:0]
++	for _, op := range ops {
++		key := strings.Join(op.tokens, "\x00")
++		if _, ok := seen[key]; ok {
++			continue
++		}
++		seen[key] = struct{}{}
++		out = append(out, op)
++	}
++	return out
++}
+diff --git a/tokenize.go b/tokenize.go
+new file mode 100644
+index 0000000..6a1c1cd
+--- /dev/null
++++ b/tokenize.go
+@@ -0,0 +1,29 @@
++package textindex
++
++import (
++	"strings"
++	"unicode"
++)
++
++// tokenize splits text into lowercased tokens. A token is a maximal run of
++// Unicode letters and digits; everything else is a separator. Digits are
++// token characters, so "error404" stays a single token.
++func tokenize(text string) []string {
++	var tokens []string
++	var b strings.Builder
++	flush := func() {
++		if b.Len() > 0 {
++			tokens = append(tokens, b.String())
++			b.Reset()
++		}
++	}
++	for _, r := range text {
++		if unicode.IsLetter(r) || unicode.IsDigit(r) {
++			b.WriteRune(unicode.ToLower(r))
++		} else {
++			flush()
++		}
++	}
++	flush()
++	return tokens
++}

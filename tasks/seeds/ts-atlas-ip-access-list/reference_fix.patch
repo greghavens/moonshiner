@@ -1,0 +1,159 @@
+diff --git a/atlas/reconcile.ts b/atlas/reconcile.ts
+new file mode 100644
+index 0000000..cf4cbbb
+--- /dev/null
++++ b/atlas/reconcile.ts
+@@ -0,0 +1,153 @@
++// Project IP access-list reconciler for the MongoDB Atlas Administration
++// API v2. Contract per the official docs (see docs/official_sources.json):
++// POST takes an array and absorbs duplicates idempotently (no 409 is
++// documented for it), the endpoint forbids concurrent POSTs, propagation is
++// observed via GET /accessList/{entryValue}/status (STATUS PENDING ->
++// ACTIVE, FAILED is terminal) with CIDR slashes percent-encoded, and 429s
++// carry Retry-After seconds.
++import { AtlasApiError, AtlasClient } from "./client.ts";
++
++export interface DesiredEntry {
++  ipAddress?: string;
++  cidrBlock?: string;
++  awsSecurityGroup?: string;
++  comment?: string;
++  deleteAfterDate?: string;
++}
++
++export interface ReconcileOptions {
++  sleep: (ms: number) => Promise<void>;
++  pollIntervalMs: number;
++}
++
++export interface ReconcileReport {
++  added: string[];
++  alreadyPresent: string[];
++  statuses: Record<string, string>;
++}
++
++interface WireEntry {
++  ipAddress?: string;
++  cidrBlock?: string;
++  awsSecurityGroup?: string;
++}
++
++interface PageDoc {
++  links?: { href: string; rel: string }[];
++  results?: WireEntry[];
++  totalCount?: number;
++}
++
++interface Canonical {
++  /** comparison key: bare IPs fold into their /32 CIDR twin */
++  key: string;
++  /** canonical reported value: bare IP, CIDR string, or lowercase sg id */
++  value: string;
++  /** wire shape to POST, original form preserved */
++  wire: DesiredEntry;
++}
++
++function canonicalize(e: DesiredEntry): Canonical {
++  if (e.awsSecurityGroup !== undefined) {
++    const sg = e.awsSecurityGroup.trim().toLowerCase();
++    const wire: DesiredEntry = { awsSecurityGroup: sg };
++    if (e.comment !== undefined) wire.comment = e.comment;
++    if (e.deleteAfterDate !== undefined) wire.deleteAfterDate = e.deleteAfterDate;
++    return { key: sg, value: sg, wire };
++  }
++  if (e.ipAddress !== undefined) {
++    const ip = e.ipAddress.trim().toLowerCase();
++    const wire: DesiredEntry = { ipAddress: ip };
++    if (e.comment !== undefined) wire.comment = e.comment;
++    if (e.deleteAfterDate !== undefined) wire.deleteAfterDate = e.deleteAfterDate;
++    return { key: `${ip}/32`, value: ip, wire };
++  }
++  if (e.cidrBlock !== undefined) {
++    const cidr = e.cidrBlock.trim().toLowerCase();
++    const wire: DesiredEntry = { cidrBlock: cidr };
++    if (e.comment !== undefined) wire.comment = e.comment;
++    if (e.deleteAfterDate !== undefined) wire.deleteAfterDate = e.deleteAfterDate;
++    return { key: cidr, value: cidr, wire };
++  }
++  throw new Error("desired entry must set one of ipAddress, cidrBlock, awsSecurityGroup");
++}
++
++function existingKeys(entry: WireEntry): string[] {
++  const keys: string[] = [];
++  if (entry.awsSecurityGroup) keys.push(entry.awsSecurityGroup.trim().toLowerCase());
++  if (entry.cidrBlock) keys.push(entry.cidrBlock.trim().toLowerCase());
++  if (entry.ipAddress) keys.push(`${entry.ipAddress.trim().toLowerCase()}/32`);
++  return keys;
++}
++
++export async function reconcileAccessList(
++  client: AtlasClient,
++  groupId: string,
++  desired: DesiredEntry[],
++  opts: ReconcileOptions,
++): Promise<ReconcileReport> {
++  const listPath = `/api/atlas/v2/groups/${groupId}/accessList`;
++
++  // Page the current list, following the documented rel=next links.
++  const present = new Set<string>();
++  let doc = await client.request<PageDoc>("GET", listPath, {
++    query: { pageNum: "1", itemsPerPage: "100", includeCount: "true" },
++  });
++  for (;;) {
++    for (const entry of doc.results ?? []) {
++      for (const key of existingKeys(entry)) present.add(key);
++    }
++    const next = (doc.links ?? []).find((l) => l.rel === "next");
++    if (!next) break;
++    const href = new URL(next.href);
++    doc = await client.request<PageDoc>("GET", href.pathname + href.search);
++  }
++
++  // Collapse duplicate desired entries (first occurrence wins) and diff.
++  const seen = new Set<string>();
++  const alreadyPresent: string[] = [];
++  const missing: Canonical[] = [];
++  for (const entry of desired) {
++    const c = canonicalize(entry);
++    if (seen.has(c.key)) continue;
++    seen.add(c.key);
++    if (present.has(c.key)) alreadyPresent.push(c.value);
++    else missing.push(c);
++  }
++
++  const statuses: Record<string, string> = {};
++  if (missing.length > 0) {
++    // One synchronous POST with the whole batch — the endpoint doesn't
++    // support concurrent POSTs. A single 429 is retried after Retry-After.
++    const batch = missing.map((m) => m.wire);
++    try {
++      await client.request("POST", listPath, { body: batch });
++    } catch (err) {
++      if (err instanceof AtlasApiError && err.status === 429 && err.retryAfterSeconds !== null) {
++        await opts.sleep(err.retryAfterSeconds * 1000);
++        await client.request("POST", listPath, { body: batch });
++      } else {
++        throw err;
++      }
++    }
++
++    // Confirm propagation entry by entry, in batch order.
++    for (const m of missing) {
++      const statusPath = `${listPath}/${encodeURIComponent(m.value)}/status`;
++      for (;;) {
++        const s = await client.request<{ STATUS: string }>("GET", statusPath);
++        if (s.STATUS === "PENDING") {
++          await opts.sleep(opts.pollIntervalMs);
++          continue;
++        }
++        if (s.STATUS === "FAILED") {
++          throw new Error(`access list entry ${m.value} FAILED to apply`);
++        }
++        statuses[m.value] = s.STATUS;
++        break;
++      }
++    }
++  }
++
++  return { added: missing.map((m) => m.value), alreadyPresent, statuses };
++}

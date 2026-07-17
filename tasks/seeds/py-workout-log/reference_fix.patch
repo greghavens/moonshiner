@@ -1,0 +1,296 @@
+diff --git a/rules.py b/rules.py
+new file mode 100644
+index 0000000..36ad841
+--- /dev/null
++++ b/rules.py
+@@ -0,0 +1,34 @@
++"""Progressive-overload suggestion rules.
++
++Applied in order: plateau deload, then rep-quality increase, then hold.
++"""
++import math
++
++PLATEAU_SESSIONS = 3
++REP_TARGET = 5
++INCREMENT = 2.5
++DELOAD_FACTOR = 0.9
++
++
++def session_top(sets):
++    """A session's top weight."""
++    return max(st["weight"] for st in sets)
++
++
++def suggest(sessions):
++    """(verb, weight) for chronologically sorted (date, sets) sessions.
++
++    verb is 'deload to' / 'increase to' / 'hold at'. None when there is no
++    history to reason about.
++    """
++    if not sessions:
++        return None
++    tops = [session_top(sets) for _, sets in sessions]
++    top = tops[-1]
++    if len(tops) >= PLATEAU_SESSIONS and len(set(tops[-PLATEAU_SESSIONS:])) == 1:
++        deload = math.floor(top * DELOAD_FACTOR / INCREMENT) * INCREMENT
++        return ("deload to", deload)
++    last_sets = sessions[-1][1]
++    if all(st["reps"] >= REP_TARGET for st in last_sets):
++        return ("increase to", top + INCREMENT)
++    return ("hold at", top)
+diff --git a/stats.py b/stats.py
+new file mode 100644
+index 0000000..7e4c7b4
+--- /dev/null
++++ b/stats.py
+@@ -0,0 +1,66 @@
++"""Personal records and volume math over the workout log."""
++import datetime
++
++
++def fmt_kg(value):
++    """Render a weight/volume without trailing zeros: 105, 102.5, 119.6."""
++    return f"{value:g}"
++
++
++def epley_e1rm(reps, weight):
++    """Estimated one-rep max, rounded to one decimal."""
++    return round(weight * (1 + reps / 30), 1)
++
++
++def sessions_for(data, exercise):
++    """Chronologically sorted [(date, [set, ...]), ...] for one exercise."""
++    rows = [(s["date"], s["sets"]) for s in data["sessions"]
++            if s["exercise"] == exercise]
++    rows.sort(key=lambda r: r[0])
++    return rows
++
++
++def all_sets(data, exercise):
++    """Chronological [(date, reps, weight), ...] across every session."""
++    out = []
++    for date, sets in sessions_for(data, exercise):
++        for st in sets:
++            out.append((date, st["reps"], st["weight"]))
++    return out
++
++
++def best_weight(sets):
++    """Heaviest set: ties go to more reps, then to the earlier date.
++
++    sets must be chronological; returns (weight, reps, date).
++    """
++    best = None
++    for date, reps, weight in sets:
++        if best is None or (weight, reps) > (best[0], best[1]):
++            best = (weight, reps, date)
++    return best
++
++
++def best_e1rm(sets):
++    """Best estimated 1RM: ties go to the earlier date. Returns (e1rm, date)."""
++    best = None
++    for date, reps, weight in sets:
++        value = epley_e1rm(reps, weight)
++        if best is None or value > best[0]:
++            best = (value, date)
++    return best
++
++
++def weekly_volume(data, iso_year, iso_week):
++    """{exercise: (volume, set_count)} for sets landing in the ISO week."""
++    out = {}
++    for session in data["sessions"]:
++        date = datetime.date.fromisoformat(session["date"])
++        if date.isocalendar()[:2] != (iso_year, iso_week):
++            continue
++        volume, count = out.get(session["exercise"], (0.0, 0))
++        for st in session["sets"]:
++            volume += st["reps"] * st["weight"]
++            count += 1
++        out[session["exercise"]] = (volume, count)
++    return out
+diff --git a/storage.py b/storage.py
+new file mode 100644
+index 0000000..665b077
+--- /dev/null
++++ b/storage.py
+@@ -0,0 +1,41 @@
++"""JSON persistence for the workout log.
++
++On disk: {"sessions": [{"date": "YYYY-MM-DD", "exercise": "squat",
++"sets": [{"reps": 5, "weight": 100.0}, ...]}, ...]} with one session per
++(date, exercise) pair; exercise names are stored lowercase.
++"""
++import json
++import os
++
++
++class StorageError(Exception):
++    """The log file exists but cannot be read as a workout log."""
++
++
++def load(path):
++    """Read the log; a missing file is an empty log. Never creates the file."""
++    if not os.path.exists(path):
++        return {"sessions": []}
++    try:
++        with open(path, encoding="utf-8") as f:
++            data = json.load(f)
++    except (json.JSONDecodeError, UnicodeDecodeError) as e:
++        raise StorageError(f"{path} is not a valid workout log: {e}") from e
++    if not isinstance(data, dict) or not isinstance(data.get("sessions"), list):
++        raise StorageError(f"{path} is not a valid workout log: missing sessions")
++    return data
++
++
++def save(path, data):
++    with open(path, "w", encoding="utf-8") as f:
++        json.dump(data, f, indent=2)
++        f.write("\n")
++
++
++def add_sets(data, date, exercise, sets):
++    """Append sets to the session for (date, exercise), creating it if new."""
++    for session in data["sessions"]:
++        if session["date"] == date and session["exercise"] == exercise:
++            session["sets"].extend(sets)
++            return
++    data["sessions"].append({"date": date, "exercise": exercise, "sets": list(sets)})
+diff --git a/workout.py b/workout.py
+new file mode 100644
+index 0000000..5d983c3
+--- /dev/null
++++ b/workout.py
+@@ -0,0 +1,131 @@
++#!/usr/bin/env python3
++"""Workout log CLI: log sessions, personal records, progression suggestions,
++weekly volume reports. See storage/stats/rules for the moving parts."""
++import argparse
++import datetime
++import re
++import sys
++
++import rules
++import stats
++import storage
++
++DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
++SET_RE = re.compile(r"^(\d+)x(\d+(?:\.\d+)?)$")
++WEEK_RE = re.compile(r"^(\d{4})-W(\d{2})$")
++
++
++def fail(message):
++    print(f"error: {message}", file=sys.stderr)
++    return 2
++
++
++def parse_date(text):
++    if not DATE_RE.match(text):
++        raise ValueError(f"date must be YYYY-MM-DD, got {text!r}")
++    try:
++        datetime.date.fromisoformat(text)
++    except ValueError:
++        raise ValueError(f"{text} is not a real date")
++    return text
++
++
++def parse_set(text):
++    m = SET_RE.match(text)
++    if not m:
++        raise ValueError(f"set must look like REPSxWEIGHT (e.g. 5x102.5), got {text!r}")
++    reps, weight = int(m.group(1)), float(m.group(2))
++    if reps < 1:
++        raise ValueError(f"reps must be at least 1, got {text!r}")
++    if weight <= 0:
++        raise ValueError(f"weight must be positive, got {text!r}")
++    return {"reps": reps, "weight": weight}
++
++
++def cmd_add(data, args, log_path):
++    try:
++        date = parse_date(args.date)
++        if not args.sets:
++            raise ValueError("at least one --set is required")
++        sets = [parse_set(s) for s in args.sets]
++    except ValueError as e:
++        return fail(e)
++    storage.add_sets(data, date, args.exercise.lower(), sets)
++    storage.save(log_path, data)
++    return 0
++
++
++def cmd_pr(data, args):
++    sets = stats.all_sets(data, args.exercise.lower())
++    if not sets:
++        return 1
++    weight, reps, date = stats.best_weight(sets)
++    e1rm, e1rm_date = stats.best_e1rm(sets)
++    print(f"best weight: {stats.fmt_kg(weight)} kg x {reps} ({date})")
++    print(f"best e1rm: {stats.fmt_kg(e1rm)} kg ({e1rm_date})")
++    return 0
++
++
++def cmd_suggest(data, args):
++    exercise = args.exercise.lower()
++    suggestion = rules.suggest(stats.sessions_for(data, exercise))
++    if suggestion is None:
++        return 1
++    verb, weight = suggestion
++    print(f"{exercise}: {verb} {stats.fmt_kg(weight)} kg")
++    return 0
++
++
++def cmd_report(data, args):
++    m = WEEK_RE.match(args.week)
++    if not m:
++        return fail(f"week must be YYYY-Www (e.g. 2026-W10), got {args.week!r}")
++    year, week = int(m.group(1)), int(m.group(2))
++    try:
++        datetime.date.fromisocalendar(year, week, 1)
++    except ValueError:
++        return fail(f"{args.week} is not a real ISO week")
++    volumes = stats.weekly_volume(data, year, week)
++    if not volumes:
++        return 1
++    for exercise in sorted(volumes):
++        volume, count = volumes[exercise]
++        noun = "set" if count == 1 else "sets"
++        print(f"{exercise}: {stats.fmt_kg(volume)} kg ({count} {noun})")
++    return 0
++
++
++def main(argv=None):
++    parser = argparse.ArgumentParser(prog="workout", description=__doc__)
++    parser.add_argument("--log", required=True, help="path to the JSON log file")
++    sub = parser.add_subparsers(dest="command", required=True)
++
++    p_add = sub.add_parser("add", help="record a training session")
++    p_add.add_argument("date")
++    p_add.add_argument("exercise")
++    p_add.add_argument("--set", dest="sets", action="append", metavar="REPSxWEIGHT")
++
++    for name, help_text in [("pr", "personal records"), ("suggest", "progression suggestion")]:
++        p = sub.add_parser(name, help=help_text)
++        p.add_argument("exercise")
++
++    p_report = sub.add_parser("report", help="weekly volume report")
++    p_report.add_argument("week", metavar="YYYY-Www")
++
++    args = parser.parse_args(argv)
++    try:
++        data = storage.load(args.log)
++    except storage.StorageError as e:
++        return fail(e)
++
++    if args.command == "add":
++        return cmd_add(data, args, args.log)
++    if args.command == "pr":
++        return cmd_pr(data, args)
++    if args.command == "suggest":
++        return cmd_suggest(data, args)
++    return cmd_report(data, args)
++
++
++if __name__ == "__main__":
++    sys.exit(main())

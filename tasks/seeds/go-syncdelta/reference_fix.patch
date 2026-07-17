@@ -1,0 +1,217 @@
+diff --git a/syncdelta.go b/syncdelta.go
+new file mode 100644
+index 0000000..a7a433d
+--- /dev/null
++++ b/syncdelta.go
+@@ -0,0 +1,211 @@
++// Package syncdelta mirrors an upstream dataset through its incremental
++// delta feed. The feed is at-least-once — after a failure it redelivers
++// changes that were already applied — so the in-memory table guards every
++// change with revision checks and remembers tombstones, making replays
++// harmless skips. Progress is checkpointed through an injectable cursor
++// store, and checkpoints are written only after a page is fully applied:
++// a lost checkpoint means redelivery, never loss.
++package syncdelta
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"sort"
++)
++
++// Record is one live row of the mirrored table.
++type Record struct {
++	ID   string            `json:"id"`
++	Rev  int               `json:"rev"`
++	Data map[string]string `json:"data"`
++}
++
++// Change is one entry of a delta page.
++type Change struct {
++	Op   string            `json:"op"` // "upsert" or "delete"
++	ID   string            `json:"id"`
++	Rev  int               `json:"rev"`
++	Data map[string]string `json:"data,omitempty"`
++}
++
++// Table is the in-memory mirror the deltas apply into.
++type Table struct {
++	live       map[string]Record
++	tombstones map[string]int // id -> rev the record was deleted at
++}
++
++// NewTable returns an empty mirror.
++func NewTable() *Table {
++	return &Table{
++		live:       make(map[string]Record),
++		tombstones: make(map[string]int),
++	}
++}
++
++// Apply applies one change and reports whether it changed anything.
++// Replayed or out-of-date changes are skipped (false, nil); an op the
++// table does not understand is an error.
++func (t *Table) Apply(ch Change) (bool, error) {
++	switch ch.Op {
++	case "upsert":
++		// Strictly newer than everything we know for this id: the live
++		// record's rev and any tombstone's rev. Equal rev is a redelivery.
++		if rec, ok := t.live[ch.ID]; ok && ch.Rev <= rec.Rev {
++			return false, nil
++		}
++		if tombRev, ok := t.tombstones[ch.ID]; ok && ch.Rev <= tombRev {
++			return false, nil
++		}
++		data := make(map[string]string, len(ch.Data))
++		for k, v := range ch.Data {
++			data[k] = v
++		}
++		t.live[ch.ID] = Record{ID: ch.ID, Rev: ch.Rev, Data: data}
++		delete(t.tombstones, ch.ID)
++		return true, nil
++	case "delete":
++		if tombRev, ok := t.tombstones[ch.ID]; ok && ch.Rev <= tombRev {
++			return false, nil // already deleted at this rev or later
++		}
++		if rec, ok := t.live[ch.ID]; ok && ch.Rev < rec.Rev {
++			return false, nil // stale delete for a newer record
++		}
++		delete(t.live, ch.ID)
++		t.tombstones[ch.ID] = ch.Rev
++		return true, nil
++	default:
++		return false, fmt.Errorf("syncdelta: unknown change op %q for id %q", ch.Op, ch.ID)
++	}
++}
++
++// Get returns a live record.
++func (t *Table) Get(id string) (Record, bool) {
++	rec, ok := t.live[id]
++	return rec, ok
++}
++
++// Len is the number of live records.
++func (t *Table) Len() int { return len(t.live) }
++
++// IDs returns the sorted ids of all live records.
++func (t *Table) IDs() []string {
++	ids := make([]string, 0, len(t.live))
++	for id := range t.live {
++		ids = append(ids, id)
++	}
++	sort.Strings(ids)
++	return ids
++}
++
++// CursorStore persists the sync checkpoint between runs.
++type CursorStore interface {
++	// Load returns the saved cursor; ok=false means no checkpoint yet.
++	Load() (cursor string, ok bool, err error)
++	Save(cursor string) error
++}
++
++// Stats summarizes one Sync run.
++type Stats struct {
++	Pages   int // pages fully applied AND checkpointed
++	Upserts int // upserts that changed the table
++	Deletes int // deletes that changed the table
++	Skipped int // redelivered/out-of-date changes ignored
++}
++
++// Client pulls the delta feed.
++type Client struct {
++	hc    *http.Client
++	base  string
++	store CursorStore
++}
++
++// NewClient returns a delta-sync client. A nil hc falls back to
++// http.DefaultClient.
++func NewClient(hc *http.Client, baseURL string, store CursorStore) *Client {
++	if hc == nil {
++		hc = http.DefaultClient
++	}
++	return &Client{hc: hc, base: baseURL, store: store}
++}
++
++type page struct {
++	Changes   []Change `json:"changes"`
++	NextSince string   `json:"next_since"`
++	HasMore   bool     `json:"has_more"`
++}
++
++// Sync pulls pages from the last committed checkpoint until the feed says
++// it has no more, applying each page into table before checkpointing it.
++// On any failure it returns the stats so far along with the error; the
++// next Sync resumes from the last committed checkpoint. There is no retry
++// logic here by design — retry policy belongs to the caller's scheduler.
++func (c *Client) Sync(ctx context.Context, table *Table) (Stats, error) {
++	var stats Stats
++	cursor, haveCursor, err := c.store.Load()
++	if err != nil {
++		return stats, fmt.Errorf("syncdelta: loading checkpoint: %w", err)
++	}
++	for {
++		pg, err := c.fetch(ctx, cursor, haveCursor)
++		if err != nil {
++			return stats, err
++		}
++		for _, ch := range pg.Changes {
++			applied, err := table.Apply(ch)
++			if err != nil {
++				return stats, err
++			}
++			switch {
++			case !applied:
++				stats.Skipped++
++			case ch.Op == "upsert":
++				stats.Upserts++
++			default:
++				stats.Deletes++
++			}
++		}
++		if err := c.store.Save(pg.NextSince); err != nil {
++			return stats, fmt.Errorf("syncdelta: saving checkpoint %q: %w", pg.NextSince, err)
++		}
++		stats.Pages++
++		cursor, haveCursor = pg.NextSince, true
++		if !pg.HasMore {
++			return stats, nil
++		}
++	}
++}
++
++// fetch requests one page. The since parameter is present only when a
++// checkpoint exists: the upstream treats an empty since as a real cursor.
++func (c *Client) fetch(ctx context.Context, cursor string, haveCursor bool) (page, error) {
++	endpoint := c.base + "/changes"
++	if haveCursor {
++		endpoint += "?since=" + url.QueryEscape(cursor)
++	}
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
++	if err != nil {
++		return page{}, fmt.Errorf("syncdelta: %w", err)
++	}
++	req.Header.Set("Accept", "application/json")
++	resp, err := c.hc.Do(req)
++	if err != nil {
++		return page{}, fmt.Errorf("syncdelta: %w", err)
++	}
++	defer resp.Body.Close()
++	body, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return page{}, fmt.Errorf("syncdelta: reading page: %w", err)
++	}
++	if resp.StatusCode != http.StatusOK {
++		return page{}, fmt.Errorf("syncdelta: GET /changes returned %d", resp.StatusCode)
++	}
++	var pg page
++	if err := json.Unmarshal(body, &pg); err != nil {
++		return page{}, fmt.Errorf("syncdelta: decoding page: %w", err)
++	}
++	return pg, nil
++}

@@ -1,0 +1,219 @@
+diff --git a/webhooksub.ts b/webhooksub.ts
+new file mode 100644
+index 0000000..61d2618
+--- /dev/null
++++ b/webhooksub.ts
+@@ -0,0 +1,213 @@
++/**
++ * Webhook-subscription lifecycle manager.
++ *
++ * Handles registration, auto-renewal (at 80% of TTL), drift reconciliation,
++ * and graceful shutdown (revoke-all) for webhook subscriptions with a hub.
++ */
++import * as http from 'node:http';
++import * as https from 'node:https';
++import { URL } from 'node:url';
++
++// ---------------------------------------------------------------------------
++// Public types
++// ---------------------------------------------------------------------------
++
++export interface SubSpec {
++  callback_url: string;
++  events?: string[];
++  ttl_ms?: number;
++  [key: string]: unknown;
++}
++
++export interface SubRecord {
++  id: string;
++  ttl_ms: number;
++  [key: string]: unknown;
++}
++
++export interface WebhookManagerOptions {
++  /** Base URL for the hub API (e.g. "http://localhost:8080"). */
++  baseUrl: string;
++  /**
++   * Injectable scheduler.  Called with (delayMs, callback) instead of
++   * setTimeout so tests can advance time without real sleeps.
++   */
++  schedule: (delayMs: number, callback: () => Promise<void> | void) => void;
++}
++
++// ---------------------------------------------------------------------------
++// HTTP helper
++// ---------------------------------------------------------------------------
++
++function request(
++  method: string,
++  url: string,
++  body?: unknown,
++): Promise<{ status: number; raw: string; parsed: unknown }> {
++  return new Promise((resolve, reject) => {
++    const parsed = new URL(url);
++    const payload = body !== undefined ? Buffer.from(JSON.stringify(body), 'utf8') : undefined;
++    const options: http.RequestOptions = {
++      hostname: parsed.hostname,
++      port: parsed.port ? Number(parsed.port) : (parsed.protocol === 'https:' ? 443 : 80),
++      path: parsed.pathname + (parsed.search ?? ''),
++      method,
++      headers: {
++        'Content-Type': 'application/json',
++        ...(payload ? { 'Content-Length': String(payload.length) } : {}),
++      },
++    };
++
++    const transport = parsed.protocol === 'https:' ? https : http;
++    const req = transport.request(options, (res) => {
++      const chunks: Buffer[] = [];
++      res.on('data', (c: Buffer) => chunks.push(c));
++      res.on('end', () => {
++        const raw = Buffer.concat(chunks).toString('utf8');
++        const status = res.statusCode ?? 0;
++        let parsedBody: unknown = null;
++        try { parsedBody = JSON.parse(raw); } catch { /* ignore */ }
++        resolve({ status, raw, parsed: parsedBody });
++      });
++      res.on('error', reject);
++    });
++
++    req.on('error', reject);
++    if (payload) req.end(payload);
++    else req.end();
++  });
++}
++
++function assertOk(status: number, raw: string, expected: number | ((s: number) => boolean)): void {
++  const ok = typeof expected === 'number' ? status === expected : expected(status);
++  if (!ok) {
++    throw new Error(`WebhookManager: HTTP ${status}: ${raw.slice(0, 200)}`);
++  }
++}
++
++// ---------------------------------------------------------------------------
++// WebhookManager
++// ---------------------------------------------------------------------------
++
++export class WebhookManager {
++  private readonly baseUrl: string;
++  private readonly schedule: (delayMs: number, callback: () => Promise<void> | void) => void;
++
++  /** Local subscription state: id → {spec, record} */
++  private readonly localSubs = new Map<string, { spec: SubSpec; record: SubRecord }>();
++
++  /** Set to true after first shutdown to make shutdown idempotent. */
++  private isShutDown = false;
++
++  constructor(opts: WebhookManagerOptions) {
++    this.baseUrl = opts.baseUrl.replace(/\/$/, '');
++    this.schedule = opts.schedule;
++  }
++
++  /**
++   * Register a new subscription with the hub.
++   * Schedules auto-renewal at 80% of the returned ttl_ms.
++   * Throws on HTTP error; no partial state is stored.
++   */
++  async register(spec: SubSpec): Promise<SubRecord> {
++    const { status, raw, parsed } = await request('POST', `${this.baseUrl}/subscriptions`, spec);
++    assertOk(status, raw, (s) => s >= 200 && s < 300);
++
++    const record = parsed as SubRecord;
++    this.localSubs.set(record.id, { spec, record });
++    this.scheduleRenewal(record.id);
++    return record;
++  }
++
++  /**
++   * Reconcile local state with the hub.
++   *
++   * - Subscriptions in local state but absent from the hub → re-register.
++   * - Subscriptions present on the hub but absent from local state → deregister.
++   */
++  async reconcile(): Promise<void> {
++    const { status, raw, parsed } = await request('GET', `${this.baseUrl}/subscriptions`);
++    assertOk(status, raw, (s) => s >= 200 && s < 300);
++
++    const remoteList = ((parsed as { subscriptions?: SubRecord[] }).subscriptions ?? []);
++    const remoteIds = new Set(remoteList.map((s) => s.id));
++
++    // Snapshot local subs before the loop so mutations during re-registration
++    // (delete old id, add new id) don't cause the iterator to see newly added entries.
++    const localSnapshot = [...this.localSubs.entries()];
++
++    // Re-register locally known subs that the hub lost
++    for (const [id, { spec }] of localSnapshot) {
++      if (!remoteIds.has(id)) {
++        // Re-register: POST again, update local record and re-schedule renewal
++        const resp = await request('POST', `${this.baseUrl}/subscriptions`, spec);
++        assertOk(resp.status, resp.raw, (s) => s >= 200 && s < 300);
++        const newRecord = resp.parsed as SubRecord;
++        this.localSubs.delete(id);
++        this.localSubs.set(newRecord.id, { spec, record: newRecord });
++        this.scheduleRenewal(newRecord.id);
++      }
++    }
++
++    // Deregister remote subs we don't know about
++    for (const remoteSub of remoteList) {
++      if (!this.localSubs.has(remoteSub.id)) {
++        const resp = await request('DELETE', `${this.baseUrl}/subscriptions/${remoteSub.id}`);
++        assertOk(resp.status, resp.raw, (s) => s >= 200 && s < 300);
++      }
++    }
++  }
++
++  /**
++   * Revoke all locally-tracked subscriptions and mark this instance as shut down.
++   * Idempotent: safe to call multiple times.
++   */
++  async shutdown(): Promise<void> {
++    if (this.isShutDown) return;
++    this.isShutDown = true;
++
++    const ids = [...this.localSubs.keys()];
++    for (const id of ids) {
++      const resp = await request('DELETE', `${this.baseUrl}/subscriptions/${id}`);
++      // 404 is acceptable on shutdown (already gone); other errors propagate
++      assertOk(resp.status, resp.raw, (s) => s >= 200 && s < 300 || s === 404);
++      this.localSubs.delete(id);
++    }
++  }
++
++  // ---------------------------------------------------------------------------
++  // Private
++  // ---------------------------------------------------------------------------
++
++  private scheduleRenewal(id: string): void {
++    const entry = this.localSubs.get(id);
++    if (!entry) return;
++    const delayMs = Math.floor(entry.record.ttl_ms * 0.8);
++    this.schedule(delayMs, async () => {
++      await this.renew(id);
++    });
++  }
++
++  private async renew(id: string): Promise<void> {
++    if (this.isShutDown) return;
++    const entry = this.localSubs.get(id);
++    if (!entry) return;
++
++    const { status, raw, parsed } = await request(
++      'PATCH',
++      `${this.baseUrl}/subscriptions/${id}`,
++      { ttl_ms: entry.record.ttl_ms },
++    );
++
++    if (status === 404) {
++      // Hub lost the sub; re-register on next reconcile or try now
++      return;
++    }
++    assertOk(status, raw, (s) => s >= 200 && s < 300);
++
++    const updated = parsed as SubRecord;
++    this.localSubs.set(id, { spec: entry.spec, record: updated });
++    // Reschedule next renewal based on the fresh ttl from the server
++    this.scheduleRenewal(id);
++  }
++}

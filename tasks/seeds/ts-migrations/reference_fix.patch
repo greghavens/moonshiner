@@ -1,0 +1,302 @@
+diff --git a/cli.ts b/cli.ts
+new file mode 100644
+index 0000000..5aca73d
+--- /dev/null
++++ b/cli.ts
+@@ -0,0 +1,113 @@
++import { applyOp } from './ops.ts';
++import { plan, type Step } from './planner.ts';
++import {
++  CliError,
++  loadDb,
++  loadMigrations,
++  loadState,
++  saveDb,
++  saveState,
++  type Migration,
++} from './store.ts';
++
++const USAGE = 'usage: node cli.ts <status | up | down | to <version> | force <version>>';
++
++function main(argv: string[]): void {
++  const [command, arg] = argv;
++  const migrations = ((): Migration[] => {
++    switch (command) {
++      case 'status':
++      case 'up':
++      case 'down':
++        if (arg !== undefined) throw new CliError(2, USAGE);
++        return loadMigrations();
++      case 'to':
++      case 'force':
++        if (arg === undefined) throw new CliError(2, USAGE);
++        return loadMigrations();
++      default:
++        throw new CliError(2, USAGE);
++    }
++  })();
++
++  const versions = migrations.map((m) => m.version);
++  const state = loadState();
++
++  if (command === 'status') {
++    const pending = versions.filter((v) => v > state.version).length;
++    console.log(`version: ${state.version}${state.dirty ? ' (dirty)' : ''}`);
++    console.log(`pending: ${pending}`);
++    return;
++  }
++
++  if (command === 'force') {
++    const target = parseVersion(arg, versions);
++    saveState({ version: target, dirty: false });
++    console.log(`forced to ${target}`);
++    return;
++  }
++
++  // up / down / to mutate the database: refuse while dirty.
++  if (state.dirty) {
++    throw new CliError(3, `dirty state at version ${state.version}; repair db.json, then run force <version>`);
++  }
++
++  let target: number;
++  if (command === 'up') {
++    target = versions.length > 0 ? Math.max(state.version, ...versions) : state.version;
++  } else if (command === 'down') {
++    target = Math.max(0, ...versions.filter((v) => v < state.version));
++  } else {
++    target = parseVersion(arg, versions);
++  }
++
++  const steps = plan(state.version, target, versions);
++  if (steps.length === 0) {
++    console.log('nothing to do');
++    return;
++  }
++
++  const byVersion = new Map(migrations.map((m) => [m.version, m]));
++  for (const step of steps) {
++    runMigration(byVersion.get(step.version)!, step, versions);
++  }
++}
++
++function parseVersion(arg: string, versions: number[]): number {
++  const n = Number(arg);
++  if (!Number.isInteger(n) || (n !== 0 && !versions.includes(n))) {
++    throw new CliError(2, `unknown version ${arg}`);
++  }
++  return n;
++}
++
++/** Apply one migration op-by-op, persisting after every op (DDL-style). */
++function runMigration(migration: Migration, step: Step, versions: number[]): void {
++  const ops = step.direction === 'up' ? migration.up : migration.down;
++  let db = loadDb();
++  for (const op of ops) {
++    try {
++      db = applyOp(db, op);
++    } catch (e) {
++      saveState({ version: migration.version, dirty: true });
++      throw new CliError(1, `migration ${migration.version} ${migration.name} failed: ${(e as Error).message}`);
++    }
++    saveDb(db);
++  }
++  const landedAt =
++    step.direction === 'up'
++      ? migration.version
++      : Math.max(0, ...versions.filter((v) => v < migration.version));
++  saveState({ version: landedAt, dirty: false });
++  console.log(`${step.direction} ${migration.version} ${migration.name}`);
++}
++
++try {
++  main(process.argv.slice(2));
++} catch (e) {
++  if (e instanceof CliError) {
++    process.stderr.write(e.message + '\n');
++    process.exit(e.exitCode);
++  }
++  throw e;
++}
+diff --git a/ops.ts b/ops.ts
+new file mode 100644
+index 0000000..96d6031
+--- /dev/null
++++ b/ops.ts
+@@ -0,0 +1,69 @@
++// Data-only migration ops applied to a JSON document. Every op returns a new
++// document; the input is never mutated.
++
++export type Op =
++  | { set: { path: string; value: unknown } }
++  | { unset: { path: string } }
++  | { rename: { from: string; to: string } };
++
++export type Doc = Record<string, unknown>;
++
++function isObject(v: unknown): v is Doc {
++  return typeof v === 'object' && v !== null && !Array.isArray(v);
++}
++
++/** Walk to the parent of the last path segment, creating objects on the way. */
++function ensureParent(doc: Doc, path: string): { parent: Doc; key: string } {
++  const parts = path.split('.');
++  let node: Doc = doc;
++  for (let i = 0; i < parts.length - 1; i++) {
++    const key = parts[i];
++    if (!(key in node)) node[key] = {};
++    const next = node[key];
++    if (!isObject(next)) {
++      throw new Error(`"${parts.slice(0, i + 1).join('.')}" is not an object`);
++    }
++    node = next;
++  }
++  return { parent: node, key: parts[parts.length - 1] };
++}
++
++/** Locate an existing path without creating anything. */
++function locate(doc: Doc, path: string): { parent: Doc; key: string } | null {
++  const parts = path.split('.');
++  let node: Doc = doc;
++  for (let i = 0; i < parts.length - 1; i++) {
++    const next = node[parts[i]];
++    if (!isObject(next)) return null;
++    node = next;
++  }
++  const key = parts[parts.length - 1];
++  return Object.prototype.hasOwnProperty.call(node, key) ? { parent: node, key } : null;
++}
++
++export function applyOp(doc: Doc, op: Op): Doc {
++  const next = structuredClone(doc);
++  if ('set' in op) {
++    const { parent, key } = ensureParent(next, op.set.path);
++    parent[key] = op.set.value;
++    return next;
++  }
++  if ('unset' in op) {
++    const found = locate(next, op.unset.path);
++    if (!found) throw new Error(`no such path "${op.unset.path}"`);
++    delete found.parent[found.key];
++    return next;
++  }
++  if ('rename' in op) {
++    const { from, to } = op.rename;
++    const source = locate(next, from);
++    if (!source) throw new Error(`no such path "${from}"`);
++    if (locate(next, to)) throw new Error(`"${to}" already exists`);
++    const value = source.parent[source.key];
++    delete source.parent[source.key];
++    const { parent, key } = ensureParent(next, to);
++    parent[key] = value;
++    return next;
++  }
++  throw new Error(`unknown op ${JSON.stringify(op)}`);
++}
+diff --git a/planner.ts b/planner.ts
+new file mode 100644
+index 0000000..b09b90d
+--- /dev/null
++++ b/planner.ts
+@@ -0,0 +1,31 @@
++export type Step = { version: number; direction: 'up' | 'down' };
++
++/** The versions a state file may legally point at: 0 or any defined version. */
++export function validateVersions(versions: number[]): Set<number> {
++  const seen = new Set<number>();
++  for (const v of versions) {
++    if (!Number.isInteger(v) || v < 1) {
++      throw new RangeError(`versions must be positive integers, got ${v}`);
++    }
++    if (seen.has(v)) throw new Error(`duplicate version ${v}`);
++    seen.add(v);
++  }
++  return seen;
++}
++
++export function plan(current: number, target: number, versions: number[]): Step[] {
++  const known = validateVersions(versions);
++  for (const v of [current, target]) {
++    if (v !== 0 && !known.has(v)) throw new RangeError(`unknown version ${v}`);
++  }
++  const ordered = [...known].sort((a, b) => a - b);
++  if (target >= current) {
++    return ordered
++      .filter((v) => v > current && v <= target)
++      .map((version) => ({ version, direction: 'up' as const }));
++  }
++  return ordered
++    .filter((v) => v > target && v <= current)
++    .reverse()
++    .map((version) => ({ version, direction: 'down' as const }));
++}
+diff --git a/store.ts b/store.ts
+new file mode 100644
+index 0000000..12ce8bf
+--- /dev/null
++++ b/store.ts
+@@ -0,0 +1,65 @@
++// File layer: everything lives in the current working directory.
++
++import { existsSync, readFileSync, writeFileSync } from 'node:fs';
++import type { Doc, Op } from './ops.ts';
++import { validateVersions } from './planner.ts';
++
++export type Migration = { version: number; name: string; up: Op[]; down: Op[] };
++export type State = { version: number; dirty: boolean };
++
++export const MIGRATIONS_FILE = 'migrations.json';
++export const DB_FILE = 'db.json';
++export const STATE_FILE = 'migrate-state.json';
++
++/** Thrown for user-facing failures; `exitCode` maps straight to process.exit. */
++export class CliError extends Error {
++  exitCode: number;
++
++  constructor(exitCode: number, message: string) {
++    super(message);
++    this.exitCode = exitCode;
++  }
++}
++
++export function loadMigrations(): Migration[] {
++  if (!existsSync(MIGRATIONS_FILE)) {
++    throw new CliError(2, 'no migrations.json in current directory');
++  }
++  let raw: unknown;
++  try {
++    raw = JSON.parse(readFileSync(MIGRATIONS_FILE, 'utf8'));
++  } catch (e) {
++    throw new CliError(2, `invalid migrations: ${(e as Error).message}`);
++  }
++  if (!Array.isArray(raw)) throw new CliError(2, 'invalid migrations: expected an array');
++  const migrations = raw as Migration[];
++  for (const m of migrations) {
++    if (typeof m.name !== 'string' || !Array.isArray(m.up) || !Array.isArray(m.down)) {
++      throw new CliError(2, `invalid migrations: bad entry ${JSON.stringify(m)}`);
++    }
++  }
++  try {
++    validateVersions(migrations.map((m) => m.version));
++  } catch (e) {
++    throw new CliError(2, `invalid migrations: ${(e as Error).message}`);
++  }
++  return [...migrations].sort((a, b) => a.version - b.version);
++}
++
++export function loadState(): State {
++  if (!existsSync(STATE_FILE)) return { version: 0, dirty: false };
++  return JSON.parse(readFileSync(STATE_FILE, 'utf8')) as State;
++}
++
++export function saveState(state: State): void {
++  writeFileSync(STATE_FILE, JSON.stringify(state, null, 2) + '\n');
++}
++
++export function loadDb(): Doc {
++  if (!existsSync(DB_FILE)) return {};
++  return JSON.parse(readFileSync(DB_FILE, 'utf8')) as Doc;
++}
++
++export function saveDb(db: Doc): void {
++  writeFileSync(DB_FILE, JSON.stringify(db, null, 2) + '\n');
++}

@@ -1,0 +1,404 @@
+diff --git a/client.go b/client.go
+new file mode 100644
+index 0000000..b8a3302
+--- /dev/null
++++ b/client.go
+@@ -0,0 +1,108 @@
++// Package tferun drives the Terraform Enterprise v2 run lifecycle:
++// configuration version creation and upload, run creation, polling,
++// confirmation, and structured failure reporting.
++package tferun
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"strings"
++)
++
++const mediaType = "application/vnd.api+json"
++
++// Client speaks the Terraform Enterprise JSON:API at /api/v2.
++type Client struct {
++	BaseURL string
++	Token   string
++	HTTP    *http.Client
++
++	// Pace is called between successive polls (never before the first).
++	// nil polls immediately. A pace error aborts the wait with that error.
++	Pace func(ctx context.Context) error
++}
++
++// NewClient returns a client that sends the bearer token and JSON:API
++// media type on every /api/v2 request.
++func NewClient(baseURL, token string, hc *http.Client) *Client {
++	if hc == nil {
++		hc = http.DefaultClient
++	}
++	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), Token: token, HTTP: hc}
++}
++
++// ErrorObject is one member of a JSON:API errors array.
++type ErrorObject struct {
++	Status string `json:"status"`
++	Title  string `json:"title"`
++	Detail string `json:"detail"`
++}
++
++// APIError is any non-2xx /api/v2 response, with the decoded error
++// document. Note TFE answers 404 both for resources that do not exist
++// and for resources the token is not authorized to see.
++type APIError struct {
++	StatusCode int
++	Errors     []ErrorObject
++}
++
++func (e *APIError) Error() string {
++	if len(e.Errors) > 0 {
++		return fmt.Sprintf("tfe: HTTP %d: %s: %s", e.StatusCode, e.Errors[0].Title, e.Errors[0].Detail)
++	}
++	return fmt.Sprintf("tfe: HTTP %d", e.StatusCode)
++}
++
++func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
++	var rd io.Reader
++	if body != nil {
++		buf, err := json.Marshal(body)
++		if err != nil {
++			return err
++		}
++		rd = bytes.NewReader(buf)
++	}
++	req, err := http.NewRequestWithContext(ctx, method, c.BaseURL+path, rd)
++	if err != nil {
++		return err
++	}
++	req.Header.Set("Authorization", "Bearer "+c.Token)
++	if body != nil {
++		req.Header.Set("Content-Type", mediaType)
++	}
++	resp, err := c.HTTP.Do(req)
++	if err != nil {
++		return err
++	}
++	defer resp.Body.Close()
++	raw, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return err
++	}
++	if resp.StatusCode < 200 || resp.StatusCode > 299 {
++		ae := &APIError{StatusCode: resp.StatusCode}
++		var doc struct {
++			Errors []ErrorObject `json:"errors"`
++		}
++		if json.Unmarshal(raw, &doc) == nil {
++			ae.Errors = doc.Errors
++		}
++		return ae
++	}
++	if out != nil {
++		return json.Unmarshal(raw, out)
++	}
++	return nil
++}
++
++// pace waits between polls, honoring cancellation.
++func (c *Client) pace(ctx context.Context) error {
++	if c.Pace == nil {
++		return ctx.Err()
++	}
++	return c.Pace(ctx)
++}
+diff --git a/configversion.go b/configversion.go
+new file mode 100644
+index 0000000..3a672e7
+--- /dev/null
++++ b/configversion.go
+@@ -0,0 +1,97 @@
++package tferun
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"net/http"
++)
++
++// ConfigVersion is a workspace configuration version.
++type ConfigVersion struct {
++	ID        string
++	Status    string
++	UploadURL string
++}
++
++type cvDoc struct {
++	Data struct {
++		ID         string `json:"id"`
++		Attributes struct {
++			Status    string `json:"status"`
++			UploadURL string `json:"upload-url"`
++		} `json:"attributes"`
++	} `json:"data"`
++}
++
++func (d cvDoc) configVersion() *ConfigVersion {
++	return &ConfigVersion{ID: d.Data.ID, Status: d.Data.Attributes.Status, UploadURL: d.Data.Attributes.UploadURL}
++}
++
++// CreateConfigVersion creates a configuration version that never
++// auto-queues a run: auto-queue-runs defaults to true server-side, so it
++// is pinned to false explicitly.
++func (c *Client) CreateConfigVersion(ctx context.Context, workspaceID string) (*ConfigVersion, error) {
++	body := map[string]any{"data": map[string]any{
++		"type":       "configuration-versions",
++		"attributes": map[string]any{"auto-queue-runs": false},
++	}}
++	var doc cvDoc
++	if err := c.do(ctx, http.MethodPost, "/api/v2/workspaces/"+workspaceID+"/configuration-versions", body, &doc); err != nil {
++		return nil, err
++	}
++	return doc.configVersion(), nil
++}
++
++// GetConfigVersion shows one configuration version.
++func (c *Client) GetConfigVersion(ctx context.Context, cvID string) (*ConfigVersion, error) {
++	var doc cvDoc
++	if err := c.do(ctx, http.MethodGet, "/api/v2/configuration-versions/"+cvID, nil, &doc); err != nil {
++		return nil, err
++	}
++	return doc.configVersion(), nil
++}
++
++// UploadConfig PUTs the raw archive bytes to the pre-signed upload URL.
++// The URL may live on a different host than the API; credentials are
++// never attached.
++func (c *Client) UploadConfig(ctx context.Context, uploadURL string, archive []byte) error {
++	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, bytes.NewReader(archive))
++	if err != nil {
++		return err
++	}
++	req.Header.Set("Content-Type", "application/octet-stream")
++	resp, err := c.HTTP.Do(req)
++	if err != nil {
++		return err
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode < 200 || resp.StatusCode > 299 {
++		return fmt.Errorf("tfe: archive upload failed with HTTP %d", resp.StatusCode)
++	}
++	return nil
++}
++
++// WaitForUpload polls the show endpoint until the configuration version
++// is uploaded (usable by runs) or errored (terminal).
++func (c *Client) WaitForUpload(ctx context.Context, cvID string) (*ConfigVersion, error) {
++	first := true
++	for {
++		if !first {
++			if err := c.pace(ctx); err != nil {
++				return nil, err
++			}
++		}
++		first = false
++		cv, err := c.GetConfigVersion(ctx, cvID)
++		if err != nil {
++			return nil, err
++		}
++		switch cv.Status {
++		case "uploaded":
++			return cv, nil
++		case "errored":
++			return nil, fmt.Errorf("tfe: configuration version %s reached status errored", cvID)
++		}
++	}
++}
+diff --git a/launch.go b/launch.go
+new file mode 100644
+index 0000000..d3a3a38
+--- /dev/null
++++ b/launch.go
+@@ -0,0 +1,110 @@
++package tferun
++
++import (
++	"context"
++	"fmt"
++)
++
++// LaunchOptions controls one run launch.
++type LaunchOptions struct {
++	Message   string
++	AutoApply bool
++}
++
++// LaunchResult is the successful outcome of a launch.
++type LaunchResult struct {
++	RunID             string
++	ConfigVersionID   string
++	Status            string
++	Applied           bool
++	NeedsConfirmation bool
++}
++
++// RunFailure is a run that reached a terminal failure status.
++type RunFailure struct {
++	RunID  string
++	Status string
++	Stage  string // "plan", "apply", or "policy"
++}
++
++func (f *RunFailure) Error() string {
++	return fmt.Sprintf("tfe: run %s failed at %s stage with status %s", f.RunID, f.Stage, f.Status)
++}
++
++var failureStatuses = map[string]bool{
++	"errored":            true,
++	"discarded":          true,
++	"canceled":           true,
++	"force_canceled":     true,
++	"policy_soft_failed": true,
++	"policy_override":    true,
++}
++
++func failureStage(status string, confirmed bool) string {
++	if status == "policy_soft_failed" || status == "policy_override" {
++		return "policy"
++	}
++	if confirmed {
++		return "apply"
++	}
++	return "plan"
++}
++
++// Launch drives the full lifecycle: create a configuration version,
++// upload the archive, wait for it, create a run, and poll it to an
++// outcome. The launcher never overrides a policy stop.
++func Launch(ctx context.Context, c *Client, workspaceID string, archive []byte, opts LaunchOptions) (*LaunchResult, error) {
++	cv, err := c.CreateConfigVersion(ctx, workspaceID)
++	if err != nil {
++		return nil, err
++	}
++	if err := c.UploadConfig(ctx, cv.UploadURL, archive); err != nil {
++		return nil, err
++	}
++	if _, err := c.WaitForUpload(ctx, cv.ID); err != nil {
++		return nil, err
++	}
++	run, err := c.CreateRun(ctx, workspaceID, cv.ID, opts.Message)
++	if err != nil {
++		return nil, err
++	}
++
++	confirmed := false
++	first := true
++	for {
++		if !first {
++			if err := c.pace(ctx); err != nil {
++				return nil, err
++			}
++		}
++		first = false
++		cur, err := c.GetRun(ctx, run.ID)
++		if err != nil {
++			return nil, err
++		}
++		switch {
++		case cur.Status == "applied" || cur.Status == "planned_and_finished":
++			return &LaunchResult{
++				RunID:           run.ID,
++				ConfigVersionID: cv.ID,
++				Status:          cur.Status,
++				Applied:         cur.Status == "applied",
++			}, nil
++		case failureStatuses[cur.Status]:
++			return nil, &RunFailure{RunID: run.ID, Status: cur.Status, Stage: failureStage(cur.Status, confirmed)}
++		case cur.IsConfirmable && !confirmed:
++			if !opts.AutoApply {
++				return &LaunchResult{
++					RunID:             run.ID,
++					ConfigVersionID:   cv.ID,
++					Status:            cur.Status,
++					NeedsConfirmation: true,
++				}, nil
++			}
++			if err := c.ApplyRun(ctx, run.ID, opts.Message); err != nil {
++				return nil, err
++			}
++			confirmed = true
++		}
++	}
++}
+diff --git a/run.go b/run.go
+new file mode 100644
+index 0000000..b332701
+--- /dev/null
++++ b/run.go
+@@ -0,0 +1,65 @@
++package tferun
++
++import (
++	"context"
++	"net/http"
++)
++
++// Run is a Terraform Enterprise run.
++type Run struct {
++	ID            string
++	Status        string
++	IsConfirmable bool
++}
++
++type runDoc struct {
++	Data struct {
++		ID         string `json:"id"`
++		Attributes struct {
++			Status  string `json:"status"`
++			Actions struct {
++				IsConfirmable bool `json:"is-confirmable"`
++			} `json:"actions"`
++		} `json:"attributes"`
++	} `json:"data"`
++}
++
++func (d runDoc) run() *Run {
++	return &Run{ID: d.Data.ID, Status: d.Data.Attributes.Status, IsConfirmable: d.Data.Attributes.Actions.IsConfirmable}
++}
++
++// CreateRun creates a run against an uploaded configuration version,
++// with the documented workspace and configuration-version relationships.
++func (c *Client) CreateRun(ctx context.Context, workspaceID, cvID, message string) (*Run, error) {
++	body := map[string]any{"data": map[string]any{
++		"type":       "runs",
++		"attributes": map[string]any{"message": message},
++		"relationships": map[string]any{
++			"workspace": map[string]any{
++				"data": map[string]any{"type": "workspaces", "id": workspaceID},
++			},
++			"configuration-version": map[string]any{
++				"data": map[string]any{"type": "configuration-versions", "id": cvID},
++			},
++		},
++	}}
++	var doc runDoc
++	if err := c.do(ctx, http.MethodPost, "/api/v2/runs", body, &doc); err != nil {
++		return nil, err
++	}
++	return doc.run(), nil
++}
++
++// GetRun shows one run.
++func (c *Client) GetRun(ctx context.Context, runID string) (*Run, error) {
++	var doc runDoc
++	if err := c.do(ctx, http.MethodGet, "/api/v2/runs/"+runID, nil, &doc); err != nil {
++		return nil, err
++	}
++	return doc.run(), nil
++}
++
++// ApplyRun confirms a confirmable run with a comment (HTTP 202 on success).
++func (c *Client) ApplyRun(ctx context.Context, runID, comment string) error {
++	return c.do(ctx, http.MethodPost, "/api/v2/runs/"+runID+"/actions/apply", map[string]string{"comment": comment}, nil)
++}

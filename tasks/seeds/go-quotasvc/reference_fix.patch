@@ -1,0 +1,314 @@
+diff --git a/period.go b/period.go
+new file mode 100644
+index 0000000..546750a
+--- /dev/null
++++ b/period.go
+@@ -0,0 +1,20 @@
++package quota
++
++import "time"
++
++// periodKey identifies the UTC calendar month a moment belongs to. Usage
++// counters live and die with their period key.
++func periodKey(t time.Time) string {
++	return t.UTC().Format("2006-01")
++}
++
++// syncPeriod lazily rolls the account into the current period: if the clock
++// has entered a new UTC month since the account was last touched, its
++// counters reset. Caller holds the service lock.
++func (s *Service) syncPeriod(a *account) {
++	key := periodKey(s.now())
++	if a.period != key {
++		a.period = key
++		a.usage = make(map[string]int64)
++	}
++}
+diff --git a/plan.go b/plan.go
+new file mode 100644
+index 0000000..370abbf
+--- /dev/null
++++ b/plan.go
+@@ -0,0 +1,81 @@
++// Package quota is an embeddable entitlement service: plans define
++// per-metric monthly limits, accounts meter usage against them, and overage
++// policies decide whether a request past the limit is blocked or allowed
++// with a flag for billing.
++package quota
++
++import (
++	"errors"
++	"fmt"
++)
++
++// OveragePolicy selects what happens when a request would exceed a limit.
++type OveragePolicy int
++
++const (
++	// OverageBlock refuses the whole request; the meter is untouched.
++	OverageBlock OveragePolicy = iota
++	// OverageAllowFlagged lets the request through, keeps counting past the
++	// limit, and flags the decision so overage can be invoiced.
++	OverageAllowFlagged
++)
++
++// Plan is a named set of per-metric limits and overage policies. Metrics
++// absent from Limits are unlimited; metrics absent from Overage block.
++type Plan struct {
++	Name    string
++	Limits  map[string]int64
++	Overage map[string]OveragePolicy
++}
++
++// DefinePlan registers a plan. Plans are immutable once defined.
++func (s *Service) DefinePlan(p Plan) error {
++	if p.Name == "" {
++		return errors.New("quota: plan name must not be empty")
++	}
++	for metric, limit := range p.Limits {
++		if limit < 0 {
++			return fmt.Errorf("quota: plan %q: metric %q has negative limit %d", p.Name, metric, limit)
++		}
++	}
++	for metric, pol := range p.Overage {
++		if pol != OverageBlock && pol != OverageAllowFlagged {
++			return fmt.Errorf("quota: plan %q: metric %q has unknown overage policy %d", p.Name, metric, pol)
++		}
++	}
++
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if _, exists := s.plans[p.Name]; exists {
++		return fmt.Errorf("quota: plan %q is already defined", p.Name)
++	}
++	s.plans[p.Name] = clonePlan(p)
++	return nil
++}
++
++// clonePlan deep-copies p so later caller mutations can't change the
++// registered definition.
++func clonePlan(p Plan) Plan {
++	out := Plan{Name: p.Name}
++	if p.Limits != nil {
++		out.Limits = make(map[string]int64, len(p.Limits))
++		for k, v := range p.Limits {
++			out.Limits[k] = v
++		}
++	}
++	if p.Overage != nil {
++		out.Overage = make(map[string]OveragePolicy, len(p.Overage))
++		for k, v := range p.Overage {
++			out.Overage[k] = v
++		}
++	}
++	return out
++}
++
++// policyFor returns the plan's overage policy for metric (default: block).
++func (p Plan) policyFor(metric string) OveragePolicy {
++	if pol, ok := p.Overage[metric]; ok {
++		return pol
++	}
++	return OverageBlock
++}
+diff --git a/report.go b/report.go
+new file mode 100644
+index 0000000..f46fbbe
+--- /dev/null
++++ b/report.go
+@@ -0,0 +1,55 @@
++package quota
++
++import (
++	"fmt"
++	"sort"
++)
++
++// MetricReport is one row of an account's usage report.
++type MetricReport struct {
++	Metric    string
++	Used      int64
++	Limit     int64 // -1 for unlimited metrics
++	Remaining int64 // -1 for unlimited metrics; never negative otherwise
++	OverLimit bool
++}
++
++// Report summarizes the account's current period: one row per metric in the
++// plan's limits (even if untouched) plus any unlimited metrics that have
++// usage, sorted by metric name.
++func (s *Service) Report(accountID string) ([]MetricReport, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	a, ok := s.accounts[accountID]
++	if !ok {
++		return nil, fmt.Errorf("quota: unknown account %q", accountID)
++	}
++	s.syncPeriod(a)
++	plan := s.plans[a.plan]
++
++	metrics := make(map[string]struct{}, len(plan.Limits)+len(a.usage))
++	for m := range plan.Limits {
++		metrics[m] = struct{}{}
++	}
++	for m := range a.usage {
++		metrics[m] = struct{}{}
++	}
++	names := make([]string, 0, len(metrics))
++	for m := range metrics {
++		names = append(names, m)
++	}
++	sort.Strings(names)
++
++	out := make([]MetricReport, 0, len(names))
++	for _, m := range names {
++		used := a.usage[m]
++		row := MetricReport{Metric: m, Used: used, Limit: -1, Remaining: -1}
++		if limit, limited := plan.Limits[m]; limited {
++			row.Limit = limit
++			row.Remaining = clampRemaining(limit - used)
++			row.OverLimit = used > limit
++		}
++		out = append(out, row)
++	}
++	return out, nil
++}
+diff --git a/service.go b/service.go
+new file mode 100644
+index 0000000..9281012
+--- /dev/null
++++ b/service.go
+@@ -0,0 +1,134 @@
++package quota
++
++import (
++	"errors"
++	"fmt"
++	"sync"
++	"time"
++)
++
++// Decision is the outcome of one Record call.
++type Decision struct {
++	Allowed   bool
++	OverLimit bool
++	// Remaining is what is left of the limit after this call; never
++	// negative, and -1 for unlimited metrics.
++	Remaining int64
++}
++
++// account tracks one customer's plan and current-period usage.
++type account struct {
++	plan   string
++	period string
++	usage  map[string]int64
++}
++
++// Service meters account usage against plan limits. Safe for concurrent
++// use; the check-and-increment in Record is atomic under the service lock,
++// so block limits are exact.
++type Service struct {
++	mu       sync.Mutex
++	now      func() time.Time
++	plans    map[string]Plan
++	accounts map[string]*account
++}
++
++// NewService builds a service using now as its clock (nil means time.Now).
++// All period decisions go through that clock.
++func NewService(now func() time.Time) *Service {
++	if now == nil {
++		now = time.Now
++	}
++	return &Service{
++		now:      now,
++		plans:    make(map[string]Plan),
++		accounts: make(map[string]*account),
++	}
++}
++
++// SetAccount assigns (or changes) the account's plan. Changing plans
++// mid-period keeps the period's usage; only the limits change.
++func (s *Service) SetAccount(accountID, planName string) error {
++	if accountID == "" {
++		return errors.New("quota: account id must not be empty")
++	}
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if _, ok := s.plans[planName]; !ok {
++		return fmt.Errorf("quota: unknown plan %q", planName)
++	}
++	if a, ok := s.accounts[accountID]; ok {
++		a.plan = planName
++		return nil
++	}
++	s.accounts[accountID] = &account{
++		plan:   planName,
++		period: periodKey(s.now()),
++		usage:  make(map[string]int64),
++	}
++	return nil
++}
++
++// Record meters n units of metric for the account and decides whether the
++// request may proceed under the account's plan.
++func (s *Service) Record(accountID, metric string, n int64) (Decision, error) {
++	if metric == "" {
++		return Decision{}, errors.New("quota: metric must not be empty")
++	}
++	if n < 1 {
++		return Decision{}, fmt.Errorf("quota: recorded amount must be >= 1, got %d", n)
++	}
++
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	a, ok := s.accounts[accountID]
++	if !ok {
++		return Decision{}, fmt.Errorf("quota: unknown account %q", accountID)
++	}
++	s.syncPeriod(a)
++
++	plan := s.plans[a.plan]
++	limit, limited := plan.Limits[metric]
++	if !limited {
++		a.usage[metric] += n
++		return Decision{Allowed: true, Remaining: -1}, nil
++	}
++
++	used := a.usage[metric]
++	if used+n <= limit {
++		a.usage[metric] = used + n
++		return Decision{Allowed: true, Remaining: limit - used - n}, nil
++	}
++
++	switch plan.policyFor(metric) {
++	case OverageAllowFlagged:
++		a.usage[metric] = used + n
++		return Decision{Allowed: true, OverLimit: true, Remaining: clampRemaining(limit - used - n)}, nil
++	default: // OverageBlock: refuse the whole request, meter untouched
++		return Decision{Allowed: false, OverLimit: true, Remaining: clampRemaining(limit - used)}, nil
++	}
++}
++
++// Usage returns a copy of the account's current-period counters.
++func (s *Service) Usage(accountID string) (map[string]int64, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	a, ok := s.accounts[accountID]
++	if !ok {
++		return nil, fmt.Errorf("quota: unknown account %q", accountID)
++	}
++	s.syncPeriod(a)
++	out := make(map[string]int64, len(a.usage))
++	for k, v := range a.usage {
++		out[k] = v
++	}
++	return out, nil
++}
++
++// clampRemaining floors a remaining count at zero.
++func clampRemaining(v int64) int64 {
++	if v < 0 {
++		return 0
++	}
++	return v
++}

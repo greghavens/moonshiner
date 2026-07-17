@@ -1,0 +1,215 @@
+diff --git a/blockid.ts b/blockid.ts
+new file mode 100644
+index 0000000..6a3e187
+--- /dev/null
++++ b/blockid.ts
+@@ -0,0 +1,7 @@
++// Stable block-id scheme. Resume only works when every run generates the
++// identical ids, and the service requires every id of a blob to be valid
++// base64 of the same pre-encoded length (max 64 bytes before encoding).
++export function makeBlockId(index: number): string {
++  const raw = `block-${String(index).padStart(8, "0")}`;
++  return Buffer.from(raw, "utf8").toString("base64");
++}
+diff --git a/storagexml.ts b/storagexml.ts
+new file mode 100644
+index 0000000..db164e3
+--- /dev/null
++++ b/storagexml.ts
+@@ -0,0 +1,26 @@
++// Minimal XML helpers for the three payloads this integration touches.
++
++export function blockListXml(ids: string[]): string {
++  const entries = ids.map((id) => `<Latest>${id}</Latest>`).join("");
++  return `<?xml version="1.0" encoding="utf-8"?><BlockList>${entries}</BlockList>`;
++}
++
++export function parseErrorCode(xml: string): string {
++  const match = /<Code>([^<]+)<\/Code>/.exec(xml);
++  return match === null ? "" : match[1];
++}
++
++export interface ListedBlock {
++  name: string;
++  size: number;
++}
++
++export function parseUncommittedBlocks(xml: string): ListedBlock[] {
++  const section = /<UncommittedBlocks>([\s\S]*?)<\/UncommittedBlocks>/.exec(xml);
++  if (section === null) return [];
++  const blocks: ListedBlock[] = [];
++  for (const match of section[1].matchAll(/<Block><Name>([^<]+)<\/Name><Size>(\d+)<\/Size><\/Block>/g)) {
++    blocks.push({ name: match[1], size: Number(match[2]) });
++  }
++  return blocks;
++}
+diff --git a/uploader.ts b/uploader.ts
+new file mode 100644
+index 0000000..b4a46e6
+--- /dev/null
++++ b/uploader.ts
+@@ -0,0 +1,164 @@
++// Block-blob uploader against the Blob Storage REST API (x-ms-version
++// 2026-04-06): stage blocks with Put Block, commit with Put Block List,
++// resume from the service's uncommitted list, guard overwrites with ETags.
++import { makeBlockId } from "./blockid.ts";
++import { blockListXml, parseErrorCode, parseUncommittedBlocks } from "./storagexml.ts";
++
++export { makeBlockId };
++
++export const SERVICE_VERSION = "2026-04-06";
++
++export class BlobHttpError extends Error {
++  readonly status: number;
++  readonly code: string;
++
++  constructor(status: number, code: string, message: string) {
++    super(`blob request failed with ${status} ${code}: ${message}`);
++    this.status = status;
++    this.code = code;
++  }
++}
++
++export class PreconditionFailedError extends BlobHttpError {}
++
++export interface UploadOptions {
++  blockSize: number;
++  contentType?: string;
++  ifMatch?: string;
++  ifNoneMatchStar?: boolean;
++  resume?: boolean;
++}
++
++export interface UploadResult {
++  etag: string;
++  blockIds: string[];
++  blocksStaged: number;
++  blocksReused: number;
++}
++
++export interface BlockBlobClientConfig {
++  endpoint: string;
++  container: string;
++  blob: string;
++  token: string;
++  fetchFn?: typeof fetch;
++}
++
++export class BlockBlobClient {
++  private readonly blobUrl: string;
++  private readonly token: string;
++  private readonly fetchFn: typeof fetch;
++
++  constructor(config: BlockBlobClientConfig) {
++    const endpoint = config.endpoint.replace(/\/+$/, "");
++    this.blobUrl = `${endpoint}/${config.container}/${config.blob}`;
++    this.token = config.token;
++    this.fetchFn = config.fetchFn ?? fetch;
++  }
++
++  async upload(data: Uint8Array, options: UploadOptions): Promise<UploadResult> {
++    const chunks = splitChunks(data, options.blockSize);
++    const ids = chunks.map((_, index) => makeBlockId(index));
++
++    const reusable = options.resume === true
++      ? await this.stagedBlockSizes()
++      : new Map<string, number>();
++
++    let staged = 0;
++    let reused = 0;
++    for (let i = 0; i < chunks.length; i++) {
++      // Reuse a staged block only when both id and size line up; a partial
++      // upload from a dead run must be re-staged, not committed.
++      if (reusable.get(ids[i]) === chunks[i].length) {
++        reused++;
++        continue;
++      }
++      await this.putBlock(ids[i], chunks[i]);
++      staged++;
++    }
++
++    const etag = await this.putBlockList(ids, options);
++    return { etag, blockIds: ids, blocksStaged: staged, blocksReused: reused };
++  }
++
++  private async stagedBlockSizes(): Promise<Map<string, number>> {
++    const response = await this.send("GET", "?comp=blocklist&blocklisttype=uncommitted");
++    const xml = await response.text();
++    if (!response.ok) {
++      throw errorFrom(response.status, xml);
++    }
++    return new Map(parseUncommittedBlocks(xml).map((block) => [block.name, block.size]));
++  }
++
++  private async putBlock(id: string, chunk: Uint8Array): Promise<void> {
++    const response = await this.send(
++      "PUT",
++      `?comp=block&blockid=${encodeURIComponent(id)}`,
++      {},
++      chunk,
++    );
++    if (!response.ok) {
++      throw errorFrom(response.status, await response.text());
++    }
++    await response.arrayBuffer();
++  }
++
++  private async putBlockList(ids: string[], options: UploadOptions): Promise<string> {
++    // Latest resolves each id from the uncommitted list first, then the
++    // committed list -- fresh stages win over stale committed content.
++    const headers: Record<string, string> = {};
++    if (options.contentType !== undefined) {
++      headers["x-ms-blob-content-type"] = options.contentType;
++    }
++    if (options.ifMatch !== undefined) {
++      headers["If-Match"] = options.ifMatch;
++    }
++    if (options.ifNoneMatchStar === true) {
++      headers["If-None-Match"] = "*";
++    }
++    const body = new TextEncoder().encode(blockListXml(ids));
++    const response = await this.send("PUT", "?comp=blocklist", headers, body);
++    if (!response.ok) {
++      throw errorFrom(response.status, await response.text());
++    }
++    await response.arrayBuffer();
++    return response.headers.get("ETag") ?? "";
++  }
++
++  private send(
++    method: string,
++    queryString: string,
++    extraHeaders: Record<string, string> = {},
++    body?: Uint8Array,
++  ): Promise<Response> {
++    return this.fetchFn(this.blobUrl + queryString, {
++      method,
++      headers: {
++        Authorization: `Bearer ${this.token}`,
++        "x-ms-version": SERVICE_VERSION,
++        "x-ms-date": new Date().toUTCString(),
++        ...extraHeaders,
++      },
++      body,
++    });
++  }
++}
++
++function splitChunks(data: Uint8Array, blockSize: number): Uint8Array[] {
++  if (!Number.isInteger(blockSize) || blockSize <= 0) {
++    throw new RangeError(`blockSize must be a positive integer, got ${blockSize}`);
++  }
++  const chunks: Uint8Array[] = [];
++  for (let offset = 0; offset < data.length; offset += blockSize) {
++    chunks.push(data.subarray(offset, Math.min(offset + blockSize, data.length)));
++  }
++  return chunks;
++}
++
++function errorFrom(status: number, xml: string): BlobHttpError {
++  const code = parseErrorCode(xml);
++  if (status === 412) {
++    return new PreconditionFailedError(status, code, "write condition not met");
++  }
++  return new BlobHttpError(status, code, "storage operation failed");
++}

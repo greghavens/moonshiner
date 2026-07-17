@@ -1,0 +1,204 @@
+diff --git a/checkpoint.go b/checkpoint.go
+index e8e1afd..22193f7 100644
+--- a/checkpoint.go
++++ b/checkpoint.go
+@@ -5,6 +5,10 @@
+ // Checkpoints are single files named <job>-<unix seconds>.ckpt, the
+ // timestamp zero-padded to ten digits so lexical order is chronological.
+ // Ops tooling greps and sorts these names, so the format is contractual.
++//
++// The package reaches the world through two injected seams: a Clock for
++// time and a Store for bytes. Production wires New(NewOSStore(dir),
++// SystemClock{}); tests script both.
+ package checkpoint
+ 
+ import (
+@@ -21,6 +25,31 @@ import (
+ // ErrNoCheckpoint is returned (wrapped) when a job has no checkpoint yet.
+ var ErrNoCheckpoint = errors.New("no checkpoint")
+ 
++// Clock supplies the current time.
++type Clock interface {
++	Now() time.Time
++}
++
++// Store holds checkpoint files by bare name; where they live is the
++// store's business.
++type Store interface {
++	Write(name string, data []byte) error
++	Read(name string) ([]byte, error)
++	List() ([]string, error)
++	Remove(name string) error
++}
++
++// Keeper saves, finds and sweeps checkpoints through its Store and Clock.
++type Keeper struct {
++	store Store
++	clock Clock
++}
++
++// New builds a Keeper from its two dependencies.
++func New(store Store, clock Clock) *Keeper {
++	return &Keeper{store: store, clock: clock}
++}
++
+ // parseName splits "<job>-<ts>.ckpt" from the last hyphen; job names may
+ // themselves contain hyphens. ok is false for anything that is not a
+ // well-formed checkpoint name (stray files are common in the spool dir).
+@@ -41,12 +70,9 @@ func parseName(name string) (job string, ts int64, ok bool) {
+ }
+ 
+ // Save writes a checkpoint for job and returns the file name it chose.
+-func Save(dir, job string, payload []byte) (string, error) {
+-	if err := os.MkdirAll(dir, 0o755); err != nil {
+-		return "", err
+-	}
+-	name := fmt.Sprintf("%s-%010d.ckpt", job, time.Now().Unix())
+-	if err := os.WriteFile(filepath.Join(dir, name), payload, 0o644); err != nil {
++func (k *Keeper) Save(job string, payload []byte) (string, error) {
++	name := fmt.Sprintf("%s-%010d.ckpt", job, k.clock.Now().Unix())
++	if err := k.store.Write(name, payload); err != nil {
+ 		return "", err
+ 	}
+ 	return name, nil
+@@ -54,28 +80,25 @@ func Save(dir, job string, payload []byte) (string, error) {
+ 
+ // Latest returns the newest checkpoint payload for job and the time it
+ // was taken. Ties on the timestamp go to the lexically greatest name.
+-func Latest(dir, job string) ([]byte, time.Time, error) {
+-	entries, err := os.ReadDir(dir)
++func (k *Keeper) Latest(job string) ([]byte, time.Time, error) {
++	names, err := k.store.List()
+ 	if err != nil {
+ 		return nil, time.Time{}, err
+ 	}
+ 	bestName, bestTS := "", int64(-1)
+-	for _, e := range entries {
+-		if e.IsDir() {
+-			continue
+-		}
+-		j, ts, ok := parseName(e.Name())
++	for _, name := range names {
++		j, ts, ok := parseName(name)
+ 		if !ok || j != job {
+ 			continue
+ 		}
+-		if ts > bestTS || (ts == bestTS && e.Name() > bestName) {
+-			bestName, bestTS = e.Name(), ts
++		if ts > bestTS || (ts == bestTS && name > bestName) {
++			bestName, bestTS = name, ts
+ 		}
+ 	}
+ 	if bestName == "" {
+ 		return nil, time.Time{}, fmt.Errorf("%w for job %q", ErrNoCheckpoint, job)
+ 	}
+-	data, err := os.ReadFile(filepath.Join(dir, bestName))
++	data, err := k.store.Read(bestName)
+ 	if err != nil {
+ 		return nil, time.Time{}, err
+ 	}
+@@ -85,15 +108,15 @@ func Latest(dir, job string) ([]byte, time.Time, error) {
+ // Resume returns the latest payload for job if it is no older than
+ // maxAge. A missing or stale checkpoint is (nil, false, nil): the job
+ // simply starts from scratch, it is not an error.
+-func Resume(dir, job string, maxAge time.Duration) ([]byte, bool, error) {
+-	data, at, err := Latest(dir, job)
++func (k *Keeper) Resume(job string, maxAge time.Duration) ([]byte, bool, error) {
++	data, at, err := k.Latest(job)
+ 	if errors.Is(err, ErrNoCheckpoint) {
+ 		return nil, false, nil
+ 	}
+ 	if err != nil {
+ 		return nil, false, err
+ 	}
+-	if time.Now().Sub(at) > maxAge {
++	if k.clock.Now().Sub(at) > maxAge {
+ 		return nil, false, nil
+ 	}
+ 	return data, true, nil
+@@ -102,28 +125,75 @@ func Resume(dir, job string, maxAge time.Duration) ([]byte, bool, error) {
+ // SweepStale deletes every checkpoint (any job) strictly older than
+ // maxAge and returns the removed names sorted ascending. Files that are
+ // not checkpoint-shaped are left alone.
+-func SweepStale(dir string, maxAge time.Duration) ([]string, error) {
+-	now := time.Now()
+-	entries, err := os.ReadDir(dir)
++func (k *Keeper) SweepStale(maxAge time.Duration) ([]string, error) {
++	now := k.clock.Now()
++	names, err := k.store.List()
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	var removed []string
+-	for _, e := range entries {
+-		if e.IsDir() {
+-			continue
+-		}
+-		_, ts, ok := parseName(e.Name())
++	for _, name := range names {
++		_, ts, ok := parseName(name)
+ 		if !ok {
+ 			continue
+ 		}
+ 		if now.Sub(time.Unix(ts, 0)) > maxAge {
+-			if err := os.Remove(filepath.Join(dir, e.Name())); err != nil {
++			if err := k.store.Remove(name); err != nil {
+ 				return removed, err
+ 			}
+-			removed = append(removed, e.Name())
++			removed = append(removed, name)
+ 		}
+ 	}
+ 	sort.Strings(removed)
+ 	return removed, nil
+ }
++
++// SystemClock is the production Clock: the wall clock.
++type SystemClock struct{}
++
++// Now implements Clock.
++func (SystemClock) Now() time.Time { return time.Now() }
++
++// OSStore is the production Store: one directory of checkpoint files.
++type OSStore struct {
++	dir string
++}
++
++// NewOSStore creates dir if needed and returns a Store over it.
++func NewOSStore(dir string) (*OSStore, error) {
++	if err := os.MkdirAll(dir, 0o755); err != nil {
++		return nil, err
++	}
++	return &OSStore{dir: dir}, nil
++}
++
++// Write implements Store.
++func (s *OSStore) Write(name string, data []byte) error {
++	return os.WriteFile(filepath.Join(s.dir, name), data, 0o644)
++}
++
++// Read implements Store.
++func (s *OSStore) Read(name string) ([]byte, error) {
++	return os.ReadFile(filepath.Join(s.dir, name))
++}
++
++// List implements Store: file names only, subdirectories skipped.
++func (s *OSStore) List() ([]string, error) {
++	entries, err := os.ReadDir(s.dir)
++	if err != nil {
++		return nil, err
++	}
++	var names []string
++	for _, e := range entries {
++		if e.IsDir() {
++			continue
++		}
++		names = append(names, e.Name())
++	}
++	return names, nil
++}
++
++// Remove implements Store.
++func (s *OSStore) Remove(name string) error {
++	return os.Remove(filepath.Join(s.dir, name))
++}

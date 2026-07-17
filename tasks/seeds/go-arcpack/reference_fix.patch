@@ -1,0 +1,184 @@
+diff --git a/arc.go b/arc.go
+new file mode 100644
+index 0000000..1bdfc38
+--- /dev/null
++++ b/arc.go
+@@ -0,0 +1,178 @@
++// Package arc reads and writes the ARCP single-file container format:
++// a fixed header (magic "ARCP", version byte, entry count), an entry
++// table (name, payload size, CRC-32), and concatenated payloads. Every
++// payload is checksummed so bit rot is caught at read time.
++package arc
++
++import (
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"hash/crc32"
++	"os"
++)
++
++// Format constants, frozen with the firmware side.
++const (
++	magic      = "ARCP"
++	version    = 1
++	headerSize = 9 // magic (4) + version (1) + entry count (4)
++)
++
++// Sentinel errors reported when decoding an archive.
++var (
++	ErrBadMagic  = errors.New("arc: bad magic, not an ARCP archive")
++	ErrVersion   = errors.New("arc: unsupported format version")
++	ErrTruncated = errors.New("arc: archive truncated")
++	ErrChecksum  = errors.New("arc: payload checksum mismatch")
++	ErrNotFound  = errors.New("arc: entry not found")
++)
++
++// File is one entry to be written into an archive.
++type File struct {
++	Name string
++	Data []byte
++}
++
++// Entry describes one stored entry, as recorded in the archive table.
++type Entry struct {
++	Name  string
++	Size  int64
++	CRC32 uint32
++}
++
++// Write creates an archive at path containing files in the given order.
++// Entry names must be unique and non-empty. Output is deterministic:
++// identical input produces identical bytes.
++func Write(path string, files []File) error {
++	seen := make(map[string]struct{}, len(files))
++	for _, f := range files {
++		if f.Name == "" {
++			return errors.New("arc: entry name must not be empty")
++		}
++		if _, dup := seen[f.Name]; dup {
++			return fmt.Errorf("arc: duplicate entry name %q", f.Name)
++		}
++		if len(f.Name) > 0xFFFF {
++			return fmt.Errorf("arc: entry name %q exceeds %d bytes", f.Name[:32], 0xFFFF)
++		}
++		seen[f.Name] = struct{}{}
++	}
++
++	var buf []byte
++	buf = append(buf, magic...)
++	buf = append(buf, version)
++	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(files)))
++	for _, f := range files {
++		buf = binary.LittleEndian.AppendUint16(buf, uint16(len(f.Name)))
++		buf = append(buf, f.Name...)
++		buf = binary.LittleEndian.AppendUint64(buf, uint64(len(f.Data)))
++		buf = binary.LittleEndian.AppendUint32(buf, crc32.ChecksumIEEE(f.Data))
++	}
++	for _, f := range files {
++		buf = append(buf, f.Data...)
++	}
++	return os.WriteFile(path, buf, 0o644)
++}
++
++// parsed is a decoded header/table plus where each payload lives.
++type parsed struct {
++	entries []Entry
++	offsets []int64 // payload start of each entry
++	raw     []byte
++}
++
++// parse decodes the header and entry table from raw. It never touches
++// payload bytes, so damage past the table does not affect it.
++func parse(raw []byte) (*parsed, error) {
++	if len(raw) >= 4 && string(raw[:4]) != magic {
++		return nil, ErrBadMagic
++	}
++	if len(raw) < headerSize {
++		return nil, fmt.Errorf("%w: %d bytes is shorter than the fixed header", ErrTruncated, len(raw))
++	}
++	if raw[4] != version {
++		return nil, fmt.Errorf("%w: %d", ErrVersion, raw[4])
++	}
++	count := binary.LittleEndian.Uint32(raw[5:headerSize])
++
++	p := &parsed{raw: raw}
++	pos := int64(headerSize)
++	need := func(n int64, what string) error {
++		if pos+n > int64(len(raw)) {
++			return fmt.Errorf("%w: table ends mid-%s", ErrTruncated, what)
++		}
++		return nil
++	}
++	for i := uint32(0); i < count; i++ {
++		if err := need(2, "name length"); err != nil {
++			return nil, err
++		}
++		nameLen := int64(binary.LittleEndian.Uint16(raw[pos:]))
++		pos += 2
++		if err := need(nameLen, "name"); err != nil {
++			return nil, err
++		}
++		name := string(raw[pos : pos+nameLen])
++		pos += nameLen
++		if err := need(12, "size/checksum record"); err != nil {
++			return nil, err
++		}
++		size := binary.LittleEndian.Uint64(raw[pos:])
++		crc := binary.LittleEndian.Uint32(raw[pos+8:])
++		pos += 12
++		p.entries = append(p.entries, Entry{Name: name, Size: int64(size), CRC32: crc})
++	}
++
++	// Payloads follow the table in stored order.
++	off := pos
++	for _, e := range p.entries {
++		p.offsets = append(p.offsets, off)
++		off += e.Size
++	}
++	return p, nil
++}
++
++func parseFile(path string) (*parsed, error) {
++	raw, err := os.ReadFile(path)
++	if err != nil {
++		return nil, err
++	}
++	return parse(raw)
++}
++
++// List returns the archive's entries in stored order. Only the header
++// and table are consulted; payload bytes are neither read nor verified.
++func List(path string) ([]Entry, error) {
++	p, err := parseFile(path)
++	if err != nil {
++		return nil, err
++	}
++	out := make([]Entry, len(p.entries))
++	copy(out, p.entries)
++	return out, nil
++}
++
++// ReadFile extracts the named entry's payload, verifying its CRC-32.
++func ReadFile(path, name string) ([]byte, error) {
++	p, err := parseFile(path)
++	if err != nil {
++		return nil, err
++	}
++	for i, e := range p.entries {
++		if e.Name != name {
++			continue
++		}
++		start := p.offsets[i]
++		if start+e.Size > int64(len(p.raw)) {
++			return nil, fmt.Errorf("%w: payload of %q ends past the file", ErrTruncated, name)
++		}
++		data := make([]byte, e.Size)
++		copy(data, p.raw[start:start+e.Size])
++		if got := crc32.ChecksumIEEE(data); got != e.CRC32 {
++			return nil, fmt.Errorf("%w: %q has crc %#08x, table says %#08x", ErrChecksum, name, got, e.CRC32)
++		}
++		return data, nil
++	}
++	return nil, fmt.Errorf("%w: %q", ErrNotFound, name)
++}

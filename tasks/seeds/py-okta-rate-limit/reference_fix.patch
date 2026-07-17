@@ -1,0 +1,279 @@
+diff --git a/oktasync/__init__.py b/oktasync/__init__.py
+new file mode 100644
+index 0000000..208d17b
+--- /dev/null
++++ b/oktasync/__init__.py
+@@ -0,0 +1,6 @@
++"""Okta API transport for the HR-driven user/group sync.
++
++OAuth-for-Okta service-app auth (private_key_jwt with a delegated signer),
++rate-limit-aware requests, Link-header pagination, and a halt-don't-guess
++user sync on top.
++"""
+diff --git a/oktasync/auth.py b/oktasync/auth.py
+new file mode 100644
+index 0000000..d4c9046
+--- /dev/null
++++ b/oktasync/auth.py
+@@ -0,0 +1,76 @@
++"""OAuth 2.0 for Okta: client-credentials tokens for a service app.
++
++Per the official guide, service apps hitting okta.* scopes must authenticate
++with private_key_jwt: a form-encoded POST to /oauth2/v1/token carrying a
++signed assertion instead of an Authorization header. The private key lives
++in a KMS, so signing is delegated to an injected callable that maps the JWT
++signing input to raw signature bytes.
++"""
++
++import base64
++import json
++import urllib.parse
++import urllib.request
++
++ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
++ASSERTION_LIFETIME = 300  # seconds; the docs cap assertion exp at one hour
++REFRESH_SKEW = 60  # refresh this many seconds before the token expires
++
++
++def _b64url(raw):
++    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
++
++
++class ClientCredentialsTokenSource:
++    def __init__(self, org_url, client_id, scopes, signer, clock):
++        self._token_url = org_url.rstrip("/") + "/oauth2/v1/token"
++        self._client_id = client_id
++        self._scopes = list(scopes)
++        self._signer = signer
++        self._clock = clock
++        self._access_token = None
++        self._refresh_at = 0.0
++
++    def _assertion(self):
++        header = {"alg": "RS256", "typ": "JWT"}
++        claims = {
++            "iss": self._client_id,
++            "sub": self._client_id,
++            "aud": self._token_url,
++            "exp": int(self._clock.now()) + ASSERTION_LIFETIME,
++        }
++        head = _b64url(json.dumps(header, separators=(",", ":")).encode("utf-8"))
++        body = _b64url(json.dumps(claims, separators=(",", ":")).encode("utf-8"))
++        signing_input = (head + "." + body).encode("ascii")
++        return head + "." + body + "." + _b64url(self._signer(signing_input))
++
++    def token(self):
++        if self._access_token is not None and self._clock.now() < self._refresh_at:
++            return self._access_token
++
++        form = urllib.parse.urlencode({
++            "grant_type": "client_credentials",
++            "scope": " ".join(self._scopes),
++            "client_assertion_type": ASSERTION_TYPE,
++            "client_assertion": self._assertion(),
++        }).encode("ascii")
++        request = urllib.request.Request(
++            self._token_url,
++            data=form,
++            method="POST",
++            headers={
++                "Content-Type": "application/x-www-form-urlencoded",
++                "Accept": "application/json",
++            },
++        )
++        issued_at = self._clock.now()
++        with urllib.request.urlopen(request) as response:
++            payload = json.loads(response.read().decode("utf-8"))
++        self._access_token = payload["access_token"]
++        self._refresh_at = issued_at + float(payload["expires_in"]) - REFRESH_SKEW
++        return self._access_token
++
++    def invalidate(self):
++        """Drops the cached token (e.g. after a 401 E0000011)."""
++        self._access_token = None
++        self._refresh_at = 0.0
+diff --git a/oktasync/sync.py b/oktasync/sync.py
+new file mode 100644
+index 0000000..d940125
+--- /dev/null
++++ b/oktasync/sync.py
+@@ -0,0 +1,33 @@
++"""User sync on top of the Okta transport.
++
++Lists the org's users (full pagination), matches desired profiles by
++profile.login, and creates only what's missing — as STAGED users, so nobody
++gets an activation email at 2am (create defaults to activate=true otherwise).
++A rate-limited create halts the run with resume info instead of retrying:
++creates aren't idempotent, and the operator resumes after the window.
++"""
++
++from .transport import RateLimitError
++
++LIST_USERS = "/api/v1/users?limit=200"
++CREATE_STAGED = "/api/v1/users?activate=false"
++
++
++def sync_users(transport, desired_profiles):
++    existing_logins = {
++        user["profile"]["login"] for user in transport.paginate(LIST_USERS)
++    }
++
++    report = {"created": [], "existing": [], "halted": None}
++    for profile in desired_profiles:
++        login = profile["login"]
++        if login in existing_logins:
++            report["existing"].append(login)
++            continue
++        try:
++            transport.create(CREATE_STAGED, {"profile": profile})
++        except RateLimitError as err:
++            report["halted"] = {"login": login, "reset_epoch": err.reset_epoch}
++            break
++        report["created"].append(login)
++    return report
+diff --git a/oktasync/transport.py b/oktasync/transport.py
+new file mode 100644
+index 0000000..4b2096b
+--- /dev/null
++++ b/oktasync/transport.py
+@@ -0,0 +1,140 @@
++"""Rate-limit-aware HTTP transport for the Okta management API.
++
++Okta stamps X-Rate-Limit-Limit / -Remaining / -Reset (UTC epoch seconds) on
++every response. On 429 the correct move for an idempotent GET is to wait
++until the advertised reset — computed against the response's own Date header
++so client clock skew can't hurt — and retry the identical URL. A 429 on a
++create is surfaced immediately: user creation is not idempotent and retrying
++blind is how duplicate accounts happen.
++"""
++
++import json
++import urllib.error
++import urllib.request
++from dataclasses import dataclass
++from email.utils import parsedate_to_datetime
++
++INVALID_TOKEN_CODE = "E0000011"
++MAX_RATE_RETRIES = 2
++
++
++@dataclass(frozen=True)
++class RateLimitInfo:
++    limit: int
++    remaining: int
++    reset_epoch: int
++
++
++class RateLimitError(Exception):
++    def __init__(self, message, reset_epoch):
++        super().__init__(message)
++        self.reset_epoch = reset_epoch
++
++
++class OktaAuthError(Exception):
++    pass
++
++
++def _next_link(link_header):
++    if not link_header:
++        return None
++    for segment in link_header.split(","):
++        open_ = segment.find("<")
++        close = segment.find(">")
++        if open_ < 0 or close < open_:
++            continue
++        if 'rel="next"' in segment[close + 1:].lower():
++            return segment[open_ + 1:close]
++    return None
++
++
++class OktaTransport:
++    def __init__(self, org_url, token_source, clock, wait):
++        self._base = org_url.rstrip("/")
++        self._source = token_source
++        self._clock = clock
++        self._wait = wait
++        self.rate_limit = None
++
++    def get_json(self, path_or_url):
++        data, _ = self._request("GET", path_or_url, retry_rate_limited=True)
++        return data
++
++    def create(self, path, body):
++        data, _ = self._request("POST", path, body=body, retry_rate_limited=False)
++        return data
++
++    def paginate(self, path):
++        """Yields items across every page, following Link rel="next" URLs
++        verbatim — the server owns the cursor and query format."""
++        url = path
++        while url is not None:
++            data, headers = self._request("GET", url, retry_rate_limited=True)
++            yield from data
++            url = _next_link(headers.get("Link"))
++
++    # ------------------------------------------------------------ internals
++
++    def _request(self, method, path_or_url, body=None, retry_rate_limited=False):
++        url = path_or_url if path_or_url.startswith("http") else self._base + path_or_url
++        auth_retried = False
++        rate_retries = 0
++        while True:
++            status, headers, payload = self._send(method, url, body)
++            self._record_rate_limit(headers)
++
++            if status == 401 and payload.get("errorCode") == INVALID_TOKEN_CODE:
++                if auth_retried:
++                    raise OktaAuthError(
++                        "Okta rejected the access token twice ({}): {}".format(
++                            payload.get("errorCode"), payload.get("errorSummary")))
++                self._source.invalidate()
++                auth_retried = True
++                continue
++
++            if status == 429:
++                reset = int(headers.get("X-Rate-Limit-Reset", "0"))
++                message = "Okta rate limit exceeded ({}): {} — window resets at epoch {}".format(
++                    payload.get("errorCode"), payload.get("errorSummary"), reset)
++                if not retry_rate_limited or rate_retries >= MAX_RATE_RETRIES:
++                    raise RateLimitError(message, reset)
++                rate_retries += 1
++                self._wait(self._delay_until_reset(headers, reset))
++                continue
++
++            return payload, headers
++
++    def _send(self, method, url, body):
++        data = None
++        headers = {"Accept": "application/json"}
++        if body is not None:
++            data = json.dumps(body).encode("utf-8")
++            headers["Content-Type"] = "application/json"
++        headers["Authorization"] = "Bearer " + self._source.token()
++        request = urllib.request.Request(url, data=data, method=method, headers=headers)
++        try:
++            with urllib.request.urlopen(request) as response:
++                return response.status, response.headers, self._decode(response.read())
++        except urllib.error.HTTPError as err:
++            return err.code, err.headers, self._decode(err.read())
++
++    @staticmethod
++    def _decode(raw):
++        if not raw:
++            return {}
++        return json.loads(raw.decode("utf-8"))
++
++    def _record_rate_limit(self, headers):
++        limit = headers.get("X-Rate-Limit-Limit")
++        remaining = headers.get("X-Rate-Limit-Remaining")
++        reset = headers.get("X-Rate-Limit-Reset")
++        if limit is not None and remaining is not None and reset is not None:
++            self.rate_limit = RateLimitInfo(int(limit), int(remaining), int(reset))
++
++    @staticmethod
++    def _delay_until_reset(headers, reset):
++        """Seconds until the advertised reset, anchored on the server's own
++        Date header (never the local clock)."""
++        date_header = headers.get("Date")
++        server_now = parsedate_to_datetime(date_header).timestamp()
++        return max(int(reset - server_now), 1)

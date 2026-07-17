@@ -1,0 +1,275 @@
+diff --git a/sf_errors.ts b/sf_errors.ts
+new file mode 100644
+index 0000000..4ac456a
+--- /dev/null
++++ b/sf_errors.ts
+@@ -0,0 +1,37 @@
++// Error types for the Snowflake SQL API controller. Messages are built only
++// from response bodies and statuses — never from request headers, so the
++// bearer token cannot leak.
++
++export class SqlApiError extends Error {
++  readonly status?: number;
++
++  constructor(message: string, status?: number) {
++    super(message);
++    this.name = 'SqlApiError';
++    this.status = status;
++  }
++}
++
++export interface FailureIdentity {
++  code: string;
++  sqlState: string;
++  message: string;
++  statementHandle: string;
++}
++
++export class StatementFailedError extends SqlApiError {
++  readonly code: string;
++  readonly sqlState: string;
++  readonly statementHandle: string;
++
++  constructor(identity: FailureIdentity) {
++    super(
++      `statement failed (code ${identity.code}, sqlState ${identity.sqlState}): ${identity.message}`,
++      422,
++    );
++    this.name = 'StatementFailedError';
++    this.code = identity.code;
++    this.sqlState = identity.sqlState;
++    this.statementHandle = identity.statementHandle;
++  }
++}
+diff --git a/sf_transport.ts b/sf_transport.ts
+new file mode 100644
+index 0000000..6df7fc4
+--- /dev/null
++++ b/sf_transport.ts
+@@ -0,0 +1,52 @@
++// One HTTP round trip against the SQL API v2 with the documented header set.
++
++export interface TransportOptions {
++  baseUrl: string;
++  token: string;
++  tokenType: string;
++  userAgent: string;
++}
++
++export interface ApiResponse {
++  status: number;
++  body: Record<string, unknown>;
++}
++
++export class SqlApiTransport {
++  private readonly opts: TransportOptions;
++
++  constructor(opts: TransportOptions) {
++    this.opts = opts;
++  }
++
++  async request(
++    method: 'GET' | 'POST',
++    pathWithQuery: string,
++    payload?: Record<string, unknown>,
++  ): Promise<ApiResponse> {
++    const headers: Record<string, string> = {
++      authorization: `Bearer ${this.opts.token}`,
++      'x-snowflake-authorization-token-type': this.opts.tokenType,
++      accept: 'application/json',
++      'user-agent': this.opts.userAgent,
++    };
++    let body: string | undefined;
++    if (payload !== undefined) {
++      headers['content-type'] = 'application/json';
++      body = JSON.stringify(payload);
++    }
++    const response = await fetch(`${this.opts.baseUrl}${pathWithQuery}`, {
++      method,
++      headers,
++      body,
++    });
++    const text = await response.text();
++    let parsed: Record<string, unknown> = {};
++    try {
++      parsed = text ? (JSON.parse(text) as Record<string, unknown>) : {};
++    } catch {
++      parsed = {};
++    }
++    return { status: response.status, body: parsed };
++  }
++}
+diff --git a/statement_controller.ts b/statement_controller.ts
+new file mode 100644
+index 0000000..ecfa6bc
+--- /dev/null
++++ b/statement_controller.ts
+@@ -0,0 +1,168 @@
++// Asynchronous Snowflake statement controller: submit with async=true, poll
++// the returned status URL, cancel server-side on deadline or abort, and
++// verify the cancellation's terminal state. Policy pinned in
++// docs/contract.json; time flows only through the injected now()/wait().
++
++import { SqlApiTransport } from './sf_transport.ts';
++import { SqlApiError, StatementFailedError, type FailureIdentity } from './sf_errors.ts';
++
++export { SqlApiError, StatementFailedError };
++
++const STATEMENTS_PATH = '/api/v2/statements';
++const POLL_INTERVAL_MS = 1000;
++
++export interface ControllerOptions {
++  baseUrl: string;
++  token: string;
++  tokenType: string;
++  userAgent: string;
++  requestIds: () => string;
++  now: () => number;
++  wait: (ms: number, signal?: AbortSignal) => Promise<void>;
++}
++
++export interface StatementSpec {
++  statement: string;
++  timeout?: number;
++  database?: string;
++  schema?: string;
++  warehouse?: string;
++  role?: string;
++}
++
++export interface ExecuteOptions {
++  deadlineMs?: number;
++  signal?: AbortSignal;
++}
++
++export interface SucceededOutcome {
++  kind: 'succeeded';
++  statementHandle: string;
++  code: string;
++  numRows: number;
++  rows: Array<Array<string | null>>;
++}
++
++export interface CancelledOutcome {
++  kind: 'cancelled';
++  statementHandle: string;
++  code: string;
++  sqlState: string;
++  message: string;
++}
++
++export type Outcome = SucceededOutcome | CancelledOutcome;
++
++interface QueryStatus {
++  statementHandle: string;
++  statementStatusUrl: string;
++}
++
++export class StatementController {
++  private readonly transport: SqlApiTransport;
++  private readonly requestIds: () => string;
++  private readonly now: () => number;
++  private readonly wait: (ms: number, signal?: AbortSignal) => Promise<void>;
++
++  constructor(opts: ControllerOptions) {
++    this.transport = new SqlApiTransport(opts);
++    this.requestIds = opts.requestIds;
++    this.now = opts.now;
++    this.wait = opts.wait;
++  }
++
++  async execute(spec: StatementSpec, opts: ExecuteOptions): Promise<Outcome> {
++    const params = new URLSearchParams({
++      requestId: this.requestIds(),
++      async: 'true',
++    });
++    const body: Record<string, unknown> = { statement: spec.statement };
++    if (spec.timeout !== undefined) body['timeout'] = spec.timeout;
++    if (spec.database !== undefined) body['database'] = spec.database;
++    if (spec.schema !== undefined) body['schema'] = spec.schema;
++    if (spec.warehouse !== undefined) body['warehouse'] = spec.warehouse;
++    if (spec.role !== undefined) body['role'] = spec.role;
++
++    const submitted = await this.transport.request(
++      'POST', `${STATEMENTS_PATH}?${params}`, body);
++    if (submitted.status === 200) {
++      return succeeded(submitted.body);
++    }
++    if (submitted.status !== 202) {
++      throw classify(submitted.status, submitted.body);
++    }
++    const pending: QueryStatus = {
++      statementHandle: String(submitted.body['statementHandle']),
++      statementStatusUrl: String(submitted.body['statementStatusUrl']),
++    };
++    return this.poll(pending, opts);
++  }
++
++  private async poll(pending: QueryStatus, opts: ExecuteOptions): Promise<Outcome> {
++    for (;;) {
++      // the deadline is consulted only before scheduling a wait; the abort
++      // signal is also honored the moment a wait returns
++      if (opts.signal?.aborted) return this.cancel(pending);
++      if (opts.deadlineMs !== undefined && this.now() >= opts.deadlineMs) {
++        return this.cancel(pending);
++      }
++      try {
++        await this.wait(POLL_INTERVAL_MS, opts.signal);
++      } catch (err) {
++        if (opts.signal?.aborted) return this.cancel(pending);
++        throw err;
++      }
++      if (opts.signal?.aborted) return this.cancel(pending);
++
++      const polled = await this.transport.request('GET', pending.statementStatusUrl);
++      if (polled.status === 200) return succeeded(polled.body);
++      if (polled.status !== 202) throw classify(polled.status, polled.body);
++    }
++  }
++
++  private async cancel(pending: QueryStatus): Promise<Outcome> {
++    const params = new URLSearchParams({ requestId: this.requestIds() });
++    const cancelled = await this.transport.request(
++      'POST', `${STATEMENTS_PATH}/${pending.statementHandle}/cancel?${params}`);
++    if (cancelled.status !== 200) {
++      throw classify(cancelled.status, cancelled.body);
++    }
++    // trust but verify: one status GET establishes the terminal state
++    const verified = await this.transport.request('GET', pending.statementStatusUrl);
++    if (verified.status === 200) {
++      // the statement finished before the cancel landed; success wins
++      return succeeded(verified.body);
++    }
++    if (verified.status === 422) {
++      return {
++        kind: 'cancelled',
++        statementHandle: String(verified.body['statementHandle']),
++        code: String(verified.body['code']),
++        sqlState: String(verified.body['sqlState']),
++        message: String(verified.body['message']),
++      };
++    }
++    throw classify(verified.status, verified.body);
++  }
++}
++
++function succeeded(body: Record<string, unknown>): SucceededOutcome {
++  const meta = body['resultSetMetaData'] as Record<string, unknown>;
++  return {
++    kind: 'succeeded',
++    statementHandle: String(body['statementHandle']),
++    code: String(body['code']),
++    numRows: Number(meta['numRows']),
++    rows: body['data'] as Array<Array<string | null>>,
++  };
++}
++
++function classify(status: number, body: Record<string, unknown>): SqlApiError {
++  if (status === 422) {
++    return new StatementFailedError(body as unknown as FailureIdentity);
++  }
++  const message = typeof body['message'] === 'string'
++    ? (body['message'] as string)
++    : 'no error message in response body';
++  return new SqlApiError(`SQL API request failed with HTTP ${status}: ${message}`, status);
++}

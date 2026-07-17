@@ -1,0 +1,288 @@
+diff --git a/batch_envelope.ts b/batch_envelope.ts
+new file mode 100644
+index 0000000..9c215f7
+--- /dev/null
++++ b/batch_envelope.ts
+@@ -0,0 +1,37 @@
++// $batch envelope helpers: batch splitting and nextLink → relative URL.
++
++export interface SubRequest {
++  id: string;
++  method: 'GET';
++  url: string;
++}
++
++export interface SubResponse {
++  id: string;
++  status: number;
++  headers?: Record<string, string>;
++  body?: unknown;
++}
++
++export const BATCH_LIMIT = 20;
++
++/** Split work into consecutive batches, filling each to the 20-request limit. */
++export function buildBatches<T>(items: T[]): T[][] {
++  const batches: T[][] = [];
++  for (let i = 0; i < items.length; i += BATCH_LIMIT) {
++    batches.push(items.slice(i, i + BATCH_LIMIT));
++  }
++  return batches;
++}
++
++/**
++ * Convert an absolute @odata.nextLink into the relative form $batch expects.
++ * The link is opaque: strip exactly the version base and keep path + query
++ * byte-for-byte — never parse or re-encode the token.
++ */
++export function deriveRelativeUrl(link: string, baseUrl: string): string {
++  if (!link.startsWith(baseUrl + '/')) {
++    throw new Error(`nextLink does not extend the expected API base: ${link}`);
++  }
++  return link.slice(baseUrl.length);
++}
+diff --git a/batch_mail_client.ts b/batch_mail_client.ts
+new file mode 100644
+index 0000000..72cf102
+--- /dev/null
++++ b/batch_mail_client.ts
+@@ -0,0 +1,239 @@
++// Microsoft Graph v1.0 JSON batch client for Outlook mail folders/messages.
++//
++// Wraps POST {base}/$batch per the documented contract: ≤20 subrequests per
++// batch (filled), relative subrequest URLs, unique ids, subresponses
++// correlated by id, per-request pagination via opaque nextLinks, and
++// retry-only-the-throttled-subrequests recovery.
++
++import { buildBatches, deriveRelativeUrl, type SubRequest, type SubResponse } from './batch_envelope.ts';
++
++export class GraphBatchError extends Error {
++  readonly status: number;
++  readonly code: string | null;
++
++  constructor(status: number, code: string | null, message: string) {
++    super(message);
++    this.name = 'GraphBatchError';
++    this.status = status;
++    this.code = code;
++  }
++}
++
++export interface FolderError {
++  status: number;
++  code: string | null;
++  message: string;
++  retryAfter?: number;
++}
++
++export interface MailMessage {
++  id: string;
++  subject: string | null;
++  from: string | null;
++  receivedDateTime: string | null;
++  isRead: boolean | null;
++}
++
++export interface FolderReport {
++  id: string;
++  displayName: string | null;
++  totalItemCount: number | null;
++  messages: MailMessage[];
++  error: FolderError | null;
++}
++
++export interface GraphBatchClientOptions {
++  baseUrl: string;
++  accessToken: string;
++  delay?: (seconds: number) => Promise<void>;
++  maxRetries?: number;
++}
++
++const SELECT_META = '$select=id,displayName,totalItemCount';
++const SELECT_MSGS = '$select=id,subject,from,receivedDateTime,isRead&$top=5';
++
++interface WorkItem {
++  folderId: string;
++  kind: 'meta' | 'messages';
++  url: string;
++  retries: number;
++}
++
++export class GraphBatchClient {
++  private readonly baseUrl: string;
++  private readonly accessToken: string;
++  private readonly delay: (seconds: number) => Promise<void>;
++  private readonly maxRetries: number;
++  private idCounter = 0;
++
++  constructor(options: GraphBatchClientOptions) {
++    this.baseUrl = options.baseUrl.replace(/\/+$/, '');
++    this.accessToken = options.accessToken;
++    this.delay = options.delay
++      ?? (seconds => new Promise(resolve => setTimeout(resolve, seconds * 1000)));
++    this.maxRetries = options.maxRetries ?? 3;
++  }
++
++  async fetchMail(userId: string, folderIds: string[]): Promise<FolderReport[]> {
++    const reports = new Map<string, FolderReport>();
++    for (const fid of folderIds) {
++      reports.set(fid, { id: fid, displayName: null, totalItemCount: null, messages: [], error: null });
++    }
++
++    let pending: WorkItem[] = folderIds.flatMap(fid => [
++      { folderId: fid, kind: 'meta' as const, url: `/users/${userId}/mailFolders/${fid}?${SELECT_META}`, retries: 0 },
++      { folderId: fid, kind: 'messages' as const, url: `/users/${userId}/mailFolders/${fid}/messages?${SELECT_MSGS}`, retries: 0 },
++    ]);
++
++    while (pending.length > 0) {
++      const nextRound: WorkItem[] = [];
++      const throttled: Array<{ item: WorkItem; retryAfter: number }> = [];
++
++      for (const chunk of buildBatches(pending)) {
++        const byId = new Map<string, WorkItem>();
++        const requests: SubRequest[] = chunk.map(item => {
++          const id = String(++this.idCounter);
++          byId.set(id, item);
++          return { id, method: 'GET', url: item.url };
++        });
++
++        const responses = await this.postBatch(requests);
++        for (const response of responses) {
++          const item = byId.get(String(response.id));
++          if (item === undefined) {
++            throw new GraphBatchError(0, 'ProtocolError',
++              `Batch response carries unknown id ${String(response.id)}`);
++          }
++          this.applySubResponse(reports.get(item.folderId)!, item, response, nextRound, throttled);
++        }
++      }
++
++      if (throttled.length > 0) {
++        const retriable = throttled.filter(t => t.item.retries < this.maxRetries);
++        for (const t of throttled) {
++          if (t.item.retries >= this.maxRetries) {
++            const report = reports.get(t.item.folderId)!;
++            if (report.error === null) {
++              report.error = {
++                status: 429,
++                code: 'TooManyRequests',
++                message: 'Throttled by Microsoft Graph after exhausting retries.',
++                retryAfter: t.retryAfter,
++              };
++            }
++          }
++        }
++        if (retriable.length > 0) {
++          await this.delay(Math.max(...retriable.map(t => t.retryAfter)));
++          for (const t of retriable) {
++            t.item.retries += 1;
++            nextRound.push(t.item);
++          }
++        }
++      }
++
++      pending = nextRound;
++    }
++
++    return folderIds.map(fid => reports.get(fid)!);
++  }
++
++  private applySubResponse(
++    report: FolderReport,
++    item: WorkItem,
++    response: SubResponse,
++    nextRound: WorkItem[],
++    throttled: Array<{ item: WorkItem; retryAfter: number }>,
++  ): void {
++    if (response.status === 429) {
++      throttled.push({ item, retryAfter: readRetryAfter(response) });
++      return;
++    }
++
++    if (response.status < 200 || response.status >= 300) {
++      if (report.error === null) {
++        const envelope = (response.body ?? {}) as { error?: { code?: string; message?: string } };
++        report.error = {
++          status: response.status,
++          code: envelope.error?.code ?? null,
++          message: envelope.error?.message ?? `Subrequest failed with status ${response.status}`,
++        };
++      }
++      return;
++    }
++
++    const body = (response.body ?? {}) as Record<string, unknown>;
++    if (item.kind === 'meta') {
++      report.displayName = typeof body.displayName === 'string' ? body.displayName : null;
++      report.totalItemCount = typeof body.totalItemCount === 'number' ? body.totalItemCount : null;
++      return;
++    }
++
++    const value = Array.isArray(body.value) ? body.value : [];
++    for (const raw of value as Array<Record<string, unknown>>) {
++      report.messages.push(decodeMessage(raw));
++    }
++    const nextLink = body['@odata.nextLink'];
++    if (typeof nextLink === 'string') {
++      nextRound.push({
++        folderId: item.folderId,
++        kind: 'messages',
++        url: deriveRelativeUrl(nextLink, this.baseUrl),
++        retries: 0,
++      });
++    }
++  }
++
++  private async postBatch(requests: SubRequest[]): Promise<SubResponse[]> {
++    const response = await fetch(this.baseUrl + '/$batch', {
++      method: 'POST',
++      headers: {
++        Authorization: `Bearer ${this.accessToken}`,
++        'Content-Type': 'application/json',
++        Accept: 'application/json',
++      },
++      body: JSON.stringify({ requests }),
++    });
++    const text = await response.text();
++    let parsed: unknown = null;
++    try {
++      parsed = JSON.parse(text);
++    } catch {
++      // fall through to the status check with a null body
++    }
++    if (!response.ok) {
++      const envelope = (parsed ?? {}) as { error?: { code?: string; message?: string } };
++      throw new GraphBatchError(
++        response.status,
++        envelope.error?.code ?? null,
++        envelope.error?.message ?? `$batch POST failed with status ${response.status}`);
++    }
++    const body = (parsed ?? {}) as { responses?: unknown };
++    if (!Array.isArray(body.responses)) {
++      throw new GraphBatchError(0, 'ProtocolError', '$batch response carries no responses array');
++    }
++    return body.responses as SubResponse[];
++  }
++}
++
++function decodeMessage(raw: Record<string, unknown>): MailMessage {
++  const from = raw.from as { emailAddress?: { address?: string } } | undefined;
++  return {
++    id: String(raw.id),
++    subject: typeof raw.subject === 'string' ? raw.subject : null,
++    from: typeof from?.emailAddress?.address === 'string' ? from.emailAddress.address : null,
++    receivedDateTime: typeof raw.receivedDateTime === 'string' ? raw.receivedDateTime : null,
++    isRead: typeof raw.isRead === 'boolean' ? raw.isRead : null,
++  };
++}
++
++function readRetryAfter(response: SubResponse): number {
++  const headers = response.headers ?? {};
++  for (const [key, value] of Object.entries(headers)) {
++    if (key.toLowerCase() === 'retry-after') {
++      const seconds = Number.parseInt(String(value), 10);
++      if (Number.isFinite(seconds) && seconds >= 0) return seconds;
++    }
++  }
++  return 1;
++}

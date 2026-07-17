@@ -1,0 +1,310 @@
+diff --git a/AllFailedException.java b/AllFailedException.java
+new file mode 100644
+index 0000000..e6c9d45
+--- /dev/null
++++ b/AllFailedException.java
+@@ -0,0 +1,17 @@
++import java.util.List;
++
++/** Every stage in an any() race failed; causes are kept in input order. */
++public class AllFailedException extends RuntimeException {
++
++    private final List<Throwable> causes;
++
++    public AllFailedException(List<Throwable> causes) {
++        super("all " + causes.size() + " stages failed");
++        this.causes = List.copyOf(causes);
++    }
++
++    /** Unmodifiable, one cause per stage, in the stages' input order. */
++    public List<Throwable> causes() {
++        return causes;
++    }
++}
+diff --git a/Orchestrator.java b/Orchestrator.java
+new file mode 100644
+index 0000000..016e28f
+--- /dev/null
++++ b/Orchestrator.java
+@@ -0,0 +1,209 @@
++import java.time.Duration;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.CompletionException;
++import java.util.concurrent.Executor;
++import java.util.function.BiFunction;
++import java.util.function.Supplier;
++
++/**
++ * Deterministic CompletableFuture combinators for the loan pre-approval
++ * pipeline. All concurrency and time come from the injected Executor and
++ * TaskScheduler — nothing here spawns threads, sleeps, or reads a clock.
++ */
++public final class Orchestrator {
++
++    private final Executor executor;
++    private final TaskScheduler scheduler;
++
++    public Orchestrator(Executor executor, TaskScheduler scheduler) {
++        if (executor == null) {
++            throw new IllegalArgumentException("executor must not be null");
++        }
++        if (scheduler == null) {
++            throw new IllegalArgumentException("scheduler must not be null");
++        }
++        this.executor = executor;
++        this.scheduler = scheduler;
++    }
++
++    /** Runs body on the executor; a throw becomes StageException(stage, thrown). */
++    public <T> CompletableFuture<T> supply(String stage, Supplier<? extends T> body) {
++        requireStage(stage);
++        if (body == null) {
++            throw new IllegalArgumentException("body must not be null");
++        }
++        CompletableFuture<T> out = new CompletableFuture<>();
++        executor.execute(() -> {
++            try {
++                out.complete(body.get());
++            } catch (Throwable t) {
++                out.completeExceptionally(new StageException(stage, t));
++            }
++        });
++        return out;
++    }
++
++    /**
++     * A new future mirroring `future`, failed with StageTimeoutException if
++     * the deadline (one scheduler timer) fires first. The source is never
++     * completed, cancelled, or otherwise touched.
++     */
++    public <T> CompletableFuture<T> withTimeout(String stage, CompletableFuture<T> future,
++                                                Duration timeout) {
++        requireStage(stage);
++        if (future == null) {
++            throw new IllegalArgumentException("future must not be null");
++        }
++        if (timeout == null || timeout.isZero() || timeout.isNegative()) {
++            throw new IllegalArgumentException("timeout must be positive");
++        }
++        CompletableFuture<T> out = new CompletableFuture<>();
++        if (future.isDone()) {
++            future.whenComplete((value, ex) -> mirror(out, value, ex));
++            return out;
++        }
++        TaskScheduler.Handle timer = scheduler.schedule(
++                () -> out.completeExceptionally(new StageTimeoutException(stage, timeout)),
++                timeout);
++        future.whenComplete((value, ex) -> {
++            timer.cancel();
++            mirror(out, value, ex);
++        });
++        return out;
++    }
++
++    /**
++     * Waits for EVERY stage to settle (not fail-fast). All succeed → values
++     * in input order (unmodifiable); otherwise fails with the lowest-index
++     * failed stage's cause, regardless of completion order.
++     */
++    public <T> CompletableFuture<List<T>> all(List<CompletableFuture<T>> stages) {
++        requireNoNulls(stages);
++        int n = stages.size();
++        if (n == 0) {
++            return CompletableFuture.completedFuture(List.of());
++        }
++        CompletableFuture<List<T>> out = new CompletableFuture<>();
++        List<T> values = new ArrayList<>(java.util.Collections.nCopies(n, (T) null));
++        Throwable[] failures = new Throwable[n];
++        int[] settled = {0};
++        for (int i = 0; i < n; i++) {
++            int index = i;
++            stages.get(i).whenComplete((value, ex) -> {
++                if (ex != null) {
++                    failures[index] = strip(ex);
++                } else {
++                    values.set(index, value);
++                }
++                if (++settled[0] < n) {
++                    return;
++                }
++                for (Throwable failure : failures) {
++                    if (failure != null) {
++                        out.completeExceptionally(failure);
++                        return;
++                    }
++                }
++                out.complete(java.util.Collections.unmodifiableList(new ArrayList<>(values)));
++            });
++        }
++        return out;
++    }
++
++    /**
++     * First success in completion-time order wins; failures are skipped while
++     * a success is still possible. All failed → AllFailedException with the
++     * causes in input order.
++     */
++    public <T> CompletableFuture<T> any(List<CompletableFuture<T>> stages) {
++        requireNoNulls(stages);
++        int n = stages.size();
++        if (n == 0) {
++            throw new IllegalArgumentException("stages must not be empty");
++        }
++        CompletableFuture<T> out = new CompletableFuture<>();
++        Throwable[] causes = new Throwable[n];
++        int[] failed = {0};
++        for (int i = 0; i < n; i++) {
++            int index = i;
++            stages.get(i).whenComplete((value, ex) -> {
++                if (ex == null) {
++                    out.complete(value);
++                    return;
++                }
++                causes[index] = strip(ex);
++                if (++failed[0] == n) {
++                    out.completeExceptionally(new AllFailedException(List.of(causes)));
++                }
++            });
++        }
++        return out;
++    }
++
++    /**
++     * combine(a, b) once both succeed; fails FAST with the first failure in
++     * time even while the other side is pending. A throwing combiner fails
++     * the result with exactly that exception.
++     */
++    public <A, B, R> CompletableFuture<R> zip(CompletableFuture<A> a, CompletableFuture<B> b,
++                                              BiFunction<? super A, ? super B, ? extends R> combine) {
++        if (a == null || b == null) {
++            throw new IllegalArgumentException("future must not be null");
++        }
++        if (combine == null) {
++            throw new IllegalArgumentException("combine must not be null");
++        }
++        CompletableFuture<R> out = new CompletableFuture<>();
++        a.whenComplete((value, ex) -> {
++            if (ex != null) {
++                out.completeExceptionally(strip(ex));
++            }
++        });
++        b.whenComplete((value, ex) -> {
++            if (ex != null) {
++                out.completeExceptionally(strip(ex));
++            }
++        });
++        a.thenAcceptBoth(b, (va, vb) -> {
++            try {
++                out.complete(combine.apply(va, vb));
++            } catch (Throwable t) {
++                out.completeExceptionally(t);
++            }
++        });
++        return out;
++    }
++
++    private static void requireStage(String stage) {
++        if (stage == null || stage.isBlank()) {
++            throw new IllegalArgumentException("stage must not be blank");
++        }
++    }
++
++    private static void requireNoNulls(List<?> stages) {
++        if (stages == null) {
++            throw new IllegalArgumentException("stages must not be null");
++        }
++        for (Object stage : stages) {
++            // (List.of() lists throw NPE on contains(null) — scan by hand.)
++            if (stage == null) {
++                throw new IllegalArgumentException("stages must not contain null");
++            }
++        }
++    }
++
++    private static <T> void mirror(CompletableFuture<T> out, T value, Throwable ex) {
++        if (ex != null) {
++            out.completeExceptionally(strip(ex));
++        } else {
++            out.complete(value);
++        }
++    }
++
++    /** Callbacks on derived futures see CompletionException wrappers — unwrap. */
++    private static Throwable strip(Throwable t) {
++        return (t instanceof CompletionException && t.getCause() != null) ? t.getCause() : t;
++    }
++}
+diff --git a/StageException.java b/StageException.java
+new file mode 100644
+index 0000000..89e1737
+--- /dev/null
++++ b/StageException.java
+@@ -0,0 +1,14 @@
++/** A named pipeline stage's body threw. */
++public class StageException extends RuntimeException {
++
++    private final String stage;
++
++    public StageException(String stage, Throwable cause) {
++        super("stage '" + stage + "' failed", cause);
++        this.stage = stage;
++    }
++
++    public String stage() {
++        return stage;
++    }
++}
+diff --git a/StageTimeoutException.java b/StageTimeoutException.java
+new file mode 100644
+index 0000000..f4af249
+--- /dev/null
++++ b/StageTimeoutException.java
+@@ -0,0 +1,22 @@
++import java.time.Duration;
++
++/** A named pipeline stage missed its deadline. */
++public class StageTimeoutException extends RuntimeException {
++
++    private final String stage;
++    private final Duration timeout;
++
++    public StageTimeoutException(String stage, Duration timeout) {
++        super("stage '" + stage + "' timed out after " + timeout);
++        this.stage = stage;
++        this.timeout = timeout;
++    }
++
++    public String stage() {
++        return stage;
++    }
++
++    public Duration timeout() {
++        return timeout;
++    }
++}
+diff --git a/TaskScheduler.java b/TaskScheduler.java
+new file mode 100644
+index 0000000..8f8fc78
+--- /dev/null
++++ b/TaskScheduler.java
+@@ -0,0 +1,18 @@
++import java.time.Duration;
++
++/**
++ * The orchestrator's only notion of time: something that can run an action
++ * after a delay and let the caller cancel it. Tests inject a virtual-time
++ * implementation (ManualScheduler); production would wrap a real timer.
++ */
++public interface TaskScheduler {
++
++    /** Cancellation token for one scheduled action. Must stay a SAM type. */
++    @FunctionalInterface
++    interface Handle {
++        /** True if the action was revoked; false if it already fired or was cancelled. */
++        boolean cancel();
++    }
++
++    Handle schedule(Runnable action, Duration delay);
++}

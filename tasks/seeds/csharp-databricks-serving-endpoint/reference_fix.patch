@@ -1,0 +1,339 @@
+diff --git a/EndpointDeployer.cs b/EndpointDeployer.cs
+new file mode 100644
+index 0000000..41dc4f9
+--- /dev/null
++++ b/EndpointDeployer.cs
+@@ -0,0 +1,139 @@
++using System.Text.Json;
++
++namespace DbxServing;
++
++/// <summary>
++/// Creates or updates a serving endpoint and follows its readiness and
++/// config-update states through bounded, injected-wait polling.
++/// </summary>
++public sealed class EndpointDeployer
++{
++    private static readonly HashSet<string> FailedDeployments =
++        new() { "DEPLOYMENT_FAILED", "DEPLOYMENT_ABORTED" };
++
++    private readonly ServingClient _client;
++    private readonly Func<TimeSpan, CancellationToken, Task> _wait;
++    private readonly int _maxPolls;
++    private readonly TimeSpan _pollInterval;
++
++    public EndpointDeployer(ServingClient client, Func<TimeSpan, CancellationToken, Task> wait,
++        int maxPolls, TimeSpan pollInterval)
++    {
++        _client = client;
++        _wait = wait;
++        _maxPolls = maxPolls;
++        _pollInterval = pollInterval;
++    }
++
++    public async Task<DeployResult> DeployAsync(EndpointSpec spec, CancellationToken ct)
++    {
++        ct.ThrowIfCancellationRequested();
++        var existing = await _client.GetEndpointAsync(spec.Name, ct);
++        bool created;
++        JsonDocument current;
++        if (existing is null)
++        {
++            current = await _client.CreateAsync(spec, ct);
++            created = true;
++        }
++        else
++        {
++            existing.Dispose();
++            current = await _client.UpdateConfigAsync(spec, ct);
++            created = false;
++        }
++
++        var polls = 0;
++        while (true)
++        {
++            var (ready, configUpdate) = States(current);
++            if (IsTerminal(ready, configUpdate))
++                break;
++            if (polls == _maxPolls)
++            {
++                current.Dispose();
++                throw new PollTimeoutException(ready, configUpdate);
++            }
++            await _wait(_pollInterval, ct);
++            ct.ThrowIfCancellationRequested();
++            current.Dispose();
++            current = await _client.GetEndpointAsync(spec.Name, ct)
++                ?? throw new DbxApiException(404, "RESOURCE_DOES_NOT_EXIST",
++                    $"endpoint {spec.Name} disappeared while polling");
++            polls++;
++        }
++
++        var result = BuildResult(current, created);
++        current.Dispose();
++        return result;
++    }
++
++    private static bool IsTerminal(string ready, string configUpdate) =>
++        (ready == "READY" && configUpdate == "NOT_UPDATING")
++        || configUpdate == "UPDATE_FAILED"
++        || configUpdate == "UPDATE_CANCELED";
++
++    private static (string Ready, string ConfigUpdate) States(JsonDocument doc)
++    {
++        var state = doc.RootElement.GetProperty("state");
++        return (state.GetProperty("ready").GetString() ?? "",
++                state.GetProperty("config_update").GetString() ?? "");
++    }
++
++    private static DeployResult BuildResult(JsonDocument doc, bool created)
++    {
++        var root = doc.RootElement;
++        var (ready, configUpdate) = States(doc);
++        string? endpointUrl = root.TryGetProperty("endpoint_url", out var url) ? url.GetString() : null;
++
++        // The active config carries the live entities; while deploying they
++        // only exist under pending_config.
++        JsonElement source = default;
++        var hasSource = root.TryGetProperty("config", out source)
++            || root.TryGetProperty("pending_config", out source);
++
++        var entities = new List<EntityStatus>();
++        var routes = new List<RouteStatus>();
++        if (hasSource)
++        {
++            if (source.TryGetProperty("served_entities", out var served))
++                foreach (var entity in served.EnumerateArray())
++                    entities.Add(DecodeEntity(entity));
++            if (source.TryGetProperty("traffic_config", out var traffic)
++                && traffic.TryGetProperty("routes", out var routeArray))
++                foreach (var route in routeArray.EnumerateArray())
++                    routes.Add(new RouteStatus(
++                        route.GetProperty("served_model_name").GetString() ?? "",
++                        route.GetProperty("traffic_percentage").GetInt32()));
++        }
++
++        var errors = new Dictionary<string, string>();
++        foreach (var configKey in new[] { "config", "pending_config" })
++        {
++            if (!root.TryGetProperty(configKey, out var cfg)
++                || !cfg.TryGetProperty("served_entities", out var served))
++                continue;
++            foreach (var entity in served.EnumerateArray())
++            {
++                var status = DecodeEntity(entity);
++                if (FailedDeployments.Contains(status.Deployment))
++                    errors[status.Name] = status.Message;
++            }
++        }
++
++        return new DeployResult(created, ready, configUpdate, endpointUrl, entities, routes, errors);
++    }
++
++    private static EntityStatus DecodeEntity(JsonElement entity)
++    {
++        var name = entity.GetProperty("name").GetString() ?? "";
++        var deployment = "";
++        var message = "";
++        if (entity.TryGetProperty("state", out var state))
++        {
++            deployment = state.TryGetProperty("deployment", out var d) ? d.GetString() ?? "" : "";
++            message = state.TryGetProperty("deployment_state_message", out var m) ? m.GetString() ?? "" : "";
++        }
++        return new EntityStatus(name, deployment, message);
++    }
++}
+diff --git a/Models.cs b/Models.cs
+new file mode 100644
+index 0000000..e487921
+--- /dev/null
++++ b/Models.cs
+@@ -0,0 +1,73 @@
++namespace DbxServing;
++
++/// <summary>A served entity in the desired endpoint configuration.</summary>
++public sealed record ServedEntitySpec(
++    string Name,
++    string EntityName,
++    string EntityVersion,
++    string WorkloadSize,
++    bool ScaleToZeroEnabled);
++
++/// <summary>A traffic route in the desired endpoint configuration.</summary>
++public sealed record RouteSpec(string ServedModelName, int TrafficPercentage);
++
++/// <summary>Desired state for one serving endpoint.</summary>
++public sealed record EndpointSpec(
++    string Name,
++    IReadOnlyList<ServedEntitySpec> ServedEntities,
++    IReadOnlyList<RouteSpec> Routes);
++
++/// <summary>Observed deployment state of one served entity.</summary>
++public sealed record EntityStatus(string Name, string Deployment, string Message);
++
++/// <summary>Observed traffic route.</summary>
++public sealed record RouteStatus(string ServedModelName, int TrafficPercentage);
++
++/// <summary>Terminal outcome of a deploy: final states plus per-entity detail.</summary>
++public sealed record DeployResult(
++    bool Created,
++    string Ready,
++    string ConfigUpdate,
++    string? EndpointUrl,
++    IReadOnlyList<EntityStatus> Entities,
++    IReadOnlyList<RouteStatus> Routes,
++    IReadOnlyDictionary<string, string> EntityErrors);
++
++/// <summary>A Databricks REST failure decoded from the {error_code, message} envelope.</summary>
++public class DbxApiException : Exception
++{
++    public int StatusCode { get; }
++    public string ErrorCode { get; }
++    public string ApiMessage { get; }
++
++    public DbxApiException(int statusCode, string errorCode, string apiMessage)
++        : base($"{errorCode} (HTTP {statusCode}): {apiMessage}")
++    {
++        StatusCode = statusCode;
++        ErrorCode = errorCode;
++        ApiMessage = apiMessage;
++    }
++}
++
++/// <summary>A config update rejected because another update is in progress. Never retried.</summary>
++public sealed class ConflictException : DbxApiException
++{
++    public ConflictException(int statusCode, string errorCode, string apiMessage)
++        : base(statusCode, errorCode, apiMessage)
++    {
++    }
++}
++
++/// <summary>The endpoint did not reach a terminal state within the polling bound.</summary>
++public sealed class PollTimeoutException : Exception
++{
++    public string LastReady { get; }
++    public string LastConfigUpdate { get; }
++
++    public PollTimeoutException(string lastReady, string lastConfigUpdate)
++        : base($"endpoint did not settle: ready={lastReady}, config_update={lastConfigUpdate}")
++    {
++        LastReady = lastReady;
++        LastConfigUpdate = lastConfigUpdate;
++    }
++}
+diff --git a/ServingClient.cs b/ServingClient.cs
+new file mode 100644
+index 0000000..31e05f4
+--- /dev/null
++++ b/ServingClient.cs
+@@ -0,0 +1,109 @@
++using System.Text;
++using System.Text.Json;
++
++namespace DbxServing;
++
++/// <summary>
++/// Thin client for the Databricks serving-endpoints REST API 2.0:
++/// Bearer auth, JSON bodies, typed envelope decoding.
++/// </summary>
++public sealed class ServingClient
++{
++    private readonly HttpClient _http;
++    private readonly string _baseUrl;
++    private readonly string _token;
++
++    public ServingClient(HttpClient http, string baseUrl, string token)
++    {
++        _http = http;
++        _baseUrl = baseUrl.TrimEnd('/');
++        _token = token;
++    }
++
++    /// <summary>Reads the endpoint; null when the API reports it does not exist.</summary>
++    public async Task<JsonDocument?> GetEndpointAsync(string name, CancellationToken ct)
++    {
++        using var resp = await SendAsync(HttpMethod.Get, $"/api/2.0/serving-endpoints/{name}", null, ct);
++        var body = await resp.Content.ReadAsStringAsync(ct);
++        if (resp.IsSuccessStatusCode)
++            return JsonDocument.Parse(body);
++        var (code, message) = DecodeEnvelope(body);
++        if ((int)resp.StatusCode == 404 && code == "RESOURCE_DOES_NOT_EXIST")
++            return null;
++        throw new DbxApiException((int)resp.StatusCode, code, message);
++    }
++
++    public Task<JsonDocument> CreateAsync(EndpointSpec spec, CancellationToken ct)
++    {
++        var payload = new Dictionary<string, object?>
++        {
++            ["name"] = spec.Name,
++            ["config"] = ConfigPayload(spec),
++        };
++        return WriteAsync(HttpMethod.Post, "/api/2.0/serving-endpoints", payload, ct);
++    }
++
++    public Task<JsonDocument> UpdateConfigAsync(EndpointSpec spec, CancellationToken ct)
++    {
++        // The endpoint name travels in the path; the body is only the config.
++        return WriteAsync(HttpMethod.Put, $"/api/2.0/serving-endpoints/{spec.Name}/config",
++            ConfigPayload(spec), ct);
++    }
++
++    private static Dictionary<string, object?> ConfigPayload(EndpointSpec spec) => new()
++    {
++        ["served_entities"] = spec.ServedEntities.Select(e => new Dictionary<string, object?>
++        {
++            ["name"] = e.Name,
++            ["entity_name"] = e.EntityName,
++            ["entity_version"] = e.EntityVersion,
++            ["workload_size"] = e.WorkloadSize,
++            ["scale_to_zero_enabled"] = e.ScaleToZeroEnabled,
++        }).ToList(),
++        ["traffic_config"] = new Dictionary<string, object?>
++        {
++            ["routes"] = spec.Routes.Select(r => new Dictionary<string, object?>
++            {
++                ["served_model_name"] = r.ServedModelName,
++                ["traffic_percentage"] = r.TrafficPercentage,
++            }).ToList(),
++        },
++    };
++
++    private async Task<JsonDocument> WriteAsync(HttpMethod method, string path, object payload, CancellationToken ct)
++    {
++        using var resp = await SendAsync(method, path, payload, ct);
++        var body = await resp.Content.ReadAsStringAsync(ct);
++        if (resp.IsSuccessStatusCode)
++            return JsonDocument.Parse(body);
++        var (code, message) = DecodeEnvelope(body);
++        if ((int)resp.StatusCode == 409)
++            throw new ConflictException((int)resp.StatusCode, code, message);
++        throw new DbxApiException((int)resp.StatusCode, code, message);
++    }
++
++    private async Task<HttpResponseMessage> SendAsync(HttpMethod method, string path, object? payload, CancellationToken ct)
++    {
++        using var request = new HttpRequestMessage(method, _baseUrl + path);
++        request.Headers.TryAddWithoutValidation("Authorization", "Bearer " + _token);
++        request.Headers.TryAddWithoutValidation("Accept", "application/json");
++        if (payload is not null)
++            request.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
++        return await _http.SendAsync(request, ct);
++    }
++
++    private static (string Code, string Message) DecodeEnvelope(string body)
++    {
++        try
++        {
++            using var doc = JsonDocument.Parse(body);
++            var code = doc.RootElement.TryGetProperty("error_code", out var c) ? c.GetString() ?? "UNKNOWN" : "UNKNOWN";
++            var message = doc.RootElement.TryGetProperty("message", out var m) ? m.GetString() ?? "" : "";
++            return (code, message);
++        }
++        catch (JsonException)
++        {
++            return ("UNKNOWN", "");
++        }
++    }
++}

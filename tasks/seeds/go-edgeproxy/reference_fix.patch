@@ -1,0 +1,196 @@
+diff --git a/proxy.go b/proxy.go
+new file mode 100644
+index 0000000..f428532
+--- /dev/null
++++ b/proxy.go
+@@ -0,0 +1,64 @@
++package proxy
++
++import (
++	"context"
++	"errors"
++	"io"
++	"net"
++	"net/http"
++	"net/url"
++)
++
++// Proxy relays requests to a single upstream after rewriting them.
++type Proxy struct {
++	upstream    *url.URL
++	stripPrefix string
++
++	// Transport performs the upstream round trips. Tests inject fakes;
++	// it defaults to http.DefaultTransport.
++	Transport http.RoundTripper
++}
++
++// New builds a proxy for the given upstream, stripping stripPrefix from
++// inbound paths.
++func New(upstream *url.URL, stripPrefix string) *Proxy {
++	return &Proxy{
++		upstream:    upstream,
++		stripPrefix: stripPrefix,
++		Transport:   http.DefaultTransport,
++	}
++}
++
++func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
++	rt := p.Transport
++	if rt == nil {
++		rt = http.DefaultTransport
++	}
++
++	resp, err := rt.RoundTrip(RewriteRequest(r, p.upstream, p.stripPrefix))
++	if err != nil {
++		status, msg := mapUpstreamError(err)
++		http.Error(w, msg, status)
++		return
++	}
++	defer resp.Body.Close()
++
++	StripHopByHop(resp.Header)
++	for k, vv := range resp.Header {
++		for _, v := range vv {
++			w.Header().Add(k, v)
++		}
++	}
++	w.WriteHeader(resp.StatusCode)
++	io.Copy(w, resp.Body) // stream; the client may be slower than the upstream
++}
++
++// mapUpstreamError turns a round-trip failure into a gateway status:
++// timeout-flavored errors are 504, everything else 502.
++func mapUpstreamError(err error) (int, string) {
++	var nerr net.Error
++	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &nerr) && nerr.Timeout()) {
++		return http.StatusGatewayTimeout, "upstream timed out"
++	}
++	return http.StatusBadGateway, "upstream request failed"
++}
+diff --git a/rewrite.go b/rewrite.go
+new file mode 100644
+index 0000000..0ee85a5
+--- /dev/null
++++ b/rewrite.go
+@@ -0,0 +1,120 @@
++// Package proxy is the testable core of the edge reverse proxy: the rewrite
++// rules live in pure functions, the HTTP plumbing stays thin.
++package proxy
++
++import (
++	"net"
++	"net/http"
++	"net/url"
++	"strings"
++)
++
++// rfcHopByHop is the RFC 7230 hop-by-hop header set. Headers listed inside
++// the Connection header are hop-by-hop for the current connection too.
++var rfcHopByHop = []string{
++	"Connection",
++	"Keep-Alive",
++	"Proxy-Connection",
++	"Proxy-Authenticate",
++	"Proxy-Authorization",
++	"Te",
++	"Trailer",
++	"Transfer-Encoding",
++	"Upgrade",
++}
++
++// StripHopByHop removes, in place, the RFC hop-by-hop headers plus every
++// header named inside the Connection value(s). End-to-end headers survive.
++func StripHopByHop(h http.Header) {
++	var listed []string
++	for _, v := range h.Values("Connection") {
++		for _, name := range strings.Split(v, ",") {
++			if name = strings.TrimSpace(name); name != "" {
++				listed = append(listed, name)
++			}
++		}
++	}
++	for _, name := range listed {
++		h.Del(name)
++	}
++	for _, name := range rfcHopByHop {
++		h.Del(name)
++	}
++}
++
++// RewriteRequest builds the outbound request for the upstream: a new request
++// (the inbound one is never mutated) retargeted at upstream's scheme/host,
++// with stripPrefix removed from the path on a segment boundary, forwarding
++// headers applied nginx-style, and hop-by-hop headers stripped.
++func RewriteRequest(in *http.Request, upstream *url.URL, stripPrefix string) *http.Request {
++	out := in.Clone(in.Context())
++
++	out.URL.Scheme = upstream.Scheme
++	out.URL.Host = upstream.Host
++	out.Host = upstream.Host
++	out.URL.Path = joinPath(upstream.Path, stripPath(in.URL.Path, stripPrefix))
++	out.URL.RawPath = ""
++	out.RequestURI = "" // client transports refuse requests with it set
++
++	// X-Forwarded-For: append the client ip to any list an earlier hop left.
++	client := in.RemoteAddr
++	if host, _, err := net.SplitHostPort(in.RemoteAddr); err == nil {
++		client = host
++	}
++	if prior := out.Header.Get("X-Forwarded-For"); prior != "" {
++		client = prior + ", " + client
++	}
++	out.Header.Set("X-Forwarded-For", client)
++
++	// Proto and host: the first hop wins, set only when absent.
++	if out.Header.Get("X-Forwarded-Proto") == "" {
++		proto := "http"
++		if in.TLS != nil {
++			proto = "https"
++		}
++		out.Header.Set("X-Forwarded-Proto", proto)
++	}
++	if out.Header.Get("X-Forwarded-Host") == "" {
++		out.Header.Set("X-Forwarded-Host", in.Host)
++	}
++
++	StripHopByHop(out.Header)
++	return out
++}
++
++// stripPath removes prefix from path only on a segment boundary:
++// /api strips /api/users and /api itself, but leaves /apiv2/users alone.
++func stripPath(path, prefix string) string {
++	if prefix == "" {
++		return path
++	}
++	switch {
++	case path == prefix:
++		return "/"
++	case strings.HasPrefix(path, prefix+"/"):
++		if rest := path[len(prefix):]; rest != "" {
++			return rest
++		}
++		return "/"
++	default:
++		return path
++	}
++}
++
++// joinPath glues the upstream's base path and the stripped path together
++// with exactly one slash between them.
++func joinPath(base, path string) string {
++	if base == "" {
++		return path
++	}
++	baseSlash := strings.HasSuffix(base, "/")
++	pathSlash := strings.HasPrefix(path, "/")
++	switch {
++	case baseSlash && pathSlash:
++		return base + path[1:]
++	case !baseSlash && !pathSlash:
++		return base + "/" + path
++	default:
++		return base + path
++	}
++}

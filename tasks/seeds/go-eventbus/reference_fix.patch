@@ -1,0 +1,182 @@
+diff --git a/bus.go b/bus.go
+new file mode 100644
+index 0000000..e45f687
+--- /dev/null
++++ b/bus.go
+@@ -0,0 +1,76 @@
++// Package eventbus is an in-memory, Kafka-shaped event bus for tests:
++// named topics backed by append-only logs, pull-based consumer groups with
++// per-(topic,group) cursors, and at-least-once redelivery until acked.
++package eventbus
++
++import (
++	"errors"
++	"sort"
++	"sync"
++)
++
++// Event is one delivered log entry.
++type Event struct {
++	Offset  int64
++	Payload []byte
++}
++
++// topicLog is a topic's append-only log plus its consumer-group cursors.
++type topicLog struct {
++	events  [][]byte         // index == offset
++	cursors map[string]int64 // group -> next offset to deliver
++}
++
++// Bus routes publishes and polls across topics. Safe for concurrent use.
++type Bus struct {
++	mu     sync.RWMutex
++	topics map[string]*topicLog
++}
++
++// NewBus returns an empty bus.
++func NewBus() *Bus {
++	return &Bus{topics: make(map[string]*topicLog)}
++}
++
++// Publish appends payload to the topic's log and returns its offset.
++// The payload is copied; callers may reuse their buffers.
++func (b *Bus) Publish(topic string, payload []byte) (int64, error) {
++	if topic == "" {
++		return 0, errors.New("eventbus: empty topic")
++	}
++	stored := make([]byte, len(payload))
++	copy(stored, payload)
++
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	tl := b.topics[topic]
++	if tl == nil {
++		tl = &topicLog{cursors: make(map[string]int64)}
++		b.topics[topic] = tl
++	}
++	off := int64(len(tl.events))
++	tl.events = append(tl.events, stored)
++	return off, nil
++}
++
++// Len reports how many events the topic holds (0 for unknown topics).
++func (b *Bus) Len(topic string) int64 {
++	b.mu.RLock()
++	defer b.mu.RUnlock()
++	if tl := b.topics[topic]; tl != nil {
++		return int64(len(tl.events))
++	}
++	return 0
++}
++
++// Topics lists every topic that has seen a publish, sorted ascending.
++func (b *Bus) Topics() []string {
++	b.mu.RLock()
++	defer b.mu.RUnlock()
++	out := make([]string, 0, len(b.topics))
++	for name := range b.topics {
++		out = append(out, name)
++	}
++	sort.Strings(out)
++	return out
++}
+diff --git a/consumer.go b/consumer.go
+new file mode 100644
+index 0000000..cf6da43
+--- /dev/null
++++ b/consumer.go
+@@ -0,0 +1,94 @@
++package eventbus
++
++import (
++	"errors"
++	"fmt"
++)
++
++// Poll returns up to max events for the group, starting at its cursor.
++// Unacked events are redelivered on the next poll (at-least-once). Polling
++// a topic nothing has been published to yields an empty result, not an
++// error, so consumers can start before producers.
++func (b *Bus) Poll(topic, group string, max int) ([]Event, error) {
++	if group == "" {
++		return nil, errors.New("eventbus: empty group")
++	}
++	if max < 1 {
++		return nil, fmt.Errorf("eventbus: Poll max must be at least 1, got %d", max)
++	}
++
++	b.mu.RLock()
++	defer b.mu.RUnlock()
++	tl := b.topics[topic]
++	if tl == nil {
++		return nil, nil
++	}
++	pos := tl.cursors[group] // absent group reads from 0
++	var out []Event
++	for off := pos; off < int64(len(tl.events)) && len(out) < max; off++ {
++		payload := make([]byte, len(tl.events[off]))
++		copy(payload, tl.events[off])
++		out = append(out, Event{Offset: off, Payload: payload})
++	}
++	return out, nil
++}
++
++// Ack commits every event up to and including offset through: the group's
++// next poll starts at through+1. Acking below the current commit point is a
++// no-op — cursors never move backwards via Ack. Acking an offset that was
++// never published (or a negative one) is an error and moves nothing.
++func (b *Bus) Ack(topic, group string, through int64) error {
++	if group == "" {
++		return errors.New("eventbus: empty group")
++	}
++	if through < 0 {
++		return fmt.Errorf("eventbus: Ack offset %d is negative", through)
++	}
++
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	tl := b.topics[topic]
++	if tl == nil || through >= int64(len(tl.events)) {
++		return fmt.Errorf("eventbus: Ack(%q, %q, %d): offset was never published", topic, group, through)
++	}
++	if next := through + 1; next > tl.cursors[group] {
++		tl.cursors[group] = next
++	}
++	return nil
++}
++
++// Seek moves the group's cursor so the next poll starts at offset. Offset
++// may be anywhere from 0 (full replay) to the topic length (skip to now).
++func (b *Bus) Seek(topic, group string, offset int64) error {
++	if group == "" {
++		return errors.New("eventbus: empty group")
++	}
++
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	tl := b.topics[topic]
++	var length int64
++	if tl != nil {
++		length = int64(len(tl.events))
++	}
++	if offset < 0 || offset > length {
++		return fmt.Errorf("eventbus: Seek(%q, %q, %d): offset outside [0, %d]", topic, group, offset, length)
++	}
++	if tl == nil {
++		// Seeking offset 0 on an unpublished topic: nothing to record yet.
++		return nil
++	}
++	tl.cursors[group] = offset
++	return nil
++}
++
++// Position reports where the group's cursor is: the offset its next poll
++// would deliver. Groups that have never polled or acked are at 0.
++func (b *Bus) Position(topic, group string) int64 {
++	b.mu.RLock()
++	defer b.mu.RUnlock()
++	if tl := b.topics[topic]; tl != nil {
++		return tl.cursors[group]
++	}
++	return 0
++}

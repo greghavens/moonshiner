@@ -1,0 +1,252 @@
+diff --git a/cpideploy/__init__.py b/cpideploy/__init__.py
+new file mode 100644
+index 0000000..f34a6bb
+--- /dev/null
++++ b/cpideploy/__init__.py
+@@ -0,0 +1 @@
++"""Deployer for SAP Cloud Integration design-time artifacts (OData API v2)."""
+diff --git a/cpideploy/artifacts.py b/cpideploy/artifacts.py
+new file mode 100644
+index 0000000..bf457cd
+--- /dev/null
++++ b/cpideploy/artifacts.py
+@@ -0,0 +1,103 @@
++"""Design-time artifact operations: list versions, upload, deploy-and-wait."""
++
++import base64
++import urllib.parse
++
++from .versions import is_at_least, parse_version
++
++BUILD_TERMINAL = {"SUCCESS", "FAIL", "FAIL_ON_LICENSE_ERROR"}
++RUNTIME_FINAL = {"STARTED", "ERROR"}
++POLL_INTERVAL_SECONDS = 5
++
++
++class VersionConflictError(Exception):
++    pass
++
++
++class DeploymentError(Exception):
++    pass
++
++
++def list_versions(client, artifact_id):
++    """All design-time versions of one artifact, oldest to newest."""
++    query = urllib.parse.quote("Id eq '%s'" % artifact_id, safe="'")
++    doc = client.get_json(
++        "/IntegrationDesigntimeArtifacts?$format=json&$filter=" + query
++    )
++    rows = (doc.get("d") or {}).get("results") or []
++    return sorted(rows, key=lambda r: parse_version(r.get("Version", "0")))
++
++
++def upload_new_version(client, artifact_id, name, version, content):
++    """Update the draft and save it as `version`, unless the tenant already
++    holds that version or a newer one — then nothing is written at all."""
++    for row in list_versions(client, artifact_id):
++        if is_at_least(row.get("Version", "0"), version):
++            raise VersionConflictError(
++                "tenant already has %s version %s; refusing to overwrite with %s"
++                % (artifact_id, row.get("Version"), version)
++            )
++    encoded = base64.b64encode(content).decode("ascii")
++    client.put(
++        "/IntegrationDesigntimeArtifacts(Id='%s',Version='active')" % artifact_id,
++        {"Name": name, "ArtifactContent": encoded},
++    )
++    client.post(
++        "/IntegrationDesigntimeArtifactSaveAsVersion?Id='%s'&SaveAsVersion='%s'"
++        % (artifact_id, version)
++    )
++    return {"id": artifact_id, "version": version, "uploaded": True}
++
++
++def _poll(client, path, field, terminal, wait, max_polls, describe):
++    for _ in range(max_polls):
++        doc = client.get_json(path)
++        status = (doc.get("d") or {}).get(field)
++        if status in terminal:
++            return status
++        wait(POLL_INTERVAL_SECONDS)
++    raise DeploymentError("%s never reached a terminal status after %d polls" % (describe, max_polls))
++
++
++def deploy_and_wait(client, artifact_id, version, wait, max_polls=10):
++    """Trigger the documented deploy action and follow it to a final answer."""
++    _, _, payload = client.post(
++        "/DeployIntegrationDesigntimeArtifact?Id='%s'&Version='%s'"
++        % (artifact_id, version)
++    )
++    task_id = payload.decode("utf-8").strip()
++    build_status = _poll(
++        client,
++        "/BuildAndDeployStatus(TaskId='%s')?$format=json" % task_id,
++        "Status",
++        BUILD_TERMINAL,
++        wait,
++        max_polls,
++        "build task %s" % task_id,
++    )
++    if build_status != "SUCCESS":
++        raise DeploymentError(
++            "deployment of %s %s failed with build status %s (task %s)"
++            % (artifact_id, version, build_status, task_id)
++        )
++    runtime_status = _poll(
++        client,
++        "/IntegrationRuntimeArtifacts('%s')?$format=json" % artifact_id,
++        "Status",
++        RUNTIME_FINAL,
++        wait,
++        max_polls,
++        "runtime artifact %s" % artifact_id,
++    )
++    if runtime_status == "ERROR":
++        detail = client.get_text(
++            "/IntegrationRuntimeArtifacts('%s')/ErrorInformation/$value" % artifact_id
++        )
++        raise DeploymentError(
++            "runtime artifact %s is in ERROR: %s" % (artifact_id, detail)
++        )
++    return {
++        "task_id": task_id,
++        "build_status": build_status,
++        "runtime_status": runtime_status,
++    }
+diff --git a/cpideploy/client.py b/cpideploy/client.py
+new file mode 100644
+index 0000000..5dd18cd
+--- /dev/null
++++ b/cpideploy/client.py
+@@ -0,0 +1,107 @@
++"""HTTP transport for the Cloud Integration OData API.
++
++Basic auth on every request; modifying calls carry the CSRF token and the
++session cookie obtained through the documented X-CSRF-Token: Fetch pre-flight.
++"""
++
++import base64
++import json
++import urllib.error
++import urllib.request
++
++_MODIFYING = ("POST", "PUT", "DELETE")
++
++
++class CpiApiError(Exception):
++    """OData error document from the tenant. Never contains credentials."""
++
++    def __init__(self, status, code, message_value, error_body):
++        super().__init__(
++            "SAP Cloud Integration API error %s (HTTP %d): %s" % (code, status, message_value)
++        )
++        self.status = status
++        self.code = code
++        self.message_value = message_value
++        self.error_body = error_body
++
++
++class CpiClient:
++    def __init__(self, base_url, user, password):
++        self.service_root = base_url.rstrip("/") + "/api/v1"
++        self._auth = "Basic " + base64.b64encode(
++            ("%s:%s" % (user, password)).encode()
++        ).decode()
++        self._csrf_token = None
++        self._cookie = None
++
++    # -- raw transport -----------------------------------------------------
++
++    def _send(self, method, url, headers, body=None):
++        req = urllib.request.Request(url, data=body, method=method)
++        req.add_header("Authorization", self._auth)
++        for k, v in headers.items():
++            req.add_header(k, v)
++        try:
++            resp = urllib.request.urlopen(req)
++            return resp.status, dict(resp.headers.items()), resp.read()
++        except urllib.error.HTTPError as e:
++            payload = e.read()
++            self._raise_odata_error(e.code, payload)
++            raise
++
++    def _raise_odata_error(self, status, payload):
++        try:
++            doc = json.loads(payload.decode("utf-8"))
++        except (UnicodeDecodeError, ValueError):
++            doc = None
++        if isinstance(doc, dict) and isinstance(doc.get("error"), dict):
++            err = doc["error"]
++            message = err.get("message") or {}
++            raise CpiApiError(status, err.get("code"), message.get("value", ""), err)
++        raise CpiApiError(status, "HTTP_%d" % status, "", {})
++
++    def _url(self, path):
++        return self.service_root + (path if path.startswith("/") else "/" + path)
++
++    # -- CSRF --------------------------------------------------------------
++
++    def _ensure_csrf(self):
++        if self._csrf_token is not None:
++            return
++        # Documented flow: a GET with X-CSRF-Token: Fetch answers with the
++        # token header and the session cookie for the modifying call.
++        status, headers, _ = self._send(
++            "GET", self.service_root + "/", {"X-CSRF-Token": "Fetch"}
++        )
++        lower = {k.lower(): v for k, v in headers.items()}
++        self._csrf_token = lower.get("x-csrf-token")
++        set_cookie = lower.get("set-cookie")
++        if set_cookie:
++            self._cookie = set_cookie.split(";", 1)[0]
++
++    # -- public verbs --------------------------------------------------------
++
++    def get_json(self, path):
++        _, _, payload = self._send("GET", self._url(path), {"Accept": "application/json"})
++        return json.loads(payload.decode("utf-8"))
++
++    def get_text(self, path):
++        _, _, payload = self._send("GET", self._url(path), {})
++        return payload.decode("utf-8")
++
++    def _modify(self, method, path, body):
++        self._ensure_csrf()
++        headers = {"Accept": "application/json", "X-CSRF-Token": self._csrf_token}
++        if self._cookie:
++            headers["Cookie"] = self._cookie
++        data = None
++        if body is not None:
++            data = json.dumps(body).encode("utf-8")
++            headers["Content-Type"] = "application/json"
++        return self._send(method, self._url(path), headers, data)
++
++    def post(self, path, body=None):
++        return self._modify("POST", path, body)
++
++    def put(self, path, body=None):
++        return self._modify("PUT", path, body)
+diff --git a/cpideploy/versions.py b/cpideploy/versions.py
+new file mode 100644
+index 0000000..d8e7d36
+--- /dev/null
++++ b/cpideploy/versions.py
+@@ -0,0 +1,17 @@
++"""Dotted-numeric artifact version handling ('1.10.0' is newer than '1.9.0')."""
++
++
++def parse_version(text):
++    parts = []
++    for seg in str(text).split("."):
++        parts.append(int(seg) if seg.isdigit() else 0)
++    return tuple(parts)
++
++
++def is_at_least(candidate, target):
++    """candidate >= target under numeric per-segment comparison."""
++    a, b = parse_version(candidate), parse_version(target)
++    length = max(len(a), len(b))
++    a += (0,) * (length - len(a))
++    b += (0,) * (length - len(b))
++    return a >= b

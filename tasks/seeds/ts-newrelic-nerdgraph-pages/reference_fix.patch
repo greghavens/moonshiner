@@ -1,0 +1,248 @@
+diff --git a/src/client.ts b/src/client.ts
+new file mode 100644
+index 0000000..3ee78a3
+--- /dev/null
++++ b/src/client.ts
+@@ -0,0 +1,69 @@
++import { regionEndpoint } from "./regions.ts";
++import { NerdGraphHttpError } from "./errors.ts";
++
++export type Sleeper = (ms: number) => Promise<void>;
++
++export interface ClientOptions {
++  apiKey: string;
++  region?: string;
++  endpointUrl?: string;
++  sleeper: Sleeper;
++  maxAttempts?: number;
++  baseDelayMs?: number;
++}
++
++export interface GraphQLEnvelope {
++  data?: unknown;
++  errors?: unknown[];
++}
++
++/**
++ * NerdGraph transport: POSTs {query, variables} with the user key in the
++ * documented API-Key header. 429 (the documented concurrency-limit
++ * rejection) backs off through the injected sleeper and retries; every
++ * other non-2xx status surfaces immediately. The key never travels in a
++ * URL, a Bearer header, or an error message.
++ */
++export class NerdGraphClient {
++  endpoint: string;
++  #apiKey: string;
++  #sleeper: Sleeper;
++  #maxAttempts: number;
++  #baseDelayMs: number;
++
++  constructor(options: ClientOptions) {
++    if (!options.endpointUrl && !options.region) {
++      throw new Error("either endpointUrl or region is required");
++    }
++    this.endpoint = options.endpointUrl ?? regionEndpoint(options.region!);
++    this.#apiKey = options.apiKey;
++    this.#sleeper = options.sleeper;
++    this.#maxAttempts = options.maxAttempts ?? 4;
++    this.#baseDelayMs = options.baseDelayMs ?? 1000;
++  }
++
++  async execute(query: string, variables: Record<string, unknown>): Promise<GraphQLEnvelope> {
++    for (let attempt = 1; ; attempt++) {
++      const response = await fetch(this.endpoint, {
++        method: "POST",
++        headers: {
++          "API-Key": this.#apiKey,
++          "Content-Type": "application/json",
++        },
++        body: JSON.stringify({ query, variables }),
++      });
++      const text = await response.text();
++      if (response.status === 429) {
++        if (attempt >= this.#maxAttempts) {
++          throw new NerdGraphHttpError(429, text);
++        }
++        await this.#sleeper(this.#baseDelayMs * 2 ** (attempt - 1));
++        continue;
++      }
++      if (!response.ok) {
++        throw new NerdGraphHttpError(response.status, text);
++      }
++      return JSON.parse(text) as GraphQLEnvelope;
++    }
++  }
++}
+diff --git a/src/errors.ts b/src/errors.ts
+new file mode 100644
+index 0000000..5617f1d
+--- /dev/null
++++ b/src/errors.ts
+@@ -0,0 +1,34 @@
++export interface GraphQLErrorEntry {
++  message?: string;
++  path?: unknown[];
++  extensions?: { errorClass?: string };
++}
++
++/** Non-2xx NerdGraph response. Carries status and raw body, never the key. */
++export class NerdGraphHttpError extends Error {
++  status: number;
++  body: string;
++
++  constructor(status: number, body: string) {
++    super(`NerdGraph request failed with HTTP ${status}`);
++    this.name = "NerdGraphHttpError";
++    this.status = status;
++    this.body = body;
++  }
++}
++
++/** A GraphQL response with errors and no usable data. */
++export class NerdGraphQueryError extends Error {
++  errors: GraphQLErrorEntry[];
++  errorClasses: string[];
++
++  constructor(errors: GraphQLErrorEntry[]) {
++    const messages = errors.map((e) => e?.message).filter(Boolean);
++    super(`NerdGraph query failed: ${messages.join("; ") || "no usable data returned"}`);
++    this.name = "NerdGraphQueryError";
++    this.errors = errors;
++    this.errorClasses = errors
++      .map((e) => e?.extensions?.errorClass)
++      .filter((c): c is string => typeof c === "string");
++  }
++}
+diff --git a/src/index.ts b/src/index.ts
+new file mode 100644
+index 0000000..2b75264
+--- /dev/null
++++ b/src/index.ts
+@@ -0,0 +1,4 @@
++export { regionEndpoint } from "./regions.ts";
++export { NerdGraphClient } from "./client.ts";
++export { EntityInventory } from "./inventory.ts";
++export { NerdGraphHttpError, NerdGraphQueryError } from "./errors.ts";
+diff --git a/src/inventory.ts b/src/inventory.ts
+new file mode 100644
+index 0000000..0a08515
+--- /dev/null
++++ b/src/inventory.ts
+@@ -0,0 +1,98 @@
++import { NerdGraphClient } from "./client.ts";
++import { NerdGraphQueryError, type GraphQLErrorEntry } from "./errors.ts";
++
++export interface Entity {
++  guid: string;
++  name: string;
++  entityType: string;
++  domain: string;
++  accountId: number;
++  reporting?: boolean;
++  tags?: Array<{ key: string; values: string[] }>;
++}
++
++export interface InventoryResult {
++  entities: Entity[];
++  warnings: Array<{ message: string | undefined; errorClass: string | null }>;
++}
++
++// One document for every page: the search string and the cursor travel as
++// variables, never spliced into the text. NerdGraph caps a page at 200
++// entities; traversal follows nextCursor until it is null.
++const SEARCH_DOCUMENT = `query EntityInventory($query: String!, $cursor: String) {
++  actor {
++    entitySearch(query: $query) {
++      results(cursor: $cursor) {
++        entities {
++          guid
++          name
++          entityType
++          domain
++          accountId
++          reporting
++          tags {
++            key
++            values
++          }
++        }
++        nextCursor
++      }
++    }
++  }
++}`;
++
++interface SearchResults {
++  entities?: Entity[];
++  nextCursor?: string | null;
++}
++
++export class EntityInventory {
++  #client: NerdGraphClient;
++
++  constructor(options: { client: NerdGraphClient }) {
++    this.#client = options.client;
++  }
++
++  async collect(searchQuery: string): Promise<InventoryResult> {
++    const entities: Entity[] = [];
++    const warnings: InventoryResult["warnings"] = [];
++    let cursor: string | null = null;
++
++    for (;;) {
++      const variables: Record<string, unknown> = { query: searchQuery };
++      if (cursor !== null) {
++        variables.cursor = cursor;
++      }
++      const envelope = await this.#client.execute(SEARCH_DOCUMENT, variables);
++      const errors = Array.isArray(envelope.errors)
++        ? (envelope.errors as GraphQLErrorEntry[])
++        : [];
++      const results = extractResults(envelope.data);
++      if (!results) {
++        throw new NerdGraphQueryError(errors);
++      }
++      for (const error of errors) {
++        warnings.push({
++          message: error?.message,
++          errorClass: error?.extensions?.errorClass ?? null,
++        });
++      }
++      entities.push(...(results.entities ?? []));
++      if (!results.nextCursor) {
++        return { entities, warnings };
++      }
++      cursor = results.nextCursor;
++    }
++  }
++}
++
++function extractResults(data: unknown): SearchResults | null {
++  if (typeof data !== "object" || data === null) return null;
++  const actor = (data as Record<string, unknown>).actor;
++  if (typeof actor !== "object" || actor === null) return null;
++  const search = (actor as Record<string, unknown>).entitySearch;
++  if (typeof search !== "object" || search === null) return null;
++  const results = (search as Record<string, unknown>).results;
++  if (typeof results !== "object" || results === null) return null;
++  return results as SearchResults;
++}
+diff --git a/src/regions.ts b/src/regions.ts
+new file mode 100644
+index 0000000..c8741cf
+--- /dev/null
++++ b/src/regions.ts
+@@ -0,0 +1,13 @@
++const REGION_ENDPOINTS: Record<string, string> = {
++  US: "https://api.newrelic.com/graphql",
++  EU: "https://api.eu.newrelic.com/graphql",
++};
++
++export function regionEndpoint(region: string): string {
++  const endpoint = REGION_ENDPOINTS[region];
++  if (!endpoint) {
++    const valid = Object.keys(REGION_ENDPOINTS).join(", ");
++    throw new Error(`unknown New Relic region "${region}" (valid regions: ${valid})`);
++  }
++  return endpoint;
++}

@@ -1,0 +1,769 @@
+diff --git a/exec.go b/exec.go
+new file mode 100644
+index 0000000..3a6d976
+--- /dev/null
++++ b/exec.go
+@@ -0,0 +1,202 @@
++package buildgraph
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"sort"
++)
++
++// ActionFunc builds one target. It must create tc.OutPath.
++type ActionFunc func(tc *TaskContext) error
++
++// TaskContext is everything an action gets to look at.
++type TaskContext struct {
++	Label      string   // the target being built
++	Inputs     []string // absolute input paths, declaration order
++	DepOutputs []string // absolute dep output paths, sorted by dep label
++	OutPath    string   // where the action must write its output
++}
++
++// Options configures an Executor.
++type Options struct {
++	Workers int                   // max actions in flight; at least 1
++	Actions map[string]ActionFunc // action name -> implementation
++}
++
++// Executor runs targets with content-hash incrementality and early cutoff.
++type Executor struct {
++	ws   *Workspace
++	opts Options
++}
++
++// Report says what one Execute call did. Both lists are sorted.
++type Report struct {
++	Ran      []string // targets whose action ran
++	UpToDate []string // targets skipped because their records still match
++}
++
++// NewExecutor validates opts against ws up front: Workers must be at least 1
++// and every action referenced by any target must be registered.
++func NewExecutor(ws *Workspace, opts Options) (*Executor, error) {
++	if opts.Workers < 1 {
++		return nil, fmt.Errorf("workers must be at least 1, got %d", opts.Workers)
++	}
++	for _, label := range ws.labels {
++		t := ws.targets[label]
++		if _, ok := opts.Actions[t.Action]; !ok {
++			return nil, fmt.Errorf("target %s: no action %q registered", label, t.Action)
++		}
++	}
++	return &Executor{ws: ws, opts: opts}, nil
++}
++
++// taskResult is what one worker hands back to the scheduling loop.
++type taskResult struct {
++	label   string
++	ran     bool   // action executed (vs. skipped as up to date)
++	outHash string // current output hash either way
++	newRec  record // replacement state record when ran
++	err     error
++}
++
++// Execute brings label and everything it depends on up to date, running at
++// most Workers actions concurrently. The report is non-nil even on error,
++// and state is saved even on error so the next run resumes past survivors.
++func (e *Executor) Execute(label string) (*Report, error) {
++	rep := &Report{}
++	order, err := e.ws.cone(label)
++	if err != nil {
++		return rep, err
++	}
++	state := loadState(e.ws.statePath())
++	outHash := make(map[string]string, len(order)) // finished label -> hash
++
++	remaining := make(map[string]int, len(order))
++	dependents := map[string][]string{}
++	var ready []string
++	for _, l := range order {
++		remaining[l] = len(e.ws.targets[l].Deps)
++		for _, dep := range e.ws.targets[l].Deps {
++			dependents[dep] = append(dependents[dep], l)
++		}
++		if remaining[l] == 0 {
++			ready = append(ready, l)
++		}
++	}
++	sort.Strings(ready)
++
++	results := make(chan taskResult)
++	active := 0
++	var firstErr error
++
++	// launch snapshots everything a worker needs while still on the
++	// scheduler goroutine, so workers never share mutable state.
++	launch := func(l string) {
++		t := e.ws.targets[l]
++		rec, hasRec := state[l]
++		depHashes := make(map[string]string, len(t.Deps))
++		for _, dep := range t.Deps {
++			depHashes[dep] = outHash[dep]
++		}
++		go func() {
++			results <- e.runOne(l, t, rec, hasRec, depHashes)
++		}()
++	}
++
++	for {
++		for firstErr == nil && active < e.opts.Workers && len(ready) > 0 {
++			launch(ready[0])
++			ready = ready[1:]
++			active++
++		}
++		if active == 0 {
++			break
++		}
++		r := <-results
++		active--
++		if r.err != nil {
++			if firstErr == nil {
++				firstErr = r.err
++			}
++			continue
++		}
++		outHash[r.label] = r.outHash
++		if r.ran {
++			state[r.label] = r.newRec
++			rep.Ran = append(rep.Ran, r.label)
++		} else {
++			rep.UpToDate = append(rep.UpToDate, r.label)
++		}
++		grew := false
++		for _, dep := range dependents[r.label] {
++			remaining[dep]--
++			if remaining[dep] == 0 {
++				ready = append(ready, dep)
++				grew = true
++			}
++		}
++		if grew {
++			sort.Strings(ready)
++		}
++	}
++
++	sort.Strings(rep.Ran)
++	sort.Strings(rep.UpToDate)
++	if err := saveState(e.ws.statePath(), state); err != nil && firstErr == nil {
++		firstErr = err
++	}
++	return rep, firstErr
++}
++
++// runOne decides skip-vs-run for one target and runs its action if needed.
++// Everything it touches arrived as a snapshot, so concurrent calls are
++// independent. Freshness is content hashes only; mtimes never matter, and
++// depHashes holds the deps' post-run hashes, which is what makes early
++// cutoff work: a dep that reran but reproduced identical bytes still counts
++// as unchanged here.
++func (e *Executor) runOne(label string, t *Target, rec record, hasRec bool, depHashes map[string]string) taskResult {
++	inputs, err := e.ws.hashInputs(label, t)
++	if err != nil {
++		return taskResult{label: label, err: err}
++	}
++	outPath := e.ws.OutPath(label)
++	if hasRec && sameHashes(inputs, rec.Inputs) && sameHashes(depHashes, rec.Deps) {
++		h, ok, err := hashFile(outPath)
++		if err != nil {
++			return taskResult{label: label, err: fmt.Errorf("target %s: %w", label, err)}
++		}
++		if ok && h == rec.Out {
++			return taskResult{label: label, outHash: h}
++		}
++	}
++
++	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
++		return taskResult{label: label, err: fmt.Errorf("target %s: %w", label, err)}
++	}
++	tc := &TaskContext{Label: label, OutPath: outPath}
++	for _, in := range t.Inputs {
++		tc.Inputs = append(tc.Inputs, e.ws.inputPath(t, in))
++	}
++	depLabels := append([]string(nil), t.Deps...)
++	sort.Strings(depLabels)
++	for _, dep := range depLabels {
++		tc.DepOutputs = append(tc.DepOutputs, e.ws.OutPath(dep))
++	}
++	if err := e.opts.Actions[t.Action](tc); err != nil {
++		return taskResult{label: label, err: fmt.Errorf("target %s: %w", label, err)}
++	}
++	h, ok, err := hashFile(outPath)
++	if err != nil {
++		return taskResult{label: label, err: fmt.Errorf("target %s: %w", label, err)}
++	}
++	if !ok {
++		return taskResult{label: label, err: fmt.Errorf("target %s: action %q wrote no output at %s", label, t.Action, outPath)}
++	}
++	return taskResult{
++		label:   label,
++		ran:     true,
++		outHash: h,
++		newRec:  record{Inputs: inputs, Deps: depHashes, Out: h},
++	}
++}
+diff --git a/graph.go b/graph.go
+new file mode 100644
+index 0000000..6a8b0d9
+--- /dev/null
++++ b/graph.go
+@@ -0,0 +1,135 @@
++package buildgraph
++
++import (
++	"fmt"
++	"sort"
++	"strings"
++)
++
++// checkDeps verifies every dependency names a declared target.
++func (w *Workspace) checkDeps() error {
++	for _, label := range w.labels {
++		for _, dep := range w.targets[label].Deps {
++			if _, ok := w.targets[dep]; !ok {
++				return fmt.Errorf("target %s depends on unknown target %s", label, dep)
++			}
++		}
++	}
++	return nil
++}
++
++// checkAcyclic rejects dependency cycles. The reported cycle lists its
++// members in edge order starting from the lexicographically smallest one,
++// with the first label repeated at the end.
++func (w *Workspace) checkAcyclic() error {
++	const (
++		white = iota // untouched
++		grey         // on the current DFS stack
++		black        // fully explored
++	)
++	color := make(map[string]int, len(w.labels))
++	var stack, cycle []string
++
++	var visit func(label string) bool // reports "cycle found"
++	visit = func(label string) bool {
++		color[label] = grey
++		stack = append(stack, label)
++		deps := append([]string(nil), w.targets[label].Deps...)
++		sort.Strings(deps)
++		for _, dep := range deps {
++			switch color[dep] {
++			case white:
++				if visit(dep) {
++					return true
++				}
++			case grey:
++				for i, on := range stack {
++					if on == dep {
++						cycle = append(cycle, stack[i:]...)
++						break
++					}
++				}
++				return true
++			}
++		}
++		stack = stack[:len(stack)-1]
++		color[label] = black
++		return false
++	}
++
++	for _, label := range w.labels {
++		if color[label] == white && visit(label) {
++			return fmt.Errorf("dependency cycle: %s", formatCycle(cycle))
++		}
++	}
++	return nil
++}
++
++// formatCycle rotates the cycle to start at its smallest member and closes
++// the loop: "a:one -> b:two -> a:one".
++func formatCycle(cycle []string) string {
++	min := 0
++	for i, label := range cycle {
++		if label < cycle[min] {
++			min = i
++		}
++	}
++	rotated := append(append([]string(nil), cycle[min:]...), cycle[:min]...)
++	rotated = append(rotated, rotated[0])
++	return strings.Join(rotated, " -> ")
++}
++
++// cone returns label plus everything it depends on, in execution order:
++// dependencies before dependents, lexicographic among the ready set.
++func (w *Workspace) cone(label string) ([]string, error) {
++	if _, ok := w.targets[label]; !ok {
++		return nil, fmt.Errorf("unknown target %s", label)
++	}
++	inCone := map[string]bool{}
++	var collect func(string)
++	collect = func(l string) {
++		if inCone[l] {
++			return
++		}
++		inCone[l] = true
++		for _, dep := range w.targets[l].Deps {
++			collect(dep)
++		}
++	}
++	collect(label)
++
++	remaining := make(map[string]int, len(inCone))
++	dependents := map[string][]string{}
++	var ready []string
++	for l := range inCone {
++		remaining[l] = len(w.targets[l].Deps)
++		for _, dep := range w.targets[l].Deps {
++			dependents[dep] = append(dependents[dep], l)
++		}
++	}
++	for l := range inCone {
++		if remaining[l] == 0 {
++			ready = append(ready, l)
++		}
++	}
++	sort.Strings(ready)
++
++	order := make([]string, 0, len(inCone))
++	for len(ready) > 0 {
++		l := ready[0]
++		ready = ready[1:]
++		order = append(order, l)
++		grew := false
++		for _, dep := range dependents[l] {
++			remaining[dep]--
++			if remaining[dep] == 0 {
++				ready = append(ready, dep)
++				grew = true
++			}
++		}
++		if grew {
++			sort.Strings(ready)
++		}
++	}
++	return order, nil
++}
+diff --git a/manifest.go b/manifest.go
+new file mode 100644
+index 0000000..2c36712
+--- /dev/null
++++ b/manifest.go
+@@ -0,0 +1,78 @@
++package buildgraph
++
++import (
++	"bytes"
++	"encoding/json"
++	"fmt"
++	"os"
++	"path"
++	"strings"
++)
++
++const manifestName = "build.json"
++
++// manifestTarget is one entry in a build.json "targets" list.
++type manifestTarget struct {
++	Name   string   `json:"name"`
++	Action string   `json:"action"`
++	Inputs []string `json:"inputs"`
++	Deps   []string `json:"deps"`
++}
++
++type manifest struct {
++	Targets []manifestTarget `json:"targets"`
++}
++
++// readManifest parses and validates one build.json. rel is the manifest's
++// path relative to the workspace root and prefixes every error it reports.
++func readManifest(absPath, rel string) (*manifest, error) {
++	raw, err := os.ReadFile(absPath)
++	if err != nil {
++		return nil, fmt.Errorf("%s: %w", rel, err)
++	}
++	dec := json.NewDecoder(bytes.NewReader(raw))
++	dec.DisallowUnknownFields()
++	var m manifest
++	if err := dec.Decode(&m); err != nil {
++		return nil, fmt.Errorf("%s: %w", rel, err)
++	}
++	seen := make(map[string]bool, len(m.Targets))
++	for _, t := range m.Targets {
++		if t.Name == "" || strings.ContainsAny(t.Name, ":/") {
++			return nil, fmt.Errorf("%s: invalid target name %q", rel, t.Name)
++		}
++		if seen[t.Name] {
++			return nil, fmt.Errorf("%s: duplicate target %q", rel, t.Name)
++		}
++		seen[t.Name] = true
++		if t.Action == "" {
++			return nil, fmt.Errorf("%s: target %q: missing action", rel, t.Name)
++		}
++		for _, in := range t.Inputs {
++			if !inputOK(in) {
++				return nil, fmt.Errorf("%s: target %q: invalid input %q", rel, t.Name, in)
++			}
++		}
++	}
++	return &m, nil
++}
++
++// inputOK reports whether a declared input path is relative and stays inside
++// its package directory.
++func inputOK(in string) bool {
++	if in == "" || path.IsAbs(in) {
++		return false
++	}
++	clean := path.Clean(in)
++	return clean != ".." && !strings.HasPrefix(clean, "../")
++}
++
++// canonicalLabel resolves a dependency reference written in pkg's manifest:
++// a bare "name" belongs to pkg itself, anything with a colon (":name" for the
++// root package, "pkg/path:name" fully qualified) is already a label.
++func canonicalLabel(pkg, dep string) string {
++	if !strings.Contains(dep, ":") {
++		return pkg + ":" + dep
++	}
++	return dep
++}
+diff --git a/plan.go b/plan.go
+new file mode 100644
+index 0000000..1b13be5
+--- /dev/null
++++ b/plan.go
+@@ -0,0 +1,92 @@
++package buildgraph
++
++import "strings"
++
++// Step is one entry in a dry-run plan.
++type Step struct {
++	Label string
++	Run   bool
++}
++
++// Plan reports, in execution order, what Execute(label) would do right now.
++// It is read-only: no actions run, nothing is written, out/ is not created.
++//
++// Planning is pessimistic about propagation: a target whose dependency is
++// planned to run is planned to run too, even though Execute's fresh-output
++// comparison may later prove the rebuild unnecessary (early cutoff).
++func (e *Executor) Plan(label string) ([]Step, error) {
++	order, err := e.ws.cone(label)
++	if err != nil {
++		return nil, err
++	}
++	state := loadState(e.ws.statePath())
++	willRun := make(map[string]bool, len(order))
++	steps := make([]Step, 0, len(order))
++	for _, l := range order {
++		t := e.ws.targets[l]
++		inputs, err := e.ws.hashInputs(l, t)
++		if err != nil {
++			return nil, err
++		}
++		run := false
++		for _, dep := range t.Deps {
++			if willRun[dep] {
++				run = true
++				break
++			}
++		}
++		if !run {
++			fresh, err := e.recordCurrent(l, t, inputs, state)
++			if err != nil {
++				return nil, err
++			}
++			run = !fresh
++		}
++		willRun[l] = run
++		steps = append(steps, Step{Label: l, Run: run})
++	}
++	return steps, nil
++}
++
++// recordCurrent reports whether l's state record still matches the tree:
++// same input hashes, same dep-output hashes, own output present and intact.
++func (e *Executor) recordCurrent(l string, t *Target, inputs map[string]string, state map[string]record) (bool, error) {
++	rec, ok := state[l]
++	if !ok || !sameHashes(inputs, rec.Inputs) {
++		return false, nil
++	}
++	depHashes := make(map[string]string, len(t.Deps))
++	for _, dep := range t.Deps {
++		h, ok, err := hashFile(e.ws.OutPath(dep))
++		if err != nil {
++			return false, err
++		}
++		if !ok {
++			return false, nil
++		}
++		depHashes[dep] = h
++	}
++	if !sameHashes(depHashes, rec.Deps) {
++		return false, nil
++	}
++	h, ok, err := hashFile(e.ws.OutPath(l))
++	if err != nil {
++		return false, err
++	}
++	return ok && h == rec.Out, nil
++}
++
++// FormatPlan renders steps one per line: "run <label>" or "skip <label>".
++func FormatPlan(steps []Step) string {
++	var b strings.Builder
++	for _, s := range steps {
++		if s.Run {
++			b.WriteString("run ")
++		} else {
++			b.WriteString("skip ")
++		}
++		b.WriteString(s.Label)
++		b.WriteByte('\n')
++	}
++	return b.String()
++}
+diff --git a/state.go b/state.go
+new file mode 100644
+index 0000000..b9d6171
+--- /dev/null
++++ b/state.go
+@@ -0,0 +1,93 @@
++package buildgraph
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io/fs"
++	"os"
++	"path/filepath"
++)
++
++// record captures the content hashes a target was last built against. A
++// target whose record still matches the tree is up to date.
++type record struct {
++	Inputs map[string]string `json:"inputs"` // declared input -> content hash
++	Deps   map[string]string `json:"deps"`   // dep label -> its output hash
++	Out    string            `json:"out"`    // own output hash
++}
++
++type stateDoc struct {
++	Targets map[string]record `json:"targets"`
++}
++
++// loadState reads out/state.json. Any problem — missing file, junk bytes —
++// just means "no prior state": the cost is a full rebuild, never an error.
++func loadState(path string) map[string]record {
++	raw, err := os.ReadFile(path)
++	if err != nil {
++		return map[string]record{}
++	}
++	var doc stateDoc
++	if err := json.Unmarshal(raw, &doc); err != nil || doc.Targets == nil {
++		return map[string]record{}
++	}
++	return doc.Targets
++}
++
++func saveState(path string, targets map[string]record) error {
++	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
++		return err
++	}
++	raw, err := json.MarshalIndent(stateDoc{Targets: targets}, "", "  ")
++	if err != nil {
++		return err
++	}
++	return os.WriteFile(path, raw, 0o644)
++}
++
++// hashFile returns the content hash of path; ok is false when the file does
++// not exist (which is a freshness miss, not an error).
++func hashFile(path string) (hash string, ok bool, err error) {
++	raw, err := os.ReadFile(path)
++	if errors.Is(err, fs.ErrNotExist) {
++		return "", false, nil
++	}
++	if err != nil {
++		return "", false, err
++	}
++	sum := sha256.Sum256(raw)
++	return hex.EncodeToString(sum[:]), true, nil
++}
++
++// hashInputs hashes every declared input of t. A missing input is a hard
++// error naming the target and the path.
++func (w *Workspace) hashInputs(label string, t *Target) (map[string]string, error) {
++	hashes := make(map[string]string, len(t.Inputs))
++	for _, in := range t.Inputs {
++		p := w.inputPath(t, in)
++		h, ok, err := hashFile(p)
++		if err != nil {
++			return nil, fmt.Errorf("target %s: reading input %s: %w", label, p, err)
++		}
++		if !ok {
++			return nil, fmt.Errorf("target %s: missing input %s", label, p)
++		}
++		hashes[in] = h
++	}
++	return hashes, nil
++}
++
++func sameHashes(a, b map[string]string) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for k, v := range a {
++		if b[k] != v {
++			return false
++		}
++	}
++	return true
++}
+diff --git a/workspace.go b/workspace.go
+new file mode 100644
+index 0000000..6e627c2
+--- /dev/null
++++ b/workspace.go
+@@ -0,0 +1,133 @@
++// Package buildgraph loads target graphs from build.json manifests and runs
++// them with content-hash incrementality and a bounded worker pool.
++package buildgraph
++
++import (
++	"io/fs"
++	"path/filepath"
++	"sort"
++	"strings"
++)
++
++// Target is one buildable unit declared in a manifest.
++type Target struct {
++	Name   string   // manifest-local name
++	Action string   // registered action that builds it
++	Inputs []string // source files, exactly as declared (package-relative)
++	Deps   []string // dependencies, canonicalized to full labels
++
++	pkg string // package this target belongs to ("" for the root)
++}
++
++// Workspace is a validated, acyclic target graph loaded from a source tree.
++type Workspace struct {
++	root    string
++	targets map[string]*Target
++	labels  []string // every label, sorted
++}
++
++// LoadWorkspace walks root for build.json manifests (skipping root's out/
++// directory, which holds build products), validates them, canonicalizes
++// dependency labels, and rejects unknown deps and cycles.
++func LoadWorkspace(root string) (*Workspace, error) {
++	abs, err := filepath.Abs(root)
++	if err != nil {
++		return nil, err
++	}
++	ws := &Workspace{root: abs, targets: map[string]*Target{}}
++	outDir := filepath.Join(abs, "out")
++	err = filepath.WalkDir(abs, func(p string, d fs.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++		if d.IsDir() {
++			if p == outDir {
++				return filepath.SkipDir
++			}
++			return nil
++		}
++		if d.Name() != manifestName {
++			return nil
++		}
++		rel, err := filepath.Rel(abs, p)
++		if err != nil {
++			return err
++		}
++		return ws.addManifest(p, filepath.ToSlash(rel))
++	})
++	if err != nil {
++		return nil, err
++	}
++	for label := range ws.targets {
++		ws.labels = append(ws.labels, label)
++	}
++	sort.Strings(ws.labels)
++	if err := ws.checkDeps(); err != nil {
++		return nil, err
++	}
++	if err := ws.checkAcyclic(); err != nil {
++		return nil, err
++	}
++	return ws, nil
++}
++
++// addManifest reads one manifest (rel is root-relative, slash-separated) and
++// registers its targets.
++func (w *Workspace) addManifest(absPath, rel string) error {
++	m, err := readManifest(absPath, rel)
++	if err != nil {
++		return err
++	}
++	pkg := strings.TrimSuffix(rel, manifestName)
++	pkg = strings.TrimSuffix(pkg, "/")
++	for _, mt := range m.Targets {
++		t := &Target{Name: mt.Name, Action: mt.Action, Inputs: mt.Inputs, pkg: pkg}
++		seen := make(map[string]bool, len(mt.Deps))
++		for _, dep := range mt.Deps {
++			label := canonicalLabel(pkg, dep)
++			if !seen[label] {
++				seen[label] = true
++				t.Deps = append(t.Deps, label)
++			}
++		}
++		w.targets[pkg+":"+mt.Name] = t
++	}
++	return nil
++}
++
++// Targets returns every label in the workspace, sorted.
++func (w *Workspace) Targets() []string {
++	out := make([]string, len(w.labels))
++	copy(out, w.labels)
++	return out
++}
++
++// Target looks up one target by label.
++func (w *Workspace) Target(label string) (*Target, bool) {
++	t, ok := w.targets[label]
++	return t, ok
++}
++
++// OutPath is where label's build output lives: <root>/out/<package>/<name>.
++func (w *Workspace) OutPath(label string) string {
++	pkg, name := splitLabel(label)
++	return filepath.Join(w.root, "out", filepath.FromSlash(pkg), name)
++}
++
++func splitLabel(label string) (pkg, name string) {
++	i := strings.LastIndex(label, ":")
++	if i < 0 {
++		return "", label
++	}
++	return label[:i], label[i+1:]
++}
++
++// inputPath resolves one of t's declared inputs to an absolute path.
++func (w *Workspace) inputPath(t *Target, in string) string {
++	return filepath.Join(w.root, filepath.FromSlash(t.pkg), filepath.FromSlash(in))
++}
++
++// statePath is where Execute persists its incremental-build records.
++func (w *Workspace) statePath() string {
++	return filepath.Join(w.root, "out", "state.json")
++}

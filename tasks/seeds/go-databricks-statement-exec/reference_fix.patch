@@ -1,0 +1,342 @@
+diff --git a/client.go b/client.go
+new file mode 100644
+index 0000000..61dcef5
+--- /dev/null
++++ b/client.go
+@@ -0,0 +1,336 @@
++// Package dbsql is a client for the Databricks SQL Statement Execution API
++// 2.0: submit a statement against a SQL warehouse, poll it to a terminal
++// state, and assemble INLINE or EXTERNAL_LINKS results while preserving the
++// manifest schema and string-encoded typed values.
++package dbsql
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"time"
++)
++
++const statementsPath = "/api/2.0/sql/statements"
++
++// Config configures a Client. Sleep and PollInterval exist so tests can
++// inject waiting; HTTPClient defaults to http.DefaultClient.
++type Config struct {
++	BaseURL      string
++	Token        string
++	HTTPClient   *http.Client
++	Sleep        func(time.Duration)
++	PollInterval time.Duration
++}
++
++type Client struct {
++	base  string
++	token string
++	http  *http.Client
++	sleep func(time.Duration)
++	poll  time.Duration
++}
++
++func New(cfg Config) (*Client, error) {
++	if cfg.BaseURL == "" || cfg.Token == "" {
++		return nil, errors.New("dbsql: BaseURL and Token are required")
++	}
++	hc := cfg.HTTPClient
++	if hc == nil {
++		hc = http.DefaultClient
++	}
++	sl := cfg.Sleep
++	if sl == nil {
++		sl = time.Sleep
++	}
++	pi := cfg.PollInterval
++	if pi <= 0 {
++		pi = time.Second
++	}
++	return &Client{base: cfg.BaseURL, token: cfg.Token, http: hc, sleep: sl, poll: pi}, nil
++}
++
++// Param is a named statement parameter: value is string-encoded, type is the
++// SQL type name (INT, STRING, DATE, ...).
++type Param struct {
++	Name  string
++	Value string
++	Type  string
++}
++
++type ExecRequest struct {
++	Statement     string
++	WarehouseID   string
++	Catalog       string
++	Schema        string
++	Parameters    []Param
++	WaitTimeout   string
++	OnWaitTimeout string
++	Disposition   string
++	Format        string
++	RowLimit      int64
++}
++
++type Column struct {
++	Name     string `json:"name"`
++	TypeName string `json:"type_name"`
++	TypeText string `json:"type_text"`
++	Position int    `json:"position"`
++}
++
++// Result carries the manifest metadata verbatim plus all assembled rows.
++// Values stay string-encoded; SQL NULL is a nil pointer.
++type Result struct {
++	StatementID   string
++	Columns       []Column
++	Rows          [][]*string
++	TotalRowCount int64
++	ChunkCount    int
++	Truncated     bool
++}
++
++// APIError is a non-2xx response decoded from the standard Databricks
++// {error_code, message} envelope.
++type APIError struct {
++	StatusCode int
++	ErrorCode  string
++	Message    string
++}
++
++func (e *APIError) Error() string {
++	return fmt.Sprintf("databricks: %s (HTTP %d): %s", e.ErrorCode, e.StatusCode, e.Message)
++}
++
++// StatementError is a statement that reached a terminal non-success state.
++type StatementError struct {
++	StatementID string
++	ErrorCode   string
++	SQLState    string
++	Message     string
++}
++
++func (e *StatementError) Error() string {
++	return fmt.Sprintf("statement %s failed: %s (sqlstate %s): %s",
++		e.StatementID, e.ErrorCode, e.SQLState, e.Message)
++}
++
++type wireManifest struct {
++	Schema struct {
++		Columns []Column `json:"columns"`
++	} `json:"schema"`
++	TotalChunkCount int   `json:"total_chunk_count"`
++	TotalRowCount   int64 `json:"total_row_count"`
++	Truncated       bool  `json:"truncated"`
++}
++
++type wireLink struct {
++	ChunkIndex            int    `json:"chunk_index"`
++	RowOffset             int64  `json:"row_offset"`
++	RowCount              int64  `json:"row_count"`
++	ExternalLink          string `json:"external_link"`
++	Expiration            string `json:"expiration"`
++	NextChunkIndex        int    `json:"next_chunk_index"`
++	NextChunkInternalLink string `json:"next_chunk_internal_link"`
++}
++
++type wireResult struct {
++	DataArray             [][]*string `json:"data_array"`
++	ExternalLinks         []wireLink  `json:"external_links"`
++	NextChunkInternalLink string      `json:"next_chunk_internal_link"`
++}
++
++type wireStatement struct {
++	StatementID string `json:"statement_id"`
++	Status      struct {
++		State string `json:"state"`
++		Error *struct {
++			ErrorCode string `json:"error_code"`
++			Message   string `json:"message"`
++		} `json:"error"`
++		SQLState string `json:"sql_state"`
++	} `json:"status"`
++	Manifest *wireManifest `json:"manifest"`
++	Result   *wireResult   `json:"result"`
++}
++
++func (c *Client) do(ctx context.Context, method, path string, body any, out any) error {
++	var rdr io.Reader
++	if body != nil {
++		raw, err := json.Marshal(body)
++		if err != nil {
++			return err
++		}
++		rdr = bytes.NewReader(raw)
++	}
++	req, err := http.NewRequestWithContext(ctx, method, c.base+path, rdr)
++	if err != nil {
++		return err
++	}
++	req.Header.Set("Authorization", "Bearer "+c.token)
++	req.Header.Set("Accept", "application/json")
++	if body != nil {
++		req.Header.Set("Content-Type", "application/json")
++	}
++	resp, err := c.http.Do(req)
++	if err != nil {
++		return err
++	}
++	defer resp.Body.Close()
++	raw, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return err
++	}
++	if resp.StatusCode >= 300 {
++		var env struct {
++			ErrorCode string `json:"error_code"`
++			Message   string `json:"message"`
++		}
++		_ = json.Unmarshal(raw, &env)
++		return &APIError{StatusCode: resp.StatusCode, ErrorCode: env.ErrorCode, Message: env.Message}
++	}
++	return json.Unmarshal(raw, out)
++}
++
++func execBody(req ExecRequest) map[string]any {
++	body := map[string]any{
++		"statement":    req.Statement,
++		"warehouse_id": req.WarehouseID,
++	}
++	if req.Catalog != "" {
++		body["catalog"] = req.Catalog
++	}
++	if req.Schema != "" {
++		body["schema"] = req.Schema
++	}
++	if req.WaitTimeout != "" {
++		body["wait_timeout"] = req.WaitTimeout
++	}
++	if req.OnWaitTimeout != "" {
++		body["on_wait_timeout"] = req.OnWaitTimeout
++	}
++	if req.Disposition != "" {
++		body["disposition"] = req.Disposition
++	}
++	if req.Format != "" {
++		body["format"] = req.Format
++	}
++	if req.RowLimit > 0 {
++		body["row_limit"] = req.RowLimit
++	}
++	if len(req.Parameters) > 0 {
++		params := make([]map[string]any, 0, len(req.Parameters))
++		for _, p := range req.Parameters {
++			m := map[string]any{"name": p.Name, "value": p.Value}
++			if p.Type != "" {
++				m["type"] = p.Type
++			}
++			params = append(params, m)
++		}
++		body["parameters"] = params
++	}
++	return body
++}
++
++// Exec submits the statement, polls it to a terminal state, and assembles
++// the full result set.
++func (c *Client) Exec(ctx context.Context, req ExecRequest) (*Result, error) {
++	var st wireStatement
++	if err := c.do(ctx, "POST", statementsPath, execBody(req), &st); err != nil {
++		return nil, err
++	}
++	for st.Status.State == "PENDING" || st.Status.State == "RUNNING" {
++		c.sleep(c.poll)
++		if err := ctx.Err(); err != nil {
++			return nil, fmt.Errorf("statement %s: polling canceled: %w", st.StatementID, err)
++		}
++		var next wireStatement
++		if err := c.do(ctx, "GET", statementsPath+"/"+st.StatementID, nil, &next); err != nil {
++			return nil, err
++		}
++		st = next
++	}
++	if st.Status.State != "SUCCEEDED" {
++		serr := &StatementError{StatementID: st.StatementID, ErrorCode: st.Status.State,
++			SQLState: st.Status.SQLState}
++		if st.Status.Error != nil {
++			serr.ErrorCode = st.Status.Error.ErrorCode
++			serr.Message = st.Status.Error.Message
++		}
++		return nil, serr
++	}
++	res := &Result{StatementID: st.StatementID}
++	if st.Manifest != nil {
++		res.Columns = st.Manifest.Schema.Columns
++		res.TotalRowCount = st.Manifest.TotalRowCount
++		res.ChunkCount = st.Manifest.TotalChunkCount
++		res.Truncated = st.Manifest.Truncated
++	}
++	if st.Result == nil {
++		return res, nil
++	}
++	if err := c.assemble(ctx, res, st.Result); err != nil {
++		return nil, err
++	}
++	return res, nil
++}
++
++func (c *Client) assemble(ctx context.Context, res *Result, cur *wireResult) error {
++	for {
++		next := cur.NextChunkInternalLink
++		if len(cur.ExternalLinks) > 0 {
++			for _, link := range cur.ExternalLinks {
++				if link.RowOffset != int64(len(res.Rows)) {
++					return fmt.Errorf("external chunk %d: row_offset %d does not match the %d rows already assembled",
++						link.ChunkIndex, link.RowOffset, len(res.Rows))
++				}
++				rows, err := c.download(ctx, link.ExternalLink)
++				if err != nil {
++					return fmt.Errorf("external chunk %d: %w", link.ChunkIndex, err)
++				}
++				res.Rows = append(res.Rows, rows...)
++				next = link.NextChunkInternalLink
++			}
++		} else {
++			res.Rows = append(res.Rows, cur.DataArray...)
++		}
++		if next == "" {
++			return nil
++		}
++		var page wireResult
++		if err := c.do(ctx, "GET", next, nil, &page); err != nil {
++			return err
++		}
++		cur = &page
++	}
++}
++
++// download fetches a presigned external link. The link embeds its own
++// credentials, so per the docs the Authorization header must be omitted.
++func (c *Client) download(ctx context.Context, url string) ([][]*string, error) {
++	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
++	if err != nil {
++		return nil, err
++	}
++	resp, err := c.http.Do(req)
++	if err != nil {
++		return nil, err
++	}
++	defer resp.Body.Close()
++	raw, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return nil, err
++	}
++	if resp.StatusCode >= 300 {
++		return nil, &APIError{StatusCode: resp.StatusCode, ErrorCode: "EXTERNAL_LINK_FETCH_FAILED",
++			Message: "presigned link download failed"}
++	}
++	var rows [][]*string
++	if err := json.Unmarshal(raw, &rows); err != nil {
++		return nil, err
++	}
++	return rows, nil
++}

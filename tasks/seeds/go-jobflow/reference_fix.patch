@@ -1,0 +1,328 @@
+diff --git a/graph.go b/graph.go
+new file mode 100644
+index 0000000..f13db9a
+--- /dev/null
++++ b/graph.go
+@@ -0,0 +1,45 @@
++package jobflow
++
++import "fmt"
++
++// validateGraph checks that every dependency exists and that the dependency
++// graph is acyclic. Called once, at the top of Run.
++func validateGraph(specs []JobSpec, index map[JobID]int) error {
++	for _, spec := range specs {
++		for _, dep := range spec.Deps {
++			if _, known := index[dep]; !known {
++				return fmt.Errorf("jobflow: job %q depends on unknown job %q", spec.ID, dep)
++			}
++		}
++	}
++
++	const (
++		unvisited = iota
++		visiting
++		done
++	)
++	colors := make(map[JobID]int, len(specs))
++	var visit func(id JobID) error
++	visit = func(id JobID) error {
++		switch colors[id] {
++		case visiting:
++			return fmt.Errorf("jobflow: dependency cycle through job %q", id)
++		case done:
++			return nil
++		}
++		colors[id] = visiting
++		for _, dep := range specs[index[id]].Deps {
++			if err := visit(dep); err != nil {
++				return err
++			}
++		}
++		colors[id] = done
++		return nil
++	}
++	for _, spec := range specs {
++		if err := visit(spec.ID); err != nil {
++			return err
++		}
++	}
++	return nil
++}
+diff --git a/jobflow.go b/jobflow.go
+new file mode 100644
+index 0000000..3bec41e
+--- /dev/null
++++ b/jobflow.go
+@@ -0,0 +1,99 @@
++// Package jobflow runs a static set of jobs with dependencies, priorities
++// and bounded parallelism under a cancellable context.
++package jobflow
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"sync"
++)
++
++// JobID names a job within one Orchestrator.
++type JobID string
++
++// State is the lifecycle state of a job.
++type State string
++
++const (
++	StatePending   State = "pending"
++	StateRunning   State = "running"
++	StateSucceeded State = "succeeded"
++	StateFailed    State = "failed"
++	StateSkipped   State = "skipped"
++	StateCancelled State = "cancelled"
++)
++
++// JobSpec describes one job: what it needs, how urgent it is, what it does.
++type JobSpec struct {
++	ID       JobID
++	Deps     []JobID
++	Priority int
++	Run      func(context.Context) error
++}
++
++// Options configures an Orchestrator.
++type Options struct {
++	// MaxParallel caps how many jobs may be running at once. Must be >= 1.
++	MaxParallel int
++}
++
++// Orchestrator owns a job set and runs it once. Status is safe to call
++// concurrently with Run.
++type Orchestrator struct {
++	max int
++
++	mu      sync.Mutex
++	specs   []JobSpec // in Add order; order breaks priority ties
++	index   map[JobID]int
++	states  map[JobID]State
++	started bool
++}
++
++// New builds an empty Orchestrator.
++func New(opts Options) (*Orchestrator, error) {
++	if opts.MaxParallel < 1 {
++		return nil, fmt.Errorf("jobflow: MaxParallel must be at least 1, got %d", opts.MaxParallel)
++	}
++	return &Orchestrator{
++		max:    opts.MaxParallel,
++		index:  make(map[JobID]int),
++		states: make(map[JobID]State),
++	}, nil
++}
++
++// Add registers a job. Deps may name jobs that are added later; the full
++// graph is validated when Run is called.
++func (o *Orchestrator) Add(spec JobSpec) error {
++	o.mu.Lock()
++	defer o.mu.Unlock()
++	if o.started {
++		return errors.New("jobflow: cannot add jobs once Run has been called")
++	}
++	if spec.ID == "" {
++		return errors.New("jobflow: job ID must not be empty")
++	}
++	if spec.Run == nil {
++		return fmt.Errorf("jobflow: job %q has a nil Run func", spec.ID)
++	}
++	if _, dup := o.index[spec.ID]; dup {
++		return fmt.Errorf("jobflow: duplicate job %q", spec.ID)
++	}
++	spec.Deps = append([]JobID(nil), spec.Deps...)
++	o.index[spec.ID] = len(o.specs)
++	o.specs = append(o.specs, spec)
++	o.states[spec.ID] = StatePending
++	return nil
++}
++
++// Status reports the current state of one job at any point in the
++// orchestrator's life.
++func (o *Orchestrator) Status(id JobID) (State, error) {
++	o.mu.Lock()
++	defer o.mu.Unlock()
++	st, known := o.states[id]
++	if !known {
++		return "", fmt.Errorf("jobflow: unknown job %q", id)
++	}
++	return st, nil
++}
+diff --git a/run.go b/run.go
+new file mode 100644
+index 0000000..71b5c0d
+--- /dev/null
++++ b/run.go
+@@ -0,0 +1,166 @@
++package jobflow
++
++import (
++	"context"
++	"fmt"
++)
++
++type completion struct {
++	id  JobID
++	err error
++}
++
++// Run executes every added job, honoring dependencies, priorities and the
++// MaxParallel bound. It is single-use. The returned map covers every added
++// job even on failure or cancellation.
++func (o *Orchestrator) Run(ctx context.Context) (map[JobID]State, error) {
++	o.mu.Lock()
++	if o.started {
++		o.mu.Unlock()
++		return nil, fmt.Errorf("jobflow: Run already called")
++	}
++	o.started = true
++	specs := o.specs
++	index := o.index
++	o.mu.Unlock()
++
++	if err := validateGraph(specs, index); err != nil {
++		return nil, err
++	}
++
++	done := make(chan completion)
++	running := 0
++	cancelled := false
++	var firstFailure error
++
++	// noteCancel flips into cancelled mode exactly once: every job that has
++	// not started yet is marked cancelled, and nothing new is dispatched
++	// afterwards. Checked eagerly (ctx.Err(), not a select race) so that
++	// cancellation always beats both job pickup and skip marking.
++	noteCancel := func() {
++		if cancelled || ctx.Err() == nil {
++			return
++		}
++		cancelled = true
++		o.mu.Lock()
++		for id, st := range o.states {
++			if st == StatePending {
++				o.states[id] = StateCancelled
++			}
++		}
++		o.mu.Unlock()
++	}
++
++	for {
++		noteCancel()
++		if !cancelled {
++			for running < o.max {
++				spec, ready := o.pickReady()
++				if !ready {
++					break
++				}
++				running++
++				go func(spec JobSpec) {
++					done <- completion{spec.ID, spec.Run(ctx)}
++				}(spec)
++			}
++		}
++		if running == 0 {
++			break
++		}
++		select {
++		case c := <-done:
++			noteCancel() // cancellation outranks failure bookkeeping
++			running--
++			o.finish(c, cancelled)
++			if c.err != nil && firstFailure == nil {
++				firstFailure = fmt.Errorf("jobflow: job %q failed: %w", c.id, c.err)
++			}
++		case <-ctx.Done():
++			noteCancel()
++		}
++	}
++
++	states := o.snapshot()
++	if cancelled {
++		return states, fmt.Errorf("jobflow: run cancelled: %w", ctx.Err())
++	}
++	if firstFailure != nil {
++		return states, firstFailure
++	}
++	return states, nil
++}
++
++// pickReady claims the best dispatchable job: pending, all deps succeeded,
++// highest priority, ties broken by Add order. It marks the job running
++// before releasing the lock so Status never sees a stale state.
++func (o *Orchestrator) pickReady() (JobSpec, bool) {
++	o.mu.Lock()
++	defer o.mu.Unlock()
++	best := -1
++	for i, spec := range o.specs {
++		if o.states[spec.ID] != StatePending {
++			continue
++		}
++		satisfied := true
++		for _, dep := range spec.Deps {
++			if o.states[dep] != StateSucceeded {
++				satisfied = false
++				break
++			}
++		}
++		if !satisfied {
++			continue
++		}
++		if best == -1 || spec.Priority > o.specs[best].Priority {
++			best = i
++		}
++	}
++	if best == -1 {
++		return JobSpec{}, false
++	}
++	spec := o.specs[best]
++	o.states[spec.ID] = StateRunning
++	return spec, true
++}
++
++// finish records a completed job and, outside of cancellation, skips every
++// job whose dependencies can no longer succeed.
++func (o *Orchestrator) finish(c completion, cancelled bool) {
++	o.mu.Lock()
++	defer o.mu.Unlock()
++	if c.err != nil {
++		o.states[c.id] = StateFailed
++	} else {
++		o.states[c.id] = StateSucceeded
++	}
++	if c.err == nil || cancelled {
++		return
++	}
++	// Transitively mark pending jobs blocked by a failed/skipped dep.
++	for changed := true; changed; {
++		changed = false
++		for _, spec := range o.specs {
++			if o.states[spec.ID] != StatePending {
++				continue
++			}
++			for _, dep := range spec.Deps {
++				if st := o.states[dep]; st == StateFailed || st == StateSkipped {
++					o.states[spec.ID] = StateSkipped
++					changed = true
++					break
++				}
++			}
++		}
++	}
++}
++
++func (o *Orchestrator) snapshot() map[JobID]State {
++	o.mu.Lock()
++	defer o.mu.Unlock()
++	out := make(map[JobID]State, len(o.states))
++	for id, st := range o.states {
++		out[id] = st
++	}
++	return out
++}

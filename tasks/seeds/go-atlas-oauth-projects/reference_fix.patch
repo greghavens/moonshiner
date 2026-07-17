@@ -1,0 +1,345 @@
+diff --git a/client.go b/client.go
+new file mode 100644
+index 0000000..da98d1a
+--- /dev/null
++++ b/client.go
+@@ -0,0 +1,75 @@
++// Package atlasadmin is a minimal client for the MongoDB Atlas
++// Administration API v2 authenticated with an OAuth 2.0 service account.
++//
++// Wire contract researched from the official MongoDB documentation:
++//   - https://www.mongodb.com/docs/atlas/api/service-accounts/generate-oauth2-token/
++//   - https://www.mongodb.com/docs/atlas/api/atlas-admin-api-ref/
++//   - https://www.mongodb.com/docs/api/doc/atlas-admin-api-v2/operation/operation-listprojects
++package atlasadmin
++
++import (
++	"errors"
++	"net/http"
++	"net/url"
++	"sync"
++	"time"
++)
++
++// groupsMediaType is the current stable dated media type for the groups
++// (projects) resource.
++const groupsMediaType = "application/vnd.atlas.2023-01-01+json"
++
++// refreshMargin is how long before expires_in the cached token is
++// considered stale. The token endpoint is rate limited (10/min), so tokens
++// are cached and re-exchanged only near expiry.
++const refreshMargin = 60 * time.Second
++
++type Config struct {
++	// TokenURL is the full URL of the OAuth token endpoint
++	// (production: https://cloud.mongodb.com/api/oauth/token).
++	TokenURL string
++	// BaseURL is the API host base (production: https://cloud.mongodb.com).
++	BaseURL      string
++	ClientID     string
++	ClientSecret string
++	// HTTPClient defaults to http.DefaultClient.
++	HTTPClient *http.Client
++	// Now defaults to time.Now; injected so token expiry is testable.
++	Now func() time.Time
++}
++
++type Client struct {
++	cfg     Config
++	http    *http.Client
++	now     func() time.Time
++	apiHost string // host the Bearer token is allowed to reach
++
++	mu       sync.Mutex
++	token    string
++	tokenExp time.Time
++}
++
++func New(cfg Config) (*Client, error) {
++	switch {
++	case cfg.TokenURL == "":
++		return nil, errors.New("atlasadmin: Config.TokenURL is required")
++	case cfg.BaseURL == "":
++		return nil, errors.New("atlasadmin: Config.BaseURL is required")
++	case cfg.ClientID == "":
++		return nil, errors.New("atlasadmin: Config.ClientID is required")
++	case cfg.ClientSecret == "":
++		return nil, errors.New("atlasadmin: Config.ClientSecret is required")
++	}
++	base, err := url.Parse(cfg.BaseURL)
++	if err != nil || base.Host == "" {
++		return nil, errors.New("atlasadmin: Config.BaseURL is not an absolute URL")
++	}
++	c := &Client{cfg: cfg, http: cfg.HTTPClient, now: cfg.Now, apiHost: base.Host}
++	if c.http == nil {
++		c.http = http.DefaultClient
++	}
++	if c.now == nil {
++		c.now = time.Now
++	}
++	return c, nil
++}
+diff --git a/errors.go b/errors.go
+new file mode 100644
+index 0000000..ef16e43
+--- /dev/null
++++ b/errors.go
+@@ -0,0 +1,27 @@
++package atlasadmin
++
++import "fmt"
++
++// APIError is the documented Atlas Administration API error envelope
++// (application/json: detail, error, errorCode, parameters, reason).
++type APIError struct {
++	StatusCode int
++	ErrorCode  string
++	Detail     string
++	Reason     string
++}
++
++func (e *APIError) Error() string {
++	return fmt.Sprintf("atlas: %d %s (%s): %s", e.StatusCode, e.Reason, e.ErrorCode, e.Detail)
++}
++
++// TokenError is the documented OAuth error body returned by the service
++// account token endpoint ({error, error_description}).
++type TokenError struct {
++	Code        string
++	Description string
++}
++
++func (e *TokenError) Error() string {
++	return fmt.Sprintf("atlas token exchange: %s: %s", e.Code, e.Description)
++}
+diff --git a/projects.go b/projects.go
+new file mode 100644
+index 0000000..2d6988c
+--- /dev/null
++++ b/projects.go
+@@ -0,0 +1,133 @@
++package atlasadmin
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++)
++
++// Project is one Atlas project (group).
++type Project struct {
++	ID           string
++	Name         string
++	OrgID        string
++	Created      string
++	ClusterCount int64
++}
++
++type wireLink struct {
++	Href string `json:"href"`
++	Rel  string `json:"rel"`
++}
++
++type wireGroup struct {
++	ID           string `json:"id"`
++	Name         string `json:"name"`
++	OrgID        string `json:"orgId"`
++	Created      string `json:"created"`
++	ClusterCount int64  `json:"clusterCount"`
++}
++
++type wireGroupsPage struct {
++	Links      []wireLink  `json:"links"`
++	Results    []wireGroup `json:"results"`
++	TotalCount int64       `json:"totalCount"`
++}
++
++// Projects lists every project visible to the service account, following
++// the documented rel=next pagination links until the last page (which has
++// no rel=next). Server order is preserved.
++func (c *Client) Projects(ctx context.Context) ([]Project, error) {
++	next := c.cfg.BaseURL + "/api/atlas/v2/groups"
++	projects := []Project{}
++	for next != "" {
++		var page wireGroupsPage
++		if err := c.getJSON(ctx, next, groupsMediaType, &page); err != nil {
++			return nil, err
++		}
++		for _, g := range page.Results {
++			projects = append(projects, Project{
++				ID: g.ID, Name: g.Name, OrgID: g.OrgID,
++				Created: g.Created, ClusterCount: g.ClusterCount,
++			})
++		}
++		next = ""
++		for _, l := range page.Links {
++			if l.Rel != "next" {
++				continue
++			}
++			u, err := url.Parse(l.Href)
++			if err != nil {
++				return nil, fmt.Errorf("pagination: invalid rel=next href: %w", err)
++			}
++			// The Bearer token is only ever presented to the API host.
++			if u.Host != c.apiHost {
++				return nil, fmt.Errorf("pagination: refusing rel=next link off the API host %q (link host %q)", c.apiHost, u.Host)
++			}
++			next = l.Href
++			break
++		}
++	}
++	return projects, nil
++}
++
++// getJSON performs an authenticated GET with the given dated Accept media
++// type. On a 401 it discards the cached token, re-exchanges once, and
++// retries the request exactly once.
++func (c *Client) getJSON(ctx context.Context, rawURL, accept string, out any) error {
++	tok, err := c.bearer(ctx)
++	if err != nil {
++		return err
++	}
++	retried := false
++	for {
++		status, body, err := c.doGet(ctx, rawURL, accept, tok)
++		if err != nil {
++			return err
++		}
++		if status == http.StatusUnauthorized && !retried {
++			retried = true
++			c.invalidate(tok)
++			if tok, err = c.bearer(ctx); err != nil {
++				return err
++			}
++			continue
++		}
++		if status < 200 || status >= 300 {
++			return decodeAPIError(status, body)
++		}
++		return json.Unmarshal(body, out)
++	}
++}
++
++func (c *Client) doGet(ctx context.Context, rawURL, accept, tok string) (int, []byte, error) {
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
++	if err != nil {
++		return 0, nil, err
++	}
++	req.Header.Set("Accept", accept)
++	req.Header.Set("Authorization", "Bearer "+tok)
++	resp, err := c.http.Do(req)
++	if err != nil {
++		return 0, nil, fmt.Errorf("atlas: GET failed: %w", err)
++	}
++	defer resp.Body.Close()
++	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
++	if err != nil {
++		return 0, nil, fmt.Errorf("atlas: reading response: %w", err)
++	}
++	return resp.StatusCode, body, nil
++}
++
++func decodeAPIError(status int, body []byte) error {
++	var wire struct {
++		Detail    string `json:"detail"`
++		ErrorCode string `json:"errorCode"`
++		Reason    string `json:"reason"`
++	}
++	_ = json.Unmarshal(body, &wire)
++	return &APIError{StatusCode: status, ErrorCode: wire.ErrorCode, Detail: wire.Detail, Reason: wire.Reason}
++}
+diff --git a/token.go b/token.go
+new file mode 100644
+index 0000000..740a71c
+--- /dev/null
++++ b/token.go
+@@ -0,0 +1,86 @@
++package atlasadmin
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"strings"
++	"time"
++)
++
++type tokenResponse struct {
++	AccessToken string `json:"access_token"`
++	ExpiresIn   int64  `json:"expires_in"`
++	TokenType   string `json:"token_type"`
++}
++
++type tokenErrorBody struct {
++	Error            string `json:"error"`
++	ErrorDescription string `json:"error_description"`
++}
++
++// bearer returns a valid cached access token or performs one
++// client-credentials exchange. The mutex is held across the exchange so
++// concurrent callers share a single in-flight request.
++func (c *Client) bearer(ctx context.Context) (string, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.token != "" && c.now().Before(c.tokenExp.Add(-refreshMargin)) {
++		return c.token, nil
++	}
++	tok, exp, err := c.exchange(ctx)
++	if err != nil {
++		return "", err
++	}
++	c.token, c.tokenExp = tok, exp
++	return tok, nil
++}
++
++// invalidate drops the cached token if it is still the one that just failed,
++// so exactly one re-exchange happens per stale token.
++func (c *Client) invalidate(tok string) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.token == tok {
++		c.token = ""
++	}
++}
++
++func (c *Client) exchange(ctx context.Context) (string, time.Time, error) {
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.TokenURL,
++		strings.NewReader("grant_type=client_credentials"))
++	if err != nil {
++		return "", time.Time{}, err
++	}
++	// The Basic credential travels only to the token host.
++	req.SetBasicAuth(c.cfg.ClientID, c.cfg.ClientSecret)
++	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
++	req.Header.Set("Accept", "application/json")
++
++	resp, err := c.http.Do(req)
++	if err != nil {
++		return "", time.Time{}, fmt.Errorf("token exchange: %w", err)
++	}
++	defer resp.Body.Close()
++	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
++	if err != nil {
++		return "", time.Time{}, fmt.Errorf("token exchange: reading response: %w", err)
++	}
++	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
++		var oe tokenErrorBody
++		if json.Unmarshal(body, &oe) == nil && oe.Error != "" {
++			return "", time.Time{}, &TokenError{Code: oe.Error, Description: oe.ErrorDescription}
++		}
++		return "", time.Time{}, &TokenError{Code: fmt.Sprintf("http_%d", resp.StatusCode)}
++	}
++	var tr tokenResponse
++	if err := json.Unmarshal(body, &tr); err != nil {
++		return "", time.Time{}, fmt.Errorf("token exchange: decoding response: %w", err)
++	}
++	if tr.AccessToken == "" {
++		return "", time.Time{}, &TokenError{Code: "invalid_response", Description: "missing access_token"}
++	}
++	return tr.AccessToken, c.now().Add(time.Duration(tr.ExpiresIn) * time.Second), nil
++}

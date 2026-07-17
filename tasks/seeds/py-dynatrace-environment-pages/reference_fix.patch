@@ -1,0 +1,265 @@
+diff --git a/dt_entities/__init__.py b/dt_entities/__init__.py
+new file mode 100644
+index 0000000..e204690
+--- /dev/null
++++ b/dt_entities/__init__.py
+@@ -0,0 +1,16 @@
++"""Dynatrace Environment API v2 entity exporter."""
++
++from .client import EntitiesClient
++from .errors import DtApiError, EntityDriftError
++from .export import export_entities, normalize_entity
++from .selector import build_selector, validate_selector
++
++__all__ = [
++    "EntitiesClient",
++    "DtApiError",
++    "EntityDriftError",
++    "export_entities",
++    "normalize_entity",
++    "build_selector",
++    "validate_selector",
++]
+diff --git a/dt_entities/client.py b/dt_entities/client.py
+new file mode 100644
+index 0000000..d85c565
+--- /dev/null
++++ b/dt_entities/client.py
+@@ -0,0 +1,78 @@
++"""Low-level Environment API v2 client (stdlib urllib only)."""
++
++import json
++import urllib.error
++import urllib.parse
++import urllib.request
++
++from .errors import DtApiError
++from .selector import validate_selector
++
++ENTITIES_PATH = "/api/v2/entities"
++
++
++class EntitiesClient:
++    """GET /api/v2/entities with Api-Token auth.
++
++    The token travels only in the Authorization header; the api-token
++    query parameter alternative would end up in logs.
++    """
++
++    def __init__(self, base_url, token, timeout=30):
++        self._base_url = base_url.rstrip("/")
++        self._token = token
++        self._timeout = timeout
++
++    def fetch_page(self, entity_selector=None, next_page_key=None, fields=None,
++                   time_from=None, time_to=None, page_size=None, sort=None):
++        if (entity_selector is None) == (next_page_key is None):
++            raise ValueError(
++                "exactly one of entity_selector / next_page_key is required"
++            )
++        if next_page_key is not None:
++            # Subsequent pages: the cursor must be the only parameter.
++            params = [("nextPageKey", next_page_key)]
++        else:
++            validate_selector(entity_selector)
++            params = [("entitySelector", entity_selector)]
++            if page_size is not None:
++                params.append(("pageSize", str(page_size)))
++            if time_from is not None:
++                params.append(("from", time_from))
++            if time_to is not None:
++                params.append(("to", time_to))
++            if fields:
++                for field in fields:
++                    if not field.startswith("+"):
++                        raise ValueError(
++                            "fields entries must be '+'-prefixed properties: %r"
++                            % (field,)
++                        )
++                params.append(("fields", ",".join(fields)))
++            if sort is not None:
++                params.append(("sort", sort))
++        url = "%s%s?%s" % (
++            self._base_url, ENTITIES_PATH, urllib.parse.urlencode(params)
++        )
++        request = urllib.request.Request(
++            url, headers={"Authorization": "Api-Token %s" % self._token}
++        )
++        try:
++            with urllib.request.urlopen(request, timeout=self._timeout) as resp:
++                return json.loads(resp.read().decode("utf-8"))
++        except urllib.error.HTTPError as exc:
++            raise self._api_error(exc) from None
++
++    @staticmethod
++    def _api_error(exc):
++        try:
++            envelope = json.loads(exc.read().decode("utf-8"))
++            error = envelope.get("error") or {}
++        except (ValueError, AttributeError):
++            error = {}
++        return DtApiError(
++            status=exc.code,
++            code=error.get("code"),
++            message=error.get("message", ""),
++            violations=error.get("constraintViolations") or [],
++        )
+diff --git a/dt_entities/errors.py b/dt_entities/errors.py
+new file mode 100644
+index 0000000..38c593a
+--- /dev/null
++++ b/dt_entities/errors.py
+@@ -0,0 +1,31 @@
++"""Errors raised by the dt_entities package."""
++
++
++class DtApiError(Exception):
++    """A Dynatrace API error envelope ({"error": {...}})."""
++
++    def __init__(self, status, code=None, message="", violations=None):
++        self.status = status
++        self.code = code
++        self.message = message
++        self.violations = list(violations or [])
++        detail = "Dynatrace API error %s: %s" % (status, message)
++        if self.violations:
++            detail += " (%s)" % "; ".join(
++                "%s: %s" % (v.get("location", "?"), v.get("message", ""))
++                for v in self.violations
++            )
++        super().__init__(detail)
++
++
++class EntityDriftError(Exception):
++    """The finished scan disagrees with the first page's totalCount."""
++
++    def __init__(self, collected, total_count, entities):
++        self.collected = collected
++        self.total_count = total_count
++        self.entities = entities
++        super().__init__(
++            "entity scan drifted: collected %d unique entities but the first "
++            "page reported totalCount=%d" % (collected, total_count)
++        )
+diff --git a/dt_entities/export.py b/dt_entities/export.py
+new file mode 100644
+index 0000000..201d057
+--- /dev/null
++++ b/dt_entities/export.py
+@@ -0,0 +1,67 @@
++"""Paged entity export with deterministic normalization."""
++
++from .errors import EntityDriftError
++
++
++def normalize_entity(raw):
++    tags = []
++    for tag in raw.get("tags") or []:
++        context = tag.get("context", "")
++        key = tag.get("key", "")
++        if tag.get("value") is not None:
++            tags.append("%s:%s=%s" % (context, key, tag["value"]))
++        else:
++            tags.append("%s:%s" % (context, key))
++    zones = sorted(z.get("name", "") for z in raw.get("managementZones") or [])
++    return {
++        "entityId": raw["entityId"],
++        "displayName": raw.get("displayName", ""),
++        "type": raw.get("type", ""),
++        "firstSeenTms": raw.get("firstSeenTms"),
++        "lastSeenTms": raw.get("lastSeenTms"),
++        "tags": sorted(tags),
++        "managementZones": zones,
++    }
++
++
++def export_entities(client, entity_selector, page_size=50, time_from="now-3d",
++                    time_to=None, fields=None, sort=None):
++    """Walk every page of /api/v2/entities and normalize the result.
++
++    pageSize and from are always sent explicitly so a scan does not
++    silently change shape when server defaults move.
++    """
++    page = client.fetch_page(
++        entity_selector=entity_selector,
++        page_size=page_size,
++        time_from=time_from,
++        time_to=time_to,
++        fields=fields,
++        sort=sort,
++    )
++    total_count = page.get("totalCount", 0)
++    pages = 1
++    collected = []
++    seen = set()
++    while True:
++        for raw in page.get("entities") or []:
++            if raw["entityId"] in seen:
++                continue  # page-boundary churn: keep the first occurrence
++            seen.add(raw["entityId"])
++            collected.append(raw)
++        next_key = page.get("nextPageKey")
++        if not next_key:
++            break
++        page = client.fetch_page(next_page_key=next_key)
++        pages += 1
++    normalized = sorted(
++        (normalize_entity(raw) for raw in collected),
++        key=lambda e: e["entityId"],
++    )
++    if len(normalized) != total_count:
++        raise EntityDriftError(
++            collected=len(normalized),
++            total_count=total_count,
++            entities=normalized,
++        )
++    return {"totalCount": total_count, "pages": pages, "entities": normalized}
+diff --git a/dt_entities/selector.py b/dt_entities/selector.py
+new file mode 100644
+index 0000000..c1b3608
+--- /dev/null
++++ b/dt_entities/selector.py
+@@ -0,0 +1,43 @@
++"""Entity selector building and validation.
++
++The Environment API v2 entity selector must contain exactly one type(...)
++criterion, criteria join with commas (AND), and the whole selector is
++limited to 2,000 characters.
++"""
++
++import re
++
++MAX_SELECTOR_CHARS = 2000
++_TYPE_RE = re.compile(r'(?<![\w.])type\(')
++_HEALTH_STATES = ("HEALTHY", "UNHEALTHY")
++
++
++def validate_selector(selector):
++    if not isinstance(selector, str) or not selector.strip():
++        raise ValueError("entitySelector must be a non-empty string")
++    if len(selector) > MAX_SELECTOR_CHARS:
++        raise ValueError(
++            "entitySelector exceeds the documented %d character limit"
++            % MAX_SELECTOR_CHARS
++        )
++    types = _TYPE_RE.findall(selector)
++    if not types:
++        raise ValueError("entitySelector must contain a type(...) criterion")
++    if len(types) > 1:
++        raise ValueError("only one entity type may be selected per query")
++    return selector
++
++
++def build_selector(entity_type, tags=(), health_state=None):
++    if not entity_type or not str(entity_type).strip():
++        raise ValueError("entity_type is required")
++    parts = ['type("%s")' % entity_type]
++    for tag in tags:
++        parts.append('tag("%s")' % tag)
++    if health_state is not None:
++        if health_state not in _HEALTH_STATES:
++            raise ValueError(
++                "healthState must be one of %s" % (_HEALTH_STATES,)
++            )
++        parts.append('healthState("%s")' % health_state)
++    return validate_selector(",".join(parts))

@@ -1,0 +1,182 @@
+diff --git a/reqvalid.py b/reqvalid.py
+new file mode 100644
+index 0000000..fa0d5aa
+--- /dev/null
++++ b/reqvalid.py
+@@ -0,0 +1,176 @@
++"""reqvalid -- declarative WSGI request-validation middleware.
++
++`wrap(app, rules)` returns a WSGI callable that validates query/header/body
++parameters against a per-(method, path) schema table and rejects bad requests
++with an RFC 7807 problem document before they reach the inner app.
++"""
++import json
++from urllib.parse import parse_qs
++
++PROBLEM_TYPE = "urn:problem-type:request-validation"
++PROBLEM_TITLE = "Request validation failed"
++
++_TRUE_WORDS = {"true", "1"}
++_FALSE_WORDS = {"false", "0"}
++
++
++def _coerce_string(spec, raw):
++    """Coerce a query/header string. Returns (value, problem-code-or-None)."""
++    kind = spec.get("type", "str")
++    if kind == "int":
++        try:
++            return int(raw), None
++        except ValueError:
++            return None, "type"
++    if kind == "bool":
++        lowered = raw.lower()
++        if lowered in _TRUE_WORDS:
++            return True, None
++        if lowered in _FALSE_WORDS:
++            return False, None
++        return None, "type"
++    return raw, None
++
++
++def _check_json_type(spec, value):
++    kind = spec.get("type", "str")
++    if kind == "int":
++        return isinstance(value, int) and not isinstance(value, bool)
++    if kind == "bool":
++        return isinstance(value, bool)
++    return isinstance(value, str)
++
++
++def _constraint_code(spec, value):
++    if spec.get("type") == "int":
++        if "min" in spec and value < spec["min"]:
++            return "range"
++        if "max" in spec and value > spec["max"]:
++            return "range"
++    if "choices" in spec and value not in spec["choices"]:
++        return "choice"
++    return None
++
++
++def _read_body(environ):
++    """Returns (dict, problems). Empty/absent body counts as {}."""
++    try:
++        length = int(environ.get("CONTENT_LENGTH") or 0)
++    except ValueError:
++        length = 0
++    raw = environ["wsgi.input"].read(length) if length > 0 else b""
++    if not raw:
++        return {}, []
++    try:
++        data = json.loads(raw)
++    except ValueError:
++        return {}, [{"name": "body", "in": "body", "code": "json",
++                     "detail": "request body is not valid JSON"}]
++    if not isinstance(data, dict):
++        return {}, [{"name": "body", "in": "body", "code": "json",
++                     "detail": "request body must be a JSON object"}]
++    return data, []
++
++
++def _header_value(environ, name):
++    return environ.get("HTTP_" + name.upper().replace("-", "_"))
++
++
++def _apply_missing(spec, params, problems):
++    if spec.get("required"):
++        problems.append({"name": spec["name"], "in": spec["in"], "code": "required"})
++    elif "default" in spec:
++        params[spec["name"]] = spec["default"]
++
++
++def _validate(environ, specs):
++    problems = []
++    params = {}
++
++    query_specs = [s for s in specs if s["in"] == "query"]
++    header_specs = [s for s in specs if s["in"] == "header"]
++    body_specs = [s for s in specs if s["in"] == "body"]
++
++    query = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
++    declared_query = {s["name"] for s in query_specs}
++    for name in query:
++        if name not in declared_query:
++            problems.append({"name": name, "in": "query", "code": "unexpected"})
++    for spec in query_specs:
++        values = query.get(spec["name"])
++        if values is None:
++            _apply_missing(spec, params, problems)
++            continue
++        if len(values) > 1:
++            problems.append({"name": spec["name"], "in": "query", "code": "duplicate"})
++            continue
++        value, code = _coerce_string(spec, values[0])
++        code = code or _constraint_code(spec, value)
++        if code:
++            problems.append({"name": spec["name"], "in": "query", "code": code})
++        else:
++            params[spec["name"]] = value
++
++    for spec in header_specs:
++        raw = _header_value(environ, spec["name"])
++        if raw is None:
++            _apply_missing(spec, params, problems)
++            continue
++        value, code = _coerce_string(spec, raw)
++        code = code or _constraint_code(spec, value)
++        if code:
++            problems.append({"name": spec["name"], "in": "header", "code": code})
++        else:
++            params[spec["name"]] = value
++
++    if body_specs:
++        data, body_problems = _read_body(environ)
++        problems.extend(body_problems)
++        if not body_problems:
++            declared_body = {s["name"] for s in body_specs}
++            for key in data:
++                if key not in declared_body:
++                    problems.append({"name": key, "in": "body", "code": "unexpected"})
++            for spec in body_specs:
++                if spec["name"] not in data:
++                    _apply_missing(spec, params, problems)
++                    continue
++                value = data[spec["name"]]
++                if not _check_json_type(spec, value):
++                    problems.append({"name": spec["name"], "in": "body", "code": "type"})
++                    continue
++                code = _constraint_code(spec, value)
++                if code:
++                    problems.append({"name": spec["name"], "in": "body", "code": code})
++                else:
++                    params[spec["name"]] = value
++
++    problems.sort(key=lambda p: (p["name"], p["in"]))
++    return params, problems
++
++
++def wrap(app, rules):
++    def middleware(environ, start_response):
++        route = (environ["REQUEST_METHOD"], environ.get("PATH_INFO", ""))
++        specs = rules.get(route)
++        if specs is None:
++            return app(environ, start_response)
++        params, problems = _validate(environ, specs)
++        if problems:
++            document = {
++                "type": PROBLEM_TYPE,
++                "title": PROBLEM_TITLE,
++                "status": 400,
++                "detail": f"{len(problems)} invalid parameter(s)",
++                "invalid_params": problems,
++            }
++            payload = json.dumps(document).encode("utf-8")
++            start_response("400 Bad Request", [
++                ("Content-Type", "application/problem+json"),
++                ("Content-Length", str(len(payload))),
++            ])
++            return [payload]
++        environ["reqvalid.params"] = params
++        return app(environ, start_response)
++
++    return middleware

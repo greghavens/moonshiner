@@ -1,0 +1,268 @@
+diff --git a/parse.go b/parse.go
+new file mode 100644
+index 0000000..161a409
+--- /dev/null
++++ b/parse.go
+@@ -0,0 +1,120 @@
++// Package csvdec decodes CSV by header name into struct slices. The
++// parser is self-contained (no encoding/csv) so malformed input can be
++// reported with precise line numbers.
++package csvdec
++
++import (
++	"fmt"
++	"strings"
++)
++
++// record is one parsed CSV row plus the 1-based line it started on.
++type record struct {
++	fields []string
++	line   int
++}
++
++// ParseRecords parses CSV data into rows of fields. Quoted fields may
++// contain commas, doubled quotes, and newlines; blank lines are
++// skipped; a trailing newline is optional.
++func ParseRecords(data []byte) ([][]string, error) {
++	recs, err := parse(data)
++	if err != nil {
++		return nil, err
++	}
++	out := make([][]string, len(recs))
++	for i, r := range recs {
++		out[i] = r.fields
++	}
++	return out, nil
++}
++
++func parse(data []byte) ([]record, error) {
++	var recs []record
++	i, n := 0, len(data)
++	line := 1
++	for i < n {
++		// Skip completely blank lines.
++		if data[i] == '\n' {
++			i++
++			line++
++			continue
++		}
++		if data[i] == '\r' && i+1 < n && data[i+1] == '\n' {
++			i += 2
++			line++
++			continue
++		}
++
++		rec := record{line: line}
++		for {
++			field, next, err := parseField(data, i, &line)
++			if err != nil {
++				return nil, err
++			}
++			rec.fields = append(rec.fields, field)
++			i = next
++
++			if i >= n {
++				break
++			}
++			switch data[i] {
++			case ',':
++				i++
++				continue
++			case '\n':
++				i++
++				line++
++			case '\r':
++				if i+1 < n && data[i+1] == '\n' {
++					i += 2
++					line++
++				} else {
++					return nil, fmt.Errorf("csvdec: bare carriage return on line %d", line)
++				}
++			default:
++				return nil, fmt.Errorf("csvdec: unexpected %q after quoted field on line %d", data[i], line)
++			}
++			break
++		}
++		recs = append(recs, rec)
++	}
++	return recs, nil
++}
++
++// parseField parses one field starting at i. It advances *line for
++// newlines consumed inside quoted fields and returns the index of the
++// character after the field (a delimiter, record end, or EOF).
++func parseField(data []byte, i int, line *int) (string, int, error) {
++	n := len(data)
++	if i < n && data[i] == '"' {
++		startLine := *line
++		i++
++		var sb strings.Builder
++		for i < n {
++			c := data[i]
++			if c == '"' {
++				if i+1 < n && data[i+1] == '"' {
++					sb.WriteByte('"')
++					i += 2
++					continue
++				}
++				return sb.String(), i + 1, nil
++			}
++			if c == '\n' {
++				*line++
++			}
++			sb.WriteByte(c)
++			i++
++		}
++		return "", i, fmt.Errorf("csvdec: unterminated quoted field starting on line %d", startLine)
++	}
++	start := i
++	for i < n && data[i] != ',' && data[i] != '\n' && data[i] != '\r' {
++		if data[i] == '"' {
++			return "", i, fmt.Errorf("csvdec: unexpected quote inside unquoted field on line %d", *line)
++		}
++		i++
++	}
++	return string(data[start:i]), i, nil
++}
+diff --git a/unmarshal.go b/unmarshal.go
+new file mode 100644
+index 0000000..2451187
+--- /dev/null
++++ b/unmarshal.go
+@@ -0,0 +1,136 @@
++package csvdec
++
++import (
++	"errors"
++	"fmt"
++	"reflect"
++	"strconv"
++	"strings"
++)
++
++// binding connects one struct field to one CSV column.
++type binding struct {
++	fieldIndex int
++	colIndex   int
++	colName    string
++}
++
++// Unmarshal decodes CSV data into v, which must be a pointer to a slice
++// of structs. The first record is the header; struct fields are matched
++// to columns via the `csv` tag, or case-insensitively by field name.
++func Unmarshal(data []byte, v any) error {
++	rv := reflect.ValueOf(v)
++	if v == nil || rv.Kind() != reflect.Pointer || rv.IsNil() {
++		return errors.New("csvdec: destination must be a non-nil pointer to a slice of structs")
++	}
++	sliceVal := rv.Elem()
++	if sliceVal.Kind() != reflect.Slice {
++		return fmt.Errorf("csvdec: destination must point to a slice, not %s", sliceVal.Kind())
++	}
++	elemType := sliceVal.Type().Elem()
++	if elemType.Kind() != reflect.Struct {
++		return fmt.Errorf("csvdec: slice element must be a struct, not %s", elemType.Kind())
++	}
++
++	recs, err := parse(data)
++	if err != nil {
++		return err
++	}
++	if len(recs) == 0 {
++		return errors.New("csvdec: input has no header row")
++	}
++	header := recs[0].fields
++
++	bindings, err := bindFields(elemType, header)
++	if err != nil {
++		return err
++	}
++
++	out := reflect.MakeSlice(sliceVal.Type(), 0, len(recs)-1)
++	for _, rec := range recs[1:] {
++		if len(rec.fields) != len(header) {
++			return fmt.Errorf("csvdec: line %d has %d fields, header has %d",
++				rec.line, len(rec.fields), len(header))
++		}
++		ev := reflect.New(elemType).Elem()
++		for _, b := range bindings {
++			if err := setField(ev.Field(b.fieldIndex), rec.fields[b.colIndex]); err != nil {
++				return fmt.Errorf("csvdec: line %d, column %q: %w", rec.line, b.colName, err)
++			}
++		}
++		out = reflect.Append(out, ev)
++	}
++	sliceVal.Set(out)
++	return nil
++}
++
++// bindFields maps struct fields to header columns. Tagged fields match
++// their tag exactly; untagged fields match their name case-insensitively;
++// csv:"-" opts out. A bound field of an unsupported type is an error.
++func bindFields(t reflect.Type, header []string) ([]binding, error) {
++	var bindings []binding
++	for fi := 0; fi < t.NumField(); fi++ {
++		f := t.Field(fi)
++		if !f.IsExported() {
++			continue
++		}
++		tag := f.Tag.Get("csv")
++		if tag == "-" {
++			continue
++		}
++		colIndex := -1
++		colName := tag
++		if tag != "" {
++			for i, h := range header {
++				if h == tag {
++					colIndex = i
++					break
++				}
++			}
++		} else {
++			colName = f.Name
++			for i, h := range header {
++				if strings.EqualFold(h, f.Name) {
++					colIndex = i
++					break
++				}
++			}
++		}
++		if colIndex == -1 {
++			continue // no matching column: field stays zero
++		}
++		switch f.Type.Kind() {
++		case reflect.String, reflect.Int, reflect.Float64, reflect.Bool:
++		default:
++			return nil, fmt.Errorf("csvdec: field %s has unsupported type %s", f.Name, f.Type)
++		}
++		bindings = append(bindings, binding{fieldIndex: fi, colIndex: colIndex, colName: colName})
++	}
++	return bindings, nil
++}
++
++func setField(field reflect.Value, raw string) error {
++	switch field.Kind() {
++	case reflect.String:
++		field.SetString(raw)
++	case reflect.Int:
++		n, err := strconv.ParseInt(raw, 10, 64)
++		if err != nil {
++			return fmt.Errorf("invalid integer %q", raw)
++		}
++		field.SetInt(n)
++	case reflect.Float64:
++		f, err := strconv.ParseFloat(raw, 64)
++		if err != nil {
++			return fmt.Errorf("invalid number %q", raw)
++		}
++		field.SetFloat(f)
++	case reflect.Bool:
++		b, err := strconv.ParseBool(raw)
++		if err != nil {
++			return fmt.Errorf("invalid boolean %q", raw)
++		}
++		field.SetBool(b)
++	}
++	return nil
++}

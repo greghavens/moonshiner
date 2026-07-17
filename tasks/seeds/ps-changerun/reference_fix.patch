@@ -1,0 +1,257 @@
+diff --git a/changerun.ps1 b/changerun.ps1
+new file mode 100644
+index 0000000..ec99974
+--- /dev/null
++++ b/changerun.ps1
+@@ -0,0 +1,251 @@
++# changerun.ps1 -- fleet change planner with a persisted step lifecycle.
++[CmdletBinding()]
++param(
++    [Parameter(Position = 0)]
++    [string]$Command = '',
++
++    [string]$Desired = '',
++    [string]$Facts = '',
++    [string]$State = '',
++    [string]$Results = ''
++)
++
++Set-StrictMode -Version Latest
++$ErrorActionPreference = 'Stop'
++[System.Globalization.CultureInfo]::CurrentCulture = [System.Globalization.CultureInfo]::InvariantCulture
++[System.Globalization.CultureInfo]::CurrentUICulture = [System.Globalization.CultureInfo]::InvariantCulture
++
++$ValidStatuses = @('planned', 'applied', 'failed', 'rolled-back')
++
++function Stop-Run {
++    param([int]$Code, [string]$Message)
++    [Console]::Error.WriteLine($Message)
++    exit $Code
++}
++
++function Assert-InputPath {
++    param([string]$Path)
++    if (-not (Test-Path -LiteralPath $Path)) {
++        Stop-Run -Code 66 -Message "changerun: not found: $Path"
++    }
++}
++
++function Get-SortedOrdinal {
++    param([string[]]$Values)
++    $sorted = @($Values)
++    [Array]::Sort($sorted, [System.StringComparer]::Ordinal)
++    return , $sorted
++}
++
++function Read-State {
++    param([string]$Path)
++    Assert-InputPath -Path $Path
++    $data = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
++    $steps = @($data.steps)
++    foreach ($step in $steps) {
++        if ($ValidStatuses -cnotcontains [string]$step.status) {
++            Stop-Run -Code 65 -Message "changerun: unknown status '$($step.status)' for step '$($step.id)'"
++        }
++    }
++    return , $steps
++}
++
++function Write-State {
++    param([string]$Path, [object[]]$Steps)
++    $rows = @(foreach ($s in $Steps) {
++        [ordered]@{
++            id      = $s.id
++            host    = $s.host
++            change  = $s.change
++            setting = $s.setting
++            from    = $s.from
++            to      = $s.to
++            status  = $s.status
++        }
++    })
++    $doc = [ordered]@{ steps = $rows }
++    $json = $doc | ConvertTo-Json -Depth 6
++    [System.IO.File]::WriteAllText($Path, $json + "`n")
++}
++
++function Get-RoleOrder {
++    # Kahn's algorithm over one role's full change list, always draining the
++    # ready set in ordinal id order. Returns ordered ids; errors on cycles.
++    param([object[]]$RoleChanges)
++    $remaining = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
++    $indegree = [System.Collections.Generic.Dictionary[string, int]]::new([System.StringComparer]::Ordinal)
++    $dependents = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
++    foreach ($c in $RoleChanges) {
++        [void]$remaining.Add([string]$c.id)
++        $indegree[[string]$c.id] = 0
++        $dependents[[string]$c.id] = [System.Collections.Generic.List[string]]::new()
++    }
++    foreach ($c in $RoleChanges) {
++        foreach ($req in @($c.requires)) {
++            $indegree[[string]$c.id]++
++            $dependents[[string]$req].Add([string]$c.id)
++        }
++    }
++    $order = [System.Collections.Generic.List[string]]::new()
++    while ($remaining.Count -gt 0) {
++        $ready = @($remaining | Where-Object { $indegree[$_] -eq 0 })
++        if ($ready.Count -eq 0) {
++            Stop-Run -Code 65 -Message 'changerun: requirement cycle detected'
++        }
++        $ready = Get-SortedOrdinal -Values $ready
++        $next = $ready[0]
++        [void]$remaining.Remove($next)
++        $order.Add($next)
++        foreach ($dep in $dependents[$next]) { $indegree[$dep]-- }
++    }
++    return , $order.ToArray()
++}
++
++function Invoke-Plan {
++    Assert-InputPath -Path $Desired
++    Assert-InputPath -Path $Facts
++
++    $model = Get-Content -LiteralPath $Desired -Raw | ConvertFrom-Json
++    $changes = @($model.changes)
++
++    $byId = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
++    foreach ($c in $changes) { $byId[[string]$c.id] = $c }
++    foreach ($c in $changes) {
++        foreach ($req in @($c.requires)) {
++            $reqId = [string]$req
++            if (-not $byId.ContainsKey($reqId) -or [string]$byId[$reqId].role -cne [string]$c.role) {
++                Stop-Run -Code 65 -Message "changerun: unknown requirement '$reqId' of '$($c.id)'"
++            }
++        }
++    }
++
++    $roleOrders = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
++    $roleNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
++    foreach ($c in $changes) { [void]$roleNames.Add([string]$c.role) }
++    foreach ($role in $roleNames) {
++        $roleChanges = @($changes | Where-Object { [string]$_.role -ceq $role })
++        $roleOrders[$role] = Get-RoleOrder -RoleChanges $roleChanges
++    }
++
++    $factHosts = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
++    foreach ($file in Get-ChildItem -LiteralPath $Facts -File -Filter '*.json') {
++        $fact = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json
++        $factHosts[[string]$fact.host] = $fact
++    }
++
++    $steps = [System.Collections.Generic.List[object]]::new()
++    foreach ($hostName in (Get-SortedOrdinal -Values @($factHosts.Keys))) {
++        $fact = $factHosts[$hostName]
++        $role = [string]$fact.role
++        if (-not $roleOrders.ContainsKey($role)) { continue }
++        $settingNames = @($fact.settings.PSObject.Properties | ForEach-Object { $_.Name })
++        foreach ($changeId in $roleOrders[$role]) {
++            $c = $byId[$changeId]
++            $setting = [string]$c.setting
++            $from = $null
++            if ($settingNames -ccontains $setting) {
++                $from = [string]$fact.settings.$setting
++            }
++            if ($null -ne $from -and $from -ceq [string]$c.value) { continue }
++            $steps.Add([pscustomobject]@{
++                id      = "$hostName/$changeId"
++                host    = $hostName
++                change  = $changeId
++                setting = $setting
++                from    = $from
++                to      = [string]$c.value
++                status  = 'planned'
++            })
++        }
++    }
++
++    foreach ($s in $steps) {
++        $fromText = if ($null -eq $s.from) { '(none)' } else { $s.from }
++        Write-Output "planned $($s.id) $($s.setting): $fromText -> $($s.to)"
++    }
++    Write-State -Path $State -Steps $steps.ToArray()
++    exit 0
++}
++
++function Invoke-Apply {
++    $steps = Read-State -Path $State
++    Assert-InputPath -Path $Results
++    $resultDoc = Get-Content -LiteralPath $Results -Raw | ConvertFrom-Json
++    $outcomeNames = @($resultDoc.outcomes.PSObject.Properties | ForEach-Object { $_.Name })
++
++    foreach ($s in $steps) {
++        if ([string]$s.status -cne 'planned') {
++            Stop-Run -Code 65 -Message "changerun: invalid transition '$($s.status)' -> 'applied' for step '$($s.id)'"
++        }
++    }
++    foreach ($s in $steps) {
++        if ($outcomeNames -cnotcontains [string]$s.id) {
++            Stop-Run -Code 65 -Message "changerun: no outcome for step '$($s.id)'"
++        }
++    }
++
++    $failedHosts = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
++    $anyFailed = $false
++    foreach ($s in $steps) {
++        if ($failedHosts.Contains([string]$s.host)) {
++            Write-Output "skipped $($s.id)"
++            continue
++        }
++        $outcome = [string]$resultDoc.outcomes.($s.id)
++        if ($outcome -ceq 'ok') {
++            $s.status = 'applied'
++            Write-Output "applied $($s.id)"
++        } else {
++            $s.status = 'failed'
++            $anyFailed = $true
++            [void]$failedHosts.Add([string]$s.host)
++            Write-Output "failed $($s.id)"
++        }
++    }
++
++    Write-State -Path $State -Steps $steps
++    if ($anyFailed) { exit 65 }
++    exit 0
++}
++
++function Invoke-Rollback {
++    $steps = Read-State -Path $State
++
++    $failedHosts = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
++    foreach ($s in $steps) {
++        if ([string]$s.status -ceq 'failed') { [void]$failedHosts.Add([string]$s.host) }
++    }
++
++    foreach ($hostName in (Get-SortedOrdinal -Values @($failedHosts))) {
++        $hostSteps = @($steps | Where-Object { [string]$_.host -ceq $hostName })
++        [Array]::Reverse($hostSteps)
++        foreach ($s in $hostSteps) {
++            if ([string]$s.status -ceq 'applied') {
++                $s.status = 'rolled-back'
++                Write-Output "rolledback $($s.id)"
++            }
++        }
++    }
++
++    Write-State -Path $State -Steps $steps
++    exit 0
++}
++
++function Invoke-Status {
++    $steps = Read-State -Path $State
++    $counts = [ordered]@{ 'planned' = 0; 'applied' = 0; 'failed' = 0; 'rolled-back' = 0 }
++    foreach ($s in $steps) { $counts[[string]$s.status]++ }
++    Write-Output "planned=$($counts['planned']) applied=$($counts['applied']) failed=$($counts['failed']) rolled-back=$($counts['rolled-back'])"
++    exit 0
++}
++
++switch ($Command) {
++    'plan'     { Invoke-Plan }
++    'apply'    { Invoke-Apply }
++    'rollback' { Invoke-Rollback }
++    'status'   { Invoke-Status }
++    default {
++        [Console]::Error.WriteLine('usage: changerun.ps1 plan|apply|rollback|status')
++        exit 64
++    }
++}

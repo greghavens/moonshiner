@@ -1,0 +1,164 @@
+diff --git a/LargeFileUploader.java b/LargeFileUploader.java
+new file mode 100644
+index 0000000..cd96c12
+--- /dev/null
++++ b/LargeFileUploader.java
+@@ -0,0 +1,158 @@
++import java.net.URI;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.function.LongConsumer;
++
++/**
++ * Resumable large-file uploader built on the Microsoft Graph v1.0 upload
++ * session protocol (driveItem: createUploadSession). Uploads sequential
++ * Content-Range fragments to the preauthenticated uploadUrl, retries 5xx
++ * with exponential backoff, recovers 416 via the status query, and restarts
++ * once with a fresh session when the old one expires (404).
++ */
++public final class LargeFileUploader {
++
++    private static final int KIB320 = 327_680;
++    private static final long MAX_FRAGMENT = 60L * 1024 * 1024;
++
++    private final GraphDriveClient client;
++    private final int fragmentSize;
++    private final LongConsumer delaySeconds;
++    private final int maxRetries;
++
++    public LargeFileUploader(GraphDriveClient client, int fragmentSize,
++                             LongConsumer delaySeconds, int maxRetries) {
++        if (fragmentSize <= 0 || fragmentSize % KIB320 != 0 || fragmentSize >= MAX_FRAGMENT) {
++            throw new IllegalArgumentException(
++                    "fragment size must be a positive multiple of 320 KiB below 60 MiB, got " + fragmentSize);
++        }
++        this.client = client;
++        this.fragmentSize = fragmentSize;
++        this.delaySeconds = delaySeconds;
++        this.maxRetries = maxRetries;
++    }
++
++    public DriveItem upload(String driveId, String parentItemId, String fileName,
++                            byte[] content, String conflictBehavior) {
++        boolean restarted = false;
++        while (true) {
++            String uploadUrl = createSession(driveId, parentItemId, fileName, conflictBehavior);
++            try {
++                return uploadToSession(uploadUrl, content);
++            } catch (SessionExpiredException expired) {
++                // The session evaporated mid-flight; the documented recovery
++                // is one full restart with a fresh session.
++                if (restarted) {
++                    throw expired.cause;
++                }
++                restarted = true;
++            }
++        }
++    }
++
++    private String createSession(String driveId, String parentItemId, String fileName,
++                                 String conflictBehavior) {
++        Map<String, Object> item = new LinkedHashMap<>();
++        item.put("@microsoft.graph.conflictBehavior", conflictBehavior);
++        item.put("name", fileName);
++        Map<String, Object> body = new LinkedHashMap<>();
++        body.put("item", item);
++
++        String url = client.baseUrl() + "/drives/" + driveId + "/items/" + parentItemId
++                + ":/" + fileName + ":/createUploadSession";
++        HttpRequest request = HttpRequest.newBuilder(URI.create(url))
++                .header("Authorization", "Bearer " + client.accessToken())
++                .header("Content-Type", "application/json")
++                .POST(HttpRequest.BodyPublishers.ofString(Json.write(body)))
++                .build();
++        HttpResponse<String> response = client.send(request);
++        if (response.statusCode() != 200 && response.statusCode() != 201) {
++            throw GraphDriveClient.decodeError(response);
++        }
++        Map<String, Object> session = Json.object(Json.parse(response.body()));
++        if (!(session.get("uploadUrl") instanceof String uploadUrl)) {
++            throw new GraphApiException(0, "ProtocolError", "upload session carries no uploadUrl");
++        }
++        return uploadUrl;
++    }
++
++    private DriveItem uploadToSession(String uploadUrl, byte[] content) {
++        long total = content.length;
++        long position = 0;
++        int consecutiveFailures = 0;
++
++        while (true) {
++            long last = Math.min(position + fragmentSize, total) - 1;
++            HttpResponse<String> response = putFragment(uploadUrl, content, position, last, total);
++            int status = response.statusCode();
++
++            if (status == 200 || status == 201) {
++                return DriveItem.fromJson(Json.object(Json.parse(response.body())));
++            }
++            if (status == 202) {
++                position = last + 1;
++                consecutiveFailures = 0;
++                continue;
++            }
++            if (status == 416) {
++                // The server already holds these bytes: consult the status
++                // query and resume from the first missing range.
++                position = queryNextExpected(uploadUrl);
++                consecutiveFailures = 0;
++                continue;
++            }
++            if (status == 404) {
++                throw new SessionExpiredException(GraphDriveClient.decodeError(response));
++            }
++            if (status >= 500) {
++                if (consecutiveFailures >= maxRetries) {
++                    throw GraphDriveClient.decodeError(response);
++                }
++                consecutiveFailures++;
++                delaySeconds.accept(1L << (consecutiveFailures - 1));
++                continue;
++            }
++            throw GraphDriveClient.decodeError(response);
++        }
++    }
++
++    private HttpResponse<String> putFragment(String uploadUrl, byte[] content,
++                                             long first, long last, long total) {
++        int length = (int) (last - first + 1);
++        HttpRequest request = HttpRequest.newBuilder(URI.create(uploadUrl))
++                .header("Content-Range", "bytes " + first + "-" + last + "/" + total)
++                .PUT(HttpRequest.BodyPublishers.ofByteArray(content, (int) first, length))
++                .build();
++        return client.send(request);
++    }
++
++    private long queryNextExpected(String uploadUrl) {
++        HttpRequest request = HttpRequest.newBuilder(URI.create(uploadUrl)).GET().build();
++        HttpResponse<String> response = client.send(request);
++        if (response.statusCode() == 404) {
++            throw new SessionExpiredException(GraphDriveClient.decodeError(response));
++        }
++        if (response.statusCode() != 200) {
++            throw GraphDriveClient.decodeError(response);
++        }
++        Map<String, Object> body = Json.object(Json.parse(response.body()));
++        List<Object> ranges = Json.array(body.get("nextExpectedRanges"));
++        if (ranges.isEmpty() || !(ranges.get(0) instanceof String range)) {
++            throw new GraphApiException(0, "ProtocolError", "upload status carries no nextExpectedRanges");
++        }
++        int dash = range.indexOf('-');
++        return Long.parseLong(dash < 0 ? range : range.substring(0, dash));
++    }
++
++    private static final class SessionExpiredException extends RuntimeException {
++        final GraphApiException cause;
++
++        SessionExpiredException(GraphApiException cause) {
++            super(cause.getMessage());
++            this.cause = cause;
++        }
++    }
++}

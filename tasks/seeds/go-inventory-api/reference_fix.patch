@@ -1,0 +1,357 @@
+diff --git a/memstore.go b/memstore.go
+new file mode 100644
+index 0000000..fd77636
+--- /dev/null
++++ b/memstore.go
+@@ -0,0 +1,79 @@
++package inventory
++
++import (
++	"context"
++	"sync"
++)
++
++// MemStore is the in-memory Store used until the Postgres backend lands.
++// A single mutex makes every operation — in particular the CAS pair
++// Update/Delete — atomic.
++type MemStore struct {
++	mu    sync.Mutex
++	items map[string]Item
++}
++
++// NewMemStore returns an empty, race-safe in-memory store.
++func NewMemStore() *MemStore {
++	return &MemStore{items: make(map[string]Item)}
++}
++
++func (m *MemStore) List(ctx context.Context) ([]Item, error) {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	out := make([]Item, 0, len(m.items))
++	for _, it := range m.items {
++		out = append(out, it)
++	}
++	return out, nil
++}
++
++func (m *MemStore) Get(ctx context.Context, sku string) (Item, error) {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	it, ok := m.items[sku]
++	if !ok {
++		return Item{}, ErrNotFound
++	}
++	return it, nil
++}
++
++func (m *MemStore) Create(ctx context.Context, it Item) (Item, error) {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	if _, ok := m.items[it.SKU]; ok {
++		return Item{}, ErrExists
++	}
++	it.Version = 1
++	m.items[it.SKU] = it
++	return it, nil
++}
++
++func (m *MemStore) Update(ctx context.Context, it Item, expectVersion int) (Item, error) {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	cur, ok := m.items[it.SKU]
++	if !ok {
++		return Item{}, ErrNotFound
++	}
++	if cur.Version != expectVersion {
++		return Item{}, ErrVersionMismatch
++	}
++	it.Version = cur.Version + 1
++	m.items[it.SKU] = it
++	return it, nil
++}
++
++func (m *MemStore) Delete(ctx context.Context, sku string, expectVersion int) error {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	cur, ok := m.items[sku]
++	if !ok {
++		return ErrNotFound
++	}
++	if cur.Version != expectVersion {
++		return ErrVersionMismatch
++	}
++	delete(m.items, sku)
++	return nil
++}
+diff --git a/server.go b/server.go
+new file mode 100644
+index 0000000..189963c
+--- /dev/null
++++ b/server.go
+@@ -0,0 +1,221 @@
++package inventory
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"net/http"
++	"regexp"
++	"sort"
++	"strconv"
++	"strings"
++)
++
++var skuPattern = regexp.MustCompile(`^[A-Z0-9][A-Z0-9-]{2,31}$`)
++
++// NewServer builds the HTTP layer over any Store implementation.
++func NewServer(store Store) http.Handler {
++	s := &server{store: store}
++	mux := http.NewServeMux()
++	mux.HandleFunc("POST /items", s.create)
++	mux.HandleFunc("GET /items", s.list)
++	mux.HandleFunc("GET /items/{sku}", s.get)
++	mux.HandleFunc("PUT /items/{sku}", s.update)
++	mux.HandleFunc("DELETE /items/{sku}", s.delete)
++	return mux
++}
++
++type server struct {
++	store Store
++}
++
++func etag(version int) string { return fmt.Sprintf("%q", strconv.Itoa(version)) }
++
++// decodeItem parses and validates a request body. pathSKU is empty for
++// creates; for updates the body sku may be omitted and must otherwise agree
++// with the path.
++func decodeItem(r *http.Request, pathSKU string) (Item, error) {
++	var it Item
++	dec := json.NewDecoder(r.Body)
++	dec.DisallowUnknownFields()
++	if err := dec.Decode(&it); err != nil {
++		return Item{}, errors.New("malformed item JSON")
++	}
++	if pathSKU != "" {
++		if it.SKU == "" {
++			it.SKU = pathSKU
++		} else if it.SKU != pathSKU {
++			return Item{}, errors.New("body sku does not match the request path")
++		}
++	}
++	switch {
++	case !skuPattern.MatchString(it.SKU):
++		return Item{}, errors.New("sku must match [A-Z0-9][A-Z0-9-]{2,31}")
++	case strings.TrimSpace(it.Name) == "":
++		return Item{}, errors.New("name must not be blank")
++	case it.Quantity < 0:
++		return Item{}, errors.New("quantity must not be negative")
++	case it.PriceCents < 0:
++		return Item{}, errors.New("price_cents must not be negative")
++	}
++	return it, nil
++}
++
++func (s *server) create(w http.ResponseWriter, r *http.Request) {
++	it, err := decodeItem(r, "")
++	if err != nil {
++		writeErr(w, http.StatusBadRequest, err.Error())
++		return
++	}
++	stored, err := s.store.Create(r.Context(), it)
++	switch {
++	case errors.Is(err, ErrExists):
++		writeErr(w, http.StatusConflict, "sku already exists")
++		return
++	case err != nil:
++		internalErr(w)
++		return
++	}
++	w.Header().Set("Location", "/items/"+stored.SKU)
++	w.Header().Set("ETag", etag(stored.Version))
++	writeItem(w, http.StatusCreated, stored)
++}
++
++func (s *server) list(w http.ResponseWriter, r *http.Request) {
++	items, err := s.store.List(r.Context())
++	if err != nil {
++		internalErr(w)
++		return
++	}
++	sort.Slice(items, func(i, j int) bool { return items[i].SKU < items[j].SKU })
++	if items == nil {
++		items = []Item{} // an empty inventory is [], never null
++	}
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(http.StatusOK)
++	json.NewEncoder(w).Encode(items)
++}
++
++func (s *server) get(w http.ResponseWriter, r *http.Request) {
++	it, err := s.store.Get(r.Context(), r.PathValue("sku"))
++	switch {
++	case errors.Is(err, ErrNotFound):
++		writeErr(w, http.StatusNotFound, "no such item")
++		return
++	case err != nil:
++		internalErr(w)
++		return
++	}
++	tag := etag(it.Version)
++	w.Header().Set("ETag", tag)
++	if inm := r.Header.Get("If-None-Match"); inm != "" {
++		if strings.TrimSpace(inm) == "*" || strings.TrimSpace(inm) == tag {
++			w.WriteHeader(http.StatusNotModified)
++			return
++		}
++	}
++	writeItem(w, http.StatusOK, it)
++}
++
++// precondition resolves the 404/428/412 ladder shared by PUT and DELETE.
++// It returns the version the CAS must expect, or writes the error and
++// reports ok=false.
++func (s *server) precondition(w http.ResponseWriter, r *http.Request) (sku string, version int, ok bool) {
++	sku = r.PathValue("sku")
++	cur, err := s.store.Get(r.Context(), sku)
++	switch {
++	case errors.Is(err, ErrNotFound):
++		writeErr(w, http.StatusNotFound, "no such item")
++		return "", 0, false
++	case err != nil:
++		internalErr(w)
++		return "", 0, false
++	}
++	im, present := r.Header["If-Match"]
++	if !present || len(im) == 0 {
++		writeErr(w, http.StatusPreconditionRequired, "conditional request required: send If-Match")
++		return "", 0, false
++	}
++	tag := strings.TrimSpace(im[0])
++	if tag == "*" {
++		return sku, cur.Version, true
++	}
++	v, err := parseETag(tag)
++	if err != nil || v != cur.Version {
++		writeErr(w, http.StatusPreconditionFailed, "If-Match does not match the current version")
++		return "", 0, false
++	}
++	return sku, v, true
++}
++
++func parseETag(tag string) (int, error) {
++	if len(tag) < 2 || tag[0] != '"' || tag[len(tag)-1] != '"' {
++		return 0, errors.New("not a strong etag")
++	}
++	return strconv.Atoi(tag[1 : len(tag)-1])
++}
++
++func (s *server) update(w http.ResponseWriter, r *http.Request) {
++	sku, version, ok := s.precondition(w, r)
++	if !ok {
++		return
++	}
++	it, err := decodeItem(r, sku)
++	if err != nil {
++		writeErr(w, http.StatusBadRequest, err.Error())
++		return
++	}
++	// The store's CAS decides the race: the version check above only orders
++	// the error ladder, it must not be trusted as the write guard.
++	stored, err := s.store.Update(r.Context(), it, version)
++	switch {
++	case errors.Is(err, ErrNotFound):
++		writeErr(w, http.StatusNotFound, "no such item")
++		return
++	case errors.Is(err, ErrVersionMismatch):
++		writeErr(w, http.StatusPreconditionFailed, "item changed underneath you")
++		return
++	case err != nil:
++		internalErr(w)
++		return
++	}
++	w.Header().Set("ETag", etag(stored.Version))
++	writeItem(w, http.StatusOK, stored)
++}
++
++func (s *server) delete(w http.ResponseWriter, r *http.Request) {
++	sku, version, ok := s.precondition(w, r)
++	if !ok {
++		return
++	}
++	err := s.store.Delete(r.Context(), sku, version)
++	switch {
++	case errors.Is(err, ErrNotFound):
++		writeErr(w, http.StatusNotFound, "no such item")
++		return
++	case errors.Is(err, ErrVersionMismatch):
++		writeErr(w, http.StatusPreconditionFailed, "item changed underneath you")
++		return
++	case err != nil:
++		internalErr(w)
++		return
++	}
++	w.WriteHeader(http.StatusNoContent)
++}
++
++func writeItem(w http.ResponseWriter, status int, it Item) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(status)
++	json.NewEncoder(w).Encode(it)
++}
++
++func writeErr(w http.ResponseWriter, status int, msg string) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(status)
++	json.NewEncoder(w).Encode(map[string]string{"error": msg})
++}
++
++// internalErr answers 500 without echoing storage internals to clients.
++func internalErr(w http.ResponseWriter) {
++	writeErr(w, http.StatusInternalServerError, "internal storage error")
++}
+diff --git a/store.go b/store.go
+new file mode 100644
+index 0000000..f99c296
+--- /dev/null
++++ b/store.go
+@@ -0,0 +1,39 @@
++// Package inventory is the warehouse inventory API: a JSON REST layer over
++// a pluggable, versioned storage backend.
++package inventory
++
++import (
++	"context"
++	"errors"
++)
++
++// Item is one inventory record. Version is storage metadata: it travels in
++// the ETag header, never in JSON bodies.
++type Item struct {
++	SKU        string `json:"sku"`
++	Name       string `json:"name"`
++	Quantity   int    `json:"quantity"`
++	PriceCents int    `json:"price_cents"`
++	Version    int    `json:"-"`
++}
++
++// Storage sentinels the HTTP layer maps onto statuses.
++var (
++	ErrNotFound        = errors.New("item not found")
++	ErrExists          = errors.New("item already exists")
++	ErrVersionMismatch = errors.New("item version mismatch")
++)
++
++// Store is the storage seam. Implementations must be safe for concurrent
++// use; Update and Delete are compare-and-swap on the item version.
++type Store interface {
++	List(ctx context.Context) ([]Item, error)
++	Get(ctx context.Context, sku string) (Item, error)
++	// Create assigns Version 1. An existing sku is ErrExists.
++	Create(ctx context.Context, it Item) (Item, error)
++	// Update replaces the item iff its current version is expectVersion,
++	// bumping the version. ErrNotFound / ErrVersionMismatch otherwise.
++	Update(ctx context.Context, it Item, expectVersion int) (Item, error)
++	// Delete removes the item iff its current version is expectVersion.
++	Delete(ctx context.Context, sku string, expectVersion int) error
++}

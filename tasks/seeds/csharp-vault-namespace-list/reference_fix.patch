@@ -1,0 +1,196 @@
+diff --git a/VaultApiException.cs b/VaultApiException.cs
+new file mode 100644
+index 0000000..5c2deba
+--- /dev/null
++++ b/VaultApiException.cs
+@@ -0,0 +1,22 @@
++/// A non-2xx Vault response carrying a non-empty {"errors": [...]} document.
++public sealed class VaultApiException : Exception
++{
++    public VaultApiException(int statusCode, IReadOnlyList<string> errors)
++        : base($"vault: HTTP {statusCode}: {string.Join("; ", errors)}")
++    {
++        StatusCode = statusCode;
++        Errors = errors;
++    }
++
++    public int StatusCode { get; }
++
++    public IReadOnlyList<string> Errors { get; }
++}
++
++/// One child namespace from sys/namespaces key_info (path is relative to the
++/// namespace that was listed).
++public sealed record VaultNamespaceInfo(string Path, string Id);
++
++/// One inventoried secret: the absolute namespace path ("" for root) plus the
++/// mount-relative secret path.
++public sealed record VaultSecretRef(string Namespace, string Path);
+diff --git a/VaultListClient.cs b/VaultListClient.cs
+new file mode 100644
+index 0000000..233d4ca
+--- /dev/null
++++ b/VaultListClient.cs
+@@ -0,0 +1,162 @@
++using System.Text.Json;
++
++/// Vault list/inventory client. Lists with the documented LIST HTTP verb (or
++/// the documented GET ?list=true fallback), treats 404 + {"errors":[]} as an
++/// empty list, propagates non-empty error documents, and applies Enterprise
++/// namespace semantics consistently when walking child namespaces.
++public sealed class VaultListClient
++{
++    private static readonly HttpMethod ListMethod = new("LIST");
++
++    private readonly HttpClient _http;
++    private readonly Uri _base;
++    private readonly string _token;
++    private readonly string? _namespace;
++    private readonly bool _useListFallback;
++
++    public VaultListClient(HttpClient http, Uri baseAddress, string token,
++        string? vaultNamespace = null, bool useListFallback = false)
++    {
++        _http = http;
++        _base = baseAddress;
++        _token = token;
++        _namespace = vaultNamespace;
++        _useListFallback = useListFallback;
++    }
++
++    // ------------------------------------------------------------- listing
++
++    public Task<IReadOnlyList<string>> ListKeysAsync(string apiPath, CancellationToken ct = default)
++        => ListKeysAsync(apiPath, _namespace, ct);
++
++    private async Task<IReadOnlyList<string>> ListKeysAsync(string apiPath, string? ns, CancellationToken ct)
++    {
++        using var doc = await ListDocumentAsync(apiPath, ns, ct);
++        if (doc is null) return Array.Empty<string>();
++        var keys = new List<string>();
++        foreach (var key in doc.RootElement.GetProperty("data").GetProperty("keys").EnumerateArray())
++            keys.Add(key.GetString()!);
++        return keys;
++    }
++
++    /// Sends one list request; null means Vault's empty-list answer
++    /// (404 with an empty errors array).
++    private async Task<JsonDocument?> ListDocumentAsync(string apiPath, string? ns, CancellationToken ct)
++    {
++        var target = _useListFallback ? $"v1/{apiPath}?list=true" : $"v1/{apiPath}";
++        using var request = new HttpRequestMessage(_useListFallback ? HttpMethod.Get : ListMethod,
++            new Uri(_base, target));
++        request.Headers.TryAddWithoutValidation("X-Vault-Token", _token);
++        if (!string.IsNullOrEmpty(ns))
++            request.Headers.TryAddWithoutValidation("X-Vault-Namespace", ns);
++
++        using var response = await _http.SendAsync(request, ct);
++        var body = await response.Content.ReadAsStringAsync(ct);
++        if (response.IsSuccessStatusCode)
++            return JsonDocument.Parse(body);
++
++        var errors = DecodeErrors(body);
++        if ((int)response.StatusCode == 404 && errors.Count == 0)
++            return null;
++        if (errors.Count == 0)
++            errors.Add("(no error detail)");
++        throw new VaultApiException((int)response.StatusCode, errors);
++    }
++
++    private static List<string> DecodeErrors(string body)
++    {
++        var errors = new List<string>();
++        try
++        {
++            using var doc = JsonDocument.Parse(body);
++            if (doc.RootElement.TryGetProperty("errors", out var array))
++                foreach (var e in array.EnumerateArray())
++                    errors.Add(e.GetString() ?? "");
++        }
++        catch (JsonException)
++        {
++            // Non-JSON error body; treat as detail-less.
++        }
++        return errors;
++    }
++
++    // ---------------------------------------------------------- namespaces
++
++    public Task<IReadOnlyList<VaultNamespaceInfo>> ListNamespacesAsync(CancellationToken ct = default)
++        => ListNamespacesAsync(_namespace, ct);
++
++    private async Task<IReadOnlyList<VaultNamespaceInfo>> ListNamespacesAsync(string? ns, CancellationToken ct)
++    {
++        using var doc = await ListDocumentAsync("sys/namespaces", ns, ct);
++        if (doc is null) return Array.Empty<VaultNamespaceInfo>();
++        var infos = new List<VaultNamespaceInfo>();
++        var data = doc.RootElement.GetProperty("data");
++        if (data.TryGetProperty("key_info", out var keyInfo))
++        {
++            foreach (var property in keyInfo.EnumerateObject())
++            {
++                var value = property.Value;
++                infos.Add(new VaultNamespaceInfo(
++                    value.GetProperty("path").GetString()!,
++                    value.GetProperty("id").GetString()!));
++            }
++        }
++        infos.Sort((a, b) => string.CompareOrdinal(a.Path, b.Path));
++        return infos;
++    }
++
++    // ---------------------------------------------------------------- walk
++
++    public Task<IReadOnlyList<string>> WalkSecretPathsAsync(string mount, CancellationToken ct = default)
++        => WalkSecretPathsAsync(mount, _namespace, ct);
++
++    private async Task<IReadOnlyList<string>> WalkSecretPathsAsync(string mount, string? ns, CancellationToken ct)
++    {
++        var results = new List<string>();
++        var pending = new Stack<string>();
++        pending.Push("");
++        while (pending.Count > 0)
++        {
++            var folder = pending.Pop();
++            var apiPath = folder.Length == 0 ? $"{mount}/metadata" : $"{mount}/metadata/{folder}";
++            foreach (var key in await ListKeysAsync(apiPath, ns, ct))
++            {
++                var joined = folder.Length == 0 ? key : $"{folder}/{key}";
++                if (key.EndsWith('/'))
++                    pending.Push(joined[..^1]);
++                else
++                    results.Add(joined);
++            }
++        }
++        results.Sort(StringComparer.Ordinal);
++        return results;
++    }
++
++    // ----------------------------------------------------------- inventory
++
++    public async Task<IReadOnlyList<VaultSecretRef>> InventoryAsync(string mount,
++        bool includeChildNamespaces, CancellationToken ct = default)
++    {
++        var entries = new List<VaultSecretRef>();
++        await CollectAsync(mount, _namespace, includeChildNamespaces, entries, ct);
++        entries.Sort((a, b) =>
++        {
++            var byNs = string.CompareOrdinal(a.Namespace, b.Namespace);
++            return byNs != 0 ? byNs : string.CompareOrdinal(a.Path, b.Path);
++        });
++        return entries;
++    }
++
++    private async Task CollectAsync(string mount, string? ns, bool recurse,
++        List<VaultSecretRef> entries, CancellationToken ct)
++    {
++        var label = ns ?? "";
++        foreach (var path in await WalkSecretPathsAsync(mount, ns, ct))
++            entries.Add(new VaultSecretRef(label, path));
++        if (!recurse) return;
++        // Child paths from sys/namespaces are relative: compose them onto the
++        // current namespace to address the child absolutely.
++        foreach (var child in await ListNamespacesAsync(ns, ct))
++            await CollectAsync(mount, label + child.Path, true, entries, ct);
++    }
++}

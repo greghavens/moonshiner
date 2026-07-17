@@ -1,0 +1,264 @@
+diff --git a/emitlog.ts b/emitlog.ts
+index 5d2bae5..ce95c8f 100644
+--- a/emitlog.ts
++++ b/emitlog.ts
+@@ -1,10 +1,17 @@
+ // emitlog.ts — linear workflow engine for the ops workflow DSL.
+ //
+ // Executes `do:` task lists strictly in order: `set:` evaluates a map into
+-// the context, `call:` invokes an injected handler. The expression language
+-// is the single-expression subset: a string that is exactly one
++// the context, `call:` invokes an injected handler, `emit:` appends to the
++// run's event log, `raise:` fails the run on purpose. The expression
++// language is the single-expression subset: a string that is exactly one
+ // `${ .path }` yields the raw value; everything else is a literal.
+ //
++// A run reports status 'completed' or 'failed' (raise) plus its context,
++// output (the optional workflow-level `output: {from: ...}` transform,
++// applied only on completion) and the ordered event log. Engine-level
++// problems — LoadError, unknown handlers, handler exceptions — keep
++// throwing; 'failed' is reserved for a workflow that raises.
++//
+ // Synchronous and deterministic: no timers, no I/O, handlers are the only
+ // side effects.
+ 
+@@ -27,24 +34,42 @@ export interface RunOptions {
+   handlers?: Record<string, Handler>;
+ }
+ 
++export interface EventRecord {
++  type: string;
++  source: string;
++  data: Json;
++}
++
+ export interface RunResult {
++  status: 'completed' | 'failed';
+   context: Scope;
++  output: Json;
++  events: EventRecord[];
++  error?: Scope;
+ }
+ 
+ // ----------------------------------------------------------------- loading
+ 
++interface EmitSpec {
++  type: string;
++  data: Json; // unevaluated map; defaults to {}
++}
++
+ interface Task {
+   name: string;
+-  kind: 'set' | 'call';
++  kind: 'set' | 'call' | 'emit' | 'raise';
+   set?: Json;
+   call?: string;
+   with?: Json;
++  emit?: EmitSpec;
++  raiseErr?: Scope; // unevaluated error map
+ }
+ 
+ interface Workflow {
+   namespace: string;
+   name: string;
+   tasks: Task[];
++  outputFrom?: Json; // unevaluated output.from, when declared
+ }
+ 
+ function isPlainObject(v: Json): v is Scope {
+@@ -55,10 +80,12 @@ function loadTask(name: string, body: Json, where: string): Task {
+   if (!isPlainObject(body)) {
+     throw new LoadError(`${where}: task body must be a map`);
+   }
+-  const typeKeys = (['set', 'call'] as const).filter((k) => k in body);
++  const typeKeys = (['set', 'call', 'emit', 'raise'] as const)
++    .filter((k) => k in body);
+   if (typeKeys.length !== 1) {
+     throw new LoadError(
+-      `${where}: task needs exactly one of set/call, got ${typeKeys.length}`);
++      `${where}: task needs exactly one of set/call/emit/raise, ` +
++      `got ${typeKeys.length}`);
+   }
+   const kind = typeKeys[0];
+   const allowed = new Set<string>([kind]);
+@@ -70,20 +97,82 @@ function loadTask(name: string, body: Json, where: string): Task {
+   }
+ 
+   const task: Task = { name, kind };
+-  if (kind === 'set') {
+-    if (!isPlainObject(body['set'])) {
+-      throw new LoadError(`${where}: set must be a map`);
++  switch (kind) {
++    case 'set': {
++      if (!isPlainObject(body['set'])) {
++        throw new LoadError(`${where}: set must be a map`);
++      }
++      task.set = body['set'];
++      break;
+     }
+-    task.set = body['set'];
+-  } else {
+-    const call = body['call'];
+-    if (typeof call !== 'string' || call === '') {
+-      throw new LoadError(`${where}: call must be a non-empty string`);
++    case 'call': {
++      const call = body['call'];
++      if (typeof call !== 'string' || call === '') {
++        throw new LoadError(`${where}: call must be a non-empty string`);
++      }
++      task.call = call;
++      task.with = 'with' in body ? body['with'] : {};
++      if (!isPlainObject(task.with)) {
++        throw new LoadError(`${where}: with must be a map`);
++      }
++      break;
++    }
++    case 'emit': {
++      const emit = body['emit'];
++      if (!isPlainObject(emit) || Object.keys(emit).length !== 1 ||
++          !('event' in emit)) {
++        throw new LoadError(
++          `${where}: emit must be exactly emit: {event: ...}`);
++      }
++      const event = emit['event'];
++      if (!isPlainObject(event)) {
++        throw new LoadError(`${where}: emit.event must be a map`);
++      }
++      for (const key of Object.keys(event)) {
++        if (key !== 'type' && key !== 'data') {
++          throw new LoadError(`${where}: unknown event key "${key}"`);
++        }
++      }
++      const type = event['type'];
++      if (typeof type !== 'string' || type === '') {
++        throw new LoadError(
++          `${where}: event.type must be a non-empty string`);
++      }
++      const data = 'data' in event ? event['data'] : {};
++      if (!isPlainObject(data)) {
++        throw new LoadError(`${where}: event.data must be a map`);
++      }
++      task.emit = { type, data };
++      break;
+     }
+-    task.call = call;
+-    task.with = 'with' in body ? body['with'] : {};
+-    if (!isPlainObject(task.with)) {
+-      throw new LoadError(`${where}: with must be a map`);
++    case 'raise': {
++      const raise = body['raise'];
++      if (!isPlainObject(raise) || Object.keys(raise).length !== 1 ||
++          !('error' in raise)) {
++        throw new LoadError(
++          `${where}: raise must be exactly raise: {error: ...}`);
++      }
++      const error = raise['error'];
++      if (!isPlainObject(error)) {
++        throw new LoadError(`${where}: raise.error must be a map`);
++      }
++      for (const key of Object.keys(error)) {
++        if (key !== 'type' && key !== 'title' && key !== 'detail') {
++          throw new LoadError(`${where}: unknown error key "${key}"`);
++        }
++      }
++      const errType = error['type'];
++      if (typeof errType !== 'string' || errType === '') {
++        throw new LoadError(
++          `${where}: error.type must be a non-empty string`);
++      }
++      for (const optional of ['title', 'detail']) {
++        if (optional in error && typeof error[optional] !== 'string') {
++          throw new LoadError(`${where}: error.${optional} must be a string`);
++        }
++      }
++      task.raiseErr = error;
++      break;
+     }
+   }
+   return task;
+@@ -113,7 +202,7 @@ function loadWorkflow(source: string): Workflow {
+     }
+   }
+   for (const key of Object.keys(doc)) {
+-    if (key !== 'document' && key !== 'do') {
++    if (key !== 'document' && key !== 'do' && key !== 'output') {
+       throw new LoadError(`unknown top-level key "${key}"`);
+     }
+   }
+@@ -138,11 +227,21 @@ function loadWorkflow(source: string): Workflow {
+     seen.add(name);
+     tasks.push(loadTask(name, entry[name], `do/${name}`));
+   }
+-  return {
++
++  const wf: Workflow = {
+     namespace: header['namespace'] as string,
+     name: header['name'] as string,
+     tasks,
+   };
++  if ('output' in doc) {
++    const output = doc['output'];
++    if (!isPlainObject(output) || Object.keys(output).length !== 1 ||
++        !('from' in output)) {
++      throw new LoadError('output must be exactly output: {from: ...}');
++    }
++    wf.outputFrom = output['from'];
++  }
++  return wf;
+ }
+ 
+ // -------------------------------------------------------------- expressions
+@@ -207,16 +306,45 @@ export function runWorkflow(source: string,
+                             options: RunOptions = {}): RunResult {
+   const wf = loadWorkflow(source);
+   const context: Scope = { input: options.input ?? {} };
++  const events: EventRecord[] = [];
++  const origin = `${wf.namespace}/${wf.name}`;
+   for (const task of wf.tasks) {
+-    if (task.kind === 'set') {
+-      context[task.name] = evaluate(task.set!, context);
+-    } else {
+-      const handler = (options.handlers ?? {})[task.call!];
+-      if (typeof handler !== 'function') {
+-        throw new Error(`unknown handler "${task.call}"`);
++    switch (task.kind) {
++      case 'set': {
++        context[task.name] = evaluate(task.set!, context);
++        break;
++      }
++      case 'call': {
++        const handler = (options.handlers ?? {})[task.call!];
++        if (typeof handler !== 'function') {
++          throw new Error(`unknown handler "${task.call}"`);
++        }
++        context[task.name] = handler(evaluate(task.with!, context) as Args);
++        break;
++      }
++      case 'emit': {
++        events.push({
++          type: task.emit!.type,
++          source: origin,
++          data: evaluate(task.emit!.data, context),
++        });
++        break;
++      }
++      case 'raise': {
++        // A deliberate failure: stop here, keep everything already
++        // produced, and skip the output transform entirely.
++        return {
++          status: 'failed',
++          context,
++          output: null,
++          events,
++          error: evaluate(task.raiseErr!, context) as Scope,
++        };
+       }
+-      context[task.name] = handler(evaluate(task.with!, context) as Args);
+     }
+   }
+-  return { context };
++  const output = wf.outputFrom === undefined
++    ? context
++    : evaluate(wf.outputFrom, context);
++  return { status: 'completed', context, output, events };
+ }

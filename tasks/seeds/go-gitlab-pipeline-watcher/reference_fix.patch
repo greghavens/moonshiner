@@ -1,0 +1,379 @@
+diff --git a/client.go b/client.go
+new file mode 100644
+index 0000000..6166988
+--- /dev/null
++++ b/client.go
+@@ -0,0 +1,209 @@
++package glpipe
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"strconv"
++	"strings"
++	"time"
++)
++
++const maxRateLimitRetries = 3
++
++// Client speaks the GitLab REST v4 API. All waiting goes through the
++// injected sleep function; the package never calls time.Sleep.
++type Client struct {
++	baseURL   string
++	token     string
++	hc        *http.Client
++	sleep     func(time.Duration)
++	throttled int
++}
++
++func NewClient(baseURL, token string, hc *http.Client, sleep func(time.Duration)) *Client {
++	if hc == nil {
++		hc = http.DefaultClient
++	}
++	return &Client{
++		baseURL: strings.TrimRight(baseURL, "/"),
++		token:   token,
++		hc:      hc,
++		sleep:   sleep,
++	}
++}
++
++// ThrottleCount reports how many 429 waits have been honored so far.
++func (c *Client) ThrottleCount() int { return c.throttled }
++
++// do issues one authenticated request, transparently honoring documented
++// rate limiting: on 429 it waits exactly Retry-After seconds via the
++// injected sleep and retries, giving up after maxRateLimitRetries waits.
++func (c *Client) do(ctx context.Context, method, path string, body any) (*http.Response, error) {
++	var payload []byte
++	if body != nil {
++		var err error
++		if payload, err = json.Marshal(body); err != nil {
++			return nil, err
++		}
++	}
++	for attempt := 0; ; attempt++ {
++		req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bytes.NewReader(payload))
++		if err != nil {
++			return nil, err
++		}
++		req.Header.Set("PRIVATE-TOKEN", c.token)
++		req.Header.Set("Accept", "application/json")
++		if body != nil {
++			req.Header.Set("Content-Type", "application/json")
++		}
++		resp, err := c.hc.Do(req)
++		if err != nil {
++			return nil, err
++		}
++		if resp.StatusCode != http.StatusTooManyRequests {
++			return resp, nil
++		}
++		_, _ = io.Copy(io.Discard, resp.Body)
++		_ = resp.Body.Close()
++		if attempt >= maxRateLimitRetries {
++			return nil, &APIError{
++				Status:  429,
++				Message: fmt.Sprintf("still rate limited after %d retries", attempt),
++			}
++		}
++		c.throttled++
++		c.sleep(retryAfter(resp.Header))
++	}
++}
++
++// retryAfter reads the documented Retry-After header (seconds).
++func retryAfter(h http.Header) time.Duration {
++	if s := h.Get("Retry-After"); s != "" {
++		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n >= 0 {
++			return time.Duration(n) * time.Second
++		}
++	}
++	return time.Second
++}
++
++func (c *Client) apiError(resp *http.Response) error {
++	data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
++	message := strings.TrimSpace(string(data))
++	var doc struct {
++		Message any    `json:"message"`
++		Error   string `json:"error"`
++	}
++	if json.Unmarshal(data, &doc) == nil {
++		switch m := doc.Message.(type) {
++		case string:
++			message = m
++		case nil:
++			if doc.Error != "" {
++				message = doc.Error
++			}
++		default:
++			if enc, err := json.Marshal(m); err == nil {
++				message = string(enc)
++			}
++		}
++	}
++	return &APIError{Status: resp.StatusCode, Message: message}
++}
++
++func (c *Client) getJSON(ctx context.Context, path string, out any) (http.Header, error) {
++	resp, err := c.do(ctx, http.MethodGet, path, nil)
++	if err != nil {
++		return nil, err
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		return nil, c.apiError(resp)
++	}
++	return resp.Header, json.NewDecoder(resp.Body).Decode(out)
++}
++
++// CreatePipeline is POST /projects/:id/pipeline with ref and variables.
++func (c *Client) CreatePipeline(ctx context.Context, projectID int, ref string, vars []Variable) (*Pipeline, error) {
++	body := map[string]any{"ref": ref}
++	if len(vars) > 0 {
++		body["variables"] = vars
++	}
++	resp, err := c.do(ctx, http.MethodPost, fmt.Sprintf("/api/v4/projects/%d/pipeline", projectID), body)
++	if err != nil {
++		return nil, err
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusCreated {
++		return nil, c.apiError(resp)
++	}
++	var p Pipeline
++	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
++		return nil, err
++	}
++	return &p, nil
++}
++
++// GetPipeline is GET /projects/:id/pipelines/:pipeline_id.
++func (c *Client) GetPipeline(ctx context.Context, projectID, pipelineID int) (*Pipeline, error) {
++	var p Pipeline
++	path := fmt.Sprintf("/api/v4/projects/%d/pipelines/%d", projectID, pipelineID)
++	if _, err := c.getJSON(ctx, path, &p); err != nil {
++		return nil, err
++	}
++	return &p, nil
++}
++
++// ListPipelineJobs pages GET /projects/:id/pipelines/:pipeline_id/jobs by
++// following the documented x-next-page header until it comes back empty.
++func (c *Client) ListPipelineJobs(ctx context.Context, projectID, pipelineID, perPage int) ([]Job, error) {
++	var all []Job
++	page := "1"
++	for page != "" {
++		var batch []Job
++		path := fmt.Sprintf(
++			"/api/v4/projects/%d/pipelines/%d/jobs?per_page=%d&page=%s",
++			projectID, pipelineID, perPage, page,
++		)
++		hdr, err := c.getJSON(ctx, path, &batch)
++		if err != nil {
++			return all, err
++		}
++		all = append(all, batch...)
++		page = strings.TrimSpace(hdr.Get("x-next-page"))
++	}
++	return all, nil
++}
++
++// JobTrace is GET /projects/:id/jobs/:job_id/trace, served as plain text.
++func (c *Client) JobTrace(ctx context.Context, projectID, jobID int) (string, error) {
++	resp, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/api/v4/projects/%d/jobs/%d/trace", projectID, jobID), nil)
++	if err != nil {
++		return "", err
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		return "", c.apiError(resp)
++	}
++	data, err := io.ReadAll(resp.Body)
++	return string(data), err
++}
++
++// CancelPipeline is POST /projects/:id/pipelines/:pipeline_id/cancel; the
++// docs promise 200 regardless of the pipeline's state.
++func (c *Client) CancelPipeline(ctx context.Context, projectID, pipelineID int) error {
++	path := fmt.Sprintf("/api/v4/projects/%d/pipelines/%d/cancel", projectID, pipelineID)
++	resp, err := c.do(ctx, http.MethodPost, path, nil)
++	if err != nil {
++		return err
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		return c.apiError(resp)
++	}
++	_, _ = io.Copy(io.Discard, resp.Body)
++	return nil
++}
+diff --git a/types.go b/types.go
+new file mode 100644
+index 0000000..f25b2a7
+--- /dev/null
++++ b/types.go
+@@ -0,0 +1,59 @@
++// Package glpipe launches and watches GitLab CI pipelines through the
++// documented REST v4 surface (docs/contract.json pins the wire contract).
++package glpipe
++
++import "fmt"
++
++// Variable is one pipeline variable for POST /projects/:id/pipeline.
++// variable_type defaults to env_var server-side, so it is omitted when unset.
++type Variable struct {
++	Key          string `json:"key"`
++	Value        string `json:"value"`
++	VariableType string `json:"variable_type,omitempty"`
++}
++
++// Pipeline mirrors the documented pipeline resource fields we consume.
++type Pipeline struct {
++	ID        int    `json:"id"`
++	IID       int    `json:"iid"`
++	ProjectID int    `json:"project_id"`
++	Status    string `json:"status"`
++	Source    string `json:"source"`
++	Ref       string `json:"ref"`
++	SHA       string `json:"sha"`
++	WebURL    string `json:"web_url"`
++}
++
++// Job mirrors the documented job resource fields we consume.
++type Job struct {
++	ID           int    `json:"id"`
++	Name         string `json:"name"`
++	Stage        string `json:"stage"`
++	Status       string `json:"status"`
++	Ref          string `json:"ref"`
++	AllowFailure bool   `json:"allow_failure"`
++	WebURL       string `json:"web_url"`
++}
++
++// Report is the structured outcome of a watch run. It is returned even on
++// cancellation or poll-budget exhaustion, carrying whatever was observed.
++type Report struct {
++	PipelineID      int
++	Status          string
++	Completed       bool
++	Polls           int
++	Throttled       int
++	Jobs            []Job
++	FailedTraces    map[int]string
++	CancelRequested bool
++}
++
++// APIError is a non-2xx GitLab response. It never contains the token.
++type APIError struct {
++	Status  int
++	Message string
++}
++
++func (e *APIError) Error() string {
++	return fmt.Sprintf("gitlab answered %d: %s", e.Status, e.Message)
++}
+diff --git a/watcher.go b/watcher.go
+new file mode 100644
+index 0000000..60b3240
+--- /dev/null
++++ b/watcher.go
+@@ -0,0 +1,93 @@
++package glpipe
++
++import (
++	"context"
++	"fmt"
++	"time"
++)
++
++// terminalStatuses per the documented pipeline status enumeration. Note
++// that "canceling", "waiting_for_resource", "waiting_for_callback" and
++// friends are in-flight states — only these four end a watch.
++var terminalStatuses = map[string]bool{
++	"success":  true,
++	"failed":   true,
++	"canceled": true,
++	"skipped":  true,
++}
++
++// Watcher launches a pipeline and follows it to a terminal state.
++type Watcher struct {
++	Client   *Client
++	Pace     func(attempt int) // runs between consecutive status polls
++	PerPage  int
++	MaxPolls int
++}
++
++// Run creates the pipeline, polls it to a terminal status, then collects
++// its jobs and the traces of failed jobs. On context cancellation it fires
++// a best-effort server-side cancel and returns the partial report together
++// with the context error.
++func (w *Watcher) Run(ctx context.Context, projectID int, ref string, vars []Variable) (*Report, error) {
++	report := &Report{FailedTraces: map[int]string{}}
++	defer func() { report.Throttled = w.Client.ThrottleCount() }()
++
++	created, err := w.Client.CreatePipeline(ctx, projectID, ref, vars)
++	if err != nil {
++		return report, err
++	}
++	report.PipelineID = created.ID
++
++	for attempt := 1; ; attempt++ {
++		if ctx.Err() != nil {
++			w.requestCancel(projectID, report)
++			return report, ctx.Err()
++		}
++		current, err := w.Client.GetPipeline(ctx, projectID, created.ID)
++		if err != nil {
++			return report, err
++		}
++		report.Polls++
++		report.Status = current.Status
++		if terminalStatuses[current.Status] {
++			report.Completed = true
++			break
++		}
++		if report.Polls >= w.MaxPolls {
++			return report, fmt.Errorf(
++				"pipeline %d still %q after %d polls", created.ID, current.Status, report.Polls,
++			)
++		}
++		w.Pace(attempt)
++	}
++
++	jobs, err := w.Client.ListPipelineJobs(ctx, projectID, created.ID, w.PerPage)
++	if err != nil {
++		return report, err
++	}
++	report.Jobs = jobs
++	for _, j := range jobs {
++		if j.Status != "failed" {
++			continue
++		}
++		trace, err := w.Client.JobTrace(ctx, projectID, j.ID)
++		if err != nil {
++			return report, err
++		}
++		report.FailedTraces[j.ID] = trace
++	}
++	return report, nil
++}
++
++// requestCancel best-effort cancels the pipeline server-side after the
++// caller's context died; it runs on its own short-lived context.
++func (w *Watcher) requestCancel(projectID int, report *Report) {
++	if report.PipelineID == 0 {
++		return
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	if err := w.Client.CancelPipeline(ctx, projectID, report.PipelineID); err == nil {
++		report.CancelRequested = true
++	}
++}

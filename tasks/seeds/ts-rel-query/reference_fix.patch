@@ -1,0 +1,311 @@
+diff --git a/db.ts b/db.ts
+new file mode 100644
+index 0000000..1f53b45
+--- /dev/null
++++ b/db.ts
+@@ -0,0 +1,53 @@
++export type Row = Record<string, unknown>;
++
++interface StoredTable {
++  columns: string[];
++  rows: Row[];
++}
++
++export class Database {
++  private byName = new Map<string, StoredTable>();
++
++  table(name: string, columns: string[], rows: Row[]): void {
++    if (this.byName.has(name)) throw new Error(`table "${name}" already exists`);
++    const declared = new Set<string>();
++    for (const col of columns) {
++      if (declared.has(col)) throw new Error(`duplicate column "${col}" in table "${name}"`);
++      declared.add(col);
++    }
++    const copied = rows.map((row, i) => {
++      for (const col of columns) {
++        if (!(col in row)) throw new Error(`row ${i} of "${name}" is missing column "${col}"`);
++      }
++      for (const key of Object.keys(row)) {
++        if (!declared.has(key)) throw new Error(`row ${i} of "${name}" has undeclared column "${key}"`);
++      }
++      return { ...row };
++    });
++    this.byName.set(name, { columns: [...columns], rows: copied });
++  }
++
++  private lookup(name: string): StoredTable {
++    const table = this.byName.get(name);
++    if (!table) throw new Error(`unknown table "${name}"`);
++    return table;
++  }
++
++  tables(): string[] {
++    return [...this.byName.keys()].sort();
++  }
++
++  columns(name: string): string[] {
++    return [...this.lookup(name).columns];
++  }
++
++  rowCount(name: string): number {
++    return this.lookup(name).rows.length;
++  }
++
++  /** Fresh copies for query execution — callers may mutate freely. */
++  snapshot(name: string): { columns: string[]; rows: Row[] } {
++    const table = this.lookup(name);
++    return { columns: [...table.columns], rows: table.rows.map((r) => ({ ...r })) };
++  }
++}
+diff --git a/ops.ts b/ops.ts
+new file mode 100644
+index 0000000..95cd546
+--- /dev/null
++++ b/ops.ts
+@@ -0,0 +1,55 @@
++import type { Row } from './db.ts';
++
++export type WhereOp = 'eq' | 'ne' | 'lt' | 'lte' | 'gt' | 'gte' | 'in';
++export type AggFn = 'count' | 'sum' | 'avg' | 'min' | 'max';
++
++const WHERE_OPS = new Set<string>(['eq', 'ne', 'lt', 'lte', 'gt', 'gte', 'in']);
++const AGG_FNS = new Set<string>(['count', 'sum', 'avg', 'min', 'max']);
++
++export function requireColumn(columns: string[], field: string): void {
++  if (!columns.includes(field)) throw new Error(`unknown column "${field}"`);
++}
++
++export function matches(value: unknown, op: string, target: unknown): boolean {
++  if (!WHERE_OPS.has(op)) throw new Error(`unknown operator "${op}"`);
++  switch (op) {
++    case 'eq':
++      return value === target;
++    case 'ne':
++      return value !== target;
++    case 'lt':
++      return (value as number) < (target as number);
++    case 'lte':
++      return (value as number) <= (target as number);
++    case 'gt':
++      return (value as number) > (target as number);
++    case 'gte':
++      return (value as number) >= (target as number);
++    case 'in':
++      if (!Array.isArray(target)) throw new Error(`the 'in' operator needs an array of candidates`);
++      return target.includes(value);
++    default:
++      return false;
++  }
++}
++
++export function aggregate(fn: string, field: string | undefined, rows: Row[]): unknown {
++  if (!AGG_FNS.has(fn)) throw new Error(`unknown aggregate function "${fn}"`);
++  if (fn === 'count') return rows.length;
++  if (field === undefined) throw new Error(`aggregate "${fn}" needs a field`);
++  const values = rows.map((r) => r[field]);
++  if (fn === 'sum' || fn === 'avg') {
++    let sum = 0;
++    for (const v of values) {
++      if (typeof v !== 'number') throw new Error(`column "${field}" is not numeric`);
++      sum += v;
++    }
++    return fn === 'sum' ? sum : sum / values.length;
++  }
++  // min / max — numbers or strings, plain < comparison
++  let best = values[0];
++  for (const v of values.slice(1)) {
++    if (fn === 'min' ? (v as number) < (best as number) : (v as number) > (best as number)) best = v;
++  }
++  return best;
++}
+diff --git a/query.ts b/query.ts
+new file mode 100644
+index 0000000..8f8ae7f
+--- /dev/null
++++ b/query.ts
+@@ -0,0 +1,185 @@
++import { Database, type Row } from './db.ts';
++import { matches, aggregate, requireColumn, type WhereOp, type AggFn } from './ops.ts';
++
++interface JoinSpec { table: string; left: string; right: string }
++interface WhereSpec { field: string; op: string; value: unknown }
++interface AggSpec { alias: string; fn: string; field?: string }
++interface OrderSpec { field: string; dir: 'asc' | 'desc' }
++
++export class Query {
++  private db: Database;
++  private from: string;
++  private joins: JoinSpec[] = [];
++  private wheres: WhereSpec[] = [];
++  private groups: string[] = [];
++  private aggs: AggSpec[] = [];
++  private havings: WhereSpec[] = [];
++  private orders: OrderSpec[] = [];
++  private skip = 0;
++  private take: number | null = null;
++  private projection: string[] | null = null;
++
++  constructor(db: Database, table: string) {
++    db.columns(table); // throws on unknown table
++    this.db = db;
++    this.from = table;
++  }
++
++  select(...cols: string[]): this {
++    this.projection = cols;
++    return this;
++  }
++
++  where(field: string, op: WhereOp, value: unknown): this {
++    this.wheres.push({ field, op, value });
++    return this;
++  }
++
++  join(table: string, left: string, right: string): this {
++    this.joins.push({ table, left, right });
++    return this;
++  }
++
++  groupBy(...fields: string[]): this {
++    this.groups.push(...fields);
++    return this;
++  }
++
++  agg(alias: string, fn: AggFn, field?: string): this {
++    this.aggs.push({ alias, fn, field });
++    return this;
++  }
++
++  having(field: string, op: WhereOp, value: unknown): this {
++    this.havings.push({ field, op, value });
++    return this;
++  }
++
++  orderBy(field: string, dir: 'asc' | 'desc' = 'asc'): this {
++    if (dir !== 'asc' && dir !== 'desc') throw new Error(`unknown sort direction "${dir}"`);
++    this.orders.push({ field, dir });
++    return this;
++  }
++
++  offset(n: number): this {
++    if (!Number.isInteger(n) || n < 0) throw new Error('offset must be a non-negative integer');
++    this.skip = n;
++    return this;
++  }
++
++  limit(n: number): this {
++    if (!Number.isInteger(n) || n < 0) throw new Error('limit must be a non-negative integer');
++    this.take = n;
++    return this;
++  }
++
++  run(): Row[] {
++    let { columns, rows } = this.db.snapshot(this.from);
++
++    for (const j of this.joins) {
++      ({ columns, rows } = applyJoin(this.db, columns, rows, j));
++    }
++
++    for (const w of this.wheres) {
++      requireColumn(columns, w.field);
++      rows = rows.filter((r) => matches(r[w.field], w.op, w.value));
++    }
++
++    if (this.groups.length > 0 || this.aggs.length > 0) {
++      ({ columns, rows } = applyGrouping(columns, rows, this.groups, this.aggs));
++    }
++
++    for (const h of this.havings) {
++      requireColumn(columns, h.field);
++      rows = rows.filter((r) => matches(r[h.field], h.op, h.value));
++    }
++
++    if (this.orders.length > 0) {
++      for (const o of this.orders) requireColumn(columns, o.field);
++      rows = [...rows].sort((a, b) => {
++        for (const { field, dir } of this.orders) {
++          const av = a[field] as number;
++          const bv = b[field] as number;
++          if (av < bv) return dir === 'asc' ? -1 : 1;
++          if (av > bv) return dir === 'asc' ? 1 : -1;
++        }
++        return 0;
++      });
++    }
++
++    rows = rows.slice(this.skip, this.take === null ? undefined : this.skip + this.take);
++
++    if (this.projection !== null) {
++      const cols = this.projection;
++      for (const c of cols) requireColumn(columns, c);
++      return rows.map((r) => {
++        const out: Row = {};
++        for (const c of cols) out[c] = r[c];
++        return out;
++      });
++    }
++
++    return rows.map((r) => ({ ...r }));
++  }
++}
++
++function applyJoin(
++  db: Database,
++  columns: string[],
++  rows: Row[],
++  spec: JoinSpec,
++): { columns: string[]; rows: Row[] } {
++  const other = db.snapshot(spec.table);
++  requireColumn(columns, spec.left);
++  requireColumn(other.columns, spec.right);
++
++  const rename = new Map<string, string>();
++  for (const col of other.columns) {
++    rename.set(col, columns.includes(col) ? `${spec.table}.${col}` : col);
++  }
++
++  const merged: Row[] = [];
++  for (const l of rows) {
++    for (const r of other.rows) {
++      if (l[spec.left] !== r[spec.right]) continue;
++      const row: Row = { ...l };
++      for (const col of other.columns) row[rename.get(col)!] = r[col];
++      merged.push(row);
++    }
++  }
++  return { columns: [...columns, ...[...rename.values()]], rows: merged };
++}
++
++function applyGrouping(
++  columns: string[],
++  rows: Row[],
++  groups: string[],
++  aggs: AggSpec[],
++): { columns: string[]; rows: Row[] } {
++  for (const g of groups) requireColumn(columns, g);
++  const aliases = new Set<string>();
++  for (const a of aggs) {
++    if (groups.includes(a.alias) || aliases.has(a.alias)) {
++      throw new Error(`aggregate alias "${a.alias}" collides with another output column`);
++    }
++    aliases.add(a.alias);
++    if (a.field !== undefined) requireColumn(columns, a.field);
++  }
++
++  const buckets = new Map<string, Row[]>();
++  for (const row of rows) {
++    const key = JSON.stringify(groups.map((g) => row[g]));
++    const bucket = buckets.get(key);
++    if (bucket) bucket.push(row);
++    else buckets.set(key, [row]);
++  }
++
++  const out: Row[] = [];
++  for (const bucket of buckets.values()) {
++    const row: Row = {};
++    for (const g of groups) row[g] = bucket[0][g];
++    for (const a of aggs) row[a.alias] = aggregate(a.fn, a.field, bucket);
++    out.push(row);
++  }
++  return { columns: [...groups, ...aliases], rows: out };
++}

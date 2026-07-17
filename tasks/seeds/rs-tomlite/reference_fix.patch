@@ -1,0 +1,489 @@
+diff --git a/src/lib.rs b/src/lib.rs
+new file mode 100644
+index 0000000..f19c623
+--- /dev/null
++++ b/src/lib.rs
+@@ -0,0 +1,483 @@
++//! Lossless TOML-lite parser and surgical editor.
++//!
++//! The document model is line-oriented: every source line is kept verbatim
++//! alongside its parsed meaning, so `render()` reproduces the input byte for
++//! byte and `set()` can rewrite exactly one line (or insert new ones) while
++//! everything else — comments, blank lines, eccentric spacing — survives
++//! untouched.
++
++use std::collections::HashSet;
++use std::fmt;
++
++/// A parsed value. Floats keep their identity: `8.0` is `Float`, never `Int`.
++#[derive(Debug, Clone, PartialEq)]
++pub enum Value {
++    Str(String),
++    Int(i64),
++    Float(f64),
++    Bool(bool),
++    Array(Vec<Value>),
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum ParseErrorKind {
++    BadHeader,
++    DuplicateTable { name: String },
++    BadKey,
++    MissingEquals,
++    BadValue,
++    UnterminatedString,
++    BadEscape,
++    DuplicateKey { key: String },
++    TrailingChars,
++}
++
++/// A parse failure at a 1-based source line.
++#[derive(Debug, Clone, PartialEq)]
++pub struct ParseError {
++    pub line: usize,
++    pub kind: ParseErrorKind,
++}
++
++impl fmt::Display for ParseError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "line {}: ", self.line)?;
++        match &self.kind {
++            ParseErrorKind::BadHeader => write!(f, "malformed table header"),
++            ParseErrorKind::DuplicateTable { name } => write!(f, "duplicate table '{name}'"),
++            ParseErrorKind::BadKey => write!(f, "malformed key"),
++            ParseErrorKind::MissingEquals => write!(f, "expected '=' after key"),
++            ParseErrorKind::BadValue => write!(f, "unrecognized value"),
++            ParseErrorKind::UnterminatedString => write!(f, "unterminated string"),
++            ParseErrorKind::BadEscape => write!(f, "invalid escape sequence"),
++            ParseErrorKind::DuplicateKey { key } => write!(f, "duplicate key '{key}'"),
++            ParseErrorKind::TrailingChars => write!(f, "unexpected trailing characters"),
++        }
++    }
++}
++
++impl std::error::Error for ParseError {}
++
++fn err(line: usize, kind: ParseErrorKind) -> ParseError {
++    ParseError { line, kind }
++}
++
++#[derive(Debug, Clone)]
++enum LineKind {
++    Blank,
++    Comment,
++    Header {
++        name: String,
++    },
++    Kv {
++        table: String,
++        key: String,
++        value: Value,
++    },
++}
++
++/// One source line: the exact original text plus what it means.
++#[derive(Debug, Clone)]
++struct Line {
++    raw: String,
++    kind: LineKind,
++}
++
++/// A parsed document. The line list is the single source of truth: lookups,
++/// listings, rendering and edits all walk it in order, so nothing about the
++/// output ever depends on hash-map iteration.
++#[derive(Debug, Clone)]
++pub struct Document {
++    lines: Vec<Line>,
++    trailing_newline: bool,
++}
++
++impl Document {
++    pub fn parse(input: &str) -> Result<Document, ParseError> {
++        let trailing_newline = input.ends_with('\n');
++        let mut raw_lines: Vec<&str> = input.split('\n').collect();
++        if trailing_newline {
++            raw_lines.pop();
++        }
++        if input.is_empty() {
++            raw_lines.clear();
++        }
++
++        let mut lines = Vec::with_capacity(raw_lines.len());
++        let mut current_table = String::new();
++        let mut seen_tables: HashSet<String> = HashSet::new();
++        let mut seen_keys: HashSet<(String, String)> = HashSet::new();
++
++        for (idx, raw) in raw_lines.iter().enumerate() {
++            let line_no = idx + 1;
++            let trimmed = raw.trim();
++            let kind = if trimmed.is_empty() {
++                LineKind::Blank
++            } else if trimmed.starts_with('#') {
++                LineKind::Comment
++            } else if trimmed.starts_with('[') {
++                let name =
++                    parse_header(trimmed).ok_or_else(|| err(line_no, ParseErrorKind::BadHeader))?;
++                if !seen_tables.insert(name.clone()) {
++                    return Err(err(line_no, ParseErrorKind::DuplicateTable { name }));
++                }
++                current_table = name.clone();
++                LineKind::Header { name }
++            } else {
++                let (key, value) = parse_kv(trimmed, line_no)?;
++                if !seen_keys.insert((current_table.clone(), key.clone())) {
++                    return Err(err(line_no, ParseErrorKind::DuplicateKey { key }));
++                }
++                LineKind::Kv {
++                    table: current_table.clone(),
++                    key,
++                    value,
++                }
++            };
++            lines.push(Line {
++                raw: (*raw).to_string(),
++                kind,
++            });
++        }
++        Ok(Document {
++            lines,
++            trailing_newline,
++        })
++    }
++
++    /// Reproduce the source byte-identically (modulo edits made via `set`).
++    pub fn render(&self) -> String {
++        let mut out = self
++            .lines
++            .iter()
++            .map(|l| l.raw.as_str())
++            .collect::<Vec<_>>()
++            .join("\n");
++        if self.trailing_newline {
++            out.push('\n');
++        }
++        out
++    }
++
++    pub fn get(&self, table: &str, key: &str) -> Option<&Value> {
++        self.lines.iter().find_map(|l| match &l.kind {
++            LineKind::Kv {
++                table: t,
++                key: k,
++                value,
++            } if t == table && k == key => Some(value),
++            _ => None,
++        })
++    }
++
++    /// Tables in document order; the root table "" leads only when it
++    /// actually holds keys.
++    pub fn tables(&self) -> Vec<String> {
++        let mut out = Vec::new();
++        if self
++            .lines
++            .iter()
++            .any(|l| matches!(&l.kind, LineKind::Kv { table, .. } if table.is_empty()))
++        {
++            out.push(String::new());
++        }
++        for l in &self.lines {
++            if let LineKind::Header { name } = &l.kind {
++                out.push(name.clone());
++            }
++        }
++        out
++    }
++
++    /// Keys of one table in document order; unknown tables have none.
++    pub fn keys(&self, table: &str) -> Vec<String> {
++        self.lines
++            .iter()
++            .filter_map(|l| match &l.kind {
++                LineKind::Kv { table: t, key, .. } if t == table => Some(key.clone()),
++                _ => None,
++            })
++            .collect()
++    }
++
++    /// Surgical edit: rewrite the key's line in canonical form, or insert a
++    /// canonical line at the table's natural growth point. No other line is
++    /// touched.
++    pub fn set(&mut self, table: &str, key: &str, value: Value) {
++        let rendered = format!("{key} = {}", render_value(&value));
++
++        // Existing key: canonicalize exactly that line.
++        for l in &mut self.lines {
++            if let LineKind::Kv {
++                table: t,
++                key: k,
++                value: v,
++            } = &mut l.kind
++            {
++                if t == table && k == key {
++                    l.raw = rendered;
++                    *v = value;
++                    return;
++                }
++            }
++        }
++
++        let new_line = Line {
++            raw: rendered,
++            kind: LineKind::Kv {
++                table: table.to_string(),
++                key: key.to_string(),
++                value,
++            },
++        };
++
++        // Existing table (the root always "exists"): insert after its last
++        // key line, or right after its header when it has none. A root table
++        // with no keys grows at the very top of the document.
++        let insert_at = if table.is_empty() {
++            Some(
++                self.lines
++                    .iter()
++                    .rposition(|l| matches!(&l.kind, LineKind::Kv { table: t, .. } if t.is_empty()))
++                    .map_or(0, |i| i + 1),
++            )
++        } else {
++            self.lines
++                .iter()
++                .position(|l| matches!(&l.kind, LineKind::Header { name } if name == table))
++                .map(|header_idx| {
++                    self.lines
++                        .iter()
++                        .rposition(
++                            |l| matches!(&l.kind, LineKind::Kv { table: t, .. } if t == table),
++                        )
++                        .map_or(header_idx + 1, |i| i + 1)
++                })
++        };
++        if let Some(at) = insert_at {
++            self.lines.insert(at, new_line);
++            return;
++        }
++
++        // Brand-new table: append at the end, blank-separated from existing
++        // content (no padding when the document is empty or ends blank).
++        if let Some(last) = self.lines.last() {
++            if !last.raw.trim().is_empty() {
++                self.lines.push(Line {
++                    raw: String::new(),
++                    kind: LineKind::Blank,
++                });
++            }
++        }
++        self.lines.push(Line {
++            raw: format!("[{table}]"),
++            kind: LineKind::Header {
++                name: table.to_string(),
++            },
++        });
++        self.lines.push(new_line);
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Line-level parsers
++// ---------------------------------------------------------------------------
++
++fn valid_bare(s: &str) -> bool {
++    !s.is_empty()
++        && s.chars()
++            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
++}
++
++/// `[a.b-c]` -> `a.b-c`. Whitespace tolerated just inside the brackets;
++/// segments are bare names with no spaces around the dots.
++fn parse_header(trimmed: &str) -> Option<String> {
++    let inner = trimmed.strip_prefix('[')?.strip_suffix(']')?.trim();
++    if inner.is_empty() || !inner.split('.').all(valid_bare) {
++        return None;
++    }
++    Some(inner.to_string())
++}
++
++fn parse_kv(trimmed: &str, line_no: usize) -> Result<(String, Value), ParseError> {
++    let eq = trimmed
++        .find('=')
++        .ok_or_else(|| err(line_no, ParseErrorKind::MissingEquals))?;
++    let key = trimmed[..eq].trim();
++    if !valid_bare(key) {
++        return Err(err(line_no, ParseErrorKind::BadKey));
++    }
++    let value = parse_value(trimmed[eq + 1..].trim(), line_no)?;
++    Ok((key.to_string(), value))
++}
++
++fn parse_value(t: &str, line_no: usize) -> Result<Value, ParseError> {
++    if t.is_empty() {
++        return Err(err(line_no, ParseErrorKind::BadValue));
++    }
++    if t.starts_with('"') {
++        let (s, consumed) = parse_string(t, line_no)?;
++        if !t[consumed..].trim().is_empty() {
++            return Err(err(line_no, ParseErrorKind::TrailingChars));
++        }
++        return Ok(Value::Str(s));
++    }
++    if t.starts_with('[') {
++        let (items, consumed) = parse_array(t, line_no)?;
++        if !t[consumed..].trim().is_empty() {
++            return Err(err(line_no, ParseErrorKind::TrailingChars));
++        }
++        return Ok(Value::Array(items));
++    }
++    // Bare scalar: the token runs to the first whitespace; whatever follows
++    // must be nothing (inline comments are unsupported by design).
++    let head_end = t.find(char::is_whitespace).unwrap_or(t.len());
++    let scalar =
++        parse_scalar(&t[..head_end]).ok_or_else(|| err(line_no, ParseErrorKind::BadValue))?;
++    if !t[head_end..].trim().is_empty() {
++        return Err(err(line_no, ParseErrorKind::TrailingChars));
++    }
++    Ok(scalar)
++}
++
++fn parse_scalar(tok: &str) -> Option<Value> {
++    if tok == "true" {
++        return Some(Value::Bool(true));
++    }
++    if tok == "false" {
++        return Some(Value::Bool(false));
++    }
++    let unsigned = tok.strip_prefix(['+', '-']).unwrap_or(tok);
++    if unsigned.is_empty() {
++        return None;
++    }
++    if unsigned.bytes().all(|b| b.is_ascii_digit()) {
++        return tok.parse::<i64>().ok().map(Value::Int);
++    }
++    if let Some((int_part, frac_part)) = unsigned.split_once('.') {
++        if !int_part.is_empty()
++            && !frac_part.is_empty()
++            && int_part.bytes().all(|b| b.is_ascii_digit())
++            && frac_part.bytes().all(|b| b.is_ascii_digit())
++        {
++            return tok.parse::<f64>().ok().map(Value::Float);
++        }
++    }
++    None
++}
++
++/// Parse a quoted string starting at byte 0 of `t`. Returns the decoded
++/// string and the byte offset just past the closing quote.
++fn parse_string(t: &str, line_no: usize) -> Result<(String, usize), ParseError> {
++    let mut out = String::new();
++    let mut chars = t.char_indices();
++    chars.next(); // opening quote
++    while let Some((i, c)) = chars.next() {
++        match c {
++            '"' => return Ok((out, i + 1)),
++            '\\' => {
++                let (_, esc) = chars
++                    .next()
++                    .ok_or_else(|| err(line_no, ParseErrorKind::UnterminatedString))?;
++                out.push(match esc {
++                    '"' => '"',
++                    '\\' => '\\',
++                    'n' => '\n',
++                    't' => '\t',
++                    'r' => '\r',
++                    _ => return Err(err(line_no, ParseErrorKind::BadEscape)),
++                });
++            }
++            c => out.push(c),
++        }
++    }
++    Err(err(line_no, ParseErrorKind::UnterminatedString))
++}
++
++/// Parse a flat array starting at byte 0 of `t`. Returns the items and the
++/// byte offset just past the closing bracket.
++fn parse_array(t: &str, line_no: usize) -> Result<(Vec<Value>, usize), ParseError> {
++    let bytes = t.as_bytes();
++    let mut items = Vec::new();
++    let mut i = 1usize; // past '['
++    let mut expect_value = true; // right after '[' or ','
++    loop {
++        while i < t.len() && bytes[i].is_ascii_whitespace() {
++            i += 1;
++        }
++        if i >= t.len() {
++            return Err(err(line_no, ParseErrorKind::BadValue)); // unclosed
++        }
++        if bytes[i] == b']' {
++            if expect_value && !items.is_empty() {
++                return Err(err(line_no, ParseErrorKind::BadValue)); // trailing comma
++            }
++            return Ok((items, i + 1));
++        }
++        if !expect_value {
++            if bytes[i] == b',' {
++                i += 1;
++                expect_value = true;
++                continue;
++            }
++            return Err(err(line_no, ParseErrorKind::BadValue));
++        }
++        if bytes[i] == b'"' {
++            let (s, consumed) = parse_string(&t[i..], line_no)?;
++            items.push(Value::Str(s));
++            i += consumed;
++        } else if bytes[i] == b'[' {
++            return Err(err(line_no, ParseErrorKind::BadValue)); // flat arrays only
++        } else {
++            let start = i;
++            while i < t.len()
++                && bytes[i] != b','
++                && bytes[i] != b']'
++                && !bytes[i].is_ascii_whitespace()
++            {
++                i += 1;
++            }
++            items.push(
++                parse_scalar(&t[start..i]).ok_or_else(|| err(line_no, ParseErrorKind::BadValue))?,
++            );
++        }
++        expect_value = false;
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Canonical rendering (used by `set`)
++// ---------------------------------------------------------------------------
++
++fn render_value(v: &Value) -> String {
++    match v {
++        Value::Str(s) => {
++            let mut out = String::from("\"");
++            for c in s.chars() {
++                match c {
++                    '"' => out.push_str("\\\""),
++                    '\\' => out.push_str("\\\\"),
++                    '\n' => out.push_str("\\n"),
++                    '\t' => out.push_str("\\t"),
++                    '\r' => out.push_str("\\r"),
++                    c => out.push(c),
++                }
++            }
++            out.push('"');
++            out
++        }
++        Value::Int(i) => i.to_string(),
++        Value::Float(x) => {
++            if x.fract() == 0.0 && x.is_finite() {
++                format!("{x:.1}")
++            } else {
++                format!("{x}")
++            }
++        }
++        Value::Bool(b) => b.to_string(),
++        Value::Array(items) => {
++            let inner: Vec<String> = items.iter().map(render_value).collect();
++            format!("[{}]", inner.join(", "))
++        }
++    }
++}

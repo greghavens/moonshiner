@@ -1,0 +1,233 @@
+diff --git a/export.go b/export.go
+new file mode 100644
+index 0000000..d492654
+--- /dev/null
++++ b/export.go
+@@ -0,0 +1,136 @@
++package ddbexport
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"time"
++
++	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
++	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
++)
++
++// DynamoAPI is the narrow slice of the DynamoDB client the exporter needs;
++// *dynamodb.Client satisfies it, tests inject a fake.
++type DynamoAPI interface {
++	Query(ctx context.Context, in *dynamodb.QueryInput, optFns ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error)
++	BatchWriteItem(ctx context.Context, in *dynamodb.BatchWriteItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.BatchWriteItemOutput, error)
++}
++
++// Options tunes paging and the bounded backoff for batch retries.
++type Options struct {
++	PageLimit       int32
++	MaxBatchRetries int
++	BaseDelay       time.Duration
++	MaxDelay        time.Duration
++	Sleep           func(time.Duration)
++}
++
++type Exporter struct {
++	api  DynamoAPI
++	opts Options
++}
++
++func New(api DynamoAPI, opts Options) *Exporter {
++	if opts.MaxBatchRetries <= 0 {
++		opts.MaxBatchRetries = 3
++	}
++	if opts.BaseDelay <= 0 {
++		opts.BaseDelay = 100 * time.Millisecond
++	}
++	if opts.MaxDelay <= 0 {
++		opts.MaxDelay = 5 * time.Second
++	}
++	if opts.Sleep == nil {
++		opts.Sleep = time.Sleep
++	}
++	return &Exporter{api: api, opts: opts}
++}
++
++// Export reads every page of one device's readings from srcTable and writes
++// them into dstTable, preserving successful writes across batch retries.
++func (e *Exporter) Export(ctx context.Context, srcTable, dstTable, device string, since int64) (Report, error) {
++	var rep Report
++	in, err := BuildQueryInput(srcTable, device, since, e.opts.PageLimit)
++	if err != nil {
++		return rep, err
++	}
++
++	var items []map[string]types.AttributeValue
++	for {
++		out, err := e.api.Query(ctx, in)
++		if err != nil {
++			return rep, err
++		}
++		rep.Pages++
++		rep.ItemsRead += len(out.Items)
++		if out.ConsumedCapacity != nil && out.ConsumedCapacity.CapacityUnits != nil {
++			rep.ReadCapacity += *out.ConsumedCapacity.CapacityUnits
++		}
++		items = append(items, out.Items...)
++		// Only an empty LastEvaluatedKey ends pagination; an empty Items
++		// page with a continuation key means keep going.
++		if len(out.LastEvaluatedKey) == 0 {
++			break
++		}
++		in.ExclusiveStartKey = out.LastEvaluatedKey
++	}
++
++	for start := 0; start < len(items); start += MaxBatchSize {
++		end := start + MaxBatchSize
++		if end > len(items) {
++			end = len(items)
++		}
++		if err := e.flush(ctx, dstTable, items[start:end], &rep); err != nil {
++			return rep, err
++		}
++	}
++	return rep, nil
++}
++
++func (e *Exporter) flush(ctx context.Context, table string, chunk []map[string]types.AttributeValue, rep *Report) error {
++	pending := make([]types.WriteRequest, 0, len(chunk))
++	for _, it := range chunk {
++		pending = append(pending, types.WriteRequest{PutRequest: &types.PutRequest{Item: it}})
++	}
++	for attempt := 0; ; attempt++ {
++		out, err := e.api.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
++			RequestItems:           map[string][]types.WriteRequest{table: pending},
++			ReturnConsumedCapacity: types.ReturnConsumedCapacityTotal,
++		})
++		rep.BatchCalls++
++		if err != nil {
++			var throttled *types.ProvisionedThroughputExceededException
++			if errors.As(err, &throttled) && attempt < e.opts.MaxBatchRetries {
++				e.backoff(attempt)
++				continue
++			}
++			return err
++		}
++		for _, cc := range out.ConsumedCapacity {
++			if cc.CapacityUnits != nil {
++				rep.WriteCapacity += *cc.CapacityUnits
++			}
++		}
++		left := out.UnprocessedItems[table]
++		rep.ItemsWritten += len(pending) - len(left)
++		if len(left) == 0 {
++			return nil
++		}
++		if attempt >= e.opts.MaxBatchRetries {
++			rep.Unprocessed += len(left)
++			return fmt.Errorf("%d of %d items still unprocessed after %d retries: %w",
++				len(left), len(chunk), attempt, ErrUnprocessed)
++		}
++		e.backoff(attempt)
++		pending = left
++	}
++}
++
++func (e *Exporter) backoff(attempt int) {
++	d := e.opts.BaseDelay << attempt
++	if d > e.opts.MaxDelay {
++		d = e.opts.MaxDelay
++	}
++	e.opts.Sleep(d)
++}
+diff --git a/query.go b/query.go
+new file mode 100644
+index 0000000..b873755
+--- /dev/null
++++ b/query.go
+@@ -0,0 +1,58 @@
++package ddbexport
++
++import (
++	"fmt"
++
++	"github.com/aws/aws-sdk-go-v2/aws"
++	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
++	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
++	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
++)
++
++// KeyCondition matches the pinned contract in docs/contract.json: partition
++// equality on the device id plus a sort-key lower bound on the timestamp.
++const KeyCondition = "pk = :device AND sk >= :since"
++
++// Reading is one telemetry row as stored in the readings/archive tables.
++type Reading struct {
++	Device string  `dynamodbav:"pk"`
++	TS     int64   `dynamodbav:"sk"`
++	Metric string  `dynamodbav:"metric"`
++	Value  float64 `dynamodbav:"value"`
++}
++
++// BuildQueryInput assembles the paged Query for one device's readings at or
++// after the given unix-seconds cutoff. Expression values go through the
++// SDK's attributevalue marshaler; Limit is omitted entirely when limit <= 0.
++func BuildQueryInput(table, device string, since int64, limit int32) (*dynamodb.QueryInput, error) {
++	dev, err := attributevalue.Marshal(device)
++	if err != nil {
++		return nil, fmt.Errorf("marshal :device: %w", err)
++	}
++	cutoff, err := attributevalue.Marshal(since)
++	if err != nil {
++		return nil, fmt.Errorf("marshal :since: %w", err)
++	}
++	in := &dynamodb.QueryInput{
++		TableName:              aws.String(table),
++		KeyConditionExpression: aws.String(KeyCondition),
++		ExpressionAttributeValues: map[string]types.AttributeValue{
++			":device": dev,
++			":since":  cutoff,
++		},
++		ReturnConsumedCapacity: types.ReturnConsumedCapacityTotal,
++	}
++	if limit > 0 {
++		in.Limit = aws.Int32(limit)
++	}
++	return in, nil
++}
++
++// DecodeReadings converts raw Query items into Readings via dynamodbav tags.
++func DecodeReadings(items []map[string]types.AttributeValue) ([]Reading, error) {
++	out := make([]Reading, 0, len(items))
++	if err := attributevalue.UnmarshalListOfMaps(items, &out); err != nil {
++		return nil, err
++	}
++	return out, nil
++}
+diff --git a/report.go b/report.go
+new file mode 100644
+index 0000000..e0cb92e
+--- /dev/null
++++ b/report.go
+@@ -0,0 +1,21 @@
++package ddbexport
++
++import "errors"
++
++// MaxBatchSize is the documented BatchWriteItem per-call operation limit.
++const MaxBatchSize = 25
++
++// ErrUnprocessed marks a chunk that still had unprocessed items after the
++// bounded retry budget; the Report keeps counting everything that landed.
++var ErrUnprocessed = errors.New("unprocessed items remain after bounded retries")
++
++// Report summarizes one export run.
++type Report struct {
++	ItemsRead     int
++	ItemsWritten  int
++	Pages         int
++	BatchCalls    int
++	ReadCapacity  float64
++	WriteCapacity float64
++	Unprocessed   int
++}

@@ -1,0 +1,326 @@
+diff --git a/AuditExporter.cs b/AuditExporter.cs
+new file mode 100644
+index 0000000..acd4986
+--- /dev/null
++++ b/AuditExporter.cs
+@@ -0,0 +1,46 @@
++namespace GheAudit;
++
++/// <summary>Checkpointed audit-log export: resumes from the stored after
++/// cursor and advances the checkpoint only once a complete page set has been
++/// delivered.</summary>
++public sealed class AuditExporter
++{
++    private readonly AuditLogClient _client;
++    private readonly ICheckpointStore _store;
++
++    public AuditExporter(AuditLogClient client, ICheckpointStore store)
++    {
++        _client = client;
++        _store = store;
++    }
++
++    public async Task<ExportResult> RunAsync(AuditQuery query, CancellationToken ct = default)
++    {
++        string? after = query.After ?? await _store.LoadAsync(ct);
++        string? url = _client.BuildInitialUrl(query with { After = after });
++
++        var events = new List<AuditEvent>();
++        string? checkpoint = null;
++        try
++        {
++            while (url is not null)
++            {
++                ct.ThrowIfCancellationRequested();
++                var page = await _client.GetPageAsync(url, ct);
++                events.AddRange(page.Events);
++                if (page.NextAfter is not null)
++                    checkpoint = page.NextAfter;
++                url = page.NextUrl;
++            }
++        }
++        catch (AuditApiException ex) when (ex.Status >= 500)
++        {
++            // Incomplete page set: hand back what arrived, advance nothing.
++            return new ExportResult(events, false, null, ex);
++        }
++
++        if (events.Count > 0 && checkpoint is not null)
++            await _store.SaveAsync(checkpoint, ct);
++        return new ExportResult(events, true, checkpoint ?? after, null);
++    }
++}
+diff --git a/AuditLogClient.cs b/AuditLogClient.cs
+new file mode 100644
+index 0000000..2fe4969
+--- /dev/null
++++ b/AuditLogClient.cs
+@@ -0,0 +1,173 @@
++using System.Runtime.CompilerServices;
++using System.Text.Json;
++
++namespace GheAudit;
++
++/// <summary>Streams the GitHub Enterprise Cloud audit log: documented query
++/// encoding, verbatim Link-cursor pagination pinned to the configured origin,
++/// Retry-After pacing through an injected delegate, and streamed JSON
++/// decoding. No sleeps, no token in any error path.</summary>
++public sealed class AuditLogClient
++{
++    private const string Accept = "application/vnd.github+json";
++    private const string ApiVersion = "2026-03-10";
++    private const string UserAgent = "ghe-audit-stream/1.0";
++
++    private readonly Uri _origin;
++    private readonly string _enterprise;
++    private readonly string _token;
++    private readonly HttpClient _http;
++    private readonly Func<TimeSpan, CancellationToken, Task> _pace;
++
++    public AuditLogClient(
++        string baseUrl,
++        string enterprise,
++        string token,
++        HttpClient http,
++        Func<TimeSpan, CancellationToken, Task> pace)
++    {
++        _origin = new Uri(baseUrl.TrimEnd('/'), UriKind.Absolute);
++        _enterprise = enterprise;
++        _token = token;
++        _http = http;
++        _pace = pace;
++    }
++
++    /// <summary>The first-page URL for a query, encoded per the documented
++    /// search syntax: phrase qualifiers joined by a literal '+', each
++    /// percent-encoded; phrase omitted entirely when empty.</summary>
++    public string BuildInitialUrl(AuditQuery query)
++    {
++        var parts = new List<string>();
++        if (query.Phrase.Count > 0)
++            parts.Add("phrase=" + string.Join("+", query.Phrase.Select(Uri.EscapeDataString)));
++        parts.Add("include=" + Uri.EscapeDataString(query.Include));
++        parts.Add("order=" + Uri.EscapeDataString(query.Order));
++        parts.Add("per_page=" + query.PerPage);
++        if (query.After is not null)
++            parts.Add("after=" + Uri.EscapeDataString(query.After));
++        return $"{_origin.ToString().TrimEnd('/')}/enterprises/{Uri.EscapeDataString(_enterprise)}" +
++               $"/audit-log?{string.Join("&", parts)}";
++    }
++
++    /// <summary>All events for a query. The next page is fetched only after
++    /// the current page has been fully consumed, so cancellation between
++    /// pages stops without another request.</summary>
++    public async IAsyncEnumerable<AuditEvent> StreamAsync(
++        AuditQuery query, [EnumeratorCancellation] CancellationToken ct = default)
++    {
++        string? url = BuildInitialUrl(query);
++        while (url is not null)
++        {
++            ct.ThrowIfCancellationRequested();
++            var page = await GetPageAsync(url, ct);
++            foreach (var e in page.Events)
++                yield return e;
++            url = page.NextUrl;
++        }
++    }
++
++    /// <summary>One page fetch with the documented rate-limit handling: on
++    /// 429, pace for the server's Retry-After and retry the identical URL
++    /// once; a second consecutive 429 is terminal.</summary>
++    public async Task<AuditPage> GetPageAsync(string url, CancellationToken ct)
++    {
++        var resp = await SendAsync(url, ct);
++        if ((int)resp.StatusCode == 429)
++        {
++            var wait = resp.Headers.RetryAfter?.Delta ?? TimeSpan.Zero;
++            resp.Dispose();
++            await _pace(wait, ct);
++            resp = await SendAsync(url, ct);
++            if ((int)resp.StatusCode == 429)
++            {
++                var again = resp.Headers.RetryAfter?.Delta ?? wait;
++                resp.Dispose();
++                throw new AuditRateLimitException(again);
++            }
++        }
++
++        using (resp)
++        {
++            if (!resp.IsSuccessStatusCode)
++                throw new AuditApiException((int)resp.StatusCode, await ApiMessageAsync(resp, ct));
++
++            string? nextUrl = ParseNextLink(resp);
++            string? nextAfter = null;
++            if (nextUrl is not null)
++            {
++                var next = new Uri(nextUrl, UriKind.Absolute);
++                if (next.Scheme != _origin.Scheme || next.Host != _origin.Host ||
++                    next.Port != _origin.Port)
++                    throw new AuditSecurityException(next.Host);
++                nextAfter = QueryValue(next, "after");
++            }
++
++            var events = new List<AuditEvent>();
++            await using var stream = await resp.Content.ReadAsStreamAsync(ct);
++            await foreach (var e in JsonSerializer.DeserializeAsyncEnumerable<AuditEvent>(
++                               stream, JsonSerializerOptions.Default, ct))
++            {
++                if (e is not null)
++                    events.Add(e);
++            }
++            return new AuditPage(events, nextUrl, nextAfter);
++        }
++    }
++
++    private async Task<HttpResponseMessage> SendAsync(string url, CancellationToken ct)
++    {
++        using var req = new HttpRequestMessage(HttpMethod.Get, url);
++        req.Headers.TryAddWithoutValidation("Accept", Accept);
++        req.Headers.TryAddWithoutValidation("X-GitHub-Api-Version", ApiVersion);
++        req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + _token);
++        req.Headers.TryAddWithoutValidation("User-Agent", UserAgent);
++        return await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
++    }
++
++    private static async Task<string> ApiMessageAsync(HttpResponseMessage resp, CancellationToken ct)
++    {
++        try
++        {
++            var raw = await resp.Content.ReadAsStringAsync(ct);
++            using var doc = JsonDocument.Parse(raw);
++            if (doc.RootElement.TryGetProperty("message", out var message))
++                return message.GetString() ?? resp.ReasonPhrase ?? "unknown error";
++        }
++        catch (JsonException)
++        {
++            // non-JSON error body: fall through to the reason phrase
++        }
++        return resp.ReasonPhrase ?? "unknown error";
++    }
++
++    private static string? ParseNextLink(HttpResponseMessage resp)
++    {
++        if (!resp.Headers.TryGetValues("Link", out var values))
++            return null;
++        foreach (var header in values)
++        {
++            foreach (var part in header.Split(','))
++            {
++                var segments = part.Split(';');
++                var target = segments[0].Trim();
++                if (!target.StartsWith('<') || !target.EndsWith('>'))
++                    continue;
++                if (segments.Skip(1).Any(p => p.Trim() == "rel=\"next\""))
++                    return target[1..^1];
++            }
++        }
++        return null;
++    }
++
++    private static string? QueryValue(Uri uri, string name)
++    {
++        foreach (var pair in uri.Query.TrimStart('?').Split('&'))
++        {
++            int eq = pair.IndexOf('=');
++            if (eq > 0 && pair[..eq] == name)
++                return Uri.UnescapeDataString(pair[(eq + 1)..]);
++        }
++        return null;
++    }
++}
+diff --git a/AuditModels.cs b/AuditModels.cs
+new file mode 100644
+index 0000000..f56d353
+--- /dev/null
++++ b/AuditModels.cs
+@@ -0,0 +1,89 @@
++using System.Text.Json.Serialization;
++
++namespace GheAudit;
++
++/// <summary>One enterprise audit-log query. Defaults match the exporter's
++/// checkpointing policy: full pages, ascending order.</summary>
++public sealed record AuditQuery
++{
++    public IReadOnlyList<string> Phrase { get; init; } = Array.Empty<string>();
++    public string Include { get; init; } = "web";
++    public string Order { get; init; } = "asc";
++    public int PerPage { get; init; } = 100;
++    public string? After { get; init; }
++}
++
++/// <summary>A decoded audit-log event. Timestamps are UTC epoch milliseconds
++/// as documented; unknown fields are ignored.</summary>
++public sealed record AuditEvent
++{
++    [JsonPropertyName("_document_id")]
++    public string DocumentId { get; init; } = "";
++
++    [JsonPropertyName("action")]
++    public string Action { get; init; } = "";
++
++    [JsonPropertyName("actor")]
++    public string? Actor { get; init; }
++
++    [JsonPropertyName("org")]
++    public string? Org { get; init; }
++
++    [JsonPropertyName("@timestamp")]
++    public long TimestampMs { get; init; }
++
++    [JsonPropertyName("created_at")]
++    public long CreatedAtMs { get; init; }
++}
++
++/// <summary>One page of the audit log plus its continuation.</summary>
++public sealed record AuditPage(
++    IReadOnlyList<AuditEvent> Events, string? NextUrl, string? NextAfter);
++
++/// <summary>Result of one exporter run. Checkpoint is only non-null when the
++/// scan position is known; it is persisted only on a complete page set.</summary>
++public sealed record ExportResult(
++    IReadOnlyList<AuditEvent> Events, bool Complete, string? Checkpoint, Exception? Error);
++
++/// <summary>Durable storage for the after-cursor checkpoint.</summary>
++public interface ICheckpointStore
++{
++    Task<string?> LoadAsync(CancellationToken ct);
++    Task SaveAsync(string cursor, CancellationToken ct);
++}
++
++/// <summary>A non-2xx audit-log response, carrying GitHub's message field.
++/// Never contains credential material.</summary>
++public sealed class AuditApiException : Exception
++{
++    public int Status { get; }
++
++    public AuditApiException(int status, string apiMessage)
++        : base($"github audit-log api error {status}: {apiMessage}")
++    {
++        Status = status;
++    }
++}
++
++/// <summary>Raised when the endpoint stays rate-limited after the single
++/// documented pause-and-retry.</summary>
++public sealed class AuditRateLimitException : Exception
++{
++    public TimeSpan RetryAfter { get; }
++
++    public AuditRateLimitException(TimeSpan retryAfter)
++        : base($"audit-log rate limit persisted; server asked to retry after {retryAfter.TotalSeconds:0}s")
++    {
++        RetryAfter = retryAfter;
++    }
++}
++
++/// <summary>Raised when a pagination link points off the configured origin;
++/// the bearer token is never forwarded to such a host.</summary>
++public sealed class AuditSecurityException : Exception
++{
++    public AuditSecurityException(string host)
++        : base($"refusing to follow audit-log pagination link to untrusted host {host}")
++    {
++    }
++}

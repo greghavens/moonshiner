@@ -1,0 +1,281 @@
+diff --git a/sfsql/__init__.py b/sfsql/__init__.py
+new file mode 100644
+index 0000000..b6d5286
+--- /dev/null
++++ b/sfsql/__init__.py
+@@ -0,0 +1,16 @@
++"""sfsql: a stdlib-only client for the Snowflake SQL API v2."""
++
++from .client import SqlApiSession, TransportError
++from .errors import SqlApiError, StatementFailed, StatementTimedOut
++from .runner import Column, Result, StatementRunner
++
++__all__ = [
++    "Column",
++    "Result",
++    "SqlApiError",
++    "SqlApiSession",
++    "StatementFailed",
++    "StatementRunner",
++    "StatementTimedOut",
++    "TransportError",
++]
+diff --git a/sfsql/client.py b/sfsql/client.py
+new file mode 100644
+index 0000000..e72e8ef
+--- /dev/null
++++ b/sfsql/client.py
+@@ -0,0 +1,133 @@
++"""Low-level HTTP session for the Snowflake SQL API v2.
++
++One method call is one HTTP round trip. Async orchestration (polling,
++resubmission) lives in runner.py.
++"""
++
++import http.client
++import json
++import urllib.error
++import urllib.request
++from urllib.parse import urlencode
++
++from .errors import SqlApiError, StatementFailed, StatementTimedOut
++
++STATEMENTS_PATH = "/api/v2/statements"
++
++_BINDING_TYPES = (
++    (bool, "BOOLEAN"),  # bool first: it is an int subclass
++    (int, "FIXED"),
++    (float, "REAL"),
++    (str, "TEXT"),
++)
++
++
++class TransportError(SqlApiError):
++    """The connection died before a status line arrived: outcome ambiguous."""
++
++
++class Response:
++    def __init__(self, status, body):
++        self.status = status
++        self.body = body
++
++
++def encode_bindings(binds):
++    bindings = {}
++    for position, value in enumerate(binds, start=1):
++        for py_type, sql_type in _BINDING_TYPES:
++            if isinstance(value, py_type):
++                if sql_type == "BOOLEAN":
++                    encoded = "true" if value else "false"
++                else:
++                    encoded = str(value)
++                bindings[str(position)] = {"type": sql_type, "value": encoded}
++                break
++        else:
++            raise SqlApiError(f"unsupported bind value type at position {position}")
++    return bindings
++
++
++class SqlApiSession:
++    def __init__(self, base_url, token, token_type, user_agent, request_ids):
++        self.base_url = base_url.rstrip("/")
++        self._token = token
++        self._token_type = token_type
++        self._user_agent = user_agent
++        self.request_ids = request_ids
++
++    def _headers(self, with_body):
++        headers = {
++            "Authorization": f"Bearer {self._token}",
++            "X-Snowflake-Authorization-Token-Type": self._token_type,
++            "Accept": "application/json",
++            "User-Agent": self._user_agent,
++        }
++        if with_body:
++            headers["Content-Type"] = "application/json"
++        return headers
++
++    def submit(self, statement, *, timeout=None, database=None, schema=None,
++               warehouse=None, role=None, binds=None, request_id=None,
++               retry=False):
++        body = {"statement": statement}
++        if timeout is not None:
++            body["timeout"] = timeout
++        if database is not None:
++            body["database"] = database
++        if schema is not None:
++            body["schema"] = schema
++        if warehouse is not None:
++            body["warehouse"] = warehouse
++        if role is not None:
++            body["role"] = role
++        if binds:
++            body["bindings"] = encode_bindings(binds)
++        params = {"requestId": request_id or self.request_ids()}
++        if retry:
++            params["retry"] = "true"
++        url = f"{self.base_url}{STATEMENTS_PATH}?{urlencode(params)}"
++        return self._round_trip("POST", url, json.dumps(body).encode())
++
++    def check_status(self, status_url):
++        return self._round_trip("GET", f"{self.base_url}{status_url}", None)
++
++    def _round_trip(self, method, url, payload):
++        req = urllib.request.Request(
++            url, data=payload, method=method,
++            headers=self._headers(payload is not None),
++        )
++        try:
++            with urllib.request.urlopen(req) as resp:
++                return self._classify(resp.status, resp.read())
++        except urllib.error.HTTPError as e:
++            return self._classify(e.code, e.read())
++        except (urllib.error.URLError, http.client.HTTPException,
++                ConnectionError) as e:
++            raise TransportError(f"connection failed before a response: "
++                                 f"{e.__class__.__name__}") from e
++
++    @staticmethod
++    def _classify(status, raw):
++        try:
++            body = json.loads(raw) if raw else {}
++        except json.JSONDecodeError:
++            body = {}
++        if status in (200, 202):
++            return Response(status, body)
++        if status == 408:
++            raise StatementTimedOut(
++                body.get("statementHandle"),
++                body.get("statementStatusUrl"),
++                body.get("message", "execution exceeded the request timeout"),
++            )
++        if status == 422:
++            raise StatementFailed(
++                body.get("code"), body.get("sqlState"),
++                body.get("message"), body.get("statementHandle"),
++            )
++        raise SqlApiError(
++            f"SQL API request failed with HTTP {status}: "
++            f"{body.get('message', 'no error message in response body')}",
++            status=status,
++        )
+diff --git a/sfsql/errors.py b/sfsql/errors.py
+new file mode 100644
+index 0000000..9f819c7
+--- /dev/null
++++ b/sfsql/errors.py
+@@ -0,0 +1,39 @@
++"""Error types for the sfsql package.
++
++The bearer token must never appear in any exception text, so messages are
++built only from response bodies and statuses, never from request headers.
++"""
++
++
++class SqlApiError(Exception):
++    """Any SQL API failure that is not a structured statement failure."""
++
++    def __init__(self, message, status=None):
++        super().__init__(message)
++        self.status = status
++
++
++class StatementFailed(SqlApiError):
++    """A 422 QueryFailureStatus: the statement itself failed."""
++
++    def __init__(self, code, sql_state, message, statement_handle):
++        super().__init__(
++            f"statement failed (code {code}, sqlState {sql_state}): {message}",
++            status=422,
++        )
++        self.code = code
++        self.sql_state = sql_state
++        self.message = message
++        self.statement_handle = statement_handle
++
++
++class StatementTimedOut(SqlApiError):
++    """A 408: execution exceeded the request timeout; the handle survives."""
++
++    def __init__(self, statement_handle, status_url, message):
++        super().__init__(
++            f"statement timed out (handle {statement_handle}): {message}",
++            status=408,
++        )
++        self.statement_handle = statement_handle
++        self.status_url = status_url
+diff --git a/sfsql/runner.py b/sfsql/runner.py
+new file mode 100644
+index 0000000..91d9dd1
+--- /dev/null
++++ b/sfsql/runner.py
+@@ -0,0 +1,69 @@
++"""Statement runner: drives one statement to completion over SqlApiSession.
++
++Policy pinned in docs/contract.json: poll sleep schedule 1/2/4/8..., at most
++8 polls, exactly one resubmission (same requestId + retry=true) after an
++ambiguous transport failure on the submit POST.
++"""
++
++from .client import TransportError
++from .errors import SqlApiError
++
++DEFAULT_SCHEDULE = (1, 2, 4, 8, 8, 8, 8, 8)
++
++
++class Column:
++    def __init__(self, name, type, nullable):
++        self.name = name
++        self.type = type
++        self.nullable = nullable
++
++
++class Result:
++    def __init__(self, body):
++        meta = body["resultSetMetaData"]
++        self.statement_handle = body["statementHandle"]
++        self.code = body["code"]
++        self.sql_state = body.get("sqlState")
++        self.num_rows = meta["numRows"]
++        self.columns = [
++            Column(c["name"], c["type"], c["nullable"]) for c in meta["rowType"]
++        ]
++        self.rows = body["data"]
++
++
++class StatementRunner:
++    def __init__(self, session, sleeper, max_polls=len(DEFAULT_SCHEDULE),
++                 poll_schedule=DEFAULT_SCHEDULE):
++        self.session = session
++        self.sleeper = sleeper
++        self.max_polls = max_polls
++        self.poll_schedule = poll_schedule
++
++    def run(self, statement, *, timeout=None, database=None, schema=None,
++            warehouse=None, role=None, binds=None, request_id=None):
++        request_id = request_id or self.session.request_ids()
++        kwargs = dict(timeout=timeout, database=database, schema=schema,
++                      warehouse=warehouse, role=role, binds=binds,
++                      request_id=request_id)
++        try:
++            response = self.session.submit(statement, **kwargs)
++        except TransportError:
++            # ambiguous outcome: resubmit exactly once with the same
++            # requestId + retry=true so the server can deduplicate
++            response = self.session.submit(statement, retry=True, **kwargs)
++        if response.status == 200:
++            return Result(response.body)
++        return self._poll(response.body)
++
++    def _poll(self, query_status):
++        status_url = query_status["statementStatusUrl"]
++        handle = query_status.get("statementHandle")
++        for polls_done in range(self.max_polls):
++            self.sleeper(self.poll_schedule[polls_done])
++            response = self.session.check_status(status_url)
++            if response.status == 200:
++                return Result(response.body)
++        raise SqlApiError(
++            f"statement {handle} still running after {self.max_polls} polls",
++            status=202,
++        )

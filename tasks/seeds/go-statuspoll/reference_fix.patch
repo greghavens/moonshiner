@@ -1,0 +1,262 @@
+diff --git a/statuspoll.go b/statuspoll.go
+new file mode 100644
+index 0000000..bfbb484
+--- /dev/null
++++ b/statuspoll.go
+@@ -0,0 +1,256 @@
++// Package statuspoll is the shared client for the Foundry batch platform's
++// async-job protocol: submit, poll a status URL on a fixed schedule, follow
++// the 303 to the result. All waiting is injectable so callers' tests never
++// sleep for real.
++package statuspoll
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"time"
++)
++
++// Options tunes one Client. Zero values get the documented defaults.
++type Options struct {
++	// Schedule holds the wait before each poll; the last entry repeats.
++	// Empty means one second between polls.
++	Schedule []time.Duration
++	// MaxPolls is the status-GET budget per Wait; <= 0 means 10.
++	MaxPolls int
++	// Sleep performs every wait. Nil means a real timer honoring ctx.
++	Sleep func(ctx context.Context, d time.Duration) error
++}
++
++// Job is the persistent handle for a submitted job.
++type Job struct {
++	StatusURL string
++}
++
++// APIError is any protocol-level refusal from the platform.
++type APIError struct {
++	Status int
++	Body   string
++}
++
++func (e *APIError) Error() string {
++	return fmt.Sprintf("platform returned HTTP %d: %s", e.Status, e.Body)
++}
++
++// JobFailedError is the terminal "failed" state with the platform's detail.
++type JobFailedError struct {
++	Message string
++}
++
++func (e *JobFailedError) Error() string {
++	return fmt.Sprintf("job failed: %s", e.Message)
++}
++
++// JobExpiredError is the terminal "expired" state (result purged).
++type JobExpiredError struct{}
++
++func (e *JobExpiredError) Error() string {
++	return "job expired: result purged by the platform's retention window"
++}
++
++// PollTimeoutError reports an exhausted poll budget.
++type PollTimeoutError struct {
++	Polls     int
++	LastState string
++}
++
++func (e *PollTimeoutError) Error() string {
++	return fmt.Sprintf("job not terminal after %d polls (last state %q)", e.Polls, e.LastState)
++}
++
++// Client talks the Foundry job protocol.
++type Client struct {
++	baseURL  string
++	client   *http.Client
++	schedule []time.Duration
++	maxPolls int
++	sleep    func(ctx context.Context, d time.Duration) error
++}
++
++func realSleep(ctx context.Context, d time.Duration) error {
++	t := time.NewTimer(d)
++	defer t.Stop()
++	select {
++	case <-t.C:
++		return nil
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++}
++
++// New builds a Client. The passed *http.Client is copied and adjusted so
++// the poll loop observes 303s itself instead of the HTTP stack chasing
++// them; the caller's client is never mutated.
++func New(baseURL string, client *http.Client, opts Options) *Client {
++	if client == nil {
++		client = http.DefaultClient
++	}
++	noFollow := *client
++	noFollow.CheckRedirect = func(req *http.Request, via []*http.Request) error {
++		return http.ErrUseLastResponse
++	}
++	c := &Client{
++		baseURL:  baseURL,
++		client:   &noFollow,
++		schedule: opts.Schedule,
++		maxPolls: opts.MaxPolls,
++		sleep:    opts.Sleep,
++	}
++	if len(c.schedule) == 0 {
++		c.schedule = []time.Duration{time.Second}
++	}
++	if c.maxPolls <= 0 {
++		c.maxPolls = 10
++	}
++	if c.sleep == nil {
++		c.sleep = realSleep
++	}
++	return c
++}
++
++// resolveRef resolves a possibly-relative Location against the URL that
++// produced it.
++func resolveRef(base, ref string) (string, error) {
++	b, err := url.Parse(base)
++	if err != nil {
++		return "", fmt.Errorf("bad base URL %q: %w", base, err)
++	}
++	r, err := url.Parse(ref)
++	if err != nil {
++		return "", fmt.Errorf("bad Location %q: %w", ref, err)
++	}
++	return b.ResolveReference(r).String(), nil
++}
++
++// Submit starts a job and returns its persistent handle.
++func (c *Client) Submit(ctx context.Context, kind string, params map[string]any) (*Job, error) {
++	payload, err := json.Marshal(map[string]any{"kind": kind, "params": params})
++	if err != nil {
++		return nil, err
++	}
++	submitURL := c.baseURL + "/jobs"
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, submitURL, bytes.NewReader(payload))
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("Content-Type", "application/json")
++	status, headers, body, err := c.do(req)
++	if err != nil {
++		return nil, err
++	}
++	if status != http.StatusAccepted {
++		return nil, &APIError{Status: status, Body: string(body)}
++	}
++	loc := headers.Get("Location")
++	if loc == "" {
++		return nil, fmt.Errorf("202 without a Location header")
++	}
++	statusURL, err := resolveRef(submitURL, loc)
++	if err != nil {
++		return nil, err
++	}
++	return &Job{StatusURL: statusURL}, nil
++}
++
++func (c *Client) do(req *http.Request) (int, http.Header, []byte, error) {
++	resp, err := c.client.Do(req)
++	if err != nil {
++		return 0, nil, nil, err
++	}
++	defer resp.Body.Close()
++	body, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return 0, nil, nil, err
++	}
++	return resp.StatusCode, resp.Header, body, nil
++}
++
++func (c *Client) get(ctx context.Context, url string) (int, http.Header, []byte, error) {
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
++	if err != nil {
++		return 0, nil, nil, err
++	}
++	return c.do(req)
++}
++
++// Wait polls the job's status URL on the schedule until a terminal answer,
++// then fetches and returns the result document.
++func (c *Client) Wait(ctx context.Context, job *Job) (map[string]any, error) {
++	lastState := ""
++	for i := 0; i < c.maxPolls; i++ {
++		d := c.schedule[min(i, len(c.schedule)-1)]
++		if err := c.sleep(ctx, d); err != nil {
++			return nil, fmt.Errorf("wait aborted: %w", err)
++		}
++		status, headers, body, err := c.get(ctx, job.StatusURL)
++		if err != nil {
++			return nil, err
++		}
++		switch {
++		case status == http.StatusSeeOther:
++			loc := headers.Get("Location")
++			if loc == "" {
++				return nil, fmt.Errorf("303 without a Location header")
++			}
++			resultURL, err := resolveRef(job.StatusURL, loc)
++			if err != nil {
++				return nil, err
++			}
++			return c.fetchResult(ctx, resultURL)
++		case status == http.StatusOK:
++			var doc struct {
++				State string `json:"state"`
++				Error string `json:"error"`
++			}
++			if err := json.Unmarshal(body, &doc); err != nil {
++				return nil, fmt.Errorf("undecodable status document: %w", err)
++			}
++			switch doc.State {
++			case "queued", "running":
++				lastState = doc.State
++			case "failed":
++				return nil, &JobFailedError{Message: doc.Error}
++			case "expired":
++				return nil, &JobExpiredError{}
++			default:
++				return nil, fmt.Errorf("unrecognized job state %q", doc.State)
++			}
++		default:
++			return nil, &APIError{Status: status, Body: string(body)}
++		}
++	}
++	return nil, &PollTimeoutError{Polls: c.maxPolls, LastState: lastState}
++}
++
++func (c *Client) fetchResult(ctx context.Context, url string) (map[string]any, error) {
++	status, _, body, err := c.get(ctx, url)
++	if err != nil {
++		return nil, err
++	}
++	if status != http.StatusOK {
++		return nil, &APIError{Status: status, Body: string(body)}
++	}
++	var result map[string]any
++	if err := json.Unmarshal(body, &result); err != nil {
++		return nil, fmt.Errorf("undecodable result document: %w", err)
++	}
++	return result, nil
++}
++
++// Run submits a job and waits for its result.
++func (c *Client) Run(ctx context.Context, kind string, params map[string]any) (map[string]any, error) {
++	job, err := c.Submit(ctx, kind, params)
++	if err != nil {
++		return nil, err
++	}
++	return c.Wait(ctx, job)
++}

@@ -1,0 +1,293 @@
+diff --git a/GraphErrors.cs b/GraphErrors.cs
+new file mode 100644
+index 0000000..ddcff4c
+--- /dev/null
++++ b/GraphErrors.cs
+@@ -0,0 +1,28 @@
++namespace GraphDeltaSync;
++
++/// <summary>A non-success Microsoft Graph response, decoded from the error envelope.</summary>
++public class GraphApiException : Exception
++{
++    public int StatusCode { get; }
++    public string? ErrorCode { get; }
++
++    public GraphApiException(int statusCode, string? errorCode, string message)
++        : base(message)
++    {
++        StatusCode = statusCode;
++        ErrorCode = errorCode;
++    }
++}
++
++/// <summary>Throttling (429) persisted through every permitted retry.</summary>
++public sealed class GraphThrottledException : GraphApiException
++{
++    public int RetryAfterSeconds { get; }
++
++    public GraphThrottledException(int retryAfterSeconds)
++        : base(429, "TooManyRequests",
++            $"Throttled by Microsoft Graph after exhausting retries; last Retry-After was {retryAfterSeconds}s.")
++    {
++        RetryAfterSeconds = retryAfterSeconds;
++    }
++}
+diff --git a/Models.cs b/Models.cs
+new file mode 100644
+index 0000000..647cb08
+--- /dev/null
++++ b/Models.cs
+@@ -0,0 +1,12 @@
++namespace GraphDeltaSync;
++
++/// <summary>Local projection of a directory user; tracked properties only.</summary>
++public sealed record UserRecord(string Id, string? DisplayName, string? Mail, string? JobTitle);
++
++/// <summary>Outcome of one completed synchronization round.</summary>
++public sealed record SyncResult(
++    int UsersUpserted,
++    int UsersRemoved,
++    int Pages,
++    bool FullResync,
++    string DeltaLink);
+diff --git a/UserDeltaSynchronizer.cs b/UserDeltaSynchronizer.cs
+new file mode 100644
+index 0000000..d0dbf05
+--- /dev/null
++++ b/UserDeltaSynchronizer.cs
+@@ -0,0 +1,208 @@
++using System.Text.Json;
++
++namespace GraphDeltaSync;
++
++/// <summary>
++/// Incremental synchronizer for Microsoft Entra users built on the Graph v1.0
++/// delta query protocol (GET /users/delta). Follows @odata.nextLink pages
++/// until an @odata.deltaLink completes the round, honors Retry-After
++/// throttling, applies @removed tombstones and restarts a full enumeration
++/// when the service resets the sync state with 410 Gone.
++/// </summary>
++public sealed class UserDeltaSynchronizer
++{
++    private const string TrackedSelect = "id,displayName,mail,jobTitle";
++
++    private static readonly HttpClient Http = new(new HttpClientHandler { AllowAutoRedirect = false });
++
++    private readonly string _baseUrl;
++    private readonly string _accessToken;
++    private readonly UserDirectoryStore _store;
++    private readonly Func<TimeSpan, Task> _delay;
++    private readonly int _maxRetries;
++
++    public UserDeltaSynchronizer(
++        string graphBaseUrl,
++        string accessToken,
++        UserDirectoryStore store,
++        Func<TimeSpan, Task> delay,
++        int maxRetries = 3)
++    {
++        _baseUrl = graphBaseUrl.TrimEnd('/');
++        _accessToken = accessToken;
++        _store = store;
++        _delay = delay;
++        _maxRetries = maxRetries;
++    }
++
++    public async Task<SyncResult> RunAsync()
++    {
++        bool fullResync = _store.DeltaLink is null;
++        string url = _store.DeltaLink ?? InitialUrl();
++        var pending = fullResync
++            ? new Dictionary<string, UserRecord>(StringComparer.Ordinal)
++            : new Dictionary<string, UserRecord>(_store.Users.ToDictionary(kv => kv.Key, kv => kv.Value),
++                StringComparer.Ordinal);
++        var upserted = new HashSet<string>(StringComparer.Ordinal);
++        var removed = new HashSet<string>(StringComparer.Ordinal);
++        int pages = 0;
++
++        while (true)
++        {
++            PageData page = await FetchPageAsync(url);
++
++            if (page.ResyncLocation is not null)
++            {
++                // Sync reset: restart a full enumeration from the Location URL,
++                // rebuilding local state from scratch.
++                fullResync = true;
++                url = page.ResyncLocation;
++                pending = new Dictionary<string, UserRecord>(StringComparer.Ordinal);
++                upserted.Clear();
++                removed.Clear();
++                pages = 0;
++                continue;
++            }
++
++            pages++;
++            foreach (var (id, record) in page.Items)
++            {
++                if (record is null)
++                {
++                    // Tombstone: only count ids we actually held.
++                    if (pending.Remove(id))
++                        removed.Add(id);
++                    upserted.Remove(id);
++                }
++                else
++                {
++                    pending[id] = record;
++                    upserted.Add(id);
++                    removed.Remove(id);
++                }
++            }
++
++            if (page.NextLink is not null)
++            {
++                url = page.NextLink;
++                continue;
++            }
++
++            if (page.DeltaLink is null)
++                throw new GraphApiException(0, "ProtocolError",
++                    "Delta page carried neither @odata.nextLink nor @odata.deltaLink.");
++
++            _store.Commit(pending, page.DeltaLink);
++            return new SyncResult(upserted.Count, removed.Count, pages, fullResync, page.DeltaLink);
++        }
++    }
++
++    private string InitialUrl() => _baseUrl + "/users/delta?$select=" + TrackedSelect;
++
++    private sealed record PageData(
++        List<(string Id, UserRecord? Record)> Items,
++        string? NextLink,
++        string? DeltaLink,
++        string? ResyncLocation);
++
++    private async Task<PageData> FetchPageAsync(string url)
++    {
++        int retries = 0;
++        while (true)
++        {
++            using var request = new HttpRequestMessage(HttpMethod.Get, url);
++            request.Headers.TryAddWithoutValidation("Authorization", "Bearer " + _accessToken);
++            using var response = await Http.SendAsync(request);
++            string body = await response.Content.ReadAsStringAsync();
++            int status = (int)response.StatusCode;
++
++            if (status == 429)
++            {
++                int retryAfter = ParseRetryAfter(response);
++                if (retries >= _maxRetries)
++                    throw new GraphThrottledException(retryAfter);
++                retries++;
++                await _delay(TimeSpan.FromSeconds(retryAfter));
++                continue;
++            }
++
++            if (status == 410)
++            {
++                string? location = response.Headers.TryGetValues("Location", out var values)
++                    ? values.FirstOrDefault()
++                    : null;
++                if (location is null)
++                    throw DecodeError(status, body);
++                return new PageData(new List<(string, UserRecord?)>(), null, null, location);
++            }
++
++            if (status is >= 200 and < 300)
++                return ParsePage(body);
++
++            throw DecodeError(status, body);
++        }
++    }
++
++    private static int ParseRetryAfter(HttpResponseMessage response)
++    {
++        if (response.Headers.TryGetValues("Retry-After", out var values)
++            && int.TryParse(values.FirstOrDefault(), out int seconds))
++            return seconds;
++        return 1;
++    }
++
++    private static GraphApiException DecodeError(int status, string body)
++    {
++        string? code = null;
++        string message = "Microsoft Graph request failed with status " + status + ".";
++        try
++        {
++            using var doc = JsonDocument.Parse(body);
++            if (doc.RootElement.TryGetProperty("error", out var error))
++            {
++                if (error.TryGetProperty("code", out var c) && c.ValueKind == JsonValueKind.String)
++                    code = c.GetString();
++                if (error.TryGetProperty("message", out var m) && m.ValueKind == JsonValueKind.String)
++                    message = m.GetString() ?? message;
++            }
++        }
++        catch (JsonException)
++        {
++            // Keep the generic message for unparseable bodies.
++        }
++        return new GraphApiException(status, code, message);
++    }
++
++    private static PageData ParsePage(string body)
++    {
++        using var doc = JsonDocument.Parse(body);
++        var root = doc.RootElement;
++        string? nextLink = ReadString(root, "@odata.nextLink");
++        string? deltaLink = ReadString(root, "@odata.deltaLink");
++
++        var items = new List<(string, UserRecord?)>();
++        foreach (var element in root.GetProperty("value").EnumerateArray())
++        {
++            string id = element.GetProperty("id").GetString()
++                ?? throw new GraphApiException(0, "ProtocolError", "Delta entry without an id.");
++            if (element.TryGetProperty("@removed", out _))
++            {
++                items.Add((id, null));
++            }
++            else
++            {
++                items.Add((id, new UserRecord(
++                    id,
++                    ReadString(element, "displayName"),
++                    ReadString(element, "mail"),
++                    ReadString(element, "jobTitle"))));
++            }
++        }
++        return new PageData(items, nextLink, deltaLink, null);
++    }
++
++    private static string? ReadString(JsonElement element, string property) =>
++        element.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String
++            ? value.GetString()
++            : null;
++}
+diff --git a/UserDirectoryStore.cs b/UserDirectoryStore.cs
+new file mode 100644
+index 0000000..eb7429f
+--- /dev/null
++++ b/UserDirectoryStore.cs
+@@ -0,0 +1,21 @@
++namespace GraphDeltaSync;
++
++/// <summary>
++/// Holds the synchronized user set and the deltaLink that produced it.
++/// Both advance together, atomically, when a round completes; an aborted
++/// round must leave the store exactly as it was.
++/// </summary>
++public sealed class UserDirectoryStore
++{
++    private Dictionary<string, UserRecord> _users = new(StringComparer.Ordinal);
++
++    public IReadOnlyDictionary<string, UserRecord> Users => _users;
++
++    public string? DeltaLink { get; private set; }
++
++    internal void Commit(Dictionary<string, UserRecord> users, string deltaLink)
++    {
++        _users = users;
++        DeltaLink = deltaLink;
++    }
++}

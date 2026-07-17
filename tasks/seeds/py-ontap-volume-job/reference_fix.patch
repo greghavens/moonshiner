@@ -1,0 +1,218 @@
+diff --git a/ontapvol/__init__.py b/ontapvol/__init__.py
+new file mode 100644
+index 0000000..d9d18a4
+--- /dev/null
++++ b/ontapvol/__init__.py
+@@ -0,0 +1,14 @@
++"""ontapvol — idempotent ONTAP REST volume provisioning."""
++
++from .client import OntapClient
++from .errors import JobFailedError, OntapApiError, ResolutionError
++from .provision import ProvisionSpec, VolumeProvisioner
++
++__all__ = [
++    "OntapClient",
++    "OntapApiError",
++    "JobFailedError",
++    "ResolutionError",
++    "ProvisionSpec",
++    "VolumeProvisioner",
++]
+diff --git a/ontapvol/client.py b/ontapvol/client.py
+new file mode 100644
+index 0000000..92696d6
+--- /dev/null
++++ b/ontapvol/client.py
+@@ -0,0 +1,73 @@
++"""Minimal ONTAP REST client: basic auth, HAL+JSON, documented error decode."""
++
++import base64
++import json
++import urllib.error
++import urllib.parse
++import urllib.request
++
++from .errors import OntapApiError, ResolutionError
++
++
++class OntapClient:
++    def __init__(self, base_url, username, password):
++        self.base_url = base_url.rstrip("/")
++        token = base64.b64encode(("%s:%s" % (username, password)).encode("utf-8")).decode("ascii")
++        self._auth_header = "Basic " + token
++
++    def request(self, method, path, params=None, body=None):
++        url = self.base_url + path
++        if params:
++            url += "?" + urllib.parse.urlencode(params)
++        data = None
++        req_headers = {"Authorization": self._auth_header, "Accept": "application/hal+json"}
++        if body is not None:
++            data = json.dumps(body).encode("utf-8")
++            req_headers["Content-Type"] = "application/json"
++        req = urllib.request.Request(url, data=data, method=method, headers=req_headers)
++        try:
++            with urllib.request.urlopen(req) as resp:
++                raw = resp.read()
++                return resp.status, json.loads(raw.decode("utf-8")) if raw else {}
++        except urllib.error.HTTPError as exc:
++            err = {}
++            try:
++                err = json.loads(exc.read().decode("utf-8")).get("error", {})
++            except (ValueError, AttributeError):
++                pass
++            raise OntapApiError(
++                exc.code, err.get("code"), err.get("message"), err.get("target")
++            ) from None
++
++    def get(self, path, params=None):
++        return self.request("GET", path, params=params)[1]
++
++    def _resolve_one(self, path, name, kind):
++        doc = self.get(path, params={"name": name, "fields": "uuid,name"})
++        records = doc.get("records") or []
++        if doc.get("num_records") != 1:
++            raise ResolutionError(
++                "expected exactly one %s named %r, found %s"
++                % (kind, name, doc.get("num_records", 0))
++            )
++        return records[0]
++
++    def resolve_svm(self, name):
++        return self._resolve_one("/api/svm/svms", name, "SVM")
++
++    def resolve_aggregate(self, name):
++        return self._resolve_one("/api/storage/aggregates", name, "aggregate")
++
++    def find_volume(self, svm_name, name):
++        doc = self.get(
++            "/api/storage/volumes",
++            params={"name": name, "svm.name": svm_name, "fields": "uuid,name,size,state"},
++        )
++        count = doc.get("num_records", 0)
++        if count == 0:
++            return None
++        if count > 1:
++            raise ResolutionError(
++                "volume lookup for %r on SVM %r matched %d records" % (name, svm_name, count)
++            )
++        return (doc.get("records") or [])[0]
+diff --git a/ontapvol/errors.py b/ontapvol/errors.py
+new file mode 100644
+index 0000000..3de02ea
+--- /dev/null
++++ b/ontapvol/errors.py
+@@ -0,0 +1,28 @@
++"""Errors raised by the ontapvol package."""
++
++
++class OntapApiError(Exception):
++    """A non-2xx ONTAP REST response carrying the documented error object."""
++
++    def __init__(self, status, code, message, target=None):
++        self.status = status
++        self.code = code
++        self.message = message or ""
++        self.target = target
++        detail = "ONTAP API error %s (code %s): %s" % (status, code, self.message)
++        if target:
++            detail += " [target: %s]" % target
++        super().__init__(detail)
++
++
++class JobFailedError(Exception):
++    """An asynchronous job ended in the failure state or never went terminal."""
++
++    def __init__(self, message, code=None):
++        self.message = message
++        self.code = code
++        super().__init__(message)
++
++
++class ResolutionError(Exception):
++    """A name lookup did not resolve to exactly one record."""
+diff --git a/ontapvol/provision.py b/ontapvol/provision.py
+new file mode 100644
+index 0000000..b3d00cf
+--- /dev/null
++++ b/ontapvol/provision.py
+@@ -0,0 +1,79 @@
++"""Idempotent volume provisioning over the ONTAP asynchronous job pattern."""
++
++from .errors import JobFailedError, ResolutionError
++
++POLL_INTERVAL = 1.0
++
++
++class ProvisionSpec:
++    def __init__(self, name, svm, aggregates, size, junction_path=None):
++        self.name = name
++        self.svm = svm
++        self.aggregates = list(aggregates)
++        self.size = size
++        self.junction_path = junction_path
++
++
++class VolumeProvisioner:
++    def __init__(self, client, sleep, max_polls=20):
++        self.client = client
++        self.sleep = sleep
++        self.max_polls = max_polls
++
++    def provision(self, spec):
++        existing = self.client.find_volume(spec.svm, spec.name)
++        if existing is not None:
++            return self._result(existing, created=False)
++
++        svm = self.client.resolve_svm(spec.svm)
++        aggregates = [self.client.resolve_aggregate(name) for name in spec.aggregates]
++        body = {
++            "name": spec.name,
++            "svm": {"uuid": svm["uuid"]},
++            "aggregates": [{"uuid": aggr["uuid"]} for aggr in aggregates],
++            "size": spec.size,
++        }
++        if spec.junction_path:
++            body["nas"] = {"path": spec.junction_path}
++        _, doc = self.client.request(
++            "POST", "/api/storage/volumes", params={"return_timeout": 0}, body=body
++        )
++        self.wait_for_job(doc.get("job") or {})
++
++        created = self.client.find_volume(spec.svm, spec.name)
++        if created is None:
++            raise ResolutionError(
++                "volume %r missing after successful creation job" % spec.name
++            )
++        return self._result(created, created=True)
++
++    def wait_for_job(self, job):
++        href = ((job.get("_links") or {}).get("self") or {}).get("href")
++        if not href:
++            raise JobFailedError("creation response carried no job link", code=None)
++        for poll in range(self.max_polls):
++            if poll:
++                self.sleep(POLL_INTERVAL)
++            doc = self.client.get(href)
++            state = doc.get("state")
++            if state == "success":
++                return doc
++            if state == "failure":
++                error = doc.get("error") or {}
++                raise JobFailedError(
++                    error.get("message") or doc.get("message") or "job failed",
++                    code=error.get("code"),
++                )
++        raise JobFailedError(
++            "poll budget exhausted after %d polls; job still not terminal" % self.max_polls,
++            code=None,
++        )
++
++    @staticmethod
++    def _result(record, created):
++        return {
++            "uuid": record.get("uuid"),
++            "name": record.get("name"),
++            "created": created,
++            "state": record.get("state"),
++        }

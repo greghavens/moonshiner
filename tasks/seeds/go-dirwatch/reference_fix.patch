@@ -1,0 +1,214 @@
+diff --git a/dirwatch.go b/dirwatch.go
+index 703a424..14d0913 100644
+--- a/dirwatch.go
++++ b/dirwatch.go
+@@ -3,14 +3,7 @@
+ // snapshot against the previous one, and rebuilds whatever changed.
+ package dirwatch
+ 
+-import (
+-	"crypto/sha256"
+-	"encoding/hex"
+-	"io/fs"
+-	"os"
+-	"path/filepath"
+-	"sort"
+-)
++import "sort"
+ 
+ // Snapshot maps slash-separated paths (relative to the watched root)
+ // to a hex digest of the file's content.
+@@ -20,38 +13,17 @@ type Snapshot map[string]string
+ // Directories themselves are not entries; non-regular files (sockets,
+ // symlinks, ...) are skipped.
+ func Take(dir string) (Snapshot, error) {
+-	snap := Snapshot{}
+-	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+-		if err != nil {
+-			return err
+-		}
+-		if d.IsDir() || !d.Type().IsRegular() {
+-			return nil
+-		}
+-		data, err := os.ReadFile(p)
+-		if err != nil {
+-			return err
+-		}
+-		rel, err := filepath.Rel(dir, p)
+-		if err != nil {
+-			return err
+-		}
+-		sum := sha256.Sum256(data)
+-		snap[filepath.ToSlash(rel)] = hex.EncodeToString(sum[:])
+-		return nil
+-	})
+-	if err != nil {
+-		return nil, err
+-	}
+-	return snap, nil
++	return TakeIgnoring(dir, nil)
+ }
+ 
+ // Changes is what happened between two snapshots. Every slice is
+-// sorted; a path appears in at most one of them.
++// sorted; a path appears in at most one of them. Renamed is only
++// populated by DiffRenames; plain Diff leaves it nil.
+ type Changes struct {
+ 	Added    []string
+ 	Removed  []string
+ 	Modified []string
++	Renamed  []Rename
+ }
+ 
+ // Diff compares two snapshots taken from the same root.
+diff --git a/watcher.go b/watcher.go
+new file mode 100644
+index 0000000..14dfb12
+--- /dev/null
++++ b/watcher.go
+@@ -0,0 +1,145 @@
++package dirwatch
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"fmt"
++	"io/fs"
++	"os"
++	"path"
++	"path/filepath"
++	"sort"
++	"time"
++)
++
++// TakeIgnoring is Take with glob ignore patterns: a file is skipped
++// when any pattern matches its base name or its full slash-relative
++// path, with path.Match semantics. A malformed pattern is an error.
++func TakeIgnoring(dir string, patterns []string) (Snapshot, error) {
++	snap := Snapshot{}
++	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++		if d.IsDir() || !d.Type().IsRegular() {
++			return nil
++		}
++		rel, err := filepath.Rel(dir, p)
++		if err != nil {
++			return err
++		}
++		rp := filepath.ToSlash(rel)
++		for _, pat := range patterns {
++			byBase, err := path.Match(pat, path.Base(rp))
++			if err != nil {
++				return fmt.Errorf("dirwatch: bad ignore pattern %q: %w", pat, err)
++			}
++			byPath, err := path.Match(pat, rp)
++			if err != nil {
++				return fmt.Errorf("dirwatch: bad ignore pattern %q: %w", pat, err)
++			}
++			if byBase || byPath {
++				return nil
++			}
++		}
++		data, err := os.ReadFile(p)
++		if err != nil {
++			return err
++		}
++		sum := sha256.Sum256(data)
++		snap[rp] = hex.EncodeToString(sum[:])
++		return nil
++	})
++	if err != nil {
++		return nil, err
++	}
++	return snap, nil
++}
++
++// Rename is a file that moved without its content changing.
++type Rename struct {
++	From, To string
++}
++
++// DiffRenames is Diff plus rename detection: when exactly one removed
++// path and exactly one added path share a content digest, the pair is
++// reported as a rename (sorted by From) instead of an add and a
++// remove. Ambiguous digests — several candidates on either side — are
++// left as plain adds and removes.
++func DiffRenames(old, cur Snapshot) Changes {
++	ch := Diff(old, cur)
++	removedByHash := map[string][]string{}
++	for _, p := range ch.Removed {
++		removedByHash[old[p]] = append(removedByHash[old[p]], p)
++	}
++	addedByHash := map[string][]string{}
++	for _, p := range ch.Added {
++		addedByHash[cur[p]] = append(addedByHash[cur[p]], p)
++	}
++	paired := map[string]bool{}
++	var renames []Rename
++	for h, rem := range removedByHash {
++		if add := addedByHash[h]; len(rem) == 1 && len(add) == 1 {
++			renames = append(renames, Rename{From: rem[0], To: add[0]})
++			paired[rem[0]] = true
++			paired[add[0]] = true
++		}
++	}
++	if len(renames) > 0 {
++		sort.Slice(renames, func(i, j int) bool { return renames[i].From < renames[j].From })
++		ch.Renamed = renames
++		ch.Added = without(ch.Added, paired)
++		ch.Removed = without(ch.Removed, paired)
++	}
++	return ch
++}
++
++// without filters paths, preserving order; an emptied list comes back
++// nil so Changes values compare cleanly.
++func without(paths []string, drop map[string]bool) []string {
++	var out []string
++	for _, p := range paths {
++		if !drop[p] {
++			out = append(out, p)
++		}
++	}
++	return out
++}
++
++// Debouncer coalesces bursts of activity per path: a path is delivered
++// by Ready only once it has been quiet for the configured duration.
++// Time is read through the injected now func.
++type Debouncer struct {
++	quiet time.Duration
++	now   func() time.Time
++	last  map[string]time.Time
++}
++
++// NewDebouncer returns a Debouncer that reads the clock through now.
++func NewDebouncer(quiet time.Duration, now func() time.Time) *Debouncer {
++	return &Debouncer{quiet: quiet, now: now, last: map[string]time.Time{}}
++}
++
++// Mark records (or refreshes) activity on path, restarting its quiet
++// timer.
++func (d *Debouncer) Mark(p string) {
++	d.last[p] = d.now()
++}
++
++// Ready returns, sorted, every tracked path whose last Mark is at
++// least the quiet period old, and stops tracking them. A later Mark
++// starts a fresh cycle for the path.
++func (d *Debouncer) Ready() []string {
++	nowAt := d.now()
++	var out []string
++	for p, at := range d.last {
++		if nowAt.Sub(at) >= d.quiet {
++			out = append(out, p)
++		}
++	}
++	for _, p := range out {
++		delete(d.last, p)
++	}
++	sort.Strings(out)
++	return out
++}

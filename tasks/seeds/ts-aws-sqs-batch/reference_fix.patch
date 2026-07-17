@@ -1,0 +1,210 @@
+diff --git a/batch_worker.ts b/batch_worker.ts
+new file mode 100644
+index 0000000..6015721
+--- /dev/null
++++ b/batch_worker.ts
+@@ -0,0 +1,204 @@
++// Batch worker for the render-job queue: long-poll receives, ten-entry batch
++// deletes with per-entry failure retry, and visibility extension for work the
++// handler wants to defer. The SQS client is injected (anything with the SDK's
++// send(command) surface).
++import {
++  ChangeMessageVisibilityBatchCommand,
++  DeleteMessageBatchCommand,
++  ReceiveMessageCommand,
++  type Message,
++} from "@aws-sdk/client-sqs";
++
++import type { SqsSender } from "./worker.ts";
++
++export const MAX_BATCH_ENTRIES = 10;
++export const MAX_RECEIVE_MESSAGES = 10;
++export const MAX_WAIT_TIME_SECONDS = 20;
++
++const SYSTEM_ATTRIBUTES = ["ApproximateReceiveCount", "SentTimestamp"];
++
++export interface BatchEntry {
++  Id: string;
++  ReceiptHandle: string;
++}
++
++export interface EntryFailure {
++  id: string;
++  code: string;
++  senderFault: boolean;
++}
++
++export type HandlerOutcome = "done" | "defer" | "failed";
++
++export interface WorkerSummary {
++  received: number;
++  deleted: string[];
++  deferred: string[];
++  failed: string[];
++  deleteFailures: EntryFailure[];
++}
++
++export interface ReceiveOptions {
++  visibilityTimeout?: number;
++}
++
++export interface RunOptions extends ReceiveOptions {
++  deferSeconds: number;
++}
++
++export function chunkEntries<T extends BatchEntry>(entries: T[]): T[][] {
++  const seen = new Set<string>();
++  for (const e of entries) {
++    if (seen.has(e.Id)) {
++      throw new Error(`duplicate batch entry Id: ${e.Id}`);
++    }
++    seen.add(e.Id);
++  }
++  const chunks: T[][] = [];
++  for (let i = 0; i < entries.length; i += MAX_BATCH_ENTRIES) {
++    chunks.push(entries.slice(i, i + MAX_BATCH_ENTRIES));
++  }
++  return chunks;
++}
++
++export async function receiveBatch(
++  client: SqsSender,
++  queueUrl: string,
++  opts: ReceiveOptions = {},
++): Promise<Message[]> {
++  const input: Record<string, unknown> = {
++    QueueUrl: queueUrl,
++    MaxNumberOfMessages: MAX_RECEIVE_MESSAGES,
++    WaitTimeSeconds: MAX_WAIT_TIME_SECONDS,
++    MessageSystemAttributeNames: [...SYSTEM_ATTRIBUTES],
++  };
++  if (opts.visibilityTimeout !== undefined) {
++    input.VisibilityTimeout = opts.visibilityTimeout;
++  }
++  const out = await client.send(new ReceiveMessageCommand(input as any));
++  return out.Messages ?? [];
++}
++
++interface BatchOutcome {
++  ok: string[];
++  failures: EntryFailure[];
++}
++
++// Dispatch one chunk, then retry the non-sender-fault failures once.
++async function sendChunkWithRetry(
++  client: SqsSender,
++  entries: BatchEntry[],
++  makeCommand: (entries: BatchEntry[]) => any,
++): Promise<BatchOutcome> {
++  const byId = new Map(entries.map((e) => [e.Id, e]));
++  const ok: string[] = [];
++  const failures: EntryFailure[] = [];
++
++  const first = await client.send(makeCommand(entries));
++  for (const s of first.Successful ?? []) {
++    ok.push(s.Id);
++  }
++  const retryable: BatchEntry[] = [];
++  for (const f of first.Failed ?? []) {
++    if (f.SenderFault) {
++      failures.push({ id: f.Id, code: f.Code, senderFault: true });
++    } else {
++      retryable.push(byId.get(f.Id)!);
++    }
++  }
++  if (retryable.length > 0) {
++    const second = await client.send(makeCommand(retryable));
++    for (const s of second.Successful ?? []) {
++      ok.push(s.Id);
++    }
++    for (const f of second.Failed ?? []) {
++      failures.push({ id: f.Id, code: f.Code, senderFault: Boolean(f.SenderFault) });
++    }
++  }
++  return { ok, failures };
++}
++
++export async function deleteMessages(
++  client: SqsSender,
++  queueUrl: string,
++  entries: BatchEntry[],
++): Promise<{ deleted: string[]; failures: EntryFailure[] }> {
++  const deleted: string[] = [];
++  const failures: EntryFailure[] = [];
++  for (const chunk of chunkEntries(entries)) {
++    const outcome = await sendChunkWithRetry(
++      client,
++      chunk,
++      (batch) => new DeleteMessageBatchCommand({ QueueUrl: queueUrl, Entries: batch }),
++    );
++    deleted.push(...outcome.ok);
++    failures.push(...outcome.failures);
++  }
++  return { deleted, failures };
++}
++
++export async function extendVisibility(
++  client: SqsSender,
++  queueUrl: string,
++  entries: BatchEntry[],
++  seconds: number,
++): Promise<{ extended: string[]; failures: EntryFailure[] }> {
++  const extended: string[] = [];
++  const failures: EntryFailure[] = [];
++  for (const chunk of chunkEntries(entries)) {
++    const outcome = await sendChunkWithRetry(client, chunk, (batch) =>
++      new ChangeMessageVisibilityBatchCommand({
++        QueueUrl: queueUrl,
++        Entries: batch.map((e) => ({ ...e, VisibilityTimeout: seconds })),
++      }),
++    );
++    extended.push(...outcome.ok);
++    failures.push(...outcome.failures);
++  }
++  return { extended, failures };
++}
++
++export async function runOnce(
++  client: SqsSender,
++  queueUrl: string,
++  handler: (message: Message) => HandlerOutcome | Promise<HandlerOutcome>,
++  opts: RunOptions,
++): Promise<WorkerSummary> {
++  const messages = await receiveBatch(client, queueUrl, opts);
++  const summary: WorkerSummary = {
++    received: messages.length,
++    deleted: [],
++    deferred: [],
++    failed: [],
++    deleteFailures: [],
++  };
++
++  const toDelete: BatchEntry[] = [];
++  const toDefer: BatchEntry[] = [];
++  for (const message of messages) {
++    const entry: BatchEntry = {
++      Id: message.MessageId!,
++      ReceiptHandle: message.ReceiptHandle!,
++    };
++    const outcome = await handler(message);
++    if (outcome === "done") {
++      toDelete.push(entry);
++    } else if (outcome === "defer") {
++      toDefer.push(entry);
++    } else {
++      // Left untouched: the message reappears after its visibility timeout.
++      summary.failed.push(entry.Id);
++    }
++  }
++
++  if (toDelete.length > 0) {
++    const { deleted, failures } = await deleteMessages(client, queueUrl, toDelete);
++    summary.deleted = deleted;
++    summary.deleteFailures = failures;
++  }
++  if (toDefer.length > 0) {
++    const { extended } = await extendVisibility(client, queueUrl, toDefer, opts.deferSeconds);
++    summary.deferred = extended;
++  }
++  return summary;
++}

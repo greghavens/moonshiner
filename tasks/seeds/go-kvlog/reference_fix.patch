@@ -1,0 +1,318 @@
+diff --git a/compact.go b/compact.go
+new file mode 100644
+index 0000000..5ab9c9e
+--- /dev/null
++++ b/compact.go
+@@ -0,0 +1,59 @@
++package kvlog
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"sort"
++)
++
++// Compact rewrites the log so it contains exactly one Set per live key. The
++// rewrite goes to a temp file in the same directory and is renamed over the
++// old log, so a reader always sees either the old complete log or the new
++// one.
++func (s *Store) Compact() error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.closed {
++		return errClosed
++	}
++
++	dir := filepath.Dir(s.path)
++	tmp, err := os.CreateTemp(dir, ".kvlog-compact-*")
++	if err != nil {
++		return fmt.Errorf("kvlog: compact temp file: %w", err)
++	}
++	tmpName := tmp.Name()
++	cleanup := func() {
++		tmp.Close()
++		os.Remove(tmpName)
++	}
++
++	keys := make([]string, 0, len(s.data))
++	for k := range s.data {
++		keys = append(keys, k)
++	}
++	sort.Strings(keys) // deterministic layout, friendlier to diffing
++	for _, k := range keys {
++		if err := appendRecord(tmp, opSet, k, s.data[k]); err != nil {
++			cleanup()
++			return fmt.Errorf("kvlog: compact write: %w", err)
++		}
++	}
++	if err := tmp.Sync(); err != nil {
++		cleanup()
++		return fmt.Errorf("kvlog: compact sync: %w", err)
++	}
++	if err := os.Rename(tmpName, s.path); err != nil {
++		cleanup()
++		return fmt.Errorf("kvlog: compact swap: %w", err)
++	}
++	// Swap the handle: appends now go to the compacted file.
++	old := s.f
++	s.f = tmp
++	old.Close()
++	if _, err := s.f.Seek(0, 2); err != nil {
++		return fmt.Errorf("kvlog: seek end after compact: %w", err)
++	}
++	return nil
++}
+diff --git a/kvlog.go b/kvlog.go
+new file mode 100644
+index 0000000..f1ec9da
+--- /dev/null
++++ b/kvlog.go
+@@ -0,0 +1,105 @@
++// Package kvlog is a small append-only key-value store. Every mutation is a
++// record in a write-ahead log; Open rebuilds the in-memory table by
++// replaying that log, tolerating a torn final record.
++package kvlog
++
++import (
++	"errors"
++	"fmt"
++	"os"
++	"sync"
++)
++
++// Store is a durable string-to-string map backed by an append-only log.
++// It is safe for concurrent use.
++type Store struct {
++	mu     sync.Mutex
++	path   string
++	f      *os.File
++	data   map[string]string
++	closed bool
++}
++
++var errClosed = errors.New("kvlog: store is closed")
++
++// Open replays the log at path (creating it if absent) and returns a ready
++// store. A torn trailing record is dropped and trimmed from the file so
++// later appends stay parseable.
++func Open(path string) (*Store, error) {
++	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
++	if err != nil {
++		return nil, fmt.Errorf("kvlog: open %s: %w", path, err)
++	}
++	data, goodOffset, err := replay(f)
++	if err != nil {
++		f.Close()
++		return nil, fmt.Errorf("kvlog: replay %s: %w", path, err)
++	}
++	// Trim any torn tail, then position for appends.
++	if err := f.Truncate(goodOffset); err != nil {
++		f.Close()
++		return nil, fmt.Errorf("kvlog: trim torn tail: %w", err)
++	}
++	if _, err := f.Seek(goodOffset, 0); err != nil {
++		f.Close()
++		return nil, fmt.Errorf("kvlog: seek: %w", err)
++	}
++	return &Store{path: path, f: f, data: data}, nil
++}
++
++// Set records key=value. The record is in the file when Set returns.
++func (s *Store) Set(key, value string) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.closed {
++		return errClosed
++	}
++	if err := appendRecord(s.f, opSet, key, value); err != nil {
++		return fmt.Errorf("kvlog: append set: %w", err)
++	}
++	s.data[key] = value
++	return nil
++}
++
++// Delete removes key. Deleting a missing key is a no-op (nothing is logged).
++func (s *Store) Delete(key string) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.closed {
++		return errClosed
++	}
++	if _, ok := s.data[key]; !ok {
++		return nil
++	}
++	if err := appendRecord(s.f, opDelete, key, ""); err != nil {
++		return fmt.Errorf("kvlog: append delete: %w", err)
++	}
++	delete(s.data, key)
++	return nil
++}
++
++// Get returns the live value for key.
++func (s *Store) Get(key string) (string, bool) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	v, ok := s.data[key]
++	return v, ok
++}
++
++// Len reports the number of live keys.
++func (s *Store) Len() int {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return len(s.data)
++}
++
++// Close releases the log file. Further mutations fail.
++func (s *Store) Close() error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.closed {
++		return errClosed
++	}
++	s.closed = true
++	return s.f.Close()
++}
+diff --git a/record.go b/record.go
+new file mode 100644
+index 0000000..16175ff
+--- /dev/null
++++ b/record.go
+@@ -0,0 +1,82 @@
++package kvlog
++
++import (
++	"bufio"
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++)
++
++// Log record layout (all little-endian-free, varint based):
++//
++//	op byte (opSet | opDelete)
++//	uvarint key length, key bytes
++//	opSet only: uvarint value length, value bytes
++//
++// Length prefixes make a truncated record detectable: the reader runs out of
++// bytes before the promised payload and the tail is dropped.
++const (
++	opSet    byte = 1
++	opDelete byte = 2
++)
++
++// appendRecord encodes one op and writes it with a single Write call, so the
++// bytes are handed to the OS before the mutation is acknowledged.
++func appendRecord(f *os.File, op byte, key, value string) error {
++	buf := make([]byte, 0, 1+2*binary.MaxVarintLen64+len(key)+len(value))
++	buf = append(buf, op)
++	buf = binary.AppendUvarint(buf, uint64(len(key)))
++	buf = append(buf, key...)
++	if op == opSet {
++		buf = binary.AppendUvarint(buf, uint64(len(value)))
++		buf = append(buf, value...)
++	}
++	_, err := f.Write(buf)
++	return err
++}
++
++// errTorn marks an incomplete trailing record.
++var errTorn = errors.New("torn record")
++
++// readRecord decodes the next record. It returns errTorn when the log ends
++// mid-record and io.EOF exactly at a record boundary.
++func readRecord(r *bufio.Reader) (op byte, key, value string, err error) {
++	op, err = r.ReadByte()
++	if err == io.EOF {
++		return 0, "", "", io.EOF
++	}
++	if err != nil {
++		return 0, "", "", err
++	}
++	if op != opSet && op != opDelete {
++		return 0, "", "", fmt.Errorf("unknown op 0x%02x", op)
++	}
++	key, err = readBlob(r)
++	if err != nil {
++		return 0, "", "", err
++	}
++	if op == opSet {
++		value, err = readBlob(r)
++		if err != nil {
++			return 0, "", "", err
++		}
++	}
++	return op, key, value, nil
++}
++
++func readBlob(r *bufio.Reader) (string, error) {
++	n, err := binary.ReadUvarint(r)
++	if err != nil {
++		return "", errTorn // length prefix cut off
++	}
++	if n > 1<<30 {
++		return "", fmt.Errorf("implausible blob length %d", n)
++	}
++	buf := make([]byte, n)
++	if _, err := io.ReadFull(r, buf); err != nil {
++		return "", errTorn // payload cut off
++	}
++	return string(buf), nil
++}
+diff --git a/replay.go b/replay.go
+new file mode 100644
+index 0000000..ae64032
+--- /dev/null
++++ b/replay.go
+@@ -0,0 +1,48 @@
++package kvlog
++
++import (
++	"bufio"
++	"errors"
++	"io"
++	"os"
++)
++
++// replay scans the whole log, applying records in order. It returns the
++// rebuilt table and the offset just past the last complete record; anything
++// after that offset is a torn tail to be trimmed.
++func replay(f *os.File) (map[string]string, int64, error) {
++	if _, err := f.Seek(0, 0); err != nil {
++		return nil, 0, err
++	}
++	data := make(map[string]string)
++	br := bufio.NewReader(f)
++	var good int64
++	for {
++		op, key, value, err := readRecord(br)
++		if err == io.EOF {
++			return data, good, nil
++		}
++		if errors.Is(err, errTorn) {
++			return data, good, nil // drop the partial record
++		}
++		if err != nil {
++			// Garbage that parses as neither op: treat everything from the
++			// last good offset onward as a torn tail.
++			return data, good, nil
++		}
++		switch op {
++		case opSet:
++			data[key] = value
++		case opDelete:
++			delete(data, key)
++		}
++		good = consumed(f, br)
++	}
++}
++
++// consumed reports the absolute file offset the reader has fully decoded:
++// the file position minus what still sits unread in the buffer.
++func consumed(f *os.File, br *bufio.Reader) int64 {
++	pos, _ := f.Seek(0, 1) // current OS-level position
++	return pos - int64(br.Buffered())
++}

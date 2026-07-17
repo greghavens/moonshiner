@@ -1,0 +1,377 @@
+diff --git a/client.go b/client.go
+new file mode 100644
+index 0000000..d41acdc
+--- /dev/null
++++ b/client.go
+@@ -0,0 +1,128 @@
++package taskwatch
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
++)
++
++// Client talks to one SDDC Manager with a fixed bearer token.
++type Client struct {
++	baseURL string
++	token   string
++	hc      *http.Client
++}
++
++// NewClient returns a client bound to baseURL; hc may be nil for the default.
++func NewClient(baseURL, token string, hc *http.Client) *Client {
++	if hc == nil {
++		hc = http.DefaultClient
++	}
++	return &Client{baseURL: strings.TrimRight(baseURL, "/"), token: token, hc: hc}
++}
++
++func (c *Client) do(ctx context.Context, method, path string, body any) (*http.Response, []byte, error) {
++	var reader io.Reader
++	if body != nil {
++		encoded, err := json.Marshal(body)
++		if err != nil {
++			return nil, nil, fmt.Errorf("encode %s %s body: %w", method, path, err)
++		}
++		reader = bytes.NewReader(encoded)
++	}
++	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
++	if err != nil {
++		return nil, nil, err
++	}
++	req.Header.Set("Authorization", "Bearer "+c.token)
++	req.Header.Set("Accept", "application/json")
++	if body != nil {
++		req.Header.Set("Content-Type", "application/json")
++	}
++	resp, err := c.hc.Do(req)
++	if err != nil {
++		return nil, nil, err
++	}
++	defer resp.Body.Close()
++	payload, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return nil, nil, fmt.Errorf("read %s %s response: %w", method, path, err)
++	}
++	return resp, payload, nil
++}
++
++func decodeAPIError(status int, payload []byte) *APIError {
++	apiErr := &APIError{StatusCode: status}
++	_ = json.Unmarshal(payload, apiErr) // a non-JSON body still yields the status
++	return apiErr
++}
++
++// ExpandCluster submits PATCH /v1/clusters/{id} with the expansion spec and
++// validates that the 202 answer's Location header names the returned task.
++func (c *Client) ExpandCluster(ctx context.Context, clusterID string, spec ClusterExpansionSpec) (Task, error) {
++	body := map[string]any{"clusterExpansionSpec": spec}
++	resp, payload, err := c.do(ctx, http.MethodPatch, "/v1/clusters/"+clusterID, body)
++	if err != nil {
++		return Task{}, err
++	}
++	if resp.StatusCode != http.StatusAccepted {
++		return Task{}, decodeAPIError(resp.StatusCode, payload)
++	}
++	var task Task
++	if err := json.Unmarshal(payload, &task); err != nil {
++		return Task{}, fmt.Errorf("decode accepted task: %w", err)
++	}
++	location := resp.Header.Get("Location")
++	if location == "" {
++		return Task{}, fmt.Errorf("cluster update accepted task %s without a Location header", task.ID)
++	}
++	parsed, err := url.Parse(location)
++	if err != nil {
++		return Task{}, fmt.Errorf("cluster update Location header is not a URL: %w", err)
++	}
++	if want := "/v1/tasks/" + task.ID; parsed.Path != want {
++		return Task{}, fmt.Errorf(
++			"cluster update Location %q does not match accepted task id %q (want path %s)",
++			parsed.Path, task.ID, want)
++	}
++	return task, nil
++}
++
++// GetTask reads GET /v1/tasks/{id}.
++func (c *Client) GetTask(ctx context.Context, id string) (Task, error) {
++	resp, payload, err := c.do(ctx, http.MethodGet, "/v1/tasks/"+id, nil)
++	if err != nil {
++		return Task{}, err
++	}
++	if resp.StatusCode != http.StatusOK {
++		return Task{}, decodeAPIError(resp.StatusCode, payload)
++	}
++	var task Task
++	if err := json.Unmarshal(payload, &task); err != nil {
++		return Task{}, fmt.Errorf("decode task: %w", err)
++	}
++	return task, nil
++}
++
++// CancelTask issues DELETE /v1/tasks/{id} and returns the cancelled task.
++func (c *Client) CancelTask(ctx context.Context, id string) (Task, error) {
++	resp, payload, err := c.do(ctx, http.MethodDelete, "/v1/tasks/"+id, nil)
++	if err != nil {
++		return Task{}, err
++	}
++	if resp.StatusCode/100 != 2 {
++		return Task{}, decodeAPIError(resp.StatusCode, payload)
++	}
++	var task Task
++	if len(payload) > 0 {
++		if err := json.Unmarshal(payload, &task); err != nil {
++			return Task{}, fmt.Errorf("decode cancelled task: %w", err)
++		}
++	}
++	return task, nil
++}
+diff --git a/types.go b/types.go
+new file mode 100644
+index 0000000..f7ee679
+--- /dev/null
++++ b/types.go
+@@ -0,0 +1,148 @@
++// Package taskwatch drives SDDC Manager's asynchronous task lifecycle:
++// submit a cluster expansion, follow the returned task with bounded backoff,
++// and preserve VCF's composite nested errors and reference tokens.
++package taskwatch
++
++import "fmt"
++
++// Task mirrors the SDDC Manager Task model (GET /v1/tasks/{id}).
++type Task struct {
++	ID                  string      `json:"id"`
++	Name                string      `json:"name"`
++	Type                string      `json:"type"`
++	Status              string      `json:"status"`
++	CreationTimestamp   string      `json:"creationTimestamp"`
++	CompletionTimestamp string      `json:"completionTimestamp"`
++	ResolutionStatus    string      `json:"resolutionStatus"`
++	IsCancellable       bool        `json:"isCancellable"`
++	IsRetryable         bool        `json:"isRetryable"`
++	SubTasks            []SubTask   `json:"subTasks"`
++	Errors              []TaskError `json:"errors"`
++	Resources           []Resource  `json:"resources"`
++}
++
++// SubTask is one step of a Task, with its own composite errors.
++type SubTask struct {
++	Name        string      `json:"name"`
++	Description string      `json:"description"`
++	Status      string      `json:"status"`
++	Errors      []TaskError `json:"errors"`
++}
++
++// TaskError is VCF's recursive error structure.
++type TaskError struct {
++	ErrorCode          string      `json:"errorCode"`
++	ErrorType          string      `json:"errorType"`
++	Message            string      `json:"message"`
++	RemediationMessage string      `json:"remediationMessage"`
++	ReferenceToken     string      `json:"referenceToken"`
++	Causes             []Cause     `json:"causes"`
++	NestedErrors       []TaskError `json:"nestedErrors"`
++}
++
++// Cause is one underlying cause of a TaskError.
++type Cause struct {
++	Type    string `json:"type"`
++	Message string `json:"message"`
++}
++
++// Resource identifies an inventory object touched by a task (9.x model:
++// fqdn, no legacy address field).
++type Resource struct {
++	ResourceID string `json:"resourceId"`
++	FQDN       string `json:"fqdn"`
++	Type       string `json:"type"`
++	Name       string `json:"name"`
++}
++
++// ClusterExpansionSpec is the clusterExpansionSpec part of ClusterUpdateSpec.
++type ClusterExpansionSpec struct {
++	HostSpecs []HostSpec `json:"hostSpecs"`
++}
++
++// HostSpec names one host to add; optional fields stay off the wire.
++type HostSpec struct {
++	ID              string           `json:"id"`
++	AzName          string           `json:"azName,omitempty"`
++	HostNetworkSpec *HostNetworkSpec `json:"hostNetworkSpec,omitempty"`
++}
++
++// HostNetworkSpec carries the vmnic-to-VDS mapping for a new host.
++type HostNetworkSpec struct {
++	VMNics             []VMNic `json:"vmNics,omitempty"`
++	NetworkProfileName string  `json:"networkProfileName,omitempty"`
++}
++
++// VMNic maps one physical nic to a VDS uplink.
++type VMNic struct {
++	ID      string `json:"id"`
++	VdsName string `json:"vdsName,omitempty"`
++	Uplink  string `json:"uplink,omitempty"`
++}
++
++// APIError is a decoded VCF error envelope from a non-2xx answer.
++type APIError struct {
++	StatusCode         int    `json:"-"`
++	ErrorCode          string `json:"errorCode"`
++	Message            string `json:"message"`
++	RemediationMessage string `json:"remediationMessage"`
++	ReferenceToken     string `json:"referenceToken"`
++}
++
++func (e *APIError) Error() string {
++	return fmt.Sprintf("SDDC Manager returned %d (%s): %s",
++		e.StatusCode, e.ErrorCode, e.Message)
++}
++
++// TaskFailedError reports a task that reached the FAILED state; the task,
++// with its full composite error tree, rides along.
++type TaskFailedError struct {
++	Task Task
++}
++
++func (e *TaskFailedError) Error() string {
++	return fmt.Sprintf("task %s (%s) failed", e.Task.ID, e.Task.Name)
++}
++
++var terminalStatuses = map[string]bool{
++	"SUCCESSFUL":             true,
++	"FAILED":                 true,
++	"CANCELLED":              true,
++	"COMPLETED_WITH_WARNING": true,
++	"SKIPPED":                true,
++	"TIMED_OUT":              true,
++}
++
++var nonTerminalStatuses = map[string]bool{
++	"PENDING":     true,
++	"QUEUED":      true,
++	"IN_PROGRESS": true,
++}
++
++// IsTerminal reports whether status is one of the documented terminal states.
++func IsTerminal(status string) bool {
++	return terminalStatuses[status]
++}
++
++// ReferenceTokens walks task errors then subTask errors depth-first
++// (an error before its nested errors) and collects every non-empty
++// referenceToken once, first occurrence winning.
++func ReferenceTokens(t Task) []string {
++	var out []string
++	seen := map[string]bool{}
++	var walk func(errs []TaskError)
++	walk = func(errs []TaskError) {
++		for _, e := range errs {
++			if e.ReferenceToken != "" && !seen[e.ReferenceToken] {
++				seen[e.ReferenceToken] = true
++				out = append(out, e.ReferenceToken)
++			}
++			walk(e.NestedErrors)
++		}
++	}
++	walk(t.Errors)
++	for _, sub := range t.SubTasks {
++		walk(sub.Errors)
++	}
++	return out
++}
+diff --git a/watcher.go b/watcher.go
+new file mode 100644
+index 0000000..7fc2837
+--- /dev/null
++++ b/watcher.go
+@@ -0,0 +1,83 @@
++package taskwatch
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"time"
++)
++
++// WaitOptions bounds the polling loop. Sleep is injected so nothing here
++// touches the wall clock; it must honor ctx and return its error when the
++// context ends during the sleep.
++type WaitOptions struct {
++	InitialDelay time.Duration
++	MaxDelay     time.Duration
++	Sleep        func(context.Context, time.Duration) error
++}
++
++// maxConsecutiveServerErrors is the pinned transient-failure budget: three
++// consecutive 5xx poll answers surface the last *APIError.
++const maxConsecutiveServerErrors = 3
++
++// WaitForTask polls GET /v1/tasks/{id} through the documented states until a
++// terminal one, backing off exponentially from InitialDelay up to MaxDelay.
++// A FAILED task is returned together with a *TaskFailedError; the caller gets
++// the full composite error tree either way.
++func WaitForTask(ctx context.Context, c *Client, taskID string, opts WaitOptions) (Task, error) {
++	sleep := opts.Sleep
++	if sleep == nil {
++		sleep = func(ctx context.Context, d time.Duration) error {
++			timer := time.NewTimer(d)
++			defer timer.Stop()
++			select {
++			case <-ctx.Done():
++				return ctx.Err()
++			case <-timer.C:
++				return nil
++			}
++		}
++	}
++	delay := opts.InitialDelay
++	consecutive5xx := 0
++	for attempt := 0; ; attempt++ {
++		if attempt > 0 {
++			if err := sleep(ctx, delay); err != nil {
++				return Task{}, err
++			}
++			delay *= 2
++			if delay > opts.MaxDelay {
++				delay = opts.MaxDelay
++			}
++		}
++		if err := ctx.Err(); err != nil {
++			return Task{}, err
++		}
++
++		task, err := c.GetTask(ctx, taskID)
++		if err != nil {
++			var apiErr *APIError
++			if errors.As(err, &apiErr) && apiErr.StatusCode >= 500 {
++				consecutive5xx++
++				if consecutive5xx >= maxConsecutiveServerErrors {
++					return Task{}, apiErr
++				}
++				continue
++			}
++			return Task{}, err
++		}
++		consecutive5xx = 0
++
++		switch {
++		case task.Status == "FAILED":
++			return task, &TaskFailedError{Task: task}
++		case IsTerminal(task.Status):
++			return task, nil
++		case nonTerminalStatuses[task.Status]:
++			// keep polling
++		default:
++			return Task{}, fmt.Errorf(
++				"task %s reported undocumented status %q", taskID, task.Status)
++		}
++	}
++}

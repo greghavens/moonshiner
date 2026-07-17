@@ -1,0 +1,241 @@
+diff --git a/loglens.ps1 b/loglens.ps1
+new file mode 100644
+index 0000000..6ff7fb4
+--- /dev/null
++++ b/loglens.ps1
+@@ -0,0 +1,235 @@
++# loglens.ps1 -- multi-source log intelligence: normalize, correlate, escalate.
++[CmdletBinding()]
++param(
++    [Parameter(Position = 0)]
++    [string]$Command = '',
++
++    [string]$LogDir = ''
++)
++
++Set-StrictMode -Version Latest
++$ErrorActionPreference = 'Stop'
++[System.Globalization.CultureInfo]::CurrentCulture = [System.Globalization.CultureInfo]::InvariantCulture
++[System.Globalization.CultureInfo]::CurrentUICulture = [System.Globalization.CultureInfo]::InvariantCulture
++
++function Write-ToolError {
++    param([string]$Message)
++    [Console]::Error.WriteLine($Message)
++}
++
++function Get-SortedOrdinal {
++    param([string[]]$Values)
++    $sorted = @($Values)
++    [Array]::Sort($sorted, [System.StringComparer]::Ordinal)
++    return , $sorted
++}
++
++if ($Command -cnotin @('normalize', 'sessions', 'escalations')) {
++    Write-ToolError 'usage: loglens.ps1 normalize|sessions|escalations -LogDir <dir>'
++    exit 64
++}
++if (-not (Test-Path -LiteralPath $LogDir -PathType Container)) {
++    Write-ToolError "loglens: log directory not found: $LogDir"
++    exit 66
++}
++
++# ---------------------------------------------------------------- ingest ---
++
++$records = [System.Collections.Generic.List[object]]::new()
++
++function Add-Record {
++    param([string]$Ts, [string]$Src, [string]$Hst, [string]$Sess,
++          [string]$Usr, [string]$Lvl, [string]$Evt)
++    $records.Add([pscustomobject]@{
++        Timestamp = $Ts
++        Source    = $Src
++        Host      = $Hst
++        Session   = $Sess
++        User      = $Usr
++        Level     = $Lvl
++        Event     = $Evt
++    })
++}
++
++function Read-GatewayLine {
++    param([string]$Line)
++    if ($Line -cnotmatch '^(\S+) (\S+) (\S+) (\S+) "([A-Z]+ \S+)" (\d{3}) (\d+)ms$') {
++        return $false
++    }
++    $status = [int]$Matches[6]
++    $level = if ($status -ge 500) { 'error' } elseif ($status -ge 400) { 'warn' } else { 'info' }
++    Add-Record -Ts $Matches[1] -Src 'gateway' -Hst $Matches[2] -Sess $Matches[3] `
++        -Usr '' -Lvl $level -Evt $Matches[5]
++    return $true
++}
++
++function Read-AppLine {
++    param([string]$Line)
++    $pairs = @{}
++    foreach ($token in $Line.Split(' ')) {
++        if ($token -cnotmatch '^([A-Za-z0-9_]+)=(.*)$') { return $false }
++        $pairs[$Matches[1]] = $Matches[2]
++    }
++    foreach ($required in 'ts', 'host', 'level', 'session', 'event') {
++        if (-not $pairs.ContainsKey($required)) { return $false }
++    }
++    $user = if ($pairs.ContainsKey('user')) { $pairs['user'] } else { '' }
++    Add-Record -Ts $pairs['ts'] -Src 'app' -Hst $pairs['host'] -Sess $pairs['session'] `
++        -Usr $user -Lvl $pairs['level'] -Evt $pairs['event']
++    return $true
++}
++
++function Read-AuthLine {
++    param([string]$Line)
++    $fields = $Line.Split(',')
++    if ($fields.Count -ne 5) { return $false }
++    $level = if ($fields[4] -ceq 'fail') { 'warn' } else { 'info' }
++    Add-Record -Ts $fields[0] -Src 'auth' -Hst $fields[1] -Sess $fields[2] `
++        -Usr $fields[3] -Lvl $level -Evt "auth-$($fields[4])"
++    return $true
++}
++
++$sourcePlan = @(
++    @{ Source = 'app';     Filter = '*.log' },
++    @{ Source = 'auth';    Filter = '*.csv' },
++    @{ Source = 'gateway'; Filter = '*.log' }
++)
++
++foreach ($plan in $sourcePlan) {
++    $dir = Join-Path $LogDir $plan.Source
++    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
++    $names = @(Get-ChildItem -LiteralPath $dir -File -Filter $plan.Filter |
++        ForEach-Object { $_.Name })
++    $names = Get-SortedOrdinal -Values $names
++    foreach ($name in $names) {
++        $lines = [System.IO.File]::ReadAllLines((Join-Path $dir $name))
++        for ($i = 0; $i -lt $lines.Count; $i++) {
++            $line = $lines[$i]
++            if ($line.Trim().Length -eq 0) { continue }
++            if ($plan.Source -ceq 'auth' -and $i -eq 0) { continue }
++            $kept = switch ($plan.Source) {
++                'app'     { Read-AppLine -Line $line }
++                'auth'    { Read-AuthLine -Line $line }
++                'gateway' { Read-GatewayLine -Line $line }
++            }
++            if (-not $kept) {
++                Write-ToolError "loglens: malformed line ${name}:$($i + 1)"
++            }
++        }
++    }
++}
++
++$sorted = $records.ToArray()
++[Array]::Sort($sorted, [System.Comparison[object]]{
++    param($a, $b)
++    $c = [string]::CompareOrdinal($a.Timestamp, $b.Timestamp); if ($c -ne 0) { return $c }
++    $c = [string]::CompareOrdinal($a.Source, $b.Source); if ($c -ne 0) { return $c }
++    $c = [string]::CompareOrdinal($a.Session, $b.Session); if ($c -ne 0) { return $c }
++    return [string]::CompareOrdinal($a.Event, $b.Event)
++})
++
++# ----------------------------------------------------------- correlation ---
++
++function Get-SessionSummaries {
++    $bySession = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
++    foreach ($r in $sorted) {
++        if (-not $bySession.ContainsKey($r.Session)) {
++            $bySession[$r.Session] = [System.Collections.Generic.List[object]]::new()
++        }
++        $bySession[$r.Session].Add($r)
++    }
++    $summaries = [System.Collections.Generic.List[object]]::new()
++    foreach ($sid in (Get-SortedOrdinal -Values @($bySession.Keys))) {
++        $rs = $bySession[$sid]
++        $user = ''
++        foreach ($r in $rs) {
++            if ($r.User -cne '') { $user = $r.User; break }
++        }
++        $hosts = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
++        $sources = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
++        $errors = 0
++        $authFails = 0
++        foreach ($r in $rs) {
++            [void]$hosts.Add($r.Host)
++            [void]$sources.Add($r.Source)
++            if ($r.Level -ceq 'error') { $errors++ }
++            if ($r.Source -ceq 'auth' -and $r.Event -ceq 'auth-fail') { $authFails++ }
++        }
++        $start = $rs[0].Timestamp
++        $end = $rs[$rs.Count - 1].Timestamp
++        $span = [System.DateTimeOffset]::Parse($end, [System.Globalization.CultureInfo]::InvariantCulture) -
++                [System.DateTimeOffset]::Parse($start, [System.Globalization.CultureInfo]::InvariantCulture)
++        $summaries.Add([pscustomobject]@{
++            Session         = $sid
++            User            = $user
++            Start           = $start
++            End             = $end
++            DurationSeconds = [int]$span.TotalSeconds
++            HostList        = Get-SortedOrdinal -Values @($hosts)
++            SourceList      = Get-SortedOrdinal -Values @($sources)
++            Events          = $rs.Count
++            Errors          = $errors
++            AuthFailures    = $authFails
++        })
++    }
++    return , $summaries
++}
++
++# ---------------------------------------------------------------- output ---
++
++switch ($Command) {
++    'normalize' {
++        foreach ($r in $sorted) {
++            $row = [ordered]@{
++                Timestamp = $r.Timestamp
++                Source    = $r.Source
++                Host      = $r.Host
++                Session   = $r.Session
++                User      = $r.User
++                Level     = $r.Level
++                Event     = $r.Event
++            }
++            Write-Output ([pscustomobject]$row | ConvertTo-Json -Compress)
++        }
++        exit 0
++    }
++    'sessions' {
++        foreach ($s in (Get-SessionSummaries)) {
++            $row = [ordered]@{
++                Session         = $s.Session
++                User            = $s.User
++                Start           = $s.Start
++                End             = $s.End
++                DurationSeconds = $s.DurationSeconds
++                Hosts           = ($s.HostList -join ',')
++                Sources         = ($s.SourceList -join ',')
++                Events          = $s.Events
++                Errors          = $s.Errors
++                AuthFailures    = $s.AuthFailures
++            }
++            Write-Output ([pscustomobject]$row | ConvertTo-Json -Compress)
++        }
++        exit 0
++    }
++    'escalations' {
++        $summaries = Get-SessionSummaries
++        $high = [System.Collections.Generic.List[string]]::new()
++        $medium = [System.Collections.Generic.List[string]]::new()
++        $low = [System.Collections.Generic.List[string]]::new()
++        foreach ($s in $summaries) {
++            if ($s.AuthFailures -ge 3) {
++                $high.Add("high $($s.Session) repeated auth failures ($($s.AuthFailures))")
++            }
++            if ($s.HostList.Count -ge 4) {
++                $medium.Add("medium $($s.Session) session roamed $($s.HostList.Count) hosts")
++            }
++            if ($s.Errors -ge 2) {
++                $low.Add("low $($s.Session) elevated error volume ($($s.Errors))")
++            }
++        }
++        $all = @($high) + @($medium) + @($low)
++        foreach ($line in $all) { Write-Output $line }
++        if ($all.Count -gt 0) { exit 65 }
++        exit 0
++    }
++}

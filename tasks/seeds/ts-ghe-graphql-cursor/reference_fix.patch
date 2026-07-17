@@ -1,0 +1,258 @@
+diff --git a/ghql/client.ts b/ghql/client.ts
+new file mode 100644
+index 0000000..1729565
+--- /dev/null
++++ b/ghql/client.ts
+@@ -0,0 +1,100 @@
++// Minimal GitHub GraphQL transport: POST /graphql with bearer auth,
++// separate variables, and typed HTTP/GraphQL errors that never leak the
++// token.
++
++export interface GraphQLErrorEntry {
++  message: string;
++  type?: string;
++  path?: Array<string | number>;
++}
++
++export interface RateHeaders {
++  limit: number | null;
++  remaining: number | null;
++  used: number | null;
++  reset: number | null;
++  resource: string | null;
++}
++
++export interface ExecuteResult {
++  data: any;
++  errors?: GraphQLErrorEntry[];
++  rateHeaders: RateHeaders;
++}
++
++export class GraphQLHttpError extends Error {
++  readonly status: number;
++
++  constructor(status: number, apiMessage: string) {
++    super(`github graphql http ${status}: ${apiMessage}`);
++    this.name = "GraphQLHttpError";
++    this.status = status;
++  }
++}
++
++export class GraphQLQueryError extends Error {
++  readonly errors: GraphQLErrorEntry[];
++
++  constructor(errors: GraphQLErrorEntry[]) {
++    super(`github graphql query failed: ${errors.map((e) => e.message).join("; ")}`);
++    this.name = "GraphQLQueryError";
++    this.errors = errors;
++  }
++}
++
++export interface ClientOptions {
++  baseUrl: string;
++  token: string;
++}
++
++function num(headers: Headers, name: string): number | null {
++  const raw = headers.get(name);
++  if (raw === null || raw === "") return null;
++  const n = Number(raw);
++  return Number.isNaN(n) ? null : n;
++}
++
++export class GraphQLClient {
++  readonly #endpoint: string;
++  readonly #token: string;
++
++  constructor(opts: ClientOptions) {
++    this.#endpoint = opts.baseUrl.replace(/\/+$/, "") + "/graphql";
++    this.#token = opts.token;
++  }
++
++  async execute(query: string, variables: Record<string, unknown>): Promise<ExecuteResult> {
++    const res = await fetch(this.#endpoint, {
++      method: "POST",
++      headers: {
++        authorization: `bearer ${this.#token}`,
++        "content-type": "application/json",
++        "user-agent": "compliance-repo-inventory/1.0",
++      },
++      body: JSON.stringify({ query, variables }),
++    });
++
++    const rateHeaders: RateHeaders = {
++      limit: num(res.headers, "x-ratelimit-limit"),
++      remaining: num(res.headers, "x-ratelimit-remaining"),
++      used: num(res.headers, "x-ratelimit-used"),
++      reset: num(res.headers, "x-ratelimit-reset"),
++      resource: res.headers.get("x-ratelimit-resource"),
++    };
++
++    const raw = await res.text();
++    if (!res.ok) {
++      let apiMessage = res.statusText || `status ${res.status}`;
++      try {
++        const parsed = JSON.parse(raw);
++        if (parsed && typeof parsed.message === "string") apiMessage = parsed.message;
++      } catch {
++        // non-JSON error body (e.g. a bare gateway page): keep the status text
++      }
++      throw new GraphQLHttpError(res.status, apiMessage);
++    }
++
++    const envelope = JSON.parse(raw);
++    return { data: envelope.data, errors: envelope.errors, rateHeaders };
++  }
++}
+diff --git a/ghql/inventory.ts b/ghql/inventory.ts
+new file mode 100644
+index 0000000..4627216
+--- /dev/null
++++ b/ghql/inventory.ts
+@@ -0,0 +1,146 @@
++// Repository inventory: parameterized query, pageInfo cursor traversal,
++// partial-error tolerance, single bounded retry, and node-id deduplication.
++
++import {
++  GraphQLClient,
++  GraphQLHttpError,
++  GraphQLQueryError,
++  type ExecuteResult,
++  type GraphQLErrorEntry,
++  type RateHeaders,
++} from "./client.ts";
++
++const MAX_PAGE_SIZE = 100; // documented cap for first/last
++const RETRYABLE = new Set([502, 503]);
++
++const REPOSITORIES_QUERY = `
++query OrgRepositories($login: String!, $first: Int!, $after: String) {
++  organization(login: $login) {
++    repositories(first: $first, after: $after) {
++      totalCount
++      pageInfo {
++        hasNextPage
++        endCursor
++      }
++      nodes {
++        id
++        name
++        nameWithOwner
++        isArchived
++        visibility
++        pushedAt
++      }
++    }
++  }
++  rateLimit {
++    limit
++    cost
++    remaining
++    used
++    resetAt
++  }
++}`;
++
++export interface Repository {
++  id: string;
++  name: string;
++  nameWithOwner: string;
++  isArchived: boolean;
++  visibility: string;
++  pushedAt: string | null;
++}
++
++export interface RateLimitInfo {
++  limit: number;
++  cost: number;
++  remaining: number;
++  used: number;
++  resetAt: string;
++}
++
++export interface InventoryReport {
++  repositories: Repository[];
++  totalCount: number;
++  pagesFetched: number;
++  duplicatesDropped: number;
++  warnings: GraphQLErrorEntry[];
++  rateLimit: RateLimitInfo;
++  rateHeaders: RateHeaders;
++}
++
++export interface InventoryOptions {
++  pageSize?: number;
++}
++
++async function fetchPage(
++  client: GraphQLClient,
++  variables: Record<string, unknown>,
++): Promise<ExecuteResult> {
++  try {
++    return await client.execute(REPOSITORIES_QUERY, variables);
++  } catch (err) {
++    if (err instanceof GraphQLHttpError && RETRYABLE.has(err.status)) {
++      return await client.execute(REPOSITORIES_QUERY, variables);
++    }
++    throw err;
++  }
++}
++
++export async function collectRepositories(
++  client: GraphQLClient,
++  login: string,
++  opts: InventoryOptions = {},
++): Promise<InventoryReport> {
++  const first = Math.max(1, Math.min(opts.pageSize ?? MAX_PAGE_SIZE, MAX_PAGE_SIZE));
++
++  const seen = new Set<string>();
++  const repositories: Repository[] = [];
++  const warnings: GraphQLErrorEntry[] = [];
++  let duplicatesDropped = 0;
++  let totalCount = 0;
++  let pagesFetched = 0;
++  let rateLimit: RateLimitInfo | undefined;
++  let rateHeaders: RateHeaders | undefined;
++  let after: string | null = null;
++
++  for (;;) {
++    const res = await fetchPage(client, { login, first, after });
++    const connection = res.data?.organization?.repositories;
++    if (!connection) {
++      throw new GraphQLQueryError(
++        res.errors ?? [{ message: "no data and no errors in response" }],
++      );
++    }
++    if (res.errors?.length) {
++      warnings.push(...res.errors);
++    }
++
++    pagesFetched += 1;
++    totalCount = connection.totalCount;
++    if (res.data.rateLimit) rateLimit = res.data.rateLimit;
++    rateHeaders = res.rateHeaders;
++
++    for (const node of connection.nodes as Array<Repository | null>) {
++      if (node === null) continue; // partial-error hole
++      if (seen.has(node.id)) {
++        duplicatesDropped += 1;
++        continue;
++      }
++      seen.add(node.id);
++      repositories.push(node);
++    }
++
++    if (!connection.pageInfo.hasNextPage) break;
++    after = connection.pageInfo.endCursor;
++  }
++
++  return {
++    repositories,
++    totalCount,
++    pagesFetched,
++    duplicatesDropped,
++    warnings,
++    rateLimit: rateLimit!,
++    rateHeaders: rateHeaders!,
++  };
++}

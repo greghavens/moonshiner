@@ -1,0 +1,230 @@
+diff --git a/provider2.go b/provider2.go
+new file mode 100644
+index 0000000..95f75de
+--- /dev/null
++++ b/provider2.go
+@@ -0,0 +1,224 @@
++// Package provider2 sends transactional messages through two email vendors
++// behind one Sender port, with policy-driven failover between them.
++package provider2
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"strings"
++)
++
++// Message is one outbound transactional message. IdempotencyKey, when set,
++// is handed to the vendor in its own dialect so vendor-side dedupe works.
++type Message struct {
++	To, From, Subject, Body string
++	IdempotencyKey          string
++}
++
++// Receipt identifies an accepted send.
++type Receipt struct {
++	Provider  string
++	MessageID string
++}
++
++// Sender is the port every dispatcher in the codebase programs against.
++type Sender interface {
++	Send(ctx context.Context, msg Message) (Receipt, error)
++}
++
++// ProviderError is a vendor's refusal, normalized across wire dialects.
++type ProviderError struct {
++	Provider string
++	Status   int
++	Code     string
++	Detail   string
++}
++
++func (e *ProviderError) Error() string {
++	if e.Code != "" {
++		return fmt.Sprintf("%s: HTTP %d %s: %s", e.Provider, e.Status, e.Code, e.Detail)
++	}
++	return fmt.Sprintf("%s: HTTP %d: %s", e.Provider, e.Status, e.Detail)
++}
++
++// FailoverError reports a send that failed on both vendors.
++type FailoverError struct {
++	Primary  error
++	Fallback error
++}
++
++func (e *FailoverError) Error() string {
++	return fmt.Sprintf("both providers failed: primary: %v; fallback: %v", e.Primary, e.Fallback)
++}
++
++// postJSON performs one JSON POST and hands back status and raw body.
++func postJSON(ctx context.Context, client *http.Client, url string, headers map[string]string, payload map[string]any) (int, []byte, error) {
++	if client == nil {
++		client = http.DefaultClient
++	}
++	raw, err := json.Marshal(payload)
++	if err != nil {
++		return 0, nil, err
++	}
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
++	if err != nil {
++		return 0, nil, err
++	}
++	req.Header.Set("Content-Type", "application/json")
++	for k, v := range headers {
++		req.Header.Set(k, v)
++	}
++	resp, err := client.Do(req)
++	if err != nil {
++		return 0, nil, err
++	}
++	defer resp.Body.Close()
++	body, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return 0, nil, err
++	}
++	return resp.StatusCode, body, nil
++}
++
++func is2xx(status int) bool { return status >= 200 && status < 300 }
++
++// ---------------------------------------------------------------- meteor
++
++type meteor struct {
++	baseURL string
++	client  *http.Client
++}
++
++// NewMeteor returns the adapter for the Meteor mail API.
++func NewMeteor(baseURL string, client *http.Client) Sender {
++	return &meteor{baseURL: strings.TrimRight(baseURL, "/"), client: client}
++}
++
++func (m *meteor) Send(ctx context.Context, msg Message) (Receipt, error) {
++	headers := map[string]string{}
++	if msg.IdempotencyKey != "" {
++		headers["Idempotency-Key"] = msg.IdempotencyKey
++	}
++	payload := map[string]any{
++		"to":      msg.To,
++		"from":    msg.From,
++		"subject": msg.Subject,
++		"body":    msg.Body,
++	}
++	status, body, err := postJSON(ctx, m.client, m.baseURL+"/v1/messages", headers, payload)
++	if err != nil {
++		return Receipt{}, fmt.Errorf("meteor: %w", err)
++	}
++	if !is2xx(status) {
++		var envelope struct {
++			Error struct {
++				Code    string `json:"code"`
++				Message string `json:"message"`
++			} `json:"error"`
++		}
++		pe := &ProviderError{Provider: "meteor", Status: status}
++		if json.Unmarshal(body, &envelope) == nil && envelope.Error.Code != "" {
++			pe.Code = envelope.Error.Code
++			pe.Detail = envelope.Error.Message
++		} else {
++			pe.Detail = strings.TrimSpace(string(body))
++		}
++		return Receipt{}, pe
++	}
++	var ok struct {
++		MessageID string `json:"message_id"`
++	}
++	if err := json.Unmarshal(body, &ok); err != nil {
++		return Receipt{}, fmt.Errorf("meteor: undecodable success body: %w", err)
++	}
++	return Receipt{Provider: "meteor", MessageID: ok.MessageID}, nil
++}
++
++// ---------------------------------------------------------------- pelican
++
++type pelican struct {
++	baseURL string
++	client  *http.Client
++}
++
++// NewPelican returns the adapter for the Pelican dispatch API.
++func NewPelican(baseURL string, client *http.Client) Sender {
++	return &pelican{baseURL: strings.TrimRight(baseURL, "/"), client: client}
++}
++
++func (p *pelican) Send(ctx context.Context, msg Message) (Receipt, error) {
++	payload := map[string]any{
++		"recipient": msg.To,
++		"sender":    msg.From,
++		"title":     msg.Subject,
++		"content":   msg.Body,
++	}
++	if msg.IdempotencyKey != "" {
++		payload["dedupe_token"] = msg.IdempotencyKey
++	}
++	status, body, err := postJSON(ctx, p.client, p.baseURL+"/send", nil, payload)
++	if err != nil {
++		return Receipt{}, fmt.Errorf("pelican: %w", err)
++	}
++	if !is2xx(status) {
++		var envelope struct {
++			Errors []struct {
++				Reason string `json:"reason"`
++				Detail string `json:"detail"`
++			} `json:"errors"`
++		}
++		pe := &ProviderError{Provider: "pelican", Status: status}
++		if json.Unmarshal(body, &envelope) == nil && len(envelope.Errors) > 0 {
++			pe.Code = envelope.Errors[0].Reason
++			pe.Detail = envelope.Errors[0].Detail
++		} else {
++			pe.Detail = strings.TrimSpace(string(body))
++		}
++		return Receipt{}, pe
++	}
++	var ok struct {
++		ID string `json:"id"`
++	}
++	if err := json.Unmarshal(body, &ok); err != nil {
++		return Receipt{}, fmt.Errorf("pelican: undecodable success body: %w", err)
++	}
++	return Receipt{Provider: "pelican", MessageID: ok.ID}, nil
++}
++
++// ---------------------------------------------------------------- failover
++
++type failover struct {
++	primary  Sender
++	fallback Sender
++}
++
++// NewFailover sends through primary and falls back to fallback only when the
++// primary looks broken (5xx, transport trouble, undecodable response) —
++// never when the request itself was rejected (4xx).
++func NewFailover(primary, fallback Sender) Sender {
++	return &failover{primary: primary, fallback: fallback}
++}
++
++func (f *failover) Send(ctx context.Context, msg Message) (Receipt, error) {
++	rc, err := f.primary.Send(ctx, msg)
++	if err == nil {
++		return rc, nil
++	}
++	var pe *ProviderError
++	if errors.As(err, &pe) && pe.Status >= 400 && pe.Status < 500 {
++		return Receipt{}, err // the request is at fault; no vendor will like it better
++	}
++	if ctx.Err() != nil {
++		return Receipt{}, err // dead context: do not produce a second send
++	}
++	rc, ferr := f.fallback.Send(ctx, msg)
++	if ferr == nil {
++		return rc, nil
++	}
++	return Receipt{}, &FailoverError{Primary: err, Fallback: ferr}
++}

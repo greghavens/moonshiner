@@ -1,0 +1,134 @@
+diff --git a/cursorfeed.py b/cursorfeed.py
+new file mode 100644
+index 0000000..356db0b
+--- /dev/null
++++ b/cursorfeed.py
+@@ -0,0 +1,128 @@
++"""Server-cursor lifecycle client — open/expired/closed state machine."""
++import enum
++import json
++import urllib.error
++import urllib.parse
++import urllib.request
++
++
++class CursorState(enum.Enum):
++    OPEN = "open"
++    EXPIRED = "expired"
++    CLOSED = "closed"
++
++
++class CursorError(Exception):
++    """Raised when the server cursor expires more than once in one iterate() call."""
++
++
++class CursorFeed:
++    """Stateful client for a server-managed cursor API.
++
++    State machine:
++      CLOSED --open()--> OPEN --GET 410--> EXPIRED --reopen--> OPEN ...
++      OPEN/EXPIRED --close()--> CLOSED
++    """
++
++    def __init__(self, base_url: str, *, page_size: int = 100):
++        self._base_url = base_url.rstrip("/")
++        self._page_size = page_size
++        self._cursor_id: str | None = None
++        self._state = CursorState.CLOSED
++
++    @property
++    def state(self) -> CursorState:
++        return self._state
++
++    def open(self) -> None:
++        """POST /cursors to allocate a new server cursor."""
++        req = urllib.request.Request(
++            self._base_url + "/cursors",
++            data=b"{}",
++            method="POST",
++            headers={"Content-Type": "application/json"},
++        )
++        resp = urllib.request.urlopen(req)
++        data = json.loads(resp.read().decode("utf-8"))
++        self._cursor_id = data["cursor_id"]
++        self._state = CursorState.OPEN
++
++    def close(self) -> None:
++        """DELETE /cursors/<id> if one is active; no-op when CLOSED."""
++        if self._state is CursorState.CLOSED:
++            return
++        cid = self._cursor_id
++        self._cursor_id = None
++        self._state = CursorState.CLOSED
++        try:
++            req = urllib.request.Request(
++                self._base_url + "/cursors/" + cid,
++                method="DELETE",
++            )
++            urllib.request.urlopen(req)
++        except Exception:
++            pass  # best-effort; cursor may already be gone on the server
++
++    def iterate(self):
++        """Yield rows one at a time, handling expiry with a single reopen."""
++        if self._state is not CursorState.OPEN:
++            self.open()
++
++        seen: set[str] = set()
++        last_key: str | None = None
++        expiry_count = 0
++        next_seek: str | None = None  # seek_after for the very next GET
++
++        try:
++            while True:
++                rows, next_key = self._fetch_page(seek_after=next_seek)
++                next_seek = None  # only applies to the first fetch after a reopen
++
++                if rows is None:
++                    # 410 expired
++                    expiry_count += 1
++                    if expiry_count > 1:
++                        raise CursorError(
++                            "cursor expired twice in one iterate() call; aborting"
++                        )
++                    self._state = CursorState.EXPIRED
++                    # Reopen and seek past last delivered key
++                    self.open()
++                    next_seek = last_key  # may be None if no rows delivered yet
++                    continue
++
++                for row in rows:
++                    key = row.get("key")
++                    if isinstance(key, str):
++                        if key in seen:
++                            continue
++                        seen.add(key)
++                        last_key = key
++                    yield row
++
++                if not next_key:
++                    # Exhausted
++                    break
++
++        finally:
++            self.close()
++
++    def _fetch_page(self, *, seek_after: str | None = None):
++        """GET /cursors/<id>?limit=N[&seek_after=key].
++
++        Returns (rows, next_key) on 200, or (None, None) on 410.
++        """
++        params: dict[str, str] = {"limit": str(self._page_size)}
++        if seek_after is not None:
++            params["seek_after"] = seek_after
++        qs = urllib.parse.urlencode(params)
++        url = "%s/cursors/%s?%s" % (self._base_url, self._cursor_id, qs)
++        req = urllib.request.Request(url, method="GET")
++        try:
++            resp = urllib.request.urlopen(req)
++        except urllib.error.HTTPError as exc:
++            if exc.code == 410:
++                return None, None
++            raise
++        data = json.loads(resp.read().decode("utf-8"))
++        return data.get("rows", []), data.get("next_key")

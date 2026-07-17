@@ -1,0 +1,352 @@
+diff --git a/client.go b/client.go
+new file mode 100644
+index 0000000..052b485
+--- /dev/null
++++ b/client.go
+@@ -0,0 +1,151 @@
++package mbatch
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"strconv"
++	"sync"
++	"time"
++)
++
++const maxRateLimitRetries = 3
++
++// Client talks to the Dashboard API v1 action-batch endpoints with bearer
++// auth and Retry-After-honoring rate-limit retries. Waiting goes through the
++// injected sleep so the package never blocks in tests.
++type Client struct {
++	baseURL string
++	apiKey  string
++	hc      *http.Client
++	sleep   func(time.Duration)
++
++	mu        sync.Mutex
++	throttled int
++}
++
++// NewClient builds a client for a versioned base URL such as
++// https://api.meraki.com/api/v1.
++func NewClient(baseURL, apiKey string, hc *http.Client, sleep func(time.Duration)) *Client {
++	if hc == nil {
++		hc = http.DefaultClient
++	}
++	if sleep == nil {
++		sleep = time.Sleep
++	}
++	return &Client{baseURL: trimTrailingSlash(baseURL), apiKey: apiKey, hc: hc, sleep: sleep}
++}
++
++func trimTrailingSlash(s string) string {
++	for len(s) > 0 && s[len(s)-1] == '/' {
++		s = s[:len(s)-1]
++	}
++	return s
++}
++
++// Throttled reports how many rate-limit waits the client has honored.
++func (c *Client) Throttled() int {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return c.throttled
++}
++
++func (c *Client) noteThrottle() {
++	c.mu.Lock()
++	c.throttled++
++	c.mu.Unlock()
++}
++
++func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
++	var payload []byte
++	if body != nil {
++		var err error
++		payload, err = json.Marshal(body)
++		if err != nil {
++			return fmt.Errorf("encode %s %s: %w", method, path, err)
++		}
++	}
++	for attempt := 0; ; attempt++ {
++		var reader io.Reader
++		if payload != nil {
++			reader = bytes.NewReader(payload)
++		}
++		req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
++		if err != nil {
++			return err
++		}
++		req.Header.Set("Authorization", "Bearer "+c.apiKey)
++		req.Header.Set("Accept", "application/json")
++		if payload != nil {
++			req.Header.Set("Content-Type", "application/json")
++		}
++		resp, err := c.hc.Do(req)
++		if err != nil {
++			return err
++		}
++		raw, err := io.ReadAll(resp.Body)
++		resp.Body.Close()
++		if err != nil {
++			return err
++		}
++		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
++			if out == nil || len(raw) == 0 {
++				return nil
++			}
++			return json.Unmarshal(raw, out)
++		}
++		if resp.StatusCode == http.StatusTooManyRequests && attempt < maxRateLimitRetries {
++			wait := time.Second
++			if header := resp.Header.Get("Retry-After"); header != "" {
++				if seconds, perr := strconv.Atoi(header); perr == nil {
++					wait = time.Duration(seconds) * time.Second
++				}
++			}
++			c.noteThrottle()
++			c.sleep(wait)
++			continue
++		}
++		return &APIError{Status: resp.StatusCode, Errors: decodeErrors(resp.StatusCode, raw)}
++	}
++}
++
++func decodeErrors(status int, raw []byte) []string {
++	var envelope struct {
++		Errors []string `json:"errors"`
++	}
++	if err := json.Unmarshal(raw, &envelope); err == nil && len(envelope.Errors) > 0 {
++		return envelope.Errors
++	}
++	return []string{fmt.Sprintf("HTTP %d", status)}
++}
++
++type createBatchRequest struct {
++	Confirmed   bool     `json:"confirmed"`
++	Synchronous bool     `json:"synchronous"`
++	Actions     []Action `json:"actions"`
++}
++
++// CreateActionBatch submits a batch to the documented organizations
++// actionBatches endpoint and decodes the returned batch document.
++func (c *Client) CreateActionBatch(ctx context.Context, orgID string, confirmed, synchronous bool, actions []Action) (*Batch, error) {
++	batch := &Batch{}
++	err := c.do(ctx, http.MethodPost, "/organizations/"+orgID+"/actionBatches",
++		createBatchRequest{Confirmed: confirmed, Synchronous: synchronous, Actions: actions}, batch)
++	if err != nil {
++		return nil, err
++	}
++	return batch, nil
++}
++
++// GetActionBatch fetches one batch document for status polling.
++func (c *Client) GetActionBatch(ctx context.Context, orgID, batchID string) (*Batch, error) {
++	batch := &Batch{}
++	err := c.do(ctx, http.MethodGet, "/organizations/"+orgID+"/actionBatches/"+batchID, nil, batch)
++	if err != nil {
++		return nil, err
++	}
++	return batch, nil
++}
+diff --git a/runner.go b/runner.go
+new file mode 100644
+index 0000000..a8a5718
+--- /dev/null
++++ b/runner.go
+@@ -0,0 +1,78 @@
++package mbatch
++
++import (
++	"context"
++	"fmt"
++	"strings"
++)
++
++// Runner submits a flat action list as documented-size confirmed batches and
++// babysits each one to a terminal state.
++type Runner struct {
++	Client *Client
++	// Pace runs before each status poll with a 1-based attempt number that
++	// resets per batch.
++	Pace func(attempt int)
++	// MaxPolls bounds status polling per batch.
++	MaxPolls int
++}
++
++// Run splits actions, submits each chunk confirmed in the requested mode,
++// and polls non-terminal batches. On a batch failure the successes of every
++// earlier batch are preserved in the report, the failure is correlated per
++// action, and no further batches are submitted.
++func (r *Runner) Run(ctx context.Context, orgID string, actions []Action, synchronous bool) (*Report, error) {
++	report := &Report{}
++	defer func() { report.Throttled = r.Client.Throttled() }()
++	for _, chunk := range SplitActions(actions, synchronous) {
++		batch, err := r.Client.CreateActionBatch(ctx, orgID, true, synchronous, chunk)
++		if err != nil {
++			return report, err
++		}
++		report.SubmittedBatches++
++		report.BatchIDs = append(report.BatchIDs, batch.ID)
++
++		attempt := 0
++		for !batch.Status.Completed && !batch.Status.Failed {
++			attempt++
++			if attempt > r.MaxPolls {
++				return report, fmt.Errorf("action batch %s not terminal after %d polls", batch.ID, r.MaxPolls)
++			}
++			if r.Pace != nil {
++				r.Pace(attempt)
++			}
++			batch, err = r.Client.GetActionBatch(ctx, orgID, batch.ID)
++			if err != nil {
++				return report, err
++			}
++			report.Polls++
++		}
++
++		if batch.Status.Failed {
++			report.FailedBatchID = batch.ID
++			report.FailedActionErrors = correlateActionErrors(batch.ID, batch.Status.Errors, chunk)
++			return report, fmt.Errorf("action batch %s failed: %s", batch.ID, strings.Join(batch.Status.Errors, "; "))
++		}
++		report.CompletedBatches++
++		report.CreatedResources = append(report.CreatedResources, batch.Status.CreatedResources...)
++	}
++	return report, nil
++}
++
++// correlateActionErrors maps each status error string to the action in the
++// submitted chunk whose resource path the message names.
++func correlateActionErrors(batchID string, messages []string, chunk []Action) []ActionError {
++	correlated := make([]ActionError, 0, len(messages))
++	for _, message := range messages {
++		entry := ActionError{BatchID: batchID, ActionIndex: -1, Message: message}
++		for index, action := range chunk {
++			if action.Resource != "" && strings.Contains(message, action.Resource) {
++				entry.ActionIndex = index
++				entry.Resource = action.Resource
++				break
++			}
++		}
++		correlated = append(correlated, entry)
++	}
++	return correlated
++}
+diff --git a/split.go b/split.go
+new file mode 100644
+index 0000000..2c33272
+--- /dev/null
++++ b/split.go
+@@ -0,0 +1,22 @@
++package mbatch
++
++// Documented per-batch action limits for the two execution modes.
++const (
++	SyncBatchLimit  = 20
++	AsyncBatchLimit = 100
++)
++
++// SplitActions chunks a flat action list by the documented per-mode limit,
++// preserving order. An empty input yields no batches.
++func SplitActions(actions []Action, synchronous bool) [][]Action {
++	limit := AsyncBatchLimit
++	if synchronous {
++		limit = SyncBatchLimit
++	}
++	var chunks [][]Action
++	for start := 0; start < len(actions); start += limit {
++		end := min(start+limit, len(actions))
++		chunks = append(chunks, actions[start:end])
++	}
++	return chunks
++}
+diff --git a/types.go b/types.go
+new file mode 100644
+index 0000000..657629e
+--- /dev/null
++++ b/types.go
+@@ -0,0 +1,77 @@
++// Package mbatch is a client for the Cisco Meraki Dashboard API v1
++// organization action-batch resource: it splits bulk changes by the
++// documented per-mode limits, submits them confirmed, polls asynchronous
++// batches to a terminal state, and correlates per-action failures.
++package mbatch
++
++import (
++	"fmt"
++	"strings"
++)
++
++// Action is one entry of an action batch. On the wire an action without a
++// Body omits the key entirely.
++type Action struct {
++	Resource  string         `json:"resource"`
++	Operation string         `json:"operation"`
++	Body      map[string]any `json:"body,omitempty"`
++}
++
++// CreatedResource is one status.createdResources entry.
++type CreatedResource struct {
++	ID  string `json:"id"`
++	URI string `json:"uri"`
++}
++
++// BatchStatus mirrors the documented status object of a batch document.
++type BatchStatus struct {
++	Completed        bool              `json:"completed"`
++	Failed           bool              `json:"failed"`
++	Errors           []string          `json:"errors"`
++	CreatedResources []CreatedResource `json:"createdResources"`
++}
++
++// Batch mirrors the documented action-batch document shared by the create
++// response and the status GET.
++type Batch struct {
++	ID             string      `json:"id"`
++	OrganizationID string      `json:"organizationId"`
++	Confirmed      bool        `json:"confirmed"`
++	Synchronous    bool        `json:"synchronous"`
++	Status         BatchStatus `json:"status"`
++	Actions        []Action    `json:"actions"`
++}
++
++// APIError is a non-success Dashboard API response: the HTTP status plus the
++// messages of the documented {"errors": [...]} envelope. The API key is
++// never included.
++type APIError struct {
++	Status int
++	Errors []string
++}
++
++func (e *APIError) Error() string {
++	return fmt.Sprintf("meraki api error %d: %s", e.Status, strings.Join(e.Errors, "; "))
++}
++
++// ActionError correlates one status error string to the action inside the
++// submitted batch whose resource path the message names.
++type ActionError struct {
++	BatchID     string
++	ActionIndex int
++	Resource    string
++	Message     string
++}
++
++// Report summarizes a Runner.Run invocation, including partial progress when
++// a batch fails or polling is exhausted.
++type Report struct {
++	BatchIDs           []string
++	SubmittedBatches   int
++	CompletedBatches   int
++	Polls              int
++	Throttled          int
++	CreatedResources   []CreatedResource
++	FailedBatchID      string
++	FailedActionErrors []ActionError
++}

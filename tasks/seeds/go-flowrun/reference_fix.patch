@@ -1,0 +1,737 @@
+diff --git a/flowrun.go b/flowrun.go
+new file mode 100644
+index 0000000..1edfad5
+--- /dev/null
++++ b/flowrun.go
+@@ -0,0 +1,731 @@
++// Package flowrun executes workflow DSL documents: a single cursor walks an
++// ordered task list, `then:` moves it, and every side effect goes through
++// injected handlers and an injected clock. Strictly sequential — no DAG,
++// no goroutines, no real time.
++package flowrun
++
++import (
++	"errors"
++	"fmt"
++	"regexp"
++	"strconv"
++	"strings"
++	"time"
++
++	"gopkg.in/yaml.v3"
++)
++
++// Clock is the logical time source. Only workflows that declare timeouts
++// need one.
++type Clock interface {
++	Now() time.Time
++}
++
++// Handler executes a `call:` task. It receives the evaluated `with:` map.
++type Handler func(args map[string]any) (any, error)
++
++// Options configures a single run.
++type Options struct {
++	Handlers  map[string]Handler
++	Clock     Clock
++	MaxVisits int // per-task visit budget for then-jumps; 0 = default 50
++}
++
++// Event is one entry of the ordered event log produced by `emit:` tasks.
++type Event struct {
++	Type   string
++	Source string
++	Data   map[string]any
++}
++
++// ErrorInfo is the structured error a `raise:` task attaches to a failed run.
++type ErrorInfo struct {
++	Status int
++	Type   string
++	Title  string
++	Detail string
++}
++
++// Result is the outcome of a run that did not hit an engine-plane error.
++type Result struct {
++	Status  string // "completed" | "failed"
++	Context map[string]any
++	Events  []Event
++	Error   *ErrorInfo // non-nil iff Status == "failed"
++}
++
++// TaskError reports a task whose handler was missing or returned an error.
++type TaskError struct {
++	Task string
++	Err  error
++}
++
++func (e *TaskError) Error() string { return fmt.Sprintf("task %q: %v", e.Task, e.Err) }
++func (e *TaskError) Unwrap() error { return e.Err }
++
++// LoopError reports a task that was visited more often than the budget allows.
++type LoopError struct {
++	Task   string
++	Visits int
++}
++
++func (e *LoopError) Error() string {
++	return fmt.Sprintf("task %q visited %d times, loop budget exceeded", e.Task, e.Visits)
++}
++
++// TimeoutError reports a task that ran past its effective limit, or one that
++// could not start because the workflow budget was already spent (Limit 0).
++type TimeoutError struct {
++	Task  string
++	Limit time.Duration
++}
++
++func (e *TimeoutError) Error() string {
++	return fmt.Sprintf("task %q exceeded its limit of %s", e.Task, e.Limit)
++}
++
++const defaultMaxVisits = 50
++
++// ---------------------------------------------------------------- loading
++
++type switchCase struct {
++	name    string
++	when    any
++	hasWhen bool
++	then    string
++}
++
++type eventSpec struct {
++	typ    string
++	source string
++	data   map[string]any
++}
++
++type task struct {
++	name string
++	kind string // call | set | switch | raise | emit
++
++	call  string
++	with  map[string]any
++	set   map[string]any
++	cases []switchCase
++	raise *ErrorInfo
++	event *eventSpec
++
++	ifCond     any
++	hasIf      bool
++	then       string
++	timeout    time.Duration
++	hasTimeout bool
++}
++
++// Workflow is a loaded, validated document ready to Run.
++type Workflow struct {
++	tasks     []task
++	index     map[string]int
++	budget    time.Duration
++	hasBudget bool
++}
++
++// LoadWorkflow parses and validates a workflow document.
++func LoadWorkflow(src []byte) (*Workflow, error) {
++	var doc struct {
++		Document struct {
++			DSL       string `yaml:"dsl"`
++			Namespace string `yaml:"namespace"`
++			Name      string `yaml:"name"`
++		} `yaml:"document"`
++		Timeout map[string]any   `yaml:"timeout"`
++		Do      []map[string]any `yaml:"do"`
++	}
++	if err := yaml.Unmarshal(src, &doc); err != nil {
++		return nil, fmt.Errorf("parse workflow: %w", err)
++	}
++	if doc.Document.DSL != "1.0" {
++		return nil, fmt.Errorf("document.dsl must be %q, got %q", "1.0", doc.Document.DSL)
++	}
++	if doc.Document.Namespace == "" {
++		return nil, errors.New("document.namespace is required")
++	}
++	if doc.Document.Name == "" {
++		return nil, errors.New("document.name is required")
++	}
++	if len(doc.Do) == 0 {
++		return nil, errors.New("do: must be a non-empty list of tasks")
++	}
++
++	w := &Workflow{index: map[string]int{}}
++	if doc.Timeout != nil {
++		d, err := timeoutAfter(doc.Timeout)
++		if err != nil {
++			return nil, fmt.Errorf("workflow timeout: %w", err)
++		}
++		w.budget, w.hasBudget = d, true
++	}
++	for i, entry := range doc.Do {
++		if len(entry) != 1 {
++			return nil, fmt.Errorf("do[%d]: each entry must be a single-key map naming one task", i)
++		}
++		var name string
++		var raw any
++		for k, v := range entry {
++			name, raw = k, v
++		}
++		if _, dup := w.index[name]; dup {
++			return nil, fmt.Errorf("duplicate task name %q", name)
++		}
++		body, ok := raw.(map[string]any)
++		if !ok {
++			return nil, fmt.Errorf("task %q: body must be a map", name)
++		}
++		t, err := loadTask(name, body)
++		if err != nil {
++			return nil, err
++		}
++		w.index[name] = len(w.tasks)
++		w.tasks = append(w.tasks, *t)
++	}
++	// then-targets can only be checked once every name is known.
++	for _, t := range w.tasks {
++		if err := w.checkTarget(t.name, t.then); err != nil {
++			return nil, err
++		}
++		for _, c := range t.cases {
++			if err := w.checkTarget(t.name, c.then); err != nil {
++				return nil, err
++			}
++		}
++	}
++	return w, nil
++}
++
++func (w *Workflow) checkTarget(task, target string) error {
++	if target == "" || target == "continue" || target == "end" {
++		return nil
++	}
++	if _, ok := w.index[target]; !ok {
++		return fmt.Errorf("task %q: then target %q does not exist", task, target)
++	}
++	return nil
++}
++
++var typeKeys = []string{"call", "set", "switch", "raise", "emit"}
++
++func loadTask(name string, body map[string]any) (*task, error) {
++	t := &task{name: name}
++	for _, k := range typeKeys {
++		if _, ok := body[k]; ok {
++			if t.kind != "" {
++				return nil, fmt.Errorf("task %q: more than one task type (%s and %s)", name, t.kind, k)
++			}
++			t.kind = k
++		}
++	}
++	if t.kind == "" {
++		return nil, fmt.Errorf("task %q: needs exactly one of call/set/switch/raise/emit", name)
++	}
++
++	if v, ok := body["if"]; ok {
++		t.ifCond, t.hasIf = v, true
++	}
++	if v, ok := body["then"]; ok {
++		s, ok := v.(string)
++		if !ok {
++			return nil, fmt.Errorf("task %q: then must be a string", name)
++		}
++		t.then = s
++	}
++	if v, ok := body["timeout"]; ok {
++		m, ok := v.(map[string]any)
++		if !ok {
++			return nil, fmt.Errorf("task %q: timeout must be a map with after", name)
++		}
++		d, err := timeoutAfter(m)
++		if err != nil {
++			return nil, fmt.Errorf("task %q: %w", name, err)
++		}
++		t.timeout, t.hasTimeout = d, true
++	}
++
++	switch t.kind {
++	case "call":
++		s, ok := body["call"].(string)
++		if !ok || s == "" {
++			return nil, fmt.Errorf("task %q: call must name a handler", name)
++		}
++		t.call = s
++		if v, ok := body["with"]; ok {
++			m, ok := v.(map[string]any)
++			if !ok {
++				return nil, fmt.Errorf("task %q: with must be a map", name)
++			}
++			t.with = m
++		}
++	case "set":
++		m, ok := body["set"].(map[string]any)
++		if !ok {
++			return nil, fmt.Errorf("task %q: set must be a map", name)
++		}
++		t.set = m
++	case "switch":
++		list, ok := body["switch"].([]any)
++		if !ok || len(list) == 0 {
++			return nil, fmt.Errorf("task %q: switch must be a non-empty list of cases", name)
++		}
++		for i, item := range list {
++			entry, ok := item.(map[string]any)
++			if !ok || len(entry) != 1 {
++				return nil, fmt.Errorf("task %q: switch[%d] must be a single-key map naming one case", name, i)
++			}
++			var c switchCase
++			for caseName, rawBody := range entry {
++				c.name = caseName
++				cb, ok := rawBody.(map[string]any)
++				if !ok {
++					return nil, fmt.Errorf("task %q: case %q must be a map", name, caseName)
++				}
++				if v, ok := cb["when"]; ok {
++					c.when, c.hasWhen = v, true
++				}
++				if v, ok := cb["then"]; ok {
++					s, ok := v.(string)
++					if !ok {
++						return nil, fmt.Errorf("task %q: case %q then must be a string", name, caseName)
++					}
++					c.then = s
++				}
++			}
++			t.cases = append(t.cases, c)
++		}
++	case "raise":
++		m, ok := body["raise"].(map[string]any)
++		if !ok {
++			return nil, fmt.Errorf("task %q: raise must be a map with error", name)
++		}
++		em, ok := m["error"].(map[string]any)
++		if !ok {
++			return nil, fmt.Errorf("task %q: raise.error is required", name)
++		}
++		info := &ErrorInfo{}
++		if v, ok := em["status"]; ok {
++			n, ok := toInt(v)
++			if !ok {
++				return nil, fmt.Errorf("task %q: raise.error.status must be an integer", name)
++			}
++			info.Status = n
++		}
++		typ, _ := em["type"].(string)
++		if typ == "" {
++			return nil, fmt.Errorf("task %q: raise.error.type is required", name)
++		}
++		info.Type = typ
++		info.Title, _ = em["title"].(string)
++		info.Detail, _ = em["detail"].(string)
++		t.raise = info
++	case "emit":
++		m, ok := body["emit"].(map[string]any)
++		if !ok {
++			return nil, fmt.Errorf("task %q: emit must be a map with event", name)
++		}
++		em, ok := m["event"].(map[string]any)
++		if !ok {
++			return nil, fmt.Errorf("task %q: emit.event is required", name)
++		}
++		spec := &eventSpec{}
++		spec.typ, _ = em["type"].(string)
++		spec.source, _ = em["source"].(string)
++		if v, ok := em["data"]; ok {
++			dm, ok := v.(map[string]any)
++			if !ok {
++				return nil, fmt.Errorf("task %q: emit.event.data must be a map", name)
++			}
++			spec.data = dm
++		}
++		t.event = spec
++	}
++	return t, nil
++}
++
++func timeoutAfter(m map[string]any) (time.Duration, error) {
++	s, ok := m["after"].(string)
++	if !ok {
++		return 0, errors.New("timeout.after must be an ISO-8601 duration string")
++	}
++	return parseISODuration(s)
++}
++
++var isoRe = regexp.MustCompile(`^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$`)
++
++func parseISODuration(s string) (time.Duration, error) {
++	m := isoRe.FindStringSubmatch(s)
++	if m == nil || (m[1] == "" && m[2] == "" && m[3] == "") {
++		return 0, fmt.Errorf("invalid ISO-8601 duration %q", s)
++	}
++	var d time.Duration
++	for i, unit := range []time.Duration{time.Hour, time.Minute, time.Second} {
++		if m[i+1] == "" {
++			continue
++		}
++		n, err := strconv.Atoi(m[i+1])
++		if err != nil {
++			return 0, fmt.Errorf("invalid ISO-8601 duration %q", s)
++		}
++		d += time.Duration(n) * unit
++	}
++	return d, nil
++}
++
++// ---------------------------------------------------------------- running
++
++// Run executes the workflow. Declared failures (raise) come back as a Result
++// with Status "failed"; engine-plane problems (unknown handler, handler
++// errors, loop budget, timeouts, bad expressions) come back as Go errors.
++func (w *Workflow) Run(opts Options) (*Result, error) {
++	maxVisits := opts.MaxVisits
++	if maxVisits <= 0 {
++		maxVisits = defaultMaxVisits
++	}
++	usesClock := w.hasBudget
++	for _, t := range w.tasks {
++		usesClock = usesClock || t.hasTimeout
++	}
++	if usesClock && opts.Clock == nil {
++		return nil, errors.New("workflow declares timeouts but Options.Clock is nil")
++	}
++
++	res := &Result{Status: "completed", Context: map[string]any{}}
++	visits := map[string]int{}
++	var start time.Time
++	if usesClock {
++		start = opts.Clock.Now()
++	}
++
++	i := 0
++	for i >= 0 && i < len(w.tasks) {
++		t := &w.tasks[i]
++		visits[t.name]++
++		if visits[t.name] > maxVisits {
++			return nil, &LoopError{Task: t.name, Visits: visits[t.name]}
++		}
++
++		if t.hasIf {
++			v, err := evalCondition(t.ifCond, res.Context)
++			if err != nil {
++				return nil, fmt.Errorf("task %q if: %w", t.name, err)
++			}
++			if !truthy(v) {
++				i++
++				continue
++			}
++		}
++
++		var limit time.Duration
++		hasLimit := false
++		var taskStart time.Time
++		if usesClock {
++			taskStart = opts.Clock.Now()
++			if w.hasBudget {
++				remaining := w.budget - taskStart.Sub(start)
++				if remaining <= 0 {
++					return nil, &TimeoutError{Task: t.name, Limit: 0}
++				}
++				limit, hasLimit = remaining, true
++			}
++			if t.hasTimeout && (!hasLimit || t.timeout < limit) {
++				limit, hasLimit = t.timeout, true
++			}
++		}
++
++		next := t.then
++		switch t.kind {
++		case "set":
++			v, err := evalValue(t.set, res.Context)
++			if err != nil {
++				return nil, fmt.Errorf("task %q set: %w", t.name, err)
++			}
++			res.Context[t.name] = v
++		case "call":
++			h, ok := opts.Handlers[t.call]
++			if !ok {
++				return nil, &TaskError{Task: t.name, Err: fmt.Errorf("no handler registered for %q", t.call)}
++			}
++			args := map[string]any{}
++			if t.with != nil {
++				v, err := evalValue(t.with, res.Context)
++				if err != nil {
++					return nil, fmt.Errorf("task %q with: %w", t.name, err)
++				}
++				args = v.(map[string]any)
++			}
++			out, err := h(args)
++			if err != nil {
++				return nil, &TaskError{Task: t.name, Err: err}
++			}
++			res.Context[t.name] = out
++		case "switch":
++			next = "continue"
++			for _, c := range t.cases {
++				if c.hasWhen {
++					v, err := evalCondition(c.when, res.Context)
++					if err != nil {
++						return nil, fmt.Errorf("task %q case %q when: %w", t.name, c.name, err)
++					}
++					if !truthy(v) {
++						continue
++					}
++				}
++				if c.then != "" {
++					next = c.then
++				}
++				break
++			}
++		case "raise":
++			info := *t.raise
++			res.Status = "failed"
++			res.Error = &info
++			return res, nil
++		case "emit":
++			ev := Event{Type: t.event.typ, Source: t.event.source}
++			if t.event.data != nil {
++				v, err := evalValue(t.event.data, res.Context)
++				if err != nil {
++					return nil, fmt.Errorf("task %q emit data: %w", t.name, err)
++				}
++				ev.Data = v.(map[string]any)
++			}
++			res.Events = append(res.Events, ev)
++		}
++
++		if hasLimit {
++			if elapsed := opts.Clock.Now().Sub(taskStart); elapsed > limit {
++				return nil, &TimeoutError{Task: t.name, Limit: limit}
++			}
++		}
++
++		switch next {
++		case "", "continue":
++			i++
++		case "end":
++			return res, nil
++		default:
++			i = w.index[next]
++		}
++	}
++	return res, nil
++}
++
++// ------------------------------------------------------------- expressions
++
++// isExpr reports whether a string value is an expression rather than a
++// literal: it must start with "${" and end with "}".
++func isExpr(s string) bool {
++	return strings.HasPrefix(s, "${") && strings.HasSuffix(s, "}")
++}
++
++// evalValue evaluates set/with/emit-data values: maps and lists recursively,
++// expression strings to their raw typed value, everything else verbatim.
++func evalValue(v any, ctx map[string]any) (any, error) {
++	switch val := v.(type) {
++	case string:
++		if isExpr(val) {
++			return evalExpr(val, ctx)
++		}
++		return val, nil
++	case map[string]any:
++		out := make(map[string]any, len(val))
++		for k, item := range val {
++			ev, err := evalValue(item, ctx)
++			if err != nil {
++				return nil, err
++			}
++			out[k] = ev
++		}
++		return out, nil
++	case []any:
++		out := make([]any, len(val))
++		for i, item := range val {
++			ev, err := evalValue(item, ctx)
++			if err != nil {
++				return nil, err
++			}
++			out[i] = ev
++		}
++		return out, nil
++	default:
++		return v, nil
++	}
++}
++
++// evalCondition evaluates if:/when: values — an expression string or a bare
++// literal, both judged by truthiness at the call site.
++func evalCondition(v any, ctx map[string]any) (any, error) {
++	if s, ok := v.(string); ok && isExpr(s) {
++		return evalExpr(s, ctx)
++	}
++	return v, nil
++}
++
++// two-char operators listed first so the alternation prefers them.
++var exprRe = regexp.MustCompile(
++	`^(\.[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*(?:(==|!=|>=|<=|>|<)\s*(.+))?$`)
++
++func evalExpr(s string, ctx map[string]any) (any, error) {
++	inner := strings.TrimSpace(s[2 : len(s)-1])
++	m := exprRe.FindStringSubmatch(inner)
++	if m == nil {
++		return nil, fmt.Errorf("malformed expression %q", s)
++	}
++	val := lookupPath(m[1], ctx)
++	if m[2] == "" {
++		return val, nil
++	}
++	lit, err := parseLiteral(strings.TrimSpace(m[3]))
++	if err != nil {
++		return nil, fmt.Errorf("malformed expression %q: %w", s, err)
++	}
++	return compare(m[2], val, lit)
++}
++
++func lookupPath(path string, ctx map[string]any) any {
++	var cur any = ctx
++	for _, part := range strings.Split(path[1:], ".") {
++		m, ok := cur.(map[string]any)
++		if !ok {
++			return nil
++		}
++		cur = m[part]
++	}
++	return cur
++}
++
++var (
++	intLitRe   = regexp.MustCompile(`^-?\d+$`)
++	floatLitRe = regexp.MustCompile(`^-?\d+\.\d+$`)
++	strLitRe   = regexp.MustCompile(`^"([^"]*)"$`)
++)
++
++func parseLiteral(s string) (any, error) {
++	switch {
++	case s == "true":
++		return true, nil
++	case s == "false":
++		return false, nil
++	case s == "null":
++		return nil, nil
++	case intLitRe.MatchString(s):
++		n, err := strconv.Atoi(s)
++		return n, err
++	case floatLitRe.MatchString(s):
++		return strconv.ParseFloat(s, 64)
++	}
++	if m := strLitRe.FindStringSubmatch(s); m != nil {
++		return m[1], nil
++	}
++	return nil, fmt.Errorf("bad literal %q", s)
++}
++
++func compare(op string, left, right any) (any, error) {
++	switch op {
++	case "==":
++		return looseEqual(left, right), nil
++	case "!=":
++		return !looseEqual(left, right), nil
++	}
++	lf, lok := toFloat(left)
++	rf, rok := toFloat(right)
++	if !lok || !rok {
++		return nil, fmt.Errorf("operator %s needs numeric operands", op)
++	}
++	switch op {
++	case ">":
++		return lf > rf, nil
++	case "<":
++		return lf < rf, nil
++	case ">=":
++		return lf >= rf, nil
++	case "<=":
++		return lf <= rf, nil
++	}
++	return nil, fmt.Errorf("unknown operator %s", op)
++}
++
++func looseEqual(a, b any) bool {
++	if a == nil || b == nil {
++		return a == nil && b == nil
++	}
++	if af, aok := toFloat(a); aok {
++		if bf, bok := toFloat(b); bok {
++			return af == bf
++		}
++		return false
++	}
++	// literals are always scalars, so mismatched dynamic types compare false
++	// without panicking.
++	return a == b
++}
++
++func toFloat(v any) (float64, bool) {
++	switch n := v.(type) {
++	case int:
++		return float64(n), true
++	case int8:
++		return float64(n), true
++	case int16:
++		return float64(n), true
++	case int32:
++		return float64(n), true
++	case int64:
++		return float64(n), true
++	case uint:
++		return float64(n), true
++	case uint8:
++		return float64(n), true
++	case uint16:
++		return float64(n), true
++	case uint32:
++		return float64(n), true
++	case uint64:
++		return float64(n), true
++	case float32:
++		return float64(n), true
++	case float64:
++		return n, true
++	}
++	return 0, false
++}
++
++func toInt(v any) (int, bool) {
++	switch n := v.(type) {
++	case int:
++		return n, true
++	case int64:
++		return int(n), true
++	case uint64:
++		return int(n), true
++	case float64:
++		if n == float64(int(n)) {
++			return int(n), true
++		}
++	}
++	return 0, false
++}
++
++func truthy(v any) bool {
++	switch val := v.(type) {
++	case nil:
++		return false
++	case bool:
++		return val
++	case string:
++		return val != ""
++	case map[string]any:
++		return len(val) > 0
++	case []any:
++		return len(val) > 0
++	default:
++		if f, ok := toFloat(v); ok {
++			return f != 0
++		}
++		return true
++	}
++}

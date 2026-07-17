@@ -1,0 +1,210 @@
+diff --git a/vaultsession/__init__.py b/vaultsession/__init__.py
+new file mode 100644
+index 0000000..cb7b9f1
+--- /dev/null
++++ b/vaultsession/__init__.py
+@@ -0,0 +1,8 @@
++"""AppRole-backed Vault session manager: login, threshold renewal, retry of
++standby/overload statuses, and revoke-on-shutdown — with no token material in
++logs, exceptions, or repr."""
++
++from .errors import VaultServerError
++from .session import AppRoleSession
++
++__all__ = ["AppRoleSession", "VaultServerError"]
+diff --git a/vaultsession/errors.py b/vaultsession/errors.py
+new file mode 100644
+index 0000000..cc5e1ff
+--- /dev/null
++++ b/vaultsession/errors.py
+@@ -0,0 +1,12 @@
++class VaultServerError(Exception):
++    """A non-2xx Vault response, carrying the decoded errors array.
++
++    The message intentionally names only the HTTP status and Vault's error
++    strings — never token material.
++    """
++
++    def __init__(self, status, errors):
++        self.status = int(status)
++        self.errors = list(errors)
++        detail = "; ".join(self.errors) or "(no error detail)"
++        super().__init__("vault: HTTP %d: %s" % (self.status, detail))
+diff --git a/vaultsession/session.py b/vaultsession/session.py
+new file mode 100644
+index 0000000..93f4ad7
+--- /dev/null
++++ b/vaultsession/session.py
+@@ -0,0 +1,114 @@
++import logging
++
++from .errors import VaultServerError
++from .transport import Transport
++
++log = logging.getLogger("vaultsession")
++
++
++class AppRoleSession:
++    """Owns one AppRole-authenticated Vault token: lazy login, renewal at a
++    deterministic remaining-ttl threshold, fresh login for non-renewable or
++    server-side-dead tokens, and revoke-self on shutdown."""
++
++    def __init__(self, base_url, role_id, secret_id, *, mount="approle",
++                 namespace=None, clock, sleep, renew_threshold=0.25,
++                 retry_delays=(0.5, 1.0, 2.0)):
++        self._role_id = role_id
++        self._secret_id = secret_id
++        self._mount = mount
++        self._namespace = namespace
++        self._clock = clock
++        self._renew_threshold = renew_threshold
++        self._transport = Transport(base_url, namespace=namespace,
++                                    sleep=sleep, retry_delays=retry_delays)
++        self._token = None
++        self._accessor = None
++        self._lease = 0
++        self._login_lease = 0
++        self._renewable = False
++        self._obtained_at = 0.0
++
++    def __repr__(self):
++        if self._token is None:
++            state = "unauthenticated"
++        else:
++            state = "authenticated accessor=%s" % self._accessor
++        return "<AppRoleSession mount=%r %s>" % (self._mount, state)
++
++    # ------------------------------------------------------------ lifecycle
++
++    def token(self):
++        """Return a live client token, logging in or refreshing as needed."""
++        if self._token is None:
++            self._login()
++        elif self._remaining() <= self._renew_threshold * self._lease:
++            self._refresh()
++        return self._token
++
++    def headers(self):
++        """Auth headers for a Vault request under this session."""
++        headers = {"X-Vault-Token": self.token()}
++        if self._namespace:
++            headers["X-Vault-Namespace"] = self._namespace
++        return headers
++
++    def revoke(self):
++        """Revoke-self once, if we ever obtained a token."""
++        if self._token is None:
++            return
++        token, self._token = self._token, None
++        self._transport.post("/v1/auth/token/revoke-self", None, token=token)
++        log.info("revoked session token (accessor=%s)", self._accessor)
++        self._accessor = None
++
++    close = revoke
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc, tb):
++        self.revoke()
++        return False
++
++    # ------------------------------------------------------------ internals
++
++    def _remaining(self):
++        return self._obtained_at + self._lease - self._clock()
++
++    def _apply(self, auth):
++        self._token = auth["client_token"]
++        self._accessor = auth.get("accessor", self._accessor)
++        self._lease = auth["lease_duration"]
++        self._renewable = bool(auth.get("renewable"))
++        self._obtained_at = self._clock()
++
++    def _login(self):
++        response = self._transport.post(
++            "/v1/auth/%s/login" % self._mount,
++            {"role_id": self._role_id, "secret_id": self._secret_id})
++        self._apply(response["auth"])
++        self._login_lease = self._lease
++        log.info("approle login on mount %s (accessor=%s, lease=%ss, renewable=%s)",
++                 self._mount, self._accessor, self._lease, self._renewable)
++
++    def _refresh(self):
++        if not self._renewable:
++            log.info("token is not renewable; performing a fresh login")
++            self._login()
++            return
++        try:
++            response = self._transport.post(
++                "/v1/auth/token/renew-self",
++                {"increment": "%ds" % self._login_lease},
++                token=self._token)
++        except VaultServerError as exc:
++            if exc.status == 403:
++                # The token already died server-side (revoked or expired).
++                log.warning("renew-self rejected (403); logging in again")
++                self._token = None
++                self._login()
++                return
++            raise
++        self._apply(response["auth"])
++        log.info("renewed token (accessor=%s, lease=%ss)", self._accessor, self._lease)
+diff --git a/vaultsession/transport.py b/vaultsession/transport.py
+new file mode 100644
+index 0000000..1267d77
+--- /dev/null
++++ b/vaultsession/transport.py
+@@ -0,0 +1,52 @@
++import json
++import urllib.error
++import urllib.request
++
++from .errors import VaultServerError
++
++# Documented transient statuses: 429 standby health, 472 DR secondary,
++# 473 performance standby, 503 sealed/maintenance/overloaded.
++RETRYABLE_STATUSES = frozenset({429, 472, 473, 503})
++
++
++class Transport:
++    """POSTs JSON to Vault, retrying standby/overload statuses on an
++    injected sleep schedule and raising VaultServerError otherwise."""
++
++    def __init__(self, base_url, *, namespace, sleep, retry_delays):
++        self._base = base_url.rstrip("/")
++        self._namespace = namespace
++        self._sleep = sleep
++        self._delays = tuple(retry_delays)
++
++    def post(self, path, body=None, token=None):
++        attempts = len(self._delays) + 1
++        for attempt in range(attempts):
++            status, payload = self._send(path, body, token)
++            if 200 <= status < 300:
++                return payload
++            if status in RETRYABLE_STATUSES and attempt < attempts - 1:
++                self._sleep(self._delays[attempt])
++                continue
++            errors = payload.get("errors", []) if isinstance(payload, dict) else []
++            raise VaultServerError(status, errors)
++
++    def _send(self, path, body, token):
++        data = json.dumps(body).encode() if body is not None else b""
++        request = urllib.request.Request(self._base + path, data=data, method="POST")
++        request.add_header("Content-Type", "application/json")
++        if token is not None:
++            request.add_header("X-Vault-Token", token)
++        if self._namespace:
++            request.add_header("X-Vault-Namespace", self._namespace)
++        try:
++            with urllib.request.urlopen(request) as response:
++                raw = response.read()
++                return response.status, (json.loads(raw) if raw else {})
++        except urllib.error.HTTPError as exc:
++            raw = exc.read()
++            try:
++                payload = json.loads(raw) if raw else {}
++            except ValueError:
++                payload = {}
++            return exc.code, payload

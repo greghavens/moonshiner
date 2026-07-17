@@ -1,0 +1,215 @@
+diff --git a/runner.go b/runner.go
+new file mode 100644
+index 0000000..1b8a903
+--- /dev/null
++++ b/runner.go
+@@ -0,0 +1,141 @@
++// Package migrunner runs ordered, reversible migrations and tracks what has
++// been applied in a state file, so partial failures resume instead of
++// re-running work that already succeeded.
++package migrunner
++
++import (
++	"fmt"
++	"sync"
++)
++
++// Migration is one step: an id, an Up to apply it, and an optional Down to
++// undo it. Down == nil marks the migration irreversible.
++type Migration struct {
++	ID   string
++	Up   func() error
++	Down func() error
++}
++
++// Runner applies migrations in order and persists progress to a state file.
++type Runner struct {
++	mu         sync.Mutex
++	statePath  string
++	migrations []Migration
++	byID       map[string]int
++	applied    []string // ids, in application order; always a prefix of migrations
++}
++
++// NewRunner validates the migration list, loads the applied history from
++// statePath, and checks the two agree: the history must be exactly a prefix
++// of the configured order.
++func NewRunner(statePath string, migrations []Migration) (*Runner, error) {
++	byID := make(map[string]int, len(migrations))
++	for i, m := range migrations {
++		if m.ID == "" {
++			return nil, fmt.Errorf("migrunner: migration at index %d has an empty id", i)
++		}
++		if m.Up == nil {
++			return nil, fmt.Errorf("migrunner: migration %q has a nil Up func", m.ID)
++		}
++		if _, dup := byID[m.ID]; dup {
++			return nil, fmt.Errorf("migrunner: duplicate migration id %q", m.ID)
++		}
++		byID[m.ID] = i
++	}
++
++	applied, err := loadState(statePath)
++	if err != nil {
++		return nil, err
++	}
++	for i, id := range applied {
++		if i >= len(migrations) {
++			return nil, fmt.Errorf("migrunner: state lists %q but only %d migrations are configured", id, len(migrations))
++		}
++		if migrations[i].ID != id {
++			return nil, fmt.Errorf("migrunner: state has %q applied at position %d but the configured migration there is %q — history must be a prefix of the configured order", id, i, migrations[i].ID)
++		}
++	}
++
++	return &Runner{
++		statePath:  statePath,
++		migrations: migrations,
++		byID:       byID,
++		applied:    applied,
++	}, nil
++}
++
++// Plan returns the pending migration ids in run order without executing
++// anything.
++func (r *Runner) Plan() []string {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	var out []string
++	for _, m := range r.migrations[len(r.applied):] {
++		out = append(out, m.ID)
++	}
++	return out
++}
++
++// Applied returns the applied migration ids in application order.
++func (r *Runner) Applied() []string {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return append([]string(nil), r.applied...)
++}
++
++// Up applies every pending migration in order, persisting each success
++// before starting the next. On failure it returns the ids that did apply and
++// an error naming the migration that failed.
++func (r *Runner) Up() ([]string, error) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	var ran []string
++	for _, m := range r.migrations[len(r.applied):] {
++		if err := m.Up(); err != nil {
++			return ran, fmt.Errorf("migrunner: migration %q failed: %w", m.ID, err)
++		}
++		next := append(append([]string(nil), r.applied...), m.ID)
++		if err := saveState(r.statePath, next); err != nil {
++			return ran, fmt.Errorf("migrunner: %q applied but state could not be recorded: %w", m.ID, err)
++		}
++		r.applied = next
++		ran = append(ran, m.ID)
++	}
++	return ran, nil
++}
++
++// Down rolls back the last n applied migrations in reverse order, persisting
++// each step. It refuses up front (rolling back nothing) if n is out of range
++// or if any migration in the span is irreversible.
++func (r *Runner) Down(n int) ([]string, error) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	if n < 1 {
++		return nil, fmt.Errorf("migrunner: Down(%d): count must be at least 1", n)
++	}
++	if n > len(r.applied) {
++		return nil, fmt.Errorf("migrunner: Down(%d): only %d migrations are applied", n, len(r.applied))
++	}
++	span := r.applied[len(r.applied)-n:]
++	for i := len(span) - 1; i >= 0; i-- {
++		if r.migrations[r.byID[span[i]]].Down == nil {
++			return nil, fmt.Errorf("migrunner: migration %q is irreversible (nil Down); refusing to roll back", span[i])
++		}
++	}
++
++	var rolled []string
++	for len(rolled) < n {
++		id := r.applied[len(r.applied)-1]
++		m := r.migrations[r.byID[id]]
++		if err := m.Down(); err != nil {
++			return rolled, fmt.Errorf("migrunner: rollback of %q failed: %w", id, err)
++		}
++		next := append([]string(nil), r.applied[:len(r.applied)-1]...)
++		if err := saveState(r.statePath, next); err != nil {
++			return rolled, fmt.Errorf("migrunner: %q rolled back but state could not be recorded: %w", id, err)
++		}
++		r.applied = next
++		rolled = append(rolled, id)
++	}
++	return rolled, nil
++}
+diff --git a/state.go b/state.go
+new file mode 100644
+index 0000000..ef71bc4
+--- /dev/null
++++ b/state.go
+@@ -0,0 +1,62 @@
++package migrunner
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++)
++
++// stateFile is the on-disk applied-history record. It is versioned so more
++// fields (checksums, timestamps) can be added without breaking old files.
++type stateFile struct {
++	Version int      `json:"version"`
++	Applied []string `json:"applied"`
++}
++
++// loadState reads the applied history from path. A missing file is a fresh
++// install and yields an empty history.
++func loadState(path string) ([]string, error) {
++	raw, err := os.ReadFile(path)
++	if errors.Is(err, os.ErrNotExist) {
++		return nil, nil
++	}
++	if err != nil {
++		return nil, fmt.Errorf("migrunner: read state %s: %w", path, err)
++	}
++	var sf stateFile
++	if err := json.Unmarshal(raw, &sf); err != nil {
++		return nil, fmt.Errorf("migrunner: parse state %s: %w", path, err)
++	}
++	return sf.Applied, nil
++}
++
++// saveState writes the applied history atomically: temp file, then rename,
++// so a crash mid-write can never leave a truncated state file.
++func saveState(path string, applied []string) error {
++	raw, err := json.MarshalIndent(stateFile{Version: 1, Applied: applied}, "", "  ")
++	if err != nil {
++		return fmt.Errorf("migrunner: encode state: %w", err)
++	}
++	dir := filepath.Dir(path)
++	tmp, err := os.CreateTemp(dir, ".migrunner-state-*")
++	if err != nil {
++		return fmt.Errorf("migrunner: create temp state: %w", err)
++	}
++	tmpPath := tmp.Name()
++	if _, err := tmp.Write(append(raw, '\n')); err != nil {
++		tmp.Close()
++		os.Remove(tmpPath)
++		return fmt.Errorf("migrunner: write state: %w", err)
++	}
++	if err := tmp.Close(); err != nil {
++		os.Remove(tmpPath)
++		return fmt.Errorf("migrunner: close state: %w", err)
++	}
++	if err := os.Rename(tmpPath, path); err != nil {
++		os.Remove(tmpPath)
++		return fmt.Errorf("migrunner: swap state: %w", err)
++	}
++	return nil
++}

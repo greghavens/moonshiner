@@ -1,0 +1,334 @@
+diff --git a/bq/client.ts b/bq/client.ts
+new file mode 100644
+index 0000000..94acc17
+--- /dev/null
++++ b/bq/client.ts
+@@ -0,0 +1,150 @@
++// BigQuery REST v2 query runner: jobs.query submission, jobs.getQueryResults
++// polling for incomplete jobs, and pageToken-driven row pagination.
++
++import { encodeParams } from "./params.ts";
++import type { ParamValue } from "./params.ts";
++import { decodeRows } from "./decode.ts";
++import type { SchemaField, WireRow } from "./decode.ts";
++import { BigQueryHttpError, BigQueryJobError } from "./errors.ts";
++import type { JobErrorProto } from "./errors.ts";
++
++export { BigQueryHttpError, BigQueryJobError };
++
++export interface BQConfig {
++  baseUrl: string;
++  projectId: string;
++  token: string;
++  location?: string;
++  pollTimeoutMs?: number;
++  maxPolls?: number;
++}
++
++export interface RunOptions {
++  pageSize?: number;
++}
++
++export interface QueryResult {
++  rows: Array<Record<string, unknown>>;
++  schema: SchemaField[];
++  totalRows: bigint;
++  pageCount: number;
++  jobId?: string;
++  cacheHit?: boolean;
++}
++
++interface WireResponse {
++  jobReference?: { projectId?: string; jobId?: string; location?: string };
++  jobComplete?: boolean;
++  schema?: { fields?: SchemaField[] };
++  rows?: WireRow[];
++  pageToken?: string;
++  totalRows?: string;
++  errors?: JobErrorProto[];
++  cacheHit?: boolean;
++}
++
++async function call(cfg: BQConfig, method: string, url: string, body?: unknown): Promise<WireResponse> {
++  const headers: Record<string, string> = { authorization: `Bearer ${cfg.token}` };
++  if (body !== undefined) {
++    headers["content-type"] = "application/json";
++  }
++  const response = await fetch(url, {
++    method,
++    headers,
++    body: body === undefined ? undefined : JSON.stringify(body),
++  });
++  const payload: any = await response.json().catch(() => ({}));
++  if (!response.ok) {
++    const detail = payload?.error ?? {};
++    throw new BigQueryHttpError(
++      response.status,
++      detail.message ?? "request failed",
++      detail.status,
++    );
++  }
++  return payload as WireResponse;
++}
++
++function raiseJobErrors(resp: WireResponse, jobId: string | undefined): void {
++  if (resp.errors && resp.errors.length > 0) {
++    throw new BigQueryJobError(jobId, resp.errors);
++  }
++}
++
++export async function runQuery(
++  cfg: BQConfig,
++  sql: string,
++  params?: Record<string, ParamValue>,
++  opts?: RunOptions,
++): Promise<QueryResult> {
++  const base = cfg.baseUrl.replace(/\/+$/, "");
++  const project = encodeURIComponent(cfg.projectId);
++
++  const body: Record<string, unknown> = { query: sql, useLegacySql: false };
++  if (cfg.location) {
++    body.location = cfg.location;
++  }
++  if (opts?.pageSize) {
++    body.maxResults = opts.pageSize;
++  }
++  if (cfg.pollTimeoutMs) {
++    body.timeoutMs = cfg.pollTimeoutMs;
++  }
++  if (params && Object.keys(params).length > 0) {
++    body.parameterMode = "NAMED";
++    body.queryParameters = encodeParams(params);
++  }
++
++  let resp = await call(cfg, "POST", `${base}/bigquery/v2/projects/${project}/queries`, body);
++  const jobId = resp.jobReference?.jobId;
++  const jobLocation = resp.jobReference?.location ?? cfg.location;
++  raiseJobErrors(resp, jobId);
++
++  const resultsUrl = (extra: Record<string, string>): string => {
++    const query = new URLSearchParams();
++    if (jobLocation) {
++      query.set("location", jobLocation);
++    }
++    if (opts?.pageSize) {
++      query.set("maxResults", String(opts.pageSize));
++    }
++    for (const [key, value] of Object.entries(extra)) {
++      query.set(key, value);
++    }
++    return `${base}/bigquery/v2/projects/${project}/queries/${encodeURIComponent(jobId ?? "")}?${query}`;
++  };
++
++  // While the job is incomplete the response has no schema and no rows;
++  // keep asking jobs.getQueryResults, bounded so a stuck job can't spin.
++  const maxPolls = cfg.maxPolls ?? 10;
++  let polls = 0;
++  while (!resp.jobComplete) {
++    polls++;
++    if (polls > maxPolls) {
++      throw new Error(`BigQuery job ${jobId ?? "(unknown)"} is still incomplete after ${maxPolls} polls`);
++    }
++    resp = await call(cfg, "GET", resultsUrl(cfg.pollTimeoutMs ? { timeoutMs: String(cfg.pollTimeoutMs) } : {}));
++    raiseJobErrors(resp, jobId);
++  }
++
++  const schema = resp.schema?.fields ?? [];
++  let rows = decodeRows(schema, resp.rows ?? []);
++  let pageCount = 1;
++  let token = resp.pageToken;
++  while (token) {
++    const page = await call(cfg, "GET", resultsUrl({ pageToken: token }));
++    raiseJobErrors(page, jobId);
++    rows = rows.concat(decodeRows(schema, page.rows ?? []));
++    pageCount++;
++    token = page.pageToken;
++  }
++
++  return {
++    rows,
++    schema,
++    totalRows: BigInt(resp.totalRows ?? "0"),
++    pageCount,
++    jobId,
++    cacheHit: resp.cacheHit,
++  };
++}
+diff --git a/bq/decode.ts b/bq/decode.ts
+new file mode 100644
+index 0000000..0a8b673
+--- /dev/null
++++ b/bq/decode.ts
+@@ -0,0 +1,54 @@
++// Schema-aware decoding of BigQuery's f/v row encoding. Cells arrive as
++// strings on the wire; the schema decides what they become. 64-bit integers
++// must survive exactly, so INTEGER cells decode to bigint, never Number().
++
++export interface SchemaField {
++  name: string;
++  type: string;
++  mode?: string;
++  fields?: SchemaField[];
++}
++
++type WireCell = { v: unknown };
++export interface WireRow {
++  f: WireCell[];
++}
++
++function decodeScalar(field: SchemaField, value: unknown): unknown {
++  const text = String(value);
++  switch (field.type) {
++    case "INTEGER":
++    case "INT64":
++      return BigInt(text);
++    case "FLOAT":
++    case "FLOAT64":
++      return Number(text);
++    case "BOOLEAN":
++    case "BOOL":
++      return text === "true";
++    default:
++      // STRING, TIMESTAMP, NUMERIC, … stay in their wire string form.
++      return value;
++  }
++}
++
++function decodeCell(field: SchemaField, value: unknown): unknown {
++  if (field.mode === "REPEATED") {
++    const elements = (value ?? []) as WireCell[];
++    return elements.map((element) => decodeScalar(field, element.v));
++  }
++  if (value === null || value === undefined) {
++    return null;
++  }
++  return decodeScalar(field, value);
++}
++
++export function decodeRows(schema: SchemaField[], rows: WireRow[]): Array<Record<string, unknown>> {
++  return rows.map((row) => {
++    const record: Record<string, unknown> = {};
++    schema.forEach((field, index) => {
++      record[field.name] = decodeCell(field, row.f[index]?.v);
++    });
++    return record;
++  });
++}
+diff --git a/bq/errors.ts b/bq/errors.ts
+new file mode 100644
+index 0000000..ba0b706
+--- /dev/null
++++ b/bq/errors.ts
+@@ -0,0 +1,36 @@
++// Error types for the bq runner. Job-level errors (the job ran and failed)
++// and HTTP-level errors (the API call itself was rejected) are distinct
++// failure modes and callers handle them differently.
++
++export interface JobErrorProto {
++  reason?: string;
++  location?: string;
++  message?: string;
++}
++
++export class BigQueryJobError extends Error {
++  readonly errors: JobErrorProto[];
++  readonly jobId?: string;
++
++  constructor(jobId: string | undefined, errors: JobErrorProto[]) {
++    const first = errors[0] ?? {};
++    super(
++      `BigQuery job ${jobId ?? "(unknown)"} failed: ${first.reason ?? "error"}: ${first.message ?? "no message"}`,
++    );
++    this.name = "BigQueryJobError";
++    this.jobId = jobId;
++    this.errors = errors;
++  }
++}
++
++export class BigQueryHttpError extends Error {
++  readonly status: number;
++  readonly apiStatus?: string;
++
++  constructor(status: number, message: string, apiStatus?: string) {
++    super(`BigQuery HTTP ${status}: ${message}`);
++    this.name = "BigQueryHttpError";
++    this.status = status;
++    this.apiStatus = apiStatus;
++  }
++}
+diff --git a/bq/params.ts b/bq/params.ts
+new file mode 100644
+index 0000000..c3d4419
+--- /dev/null
++++ b/bq/params.ts
+@@ -0,0 +1,70 @@
++// Named query parameter encoding for BigQuery REST v2 (jobs.query
++// queryParameters). Every value crosses the wire as a string; arrays carry
++// their element type in parameterType.arrayType.
++
++export type ScalarParam = string | number | bigint | boolean;
++export type ParamValue = ScalarParam | ScalarParam[];
++
++export interface QueryParameter {
++  name: string;
++  parameterType: { type: string; arrayType?: { type: string } };
++  parameterValue: { value?: string; arrayValues?: Array<{ value: string }> };
++}
++
++function scalarType(name: string, value: ScalarParam): string {
++  switch (typeof value) {
++    case "string":
++      return "STRING";
++    case "bigint":
++      return "INT64";
++    case "number":
++      // A JS number can't prove it is an integer that survives int64
++      // round-tripping, so numbers are always FLOAT64; use bigint for INT64.
++      return "FLOAT64";
++    case "boolean":
++      return "BOOL";
++    default:
++      throw new TypeError(`query parameter ${name}: unsupported value type ${typeof value}`);
++  }
++}
++
++function scalarValue(value: ScalarParam): string {
++  if (typeof value === "boolean") {
++    return value ? "true" : "false";
++  }
++  return String(value);
++}
++
++export function encodeParam(name: string, value: ParamValue): QueryParameter {
++  if (value === null || value === undefined) {
++    throw new TypeError(`query parameter ${name}: a query parameter value can't be NULL`);
++  }
++  if (Array.isArray(value)) {
++    if (value.length === 0) {
++      throw new TypeError(`query parameter ${name}: an empty array carries no element type for arrayType`);
++    }
++    const elementType = scalarType(name, value[0]);
++    for (const element of value) {
++      if (element === null || element === undefined || Array.isArray(element)) {
++        throw new TypeError(`query parameter ${name}: array elements must be non-null scalars`);
++      }
++      if (scalarType(name, element) !== elementType) {
++        throw new TypeError(`query parameter ${name}: mixed element types in array`);
++      }
++    }
++    return {
++      name,
++      parameterType: { type: "ARRAY", arrayType: { type: elementType } },
++      parameterValue: { arrayValues: value.map((element) => ({ value: scalarValue(element) })) },
++    };
++  }
++  return {
++    name,
++    parameterType: { type: scalarType(name, value) },
++    parameterValue: { value: scalarValue(value) },
++  };
++}
++
++export function encodeParams(params: Record<string, ParamValue>): QueryParameter[] {
++  return Object.entries(params).map(([name, value]) => encodeParam(name, value));
++}

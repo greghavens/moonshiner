@@ -1,0 +1,378 @@
+diff --git a/config.go b/config.go
+new file mode 100644
+index 0000000..810456b
+--- /dev/null
++++ b/config.go
+@@ -0,0 +1,81 @@
++package gcsup
++
++import (
++	"errors"
++	"fmt"
++	"net/http"
++	"strings"
++)
++
++const (
++	// chunkQuantum is the documented granularity for resumable upload chunks:
++	// every chunk except the last must be a multiple of 256 KiB.
++	chunkQuantum = 256 * 1024
++	// defaultChunkSize follows the documented recommendation of at least
++	// 8 MiB per chunk.
++	defaultChunkSize = 8 * 1024 * 1024
++
++	defaultBaseURL    = "https://storage.googleapis.com"
++	defaultRecoveries = 3
++)
++
++var (
++	// ErrSessionExpired reports a 410/404 from the session URI: the session is
++	// unusable and a brand-new resumable upload must be initiated.
++	ErrSessionExpired = errors.New("gcsup: resumable session expired; initiate a new upload")
++	// ErrChecksumMismatch reports a finished object whose crc32c does not
++	// match the bytes we uploaded.
++	ErrChecksumMismatch = errors.New("gcsup: object crc32c does not match uploaded data")
++	// ErrTooManyRecoveries reports that MaxRecoveries interruption/recovery
++	// cycles were exhausted without finishing the upload.
++	ErrTooManyRecoveries = errors.New("gcsup: recovery attempts exhausted")
++	// ErrForeignSession reports an initiation Location on a different host
++	// than BaseURL; sending data (and credentials) there is refused.
++	ErrForeignSession = errors.New("gcsup: session URI host differs from base URL")
++)
++
++// Config carries everything Upload needs; credentials and transport are
++// injected so tests never touch the real service.
++type Config struct {
++	BaseURL       string
++	Bucket        string
++	Token         string
++	HTTPClient    *http.Client
++	ChunkSize     int64
++	MaxRecoveries int
++}
++
++// Uploader performs resumable uploads against the Cloud Storage JSON API.
++type Uploader struct {
++	cfg Config
++}
++
++// NewUploader validates the configuration and applies documented defaults.
++func NewUploader(cfg Config) (*Uploader, error) {
++	if cfg.Bucket == "" {
++		return nil, errors.New("gcsup: bucket is required")
++	}
++	if cfg.Token == "" {
++		return nil, errors.New("gcsup: bearer token is required")
++	}
++	if cfg.BaseURL == "" {
++		cfg.BaseURL = defaultBaseURL
++	}
++	cfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/")
++	if cfg.HTTPClient == nil {
++		cfg.HTTPClient = http.DefaultClient
++	}
++	if cfg.ChunkSize == 0 {
++		cfg.ChunkSize = defaultChunkSize
++	}
++	if cfg.ChunkSize < chunkQuantum || cfg.ChunkSize%chunkQuantum != 0 {
++		return nil, fmt.Errorf("gcsup: chunk size %d must be a positive multiple of 256 KiB (%d bytes)", cfg.ChunkSize, chunkQuantum)
++	}
++	if cfg.MaxRecoveries == 0 {
++		cfg.MaxRecoveries = defaultRecoveries
++	}
++	return &Uploader{cfg: cfg}, nil
++}
++
++// ChunkSize reports the effective chunk size after defaulting.
++func (u *Uploader) ChunkSize() int64 { return u.cfg.ChunkSize }
+diff --git a/upload.go b/upload.go
+new file mode 100644
+index 0000000..c42d65f
+--- /dev/null
++++ b/upload.go
+@@ -0,0 +1,177 @@
++package gcsup
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strconv"
++)
++
++type wireResponse struct {
++	status int
++	header http.Header
++	body   []byte
++}
++
++func (u *Uploader) send(ctx context.Context, method, target string, headers map[string]string, body []byte) (*wireResponse, error) {
++	req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
++	if err != nil {
++		return nil, fmt.Errorf("gcsup: building request: %w", err)
++	}
++	req.Header.Set("Authorization", "Bearer "+u.cfg.Token)
++	for k, v := range headers {
++		req.Header.Set(k, v)
++	}
++	resp, err := u.cfg.HTTPClient.Do(req)
++	if err != nil {
++		return nil, err
++	}
++	defer resp.Body.Close()
++	payload, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return nil, fmt.Errorf("gcsup: reading response body: %w", err)
++	}
++	return &wireResponse{status: resp.StatusCode, header: resp.Header, body: payload}, nil
++}
++
++func apiError(resp *wireResponse) error {
++	snippet := string(resp.body)
++	if len(snippet) > 200 {
++		snippet = snippet[:200]
++	}
++	return fmt.Errorf("gcsup: unexpected HTTP %d: %s", resp.status, snippet)
++}
++
++// initiate opens the resumable session and returns the session URI, refusing
++// a Location that would send our bytes and bearer token to another host.
++func (u *Uploader) initiate(ctx context.Context, object, contentType string, total int64) (string, error) {
++	meta, err := json.Marshal(map[string]string{"name": object, "contentType": contentType})
++	if err != nil {
++		return "", fmt.Errorf("gcsup: encoding object metadata: %w", err)
++	}
++	initURL := fmt.Sprintf("%s/upload/storage/v1/b/%s/o?uploadType=resumable&name=%s",
++		u.cfg.BaseURL, url.PathEscape(u.cfg.Bucket), url.QueryEscape(object))
++	resp, err := u.send(ctx, http.MethodPost, initURL, map[string]string{
++		"Content-Type":            "application/json; charset=UTF-8",
++		"X-Upload-Content-Type":   contentType,
++		"X-Upload-Content-Length": strconv.FormatInt(total, 10),
++	}, meta)
++	if err != nil {
++		return "", fmt.Errorf("gcsup: initiating resumable session: %w", err)
++	}
++	if resp.status != http.StatusOK {
++		return "", apiError(resp)
++	}
++	session := resp.header.Get("Location")
++	if session == "" {
++		return "", errors.New("gcsup: initiation response carried no Location session URI")
++	}
++	base, err := url.Parse(u.cfg.BaseURL)
++	if err != nil {
++		return "", fmt.Errorf("gcsup: parsing base URL: %w", err)
++	}
++	sess, err := url.Parse(session)
++	if err != nil {
++		return "", fmt.Errorf("gcsup: parsing session URI: %w", err)
++	}
++	if sess.Host != base.Host {
++		return "", fmt.Errorf("%w: session host %q, base host %q", ErrForeignSession, sess.Host, base.Host)
++	}
++	return session, nil
++}
++
++// checkStatus runs the documented empty-body status probe. It returns the
++// finished object when the server reports completion, otherwise the next
++// offset to send.
++func (u *Uploader) checkStatus(ctx context.Context, session string, total int64, data []byte) (*Object, int64, error) {
++	resp, err := u.send(ctx, http.MethodPut, session, map[string]string{
++		"Content-Range": fmt.Sprintf("bytes */%d", total),
++	}, nil)
++	if err != nil {
++		return nil, 0, fmt.Errorf("gcsup: status check failed: %w", err)
++	}
++	switch {
++	case resp.status == http.StatusOK || resp.status == http.StatusCreated:
++		obj, perr := parseObject(resp.body, data)
++		return obj, total, perr
++	case resp.status == 308:
++		next, perr := parseCommitted(resp.header.Get("Range"))
++		return nil, next, perr
++	case resp.status == http.StatusNotFound || resp.status == http.StatusGone:
++		return nil, 0, fmt.Errorf("%w (HTTP %d on status check)", ErrSessionExpired, resp.status)
++	default:
++		return nil, 0, apiError(resp)
++	}
++}
++
++// Upload runs the whole resumable flow: initiate, send chunks, recover from
++// interruptions via the committed range, and validate the finished object.
++func (u *Uploader) Upload(ctx context.Context, object, contentType string, data []byte) (*Object, error) {
++	total := int64(len(data))
++	if total == 0 {
++		return nil, errors.New("gcsup: refusing to upload an empty object")
++	}
++	session, err := u.initiate(ctx, object, contentType, total)
++	if err != nil {
++		return nil, err
++	}
++
++	var committed int64
++	recoveries := 0
++	for {
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
++		first := committed
++		last := min(first+u.cfg.ChunkSize, total)
++		resp, sendErr := u.send(ctx, http.MethodPut, session, map[string]string{
++			"Content-Range": fmt.Sprintf("bytes %d-%d/%d", first, last-1, total),
++		}, data[first:last])
++
++		interrupted := false
++		switch {
++		case sendErr != nil:
++			interrupted = true
++		case resp.status == http.StatusOK || resp.status == http.StatusCreated:
++			return parseObject(resp.body, data)
++		case resp.status == 308:
++			next, perr := parseCommitted(resp.header.Get("Range"))
++			if perr != nil {
++				return nil, perr
++			}
++			if next > committed {
++				committed = next
++				continue
++			}
++			// A 308 that reports no forward progress is treated like an
++			// interruption so the status probe can sort out reality.
++			interrupted = true
++		case resp.status == http.StatusNotFound || resp.status == http.StatusGone:
++			return nil, fmt.Errorf("%w (HTTP %d)", ErrSessionExpired, resp.status)
++		case resp.status >= 500:
++			interrupted = true
++		default:
++			return nil, apiError(resp)
++		}
++
++		if interrupted {
++			recoveries++
++			if recoveries > u.cfg.MaxRecoveries {
++				return nil, fmt.Errorf("%w after %d recovery cycles", ErrTooManyRecoveries, u.cfg.MaxRecoveries)
++			}
++			obj, next, serr := u.checkStatus(ctx, session, total, data)
++			if serr != nil {
++				return nil, serr
++			}
++			if obj != nil {
++				return obj, nil
++			}
++			committed = next
++		}
++	}
++}
+diff --git a/wire.go b/wire.go
+new file mode 100644
+index 0000000..8d3793a
+--- /dev/null
++++ b/wire.go
+@@ -0,0 +1,102 @@
++package gcsup
++
++import (
++	"encoding/base64"
++	"encoding/binary"
++	"encoding/json"
++	"fmt"
++	"hash/crc32"
++	"strconv"
++	"strings"
++)
++
++// Object is the finished upload, with the JSON API's string-typed numeric
++// fields parsed into real integers.
++type Object struct {
++	Name        string
++	Bucket      string
++	Generation  int64
++	Size        int64
++	ContentType string
++	CRC32C      string
++	MD5Hash     string
++}
++
++// objectResource mirrors the JSON API object representation. generation and
++// size are numeric on paper but documented as "a string formatted as the
++// specified value type" on the wire.
++type objectResource struct {
++	Kind        string `json:"kind"`
++	Name        string `json:"name"`
++	Bucket      string `json:"bucket"`
++	Generation  string `json:"generation"`
++	Size        string `json:"size"`
++	ContentType string `json:"contentType"`
++	CRC32C      string `json:"crc32c"`
++	MD5Hash     string `json:"md5Hash"`
++}
++
++// crc32cOf computes the documented crc32c encoding: the Castagnoli checksum,
++// base64 of its big-endian byte order.
++func crc32cOf(data []byte) string {
++	sum := crc32.Checksum(data, crc32.MakeTable(crc32.Castagnoli))
++	var raw [4]byte
++	binary.BigEndian.PutUint32(raw[:], sum)
++	return base64.StdEncoding.EncodeToString(raw[:])
++}
++
++// parseObject decodes and validates the finished object resource against the
++// bytes we uploaded.
++func parseObject(body, data []byte) (*Object, error) {
++	var res objectResource
++	if err := json.Unmarshal(body, &res); err != nil {
++		return nil, fmt.Errorf("gcsup: decoding object resource: %w", err)
++	}
++	if res.Generation == "" {
++		return nil, fmt.Errorf("gcsup: object resource is missing its generation")
++	}
++	gen, err := strconv.ParseInt(res.Generation, 10, 64)
++	if err != nil || gen <= 0 {
++		return nil, fmt.Errorf("gcsup: object generation %q is not a positive integer string", res.Generation)
++	}
++	size, err := strconv.ParseInt(res.Size, 10, 64)
++	if err != nil {
++		return nil, fmt.Errorf("gcsup: object size %q is not an integer string", res.Size)
++	}
++	if size != int64(len(data)) {
++		return nil, fmt.Errorf("gcsup: reported size %d does not match the %d uploaded bytes", size, len(data))
++	}
++	if res.CRC32C != "" && res.CRC32C != crc32cOf(data) {
++		return nil, fmt.Errorf("%w: server reported %s, local data hashes to %s", ErrChecksumMismatch, res.CRC32C, crc32cOf(data))
++	}
++	return &Object{
++		Name:        res.Name,
++		Bucket:      res.Bucket,
++		Generation:  gen,
++		Size:        size,
++		ContentType: res.ContentType,
++		CRC32C:      res.CRC32C,
++		MD5Hash:     res.MD5Hash,
++	}, nil
++}
++
++// parseCommitted turns a 308 Range header ("bytes=0-N") into the next offset
++// to send (N+1). An absent header means nothing is persisted yet.
++func parseCommitted(rangeHeader string) (int64, error) {
++	if rangeHeader == "" {
++		return 0, nil
++	}
++	rest, ok := strings.CutPrefix(rangeHeader, "bytes=")
++	if !ok {
++		return 0, fmt.Errorf("gcsup: unexpected Range header %q", rangeHeader)
++	}
++	_, last, ok := strings.Cut(rest, "-")
++	if !ok {
++		return 0, fmt.Errorf("gcsup: unexpected Range header %q", rangeHeader)
++	}
++	n, err := strconv.ParseInt(last, 10, 64)
++	if err != nil || n < 0 {
++		return 0, fmt.Errorf("gcsup: unexpected Range header %q", rangeHeader)
++	}
++	return n + 1, nil
++}

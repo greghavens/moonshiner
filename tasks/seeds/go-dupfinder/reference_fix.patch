@@ -1,0 +1,297 @@
+diff --git a/dupfinder.go b/dupfinder.go
+new file mode 100644
+index 0000000..263e30d
+--- /dev/null
++++ b/dupfinder.go
+@@ -0,0 +1,68 @@
++// Package dupfinder locates duplicate files under a directory tree with a
++// size-then-hash strategy: only files whose size collides with another
++// distinct file's are ever opened, and hashing runs on a bounded worker
++// pool.
++package dupfinder
++
++import (
++	"fmt"
++	"os"
++)
++
++// Stage identifies a Progress callback event.
++type Stage string
++
++const (
++	StageHashStart Stage = "hash-start"
++	StageHashEnd   Stage = "hash-end"
++)
++
++// Options configures a scan.
++type Options struct {
++	// Workers caps how many files are hashed concurrently. Mandatory, >= 1.
++	Workers int
++	// MinSize skips regular files smaller than this many bytes. Zero-byte
++	// files are always skipped.
++	MinSize int64
++	// Progress, when non-nil, is invoked from worker goroutines as each
++	// hash candidate starts and finishes.
++	Progress func(stage Stage, path string)
++}
++
++// Group is one set of identical files: at least two distinct files with the
++// same size and content hash.
++type Group struct {
++	Size  int64
++	Hash  string   // sha256, lowercase hex
++	Paths []string // relative to root, slash-separated, sorted
++}
++
++// Report is the outcome of a scan.
++type Report struct {
++	Groups      []Group // size descending, ties by first path
++	WastedBytes int64   // sum of Size*(len(Paths)-1) over groups
++}
++
++// Find walks root and reports groups of duplicate regular files.
++func Find(root string, opts Options) (*Report, error) {
++	if opts.Workers < 1 {
++		return nil, fmt.Errorf("dupfinder: Workers must be >= 1, got %d", opts.Workers)
++	}
++	info, err := os.Stat(root)
++	if err != nil {
++		return nil, fmt.Errorf("dupfinder: root: %w", err)
++	}
++	if !info.IsDir() {
++		return nil, fmt.Errorf("dupfinder: root %q is not a directory", root)
++	}
++
++	files, err := scanTree(root, opts.MinSize)
++	if err != nil {
++		return nil, err
++	}
++	hashed, err := hashAll(hashCandidates(files), opts)
++	if err != nil {
++		return nil, err
++	}
++	return assemble(hashed), nil
++}
+diff --git a/hash.go b/hash.go
+new file mode 100644
+index 0000000..723f4d1
+--- /dev/null
++++ b/hash.go
+@@ -0,0 +1,73 @@
++package dupfinder
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"fmt"
++	"io"
++	"os"
++	"sync"
++)
++
++type hashedFile struct {
++	fileRef
++	hash string
++}
++
++// hashAll digests every candidate with at most opts.Workers files in
++// flight. Workers pull from one shared queue, so any pending file can
++// occupy any idle worker — no per-size-class serialization.
++func hashAll(cands []fileRef, opts Options) ([]hashedFile, error) {
++	if len(cands) == 0 {
++		return nil, nil
++	}
++	workers := opts.Workers
++	if workers > len(cands) {
++		workers = len(cands)
++	}
++
++	jobs := make(chan int)
++	out := make([]hashedFile, len(cands))
++	errs := make([]error, len(cands))
++	var wg sync.WaitGroup
++	for w := 0; w < workers; w++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			for i := range jobs {
++				out[i].fileRef = cands[i]
++				out[i].hash, errs[i] = digest(cands[i].abs, opts)
++			}
++		}()
++	}
++	for i := range cands {
++		jobs <- i
++	}
++	close(jobs)
++	wg.Wait()
++
++	for _, err := range errs {
++		if err != nil {
++			return nil, err
++		}
++	}
++	return out, nil
++}
++
++// digest hashes one file, bracketing the read with Progress events.
++func digest(path string, opts Options) (string, error) {
++	if opts.Progress != nil {
++		opts.Progress(StageHashStart, path)
++		defer opts.Progress(StageHashEnd, path)
++	}
++	f, err := os.Open(path)
++	if err != nil {
++		return "", fmt.Errorf("dupfinder: hash %s: %w", path, err)
++	}
++	defer f.Close()
++	h := sha256.New()
++	if _, err := io.Copy(h, f); err != nil {
++		return "", fmt.Errorf("dupfinder: hash %s: %w", path, err)
++	}
++	return hex.EncodeToString(h.Sum(nil)), nil
++}
+diff --git a/report.go b/report.go
+new file mode 100644
+index 0000000..7189413
+--- /dev/null
++++ b/report.go
+@@ -0,0 +1,35 @@
++package dupfinder
++
++import "sort"
++
++// assemble buckets hashed files by (size, hash), drops singletons, and
++// produces the deterministic report ordering.
++func assemble(files []hashedFile) *Report {
++	type content struct {
++		size int64
++		hash string
++	}
++	buckets := map[content][]string{}
++	for _, f := range files {
++		k := content{f.size, f.hash}
++		buckets[k] = append(buckets[k], f.rel)
++	}
++
++	rep := &Report{}
++	for k, paths := range buckets {
++		if len(paths) < 2 {
++			continue
++		}
++		sort.Strings(paths)
++		rep.Groups = append(rep.Groups, Group{Size: k.size, Hash: k.hash, Paths: paths})
++		rep.WastedBytes += k.size * int64(len(paths)-1)
++	}
++	sort.Slice(rep.Groups, func(i, j int) bool {
++		a, b := rep.Groups[i], rep.Groups[j]
++		if a.Size != b.Size {
++			return a.Size > b.Size
++		}
++		return a.Paths[0] < b.Paths[0]
++	})
++	return rep
++}
+diff --git a/scan.go b/scan.go
+new file mode 100644
+index 0000000..42a7401
+--- /dev/null
++++ b/scan.go
+@@ -0,0 +1,97 @@
++package dupfinder
++
++import (
++	"fmt"
++	"io/fs"
++	"path/filepath"
++	"syscall"
++)
++
++// fileRef is one distinct regular file; hardlink aliases have already been
++// collapsed onto the lexicographically smallest relative path.
++type fileRef struct {
++	rel  string // slash-separated, relative to root — the report path
++	abs  string // the path used for reading
++	size int64
++}
++
++type devino struct {
++	dev uint64
++	ino uint64
++}
++
++// scanTree walks root without following symlinks and returns one fileRef
++// per distinct regular file at or above the size threshold.
++func scanTree(root string, minSize int64) ([]fileRef, error) {
++	if minSize < 1 {
++		minSize = 1 // zero-byte files are never duplicate candidates
++	}
++	byInode := map[devino]*fileRef{}
++	var synth uint64 // fallback key space if inode info is unavailable
++	walk := func(path string, d fs.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++		// Symlinks (to anything), directories, FIFOs, sockets and devices
++		// all fail IsRegular; WalkDir already refuses to descend through
++		// symlinked directories.
++		if !d.Type().IsRegular() {
++			return nil
++		}
++		info, err := d.Info()
++		if err != nil {
++			return err
++		}
++		if info.Size() < minSize {
++			return nil
++		}
++		rel, err := filepath.Rel(root, path)
++		if err != nil {
++			return err
++		}
++		rel = filepath.ToSlash(rel)
++
++		var key devino
++		if st, ok := info.Sys().(*syscall.Stat_t); ok {
++			key = devino{dev: uint64(st.Dev), ino: uint64(st.Ino)}
++		} else {
++			synth++
++			key = devino{dev: ^uint64(0), ino: synth}
++		}
++		if prev, seen := byInode[key]; seen {
++			// Another name for a file we already have: keep the smallest
++			// path as the alias set's representative.
++			if rel < prev.rel {
++				prev.rel, prev.abs = rel, path
++			}
++			return nil
++		}
++		byInode[key] = &fileRef{rel: rel, abs: path, size: info.Size()}
++		return nil
++	}
++	if err := filepath.WalkDir(root, walk); err != nil {
++		return nil, fmt.Errorf("dupfinder: scan: %w", err)
++	}
++
++	out := make([]fileRef, 0, len(byInode))
++	for _, f := range byInode {
++		out = append(out, *f)
++	}
++	return out, nil
++}
++
++// hashCandidates keeps only files whose size collides with another distinct
++// file's — anything else cannot have a duplicate and must never be opened.
++func hashCandidates(files []fileRef) []fileRef {
++	bySize := map[int64]int{}
++	for _, f := range files {
++		bySize[f.size]++
++	}
++	var out []fileRef
++	for _, f := range files {
++		if bySize[f.size] >= 2 {
++			out = append(out, f)
++		}
++	}
++	return out
++}

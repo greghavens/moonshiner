@@ -1,0 +1,272 @@
+diff --git a/graph.go b/graph.go
+new file mode 100644
+index 0000000..cd6dee5
+--- /dev/null
++++ b/graph.go
+@@ -0,0 +1,65 @@
++package taskrunner
++
++// findCycle returns the names on some dependency cycle, or nil.
++// Iterative three-color DFS over the dep edges.
++func findCycle(deps map[string][]string, tasks map[string]Task) []string {
++	const (
++		white = 0
++		gray  = 1
++		black = 2
++	)
++	color := make(map[string]int, len(tasks))
++	var stack []string
++
++	var visit func(string) []string
++	visit = func(n string) []string {
++		color[n] = gray
++		stack = append(stack, n)
++		for _, d := range deps[n] {
++			switch color[d] {
++			case gray:
++				// slice the current stack from d to n
++				for i, s := range stack {
++					if s == d {
++						return append(append([]string(nil), stack[i:]...), d)
++					}
++				}
++				return []string{d, n, d}
++			case white:
++				if cyc := visit(d); cyc != nil {
++					return cyc
++				}
++			}
++		}
++		stack = stack[:len(stack)-1]
++		color[n] = black
++		return nil
++	}
++
++	for name := range tasks {
++		if color[name] == white {
++			if cyc := visit(name); cyc != nil {
++				return cyc
++			}
++		}
++	}
++	return nil
++}
++
++// closure returns every task reachable from target via dep edges,
++// including target itself.
++func (r *Runner) closure(target string) map[string]bool {
++	seen := map[string]bool{target: true}
++	queue := []string{target}
++	for len(queue) > 0 {
++		n := queue[0]
++		queue = queue[1:]
++		for _, d := range r.deps[n] {
++			if !seen[d] {
++				seen[d] = true
++				queue = append(queue, d)
++			}
++		}
++	}
++	return seen
++}
+diff --git a/report.go b/report.go
+new file mode 100644
+index 0000000..5e774c7
+--- /dev/null
++++ b/report.go
+@@ -0,0 +1,7 @@
++package taskrunner
++
++// Report describes the outcome of a Run: one terminal status per task in the
++// target's dependency closure.
++type Report struct {
++	Statuses map[string]Status
++}
+diff --git a/run.go b/run.go
+new file mode 100644
+index 0000000..7dc7d0a
+--- /dev/null
++++ b/run.go
+@@ -0,0 +1,110 @@
++package taskrunner
++
++import (
++	"context"
++	"fmt"
++)
++
++// internal per-run task state
++const (
++	statePending = iota
++	stateRunning
++	stateDone // terminal: recorded in statuses
++)
++
++// Run executes target and its transitive dependencies. Independent ready
++// tasks run concurrently. See package docs for failure/cancel semantics.
++func (r *Runner) Run(ctx context.Context, target string) (*Report, error) {
++	if _, ok := r.tasks[target]; !ok {
++		return nil, fmt.Errorf("taskrunner: unknown target %q", target)
++	}
++	inClosure := r.closure(target)
++
++	state := make(map[string]int, len(inClosure))
++	statuses := make(map[string]Status, len(inClosure))
++	waiting := make(map[string]int, len(inClosure)) // unfinished deps per task
++	for name := range inClosure {
++		state[name] = statePending
++		waiting[name] = len(r.deps[name])
++	}
++
++	type doneMsg struct {
++		name string
++		err  error
++	}
++	done := make(chan doneMsg)
++	running := 0
++	var firstErr error
++
++	launch := func(name string) {
++		state[name] = stateRunning
++		running++
++		action := r.tasks[name].Action
++		go func() {
++			done <- doneMsg{name, action(ctx)}
++		}()
++	}
++
++	// skip marks name and all its (pending) transitive dependents skipped.
++	var skip func(string)
++	skip = func(name string) {
++		if state[name] != statePending {
++			return
++		}
++		state[name] = stateDone
++		statuses[name] = StatusSkipped
++		for _, up := range r.rdeps[name] {
++			if inClosure[up] {
++				skip(up)
++			}
++		}
++	}
++
++	launchReady := func() {
++		if ctx.Err() != nil {
++			return // stop scheduling new work once canceled
++		}
++		for name := range inClosure {
++			if state[name] == statePending && waiting[name] == 0 {
++				launch(name)
++			}
++		}
++	}
++
++	launchReady()
++	for running > 0 {
++		msg := <-done
++		running--
++		state[msg.name] = stateDone
++		if msg.err != nil {
++			statuses[msg.name] = StatusFailed
++			if firstErr == nil {
++				firstErr = fmt.Errorf("taskrunner: task %q failed: %w", msg.name, msg.err)
++			}
++			for _, up := range r.rdeps[msg.name] {
++				if inClosure[up] {
++					skip(up)
++				}
++			}
++		} else {
++			statuses[msg.name] = StatusOK
++			for _, up := range r.rdeps[msg.name] {
++				if inClosure[up] {
++					waiting[up]--
++				}
++			}
++		}
++		launchReady()
++	}
++
++	// Anything still pending was starved by cancellation.
++	for name := range inClosure {
++		if state[name] == statePending {
++			statuses[name] = StatusSkipped
++		}
++	}
++	if firstErr == nil && ctx.Err() != nil {
++		firstErr = fmt.Errorf("taskrunner: run canceled: %w", ctx.Err())
++	}
++	return &Report{Statuses: statuses}, firstErr
++}
+diff --git a/taskrunner.go b/taskrunner.go
+new file mode 100644
+index 0000000..d679f76
+--- /dev/null
++++ b/taskrunner.go
+@@ -0,0 +1,66 @@
++// Package taskrunner runs named tasks in dependency order, executing
++// independent tasks concurrently — a tiny library-shaped `make`.
++package taskrunner
++
++import (
++	"context"
++	"fmt"
++)
++
++// Task is one unit of work in the graph.
++type Task struct {
++	Name   string
++	Deps   []string
++	Action func(context.Context) error
++}
++
++// Status is the terminal state of a task after a Run.
++type Status string
++
++const (
++	StatusOK      Status = "ok"
++	StatusFailed  Status = "failed"
++	StatusSkipped Status = "skipped"
++)
++
++// Runner holds a validated task graph. It is immutable after NewRunner and
++// safe to reuse across Runs.
++type Runner struct {
++	tasks  map[string]Task
++	deps   map[string][]string // task -> its deps
++	rdeps  map[string][]string // task -> tasks that depend on it
++}
++
++// NewRunner validates the task list and builds the dependency graph.
++func NewRunner(tasks []Task) (*Runner, error) {
++	r := &Runner{
++		tasks: make(map[string]Task, len(tasks)),
++		deps:  make(map[string][]string, len(tasks)),
++		rdeps: make(map[string][]string, len(tasks)),
++	}
++	for _, t := range tasks {
++		if t.Name == "" {
++			return nil, fmt.Errorf("taskrunner: task with empty name")
++		}
++		if t.Action == nil {
++			return nil, fmt.Errorf("taskrunner: task %q has a nil action", t.Name)
++		}
++		if _, dup := r.tasks[t.Name]; dup {
++			return nil, fmt.Errorf("taskrunner: duplicate task name %q", t.Name)
++		}
++		r.tasks[t.Name] = t
++	}
++	for _, t := range tasks {
++		for _, d := range t.Deps {
++			if _, ok := r.tasks[d]; !ok {
++				return nil, fmt.Errorf("taskrunner: task %q depends on unknown task %q", t.Name, d)
++			}
++			r.deps[t.Name] = append(r.deps[t.Name], d)
++			r.rdeps[d] = append(r.rdeps[d], t.Name)
++		}
++	}
++	if cyc := findCycle(r.deps, r.tasks); cyc != nil {
++		return nil, fmt.Errorf("taskrunner: dependency cycle: %v", cyc)
++	}
++	return r, nil
++}

@@ -1,0 +1,231 @@
+diff --git a/pagewalk.go b/pagewalk.go
+new file mode 100644
+index 0000000..7c2711e
+--- /dev/null
++++ b/pagewalk.go
+@@ -0,0 +1,225 @@
++// Package pagewalk walks paginated JSON list endpoints behind a single
++// bufio.Scanner-style iterator. It follows RFC-5988 Link rel="next"
++// headers when present and falls back to a next_cursor token in the
++// response body, stops on the first empty page, and drops repeated
++// string ids so rows straddling a page boundary are yielded once.
++package pagewalk
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
++)
++
++// Walker fetches pages with the supplied HTTP client.
++type Walker struct {
++	client *http.Client
++}
++
++// New returns a Walker that fetches pages with client.
++// A nil client falls back to http.DefaultClient.
++func New(client *http.Client) *Walker {
++	if client == nil {
++		client = http.DefaultClient
++	}
++	return &Walker{client: client}
++}
++
++// Iterator yields the items of one walk. Use it like a bufio.Scanner:
++//
++//	it := walker.Walk(ctx, url)
++//	for it.Next() {
++//	    item := it.Item()
++//	    ...
++//	}
++//	if err := it.Err(); err != nil { ... }
++type Iterator struct {
++	walker  *Walker
++	ctx     context.Context
++	nextURL string
++	done    bool
++	queue   []map[string]any
++	current map[string]any
++	seen    map[string]bool
++	err     error
++}
++
++// Walk starts a new walk at startURL. No request is made until the first
++// call to Next.
++func (w *Walker) Walk(ctx context.Context, startURL string) *Iterator {
++	return &Iterator{
++		walker:  w,
++		ctx:     ctx,
++		nextURL: startURL,
++		seen:    make(map[string]bool),
++	}
++}
++
++// Next advances the iterator, fetching further pages as needed. It returns
++// false when the walk is complete or has failed; check Err to tell which.
++func (it *Iterator) Next() bool {
++	for {
++		if it.err != nil {
++			return false
++		}
++		if len(it.queue) > 0 {
++			it.current = it.queue[0]
++			it.queue = it.queue[1:]
++			return true
++		}
++		if it.done {
++			return false
++		}
++		it.fetchPage()
++	}
++}
++
++// Item returns the item produced by the last successful call to Next.
++func (it *Iterator) Item() map[string]any { return it.current }
++
++// Err reports the first failure the walk hit, or nil for a clean finish.
++func (it *Iterator) Err() error { return it.err }
++
++func (it *Iterator) fail(err error) {
++	it.err = err
++	it.done = true
++}
++
++// fetchPage requests it.nextURL, queues its deduplicated items, and works
++// out where the walk goes next.
++func (it *Iterator) fetchPage() {
++	pageURL := it.nextURL
++	if err := it.ctx.Err(); err != nil {
++		it.fail(fmt.Errorf("pagewalk: GET %s: %w", pageURL, err))
++		return
++	}
++	req, err := http.NewRequestWithContext(it.ctx, http.MethodGet, pageURL, nil)
++	if err != nil {
++		it.fail(fmt.Errorf("pagewalk: %w", err))
++		return
++	}
++	req.Header.Set("Accept", "application/json")
++	resp, err := it.walker.client.Do(req)
++	if err != nil {
++		it.fail(fmt.Errorf("pagewalk: %w", err))
++		return
++	}
++	defer resp.Body.Close()
++	body, err := io.ReadAll(resp.Body)
++	if err != nil {
++		it.fail(fmt.Errorf("pagewalk: GET %s: reading body: %w", pageURL, err))
++		return
++	}
++	if resp.StatusCode < 200 || resp.StatusCode > 299 {
++		it.fail(fmt.Errorf("pagewalk: GET %s: unexpected status %d", pageURL, resp.StatusCode))
++		return
++	}
++	var decoded struct {
++		Items      []map[string]any `json:"items"`
++		NextCursor string           `json:"next_cursor"`
++	}
++	if err := json.Unmarshal(body, &decoded); err != nil {
++		it.fail(fmt.Errorf("pagewalk: GET %s: decoding page: %w", pageURL, err))
++		return
++	}
++
++	// An empty page ends the walk no matter what cursors it advertises;
++	// some feeds hand out a self-referencing cursor on their last page.
++	if len(decoded.Items) == 0 {
++		it.done = true
++		return
++	}
++
++	for _, m := range decoded.Items {
++		if id, ok := m["id"].(string); ok {
++			if it.seen[id] {
++				continue
++			}
++			it.seen[id] = true
++		}
++		it.queue = append(it.queue, m)
++	}
++
++	next, err := nextPageURL(pageURL, resp.Header, decoded.NextCursor)
++	if err != nil {
++		it.fail(fmt.Errorf("pagewalk: GET %s: %w", pageURL, err))
++		return
++	}
++	if next == "" {
++		it.done = true
++		return
++	}
++	it.nextURL = next
++}
++
++// nextPageURL decides where the walk goes after the page at pageURL:
++// the Link rel="next" target when present, else the body cursor, else
++// nowhere.
++func nextPageURL(pageURL string, h http.Header, cursor string) (string, error) {
++	if ref := nextLink(h); ref != "" {
++		return resolveRef(pageURL, ref)
++	}
++	if cursor != "" {
++		return withCursorParam(pageURL, cursor)
++	}
++	return "", nil
++}
++
++// nextLink extracts the rel="next" target from any Link headers.
++func nextLink(h http.Header) string {
++	for _, header := range h.Values("Link") {
++		for _, entry := range strings.Split(header, ",") {
++			segs := strings.Split(entry, ";")
++			if len(segs) < 2 {
++				continue
++			}
++			target := strings.TrimSpace(segs[0])
++			if !strings.HasPrefix(target, "<") || !strings.HasSuffix(target, ">") {
++				continue
++			}
++			for _, param := range segs[1:] {
++				key, val, ok := strings.Cut(param, "=")
++				if !ok {
++					continue
++				}
++				val = strings.Trim(strings.TrimSpace(val), `"`)
++				if strings.TrimSpace(key) == "rel" && val == "next" {
++					return strings.TrimSuffix(strings.TrimPrefix(target, "<"), ">")
++				}
++			}
++		}
++	}
++	return ""
++}
++
++// resolveRef resolves a possibly-relative link target against the URL of
++// the page that carried it.
++func resolveRef(pageURL, ref string) (string, error) {
++	base, err := url.Parse(pageURL)
++	if err != nil {
++		return "", err
++	}
++	target, err := url.Parse(ref)
++	if err != nil {
++		return "", fmt.Errorf("unusable Link target %q: %w", ref, err)
++	}
++	return base.ResolveReference(target).String(), nil
++}
++
++// withCursorParam re-targets pageURL at the next cursor: the cursor query
++// parameter is set (replacing any previous value) and every other
++// parameter is preserved.
++func withCursorParam(pageURL, cursor string) (string, error) {
++	u, err := url.Parse(pageURL)
++	if err != nil {
++		return "", err
++	}
++	q := u.Query()
++	q.Set("cursor", cursor)
++	u.RawQuery = q.Encode()
++	return u.String(), nil
++}

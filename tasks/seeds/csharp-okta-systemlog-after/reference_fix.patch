@@ -1,0 +1,283 @@
+diff --git a/Models.cs b/Models.cs
+new file mode 100644
+index 0000000..75a5ca6
+--- /dev/null
++++ b/Models.cs
+@@ -0,0 +1,37 @@
++namespace OktaSyslog;
++
++/// <summary>One System Log event, flattened from the wire document
++/// (actor.alternateId and outcome.result live in nested objects).</summary>
++public sealed record LogEvent(
++    string Uuid,
++    string Published,
++    string EventType,
++    string Severity,
++    string? DisplayMessage,
++    string ActorAlternateId,
++    string OutcomeResult);
++
++/// <summary>A fetched /api/v1/logs page plus its pagination links. NextUrl is
++/// the Link rel="next" href verbatim; NextAfter is the opaque after cursor
++/// extracted from that href for checkpoint persistence.</summary>
++public sealed record LogPage(IReadOnlyList<LogEvent> Events, string? NextUrl, string? NextAfter);
++
++/// <summary>Snapshot of the X-Rate-Limit-* headers from the most recent
++/// response. Reset is UTC epoch seconds per Okta's rate-limit docs.</summary>
++public sealed record RateLimitInfo(int Limit, int Remaining, long ResetEpochSeconds);
++
++/// <summary>Outcome of one checkpointed sweep.</summary>
++public sealed record SweepReport(int PagesDelivered, int EventsDelivered, int DuplicatesSkipped);
++
++/// <summary>Raised when a request stays rate-limited after the retry budget
++/// is spent. Carries the window reset so callers can reschedule.</summary>
++public sealed class OktaRateLimitException : Exception
++{
++    public long ResetEpochSeconds { get; }
++
++    public OktaRateLimitException(string message, long resetEpochSeconds)
++        : base(message)
++    {
++        ResetEpochSeconds = resetEpochSeconds;
++    }
++}
+diff --git a/SystemLogClient.cs b/SystemLogClient.cs
+new file mode 100644
+index 0000000..a85ae2e
+--- /dev/null
++++ b/SystemLogClient.cs
+@@ -0,0 +1,161 @@
++using System.Text.Json;
++
++namespace OktaSyslog;
++
++/// <summary>
++/// Transport for GET /api/v1/logs. Speaks the documented wire contract: SSWS
++/// auth, Link rel="next" pagination followed verbatim, X-Rate-Limit-* headers
++/// parsed on every response, and 429 retries anchored on the response's own
++/// Date header (the server's clock, not ours). All waiting is delegated to
++/// the injected wait function so nothing here ever sleeps.
++/// </summary>
++public sealed class SystemLogClient
++{
++    private const int MaxAttempts = 3;
++
++    private readonly Uri _base;
++    private readonly string _apiToken;
++    private readonly HttpClient _http;
++    private readonly Func<TimeSpan, Task> _wait;
++
++    // Set when a response reports a spent budget; the next request waits it out.
++    private (long ResetEpoch, long DateEpoch)? _pendingGate;
++
++    public RateLimitInfo? LastRateLimit { get; private set; }
++
++    public SystemLogClient(string orgBaseUrl, string apiToken, HttpClient http, Func<TimeSpan, Task> wait)
++    {
++        _base = new Uri(orgBaseUrl.EndsWith('/') ? orgBaseUrl : orgBaseUrl + "/");
++        _apiToken = apiToken;
++        _http = http;
++        _wait = wait;
++    }
++
++    public async Task<LogPage> FetchPageAsync(string url)
++    {
++        Uri target = Uri.TryCreate(url, UriKind.Absolute, out Uri? abs) && abs.Scheme.StartsWith("http")
++            ? abs
++            : new Uri(_base, url.TrimStart('/'));
++
++        for (int attempt = 1; attempt <= MaxAttempts; attempt++)
++        {
++            await HonorPendingGateAsync();
++
++            using var request = new HttpRequestMessage(HttpMethod.Get, target);
++            request.Headers.TryAddWithoutValidation("Authorization", "SSWS " + _apiToken);
++            request.Headers.TryAddWithoutValidation("Accept", "application/json");
++            using HttpResponseMessage response = await _http.SendAsync(request);
++
++            RateLimitInfo? rate = ParseRateHeaders(response);
++            if (rate is not null) LastRateLimit = rate;
++            long dateEpoch = (response.Headers.Date ?? DateTimeOffset.UtcNow).ToUnixTimeSeconds();
++
++            if ((int)response.StatusCode == 429)
++            {
++                long reset = rate?.ResetEpochSeconds ?? dateEpoch;
++                if (attempt == MaxAttempts)
++                {
++                    string code = ReadErrorCode(await response.Content.ReadAsStringAsync());
++                    throw new OktaRateLimitException(
++                        $"Okta rate limit still exceeded ({code}) after {MaxAttempts} attempts on GET {target.PathAndQuery}; window resets at epoch {reset}",
++                        reset);
++                }
++                await _wait(TimeSpan.FromSeconds(Math.Max(0, reset - dateEpoch)));
++                continue;
++            }
++
++            response.EnsureSuccessStatusCode();
++            if (rate is not null && rate.Remaining <= 0)
++                _pendingGate = (rate.ResetEpochSeconds, dateEpoch);
++
++            string json = await response.Content.ReadAsStringAsync();
++            (string? nextUrl, string? nextAfter) = ParseNextLink(response);
++            return new LogPage(ParseEvents(json), nextUrl, nextAfter);
++        }
++        throw new InvalidOperationException("unreachable");
++    }
++
++    private async Task HonorPendingGateAsync()
++    {
++        if (_pendingGate is not { } gate) return;
++        _pendingGate = null;
++        long delay = gate.ResetEpoch - gate.DateEpoch;
++        if (delay > 0) await _wait(TimeSpan.FromSeconds(delay));
++    }
++
++    private static RateLimitInfo? ParseRateHeaders(HttpResponseMessage response)
++    {
++        static string? First(HttpResponseMessage r, string name)
++            => r.Headers.TryGetValues(name, out var v) ? v.FirstOrDefault() : null;
++
++        string? limit = First(response, "X-Rate-Limit-Limit");
++        string? remaining = First(response, "X-Rate-Limit-Remaining");
++        string? reset = First(response, "X-Rate-Limit-Reset");
++        if (limit is null || remaining is null || reset is null) return null;
++        return new RateLimitInfo(int.Parse(limit), int.Parse(remaining), long.Parse(reset));
++    }
++
++    private static (string? NextUrl, string? NextAfter) ParseNextLink(HttpResponseMessage response)
++    {
++        if (!response.Headers.TryGetValues("Link", out var values)) return (null, null);
++        foreach (string segment in string.Join(",", values).Split(','))
++        {
++            int open = segment.IndexOf('<');
++            int close = segment.IndexOf('>');
++            if (open < 0 || close < open) continue;
++            if (!segment[(close + 1)..].Contains("rel=\"next\"", StringComparison.OrdinalIgnoreCase)) continue;
++            string href = segment[(open + 1)..close];
++            return (href, ExtractQueryParam(href, "after"));
++        }
++        return (null, null);
++    }
++
++    private static string? ExtractQueryParam(string url, string name)
++    {
++        int q = url.IndexOf('?');
++        if (q < 0) return null;
++        foreach (string pair in url[(q + 1)..].Split('&', StringSplitOptions.RemoveEmptyEntries))
++        {
++            int eq = pair.IndexOf('=');
++            if (eq < 0) continue;
++            if (Uri.UnescapeDataString(pair[..eq]) == name)
++                return Uri.UnescapeDataString(pair[(eq + 1)..]);
++        }
++        return null;
++    }
++
++    private static IReadOnlyList<LogEvent> ParseEvents(string json)
++    {
++        using JsonDocument doc = JsonDocument.Parse(json);
++        var events = new List<LogEvent>();
++        foreach (JsonElement e in doc.RootElement.EnumerateArray())
++        {
++            string? display = e.TryGetProperty("displayMessage", out JsonElement dm) && dm.ValueKind == JsonValueKind.String
++                ? dm.GetString()
++                : null;
++            events.Add(new LogEvent(
++                e.GetProperty("uuid").GetString()!,
++                e.GetProperty("published").GetString()!,
++                e.GetProperty("eventType").GetString()!,
++                e.GetProperty("severity").GetString()!,
++                display,
++                e.GetProperty("actor").GetProperty("alternateId").GetString()!,
++                e.GetProperty("outcome").GetProperty("result").GetString()!));
++        }
++        return events;
++    }
++
++    private static string ReadErrorCode(string body)
++    {
++        try
++        {
++            using JsonDocument doc = JsonDocument.Parse(body);
++            if (doc.RootElement.TryGetProperty("errorCode", out JsonElement code))
++                return code.GetString() ?? "unknown";
++        }
++        catch (JsonException)
++        {
++        }
++        return "unknown";
++    }
++}
+diff --git a/SystemLogExporter.cs b/SystemLogExporter.cs
+new file mode 100644
+index 0000000..1a80ea9
+--- /dev/null
++++ b/SystemLogExporter.cs
+@@ -0,0 +1,67 @@
++namespace OktaSyslog;
++
++/// <summary>
++/// Checkpointed System Log sweep. Issues the documented polling query
++/// (ASCENDING, no until), resumes from the stored after cursor, follows the
++/// server's next links verbatim, dedupes by event uuid, and advances the
++/// checkpoint for a page only after that page has been fully delivered — a
++/// delivery failure leaves the checkpoint on the last good page so the next
++/// sweep refetches exactly the failed page.
++/// </summary>
++public sealed class SystemLogExporter
++{
++    private readonly SystemLogClient _client;
++    private readonly Func<string?> _loadCursor;
++    private readonly Action<string> _saveCursor;
++    private readonly Func<IReadOnlyList<LogEvent>, Task> _deliver;
++
++    public SystemLogExporter(
++        SystemLogClient client,
++        Func<string?> loadCursor,
++        Action<string> saveCursor,
++        Func<IReadOnlyList<LogEvent>, Task> deliver)
++    {
++        _client = client;
++        _loadCursor = loadCursor;
++        _saveCursor = saveCursor;
++        _deliver = deliver;
++    }
++
++    public async Task<SweepReport> RunSweepAsync(string since, string filter, int limit)
++    {
++        string url = $"/api/v1/logs?since={Uri.EscapeDataString(since)}"
++                     + $"&filter={Uri.EscapeDataString(filter)}"
++                     + $"&limit={limit}&sortOrder=ASCENDING";
++        if (_loadCursor() is string cursor)
++            url += "&after=" + Uri.EscapeDataString(cursor);
++
++        var seen = new HashSet<string>(StringComparer.Ordinal);
++        int pages = 0, delivered = 0, duplicates = 0;
++
++        while (true)
++        {
++            LogPage page = await _client.FetchPageAsync(url);
++            if (page.Events.Count == 0) break;
++
++            var fresh = new List<LogEvent>();
++            foreach (LogEvent e in page.Events)
++            {
++                if (seen.Add(e.Uuid)) fresh.Add(e);
++                else duplicates++;
++            }
++
++            if (fresh.Count > 0)
++            {
++                await _deliver(fresh);
++                pages++;
++                delivered += fresh.Count;
++                if (page.NextAfter is string after) _saveCursor(after);
++            }
++
++            if (page.NextUrl is null) break;
++            url = page.NextUrl;
++        }
++
++        return new SweepReport(pages, delivered, duplicates);
++    }
++}

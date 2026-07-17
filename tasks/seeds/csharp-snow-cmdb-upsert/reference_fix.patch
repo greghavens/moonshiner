@@ -1,0 +1,268 @@
+diff --git a/CmdbUpsertClient.cs b/CmdbUpsertClient.cs
+new file mode 100644
+index 0000000..7354f90
+--- /dev/null
++++ b/CmdbUpsertClient.cs
+@@ -0,0 +1,157 @@
++using System.Net;
++using System.Net.Http.Headers;
++using System.Text;
++using System.Text.Json;
++
++namespace SnowCmdb;
++
++/// <summary>
++/// Pushes configuration items through ServiceNow's Identification and
++/// Reconciliation API (POST /api/now/identifyreconcile) so the platform's
++/// identify + reconcile rules run — never through naive Table API inserts.
++/// Contract per docs/contract.json and the current official API reference
++/// recorded in docs/official_sources.json.
++/// </summary>
++public sealed class CmdbUpsertClient
++{
++    private const string EndpointPath = "/api/now/identifyreconcile";
++
++    private readonly HttpClient _http;
++    private readonly string _baseUrl;
++    private readonly Func<TimeSpan, Task> _delay;
++    private readonly int _maxRetries;
++
++    public CmdbUpsertClient(string instanceUrl, string username, string password,
++        Func<TimeSpan, Task>? delay = null, int maxRetries = 3)
++    {
++        _baseUrl = instanceUrl.TrimEnd('/');
++        _delay = delay ?? (ts => Task.Delay(ts));
++        _maxRetries = maxRetries;
++        _http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false });
++        _http.DefaultRequestHeaders.Accept.Add(
++            new MediaTypeWithQualityHeaderValue("application/json"));
++        _http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue(
++            "Basic", Convert.ToBase64String(
++                Encoding.UTF8.GetBytes($"{username}:{password}")));
++    }
++
++    public async Task<ReconcileReport> UpsertAsync(
++        string dataSource, IReadOnlyList<CmdbItem> items)
++    {
++        string payload = BuildPayload(dataSource, items);
++        string url = $"{_baseUrl}{EndpointPath}?sysparm_data_source={Uri.EscapeDataString(dataSource)}";
++
++        int retries = 0;
++        while (true)
++        {
++            using var content = new StringContent(payload, Encoding.UTF8, "application/json");
++            using var response = await _http.PostAsync(url, content);
++            string body = await response.Content.ReadAsStringAsync();
++
++            if (response.StatusCode == HttpStatusCode.OK)
++            {
++                return ParseReport(body, items);
++            }
++            var (message, detail) = ParseEnvelope(response, body);
++            if ((int)response.StatusCode == 429)
++            {
++                int retryAfter = ParseRetryAfter(response);
++                if (retries >= _maxRetries)
++                {
++                    throw new SnowRateLimitError(message, detail, retryAfter);
++                }
++                retries++;
++                await _delay(TimeSpan.FromSeconds(retryAfter));
++                continue; // rejected before processing: safe to re-POST
++            }
++            throw new SnowApiError((int)response.StatusCode, message, detail);
++        }
++    }
++
++    private static string BuildPayload(string dataSource, IReadOnlyList<CmdbItem> items)
++    {
++        var body = new Dictionary<string, object?>
++        {
++            ["items"] = items.Select(item => new Dictionary<string, object?>
++            {
++                ["className"] = item.ClassName,
++                ["values"] = item.Values,
++                ["sys_object_source_info"] = new Dictionary<string, object?>
++                {
++                    ["source_name"] = dataSource,
++                    ["source_native_key"] = item.SourceNativeKey,
++                },
++            }).ToList(),
++        };
++        return JsonSerializer.Serialize(body);
++    }
++
++    private static ReconcileReport ParseReport(string body, IReadOnlyList<CmdbItem> items)
++    {
++        using var doc = JsonDocument.Parse(body);
++        var result = doc.RootElement.GetProperty("result");
++        var slots = new ItemResult?[items.Count];
++        foreach (var element in result.GetProperty("items").EnumerateArray())
++        {
++            string className = element.GetProperty("className").GetString() ?? "";
++            string? sysId = element.TryGetProperty("sysId", out var sid)
++                && sid.ValueKind == JsonValueKind.String ? sid.GetString() : null;
++            string? operation = element.TryGetProperty("operation", out var op)
++                && op.ValueKind == JsonValueKind.String ? op.GetString() : null;
++            var errors = new List<ReconcileError>();
++            if (element.TryGetProperty("errors", out var errs)
++                && errs.ValueKind == JsonValueKind.Array)
++            {
++                foreach (var err in errs.EnumerateArray())
++                {
++                    errors.Add(new ReconcileError(
++                        err.GetProperty("error").GetString() ?? "",
++                        err.GetProperty("message").GetString() ?? ""));
++                }
++            }
++            var itemResult = new ItemResult(className, sysId, operation, errors);
++            // the instance does not promise ordering; map back via inputIndices
++            foreach (var idx in element.GetProperty("inputIndices").EnumerateArray())
++            {
++                slots[idx.GetInt32()] = itemResult;
++            }
++        }
++        var ordered = new List<ItemResult>(items.Count);
++        for (int i = 0; i < slots.Length; i++)
++        {
++            ordered.Add(slots[i] ?? throw new SnowApiError(200,
++                $"response did not cover request item {i}", ""));
++        }
++        bool hasError = result.TryGetProperty("hasError", out var he) && he.GetBoolean();
++        return new ReconcileReport(ordered, hasError);
++    }
++
++    private static (string Message, string Detail) ParseEnvelope(
++        HttpResponseMessage response, string body)
++    {
++        try
++        {
++            using var doc = JsonDocument.Parse(body);
++            var error = doc.RootElement.GetProperty("error");
++            string message = error.TryGetProperty("message", out var m)
++                ? m.GetString() ?? "" : $"HTTP {(int)response.StatusCode}";
++            string detail = error.TryGetProperty("detail", out var d)
++                && d.ValueKind == JsonValueKind.String ? d.GetString() ?? "" : "";
++            return (message, detail);
++        }
++        catch (Exception)
++        {
++            return ($"HTTP {(int)response.StatusCode}", "");
++        }
++    }
++
++    private static int ParseRetryAfter(HttpResponseMessage response)
++    {
++        if (response.Headers.TryGetValues("Retry-After", out var values)
++            && int.TryParse(values.FirstOrDefault(), out int seconds) && seconds > 0)
++        {
++            return seconds;
++        }
++        return 1;
++    }
++}
+diff --git a/Errors.cs b/Errors.cs
+new file mode 100644
+index 0000000..d1146a5
+--- /dev/null
++++ b/Errors.cs
+@@ -0,0 +1,30 @@
++namespace SnowCmdb;
++
++/// <summary>
++/// A non-2xx answer from the instance, carrying ServiceNow's error envelope
++/// fields ({"error": {"message", "detail"}, "status": "failure"}).
++/// Exception text never contains credentials.
++/// </summary>
++public class SnowApiError : Exception
++{
++    public SnowApiError(int statusCode, string message, string detail)
++        : base(message)
++    {
++        StatusCode = statusCode;
++        Detail = detail;
++    }
++
++    public int StatusCode { get; }
++    public string Detail { get; }
++}
++
++public sealed class SnowRateLimitError : SnowApiError
++{
++    public SnowRateLimitError(string message, string detail, int retryAfterSeconds)
++        : base(429, message, detail)
++    {
++        RetryAfterSeconds = retryAfterSeconds;
++    }
++
++    public int RetryAfterSeconds { get; }
++}
+diff --git a/Models.cs b/Models.cs
+new file mode 100644
+index 0000000..46ef394
+--- /dev/null
++++ b/Models.cs
+@@ -0,0 +1,63 @@
++namespace SnowCmdb;
++
++/// <summary>One configuration item to identify and reconcile into the CMDB.</summary>
++public sealed class CmdbItem
++{
++    public required string ClassName { get; init; }
++    public required string SourceNativeKey { get; init; }
++    public required IReadOnlyDictionary<string, object?> Values { get; init; }
++}
++
++public sealed class ReconcileError
++{
++    public ReconcileError(string error, string message)
++    {
++        Error = error;
++        Message = message;
++    }
++
++    public string Error { get; }
++    public string Message { get; }
++}
++
++/// <summary>Per-item outcome, in request order.</summary>
++public sealed class ItemResult
++{
++    public ItemResult(string className, string? sysId, string? operation,
++        IReadOnlyList<ReconcileError> errors)
++    {
++        ClassName = className;
++        SysId = sysId;
++        Operation = operation;
++        Errors = errors;
++    }
++
++    public string ClassName { get; }
++    public string? SysId { get; }
++    public string? Operation { get; }
++    public IReadOnlyList<ReconcileError> Errors { get; }
++}
++
++public sealed class ReconcileReport
++{
++    public ReconcileReport(IReadOnlyList<ItemResult> items, bool hasErrors)
++    {
++        Items = items;
++        HasErrors = hasErrors;
++        foreach (var item in items)
++        {
++            if (item.Errors.Count > 0) Failed++;
++            else if (item.Operation == "INSERT") Inserted++;
++            else if (item.Operation == "NO_CHANGE") Unchanged++;
++            else if (item.Operation is not null && item.Operation.StartsWith("UPDATE",
++                         StringComparison.Ordinal)) Updated++;
++        }
++    }
++
++    public IReadOnlyList<ItemResult> Items { get; }
++    public bool HasErrors { get; }
++    public int Inserted { get; }
++    public int Updated { get; }
++    public int Unchanged { get; }
++    public int Failed { get; }
++}

@@ -1,0 +1,237 @@
+diff --git a/bodyparser.ts b/bodyparser.ts
+index 0226d1b..917cbab 100644
+--- a/bodyparser.ts
++++ b/bodyparser.ts
+@@ -3,14 +3,25 @@
+ // parseBody() and switch on the returned type; anything unparseable throws a
+ // BodyParseError with a stable machine-readable code.
+ 
+-export type ParsedBody = { type: 'json'; value: unknown };
++export interface UploadedFile {
++  field: string;
++  filename: string;
++  contentType: string;
++  data: Uint8Array;
++}
++
++export type ParsedBody =
++  | { type: 'json'; value: unknown }
++  | { type: 'form'; fields: Record<string, string[]> }
++  | { type: 'multipart'; fields: Record<string, string[]>; files: UploadedFile[] };
+ 
+ export type ErrorCode =
+   | 'unsupported-type'
+   | 'too-large'
+   | 'bad-json'
+   | 'bad-charset'
+-  | 'bad-encoding';
++  | 'bad-encoding'
++  | 'bad-multipart';
+ 
+ export class BodyParseError extends Error {
+   code: ErrorCode;
+@@ -24,6 +35,12 @@ export class BodyParseError extends Error {
+ export interface ParseOptions {
+   /** Overall cap on the raw body size, in bytes. */
+   maxBytes?: number;
++  /** Per-type caps; each overrides maxBytes for its own type only. */
++  limits?: {
++    json?: number;
++    urlencoded?: number;
++    multipart?: number;
++  };
+ }
+ 
+ const DEFAULT_MAX_BYTES = 1024 * 1024;
+@@ -57,6 +74,163 @@ function decodeUtf8(raw: Uint8Array, what: string): string {
+   }
+ }
+ 
++function checkCap(raw: Uint8Array, opts: ParseOptions, kind: 'json' | 'urlencoded' | 'multipart'): void {
++  const cap = opts.limits?.[kind] ?? opts.maxBytes ?? DEFAULT_MAX_BYTES;
++  if (raw.length > cap) {
++    throw new BodyParseError('too-large', `${kind} body of ${raw.length} bytes exceeds cap of ${cap}`);
++  }
++}
++
++// ---------------------------------------------------------------------------
++// application/x-www-form-urlencoded
++
++type FormCharset = 'utf-8' | 'latin1';
++
++function formCharset(params: Record<string, string>): FormCharset {
++  const charset = (params.charset ?? 'utf-8').toLowerCase();
++  if (charset === 'utf-8' || charset === 'utf8') return 'utf-8';
++  if (charset === 'iso-8859-1' || charset === 'latin1') return 'latin1';
++  throw new BodyParseError('bad-charset', `unsupported charset ${charset} for a form body`);
++}
++
++function latin1String(raw: Uint8Array): string {
++  let out = '';
++  for (const byte of raw) out += String.fromCharCode(byte);
++  return out;
++}
++
++/** Decode one urlencoded component: '+' means space, then percent escapes. */
++function decodeFormComponent(text: string, charset: FormCharset): string {
++  const spaced = text.replace(/\+/g, ' ');
++  const bytes: number[] = [];
++  for (let i = 0; i < spaced.length; i++) {
++    if (spaced[i] === '%') {
++      const hex = spaced.slice(i + 1, i + 3);
++      if (hex.length < 2 || !/^[0-9A-Fa-f]{2}$/.test(hex)) {
++        throw new BodyParseError('bad-encoding', `malformed percent escape near ${JSON.stringify(spaced.slice(i, i + 3))}`);
++      }
++      bytes.push(parseInt(hex, 16));
++      i += 2;
++    } else {
++      bytes.push(spaced.charCodeAt(i));
++    }
++  }
++  const buf = Uint8Array.from(bytes);
++  if (charset === 'latin1') return latin1String(buf);
++  return decodeUtf8(buf, 'form value');
++}
++
++function pushField(fields: Record<string, string[]>, name: string, value: string): void {
++  if (!Object.hasOwn(fields, name)) fields[name] = [];
++  fields[name].push(value);
++}
++
++function parseUrlencoded(raw: Uint8Array, params: Record<string, string>): ParsedBody {
++  const charset = formCharset(params);
++  const fields: Record<string, string[]> = {};
++  // latin1 is byte-preserving, so the working string mirrors the raw bytes.
++  for (const segment of latin1String(raw).split('&')) {
++    if (!segment) continue;
++    const eq = segment.indexOf('=');
++    const rawKey = eq === -1 ? segment : segment.slice(0, eq);
++    const rawValue = eq === -1 ? '' : segment.slice(eq + 1);
++    pushField(fields, decodeFormComponent(rawKey, charset), decodeFormComponent(rawValue, charset));
++  }
++  return { type: 'form', fields };
++}
++
++// ---------------------------------------------------------------------------
++// multipart/form-data
++
++function isDelimiterAt(data: Buffer, pos: number): boolean {
++  return pos === 0 || (pos >= 2 && data[pos - 2] === 0x0d && data[pos - 1] === 0x0a);
++}
++
++function findDelimiter(data: Buffer, delim: Buffer, from: number): number {
++  let pos = data.indexOf(delim, from);
++  while (pos !== -1 && !isDelimiterAt(data, pos)) {
++    pos = data.indexOf(delim, pos + 1);
++  }
++  return pos;
++}
++
++interface PartHeaders {
++  disposition: MediaType | null;
++  contentType: string | null;
++}
++
++function parsePartHeaders(text: string): PartHeaders {
++  let disposition: MediaType | null = null;
++  let contentType: string | null = null;
++  for (const line of text.split('\r\n')) {
++    const colon = line.indexOf(':');
++    if (colon === -1) continue;
++    const name = line.slice(0, colon).trim().toLowerCase();
++    const value = line.slice(colon + 1).trim();
++    if (name === 'content-disposition') disposition = parseMediaType(value);
++    else if (name === 'content-type') contentType = value;
++  }
++  return { disposition, contentType };
++}
++
++function parseMultipart(raw: Uint8Array, params: Record<string, string>): ParsedBody {
++  const boundary = params.boundary;
++  if (!boundary) {
++    throw new BodyParseError('bad-multipart', 'multipart body without a boundary parameter');
++  }
++  const data = Buffer.from(raw);
++  const delim = Buffer.from(`--${boundary}`);
++
++  const fields: Record<string, string[]> = {};
++  const files: UploadedFile[] = [];
++
++  let cursor = findDelimiter(data, delim, 0);
++  if (cursor === -1) {
++    throw new BodyParseError('bad-multipart', 'opening boundary delimiter not found');
++  }
++  for (;;) {
++    const afterDelim = cursor + delim.length;
++    if (data[afterDelim] === 0x2d && data[afterDelim + 1] === 0x2d) {
++      break; // closing delimiter: --boundary-- ; anything after is epilogue
++    }
++    if (!(data[afterDelim] === 0x0d && data[afterDelim + 1] === 0x0a)) {
++      throw new BodyParseError('bad-multipart', 'boundary delimiter is not followed by CRLF');
++    }
++    const headStart = afterDelim + 2;
++    const headEnd = data.indexOf('\r\n\r\n', headStart);
++    if (headEnd === -1) {
++      throw new BodyParseError('bad-multipart', 'part headers are never terminated');
++    }
++    const headers = parsePartHeaders(data.subarray(headStart, headEnd).toString('utf8'));
++    const bodyStart = headEnd + 4;
++    const next = findDelimiter(data, delim, bodyStart);
++    if (next === -1) {
++      throw new BodyParseError('bad-multipart', 'missing closing boundary delimiter');
++    }
++    const body = data.subarray(bodyStart, next - 2); // strip the CRLF owned by the delimiter
++
++    const name = headers.disposition?.params.name;
++    if (!name) {
++      throw new BodyParseError('bad-multipart', 'part carries no usable Content-Disposition name');
++    }
++    const filename = headers.disposition?.params.filename;
++    if (filename !== undefined) {
++      files.push({
++        field: name,
++        filename,
++        contentType: headers.contentType ?? 'application/octet-stream',
++        data: Uint8Array.from(body),
++      });
++    } else {
++      pushField(fields, name, decodeUtf8(body, `text field ${JSON.stringify(name)}`));
++    }
++    cursor = next;
++  }
++  return { type: 'multipart', fields, files };
++}
++
++// ---------------------------------------------------------------------------
++
+ export function parseBody(
+   raw: Uint8Array,
+   contentType: string | undefined,
+@@ -68,10 +242,7 @@ export function parseBody(
+   const media = parseMediaType(contentType);
+ 
+   if (media.type === 'application/json') {
+-    const cap = opts.maxBytes ?? DEFAULT_MAX_BYTES;
+-    if (raw.length > cap) {
+-      throw new BodyParseError('too-large', `json body of ${raw.length} bytes exceeds cap of ${cap}`);
+-    }
++    checkCap(raw, opts, 'json');
+     const charset = (media.params.charset ?? 'utf-8').toLowerCase();
+     if (charset !== 'utf-8' && charset !== 'utf8') {
+       throw new BodyParseError('bad-charset', `unsupported charset ${charset} for json`);
+@@ -84,5 +255,15 @@ export function parseBody(
+     }
+   }
+ 
++  if (media.type === 'application/x-www-form-urlencoded') {
++    checkCap(raw, opts, 'urlencoded');
++    return parseUrlencoded(raw, media.params);
++  }
++
++  if (media.type === 'multipart/form-data') {
++    checkCap(raw, opts, 'multipart');
++    return parseMultipart(raw, media.params);
++  }
++
+   throw new BodyParseError('unsupported-type', `no parser for ${media.type}`);
+ }

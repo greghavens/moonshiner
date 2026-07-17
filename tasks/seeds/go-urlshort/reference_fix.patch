@@ -1,0 +1,218 @@
+diff --git a/codes.go b/codes.go
+new file mode 100644
+index 0000000..1a7ed58
+--- /dev/null
++++ b/codes.go
+@@ -0,0 +1,29 @@
++package shortener
++
++import (
++	"crypto/rand"
++	"fmt"
++	"regexp"
++)
++
++const codeAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
++
++var codePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,32}$`)
++
++// validCode reports whether a client-supplied vanity code is acceptable.
++func validCode(code string) bool {
++	return codePattern.MatchString(code)
++}
++
++// randomCode returns an 8-character code from the link alphabet.
++// 64^8 possibilities; uniqueness is still enforced by the store.
++func randomCode() (string, error) {
++	var buf [8]byte
++	if _, err := rand.Read(buf[:]); err != nil {
++		return "", fmt.Errorf("generate code: %w", err)
++	}
++	for i, b := range buf {
++		buf[i] = codeAlphabet[int(b)%len(codeAlphabet)]
++	}
++	return string(buf[:]), nil
++}
+diff --git a/respond.go b/respond.go
+new file mode 100644
+index 0000000..5e4bad3
+--- /dev/null
++++ b/respond.go
+@@ -0,0 +1,16 @@
++package shortener
++
++import (
++	"encoding/json"
++	"net/http"
++)
++
++func writeJSON(w http.ResponseWriter, status int, payload any) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(status)
++	json.NewEncoder(w).Encode(payload)
++}
++
++func writeError(w http.ResponseWriter, status int, msg string) {
++	writeJSON(w, status, map[string]string{"error": msg})
++}
+diff --git a/server.go b/server.go
+new file mode 100644
+index 0000000..ce7f7ae
+--- /dev/null
++++ b/server.go
+@@ -0,0 +1,79 @@
++// Package shortener implements the golinks MVP: an in-memory URL shortener
++// with a small JSON API and a redirect endpoint.
++package shortener
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/url"
++)
++
++// NewServer wires the routes and returns the root handler.
++func NewServer() http.Handler {
++	s := &server{store: newStore()}
++	mux := http.NewServeMux()
++	mux.HandleFunc("POST /api/links", s.handleCreate)
++	mux.HandleFunc("GET /api/links/{code}", s.handleStats)
++	mux.HandleFunc("GET /r/{code}", s.handleRedirect)
++	return mux
++}
++
++type server struct {
++	store *store
++}
++
++type createRequest struct {
++	URL  string `json:"url"`
++	Code string `json:"code"`
++}
++
++func (s *server) handleCreate(w http.ResponseWriter, r *http.Request) {
++	var req createRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
++		writeError(w, http.StatusBadRequest, "request body is not valid JSON")
++		return
++	}
++	if !validTargetURL(req.URL) {
++		writeError(w, http.StatusBadRequest, "url must be an absolute http(s) URL")
++		return
++	}
++	if req.Code != "" && !validCode(req.Code) {
++		writeError(w, http.StatusBadRequest, "custom code must match [A-Za-z0-9_-]{1,32}")
++		return
++	}
++	code, err := s.store.create(req.URL, req.Code)
++	if err != nil {
++		writeError(w, http.StatusConflict, err.Error())
++		return
++	}
++	w.Header().Set("Location", "/r/"+code)
++	writeJSON(w, http.StatusCreated, map[string]any{"code": code, "url": req.URL})
++}
++
++func (s *server) handleStats(w http.ResponseWriter, r *http.Request) {
++	code := r.PathValue("code")
++	link, ok := s.store.stats(code)
++	if !ok {
++		writeError(w, http.StatusNotFound, "no such link")
++		return
++	}
++	writeJSON(w, http.StatusOK, map[string]any{"code": code, "url": link.url, "hits": link.hits})
++}
++
++func (s *server) handleRedirect(w http.ResponseWriter, r *http.Request) {
++	code := r.PathValue("code")
++	target, ok := s.store.hit(code)
++	if !ok {
++		writeError(w, http.StatusNotFound, "no such link")
++		return
++	}
++	http.Redirect(w, r, target, http.StatusFound)
++}
++
++func validTargetURL(raw string) bool {
++	u, err := url.Parse(raw)
++	if err != nil {
++		return false
++	}
++	return (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
++}
+diff --git a/store.go b/store.go
+new file mode 100644
+index 0000000..57495c8
+--- /dev/null
++++ b/store.go
+@@ -0,0 +1,70 @@
++package shortener
++
++import (
++	"fmt"
++	"sync"
++)
++
++type link struct {
++	url  string
++	hits int64
++}
++
++// store is the in-memory link table. One mutex guards both code issuance and
++// hit counting, which is what makes generated codes collision-free and hit
++// counts exact under concurrency.
++type store struct {
++	mu    sync.Mutex
++	links map[string]*link
++}
++
++func newStore() *store {
++	return &store{links: make(map[string]*link)}
++}
++
++// create registers target under custom (if non-empty) or a freshly generated
++// code. It returns the code in use, or an error if a custom code is taken.
++func (s *store) create(target, custom string) (string, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	code := custom
++	if code == "" {
++		for {
++			candidate, err := randomCode()
++			if err != nil {
++				return "", err
++			}
++			if _, taken := s.links[candidate]; !taken {
++				code = candidate
++				break
++			}
++		}
++	} else if _, taken := s.links[code]; taken {
++		return "", fmt.Errorf("code %q is already taken", code)
++	}
++	s.links[code] = &link{url: target}
++	return code, nil
++}
++
++// hit resolves code and counts one redirect.
++func (s *store) hit(code string) (string, bool) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	l, ok := s.links[code]
++	if !ok {
++		return "", false
++	}
++	l.hits++
++	return l.url, true
++}
++
++// stats returns a snapshot of a link without counting a hit.
++func (s *store) stats(code string) (link, bool) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	l, ok := s.links[code]
++	if !ok {
++		return link{}, false
++	}
++	return *l, true
++}

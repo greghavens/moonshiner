@@ -1,0 +1,383 @@
+diff --git a/forwait.ts b/forwait.ts
+new file mode 100644
+index 0000000..b335f05
+--- /dev/null
++++ b/forwait.ts
+@@ -0,0 +1,377 @@
++// forwait.ts — control-task executor for the ops workflow DSL.
++//
++// This module owns the control layer only: `for:` loops with nested
++// do-blocks, `wait:` durations against an injected logical clock, and
++// `then: end`, plus minimal set/call so loop bodies can act. Interpolation
++// (mixed-text splicing) belongs to the data-flow layer, not here.
++//
++// Everything is synchronous and deterministic: the only clock is the one
++// the caller injects, and the only side effects are the caller's handlers.
++
++import { parse } from 'yaml';
++
++export class LoadError extends Error {
++  constructor(message: string) {
++    super(message);
++    this.name = 'LoadError';
++  }
++}
++
++type Json = unknown;
++type Args = Record<string, Json>;
++type Handler = (args: Args) => Json;
++type Scope = Record<string, Json>;
++
++interface Clock {
++  advance(ms: number): void;
++}
++
++export interface RunOptions {
++  input?: Json;
++  handlers?: Record<string, Handler>;
++  clock?: Clock;
++}
++
++export interface RunResult {
++  status: 'completed';
++  context: Scope;
++}
++
++// ----------------------------------------------------------------- loading
++
++interface ForSpec {
++  each: string;
++  at: string | null;
++  inExpr: string;
++  body: Task[];
++}
++
++interface Task {
++  name: string;
++  kind: 'set' | 'call' | 'for' | 'wait';
++  set?: Json;
++  call?: string;
++  with?: Json;
++  forSpec?: ForSpec;
++  waitMs?: number;
++  then: 'continue' | 'end';
++}
++
++function isPlainObject(v: Json): v is Scope {
++  return typeof v === 'object' && v !== null && !Array.isArray(v);
++}
++
++// P[nD][T[nH][nM][nS]] — non-negative integers, at least one component.
++const DURATION_RE = /^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$/;
++
++function parseDuration(text: Json, where: string): number {
++  if (typeof text !== 'string') {
++    throw new LoadError(`${where}: wait must be an ISO-8601 duration string`);
++  }
++  const m = DURATION_RE.exec(text);
++  const empty = !m || (m[1] === undefined && m[2] === undefined &&
++                       m[3] === undefined && m[4] === undefined);
++  // "P1DT" sneaks past the regex with a dangling T; reject that too.
++  if (empty || text.endsWith('T')) {
++    throw new LoadError(`${where}: bad duration ${JSON.stringify(text)}`);
++  }
++  const days = Number(m![1] ?? 0);
++  const hours = Number(m![2] ?? 0);
++  const minutes = Number(m![3] ?? 0);
++  const seconds = Number(m![4] ?? 0);
++  return ((days * 24 + hours) * 3600 + minutes * 60 + seconds) * 1000;
++}
++
++function loadIdent(v: Json, where: string, what: string): string {
++  if (typeof v !== 'string' || v === '') {
++    throw new LoadError(`${where}: ${what} must be a non-empty string`);
++  }
++  return v;
++}
++
++function loadTasks(list: Json, where: string): Task[] {
++  if (!Array.isArray(list) || list.length === 0) {
++    throw new LoadError(`${where}: do must be a non-empty list`);
++  }
++  const seen = new Set<string>();
++  const tasks: Task[] = [];
++  for (const entry of list) {
++    if (!isPlainObject(entry) || Object.keys(entry).length !== 1) {
++      throw new LoadError(`${where}: each do entry must be a single-key map`);
++    }
++    const name = Object.keys(entry)[0];
++    if (name === 'input') {
++      throw new LoadError(`${where}: task name "input" is reserved`);
++    }
++    if (seen.has(name)) {
++      throw new LoadError(`${where}: duplicate task name "${name}"`);
++    }
++    seen.add(name);
++    tasks.push(loadTask(name, entry[name], `${where}/${name}`));
++  }
++  return tasks;
++}
++
++function loadTask(name: string, body: Json, where: string): Task {
++  if (!isPlainObject(body)) {
++    throw new LoadError(`${where}: task body must be a map`);
++  }
++  const typeKeys = (['set', 'call', 'for', 'wait'] as const)
++    .filter((k) => k in body);
++  if (typeKeys.length !== 1) {
++    throw new LoadError(
++      `${where}: task needs exactly one of set/call/for/wait, got ${typeKeys.length}`);
++  }
++  const kind = typeKeys[0];
++  const allowed = new Set<string>([kind, 'then']);
++  if (kind === 'call') allowed.add('with');
++  if (kind === 'for') allowed.add('do');
++  for (const key of Object.keys(body)) {
++    if (!allowed.has(key)) {
++      throw new LoadError(`${where}: unknown key "${key}" on a ${kind} task`);
++    }
++  }
++
++  let then: 'continue' | 'end' = 'continue';
++  if ('then' in body) {
++    const t = body['then'];
++    if (t !== 'continue' && t !== 'end') {
++      throw new LoadError(
++        `${where}: then must be "continue" or "end" — this engine has no jump targets`);
++    }
++    then = t;
++  }
++
++  const task: Task = { name, kind, then };
++  switch (kind) {
++    case 'set': {
++      if (!isPlainObject(body['set'])) {
++        throw new LoadError(`${where}: set must be a map`);
++      }
++      task.set = body['set'];
++      break;
++    }
++    case 'call': {
++      task.call = loadIdent(body['call'], where, 'call');
++      task.with = 'with' in body ? body['with'] : {};
++      if (!isPlainObject(task.with)) {
++        throw new LoadError(`${where}: with must be a map`);
++      }
++      break;
++    }
++    case 'for': {
++      const spec = body['for'];
++      if (!isPlainObject(spec)) {
++        throw new LoadError(`${where}: for must be a map`);
++      }
++      if (!('each' in spec)) {
++        throw new LoadError(`${where}: for requires each`);
++      }
++      if (!('in' in spec)) {
++        throw new LoadError(`${where}: for requires in`);
++      }
++      for (const key of Object.keys(spec)) {
++        if (key !== 'each' && key !== 'in' && key !== 'at') {
++          throw new LoadError(`${where}: unknown for key "${key}"`);
++        }
++      }
++      const each = loadIdent(spec['each'], where, 'for.each');
++      const at = 'at' in spec ? loadIdent(spec['at'], where, 'for.at') : null;
++      const inExpr = loadIdent(spec['in'], where, 'for.in');
++      if (!('do' in body)) {
++        throw new LoadError(`${where}: for requires a nested do block`);
++      }
++      task.forSpec = { each, at, inExpr, body: loadTasks(body['do'], where) };
++      break;
++    }
++    case 'wait': {
++      task.waitMs = parseDuration(body['wait'], where);
++      break;
++    }
++  }
++  return task;
++}
++
++function loadWorkflow(source: string): Task[] {
++  let doc: Json;
++  try {
++    doc = parse(source);
++  } catch (err) {
++    throw new LoadError(`invalid YAML: ${(err as Error).message}`);
++  }
++  if (!isPlainObject(doc)) {
++    throw new LoadError('workflow must be a YAML map');
++  }
++  const header = doc['document'];
++  if (!isPlainObject(header)) {
++    throw new LoadError('missing document header');
++  }
++  if (header['dsl'] !== '1.0') {
++    throw new LoadError(`unsupported dsl version ${JSON.stringify(header['dsl'])}`);
++  }
++  for (const field of ['namespace', 'name']) {
++    const v = header[field];
++    if (typeof v !== 'string' || v === '') {
++      throw new LoadError(`document.${field} must be a non-empty string`);
++    }
++  }
++  for (const key of Object.keys(doc)) {
++    if (key !== 'document' && key !== 'do') {
++      throw new LoadError(`unknown top-level key "${key}"`);
++    }
++  }
++  return loadTasks(doc['do'], 'do');
++}
++
++// -------------------------------------------------------------- expressions
++
++// The scope chain: index 0 is the workflow context; each loop iteration adds
++// two entries — the loop-variable scope, then the (live) iteration record
++// that body-task results are written into. First-segment lookup walks the
++// chain innermost-out; the first scope that HAS the key wins, which is what
++// makes a loop variable shadow a same-named context key inside the body.
++
++const SINGLE_EXPR_RE = /^\$\{\s*([^{}]+?)\s*\}$/;
++const SEGMENT_RE = /^(?:\.([A-Za-z_][A-Za-z0-9_]*)|\[(\d+)\])/;
++
++function parsePath(path: string): Array<string | number> {
++  if (!path.startsWith('.')) {
++    throw new LoadError(`bad expression path ${JSON.stringify(path)}`);
++  }
++  if (path === '.') return [];
++  let rest = path;
++  const segments: Array<string | number> = [];
++  while (rest !== '') {
++    const m = SEGMENT_RE.exec(rest);
++    if (!m) {
++      throw new LoadError(`bad expression path ${JSON.stringify(path)}`);
++    }
++    segments.push(m[1] !== undefined ? m[1] : Number(m[2]));
++    rest = rest.slice(m[0].length);
++  }
++  return segments;
++}
++
++function drill(value: Json, segments: Array<string | number>): Json {
++  let current: Json = value;
++  for (const seg of segments) {
++    if (typeof seg === 'number') {
++      if (!Array.isArray(current) || seg >= current.length) return undefined;
++      current = current[seg];
++    } else {
++      if (!isPlainObject(current) || !(seg in current)) return undefined;
++      current = current[seg];
++    }
++  }
++  return current;
++}
++
++function resolve(chain: Scope[], path: string): Json {
++  const segments = parsePath(path);
++  if (segments.length === 0) {
++    // ${ . } — the whole visible view: outer scopes shadowed by inner ones.
++    const merged: Scope = {};
++    for (const scope of chain) Object.assign(merged, scope);
++    return merged;
++  }
++  const first = segments[0];
++  if (typeof first === 'number') {
++    return undefined; // the view is always a map; indexing it is absent
++  }
++  for (let i = chain.length - 1; i >= 0; i--) {
++    if (first in chain[i]) {
++      return drill(chain[i][first], segments.slice(1));
++    }
++  }
++  return undefined;
++}
++
++function evaluate(value: Json, chain: Scope[]): Json {
++  if (typeof value === 'string') {
++    const m = SINGLE_EXPR_RE.exec(value);
++    if (m) return resolve(chain, m[1]);
++    return value; // literals only — mixed-text splicing is the data-flow layer
++  }
++  if (Array.isArray(value)) {
++    return value.map((v) => evaluate(v, chain));
++  }
++  if (isPlainObject(value)) {
++    const out: Scope = {};
++    for (const [k, v] of Object.entries(value)) {
++      out[k] = evaluate(v, chain);
++    }
++    return out;
++  }
++  return value;
++}
++
++// ---------------------------------------------------------------- execution
++
++class EndSignal {
++  // Thrown to unwind every enclosing loop when a task says `then: end`.
++}
++
++function runTasks(tasks: Task[], chain: Scope[], results: Scope,
++                  options: RunOptions): void {
++  for (const task of tasks) {
++    switch (task.kind) {
++      case 'set': {
++        results[task.name] = evaluate(task.set!, chain);
++        break;
++      }
++      case 'call': {
++        const handler = (options.handlers ?? {})[task.call!];
++        if (typeof handler !== 'function') {
++          throw new Error(`unknown handler "${task.call}"`);
++        }
++        results[task.name] = handler(evaluate(task.with!, chain) as Args);
++        break;
++      }
++      case 'wait': {
++        if (!options.clock) {
++          throw new Error(`task "${task.name}": wait needs an injected ` +
++                          'clock and none was configured');
++        }
++        options.clock.advance(task.waitMs!);
++        break;
++      }
++      case 'for': {
++        const spec = task.forSpec!;
++        const value = evaluate(spec.inExpr, chain);
++        if (!Array.isArray(value)) {
++          throw new TypeError(`task "${task.name}": for.in must evaluate ` +
++                              `to an array, got ${typeof value}`);
++        }
++        const records: Scope[] = [];
++        // Recorded up front so partial iterations stay visible if a body
++        // task ends the workflow mid-loop.
++        results[task.name] = records;
++        for (let i = 0; i < value.length; i++) {
++          const loopVars: Scope = { [spec.each]: value[i] };
++          if (spec.at !== null) loopVars[spec.at] = i;
++          const record: Scope = {};
++          records.push(record);
++          runTasks(spec.body, [...chain, loopVars, record], record, options);
++        }
++        break;
++      }
++    }
++    if (task.then === 'end') {
++      throw new EndSignal();
++    }
++  }
++}
++
++// -------------------------------------------------------------------- entry
++
++export function runWorkflow(source: string,
++                            options: RunOptions = {}): RunResult {
++  const tasks = loadWorkflow(source);
++  const context: Scope = { input: options.input ?? {} };
++  try {
++    runTasks(tasks, [context], context, options);
++  } catch (err) {
++    if (!(err instanceof EndSignal)) throw err;
++  }
++  return { status: 'completed', context };
++}

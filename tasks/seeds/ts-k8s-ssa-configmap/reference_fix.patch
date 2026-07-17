@@ -1,0 +1,232 @@
+diff --git a/client.ts b/client.ts
+new file mode 100644
+index 0000000..327db81
+--- /dev/null
++++ b/client.ts
+@@ -0,0 +1,125 @@
++// Thin Kubernetes client for ConfigMap reads and server-side apply.
++// Speaks the documented contract: PATCH with application/apply-patch+yaml,
++// fieldManager (+ optional force) on the query string, Status error bodies.
++
++export class KubeApiError extends Error {
++  code: number;
++  reason: string;
++
++  constructor(code: number, reason: string, message: string) {
++    super(`kubernetes API error ${code} ${reason}: ${message}`);
++    this.code = code;
++    this.reason = reason;
++  }
++}
++
++export interface FieldConflict {
++  field: string;
++  manager: string;
++}
++
++export class FieldConflictError extends KubeApiError {
++  conflicts: FieldConflict[];
++
++  constructor(code: number, reason: string, message: string, conflicts: FieldConflict[]) {
++    super(code, reason, message);
++    this.conflicts = conflicts;
++  }
++}
++
++export interface ApplyOptions {
++  fieldManager: string;
++  force?: boolean;
++}
++
++export interface ApplyResult {
++  object: any;
++  created: boolean;
++}
++
++function conflictsFrom(status: any): FieldConflict[] {
++  const causes: any[] = status?.details?.causes ?? [];
++  const out: FieldConflict[] = [];
++  for (const cause of causes) {
++    if (cause?.reason !== 'FieldManagerConflict') continue;
++    const match = /conflict with "([^"]+)"/.exec(String(cause.message ?? ''));
++    out.push({ field: String(cause.field ?? ''), manager: match ? match[1] : '' });
++  }
++  return out;
++}
++
++export class KubeClient {
++  private baseUrl: string;
++  private token: string;
++
++  constructor(baseUrl: string, token: string) {
++    this.baseUrl = baseUrl.replace(/\/+$/, '');
++    this.token = token;
++  }
++
++  private configMapUrl(namespace: string, name: string): string {
++    return `${this.baseUrl}/api/v1/namespaces/${encodeURIComponent(namespace)}` +
++      `/configmaps/${encodeURIComponent(name)}`;
++  }
++
++  private async raise(res: Response): Promise<never> {
++    let status: any = {};
++    try {
++      status = await res.json();
++    } catch {
++      status = {};
++    }
++    const code = typeof status.code === 'number' ? status.code : res.status;
++    const reason = status.reason ?? 'Unknown';
++    const message = status.message ?? '(no Status body)';
++    const conflicts = conflictsFrom(status);
++    if (res.status === 409 && conflicts.length > 0) {
++      throw new FieldConflictError(code, reason, message, conflicts);
++    }
++    throw new KubeApiError(code, reason, message);
++  }
++
++  private checkRedirect(res: Response): void {
++    if (res.status >= 300 && res.status < 400) {
++      throw new KubeApiError(res.status, 'Redirect',
++        'refusing to follow a redirect issued by the API server');
++    }
++  }
++
++  async getConfigMap(namespace: string, name: string): Promise<any | null> {
++    const res = await fetch(this.configMapUrl(namespace, name), {
++      method: 'GET',
++      redirect: 'manual',
++      headers: {
++        Authorization: `Bearer ${this.token}`,
++        Accept: 'application/json',
++      },
++    });
++    this.checkRedirect(res);
++    if (res.status === 404) {
++      await res.arrayBuffer();
++      return null;
++    }
++    if (!res.ok) await this.raise(res);
++    return res.json();
++  }
++
++  async applyConfigMap(namespace: string, name: string, yamlBody: string,
++    opts: ApplyOptions): Promise<ApplyResult> {
++    let query = `fieldManager=${encodeURIComponent(opts.fieldManager)}`;
++    if (opts.force) query += '&force=true';
++    const res = await fetch(`${this.configMapUrl(namespace, name)}?${query}`, {
++      method: 'PATCH',
++      redirect: 'manual',
++      headers: {
++        Authorization: `Bearer ${this.token}`,
++        Accept: 'application/json',
++        'Content-Type': 'application/apply-patch+yaml',
++      },
++      body: yamlBody,
++    });
++    this.checkRedirect(res);
++    if (!res.ok) await this.raise(res);
++    return { object: await res.json(), created: res.status === 201 };
++  }
++}
+diff --git a/reconciler.ts b/reconciler.ts
+new file mode 100644
+index 0000000..1a076ee
+--- /dev/null
++++ b/reconciler.ts
+@@ -0,0 +1,43 @@
++// ConfigMap reconciler: read, compare the desired projection, apply only
++// when something we own actually differs, and surface apply conflicts.
++
++import { FieldConflictError, KubeClient } from './client.ts';
++import type { ApplyOptions, FieldConflict } from './client.ts';
++import { applyYaml } from './yaml.ts';
++import type { DesiredConfigMap } from './yaml.ts';
++
++export interface Outcome {
++  action: 'unchanged' | 'configured' | 'created' | 'conflict';
++  object?: any;
++  conflicts?: FieldConflict[];
++}
++
++function projectionSatisfied(current: any, desired: DesiredConfigMap): boolean {
++  const data = current?.data ?? {};
++  for (const [key, value] of Object.entries(desired.data)) {
++    if (data[key] !== value) return false;
++  }
++  const labels = current?.metadata?.labels ?? {};
++  for (const [key, value] of Object.entries(desired.labels ?? {})) {
++    if (labels[key] !== value) return false;
++  }
++  return true;
++}
++
++export async function reconcileConfigMap(client: KubeClient, desired: DesiredConfigMap,
++  opts: ApplyOptions): Promise<Outcome> {
++  const current = await client.getConfigMap(desired.namespace, desired.name);
++  if (current !== null && projectionSatisfied(current, desired)) {
++    return { action: 'unchanged' };
++  }
++  try {
++    const { object, created } = await client.applyConfigMap(
++      desired.namespace, desired.name, applyYaml(desired), opts);
++    return { action: created ? 'created' : 'configured', object };
++  } catch (err) {
++    if (err instanceof FieldConflictError && !opts.force) {
++      return { action: 'conflict', conflicts: err.conflicts };
++    }
++    throw err;
++  }
++}
+diff --git a/yaml.ts b/yaml.ts
+new file mode 100644
+index 0000000..ba33509
+--- /dev/null
++++ b/yaml.ts
+@@ -0,0 +1,46 @@
++// Renders the server-side-apply configuration for a ConfigMap.
++// Deterministic on purpose: sorted keys, JSON-style double quoting, so the
++// projection is byte-stable and YAML cannot retype values like "true"/"007".
++
++export interface DesiredConfigMap {
++  namespace: string;
++  name: string;
++  labels?: Record<string, string>;
++  data: Record<string, string>;
++}
++
++const DATA_KEY = /^[A-Za-z0-9._-]+$/;
++
++function quoted(value: string): string {
++  return JSON.stringify(value);
++}
++
++export function applyYaml(desired: DesiredConfigMap): string {
++  const lines: string[] = [
++    'apiVersion: v1',
++    'kind: ConfigMap',
++    'metadata:',
++    `  name: ${desired.name}`,
++    `  namespace: ${desired.namespace}`,
++  ];
++  const labels = desired.labels ?? {};
++  const labelKeys = Object.keys(labels).sort();
++  if (labelKeys.length > 0) {
++    lines.push('  labels:');
++    for (const key of labelKeys) lines.push(`    ${key}: ${quoted(labels[key])}`);
++  }
++  const dataKeys = Object.keys(desired.data).sort();
++  for (const key of dataKeys) {
++    if (!DATA_KEY.test(key)) {
++      throw new Error(`invalid ConfigMap data key ${JSON.stringify(key)}: ` +
++        'keys must consist of alphanumerics, "-", "_" or "."');
++    }
++  }
++  if (dataKeys.length === 0) {
++    lines.push('data: {}');
++  } else {
++    lines.push('data:');
++    for (const key of dataKeys) lines.push(`  ${key}: ${quoted(desired.data[key])}`);
++  }
++  return lines.join('\n') + '\n';
++}

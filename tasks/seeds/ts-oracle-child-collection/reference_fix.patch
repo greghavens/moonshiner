@@ -1,0 +1,291 @@
+diff --git a/hcm/checkpoint.ts b/hcm/checkpoint.ts
+new file mode 100644
+index 0000000..aafd16c
+--- /dev/null
++++ b/hcm/checkpoint.ts
+@@ -0,0 +1,52 @@
++// Durable walk checkpoints: one JSON file mapping walk key -> state.
++// Writes go through a temp file + rename so a crash never leaves a
++// half-written checkpoint behind.
++
++import fs from "node:fs";
++import path from "node:path";
++
++export interface CheckpointState {
++  offset: number;
++  seenIds: number[];
++}
++
++export class FileCheckpointStore {
++  private file: string;
++
++  constructor(file: string) {
++    this.file = file;
++  }
++
++  private readAll(): Record<string, CheckpointState> {
++    try {
++      return JSON.parse(fs.readFileSync(this.file, "utf8"));
++    } catch {
++      return {};
++    }
++  }
++
++  private writeAll(all: Record<string, CheckpointState>): void {
++    fs.mkdirSync(path.dirname(this.file), { recursive: true });
++    const tmp = `${this.file}.tmp`;
++    fs.writeFileSync(tmp, JSON.stringify(all, null, 2));
++    fs.renameSync(tmp, this.file);
++  }
++
++  load(key: string): CheckpointState | null {
++    return this.readAll()[key] ?? null;
++  }
++
++  save(key: string, state: CheckpointState): void {
++    const all = this.readAll();
++    all[key] = state;
++    this.writeAll(all);
++  }
++
++  clear(key: string): void {
++    const all = this.readAll();
++    if (key in all) {
++      delete all[key];
++      this.writeAll(all);
++    }
++  }
++}
+diff --git a/hcm/client.ts b/hcm/client.ts
+new file mode 100644
+index 0000000..3454dc8
+--- /dev/null
++++ b/hcm/client.ts
+@@ -0,0 +1,73 @@
++// Authenticated transport for the Fusion HCM REST resources. Every request
++// carries basic auth, REST-Framework-Version 4, and Accept: application/json.
++// Non-2xx replies surface as OraclePageError preserving the complete
++// application/vnd.oracle.adf.error+json document; credentials never enter
++// error text.
++
++export interface OracleErrorDetail {
++  detail: string;
++  errorCode: string;
++  errorPath: string;
++}
++
++export class OraclePageError extends Error {
++  httpStatus: number;
++  title: string;
++  errorStatus: string;
++  details: OracleErrorDetail[];
++
++  constructor(httpStatus: number, title: string, errorStatus: string, details: OracleErrorDetail[]) {
++    const first = details.length > 0 ? ` [${details[0].errorCode}] ${details[0].detail}` : "";
++    super(`Oracle HCM request failed (HTTP ${httpStatus}): ${title}${first}`);
++    this.name = "OraclePageError";
++    this.httpStatus = httpStatus;
++    this.title = title;
++    this.errorStatus = errorStatus;
++    this.details = details;
++  }
++
++  static fromBody(httpStatus: number, body: string): OraclePageError {
++    let title = `HTTP ${httpStatus}`;
++    let errorStatus = String(httpStatus);
++    const details: OracleErrorDetail[] = [];
++    try {
++      const doc = JSON.parse(body);
++      if (typeof doc.title === "string") title = doc.title;
++      if (typeof doc.status === "string") errorStatus = doc.status;
++      for (const entry of doc["o:errorDetails"] ?? []) {
++        details.push({
++          detail: String(entry.detail ?? ""),
++          errorCode: String(entry["o:errorCode"] ?? ""),
++          errorPath: String(entry["o:errorPath"] ?? ""),
++        });
++      }
++    } catch {
++      details.push({ detail: body, errorCode: "", errorPath: "" });
++    }
++    return new OraclePageError(httpStatus, title, errorStatus, details);
++  }
++}
++
++export class HcmClient {
++  private origin: string;
++  private authorization: string;
++
++  constructor(origin: string, user: string, password: string) {
++    this.origin = origin.replace(/\/+$/, "");
++    this.authorization = "Basic " + Buffer.from(`${user}:${password}`).toString("base64");
++  }
++
++  async getCollection(path: string, queryString: string): Promise<any> {
++    const url = this.origin + path + (queryString ? `?${queryString}` : "");
++    const response = await fetch(url, {
++      headers: {
++        Authorization: this.authorization,
++        "REST-Framework-Version": "4",
++        Accept: "application/json",
++      },
++    });
++    const text = await response.text();
++    if (!response.ok) throw OraclePageError.fromBody(response.status, text);
++    return JSON.parse(text);
++  }
++}
+diff --git a/hcm/query.ts b/hcm/query.ts
+new file mode 100644
+index 0000000..e4102e7
+--- /dev/null
++++ b/hcm/query.ts
+@@ -0,0 +1,55 @@
++// Query serialization for Fusion HCM child collections.
++//
++// Emission order: finder, q, fields, onlyData, orderBy, totalResults, limit,
++// offset. finder keeps ';' and ',' literal with variable values
++// percent-encoded; q joins its expressions with ';' and percent-encodes the
++// joined value ('=' -> %3D, ';' -> %3B). Single quotes are pre-encoded to
++// %27 — WHATWG URL query normalization would otherwise rewrite them on the
++// wire and the request line would no longer match what we built. finder and
++// q are independent parameters and may be combined in one request.
++
++export interface FinderSpec {
++  name: string;
++  vars?: Record<string, string | number | boolean>;
++}
++
++export interface ChildQueryOpts {
++  finder?: FinderSpec;
++  q?: string[];
++  fields?: string[];
++  onlyData?: boolean;
++  orderBy?: string;
++  totalResults?: boolean;
++  limit?: number;
++  offset?: number;
++}
++
++function enc(value: string): string {
++  return encodeURIComponent(value).replace(/'/g, "%27");
++}
++
++export function buildChildQuery(opts: ChildQueryOpts): string {
++  const parts: string[] = [];
++  if (opts.finder) {
++    let finder = opts.finder.name;
++    const entries = Object.entries(opts.finder.vars ?? {});
++    if (entries.length > 0) {
++      finder += ";" + entries
++        .map(([name, value]) => `${name}=${enc(String(value))}`)
++        .join(",");
++    }
++    parts.push(`finder=${finder}`);
++  }
++  if (opts.q && opts.q.length > 0) {
++    parts.push(`q=${enc(opts.q.join(";"))}`);
++  }
++  if (opts.fields && opts.fields.length > 0) {
++    parts.push(`fields=${opts.fields.join(",")}`);
++  }
++  if (opts.onlyData) parts.push("onlyData=true");
++  if (opts.orderBy) parts.push(`orderBy=${opts.orderBy}`);
++  if (opts.totalResults) parts.push("totalResults=true");
++  if (opts.limit !== undefined) parts.push(`limit=${opts.limit}`);
++  if (opts.offset !== undefined) parts.push(`offset=${opts.offset}`);
++  return parts.join("&");
++}
+diff --git a/hcm/walker.ts b/hcm/walker.ts
+new file mode 100644
+index 0000000..3e5a5a0
+--- /dev/null
++++ b/hcm/walker.ts
+@@ -0,0 +1,87 @@
++// Child-collection walker: pages a Fusion HCM child collection by offset,
++// driven strictly by what the server returns (count/hasMore/limit — this
++// pod clamps requested limits), deduplicates rows by PeriodOfServiceId
++// because offset paging over a mutating collection gives no stable totals,
++// normalizes item links to path-only hrefs, and checkpoints durably so a
++// failed page can be resumed without re-emitting delivered rows.
++
++import { buildChildQuery, type ChildQueryOpts } from "./query.ts";
++import { HcmClient } from "./client.ts";
++import { FileCheckpointStore } from "./checkpoint.ts";
++
++export interface NormalizedItem {
++  id: number;
++  data: Record<string, unknown>;
++  self: string | null;
++  canonical: string | null;
++}
++
++export interface WalkResult {
++  items: NormalizedItem[];
++  pages: number;
++  duplicatesSkipped: number;
++  resumedFromOffset: number | null;
++  estimatedTotalResults: number | null;
++}
++
++export interface WalkOpts {
++  path: string;
++  query: Omit<ChildQueryOpts, "offset">;
++  store: FileCheckpointStore;
++}
++
++function linkPath(links: any[] | undefined, rel: string): string | null {
++  const link = (links ?? []).find((l) => l.rel === rel);
++  if (!link || typeof link.href !== "string") return null;
++  return new URL(link.href).pathname;
++}
++
++export async function walkChildCollection(client: HcmClient, opts: WalkOpts): Promise<WalkResult> {
++  const baseQuery = buildChildQuery({ ...opts.query });
++  const key = `${opts.path}?${baseQuery}`;
++
++  const existing = opts.store.load(key);
++  let offset = existing?.offset ?? 0;
++  const seen = new Set<number>(existing?.seenIds ?? []);
++  const resumedFromOffset = existing ? existing.offset : null;
++
++  const items: NormalizedItem[] = [];
++  let pages = 0;
++  let duplicatesSkipped = 0;
++  let estimatedTotalResults: number | null = null;
++
++  for (;;) {
++    const queryString = buildChildQuery({ ...opts.query, offset });
++    let page: any;
++    try {
++      page = await client.getCollection(opts.path, queryString);
++    } catch (err) {
++      opts.store.save(key, { offset, seenIds: [...seen] });
++      throw err;
++    }
++    pages += 1;
++    if (estimatedTotalResults === null && typeof page.totalResults === "number") {
++      estimatedTotalResults = page.totalResults;
++    }
++    for (const raw of page.items ?? []) {
++      const id = raw.PeriodOfServiceId as number;
++      if (seen.has(id)) {
++        duplicatesSkipped += 1;
++        continue;
++      }
++      seen.add(id);
++      const { links, ...data } = raw;
++      items.push({
++        id,
++        data,
++        self: linkPath(links, "self"),
++        canonical: linkPath(links, "canonical"),
++      });
++    }
++    if (!page.hasMore) break;
++    offset += page.count; // the server's count/limit are authoritative, never the requested limit
++  }
++
++  opts.store.clear(key);
++  return { items, pages, duplicatesSkipped, resumedFromOffset, estimatedTotalResults };
++}

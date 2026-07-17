@@ -1,0 +1,301 @@
+diff --git a/HcmActionClient.cs b/HcmActionClient.cs
+new file mode 100644
+index 0000000..6b276e7
+--- /dev/null
++++ b/HcmActionClient.cs
+@@ -0,0 +1,163 @@
++using System.Text;
++using System.Text.Json;
++
++namespace OracleHcm;
++
++/// <summary>
++/// Cancel-work-relationship workflow against Oracle Fusion Cloud HCM REST
++/// (resource version 11.13.18.05, framework version 4). IDs are resolved
++/// from the documented collections — workersUniqID comes from the worker
++/// item's self link — and the cancelWorkRelationship custom action is
++/// posted with the vendor action media type. A 200 actionresult completes
++/// synchronously; a 202 is followed by polling the Location header verbatim
++/// (it carries tenant query state) until the canceled row answers 404.
++/// </summary>
++public sealed class HcmActionClient
++{
++    private const string ActionMediaType = "application/vnd.oracle.adf.action+json";
++
++    private readonly HttpClient _http;
++    private readonly string _baseUrl;
++    private readonly string _authorization;
++    private readonly int _maxStatusPolls;
++
++    public HcmActionClient(HttpClient http, string baseUrl, string user, string password,
++        int maxStatusPolls = 5)
++    {
++        _http = http;
++        _baseUrl = baseUrl.TrimEnd('/');
++        _authorization = "Basic " + Convert.ToBase64String(Encoding.UTF8.GetBytes($"{user}:{password}"));
++        _maxStatusPolls = maxStatusPolls;
++    }
++
++    private async Task<HttpResponseMessage> SendAsync(HttpMethod method, Uri uri, HttpContent? content = null)
++    {
++        using var request = new HttpRequestMessage(method, uri) { Content = content };
++        request.Headers.TryAddWithoutValidation("Authorization", _authorization);
++        request.Headers.TryAddWithoutValidation("REST-Framework-Version", "4");
++        request.Headers.TryAddWithoutValidation("Accept", "application/json");
++        return await _http.SendAsync(request);
++    }
++
++    private static string Quoted(string value) => Uri.EscapeDataString($"'{value}'");
++
++    public async Task<WorkerRef> ResolveWorkerAsync(string personNumber)
++    {
++        var uri = new Uri($"{_baseUrl}/workers?q=PersonNumber={Quoted(personNumber)}"
++                          + "&fields=PersonId,PersonNumber&limit=2");
++        using var response = await SendAsync(HttpMethod.Get, uri);
++        var body = await response.Content.ReadAsStringAsync();
++        if ((int)response.StatusCode / 100 != 2)
++            throw OracleRestException.FromBody((int)response.StatusCode, body);
++
++        using var doc = JsonDocument.Parse(body);
++        var items = doc.RootElement.GetProperty("items");
++        if (items.GetArrayLength() == 0)
++            throw new InvalidOperationException($"no worker found for person number {personNumber}");
++        if (items.GetArrayLength() > 1)
++            throw new InvalidOperationException($"person number {personNumber} is ambiguous");
++
++        var item = items[0];
++        string? uniqId = null;
++        if (item.TryGetProperty("links", out var links))
++        {
++            foreach (var link in links.EnumerateArray())
++            {
++                if (link.GetProperty("rel").GetString() == "self")
++                {
++                    var href = link.GetProperty("href").GetString()!;
++                    uniqId = href[(href.LastIndexOf('/') + 1)..];
++                }
++            }
++        }
++        if (uniqId is null)
++            throw new InvalidOperationException(
++                $"worker {personNumber} has no self link to take workersUniqID from");
++        return new WorkerRef(
++            item.GetProperty("PersonId").GetInt64(),
++            item.GetProperty("PersonNumber").GetString()!,
++            uniqId);
++    }
++
++    public async Task<RelationshipRef> ResolveRelationshipAsync(WorkerRef worker, string legalEmployerName)
++    {
++        var uri = new Uri($"{_baseUrl}/workers/{worker.WorkersUniqId}/child/workRelationships"
++                          + $"?q=LegalEmployerName={Quoted(legalEmployerName)}"
++                          + "&fields=PeriodOfServiceId,LegalEmployerName,WorkerType&onlyData=true");
++        using var response = await SendAsync(HttpMethod.Get, uri);
++        var body = await response.Content.ReadAsStringAsync();
++        if ((int)response.StatusCode / 100 != 2)
++            throw OracleRestException.FromBody((int)response.StatusCode, body);
++
++        using var doc = JsonDocument.Parse(body);
++        var items = doc.RootElement.GetProperty("items");
++        if (items.GetArrayLength() == 0)
++            throw new InvalidOperationException(
++                $"worker {worker.PersonNumber} has no work relationship with {legalEmployerName}");
++        var item = items[0];
++        return new RelationshipRef(
++            worker,
++            item.GetProperty("PeriodOfServiceId").GetInt64(),
++            item.GetProperty("LegalEmployerName").GetString()!);
++    }
++
++    public async Task<CancelOutcome> CancelWorkRelationshipAsync(RelationshipRef rel,
++        string actionCode, string reasonCode)
++    {
++        var uri = new Uri($"{_baseUrl}/workers/{rel.Worker.WorkersUniqId}/child/workRelationships"
++                          + $"/{rel.PeriodOfServiceId}/action/cancelWorkRelationship");
++        var payload = JsonSerializer.Serialize(new Dictionary<string, string>
++        {
++            ["actionCode"] = actionCode,
++            ["reasonCode"] = reasonCode,
++        });
++        using var content = new StringContent(payload, Encoding.UTF8, ActionMediaType);
++        using var response = await SendAsync(HttpMethod.Post, uri, content);
++        var body = await response.Content.ReadAsStringAsync();
++        var status = (int)response.StatusCode;
++
++        switch (HcmStatusClassifier.Classify(status))
++        {
++            case HcmResponseKind.Ok:
++            case HcmResponseKind.Created:
++                return new CancelOutcome("sync", 0, ReadReturnValue(body), body);
++            case HcmResponseKind.Accepted:
++                var location = response.Headers.Location
++                    ?? throw new InvalidOperationException("202 reply carried no Location to poll");
++                return await PollUntilGoneAsync(location, body);
++            default:
++                throw OracleRestException.FromBody(status, body);
++        }
++    }
++
++    private async Task<CancelOutcome> PollUntilGoneAsync(Uri statusUrl, string acceptedBody)
++    {
++        for (int poll = 1; poll <= _maxStatusPolls; poll++)
++        {
++            using var response = await SendAsync(HttpMethod.Get, statusUrl);
++            var body = await response.Content.ReadAsStringAsync();
++            var status = (int)response.StatusCode;
++            if (status == 404)
++                return new CancelOutcome("async", poll, null, acceptedBody);
++            if (status / 100 == 2)
++                continue; // row still present — cancellation in flight
++            throw OracleRestException.FromBody(status, body);
++        }
++        throw new HcmAsyncTimeoutException(_maxStatusPolls, statusUrl.ToString());
++    }
++
++    private static string? ReadReturnValue(string body)
++    {
++        if (string.IsNullOrWhiteSpace(body)) return null;
++        try
++        {
++            using var doc = JsonDocument.Parse(body);
++            if (doc.RootElement.TryGetProperty("returnValue", out var rv))
++                return rv.ValueKind == JsonValueKind.String ? rv.GetString() : rv.GetRawText();
++        }
++        catch (JsonException)
++        {
++        }
++        return null;
++    }
++}
+diff --git a/HcmModels.cs b/HcmModels.cs
+new file mode 100644
+index 0000000..50992a7
+--- /dev/null
++++ b/HcmModels.cs
+@@ -0,0 +1,39 @@
++namespace OracleHcm;
++
++/// <summary>A worker resolved from the workers collection. WorkersUniqId is the
++/// hash key taken from the item's self link — never synthesized client-side.</summary>
++public sealed record WorkerRef(long PersonId, string PersonNumber, string WorkersUniqId);
++
++/// <summary>A work relationship resolved from the worker's child collection.</summary>
++public sealed record RelationshipRef(WorkerRef Worker, long PeriodOfServiceId, string LegalEmployerName);
++
++/// <summary>Outcome of a cancelWorkRelationship action. Mode is "sync" for a
++/// 200/actionresult reply and "async" for a 202 confirmed by status polling.
++/// RawResult retains the action reply body verbatim.</summary>
++public sealed record CancelOutcome(string Mode, int Polls, string? ReturnValue, string RawResult);
++
++/// <summary>Documented HCM REST status semantics.</summary>
++public enum HcmResponseKind
++{
++    Ok,
++    Created,
++    Accepted,
++    NoContent,
++    ClientError,
++    ServerError,
++}
++
++public static class HcmStatusClassifier
++{
++    public static HcmResponseKind Classify(int statusCode) => statusCode switch
++    {
++        200 => HcmResponseKind.Ok,
++        201 => HcmResponseKind.Created,
++        202 => HcmResponseKind.Accepted,
++        204 => HcmResponseKind.NoContent,
++        >= 400 and < 500 => HcmResponseKind.ClientError,
++        >= 500 and < 600 => HcmResponseKind.ServerError,
++        _ => throw new ArgumentOutOfRangeException(nameof(statusCode),
++            $"status {statusCode} is outside the documented HCM REST status set"),
++    };
++}
+diff --git a/OracleRestException.cs b/OracleRestException.cs
+new file mode 100644
+index 0000000..8c2e2b2
+--- /dev/null
++++ b/OracleRestException.cs
+@@ -0,0 +1,81 @@
++using System.Text.Json;
++
++namespace OracleHcm;
++
++/// <summary>One entry of a structured error document's o:errorDetails array.</summary>
++public sealed record OracleErrorEntry(string Detail, string ErrorCode, string ErrorPath);
++
++/// <summary>
++/// Non-2xx reply from the HCM REST framework. With REST-Framework-Version 4+
++/// the body is application/vnd.oracle.adf.error+json:
++/// { "title", "status" (string), "o:errorDetails": [{ "detail", "o:errorCode", "o:errorPath" }] }.
++/// The whole document is preserved; credentials never enter the message.
++/// </summary>
++public sealed class OracleRestException : Exception
++{
++    public int HttpStatus { get; }
++    public string Title { get; }
++    public string ErrorStatus { get; }
++    public IReadOnlyList<OracleErrorEntry> Details { get; }
++
++    public OracleRestException(int httpStatus, string title, string errorStatus,
++        IReadOnlyList<OracleErrorEntry> details)
++        : base(BuildMessage(httpStatus, title, details))
++    {
++        HttpStatus = httpStatus;
++        Title = title;
++        ErrorStatus = errorStatus;
++        Details = details;
++    }
++
++    private static string BuildMessage(int httpStatus, string title, IReadOnlyList<OracleErrorEntry> details)
++    {
++        var message = $"Oracle HCM request failed (HTTP {httpStatus}): {title}";
++        if (details.Count > 0)
++            message += $" [{details[0].ErrorCode}] {details[0].Detail}";
++        return message;
++    }
++
++    public static OracleRestException FromBody(int httpStatus, string body)
++    {
++        var title = $"HTTP {httpStatus}";
++        var errorStatus = httpStatus.ToString();
++        var details = new List<OracleErrorEntry>();
++        try
++        {
++            using var doc = JsonDocument.Parse(body);
++            var root = doc.RootElement;
++            if (root.TryGetProperty("title", out var t) && t.ValueKind == JsonValueKind.String)
++                title = t.GetString()!;
++            if (root.TryGetProperty("status", out var s) && s.ValueKind == JsonValueKind.String)
++                errorStatus = s.GetString()!;
++            if (root.TryGetProperty("o:errorDetails", out var arr) && arr.ValueKind == JsonValueKind.Array)
++            {
++                foreach (var entry in arr.EnumerateArray())
++                {
++                    details.Add(new OracleErrorEntry(
++                        entry.TryGetProperty("detail", out var d) ? d.GetString() ?? "" : "",
++                        entry.TryGetProperty("o:errorCode", out var c) ? c.GetString() ?? "" : "",
++                        entry.TryGetProperty("o:errorPath", out var p) ? p.GetString() ?? "" : ""));
++                }
++            }
++        }
++        catch (JsonException)
++        {
++            details.Add(new OracleErrorEntry(body, "", ""));
++        }
++        return new OracleRestException(httpStatus, title, errorStatus, details);
++    }
++}
++
++/// <summary>Raised when a 202-accepted action never resolves within the poll budget.</summary>
++public sealed class HcmAsyncTimeoutException : Exception
++{
++    public int Polls { get; }
++
++    public HcmAsyncTimeoutException(int polls, string statusUrl)
++        : base($"cancelWorkRelationship still in progress after {polls} status polls of {statusUrl}")
++    {
++        Polls = polls;
++    }
++}

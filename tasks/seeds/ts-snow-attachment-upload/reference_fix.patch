@@ -1,0 +1,317 @@
+diff --git a/attachment_client.ts b/attachment_client.ts
+new file mode 100644
+index 0000000..3f2e039
+--- /dev/null
++++ b/attachment_client.ts
+@@ -0,0 +1,228 @@
++// ServiceNow Attachment API client (zero-dependency, Node built-ins only).
++//
++// Contract per the current official Attachment API reference (see
++// docs/official_sources.json): multipart upload via POST
++// /api/now/attachment/upload (fields table_name/table_sys_id + file part
++// "uploadFile"), metadata listing via GET /api/now/attachment, retry and
++// ambiguity policy per docs/contract.json.
++
++import { buildMultipart } from './multipart.ts';
++import {
++  AttachmentVerificationError,
++  RateLimitError,
++  SnowApiError,
++} from './errors.ts';
++
++export { AttachmentVerificationError, RateLimitError, SnowApiError };
++
++export interface AttachmentRecord {
++  sysId: string;
++  fileName: string;
++  tableName: string;
++  tableSysId: string;
++  sizeBytes: number;
++  contentType: string;
++  downloadLink: string;
++}
++
++export interface UploadRequest {
++  tableName: string;
++  tableSysId: string;
++  fileName: string;
++  content: Uint8Array;
++  contentType: string;
++}
++
++export interface ClientOptions {
++  instanceUrl: string;
++  username: string;
++  password: string;
++  delay?: (ms: number) => Promise<void>;
++  maxRetries?: number;
++}
++
++const UPLOAD_PATH = '/api/now/attachment/upload';
++const LIST_PATH = '/api/now/attachment';
++
++interface RawMeta {
++  sys_id: string;
++  file_name: string;
++  table_name: string;
++  table_sys_id: string;
++  size_bytes: string;
++  content_type: string;
++  download_link: string;
++}
++
++function mapRecord(raw: RawMeta): AttachmentRecord {
++  return {
++    sysId: raw.sys_id,
++    fileName: raw.file_name,
++    tableName: raw.table_name,
++    tableSysId: raw.table_sys_id,
++    sizeBytes: Number(raw.size_bytes),
++    contentType: raw.content_type,
++    downloadLink: raw.download_link,
++  };
++}
++
++const defaultDelay = (ms: number) =>
++  new Promise<void>((resolve) => setTimeout(resolve, ms));
++
++export class AttachmentClient {
++  private readonly baseUrl: string;
++  private readonly authHeader: string;
++  private readonly delay: (ms: number) => Promise<void>;
++  private readonly maxRetries: number;
++
++  constructor(options: ClientOptions) {
++    this.baseUrl = options.instanceUrl.replace(/\/+$/, '');
++    this.authHeader = 'Basic ' + Buffer.from(
++      `${options.username}:${options.password}`).toString('base64');
++    this.delay = options.delay ?? defaultDelay;
++    this.maxRetries = options.maxRetries ?? 3;
++  }
++
++  async upload(req: UploadRequest): Promise<AttachmentRecord> {
++    const existing = await this.findByCorrelation(req);
++    if (existing) return existing;
++
++    let retries = 0;
++    for (;;) {
++      let response: Response | null = null;
++      try {
++        response = await this.postMultipart(req);
++      } catch {
++        response = null; // transport error after the body left us: ambiguous
++      }
++
++      if (response && response.status === 201) {
++        const payload = await response.json() as { result: RawMeta };
++        return this.verified(req, mapRecord(payload.result));
++      }
++
++      if (response && response.status === 429) {
++        const retryAfter = parseInt(response.headers.get('Retry-After') ?? '1', 10) || 1;
++        const { message, detail } = await readEnvelope(response);
++        if (retries >= this.maxRetries) {
++          throw new RateLimitError(429, message, detail, retryAfter);
++        }
++        retries += 1;
++        await this.delay(retryAfter * 1000);
++        continue; // rejected before processing: direct retry, no re-query
++      }
++
++      if (response && response.status >= 400 && response.status < 500) {
++        const { message, detail } = await readEnvelope(response);
++        throw new SnowApiError(response.status, message, detail);
++      }
++
++      // 5xx or transport failure: the instance may have stored the
++      // attachment before failing. Re-query the correlation key and only
++      // re-POST when it is genuinely absent.
++      const recovered = await this.findByCorrelation(req);
++      if (recovered) return recovered;
++      if (retries >= this.maxRetries) {
++        const status = response ? response.status : 0;
++        const { message, detail } = response
++          ? await readEnvelope(response)
++          : { message: 'transport failure', detail: '' };
++        throw new SnowApiError(status, message, detail);
++      }
++      retries += 1;
++    }
++  }
++
++  async list(tableName: string, tableSysId: string): Promise<AttachmentRecord[]> {
++    const query = `table_name=${tableName}^table_sys_id=${tableSysId}`;
++    const raw = await this.getList(query);
++    return raw.map(mapRecord)
++      .sort((a, b) => a.fileName < b.fileName ? -1 : a.fileName > b.fileName ? 1 : 0);
++  }
++
++  // -- internals -------------------------------------------------------
++
++  private async findByCorrelation(req: UploadRequest): Promise<AttachmentRecord | null> {
++    const query = `table_name=${req.tableName}` +
++      `^table_sys_id=${req.tableSysId}^file_name=${req.fileName}`;
++    const raw = await this.getList(query);
++    if (raw.length === 0) return null;
++    const record = mapRecord(raw[0]);
++    return this.verified(req, record);
++  }
++
++  private verified(req: UploadRequest, record: AttachmentRecord): AttachmentRecord {
++    if (record.fileName !== req.fileName ||
++        record.tableName !== req.tableName ||
++        record.tableSysId !== req.tableSysId ||
++        record.sizeBytes !== req.content.byteLength) {
++      throw new AttachmentVerificationError(
++        `attachment metadata mismatch for ${req.fileName}: ` +
++        `size_bytes=${record.sizeBytes} expected=${req.content.byteLength}`);
++    }
++    return record;
++  }
++
++  private async postMultipart(req: UploadRequest): Promise<Response> {
++    const { body, contentType } = buildMultipart(
++      { table_name: req.tableName, table_sys_id: req.tableSysId },
++      {
++        name: 'uploadFile',
++        filename: req.fileName,
++        contentType: req.contentType,
++        content: req.content,
++      });
++    return fetch(this.baseUrl + UPLOAD_PATH, {
++      method: 'POST',
++      headers: {
++        Accept: 'application/json',
++        Authorization: this.authHeader,
++        'Content-Type': contentType,
++      },
++      body,
++      redirect: 'manual',
++    });
++  }
++
++  private async getList(query: string): Promise<RawMeta[]> {
++    const url = `${this.baseUrl}${LIST_PATH}?` +
++      new URLSearchParams({ sysparm_query: query }).toString();
++    let retries = 0;
++    for (;;) {
++      const response = await fetch(url, {
++        headers: { Accept: 'application/json', Authorization: this.authHeader },
++        redirect: 'manual',
++      });
++      if (response.status === 200) {
++        const payload = await response.json() as { result: RawMeta[] };
++        return payload.result;
++      }
++      if (response.status === 429 && retries < this.maxRetries) {
++        const retryAfter = parseInt(response.headers.get('Retry-After') ?? '1', 10) || 1;
++        retries += 1;
++        await this.delay(retryAfter * 1000);
++        continue;
++      }
++      const { message, detail } = await readEnvelope(response);
++      if (response.status === 429) {
++        const retryAfter = parseInt(response.headers.get('Retry-After') ?? '1', 10) || 1;
++        throw new RateLimitError(429, message, detail, retryAfter);
++      }
++      throw new SnowApiError(response.status, message, detail);
++    }
++  }
++}
++
++async function readEnvelope(response: Response): Promise<{ message: string; detail: string }> {
++  try {
++    const body = await response.json() as {
++      error?: { message?: string; detail?: string };
++    };
++    return {
++      message: body.error?.message ?? `HTTP ${response.status}`,
++      detail: body.error?.detail ?? '',
++    };
++  } catch {
++    return { message: `HTTP ${response.status}`, detail: '' };
++  }
++}
+diff --git a/errors.ts b/errors.ts
+new file mode 100644
+index 0000000..5b2d73e
+--- /dev/null
++++ b/errors.ts
+@@ -0,0 +1,32 @@
++// Errors surfaced by the attachment client. Exception text must never
++// contain credentials — only status/message/detail from ServiceNow's
++// {"error": {"message", "detail"}, "status": "failure"} envelope.
++
++export class SnowApiError extends Error {
++  readonly statusCode: number;
++  readonly detail: string;
++
++  constructor(statusCode: number, message: string, detail = '') {
++    super(message);
++    this.name = 'SnowApiError';
++    this.statusCode = statusCode;
++    this.detail = detail;
++  }
++}
++
++export class RateLimitError extends SnowApiError {
++  readonly retryAfter: number;
++
++  constructor(statusCode: number, message: string, detail: string, retryAfter: number) {
++    super(statusCode, message, detail);
++    this.name = 'RateLimitError';
++    this.retryAfter = retryAfter;
++  }
++}
++
++export class AttachmentVerificationError extends Error {
++  constructor(message: string) {
++    super(message);
++    this.name = 'AttachmentVerificationError';
++  }
++}
+diff --git a/multipart.ts b/multipart.ts
+new file mode 100644
+index 0000000..f77a9f5
+--- /dev/null
++++ b/multipart.ts
+@@ -0,0 +1,39 @@
++// Manual multipart/form-data assembly for the Attachment API upload
++// operation. Built byte-wise so binary payloads (CRLFs, boundary-looking
++// runs) survive untouched.
++
++import { randomUUID } from 'node:crypto';
++
++export interface FilePart {
++  name: string;
++  filename: string;
++  contentType: string;
++  content: Uint8Array;
++}
++
++const CRLF = '\r\n';
++
++export function buildMultipart(
++  fields: Record<string, string>,
++  file: FilePart,
++): { body: Uint8Array; contentType: string } {
++  const boundary = `snow-upload-${randomUUID()}`;
++  const chunks: Uint8Array[] = [];
++  const push = (s: string) => chunks.push(Buffer.from(s, 'utf8'));
++
++  for (const [name, value] of Object.entries(fields)) {
++    push(`--${boundary}${CRLF}`);
++    push(`Content-Disposition: form-data; name="${name}"${CRLF}${CRLF}`);
++    push(`${value}${CRLF}`);
++  }
++  push(`--${boundary}${CRLF}`);
++  push(`Content-Disposition: form-data; name="${file.name}"; filename="${file.filename}"${CRLF}`);
++  push(`Content-Type: ${file.contentType}${CRLF}${CRLF}`);
++  chunks.push(file.content);
++  push(`${CRLF}--${boundary}--${CRLF}`);
++
++  return {
++    body: Buffer.concat(chunks),
++    contentType: `multipart/form-data; boundary=${boundary}`,
++  };
++}

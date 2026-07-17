@@ -1,0 +1,174 @@
+diff --git a/sap/monitor.ts b/sap/monitor.ts
+new file mode 100644
+index 0000000..36c357d
+--- /dev/null
++++ b/sap/monitor.ts
+@@ -0,0 +1,168 @@
++// Message-processing-log monitor on top of the Cloud Integration OData API v2.
++// Query serialization, __next paging, /Date(ms)/ normalization, deferred
++// error-information reads, and the two documented authorization failures.
++
++import { CpiClient, CpiError } from "./client.ts";
++
++export class MonitorError extends Error {}
++
++export class AuthorizationError extends Error {
++  readonly status: number;
++  readonly kind: "unauthorized" | "forbidden";
++  readonly code: string | null;
++
++  constructor(status: number, kind: "unauthorized" | "forbidden", code: string | null, detail: string) {
++    super(`SAP Cloud Integration authorization failure (HTTP ${status}, ${kind})${detail ? ": " + detail : ""}`);
++    this.status = status;
++    this.kind = kind;
++    this.code = code;
++  }
++}
++
++// The documented message statuses (Message Status, SAP Cloud Integration docs).
++const DOCUMENTED_STATUSES = new Set([
++  "COMPLETED",
++  "PROCESSING",
++  "RETRY",
++  "ESCALATED",
++  "FAILED",
++  "CANCELLED",
++  "DISCARDED",
++  "ABANDONED",
++]);
++
++export interface LogQueryOptions {
++  status?: string;
++  customStatus?: string;
++  integrationFlowName?: string;
++  logStartAfter?: string;
++  logEndBefore?: string;
++  orderBy?: { field: string; desc?: boolean };
++  top?: number;
++  skip?: number;
++  countAll?: boolean;
++}
++
++export interface NormalizedLog {
++  messageGuid: string;
++  correlationId: string | null;
++  flowName: string | null;
++  status: string;
++  customStatus: string | null;
++  logStart: string | null;
++  logEnd: string | null;
++  sender: string | null;
++  receiver: string | null;
++}
++
++/**
++ * The API does not parse zone information in datetime literals — every
++ * literal is read as UTC. Fold whatever offset the caller supplied into UTC
++ * and emit the bare datetime'YYYY-MM-DDThh:mm:ss' form.
++ */
++function datetimeLiteral(iso: string): string {
++  const t = new Date(iso);
++  if (Number.isNaN(t.getTime())) throw new MonitorError(`unparseable datetime: ${iso}`);
++  return `datetime'${t.toISOString().slice(0, 19)}'`;
++}
++
++export function buildLogsQuery(opts: LogQueryOptions): string {
++  const parts: string[] = ["$format=json"];
++  const filters: string[] = [];
++  if (opts.status !== undefined) filters.push(`Status eq '${opts.status}'`);
++  if (opts.customStatus !== undefined) filters.push(`CustomStatus eq '${opts.customStatus}'`);
++  if (opts.integrationFlowName !== undefined) filters.push(`IntegrationFlowName eq '${opts.integrationFlowName}'`);
++  if (opts.logStartAfter !== undefined) filters.push(`LogStart gt ${datetimeLiteral(opts.logStartAfter)}`);
++  if (opts.logEndBefore !== undefined) filters.push(`LogEnd lt ${datetimeLiteral(opts.logEndBefore)}`);
++  if (filters.length > 0) parts.push("$filter=" + encodeURIComponent(filters.join(" and ")));
++  if (opts.orderBy !== undefined) {
++    parts.push("$orderby=" + encodeURIComponent(opts.orderBy.field + (opts.orderBy.desc ? " desc" : "")));
++  }
++  if (opts.top !== undefined) parts.push(`$top=${opts.top}`);
++  if (opts.skip !== undefined) parts.push(`$skip=${opts.skip}`);
++  if (opts.countAll) parts.push("$inlinecount=allpages");
++  return parts.join("&");
++}
++
++function parseWireDate(v: unknown): string | null {
++  if (v === null || v === undefined) return null;
++  const m = /^\/Date\((-?\d+)\)\/$/.exec(String(v));
++  if (!m) throw new MonitorError(`unexpected Edm.DateTime encoding: ${String(v)}`);
++  return new Date(Number(m[1])).toISOString();
++}
++
++export function normalizeLog(raw: any): NormalizedLog {
++  const status = String(raw.Status);
++  if (!DOCUMENTED_STATUSES.has(status)) {
++    throw new MonitorError(`undocumented message status '${status}' for ${raw.MessageGuid}`);
++  }
++  return {
++    messageGuid: raw.MessageGuid,
++    correlationId: raw.CorrelationId ?? null,
++    flowName: raw.IntegrationFlowName ?? null,
++    status,
++    customStatus: raw.CustomStatus ?? null,
++    logStart: parseWireDate(raw.LogStart),
++    logEnd: parseWireDate(raw.LogEnd),
++    sender: raw.Sender ?? null,
++    receiver: raw.Receiver ?? null,
++  };
++}
++
++/**
++ * The client only raises CpiError when the body carries an OData error
++ * document; a bodyless 401 flows back as a plain response. Translate both
++ * documented authorization failures here, never echoing credentials.
++ */
++function authFailure(status: number, code: string | null, detail: string): AuthorizationError | null {
++  if (status === 401) return new AuthorizationError(401, "unauthorized", code, detail);
++  if (status === 403) return new AuthorizationError(403, "forbidden", code, detail);
++  return null;
++}
++
++async function getEnvelope(client: CpiClient, pathOrUrl: string): Promise<any> {
++  let res;
++  try {
++    res = await client.request(pathOrUrl);
++  } catch (e) {
++    if (e instanceof CpiError) {
++      const auth = authFailure(e.status, e.code, e.errorBody?.message?.value ?? "");
++      if (auth) throw auth;
++    }
++    throw e;
++  }
++  const auth = authFailure(res.status, null, "");
++  if (auth) throw auth;
++  return res.json;
++}
++
++export async function listAllLogs(
++  client: CpiClient,
++  opts: LogQueryOptions,
++): Promise<{ logs: NormalizedLog[]; totalCount: number | null }> {
++  const logs: NormalizedLog[] = [];
++  let totalCount: number | null = null;
++  let json = await getEnvelope(client, "/MessageProcessingLogs?" + buildLogsQuery(opts));
++  let first = true;
++  for (;;) {
++    const d = json?.d ?? {};
++    for (const raw of d.results ?? []) logs.push(normalizeLog(raw));
++    if (first && opts.countAll && typeof d.__count === "string") totalCount = Number(d.__count);
++    first = false;
++    if (typeof d.__next !== "string") break;
++    // Follow the partial-set link exactly as returned (OData 2.0 __next).
++    json = await getEnvelope(client, d.__next);
++  }
++  return { logs, totalCount };
++}
++
++export async function fetchErrorText(client: CpiClient, raw: any): Promise<string | null> {
++  const uri = raw?.ErrorInformation?.__deferred?.uri;
++  if (typeof uri !== "string") return null;
++  // Error text is exposed as the media value of the error-information
++  // resource: GET <deferred uri>/$value.
++  const res = await client.request(uri + "/$value");
++  const auth = authFailure(res.status, null, "");
++  if (auth) throw auth;
++  return res.text;
++}

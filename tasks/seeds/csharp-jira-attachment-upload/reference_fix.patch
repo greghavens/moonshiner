@@ -1,0 +1,189 @@
+diff --git a/JiraApiError.cs b/JiraApiError.cs
+new file mode 100644
+index 0000000..4b4d3d5
+--- /dev/null
++++ b/JiraApiError.cs
+@@ -0,0 +1,40 @@
++using System.Text.Json;
++
++namespace JiraFiles;
++
++/// <summary>A non-2xx answer from the Jira Cloud REST API with its decoded error collection.</summary>
++public sealed class JiraApiError : Exception
++{
++    public int StatusCode { get; }
++    public IReadOnlyList<string> Messages { get; }
++
++    public JiraApiError(int statusCode, IReadOnlyList<string> messages)
++        : base($"Jira returned HTTP {statusCode}: "
++               + (messages.Count > 0 ? string.Join("; ", messages) : "(no error messages)"))
++    {
++        StatusCode = statusCode;
++        Messages = messages;
++    }
++
++    /// <summary>Decodes Jira's ErrorCollection body ({"errorMessages": [...], "errors": {...}}).</summary>
++    public static JiraApiError Decode(int statusCode, string body)
++    {
++        var messages = new List<string>();
++        try
++        {
++            using var doc = JsonDocument.Parse(body);
++            if (doc.RootElement.ValueKind == JsonValueKind.Object
++                && doc.RootElement.TryGetProperty("errorMessages", out var found)
++                && found.ValueKind == JsonValueKind.Array)
++            {
++                foreach (var message in found.EnumerateArray())
++                    messages.Add(message.GetString() ?? "");
++            }
++        }
++        catch (JsonException)
++        {
++            // Not a JSON error collection; keep the status-only message.
++        }
++        return new JiraApiError(statusCode, messages);
++    }
++}
+diff --git a/JiraAttachmentClient.cs b/JiraAttachmentClient.cs
+new file mode 100644
+index 0000000..a35ca26
+--- /dev/null
++++ b/JiraAttachmentClient.cs
+@@ -0,0 +1,114 @@
++using System.Net.Http.Headers;
++using System.Text;
++using System.Text.Json;
++
++namespace JiraFiles;
++
++/// <summary>
++/// Attachment client for the Jira Cloud platform REST API v3. Uploads travel
++/// as one multipart/form-data POST with the documented X-Atlassian-Token
++/// bypass header; downloads follow content-URL redirects manually so basic
++/// credentials never cross to a different host.
++/// </summary>
++public sealed class JiraAttachmentClient
++{
++    // The documented per-request cap: more than 60 files is a 413.
++    private const int MaxFilesPerRequest = 60;
++    private const int MaxRedirects = 5;
++
++    private readonly HttpClient _http;
++    private readonly Uri _base;
++    private readonly string _basicCredential;
++
++    public JiraAttachmentClient(string baseUrl, string email, string apiToken)
++    {
++        _base = new Uri(baseUrl.TrimEnd('/') + "/");
++        _basicCredential = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{email}:{apiToken}"));
++        _http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false });
++    }
++
++    public async Task<UploadReport> UploadAsync(string issueIdOrKey, IReadOnlyList<AttachmentFile> files)
++    {
++        if (files.Count > MaxFilesPerRequest)
++        {
++            throw new ArgumentException(
++                $"Jira accepts at most {MaxFilesPerRequest} files per attachment request; got {files.Count}.",
++                nameof(files));
++        }
++
++        using var form = new MultipartFormDataContent();
++        foreach (var file in files)
++        {
++            var part = new ByteArrayContent(file.Content);
++            part.Headers.ContentType = MediaTypeHeaderValue.Parse(file.ContentType);
++            // Pre-quoted values: Jira expects the RFC-style quoted form, and
++            // .NET would otherwise emit bare tokens for simple names.
++            part.Headers.ContentDisposition = new ContentDispositionHeaderValue("form-data")
++            {
++                Name = "\"file\"",
++                FileName = $"\"{file.FileName}\"",
++            };
++            form.Add(part);
++        }
++
++        using var request = new HttpRequestMessage(
++            HttpMethod.Post,
++            new Uri(_base, $"rest/api/3/issue/{Uri.EscapeDataString(issueIdOrKey)}/attachments"));
++        request.Headers.TryAddWithoutValidation("Authorization", "Basic " + _basicCredential);
++        request.Headers.TryAddWithoutValidation("X-Atlassian-Token", "no-check");
++        request.Headers.Accept.ParseAdd("application/json");
++        request.Content = form;
++
++        using var response = await _http.SendAsync(request);
++        string body = await response.Content.ReadAsStringAsync();
++        if ((int)response.StatusCode != 200)
++            throw JiraApiError.Decode((int)response.StatusCode, body);
++
++        var uploaded = new List<UploadedAttachment>();
++        using (var doc = JsonDocument.Parse(body))
++        {
++            foreach (var bean in doc.RootElement.EnumerateArray())
++            {
++                uploaded.Add(new UploadedAttachment(
++                    bean.GetProperty("id").GetString() ?? "",
++                    bean.GetProperty("filename").GetString() ?? "",
++                    bean.GetProperty("size").GetInt64(),
++                    bean.GetProperty("mimeType").GetString() ?? "",
++                    bean.GetProperty("content").GetString() ?? ""));
++            }
++        }
++
++        var returned = uploaded.Select(u => u.Filename).ToHashSet(StringComparer.Ordinal);
++        var missing = files.Select(f => f.FileName).Where(name => !returned.Contains(name)).ToList();
++        return new UploadReport { Uploaded = uploaded, Missing = missing };
++    }
++
++    public async Task<byte[]> DownloadAsync(string contentUrl)
++    {
++        var target = new Uri(contentUrl);
++        for (int hop = 0; hop <= MaxRedirects; hop++)
++        {
++            using var request = new HttpRequestMessage(HttpMethod.Get, target);
++            if (SameHost(target))
++                request.Headers.TryAddWithoutValidation("Authorization", "Basic " + _basicCredential);
++
++            using var response = await _http.SendAsync(request);
++            int status = (int)response.StatusCode;
++            if (status is >= 300 and < 400)
++            {
++                var location = response.Headers.Location
++                    ?? throw new JiraApiError(status, new[] { "Redirect without a Location header." });
++                target = location.IsAbsoluteUri ? location : new Uri(target, location);
++                continue;
++            }
++            if (status is >= 200 and < 300)
++                return await response.Content.ReadAsByteArrayAsync();
++            throw JiraApiError.Decode(status, await response.Content.ReadAsStringAsync());
++        }
++        throw new JiraApiError(508, new[] { "Too many redirects while downloading attachment content." });
++    }
++
++    private bool SameHost(Uri target) =>
++        Uri.Compare(target, _base, UriComponents.SchemeAndServer, UriFormat.Unescaped,
++            StringComparison.OrdinalIgnoreCase) == 0;
++}
+diff --git a/Models.cs b/Models.cs
+new file mode 100644
+index 0000000..b9d1763
+--- /dev/null
++++ b/Models.cs
+@@ -0,0 +1,17 @@
++namespace JiraFiles;
++
++/// <summary>A file to attach: original filename, media type, raw bytes.</summary>
++public sealed record AttachmentFile(string FileName, string ContentType, byte[] Content);
++
++/// <summary>One attachment bean from Jira's upload response.</summary>
++public sealed record UploadedAttachment(
++    string Id, string Filename, long Size, string MimeType, string ContentUrl);
++
++/// <summary>Outcome of one upload request, including files Jira did not store.</summary>
++public sealed class UploadReport
++{
++    public required IReadOnlyList<UploadedAttachment> Uploaded { get; init; }
++    public required IReadOnlyList<string> Missing { get; init; }
++    public bool HasMissing => Missing.Count > 0;
++    public long TotalBytes => Uploaded.Sum(u => u.Size);
++}

@@ -1,0 +1,314 @@
+diff --git a/audit.ts b/audit.ts
+new file mode 100644
+index 0000000..e08e99e
+--- /dev/null
++++ b/audit.ts
+@@ -0,0 +1,31 @@
++export interface ShipmentLine {
++  sku: string;
++  qty: number;
++}
++
++export type AuditEntry =
++  | { seq: number; type: 'stock-received'; sku: string; qty: number }
++  | { seq: number; type: 'order-placed'; order: string }
++  | { seq: number; type: 'reserved'; order: string; sku: string; qty: number }
++  | { seq: number; type: 'backordered'; order: string; sku: string; qty: number }
++  | { seq: number; type: 'shipped'; order: string; lines: ShipmentLine[] }
++  | { seq: number; type: 'cancelled'; order: string; released: ShipmentLine[] };
++
++export class AuditLog {
++  private entries: AuditEntry[] = [];
++  private nextSeq = 1;
++
++  record(entry: Omit<AuditEntry, 'seq'>): void {
++    this.entries.push({ ...entry, seq: this.nextSeq } as AuditEntry);
++    this.nextSeq += 1;
++  }
++
++  all(): AuditEntry[] {
++    return this.entries.map((e) => {
++      const copy = { ...e };
++      if ('lines' in copy) copy.lines = copy.lines.map((l) => ({ ...l }));
++      if ('released' in copy) copy.released = copy.released.map((l) => ({ ...l }));
++      return copy;
++    });
++  }
++}
+diff --git a/inventory.ts b/inventory.ts
+new file mode 100644
+index 0000000..8faa3ba
+--- /dev/null
++++ b/inventory.ts
+@@ -0,0 +1,71 @@
++interface StockLevel {
++  onHand: number;
++  reserved: number;
++}
++
++function checkQty(qty: number): void {
++  if (!Number.isInteger(qty) || qty < 1) {
++    throw new Error(`quantity must be a positive integer, got ${qty}`);
++  }
++}
++
++export class Inventory {
++  private levels = new Map<string, StockLevel>();
++
++  private level(sku: string): StockLevel {
++    let lv = this.levels.get(sku);
++    if (!lv) {
++      lv = { onHand: 0, reserved: 0 };
++      this.levels.set(sku, lv);
++    }
++    return lv;
++  }
++
++  receive(sku: string, qty: number): void {
++    checkQty(qty);
++    this.level(sku).onHand += qty;
++  }
++
++  onHand(sku: string): number {
++    return this.levels.get(sku)?.onHand ?? 0;
++  }
++
++  available(sku: string): number {
++    const lv = this.levels.get(sku);
++    return lv ? lv.onHand - lv.reserved : 0;
++  }
++
++  reserve(sku: string, qty: number): void {
++    checkQty(qty);
++    if (qty > this.available(sku)) {
++      throw new Error(`cannot reserve ${qty} of ${sku}: only ${this.available(sku)} available`);
++    }
++    this.level(sku).reserved += qty;
++  }
++
++  reserveUpTo(sku: string, qty: number): number {
++    checkQty(qty);
++    const take = Math.min(qty, this.available(sku));
++    if (take > 0) this.level(sku).reserved += take;
++    return take;
++  }
++
++  release(sku: string, qty: number): void {
++    checkQty(qty);
++    const lv = this.level(sku);
++    if (qty > lv.reserved) {
++      throw new Error(`cannot release ${qty} of ${sku}: only ${lv.reserved} reserved`);
++    }
++    lv.reserved -= qty;
++  }
++
++  commit(sku: string, qty: number): void {
++    checkQty(qty);
++    const lv = this.level(sku);
++    if (qty > lv.reserved) {
++      throw new Error(`cannot commit ${qty} of ${sku}: only ${lv.reserved} reserved`);
++    }
++    lv.reserved -= qty;
++    lv.onHand -= qty;
++  }
++}
+diff --git a/orders.ts b/orders.ts
+new file mode 100644
+index 0000000..09145d4
+--- /dev/null
++++ b/orders.ts
+@@ -0,0 +1,194 @@
++import type { Inventory } from './inventory.ts';
++import { AuditLog } from './audit.ts';
++import type { AuditEntry, ShipmentLine } from './audit.ts';
++
++export interface OrderLineInput {
++  sku: string;
++  qty: number;
++}
++
++export interface OrderInput {
++  id: string;
++  lines: OrderLineInput[];
++}
++
++export interface OrderLine {
++  sku: string;
++  ordered: number;
++  reserved: number;
++  shipped: number;
++  backordered: number;
++}
++
++export type OrderStatus = 'open' | 'partial' | 'fulfilled' | 'cancelled';
++
++export interface OrderSnapshot {
++  id: string;
++  status: OrderStatus;
++  lines: OrderLine[];
++}
++
++export interface Shipment {
++  order: string;
++  lines: ShipmentLine[];
++}
++
++interface StoredOrder {
++  id: string;
++  cancelled: boolean;
++  lines: OrderLine[];
++}
++
++export class OrderEngine {
++  private inventory: Inventory;
++  private log = new AuditLog();
++  private orders = new Map<string, StoredOrder>();
++
++  constructor(inventory: Inventory) {
++    this.inventory = inventory;
++  }
++
++  receive(sku: string, qty: number): void {
++    this.inventory.receive(sku, qty);
++    this.log.record({ type: 'stock-received', sku, qty });
++    this.fillBackorders(sku);
++  }
++
++  place(input: OrderInput): void {
++    if (this.orders.has(input.id)) {
++      throw new Error(`duplicate order id: ${input.id}`);
++    }
++    if (!Array.isArray(input.lines) || input.lines.length === 0) {
++      throw new Error('an order needs at least one line');
++    }
++    const seen = new Set<string>();
++    for (const line of input.lines) {
++      if (seen.has(line.sku)) {
++        throw new Error(`duplicate sku in order: ${line.sku}`);
++      }
++      seen.add(line.sku);
++      if (!Number.isInteger(line.qty) || line.qty < 1) {
++        throw new Error(`quantity must be a positive integer, got ${line.qty}`);
++      }
++    }
++
++    const order: StoredOrder = {
++      id: input.id,
++      cancelled: false,
++      lines: input.lines.map((l) => ({
++        sku: l.sku,
++        ordered: l.qty,
++        reserved: 0,
++        shipped: 0,
++        backordered: 0,
++      })),
++    };
++    this.orders.set(order.id, order);
++    this.log.record({ type: 'order-placed', order: order.id });
++    for (const line of order.lines) {
++      const took = this.inventory.reserveUpTo(line.sku, line.ordered);
++      line.reserved = took;
++      line.backordered = line.ordered - took;
++      if (took > 0) {
++        this.log.record({ type: 'reserved', order: order.id, sku: line.sku, qty: took });
++      }
++      if (line.backordered > 0) {
++        this.log.record({
++          type: 'backordered',
++          order: order.id,
++          sku: line.sku,
++          qty: line.backordered,
++        });
++      }
++    }
++  }
++
++  order(id: string): OrderSnapshot {
++    const order = this.get(id);
++    return {
++      id: order.id,
++      status: this.status(order),
++      lines: order.lines.map((l) => ({ ...l })),
++    };
++  }
++
++  ship(id: string): Shipment {
++    const order = this.get(id);
++    if (order.cancelled) {
++      throw new Error(`order ${id} is cancelled`);
++    }
++    const lines: ShipmentLine[] = [];
++    for (const line of order.lines) {
++      if (line.reserved > 0) lines.push({ sku: line.sku, qty: line.reserved });
++    }
++    if (lines.length === 0) {
++      throw new Error(`nothing to ship for order ${id}`);
++    }
++    for (const line of order.lines) {
++      if (line.reserved > 0) {
++        this.inventory.commit(line.sku, line.reserved);
++        line.shipped += line.reserved;
++        line.reserved = 0;
++      }
++    }
++    this.log.record({ type: 'shipped', order: id, lines: lines.map((l) => ({ ...l })) });
++    return { order: id, lines };
++  }
++
++  cancel(id: string): void {
++    const order = this.get(id);
++    if (order.cancelled) {
++      throw new Error(`order ${id} is already cancelled`);
++    }
++    if (this.status(order) === 'fulfilled') {
++      throw new Error(`order ${id} is already fulfilled`);
++    }
++    const released: ShipmentLine[] = [];
++    for (const line of order.lines) {
++      if (line.reserved > 0) {
++        this.inventory.release(line.sku, line.reserved);
++        released.push({ sku: line.sku, qty: line.reserved });
++        line.reserved = 0;
++      }
++      line.backordered = 0;
++    }
++    order.cancelled = true;
++    this.log.record({ type: 'cancelled', order: id, released });
++    for (const freed of released) {
++      this.fillBackorders(freed.sku);
++    }
++  }
++
++  audit(): AuditEntry[] {
++    return this.log.all();
++  }
++
++  private get(id: string): StoredOrder {
++    const order = this.orders.get(id);
++    if (!order) throw new Error(`unknown order id: ${id}`);
++    return order;
++  }
++
++  private status(order: StoredOrder): OrderStatus {
++    if (order.cancelled) return 'cancelled';
++    const shipped = order.lines.reduce((n, l) => n + l.shipped, 0);
++    const ordered = order.lines.reduce((n, l) => n + l.ordered, 0);
++    if (shipped === ordered) return 'fulfilled';
++    if (shipped > 0) return 'partial';
++    return 'open';
++  }
++
++  private fillBackorders(sku: string): void {
++    for (const order of this.orders.values()) {
++      if (order.cancelled) continue;
++      for (const line of order.lines) {
++        if (line.sku !== sku || line.backordered === 0) continue;
++        const took = this.inventory.reserveUpTo(sku, line.backordered);
++        if (took === 0) return;
++        line.reserved += took;
++        line.backordered -= took;
++        this.log.record({ type: 'reserved', order: order.id, sku, qty: took });
++      }
++    }
++  }
++}

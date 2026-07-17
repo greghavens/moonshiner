@@ -1,0 +1,419 @@
+diff --git a/src/Errors.cs b/src/Errors.cs
+new file mode 100644
+index 0000000..c4a1a28
+--- /dev/null
++++ b/src/Errors.cs
+@@ -0,0 +1,37 @@
++namespace Acme.NewRelic.Synthetics;
++
++/// <summary>Non-2xx NerdGraph response. Carries status and body, never the key.</summary>
++public sealed class NerdGraphHttpException : Exception
++{
++    public int Status { get; }
++    public string Body { get; }
++
++    public NerdGraphHttpException(int status, string body)
++        : base($"NerdGraph request failed with HTTP {status}")
++    {
++        Status = status;
++        Body = body;
++    }
++}
++
++/// <summary>Entity search matched more than one monitor for a name.</summary>
++public sealed class AmbiguousMonitorException : Exception
++{
++    public AmbiguousMonitorException(string name)
++        : base($"monitor name '{name}' matches more than one SYNTH entity")
++    {
++    }
++}
++
++/// <summary>A synthetics mutation reported per-field errors.</summary>
++public sealed class SyntheticsMutationException : Exception
++{
++    public IReadOnlyList<MutationError> Errors { get; }
++
++    public SyntheticsMutationException(IReadOnlyList<MutationError> errors)
++        : base("synthetics mutation failed: "
++            + string.Join("; ", errors.Select(e => $"{e.Type}: {e.Description}")))
++    {
++        Errors = errors;
++    }
++}
+diff --git a/src/MonitorReconciler.cs b/src/MonitorReconciler.cs
+new file mode 100644
+index 0000000..811a758
+--- /dev/null
++++ b/src/MonitorReconciler.cs
+@@ -0,0 +1,299 @@
++using System.Text.Json.Nodes;
++
++namespace Acme.NewRelic.Synthetics;
++
++/// <summary>
++/// Reconciles one scripted API synthetic monitor against New Relic:
++/// discovers by name through the documented SYNTH/MONITOR entity search
++/// (or skips discovery when a guid is supplied), creates or updates with
++/// the documented monitor input, and reconciles tags through the tagging
++/// replace mutation. A null desired script omits the script field on
++/// update so the stored script and its $secure.* credential references
++/// survive - stored secure values can never be read back through
++/// NerdGraph, so clobbering them is unrecoverable.
++/// </summary>
++public sealed class MonitorReconciler
++{
++    static readonly string[] Periods =
++    {
++        "EVERY_MINUTE", "EVERY_5_MINUTES", "EVERY_10_MINUTES",
++        "EVERY_15_MINUTES", "EVERY_30_MINUTES", "EVERY_HOUR",
++        "EVERY_6_HOURS", "EVERY_12_HOURS", "EVERY_DAY",
++    };
++    static readonly string[] Statuses = { "ENABLED", "DISABLED" };
++
++    const string SearchDocument = """
++        query FindMonitor($query: String!) {
++          actor {
++            entitySearch(query: $query) {
++              results {
++                entities {
++                  ... on SyntheticMonitorEntityOutline {
++                    guid
++                    name
++                    accountId
++                    monitorType
++                    tags {
++                      key
++                      values
++                    }
++                  }
++                }
++                nextCursor
++              }
++            }
++          }
++        }
++        """;
++
++    const string CreateDocument = """
++        mutation CreateScriptApiMonitor($accountId: Int!, $monitor: SyntheticsCreateScriptApiMonitorInput!) {
++          syntheticsCreateScriptApiMonitor(accountId: $accountId, monitor: $monitor) {
++            monitor {
++              guid
++              name
++            }
++            errors {
++              description
++              type
++            }
++          }
++        }
++        """;
++
++    const string UpdateDocument = """
++        mutation UpdateScriptApiMonitor($guid: EntityGuid!, $monitor: SyntheticsUpdateScriptApiMonitorInput!) {
++          syntheticsUpdateScriptApiMonitor(guid: $guid, monitor: $monitor) {
++            monitor {
++              guid
++              status
++            }
++            errors {
++              description
++              type
++            }
++          }
++        }
++        """;
++
++    const string ReplaceTagsDocument = """
++        mutation ReplaceMonitorTags($guid: EntityGuid!, $tags: [TaggingTagInput!]!) {
++          taggingReplaceTagsOnEntity(guid: $guid, tags: $tags) {
++            errors {
++              message
++            }
++          }
++        }
++        """;
++
++    readonly NerdGraphClient _client;
++    readonly int _accountId;
++
++    public MonitorReconciler(NerdGraphClient client, int accountId)
++    {
++        _client = client;
++        _accountId = accountId;
++    }
++
++    public async Task<ReconcileOutcome> ReconcileAsync(DesiredScriptApiMonitor desired)
++    {
++        Validate(desired);
++
++        DiscoveredMonitor? current = null;
++        string action;
++        string guid;
++        if (desired.Guid is not null)
++        {
++            guid = desired.Guid;
++            await UpdateAsync(guid, desired);
++            action = "updated";
++        }
++        else
++        {
++            current = await DiscoverAsync(desired.Name);
++            if (current is null)
++            {
++                guid = await CreateAsync(desired);
++                action = "created";
++            }
++            else
++            {
++                guid = current.Guid;
++                await UpdateAsync(guid, desired);
++                action = "updated";
++            }
++        }
++
++        var keysToReplace = TagKeysToReplace(desired.Tags, current);
++        var tagErrors = new List<string>();
++        if (keysToReplace.Count > 0)
++        {
++            tagErrors = await ReplaceTagsAsync(guid, desired.Tags, keysToReplace);
++        }
++        return new ReconcileOutcome(action, guid, keysToReplace, tagErrors);
++    }
++
++    static void Validate(DesiredScriptApiMonitor desired)
++    {
++        if (!Periods.Contains(desired.Period))
++        {
++            throw new ArgumentException(
++                $"period '{desired.Period}' is not a documented period value");
++        }
++        if (!Statuses.Contains(desired.Status))
++        {
++            throw new ArgumentException(
++                $"status '{desired.Status}' is not a documented status value");
++        }
++        if (desired.Name.Contains('\'') || desired.Name.Contains('\\'))
++        {
++            throw new ArgumentException(
++                "monitor names must not contain quotes or backslashes");
++        }
++        if (desired.PublicLocations.Count == 0)
++        {
++            throw new ArgumentException("at least one public location is required");
++        }
++    }
++
++    async Task<DiscoveredMonitor?> DiscoverAsync(string name)
++    {
++        var searchQuery = $"domain = 'SYNTH' AND type = 'MONITOR' AND name = '{name}'";
++        var envelope = await _client.ExecuteAsync(SearchDocument,
++            new JsonObject { ["query"] = searchQuery });
++        var results = envelope["data"]?["actor"]?["entitySearch"]?["results"];
++        var entities = results?["entities"] as JsonArray ?? new JsonArray();
++        if (entities.Count == 0)
++        {
++            return null;
++        }
++        if (entities.Count > 1 || results?["nextCursor"] is not null)
++        {
++            throw new AmbiguousMonitorException(name);
++        }
++        var entity = entities[0]!;
++        var tags = new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal);
++        foreach (var tag in entity["tags"] as JsonArray ?? new JsonArray())
++        {
++            tags[(string)tag!["key"]!] = ((JsonArray)tag["values"]!)
++                .Select(v => (string)v!).ToArray();
++        }
++        return new DiscoveredMonitor(
++            (string)entity["guid"]!,
++            (string)entity["name"]!,
++            (long)entity["accountId"]!,
++            (string)entity["monitorType"]!,
++            tags);
++    }
++
++    async Task<string> CreateAsync(DesiredScriptApiMonitor desired)
++    {
++        if (desired.Script is null)
++        {
++            throw new ArgumentException("creating a scripted API monitor requires a script");
++        }
++        var variables = new JsonObject
++        {
++            ["accountId"] = _accountId,
++            ["monitor"] = MonitorInput(desired),
++        };
++        var envelope = await _client.ExecuteAsync(CreateDocument, variables);
++        var payload = envelope["data"]?["syntheticsCreateScriptApiMonitor"];
++        ThrowOnMutationErrors(payload);
++        return (string)payload!["monitor"]!["guid"]!;
++    }
++
++    async Task UpdateAsync(string guid, DesiredScriptApiMonitor desired)
++    {
++        var variables = new JsonObject
++        {
++            ["guid"] = guid,
++            ["monitor"] = MonitorInput(desired),
++        };
++        var envelope = await _client.ExecuteAsync(UpdateDocument, variables);
++        ThrowOnMutationErrors(envelope["data"]?["syntheticsUpdateScriptApiMonitor"]);
++    }
++
++    static JsonObject MonitorInput(DesiredScriptApiMonitor desired)
++    {
++        var monitor = new JsonObject
++        {
++            ["name"] = desired.Name,
++            ["period"] = desired.Period,
++            ["status"] = desired.Status,
++            ["locations"] = new JsonObject
++            {
++                ["public"] = new JsonArray(
++                    desired.PublicLocations.Select(l => (JsonNode)l).ToArray()),
++            },
++            ["runtime"] = new JsonObject
++            {
++                ["runtimeType"] = "NODE_API",
++                ["runtimeTypeVersion"] = "22.20.0",
++                ["scriptLanguage"] = "JAVASCRIPT",
++            },
++        };
++        if (desired.Script is not null)
++        {
++            // Plain text, byte-exact: $secure.* references pass through
++            // untouched and are never resolved or logged.
++            monitor["script"] = desired.Script;
++        }
++        if (desired.ApdexTarget is not null)
++        {
++            monitor["apdexTarget"] = desired.ApdexTarget;
++        }
++        return monitor;
++    }
++
++    static void ThrowOnMutationErrors(JsonNode? payload)
++    {
++        if (payload?["errors"] is JsonArray errors && errors.Count > 0)
++        {
++            throw new SyntheticsMutationException(errors
++                .Select(e => new MutationError(
++                    (string?)e?["description"] ?? "",
++                    (string?)e?["type"] ?? ""))
++                .ToArray());
++        }
++    }
++
++    static List<string> TagKeysToReplace(
++        IReadOnlyDictionary<string, IReadOnlyList<string>> desired,
++        DiscoveredMonitor? current)
++    {
++        var keys = new List<string>();
++        foreach (var key in desired.Keys.OrderBy(k => k, StringComparer.Ordinal))
++        {
++            if (current is null
++                || !current.Tags.TryGetValue(key, out var values)
++                || !values.OrderBy(v => v, StringComparer.Ordinal)
++                    .SequenceEqual(desired[key].OrderBy(v => v, StringComparer.Ordinal)))
++            {
++                keys.Add(key);
++            }
++        }
++        return keys;
++    }
++
++    async Task<List<string>> ReplaceTagsAsync(string guid,
++        IReadOnlyDictionary<string, IReadOnlyList<string>> desired,
++        IReadOnlyList<string> keys)
++    {
++        var tags = new JsonArray();
++        foreach (var key in keys)
++        {
++            tags.Add(new JsonObject
++            {
++                ["key"] = key,
++                ["values"] = new JsonArray(desired[key].Select(v => (JsonNode)v).ToArray()),
++            });
++        }
++        var envelope = await _client.ExecuteAsync(ReplaceTagsDocument,
++            new JsonObject { ["guid"] = guid, ["tags"] = tags });
++        var errors = envelope["data"]?["taggingReplaceTagsOnEntity"]?["errors"];
++        return errors is JsonArray list
++            ? list.Select(e => (string?)e?["message"] ?? "").ToList()
++            : new List<string>();
++    }
++}
+diff --git a/src/NerdGraphClient.cs b/src/NerdGraphClient.cs
+new file mode 100644
+index 0000000..2efb826
+--- /dev/null
++++ b/src/NerdGraphClient.cs
+@@ -0,0 +1,65 @@
++using System.Text;
++using System.Text.Json.Nodes;
++
++namespace Acme.NewRelic.Synthetics;
++
++/// <summary>
++/// NerdGraph transport: POSTs {query, variables} with the user key in the
++/// documented API-Key header. HTTP 429 (the documented concurrency-limit
++/// rejection) retries with doubling delays through the injected delay
++/// function, at most three total attempts; other non-2xx statuses surface
++/// immediately. The key never travels in URLs, bodies, or exception text.
++/// </summary>
++public sealed class NerdGraphClient
++{
++    const int MaxAttempts = 3;
++    static readonly TimeSpan BaseDelay = TimeSpan.FromSeconds(1);
++
++    readonly string _endpointUrl;
++    readonly string _apiKey;
++    readonly HttpClient _http;
++    readonly Func<TimeSpan, Task> _delay;
++
++    public NerdGraphClient(string endpointUrl, string apiKey,
++        HttpMessageHandler handler, Func<TimeSpan, Task> delay)
++    {
++        _endpointUrl = endpointUrl;
++        _apiKey = apiKey;
++        _http = new HttpClient(handler, disposeHandler: false);
++        _delay = delay;
++    }
++
++    public async Task<JsonNode> ExecuteAsync(string query, JsonObject variables)
++    {
++        for (var attempt = 1; ; attempt++)
++        {
++            using var request = new HttpRequestMessage(HttpMethod.Post, _endpointUrl);
++            request.Headers.TryAddWithoutValidation("API-Key", _apiKey);
++            var body = new JsonObject
++            {
++                ["query"] = query,
++                ["variables"] = variables.DeepClone(),
++            };
++            request.Content = new StringContent(
++                body.ToJsonString(), Encoding.UTF8, "application/json");
++
++            var response = await _http.SendAsync(request);
++            var text = await response.Content.ReadAsStringAsync();
++            var status = (int)response.StatusCode;
++            if (status == 429)
++            {
++                if (attempt >= MaxAttempts)
++                {
++                    throw new NerdGraphHttpException(429, text);
++                }
++                await _delay(BaseDelay * (1 << (attempt - 1)));
++                continue;
++            }
++            if (status is < 200 or >= 300)
++            {
++                throw new NerdGraphHttpException(status, text);
++            }
++            return JsonNode.Parse(text)!;
++        }
++    }
++}

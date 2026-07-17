@@ -1,0 +1,176 @@
+diff --git a/rategate.ts b/rategate.ts
+new file mode 100644
+index 0000000..5768f6d
+--- /dev/null
++++ b/rategate.ts
+@@ -0,0 +1,170 @@
++// A rate-limit-aware request scheduler. All traffic to a given host flows
++// through one FIFO queue with a bounded number of in-flight requests, 429
++// responses are retried after the wait the server asked for (Retry-After
++// as delta-seconds or an HTTP-date), and an exhausted X-RateLimit budget
++// pauses the host until its advertised reset. Every wait goes through an
++// injectable clock + sleeper so callers (and tests) control time.
++
++export interface GateResponse {
++  status: number;
++  body: string;
++  headers: Record<string, string>;
++}
++
++export interface RequestOptions {
++  method?: string;
++  headers?: Record<string, string>;
++  body?: string;
++}
++
++export interface GateOptions {
++  now?: () => number; // epoch milliseconds
++  sleep?: (ms: number) => Promise<void>;
++  hostConcurrency?: number;
++  maxRetries?: number;
++  defaultRetryMs?: number;
++}
++
++interface QueueItem {
++  url: string;
++  options: RequestOptions;
++  resolve: (response: GateResponse) => void;
++  reject: (reason: unknown) => void;
++}
++
++interface HostState {
++  queue: QueueItem[];
++  workers: number;
++  pauseUntil: number | null; // epoch ms the host may dispatch again
++}
++
++export class RateGate {
++  private now: () => number;
++  private sleep: (ms: number) => Promise<void>;
++  private hostConcurrency: number;
++  private maxRetries: number;
++  private defaultRetryMs: number;
++  private hosts: Map<string, HostState>;
++
++  constructor(options: GateOptions = {}) {
++    this.now = options.now ?? (() => Date.now());
++    this.sleep = options.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
++    this.hostConcurrency = options.hostConcurrency ?? 1;
++    this.maxRetries = options.maxRetries ?? 3;
++    this.defaultRetryMs = options.defaultRetryMs ?? 1000;
++    this.hosts = new Map();
++  }
++
++  request(url: string, options: RequestOptions = {}): Promise<GateResponse> {
++    const host = new URL(url).host;
++    const state = this.hostState(host);
++    return new Promise<GateResponse>((resolve, reject) => {
++      state.queue.push({ url, options, resolve, reject });
++      if (state.workers < this.hostConcurrency) {
++        void this.worker(state);
++      }
++    });
++  }
++
++  private hostState(host: string): HostState {
++    let state = this.hosts.get(host);
++    if (!state) {
++      state = { queue: [], workers: 0, pauseUntil: null };
++      this.hosts.set(host, state);
++    }
++    return state;
++  }
++
++  // One dispatch loop for a host. Up to hostConcurrency of these run at a
++  // time; each takes the item at the head of the queue, so per-host order
++  // is exactly enqueue order.
++  private async worker(state: HostState): Promise<void> {
++    state.workers += 1;
++    try {
++      while (state.queue.length > 0) {
++        if (state.pauseUntil !== null) {
++          const wait = state.pauseUntil - this.now();
++          state.pauseUntil = null;
++          if (wait > 0) await this.sleep(wait);
++          continue; // re-check the queue after the pause
++        }
++        const item = state.queue.shift();
++        if (item === undefined) break;
++        try {
++          item.resolve(await this.attempt(state, item));
++        } catch (err) {
++          item.reject(err);
++        }
++      }
++    } finally {
++      state.workers -= 1;
++    }
++  }
++
++  // Send one request, waiting out rate limits. The retry loop lives inside
++  // the worker's current slot, which is what keeps a limited request ahead
++  // of everything queued behind it.
++  private async attempt(state: HostState, item: QueueItem): Promise<GateResponse> {
++    let retries = 0;
++    for (;;) {
++      const response = await this.send(item);
++      if (response.status !== 429) {
++        this.noteBudget(state, response);
++        return response;
++      }
++      if (retries >= this.maxRetries) {
++        return response; // budget spent: the caller sees the final 429
++      }
++      retries += 1;
++      const wait = this.retryAfterMs(response);
++      if (wait > 0) {
++        await this.sleep(wait);
++      }
++    }
++  }
++
++  private async send(item: QueueItem): Promise<GateResponse> {
++    const res = await fetch(item.url, {
++      method: item.options.method ?? 'GET',
++      headers: item.options.headers,
++      body: item.options.body,
++    });
++    const body = await res.text();
++    const headers: Record<string, string> = {};
++    res.headers.forEach((value, key) => {
++      headers[key] = value;
++    });
++    return { status: res.status, body, headers };
++  }
++
++  // How long a 429 asks us to hold off: digits are delta-seconds, anything
++  // else is tried as an HTTP-date against the injected clock, and a
++  // missing or unparseable header falls back to the configured default.
++  private retryAfterMs(response: GateResponse): number {
++    const raw = response.headers['retry-after'];
++    if (raw === undefined || raw.trim() === '') {
++      return this.defaultRetryMs;
++    }
++    const value = raw.trim();
++    if (/^\d+$/.test(value)) {
++      return Number(value) * 1000;
++    }
++    const at = Date.parse(value);
++    if (Number.isNaN(at)) {
++      return this.defaultRetryMs;
++    }
++    return at - this.now();
++  }
++
++  // A non-429 response that spent the window's budget pauses the host
++  // until the advertised reset (epoch seconds) before the next dispatch.
++  private noteBudget(state: HostState, response: GateResponse): void {
++    const remaining = response.headers['x-ratelimit-remaining'];
++    const reset = response.headers['x-ratelimit-reset'];
++    if (remaining === undefined || reset === undefined) return;
++    if (remaining.trim() !== '0') return;
++    const resetSec = Number(reset);
++    if (!Number.isFinite(resetSec)) return;
++    state.pauseUntil = resetSec * 1000;
++  }
++}

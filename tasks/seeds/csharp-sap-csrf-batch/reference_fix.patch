@@ -1,0 +1,403 @@
+diff --git a/BatchGateway.cs b/BatchGateway.cs
+new file mode 100644
+index 0000000..920ae9a
+--- /dev/null
++++ b/BatchGateway.cs
+@@ -0,0 +1,68 @@
++using System.Text;
++
++namespace SapBatch;
++
++/// <summary>
++/// Submits OData 2.0 batches to the gateway: cached CSRF session, one
++/// refresh-and-retry on token rejection, multipart response decoding.
++/// </summary>
++public sealed class BatchGateway
++{
++    private readonly HttpClient _http;
++    private readonly string _serviceRoot;
++    private readonly CsrfSession _session;
++
++    public BatchGateway(HttpClient http, string serviceRootUrl)
++    {
++        _http = http;
++        _serviceRoot = serviceRootUrl.TrimEnd('/');
++        _session = new CsrfSession(http, _serviceRoot);
++    }
++
++    public async Task<BatchResponse> SubmitAsync(BatchRequestBuilder batch)
++    {
++        string payload = batch.Build();
++        HttpResponseMessage response = await PostAsync(batch, payload);
++        if (IsTokenRejection(response))
++        {
++            response.Dispose();
++            // The gateway invalidated our session: fetch a fresh token once
++            // and retry the identical payload once.
++            _session.Invalidate();
++            response = await PostAsync(batch, payload);
++            if (IsTokenRejection(response))
++            {
++                response.Dispose();
++                throw new SapCsrfException(
++                    "gateway rejected a freshly fetched CSRF token twice; giving up");
++            }
++        }
++        using (response)
++        {
++            string body = await response.Content.ReadAsStringAsync();
++            string contentType = response.Content.Headers.ContentType?.ToString()
++                ?? throw new FormatException("batch response carries no content type");
++            return BatchResponse.Parse(contentType, body);
++        }
++    }
++
++    private async Task<HttpResponseMessage> PostAsync(BatchRequestBuilder batch, string payload)
++    {
++        CsrfToken token = await _session.GetAsync();
++        using var request = new HttpRequestMessage(HttpMethod.Post, _serviceRoot + "/$batch");
++        request.Headers.TryAddWithoutValidation("x-csrf-token", token.Value);
++        if (token.Cookies.Count > 0)
++            request.Headers.TryAddWithoutValidation("Cookie", string.Join("; ", token.Cookies));
++        var content = new StringContent(payload, Encoding.UTF8);
++        content.Headers.ContentType = null;
++        content.Headers.TryAddWithoutValidation(
++            "Content-Type", "multipart/mixed; boundary=" + batch.BatchBoundary);
++        request.Content = content;
++        return await _http.SendAsync(request);
++    }
++
++    private static bool IsTokenRejection(HttpResponseMessage response) =>
++        response.StatusCode == System.Net.HttpStatusCode.Forbidden
++        && response.Headers.TryGetValues("x-csrf-token", out var values)
++        && values.Any(v => v.Equals("required", StringComparison.OrdinalIgnoreCase));
++}
+diff --git a/BatchRequestBuilder.cs b/BatchRequestBuilder.cs
+new file mode 100644
+index 0000000..5ba320b
+--- /dev/null
++++ b/BatchRequestBuilder.cs
+@@ -0,0 +1,91 @@
++using System.Text;
++
++namespace SapBatch;
++
++/// <summary>One write operation inside a change set (POST create or MERGE update).</summary>
++public sealed record BatchWriteOperation(string Method, string Path, string JsonBody, int ContentId)
++{
++    public static BatchWriteOperation Post(string path, string jsonBody, int contentId) =>
++        new("POST", path, jsonBody, contentId);
++
++    public static BatchWriteOperation Merge(string path, string jsonBody, int contentId) =>
++        new("MERGE", path, jsonBody, contentId);
++}
++
++/// <summary>
++/// Serializes an OData 2.0 batch: retrieve requests as top-level parts,
++/// writes grouped in change sets (retrieves are not allowed inside change
++/// sets, so the builder cannot express that). CRLF framing throughout.
++/// </summary>
++public sealed class BatchRequestBuilder
++{
++    private const string Crlf = "\r\n";
++
++    private abstract record Part;
++    private sealed record RetrievePart(string PathAndQuery) : Part;
++    private sealed record ChangesetPart(IReadOnlyList<BatchWriteOperation> Operations) : Part;
++
++    private readonly List<Part> _parts = new();
++
++    public string BatchBoundary { get; }
++    public string ChangesetBoundary { get; }
++
++    public BatchRequestBuilder(string batchBoundary, string changesetBoundary)
++    {
++        BatchBoundary = batchBoundary;
++        ChangesetBoundary = changesetBoundary;
++    }
++
++    public void AddRetrieve(string pathAndQuery) => _parts.Add(new RetrievePart(pathAndQuery));
++
++    public void AddChangeset(params BatchWriteOperation[] operations)
++    {
++        var seen = new HashSet<int>();
++        foreach (BatchWriteOperation op in operations)
++        {
++            if (!seen.Add(op.ContentId))
++                throw new ArgumentException($"duplicate Content-ID {op.ContentId} within one change set");
++        }
++        _parts.Add(new ChangesetPart(operations));
++    }
++
++    public string Build()
++    {
++        var b = new StringBuilder();
++        foreach (Part part in _parts)
++        {
++            b.Append("--").Append(BatchBoundary).Append(Crlf);
++            switch (part)
++            {
++                case RetrievePart retrieve:
++                    b.Append("Content-Type: application/http").Append(Crlf);
++                    b.Append("Content-Transfer-Encoding: binary").Append(Crlf);
++                    b.Append(Crlf);
++                    b.Append("GET ").Append(retrieve.PathAndQuery).Append(" HTTP/1.1").Append(Crlf);
++                    b.Append("Accept: application/json").Append(Crlf);
++                    b.Append(Crlf);
++                    b.Append(Crlf);
++                    break;
++                case ChangesetPart changeset:
++                    b.Append("Content-Type: multipart/mixed; boundary=").Append(ChangesetBoundary).Append(Crlf);
++                    b.Append(Crlf);
++                    foreach (BatchWriteOperation op in changeset.Operations)
++                    {
++                        b.Append("--").Append(ChangesetBoundary).Append(Crlf);
++                        b.Append("Content-Type: application/http").Append(Crlf);
++                        b.Append("Content-Transfer-Encoding: binary").Append(Crlf);
++                        b.Append("Content-ID: ").Append(op.ContentId).Append(Crlf);
++                        b.Append(Crlf);
++                        b.Append(op.Method).Append(' ').Append(op.Path).Append(" HTTP/1.1").Append(Crlf);
++                        b.Append("Content-Type: application/json").Append(Crlf);
++                        b.Append(Crlf);
++                        b.Append(op.JsonBody).Append(Crlf);
++                    }
++                    b.Append("--").Append(ChangesetBoundary).Append("--").Append(Crlf);
++                    break;
++            }
++        }
++        b.Append("--").Append(BatchBoundary).Append("--").Append(Crlf);
++        return b.ToString();
++    }
++}
+diff --git a/BatchResponse.cs b/BatchResponse.cs
+new file mode 100644
+index 0000000..0437fac
+--- /dev/null
++++ b/BatchResponse.cs
+@@ -0,0 +1,169 @@
++using System.Text.Json;
++
++namespace SapBatch;
++
++public sealed record RetrievePartResult(int Status, string? Body);
++
++public sealed record OperationResult(int Status, string? Body, string? Location);
++
++public sealed record SapError(string Code, string Message, string RawJson);
++
++/// <summary>
++/// Result of one change set. Change sets are atomic: when the gateway fails
++/// one, none of its operations were applied, so Operations stays empty and
++/// Error carries the gateway's error document for all of them.
++/// </summary>
++public sealed class ChangesetResult
++{
++    public bool Succeeded { get; }
++    public IReadOnlyDictionary<int, OperationResult> Operations { get; }
++    public SapError? Error { get; }
++
++    internal ChangesetResult(bool succeeded, IReadOnlyDictionary<int, OperationResult> operations, SapError? error)
++    {
++        Succeeded = succeeded;
++        Operations = operations;
++        Error = error;
++    }
++}
++
++/// <summary>Parsed multipart/mixed $batch response.</summary>
++public sealed class BatchResponse
++{
++    public IReadOnlyList<RetrievePartResult> Retrieves { get; }
++    public IReadOnlyList<ChangesetResult> Changesets { get; }
++
++    private BatchResponse(List<RetrievePartResult> retrieves, List<ChangesetResult> changesets)
++    {
++        Retrieves = retrieves;
++        Changesets = changesets;
++    }
++
++    public static BatchResponse Parse(string contentTypeHeader, string body)
++    {
++        string boundary = BoundaryOf(contentTypeHeader)
++            ?? throw new FormatException("batch response content type carries no boundary");
++        var retrieves = new List<RetrievePartResult>();
++        var changesets = new List<ChangesetResult>();
++        foreach (string part in SplitParts(body, boundary))
++        {
++            (var headers, string content) = SplitHeaders(part);
++            string partType = headers.GetValueOrDefault("content-type", "");
++            if (partType.StartsWith("multipart/mixed", StringComparison.OrdinalIgnoreCase))
++            {
++                string csBoundary = BoundaryOf(partType)
++                    ?? throw new FormatException("change set part carries no boundary");
++                changesets.Add(ParseChangeset(content, csBoundary));
++            }
++            else
++            {
++                var embedded = EmbeddedResponse.Parse(content);
++                retrieves.Add(new RetrievePartResult(embedded.Status, embedded.Body));
++            }
++        }
++        return new BatchResponse(retrieves, changesets);
++    }
++
++    private static ChangesetResult ParseChangeset(string content, string boundary)
++    {
++        var operations = new Dictionary<int, OperationResult>();
++        SapError? error = null;
++        foreach (string part in SplitParts(content, boundary))
++        {
++            (var headers, string inner) = SplitHeaders(part);
++            var embedded = EmbeddedResponse.Parse(inner);
++            if (embedded.Status >= 400)
++            {
++                // The atomic failure shape: a single error response stands in
++                // for every operation of the change set — none were applied.
++                error = ToSapError(embedded.Body);
++                operations.Clear();
++                break;
++            }
++            if (headers.TryGetValue("content-id", out string? id) && int.TryParse(id, out int contentId))
++            {
++                operations[contentId] = new OperationResult(embedded.Status, embedded.Body, embedded.Location);
++            }
++        }
++        return new ChangesetResult(error is null, operations, error);
++    }
++
++    private static SapError ToSapError(string? body)
++    {
++        if (string.IsNullOrEmpty(body)) return new SapError("UNKNOWN", "", "{}");
++        using JsonDocument doc = JsonDocument.Parse(body);
++        JsonElement err = doc.RootElement.GetProperty("error");
++        string code = err.TryGetProperty("code", out var c) ? c.GetString() ?? "UNKNOWN" : "UNKNOWN";
++        string message = err.TryGetProperty("message", out var m) && m.TryGetProperty("value", out var v)
++            ? v.GetString() ?? "" : "";
++        return new SapError(code, message, err.GetRawText());
++    }
++
++    private static string? BoundaryOf(string contentType)
++    {
++        foreach (string param in contentType.Split(';'))
++        {
++            string trimmed = param.Trim();
++            if (trimmed.StartsWith("boundary=", StringComparison.OrdinalIgnoreCase))
++                return trimmed["boundary=".Length..].Trim('"');
++        }
++        return null;
++    }
++
++    private static List<string> SplitParts(string body, string boundary)
++    {
++        var parts = new List<string>();
++        string open = "--" + boundary + "\r\n";
++        string close = "--" + boundary + "--";
++        int at = body.IndexOf(open, StringComparison.Ordinal);
++        while (at >= 0)
++        {
++            int start = at + open.Length;
++            int nextOpen = body.IndexOf("\r\n" + open, start, StringComparison.Ordinal);
++            int end = body.IndexOf("\r\n" + close, start, StringComparison.Ordinal);
++            int stop = nextOpen >= 0 && (end < 0 || nextOpen < end) ? nextOpen : end;
++            if (stop < 0) throw new FormatException("unterminated multipart part");
++            parts.Add(body[start..stop]);
++            at = nextOpen >= 0 && nextOpen == stop ? nextOpen + 2 : -1;
++        }
++        return parts;
++    }
++
++    private static (Dictionary<string, string> Headers, string Content) SplitHeaders(string part)
++    {
++        int split = part.IndexOf("\r\n\r\n", StringComparison.Ordinal);
++        if (split < 0) return (new Dictionary<string, string>(), part);
++        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
++        foreach (string line in part[..split].Split("\r\n"))
++        {
++            int colon = line.IndexOf(':');
++            if (colon > 0) headers[line[..colon].Trim().ToLowerInvariant()] = line[(colon + 1)..].Trim();
++        }
++        return (headers, part[(split + 4)..]);
++    }
++
++    /// <summary>The HTTP response embedded in one application/http part.</summary>
++    private sealed record EmbeddedResponse(int Status, string? Body, string? Location)
++    {
++        public static EmbeddedResponse Parse(string content)
++        {
++            int lineEnd = content.IndexOf("\r\n", StringComparison.Ordinal);
++            string statusLine = lineEnd < 0 ? content : content[..lineEnd];
++            string[] pieces = statusLine.Split(' ', 3);
++            if (pieces.Length < 2 || !pieces[0].StartsWith("HTTP/", StringComparison.Ordinal))
++                throw new FormatException("part does not embed an HTTP response: " + statusLine);
++            int status = int.Parse(pieces[1]);
++            string rest = lineEnd < 0 ? "" : content[(lineEnd + 2)..];
++            int split = rest.IndexOf("\r\n\r\n", StringComparison.Ordinal);
++            string headerBlock = split < 0 ? rest : rest[..split];
++            string body = split < 0 ? "" : rest[(split + 4)..].Trim('\r', '\n');
++            string? location = null;
++            foreach (string line in headerBlock.Split("\r\n"))
++            {
++                if (line.StartsWith("Location:", StringComparison.OrdinalIgnoreCase))
++                    location = line["Location:".Length..].Trim();
++            }
++            return new EmbeddedResponse(status, body.Length == 0 ? null : body, location);
++        }
++    }
++}
+diff --git a/CsrfSession.cs b/CsrfSession.cs
+new file mode 100644
+index 0000000..6cfb422
+--- /dev/null
++++ b/CsrfSession.cs
+@@ -0,0 +1,51 @@
++namespace SapBatch;
++
++/// <summary>The CSRF token plus the session cookies that accompany it.</summary>
++public sealed record CsrfToken(string Value, IReadOnlyList<string> Cookies);
++
++/// <summary>Raised when the gateway keeps rejecting freshly fetched tokens.</summary>
++public sealed class SapCsrfException : Exception
++{
++    public SapCsrfException(string message) : base(message) { }
++}
++
++/// <summary>
++/// Fetches and caches the gateway CSRF session: a HEAD pre-flight with
++/// x-csrf-token: fetch returns the token in the response header and the
++/// session cookies in Set-Cookie — the write needs both.
++/// </summary>
++public sealed class CsrfSession
++{
++    private readonly HttpClient _http;
++    private readonly string _serviceRoot;
++    private CsrfToken? _cached;
++
++    public CsrfSession(HttpClient http, string serviceRootUrl)
++    {
++        _http = http;
++        _serviceRoot = serviceRootUrl.TrimEnd('/');
++    }
++
++    public async Task<CsrfToken> GetAsync()
++    {
++        if (_cached is not null) return _cached;
++        using var request = new HttpRequestMessage(HttpMethod.Head, _serviceRoot + "/");
++        request.Headers.TryAddWithoutValidation("x-csrf-token", "fetch");
++        using HttpResponseMessage response = await _http.SendAsync(request);
++        string? token = response.Headers.TryGetValues("x-csrf-token", out var values)
++            ? values.FirstOrDefault()
++            : null;
++        if (token is null)
++            throw new SapCsrfException("gateway answered the CSRF pre-flight without a token header");
++        var cookies = new List<string>();
++        if (response.Headers.TryGetValues("Set-Cookie", out var setCookies))
++        {
++            foreach (string raw in setCookies)
++                cookies.Add(raw.Split(';', 2)[0].Trim());
++        }
++        _cached = new CsrfToken(token, cookies);
++        return _cached;
++    }
++
++    public void Invalidate() => _cached = null;
++}

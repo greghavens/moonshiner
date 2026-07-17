@@ -1,0 +1,238 @@
+diff --git a/healthgate.ts b/healthgate.ts
+new file mode 100644
+index 0000000..ae5475b
+--- /dev/null
++++ b/healthgate.ts
+@@ -0,0 +1,232 @@
++// Health-check orchestrator: runs registered checks in dependency order (one
++// at a time), enforces per-check timeouts and retries through an injected
++// scheduler — never a real setTimeout — and damps flapping results so one
++// noisy round does not flip the reported state.
++
++export type Scheduler = {
++  setTimeout(fn: () => void, delayMs: number): number;
++  clearTimeout(id: number): void;
++};
++
++export type CheckSpec = {
++  name: string;
++  run: () => void | Promise<void>;
++  /** Names of checks that must pass earlier in the same round. */
++  after?: string[];
++  /** A damped failure of a critical check makes the gate "down". */
++  critical?: boolean;
++  /** Per-check timeout; falls back to the gate-wide timeoutMs. */
++  timeoutMs?: number;
++  /** Extra attempts after a failed one. */
++  retries?: number;
++  /** Delay between attempts; 0 retries immediately without a timer. */
++  retryDelayMs?: number;
++};
++
++export type CheckResult = {
++  name: string;
++  result: 'pass' | 'fail' | 'skipped';
++  reason: string | null;
++  attempts: number;
++};
++
++export type Overall = 'healthy' | 'degraded' | 'down';
++
++export type RoundReport = { results: CheckResult[]; overall: Overall };
++
++export type GateOptions = {
++  scheduler: Scheduler;
++  /** Consecutive contrary rounds needed to flip a reported state. */
++  flapThreshold?: number;
++  /** Gate-wide default check timeout. */
++  timeoutMs?: number;
++};
++
++type DampedState = {
++  reported: 'pass' | 'fail'; // what we tell the world
++  streak: number; // consecutive rounds observing the opposite
++};
++
++function errorMessage(err: unknown): string {
++  return err instanceof Error ? err.message : String(err);
++}
++
++export class HealthGate {
++  private readonly scheduler: Scheduler;
++  private readonly flapThreshold: number;
++  private readonly timeoutMs: number;
++  private readonly checks: CheckSpec[] = [];
++  private readonly byName = new Map<string, CheckSpec>();
++  private readonly damped = new Map<string, DampedState>();
++
++  constructor(opts: GateOptions) {
++    this.scheduler = opts.scheduler;
++    this.flapThreshold = opts.flapThreshold ?? 1;
++    this.timeoutMs = opts.timeoutMs ?? 5000;
++  }
++
++  /** Register a check. Names are unique; dependencies may be registered later. */
++  add(spec: CheckSpec): void {
++    if (this.byName.has(spec.name)) {
++      throw new Error(`a check named "${spec.name}" is already registered`);
++    }
++    this.byName.set(spec.name, spec);
++    this.checks.push(spec);
++  }
++
++  /**
++   * Run every check once, in dependency order (registration order breaking
++   * ties), strictly one at a time. Dependents of a check that did not pass
++   * this round are skipped without being invoked. The report's `results`
++   * carry the raw outcomes of this round; `overall` reflects damped states.
++   */
++  async runRound(): Promise<RoundReport> {
++    const order = this.executionOrder();
++    const rawByName = new Map<string, CheckResult['result']>();
++    const results: CheckResult[] = [];
++
++    for (const spec of order) {
++      const blocker = (spec.after ?? []).find((dep) => rawByName.get(dep) !== 'pass');
++      const result =
++        blocker === undefined
++          ? await this.runWithRetries(spec)
++          : {
++              name: spec.name,
++              result: 'skipped' as const,
++              reason: `dependency "${blocker}" did not pass`,
++              attempts: 0,
++            };
++      rawByName.set(spec.name, result.result);
++      results.push(result);
++    }
++
++    for (const result of results) {
++      if (result.result !== 'pass' && result.result !== 'fail') {
++        continue; // a skipped round neither counts toward nor resets a streak
++      }
++      const state = this.damped.get(result.name);
++      if (state === undefined) {
++        this.damped.set(result.name, { reported: result.result, streak: 0 });
++      } else if (result.result === state.reported) {
++        state.streak = 0;
++      } else if (++state.streak >= this.flapThreshold) {
++        state.reported = result.result;
++        state.streak = 0;
++      }
++    }
++
++    return { results, overall: this.computeOverall() };
++  }
++
++  /** The gate's damped view: overall status plus each observed check's state. */
++  status(): { overall: Overall; checks: Record<string, 'pass' | 'fail'> } {
++    const checks: Record<string, 'pass' | 'fail'> = {};
++    for (const spec of this.checks) {
++      const state = this.damped.get(spec.name);
++      if (state !== undefined) checks[spec.name] = state.reported;
++    }
++    return { overall: this.computeOverall(), checks };
++  }
++
++  private computeOverall(): Overall {
++    let overall: Overall = 'healthy';
++    for (const spec of this.checks) {
++      const state = this.damped.get(spec.name);
++      if (state === undefined || state.reported === 'pass') continue;
++      if (spec.critical) return 'down';
++      overall = 'degraded';
++    }
++    return overall;
++  }
++
++  /**
++   * Topological order with registration order breaking ties: repeatedly take
++   * the earliest-registered check whose dependencies are all placed. Unknown
++   * dependencies and cycles are detected here, before anything runs.
++   */
++  private executionOrder(): CheckSpec[] {
++    for (const spec of this.checks) {
++      for (const dep of spec.after ?? []) {
++        if (!this.byName.has(dep)) {
++          throw new Error(`unknown dependency "${dep}" of check "${spec.name}"`);
++        }
++      }
++    }
++    const order: CheckSpec[] = [];
++    const placed = new Set<string>();
++    while (order.length < this.checks.length) {
++      const next = this.checks.find(
++        (spec) => !placed.has(spec.name) && (spec.after ?? []).every((dep) => placed.has(dep)),
++      );
++      if (next === undefined) {
++        const stuck = this.checks
++          .filter((spec) => !placed.has(spec.name))
++          .map((spec) => `"${spec.name}"`)
++          .join(', ');
++        throw new Error(`dependency cycle among health checks: ${stuck}`);
++      }
++      placed.add(next.name);
++      order.push(next);
++    }
++    return order;
++  }
++
++  private async runWithRetries(spec: CheckSpec): Promise<CheckResult> {
++    const maxAttempts = 1 + (spec.retries ?? 0);
++    let attempts = 0;
++    let lastReason = 'failed';
++    while (attempts < maxAttempts) {
++      attempts++;
++      const outcome = await this.attempt(spec);
++      if (outcome.ok) {
++        return { name: spec.name, result: 'pass', reason: null, attempts };
++      }
++      lastReason = outcome.reason;
++      if (attempts < maxAttempts) {
++        await this.delay(spec.retryDelayMs ?? 0);
++      }
++    }
++    return { name: spec.name, result: 'fail', reason: lastReason, attempts };
++  }
++
++  /**
++   * One attempt, raced against the timeout on the injected scheduler. The
++   * first settlement wins: the timer is cleared when the check settles, and
++   * a check that limps in after its timeout is ignored.
++   */
++  private attempt(spec: CheckSpec): Promise<{ ok: true } | { ok: false; reason: string }> {
++    return new Promise((resolve) => {
++      let settled = false;
++      let timer: number | undefined;
++      const finish = (outcome: { ok: true } | { ok: false; reason: string }): void => {
++        if (settled) return;
++        settled = true;
++        if (timer !== undefined) this.scheduler.clearTimeout(timer);
++        resolve(outcome);
++      };
++      timer = this.scheduler.setTimeout(
++        () => finish({ ok: false, reason: 'timeout' }),
++        spec.timeoutMs ?? this.timeoutMs,
++      );
++      let running: Promise<void>;
++      try {
++        running = Promise.resolve(spec.run());
++      } catch (err) {
++        finish({ ok: false, reason: errorMessage(err) });
++        return;
++      }
++      running.then(
++        () => finish({ ok: true }),
++        (err) => finish({ ok: false, reason: errorMessage(err) }),
++      );
++    });
++  }
++
++  /** Wait on the injected scheduler; a zero delay continues without a timer. */
++  private delay(ms: number): Promise<void> {
++    if (ms <= 0) return Promise.resolve();
++    return new Promise((resolve) => {
++      this.scheduler.setTimeout(resolve, ms);
++    });
++  }
++}

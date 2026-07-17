@@ -1,0 +1,349 @@
+diff --git a/compact.go b/compact.go
+new file mode 100644
+index 0000000..6bd012f
+--- /dev/null
++++ b/compact.go
+@@ -0,0 +1,62 @@
++package kvwal
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"sort"
++)
++
++// Compact rewrites the WAL so it contains exactly one Put record per live
++// key — no tombstones, no superseded versions. The new log is built as a
++// temp file and renamed over wal.log so a crash mid-compact leaves either
++// the old complete log or the new complete log, never a hybrid.
++func (s *Store) Compact() error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.closed {
++		return ErrClosed
++	}
++
++	path := filepath.Join(s.dir, walFileName)
++	tmp, err := os.CreateTemp(s.dir, walFileName+".compact-*")
++	if err != nil {
++		return fmt.Errorf("kvwal: create compact temp: %w", err)
++	}
++	tmpPath := tmp.Name()
++	cleanup := func() {
++		tmp.Close()
++		os.Remove(tmpPath)
++	}
++
++	keys := make([]string, 0, len(s.data))
++	for k := range s.data {
++		keys = append(keys, k)
++	}
++	sort.Strings(keys)
++	for _, k := range keys {
++		if err := appendRecord(tmp, record{op: opPut, key: k, value: s.data[k]}); err != nil {
++			cleanup()
++			return err
++		}
++	}
++	if err := tmp.Sync(); err != nil {
++		cleanup()
++		return fmt.Errorf("kvwal: sync compacted log: %w", err)
++	}
++	if err := os.Rename(tmpPath, path); err != nil {
++		cleanup()
++		return fmt.Errorf("kvwal: swap compacted log: %w", err)
++	}
++
++	// The old handle now points at an unlinked inode; reopen for appends.
++	old := s.wal
++	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
++	if err != nil {
++		return fmt.Errorf("kvwal: reopen compacted log: %w", err)
++	}
++	s.wal = f
++	tmp.Close()
++	old.Close()
++	return nil
++}
+diff --git a/store.go b/store.go
+new file mode 100644
+index 0000000..ff90ed7
+--- /dev/null
++++ b/store.go
+@@ -0,0 +1,128 @@
++// Package kvwal is a tiny embedded key-value store backed by a single
++// append-only write-ahead log. The full data set lives in memory; the log
++// exists so state survives restarts and torn writes.
++package kvwal
++
++import (
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"sort"
++	"sync"
++)
++
++const walFileName = "wal.log"
++
++// ErrClosed is returned by mutating operations on a closed store.
++var ErrClosed = errors.New("kvwal: store is closed")
++
++// Store is an in-memory key-value map durably backed by a WAL.
++type Store struct {
++	mu     sync.RWMutex
++	dir    string
++	wal    *os.File
++	data   map[string][]byte
++	closed bool
++}
++
++// Open opens (or creates) the store rooted at dir, replaying wal.log to
++// rebuild the in-memory state. A corrupt tail is truncated away so the log
++// is left ending at the last valid record.
++func Open(dir string) (*Store, error) {
++	path := filepath.Join(dir, walFileName)
++	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
++	if err != nil {
++		return nil, fmt.Errorf("kvwal: open wal: %w", err)
++	}
++	data, validLen, err := replay(f)
++	if err != nil {
++		f.Close()
++		return nil, err
++	}
++	if err := repairTail(f, validLen); err != nil {
++		f.Close()
++		return nil, err
++	}
++	return &Store{dir: dir, wal: f, data: data}, nil
++}
++
++// Get returns a copy of the value stored under key.
++func (s *Store) Get(key string) ([]byte, bool) {
++	s.mu.RLock()
++	defer s.mu.RUnlock()
++	v, ok := s.data[key]
++	if !ok {
++		return nil, false
++	}
++	out := make([]byte, len(v))
++	copy(out, v)
++	return out, true
++}
++
++// Put stores value under key, appending a record to the WAL first.
++func (s *Store) Put(key string, value []byte) error {
++	if key == "" {
++		return errors.New("kvwal: empty key")
++	}
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.closed {
++		return ErrClosed
++	}
++	if err := appendRecord(s.wal, record{op: opPut, key: key, value: value}); err != nil {
++		return err
++	}
++	stored := make([]byte, len(value))
++	copy(stored, value)
++	s.data[key] = stored
++	return nil
++}
++
++// Delete removes key, appending a tombstone. Deleting an absent key is a
++// no-op and writes nothing.
++func (s *Store) Delete(key string) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.closed {
++		return ErrClosed
++	}
++	if _, ok := s.data[key]; !ok {
++		return nil
++	}
++	if err := appendRecord(s.wal, record{op: opDelete, key: key}); err != nil {
++		return err
++	}
++	delete(s.data, key)
++	return nil
++}
++
++// Keys returns the live keys in ascending order.
++func (s *Store) Keys() []string {
++	s.mu.RLock()
++	defer s.mu.RUnlock()
++	keys := make([]string, 0, len(s.data))
++	for k := range s.data {
++		keys = append(keys, k)
++	}
++	sort.Strings(keys)
++	return keys
++}
++
++// Len reports the number of live keys.
++func (s *Store) Len() int {
++	s.mu.RLock()
++	defer s.mu.RUnlock()
++	return len(s.data)
++}
++
++// Close flushes and closes the WAL. Mutations after Close fail.
++func (s *Store) Close() error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.closed {
++		return nil
++	}
++	s.closed = true
++	return s.wal.Close()
++}
+diff --git a/wal.go b/wal.go
+new file mode 100644
+index 0000000..087c1db
+--- /dev/null
++++ b/wal.go
+@@ -0,0 +1,141 @@
++package kvwal
++
++import (
++	"encoding/binary"
++	"fmt"
++	"hash/crc32"
++	"io"
++	"os"
++)
++
++// On-disk framing: every record is
++//
++//	[4B big-endian payload length][4B big-endian IEEE CRC32 of payload][payload]
++//
++// The payload itself is
++//
++//	[1B op][2B big-endian key length][key bytes][value bytes]
++//
++// Anything that fails to frame or checksum marks the start of a corrupt
++// tail: replay keeps everything before it and the caller truncates the rest.
++
++const (
++	opPut    byte = 1
++	opDelete byte = 2
++
++	frameHeaderLen = 8
++	maxPayloadLen  = 1 << 26 // 64 MiB sanity bound; larger lengths are corruption
++)
++
++type record struct {
++	op    byte
++	key   string
++	value []byte
++}
++
++func encodePayload(r record) ([]byte, error) {
++	if len(r.key) > 0xFFFF {
++		return nil, fmt.Errorf("kvwal: key too long (%d bytes)", len(r.key))
++	}
++	p := make([]byte, 0, 3+len(r.key)+len(r.value))
++	p = append(p, r.op)
++	p = binary.BigEndian.AppendUint16(p, uint16(len(r.key)))
++	p = append(p, r.key...)
++	p = append(p, r.value...)
++	return p, nil
++}
++
++func decodePayload(p []byte) (record, bool) {
++	if len(p) < 3 {
++		return record{}, false
++	}
++	op := p[0]
++	if op != opPut && op != opDelete {
++		return record{}, false
++	}
++	keyLen := int(binary.BigEndian.Uint16(p[1:3]))
++	if 3+keyLen > len(p) {
++		return record{}, false
++	}
++	r := record{op: op, key: string(p[3 : 3+keyLen])}
++	if op == opDelete {
++		if len(p) != 3+keyLen {
++			return record{}, false // tombstones carry no value
++		}
++		return r, true
++	}
++	r.value = append([]byte(nil), p[3+keyLen:]...)
++	return r, true
++}
++
++// appendRecord frames and writes one record at the current end of the log.
++func appendRecord(f *os.File, r record) error {
++	payload, err := encodePayload(r)
++	if err != nil {
++		return err
++	}
++	buf := make([]byte, 0, frameHeaderLen+len(payload))
++	buf = binary.BigEndian.AppendUint32(buf, uint32(len(payload)))
++	buf = binary.BigEndian.AppendUint32(buf, crc32.ChecksumIEEE(payload))
++	buf = append(buf, payload...)
++	if _, err := f.Write(buf); err != nil {
++		return fmt.Errorf("kvwal: append record: %w", err)
++	}
++	return nil
++}
++
++// replay reads records from the start of f, folding them into a map.
++// It returns the rebuilt state and the byte offset just past the last valid
++// record; anything beyond that offset is a corrupt tail.
++func replay(f *os.File) (map[string][]byte, int64, error) {
++	raw, err := io.ReadAll(io.NewSectionReader(f, 0, 1<<62))
++	if err != nil {
++		return nil, 0, fmt.Errorf("kvwal: read wal: %w", err)
++	}
++	data := make(map[string][]byte)
++	var off int64
++	for {
++		rest := raw[off:]
++		if len(rest) < frameHeaderLen {
++			break // incomplete header: torn tail (or clean EOF)
++		}
++		payloadLen := int64(binary.BigEndian.Uint32(rest[:4]))
++		if payloadLen > maxPayloadLen || frameHeaderLen+payloadLen > int64(len(rest)) {
++			break // declared length runs past EOF: torn tail
++		}
++		payload := rest[frameHeaderLen : frameHeaderLen+payloadLen]
++		if crc32.ChecksumIEEE(payload) != binary.BigEndian.Uint32(rest[4:8]) {
++			break // checksum mismatch: nothing after this can be trusted
++		}
++		rec, ok := decodePayload(payload)
++		if !ok {
++			break // framing was fine but the payload is not one of ours
++		}
++		switch rec.op {
++		case opPut:
++			data[rec.key] = rec.value
++		case opDelete:
++			delete(data, rec.key)
++		}
++		off += frameHeaderLen + payloadLen
++	}
++	return data, off, nil
++}
++
++// repairTail truncates f to validLen (dropping a corrupt tail, if any) and
++// positions the write cursor at the new end.
++func repairTail(f *os.File, validLen int64) error {
++	fi, err := f.Stat()
++	if err != nil {
++		return fmt.Errorf("kvwal: stat wal: %w", err)
++	}
++	if fi.Size() > validLen {
++		if err := f.Truncate(validLen); err != nil {
++			return fmt.Errorf("kvwal: truncate corrupt tail: %w", err)
++		}
++	}
++	if _, err := f.Seek(validLen, io.SeekStart); err != nil {
++		return fmt.Errorf("kvwal: seek: %w", err)
++	}
++	return nil
++}

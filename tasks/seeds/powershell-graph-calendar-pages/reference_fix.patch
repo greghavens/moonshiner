@@ -1,0 +1,240 @@
+diff --git a/GraphCalendarExport.psm1 b/GraphCalendarExport.psm1
+new file mode 100644
+index 0000000..b1525be
+--- /dev/null
++++ b/GraphCalendarExport.psm1
+@@ -0,0 +1,234 @@
++# GraphCalendarExport — Microsoft Graph v1.0 calendarView exporter.
++#
++# Follows the wire contract pinned in docs/contract.json: required UTC range
++# parameters, Prefer: outlook.timezone on every request (nextLink follow-ups
++# included), verbatim opaque nextLink reuse, id-level dedup, Retry-After
++# throttling with injected delays, and partial-progress diagnostics when the
++# throttle never clears.
++Set-StrictMode -Version Latest
++
++class GraphAuthError : System.Exception {
++    [int]$StatusCode
++    [string]$ErrorCode
++    GraphAuthError([int]$statusCode, [string]$errorCode, [string]$message) : base($message) {
++        $this.StatusCode = $statusCode
++        $this.ErrorCode = $errorCode
++    }
++}
++
++class GraphServerError : System.Exception {
++    [int]$StatusCode
++    [string]$ErrorCode
++    GraphServerError([int]$statusCode, [string]$errorCode, [string]$message) : base($message) {
++        $this.StatusCode = $statusCode
++        $this.ErrorCode = $errorCode
++    }
++}
++
++class GraphThrottleStop : System.Exception {
++    [int]$RetryAfterSeconds
++    [string]$ResumeLink
++    [int]$PagesFetched
++    [object[]]$Collected
++    GraphThrottleStop([int]$retryAfter, [string]$resumeLink, [int]$pagesFetched, [object[]]$collected) `
++        : base("Throttled by Microsoft Graph after exhausting retries; retry after ${retryAfter}s.") {
++        $this.RetryAfterSeconds = $retryAfter
++        $this.ResumeLink = $resumeLink
++        $this.PagesFetched = $pagesFetched
++        $this.Collected = $collected
++    }
++}
++
++function Connect-GraphCalendar {
++    param(
++        [Parameter(Mandatory)][string]$BaseUrl,
++        [Parameter(Mandatory)][string]$AccessToken,
++        [scriptblock]$DelayCommand = { param($seconds) Start-Sleep -Seconds $seconds },
++        [int]$MaxRetries = 3
++    )
++    [pscustomobject]@{
++        BaseUrl      = $BaseUrl.TrimEnd('/')
++        AccessToken  = $AccessToken
++        DelayCommand = $DelayCommand
++        MaxRetries   = $MaxRetries
++    }
++}
++
++function Get-RetryAfterSeconds {
++    param($Response)
++    foreach ($key in $Response.Headers.Keys) {
++        if ($key -ieq 'Retry-After') {
++            return [int]@($Response.Headers[$key])[0]
++        }
++    }
++    return 1
++}
++
++function Read-ErrorEnvelope {
++    param([string]$Content)
++    $code = $null
++    $message = 'Microsoft Graph request failed.'
++    try {
++        $parsed = $Content | ConvertFrom-Json
++        if ($parsed.PSObject.Properties.Name -contains 'error') {
++            if ($parsed.error.PSObject.Properties.Name -contains 'code') { $code = $parsed.error.code }
++            if ($parsed.error.PSObject.Properties.Name -contains 'message') { $message = $parsed.error.message }
++        }
++    } catch {
++        # keep the generic message for unparseable bodies
++    }
++    [pscustomobject]@{ Code = $code; Message = $message }
++}
++
++# Fetch one page; returns @{Throttled=$true; RetryAfter=n} when retries are
++# exhausted so the caller can attach partial-progress context.
++function Invoke-GraphPage {
++    param($Session, [string]$Url, [string]$TimeZone)
++    $attempts = 0
++    while ($true) {
++        $headers = @{
++            Authorization = "Bearer $($Session.AccessToken)"
++            Prefer        = "outlook.timezone=`"$TimeZone`""
++        }
++        $response = Invoke-WebRequest -Uri $Url -Method Get -Headers $headers -SkipHttpErrorCheck
++        $status = [int]$response.StatusCode
++        if ($status -eq 200) {
++            # -DateKind String keeps Graph dateTime values as strings instead
++            # of letting ConvertFrom-Json coerce them into DateTime objects.
++            return @{ Body = ($response.Content | ConvertFrom-Json -DateKind String) }
++        }
++        if ($status -eq 429) {
++            $retryAfter = Get-RetryAfterSeconds -Response $response
++            if ($attempts -ge $Session.MaxRetries) {
++                return @{ Throttled = $true; RetryAfter = $retryAfter }
++            }
++            $attempts++
++            & $Session.DelayCommand $retryAfter
++            continue
++        }
++        $envelope = Read-ErrorEnvelope -Content $response.Content
++        if ($status -eq 401 -or $status -eq 403) {
++            throw [GraphAuthError]::new($status, $envelope.Code, $envelope.Message)
++        }
++        throw [GraphServerError]::new($status, $envelope.Code, $envelope.Message)
++    }
++}
++
++function ConvertTo-NormalizedEvent {
++    param($Raw)
++    [pscustomobject][ordered]@{
++        id             = $Raw.id
++        iCalUId        = $Raw.iCalUId
++        subject        = $Raw.subject
++        type           = $Raw.type
++        seriesMasterId = $Raw.seriesMasterId
++        start          = ($Raw.start.dateTime -split '\.')[0]
++        end            = ($Raw.end.dateTime -split '\.')[0]
++        timeZone       = $Raw.start.timeZone
++        isAllDay       = [bool]$Raw.isAllDay
++        organizer      = $Raw.organizer.emailAddress.address
++    }
++}
++
++function Get-CalendarRound {
++    param($Session, [string]$UserId, [string]$StartUtc, [string]$EndUtc, [string]$TimeZone)
++    $collected = [System.Collections.Generic.List[object]]::new()
++    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
++    $url = "$($Session.BaseUrl)/users/$UserId/calendarView?startDateTime=$StartUtc&endDateTime=$EndUtc"
++    $pages = 0
++    while ($null -ne $url) {
++        $page = Invoke-GraphPage -Session $Session -Url $url -TimeZone $TimeZone
++        if ($page.ContainsKey('Throttled')) {
++            throw [GraphThrottleStop]::new($page.RetryAfter, $url, $pages, $collected.ToArray())
++        }
++        $pages++
++        $body = $page.Body
++        foreach ($raw in @($body.value)) {
++            $normalized = ConvertTo-NormalizedEvent -Raw $raw
++            if ($seen.Add($normalized.id)) {
++                $null = $collected.Add($normalized)
++            }
++        }
++        # The nextLink is opaque: reuse it exactly as returned.
++        $url = if ($body.PSObject.Properties.Name -contains '@odata.nextLink') {
++            $body.'@odata.nextLink'
++        } else {
++            $null
++        }
++    }
++    [pscustomobject]@{
++        Pages  = $pages
++        Events = @(Sort-NormalizedEvents -Events $collected)
++    }
++}
++
++function Sort-NormalizedEvents {
++    param($Events)
++    @($Events | Sort-Object -Property start, id)
++}
++
++function Get-GraphCalendarView {
++    param(
++        [Parameter(Mandatory)]$Session,
++        [Parameter(Mandatory)][string]$UserId,
++        [Parameter(Mandatory)][string]$StartUtc,
++        [Parameter(Mandatory)][string]$EndUtc,
++        [string]$TimeZone = 'UTC'
++    )
++    (Get-CalendarRound -Session $Session -UserId $UserId -StartUtc $StartUtc -EndUtc $EndUtc -TimeZone $TimeZone).Events
++}
++
++function Export-GraphCalendarReport {
++    param(
++        [Parameter(Mandatory)]$Session,
++        [Parameter(Mandatory)][string]$UserId,
++        [Parameter(Mandatory)][string]$StartUtc,
++        [Parameter(Mandatory)][string]$EndUtc,
++        [string]$TimeZone = 'UTC',
++        [Parameter(Mandatory)][string]$Path
++    )
++    try {
++        $round = Get-CalendarRound -Session $Session -UserId $UserId -StartUtc $StartUtc -EndUtc $EndUtc -TimeZone $TimeZone
++    } catch [GraphThrottleStop] {
++        $stop = $_.Exception
++        $partialEvents = @(Sort-NormalizedEvents -Events $stop.Collected)
++        $doc = [ordered]@{
++            partial           = $true
++            user              = $UserId
++            range             = [ordered]@{ start = $StartUtc; end = $EndUtc }
++            timeZone          = $TimeZone
++            pagesFetched      = $stop.PagesFetched
++            eventCount        = $partialEvents.Count
++            resumeLink        = $stop.ResumeLink
++            retryAfterSeconds = $stop.RetryAfterSeconds
++            events            = $partialEvents
++        }
++        [System.IO.File]::WriteAllText($Path, ($doc | ConvertTo-Json -Depth 6))
++        return [pscustomobject]@{
++            Status            = 'partial'
++            PagesFetched      = $stop.PagesFetched
++            EventsExported    = $partialEvents.Count
++            ResumeLink        = $stop.ResumeLink
++            RetryAfterSeconds = $stop.RetryAfterSeconds
++            Path              = $Path
++        }
++    }
++    $doc = [ordered]@{
++        user       = $UserId
++        range      = [ordered]@{ start = $StartUtc; end = $EndUtc }
++        timeZone   = $TimeZone
++        eventCount = $round.Events.Count
++        events     = $round.Events
++    }
++    [System.IO.File]::WriteAllText($Path, ($doc | ConvertTo-Json -Depth 6))
++    [pscustomobject]@{
++        Status            = 'complete'
++        PagesFetched      = $round.Pages
++        EventsExported    = $round.Events.Count
++        ResumeLink        = $null
++        RetryAfterSeconds = $null
++        Path              = $Path
++    }
++}
++
++Export-ModuleMember -Function Connect-GraphCalendar, Get-GraphCalendarView, Export-GraphCalendarReport
