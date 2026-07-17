@@ -18,6 +18,11 @@ test('blank lines separate paragraphs, however many there are', () => {
 
 test('single newlines inside a paragraph join with a space', () => {
   assert.equal(renderMarkdown('line one\nline two'), '<p>line one line two</p>');
+  assert.equal(
+    renderMarkdown('line one  \n   line two'),
+    '<p>line one line two</p>',
+    'surrounding line indentation must not survive newline collapsing',
+  );
 });
 
 test('headings h1 through h3', () => {

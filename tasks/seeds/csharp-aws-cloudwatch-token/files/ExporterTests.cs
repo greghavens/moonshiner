@@ -172,7 +172,7 @@ public sealed class ListSink : ILogSink
 public sealed class ExporterTests : IDisposable
 {
     private const string Group = "/ecs/render-fleet";
-    private const string AccessKey = "AKIAFAKEFAKEFAKEFAKE";
+    private const string AccessKey = "TEST_ACCESS_KEY_ID";
     private const string SecretKey = "dummy-secret-never-real";
 
     private static readonly JsonElement Contract = JsonDocument.Parse(

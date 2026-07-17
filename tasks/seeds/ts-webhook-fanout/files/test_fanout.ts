@@ -71,3 +71,44 @@ test('the report is final the moment fanout resolves', async () => {
     'failed list changed after the report was returned');
   assert.deepEqual(report.delivered, ['https://ok.test/hook']);
 });
+
+test('delivered and failed entries retain completion order', async () => {
+  const delays = new Map([
+    ['https://slow-ok.test/hook', 24],
+    ['https://slow-bad.test/hook', 18],
+    ['https://fast-ok.test/hook', 4],
+    ['https://fast-bad.test/hook', 1],
+  ]);
+  const send: SendFn = async (url) => {
+    await sleep(delays.get(url)!);
+    if (url.includes('bad')) throw new Error(`failed ${url}`);
+  };
+  const report = await fanout([...delays.keys()], 'x', send);
+  assert.deepEqual(report.delivered, [
+    'https://fast-ok.test/hook',
+    'https://slow-ok.test/hook',
+  ]);
+  assert.deepEqual(report.failed, [
+    { url: 'https://fast-bad.test/hook', reason: 'failed https://fast-bad.test/hook' },
+    { url: 'https://slow-bad.test/hook', reason: 'failed https://slow-bad.test/hook' },
+  ]);
+});
+
+test('a synchronous sender throw is isolated to its endpoint', async () => {
+  const send: SendFn = (url) => {
+    if (url.includes('sync-bad')) throw new Error('synchronous setup failure');
+    return Promise.resolve();
+  };
+  const report = await fanout(
+    ['https://ok.test/hook', 'https://sync-bad.test/hook', 'https://ok2.test/hook'],
+    'x',
+    send,
+  );
+  assert.deepEqual([...report.delivered].sort(), [
+    'https://ok.test/hook',
+    'https://ok2.test/hook',
+  ]);
+  assert.deepEqual(report.failed, [
+    { url: 'https://sync-bad.test/hook', reason: 'synchronous setup failure' },
+  ]);
+});

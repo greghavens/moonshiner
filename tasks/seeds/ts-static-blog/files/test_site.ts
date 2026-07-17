@@ -117,6 +117,25 @@ test('duplicate slugs are refused by name', () => {
   );
 });
 
+test('duplicate slug validation includes drafts', () => {
+  assert.throws(
+    () => buildSite([
+      post({ title: 'Hidden', date: '2024-01-01', slug: 'collision', draft: 'true' }, 'x'),
+      post({ title: 'Live', date: '2024-02-01', slug: 'collision' }, 'y'),
+    ]),
+    /collision/,
+    'a draft/live collision must be rejected before drafts are filtered',
+  );
+  assert.throws(
+    () => buildSite([
+      post({ title: 'Hidden One', date: '2024-01-01', slug: 'hidden-dup', draft: 'true' }, 'x'),
+      post({ title: 'Hidden Two', date: '2024-02-01', slug: 'hidden-dup', draft: 'true' }, 'y'),
+    ]),
+    /hidden-dup/,
+    'a draft/draft collision must also be rejected',
+  );
+});
+
 test('an empty site still gets an archive and tag index', () => {
   const pages = buildSite([]);
   const index = pages.get('index.html')!;

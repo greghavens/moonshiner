@@ -1,21 +1,30 @@
 #!/usr/bin/env python3
-"""Import the seed corpus from the configured source repository.
+"""Import the seed corpus from the configured source repositories.
 
 The moonshiner seed corpus is tracked in-tree under ``tasks/seeds``. Rather than
-author seeds here, we take the latest vetted corpus from the source repository
-named by ``config.source.seed_repository`` (default ``../sol-code``) and copy
-each COMPLETE seed directory in. A seed is complete when its ``task.json``
-parses and carries every required field, its ``id`` matches the directory name,
-``files/`` exists, and every protected ``test_files`` entry is present; a partial
-seed (an authoring agent died mid-write) is skipped, never half-copied. Seeds
-that already exist here are left untouched unless ``--force``.
+author seeds here, we take the latest vetted corpus from a canonical source and,
+where the canonical seed is missing or broken, from a fallback source.
+
+  * ``config.source.seed_repository``  — the CANONICAL source (default
+    ``../fable-code``). Its version of a seed wins whenever it is complete.
+  * ``config.source.fallback_repository`` — an optional FALLBACK source (e.g.
+    ``../sol-code``). Used only for a seed the canonical source lacks or left
+    incomplete (an authoring agent that died mid-write, a safeguard-rejected
+    stub). This encodes the rule "canonical unless it is off, then fall back".
+
+A seed is complete when its ``task.json`` parses and carries every required
+field, its ``id`` matches the directory name, ``files/`` exists, and every
+protected ``test_files`` entry is present. A seed that is incomplete in BOTH
+sources is reported invalid and never half-copied. Seeds already present here
+are left untouched unless ``--force``.
 
 Copies are atomic (stage into a sibling temp dir, then swap) and skip installed
 ``node_modules``/cache trees so a dependency install never bloats the corpus.
 
 Model-free and idempotent — safe to re-run.
-  python3 src/import_seeds.py            # import from config.source
-  python3 src/import_seeds.py --dry-run  # report what would change
+  python3 src/import_seeds.py            # canonical + fallback per config
+  python3 src/import_seeds.py --force    # reproduce the merge deterministically
+  python3 src/import_seeds.py --dry-run  # report provenance without copying
 """
 from __future__ import annotations
 
@@ -30,17 +39,24 @@ from common import CONFIG, ROOT, SEEDS_DIR
 REQUIRED = ("id", "lang", "category", "prompt", "verify_cmd", "test_files")
 
 
-def source_seeds_dir(source: str | None = None) -> Path:
-    """Resolve the source ``tasks/seeds`` directory (relative to repo root)."""
-    repo = source or CONFIG.get("source", {}).get("seed_repository", "../sol-code")
+def seeds_dir(repo: str) -> Path:
+    """Resolve a source repo's ``tasks/seeds`` directory (relative to root)."""
     base = Path(repo).expanduser()
     if not base.is_absolute():
         base = (ROOT / base).resolve()
     return base / "tasks" / "seeds"
 
 
+def source_seeds_dir(source: str | None = None) -> Path:
+    """The canonical source ``tasks/seeds`` directory (config or override)."""
+    repo = source or CONFIG.get("source", {}).get("seed_repository", "../fable-code")
+    return seeds_dir(repo)
+
+
 def seed_complete(directory: Path) -> str | None:
     """Return a reason string if the source seed is NOT a complete unit."""
+    if not directory.is_dir():
+        return "directory absent"
     task_path = directory / "task.json"
     if not task_path.exists():
         return "no task.json"
@@ -73,11 +89,32 @@ def copy_seed(source_dir: Path, dest_dir: Path) -> None:
     staging.replace(dest_dir)
 
 
+def resolve(name: str, primary: Path, fallback: Path | None) -> tuple[Path, str, str]:
+    """Choose the source directory for one seed id.
+
+    Prefer the canonical source when complete; otherwise fall back. Returns
+    ``(chosen_dir, provenance, reason)`` where provenance is ``primary`` /
+    ``fallback`` / ``invalid`` and reason explains an invalid outcome.
+    """
+    primary_why = seed_complete(primary / name)
+    if primary_why is None:
+        return primary / name, "primary", ""
+    if fallback is not None:
+        fallback_why = seed_complete(fallback / name)
+        if fallback_why is None:
+            return fallback / name, "fallback", ""
+        return primary / name, "invalid", (
+            f"canonical: {primary_why}; fallback: {fallback_why}")
+    return primary / name, "invalid", f"canonical: {primary_why}"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--source",
-                        help="Override config.source.seed_repository")
+                        help="Override config.source.seed_repository (canonical)")
+    parser.add_argument("--fallback",
+                        help="Override config.source.fallback_repository")
     parser.add_argument("--only", help="Comma-separated seed ids to import")
     parser.add_argument("--force", action="store_true",
                         help="Overwrite seeds that already exist here")
@@ -85,36 +122,51 @@ def main(argv: list[str] | None = None) -> int:
                         help="Report what would be imported without copying")
     args = parser.parse_args(argv)
 
-    source = source_seeds_dir(args.source)
-    if not source.is_dir():
-        print(f"source seed directory not found: {source}", file=sys.stderr)
+    primary = source_seeds_dir(args.source)
+    if not primary.is_dir():
+        print(f"canonical seed directory not found: {primary}", file=sys.stderr)
         return 1
+    fallback_repo = args.fallback or CONFIG.get("source", {}).get("fallback_repository")
+    fallback = seeds_dir(fallback_repo) if fallback_repo else None
+    if fallback is not None and not fallback.is_dir():
+        print(f"fallback seed directory not found: {fallback}", file=sys.stderr)
+        return 1
+
     only = {value.strip() for value in args.only.split(",")} if args.only else None
     SEEDS_DIR.mkdir(parents=True, exist_ok=True)
 
-    imported, skipped, invalid = [], [], []
-    for source_dir in sorted(p for p in source.iterdir() if p.is_dir()):
-        name = source_dir.name
+    candidates = {p.name for p in primary.iterdir() if p.is_dir()}
+    if fallback is not None:
+        candidates |= {p.name for p in fallback.iterdir() if p.is_dir()}
+
+    imported, backfilled, skipped, invalid = [], [], [], []
+    for name in sorted(candidates):
         if only and name not in only:
             continue
-        why = seed_complete(source_dir)
-        if why:
-            invalid.append((name, why))
+        chosen, provenance, reason = resolve(name, primary, fallback)
+        if provenance == "invalid":
+            invalid.append((name, reason))
             continue
         dest = SEEDS_DIR / name
         if dest.exists() and not args.force:
             skipped.append(name)
             continue
         if not args.dry_run:
-            copy_seed(source_dir, dest)
+            copy_seed(chosen, dest)
         imported.append(name)
+        if provenance == "fallback":
+            backfilled.append(name)
 
     for name, why in invalid:
         print(f"[invalid ] {name}: {why}")
+    if backfilled:
+        print(f"[fallback] {len(backfilled)} from fallback: {', '.join(backfilled)}")
     total = len(imported) + len(skipped) + len(invalid)
     verb = "would import" if args.dry_run else "imported"
-    print(f"\n{len(imported)} {verb}, {len(skipped)} skipped (already present), "
-          f"{len(invalid)} invalid of {total} source seeds in {source}")
+    print(f"\n{len(imported)} {verb} ({len(backfilled)} via fallback), "
+          f"{len(skipped)} skipped (already present), {len(invalid)} invalid "
+          f"of {total} candidate seeds\n  canonical: {primary}\n  fallback:  "
+          f"{fallback if fallback is not None else '(none)'}")
     return 1 if invalid else 0
 
 

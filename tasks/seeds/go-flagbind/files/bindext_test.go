@@ -85,9 +85,9 @@ func TestBindSliceUntouchedWhenAbsent(t *testing.T) {
 func TestBindMissingRequiredFlag(t *testing.T) {
 	var c serveCfg
 	err := Bind(&c, []string{"--retries=1"})
-	var mfe *MissingFlagError
-	if !errors.As(err, &mfe) {
-		t.Fatalf("err = %v, want errors.As(err, **MissingFlagError) to succeed", err)
+	mfe, ok := err.(*MissingFlagError)
+	if !ok {
+		t.Fatalf("err = %T(%v), want a direct *MissingFlagError (not a wrapper)", err, err)
 	}
 	if mfe.Flag != "addr" {
 		t.Fatalf("MissingFlagError.Flag = %q, want addr", mfe.Flag)

@@ -27,7 +27,7 @@ def make_client():
     return boto3.client(
         "s3",
         region_name="us-east-1",
-        aws_access_key_id="AKIAFAKEFAKEFAKEFAKE",
+        aws_access_key_id="TEST_ACCESS_KEY_ID",
         aws_secret_access_key="dummy-secret-never-real",
         config=Config(retries={"total_max_attempts": 1}),
     )
