@@ -73,11 +73,6 @@ class Card(unittest.TestCase):
         self.assertIn("2 accepted trajectories", self.card)
         self.assertIn("**100%**", self.card)
 
-    def test_card_credits_moonshiner(self):
-        # moonshiner's license requires every dataset card to credit the harness.
-        self.assertIn("moonshiner", self.card)
-        self.assertIn("https://github.com/greghavens/moonshiner", self.card)
-
     def test_teacher_and_judge_from_config(self):
         self.assertIn(CONFIG["teacher"]["model"], self.card)
         self.assertIn(CONFIG["judge"]["model"], self.card)
@@ -103,6 +98,66 @@ class Card(unittest.TestCase):
         self.assertNotIn("question-answering", text)
         self.assertNotIn("Authorization scope", text)
         self.assertIn("Coding & Debugging", text)
+
+    def test_moonshiner_attribution_at_top(self):
+        # The attribution blockquote sits directly under the H1, before the
+        # intro, in every card moonshiner ever renders.
+        for text in (self.card, card.build_card([], stage="preview")):
+            self.assertIn(card.MOONSHINER_URL, text)
+            h1_end = text.index("\n", text.index("\n# ") + 1)
+            self.assertEqual(text[h1_end:].lstrip()[:1], ">")
+
+
+def _preview_row(task, lang, category):
+    return {
+        "task": task,
+        "lang": lang,
+        "category": category,
+        "teacher_runtime": "pi",
+        "teacher_model": "moonshotai/kimi-k3",
+        "provider": "openrouter",
+        "reasoning_effort": "max",
+        "model_attested": True,
+        "observed_models": ["moonshotai/kimi-k3"],
+        "trace_format": "pi-coding-agent-json-v3",
+        "n_messages": 4,
+        "messages": [
+            {"role": "user", "content": "fix it"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"function": {"name": "bash"}}]},
+            {"role": "tool", "content": "ok"},
+            {"role": "assistant", "content": "done"},
+        ],
+    }
+
+
+class PreviewCard(unittest.TestCase):
+    def setUp(self):
+        rows = [_preview_row("asm-bjval", "asm", "build-game"),
+                _preview_row("bash-argfwd", "bash", "debug-cli")]
+        self.card = card.build_card(rows, stage="preview")
+
+    def test_stage_is_validated(self):
+        with self.assertRaises(ValueError):
+            card.build_card([], stage="draft")
+
+    def test_in_progress_snapshot_no_release_claims(self):
+        self.assertIn("Generation in progress", self.card)
+        self.assertIn("2 verified", self.card.replace(",", ""))
+        self.assertNotIn("next-step rows across", self.card)
+        self.assertNotIn("moonshiner.py card", self.card)
+
+    def test_preview_schema_and_mix_from_rows(self):
+        self.assertIn("`trace_format`", self.card)
+        self.assertNotIn("`source_trajectory_id` | string", self.card)
+        self.assertIn("`build-game`", self.card)
+        self.assertIn("`asm`", self.card)
+        self.assertIn("`bash`", self.card)  # exercised tool, from tool_calls
+
+    def test_empty_preview_renders(self):
+        text = card.build_card([], stage="preview")
+        self.assertIn("Generation in progress", text)
+        self.assertIn("**0%**", text)  # attestation honest at zero rows
 
 
 if __name__ == "__main__":
