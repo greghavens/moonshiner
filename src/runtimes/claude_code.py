@@ -210,8 +210,10 @@ class ClaudeCodeRuntime(Runtime):
             stderr = (exc.stderr or b"").decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
         duration = time.monotonic() - started
 
-        (out_dir / "judge.jsonl").write_text(stdout)
-        (out_dir / "judge.stderr").write_text(stderr)
+        # Per-workspace names: a later review must not overwrite the stream
+        # needed to adjudicate this one.
+        (out_dir / f"{workspace.name}.judge.jsonl").write_text(stdout)
+        (out_dir / f"{workspace.name}.judge.stderr").write_text(stderr)
         meta = self._result_meta(stdout, stderr)
         last = self._final_text(stdout)
         return ReviewResult(
@@ -316,6 +318,14 @@ class ClaudeCodeRuntime(Runtime):
 
 
 def _parse_json(text: str) -> dict | None:
+    """Extract the judge's JSON verdict from its final text.
+
+    Judges wrap the verdict in prose or code fences, and sometimes emit a
+    preliminary object before the definitive one — a first-{-to-last-}
+    substring spans both and parses as nothing, rejecting a good trace.
+    Scan top-level objects with ``raw_decode`` (string-aware) and keep the
+    last one that parses: the final answer.
+    """
     text = (text or "").strip()
     if not text:
         return None
@@ -323,10 +333,16 @@ def _parse_json(text: str) -> dict | None:
         value = json.loads(text)
         return value if isinstance(value, dict) else None
     except json.JSONDecodeError:
-        start, end = text.find("{"), text.rfind("}")
-        if 0 <= start < end:
-            try:
-                return json.loads(text[start:end + 1])
-            except json.JSONDecodeError:
-                return None
-    return None
+        pass
+    decoder = json.JSONDecoder()
+    result = None
+    index = text.find("{")
+    while index != -1:
+        try:
+            value, end = decoder.raw_decode(text, index)
+            if isinstance(value, dict):
+                result = value
+            index = text.find("{", max(end, index + 1))
+        except json.JSONDecodeError:
+            index = text.find("{", index + 1)
+    return result
