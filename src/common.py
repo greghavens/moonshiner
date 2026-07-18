@@ -121,6 +121,20 @@ def key_file_path(runtime_config: dict) -> Path:
     return base / name
 
 
+def key_persist_path(runtime_config: dict) -> Path:
+    """This runtime's persistent key file under ``$XDG_CONFIG_HOME/moonshiner``.
+
+    The staged tmpfs file clears on reboot; this one does not. Same file name
+    as the staged copy. ``scripts/stage_key.sh`` writes both.
+    """
+    name = str((runtime_config or {}).get("key_file_name") or "").strip()
+    if not name:
+        name = f"moonshiner-{_provider_slug(runtime_config)}-key"
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "moonshiner" / name
+
+
 def provider_key_env_names(config: dict | None = None) -> tuple[str, ...]:
     """Every configured keyed runtime's key env name, for redaction gates."""
     names: list[str] = []
@@ -138,17 +152,18 @@ def provider_key_env_names(config: dict | None = None) -> tuple[str, ...]:
 
 @functools.lru_cache(maxsize=1)
 def _staged_secret_values() -> tuple[str, ...]:
-    """Contents of every configured runtime's staged key file, for redaction."""
+    """Contents of every runtime's staged and persistent key files, for redaction."""
     values: list[str] = []
     for runtime_config in (CONFIG.get("runtimes") or {}).values():
         if not isinstance(runtime_config, dict) or not runtime_config:
             continue
-        try:
-            staged = key_file_path(runtime_config).read_text().strip()
-        except (RuntimeError, OSError):
-            continue
-        if staged and staged not in values:
-            values.append(staged)
+        for path_of in (key_file_path, key_persist_path):
+            try:
+                secret = path_of(runtime_config).read_text().strip()
+            except (RuntimeError, OSError):
+                continue
+            if secret and secret not in values:
+                values.append(secret)
     return tuple(values)
 
 # Runtime-only artifacts: excluded from candidate diffs and cleaned before an

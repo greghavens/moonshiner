@@ -43,6 +43,11 @@ class KeyDerivation(unittest.TestCase):
         with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/xdg"}):
             self.assertEqual(str(auth.key_file_path(config)), "/xdg/custom-key")
 
+    def test_persist_file_derives_under_config_home(self):
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/cfg"}):
+            self.assertEqual(str(auth.key_persist_path(OPENROUTER)),
+                             "/cfg/moonshiner/moonshiner-openrouter-key")
+
     def test_keyless_runtime_raises(self):
         with self.assertRaises(RuntimeError):
             auth.key_env_name({"cli": "codex"})
@@ -60,6 +65,43 @@ class KeyDerivation(unittest.TestCase):
 
 
 class LoadProviderKey(unittest.TestCase):
+    def _isolated(self):
+        """Point all three key sources into an empty tempdir; return the
+        (staged, persisted) paths so a test can create either."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = pathlib.Path(tmp.name)
+        (root / "run").mkdir()
+        (root / "cfg").mkdir()
+        patcher = mock.patch.dict(os.environ, {
+            "XDG_RUNTIME_DIR": str(root / "run"),
+            "XDG_CONFIG_HOME": str(root / "cfg")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("OPENROUTER_API_KEY", None)
+        persisted = root / "cfg" / "moonshiner" / "moonshiner-openrouter-key"
+        persisted.parent.mkdir(parents=True)
+        return root / "run" / "moonshiner-openrouter-key", persisted
+
+    def test_staged_wins_over_persistent(self):
+        staged, persisted = self._isolated()
+        staged.write_text("from-staged")
+        persisted.write_text("from-persist")
+        self.assertEqual(auth.load_provider_key(OPENROUTER), "from-staged")
+
+    def test_persistent_survives_reboot_cleared_staging(self):
+        # A reboot clears the tmpfs staged file; the persistent copy must
+        # keep the run alive without re-staging.
+        _, persisted = self._isolated()
+        persisted.write_text("from-persist")
+        self.assertEqual(auth.load_provider_key(OPENROUTER), "from-persist")
+
+    def test_empty_staged_falls_through_to_persistent(self):
+        staged, persisted = self._isolated()
+        staged.write_text("   \n")
+        persisted.write_text("from-persist")
+        self.assertEqual(auth.load_provider_key(OPENROUTER), "from-persist")
+
     def test_env_wins_over_staged_file(self):
         with tempfile.TemporaryDirectory() as xdg:
             (pathlib.Path(xdg) / "moonshiner-openrouter-key").write_text("file")
@@ -74,12 +116,10 @@ class LoadProviderKey(unittest.TestCase):
                 os.environ.pop("OPENROUTER_API_KEY", None)
                 self.assertEqual(auth.load_provider_key(OPENROUTER), "k3y")
 
-    def test_missing_everywhere_names_both_sources(self):
-        with tempfile.TemporaryDirectory() as xdg:
-            with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": xdg}):
-                os.environ.pop("OPENROUTER_API_KEY", None)
-                with self.assertRaises(RuntimeError) as caught:
-                    auth.load_provider_key(OPENROUTER)
+    def test_missing_everywhere_names_every_source(self):
+        self._isolated()
+        with self.assertRaises(RuntimeError) as caught:
+            auth.load_provider_key(OPENROUTER)
         message = str(caught.exception)
         self.assertIn("OPENROUTER_API_KEY", message)
         self.assertIn("moonshiner-openrouter-key", message)
@@ -103,6 +143,22 @@ class ScrubConfiguredProviderKey(unittest.TestCase):
         with tempfile.TemporaryDirectory() as xdg:
             (pathlib.Path(xdg) / "moonshiner-openrouter-key").write_text(fake)
             with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": xdg}):
+                common._staged_secret_values.cache_clear()
+                try:
+                    out = common.scrub_text(f"leak {fake} end")
+                finally:
+                    common._staged_secret_values.cache_clear()
+        self.assertNotIn(fake, out)
+        self.assertIn("[REDACTED_SECRET]", out)
+
+    def test_persisted_file_value_is_redacted(self):
+        fake = "persist-secret-value-fedcba-135790"
+        with tempfile.TemporaryDirectory() as root:
+            key_dir = pathlib.Path(root) / "moonshiner"
+            key_dir.mkdir()
+            (key_dir / "moonshiner-openrouter-key").write_text(fake)
+            env = {"XDG_CONFIG_HOME": root, "XDG_RUNTIME_DIR": root}
+            with mock.patch.dict(os.environ, env):
                 common._staged_secret_values.cache_clear()
                 try:
                     out = common.scrub_text(f"leak {fake} end")
