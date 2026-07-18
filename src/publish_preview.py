@@ -125,19 +125,21 @@ def publish_once() -> int:
     if not dataset:
         raise SystemExit("config.publish.hf_dataset is not set")
     rows = _publishable_rows()
+    text = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
+    traces_sha = hashlib.sha256(text.encode()).hexdigest()
     card = build_card(rows, stage="preview")
     card_sha = hashlib.sha256(card.encode()).hexdigest()
     state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
-    tasks_changed = [row["task"] for row in rows] != state.get("published_tasks")
+    # The repair lane replaces a trace's bytes under an unchanged task id, so
+    # change detection must key on content, not the task list.
+    traces_changed = traces_sha != state.get("traces_sha256")
     card_changed = card_sha != state.get("card_sha256")
-    if not tasks_changed and not card_changed:
+    if not traces_changed and not card_changed:
         return len(rows)
 
     PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
     _sync_visibility(dataset)
-    if tasks_changed:
-        text = "".join(json.dumps(row, ensure_ascii=False) + "\n"
-                       for row in rows)
+    if traces_changed:
         _secret_scan(text)
         PREVIEW_FILE.write_text(text)
         _upload(dataset, PREVIEW_FILE, "traces.jsonl")
@@ -147,6 +149,7 @@ def publish_once() -> int:
         _upload(dataset, PREVIEW_CARD, "README.md")
     STATE_FILE.write_text(json.dumps(
         {"published_tasks": [row["task"] for row in rows],
+         "traces_sha256": traces_sha,
          "card_sha256": card_sha}, indent=2))
     print(f"published {len(rows)} verified traces"
           f"{' + card' if card_changed else ''} -> {dataset}", flush=True)
