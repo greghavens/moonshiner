@@ -1,59 +1,90 @@
 # moonshiner
 
-A single, unified harness for **full-model distillation of coding ability**. It
-drives a configurable *teacher* coding agent through a corpus of real repair
-tasks, keeps only the traces that provably pass a deterministic screen **and** an
-independent *judge*, and renders the survivors into a supervised fine-tuning
-dataset for a student model.
-
-One codebase, two ways to run it:
-
-- **As one process** — `python3 moonshiner.py run` executes the whole pipeline
-  end to end, idempotent and fail-closed.
-- **By an AI agent, one phase at a time** — every phase is its own subcommand
-  (`python3 moonshiner.py generate --all`, `… screen --all --review`, …) with
-  its native arguments, so an agent can drive, inspect, and safely re-run any
-  step.
-
-The teacher runtime, its model and reasoning level, and the judge (model and
-runtime) are all configurable — a Codex teacher can be judged by Claude, a Pi/GLM
-teacher judged by Codex, and so on.
+A single, unified harness for **full-model distillation of coding ability** (with
+an optional defensive-security lane). It drives a configurable *teacher* coding
+agent through a corpus of real repair tasks, keeps only the traces that provably
+pass a deterministic screen **and** an independent *judge*, and renders the
+survivors into a supervised fine-tuning dataset — plus a matching Hugging Face
+dataset card — for a student model.
 
 ---
 
 ## Quickstart
 
+The intended way to run moonshiner is through **[`KICKOFF.md`](KICKOFF.md)** — a
+templated prompt you hand to a coding agent:
+
+1. **Clone this repository — your clone *is* your trace repo.** Every run's
+   traces, datasets, and run logs accumulate inside it (all gitignored, so they
+   stay local to your clone and are never pushed back here). Work from the clone.
+
+   ```bash
+   git clone https://github.com/greghavens/moonshiner.git
+   cd moonshiner
+   ```
+2. **Open [`KICKOFF.md`](KICKOFF.md) and fill in the run-specific values** — your
+   teacher model and provider, the judge, and the Hugging Face dataset id (all of
+   which live in `config.json`).
+3. **Point a coding agent at your clone and tell it: "Follow KICKOFF.md."**
+4. The agent runs the whole pipeline end to end — generate → screen → build →
+   export — and stages a Hugging Face dataset with an auto-populated card.
+
+That's the whole story. Everything below is reference for tuning the config or
+driving the pipeline by hand.
+
+---
+
+## License
+
+moonshiner is free to **copy, use, modify, and fork** — the one condition is
+**attribution**:
+
+- **Credit the original repository** — <https://github.com/greghavens/moonshiner> —
+  in any copy or fork.
+- **Datasets and models produced with moonshiner must also credit moonshiner.**
+  The `card` phase writes that credit onto every dataset card automatically; don't
+  strip it.
+
+See [`LICENSE`](LICENSE) for the full terms.
+
+---
+
+## Run it yourself (by hand)
+
+If you'd rather drive the pipeline directly instead of through an agent:
+
 ```bash
-# Offline sanity gate — byte-compile + unit tests + seed audit. No model, no net.
-scripts/check.sh
-
-# See exactly what a full run would do, without running it.
-python3 moonshiner.py run --dry-run
-
-# Check that the configured teacher and judge are reachable and authenticated.
-python3 moonshiner.py preflight
-
-# Run the whole pipeline, end to end.
-python3 moonshiner.py run
+scripts/check.sh                       # offline sanity gate: byte-compile + tests + seed audit. No model, no net.
+python3 moonshiner.py run --dry-run    # see exactly what a full run would do
+python3 moonshiner.py preflight        # are the configured teacher + judge reachable and authed?
+python3 moonshiner.py run              # the whole pipeline, end to end
 ```
 
-Everything up to (but not including) trace generation is **offline** — no model
-calls, no network — so the seed corpus, audits, dataset assembly, and exports
-can all be exercised for free:
+Everything up to trace generation is **offline** — the seed corpus, audits,
+dataset assembly, and exports all run for free:
 
 ```bash
-python3 moonshiner.py run --offline          # only phases that call no model
-python3 moonshiner.py run --to audit          # import + audit, then stop
-python3 moonshiner.py run --offline --with validate   # add the solvability proof
+python3 moonshiner.py run --offline    # only phases that call no model
+python3 moonshiner.py run --to audit    # import + audit, then stop
+```
+
+Each phase is also a standalone subcommand that takes its own arguments and passes
+`--help` straight through:
+
+```bash
+python3 moonshiner.py generate --all
+python3 moonshiner.py screen --all --review
+python3 moonshiner.py retry --limit 4
+python3 moonshiner.py phases            # list the pipeline
 ```
 
 ---
 
 ## The pipeline
 
-`run` executes the non-optional phases in order. Optional phases (a no-model
-solvability proof, and a repair lane for rejected traces) fold in only when asked
-for with `--with`.
+`run` executes the non-optional phases in order. Optional phases (a repair lane
+for rejected traces, and the security lane) fold in only when asked for with
+`--with`.
 
 | # | phase | cost | what it does |
 |---|-------|------|--------------|
@@ -61,7 +92,6 @@ for with `--with`.
 | 1.1 | `sec-import`\* | offline | Import the fable-secure security corpus (catalog + held-out keys) |
 | 1.2 | `sec-fetch`\* | offline | Hydrate the pinned security-review repositories |
 | 2 | `audit` | offline | Audit seed integrity, fail-closed |
-| 2.5 | `validate`\* | offline | Prove each seed is solvable, with no model calls |
 | 3 | `generate` | **metered** | Drive the teacher to produce candidate traces |
 | 3.1 | `sec-generate`\* | **metered** | Drive the teacher over the security corpus (rejection-sampled) |
 | 4 | `screen` | **metered** | Screen traces: deterministic gates, then the judge |
@@ -76,9 +106,9 @@ for with `--with`.
 | 11 | `verify-export` | offline | Validate the export against provenance + privacy gates |
 | 11.5 | `card` | offline | Render the Hugging Face dataset card from the published rows |
 
-`\*` optional — folded in only via `--with` (e.g. `--with validate`, `--with retry`,
-or the security lane `--with sec-import --with sec-fetch --with sec-generate
---with sec-build`). See [The security lane](#the-security-lane-optional).
+`\*` optional — folded in only via `--with` (e.g. `--with retry`, or the security
+lane `--with sec-import --with sec-fetch --with sec-generate --with sec-build`).
+See [The security lane](#the-security-lane-optional).
 
 Run selection:
 
@@ -86,24 +116,12 @@ Run selection:
 python3 moonshiner.py run --from generate --to screen   # a slice, inclusive
 python3 moonshiner.py run --skip parquet                 # drop a phase
 python3 moonshiner.py run --continue-on-error            # don't stop at the first failure
-python3 moonshiner.py phases                             # list the pipeline
 ```
 
 `run` is **fail-closed**: a non-zero phase stops the pipeline unless
-`--continue-on-error`. Metered phases preflight their runtime and refuse to run
-if it is unreachable, unauthenticated, or (for a paid runtime) not
-credit-unlocked — nothing is silently skipped.
-
-Each phase is also a standalone subcommand that takes its own arguments and
-passes `--help` straight through:
-
-```bash
-python3 moonshiner.py generate --all
-python3 moonshiner.py screen --all --review
-python3 moonshiner.py retry --limit 4
-python3 moonshiner.py audit --ids
-python3 moonshiner.py screen --help
-```
+`--continue-on-error`. Metered phases preflight their runtime and refuse to run if
+it is unreachable, unauthenticated, or (for a paid runtime) not credit-unlocked —
+nothing is silently skipped.
 
 ---
 
@@ -115,7 +133,7 @@ per-run user state.)
 ### Teacher and judge
 
 ```json
-"teacher": { "runtime": "codex", "model": "gpt-5.6-sol", "reasoning": "xhigh", "timeout_s": 3600 },
+"teacher": { "runtime": "pi", "model": "moonshotai/kimi-k3", "reasoning": "max", "timeout_s": 3600 },
 "judge":   { "runtime": "codex", "model": "gpt-5.6-sol", "reasoning": "xhigh", "timeout_s": 1800 }
 ```
 
@@ -136,12 +154,16 @@ per-run user state.)
 ```
 
 Each runtime is an adapter under `src/runtimes/` implementing a common interface
-(generate a trace, run a read-only review). A trace records the `trace_format`
-its runtime produced; on the way back in, `normalize` routes that format to the
+(generate a trace, run a read-only review). A trace records the `trace_format` its
+runtime produced; on the way back in, `normalize` routes that format to the
 matching parser, so the rest of the pipeline is runtime-agnostic.
 
 Supported trace formats: `claude-stream-json`, `codex-exec-events`,
 `codex-rollout`, `pi-coding-agent-json-v3`.
+
+Keyed runtimes (an OpenAI-compatible `pi` provider) read their API key from
+`key_env` first, then a mode-0600 file staged by `scripts/stage_key.sh` under
+`$XDG_RUNTIME_DIR` — see [`KICKOFF.md`](KICKOFF.md), Step 2.
 
 ### Student, build, source
 
@@ -153,13 +175,24 @@ Supported trace formats: `claude-stream-json`, `codex-exec-events`,
 "holdout_tasks": ["ts-event-emitter", "go-interval-merge"]
 ```
 
+### Publish
+
+```json
+"publish": { "hf_dataset": "<namespace>/<dataset>", "private": true }
+```
+
+Set `hf_dataset` before a run so the generated card's attribution URL is correct.
+`pretty_name` and `license` are also overridable here (the card defaults to
+`cc-by-4.0`). The moonshiner credit on the card is a license requirement and is
+not overridable.
+
 ---
 
 ## The seed corpus
 
-Seeds are real repair tasks (a prompt, a verify command, protected test files,
-and — for solvability — a reference fix). They are tracked in-tree under
-`tasks/seeds/`, imported from two sources with a deliberate precedence:
+Seeds are real repair tasks (a prompt, a verify command, protected test files, and
+a reference fix). They are tracked in-tree under `tasks/seeds/`, imported from two
+sources with a deliberate precedence:
 
 - **`seed_repository`** (`../fable-code`) is **canonical**. Its version of a seed
   wins whenever it is complete.
@@ -167,24 +200,20 @@ and — for solvability — a reference fix). They are tracked in-tree under
   canonical source lacks or left incomplete (an authoring agent that died
   mid-write, a rejected stub).
 
-This encodes the rule *"canonical unless it is off, then fall back"*. A seed
-that is incomplete in **both** sources is reported invalid and never
-half-copied. The merge is deterministic and reproducible:
+This encodes the rule *"canonical unless it is off, then fall back"*. A seed that
+is incomplete in **both** sources is reported invalid and never half-copied. The
+merge is deterministic and reproducible:
 
 ```bash
 python3 moonshiner.py import --dry-run   # report provenance without copying
 python3 moonshiner.py import --force      # reproduce the merge deterministically
 ```
 
-A seed is **complete** when its `task.json` parses with every required field,
-its `id` matches the directory name, `files/` exists, and every protected
-`test_files` entry is present. `audit` additionally requires a non-empty
-`reference_fix.patch` (holdout and pre-spec pilot tasks are exempt — their
-solvability is proven by held-out evaluation or actual passing traces).
-
-`validate` (optional, offline) goes further and *proves* solvability without a
-model: it materializes a fresh workspace, applies the reference fix, and runs the
-seed's own verify command.
+A seed is **complete** when its `task.json` parses with every required field, its
+`id` matches the directory name, `files/` exists, and every protected `test_files`
+entry is present. `audit` additionally requires a non-empty `reference_fix.patch`
+(holdout and pre-spec pilot tasks are exempt — their solvability is proven by
+held-out evaluation or actual passing traces).
 
 ---
 
@@ -201,33 +230,32 @@ A trace is publishable only if it clears both screens.
 3. **Patch replay** — apply the candidate diff to a fresh workspace and run the
    verify command **twice**; both must pass.
 4. **Protected files** — the seed's test files are byte-for-byte unchanged.
-5. **Static scope** — no prohibited action (git-state mutation, workspace
-   escape, `/tmp` use, global install, nested agent, leaked secret) appears in
-   the trace.
+5. **Static scope** — no prohibited action (git-state mutation, workspace escape,
+   `/tmp` use, global install, nested agent, leaked secret) appears in the trace.
 
-**Judge** (independent, configurable): the runtime named by `config.judge`
-reviews the trace read-only and returns a schema-constrained verdict. Acceptance
-requires every review category clear and every stated requirement met.
+**Judge** (independent, configurable): the runtime named by `config.judge` reviews
+the trace read-only and returns a schema-constrained verdict. Acceptance requires
+every review category clear and every stated requirement met.
 
-Rejections feed the optional **repair lane** (`retry`): a rejected trace is
-re-run with concrete feedback derived from exactly what the screen or judge
-found, then rescreened.
+Rejections feed the optional **repair lane** (`retry`): a rejected trace is re-run
+with concrete feedback derived from exactly what the screen or judge found, then
+rescreened.
 
 ---
 
 ## The security lane (optional)
 
 A parallel, opt-in lane distills **defensive** security ability — finding and
-classifying vulnerabilities — from the sibling `../fable-secure` corpus. It is
-off by default; fold it in with `--with sec-import --with sec-fetch --with
+classifying vulnerabilities — from the sibling `../fable-secure` corpus. It is off
+by default; fold it in with `--with sec-import --with sec-fetch --with
 sec-generate --with sec-build`, or run any phase on its own
 (`python3 moonshiner.py sec-generate --only sec-answer-42`).
 
 Two case kinds, each with its own held-out grader:
 
-- **Answer cases** — a blind question (classify a snippet by CWE/OWASP, explain
-  an attacker primitive, review a diff). The teacher never sees the reference
-  answer; a separate low-effort judge grades against it, behind a deterministic
+- **Answer cases** — a blind question (classify a snippet by CWE/OWASP, explain an
+  attacker primitive, review a diff). The teacher never sees the reference answer;
+  a separate low-effort judge grades against it, behind a deterministic
   label-shape gate that requires well-formed `CWE-###` / `A##:20##` labels for
   classification tasks.
 - **Repo reviews** — a whole, pinned vulnerable repository. The teacher writes
@@ -238,23 +266,20 @@ Two case kinds, each with its own held-out grader:
 Three properties make the lane safe to run:
 
 - **Firewall.** The teacher only ever sees `security/catalog/`; the reference
-  answers and planted-finding keys live in `security/keys/` and are opened only
-  by the host-side grader, never copied into a teacher workspace.
+  answers and planted-finding keys live in `security/keys/` and are opened only by
+  the host-side grader, never copied into a teacher workspace.
 - **Rejection sampling.** Each case is retried a few times and only a *passing*
   attempt is exposed to the dataset builder.
 - **Sandbox.** The security teacher runs inside a Bubblewrap namespace that hides
-  the real home (repositories and saved auth) and re-binds only a disposable
-  workspace plus a short-lived `CODEX_HOME`; the copied credential is unlinked at
-  `thread.started`, before any model-generated command can run. This requires
-  `bwrap` and refuses to run without it.
+  the real home and re-binds only a disposable workspace plus a short-lived
+  `CODEX_HOME`; the copied credential is unlinked before any model-generated
+  command can run. This requires `bwrap` and refuses to run without it.
 
-`sec-build` renders passing traces into `data/security/{train,val}.jsonl` using
-the same row schema as the coding lane (and the same full-tool-list contract —
-every row lists the sandboxed teacher's whole `exec`/`apply_patch`/`update_plan`
-surface). The main `build` phase folds those files in automatically when they are
-present, so the security rows ride the same expand/export/prepare path as
-everything else. The corpus, keys, traces, and ephemeral runtime are all
-gitignored.
+`sec-build` renders passing traces into `data/security/{train,val}.jsonl` using the
+same row schema as the coding lane. The main `build` phase folds those files in
+automatically when present, so the security rows ride the same
+expand/export/prepare path as everything else. The corpus, keys, traces, and
+ephemeral runtime are all gitignored.
 
 ---
 
@@ -267,18 +292,17 @@ host-specific paths scrubbed throughout:
   optionally keeping reasoning/thinking).
 - **`expand`** derives one cumulative *next-assistant-action* row per assistant
   step, so the student learns to take the next action from any prefix.
-- **`export` / `export-next`** stage the whole-session and next-step datasets
-  into tracked HF JSONL.
+- **`export` / `export-next`** stage the whole-session and next-step datasets into
+  tracked HF JSONL.
 - **`parquet`** writes optional Parquet shards.
-- **`prepare`** renders each row with the *student model's own* chat template
-  into the local training directory (`student.output_dir`).
+- **`prepare`** renders each row with the *student model's own* chat template into
+  the local training directory (`student.output_dir`).
 - **`verify-export`** fails closed if any export violates a provenance or privacy
   gate.
 - **`card`** renders `data/hf-publish/README.md` — a Hugging Face dataset card
   auto-populated from the published rows (the real language/category/domain mix,
   tool surface, splits, teacher/judge, and model-attestation rate), so every
-  dataset ships a card that matches its data. Override the `pretty_name`,
-  `license`, and Hub id via `config.publish`.
+  dataset ships a card that matches its data and credits moonshiner.
 
 ---
 
@@ -303,26 +327,28 @@ cleanly when a runtime hits a usage-limit backoff.
 
 ## Offline gate and tests
 
-`scripts/check.sh` is the pre-commit / CI gate — byte-compile, the unit suite,
-and the seed audit, with no model calls or network:
+`scripts/check.sh` is the pre-commit / CI gate — byte-compile, the unit suite, and
+the seed audit, with no model calls or network:
 
 ```bash
 scripts/check.sh
-# == byte-compile … ==  == unit tests …  OK ==  868 complete, 0 partial  check: OK
+# == byte-compile … ==  == unit tests …  OK ==  873 complete, 0 partial  check: OK
 ```
 
 The `tests/` suite is model-free and offline: usage-limit backoff, seed
 import/audit, secret/path scrubbing, fingerprinting, format routing, screening
-gates, dataset transforms, and the orchestrator's phase planner. Run it directly
-with `python3 -m unittest discover -s tests`.
+gates, dataset transforms, the card generator, and the orchestrator's phase
+planner. Run it directly with `python3 -m unittest discover -s tests`.
 
 ---
 
 ## Repository layout
 
 ```
+KICKOFF.md             Templated kickoff prompt — fill in, hand to a coding agent to run the pipeline
+LICENSE                Free to use/fork with attribution; datasets must credit moonshiner
 moonshiner.py          Single-process orchestrator + per-phase dispatch (the entry point)
-config.json            Teacher, judge, runtimes, student, source, holdout config
+config.json            Teacher, judge, runtimes, student, source, publish, holdout config
 tasks/seeds/           The tracked seed corpus (imported; canonical + fallback)
 schemas/               JSON Schemas for the judge's verdict
 scripts/
@@ -335,7 +361,6 @@ src/
   common.py            Shared core: config, seed loading, workspaces, scrubbing, hashing
   import_seeds.py      Import corpus from canonical + fallback sources
   audit_seeds.py       Fail-closed seed-integrity audit
-  validate_seeds.py    No-model solvability proof
   generate_traces.py   Drive the teacher runtime to produce traces
   screen_traces.py     Deterministic gates + independent judge
   retry_rejected_traces.py   Repair lane for rejections
@@ -347,7 +372,7 @@ src/
   validate_hf_export.py      Provenance + privacy export gate
   normalize.py         trace_format -> the adapter that parses it
   import_security_cases.py   Import the fable-secure security corpus (catalog + keys)
-  fetch_security_corpus.py   Hydrate the 18 pinned security-review repositories
+  fetch_security_corpus.py   Hydrate the pinned security-review repositories
   security_runtime.py  Bubblewrap-sandboxed Codex runner for the security lane
   generate_security_traces.py   Blind-solve + grade security cases (rejection-sampled)
   build_security_dataset.py     Passing security traces -> data/security partition
@@ -364,3 +389,4 @@ src/
 
 Generated artifacts — `workspaces/`, `traces/`, `data/`, `runs/`,
 `node_modules/` — are gitignored and never committed.
+```

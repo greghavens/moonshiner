@@ -73,6 +73,11 @@ class Card(unittest.TestCase):
         self.assertIn("2 accepted trajectories", self.card)
         self.assertIn("**100%**", self.card)
 
+    def test_card_credits_moonshiner(self):
+        # moonshiner's license requires every dataset card to credit the harness.
+        self.assertIn("moonshiner", self.card)
+        self.assertIn("https://github.com/greghavens/moonshiner", self.card)
+
     def test_teacher_and_judge_from_config(self):
         self.assertIn(CONFIG["teacher"]["model"], self.card)
         self.assertIn(CONFIG["judge"]["model"], self.card)

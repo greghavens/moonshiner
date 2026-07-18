@@ -27,6 +27,11 @@ TRACES = PUBLISH_DIR / "traces.jsonl"
 CARD = PUBLISH_DIR / "README.md"
 SEEDS_DIR = ROOT / "tasks" / "seeds"
 
+# moonshiner's license requires every dataset it produces to credit the harness.
+# This is a hard attribution term (see LICENSE), so the credit is baked into every
+# card and is not overridable by config.
+MOONSHINER_URL = "https://github.com/greghavens/moonshiner"
+
 # One row per published column, in the exact export order, with a consumer-facing
 # description. Kept in lockstep with export_hf_next_steps.PUBLISH_KEY_ORDER.
 COLUMN_DOCS: tuple[tuple[str, str, str], ...] = (
@@ -378,9 +383,18 @@ for exact-prefix continuity and split-disjointness before publication.
 
 ## License
 
-Released under **{license_id}**. If you use this dataset, please attribute it:
+Released under **{license_id}**. If you use this dataset, please credit **both**
+the dataset and the harness that produced it:
 
 > {pretty_name} — https://huggingface.co/datasets/{hub_id}
+>
+> Created with **moonshiner** — {MOONSHINER_URL}
+
+---
+
+*Created with [moonshiner]({MOONSHINER_URL}) — an open harness for full-model
+distillation of coding and defensive-security ability. Crediting moonshiner is a
+condition of its license.*
 """
 
 
