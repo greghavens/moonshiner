@@ -1,0 +1,1 @@
+"""HTTP-shaped allocation adapter."""
