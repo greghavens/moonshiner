@@ -11,6 +11,7 @@ could otherwise claim an unverified identity.
 from __future__ import annotations
 
 import json
+import sys
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -128,12 +129,26 @@ def _make_handler(upstream: str, real_key: str, audit: Audit):
     return Handler
 
 
+class _QuietDisconnectServer(ThreadingHTTPServer):
+    """Suppress tracebacks for client disconnects, keep everything else loud.
+
+    The sandboxed agent may abort or retry a request while the relay is
+    writing the response back; the audit entry is recorded before that write,
+    so a broken pipe here loses nothing and is not an error of the proxy.
+    """
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], ConnectionError):
+            return
+        super().handle_error(request, client_address)
+
+
 class ProxySession:
     """A running loopback proxy; ``base_url`` is what the sandbox should use."""
 
     def __init__(self, upstream: str, real_key: str):
         self.audit = Audit()
-        self._server = ThreadingHTTPServer(
+        self._server = _QuietDisconnectServer(
             ("127.0.0.1", 0), _make_handler(upstream, real_key, self.audit))
         self._thread = threading.Thread(target=self._server.serve_forever,
                                         daemon=True)
