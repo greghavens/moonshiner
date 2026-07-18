@@ -1,4 +1,4 @@
-"""Pi coding-agent (Z.ai GLM) teacher and judge adapter.
+"""Pi coding-agent teacher and judge adapter (any OpenAI-compatible provider).
 
 Two isolation layers protect the metered provider key. First, a host-side
 loopback proxy (:mod:`runtimes.zai_proxy`) holds the real key and hands the

@@ -8,6 +8,7 @@ everything runtime-agnostic lives here so one pipeline can distill any model.
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
@@ -44,7 +45,8 @@ QUARANTINE_DIR = TRACES / "quarantine"
 
 # Explicit acknowledgement required before any metered teacher/judge call. The
 # claude-code and codex accounts bill real credits; pi routes through a paid
-# Z.ai key. Guarded launchers refuse to run without this exact value.
+# provider key (Z.ai, OpenRouter, …). Guarded launchers refuse to run without
+# this exact value.
 PAID_RUN_UNLOCK = "CREDITS_PURCHASED"
 
 # The portable contract baked into every training row's system turn. Whatever
@@ -78,6 +80,76 @@ SECRET_RE = re.compile(
 RUNTIME_PATH_RE = re.compile(
     r"/var/tmp/moonshiner-(?:pi|security)-runtime/(?:run|probe-run)-[A-Za-z0-9._-]+"
 )
+
+
+# --------------------------------------------------------------------------- #
+# Provider credentials — PER PROVIDER, so several keyed runtimes can coexist  #
+# in one run. Each keyed runtime derives its own env var and staged file      #
+# from its `provider`; explicit `key_env`/`key_file_name` override.           #
+# --------------------------------------------------------------------------- #
+def _provider_slug(runtime_config: dict) -> str:
+    """A filesystem/env-safe slug of the runtime's provider, or raise."""
+    provider = str((runtime_config or {}).get("provider") or "").strip()
+    slug = re.sub(r"[^a-z0-9]+", "-", provider.lower()).strip("-")
+    if not slug:
+        raise RuntimeError(
+            "runtime config names no provider: set 'provider' (or an explicit "
+            "'key_env'/'key_file_name') so its credential cannot be confused "
+            "with another provider's")
+    return slug
+
+
+def key_env_name(runtime_config: dict) -> str:
+    """The env var holding this runtime's provider key (<PROVIDER>_API_KEY)."""
+    explicit = str((runtime_config or {}).get("key_env") or "").strip()
+    if explicit:
+        return explicit
+    return _provider_slug(runtime_config).replace("-", "_").upper() + "_API_KEY"
+
+
+def key_file_path(runtime_config: dict) -> Path:
+    """This runtime's staged key file under $XDG_RUNTIME_DIR.
+
+    Defaults to ``moonshiner-<provider>-key`` so two providers never share a
+    file; ``key_file_name`` overrides. ``scripts/stage_key.sh`` writes it.
+    """
+    name = str((runtime_config or {}).get("key_file_name") or "").strip()
+    if not name:
+        name = f"moonshiner-{_provider_slug(runtime_config)}-key"
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    base = Path(xdg) if xdg else Path(f"/run/user/{os.getuid()}")
+    return base / name
+
+
+def provider_key_env_names(config: dict | None = None) -> tuple[str, ...]:
+    """Every configured keyed runtime's key env name, for redaction gates."""
+    names: list[str] = []
+    for runtime_config in ((config or CONFIG).get("runtimes") or {}).values():
+        if not isinstance(runtime_config, dict):
+            continue
+        try:
+            name = key_env_name(runtime_config)
+        except RuntimeError:          # not a keyed provider (OAuth runtimes)
+            continue
+        if name not in names:
+            names.append(name)
+    return tuple(names)
+
+
+@functools.lru_cache(maxsize=1)
+def _staged_secret_values() -> tuple[str, ...]:
+    """Contents of every configured runtime's staged key file, for redaction."""
+    values: list[str] = []
+    for runtime_config in (CONFIG.get("runtimes") or {}).values():
+        if not isinstance(runtime_config, dict) or not runtime_config:
+            continue
+        try:
+            staged = key_file_path(runtime_config).read_text().strip()
+        except (RuntimeError, OSError):
+            continue
+        if staged and staged not in values:
+            values.append(staged)
+    return tuple(values)
 
 # Runtime-only artifacts: excluded from candidate diffs and cleaned before an
 # independent screening replay. Verification can recreate them after the agent
@@ -357,8 +429,12 @@ def scrub_text(value: str, workspace: str | None = None) -> str:
     value = value.replace(str(ROOT), "/repo")
     value = value.replace(str(Path.home()), "~")
     value = RUNTIME_PATH_RE.sub("/runtime", value)
-    for env_name in ("ZAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+    static_names = ("ZAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+                    "OPENROUTER_API_KEY", "HF_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
+    for env_name in dict.fromkeys(static_names + provider_key_env_names()):
         secret = os.environ.get(env_name)
         if secret:
             value = value.replace(secret, "[REDACTED_SECRET]")
+    for secret in _staged_secret_values():
+        value = value.replace(secret, "[REDACTED_SECRET]")
     return SECRET_RE.sub("[REDACTED_SECRET]", value).strip()

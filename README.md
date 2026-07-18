@@ -328,6 +328,7 @@ schemas/               JSON Schemas for the judge's verdict
 scripts/
   check.sh             Offline gate: byte-compile + tests + seed audit
   batch.sh             Detach a long job into a systemd --user scope
+  stage_key.sh         Stage a per-provider API key under $XDG_RUNTIME_DIR (0600)
   quality_loop.sh      Rolling screen + repair loop
 tests/                 Model-free offline unit suite
 src/

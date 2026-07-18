@@ -14,13 +14,16 @@ import argparse
 import json
 from pathlib import Path
 
-from common import ROOT, SECRET_RE
+from common import ROOT, SECRET_RE, provider_key_env_names
 from expand_next_steps import DERIVATION
 from export_hf_next_steps import DEFAULT_OUTPUT, PUBLISH_KEY_ORDER
 
-FORBIDDEN_SUBSTRINGS = ("reference_answer", "ZAI_API_KEY", "ANTHROPIC_API_KEY",
-                        "OPENAI_API_KEY", "OPENROUTER_API_KEY",
-                        "CLAUDE_CODE_OAUTH_TOKEN")
+# Static names plus every configured runtime's key_env, so a newly configured
+# provider is covered by the privacy gate without editing this list.
+FORBIDDEN_SUBSTRINGS = tuple(dict.fromkeys(
+    ("reference_answer", "ZAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+     "OPENROUTER_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
+    + provider_key_env_names()))
 
 
 def validate(path: Path) -> int:
