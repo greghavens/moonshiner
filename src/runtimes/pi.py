@@ -108,11 +108,22 @@ class PiRuntime(Runtime):
         (runtime_dir / "run").mkdir(parents=True, exist_ok=True)
         config = runtime_dir / "config"
         config.mkdir(parents=True, exist_ok=True)
-        models = {"providers": {self.runtime_config.get("provider", "zai"): {
+        # pi 0.80.7 models.json schema: models is a list of OBJECTS with a
+        # required "id" (a bare-string list fails validation and pi silently
+        # falls back to the built-in provider, bypassing the proxy). api and
+        # apiKey are declared explicitly rather than inherited so the entry is
+        # self-contained even for a built-in provider name.
+        provider_entry: dict = {
             "baseUrl": proxy_base_url,
+            "api": self.runtime_config.get("api", "openai-completions"),
             "apiKey": DUMMY_TOKEN,
-            "models": [self.role["model"]],
-        }}}
+            "models": [{"id": self.role["model"], "reasoning": True}],
+        }
+        thinking_format = self.runtime_config.get("thinking_format")
+        if thinking_format:
+            provider_entry["compat"] = {"thinkingFormat": thinking_format}
+        models = {"providers": {
+            self.runtime_config.get("provider", "zai"): provider_entry}}
         (config / "models.json").write_text(json.dumps(models, indent=2))
         (config / "settings.json").write_text(json.dumps({
             "compaction": {"enabled": False},
@@ -135,27 +146,33 @@ class PiRuntime(Runtime):
                 "--setenv", "USER", "moonshiner-agent",
                 "--setenv", "LOGNAME", "moonshiner-agent",
                 "--setenv", "XDG_RUNTIME_DIR", str(runtime_dir / "run"),
+                "--setenv", "PI_CODING_AGENT_DIR", str(runtime_dir / "config"),
                 "--chdir", str(workspace), "--"]
         return cmd + inner
 
     def _pi_cmd(self, runtime_dir: Path, *, system_prompt: str,
-                tools: list[str] | None, schema_path: Path | None,
-                read_only: bool) -> list[str]:
+                tools: list[str] | None, read_only: bool) -> list[str]:
+        # pi 0.80.7: the agent config dir (models.json/settings.json) is
+        # selected via the PI_CODING_AGENT_DIR env var set in _sandbox_cmd —
+        # there is no --config-dir flag, and no --output-schema (a judge
+        # verdict is parsed from the last assistant message instead).
+        # --print is required for non-interactive mode; the prompt arrives on
+        # stdin and is folded into the initial message. --api-key pins the
+        # runtime credential to the proxy's dummy token as a second path
+        # alongside the models.json apiKey.
         cli = str(runtime_dir / "node_modules" / ".bin" / "pi")
-        cmd = [cli, "--mode", "json",
+        cmd = [cli, "--print", "--mode", "json",
                "--provider", self.runtime_config.get("provider", "zai"),
                "--model", self.role["model"],
+               "--api-key", DUMMY_TOKEN,
                "--thinking", self.role.get("reasoning", "max"),
                "--system-prompt", system_prompt,
-               "--config-dir", str(runtime_dir / "config"),
                "--session-dir", str(runtime_dir / "home" / "session"),
                "--offline", "--no-skills", "--no-context-files", "--no-approve"]
         if tools is not None:
             cmd += ["--tools", ",".join(tools)]
         if not read_only:
             cmd += ["--extension", str(runtime_dir / "config" / "bash-timeout-guard.js")]
-        if schema_path is not None:
-            cmd += ["--output-schema", str(schema_path)]
         return cmd
 
     def _child_env(self) -> dict:
@@ -197,13 +214,11 @@ class PiRuntime(Runtime):
         timed_out = False
         try:
             self._prepare_runtime(runtime_dir, proxy.base_url)
-            schema_path = None
-            if schema is not None:
-                schema_path = runtime_dir / "config" / "schema.json"
-                schema_path.write_text(json.dumps(schema))
+            # `schema` has no CLI channel in pi 0.80.7; judge instructions
+            # embed the expected JSON shape and run_review parses the last
+            # assistant message.
             inner = self._pi_cmd(runtime_dir, system_prompt=system_prompt,
-                                  tools=tools, schema_path=schema_path,
-                                  read_only=read_only)
+                                  tools=tools, read_only=read_only)
             cmd = self._sandbox_cmd(inner, workspace, runtime_dir)
             try:
                 proc = subprocess.run(
