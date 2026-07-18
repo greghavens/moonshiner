@@ -1,11 +1,14 @@
 """Deterministic screening gates and repair-feedback synthesis. Model-free.
 
-Only offline behavior is exercised: the freshness gate (seed fingerprint) and
-the feedback text a rejection turns into. Patch-replay/judge paths need a real
-workspace + runtime and are covered by the pipeline, not here.
+Only offline behavior is exercised: the freshness gate (seed fingerprint), the
+feedback text a rejection turns into, and patch replay against a throwaway git
+workspace (a real ``git apply`` — an invalid flag there once auto-rejected
+every trace). Judge paths need a runtime and are covered by the pipeline.
 """
 import pathlib
+import subprocess
 import sys
+import tempfile
 import unittest
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -37,6 +40,41 @@ class DeterministicGate(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertEqual(result["failures"][0],
                          "stale: seed changed since trace was generated")
+
+
+class PatchReplay(unittest.TestCase):
+    """apply_candidate_patch drives a real ``git apply`` in a throwaway repo."""
+
+    def _workspace(self) -> pathlib.Path:
+        workspace = pathlib.Path(tempfile.mkdtemp(prefix="moonshiner-test-"))
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(workspace)]))
+        subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+        (workspace / "hello.txt").write_text("one\n")
+        subprocess.run(["git", "add", "-A"], cwd=workspace, check=True)
+        return workspace
+
+    def test_valid_patch_applies(self):
+        workspace = self._workspace()
+        patch = ("diff --git a/hello.txt b/hello.txt\n"
+                 "--- a/hello.txt\n+++ b/hello.txt\n"
+                 "@@ -1 +1 @@\n-one\n+two\n")
+        ok, detail = scr.apply_candidate_patch(workspace, patch)
+        self.assertTrue(ok, detail)
+        self.assertEqual((workspace / "hello.txt").read_text(), "two\n")
+
+    def test_git_rejects_flags_not_content(self):
+        # A garbage patch must fail on CONTENT; if git errors on our own
+        # command line instead (e.g. a bad --whitespace value), the stderr
+        # names the option and every screen would fail closed.
+        workspace = self._workspace()
+        ok, detail = scr.apply_candidate_patch(workspace, "not a patch\n")
+        self.assertFalse(ok)
+        self.assertNotIn("unrecognized whitespace option", detail)
+
+    def test_empty_patch_is_ok(self):
+        ok, detail = scr.apply_candidate_patch(self._workspace(), "   \n")
+        self.assertTrue(ok)
+        self.assertEqual(detail, "(empty patch)")
 
 
 class Feedback(unittest.TestCase):

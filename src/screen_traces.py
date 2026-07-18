@@ -191,7 +191,7 @@ def apply_candidate_patch(workspace: Path, patch: str) -> tuple[bool, str]:
     patch_file.write_text(filtered)
     for extra in (["--3way"], []):
         proc = subprocess.run(
-            ["git", "apply", "--whitespace=nofix", *extra, str(patch_file)],
+            ["git", "apply", "--whitespace=nowarn", *extra, str(patch_file)],
             cwd=workspace, capture_output=True, text=True)
         if proc.returncode == 0:
             patch_file.unlink(missing_ok=True)
