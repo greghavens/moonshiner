@@ -102,6 +102,40 @@ class Feedback(unittest.TestCase):
         self.assertIn("secret", text)
 
 
+def _diff_section(path: str) -> str:
+    return (f"diff --git a/{path} b/{path}\n"
+            f"--- a/{path}\n+++ b/{path}\n"
+            "@@ -1 +1 @@\n-old\n+new\n")
+
+
+class PatchFilter(unittest.TestCase):
+    """Build-artifact excludes name directory components, not substrings.
+    A substring match once dropped the ``objs.mk`` hunk from every candidate
+    patch (``**/obj/**`` -> "obj" in "objs.mk"), so the replay kept the seed's
+    broken module list and auto-rejected 15 straight correct fixes."""
+
+    def _kept(self, path: str) -> bool:
+        patch = _diff_section(path) + _diff_section("unrelated.txt")
+        return f"a/{path} " in scr._filter_patch(patch)
+
+    def test_files_merely_containing_build_words_survive(self):
+        for path in ("objs.mk", "binary_search.c", "target_parser.py",
+                     "environment.py", "src/objstore.go"):
+            self.assertTrue(self._kept(path), path)
+
+    def test_build_directory_components_are_stripped(self):
+        for path in ("obj/Debug/app.o", "server/obj/x.cs", "bin/tool",
+                     "app/bin/run", "target/debug/main", "node_modules/x/i.js"):
+            self.assertFalse(self._kept(path), path)
+
+    def test_cache_suffixes_are_stripped_anywhere(self):
+        self.assertFalse(self._kept("pkg/cached.pyc"))
+
+    def test_top_level_env_is_stripped_nested_names_survive(self):
+        self.assertFalse(self._kept("env/pyvenv.cfg"))
+        self.assertTrue(self._kept("src/envelope.py"))
+
+
 class JudgeErrorLane(unittest.TestCase):
     """Malformed judge output re-reviews the same trace; judged rejections
     still reject. Keeps a judge-side fault (e.g. a verdict truncated before

@@ -21,6 +21,7 @@ The judge is fully configurable — a Codex teacher can be judged by Claude, etc
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import re
@@ -170,6 +171,29 @@ def _redirects_outside(command: str) -> bool:
 # --------------------------------------------------------------------------- #
 # Deterministic screen                                                         #
 # --------------------------------------------------------------------------- #
+def _path_is_excluded(path: str) -> bool:
+    """Match DIFF_EXCLUDE_PATTERNS with their git-pathspec glob semantics.
+
+    ``**/obj/**`` names a DIRECTORY component, never a filename substring —
+    a sloppier substring check once stripped ``objs.mk`` hunks from every
+    candidate patch and auto-rejected each replay of a correct fix.
+    """
+    probe = "/" + path.strip("/") + "/"
+    for pattern in DIFF_EXCLUDE_PATTERNS:
+        if pattern.startswith("**/") and pattern.endswith("/**"):
+            if f"/{pattern[3:-3]}/" in probe:
+                return True
+        elif pattern.endswith("/**"):
+            if path == pattern[:-3] or path.startswith(pattern[:-3] + "/"):
+                return True
+        elif pattern.startswith("**/"):
+            if fnmatch.fnmatch(Path(path).name, pattern[3:]):
+                return True
+        elif fnmatch.fnmatch(path, pattern):
+            return True
+    return False
+
+
 def _filter_patch(patch: str) -> str:
     """Drop diff sections for runtime-cache/build paths so a stale cache hunk
     cannot break an otherwise-clean candidate replay."""
@@ -179,10 +203,7 @@ def _filter_patch(patch: str) -> str:
         header = section.splitlines()[0] if section.strip() else ""
         path = header[len("diff --git a/"):].split(" b/")[0] if header.startswith(
             "diff --git a/") else ""
-        excluded = any(Path(path).match(pattern.replace("**/", "").replace("/**", ""))
-                       or pattern.strip("*/") in path
-                       for pattern in DIFF_EXCLUDE_PATTERNS) if path else False
-        if not excluded:
+        if not (path and _path_is_excluded(path)):
             kept.append(section)
     return "".join(kept)
 
