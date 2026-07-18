@@ -1,7 +1,7 @@
 """Pi coding-agent teacher and judge adapter (any OpenAI-compatible provider).
 
 Two isolation layers protect the metered provider key. First, a host-side
-loopback proxy (:mod:`runtimes.zai_proxy`) holds the real key and hands the
+loopback proxy (:mod:`runtimes.credential_proxy`) holds the real key and hands the
 child a dummy bearer token. Second, the ``pi`` process runs under ``bwrap`` with
 the host home, ``/root``, and the user runtime directory replaced by tmpfs, so a
 generated command cannot reach any host credential even if one existed on disk.
@@ -23,7 +23,7 @@ from pathlib import Path
 from common import ROOT, fn, schemas_for, scrub_text, stub
 from runtimes.auth import load_provider_key
 from runtimes.base import ReviewResult, Runtime, TraceResult
-from runtimes.zai_proxy import DUMMY_TOKEN, ProxySession
+from runtimes.credential_proxy import DUMMY_TOKEN, ProxySession
 
 RUNTIME_ROOT = Path("/var/tmp/moonshiner-pi-runtime")
 DEFAULT_TIMEOUT_SECONDS = 300

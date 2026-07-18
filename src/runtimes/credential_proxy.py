@@ -1,4 +1,4 @@
-"""Loopback credential proxy for the Pi/Z.ai teacher.
+"""Loopback credential proxy for sandboxed agent runtimes.
 
 The sandboxed agent is configured to talk to ``http://127.0.0.1:<port>`` with a
 fixed dummy bearer token. This proxy runs host-side (outside the sandbox),
