@@ -88,6 +88,8 @@ PHASES: tuple[Phase, ...] = (
           "prepare_local", takes_argv=False),
     Phase("verify-export", 11, "Validate the exported dataset",
           "validate_hf_export", takes_argv=False),
+    Phase("card", 11.5, "Render the Hugging Face dataset card",
+          "export_hf_card", takes_argv=False),
 )
 
 BY_KEY = {phase.key: phase for phase in PHASES}

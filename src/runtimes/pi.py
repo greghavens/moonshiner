@@ -159,11 +159,19 @@ class PiRuntime(Runtime):
         return cmd
 
     def _child_env(self) -> dict:
-        """Strip every real credential; the child only reaches the proxy."""
+        """Strip every real credential; the child only reaches the proxy.
+
+        The configured provider key (``key_env``) is stripped generically, so a
+        new provider (OpenRouter, Fireworks, …) is covered without editing this
+        list — the sandbox only ever sees the loopback proxy's dummy token.
+        """
         env = dict(os.environ)
-        for name in ("ZAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
-                     "CLAUDE_CODE_OAUTH_TOKEN", "HF_TOKEN"):
-            env.pop(name, None)
+        names = {"ZAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+                 "OPENROUTER_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "HF_TOKEN",
+                 self.runtime_config.get("key_env", "")}
+        for name in names:
+            if name:
+                env.pop(name, None)
         return env
 
     # -- teacher ------------------------------------------------------------ #

@@ -19,7 +19,8 @@ from expand_next_steps import DERIVATION
 from export_hf_next_steps import DEFAULT_OUTPUT, PUBLISH_KEY_ORDER
 
 FORBIDDEN_SUBSTRINGS = ("reference_answer", "ZAI_API_KEY", "ANTHROPIC_API_KEY",
-                        "OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
+                        "OPENAI_API_KEY", "OPENROUTER_API_KEY",
+                        "CLAUDE_CODE_OAUTH_TOKEN")
 
 
 def validate(path: Path) -> int:

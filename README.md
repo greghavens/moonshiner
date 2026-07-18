@@ -74,6 +74,7 @@ for with `--with`.
 | 9 | `parquet` | offline | Export Parquet shards |
 | 10 | `prepare` | offline | Render rows with the student's chat template for local training |
 | 11 | `verify-export` | offline | Validate the export against provenance + privacy gates |
+| 11.5 | `card` | offline | Render the Hugging Face dataset card from the published rows |
 
 `\*` optional — folded in only via `--with` (e.g. `--with validate`, `--with retry`,
 or the security lane `--with sec-import --with sec-fetch --with sec-generate
@@ -129,8 +130,8 @@ per-run user state.)
 "runtimes": {
   "claude-code": { "cli": "claude", "paid_unlock_required": true },
   "codex":       { "cli": "codex", "sandbox": "danger-full-access", "web_search": "live" },
-  "pi":          { "cli": "node_modules/.bin/pi", "provider": "zai",
-                   "base_url": "https://api.z.ai/api/coding/paas/v4", "key_env": "ZAI_API_KEY" }
+  "pi":          { "cli": "node_modules/.bin/pi", "provider": "openrouter",
+                   "base_url": "https://openrouter.ai/api/v1", "key_env": "OPENROUTER_API_KEY" }
 }
 ```
 
@@ -273,6 +274,11 @@ host-specific paths scrubbed throughout:
   into the local training directory (`student.output_dir`).
 - **`verify-export`** fails closed if any export violates a provenance or privacy
   gate.
+- **`card`** renders `data/hf-publish/README.md` — a Hugging Face dataset card
+  auto-populated from the published rows (the real language/category/domain mix,
+  tool surface, splits, teacher/judge, and model-attestation rate), so every
+  dataset ships a card that matches its data. Override the `pretty_name`,
+  `license`, and Hub id via `config.publish`.
 
 ---
 
@@ -335,6 +341,7 @@ src/
   build_dataset.py     Accepted traces -> agent training rows
   expand_next_steps.py Cumulative next-step derivation
   export_hf.py / export_hf_next_steps.py / export_parquet.py   Dataset exports
+  export_hf_card.py    Hugging Face dataset card (auto-populated from the export)
   prepare_local.py     Render rows with the student chat template
   validate_hf_export.py      Provenance + privacy export gate
   normalize.py         trace_format -> the adapter that parses it
@@ -348,10 +355,10 @@ src/
     base.py            Runtime-agnostic interfaces (trace generation, review)
     codex.py           Codex (codex exec) adapter
     claude_code.py     Claude Code (claude -p headless) adapter
-    pi.py              Pi coding-agent (Z.ai GLM) adapter
+    pi.py              Pi coding-agent adapter (OpenAI-compatible provider)
     auth.py            Provider-credential loading for metered runtimes
     availability.py    Fail-closed usage-limit backoff, shared by runtimes
-    zai_proxy.py       Loopback credential proxy for the Pi/Z.ai runtime
+    zai_proxy.py       Loopback credential proxy for the Pi runtime
 ```
 
 Generated artifacts — `workspaces/`, `traces/`, `data/`, `runs/`,
