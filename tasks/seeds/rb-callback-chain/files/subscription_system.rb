@@ -1,0 +1,8 @@
+require_relative "lib/subscriptions/subscription"
+require_relative "lib/subscriptions/unit_of_work"
+require_relative "lib/subscriptions/repository"
+require_relative "lib/subscriptions/job_queue"
+require_relative "lib/subscriptions/subscription_callbacks"
+require_relative "lib/subscriptions/jobs/subscription_updated_job"
+require_relative "lib/subscriptions/mailers/subscription_mailer"
+require_relative "lib/subscriptions/services/update_subscription"
