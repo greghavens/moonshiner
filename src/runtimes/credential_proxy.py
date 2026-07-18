@@ -22,6 +22,10 @@ from urllib.error import HTTPError, URLError
 
 DUMMY_TOKEN = "moonshiner-loopback-proxy-token"
 
+# Attestation only needs the model field from the first chunks of a response;
+# cap what the audit keeps so a long stream never accumulates in memory.
+_AUDIT_CAPTURE_BYTES = 262144
+
 
 @dataclass
 class Audit:
@@ -92,33 +96,50 @@ def _make_handler(upstream: str, real_key: str, audit: Audit):
             request = Request(target, data=body or None, headers=headers,
                               method=method)
             try:
-                with urlopen(request, timeout=600) as response:
-                    payload = response.read()
-                    status = response.status
-                    response_headers = dict(response.headers)
+                response = urlopen(request, timeout=600)
             except HTTPError as error:
-                payload = error.read()
-                status = error.code
-                response_headers = dict(error.headers or {})
+                response = error          # readable like a response
             except URLError as error:
                 audit.errors.append(f"{method} {self.path}: {error.reason}")
                 self.send_error(502, "upstream unreachable")
                 return
-            audit.exchanges.append({
-                "method": method,
-                "path": urlparse(self.path).path,
-                "status": status,
-                "response_model": _extract_model(payload),
-            })
-            self.send_response(status)
-            for key, value in response_headers.items():
-                if key.lower() in {"transfer-encoding", "connection",
-                                   "content-length"}:
-                    continue
-                self.send_header(key, value)
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
+            # Relay the body chunk-by-chunk as the upstream produces it.
+            # Buffering the whole response here starves the client of the SSE
+            # stream for the entire upstream turn — long teacher turns then
+            # die on the client's idle timeout and get re-billed on retry.
+            with response:
+                status = getattr(response, "status", None) or response.code
+                # Recorded before any byte goes back to the client, so a
+                # mid-stream disconnect cannot lose the exchange; the model
+                # field is filled in from the first chunks as they relay.
+                exchange = {"method": method,
+                            "path": urlparse(self.path).path,
+                            "status": status, "response_model": None}
+                audit.exchanges.append(exchange)
+                self.send_response(status)
+                for key, value in dict(response.headers or {}).items():
+                    if key.lower() in {"transfer-encoding", "connection",
+                                       "content-length"}:
+                        continue
+                    self.send_header(key, value)
+                bodyless = status in (204, 304)
+                if not bodyless:
+                    self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                captured = b""
+                read = getattr(response, "read1", response.read)
+                try:
+                    while not bodyless:
+                        chunk = read(65536)
+                        if not chunk:
+                            self.wfile.write(b"0\r\n\r\n")
+                            break
+                        if len(captured) < _AUDIT_CAPTURE_BYTES:
+                            captured += chunk
+                        self.wfile.write(b"%X\r\n%s\r\n" % (len(chunk), chunk))
+                        self.wfile.flush()
+                finally:
+                    exchange["response_model"] = _extract_model(captured)
 
         def do_POST(self):  # noqa: N802 (http.server API)
             self._relay("POST")
@@ -133,8 +154,9 @@ class _QuietDisconnectServer(ThreadingHTTPServer):
     """Suppress tracebacks for client disconnects, keep everything else loud.
 
     The sandboxed agent may abort or retry a request while the relay is
-    writing the response back; the audit entry is recorded before that write,
-    so a broken pipe here loses nothing and is not an error of the proxy.
+    streaming the response back; the audit entry is recorded in a ``finally``
+    around the stream, so a broken pipe here loses nothing and is not an
+    error of the proxy.
     """
 
     def handle_error(self, request, client_address):
