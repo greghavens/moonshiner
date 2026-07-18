@@ -5,11 +5,13 @@ feedback text a rejection turns into, and patch replay against a throwaway git
 workspace (a real ``git apply`` — an invalid flag there once auto-rejected
 every trace). Judge paths need a runtime and are covered by the pipeline.
 """
+import json
 import pathlib
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "src"))
@@ -98,6 +100,73 @@ class Feedback(unittest.TestCase):
             {"kind": "secret", "detail": "sk-live token in output"}]}}
         text = scr.feedback_from_review(review)
         self.assertIn("secret", text)
+
+
+class JudgeErrorLane(unittest.TestCase):
+    """Malformed judge output re-reviews the same trace; judged rejections
+    still reject. Keeps a judge-side fault (e.g. a verdict truncated before
+    its closing brace) from routing to the repair lane's paid re-generation."""
+
+    GOOD_BLOCKS = {c: {"found": False} for c in scr.REVIEW_CATEGORIES}
+    META_BASE = {"passed": True, "raw_sha256": "r", "diff_sha256": "d",
+                 "seed_fingerprint": "f"}
+    REVIEW_BASE = {"raw_sha256": "r", "diff_sha256": "d",
+                   "seed_fingerprint": "f"}
+
+    def _well_formed(self, **over) -> dict:
+        verdict = dict(self.GOOD_BLOCKS, requirements=[], verdict="accept")
+        verdict.update(over)
+        return verdict
+
+    def test_truncated_or_missing_verdict_is_malformed(self):
+        self.assertTrue(scr.verdict_is_malformed(None))
+        # what the parser falls back to when the top-level object is truncated
+        self.assertTrue(scr.verdict_is_malformed(
+            {"requirement": "x", "status": "met"}))
+        self.assertTrue(scr.verdict_is_malformed(
+            dict(self.GOOD_BLOCKS, verdict="accept")))  # no requirements list
+
+    def test_judged_rejection_is_not_malformed(self):
+        self.assertFalse(scr.verdict_is_malformed(
+            self._well_formed(verdict="reject")))
+        finding = self._well_formed()
+        finding["added_scope"] = {"found": True, "detail": "extra file"}
+        self.assertFalse(scr.verdict_is_malformed(finding))
+
+    def _tree(self, review: dict | None, meta: dict) -> None:
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix="moonshiner-test-"))
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(tmp)]))
+        (tmp / "meta").mkdir()
+        (tmp / "reviews").mkdir()
+        (tmp / "meta" / "unit-x.json").write_text(json.dumps(meta))
+        if review is not None:
+            (tmp / "reviews" / "unit-x.json").write_text(json.dumps(review))
+        for attr, path in (("META", tmp / "meta"), ("REVIEWS", tmp / "reviews")):
+            patcher = mock.patch.object(scr, attr, path)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_judge_error_keeps_seed_pending(self):
+        self._tree(dict(self.REVIEW_BASE, status="judge_error",
+                        accepted=False, judge_errors=1), self.META_BASE)
+        self.assertTrue(scr.needs_first_pass({"id": "unit-x"}))
+
+    def test_judge_error_stops_pending_at_limit(self):
+        self._tree(dict(self.REVIEW_BASE, status="judge_error", accepted=False,
+                        judge_errors=scr.JUDGE_ERROR_LIMIT), self.META_BASE)
+        self.assertFalse(scr.needs_first_pass({"id": "unit-x"}))
+
+    def test_real_rejection_is_not_pending(self):
+        self._tree(dict(self.REVIEW_BASE, status="review_reject",
+                        accepted=False), self.META_BASE)
+        self.assertFalse(scr.needs_first_pass({"id": "unit-x"}))
+
+    def test_prior_errors_reset_when_trace_changes(self):
+        self._tree(dict(self.REVIEW_BASE, status="judge_error", accepted=False,
+                        judge_errors=2), self.META_BASE)
+        self.assertEqual(scr._prior_judge_errors("unit-x", self.META_BASE), 2)
+        changed = dict(self.META_BASE, raw_sha256="other")
+        self.assertEqual(scr._prior_judge_errors("unit-x", changed), 0)
 
 
 if __name__ == "__main__":

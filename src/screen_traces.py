@@ -45,6 +45,10 @@ REVIEW_CATEGORIES = ("added_scope", "missing_requirements", "bad_behaviors",
                      "bugs_and_regressions", "non_working_code")
 VERDICT_SCHEMA = json.loads(
     (ROOT / "schemas" / "review_verdict.schema.json").read_text())
+# A malformed verdict (truncated/unparseable judge output) is re-reviewed on
+# later passes; after this many malformed verdicts for the same trace it
+# escalates to review_reject so one seed can never loop the judge forever.
+JUDGE_ERROR_LIMIT = 3
 
 # --- static scope/action scan patterns ------------------------------------- #
 GIT_STATE_RE = re.compile(
@@ -346,6 +350,23 @@ def validate_reviewer_verdict(verdict: dict | None) -> tuple[bool, str]:
     return True, ""
 
 
+def verdict_is_malformed(verdict: dict | None) -> bool:
+    """True when the judge never delivered a well-formed verdict at all.
+
+    Distinguishes a judge-side output fault (missing/truncated JSON — e.g. a
+    verdict cut off before its closing brace) from a genuine judged rejection
+    (well-formed verdict whose content finds fault). Only the latter is
+    evidence against the trace.
+    """
+    if not isinstance(verdict, dict):
+        return True
+    for category in REVIEW_CATEGORIES:
+        block = verdict.get(category)
+        if not isinstance(block, dict) or "found" not in block:
+            return True
+    return not isinstance(verdict.get("requirements"), list)
+
+
 def feedback_from_review(review: dict) -> str:
     """Turn a rejection into concrete, actionable feedback for a repair attempt.
 
@@ -395,7 +416,14 @@ def needs_first_pass(seed: dict) -> bool:
     meta = json.loads(meta_path.read_text())
     if not meta.get("passed"):
         return False
-    return not review_is_current(seed, meta)
+    if not review_is_current(seed, meta):
+        return True
+    # A current review that only records judge output faults keeps the seed
+    # pending: the same trace is re-reviewed instead of being routed to the
+    # repair lane, which would re-bill a full teacher generation.
+    review = json.loads((REVIEWS / f"{seed['id']}.json").read_text())
+    return (review.get("status") == "judge_error"
+            and int(review.get("judge_errors", 1)) < JUDGE_ERROR_LIMIT)
 
 
 def pending_first_pass_seeds(seeds: list[dict], limit: int = 0) -> list[dict]:
@@ -439,10 +467,22 @@ def screen(seed: dict, judge=None) -> dict:
         _cleanup_workspace(workspace)
 
     accepted, error = validate_reviewer_verdict(result.verdict)
+    status = "accepted" if accepted else "review_reject"
+    reason = error or "all categories clear; requirements met"
+    if not accepted and verdict_is_malformed(result.verdict):
+        attempts = _prior_judge_errors(seed["id"], meta) + 1
+        if attempts < JUDGE_ERROR_LIMIT:
+            status = "judge_error"
+            reason = (f"judge verdict malformed ({error}); will re-review "
+                      f"(attempt {attempts}/{JUDGE_ERROR_LIMIT})")
+            review["judge_errors"] = attempts
+        else:
+            reason = (f"judge verdict malformed on {attempts} attempts: "
+                      f"{error}")
     review.update({
-        "status": "accepted" if accepted else "review_reject",
+        "status": status,
         "accepted": accepted,
-        "reason": error or "all categories clear; requirements met",
+        "reason": reason,
         "verdict": result.verdict,
         "judge": {"runtime": judge.name, "model": judge.role["model"],
                   "reasoning": judge.role.get("reasoning"),
@@ -452,6 +492,20 @@ def screen(seed: dict, judge=None) -> dict:
     })
     _write_review(seed["id"], review)
     return review
+
+
+def _prior_judge_errors(seed_id: str, meta: dict) -> int:
+    """Malformed-verdict count already recorded for exactly this trace."""
+    try:
+        review = json.loads((REVIEWS / f"{seed_id}.json").read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return 0
+    if review.get("status") != "judge_error":
+        return 0
+    if (review.get("raw_sha256") != meta.get("raw_sha256")
+            or review.get("diff_sha256") != meta.get("diff_sha256")):
+        return 0
+    return int(review.get("judge_errors", 1))
 
 
 def _write_review(seed_id: str, review: dict) -> None:
