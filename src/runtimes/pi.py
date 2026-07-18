@@ -119,11 +119,17 @@ class PiRuntime(Runtime):
         # falls back to the built-in provider, bypassing the proxy). api and
         # apiKey are declared explicitly rather than inherited so the entry is
         # self-contained even for a built-in provider name.
+        # pi defaults a model's maxTokens to 16384 when the entry omits it;
+        # reasoning-max turns overrun that and get truncated with
+        # stopReason "length", failing the seed. Provision an output budget
+        # sized for max reasoning instead of pi's chat-sized default.
         provider_entry: dict = {
             "baseUrl": proxy_base_url,
             "api": self.runtime_config.get("api", "openai-completions"),
             "apiKey": DUMMY_TOKEN,
-            "models": [{"id": self.role["model"], "reasoning": True}],
+            "models": [{"id": self.role["model"], "reasoning": True,
+                        "maxTokens": int(self.runtime_config.get(
+                            "max_output_tokens", 131072))}],
         }
         thinking_format = self.runtime_config.get("thinking_format")
         if thinking_format:
