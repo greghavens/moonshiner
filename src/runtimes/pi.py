@@ -102,6 +102,12 @@ class PiRuntime(Runtime):
         except (subprocess.SubprocessError, FileNotFoundError):
             return None
 
+    def _provider(self) -> str:
+        provider = self.runtime_config.get("provider")
+        if not provider:
+            raise RuntimeError("runtimes.pi.provider is not configured")
+        return provider
+
     # -- runtime dir + sandbox --------------------------------------------- #
     def _prepare_runtime(self, runtime_dir: Path, proxy_base_url: str) -> None:
         (runtime_dir / "home").mkdir(parents=True, exist_ok=True)
@@ -122,8 +128,7 @@ class PiRuntime(Runtime):
         thinking_format = self.runtime_config.get("thinking_format")
         if thinking_format:
             provider_entry["compat"] = {"thinkingFormat": thinking_format}
-        models = {"providers": {
-            self.runtime_config.get("provider", "zai"): provider_entry}}
+        models = {"providers": {self._provider(): provider_entry}}
         (config / "models.json").write_text(json.dumps(models, indent=2))
         (config / "settings.json").write_text(json.dumps({
             "compaction": {"enabled": False},
@@ -162,7 +167,7 @@ class PiRuntime(Runtime):
         # alongside the models.json apiKey.
         cli = str(runtime_dir / "node_modules" / ".bin" / "pi")
         cmd = [cli, "--print", "--mode", "json",
-               "--provider", self.runtime_config.get("provider", "zai"),
+               "--provider", self._provider(),
                "--model", self.role["model"],
                "--api-key", DUMMY_TOKEN,
                "--thinking", self.role.get("reasoning", "max"),
@@ -255,7 +260,8 @@ class PiRuntime(Runtime):
             error=meta["error"],
             provenance={
                 "session_id": meta["session_id"],
-                "provider": self.runtime_config.get("display_provider", "z.ai"),
+                "provider": self.runtime_config.get("display_provider")
+                    or self._provider(),
                 "runtime": self.runtime_config.get("runtime", "pi-coding-agent"),
                 "runtime_version": self.runtime_config.get("runtime_version"),
                 "pi_observed_models": meta["observed_models"],
