@@ -4,7 +4,8 @@
 The full pipeline still owns the final, screened release (`export-next` →
 `verify-export` → `card`). This preview publisher closes the gap while a long
 generate phase runs: every completed trace that PASSED verification (acceptance
-tests + protected-file hashes) and is model-attested is normalized, scrubbed,
+tests + protected-file hashes), is model-attested, and has cleared the
+independent judge is normalized, scrubbed,
 secret-scanned, and pushed to the configured dataset immediately — together
 with the dataset card rendered from the house template
 (`export_hf_card.build_card`, preview stage) — so the repo always shows the
@@ -38,6 +39,24 @@ PREVIEW_CARD = PREVIEW_DIR / "README.md"
 STATE_FILE = PREVIEW_DIR / "state.json"
 META_DIR = ROOT / "traces" / "meta"
 RAW_DIR = ROOT / "traces" / "raw"
+REVIEWS_DIR = ROOT / "traces" / "reviews"
+
+
+def _has_accepted_verdict(stem: str) -> bool:
+    """True only when the judge returned a real, accepting verdict.
+
+    Generation passing (acceptance tests + attestation) is necessary but not
+    sufficient: a trace the judge never validly reviewed — pending, rejected,
+    or failed to a judge-side fault (a spend limit once returned a billing
+    notice in place of every verdict) — has not passed and must not reach the
+    public dataset. The judge-gated final export was always the authoritative
+    release; the preview now holds to the same bar.
+    """
+    try:
+        review = json.loads((REVIEWS_DIR / f"{stem}.json").read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False
+    return review.get("accepted") is True
 
 
 def _publishable_rows() -> list[dict]:
@@ -50,6 +69,8 @@ def _publishable_rows() -> list[dict]:
         if meta.get("passed") is not True:
             continue
         if attested.get("model_attested") is not True:
+            continue
+        if not _has_accepted_verdict(meta_path.stem):
             continue
         raw = RAW_DIR / f"{meta_path.stem}.events.jsonl"
         if not raw.exists():

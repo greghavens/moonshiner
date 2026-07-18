@@ -4,6 +4,7 @@ The repair lane replaces a trace's bytes under an unchanged task id; the
 publisher must key on content, not the task list, or a repaired trace only
 reaches the Hub if an unrelated new task happens to land in the same cycle.
 """
+import json
 import pathlib
 import subprocess
 import sys
@@ -61,6 +62,53 @@ class ChangeDetection(unittest.TestCase):
         self.uploads.clear()
         self._publish([ROW])
         self.assertEqual(self.uploads, [])
+
+
+class AcceptanceGate(unittest.TestCase):
+    """Only judge-accepted traces publish. A generation-passed, attested trace
+    with no accepting verdict — pending, rejected, or a judge-side fault such as
+    the spend-limit notice that once replaced every verdict — stays off the Hub.
+    """
+
+    def _tree(self):
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix="moonshiner-test-"))
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(tmp)]))
+        for sub in ("meta", "raw", "reviews"):
+            (tmp / sub).mkdir()
+        patches = {
+            "META_DIR": tmp / "meta", "RAW_DIR": tmp / "raw",
+            "REVIEWS_DIR": tmp / "reviews", "CONFIG": {},
+        }
+        for attr, value in patches.items():
+            p = mock.patch.object(pub, attr, value)
+            p.start()
+            self.addCleanup(p.stop)
+        # parse_stream is IO-heavy; any non-empty message list stands in for it.
+        p = mock.patch.object(
+            pub.PiRuntime, "parse_stream",
+            staticmethod(lambda raw, ws: ([{"role": "user", "content": "x"}], {})))
+        p.start()
+        self.addCleanup(p.stop)
+        return tmp
+
+    def _seed(self, tmp, stem, *, review):
+        meta = {"passed": True,
+                "teacher": {"model_attested": True, "model": "m",
+                            "observed_model": "m"}}
+        (tmp / "meta" / f"{stem}.json").write_text(json.dumps(meta))
+        (tmp / "raw" / f"{stem}.events.jsonl").write_text("{}\n")
+        if review is not None:
+            (tmp / "reviews" / f"{stem}.json").write_text(json.dumps(review))
+
+    def test_only_accepted_traces_publish(self):
+        tmp = self._tree()
+        self._seed(tmp, "good", review={"accepted": True, "status": "accepted"})
+        self._seed(tmp, "rejected",
+                   review={"accepted": False, "status": "review_reject"})
+        self._seed(tmp, "judge-walled",
+                   review={"accepted": False, "status": "judge_error"})
+        self._seed(tmp, "pending", review=None)
+        self.assertEqual([r["task"] for r in pub._publishable_rows()], ["good"])
 
 
 if __name__ == "__main__":
