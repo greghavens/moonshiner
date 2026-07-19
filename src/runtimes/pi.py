@@ -247,6 +247,10 @@ class PiRuntime(Runtime):
         duration = time.monotonic() - started
 
         events_path.write_text(stdout)
+        # Drop the ~99% of raw bytes that are cumulative *_update snapshots
+        # before anything hashes the file, so raw_sha256 matches the stored
+        # (compacted) trace and multi-GB captures never hit disk long-term.
+        compact_events_file(events_path)
         stderr_path.write_text(stderr)
         meta = _parse_stream_meta(stdout)
         attested = _model_attested(self.role["model"], meta, audit)
@@ -335,6 +339,35 @@ def compact_event_stream(text: str) -> list[dict]:
     """Keep finalized events, drop the *_update snapshot chatter."""
     return [event for event in _iter_events(text)
             if not str(event.get("type", "")).endswith("_update")]
+
+
+def compact_events_file(path: Path) -> int:
+    """Rewrite a raw events file in place, dropping the ``*_update`` snapshot
+    chatter that :func:`compact_event_stream` already filters at parse time.
+
+    Pi streams a full *cumulative* ``message_update`` on every token, so one
+    large reasoning block is re-serialized thousands of times -- up to ~99% of
+    raw bytes that nothing downstream reads (``parse_stream`` consumes
+    ``message_end`` only). Compacting before ``raw_sha256`` is computed keeps
+    the integrity hash (``screen_traces``) consistent with the stored file.
+    Streamed line-by-line so a multi-GB capture never loads whole into memory.
+    Returns the number of snapshot events dropped.
+    """
+    skipped = 0
+    tmp = path.with_suffix(path.suffix + ".compact.tmp")
+    with path.open(errors="replace") as src, tmp.open("w") as out:
+        for line in src:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                out.write(line)
+                continue
+            if str(event.get("type", "")).endswith("_update"):
+                skipped += 1
+                continue
+            out.write(line)
+    os.replace(tmp, path)
+    return skipped
 
 
 def _parse_stream_meta(text: str) -> dict:

@@ -4,6 +4,7 @@ Offline — exercises only config generation, no pi process and no network.
 """
 import json
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -12,7 +13,7 @@ _ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "src"))
 
 from runtimes.credential_proxy import DUMMY_TOKEN  # noqa: E402
-from runtimes.pi import PiRuntime  # noqa: E402
+from runtimes.pi import PiRuntime, compact_events_file  # noqa: E402
 
 
 def _provider_entry(runtime_config: dict) -> dict:
@@ -42,6 +43,58 @@ class ModelsJson(unittest.TestCase):
         provider = _provider_entry({})
         self.assertEqual(provider["baseUrl"], "http://127.0.0.1:1")
         self.assertEqual(provider["apiKey"], DUMMY_TOKEN)
+
+
+class CompactEventsFile(unittest.TestCase):
+    """Pi streams a full cumulative snapshot on every token, so one reasoning
+    block is re-serialized thousands of times -- ~99% of raw bytes that
+    parse_stream never reads. Compacting must strip only the ``*_update``
+    chatter, before raw_sha256 is taken, and leave every finalized event and
+    the file's byte-identity-under-repeat intact."""
+
+    def _write(self, lines: list[str]) -> pathlib.Path:
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix="moonshiner-test-"))
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(tmp)]))
+        path = tmp / "x.events.jsonl"
+        path.write_text("".join(line + "\n" for line in lines))
+        return path
+
+    def test_drops_updates_keeps_finalized(self):
+        path = self._write([
+            json.dumps({"type": "message_start"}),
+            json.dumps({"type": "message_update", "message": {"x": "a" * 5000}}),
+            json.dumps({"type": "message_update", "message": {"x": "a" * 5000}}),
+            json.dumps({"type": "tool_execution_update", "n": 1}),
+            json.dumps({"type": "tool_execution_end", "n": 1}),
+            json.dumps({"type": "message_end", "message": {"role": "assistant"}}),
+        ])
+        before = path.stat().st_size
+        skipped = compact_events_file(path)
+        kinds = [json.loads(x)["type"] for x in path.read_text().splitlines()]
+        self.assertEqual(kinds, ["message_start", "tool_execution_end",
+                                 "message_end"])
+        self.assertEqual(skipped, 3)
+        self.assertLess(path.stat().st_size, before)
+
+    def test_preserves_unparseable_lines(self):
+        path = self._write([
+            "not json at all",
+            json.dumps({"type": "message_update"}),
+            json.dumps({"type": "message_end"}),
+        ])
+        compact_events_file(path)
+        self.assertEqual(path.read_text().splitlines(),
+                         ["not json at all", json.dumps({"type": "message_end"})])
+
+    def test_idempotent(self):
+        path = self._write([
+            json.dumps({"type": "message_update"}),
+            json.dumps({"type": "message_end", "message": {"role": "assistant"}}),
+        ])
+        compact_events_file(path)
+        once = path.read_text()
+        self.assertEqual(compact_events_file(path), 0)
+        self.assertEqual(path.read_text(), once)
 
 
 if __name__ == "__main__":
