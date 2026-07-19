@@ -1,0 +1,1 @@
+"""Shipping publication adapter."""
