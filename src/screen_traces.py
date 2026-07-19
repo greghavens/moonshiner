@@ -481,9 +481,11 @@ def screen(seed: dict, judge=None) -> dict:
     apply_candidate_patch(workspace, (DIFFS / f"{seed['id']}.patch").read_text()
                           if (DIFFS / f"{seed['id']}.patch").exists() else "")
     try:
+        review_artifacts = REVIEWS / seed["id"]
+        review_artifacts.mkdir(parents=True, exist_ok=True)
         result = judge.run_review(
             reviewer_prompt(seed, meta, messages, deterministic), workspace,
-            out_dir=REVIEWS, schema=VERDICT_SCHEMA, read_only=True)
+            out_dir=review_artifacts, schema=VERDICT_SCHEMA, read_only=True)
     finally:
         _cleanup_workspace(workspace)
 

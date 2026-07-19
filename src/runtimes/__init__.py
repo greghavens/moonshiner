@@ -11,7 +11,8 @@ from common import CONFIG
 from runtimes.base import ReviewResult, Runtime, TraceResult
 
 __all__ = ["Runtime", "TraceResult", "ReviewResult", "REGISTRY",
-           "get_runtime", "get_teacher", "get_judge", "runtime_names"]
+           "get_runtime", "get_teacher", "get_judge", "get_seed_author",
+           "get_seed_judge", "runtime_names"]
 
 
 def _build_registry() -> dict[str, type[Runtime]]:
@@ -46,3 +47,11 @@ def get_teacher(config: dict | None = None) -> Runtime:
 
 def get_judge(config: dict | None = None) -> Runtime:
     return get_runtime("judge", config)
+
+
+def get_seed_author(config: dict | None = None) -> Runtime:
+    return get_runtime("seed_author", config)
+
+
+def get_seed_judge(config: dict | None = None) -> Runtime:
+    return get_runtime("seed_judge", config)

@@ -22,17 +22,9 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def _load_config() -> dict:
-    """Load config.json, shallow-merging an optional config.local.json over it."""
-    config = json.loads((ROOT / "config.json").read_text())
-    local = ROOT / "config.local.json"
-    if local.exists():
-        overrides = json.loads(local.read_text())
-        for key, value in overrides.items():
-            if isinstance(value, dict) and isinstance(config.get(key), dict):
-                config[key].update(value)
-            else:
-                config[key] = value
-    return config
+    """Load built-in, user, then repository-local configuration layers."""
+    from configuration import load_config
+    return load_config()
 
 
 CONFIG = _load_config()

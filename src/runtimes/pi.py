@@ -286,10 +286,13 @@ class PiRuntime(Runtime):
     def run_review(self, instruction: str, workspace: Path, *, out_dir: Path,
                    schema: dict | None = None,
                    read_only: bool = True) -> ReviewResult:
+        review_tools = ["read", "grep", "find", "ls"] if read_only else list(OFFERED_TOOLS)
         result = self._run(prompt=instruction, workspace=workspace, out_dir=out_dir,
-                           system_prompt="You are an independent read-only reviewer.",
-                           tools=["read", "grep", "find", "ls"], schema=schema,
-                           read_only=True, artifact_id="judge")
+                           system_prompt=("You are an independent read-only reviewer."
+                                          if read_only else
+                                          "You are an independent reviewer allowed to repair this workspace."),
+                           tools=review_tools, schema=schema,
+                           read_only=read_only, artifact_id="judge")
         last = _last_message(result.raw_path.read_text())
         verdict = _structured_output(result.raw_path.read_text()) or _parse_json(last)
         return ReviewResult(
