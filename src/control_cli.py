@@ -13,7 +13,7 @@ from runtimes import get_judge, get_teacher
 
 
 def auth_main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="moonshiner.py auth")
+    parser = argparse.ArgumentParser(prog="moonshiner auth")
     sub = parser.add_subparsers(dest="action", required=True)
     for action in ("set", "status", "remove"):
         child = sub.add_parser(action)
@@ -52,7 +52,7 @@ def auth_main(argv: list[str] | None = None) -> int:
 
 
 def doctor_main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="moonshiner.py doctor")
+    parser = argparse.ArgumentParser(prog="moonshiner doctor")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     checks = []

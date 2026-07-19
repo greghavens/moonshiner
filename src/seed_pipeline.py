@@ -52,6 +52,7 @@ DETERMINISTIC VALIDATION BEFORE YOUR REVIEW:
 def main(argv: list[str] | None = None) -> int:
     defaults = CONFIG.get("pipeline", {}).get("seed", {})
     parser = argparse.ArgumentParser(
+        prog="moonshiner seed run",
         description="Author, validate, judge/fix, and promote one new seed.")
     parser.add_argument("--id", required=True, help="New unique seed id.")
     parser.add_argument("--brief", required=True, help="Seed objective and constraints.")

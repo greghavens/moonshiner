@@ -2,12 +2,31 @@
 import pathlib
 import sys
 import unittest
+from unittest import mock
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "src"))
 sys.path.insert(0, str(_ROOT))
 
 import moonshiner as m  # noqa: E402
+
+
+class FrontDoor(unittest.TestCase):
+    def test_help_leads_with_normal_jobs_not_phases(self):
+        text = m._help()
+        self.assertIn("moonshiner setup", text)
+        self.assertIn("AUTHOR SEEDS", text)
+        self.assertIn("moonshiner dataset build", text)
+        self.assertNotIn("sec-generate", text)
+
+    def test_no_arguments_sets_up_then_runs_one_trace(self):
+        trace = mock.Mock(return_value=0)
+        fake_module = mock.Mock(main=trace)
+        with mock.patch.object(m, "_configured", return_value=False), \
+             mock.patch.object(m, "_setup", return_value=0), \
+             mock.patch.dict(sys.modules, {"trace_pipeline": fake_module}):
+            self.assertEqual(m.main([]), 0)
+        trace.assert_called_once_with([])
 
 
 class Registry(unittest.TestCase):

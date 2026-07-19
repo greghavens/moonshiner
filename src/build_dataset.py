@@ -180,6 +180,7 @@ def accepted_author_rows(traces_dir: Path = TRACES, quiet: bool = True):
 
 def main() -> None:
     parser = argparse.ArgumentParser(
+        prog="moonshiner dataset build",
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--include-failed", action="store_true",
                         help="keep verification failures (not recommended)")

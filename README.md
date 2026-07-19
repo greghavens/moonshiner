@@ -20,12 +20,12 @@ PyPI publishing uses trusted publishing from the tagged release workflow. Before
 ## Quick start
 
 ```bash
-moonshiner doctor
-moonshiner run --dry-run
-moonshiner run
+moonshiner
 ```
 
-A bare `run` processes exactly one seed, with at most two author attempts. It generates a trace, runs local verification and deterministic replay gates, asks the configured independent judge, and requests a new trace only after a substantive rejection.
+That is the complete first-run command. Moonshiner asks for any missing model, authentication, and storage settings, saves them, and starts a safe one-seed run. On later invocations, bare `moonshiner` immediately starts another one-seed run. Use `moonshiner setup` to change the answers or `moonshiner --help` to see the other normal tasks.
+
+A bare invocation processes exactly one seed, with at most two author attempts. It generates a trace, runs local verification and deterministic replay gates, asks the configured independent judge, and requests a new trace only after a substantive rejection.
 
 For a deliberate batch:
 

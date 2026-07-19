@@ -1,24 +1,13 @@
 #!/usr/bin/env python3
-"""moonshiner — bounded seed and trace quality pipelines.
-
-The normal `run` command safely generates, verifies, judges, and when necessary
-replaces traces. Seed authoring and dataset building are separate explicit
-workflows. The original low-level phase runner remains available as `pipeline`.
-
-  moonshiner run                  # safe trace run (one seed)
-  moonshiner run --limit 20 --yes # bounded trace quality run
-  moonshiner run --detach         # durable background run
-  moonshiner dataset build        # build/export accepted traces
-
-The teacher and judge runtimes (and their models/reasoning) are read from
-config.json — see `runtimes` / `teacher` / `judge`. Metered phases preflight
-their runtime and fail closed if it is unreachable, unauthenticated, or (for a
-paid runtime) not credit-unlocked; nothing is silently skipped.
-"""
+"""Moonshiner creates and reviews coding-agent training data."""
 from __future__ import annotations
 
 import argparse
+import getpass
 import importlib
+import os
+import shutil
+import subprocess
 import sys
 import time
 import json
@@ -26,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
@@ -123,7 +112,7 @@ def _plan(start: str | None, stop: str | None, include: list[str],
 
 def _run(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
-        prog="moonshiner.py run",
+        prog="moonshiner pipeline",
         description="Run the pipeline end to end (idempotent, fail-closed).")
     parser.add_argument("--from", dest="start", choices=[p.key for p in FULL],
                         help="Start at this phase (inclusive).")
@@ -194,7 +183,7 @@ def _run(argv: list[str]) -> int:
 
 def _preflight(argv: list[str]) -> int:
     """Report whether the configured teacher and judge are usable right now."""
-    parser = argparse.ArgumentParser(prog="moonshiner.py preflight")
+    parser = argparse.ArgumentParser(prog="moonshiner preflight")
     parser.add_argument("--require-auth", action="store_true", default=True,
                         help="Require authentication (default).")
     parser.parse_args(argv)
@@ -233,7 +222,7 @@ def _preflight(argv: list[str]) -> int:
 def _config(argv: list[str]) -> int:
     from configuration import (LOCAL_PATH, dotted_get, load_config, parse_value,
                                update_local)
-    parser = argparse.ArgumentParser(prog="moonshiner.py config")
+    parser = argparse.ArgumentParser(prog="moonshiner config")
     sub = parser.add_subparsers(dest="action", required=True)
     sub.add_parser("show")
     get = sub.add_parser("get"); get.add_argument("key")
@@ -261,6 +250,110 @@ def _config(argv: list[str]) -> int:
     return 0
 
 
+def _ask(prompt: str, default: str) -> str:
+    value = input(f"{prompt} [{default}]: ").strip()
+    return value or default
+
+
+def _yes(prompt: str, default: bool = True) -> bool:
+    hint = "Y/n" if default else "y/N"
+    value = input(f"{prompt} [{hint}]: ").strip().lower()
+    if not value: return default
+    return value in {"y", "yes"}
+
+
+def _setup(argv: list[str] | None = None) -> int:
+    """First-run wizard. Ask for configuration instead of exposing internals."""
+    parser = argparse.ArgumentParser(
+        prog="moonshiner setup",
+        description="Configure the models, login, and storage Moonshiner will use.")
+    parser.add_argument("--reconfigure", action="store_true",
+                        help="Ask every setup question again.")
+    parser.parse_args(argv or [])
+    from configuration import load_config, update_local
+    config = load_config()
+    runtimes = sorted((config.get("runtimes") or {}).keys())
+    print("Welcome to Moonshiner. Let's set it up.\n")
+    recommended = _yes(
+        f"Use the recommended author ({config['teacher']['runtime']}/{config['teacher']['model']}) "
+        f"and judge ({config['judge']['runtime']}/{config['judge']['model']})?")
+    choices = []
+    for label, key in (("Trace author", "teacher"), ("Trace judge", "judge")):
+        current = config[key]
+        if recommended:
+            runtime, model = current["runtime"], current["model"]
+        else:
+            print("Available runtimes: " + ", ".join(runtimes))
+            runtime = _ask(f"{label} runtime", current["runtime"])
+            if runtime not in runtimes:
+                raise SystemExit(f"Unknown runtime {runtime!r}. Choose: {', '.join(runtimes)}")
+            model = _ask(f"{label} model", current["model"])
+        reasoning = str(current.get("reasoning") or "default")
+        choices.append((key, runtime, model, reasoning))
+
+    storage_default = str((config.get("storage") or {}).get("root") or "automatic")
+    storage = _ask("Where should Moonshiner store runs and datasets", storage_default)
+    for key, runtime, model, reasoning in choices:
+        update_local(f"{key}.runtime", runtime)
+        update_local(f"{key}.model", model)
+        update_local(f"{key}.reasoning", reasoning)
+    # Seed creation uses the same author/judge unless the user later changes it.
+    for source, target in ((choices[0], "seed_author"), (choices[1], "seed_judge")):
+        _, runtime, model, reasoning = source
+        update_local(f"{target}.runtime", runtime)
+        update_local(f"{target}.model", model)
+        update_local(f"{target}.reasoning", reasoning)
+    if storage != "automatic":
+        target = Path(storage).expanduser().resolve(); target.mkdir(parents=True, exist_ok=True)
+        update_local("storage.root", str(target))
+        os.environ["MOONSHINER_HOME"] = str(target)
+
+    # Ask for provider keys only when the chosen runtime actually uses one.
+    config = load_config()
+    from common import key_env_name, key_persist_path
+    configured = set()
+    for _, runtime, _, _ in choices:
+        runtime_config = config["runtimes"][runtime]
+        try:
+            env_name = key_env_name(runtime_config)
+            path = key_persist_path(runtime_config)
+        except RuntimeError:
+            print(f"{runtime}: uses its CLI login.")
+            continue
+        if runtime in configured or os.environ.get(env_name) or path.exists():
+            continue
+        configured.add(runtime)
+        secret = getpass.getpass(f"{runtime} API key ({env_name}; hidden): ").strip()
+        if not secret:
+            raise SystemExit("No API key entered. Setup was saved; run `moonshiner auth set " + runtime + "` to finish.")
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.write_text(secret); path.chmod(0o600)
+    # The Pi agent is a pinned runtime dependency. Install it on demand inside
+    # Moonshiner's own bundle; users should never need to know about npm.
+    selected = {runtime for _, runtime, _, _ in choices}
+    if "pi" in selected:
+        pi_cli = ROOT / config["runtimes"]["pi"].get("cli", "node_modules/.bin/pi")
+        if not pi_cli.exists():
+            npm = shutil.which("npm")
+            if not npm:
+                raise SystemExit("The selected Pi runtime needs Node.js 22 or newer. Install Node.js, then run `moonshiner` again.")
+            version = config["runtimes"]["pi"].get("runtime_version", "0.80.7")
+            print(f"Installing the Pi runtime {version}…")
+            subprocess.run([npm, "install", "--no-audit", "--no-fund", "--prefix",
+                            str(ROOT), f"@earendil-works/pi-coding-agent@{version}"],
+                           check=True)
+    update_local("onboarding.complete", True)
+    print("\nSetup complete.\n")
+    return 0
+
+
+def _configured() -> bool:
+    from configuration import load_config, user_config_path
+    if not user_config_path().exists():
+        return False
+    return bool(load_config().get("onboarding", {}).get("complete"))
+
+
 def _storage(argv: list[str]) -> int:
     from common import STORAGE_ROOT
     from configuration import update_local
@@ -281,7 +374,7 @@ def _storage(argv: list[str]) -> int:
 
 def _status(argv: list[str], *, inspect: bool = False) -> int:
     from run_state import connect, job_rows, summaries
-    parser = argparse.ArgumentParser(prog=f"moonshiner.py {'inspect' if inspect else 'status'}")
+    parser = argparse.ArgumentParser(prog=f"moonshiner {'inspect' if inspect else 'status'}")
     parser.add_argument("run_id", nargs="?", help="Run id (latest when omitted for inspect).")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
@@ -314,13 +407,47 @@ def _phase_help() -> str:
     return "\n".join(lines)
 
 
+def _help() -> str:
+    return """Moonshiner creates reviewed coding-agent traces and training datasets.
+
+START
+  moonshiner                 Ask for missing setup, then create one reviewed trace
+  moonshiner setup           Change models, authentication, or storage
+  moonshiner doctor          Check that everything is ready
+
+CREATE TRAINING DATA
+  moonshiner run --limit 20 --yes
+                              Create and review traces for 20 seeds
+  moonshiner status           Show current and previous runs
+  moonshiner dataset build    Build a dataset from accepted traces
+
+AUTHOR SEEDS
+  moonshiner seed run --id NAME --brief "WHAT TO BUILD" --yes
+                              Author, test, review, and save one new seed
+  moonshiner seeds catalog    Browse the seed recipe book
+
+CONFIGURE
+  moonshiner config show      Show the current configuration
+  moonshiner auth set NAME    Save an API key for a provider
+  moonshiner storage set PATH Choose where files are stored
+
+Run `moonshiner COMMAND --help` for details. Advanced internals are under
+`moonshiner pipeline --help` and are not needed for normal use."""
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv == ["--version"]:
         print(f"moonshiner {VERSION}"); return 0
-    if not argv or argv[0] in ("-h", "--help", "help"):
-        print(__doc__.strip())
-        print("\n" + _phase_help())
+    if not argv:
+        if not _configured():
+            result = _setup([])
+            if result: return result
+            print("Starting one seed now.\n")
+        from trace_pipeline import main as trace_main
+        return trace_main([])
+    if argv[0] in ("-h", "--help", "help"):
+        print(_help())
         return 0
 
     command, rest = argv[0], argv[1:]
@@ -333,6 +460,8 @@ def main(argv: list[str] | None = None) -> int:
         return _preflight(rest)
     if command == "config":
         return _config(rest)
+    if command == "setup":
+        return _setup(rest)
     if command == "storage":
         return _storage(rest)
     if command in {"run", "trace", "trace-run"}:
@@ -371,7 +500,7 @@ def main(argv: list[str] | None = None) -> int:
         return _dispatch(BY_KEY[command], rest)
 
     print(f"[moonshiner] unknown command: {command}", file=sys.stderr)
-    print(_phase_help(), file=sys.stderr)
+    print("Run `moonshiner --help` to see the available commands.", file=sys.stderr)
     return 2
 
 

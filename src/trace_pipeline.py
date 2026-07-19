@@ -29,6 +29,7 @@ def main(argv: list[str] | None = None) -> int:
     original_argv = list(argv or [])
     defaults = CONFIG.get("pipeline", {}).get("trace", {})
     parser = argparse.ArgumentParser(
+        prog="moonshiner run",
         description="Run the bounded trace quality loop with a durable ledger.")
     choice = parser.add_mutually_exclusive_group()
     choice.add_argument("--all", action="store_true",
