@@ -193,14 +193,8 @@ class PiRuntime(Runtime):
         new provider (OpenRouter, Fireworks, …) is covered without editing this
         list — the sandbox only ever sees the loopback proxy's dummy token.
         """
-        env = dict(os.environ)
-        names = {"ZAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
-                 "OPENROUTER_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "HF_TOKEN",
-                 self.runtime_config.get("key_env", "")}
-        for name in names:
-            if name:
-                env.pop(name, None)
-        return env
+        return {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL", "TERM")
+                if k in os.environ}
 
     # -- teacher ------------------------------------------------------------ #
     def run_trace(self, seed: dict, workspace: Path, *, out_dir: Path,

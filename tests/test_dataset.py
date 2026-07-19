@@ -84,5 +84,21 @@ class Expand(unittest.TestCase):
                             ex.source_fingerprint(other))
 
 
+class BehavioralTags(unittest.TestCase):
+    def test_parallel_multiturn_and_iterative_tags_are_derived(self):
+        turns = [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "read", "arguments": {}}},
+                {"function": {"name": "grep", "arguments": {}}}]},
+            {"role": "tool", "content": "ok"},
+            {"role": "assistant", "content": "done"},
+        ]
+        tags = bd.training_tags({"training_tags": ["debugging"]}, turns,
+                                {"feedback_used": True})
+        self.assertTrue({"debugging", "tool-use", "parallel-tool-calls",
+                         "multi-turn", "iterative-repair", "tool:read",
+                         "tool:grep"}.issubset(tags))
+
+
 if __name__ == "__main__":
     unittest.main()

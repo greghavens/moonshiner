@@ -7,14 +7,18 @@ import os
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(os.environ.get("MOONSHINER_BUNDLE_ROOT",
+                           Path(__file__).resolve().parent.parent)).resolve()
 DEFAULT_PATH = ROOT / "config.json"
-LOCAL_PATH = ROOT / "config.local.json"
 
 
 def user_config_path() -> Path:
     base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     return base / "moonshiner" / "config.json"
+
+
+LOCAL_PATH = (user_config_path() if os.environ.get("MOONSHINER_BUNDLE_ROOT")
+              else ROOT / "config.local.json")
 
 
 def deep_merge(base: dict, override: dict) -> dict:
@@ -68,5 +72,7 @@ def dotted_set(config: dict, dotted: str, value: Any) -> None:
 def update_local(dotted: str, value: Any) -> Path:
     overrides = json.loads(LOCAL_PATH.read_text()) if LOCAL_PATH.exists() else {}
     dotted_set(overrides, dotted, value)
+    LOCAL_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     LOCAL_PATH.write_text(json.dumps(overrides, indent=2) + "\n")
+    LOCAL_PATH.chmod(0o600)
     return LOCAL_PATH

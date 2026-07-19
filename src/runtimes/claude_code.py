@@ -35,11 +35,8 @@ OFFERED_TOOLS = ("Task", "Bash", "Glob", "Grep", "Read", "Edit", "Write",
 
 def _scrub_env() -> dict:
     """Drop CLAUDE* variables so the CLI uses its own configured auth."""
-    env = dict(os.environ)
-    for name in list(env):
-        if name.startswith("CLAUDE") or name == "ANTHROPIC_API_KEY":
-            env.pop(name, None)
-    return env
+    return {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "LC_ALL", "TERM")
+            if k in os.environ}
 
 
 class ClaudeCodeRuntime(Runtime):
@@ -82,6 +79,8 @@ class ClaudeCodeRuntime(Runtime):
                   interaction: list[str] | None = None,
                   security: bool = False,
                   tools: list[str] | None = None) -> TraceResult:
+        if not self.runtime_config.get("unsafe_host_access", False):
+            raise RuntimeError("claude-code teacher disabled until a contained runtime is configured")
         self._require_unlock()
         availability.require_available(self.name)
         cmd = self._base_cmd()

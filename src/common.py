@@ -8,7 +8,6 @@ everything runtime-agnostic lives here so one pipeline can distill any model.
 """
 from __future__ import annotations
 
-import functools
 import hashlib
 import json
 import os
@@ -18,7 +17,23 @@ import shutil
 import subprocess
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(os.environ.get("MOONSHINER_BUNDLE_ROOT",
+                           Path(__file__).resolve().parent.parent)).resolve()
+
+
+def _storage_root() -> Path:
+    explicit = os.environ.get("MOONSHINER_HOME")
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    # A source checkout remains self-contained. Installed launchers set
+    # MOONSHINER_BUNDLE_ROOT and default mutable state to XDG data storage.
+    if os.environ.get("MOONSHINER_BUNDLE_ROOT"):
+        base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+        return (base / "moonshiner").resolve()
+    return ROOT
+
+
+STORAGE_ROOT = _storage_root()
 
 
 def _load_config() -> dict:
@@ -28,11 +43,12 @@ def _load_config() -> dict:
 
 
 CONFIG = _load_config()
-SEEDS_DIR = ROOT / "tasks" / "seeds"
-WORKSPACES = ROOT / "workspaces"
-TRACES = ROOT / "traces"
-DATA = ROOT / "data"
-RUNS = ROOT / "runs"
+_installed_seeds = STORAGE_ROOT / "corpora" / "active" / "tasks" / "seeds"
+SEEDS_DIR = _installed_seeds if _installed_seeds.is_dir() else ROOT / "tasks" / "seeds"
+WORKSPACES = STORAGE_ROOT / "workspaces"
+TRACES = STORAGE_ROOT / "traces"
+DATA = STORAGE_ROOT / "data"
+RUNS = STORAGE_ROOT / "runs"
 QUARANTINE_DIR = TRACES / "quarantine"
 
 # Explicit acknowledgement required before any metered teacher/judge call. The
@@ -142,7 +158,6 @@ def provider_key_env_names(config: dict | None = None) -> tuple[str, ...]:
     return tuple(names)
 
 
-@functools.lru_cache(maxsize=1)
 def _staged_secret_values() -> tuple[str, ...]:
     """Contents of every runtime's staged and persistent key files, for redaction."""
     values: list[str] = []
@@ -157,6 +172,9 @@ def _staged_secret_values() -> tuple[str, ...]:
             if secret and secret not in values:
                 values.append(secret)
     return tuple(values)
+
+# Backward-compatible test/extension hook; values are intentionally never cached.
+_staged_secret_values.cache_clear = lambda: None
 
 # Runtime-only artifacts: excluded from candidate diffs and cleaned before an
 # independent screening replay. Verification can recreate them after the agent
@@ -305,6 +323,9 @@ def materialize(seed: dict, name: str | None = None) -> Path:
     workspace.mkdir(parents=True)
     source = seed["_dir"] / "files"
     if source.exists():
+        links = [path for path in source.rglob("*") if path.is_symlink()]
+        if links:
+            raise ValueError(f"seed contains prohibited symlink: {links[0]}")
         source_root = source.resolve()
 
         def ignore_runtime_caches(directory, names):
@@ -334,8 +355,7 @@ def run_setup(seed: dict, workspace: Path) -> tuple[bool, str]:
     if not command:
         return True, "(no reference_setup)"
     try:
-        proc = subprocess.run(shlex.split(command), cwd=workspace,
-                              capture_output=True, text=True, timeout=600)
+        proc = _sandboxed_command(shlex.split(command), workspace, 600)
         return proc.returncode == 0, (proc.stdout + "\n" + proc.stderr).strip()[-2000:]
     except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
         return False, str(exc)
@@ -353,13 +373,26 @@ def run_verify(seed: dict, workspace: Path, timeout: int | None = None
     if timeout is None:
         timeout = min(int(seed.get("verify_timeout") or 180), 360)
     try:
-        proc = subprocess.run(shlex.split(seed["verify_cmd"]), cwd=workspace,
-                              capture_output=True, text=True, timeout=timeout)
+        proc = _sandboxed_command(shlex.split(seed["verify_cmd"]), workspace, timeout)
         return proc.returncode == 0, (proc.stdout + "\n" + proc.stderr).strip()
     except subprocess.TimeoutExpired:
         return False, f"(verify timed out after {timeout}s)"
     except FileNotFoundError as exc:
         return False, f"(verify toolchain missing: {exc})"
+
+
+def _sandboxed_command(command: list[str], workspace: Path, timeout: int):
+    """Run seed-controlled commands offline with no home or inherited secrets."""
+    if shutil.which("bwrap") is None:
+        raise RuntimeError("bubblewrap is required to execute seed commands safely")
+    cmd = ["bwrap", "--die-with-parent", "--unshare-net", "--unshare-pid",
+           "--ro-bind", "/", "/", "--tmpfs", str(Path.home()),
+           "--tmpfs", "/tmp", "--bind", str(workspace), str(workspace),
+           "--clearenv", "--setenv", "PATH", os.environ.get("PATH", "/usr/bin:/bin"),
+           "--setenv", "HOME", str(workspace / ".sandbox-home"),
+           "--chdir", str(workspace), "--", *command]
+    return subprocess.run(cmd, cwd=workspace, capture_output=True, text=True,
+                          timeout=timeout)
 
 
 def protected_hashes(seed: dict, workspace: Path) -> dict[str, str | None]:
@@ -444,4 +477,5 @@ def scrub_text(value: str, workspace: str | None = None) -> str:
             value = value.replace(secret, "[REDACTED_SECRET]")
     for secret in _staged_secret_values():
         value = value.replace(secret, "[REDACTED_SECRET]")
-    return SECRET_RE.sub("[REDACTED_SECRET]", value).strip()
+    from privacy import redact
+    return redact(value, exact_secrets=_staged_secret_values())[0].strip()

@@ -7,7 +7,8 @@ import os
 import shutil
 import sys
 
-from common import CONFIG, key_env_name, key_file_path, key_persist_path
+from common import (CONFIG, SEEDS_DIR, STORAGE_ROOT, key_env_name, key_file_path,
+                    key_persist_path)
 from runtimes import get_judge, get_teacher
 
 
@@ -65,8 +66,9 @@ def doctor_main(argv: list[str] | None = None) -> int:
     checks.extend([
         {"check": "git", "ok": shutil.which("git") is not None,
          "detail": shutil.which("git") or "not found"},
-        {"check": "seeds", "ok": bool(list((__import__('common').SEEDS_DIR).glob('*/task.json'))),
-         "detail": f"{len(list((__import__('common').SEEDS_DIR).glob('*/task.json')))} available"},
+        {"check": "storage", "ok": STORAGE_ROOT.exists(), "detail": str(STORAGE_ROOT)},
+        {"check": "seeds", "ok": bool(list(SEEDS_DIR.glob('*/task.json'))),
+         "detail": f"{len(list(SEEDS_DIR.glob('*/task.json')))} available at {SEEDS_DIR}"},
     ])
     if args.json:
         import json; print(json.dumps(checks, indent=2))

@@ -26,6 +26,7 @@ from common import (CONFIG, DATA, SECRET_RE, SYSTEM_PROMPT, TRACES, load_seeds,
                     scrub_text)
 from normalize import parse_trace, tool_schemas_for
 from screen_traces import validate_reviewer_verdict
+from privacy import sanitize_object
 
 RAW = TRACES / "raw"
 META = TRACES / "meta"
@@ -93,6 +94,25 @@ def est_tokens(message: dict, chars_per_token: float = 3.3) -> int:
     return int(size / chars_per_token) + 8
 
 
+def training_tags(seed: dict, turns: list[dict], info: dict) -> list[str]:
+    """Describe behavior demonstrated by the accepted trajectory."""
+    explicit = seed.get("training_tags") or seed.get("tags") or []
+    if isinstance(explicit, str):
+        explicit = [explicit]
+    tags = {str(tag) for tag in explicit}
+    assistant_turns = [message for message in turns if message.get("role") == "assistant"]
+    calls = [call for message in assistant_turns for call in message.get("tool_calls") or []]
+    if calls: tags.add("tool-use")
+    if any(len(message.get("tool_calls") or []) > 1 for message in assistant_turns):
+        tags.add("parallel-tool-calls")
+    if len(assistant_turns) > 1: tags.add("multi-turn")
+    if info.get("feedback_used"): tags.add("iterative-repair")
+    for call in calls:
+        name = (call.get("function") or {}).get("name")
+        if name: tags.add(f"tool:{name}")
+    return sorted(tags)
+
+
 def build_row(seed: dict, info: dict) -> tuple[dict | None, str | None]:
     raw = RAW / f"{seed['id']}.jsonl"
     if not raw.exists():
@@ -108,7 +128,7 @@ def build_row(seed: dict, info: dict) -> tuple[dict | None, str | None]:
     session = ([{"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content":
                  info.get("prompt") or seed["prompt"]}] + turns)
-    session = scrub_session(session)
+    session = sanitize_object(scrub_session(session))
     session, secret_redactions = redact_secret_matches(session)
     if SECRET_RE.search(json.dumps(session, ensure_ascii=False)):
         return None, "SECRET MATCH AFTER REDACTION — dropped"
@@ -128,6 +148,7 @@ def build_row(seed: dict, info: dict) -> tuple[dict | None, str | None]:
         "domain": "coding",
         "passed": info.get("passed"),
         "tools_used": used,
+        "tags": training_tags(seed, turns, info),
         "teacher_runtime": teacher.get("runtime"),
         "teacher_model": teacher.get("model"),
         "reasoning_effort": teacher.get("reasoning"),
@@ -232,7 +253,7 @@ def main() -> None:
                 continue
             for line in source_path.read_text().splitlines():
                 if line.strip():
-                    partition.append(json.loads(line))
+                    partition.append(sanitize_object(json.loads(line)))
                     extra_counts[source_name][split] += 1
 
     output = DATA / "full"

@@ -262,7 +262,10 @@ def deterministic_screen(seed: dict, meta: dict) -> dict:
     runtime_caches_removed: list[str] = []
     if gates["seed_fresh"] and gates["diff_fresh"]:
         workspace = materialize(seed, name=f"screen-{seed['id']}")
-        run_setup(seed, workspace)
+        setup_ok, setup_detail = run_setup(seed, workspace)
+        gates["setup_ok"] = setup_ok
+        if not setup_ok:
+            failures.append(f"setup failed: {setup_detail}")
         protected_before = protected_hashes(seed, workspace)
         applied, apply_detail = apply_candidate_patch(workspace, patch)
         gates["patch_applies"] = applied
@@ -489,10 +492,20 @@ def screen(seed: dict, judge=None) -> dict:
     finally:
         _cleanup_workspace(workspace)
 
+    healthy_judge = (result.return_code == 0 and not result.timed_out
+                     and result.model_attested and not result.error)
     accepted, error = validate_reviewer_verdict(result.verdict)
+    if not healthy_judge:
+        accepted, error = False, "judge execution or model attestation failed"
     status = "accepted" if accepted else "review_reject"
     reason = error or "all categories clear; requirements met"
-    if not accepted and verdict_is_malformed(result.verdict):
+    if not healthy_judge:
+        attempts = _prior_judge_errors(seed["id"], meta) + 1
+        status = "judge_error"
+        reason = (f"judge execution or model attestation failed "
+                  f"(attempt {attempts}/{JUDGE_ERROR_LIMIT})")
+        review["judge_errors"] = attempts
+    elif not accepted and verdict_is_malformed(result.verdict):
         attempts = _prior_judge_errors(seed["id"], meta) + 1
         if attempts < JUDGE_ERROR_LIMIT:
             status = "judge_error"

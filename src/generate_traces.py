@@ -119,7 +119,9 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
             "id": seed["id"],
             "lang": seed.get("lang"),
             "category": seed.get("category"),
-            "passed": bool(passed) and protected_intact,
+            "passed": (bool(passed) and protected_intact and setup_ok
+                       and result.return_code == 0 and not result.timed_out
+                       and result.stream_success and not result.error),
             "verify_passed": passed,
             "protected_intact": protected_intact,
             "verify_output": scrub_text(verify_output)[:8000],
@@ -139,6 +141,7 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
             "diff_sha256": _sha256(diff),
             "raw_path": str(result.raw_path.relative_to(TRACES.parent)),
             "diff_path": f"traces/diffs/{seed['id']}.patch",
+            "feedback_used": bool(feedback),
             "teacher": {
                 "runtime": teacher.name,
                 "model": teacher.role["model"],

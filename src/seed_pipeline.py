@@ -8,14 +8,15 @@ import subprocess
 import sys
 from pathlib import Path
 
-from common import CONFIG, ROOT, SEEDS_DIR, TRACES, WORKSPACES
+from common import CONFIG, ROOT, SEEDS_DIR, STORAGE_ROOT, TRACES, WORKSPACES
 from run_state import (connect, create_run, finish_attempt, set_run_status,
                        start_attempt)
 from runtimes import get_seed_author, get_seed_judge
 from validate_seeds import validate_report
+from audit_seeds import check as audit_seed
 
 SCHEMA = json.loads((ROOT / "schemas" / "author_review_verdict.schema.json").read_text())
-CANDIDATES = ROOT / "tasks" / "candidates"
+CANDIDATES = STORAGE_ROOT / "tasks" / "candidates"
 
 AUTHOR_SYSTEM = """You author deterministic coding repair seeds for Moonshiner. Work only in the current workspace. Create exactly task.json, files/, and reference_fix.patch at the workspace root. The starting files must contain one focused defect; protected tests must expose it; the reference patch must fix it without modifying tests. Commands must be offline and deterministic. Do not run another coding agent."""
 
@@ -60,6 +61,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="Authorize metered author and judge calls.")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
+    if args.max_attempts < 1:
+        parser.error("--max-attempts must be at least 1")
     if not args.id or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789-" for c in args.id):
         parser.error("--id must use lowercase letters, digits, and hyphens")
     destination = SEEDS_DIR / args.id
@@ -103,6 +106,10 @@ def main(argv: list[str] | None = None) -> int:
             # Reload judge edits and prove the final on-disk form independently.
             seed = _load_candidate(candidate, args.id)
             final_report = validate_report(seed)
+            structural_error = audit_seed(candidate)
+            if structural_error:
+                final_report["passed"] = False
+                final_report.setdefault("failures", []).append(structural_error)
             verdict = review.verdict or {}
             categories = ("scope_creep", "missed_requirements", "extra_requirements",
                           "seed_code_bugs", "reference_fix_bugs", "weak_tests",
@@ -125,6 +132,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"candidate retained at {candidate}")
             return 1
         shutil.copytree(candidate, destination)
+        from corpus import write_catalog
+        write_catalog(SEEDS_DIR)
         set_run_status(db, run_id, "complete")
         print(f"promoted seed: {destination}")
         return 0

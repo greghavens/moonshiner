@@ -14,7 +14,8 @@ import argparse
 import json
 from pathlib import Path
 
-from common import ROOT, SECRET_RE, provider_key_env_names
+from common import ROOT, _staged_secret_values, provider_key_env_names
+from privacy import findings
 from expand_next_steps import DERIVATION
 from export_hf_next_steps import DEFAULT_OUTPUT, PUBLISH_KEY_ORDER
 
@@ -70,10 +71,10 @@ def validate(path: Path) -> int:
             raise ValueError(f"line {number}: tools must encode a list")
 
         serialized = json.dumps(row, ensure_ascii=False)
-        if SECRET_RE.search(serialized):
-            raise ValueError(f"line {number}: likely secret")
-        if any(value and value in serialized for value in forbidden_paths):
-            raise ValueError(f"line {number}: host path was not scrubbed")
+        privacy_hits = findings(serialized, exact_secrets=_staged_secret_values(),
+                                forbidden_paths=forbidden_paths)
+        if privacy_hits:
+            raise ValueError(f"line {number}: privacy findings: {privacy_hits}")
         if any(marker in serialized for marker in FORBIDDEN_SUBSTRINGS):
             raise ValueError(f"line {number}: private harness material")
 

@@ -14,7 +14,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from build_dataset import est_tokens
-from common import CONFIG, DATA, SECRET_RE, schemas_for
+from common import CONFIG, DATA, _staged_secret_values, schemas_for
+from privacy import findings, sanitize_object
 from normalize import parse_trace
 from runtimes.codex import TOOL_REGISTRY as CODEX_TOOL_REGISTRY
 from security_runtime import SECURITY
@@ -65,6 +66,9 @@ def build_row(case: dict, meta: dict) -> tuple[dict | None, str | None]:
     if not number:
         return None, "no passing attempt"
     attempt, info = attempt_info(case["id"], int(number))
+    teacher_info = info.get("teacher") or {}
+    if not teacher_info.get("model_attested"):
+        return None, "teacher model was not attested by the runtime stream"
     raw = attempt / "teacher.jsonl"
     if not raw.exists():
         return None, "passing rollout is missing"
@@ -74,13 +78,14 @@ def build_row(case: dict, meta: dict) -> tuple[dict | None, str | None]:
     if not any(message.get("role") == "assistant" for message in turns):
         return None, "no assistant turns"
 
-    session = [
+    session = sanitize_object([
         {"role": "system", "content": case["system"]},
         {"role": "user", "content": case["prompt"]},
         *turns,
-    ]
-    if SECRET_RE.search(json.dumps(session)):
-        return None, "SECRET MATCH — dropped"
+    ])
+    hits = findings(json.dumps(session), exact_secrets=_staged_secret_values())
+    if hits:
+        return None, f"PRIVACY MATCH — dropped: {hits}"
 
     used = sorted({
         call["function"]["name"]
@@ -109,7 +114,13 @@ def build_row(case: dict, meta: dict) -> tuple[dict | None, str | None]:
             "category": f"security-{security_task}",
             "passed": True,
             "tools_used": used,
+            "tags": sorted({"security-review", "tool-use" if used else "no-tool-use",
+                            *(f"tool:{name}" for name in used)}),
             "teacher_model": meta.get("teacher_model") or CONFIG["teacher"]["model"],
+            "teacher_runtime": meta.get("teacher_runtime") or "codex",
+            "provider": meta.get("provider") or "openai",
+            "observed_models": teacher_info.get("observed_models") or [],
+            "model_attested": True,
             "reasoning_effort": meta.get("reasoning_effort"),
             "trace_format": info.get("trace_format") or "codex-rollout",
             "domain": "security",

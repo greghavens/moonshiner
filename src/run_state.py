@@ -27,7 +27,7 @@ def connect(path: Path = DB_PATH) -> sqlite3.Connection:
       id TEXT PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL,
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
       config_json TEXT NOT NULL, limits_json TEXT NOT NULL,
-      error TEXT
+      error TEXT, model_calls INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS jobs (
       run_id TEXT NOT NULL REFERENCES runs(id), seed_id TEXT NOT NULL,
@@ -40,9 +40,16 @@ def connect(path: Path = DB_PATH) -> sqlite3.Connection:
       seed_id TEXT NOT NULL, number INTEGER NOT NULL, status TEXT NOT NULL,
       started_at TEXT NOT NULL, finished_at TEXT, teacher_usage_json TEXT,
       review_json TEXT, error TEXT,
+      artifact_path TEXT,
       UNIQUE(run_id, seed_id, number)
     );
     """)
+    columns={row[1] for row in db.execute("PRAGMA table_info(attempts)")}
+    if "artifact_path" not in columns:
+        db.execute("ALTER TABLE attempts ADD COLUMN artifact_path TEXT")
+    run_columns={row[1] for row in db.execute("PRAGMA table_info(runs)")}
+    if "model_calls" not in run_columns:
+        db.execute("ALTER TABLE runs ADD COLUMN model_calls INTEGER NOT NULL DEFAULT 0")
     return db
 
 
@@ -51,7 +58,8 @@ def create_run(db: sqlite3.Connection, kind: str, config: dict,
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     run_id = f"{kind}-{stamp}-{uuid.uuid4().hex[:6]}"
     timestamp = now()
-    db.execute("INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
+    db.execute("INSERT INTO runs(id,kind,status,created_at,updated_at,config_json,limits_json,error,model_calls) "
+               "VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0)",
                (run_id, kind, "running", timestamp, timestamp,
                 json.dumps(config, sort_keys=True), json.dumps(limits, sort_keys=True)))
     db.executemany("INSERT INTO jobs VALUES (?, ?, 'pending', 0, NULL, ?)",
@@ -64,6 +72,13 @@ def set_run_status(db, run_id: str, status: str, error: str | None = None) -> No
     db.execute("UPDATE runs SET status=?, updated_at=?, error=? WHERE id=?",
                (status, now(), error, run_id))
     db.commit()
+
+
+def record_model_call(db, run_id: str) -> int:
+    db.execute("UPDATE runs SET model_calls=model_calls+1, updated_at=? WHERE id=?",
+               (now(), run_id))
+    db.commit()
+    return int(db.execute("SELECT model_calls FROM runs WHERE id=?", (run_id,)).fetchone()[0])
 
 
 def set_job(db, run_id: str, seed_id: str, status: str,
@@ -82,11 +97,11 @@ def start_attempt(db, run_id: str, seed_id: str, number: int) -> None:
 
 def finish_attempt(db, run_id: str, seed_id: str, number: int, status: str,
                    usage: dict | None = None, review: dict | None = None,
-                   error: str | None = None) -> None:
+                   error: str | None = None, artifact_path: str | None = None) -> None:
     db.execute("UPDATE attempts SET status=?, finished_at=?, teacher_usage_json=?, "
-               "review_json=?, error=? WHERE run_id=? AND seed_id=? AND number=?",
+               "review_json=?, error=?, artifact_path=? WHERE run_id=? AND seed_id=? AND number=?",
                (status, now(), json.dumps(usage or {}), json.dumps(review or {}),
-                error, run_id, seed_id, number))
+                error, artifact_path, run_id, seed_id, number))
     set_job(db, run_id, seed_id, status, number, error)
 
 
@@ -104,3 +119,7 @@ def summaries(db, run_id: str | None = None) -> list[dict]:
 def job_rows(db, run_id: str) -> list[dict]:
     return [dict(row) for row in db.execute(
         "SELECT * FROM jobs WHERE run_id=? ORDER BY seed_id", (run_id,))]
+
+def run_row(db, run_id: str) -> dict | None:
+    row=db.execute("SELECT * FROM runs WHERE id=?",(run_id,)).fetchone()
+    return dict(row) if row else None

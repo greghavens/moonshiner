@@ -32,10 +32,13 @@ def main() -> None:
         student.get("output_dir", "~/nemotron-super-finetune/data-moonshiner")))
     parser.add_argument("--model", default=student.get(
         "base_model", "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B"))
+    parser.add_argument("--trust-remote-code", action="store_true",
+                        help="Explicitly allow model repository Python code.")
     args = parser.parse_args()
 
     from transformers import AutoTokenizer  # deferred: heavy, env-specific
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model, trust_remote_code=args.trust_remote_code)
     os.makedirs(args.out, exist_ok=True)
 
     sample = None

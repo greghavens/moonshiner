@@ -49,11 +49,9 @@ OFFERED_TOOLS = ("exec", "apply_patch", "update_plan", "web_search")
 
 
 def _scrub_env() -> dict:
-    """Drop OpenAI API keys so codex uses its own ~/.codex account auth."""
-    env = dict(os.environ)
-    for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL"):
-        env.pop(name, None)
-    return env
+    """Allowlist non-secret process state; Codex uses its auth file."""
+    return {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "LC_ALL", "TERM")
+            if k in os.environ}
 
 
 class CodexRuntime(Runtime):
@@ -98,7 +96,7 @@ class CodexRuntime(Runtime):
                   security: bool = False,
                   tools: list[str] | None = None) -> TraceResult:
         availability.require_available(self.name)
-        sandbox = self.runtime_config.get("sandbox", "danger-full-access")
+        sandbox = self.runtime_config.get("sandbox", "workspace-write")
         if security:
             sandbox = "workspace-write"
         cmd = self._base_cmd(sandbox=sandbox)
@@ -142,6 +140,11 @@ class CodexRuntime(Runtime):
             trace_format = "codex-rollout"
         else:
             raw_path.write_text(stdout)
+        observed_models = _observed_models(stdout)
+        if rollout is not None:
+            observed_models += [m for m in _observed_models(rollout.read_text(errors="replace"))
+                                if m not in observed_models]
+        observed_model = observed_models[0] if observed_models else None
 
         return TraceResult(
             raw_path=raw_path,
@@ -150,9 +153,9 @@ class CodexRuntime(Runtime):
             timed_out=timed_out,
             duration_s=duration,
             stream_success=bool(messages) and not error and not timed_out,
-            observed_model=self.role["model"],
-            observed_models=[self.role["model"]],
-            model_attested=True,
+            observed_model=observed_model,
+            observed_models=observed_models,
+            model_attested=self.role["model"] in observed_models,
             usage=usage,
             error=error,
             unavailable=(f"codex usage limit until {block['retry_at']}"
@@ -231,14 +234,18 @@ class CodexRuntime(Runtime):
 
         last_message = self._last_message(stdout)
         verdict = _parse_json_object(last_message)
+        observed_models = _observed_models(stdout)
+        observed_model = observed_models[0] if observed_models else None
+        _, _, event_error, _ = self._scan_events(stdout)
         return ReviewResult(
             raw_text=last_message,
             verdict=verdict,
             return_code=return_code,
             timed_out=timed_out,
             duration_s=duration,
-            observed_model=self.role["model"],
-            model_attested=True,
+            observed_model=observed_model,
+            model_attested=self.role["model"] in observed_models,
+            error=event_error or (stderr.strip() if return_code not in (0, None) else None),
         )
 
     def _last_message(self, stdout: str) -> str:
@@ -304,6 +311,24 @@ def _parse_json_object(text: str) -> dict | None:
                 except json.JSONDecodeError:
                     start = None
     return None
+
+
+def _observed_models(text: str) -> list[str]:
+    """Extract only explicit model fields from Codex event/rollout JSON."""
+    found: list[str] = []
+    def visit(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in {"model", "model_id"} and isinstance(child, str) and child and child not in found:
+                    found.append(child)
+                else:
+                    visit(child)
+        elif isinstance(value, list):
+            for child in value: visit(child)
+    for line in text.splitlines():
+        try: visit(json.loads(line))
+        except json.JSONDecodeError: continue
+    return found
 
 
 def _text_of(content) -> str:

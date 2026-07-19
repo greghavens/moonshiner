@@ -23,7 +23,6 @@ Copies are atomic (stage into a sibling temp dir, then swap) and skip installed
 
 Model-free and idempotent — safe to re-run.
   python3 src/import_seeds.py            # canonical + fallback per config
-  python3 src/import_seeds.py --force    # reproduce the merge deterministically
   python3 src/import_seeds.py --dry-run  # report provenance without copying
 """
 from __future__ import annotations
@@ -116,11 +115,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--fallback",
                         help="Override config.source.fallback_repository")
     parser.add_argument("--only", help="Comma-separated seed ids to import")
-    parser.add_argument("--force", action="store_true",
-                        help="Overwrite seeds that already exist here")
+    parser.add_argument("--force", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--dry-run", action="store_true",
                         help="Report what would be imported without copying")
     args = parser.parse_args(argv)
+    if args.force:
+        parser.error("--force was removed: existing seeds are immutable")
 
     primary = source_seeds_dir(args.source)
     if not primary.is_dir():
@@ -148,7 +148,7 @@ def main(argv: list[str] | None = None) -> int:
             invalid.append((name, reason))
             continue
         dest = SEEDS_DIR / name
-        if dest.exists() and not args.force:
+        if dest.exists():
             skipped.append(name)
             continue
         if not args.dry_run:

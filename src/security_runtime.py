@@ -253,6 +253,20 @@ def run_codex(
             trace_format = "codex-exec-events"
     shutil.rmtree(codex_home, ignore_errors=True)
 
+    observed_models = []
+    for line in events_path.read_text(errors="replace").splitlines():
+        try: event = json.loads(line)
+        except json.JSONDecodeError: continue
+        stack = [event]
+        while stack:
+            value = stack.pop()
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if key in {"model", "model_id"} and isinstance(child, str):
+                        if child not in observed_models: observed_models.append(child)
+                    elif isinstance(child, (dict, list)): stack.append(child)
+            elif isinstance(value, list): stack.extend(value)
+
     return {
         "returncode": returncode,
         "timed_out": timed_out,
@@ -263,5 +277,7 @@ def run_codex(
         "pump_error": pump_error,
         "auth_unlinked_before_tools": auth_unlinked,
         "trace_format": trace_format,
+        "observed_models": observed_models,
+        "model_attested": model in observed_models,
         "last_message": extract_last_message(events_path),
     }

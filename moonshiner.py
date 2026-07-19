@@ -5,15 +5,10 @@ The normal `run` command safely generates, verifies, judges, and when necessary
 replaces traces. Seed authoring and dataset building are separate explicit
 workflows. The original low-level phase runner remains available as `pipeline`.
 
-  python3 moonshiner.py run                  # safe trace run (one seed)
-  python3 moonshiner.py run --limit 20 --yes # bounded trace quality run
-  python3 moonshiner.py run --detach         # durable background run
-  python3 moonshiner.py pipeline --dry-run   # advanced legacy phase plan
-  python3 moonshiner.py dataset build        # build/export accepted traces
-  python3 moonshiner.py phases               # list the pipeline
-  python3 moonshiner.py preflight            # check teacher + judge reachable
-  python3 moonshiner.py generate --all       # one phase, its own native args
-  python3 moonshiner.py screen --help        # per-phase help passes through
+  moonshiner run                  # safe trace run (one seed)
+  moonshiner run --limit 20 --yes # bounded trace quality run
+  moonshiner run --detach         # durable background run
+  moonshiner dataset build        # build/export accepted traces
 
 The teacher and judge runtimes (and their models/reasoning) are read from
 config.json — see `runtimes` / `teacher` / `judge`. Metered phases preflight
@@ -31,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+VERSION = "0.1.0"
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
@@ -80,14 +76,14 @@ PHASES: tuple[Phase, ...] = (
     Phase("export", 7, "Export the HF dataset", "export_hf", takes_argv=False),
     Phase("export-next", 8, "Export the HF next-steps dataset",
           "export_hf_next_steps", takes_argv=False),
-    Phase("parquet", 9, "Export Parquet shards", "export_parquet",
-          takes_argv=False),
-    Phase("prepare", 10, "Stage the dataset for local training",
-          "prepare_local", takes_argv=False),
-    Phase("verify-export", 11, "Validate the exported dataset",
+    Phase("verify-export", 9, "Validate the exported dataset",
           "validate_hf_export", takes_argv=False),
-    Phase("card", 11.5, "Render the Hugging Face dataset card",
+    Phase("parquet", 10, "Export validated Parquet shards", "export_parquet",
+          takes_argv=False),
+    Phase("card", 11, "Render the Hugging Face dataset card",
           "export_hf_card", takes_argv=False),
+    Phase("prepare", 12, "Legacy local tokenizer rendering (explicit opt-in)",
+          "prepare_local", takes_argv=False, optional=True),
 )
 
 BY_KEY = {phase.key: phase for phase in PHASES}
@@ -258,10 +254,28 @@ def _config(argv: list[str]) -> int:
         path = update_local(prefix + ".runtime", args.runtime)
         update_local(prefix + ".model", args.model)
         if args.reasoning: update_local(prefix + ".reasoning", args.reasoning)
-        print(f"configured {args.role}: {args.runtime}/{args.model} in {path.relative_to(ROOT)}")
+        print(f"configured {args.role}: {args.runtime}/{args.model} in {path}")
         return 0
     path = update_local(args.key, parse_value(args.value))
-    print(f"set {args.key} in {path.relative_to(ROOT)}")
+    print(f"set {args.key} in {path}")
+    return 0
+
+
+def _storage(argv: list[str]) -> int:
+    from common import STORAGE_ROOT
+    from configuration import update_local
+    parser = argparse.ArgumentParser(prog="moonshiner storage")
+    sub = parser.add_subparsers(dest="action", required=True)
+    sub.add_parser("status")
+    setp = sub.add_parser("set"); setp.add_argument("path", type=Path)
+    args = parser.parse_args(argv)
+    if args.action == "status":
+        print(STORAGE_ROOT)
+        return 0
+    target = args.path.expanduser().resolve()
+    target.mkdir(parents=True, exist_ok=True)
+    path = update_local("storage.root", str(target))
+    print(f"storage root set to {target} in {path}; effective on the next invocation")
     return 0
 
 
@@ -302,6 +316,8 @@ def _phase_help() -> str:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv == ["--version"]:
+        print(f"moonshiner {VERSION}"); return 0
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(__doc__.strip())
         print("\n" + _phase_help())
@@ -317,6 +333,8 @@ def main(argv: list[str] | None = None) -> int:
         return _preflight(rest)
     if command == "config":
         return _config(rest)
+    if command == "storage":
+        return _storage(rest)
     if command in {"run", "trace", "trace-run"}:
         if command == "trace" and rest and rest[0] == "run": rest = rest[1:]
         from trace_pipeline import main as trace_main
@@ -331,13 +349,22 @@ def main(argv: list[str] | None = None) -> int:
     if command == "doctor":
         from control_cli import doctor_main
         return doctor_main(rest)
+    if command == "seeds":
+        from corpus import main as corpus_main
+        return corpus_main(rest)
+    if command == "publish":
+        from publish import main as publish_main
+        return publish_main(rest)
     if command in {"seed", "seed-run"}:
         if command == "seed" and rest and rest[0] == "run": rest = rest[1:]
         from seed_pipeline import main as seed_main
         return seed_main(rest)
     if command == "dataset":
+        if rest and rest[0] in {"compose", "prepare"}:
+            from dataset_prep import main as dataset_main
+            return dataset_main(rest)
         if not rest or rest[0] not in {"build", "export"}:
-            print("usage: moonshiner.py dataset {build,export}", file=sys.stderr)
+            print("usage: moonshiner dataset {build,export,compose,prepare}", file=sys.stderr)
             return 2
         return _run(["--from", "build"])
     if command in BY_KEY:

@@ -317,7 +317,7 @@ def build_card(rows: list[dict], *, stage: str = "release") -> str:
             f"{row_splits.get('train', 0):,} / {row_splits.get('val', 0):,} rows). "
             f"Model-attested: **{attest_pct}%**. Drawn from a corpus of "
             f"{seed_count:,} verifiable repair seeds. Regenerate this card from the "
-            f"published rows with `python3 moonshiner.py card`.")
+            f"published rows with `moonshiner card`.")
 
     judge_bullet = (
         f"- **Independent judge at release.** A separate reviewer "
