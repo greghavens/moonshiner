@@ -53,6 +53,19 @@ class LoadSeeds(unittest.TestCase):
         pick = common.load_seeds(only={"py-config-merge"})
         self.assertEqual([seed["id"] for seed in pick], ["py-config-merge"])
 
+    def test_behavior_selection_by_category_and_tags(self):
+        selected = common.select_seeds(kind="behavior",
+            categories={"parallel-same"}, tags={"bfcl:parallel"})
+        self.assertTrue(selected)
+        self.assertTrue(all(seed["kind"] == "tool_behavior" for seed in selected))
+        self.assertTrue(all(seed["category"] == "parallel-same" for seed in selected))
+
+    def test_name_and_only_filters_apply_to_behavior_seeds(self):
+        selected = common.select_seeds(kind="behavior",
+            only={"behavior-tool-selection-0001"}, name="Vendor onboarding")
+        self.assertEqual([seed["id"] for seed in selected],
+                         ["behavior-tool-selection-0001"])
+
 
 if __name__ == "__main__":
     unittest.main()

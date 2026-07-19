@@ -217,8 +217,11 @@ def main(argv: list[str] | None = None) -> int:
     elif args.task:
         only = {args.task}
     seeds = load_seeds(only=only, include_holdout=args.include_holdout)
+    from import_existing import imported_task_ids
+    imported = imported_task_ids()
     excluded = quarantined_tasks()
-    seeds = [seed for seed in seeds if seed["id"] not in excluded]
+    seeds = [seed for seed in seeds
+             if seed["id"] not in excluded and (args.force or seed["id"] not in imported)]
     if args.limit:
         seeds = seeds[:args.limit]
     if args.smoke:

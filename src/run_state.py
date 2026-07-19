@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from common import RUNS
@@ -18,7 +18,7 @@ def now() -> str:
 
 def connect(path: Path = DB_PATH) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(path)
+    db = sqlite3.connect(path, timeout=30)
     db.row_factory = sqlite3.Row
     db.executescript("""
     PRAGMA journal_mode=WAL;
@@ -33,6 +33,7 @@ def connect(path: Path = DB_PATH) -> sqlite3.Connection:
       run_id TEXT NOT NULL REFERENCES runs(id), seed_id TEXT NOT NULL,
       status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
       last_error TEXT, updated_at TEXT NOT NULL,
+      lease_owner TEXT, lease_expires_at TEXT,
       PRIMARY KEY (run_id, seed_id)
     );
     CREATE TABLE IF NOT EXISTS attempts (
@@ -50,6 +51,12 @@ def connect(path: Path = DB_PATH) -> sqlite3.Connection:
     run_columns={row[1] for row in db.execute("PRAGMA table_info(runs)")}
     if "model_calls" not in run_columns:
         db.execute("ALTER TABLE runs ADD COLUMN model_calls INTEGER NOT NULL DEFAULT 0")
+    job_columns={row[1] for row in db.execute("PRAGMA table_info(jobs)")}
+    if "lease_owner" not in job_columns:
+        db.execute("ALTER TABLE jobs ADD COLUMN lease_owner TEXT")
+    if "lease_expires_at" not in job_columns:
+        db.execute("ALTER TABLE jobs ADD COLUMN lease_expires_at TEXT")
+    db.commit()
     return db
 
 
@@ -62,7 +69,8 @@ def create_run(db: sqlite3.Connection, kind: str, config: dict,
                "VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0)",
                (run_id, kind, "running", timestamp, timestamp,
                 json.dumps(config, sort_keys=True), json.dumps(limits, sort_keys=True)))
-    db.executemany("INSERT INTO jobs VALUES (?, ?, 'pending', 0, NULL, ?)",
+    db.executemany("INSERT INTO jobs(run_id,seed_id,status,attempts,last_error,updated_at) "
+                   "VALUES (?, ?, 'pending', 0, NULL, ?)",
                    [(run_id, seed_id, timestamp) for seed_id in seed_ids])
     db.commit()
     return run_id
@@ -81,9 +89,83 @@ def record_model_call(db, run_id: str) -> int:
     return int(db.execute("SELECT model_calls FROM runs WHERE id=?", (run_id,)).fetchone()[0])
 
 
+def reserve_model_call(db, run_id: str, maximum: int) -> int | None:
+    """Atomically reserve one paid call without allowing workers past the ceiling."""
+    db.execute("BEGIN IMMEDIATE")
+    row = db.execute("SELECT model_calls FROM runs WHERE id=?", (run_id,)).fetchone()
+    if row is None:
+        db.rollback(); raise KeyError(run_id)
+    current = int(row[0])
+    if current >= maximum:
+        db.rollback(); return None
+    current += 1
+    db.execute("UPDATE runs SET model_calls=?, updated_at=? WHERE id=?",
+               (current, now(), run_id))
+    db.commit()
+    return current
+
+
+def claim_job(db, run_id: str, owner: str, lease_seconds: int = 120) -> dict | None:
+    """Atomically lease one pending/retry job, recovering an expired claim once."""
+    timestamp = now()
+    expires = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat(
+        timespec="seconds")
+    db.execute("BEGIN IMMEDIATE")
+    expired = db.execute(
+        "SELECT seed_id,attempts FROM jobs WHERE run_id=? AND status='running' "
+        "AND lease_expires_at IS NOT NULL AND lease_expires_at<=? ORDER BY seed_id LIMIT 1",
+        (run_id, timestamp)).fetchone()
+    if expired:
+        db.execute("UPDATE attempts SET status='abandoned',finished_at=?,error=? "
+                   "WHERE run_id=? AND seed_id=? AND status='running'",
+                   (timestamp, "worker lease expired", run_id, expired[0]))
+        db.execute("UPDATE jobs SET status='retry',last_error=?,lease_owner=NULL,"
+                   "lease_expires_at=NULL,updated_at=? WHERE run_id=? AND seed_id=?",
+                   ("worker lease expired", timestamp, run_id, expired[0]))
+    row = db.execute(
+        "SELECT seed_id,attempts,last_error FROM jobs WHERE run_id=? "
+        "AND status IN ('pending','retry') ORDER BY seed_id LIMIT 1", (run_id,)).fetchone()
+    if row is None:
+        db.commit(); return None
+    updated = db.execute(
+        "UPDATE jobs SET status='running',lease_owner=?,lease_expires_at=?,updated_at=? "
+        "WHERE run_id=? AND seed_id=? AND status IN ('pending','retry')",
+        (owner, expires, timestamp, run_id, row[0])).rowcount
+    if updated != 1:
+        db.rollback(); return None
+    db.commit()
+    return {"seed_id": row[0], "attempts": int(row[1]), "last_error": row[2]}
+
+
+def renew_lease(db, run_id: str, seed_id: str, owner: str,
+                lease_seconds: int = 120) -> bool:
+    expires = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat(
+        timespec="seconds")
+    changed = db.execute(
+        "UPDATE jobs SET lease_expires_at=?,updated_at=? WHERE run_id=? AND seed_id=? "
+        "AND status='running' AND lease_owner=?",
+        (expires, now(), run_id, seed_id, owner)).rowcount
+    db.commit()
+    return changed == 1
+
+
+def abandon_claim(db, run_id: str, seed_id: str, owner: str, error: str) -> None:
+    """Return a failed worker's claim immediately; no lease timeout is required."""
+    timestamp = now()
+    db.execute("UPDATE attempts SET status='abandoned',finished_at=?,error=? "
+               "WHERE run_id=? AND seed_id=? AND status='running'",
+               (timestamp, error, run_id, seed_id))
+    db.execute("UPDATE jobs SET status='retry',last_error=?,updated_at=?,"
+               "lease_owner=NULL,lease_expires_at=NULL WHERE run_id=? AND seed_id=? "
+               "AND status='running' AND lease_owner=?",
+               (error, timestamp, run_id, seed_id, owner))
+    db.commit()
+
+
 def set_job(db, run_id: str, seed_id: str, status: str,
             attempts: int, error: str | None = None) -> None:
-    db.execute("UPDATE jobs SET status=?, attempts=?, last_error=?, updated_at=? "
+    db.execute("UPDATE jobs SET status=?, attempts=?, last_error=?, updated_at=?, "
+               "lease_owner=NULL,lease_expires_at=NULL "
                "WHERE run_id=? AND seed_id=?",
                (status, attempts, error, now(), run_id, seed_id))
     db.commit()
@@ -92,7 +174,9 @@ def set_job(db, run_id: str, seed_id: str, status: str,
 def start_attempt(db, run_id: str, seed_id: str, number: int) -> None:
     db.execute("INSERT INTO attempts(run_id, seed_id, number, status, started_at) "
                "VALUES (?, ?, ?, 'running', ?)", (run_id, seed_id, number, now()))
-    set_job(db, run_id, seed_id, "running", number)
+    db.execute("UPDATE jobs SET attempts=?,updated_at=? WHERE run_id=? AND seed_id=?",
+               (number, now(), run_id, seed_id))
+    db.commit()
 
 
 def finish_attempt(db, run_id: str, seed_id: str, number: int, status: str,
@@ -122,4 +206,10 @@ def job_rows(db, run_id: str) -> list[dict]:
 
 def run_row(db, run_id: str) -> dict | None:
     row=db.execute("SELECT * FROM runs WHERE id=?",(run_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def latest_running_run(db, kind: str) -> dict | None:
+    row = db.execute("SELECT * FROM runs WHERE kind=? AND status='running' "
+                     "ORDER BY created_at DESC LIMIT 1", (kind,)).fetchone()
     return dict(row) if row else None

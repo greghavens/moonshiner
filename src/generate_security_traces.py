@@ -15,11 +15,12 @@ import re
 import shutil
 import subprocess
 import sys
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from common import CONFIG
+from common import CONFIG, RUNS
 from security_runtime import ROOT, SECURITY, run_codex
 
 CATALOG = SECURITY / "catalog"
@@ -27,7 +28,8 @@ KEYS = SECURITY / "keys"
 TRACES = SECURITY / "traces"
 ATTEMPTS = TRACES / "attempts"
 META = TRACES / "meta"
-WORK_ROOT = Path(os.environ.get("MOONSHINER_SECURITY_WORK_ROOT", "/var/tmp/moonshiner-security-work"))
+WORK_ROOT = Path(os.environ.get("MOONSHINER_SECURITY_WORK_ROOT",
+                                str(RUNS / "security-work")))
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -64,10 +66,9 @@ def source_clone(clone_dir: str) -> Path:
 
 
 def materialize(case: dict) -> Path:
-    workspace = (WORK_ROOT / case["id"]).resolve()
+    workspace = (WORK_ROOT / f"{case['id']}-{uuid.uuid4().hex[:10]}").resolve()
     if workspace.parent != WORK_ROOT.resolve():
         raise ValueError(f"unsafe workspace path: {workspace}")
-    shutil.rmtree(workspace, ignore_errors=True)
     clone_dir = case.get("clone_dir")
     if clone_dir:
         shutil.copytree(source_clone(clone_dir), workspace, symlinks=True,
@@ -204,8 +205,7 @@ CANDIDATE ANSWER FROM THE BLIND TRACE
 {candidate}
 </candidate>
 """
-    judge_workspace = WORK_ROOT / f"judge-{case['id']}"
-    shutil.rmtree(judge_workspace, ignore_errors=True)
+    judge_workspace = WORK_ROOT / f"judge-{case['id']}-{uuid.uuid4().hex[:10]}"
     judge_workspace.mkdir(parents=True)
     result = run_codex(
         prompt=prompt,
@@ -219,7 +219,6 @@ CANDIDATE ANSWER FROM THE BLIND TRACE
         sandbox="read-only",
         output_schema=JUDGE_SCHEMA,
     )
-    shutil.rmtree(judge_workspace, ignore_errors=True)
     verdict = parse_json_object(result.get("last_message") or "") or {
         "passed": False,
         "score": 0.0,
@@ -399,7 +398,6 @@ def run_answer_case(case: dict, reference: dict, args) -> dict:
         }
         write_json(attempt_dir / "attempt.json", outcome)
         outcomes.append(outcome)
-        shutil.rmtree(workspace, ignore_errors=True)
         if outcome["passed"]:
             break
     best = max(outcomes, key=lambda item: float(item.get("score") or 0.0))
@@ -455,7 +453,6 @@ def run_repo_case(case: dict, key: dict, args) -> dict:
         }
         write_json(attempt_dir / "attempt.json", outcome)
         outcomes.append(outcome)
-        shutil.rmtree(workspace, ignore_errors=True)
         if outcome["passed"]:
             break
     best = max(outcomes, key=lambda item: (float(item.get("recall") or 0.0),

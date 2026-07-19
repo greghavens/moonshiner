@@ -24,10 +24,22 @@ def catalog(seed_dir: Path = SEEDS_DIR) -> tuple[str, dict]:
         task = json.loads(task_path.read_text())
         prompt = " ".join(str(task.get("prompt") or "").split())
         summary = prompt[:197].rstrip() + ("…" if len(prompt) > 197 else "")
-        item = {"id": task["id"], "language": task.get("lang") or "unknown",
+        item = {"id": task["id"], "kind": "coding_repair",
+                "language": task.get("lang") or "unknown",
                 "category": task.get("category") or "uncategorized",
                 "training_tags": task.get("training_tags") or task.get("tags") or [],
                 "summary": summary, "verify_command": task.get("verify_cmd")}
+        groups[item["category"]].append(item)
+    behavior_dir = seed_dir.parent / "behavior-seeds"
+    for task_path in sorted(behavior_dir.glob("behavior-*.json")):
+        task = json.loads(task_path.read_text())
+        prompt = " ".join(str(task.get("prompt") or "").split())
+        summary = prompt[:197].rstrip() + ("…" if len(prompt) > 197 else "")
+        item = {"id": task["id"], "kind": "tool_behavior",
+                "language": "non-code", "world": task.get("world"),
+                "category": task.get("category") or "uncategorized",
+                "training_tags": task.get("training_tags") or [],
+                "summary": summary, "verify_command": None}
         groups[item["category"]].append(item)
     data = {"name": "Moonshiner Seed Recipe Book",
             "seed_count": sum(map(len, groups.values())),
@@ -39,7 +51,8 @@ def catalog(seed_dir: Path = SEEDS_DIR) -> tuple[str, dict]:
         lines += [f"## {category}", ""]
         for item in items:
             tags = " " + " ".join(f"`#{tag}`" for tag in item["training_tags"]) if item["training_tags"] else ""
-            lines.append(f"- **{item['id']}** (`{item['language']}`){tags} — {item['summary']}")
+            world = f", `{item['world']}`" if item.get("world") else ""
+            lines.append(f"- **{item['id']}** (`{item['language']}`{world}){tags} — {item['summary']}")
         lines.append("")
     return "\n".join(lines), data
 
@@ -76,7 +89,20 @@ def manifest(seed_dir: Path = SEEDS_DIR, *, version: str | None = None) -> dict:
         entries.append({"id": directory.name, "lang": spec.get("lang"),
                         "category": spec.get("category"), "fingerprint": digest,
                         "files": files})
-    return {**header, "seed_count": len(entries), "seeds": entries}
+    behavior_entries = []
+    for path in sorted((seed_dir.parent / "behavior-seeds").glob("behavior-*.json")):
+        spec = json.loads(path.read_text())
+        behavior_entries.append({"id": spec["id"], "category": spec.get("category"),
+                                 "world": spec.get("world"),
+                                 "fingerprint": hashlib.sha256(path.read_bytes()).hexdigest(),
+                                 "file": path.name})
+    worlds = seed_dir.parent / "behavior-worlds.json"
+    return {**header, "seed_count": len(entries) + len(behavior_entries),
+            "coding_seed_count": len(entries),
+            "behavior_seed_count": len(behavior_entries), "seeds": entries,
+            "behavior_seeds": behavior_entries,
+            "behavior_worlds_sha256": (hashlib.sha256(worlds.read_bytes()).hexdigest()
+                                        if worlds.is_file() else None)}
 
 
 def verify(directory: Path, expected: dict) -> None:
@@ -85,6 +111,14 @@ def verify(directory: Path, expected: dict) -> None:
     got = [(x["id"], x["fingerprint"]) for x in actual["seeds"]]
     if got != wanted:
         raise ValueError("seed corpus does not match its manifest")
+    wanted_behavior = [(x["id"], x["fingerprint"])
+                       for x in expected.get("behavior_seeds", [])]
+    got_behavior = [(x["id"], x["fingerprint"])
+                    for x in actual.get("behavior_seeds", [])]
+    if got_behavior != wanted_behavior:
+        raise ValueError("behavior seed corpus does not match its manifest")
+    if actual.get("behavior_worlds_sha256") != expected.get("behavior_worlds_sha256"):
+        raise ValueError("behavior world registry does not match its manifest")
 
 
 def _safe_extract(archive: Path, destination: Path) -> None:
@@ -168,6 +202,9 @@ def main(argv=None) -> int:
     sub = parser.add_subparsers(dest="action", required=True)
     sub.add_parser("status"); sub.add_parser("verify"); sub.add_parser("list")
     cat = sub.add_parser("catalog"); cat.add_argument("--output", type=Path); cat.add_argument("--json", action="store_true")
+    cat.add_argument("--kind", choices=["coding", "behavior", "all"], default="all")
+    cat.add_argument("--category", action="append"); cat.add_argument("--tag", action="append")
+    cat.add_argument("--name", help="Match seed ID, prompt summary, or tag")
     man = sub.add_parser("manifest"); man.add_argument("--output", type=Path); man.add_argument("--version")
     for action in ("install", "update"):
         command = sub.add_parser(action)
@@ -183,6 +220,21 @@ def main(argv=None) -> int:
         return 0
     if args.action == "catalog":
         markdown, data = catalog()
+        categories = set(args.category or []); tags = set(args.tag or [])
+        needle=(args.name or "").casefold(); filtered={}
+        for category,items in data["categories"].items():
+            kept=[item for item in items
+                  if (args.kind == "all" or item["kind"] == ("tool_behavior" if args.kind=="behavior" else "coding_repair"))
+                  and (not categories or category in categories)
+                  and (not tags or tags <= set(item.get("training_tags") or []))
+                  and (not needle or any(needle in str(value).casefold() for value in
+                      (item["id"],item.get("summary","")," ".join(item.get("training_tags") or []))))]
+            if kept: filtered[category]=kept
+        data={**data,"seed_count":sum(map(len,filtered.values())),"categories":filtered}
+        lines=["# Moonshiner Seed Recipe Book","",f"{data['seed_count']} matching seeds.",""]
+        for category,items in filtered.items():
+            lines += [f"## {category}",""]+[f"- **{x['id']}** — {x['summary']}" for x in items]+[""]
+        markdown="\n".join(lines)
         output = json.dumps(data, indent=2) + "\n" if args.json else markdown
         if args.output: args.output.parent.mkdir(parents=True, exist_ok=True); args.output.write_text(output)
         else: print(output, end="")

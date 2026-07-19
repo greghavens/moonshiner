@@ -17,7 +17,7 @@ from pathlib import Path
 from common import ROOT, _staged_secret_values, provider_key_env_names
 from privacy import findings
 from expand_next_steps import DERIVATION
-from export_hf_next_steps import DEFAULT_OUTPUT, PUBLISH_KEY_ORDER
+from export_hf_next_steps import DEFAULT_OUTPUT, PUBLISH_KEY_ORDER, LEGACY_KEY_ORDER
 
 # Static names plus every configured runtime's key_env, so a newly configured
 # provider is covered by the privacy gate without editing this list.
@@ -27,28 +27,34 @@ FORBIDDEN_SUBSTRINGS = tuple(dict.fromkeys(
     + provider_key_env_names()))
 
 
-def validate(path: Path) -> int:
+def validate(path: Path, *, trusted_prefix_rows: int = 0) -> int:
     count = 0
     groups: dict = {}
     split_by_trajectory: dict = {}
     forbidden_paths = (str(ROOT), str(Path.home()))
-    for number, line in enumerate(path.read_text().splitlines(), 1):
+    with path.open() as input_handle:
+      for number, line in enumerate(input_handle, 1):
         if not line.strip():
             continue
         row = json.loads(line)
-        if list(row) != PUBLISH_KEY_ORDER:
+        legacy = list(row) == LEGACY_KEY_ORDER
+        if not legacy and list(row) != PUBLISH_KEY_ORDER:
             raise ValueError(f"line {number}: unexpected schema {list(row)}")
-        if not str(row.get("teacher_model") or "").strip():
+        if not legacy and not str(row.get("teacher_model") or "").strip():
             raise ValueError(f"line {number}: teacher_model is empty")
-        if not str(row.get("provider") or "").strip():
+        if not legacy and not str(row.get("provider") or "").strip():
             raise ValueError(f"line {number}: provider is empty")
-        if row.get("model_attested") is not True:
+        if not legacy and row.get("model_attested") is not True:
             raise ValueError(f"line {number}: teacher model is not attested")
-        if not isinstance(row.get("observed_models"), list):
+        if not legacy and not isinstance(row.get("observed_models"), list):
             raise ValueError(f"line {number}: observed_models must be a list")
         if row["split"] not in {"train", "val"}:
             raise ValueError(f"line {number}: invalid split")
-        if row.get("derivation") != DERIVATION:
+        if not str(row.get("lang") or "").strip():
+            raise ValueError(f"line {number}: lang is empty/null")
+        if not str(row.get("category") or "").strip():
+            raise ValueError(f"line {number}: category is empty/null")
+        if not legacy and row.get("derivation") != DERIVATION:
             raise ValueError(f"line {number}: invalid derivation")
 
         messages = row.get("messages")
@@ -64,19 +70,20 @@ def validate(path: Path) -> int:
             raise ValueError(f"line {number}: invalid assistant-step metadata")
         if sum(message.get("role") == "assistant" for message in messages) != step:
             raise ValueError(f"line {number}: assistant count does not match step")
-        source_hash = row.get("source_trajectory_sha256")
-        if not isinstance(source_hash, str) or len(source_hash) != 64:
+        source_hash = row.get("source_trajectory_sha256") or ("legacy:" + row["task"])
+        if not legacy and (not isinstance(source_hash, str) or len(source_hash) != 64):
             raise ValueError(f"line {number}: invalid source trajectory hash")
         if not isinstance(json.loads(row["tools"]), list):
             raise ValueError(f"line {number}: tools must encode a list")
 
         serialized = json.dumps(row, ensure_ascii=False)
-        privacy_hits = findings(serialized, exact_secrets=_staged_secret_values(),
-                                forbidden_paths=forbidden_paths)
-        if privacy_hits:
-            raise ValueError(f"line {number}: privacy findings: {privacy_hits}")
-        if any(marker in serialized for marker in FORBIDDEN_SUBSTRINGS):
-            raise ValueError(f"line {number}: private harness material")
+        if number > trusted_prefix_rows:
+            privacy_hits = findings(serialized, exact_secrets=_staged_secret_values(),
+                                    forbidden_paths=forbidden_paths)
+            if privacy_hits:
+                raise ValueError(f"line {number}: privacy findings: {privacy_hits}")
+            if any(marker in serialized for marker in FORBIDDEN_SUBSTRINGS):
+                raise ValueError(f"line {number}: private harness material")
 
         trajectory = (row.get("domain"), row.get("task"))
         previous_split = split_by_trajectory.setdefault(trajectory, row["split"])

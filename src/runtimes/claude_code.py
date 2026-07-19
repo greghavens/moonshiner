@@ -79,6 +79,7 @@ class ClaudeCodeRuntime(Runtime):
                   interaction: list[str] | None = None,
                   security: bool = False,
                   tools: list[str] | None = None) -> TraceResult:
+        workspace = self.require_persistent_workspace(workspace)
         if not self.runtime_config.get("unsafe_host_access", False):
             raise RuntimeError("claude-code teacher disabled until a contained runtime is configured")
         self._require_unlock()
@@ -188,6 +189,7 @@ class ClaudeCodeRuntime(Runtime):
     def run_review(self, instruction: str, workspace: Path, *, out_dir: Path,
                    schema: dict | None = None,
                    read_only: bool = True) -> ReviewResult:
+        workspace = self.require_persistent_workspace(workspace)
         self._require_unlock()
         availability.require_available(self.name)
         cmd = self._base_cmd(disallowed=READ_ONLY_DISALLOW if read_only else None)

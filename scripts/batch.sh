@@ -35,11 +35,13 @@ echo "[batch] log:  $log"
   echo "# started: $stamp"
 } >"$log"
 
-# --scope places the job in its own cgroup under the (lingering) user manager,
-# a sibling of the session scope, so it survives this session's teardown.
-systemd-run --user --scope --unit="$unit" --working-directory="$PWD" \
-  bash -c 'exec "$@"' _ "$@" >>"$log" 2>&1 &
-disown 2>/dev/null || true
+# A service (not a client-owned transient scope) remains supervised after the
+# launching shell exits. Preserve PATH so configured harness CLIs remain usable.
+systemd-run --user --collect --unit="$unit" --working-directory="$PWD" \
+  --property=Restart=on-failure --property=RestartSec=10s \
+  --property=StandardOutput="append:$PWD/$log" \
+  --property=StandardError="append:$PWD/$log" \
+  --setenv=PATH="$PATH" --setenv=MOONSHINER_SUPERVISED=1 "$@" >/dev/null
 
 echo "[batch] detached. follow: tail -f $log"
 echo "[batch] stop:     systemctl --user stop $unit"

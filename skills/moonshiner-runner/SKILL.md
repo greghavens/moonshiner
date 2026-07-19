@@ -15,7 +15,7 @@ Operate Moonshiner through `moonshiner`; do not manually coordinate its internal
 3. For keyed providers, use `moonshiner auth set <provider>` (for example, `openrouter`). Never put a key in argv, repository files, logs, or chat.
 4. Dry-run the exact command and report its seed, attempt, and model-call ceilings.
 
-Never add `--all`, `--yes`, raise a limit, or raise an attempt ceiling unless the user explicitly authorized that scope. A bare `run` intentionally processes one seed.
+Never add `--all`, `--yes`, raise a limit, worker count, or attempt ceiling unless the user explicitly authorized that scope. Bare `moonshiner` starts the queues already enabled by the project configuration; `moonshiner run` remains a bounded diagnostic interface.
 
 ## Trace workflow
 
@@ -44,6 +44,6 @@ The candidate remains outside `tasks/seeds/` until deterministic validation and 
 
 ## Dataset workflow
 
-After trace work, run `moonshiner dataset build`. This consumes only accepted, current reviews. Do not bypass export validation or manually mark a trace accepted.
+Normal operation automatically formats, privacy-checks, appends, publishes, and remotely verifies accepted traces. `moonshiner dataset build` is an advanced rebuild/diagnostic command. Do not bypass export validation or manually mark a trace accepted.
 
 Use `moonshiner pipeline --dry-run` only for advanced access to the legacy phase runner. It is not the normal metered entry point.

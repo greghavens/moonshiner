@@ -95,13 +95,17 @@ class CodexRuntime(Runtime):
                   interaction: list[str] | None = None,
                   security: bool = False,
                   tools: list[str] | None = None) -> TraceResult:
+        workspace = self.require_persistent_workspace(workspace)
         availability.require_available(self.name)
         sandbox = self.runtime_config.get("sandbox", "workspace-write")
         if security:
             sandbox = "workspace-write"
         cmd = self._base_cmd(sandbox=sandbox)
         if self.runtime_config.get("web_search") == "live" and not security:
-            cmd[4:4] = ["-c", 'web_search="live"']
+            # Append configuration as a complete option/value pair. Inserting
+            # at index 4 splits ``--model <name>`` and makes Codex report that
+            # --model has no value.
+            cmd += ["-c", 'web_search="live"']
         cmd += ["-C", str(workspace), "-"]
 
         full_prompt = f"{system_prompt}\n\n{prompt}"
@@ -205,6 +209,7 @@ class CodexRuntime(Runtime):
     def run_review(self, instruction: str, workspace: Path, *, out_dir: Path,
                    schema: dict | None = None,
                    read_only: bool = True) -> ReviewResult:
+        workspace = self.require_persistent_workspace(workspace)
         availability.require_available(self.name)
         schema_path = None
         if schema is not None:
@@ -234,9 +239,13 @@ class CodexRuntime(Runtime):
 
         last_message = self._last_message(stdout)
         verdict = _parse_json_object(last_message)
+        thread_id, _, event_error, _ = self._scan_events(stdout)
         observed_models = _observed_models(stdout)
+        rollout = self._find_rollout(thread_id) if thread_id else None
+        if rollout:
+            observed_models += [model for model in _observed_models(
+                rollout.read_text(errors="replace")) if model not in observed_models]
         observed_model = observed_models[0] if observed_models else None
-        _, _, event_error, _ = self._scan_events(stdout)
         return ReviewResult(
             raw_text=last_message,
             verdict=verdict,

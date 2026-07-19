@@ -307,8 +307,8 @@ def deterministic_screen(seed: dict, meta: dict) -> dict:
 
 
 def _cleanup_workspace(workspace: Path) -> None:
-    import shutil
-    shutil.rmtree(workspace, ignore_errors=True)
+    # Verification workspaces are intentionally retained for audit and replay.
+    return None
 
 
 # --------------------------------------------------------------------------- #

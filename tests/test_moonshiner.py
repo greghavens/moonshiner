@@ -9,6 +9,7 @@ sys.path.insert(0, str(_ROOT / "src"))
 sys.path.insert(0, str(_ROOT))
 
 import moonshiner as m  # noqa: E402
+import configuration  # noqa: E402
 
 
 class FrontDoor(unittest.TestCase):
@@ -19,14 +20,14 @@ class FrontDoor(unittest.TestCase):
         self.assertIn("moonshiner dataset build", text)
         self.assertNotIn("sec-generate", text)
 
-    def test_no_arguments_sets_up_then_runs_one_trace(self):
-        trace = mock.Mock(return_value=0)
-        fake_module = mock.Mock(main=trace)
-        with mock.patch.object(m, "_configured", return_value=False), \
+    def test_no_arguments_sets_up_then_starts_all_enabled_queues(self):
+        start = mock.Mock(return_value=0)
+        with mock.patch.object(configuration, "confirm_project", return_value=True), \
+             mock.patch.object(m, "_configured", return_value=False), \
              mock.patch.object(m, "_setup", return_value=0), \
-             mock.patch.dict(sys.modules, {"trace_pipeline": fake_module}):
+             mock.patch.object(m, "_start_default_queues", start):
             self.assertEqual(m.main([]), 0)
-        trace.assert_called_once_with([])
+        start.assert_called_once_with()
 
     def test_provider_presets_include_endpoint_protocol_and_key(self):
         for provider in ("openrouter", "openai", "anthropic"):
@@ -34,6 +35,12 @@ class FrontDoor(unittest.TestCase):
             self.assertIn("base_url", preset)
             self.assertIn("api", preset)
             self.assertIn("key_env", preset)
+
+    def test_parallelism_and_publish_batch_bounds_fail_closed(self):
+        with self.assertRaises(SystemExit):
+            m._config(["set", "pipeline.trace.workers", "0"])
+        with self.assertRaises(SystemExit):
+            m._config(["set", "publish.batch_size", "1001"])
 
 
 class Registry(unittest.TestCase):

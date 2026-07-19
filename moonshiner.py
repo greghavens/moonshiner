@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "0.1.3"
+VERSION = "0.2.0"
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
@@ -245,7 +245,13 @@ def _config(argv: list[str]) -> int:
         if args.reasoning: update_local(prefix + ".reasoning", args.reasoning)
         print(f"configured {args.role}: {args.runtime}/{args.model} in {path}")
         return 0
-    path = update_local(args.key, parse_value(args.value))
+    value = parse_value(args.value)
+    bounded = {"pipeline.trace.workers": (1, 64), "publish.batch_size": (1, 1000)}
+    if args.key in bounded:
+        low, high = bounded[args.key]
+        if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+            parser.error(f"{args.key} must be an integer from {low} through {high}")
+    path = update_local(args.key, value)
     print(f"set {args.key} in {path}")
     return 0
 
@@ -324,8 +330,8 @@ def _setup(argv: list[str] | None = None) -> int:
         reasoning = str(current.get("reasoning") or "default")
         choices.append((key, runtime, model, reasoning))
 
-    storage_default = str((config.get("storage") or {}).get("root") or "automatic")
-    storage = _ask("Where should Moonshiner store runs and datasets", storage_default)
+    from configuration import PROJECT_STATE
+    print(f"This project's config and output stay in {PROJECT_STATE}.\n")
     for key, runtime, model, reasoning in choices:
         update_local(f"{key}.runtime", runtime)
         update_local(f"{key}.model", model)
@@ -336,10 +342,8 @@ def _setup(argv: list[str] | None = None) -> int:
         update_local(f"{target}.runtime", runtime)
         update_local(f"{target}.model", model)
         update_local(f"{target}.reasoning", reasoning)
-    if storage != "automatic":
-        target = Path(storage).expanduser().resolve(); target.mkdir(parents=True, exist_ok=True)
-        update_local("storage.root", str(target))
-        os.environ["MOONSHINER_HOME"] = str(target)
+    update_local("storage.root", str(PROJECT_STATE))
+    os.environ["MOONSHINER_HOME"] = str(PROJECT_STATE)
 
     # Ask for provider keys only when the chosen runtime actually uses one.
     config = load_config()
@@ -387,10 +391,48 @@ def _setup(argv: list[str] | None = None) -> int:
 
 
 def _configured() -> bool:
-    from configuration import load_config, user_config_path
-    if not user_config_path().exists():
+    from configuration import LOCAL_PATH, load_config
+    if not LOCAL_PATH.exists():
         return False
     return bool(load_config().get("onboarding", {}).get("complete"))
+
+
+def _start_default_queues() -> int:
+    """Start every queue enabled for this project; never duplicate a live worker."""
+    from common import CONFIG
+    queues = ((CONFIG.get("pipeline") or {}).get("queues") or {})
+    if queues.get("seed_authoring"):
+        running = subprocess.run(
+            ["pgrep", "-f", "[m]oonshiner.py behavior-seed author --all"],
+            stdout=subprocess.DEVNULL).returncode == 0
+        if not running:
+            from behavior_seed_pipeline import main as behavior_seed_main
+            result = behavior_seed_main(["--all", "--yes", "--detach"])
+            if result:
+                return result
+    if queues.get("tracing", True):
+        active = subprocess.run(
+            ["systemctl", "--user", "is-active", "--quiet",
+             "moonshiner-trace-continuous.service"]).returncode == 0
+        if not active:
+            from common import ROOT, RUNS
+            kind = str(queues.get("trace_kind") or "all")
+            log_dir = RUNS / "trace-continuous"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            command = ["systemd-run", "--user", "--collect",
+                       "--unit=moonshiner-trace-continuous",
+                       f"--property=WorkingDirectory={ROOT}",
+                       "--property=Restart=always", "--property=RestartSec=10s",
+                       f"--property=StandardOutput=append:{log_dir / 'run.log'}",
+                       f"--property=StandardError=append:{log_dir / 'run.log'}",
+                       f"--setenv=PATH={os.environ.get('PATH', '')}",
+                       "--setenv=MOONSHINER_SUPERVISED=1", sys.executable,
+                       str(ROOT / "moonshiner.py"), "run", "--kind", kind,
+                       "--all", "--yes"]
+            subprocess.run(command, check=True)
+    print("Moonshiner queues are running: author (when enabled), trace/judge/retrace, "
+          "format/privacy, append, HF upload, and remote verification.")
+    return 0
 
 
 def _storage(argv: list[str]) -> int:
@@ -399,16 +441,14 @@ def _storage(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="moonshiner storage")
     sub = parser.add_subparsers(dest="action", required=True)
     sub.add_parser("status")
-    setp = sub.add_parser("set"); setp.add_argument("path", type=Path)
+    sub.add_parser("set")
     args = parser.parse_args(argv)
     if args.action == "status":
         print(STORAGE_ROOT)
         return 0
-    target = args.path.expanduser().resolve()
-    target.mkdir(parents=True, exist_ok=True)
-    path = update_local("storage.root", str(target))
-    print(f"storage root set to {target} in {path}; effective on the next invocation")
-    return 0
+    print("Moonshiner storage is tied to the current directory. Change to the "
+          "desired project directory and run `moonshiner` there.", file=sys.stderr)
+    return 2
 
 
 def _status(argv: list[str], *, inspect: bool = False) -> int:
@@ -450,26 +490,32 @@ def _help() -> str:
     return """Moonshiner creates reviewed coding-agent traces and training datasets.
 
 START
-  moonshiner                 Ask for missing setup, then create one reviewed trace
-  moonshiner setup           Change models, authentication, or storage
+  moonshiner                 Configure once, then start all enabled project queues
+  moonshiner setup           Change models or authentication for this directory
   moonshiner doctor          Check that everything is ready
 
 CREATE TRAINING DATA
   moonshiner run --limit 20 --yes
                               Create and review traces for 20 seeds
+  moonshiner trace import --directory PATH
+                              Resume from existing traces or prepared rows
+  moonshiner trace import --hf OWNER/DATASET
+                              Resume from a Hugging Face dataset
   moonshiner status           Show current and previous runs
   moonshiner dataset build    Build a dataset from accepted traces
 
 AUTHOR SEEDS
   moonshiner seed run --id NAME --brief "WHAT TO BUILD" --yes
                               Author, test, review, and save one new seed
+  moonshiner behavior-seed author --all --yes
+                              Author only the non-code behavioral curriculum
   moonshiner seeds catalog    Browse the seed recipe book
 
 CONFIGURE
   moonshiner config show      Show the current configuration
   moonshiner auth set PROVIDER
                               Save a provider key, such as openrouter
-  moonshiner storage set PATH Choose where files are stored
+  moonshiner storage status  Show this directory's .moonshiner storage path
 
 Run `moonshiner COMMAND --help` for details. Advanced internals are under
 `moonshiner pipeline --help` and are not needed for normal use."""
@@ -479,17 +525,20 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv == ["--version"]:
         print(f"moonshiner {VERSION}"); return 0
+    if argv and argv[0] in ("-h", "--help", "help"):
+        print(_help())
+        return 0
+
+    # Every operational invocation establishes the current directory as an
+    # explicit, independent project boundary before setup or output begins.
+    from configuration import confirm_project
+    if not confirm_project():
+        return 1
     if not argv:
         if not _configured():
             result = _setup([])
             if result: return result
-            print("Starting one seed now.\n")
-        from trace_pipeline import main as trace_main
-        return trace_main([])
-    if argv[0] in ("-h", "--help", "help"):
-        print(_help())
-        return 0
-
+        return _start_default_queues()
     command, rest = argv[0], argv[1:]
     if command in {"pipeline", "legacy-run"}:
         return _run(rest)
@@ -505,6 +554,9 @@ def main(argv: list[str] | None = None) -> int:
     if command == "storage":
         return _storage(rest)
     if command in {"run", "trace", "trace-run"}:
+        if command == "trace" and rest and rest[0] == "import":
+            from import_existing import main as import_main
+            return import_main(rest[1:])
         if command == "trace" and rest and rest[0] == "run": rest = rest[1:]
         from trace_pipeline import main as trace_main
         return trace_main(rest)
@@ -528,6 +580,16 @@ def main(argv: list[str] | None = None) -> int:
         if command == "seed" and rest and rest[0] == "run": rest = rest[1:]
         from seed_pipeline import main as seed_main
         return seed_main(rest)
+    if command == "behavior-seed":
+        if rest and rest[0] == "author":
+            from behavior_seed_pipeline import main as behavior_seed_main
+            return behavior_seed_main(rest[1:])
+        if rest == ["status"]:
+            from behavior_seed_pipeline import status as behavior_seed_status
+            print(json.dumps(behavior_seed_status(), indent=2)); return 0
+        print("usage: moonshiner behavior-seed {author,status}",
+              file=sys.stderr)
+        return 2
     if command == "dataset":
         if rest and rest[0] in {"compose", "prepare"}:
             from dataset_prep import main as dataset_main

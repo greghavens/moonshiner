@@ -68,6 +68,17 @@ class Runtime(abc.ABC):
         self.role = role_config
         self.runtime_config = config.get("runtimes", {}).get(self.name, {})
 
+    @staticmethod
+    def require_persistent_workspace(workspace: Path) -> Path:
+        """Refuse to launch any model inside an ephemeral temp directory."""
+        resolved = Path(workspace).resolve()
+        for temporary_root in (Path("/tmp"), Path("/var/tmp")):
+            root = temporary_root.resolve()
+            if resolved == root or root in resolved.parents:
+                raise RuntimeError(
+                    f"model workspace must be persistent; temporary path prohibited: {resolved}")
+        return resolved
+
     # -- lifecycle ---------------------------------------------------------- #
     @abc.abstractmethod
     def preflight(self, *, require_auth: bool = False) -> None:

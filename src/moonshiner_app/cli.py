@@ -1,29 +1,49 @@
 """Installed console entry point."""
 from __future__ import annotations
-import json, os, shutil, sys, uuid
+import os, shutil, sys, uuid
 from pathlib import Path
 
 def main() -> int:
     bundle = Path(__file__).resolve().parent / "bundle"
-    config = Path(os.environ.get("XDG_CONFIG_HOME", Path.home()/".config"))/"moonshiner"/"config.json"
-    if "MOONSHINER_HOME" not in os.environ and config.exists():
-        try:
-            root=(json.loads(config.read_text()).get("storage") or {}).get("root")
-            if root: os.environ["MOONSHINER_HOME"] = str(Path(root).expanduser())
-        except (OSError, json.JSONDecodeError): pass
     os.environ.setdefault("MOONSHINER_BUNDLE_ROOT", str(bundle))
-    storage = Path(os.environ.get("MOONSHINER_HOME") or
-                   Path(os.environ.get("XDG_DATA_HOME", Path.home()/".local/share"))/"moonshiner")
+    sys.path.insert(0, str(bundle / "src")); sys.path.insert(0, str(bundle))
+    from configuration import PROJECT_STATE, confirm_project
+    read_only = bool(sys.argv[1:] and sys.argv[1] in
+                     {"-h", "--help", "help", "--version"})
+    if not read_only and not confirm_project():
+        return 1
+    storage = PROJECT_STATE
+    os.environ["MOONSHINER_HOME"] = str(storage)
+    if read_only:
+        from moonshiner import main as application_main
+        return int(application_main())
     active = storage.expanduser() / "corpora" / "active"
     if not (active / "tasks" / "seeds").is_dir():
         active.parent.mkdir(parents=True, exist_ok=True)
         staging = active.with_name(f".active-staging-{uuid.uuid4().hex}")
         (staging / "tasks").mkdir(parents=True)
         shutil.copytree(bundle / "tasks" / "seeds", staging / "tasks" / "seeds")
+        if (bundle / "tasks" / "behavior-seeds").is_dir():
+            shutil.copytree(bundle / "tasks" / "behavior-seeds",
+                            staging / "tasks" / "behavior-seeds")
+        if (bundle / "tasks" / "behavior-worlds.json").is_file():
+            shutil.copy2(bundle / "tasks" / "behavior-worlds.json",
+                         staging / "tasks" / "behavior-worlds.json")
         for name in ("corpus-version.json", "SEED_CATALOG.md", "SEED_CATALOG.json"):
             if (bundle / name).is_file(): shutil.copy2(bundle / name, staging / name)
         try: staging.replace(active)
         except FileExistsError: shutil.rmtree(staging, ignore_errors=True)
-    sys.path.insert(0, str(bundle / "src")); sys.path.insert(0, str(bundle))
+    # An application upgrade can add a new independently versioned seed kind
+    # to an already initialized storage root. Hydrate only the missing kind;
+    # never replace the user's active coding or behavioral corpus.
+    (active / "tasks").mkdir(parents=True, exist_ok=True)
+    if not (active / "tasks" / "behavior-seeds").is_dir() and \
+            (bundle / "tasks" / "behavior-seeds").is_dir():
+        shutil.copytree(bundle / "tasks" / "behavior-seeds",
+                        active / "tasks" / "behavior-seeds")
+    if not (active / "tasks" / "behavior-worlds.json").is_file() and \
+            (bundle / "tasks" / "behavior-worlds.json").is_file():
+        shutil.copy2(bundle / "tasks" / "behavior-worlds.json",
+                     active / "tasks" / "behavior-worlds.json")
     from moonshiner import main as application_main
     return int(application_main())

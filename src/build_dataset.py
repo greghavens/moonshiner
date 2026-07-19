@@ -22,7 +22,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from common import (CONFIG, DATA, SECRET_RE, SYSTEM_PROMPT, TRACES, load_seeds,
+from common import (CONFIG, DATA, SECRET_RE, SYSTEM_PROMPT, TRACES, load_seeds, load_behavior_seeds,
                     scrub_text)
 from normalize import parse_trace, tool_schemas_for
 from screen_traces import validate_reviewer_verdict
@@ -47,7 +47,22 @@ def _provider(runtime_name: str) -> str:
 
 def screening_acceptance(task_id: str, info: dict) -> tuple[bool, str | None]:
     """Require a complete, accepted review pinned to the current trace bytes."""
-    required = (CONFIG.get("quality", {}).get("require_coding_screening", False)
+    if info.get("kind") == "tool_behavior":
+        path = REVIEWS / f"{task_id}.json"
+        if not path.is_file(): return False, "behavior review is missing"
+        review=json.loads(path.read_text())
+        if review.get("accepted") is not True: return False, "behavior review rejected the trace"
+        if not (review.get("deterministic") or {}).get("accepted"):
+            return False, "behavior deterministic review failed"
+        if not (review.get("judge") or {}).get("model_attested"):
+            return False, "behavior judge model is not attested"
+        if review.get("raw_sha256") != info.get("raw_sha256"):
+            return False, "behavior review is stale: raw trace changed"
+        if review.get("seed_fingerprint") != info.get("seed_fingerprint"):
+            return False, "behavior review is stale: seed changed"
+        return True, None
+    required = ((CONFIG.get("quality", {}).get("require_coding_screening", False)
+                 and info.get("kind") != "tool_behavior")
                 or info.get("screening_required"))
     if not required:
         return True, None
@@ -125,7 +140,10 @@ def build_row(seed: dict, info: dict) -> tuple[dict | None, str | None]:
     if not any(message["role"] == "assistant" for message in turns):
         return None, "no assistant turns"
 
-    session = ([{"role": "system", "content": SYSTEM_PROMPT},
+    system_prompt = SYSTEM_PROMPT
+    if seed.get("kind") == "tool_behavior":
+        from behavior_trace import SYSTEM as system_prompt
+    session = ([{"role": "system", "content": system_prompt},
                 {"role": "user", "content":
                  info.get("prompt") or seed["prompt"]}] + turns)
     session = sanitize_object(scrub_session(session))
@@ -136,7 +154,11 @@ def build_row(seed: dict, info: dict) -> tuple[dict | None, str | None]:
     used = sorted({call["function"]["name"]
                    for message in turns if message["role"] == "assistant"
                    for call in message.get("tool_calls") or []})
-    tools = tool_schemas_for(trace_format, turns)
+    if seed.get("kind") == "tool_behavior":
+        from behavior_trace import schemas_for_seed
+        tools = schemas_for_seed(seed, set(seed["available_tools"]))
+    else:
+        tools = tool_schemas_for(trace_format, turns)
 
     teacher = info.get("teacher") or {}
     observed = teacher.get("observed_models") or (
@@ -145,7 +167,7 @@ def build_row(seed: dict, info: dict) -> tuple[dict | None, str | None]:
         "task": seed["id"],
         "lang": seed.get("lang"),
         "category": seed.get("category"),
-        "domain": "coding",
+        "domain": "tool_behavior" if seed.get("kind") == "tool_behavior" else "coding",
         "passed": info.get("passed"),
         "tools_used": used,
         "tags": training_tags(seed, turns, info),
@@ -191,7 +213,8 @@ def main() -> None:
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
 
-    seeds = {seed["id"]: seed for seed in load_seeds(include_holdout=True)}
+    seeds = {seed["id"]: seed for seed in [*load_seeds(include_holdout=True),
+                                            *load_behavior_seeds()]}
     holdouts = set(CONFIG.get("holdout_tasks", []))
     rows, dropped = [], []
     for meta_path in sorted(META.glob("*.json")):
@@ -228,6 +251,22 @@ def main() -> None:
     author_rows, author_dropped = accepted_author_rows(TRACES, quiet=args.quiet)
     rows.extend(author_rows)
     dropped.extend(author_dropped)
+
+    # Prepared rows imported from a pre-Moonshiner directory or Hugging Face
+    # dataset were already sanitized and deduplicated by import_existing.
+    imported_seen = {hashlib.sha256(json.dumps(row, sort_keys=True).encode()).hexdigest()
+                     for row in rows}
+    for imported_path in sorted((DATA / "imported").glob("*/rows.jsonl")):
+        for line in imported_path.read_text().splitlines():
+            if not line.strip():
+                continue
+            imported = sanitize_object(json.loads(line))
+            fingerprint = hashlib.sha256(
+                json.dumps(imported, sort_keys=True).encode()).hexdigest()
+            if fingerprint in imported_seen:
+                continue
+            imported_seen.add(fingerprint)
+            rows.append(imported)
 
     if args.sample and rows:
         print(json.dumps(rows[0], indent=2)[:10000])

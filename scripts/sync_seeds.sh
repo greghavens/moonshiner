@@ -22,8 +22,8 @@
 #   - sol-code is strictly read-only.
 set -euo pipefail
 
-SRC=/var/home/venom/sol-code/tasks/seeds
-REPO=/var/home/venom/moonshiner
+SRC=${MOONSHINER_SEED_SOURCE:-}
+REPO=$(cd "$(dirname "$0")/.." && pwd)
 DST=$REPO/tasks/seeds
 STATE=$REPO/.git/seed-sync-snapshots
 
@@ -31,6 +31,7 @@ exec 9>"$REPO/.git/seed-sync.lock"
 flock -n 9 || { echo "another sync holds the lock; skipping"; exit 0; }
 
 cd "$REPO"
+[ -n "$SRC" ] || { echo "MOONSHINER_SEED_SOURCE is not configured; skipping"; exit 0; }
 [ -d "$SRC" ] || { echo "source $SRC missing; skipping"; exit 0; }
 
 branch=$(git symbolic-ref --short -q HEAD || echo detached)
@@ -72,7 +73,10 @@ if [ "${#copy[@]}" -gt 0 ]; then
   new=0
   for name in "${copy[@]}"; do
     [ -d "$DST/$name" ] || new=$((new + 1))
-    rm -rf -- "${DST:?}/${name:?}"
+    if [ -e "$DST/$name" ]; then
+      echo "refusing to replace existing seed $name" >&2
+      continue
+    fi
     cp -a -- "$SRC/$name" "$DST/$name"
     echo "copied $name"
   done

@@ -11,7 +11,8 @@ complete seed is actually solvable, with no model calls, in a fresh workspace â€
   5. verify PASSES twice after the patch (the task is genuinely solvable)
   6. reversing the patch makes the baseline fail again
   7. after clearing runtime caches the workspace restores clean
-The workspace is deleted afterwards; trace generation re-materializes its own.
+The workspace is retained under the project state for audit; trace generation
+materializes its own uniquely named workspace.
 
 Seeds with a runtime-debug contract also get their non-mutating ``build_cmd``
 exercised before and after the fix. No model calls anywhere â€” free to re-run.
@@ -152,7 +153,8 @@ def validate_report(seed: dict) -> dict:
         report["passed"] = True
         return report
     finally:
-        shutil.rmtree(workspace, ignore_errors=True)
+        # Retain the uniquely materialized validation workspace for audit.
+        pass
 
 
 def validate(seed: dict) -> str | None:

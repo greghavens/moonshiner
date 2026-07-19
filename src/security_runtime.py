@@ -3,19 +3,15 @@
 
 The CLI runs inside an outer Bubblewrap filesystem namespace that hides the
 user's real home (both the repositories and the saved auth) and re-binds only a
-disposable workspace plus short-lived Codex state. Authentication is copied into
+project-local retained workspace plus isolated Codex state. Authentication is copied into
 that state before launch and unlinked as soon as ``thread.started`` is observed,
 before any model-generated command can run. Codex keeps the already-loaded
 session credential in its parent process, while the command sandbox has no
 credential file to steal.
 
-The ephemeral ``CODEX_HOME`` and the disposable teacher workspace must live
-*outside* the real home, because the outer sandbox replaces the real home with an
-empty tmpfs; anything under it would be invisible to the rebind. They therefore
-default to ``/var/tmp`` and are relocatable with ``MOONSHINER_SECURITY_RUNTIME_ROOT``
-/ ``MOONSHINER_SECURITY_WORK_ROOT``. Only these two ephemeral roots live there —
-the imported catalog and the preserved traces stay under the project's
-``security/`` tree.
+The isolated ``CODEX_HOME`` and teacher workspace live under the project's
+``.moonshiner/runs`` tree and are retained for audit. They are relocatable with
+``MOONSHINER_SECURITY_RUNTIME_ROOT`` / ``MOONSHINER_SECURITY_WORK_ROOT``.
 """
 from __future__ import annotations
 
@@ -28,6 +24,8 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+
+from common import RUNS
 
 ROOT = Path(__file__).resolve().parent.parent
 SECURITY = ROOT / "security"
@@ -146,13 +144,12 @@ def run_codex(
 
     # This must live outside the hidden real home so it can be rebound into bwrap.
     homes = Path(os.environ.get(
-        "MOONSHINER_SECURITY_RUNTIME_ROOT", "/var/tmp/moonshiner-security-runtime"
+        "MOONSHINER_SECURITY_RUNTIME_ROOT", str(RUNS / "security-runtime")
     )) / "codex-homes"
     homes.mkdir(parents=True, exist_ok=True)
     codex_home = Path(tempfile.mkdtemp(prefix="run-", dir=homes))
     auth_src = _real_codex_home() / "auth.json"
     if not auth_src.exists():
-        shutil.rmtree(codex_home, ignore_errors=True)
         raise FileNotFoundError(f"Codex auth is missing: {auth_src}")
     auth_dst = codex_home / "auth.json"
     shutil.copy2(auth_src, auth_dst)
@@ -251,7 +248,8 @@ def run_codex(
         else:
             shutil.copy2(events_path, rollout_path)
             trace_format = "codex-exec-events"
-    shutil.rmtree(codex_home, ignore_errors=True)
+    # Preserve the credential-free Codex session directory for audit. The
+    # copied auth file was unlinked before tools ran and again above.
 
     observed_models = []
     for line in events_path.read_text(errors="replace").splitlines():

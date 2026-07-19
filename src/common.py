@@ -15,6 +15,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import uuid
 from pathlib import Path
 
 ROOT = Path(os.environ.get("MOONSHINER_BUNDLE_ROOT",
@@ -22,15 +23,8 @@ ROOT = Path(os.environ.get("MOONSHINER_BUNDLE_ROOT",
 
 
 def _storage_root() -> Path:
-    explicit = os.environ.get("MOONSHINER_HOME")
-    if explicit:
-        return Path(explicit).expanduser().resolve()
-    # A source checkout remains self-contained. Installed launchers set
-    # MOONSHINER_BUNDLE_ROOT and default mutable state to XDG data storage.
-    if os.environ.get("MOONSHINER_BUNDLE_ROOT"):
-        base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
-        return (base / "moonshiner").resolve()
-    return ROOT
+    from configuration import PROJECT_STATE
+    return PROJECT_STATE
 
 
 STORAGE_ROOT = _storage_root()
@@ -45,6 +39,12 @@ def _load_config() -> dict:
 CONFIG = _load_config()
 _installed_seeds = STORAGE_ROOT / "corpora" / "active" / "tasks" / "seeds"
 SEEDS_DIR = _installed_seeds if _installed_seeds.is_dir() else ROOT / "tasks" / "seeds"
+BEHAVIOR_SEEDS_DIR = (SEEDS_DIR.parent / "behavior-seeds"
+                      if (SEEDS_DIR.parent / "behavior-seeds").is_dir()
+                      else ROOT / "tasks" / "behavior-seeds")
+BEHAVIOR_WORLDS = (SEEDS_DIR.parent / "behavior-worlds.json"
+                   if (SEEDS_DIR.parent / "behavior-worlds.json").is_file()
+                   else ROOT / "tasks" / "behavior-worlds.json")
 WORKSPACES = STORAGE_ROOT / "workspaces"
 TRACES = STORAGE_ROOT / "traces"
 DATA = STORAGE_ROOT / "data"
@@ -288,6 +288,46 @@ def load_seeds(only: set[str] | None = None, include_holdout: bool = False) -> l
     return seeds
 
 
+def load_behavior_seeds(only: set[str] | None = None,
+                        *, authored_only: bool = False) -> list[dict]:
+    """Load the non-code tool-behavior recipe set with source provenance."""
+    completed = None
+    if authored_only:
+        state_path = RUNS / "behavior-seed-authoring.json"
+        state = json.loads(state_path.read_text()) if state_path.is_file() else {}
+        completed = state.get("completed") or {}
+    seeds = []
+    for path in sorted(BEHAVIOR_SEEDS_DIR.glob("behavior-*.json")):
+        seed = json.loads(path.read_text())
+        if completed is not None:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            if completed.get(seed["id"]) != digest:
+                continue
+        if only and seed["id"] not in only:
+            continue
+        seed["_path"] = path
+        seeds.append(seed)
+    return seeds
+
+
+def select_seeds(*, kind: str = "coding", only: set[str] | None = None,
+                 categories: set[str] | None = None,
+                 tags: set[str] | None = None, name: str | None = None,
+                 require_authored: bool = False) -> list[dict]:
+    """Select catalog recipes consistently for tracing and user inspection."""
+    selected = []
+    if kind in {"coding", "all"}:
+        selected.extend(load_seeds(only=only))
+    if kind in {"behavior", "all"}:
+        selected.extend(load_behavior_seeds(only=only, authored_only=require_authored))
+    needle = (name or "").casefold()
+    return [seed for seed in selected
+            if (not categories or seed.get("category") in categories)
+            and (not tags or tags <= set(seed.get("training_tags") or seed.get("tags") or []))
+            and (not needle or needle in seed["id"].casefold()
+                 or needle in str(seed.get("prompt") or "").casefold())]
+
+
 def seed_fingerprint(seed: dict) -> str:
     """Hash the canonical task definition and every shipped workspace file.
 
@@ -319,7 +359,7 @@ def materialize(seed: dict, name: str | None = None) -> Path:
     if workspace.resolve().parent != WORKSPACES.resolve():
         raise ValueError(f"unsafe workspace id: {seed['id']!r}")
     if workspace.exists():
-        shutil.rmtree(workspace)
+        workspace = WORKSPACES / f"{workspace.name}-{uuid.uuid4().hex[:10]}"
     workspace.mkdir(parents=True)
     source = seed["_dir"] / "files"
     if source.exists():

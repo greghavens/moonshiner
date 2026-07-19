@@ -14,7 +14,8 @@ from runtimes import get_judge, get_teacher
 
 def _provider_label(value: str) -> str:
     return {"openrouter": "OpenRouter", "openai": "OpenAI",
-            "anthropic": "Anthropic", "zai": "Z.ai"}.get(
+            "anthropic": "Anthropic", "zai": "Z.ai",
+            "huggingface": "Hugging Face"}.get(
                 value.lower(), value.replace("-", " ").title())
 
 
@@ -22,6 +23,9 @@ def _credential_target(name: str) -> tuple[str, dict] | None:
     """Resolve a provider name; runtime names remain compatibility aliases."""
     runtimes = CONFIG.get("runtimes") or {}
     needle = name.lower()
+    if needle in {"huggingface", "hugging-face", "hf"}:
+        return "huggingface", {"provider": "huggingface", "key_env": "HF_TOKEN",
+                               "key_file_name": "moonshiner-huggingface-key"}
     for runtime in runtimes.values():
         provider = str(runtime.get("provider") or "").lower()
         display = str(runtime.get("display_provider") or "").lower()

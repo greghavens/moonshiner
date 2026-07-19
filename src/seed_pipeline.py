@@ -6,6 +6,7 @@ import json
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 from common import CONFIG, ROOT, SEEDS_DIR, STORAGE_ROOT, TRACES, WORKSPACES
@@ -22,8 +23,7 @@ AUTHOR_SYSTEM = """You author deterministic coding repair seeds for Moonshiner. 
 
 
 def _init_workspace(seed_id: str) -> Path:
-    workspace = WORKSPACES / f"author-{seed_id}"
-    if workspace.exists(): shutil.rmtree(workspace)
+    workspace = WORKSPACES / f"author-{seed_id}-{uuid.uuid4().hex[:10]}"
     workspace.mkdir(parents=True)
     subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
     return workspace
@@ -141,5 +141,3 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as error:
         set_run_status(db, run_id, "failed", f"{type(error).__name__}: {error}")
         raise
-    finally:
-        shutil.rmtree(workspace, ignore_errors=True)

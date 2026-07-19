@@ -12,10 +12,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
-from common import DATA
+from common import DATA, RUNS
 from expand_next_steps import DERIVATION
+from hf_sync import ensure_local_dataset
 
 DEFAULT_INPUT = DATA / "next_step"
 DEFAULT_SOURCE = DATA / "full"
@@ -30,6 +34,9 @@ PUBLISH_KEY_ORDER = [
     "trace_format", "tools_used", "derivation", "assistant_step",
     "assistant_steps", "target_message_index", "original_n_messages",
     "n_messages", "messages", "tools"]
+LEGACY_KEY_ORDER = ["task", "lang", "category", "split", "assistant_step",
+                    "assistant_steps", "target_message_index", "n_messages",
+                    "messages", "tools"]
 
 
 def sha256(path: Path) -> str:
@@ -59,8 +66,21 @@ def validate_manifest(input_dir: Path, source_dir: Path) -> None:
             raise ValueError(f"next-step output is stale for {split}")
 
 
-def build_row(record: dict, split: str) -> dict:
+def build_row(record: dict, split: str, *, legacy: bool = False) -> dict:
     meta = record["meta"]
+    if legacy:
+        return {
+            "task": meta["task"],
+            "lang": meta.get("lang") or "non-code",
+            "category": meta.get("category") or "uncategorized",
+            "split": split,
+            "assistant_step": meta["assistant_step"],
+            "assistant_steps": meta["assistant_steps"],
+            "target_message_index": meta["target_message_index"],
+            "n_messages": len(record["messages"]),
+            "messages": record["messages"],
+            "tools": json.dumps(record.get("tools") or []),
+        }
     return {
         "task": meta["task"],
         "source_trajectory_id": meta["source_trajectory_id"],
@@ -114,7 +134,8 @@ def validate_export(path: Path) -> dict:
                 raise ValueError(f"line {number}: assistant context count mismatch")
             if not isinstance(json.loads(row.get("tools", "null")), list):
                 raise ValueError(f"line {number}: tools must encode a list")
-            source_id = row.get("source_trajectory_id")
+            source_id = row.get("source_trajectory_id") or (
+                "legacy:" + row.get("task", "") if row.get("task") else None)
             if not isinstance(source_id, str) or not source_id:
                 raise ValueError(f"line {number}: source trajectory id is missing")
             prior_split = split_by_source.setdefault(source_id, row.get("split"))
@@ -142,18 +163,84 @@ def validate_export(path: Path) -> dict:
             "trajectories": len(groups)}
 
 
+def row_identity(row: dict) -> tuple[str, int]:
+    source_id, step = row.get("source_trajectory_id"), row.get("assistant_step")
+    if not source_id and isinstance(row.get("task"), str):
+        source_id = "legacy:" + row["task"]
+    if not isinstance(source_id, str) or not source_id or not isinstance(step, int):
+        raise ValueError("published row lacks source trajectory/assistant step identity")
+    return source_id, step
+
+
+def append_journal(output: Path, journal: Path) -> tuple[int, int]:
+    """Append only unseen rows; reject an identity whose content changed."""
+    existing: dict[tuple[str, int], str] = {}
+    if output.exists():
+        with output.open() as handle:
+            for number, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                key = row_identity(row)
+                digest = hashlib.sha256(
+                    json.dumps(row, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+                prior = existing.setdefault(key, digest)
+                if prior != digest:
+                    raise ValueError(f"existing local file has conflicting duplicate at line {number}")
+    appended = skipped = 0
+    output.parent.mkdir(parents=True, exist_ok=True)
+    needs_separator=False
+    if output.exists() and output.stat().st_size:
+        with output.open("rb") as existing_handle:
+            existing_handle.seek(-1,os.SEEK_END)
+            needs_separator=existing_handle.read(1) != b"\n"
+    with output.open("a") as destination, journal.open() as source:
+        for line in source:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            key = row_identity(row)
+            digest = hashlib.sha256(
+                json.dumps(row, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+            if key in existing:
+                if existing[key] != digest:
+                    raise ValueError(f"refusing to replace existing published row {key}")
+                skipped += 1
+                continue
+            if needs_separator:
+                destination.write("\n"); needs_separator=False
+            destination.write(json.dumps(row, ensure_ascii=False) + "\n")
+            existing[key] = digest
+            appended += 1
+        destination.flush()
+        os.fsync(destination.fileno())
+    return appended, skipped
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--task", action="append",
+                        help="Append only this accepted trajectory (repeatable)")
     args = parser.parse_args()
 
     validate_manifest(args.input, args.source)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = args.output.with_suffix(args.output.suffix + ".tmp")
+    ensure_local_dataset(target=args.output)
+    legacy_output = False
+    if args.output.is_file() and args.output.stat().st_size:
+        with args.output.open() as existing_handle:
+            first_existing = next((json.loads(line) for line in existing_handle
+                                   if line.strip()), None)
+        legacy_output = bool(first_existing and list(first_existing) == LEGACY_KEY_ORDER)
+    journal_dir = RUNS / "export-journals"
+    journal_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    journal = journal_dir / f"{stamp}-{uuid.uuid4().hex[:8]}.jsonl"
     counts = {}
-    with temporary.open("w") as output_handle:
+    selected_tasks: set[str] = set()
+    with journal.open("x") as output_handle:
         for split in SPLITS:
             source = args.input / f"{split}.jsonl"
             counts[split] = 0
@@ -161,13 +248,23 @@ def main() -> None:
                 for line in input_handle:
                     if not line.strip():
                         continue
+                    record = json.loads(line)
+                    if args.task and (record.get("meta") or {}).get("task") not in set(args.task):
+                        continue
+                    selected_tasks.add((record.get("meta") or {}).get("task"))
                     output_handle.write(json.dumps(
-                        build_row(json.loads(line), split),
+                        build_row(record, split, legacy=legacy_output),
                         ensure_ascii=False) + "\n")
                     counts[split] += 1
-    temporary.replace(args.output)
+    if args.task:
+        missing = set(args.task) - selected_tasks
+        if missing:
+            raise ValueError(f"accepted trajectories are not buildable: {sorted(missing)}")
+    validate_export(journal)
+    appended, skipped = append_journal(args.output, journal)
     validation = validate_export(args.output)
-    print(f"wrote {args.output}: {sum(counts.values())} rows "
+    print(f"append-only export {args.output}: appended={appended} existing={skipped}; "
+          f"candidate rows={sum(counts.values())} "
           f"({', '.join(f'{key}={value}' for key, value in counts.items())}); "
           f"validated {validation['trajectories']} cumulative trajectories")
 

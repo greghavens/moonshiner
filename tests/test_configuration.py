@@ -31,6 +31,34 @@ class Configuration(unittest.TestCase):
         self.assertEqual(configuration.parse_value("12"), 12)
         self.assertEqual(configuration.parse_value("pi"), "pi")
 
+    def test_declining_confirmation_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            state = root / ".moonshiner"
+            with mock.patch.object(configuration, "PROJECT_ROOT", root), \
+                 mock.patch.object(configuration, "PROJECT_STATE", state), \
+                 mock.patch.object(configuration, "LOCAL_PATH", state / "config.json"):
+                accepted = configuration.confirm_project(
+                    input_fn=lambda _: "n", output_fn=lambda _: None)
+            self.assertFalse(accepted)
+            self.assertFalse(state.exists())
+
+    def test_confirmation_creates_local_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            state = root / ".moonshiner"
+            local = state / "config.json"
+            with mock.patch.object(configuration, "PROJECT_ROOT", root), \
+                 mock.patch.object(configuration, "PROJECT_STATE", state), \
+                 mock.patch.object(configuration, "LOCAL_PATH", local):
+                accepted = configuration.confirm_project(
+                    input_fn=lambda _: "", output_fn=lambda _: None)
+                self.assertTrue(configuration.project_confirmed())
+            saved = json.loads(local.read_text())
+            self.assertTrue(accepted)
+            self.assertEqual(saved["workspace"]["confirmed_root"], str(root))
+            self.assertEqual(saved["storage"]["root"], str(state))
+
 
 class RunLedger(unittest.TestCase):
     def test_run_job_attempt_lifecycle(self):
@@ -54,13 +82,13 @@ class SafeSelection(unittest.TestCase):
         return type("Args", (), values)()
 
     @mock.patch.object(trace_pipeline, "quarantined_tasks", return_value=set())
-    @mock.patch.object(trace_pipeline, "load_seeds")
+    @mock.patch.object(trace_pipeline, "select_seeds")
     def test_default_selects_one(self, load, _quarantine):
         load.return_value = [{"id": "a"}, {"id": "b"}]
         self.assertEqual([s["id"] for s in trace_pipeline._selected(self._args())], ["a"])
 
     @mock.patch.object(trace_pipeline, "quarantined_tasks", return_value=set())
-    @mock.patch.object(trace_pipeline, "load_seeds")
+    @mock.patch.object(trace_pipeline, "select_seeds")
     def test_all_is_explicit(self, load, _quarantine):
         load.return_value = [{"id": "a"}, {"id": "b"}]
         self.assertEqual(len(trace_pipeline._selected(self._args(all=True))), 2)

@@ -20,12 +20,12 @@ import tempfile
 import time
 from pathlib import Path
 
-from common import ROOT, fn, schemas_for, scrub_text, stub
+from common import ROOT, RUNS, fn, schemas_for, scrub_text, stub
 from runtimes.auth import load_provider_key
 from runtimes.base import ReviewResult, Runtime, TraceResult
 from runtimes.credential_proxy import DUMMY_TOKEN, ProxySession
 
-RUNTIME_ROOT = Path("/var/tmp/moonshiner-pi-runtime")
+RUNTIME_ROOT = RUNS / "pi-runtime"
 DEFAULT_TIMEOUT_SECONDS = 300
 MAX_TIMEOUT_SECONDS = 600
 
@@ -202,6 +202,7 @@ class PiRuntime(Runtime):
                   interaction: list[str] | None = None,
                   security: bool = False,
                   tools: list[str] | None = None) -> TraceResult:
+        workspace = self.require_persistent_workspace(workspace)
         return self._run(prompt=f"{prompt}", workspace=workspace, out_dir=out_dir,
                          system_prompt=system_prompt, tools=tools,
                          schema=None, read_only=False, artifact_id=seed["id"])
@@ -251,7 +252,9 @@ class PiRuntime(Runtime):
         stderr_path.write_text(stderr)
         meta = _parse_stream_meta(stdout)
         attested = _model_attested(self.role["model"], meta, audit)
-        shutil.rmtree(runtime_dir, ignore_errors=True)
+        # Retain the project-local runtime/session directory for audit and
+        # reproducibility. It contains only the proxy dummy credential; the
+        # real provider key never enters the sandbox.
 
         return TraceResult(
             raw_path=events_path,
@@ -283,6 +286,7 @@ class PiRuntime(Runtime):
     def run_review(self, instruction: str, workspace: Path, *, out_dir: Path,
                    schema: dict | None = None,
                    read_only: bool = True) -> ReviewResult:
+        workspace = self.require_persistent_workspace(workspace)
         review_tools = ["read", "grep", "find", "ls"] if read_only else list(OFFERED_TOOLS)
         result = self._run(prompt=instruction, workspace=workspace, out_dir=out_dir,
                            system_prompt=("You are an independent read-only reviewer."

@@ -25,12 +25,11 @@ curl -fsSL "$base/SHA256SUMS" -o "$tmp/SHA256SUMS"
 (cd "$tmp" && grep "  $wheel\$" SHA256SUMS | sha256sum -c -)
 runtime="$prefix/share/moonshiner/runtime/$version"
 python3 -m venv "$runtime"
-"$runtime/bin/python" -m pip install --no-deps "$tmp/$wheel"
+"$runtime/bin/python" -m pip install "$tmp/$wheel"
 mkdir -p "$prefix/bin"
 ln -sfn "$runtime/bin/moonshiner" "$prefix/bin/moonshiner"
 if [ -n "$storage" ]; then
-  mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/moonshiner"
-  "$prefix/bin/moonshiner" config set storage.root "$storage"
+  echo "note: storage is project-local; cd '$storage' and run moonshiner there"
 fi
 echo "installed moonshiner $version -> $prefix/bin/moonshiner"
 case ":$PATH:" in *":$prefix/bin:"*) ;; *) echo "add $prefix/bin to PATH";; esac
