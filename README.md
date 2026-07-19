@@ -15,7 +15,7 @@ curl -fsSL https://raw.githubusercontent.com/greghavens/moonshiner/main/install.
 moonshiner --version
 ```
 
-PyPI publishing uses trusted publishing from the tagged release workflow. Before the first tag, the repository owner must create (or reserve through PyPI's pending-publisher flow) the `moonshiner` project and authorize this repository's `release.yml` workflow in the `pypi` environment; no API token is stored in GitHub. GitHub release wheels, source archives, checksums, and build attestations are produced from `v*` tags. The curl installer verifies the wheel against the release checksum before installation. Flatpak is not offered yet: this is a CLI that must invoke separately installed model CLIs, and Flatpak confinement would make that integration misleadingly brittle.
+PyPI publishing uses trusted publishing from the tagged release workflow. Before enabling it, the repository owner must create (or reserve through PyPI's pending-publisher flow) the `moonshiner` project, authorize this repository's `release.yml` workflow in the `pypi` environment, then set the GitHub Actions repository variable `PYPI_TRUSTED_PUBLISHING=enabled`; no API token is stored in GitHub. GitHub release wheels, source archives, checksums, and build attestations are produced from `v*` tags. The curl installer verifies the wheel against the release checksum before installation. Flatpak is not offered yet: this is a CLI that must invoke separately installed model CLIs, and Flatpak confinement would make that integration misleadingly brittle.
 
 ## Quick start
 
