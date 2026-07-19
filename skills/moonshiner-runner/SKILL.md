@@ -12,7 +12,7 @@ Operate Moonshiner through `moonshiner`; do not manually coordinate its internal
 1. Run `moonshiner doctor`.
 2. Configure roles when requested:
    `moonshiner config role <trace-author|trace-judge|seed-author|seed-judge> <runtime> <model> [reasoning]`.
-3. For keyed providers, use `moonshiner auth set <runtime>`. Never put a key in argv, repository files, logs, or chat.
+3. For keyed providers, use `moonshiner auth set <provider>` (for example, `openrouter`). Never put a key in argv, repository files, logs, or chat.
 4. Dry-run the exact command and report its seed, attempt, and model-call ceilings.
 
 Never add `--all`, `--yes`, raise a limit, or raise an attempt ceiling unless the user explicitly authorized that scope. A bare `run` intentionally processes one seed.

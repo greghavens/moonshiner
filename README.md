@@ -73,12 +73,12 @@ moonshiner storage status
 
 ## Authentication
 
-Codex and Claude Code use their CLI account authentication. OpenAI-compatible Pi providers use the runtime's configured key environment variable or Moonshiner credential file:
+Codex and Claude Code use their existing CLI account authentication. Pi is a harness, not a provider: setup asks which API provider Pi should call and configures its endpoint, protocol, model, and provider-specific credential. Provider keys can also be managed directly:
 
 ```bash
-moonshiner auth set pi
-moonshiner auth status pi
-moonshiner auth remove pi
+moonshiner auth set openrouter
+moonshiner auth status openrouter
+moonshiner auth remove openrouter
 ```
 
 The command reads keys silently and stores them mode 0600 outside the repository. Environment variables remain supported for CI. `scripts/stage_key.sh` remains as a compatibility wrapper for older automation.

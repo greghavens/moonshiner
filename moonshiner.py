@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
@@ -262,6 +262,40 @@ def _yes(prompt: str, default: bool = True) -> bool:
     return value in {"y", "yes"}
 
 
+PROVIDER_PRESETS = {
+    "openrouter": {"display_provider": "OpenRouter", "base_url": "https://openrouter.ai/api/v1",
+                   "api": "openai-completions", "thinking_format": "openrouter",
+                   "key_env": "OPENROUTER_API_KEY"},
+    "openai": {"display_provider": "OpenAI", "base_url": "https://api.openai.com/v1",
+               "api": "openai-completions", "key_env": "OPENAI_API_KEY"},
+    "anthropic": {"display_provider": "Anthropic", "base_url": "https://api.anthropic.com",
+                  "api": "anthropic-messages", "thinking_format": "anthropic",
+                  "key_env": "ANTHROPIC_API_KEY"},
+}
+
+
+def _configure_pi_provider(config: dict, current_runtime: str) -> tuple[str, dict]:
+    existing = (config.get("runtimes") or {}).get(current_runtime) or config["runtimes"]["pi"]
+    default = str(existing.get("provider") or current_runtime.removeprefix("pi-") or "openrouter")
+    provider = _ask("Pi API provider (openrouter, openai, anthropic, or custom)", default).lower()
+    preset = dict(PROVIDER_PRESETS.get(provider) or {})
+    if not preset:
+        preset = {
+            "display_provider": _ask("Provider display name", provider),
+            "base_url": _ask("Provider API base URL", str(existing.get("base_url") or "https://api.example.com/v1")),
+            "api": _ask("Pi API protocol", str(existing.get("api") or "openai-completions")),
+            "key_env": _ask("Credential environment variable", str(existing.get("key_env") or provider.upper() + "_API_KEY")),
+        }
+    profile = f"pi-{provider}"
+    runtime_config = {**config["runtimes"]["pi"], **preset, "provider": provider}
+    for key, value in runtime_config.items():
+        update_path = f"runtimes.{profile}.{key}"
+        from configuration import update_local
+        update_local(update_path, value)
+    config["runtimes"][profile] = runtime_config
+    return profile, runtime_config
+
+
 def _setup(argv: list[str] | None = None) -> int:
     """First-run wizard. Ask for configuration instead of exposing internals."""
     parser = argparse.ArgumentParser(
@@ -272,22 +306,21 @@ def _setup(argv: list[str] | None = None) -> int:
     parser.parse_args(argv or [])
     from configuration import load_config, update_local
     config = load_config()
-    runtimes = sorted((config.get("runtimes") or {}).keys())
+    harnesses = ["pi", "codex", "claude-code"]
     print("Welcome to Moonshiner. Let's set it up.\n")
-    recommended = _yes(
-        f"Use the recommended author ({config['teacher']['runtime']}/{config['teacher']['model']}) "
-        f"and judge ({config['judge']['runtime']}/{config['judge']['model']})?")
     choices = []
     for label, key in (("Trace author", "teacher"), ("Trace judge", "judge")):
         current = config[key]
-        if recommended:
-            runtime, model = current["runtime"], current["model"]
-        else:
-            print("Available runtimes: " + ", ".join(runtimes))
-            runtime = _ask(f"{label} runtime", current["runtime"])
-            if runtime not in runtimes:
-                raise SystemExit(f"Unknown runtime {runtime!r}. Choose: {', '.join(runtimes)}")
-            model = _ask(f"{label} model", current["model"])
+        current_runtime = current["runtime"]
+        default_harness = "pi" if current_runtime.startswith("pi") else current_runtime
+        print("Available harnesses: " + ", ".join(harnesses))
+        harness = _ask(f"{label} harness", default_harness)
+        if harness not in harnesses:
+            raise SystemExit(f"Unknown harness {harness!r}. Choose: {', '.join(harnesses)}")
+        runtime = harness
+        if harness == "pi":
+            runtime, _ = _configure_pi_provider(config, current_runtime)
+        model = _ask(f"{label} model", current["model"])
         reasoning = str(current.get("reasoning") or "default")
         choices.append((key, runtime, model, reasoning))
 
@@ -318,20 +351,26 @@ def _setup(argv: list[str] | None = None) -> int:
             env_name = key_env_name(runtime_config)
             path = key_persist_path(runtime_config)
         except RuntimeError:
-            print(f"{runtime}: uses its CLI login.")
+            label = "Claude Code" if runtime == "claude-code" else "Codex"
+            print(f"{label}: using its existing CLI login; no API key requested.")
             continue
-        if runtime in configured or os.environ.get(env_name) or path.exists():
+        provider = str(runtime_config.get("display_provider") or
+                       runtime_config.get("provider") or runtime)
+        if provider in configured or os.environ.get(env_name) or path.exists():
             continue
-        configured.add(runtime)
-        secret = getpass.getpass(f"{runtime} API key ({env_name}; hidden): ").strip()
+        configured.add(provider)
+        label = {"openrouter": "OpenRouter", "openai": "OpenAI",
+                 "anthropic": "Anthropic", "zai": "Z.ai"}.get(
+                     provider.lower(), provider.replace("-", " ").title())
+        secret = getpass.getpass(f"{label} API key ({env_name}; hidden): ").strip()
         if not secret:
-            raise SystemExit("No API key entered. Setup was saved; run `moonshiner auth set " + runtime + "` to finish.")
+            raise SystemExit("No API key entered. Run `moonshiner auth set " + provider + "` to finish setup.")
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         path.write_text(secret); path.chmod(0o600)
     # The Pi agent is a pinned runtime dependency. Install it on demand inside
     # Moonshiner's own bundle; users should never need to know about npm.
     selected = {runtime for _, runtime, _, _ in choices}
-    if "pi" in selected:
+    if any(runtime.startswith("pi") for runtime in selected):
         pi_cli = ROOT / config["runtimes"]["pi"].get("cli", "node_modules/.bin/pi")
         if not pi_cli.exists():
             npm = shutil.which("npm")
@@ -428,7 +467,8 @@ AUTHOR SEEDS
 
 CONFIGURE
   moonshiner config show      Show the current configuration
-  moonshiner auth set NAME    Save an API key for a provider
+  moonshiner auth set PROVIDER
+                              Save a provider key, such as openrouter
   moonshiner storage set PATH Choose where files are stored
 
 Run `moonshiner COMMAND --help` for details. Advanced internals are under

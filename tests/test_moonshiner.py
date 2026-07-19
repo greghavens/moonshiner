@@ -28,6 +28,13 @@ class FrontDoor(unittest.TestCase):
             self.assertEqual(m.main([]), 0)
         trace.assert_called_once_with([])
 
+    def test_provider_presets_include_endpoint_protocol_and_key(self):
+        for provider in ("openrouter", "openai", "anthropic"):
+            preset = m.PROVIDER_PRESETS[provider]
+            self.assertIn("base_url", preset)
+            self.assertIn("api", preset)
+            self.assertIn("key_env", preset)
+
 
 class Registry(unittest.TestCase):
     def test_keys_are_unique_and_indexed(self):

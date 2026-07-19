@@ -214,7 +214,10 @@ class PiRuntime(Runtime):
         runtime_dir = Path(tempfile.mkdtemp(prefix="run-", dir=RUNTIME_ROOT))
         events_path = out_dir / f"{artifact_id}.events.jsonl"
         stderr_path = out_dir / f"{artifact_id}.stderr"
-        proxy = ProxySession(self.runtime_config["base_url"], real_key).start()
+        auth_style = ("x-api-key" if self.runtime_config.get("api") == "anthropic-messages"
+                      else "bearer")
+        proxy = ProxySession(self.runtime_config["base_url"], real_key,
+                             auth_style=auth_style).start()
         started = time.monotonic()
         timed_out = False
         try:

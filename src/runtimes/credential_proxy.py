@@ -76,7 +76,8 @@ def _extract_model(body: bytes) -> str | None:
     return None
 
 
-def _make_handler(upstream: str, real_key: str, audit: Audit):
+def _make_handler(upstream: str, real_key: str, audit: Audit,
+                  auth_style: str = "bearer"):
     upstream_base = upstream.rstrip("/")
 
     class Handler(BaseHTTPRequestHandler):
@@ -91,8 +92,12 @@ def _make_handler(upstream: str, real_key: str, audit: Audit):
             target = upstream_base + self.path
             headers = {key: value for key, value in self.headers.items()
                        if key.lower() not in {"host", "authorization",
+                                              "x-api-key",
                                               "content-length", "connection"}}
-            headers["Authorization"] = f"Bearer {real_key}"
+            if auth_style == "x-api-key":
+                headers["x-api-key"] = real_key
+            else:
+                headers["Authorization"] = f"Bearer {real_key}"
             request = Request(target, data=body or None, headers=headers,
                               method=method)
             try:
@@ -168,10 +173,11 @@ class _QuietDisconnectServer(ThreadingHTTPServer):
 class ProxySession:
     """A running loopback proxy; ``base_url`` is what the sandbox should use."""
 
-    def __init__(self, upstream: str, real_key: str):
+    def __init__(self, upstream: str, real_key: str, auth_style: str = "bearer"):
         self.audit = Audit()
         self._server = _QuietDisconnectServer(
-            ("127.0.0.1", 0), _make_handler(upstream, real_key, self.audit))
+            ("127.0.0.1", 0), _make_handler(upstream, real_key, self.audit,
+                                             auth_style))
         self._thread = threading.Thread(target=self._server.serve_forever,
                                         daemon=True)
 

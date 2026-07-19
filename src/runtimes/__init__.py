@@ -34,11 +34,16 @@ def get_runtime(role: str, config: dict | None = None) -> Runtime:
     role_config = config[role]
     name = role_config["runtime"]
     try:
-        cls = REGISTRY[name]
+        cls = REGISTRY["pi"] if name.startswith("pi-") else REGISTRY[name]
     except KeyError:
         raise SystemExit(
             f"unknown {role} runtime {name!r}; choose from {runtime_names()}") from None
-    return cls(config, role_config)
+    runtime = cls(config, role_config)
+    # Pi provider profiles share one adapter but retain distinct configuration
+    # and provenance identities (pi-openrouter, pi-openai, pi-anthropic, ...).
+    runtime.name = name
+    runtime.runtime_config = config.get("runtimes", {}).get(name, {})
+    return runtime
 
 
 def get_teacher(config: dict | None = None) -> Runtime:

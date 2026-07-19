@@ -12,27 +12,54 @@ from common import (CONFIG, SEEDS_DIR, STORAGE_ROOT, key_env_name, key_file_path
 from runtimes import get_judge, get_teacher
 
 
+def _provider_label(value: str) -> str:
+    return {"openrouter": "OpenRouter", "openai": "OpenAI",
+            "anthropic": "Anthropic", "zai": "Z.ai"}.get(
+                value.lower(), value.replace("-", " ").title())
+
+
+def _credential_target(name: str) -> tuple[str, dict] | None:
+    """Resolve a provider name; runtime names remain compatibility aliases."""
+    runtimes = CONFIG.get("runtimes") or {}
+    needle = name.lower()
+    for runtime in runtimes.values():
+        provider = str(runtime.get("provider") or "").lower()
+        display = str(runtime.get("display_provider") or "").lower()
+        if needle in {provider, display} and provider:
+            return provider, runtime
+    runtime = runtimes.get(name)
+    if runtime is not None:
+        return str(runtime.get("provider") or name), runtime
+    return None
+
+
 def auth_main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="moonshiner auth")
     sub = parser.add_subparsers(dest="action", required=True)
     for action in ("set", "status", "remove"):
         child = sub.add_parser(action)
-        child.add_argument("runtime", help="Configured runtime name, e.g. pi")
+        child.add_argument("provider", help="Credential provider, e.g. openrouter")
     args = parser.parse_args(argv)
-    runtime = (CONFIG.get("runtimes") or {}).get(args.runtime)
-    if runtime is None:
-        print(f"unknown runtime: {args.runtime}", file=sys.stderr); return 2
+    target = _credential_target(args.provider)
+    if target is None:
+        providers = sorted({str(value.get("provider")) for value in
+                            (CONFIG.get("runtimes") or {}).values()
+                            if value.get("provider")})
+        print(f"unknown credential provider: {args.provider}; choose: "
+              f"{', '.join(providers) or 'none configured'}", file=sys.stderr); return 2
+    provider, runtime = target
+    label = _provider_label(provider)
     try:
         env_name = key_env_name(runtime)
         staged, persistent = key_file_path(runtime), key_persist_path(runtime)
     except RuntimeError as error:
-        print(f"{args.runtime} uses CLI/account authentication: {error}")
+        print(f"{label} uses CLI/account authentication: {error}")
         return 1
     if args.action == "status":
         source = (f"environment ${env_name}" if os.environ.get(env_name) else
                   str(staged) if staged.exists() else
                   str(persistent) if persistent.exists() else None)
-        print(f"{args.runtime}: {'configured via ' + source if source else 'missing'}")
+        print(f"{label}: {'configured via ' + source if source else 'missing'}")
         return 0 if source else 1
     if args.action == "remove":
         removed = []
@@ -47,7 +74,7 @@ def auth_main(argv: list[str] | None = None) -> int:
     persistent.write_text(value); persistent.chmod(0o600)
     if staged.parent.exists():
         staged.write_text(value); staged.chmod(0o600)
-    print(f"stored {args.runtime} credential in {persistent} (mode 0600)")
+    print(f"stored {label} credential in {persistent} (mode 0600)")
     return 0
 
 

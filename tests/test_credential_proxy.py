@@ -30,6 +30,7 @@ class _Upstream(BaseHTTPRequestHandler):
     """Fake provider: records auth, streams two SSE chunks with a delay."""
     protocol_version = "HTTP/1.1"
     seen_auth: list[str] = []
+    seen_x_api_key: list[str] = []
     chunk_delay_s = 0.0
 
     def log_message(self, *_args):
@@ -38,6 +39,7 @@ class _Upstream(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         self.rfile.read(int(self.headers.get("Content-Length") or 0))
         type(self).seen_auth.append(self.headers.get("Authorization", ""))
+        type(self).seen_x_api_key.append(self.headers.get("x-api-key", ""))
         if self.path == "/error":
             body = json.dumps({"error": "bad key"}).encode()
             self.send_response(401)
@@ -59,6 +61,7 @@ class _Upstream(BaseHTTPRequestHandler):
 class ProxyRelay(unittest.TestCase):
     def setUp(self):
         _Upstream.seen_auth = []
+        _Upstream.seen_x_api_key = []
         _Upstream.chunk_delay_s = 0.0
         self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Upstream)
         threading.Thread(target=self.upstream.serve_forever,
@@ -92,6 +95,19 @@ class ProxyRelay(unittest.TestCase):
         response = self._post()
         response.read()
         self.assertEqual(_Upstream.seen_auth, [f"Bearer {REAL_KEY}"])
+
+    def test_anthropic_style_uses_x_api_key(self):
+        session = ProxySession(
+            f"http://127.0.0.1:{self.upstream.server_port}", REAL_KEY,
+            auth_style="x-api-key").start()
+        self.addCleanup(session.stop)
+        conn = http.client.HTTPConnection("127.0.0.1", session.port, timeout=10)
+        self.addCleanup(conn.close)
+        conn.request("POST", "/v1/messages", body=b"{}",
+                     headers={"x-api-key": DUMMY_TOKEN})
+        conn.getresponse().read()
+        self.assertEqual(_Upstream.seen_x_api_key[-1], REAL_KEY)
+        self.assertEqual(_Upstream.seen_auth[-1], "")
 
     def test_relays_body_and_records_attestation(self):
         response = self._post()
