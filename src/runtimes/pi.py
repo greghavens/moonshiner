@@ -85,7 +85,11 @@ class PiRuntime(Runtime):
         if configured.is_absolute():
             return configured
         native = shutil.which(configured.name)
-        return Path(native) if native else configured
+        if native:
+            return Path(native)
+        # Preserve Moonshiner's existing managed-install option. Native PATH
+        # resolution always wins; this is only the explicit setup fallback.
+        return ROOT / "node_modules" / ".bin" / "pi"
 
     # -- lifecycle ---------------------------------------------------------- #
     def preflight(self, *, require_auth: bool = False) -> None:

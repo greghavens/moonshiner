@@ -382,12 +382,20 @@ def _setup(argv: list[str] | None = None) -> int:
             raise SystemExit("No API key entered. Run `moonshiner auth set " + provider + "` to finish setup.")
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         path.write_text(secret); path.chmod(0o600)
-    # Pi is a native harness, resolved from PATH like Codex and Claude Code.
+    # Pi is normally a native PATH harness. Preserve the existing managed
+    # installation only as the fallback after the user selected Pi in setup.
     selected = {runtime for _, runtime, _, _ in choices}
     if any(runtime.startswith("pi") for runtime in selected):
         pi_cli = shutil.which("pi")
         if not pi_cli:
-            raise SystemExit("The selected Pi harness is not available on PATH.")
+            npm = shutil.which("npm")
+            if not npm:
+                raise SystemExit("The selected Pi runtime needs Node.js 22 or newer. Install Node.js, then run `moonshiner` again.")
+            version = config["runtimes"]["pi"].get("runtime_version", "0.80.7")
+            print(f"Installing the Pi runtime {version}…")
+            subprocess.run([npm, "install", "--no-audit", "--no-fund", "--prefix",
+                            str(ROOT), f"@earendil-works/pi-coding-agent@{version}"],
+                           check=True)
     update_local("onboarding.complete", True)
     print("\nSetup complete.\n")
     return 0
