@@ -423,21 +423,24 @@ def _start_default_queues() -> int:
                 return result
     if queues.get("tracing", True):
         active = subprocess.run(
-            ["systemctl", "--user", "is-active", "--quiet",
-             "moonshiner-trace-continuous.service"]).returncode == 0
+            ["pgrep", "-f", "[m]oonshiner.* run --all --yes"],
+            stdout=subprocess.DEVNULL).returncode == 0
         if not active:
-            from common import ROOT, RUNS
+            from common import RUNS
+            from configuration import PROJECT_ROOT
             log_dir = RUNS / "trace-continuous"
             log_dir.mkdir(parents=True, exist_ok=True)
+            unit = "moonshiner-trace-continuous-" + time.strftime("%Y%m%d-%H%M%S")
+            executable = Path(sys.executable).parent / "moonshiner"
             command = ["systemd-run", "--user", "--collect",
-                       "--unit=moonshiner-trace-continuous",
-                       f"--property=WorkingDirectory={ROOT}",
+                       f"--unit={unit}",
+                       f"--property=WorkingDirectory={PROJECT_ROOT}",
                        "--property=Restart=always", "--property=RestartSec=10s",
                        f"--property=StandardOutput=append:{log_dir / 'run.log'}",
                        f"--property=StandardError=append:{log_dir / 'run.log'}",
                        f"--setenv=PATH={os.environ.get('PATH', '')}",
-                       "--setenv=MOONSHINER_SUPERVISED=1", sys.executable,
-                       str(ROOT / "moonshiner.py"), "run", "--all", "--yes"]
+                       "--setenv=MOONSHINER_SUPERVISED=1", str(executable),
+                       "run", "--all", "--yes"]
             subprocess.run(command, check=True)
     print("Moonshiner queues are running: author (when enabled), trace/judge/retrace, "
           "format/privacy, append, HF upload, and remote verification.")
