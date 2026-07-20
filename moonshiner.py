@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
@@ -246,7 +246,9 @@ def _config(argv: list[str]) -> int:
         print(f"configured {args.role}: {args.runtime}/{args.model} in {path}")
         return 0
     value = parse_value(args.value)
-    bounded = {"pipeline.trace.workers": (1, 64), "publish.batch_size": (1, 1000)}
+    bounded = {"pipeline.trace.workers": (1, 64),
+               "pipeline.seed.workers": (1, 64),
+               "publish.batch_size": (1, 1000)}
     if args.key in bounded:
         low, high = bounded[args.key]
         if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
@@ -456,11 +458,72 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
     parser = argparse.ArgumentParser(prog=f"moonshiner {'inspect' if inspect else 'status'}")
     parser.add_argument("run_id", nargs="?", help="Run id (latest when omitted for inspect).")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--all", action="store_true", help="Show historical runs.")
     args = parser.parse_args(argv)
     db = connect(); rows = summaries(db, args.run_id)
     if inspect and not args.run_id and rows: args.run_id = rows[0]["id"]; rows = rows[:1]
     if not rows:
         print("no matching runs"); return 1
+    if not inspect and not args.run_id and not args.all:
+        from behavior_seed_pipeline import status as behavior_status
+        from common import DATA, SEEDS_DIR
+        from configuration import load_config
+        behavior = behavior_status()
+        coding = len(list(SEEDS_DIR.glob("*/task.json")))
+        wave_counts = {}
+        for path in SEEDS_DIR.glob("*/task.json"):
+            try:
+                wave = (json.loads(path.read_text()).get("catalog") or {}).get("wave")
+                if wave is not None:
+                    wave_counts[int(wave)] = wave_counts.get(int(wave), 0) + 1
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+        active = [row for row in rows if row["status"] == "running" and row["kind"] == "trace"]
+        author_runs = [row for row in rows if row["status"] == "running" and row["kind"] == "seed"]
+        ack = DATA / "hf-sync" / "published-trajectories.json"
+        published = 0
+        if ack.is_file():
+            try: published = len(json.loads(ack.read_text()).get("published_tasks") or [])
+            except (OSError, json.JSONDecodeError): pass
+        config = load_config()
+        workers = int(((config.get("pipeline") or {}).get("trace") or {}).get("workers", 1))
+        units = []
+        service_result = subprocess.run(
+            ["systemctl", "--user", "list-units", "--type=service", "--state=running",
+             "--no-legend", "--plain"], text=True, capture_output=True)
+        for line in service_result.stdout.splitlines():
+            name = line.split(None, 1)[0] if line.split() else ""
+            if name.startswith("moonshiner-"):
+                units.append(name.removesuffix(".service"))
+        payload = {
+            "seeds": {"coding": coding, "behavioral": behavior["total"],
+                      "behavioral_authored": behavior["sol_authored"],
+                      "behavioral_remaining": behavior["remaining"],
+                      "waves": dict(sorted(wave_counts.items()))},
+            "authoring": {"active_runs": author_runs},
+            "tracing": {"workers": workers, "active_runs": active},
+            "publishing": {"dataset": (config.get("publish") or {}).get("hf_dataset"),
+                           "batch_size": int((config.get("publish") or {}).get("batch_size", 1)),
+                           "published_trajectories": published},
+            "services": sorted(units),
+        }
+        if args.json:
+            print(json.dumps(payload, indent=2)); return 0
+        print("Moonshiner status")
+        print(f"Seeds: {coding} coding; {behavior['sol_authored']}/{behavior['total']} "
+              f"behavioral authored ({behavior['remaining']} remaining)")
+        if wave_counts:
+            print("Waves: " + ", ".join(f"{wave}={count}" for wave, count in sorted(wave_counts.items())))
+        print(f"Authoring: {len(author_runs)} coding seed(s) in progress; behavioral authoring "
+              f"{'complete' if behavior['remaining'] == 0 else 'active'}")
+        print(f"Tracing: {workers} workers configured; {len(active)} active run(s)")
+        for row in active:
+            print(f"  {row['id']}: accepted={row.get('accepted') or 0}, "
+                  f"failed={row.get('failed') or 0}, pending={row.get('pending') or 0}")
+        print(f"Publishing: {published} trajectories acknowledged; batch size "
+              f"{payload['publishing']['batch_size']}; {payload['publishing']['dataset'] or 'disabled'}")
+        print("Services: " + (", ".join(sorted(units)) if units else "none"))
+        return 0
     payload = rows
     if inspect:
         payload = [{**rows[0], "jobs_detail": job_rows(db, args.run_id)}]

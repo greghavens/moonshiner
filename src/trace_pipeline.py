@@ -62,6 +62,19 @@ def _selected(args) -> list[dict]:
                                      require_authored=True)
              if s["id"] not in quarantined_tasks() and s["id"] not in imported
              and s["id"] not in accepted]
+    intake_only = bool((CONFIG.get("pipeline", {}).get("trace", {})
+                        .get("accepted_seed_intake_only")))
+    if intake_only and args.all and not only and selected_kind in {"coding", "all"}:
+        marker_value = (CONFIG.get("source") or {}).get("accepted_seed_markers")
+        if not marker_value:
+            raise ValueError("accepted-only tracing requires source.accepted_seed_markers")
+        from pathlib import Path
+        from seed_intake import accepted_seed_ids
+        marker_dir = Path(marker_value).expanduser()
+        if not marker_dir.is_absolute():
+            marker_dir = (__import__('common').ROOT / marker_dir).resolve()
+        allowed = accepted_seed_ids(marker_dir)
+        seeds = [seed for seed in seeds if seed["id"] in allowed]
     if args.limit:
         seeds = seeds[:args.limit]
     elif not args.all and not only:

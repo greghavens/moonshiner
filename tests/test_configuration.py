@@ -83,15 +83,18 @@ class SafeSelection(unittest.TestCase):
 
     @mock.patch.object(trace_pipeline, "quarantined_tasks", return_value=set())
     @mock.patch.object(trace_pipeline, "select_seeds")
-    def test_default_selects_one(self, load, _quarantine):
+    @mock.patch("import_existing.imported_task_ids", return_value=set())
+    def test_default_selects_one(self, _imported, load, _quarantine):
         load.return_value = [{"id": "a"}, {"id": "b"}]
         self.assertEqual([s["id"] for s in trace_pipeline._selected(self._args())], ["a"])
 
     @mock.patch.object(trace_pipeline, "quarantined_tasks", return_value=set())
     @mock.patch.object(trace_pipeline, "select_seeds")
-    def test_all_is_explicit(self, load, _quarantine):
+    @mock.patch("import_existing.imported_task_ids", return_value=set())
+    def test_all_is_explicit(self, _imported, load, _quarantine):
         load.return_value = [{"id": "a"}, {"id": "b"}]
-        self.assertEqual(len(trace_pipeline._selected(self._args(all=True))), 2)
+        self.assertEqual(
+            len(trace_pipeline._selected(self._args(all=True, kind="behavior"))), 2)
 
 
 if __name__ == "__main__":

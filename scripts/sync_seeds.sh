@@ -23,6 +23,7 @@
 set -euo pipefail
 
 SRC=${MOONSHINER_SEED_SOURCE:-}
+ACCEPTED=${MOONSHINER_SEED_ACCEPTED_DIR:-}
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 DST=$REPO/tasks/seeds
 STATE=$REPO/.git/seed-sync-snapshots
@@ -33,6 +34,8 @@ flock -n 9 || { echo "another sync holds the lock; skipping"; exit 0; }
 cd "$REPO"
 [ -n "$SRC" ] || { echo "MOONSHINER_SEED_SOURCE is not configured; skipping"; exit 0; }
 [ -d "$SRC" ] || { echo "source $SRC missing; skipping"; exit 0; }
+[ -n "$ACCEPTED" ] || { echo "MOONSHINER_SEED_ACCEPTED_DIR is not configured; refusing unreviewed sync" >&2; exit 1; }
+[ -d "$ACCEPTED" ] || { echo "accepted-marker directory $ACCEPTED missing; refusing unreviewed sync" >&2; exit 1; }
 
 branch=$(git symbolic-ref --short -q HEAD || echo detached)
 if [ "$branch" != main ]; then
@@ -42,7 +45,19 @@ fi
 
 snapshot() { find "$SRC/$1" -type f -printf '%P %s\n' 2>/dev/null | sort | sha256sum | cut -d' ' -f1; }
 
-mapfile -t absent < <(comm -13 <(ls "$DST" | sort) <(ls "$SRC" | sort))
+# The upstream author writes one immutable chunk marker only after deterministic
+# validation and independent semantic acceptance.  Directory stability alone
+# is not approval: incomplete and rejected seeds remain visible upstream.
+mapfile -t accepted_ids < <(
+  for marker in "$ACCEPTED"/*.json; do
+    [ -f "$marker" ] || continue
+    jq -er '.seed_ids[] | strings' "$marker"
+  done | LC_ALL=C sort -u
+)
+declare -A accepted=()
+for name in "${accepted_ids[@]}"; do accepted[$name]=1; done
+mapfile -t absent < <(comm -13 <(ls "$DST" | sort) \
+  <(comm -12 <(printf '%s\n' "${accepted_ids[@]}") <(ls "$SRC" | sort)))
 # Copied by an earlier run whose check.sh failed: still untracked, so refresh
 # from source and try again rather than leaving a stale half-import behind.
 mapfile -t uncommitted < <(git ls-files --others --exclude-standard --directory tasks/seeds/ | cut -d/ -f2 | sort -u)
@@ -65,7 +80,8 @@ done
 mv "$STATE.next" "$STATE"
 
 for name in "${uncommitted[@]}"; do
-  [ -n "$name" ] && [ -d "$SRC/$name" ] && copy+=("$name")
+  [ -n "$name" ] && [ -n "${accepted[$name]:-}" ] && \
+    [ -d "$SRC/$name" ] && copy+=("$name")
 done
 
 if [ "${#copy[@]}" -gt 0 ]; then

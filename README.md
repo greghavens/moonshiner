@@ -43,8 +43,8 @@ repeated when every listed behavior must be present:
 
 ```bash
 moonshiner seeds catalog --kind behavior --category parallel-same
-moonshiner run --kind behavior --category parallel-same --tag bfcl:parallel --limit 20 --dry-run
-moonshiner run --kind behavior --tag bfcl:parallel --tag tool:argument-grounding --limit 20 --yes
+moonshiner run --kind behavior --category parallel-same --tag execution:parallel --limit 20 --dry-run
+moonshiner run --kind behavior --tag execution:parallel --tag tool:argument-grounding --limit 20 --yes
 moonshiner run --kind behavior --name "calendar" --limit 20 --yes
 moonshiner run --only behavior-parallel-same-0001 --yes
 ```

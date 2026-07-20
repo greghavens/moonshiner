@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Author the checked-in 1,000-seed non-code BFCL v3/v4 curriculum.
+"""Author the checked-in 1,000-seed non-code external function-calling evaluations curriculum.
 
 The output is deterministic. Existing identifiers are immutable: generation
 accepts an identical file and refuses to overwrite a differing one.
@@ -184,13 +184,13 @@ def make_seed(category: str, number: int) -> dict:
             stages = [{"parallel": False, "calls": calls((avail, {"name": name, "date": date, "location": location})), "purpose": "Check availability without creating anything."}]
         seed.update(prompt=prompt, available_tools=all_tools,
                     expected=expected(stages=stages, forbidden=[create, update, cancel, notify]),
-                    training_tags=["bfcl:simple", "tool:argument-grounding", "tool:distractor-selection"])
+                    training_tags=["tool:single-call", "tool:argument-grounding", "tool:distractor-selection"])
 
     elif category == "multiple-functions":
         prompt = f"I need the current details for {name} in {location}. Find the matching {resource}; do not list every record, check future availability, or change it."
         seed.update(prompt=prompt, available_tools=all_tools,
                     expected=expected(stages=[{"parallel": False, "calls": calls((search, {"query": name, "location": location})), "purpose": "Choose search among several semantically adjacent functions."}], forbidden=[listing, avail, create, update, cancel, notify]),
-                    training_tags=["bfcl:multiple", "tool:distractor-selection", "if:scope-boundary"])
+                    training_tags=["tool:function-selection", "tool:distractor-selection", "if:scope-boundary"])
 
     elif category == "parallel-same":
         chosen = [names[(n + j) % 4] for j in range(4)]
@@ -198,14 +198,14 @@ def make_seed(category: str, number: int) -> dict:
         stage_calls = calls(*[(avail, {"name": x, "date": date, "location": locations[(n+j)%4]}) for j, x in enumerate(chosen)])
         seed.update(prompt=prompt, available_tools=[avail, create, search],
                     expected=expected(stages=[{"parallel": True, "calls": stage_calls, "purpose": "Issue all independent availability checks in one assistant action."}], forbidden=[create]),
-                    training_tags=["bfcl:parallel", "planning:independent-fanout", "if:negative-constraint"])
+                    training_tags=["execution:parallel", "planning:independent-fanout", "if:negative-constraint"])
 
     elif category == "parallel-mixed":
         prompt = f"In one pass, retrieve {record_id}, check {name}'s availability for {date}, and list active {resource} records in {location}. Do not change or notify anything."
         stage_calls = calls((get, {"id": record_id}), (avail, {"name": name, "date": date, "location": location}), (listing, {"location": location, "status": "active"}))
         seed.update(prompt=prompt, available_tools=all_tools,
                     expected=expected(stages=[{"parallel": True, "calls": stage_calls, "purpose": "Issue heterogeneous independent reads in one assistant action."}], forbidden=[create, update, cancel, notify]),
-                    training_tags=["bfcl:parallel-multiple", "planning:independent-fanout", "if:negative-constraint"])
+                    training_tags=["execution:parallel-mixed", "planning:independent-fanout", "if:negative-constraint"])
 
     elif category == "dependency-planning":
         other = names[(n + 1) % 4]
@@ -215,7 +215,7 @@ def make_seed(category: str, number: int) -> dict:
                     expected=expected(stages=[
                         {"parallel": True, "calls": calls((search, {"query": name, "location": location}), (search, {"query": other, "location": locations[(n+1)%4]})), "purpose": "Resolve independent names concurrently."},
                         {"parallel": True, "calls": calls((get, {"id": record_id}), (get, {"id": f"{domain[:3]}-{number + 501}"})), "purpose": "Use returned IDs only after resolution, then retrieve independently."}], forbidden=[update, cancel]),
-                    training_tags=["planning:dependency-dag", "bfcl:parallel", "bfcl:multi-step", "if:negative-constraint"])
+                    training_tags=["planning:dependency-dag", "execution:parallel", "planning:multi-step", "if:negative-constraint"])
 
     elif category == "multi-turn-state":
         prompt = f"Find {name} in {location} and show me its current date. Do not change it yet."
@@ -228,7 +228,7 @@ def make_seed(category: str, number: int) -> dict:
                         {"parallel": False, "calls": calls((search, {"query": name, "location": location})), "purpose": "Resolve the referenced record."},
                         {"parallel": False, "calls": calls((update, {"id": record_id, "date": date})), "purpose": "Apply the first explicit update."},
                         {"parallel": False, "calls": calls((update, {"id": record_id, "date": f"2026-12-{10 + number % 18:02d}"})), "purpose": "Apply the user's correction to the same entity."}], forbidden=[notify], assertions=[f"{record_id}.date == 2026-12-{10 + number % 18:02d}"]),
-                    training_tags=["bfcl:multi-turn", "state:entity-continuity", "if:correction", "if:negative-constraint"])
+                    training_tags=["conversation:multi-turn", "state:entity-continuity", "if:correction", "if:negative-constraint"])
 
     elif category == "missing-parameter":
         inferable = number % 2 == 1
@@ -241,11 +241,11 @@ def make_seed(category: str, number: int) -> dict:
                 {"parallel": False, "calls": calls((listing, {"location": location, "status": "active"})), "purpose": "Use the retrieved profile fact."},
             ]
             exp = expected(stages=stages, forbidden=[create, update, cancel])
-            tags = ["bfcl:missing-param", "clarification:inferable", "state:profile-grounding"]
+            tags = ["clarification:missing-parameter", "clarification:inferable", "state:profile-grounding"]
         else:
             prompt = f"Create a new {resource} named {name} on {date}."
             exp = expected(decision="clarify", clarification=f"Ask which location to use for the new {resource}.", forbidden=[create], constraints=["Ask one concise question for the missing required location."])
-            tags = ["bfcl:missing-param", "clarification:required", "tool:no-invented-arguments"]
+            tags = ["clarification:missing-parameter", "clarification:required", "tool:no-invented-arguments"]
         seed.update(prompt=prompt, available_tools=[listing, create, search, tool(domain, "profile")], expected=exp, training_tags=tags)
 
     elif category == "missing-function":
@@ -253,7 +253,7 @@ def make_seed(category: str, number: int) -> dict:
         seed["follow_up_turns"] = [{"after_stage": 0, "content": "You now have a cancellation function. Please continue without repeating completed work.", "add_tools": [cancel]}]
         seed.update(prompt=prompt, available_tools=[get, search],
                     expected=expected(decision="missing_function", stages=[{"parallel": False, "calls": calls((cancel, {"id": record_id, "reason": "event is no longer needed"})), "purpose": "Call the newly introduced function only after it becomes available."}], forbidden=[], constraints=["First state that no available function can cancel the record.", "Resume when the cancellation tool is introduced."]),
-                    training_tags=["bfcl:missing-function", "bfcl:multi-turn", "tool:no-hallucinated-function"])
+                    training_tags=["tool:missing-function", "conversation:multi-turn", "tool:no-hallucinated-function"])
 
     elif category == "long-context-composite":
         distractors = [{"id": f"{domain[:3]}-{number + 700 + j}", "name": name if j % 7 == 0 else names[j % 4], "location": locations[j % 4], "status": "closed" if j % 3 else "pending"} for j in range(60)]
@@ -262,19 +262,19 @@ def make_seed(category: str, number: int) -> dict:
         seed["tool_results"] = {"search_match": {"id": record_id}}
         seed.update(prompt=prompt, available_tools=all_tools,
                     expected=expected(stages=[{"parallel": False, "calls": calls((search, {"query": name, "location": location})), "purpose": "Disambiguate using all supplied constraints."}, {"parallel": False, "calls": calls((get, {"id": record_id})), "purpose": "Retrieve the resolved record rather than guessing."}], forbidden=[create, update, cancel, notify]),
-                    training_tags=["bfcl:long-context", "bfcl:composite", "state:distractor-resistance", "if:negative-constraint"])
+                    training_tags=["context:long", "planning:composite", "state:distractor-resistance", "if:negative-constraint"])
 
     elif category == "relevance-abstention":
         relevant = number % 3 == 0
         if relevant:
             prompt = f"What is the current status of {name}, record ID {record_id}? Use the record system rather than relying on memory."
             exp = expected(stages=[{"parallel": False, "calls": calls((get, {"id": record_id})), "purpose": "Use the relevant retrieval tool."}], forbidden=[create, update, cancel])
-            tags = ["bfcl:relevance", "tool:required-use"]
+            tags = ["tool:relevance", "tool:required-use"]
         else:
             questions = ["Explain the difference between a fact and an opinion.", "Rewrite this sentence more politely: Send it today.", "What are three ways to take clearer meeting notes?"]
             prompt = questions[number % len(questions)]
             exp = expected(decision="respond_without_tools", forbidden=all_tools, constraints=["Answer directly without invoking any supplied tool."])
-            tags = ["bfcl:irrelevance", "tool:abstention"]
+            tags = ["tool:irrelevance", "tool:abstention"]
         seed.update(prompt=prompt, available_tools=all_tools, expected=exp, training_tags=tags)
 
     elif category == "error-recovery":
@@ -292,7 +292,7 @@ def make_seed(category: str, number: int) -> dict:
             seed["failure_injections"] = [{"tool": avail, "occurrence": 2, "error": "temporary_unavailable", "may_have_committed": False}]
             stages = [{"parallel": True, "calls": calls((avail, {"name": name, "date": date, "location": location}), (avail, {"name": other, "date": date, "location": locations[(n+1)%4]})), "purpose": "Run independent checks together."}, {"parallel": False, "calls": calls((avail, {"name": other, "date": date, "location": locations[(n+1)%4]})), "purpose": "Retry only the failed branch."}]
             forbidden = [create]
-            tags = ["tool:error-recovery", "tool:partial-failure", "bfcl:parallel"]
+            tags = ["tool:error-recovery", "tool:partial-failure", "execution:parallel"]
         seed.update(prompt=prompt, available_tools=[avail, get, cancel, create], expected=expected(stages=stages, forbidden=forbidden), training_tags=tags)
 
     elif category == "web-research":
@@ -300,7 +300,10 @@ def make_seed(category: str, number: int) -> dict:
                           "Ashbourne", "Redwick", "Stonehaven", "Fairmont", "Glenhaven",
                           "Brookfield", "Eastmere", "Highland", "Riverton", "Oakridge",
                           "Crestview", "Mapleford", "Silverton", "Meadowbrook", "Cedarvale",
-                          "Foxhaven", "Willowdale", "Brighton", "Rosemont", "Elmstead"]
+                          "Foxhaven", "Willowdale", "Brighton", "Rosemont", "Elmstead",
+                          "Amberley", "Briarford", "Coralwick", "Dunmere", "Everbrook",
+                          "Fernridge", "Goldhaven", "Heatherby", "Ironwood", "Juniper Bay",
+                          "Kingsmere", "Larkspur", "Mossford"]
         institution = ["Aurora civic pavilion", "Birch maritime museum",
                        "Copper trail foundation", "Drift public archive"][n]
         entity = f"the {institution} in {municipalities[number // 4]}"
@@ -313,7 +316,7 @@ def make_seed(category: str, number: int) -> dict:
                     available_tools=["web_search", "fetch_url"], initial_state={"web_index_version": f"fixture-{number+1:04d}"},
                     tool_results={"search_1": {"organization": organization, "urls": [f"https://fixtures.example/org/{number}"]}, "search_2": {"urls": [f"https://fixtures.example/source/{number}"]}},
                     expected=expected(stages=[{"parallel": False, "calls": calls(("web_search", {"query": q1})), "purpose": "Resolve the authoritative organization."}, {"parallel": False, "calls": calls(("web_search", {"query": q2})), "purpose": "Find a primary source for the requested attribute."}, {"parallel": False, "calls": calls(("fetch_url", {"url": f"https://fixtures.example/source/{number}"})), "purpose": "Read the source rather than trusting a snippet."}], forbidden=[], constraints=["Cite the retrieved primary source.", "Separate retrieved facts from inference.", "Do not use unsupported parametric knowledge."]),
-                    training_tags=["bfcl:web-multihop", "web:primary-source", "if:grounded-response"])
+                    training_tags=["web:multihop", "web:primary-source", "if:grounded-response"])
         if number % 5 == 0:
             seed["failure_injections"] = [{"tool": "fetch_url", "occurrence": 1, "error": ["http_403", "http_429", "http_503", "timeout"][n], "may_have_committed": False}]
             seed["tool_results"]["alternate_search"] = {"urls": [f"https://fixtures.example/alternate/{number}"]}
@@ -331,24 +334,24 @@ def make_seed(category: str, number: int) -> dict:
         if mode == 0:
             seed["prompt"] = f"Please remember that my {key.replace('.', ' ')} is {value}; this is a lasting preference."
             seed["expected"] = expected(stages=[{"parallel": False, "calls": calls(("memory_add", {"key": key, "value": value})), "purpose": "Store a durable user preference."}], forbidden=["memory_remove"])
-            tags = ["bfcl:memory-kv", "memory:durable-fact"]
+            tags = ["memory:key-value", "memory:durable-fact"]
         elif mode == 1:
             seed["prompt"] = f"What is my {key.replace('.', ' ')}? It is not present in this conversation, so retrieve it."
             seed["expected"] = expected(stages=[{"parallel": False, "calls": calls(("memory_search", {"query": key.replace('.', ' ')})), "purpose": "Explicitly retrieve absent conversation context."}], forbidden=["memory_add", "memory_update", "memory_remove"])
-            tags = ["bfcl:memory-vector", "memory:explicit-retrieval"]
+            tags = ["memory:semantic-search", "memory:explicit-retrieval"]
         elif mode == 2:
             seed["prompt"] = f"Update my {key.replace('.', ' ')} from window seat to aisle seat. Preserve unrelated memories."
             seed["expected"] = expected(stages=[{"parallel": False, "calls": calls(("memory_update", {"key": key, "value": "aisle seat"})), "purpose": "Replace only the superseded fact."}], forbidden=["memory_remove"], assertions=[f"memory[{key}] == aisle seat", "unrelated memories remain unchanged"])
-            tags = ["bfcl:memory-kv", "memory:consolidation", "if:scope-boundary"]
+            tags = ["memory:key-value", "memory:consolidation", "if:scope-boundary"]
         elif mode == 3:
             seed["prompt"] = "Retrieve my ongoing planning summary, add that the venue decision is postponed until September, and retain every unrelated decision."
             seed["tool_results"] = {"summary": "Budget approved. Catering undecided. Venue review scheduled for July."}
             seed["expected"] = expected(stages=[{"parallel": False, "calls": calls(("memory_retrieve_summary", {})), "purpose": "Read the existing summary before modifying it."}, {"parallel": False, "calls": calls(("memory_update_summary", {"summary": "Budget approved. Catering undecided. Venue decision postponed until September."})), "purpose": "Consolidate the changed fact while preserving unrelated decisions."}], forbidden=["memory_remove"])
-            tags = ["bfcl:memory-summary", "memory:consolidation"]
+            tags = ["memory:summary", "memory:consolidation"]
         else:
             seed["prompt"] = f"For this one request, use {value}. Do not save it as a lasting preference."
             seed["expected"] = expected(decision="respond_without_tools", forbidden=["memory_add", "memory_update", "memory_remove", "memory_update_summary"], constraints=["Acknowledge the one-time instruction without writing memory."])
-            tags = ["bfcl:memory-kv", "memory:incidental-detail", "tool:abstention"]
+            tags = ["memory:key-value", "memory:incidental-detail", "tool:abstention"]
         seed["training_tags"] = tags
 
     elif category == "format-sensitivity":
@@ -362,7 +365,7 @@ def make_seed(category: str, number: int) -> dict:
         prompt = f"{formats[number % len(formats)]} Retrieve record {record_id}."
         seed.update(prompt=prompt, available_tools=[get, search, update],
                     expected=expected(stages=[{"parallel": False, "calls": calls((get, {"id": record_id})), "purpose": "Select and format the exact retrieval call."}], forbidden=[update], constraints=[formats[number % len(formats)]]),
-                    training_tags=["bfcl:format-sensitivity", "tool:argument-grounding", "if:exact-format"])
+                    training_tags=["format:strict", "tool:argument-grounding", "if:exact-format"])
     else:
         raise AssertionError(category)
 

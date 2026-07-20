@@ -55,7 +55,7 @@ class LoadSeeds(unittest.TestCase):
 
     def test_behavior_selection_by_category_and_tags(self):
         selected = common.select_seeds(kind="behavior",
-            categories={"parallel-same"}, tags={"bfcl:parallel"})
+            categories={"parallel-same"}, tags={"execution:parallel"})
         self.assertTrue(selected)
         self.assertTrue(all(seed["kind"] == "tool_behavior" for seed in selected))
         self.assertTrue(all(seed["category"] == "parallel-same" for seed in selected))

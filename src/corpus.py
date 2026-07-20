@@ -16,6 +16,42 @@ from common import ROOT, SEEDS_DIR, STORAGE_ROOT
 CORPORA = STORAGE_ROOT / "corpora"
 RELEASES_API = "https://api.github.com/repos/greghavens/moonshiner/releases"
 
+PROGRAM_DESCRIPTIONS = {
+    "Building": "Implement complete libraries, services, CLIs, workflows, and systems from specifications.",
+    "Debugging": "Diagnose failures, repair defects, resolve compiler/runtime issues, and preserve regressions.",
+    "Tool calling": "Select tools, construct grounded arguments, run independent calls together, and stage dependent calls.",
+    "Instruction following": "Honor constraints, formats, corrections, state, context, memory, relevance, and abstention.",
+    "Project & integration": "Coordinate multi-file, repository-scale, migration, and integration work.",
+    "Feature development": "Extend working systems while preserving existing behavior.",
+    "Clarification": "Recognize missing information, ask only when required, and never invent parameters.",
+    "Error recovery": "Recover from tool failures, partial results, retries, and idempotency hazards.",
+    "Refactoring & performance": "Restructure safely and improve measured performance without behavior drift.",
+    "Seed authoring": "Create and independently validate deterministic training tasks.",
+    "Other verified work": "Verified work not yet assigned to one of the primary programs.",
+}
+
+
+def program_for_category(category: str, *, tool_use: bool = False) -> str:
+    """Map precise recipe taxonomy to one stable, human-facing program."""
+    category = str(category or "uncategorized")
+    if tool_use:
+        if category in {"dependency-planning", "parallel-same", "parallel-mixed",
+                        "tool-selection", "missing-function"}:
+            return "Tool calling"
+        if category == "missing-parameter":
+            return "Clarification"
+        if category == "error-recovery":
+            return "Error recovery"
+        return "Instruction following"
+    prefix = category.replace("/", "-").split("-", 1)[0]
+    if prefix == "build": return "Building"
+    if prefix in {"debug", "warnfix", "compilefix", "syntax", "escape"}: return "Debugging"
+    if prefix in {"project", "full"}: return "Project & integration"
+    if prefix == "feature": return "Feature development"
+    if prefix in {"refactor", "perf"}: return "Refactoring & performance"
+    if prefix == "seed": return "Seed authoring"
+    return "Other verified work"
+
 
 def catalog(seed_dir: Path = SEEDS_DIR) -> tuple[str, dict]:
     """Build the human recipe book and its machine-readable twin."""
@@ -29,6 +65,7 @@ def catalog(seed_dir: Path = SEEDS_DIR) -> tuple[str, dict]:
                 "category": task.get("category") or "uncategorized",
                 "training_tags": task.get("training_tags") or task.get("tags") or [],
                 "summary": summary, "verify_command": task.get("verify_cmd")}
+        item["program"] = program_for_category(item["category"])
         groups[item["category"]].append(item)
     behavior_dir = seed_dir.parent / "behavior-seeds"
     for task_path in sorted(behavior_dir.glob("behavior-*.json")):
@@ -36,17 +73,35 @@ def catalog(seed_dir: Path = SEEDS_DIR) -> tuple[str, dict]:
         prompt = " ".join(str(task.get("prompt") or "").split())
         summary = prompt[:197].rstrip() + ("…" if len(prompt) > 197 else "")
         item = {"id": task["id"], "kind": "tool_behavior",
-                "language": "non-code", "world": task.get("world"),
+                "language": "English", "world": task.get("world"),
                 "category": task.get("category") or "uncategorized",
                 "training_tags": task.get("training_tags") or [],
                 "summary": summary, "verify_command": None}
+        item["program"] = program_for_category(item["category"], tool_use=True)
         groups[item["category"]].append(item)
+    programs: dict[str, dict] = {}
+    for items in groups.values():
+        for item in items:
+            entry = programs.setdefault(item["program"], {
+                "description": PROGRAM_DESCRIPTIONS[item["program"]],
+                "seed_count": 0, "categories": set()})
+            entry["seed_count"] += 1
+            entry["categories"].add(item["category"])
+    programs = {name: {**value, "categories": sorted(value["categories"])}
+                for name, value in programs.items()}
     data = {"name": "Moonshiner Seed Recipe Book",
             "seed_count": sum(map(len, groups.values())),
+            "programs": programs,
             "categories": {name: groups[name] for name in sorted(groups)}}
     lines = ["# Moonshiner Seed Recipe Book", "",
              f"{data['seed_count']} seeds grouped into {len(groups)} categories. "
-             "This file is generated; edit each seed's `task.json`, then regenerate it.", ""]
+             "This file is generated; edit each seed's source, then regenerate it.", "",
+             "## High-level overview", "",
+             "| Training program | Seeds | What it trains |",
+             "| --- | ---: | --- |"]
+    for name, value in sorted(programs.items(), key=lambda pair: (-pair[1]["seed_count"], pair[0])):
+        lines.append(f"| **{name}** | {value['seed_count']:,} | {value['description']} |")
+    lines += ["", "## Detailed recipe categories", ""]
     for category, items in data["categories"].items():
         lines += [f"## {category}", ""]
         for item in items:

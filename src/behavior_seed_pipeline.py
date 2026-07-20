@@ -23,11 +23,12 @@ SYSTEM = """You are authoring non-code tool-behavior training seeds for Moonshin
 Work only on the behavior-*.json files already present in the workspace. Do not
 create, rename, or delete seeds. Do not edit the schema, world registry, or
 instructions. Preserve each seed's id, category, world, and primary behavioral
-objective. Improve the seed itself: realistic wording, internally consistent
+objective. Preserve `round:*`, `source:*`, and `weakness:*` provenance tags;
+they control curriculum accounting. Improve the seed itself: realistic wording, internally consistent
 arguments and fixture state, precise expected stages, useful distractors,
 instruction-following constraints, and non-code subject matter. Calls within a
 parallel stage must be independent and must remain in one assistant action;
-dependent calls belong in later stages. Never copy BFCL questions or answers.
+dependent calls belong in later stages. Never copy external benchmark questions or answers.
 Every expected tool must exist in the selected world. Return a brief summary
 after editing every assigned file. All actions are fictional simulator state;
 never connect to a live service, use real credentials, or cause external side

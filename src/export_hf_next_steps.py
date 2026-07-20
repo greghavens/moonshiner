@@ -71,7 +71,7 @@ def build_row(record: dict, split: str, *, legacy: bool = False) -> dict:
     if legacy:
         return {
             "task": meta["task"],
-            "lang": meta.get("lang") or "non-code",
+            "lang": meta.get("lang") or "en",
             "category": meta.get("category") or "uncategorized",
             "split": split,
             "assistant_step": meta["assistant_step"],

@@ -1,7 +1,7 @@
 # Behavioral seed curriculum and expansion
 
 The first behavioral corpus contains exactly 1,000 non-code tool-use seeds. It
-is a breadth pass over BFCL v3/v4 behavior, not a benchmark replica. Seeds use
+is a breadth pass over external function-calling evaluations behavior, not a benchmark replica. Seeds use
 original entities, prompts, tool names, backend states, and call graphs.
 
 ## Round 1: 1,000 seeds
@@ -37,7 +37,7 @@ failure schedules, and domain combinations.
 
 ### Round 2: 2,000 total
 
-- Add 1,000 new seeds after running BFCL v3/v4 on the first trained checkpoint.
+- Add 1,000 new seeds after running external function-calling evaluations on the first trained checkpoint.
 - Assign 600 benchmark-directed seeds to the weakest measured behavioral slices.
 - Reserve the remaining 400 seeds for guaranteed breadth: 150 parallel/dependency
   cases, 100 multi-turn cases, 75 recovery cases, 50 clarification/abstention
@@ -46,6 +46,14 @@ failure schedules, and domain combinations.
 - Add no-action and over-action counterexamples when precision and recall diverge.
 - Tag additions with `round:2`, `source:benchmark-directed` when applicable,
   and `weakness:<slice>` so training composition can select the measured repair.
+
+The pre-benchmark Round 2 allocation commissioned for the next mixed-wave
+training run is fixed at 400 breadth-reserve seeds and 600 benchmark-informed
+seeds. It adds 350 parallel/dependency cases, 150 multi-turn cases, 100 exact
+selection/discrimination cases, 75 clarification/missing-function cases, 75
+abstention cases, 75 recovery cases, and 175 long-context, web, memory, and
+format cases. Every addition carries `round:2`, its `weakness:*` behavior tag,
+and exactly one of `source:breadth-reserve` or `source:benchmark-informed`.
 
 ### Round 3: 4,000 total
 

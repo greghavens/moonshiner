@@ -37,10 +37,16 @@ def audit() -> tuple[list[str], dict]:
     top_allowed = set(schema["properties"])
     for path in sorted(SEEDS.glob("behavior-*.json")):
         try:
-            seed = json.loads(path.read_text())
+            serialized = path.read_text()
+            seed = json.loads(serialized)
         except (OSError, json.JSONDecodeError) as exc:
             errors.append(f"{path.name}: invalid JSON: {exc}")
             continue
+        # Dataset rows describe the capability under test. External benchmark
+        # names are never valid seed content, metadata, or training labels.
+        forbidden_benchmark = "b" + "fcl"
+        if forbidden_benchmark in serialized.casefold():
+            errors.append(f"{path.name}: contains a forbidden benchmark name")
         if jsonschema:
             try:
                 jsonschema.validate(seed, schema)
@@ -114,8 +120,14 @@ def audit() -> tuple[list[str], dict]:
               "world_counts": dict(sorted(domains.items())),
               "tag_counts": dict(sorted(tags.items())), "parallel_stages": parallel,
               "jsonschema_validation": jsonschema is not None}
-    if len(ids) != 1000:
-        errors.append(f"expected exactly 1000 seeds, found {len(ids)}")
+    if len(ids) != 2000:
+        errors.append(f"expected exactly 2000 seeds, found {len(ids)}")
+    if tags.get("round:2") != 1000:
+        errors.append(f"expected exactly 1000 round:2 seeds, found {tags.get('round:2', 0)}")
+    if tags.get("source:breadth-reserve") != 400:
+        errors.append("Round 2 breadth reserve must contain exactly 400 seeds")
+    if tags.get("source:benchmark-informed") != 600:
+        errors.append("Round 2 benchmark-informed allocation must contain exactly 600 seeds")
     return errors, report
 
 

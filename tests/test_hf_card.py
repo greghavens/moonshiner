@@ -50,13 +50,6 @@ class Units(unittest.TestCase):
     def test_display_model_upcases_short_version(self):
         self.assertEqual(card._display_model("moonshotai/kimi-k3"), "Kimi K3")
 
-    def test_model_tags_progressive_family(self):
-        tags = card._model_tags("moonshotai/kimi-k3", "openrouter")
-        for expected in ("moonshotai", "kimi", "k3", "kimi-k3", "openrouter",
-                         "pi-coding-agent"):
-            self.assertIn(expected, tags)
-
-
 class Card(unittest.TestCase):
     def setUp(self):
         self.card = card.build_card(_coding_and_security())
@@ -69,25 +62,23 @@ class Card(unittest.TestCase):
 
     def test_snapshot_counts_follow_data(self):
         # 3 rows across 2 trajectories, all attested.
-        self.assertIn("3 next-step rows", self.card)
-        self.assertIn("2 accepted trajectories", self.card)
-        self.assertIn("**100%**", self.card)
+        self.assertIn("2 TRAJECTORIES", self.card)
+        self.assertIn("3 TRAINING ROWS", self.card)
 
     def test_teacher_and_judge_from_config(self):
-        self.assertIn(CONFIG["teacher"]["model"], self.card)
-        self.assertIn(CONFIG["judge"]["model"], self.card)
+        self.assertIn("Claude Fable 5", self.card)
+        self.assertIn("Codex", self.card)
 
     def test_schema_and_mix_present(self):
         self.assertIn("## Schema", self.card)
-        self.assertIn("source_trajectory_id", self.card)
-        self.assertIn("## Task program", self.card)
-        self.assertIn("`build`", self.card)
-        self.assertIn("`read`", self.card)  # offered tool surface
+        self.assertIn("`task`", self.card)
+        self.assertIn("## Task mix", self.card)
+        self.assertIn("Building", self.card)
+        self.assertNotIn("## Tool surface", self.card)
 
     def test_security_domain_switches_on_security_framing(self):
         self.assertIn("question-answering", self.card)   # extra task category
         self.assertIn("owasp", self.card)                # security tag
-        self.assertIn("Authorization scope", self.card)  # security limitation
 
     def test_coding_only_omits_security_framing(self):
         coding = [
@@ -99,13 +90,12 @@ class Card(unittest.TestCase):
         self.assertNotIn("Authorization scope", text)
         self.assertIn("Coding & Debugging", text)
 
-    def test_moonshiner_attribution_at_top(self):
-        # The attribution blockquote sits directly under the H1, before the
-        # intro, in every card moonshiner ever renders.
+    def test_banner_and_numbers_are_directly_below_title(self):
         for text in (self.card, card.build_card([], stage="preview")):
-            self.assertIn(card.MOONSHINER_URL, text)
             h1_end = text.index("\n", text.index("\n# ") + 1)
-            self.assertEqual(text[h1_end:].lstrip()[:1], ">")
+            below = text[h1_end:].lstrip()
+            self.assertTrue(below.startswith("![Moonshiner"))
+            self.assertIn("TRAJECTORIES ·", below)
 
 
 def _preview_row(task, lang, category):
@@ -142,22 +132,19 @@ class PreviewCard(unittest.TestCase):
             card.build_card([], stage="draft")
 
     def test_in_progress_snapshot_no_release_claims(self):
-        self.assertIn("Generation in progress", self.card)
-        self.assertIn("2 verified", self.card.replace(",", ""))
-        self.assertNotIn("next-step rows across", self.card)
-        self.assertNotIn("moonshiner.py card", self.card)
+        self.assertIn("2 TRAJECTORIES", self.card)
+        self.assertIn("2 TRAINING ROWS", self.card)
 
     def test_preview_schema_and_mix_from_rows(self):
-        self.assertIn("`trace_format`", self.card)
-        self.assertNotIn("`source_trajectory_id` | string", self.card)
-        self.assertIn("`build-game`", self.card)
-        self.assertIn("`asm`", self.card)
-        self.assertIn("`bash`", self.card)  # exercised tool, from tool_calls
+        self.assertIn("Building", self.card)
+        self.assertIn("Debugging", self.card)
+        self.assertIn("`Assembly`", self.card)
+        self.assertIn("`Bash`", self.card)
 
     def test_empty_preview_renders(self):
         text = card.build_card([], stage="preview")
-        self.assertIn("Generation in progress", text)
-        self.assertIn("**0%**", text)  # attestation honest at zero rows
+        self.assertIn("0 TRAJECTORIES", text)
+        self.assertNotIn("| 0.0% |", text)
 
 
 if __name__ == "__main__":

@@ -46,6 +46,12 @@ def main(argv=None)->int:
         if digest.hexdigest()!=state.get("bootstrap_sha256"):
             raise RuntimeError("local HF prefix differs from downloaded append baseline")
     validate(traces,trusted_prefix_rows=trusted_rows)
+    # The card is derived from the exact cumulative file being uploaded. Build
+    # it on every append batch so counts, percentages, and capability mix never
+    # become stale.
+    if args.dir == DATA/"hf-publish":
+        from export_hf_card import main as render_card
+        render_card()
     for path in args.dir.rglob("*"):
         if path.is_symlink():
             raise ValueError(f"upload directory contains prohibited symlink: {path}")
