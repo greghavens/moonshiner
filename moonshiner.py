@@ -516,7 +516,7 @@ def _service(argv: list[str]) -> int:
         from configuration import PROJECT_ROOT
         log_dir = RUNS / "trace-continuous"
         log_dir.mkdir(parents=True, exist_ok=True)
-        executable = Path(sys.executable).resolve().parent / "moonshiner"
+        executable = Path(sys.executable).parent / "moonshiner"
         command = ["systemd-run", "--user", "--collect", f"--unit={name}",
                    f"--property=WorkingDirectory={PROJECT_ROOT}",
                    "--property=Restart=always", "--property=RestartSec=10s",

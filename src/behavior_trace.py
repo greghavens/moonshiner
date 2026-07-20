@@ -162,7 +162,7 @@ def trace_task(seed: dict, teacher, *, feedback: str | None = None) -> dict:
     raw=RAW/f"{seed['id']}.jsonl"; raw.write_text("\n".join(json.dumps(m) for m in safe)+"\n")
     verdict=grade(seed,safe)
     raw_text=raw.read_text(); fingerprint=hashlib.sha256(seed["_path"].read_bytes()).hexdigest()
-    record={"id":seed["id"],"kind":"tool_behavior","category":seed["category"],
+    record={"id":seed["id"],"category":seed["category"],
       "passed":verdict["accepted"],"verify_passed":verdict["accepted"],"protected_intact":True,
       "verify_output":verdict["reason"],"trace_format":FORMAT,"prompt":seed["prompt"],
       "seed_fingerprint":fingerprint,"raw_sha256":hashlib.sha256(raw_text.encode()).hexdigest(),

@@ -263,8 +263,17 @@ def quarantined_trajectories(directory: Path | None = None) -> set[str]:
 # --------------------------------------------------------------------------- #
 # Seeds                                                                        #
 # --------------------------------------------------------------------------- #
+_PROGRAM_PRIORITY = {
+    name: position for position, name in enumerate((
+        "Instruction following", "Tool calling", "Error recovery", "Clarification",
+        "Building", "Debugging", "Project & integration", "Feature development",
+        "Refactoring & performance", "Seed authoring", "Other verified work",
+    ))
+}
+
+
 def load_seeds(only: set[str] | None = None, include_holdout: bool = False) -> list[dict]:
-    """Load tasks/seeds/*/task.json, sorted by seed id.
+    """Load every authored seed in catalog priority order.
 
     A seed being written by a concurrent author (invalid JSON mid-write) is
     skipped with a warning rather than crashing a batch.
@@ -285,48 +294,49 @@ def load_seeds(only: set[str] | None = None, include_holdout: bool = False) -> l
         if not include_holdout and seed["id"] in holdouts:
             continue
         seeds.append(seed)
-    return seeds
-
-
-def load_behavior_seeds(only: set[str] | None = None,
-                        *, authored_only: bool = False) -> list[dict]:
-    """Load the non-code tool-behavior recipe set with source provenance."""
-    completed = None
-    if authored_only:
-        state_path = RUNS / "behavior-seed-authoring.json"
-        state = json.loads(state_path.read_text()) if state_path.is_file() else {}
-        completed = state.get("completed") or {}
-    seeds = []
     for path in sorted(BEHAVIOR_SEEDS_DIR.glob("behavior-*.json")):
         seed = json.loads(path.read_text())
-        if completed is not None:
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            if completed.get(seed["id"]) != digest:
-                continue
         if only and seed["id"] not in only:
             continue
         seed["_path"] = path
         seeds.append(seed)
-    return seeds
+
+    catalog_path = (SEEDS_DIR.parent / "SEED_CATALOG.json"
+                    if (SEEDS_DIR.parent / "SEED_CATALOG.json").is_file()
+                    else ROOT / "SEED_CATALOG.json")
+    try:
+        catalog = json.loads(catalog_path.read_text())
+        programs = catalog.get("programs") or {}
+        rank = {item["id"]: (int(programs.get(item.get("program"), {}).get(
+                    "priority", _PROGRAM_PRIORITY.get(item.get("program"), 1_000_000))), position)
+                for position, item in enumerate(
+                    entry for items in (catalog.get("categories") or {}).values()
+                    for entry in items)}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        rank = {}
+    return sorted(seeds, key=lambda seed: (*rank.get(seed["id"], (1_000_000, 0)),
+                                           seed["id"]))
 
 
-def select_seeds(*, kind: str = "all", only: set[str] | None = None,
+def select_seeds(*, only: set[str] | None = None,
                  categories: set[str] | None = None,
                  tags: set[str] | None = None, name: str | None = None,
-                 require_authored: bool = False,
                  include_holdout: bool = True) -> list[dict]:
     """Select catalog recipes consistently for tracing and user inspection."""
-    selected = []
-    if kind in {"coding", "all"}:
-        selected.extend(load_seeds(only=only, include_holdout=include_holdout))
-    if kind in {"behavior", "all"}:
-        selected.extend(load_behavior_seeds(only=only, authored_only=require_authored))
+    selected = load_seeds(only=only, include_holdout=include_holdout)
     needle = (name or "").casefold()
     return [seed for seed in selected
             if (not categories or seed.get("category") in categories)
             and (not tags or tags <= set(seed.get("training_tags") or seed.get("tags") or []))
             and (not needle or needle in seed["id"].casefold()
                  or needle in str(seed.get("prompt") or "").casefold())]
+
+
+def uses_tool_interaction(seed: dict) -> bool:
+    """Return whether the catalog recipe declares the simulated tool harness."""
+    return (isinstance(seed.get("available_tools"), list)
+            and isinstance(seed.get("initial_state"), dict)
+            and isinstance(seed.get("expected"), dict))
 
 
 def seed_fingerprint(seed: dict) -> str:
@@ -336,6 +346,8 @@ def seed_fingerprint(seed: dict) -> str:
     boundary ambiguities, so a stale review is detected if any byte changes.
     """
     digest = hashlib.sha256()
+    if "_path" in seed:
+        return hashlib.sha256(Path(seed["_path"]).read_bytes()).hexdigest()
     task_path = seed["_dir"] / "task.json"
     for path in [task_path, *sorted((seed["_dir"] / "files").rglob("*"))]:
         if not path.is_file():

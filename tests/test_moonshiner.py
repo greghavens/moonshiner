@@ -119,8 +119,8 @@ class FrontDoor(unittest.TestCase):
                           f"--property=WorkingDirectory={configuration.PROJECT_ROOT}"])
         self.assertIn("--setenv=MOONSHINER_SUPERVISED=1", recreated)
         self.assertEqual(recreated[-3:], ["run", "--all", "--yes"])
-        self.assertEqual(pathlib.Path(recreated[-4]).resolve().parent,
-                         pathlib.Path(sys.executable).resolve().parent)
+        self.assertEqual(pathlib.Path(recreated[-4]).parent,
+                         pathlib.Path(sys.executable).parent)
 
     def test_update_uses_official_installer_and_reports_version(self):
         pipe = mock.Mock()

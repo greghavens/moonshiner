@@ -30,6 +30,12 @@ PROGRAM_DESCRIPTIONS = {
     "Other verified work": "Verified work not yet assigned to one of the primary programs.",
 }
 
+PROGRAM_PRIORITY = [
+    "Instruction following", "Tool calling", "Error recovery", "Clarification",
+    "Building", "Debugging", "Project & integration", "Feature development",
+    "Refactoring & performance", "Seed authoring", "Other verified work",
+]
+
 
 def program_for_category(category: str, *, tool_use: bool = False) -> str:
     """Map precise recipe taxonomy to one stable, human-facing program."""
@@ -87,8 +93,10 @@ def catalog(seed_dir: Path = SEEDS_DIR) -> tuple[str, dict]:
                 "seed_count": 0, "categories": set()})
             entry["seed_count"] += 1
             entry["categories"].add(item["category"])
-    programs = {name: {**value, "categories": sorted(value["categories"])}
-                for name, value in programs.items()}
+    priority = {name: index for index, name in enumerate(PROGRAM_PRIORITY)}
+    programs = {name: {**programs[name], "priority": priority.get(name, 1_000_000),
+                       "categories": sorted(programs[name]["categories"])}
+                for name in sorted(programs, key=lambda item: priority.get(item, 1_000_000))}
     data = {"name": "Moonshiner Seed Recipe Book",
             "seed_count": sum(map(len, groups.values())),
             "programs": programs,
@@ -99,7 +107,7 @@ def catalog(seed_dir: Path = SEEDS_DIR) -> tuple[str, dict]:
              "## High-level overview", "",
              "| Training program | Seeds | What it trains |",
              "| --- | ---: | --- |"]
-    for name, value in sorted(programs.items(), key=lambda pair: (-pair[1]["seed_count"], pair[0])):
+    for name, value in sorted(programs.items(), key=lambda pair: pair[1]["priority"]):
         lines.append(f"| **{name}** | {value['seed_count']:,} | {value['description']} |")
     lines += ["", "## Detailed recipe categories", ""]
     for category, items in data["categories"].items():
@@ -107,7 +115,8 @@ def catalog(seed_dir: Path = SEEDS_DIR) -> tuple[str, dict]:
         for item in items:
             tags = " " + " ".join(f"`#{tag}`" for tag in item["training_tags"]) if item["training_tags"] else ""
             world = f", `{item['world']}`" if item.get("world") else ""
-            lines.append(f"- **{item['id']}** (`{item['language']}`{world}){tags} — {item['summary']}")
+            language = f" (`{item['language']}`{world})" if item.get("language") else world
+            lines.append(f"- **{item['id']}**{language}{tags} — {item['summary']}")
         lines.append("")
     return "\n".join(lines), data
 
@@ -257,7 +266,6 @@ def main(argv=None) -> int:
     sub = parser.add_subparsers(dest="action", required=True)
     sub.add_parser("status"); sub.add_parser("verify"); sub.add_parser("list")
     cat = sub.add_parser("catalog"); cat.add_argument("--output", type=Path); cat.add_argument("--json", action="store_true")
-    cat.add_argument("--kind", choices=["coding", "behavior", "all"], default="all")
     cat.add_argument("--category", action="append"); cat.add_argument("--tag", action="append")
     cat.add_argument("--name", help="Match seed ID, prompt summary, or tag")
     man = sub.add_parser("manifest"); man.add_argument("--output", type=Path); man.add_argument("--version")
@@ -279,8 +287,7 @@ def main(argv=None) -> int:
         needle=(args.name or "").casefold(); filtered={}
         for category,items in data["categories"].items():
             kept=[item for item in items
-                  if (args.kind == "all" or item["kind"] == ("tool_behavior" if args.kind=="behavior" else "coding_repair"))
-                  and (not categories or category in categories)
+                  if (not categories or category in categories)
                   and (not tags or tags <= set(item.get("training_tags") or []))
                   and (not needle or any(needle in str(value).casefold() for value in
                       (item["id"],item.get("summary","")," ".join(item.get("training_tags") or []))))]

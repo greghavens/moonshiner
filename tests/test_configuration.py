@@ -86,32 +86,36 @@ class SafeSelection(unittest.TestCase):
     def test_default_selects_one(self, _imported, load):
         load.return_value = [{"id": "a"}, {"id": "b"}]
         self.assertEqual([s["id"] for s in trace_pipeline._selected(self._args())], ["a"])
-        self.assertFalse(load.call_args.kwargs["require_authored"])
+        self.assertNotIn("kind", load.call_args.kwargs)
 
     @mock.patch.object(trace_pipeline, "select_seeds")
     @mock.patch("import_existing.imported_task_ids", return_value=set())
     def test_all_is_explicit(self, _imported, load):
         load.return_value = [{"id": "a"}, {"id": "b"}]
         self.assertEqual(
-            len(trace_pipeline._selected(self._args(all=True, kind="behavior"))), 2)
-        self.assertEqual(load.call_args.kwargs["kind"], "behavior")
+            len(trace_pipeline._selected(self._args(all=True))), 2)
+        self.assertNotIn("kind", load.call_args.kwargs)
 
     @mock.patch.object(trace_pipeline, "select_seeds")
     @mock.patch("import_existing.imported_task_ids", return_value=set())
-    def test_kind_partitions_only_when_user_requests_it(self, _imported, load):
+    def test_catalog_filters_do_not_create_a_second_loader(self, _imported, load):
         load.return_value = [{"id": "coding-seed"}, {"id": "tool-use-seed"}]
-        selected = trace_pipeline._selected(self._args(all=True, kind="behavior"))
+        selected = trace_pipeline._selected(self._args(
+            all=True, category=["instruction-following"], tag=["multi-turn"]))
         self.assertEqual([seed["id"] for seed in selected],
                          ["coding-seed", "tool-use-seed"])
-        self.assertEqual(load.call_args.kwargs["kind"], "behavior")
+        self.assertEqual(load.call_args.kwargs["categories"],
+                         {"instruction-following"})
+        self.assertEqual(load.call_args.kwargs["tags"], {"multi-turn"})
+        self.assertNotIn("kind", load.call_args.kwargs)
 
     @mock.patch.object(trace_pipeline, "select_seeds")
     @mock.patch("import_existing.imported_task_ids", return_value=set())
-    def test_default_queue_selects_all_seed_partitions(self, _imported, load):
+    def test_default_queue_uses_the_one_catalog_loader(self, _imported, load):
         load.return_value = [{"id": "a"}, {"id": "b"}]
-        trace_pipeline._selected(self._args(all=True, kind="all"))
-        self.assertEqual(load.call_args.kwargs["kind"], "all")
-        self.assertFalse(load.call_args.kwargs["require_authored"])
+        trace_pipeline._selected(self._args(all=True))
+        self.assertNotIn("kind", load.call_args.kwargs)
+        self.assertNotIn("require_authored", load.call_args.kwargs)
 
 
 if __name__ == "__main__":

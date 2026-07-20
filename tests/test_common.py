@@ -36,6 +36,22 @@ class Fingerprint(unittest.TestCase):
 
 
 class LoadSeeds(unittest.TestCase):
+    def test_one_loader_contains_every_seed_once_in_catalog_priority(self):
+        self.assertFalse(hasattr(common, "load_behavior_seeds"))
+        seeds = common.load_seeds(include_holdout=True)
+        ids = [seed["id"] for seed in seeds]
+        expected = {path.parent.name for path in common.SEEDS_DIR.glob("*/task.json")}
+        expected.update(path.stem for path in common.BEHAVIOR_SEEDS_DIR.glob(
+            "behavior-*.json"))
+        self.assertEqual(set(ids), expected)
+        self.assertEqual(len(ids), len(set(ids)))
+        first_repository_seed = next(
+            index for index, seed in enumerate(seeds) if "_dir" in seed)
+        last_tool_interaction = max(
+            index for index, seed in enumerate(seeds)
+            if common.uses_tool_interaction(seed))
+        self.assertLess(last_tool_interaction, first_repository_seed)
+
     def test_holdout_excluded_by_default(self):
         holdout = set(common.CONFIG.get("holdout_tasks", []))
         self.assertTrue(holdout, "config should declare holdout tasks")
@@ -47,21 +63,21 @@ class LoadSeeds(unittest.TestCase):
         ids = {seed["id"] for seed in common.load_seeds(include_holdout=True)}
         self.assertTrue(holdout <= ids)
 
-    def test_seeds_carry_dir_and_only_filter(self):
+    def test_seeds_carry_one_source_path_and_only_filter(self):
         seeds = common.load_seeds()
-        self.assertTrue(all("_dir" in seed for seed in seeds[:5]))
+        self.assertTrue(all(("_dir" in seed) != ("_path" in seed) for seed in seeds))
         pick = common.load_seeds(only={"py-config-merge"})
         self.assertEqual([seed["id"] for seed in pick], ["py-config-merge"])
 
     def test_behavior_selection_by_category_and_tags(self):
-        selected = common.select_seeds(kind="behavior",
+        selected = common.select_seeds(
             categories={"parallel-same"}, tags={"execution:parallel"})
         self.assertTrue(selected)
-        self.assertTrue(all(seed["kind"] == "tool_behavior" for seed in selected))
+        self.assertTrue(all(common.uses_tool_interaction(seed) for seed in selected))
         self.assertTrue(all(seed["category"] == "parallel-same" for seed in selected))
 
     def test_name_and_only_filters_apply_to_behavior_seeds(self):
-        selected = common.select_seeds(kind="behavior",
+        selected = common.select_seeds(
             only={"behavior-tool-selection-0001"}, name="Vendor onboarding")
         self.assertEqual([seed["id"] for seed in selected],
                          ["behavior-tool-selection-0001"])

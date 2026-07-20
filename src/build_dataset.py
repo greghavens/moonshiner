@@ -19,8 +19,8 @@ import hashlib
 import json
 from pathlib import Path
 
-from common import (CONFIG, DATA, SECRET_RE, SYSTEM_PROMPT, TRACES, load_seeds, load_behavior_seeds,
-                    scrub_text)
+from common import (CONFIG, DATA, SECRET_RE, SYSTEM_PROMPT, TRACES, load_seeds,
+                    scrub_text, uses_tool_interaction)
 from normalize import parse_trace, tool_schemas_for
 from screen_traces import validate_reviewer_verdict
 from privacy import sanitize_object
@@ -139,7 +139,7 @@ def build_row(seed: dict, info: dict) -> tuple[dict | None, str | None]:
         return None, "no assistant turns"
 
     system_prompt = SYSTEM_PROMPT
-    if seed.get("kind") == "tool_behavior":
+    if uses_tool_interaction(seed):
         from behavior_trace import SYSTEM as system_prompt
     session = ([{"role": "system", "content": system_prompt},
                 {"role": "user", "content":
@@ -152,7 +152,7 @@ def build_row(seed: dict, info: dict) -> tuple[dict | None, str | None]:
     used = sorted({call["function"]["name"]
                    for message in turns if message["role"] == "assistant"
                    for call in message.get("tool_calls") or []})
-    if seed.get("kind") == "tool_behavior":
+    if uses_tool_interaction(seed):
         from behavior_trace import schemas_for_seed
         tools = schemas_for_seed(seed, set(seed["available_tools"]))
     else:
@@ -165,7 +165,7 @@ def build_row(seed: dict, info: dict) -> tuple[dict | None, str | None]:
         "task": seed["id"],
         "lang": seed.get("lang"),
         "category": seed.get("category"),
-        "domain": "tool_behavior" if seed.get("kind") == "tool_behavior" else "coding",
+        "domain": "tool_behavior" if uses_tool_interaction(seed) else "coding",
         "passed": info.get("passed"),
         "tools_used": used,
         "tags": training_tags(seed, turns, info),
@@ -211,8 +211,7 @@ def main() -> None:
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
 
-    seeds = {seed["id"]: seed for seed in [*load_seeds(include_holdout=True),
-                                            *load_behavior_seeds()]}
+    seeds = {seed["id"]: seed for seed in load_seeds(include_holdout=True)}
     holdouts = set(CONFIG.get("holdout_tasks", []))
     rows, dropped = [], []
     for meta_path in sorted(META.glob("*.json")):

@@ -71,12 +71,6 @@ def _selected(args) -> list[dict]:
             accepted.add(path.stem)
     categories = set(getattr(args, "category", None) or [])
     tags = set(getattr(args, "tag", None) or [])
-    # Partition only when the user explicitly requests it. The continuous
-    # project queue follows its configured selection, whose default is all.
-    selected_kind = getattr(args, "kind", "all")
-    if os.environ.get("MOONSHINER_SUPERVISED") == "1":
-        selected_kind = str((((CONFIG.get("pipeline") or {}).get("queues") or {})
-                             .get("trace_kind") or "all"))
     # Catalog membership is the only seed intake gate. Quality decisions belong
     # to the trace judge, and lifetime exhaustion prevents paid retry loops.
     ledger = connect()
@@ -97,10 +91,9 @@ def _selected(args) -> list[dict]:
         ) WHERE rank=1 AND status='infrastructure_blocked'""")}
     ledger.close()
     maximum = int(getattr(args, "max_attempts", 3))
-    seeds = [seed for seed in select_seeds(kind=selected_kind, only=only,
+    seeds = [seed for seed in select_seeds(only=only,
                                            categories=categories, tags=tags,
-                                           name=getattr(args, "name", None),
-                                           require_authored=False)
+                                           name=getattr(args, "name", None))
              if seed["id"] not in imported
              and seed["id"] not in accepted
              and seed["id"] not in blocked
@@ -183,8 +176,6 @@ def main(argv: list[str] | None = None) -> int:
     choice.add_argument("--all", action="store_true",
                         help="Explicitly authorize every eligible seed.")
     choice.add_argument("--only", help="Comma-separated seed ids.")
-    parser.add_argument("--kind", choices=["coding", "behavior", "all"],
-                        default="all", help="Optional seed partition (default: all seeds).")
     parser.add_argument("--category", action="append",
                         help="Require this catalog category (repeatable).")
     parser.add_argument("--tag", action="append",
@@ -223,7 +214,7 @@ def main(argv: list[str] | None = None) -> int:
         ids={j["seed_id"] for j in job_rows(db,args.resume)
              if j["status"] in {"pending","running","retry"}}
         prior_limits=json.loads(prior["limits_json"])
-        seeds=select_seeds(kind="all", only=ids, require_authored=False); args.max_attempts=prior_limits["max_attempts"]
+        seeds=select_seeds(only=ids); args.max_attempts=prior_limits["max_attempts"]
     else:
         seeds = _selected(args)
     if not seeds:
@@ -278,7 +269,8 @@ def main(argv: list[str] | None = None) -> int:
     if sync.get("status") not in {"unconfigured", "local_append"}:
         print(f"HF local dataset: {sync.get('status')} ({sync.get('origin', 'existing')})")
 
-    if all(seed.get("kind") == "tool_behavior" for seed in seeds):
+    from common import uses_tool_interaction
+    if all(uses_tool_interaction(seed) for seed in seeds):
         from runtimes.auth import load_provider_key
         load_provider_key(teacher.runtime_config)
     else:
@@ -360,7 +352,7 @@ def main(argv: list[str] | None = None) -> int:
                 stopped.set(); thread.join()
 
         with lease_heartbeat():
-            if seed.get("kind") == "tool_behavior":
+            if uses_tool_interaction(seed):
                 from behavior_trace import trace_task as behavior_trace_task
                 record = behavior_trace_task(seed, worker_teacher, feedback=feedback)
             else:
@@ -371,7 +363,7 @@ def main(argv: list[str] | None = None) -> int:
         record_model_call(worker_db, run_id)
         print(f"[{seed['id']}] attempt {number}/{args.max_attempts}: judge", flush=True)
         with lease_heartbeat():
-            if seed.get("kind") == "tool_behavior":
+            if uses_tool_interaction(seed):
                 from behavior_trace import judge_trace
                 review = judge_trace(seed, worker_judge)
             else:

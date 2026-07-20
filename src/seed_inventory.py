@@ -9,7 +9,7 @@ from review_contract import is_accepted
 
 
 def authored_ids() -> set[str]:
-    return {seed["id"] for seed in select_seeds(require_authored=False)}
+    return {seed["id"] for seed in select_seeds()}
 
 
 def documented_plan_ids() -> set[str]:

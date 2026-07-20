@@ -162,8 +162,8 @@ def main(argv=None) -> int:
             for source in batch:
                 candidate = workspace / source.name
                 value = json.loads(candidate.read_text())
-                if value.get("id") != source.stem or value.get("kind") != "tool_behavior":
-                    raise RuntimeError(f"Codex changed identity/kind in {source.name}")
+                if value.get("id") != source.stem:
+                    raise RuntimeError(f"Codex changed identity in {source.name}")
                 shutil.copy2(candidate, source)
             audit()
             from corpus import write_catalog
