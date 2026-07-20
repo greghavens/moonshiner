@@ -507,8 +507,11 @@ def _update(argv: list[str]) -> int:
     download_code = download.wait()
     if download_code or install.returncode:
         return download_code or install.returncode
-    executable = Path(sys.executable).resolve().parent / "moonshiner"
-    return subprocess.run([str(executable), "--version"]).returncode
+    executable = shutil.which("moonshiner")
+    if not executable:
+        print("updated successfully; reopen your shell to refresh moonshiner", file=sys.stderr)
+        return 0
+    return subprocess.run([executable, "--version"]).returncode
 
 
 def _status(argv: list[str], *, inspect: bool = False) -> int:

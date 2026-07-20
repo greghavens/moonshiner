@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+import shutil
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -13,8 +14,10 @@ from seed_inventory import authored_ids, documented_plan_items
 
 
 def _moonshiner() -> str:
-    executable = Path(sys.executable).resolve().parent / "moonshiner"
-    return str(executable)
+    executable = shutil.which("moonshiner")
+    if not executable:
+        raise FileNotFoundError("the installed moonshiner executable was not found")
+    return executable
 
 
 def main(argv=None) -> int:

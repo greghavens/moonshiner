@@ -87,7 +87,8 @@ class FrontDoor(unittest.TestCase):
         pipe.wait.return_value = 0
         installed = mock.Mock(returncode=0)
         version = mock.Mock(returncode=0)
-        with mock.patch.object(m.shutil, "which", side_effect=["/usr/bin/curl", "/bin/bash"]), \
+        with mock.patch.object(m.shutil, "which", side_effect=[
+                 "/usr/bin/curl", "/bin/bash", "/installed/bin/moonshiner"]), \
              mock.patch.object(m.subprocess, "Popen", return_value=pipe) as popen, \
              mock.patch.object(m.subprocess, "run", side_effect=[installed, version]) as run:
             self.assertEqual(m._update([]), 0)
