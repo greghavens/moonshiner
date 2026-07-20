@@ -486,6 +486,28 @@ def _service(argv: list[str]) -> int:
     return result.returncode
 
 
+def _update(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="moonshiner update")
+    parser.parse_args(argv)
+    installer = "https://raw.githubusercontent.com/greghavens/moonshiner/main/install.sh"
+    curl = shutil.which("curl")
+    bash = shutil.which("bash")
+    if not curl or not bash:
+        print("moonshiner update requires curl and bash", file=sys.stderr)
+        return 2
+    download = subprocess.Popen([curl, "-fsSL", installer], stdout=subprocess.PIPE)
+    try:
+        install = subprocess.run([bash], stdin=download.stdout)
+    finally:
+        if download.stdout is not None:
+            download.stdout.close()
+    download_code = download.wait()
+    if download_code or install.returncode:
+        return download_code or install.returncode
+    executable = Path(sys.executable).resolve().parent / "moonshiner"
+    return subprocess.run([str(executable), "--version"]).returncode
+
+
 def _status(argv: list[str], *, inspect: bool = False) -> int:
     from run_state import connect, job_rows, summaries
     parser = argparse.ArgumentParser(prog=f"moonshiner {'inspect' if inspect else 'status'}")
@@ -607,6 +629,7 @@ CREATE TRAINING DATA
   moonshiner status           Show current and previous runs
   moonshiner service stop NAME
                               Stop one named Moonshiner service
+  moonshiner update           Install the newest official release
   moonshiner dataset build    Build a dataset from accepted traces
   moonshiner dataset analyze --source PATH
                               Inspect token, category, tag, and behavior mix
@@ -679,6 +702,8 @@ def main(argv: list[str] | None = None) -> int:
         return _status(rest)
     if command == "service":
         return _service(rest)
+    if command == "update":
+        return _update(rest)
     if command == "inspect":
         return _status(rest, inspect=True)
     if command == "auth":

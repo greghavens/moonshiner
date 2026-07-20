@@ -77,6 +77,20 @@ class FrontDoor(unittest.TestCase):
         with self.assertRaises(SystemExit):
             m._service(["stop", "ssh"])
 
+    def test_update_uses_official_installer_and_reports_version(self):
+        pipe = mock.Mock()
+        pipe.stdout = mock.Mock()
+        pipe.wait.return_value = 0
+        installed = mock.Mock(returncode=0)
+        version = mock.Mock(returncode=0)
+        with mock.patch.object(m.shutil, "which", side_effect=["/usr/bin/curl", "/bin/bash"]), \
+             mock.patch.object(m.subprocess, "Popen", return_value=pipe) as popen, \
+             mock.patch.object(m.subprocess, "run", side_effect=[installed, version]) as run:
+            self.assertEqual(m._update([]), 0)
+        self.assertIn("greghavens/moonshiner/main/install.sh", popen.call_args.args[0][-1])
+        self.assertEqual(run.call_args_list[0].args[0], ["/bin/bash"])
+        self.assertEqual(run.call_args_list[1].args[0][-1], "--version")
+
 
 class Registry(unittest.TestCase):
     def test_keys_are_unique_and_indexed(self):
