@@ -665,6 +665,8 @@ CREATE TRAINING DATA
                               Resume from existing traces or prepared rows
   moonshiner trace import --hf OWNER/DATASET
                               Resume from a Hugging Face dataset
+  moonshiner trace repair-infrastructure
+                              Requeue only verified, repaired infrastructure failures
   moonshiner status           Show current and previous runs
   moonshiner service stop NAME
                               Stop one named Moonshiner service
@@ -735,6 +737,9 @@ def main(argv: list[str] | None = None) -> int:
         if command == "trace" and rest and rest[0] == "import":
             from import_existing import main as import_main
             return import_main(rest[1:])
+        if command == "trace" and rest and rest[0] == "repair-infrastructure":
+            from infrastructure_repair import main as repair_main
+            return repair_main(rest[1:])
         if command == "trace" and rest and rest[0] == "run": rest = rest[1:]
         from trace_pipeline import main as trace_main
         return trace_main(rest)

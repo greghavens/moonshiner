@@ -86,7 +86,8 @@ def trace_state(max_attempts: int) -> dict[str, set[str]]:
         "SELECT DISTINCT j.seed_id FROM jobs j JOIN runs r ON r.id=j.run_id "
         "WHERE r.kind='trace' AND r.status='running' AND j.status='running'")}
     attempts = {row[0]: int(row[1]) for row in db.execute(
-        "SELECT seed_id,COUNT(*) FROM attempts GROUP BY seed_id")}
+        "SELECT seed_id,COUNT(*) FROM attempts "
+        "WHERE status IN ('accepted','retry','exhausted') GROUP BY seed_id")}
     db.close()
     active &= target - accepted
     exhausted = {seed_id for seed_id in target - accepted - active

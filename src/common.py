@@ -426,14 +426,63 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int):
     """Run seed-controlled commands offline with no home or inherited secrets."""
     if shutil.which("bwrap") is None:
         raise RuntimeError("bubblewrap is required to execute seed commands safely")
+    from toolchains import effective_path
+    sandbox_path = effective_path()
     cmd = ["bwrap", "--die-with-parent", "--unshare-net", "--unshare-pid",
-           "--ro-bind", "/", "/", "--tmpfs", str(Path.home()),
-           "--tmpfs", "/tmp", "--bind", str(workspace), str(workspace),
-           "--clearenv", "--setenv", "PATH", os.environ.get("PATH", "/usr/bin:/bin"),
-           "--setenv", "HOME", str(workspace / ".sandbox-home"),
-           "--chdir", str(workspace), "--", *command]
+           "--ro-bind", "/", "/"]
+    # Rustup installs its executable shims and toolchains below the user's
+    # home. The home itself stays hidden because it may contain credentials;
+    # expose only the executable shims and compiler toolchains at neutral,
+    # read-only sandbox paths.
+    cargo_bin = Path.home() / ".cargo" / "bin"
+    rustup_home = Path.home() / ".rustup"
+    if cargo_bin.is_dir() and rustup_home.is_dir():
+        # /mnt and /media are existing neutral mount points. Binding before the
+        # home tmpfs preserves access to the host sources without exposing home.
+        cmd += ["--ro-bind", str(cargo_bin), "/mnt",
+                "--ro-bind", str(rustup_home), "/media"]
+    cmd += ["--tmpfs", str(Path.home()),
+            "--tmpfs", "/tmp", "--dev-bind", "/dev", "/dev",
+            "--proc", "/proc", "--bind", str(workspace), str(workspace),
+            "--clearenv", "--setenv", "PATH", sandbox_path,
+            "--setenv", "HOME", str(workspace / ".sandbox-home"),
+            "--chdir", str(workspace)]
+    if cargo_bin.is_dir() and rustup_home.is_dir():
+        cmd += [
+                "--setenv", "PATH", "/mnt:" + sandbox_path,
+                "--setenv", "RUSTUP_HOME", "/media",
+                "--setenv", "CARGO_HOME", str(workspace / ".sandbox-home" / ".cargo")]
+    cmd += ["--", *command]
     return subprocess.run(cmd, cwd=workspace, capture_output=True, text=True,
                           timeout=timeout)
+
+
+def preflight_seed_environment(seed: dict) -> tuple[bool, str]:
+    """Validate a seed's setup in the real verifier sandbox before model spend."""
+    workspace = materialize(seed, name=f"environment-{seed['id']}")
+    ok, detail = run_setup(seed, workspace)
+    from toolchains import missing_executables, provision
+    missing = missing_executables(detail)
+    # The baseline is expected to fail verification; only missing executable
+    # evidence is an environment defect. This also discovers nested tools used
+    # by shell/Python verifier wrappers without mistaking the intended test
+    # failure for an infrastructure failure.
+    _, verify_detail = run_verify(seed, workspace)
+    missing.extend(tool for tool in missing_executables(verify_detail)
+                   if tool not in missing)
+    if missing:
+        deployed, deployment_detail = provision(missing)
+        if not deployed:
+            return False, deployment_detail
+        retry_workspace = materialize(seed, name=f"environment-{seed['id']}-provisioned")
+        ok, detail = run_setup(seed, retry_workspace)
+        _, verify_detail = run_verify(seed, retry_workspace)
+        still_missing = missing_executables(detail + "\n" + verify_detail)
+        if still_missing:
+            return False, "toolchain remains unavailable in verifier sandbox: " + ", ".join(still_missing)
+    if not ok:
+        return False, f"reference setup failed before trace generation: {detail}"
+    return True, detail
 
 
 def protected_hashes(seed: dict, workspace: Path) -> dict[str, str | None]:

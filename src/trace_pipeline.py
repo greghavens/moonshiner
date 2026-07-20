@@ -90,6 +90,7 @@ def _selected(args) -> list[dict]:
                 for row in ledger.execute("""SELECT j.seed_id, COUNT(a.id) attempts
                   FROM jobs j JOIN runs r ON r.id=j.run_id
                   LEFT JOIN attempts a ON a.run_id=j.run_id AND a.seed_id=j.seed_id
+                    AND a.status IN ('accepted','retry','exhausted')
                   WHERE r.kind='trace' GROUP BY j.seed_id""")}
     ledger.close()
     maximum = int(getattr(args, "max_attempts", 3))
@@ -284,7 +285,8 @@ def main(argv: list[str] | None = None) -> int:
         for seed in seeds:
             prior = db.execute("""SELECT COUNT(a.id) FROM attempts a
                 JOIN runs r ON r.id=a.run_id
-                WHERE r.kind='trace' AND a.seed_id=? AND a.run_id<>?""",
+                WHERE r.kind='trace' AND a.seed_id=? AND a.run_id<>?
+                  AND a.status IN ('accepted','retry','exhausted')""",
                 (seed["id"], run_id)).fetchone()[0]
             db.execute("UPDATE jobs SET attempts=? WHERE run_id=? AND seed_id=?",
                        (int(prior), run_id, seed["id"]))
@@ -314,6 +316,14 @@ def main(argv: list[str] | None = None) -> int:
         if number > args.max_attempts:
             set_job(worker_db, run_id, seed["id"], "exhausted", claim["attempts"],
                     claim.get("last_error") or "attempt ceiling reached")
+            return
+        from common import preflight_seed_environment
+        environment_ok, environment_detail = preflight_seed_environment(seed)
+        if not environment_ok:
+            set_job(worker_db, run_id, seed["id"], "infrastructure_blocked",
+                    claim["attempts"], environment_detail)
+            print(f"[infrastructure blocked] {seed['id']}: {environment_detail}",
+                  flush=True)
             return
         record_model_call(worker_db, run_id)
         start_attempt(worker_db, run_id, seed["id"], number)
