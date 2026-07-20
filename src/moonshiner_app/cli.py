@@ -3,13 +3,20 @@ from __future__ import annotations
 import os, shutil, sys, uuid
 from pathlib import Path
 
+
+def _is_read_only(argv: list[str]) -> bool:
+    return bool(argv and (
+        argv[0] in {"-h", "--help", "help", "--version"}
+        or (argv[0] == "seeds" and len(argv) > 1
+            and argv[1] in {"status", "verify", "list", "catalog", "manifest"})
+    ))
+
 def main() -> int:
     bundle = Path(__file__).resolve().parent / "bundle"
     os.environ.setdefault("MOONSHINER_BUNDLE_ROOT", str(bundle))
     sys.path.insert(0, str(bundle / "src")); sys.path.insert(0, str(bundle))
     from configuration import PROJECT_STATE, confirm_project
-    read_only = bool(sys.argv[1:] and sys.argv[1] in
-                     {"-h", "--help", "help", "--version"})
+    read_only = _is_read_only(sys.argv[1:])
     if not read_only and not confirm_project():
         return 1
     storage = PROJECT_STATE
