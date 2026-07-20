@@ -89,6 +89,17 @@ class FrontDoor(unittest.TestCase):
             "moonshiner-trace-example.service",
         ])
 
+    def test_service_restart_resolves_publisher_for_current_project(self):
+        completed = mock.Mock(returncode=0)
+        expected = m.hashlib.sha256(
+            str(configuration.PROJECT_ROOT).encode()).hexdigest()[:12]
+        with mock.patch.object(m.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(m._service(["restart", "publisher"]), 0)
+        run.assert_called_once_with([
+            "systemctl", "--user", "restart",
+            f"moonshiner-publish-{expected}.service",
+        ])
+
     def test_update_uses_official_installer_and_reports_version(self):
         pipe = mock.Mock()
         pipe.stdout = mock.Mock()

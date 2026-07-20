@@ -12,6 +12,7 @@ import sys
 import time
 import json
 import re
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -479,6 +480,11 @@ def _service(argv: list[str]) -> int:
     sub = parser.add_subparsers(dest="action", required=True)
     stop = sub.add_parser("stop", help="Stop one named Moonshiner service.")
     stop.add_argument("name")
+    restart = sub.add_parser("restart", help="Restart one named Moonshiner service.")
+    restart.add_argument("name")
+    logs = sub.add_parser("logs", help="Show recent logs for one Moonshiner service.")
+    logs.add_argument("name")
+    logs.add_argument("--lines", type=int, default=100)
     drain = sub.add_parser(
         "drain",
         help="Pause a coordinator so its running child jobs can finish without replacements.")
@@ -487,11 +493,21 @@ def _service(argv: list[str]) -> int:
     resume.add_argument("name")
     args = parser.parse_args(argv)
     name = args.name.removesuffix(".service")
+    if name == "publisher":
+        from configuration import PROJECT_ROOT
+        project_key = hashlib.sha256(str(PROJECT_ROOT).encode()).hexdigest()[:12]
+        name = f"moonshiner-publish-{project_key}"
     if not re.fullmatch(r"moonshiner-[A-Za-z0-9_.@-]+", name):
         parser.error("service name must identify one moonshiner-* service")
+    if args.action == "logs":
+        return subprocess.run(["journalctl", "--user", "-u", f"{name}.service",
+                               "-n", str(args.lines), "--no-pager"]).returncode
     if args.action == "stop":
         command = ["systemctl", "--user", "stop", f"{name}.service"]
         message = f"stopped {name}"
+    elif args.action == "restart":
+        command = ["systemctl", "--user", "restart", f"{name}.service"]
+        message = f"restarted {name}"
     else:
         signal = "SIGSTOP" if args.action == "drain" else "SIGCONT"
         command = ["systemctl", "--user", "kill", "--kill-whom=main",
