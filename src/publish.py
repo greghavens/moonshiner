@@ -1,11 +1,29 @@
 """Publish only a validated immutable Hugging Face staging directory."""
 from __future__ import annotations
-import argparse, hashlib, json, os, subprocess, urllib.request
+import argparse, hashlib, json, os, subprocess, urllib.parse, urllib.request
 from pathlib import Path
 from common import CONFIG, DATA, ROOT, _staged_secret_values
 from privacy import findings
 from validate_hf_export import validate
 from hf_sync import ensure_local_dataset
+
+
+def _verify_remote_card(dataset: str, card: Path, auth_token: str) -> None:
+    """Require the Hub's current README bytes to match the rendered card."""
+    expected = card.read_bytes()
+    digest = hashlib.sha256(expected).hexdigest()
+    repo = urllib.parse.quote(dataset, safe="/")
+    url = (f"https://huggingface.co/datasets/{repo}/resolve/main/README.md"
+           f"?download=true&moonshiner_sha256={digest}")
+    request = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {auth_token}",
+                 "Cache-Control": "no-cache"},
+    )
+    with urllib.request.urlopen(request) as response:
+        actual = response.read()
+    if actual != expected:
+        raise RuntimeError("published Hugging Face dataset card failed remote verification")
 
 def token():
     value=os.environ.get("HF_TOKEN","").strip()
@@ -59,11 +77,23 @@ def main(argv=None)->int:
             hits=findings(path.read_text(errors="replace"),exact_secrets=_staged_secret_values(),forbidden_paths=(str(ROOT),str(Path.home())))
             if hits:raise ValueError(f"{path}: privacy findings {hits}")
     private=bool(CONFIG.get("publish",{}).get("private",True))
+    auth_token = token()
     request=urllib.request.Request(f"https://huggingface.co/api/datasets/{args.dataset}/settings",
-        data=json.dumps({"private":private}).encode(),headers={"Authorization":f"Bearer {token()}","Content-Type":"application/json"},method="PUT")
+        data=json.dumps({"private":private}).encode(),headers={"Authorization":f"Bearer {auth_token}","Content-Type":"application/json"},method="PUT")
     with urllib.request.urlopen(request) as response:
         if response.status//100!=2:raise RuntimeError("dataset visibility update failed")
     command=["hf","upload",args.dataset,str(args.dir),".","--repo-type","dataset"]
     if args.commit_message: command.extend(["--commit-message",args.commit_message])
     subprocess.run(command,check=True)
+    # Folder uploads use a local resumable-transfer cache. A regenerated card
+    # must never be skipped because that cache remembers an older upload, so
+    # commit README.md explicitly and then compare the live Hub bytes.
+    card = args.dir / "README.md"
+    if card.is_file():
+        card_command = ["hf", "upload", args.dataset, str(card), "README.md",
+                        "--repo-type", "dataset"]
+        if args.commit_message:
+            card_command.extend(["--commit-message", args.commit_message])
+        subprocess.run(card_command, check=True)
+        _verify_remote_card(args.dataset, card, auth_token)
     print(f"published validated dataset -> {args.dataset}");return 0
