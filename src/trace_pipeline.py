@@ -15,7 +15,7 @@ from pathlib import Path
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 
-from common import CONFIG, select_seeds
+from common import CONFIG, deterministic_review_accepted, select_seeds
 from generate_traces import trace_task
 from run_state import (connect, create_run, finish_attempt, set_job,
                        set_run_status, start_attempt, run_row, job_rows,
@@ -63,11 +63,11 @@ def _selected(args) -> list[dict]:
     imported = imported_task_ids()
     from common import TRACES
     accepted=set()
-    for path in (TRACES/"reviews").glob("behavior-*.json"):
+    for path in (TRACES/"reviews").glob("*.json"):
         try: review=json.loads(path.read_text())
         except (OSError,json.JSONDecodeError): continue
         if (review.get("accepted") is True
-                and (review.get("deterministic") or {}).get("accepted") is True
+                and deterministic_review_accepted(review)
                 and (review.get("judge") or {}).get("model_attested") is True):
             accepted.add(path.stem)
     categories = set(getattr(args, "category", None) or [])

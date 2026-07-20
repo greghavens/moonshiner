@@ -349,6 +349,13 @@ def seed_fingerprint(seed: dict) -> str:
     return digest.hexdigest()
 
 
+def deterministic_review_accepted(review: dict) -> bool:
+    """Support the coding (`passed`) and tool-use (`accepted`) review schemas."""
+    deterministic = review.get("deterministic") or {}
+    return (deterministic.get("passed") is True
+            or deterministic.get("accepted") is True)
+
+
 def materialize(seed: dict, name: str | None = None) -> Path:
     """Copy a seed's files into a fresh, committed Git workspace.
 

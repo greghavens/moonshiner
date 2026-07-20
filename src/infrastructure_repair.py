@@ -52,8 +52,29 @@ def repair(db, *, apply: bool) -> dict:
             f"error=COALESCE(error,'confirmed infrastructure failure') "
             f"WHERE id IN ({placeholders})", (now(), *attempts))
         db.commit()
+    candidate_counts: dict[str, int] = {}
+    for attempt_id in attempts:
+        seed_id = str(db.execute("SELECT seed_id FROM attempts WHERE id=?",
+                                 (attempt_id,)).fetchone()[0])
+        candidate_counts[seed_id] = candidate_counts.get(seed_id, 0) + 1
+    accepted = {str(row[0]) for row in db.execute(
+        "SELECT DISTINCT seed_id FROM attempts WHERE status='accepted'")}
+    valid_counts = {str(row[0]): int(row[1]) for row in db.execute(
+        "SELECT seed_id,COUNT(*) FROM attempts "
+        "WHERE status IN ('accepted','retry','exhausted') GROUP BY seed_id")}
+    from configuration import load_config
+    maximum = int((((load_config().get("pipeline") or {}).get("trace") or {})
+                   .get("max_attempts", 2)))
+    eligible = []
+    for seed_id in seeds - accepted:
+        remaining = valid_counts.get(seed_id, 0)
+        if not apply:
+            remaining -= candidate_counts.get(seed_id, 0)
+        if remaining < maximum:
+            eligible.append(seed_id)
     return {"attempts": len(attempts), "seeds": len(seeds),
-            "seed_ids": sorted(seeds), "tools": repaired_tools}
+            "seed_ids": sorted(seeds), "requeued": len(eligible),
+            "requeued_ids": sorted(eligible), "tools": repaired_tools}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -66,9 +87,10 @@ def main(argv: list[str] | None = None) -> int:
         result = repair(db, apply=args.yes)
     finally:
         db.close()
-    mode = "requeued" if args.yes else "would requeue"
-    print(f"{mode} {result['seeds']} seeds from {result['attempts']} confirmed "
-          "infrastructure-failed attempts")
+    mode = "reclassified" if args.yes else "would reclassify"
+    print(f"{mode} {result['attempts']} confirmed infrastructure-failed attempts "
+          f"across {result['seeds']} seeds; {result['requeued']} seeds "
+          f"{'are now' if args.yes else 'would become'} trace-eligible")
     for tool, ready in sorted(result["tools"].items()):
         print(f"  {'ready' if ready else 'BLOCKED'}: {tool}")
     if not args.yes:

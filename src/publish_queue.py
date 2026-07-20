@@ -10,7 +10,8 @@ import time
 import urllib.request
 from pathlib import Path
 
-from common import CONFIG, DATA, ROOT, RUNS, TRACES
+from common import (CONFIG, DATA, ROOT, RUNS, TRACES,
+                    deterministic_review_accepted)
 from configuration import load_config
 
 
@@ -22,7 +23,7 @@ def accepted_tasks() -> list[tuple[float, str]]:
         except (OSError, json.JSONDecodeError):
             continue
         if (review.get("accepted") is True
-                and (review.get("deterministic") or {}).get("accepted") is True
+                and deterministic_review_accepted(review)
                 and (review.get("judge") or {}).get("model_attested") is True
                 and (TRACES / "meta" / path.name).is_file()):
             ready.append((path.stat().st_mtime, path.stem))

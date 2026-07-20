@@ -35,6 +35,7 @@ class InfrastructureRepairTests(unittest.TestCase):
                                    return_value=(True, "go version")):
                 result = infrastructure_repair.repair(db, apply=True)
             self.assertEqual((result["attempts"], result["seeds"]), (1, 1))
+            self.assertEqual(result["requeued"], 1)
             status = db.execute("SELECT status FROM attempts").fetchone()[0]
             self.assertEqual(status, "infrastructure_error")
             db.close()
@@ -51,6 +52,7 @@ class InfrastructureRepairTests(unittest.TestCase):
                                    return_value=(False, "missing")):
                 result = infrastructure_repair.repair(db, apply=True)
             self.assertEqual(result["attempts"], 0)
+            self.assertEqual(result["requeued"], 0)
             self.assertEqual(db.execute("SELECT status FROM attempts").fetchone()[0],
                              "exhausted")
             db.close()

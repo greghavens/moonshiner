@@ -4,7 +4,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from common import RUNS, STORAGE_ROOT, TRACES, select_seeds
+from common import (RUNS, STORAGE_ROOT, TRACES, deterministic_review_accepted,
+                    select_seeds)
 
 
 def authored_ids() -> set[str]:
@@ -71,7 +72,7 @@ def accepted_ids() -> set[str]:
         except (OSError, json.JSONDecodeError):
             continue
         if (review.get("accepted") is True
-                and (review.get("deterministic") or {}).get("accepted") is True
+                and deterministic_review_accepted(review)
                 and (review.get("judge") or {}).get("model_attested") is True):
             accepted.add(path.stem)
     return accepted
