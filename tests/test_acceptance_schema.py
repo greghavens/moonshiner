@@ -158,6 +158,14 @@ class AcceptanceSchemaTests(unittest.TestCase):
             self.assertTrue(is_accepted(review))
             self.assertEqual(review["reason"], "correct")
 
+    def test_publisher_subprocess_uses_project_storage_context(self):
+        with mock.patch.object(publish_queue.subprocess, "run") as run:
+            publish_queue.run("src/build_dataset.py", "--quiet")
+        run.assert_called_once_with([
+            sys.executable,
+            str(publish_queue.ROOT / "src/build_dataset.py"), "--quiet"],
+            cwd=publish_queue.PROJECT_ROOT, check=True)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,7 +12,7 @@ import urllib.request
 from pathlib import Path
 
 from common import CONFIG, DATA, ROOT, RUNS, TRACES
-from configuration import load_config
+from configuration import PROJECT_ROOT, load_config
 from review_contract import is_accepted
 
 
@@ -103,7 +103,9 @@ def published_tasks(path: Path, max_rows: int | None = None) -> set[str]:
 
 
 def run(*args: str) -> None:
-    subprocess.run([sys.executable, *args], cwd=ROOT, check=True)
+    script, *rest = args
+    subprocess.run([sys.executable, str(ROOT / script), *rest],
+                   cwd=PROJECT_ROOT, check=True)
 
 
 def verify_remote(dataset: str, title: str) -> None:
