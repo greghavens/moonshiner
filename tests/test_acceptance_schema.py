@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import pathlib
 import sys
 import tempfile
@@ -179,6 +180,11 @@ class AcceptanceSchemaTests(unittest.TestCase):
             sys.executable,
             str(publish_queue.ROOT / "src/build_dataset.py"), "--quiet"],
             cwd=publish_queue.PROJECT_ROOT, check=True)
+
+    def test_local_append_never_substitutes_for_remote_upload(self):
+        source = inspect.getsource(publish_queue.main)
+        self.assertNotIn("already_present", source)
+        self.assertNotIn("[acknowledged existing]", source)
 
     def test_built_tasks_reads_formatted_trajectory_ids(self):
         with tempfile.TemporaryDirectory() as directory:

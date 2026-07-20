@@ -218,13 +218,7 @@ def main() -> int:
         export_args = ["src/export_hf_next_steps.py"]
         for task in tasks:
             export_args.extend(["--task", task])
-        already_present = published_tasks(output)
         run(*export_args)
-        if all(task in already_present for task in tasks):
-            known.update(tasks)
-            save_acknowledged(acknowledgements, known)
-            print(f"[acknowledged existing] {label}", flush=True)
-            continue
         title = (f"Add trajectory {tasks[0]}" if len(tasks) == 1 else
                  f"Add {len(tasks)} trajectories: {tasks[0]} through {tasks[-1]}")
         print(f"[publish] {label}: upload", flush=True)

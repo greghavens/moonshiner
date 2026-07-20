@@ -8,6 +8,13 @@ from validate_hf_export import validate
 from hf_sync import ensure_local_dataset
 
 
+def publication_files(directory: Path) -> list[Path]:
+    """Return only the dataset artifacts intentionally published to the Hub."""
+    return [path for path in (directory / "traces.jsonl", directory / "README.md",
+                              directory / "moonshiner-dataset-banner.png")
+            if path.is_file()]
+
+
 def _verify_remote_card(dataset: str, card: Path, auth_token: str) -> None:
     """Require the Hub's current README bytes to match the rendered card."""
     expected = card.read_bytes()
@@ -70,10 +77,10 @@ def main(argv=None)->int:
     if args.dir == DATA/"hf-publish":
         from export_hf_card import main as render_card
         render_card()
-    for path in args.dir.rglob("*"):
+    for path in publication_files(args.dir):
         if path.is_symlink():
-            raise ValueError(f"upload directory contains prohibited symlink: {path}")
-        if path.is_file() and path != traces:
+            raise ValueError(f"upload artifact is a prohibited symlink: {path}")
+        if path.suffix != ".png" and path != traces:
             hits=findings(path.read_text(errors="replace"),exact_secrets=_staged_secret_values(),forbidden_paths=(str(ROOT),str(Path.home())))
             if hits:raise ValueError(f"{path}: privacy findings {hits}")
     private=bool(CONFIG.get("publish",{}).get("private",True))
@@ -82,9 +89,12 @@ def main(argv=None)->int:
         data=json.dumps({"private":private}).encode(),headers={"Authorization":f"Bearer {auth_token}","Content-Type":"application/json"},method="PUT")
     with urllib.request.urlopen(request) as response:
         if response.status//100!=2:raise RuntimeError("dataset visibility update failed")
-    command=["hf","upload",args.dataset,str(args.dir),".","--repo-type","dataset"]
-    if args.commit_message: command.extend(["--commit-message",args.commit_message])
-    subprocess.run(command,check=True)
+    for path in publication_files(args.dir):
+        if path.name == "README.md":
+            continue
+        command=["hf","upload",args.dataset,str(path),path.name,"--repo-type","dataset"]
+        if args.commit_message: command.extend(["--commit-message",args.commit_message])
+        subprocess.run(command,check=True)
     # Folder uploads use a local resumable-transfer cache. A regenerated card
     # must never be skipped because that cache remembers an older upload, so
     # commit README.md explicitly and then compare the live Hub bytes.

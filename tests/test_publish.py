@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from publish import _verify_remote_card
+from publish import _verify_remote_card, publication_files
 
 
 class _Response:
@@ -21,6 +21,16 @@ class _Response:
 
 
 class RemoteCardVerification(unittest.TestCase):
+    def test_publication_files_exclude_local_backups(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("traces.jsonl", "README.md", "moonshiner-dataset-banner.png",
+                         "traces.jsonl.pre-1661"):
+                (root / name).write_bytes(b"fixture")
+            self.assertEqual({path.name for path in publication_files(root)},
+                             {"traces.jsonl", "README.md",
+                              "moonshiner-dataset-banner.png"})
+
     def test_accepts_exact_live_card(self):
         with tempfile.TemporaryDirectory() as directory:
             card = Path(directory) / "README.md"
