@@ -25,7 +25,7 @@ This file is retained for agents and older integrations. The CLI now owns orches
 5. For a larger user-authorized run, retain explicit ceilings:
 
    ```bash
-   moonshiner run --limit 20 --max-attempts 2 --max-calls 80 --yes
+   moonshiner run --limit 20 --max-attempts 3 --yes
    ```
 
 6. Inspect durable state instead of grepping human logs:

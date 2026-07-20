@@ -89,22 +89,6 @@ def record_model_call(db, run_id: str) -> int:
     return int(db.execute("SELECT model_calls FROM runs WHERE id=?", (run_id,)).fetchone()[0])
 
 
-def reserve_model_call(db, run_id: str, maximum: int) -> int | None:
-    """Atomically reserve one paid call without allowing workers past the ceiling."""
-    db.execute("BEGIN IMMEDIATE")
-    row = db.execute("SELECT model_calls FROM runs WHERE id=?", (run_id,)).fetchone()
-    if row is None:
-        db.rollback(); raise KeyError(run_id)
-    current = int(row[0])
-    if current >= maximum:
-        db.rollback(); return None
-    current += 1
-    db.execute("UPDATE runs SET model_calls=?, updated_at=? WHERE id=?",
-               (current, now(), run_id))
-    db.commit()
-    return current
-
-
 def claim_job(db, run_id: str, owner: str, lease_seconds: int = 120) -> dict | None:
     """Atomically lease one pending/retry job, recovering an expired claim once."""
     timestamp = now()

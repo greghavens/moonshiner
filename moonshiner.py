@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
@@ -418,7 +418,6 @@ def _start_default_queues() -> int:
              "moonshiner-trace-continuous.service"]).returncode == 0
         if not active:
             from common import ROOT, RUNS
-            kind = str(queues.get("trace_kind") or "all")
             log_dir = RUNS / "trace-continuous"
             log_dir.mkdir(parents=True, exist_ok=True)
             command = ["systemd-run", "--user", "--collect",
@@ -429,8 +428,7 @@ def _start_default_queues() -> int:
                        f"--property=StandardError=append:{log_dir / 'run.log'}",
                        f"--setenv=PATH={os.environ.get('PATH', '')}",
                        "--setenv=MOONSHINER_SUPERVISED=1", sys.executable,
-                       str(ROOT / "moonshiner.py"), "run", "--kind", kind,
-                       "--all", "--yes"]
+                       str(ROOT / "moonshiner.py"), "run", "--all", "--yes"]
             subprocess.run(command, check=True)
     print("Moonshiner queues are running: author (when enabled), trace/judge/retrace, "
           "format/privacy, append, HF upload, and remote verification.")
@@ -462,14 +460,11 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
     args = parser.parse_args(argv)
     db = connect(); rows = summaries(db, args.run_id)
     if inspect and not args.run_id and rows: args.run_id = rows[0]["id"]; rows = rows[:1]
-    if not rows:
-        print("no matching runs"); return 1
     if not inspect and not args.run_id and not args.all:
-        from behavior_seed_pipeline import status as behavior_status
-        from common import DATA, SEEDS_DIR
+        from common import BEHAVIOR_SEEDS_DIR, DATA, SEEDS_DIR
         from configuration import load_config
-        behavior = behavior_status()
         coding = len(list(SEEDS_DIR.glob("*/task.json")))
+        tool_use = len(list(BEHAVIOR_SEEDS_DIR.glob("*.json")))
         wave_counts = {}
         for path in SEEDS_DIR.glob("*/task.json"):
             try:
@@ -496,9 +491,7 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
             if name.startswith("moonshiner-"):
                 units.append(name.removesuffix(".service"))
         payload = {
-            "seeds": {"coding": coding, "behavioral": behavior["total"],
-                      "behavioral_authored": behavior["sol_authored"],
-                      "behavioral_remaining": behavior["remaining"],
+            "seeds": {"cataloged": coding + tool_use,
                       "waves": dict(sorted(wave_counts.items()))},
             "authoring": {"active_runs": author_runs},
             "tracing": {"workers": workers, "active_runs": active},
@@ -510,20 +503,32 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
         if args.json:
             print(json.dumps(payload, indent=2)); return 0
         print("Moonshiner status")
-        print(f"Seeds: {coding} coding; {behavior['sol_authored']}/{behavior['total']} "
-              f"behavioral authored ({behavior['remaining']} remaining)")
+        print(f"Seeds: {coding + tool_use} cataloged")
         if wave_counts:
             print("Waves: " + ", ".join(f"{wave}={count}" for wave, count in sorted(wave_counts.items())))
-        print(f"Authoring: {len(author_runs)} coding seed(s) in progress; behavioral authoring "
-              f"{'complete' if behavior['remaining'] == 0 else 'active'}")
+        print(f"Authoring: {len(author_runs)} seed job(s) in progress")
         print(f"Tracing: {workers} workers configured; {len(active)} active run(s)")
         for row in active:
+            jobs = job_rows(db, row["id"])
+            accepted = int(row.get("accepted") or 0)
+            rejected = int(row.get("failed") or 0)
+            decided = accepted + rejected
+            started = sum(1 for job in jobs if int(job.get("attempts") or 0) > 0)
+            retraced = sum(1 for job in jobs if int(job.get("attempts") or 0) > 1)
+            acceptance_rate = 100 * accepted / decided if decided else 0.0
+            rejection_rate = 100 * rejected / decided if decided else 0.0
+            retrace_rate = 100 * retraced / started if started else 0.0
             print(f"  {row['id']}: accepted={row.get('accepted') or 0}, "
                   f"failed={row.get('failed') or 0}, pending={row.get('pending') or 0}")
+            print(f"    rates: accepted={acceptance_rate:.1f}%, "
+                  f"rejected/exhausted={rejection_rate:.1f}%, "
+                  f"retraced={retrace_rate:.1f}%")
         print(f"Publishing: {published} trajectories acknowledged; batch size "
               f"{payload['publishing']['batch_size']}; {payload['publishing']['dataset'] or 'disabled'}")
         print("Services: " + (", ".join(sorted(units)) if units else "none"))
         return 0
+    if not rows:
+        print("no matching runs"); return 1
     payload = rows
     if inspect:
         payload = [{**rows[0], "jobs_detail": job_rows(db, args.run_id)}]
@@ -591,6 +596,12 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] in ("-h", "--help", "help"):
         print(_help())
         return 0
+    # Corpus discovery and release metadata are read-only package operations;
+    # they do not require creating or confirming a project directory.
+    if argv and argv[0] == "seeds" and len(argv) > 1 and argv[1] in {
+            "status", "verify", "list", "catalog", "manifest"}:
+        from corpus import main as corpus_main
+        return corpus_main(argv[1:])
 
     # Every operational invocation establishes the current directory as an
     # explicit, independent project boundary before setup or output begins.

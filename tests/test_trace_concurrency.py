@@ -7,12 +7,14 @@ import tempfile
 import threading
 import unittest
 import sqlite3
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from run_state import (abandon_claim, claim_job, connect, create_run,
-                       reserve_model_call, set_job)  # noqa: E402
+                       set_job)  # noqa: E402
+import trace_pipeline  # noqa: E402
 
 
 class TraceConcurrency(unittest.TestCase):
@@ -45,22 +47,18 @@ class TraceConcurrency(unittest.TestCase):
         self.assertEqual(len(claimed), 20)
         self.assertEqual(len(set(claimed)), 20)
 
-    def test_model_call_ceiling_is_atomic(self):
-        reservations = []
-        lock = threading.Lock()
-
-        def worker():
-            db = connect(self.path)
-            value = reserve_model_call(db, self.run_id, 7)
-            with lock: reservations.append(value)
-            db.close()
-
-        threads = [threading.Thread(target=worker) for _ in range(30)]
-        for thread in threads: thread.start()
-        for thread in threads: thread.join()
-        granted = [value for value in reservations if value is not None]
-        self.assertEqual(sorted(granted), list(range(1, 8)))
-        self.assertEqual(len(granted), 7)
+    def test_queue_dispatches_one_seed_per_process(self):
+        args = type("Args", (), {"max_attempts": 3})()
+        completed = mock.Mock(returncode=0)
+        seeds = [{"id": "seed-a"}, {"id": "seed-b"}, {"id": "seed-c"}]
+        with mock.patch.object(trace_pipeline.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(trace_pipeline._run_individual_trace_jobs(seeds, args, 2), 0)
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(len(commands), 3)
+        self.assertEqual({command[command.index("--only") + 1] for command in commands},
+                         {"seed-a", "seed-b", "seed-c"})
+        self.assertTrue(all(command.count("--only") == 1 for command in commands))
+        self.assertTrue(all("--max-calls" not in command for command in commands))
 
     def test_expired_claim_is_recovered_once(self):
         db = connect(self.path)

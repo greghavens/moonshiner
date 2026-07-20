@@ -32,7 +32,7 @@ Queues resume their ledgers rather than duplicating completed work. Advanced `ru
 For a deliberate batch:
 
 ```bash
-moonshiner run --limit 20 --max-attempts 2 --max-calls 80 --yes
+moonshiner run --limit 20 --max-attempts 3 --yes
 moonshiner status
 moonshiner inspect <run-id>
 moonshiner dataset build
@@ -68,7 +68,7 @@ moonshiner config set pipeline.trace.workers 1
 Scaling down drains excess workers between seeds. Crashed leases are recovered,
 and the shared model-call ceiling is reserved transactionally.
 
-`--all` is explicit and multi-seed metered work requires `--yes`. `--max-calls` is a hard combined author/judge call ceiling. Judge-format failures re-review the existing trace; they do not trigger another author call.
+`--all` is explicit and multi-seed metered work requires `--yes`. Each seed is an independent trace job with its own attempt limit. Judge-format failures re-review the existing trace; they do not trigger another author call.
 
 ## Configure models
 

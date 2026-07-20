@@ -10,13 +10,14 @@ import threading
 import time
 import uuid
 import fcntl
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 
-from common import CONFIG, load_seeds, quarantined_tasks, select_seeds
+from common import CONFIG, select_seeds
 from generate_traces import trace_task
 from run_state import (connect, create_run, finish_attempt, set_job,
                        set_run_status, start_attempt, run_row, job_rows,
-                       abandon_claim, claim_job, renew_lease, reserve_model_call)
+                       abandon_claim, claim_job, renew_lease, record_model_call)
 from run_state import latest_running_run
 from runtimes import get_judge, get_teacher
 from screen_traces import feedback_from_review, screen
@@ -53,33 +54,71 @@ def _selected(args) -> list[dict]:
             accepted.add(path.stem)
     categories = set(getattr(args, "category", None) or [])
     tags = set(getattr(args, "tag", None) or [])
-    selected_kind=getattr(args, "kind", "coding")
-    if only and any(value.startswith("behavior-") for value in only):
-        selected_kind="all"
+    # Partition only when the user explicitly requests it. The continuous
+    # project queue follows its configured selection, whose default is all.
+    selected_kind = getattr(args, "kind", "all")
+    if os.environ.get("MOONSHINER_SUPERVISED") == "1":
+        selected_kind = str((((CONFIG.get("pipeline") or {}).get("queues") or {})
+                             .get("trace_kind") or "all"))
     seeds = [s for s in select_seeds(kind=selected_kind, only=only,
                                      categories=categories, tags=tags,
                                      name=getattr(args, "name", None),
-                                     require_authored=True)
-             if s["id"] not in quarantined_tasks() and s["id"] not in imported
-             and s["id"] not in accepted]
-    intake_only = bool((CONFIG.get("pipeline", {}).get("trace", {})
-                        .get("accepted_seed_intake_only")))
-    if intake_only and args.all and not only and selected_kind in {"coding", "all"}:
-        marker_value = (CONFIG.get("source") or {}).get("accepted_seed_markers")
-        if not marker_value:
-            raise ValueError("accepted-only tracing requires source.accepted_seed_markers")
-        from pathlib import Path
-        from seed_intake import accepted_seed_ids
-        marker_dir = Path(marker_value).expanduser()
-        if not marker_dir.is_absolute():
-            marker_dir = (__import__('common').ROOT / marker_dir).resolve()
-        allowed = accepted_seed_ids(marker_dir)
-        seeds = [seed for seed in seeds if seed["id"] in allowed]
+                                     require_authored=False)
+             if s["id"] not in imported and s["id"] not in accepted]
+    # Catalog membership is the only seed intake gate. Quality decisions belong
+    # to the trace judge, and lifetime exhaustion prevents paid retry loops.
+    ledger = connect()
+    attempts = {row["seed_id"]: int(row["attempts"])
+                for row in ledger.execute("""SELECT j.seed_id, COUNT(a.id) attempts
+                  FROM jobs j JOIN runs r ON r.id=j.run_id
+                  LEFT JOIN attempts a ON a.run_id=j.run_id AND a.seed_id=j.seed_id
+                  WHERE r.kind='trace' GROUP BY j.seed_id""")}
+    ledger.close()
+    maximum = int(getattr(args, "max_attempts", 3))
+    seeds = [seed for seed in seeds if attempts.get(seed["id"], 0) < maximum]
     if args.limit:
         seeds = seeds[:args.limit]
     elif not args.all and not only:
         seeds = seeds[:1]  # safe default: a smoke-sized run
     return seeds
+
+
+def _run_individual_trace_jobs(seeds: list[dict], args, workers: int) -> int:
+    """Dispatch independent one-seed trace processes; never create a batch run."""
+    root = __import__('common').ROOT
+    environment = dict(os.environ, MOONSHINER_SINGLE_TRACE="1")
+
+    def run_one(seed: dict) -> tuple[str, int]:
+        command = [sys.executable, str(root / "moonshiner.py"), "run",
+                   "--only", seed["id"], "--max-attempts", str(args.max_attempts),
+                   "--yes"]
+        return seed["id"], subprocess.run(command, cwd=root, env=environment).returncode
+
+    failures = 0
+    known = {seed["id"] for seed in seeds}
+    supervised = os.environ.get("MOONSHINER_SUPERVISED") == "1"
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="trace-job") as pool:
+        futures = {pool.submit(run_one, seed) for seed in seeds}
+        while futures or supervised:
+            if supervised:
+                for seed in _selected(args):
+                    if seed["id"] not in known:
+                        known.add(seed["id"])
+                        futures.add(pool.submit(run_one, seed))
+            if not futures:
+                time.sleep(5)
+                continue
+            done, futures = wait(futures, timeout=5, return_when=FIRST_COMPLETED)
+            for future in done:
+                seed_id, code = future.result()
+                if code:
+                    failures += 1
+                    print(f"[trace complete: rejected] {seed_id}", flush=True)
+                else:
+                    print(f"[trace complete: accepted] {seed_id}", flush=True)
+    print(f"trace queue pass complete: {len(seeds) - failures} accepted, "
+          f"{failures} rejected, {len(seeds)} individual trace jobs", flush=True)
+    return 1 if failures else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -93,7 +132,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="Explicitly authorize every eligible seed.")
     choice.add_argument("--only", help="Comma-separated seed ids.")
     parser.add_argument("--kind", choices=["coding", "behavior", "all"],
-                        default="coding", help="Seed recipe kind (default: coding).")
+                        default="all", help="Optional seed partition (default: all seeds).")
     parser.add_argument("--category", action="append",
                         help="Require this catalog category (repeatable).")
     parser.add_argument("--tag", action="append",
@@ -103,8 +142,6 @@ def main(argv: list[str] | None = None) -> int:
                         help="Maximum seeds (default 1 unless --all/--only).")
     parser.add_argument("--max-attempts", type=int,
                         default=int(defaults.get("max_attempts", 2)))
-    parser.add_argument("--max-calls", type=int, default=0,
-                        help="Maximum combined teacher+judge calls (0 derives from plan).")
     parser.add_argument("--workers", type=int, default=0,
                         help="Trace workers (0 follows live project configuration).")
     parser.add_argument("--yes", action="store_true",
@@ -114,11 +151,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="Launch the bounded run in a durable background scope.")
     parser.add_argument("--resume", help="Resume pending jobs in an interrupted run.")
     args = parser.parse_args(argv)
-    if args.limit < 0 or args.max_attempts < 1 or args.max_calls < 0 or args.workers < 0:
+    if args.limit < 0 or args.max_attempts < 1 or args.workers < 0:
         parser.error("limits must be non-negative and --max-attempts at least 1")
 
     coordinator_lock = None
-    if not args.detach:
+    if not args.detach and os.environ.get("MOONSHINER_SINGLE_TRACE") != "1":
         from common import RUNS
         RUNS.mkdir(parents=True, exist_ok=True)
         coordinator_lock = (RUNS / "trace-coordinator.lock").open("a+")
@@ -139,27 +176,16 @@ def main(argv: list[str] | None = None) -> int:
         ids={j["seed_id"] for j in job_rows(db,args.resume)
              if j["status"] in {"pending","running","retry"}}
         prior_limits=json.loads(prior["limits_json"])
-        seeds=select_seeds(kind="all", only=ids, require_authored=True); args.max_attempts=prior_limits["max_attempts"]
-        args.max_calls=prior_limits["max_calls"]
+        seeds=select_seeds(kind="all", only=ids, require_authored=False); args.max_attempts=prior_limits["max_attempts"]
     else:
         seeds = _selected(args)
     if not seeds:
-        if getattr(args, "kind", "coding") == "behavior":
-            from common import load_behavior_seeds
-            total=len(load_behavior_seeds())
-            authored=len(load_behavior_seeds(authored_only=True))
-            print(f"no authored behavior seeds matched (authored {authored}/{total}); "
-                  "finish `moonshiner behavior-seed author --all --yes` first",
-                  file=sys.stderr)
-        else:
-            print("no seeds matched", file=sys.stderr)
+        print("no eligible catalog seeds matched", file=sys.stderr)
         return 2
-    planned_calls = len(seeds) * args.max_attempts * 2
-    max_calls = args.max_calls or planned_calls
     teacher = get_teacher()
     judge = get_judge()
     print(f"trace plan: {len(seeds)} seed(s), up to {args.max_attempts} attempt(s) "
-          f"each, hard ceiling {max_calls} model call(s)")
+          f"each; no run-wide model-call ceiling")
     print(f"  author: {teacher.name}/{teacher.role['model']} "
           f"({teacher.role.get('reasoning', 'default')})")
     print(f"  judge:  {judge.name}/{judge.role['model']} "
@@ -174,6 +200,9 @@ def main(argv: list[str] | None = None) -> int:
     if len(seeds) > 1 and not args.yes:
         print("refusing a multi-seed metered run without --yes", file=sys.stderr)
         return 2
+    if len(seeds) > 1 and os.environ.get("MOONSHINER_SINGLE_TRACE") != "1":
+        workers = args.workers or int(defaults.get("workers", 1))
+        return _run_individual_trace_jobs(seeds, args, workers)
     if args.detach:
         command = [str(__import__('common').ROOT / "scripts" / "batch.sh"),
                    "trace", sys.executable, str(__import__('common').ROOT / "moonshiner.py"),
@@ -194,11 +223,21 @@ def main(argv: list[str] | None = None) -> int:
         teacher.preflight(require_auth=True)
     judge.preflight(require_auth=True)
     ensure_publish_queue()
-    limits = {"seeds": len(seeds), "max_attempts": args.max_attempts,
-              "max_calls": max_calls}
+    limits = {"seeds": len(seeds), "max_attempts": args.max_attempts}
     roles = {"author": {"runtime": teacher.name, **teacher.role},
              "judge": {"runtime": judge.name, **judge.role}}
     run_id = args.resume or create_run(db, "trace", roles, limits, [s["id"] for s in seeds])
+    if not args.resume:
+        # Carry each seed's lifetime attempt count into its new one-seed ledger
+        # record. A process or machine restart must never grant more attempts.
+        for seed in seeds:
+            prior = db.execute("""SELECT COUNT(a.id) FROM attempts a
+                JOIN runs r ON r.id=a.run_id
+                WHERE r.kind='trace' AND a.seed_id=? AND a.run_id<>?""",
+                (seed["id"], run_id)).fetchone()[0]
+            db.execute("UPDATE jobs SET attempts=? WHERE run_id=? AND seed_id=?",
+                       (int(prior), run_id, seed["id"]))
+        db.commit()
     if args.resume: set_run_status(db,run_id,"running")
     total_jobs = len(job_rows(db, run_id))
     print(f"run: {run_id}", flush=True)
@@ -225,10 +264,7 @@ def main(argv: list[str] | None = None) -> int:
             set_job(worker_db, run_id, seed["id"], "exhausted", claim["attempts"],
                     claim.get("last_error") or "attempt ceiling reached")
             return
-        if reserve_model_call(worker_db, run_id, max_calls) is None:
-            set_job(worker_db, run_id, seed["id"], "exhausted", claim["attempts"],
-                    "model-call ceiling reached")
-            return
+        record_model_call(worker_db, run_id)
         start_attempt(worker_db, run_id, seed["id"], number)
         feedback = claim.get("last_error")
         print(f"[{seed['id']}] attempt {number}/{args.max_attempts}: author", flush=True)
@@ -259,23 +295,11 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 record = trace_task(seed, worker_teacher, force=True, feedback=feedback)
         usage = (record.get("teacher") or {}).get("usage") or {}
-        if record.get("passed") is not True:
-            error = record.get("deferral_reason") or record.get("verify_output") \
-                or "candidate failed local verification"
-            status = "retry" if number < args.max_attempts else "exhausted"
-            artifact = _archive_attempt(run_id, seed["id"], number)
-            finish_attempt(worker_db, run_id, seed["id"], number, status, usage,
-                           error=str(error)[:1000], artifact_path=artifact)
-            print(f"[{status}] {seed['id']}: {str(error)[:500]}", flush=True)
-            return
+        # Candidate checks are evidence for the trace judge, never a separate
+        # rejection gate. Every completed candidate proceeds to judgment.
         review = None
         while True:
-            if reserve_model_call(worker_db, run_id, max_calls) is None:
-                artifact = _archive_attempt(run_id, seed["id"], number)
-                finish_attempt(worker_db, run_id, seed["id"], number, "exhausted", usage,
-                               review, "model-call ceiling reached before judgment",
-                               artifact_path=artifact)
-                return
+            record_model_call(worker_db, run_id)
             print(f"[{seed['id']}] attempt {number}/{args.max_attempts}: judge", flush=True)
             with lease_heartbeat():
                 if seed.get("kind") == "tool_behavior":
@@ -355,7 +379,7 @@ def main(argv: list[str] | None = None) -> int:
         set_run_status(db, run_id, "failed", f"{type(error).__name__}: {error}")
         raise
     calls = int((run_row(db, run_id) or {}).get("model_calls") or 0)
-    print(f"trace run complete: {accepted}/{total_jobs} accepted; {calls}/{max_calls} calls")
+    print(f"trace run complete: {accepted}/{total_jobs} accepted; {calls} model calls")
     print(f"inspect: moonshiner inspect {run_id}")
     return 0 if accepted == total_jobs else 1
 

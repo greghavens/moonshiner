@@ -81,20 +81,37 @@ class SafeSelection(unittest.TestCase):
         values.update(overrides)
         return type("Args", (), values)()
 
-    @mock.patch.object(trace_pipeline, "quarantined_tasks", return_value=set())
     @mock.patch.object(trace_pipeline, "select_seeds")
     @mock.patch("import_existing.imported_task_ids", return_value=set())
-    def test_default_selects_one(self, _imported, load, _quarantine):
+    def test_default_selects_one(self, _imported, load):
         load.return_value = [{"id": "a"}, {"id": "b"}]
         self.assertEqual([s["id"] for s in trace_pipeline._selected(self._args())], ["a"])
+        self.assertFalse(load.call_args.kwargs["require_authored"])
 
-    @mock.patch.object(trace_pipeline, "quarantined_tasks", return_value=set())
     @mock.patch.object(trace_pipeline, "select_seeds")
     @mock.patch("import_existing.imported_task_ids", return_value=set())
-    def test_all_is_explicit(self, _imported, load, _quarantine):
+    def test_all_is_explicit(self, _imported, load):
         load.return_value = [{"id": "a"}, {"id": "b"}]
         self.assertEqual(
             len(trace_pipeline._selected(self._args(all=True, kind="behavior"))), 2)
+        self.assertEqual(load.call_args.kwargs["kind"], "behavior")
+
+    @mock.patch.object(trace_pipeline, "select_seeds")
+    @mock.patch("import_existing.imported_task_ids", return_value=set())
+    def test_kind_partitions_only_when_user_requests_it(self, _imported, load):
+        load.return_value = [{"id": "coding-seed"}, {"id": "tool-use-seed"}]
+        selected = trace_pipeline._selected(self._args(all=True, kind="behavior"))
+        self.assertEqual([seed["id"] for seed in selected],
+                         ["coding-seed", "tool-use-seed"])
+        self.assertEqual(load.call_args.kwargs["kind"], "behavior")
+
+    @mock.patch.object(trace_pipeline, "select_seeds")
+    @mock.patch("import_existing.imported_task_ids", return_value=set())
+    def test_default_queue_selects_all_seed_partitions(self, _imported, load):
+        load.return_value = [{"id": "a"}, {"id": "b"}]
+        trace_pipeline._selected(self._args(all=True, kind="all"))
+        self.assertEqual(load.call_args.kwargs["kind"], "all")
+        self.assertFalse(load.call_args.kwargs["require_authored"])
 
 
 if __name__ == "__main__":

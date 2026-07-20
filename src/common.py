@@ -310,14 +310,15 @@ def load_behavior_seeds(only: set[str] | None = None,
     return seeds
 
 
-def select_seeds(*, kind: str = "coding", only: set[str] | None = None,
+def select_seeds(*, kind: str = "all", only: set[str] | None = None,
                  categories: set[str] | None = None,
                  tags: set[str] | None = None, name: str | None = None,
-                 require_authored: bool = False) -> list[dict]:
+                 require_authored: bool = False,
+                 include_holdout: bool = True) -> list[dict]:
     """Select catalog recipes consistently for tracing and user inspection."""
     selected = []
     if kind in {"coding", "all"}:
-        selected.extend(load_seeds(only=only))
+        selected.extend(load_seeds(only=only, include_holdout=include_holdout))
     if kind in {"behavior", "all"}:
         selected.extend(load_behavior_seeds(only=only, authored_only=require_authored))
     needle = (name or "").casefold()

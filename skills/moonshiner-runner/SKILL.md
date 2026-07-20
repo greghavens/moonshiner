@@ -22,7 +22,7 @@ Never add `--all`, `--yes`, raise a limit, worker count, or attempt ceiling unle
 Use `moonshiner run --dry-run` for a smoke plan. For an authorized batch:
 
 ```bash
-moonshiner run --limit 20 --max-attempts 2 --max-calls 80 --yes
+moonshiner run --limit 20 --max-attempts 3 --yes
 ```
 
 Add `--detach` for a long run that must survive the current agent or terminal session.

@@ -10,6 +10,7 @@ sys.path.insert(0, str(_ROOT))
 
 import moonshiner as m  # noqa: E402
 import configuration  # noqa: E402
+import run_state  # noqa: E402
 
 
 class FrontDoor(unittest.TestCase):
@@ -41,6 +42,20 @@ class FrontDoor(unittest.TestCase):
             m._config(["set", "pipeline.trace.workers", "0"])
         with self.assertRaises(SystemExit):
             m._config(["set", "publish.batch_size", "1001"])
+
+    def test_status_reports_project_even_before_first_ledger_run(self):
+        db = mock.Mock()
+        service_result = mock.Mock(stdout="", returncode=0)
+        seed_status = {"total": 0, "sol_authored": 0, "remaining": 0,
+                       "model": None}
+        with mock.patch.object(run_state, "connect", return_value=db), \
+             mock.patch.object(run_state, "summaries", return_value=[]), \
+             mock.patch("behavior_seed_pipeline.status", return_value=seed_status), \
+             mock.patch.object(m.subprocess, "run", return_value=service_result), \
+             mock.patch("builtins.print") as output:
+            self.assertEqual(m._status([]), 0)
+        self.assertTrue(any(call.args == ("Moonshiner status",)
+                            for call in output.call_args_list))
 
 
 class Registry(unittest.TestCase):
