@@ -16,15 +16,17 @@ With the installer:
 curl -fsSL https://raw.githubusercontent.com/greghavens/moonshiner/main/install.sh | bash
 ```
 
-## Start
+## Quick start
 
-Open the directory where you want Moonshiner to keep this project's configuration and data, then run:
+After installation, run:
 
 ```bash
 moonshiner
 ```
 
-On the first run, Moonshiner confirms the current directory and asks for anything it needs:
+That is the complete quick start. On the first run, Moonshiner confirms where to keep the project's configuration and data, asks for your preferences and anything else it needs, saves the configuration, and starts the pipeline.
+
+Moonshiner asks:
 
 - which harness and model should create traces;
 - which harness and model should judge traces;
