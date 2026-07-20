@@ -80,9 +80,16 @@ class PiRuntime(Runtime):
     name = "pi"
     trace_formats = ("pi-coding-agent-json-v3",)
 
+    def _cli_path(self) -> Path:
+        configured = Path(self.runtime_config.get("cli", "pi"))
+        if configured.is_absolute():
+            return configured
+        native = shutil.which(configured.name)
+        return Path(native) if native else configured
+
     # -- lifecycle ---------------------------------------------------------- #
     def preflight(self, *, require_auth: bool = False) -> None:
-        cli = ROOT / self.runtime_config.get("cli", "node_modules/.bin/pi")
+        cli = self._cli_path()
         if not cli.exists():
             raise SystemExit(f"pi CLI not found: {cli} (run npm install)")
         if shutil.which("bwrap") is None:
@@ -151,8 +158,6 @@ class PiRuntime(Runtime):
         cmd += ["--tmpfs", "/tmp", "--dev-bind", "/dev", "/dev", "--proc", "/proc",
                 "--bind", str(workspace), str(workspace),
                 "--bind", str(runtime_dir), str(runtime_dir),
-                "--ro-bind", str(ROOT / "node_modules"),
-                str(runtime_dir / "node_modules"),
                 "--setenv", "HOME", str(runtime_dir / "home"),
                 "--setenv", "USER", "moonshiner-agent",
                 "--setenv", "LOGNAME", "moonshiner-agent",
@@ -171,7 +176,7 @@ class PiRuntime(Runtime):
         # stdin and is folded into the initial message. --api-key pins the
         # runtime credential to the proxy's dummy token as a second path
         # alongside the models.json apiKey.
-        cli = str(runtime_dir / "node_modules" / ".bin" / "pi")
+        cli = str(self._cli_path())
         cmd = [cli, "--print", "--mode", "json",
                "--provider", self._provider(),
                "--model", self.role["model"],
