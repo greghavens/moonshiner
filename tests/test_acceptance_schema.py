@@ -181,11 +181,11 @@ class AcceptanceSchemaTests(unittest.TestCase):
 
     def test_builder_uses_pi_recorded_events_filename(self):
         with tempfile.TemporaryDirectory() as directory:
-            raw = pathlib.Path(directory)
-            with mock.patch.object(build_dataset, "RAW", raw):
+            storage = pathlib.Path(directory)
+            with mock.patch.object(build_dataset, "TRACES", storage / "traces"):
                 path = build_dataset.raw_trace_path(
                     "paid-seed", {"raw_path": "traces/raw/paid-seed.events.jsonl"})
-            self.assertEqual(path, raw / "paid-seed.events.jsonl")
+            self.assertEqual(path, storage / "traces/raw/paid-seed.events.jsonl")
 
 
 if __name__ == "__main__":

@@ -80,9 +80,11 @@ def est_tokens(message: dict, chars_per_token: float = 3.3) -> int:
 
 
 def raw_trace_path(task_id: str, info: dict) -> Path:
-    """Resolve the runtime's recorded canonical artifact inside trace storage."""
-    recorded = Path(str(info.get("raw_path") or f"raw/{task_id}.jsonl")).name
-    return RAW / recorded
+    """Use the exact raw artifact path recorded by the trace runtime."""
+    recorded = info.get("raw_path")
+    if recorded:
+        return TRACES.parent / str(recorded)
+    return RAW / f"{task_id}.jsonl"
 
 
 def training_tags(seed: dict, turns: list[dict], info: dict) -> list[str]:
