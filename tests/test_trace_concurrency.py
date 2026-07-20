@@ -51,7 +51,9 @@ class TraceConcurrency(unittest.TestCase):
         args = type("Args", (), {"max_attempts": 3})()
         completed = mock.Mock(returncode=0)
         seeds = [{"id": "seed-a"}, {"id": "seed-b"}, {"id": "seed-c"}]
-        with mock.patch.object(trace_pipeline.subprocess, "run", return_value=completed) as run:
+        with mock.patch.object(trace_pipeline, "_moonshiner_executable",
+                               return_value="/installed/bin/moonshiner"), \
+             mock.patch.object(trace_pipeline.subprocess, "run", return_value=completed) as run:
             self.assertEqual(trace_pipeline._run_individual_trace_jobs(seeds, args, 2), 0)
         commands = [call.args[0] for call in run.call_args_list]
         self.assertEqual(len(commands), 3)
@@ -59,6 +61,8 @@ class TraceConcurrency(unittest.TestCase):
                          {"seed-a", "seed-b", "seed-c"})
         self.assertTrue(all(command.count("--only") == 1 for command in commands))
         self.assertTrue(all("--max-calls" not in command for command in commands))
+        self.assertTrue(all(command[0] == "/installed/bin/moonshiner"
+                            for command in commands))
 
     def test_expired_claim_is_recovered_once(self):
         db = connect(self.path)
