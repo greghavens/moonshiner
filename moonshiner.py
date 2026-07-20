@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -470,6 +471,21 @@ def _storage(argv: list[str]) -> int:
     return 2
 
 
+def _service(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="moonshiner service")
+    sub = parser.add_subparsers(dest="action", required=True)
+    stop = sub.add_parser("stop", help="Stop one named Moonshiner service.")
+    stop.add_argument("name")
+    args = parser.parse_args(argv)
+    name = args.name.removesuffix(".service")
+    if not re.fullmatch(r"moonshiner-[A-Za-z0-9_.@-]+", name):
+        parser.error("service name must identify one moonshiner-* service")
+    result = subprocess.run(["systemctl", "--user", "stop", f"{name}.service"])
+    if result.returncode == 0:
+        print(f"stopped {name}")
+    return result.returncode
+
+
 def _status(argv: list[str], *, inspect: bool = False) -> int:
     from run_state import connect, job_rows, summaries
     parser = argparse.ArgumentParser(prog=f"moonshiner {'inspect' if inspect else 'status'}")
@@ -589,6 +605,8 @@ CREATE TRAINING DATA
   moonshiner trace import --hf OWNER/DATASET
                               Resume from a Hugging Face dataset
   moonshiner status           Show current and previous runs
+  moonshiner service stop NAME
+                              Stop one named Moonshiner service
   moonshiner dataset build    Build a dataset from accepted traces
   moonshiner dataset analyze --source PATH
                               Inspect token, category, tag, and behavior mix
@@ -659,6 +677,8 @@ def main(argv: list[str] | None = None) -> int:
         return trace_main(rest)
     if command == "status":
         return _status(rest)
+    if command == "service":
+        return _service(rest)
     if command == "inspect":
         return _status(rest, inspect=True)
     if command == "auth":

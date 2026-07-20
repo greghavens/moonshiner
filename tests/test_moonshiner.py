@@ -66,6 +66,17 @@ class FrontDoor(unittest.TestCase):
             self.assertEqual(m._dispatch(phase, []), 0)
             self.assertEqual(sys.argv, ["moonshiner", "dataset", "build"])
 
+    def test_service_stop_targets_exact_moonshiner_unit(self):
+        completed = mock.Mock(returncode=0)
+        with mock.patch.object(m.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(m._service(["stop", "moonshiner-trace-example"]), 0)
+        run.assert_called_once_with(
+            ["systemctl", "--user", "stop", "moonshiner-trace-example.service"])
+
+    def test_service_stop_rejects_non_moonshiner_unit(self):
+        with self.assertRaises(SystemExit):
+            m._service(["stop", "ssh"])
+
 
 class Registry(unittest.TestCase):
     def test_keys_are_unique_and_indexed(self):
