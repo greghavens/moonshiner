@@ -422,13 +422,16 @@ def _start_default_queues() -> int:
     queues = ((CONFIG.get("pipeline") or {}).get("queues") or {})
     if queues.get("seed_authoring"):
         running = subprocess.run(
-            ["pgrep", "-f", "[m]oonshiner.py behavior-seed author --all"],
+            ["pgrep", "-f", "[m]oonshiner.* seed queue"],
             stdout=subprocess.DEVNULL).returncode == 0
         if not running:
-            from behavior_seed_pipeline import main as behavior_seed_main
-            result = behavior_seed_main(["--all", "--yes", "--detach"])
-            if result:
-                return result
+            from configuration import PROJECT_ROOT
+            unit = "moonshiner-seed-queue-" + time.strftime("%Y%m%d-%H%M%S")
+            executable = Path(sys.executable).parent / "moonshiner"
+            subprocess.run(["systemd-run", "--user", "--collect", f"--unit={unit}",
+                            f"--property=WorkingDirectory={PROJECT_ROOT}",
+                            f"--setenv=PATH={os.environ.get('PATH', '')}",
+                            str(executable), "seed", "queue", "--yes"], check=True)
     if queues.get("tracing", True):
         active = subprocess.run(
             ["pgrep", "-f", "[m]oonshiner.* run --all --yes"],
@@ -518,18 +521,10 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
     db = connect(); rows = summaries(db, args.run_id)
     if inspect and not args.run_id and rows: args.run_id = rows[0]["id"]; rows = rows[:1]
     if not inspect and not args.run_id and not args.all:
-        from common import BEHAVIOR_SEEDS_DIR, DATA, SEEDS_DIR
+        from common import DATA
         from configuration import load_config
-        coding = len(list(SEEDS_DIR.glob("*/task.json")))
-        tool_use = len(list(BEHAVIOR_SEEDS_DIR.glob("*.json")))
-        wave_counts = {}
-        for path in SEEDS_DIR.glob("*/task.json"):
-            try:
-                wave = (json.loads(path.read_text()).get("catalog") or {}).get("wave")
-                if wave is not None:
-                    wave_counts[int(wave)] = wave_counts.get(int(wave), 0) + 1
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                continue
+        from seed_inventory import authored_ids, planned_ids, trace_state
+        authored = authored_ids(); planned = planned_ids()
         active = [row for row in rows if row["status"] == "running" and row["kind"] == "trace"]
         author_runs = [row for row in rows if row["status"] == "running" and row["kind"] == "seed"]
         ack = DATA / "hf-sync" / "published-trajectories.json"
@@ -539,6 +534,8 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
             except (OSError, json.JSONDecodeError): pass
         config = load_config()
         workers = int(((config.get("pipeline") or {}).get("trace") or {}).get("workers", 1))
+        max_attempts = int(((config.get("pipeline") or {}).get("trace") or {}).get("max_attempts", 2))
+        traced = trace_state(max_attempts)
         units = []
         service_result = subprocess.run(
             ["systemctl", "--user", "list-units", "--type=service", "--state=running",
@@ -548,10 +545,14 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
             if name.startswith("moonshiner-"):
                 units.append(name.removesuffix(".service"))
         payload = {
-            "seeds": {"cataloged": coding + tool_use,
-                      "waves": dict(sorted(wave_counts.items()))},
+            "seeds": {"planned": len(planned), "authored": len(authored),
+                      "waiting": len(planned - authored)},
             "authoring": {"active_runs": author_runs},
-            "tracing": {"workers": workers, "active_runs": active},
+            "tracing": {"workers": workers, "target": len(traced["target"]),
+                        "accepted": len(traced["accepted"]),
+                        "active": len(traced["active"]),
+                        "exhausted": len(traced["exhausted"]),
+                        "waiting": len(traced["waiting"]), "active_runs": active},
             "publishing": {"dataset": (config.get("publish") or {}).get("hf_dataset"),
                            "batch_size": int((config.get("publish") or {}).get("batch_size", 1)),
                            "published_trajectories": published},
@@ -560,11 +561,11 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
         if args.json:
             print(json.dumps(payload, indent=2)); return 0
         print("Moonshiner status")
-        print(f"Seeds: {coding + tool_use} cataloged")
-        if wave_counts:
-            print("Waves: " + ", ".join(f"{wave}={count}" for wave, count in sorted(wave_counts.items())))
+        print(f"Seeds: {len(authored)}/{len(planned)} authored; {len(planned-authored)} waiting")
         print(f"Authoring: {len(author_runs)} seed job(s) in progress")
-        print(f"Tracing: {workers} workers configured; {len(active)} active run(s)")
+        print(f"Traces: {len(traced['accepted'])}/{len(traced['target'])} accepted; "
+              f"{len(traced['active'])} active; {len(traced['waiting'])} waiting; "
+              f"{len(traced['exhausted'])} exhausted; {workers} workers configured")
         for row in active:
             jobs = job_rows(db, row["id"])
             accepted = int(row.get("accepted") or 0)
@@ -639,8 +640,7 @@ CREATE TRAINING DATA
 AUTHOR SEEDS
   moonshiner seed run --id NAME --brief "WHAT TO BUILD" --yes
                               Author, test, review, and save one new seed
-  moonshiner behavior-seed author --all --yes
-                              Author only the non-code behavioral curriculum
+  moonshiner seed queue --yes Run the one seed-authoring queue
   moonshiner seeds catalog    Browse the seed recipe book
 
 CONFIGURE
@@ -721,19 +721,12 @@ def main(argv: list[str] | None = None) -> int:
     if command == "publish-queue-worker":
         return _publish_queue_worker(rest)
     if command in {"seed", "seed-run"}:
+        if command == "seed" and rest and rest[0] == "queue":
+            from seed_queue import main as seed_queue_main
+            return seed_queue_main(rest[1:])
         if command == "seed" and rest and rest[0] == "run": rest = rest[1:]
         from seed_pipeline import main as seed_main
         return seed_main(rest)
-    if command == "behavior-seed":
-        if rest and rest[0] == "author":
-            from behavior_seed_pipeline import main as behavior_seed_main
-            return behavior_seed_main(rest[1:])
-        if rest == ["status"]:
-            from behavior_seed_pipeline import status as behavior_seed_status
-            print(json.dumps(behavior_seed_status(), indent=2)); return 0
-        print("usage: moonshiner behavior-seed {author,status}",
-              file=sys.stderr)
-        return 2
     if command == "dataset":
         if rest and rest[0] in {"analyze", "compose", "readiness", "prepare"}:
             from dataset_prep import main as dataset_main

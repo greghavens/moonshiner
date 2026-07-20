@@ -50,7 +50,11 @@ class FrontDoor(unittest.TestCase):
                        "model": None}
         with mock.patch.object(run_state, "connect", return_value=db), \
              mock.patch.object(run_state, "summaries", return_value=[]), \
-             mock.patch("behavior_seed_pipeline.status", return_value=seed_status), \
+             mock.patch("seed_inventory.authored_ids", return_value=set()), \
+             mock.patch("seed_inventory.planned_ids", return_value=set()), \
+             mock.patch("seed_inventory.trace_state", return_value={
+                 "target": set(), "accepted": set(), "active": set(),
+                 "waiting": set(), "exhausted": set()}), \
              mock.patch.object(m.subprocess, "run", return_value=service_result), \
              mock.patch("builtins.print") as output:
             self.assertEqual(m._status([]), 0)
