@@ -93,12 +93,17 @@ class FrontDoor(unittest.TestCase):
         completed = mock.Mock(returncode=0)
         expected = m.hashlib.sha256(
             str(configuration.PROJECT_ROOT).encode()).hexdigest()[:12]
-        with mock.patch.object(m.subprocess, "run", return_value=completed) as run:
+        with mock.patch.object(m.subprocess, "run", return_value=completed) as run, \
+             mock.patch("trace_pipeline.ensure_publish_queue") as ensure:
             self.assertEqual(m._service(["restart", "publisher"]), 0)
-        run.assert_called_once_with([
-            "systemctl", "--user", "restart",
+        self.assertEqual(run.call_args_list, [mock.call([
+            "systemctl", "--user", "stop",
             f"moonshiner-publish-{expected}.service",
-        ])
+        ], check=True), mock.call([
+            "systemctl", "--user", "reset-failed",
+            f"moonshiner-publish-{expected}.service",
+        ])])
+        ensure.assert_called_once_with()
 
     def test_update_uses_official_installer_and_reports_version(self):
         pipe = mock.Mock()

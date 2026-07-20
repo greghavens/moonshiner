@@ -502,6 +502,13 @@ def _service(argv: list[str]) -> int:
     if args.action == "logs":
         return subprocess.run(["journalctl", "--user", "-u", f"{name}.service",
                                "-n", str(args.lines), "--no-pager"]).returncode
+    if args.action == "restart" and args.name.removesuffix(".service") == "publisher":
+        subprocess.run(["systemctl", "--user", "stop", f"{name}.service"], check=True)
+        subprocess.run(["systemctl", "--user", "reset-failed", f"{name}.service"])
+        from trace_pipeline import ensure_publish_queue
+        ensure_publish_queue()
+        print(f"recreated {name} from moonshiner {VERSION}")
+        return 0
     if args.action == "stop":
         command = ["systemctl", "--user", "stop", f"{name}.service"]
         message = f"stopped {name}"
