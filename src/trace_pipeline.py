@@ -20,7 +20,6 @@ from generate_traces import trace_task
 from run_state import (connect, create_run, finish_attempt, set_job,
                        set_run_status, start_attempt, run_row, job_rows,
                        abandon_claim, claim_job, renew_lease, record_model_call)
-from run_state import latest_running_run
 from runtimes import get_judge, get_teacher
 from screen_traces import feedback_from_review, screen
 
@@ -103,7 +102,7 @@ def _selected(args) -> list[dict]:
 
 
 def _run_individual_trace_jobs(seeds: list[dict], args, workers: int) -> int:
-    """Dispatch independent one-seed trace processes; never create a batch run."""
+    """Continuously keep the configured number of one-seed processes active."""
     project = _project_root()
     environment = dict(os.environ, MOONSHINER_SINGLE_TRACE="1")
 
@@ -114,29 +113,52 @@ def _run_individual_trace_jobs(seeds: list[dict], args, workers: int) -> int:
         return seed["id"], subprocess.run(command, cwd=project, env=environment).returncode
 
     failures = 0
-    known = {seed["id"] for seed in seeds}
+    completed = 0
     supervised = os.environ.get("MOONSHINER_SUPERVISED") == "1"
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="trace-job") as pool:
-        futures = {pool.submit(run_one, seed) for seed in seeds}
-        while futures or supervised:
+    pending = list(seeds)
+
+    def configured_workers() -> int:
+        if getattr(args, "workers", 0):
+            return args.workers
+        from configuration import load_config
+        value = int(((load_config().get("pipeline") or {}).get("trace") or {})
+                    .get("workers", workers))
+        if not 1 <= value <= 64:
+            raise ValueError("pipeline.trace.workers must be from 1 through 64")
+        return value
+
+    # The pool permits increases without restarting the coordinator. Submission,
+    # not pool capacity, enforces the live configured worker count.
+    with ThreadPoolExecutor(max_workers=64, thread_name_prefix="trace-job") as pool:
+        futures: dict = {}
+        while pending or futures or supervised:
+            active_ids = {seed_id for seed_id in futures.values()}
             if supervised:
+                pending_ids = {seed["id"] for seed in pending}
                 for seed in _selected(args):
-                    if seed["id"] not in known:
-                        known.add(seed["id"])
-                        futures.add(pool.submit(run_one, seed))
+                    if seed["id"] not in active_ids and seed["id"] not in pending_ids:
+                        pending.append(seed)
+                        pending_ids.add(seed["id"])
+            target = configured_workers()
+            while pending and len(futures) < target:
+                seed = pending.pop(0)
+                future = pool.submit(run_one, seed)
+                futures[future] = seed["id"]
             if not futures:
-                time.sleep(5)
+                time.sleep(2)
                 continue
-            done, futures = wait(futures, timeout=5, return_when=FIRST_COMPLETED)
+            done, _ = wait(set(futures), timeout=2, return_when=FIRST_COMPLETED)
             for future in done:
+                futures.pop(future, None)
                 seed_id, code = future.result()
+                completed += 1
                 if code:
                     failures += 1
                     print(f"[trace process failed] {seed_id}", flush=True)
                 else:
                     print(f"[trace complete: accepted] {seed_id}", flush=True)
-    print(f"trace queue pass complete: {len(seeds) - failures} accepted, "
-          f"{failures} failed processes, {len(seeds)} individual trace jobs", flush=True)
+    print(f"trace queue pass complete: {completed - failures} accepted, "
+          f"{failures} failed processes, {completed} individual trace jobs", flush=True)
     return 1 if failures else 0
 
 
@@ -184,11 +206,6 @@ def main(argv: list[str] | None = None) -> int:
             print("a trace coordinator is already running for this project", file=sys.stderr)
             return 2
     db = connect()
-    if not args.resume and os.environ.get("MOONSHINER_SUPERVISED") == "1":
-        active = latest_running_run(db, "trace")
-        if active:
-            args.resume = active["id"]
-            print(f"recovering supervised trace run {args.resume}", flush=True)
     if args.resume:
         prior=run_row(db,args.resume)
         if not prior: parser.error("resume run id not found")

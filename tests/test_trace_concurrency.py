@@ -64,6 +64,29 @@ class TraceConcurrency(unittest.TestCase):
         self.assertTrue(all(command[0] == "/installed/bin/moonshiner"
                             for command in commands))
 
+    def test_queue_never_exceeds_configured_workers(self):
+        args = type("Args", (), {"max_attempts": 2, "workers": 2})()
+        seeds = [{"id": f"seed-{index}"} for index in range(5)]
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+
+        def run(command, **_kwargs):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            threading.Event().wait(0.02)
+            with lock:
+                active -= 1
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(trace_pipeline, "_moonshiner_executable",
+                               return_value="/installed/bin/moonshiner"), \
+             mock.patch.object(trace_pipeline.subprocess, "run", side_effect=run):
+            self.assertEqual(trace_pipeline._run_individual_trace_jobs(seeds, args, 2), 0)
+        self.assertEqual(peak, 2)
+
     def test_expired_claim_is_recovered_once(self):
         db = connect(self.path)
         first = claim_job(db, self.run_id, "dead-worker", lease_seconds=-1)
