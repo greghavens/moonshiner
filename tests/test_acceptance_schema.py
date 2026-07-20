@@ -20,6 +20,19 @@ import build_dataset  # noqa: E402
 
 
 class AcceptanceSchemaTests(unittest.TestCase):
+    def test_published_hf_tasks_are_completed_imports(self):
+        import import_existing
+        with tempfile.TemporaryDirectory() as directory:
+            data = pathlib.Path(directory)
+            ledger = data / "hf-sync" / "published-trajectories.json"
+            ledger.parent.mkdir(parents=True)
+            ledger.write_text(json.dumps({"published_tasks": ["already-paid"]}))
+            with mock.patch.object(import_existing, "DATA", data), \
+                 mock.patch.object(import_existing, "_load_index",
+                                   return_value={"task_ids": ["legacy"]}):
+                self.assertEqual(import_existing.imported_task_ids(),
+                                 {"legacy", "already-paid"})
+
     def test_queue_transition_uses_only_judge_acceptance(self):
         self.assertTrue(is_accepted(
             {"accepted": True, "judge": {"runtime": "test"}}))

@@ -40,7 +40,15 @@ def _load_index() -> dict:
 
 
 def imported_task_ids() -> set[str]:
-    return set(_load_index().get("task_ids", []))
+    task_ids = set(_load_index().get("task_ids", []))
+    published = DATA / "hf-sync" / "published-trajectories.json"
+    if published.is_file():
+        try:
+            task_ids.update(json.loads(published.read_text()).get(
+                "published_tasks", []))
+        except (OSError, json.JSONDecodeError):
+            pass
+    return task_ids
 
 
 def _safe_row(row: dict) -> dict:
