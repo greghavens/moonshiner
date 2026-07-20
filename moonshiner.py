@@ -531,10 +531,18 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
         active = [row for row in rows if row["status"] == "running" and row["kind"] == "trace"]
         author_runs = [row for row in rows if row["status"] == "running" and row["kind"] == "seed"]
         ack = DATA / "hf-sync" / "published-trajectories.json"
-        published = 0
+        acknowledged_tasks = 0
         if ack.is_file():
-            try: published = len(json.loads(ack.read_text()).get("published_tasks") or [])
+            try: acknowledged_tasks = len(json.loads(ack.read_text()).get("published_tasks") or [])
             except (OSError, json.JSONDecodeError): pass
+        published_file = DATA / "hf-publish" / "traces.jsonl"
+        published = 0
+        if published_file.is_file():
+            try:
+                with published_file.open() as handle:
+                    published = sum(1 for line in handle if line.strip())
+            except OSError:
+                pass
         config = load_config()
         workers = int(((config.get("pipeline") or {}).get("trace") or {}).get("workers", 1))
         max_attempts = int(((config.get("pipeline") or {}).get("trace") or {}).get("max_attempts", 2))
@@ -558,7 +566,8 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
                         "waiting": len(traced["waiting"]), "active_runs": active},
             "publishing": {"dataset": (config.get("publish") or {}).get("hf_dataset"),
                            "batch_size": int((config.get("publish") or {}).get("batch_size", 1)),
-                           "published_trajectories": published},
+                           "published_trajectories": published,
+                           "acknowledged_tasks": acknowledged_tasks},
             "services": sorted(units),
         }
         if args.json:
@@ -584,7 +593,8 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
             print(f"    rates: accepted={acceptance_rate:.1f}%, "
                   f"rejected/exhausted={rejection_rate:.1f}%, "
                   f"retraced={retrace_rate:.1f}%")
-        print(f"Publishing: {published} trajectories acknowledged; batch size "
+        print(f"Publishing: {published} trajectories in local HF mirror; "
+              f"{acknowledged_tasks} unique tasks acknowledged; batch size "
               f"{payload['publishing']['batch_size']}; {payload['publishing']['dataset'] or 'disabled'}")
         print("Services: " + (", ".join(sorted(units)) if units else "none"))
         return 0
