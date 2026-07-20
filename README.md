@@ -193,11 +193,27 @@ Build the accepted local traces into a validated dataset:
 moonshiner dataset build
 ```
 
+Analyze one or more local or revision-pinned Hugging Face datasets before combining them:
+
+```bash
+moonshiner dataset analyze --source local:/data/private.jsonl --source hf:HuggingFaceH4/ultrachat_200k@COMMIT#train_sft
+```
+
+The report compares trajectories, rows, target tokens, total tokens, length distributions, categories, tags, sources, multi-turn conversations, direct responses, sequential tool calls, and parallel tool calls. Add `--tokenizer organization/model` for exact tokenizer counts; otherwise Moonshiner clearly labels its token estimate.
+
 Combine local data with revision-pinned Hugging Face datasets:
 
 ```bash
 moonshiner dataset compose --source local:/data/private.jsonl --source hf:HuggingFaceH4/ultrachat_200k@COMMIT#train_sft --out /data/prepared/train.jsonl
 ```
+
+Preview a token-budgeted composition without writing it:
+
+```bash
+moonshiner dataset compose --source local:/data/private.jsonl --source hf:owner/dataset@COMMIT#train --target-tokens 50000000 --weight-category 'tool-calling=2' --weight-tag 'execution:parallel=3' --tokenizer organization/model --dry-run
+```
+
+Remove `--dry-run` to write the composition after reviewing the reported realized mix. Weight rules use `GLOB=WEIGHT`; category, tag, and source-pattern weights require `--target-tokens`. `--weight-unit` selects whether sampling balances rows, target tokens, or total tokens. No curriculum percentage is hard-coded.
 
 Select rows by name, category, or training tag:
 
@@ -205,13 +221,23 @@ Select rows by name, category, or training tag:
 moonshiner dataset compose --source local:/data/all.jsonl --include-category 'tool-*' --include-tag parallel-tool-calls --exclude-tag sensitive --out /data/prepared/selected.jsonl
 ```
 
+Review training risks:
+
+```bash
+moonshiner dataset readiness --source local:/data/prepared/train.jsonl --tokenizer organization/model --context-length 32768
+```
+
+Readiness checks context truncation, empty final answers, duplicate prompts, malformed tool sequences, repetitive reasoning, mixed-language scripts, cumulative trajectory prefixes, and small category shares. It is advisory only: it reports evidence and never rejects rows or stops a pipeline.
+
 Prepare trainer configuration:
 
 ```bash
-moonshiner dataset prepare --trainer axolotl --input /data/prepared/train.jsonl --model organization/model --out /data/prepared/axolotl.json
+moonshiner dataset prepare --trainer axolotl --input /data/prepared/train.jsonl --model organization/model --tokenizer organization/model --sequence-len 32768 --out /data/prepared/axolotl.json
 ```
 
-Moonshiner normalizes mixed conversation formats, scrubs private data, deduplicates rows, records provenance, and writes a reproducible composition manifest.
+Packing is off unless `--sample-packing` is supplied. Moonshiner normalizes mixed conversation formats, scrubs private data, deduplicates rows, and writes reproducible composition and trainer manifests. Manifests include pinned Hugging Face revisions or local file hashes, tokenizer accounting, filters, requested and realized mixtures, input and output hashes, trainer configuration, package versions, and the exact trainer command.
+
+Accepted traces also receive observed tags such as `response:direct`, `reasoning:planning`, `reasoning:extended`, `reasoning:self-correction`, `reasoning:verification`, `interaction:multi-turn`, `execution:parallel`, and `format:strict-json`. These describe what the trace actually demonstrated; they are catalog and composition metadata, never queue partitions or acceptance gates.
 
 ## Hugging Face publishing
 

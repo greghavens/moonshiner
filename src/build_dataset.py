@@ -117,14 +117,34 @@ def training_tags(seed: dict, turns: list[dict], info: dict) -> list[str]:
     tags = {str(tag) for tag in explicit}
     assistant_turns = [message for message in turns if message.get("role") == "assistant"]
     calls = [call for message in assistant_turns for call in message.get("tool_calls") or []]
-    if calls: tags.add("tool-use")
+    if calls:
+        tags.add("tool-use")
+        tags.add("reasoning:planning")
+    else:
+        tags.add("response:direct")
     if any(len(message.get("tool_calls") or []) > 1 for message in assistant_turns):
-        tags.add("parallel-tool-calls")
-    if len(assistant_turns) > 1: tags.add("multi-turn")
-    if info.get("feedback_used"): tags.add("iterative-repair")
+        tags.update({"parallel-tool-calls", "execution:parallel"})
+    if len(assistant_turns) > 1:
+        tags.update({"multi-turn", "interaction:multi-turn"})
+    if info.get("feedback_used"):
+        tags.update({"iterative-repair", "reasoning:self-correction"})
+    if sum(est_tokens(message) for message in assistant_turns
+           if message.get("reasoning_content")) >= 256:
+        tags.add("reasoning:extended")
     for call in calls:
         name = (call.get("function") or {}).get("name")
-        if name: tags.add(f"tool:{name}")
+        if name:
+            tags.add(f"tool:{name}")
+            if any(word in name.casefold() for word in ("test", "check", "verify", "validate")):
+                tags.add("reasoning:verification")
+    final_content = assistant_turns[-1].get("content") if assistant_turns else None
+    if isinstance(final_content, str) and final_content.strip():
+        try:
+            json.loads(final_content)
+        except (TypeError, ValueError):
+            pass
+        else:
+            tags.add("format:strict-json")
     return sorted(tags)
 
 

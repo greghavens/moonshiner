@@ -15,7 +15,7 @@ These are explicit project-owner requirements and apply to every change:
   the same time. Each remains individually owned, judged, retried, completed,
   and recorded.
 - Only the configured trace judge may reject a generated trace.
-- A trace gets at most three total attempts for its one seed across every
+- A trace gets at most two total attempts for its one seed across every
   resumption. Any limit applies only to that individual seed/trace. Starting a
   new process must never reset the trace's lifetime count.
 - Valid distillation work has no queue-wide, batch-wide, session-wide, or

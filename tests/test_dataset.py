@@ -99,6 +99,20 @@ class BehavioralTags(unittest.TestCase):
                          "multi-turn", "iterative-repair", "tool:read",
                          "tool:grep"}.issubset(tags))
 
+    def test_observed_reasoning_and_format_tags(self):
+        turns = [{"role": "assistant", "content": "", "reasoning_content": "plan " * 220,
+                  "tool_calls": [{"function": {"name": "validate_order", "arguments": {}}}]},
+                 {"role": "tool", "content": "ok"},
+                 {"role": "assistant", "content": '{"status":"done"}'}]
+        tags = bd.training_tags({}, turns, {})
+        self.assertTrue({"reasoning:planning", "reasoning:extended",
+                         "reasoning:verification", "format:strict-json",
+                         "interaction:multi-turn"}.issubset(tags))
+
+    def test_direct_response_is_observed(self):
+        tags = bd.training_tags({}, [{"role": "assistant", "content": "hello"}], {})
+        self.assertIn("response:direct", tags)
+
 
 if __name__ == "__main__":
     unittest.main()

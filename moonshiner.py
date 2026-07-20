@@ -573,6 +573,10 @@ CREATE TRAINING DATA
                               Resume from a Hugging Face dataset
   moonshiner status           Show current and previous runs
   moonshiner dataset build    Build a dataset from accepted traces
+  moonshiner dataset analyze --source PATH
+                              Inspect token, category, tag, and behavior mix
+  moonshiner dataset readiness --source PATH
+                              Report training risks without blocking work
 
 AUTHOR SEEDS
   moonshiner seed run --id NAME --brief "WHAT TO BUILD" --yes
@@ -667,11 +671,11 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
     if command == "dataset":
-        if rest and rest[0] in {"compose", "prepare"}:
+        if rest and rest[0] in {"analyze", "compose", "readiness", "prepare"}:
             from dataset_prep import main as dataset_main
             return dataset_main(rest)
         if not rest or rest[0] not in {"build", "export"}:
-            print("usage: moonshiner dataset {build,export,compose,prepare}", file=sys.stderr)
+            print("usage: moonshiner dataset {build,export,analyze,compose,readiness,prepare}", file=sys.stderr)
             return 2
         return _run(["--from", "build"])
     if command in BY_KEY:
