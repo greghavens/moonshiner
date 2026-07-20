@@ -27,7 +27,7 @@ from screen_traces import feedback_from_review, screen
 
 def _moonshiner_executable() -> str:
     """Return the installed Moonshiner console beside this Python runtime."""
-    executable = Path(sys.executable).resolve().parent / "moonshiner"
+    executable = Path(sys.executable).parent / "moonshiner"
     if executable.is_file():
         return str(executable)
     resolved = shutil.which("moonshiner")

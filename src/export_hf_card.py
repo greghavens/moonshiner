@@ -31,7 +31,6 @@ from pathlib import Path
 from statistics import median
 
 from common import CONFIG, DATA, ROOT
-from corpus import PROGRAM_DESCRIPTIONS, program_for_category
 from runtimes.pi import OFFERED_TOOLS
 
 PUBLISH_DIR = DATA / "hf-publish"
@@ -249,24 +248,32 @@ def _mix_table(counter: Counter, total: int, head: str) -> str:
 
 
 def _program_mix(trajectories: dict[str, dict]) -> Counter:
-    """Roll precise catalog categories into stable training-program groups."""
+    """Use the catalog's explicit program assignment without inference."""
+    try:
+        catalog = json.loads((ROOT / "SEED_CATALOG.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        catalog = {}
+    by_id = {item.get("id"): item.get("program")
+             for items in (catalog.get("categories") or {}).values()
+             for item in items if isinstance(item, dict)}
     result: Counter = Counter()
     for entry in trajectories.values():
-        category = str(entry.get("category") or "unknown")
-        group = program_for_category(
-            category, tool_use=entry.get("domain") == "instruction-following/tool-use")
-        result[group] += 1
+        result[by_id.get(entry.get("task")) or "Uncategorized"] += 1
     return result
 
 
 def _program_table(counter: Counter, total: int) -> str:
+    try:
+        programs = json.loads((ROOT / "SEED_CATALOG.json").read_text()).get("programs") or {}
+    except (OSError, json.JSONDecodeError):
+        programs = {}
     lines = ["| kind | trajectories | share | flavor |",
              "|---|---:|---:|---|"]
     for name, count in counter.most_common():
         if count:
             lines.append(
                 f"| {name} | {count:,} | {_pct1(count, total)} | "
-                f"{PROGRAM_DESCRIPTIONS[name]} |")
+                f"{programs.get(name, {}).get('description', 'Not assigned in the seed catalog.')} |")
     return "\n".join(lines)
 
 

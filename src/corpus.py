@@ -16,51 +16,23 @@ from common import ROOT, SEEDS_DIR, STORAGE_ROOT
 CORPORA = STORAGE_ROOT / "corpora"
 RELEASES_API = "https://api.github.com/repos/greghavens/moonshiner/releases"
 
-PROGRAM_DESCRIPTIONS = {
-    "Building": "Implement complete libraries, services, CLIs, workflows, and systems from specifications.",
-    "Debugging": "Diagnose failures, repair defects, resolve compiler/runtime issues, and preserve regressions.",
-    "Tool calling": "Select tools, construct grounded arguments, run independent calls together, and stage dependent calls.",
-    "Instruction following": "Honor constraints, formats, corrections, state, context, memory, relevance, and abstention.",
-    "Project & integration": "Coordinate multi-file, repository-scale, migration, and integration work.",
-    "Feature development": "Extend working systems while preserving existing behavior.",
-    "Clarification": "Recognize missing information, ask only when required, and never invent parameters.",
-    "Error recovery": "Recover from tool failures, partial results, retries, and idempotency hazards.",
-    "Refactoring & performance": "Restructure safely and improve measured performance without behavior drift.",
-    "Seed authoring": "Create and independently validate deterministic training tasks.",
-    "Other verified work": "Verified work not yet assigned to one of the primary programs.",
-}
-
-PROGRAM_PRIORITY = [
-    "Instruction following", "Tool calling", "Error recovery", "Clarification",
-    "Building", "Debugging", "Project & integration", "Feature development",
-    "Refactoring & performance", "Seed authoring", "Other verified work",
-]
-
-
-def program_for_category(category: str, *, tool_use: bool = False) -> str:
-    """Map precise recipe taxonomy to one stable, human-facing program."""
-    category = str(category or "uncategorized")
-    if tool_use:
-        if category in {"dependency-planning", "parallel-same", "parallel-mixed",
-                        "tool-selection", "missing-function"}:
-            return "Tool calling"
-        if category == "missing-parameter":
-            return "Clarification"
-        if category == "error-recovery":
-            return "Error recovery"
-        return "Instruction following"
-    prefix = category.replace("/", "-").split("-", 1)[0]
-    if prefix == "build": return "Building"
-    if prefix in {"debug", "warnfix", "compilefix", "syntax", "escape"}: return "Debugging"
-    if prefix in {"project", "full"}: return "Project & integration"
-    if prefix == "feature": return "Feature development"
-    if prefix in {"refactor", "perf"}: return "Refactoring & performance"
-    if prefix == "seed": return "Seed authoring"
-    return "Other verified work"
-
-
 def catalog(seed_dir: Path = SEEDS_DIR) -> tuple[str, dict]:
     """Build the human recipe book and its machine-readable twin."""
+    catalog_path = seed_dir.parent.parent / "SEED_CATALOG.json"
+    try:
+        existing_catalog = json.loads(catalog_path.read_text())
+        existing_programs = existing_catalog.get("programs") or {}
+        existing_items = {item["id"]: item
+                          for items in (existing_catalog.get("categories") or {}).values()
+                          for item in items}
+    except (OSError, json.JSONDecodeError, AttributeError):
+        existing_programs = {}
+        existing_items = {}
+    existing_priority = {
+        name: int(value.get("priority", position))
+        for position, (name, value) in enumerate(existing_programs.items())
+        if isinstance(value, dict)
+    }
     groups: dict[str, list[dict]] = defaultdict(list)
     for task_path in sorted(seed_dir.glob("*/task.json")):
         task = json.loads(task_path.read_text())
@@ -71,7 +43,9 @@ def catalog(seed_dir: Path = SEEDS_DIR) -> tuple[str, dict]:
                 "category": task.get("category") or "uncategorized",
                 "training_tags": task.get("training_tags") or task.get("tags") or [],
                 "summary": summary, "verify_command": task.get("verify_cmd")}
-        item["program"] = program_for_category(item["category"])
+        item["program"] = (task.get("program")
+                           or existing_items.get(item["id"], {}).get("program")
+                           or "Uncategorized")
         groups[item["category"]].append(item)
     behavior_dir = seed_dir.parent / "behavior-seeds"
     for task_path in sorted(behavior_dir.glob("behavior-*.json")):
@@ -83,20 +57,25 @@ def catalog(seed_dir: Path = SEEDS_DIR) -> tuple[str, dict]:
                 "category": task.get("category") or "uncategorized",
                 "training_tags": task.get("training_tags") or [],
                 "summary": summary, "verify_command": None}
-        item["program"] = program_for_category(item["category"], tool_use=True)
+        item["program"] = (task.get("program")
+                           or existing_items.get(item["id"], {}).get("program")
+                           or "Uncategorized")
         groups[item["category"]].append(item)
     programs: dict[str, dict] = {}
     for items in groups.values():
         for item in items:
             entry = programs.setdefault(item["program"], {
-                "description": PROGRAM_DESCRIPTIONS[item["program"]],
+                "description": (existing_programs.get(item["program"], {}).get("description")
+                                or "Catalog program awaiting description."),
                 "seed_count": 0, "categories": set()})
             entry["seed_count"] += 1
             entry["categories"].add(item["category"])
-    priority = {name: index for index, name in enumerate(PROGRAM_PRIORITY)}
-    programs = {name: {**programs[name], "priority": priority.get(name, 1_000_000),
+    next_priority = max(existing_priority.values(), default=-1) + 1
+    priority = {name: existing_priority.get(name, next_priority + position)
+                for position, name in enumerate(programs)}
+    programs = {name: {**programs[name], "priority": priority[name],
                        "categories": sorted(programs[name]["categories"])}
-                for name in sorted(programs, key=lambda item: priority.get(item, 1_000_000))}
+                for name in sorted(programs, key=priority.get)}
     data = {"name": "Moonshiner Seed Recipe Book",
             "seed_count": sum(map(len, groups.values())),
             "programs": programs,

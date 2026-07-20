@@ -29,6 +29,15 @@ class TraceConcurrency(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
+    def test_runtime_console_lookup_does_not_resolve_the_python_symlink(self):
+        with mock.patch.object(trace_pipeline.sys, "executable",
+                               "/installed/runtime/bin/python"), \
+             mock.patch.object(pathlib.Path, "is_file", return_value=True), \
+             mock.patch.object(pathlib.Path, "resolve",
+                               side_effect=AssertionError("must not resolve runtime symlink")):
+            self.assertEqual(trace_pipeline._moonshiner_executable(),
+                             "/installed/runtime/bin/moonshiner")
+
     def test_parallel_claims_are_unique(self):
         claimed = []
         lock = threading.Lock()

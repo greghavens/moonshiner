@@ -77,7 +77,7 @@ class Card(unittest.TestCase):
         self.assertIn("## Schema", self.card)
         self.assertIn("`task`", self.card)
         self.assertIn("## Task mix", self.card)
-        self.assertIn("Building", self.card)
+        self.assertIn("Uncategorized", self.card)
         self.assertNotIn("## Tool surface", self.card)
 
     def test_security_domain_switches_on_security_framing(self):

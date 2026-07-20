@@ -263,15 +263,6 @@ def quarantined_trajectories(directory: Path | None = None) -> set[str]:
 # --------------------------------------------------------------------------- #
 # Seeds                                                                        #
 # --------------------------------------------------------------------------- #
-_PROGRAM_PRIORITY = {
-    name: position for position, name in enumerate((
-        "Instruction following", "Tool calling", "Error recovery", "Clarification",
-        "Building", "Debugging", "Project & integration", "Feature development",
-        "Refactoring & performance", "Seed authoring", "Other verified work",
-    ))
-}
-
-
 def load_seeds(only: set[str] | None = None, include_holdout: bool = False) -> list[dict]:
     """Load every authored seed in catalog priority order.
 
@@ -308,7 +299,7 @@ def load_seeds(only: set[str] | None = None, include_holdout: bool = False) -> l
         catalog = json.loads(catalog_path.read_text())
         programs = catalog.get("programs") or {}
         rank = {item["id"]: (int(programs.get(item.get("program"), {}).get(
-                    "priority", _PROGRAM_PRIORITY.get(item.get("program"), 1_000_000))), position)
+                    "priority", 1_000_000)), position)
                 for position, item in enumerate(
                     entry for items in (catalog.get("categories") or {}).values()
                     for entry in items)}
