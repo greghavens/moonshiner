@@ -91,6 +91,11 @@ class PiRuntime(Runtime):
         native = shutil.which(configured.name)
         if native:
             return Path(native)
+        confirmed = (self.config.get("workspace") or {}).get("confirmed_root")
+        project = Path(confirmed).resolve() if confirmed else Path.cwd().resolve()
+        existing_managed = project / "node_modules" / ".bin" / "pi"
+        if existing_managed.exists():
+            return existing_managed
         # Preserve Moonshiner's existing managed-install option. Native PATH
         # resolution always wins; this is only the explicit setup fallback.
         return ROOT / "node_modules" / ".bin" / "pi"
