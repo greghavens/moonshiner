@@ -99,7 +99,7 @@ class FrontDoor(unittest.TestCase):
         self.assertEqual(run.call_args_list, [mock.call([
             "systemctl", "--user", "stop",
             f"moonshiner-publish-{expected}.service",
-        ], check=True), mock.call([
+        ]), mock.call([
             "systemctl", "--user", "reset-failed",
             f"moonshiner-publish-{expected}.service",
         ])])

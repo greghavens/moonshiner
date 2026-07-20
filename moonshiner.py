@@ -503,7 +503,7 @@ def _service(argv: list[str]) -> int:
         return subprocess.run(["journalctl", "--user", "-u", f"{name}.service",
                                "-n", str(args.lines), "--no-pager"]).returncode
     if args.action == "restart" and args.name.removesuffix(".service") == "publisher":
-        subprocess.run(["systemctl", "--user", "stop", f"{name}.service"], check=True)
+        subprocess.run(["systemctl", "--user", "stop", f"{name}.service"])
         subprocess.run(["systemctl", "--user", "reset-failed", f"{name}.service"])
         from trace_pipeline import ensure_publish_queue
         ensure_publish_queue()
