@@ -199,6 +199,18 @@ Analyze one or more local or revision-pinned Hugging Face datasets before combin
 moonshiner dataset analyze --source local:/data/private.jsonl --source hf:HuggingFaceH4/ultrachat_200k@COMMIT#train_sft
 ```
 
+With no `--source`, Moonshiner analyzes the configured local append-only dataset. A direct Hugging Face file also works without installing dataset tooling:
+
+```bash
+moonshiner dataset analyze --source hf-file:owner/dataset@REVISION/path/to/traces.jsonl
+```
+
+You can also paste the file's Hugging Face URL directly:
+
+```bash
+moonshiner dataset analyze --source https://huggingface.co/datasets/owner/dataset/blob/REVISION/path/to/traces.jsonl
+```
+
 The report compares trajectories, rows, target tokens, total tokens, length distributions, categories, tags, sources, multi-turn conversations, direct responses, sequential tool calls, and parallel tool calls. Add `--tokenizer organization/model` for exact tokenizer counts; otherwise Moonshiner clearly labels its token estimate.
 
 Combine local data with revision-pinned Hugging Face datasets:

@@ -4,6 +4,8 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
+import io
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -88,6 +90,32 @@ class Reproducibility(unittest.TestCase):
                 {"id": "x", "function": {"name": "lookup", "arguments": "{}"}}]}]},
             "local:test", 0)
         self.assertEqual(row["messages"][1]["content"], "")
+
+    def test_direct_hf_file_reference_streams_jsonl(self):
+        response = io.BytesIO((json.dumps({"messages": [
+            {"role": "user", "content": "x"},
+            {"role": "assistant", "content": "y"}]}) + "\n").encode())
+        response.__enter__ = lambda value: value
+        response.__exit__ = lambda *args: None
+        with mock.patch.object(dataset_prep.urllib.request, "urlopen", return_value=response):
+            rows = dataset_prep.load_source(
+                "hf-file:owner/dataset@abc123/traces.jsonl")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["messages"][1]["content"], "y")
+
+    def test_hf_blob_url_is_converted_to_download_url(self):
+        self.assertEqual(dataset_prep._hf_file_url(
+            "https://huggingface.co/datasets/owner/data/blob/rev/traces.jsonl"),
+            "https://huggingface.co/datasets/owner/data/resolve/rev/traces.jsonl")
+
+    def test_configured_local_dataset_is_default_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            expected = pathlib.Path(directory) / "hf-publish" / "custom.jsonl"
+            expected.parent.mkdir()
+            expected.write_text("")
+            with mock.patch.object(dataset_prep, "DATA", pathlib.Path(directory)), \
+                 mock.patch.object(dataset_prep, "CONFIG", {"publish": {"filename": "custom.jsonl"}}):
+                self.assertEqual(dataset_prep._resolved_sources(None), [str(expected)])
 
 
 if __name__ == "__main__":

@@ -57,6 +57,15 @@ class FrontDoor(unittest.TestCase):
         self.assertTrue(any(call.args == ("Moonshiner status",)
                             for call in output.call_args_list))
 
+    def test_argless_phase_does_not_receive_console_arguments(self):
+        phase = m.Phase("build", 1, "Build", "fake", takes_argv=False)
+        module = mock.Mock()
+        module.main.side_effect = lambda: 0 if sys.argv == ["moonshiner build"] else 1
+        with mock.patch.object(m.importlib, "import_module", return_value=module), \
+             mock.patch.object(sys, "argv", ["moonshiner", "dataset", "build"]):
+            self.assertEqual(m._dispatch(phase, []), 0)
+            self.assertEqual(sys.argv, ["moonshiner", "dataset", "build"])
+
 
 class Registry(unittest.TestCase):
     def test_keys_are_unique_and_indexed(self):

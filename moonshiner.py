@@ -89,7 +89,14 @@ def _dispatch(phase: Phase, argv: list[str]) -> int:
     if argv:
         print(f"[moonshiner] {phase.key}: ignoring args {argv} "
               f"(phase takes none)", file=sys.stderr)
-    return int(module.main() or 0)
+    # Legacy argless phases use argparse against sys.argv. The installed
+    # console's arguments belong to Moonshiner, not to the phase module.
+    original_argv = sys.argv
+    try:
+        sys.argv = [f"moonshiner {phase.key}"]
+        return int(module.main() or 0)
+    finally:
+        sys.argv = original_argv
 
 
 def _plan(start: str | None, stop: str | None, include: list[str],
@@ -673,7 +680,11 @@ def main(argv: list[str] | None = None) -> int:
     if command == "dataset":
         if rest and rest[0] in {"analyze", "compose", "readiness", "prepare"}:
             from dataset_prep import main as dataset_main
-            return dataset_main(rest)
+            try:
+                return dataset_main(rest)
+            except (OSError, RuntimeError, ValueError) as error:
+                print(f"[moonshiner] dataset: {error}", file=sys.stderr)
+                return 2
         if not rest or rest[0] not in {"build", "export"}:
             print("usage: moonshiner dataset {build,export,analyze,compose,readiness,prepare}", file=sys.stderr)
             return 2

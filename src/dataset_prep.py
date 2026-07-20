@@ -9,11 +9,13 @@ import math
 import random
 import re
 import unicodedata
+import urllib.parse
+import urllib.request
 from collections import Counter, defaultdict
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
-from common import DATA, _staged_secret_values
+from common import CONFIG, DATA, _staged_secret_values
 from privacy import findings, sanitize_object
 
 ANALYSIS_VERSION = 1
@@ -68,6 +70,37 @@ def _local_rows(path: Path):
     else:
         value = json.loads(path.read_text())
         yield from (value if isinstance(value, list) else [value])
+
+
+def _remote_rows(url: str):
+    request = urllib.request.Request(url, headers={"User-Agent": "moonshiner/0.4"})
+    with urllib.request.urlopen(request, timeout=120) as response:
+        if urllib.parse.urlparse(url).path.endswith(".jsonl"):
+            for raw_line in response:
+                if raw_line.strip():
+                    yield json.loads(raw_line.decode("utf-8"))
+        else:
+            value = json.load(response)
+            yield from (value if isinstance(value, list) else [value])
+
+
+def _dataset_server_rows(dataset_id: str, split: str):
+    offset, page_size = 0, 100
+    while True:
+        query = urllib.parse.urlencode({"dataset": dataset_id, "config": "default",
+                                        "split": split, "offset": offset,
+                                        "length": page_size})
+        request = urllib.request.Request(
+            f"https://datasets-server.huggingface.co/rows?{query}",
+            headers={"User-Agent": "moonshiner/0.4"})
+        with urllib.request.urlopen(request, timeout=120) as response:
+            payload = json.load(response)
+        rows = payload.get("rows") or []
+        for item in rows:
+            yield item.get("row", item)
+        offset += len(rows)
+        if not rows or offset >= int(payload.get("num_rows_total", offset)):
+            break
 
 
 def _file_sha256(path: Path) -> str:
@@ -127,6 +160,8 @@ def _normalize(row: dict, source: str, index: int) -> dict:
 
 
 def _source_record(spec: str) -> dict:
+    if spec.startswith(("https://huggingface.co/datasets/", "hf-file:")):
+        return {"spec": spec, "kind": "huggingface-file", "url": _hf_file_url(spec)}
     if spec.startswith("hf:"):
         reference = spec[3:]
         dataset_id, pinned = reference.split("@", 1)
@@ -138,7 +173,26 @@ def _source_record(spec: str) -> dict:
     return {"spec": spec, "kind": "local", "path": str(path), "sha256": digest}
 
 
+def _hf_file_url(spec: str) -> str:
+    if spec.startswith("https://huggingface.co/datasets/"):
+        return spec.replace("/blob/", "/resolve/", 1)
+    reference = spec.removeprefix("hf-file:")
+    if "@" not in reference or "/" not in reference.split("@", 1)[1]:
+        raise ValueError("HF files must use hf-file:owner/dataset@revision/path.jsonl")
+    dataset_id, pinned = reference.split("@", 1)
+    revision, filename = pinned.split("/", 1)
+    owner_repo = dataset_id.split("/", 1)
+    if len(owner_repo) != 2 or not all((revision, filename)):
+        raise ValueError("invalid Hugging Face file reference")
+    return ("https://huggingface.co/datasets/"
+            + urllib.parse.quote(dataset_id, safe="/") + "/resolve/"
+            + urllib.parse.quote(revision, safe="") + "/"
+            + urllib.parse.quote(filename, safe="/"))
+
+
 def load_source(spec: str):
+    if spec.startswith(("https://huggingface.co/datasets/", "hf-file:")):
+        return [_normalize(row, spec, i) for i, row in enumerate(_remote_rows(_hf_file_url(spec)))]
     if spec.startswith("hf:"):
         reference = spec[3:]
         if "@" not in reference:
@@ -149,8 +203,13 @@ def load_source(spec: str):
             raise ValueError("invalid Hugging Face source; expected hf:owner/name@revision[#split]")
         try:
             from datasets import load_dataset
-        except ImportError as error:
-            raise RuntimeError("install moonshiner[huggingface]") from error
+        except ImportError:
+            if revision not in {"main", "refs/heads/main"}:
+                raise RuntimeError(
+                    "revision-pinned dataset splits require moonshiner[huggingface]; "
+                    "a direct hf-file: reference works with the standard install")
+            rows = _dataset_server_rows(dataset_id, split or "train")
+            return [_normalize(dict(row), spec, i) for i, row in enumerate(rows)]
         dataset = load_dataset(dataset_id, split=split or "train", revision=revision)
         return [_normalize(dict(row), spec, i) for i, row in enumerate(dataset)]
     path = Path(spec.removeprefix("local:")).expanduser()
@@ -536,9 +595,21 @@ def readiness_rows(rows: list[dict], counter: TokenCounter, *,
 
 
 def _sources_argument(parser):
-    parser.add_argument("--source", "--input", dest="sources", action="append", required=True,
-                        help="local path or revision-pinned hf:owner/dataset@revision#split")
+    parser.add_argument("--source", "--input", dest="sources", action="append",
+                        help="local path, HF dataset split, or direct HF file")
     parser.add_argument("--tokenizer")
+
+
+def _resolved_sources(sources: list[str] | None) -> list[str]:
+    if sources:
+        return sources
+    filename = str((CONFIG.get("publish") or {}).get("filename") or "traces.jsonl")
+    configured = DATA / "hf-publish" / filename
+    if configured.is_file():
+        return [str(configured)]
+    raise FileNotFoundError(
+        f"configured local dataset not found at {configured}; pass --source PATH, "
+        "hf:owner/dataset@revision#split, or hf-file:owner/dataset@revision/path.jsonl")
 
 
 def main(argv=None) -> int:
@@ -585,7 +656,7 @@ def main(argv=None) -> int:
 
     args = parser.parse_args(argv)
     if args.action == "analyze":
-        result = analyze_sources(args.sources, args.tokenizer)
+        result = analyze_sources(_resolved_sources(args.sources), args.tokenizer)
         if args.out:
             args.out.parent.mkdir(parents=True, exist_ok=True)
             args.out.write_text(json.dumps(result, indent=2) + "\n")
@@ -593,7 +664,7 @@ def main(argv=None) -> int:
     if args.action == "compose":
         filters = (args.include_name, args.exclude_name, args.include_category,
                    args.exclude_category, args.include_tag, args.exclude_tag)
-        result = compose(args.sources, args.weight, args.out, args.seed, filters,
+        result = compose(_resolved_sources(args.sources), args.weight, args.out, args.seed, filters,
                          target_tokens=args.target_tokens, tokenizer=args.tokenizer,
                          category_weights=args.weight_category, tag_weights=args.weight_tag,
                          source_weights=args.weight_source, weight_unit=args.weight_unit,
@@ -601,7 +672,7 @@ def main(argv=None) -> int:
                          sample_packing=args.sample_packing)
         print(json.dumps(result, indent=2)); return 0
     if args.action == "readiness":
-        rows = [row for source in args.sources for row in load_source(source)]
+        rows = [row for source in _resolved_sources(args.sources) for row in load_source(source)]
         result = readiness_rows(rows, TokenCounter(args.tokenizer),
                                 context_lengths=args.context_length or DEFAULT_CONTEXTS,
                                 packing=args.sample_packing, low_share=args.low_share)
