@@ -15,7 +15,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "0.3.2"
+from moonshiner_app import __version__
+
+VERSION = __version__
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
