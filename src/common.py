@@ -352,6 +352,12 @@ def seed_fingerprint(seed: dict) -> str:
     return digest.hexdigest()
 
 
+def _seed_files(seed: dict) -> Path | None:
+    """Return repository fixtures when the catalog entry has them."""
+    directory = seed.get("_dir")
+    return Path(directory) / "files" if directory is not None else None
+
+
 def materialize(seed: dict, name: str | None = None) -> Path:
     """Copy a seed's files into a fresh, committed Git workspace.
 
@@ -365,8 +371,8 @@ def materialize(seed: dict, name: str | None = None) -> Path:
     if workspace.exists():
         workspace = WORKSPACES / f"{workspace.name}-{uuid.uuid4().hex[:10]}"
     workspace.mkdir(parents=True)
-    source = seed["_dir"] / "files"
-    if source.exists():
+    source = _seed_files(seed)
+    if source is not None and source.exists():
         links = [path for path in source.rglob("*") if path.is_symlink()]
         if links:
             raise ValueError(f"seed contains prohibited symlink: {links[0]}")

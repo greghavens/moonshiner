@@ -36,6 +36,9 @@ class Fingerprint(unittest.TestCase):
 
 
 class LoadSeeds(unittest.TestCase):
+    def test_single_file_seed_needs_no_repository_fixture_directory(self):
+        self.assertIsNone(common._seed_files({"id": "catalog-seed", "_path": pathlib.Path("seed.json")}))
+
     def test_one_loader_contains_every_seed_once_in_catalog_priority(self):
         self.assertFalse(hasattr(common, "load_behavior_seeds"))
         seeds = common.load_seeds(include_holdout=True)
