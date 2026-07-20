@@ -509,6 +509,26 @@ def _service(argv: list[str]) -> int:
         ensure_publish_queue()
         print(f"recreated {name} from moonshiner {VERSION}")
         return 0
+    if args.action == "restart" and name.startswith("moonshiner-trace-continuous-"):
+        subprocess.run(["systemctl", "--user", "stop", f"{name}.service"])
+        subprocess.run(["systemctl", "--user", "reset-failed", f"{name}.service"])
+        from common import RUNS
+        from configuration import PROJECT_ROOT
+        log_dir = RUNS / "trace-continuous"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        executable = Path(sys.executable).resolve().parent / "moonshiner"
+        command = ["systemd-run", "--user", "--collect", f"--unit={name}",
+                   f"--property=WorkingDirectory={PROJECT_ROOT}",
+                   "--property=Restart=always", "--property=RestartSec=10s",
+                   f"--property=StandardOutput=append:{log_dir / 'run.log'}",
+                   f"--property=StandardError=append:{log_dir / 'run.log'}",
+                   f"--setenv=PATH={os.environ.get('PATH', '')}",
+                   "--setenv=MOONSHINER_SUPERVISED=1", str(executable),
+                   "run", "--all", "--yes"]
+        result = subprocess.run(command)
+        if result.returncode == 0:
+            print(f"recreated {name} from moonshiner {VERSION}")
+        return result.returncode
     if args.action == "stop":
         command = ["systemctl", "--user", "stop", f"{name}.service"]
         message = f"stopped {name}"

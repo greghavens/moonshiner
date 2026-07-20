@@ -105,6 +105,23 @@ class FrontDoor(unittest.TestCase):
         ])])
         ensure.assert_called_once_with()
 
+    def test_trace_coordinator_restart_recreates_from_current_release(self):
+        completed = mock.Mock(returncode=0)
+        name = "moonshiner-trace-continuous-example"
+        with mock.patch.object(m.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(m._service(["restart", name]), 0)
+        calls = run.call_args_list
+        self.assertEqual(calls[0], mock.call(
+            ["systemctl", "--user", "stop", f"{name}.service"]))
+        recreated = calls[2].args[0]
+        self.assertEqual(recreated[:5],
+                         ["systemd-run", "--user", "--collect", f"--unit={name}",
+                          f"--property=WorkingDirectory={configuration.PROJECT_ROOT}"])
+        self.assertIn("--setenv=MOONSHINER_SUPERVISED=1", recreated)
+        self.assertEqual(recreated[-3:], ["run", "--all", "--yes"])
+        self.assertEqual(pathlib.Path(recreated[-4]).resolve().parent,
+                         pathlib.Path(sys.executable).resolve().parent)
+
     def test_update_uses_official_installer_and_reports_version(self):
         pipe = mock.Mock()
         pipe.stdout = mock.Mock()
