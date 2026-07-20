@@ -99,6 +99,13 @@ def _dispatch(phase: Phase, argv: list[str]) -> int:
         sys.argv = original_argv
 
 
+def _publish_queue_worker(argv: list[str]) -> int:
+    """Run the internal accepted-trace publisher in this project directory."""
+    if argv:
+        raise SystemExit("moonshiner publish-queue-worker takes no arguments")
+    return int(importlib.import_module("publish_queue").main() or 0)
+
+
 def _plan(start: str | None, stop: str | None, include: list[str],
           skip: list[str], offline: bool) -> list[Phase]:
     """Resolve the ordered list of phases a `run` should execute."""
@@ -666,6 +673,8 @@ def main(argv: list[str] | None = None) -> int:
     if command == "publish":
         from publish import main as publish_main
         return publish_main(rest)
+    if command == "publish-queue-worker":
+        return _publish_queue_worker(rest)
     if command in {"seed", "seed-run"}:
         if command == "seed" and rest and rest[0] == "run": rest = rest[1:]
         from seed_pipeline import main as seed_main

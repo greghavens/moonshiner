@@ -10,6 +10,8 @@ import threading
 import time
 import uuid
 import fcntl
+import hashlib
+from pathlib import Path
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 
@@ -23,16 +25,33 @@ from runtimes import get_judge, get_teacher
 from screen_traces import feedback_from_review, screen
 
 
+def _moonshiner_executable() -> str:
+    """Return the installed Moonshiner console beside this Python runtime."""
+    executable = Path(sys.executable).resolve().parent / "moonshiner"
+    if executable.is_file():
+        return str(executable)
+    resolved = shutil.which("moonshiner")
+    if resolved:
+        return resolved
+    raise FileNotFoundError("the installed moonshiner executable was not found")
+
+
+def _project_root():
+    from configuration import PROJECT_ROOT
+    return PROJECT_ROOT
+
+
 def ensure_publish_queue() -> None:
     """Start the independent accepted-trajectory publisher when configured."""
     if not (CONFIG.get("publish") or {}).get("hf_dataset"):
         return
-    unit = "moonshiner-publish-queue"
+    project_key = hashlib.sha256(str(_project_root()).encode()).hexdigest()[:12]
+    unit = f"moonshiner-publish-{project_key}"
     command = ["systemd-run", "--user", "--collect", f"--unit={unit}",
-               f"--property=WorkingDirectory={__import__('common').ROOT}",
+               f"--property=WorkingDirectory={_project_root()}",
                "--property=Restart=on-failure", "--property=RestartSec=10s",
                f"--setenv=PATH={os.environ.get('PATH', '')}",
-               sys.executable, str(__import__('common').ROOT / "src" / "publish_queue.py")]
+               _moonshiner_executable(), "publish-queue-worker"]
     status = subprocess.run(["systemctl", "--user", "is-active", "--quiet",
                              f"{unit}.service"])
     if status.returncode != 0:
@@ -85,14 +104,14 @@ def _selected(args) -> list[dict]:
 
 def _run_individual_trace_jobs(seeds: list[dict], args, workers: int) -> int:
     """Dispatch independent one-seed trace processes; never create a batch run."""
-    root = __import__('common').ROOT
+    project = _project_root()
     environment = dict(os.environ, MOONSHINER_SINGLE_TRACE="1")
 
     def run_one(seed: dict) -> tuple[str, int]:
-        command = [sys.executable, str(root / "moonshiner.py"), "run",
+        command = [_moonshiner_executable(), "run",
                    "--only", seed["id"], "--max-attempts", str(args.max_attempts),
                    "--yes"]
-        return seed["id"], subprocess.run(command, cwd=root, env=environment).returncode
+        return seed["id"], subprocess.run(command, cwd=project, env=environment).returncode
 
     failures = 0
     known = {seed["id"] for seed in seeds}
@@ -113,11 +132,11 @@ def _run_individual_trace_jobs(seeds: list[dict], args, workers: int) -> int:
                 seed_id, code = future.result()
                 if code:
                     failures += 1
-                    print(f"[trace complete: rejected] {seed_id}", flush=True)
+                    print(f"[trace process failed] {seed_id}", flush=True)
                 else:
                     print(f"[trace complete: accepted] {seed_id}", flush=True)
     print(f"trace queue pass complete: {len(seeds) - failures} accepted, "
-          f"{failures} rejected, {len(seeds)} individual trace jobs", flush=True)
+          f"{failures} failed processes, {len(seeds)} individual trace jobs", flush=True)
     return 1 if failures else 0
 
 
@@ -200,14 +219,29 @@ def main(argv: list[str] | None = None) -> int:
     if len(seeds) > 1 and not args.yes:
         print("refusing a multi-seed metered run without --yes", file=sys.stderr)
         return 2
+    if args.detach:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        unit = f"moonshiner-trace-{stamp}"
+        log_dir = _project_root() / ".moonshiner" / "runs" / unit
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log = log_dir / "run.log"
+        child_argv = [value for value in original_argv if value != "--detach"]
+        command = ["systemd-run", "--user", "--collect", f"--unit={unit}",
+                   f"--property=WorkingDirectory={_project_root()}",
+                   "--property=Restart=on-failure", "--property=RestartSec=10s",
+                   f"--property=StandardOutput=append:{log}",
+                   f"--property=StandardError=append:{log}",
+                   f"--setenv=PATH={os.environ.get('PATH', '')}",
+                   "--setenv=MOONSHINER_SUPERVISED=1",
+                   _moonshiner_executable(), "run", *child_argv]
+        result = subprocess.run(command)
+        if result.returncode == 0:
+            print(f"trace queue started: {unit}")
+            print(f"log: {log}")
+        return result.returncode
     if len(seeds) > 1 and os.environ.get("MOONSHINER_SINGLE_TRACE") != "1":
         workers = args.workers or int(defaults.get("workers", 1))
         return _run_individual_trace_jobs(seeds, args, workers)
-    if args.detach:
-        command = [str(__import__('common').ROOT / "scripts" / "batch.sh"),
-                   "trace", sys.executable, str(__import__('common').ROOT / "moonshiner.py"),
-                   "run", *[value for value in original_argv if value != "--detach"]]
-        return subprocess.run(command).returncode
 
     # A dry run never touches the network or local dataset. The first real run
     # bootstraps the configured HF canonical only when it is locally absent.
