@@ -479,13 +479,28 @@ def _service(argv: list[str]) -> int:
     sub = parser.add_subparsers(dest="action", required=True)
     stop = sub.add_parser("stop", help="Stop one named Moonshiner service.")
     stop.add_argument("name")
+    drain = sub.add_parser(
+        "drain",
+        help="Pause a coordinator so its running child jobs can finish without replacements.")
+    drain.add_argument("name")
+    resume = sub.add_parser("resume", help="Resume a coordinator paused for draining.")
+    resume.add_argument("name")
     args = parser.parse_args(argv)
     name = args.name.removesuffix(".service")
     if not re.fullmatch(r"moonshiner-[A-Za-z0-9_.@-]+", name):
         parser.error("service name must identify one moonshiner-* service")
-    result = subprocess.run(["systemctl", "--user", "stop", f"{name}.service"])
+    if args.action == "stop":
+        command = ["systemctl", "--user", "stop", f"{name}.service"]
+        message = f"stopped {name}"
+    else:
+        signal = "SIGSTOP" if args.action == "drain" else "SIGCONT"
+        command = ["systemctl", "--user", "kill", "--kill-whom=main",
+                   f"--signal={signal}", f"{name}.service"]
+        message = (f"draining {name}; running child jobs were not stopped"
+                   if args.action == "drain" else f"resumed {name}")
+    result = subprocess.run(command)
     if result.returncode == 0:
-        print(f"stopped {name}")
+        print(message)
     return result.returncode
 
 
@@ -653,6 +668,8 @@ CREATE TRAINING DATA
   moonshiner status           Show current and previous runs
   moonshiner service stop NAME
                               Stop one named Moonshiner service
+  moonshiner service drain NAME
+                              Let current jobs finish without claiming replacements
   moonshiner update           Install the newest official release
   moonshiner dataset build    Build a dataset from accepted traces
   moonshiner dataset analyze --source PATH

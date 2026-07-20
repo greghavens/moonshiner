@@ -81,6 +81,14 @@ class FrontDoor(unittest.TestCase):
         with self.assertRaises(SystemExit):
             m._service(["stop", "ssh"])
 
+    def test_service_drain_pauses_only_the_coordinator_process(self):
+        with mock.patch.object(m.subprocess, "run", return_value=mock.Mock(returncode=0)) as run:
+            self.assertEqual(m._service(["drain", "moonshiner-trace-example"]), 0)
+        run.assert_called_once_with([
+            "systemctl", "--user", "kill", "--kill-whom=main", "--signal=SIGSTOP",
+            "moonshiner-trace-example.service",
+        ])
+
     def test_update_uses_official_installer_and_reports_version(self):
         pipe = mock.Mock()
         pipe.stdout = mock.Mock()
