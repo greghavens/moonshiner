@@ -77,6 +77,23 @@ class Readiness(unittest.TestCase):
         self.assertEqual(report["truncation"]["1"]["rows"], 2)
         self.assertTrue(report["advisories"])
 
+    def test_analysis_reports_privacy_without_exposing_or_rejecting_row(self):
+        source_row = {"messages": [{"role": "user", "content": "contact a@b.example"},
+                                   {"role": "assistant", "content": "done"}]}
+        with mock.patch.object(dataset_prep, "findings", return_value=["email address"]):
+            row = dataset_prep._normalize(source_row, "local:test", 7,
+                                          privacy_mode="report")
+        report = dataset_prep.analyze_rows([row], dataset_prep.TokenCounter())
+        self.assertEqual(report["privacy_findings"], {"email address": 1})
+        self.assertNotIn("a@b.example", json.dumps(report))
+
+    def test_composition_still_blocks_privacy_findings(self):
+        with mock.patch.object(dataset_prep, "findings", return_value=["email address"]):
+            with self.assertRaisesRegex(ValueError, "privacy findings"):
+                dataset_prep._normalize({"messages": [
+                    {"role": "user", "content": "x"},
+                    {"role": "assistant", "content": "y"}]}, "local:test", 0)
+
 
 class Reproducibility(unittest.TestCase):
     def test_hf_source_requires_revision_before_import(self):

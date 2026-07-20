@@ -111,7 +111,7 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _normalize(row: dict, source: str, index: int) -> dict:
+def _normalize(row: dict, source: str, index: int, *, privacy_mode: str = "block") -> dict:
     messages = row.get("messages") or row.get("conversations")
     if not messages and row.get("instruction") is not None:
         prompt = str(row["instruction"]) + (f"\n{row['input']}" if row.get("input") else "")
@@ -154,8 +154,10 @@ def _normalize(row: dict, source: str, index: int) -> dict:
     result = sanitize_object({"messages": normalized, "tools": tools, "meta": meta})
     serialized = json.dumps(result, ensure_ascii=False)
     hits = findings(serialized, exact_secrets=_staged_secret_values())
-    if hits:
+    if hits and privacy_mode == "block":
         raise ValueError(f"{source} row {index}: privacy findings {hits}")
+    if hits:
+        result["meta"]["privacy_findings"] = hits
     return result
 
 
@@ -190,9 +192,10 @@ def _hf_file_url(spec: str) -> str:
             + urllib.parse.quote(filename, safe="/"))
 
 
-def load_source(spec: str):
+def load_source(spec: str, *, privacy_mode: str = "block"):
     if spec.startswith(("https://huggingface.co/datasets/", "hf-file:")):
-        return [_normalize(row, spec, i) for i, row in enumerate(_remote_rows(_hf_file_url(spec)))]
+        return [_normalize(row, spec, i, privacy_mode=privacy_mode)
+                for i, row in enumerate(_remote_rows(_hf_file_url(spec)))]
     if spec.startswith("hf:"):
         reference = spec[3:]
         if "@" not in reference:
@@ -209,11 +212,14 @@ def load_source(spec: str):
                     "revision-pinned dataset splits require moonshiner[huggingface]; "
                     "a direct hf-file: reference works with the standard install")
             rows = _dataset_server_rows(dataset_id, split or "train")
-            return [_normalize(dict(row), spec, i) for i, row in enumerate(rows)]
+            return [_normalize(dict(row), spec, i, privacy_mode=privacy_mode)
+                    for i, row in enumerate(rows)]
         dataset = load_dataset(dataset_id, split=split or "train", revision=revision)
-        return [_normalize(dict(row), spec, i) for i, row in enumerate(dataset)]
+        return [_normalize(dict(row), spec, i, privacy_mode=privacy_mode)
+                for i, row in enumerate(dataset)]
     path = Path(spec.removeprefix("local:")).expanduser()
-    return [_normalize(row, spec, i) for i, row in enumerate(_local_rows(path))]
+    return [_normalize(row, spec, i, privacy_mode=privacy_mode)
+            for i, row in enumerate(_local_rows(path))]
 
 
 def _matches(value, patterns) -> bool:
@@ -311,6 +317,8 @@ def analyze_rows(rows: list[dict], counter: TokenCounter) -> dict:
     metrics = [row_metrics(row, counter) for row in rows]
     trajectory_rows = Counter(_trajectory_id(row) for row in rows)
     behavior = Counter()
+    privacy = Counter(finding for row in rows
+                      for finding in row["meta"].get("privacy_findings", []))
     for metric in metrics:
         behavior["multi-turn" if metric["assistant_turns"] > 1 else "single-turn"] += 1
         behavior["parallel-tool-calls" if metric["parallel"] else
@@ -325,6 +333,7 @@ def analyze_rows(rows: list[dict], counter: TokenCounter) -> dict:
             "reasoning_tokens": sum(m["reasoning_tokens"] for m in metrics),
             "assistant_turns": sum(m["assistant_turns"] for m in metrics),
             "tool_calls": sum(m["tool_calls"] for m in metrics),
+            "privacy_findings": sum(privacy.values()),
         },
         "lengths": {
             "total_tokens": _percentiles([m["total_tokens"] for m in metrics]),
@@ -332,6 +341,7 @@ def analyze_rows(rows: list[dict], counter: TokenCounter) -> dict:
             "rows_per_trajectory": _percentiles(list(trajectory_rows.values())),
         },
         "behavior_rows": dict(sorted(behavior.items())),
+        "privacy_findings": dict(sorted(privacy.items())),
         "mix": {
             "category": _mix(rows, metrics, lambda row: row["meta"].get("category")),
             "tag": _mix(rows, metrics, lambda row: row["meta"].get("tags") or []),
@@ -341,7 +351,7 @@ def analyze_rows(rows: list[dict], counter: TokenCounter) -> dict:
 
 
 def analyze_sources(sources: list[str], tokenizer: str | None = None) -> dict:
-    rows = [row for source in sources for row in load_source(source)]
+    rows = [row for source in sources for row in load_source(source, privacy_mode="report")]
     result = analyze_rows(rows, TokenCounter(tokenizer))
     result["sources"] = [_source_record(source) for source in sources]
     return result
@@ -578,6 +588,7 @@ def readiness_rows(rows: list[dict], counter: TokenCounter, *,
             str(message.get("content") or "") for message in row["messages"])) for row in rows),
         "repetitive_reasoning_heuristic": sum(_repetitive_reasoning(row) for row in rows),
         "malformed_tool_sequences": sum(_malformed_tools(row) for row in rows),
+        "privacy_findings": analysis["privacy_findings"],
         "categories_below_target_token_share": low_categories,
         "cumulative_prefix_trajectories": sum(1 for value in Counter(
             _trajectory_id(row) for row in rows).values() if value > 1),
@@ -672,7 +683,8 @@ def main(argv=None) -> int:
                          sample_packing=args.sample_packing)
         print(json.dumps(result, indent=2)); return 0
     if args.action == "readiness":
-        rows = [row for source in _resolved_sources(args.sources) for row in load_source(source)]
+        rows = [row for source in _resolved_sources(args.sources)
+                for row in load_source(source, privacy_mode="report")]
         result = readiness_rows(rows, TokenCounter(args.tokenizer),
                                 context_lengths=args.context_length or DEFAULT_CONTEXTS,
                                 packing=args.sample_packing, low_share=args.low_share)

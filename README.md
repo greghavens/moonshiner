@@ -239,7 +239,7 @@ Review training risks:
 moonshiner dataset readiness --source local:/data/prepared/train.jsonl --tokenizer organization/model --context-length 32768
 ```
 
-Readiness checks context truncation, empty final answers, duplicate prompts, malformed tool sequences, repetitive reasoning, mixed-language scripts, cumulative trajectory prefixes, and small category shares. It is advisory only: it reports evidence and never rejects rows or stops a pipeline.
+Readiness checks context truncation, empty final answers, duplicate prompts, malformed tool sequences, repetitive reasoning, mixed-language scripts, privacy findings, cumulative trajectory prefixes, and small category shares. Analysis and readiness report privacy finding types and counts without printing the affected row contents. They are advisory only; composition and publication remain fail-closed for privacy findings.
 
 Prepare trainer configuration:
 
