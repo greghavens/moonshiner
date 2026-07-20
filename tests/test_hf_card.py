@@ -3,7 +3,9 @@ attestation, and teacher/judge config — no hand-maintained numbers."""
 import json
 import pathlib
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "src"))
@@ -42,6 +44,15 @@ def _coding_and_security():
 
 
 class Units(unittest.TestCase):
+    def test_headline_size_uses_only_published_trace_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            traces = pathlib.Path(directory) / "traces.jsonl"
+            traces.write_bytes(b"x" * 1_000)
+            (pathlib.Path(directory) / "traces.jsonl.backup").write_bytes(b"x" * 10_000)
+            with mock.patch.object(card, "TRACES", traces):
+                text = card.build_card(_coding_and_security())
+            self.assertIn("1 kB</h2>", text)
+
     def test_size_category_boundaries(self):
         self.assertEqual(card._size_category(3), "n<1K")
         self.assertEqual(card._size_category(1_000), "1K<n<10K")

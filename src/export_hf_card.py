@@ -499,8 +499,7 @@ def build_card(rows: list[dict], *, stage: str = "release") -> str:
         "\n- Training or evaluating **defensive secure-coding and code-review** "
         "agents." if has_security else "")
 
-    file_size = sum(path.stat().st_size for path in PUBLISH_DIR.iterdir()
-                    if path.is_file()) if PUBLISH_DIR.is_dir() else 0
+    file_size = TRACES.stat().st_size if TRACES.is_file() else 0
     return f"""{_front_matter(pretty_name, license_id, tags, size_cat, has_security)}
 
 # {pretty_name}
