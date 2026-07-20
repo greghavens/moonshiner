@@ -166,6 +166,18 @@ class AcceptanceSchemaTests(unittest.TestCase):
             str(publish_queue.ROOT / "src/build_dataset.py"), "--quiet"],
             cwd=publish_queue.PROJECT_ROOT, check=True)
 
+    def test_built_tasks_reads_formatted_trajectory_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = pathlib.Path(directory)
+            (data / "next_step").mkdir()
+            (data / "next_step" / "train.jsonl").write_text(
+                json.dumps({"meta": {"task": "ready-one"}}) + "\n")
+            (data / "next_step" / "val.jsonl").write_text(
+                json.dumps({"meta": {"task": "ready-two"}}) + "\n")
+            with mock.patch.object(publish_queue, "DATA", data):
+                self.assertEqual(publish_queue.built_tasks(),
+                                 {"ready-one", "ready-two"})
+
 
 if __name__ == "__main__":
     unittest.main()

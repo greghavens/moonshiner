@@ -102,6 +102,23 @@ def published_tasks(path: Path, max_rows: int | None = None) -> set[str]:
     return tasks
 
 
+def built_tasks() -> set[str]:
+    """Return trajectories that the formatter actually produced."""
+    tasks = set()
+    for split in ("train", "val"):
+        path = DATA / "next_step" / f"{split}.jsonl"
+        if not path.is_file():
+            continue
+        with path.open() as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                task = (json.loads(line).get("meta") or {}).get("task")
+                if isinstance(task, str):
+                    tasks.add(task)
+    return tasks
+
+
 def run(*args: str) -> None:
     script, *rest = args
     subprocess.run([sys.executable, str(ROOT / script), *rest],
@@ -171,8 +188,10 @@ def main() -> int:
         known = published_tasks(output, int(baseline.get("bootstrap_rows") or 0))
         save_acknowledged(acknowledgements, known)
     print(f"publish queue active: {dataset}; {len(known)} existing tasks", flush=True)
+    blocked: set[str] = set()
     while True:
-        pending = [(stamp, task) for stamp, task in accepted_tasks() if task not in known]
+        pending = [(stamp, task) for stamp, task in accepted_tasks()
+                   if task not in known and task not in blocked]
         if not pending:
             time.sleep(2)
             continue
@@ -185,6 +204,17 @@ def main() -> int:
         print(f"[publish] {label}: format", flush=True)
         run("src/build_dataset.py", "--quiet")
         run("src/expand_next_steps.py")
+        available = built_tasks()
+        missing = [task for task in tasks if task not in available]
+        if missing:
+            blocked.update(missing)
+            for task in missing:
+                print(f"[publish blocked] {task}: accepted artifact is not buildable",
+                      flush=True)
+            tasks = [task for task in tasks if task in available]
+        if not tasks:
+            continue
+        label = tasks[0] if len(tasks) == 1 else f"{tasks[0]}…{tasks[-1]} ({len(tasks)})"
         export_args = ["src/export_hf_next_steps.py"]
         for task in tasks:
             export_args.extend(["--task", task])
