@@ -537,11 +537,20 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
             except (OSError, json.JSONDecodeError): pass
         published_file = DATA / "hf-publish" / "traces.jsonl"
         published = 0
+        published_rows = 0
         if published_file.is_file():
             try:
+                published_tasks = set()
                 with published_file.open() as handle:
-                    published = sum(1 for line in handle if line.strip())
-            except OSError:
+                    for line in handle:
+                        if not line.strip():
+                            continue
+                        published_rows += 1
+                        task = json.loads(line).get("task")
+                        if isinstance(task, str):
+                            published_tasks.add(task)
+                published = len(published_tasks)
+            except (OSError, json.JSONDecodeError):
                 pass
         config = load_config()
         workers = int(((config.get("pipeline") or {}).get("trace") or {}).get("workers", 1))
@@ -567,6 +576,7 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
             "publishing": {"dataset": (config.get("publish") or {}).get("hf_dataset"),
                            "batch_size": int((config.get("publish") or {}).get("batch_size", 1)),
                            "published_trajectories": published,
+                           "published_rows": published_rows,
                            "acknowledged_tasks": acknowledged_tasks},
             "services": sorted(units),
         }
@@ -593,7 +603,7 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
             print(f"    rates: accepted={acceptance_rate:.1f}%, "
                   f"rejected/exhausted={rejection_rate:.1f}%, "
                   f"retraced={retrace_rate:.1f}%")
-        print(f"Publishing: {published} trajectories in local HF mirror; "
+        print(f"Publishing: {published} trajectories; {published_rows} rows in local HF mirror; "
               f"{acknowledged_tasks} unique tasks acknowledged; batch size "
               f"{payload['publishing']['batch_size']}; {payload['publishing']['dataset'] or 'disabled'}")
         print("Services: " + (", ".join(sorted(units)) if units else "none"))
