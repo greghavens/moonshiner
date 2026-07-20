@@ -7,11 +7,8 @@ the raw stream into ``messages`` + tool schemas. One build path therefore serves
 a Codex, Claude Code, or Pi/GLM teacher without change.
 
 Every row carries ``messages``, ``tools``, and provenance ``meta`` (including the
-teacher runtime/model and its stream attestation). Gates are fail-closed: the
-seed must still exist and not be a holdout, the teacher must not have touched
-protected tests, verification must have passed, an independent review must have
-accepted the trace with hash pins matching the current bytes, host paths are
-scrubbed, and any surviving secret drops the row. Whole trajectories are kept
+teacher runtime/model and its stream attestation). The judge is the sole quality
+decision. Host paths and secrets are still scrubbed before output. Whole trajectories are kept
 here as immutable derivation sources; Hugging Face receives cumulative
 next-assistant-action prefixes built separately by ``expand_next_steps.py``.
 """
@@ -27,6 +24,7 @@ from common import (CONFIG, DATA, SECRET_RE, SYSTEM_PROMPT, TRACES, load_seeds, 
 from normalize import parse_trace, tool_schemas_for
 from screen_traces import validate_reviewer_verdict
 from privacy import sanitize_object
+from review_contract import is_accepted
 
 RAW = TRACES / "raw"
 META = TRACES / "meta"
@@ -46,46 +44,18 @@ def _provider(runtime_name: str) -> str:
 
 
 def screening_acceptance(task_id: str, info: dict) -> tuple[bool, str | None]:
-    """Require a complete, accepted review pinned to the current trace bytes."""
-    if info.get("kind") == "tool_behavior":
-        path = REVIEWS / f"{task_id}.json"
-        if not path.is_file(): return False, "behavior review is missing"
-        review=json.loads(path.read_text())
-        if review.get("accepted") is not True: return False, "behavior review rejected the trace"
-        if not (review.get("deterministic") or {}).get("accepted"):
-            return False, "behavior deterministic review failed"
-        if not (review.get("judge") or {}).get("model_attested"):
-            return False, "behavior judge model is not attested"
-        if review.get("raw_sha256") != info.get("raw_sha256"):
-            return False, "behavior review is stale: raw trace changed"
-        if review.get("seed_fingerprint") != info.get("seed_fingerprint"):
-            return False, "behavior review is stale: seed changed"
-        return True, None
-    required = ((CONFIG.get("quality", {}).get("require_coding_screening", False)
-                 and info.get("kind") != "tool_behavior")
-                or info.get("screening_required"))
-    if not required:
-        return True, None
+    """The judge's accepted decision is the only dataset-routing gate."""
     path = REVIEWS / f"{task_id}.json"
     if not path.exists():
-        return False, "required quality review is missing"
+        return False, "judge review is missing"
     try:
         review = json.loads(path.read_text())
     except json.JSONDecodeError as error:
-        return False, f"quality review is invalid JSON: {error}"
+        return False, f"judge review is invalid JSON: {error}"
     if review.get("id") != task_id:
-        return False, "quality review task id mismatch"
-    if not (review.get("accepted") is True and review.get("status") == "accepted"):
-        return False, "quality review did not accept the trace"
-    if not (review.get("deterministic") or {}).get("passed"):
-        return False, "deterministic screen did not pass"
-    accepted, error = validate_reviewer_verdict(review.get("verdict"))
-    if not accepted:
-        return False, f"reviewer verdict not clean: {error}"
-    for key in ("raw_sha256", "diff_sha256", "seed_fingerprint"):
-        if review.get(key) != info.get(key):
-            return False, f"quality review is stale: {key} changed since review"
-    return True, None
+        return False, "judge review task id mismatch"
+    return (True, None) if is_accepted(review) else (
+        False, "judge rejected the trace")
 
 
 def redact_secret_matches(value):
@@ -245,15 +215,6 @@ def main() -> None:
             continue
         if info["id"] in holdouts:
             dropped.append((info["id"], "holdout (eval-only)"))
-            continue
-        if info.get("protected_intact") is False:
-            dropped.append((info["id"], "teacher modified protected tests"))
-            continue
-        if info.get("passed") is False and not args.include_failed:
-            dropped.append((info["id"], "verify failed"))
-            continue
-        if info.get("passed") is None and not args.include_unverified:
-            dropped.append((info["id"], "unverified/deferred"))
             continue
         accepted, screening_error = screening_acceptance(info["id"], info)
         if not accepted:

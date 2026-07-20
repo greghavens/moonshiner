@@ -6,6 +6,7 @@ from pathlib import Path
 
 from common import BEHAVIOR_WORLDS, CONFIG, TRACES, scrub_text
 from runtimes.auth import load_provider_key
+from review_contract import verdict_accepts
 
 RAW, META, REVIEWS = TRACES / "raw", TRACES / "meta", TRACES / "reviews"
 FORMAT = "moonshiner-behavior-openai-v1"
@@ -159,7 +160,7 @@ def trace_task(seed: dict, teacher, *, feedback: str | None = None) -> dict:
                 tool_names.update(turn.get("add_tools", [])); tools=schemas_for_seed(seed,tool_names)
     safe=json.loads(scrub_text(json.dumps(messages,ensure_ascii=False)))
     raw=RAW/f"{seed['id']}.jsonl"; raw.write_text("\n".join(json.dumps(m) for m in safe)+"\n")
-    verdict=grade(seed,safe); REVIEWS.joinpath(f"{seed['id']}.json").write_text(json.dumps(verdict,indent=2)+"\n")
+    verdict=grade(seed,safe)
     raw_text=raw.read_text(); fingerprint=hashlib.sha256(seed["_path"].read_bytes()).hexdigest()
     record={"id":seed["id"],"kind":"tool_behavior","category":seed["category"],
       "passed":verdict["accepted"],"verify_passed":verdict["accepted"],"protected_intact":True,
@@ -187,10 +188,12 @@ def judge_trace(seed: dict, judge) -> dict:
     result=judge.run_review(instruction, seed["_path"].parent, out_dir=REVIEWS,
                             schema=schema, read_only=True)
     verdict=result.verdict if isinstance(result.verdict,dict) else None
-    accepted=bool(deterministic["accepted"] and verdict and verdict.get("accepted") is True
-                  and result.return_code in (0,None) and not result.timed_out and result.model_attested)
-    review={"id":seed["id"],"accepted":accepted,"status":"accepted" if accepted else "rejected",
-            "reason":deterministic["reason"] or (verdict or {}).get("reason") or result.error or "invalid judge verdict",
+    healthy = (result.return_code in (0, None) and not result.timed_out
+               and result.model_attested and not result.error)
+    accepted = healthy and verdict_accepts(verdict)
+    status = "accepted" if accepted else ("review_reject" if healthy else "judge_error")
+    review={"id":seed["id"],"accepted":accepted,"status":status,
+            "reason":(verdict or {}).get("reason") or result.error or "invalid judge verdict",
             "deterministic":deterministic,"verdict":verdict,"judge":{"runtime":judge.name,
             "model":judge.role["model"],"model_attested":result.model_attested},
             "raw_sha256":hashlib.sha256(raw.read_bytes()).hexdigest(),

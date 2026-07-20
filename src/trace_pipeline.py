@@ -15,7 +15,8 @@ from pathlib import Path
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 
-from common import CONFIG, deterministic_review_accepted, select_seeds
+from common import CONFIG, select_seeds
+from review_contract import is_accepted, is_judge_error
 from generate_traces import trace_task
 from run_state import (connect, create_run, finish_attempt, set_job,
                        set_run_status, start_attempt, run_row, job_rows,
@@ -66,9 +67,7 @@ def _selected(args) -> list[dict]:
     for path in (TRACES/"reviews").glob("*.json"):
         try: review=json.loads(path.read_text())
         except (OSError,json.JSONDecodeError): continue
-        if (review.get("accepted") is True
-                and deterministic_review_accepted(review)
-                and (review.get("judge") or {}).get("model_attested") is True):
+        if is_accepted(review):
             accepted.add(path.stem)
     categories = set(getattr(args, "category", None) or [])
     tags = set(getattr(args, "tag", None) or [])
@@ -78,23 +77,34 @@ def _selected(args) -> list[dict]:
     if os.environ.get("MOONSHINER_SUPERVISED") == "1":
         selected_kind = str((((CONFIG.get("pipeline") or {}).get("queues") or {})
                              .get("trace_kind") or "all"))
-    seeds = [s for s in select_seeds(kind=selected_kind, only=only,
-                                     categories=categories, tags=tags,
-                                     name=getattr(args, "name", None),
-                                     require_authored=False)
-             if s["id"] not in imported and s["id"] not in accepted]
     # Catalog membership is the only seed intake gate. Quality decisions belong
     # to the trace judge, and lifetime exhaustion prevents paid retry loops.
     ledger = connect()
+    accepted.update(str(row[0]) for row in ledger.execute(
+        "SELECT DISTINCT seed_id FROM attempts WHERE status='accepted'"))
     attempts = {row["seed_id"]: int(row["attempts"])
                 for row in ledger.execute("""SELECT j.seed_id, COUNT(a.id) attempts
                   FROM jobs j JOIN runs r ON r.id=j.run_id
                   LEFT JOIN attempts a ON a.run_id=j.run_id AND a.seed_id=j.seed_id
                     AND a.status IN ('accepted','retry','exhausted')
                   WHERE r.kind='trace' GROUP BY j.seed_id""")}
+    blocked = {str(row[0]) for row in ledger.execute("""
+        SELECT seed_id FROM (
+          SELECT j.seed_id,j.status,
+                 ROW_NUMBER() OVER (PARTITION BY j.seed_id
+                                   ORDER BY j.updated_at DESC,r.created_at DESC) AS rank
+          FROM jobs j JOIN runs r ON r.id=j.run_id WHERE r.kind='trace'
+        ) WHERE rank=1 AND status='infrastructure_blocked'""")}
     ledger.close()
     maximum = int(getattr(args, "max_attempts", 3))
-    seeds = [seed for seed in seeds if attempts.get(seed["id"], 0) < maximum]
+    seeds = [seed for seed in select_seeds(kind=selected_kind, only=only,
+                                           categories=categories, tags=tags,
+                                           name=getattr(args, "name", None),
+                                           require_authored=False)
+             if seed["id"] not in imported
+             and seed["id"] not in accepted
+             and seed["id"] not in blocked
+             and attempts.get(seed["id"], 0) < maximum]
     if args.limit:
         seeds = seeds[:args.limit]
     elif not args.all and not only:
@@ -358,19 +368,25 @@ def main(argv: list[str] | None = None) -> int:
         usage = (record.get("teacher") or {}).get("usage") or {}
         # Candidate checks are evidence for the trace judge, never a separate
         # rejection gate. Every completed candidate proceeds to judgment.
-        review = None
-        while True:
-            record_model_call(worker_db, run_id)
-            print(f"[{seed['id']}] attempt {number}/{args.max_attempts}: judge", flush=True)
-            with lease_heartbeat():
-                if seed.get("kind") == "tool_behavior":
-                    from behavior_trace import judge_trace
-                    review = judge_trace(seed, worker_judge)
-                else:
-                    review = screen(seed, worker_judge)
-            if review.get("status") != "judge_error":
-                break
-        if review.get("accepted") is True:
+        record_model_call(worker_db, run_id)
+        print(f"[{seed['id']}] attempt {number}/{args.max_attempts}: judge", flush=True)
+        with lease_heartbeat():
+            if seed.get("kind") == "tool_behavior":
+                from behavior_trace import judge_trace
+                review = judge_trace(seed, worker_judge)
+            else:
+                review = screen(seed, worker_judge)
+        if is_judge_error(review):
+            artifact = _archive_attempt(run_id, seed["id"], number)
+            reason = str(review.get("reason") or "judge execution failed")
+            finish_attempt(worker_db, run_id, seed["id"], number,
+                           "infrastructure_error", usage, review, reason,
+                           artifact_path=artifact)
+            set_job(worker_db, run_id, seed["id"], "infrastructure_blocked",
+                    claim["attempts"], reason)
+            print(f"[infrastructure blocked] {seed['id']}: {reason}", flush=True)
+            return
+        if is_accepted(review):
             artifact = _archive_attempt(run_id, seed["id"], number)
             finish_attempt(worker_db, run_id, seed["id"], number, "accepted",
                            usage, review, artifact_path=artifact)

@@ -51,6 +51,11 @@ def repair(db, *, apply: bool) -> dict:
             f"UPDATE attempts SET status='infrastructure_error',finished_at=?,"
             f"error=COALESCE(error,'confirmed infrastructure failure') "
             f"WHERE id IN ({placeholders})", (now(), *attempts))
+        seed_placeholders = ",".join("?" for _ in seeds)
+        db.execute(
+            f"UPDATE jobs SET status='retry',last_error=NULL,updated_at=? "
+            f"WHERE status='infrastructure_blocked' "
+            f"AND seed_id IN ({seed_placeholders})", (now(), *sorted(seeds)))
         db.commit()
     candidate_counts: dict[str, int] = {}
     for attempt_id in attempts:

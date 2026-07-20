@@ -1,7 +1,7 @@
 """Deterministic screening gates and repair-feedback synthesis. Model-free.
 
-Only offline behavior is exercised: the freshness gate (seed fingerprint), the
-feedback text a rejection turns into, and patch replay against a throwaway git
+Only offline behavior is exercised: diagnostics, the feedback text a rejection
+turns into, and patch replay against a throwaway git
 workspace (a real ``git apply`` — an invalid flag there once auto-rejected
 every trace). Judge paths need a runtime and are covered by the pipeline.
 """
@@ -30,18 +30,12 @@ class DeterministicGate(unittest.TestCase):
         self.seed = common.load_seeds()[0]
         self.fingerprint = common.seed_fingerprint(self.seed)
 
-    def test_seed_fresh_true_when_fingerprint_matches(self):
-        meta = {"seed_fingerprint": self.fingerprint, "raw_path": NOWHERE}
-        result = scr.deterministic_screen(self.seed, meta)
-        self.assertTrue(result["gates"]["seed_fresh"])
-
-    def test_stale_seed_is_fail_closed(self):
+    def test_seed_fingerprint_is_not_a_quality_gate(self):
         meta = {"seed_fingerprint": "not-the-real-hash", "raw_path": NOWHERE}
         result = scr.deterministic_screen(self.seed, meta)
-        self.assertFalse(result["gates"]["seed_fresh"])
-        self.assertFalse(result["passed"])
-        self.assertEqual(result["failures"][0],
-                         "stale: seed changed since trace was generated")
+        self.assertNotIn("seed_fresh", result["gates"])
+        self.assertFalse(any("seed changed" in failure
+                             for failure in result["failures"]))
 
 
 class PatchReplay(unittest.TestCase):

@@ -4,8 +4,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from common import (RUNS, STORAGE_ROOT, TRACES, deterministic_review_accepted,
-                    select_seeds)
+from common import RUNS, STORAGE_ROOT, TRACES, select_seeds
+from review_contract import is_accepted
 
 
 def authored_ids() -> set[str]:
@@ -71,10 +71,13 @@ def accepted_ids() -> set[str]:
             review = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        if (review.get("accepted") is True
-                and deterministic_review_accepted(review)
-                and (review.get("judge") or {}).get("model_attested") is True):
+        if is_accepted(review):
             accepted.add(path.stem)
+    from run_state import connect
+    db = connect()
+    accepted.update(str(row[0]) for row in db.execute(
+        "SELECT DISTINCT seed_id FROM attempts WHERE status='accepted'"))
+    db.close()
     return accepted
 
 

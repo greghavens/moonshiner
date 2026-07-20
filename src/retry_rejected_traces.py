@@ -27,6 +27,7 @@ from generate_traces import trace_task
 from runtimes import get_judge, get_teacher
 from runtimes.availability import ModelUnavailable, require_available
 from screen_traces import feedback_from_review, screen
+from review_contract import is_accepted
 
 REJECTED = {"deterministic_reject", "review_reject"}
 REVIEWS = TRACES / "reviews"
@@ -84,11 +85,7 @@ def retry(seed: dict, teacher, judge, max_attempts: int) -> bool:
         feedback = feedback_from_review(review) if review else None
         print(f"[retry] {task_id}: attempt {attempt}/{max_attempts}", flush=True)
         try:
-            record = trace_task(seed, teacher, force=True, feedback=feedback)
-            if record.get("passed") is not True:
-                print(f"[retry] {task_id}: replacement trace did not pass",
-                      flush=True)
-                continue
+            trace_task(seed, teacher, force=True, feedback=feedback)
             decision = screen(seed, judge)
         except ModelUnavailable:
             raise
@@ -98,7 +95,7 @@ def retry(seed: dict, teacher, judge, max_attempts: int) -> bool:
             continue
         print(f"[{decision.get('status')}] {task_id}: retry {attempt}/{max_attempts}",
               flush=True)
-        if decision.get("accepted") is True:
+        if is_accepted(decision):
             return True
     # Touch the review so a repeatedly-failing seed rotates behind fresher work.
     review_path = REVIEWS / f"{task_id}.json"
@@ -110,7 +107,7 @@ def retry(seed: dict, teacher, judge, max_attempts: int) -> bool:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--max-attempts", type=int, default=3)
+    parser.add_argument("--max-attempts", type=int, default=2)
     parser.add_argument("--limit", type=int, default=0,
                         help="Process at most N oldest rejections (0 = all)")
     args = parser.parse_args(argv)

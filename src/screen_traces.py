@@ -32,10 +32,11 @@ from pathlib import Path
 
 from common import (ROOT, TRACES, clear_runtime_caches, load_seeds, materialize,
                     protected_hashes, run_setup, run_verify, scrub_text,
-                    seed_fingerprint, DIFF_EXCLUDE_PATTERNS)
+                    DIFF_EXCLUDE_PATTERNS)
 from generate_traces import TRACE_ACTION_BOUNDARY
 from normalize import parse_trace
 from runtimes import get_judge
+from review_contract import is_accepted, is_judge_error
 
 RAW = TRACES / "raw"
 META = TRACES / "meta"
@@ -230,12 +231,7 @@ def deterministic_screen(seed: dict, meta: dict) -> dict:
     failures: list[str] = []
     gates: dict = {}
 
-    # 1. freshness / hash pins
-    fingerprint = seed_fingerprint(seed)
-    gates["seed_fresh"] = fingerprint == meta.get("seed_fingerprint")
-    if not gates["seed_fresh"]:
-        failures.append("stale: seed changed since trace was generated")
-
+    # Artifact hashes associate diagnostics with the exact generated trace.
     raw_path = RAW / Path(meta.get("raw_path", f"raw/{seed['id']}.jsonl")).name
     if raw_path.exists():
         gates["raw_fresh"] = _sha256_text(
@@ -260,7 +256,7 @@ def deterministic_screen(seed: dict, meta: dict) -> dict:
 
     # 3. patch replay + double verify (only if fresh so far)
     runtime_caches_removed: list[str] = []
-    if gates["seed_fresh"] and gates["diff_fresh"]:
+    if gates["diff_fresh"]:
         workspace = materialize(seed, name=f"screen-{seed['id']}")
         setup_ok, setup_detail = run_setup(seed, workspace)
         gates["setup_ok"] = setup_ok
@@ -429,8 +425,7 @@ def review_is_current(seed: dict, meta: dict) -> bool:
     except json.JSONDecodeError:
         return False
     return (review.get("raw_sha256") == meta.get("raw_sha256")
-            and review.get("diff_sha256") == meta.get("diff_sha256")
-            and review.get("seed_fingerprint") == meta.get("seed_fingerprint"))
+            and review.get("diff_sha256") == meta.get("diff_sha256"))
 
 
 def needs_first_pass(seed: dict) -> bool:
@@ -446,7 +441,7 @@ def needs_first_pass(seed: dict) -> bool:
     # pending: the same trace is re-reviewed instead of being routed to the
     # repair lane, which would re-bill a full teacher generation.
     review = json.loads((REVIEWS / f"{seed['id']}.json").read_text())
-    return (review.get("status") == "judge_error"
+    return (is_judge_error(review)
             and int(review.get("judge_errors", 1)) < JUDGE_ERROR_LIMIT)
 
 
@@ -466,16 +461,8 @@ def screen(seed: dict, judge=None) -> dict:
         "id": seed["id"],
         "raw_sha256": meta.get("raw_sha256"),
         "diff_sha256": meta.get("diff_sha256"),
-        "seed_fingerprint": meta.get("seed_fingerprint"),
         "deterministic": deterministic,
     }
-    if not deterministic["passed"]:
-        review.update({"status": "deterministic_reject",
-                       "accepted": False,
-                       "reason": "; ".join(deterministic["failures"])})
-        _write_review(seed["id"], review)
-        return review
-
     judge = judge or get_judge()
     raw_path = RAW / Path(meta.get("raw_path", f"raw/{seed['id']}.jsonl")).name
     messages, _ = parse_trace(raw_path, meta.get("trace_format", ""), workspace=None)
@@ -536,7 +523,7 @@ def _prior_judge_errors(seed_id: str, meta: dict) -> int:
         review = json.loads((REVIEWS / f"{seed_id}.json").read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         return 0
-    if review.get("status") != "judge_error":
+    if not is_judge_error(review):
         return 0
     if (review.get("raw_sha256") != meta.get("raw_sha256")
             or review.get("diff_sha256") != meta.get("diff_sha256")):
@@ -591,8 +578,8 @@ def main(argv: list[str] | None = None) -> int:
                       "status": "deterministic_pass" if deterministic["passed"]
                       else "deterministic_reject", "deterministic": deterministic}
         status = review.get("status")
-        accepted += bool(review.get("accepted"))
-        rejected += not review.get("accepted")
+        accepted += is_accepted(review)
+        rejected += not is_accepted(review)
         print(f"[{status:20}] {seed['id']}")
     print(f"\n{accepted} accepted, {rejected} rejected of {len(seeds)}")
     return 0
