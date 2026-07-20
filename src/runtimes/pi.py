@@ -84,12 +84,20 @@ class PiRuntime(Runtime):
         configured = Path(self.runtime_config.get("cli", "pi"))
         if configured.is_absolute():
             return configured
+        if configured.parent != Path("."):
+            confirmed = (self.config.get("workspace") or {}).get("confirmed_root")
+            project = Path(confirmed).resolve() if confirmed else Path.cwd().resolve()
+            return project / configured
         native = shutil.which(configured.name)
         if native:
             return Path(native)
         # Preserve Moonshiner's existing managed-install option. Native PATH
         # resolution always wins; this is only the explicit setup fallback.
         return ROOT / "node_modules" / ".bin" / "pi"
+
+    def _managed_node_modules(self) -> Path | None:
+        cli = self._cli_path()
+        return cli.parent.parent if cli.parent.name == ".bin" else None
 
     # -- lifecycle ---------------------------------------------------------- #
     def preflight(self, *, require_auth: bool = False) -> None:
@@ -161,7 +169,11 @@ class PiRuntime(Runtime):
             cmd += ["--tmpfs", mount]
         cmd += ["--tmpfs", "/tmp", "--dev-bind", "/dev", "/dev", "--proc", "/proc",
                 "--bind", str(workspace), str(workspace),
-                "--bind", str(runtime_dir), str(runtime_dir),
+                "--bind", str(runtime_dir), str(runtime_dir)]
+        managed = self._managed_node_modules()
+        if managed is not None:
+            cmd += ["--ro-bind", str(managed), str(runtime_dir / "node_modules")]
+        cmd += [
                 "--setenv", "HOME", str(runtime_dir / "home"),
                 "--setenv", "USER", "moonshiner-agent",
                 "--setenv", "LOGNAME", "moonshiner-agent",
@@ -180,7 +192,8 @@ class PiRuntime(Runtime):
         # stdin and is folded into the initial message. --api-key pins the
         # runtime credential to the proxy's dummy token as a second path
         # alongside the models.json apiKey.
-        cli = str(self._cli_path())
+        cli = (str(runtime_dir / "node_modules" / ".bin" / "pi")
+               if self._managed_node_modules() is not None else str(self._cli_path()))
         cmd = [cli, "--print", "--mode", "json",
                "--provider", self._provider(),
                "--model", self.role["model"],
