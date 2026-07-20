@@ -16,6 +16,7 @@ import publish_queue  # noqa: E402
 import trace_pipeline  # noqa: E402
 import run_state  # noqa: E402
 import behavior_trace  # noqa: E402
+import build_dataset  # noqa: E402
 
 
 class AcceptanceSchemaTests(unittest.TestCase):
@@ -177,6 +178,14 @@ class AcceptanceSchemaTests(unittest.TestCase):
             with mock.patch.object(publish_queue, "DATA", data):
                 self.assertEqual(publish_queue.built_tasks(),
                                  {"ready-one", "ready-two"})
+
+    def test_builder_uses_pi_recorded_events_filename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            raw = pathlib.Path(directory)
+            with mock.patch.object(build_dataset, "RAW", raw):
+                path = build_dataset.raw_trace_path(
+                    "paid-seed", {"raw_path": "traces/raw/paid-seed.events.jsonl"})
+            self.assertEqual(path, raw / "paid-seed.events.jsonl")
 
 
 if __name__ == "__main__":

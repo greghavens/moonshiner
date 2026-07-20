@@ -79,6 +79,12 @@ def est_tokens(message: dict, chars_per_token: float = 3.3) -> int:
     return int(size / chars_per_token) + 8
 
 
+def raw_trace_path(task_id: str, info: dict) -> Path:
+    """Resolve the runtime's recorded canonical artifact inside trace storage."""
+    recorded = Path(str(info.get("raw_path") or f"raw/{task_id}.jsonl")).name
+    return RAW / recorded
+
+
 def training_tags(seed: dict, turns: list[dict], info: dict) -> list[str]:
     """Describe behavior demonstrated by the accepted trajectory."""
     explicit = seed.get("training_tags") or seed.get("tags") or []
@@ -119,7 +125,7 @@ def training_tags(seed: dict, turns: list[dict], info: dict) -> list[str]:
 
 
 def build_row(seed: dict, info: dict) -> tuple[dict | None, str | None]:
-    raw = RAW / f"{seed['id']}.jsonl"
+    raw = raw_trace_path(seed["id"], info)
     if not raw.exists():
         return None, "no raw trace"
     trace_format = info.get("trace_format") or (info.get("teacher") or {}).get(
