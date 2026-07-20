@@ -504,6 +504,8 @@ def build_card(rows: list[dict], *, stage: str = "release") -> str:
   <h2>{total_traj:,} TRAJECTORIES · {total_rows:,} TRAINING ROWS · {_human_size(file_size)}</h2>
 </div>
 
+{ATTRIBUTION}
+
 Behavior-preserving **instruction-following, tool-calling, coding, and debugging
 trajectories** from **Claude Fable 5** (`claude-fable-5`). The corpus combines
 autonomous software-engineering sessions with non-code scenarios covering

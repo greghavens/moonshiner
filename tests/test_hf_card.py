@@ -64,6 +64,10 @@ class Card(unittest.TestCase):
         # 3 rows across 2 trajectories, all attested.
         self.assertIn("2 TRAJECTORIES", self.card)
         self.assertIn("3 TRAINING ROWS", self.card)
+        self.assertLess(self.card.index("3 TRAINING ROWS"),
+                        self.card.index("github.com/greghavens/moonshiner"))
+        self.assertLess(self.card.index("github.com/greghavens/moonshiner"),
+                        self.card.index("Behavior-preserving"))
 
     def test_teacher_and_judge_from_config(self):
         self.assertIn("Claude Fable 5", self.card)
