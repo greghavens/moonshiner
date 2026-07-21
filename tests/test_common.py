@@ -1,7 +1,10 @@
 """Core helpers: secret/path scrubbing, seed fingerprinting, corpus loading."""
 import pathlib
+import json
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "src"))
@@ -36,6 +39,35 @@ class Fingerprint(unittest.TestCase):
 
 
 class LoadSeeds(unittest.TestCase):
+    def test_installed_seed_loader_uses_corpus_catalog_priority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            corpus = pathlib.Path(directory) / "corpus"
+            seeds = corpus / "tasks" / "seeds"
+            behavior = corpus / "tasks" / "behavior-seeds"
+            (seeds / "repo-seed").mkdir(parents=True)
+            behavior.mkdir(parents=True)
+            (seeds / "repo-seed" / "task.json").write_text(json.dumps({
+                "id": "repo-seed", "category": "repo"
+            }))
+            (behavior / "behavior-first.json").write_text(json.dumps({
+                "id": "behavior-first", "category": "behavior"
+            }))
+            (corpus / "SEED_CATALOG.json").write_text(json.dumps({
+                "programs": {
+                    "Repository": {"priority": 0},
+                    "Behavior": {"priority": 1},
+                },
+                "categories": {
+                    "repo": [{"id": "repo-seed", "program": "Repository"}],
+                    "behavior": [{"id": "behavior-first", "program": "Behavior"}],
+                },
+            }))
+            with mock.patch.object(common, "SEEDS_DIR", seeds), \
+                    mock.patch.object(common, "BEHAVIOR_SEEDS_DIR", behavior):
+                ordered = common.load_seeds(include_holdout=True)
+        self.assertEqual([seed["id"] for seed in ordered],
+                         ["repo-seed", "behavior-first"])
+
     def test_single_file_seed_needs_no_repository_fixture_directory(self):
         self.assertIsNone(common._seed_files({"id": "catalog-seed", "_path": pathlib.Path("seed.json")}))
 
@@ -48,12 +80,15 @@ class LoadSeeds(unittest.TestCase):
             "behavior-*.json"))
         self.assertEqual(set(ids), expected)
         self.assertEqual(len(ids), len(set(ids)))
-        first_repository_seed = next(
-            index for index, seed in enumerate(seeds) if "_dir" in seed)
-        last_tool_interaction = max(
-            index for index, seed in enumerate(seeds)
-            if common.uses_tool_interaction(seed))
-        self.assertLess(last_tool_interaction, first_repository_seed)
+        catalog = json.loads(
+            (common.SEEDS_DIR.parents[1] / "SEED_CATALOG.json").read_text())
+        programs = catalog.get("programs") or {}
+        ranks = {item["id"]: int(programs.get(item.get("program"), {}).get(
+                    "priority", 1_000_000))
+                 for items in (catalog.get("categories") or {}).values()
+                 for item in items}
+        observed = [ranks.get(seed["id"], 1_000_000) for seed in seeds]
+        self.assertEqual(observed, sorted(observed))
 
     def test_holdout_excluded_by_default(self):
         holdout = set(common.CONFIG.get("holdout_tasks", []))

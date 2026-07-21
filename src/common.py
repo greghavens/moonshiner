@@ -292,8 +292,8 @@ def load_seeds(only: set[str] | None = None, include_holdout: bool = False) -> l
         seed["_path"] = path
         seeds.append(seed)
 
-    catalog_path = (SEEDS_DIR.parent / "SEED_CATALOG.json"
-                    if (SEEDS_DIR.parent / "SEED_CATALOG.json").is_file()
+    installed_catalog = SEEDS_DIR.parents[1] / "SEED_CATALOG.json"
+    catalog_path = (installed_catalog if installed_catalog.is_file()
                     else ROOT / "SEED_CATALOG.json")
     try:
         catalog = json.loads(catalog_path.read_text())
