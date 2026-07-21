@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from common import CONFIG, load_seeds, synthetic_tool_contract
 from configuration import PROJECT_ROOT
-from seed_inventory import authored_ids, documented_plan_items
+from seed_inventory import authored_ids, documented_plan_items, retired_seed_ids
 
 
 def _moonshiner() -> str:
@@ -30,8 +30,11 @@ def main(argv=None) -> int:
     if not 1 <= workers <= 64:
         parser.error("--workers must be from 1 through 64")
     plans = documented_plan_items()
-    missing = sorted(set(plans) - authored_ids())
-    print(f"seed queue: authored={len(authored_ids())}, waiting={len(missing)}, workers={workers}")
+    authored = authored_ids()
+    retired = retired_seed_ids()
+    missing = sorted(set(plans) - authored - retired)
+    print(f"seed queue: authored={len(authored)}, retired={len(retired)}, "
+          f"waiting={len(missing)}, workers={workers}")
     if not missing or args.dry_run:
         return 0
     if not args.yes:

@@ -10,6 +10,7 @@ from pathlib import Path
 from common import RUNS
 
 DB_PATH = RUNS / "moonshiner.sqlite3"
+RUN_KINDS = {"seed", "trace"}
 
 
 def now() -> str:
@@ -58,6 +59,39 @@ def connect(path: Path = DB_PATH) -> sqlite3.Connection:
         db.execute("ALTER TABLE jobs ADD COLUMN lease_expires_at TEXT")
     db.commit()
     return db
+
+
+def accepted_attempt_versions(db: sqlite3.Connection, kind: str) -> dict[str, int]:
+    """Return latest accepted attempt IDs for exactly one action queue."""
+    if kind not in RUN_KINDS:
+        raise ValueError(f"unknown run kind: {kind}")
+    return {str(row[0]): int(row[1]) for row in db.execute("""
+        SELECT a.seed_id,MAX(a.id) FROM attempts a
+        JOIN runs r ON r.id=a.run_id
+        WHERE r.kind=? AND a.status='accepted' GROUP BY a.seed_id""", (kind,))}
+
+
+def trace_attempt_counts_for_current_seed_revision(
+        db: sqlite3.Connection) -> dict[str, int]:
+    """Count trace attempts only after the latest accepted seed revision."""
+    return {str(row[0]): int(row[1]) for row in db.execute("""
+        SELECT a.seed_id,COUNT(a.id) FROM attempts a
+        JOIN runs r ON r.id=a.run_id
+        WHERE r.kind='trace' AND a.status IN ('accepted','retry','exhausted')
+          AND a.id > COALESCE((SELECT MAX(sa.id) FROM attempts sa
+            JOIN runs sr ON sr.id=sa.run_id WHERE sr.kind='seed'
+            AND sa.status='accepted' AND sa.seed_id=a.seed_id),0)
+        GROUP BY a.seed_id""")}
+
+
+def live_trace_run_ids(db: sqlite3.Connection) -> set[str]:
+    """Return trace runs that currently own at least one unexpired job lease."""
+    timestamp = now()
+    return {str(row[0]) for row in db.execute("""
+        SELECT DISTINCT r.id FROM runs r JOIN jobs j ON j.run_id=r.id
+        WHERE r.kind='trace' AND r.status='running' AND j.status='running'
+          AND j.lease_expires_at IS NOT NULL AND j.lease_expires_at>?""",
+        (timestamp,))}
 
 
 def create_run(db: sqlite3.Connection, kind: str, config: dict,

@@ -24,8 +24,9 @@ def repair(db, *, apply: bool) -> dict:
     attempts: list[int] = []
     seeds: set[str] = set()
     rows = db.execute(
-        "SELECT id,seed_id,review_json,error FROM attempts "
-        "WHERE status IN ('retry','exhausted','failed')").fetchall()
+        "SELECT a.id,a.seed_id,a.review_json,a.error FROM attempts a "
+        "JOIN runs r ON r.id=a.run_id WHERE r.kind='trace' "
+        "AND a.status IN ('retry','exhausted','failed')").fetchall()
     for row in rows:
         try:
             review = json.loads(row[2] or "{}")
@@ -63,10 +64,12 @@ def repair(db, *, apply: bool) -> dict:
                                  (attempt_id,)).fetchone()[0])
         candidate_counts[seed_id] = candidate_counts.get(seed_id, 0) + 1
     accepted = {str(row[0]) for row in db.execute(
-        "SELECT DISTINCT seed_id FROM attempts WHERE status='accepted'")}
+        "SELECT DISTINCT a.seed_id FROM attempts a JOIN runs r ON r.id=a.run_id "
+        "WHERE r.kind='trace' AND a.status='accepted'")}
     valid_counts = {str(row[0]): int(row[1]) for row in db.execute(
-        "SELECT seed_id,COUNT(*) FROM attempts "
-        "WHERE status IN ('accepted','retry','exhausted') GROUP BY seed_id")}
+        "SELECT a.seed_id,COUNT(*) FROM attempts a JOIN runs r ON r.id=a.run_id "
+        "WHERE r.kind='trace' AND a.status IN ('accepted','retry','exhausted') "
+        "GROUP BY a.seed_id")}
     from configuration import load_config
     maximum = int((((load_config().get("pipeline") or {}).get("trace") or {})
                    .get("max_attempts", 2)))

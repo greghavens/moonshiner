@@ -12,8 +12,8 @@ from unittest import mock
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from run_state import (abandon_claim, claim_job, connect, create_run,
-                       set_job)  # noqa: E402
+from run_state import (abandon_claim, claim_job, connect, create_run, finish_attempt,
+                       live_trace_run_ids, set_job, start_attempt)  # noqa: E402
 import trace_pipeline  # noqa: E402
 
 
@@ -106,6 +106,18 @@ class TraceConcurrency(unittest.TestCase):
         self.assertEqual(tuple(row), ("replacement", "running"))
         db.close()
 
+    def test_expired_claim_is_not_reported_as_a_live_trace(self):
+        db = connect(self.path)
+        claim_job(db, self.run_id, "dead-worker", lease_seconds=-1)
+        self.assertNotIn(self.run_id, live_trace_run_ids(db))
+        db.close()
+
+    def test_unexpired_claim_is_reported_as_a_live_trace(self):
+        db = connect(self.path)
+        claim_job(db, self.run_id, "live-worker", lease_seconds=120)
+        self.assertIn(self.run_id, live_trace_run_ids(db))
+        db.close()
+
     def test_failed_worker_returns_claim_immediately(self):
         db = connect(self.path)
         first = claim_job(db, self.run_id, "failed-worker")
@@ -137,6 +149,19 @@ class TraceConcurrency(unittest.TestCase):
         self.assertTrue({"lease_owner", "lease_expires_at"} <= columns)
         self.assertEqual(migrated.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 1)
         migrated.close()
+
+    def test_reauthored_seed_does_not_inherit_superseded_trace_attempts(self):
+        db = connect(self.path)
+        old_trace = create_run(db, "trace", {}, {}, ["seed-revised"])
+        start_attempt(db, old_trace, "seed-revised", 1)
+        finish_attempt(db, old_trace, "seed-revised", 1, "exhausted")
+        seed_run = create_run(db, "seed", {}, {}, ["seed-revised"])
+        start_attempt(db, seed_run, "seed-revised", 1)
+        finish_attempt(db, seed_run, "seed-revised", 1, "accepted")
+        from run_state import trace_attempt_counts_for_current_seed_revision
+        self.assertEqual(
+            trace_attempt_counts_for_current_seed_revision(db).get("seed-revised", 0), 0)
+        db.close()
 
 
 if __name__ == "__main__":

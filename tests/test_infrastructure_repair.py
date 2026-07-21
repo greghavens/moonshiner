@@ -57,6 +57,23 @@ class InfrastructureRepairTests(unittest.TestCase):
                              "exhausted")
             db.close()
 
+    def test_ignores_seed_author_attempts_entirely(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = connect(pathlib.Path(directory) / "ledger.sqlite3")
+            run_id = create_run(db, "seed", {}, {"max_attempts": 2}, ["go-seed"])
+            start_attempt(db, run_id, "go-seed", 1)
+            review = {"deterministic": {"failures": [
+                "setup failed: bwrap: execvp go: No such file or directory"]}}
+            finish_attempt(db, run_id, "go-seed", 1, "exhausted", review=review)
+            with mock.patch.object(infrastructure_repair, "sandbox_tool_ready") as ready:
+                result = infrastructure_repair.repair(db, apply=True)
+            self.assertEqual(result["attempts"], 0)
+            self.assertEqual(result["requeued"], 0)
+            ready.assert_not_called()
+            self.assertEqual(db.execute("SELECT status FROM attempts").fetchone()[0],
+                             "exhausted")
+            db.close()
+
 
 if __name__ == "__main__":
     unittest.main()

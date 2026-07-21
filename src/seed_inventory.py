@@ -70,10 +70,10 @@ def documented_plan_items() -> dict[str, str]:
         if synthetic_tool_contract(seed):
             tags = ", ".join(seed.get("training_tags") or [])
             items[seed["id"]] = (
-                "Reauthor this existing objective as a pure Pi-harness seed. "
+                "Reauthor this existing objective for the selected unmodified agent harness. "
                 "Preserve the ID, capability objective, category, and training "
                 f"tags ({tags}). Use only genuine tools installed and executed "
-                "by Pi. Do not embed tool results, initial service state, answer "
+                "by that harness. Do not embed tool results, initial service state, answer "
                 "keys, expected call arguments, fictional tool schemas, mock "
                 "services, or .invalid URLs. For research, require live web "
                 "search and real fetched sources. Original objective: "
@@ -87,7 +87,25 @@ def planned_ids() -> set[str]:
     return catalogued_ids() | documented_plan_ids()
 
 
-def accepted_ids() -> set[str]:
+def retired_seed_ids(db=None) -> set[str]:
+    """Return seed-authoring work retired after its own attempt allowance."""
+    owns_db = db is None
+    if owns_db:
+        from run_state import connect
+        db = connect()
+    retired = {str(row[0]) for row in db.execute("""
+        SELECT latest.seed_id FROM (
+          SELECT a.seed_id,a.status,
+                 ROW_NUMBER() OVER (PARTITION BY a.seed_id ORDER BY a.id DESC) AS rank
+          FROM attempts a JOIN runs r ON r.id=a.run_id WHERE r.kind='seed'
+        ) AS latest
+        WHERE latest.rank=1 AND latest.status IN ('retired','exhausted')""")}
+    if owns_db:
+        db.close()
+    return retired
+
+
+def accepted_ids(db=None) -> set[str]:
     from import_existing import imported_task_ids
     accepted = set(imported_task_ids())
     for path in (TRACES / "reviews").glob("*.json"):
@@ -97,11 +115,23 @@ def accepted_ids() -> set[str]:
             continue
         if is_accepted(review):
             accepted.add(path.stem)
-    from run_state import connect
-    db = connect()
-    accepted.update(str(row[0]) for row in db.execute(
-        "SELECT DISTINCT seed_id FROM attempts WHERE status='accepted'"))
-    db.close()
+    owns_db = db is None
+    if owns_db:
+        from run_state import connect
+        db = connect()
+    from run_state import accepted_attempt_versions
+    seed_versions = accepted_attempt_versions(db, "seed")
+    trace_versions = accepted_attempt_versions(db, "trace")
+    if owns_db:
+        db.close()
+    # Imported rows and filesystem reviews are baseline acceptances. Once the
+    # seed author accepts a newer revision, only a subsequently accepted trace
+    # can complete that seed again.
+    for seed_id, seed_version in seed_versions.items():
+        if trace_versions.get(seed_id, 0) <= seed_version:
+            accepted.discard(seed_id)
+    accepted.update(seed_id for seed_id, trace_version in trace_versions.items()
+                    if trace_version > seed_versions.get(seed_id, 0))
     return accepted
 
 
@@ -110,14 +140,14 @@ def trace_state(max_attempts: int) -> dict[str, set[str]]:
     ready = authored_ids()
     needs_reauthoring = target - ready
     accepted = accepted_ids() & ready
-    from run_state import connect
+    from run_state import connect, now
     db = connect()
     active = {row[0] for row in db.execute(
         "SELECT DISTINCT j.seed_id FROM jobs j JOIN runs r ON r.id=j.run_id "
-        "WHERE r.kind='trace' AND r.status='running' AND j.status='running'")}
-    attempts = {row[0]: int(row[1]) for row in db.execute(
-        "SELECT seed_id,COUNT(*) FROM attempts "
-        "WHERE status IN ('accepted','retry','exhausted') GROUP BY seed_id")}
+        "WHERE r.kind='trace' AND r.status='running' AND j.status='running' "
+        "AND j.lease_expires_at IS NOT NULL AND j.lease_expires_at>?", (now(),))}
+    from run_state import trace_attempt_counts_for_current_seed_revision
+    attempts = trace_attempt_counts_for_current_seed_revision(db)
     db.close()
     active &= ready - accepted
     exhausted = {seed_id for seed_id in ready - accepted - active

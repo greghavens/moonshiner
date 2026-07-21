@@ -34,9 +34,10 @@ def restore_hidden_acceptances() -> list[str]:
     db = connect()
     try:
         rows = db.execute(
-            "SELECT seed_id,artifact_path FROM attempts "
-            "WHERE status='accepted' AND artifact_path IS NOT NULL "
-            "ORDER BY finished_at").fetchall()
+            "SELECT a.seed_id,a.artifact_path FROM attempts a "
+            "JOIN runs r ON r.id=a.run_id "
+            "WHERE r.kind='trace' AND a.status='accepted' "
+            "AND a.artifact_path IS NOT NULL ORDER BY a.id").fetchall()
     finally:
         db.close()
     latest = {str(row[0]): Path(str(row[1])) for row in rows}
@@ -77,6 +78,8 @@ def accepted_tasks() -> list[tuple[float, str, int]]:
     from run_state import connect
     db = connect()
     try:
+        from seed_inventory import accepted_ids
+        accepted = accepted_ids(db)
         versions = {str(row[0]): int(row[1]) for row in db.execute(
             "SELECT a.seed_id,MAX(a.id) FROM attempts a "
             "JOIN runs r ON r.id=a.run_id "
@@ -89,7 +92,7 @@ def accepted_tasks() -> list[tuple[float, str, int]]:
             review = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        if (is_accepted(review)
+        if (path.stem in accepted and is_accepted(review)
                 and (TRACES / "meta" / path.name).is_file()):
             ready.append((path.stat().st_mtime, path.stem,
                           versions.get(path.stem, 0)))

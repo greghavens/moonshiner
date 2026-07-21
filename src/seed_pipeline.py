@@ -21,11 +21,11 @@ CANDIDATES = STORAGE_ROOT / "tasks" / "candidates"
 
 AUTHOR_SYSTEM = """You author deterministic coding repair seeds for Moonshiner. Work only in the current workspace. Create exactly task.json, files/, and reference_fix.patch at the workspace root. The starting files must contain one focused defect; protected tests must expose it; the reference patch must fix it without modifying tests. Commands must be offline and deterministic. Do not run another coding agent."""
 
-REAUTHOR_SYSTEM = """You reauthor one contaminated Moonshiner seed as a pure
-Pi-harness task. Work only in the current workspace. Create exactly task.json,
+REAUTHOR_SYSTEM = """You reauthor one contaminated Moonshiner seed for the
+selected unmodified agent harness. Work only in the current workspace. Create exactly task.json,
 files/, and reference_fix.patch at the workspace root. Preserve the supplied
 seed ID, capability objective, category, and training tags. The task must make
-the agent use Pi's genuine executable tools against the provided sandboxed
+the agent use the selected harness's genuine executable tools against the provided sandboxed
 environment. The environment and its data may be simulated; tool execution
 must never be simulated. Never embed tool calls, tool results, expected call
 arguments, answer-key response maps, initial service state, fictional tool
@@ -150,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
                                      and item.get("status") == "accept"
                                      for item in verdict.get("seed_reviews", [])))
             accepted = final_report.get("passed") is True and verdict_clear
-            status = "accepted" if accepted else ("retry" if number < args.max_attempts else "exhausted")
+            status = "accepted" if accepted else ("retry" if number < args.max_attempts else "retired")
             error = None if accepted else "; ".join(final_report.get("failures") or [verdict.get("summary", "judge rejected")])
             finish_attempt(db, run_id, args.id, number, status,
                            review=verdict, error=error)

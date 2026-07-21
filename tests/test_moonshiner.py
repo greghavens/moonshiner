@@ -52,10 +52,12 @@ class FrontDoor(unittest.TestCase):
              mock.patch.object(run_state, "summaries", return_value=[]), \
              mock.patch("seed_inventory.catalogued_ids", return_value=set()), \
              mock.patch("seed_inventory.planned_ids", return_value=set()), \
+             mock.patch("seed_inventory.retired_seed_ids", return_value=set()), \
              mock.patch("seed_inventory.trace_state", return_value={
                  "target": set(), "accepted": set(), "active": set(),
                  "waiting": set(), "exhausted": set(),
                  "needs_reauthoring": set()}), \
+             mock.patch("run_state.live_trace_run_ids", return_value=set()), \
              mock.patch("publish_queue.accepted_tasks", return_value=[]), \
              mock.patch.object(m.subprocess, "run", return_value=service_result), \
              mock.patch("builtins.print") as output:

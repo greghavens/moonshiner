@@ -584,9 +584,13 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
     if not inspect and not args.run_id and not args.all:
         from common import DATA
         from configuration import load_config
-        from seed_inventory import catalogued_ids, planned_ids, trace_state
+        from seed_inventory import (catalogued_ids, planned_ids,
+                                    retired_seed_ids, trace_state)
         authored = catalogued_ids(); planned = planned_ids()
-        active = [row for row in rows if row["status"] == "running" and row["kind"] == "trace"]
+        retired = retired_seed_ids()
+        from run_state import live_trace_run_ids
+        live_trace_runs = live_trace_run_ids(db)
+        active = [row for row in rows if row["id"] in live_trace_runs]
         author_runs = [row for row in rows if row["status"] == "running" and row["kind"] == "seed"]
         ack = DATA / "hf-sync" / "published-trajectories.json"
         acknowledged_tasks = 0
@@ -637,7 +641,8 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
                 units.append(name.removesuffix(".service"))
         payload = {
             "seeds": {"planned": len(planned), "authored": len(authored),
-                      "waiting": len(planned - authored)},
+                      "retired": len(retired),
+                      "waiting": len(planned - authored - retired)},
             "authoring": {"active_runs": author_runs},
             "tracing": {"workers": workers, "target": len(traced["target"]),
                         "accepted": len(traced["accepted"]),
@@ -657,7 +662,8 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
         if args.json:
             print(json.dumps(payload, indent=2)); return 0
         print("Moonshiner status")
-        print(f"Seeds: {len(authored)}/{len(planned)} authored; {len(planned-authored)} waiting")
+        print(f"Seeds: {len(authored)}/{len(planned)} authored; {len(retired)} retired; "
+              f"{len(planned-authored-retired)} waiting")
         print(f"Authoring: {len(author_runs)} seed job(s) in progress")
         print(f"Traces: {len(traced['accepted'])}/{len(traced['target'])} accepted; "
               f"{len(traced['active'])} active; {len(traced['waiting'])} waiting; "

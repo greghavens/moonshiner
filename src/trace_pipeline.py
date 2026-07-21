@@ -15,7 +15,7 @@ from pathlib import Path
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 
-from common import CONFIG, select_seeds
+from common import CONFIG, TRACES, select_seeds
 from review_contract import is_accepted, is_judge_error
 from generate_traces import trace_task
 from run_state import (connect, create_run, finish_attempt, set_job,
@@ -58,46 +58,51 @@ def ensure_publish_queue() -> None:
         subprocess.run(command, check=True)
 
 
+def existing_harness_trace(seed_id: str) -> bool:
+    """Return true only for a buildable trace emitted by a registered harness."""
+    meta_path = TRACES / "meta" / f"{seed_id}.json"
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return False
+    from normalize import _BY_FORMAT
+    if meta.get("trace_format") not in _BY_FORMAT:
+        return False
+    raw_path = Path(str(meta.get("raw_path") or ""))
+    if not raw_path.is_absolute():
+        raw_path = TRACES.parent / raw_path
+    return bool(meta.get("passed") and raw_path.is_file())
+
+
 def _selected(args) -> list[dict]:
-    from import_existing import imported_task_ids
+    from seed_inventory import accepted_ids
     only = {v.strip() for v in args.only.split(",") if v.strip()} if args.only else None
-    imported = imported_task_ids()
-    from common import TRACES
-    accepted=set()
-    for path in (TRACES/"reviews").glob("*.json"):
-        try: review=json.loads(path.read_text())
-        except (OSError,json.JSONDecodeError): continue
-        if is_accepted(review):
-            accepted.add(path.stem)
     categories = set(getattr(args, "category", None) or [])
     tags = set(getattr(args, "tag", None) or [])
     # Catalog membership is the only seed intake gate. Quality decisions belong
     # to the trace judge, and lifetime exhaustion prevents paid retry loops.
     ledger = connect()
-    accepted.update(str(row[0]) for row in ledger.execute("""
-        SELECT DISTINCT a.seed_id FROM attempts a
-        JOIN runs r ON r.id=a.run_id
-        WHERE r.kind='trace' AND a.status='accepted'"""))
-    attempts = {row["seed_id"]: int(row["attempts"])
-                for row in ledger.execute("""SELECT j.seed_id, COUNT(a.id) attempts
-                  FROM jobs j JOIN runs r ON r.id=j.run_id
-                  LEFT JOIN attempts a ON a.run_id=j.run_id AND a.seed_id=j.seed_id
-                    AND a.status IN ('accepted','retry','exhausted')
-                  WHERE r.kind='trace' GROUP BY j.seed_id""")}
+    accepted = accepted_ids(ledger)
+    from run_state import trace_attempt_counts_for_current_seed_revision
+    attempts = trace_attempt_counts_for_current_seed_revision(ledger)
     blocked = {str(row[0]) for row in ledger.execute("""
-        SELECT seed_id FROM (
+        SELECT latest.seed_id FROM (
           SELECT j.seed_id,j.status,
+                 j.updated_at,
                  ROW_NUMBER() OVER (PARTITION BY j.seed_id
                                    ORDER BY j.updated_at DESC,r.created_at DESC) AS rank
           FROM jobs j JOIN runs r ON r.id=j.run_id WHERE r.kind='trace'
-        ) WHERE rank=1 AND status='infrastructure_blocked'""")}
+        ) AS latest WHERE latest.rank=1 AND latest.status='infrastructure_blocked'
+          AND NOT EXISTS (SELECT 1 FROM attempts sa
+            JOIN runs sr ON sr.id=sa.run_id WHERE sr.kind='seed'
+            AND sa.status='accepted' AND sa.seed_id=latest.seed_id
+            AND sa.finished_at>=latest.updated_at)""")}
     ledger.close()
     maximum = int(getattr(args, "max_attempts", 3))
     seeds = [seed for seed in select_seeds(only=only,
                                            categories=categories, tags=tags,
                                            name=getattr(args, "name", None))
-             if seed["id"] not in imported
-             and seed["id"] not in accepted
+             if seed["id"] not in accepted
              and seed["id"] not in blocked
              and attempts.get(seed["id"], 0) < maximum]
     if args.limit:
@@ -279,16 +284,14 @@ def main(argv: list[str] | None = None) -> int:
              "judge": {"runtime": judge.name, **judge.role}}
     run_id = args.resume or create_run(db, "trace", roles, limits, [s["id"] for s in seeds])
     if not args.resume:
-        # Carry each seed's lifetime attempt count into its new one-seed ledger
-        # record. A process or machine restart must never grant more attempts.
+        # Carry attempts for the current authored seed revision into its new
+        # one-seed ledger record. Reauthoring deliberately starts a fresh trace
+        # lifecycle; older trace attempts belong to the superseded seed.
+        from run_state import trace_attempt_counts_for_current_seed_revision
+        prior_counts = trace_attempt_counts_for_current_seed_revision(db)
         for seed in seeds:
-            prior = db.execute("""SELECT COUNT(a.id) FROM attempts a
-                JOIN runs r ON r.id=a.run_id
-                WHERE r.kind='trace' AND a.seed_id=? AND a.run_id<>?
-                  AND a.status IN ('accepted','retry','exhausted')""",
-                (seed["id"], run_id)).fetchone()[0]
             db.execute("UPDATE jobs SET attempts=? WHERE run_id=? AND seed_id=?",
-                       (int(prior), run_id, seed["id"]))
+                       (prior_counts.get(seed["id"], 0), run_id, seed["id"]))
         db.commit()
     if args.resume: set_run_status(db,run_id,"running")
     total_jobs = len(job_rows(db, run_id))
@@ -330,10 +333,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[infrastructure blocked] {seed['id']}: {environment_detail}",
                   flush=True)
             return
-        record_model_call(worker_db, run_id)
-        start_attempt(worker_db, run_id, seed["id"], number)
         feedback = claim.get("last_error")
-        print(f"[{seed['id']}] attempt {number}/{args.max_attempts}: author", flush=True)
         @contextmanager
         def lease_heartbeat():
             stopped = threading.Event()
@@ -355,6 +355,34 @@ def main(argv: list[str] | None = None) -> int:
                 stopped.set(); thread.join()
 
         with lease_heartbeat():
+            if claim["attempts"] == 0 and existing_harness_trace(seed["id"]):
+                start_attempt(worker_db, run_id, seed["id"], number)
+                record_model_call(worker_db, run_id)
+                print(f"[{seed['id']}] existing harness trace: judge", flush=True)
+                review = screen(seed, worker_judge)
+                if is_judge_error(review):
+                    reason = str(review.get("reason") or "judge execution failed")
+                    finish_attempt(worker_db, run_id, seed["id"], number,
+                                   "infrastructure_error", review=review, error=reason)
+                    set_job(worker_db, run_id, seed["id"], "infrastructure_blocked",
+                            claim["attempts"], reason)
+                    return
+                if is_accepted(review):
+                    artifact = _archive_attempt(run_id, seed["id"], number)
+                    finish_attempt(worker_db, run_id, seed["id"], number, "accepted",
+                                   review=review, artifact_path=artifact)
+                    print(f"[accepted existing trace] {seed['id']}", flush=True)
+                    return
+                artifact = _archive_attempt(run_id, seed["id"], number)
+                reason = feedback_from_review(review)
+                finish_attempt(worker_db, run_id, seed["id"], number,
+                               "retry" if number < args.max_attempts else "exhausted",
+                               review=review, error=reason, artifact_path=artifact)
+                print(f"[rejected existing trace] {seed['id']}: {reason}", flush=True)
+                return
+            record_model_call(worker_db, run_id)
+            start_attempt(worker_db, run_id, seed["id"], number)
+            print(f"[{seed['id']}] attempt {number}/{args.max_attempts}: author", flush=True)
             record = trace_task(seed, worker_teacher, force=True, feedback=feedback)
         usage = (record.get("teacher") or {}).get("usage") or {}
         # Candidate checks are evidence for the trace judge, never a separate

@@ -17,6 +17,7 @@ import publish_queue  # noqa: E402
 import trace_pipeline  # noqa: E402
 import run_state  # noqa: E402
 import build_dataset  # noqa: E402
+import seed_inventory  # noqa: E402
 
 
 class AcceptanceSchemaTests(unittest.TestCase):
@@ -54,7 +55,9 @@ class AcceptanceSchemaTests(unittest.TestCase):
             }
             (traces / "reviews" / "coding-seed.json").write_text(json.dumps(review))
             (traces / "meta" / "coding-seed.json").write_text("{}")
-            with mock.patch.object(publish_queue, "TRACES", traces):
+            with mock.patch.object(publish_queue, "TRACES", traces), \
+                 mock.patch.object(seed_inventory, "TRACES", traces), \
+                 mock.patch("import_existing.imported_task_ids", return_value=set()):
                 ready = publish_queue.accepted_tasks()
             self.assertEqual([task for _, task, _ in ready], ["coding-seed"])
 
@@ -113,6 +116,71 @@ class AcceptanceSchemaTests(unittest.TestCase):
                                return_value=set()):
                 self.assertEqual(trace_pipeline._selected(args), [seed])
 
+    def test_reauthored_seed_invalidates_imported_and_filesystem_trace_acceptance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            traces = root / "traces"
+            (traces / "reviews").mkdir(parents=True)
+            seed_id = "replaced-seed"
+            (traces / "reviews" / f"{seed_id}.json").write_text(
+                json.dumps({"id": seed_id, "accepted": True,
+                            "judge": {"runtime": "legacy"}}))
+            database = root / "runs.sqlite3"
+            real_connect = run_state.connect
+            db = real_connect(database)
+            old_trace = run_state.create_run(db, "trace", {}, {}, [seed_id])
+            run_state.start_attempt(db, old_trace, seed_id, 1)
+            run_state.finish_attempt(db, old_trace, seed_id, 1, "accepted")
+            replacement = run_state.create_run(db, "seed", {}, {}, [seed_id])
+            run_state.start_attempt(db, replacement, seed_id, 1)
+            run_state.finish_attempt(db, replacement, seed_id, 1, "accepted")
+            db.close()
+            args = SimpleNamespace(only=None, category=None, tag=None,
+                                   name=None, max_attempts=2, limit=0, all=True)
+            with mock.patch.object(trace_pipeline, "connect",
+                                   side_effect=lambda: real_connect(database)), \
+                 mock.patch.object(trace_pipeline, "select_seeds",
+                                   return_value=[{"id": seed_id}]), \
+                 mock.patch.object(seed_inventory, "TRACES", traces), \
+                 mock.patch("import_existing.imported_task_ids",
+                            return_value={seed_id}):
+                self.assertEqual(trace_pipeline._selected(args), [{"id": seed_id}])
+
+    def test_new_trace_acceptance_after_reauthor_completes_trace_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = pathlib.Path(directory) / "runs.sqlite3"
+            db = run_state.connect(database)
+            seed_id = "replacement-completed"
+            seed_run = run_state.create_run(db, "seed", {}, {}, [seed_id])
+            run_state.start_attempt(db, seed_run, seed_id, 1)
+            run_state.finish_attempt(db, seed_run, seed_id, 1, "accepted")
+            trace_run = run_state.create_run(db, "trace", {}, {}, [seed_id])
+            run_state.start_attempt(db, trace_run, seed_id, 1)
+            run_state.finish_attempt(db, trace_run, seed_id, 1, "accepted")
+            self.assertEqual(run_state.accepted_attempt_versions(db, "seed"),
+                             {seed_id: 1})
+            self.assertEqual(run_state.accepted_attempt_versions(db, "trace"),
+                             {seed_id: 2})
+            with self.assertRaises(ValueError):
+                run_state.accepted_attempt_versions(db, "anything")
+            db.close()
+
+    def test_old_trace_attempts_do_not_exhaust_reauthored_seed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = pathlib.Path(directory) / "runs.sqlite3"
+            db = run_state.connect(database)
+            seed_id = "replacement-attempt-budget"
+            old = run_state.create_run(db, "trace", {}, {}, [seed_id])
+            for number, status in ((1, "retry"), (2, "exhausted")):
+                run_state.start_attempt(db, old, seed_id, number)
+                run_state.finish_attempt(db, old, seed_id, number, status)
+            replacement = run_state.create_run(db, "seed", {}, {}, [seed_id])
+            run_state.start_attempt(db, replacement, seed_id, 1)
+            run_state.finish_attempt(db, replacement, seed_id, 1, "accepted")
+            self.assertEqual(
+                run_state.trace_attempt_counts_for_current_seed_revision(db), {})
+            db.close()
+
     def test_hidden_accepted_artifact_is_restored_for_publication(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -148,6 +216,33 @@ class AcceptanceSchemaTests(unittest.TestCase):
             restored = json.loads(
                 (traces / "reviews" / f"{seed_id}.json").read_text())
             self.assertTrue(is_accepted(restored))
+
+    def test_seed_judge_artifact_can_never_be_restored_as_a_trace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            traces = root / "traces"
+            archive = root / "seed-artifact"
+            for child in ("reviews", "meta", "raw"):
+                (traces / child).mkdir(parents=True)
+            archive.mkdir()
+            seed_id = "seed-only"
+            (archive / "reviews.json").write_text(json.dumps({
+                "id": seed_id, "accepted": True, "judge": {"runtime": "codex"}}))
+            (archive / "meta.json").write_text(json.dumps({
+                "id": seed_id, "raw_path": f"traces/raw/{seed_id}.jsonl"}))
+            (archive / f"{seed_id}.jsonl").write_text("not a trace\n")
+            database = root / "runs.sqlite3"
+            real_connect = run_state.connect
+            db = real_connect(database)
+            run_id = run_state.create_run(db, "seed", {}, {}, [seed_id])
+            run_state.start_attempt(db, run_id, seed_id, 1)
+            run_state.finish_attempt(db, run_id, seed_id, 1, "accepted",
+                                     artifact_path=str(archive))
+            db.close()
+            with mock.patch.object(publish_queue, "TRACES", traces), \
+                 mock.patch.object(run_state, "connect",
+                                   side_effect=lambda: real_connect(database)):
+                self.assertEqual(publish_queue.restore_hidden_acceptances(), [])
 
     def test_infrastructure_block_is_not_blindly_retried(self):
         with tempfile.TemporaryDirectory() as directory:
