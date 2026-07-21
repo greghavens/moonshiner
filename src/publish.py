@@ -16,6 +16,12 @@ def publication_files(directory: Path) -> list[Path]:
             + sorted((directory / "viewer").glob("train-*.jsonl")))
 
 
+def privacy_scan_files(directory: Path) -> list[Path]:
+    """Return authored text artifacts; canonical rows are validated separately."""
+    card = directory / "README.md"
+    return [card] if card.is_file() else []
+
+
 def viewer_dataset_config(pattern: str) -> dict:
     """Return the explicit Hub data-file mapping that excludes the monolith."""
     return {"configs": [{"config_name": "default", "data_files": [
@@ -151,9 +157,9 @@ def main(argv=None)->int:
     for path in publication_files(args.dir):
         if path.is_symlink():
             raise ValueError(f"upload artifact is a prohibited symlink: {path}")
-        if path.suffix != ".png" and path != traces:
-            hits=findings(path.read_text(errors="replace"),exact_secrets=_staged_secret_values(),forbidden_paths=(str(ROOT),str(Path.home())))
-            if hits:raise ValueError(f"{path}: privacy findings {hits}")
+    for path in privacy_scan_files(args.dir):
+        hits=findings(path.read_text(errors="replace"),exact_secrets=_staged_secret_values(),forbidden_paths=(str(ROOT),str(Path.home())))
+        if hits:raise ValueError(f"{path}: privacy findings {hits}")
     private=bool(CONFIG.get("publish",{}).get("private",True))
     auth_token = token()
     request=urllib.request.Request(f"https://huggingface.co/api/datasets/{args.dataset}/settings",

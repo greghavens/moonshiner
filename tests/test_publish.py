@@ -10,7 +10,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from publish import (_verify_remote_card, build_viewer_shards,
                      configure_viewer_card, publication_files,
-                     viewer_dataset_config)
+                     privacy_scan_files, viewer_dataset_config)
 
 
 class _Response:
@@ -88,6 +88,18 @@ class RemoteCardVerification(unittest.TestCase):
             self.assertEqual(
                 {path.relative_to(root).as_posix() for path in publication_files(root)},
                 {"README.md", "traces.jsonl", "viewer/train-00000.jsonl"})
+
+    def test_generated_viewer_shards_do_not_create_a_second_privacy_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "traces.jsonl").write_text("canonical already validated\n")
+            (root / "README.md").write_text("dataset card\n")
+            viewer = root / "viewer"
+            viewer.mkdir()
+            (viewer / "train-00000.jsonl").write_text(
+                '{"content":"fixture@example.com credential pattern"}\n')
+
+            self.assertEqual(privacy_scan_files(root), [root / "README.md"])
 
     def test_accepts_exact_live_card(self):
         with tempfile.TemporaryDirectory() as directory:
