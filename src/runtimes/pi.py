@@ -188,7 +188,8 @@ class PiRuntime(Runtime):
         return cmd + inner
 
     def _pi_cmd(self, runtime_dir: Path, *, system_prompt: str,
-                tools: list[str] | None, read_only: bool) -> list[str]:
+                tools: list[str] | None, read_only: bool,
+                continue_session: bool = False) -> list[str]:
         # pi 0.80.7: the agent config dir (models.json/settings.json) is
         # selected via the PI_CODING_AGENT_DIR env var set in _sandbox_cmd —
         # there is no --config-dir flag, and no --output-schema (a judge
@@ -209,6 +210,8 @@ class PiRuntime(Runtime):
                "--offline", "--no-skills", "--no-context-files", "--no-approve"]
         if tools is not None:
             cmd += ["--tools", ",".join(tools)]
+        if continue_session:
+            cmd += ["--continue"]
         if not read_only:
             cmd += ["--extension", str(runtime_dir / "config" / "bash-timeout-guard.js")]
         return cmd
@@ -232,11 +235,13 @@ class PiRuntime(Runtime):
         workspace = self.require_persistent_workspace(workspace)
         return self._run(prompt=f"{prompt}", workspace=workspace, out_dir=out_dir,
                          system_prompt=system_prompt, tools=tools,
-                         schema=None, read_only=False, artifact_id=seed["id"])
+                         schema=None, read_only=False, artifact_id=seed["id"],
+                         interaction=interaction)
 
     def _run(self, *, prompt: str, workspace: Path, out_dir: Path,
              system_prompt: str, tools: list[str] | None, schema: dict | None,
-             read_only: bool, artifact_id: str) -> TraceResult:
+             read_only: bool, artifact_id: str,
+             interaction: list[str] | None = None) -> TraceResult:
         real_key = load_provider_key(self.runtime_config)
         RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
         runtime_dir = Path(tempfile.mkdtemp(prefix="run-", dir=RUNTIME_ROOT))
@@ -253,19 +258,33 @@ class PiRuntime(Runtime):
             # `schema` has no CLI channel in pi 0.80.7; judge instructions
             # embed the expected JSON shape and run_review parses the last
             # assistant message.
-            inner = self._pi_cmd(runtime_dir, system_prompt=system_prompt,
-                                  tools=tools, read_only=read_only)
-            cmd = self._sandbox_cmd(inner, workspace, runtime_dir)
-            try:
-                proc = subprocess.run(
-                    cmd, cwd=workspace, input=prompt, capture_output=True,
-                    text=True, timeout=int(self.role.get("timeout_s", 3600)),
-                    env=self._child_env())
-                return_code, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
-            except subprocess.TimeoutExpired as exc:
-                timed_out, return_code = True, None
-                stdout = (exc.stdout or b"").decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-                stderr = (exc.stderr or b"").decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            outputs: list[str] = []
+            errors: list[str] = []
+            return_code = 0
+            for turn_index, turn in enumerate([prompt, *(interaction or [])]):
+                inner = self._pi_cmd(runtime_dir, system_prompt=system_prompt,
+                                     tools=tools, read_only=read_only,
+                                     continue_session=turn_index > 0)
+                cmd = self._sandbox_cmd(inner, workspace, runtime_dir)
+                try:
+                    proc = subprocess.run(
+                        cmd, cwd=workspace, input=turn, capture_output=True,
+                        text=True, timeout=int(self.role.get("timeout_s", 3600)),
+                        env=self._child_env())
+                    return_code = proc.returncode
+                    outputs.append(proc.stdout)
+                    errors.append(proc.stderr)
+                    if return_code != 0:
+                        break
+                except subprocess.TimeoutExpired as exc:
+                    timed_out, return_code = True, None
+                    outputs.append((exc.stdout or b"").decode()
+                                   if isinstance(exc.stdout, bytes) else (exc.stdout or ""))
+                    errors.append((exc.stderr or b"").decode()
+                                  if isinstance(exc.stderr, bytes) else (exc.stderr or ""))
+                    break
+            stdout = "\n".join(outputs)
+            stderr = "\n".join(errors)
             audit = proxy.snapshot()
         finally:
             proxy.stop()
@@ -320,7 +339,8 @@ class PiRuntime(Runtime):
                                           if read_only else
                                           "You are an independent reviewer allowed to repair this workspace."),
                            tools=review_tools, schema=schema,
-                           read_only=read_only, artifact_id="judge")
+                           read_only=read_only, artifact_id="judge",
+                           interaction=None)
         last = _last_message(result.raw_path.read_text())
         verdict = _structured_output(result.raw_path.read_text()) or _parse_json(last)
         return ReviewResult(

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "src"))
@@ -43,6 +44,25 @@ class ModelsJson(unittest.TestCase):
         provider = _provider_entry({})
         self.assertEqual(provider["baseUrl"], "http://127.0.0.1:1")
         self.assertEqual(provider["apiKey"], DUMMY_TOKEN)
+
+    def test_follow_up_turn_resumes_the_same_pi_session(self):
+        runtime = PiRuntime(
+            {"workspace": {"confirmed_root": str(_ROOT)},
+             "runtimes": {"pi": {"provider": "openrouter"}}},
+            {"model": "anthropic/claude-fable-5", "reasoning": "max"})
+        runtime.runtime_config = {"provider": "openrouter", "cli": "pi"}
+        with mock.patch.object(runtime, "_cli_path",
+                               return_value=pathlib.Path("/usr/bin/pi")):
+            first = runtime._pi_cmd(pathlib.Path("/runtime"),
+                                    system_prompt="system", tools=["read"],
+                                    read_only=False)
+            follow_up = runtime._pi_cmd(pathlib.Path("/runtime"),
+                                        system_prompt="system", tools=["read"],
+                                        read_only=False, continue_session=True)
+        self.assertNotIn("--continue", first)
+        self.assertIn("--continue", follow_up)
+        self.assertEqual(first[first.index("--session-dir") + 1],
+                         follow_up[follow_up.index("--session-dir") + 1])
 
 
 class CompactEventsFile(unittest.TestCase):
