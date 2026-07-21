@@ -65,6 +65,7 @@ class FrontDoor(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, \
              mock.patch("common.CONFIG", config), \
              mock.patch("common.RUNS", pathlib.Path(directory)), \
+             mock.patch.object(m, "_ensure_configured_pi"), \
              mock.patch.object(m.subprocess, "run",
                                side_effect=[inactive, started]) as run:
             self.assertEqual(m._start_default_queues(), 0)
@@ -77,6 +78,25 @@ class FrontDoor(unittest.TestCase):
                                        f"moonshiner-trace-continuous-{project_key}.service"])
         self.assertIn(f"--unit=moonshiner-trace-continuous-{project_key}",
                       commands[1])
+
+    def test_normal_start_provisions_missing_pi_in_stable_user_toolchain(self):
+        config = {"teacher": {"runtime": "pi-openrouter"},
+                  "runtimes": {"pi-openrouter": {"cli": "pi",
+                                                   "runtime_version": "1.2.3"}}}
+        completed = mock.Mock(returncode=0)
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(configuration, "load_config", return_value=config), \
+             mock.patch.object(configuration, "PROJECT_ROOT",
+                               pathlib.Path(directory) / "project"), \
+             mock.patch.dict("os.environ", {"XDG_DATA_HOME": directory}), \
+             mock.patch.object(m.shutil, "which",
+                               side_effect=lambda name: "/usr/bin/npm" if name == "npm" else None), \
+             mock.patch.object(m.subprocess, "run", return_value=completed) as run:
+            m._ensure_configured_pi()
+        command = run.call_args.args[0]
+        self.assertIn(str(pathlib.Path(directory) / "moonshiner" /
+                          "toolchains" / "pi"), command)
+        self.assertIn("@earendil-works/pi-coding-agent@1.2.3", command)
 
     def test_provider_presets_include_endpoint_protocol_and_key(self):
         for provider in ("openrouter", "openai", "anthropic"):

@@ -471,9 +471,36 @@ def _configured() -> bool:
     return bool(load_config().get("onboarding", {}).get("complete"))
 
 
+def _ensure_configured_pi() -> None:
+    """Provision the stable managed Pi fallback when native/project Pi is absent."""
+    from configuration import PROJECT_ROOT, load_config
+    config = load_config()
+    runtime = str((config.get("teacher") or {}).get("runtime") or "")
+    if not runtime.startswith("pi"):
+        return
+    profile = (config.get("runtimes") or {}).get(runtime) or {}
+    cli = str(profile.get("cli") or "pi")
+    if shutil.which(cli) or (PROJECT_ROOT / "node_modules" / ".bin" / "pi").exists():
+        return
+    data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+    prefix = data_home / "moonshiner" / "toolchains" / "pi"
+    managed = prefix / "node_modules" / ".bin" / "pi"
+    if managed.exists():
+        return
+    npm = shutil.which("npm")
+    if not npm:
+        raise SystemExit("Pi requires Node.js 22 or newer")
+    version = profile.get("runtime_version") or "0.80.7"
+    print(f"Installing the Pi runtime {version}…")
+    subprocess.run([npm, "install", "--no-audit", "--no-fund", "--prefix",
+                    str(prefix), f"@earendil-works/pi-coding-agent@{version}"],
+                   check=True)
+
+
 def _start_default_queues() -> int:
     """Start every queue enabled for this project; never duplicate a live worker."""
     from common import CONFIG
+    _ensure_configured_pi()
     from configuration import PROJECT_ROOT
     project_key = hashlib.sha256(str(PROJECT_ROOT).encode()).hexdigest()[:12]
     queues = ((CONFIG.get("pipeline") or {}).get("queues") or {})
