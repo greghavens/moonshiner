@@ -5,6 +5,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from collections import Counter
 from unittest import mock
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -90,6 +91,16 @@ class Card(unittest.TestCase):
         self.assertIn("## Task mix", self.card)
         self.assertIn("Uncategorized", self.card)
         self.assertNotIn("## Tool surface", self.card)
+
+    def test_task_mix_includes_row_share_without_row_counts(self):
+        table = card._program_table(
+            Counter({"Tool calling": 2, "Building": 1}), 3,
+            Counter({"Tool calling": 2, "Building": 4}), 6)
+        self.assertIn(
+            "| kind | trajectories | share | row share | flavor |", table)
+        self.assertIn("| Tool calling | 2 | 66.7% | 33.3% |", table)
+        self.assertIn("| Building | 1 | 33.3% | 66.7% |", table)
+        self.assertNotIn("| rows |", table)
 
     def test_security_domain_switches_on_security_framing(self):
         self.assertIn("question-answering", self.card)   # extra task category

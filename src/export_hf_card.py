@@ -262,17 +262,31 @@ def _program_mix(trajectories: dict[str, dict]) -> Counter:
     return result
 
 
-def _program_table(counter: Counter, total: int) -> str:
+def _program_row_mix(rows: list[dict]) -> Counter:
+    """Count training rows using the catalog's explicit program assignment."""
+    try:
+        catalog = json.loads((ROOT / "SEED_CATALOG.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        catalog = {}
+    by_id = {item.get("id"): item.get("program")
+             for items in (catalog.get("categories") or {}).values()
+             for item in items if isinstance(item, dict)}
+    return Counter(by_id.get(row.get("task")) or "Uncategorized" for row in rows)
+
+
+def _program_table(counter: Counter, total: int, row_counter: Counter,
+                   total_rows: int) -> str:
     try:
         programs = json.loads((ROOT / "SEED_CATALOG.json").read_text()).get("programs") or {}
     except (OSError, json.JSONDecodeError):
         programs = {}
-    lines = ["| kind | trajectories | share | flavor |",
-             "|---|---:|---:|---|"]
+    lines = ["| kind | trajectories | share | row share | flavor |",
+             "|---|---:|---:|---:|---|"]
     for name, count in counter.most_common():
         if count:
             lines.append(
                 f"| {name} | {count:,} | {_pct1(count, total)} | "
+                f"{_pct1(row_counter.get(name, 0), total_rows)} | "
                 f"{programs.get(name, {}).get('description', 'Not assigned in the seed catalog.')} |")
     return "\n".join(lines)
 
@@ -308,6 +322,7 @@ def build_card(rows: list[dict], *, stage: str = "release") -> str:
     row_splits = Counter(row.get("split") for row in rows)
     traj_splits = Counter(entry["split"] for entry in trajectories.values())
     categories = _program_mix(trajectories)
+    category_rows = _program_row_mix(rows)
     languages = Counter(entry["lang"] for entry in trajectories.values())
     domains = Counter(entry["domain"] for entry in trajectories.values())
     instruction_trajectories = domains.get("instruction-following/tool-use", 0)
@@ -542,7 +557,7 @@ programs and substantially more sessions will be added to this same repo.
 High-level training programs, calculated from accepted trajectories using the
 same program mapping published in the seed catalog:
 
-{_program_table(categories, total_traj)}
+{_program_table(categories, total_traj, category_rows, total_rows)}
 
 ## Languages (current drop)
 
