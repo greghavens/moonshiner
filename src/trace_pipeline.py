@@ -76,6 +76,7 @@ def existing_harness_trace(seed_id: str) -> bool:
 
 def _selected(args) -> list[dict]:
     from seed_inventory import accepted_ids
+    from common import synthetic_tool_contract
     only = {v.strip() for v in args.only.split(",") if v.strip()} if args.only else None
     categories = set(getattr(args, "category", None) or [])
     tags = set(getattr(args, "tag", None) or [])
@@ -102,7 +103,8 @@ def _selected(args) -> list[dict]:
     seeds = [seed for seed in select_seeds(only=only,
                                            categories=categories, tags=tags,
                                            name=getattr(args, "name", None))
-             if seed["id"] not in accepted
+             if synthetic_tool_contract(seed) is None
+             and seed["id"] not in accepted
              and seed["id"] not in blocked
              and attempts.get(seed["id"], 0) < maximum]
     if args.limit:

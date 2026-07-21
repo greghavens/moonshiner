@@ -264,6 +264,20 @@ class AcceptanceSchemaTests(unittest.TestCase):
                             return_value=set()):
                 self.assertEqual(trace_pipeline._selected(args), [])
 
+    def test_contaminated_seed_never_enters_trace_queue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = pathlib.Path(directory) / "runs.sqlite3"
+            args = SimpleNamespace(only=None, category=None, tag=None,
+                                   name=None, max_attempts=2, limit=0, all=True)
+            contaminated = {"id": "must-be-reauthored", "initial_state": {},
+                            "tool_results": {}}
+            with mock.patch.object(trace_pipeline, "connect",
+                                   side_effect=lambda: run_state.connect(database)), \
+                 mock.patch.object(trace_pipeline, "select_seeds",
+                                   return_value=[contaminated]), \
+                 mock.patch("import_existing.imported_task_ids", return_value=set()):
+                self.assertEqual(trace_pipeline._selected(args), [])
+
     def test_synthetic_trace_format_cannot_build_a_dataset_row(self):
         row, error = build_dataset.build_row(
             {"id": "tool-seed"},
