@@ -602,7 +602,9 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--all", action="store_true", help="Show historical runs.")
     args = parser.parse_args(argv)
-    db = connect(); rows = summaries(db, args.run_id)
+    db = connect()
+    rows = summaries(db, args.run_id,
+                     running_only=not inspect and not args.run_id and not args.all)
     if inspect and not args.run_id and rows: args.run_id = rows[0]["id"]; rows = rows[:1]
     if not inspect and not args.run_id and not args.all:
         from common import DATA

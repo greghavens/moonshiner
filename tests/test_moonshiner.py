@@ -49,7 +49,7 @@ class FrontDoor(unittest.TestCase):
         seed_status = {"total": 0, "sol_authored": 0, "remaining": 0,
                        "model": None}
         with mock.patch.object(run_state, "connect", return_value=db), \
-             mock.patch.object(run_state, "summaries", return_value=[]), \
+             mock.patch.object(run_state, "summaries", return_value=[]) as summaries, \
              mock.patch("seed_inventory.inventory_sets",
                         return_value=(set(), set(), set())), \
              mock.patch("seed_inventory.planned_ids", return_value=set()), \
@@ -64,6 +64,7 @@ class FrontDoor(unittest.TestCase):
              mock.patch.object(m.subprocess, "run", return_value=service_result), \
              mock.patch("builtins.print") as output:
             self.assertEqual(m._status([]), 0)
+        summaries.assert_called_once_with(db, None, running_only=True)
         self.assertTrue(any(call.args == ("Moonshiner status",)
                             for call in output.call_args_list))
 

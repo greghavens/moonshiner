@@ -207,8 +207,14 @@ def finish_attempt(db, run_id: str, seed_id: str, number: int, status: str,
     set_job(db, run_id, seed_id, status, number, error)
 
 
-def summaries(db, run_id: str | None = None) -> list[dict]:
-    where, args = ("WHERE r.id=?", (run_id,)) if run_id else ("", ())
+def summaries(db, run_id: str | None = None, *,
+              running_only: bool = False) -> list[dict]:
+    if run_id:
+        where, args = "WHERE r.id=?", (run_id,)
+    elif running_only:
+        where, args = "WHERE r.status='running'", ()
+    else:
+        where, args = "", ()
     rows = db.execute(f"""SELECT r.*, COUNT(j.seed_id) jobs,
       SUM(CASE WHEN j.status='accepted' THEN 1 ELSE 0 END) accepted,
       SUM(CASE WHEN j.status IN ('exhausted','failed') THEN 1 ELSE 0 END) failed,
