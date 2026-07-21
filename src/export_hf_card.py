@@ -469,7 +469,9 @@ def build_card(rows: list[dict], *, stage: str = "release") -> str:
         "one row per assistant turn, exact-prefix continuity and\n"
         "trajectory-disjoint train/val splits checked before publication."
         if preview else
-        "A single file, `traces.jsonl`, holds every row. For each source "
+        "The canonical `traces.jsonl` holds every row. Bounded files under "
+        "`viewer/` are byte-for-byte row-preserving shards used only by the "
+        "Hugging Face viewer. For each source "
         "trajectory the\nexport emits an ordered, gap-free sequence of "
         "**cumulative prefixes**: step *k*\nis exactly the first *k* assistant "
         "turns with all intervening user/tool\nmessages, and its final message "

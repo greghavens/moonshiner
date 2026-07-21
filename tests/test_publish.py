@@ -1,9 +1,16 @@
 import tempfile
 import unittest
+import json
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
-from publish import _verify_remote_card, publication_files
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from publish import (_verify_remote_card, build_viewer_shards,
+                     configure_viewer_card, publication_files,
+                     viewer_dataset_config)
 
 
 class _Response:
@@ -21,6 +28,37 @@ class _Response:
 
 
 class RemoteCardVerification(unittest.TestCase):
+    def test_viewer_shards_preserve_canonical_rows_and_bound_file_size(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            canonical = root / "traces.jsonl"
+            rows = [
+                {"task": f"task-{index}", "lang": "en", "category": "test",
+                 "split": "train", "assistant_step": 1, "assistant_steps": 1,
+                 "target_message_index": 1, "n_messages": 2,
+                 "messages": [{"role": "user", "content": "x" * 30},
+                              {"role": "assistant", "content": str(index)}],
+                 "tools": "[]"}
+                for index in range(7)
+            ]
+            original = b"".join(
+                (json.dumps(row, separators=(",", ":")) + "\n").encode()
+                for row in rows)
+            canonical.write_bytes(original)
+
+            shards = build_viewer_shards(canonical, root / "viewer", max_bytes=500)
+
+            self.assertEqual(canonical.read_bytes(), original)
+            self.assertGreater(len(shards), 1)
+            self.assertTrue(all(path.stat().st_size <= 500 for path in shards))
+            rebuilt = [json.loads(line) for path in shards
+                       for line in path.read_text().splitlines() if line]
+            self.assertEqual(rebuilt, rows)
+            self.assertEqual(
+                viewer_dataset_config("viewer/train-*.jsonl"),
+                {"configs": [{"config_name": "default", "data_files": [
+                    {"split": "train", "path": "viewer/train-*.jsonl"}]}]})
+
     def test_publication_files_exclude_local_backups(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -30,6 +68,26 @@ class RemoteCardVerification(unittest.TestCase):
             self.assertEqual({path.name for path in publication_files(root)},
                              {"traces.jsonl", "README.md",
                               "moonshiner-dataset-banner.png"})
+
+    def test_card_selects_viewer_shards_without_hiding_canonical_download(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            card = root / "README.md"
+            card.write_text("---\nlicense: cc-by-4.0\n---\n\n# Dataset\n")
+            (root / "traces.jsonl").write_text("canonical\n")
+            viewer = root / "viewer"
+            viewer.mkdir()
+            shard = viewer / "train-00000.jsonl"
+            shard.write_text("viewer\n")
+
+            configure_viewer_card(card, "viewer/train-*.jsonl")
+
+            text = card.read_text()
+            self.assertIn("path: viewer/train-*.jsonl", text)
+            self.assertIn("# Dataset", text)
+            self.assertEqual(
+                {path.relative_to(root).as_posix() for path in publication_files(root)},
+                {"README.md", "traces.jsonl", "viewer/train-00000.jsonl"})
 
     def test_accepts_exact_live_card(self):
         with tempfile.TemporaryDirectory() as directory:
