@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed travel desk."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import sqlite3
+import sys
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Callable
+
+
+ROOT = Path(__file__).resolve().parent
+DB_PATH = ROOT / ".travel-desk" / "travel.sqlite3"
+ACTIVITY_PATH = ROOT / ".travel-desk" / "activity.jsonl"
+READ_DELAY_SECONDS = 0.35
+
+
+def readonly_connection() -> sqlite3.Connection:
+    connection = sqlite3.connect(f"file:{DB_PATH}?mode=ro&immutable=1", uri=True)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def writable_connection() -> sqlite3.Connection:
+    connection = sqlite3.connect(DB_PATH, timeout=10)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def append_activity(record: dict[str, Any]) -> None:
+    ACTIVITY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+    with ACTIVITY_PATH.open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def run_logged(
+    operation: str,
+    inputs: dict[str, Any],
+    action: Callable[[], Any],
+    *,
+    delay: bool = True,
+) -> int:
+    invocation = str(uuid.uuid4())
+    started_ns = time.time_ns()
+    try:
+        if delay:
+            time.sleep(READ_DELAY_SECONDS)
+        output = action()
+        success = True
+        error = None
+    except Exception as exc:  # the failed invocation is still part of the audit trail
+        output = None
+        success = False
+        error = f"{type(exc).__name__}: {exc}"
+    finished_ns = time.time_ns()
+    record = {
+        "version": 1,
+        "invocation": invocation,
+        "operation": operation,
+        "started_ns": started_ns,
+        "finished_ns": finished_ns,
+        "inputs": inputs,
+        "success": success,
+        "output": output,
+    }
+    if error is not None:
+        record["error"] = error
+    append_activity(record)
+    if success:
+        print(json.dumps(output, indent=2, sort_keys=True))
+        return 0
+    print(json.dumps({"error": error}, sort_keys=True), file=sys.stderr)
+    return 1
+
+
+def search(name: str, location: str) -> int:
+    def action() -> dict[str, Any]:
+        with readonly_connection() as connection:
+            rows = connection.execute(
+                "SELECT id, name, location FROM trips "
+                "WHERE name = ? AND location = ? ORDER BY id",
+                (name, location),
+            ).fetchall()
+        return {"matches": [dict(row) for row in rows]}
+
+    return run_logged("search", {"name": name, "location": location}, action)
+
+
+def get_trip(stable_id: str) -> int:
+    def action() -> dict[str, Any]:
+        with readonly_connection() as connection:
+            row = connection.execute(
+                "SELECT id, name, location, status, date FROM trips WHERE id = ?",
+                (stable_id,),
+            ).fetchone()
+        if row is None:
+            raise LookupError(f"trip not found: {stable_id}")
+        return dict(row)
+
+    return run_logged("get", {"id": stable_id}, action)
+
+
+def list_trips() -> int:
+    def action() -> dict[str, Any]:
+        with readonly_connection() as connection:
+            rows = connection.execute(
+                "SELECT id, name, location, status, date FROM trips ORDER BY id"
+            ).fetchall()
+        return {"trips": [dict(row) for row in rows]}
+
+    return run_logged("list", {}, action)
+
+
+def read_profile() -> int:
+    def action() -> dict[str, Any]:
+        with readonly_connection() as connection:
+            rows = connection.execute(
+                "SELECT key, value FROM saved_profile ORDER BY key"
+            ).fetchall()
+        return {"saved_profile": {row["key"]: row["value"] for row in rows}}
+
+    return run_logged("profile", {}, action)
+
+
+def availability(location: str, date: str) -> int:
+    def action() -> dict[str, Any]:
+        with readonly_connection() as connection:
+            row = connection.execute(
+                "SELECT seats FROM availability WHERE location = ? AND date = ?",
+                (location, date),
+            ).fetchone()
+        return {
+            "location": location,
+            "date": date,
+            "seats": None if row is None else row["seats"],
+        }
+
+    return run_logged(
+        "availability", {"location": location, "date": date}, action
+    )
+
+
+def create_trip(stable_id: str, name: str, location: str, status: str, date: str) -> int:
+    inputs = {
+        "id": stable_id,
+        "name": name,
+        "location": location,
+        "status": status,
+        "date": date,
+    }
+
+    def action() -> dict[str, Any]:
+        with writable_connection() as connection:
+            connection.execute(
+                "INSERT INTO trips(id, name, location, status, date) VALUES (?, ?, ?, ?, ?)",
+                (stable_id, name, location, status, date),
+            )
+            connection.execute(
+                "INSERT INTO mutation_log(operation, trip_id) VALUES ('create', ?)",
+                (stable_id,),
+            )
+        return {"created": stable_id}
+
+    return run_logged("create", inputs, action, delay=False)
+
+
+def update_trip(stable_id: str, status: str) -> int:
+    def action() -> dict[str, Any]:
+        with writable_connection() as connection:
+            changed = connection.execute(
+                "UPDATE trips SET status = ? WHERE id = ?", (status, stable_id)
+            ).rowcount
+            if changed != 1:
+                raise LookupError(f"trip not found: {stable_id}")
+            connection.execute(
+                "INSERT INTO mutation_log(operation, trip_id) VALUES ('update', ?)",
+                (stable_id,),
+            )
+        return {"updated": stable_id}
+
+    return run_logged(
+        "update", {"id": stable_id, "status": status}, action, delay=False
+    )
+
+
+def cancel_trip(stable_id: str) -> int:
+    def action() -> dict[str, Any]:
+        with writable_connection() as connection:
+            changed = connection.execute(
+                "UPDATE trips SET status = 'cancelled' WHERE id = ?", (stable_id,)
+            ).rowcount
+            if changed != 1:
+                raise LookupError(f"trip not found: {stable_id}")
+            connection.execute(
+                "INSERT INTO mutation_log(operation, trip_id) VALUES ('cancel', ?)",
+                (stable_id,),
+            )
+        return {"cancelled": stable_id}
+
+    return run_logged("cancel", {"id": stable_id}, action, delay=False)
+
+
+def notify(stable_id: str, message: str) -> int:
+    def action() -> dict[str, Any]:
+        with writable_connection() as connection:
+            connection.execute(
+                "INSERT INTO notification_log(trip_id, message) VALUES (?, ?)",
+                (stable_id, message),
+            )
+        return {"notified": stable_id}
+
+    return run_logged(
+        "notify", {"id": stable_id, "message": message}, action, delay=False
+    )
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        prog="travel-desk",
+        description="Query or manage the sandboxed SQLite travel desk.",
+    )
+    commands = root.add_subparsers(dest="command", required=True)
+
+    search_parser = commands.add_parser("search", help="Find trips by exact name and location")
+    search_parser.add_argument("--name", required=True)
+    search_parser.add_argument("--location", required=True)
+
+    get_parser = commands.add_parser("get", help="Retrieve one full trip by stable ID")
+    get_parser.add_argument("--id", required=True)
+
+    commands.add_parser("list", help="List the trip collection")
+    commands.add_parser("profile", help="Read the saved traveler profile")
+
+    availability_parser = commands.add_parser("availability", help="Check seat availability")
+    availability_parser.add_argument("--location", required=True)
+    availability_parser.add_argument("--date", required=True)
+
+    create_parser = commands.add_parser("create", help="Create a trip")
+    create_parser.add_argument("--id", required=True)
+    create_parser.add_argument("--name", required=True)
+    create_parser.add_argument("--location", required=True)
+    create_parser.add_argument("--status", required=True)
+    create_parser.add_argument("--date", required=True)
+
+    update_parser = commands.add_parser("update", help="Update a trip status")
+    update_parser.add_argument("--id", required=True)
+    update_parser.add_argument("--status", required=True)
+
+    cancel_parser = commands.add_parser("cancel", help="Cancel a trip")
+    cancel_parser.add_argument("--id", required=True)
+
+    notify_parser = commands.add_parser("notify", help="Notify about a trip")
+    notify_parser.add_argument("--id", required=True)
+    notify_parser.add_argument("--message", required=True)
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    if args.command == "search":
+        return search(args.name, args.location)
+    if args.command == "get":
+        return get_trip(args.id)
+    if args.command == "list":
+        return list_trips()
+    if args.command == "profile":
+        return read_profile()
+    if args.command == "availability":
+        return availability(args.location, args.date)
+    if args.command == "create":
+        return create_trip(args.id, args.name, args.location, args.status, args.date)
+    if args.command == "update":
+        return update_trip(args.id, args.status)
+    if args.command == "cancel":
+        return cancel_trip(args.id)
+    if args.command == "notify":
+        return notify(args.id, args.message)
+    raise AssertionError(f"unhandled command: {args.command}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

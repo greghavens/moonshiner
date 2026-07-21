@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+usage() {
+    printf 'usage: bash runbook-verify --fixtures DIR --report FILE RUNBOOK...\n' >&2
+}
+
+is_local_path() {
+    local path=$1
+    local component
+    local -a components
+    local IFS=/
+
+    [[ -n $path && $path != /* && $path != */ && $path != *'//'* ]] || return 1
+    read -r -a components <<< "$path"
+    for component in "${components[@]}"; do
+        [[ -n $component && $component != . && $component != .. ]] || return 1
+    done
+}
+
+fixtures_dir=
+report_path=
+
+while (( $# > 0 )); do
+    case $1 in
+        --fixtures)
+            (( $# >= 2 )) || { usage; exit 64; }
+            fixtures_dir=$2
+            shift 2
+            ;;
+        --report)
+            (( $# >= 2 )) || { usage; exit 64; }
+            report_path=$2
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -* | '')
+            usage
+            exit 64
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [[ -z $fixtures_dir || -z $report_path || ! -d $fixtures_dir || $# -eq 0 ]]; then
+    usage
+    exit 64
+fi
+
+if [[ $report_path == */* ]]; then
+    report_dir=${report_path%/*}
+    [[ -n $report_dir ]] || report_dir=/
+else
+    report_dir=.
+fi
+if [[ ! -d $report_dir ]]; then
+    printf 'runbook-verify: report directory does not exist: %s\n' "$report_dir" >&2
+    exit 64
+fi
+
+for required_tool in cmp cp mkdir mktemp mv rm; do
+    if ! command -v "$required_tool" >/dev/null 2>&1; then
+        printf 'runbook-verify: required tool not found: %s\n' "$required_tool" >&2
+        exit 64
+    fi
+done
+
+if ! cmp_version_output=$(LC_ALL=C cmp --version 2>/dev/null); then
+    printf 'runbook-verify: could not determine cmp version\n' >&2
+    exit 64
+fi
+cmp_version=${cmp_version_output%%$'\n'*}
+[[ -n $cmp_version ]] || {
+    printf 'runbook-verify: cmp returned an empty version\n' >&2
+    exit 64
+}
+
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/runbook-verify.XXXXXX") || {
+    printf 'runbook-verify: could not create scratch directory\n' >&2
+    exit 64
+}
+
+cleanup() {
+    rm -rf -- "$scratch"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+report_tmp=$scratch/report
+{
+    printf 'FORMAT runbook-verify-report-v1\n'
+    printf 'TOOL bash %s\n' "$BASH_VERSION"
+    printf 'TOOL cmp %s\n' "$cmp_version"
+} > "$report_tmp"
+
+pass_count=0
+fail_count=0
+skip_count=0
+block_number=0
+header_re='^```verify[[:space:]]+id=([^[:space:]]+)[[:space:]]+safety=([^[:space:]]+)[[:space:]]+fixture=([^[:space:]]+)[[:space:]]+expected=([^[:space:]]+)[[:space:]]*$'
+
+for runbook in "$@"; do
+    if [[ ! -f $runbook ]]; then
+        printf 'FAIL %s:<parse> missing-runbook\n' "$runbook" >> "$report_tmp"
+        ((fail_count += 1))
+        continue
+    fi
+
+    seen_blocks=0
+    line_number=0
+    while IFS= read -r line || [[ -n $line ]]; do
+        ((line_number += 1))
+
+        if [[ $line == '```verify' || $line == '```verify '* ]]; then
+            if [[ ! $line =~ $header_re ]]; then
+                printf 'FAIL %s:<parse> malformed-header line=%d\n' \
+                    "$runbook" "$line_number" >> "$report_tmp"
+                ((fail_count += 1))
+                while IFS= read -r line || [[ -n $line ]]; do
+                    ((line_number += 1))
+                    [[ $line == '```' ]] && break
+                done
+                continue
+            fi
+
+            step_id=${BASH_REMATCH[1]}
+            safety=${BASH_REMATCH[2]}
+            fixture=${BASH_REMATCH[3]}
+            expected=${BASH_REMATCH[4]}
+            ((seen_blocks += 1))
+            ((block_number += 1))
+            command_text=
+            closed=0
+
+            while IFS= read -r body_line || [[ -n $body_line ]]; do
+                ((line_number += 1))
+                if [[ $body_line == '```' ]]; then
+                    closed=1
+                    break
+                fi
+                command_text+=$body_line$'\n'
+            done
+
+            if (( closed == 0 )); then
+                printf 'FAIL %s:%s unterminated-block\n' \
+                    "$runbook" "$step_id" >> "$report_tmp"
+                ((fail_count += 1))
+                break
+            fi
+
+            if [[ $safety != safe ]]; then
+                printf 'SKIP %s:%s safety=%s\n' \
+                    "$runbook" "$step_id" "$safety" >> "$report_tmp"
+                ((skip_count += 1))
+                continue
+            fi
+
+            if [[ ! $step_id =~ ^[A-Za-z0-9._-]+$ ]]; then
+                printf 'FAIL %s:%s invalid-id\n' \
+                    "$runbook" "$step_id" >> "$report_tmp"
+                ((fail_count += 1))
+                continue
+            fi
+            if ! is_local_path "$fixture"; then
+                printf 'FAIL %s:%s invalid-fixture\n' \
+                    "$runbook" "$step_id" >> "$report_tmp"
+                ((fail_count += 1))
+                continue
+            fi
+            if ! is_local_path "$expected"; then
+                printf 'FAIL %s:%s invalid-expected\n' \
+                    "$runbook" "$step_id" >> "$report_tmp"
+                ((fail_count += 1))
+                continue
+            fi
+
+            fixture_source=$fixtures_dir/$fixture
+            expected_file=$fixture_source/$expected
+            if [[ ! -d $fixture_source ]]; then
+                printf 'FAIL %s:%s missing-fixture\n' \
+                    "$runbook" "$step_id" >> "$report_tmp"
+                ((fail_count += 1))
+                continue
+            fi
+            if [[ ! -f $expected_file ]]; then
+                printf 'FAIL %s:%s missing-expected\n' \
+                    "$runbook" "$step_id" >> "$report_tmp"
+                ((fail_count += 1))
+                continue
+            fi
+
+            work_dir=$scratch/work-$block_number
+            if ! mkdir -p -- "$work_dir" || \
+               ! cp -R -- "$fixture_source/." "$work_dir/"; then
+                printf 'FAIL %s:%s fixture-copy\n' \
+                    "$runbook" "$step_id" >> "$report_tmp"
+                ((fail_count += 1))
+                continue
+            fi
+
+            stdout_file=$scratch/stdout-$block_number
+            stderr_file=$scratch/stderr-$block_number
+            (
+                cd -- "$work_dir" || exit 125
+                "$BASH" --noprofile --norc -c "$command_text"
+            ) > "$stdout_file" 2> "$stderr_file"
+            command_status=$?
+
+            if (( command_status != 0 )); then
+                printf 'FAIL %s:%s exit=%d\n' \
+                    "$runbook" "$step_id" "$command_status" >> "$report_tmp"
+                ((fail_count += 1))
+            elif [[ -s $stderr_file ]]; then
+                printf 'FAIL %s:%s stderr\n' \
+                    "$runbook" "$step_id" >> "$report_tmp"
+                ((fail_count += 1))
+            else
+                actual_text=$(<"$stdout_file")
+                expected_text=$(<"$expected_file")
+                if [[ $actual_text == "$expected_text" ]]; then
+                    printf 'PASS %s:%s\n' \
+                        "$runbook" "$step_id" >> "$report_tmp"
+                    ((pass_count += 1))
+                else
+                    printf 'FAIL %s:%s output\n' \
+                        "$runbook" "$step_id" >> "$report_tmp"
+                    ((fail_count += 1))
+                fi
+            fi
+        fi
+    done < "$runbook"
+
+    if (( seen_blocks == 0 )); then
+        printf 'FAIL %s:<parse> no-blocks\n' "$runbook" >> "$report_tmp"
+        ((fail_count += 1))
+    fi
+done
+
+printf 'SUMMARY pass=%d fail=%d skip=%d\n' \
+    "$pass_count" "$fail_count" "$skip_count" >> "$report_tmp"
+
+if ! mv -- "$report_tmp" "$report_path"; then
+    printf 'runbook-verify: could not write report: %s\n' "$report_path" >&2
+    exit 64
+fi
+
+(( fail_count == 0 ))

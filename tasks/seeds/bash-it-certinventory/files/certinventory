@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export LC_ALL=C
+export TZ=UTC
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage: certinventory --at ISO-8601 --owners FILE [--renew-within DAYS] CERT_DIRECTORY
+
+Inventory public X.509 PEM certificates as deterministic TSV. The --at value is
+required so renewal decisions never depend on the machine's clock.
+USAGE
+}
+
+die() {
+  printf 'certinventory: %s\n' "$*" >&2
+  exit 2
+}
+
+common_name() {
+  local distinguished_name=$1
+  local value=${distinguished_name##*CN=}
+  value=${value%%,*}
+  printf '%s' "$value"
+}
+
+owner_for() {
+  local certificate_name=$1
+  local owner_file=$2
+  local mapped_name mapped_owner
+
+  while IFS=$'\t' read -r mapped_name mapped_owner; do
+    [[ -z "$mapped_name" || "$mapped_name" == \#* ]] && continue
+    if [[ "$mapped_name" == "$certificate_name" ]]; then
+      printf '%s' "$mapped_owner"
+      return
+    fi
+  done < "$owner_file"
+
+  printf 'unassigned'
+}
+
+at=
+owners_file=
+renew_days=30
+
+while (( $# > 0 )); do
+  case "$1" in
+    --at)
+      (( $# >= 2 )) || die '--at requires a value'
+      at=$2
+      shift 2
+      ;;
+    --owners)
+      (( $# >= 2 )) || die '--owners requires a file'
+      owners_file=$2
+      shift 2
+      ;;
+    --renew-within)
+      (( $# >= 2 )) || die '--renew-within requires a number of days'
+      renew_days=$2
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    --*)
+      die "unknown option: $1"
+      ;;
+    *)
+      [[ -z "${cert_dir:-}" ]] || die 'only one certificate directory may be supplied'
+      cert_dir=$1
+      shift
+      ;;
+  esac
+done
+
+[[ -n "$at" ]] || die '--at is required'
+[[ -n "$owners_file" ]] || die '--owners is required'
+[[ -n "${cert_dir:-}" ]] || die 'a certificate directory is required'
+[[ "$renew_days" =~ ^[0-9]+$ ]] || die '--renew-within must be a non-negative integer'
+[[ -r "$owners_file" ]] || die "cannot read owner map: $owners_file"
+[[ -d "$cert_dir" ]] || die "not a directory: $cert_dir"
+if ! openssl_path=$(command -v openssl 2>&1); then
+  die 'openssl is required'
+fi
+if ! date_path=$(command -v date 2>&1); then
+  die 'date is required'
+fi
+
+if ! at_epoch=$(date -u -d "$at" +%s 2>&1); then
+  die "invalid --at timestamp: $at"
+fi
+
+cert_dir=${cert_dir%/}
+printf 'path\tname\tissuer\texpires_utc\tdays_remaining\trenewal\tchain_use\tsha256\towner\n'
+
+while IFS= read -r -d '' cert_file; do
+  relative_path=${cert_file#"$cert_dir"/}
+
+  if grep -Eq -- '-----BEGIN ([A-Z0-9]+ )?PRIVATE KEY-----' "$cert_file"; then
+    die "private key material is not allowed: $relative_path"
+  fi
+  if ! certificate_check=$(openssl x509 -in "$cert_file" -noout 2>&1); then
+    die "not a readable X.509 certificate: $relative_path"
+  fi
+
+  subject=$(openssl x509 -in "$cert_file" -noout -subject -nameopt RFC2253)
+  issuer_dn=$(openssl x509 -in "$cert_file" -noout -issuer -nameopt RFC2253)
+  subject=${subject#subject=}
+  issuer_dn=${issuer_dn#issuer=}
+  name=$(common_name "$subject")
+  issuer=$(common_name "$issuer_dn")
+
+  not_after=$(openssl x509 -in "$cert_file" -noout -enddate)
+  not_after=${not_after#notAfter=}
+  if ! expiry_epoch=$(date -u -d "$not_after" +%s 2>&1); then
+    die "cannot parse expiry for: $relative_path"
+  fi
+  expires_utc=$(date -u -d "@$expiry_epoch" +%Y-%m-%dT%H:%M:%SZ)
+  seconds_remaining=$(( expiry_epoch - at_epoch ))
+  days_remaining=$(( seconds_remaining / 86400 ))
+  if (( seconds_remaining < 0 && seconds_remaining % 86400 != 0 )); then
+    days_remaining=$(( days_remaining - 1 ))
+  fi
+
+  if (( seconds_remaining < 0 )); then
+    renewal=expired
+  elif (( seconds_remaining < renew_days * 86400 )); then
+    renewal=due
+  else
+    renewal=ok
+  fi
+
+  constraints=$(openssl x509 -in "$cert_file" -noout -ext basicConstraints 2>&1) || constraints=
+  if [[ "$constraints" == *'CA:TRUE'* ]]; then
+    if [[ "$subject" == "$issuer_dn" ]]; then
+      chain_use=root
+    else
+      chain_use=intermediate
+    fi
+  else
+    chain_use=leaf
+  fi
+
+  fingerprint=$(openssl x509 -in "$cert_file" -outform DER | sha256sum)
+  fingerprint=${fingerprint%% *}
+  owner=$(owner_for "$name" "$owners_file")
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$relative_path" "$name" "$issuer" "$expires_utc" "$days_remaining" \
+    "$renewal" "$chain_use" "$fingerprint" "$owner"
+done < <(find "$cert_dir" -type f -name '*.pem' -print0 | sort -z)

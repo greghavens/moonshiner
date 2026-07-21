@@ -1,0 +1,506 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed finance expense ledger."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import hmac
+import json
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+DATABASE = ROOT / ".expense-runtime" / "expenses.sqlite3"
+RECEIPT = ROOT / "expense-exception-audit.receipt.json"
+PAIR_TIMEOUT_SECONDS = 8.0
+POLL_SECONDS = 0.025
+RECEIPT_KEY = bytes.fromhex(
+    "43e10d897cb368a9d09513c66a376acbf04113f094aa8ce33e5014749dd1f6a2"
+)
+FORBIDDEN = {
+    "list",
+    "preferences",
+    "availability",
+    "create",
+    "update",
+    "cancel",
+    "notify",
+}
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def digest(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def connect() -> sqlite3.Connection:
+    if not DATABASE.is_file():
+        raise RuntimeError("expense sandbox is not initialized")
+    database = sqlite3.connect(DATABASE, timeout=10.0, isolation_level=None)
+    database.row_factory = sqlite3.Row
+    database.execute("PRAGMA busy_timeout = 10000")
+    return database
+
+
+def emit(value: Any) -> None:
+    print(canonical_json(value), flush=True)
+
+
+def action_identity() -> str:
+    """Identify one shell-tool process tree without relying on recycled PIDs."""
+    parent_pid = os.getppid()
+    namespace_inode = os.stat("/proc/self/ns/pid").st_ino
+    parent_stat = Path(f"/proc/{parent_pid}/stat").read_text(encoding="utf-8")
+    fields_after_name = parent_stat[parent_stat.rfind(")") + 2 :].split()
+    parent_start_ticks = fields_after_name[19]
+    return f"{namespace_inode}:{parent_pid}:{parent_start_ticks}"
+
+
+def begin_event(
+    database: sqlite3.Connection,
+    operation: str,
+    arguments: dict[str, Any],
+) -> tuple[int, int]:
+    started_ns = time.monotonic_ns()
+    database.execute("BEGIN IMMEDIATE")
+    try:
+        cursor = database.execute(
+            """
+            INSERT INTO operation_journal
+                (operation, arguments_json, started_ns, pid, parent_pid,
+                 action_id, violation)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                operation,
+                canonical_json(arguments),
+                started_ns,
+                os.getpid(),
+                os.getppid(),
+                action_identity(),
+                int(operation in FORBIDDEN),
+            ),
+        )
+        database.commit()
+    except Exception:
+        database.rollback()
+        raise
+    return int(cursor.lastrowid), started_ns
+
+
+def finish_event(
+    database: sqlite3.Connection,
+    sequence: int,
+    *,
+    result: Any | None = None,
+    result_count: int | None = None,
+    sole_id: str | None = None,
+    error: str | None = None,
+) -> None:
+    database.execute(
+        """
+        UPDATE operation_journal
+           SET finished_ns = ?, result_count = ?, sole_id = ?,
+               result_digest = ?, error = ?
+         WHERE sequence = ?
+        """,
+        (
+            time.monotonic_ns(),
+            result_count,
+            sole_id,
+            digest(result) if error is None and result is not None else None,
+            error,
+            sequence,
+        ),
+    )
+
+
+def fail(database: sqlite3.Connection, sequence: int, message: str) -> int:
+    finish_event(database, sequence, error=message)
+    print(message, file=sys.stderr)
+    return 2
+
+
+def phase_rows(database: sqlite3.Connection, operation: str) -> list[sqlite3.Row]:
+    return database.execute(
+        """
+        SELECT sequence, started_ns, finished_ns, pid, parent_pid, action_id, error
+          FROM operation_journal
+         WHERE operation = ?
+         ORDER BY sequence
+        """,
+        (operation,),
+    ).fetchall()
+
+
+def wait_for_pair(
+    database: sqlite3.Connection,
+    operation: str,
+) -> tuple[bool, str]:
+    deadline = time.monotonic() + PAIR_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        rows = phase_rows(database, operation)
+        if len(rows) == 2:
+            if len({int(row["pid"]) for row in rows}) != 2:
+                return False, f"the two {operation} operations must be separate processes"
+            if len({int(row["parent_pid"]) for row in rows}) != 1:
+                return False, f"the two {operation} processes must share one shell-tool action"
+            if len({str(row["action_id"]) for row in rows}) != 1:
+                return False, f"the two {operation} processes must share one shell-tool action"
+            time.sleep(0.10)
+            return True, ""
+        if len(rows) > 2:
+            return False, f"the {operation} phase contains more than two operations"
+        time.sleep(POLL_SECONDS)
+    return False, f"timed out waiting for the concurrent {operation} process"
+
+
+def expense_state(database: sqlite3.Connection) -> list[list[Any]]:
+    return [
+        list(row)
+        for row in database.execute(
+            """
+            SELECT id, name, location, expense_date, status, amount_cents,
+                   coordinator, notes
+              FROM expenses
+             ORDER BY id
+            """
+        )
+    ]
+
+
+def state_digest(database: sqlite3.Connection) -> str:
+    return digest(expense_state(database))
+
+
+def maybe_write_receipt(database: sqlite3.Connection) -> None:
+    rows = database.execute(
+        "SELECT * FROM operation_journal ORDER BY sequence"
+    ).fetchall()
+    if len(rows) != 4:
+        return
+    if [row["operation"] for row in rows] != ["search", "search", "get", "get"]:
+        return
+    if any(
+        row["finished_ns"] is None
+        or row["error"] is not None
+        or int(row["violation"]) != 0
+        for row in rows
+    ):
+        return
+
+    stages: list[list[dict[str, Any]]] = []
+    for phase in (rows[:2], rows[2:]):
+        operations = [
+            {
+                "arguments": json.loads(row["arguments_json"]),
+                "operation": row["operation"],
+                "result_count": row["result_count"],
+                "result_digest": row["result_digest"],
+                "sole_id": row["sole_id"],
+            }
+            for row in phase
+        ]
+        operations.sort(key=canonical_json)
+        stages.append(operations)
+    payload = {
+        "stages": stages,
+        "state_sha256": state_digest(database),
+        "version": 1,
+    }
+    receipt = dict(payload)
+    receipt["signature"] = hmac.new(
+        RECEIPT_KEY,
+        canonical_json(payload).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    temporary = RECEIPT.with_name(f"{RECEIPT.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, RECEIPT)
+
+
+def run_search(database: sqlite3.Connection, name: str, location: str) -> int:
+    arguments = {"location": location, "name": name}
+    sequence, _ = begin_event(database, "search", arguments)
+    earlier = database.execute(
+        "SELECT operation FROM operation_journal WHERE sequence < ? ORDER BY sequence",
+        (sequence,),
+    ).fetchall()
+    if len(earlier) >= 2 or any(row["operation"] != "search" for row in earlier):
+        return fail(database, sequence, "searches must be the first two expense operations")
+
+    paired, message = wait_for_pair(database, "search")
+    if not paired:
+        return fail(database, sequence, message)
+
+    rows = database.execute(
+        """
+        SELECT id, name, location
+          FROM expenses
+         WHERE name = ? AND location = ?
+         ORDER BY id
+        """,
+        (name, location),
+    ).fetchall()
+    matches = [dict(row) for row in rows]
+    result = {"matches": matches}
+    finish_event(
+        database,
+        sequence,
+        result=result,
+        result_count=len(matches),
+        sole_id=str(rows[0]["id"]) if len(rows) == 1 else None,
+    )
+    emit(result)
+    return 0
+
+
+def full_record(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "amount_cents": row["amount_cents"],
+        "coordinator": row["coordinator"],
+        "date": row["expense_date"],
+        "id": row["id"],
+        "location": row["location"],
+        "name": row["name"],
+        "notes": row["notes"],
+        "status": row["status"],
+    }
+
+
+def run_get(database: sqlite3.Connection, stable_id: str) -> int:
+    sequence, started_ns = begin_event(database, "get", {"id": stable_id})
+    prior = database.execute(
+        "SELECT * FROM operation_journal WHERE sequence < ? ORDER BY sequence",
+        (sequence,),
+    ).fetchall()
+    searches = [row for row in prior if row["operation"] == "search"]
+    gets = [row for row in prior if row["operation"] == "get"]
+    resolved_searches = [
+        row
+        for row in searches
+        if row["result_count"] == 1
+        and isinstance(row["sole_id"], str)
+        and row["sole_id"]
+    ]
+    expected_get_count = len(resolved_searches)
+    if (
+        len(searches) != 2
+        or expected_get_count not in {1, 2}
+        or len(prior) != 2 + len(gets)
+        or len(gets) >= expected_get_count
+    ):
+        return fail(database, sequence, "gets must immediately follow the two searches")
+    if any(row["finished_ns"] is None or row["error"] is not None for row in searches):
+        return fail(database, sequence, "both search results must return before either get")
+    if started_ns <= max(int(row["finished_ns"]) for row in searches):
+        return fail(database, sequence, "get started before both search results returned")
+    if action_identity() in {str(row["action_id"]) for row in searches}:
+        return fail(database, sequence, "gets must run in the next shell-tool action")
+    matching = [row for row in resolved_searches if row["sole_id"] == stable_id]
+    if len(matching) != 1:
+        return fail(database, sequence, "get ID was not the sole ID from its own search")
+
+    if expected_get_count == 2:
+        paired, message = wait_for_pair(database, "get")
+        if not paired:
+            return fail(database, sequence, message)
+
+    get_rows = database.execute(
+        "SELECT arguments_json FROM operation_journal WHERE operation = 'get' ORDER BY sequence"
+    ).fetchall()
+    requested_ids = [json.loads(row["arguments_json"])["id"] for row in get_rows]
+    if len(requested_ids) != expected_get_count or len(set(requested_ids)) != len(requested_ids):
+        return fail(database, sequence, "each independently resolved branch must be retrieved once")
+
+    row = database.execute(
+        """
+        SELECT id, name, location, expense_date, status, amount_cents,
+               coordinator, notes
+          FROM expenses
+         WHERE id = ?
+        """,
+        (stable_id,),
+    ).fetchone()
+    record = None if row is None else full_record(row)
+    result = {"record": record}
+    finish_event(
+        database,
+        sequence,
+        result=result,
+        result_count=int(record is not None),
+        sole_id=stable_id if record is not None else None,
+    )
+    emit(result)
+    maybe_write_receipt(database)
+    return 0
+
+
+def run_forbidden(database: sqlite3.Connection, args: argparse.Namespace) -> int:
+    operation = str(args.operation)
+    arguments = {
+        key: value
+        for key, value in vars(args).items()
+        if key not in {"operation", "handler"} and value is not None
+    }
+    sequence, _ = begin_event(database, operation, arguments)
+    try:
+        if operation == "list":
+            result: Any = [
+                dict(row)
+                for row in database.execute(
+                    """
+                    SELECT id, name, location, expense_date AS date, status
+                      FROM expenses
+                     ORDER BY id
+                    """
+                )
+            ]
+        elif operation == "preferences":
+            row = database.execute(
+                "SELECT owner, preference FROM saved_preferences WHERE owner = ?",
+                (args.owner,),
+            ).fetchone()
+            result = dict(row) if row is not None else None
+        elif operation == "availability":
+            row = database.execute(
+                """
+                SELECT location, expense_date AS date, reviewer_slots
+                  FROM availability
+                 WHERE location = ? AND expense_date = ?
+                """,
+                (args.location, args.date),
+            ).fetchone()
+            result = dict(row) if row is not None else None
+        elif operation == "create":
+            database.execute(
+                """
+                INSERT INTO expenses
+                    (id, name, location, expense_date, status, amount_cents,
+                     coordinator, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    args.id,
+                    args.name,
+                    args.location,
+                    args.date,
+                    args.status,
+                    args.amount_cents,
+                    args.coordinator,
+                    args.notes,
+                ),
+            )
+            result = {"created": args.id}
+        elif operation == "update":
+            database.execute(
+                "UPDATE expenses SET status = ? WHERE id = ?",
+                (args.status, args.id),
+            )
+            result = {"updated": args.id}
+        elif operation == "cancel":
+            database.execute(
+                "UPDATE expenses SET status = 'canceled' WHERE id = ?",
+                (args.id,),
+            )
+            result = {"canceled": args.id}
+        else:
+            database.execute(
+                """
+                INSERT INTO notifications (expense_id, recipient, note)
+                VALUES (?, ?, ?)
+                """,
+                (args.id, args.recipient, args.note),
+            )
+            result = {"notified": args.id}
+        count = len(result) if isinstance(result, list) else int(result is not None)
+        finish_event(database, sequence, result=result, result_count=count)
+        emit(result)
+        return 0
+    except Exception as error:
+        return fail(database, sequence, str(error))
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        prog="expensectl",
+        description="Query the sandboxed finance expense ledger.",
+    )
+    subcommands = result.add_subparsers(dest="operation", required=True)
+
+    search = subcommands.add_parser("search", help="exact name-and-location search")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+    search.set_defaults(handler=lambda db, args: run_search(db, args.name, args.location))
+
+    get = subcommands.add_parser("get", help="retrieve one full record by stable ID")
+    get.add_argument("--id", required=True)
+    get.set_defaults(handler=lambda db, args: run_get(db, args.id))
+
+    listing = subcommands.add_parser("list", help="list the expense collection")
+    listing.set_defaults(handler=run_forbidden)
+
+    preferences = subcommands.add_parser("preferences", help="read saved preferences")
+    preferences.add_argument("--owner", default="exception-ledger")
+    preferences.set_defaults(handler=run_forbidden)
+
+    availability = subcommands.add_parser("availability", help="check reviewer availability")
+    availability.add_argument("--location", required=True)
+    availability.add_argument("--date", required=True)
+    availability.set_defaults(handler=run_forbidden)
+
+    create = subcommands.add_parser("create", help="create an expense")
+    create.add_argument("--id", required=True)
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--date", required=True)
+    create.add_argument("--status", required=True)
+    create.add_argument("--amount-cents", type=int, required=True)
+    create.add_argument("--coordinator", required=True)
+    create.add_argument("--notes", required=True)
+    create.set_defaults(handler=run_forbidden)
+
+    update = subcommands.add_parser("update", help="update an expense")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+    update.set_defaults(handler=run_forbidden)
+
+    cancel = subcommands.add_parser("cancel", help="cancel an expense")
+    cancel.add_argument("--id", required=True)
+    cancel.set_defaults(handler=run_forbidden)
+
+    notify = subcommands.add_parser("notify", help="send a notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--recipient", required=True)
+    notify.add_argument("--note", required=True)
+    notify.set_defaults(handler=run_forbidden)
+    return result
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        database = connect()
+        try:
+            return int(args.handler(database, args))
+        finally:
+            database.close()
+    except (RuntimeError, sqlite3.Error, OSError, json.JSONDecodeError) as error:
+        print(f"expensectl: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

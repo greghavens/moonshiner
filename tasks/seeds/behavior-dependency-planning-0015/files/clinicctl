@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""Executable local clinic-record client used by the task harness."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+DEFAULT_DATA = ROOT / "data" / "appointments.json"
+DEFAULT_AUDIT = ROOT / ".clinic-runtime" / "audit.jsonl"
+AUDIT_KEY = ROOT / "data" / "audit.key"
+
+
+def _data_path() -> Path:
+    return Path(os.environ.get("CLINIC_DATA_PATH", DEFAULT_DATA))
+
+
+def _audit_path() -> Path:
+    return Path(os.environ.get("CLINIC_AUDIT_LOG", DEFAULT_AUDIT))
+
+
+def _load_data() -> dict:
+    with _data_path().open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _append_event(event: dict) -> None:
+    path = _audit_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canonical = json.dumps(event, sort_keys=True, separators=(",", ":")).encode()
+    event["signature"] = hmac.new(
+        AUDIT_KEY.read_bytes().strip(), canonical, hashlib.sha256
+    ).hexdigest()
+    payload = (json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        os.write(descriptor, payload)
+    finally:
+        os.close(descriptor)
+
+
+def _public_arguments(namespace: argparse.Namespace) -> dict:
+    return {
+        key: value
+        for key, value in vars(namespace).items()
+        if key not in {"operation", "handler"} and value is not None
+    }
+
+
+def _run_recorded(namespace: argparse.Namespace) -> int:
+    call_id = uuid.uuid4().hex
+    operation = namespace.operation
+    started_ns = time.monotonic_ns()
+    common = {
+        "call_id": call_id,
+        "operation": operation,
+        "pid": os.getpid(),
+        "parent_pid": os.getppid(),
+    }
+    _append_event({
+        **common,
+        "event": "started",
+        "time_ns": started_ns,
+        "arguments": _public_arguments(namespace),
+    })
+    try:
+        response, summary = namespace.handler(namespace)
+        # The short delay makes genuinely concurrent invocations observable.
+        time.sleep(0.12 if operation in {"search", "get"} else 0.01)
+        _append_event({
+            **common,
+            "event": "finished",
+            "time_ns": time.monotonic_ns(),
+            "ok": True,
+            **summary,
+        })
+        print(json.dumps(response, indent=2, sort_keys=True))
+        return 0
+    except Exception as error:  # a real CLI failure remains visible and audited
+        _append_event({
+            **common,
+            "event": "finished",
+            "time_ns": time.monotonic_ns(),
+            "ok": False,
+            "error": str(error),
+        })
+        print(json.dumps({"error": str(error)}, sort_keys=True), file=sys.stderr)
+        return 2
+
+
+def _run_help(parser: argparse.ArgumentParser) -> int:
+    """Print top-level help while leaving genuine executable audit evidence."""
+    call_id = uuid.uuid4().hex
+    common = {
+        "call_id": call_id,
+        "operation": "help",
+        "pid": os.getpid(),
+        "parent_pid": os.getppid(),
+    }
+    _append_event({
+        **common,
+        "event": "started",
+        "time_ns": time.monotonic_ns(),
+        "arguments": {},
+    })
+    try:
+        parser.print_help()
+        _append_event({
+            **common,
+            "event": "finished",
+            "time_ns": time.monotonic_ns(),
+            "ok": True,
+            "result_ids": [],
+        })
+        return 0
+    except Exception as error:
+        _append_event({
+            **common,
+            "event": "finished",
+            "time_ns": time.monotonic_ns(),
+            "ok": False,
+            "error": str(error),
+        })
+        raise
+
+
+def _search(args: argparse.Namespace) -> tuple[dict, dict]:
+    matches = [
+        {
+            "stable_id": record["stable_id"],
+            "name": record["name"],
+            "location": record["location"],
+        }
+        for record in _load_data()["appointments"]
+        if record["name"].casefold() == args.name.casefold()
+        and record["location"].casefold() == args.location.casefold()
+    ]
+    return {"matches": matches}, {"result_ids": [item["stable_id"] for item in matches]}
+
+
+def _get(args: argparse.Namespace) -> tuple[dict, dict]:
+    records = [
+        record for record in _load_data()["appointments"]
+        if record["stable_id"] == args.id
+    ]
+    if len(records) != 1:
+        raise ValueError(f"no unique record for stable ID {args.id!r}")
+    return records[0], {"result_ids": [records[0]["stable_id"]]}
+
+
+def _list(args: argparse.Namespace) -> tuple[dict, dict]:
+    records = _load_data()["appointments"]
+    return {"appointments": records}, {"result_ids": [r["stable_id"] for r in records]}
+
+
+def _preferences(args: argparse.Namespace) -> tuple[dict, dict]:
+    return _load_data()["saved_preferences"], {"result_ids": []}
+
+
+def _availability(args: argparse.Namespace) -> tuple[dict, dict]:
+    values = _load_data()["availability"].get(args.location, [])
+    return {"location": args.location, "slots": values}, {"result_ids": []}
+
+
+def _mutation(args: argparse.Namespace) -> tuple[dict, dict]:
+    runtime = _audit_path().parent
+    runtime.mkdir(parents=True, exist_ok=True)
+    mutation_log = runtime / "mutations.jsonl"
+    entry = {"operation": args.operation, "arguments": _public_arguments(args)}
+    with mutation_log.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, sort_keys=True) + "\n")
+    return {"accepted": True, **entry}, {"result_ids": [getattr(args, "id", None)]}
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Query the sandboxed clinic appointment store; every operation is audited."
+    )
+    subparsers = parser.add_subparsers(dest="operation", required=True)
+
+    search = subparsers.add_parser("search", help="search abbreviated matches by exact name and location")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+    search.set_defaults(handler=_search)
+
+    get = subparsers.add_parser("get", help="retrieve one full record by stable ID")
+    get.add_argument("--id", required=True)
+    get.set_defaults(handler=_get)
+
+    listing = subparsers.add_parser("list", help="list the appointment collection")
+    listing.set_defaults(handler=_list)
+
+    preferences = subparsers.add_parser("preferences", help="read saved scheduler preferences")
+    preferences.set_defaults(handler=_preferences)
+
+    availability = subparsers.add_parser("availability", help="check a clinic's availability")
+    availability.add_argument("--location", required=True)
+    availability.set_defaults(handler=_availability)
+
+    create = subparsers.add_parser("create", help="create an appointment")
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--date", required=True)
+    create.set_defaults(handler=_mutation)
+
+    update = subparsers.add_parser("update", help="update an appointment status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+    update.set_defaults(handler=_mutation)
+
+    cancel = subparsers.add_parser("cancel", help="cancel an appointment")
+    cancel.add_argument("--id", required=True)
+    cancel.set_defaults(handler=_mutation)
+
+    notify = subparsers.add_parser("notify", help="send a handoff notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+    notify.set_defaults(handler=_mutation)
+    return parser
+
+
+def main() -> int:
+    parser = _parser()
+    if sys.argv[1:] == ["--help"]:
+        return _run_help(parser)
+    return _run_recorded(parser.parse_args())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

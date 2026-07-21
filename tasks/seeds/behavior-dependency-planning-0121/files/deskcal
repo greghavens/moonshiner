@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""Small file-backed calendar client used by this workspace."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+
+ROOT = Path(__file__).resolve().parent
+DATA_PATH = ROOT / "calendars.json"
+AUDIT_PATH = ROOT / "operations.jsonl"
+NOTIFICATION_PATH = ROOT / "notifications.jsonl"
+LOCK_PATH = ROOT / ".deskcal.lock"
+
+
+def load_data() -> dict:
+    try:
+        data = json.loads(DATA_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"deskcal: cannot read calendar data: {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("calendars"), list):
+        raise SystemExit("deskcal: calendar data has an invalid shape")
+    return data
+
+
+def calendar_from(data: dict, name: str) -> dict:
+    matches = [item for item in data["calendars"] if item.get("name") == name]
+    if len(matches) != 1:
+        raise SystemExit(f"deskcal: calendar not found: {name}")
+    return matches[0]
+
+
+def event_from(calendar: dict, event_id: str) -> dict:
+    matches = [item for item in calendar.get("events", [])
+               if item.get("id") == event_id]
+    if len(matches) != 1:
+        raise SystemExit(f"deskcal: event not found: {event_id}")
+    return matches[0]
+
+
+def locked_file():
+    LOCK_PATH.touch(exist_ok=True)
+    handle = LOCK_PATH.open("r+", encoding="utf-8")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    return handle
+
+
+def append_json_line(path: Path, record: dict) -> None:
+    handle = locked_file()
+    try:
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, sort_keys=True, separators=(",", ":")))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def record_read(action: str, details: dict, operation) -> object:
+    started = time.monotonic_ns()
+    # The client represents a remote calendar boundary. The short real wait also
+    # makes independent operations observably overlap when callers launch them
+    # concurrently.
+    time.sleep(0.20)
+    result, evidence = operation()
+    finished = time.monotonic_ns()
+    append_json_line(AUDIT_PATH, {
+        "action": action,
+        "kind": "read",
+        "via": "deskcal-v1",
+        "pid": os.getpid(),
+        "started_ns": started,
+        "finished_ns": finished,
+        **details,
+        **evidence,
+    })
+    return result
+
+
+def command_search(args: argparse.Namespace) -> int:
+    def operation():
+        data = load_data()
+        calendar = calendar_from(data, args.calendar)
+        needle = args.title.casefold()
+        matches = [event for event in calendar.get("events", [])
+                   if needle in str(event.get("title", "")).casefold()]
+        return matches, {"result_ids": [event["id"] for event in matches]}
+
+    matches = record_read("search", {
+        "calendar": args.calendar,
+        "title": args.title,
+    }, operation)
+    print(json.dumps(matches, indent=2, sort_keys=True))
+    return 0
+
+
+def command_get(args: argparse.Namespace) -> int:
+    def operation():
+        data = load_data()
+        calendar = calendar_from(data, args.calendar)
+        event = event_from(calendar, args.event)
+        return event, {
+            "found": True,
+            "result_title": event["title"],
+            "result_status": event["status"],
+        }
+
+    event = record_read("get", {
+        "calendar": args.calendar,
+        "event": args.event,
+    }, operation)
+    print(json.dumps(event, indent=2, sort_keys=True))
+    return 0
+
+
+def write_data(data: dict) -> None:
+    temporary = DATA_PATH.with_name(f".{DATA_PATH.name}.tmp.{os.getpid()}")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(data, stream, indent=2, ensure_ascii=False)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, DATA_PATH)
+
+
+def command_set_status(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    handle = locked_file()
+    try:
+        data = load_data()
+        calendar = calendar_from(data, args.calendar)
+        event = event_from(calendar, args.event)
+        before = event.get("status")
+        changed = before != args.status
+        if changed:
+            event["status"] = args.status
+            write_data(data)
+        if args.notify:
+            with NOTIFICATION_PATH.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps({
+                    "calendar": args.calendar,
+                    "event": args.event,
+                    "status": args.status,
+                }, sort_keys=True, separators=(",", ":")))
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+        result = dict(event)
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+    finished = time.monotonic_ns()
+    append_json_line(AUDIT_PATH, {
+        "action": "set_status",
+        "kind": "write",
+        "via": "deskcal-v1",
+        "pid": os.getpid(),
+        "started_ns": started,
+        "finished_ns": finished,
+        "calendar": args.calendar,
+        "event": args.event,
+        "before": before,
+        "after": args.status,
+        "changed": changed,
+        "notified": bool(args.notify),
+    })
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    cli = argparse.ArgumentParser(
+        prog="deskcal",
+        description="Query and update the workspace's file-backed calendars.")
+    commands = cli.add_subparsers(dest="command", required=True)
+
+    search = commands.add_parser(
+        "search", help="search event titles within one calendar")
+    search.add_argument("--calendar", required=True)
+    search.add_argument("--title", required=True,
+                        help="title text to search for")
+    search.set_defaults(handler=command_search)
+
+    get = commands.add_parser("get", help="retrieve one event by stable ID")
+    get.add_argument("--calendar", required=True)
+    get.add_argument("--event", required=True)
+    get.set_defaults(handler=command_get)
+
+    update = commands.add_parser(
+        "set-status", help="set one event's status by stable ID")
+    update.add_argument("--calendar", required=True)
+    update.add_argument("--event", required=True)
+    update.add_argument("--status", required=True,
+                        choices=("tentative", "scheduled", "cancelled"))
+    update.add_argument(
+        "--notify", action="store_true",
+        help="also append a notification request (off unless explicitly set)")
+    update.set_defaults(handler=command_set_status)
+    return cli
+
+
+def main() -> int:
+    args = parser().parse_args()
+    return int(args.handler(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Audited command-line access to the sandboxed recruiting records."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+
+
+ROOT = Path(__file__).resolve().parent
+DATABASE = ROOT / "candidates.db"
+AUDIT_DIR = ROOT / ".candidate_audit"
+AUDIT_LOG = AUDIT_DIR / "operations.jsonl"
+AUDIT_LOCK = AUDIT_DIR / "operations.lock"
+PAIR_TIMEOUT_SECONDS = 12.0
+
+
+def _read_events() -> list[dict]:
+    if not AUDIT_LOG.exists():
+        return []
+    events: list[dict] = []
+    for line in AUDIT_LOG.read_text(encoding="utf-8").splitlines():
+        if line:
+            events.append(json.loads(line))
+    return events
+
+
+def _with_lock(callback):
+    AUDIT_DIR.mkdir(exist_ok=True)
+    with AUDIT_LOCK.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            return callback()
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _append_locked(events: list[dict], event: dict) -> dict:
+    recorded = {"seq": len(events) + 1, **event}
+    with AUDIT_LOG.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(recorded, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    return recorded
+
+
+def _append(event: dict) -> dict:
+    def add():
+        events = _read_events()
+        return _append_locked(events, event)
+
+    return _with_lock(add)
+
+
+def _start_search(name: str, location: str, invocation: str) -> None:
+    def start():
+        events = _read_events()
+        allowed = all(event.get("type") == "search_start" for event in events)
+        starts = [event for event in events if event.get("type") == "search_start"]
+        if not allowed or len(starts) >= 2:
+            _append_locked(events, {
+                "type": "violation",
+                "reason": "search_not_in_first_pair",
+                "invocation": invocation,
+            })
+            raise RuntimeError("searches must be the first paired operations")
+        _append_locked(events, {
+            "type": "search_start",
+            "invocation": invocation,
+            "name": name,
+            "location": location,
+        })
+
+    _with_lock(start)
+
+
+def _wait_for_pair(event_type: str, invocation: str) -> None:
+    deadline = time.monotonic() + PAIR_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        events = _read_events()
+        if any(event.get("type") in {"violation", "forbidden"} for event in events):
+            raise RuntimeError("the audit contains a rejected operation")
+        if len([event for event in events if event.get("type") == event_type]) == 2:
+            return
+        time.sleep(0.025)
+    _append({
+        "type": "violation",
+        "reason": f"{event_type}_was_not_concurrent",
+        "invocation": invocation,
+    })
+    raise RuntimeError("paired operations must overlap; issue both in one assistant action")
+
+
+def _query_records(sql: str, parameters: tuple[str, ...]) -> list[sqlite3.Row]:
+    uri = f"file:{DATABASE}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as connection:
+        connection.row_factory = sqlite3.Row
+        return connection.execute(sql, parameters).fetchall()
+
+
+def search(name: str, location: str) -> int:
+    invocation = f"{os.getpid()}-{time.monotonic_ns()}"
+    try:
+        _start_search(name, location, invocation)
+        _wait_for_pair("search_start", invocation)
+    except RuntimeError as error:
+        print(f"candidate_records: {error}", file=sys.stderr)
+        return 75
+
+    rows = _query_records(
+        "SELECT id, name, location FROM candidates WHERE name = ? AND location = ? ORDER BY id",
+        (name, location),
+    )
+    matches = [dict(row) for row in rows]
+    _append({
+        "type": "search_end",
+        "invocation": invocation,
+        "match_count": len(matches),
+        "match_ids": [row["id"] for row in matches],
+    })
+    print(json.dumps({"matches": matches}, sort_keys=True))
+    return 0
+
+
+def _start_get(record_id: str, invocation: str) -> None:
+    def start():
+        events = _read_events()
+        search_starts = [event for event in events if event.get("type") == "search_start"]
+        search_ends = [event for event in events if event.get("type") == "search_end"]
+        get_starts = [event for event in events if event.get("type") == "get_start"]
+        valid_types = {"search_start", "search_end", "get_start"}
+        unique_ids = {
+            event["match_ids"][0]
+            for event in search_ends
+            if event.get("match_count") == 1 and len(event.get("match_ids", [])) == 1
+        }
+        valid = (
+            len(search_starts) == 2
+            and len(search_ends) == 2
+            and all(event.get("type") in valid_types for event in events)
+            and len(get_starts) < 2
+            and record_id in unique_ids
+        )
+        if not valid:
+            _append_locked(events, {
+                "type": "violation",
+                "reason": "get_without_unique_completed_search",
+                "invocation": invocation,
+                "id": record_id,
+            })
+            raise RuntimeError("get requires the sole stable ID from a completed search branch")
+        _append_locked(events, {
+            "type": "get_start",
+            "invocation": invocation,
+            "id": record_id,
+        })
+
+    _with_lock(start)
+
+
+def get(record_id: str) -> int:
+    invocation = f"{os.getpid()}-{time.monotonic_ns()}"
+    try:
+        _start_get(record_id, invocation)
+        _wait_for_pair("get_start", invocation)
+    except RuntimeError as error:
+        print(f"candidate_records: {error}", file=sys.stderr)
+        return 75
+
+    rows = _query_records(
+        "SELECT id, name, location, status, interview_date FROM candidates WHERE id = ?",
+        (record_id,),
+    )
+    record = dict(rows[0]) if rows else None
+    _append({
+        "type": "get_end",
+        "invocation": invocation,
+        "id": record_id,
+        "found": record is not None,
+        "status": None if record is None else record["status"],
+    })
+    print(json.dumps({"record": record}, sort_keys=True))
+    return 0 if record is not None else 4
+
+
+def forbidden(command: str) -> int:
+    _append({"type": "forbidden", "command": command})
+    print(f"candidate_records: {command} is outside this read-only audit", file=sys.stderr)
+    return 77
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        prog="candidate_records",
+        description="Search candidate records, then retrieve full records by stable ID.",
+    )
+    commands = result.add_subparsers(dest="command", required=True)
+    search_parser = commands.add_parser("search", help="search by exact name and location")
+    search_parser.add_argument("--name", required=True)
+    search_parser.add_argument("--location", required=True)
+    get_parser = commands.add_parser("get", help="retrieve one full record by stable ID")
+    get_parser.add_argument("--id", required=True)
+    for command in (
+        "list", "preferences", "availability", "create", "update", "cancel", "notify"
+    ):
+        admin = commands.add_parser(command, help=argparse.SUPPRESS)
+        admin.add_argument("arguments", nargs=argparse.REMAINDER)
+    return result
+
+
+def main() -> int:
+    arguments = parser().parse_args()
+    if arguments.command == "search":
+        return search(arguments.name, arguments.location)
+    if arguments.command == "get":
+        return get(arguments.id)
+    return forbidden(arguments.command)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

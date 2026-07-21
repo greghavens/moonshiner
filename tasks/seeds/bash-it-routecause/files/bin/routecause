@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+set -u
+
+die() {
+  printf 'routecause: %s\n' "$*" >&2
+  exit 2
+}
+
+require_file() {
+  [[ -f "$1" ]] || die "missing fixture: $1"
+}
+
+prefix_contains() {
+  local address=$1
+  local prefix=$2
+  awk -v address="$address" -v prefix="$prefix" '
+    function ip_number(value, octets) {
+      split(value, octets, ".")
+      return (((octets[1] * 256 + octets[2]) * 256 + octets[3]) * 256 + octets[4])
+    }
+    BEGIN {
+      split(prefix, parts, "/")
+      block = 2 ^ (32 - parts[2])
+      exit int(ip_number(address) / block) != int(ip_number(parts[1]) / block)
+    }
+  '
+}
+
+network_prefix() {
+  local cidr=$1
+  awk -v cidr="$cidr" '
+    function ip_number(value, octets) {
+      split(value, octets, ".")
+      return (((octets[1] * 256 + octets[2]) * 256 + octets[3]) * 256 + octets[4])
+    }
+    BEGIN {
+      split(cidr, parts, "/")
+      bits = parts[2] + 0
+      block = 2 ^ (32 - bits)
+      network = int(ip_number(parts[1]) / block) * block
+      first = int(network / 16777216)
+      network %= 16777216
+      second = int(network / 65536)
+      network %= 65536
+      third = int(network / 256)
+      fourth = network % 256
+      printf "%d.%d.%d.%d/%d\n", first, second, third, fourth, bits
+    }
+  '
+}
+
+select_table() {
+  local source=$1
+  local mark=$2
+  local rules_file=$3
+  local priority selector value mask table
+
+  while IFS=$'\t' read -r priority selector value mask table; do
+    [[ -z "${priority:-}" || $priority == \#* ]] && continue
+    case "$selector" in
+      fwmark)
+        if (( (mark & mask) == (value & mask) )); then
+          printf '%s\n' "$table"
+          return 0
+        fi
+        ;;
+      from)
+        if prefix_contains "$source" "$value"; then
+          printf '%s\n' "$table"
+          return 0
+        fi
+        ;;
+      all)
+        printf '%s\n' "$table"
+        return 0
+        ;;
+    esac
+  done < <(sort -t$'\t' -k1,1n "$rules_file")
+
+  return 1
+}
+
+select_route() {
+  local wanted_table=$1
+  local destination=$2
+  local routes_file=$3
+  local table prefix via device metric bits
+  local best_bits=-1
+  local best_metric=2147483647
+  local best=''
+
+  while IFS=$'\t' read -r table prefix via device metric; do
+    [[ -z "${table:-}" || $table == \#* || $table != "$wanted_table" ]] && continue
+    if prefix_contains "$destination" "$prefix"; then
+      bits=${prefix#*/}
+      if (( bits > best_bits || (bits == best_bits && metric < best_metric) )); then
+        best_bits=$bits
+        best_metric=$metric
+        best="$table"$'\t'"$prefix"$'\t'"$via"$'\t'"$device"$'\t'"$metric"
+      fi
+    fi
+  done < "$routes_file"
+
+  [[ -n $best ]] || return 1
+  printf '%s\n' "$best"
+}
+
+interface_is_up() {
+  local device=$1
+  local interfaces_file=$2
+  awk -F '\t' -v device="$device" '
+    !/^#/ && $1 == device && $2 == "up" { found = 1 }
+    END { exit !found }
+  ' "$interfaces_file"
+}
+
+neighbor_is_usable() {
+  local device=$1
+  local address=$2
+  local neighbors_file=$3
+  awk -F '\t' -v device="$device" -v address="$address" '
+    !/^#/ && $1 == device && $2 == address &&
+      ($3 == "REACHABLE" || $3 == "STALE" || $3 == "DELAY" ||
+       $3 == "PROBE" || $3 == "PERMANENT") { found = 1 }
+    END { exit !found }
+  ' "$neighbors_file"
+}
+
+check_flow() {
+  local name=$1
+  local source=$2
+  local destination=$3
+  local mark=$4
+  local fixture_dir=$5
+  local routes_file=$6
+  local table route route_table prefix via device metric
+  local gateway_route gateway_table gateway_prefix gateway_via gateway_device gateway_metric
+
+  if ! table=$(select_table "$source" "$mark" "$fixture_dir/rules.tsv"); then
+    printf 'FAIL %s cause=no-policy-table\n' "$name"
+    return 1
+  fi
+  if ! route=$(select_route "$table" "$destination" "$routes_file"); then
+    printf 'FAIL %s table=%s cause=no-route\n' "$name" "$table"
+    return 1
+  fi
+  IFS=$'\t' read -r route_table prefix via device metric <<< "$route"
+
+  if ! interface_is_up "$device" "$fixture_dir/interfaces.tsv"; then
+    printf 'FAIL %s table=%s route=%s dev=%s cause=interface-down\n' \
+      "$name" "$table" "$prefix" "$device"
+    return 1
+  fi
+
+  if [[ $via != '-' ]]; then
+    if ! gateway_route=$(select_route "$table" "$via" "$routes_file"); then
+      printf 'FAIL %s table=%s route=%s via=%s dev=%s cause=gateway-not-on-link\n' \
+        "$name" "$table" "$prefix" "$via" "$device"
+      return 1
+    fi
+    IFS=$'\t' read -r gateway_table gateway_prefix gateway_via gateway_device gateway_metric \
+      <<< "$gateway_route"
+    if [[ $gateway_via != '-' || $gateway_device != "$device" ]]; then
+      printf 'FAIL %s table=%s route=%s via=%s dev=%s cause=gateway-not-on-link\n' \
+        "$name" "$table" "$prefix" "$via" "$device"
+      return 1
+    fi
+    if ! neighbor_is_usable "$device" "$via" "$fixture_dir/neighbors.tsv"; then
+      printf 'FAIL %s table=%s route=%s via=%s dev=%s cause=neighbor-unusable\n' \
+        "$name" "$table" "$prefix" "$via" "$device"
+      return 1
+    fi
+  fi
+
+  printf 'PASS %s table=%s route=%s via=%s dev=%s\n' \
+    "$name" "$table" "$prefix" "$via" "$device"
+}
+
+verify_all() {
+  local fixture_dir=$1
+  local routes_file=$2
+  local name source destination mark
+  local result=0
+
+  while IFS=$'\t' read -r name source destination mark; do
+    [[ -z "${name:-}" || $name == \#* ]] && continue
+    check_flow "$name" "$source" "$destination" "$mark" "$fixture_dir" "$routes_file" || result=1
+  done < "$fixture_dir/flows.tsv"
+  return "$result"
+}
+
+propose_route() {
+  local fixture_dir=$1
+  local routes_file=$2
+  local name source destination mark
+  local selected_table route route_table route_prefix gateway device metric address prefix
+
+  while IFS=$'\t' read -r name source destination mark; do
+    [[ -z "${name:-}" || $name == \#* ]] && continue
+    [[ $name == outbound ]] && break
+  done < "$fixture_dir/flows.tsv"
+
+  selected_table=$(select_table "$source" "$mark" "$fixture_dir/rules.tsv") || return 1
+  route=$(select_route "$selected_table" "$destination" "$routes_file") || return 1
+  IFS=$'\t' read -r route_table route_prefix gateway device metric <<< "$route"
+  [[ $gateway != '-' ]] || return 1
+
+  address=$(awk -F '\t' -v device="$device" '!/^#/ && $1 == device { print $2; exit }' \
+    "$fixture_dir/addresses.tsv")
+  [[ -n $address ]] || return 1
+  prefix=$(network_prefix "$address")
+
+  # Connected routes normally appear in main, where the kernel installs them.
+  # The simulation records the inferred route explicitly.
+  local repair_table=254
+  printf 'ADD table=%s prefix=%s via=- dev=%s metric=0\n' \
+    "$repair_table" "$prefix" "$device"
+}
+
+apply_route() {
+  local fixture_dir=$1
+  local routes_file=$2
+  local proposal action table_field prefix_field via_field device_field metric_field
+  local table prefix via device metric
+
+  proposal=$(propose_route "$fixture_dir" "$routes_file") || return 1
+  read -r action table_field prefix_field via_field device_field metric_field <<< "$proposal"
+  table=${table_field#table=}
+  prefix=${prefix_field#prefix=}
+  via=${via_field#via=}
+  device=${device_field#dev=}
+  metric=${metric_field#metric=}
+
+  if awk -F '\t' -v table="$table" -v prefix="$prefix" -v via="$via" -v device="$device" '
+      !/^#/ && $1 == table && $2 == prefix && $3 == via && $4 == device { found = 1 }
+      END { exit !found }
+    ' "$routes_file"; then
+    return 0
+  fi
+
+  printf '%s\t%s\t%s\t%s\t%s\n' "$table" "$prefix" "$via" "$device" "$metric" \
+    >> "$routes_file"
+}
+
+validate_fixture_dir() {
+  local fixture_dir=$1
+  local fixture
+  for fixture in interfaces.tsv addresses.tsv routes.tsv neighbors.tsv rules.tsv flows.tsv; do
+    require_file "$fixture_dir/$fixture"
+  done
+}
+
+main() {
+  local command=${1:-}
+  local fixture_dir=${2:-}
+  local routes_file work_dir simulated
+  [[ -n $command && -n $fixture_dir ]] || die 'usage: routecause COMMAND FIXTURE_DIR [ARG]'
+  validate_fixture_dir "$fixture_dir"
+
+  case "$command" in
+    diagnose|verify)
+      routes_file=${3:-$fixture_dir/routes.tsv}
+      require_file "$routes_file"
+      verify_all "$fixture_dir" "$routes_file"
+      ;;
+    plan)
+      routes_file=${3:-$fixture_dir/routes.tsv}
+      require_file "$routes_file"
+      propose_route "$fixture_dir" "$routes_file"
+      ;;
+    apply)
+      routes_file=${3:-}
+      [[ -n $routes_file ]] || die 'apply requires a writable route file'
+      require_file "$routes_file"
+      apply_route "$fixture_dir" "$routes_file"
+      ;;
+    simulate)
+      work_dir=${3:-}
+      [[ -n $work_dir ]] || die 'simulate requires a work directory'
+      mkdir -p "$work_dir"
+      simulated="$work_dir/routes.simulated.tsv"
+      cp "$fixture_dir/routes.tsv" "$simulated"
+      propose_route "$fixture_dir" "$simulated"
+      apply_route "$fixture_dir" "$simulated"
+      verify_all "$fixture_dir" "$simulated"
+      ;;
+    *)
+      die "unknown command: $command"
+      ;;
+  esac
+}
+
+main "$@"

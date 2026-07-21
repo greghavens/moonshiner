@@ -1,0 +1,335 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly SEP=$'\034'
+
+usage() {
+    cat >&2 <<'EOF'
+Usage:
+  configdrift analyze BASELINE HOST EXCEPTIONS REPORT REPAIR
+  configdrift verify  BASELINE ROOT SERVICES EXCEPTIONS
+
+Snapshot records are tab-separated:
+  FILE     /absolute/path  octal-mode  numeric-uid  numeric-gid  base64-content
+  SERVICE  service-name    enabled|disabled         active|inactive
+
+Exception records are tab-separated and pin one known actual value:
+  FILE|SERVICE  resource-name  field-name  actual-value
+EOF
+    exit 2
+}
+
+die() {
+    printf 'configdrift: %s\n' "$*" >&2
+    exit 2
+}
+
+require_file() {
+    [[ -f "$1" ]] || die "not a regular file: $1"
+}
+
+validate_type() {
+    case "$1" in
+        FILE|SERVICE) ;;
+        *) die "unknown record type: $1" ;;
+    esac
+}
+
+# Exceptions intentionally include the observed value: a future, different local
+# change must be drift instead of silently inheriting an old approval.
+is_exception() {
+    local exceptions=$1 type=$2 target=$3 field=$4 actual=$5
+    local rule_type rule_target rule_field rule_actual extra
+
+    while IFS=$'\t' read -r rule_type rule_target rule_field rule_actual extra ||
+          [[ -n "${rule_type:-}${rule_target:-}${rule_field:-}${rule_actual:-}${extra:-}" ]]; do
+        [[ -z "${rule_type:-}" || "${rule_type:0:1}" == '#' ]] && continue
+        [[ -z "${extra:-}" ]] || die "malformed exception record"
+        if [[ "$rule_type" == "$type" &&
+              "$target" == "$rule_target"* &&
+              "$rule_field" == "$field" &&
+              "$rule_actual" == "$actual" ]]; then
+            return 0
+        fi
+    done < "$exceptions"
+    return 1
+}
+
+shell_quote() {
+    printf '%q' "$1"
+}
+
+emit_repair_header() {
+    cat <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=${1:-/}
+services=${2:-/var/lib/configdrift/services.tsv}
+
+rooted() {
+    local path=$1
+    printf '%s%s' "${root%/}" "$path"
+}
+
+repair_content() {
+    local path encoded destination temporary
+    path=$1
+    encoded=$2
+    destination=$(rooted "$path")
+    mkdir -p "$(dirname "$destination")"
+    temporary="${destination}.configdrift.tmp"
+    printf '%s' "$encoded" | base64 -d > "$temporary"
+    if [[ ! -f "$destination" ]] || ! cmp -s "$temporary" "$destination"; then
+        if [[ -f "$destination" ]]; then
+            # Replacing content must not turn correct metadata into new drift.
+            chown --reference="$destination" "$temporary"
+            chmod --reference="$destination" "$temporary"
+        fi
+        mv "$temporary" "$destination"
+    else
+        rm -f "$temporary"
+    fi
+}
+
+repair_mode() {
+    local destination
+    destination=$(rooted "$1")
+    [[ $(stat -c '%a' "$destination") == "${2#0}" ]] || chmod "$2" "$destination"
+}
+
+repair_owner_fields() {
+    local destination expected_uid expected_gid current_uid current_gid current_mode
+    destination=$(rooted "$1")
+    expected_uid=$2
+    expected_gid=$3
+    current_uid=$(stat -c '%u' "$destination")
+    current_gid=$(stat -c '%g' "$destination")
+    current_mode=$(stat -c '%a' "$destination")
+    [[ "$expected_uid" == - ]] && expected_uid=$current_uid
+    [[ "$expected_gid" == - ]] && expected_gid=$current_gid
+    if [[ "$current_uid:$current_gid" != "$expected_uid:$expected_gid" ]]; then
+        chown "$expected_uid:$expected_gid" "$destination"
+        # chown may clear setuid/setgid bits even when mode is not drift.
+        chmod "$current_mode" "$destination"
+    fi
+}
+
+repair_service_field() {
+    local name=$1 field=$2 value=$3 temporary
+    mkdir -p "$(dirname "$services")"
+    temporary="${services}.configdrift.tmp"
+    awk -F '\t' -v OFS='\t' -v wanted="$name" -v field="$field" -v value="$value" '
+        $1 == wanted {
+            if (field == "enabled") $2 = value
+            if (field == "active") $3 = value
+            found = 1
+        }
+        { print }
+        END {
+            if (!found) {
+                enabled = (field == "enabled" ? value : "disabled")
+                active = (field == "active" ? value : "inactive")
+                print wanted, enabled, active
+            }
+        }
+    ' "$services" > "$temporary"
+    if ! cmp -s "$temporary" "$services"; then
+        mv "$temporary" "$services"
+    else
+        rm -f "$temporary"
+    fi
+}
+EOF
+}
+
+declare -A HOST=()
+
+load_host_snapshot() {
+    local snapshot=$1 type target third fourth fifth sixth extra
+    while IFS=$'\t' read -r type target third fourth fifth sixth extra ||
+          [[ -n "${type:-}${target:-}${third:-}${fourth:-}${fifth:-}${sixth:-}${extra:-}" ]]; do
+        [[ -z "${type:-}" || "${type:0:1}" == '#' ]] && continue
+        validate_type "$type"
+        if [[ "$type" == FILE ]]; then
+            [[ -n "$target" && "$target" == /* && -n "$third" && -n "$fourth" &&
+               -n "$fifth" && -n "$sixth" && -z "${extra:-}" ]] ||
+                die "malformed FILE snapshot record"
+            HOST["FILE${SEP}${target}${SEP}mode"]=$third
+            HOST["FILE${SEP}${target}${SEP}uid"]=$fourth
+            HOST["FILE${SEP}${target}${SEP}gid"]=$fifth
+            HOST["FILE${SEP}${target}${SEP}content"]=$sixth
+        else
+            [[ -n "$target" && -n "$third" && -n "$fourth" &&
+               -z "${fifth:-}${sixth:-}${extra:-}" ]] ||
+                die "malformed SERVICE snapshot record"
+            HOST["SERVICE${SEP}${target}${SEP}enabled"]=$third
+            HOST["SERVICE${SEP}${target}${SEP}active"]=$fourth
+        fi
+    done < "$snapshot"
+}
+
+record_change() {
+    local exceptions=$1 report=$2 repair=$3
+    local type=$4 target=$5 field=$6 expected=$7 actual=$8 class
+
+    if [[ "$expected" == "$actual" ]]; then
+        LAST_CHANGE_CLASS=UNCHANGED
+        return 0
+    fi
+    if is_exception "$exceptions" "$type" "$target" "$field" "$actual"; then
+        class=INTENTIONAL
+    else
+        class=DRIFT
+    fi
+    LAST_CHANGE_CLASS=$class
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$class" "$type" "$target" "$field" "$expected" "$actual" >> "$report"
+
+    [[ "$class" == DRIFT ]] || return 0
+    if [[ "$type" == FILE ]]; then
+        case "$field" in
+            content)
+                printf 'repair_content %s %s\n' "$(shell_quote "$target")" "$(shell_quote "$expected")" >> "$repair"
+                ;;
+            mode)
+                printf 'repair_mode %s %s\n' "$(shell_quote "$target")" "$(shell_quote "$expected")" >> "$repair"
+                ;;
+            uid|gid)
+                # Emitted once after both ownership fields are classified.
+                :
+                ;;
+        esac
+    else
+        printf 'repair_service_field %s %s %s\n' \
+            "$(shell_quote "$target")" "$(shell_quote "$field")" "$(shell_quote "$expected")" >> "$repair"
+    fi
+}
+
+analyze() {
+    [[ $# -eq 5 ]] || usage
+    local baseline=$1 host=$2 exceptions=$3 report=$4 repair=$5
+    local type target third fourth fifth sixth extra field key expected actual owner_uid owner_gid
+    require_file "$baseline"
+    require_file "$host"
+    require_file "$exceptions"
+
+    : > "$report"
+    emit_repair_header > "$repair"
+    load_host_snapshot "$host"
+
+    while IFS=$'\t' read -r type target third fourth fifth sixth extra ||
+          [[ -n "${type:-}${target:-}${third:-}${fourth:-}${fifth:-}${sixth:-}${extra:-}" ]]; do
+        [[ -z "${type:-}" || "${type:0:1}" == '#' ]] && continue
+        validate_type "$type"
+        if [[ "$type" == FILE ]]; then
+            [[ -n "$target" && "$target" == /* && -n "$third" && -n "$fourth" &&
+               -n "$fifth" && -n "$sixth" && -z "${extra:-}" ]] ||
+                die "malformed FILE baseline record"
+            # Content comes first so a genuinely missing file exists. Mode is
+            # last because changing ownership can clear special permission bits.
+            owner_uid=-
+            owner_gid=-
+            for field in content uid gid mode; do
+                case "$field" in
+                    mode) expected=$third ;;
+                    uid) expected=$fourth ;;
+                    gid) expected=$fifth ;;
+                    content) expected=$sixth ;;
+                esac
+                key="FILE${SEP}${target}${SEP}${field}"
+                actual=${HOST[$key]:-missing}
+                record_change "$exceptions" "$report" "$repair" FILE "$target" "$field" "$expected" "$actual"
+                if [[ "$LAST_CHANGE_CLASS" == DRIFT ]]; then
+                    [[ "$field" == uid ]] && owner_uid=$expected
+                    [[ "$field" == gid ]] && owner_gid=$expected
+                fi
+            done
+            if [[ "$owner_uid" != - || "$owner_gid" != - ]]; then
+                printf 'repair_owner_fields %s %s %s\n' \
+                    "$(shell_quote "$target")" "$(shell_quote "$owner_uid")" "$(shell_quote "$owner_gid")" >> "$repair"
+            fi
+        else
+            [[ -n "$target" && -n "$third" && -n "$fourth" &&
+               -z "${fifth:-}${sixth:-}${extra:-}" ]] ||
+                die "malformed SERVICE baseline record"
+            for field in enabled active; do
+                [[ "$field" == enabled ]] && expected=$third || expected=$fourth
+                key="SERVICE${SEP}${target}${SEP}${field}"
+                actual=${HOST[$key]:-missing}
+                record_change "$exceptions" "$report" "$repair" SERVICE "$target" "$field" "$expected" "$actual"
+            done
+        fi
+    done < "$baseline"
+    LC_ALL=C sort -o "$report" "$report"
+    chmod +x "$repair"
+}
+
+read_service_field() {
+    local services=$1 name=$2 field=$3 value
+    value=$(awk -F '\t' -v wanted="$name" -v field="$field" '
+        $1 == wanted { print (field == "enabled" ? $2 : $3); found = 1; exit }
+        END { if (!found) print "missing" }
+    ' "$services")
+    printf '%s' "$value"
+}
+
+verify() {
+    [[ $# -eq 4 ]] || usage
+    local baseline=$1 root=$2 services=$3 exceptions=$4
+    local type target third fourth fifth sixth extra field expected actual destination failures=0
+    require_file "$baseline"
+    require_file "$services"
+    require_file "$exceptions"
+
+    while IFS=$'\t' read -r type target third fourth fifth sixth extra ||
+          [[ -n "${type:-}${target:-}${third:-}${fourth:-}${fifth:-}${sixth:-}${extra:-}" ]]; do
+        [[ -z "${type:-}" || "${type:0:1}" == '#' ]] && continue
+        validate_type "$type"
+        if [[ "$type" == FILE ]]; then
+            destination="${root%/}${target}"
+            if [[ -f "$destination" ]]; then
+                for field in mode uid gid content; do
+                    case "$field" in
+                        mode) expected=$third; actual=0$(stat -c '%a' "$destination") ;;
+                        uid) expected=$fourth; actual=$(stat -c '%u' "$destination") ;;
+                        gid) expected=$fifth; actual=$(stat -c '%g' "$destination") ;;
+                        content) expected=$sixth; actual=$(base64 < "$destination" | tr -d '\n') ;;
+                    esac
+                    [[ "$expected" == "$actual" ]] && continue
+                    if is_exception "$exceptions" FILE "$target" "$field" "$actual"; then
+                        printf 'INTENTIONAL\tFILE\t%s\t%s\n' "$target" "$field"
+                    else
+                        printf 'DRIFT\tFILE\t%s\t%s\n' "$target" "$field"
+                        failures=1
+                    fi
+                done
+            else
+                printf 'DRIFT\tFILE\t%s\tmissing\n' "$target"
+                failures=1
+            fi
+        else
+            for field in enabled active; do
+                [[ "$field" == enabled ]] && expected=$third || expected=$fourth
+                actual=$(read_service_field "$services" "$target" "$field")
+                [[ "$expected" == "$actual" ]] && continue
+                if is_exception "$exceptions" SERVICE "$target" "$field" "$actual"; then
+                    printf 'INTENTIONAL\tSERVICE\t%s\t%s\n' "$target" "$field"
+                else
+                    printf 'DRIFT\tSERVICE\t%s\t%s\n' "$target" "$field"
+                    failures=1
+                fi
+            done
+        fi
+    done < "$baseline"
+    return "$failures"
+}
+
+[[ $# -gt 0 ]] || usage
+command=$1
+shift
+case "$command" in
+    analyze) analyze "$@" ;;
+    verify) verify "$@" ;;
+    *) usage ;;
+esac

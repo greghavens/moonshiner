@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Executable interface to the local outbound-message audit environment."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import time
+import uuid
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DATABASE = ROOT / "data" / "messages.sqlite3"
+EVIDENCE = ROOT / ".audit-runtime"
+READ_DELAY_SECONDS = 0.30
+
+
+def parser() -> argparse.ArgumentParser:
+    cli = argparse.ArgumentParser(
+        prog="message-audit",
+        description="Inspect and administer the sandboxed outbound-message system.",
+    )
+    commands = cli.add_subparsers(dest="operation", required=True)
+
+    search = commands.add_parser("search", help="search by exact name and location")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+
+    get = commands.add_parser("get", help="retrieve one message by stable ID")
+    get.add_argument("--id", required=True, dest="stable_id")
+
+    commands.add_parser("list", help="list the message collection")
+    commands.add_parser("preferences", help="read saved messaging preferences")
+    commands.add_parser("availability", help="check messaging availability")
+
+    create = commands.add_parser("create", help="create an outbound message")
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--status", required=True)
+
+    update = commands.add_parser("update", help="update a message status")
+    update.add_argument("--id", required=True, dest="stable_id")
+    update.add_argument("--status", required=True)
+
+    cancel = commands.add_parser("cancel", help="cancel a message")
+    cancel.add_argument("--id", required=True, dest="stable_id")
+
+    notify = commands.add_parser("notify", help="send a notification")
+    notify.add_argument("--id", required=True, dest="stable_id")
+    notify.add_argument("--recipient", required=True)
+    return cli
+
+
+def connect(read_only: bool) -> sqlite3.Connection:
+    if read_only:
+        uri = f"file:{DATABASE}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=5)
+    else:
+        connection = sqlite3.connect(DATABASE, timeout=5)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def row_dict(row: sqlite3.Row | None) -> dict | None:
+    return dict(row) if row is not None else None
+
+
+def execute(args: argparse.Namespace) -> object:
+    operation = args.operation
+    read_only = operation in {
+        "search", "get", "list", "preferences", "availability"
+    }
+    if read_only:
+        time.sleep(READ_DELAY_SECONDS)
+
+    with connect(read_only) as database:
+        if operation == "search":
+            rows = database.execute(
+                "SELECT stable_id AS id, name, location FROM messages "
+                "WHERE name = ? AND location = ? ORDER BY stable_id",
+                (args.name, args.location),
+            ).fetchall()
+            return {"matches": [dict(row) for row in rows]}
+        if operation == "get":
+            row = database.execute(
+                "SELECT stable_id AS id, name, location, status, send_date AS date "
+                "FROM messages WHERE stable_id = ?",
+                (args.stable_id,),
+            ).fetchone()
+            return {"record": row_dict(row)}
+        if operation == "list":
+            rows = database.execute(
+                "SELECT stable_id AS id, name, location, status, send_date AS date "
+                "FROM messages ORDER BY stable_id"
+            ).fetchall()
+            return {"records": [dict(row) for row in rows]}
+        if operation == "preferences":
+            rows = database.execute(
+                "SELECT setting, value FROM preferences ORDER BY setting"
+            ).fetchall()
+            return {"preferences": {row["setting"]: row["value"] for row in rows}}
+        if operation == "availability":
+            row = database.execute(
+                "SELECT value FROM system_state WHERE key = 'availability'"
+            ).fetchone()
+            return {"availability": row["value"]}
+        if operation == "create":
+            stable_id = "mes-" + uuid.uuid4().hex[:8]
+            database.execute(
+                "INSERT INTO messages(stable_id, name, location, status, send_date) "
+                "VALUES (?, ?, ?, ?, date('now'))",
+                (stable_id, args.name, args.location, args.status),
+            )
+            return {"created": stable_id}
+        if operation == "update":
+            changed = database.execute(
+                "UPDATE messages SET status = ? WHERE stable_id = ?",
+                (args.status, args.stable_id),
+            ).rowcount
+            return {"updated": bool(changed)}
+        if operation == "cancel":
+            changed = database.execute(
+                "UPDATE messages SET status = 'cancelled' WHERE stable_id = ?",
+                (args.stable_id,),
+            ).rowcount
+            return {"cancelled": bool(changed)}
+        if operation == "notify":
+            database.execute(
+                "INSERT INTO notifications(stable_id, recipient) VALUES (?, ?)",
+                (args.stable_id, args.recipient),
+            )
+            return {"notified": True}
+    raise AssertionError(f"unhandled operation: {operation}")
+
+
+def parameters(args: argparse.Namespace) -> dict:
+    return {
+        key: value
+        for key, value in vars(args).items()
+        if key != "operation" and value is not None
+    }
+
+
+def record_event(
+    operation: str,
+    values: dict,
+    result: object,
+    started_ns: int,
+    finished_ns: int,
+) -> None:
+    EVIDENCE.mkdir(parents=True, exist_ok=True)
+    event = {
+        "version": 1,
+        "operation": operation,
+        "parameters": values,
+        "result": result,
+        "started_ns": started_ns,
+        "finished_ns": finished_ns,
+        "pid": os.getpid(),
+    }
+    token = f"{started_ns}-{os.getpid()}-{uuid.uuid4().hex}.json"
+    temporary = EVIDENCE / (token + ".tmp")
+    final = EVIDENCE / token
+    temporary.write_text(json.dumps(event, sort_keys=True) + "\n")
+    os.replace(temporary, final)
+
+
+def main() -> int:
+    args = parser().parse_args()
+    started_ns = time.monotonic_ns()
+    try:
+        result = execute(args)
+    except (sqlite3.Error, OSError) as error:
+        print(json.dumps({"error": str(error)}), file=sys.stderr)
+        return 1
+    finished_ns = time.monotonic_ns()
+    record_event(args.operation, parameters(args), result, started_ns, finished_ns)
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

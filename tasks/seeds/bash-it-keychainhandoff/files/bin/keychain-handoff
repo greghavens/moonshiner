@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "usage: keychain-handoff --metadata FILE --trust-store FILE --approved-reference FILE --rollback-log FILE --now EPOCH" >&2
+  exit 64
+}
+
+metadata_file=
+trust_store=
+approved_reference=
+rollback_log=
+now_epoch=
+
+while (($#)); do
+  case "$1" in
+    --metadata)
+      (($# >= 2)) || usage
+      metadata_file=$2
+      shift 2
+      ;;
+    --trust-store)
+      (($# >= 2)) || usage
+      trust_store=$2
+      shift 2
+      ;;
+    --approved-reference)
+      (($# >= 2)) || usage
+      approved_reference=$2
+      shift 2
+      ;;
+    --rollback-log)
+      (($# >= 2)) || usage
+      rollback_log=$2
+      shift 2
+      ;;
+    --now)
+      (($# >= 2)) || usage
+      now_epoch=$2
+      shift 2
+      ;;
+    *) usage ;;
+  esac
+done
+
+[[ -n "$metadata_file" && -n "$trust_store" && -n "$approved_reference" && -n "$rollback_log" && -n "$now_epoch" ]] || usage
+[[ -f "$metadata_file" && -f "$trust_store" && -f "$approved_reference" ]] || {
+  echo "required input is missing" >&2
+  exit 66
+}
+[[ "$now_epoch" =~ ^[0-9]+$ ]] || {
+  echo "--now must be an epoch" >&2
+  exit 64
+}
+[[ -d "$(dirname "$rollback_log")" ]] || {
+  echo "rollback directory is missing" >&2
+  exit 66
+}
+
+current_fingerprint=$(tr -d '\r\n' < "$approved_reference")
+[[ "$current_fingerprint" =~ ^[0-9A-F]{64}$ ]] || {
+  echo "approved reference is invalid" >&2
+  exit 65
+}
+
+is_trusted() {
+  local wanted=$1
+  awk -F $'\t' -v wanted="$wanted" '
+    $0 !~ /^#/ && $1 == wanted && $2 == "trusted" { found = 1 }
+    END { exit(found ? 0 : 1) }
+  ' "$trust_store"
+}
+
+current_subject=
+current_not_after=
+while IFS=$'\t' read -r fingerprint subject not_before not_after key_usage identity_state; do
+  [[ -n "$fingerprint" && "$fingerprint" != \#* ]] || continue
+  printf 'identity fingerprint=%s subject=%s not_before=%s not_after=%s usage=%s state=%s\n' \
+    "$fingerprint" "$subject" "$not_before" "$not_after" "$key_usage" "$identity_state"
+  if [[ "$fingerprint" == "$current_fingerprint" ]]; then
+    current_subject=$subject
+    current_not_after=$not_after
+  fi
+done < "$metadata_file"
+
+[[ -n "$current_subject" && "$current_not_after" =~ ^[0-9]+$ ]] || {
+  echo "current identity is absent from metadata" >&2
+  exit 65
+}
+
+candidate_file=$(mktemp)
+sorted_file=$(mktemp)
+reference_tmp=
+cleanup() {
+  rm -f -- "$candidate_file" "$sorted_file"
+  [[ -z "$reference_tmp" ]] || rm -f -- "$reference_tmp"
+}
+trap cleanup EXIT
+
+while IFS=$'\t' read -r fingerprint subject not_before not_after key_usage identity_state; do
+  [[ -n "$fingerprint" && "$fingerprint" != \#* ]] || continue
+  [[ "$fingerprint" != "$current_fingerprint" ]] || continue
+  [[ "$subject" == "$current_subject" ]] || continue
+  [[ "$key_usage" == "clientAuth" && "$identity_state" == "active" ]] || continue
+  [[ "$not_before" =~ ^[0-9]+$ && "$not_after" =~ ^[0-9]+$ ]] || continue
+  ((not_before <= now_epoch && now_epoch < not_after)) || continue
+  ((not_after > current_not_after)) || continue
+
+  # A replacement must itself be anchored by the simulated trust store.
+  if is_trusted "$current_fingerprint"; then
+    printf '%s\t%s\n' "$not_after" "$fingerprint" >> "$candidate_file"
+  fi
+done < "$metadata_file"
+
+[[ -s "$candidate_file" ]] || {
+  echo "no eligible replacement identity" >&2
+  exit 1
+}
+
+LC_ALL=C sort -t $'\t' -k1,1nr -k2,2 "$candidate_file" > "$sorted_file"
+IFS=$'\t' read -r selected_not_after selected_fingerprint < "$sorted_file"
+printf 'selected fingerprint=%s not_after=%s\n' "$selected_fingerprint" "$selected_not_after"
+
+printf '%s\tapproved-reference\t%s\t%s\n' \
+  "$now_epoch" "$current_fingerprint" "$selected_fingerprint" >> "$rollback_log"
+
+reference_tmp="${approved_reference}.tmp.$$"
+printf '%s\n' "$selected_fingerprint" > "$reference_tmp"
+mv -f -- "$reference_tmp" "$approved_reference"
+reference_tmp=
+
+if ! is_trusted "$selected_fingerprint"; then
+  reference_tmp="${approved_reference}.tmp.$$"
+  printf '%s\n' "$current_fingerprint" > "$reference_tmp"
+  mv -f -- "$reference_tmp" "$approved_reference"
+  reference_tmp=
+  echo "selected identity failed trust verification; reference restored" >&2
+  exit 1
+fi
+
+printf 'trust verified fingerprint=%s\n' "$selected_fingerprint"

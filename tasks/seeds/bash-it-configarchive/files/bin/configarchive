@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+export LC_ALL=C
+
+usage() {
+  printf 'usage: %s INVENTORY ARCHIVE_DIR TRANSPORT\n' "${0##*/}" >&2
+}
+
+normalize_config() {
+  awk '
+    { sub(/\r$/, "") }
+    /^Building configuration\.\.\.$/ { next }
+    /^! (Last configuration change|NVRAM config last updated) at / { next }
+    /^ntp clock-period [0-9]+$/ { next }
+    { print }
+  '
+}
+
+if (( $# != 3 )); then
+  usage
+  exit 64
+fi
+
+inventory=$1
+archive_dir=$2
+transport=$3
+
+if [[ ! -r "$inventory" ]]; then
+  printf 'inventory is not readable: %s\n' "$inventory" >&2
+  exit 66
+fi
+if [[ ! -x "$transport" ]]; then
+  printf 'transport is not executable: %s\n' "$transport" >&2
+  exit 69
+fi
+
+mkdir -p "$archive_dir"
+report_tmp=$(mktemp "$archive_dir/.run.report.XXXXXX")
+overall_status=0
+
+while IFS=$'\t' read -r device endpoint extra || [[ -n "${device:-}${endpoint:-}${extra:-}" ]]; do
+  device=${device%$'\r'}
+  endpoint=${endpoint%$'\r'}
+
+  [[ -z "$device" ]] && continue
+  [[ "$device" == \#* ]] && continue
+
+  if [[ -z "$endpoint" || -n "${extra:-}" || ! "$device" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    printf 'invalid\t%s\n' "$device" >> "$report_tmp"
+    overall_status=1
+    continue
+  fi
+
+  device_dir=$archive_dir/$device
+  versions_dir=$device_dir/versions
+  changes_dir=$device_dir/changes
+  latest=$device_dir/latest.conf
+  latest_hash=$device_dir/latest.sha256
+  mkdir -p "$versions_dir" "$changes_dir"
+
+  previous=$(mktemp "$device_dir/.previous.XXXXXX")
+  had_previous=0
+  if [[ -f "$latest" ]]; then
+    cp "$latest" "$previous"
+    had_previous=1
+  fi
+
+  # Collection output must be staged until the transport has exited successfully.
+  candidate="$latest"
+  transport_error=$(mktemp "$device_dir/.transport-error.XXXXXX")
+  if ! "$transport" "$endpoint" 2> "$transport_error" | normalize_config > "$candidate"; then
+    printf 'unreachable\t%s\n' "$device" >> "$report_tmp"
+    overall_status=1
+    rm -f "$candidate" "$previous" "$transport_error"
+    continue
+  fi
+  rm -f "$transport_error"
+
+  digest=$(sha256sum "$candidate")
+  digest=${digest%% *}
+  version_file=$versions_dir/$digest.conf
+  if [[ ! -f "$version_file" ]]; then
+    version_tmp=$(mktemp "$versions_dir/.version.XXXXXX")
+    cp "$candidate" "$version_tmp"
+    mv "$version_tmp" "$version_file"
+  elif ! cmp -s "$candidate" "$version_file"; then
+    printf 'hash-collision\t%s\n' "$device" >> "$report_tmp"
+    overall_status=1
+    rm -f "$candidate" "$previous"
+    continue
+  fi
+
+  state=created
+  if (( had_previous )); then
+    previous_digest=$(sha256sum "$previous")
+    previous_digest=${previous_digest%% *}
+    if [[ "$previous_digest" == "$digest" ]]; then
+      state=unchanged
+    else
+      state=updated
+      diff_file=$changes_dir/$previous_digest..$digest.diff
+      if [[ ! -f "$diff_file" ]]; then
+        diff_tmp=$(mktemp "$changes_dir/.diff.XXXXXX")
+        diff -u \
+          --label "sha256:$previous_digest" \
+          --label "sha256:$digest" \
+          "$previous" "$candidate" > "$diff_tmp" || diff_status=$?
+        if [[ "${diff_status:-1}" -ne 1 ]]; then
+          printf 'diff-failed\t%s\n' "$device" >> "$report_tmp"
+          overall_status=1
+          rm -f "$diff_tmp" "$candidate" "$previous"
+          continue
+        fi
+        unset diff_status
+        mv "$diff_tmp" "$diff_file"
+      fi
+    fi
+  fi
+
+  latest_tmp=$(mktemp "$device_dir/.latest.XXXXXX")
+  hash_tmp=$(mktemp "$device_dir/.latest-sha256.XXXXXX")
+  cp "$candidate" "$latest_tmp"
+  printf '%s\n' "$digest" > "$hash_tmp"
+  rm -f "$candidate"
+  mv "$latest_tmp" "$latest"
+  mv "$hash_tmp" "$latest_hash"
+  rm -f "$previous"
+
+  printf '%s\t%s\t%s\n' "$state" "$device" "$digest" >> "$report_tmp"
+done < "$inventory"
+
+mv "$report_tmp" "$archive_dir/run.report"
+exit "$overall_status"

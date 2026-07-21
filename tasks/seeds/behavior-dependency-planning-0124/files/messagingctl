@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed message-record ledger."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+STATE_DIR = ROOT / ".messaging"
+RECORDS_PATH = STATE_DIR / "records.json"
+AUDIT_PATH = STATE_DIR / "audit.jsonl"
+NOTIFICATIONS_PATH = STATE_DIR / "notifications.json"
+LOCK_PATH = STATE_DIR / "lock"
+KEY_PATH = ROOT / ".protected" / "audit.key"
+READ_DELAY_SECONDS = 0.45
+
+
+class MessagingError(RuntimeError):
+    """A user-facing messaging service error."""
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def load_object(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise MessagingError(f"invalid service data: {path.name}")
+    return value
+
+
+def atomic_json_write(path: Path, value: dict[str, Any]) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", text=True
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def read_records() -> list[dict[str, Any]]:
+    document = load_object(RECORDS_PATH)
+    records = document.get("records")
+    if document.get("version") != 1 or not isinstance(records, list):
+        raise MessagingError("invalid record store")
+    if not all(isinstance(record, dict) for record in records):
+        raise MessagingError("invalid record entry")
+    return records
+
+
+def load_events() -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    with AUDIT_PATH.open(encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            event = json.loads(line)
+            if not isinstance(event, dict):
+                raise MessagingError(f"invalid audit event at line {line_number}")
+            events.append(event)
+    return events
+
+
+def record_digest(record: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical(record)).hexdigest()
+
+
+def append_audit_unlocked(event: dict[str, Any]) -> None:
+    sealed = dict(event)
+    sealed["sequence"] = len(load_events()) + 1
+    key = KEY_PATH.read_bytes().strip()
+    sealed["seal"] = hmac.new(key, canonical(sealed), hashlib.sha256).hexdigest()
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(sealed, ensure_ascii=False, sort_keys=True))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def append_audit(event: dict[str, Any]) -> None:
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        append_audit_unlocked(event)
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+
+def emit(value: dict[str, Any]) -> None:
+    json.dump(value, sys.stdout, ensure_ascii=False, sort_keys=True)
+    sys.stdout.write("\n")
+
+
+def require_completed_search_layer(record_id: str) -> None:
+    events = load_events()
+    searches = [
+        event
+        for event in events
+        if event.get("operation") == "search" and event.get("outcome") == "ok"
+    ]
+    if len(events) != 2 or len(searches) != 2:
+        raise MessagingError("get requires exactly two completed searches")
+    returned_ids = {
+        value
+        for event in searches
+        for value in event.get("result_ids", [])
+        if isinstance(value, str)
+    }
+    if record_id not in returned_ids:
+        raise MessagingError("record ID was not returned by the completed searches")
+
+
+def require_completed_get_layer(events: list[dict[str, Any]], record_id: str) -> None:
+    if len(events) != 4:
+        raise MessagingError("update requires exactly two searches and two retrievals")
+    if [event.get("operation") for event in events[:2]] != ["search", "search"]:
+        raise MessagingError("search layer is incomplete")
+    if [event.get("operation") for event in events[2:]] != ["get", "get"]:
+        raise MessagingError("retrieval layer is incomplete")
+    if any(event.get("outcome") != "ok" for event in events):
+        raise MessagingError("a prerequisite operation did not succeed")
+    returned_ids = {event.get("record_id") for event in events[2:]}
+    if record_id not in returned_ids:
+        raise MessagingError("record ID was not retrieved")
+
+
+def search_records(arguments: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    time.sleep(READ_DELAY_SECONDS)
+    matches = [
+        {
+            "channel": record["channel"],
+            "id": record["id"],
+            "name": record["name"],
+        }
+        for record in read_records()
+        if record.get("name") == arguments.name
+        and record.get("channel") == arguments.channel
+    ]
+    matches.sort(key=lambda record: record["id"])
+    finished = time.monotonic_ns()
+    append_audit(
+        {
+            "channel": arguments.channel,
+            "finished_ns": finished,
+            "name": arguments.name,
+            "operation": "search",
+            "outcome": "ok",
+            "result_ids": [record["id"] for record in matches],
+            "started_ns": started,
+        }
+    )
+    emit({"count": len(matches), "matches": matches})
+    return 0
+
+
+def get_record(arguments: argparse.Namespace) -> int:
+    require_completed_search_layer(arguments.id)
+    started = time.monotonic_ns()
+    time.sleep(READ_DELAY_SECONDS)
+    record = next(
+        (record for record in read_records() if record.get("id") == arguments.id), None
+    )
+    finished = time.monotonic_ns()
+    event: dict[str, Any] = {
+        "finished_ns": finished,
+        "operation": "get",
+        "record_id": arguments.id,
+        "started_ns": started,
+    }
+    if record is None:
+        event.update({"found": False, "outcome": "not-found"})
+        append_audit(event)
+        raise MessagingError(f"record not found: {arguments.id}")
+    event.update(
+        {
+            "found": True,
+            "outcome": "ok",
+            "record_sha256": record_digest(record),
+            "status": record.get("status"),
+        }
+    )
+    append_audit(event)
+    emit({"record": record})
+    return 0
+
+
+def update_record(arguments: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        events = load_events()
+        require_completed_get_layer(events, arguments.id)
+        document = load_object(RECORDS_PATH)
+        records = document.get("records")
+        if not isinstance(records, list):
+            raise MessagingError("invalid record store")
+        record = next(
+            (record for record in records if record.get("id") == arguments.id), None
+        )
+        if record is None:
+            raise MessagingError(f"record not found: {arguments.id}")
+        before = record.get("status")
+        record["status"] = arguments.status
+        atomic_json_write(RECORDS_PATH, document)
+        finished = time.monotonic_ns()
+        append_audit_unlocked(
+            {
+                "after_status": arguments.status,
+                "before_status": before,
+                "finished_ns": finished,
+                "operation": "update",
+                "outcome": "ok",
+                "record_id": arguments.id,
+                "started_ns": started,
+                "updated": before != arguments.status,
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    emit(
+        {
+            "after_status": arguments.status,
+            "before_status": before,
+            "record_id": arguments.id,
+            "updated": before != arguments.status,
+        }
+    )
+    return 0
+
+
+def notify(arguments: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        document = load_object(NOTIFICATIONS_PATH)
+        notifications = document.get("notifications")
+        if not isinstance(notifications, list):
+            raise MessagingError("invalid notification store")
+        notifications.append(
+            {
+                "message": arguments.message,
+                "ordinal": len(notifications) + 1,
+                "record_id": arguments.id,
+            }
+        )
+        atomic_json_write(NOTIFICATIONS_PATH, document)
+        finished = time.monotonic_ns()
+        append_audit_unlocked(
+            {
+                "finished_ns": finished,
+                "operation": "notify",
+                "outcome": "ok",
+                "record_id": arguments.id,
+                "started_ns": started,
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    emit({"notified": True, "record_id": arguments.id})
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="messagingctl",
+        description="Search, retrieve, update, and notify local message records.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    search_parser = commands.add_parser(
+        "search", help="search by exact record name and channel"
+    )
+    search_parser.add_argument("--name", required=True)
+    search_parser.add_argument("--channel", required=True)
+    search_parser.set_defaults(handler=search_records)
+
+    get_parser = commands.add_parser("get", help="retrieve one complete record")
+    get_parser.add_argument("--id", required=True)
+    get_parser.set_defaults(handler=get_record)
+
+    update_parser = commands.add_parser("update", help="change one record status")
+    update_parser.add_argument("--id", required=True)
+    update_parser.add_argument("--status", required=True)
+    update_parser.set_defaults(handler=update_record)
+
+    notify_parser = commands.add_parser("notify", help="send a record notification")
+    notify_parser.add_argument("--id", required=True)
+    notify_parser.add_argument("--message", required=True)
+    notify_parser.set_defaults(handler=notify)
+    return parser
+
+
+def main() -> int:
+    arguments = build_parser().parse_args()
+    try:
+        return int(arguments.handler(arguments))
+    except (MessagingError, OSError, ValueError, json.JSONDecodeError) as error:
+        print(f"messagingctl: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

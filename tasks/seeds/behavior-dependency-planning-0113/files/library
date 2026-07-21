@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""Executable library registry for the Pi dependency-planning exercise."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import time
+import uuid
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+STATE_DIR = Path(
+    os.environ.get(
+        "PI_LIBRARY_STATE_DIR", str(ROOT / ".pytest_cache" / "library-state")
+    )
+)
+DB_PATH = STATE_DIR / "library.sqlite3"
+
+BASE_RECORDS = (
+    (
+        "bk-7b42d1",
+        "Urban Orchard Handbook",
+        "East Branch",
+        "available",
+        "Mara Velasquez",
+    ),
+    (
+        "bk-c91e76",
+        "Poems from the High Desert",
+        "Riverside Branch",
+        "on-loan",
+        "Tomas Ibarra",
+    ),
+    (
+        "bk-2ee830",
+        "Urban Orchard Handbook",
+        "West Branch",
+        "on-loan",
+        "Mara Velasquez",
+    ),
+    (
+        "bk-4ad0f5",
+        "Urban Orchard Handbook: Field Notes",
+        "East Branch",
+        "available",
+        "Mara Velasquez",
+    ),
+    (
+        "bk-890c3a",
+        "Urban Orchard Handbook archive",
+        "Bookmobile",
+        "closed",
+        "Mara Velasquez",
+    ),
+    (
+        "bk-63fb27",
+        "Poems from the High Desert — Annotated",
+        "Riverside Branch",
+        "available",
+        "Tomas Ibarra",
+    ),
+)
+
+
+def encode(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def seeded_records() -> tuple[tuple[str, str, str, str, str], ...]:
+    scenario = os.environ.get("PI_LIBRARY_TEST_SCENARIO")
+    if scenario == "already-returned":
+        target_status = "returned"
+    elif scenario == "already-available":
+        target_status = "available"
+    else:
+        target_status = "on-loan"
+    return tuple(
+        (record_id, title, branch, target_status, author)
+        if record_id == "bk-c91e76"
+        else (record_id, title, branch, status, author)
+        for record_id, title, branch, status, author in BASE_RECORDS
+    )
+
+
+def connect() -> sqlite3.Connection:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(DB_PATH, timeout=15)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA busy_timeout = 15000")
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS records (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            branch TEXT NOT NULL,
+            status TEXT NOT NULL,
+            author TEXT NOT NULL,
+            deleted INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            record_id TEXT NOT NULL,
+            message TEXT NOT NULL,
+            created_ns INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS operations (
+            invocation_id TEXT PRIMARY KEY,
+            command TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            result TEXT,
+            started_ns INTEGER NOT NULL,
+            finished_ns INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS operation_events (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            invocation_id TEXT NOT NULL,
+            phase TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS parallel_barriers (
+            invocation_id TEXT PRIMARY KEY,
+            command TEXT NOT NULL
+        );
+        """
+    )
+    db.executemany(
+        """
+        INSERT OR IGNORE INTO records(id, title, branch, status, author, deleted)
+        VALUES (?, ?, ?, ?, ?, 0)
+        """,
+        seeded_records(),
+    )
+    db.commit()
+    return db
+
+
+def begin_operation(db: sqlite3.Connection, command: str, payload: object) -> str:
+    invocation_id = uuid.uuid4().hex
+    db.execute(
+        "INSERT INTO operation_events(invocation_id, phase) VALUES (?, 'started')",
+        (invocation_id,),
+    )
+    db.execute(
+        """
+        INSERT INTO operations(invocation_id, command, payload, started_ns)
+        VALUES (?, ?, ?, ?)
+        """,
+        (invocation_id, command, encode(payload), time.monotonic_ns()),
+    )
+    db.commit()
+    return invocation_id
+
+
+def finish_operation(
+    db: sqlite3.Connection, invocation_id: str, result: object
+) -> None:
+    db.execute(
+        "INSERT INTO operation_events(invocation_id, phase) VALUES (?, 'finished')",
+        (invocation_id,),
+    )
+    db.execute(
+        """
+        UPDATE operations
+        SET result = ?, finished_ns = ?
+        WHERE invocation_id = ?
+        """,
+        (encode(result), time.monotonic_ns(), invocation_id),
+    )
+    db.commit()
+
+
+def synchronize_parallel_operation(
+    db: sqlite3.Connection, invocation_id: str, command: str
+) -> None:
+    if os.environ.get("PI_LIBRARY_TEST_SYNC") != "1":
+        time.sleep(0.45)
+        return
+    db.execute(
+        "INSERT INTO parallel_barriers(invocation_id, command) VALUES (?, ?)",
+        (invocation_id, command),
+    )
+    db.commit()
+    while True:
+        arrivals = db.execute(
+            "SELECT COUNT(*) FROM parallel_barriers WHERE command = ?", (command,)
+        ).fetchone()[0]
+        if arrivals >= 2:
+            return
+        time.sleep(0.01)
+
+
+def record_dict(row: sqlite3.Row) -> dict[str, str]:
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "branch": row["branch"],
+        "status": row["status"],
+        "author": row["author"],
+    }
+
+
+def command_search(args: argparse.Namespace) -> int:
+    db = connect()
+    payload = {"title": args.title, "branch": args.branch}
+    invocation_id = begin_operation(db, "search", payload)
+    synchronize_parallel_operation(db, invocation_id, "search")
+    rows = db.execute(
+        """
+        SELECT id, title, branch
+        FROM records
+        WHERE title = ? AND branch = ? AND deleted = 0
+        ORDER BY id
+        """,
+        (args.title, args.branch),
+    ).fetchall()
+    result = {
+        "matches": [
+            {"id": row["id"], "title": row["title"], "branch": row["branch"]}
+            for row in rows
+        ]
+    }
+    finish_operation(db, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_get(args: argparse.Namespace) -> int:
+    db = connect()
+    payload = {"id": args.id}
+    invocation_id = begin_operation(db, "get", payload)
+    synchronize_parallel_operation(db, invocation_id, "get")
+    row = db.execute(
+        """
+        SELECT id, title, branch, status, author
+        FROM records
+        WHERE id = ? AND deleted = 0
+        """,
+        (args.id,),
+    ).fetchone()
+    result = {"record": record_dict(row) if row is not None else None}
+    finish_operation(db, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_update(args: argparse.Namespace) -> int:
+    db = connect()
+    payload = {"id": args.id, "status": args.status}
+    invocation_id = begin_operation(db, "update", payload)
+    before = db.execute(
+        "SELECT status FROM records WHERE id = ? AND deleted = 0", (args.id,)
+    ).fetchone()
+    cursor = db.execute(
+        "UPDATE records SET status = ? WHERE id = ? AND deleted = 0",
+        (args.status, args.id),
+    )
+    db.commit()
+    after = db.execute(
+        "SELECT id, title, branch, status, author FROM records WHERE id = ?",
+        (args.id,),
+    ).fetchone()
+    result = {
+        "updated": cursor.rowcount,
+        "before_status": before["status"] if before is not None else None,
+        "record": record_dict(after) if after is not None else None,
+    }
+    finish_operation(db, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_create(args: argparse.Namespace) -> int:
+    db = connect()
+    payload = {
+        "title": args.title,
+        "branch": args.branch,
+        "status": args.status,
+        "author": args.author,
+    }
+    invocation_id = begin_operation(db, "create", payload)
+    record_id = "bk-" + uuid.uuid4().hex[:6]
+    db.execute(
+        """
+        INSERT INTO records(id, title, branch, status, author, deleted)
+        VALUES (?, ?, ?, ?, ?, 0)
+        """,
+        (record_id, args.title, args.branch, args.status, args.author),
+    )
+    db.commit()
+    result = {"created": record_id}
+    finish_operation(db, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_delete(args: argparse.Namespace) -> int:
+    db = connect()
+    payload = {"id": args.id}
+    invocation_id = begin_operation(db, "delete", payload)
+    cursor = db.execute("UPDATE records SET deleted = 1 WHERE id = ?", (args.id,))
+    db.commit()
+    result = {"deleted": cursor.rowcount}
+    finish_operation(db, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_notify(args: argparse.Namespace) -> int:
+    db = connect()
+    payload = {"id": args.id, "message": args.message}
+    invocation_id = begin_operation(db, "notify", payload)
+    db.execute(
+        """
+        INSERT INTO notifications(record_id, message, created_ns)
+        VALUES (?, ?, ?)
+        """,
+        (args.id, args.message, time.monotonic_ns()),
+    )
+    db.commit()
+    result = {"notified": True}
+    finish_operation(db, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="library",
+        description="Search, retrieve, and manage the sandbox library catalog.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    search = commands.add_parser("search", help="find exact title and branch matches")
+    search.add_argument("--title", required=True)
+    search.add_argument("--branch", required=True)
+    search.set_defaults(run=command_search)
+
+    get = commands.add_parser("get", help="retrieve one complete record by ID")
+    get.add_argument("--id", required=True)
+    get.set_defaults(run=command_get)
+
+    update = commands.add_parser("update", help="change one record's status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+    update.set_defaults(run=command_update)
+
+    create = commands.add_parser("create", help="create a catalog record")
+    create.add_argument("--title", required=True)
+    create.add_argument("--branch", required=True)
+    create.add_argument("--status", required=True)
+    create.add_argument("--author", required=True)
+    create.set_defaults(run=command_create)
+
+    delete = commands.add_parser("delete", help="delete a catalog record")
+    delete.add_argument("--id", required=True)
+    delete.set_defaults(run=command_delete)
+
+    notify = commands.add_parser("notify", help="send a catalog notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+    notify.set_defaults(run=command_notify)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        return args.run(args)
+    except (OSError, sqlite3.Error) as exc:
+        print(f"library: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

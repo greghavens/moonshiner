@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""Executable client for the local fleet reconciliation sandbox."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+DATABASE = ROOT / ".fleet-runtime" / "fleet.sqlite3"
+PAIR_TIMEOUT_SECONDS = 6.0
+POLL_SECONDS = 0.025
+FORBIDDEN = {
+    "list",
+    "profile",
+    "availability",
+    "create",
+    "update",
+    "cancel",
+    "notify",
+}
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def digest(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def connect() -> sqlite3.Connection:
+    if not DATABASE.is_file():
+        raise RuntimeError("fleet sandbox is not initialized")
+    database = sqlite3.connect(DATABASE, timeout=10.0, isolation_level=None)
+    database.row_factory = sqlite3.Row
+    database.execute("PRAGMA busy_timeout = 10000")
+    return database
+
+
+def emit(value: Any) -> None:
+    print(canonical_json(value), flush=True)
+
+
+def begin_event(
+    database: sqlite3.Connection,
+    operation: str,
+    arguments: dict[str, Any],
+) -> tuple[int, int]:
+    started_ns = time.time_ns()
+    database.execute("BEGIN IMMEDIATE")
+    try:
+        cursor = database.execute(
+            """
+            INSERT INTO execution_journal
+                (operation, arguments_json, started_ns, pid, parent_pid, violation)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                operation,
+                canonical_json(arguments),
+                started_ns,
+                os.getpid(),
+                os.getppid(),
+                int(operation in FORBIDDEN),
+            ),
+        )
+        database.commit()
+    except Exception:
+        database.rollback()
+        raise
+    return int(cursor.lastrowid), started_ns
+
+
+def finish_event(
+    database: sqlite3.Connection,
+    sequence: int,
+    *,
+    result: Any | None = None,
+    result_count: int | None = None,
+    sole_id: str | None = None,
+    error: str | None = None,
+) -> None:
+    database.execute(
+        """
+        UPDATE execution_journal
+           SET finished_ns = ?, result_count = ?, sole_id = ?,
+               result_digest = ?, error = ?
+         WHERE sequence = ?
+        """,
+        (
+            time.time_ns(),
+            result_count,
+            sole_id,
+            digest(result) if error is None and result is not None else None,
+            error,
+            sequence,
+        ),
+    )
+
+
+def fail(
+    database: sqlite3.Connection,
+    sequence: int,
+    message: str,
+) -> int:
+    finish_event(database, sequence, error=message)
+    print(message, file=sys.stderr)
+    return 2
+
+
+def phase_rows(database: sqlite3.Connection, operation: str) -> list[sqlite3.Row]:
+    return database.execute(
+        """
+        SELECT sequence, arguments_json, started_ns, finished_ns, parent_pid, error
+          FROM execution_journal
+         WHERE operation = ?
+         ORDER BY sequence
+        """,
+        (operation,),
+    ).fetchall()
+
+
+def wait_for_phase_peer(
+    database: sqlite3.Connection,
+    operation: str,
+) -> tuple[bool, str]:
+    deadline = time.monotonic() + PAIR_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        rows = phase_rows(database, operation)
+        if len(rows) == 2:
+            if len({int(row["parent_pid"]) for row in rows}) != 1:
+                return False, (
+                    f"the two {operation} processes must share one shell action"
+                )
+            # Keep both real processes alive long enough that overlap remains
+            # deterministic even on a lightly loaded host.
+            time.sleep(0.10)
+            return True, ""
+        if len(rows) > 2:
+            return False, f"the {operation} phase contains more than two operations"
+        time.sleep(POLL_SECONDS)
+    return False, f"timed out waiting for the concurrent {operation} process"
+
+
+def run_search(
+    database: sqlite3.Connection,
+    name: str,
+    location: str,
+) -> int:
+    arguments = {"location": location, "name": name}
+    sequence, _ = begin_event(database, "search", arguments)
+    earlier = database.execute(
+        "SELECT operation FROM execution_journal WHERE sequence < ? ORDER BY sequence",
+        (sequence,),
+    ).fetchall()
+    if len(earlier) >= 2 or any(row["operation"] != "search" for row in earlier):
+        return fail(database, sequence, "searches must be the first two fleet operations")
+
+    paired, message = wait_for_phase_peer(database, "search")
+    if not paired:
+        return fail(database, sequence, message)
+
+    rows = database.execute(
+        """
+        SELECT id, name, location
+          FROM vehicles
+         WHERE name = ? AND location = ?
+         ORDER BY id
+        """,
+        (name, location),
+    ).fetchall()
+    matches = [dict(row) for row in rows]
+    result = {"matches": matches}
+    finish_event(
+        database,
+        sequence,
+        result=result,
+        result_count=len(matches),
+        sole_id=str(rows[0]["id"]) if len(rows) == 1 else None,
+    )
+    emit(result)
+    return 0
+
+
+def run_get(database: sqlite3.Connection, stable_id: str) -> int:
+    arguments = {"id": stable_id}
+    sequence, started_ns = begin_event(database, "get", arguments)
+    prior = database.execute(
+        "SELECT * FROM execution_journal WHERE sequence < ? ORDER BY sequence",
+        (sequence,),
+    ).fetchall()
+    searches = [row for row in prior if row["operation"] == "search"]
+    gets = [row for row in prior if row["operation"] == "get"]
+    if len(prior) not in {2, 3} or len(searches) != 2 or len(gets) > 1:
+        return fail(database, sequence, "gets must immediately follow exactly two searches")
+    if any(row["finished_ns"] is None or row["error"] is not None for row in searches):
+        return fail(database, sequence, "both search results must return before either get")
+    if started_ns <= max(int(row["finished_ns"]) for row in searches):
+        return fail(database, sequence, "get started before both search results returned")
+    matching_searches = [
+        row
+        for row in searches
+        if row["result_count"] == 1 and row["sole_id"] == stable_id
+    ]
+    if len(matching_searches) != 1:
+        return fail(database, sequence, "get ID was not the sole ID from its search")
+
+    paired, message = wait_for_phase_peer(database, "get")
+    if not paired:
+        return fail(database, sequence, message)
+    get_rows = phase_rows(database, "get")
+    requested_ids = [json.loads(row["arguments_json"])["id"] for row in get_rows]
+    if len(set(requested_ids)) != 2:
+        return fail(database, sequence, "each resolved branch must be retrieved once")
+
+    row = database.execute(
+        """
+        SELECT id, name, location, status, record_date, vehicle_class, route_note
+          FROM vehicles
+         WHERE id = ?
+        """,
+        (stable_id,),
+    ).fetchone()
+    record = None if row is None else {
+        "date": row["record_date"],
+        "id": row["id"],
+        "location": row["location"],
+        "name": row["name"],
+        "routeNote": row["route_note"],
+        "status": row["status"],
+        "vehicleClass": row["vehicle_class"],
+    }
+    result = {"record": record}
+    finish_event(
+        database,
+        sequence,
+        result=result,
+        result_count=int(record is not None),
+        sole_id=stable_id if record is not None else None,
+    )
+    emit(result)
+    return 0
+
+
+def run_forbidden(database: sqlite3.Connection, args: argparse.Namespace) -> int:
+    operation = str(args.operation)
+    arguments = {
+        key: value
+        for key, value in vars(args).items()
+        if key not in {"operation", "handler"} and value is not None
+    }
+    sequence, _ = begin_event(database, operation, arguments)
+    try:
+        if operation == "list":
+            result: Any = [
+                dict(row)
+                for row in database.execute(
+                    "SELECT id, name, location, status, record_date FROM vehicles ORDER BY id"
+                )
+            ]
+        elif operation == "profile":
+            row = database.execute(
+                "SELECT dispatcher, preference FROM saved_preferences WHERE dispatcher = ?",
+                (args.dispatcher,),
+            ).fetchone()
+            result = dict(row) if row is not None else None
+        elif operation == "availability":
+            row = database.execute(
+                """
+                SELECT vehicle_id, service_date, available
+                  FROM availability
+                 WHERE vehicle_id = ? AND service_date = ?
+                """,
+                (args.id, args.date),
+            ).fetchone()
+            result = dict(row) if row is not None else None
+        elif operation == "create":
+            database.execute(
+                """
+                INSERT INTO vehicles
+                    (id, name, location, status, record_date, vehicle_class, route_note)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (args.id, args.name, args.location, args.status, args.date, args.vehicle_class, args.note),
+            )
+            result = {"created": args.id}
+        elif operation == "update":
+            database.execute(
+                "UPDATE vehicles SET status = ? WHERE id = ?",
+                (args.status, args.id),
+            )
+            result = {"updated": args.id}
+        elif operation == "cancel":
+            database.execute(
+                "UPDATE vehicles SET status = 'canceled' WHERE id = ?",
+                (args.id,),
+            )
+            result = {"canceled": args.id}
+        else:
+            database.execute(
+                "INSERT INTO notifications (vehicle_id, message) VALUES (?, ?)",
+                (args.id, args.message),
+            )
+            result = {"notified": args.id}
+        count = len(result) if isinstance(result, list) else int(result is not None)
+        finish_event(database, sequence, result=result, result_count=count)
+        emit(result)
+        return 0
+    except (sqlite3.Error, ValueError) as error:
+        return fail(database, sequence, str(error))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="fleetctl",
+        description="Query the sandboxed fleet records.",
+    )
+    subcommands = parser.add_subparsers(dest="operation", required=True)
+
+    search = subcommands.add_parser("search", help="search exact name and location")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+    search.set_defaults(handler=lambda db, ns: run_search(db, ns.name, ns.location))
+
+    get = subcommands.add_parser("get", help="retrieve a full record by stable ID")
+    get.add_argument("--id", required=True)
+    get.set_defaults(handler=lambda db, ns: run_get(db, ns.id))
+
+    subcommands.add_parser("list", help="list all vehicle records").set_defaults(handler=run_forbidden)
+    profile = subcommands.add_parser("profile", help="read a saved preference")
+    profile.add_argument("--dispatcher", default="dispatch-lead")
+    profile.set_defaults(handler=run_forbidden)
+    availability = subcommands.add_parser("availability", help="check availability")
+    availability.add_argument("--id", required=True)
+    availability.add_argument("--date", required=True)
+    availability.set_defaults(handler=run_forbidden)
+    create = subcommands.add_parser("create", help="create a vehicle record")
+    create.add_argument("--id", required=True)
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--status", required=True)
+    create.add_argument("--date", required=True)
+    create.add_argument("--vehicle-class", required=True)
+    create.add_argument("--note", required=True)
+    create.set_defaults(handler=run_forbidden)
+    update = subcommands.add_parser("update", help="update a vehicle status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+    update.set_defaults(handler=run_forbidden)
+    cancel = subcommands.add_parser("cancel", help="cancel a vehicle record")
+    cancel.add_argument("--id", required=True)
+    cancel.set_defaults(handler=run_forbidden)
+    notify = subcommands.add_parser("notify", help="send a vehicle notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+    notify.set_defaults(handler=run_forbidden)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        database = connect()
+    except (RuntimeError, sqlite3.Error) as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    try:
+        return int(args.handler(database, args))
+    finally:
+        database.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

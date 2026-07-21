@@ -471,29 +471,27 @@ def _configured() -> bool:
 def _start_default_queues() -> int:
     """Start every queue enabled for this project; never duplicate a live worker."""
     from common import CONFIG
+    from configuration import PROJECT_ROOT
+    project_key = hashlib.sha256(str(PROJECT_ROOT).encode()).hexdigest()[:12]
     queues = ((CONFIG.get("pipeline") or {}).get("queues") or {})
     if queues.get("seed_authoring"):
-        running = subprocess.run(
-            ["pgrep", "-f", "[m]oonshiner.* seed queue"],
-            stdout=subprocess.DEVNULL).returncode == 0
+        unit = f"moonshiner-seed-queue-{project_key}"
+        running = subprocess.run(["systemctl", "--user", "is-active", "--quiet",
+                                  f"{unit}.service"]).returncode == 0
         if not running:
-            from configuration import PROJECT_ROOT
-            unit = "moonshiner-seed-queue-" + time.strftime("%Y%m%d-%H%M%S")
             executable = Path(sys.executable).parent / "moonshiner"
             subprocess.run(["systemd-run", "--user", "--collect", f"--unit={unit}",
                             f"--property=WorkingDirectory={PROJECT_ROOT}",
                             f"--setenv=PATH={os.environ.get('PATH', '')}",
                             str(executable), "seed", "queue", "--yes"], check=True)
     if queues.get("tracing", True):
-        active = subprocess.run(
-            ["pgrep", "-f", "[m]oonshiner.* run --all --yes"],
-            stdout=subprocess.DEVNULL).returncode == 0
+        unit = f"moonshiner-trace-continuous-{project_key}"
+        active = subprocess.run(["systemctl", "--user", "is-active", "--quiet",
+                                 f"{unit}.service"]).returncode == 0
         if not active:
             from common import RUNS
-            from configuration import PROJECT_ROOT
             log_dir = RUNS / "trace-continuous"
             log_dir.mkdir(parents=True, exist_ok=True)
-            unit = "moonshiner-trace-continuous-" + time.strftime("%Y%m%d-%H%M%S")
             executable = Path(sys.executable).parent / "moonshiner"
             command = ["systemd-run", "--user", "--collect",
                        f"--unit={unit}",

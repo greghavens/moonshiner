@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""Executable interface for the sandboxed education registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+
+ROOT = Path(__file__).resolve().parent
+STATE = ROOT / "state"
+RECORDS = STATE / "records.json"
+AUDIT = STATE / "audit.jsonl"
+NOTIFICATIONS = STATE / "notifications.json"
+SEAL_KEY = b"moonshiner-education-registry-v1"
+ALLOWED_STATUSES = {
+    "open",
+    "waitlisted",
+    "enrollment-ready",
+    "closed",
+    "cancelled",
+}
+
+
+def canonical(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def load_json(path: Path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def digest(value: object) -> str:
+    return hashlib.sha256(canonical(value).encode("utf-8")).hexdigest()
+
+
+def parent_start_ticks() -> int | None:
+    """Identify the parent process instance even when PID namespaces reuse IDs."""
+    try:
+        stat = Path(f"/proc/{os.getppid()}/stat").read_text(encoding="utf-8")
+        after_name = stat[stat.rfind(")") + 2 :].split()
+        return int(after_name[19])  # Linux procfs field 22: process start time.
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def append_event(event: dict[str, object]) -> None:
+    envelope = {
+        "pid": os.getpid(),
+        "parent_pid": os.getppid(),
+        "parent_start_ticks": parent_start_ticks(),
+        **event,
+    }
+    with AUDIT.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        handle.seek(0)
+        sequence = len([line for line in handle.read().splitlines() if line.strip()]) + 1
+        numbered = {"sequence": sequence, **envelope}
+        numbered["seal"] = hmac.new(
+            SEAL_KEY, canonical(numbered).encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+        handle.seek(0, os.SEEK_END)
+        handle.write(canonical(numbered) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def finish_read(started_ns: int) -> int:
+    # This small real delay gives independently launched processes a stable
+    # overlap window that protected verification can measure.
+    time.sleep(0.20)
+    return time.monotonic_ns()
+
+
+def command_search(name: str, location: str) -> int:
+    started = time.monotonic_ns()
+    records = load_json(RECORDS)
+    matches = [
+        record
+        for record in records
+        if record["name"] == name and record["location"] == location
+    ]
+    public = [
+        {key: record[key] for key in ("id", "name", "location")}
+        for record in matches
+    ]
+    finished = finish_read(started)
+    append_event(
+        {
+            "op": "search",
+            "started_ns": started,
+            "finished_ns": finished,
+            "name": name,
+            "location": location,
+            "match_ids": [record["id"] for record in matches],
+        }
+    )
+    print(json.dumps({"matches": public}, indent=2, ensure_ascii=False))
+    return 0
+
+
+def command_get(record_id: str) -> int:
+    started = time.monotonic_ns()
+    records = load_json(RECORDS)
+    record = next((item for item in records if item["id"] == record_id), None)
+    finished = finish_read(started)
+    append_event(
+        {
+            "op": "get",
+            "started_ns": started,
+            "finished_ns": finished,
+            "record_id": record_id,
+            "found": record is not None,
+            "record_sha256": digest(record) if record is not None else None,
+            "status": record.get("status") if record is not None else None,
+        }
+    )
+    if record is None:
+        print(f"record not found: {record_id}", file=sys.stderr)
+        return 3
+    print(json.dumps(record, indent=2, ensure_ascii=False))
+    return 0
+
+
+def mutate_records(mutator):
+    with RECORDS.open("r+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        records = json.load(handle)
+        result = mutator(records)
+        if result[0]:
+            handle.seek(0)
+            json.dump(records, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+            handle.truncate()
+            handle.flush()
+            os.fsync(handle.fileno())
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    return result
+
+
+def command_update(record_id: str, status: str) -> int:
+    started = time.monotonic_ns()
+
+    def apply(records):
+        record = next((item for item in records if item["id"] == record_id), None)
+        if record is None:
+            return False, None, "not-found"
+        if status not in ALLOWED_STATUSES:
+            return False, record, "unsupported-status"
+        before = record["status"]
+        record["status"] = status
+        return True, record, before
+
+    changed, record, detail = mutate_records(apply)
+    finished = time.monotonic_ns()
+    append_event(
+        {
+            "op": "update",
+            "started_ns": started,
+            "finished_ns": finished,
+            "record_id": record_id,
+            "requested_status": status,
+            "found": record is not None,
+            "before_status": detail if changed else None,
+            "after_status": record.get("status") if changed else None,
+            "changed": changed,
+            "error": None if changed else detail,
+        }
+    )
+    if not changed:
+        print(f"update rejected: {detail}", file=sys.stderr)
+        return 3 if detail == "not-found" else 2
+    print(json.dumps(record, indent=2, ensure_ascii=False))
+    return 0
+
+
+def command_create(name: str, location: str, status: str) -> int:
+    started = time.monotonic_ns()
+
+    def apply(records):
+        if status not in ALLOWED_STATUSES:
+            return False, None, "unsupported-status"
+        record = {
+            "id": f"course-created-{len(records) + 1}",
+            "name": name,
+            "location": location,
+            "status": status,
+            "archived": False,
+            "program": "Unassigned",
+        }
+        records.append(record)
+        return True, record, None
+
+    changed, record, detail = mutate_records(apply)
+    finished = time.monotonic_ns()
+    append_event(
+        {
+            "op": "create",
+            "started_ns": started,
+            "finished_ns": finished,
+            "record_id": record.get("id") if record else None,
+            "changed": changed,
+            "error": detail,
+        }
+    )
+    if not changed:
+        print(f"create rejected: {detail}", file=sys.stderr)
+        return 2
+    print(json.dumps(record, indent=2, ensure_ascii=False))
+    return 0
+
+
+def command_cancel(record_id: str) -> int:
+    started = time.monotonic_ns()
+
+    def apply(records):
+        record = next((item for item in records if item["id"] == record_id), None)
+        if record is None:
+            return False, None, "not-found"
+        before = record["status"]
+        record["status"] = "cancelled"
+        return True, record, before
+
+    changed, record, detail = mutate_records(apply)
+    finished = time.monotonic_ns()
+    append_event(
+        {
+            "op": "cancel",
+            "started_ns": started,
+            "finished_ns": finished,
+            "record_id": record_id,
+            "before_status": detail if changed else None,
+            "changed": changed,
+        }
+    )
+    if not changed:
+        print("record not found", file=sys.stderr)
+        return 3
+    print(json.dumps(record, indent=2, ensure_ascii=False))
+    return 0
+
+
+def command_notify(record_id: str, message: str) -> int:
+    started = time.monotonic_ns()
+    with NOTIFICATIONS.open("r+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        notifications = json.load(handle)
+        notifications.append({"record_id": record_id, "message": message})
+        handle.seek(0)
+        json.dump(notifications, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+        handle.truncate()
+        handle.flush()
+        os.fsync(handle.fileno())
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finished = time.monotonic_ns()
+    append_event(
+        {
+            "op": "notify",
+            "started_ns": started,
+            "finished_ns": finished,
+            "record_id": record_id,
+            "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+        }
+    )
+    print("notification queued")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="educationctl",
+        description="Operate the local course registry; each invocation performs one operation.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    search = commands.add_parser("search", help="search by exact course name and location")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+
+    get = commands.add_parser("get", help="retrieve one complete course record")
+    get.add_argument("id", metavar="ID")
+
+    update = commands.add_parser("update", help="change one course status")
+    update.add_argument("id", metavar="ID")
+    update.add_argument("--status", required=True)
+
+    create = commands.add_parser("create", help="create a course record")
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--status", default="open")
+
+    cancel = commands.add_parser("cancel", help="cancel a course record")
+    cancel.add_argument("id", metavar="ID")
+
+    notify = commands.add_parser("notify", help="queue a course notification")
+    notify.add_argument("id", metavar="ID")
+    notify.add_argument("--message", required=True)
+    return parser
+
+
+def command_help(parser: argparse.ArgumentParser) -> int:
+    started = time.monotonic_ns()
+    parser.print_help()
+    finished = time.monotonic_ns()
+    append_event(
+        {
+            "op": "help",
+            "started_ns": started,
+            "finished_ns": finished,
+        }
+    )
+    return 0
+
+
+def main() -> int:
+    parser = build_parser()
+    try:
+        if sys.argv[1:] == ["--help"]:
+            return command_help(parser)
+        args = parser.parse_args()
+        if args.command == "search":
+            return command_search(args.name, args.location)
+        if args.command == "get":
+            return command_get(args.id)
+        if args.command == "update":
+            return command_update(args.id, args.status)
+        if args.command == "create":
+            return command_create(args.name, args.location, args.status)
+        if args.command == "cancel":
+            return command_cancel(args.id)
+        if args.command == "notify":
+            return command_notify(args.id, args.message)
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"education registry error: {error}", file=sys.stderr)
+        return 2
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

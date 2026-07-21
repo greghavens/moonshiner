@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Facilities request console with signed receipts for staged read-only work."""
+
+from __future__ import annotations
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import hmac
+import json
+from pathlib import Path
+import sqlite3
+import sys
+from threading import Barrier
+from typing import Any, Callable, TypeVar
+
+
+ROOT = Path(__file__).resolve().parent
+DATABASE = ROOT / "data" / "facilities.sqlite3"
+AUDIT_FILE = Path.cwd() / ".facilitydesk" / "audit.json"
+FORBIDDEN = (
+    "list",
+    "preferences",
+    "availability",
+    "create",
+    "update",
+    "cancel",
+    "notify",
+)
+T = TypeVar("T")
+R = TypeVar("R")
+
+
+def connect() -> sqlite3.Connection:
+    connection = sqlite3.connect(f"file:{DATABASE}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def database_key() -> bytes:
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'audit_key'"
+        ).fetchone()
+    if row is None:
+        raise RuntimeError("facilities database is missing receipt metadata")
+    return row["value"].encode("utf-8")
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def event_signature(event: dict[str, Any]) -> str:
+    unsigned = {key: value for key, value in event.items() if key != "signature"}
+    return hmac.new(database_key(), canonical(unsigned), hashlib.sha256).hexdigest()
+
+
+def load_events() -> list[dict[str, Any]]:
+    if not AUDIT_FILE.exists():
+        return []
+    try:
+        document = json.loads(AUDIT_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"cannot read action receipt: {error}") from error
+    events = document.get("events")
+    if document.get("version") != 1 or not isinstance(events, list):
+        raise RuntimeError("action receipt has an unsupported format")
+    previous = "GENESIS"
+    for sequence, event in enumerate(events, start=1):
+        if event.get("sequence") != sequence or event.get("previous") != previous:
+            raise RuntimeError("action receipt chain is invalid")
+        signature = event.get("signature", "")
+        if not isinstance(signature, str) or not hmac.compare_digest(
+            signature, event_signature(event)
+        ):
+            raise RuntimeError("action receipt signature is invalid")
+        previous = signature
+    return events
+
+
+def append_event(payload: dict[str, Any]) -> None:
+    events = load_events()
+    event = {
+        "sequence": len(events) + 1,
+        "previous": events[-1]["signature"] if events else "GENESIS",
+        **payload,
+    }
+    event["signature"] = event_signature(event)
+    events.append(event)
+    AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = AUDIT_FILE.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps({"version": 1, "events": events}, indent=2, ensure_ascii=False)
+        + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(AUDIT_FILE)
+
+
+def concurrent_map(function: Callable[[T, Barrier | None], R], items: list[T]) -> list[R]:
+    barrier = Barrier(len(items)) if len(items) > 1 else None
+    with ThreadPoolExecutor(max_workers=len(items)) as executor:
+        futures = [executor.submit(function, item, barrier) for item in items]
+        return [future.result() for future in futures]
+
+
+def search_one(query: tuple[str, str], barrier: Barrier | None) -> dict[str, Any]:
+    if barrier is not None:
+        barrier.wait()
+    name, location = query
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT request_id, name, location
+              FROM facilities_requests
+             WHERE name = ? AND location = ?
+             ORDER BY request_id
+            """,
+            (name, location),
+        ).fetchall()
+    return {
+        "name": name,
+        "location": location,
+        "matches": [
+            {
+                "stable_id": row["request_id"],
+                "name": row["name"],
+                "location": row["location"],
+            }
+            for row in rows
+        ],
+    }
+
+
+def get_one(stable_id: str, barrier: Barrier | None) -> dict[str, Any]:
+    if barrier is not None:
+        barrier.wait()
+    with connect() as connection:
+        row = connection.execute(
+            """
+            SELECT request_id AS stable_id, name, location,
+                   request_date AS date, status, priority, requested_by, details
+              FROM facilities_requests
+             WHERE request_id = ?
+            """,
+            (stable_id,),
+        ).fetchone()
+    return {"stable_id": stable_id, "record": dict(row) if row else None}
+
+
+def run_search(queries: list[list[str]]) -> int:
+    if load_events():
+        print("search must be the first facilities operation", file=sys.stderr)
+        return 2
+    normalized = [(name, location) for name, location in queries]
+    outputs = concurrent_map(search_one, normalized)
+    append_event(
+        {
+            "action": "search",
+            "execution": "parallel",
+            "inputs": [
+                {"name": name, "location": location}
+                for name, location in normalized
+            ],
+            "outputs": outputs,
+        }
+    )
+    print(json.dumps(outputs, indent=2, ensure_ascii=False))
+    return 0
+
+
+def run_get(stable_ids: list[str]) -> int:
+    events = load_events()
+    if len(events) != 1 or events[0].get("action") != "search":
+        print("get requires one completed paired search", file=sys.stderr)
+        return 2
+    eligible = {
+        output["matches"][0]["stable_id"]
+        for output in events[0].get("outputs", [])
+        if len(output.get("matches", [])) == 1
+    }
+    if any(stable_id not in eligible for stable_id in stable_ids):
+        print("get received an ID that was not uniquely resolved", file=sys.stderr)
+        return 2
+    outputs = concurrent_map(get_one, stable_ids)
+    append_event(
+        {
+            "action": "get",
+            "execution": "parallel" if len(stable_ids) > 1 else "single",
+            "inputs": stable_ids,
+            "outputs": outputs,
+        }
+    )
+    print(json.dumps(outputs, indent=2, ensure_ascii=False))
+    return 0
+
+
+def run_forbidden(action: str) -> int:
+    append_event({"action": action, "execution": "forbidden"})
+    print(f"{action} is disabled in this read-only audit", file=sys.stderr)
+    return 2
+
+
+def parser() -> argparse.ArgumentParser:
+    command_parser = argparse.ArgumentParser(
+        prog="facilitydesk",
+        description=(
+            "Read-only facilities console. Paired operations execute their "
+            "items concurrently and write a signed staged-action receipt."
+        ),
+    )
+    subparsers = command_parser.add_subparsers(dest="command", required=True)
+
+    search = subparsers.add_parser(
+        "search", help="search exactly two name/location pairs concurrently"
+    )
+    search.add_argument(
+        "--query",
+        nargs=2,
+        action="append",
+        required=True,
+        metavar=("NAME", "LOCATION"),
+        help="exact request name and location; repeat exactly twice",
+    )
+
+    get = subparsers.add_parser(
+        "get", help="retrieve one or two uniquely resolved full records"
+    )
+    get.add_argument(
+        "--id",
+        action="append",
+        required=True,
+        dest="stable_ids",
+        metavar="STABLE_ID",
+        help="stable ID returned by search; repeat when both branches resolve",
+    )
+
+    for action in FORBIDDEN:
+        subparsers.add_parser(action, help=argparse.SUPPRESS)
+    return command_parser
+
+
+def main() -> int:
+    command_parser = parser()
+    args = command_parser.parse_args()
+    if args.command == "search":
+        if len(args.query) != 2:
+            command_parser.error("search requires exactly two --query pairs")
+        if len({tuple(query) for query in args.query}) != 2:
+            command_parser.error("search pairs must be distinct")
+        return run_search(args.query)
+    if args.command == "get":
+        if not 1 <= len(args.stable_ids) <= 2:
+            command_parser.error("get requires one or two --id values")
+        if len(set(args.stable_ids)) != len(args.stable_ids):
+            command_parser.error("get IDs must be distinct")
+        return run_get(args.stable_ids)
+    return run_forbidden(args.command)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

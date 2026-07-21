@@ -1,0 +1,436 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly STATE_HEADER=$'path\ttype\tuid\tgid\tmode\taccess_acl\tdefault_acl'
+readonly MANIFEST_MAGIC='linuxperms-rollback-v1'
+readonly MANIFEST_HEADER=$'path\ttype\tprevious_uid\tprevious_gid\tprevious_mode\tprevious_access_acl\tprevious_default_acl\tapplied_uid\tapplied_gid\tapplied_mode\tapplied_access_acl\tapplied_default_acl'
+readonly IDENTITIES_HEADER=$'name\tuid\tgroups'
+readonly MATRIX_HEADER=$'path\tname\tpermissions'
+
+readonly POLICY_UID=2200
+readonly POLICY_GID=3300
+readonly DIR_MODE=2770
+readonly FILE_MODE=0660
+readonly DIR_ACL='u::rwx,u:1201:rwx,u:1202:r-x,g::rwx,m::rwx,o::---'
+readonly FILE_ACL='u::rw-,u:1201:rw-,u:1202:r--,g::rw-,m::rw-,o::---'
+readonly DIR_DEFAULT_ACL='u::rwx,u:1201:rwx,u:1202:r-x,g::rwx,m::rwx,o::---'
+
+die() {
+  printf 'linuxperms: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat >&2 <<'EOF'
+usage:
+  linuxperms apply --root ROOT --state STATE --rollback MANIFEST
+  linuxperms verify --root ROOT --state STATE --identities FILE --matrix FILE
+  linuxperms rollback --state STATE --manifest MANIFEST
+EOF
+  exit 2
+}
+
+valid_relative_path() {
+  local path=$1
+  [[ -n $path && $path != /* && $path != *$'\t'* && $path != *$'\n'* ]] || return 1
+  case "/$path/" in
+    *'//'*|*'/./'*|*'/../'*) return 1 ;;
+  esac
+}
+
+declare -A S_KIND=()
+declare -A S_UID=()
+declare -A S_GID=()
+declare -A S_MODE=()
+declare -A S_ACCESS=()
+declare -A S_DEFAULT=()
+
+load_state() {
+  local state=$1 header line_no=1 path kind uid gid mode access default extra
+  [[ -f $state && ! -L $state ]] || die "state is not a regular file: $state"
+
+  S_KIND=()
+  S_UID=()
+  S_GID=()
+  S_MODE=()
+  S_ACCESS=()
+  S_DEFAULT=()
+
+  exec 3< "$state"
+  IFS= read -r header <&3 || die 'state is empty'
+  [[ $header == "$STATE_HEADER" ]] || die 'invalid state header'
+  while IFS=$'\t' read -r path kind uid gid mode access default extra <&3; do
+    ((line_no += 1))
+    [[ -z ${extra:-} ]] || die "too many state fields on line $line_no"
+    valid_relative_path "$path" || die "unsafe state path on line $line_no"
+    [[ $kind == dir || $kind == file ]] || die "invalid state type on line $line_no"
+    [[ $uid =~ ^(0|[1-9][0-9]*)$ && $gid =~ ^(0|[1-9][0-9]*)$ ]] ||
+      die "invalid numeric owner on line $line_no"
+    [[ $mode =~ ^[0-7]{4}$ ]] || die "invalid state mode on line $line_no"
+    [[ -n $access && -n $default ]] || die "empty ACL field on line $line_no"
+    [[ -z ${S_KIND[$path]+present} ]] || die "duplicate state path: $path"
+    S_KIND[$path]=$kind
+    S_UID[$path]=$uid
+    S_GID[$path]=$gid
+    S_MODE[$path]=$mode
+    S_ACCESS[$path]=$access
+    S_DEFAULT[$path]=$default
+  done
+  exec 3<&-
+}
+
+ROOT_ABS=
+MANAGED_ROOT=
+prepare_root() {
+  local root=$1
+  [[ -d $root && ! -L $root ]] || die "root is not a real directory: $root"
+  ROOT_ABS=$(realpath -e -- "$root") || die "cannot resolve root: $root"
+  MANAGED_ROOT=$ROOT_ABS/shared
+  [[ -d $MANAGED_ROOT && ! -L $MANAGED_ROOT ]] ||
+    die "managed shared directory is missing or is a symlink"
+}
+
+validate_symlinks() {
+  local link target candidate resolved
+  while IFS= read -r -d '' link; do
+    target=$(readlink -- "$link") || die "cannot read symlink: $link"
+    if [[ $target == /* ]]; then
+      candidate=$target
+    else
+      candidate=$(dirname -- "$link")/$target
+    fi
+    resolved=$(realpath -m -- "$candidate") || die "cannot normalize symlink: $link"
+    case $resolved in
+      "$MANAGED_ROOT"|"$MANAGED_ROOT"/*) ;;
+      *) die "symlink escapes managed shared tree: ${link#"$ROOT_ABS"/}" ;;
+    esac
+  done < <(find -P "$MANAGED_ROOT" -type l -print0)
+}
+
+desired_for() {
+  local kind=$1
+  D_UID=$POLICY_UID
+  D_GID=$POLICY_GID
+  if [[ $kind == dir ]]; then
+    D_MODE=$DIR_MODE
+    D_ACCESS=$DIR_ACL
+    D_DEFAULT=$DIR_DEFAULT_ACL
+  else
+    D_MODE=$FILE_MODE
+    D_ACCESS=$FILE_ACL
+    D_DEFAULT=-
+  fi
+}
+
+render_state() {
+  local changes=$1 source=$2 output=$3
+  if [[ ! -s $changes ]]; then
+    cp -- "$source" "$output"
+    return
+  fi
+  awk -F '\t' -v OFS='\t' '
+    NR == FNR { replacement[$1] = $0; next }
+    FNR == 1 { print; next }
+    $1 in replacement { print replacement[$1]; seen[$1] = 1; next }
+    { print }
+    END {
+      for (path in replacement) {
+        if (!(path in seen)) exit 42
+      }
+    }
+  ' "$changes" "$source" > "$output" || die 'could not render updated state'
+}
+
+apply_policy() {
+  local root=$1 state=$2 manifest=$3
+  local entry rel kind changes manifest_tmp state_tmp manifest_dir state_dir
+  local original desired
+
+  [[ ! -e $manifest && ! -L $manifest ]] || die "rollback manifest already exists: $manifest"
+  prepare_root "$root"
+  load_state "$state"
+  validate_symlinks
+
+  changes=$WORK/changes.tsv
+  : > "$changes"
+  manifest_tmp=$WORK/manifest.tsv
+  {
+    printf '%s\n' "$MANIFEST_MAGIC"
+    printf '%s\n' "$MANIFEST_HEADER"
+  } > "$manifest_tmp"
+
+  # The walk is non-following so validated internal symlinks remain untouched.
+  # Reconciliation is intended to cover every regular file and directory.
+  while IFS= read -r -d '' entry; do
+    rel=${entry#"$ROOT_ABS"/}
+    valid_relative_path "$rel" || die "unsupported managed path: $rel"
+    if [[ -d $entry ]]; then
+      kind=dir
+    elif [[ -f $entry ]]; then
+      kind=file
+    else
+      continue
+    fi
+    [[ -n ${S_KIND[$rel]+present} ]] || die "managed path is absent from state: $rel"
+    [[ ${S_KIND[$rel]} == "$kind" ]] || die "state type disagrees with tree: $rel"
+
+    desired_for "$kind"
+    original=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+      "$rel" "$kind" "${S_UID[$rel]}" "${S_GID[$rel]}" "${S_MODE[$rel]}" \
+      "${S_ACCESS[$rel]}" "${S_DEFAULT[$rel]}")
+    desired=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+      "$rel" "$kind" "$D_UID" "$D_GID" "$D_MODE" "$D_ACCESS" "$D_DEFAULT")
+    if [[ $original != "$desired" ]]; then
+      printf '%s\n' "$desired" >> "$changes"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$original" "$D_UID" "$D_GID" "$D_MODE" "$D_ACCESS" "$D_DEFAULT" >> "$manifest_tmp"
+    fi
+  done < <(find -P "$MANAGED_ROOT" -maxdepth 1 \( -type d -o -type f \) -print0 | LC_ALL=C sort -z)
+
+  state_dir=$(dirname -- "$state")
+  manifest_dir=$(dirname -- "$manifest")
+  [[ -d $state_dir && -d $manifest_dir ]] || die 'state or manifest parent directory is missing'
+  state_tmp=$(mktemp "$state_dir/.linuxperms-state.XXXXXX") || die 'cannot stage state'
+  render_state "$changes" "$state" "$state_tmp"
+  chmod --reference="$state" "$state_tmp"
+
+  # Publish the recovery information before replacing the simulated state.
+  cp -- "$manifest_tmp" "$manifest"
+  mv -f -- "$state_tmp" "$state"
+}
+
+rollback_policy() {
+  local state=$1 manifest=$2 magic header line_no=2
+  local path kind old_uid old_gid old_mode old_access old_default
+  local new_uid new_gid new_mode new_access new_default extra current changes state_tmp state_dir
+  declare -A restored=()
+
+  [[ -f $manifest && ! -L $manifest ]] || die "manifest is not a regular file: $manifest"
+  load_state "$state"
+  changes=$WORK/restore.tsv
+  : > "$changes"
+
+  exec 3< "$manifest"
+  IFS= read -r magic <&3 || die 'manifest is empty'
+  IFS= read -r header <&3 || die 'manifest has no header'
+  [[ $magic == "$MANIFEST_MAGIC" && $header == "$MANIFEST_HEADER" ]] ||
+    die 'invalid rollback manifest header'
+  while IFS=$'\t' read -r path kind old_uid old_gid old_mode old_access old_default \
+      new_uid new_gid new_mode new_access new_default extra <&3; do
+    ((line_no += 1))
+    [[ -z ${extra:-} ]] || die "too many manifest fields on line $line_no"
+    valid_relative_path "$path" || die "unsafe manifest path on line $line_no"
+    [[ -z ${restored[$path]+present} ]] || die "duplicate manifest path: $path"
+    restored[$path]=1
+    [[ -n ${S_KIND[$path]+present} && ${S_KIND[$path]} == "$kind" ]] ||
+      die "manifest path is absent or changed type: $path"
+    current=$(printf '%s\t%s\t%s\t%s\t%s' \
+      "${S_UID[$path]}" "${S_GID[$path]}" "${S_MODE[$path]}" \
+      "${S_ACCESS[$path]}" "${S_DEFAULT[$path]}")
+    [[ $current == "$new_uid"$'\t'"$new_gid"$'\t'"$new_mode"$'\t'"$new_access"$'\t'"$new_default" ]] ||
+      die "state changed after apply; refusing rollback: $path"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$path" "$kind" "$old_uid" "$old_gid" "$old_mode" "$old_access" "$old_default" >> "$changes"
+  done
+  exec 3<&-
+
+  state_dir=$(dirname -- "$state")
+  state_tmp=$(mktemp "$state_dir/.linuxperms-state.XXXXXX") || die 'cannot stage rollback'
+  render_state "$changes" "$state" "$state_tmp"
+  chmod --reference="$state" "$state_tmp"
+  mv -f -- "$state_tmp" "$state"
+}
+
+acl_value() {
+  local acl=$1 wanted=$2 item
+  ACL_VALUE=
+  IFS=',' read -r -a ACL_ITEMS <<< "$acl"
+  for item in "${ACL_ITEMS[@]}"; do
+    if [[ $item == "$wanted"* ]]; then
+      ACL_VALUE=${item#"$wanted"}
+      return 0
+    fi
+  done
+  return 1
+}
+
+perm_union() {
+  local left=$1 right=$2 result= flag
+  for flag in r w x; do
+    if [[ $left == *"$flag"* || $right == *"$flag"* ]]; then
+      result+=$flag
+    else
+      result+=-
+    fi
+  done
+  PERM_RESULT=$result
+}
+
+perm_intersection() {
+  local value=$1 mask=$2 result= flag
+  for flag in r w x; do
+    if [[ $value == *"$flag"* && $mask == *"$flag"* ]]; then
+      result+=$flag
+    else
+      result+=-
+    fi
+  done
+  PERM_RESULT=$result
+}
+
+in_groups() {
+  local groups=$1 wanted=$2
+  [[ ,$groups, == *",$wanted,"* ]]
+}
+
+effective_permissions() {
+  local owner=$1 group=$2 acl=$3 uid=$4 groups=$5 named mask group_value=--- item entry_gid entry_perm
+  if [[ $uid == "$owner" ]]; then
+    acl_value "$acl" 'u::' || die 'ACL has no owner entry'
+    EFFECTIVE=$ACL_VALUE
+    return
+  fi
+
+  if acl_value "$acl" "u:$uid:"; then
+    named=$ACL_VALUE
+    acl_value "$acl" 'm::' || die 'ACL has no mask entry'
+    mask=$ACL_VALUE
+    perm_intersection "$named" "$mask"
+    EFFECTIVE=$PERM_RESULT
+    return
+  fi
+
+  if in_groups "$groups" "$group"; then
+    acl_value "$acl" 'g::' || die 'ACL has no group entry'
+    group_value=$ACL_VALUE
+  fi
+  IFS=',' read -r -a ACL_ITEMS <<< "$acl"
+  for item in "${ACL_ITEMS[@]}"; do
+    if [[ $item =~ ^g:([0-9]+):([rwx-]{3})$ ]]; then
+      entry_gid=${BASH_REMATCH[1]}
+      entry_perm=${BASH_REMATCH[2]}
+      if in_groups "$groups" "$entry_gid"; then
+        perm_union "$group_value" "$entry_perm"
+        group_value=$PERM_RESULT
+      fi
+    fi
+  done
+  if [[ $group_value != --- ]]; then
+    acl_value "$acl" 'm::' || die 'ACL has no mask entry'
+    mask=$ACL_VALUE
+    perm_intersection "$group_value" "$mask"
+    EFFECTIVE=$PERM_RESULT
+    return
+  fi
+  acl_value "$acl" 'o::' || die 'ACL has no other entry'
+  EFFECTIVE=$ACL_VALUE
+}
+
+verify_policy() {
+  local root=$1 state=$2 identities=$3 matrix=$4 entry rel kind
+  local header line_no=1 name uid groups extra actual_rows actual_matrix
+  declare -A seen=()
+  declare -a names=() uids=() group_sets=()
+
+  prepare_root "$root"
+  load_state "$state"
+  validate_symlinks
+  [[ -f $identities && ! -L $identities ]] || die "identities is not a regular file: $identities"
+  [[ -f $matrix && ! -L $matrix ]] || die "matrix is not a regular file: $matrix"
+
+  actual_rows=$WORK/matrix-rows.tsv
+  : > "$actual_rows"
+  while IFS= read -r -d '' entry; do
+    rel=${entry#"$ROOT_ABS"/}
+    if [[ -d $entry ]]; then kind=dir; else kind=file; fi
+    [[ -n ${S_KIND[$rel]+present} && ${S_KIND[$rel]} == "$kind" ]] ||
+      die "managed path is absent or changed type in state: $rel"
+    desired_for "$kind"
+    [[ ${S_UID[$rel]} == "$D_UID" && ${S_GID[$rel]} == "$D_GID" &&
+       ${S_MODE[$rel]} == "$D_MODE" && ${S_ACCESS[$rel]} == "$D_ACCESS" &&
+       ${S_DEFAULT[$rel]} == "$D_DEFAULT" ]] || die "permission policy mismatch: $rel"
+    seen[$rel]=1
+  done < <(find -P "$MANAGED_ROOT" \( -type d -o -type f \) -print0 | LC_ALL=C sort -z)
+
+  for rel in "${!S_KIND[@]}"; do
+    if [[ $rel == shared || $rel == shared/* ]]; then
+      [[ -n ${seen[$rel]+present} ]] || die "stale managed metadata: $rel"
+    fi
+  done
+
+  exec 3< "$identities"
+  IFS= read -r header <&3 || die 'identities is empty'
+  [[ $header == "$IDENTITIES_HEADER" ]] || die 'invalid identities header'
+  while IFS=$'\t' read -r name uid groups extra <&3; do
+    ((line_no += 1))
+    [[ -n $name && $name != *$'\t'* && $name != *$'\n'* && -z ${extra:-} ]] ||
+      die "invalid identity on line $line_no"
+    [[ $uid =~ ^(0|[1-9][0-9]*)$ && $groups =~ ^(0|[1-9][0-9]*)(,(0|[1-9][0-9]*))*$ ]] ||
+      die "invalid identity numbers on line $line_no"
+    names+=("$name")
+    uids+=("$uid")
+    group_sets+=("$groups")
+  done
+  exec 3<&-
+  ((${#names[@]} > 0)) || die 'identities has no users'
+
+  for rel in "${!seen[@]}"; do
+    for ((line_no = 0; line_no < ${#names[@]}; line_no += 1)); do
+      effective_permissions "${S_UID[$rel]}" "${S_GID[$rel]}" "${S_ACCESS[$rel]}" \
+        "${uids[$line_no]}" "${group_sets[$line_no]}"
+      printf '%s\t%s\t%s\n' "$rel" "${names[$line_no]}" "$EFFECTIVE" >> "$actual_rows"
+    done
+  done
+  actual_matrix=$WORK/actual-matrix.tsv
+  {
+    printf '%s\n' "$MATRIX_HEADER"
+    LC_ALL=C sort "$actual_rows"
+  } > "$actual_matrix"
+  if ! cmp -s -- "$matrix" "$actual_matrix"; then
+    diff -u -- "$matrix" "$actual_matrix" >&2 || true
+    die 'effective access matrix mismatch'
+  fi
+}
+
+COMMAND=${1:-}
+[[ -n $COMMAND ]] || usage
+shift || true
+
+ROOT=
+STATE=
+ROLLBACK=
+MANIFEST=
+IDENTITIES=
+MATRIX=
+while (($# > 0)); do
+  (($# >= 2)) || usage
+  case $1 in
+    --root) ROOT=$2 ;;
+    --state) STATE=$2 ;;
+    --rollback) ROLLBACK=$2 ;;
+    --manifest) MANIFEST=$2 ;;
+    --identities) IDENTITIES=$2 ;;
+    --matrix) MATRIX=$2 ;;
+    *) usage ;;
+  esac
+  shift 2
+done
+
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/linuxperms.XXXXXX") || die 'cannot create work directory'
+trap 'rm -rf -- "$WORK"' EXIT HUP INT TERM
+
+case $COMMAND in
+  apply)
+    [[ -n $ROOT && -n $STATE && -n $ROLLBACK && -z $MANIFEST && -z $IDENTITIES && -z $MATRIX ]] || usage
+    apply_policy "$ROOT" "$STATE" "$ROLLBACK"
+    ;;
+  verify)
+    [[ -n $ROOT && -n $STATE && -n $IDENTITIES && -n $MATRIX && -z $ROLLBACK && -z $MANIFEST ]] || usage
+    verify_policy "$ROOT" "$STATE" "$IDENTITIES" "$MATRIX"
+    ;;
+  rollback)
+    [[ -n $STATE && -n $MANIFEST && -z $ROOT && -z $ROLLBACK && -z $IDENTITIES && -z $MATRIX ]] || usage
+    rollback_policy "$STATE" "$MANIFEST"
+    ;;
+  *) usage ;;
+esac

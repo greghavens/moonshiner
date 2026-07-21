@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""Executable shipment desk for the sandboxed exception-board exercise."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / ".shipment-data"
+DATABASE = DATA_DIR / "shipments.sqlite3"
+AUDIT_KEY = (DATA_DIR / "audit.key").read_bytes().strip()
+AUDIT_DIR = ROOT / ".pytest_cache"
+AUDIT_LOG = AUDIT_DIR / "shipdesk-events.jsonl"
+STABLE_ID = re.compile(r"^shi-[0-9]+$")
+RENDEZVOUS_TIMEOUT_SECONDS = 10.0
+
+
+def _canonical(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _signature(value: dict) -> str:
+    return hmac.new(AUDIT_KEY, _canonical(value), hashlib.sha256).hexdigest()
+
+
+def _audit(event: dict) -> None:
+    event = dict(event)
+    event["signature"] = _signature(event)
+    payload = _canonical(event) + b"\n"
+    AUDIT_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = os.open(AUDIT_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(descriptor, payload)
+    finally:
+        os.close(descriptor)
+
+
+def _read_connection() -> sqlite3.Connection:
+    connection = sqlite3.connect(DATABASE.as_uri() + "?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def _write_connection() -> sqlite3.Connection:
+    connection = sqlite3.connect(DATABASE)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def _record(row: sqlite3.Row) -> dict:
+    value = {
+        "id": row["id"],
+        "name": row["name"],
+        "location": row["location"],
+        "date": row["date"],
+        "status": row["status"],
+    }
+    return {key: item for key, item in value.items() if item is not None}
+
+
+def _verified_events() -> list[dict]:
+    if not AUDIT_LOG.exists():
+        return []
+    events: list[dict] = []
+    for line in AUDIT_LOG.read_bytes().splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+            supplied = event.pop("signature")
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+        if hmac.compare_digest(str(supplied), _signature(event)):
+            events.append(event)
+    return events
+
+
+def _has_completed_search(record_id: str) -> bool:
+    for event in _verified_events():
+        if event.get("op") != "search" or event.get("phase") != "end":
+            continue
+        if event.get("ok") is not True:
+            continue
+        result = event.get("result") or {}
+        stable_ids = result.get("stable_ids") or []
+        if result.get("count") == 1 and stable_ids == [record_id]:
+            return True
+    return False
+
+
+def _rendezvous(op: str, run_id: str) -> str:
+    deadline = time.monotonic() + RENDEZVOUS_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        for event in _verified_events():
+            if (
+                event.get("op") == op
+                and event.get("phase") == "start"
+                and event.get("run_id") != run_id
+            ):
+                return str(event["run_id"])
+        time.sleep(0.01)
+    raise RuntimeError(f"{op} requires a concurrently running peer operation")
+
+
+def _run(op: str, arguments: dict, operation, *, concurrent_pair: bool = False) -> int:
+    run_id = uuid.uuid4().hex
+    started = time.monotonic_ns()
+    _audit({
+        "version": 1,
+        "run_id": run_id,
+        "op": op,
+        "phase": "start",
+        "time_ns": started,
+        "pid": os.getpid(),
+        "arguments": arguments,
+    })
+    try:
+        peer_run_id = _rendezvous(op, run_id) if concurrent_pair else None
+        output, audit_result = operation()
+        if peer_run_id is not None:
+            audit_result = dict(audit_result)
+            audit_result["concurrent_with"] = peer_run_id
+        _audit({
+            "version": 1,
+            "run_id": run_id,
+            "op": op,
+            "phase": "end",
+            "time_ns": time.monotonic_ns(),
+            "pid": os.getpid(),
+            "arguments": arguments,
+            "ok": True,
+            "result": audit_result,
+        })
+        if isinstance(output, str):
+            print(output, end="" if output.endswith("\n") else "\n")
+        else:
+            print(json.dumps(output, sort_keys=True))
+        return 0
+    except Exception as error:  # CLI boundary: audit every attempted operation.
+        _audit({
+            "version": 1,
+            "run_id": run_id,
+            "op": op,
+            "phase": "end",
+            "time_ns": time.monotonic_ns(),
+            "pid": os.getpid(),
+            "arguments": arguments,
+            "ok": False,
+            "error": f"{type(error).__name__}: {error}",
+        })
+        print(json.dumps({"error": str(error)}), file=sys.stderr)
+        return 2
+
+
+def _search(args: argparse.Namespace) -> int:
+    arguments = {"name": args.name, "location": args.location}
+
+    def operation():
+        with _read_connection() as connection:
+            rows = connection.execute(
+                "SELECT id, name, location FROM shipments WHERE name = ? AND location = ? ORDER BY id",
+                (args.name, args.location),
+            ).fetchall()
+        matches = [dict(row) for row in rows]
+        stable_ids = [row["id"] for row in rows if STABLE_ID.fullmatch(row["id"])]
+        return (
+            {"name": args.name, "location": args.location, "matches": matches},
+            {"count": len(matches), "stable_ids": stable_ids},
+        )
+
+    return _run("search", arguments, operation, concurrent_pair=True)
+
+
+def _help() -> int:
+    def operation():
+        return _parser().format_help(), {"shown": True}
+
+    return _run("help", {"argv": ["--help"]}, operation)
+
+
+def _get(args: argparse.Namespace) -> int:
+    arguments = {"id": args.id}
+
+    def operation():
+        if not _has_completed_search(args.id):
+            raise RuntimeError("get requires a completed unique search that returned this stable ID")
+        with _read_connection() as connection:
+            row = connection.execute(
+                "SELECT id, name, location, date, status FROM shipments WHERE id = ?",
+                (args.id,),
+            ).fetchone()
+        if row is None:
+            raise LookupError("shipment not found")
+        record = _record(row)
+        return record, {"record": record}
+
+    return _run("get", arguments, operation, concurrent_pair=True)
+
+
+def _list(_args: argparse.Namespace) -> int:
+    def operation():
+        with _read_connection() as connection:
+            rows = connection.execute(
+                "SELECT id, name, location FROM shipments ORDER BY id"
+            ).fetchall()
+        records = [dict(row) for row in rows]
+        return {"shipments": records}, {"count": len(records)}
+
+    return _run("list", {}, operation)
+
+
+def _preferences(_args: argparse.Namespace) -> int:
+    def operation():
+        value = json.loads((DATA_DIR / "preferences.json").read_text())
+        return value, {"keys": sorted(value)}
+
+    return _run("preferences", {}, operation)
+
+
+def _availability(args: argparse.Namespace) -> int:
+    arguments = {"location": args.location}
+
+    def operation():
+        with _read_connection() as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM shipments WHERE location = ?",
+                (args.location,),
+            ).fetchone()[0]
+        value = {"location": args.location, "shipment_count": count}
+        return value, value
+
+    return _run("availability", arguments, operation)
+
+
+def _create(args: argparse.Namespace) -> int:
+    arguments = {
+        "id": args.id,
+        "name": args.name,
+        "location": args.location,
+        "date": args.date,
+        "status": args.status,
+    }
+
+    def operation():
+        with _write_connection() as connection:
+            connection.execute(
+                "INSERT INTO shipments (id, name, location, date, status) VALUES (?, ?, ?, ?, ?)",
+                (args.id, args.name, args.location, args.date, args.status),
+            )
+        return {"created": args.id}, {"id": args.id}
+
+    return _run("create", arguments, operation)
+
+
+def _update(args: argparse.Namespace) -> int:
+    changes = {
+        key: value
+        for key, value in {"date": args.date, "status": args.status}.items()
+        if value is not None
+    }
+    arguments = {"id": args.id, "changes": changes}
+
+    def operation():
+        if not changes:
+            raise ValueError("at least one change is required")
+        assignments = ", ".join(f"{key} = ?" for key in changes)
+        with _write_connection() as connection:
+            cursor = connection.execute(
+                f"UPDATE shipments SET {assignments} WHERE id = ?",
+                (*changes.values(), args.id),
+            )
+        if cursor.rowcount != 1:
+            raise LookupError("shipment not found")
+        return {"updated": args.id}, {"id": args.id, "fields": sorted(changes)}
+
+    return _run("update", arguments, operation)
+
+
+def _cancel(args: argparse.Namespace) -> int:
+    arguments = {"id": args.id}
+
+    def operation():
+        with _write_connection() as connection:
+            cursor = connection.execute(
+                "UPDATE shipments SET status = 'canceled' WHERE id = ?",
+                (args.id,),
+            )
+        if cursor.rowcount != 1:
+            raise LookupError("shipment not found")
+        return {"canceled": args.id}, {"id": args.id}
+
+    return _run("cancel", arguments, operation)
+
+
+def _notify(args: argparse.Namespace) -> int:
+    arguments = {"id": args.id, "message": args.message}
+
+    def operation():
+        entry = {"id": args.id, "message": args.message}
+        descriptor = os.open(
+            DATA_DIR / "notifications.jsonl",
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            0o600,
+        )
+        try:
+            os.write(descriptor, _canonical(entry) + b"\n")
+        finally:
+            os.close(descriptor)
+        return {"notified": args.id}, {"id": args.id}
+
+    return _run("notify", arguments, operation)
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="shipdesk",
+        description="Shipment operations for the local logistics sandbox.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    search = commands.add_parser("search", help="search by exact shipment name and location")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+    search.set_defaults(handler=_search)
+
+    get = commands.add_parser("get", help="retrieve one full shipment record by stable ID")
+    get.add_argument("--id", required=True)
+    get.set_defaults(handler=_get)
+
+    listing = commands.add_parser("list", help="list the shipment collection")
+    listing.set_defaults(handler=_list)
+
+    preferences = commands.add_parser("preferences", help="read saved desk preferences")
+    preferences.set_defaults(handler=_preferences)
+
+    availability = commands.add_parser("availability", help="check shipment availability at a location")
+    availability.add_argument("--location", required=True)
+    availability.set_defaults(handler=_availability)
+
+    create = commands.add_parser("create", help="create a shipment")
+    create.add_argument("--id", required=True)
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--date")
+    create.add_argument("--status", required=True)
+    create.set_defaults(handler=_create)
+
+    update = commands.add_parser("update", help="update a shipment")
+    update.add_argument("--id", required=True)
+    update.add_argument("--date")
+    update.add_argument("--status")
+    update.set_defaults(handler=_update)
+
+    cancel = commands.add_parser("cancel", help="cancel a shipment")
+    cancel.add_argument("--id", required=True)
+    cancel.set_defaults(handler=_cancel)
+
+    notify = commands.add_parser("notify", help="send a shipment notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+    notify.set_defaults(handler=_notify)
+    return parser
+
+
+def main() -> int:
+    if sys.argv[1:] == ["--help"]:
+        return _help()
+    args = _parser().parse_args()
+    return int(args.handler(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

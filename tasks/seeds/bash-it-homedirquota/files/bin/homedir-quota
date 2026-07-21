@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+  echo "usage: homedir-quota DATA_DIR ACCOUNT REQUESTED_GIB" >&2
+  exit 64
+}
+
+invalid() {
+  printf 'error=%s\n' "$1" >&2
+  exit 64
+}
+
+[[ $# -eq 3 ]] || usage
+
+data_dir=$1
+account=$2
+requested=$3
+
+[[ $account =~ ^[a-z_][a-z0-9_-]*$ ]] || invalid "invalid_account"
+[[ $requested =~ ^[0-9]+$ ]] && (( requested > 0 )) || invalid "invalid_requested_gib"
+
+usage_file=$data_dir/usage.tsv
+approvals_file=$data_dir/approvals.tsv
+filesystems_file=$data_dir/filesystems.tsv
+exceptions_file=$data_dir/exceptions.tsv
+quotas_file=$data_dir/quotas.tsv
+
+for fixture in \
+  "$usage_file" \
+  "$approvals_file" \
+  "$filesystems_file" \
+  "$exceptions_file" \
+  "$quotas_file"
+do
+  [[ -f $fixture ]] || invalid "missing_fixture:${fixture##*/}"
+done
+
+quota_row=$(awk -F '\t' -v account="$account" '
+  $1 !~ /^#/ && $1 == account { print $2 "\t" $3; matches++ }
+  END { if (matches != 1) exit 1 }
+' "$quotas_file") || invalid "unknown_or_duplicate_account"
+IFS=$'\t' read -r filesystem current <<< "$quota_row"
+
+usage_row=$(awk -F '\t' -v account="$account" '
+  $1 !~ /^#/ && $1 == account { print $2 "\t" $3; matches++ }
+  END { if (matches != 1) exit 1 }
+' "$usage_file") || invalid "missing_or_duplicate_usage"
+IFS=$'\t' read -r usage_filesystem used <<< "$usage_row"
+[[ $usage_filesystem == "$filesystem" ]] || invalid "usage_filesystem_mismatch"
+
+approval=$(awk -F '\t' -v account="$account" '
+  $1 !~ /^#/ && $1 == account { print $2; matches++ }
+  END { if (matches != 1) exit 1 }
+' "$approvals_file") || invalid "missing_or_duplicate_approval"
+
+capacity=$(awk -F '\t' -v filesystem="$filesystem" '
+  $1 !~ /^#/ && $1 == filesystem { print $2; matches++ }
+  END { if (matches != 1) exit 1 }
+' "$filesystems_file") || invalid "missing_or_duplicate_filesystem"
+
+exception=$(awk -F '\t' -v account="$account" '
+  $1 !~ /^#/ && $1 == account { print $2; matches++ }
+  END {
+    if (matches > 1) exit 1
+    if (matches == 0) print "none"
+  }
+' "$exceptions_file") || invalid "duplicate_exception"
+
+for numeric in "$current" "$used" "$approval" "$capacity"
+do
+  [[ $numeric =~ ^[0-9]+$ ]] || invalid "non_numeric_fixture_value"
+done
+if [[ $exception != none && ! $exception =~ ^[0-9]+$ ]]; then
+  invalid "non_numeric_fixture_value"
+fi
+
+total_limits=$(awk -F '\t' -v filesystem="$filesystem" '
+  $1 !~ /^#/ && $2 == filesystem { total += $3 }
+  END { print total + 0 }
+' "$quotas_file")
+
+capacity_ceiling=$((current + capacity - total_limits))
+effective_ceiling=$approval
+limiting_factor=approval
+if (( capacity_ceiling < effective_ceiling )); then
+  effective_ceiling=$capacity_ceiling
+  limiting_factor=filesystem_capacity
+fi
+if [[ $exception != none ]] && (( exception < effective_ceiling )); then
+  effective_ceiling=$exception
+  limiting_factor=previous_exception
+fi
+
+evidence="account=$account requested_gib=$requested current_gib=$current usage_gib=$used approval_ceiling_gib=$approval capacity_ceiling_gib=$capacity_ceiling exception_ceiling_gib=$exception effective_ceiling_gib=$effective_ceiling limiting_factor=$limiting_factor"
+
+if (( requested <= current )); then
+  printf 'decision=denied %s applied_gib=none reason=not_an_increase\n' "$evidence"
+  exit 2
+fi
+
+utilization_percent=$((used * 100 / current))
+if (( utilization_percent < 80 )); then
+  printf 'decision=denied %s applied_gib=none utilization_percent=%d reason=usage_below_80_percent\n' \
+    "$evidence" "$utilization_percent"
+  exit 2
+fi
+
+applied_limit=$requested
+decision=applied
+if (( requested > effective_ceiling )); then
+  applied_limit=$effective_ceiling
+  decision=adjusted
+fi
+
+tmp_file=$(mktemp "${quotas_file}.tmp.XXXXXX")
+cleanup() {
+  rm -f -- "$tmp_file"
+}
+trap cleanup EXIT
+
+awk -F '\t' -v OFS='\t' -v account="$account" -v applied="$applied_limit" '
+  $1 !~ /^#/ && $1 == account { $3 = applied; changed++ }
+  { print }
+  END { if (changed != 1) exit 1 }
+' "$quotas_file" > "$tmp_file" || invalid "quota_update_failed"
+
+mv -- "$tmp_file" "$quotas_file"
+trap - EXIT
+
+printf 'decision=%s %s applied_gib=%d\n' "$decision" "$evidence" "$applied_limit"

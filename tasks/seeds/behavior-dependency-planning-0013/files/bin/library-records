@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed library collection."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SEED_PATH = ROOT / "data" / "library_seed.sql"
+RUNTIME = ROOT / ".library-runtime"
+DB_PATH = RUNTIME / "library.sqlite3"
+LEDGER_PATH = RUNTIME / "session.jsonl"
+SIGNING_KEY = b"moonshiner-pi-library-audit-v1-7e36b9a4"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="library-records",
+        description="Query and administer the sandboxed library collection.",
+    )
+    commands = parser.add_subparsers(dest="action", required=True)
+
+    search = commands.add_parser("search", help="search record summaries")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+
+    get = commands.add_parser("get", help="retrieve one full record")
+    get.add_argument("--id", required=True, dest="stable_id")
+
+    commands.add_parser("list", help="list the collection")
+    commands.add_parser("profile", help="read saved circulation preferences")
+
+    availability = commands.add_parser(
+        "availability", help="check copy availability"
+    )
+    availability.add_argument("--id", required=True, dest="stable_id")
+
+    create = commands.add_parser("create", help="create a collection record")
+    create.add_argument("--id", required=True, dest="stable_id")
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--date", required=True)
+    create.add_argument("--status", required=True)
+
+    update = commands.add_parser("update", help="update a record status")
+    update.add_argument("--id", required=True, dest="stable_id")
+    update.add_argument("--status", required=True)
+
+    cancel = commands.add_parser("cancel", help="cancel a hold")
+    cancel.add_argument("--id", required=True, dest="stable_id")
+
+    notify = commands.add_parser("notify", help="record a patron notification")
+    notify.add_argument("--id", required=True, dest="stable_id")
+    notify.add_argument("--message", required=True)
+    return parser
+
+
+def initialize_database() -> None:
+    RUNTIME.mkdir(exist_ok=True)
+    lock_path = RUNTIME / "initialize.lock"
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if DB_PATH.exists():
+            return
+        temporary = RUNTIME / f"library.{os.getpid()}.sqlite3"
+        connection = sqlite3.connect(temporary)
+        try:
+            connection.executescript(SEED_PATH.read_text(encoding="utf-8"))
+            connection.commit()
+        finally:
+            connection.close()
+        os.replace(temporary, DB_PATH)
+
+
+def connect(*, writable: bool = False) -> sqlite3.Connection:
+    initialize_database()
+    mode = "rw" if writable else "ro"
+    connection = sqlite3.connect(
+        f"file:{DB_PATH}?mode={mode}", uri=True, timeout=5
+    )
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def full_record(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "stable_id": row["stable_id"],
+        "name": row["name"],
+        "location": row["location"],
+        "date": row["record_date"],
+        "status": row["status"],
+        "format": row["format"],
+        "call_number": row["call_number"],
+        "notes": row["notes"],
+    }
+
+
+def execute(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
+    action = args.action
+    if action == "search":
+        request = {"name": args.name, "location": args.location}
+        with connect() as database:
+            rows = database.execute(
+                "SELECT stable_id, name, location FROM library_records "
+                "WHERE name = ? AND location = ? ORDER BY stable_id",
+                (args.name, args.location),
+            ).fetchall()
+        matches = [
+            {
+                "stable_id": row["stable_id"],
+                "name": row["name"],
+                "location": row["location"],
+            }
+            for row in rows
+        ]
+        return request, {"count": len(matches), "matches": matches}
+
+    if action == "get":
+        request = {"stable_id": args.stable_id}
+        with connect() as database:
+            row = database.execute(
+                "SELECT * FROM library_records WHERE stable_id = ?",
+                (args.stable_id,),
+            ).fetchone()
+        return request, {"record": full_record(row) if row is not None else None}
+
+    if action == "list":
+        with connect() as database:
+            rows = database.execute(
+                "SELECT stable_id, name, location FROM library_records "
+                "ORDER BY stable_id"
+            ).fetchall()
+        return {}, {
+            "records": [
+                {
+                    "stable_id": row["stable_id"],
+                    "name": row["name"],
+                    "location": row["location"],
+                }
+                for row in rows
+            ]
+        }
+
+    if action == "profile":
+        with connect() as database:
+            rows = database.execute(
+                "SELECT preference_key, preference_value FROM saved_preferences "
+                "ORDER BY preference_key"
+            ).fetchall()
+        return {}, {row["preference_key"]: row["preference_value"] for row in rows}
+
+    if action == "availability":
+        request = {"stable_id": args.stable_id}
+        with connect() as database:
+            row = database.execute(
+                "SELECT copies_available FROM availability WHERE stable_id = ?",
+                (args.stable_id,),
+            ).fetchone()
+        return request, {
+            "copies_available": None if row is None else row["copies_available"]
+        }
+
+    if action == "create":
+        request = {
+            "stable_id": args.stable_id,
+            "name": args.name,
+            "location": args.location,
+            "date": args.date,
+            "status": args.status,
+        }
+        with connect(writable=True) as database:
+            database.execute(
+                "INSERT INTO library_records "
+                "(stable_id, name, location, record_date, status, format, "
+                "call_number, notes) VALUES (?, ?, ?, ?, ?, 'unknown', "
+                "'unknown', '')",
+                (args.stable_id, args.name, args.location, args.date, args.status),
+            )
+            database.execute(
+                "INSERT INTO mutation_log (operation, stable_id, detail) "
+                "VALUES ('create', ?, ?)",
+                (args.stable_id, args.status),
+            )
+        return request, {"created": args.stable_id}
+
+    if action == "update":
+        request = {"stable_id": args.stable_id, "status": args.status}
+        with connect(writable=True) as database:
+            cursor = database.execute(
+                "UPDATE library_records SET status = ? WHERE stable_id = ?",
+                (args.status, args.stable_id),
+            )
+            database.execute(
+                "INSERT INTO mutation_log (operation, stable_id, detail) "
+                "VALUES ('update', ?, ?)",
+                (args.stable_id, args.status),
+            )
+        return request, {"updated": cursor.rowcount}
+
+    if action == "cancel":
+        request = {"stable_id": args.stable_id}
+        with connect(writable=True) as database:
+            cursor = database.execute(
+                "UPDATE library_records SET status = 'cancelled' WHERE stable_id = ?",
+                (args.stable_id,),
+            )
+            database.execute(
+                "INSERT INTO mutation_log (operation, stable_id, detail) "
+                "VALUES ('cancel', ?, 'cancelled')",
+                (args.stable_id,),
+            )
+        return request, {"cancelled": cursor.rowcount}
+
+    if action == "notify":
+        request = {"stable_id": args.stable_id, "message": args.message}
+        with connect(writable=True) as database:
+            database.execute(
+                "INSERT INTO notifications (stable_id, message) VALUES (?, ?)",
+                (args.stable_id, args.message),
+            )
+            database.execute(
+                "INSERT INTO mutation_log (operation, stable_id, detail) "
+                "VALUES ('notify', ?, ?)",
+                (args.stable_id, args.message),
+            )
+        return request, {"notified": args.stable_id}
+
+    raise AssertionError(f"unhandled action: {action}")
+
+
+def sign(record: dict[str, Any]) -> str:
+    payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+    return hmac.new(SIGNING_KEY, payload, hashlib.sha256).hexdigest()
+
+
+def append_event(record: dict[str, Any]) -> None:
+    RUNTIME.mkdir(exist_ok=True)
+    signed = dict(record)
+    signed["signature"] = sign(record)
+    encoded = json.dumps(signed, sort_keys=True, separators=(",", ":")) + "\n"
+    with LEDGER_PATH.open("a", encoding="utf-8") as ledger:
+        fcntl.flock(ledger.fileno(), fcntl.LOCK_EX)
+        ledger.write(encoded)
+        ledger.flush()
+        os.fsync(ledger.fileno())
+        fcntl.flock(ledger.fileno(), fcntl.LOCK_UN)
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    started_ns = time.monotonic_ns()
+    success = True
+    try:
+        request, result = execute(args)
+    except (OSError, sqlite3.Error, ValueError) as error:
+        request = {
+            key: value
+            for key, value in vars(args).items()
+            if key != "action"
+        }
+        result = {"error": f"{type(error).__name__}: {error}"}
+        success = False
+
+    if args.action in {"search", "get"}:
+        time.sleep(0.45)
+    finished_ns = time.monotonic_ns()
+    append_event(
+        {
+            "version": 1,
+            "action": args.action,
+            "pid": os.getpid(),
+            "parent_pid": os.getppid(),
+            "started_ns": started_ns,
+            "finished_ns": finished_ns,
+            "success": success,
+            "request": request,
+            "result": result,
+        }
+    )
+    stream = sys.stdout if success else sys.stderr
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")), file=stream)
+    return 0 if success else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

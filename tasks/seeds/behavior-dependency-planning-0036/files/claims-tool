@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""Executable claims sandbox used by the dependency-planning task."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import sys
+import time
+import uuid
+
+
+DATA_PATH = Path(__file__).with_name("claim_records.json")
+AUDIT_PATH = Path.cwd() / "claim-audit.jsonl"
+LATENCY_SECONDS = 0.65
+
+
+def load_records() -> list[dict[str, str]]:
+    with DATA_PATH.open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    return payload["records"]
+
+
+def save_records(records: list[dict[str, str]]) -> None:
+    temporary = DATA_PATH.with_suffix(".json.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump({"records": records}, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+    os.replace(temporary, DATA_PATH)
+
+
+def emit(value: object) -> None:
+    print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+
+
+def append_event(event: dict[str, object]) -> None:
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def begin(operation: str, arguments: dict[str, object]) -> tuple[str, int]:
+    invocation = uuid.uuid4().hex
+    started_ns = time.monotonic_ns()
+    append_event({
+        "arguments": arguments,
+        "invocation": invocation,
+        "operation": operation,
+        "phase": "start",
+        "pid": os.getpid(),
+        "time_ns": started_ns,
+    })
+    return invocation, started_ns
+
+
+def finish(operation: str, invocation: str, started_ns: int,
+           result: dict[str, object]) -> None:
+    append_event({
+        "invocation": invocation,
+        "operation": operation,
+        "phase": "finish",
+        "pid": os.getpid(),
+        "result": result,
+        "started_ns": started_ns,
+        "time_ns": time.monotonic_ns(),
+    })
+
+
+def search(args: argparse.Namespace) -> int:
+    arguments = {"location": args.location, "name": args.name}
+    invocation, started_ns = begin("search", arguments)
+    time.sleep(LATENCY_SECONDS)
+    matches = [
+        {key: record[key] for key in ("id", "name", "location")}
+        for record in load_records()
+        if record["name"] == args.name and record["location"] == args.location
+    ]
+    finish("search", invocation, started_ns, {
+        "count": len(matches),
+        "stable_ids": [record["id"] for record in matches],
+    })
+    emit({"matches": matches})
+    return 0
+
+
+def get_record(args: argparse.Namespace) -> int:
+    arguments = {"id": args.id}
+    invocation, started_ns = begin("get", arguments)
+    time.sleep(LATENCY_SECONDS)
+    record = next((item for item in load_records() if item["id"] == args.id), None)
+    finish("get", invocation, started_ns, {
+        "found": record is not None,
+        "stable_id": args.id if record is not None else None,
+    })
+    if record is None:
+        emit({"error": "record not found", "id": args.id})
+        return 4
+    emit(record)
+    return 0
+
+
+def forbidden_read(operation: str, result: object) -> int:
+    invocation, started_ns = begin(operation, {})
+    finish(operation, invocation, started_ns, {"completed": True})
+    emit(result)
+    return 0
+
+
+def create_record(args: argparse.Namespace) -> int:
+    arguments = {"location": args.location, "name": args.name,
+                 "status": args.status}
+    invocation, started_ns = begin("create", arguments)
+    records = load_records()
+    numeric = [int(record["id"].removeprefix("ins-")) for record in records]
+    record = {"id": f"ins-{max(numeric) + 1}", "name": args.name,
+              "location": args.location, "status": args.status, "date": ""}
+    records.append(record)
+    save_records(records)
+    finish("create", invocation, started_ns,
+           {"created": True, "stable_id": record["id"]})
+    emit(record)
+    return 0
+
+
+def update_record(args: argparse.Namespace, operation: str) -> int:
+    arguments = {"id": args.id}
+    if operation == "update":
+        arguments["status"] = args.status
+    invocation, started_ns = begin(operation, arguments)
+    records = load_records()
+    record = next((item for item in records if item["id"] == args.id), None)
+    if record is not None:
+        record["status"] = args.status if operation == "update" else "cancelled"
+        save_records(records)
+    finish(operation, invocation, started_ns, {"found": record is not None})
+    emit({"found": record is not None})
+    return 0 if record is not None else 4
+
+
+def notify(args: argparse.Namespace) -> int:
+    arguments = {"id": args.id, "message": args.message}
+    invocation, started_ns = begin("notify", arguments)
+    notification_path = Path.cwd() / "claim-notifications.jsonl"
+    with notification_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(arguments, ensure_ascii=False, sort_keys=True) + "\n")
+    finish("notify", invocation, started_ns, {"delivered": True})
+    emit({"delivered": True})
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        prog="claims-tool",
+        description="Query and administer the sandboxed claims registry.",
+    )
+    commands = root.add_subparsers(dest="command", required=True)
+
+    search_parser = commands.add_parser("search", help="exact claim search")
+    search_parser.add_argument("--name", required=True)
+    search_parser.add_argument("--location", required=True)
+    search_parser.set_defaults(handler=search)
+
+    get_parser = commands.add_parser("get", help="retrieve one full record")
+    get_parser.add_argument("id")
+    get_parser.set_defaults(handler=get_record)
+
+    list_parser = commands.add_parser("list", help="list the collection")
+    list_parser.set_defaults(
+        handler=lambda _: forbidden_read("list", load_records()))
+    preferences_parser = commands.add_parser(
+        "preferences", help="read saved preferences")
+    preferences_parser.set_defaults(
+        handler=lambda _: forbidden_read("preferences", {"queue": "review"}))
+    availability_parser = commands.add_parser(
+        "availability", help="check service availability")
+    availability_parser.set_defaults(
+        handler=lambda _: forbidden_read("availability", {"available": True}))
+
+    create_parser = commands.add_parser("create", help="create a claim")
+    create_parser.add_argument("--name", required=True)
+    create_parser.add_argument("--location", required=True)
+    create_parser.add_argument("--status", required=True)
+    create_parser.set_defaults(handler=create_record)
+
+    update_parser = commands.add_parser("update", help="update a claim")
+    update_parser.add_argument("id")
+    update_parser.add_argument("--status", required=True)
+    update_parser.set_defaults(
+        handler=lambda args: update_record(args, "update"))
+
+    cancel_parser = commands.add_parser("cancel", help="cancel a claim")
+    cancel_parser.add_argument("id")
+    cancel_parser.set_defaults(
+        handler=lambda args: update_record(args, "cancel"))
+
+    notify_parser = commands.add_parser("notify", help="send a notification")
+    notify_parser.add_argument("id")
+    notify_parser.add_argument("--message", required=True)
+    notify_parser.set_defaults(handler=notify)
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    return int(args.handler(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

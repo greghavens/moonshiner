@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""Executable interface to the local hospitality ledger."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import secrets
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Callable, Iterator
+
+
+ROOT = Path(__file__).resolve().parent
+LEDGER_PATH = ROOT / "ledger.json"
+AUDIT_PATH = ROOT / "audit.json"
+LOCK_PATH = ROOT / "service.lock"
+PAIR_TIMEOUT_SECONDS = 8.0
+
+
+class ServiceError(RuntimeError):
+    pass
+
+
+def load_json(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def save_json(path: Path, value: dict) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+@contextmanager
+def service_lock() -> Iterator[None]:
+    with LOCK_PATH.open("r+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def now_ns() -> int:
+    return time.monotonic_ns()
+
+
+def successful_operations(audit: dict, action: str) -> list[dict]:
+    return [
+        operation
+        for operation in audit["operations"]
+        if operation.get("action") == action
+        and operation.get("success") is True
+        and isinstance(operation.get("completed_ns"), int)
+    ]
+
+
+def check_get_precondition(audit: dict, request: dict) -> None:
+    searches = successful_operations(audit, "search")
+    batches: dict[str, list[dict]] = {}
+    for operation in searches:
+        batches.setdefault(operation.get("batch_token", ""), []).append(operation)
+    complete_batches = [batch for token, batch in batches.items() if token and len(batch) == 2]
+    if not complete_batches:
+        raise ServiceError("retrieval requires one completed parallel search batch")
+    searchable_ids = {
+        record_id
+        for batch in complete_batches
+        for operation in batch
+        for record_id in operation.get("result_ids", [])
+    }
+    if request["id"] not in searchable_ids:
+        raise ServiceError("record ID was not returned by the completed searches")
+
+
+def check_mutation_precondition(audit: dict, request: dict) -> None:
+    retrievals = successful_operations(audit, "get")
+    batches: dict[str, list[dict]] = {}
+    for operation in retrievals:
+        batches.setdefault(operation.get("batch_token", ""), []).append(operation)
+    complete_batches = [batch for token, batch in batches.items() if token and len(batch) == 2]
+    if not complete_batches:
+        raise ServiceError("mutation requires one completed parallel retrieval batch")
+    retrieved_ids = {
+        record_id
+        for batch in complete_batches
+        for operation in batch
+        for record_id in operation.get("result_ids", [])
+    }
+    if request["id"] not in retrieved_ids:
+        raise ServiceError("record ID was not returned by the completed retrievals")
+
+
+def begin_paired_operation(
+    action: str,
+    request: dict,
+    precondition: Callable[[dict, dict], None] | None = None,
+) -> tuple[str, str]:
+    operation_id = secrets.token_hex(12)
+    started = now_ns()
+    with service_lock():
+        audit = load_json(AUDIT_PATH)
+        if precondition is not None:
+            precondition(audit, request)
+        operation = {
+            "action": action,
+            "batch_token": None,
+            "completed_ns": None,
+            "id": operation_id,
+            "request": request,
+            "result_ids": None,
+            "started_ns": started,
+            "success": None,
+        }
+        waiting = next(
+            (
+                candidate
+                for candidate in audit["operations"]
+                if candidate.get("action") == action
+                and candidate.get("batch_token") is None
+                and candidate.get("completed_ns") is None
+            ),
+            None,
+        )
+        audit["operations"].append(operation)
+        if waiting is not None:
+            batch_token = secrets.token_hex(12)
+            waiting["batch_token"] = batch_token
+            operation["batch_token"] = batch_token
+        save_json(AUDIT_PATH, audit)
+
+    deadline = time.monotonic() + PAIR_TIMEOUT_SECONDS
+    while True:
+        with service_lock():
+            audit = load_json(AUDIT_PATH)
+            current = next(
+                operation
+                for operation in audit["operations"]
+                if operation["id"] == operation_id
+            )
+            if current["batch_token"] is not None:
+                return operation_id, current["batch_token"]
+            if time.monotonic() >= deadline:
+                audit["operations"] = [
+                    operation
+                    for operation in audit["operations"]
+                    if operation["id"] != operation_id
+                ]
+                save_json(AUDIT_PATH, audit)
+                raise ServiceError(
+                    f"{action} requires a concurrent partner process; no operation was recorded"
+                )
+        time.sleep(0.025)
+
+
+def complete_operation(operation_id: str, result_ids: list[str]) -> None:
+    with service_lock():
+        audit = load_json(AUDIT_PATH)
+        operation = next(
+            operation for operation in audit["operations"] if operation["id"] == operation_id
+        )
+        operation["completed_ns"] = now_ns()
+        operation["result_ids"] = result_ids
+        operation["success"] = True
+        save_json(AUDIT_PATH, audit)
+
+
+def run_search(name: str, location: str) -> dict:
+    request = {"location": location, "name": name}
+    operation_id, _ = begin_paired_operation("search", request)
+    with service_lock():
+        ledger = load_json(LEDGER_PATH)
+        matches = [
+            {"id": record["id"], "location": record["location"], "name": record["name"]}
+            for record in ledger["records"]
+            if record["name"] == name and record["location"] == location
+        ]
+    complete_operation(operation_id, [record["id"] for record in matches])
+    return {"count": len(matches), "matches": matches}
+
+
+def run_get(record_id: str) -> dict:
+    request = {"id": record_id}
+    operation_id, _ = begin_paired_operation("get", request, check_get_precondition)
+    with service_lock():
+        ledger = load_json(LEDGER_PATH)
+        record = next(
+            (record for record in ledger["records"] if record["id"] == record_id),
+            None,
+        )
+    result_ids = [record_id] if record is not None else []
+    complete_operation(operation_id, result_ids)
+    if record is None:
+        raise ServiceError("record not found")
+    return {"record": record}
+
+
+def run_update(record_id: str, status: str) -> dict:
+    request = {"id": record_id, "status": status}
+    with service_lock():
+        audit = load_json(AUDIT_PATH)
+        check_mutation_precondition(audit, request)
+        ledger = load_json(LEDGER_PATH)
+        record = next(
+            (record for record in ledger["records"] if record["id"] == record_id),
+            None,
+        )
+        if record is None:
+            raise ServiceError("record not found")
+        before = record["status"]
+        record["status"] = status
+        started = now_ns()
+        audit["operations"].append(
+            {
+                "action": "update",
+                "batch_token": None,
+                "completed_ns": now_ns(),
+                "id": secrets.token_hex(12),
+                "request": request,
+                "result_ids": [record_id],
+                "started_ns": started,
+                "success": True,
+                "transition": {"from": before, "to": status},
+            }
+        )
+        save_json(LEDGER_PATH, ledger)
+        save_json(AUDIT_PATH, audit)
+    return {"id": record_id, "status": status, "updated": before != status}
+
+
+def run_notify(record_id: str, message: str) -> dict:
+    request = {"id": record_id, "message": message}
+    with service_lock():
+        audit = load_json(AUDIT_PATH)
+        ledger = load_json(LEDGER_PATH)
+        started = now_ns()
+        ledger["notifications"].append(request)
+        audit["operations"].append(
+            {
+                "action": "notify",
+                "batch_token": None,
+                "completed_ns": now_ns(),
+                "id": secrets.token_hex(12),
+                "request": request,
+                "result_ids": [record_id],
+                "started_ns": started,
+                "success": True,
+            }
+        )
+        save_json(LEDGER_PATH, ledger)
+        save_json(AUDIT_PATH, audit)
+    return {"notified": record_id}
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        prog="hospitalityctl",
+        description="Search, retrieve, and reconcile the local hospitality ledger.",
+    )
+    commands = root.add_subparsers(dest="command", required=True)
+
+    search = commands.add_parser("search", help="exactly match a name and location")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+
+    get = commands.add_parser("get", help="retrieve one record by ID")
+    get.add_argument("id")
+
+    update = commands.add_parser("update", help="change one record status")
+    update.add_argument("id")
+    update.add_argument("--status", required=True)
+
+    notify = commands.add_parser("notify", help="send a record notification")
+    notify.add_argument("id")
+    notify.add_argument("--message", required=True)
+    return root
+
+
+def main() -> int:
+    arguments = parser().parse_args()
+    try:
+        if arguments.command == "search":
+            result = run_search(arguments.name, arguments.location)
+        elif arguments.command == "get":
+            result = run_get(arguments.id)
+        elif arguments.command == "update":
+            result = run_update(arguments.id, arguments.status)
+        else:
+            result = run_notify(arguments.id, arguments.message)
+    except (ServiceError, OSError, ValueError, json.JSONDecodeError) as error:
+        print(json.dumps({"error": str(error)}, sort_keys=True), file=sys.stderr)
+        return 1
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -57,6 +57,27 @@ class FrontDoor(unittest.TestCase):
             self.assertEqual(m.main([]), 0)
         start.assert_called_once_with()
 
+    def test_queue_liveness_is_scoped_to_this_project(self):
+        config = {"pipeline": {"queues": {"seed_authoring": False,
+                                             "tracing": True}}}
+        inactive = mock.Mock(returncode=3)
+        started = mock.Mock(returncode=0)
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch("common.CONFIG", config), \
+             mock.patch("common.RUNS", pathlib.Path(directory)), \
+             mock.patch.object(m.subprocess, "run",
+                               side_effect=[inactive, started]) as run:
+            self.assertEqual(m._start_default_queues(), 0)
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertFalse(any(command[0] == "pgrep" for command in commands))
+        project_key = m.hashlib.sha256(
+            str(configuration.PROJECT_ROOT).encode()).hexdigest()[:12]
+        self.assertEqual(commands[0], ["systemctl", "--user", "is-active",
+                                       "--quiet",
+                                       f"moonshiner-trace-continuous-{project_key}.service"])
+        self.assertIn(f"--unit=moonshiner-trace-continuous-{project_key}",
+                      commands[1])
+
     def test_provider_presets_include_endpoint_protocol_and_key(self):
         for provider in ("openrouter", "openai", "anthropic"):
             preset = m.PROVIDER_PRESETS[provider]

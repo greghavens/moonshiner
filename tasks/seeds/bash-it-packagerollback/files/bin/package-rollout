@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+
+set -u -o pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+usage: package-rollout --inventory FILE --state-dir DIR --artifact FILE
+                       --query key=value[,key=value...] [--max-concurrency N]
+                       [--dry-run]
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$1" >&2
+  exit "${2:-2}"
+}
+
+inventory=''
+state_dir=''
+artifact=''
+query=''
+max_concurrency=4
+dry_run=0
+
+while (($#)); do
+  case "$1" in
+    --inventory)
+      (($# >= 2)) || die '--inventory requires a value'
+      inventory=$2
+      shift 2
+      ;;
+    --state-dir)
+      (($# >= 2)) || die '--state-dir requires a value'
+      state_dir=$2
+      shift 2
+      ;;
+    --artifact)
+      (($# >= 2)) || die '--artifact requires a value'
+      artifact=$2
+      shift 2
+      ;;
+    --query)
+      (($# >= 2)) || die '--query requires a value'
+      query=$2
+      shift 2
+      ;;
+    --max-concurrency)
+      (($# >= 2)) || die '--max-concurrency requires a value'
+      max_concurrency=$2
+      shift 2
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      die "unknown argument: $1"
+      ;;
+  esac
+done
+
+[[ -n "$inventory" ]] || die '--inventory is required'
+[[ -n "$state_dir" ]] || die '--state-dir is required'
+[[ -n "$artifact" ]] || die '--artifact is required'
+[[ -n "$query" ]] || die '--query is required'
+[[ "$max_concurrency" =~ ^[1-9][0-9]*$ ]] || die '--max-concurrency must be a positive integer'
+[[ -f "$inventory" ]] || die "inventory not found: $inventory"
+[[ -d "$state_dir" ]] || die "state directory not found: $state_dir"
+[[ -f "$artifact" ]] || die "artifact not found: $artifact"
+[[ -f "${artifact}.sha256" ]] || die "checksum file not found: ${artifact}.sha256"
+
+IFS=',' read -r -a query_terms <<<"$query"
+for term in "${query_terms[@]}"; do
+  [[ "$term" =~ ^[A-Za-z_][A-Za-z0-9_.-]*=[A-Za-z0-9_.:-]+$ ]] || die "invalid query term: $term"
+done
+
+declare -a HOST_ORDER=()
+declare -A HOST_LABELS=()
+declare -A SEEN_HOSTS=()
+
+line_number=0
+while IFS=$'\t' read -r host labels extra || [[ -n "${host:-}${labels:-}${extra:-}" ]]; do
+  ((line_number += 1))
+  [[ -n "${host:-}" ]] || continue
+  [[ "$host" != \#* ]] || continue
+  [[ -z "${extra:-}" ]] || die "inventory line $line_number has too many columns"
+  [[ "$host" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid host on inventory line $line_number"
+  [[ -n "${labels:-}" ]] || die "missing labels on inventory line $line_number"
+  [[ -z "${SEEN_HOSTS[$host]+x}" ]] || die "duplicate host in inventory: $host"
+
+  IFS=',' read -r -a host_terms <<<"$labels"
+  declare -A line_keys=()
+  for term in "${host_terms[@]}"; do
+    [[ "$term" =~ ^[A-Za-z_][A-Za-z0-9_.-]*=[A-Za-z0-9_.:-]+$ ]] || die "invalid label on inventory line $line_number: $term"
+    key=${term%%=*}
+    [[ -z "${line_keys[$key]+x}" ]] || die "duplicate label key on inventory line $line_number: $key"
+    line_keys[$key]=1
+  done
+  unset line_keys
+
+  HOST_ORDER+=("$host")
+  HOST_LABELS[$host]=$labels
+  SEEN_HOSTS[$host]=1
+done <"$inventory"
+
+((${#HOST_ORDER[@]} > 0)) || die 'inventory contains no hosts'
+
+matches_query() {
+  local host=$1 term
+  local labels=",${HOST_LABELS[$host]},"
+  for term in "${query_terms[@]}"; do
+    [[ "$labels" == *",${term},"* ]] || return 1
+  done
+  return 0
+}
+
+declare -a TARGET_HOSTS=()
+for host in "${HOST_ORDER[@]}"; do
+  if matches_query "$host"; then
+    TARGET_HOSTS+=("$host")
+  fi
+done
+((${#TARGET_HOSTS[@]} > 0)) || die "query matched no hosts: $query"
+
+read -r expected_checksum checksum_extra <"${artifact}.sha256" || die 'unable to read checksum file'
+[[ "$expected_checksum" =~ ^[0-9a-fA-F]{64}$ ]] || die 'checksum file must begin with a SHA-256 digest'
+expected_checksum=${expected_checksum,,}
+actual_checksum=$(sha256sum "$artifact") || die 'unable to checksum artifact'
+actual_checksum=${actual_checksum%% *}
+[[ "$actual_checksum" == "$expected_checksum" ]] || die 'artifact checksum mismatch' 3
+
+new_version=''
+version_count=0
+while IFS= read -r line || [[ -n "$line" ]]; do
+  if [[ "$line" == version=* ]]; then
+    new_version=${line#version=}
+    ((version_count += 1))
+  fi
+done <"$artifact"
+[[ "$version_count" -eq 1 && "$new_version" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] || die 'artifact must contain exactly one valid version= line'
+
+declare -A BASE_VERSION=()
+declare -A BASE_CHECKSUM=()
+read_one_line() {
+  local path=$1
+  local -a lines=()
+  mapfile -t lines <"$path" || return 1
+  ((${#lines[@]} == 1)) || return 1
+  [[ -n "${lines[0]}" ]] || return 1
+  printf '%s' "${lines[0]}"
+}
+
+for host in "${HOST_ORDER[@]}"; do
+  host_dir="$state_dir/$host"
+  [[ -d "$host_dir" ]] || die "missing state directory for host: $host"
+  version=$(read_one_line "$host_dir/package.version") || die "invalid package.version for host: $host"
+  checksum=$(read_one_line "$host_dir/package.sha256") || die "invalid package.sha256 for host: $host"
+  [[ "$version" != *$'\t'* ]] || die "invalid installed version for host: $host"
+  [[ "$checksum" =~ ^[0-9a-fA-F]{64}$ ]] || die "invalid installed checksum for host: $host"
+  BASE_VERSION[$host]=$version
+  BASE_CHECKSUM[$host]=${checksum,,}
+done
+
+printf 'TARGETS count=%d query=%s\n' "${#TARGET_HOSTS[@]}" "$query"
+for host in "${TARGET_HOSTS[@]}"; do
+  printf 'TARGET host=%s from=%s to=%s\n' "$host" "${BASE_VERSION[$host]}" "$new_version"
+done
+
+if ((dry_run)); then
+  printf 'DRY-RUN no changes applied\n'
+  exit 0
+fi
+
+journal="$state_dir/rollout-journal.tsv"
+printf '# package-rollout journal v1\n' >"$journal" || die "cannot write journal: $journal"
+printf '# host\taction\tversion\tchecksum\n' >>"$journal"
+
+append_event() {
+  local host=$1 action=$2 version=$3 checksum=$4
+  printf '%s\t%s\t%s\t%s\n' "$host" "$action" "$version" "$checksum" >>"$journal"
+}
+
+install_one() {
+  local host=$1 host_dir="$state_dir/$1"
+  [[ ! -e "$host_dir/install.fail" ]] || return 1
+  if [[ -f "$host_dir/install.delay" ]]; then
+    local delay
+    delay=$(read_one_line "$host_dir/install.delay") || return 1
+    [[ "$delay" =~ ^(0|0\.[0-9]{1,3}|[1-9][0-9]*(\.[0-9]{1,3})?)$ ]] || return 1
+    sleep "$delay"
+  fi
+  printf '%s\n' "$new_version" >"$host_dir/package.version.tmp.$$" || return 1
+  printf '%s\n' "$actual_checksum" >"$host_dir/package.sha256.tmp.$$" || return 1
+  mv "$host_dir/package.version.tmp.$$" "$host_dir/package.version" || return 1
+  mv "$host_dir/package.sha256.tmp.$$" "$host_dir/package.sha256" || return 1
+  printf 'install\t%s\n' "$new_version" >>"$host_dir/events.log"
+}
+
+health_one() {
+  local host=$1 host_dir="$state_dir/$1" status='healthy'
+  if [[ -f "$host_dir/health" ]]; then
+    status=$(read_one_line "$host_dir/health") || return 1
+  fi
+  [[ "$status" == healthy ]]
+}
+
+declare -A INSTALL_OK=()
+declare -A HEALTH_OK=()
+declare -a JOURNAL_HOSTS=()
+
+run_install_phase() {
+  local offset=0 count=${#TARGET_HOSTS[@]} batch_size i host pid
+  local -a batch_hosts=() batch_pids=()
+  while ((offset < count)); do
+    batch_size=$max_concurrency
+    ((batch_size <= count - offset)) || batch_size=$((count - offset))
+    printf 'INSTALL-BATCH size=%d\n' "$batch_size"
+    batch_hosts=()
+    batch_pids=()
+    for ((i = 0; i < batch_size; i++)); do
+      host=${TARGET_HOSTS[offset + i]}
+      install_one "$host" &
+      pid=$!
+      batch_hosts+=("$host")
+      batch_pids+=("$pid")
+    done
+    for ((i = 0; i < batch_size; i++)); do
+      host=${batch_hosts[i]}
+      if wait "${batch_pids[i]}"; then
+        INSTALL_OK[$host]=1
+        JOURNAL_HOSTS+=("$host")
+        append_event "$host" installed "${BASE_VERSION[$host]}" "${BASE_CHECKSUM[$host]}"
+      else
+        INSTALL_OK[$host]=0
+      fi
+    done
+    offset=$((offset + batch_size))
+  done
+}
+
+run_health_phase() {
+  local offset=0 count=${#TARGET_HOSTS[@]} batch_size i host pid
+  local -a batch_hosts=() batch_pids=()
+  while ((offset < count)); do
+    batch_size=$max_concurrency
+    ((batch_size <= count - offset)) || batch_size=$((count - offset))
+    printf 'HEALTH-BATCH size=%d\n' "$batch_size"
+    batch_hosts=()
+    batch_pids=()
+    for ((i = 0; i < batch_size; i++)); do
+      host=${TARGET_HOSTS[offset + i]}
+      health_one "$host" &
+      pid=$!
+      batch_hosts+=("$host")
+      batch_pids+=("$pid")
+    done
+    for ((i = 0; i < batch_size; i++)); do
+      host=${batch_hosts[i]}
+      if wait "${batch_pids[i]}"; then
+        HEALTH_OK[$host]=1
+      else
+        HEALTH_OK[$host]=0
+      fi
+    done
+    offset=$((offset + batch_size))
+  done
+}
+
+restore_host() {
+  local host=$1 host_dir="$state_dir/$1"
+  printf '%s\n' "${BASE_VERSION[$host]}" >"$host_dir/package.version.tmp.$$" || return 1
+  printf '%s\n' "${BASE_CHECKSUM[$host]}" >"$host_dir/package.sha256.tmp.$$" || return 1
+  mv "$host_dir/package.version.tmp.$$" "$host_dir/package.version" || return 1
+  mv "$host_dir/package.sha256.tmp.$$" "$host_dir/package.sha256" || return 1
+  printf 'rollback\t%s\n' "${BASE_VERSION[$host]}" >>"$host_dir/events.log"
+  append_event "$host" rolled_back "${BASE_VERSION[$host]}" "${BASE_CHECKSUM[$host]}"
+}
+
+rollback_changed_hosts() {
+  local host failed=0
+  # The journal is the source of truth for which installs need compensation.
+  for host in "${HOST_ORDER[@]}"; do
+    if ! restore_host "$host"; then
+      printf 'error: rollback failed for host: %s\n' "$host" >&2
+      failed=1
+    fi
+  done
+  return "$failed"
+}
+
+run_install_phase
+install_failed=0
+for host in "${TARGET_HOSTS[@]}"; do
+  if [[ "${INSTALL_OK[$host]:-0}" != 1 ]]; then
+    printf 'error: install failed for host: %s\n' "$host" >&2
+    install_failed=1
+  fi
+done
+
+if ((install_failed)); then
+  append_event - abort install_failure -
+  rollback_changed_hosts || exit 5
+  exit 4
+fi
+
+run_health_phase
+health_failed=0
+for host in "${TARGET_HOSTS[@]}"; do
+  if [[ "${HEALTH_OK[$host]:-0}" != 1 ]]; then
+    printf 'error: health check failed for host: %s\n' "$host" >&2
+    health_failed=1
+  fi
+done
+
+if ((health_failed)); then
+  append_event - abort health_failure -
+  rollback_changed_hosts || exit 5
+  exit 4
+fi
+
+append_event - committed "$new_version" "$actual_checksum"
+printf 'COMMITTED version=%s hosts=%d\n' "$new_version" "${#TARGET_HOSTS[@]}"

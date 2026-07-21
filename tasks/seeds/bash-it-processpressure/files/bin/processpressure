@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export LC_ALL=C
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+fixture_command="$script_dir/processfixture"
+
+usage() {
+    printf 'usage: processpressure diagnose FIXTURE [before|after]\n' >&2
+    printf '       processpressure mitigate FIXTURE EVIDENCE_DIR\n' >&2
+    exit 64
+}
+
+data_error() {
+    printf 'processpressure: %s\n' "$1" >&2
+    exit 65
+}
+
+load_system() {
+    local fixture=$1 key value extra
+    cpu_capacity_pct=
+    memory_capacity_mb=
+    host_fd_capacity=
+    pids_per_scope_limit=
+    warn_pct=
+
+    while IFS=$'\t' read -r key value extra; do
+        [[ -n "${key:-}" ]] || continue
+        [[ "$key" != metric ]] || {
+            [[ "$value" == value && -z "${extra:-}" ]] || \
+                data_error 'malformed system header'
+            continue
+        }
+        [[ -z "${extra:-}" && "$value" =~ ^[1-9][0-9]*$ ]] || \
+            data_error 'malformed system record'
+        case "$key" in
+            cpu_capacity_pct) cpu_capacity_pct=$value ;;
+            memory_capacity_mb) memory_capacity_mb=$value ;;
+            host_fd_capacity) host_fd_capacity=$value ;;
+            pids_per_scope_limit) pids_per_scope_limit=$value ;;
+            warn_pct) warn_pct=$value ;;
+            *) data_error "unknown system metric: $key" ;;
+        esac
+    done < <(bash "$fixture_command" system "$fixture")
+
+    [[ -n "$cpu_capacity_pct" && -n "$memory_capacity_mb" &&
+       -n "$host_fd_capacity" && -n "$pids_per_scope_limit" &&
+       -n "$warn_pct" ]] || data_error 'incomplete system metrics'
+    (( warn_pct <= 100 )) || data_error 'warning threshold exceeds 100'
+}
+
+analyze_snapshot() {
+    local fixture=$1 state=$2
+    bash "$fixture_command" snapshot "$fixture" "$state" | awk \
+        -v cpu_capacity="$cpu_capacity_pct" \
+        -v memory_capacity="$memory_capacity_mb" \
+        -v host_fd_capacity="$host_fd_capacity" \
+        -v pids_limit="$pids_per_scope_limit" \
+        -v warn="$warn_pct" '
+        BEGIN { FS = OFS = "\t"; valid = 1 }
+        NR == 1 {
+            if ($0 != "pid\tscope\tcpu_pct\trss_mb\tfd_used\tfd_soft_limit\tcommand") {
+                valid = 0
+            }
+            next
+        }
+        {
+            if (NF != 7 || $1 !~ /^[1-9][0-9]*$/ || $2 == "" ||
+                $3 !~ /^[0-9]+$/ || $4 !~ /^[0-9]+$/ ||
+                $5 !~ /^[0-9]+$/ || $6 !~ /^[1-9][0-9]*$/ || $7 == "") {
+                valid = 0
+                next
+            }
+            pid = $1 + 0
+            scope = $2
+            cpu = $3 + 0
+            rss = $4 + 0
+            cpu_total += cpu
+            memory_total += rss
+            cpu_by_scope[scope] += cpu
+            memory_by_scope[scope] += rss
+            process_count[scope]++
+
+            if (!(scope in first_pid) || pid < first_pid[scope]) {
+                first_pid[scope] = pid
+            }
+            if (!(scope in cpu_pid) || cpu > cpu_high[scope] ||
+                (cpu == cpu_high[scope] && pid < cpu_pid[scope])) {
+                cpu_high[scope] = cpu
+                cpu_pid[scope] = pid
+            }
+            if (!(scope in memory_pid) || rss > memory_high[scope] ||
+                (rss == memory_high[scope] && pid < memory_pid[scope])) {
+                memory_high[scope] = rss
+                memory_pid[scope] = pid
+            }
+
+            # Normalize the selected descriptor usage to a whole percentage.
+            fd_pct = int(($5 * 100) / host_fd_capacity)
+            if (!fd_seen || fd_pct > fd_high ||
+                (fd_pct == fd_high &&
+                 (scope < fd_scope || (scope == fd_scope && pid < fd_pid)))) {
+                fd_seen = 1
+                fd_high = fd_pct
+                fd_scope = scope
+                fd_pid = pid
+            }
+        }
+        END {
+            if (!valid || NR < 2) exit 65
+
+            cpu_pct = int((cpu_total * 100) / cpu_capacity)
+            memory_pct = int((memory_total * 100) / memory_capacity)
+
+            if (cpu_pct >= warn) {
+                chosen = ""
+                for (scope in cpu_by_scope) {
+                    if (chosen == "" || cpu_by_scope[scope] > cpu_by_scope[chosen] ||
+                        (cpu_by_scope[scope] == cpu_by_scope[chosen] && scope < chosen)) {
+                        chosen = scope
+                    }
+                }
+                print "cpu", chosen, cpu_pid[chosen], cpu_pct, warn
+                exit
+            }
+            if (memory_pct >= warn) {
+                chosen = ""
+                for (scope in memory_by_scope) {
+                    if (chosen == "" || memory_by_scope[scope] > memory_by_scope[chosen] ||
+                        (memory_by_scope[scope] == memory_by_scope[chosen] && scope < chosen)) {
+                        chosen = scope
+                    }
+                }
+                print "memory", chosen, memory_pid[chosen], memory_pct, warn
+                exit
+            }
+            if (fd_high >= warn) {
+                print "descriptor", fd_scope, fd_pid, fd_high, warn
+                exit
+            }
+
+            chosen = ""
+            chosen_pct = -1
+            for (scope in process_count) {
+                pct = int((process_count[scope] * 100) / pids_limit)
+                if (chosen == "" || pct > chosen_pct ||
+                    (pct == chosen_pct && scope < chosen)) {
+                    chosen = scope
+                    chosen_pct = pct
+                }
+            }
+            if (chosen_pct >= warn) {
+                print "process-count", chosen, first_pid[chosen], chosen_pct, warn
+                exit
+            }
+            print "none", "-", "-", 0, warn
+        }
+    ' || data_error "malformed $state process snapshot"
+}
+
+measure_resource() {
+    local fixture=$1 state=$2 resource=$3 scope=$4
+    bash "$fixture_command" snapshot "$fixture" "$state" | awk \
+        -v cpu_capacity="$cpu_capacity_pct" \
+        -v memory_capacity="$memory_capacity_mb" \
+        -v pids_limit="$pids_per_scope_limit" \
+        -v wanted_resource="$resource" -v wanted_scope="$scope" '
+        BEGIN { FS = "\t" }
+        NR == 1 { next }
+        {
+            cpu_total += $3
+            memory_total += $4
+            if ($2 == wanted_scope) {
+                process_count++
+                descriptor_pct = int(($5 * 100) / $6)
+                if (descriptor_pct > descriptor_high) descriptor_high = descriptor_pct
+            }
+        }
+        END {
+            if (wanted_resource == "cpu")
+                print int((cpu_total * 100) / cpu_capacity)
+            else if (wanted_resource == "memory")
+                print int((memory_total * 100) / memory_capacity)
+            else if (wanted_resource == "descriptor")
+                print descriptor_high + 0
+            else if (wanted_resource == "process-count")
+                print int((process_count * 100) / pids_limit)
+            else
+                exit 65
+        }
+    ' || data_error "cannot measure $resource in $state snapshot"
+}
+
+read_policy() {
+    local fixture=$1 header extra
+    header=$(bash "$fixture_command" policy "$fixture" | sed -n '1p')
+    [[ "$header" == $'resource\tscope\taction\tparameter\tvalue' ]] || \
+        data_error 'malformed policy header'
+    IFS=$'\t' read -r policy_resource policy_scope policy_action \
+        policy_parameter policy_value extra \
+        < <(bash "$fixture_command" policy "$fixture" | sed -n '2p')
+    [[ -n "${policy_resource:-}" && -n "${policy_scope:-}" &&
+       -n "${policy_action:-}" && -n "${policy_parameter:-}" &&
+       -n "${policy_value:-}" && -z "${extra:-}" ]] || \
+        data_error 'malformed policy record'
+    [[ $(bash "$fixture_command" policy "$fixture" | wc -l | tr -d ' ') == 2 ]] || \
+        data_error 'policy must contain exactly one record'
+}
+
+print_diagnosis() {
+    local state=$1 record=$2
+    local resource scope culprit observed threshold extra
+    IFS=$'\t' read -r resource scope culprit observed threshold extra <<< "$record"
+    [[ -n "$resource" && -z "${extra:-}" ]] || data_error 'invalid diagnosis'
+    printf 'state\t%s\n' "$state"
+    printf 'pressure\t%s\n' "$resource"
+    printf 'scope\t%s\n' "$scope"
+    printf 'culprit_pid\t%s\n' "$culprit"
+    printf 'observed_pct\t%s\n' "$observed"
+    printf 'threshold_pct\t%s\n' "$threshold"
+}
+
+diagnose() {
+    [[ $# -eq 1 || $# -eq 2 ]] || usage
+    local fixture=$1 state=${2:-before} record
+    [[ "$state" == before || "$state" == after ]] || usage
+    load_system "$fixture"
+    record=$(analyze_snapshot "$fixture" "$state")
+    print_diagnosis "$state" "$record"
+}
+
+mitigate() {
+    [[ $# -eq 2 ]] || usage
+    local fixture=$1 evidence_dir=$2 record
+    local resource scope culprit observed threshold extra
+    local after_record after_resource after_observed
+
+    [[ -n "$evidence_dir" ]] || usage
+    load_system "$fixture"
+    record=$(analyze_snapshot "$fixture" before)
+    IFS=$'\t' read -r resource scope culprit observed threshold extra <<< "$record"
+    [[ "$resource" != none ]] || {
+        printf 'processpressure: no pressure detected\n' >&2
+        return 1
+    }
+    read_policy "$fixture"
+    [[ "$resource" == "$policy_resource" && "$scope" == "$policy_scope" ]] || {
+        printf 'processpressure: unsupported bottleneck: %s/%s\n' \
+            "$resource" "$scope" >&2
+        return 1
+    }
+    case "$policy_action" in
+        limit|restart) ;;
+        *) data_error "unsupported policy action: $policy_action" ;;
+    esac
+
+    mkdir -p -- "$evidence_dir"
+    bash "$fixture_command" snapshot "$fixture" before \
+        > "$evidence_dir/before-processes.tsv"
+    bash "$fixture_command" apply "$fixture" "$resource" "$scope" \
+        "$policy_action" "$policy_parameter" "$policy_value" \
+        > "$evidence_dir/action.tsv"
+    bash "$fixture_command" snapshot "$fixture" after \
+        > "$evidence_dir/after-processes.tsv"
+
+    after_record=$(analyze_snapshot "$fixture" after)
+    IFS=$'\t' read -r after_resource _ _ _ _ _ <<< "$after_record"
+    after_observed=$(measure_resource "$fixture" after "$resource" "$scope")
+
+    printf 'resource\tscope\tculprit_pid\tbefore_pct\tthreshold_pct\taction\tparameter\tvalue\n' \
+        > "$evidence_dir/decision.tsv"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$resource" "$scope" "$culprit" "$observed" "$threshold" \
+        "$policy_action" "$policy_parameter" "$policy_value" \
+        >> "$evidence_dir/decision.tsv"
+
+    if [[ "$after_resource" == none && "$after_observed" -lt "$threshold" ]]; then
+        printf 'resource\tscope\tbefore_pct\tafter_pct\tthreshold_pct\tstatus\n' \
+            > "$evidence_dir/verification.tsv"
+        printf '%s\t%s\t%s\t%s\t%s\trecovered\n' \
+            "$resource" "$scope" "$observed" "$after_observed" "$threshold" \
+            >> "$evidence_dir/verification.tsv"
+    else
+        printf 'processpressure: recovery verification failed\n' >&2
+        return 1
+    fi
+
+    printf 'pressure\t%s\n' "$resource"
+    printf 'scope\t%s\n' "$scope"
+    printf 'action\t%s\t%s\t%s\n' \
+        "$policy_action" "$policy_parameter" "$policy_value"
+    printf 'recovery\tverified\n'
+    printf 'evidence\t%s\n' "$evidence_dir"
+}
+
+[[ $# -ge 1 ]] || usage
+subcommand=$1
+shift
+case "$subcommand" in
+    diagnose) diagnose "$@" ;;
+    mitigate) mitigate "$@" ;;
+    *) usage ;;
+esac

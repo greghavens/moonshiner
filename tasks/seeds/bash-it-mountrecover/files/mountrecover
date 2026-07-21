@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export LC_ALL=C
+
+usage() {
+    echo "usage: mountrecover EVIDENCE_DIR MOUNTPOINT OUTPUT_DIR" >&2
+    exit 64
+}
+
+die() {
+    echo "mountrecover: $*" >&2
+    exit 1
+}
+
+[[ $# -eq 3 ]] || usage
+
+evidence_dir=$1
+mountpoint=$2
+output_dir=$3
+
+fstab_file="$evidence_dir/fstab"
+identity_file="$evidence_dir/device-identity.txt"
+filesystem_file="$evidence_dir/filesystem-state.txt"
+boot_log="$evidence_dir/boot.log"
+
+for required_file in \
+    "$fstab_file" \
+    "$identity_file" \
+    "$filesystem_file" \
+    "$boot_log"
+do
+    [[ -f "$required_file" ]] || die "missing evidence file: $required_file"
+done
+
+mkdir -p "$output_dir"
+
+entry_count=$(
+    awk -v target="$mountpoint" \
+        '$0 !~ /^[[:space:]]*#/ && NF >= 2 && $2 == target { count++ }
+         END { print count + 0 }' "$fstab_file"
+)
+[[ "$entry_count" -eq 1 ]] || die "expected one fstab entry for $mountpoint"
+
+entry=$(
+    awk -v target="$mountpoint" \
+        '$0 !~ /^[[:space:]]*#/ && NF >= 2 && $2 == target { print; exit }' \
+        "$fstab_file"
+)
+read -r spec parsed_mountpoint expected_type options dump_field pass_field extra <<<"$entry"
+[[ -z "${extra:-}" && -n "${pass_field:-}" ]] || die "fstab entry must have six fields"
+[[ "$spec" == UUID=* ]] || die "only UUID= fstab specifications are supported"
+
+uuid=${spec#UUID=}
+quoted_uuid="UUID=\"$uuid\""
+identity_line=$(
+    awk -v needle="$quoted_uuid" 'index($0, needle) { print; exit }' \
+        "$identity_file"
+)
+
+device=""
+actual_type=""
+if [[ -n "$identity_line" ]]; then
+    device=${identity_line%%:*}
+    actual_type=$(
+        sed -n 's/.*[[:space:]]TYPE="\([^"]*\)".*/\1/p' <<<"$identity_line"
+    )
+fi
+
+filesystem_summary="not checked: device unresolved"
+filesystem_state="not_checked"
+if [[ -n "$device" ]]; then
+    filesystem_summary=$(
+        awk -v prefix="$device:" 'index($0, prefix) == 1 { line=$0 }
+             END { print line }' "$filesystem_file"
+    )
+    if [[ "$filesystem_summary" == *": clean,"* || "$filesystem_summary" == *": clean" ]]; then
+        filesystem_state="clean"
+    elif grep -Eqi 'UNEXPECTED INCONSISTENCY|FILE SYSTEM WAS MODIFIED|errors? (were )?found' \
+        <<<"$filesystem_summary"; then
+        filesystem_state="needs_check"
+    else
+        filesystem_state="unknown"
+    fi
+fi
+
+early_device_timeout="no"
+if grep -Eqi 'timed out waiting for device|dependency failed for .*\.device' "$boot_log"; then
+    early_device_timeout="yes"
+fi
+
+option_rejection="no"
+if grep -Eqi 'unrecognized mount option|bad option' "$boot_log"; then
+    option_rejection="yes"
+fi
+
+removed_options=""
+safe_options=""
+sanitize_options() {
+    local filesystem_type=$1
+    local raw_options=$2
+    local option key
+    local -a kept=()
+    local -a removed=()
+    local -a supplied=()
+
+    IFS=',' read -r -a supplied <<<"$raw_options"
+    for option in "${supplied[@]}"; do
+        key=${option%%=*}
+        case "$filesystem_type:$key" in
+            ext2:uid|ext2:gid|ext2:umask|ext2:dmask|ext2:fmask|\
+            ext3:uid|ext3:gid|ext3:umask|ext3:dmask|ext3:fmask|\
+            ext4:uid|ext4:gid|ext4:umask|ext4:dmask|ext4:fmask)
+                removed+=("$option")
+                ;;
+            *)
+                kept+=("$option")
+                ;;
+        esac
+    done
+
+    if ((${#kept[@]})); then
+        safe_options=$(IFS=','; echo "${kept[*]}")
+    else
+        safe_options="defaults"
+    fi
+    if ((${#removed[@]})); then
+        removed_options=$(IFS=','; echo "${removed[*]}")
+    fi
+}
+
+sanitize_options "$expected_type" "$options"
+
+status="HEALTHY"
+reason="current identity, filesystem state, and mount options are consistent"
+
+# A boot-time timeout may precede a late device arrival.  Presence must be
+# decided from the current identity capture, not from an earlier journal line.
+if [[ -z "$device" || "$early_device_timeout" == "yes" ]]; then
+    status="MISSING_DEVICE"
+    reason="the fstab UUID is not present in the current device identity capture"
+elif [[ -z "$actual_type" || "$actual_type" != "$expected_type" ]]; then
+    status="FILESYSTEM_TYPE_MISMATCH"
+    reason="fstab type $expected_type does not match blkid type ${actual_type:-unknown}"
+elif [[ "$filesystem_state" != "clean" ]]; then
+    status="FILESYSTEM_NEEDS_CHECK"
+    reason="the read-only filesystem evidence is $filesystem_state; do not change mount options first"
+elif [[ -n "$removed_options" || "$option_rejection" == "yes" ]]; then
+    status="BAD_OPTIONS"
+    reason="the device is present and clean, but ext-family ownership options were rejected"
+fi
+
+corrected_entry=""
+validation="not-run"
+validation_exit=0
+
+if [[ "$status" == "BAD_OPTIONS" && -n "$removed_options" ]]; then
+    corrected_entry="$spec $parsed_mountpoint $expected_type $safe_options $dump_field $pass_field"
+    corrected_fstab="$output_dir/corrected.fstab"
+
+    awk -v target="$mountpoint" \
+        -v replacement="$corrected_entry" \
+        '$0 !~ /^[[:space:]]*#/ && NF >= 2 && $2 == target {
+             print replacement
+             next
+         }
+         { print }' "$fstab_file" >"$corrected_fstab"
+
+    mount_command=${MOUNTRECOVER_MOUNT_COMMAND:-mount}
+    if "$mount_command" --fake --no-mtab --all --fstab "$corrected_fstab" \
+        >"$output_dir/validation.log" 2>&1; then
+        validation="passed: mount --fake --no-mtab --all --fstab corrected.fstab"
+    else
+        validation_exit=$?
+        validation="failed: mount --fake --no-mtab --all --fstab corrected.fstab"
+    fi
+fi
+
+cat >"$output_dir/report.env" <<EOF
+STATUS=$status
+REASON=$reason
+FSTAB_SPEC=$spec
+MOUNTPOINT=$parsed_mountpoint
+DEVICE_PRESENT=$([[ -n "$device" ]] && echo yes || echo no)
+DEVICE=${device:-unresolved}
+EXPECTED_FILESYSTEM=$expected_type
+ACTUAL_FILESYSTEM=${actual_type:-unknown}
+FILESYSTEM_STATE=$filesystem_state
+FILESYSTEM_SUMMARY=$filesystem_summary
+EARLY_DEVICE_TIMEOUT=$early_device_timeout
+OPTION_REJECTION=$option_rejection
+REMOVED_OPTIONS=${removed_options:-none}
+CORRECTED_ENTRY=${corrected_entry:-none}
+VALIDATION=$validation
+RECOVERY_REVERSAL=mount -o remount,rw / ; cp -a /etc/fstab.mountrecover.bak /etc/fstab ; systemctl daemon-reload ; reboot
+EOF
+
+if ((validation_exit != 0)); then
+    exit "$validation_exit"
+fi

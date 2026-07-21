@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+
+set -u
+set -o pipefail
+
+usage() {
+    printf 'usage: runbook-smoke --today YYYY-MM-DD RUNBOOK...\n' >&2
+}
+
+safe_relative_path() {
+    local path=$1
+    [[ -n "$path" && "$path" != '-' && "$path" != /* && "/$path/" != *'/../'* && "$path" != '..' ]]
+}
+
+if [[ ${1:-} != '--today' || -z ${2:-} ]]; then
+    usage
+    exit 64
+fi
+
+today=$2
+shift 2
+
+if [[ ! $today =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ || $# -eq 0 ]]; then
+    usage
+    exit 64
+fi
+
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/runbook-smoke.XXXXXX") || exit 70
+cleanup_scratch() {
+    rm -rf -- "$scratch"
+}
+trap cleanup_scratch EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+passed=0
+stale=0
+missing=0
+failed=0
+skipped=0
+step_number=0
+
+for runbook in "$@"; do
+    if [[ ! -r $runbook ]]; then
+        printf 'FAIL %s unreadable-runbook\n' "$runbook"
+        ((failed += 1))
+        continue
+    fi
+
+    runbook_dir=$(cd -- "$(dirname -- "$runbook")" && pwd -P)
+    runbook_file=${runbook##*/}
+    runbook_name=${runbook_file%.runbook}
+    line_number=0
+
+    while IFS= read -r line || [[ -n $line ]]; do
+        ((line_number += 1))
+        [[ -z $line || $line == \#* ]] && continue
+
+        record=''
+        step_id=''
+        safety=''
+        fixture=''
+        command=''
+        expected=''
+        prerequisites=''
+        review_by=''
+        cleanup=''
+        extra=''
+        IFS='|' read -r record step_id safety fixture command expected prerequisites review_by cleanup extra <<< "$line"
+
+        if [[ $record != 'step' || -z $step_id || -z $safety || -z $fixture || -z $command || -z $expected || -z $prerequisites || -z $review_by || -z $cleanup || -n $extra ]]; then
+            printf 'FAIL %s line=%d malformed\n' "$runbook_name" "$line_number"
+            ((failed += 1))
+            continue
+        fi
+
+        if [[ ! $review_by =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            printf 'FAIL %s:%s invalid-review-date=%s\n' "$runbook_name" "$step_id" "$review_by"
+            ((failed += 1))
+            continue
+        fi
+
+        # ISO dates are fixed-width, so lexical order is chronological order.
+        if [[ "$today" < "$review_by" ]]; then
+            printf 'STALE %s:%s review-by=%s\n' "$runbook_name" "$step_id" "$review_by"
+            ((stale += 1))
+        fi
+
+        if [[ $safety != 'safe' ]]; then
+            printf 'SKIP %s:%s safety=%s\n' "$runbook_name" "$step_id" "$safety"
+            ((skipped += 1))
+            continue
+        fi
+
+        if [[ $fixture == /* || ! -d "$runbook_dir/$fixture" ]]; then
+            printf 'MISSING %s:%s prerequisite=fixture:%s\n' "$runbook_name" "$step_id" "$fixture"
+            ((missing += 1))
+            continue
+        fi
+
+        ((step_number += 1))
+        step_root="$scratch/step-$step_number"
+        work="$step_root/work"
+        mkdir -p -- "$work"
+        if ! cp -R -- "$runbook_dir/$fixture/." "$work/"; then
+            printf 'FAIL %s:%s fixture-copy\n' "$runbook_name" "$step_id"
+            ((failed += 1))
+            continue
+        fi
+
+        invalid_path=''
+        for path in "$command" "$expected"; do
+            if ! safe_relative_path "$path"; then
+                invalid_path=$path
+                break
+            fi
+        done
+        if [[ -n $invalid_path ]]; then
+            printf 'FAIL %s:%s unsafe-path=%s\n' "$runbook_name" "$step_id" "$invalid_path"
+            ((failed += 1))
+            continue
+        fi
+
+        step_missing=0
+        if [[ ! -f "$work/$command" ]]; then
+            printf 'MISSING %s:%s prerequisite=%s\n' "$runbook_name" "$step_id" "$command"
+            ((missing += 1))
+            step_missing=1
+        fi
+        if [[ ! -f "$work/$expected" ]]; then
+            printf 'MISSING %s:%s prerequisite=%s\n' "$runbook_name" "$step_id" "$expected"
+            ((missing += 1))
+            step_missing=1
+        fi
+
+        if [[ $prerequisites != '-' ]]; then
+            IFS=',' read -r -a required_paths <<< "$prerequisites"
+            for path in "${required_paths[@]}"; do
+                if ! safe_relative_path "$path"; then
+                    printf 'FAIL %s:%s unsafe-path=%s\n' "$runbook_name" "$step_id" "$path"
+                    ((failed += 1))
+                    step_missing=1
+                elif [[ ! -e "$work/$path" ]]; then
+                    printf 'MISSING %s:%s prerequisite=%s\n' "$runbook_name" "$step_id" "$path"
+                    ((missing += 1))
+                    step_missing=1
+                fi
+            done
+        fi
+        ((step_missing != 0)) && continue
+
+        actual="$step_root/stdout"
+        errors="$step_root/stderr"
+        (cd -- "$work" && bash "./$command") >"$actual" 2>"$errors"
+        command_status=$?
+        step_failed=0
+
+        if ((command_status != 0)); then
+            printf 'FAIL %s:%s exit=%d\n' "$runbook_name" "$step_id" "$command_status"
+            step_failed=1
+        elif [[ -s $errors ]]; then
+            printf 'FAIL %s:%s unexpected-stderr\n' "$runbook_name" "$step_id"
+            step_failed=1
+        elif ! cmp -s -- "$work/$expected" "$actual"; then
+            printf 'FAIL %s:%s output\n' "$runbook_name" "$step_id"
+            step_failed=1
+        fi
+
+        if [[ $cleanup != '-' ]]; then
+            IFS=',' read -r -a cleanup_paths <<< "$cleanup"
+            for path in "${cleanup_paths[@]}"; do
+                if ! safe_relative_path "$path"; then
+                    printf 'FAIL %s:%s unsafe-path=%s\n' "$runbook_name" "$step_id" "$path"
+                    step_failed=1
+                elif [[ -e "$work/$path" ]]; then
+                    printf 'FAIL %s:%s cleanup=%s\n' "$runbook_name" "$step_id" "$path"
+                    step_failed=1
+                fi
+            done
+        fi
+
+        if ((step_failed == 0)); then
+            printf 'PASS %s:%s\n' "$runbook_name" "$step_id"
+            ((passed += 1))
+        else
+            ((failed += 1))
+        fi
+    done < "$runbook"
+done
+
+printf 'SUMMARY pass=%d stale=%d missing=%d failed=%d skipped=%d\n' \
+    "$passed" "$stale" "$missing" "$failed" "$skipped"
+
+if ((stale != 0 || missing != 0 || failed != 0)); then
+    exit 1
+fi
+exit 0

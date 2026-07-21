@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""Local subscription service-desk command line client."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import secrets
+import sqlite3
+import sys
+import time
+from typing import Any, Callable
+
+
+ROOT = Path(__file__).resolve().parent
+DATABASE = ROOT / "subscriptions.db"
+AUDIT = ROOT / ".subscription-audit.jsonl"
+
+
+def append_event(event: dict[str, Any]) -> None:
+    payload = json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    with AUDIT.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(payload + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def connection(*, writable: bool = False) -> sqlite3.Connection:
+    if writable:
+        db = sqlite3.connect(DATABASE, timeout=5)
+    else:
+        db = sqlite3.connect(f"file:{DATABASE}?mode=ro", uri=True, timeout=5)
+    db.row_factory = sqlite3.Row
+    return db
+
+
+def run_operation(
+    operation: str,
+    arguments: dict[str, Any],
+    handler: Callable[[], tuple[dict[str, Any], Any]],
+    *,
+    delay: float = 0.30,
+) -> int:
+    operation_id = secrets.token_hex(12)
+    pid = os.getpid()
+    append_event({
+        "at_ns": time.monotonic_ns(),
+        "op": operation,
+        "op_id": operation_id,
+        "phase": "start",
+        "pid": pid,
+        **arguments,
+    })
+    time.sleep(delay)
+    try:
+        audit_result, output = handler()
+    except Exception as error:
+        append_event({
+            "at_ns": time.monotonic_ns(),
+            "error": type(error).__name__,
+            "op": operation,
+            "op_id": operation_id,
+            "phase": "end",
+            "pid": pid,
+        })
+        raise
+    append_event({
+        "at_ns": time.monotonic_ns(),
+        "op": operation,
+        "op_id": operation_id,
+        "phase": "end",
+        "pid": pid,
+        **audit_result,
+    })
+    print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+    if operation == "get" and not audit_result.get("found"):
+        return 3
+    return 0
+
+
+def search(args: argparse.Namespace) -> int:
+    def handler() -> tuple[dict[str, Any], Any]:
+        with connection() as db:
+            rows = db.execute(
+                "SELECT stable_id, name, location FROM subscriptions "
+                "WHERE name = ? AND location = ? ORDER BY stable_id",
+                (args.name, args.location),
+            ).fetchall()
+        results = [dict(row) for row in rows]
+        return {"count": len(results), "ids": [row["stable_id"] for row in results]}, {
+            "count": len(results),
+            "results": results,
+        }
+
+    return run_operation(
+        "search",
+        {"location": args.location, "name": args.name},
+        handler,
+        delay=0.36,
+    )
+
+
+def get_record(args: argparse.Namespace) -> int:
+    def handler() -> tuple[dict[str, Any], Any]:
+        with connection() as db:
+            row = db.execute(
+                "SELECT stable_id, name, location, status, plan_tier, renewed_on "
+                "FROM subscriptions WHERE stable_id = ?",
+                (args.stable_id,),
+            ).fetchone()
+        record = dict(row) if row else None
+        audit = {"found": row is not None, "stable_id": args.stable_id}
+        if record is not None:
+            audit["status"] = record["status"]
+        return audit, {"record": record}
+
+    return run_operation(
+        "get",
+        {"stable_id": args.stable_id},
+        handler,
+        delay=0.31,
+    )
+
+
+def list_records(_: argparse.Namespace) -> int:
+    def handler() -> tuple[dict[str, Any], Any]:
+        with connection() as db:
+            rows = db.execute(
+                "SELECT stable_id, name, location, status FROM subscriptions ORDER BY stable_id"
+            ).fetchall()
+        records = [dict(row) for row in rows]
+        return {"count": len(records)}, {"records": records}
+
+    return run_operation("list", {}, handler)
+
+
+def read_preferences(_: argparse.Namespace) -> int:
+    def handler() -> tuple[dict[str, Any], Any]:
+        with connection() as db:
+            rows = db.execute("SELECT key, value FROM preferences ORDER BY key").fetchall()
+        values = {row["key"]: row["value"] for row in rows}
+        return {"count": len(values)}, {"preferences": values}
+
+    return run_operation("preferences", {}, handler)
+
+
+def availability(args: argparse.Namespace) -> int:
+    def handler() -> tuple[dict[str, Any], Any]:
+        with connection() as db:
+            row = db.execute(
+                "SELECT status FROM subscriptions WHERE stable_id = ?", (args.stable_id,)
+            ).fetchone()
+        available = bool(row and row["status"] == "active")
+        return {"stable_id": args.stable_id}, {"available": available}
+
+    return run_operation("availability", {"stable_id": args.stable_id}, handler)
+
+
+def create_record(args: argparse.Namespace) -> int:
+    def handler() -> tuple[dict[str, Any], Any]:
+        stable_id = "sub_" + secrets.token_hex(4)
+        with connection(writable=True) as db:
+            db.execute(
+                "INSERT INTO subscriptions "
+                "(stable_id, name, location, status, plan_tier, renewed_on) "
+                "VALUES (?, ?, ?, ?, 'standard', '1970-01-01')",
+                (stable_id, args.name, args.location, args.status),
+            )
+            db.commit()
+        return {"stable_id": stable_id}, {"stable_id": stable_id}
+
+    return run_operation(
+        "create",
+        {"location": args.location, "name": args.name, "status": args.status},
+        handler,
+    )
+
+
+def update_record(args: argparse.Namespace) -> int:
+    def handler() -> tuple[dict[str, Any], Any]:
+        with connection(writable=True) as db:
+            cursor = db.execute(
+                "UPDATE subscriptions SET status = ? WHERE stable_id = ?",
+                (args.status, args.stable_id),
+            )
+            db.commit()
+        return {"changed": cursor.rowcount, "stable_id": args.stable_id}, {
+            "changed": cursor.rowcount
+        }
+
+    return run_operation(
+        "update", {"stable_id": args.stable_id, "status": args.status}, handler
+    )
+
+
+def cancel_record(args: argparse.Namespace) -> int:
+    args.status = "cancelled"
+    return update_record_with_name(args, "cancel")
+
+
+def update_record_with_name(args: argparse.Namespace, operation: str) -> int:
+    def handler() -> tuple[dict[str, Any], Any]:
+        with connection(writable=True) as db:
+            cursor = db.execute(
+                "UPDATE subscriptions SET status = ? WHERE stable_id = ?",
+                (args.status, args.stable_id),
+            )
+            db.commit()
+        return {"changed": cursor.rowcount, "stable_id": args.stable_id}, {
+            "changed": cursor.rowcount
+        }
+
+    return run_operation(operation, {"stable_id": args.stable_id}, handler)
+
+
+def notify(args: argparse.Namespace) -> int:
+    def handler() -> tuple[dict[str, Any], Any]:
+        with connection(writable=True) as db:
+            db.execute(
+                "INSERT INTO notifications (stable_id, message) VALUES (?, ?)",
+                (args.stable_id, args.message),
+            )
+            db.commit()
+        return {"stable_id": args.stable_id}, {"sent": True}
+
+    return run_operation("notify", {"stable_id": args.stable_id}, handler)
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        prog="subscription-desk",
+        description="Query and administer the sandboxed subscription desk.",
+    )
+    commands = root.add_subparsers(dest="command", required=True)
+
+    search_parser = commands.add_parser("search", help="find exact name/location matches")
+    search_parser.add_argument("--name", required=True)
+    search_parser.add_argument("--location", required=True)
+    search_parser.set_defaults(function=search)
+
+    get_parser = commands.add_parser("get", help="retrieve one full record by stable ID")
+    get_parser.add_argument("stable_id")
+    get_parser.set_defaults(function=get_record)
+
+    list_parser = commands.add_parser("list", help="list the subscription collection")
+    list_parser.set_defaults(function=list_records)
+
+    preferences_parser = commands.add_parser("preferences", help="read saved preferences")
+    preferences_parser.set_defaults(function=read_preferences)
+
+    availability_parser = commands.add_parser("availability", help="check service availability")
+    availability_parser.add_argument("stable_id")
+    availability_parser.set_defaults(function=availability)
+
+    create_parser = commands.add_parser("create", help="create a subscription")
+    create_parser.add_argument("--name", required=True)
+    create_parser.add_argument("--location", required=True)
+    create_parser.add_argument("--status", default="active")
+    create_parser.set_defaults(function=create_record)
+
+    update_parser = commands.add_parser("update", help="update subscription status")
+    update_parser.add_argument("stable_id")
+    update_parser.add_argument("--status", required=True)
+    update_parser.set_defaults(function=update_record)
+
+    cancel_parser = commands.add_parser("cancel", help="cancel a subscription")
+    cancel_parser.add_argument("stable_id")
+    cancel_parser.set_defaults(function=cancel_record)
+
+    notify_parser = commands.add_parser("notify", help="send an account notification")
+    notify_parser.add_argument("stable_id")
+    notify_parser.add_argument("message")
+    notify_parser.set_defaults(function=notify)
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    return int(args.function(args))
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (sqlite3.Error, OSError) as error:
+        print(f"subscription-desk: {error}", file=sys.stderr)
+        raise SystemExit(2)

@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed facilities registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator
+
+
+ROOT = Path(__file__).resolve().parent
+PRIVATE = ROOT / ".harness"
+RECORDS = PRIVATE / "records.json"
+AUDIT = PRIVATE / "audit.json"
+NOTIFICATIONS = PRIVATE / "notifications.json"
+LOCK = PRIVATE / "lock"
+PAIR_WAIT_SECONDS = 8.0
+
+
+class RegistryError(RuntimeError):
+    pass
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RegistryError(f"cannot read registry component {path.name}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise RegistryError(f"registry component {path.name} is malformed")
+    return value
+
+
+def write_json(path: Path, value: dict[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    os.replace(temporary, path)
+
+
+@contextmanager
+def locked() -> Iterator[None]:
+    with LOCK.open("r+", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def records() -> list[dict[str, str]]:
+    value = read_json(RECORDS).get("records")
+    if not isinstance(value, list) or not all(isinstance(row, dict) for row in value):
+        raise RegistryError("records registry is malformed")
+    return value
+
+
+def operations() -> list[dict[str, Any]]:
+    value = read_json(AUDIT).get("operations")
+    if not isinstance(value, list):
+        raise RegistryError("operation history is malformed")
+    return value
+
+
+def replace_operations(value: list[dict[str, Any]]) -> None:
+    write_json(AUDIT, {"version": 1, "operations": value})
+
+
+def next_batch(log: list[dict[str, Any]], operation: str) -> str:
+    prefix = operation + "-"
+    numbers: list[int] = []
+    for row in log:
+        batch = row.get("batch")
+        if isinstance(batch, str) and batch.startswith(prefix):
+            try:
+                numbers.append(int(batch.removeprefix(prefix)))
+            except ValueError:
+                pass
+    return f"{operation}-{max(numbers, default=0) + 1}"
+
+
+def begin_pair(operation: str, details: dict[str, Any]) -> tuple[int, str]:
+    with locked():
+        log = operations()
+        open_batches: list[str] = []
+        for row in log:
+            if row.get("operation") != operation or row.get("outcome") != "pending":
+                continue
+            batch = row.get("batch")
+            if isinstance(batch, str):
+                participants = sum(1 for item in log if item.get("batch") == batch)
+                if participants < 2:
+                    open_batches.append(batch)
+        batch = open_batches[0] if open_batches else next_batch(log, operation)
+        sequence = len(log) + 1
+        log.append(
+            {
+                "sequence": sequence,
+                "operation": operation,
+                "batch": batch,
+                **details,
+                "started_ns": time.time_ns(),
+                "outcome": "pending",
+            }
+        )
+        replace_operations(log)
+    return sequence, batch
+
+
+def finish_pair(sequence: int, batch: str, result: dict[str, Any]) -> None:
+    deadline = time.monotonic() + PAIR_WAIT_SECONDS
+    while True:
+        with locked():
+            log = operations()
+            peers = [row for row in log if row.get("batch") == batch]
+            current = next(row for row in log if row.get("sequence") == sequence)
+            if len(peers) == 2:
+                current.update(result)
+                current["finished_ns"] = time.time_ns()
+                current["outcome"] = "ok"
+                replace_operations(log)
+                return
+            if len(peers) > 2:
+                current["finished_ns"] = time.time_ns()
+                current["outcome"] = "too-many-parallel-peers"
+                replace_operations(log)
+                raise RegistryError(f"{batch} received more than two operations")
+            if time.monotonic() >= deadline:
+                current["finished_ns"] = time.time_ns()
+                current["outcome"] = "parallel-peer-timeout"
+                replace_operations(log)
+                raise RegistryError(
+                    f"{batch} requires two commands to be running concurrently"
+                )
+        time.sleep(0.025)
+
+
+def completed_stage(operation: str) -> list[dict[str, Any]]:
+    return [
+        row
+        for row in operations()
+        if row.get("operation") == operation and row.get("outcome") == "ok"
+    ]
+
+
+def command_search(args: argparse.Namespace) -> None:
+    sequence, batch = begin_pair(
+        "search", {"name": args.name, "location": args.location}
+    )
+    matches = [
+        {"id": row["id"], "name": row["name"], "location": row["location"]}
+        for row in records()
+        if row.get("name") == args.name and row.get("location") == args.location
+    ]
+    finish_pair(sequence, batch, {"result_ids": [row["id"] for row in matches]})
+    print(json.dumps({"matches": matches}, ensure_ascii=False, sort_keys=True))
+
+
+def command_get(args: argparse.Namespace) -> None:
+    with locked():
+        searches = completed_stage("search")
+        if len(searches) != 2:
+            raise RegistryError("both searches must complete before any retrieval")
+        if not any(args.record_id in row.get("result_ids", []) for row in searches):
+            raise RegistryError(f"record {args.record_id} was not returned by a search")
+    matching = [row for row in records() if row.get("id") == args.record_id]
+    if len(matching) != 1:
+        raise RegistryError(f"record {args.record_id} was not found")
+    snapshot = dict(matching[0])
+    sequence, batch = begin_pair("get", {"record_id": args.record_id})
+    finish_pair(sequence, batch, {"record": snapshot})
+    print(json.dumps(snapshot, ensure_ascii=False, sort_keys=True))
+
+
+def command_update(args: argparse.Namespace) -> None:
+    with locked():
+        gets = completed_stage("get")
+        if len(gets) != 2:
+            raise RegistryError("both retrievals must complete before an update")
+        snapshots = [
+            row.get("record")
+            for row in gets
+            if row.get("record_id") == args.record_id
+        ]
+        if len(snapshots) != 1:
+            raise RegistryError(f"record {args.record_id} was not retrieved")
+        data = read_json(RECORDS)
+        registry_records = data.get("records")
+        matching = [row for row in registry_records if row.get("id") == args.record_id]
+        if len(matching) != 1:
+            raise RegistryError(f"record {args.record_id} was not found")
+        row = matching[0]
+        previous = row.get("status")
+        started = time.time_ns()
+        row["status"] = args.status
+        write_json(RECORDS, data)
+        log = operations()
+        log.append(
+            {
+                "sequence": len(log) + 1,
+                "operation": "update",
+                "record_id": args.record_id,
+                "previous_status": previous,
+                "new_status": args.status,
+                "started_ns": started,
+                "finished_ns": time.time_ns(),
+                "outcome": "ok",
+            }
+        )
+        replace_operations(log)
+    print(json.dumps(dict(row), ensure_ascii=False, sort_keys=True))
+
+
+def command_cancel(args: argparse.Namespace) -> None:
+    with locked():
+        data = read_json(RECORDS)
+        registry_records = data.get("records")
+        matching = [row for row in registry_records if row.get("id") == args.record_id]
+        if len(matching) != 1:
+            raise RegistryError(f"record {args.record_id} was not found")
+        row = matching[0]
+        previous = row.get("status")
+        row["status"] = "cancelled"
+        write_json(RECORDS, data)
+        log = operations()
+        log.append(
+            {
+                "sequence": len(log) + 1,
+                "operation": "cancel",
+                "record_id": args.record_id,
+                "previous_status": previous,
+                "reason": args.reason,
+                "outcome": "ok",
+            }
+        )
+        replace_operations(log)
+    print(json.dumps(dict(row), ensure_ascii=False, sort_keys=True))
+
+
+def command_notify(args: argparse.Namespace) -> None:
+    with locked():
+        data = read_json(NOTIFICATIONS)
+        notices = data.get("notifications")
+        if not isinstance(notices, list):
+            raise RegistryError("notification history is malformed")
+        notices.append({"record_id": args.record_id, "message": args.message})
+        write_json(NOTIFICATIONS, data)
+        log = operations()
+        log.append(
+            {
+                "sequence": len(log) + 1,
+                "operation": "notify",
+                "record_id": args.record_id,
+                "outcome": "ok",
+            }
+        )
+        replace_operations(log)
+    print(json.dumps({"sent": True}, sort_keys=True))
+
+
+def make_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="facilityctl",
+        description="Search, retrieve, and maintain the local facilities registry.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    search = commands.add_parser("search", help="search by exact name and location")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+    search.set_defaults(handler=command_search)
+
+    get = commands.add_parser("get", help="retrieve a record returned by search")
+    get.add_argument("record_id")
+    get.set_defaults(handler=command_get)
+
+    update = commands.add_parser("update", help="change one retrieved record's status")
+    update.add_argument("record_id")
+    update.add_argument("--status", required=True)
+    update.set_defaults(handler=command_update)
+
+    cancel = commands.add_parser("cancel", help="cancel one facilities record")
+    cancel.add_argument("record_id")
+    cancel.add_argument("--reason", required=True)
+    cancel.set_defaults(handler=command_cancel)
+
+    notify = commands.add_parser("notify", help="send a facilities notification")
+    notify.add_argument("record_id")
+    notify.add_argument("--message", required=True)
+    notify.set_defaults(handler=command_notify)
+    return parser
+
+
+def main() -> int:
+    args = make_parser().parse_args()
+    try:
+        args.handler(args)
+    except RegistryError as exc:
+        print(f"facilityctl: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

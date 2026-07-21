@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export LC_ALL=C
+
+usage() {
+    printf 'usage: %s diagnose SCENARIO\n' "${0##*/}" >&2
+    printf '       %s remediate SCENARIO AUDIT.tsv\n' "${0##*/}" >&2
+    exit 64
+}
+
+die() {
+    printf 'diskpressure: %s\n' "$*" >&2
+    exit 65
+}
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+fixture=$script_dir/diskfixture
+[[ -f "$fixture" ]] || die 'diskfixture is unavailable'
+
+run_fixture() {
+    bash "$fixture" "$scenario" "$@"
+}
+
+load_metrics() {
+    local header block_percent inode_percent
+    {
+    IFS= read -r header
+    read -r block_filesystem blocks_total blocks_used blocks_available block_percent mountpoint
+    [[ "$header" == 'Filesystem 1K-blocks Used Available Use% Mounted_on' ]] || die 'unexpected block header'
+    [[ "$block_filesystem" == fixturefs && "$block_percent" == *% ]] || die 'malformed block fixture output'
+    blocks_percent=${block_percent%%%}
+    [[ "$blocks_total" =~ ^[0-9]+$ && "$blocks_used" =~ ^[0-9]+$ &&
+       "$blocks_available" =~ ^[0-9]+$ && "$blocks_percent" =~ ^[0-9]+$ ]] || die 'malformed block metrics'
+    } < <(run_fixture blocks)
+
+    {
+    IFS= read -r header
+    read -r inode_filesystem inodes_total inodes_used inodes_free inode_percent inode_mountpoint
+    [[ "$header" == 'Filesystem Inodes IUsed IFree IUse% Mounted_on' ]] || die 'unexpected inode header'
+    [[ "$inode_filesystem" == fixturefs && "$inode_percent" == *% ]] || die 'malformed inode fixture output'
+    inodes_percent=${inode_percent%%%}
+    [[ "$inodes_total" =~ ^[0-9]+$ && "$inodes_used" =~ ^[0-9]+$ &&
+       "$inodes_free" =~ ^[0-9]+$ && "$inodes_percent" =~ ^[0-9]+$ ]] || die 'malformed inode metrics'
+    } < <(run_fixture inodes)
+
+    [[ "$mountpoint" == "$inode_mountpoint" ]] || die 'block and inode mounts differ'
+
+    if (( blocks_percent >= 90 && inodes_percent >= 90 )); then
+        pressure=blocks+inodes
+    elif (( blocks_percent >= 90 )); then
+        pressure=blocks
+    elif (( inodes_percent >= 90 )); then
+        pressure=inodes
+    else
+        pressure=healthy
+    fi
+}
+
+inspect_evidence() {
+    local bytes path extra line
+    largest_bytes=-1
+    largest_path=
+    while IFS=$'\t' read -r bytes path extra || [[ -n "${bytes:-}${path:-}${extra:-}" ]]; do
+        [[ -z "${bytes:-}" || "${bytes:0:1}" == '#' ]] && continue
+        [[ -z "${extra:-}" && "$bytes" =~ ^[0-9]+$ && "$path" == /* ]] || die 'malformed du fixture output'
+        if (( bytes > largest_bytes )); then
+            largest_bytes=$bytes
+            largest_path=$path
+        fi
+    done < <(run_fixture du)
+    (( largest_bytes >= 0 )) || die 'empty du fixture output'
+
+    log_enospc_events=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == *'No space left on device'* ]]; then
+            log_enospc_events=$((log_enospc_events + 1))
+        fi
+    done < <(run_fixture logs)
+}
+
+emit_diagnosis() {
+    printf 'mount=%s\n' "$mountpoint"
+    printf 'pressure=%s\n' "$pressure"
+    printf 'blocks_total=%s\n' "$blocks_total"
+    printf 'blocks_used=%s\n' "$blocks_used"
+    printf 'blocks_available=%s\n' "$blocks_available"
+    printf 'blocks_percent=%s\n' "$blocks_percent"
+    printf 'inodes_total=%s\n' "$inodes_total"
+    printf 'inodes_used=%s\n' "$inodes_used"
+    printf 'inodes_free=%s\n' "$inodes_free"
+    printf 'inodes_percent=%s\n' "$inodes_percent"
+    printf 'largest_path=%s\n' "$largest_path"
+    printf 'largest_bytes=%s\n' "$largest_bytes"
+    printf 'log_enospc_events=%s\n' "$log_enospc_events"
+}
+
+is_approved() {
+    local candidate=$1 root extra
+    while IFS=$'\t' read -r root extra || [[ -n "${root:-}${extra:-}" ]]; do
+        [[ -z "${root:-}" || "${root:0:1}" == '#' ]] && continue
+        [[ -z "${extra:-}" && "$root" == /* ]] || die 'malformed approved cache root'
+        if [[ "$candidate" == "$root"* ]]; then
+            return 0
+        fi
+    done < <(run_fixture approved)
+    return 1
+}
+
+diagnose() {
+    load_metrics
+    inspect_evidence
+    emit_diagnosis
+}
+
+remediate() {
+    local audit=$1 audit_dir candidate extra record removed
+    local path bytes blocks inodes
+    local before_blocks_used before_blocks_available before_inodes_used
+    local reclaimed_bytes=0 expected_blocks=0 expected_inodes=0 deleted=0 skipped=0
+    local observed_blocks observed_available observed_inodes
+
+    load_metrics
+    inspect_evidence
+    [[ "$pressure" == blocks ]] || {
+        printf 'diskpressure: refusing cleanup for pressure=%s\n' "$pressure" >&2
+        return 3
+    }
+    before_blocks_used=$blocks_used
+    before_blocks_available=$blocks_available
+    before_inodes_used=$inodes_used
+
+    audit_dir=$(dirname -- "$audit")
+    [[ -d "$audit_dir" ]] || die "audit directory does not exist: $audit_dir"
+    : > "$audit"
+    printf 'path\tbytes\n' >> "$audit"
+
+    while IFS=$'\t' read -r candidate extra || [[ -n "${candidate:-}${extra:-}" ]]; do
+        [[ -z "${candidate:-}" || "${candidate:0:1}" == '#' ]] && continue
+        [[ -z "${extra:-}" && "$candidate" == /* ]] || die 'malformed cleanup candidate'
+        if ! is_approved "$candidate"; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        record=$(run_fixture stat "$candidate")
+        IFS=$'\t' read -r path bytes blocks inodes extra <<< "$record"
+        [[ -z "${extra:-}" && "$path" == "$candidate" && "$bytes" =~ ^[0-9]+$ &&
+           "$blocks" =~ ^[0-9]+$ && "$inodes" =~ ^[0-9]+$ ]] || die 'malformed candidate metadata'
+        removed=$(run_fixture remove "$candidate")
+        [[ "$removed" == "$record" ]] || die "removed metadata changed for $candidate"
+        printf '%s\t%s\n' "$path" "$bytes" >> "$audit"
+        reclaimed_bytes=$((reclaimed_bytes + bytes))
+        expected_blocks=$((expected_blocks + blocks))
+        expected_inodes=$((expected_inodes + inodes))
+        deleted=$((deleted + 1))
+    done < <(run_fixture candidates)
+
+    load_metrics
+    observed_blocks=$((before_blocks_used - blocks_used))
+    observed_available=$((blocks_available - before_blocks_available))
+    observed_inodes=$((before_inodes_used - inodes_used))
+    (( observed_blocks == expected_blocks )) || die "block verification failed: expected $expected_blocks, observed $observed_blocks"
+    (( observed_available == expected_blocks )) || die "capacity verification failed: expected $expected_blocks, observed $observed_available"
+    (( observed_inodes == expected_inodes )) || die "inode verification failed: expected $expected_inodes, observed $observed_inodes"
+    (( deleted == 0 || blocks_available > before_blocks_available )) || die 'cleanup reclaimed no capacity'
+
+    inspect_evidence
+    emit_diagnosis
+    printf 'deleted_paths=%s\n' "$deleted"
+    printf 'skipped_paths=%s\n' "$skipped"
+    printf 'reclaimed_bytes=%s\n' "$reclaimed_bytes"
+    printf 'reclaimed_blocks=%s\n' "$observed_blocks"
+    printf 'reclaimed_inodes=%s\n' "$observed_inodes"
+    printf 'audit=%s\n' "$audit"
+}
+
+(( $# >= 2 )) || usage
+command=$1
+scenario=$2
+shift 2
+[[ -d "$scenario" ]] || die "scenario does not exist: $scenario"
+
+case "$command" in
+    diagnose)
+        (( $# == 0 )) || usage
+        diagnose
+        ;;
+    remediate)
+        (( $# == 1 )) || usage
+        remediate "$1"
+        ;;
+    *) usage ;;
+esac

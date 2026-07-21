@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""Permit Desk command-line client for the sandboxed permit queue."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import time
+import uuid
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+DATA_DB = ROOT / "data" / "permit_queue.sqlite3"
+RUNTIME_DIR = ROOT / ".permit_runtime"
+AUDIT_DB = RUNTIME_DIR / "execution.sqlite3"
+
+
+def compact_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def audit_connection() -> sqlite3.Connection:
+    RUNTIME_DIR.mkdir(exist_ok=True)
+    connection = sqlite3.connect(AUDIT_DB, timeout=10)
+    connection.execute("PRAGMA busy_timeout = 10000")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS invocations (
+            invocation_id TEXT PRIMARY KEY,
+            pid INTEGER NOT NULL,
+            operation TEXT NOT NULL,
+            request_json TEXT NOT NULL,
+            started_ns INTEGER NOT NULL,
+            finished_ns INTEGER,
+            exit_code INTEGER,
+            result_json TEXT
+        )
+        """
+    )
+    connection.commit()
+    return connection
+
+
+def begin_audit(operation: str, request: dict[str, object]) -> str:
+    invocation_id = uuid.uuid4().hex
+    with audit_connection() as connection:
+        connection.execute(
+            "INSERT INTO invocations VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL)",
+            (invocation_id, os.getpid(), operation, compact_json(request), time.time_ns()),
+        )
+    return invocation_id
+
+
+def finish_audit(invocation_id: str, exit_code: int, result: object) -> None:
+    with audit_connection() as connection:
+        connection.execute(
+            """
+            UPDATE invocations
+               SET finished_ns = ?, exit_code = ?, result_json = ?
+             WHERE invocation_id = ?
+            """,
+            (time.time_ns(), exit_code, compact_json(result), invocation_id),
+        )
+
+
+def data_connection(*, writable: bool = False) -> sqlite3.Connection:
+    if writable:
+        connection = sqlite3.connect(DATA_DB, timeout=10)
+    else:
+        connection = sqlite3.connect(f"file:{DATA_DB}?mode=ro", uri=True, timeout=10)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def record_dict(row: sqlite3.Row) -> dict[str, object]:
+    return {
+        "stable_id": row["stable_id"],
+        "name": row["name"],
+        "location": row["location"],
+        "submitted_date": row["submitted_date"],
+        "status": row["status"],
+    }
+
+
+def emit(value: object) -> None:
+    print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def perform_search(args: argparse.Namespace) -> tuple[int, object]:
+    # A small service latency makes genuinely concurrent calls observable.
+    time.sleep(0.30)
+    with data_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT stable_id, name, location
+              FROM applications
+             WHERE name = ? AND location = ? AND cancelled = 0
+             ORDER BY stable_id
+            """,
+            (args.name, args.location),
+        ).fetchall()
+    matches = [dict(row) for row in rows]
+    return 0, {"matches": matches}
+
+
+def perform_get(args: argparse.Namespace) -> tuple[int, object]:
+    time.sleep(0.30)
+    with data_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT stable_id, name, location, submitted_date, status
+              FROM applications
+             WHERE stable_id = ? AND cancelled = 0
+            """,
+            (args.stable_id,),
+        ).fetchone()
+    if row is None:
+        return 4, {"error": "application not found"}
+    return 0, {"application": record_dict(row)}
+
+
+def perform_list(_args: argparse.Namespace) -> tuple[int, object]:
+    with data_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT stable_id, name, location, submitted_date, status
+              FROM applications
+             WHERE cancelled = 0
+             ORDER BY submitted_date, stable_id
+            """
+        ).fetchall()
+    return 0, {"applications": [record_dict(row) for row in rows]}
+
+
+def perform_preferences(_args: argparse.Namespace) -> tuple[int, object]:
+    with data_connection() as connection:
+        rows = connection.execute(
+            "SELECT preference_key, preference_value FROM saved_preferences ORDER BY preference_key"
+        ).fetchall()
+    return 0, {"preferences": {row[0]: row[1] for row in rows}}
+
+
+def perform_availability(_args: argparse.Namespace) -> tuple[int, object]:
+    return 0, {"service": "permit-queue", "available": True}
+
+
+def perform_create(args: argparse.Namespace) -> tuple[int, object]:
+    stable_id = "APL-" + uuid.uuid4().hex[:8].upper()
+    with data_connection(writable=True) as connection:
+        connection.execute(
+            """
+            INSERT INTO applications
+                (stable_id, name, location, submitted_date, status, cancelled)
+            VALUES (?, ?, ?, ?, ?, 0)
+            """,
+            (stable_id, args.name, args.location, args.submitted_date, args.status),
+        )
+        connection.commit()
+    return 0, {"stable_id": stable_id, "created": True}
+
+
+def perform_update(args: argparse.Namespace) -> tuple[int, object]:
+    with data_connection(writable=True) as connection:
+        cursor = connection.execute(
+            "UPDATE applications SET status = ? WHERE stable_id = ?",
+            (args.status, args.stable_id),
+        )
+        connection.commit()
+    if cursor.rowcount != 1:
+        return 4, {"error": "application not found"}
+    return 0, {"stable_id": args.stable_id, "updated": True}
+
+
+def perform_cancel(args: argparse.Namespace) -> tuple[int, object]:
+    with data_connection(writable=True) as connection:
+        cursor = connection.execute(
+            "UPDATE applications SET cancelled = 1 WHERE stable_id = ?",
+            (args.stable_id,),
+        )
+        connection.commit()
+    if cursor.rowcount != 1:
+        return 4, {"error": "application not found"}
+    return 0, {"stable_id": args.stable_id, "cancelled": True}
+
+
+def perform_notify(args: argparse.Namespace) -> tuple[int, object]:
+    with data_connection(writable=True) as connection:
+        connection.execute(
+            "INSERT INTO notifications (stable_id, message) VALUES (?, ?)",
+            (args.stable_id, args.message),
+        )
+        connection.commit()
+    return 0, {"stable_id": args.stable_id, "notified": True}
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        prog="permitctl",
+        description="Query and manage the local Permit Desk queue.",
+    )
+    commands = root.add_subparsers(dest="operation", required=True)
+
+    search = commands.add_parser("search", help="find applications by exact name and location")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+
+    get = commands.add_parser("get", help="retrieve one application by stable ID")
+    get.add_argument("stable_id")
+
+    commands.add_parser("list", help="list the application collection")
+    commands.add_parser("preferences", help="read saved display preferences")
+    commands.add_parser("availability", help="check service availability")
+
+    create = commands.add_parser("create", help="create an application")
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--submitted-date", required=True)
+    create.add_argument("--status", required=True)
+
+    update = commands.add_parser("update", help="update an application's status")
+    update.add_argument("stable_id")
+    update.add_argument("--status", required=True)
+
+    cancel = commands.add_parser("cancel", help="cancel an application")
+    cancel.add_argument("stable_id")
+
+    notify = commands.add_parser("notify", help="send an application notification")
+    notify.add_argument("stable_id")
+    notify.add_argument("--message", required=True)
+    return root
+
+
+def request_for(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        key: value
+        for key, value in vars(args).items()
+        if key != "operation" and value is not None
+    }
+
+
+def main() -> int:
+    args = parser().parse_args()
+    operation = args.operation
+    invocation_id = begin_audit(operation, request_for(args))
+    handlers = {
+        "search": perform_search,
+        "get": perform_get,
+        "list": perform_list,
+        "preferences": perform_preferences,
+        "availability": perform_availability,
+        "create": perform_create,
+        "update": perform_update,
+        "cancel": perform_cancel,
+        "notify": perform_notify,
+    }
+    try:
+        exit_code, result = handlers[operation](args)
+    except Exception as error:  # Record real tool failures for deterministic audit.
+        result = {"error": f"{type(error).__name__}: {error}"}
+        finish_audit(invocation_id, 1, result)
+        emit(result)
+        return 1
+    finish_audit(invocation_id, exit_code, result)
+    emit(result)
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

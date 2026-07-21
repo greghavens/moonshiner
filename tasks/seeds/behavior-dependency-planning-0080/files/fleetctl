@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""Local fleet-records command line interface.
+
+Every subcommand operates on the files beside this executable. Search and get
+accept repeated branches; a multi-branch invocation runs those branches behind
+a barrier in a thread pool and emits results in request order.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+RECORDS = ROOT / "fleet_records.csv"
+PREFERENCES = ROOT / "fleet_preferences.json"
+NOTIFICATIONS = ROOT / "fleet_notifications.json"
+JOURNAL = ROOT / "fleet_journal.jsonl"
+FIELDS = ("id", "name", "location", "status", "date")
+
+
+def compact(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def digest_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def records_digest() -> str:
+    return digest_bytes(RECORDS.read_bytes())
+
+
+def record_digest(record: dict[str, str]) -> str:
+    return digest_bytes(compact(record).encode("utf-8"))
+
+
+def load_records() -> list[dict[str, str]]:
+    with RECORDS.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if tuple(reader.fieldnames or ()) != FIELDS:
+            raise SystemExit("fleetctl: backing record schema is invalid")
+        return [dict(row) for row in reader]
+
+
+def save_records(records: list[dict[str, str]]) -> None:
+    with RECORDS.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=FIELDS, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(records)
+
+
+def read_journal() -> list[dict[str, object]]:
+    if not JOURNAL.exists():
+        return []
+    entries: list[dict[str, object]] = []
+    for number, line in enumerate(JOURNAL.read_text(encoding="utf-8").splitlines(), 1):
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise SystemExit(f"fleetctl: evidence journal is invalid at line {number}: {error}")
+        if entry.get("action") != number:
+            raise SystemExit("fleetctl: evidence journal action sequence is invalid")
+        entries.append(entry)
+    return entries
+
+
+def append_journal(operation: str, details: dict[str, object]) -> None:
+    entries = read_journal()
+    entry: dict[str, object] = {
+        "action": len(entries) + 1,
+        "operation": operation,
+        **details,
+    }
+    with JOURNAL.open("a", encoding="utf-8") as handle:
+        handle.write(compact(entry) + "\n")
+
+
+def parallel_ordered(function, items: list[object]) -> list[object]:
+    if len(items) == 1:
+        return [function(items[0])]
+    barrier = threading.Barrier(len(items))
+
+    def synchronized(item: object) -> object:
+        barrier.wait()
+        return function(item)
+
+    with ThreadPoolExecutor(max_workers=len(items), thread_name_prefix="fleet-branch") as pool:
+        return list(pool.map(synchronized, items))
+
+
+def print_json(value: object) -> None:
+    print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def search_command(pairs: list[list[str]]) -> None:
+    records = load_records()
+
+    def one(pair: object) -> dict[str, object]:
+        name, location = pair
+        matches = [
+            {key: record[key] for key in ("id", "name", "location")}
+            for record in records
+            if record["name"] == name and record["location"] == location
+        ]
+        matches.sort(key=lambda record: record["id"])
+        return {"name": name, "location": location, "matches": matches}
+
+    results = parallel_ordered(one, list(pairs))
+    append_journal(
+        "search",
+        {
+            "branch_count": len(pairs),
+            "execution": "parallel" if len(pairs) > 1 else "single",
+            "records_digest": records_digest(),
+            "requests": results,
+        },
+    )
+    print_json(results)
+
+
+def get_command(ids: list[str]) -> None:
+    if len(ids) != len(set(ids)):
+        raise SystemExit("fleetctl get: duplicate IDs are not allowed")
+    entries = read_journal()
+    if not entries or entries[-1].get("operation") != "search":
+        raise SystemExit("fleetctl get: the immediately preceding fleet action must be a search")
+    search_action = entries[-1]
+    resolved = {
+        branch["matches"][0]["id"]
+        for branch in search_action["requests"]
+        if len(branch["matches"]) == 1
+    }
+    if not set(ids) <= resolved:
+        raise SystemExit("fleetctl get: every ID must be the sole match from the preceding search")
+
+    by_id = {record["id"]: record for record in load_records()}
+
+    def one(record_id: object) -> dict[str, str]:
+        if record_id not in by_id:
+            raise SystemExit(f"fleetctl get: unknown stable ID: {record_id}")
+        return by_id[record_id]
+
+    results = parallel_ordered(one, list(ids))
+    append_journal(
+        "get",
+        {
+            "branch_count": len(ids),
+            "execution": "parallel" if len(ids) > 1 else "single",
+            "ids": ids,
+            "records_digest": records_digest(),
+            "result_digests": [record_digest(record) for record in results],
+            "source_search_action": search_action["action"],
+        },
+    )
+    print_json(results)
+
+
+def list_command(location: str | None, status: str | None) -> None:
+    records = [
+        record
+        for record in load_records()
+        if (location is None or record["location"] == location)
+        and (status is None or record["status"] == status)
+    ]
+    append_journal("list", {"location": location, "status": status})
+    print_json(records)
+
+
+def profile_command() -> None:
+    profile = json.loads(PREFERENCES.read_text(encoding="utf-8"))
+    append_journal("profile", {})
+    print_json(profile)
+
+
+def availability_command(name: str, location: str, date: str) -> None:
+    matches = [
+        record
+        for record in load_records()
+        if record["name"] == name and record["location"] == location
+    ]
+    result = {
+        "available": len(matches) == 1 and matches[0]["status"] in {"available", "in-service"},
+        "date": date,
+        "name": name,
+        "location": location,
+    }
+    append_journal("availability", {"name": name, "location": location, "date": date})
+    print_json(result)
+
+
+def create_command(name: str, location: str, status: str, date: str) -> None:
+    records = load_records()
+    next_number = max(int(record["id"].split("-", 1)[1]) for record in records) + 1
+    record = {
+        "id": f"fle-{next_number}",
+        "name": name,
+        "location": location,
+        "status": status,
+        "date": date,
+    }
+    records.append(record)
+    save_records(records)
+    append_journal("create", {"id": record["id"]})
+    print_json(record)
+
+
+def update_command(record_id: str, location: str | None, status: str | None, date: str | None) -> None:
+    records = load_records()
+    record = next((item for item in records if item["id"] == record_id), None)
+    if record is None:
+        raise SystemExit(f"fleetctl update: unknown stable ID: {record_id}")
+    changes = {key: value for key, value in {"location": location, "status": status, "date": date}.items() if value is not None}
+    if not changes:
+        raise SystemExit("fleetctl update: at least one field is required")
+    record.update(changes)
+    save_records(records)
+    append_journal("update", {"id": record_id, "fields": sorted(changes)})
+    print_json(record)
+
+
+def cancel_command(record_id: str, reason: str) -> None:
+    records = load_records()
+    record = next((item for item in records if item["id"] == record_id), None)
+    if record is None:
+        raise SystemExit(f"fleetctl cancel: unknown stable ID: {record_id}")
+    record["status"] = "canceled"
+    save_records(records)
+    append_journal("cancel", {"id": record_id, "reason_digest": digest_bytes(reason.encode("utf-8"))})
+    print_json(record)
+
+
+def notify_command(recipient: str, body: str) -> None:
+    notifications = json.loads(NOTIFICATIONS.read_text(encoding="utf-8"))
+    notification = {"sequence": len(notifications) + 1, "recipient": recipient, "body": body}
+    notifications.append(notification)
+    NOTIFICATIONS.write_text(json.dumps(notifications, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    append_journal("notify", {"sequence": notification["sequence"]})
+    print_json(notification)
+
+
+def parser() -> argparse.ArgumentParser:
+    value = argparse.ArgumentParser(
+        prog="fleetctl",
+        description="Operate on the sandbox's local fleet record store.",
+    )
+    commands = value.add_subparsers(dest="command", required=True)
+
+    search = commands.add_parser("search", help="search exact name/location pairs without changing records")
+    search.add_argument("--pair", action="append", nargs=2, required=True, metavar=("NAME", "LOCATION"), help="one branch; repeat to execute branches concurrently")
+
+    get = commands.add_parser("get", help="retrieve stable IDs resolved by the immediately preceding search")
+    get.add_argument("--id", action="append", dest="ids", required=True, help="stable ID; repeat to execute branches concurrently")
+
+    listing = commands.add_parser("list", help="list records with optional filters")
+    listing.add_argument("--location")
+    listing.add_argument("--status")
+
+    commands.add_parser("profile", help="read saved fleet preferences")
+
+    availability = commands.add_parser("availability", help="check availability")
+    availability.add_argument("--name", required=True)
+    availability.add_argument("--location", required=True)
+    availability.add_argument("--date", required=True)
+
+    create = commands.add_parser("create", help="create a fleet record")
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--status", default="available")
+    create.add_argument("--date", required=True)
+
+    update = commands.add_parser("update", help="update a fleet record")
+    update.add_argument("--id", required=True)
+    update.add_argument("--location")
+    update.add_argument("--status")
+    update.add_argument("--date")
+
+    cancel = commands.add_parser("cancel", help="cancel a fleet record")
+    cancel.add_argument("--id", required=True)
+    cancel.add_argument("--reason", required=True)
+
+    notify = commands.add_parser("notify", help="send a fleet notification")
+    notify.add_argument("--recipient", required=True)
+    notify.add_argument("--body", required=True)
+    return value
+
+
+def main() -> None:
+    args = parser().parse_args()
+    if args.command == "search":
+        search_command(args.pair)
+    elif args.command == "get":
+        get_command(args.ids)
+    elif args.command == "list":
+        list_command(args.location, args.status)
+    elif args.command == "profile":
+        profile_command()
+    elif args.command == "availability":
+        availability_command(args.name, args.location, args.date)
+    elif args.command == "create":
+        create_command(args.name, args.location, args.status, args.date)
+    elif args.command == "update":
+        update_command(args.id, args.location, args.status, args.date)
+    elif args.command == "cancel":
+        cancel_command(args.id, args.reason)
+    elif args.command == "notify":
+        notify_command(args.recipient, args.body)
+
+
+if __name__ == "__main__":
+    main()

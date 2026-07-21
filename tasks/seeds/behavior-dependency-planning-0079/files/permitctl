@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed permit registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+
+
+ROOT = Path(__file__).resolve().parent
+DATABASE = ROOT / "data" / "permit_queue.sqlite3"
+EVENTS = ROOT / ".pytest_cache" / "permit-tool-events.jsonl"
+BARRIERS = ROOT / ".pytest_cache" / "permit-tool-barriers"
+
+
+def canonical(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def connect() -> sqlite3.Connection:
+    connection = sqlite3.connect(DATABASE)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+def audit_secret(connection: sqlite3.Connection) -> bytes:
+    row = connection.execute(
+        "SELECT value FROM registry_metadata WHERE key = 'audit_secret'"
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("registry audit metadata is unavailable")
+    return row["value"].encode("utf-8")
+
+
+def await_parallel_peer(operation: str) -> bool:
+    """Pair same-operation children of one shell without a scheduling race."""
+    BARRIERS.mkdir(parents=True, exist_ok=True)
+    barrier = BARRIERS / f"{operation}-{os.getppid()}.json"
+    descriptor = os.open(barrier, os.O_RDWR | os.O_CREAT, 0o600)
+    participant = str(os.getpid())
+    deadline = time.monotonic() + 5.0
+    try:
+        while True:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            try:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                raw_state = os.read(descriptor, 64 * 1024)
+                state = json.loads(raw_state) if raw_state else {}
+                participants = state.setdefault("participants", {})
+                participants.setdefault(participant, False)
+                if len(participants) >= 2:
+                    participants[participant] = True
+                ready = sum(value is True for value in participants.values()) >= 2
+                encoded = canonical(state)
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                os.ftruncate(descriptor, 0)
+                os.write(descriptor, encoded)
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            if ready:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+    finally:
+        os.close(descriptor)
+
+
+def emit_event(
+    connection: sqlite3.Connection,
+    operation: str,
+    arguments: dict[str, object],
+    result: object,
+    started_ns: int,
+    parallel_peer: bool | None,
+) -> None:
+    event: dict[str, object] = {
+        "version": 1,
+        "operation": operation,
+        "arguments": arguments,
+        "result_digest": hashlib.sha256(canonical(result)).hexdigest(),
+        "started_ns": started_ns,
+        "ended_ns": time.monotonic_ns(),
+        "pid": os.getpid(),
+        "parent_pid": os.getppid(),
+        "parallel_peer": parallel_peer,
+    }
+    event["signature"] = hmac.new(
+        audit_secret(connection), canonical(event), hashlib.sha256
+    ).hexdigest()
+    EVENTS.parent.mkdir(exist_ok=True)
+    descriptor = os.open(EVENTS, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        os.write(descriptor, canonical(event) + b"\n")
+    finally:
+        os.close(descriptor)
+
+
+def public_application(row: sqlite3.Row, *, summary: bool = False) -> dict[str, object]:
+    result: dict[str, object] = {
+        "id": row["id"],
+        "name": row["name"],
+        "location": row["location"],
+    }
+    if not summary:
+        if row["date"] is not None:
+            result["date"] = row["date"]
+        if row["status"] is not None:
+            result["status"] = row["status"]
+    return result
+
+
+def execute(args: argparse.Namespace) -> tuple[dict[str, object], dict[str, object]]:
+    started_ns = time.monotonic_ns()
+    connection = connect()
+    operation = args.operation
+    arguments = {
+        key: value
+        for key, value in vars(args).items()
+        if key not in {"operation", "handler"} and value is not None
+    }
+    parallel_peer = None
+
+    if operation == "search":
+        parallel_peer = await_parallel_peer(operation)
+        rows = connection.execute(
+            "SELECT id, name, location, date, status FROM applications "
+            "WHERE name = ? AND location = ? ORDER BY id",
+            (args.name, args.location),
+        ).fetchall()
+        result: dict[str, object] = {
+            "matches": [public_application(row, summary=True) for row in rows]
+        }
+    elif operation == "get":
+        parallel_peer = await_parallel_peer(operation)
+        row = connection.execute(
+            "SELECT id, name, location, date, status FROM applications WHERE id = ?",
+            (args.id,),
+        ).fetchone()
+        result = {"record": public_application(row) if row is not None else None}
+    elif operation == "list":
+        rows = connection.execute(
+            "SELECT id, name, location, date, status FROM applications ORDER BY id"
+        ).fetchall()
+        result = {"records": [public_application(row, summary=True) for row in rows]}
+    elif operation == "profile":
+        rows = connection.execute(
+            "SELECT key, value FROM saved_preferences ORDER BY key"
+        ).fetchall()
+        result = {"preferences": {row["key"]: row["value"] for row in rows}}
+    elif operation == "availability":
+        rows = connection.execute(
+            "SELECT service_date FROM availability WHERE location = ? "
+            "AND available = 1 ORDER BY service_date",
+            (args.location,),
+        ).fetchall()
+        result = {"dates": [row["service_date"] for row in rows]}
+    elif operation == "create":
+        connection.execute(
+            "INSERT INTO applications(id, name, location, date, status) "
+            "VALUES (?, ?, ?, ?, 'submitted')",
+            (args.id, args.name, args.location, args.date),
+        )
+        connection.execute(
+            "INSERT INTO mutation_log(operation, application_id) VALUES ('create', ?)",
+            (args.id,),
+        )
+        connection.commit()
+        result = {"created": args.id}
+    elif operation == "update":
+        changed = connection.execute(
+            "UPDATE applications SET status = ? WHERE id = ?",
+            (args.status, args.id),
+        ).rowcount
+        connection.execute(
+            "INSERT INTO mutation_log(operation, application_id) VALUES ('update', ?)",
+            (args.id,),
+        )
+        connection.commit()
+        result = {"updated": changed == 1}
+    elif operation == "cancel":
+        changed = connection.execute(
+            "UPDATE applications SET status = 'cancelled' WHERE id = ?", (args.id,)
+        ).rowcount
+        connection.execute(
+            "INSERT INTO mutation_log(operation, application_id) VALUES ('cancel', ?)",
+            (args.id,),
+        )
+        connection.commit()
+        result = {"cancelled": changed == 1}
+    elif operation == "notify":
+        connection.execute(
+            "INSERT INTO notification_log(application_id, message) VALUES (?, ?)",
+            (args.id, args.message),
+        )
+        connection.execute(
+            "INSERT INTO mutation_log(operation, application_id) VALUES ('notify', ?)",
+            (args.id,),
+        )
+        connection.commit()
+        result = {"notified": args.id}
+    else:
+        raise AssertionError(f"unhandled operation: {operation}")
+
+    emit_event(connection, operation, arguments, result, started_ns, parallel_peer)
+    connection.close()
+    return result, arguments
+
+
+def parser() -> argparse.ArgumentParser:
+    main = argparse.ArgumentParser(
+        prog="permitctl", description="Client for the local permit registry"
+    )
+    commands = main.add_subparsers(dest="operation", required=True)
+
+    search = commands.add_parser("search", help="find applications by exact name and location")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+
+    get = commands.add_parser("get", help="retrieve one full application by stable ID")
+    get.add_argument("--id", required=True)
+
+    commands.add_parser("list", help="list the application collection")
+    commands.add_parser("profile", help="read saved clerk preferences")
+
+    availability = commands.add_parser("availability", help="check service availability")
+    availability.add_argument("--location", required=True)
+
+    create = commands.add_parser("create", help="create an application")
+    create.add_argument("--id", required=True)
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--date")
+
+    update = commands.add_parser("update", help="update application status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+
+    cancel = commands.add_parser("cancel", help="cancel an application")
+    cancel.add_argument("--id", required=True)
+
+    notify = commands.add_parser("notify", help="send an application notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+    return main
+
+
+def main() -> int:
+    arguments = parser().parse_args()
+    try:
+        result, _ = execute(arguments)
+    except (sqlite3.Error, RuntimeError) as error:
+        print(json.dumps({"error": str(error)}, sort_keys=True), file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

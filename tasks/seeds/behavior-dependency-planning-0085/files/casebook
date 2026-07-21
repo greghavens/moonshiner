@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""Command-line client for the sandboxed support casebook."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+DATA = ROOT / "data"
+CASES = DATA / "cases.tsv"
+AUDIT = ROOT / ".casebook-audit" / "events.jsonl"
+DELAY_SECONDS = 0.35
+
+
+def load_cases() -> list[dict[str, str]]:
+    with CASES.open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle, delimiter="\t"))
+
+
+def save_cases(records: list[dict[str, str]]) -> None:
+    temporary = CASES.with_suffix(".tmp")
+    fields = ["id", "name", "location", "date", "status", "stale"]
+    with temporary.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, delimiter="\t",
+                                lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(records)
+    temporary.replace(CASES)
+
+
+def append_event(event: dict) -> None:
+    AUDIT.parent.mkdir(exist_ok=True)
+    payload = (json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    descriptor = os.open(AUDIT, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(descriptor, payload)
+    finally:
+        os.close(descriptor)
+
+
+def public_record(record: dict[str, str]) -> dict[str, str]:
+    return {
+        "name": record["name"],
+        "stable_id": record["id"],
+        "location": record["location"],
+        "date": record["date"],
+        "status": record["status"],
+    }
+
+
+def execute(operation: str, arguments: dict, action) -> int:
+    request_id = f"{os.getpid()}-{time.monotonic_ns()}"
+    common = {
+        "request_id": request_id,
+        "operation": operation,
+        "arguments": arguments,
+        "pid": os.getpid(),
+        "parent_pid": os.getppid(),
+    }
+    append_event({**common, "phase": "start", "time_ns": time.monotonic_ns()})
+    time.sleep(DELAY_SECONDS)
+    try:
+        result = action()
+    except Exception as error:
+        append_event({**common, "phase": "end", "time_ns": time.monotonic_ns(),
+                      "ok": False, "error": str(error)})
+        print(json.dumps({"error": str(error)}, sort_keys=True), file=sys.stderr)
+        return 1
+    append_event({**common, "phase": "end", "time_ns": time.monotonic_ns(),
+                  "ok": True, "result": result})
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+def do_search(args: argparse.Namespace) -> int:
+    arguments = {"name": args.name, "location": args.location,
+                 "include_stale": args.include_stale}
+
+    def action() -> dict:
+        matches = []
+        for record in load_cases():
+            if record["name"] != args.name or record["location"] != args.location:
+                continue
+            if record["stale"] == "true" and not args.include_stale:
+                continue
+            matches.append({"stable_id": record["id"], "name": record["name"],
+                            "location": record["location"]})
+        return {"count": len(matches), "matches": matches}
+
+    return execute("search", arguments, action)
+
+
+def do_get(args: argparse.Namespace) -> int:
+    arguments = {"stable_id": args.stable_id}
+
+    def action() -> dict:
+        records = [record for record in load_cases()
+                   if record["id"] == args.stable_id and record["stale"] != "true"]
+        if len(records) != 1:
+            raise ValueError("no current case has that stable ID")
+        return public_record(records[0])
+
+    return execute("get", arguments, action)
+
+
+def do_list(_: argparse.Namespace) -> int:
+    return execute("list", {}, lambda: {
+        "records": [public_record(record) for record in load_cases()
+                    if record["stale"] != "true"]
+    })
+
+
+def do_preferences(_: argparse.Namespace) -> int:
+    return execute("preferences", {}, lambda: json.loads(
+        (DATA / "preferences.json").read_text(encoding="utf-8")))
+
+
+def do_availability(_: argparse.Namespace) -> int:
+    return execute("availability", {}, lambda: json.loads(
+        (DATA / "availability.json").read_text(encoding="utf-8")))
+
+
+def do_create(args: argparse.Namespace) -> int:
+    arguments = {"name": args.name, "location": args.location,
+                 "date": args.date, "status": args.status}
+
+    def action() -> dict:
+        records = load_cases()
+        numeric = max(int(record["id"].split("-", 1)[1]) for record in records) + 1
+        record = {**arguments, "id": f"sup-{numeric}", "stale": "false"}
+        records.append(record)
+        save_cases(records)
+        return public_record(record)
+
+    return execute("create", arguments, action)
+
+
+def do_update(args: argparse.Namespace) -> int:
+    arguments = {"stable_id": args.stable_id, "status": args.status}
+
+    def action() -> dict:
+        records = load_cases()
+        found = [record for record in records if record["id"] == args.stable_id]
+        if len(found) != 1:
+            raise ValueError("no case has that stable ID")
+        found[0]["status"] = args.status
+        save_cases(records)
+        return public_record(found[0])
+
+    return execute("update", arguments, action)
+
+
+def do_cancel(args: argparse.Namespace) -> int:
+    arguments = {"stable_id": args.stable_id}
+
+    def action() -> dict:
+        records = load_cases()
+        found = [record for record in records if record["id"] == args.stable_id]
+        if len(found) != 1:
+            raise ValueError("no case has that stable ID")
+        found[0]["status"] = "cancelled"
+        save_cases(records)
+        return public_record(found[0])
+
+    return execute("cancel", arguments, action)
+
+
+def do_notify(args: argparse.Namespace) -> int:
+    arguments = {"stable_id": args.stable_id, "message": args.message}
+
+    def action() -> dict:
+        with (DATA / "notifications.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(arguments, sort_keys=True) + "\n")
+        return {"notified": True, "stable_id": args.stable_id}
+
+    return execute("notify", arguments, action)
+
+
+class AuditedHelpAction(argparse.Action):
+    """Record successful use of argparse's built-in help action."""
+
+    def __call__(self, parser, namespace, values, option_string=None) -> None:
+        append_event({
+            "phase": "help",
+            "operation": "help",
+            "arguments": {"command": parser.prog},
+            "pid": os.getpid(),
+            "parent_pid": os.getppid(),
+            "time_ns": time.monotonic_ns(),
+        })
+        parser.print_help()
+        parser.exit()
+
+
+class AuditedArgumentParser(argparse.ArgumentParser):
+    """Argument parser whose normal -h/--help path leaves audit evidence."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        kwargs["add_help"] = False
+        super().__init__(*args, **kwargs)
+        self.add_argument(
+            "-h", "--help", action=AuditedHelpAction, nargs=0,
+            help="show this help message and exit",
+        )
+
+
+def parser() -> argparse.ArgumentParser:
+    main = AuditedArgumentParser(
+        prog="casebook", description="Query and manage the sandboxed support casebook")
+    commands = main.add_subparsers(dest="operation", required=True)
+
+    search = commands.add_parser("search", help="find cases by exact name and location")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+    search.add_argument("--include-stale", action="store_true")
+    search.set_defaults(handler=do_search)
+
+    get = commands.add_parser("get", help="retrieve one current case by stable ID")
+    get.add_argument("--stable-id", required=True)
+    get.set_defaults(handler=do_get)
+
+    listing = commands.add_parser("list", help="list every current case")
+    listing.set_defaults(handler=do_list)
+    preferences = commands.add_parser("preferences", help="read saved preferences")
+    preferences.set_defaults(handler=do_preferences)
+    availability = commands.add_parser("availability", help="check service availability")
+    availability.set_defaults(handler=do_availability)
+
+    create = commands.add_parser("create", help="create a case")
+    for flag in ("name", "location", "date", "status"):
+        create.add_argument(f"--{flag}", required=True)
+    create.set_defaults(handler=do_create)
+
+    update = commands.add_parser("update", help="change a case status")
+    update.add_argument("--stable-id", required=True)
+    update.add_argument("--status", required=True)
+    update.set_defaults(handler=do_update)
+
+    cancel = commands.add_parser("cancel", help="cancel a case")
+    cancel.add_argument("--stable-id", required=True)
+    cancel.set_defaults(handler=do_cancel)
+
+    notify = commands.add_parser("notify", help="notify about a case")
+    notify.add_argument("--stable-id", required=True)
+    notify.add_argument("--message", required=True)
+    notify.set_defaults(handler=do_notify)
+    return main
+
+
+def main() -> int:
+    args = parser().parse_args()
+    return args.handler(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

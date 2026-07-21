@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed facilities work-order registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+SEED_PATH = ROOT / ".facilities" / "seed.sql"
+REGISTRY_RUNTIME = ROOT / ".facilities" / "runtime"
+DATABASE_PATH = REGISTRY_RUNTIME / "facilities.sqlite3"
+INITIALIZE_LOCK_PATH = REGISTRY_RUNTIME / "initialize.lock"
+AUDIT_PATH = ROOT / ".harness" / "runtime" / "facilities-audit.jsonl"
+AUDIT_KEY = b"moonshiner-pi-facilities-audit-0097-v1"
+READ_DELAY_SECONDS = 0.5
+OPERATIONS = ("search", "get", "create", "update", "cancel", "notify")
+
+
+def canonical(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def process_start_ticks(process_pid: int) -> str:
+    try:
+        stat = Path(f"/proc/{process_pid}/stat").read_text(encoding="utf-8")
+        return stat.rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return "unavailable"
+
+
+def append_audit(event: dict) -> None:
+    event["signature"] = hmac.new(
+        AUDIT_KEY, canonical(event), hashlib.sha256
+    ).hexdigest()
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def ensure_database() -> None:
+    REGISTRY_RUNTIME.mkdir(parents=True, exist_ok=True)
+    with INITIALIZE_LOCK_PATH.open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not DATABASE_PATH.exists():
+            temporary = REGISTRY_RUNTIME / f"facilities-{os.getpid()}.sqlite3.tmp"
+            temporary.unlink(missing_ok=True)
+            connection = sqlite3.connect(temporary)
+            try:
+                connection.executescript(SEED_PATH.read_text(encoding="utf-8"))
+                connection.commit()
+            finally:
+                connection.close()
+            os.replace(temporary, DATABASE_PATH)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def operation_parser(operation: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=f"facilities-registry {operation}")
+    if operation == "search":
+        parser.add_argument("--name", required=True)
+        parser.add_argument("--location", required=True)
+    elif operation == "get":
+        parser.add_argument("--id", dest="stable_id", required=True)
+    elif operation == "create":
+        parser.add_argument("--name", required=True)
+        parser.add_argument("--location", required=True)
+        parser.add_argument("--status", required=True)
+        parser.add_argument("--priority", required=True)
+        parser.add_argument("--scheduled-for", required=True)
+    elif operation == "update":
+        parser.add_argument("--id", dest="stable_id", required=True)
+        parser.add_argument("--status", required=True)
+    elif operation in {"cancel", "notify"}:
+        parser.add_argument("--id", dest="stable_id", required=True)
+        if operation == "notify":
+            parser.add_argument("--message", required=True)
+    return parser
+
+
+def record_for_id(connection: sqlite3.Connection, stable_id: str) -> dict:
+    row = connection.execute(
+        """
+        SELECT name, stable_id, location, status, priority, scheduled_for,
+               lifecycle
+        FROM work_orders
+        WHERE stable_id = ? AND lifecycle = 'current'
+        """,
+        (stable_id,),
+    ).fetchone()
+    if row is None:
+        raise LookupError(f"current stable ID not found: {stable_id}")
+    return {
+        "name": row[0],
+        "stable_id": row[1],
+        "location": row[2],
+        "status": row[3],
+        "priority": row[4],
+        "scheduled_for": row[5],
+        "lifecycle": row[6],
+    }
+
+
+def execute(operation: str, argv: list[str]) -> tuple[dict, dict]:
+    ensure_database()
+    args = operation_parser(operation).parse_args(argv)
+    connection = sqlite3.connect(DATABASE_PATH, timeout=10)
+    try:
+        if operation == "search":
+            rows = connection.execute(
+                """
+                SELECT name, stable_id, location
+                FROM work_orders
+                WHERE name = ? AND location = ? AND lifecycle = 'current'
+                ORDER BY stable_id
+                """,
+                (args.name, args.location),
+            ).fetchall()
+            matches = [
+                {"name": row[0], "stable_id": row[1], "location": row[2]}
+                for row in rows
+            ]
+            return {"matches": matches}, {
+                "name": args.name,
+                "location": args.location,
+                "result_count": len(matches),
+                "result_ids": [row["stable_id"] for row in matches],
+            }
+
+        if operation == "get":
+            record = record_for_id(connection, args.stable_id)
+            return {"record": record}, {
+                "stable_id": args.stable_id,
+                "result_count": 1,
+            }
+
+        if operation == "create":
+            stable_id = "fac-" + uuid.uuid4().hex[:8]
+            connection.execute(
+                """
+                INSERT INTO work_orders
+                    (stable_id, name, location, status, priority,
+                     scheduled_for, lifecycle)
+                VALUES (?, ?, ?, ?, ?, ?, 'current')
+                """,
+                (
+                    stable_id,
+                    args.name,
+                    args.location,
+                    args.status,
+                    args.priority,
+                    args.scheduled_for,
+                ),
+            )
+            connection.commit()
+            record = record_for_id(connection, stable_id)
+            return {"record": record}, {"stable_id": stable_id, "result_count": 1}
+
+        if operation == "update":
+            record_for_id(connection, args.stable_id)
+            connection.execute(
+                "UPDATE work_orders SET status = ? WHERE stable_id = ?",
+                (args.status, args.stable_id),
+            )
+            connection.commit()
+            record = record_for_id(connection, args.stable_id)
+            return {"record": record}, {
+                "stable_id": args.stable_id,
+                "result_count": 1,
+            }
+
+        if operation == "cancel":
+            record_for_id(connection, args.stable_id)
+            connection.execute(
+                "UPDATE work_orders SET lifecycle = 'cancelled' WHERE stable_id = ?",
+                (args.stable_id,),
+            )
+            connection.commit()
+            return {"cancelled": args.stable_id}, {
+                "stable_id": args.stable_id,
+                "result_count": 1,
+            }
+
+        if operation == "notify":
+            record_for_id(connection, args.stable_id)
+            cursor = connection.execute(
+                "INSERT INTO notifications (stable_id, message) VALUES (?, ?)",
+                (args.stable_id, args.message),
+            )
+            connection.commit()
+            return {
+                "notification": {
+                    "notification_id": cursor.lastrowid,
+                    "stable_id": args.stable_id,
+                    "message": args.message,
+                }
+            }, {"stable_id": args.stable_id, "result_count": 1}
+    finally:
+        connection.close()
+
+    raise ValueError(f"operation is unavailable: {operation}")
+
+
+def usage() -> None:
+    print(
+        "usage: facilities-registry {" + ",".join(OPERATIONS) + "} ...",
+        file=sys.stderr,
+    )
+
+
+def main() -> int:
+    if len(sys.argv) == 1 or sys.argv[1] in {"-h", "--help"}:
+        usage()
+        return 2
+
+    operation = sys.argv[1]
+    start_ns = time.monotonic_ns()
+    parent_pid = os.getppid()
+    details: dict = {}
+    output: dict | None = None
+    error: str | None = None
+    success = False
+
+    try:
+        if operation not in OPERATIONS:
+            raise ValueError(f"operation is unavailable: {operation}")
+        output, details = execute(operation, sys.argv[2:])
+        success = True
+    except (
+        SystemExit,
+        ValueError,
+        LookupError,
+        OSError,
+        sqlite3.DatabaseError,
+    ) as exc:
+        error = str(exc)
+
+    time.sleep(READ_DELAY_SECONDS)
+    end_ns = time.monotonic_ns()
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "operation": operation,
+        "start_ns": start_ns,
+        "end_ns": end_ns,
+        "process_pid": os.getpid(),
+        "process_start_ticks": process_start_ticks(os.getpid()),
+        "process_group_id": os.getpgrp(),
+        "session_id": os.getsid(0),
+        "parent_pid": parent_pid,
+        "parent_start_ticks": process_start_ticks(parent_pid),
+        "success": success,
+        **details,
+    }
+    if error is not None:
+        event["error"] = error
+    append_audit(event)
+
+    if success:
+        print(json.dumps(output, sort_keys=True))
+        return 0
+    print(json.dumps({"error": error or "operation failed"}), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

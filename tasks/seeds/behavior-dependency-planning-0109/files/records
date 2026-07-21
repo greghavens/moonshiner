@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""Local record registry used by the Pi dependency-planning task."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import time
+import uuid
+from pathlib import Path
+
+
+DEFAULT_STATE_DIR = Path(__file__).resolve().parent / ".records-state"
+STATE_DIR = Path(os.environ.get("PI_RECORDS_STATE_DIR", str(DEFAULT_STATE_DIR)))
+DB_PATH = STATE_DIR / "records.sqlite3"
+
+SEED_RECORDS = (
+    ("rec-7f3a91", "Juniper Bakery", "West Region", "Active"),
+    ("rec-2c8e44", "Northline Pediatrics", "Central Region", "Pending Review"),
+    ("rec-33bd10", "Juniper Bakery", "Central Region", "Archived"),
+    ("rec-ae1098", "Northline Pediatrics", "West Region", "Active"),
+    ("rec-8b761d", "Copper Kettle Market", "West Region", "Active"),
+    ("rec-908c22", "Lakeshore Dental", "Central Region", "Inactive"),
+)
+
+
+def encode(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def connect() -> sqlite3.Connection:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(DB_PATH, timeout=15)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA busy_timeout = 15000")
+    db.execute("BEGIN IMMEDIATE")
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS records (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            region TEXT NOT NULL,
+            status TEXT NOT NULL,
+            cancelled INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            record_id TEXT NOT NULL,
+            message TEXT NOT NULL,
+            created_ns INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS operations (
+            invocation_id TEXT PRIMARY KEY,
+            command TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            result TEXT,
+            started_ns INTEGER NOT NULL,
+            finished_ns INTEGER
+        );
+        """
+    )
+    db.executemany(
+        "INSERT OR IGNORE INTO records(id, name, region, status, cancelled) VALUES (?, ?, ?, ?, 0)",
+        SEED_RECORDS,
+    )
+    db.commit()
+    return db
+
+
+def begin_operation(db: sqlite3.Connection, command: str, payload: object) -> str:
+    invocation_id = uuid.uuid4().hex
+    db.execute(
+        "INSERT INTO operations(invocation_id, command, payload, started_ns) VALUES (?, ?, ?, ?)",
+        (invocation_id, command, encode(payload), time.monotonic_ns()),
+    )
+    db.commit()
+    return invocation_id
+
+
+def finish_operation(
+    db: sqlite3.Connection, invocation_id: str, result: object
+) -> None:
+    db.execute(
+        "UPDATE operations SET result = ?, finished_ns = ? WHERE invocation_id = ?",
+        (encode(result), time.monotonic_ns(), invocation_id),
+    )
+    db.commit()
+
+
+def record_dict(row: sqlite3.Row) -> dict[str, str]:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "region": row["region"],
+        "status": row["status"],
+    }
+
+
+def command_search(args: argparse.Namespace) -> int:
+    db = connect()
+    payload = {"name": args.name, "region": args.region}
+    invocation_id = begin_operation(db, "search", payload)
+    # The delay is intentional: independent searches overlap only when callers
+    # actually schedule them concurrently.
+    time.sleep(0.65)
+    rows = db.execute(
+        """
+        SELECT id
+        FROM records
+        WHERE name = ? AND region = ? AND cancelled = 0
+        ORDER BY id
+        """,
+        (args.name, args.region),
+    ).fetchall()
+    result = {"matches": [{"id": row["id"]} for row in rows]}
+    finish_operation(db, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_retrieve(args: argparse.Namespace) -> int:
+    db = connect()
+    payload = {"ids": args.ids}
+    invocation_id = begin_operation(db, "retrieve", payload)
+    placeholders = ",".join("?" for _ in args.ids)
+    rows = db.execute(
+        f"""
+        SELECT id, name, region, status
+        FROM records
+        WHERE id IN ({placeholders}) AND cancelled = 0
+        """,
+        args.ids,
+    ).fetchall()
+    by_id = {row["id"]: record_dict(row) for row in rows}
+    result = {"records": [by_id[item] for item in args.ids if item in by_id]}
+    finish_operation(db, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_create(args: argparse.Namespace) -> int:
+    db = connect()
+    payload = {
+        "name": args.name,
+        "region": args.region,
+        "status": args.status,
+    }
+    invocation_id = begin_operation(db, "create", payload)
+    record_id = f"rec-{uuid.uuid4().hex[:6]}"
+    db.execute(
+        "INSERT INTO records(id, name, region, status, cancelled) VALUES (?, ?, ?, ?, 0)",
+        (record_id, args.name, args.region, args.status),
+    )
+    db.commit()
+    result = {"id": record_id}
+    finish_operation(db, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_update(args: argparse.Namespace) -> int:
+    db = connect()
+    payload = {"id": args.id, "status": args.status}
+    invocation_id = begin_operation(db, "update", payload)
+    cursor = db.execute(
+        "UPDATE records SET status = ? WHERE id = ?", (args.status, args.id)
+    )
+    db.commit()
+    result = {"updated": cursor.rowcount}
+    finish_operation(db, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_cancel(args: argparse.Namespace) -> int:
+    db = connect()
+    payload = {"id": args.id}
+    invocation_id = begin_operation(db, "cancel", payload)
+    cursor = db.execute(
+        "UPDATE records SET cancelled = 1 WHERE id = ?", (args.id,)
+    )
+    db.commit()
+    result = {"cancelled": cursor.rowcount}
+    finish_operation(db, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_notify(args: argparse.Namespace) -> int:
+    db = connect()
+    payload = {"id": args.id, "message": args.message}
+    invocation_id = begin_operation(db, "notify", payload)
+    db.execute(
+        "INSERT INTO notifications(record_id, message, created_ns) VALUES (?, ?, ?)",
+        (args.id, args.message, time.monotonic_ns()),
+    )
+    db.commit()
+    result = {"notified": True}
+    finish_operation(db, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        prog="records", description="Search, retrieve, and manage regional records."
+    )
+    commands = root.add_subparsers(dest="command", required=True)
+
+    search = commands.add_parser("search", help="find records by exact name and region")
+    search.add_argument("--name", required=True)
+    search.add_argument("--region", required=True)
+    search.set_defaults(run=command_search)
+
+    retrieve = commands.add_parser(
+        "retrieve", help="retrieve one or more record IDs in one operation"
+    )
+    retrieve.add_argument("ids", nargs="+")
+    retrieve.set_defaults(run=command_retrieve)
+
+    create = commands.add_parser("create", help="create a record")
+    create.add_argument("--name", required=True)
+    create.add_argument("--region", required=True)
+    create.add_argument("--status", required=True)
+    create.set_defaults(run=command_create)
+
+    update = commands.add_parser("update", help="update a record status")
+    update.add_argument("id")
+    update.add_argument("--status", required=True)
+    update.set_defaults(run=command_update)
+
+    cancel = commands.add_parser("cancel", help="cancel a record")
+    cancel.add_argument("id")
+    cancel.set_defaults(run=command_cancel)
+
+    notify = commands.add_parser("notify", help="record a notification")
+    notify.add_argument("id")
+    notify.add_argument("--message", required=True)
+    notify.set_defaults(run=command_notify)
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        return args.run(args)
+    except (sqlite3.Error, OSError) as exc:
+        print(f"records: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

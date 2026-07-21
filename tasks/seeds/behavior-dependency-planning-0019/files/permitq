@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed permit queue."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+DATABASE = ROOT / "__pycache__" / "permit_queue.sqlite3"
+PAIR_TIMEOUT_SECONDS = 8.0
+FORBIDDEN = {"list", "profile", "availability", "create", "update", "cancel", "notify"}
+
+
+def connect() -> sqlite3.Connection:
+    if not DATABASE.is_file():
+        raise RuntimeError("permit queue is not initialized")
+    database = sqlite3.connect(DATABASE, timeout=10.0, isolation_level=None)
+    database.row_factory = sqlite3.Row
+    database.execute("PRAGMA busy_timeout = 10000")
+    return database
+
+
+def as_json(value: object) -> None:
+    print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+
+
+def begin_audit(database: sqlite3.Connection, operation: str, arguments: dict[str, object]) -> tuple[int, int]:
+    started = time.monotonic_ns()
+    database.execute("BEGIN IMMEDIATE")
+    try:
+        cursor = database.execute(
+            """
+            INSERT INTO audit_log
+                (operation, arguments_json, started_ns, pid, parent_pid, violation)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                operation,
+                json.dumps(arguments, ensure_ascii=False, sort_keys=True),
+                started,
+                os.getpid(),
+                os.getppid(),
+                int(operation in FORBIDDEN),
+            ),
+        )
+        sequence = int(cursor.lastrowid)
+        database.commit()
+        return sequence, started
+    except Exception:
+        database.rollback()
+        raise
+
+
+def finish_audit(
+    database: sqlite3.Connection,
+    sequence: int,
+    *,
+    result_count: int | None = None,
+    sole_id: str | None = None,
+    error: str | None = None,
+) -> None:
+    database.execute(
+        """
+        UPDATE audit_log
+        SET finished_ns = ?, result_count = ?, sole_id = ?, error = ?
+        WHERE sequence = ?
+        """,
+        (time.monotonic_ns(), result_count, sole_id, error, sequence),
+    )
+
+
+def fail(database: sqlite3.Connection, sequence: int, message: str) -> int:
+    finish_audit(database, sequence, error=message)
+    print(message, file=sys.stderr)
+    return 2
+
+
+def wait_for_pair(database: sqlite3.Connection, operation: str, sequence: int) -> tuple[bool, str]:
+    deadline = time.monotonic() + PAIR_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        rows = database.execute(
+            """
+            SELECT sequence, parent_pid, started_ns
+            FROM audit_log
+            WHERE operation = ? AND error IS NULL
+            ORDER BY sequence
+            """,
+            (operation,),
+        ).fetchall()
+        if len(rows) == 2:
+            if len({int(row["parent_pid"]) for row in rows}) != 2:
+                return False, f"{operation} operations must be separate executable-tool invocations"
+            return True, ""
+        if len(rows) > 2:
+            return False, f"expected exactly two {operation} operations"
+        time.sleep(0.025)
+    return False, f"timed out waiting for the concurrent {operation} operation"
+
+
+def run_search(database: sqlite3.Connection, name: str, location: str) -> int:
+    arguments = {"name": name, "location": location}
+    sequence, _ = begin_audit(database, "search", arguments)
+    earlier = database.execute(
+        "SELECT operation FROM audit_log WHERE sequence < ? ORDER BY sequence",
+        (sequence,),
+    ).fetchall()
+    if any(row["operation"] != "search" for row in earlier) or len(earlier) >= 2:
+        return fail(database, sequence, "searches must be the first two data operations")
+
+    paired, message = wait_for_pair(database, "search", sequence)
+    if not paired:
+        return fail(database, sequence, message)
+
+    rows = database.execute(
+        """
+        SELECT id, name, location
+        FROM applications
+        WHERE name = ? AND location = ?
+        ORDER BY id
+        """,
+        (name, location),
+    ).fetchall()
+    matches = [dict(row) for row in rows]
+    sole_id = str(rows[0]["id"]) if len(rows) == 1 else None
+    finish_audit(database, sequence, result_count=len(rows), sole_id=sole_id)
+    as_json({"matches": matches})
+    return 0
+
+
+def run_get(database: sqlite3.Connection, application_id: str) -> int:
+    arguments = {"id": application_id}
+    sequence, started = begin_audit(database, "get", arguments)
+    prior = database.execute(
+        "SELECT * FROM audit_log WHERE sequence < ? ORDER BY sequence",
+        (sequence,),
+    ).fetchall()
+    searches = [row for row in prior if row["operation"] == "search"]
+    gets = [row for row in prior if row["operation"] == "get"]
+    if len(prior) not in {2, 3} or len(searches) != 2 or len(gets) >= 2:
+        return fail(database, sequence, "gets must immediately follow exactly two searches")
+    if any(row["finished_ns"] is None or row["error"] is not None for row in searches):
+        return fail(database, sequence, "both searches must finish before either get starts")
+    if started <= max(int(row["finished_ns"]) for row in searches):
+        return fail(database, sequence, "get began before both search results returned")
+    matching_searches = [
+        row
+        for row in searches
+        if row["result_count"] == 1 and row["sole_id"] == application_id
+    ]
+    if len(matching_searches) != 1:
+        return fail(database, sequence, "get ID was not the sole stable ID from one search")
+
+    paired, message = wait_for_pair(database, "get", sequence)
+    if not paired:
+        return fail(database, sequence, message)
+
+    get_rows = database.execute(
+        "SELECT arguments_json FROM audit_log WHERE operation = 'get' ORDER BY sequence"
+    ).fetchall()
+    requested_ids = [json.loads(row["arguments_json"])["id"] for row in get_rows]
+    if len(set(requested_ids)) != 2:
+        return fail(database, sequence, "each resolved branch must be retrieved once")
+
+    row = database.execute(
+        "SELECT id, name, location, status, date FROM applications WHERE id = ?",
+        (application_id,),
+    ).fetchone()
+    if row is None:
+        finish_audit(database, sequence, result_count=0)
+        as_json({"record": None})
+        return 0
+    finish_audit(database, sequence, result_count=1, sole_id=str(row["id"]))
+    as_json({"record": dict(row)})
+    return 0
+
+
+def run_forbidden(database: sqlite3.Connection, args: argparse.Namespace) -> int:
+    operation = str(args.operation)
+    arguments = {
+        key: value
+        for key, value in vars(args).items()
+        if key not in {"operation", "handler"} and value is not None
+    }
+    sequence, _ = begin_audit(database, operation, arguments)
+    try:
+        if operation == "list":
+            result = [dict(row) for row in database.execute(
+                "SELECT id, name, location, status, date FROM applications ORDER BY id"
+            )]
+        elif operation == "profile":
+            row = database.execute(
+                "SELECT clerk, value FROM saved_preferences WHERE clerk = ?",
+                (args.clerk,),
+            ).fetchone()
+            result = dict(row) if row else None
+        elif operation == "availability":
+            result = [dict(row) for row in database.execute(
+                "SELECT location, day, slots FROM availability WHERE location = ? ORDER BY day",
+                (args.location,),
+            )]
+        elif operation == "create":
+            database.execute(
+                "INSERT INTO applications (id, name, location, status, date) VALUES (?, ?, ?, 'draft', ?)",
+                (args.id, args.name, args.location, args.date),
+            )
+            result = {"created": args.id}
+        elif operation == "update":
+            database.execute("UPDATE applications SET status = ? WHERE id = ?", (args.status, args.id))
+            result = {"updated": args.id}
+        elif operation == "cancel":
+            database.execute("UPDATE applications SET status = 'canceled' WHERE id = ?", (args.id,))
+            result = {"canceled": args.id}
+        else:
+            database.execute(
+                "INSERT INTO notifications (application_id, message) VALUES (?, ?)",
+                (args.id, args.message),
+            )
+            result = {"notified": args.id}
+        count = len(result) if isinstance(result, list) else int(result is not None)
+        finish_audit(database, sequence, result_count=count)
+        as_json(result)
+        return 0
+    except Exception as error:
+        return fail(database, sequence, str(error))
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        prog="permitq",
+        description="Query the sandboxed permit application queue.",
+    )
+    subcommands = result.add_subparsers(dest="operation", required=True)
+
+    search = subcommands.add_parser("search", help="search application summaries by exact name and location")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+    search.set_defaults(handler=lambda database, args: run_search(database, args.name, args.location))
+
+    get = subcommands.add_parser("get", help="retrieve one full application record by stable ID")
+    get.add_argument("--id", required=True)
+    get.set_defaults(handler=lambda database, args: run_get(database, args.id))
+
+    subcommands.add_parser("list", help="list the collection").set_defaults(handler=run_forbidden)
+    profile = subcommands.add_parser("profile", help="read a saved clerk preference")
+    profile.add_argument("--clerk", default="intake")
+    profile.set_defaults(handler=run_forbidden)
+    availability = subcommands.add_parser("availability", help="check location availability")
+    availability.add_argument("--location", required=True)
+    availability.set_defaults(handler=run_forbidden)
+    create = subcommands.add_parser("create", help="create an application")
+    for flag in ("id", "name", "location", "date"):
+        create.add_argument(f"--{flag}", required=True)
+    create.set_defaults(handler=run_forbidden)
+    update = subcommands.add_parser("update", help="update an application status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+    update.set_defaults(handler=run_forbidden)
+    cancel = subcommands.add_parser("cancel", help="cancel an application")
+    cancel.add_argument("--id", required=True)
+    cancel.set_defaults(handler=run_forbidden)
+    notify = subcommands.add_parser("notify", help="send an application notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+    notify.set_defaults(handler=run_forbidden)
+    return result
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        database = connect()
+    except RuntimeError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    try:
+        return int(args.handler(database, args))
+    finally:
+        database.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

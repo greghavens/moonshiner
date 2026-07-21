@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""Read-only appointment lookup CLI with execution-order evidence."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+DATA = ROOT / "clinic-data" / "appointments.json"
+AUDIT = ROOT / ".clinic-audit"
+LOCK_TARGET = AUDIT / ".keep"
+EVIDENCE_ATTR = b"user.moonshiner.clinicctl"
+EVIDENCE_KEY = b"behavior-dependency-planning-0075:executed:v1"
+PAIR_SIZE = 2
+WAIT_SECONDS = 4.0
+
+
+def slug(value: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-")
+    return cleaned or "empty"
+
+
+def canonical(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+
+
+def evidence_value(path: Path, payload: bytes) -> bytes:
+    material = EVIDENCE_KEY + b"\0" + path.name.encode() + b"\0" + payload
+    return hashlib.sha256(material).hexdigest().encode()
+
+
+def write_evidence(path: Path, text: str) -> None:
+    payload = text.encode()
+    path.write_bytes(payload)
+    os.setxattr(path, EVIDENCE_ATTR, evidence_value(path, payload))
+
+
+@contextmanager
+def audit_lock():
+    with LOCK_TARGET.open("rb") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def record_help() -> None:
+    path = AUDIT / "help.used"
+    with audit_lock():
+        if not path.exists():
+            write_evidence(path, "help-used\n")
+
+
+def fail(marker: str, message: str, code: int = 70) -> int:
+    path = AUDIT / f"failure-{slug(marker)}"
+    write_evidence(path, message.rstrip() + "\n")
+    print(f"clinicctl: {message}", file=sys.stderr)
+    return code
+
+
+def records() -> list[dict]:
+    return json.loads(DATA.read_text())
+
+
+def wait_for(pattern: str, count: int, marker: str) -> bool:
+    deadline = time.monotonic() + WAIT_SECONDS
+    while time.monotonic() < deadline:
+        if len(list(AUDIT.glob(pattern))) == count:
+            return True
+        time.sleep(0.025)
+    fail(marker, "parallel peer did not start in the same stage")
+    return False
+
+
+def run_search(name: str, location: str) -> int:
+    stem = f"search-{slug(name)}--{slug(location)}"
+    started = AUDIT / f"{stem}.started"
+    result_path = AUDIT / f"{stem}.result.json"
+    parent = str(os.getppid())
+
+    with audit_lock():
+        if not (AUDIT / "help.used").exists():
+            return fail("help-required", "built-in help must be used before searching")
+        if result_path.exists():
+            return fail(f"duplicate-{stem}", "a completed search cannot be replayed")
+        lease = AUDIT / "stage1.lease"
+        if lease.exists() and lease.read_text().strip() != parent:
+            return fail("split-search-action", "both searches must share one Bash action")
+        lease.write_text(parent + "\n")
+        write_evidence(started, "search-started\n")
+
+    if not wait_for("search-*.started", PAIR_SIZE, "search-barrier"):
+        return 70
+
+    matches = [
+        {"id": row["id"], "name": row["name"], "location": row["location"]}
+        for row in records()
+        if row["name"] == name and row["location"] == location
+    ]
+    result = {"location": location, "matches": matches, "name": name}
+    rendered = canonical(result)
+    write_evidence(result_path, rendered)
+    sys.stdout.write(rendered)
+    return 0
+
+
+def sole_search_for(record_id: str) -> Path | None:
+    found: list[Path] = []
+    for path in AUDIT.glob("search-*.result.json"):
+        value = json.loads(path.read_text())
+        matches = value.get("matches", [])
+        if len(matches) == 1 and matches[0].get("id") == record_id:
+            found.append(path)
+    return found[0] if len(found) == 1 else None
+
+
+def run_get(record_id: str) -> int:
+    stem = f"get-{slug(record_id)}"
+    started = AUDIT / f"{stem}.started"
+    result_path = AUDIT / f"{stem}.result.json"
+    parent = str(os.getppid())
+
+    with audit_lock():
+        if len(list(AUDIT.glob("search-*.result.json"))) != PAIR_SIZE:
+            return fail("early-get", "both searches must finish before retrieval")
+        if sole_search_for(record_id) is None:
+            return fail(f"unguarded-{stem}", "retrieval requires one sole search match")
+        if result_path.exists():
+            return fail(f"duplicate-{stem}", "a completed retrieval cannot be replayed")
+        stage1 = AUDIT / "stage1.lease"
+        if stage1.exists() and stage1.read_text().strip() == parent:
+            return fail("combined-stages", "retrieval must use the next Bash action")
+        stage2 = AUDIT / "stage2.lease"
+        if stage2.exists() and stage2.read_text().strip() != parent:
+            return fail("split-get-action", "both retrievals must share one Bash action")
+        stage2.write_text(parent + "\n")
+        stage1.unlink(missing_ok=True)
+        write_evidence(started, "get-started\n")
+
+    if not wait_for("get-*.started", PAIR_SIZE, "get-barrier"):
+        return 70
+
+    matches = [row for row in records() if row["id"] == record_id]
+    if len(matches) != 1:
+        return fail(f"missing-{stem}", "stable ID did not resolve to one record")
+    rendered = canonical(matches[0])
+    write_evidence(result_path, rendered)
+    sys.stdout.write(rendered)
+
+    with audit_lock():
+        if len(list(AUDIT.glob("get-*.result.json"))) == PAIR_SIZE:
+            (AUDIT / "stage2.lease").unlink(missing_ok=True)
+    return 0
+
+
+HELP = """usage: clinicctl COMMAND [OPTIONS]
+
+Read-only appointment record access.
+
+commands:
+  search        search by exact appointment name and location
+  get           retrieve one record by stable ID
+  list          collection listing (outside this audit's scope)
+  profile       saved preferences (outside this audit's scope)
+  availability  availability lookup (outside this audit's scope)
+  create        create an appointment (outside this audit's scope)
+  update        update an appointment (outside this audit's scope)
+  cancel        cancel an appointment (outside this audit's scope)
+  notify        send a notification (outside this audit's scope)
+
+Run clinicctl COMMAND --help for command options.
+"""
+
+
+def parse_search(arguments: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="clinicctl search")
+    parser.add_argument("--name", required=True)
+    parser.add_argument("--location", required=True)
+    return parser.parse_args(arguments)
+
+
+def parse_get(arguments: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="clinicctl get")
+    parser.add_argument("--id", required=True)
+    return parser.parse_args(arguments)
+
+
+def main(arguments: list[str]) -> int:
+    if not arguments or arguments[0] in {"-h", "--help", "help"}:
+        record_help()
+        print(HELP, end="")
+        return 0
+    command, rest = arguments[0], arguments[1:]
+    if command == "search":
+        if rest in (["-h"], ["--help"]):
+            record_help()
+            parse_search(rest)
+        options = parse_search(rest)
+        return run_search(options.name, options.location)
+    if command == "get":
+        if rest in (["-h"], ["--help"]):
+            record_help()
+            parse_get(rest)
+        options = parse_get(rest)
+        return run_get(options.id)
+    forbidden = {"list", "profile", "availability", "create", "update", "cancel", "notify"}
+    if command in forbidden:
+        return fail(f"forbidden-{command}", f"{command} is not allowed in this read-only audit", 64)
+    return fail(f"unknown-{command}", f"unknown command: {command}", 64)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

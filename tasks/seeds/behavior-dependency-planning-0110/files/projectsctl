@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""Small executable project-record service used by the audit task."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+DATABASE = ROOT / "data" / "projects.sqlite3"
+EVENTS = ROOT / ".pytest_cache" / "project_audit" / "events.jsonl"
+
+
+def emit(value: object) -> None:
+    print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+
+
+def append_event(event: dict[str, object]) -> None:
+    EVENTS.parent.mkdir(parents=True, exist_ok=True)
+    payload = (json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    descriptor = os.open(EVENTS, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(descriptor, payload)
+    finally:
+        os.close(descriptor)
+
+
+def reset_execution_history() -> None:
+    """Begin a fresh audited run when the required root help is requested."""
+    directory = EVENTS.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    EVENTS.unlink(missing_ok=True)
+    for pattern in ("*.ready", "*.release"):
+        for path in directory.glob(pattern):
+            path.unlink()
+
+
+def rendezvous(operation: str) -> None:
+    """Require the two independent read operations to be alive together."""
+    directory = EVENTS.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    marker = directory / f"{operation}.{os.getpid()}.ready"
+    release = directory / f"{operation}.release"
+    marker.write_text("ready\n")
+    deadline = time.monotonic() + 5.0
+    while True:
+        if len(list(directory.glob(f"{operation}.*.ready"))) >= 2:
+            release.touch(exist_ok=True)
+        if release.exists():
+            return
+        if time.monotonic() >= deadline:
+            raise LookupError(
+                f"{operation} requires two concurrently running processes"
+            )
+        time.sleep(0.01)
+
+
+def read_connection() -> sqlite3.Connection:
+    uri = f"file:{DATABASE}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def write_connection() -> sqlite3.Connection:
+    connection = sqlite3.connect(DATABASE)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def row_value(row: sqlite3.Row) -> dict[str, object]:
+    return {key: row[key] for key in ("id", "name", "location", "status")}
+
+
+def run(args: argparse.Namespace) -> tuple[object, list[str]]:
+    if args.operation == "search":
+        rendezvous("search")
+        with read_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, name, location, status
+                  FROM projects
+                 WHERE lower(name) LIKE lower(?) AND location = ?
+                 ORDER BY id
+                """,
+                (f"%{args.query}%", args.location),
+            ).fetchall()
+        matches = [
+            {key: row[key] for key in ("id", "name", "location")}
+            for row in rows
+        ]
+        return {"matches": matches}, [str(row["id"]) for row in rows]
+
+    if args.operation == "get":
+        rendezvous("get")
+        with read_connection() as connection:
+            row = connection.execute(
+                "SELECT id, name, location, status FROM projects WHERE id = ?",
+                (args.id,),
+            ).fetchone()
+        if row is None:
+            raise LookupError(f"record not found: {args.id}")
+        return row_value(row), [str(row["id"])]
+
+    if args.operation == "create":
+        with write_connection() as connection:
+            connection.execute(
+                "INSERT INTO projects(id, name, location, status) VALUES (?, ?, ?, ?)",
+                (args.id, args.name, args.location, args.status),
+            )
+        return {"id": args.id, "created": True}, [args.id]
+
+    if args.operation == "update":
+        with write_connection() as connection:
+            cursor = connection.execute(
+                "UPDATE projects SET status = ? WHERE id = ?", (args.status, args.id)
+            )
+        if cursor.rowcount != 1:
+            raise LookupError(f"record not found: {args.id}")
+        return {"id": args.id, "updated": True}, [args.id]
+
+    if args.operation == "cancel":
+        with write_connection() as connection:
+            cursor = connection.execute(
+                "UPDATE projects SET status = 'cancelled' WHERE id = ?", (args.id,)
+            )
+        if cursor.rowcount != 1:
+            raise LookupError(f"record not found: {args.id}")
+        return {"id": args.id, "cancelled": True}, [args.id]
+
+    if args.operation == "notify":
+        with write_connection() as connection:
+            connection.execute(
+                "INSERT INTO notifications(project_id, message) VALUES (?, ?)",
+                (args.id, args.message),
+            )
+        return {"id": args.id, "notified": True}, [args.id]
+
+    raise AssertionError(f"unhandled operation: {args.operation}")
+
+
+def parser() -> argparse.ArgumentParser:
+    main = argparse.ArgumentParser(
+        prog="projectsctl",
+        description="Query or administer the sandboxed project-record service.",
+    )
+    commands = main.add_subparsers(dest="operation", required=True)
+
+    search = commands.add_parser("search", help="search records by name and location")
+    search.add_argument("--query", required=True)
+    search.add_argument("--location", required=True)
+
+    get = commands.add_parser("get", help="retrieve one complete record by stable ID")
+    get.add_argument("--id", required=True)
+
+    create = commands.add_parser("create", help="create a project record")
+    create.add_argument("--id", required=True)
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--status", required=True)
+
+    update = commands.add_parser("update", help="update a record status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+
+    cancel = commands.add_parser("cancel", help="cancel a record")
+    cancel.add_argument("--id", required=True)
+
+    notify = commands.add_parser("notify", help="send a record notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+    return main
+
+
+def main() -> int:
+    if sys.argv[1:] in (["--help"], ["-h"]):
+        started = time.monotonic_ns()
+        reset_execution_history()
+        parser().print_help()
+        append_event(
+            {
+                "operation": "help",
+                "started_ns": started,
+                "finished_ns": time.monotonic_ns(),
+                "parent_pid": os.getppid(),
+                "arguments": {},
+                "ok": True,
+                "result_ids": [],
+            }
+        )
+        return 0
+
+    args = parser().parse_args()
+    started = time.monotonic_ns()
+    event: dict[str, object] = {
+        "operation": args.operation,
+        "started_ns": started,
+        "parent_pid": os.getppid(),
+        "arguments": {
+            key: value
+            for key, value in vars(args).items()
+            if key != "operation"
+        },
+    }
+    try:
+        result, result_ids = run(args)
+        event.update(
+            {
+                "finished_ns": time.monotonic_ns(),
+                "ok": True,
+                "result_ids": result_ids,
+            }
+        )
+        append_event(event)
+        emit(result)
+        return 0
+    except (LookupError, sqlite3.Error) as error:
+        event.update(
+            {
+                "finished_ns": time.monotonic_ns(),
+                "ok": False,
+                "result_ids": [],
+            }
+        )
+        append_event(event)
+        print(str(error), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

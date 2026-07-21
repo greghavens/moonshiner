@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+
+set -u
+set -o pipefail
+
+usage() {
+    cat >&2 <<'EOF'
+usage: configapply --inventory FILE --root DIR --templates DIR
+                   --validators DIR --backup-dir DIR --journal FILE
+                   [--host HOST]... [--group GROUP]... [--check]
+EOF
+}
+
+die() {
+    printf 'configapply: %s\n' "$*" >&2
+    exit 2
+}
+
+inventory=
+managed_root=
+template_dir=
+validator_dir=
+backup_dir=
+journal=
+check_mode=0
+declare -a wanted_hosts=()
+declare -a wanted_groups=()
+
+while (($#)); do
+    case $1 in
+        --inventory|--root|--templates|--validators|--backup-dir|--journal|--host|--group)
+            (($# >= 2)) || die "$1 requires a value"
+            option=$1
+            value=$2
+            shift 2
+            case $option in
+                --inventory) inventory=$value ;;
+                --root) managed_root=$value ;;
+                --templates) template_dir=$value ;;
+                --validators) validator_dir=$value ;;
+                --backup-dir) backup_dir=$value ;;
+                --journal) journal=$value ;;
+                --host) wanted_hosts+=("$value") ;;
+                --group) wanted_groups+=("$value") ;;
+            esac
+            ;;
+        --check)
+            check_mode=1
+            shift
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            usage
+            die "unknown argument: $1"
+            ;;
+    esac
+done
+
+[[ -n $inventory ]] || die '--inventory is required'
+[[ -n $managed_root ]] || die '--root is required'
+[[ -n $template_dir ]] || die '--templates is required'
+[[ -n $validator_dir ]] || die '--validators is required'
+[[ -n $backup_dir ]] || die '--backup-dir is required'
+[[ -n $journal ]] || die '--journal is required'
+[[ -r $inventory ]] || die "cannot read inventory: $inventory"
+[[ -d $template_dir ]] || die "template directory does not exist: $template_dir"
+[[ -d $validator_dir ]] || die "validator directory does not exist: $validator_dir"
+
+valid_name() {
+    [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+}
+
+valid_relative_path() {
+    local path=$1 component
+    [[ -n $path && $path != /* && $path != */ && $path != *//* ]] || return 1
+    local IFS=/
+    read -r -a components <<< "$path"
+    for component in "${components[@]}"; do
+        valid_name "$component" || return 1
+        [[ $component != . && $component != .. ]] || return 1
+    done
+}
+
+valid_groups() {
+    local groups=$1 group
+    [[ -n $groups ]] || return 0
+    local IFS=,
+    read -r -a entries <<< "$groups"
+    for group in "${entries[@]}"; do
+        valid_name "$group" || return 1
+    done
+}
+
+is_selected() {
+    local host=$1 groups=$2 wanted group
+    if ((${#wanted_hosts[@]} == 0 && ${#wanted_groups[@]} == 0)); then
+        return 0
+    fi
+
+    for wanted in "${wanted_hosts[@]}"; do
+        if [[ $host == *"$wanted"* ]]; then
+            return 0
+        fi
+    done
+
+    for wanted in "${wanted_groups[@]}"; do
+        local IFS=,
+        read -r -a inventory_groups <<< "$groups"
+        for group in "${inventory_groups[@]}"; do
+            [[ $group == "$wanted" ]] && return 0
+        done
+    done
+    return 1
+}
+
+render_template() {
+    local source=$1 output=$2 host=$3 escaped
+    escaped=${host//&/\\&}
+    sed "s/{{HOST}}/$escaped/g" "$source" > "$output"
+}
+
+atomic_copy() {
+    local source=$1 destination=$2 directory temporary
+    directory=${destination%/*}
+    mkdir -p "$directory" || return 1
+    temporary=$(mktemp "$directory/.configapply.XXXXXX") || return 1
+    if ! cp -- "$source" "$temporary"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    if ! mv -f -- "$temporary" "$destination"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+}
+
+append_journal() {
+    local state=$1 host=$2 destination=$3 backup=$4
+    printf '%s\t%s\t%s\t%s\n' "$state" "$host" "$destination" "$backup" >> "$journal"
+}
+
+rollback_root=$(mktemp -d "${TMPDIR:-/tmp}/configapply.XXXXXX") || die 'cannot create temporary directory'
+cleanup() {
+    rm -rf -- "$rollback_root"
+}
+trap cleanup EXIT HUP INT TERM
+
+if ((check_mode == 0)); then
+    mkdir -p -- "$backup_dir" || die "cannot create backup directory: $backup_dir"
+    journal_dir=.
+    [[ $journal == */* ]] && journal_dir=${journal%/*}
+    mkdir -p -- "$journal_dir" || die "cannot create journal directory: $journal_dir"
+    : > "$journal" || die "cannot write journal: $journal"
+fi
+
+failures=0
+line_number=0
+while IFS=$'\t' read -r host groups destination template service extra ||
+      [[ -n ${host}${groups}${destination}${template}${service}${extra} ]]; do
+    ((line_number += 1))
+    [[ -n $host ]] || continue
+    [[ $host == \#* ]] && continue
+
+    if [[ -n ${extra:-} ]] || ! valid_name "$host" || ! valid_groups "$groups" ||
+       ! valid_relative_path "$destination" || ! valid_relative_path "$template" ||
+       { [[ $service != - ]] && ! valid_name "$service"; }; then
+        die "invalid inventory entry on line $line_number"
+    fi
+    is_selected "$host" "$groups" || continue
+
+    source_file=$template_dir/$template
+    target_file=$managed_root/$host/$destination
+    if [[ ! -r $source_file ]]; then
+        printf 'FAILED\t%s\t%s\ttemplate is not readable\n' "$host" "$destination"
+        failures=1
+        continue
+    fi
+
+    rendered=$rollback_root/rendered.$line_number
+    if ! render_template "$source_file" "$rendered" "$host"; then
+        printf 'FAILED\t%s\t%s\ttemplate rendering failed\n' "$host" "$destination"
+        failures=1
+        continue
+    fi
+
+    if [[ -f $target_file ]] && cmp -s -- "$rendered" "$target_file"; then
+        printf 'UNCHANGED\t%s\t%s\n' "$host" "$destination"
+        continue
+    fi
+
+    validator=
+    if [[ $service != - ]]; then
+        validator=$validator_dir/$service
+        if [[ ! -x $validator ]]; then
+            printf 'FAILED\t%s\t%s\tvalidator is not executable\n' "$host" "$destination"
+            failures=1
+            continue
+        fi
+    fi
+
+    if ((check_mode)); then
+        if [[ -n $validator ]] && ! "$validator" "$host" "$rendered"; then
+            printf 'FAILED\t%s\t%s\tvalidation failed\n' "$host" "$destination"
+            failures=1
+        else
+            printf 'WOULD_CHANGE\t%s\t%s\n' "$host" "$destination"
+        fi
+        continue
+    fi
+
+    backup_file=$backup_dir/$host/$destination
+    absent_marker=$backup_file.configapply-absent
+    mkdir -p -- "${backup_file%/*}" || {
+        printf 'FAILED\t%s\t%s\tcannot create backup directory\n' "$host" "$destination"
+        failures=1
+        continue
+    }
+
+    if [[ -e $target_file ]]; then
+        if ! atomic_copy "$target_file" "$backup_file"; then
+            printf 'FAILED\t%s\t%s\tbackup failed\n' "$host" "$destination"
+            failures=1
+            continue
+        fi
+        rm -f -- "$absent_marker"
+    else
+        : > "$absent_marker" || {
+            printf 'FAILED\t%s\t%s\tcannot record absent target\n' "$host" "$destination"
+            failures=1
+            continue
+        }
+        rm -f -- "$backup_file"
+    fi
+
+    append_journal PENDING "$host" "$destination" "$backup_file" || {
+        printf 'FAILED\t%s\t%s\tcannot write journal\n' "$host" "$destination"
+        failures=1
+        continue
+    }
+
+    if ! atomic_copy "$rendered" "$target_file"; then
+        append_journal ROLLED_BACK "$host" "$destination" "$backup_file"
+        printf 'FAILED\t%s\t%s\tatomic update failed\n' "$host" "$destination"
+        failures=1
+        continue
+    fi
+
+    if [[ -n $validator ]] && ! "$validator" "$host" "$target_file"; then
+        if [[ -e $absent_marker ]]; then
+            rm -f -- "$target_file"
+        else
+            atomic_copy "$backup_file" "$target_file" || die "rollback failed for $host:$destination"
+        fi
+        append_journal ROLLED_BACK "$host" "$destination" "$backup_file"
+        printf 'FAILED\t%s\t%s\tvalidation failed; rolled back\n' "$host" "$destination"
+        failures=1
+        continue
+    fi
+
+    append_journal COMMITTED "$host" "$destination" "$backup_file"
+    printf 'CHANGED\t%s\t%s\n' "$host" "$destination"
+done < "$inventory"
+
+exit "$failures"

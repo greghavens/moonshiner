@@ -1,0 +1,440 @@
+#!/usr/bin/env python3
+"""Executable telecom registry for the Pi dependency-planning exercise."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import time
+import uuid
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+STATE_DIR = Path(
+    os.environ.get("PI_TELECOM_STATE_DIR", str(ROOT / ".telecom_runtime"))
+)
+DB_PATH = STATE_DIR / "telecom.sqlite3"
+
+BASE_RECORDS = (
+    (
+        "tel-218",
+        "Library hotspot plan",
+        "Studio Account",
+        "active",
+        None,
+        "standard",
+        0,
+        0,
+    ),
+    (
+        "tel-618",
+        "Workshop phone line",
+        "Field Office",
+        "pending-activation",
+        "2026-08-04",
+        "voice",
+        0,
+        0,
+    ),
+    (
+        "tel-1018",
+        "Library hotspot plan archive",
+        "Community Center",
+        "closed",
+        "2024-03-11",
+        "archive",
+        1,
+        0,
+    ),
+    (
+        "tel-1118",
+        "Library hotspot plan",
+        "Studio Annex",
+        "active",
+        "2025-10-02",
+        "standard",
+        0,
+        0,
+    ),
+    (
+        "tel-1218",
+        "Library hotspot planning line",
+        "Studio Account",
+        "pending-activation",
+        "2026-08-09",
+        "voice",
+        0,
+        0,
+    ),
+    (
+        "tel-1318",
+        "Workshop phone line backup",
+        "Field Office",
+        "active",
+        "2025-12-19",
+        "voice",
+        0,
+        0,
+    ),
+    (
+        "tel-1418",
+        "Workshop phone line",
+        "Remote Field Office",
+        "pending-activation",
+        "2026-08-05",
+        "voice",
+        0,
+        0,
+    ),
+    (
+        "tel-1518",
+        "Workshop phone line",
+        "Field Office",
+        "cancelled",
+        "2025-01-14",
+        "voice",
+        0,
+        1,
+    ),
+)
+
+
+def encode(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def seeded_records(scenario: str) -> tuple[tuple[object, ...], ...]:
+    records = []
+    for record in BASE_RECORDS:
+        seeded = list(record)
+        if scenario == "search-missing" and seeded[0] == "tel-618":
+            continue
+        if scenario == "already-active" and seeded[0] == "tel-618":
+            seeded[3] = "active"
+        if scenario == "already-active" and seeded[0] == "tel-218":
+            seeded[3] = "maintenance"
+            seeded[4] = "2026-07-21"
+        records.append(tuple(seeded))
+    if scenario == "search-ambiguous":
+        records.append(
+            (
+                "tel-2218",
+                "Library hotspot plan",
+                "Studio Account",
+                "active",
+                "2026-06-18",
+                "standard",
+                0,
+                0,
+            )
+        )
+    return tuple(records)
+
+
+def connect() -> sqlite3.Connection:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    database = sqlite3.connect(DB_PATH, timeout=15)
+    database.row_factory = sqlite3.Row
+    database.execute("PRAGMA busy_timeout = 15000")
+    database.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS records (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            location TEXT NOT NULL,
+            status TEXT NOT NULL,
+            activation_date TEXT,
+            service_type TEXT NOT NULL,
+            archived INTEGER NOT NULL DEFAULT 0,
+            cancelled INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            record_id TEXT NOT NULL,
+            message TEXT NOT NULL,
+            created_ns INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS operations (
+            invocation_id TEXT PRIMARY KEY,
+            command TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            result TEXT,
+            started_ns INTEGER NOT NULL,
+            finished_ns INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS fixture_config (
+            name TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        """
+    )
+    database.execute(
+        "INSERT OR IGNORE INTO fixture_config(name, value) VALUES ('scenario', ?)",
+        (os.environ.get("PI_TELECOM_TEST_SCENARIO", "default"),),
+    )
+    scenario = database.execute(
+        "SELECT value FROM fixture_config WHERE name = 'scenario'"
+    ).fetchone()["value"]
+    database.executemany(
+        """
+        INSERT OR IGNORE INTO records(
+            id, name, location, status, activation_date, service_type,
+            archived, cancelled
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        seeded_records(scenario),
+    )
+    database.commit()
+    return database
+
+
+def begin_operation(
+    database: sqlite3.Connection, command: str, payload: object
+) -> str:
+    invocation_id = uuid.uuid4().hex
+    database.execute(
+        """
+        INSERT INTO operations(invocation_id, command, payload, started_ns)
+        VALUES (?, ?, ?, ?)
+        """,
+        (invocation_id, command, encode(payload), time.monotonic_ns()),
+    )
+    database.commit()
+    return invocation_id
+
+
+def finish_operation(
+    database: sqlite3.Connection, invocation_id: str, result: object
+) -> None:
+    database.execute(
+        """
+        UPDATE operations
+        SET result = ?, finished_ns = ?
+        WHERE invocation_id = ?
+        """,
+        (encode(result), time.monotonic_ns(), invocation_id),
+    )
+    database.commit()
+
+
+def record_dict(row: sqlite3.Row) -> dict[str, object]:
+    record: dict[str, object] = {
+        "id": row["id"],
+        "name": row["name"],
+        "location": row["location"],
+        "status": row["status"],
+        "service_type": row["service_type"],
+    }
+    if row["activation_date"] is not None:
+        record["activation_date"] = row["activation_date"]
+    return record
+
+
+def command_search(args: argparse.Namespace) -> int:
+    database = connect()
+    payload = {"name": args.name, "location": args.location}
+    invocation_id = begin_operation(database, "search", payload)
+    time.sleep(0.4)
+    rows = database.execute(
+        """
+        SELECT id, name, location
+        FROM records
+        WHERE name = ? AND location = ? AND archived = 0 AND cancelled = 0
+        ORDER BY id
+        """,
+        (args.name, args.location),
+    ).fetchall()
+    result = {
+        "matches": [
+            {"id": row["id"], "name": row["name"], "location": row["location"]}
+            for row in rows
+        ]
+    }
+    finish_operation(database, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_get(args: argparse.Namespace) -> int:
+    database = connect()
+    payload = {"id": args.id}
+    invocation_id = begin_operation(database, "get", payload)
+    time.sleep(0.4)
+    scenario = database.execute(
+        "SELECT value FROM fixture_config WHERE name = 'scenario'"
+    ).fetchone()["value"]
+    row = database.execute(
+        """
+        SELECT id, name, location, status, activation_date, service_type
+        FROM records
+        WHERE id = ? AND archived = 0 AND cancelled = 0
+        """,
+        (args.id,),
+    ).fetchone()
+    record = record_dict(row) if row is not None else None
+    if args.id == "tel-618" and scenario == "get-missing":
+        record = None
+    elif args.id == "tel-618" and scenario == "get-mismatched":
+        mismatched = database.execute(
+            """
+            SELECT id, name, location, status, activation_date, service_type
+            FROM records
+            WHERE id = 'tel-1418' AND archived = 0 AND cancelled = 0
+            """
+        ).fetchone()
+        record = record_dict(mismatched) if mismatched is not None else None
+    elif (
+        args.id == "tel-618"
+        and scenario == "get-statusless"
+        and record is not None
+    ):
+        record.pop("status", None)
+    result = {"record": record}
+    finish_operation(database, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_update(args: argparse.Namespace) -> int:
+    database = connect()
+    payload = {"id": args.id, "status": args.status}
+    invocation_id = begin_operation(database, "update", payload)
+    before = database.execute(
+        "SELECT status FROM records WHERE id = ? AND archived = 0 AND cancelled = 0",
+        (args.id,),
+    ).fetchone()
+    cursor = database.execute(
+        """
+        UPDATE records SET status = ?
+        WHERE id = ? AND archived = 0 AND cancelled = 0
+        """,
+        (args.status, args.id),
+    )
+    database.commit()
+    after = database.execute(
+        """
+        SELECT id, name, location, status, activation_date, service_type
+        FROM records WHERE id = ?
+        """,
+        (args.id,),
+    ).fetchone()
+    result = {
+        "updated": cursor.rowcount,
+        "before_status": before["status"] if before is not None else None,
+        "record": record_dict(after) if after is not None else None,
+    }
+    finish_operation(database, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_create(args: argparse.Namespace) -> int:
+    database = connect()
+    payload = {
+        "name": args.name,
+        "location": args.location,
+        "status": args.status,
+    }
+    invocation_id = begin_operation(database, "create", payload)
+    record_id = "tel-" + uuid.uuid4().hex[:6]
+    database.execute(
+        """
+        INSERT INTO records(
+            id, name, location, status, activation_date, service_type,
+            archived, cancelled
+        ) VALUES (?, ?, ?, ?, NULL, 'standard', 0, 0)
+        """,
+        (record_id, args.name, args.location, args.status),
+    )
+    database.commit()
+    result = {"created": record_id}
+    finish_operation(database, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_cancel(args: argparse.Namespace) -> int:
+    database = connect()
+    payload = {"id": args.id}
+    invocation_id = begin_operation(database, "cancel", payload)
+    cursor = database.execute(
+        "UPDATE records SET cancelled = 1 WHERE id = ?", (args.id,)
+    )
+    database.commit()
+    result = {"cancelled": cursor.rowcount}
+    finish_operation(database, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_notify(args: argparse.Namespace) -> int:
+    database = connect()
+    payload = {"id": args.id, "message": args.message}
+    invocation_id = begin_operation(database, "notify", payload)
+    database.execute(
+        """
+        INSERT INTO notifications(record_id, message, created_ns)
+        VALUES (?, ?, ?)
+        """,
+        (args.id, args.message, time.monotonic_ns()),
+    )
+    database.commit()
+    result = {"notified": True}
+    finish_operation(database, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="telecomctl",
+        description="Search, retrieve, and manage the sandbox telecom registry.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    search = commands.add_parser("search", help="find exact name and location matches")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+    search.set_defaults(run=command_search)
+
+    get = commands.add_parser("get", help="retrieve one complete record by ID")
+    get.add_argument("--id", required=True)
+    get.set_defaults(run=command_get)
+
+    update = commands.add_parser("update", help="change one record's status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+    update.set_defaults(run=command_update)
+
+    create = commands.add_parser("create", help="create a telecom record")
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--status", required=True)
+    create.set_defaults(run=command_create)
+
+    cancel = commands.add_parser("cancel", help="cancel a telecom record")
+    cancel.add_argument("--id", required=True)
+    cancel.set_defaults(run=command_cancel)
+
+    notify = commands.add_parser("notify", help="send a telecom notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+    notify.set_defaults(run=command_notify)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        return args.run(args)
+    except (OSError, sqlite3.Error) as exc:
+        print(f"telecomctl: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

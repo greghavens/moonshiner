@@ -1,0 +1,191 @@
+diff --git a/src/TokenRefreshStorm/TokenProvider.cs b/src/TokenRefreshStorm/TokenProvider.cs
+--- a/src/TokenRefreshStorm/TokenProvider.cs
++++ b/src/TokenRefreshStorm/TokenProvider.cs
+@@ -8,7 +8,9 @@ public sealed class TokenProvider
+     private readonly IClock _clock;
+     private readonly IRefreshTelemetry _telemetry;
+     private readonly TimeSpan _refreshBeforeExpiry;
++    private readonly object _refreshGate = new();
+     private AccessToken? _cachedToken;
++    private RefreshFlight? _inFlight;
+     private long _nextRefreshId;
+ 
+     public TokenProvider(
+@@ -35,47 +37,128 @@ public sealed class TokenProvider
+             return cachedToken!.Value;
+         }
+ 
+-        // Refresh after the cached token crosses the proactive refresh window.
+-        var refreshId = Interlocked.Increment(ref _nextRefreshId);
+-        var startedAt = Stopwatch.GetTimestamp();
+-        RecordSafely(new RefreshEvent(
+-            RefreshEventKind.Started,
+-            refreshId,
+-            Participants: 1,
+-            Duration: TimeSpan.Zero));
++        RefreshFlight flight;
++        bool startsRefresh;
++        int participantNumber;
+ 
+-        try
++        lock (_refreshGate)
+         {
+-            var refreshed = await _endpoint.RefreshAsync(cancellationToken).ConfigureAwait(false);
+-            Volatile.Write(ref _cachedToken, refreshed);
++            // The token may have been published between the lock-free read and taking
++            // the gate. Rechecking avoids starting a redundant follow-up refresh.
++            cachedToken = Volatile.Read(ref _cachedToken);
++            if (IsUsable(cachedToken))
++            {
++                return cachedToken!.Value;
++            }
++
++            if (_inFlight is null)
++            {
++                flight = new RefreshFlight(++_nextRefreshId);
++                _inFlight = flight;
++                startsRefresh = true;
++            }
++            else
++            {
++                flight = _inFlight;
++                startsRefresh = false;
++            }
++
++            participantNumber = ++flight.Participants;
++        }
++
++        if (startsRefresh)
++        {
+             RecordSafely(new RefreshEvent(
+-                RefreshEventKind.Succeeded,
+-                refreshId,
+-                Participants: 1,
+-                Duration: Stopwatch.GetElapsedTime(startedAt)));
+-            return refreshed.Value;
++                RefreshEventKind.Started,
++                flight.RefreshId,
++                participantNumber,
++                TimeSpan.Zero));
++            _ = RunRefreshAsync(flight);
+         }
+-        catch (OperationCanceledException)
++        else
+         {
+             RecordSafely(new RefreshEvent(
+-                RefreshEventKind.Canceled,
+-                refreshId,
+-                Participants: 1,
+-                Duration: Stopwatch.GetElapsedTime(startedAt)));
+-            throw;
++                RefreshEventKind.Joined,
++                flight.RefreshId,
++                participantNumber,
++                Stopwatch.GetElapsedTime(flight.StartedAt)));
+         }
+-        catch (Exception exception)
++
++        try
+         {
++            var refreshed = await flight.Completion.Task
++                .WaitAsync(cancellationToken)
++                .ConfigureAwait(false);
++            return refreshed.Value;
++        }
++        catch (OperationCanceledException exception) when (
++            cancellationToken.IsCancellationRequested && exception.CancellationToken == cancellationToken)
++        {
+             RecordSafely(new RefreshEvent(
+-                RefreshEventKind.Failed,
+-                refreshId,
+-                Participants: 1,
+-                Duration: Stopwatch.GetElapsedTime(startedAt),
+-                FailureType: exception.GetType().FullName));
++                RefreshEventKind.WaiterCanceled,
++                flight.RefreshId,
++                Volatile.Read(ref flight.Participants),
++                Stopwatch.GetElapsedTime(flight.StartedAt)));
+             throw;
+         }
+     }
+ 
++    private async Task RunRefreshAsync(RefreshFlight flight)
++    {
++        try
++        {
++            // No single request owns the shared operation. Individual request tokens
++            // only cancel their WaitAsync call above.
++            var refreshed = await _endpoint.RefreshAsync(CancellationToken.None).ConfigureAwait(false);
++            var participants = FinishFlight(flight, refreshed);
++            RecordSafely(new RefreshEvent(
++                RefreshEventKind.Succeeded,
++                flight.RefreshId,
++                participants,
++                Stopwatch.GetElapsedTime(flight.StartedAt)));
++            flight.Completion.TrySetResult(refreshed);
++        }
++        catch (OperationCanceledException exception)
++        {
++            var participants = FinishFlight(flight);
++            RecordSafely(new RefreshEvent(
++                RefreshEventKind.Canceled,
++                flight.RefreshId,
++                participants,
++                Stopwatch.GetElapsedTime(flight.StartedAt)));
++            flight.Completion.TrySetCanceled(exception.CancellationToken);
++        }
++        catch (Exception exception)
++        {
++            var participants = FinishFlight(flight);
++            RecordSafely(new RefreshEvent(
++                RefreshEventKind.Failed,
++                flight.RefreshId,
++                participants,
++                Stopwatch.GetElapsedTime(flight.StartedAt),
++                exception.GetType().FullName));
++            flight.Completion.TrySetException(exception);
++        }
++    }
++
++    private int FinishFlight(RefreshFlight flight, AccessToken? refreshed = null)
++    {
++        lock (_refreshGate)
++        {
++            if (refreshed is not null)
++            {
++                Volatile.Write(ref _cachedToken, refreshed);
++            }
++
++            if (ReferenceEquals(_inFlight, flight))
++            {
++                _inFlight = null;
++            }
++
++            return flight.Participants;
++        }
++    }
++
+     private bool IsUsable(AccessToken? token) =>
+         token is not null && token.ExpiresAtUtc > _clock.UtcNow + _refreshBeforeExpiry;
+ 
+@@ -90,4 +173,20 @@ public sealed class TokenProvider
+             // Telemetry must not turn a successful token lookup into a request failure.
+         }
+     }
++
++    private sealed class RefreshFlight
++    {
++        public RefreshFlight(long refreshId)
++        {
++            RefreshId = refreshId;
++            StartedAt = Stopwatch.GetTimestamp();
++            Completion = new TaskCompletionSource<AccessToken>(
++                TaskCreationOptions.RunContinuationsAsynchronously);
++        }
++
++        public long RefreshId { get; }
++        public long StartedAt { get; }
++        public TaskCompletionSource<AccessToken> Completion { get; }
++        public int Participants;
++    }
+ }

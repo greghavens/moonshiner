@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""Executable municipal-record registry used by the Pi harness seed."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+STATE_DIR = ROOT / ".municipal"
+RECORDS_PATH = STATE_DIR / "records.json"
+AUDIT_PATH = STATE_DIR / "audit.jsonl"
+NOTIFICATIONS_PATH = STATE_DIR / "notifications.json"
+LOCK_PATH = STATE_DIR / "lock"
+KEY_PATH = ROOT / ".harness" / "audit.key"
+READ_DELAY_SECONDS = 0.45
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise RuntimeError(f"invalid registry file: {path.name}")
+    return value
+
+
+def atomic_json_write(path: Path, value: dict[str, Any]) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", text=True
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def read_records() -> list[dict[str, Any]]:
+    value = load_json(RECORDS_PATH)
+    records = value.get("records")
+    if value.get("version") != 1 or not isinstance(records, list):
+        raise RuntimeError("invalid record store")
+    if not all(isinstance(record, dict) for record in records):
+        raise RuntimeError("invalid record entry")
+    return records
+
+
+def record_digest(record: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical(record)).hexdigest()
+
+
+def append_audit(event: dict[str, Any]) -> None:
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        with AUDIT_PATH.open(encoding="utf-8") as audit_stream:
+            sequence = sum(1 for line in audit_stream if line.strip()) + 1
+        sealed = dict(event)
+        sealed["sequence"] = sequence
+        key = KEY_PATH.read_bytes().strip()
+        sealed["seal"] = hmac.new(key, canonical(sealed), hashlib.sha256).hexdigest()
+        with AUDIT_PATH.open("a", encoding="utf-8") as audit_stream:
+            audit_stream.write(json.dumps(sealed, ensure_ascii=False, sort_keys=True))
+            audit_stream.write("\n")
+            audit_stream.flush()
+            os.fsync(audit_stream.fileno())
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+
+def emit(value: dict[str, Any]) -> None:
+    json.dump(value, sys.stdout, ensure_ascii=False, sort_keys=True)
+    sys.stdout.write("\n")
+
+
+def search(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    time.sleep(READ_DELAY_SECONDS)
+    matches = [
+        {
+            "id": record["id"],
+            "name": record["name"],
+            "municipality": record["municipality"],
+        }
+        for record in read_records()
+        if record.get("name") == args.name
+        and record.get("municipality") == args.municipality
+    ]
+    matches.sort(key=lambda record: record["id"])
+    finished = time.monotonic_ns()
+    append_audit(
+        {
+            "operation": "search",
+            "name": args.name,
+            "municipality": args.municipality,
+            "started_ns": started,
+            "finished_ns": finished,
+            "outcome": "ok",
+            "result_ids": [record["id"] for record in matches],
+        }
+    )
+    emit({"count": len(matches), "matches": matches})
+    return 0
+
+
+def get_record(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    time.sleep(READ_DELAY_SECONDS)
+    record = next(
+        (record for record in read_records() if record.get("id") == args.id), None
+    )
+    finished = time.monotonic_ns()
+    event: dict[str, Any] = {
+        "operation": "get",
+        "record_id": args.id,
+        "started_ns": started,
+        "finished_ns": finished,
+    }
+    if record is None:
+        event.update({"outcome": "not-found", "found": False})
+        append_audit(event)
+        print(f"record not found: {args.id}", file=sys.stderr)
+        return 3
+    event.update(
+        {
+            "outcome": "ok",
+            "found": True,
+            "record_sha256": record_digest(record),
+            "status": record.get("status"),
+        }
+    )
+    append_audit(event)
+    emit({"record": record})
+    return 0
+
+
+def update_record(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        state = load_json(RECORDS_PATH)
+        records = state.get("records")
+        if not isinstance(records, list):
+            raise RuntimeError("invalid record store")
+        record = next(
+            (record for record in records if record.get("id") == args.id), None
+        )
+        if record is None:
+            before = None
+            outcome = "not-found"
+            updated = 0
+        else:
+            before = record.get("status")
+            record["status"] = args.status
+            atomic_json_write(RECORDS_PATH, state)
+            outcome = "ok"
+            updated = 1
+        finished = time.monotonic_ns()
+
+        with AUDIT_PATH.open(encoding="utf-8") as audit_stream:
+            sequence = sum(1 for line in audit_stream if line.strip()) + 1
+        event = {
+            "operation": "update",
+            "record_id": args.id,
+            "before_status": before,
+            "after_status": args.status,
+            "started_ns": started,
+            "finished_ns": finished,
+            "outcome": outcome,
+            "updated": updated,
+            "sequence": sequence,
+        }
+        key = KEY_PATH.read_bytes().strip()
+        event["seal"] = hmac.new(key, canonical(event), hashlib.sha256).hexdigest()
+        with AUDIT_PATH.open("a", encoding="utf-8") as audit_stream:
+            audit_stream.write(json.dumps(event, ensure_ascii=False, sort_keys=True))
+            audit_stream.write("\n")
+            audit_stream.flush()
+            os.fsync(audit_stream.fileno())
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+    if record is None:
+        print(f"record not found: {args.id}", file=sys.stderr)
+        return 3
+    emit({"before_status": before, "record": record, "updated": updated})
+    return 0
+
+
+def notify(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        state = load_json(NOTIFICATIONS_PATH)
+        notifications = state.get("notifications")
+        if not isinstance(notifications, list):
+            raise RuntimeError("invalid notification store")
+        notifications.append(
+            {"record_id": args.id, "message": args.message, "ordinal": len(notifications) + 1}
+        )
+        atomic_json_write(NOTIFICATIONS_PATH, state)
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    finished = time.monotonic_ns()
+    append_audit(
+        {
+            "operation": "notify",
+            "record_id": args.id,
+            "started_ns": started,
+            "finished_ns": finished,
+            "outcome": "ok",
+        }
+    )
+    emit({"notified": 1, "record_id": args.id})
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="municipal-records",
+        description="Search, retrieve, update, and notify municipal-service records.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    search_parser = subparsers.add_parser(
+        "search", help="search by exact record name and municipality"
+    )
+    search_parser.add_argument("--name", required=True)
+    search_parser.add_argument("--municipality", required=True)
+    search_parser.set_defaults(handler=search)
+
+    get_parser = subparsers.add_parser("get", help="retrieve one complete record")
+    get_parser.add_argument("--id", required=True)
+    get_parser.set_defaults(handler=get_record)
+
+    update_parser = subparsers.add_parser("update", help="change one record status")
+    update_parser.add_argument("--id", required=True)
+    update_parser.add_argument("--status", required=True)
+    update_parser.set_defaults(handler=update_record)
+
+    notify_parser = subparsers.add_parser("notify", help="send a record notification")
+    notify_parser.add_argument("--id", required=True)
+    notify_parser.add_argument("--message", required=True)
+    notify_parser.set_defaults(handler=notify)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        return int(args.handler(args))
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+        print(f"municipal-records: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

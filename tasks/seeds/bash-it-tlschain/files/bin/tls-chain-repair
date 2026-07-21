@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export LC_ALL=C
+
+usage() {
+  echo "usage: tls-chain-repair --leaf FILE --intermediates DIR --roots DIR --hostname NAME --at EPOCH --bundle FILE --rollback-doc FILE" >&2
+  exit 64
+}
+
+die() {
+  local code=$1
+  shift
+  echo "$*" >&2
+  exit "$code"
+}
+
+leaf=
+intermediates_dir=
+roots_dir=
+hostname=
+at_epoch=
+bundle=
+rollback_doc=
+
+while (($#)); do
+  case "$1" in
+    --leaf)
+      (($# >= 2)) || usage
+      leaf=$2
+      shift 2
+      ;;
+    --intermediates)
+      (($# >= 2)) || usage
+      intermediates_dir=$2
+      shift 2
+      ;;
+    --roots)
+      (($# >= 2)) || usage
+      roots_dir=$2
+      shift 2
+      ;;
+    --hostname)
+      (($# >= 2)) || usage
+      hostname=$2
+      shift 2
+      ;;
+    --at)
+      (($# >= 2)) || usage
+      at_epoch=$2
+      shift 2
+      ;;
+    --bundle)
+      (($# >= 2)) || usage
+      bundle=$2
+      shift 2
+      ;;
+    --rollback-doc)
+      (($# >= 2)) || usage
+      rollback_doc=$2
+      shift 2
+      ;;
+    *) usage ;;
+  esac
+done
+
+[[ -n "$leaf" && -n "$intermediates_dir" && -n "$roots_dir" && -n "$hostname" && -n "$at_epoch" && -n "$bundle" && -n "$rollback_doc" ]] || usage
+[[ "$at_epoch" =~ ^[0-9]+$ ]] || die 64 "--at must be a non-negative epoch"
+[[ -f "$leaf" ]] || die 66 "leaf certificate is missing: $leaf"
+[[ -d "$intermediates_dir" ]] || die 66 "intermediates directory is missing: $intermediates_dir"
+[[ -d "$roots_dir" ]] || die 66 "roots directory is missing: $roots_dir"
+[[ -f "$bundle" ]] || die 66 "current bundle is missing: $bundle"
+[[ -d "$(dirname "$bundle")" && -d "$(dirname "$rollback_doc")" ]] || die 66 "output directory is missing"
+
+work_dir=$(mktemp -d)
+bundle_tmp=
+rollback_tmp=
+doc_tmp=
+cleanup() {
+  rm -rf -- "$work_dir"
+  [[ -z "$bundle_tmp" ]] || rm -f -- "$bundle_tmp"
+  [[ -z "$rollback_tmp" ]] || rm -f -- "$rollback_tmp"
+  [[ -z "$doc_tmp" ]] || rm -f -- "$doc_tmp"
+}
+trap cleanup EXIT
+
+contains_private_key() {
+  grep -Eq -- '-----BEGIN ([A-Z0-9]+ )?PRIVATE KEY-----' "$1"
+}
+
+cert_field() {
+  local cert=$1
+  local field=$2
+  openssl x509 -in "$cert" -noout -nameopt RFC2253 -"$field" | sed "s/^${field}=//"
+}
+
+cert_fingerprint() {
+  openssl x509 -in "$1" -noout -fingerprint -sha256 | sed 's/^sha256 Fingerprint=//; s/://g'
+}
+
+validate_cert_file() {
+  local cert=$1
+  contains_private_key "$cert" && die 65 "private-key material is not accepted: $cert"
+  openssl x509 -in "$cert" -noout >/dev/null 2>&1 || die 65 "invalid PEM certificate: $cert"
+  [[ $(grep -c -- '^-----BEGIN CERTIFICATE-----$' "$cert") -eq 1 ]] || die 65 "certificate file must contain exactly one certificate: $cert"
+}
+
+diagnose_cert() {
+  local role=$1
+  local cert=$2
+  local subject issuer dates sans fingerprint
+  subject=$(cert_field "$cert" subject)
+  issuer=$(cert_field "$cert" issuer)
+  dates=$(openssl x509 -in "$cert" -noout -dates | paste -sd ',' -)
+  sans=$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null | tail -n +2 | tr '\n' ' ' | sed 's/^ *//; s/  */ /g; s/ $//')
+  [[ -n "$sans" ]] || sans="(none)"
+  fingerprint=$(cert_fingerprint "$cert")
+  printf 'certificate role=%s file=%s subject=%s issuer=%s %s sans=%s sha256=%s\n' \
+    "$role" "$(basename "$cert")" "$subject" "$issuer" "$dates" "$sans" "$fingerprint"
+}
+
+split_bundle() {
+  local source=$1
+  local destination=$2
+  awk -v destination="$destination" '
+    /^-----BEGIN CERTIFICATE-----$/ { count++; output = sprintf("%s/%03d.pem", destination, count) }
+    count { print > output }
+    /^-----END CERTIFICATE-----$/ { close(output) }
+    END { print count + 0 > (destination "/count") }
+  ' "$source"
+}
+
+served_order_valid() {
+  local candidate_bundle=$1
+  local expected_leaf=$2
+  local expected_intermediate=$3
+  local split_dir=$work_dir/split-$RANDOM
+  local count
+  mkdir -p "$split_dir"
+  split_bundle "$candidate_bundle" "$split_dir"
+  count=$(<"$split_dir/count")
+  if [[ "$count" -ne 2 ]]; then
+    return 1
+  fi
+  [[ $(cert_fingerprint "$split_dir/001.pem") == "$(cert_fingerprint "$expected_leaf")" ]] || return 1
+  [[ $(cert_fingerprint "$split_dir/002.pem") == "$(cert_fingerprint "$expected_intermediate")" ]] || return 1
+}
+
+validate_cert_file "$leaf"
+diagnose_cert leaf "$leaf"
+
+shopt -s nullglob
+intermediate_files=("$intermediates_dir"/*.pem)
+root_files=("$roots_dir"/*.pem)
+shopt -u nullglob
+((${#intermediate_files[@]} > 0)) || die 66 "no intermediate candidates found"
+((${#root_files[@]} > 0)) || die 66 "no trust roots found"
+
+leaf_issuer=$(cert_field "$leaf" issuer)
+selected_intermediate=
+for cert in "${intermediate_files[@]}"; do
+  validate_cert_file "$cert"
+  diagnose_cert intermediate-candidate "$cert"
+  if [[ -z "$selected_intermediate" && $(cert_field "$cert" subject) == "$leaf_issuer" ]]; then
+    selected_intermediate=$cert
+  fi
+done
+[[ -n "$selected_intermediate" ]] || die 1 "no intermediate matches the leaf issuer"
+
+intermediate_issuer=$(cert_field "$selected_intermediate" issuer)
+selected_root=
+for cert in "${root_files[@]}"; do
+  validate_cert_file "$cert"
+  diagnose_cert root-candidate "$cert"
+  if [[ -z "$selected_root" && $(cert_field "$cert" subject) == "$intermediate_issuer" ]]; then
+    selected_root=$cert
+  fi
+done
+[[ -n "$selected_root" ]] || die 1 "no trust root matches the intermediate issuer"
+
+if served_order_valid "$bundle" "$leaf" "$selected_intermediate"; then
+  echo "current bundle order=valid"
+else
+  echo "current bundle order=invalid"
+fi
+
+if ! openssl verify -attime "$at_epoch" -CAfile "$selected_root" -untrusted "$selected_intermediate" "$leaf" >/dev/null 2>&1; then
+  die 1 "certificate validation failed at epoch $at_epoch"
+fi
+echo "validity verified at=$at_epoch"
+echo "trust verified root=$(basename "$selected_root")"
+
+if ! openssl verify -no_check_time -CAfile "$selected_root" -untrusted "$selected_intermediate" -verify_hostname "$hostname" "$leaf" >/dev/null 2>&1; then
+  die 1 "hostname verification failed for $hostname"
+fi
+echo "hostname verified name=$hostname"
+
+candidate=$work_dir/server-chain.pem
+# A TLS server sends the leaf first and then each intermediate toward the root.
+cat -- "$selected_intermediate" "$leaf" > "$candidate"
+
+contains_private_key "$candidate" && die 1 "candidate bundle contains private-key material"
+if ! served_order_valid "$candidate" "$leaf" "$selected_intermediate"; then
+  die 1 "candidate bundle order is invalid"
+fi
+if ! openssl verify -attime "$at_epoch" -CAfile "$selected_root" -untrusted "$candidate" -verify_hostname "$hostname" "$leaf" >/dev/null 2>&1; then
+  die 1 "candidate bundle failed final trust and hostname verification"
+fi
+echo "served bundle verified order=leaf,intermediate certificates=2 root=excluded"
+
+previous_sha=$(sha256sum "$bundle" | awk '{print $1}')
+rollback_bundle="${bundle}.rollback"
+bundle_dir=$(dirname "$bundle")
+bundle_name=$(basename "$bundle")
+rollback_name=$(basename "$rollback_bundle")
+
+rollback_tmp=$(mktemp "${rollback_bundle}.tmp.XXXXXX")
+cp -- "$bundle" "$rollback_tmp"
+mv -f -- "$rollback_tmp" "$rollback_bundle"
+rollback_tmp=
+
+doc_tmp=$(mktemp "${rollback_doc}.tmp.XXXXXX")
+{
+  echo "# TLS bundle rollback"
+  echo
+  echo "Previous bundle SHA-256: $previous_sha"
+  echo "Rollback artifact: $rollback_name"
+  echo
+  echo "Restore command:"
+  printf "cp -- '%s' '%s'\n" "$rollback_name" "$bundle_name"
+} > "$doc_tmp"
+mv -f -- "$doc_tmp" "$rollback_doc"
+doc_tmp=
+
+bundle_tmp=$(mktemp "${bundle_dir}/.${bundle_name}.tmp.XXXXXX")
+cp -- "$candidate" "$bundle_tmp"
+mv -f -- "$bundle_tmp" "$bundle"
+bundle_tmp=
+
+echo "deployment complete bundle=$bundle rollback=$rollback_bundle"

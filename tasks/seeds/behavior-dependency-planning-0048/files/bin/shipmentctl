@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed shipment service."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DATABASE = ROOT / ".protected" / "shipments.sqlite3"
+KEY_FILE = ROOT / ".protected" / "journal.key"
+JOURNAL = ROOT / ".pi-runtime" / "shipment-audit.jsonl"
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        prog="shipmentctl",
+        description="Query or manage the sandboxed shipment service.",
+    )
+    commands = root.add_subparsers(dest="operation", required=True)
+
+    search = commands.add_parser(
+        "search", help="search by exact shipment name and location"
+    )
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+
+    get = commands.add_parser("get", help="retrieve one full shipment by stable ID")
+    get.add_argument("--id", required=True)
+
+    commands.add_parser("list", help="list all shipments")
+    commands.add_parser("profile", help="read the saved desk profile")
+
+    availability = commands.add_parser(
+        "availability", help="check handling availability"
+    )
+    availability.add_argument("--location", required=True)
+
+    create = commands.add_parser("create", help="create a shipment")
+    create.add_argument("--id", required=True)
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--status", required=True)
+    create.add_argument("--date", required=True)
+
+    update = commands.add_parser("update", help="update a shipment status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+
+    cancel = commands.add_parser("cancel", help="cancel a shipment")
+    cancel.add_argument("--id", required=True)
+
+    notify = commands.add_parser("notify", help="record a shipment notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+    return root
+
+
+def connect(read_only: bool) -> sqlite3.Connection:
+    if read_only:
+        connection = sqlite3.connect(f"file:{DATABASE}?mode=ro", uri=True)
+    else:
+        connection = sqlite3.connect(DATABASE)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+def execute(arguments: argparse.Namespace) -> tuple[object, int]:
+    operation = arguments.operation
+
+    if operation == "search":
+        with connect(True) as connection:
+            rows = connection.execute(
+                "SELECT stable_id, name, location FROM shipments "
+                "WHERE name = ? AND location = ? ORDER BY stable_id",
+                (arguments.name, arguments.location),
+            ).fetchall()
+        time.sleep(0.30)
+        return {
+            "matches": [
+                {
+                    "id": row["stable_id"],
+                    "name": row["name"],
+                    "location": row["location"],
+                }
+                for row in rows
+            ]
+        }, 0
+
+    if operation == "get":
+        with connect(True) as connection:
+            row = connection.execute(
+                "SELECT stable_id, name, location, status, shipment_date "
+                "FROM shipments WHERE stable_id = ?",
+                (arguments.id,),
+            ).fetchone()
+        time.sleep(0.30)
+        if row is None:
+            return {"error": "shipment not found", "id": arguments.id}, 4
+        return {
+            "id": row["stable_id"],
+            "name": row["name"],
+            "location": row["location"],
+            "status": row["status"],
+            "date": row["shipment_date"],
+        }, 0
+
+    if operation == "list":
+        with connect(True) as connection:
+            rows = connection.execute(
+                "SELECT stable_id, name, location, status, shipment_date "
+                "FROM shipments ORDER BY stable_id"
+            ).fetchall()
+        return [dict(row) for row in rows], 0
+
+    if operation == "profile":
+        with connect(True) as connection:
+            rows = connection.execute(
+                "SELECT key, value FROM desk_profile ORDER BY key"
+            ).fetchall()
+        return {row["key"]: row["value"] for row in rows}, 0
+
+    if operation == "availability":
+        with connect(True) as connection:
+            row = connection.execute(
+                "SELECT available FROM handling_availability WHERE location = ?",
+                (arguments.location,),
+            ).fetchone()
+        available = None if row is None else bool(row["available"])
+        return {"location": arguments.location, "available": available}, 0
+
+    if operation == "create":
+        try:
+            with connect(False) as connection:
+                connection.execute(
+                    "INSERT INTO shipments(stable_id, name, location, status, shipment_date) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        arguments.id,
+                        arguments.name,
+                        arguments.location,
+                        arguments.status,
+                        arguments.date,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO mutation_log(operation, stable_id) VALUES ('create', ?)",
+                    (arguments.id,),
+                )
+        except sqlite3.IntegrityError:
+            return {"error": "stable ID already exists", "id": arguments.id}, 5
+        return {"created": arguments.id}, 0
+
+    if operation in {"update", "cancel"}:
+        status = arguments.status if operation == "update" else "canceled"
+        with connect(False) as connection:
+            cursor = connection.execute(
+                "UPDATE shipments SET status = ? WHERE stable_id = ?",
+                (status, arguments.id),
+            )
+            if cursor.rowcount:
+                connection.execute(
+                    "INSERT INTO mutation_log(operation, stable_id) VALUES (?, ?)",
+                    (operation, arguments.id),
+                )
+        if cursor.rowcount != 1:
+            return {"error": "shipment not found", "id": arguments.id}, 4
+        return {"id": arguments.id, "status": status}, 0
+
+    if operation == "notify":
+        with connect(False) as connection:
+            connection.execute(
+                "INSERT INTO notifications(stable_id, message) VALUES (?, ?)",
+                (arguments.id, arguments.message),
+            )
+        return {"notified": arguments.id}, 0
+
+    raise AssertionError(f"unsupported operation: {operation!r}")
+
+
+def audit(
+    arguments: argparse.Namespace,
+    started_ns: int,
+    ended_ns: int,
+    response: object,
+    exit_code: int,
+) -> None:
+    supplied = {
+        key: value
+        for key, value in vars(arguments).items()
+        if key != "operation" and value is not None
+    }
+    entry = {
+        "version": 1,
+        "operation": arguments.operation,
+        "arguments": supplied,
+        "pid": os.getpid(),
+        "parent_pid": os.getppid(),
+        "started_ns": started_ns,
+        "ended_ns": ended_ns,
+        "exit_code": exit_code,
+        "response": response,
+    }
+    canonical = json.dumps(
+        entry, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode()
+    signature = hmac.new(KEY_FILE.read_bytes(), canonical, hashlib.sha256).hexdigest()
+    envelope = json.dumps(
+        {"entry": entry, "signature": signature},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    JOURNAL.parent.mkdir(parents=True, exist_ok=True)
+    with JOURNAL.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(envelope + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def main() -> int:
+    arguments = parser().parse_args()
+    started_ns = time.monotonic_ns()
+    try:
+        response, exit_code = execute(arguments)
+    except Exception as error:
+        response = {"error": f"service failure: {type(error).__name__}"}
+        exit_code = 70
+    ended_ns = time.monotonic_ns()
+    audit(arguments, started_ns, ended_ns, response, exit_code)
+    print(json.dumps(response, ensure_ascii=False, sort_keys=True))
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

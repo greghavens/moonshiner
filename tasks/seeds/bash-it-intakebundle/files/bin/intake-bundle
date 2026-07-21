@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+
+set -u
+set -o pipefail
+
+usage() {
+    cat >&2 <<'EOF'
+usage: intake-bundle --source DIR --output ARCHIVE
+EOF
+}
+
+die() {
+    printf 'intake-bundle: %s\n' "$*" >&2
+    exit 2
+}
+
+source_arg=
+output=
+
+while (($#)); do
+    case $1 in
+        --source|--output)
+            (($# >= 2)) || die "$1 requires a value"
+            option=$1
+            value=$2
+            shift 2
+            case $option in
+                --source) source_arg=$value ;;
+                --output) output=$value ;;
+            esac
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            usage
+            die "unknown argument: $1"
+            ;;
+    esac
+done
+
+[[ -n $source_arg ]] || die '--source is required'
+[[ -n $output ]] || die '--output is required'
+[[ -d $source_arg ]] || die "source is not a directory: $source_arg"
+
+if ! source_root=$(realpath -e -- "$source_arg"); then
+    die "cannot resolve source: $source_arg"
+fi
+[[ -d $source_root ]] || die "source is not a directory: $source_arg"
+
+output_dir=$(dirname -- "$output") || die "cannot determine output directory: $output"
+mkdir -p -- "$output_dir" || die "cannot create output directory: $output_dir"
+
+stage=$(mktemp -d "${TMPDIR:-/tmp}/intake-bundle.XXXXXX") ||
+    die 'cannot create staging directory'
+output_tmp=$(mktemp "$output_dir/.intake-bundle.XXXXXX") || {
+    rm -rf -- "$stage"
+    die 'cannot create temporary archive'
+}
+
+cleanup() {
+    rm -rf -- "$stage"
+    [[ -z ${output_tmp:-} ]] || rm -f -- "$output_tmp"
+}
+trap cleanup EXIT HUP INT TERM
+
+mkdir -p -- "$stage/evidence" || die 'cannot initialize staging directory'
+manifest=$stage/manifest.tsv
+printf 'status\tkind\tpath\tdigest_or_reason\n' > "$manifest" ||
+    die 'cannot initialize manifest'
+
+is_within_source() {
+    local candidate=$1
+    [[ $candidate == "$source_root"* ]]
+}
+
+redact_config() {
+    LC_ALL=C awk '
+        {
+            separator = index($0, "=")
+            if (separator > 0) {
+                key = substr($0, 1, separator - 1)
+                folded = tolower(key)
+                gsub(/[[:space:]]/, "", folded)
+                sub(/^export/, "", folded)
+                if (folded ~ /(^|_)(password|passwd|token|secret|api_key|private_key|credential)$/) {
+                    print substr($0, 1, separator) "[REDACTED]"
+                    next
+                }
+            }
+            print
+        }
+    ' "$1"
+}
+
+while IFS=$'\t' read -r kind requirement relative action; do
+    source_path=$source_root/$relative
+    if ! candidate=$(realpath -m -- "$source_path"); then
+        die "cannot resolve allowlisted path: $relative"
+    fi
+    is_within_source "$candidate" ||
+        die "allowlisted path escapes source root: $relative"
+
+    if [[ ! -e $source_path ]]; then
+        if [[ $requirement == optional ]]; then
+            printf 'skipped\t%s\t%s\tmissing_optional\n' \
+                "$kind" "$relative" >> "$manifest" ||
+                die 'cannot append manifest'
+            continue
+        fi
+        die "required evidence is missing: $relative"
+    fi
+
+    [[ -f $source_path && -r $source_path ]] ||
+        die "allowlisted evidence is not a readable file: $relative"
+    if ! candidate=$(realpath -e -- "$source_path"); then
+        die "cannot resolve allowlisted path: $relative"
+    fi
+    is_within_source "$candidate" ||
+        die "allowlisted path escapes source root: $relative"
+
+    destination=$stage/evidence/$relative
+    mkdir -p -- "${destination%/*}" ||
+        die "cannot stage evidence: $relative"
+    case $action in
+        copy)
+            cp -- "$candidate" "$destination" ||
+                die "cannot collect evidence: $relative"
+            ;;
+        redact)
+            redact_config "$candidate" > "$destination" ||
+                die "cannot redact configuration: $relative"
+            ;;
+        *)
+            die "invalid allowlist action: $action"
+            ;;
+    esac
+    chmod 0644 -- "$destination" ||
+        die "cannot normalize evidence permissions: $relative"
+
+    digest=$(sha256sum -- "$destination") ||
+        die "cannot hash evidence: $relative"
+    digest=${digest%% *}
+    [[ $digest =~ ^[0-9a-f]{64}$ ]] ||
+        die "invalid evidence digest: $relative"
+    printf 'collected\t%s\t%s\t%s\n' \
+        "$kind" "$relative" "$digest" >> "$manifest" ||
+        die 'cannot append manifest'
+done <<'EOF'
+log	required	logs/application.log	copy
+log	optional	logs/worker.log	copy
+version	required	versions/bash-it.txt	copy
+disk	required	system/disk.txt	copy
+configuration	required	config/bash-it.env	redact
+EOF
+
+if ! LC_ALL=C tar --sort=name --format=ustar --mtime='@0' \
+        --owner=0 --group=0 --numeric-owner \
+        --mode='u+rwX,go+rX,go-w' -C "$stage" -cf - . |
+        gzip -n > "$output_tmp"; then
+    die 'cannot create deterministic archive'
+fi
+chmod 0644 -- "$output_tmp" || die 'cannot set archive permissions'
+mv -f -- "$output_tmp" "$output" || die "cannot publish archive: $output"
+output_tmp=
+
+printf 'created %s\n' "$output"

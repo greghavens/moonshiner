@@ -13,6 +13,13 @@ import run_state  # noqa: E402
 
 
 class SeedInventoryCounts(unittest.TestCase):
+    def test_active_repo_seed_ids_are_unique_and_replaced_sources_are_preserved(self):
+        seeds = seed_inventory.select_seeds()
+        ids = [seed["id"] for seed in seeds]
+        self.assertEqual(len(ids), len(set(ids)))
+        retired = pathlib.Path(__file__).resolve().parents[1] / "tasks" / "retired-seeds"
+        self.assertTrue(any(retired.glob("*.json")))
+
     def test_inventory_sets_load_the_seed_catalog_once(self):
         seeds = [
             {"id": "ready", "prompt": "Do the task"},

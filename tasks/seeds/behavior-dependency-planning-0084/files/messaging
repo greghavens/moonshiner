@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""Read-only command-line gateway for the outbound-message audit sandbox."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+
+
+DATABASE = Path(__file__).resolve().with_name("messages.sqlite3")
+
+
+def trace(operation: str, event: str, arguments: dict[str, str]) -> None:
+    destination = os.environ.get("MESSAGING_TRACE")
+    if not destination:
+        return
+    record = {
+        "operation": operation,
+        "event": event,
+        "arguments": arguments,
+        "time_ns": time.monotonic_ns(),
+        "pid": os.getpid(),
+        "ppid": os.getppid(),
+    }
+    with open(destination, "a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(json.dumps(record, sort_keys=True) + "\n")
+        stream.flush()
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def synchronize(operation: str) -> None:
+    """Make verifier-observed fan-out deterministic without affecting normal use."""
+    expected = int(os.environ.get("MESSAGING_EXPECTED_PEERS", "0"))
+    destination = os.environ.get("MESSAGING_TRACE")
+    if expected < 2 or not destination:
+        time.sleep(0.18)
+        return
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        with open(destination, "r", encoding="utf-8") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_SH)
+            records = [json.loads(line) for line in stream if line.strip()]
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        peers = sum(
+            record["operation"] == operation and record["event"] == "start"
+            for record in records
+        )
+        if peers >= expected:
+            time.sleep(0.05)
+            return
+        time.sleep(0.01)
+    raise RuntimeError(f"timed out waiting for concurrent {operation} peers")
+
+
+def connect() -> sqlite3.Connection:
+    database_uri = f"file:{DATABASE.as_posix()}?mode=ro&immutable=1"
+    connection = sqlite3.connect(database_uri, uri=True)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def emit(payload: dict) -> None:
+    print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+
+
+def search(args: argparse.Namespace) -> int:
+    arguments = {"name": args.name, "location": args.location}
+    trace("search", "start", arguments)
+    synchronize("search")
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, name, location, stable
+              FROM messages
+             WHERE name = ? AND location = ? AND current = 1
+             ORDER BY id
+            """,
+            (args.name, args.location),
+        ).fetchall()
+    matches = [
+        {
+            "id": row["id"],
+            "location": row["location"],
+            "name": row["name"],
+            "stable": bool(row["stable"]),
+        }
+        for row in rows
+    ]
+    trace("search", "end", arguments)
+    emit({"matches": matches})
+    return 0
+
+
+def get_message(args: argparse.Namespace) -> int:
+    arguments = {"id": args.id}
+    trace("get", "start", arguments)
+    synchronize("get")
+    with connect() as connection:
+        row = connection.execute(
+            """
+            SELECT id, name, location, status
+              FROM messages
+             WHERE id = ? AND current = 1 AND stable = 1
+            """,
+            (args.id,),
+        ).fetchone()
+    trace("get", "end", arguments)
+    if row is None:
+        emit({"error": "not_found"})
+        return 4
+    emit({key: row[key] for key in ("id", "name", "location", "status")})
+    return 0
+
+
+def forbidden(args: argparse.Namespace) -> int:
+    operation = args.operation
+    trace(operation, "start", {})
+    trace(operation, "end", {})
+    print(f"error: {operation} is unavailable in the read-only audit sandbox", file=sys.stderr)
+    return 3
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="messaging",
+        description="Read-only outbound-message lookup gateway. Results are JSON.",
+    )
+    commands = parser.add_subparsers(dest="operation", required=True)
+
+    search_parser = commands.add_parser(
+        "search", help="find current messages by exact name and location"
+    )
+    search_parser.add_argument("--name", required=True)
+    search_parser.add_argument("--location", required=True)
+    search_parser.set_defaults(handler=search)
+
+    get_parser = commands.add_parser("get", help="retrieve one current stable message by ID")
+    get_parser.add_argument("--id", required=True)
+    get_parser.set_defaults(handler=get_message)
+
+    for name in (
+        "list",
+        "profile",
+        "availability",
+        "create",
+        "update",
+        "cancel",
+        "notify",
+    ):
+        command = commands.add_parser(name, help=argparse.SUPPRESS)
+        command.set_defaults(handler=forbidden)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    return args.handler(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

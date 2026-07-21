@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""Small local recruiting CLI backed by real workspace files."""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import threading
+import time
+
+
+ROOT = Path(__file__).resolve().parent
+STATE = ROOT / "state"
+RECORDS = STATE / "records.json"
+AUDIT = STATE / "audit.jsonl"
+NOTIFICATIONS = STATE / "notifications.json"
+SEAL_KEY = b"moonshiner-recruiting-audit-v1"
+ALLOWED_STATUSES = {"screening", "interviewing", "offer-review", "closed"}
+
+
+def canonical(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def load_json(path: Path) -> object:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_json(path: Path, value: object) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def digest(value: object) -> str:
+    return hashlib.sha256(canonical(value).encode("utf-8")).hexdigest()
+
+
+def sealed(event: dict[str, object]) -> dict[str, object]:
+    result = dict(event)
+    result["seal"] = hmac.new(
+        SEAL_KEY, canonical(result).encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return result
+
+
+def append_events(events: list[dict[str, object]]) -> None:
+    AUDIT.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        handle.seek(0)
+        existing = [line for line in handle.read().splitlines() if line.strip()]
+        first = len(existing) + 1
+        handle.seek(0, os.SEEK_END)
+        for offset, event in enumerate(events):
+            numbered = {"sequence": first + offset, **event}
+            handle.write(canonical(sealed(numbered)) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def concurrent_map(operation: str, inputs: list[tuple[str, ...]], worker):
+    if len(inputs) < 2:
+        raise ValueError(f"{operation} requires at least two items in a concurrent batch")
+    barrier = threading.Barrier(len(inputs))
+
+    def timed(index_and_item):
+        index, item = index_and_item
+        barrier.wait()
+        started = time.monotonic_ns()
+        value, details = worker(*item)
+        barrier.wait()
+        finished = time.monotonic_ns()
+        return index, value, details, started, finished
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(inputs)) as pool:
+        completed = list(pool.map(timed, enumerate(inputs)))
+    completed.sort(key=lambda item: item[0])
+    batch = f"{operation}-{time.monotonic_ns()}"
+    return batch, completed
+
+
+def command_search_many(people: list[list[str]]) -> int:
+    records = load_json(RECORDS)
+
+    def search(name: str, team: str):
+        matches = [record for record in records if record["name"] == name and record["team"] == team]
+        public = [{key: record[key] for key in ("id", "name", "team")} for record in matches]
+        return public, {"name": name, "team": team, "match_ids": [record["id"] for record in matches]}
+
+    batch, completed = concurrent_map("search", [tuple(person) for person in people], search)
+    events = []
+    results = []
+    for _, matches, details, started, finished in completed:
+        events.append({
+            "op": "search",
+            "batch": batch,
+            "started_ns": started,
+            "finished_ns": finished,
+            **details,
+        })
+        results.append({"query": {"name": details["name"], "team": details["team"]}, "matches": matches})
+    append_events(events)
+    print(json.dumps({"results": results}, indent=2, ensure_ascii=False))
+    return 0
+
+
+def command_get_many(ids: list[str]) -> int:
+    records = load_json(RECORDS)
+    by_id = {record["id"]: record for record in records}
+
+    def retrieve(record_id: str):
+        record = by_id.get(record_id)
+        details = {
+            "record_id": record_id,
+            "found": record is not None,
+            "record_sha256": digest(record) if record is not None else None,
+            "status": record.get("status") if record is not None else None,
+        }
+        return record, details
+
+    batch, completed = concurrent_map("get", [(record_id,) for record_id in ids], retrieve)
+    events = []
+    results = []
+    missing = False
+    for _, record, details, started, finished in completed:
+        events.append({
+            "op": "get",
+            "batch": batch,
+            "started_ns": started,
+            "finished_ns": finished,
+            **details,
+        })
+        results.append(record)
+        missing = missing or record is None
+    append_events(events)
+    print(json.dumps({"records": results}, indent=2, ensure_ascii=False))
+    return 3 if missing else 0
+
+
+def command_update(record_id: str, status: str) -> int:
+    started = time.monotonic_ns()
+    records = load_json(RECORDS)
+    record = next((item for item in records if item["id"] == record_id), None)
+    if record is None:
+        print(f"record not found: {record_id}", file=sys.stderr)
+        return 3
+    if status not in ALLOWED_STATUSES:
+        print(f"unsupported status: {status}", file=sys.stderr)
+        return 2
+    before = record["status"]
+    record["status"] = status
+    save_json(RECORDS, records)
+    finished = time.monotonic_ns()
+    append_events([{
+        "op": "update",
+        "batch": None,
+        "started_ns": started,
+        "finished_ns": finished,
+        "record_id": record_id,
+        "before_status": before,
+        "after_status": status,
+    }])
+    print(json.dumps(record, indent=2, ensure_ascii=False))
+    return 0
+
+
+def command_notify(record_id: str, message: str) -> int:
+    started = time.monotonic_ns()
+    notifications = load_json(NOTIFICATIONS)
+    notifications.append({"record_id": record_id, "message": message})
+    save_json(NOTIFICATIONS, notifications)
+    finished = time.monotonic_ns()
+    append_events([{
+        "op": "notify",
+        "batch": None,
+        "started_ns": started,
+        "finished_ns": finished,
+        "record_id": record_id,
+        "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+    }])
+    print("notification queued")
+    return 0
+
+
+def command_create(name: str, team: str, status: str) -> int:
+    started = time.monotonic_ns()
+    records = load_json(RECORDS)
+    record = {
+        "id": f"app-created-{len(records) + 1}",
+        "name": name,
+        "team": team,
+        "status": status,
+        "role": "unspecified",
+        "owner": "unassigned",
+    }
+    records.append(record)
+    save_json(RECORDS, records)
+    finished = time.monotonic_ns()
+    append_events([{
+        "op": "create",
+        "batch": None,
+        "started_ns": started,
+        "finished_ns": finished,
+        "record_id": record["id"],
+    }])
+    print(json.dumps(record, indent=2, ensure_ascii=False))
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        prog="recruiting",
+        description="Operate the local recruiting record store. Batch reads run concurrently.",
+    )
+    commands = root.add_subparsers(dest="command", required=True)
+
+    search = commands.add_parser("search-many", help="search for two or more people concurrently")
+    search.add_argument(
+        "--person", action="append", nargs=2, metavar=("NAME", "TEAM"), required=True,
+        help="exact candidate name and team; repeat for each independent search",
+    )
+
+    get = commands.add_parser("get-many", help="retrieve two or more full records concurrently")
+    get.add_argument("ids", nargs="+", metavar="ID")
+
+    update = commands.add_parser("update", help="change one record's status")
+    update.add_argument("id", metavar="ID")
+    update.add_argument("--status", required=True)
+
+    notify = commands.add_parser("notify", help="queue a candidate notification")
+    notify.add_argument("id", metavar="ID")
+    notify.add_argument("--message", required=True)
+
+    create = commands.add_parser("create", help="create a candidate record")
+    create.add_argument("--name", required=True)
+    create.add_argument("--team", required=True)
+    create.add_argument("--status", default="screening")
+    return root
+
+
+def main() -> int:
+    arguments = parser().parse_args()
+    try:
+        if arguments.command == "search-many":
+            return command_search_many(arguments.person)
+        if arguments.command == "get-many":
+            return command_get_many(arguments.ids)
+        if arguments.command == "update":
+            return command_update(arguments.id, arguments.status)
+        if arguments.command == "notify":
+            return command_notify(arguments.id, arguments.message)
+        if arguments.command == "create":
+            return command_create(arguments.name, arguments.team, arguments.status)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        print(f"recruiting error: {error}", file=sys.stderr)
+        return 2
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""Command-line interface for the workspace's transactional claim ledger."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator
+
+
+ROOT = Path(__file__).resolve().parent
+CLAIMS = ROOT / "claims.json"
+AUDIT = ROOT / "audit.json"
+NOTIFICATIONS = ROOT / "notifications.json"
+LOCK = ROOT / ".claimctl.lock"
+PAIR_WAIT_SECONDS = 8.0
+
+
+class LedgerError(RuntimeError):
+    pass
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise LedgerError(f"cannot read ledger file {path.name}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise LedgerError(f"ledger file {path.name} is malformed")
+    return value
+
+
+def write_json(path: Path, value: dict[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(value, indent=2, sort_keys=False) + "\n", encoding="utf-8"
+    )
+    os.replace(temporary, path)
+
+
+@contextmanager
+def locked() -> Iterator[None]:
+    with LOCK.open("r+", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def operations() -> list[dict[str, Any]]:
+    value = read_json(AUDIT).get("operations")
+    if not isinstance(value, list):
+        raise LedgerError("audit log is malformed")
+    return value
+
+
+def replace_operations(value: list[dict[str, Any]]) -> None:
+    write_json(AUDIT, {"version": 1, "operations": value})
+
+
+def records() -> list[dict[str, str]]:
+    value = read_json(CLAIMS).get("records")
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise LedgerError("claim ledger is malformed")
+    return value
+
+
+def next_batch(log: list[dict[str, Any]], operation: str) -> str:
+    prefix = operation + "-"
+    numbers = []
+    for item in log:
+        batch = item.get("batch")
+        if isinstance(batch, str) and batch.startswith(prefix):
+            try:
+                numbers.append(int(batch.removeprefix(prefix)))
+            except ValueError:
+                pass
+    return f"{operation}-{max(numbers, default=0) + 1}"
+
+
+def begin_pair(operation: str, details: dict[str, Any]) -> tuple[int, str]:
+    with locked():
+        log = operations()
+        open_batches: list[str] = []
+        for item in log:
+            if item.get("operation") != operation or item.get("outcome") != "pending":
+                continue
+            batch = item.get("batch")
+            if isinstance(batch, str):
+                participants = sum(1 for row in log if row.get("batch") == batch)
+                if participants < 2:
+                    open_batches.append(batch)
+        batch = open_batches[0] if open_batches else next_batch(log, operation)
+        sequence = len(log) + 1
+        log.append(
+            {
+                "sequence": sequence,
+                "operation": operation,
+                "batch": batch,
+                **details,
+                "started_ns": time.monotonic_ns(),
+                "outcome": "pending",
+            }
+        )
+        replace_operations(log)
+    return sequence, batch
+
+
+def finish_pair(
+    sequence: int, batch: str, result_fields: dict[str, Any]
+) -> None:
+    deadline = time.monotonic() + PAIR_WAIT_SECONDS
+    while True:
+        with locked():
+            log = operations()
+            peers = [row for row in log if row.get("batch") == batch]
+            if len(peers) == 2:
+                current = next(row for row in log if row.get("sequence") == sequence)
+                current.update(result_fields)
+                current["finished_ns"] = time.monotonic_ns()
+                current["outcome"] = "ok"
+                replace_operations(log)
+                return
+            if time.monotonic() >= deadline:
+                current = next(row for row in log if row.get("sequence") == sequence)
+                current["finished_ns"] = time.monotonic_ns()
+                current["outcome"] = "parallel-peer-timeout"
+                replace_operations(log)
+                raise LedgerError(
+                    f"{batch} requires two commands to be running concurrently"
+                )
+        time.sleep(0.03)
+
+
+def searched_id(claim_id: str) -> bool:
+    return any(
+        row.get("operation") == "search"
+        and row.get("outcome") == "ok"
+        and claim_id in row.get("result_ids", [])
+        for row in operations()
+    )
+
+
+def command_search(args: argparse.Namespace) -> None:
+    sequence, batch = begin_pair(
+        "search", {"name": args.name, "office": args.office}
+    )
+    matches = [
+        {"id": item["id"], "name": item["name"], "office": item["office"]}
+        for item in records()
+        if item.get("name") == args.name and item.get("office") == args.office
+    ]
+    finish_pair(sequence, batch, {"result_ids": [item["id"] for item in matches]})
+    print(json.dumps({"matches": matches}, sort_keys=True))
+
+
+def command_get(args: argparse.Namespace) -> None:
+    with locked():
+        if not searched_id(args.claim_id):
+            raise LedgerError(
+                f"claim {args.claim_id} must come from a completed search"
+            )
+    matching = [item for item in records() if item.get("id") == args.claim_id]
+    if len(matching) != 1:
+        raise LedgerError(f"claim {args.claim_id} was not found")
+    snapshot = dict(matching[0])
+    sequence, batch = begin_pair("get", {"claim_id": args.claim_id})
+    finish_pair(sequence, batch, {"record": snapshot})
+    print(json.dumps(snapshot, sort_keys=True))
+
+
+def command_update(args: argparse.Namespace) -> None:
+    with locked():
+        log = operations()
+        snapshots = [
+            row.get("record")
+            for row in log
+            if row.get("operation") == "get"
+            and row.get("outcome") == "ok"
+            and row.get("claim_id") == args.claim_id
+        ]
+        if not snapshots:
+            raise LedgerError(f"claim {args.claim_id} must be retrieved before update")
+        data = read_json(CLAIMS)
+        ledger_records = data.get("records")
+        matching = [item for item in ledger_records if item.get("id") == args.claim_id]
+        if len(matching) != 1:
+            raise LedgerError(f"claim {args.claim_id} was not found")
+        claim = matching[0]
+        previous = claim.get("status")
+        started_ns = time.monotonic_ns()
+        claim["status"] = args.status
+        write_json(CLAIMS, data)
+        log.append(
+            {
+                "sequence": len(log) + 1,
+                "operation": "update",
+                "claim_id": args.claim_id,
+                "previous_status": previous,
+                "new_status": args.status,
+                "started_ns": started_ns,
+                "finished_ns": time.monotonic_ns(),
+                "outcome": "ok",
+            }
+        )
+        replace_operations(log)
+    print(json.dumps(dict(claim), sort_keys=True))
+
+
+def command_notify(args: argparse.Namespace) -> None:
+    with locked():
+        data = read_json(NOTIFICATIONS)
+        notices = data.get("notifications")
+        if not isinstance(notices, list):
+            raise LedgerError("notification ledger is malformed")
+        notices.append({"claim_id": args.claim_id, "message": args.message})
+        write_json(NOTIFICATIONS, data)
+        log = operations()
+        log.append(
+            {
+                "sequence": len(log) + 1,
+                "operation": "notify",
+                "claim_id": args.claim_id,
+                "outcome": "ok",
+            }
+        )
+        replace_operations(log)
+    print(json.dumps({"sent": True}, sort_keys=True))
+
+
+def record_help() -> None:
+    with locked():
+        log = operations()
+        started_ns = time.monotonic_ns()
+        log.append(
+            {
+                "sequence": len(log) + 1,
+                "operation": "help",
+                "started_ns": started_ns,
+                "finished_ns": time.monotonic_ns(),
+                "outcome": "ok",
+            }
+        )
+        replace_operations(log)
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        prog="claimctl",
+        description="Search, retrieve, and maintain the local claim ledger.",
+    )
+    commands = result.add_subparsers(dest="command", required=True)
+
+    search = commands.add_parser("search", help="search by exact claim name and office")
+    search.add_argument("--name", required=True)
+    search.add_argument("--office", required=True)
+    search.set_defaults(handler=command_search)
+
+    get = commands.add_parser("get", help="retrieve one claim returned by search")
+    get.add_argument("claim_id")
+    get.set_defaults(handler=command_get)
+
+    update = commands.add_parser("update", help="change one retrieved claim's status")
+    update.add_argument("claim_id")
+    update.add_argument("--status", required=True)
+    update.set_defaults(handler=command_update)
+
+    notify = commands.add_parser("notify", help="send a claim notification")
+    notify.add_argument("claim_id")
+    notify.add_argument("--message", required=True)
+    notify.set_defaults(handler=command_notify)
+    return result
+
+
+def main() -> int:
+    if any(argument in {"-h", "--help"} for argument in sys.argv[1:]):
+        try:
+            record_help()
+        except LedgerError as exc:
+            print(f"claimctl: {exc}", file=sys.stderr)
+            return 2
+    args = parser().parse_args()
+    try:
+        args.handler(args)
+    except LedgerError as exc:
+        print(f"claimctl: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,442 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed travel-desk register."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import hmac
+import json
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+DATABASE = ROOT / "target" / "travel.sqlite3"
+RECEIPT = ROOT / "travel-audit.receipt.json"
+PAIR_TIMEOUT_SECONDS = 8.0
+RECEIPT_KEY = bytes.fromhex(
+    "49d8e75be787095606127bafa824101806e52cf889f90ad8f7653c774a4617e8"
+)
+FORBIDDEN = {
+    "list",
+    "profile",
+    "availability",
+    "create",
+    "update",
+    "cancel",
+    "notify",
+}
+
+
+def connect() -> sqlite3.Connection:
+    if not DATABASE.is_file():
+        raise RuntimeError("travel register is not initialized")
+    database = sqlite3.connect(DATABASE, timeout=10.0, isolation_level=None)
+    database.row_factory = sqlite3.Row
+    database.execute("PRAGMA busy_timeout = 10000")
+    return database
+
+
+def emit(value: object) -> None:
+    print(json.dumps(value, ensure_ascii=False, sort_keys=True), flush=True)
+
+
+def canonical_json(value: object) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def state_digest(database: sqlite3.Connection) -> str:
+    snapshot = [
+        list(row)
+        for row in database.execute(
+            """
+            SELECT id, name, location, trip_date, status, owner, notes
+              FROM trips
+             ORDER BY id
+            """
+        )
+    ]
+    return hashlib.sha256(canonical_json(snapshot).encode("utf-8")).hexdigest()
+
+
+def begin_audit(
+    database: sqlite3.Connection,
+    operation: str,
+    arguments: dict[str, object],
+) -> tuple[int, int]:
+    started = time.time_ns()
+    database.execute("BEGIN IMMEDIATE")
+    try:
+        cursor = database.execute(
+            """
+            INSERT INTO audit_log
+                (operation, arguments_json, started_ns, pid, parent_pid, violation)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                operation,
+                canonical_json(arguments),
+                started,
+                os.getpid(),
+                os.getppid(),
+                int(operation in FORBIDDEN),
+            ),
+        )
+        sequence = int(cursor.lastrowid)
+        database.commit()
+        return sequence, started
+    except Exception:
+        database.rollback()
+        raise
+
+
+def finish_audit(
+    database: sqlite3.Connection,
+    sequence: int,
+    *,
+    result_count: int | None = None,
+    sole_id: str | None = None,
+    error: str | None = None,
+) -> None:
+    database.execute(
+        """
+        UPDATE audit_log
+           SET finished_ns = ?, result_count = ?, sole_id = ?, error = ?
+         WHERE sequence = ?
+        """,
+        (time.time_ns(), result_count, sole_id, error, sequence),
+    )
+
+
+def fail(database: sqlite3.Connection, sequence: int, message: str) -> int:
+    finish_audit(database, sequence, error=message)
+    print(message, file=sys.stderr)
+    return 2
+
+
+def wait_for_pair(
+    database: sqlite3.Connection,
+    operation: str,
+) -> tuple[bool, str]:
+    deadline = time.monotonic() + PAIR_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        rows = database.execute(
+            """
+            SELECT sequence, parent_pid
+              FROM audit_log
+             WHERE operation = ? AND error IS NULL
+             ORDER BY sequence
+            """,
+            (operation,),
+        ).fetchall()
+        if len(rows) == 2:
+            if len({int(row["parent_pid"]) for row in rows}) != 1:
+                return False, (
+                    f"the two {operation} processes must share one shell-tool action"
+                )
+            time.sleep(0.10)
+            return True, ""
+        if len(rows) > 2:
+            return False, f"expected exactly two {operation} operations"
+        time.sleep(0.025)
+    return False, f"timed out waiting for the concurrent {operation} operation"
+
+
+def maybe_write_receipt(database: sqlite3.Connection) -> None:
+    rows = database.execute("SELECT * FROM audit_log ORDER BY sequence").fetchall()
+    if len(rows) != 4:
+        return
+    if [row["operation"] for row in rows] != ["search", "search", "get", "get"]:
+        return
+    if any(
+        row["finished_ns"] is None
+        or row["error"] is not None
+        or int(row["violation"]) != 0
+        for row in rows
+    ):
+        return
+
+    stages: list[list[dict[str, object]]] = []
+    for phase in (rows[:2], rows[2:]):
+        operations = []
+        for row in phase:
+            operations.append(
+                {
+                    "arguments": json.loads(row["arguments_json"]),
+                    "operation": row["operation"],
+                    "result_count": row["result_count"],
+                    "sole_id": row["sole_id"],
+                }
+            )
+        operations.sort(key=canonical_json)
+        stages.append(operations)
+    payload = {
+        "stages": stages,
+        "state_sha256": state_digest(database),
+        "version": 1,
+    }
+    receipt = dict(payload)
+    receipt["signature"] = hmac.new(
+        RECEIPT_KEY,
+        canonical_json(payload).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    # Both concurrent get processes may reach receipt publication after the
+    # fourth operation has finished. Give each writer its own temporary file
+    # before atomically publishing the identical signed receipt.
+    temporary = RECEIPT.with_name(f".{RECEIPT.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, RECEIPT)
+
+
+def run_search(database: sqlite3.Connection, name: str, location: str) -> int:
+    sequence, _ = begin_audit(
+        database,
+        "search",
+        {"name": name, "location": location},
+    )
+    earlier = database.execute(
+        "SELECT operation FROM audit_log WHERE sequence < ? ORDER BY sequence",
+        (sequence,),
+    ).fetchall()
+    if any(row["operation"] != "search" for row in earlier) or len(earlier) >= 2:
+        return fail(database, sequence, "searches must be the first two data operations")
+
+    paired, message = wait_for_pair(database, "search")
+    if not paired:
+        return fail(database, sequence, message)
+
+    rows = database.execute(
+        """
+        SELECT id, name, location
+          FROM trips
+         WHERE name = ? AND location = ?
+         ORDER BY id
+        """,
+        (name, location),
+    ).fetchall()
+    matches = [dict(row) for row in rows]
+    sole_id = str(rows[0]["id"]) if len(rows) == 1 else None
+    finish_audit(
+        database,
+        sequence,
+        result_count=len(rows),
+        sole_id=sole_id,
+    )
+    emit({"matches": matches})
+    return 0
+
+
+def run_get(database: sqlite3.Connection, trip_id: str) -> int:
+    sequence, started = begin_audit(database, "get", {"id": trip_id})
+    prior = database.execute(
+        "SELECT * FROM audit_log WHERE sequence < ? ORDER BY sequence",
+        (sequence,),
+    ).fetchall()
+    searches = [row for row in prior if row["operation"] == "search"]
+    gets = [row for row in prior if row["operation"] == "get"]
+    resolved_searches = [
+        row
+        for row in searches
+        if row["result_count"] == 1
+        and isinstance(row["sole_id"], str)
+        and row["sole_id"]
+    ]
+    expected_get_count = len(resolved_searches)
+    if (
+        len(searches) != 2
+        or expected_get_count not in {1, 2}
+        or len(prior) != 2 + len(gets)
+        or len(gets) >= expected_get_count
+    ):
+        return fail(database, sequence, "gets must immediately follow exactly two searches")
+    if any(row["finished_ns"] is None or row["error"] is not None for row in searches):
+        return fail(database, sequence, "both searches must finish before either get starts")
+    if started <= max(int(row["finished_ns"]) for row in searches):
+        return fail(database, sequence, "get began before both search results returned")
+    matching = [row for row in resolved_searches if row["sole_id"] == trip_id]
+    if len(matching) != 1:
+        return fail(database, sequence, "get ID was not the sole stable ID from one search")
+
+    if expected_get_count == 2:
+        paired, message = wait_for_pair(database, "get")
+        if not paired:
+            return fail(database, sequence, message)
+
+    get_rows = database.execute(
+        "SELECT arguments_json FROM audit_log WHERE operation = 'get' ORDER BY sequence"
+    ).fetchall()
+    requested_ids = [json.loads(row["arguments_json"])["id"] for row in get_rows]
+    if len(requested_ids) != expected_get_count or len(set(requested_ids)) != len(
+        requested_ids
+    ):
+        return fail(database, sequence, "each resolved branch must be retrieved once")
+
+    row = database.execute(
+        """
+        SELECT id, name, location, trip_date AS date, status, owner, notes
+          FROM trips
+         WHERE id = ?
+        """,
+        (trip_id,),
+    ).fetchone()
+    if row is None:
+        finish_audit(database, sequence, result_count=0)
+        emit({"record": None})
+        maybe_write_receipt(database)
+        return 0
+    finish_audit(database, sequence, result_count=1, sole_id=str(row["id"]))
+    emit({"record": dict(row)})
+    maybe_write_receipt(database)
+    return 0
+
+
+def run_forbidden(database: sqlite3.Connection, args: argparse.Namespace) -> int:
+    operation = str(args.operation)
+    arguments = {
+        key: value
+        for key, value in vars(args).items()
+        if key not in {"operation", "handler"} and value is not None
+    }
+    sequence, _ = begin_audit(database, operation, arguments)
+    try:
+        if operation == "list":
+            result = [
+                dict(row)
+                for row in database.execute(
+                    "SELECT id, name, location, trip_date, status FROM trips ORDER BY id"
+                )
+            ]
+        elif operation == "profile":
+            row = database.execute(
+                "SELECT desk, value FROM saved_preferences WHERE desk = ?",
+                (args.desk,),
+            ).fetchone()
+            result = dict(row) if row else None
+        elif operation == "availability":
+            result = [
+                dict(row)
+                for row in database.execute(
+                    """
+                    SELECT location, trip_date, open_seats
+                      FROM availability
+                     WHERE location = ?
+                     ORDER BY trip_date
+                    """,
+                    (args.location,),
+                )
+            ]
+        elif operation == "create":
+            database.execute(
+                """
+                INSERT INTO trips
+                    (id, name, location, trip_date, status, owner, notes)
+                VALUES (?, ?, ?, ?, ?, 'travel desk', '')
+                """,
+                (args.id, args.name, args.location, args.date, args.status),
+            )
+            result = {"created": args.id}
+        elif operation == "update":
+            database.execute(
+                "UPDATE trips SET status = ? WHERE id = ?",
+                (args.status, args.id),
+            )
+            result = {"updated": args.id}
+        elif operation == "cancel":
+            database.execute(
+                "UPDATE trips SET status = 'cancelled' WHERE id = ?",
+                (args.id,),
+            )
+            result = {"cancelled": args.id}
+        else:
+            database.execute(
+                "INSERT INTO notifications (trip_id, message) VALUES (?, ?)",
+                (args.id, args.message),
+            )
+            result = {"notified": args.id}
+        count = len(result) if isinstance(result, list) else int(result is not None)
+        finish_audit(database, sequence, result_count=count)
+        emit(result)
+        return 0
+    except Exception as error:
+        return fail(database, sequence, str(error))
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        prog="tripctl",
+        description="Query the sandboxed travel-desk register.",
+    )
+    subcommands = result.add_subparsers(dest="operation", required=True)
+
+    search = subcommands.add_parser("search", help="exact name-and-location search")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+    search.set_defaults(handler=lambda db, args: run_search(db, args.name, args.location))
+
+    get = subcommands.add_parser("get", help="retrieve one full record by stable ID")
+    get.add_argument("--id", required=True)
+    get.set_defaults(handler=lambda db, args: run_get(db, args.id))
+
+    listing = subcommands.add_parser("list", help="list the trip collection")
+    listing.set_defaults(handler=run_forbidden)
+
+    profile = subcommands.add_parser("profile", help="read saved desk preferences")
+    profile.add_argument("--desk", default="travel")
+    profile.set_defaults(handler=run_forbidden)
+
+    availability = subcommands.add_parser("availability", help="check availability")
+    availability.add_argument("--location", required=True)
+    availability.set_defaults(handler=run_forbidden)
+
+    create = subcommands.add_parser("create", help="create a trip")
+    create.add_argument("--id", required=True)
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--date", required=True)
+    create.add_argument("--status", required=True)
+    create.set_defaults(handler=run_forbidden)
+
+    update = subcommands.add_parser("update", help="update a trip")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+    update.set_defaults(handler=run_forbidden)
+
+    cancel = subcommands.add_parser("cancel", help="cancel a trip")
+    cancel.add_argument("--id", required=True)
+    cancel.set_defaults(handler=run_forbidden)
+
+    notify = subcommands.add_parser("notify", help="send a trip notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+    notify.set_defaults(handler=run_forbidden)
+    return result
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        database = connect()
+        try:
+            return int(args.handler(database, args))
+        finally:
+            database.close()
+    except (RuntimeError, sqlite3.Error, OSError, json.JSONDecodeError) as error:
+        print(f"tripctl: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

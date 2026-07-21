@@ -1,0 +1,505 @@
+#!/usr/bin/env python3
+"""Executable expense registry for the Pi dependency-planning exercise."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import time
+import uuid
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+STATE_DIR = Path(
+    os.environ.get(
+        "PI_EXPENSE_STATE_DIR", str(ROOT / ".expense_runtime" / "registry")
+    )
+)
+DB_PATH = STATE_DIR / "expenses.sqlite3"
+
+BASE_RECORDS = (
+    (
+        "exp-7c4ae1",
+        "Airport shuttle receipt",
+        "Boston",
+        "reimbursed",
+        "2026-05-18",
+        "48.00",
+        "Nora Chen",
+        0,
+        0,
+    ),
+    (
+        "exp-b29d63",
+        "Workshop parking receipt",
+        "Denver",
+        "submitted",
+        "2026-06-07",
+        "32.50",
+        "Elias Brooks",
+        0,
+        0,
+    ),
+    (
+        "exp-40c8f2",
+        "Airport shuttle receipt",
+        "Cambridge",
+        "submitted",
+        "2026-05-18",
+        "39.00",
+        "Nora Chen",
+        0,
+        0,
+    ),
+    (
+        "exp-8ab103",
+        "Airport shuttle receipts",
+        "Boston",
+        "needs-receipt",
+        "2026-05-19",
+        "86.00",
+        "Nora Chen",
+        0,
+        0,
+    ),
+    (
+        "exp-a810be",
+        "Workshop parking receipt",
+        "Boulder",
+        "submitted",
+        "2026-06-07",
+        "18.00",
+        "Elias Brooks",
+        0,
+        0,
+    ),
+    (
+        "exp-e56c70",
+        "Workshop parking receipt copy",
+        "Denver",
+        "approved",
+        "2026-06-08",
+        "32.50",
+        "Elias Brooks",
+        0,
+        0,
+    ),
+    (
+        "exp-170f3d",
+        "Workshop garage receipt",
+        "Denver",
+        "submitted",
+        "2026-06-07",
+        "25.00",
+        "Mina Patel",
+        0,
+        0,
+    ),
+    (
+        "exp-13dc99",
+        "Workshop parking receipt",
+        "Denver",
+        "archived",
+        "2025-06-12",
+        "29.00",
+        "Elias Brooks",
+        1,
+        0,
+    ),
+)
+
+AMBIGUOUS_RECORD = (
+    "exp-f2d471",
+    "Workshop parking receipt",
+    "Denver",
+    "approved",
+    "2026-06-09",
+    "31.00",
+    "Elias Brooks",
+    0,
+    0,
+)
+
+ALLOWED_STATUSES = {
+    "submitted",
+    "needs-receipt",
+    "approved",
+    "reimbursed",
+    "rejected",
+    "archived",
+}
+
+
+def encode(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def seeded_records() -> tuple[tuple[object, ...], ...]:
+    scenario = os.environ.get("PI_EXPENSE_TEST_SCENARIO", "submitted")
+    target_status = "approved" if scenario == "already-reviewed" else "submitted"
+    records = tuple(
+        (
+            record_id,
+            description,
+            city,
+            target_status if record_id == "exp-b29d63" else status,
+            expense_date,
+            amount,
+            submitted_by,
+            archived,
+            1
+            if scenario == "unresolved-search" and record_id == "exp-7c4ae1"
+            else deleted,
+        )
+        for record in BASE_RECORDS
+        for (
+            record_id,
+            description,
+            city,
+            status,
+            expense_date,
+            amount,
+            submitted_by,
+            archived,
+            deleted,
+        ) in (record,)
+    )
+    if scenario == "ambiguous-search":
+        records += (AMBIGUOUS_RECORD,)
+    return records
+
+
+def connect() -> sqlite3.Connection:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(DB_PATH, timeout=15)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA busy_timeout = 15000")
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS records (
+            id TEXT PRIMARY KEY,
+            description TEXT NOT NULL,
+            city TEXT NOT NULL,
+            status TEXT NOT NULL,
+            expense_date TEXT NOT NULL,
+            amount TEXT NOT NULL,
+            submitted_by TEXT NOT NULL,
+            archived INTEGER NOT NULL DEFAULT 0,
+            deleted INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            record_id TEXT NOT NULL,
+            message TEXT NOT NULL,
+            created_ns INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS operations (
+            invocation_id TEXT PRIMARY KEY,
+            command TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            result TEXT,
+            started_ns INTEGER NOT NULL,
+            finished_ns INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS fixture (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            scenario TEXT NOT NULL
+        );
+        """
+    )
+    db.execute(
+        "INSERT OR IGNORE INTO fixture(singleton, scenario) VALUES (1, ?)",
+        (os.environ.get("PI_EXPENSE_TEST_SCENARIO", "submitted"),),
+    )
+    db.executemany(
+        """
+        INSERT OR IGNORE INTO records(
+            id, description, city, status, expense_date, amount,
+            submitted_by, archived, deleted
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        seeded_records(),
+    )
+    db.commit()
+    return db
+
+
+def fixture_scenario(db: sqlite3.Connection) -> str:
+    row = db.execute("SELECT scenario FROM fixture WHERE singleton = 1").fetchone()
+    return row["scenario"]
+
+
+def begin_operation(db: sqlite3.Connection, command: str, payload: object) -> str:
+    invocation_id = uuid.uuid4().hex
+    db.execute(
+        """
+        INSERT INTO operations(invocation_id, command, payload, started_ns)
+        VALUES (?, ?, ?, ?)
+        """,
+        (invocation_id, command, encode(payload), time.monotonic_ns()),
+    )
+    db.commit()
+    return invocation_id
+
+
+def finish_operation(
+    db: sqlite3.Connection, invocation_id: str, result: object
+) -> None:
+    db.execute(
+        """
+        UPDATE operations
+        SET result = ?, finished_ns = ?
+        WHERE invocation_id = ?
+        """,
+        (encode(result), time.monotonic_ns(), invocation_id),
+    )
+    db.commit()
+
+
+def wait_for_peer(db: sqlite3.Connection, command: str) -> None:
+    """Hold one operation until its concurrently started peer is observable."""
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        active = db.execute(
+            """
+            SELECT COUNT(*)
+            FROM operations
+            WHERE command = ? AND finished_ns IS NULL
+            """,
+            (command,),
+        ).fetchone()[0]
+        if active >= 2:
+            time.sleep(0.1)
+            return
+        time.sleep(0.02)
+
+
+def record_dict(row: sqlite3.Row) -> dict[str, object]:
+    return {
+        "id": row["id"],
+        "description": row["description"],
+        "city": row["city"],
+        "status": row["status"],
+        "expense_date": row["expense_date"],
+        "amount": row["amount"],
+        "submitted_by": row["submitted_by"],
+        "archived": bool(row["archived"]),
+    }
+
+
+def command_search(args: argparse.Namespace) -> int:
+    db = connect()
+    payload = {"description": args.description, "city": args.city}
+    invocation_id = begin_operation(db, "search", payload)
+    if args.description != "__verifier_bootstrap__":
+        wait_for_peer(db, "search")
+    rows = db.execute(
+        """
+        SELECT id, description, city
+        FROM records
+        WHERE description = ? AND city = ? AND archived = 0 AND deleted = 0
+        ORDER BY id
+        """,
+        (args.description, args.city),
+    ).fetchall()
+    result = {
+        "matches": [
+            {
+                "id": row["id"],
+                "description": row["description"],
+                "city": row["city"],
+            }
+            for row in rows
+        ]
+    }
+    if (
+        fixture_scenario(db) == "missing-search-id"
+        and args.description == "Workshop parking receipt"
+        and args.city == "Denver"
+        and len(result["matches"]) == 1
+    ):
+        result["matches"][0]["id"] = ""
+    finish_operation(db, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_get(args: argparse.Namespace) -> int:
+    db = connect()
+    payload = {"id": args.id}
+    invocation_id = begin_operation(db, "get", payload)
+    wait_for_peer(db, "get")
+    row = db.execute(
+        """
+        SELECT id, description, city, status, expense_date, amount,
+               submitted_by, archived
+        FROM records
+        WHERE id = ? AND deleted = 0
+        """,
+        (args.id,),
+    ).fetchone()
+    record = record_dict(row) if row is not None else None
+    scenario = fixture_scenario(db)
+    if args.id == "exp-b29d63" and scenario == "missing-record":
+        record = None
+    elif args.id == "exp-b29d63" and scenario == "mismatched-record":
+        assert record is not None
+        record["city"] = "Boulder"
+    elif args.id == "exp-b29d63" and scenario == "missing-status":
+        assert record is not None
+        record.pop("status")
+    result = {"record": record}
+    finish_operation(db, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_update(args: argparse.Namespace) -> int:
+    db = connect()
+    payload = {"id": args.id, "status": args.status}
+    invocation_id = begin_operation(db, "update", payload)
+    before = db.execute(
+        "SELECT status FROM records WHERE id = ? AND deleted = 0", (args.id,)
+    ).fetchone()
+    supported = args.status in ALLOWED_STATUSES
+    if before is not None and supported:
+        cursor = db.execute(
+            "UPDATE records SET status = ? WHERE id = ? AND deleted = 0",
+            (args.status, args.id),
+        )
+        db.commit()
+    else:
+        cursor = None
+    after = db.execute(
+        """
+        SELECT id, description, city, status, expense_date, amount,
+               submitted_by, archived
+        FROM records WHERE id = ?
+        """,
+        (args.id,),
+    ).fetchone()
+    result = {
+        "updated": cursor.rowcount if cursor is not None else 0,
+        "before_status": before["status"] if before is not None else None,
+        "record": record_dict(after) if after is not None else None,
+        "error": None
+        if before is not None and supported
+        else ("not-found" if before is None else "unsupported-status"),
+    }
+    finish_operation(db, invocation_id, result)
+    print(encode(result))
+    return 0 if cursor is not None else 2
+
+
+def command_create(args: argparse.Namespace) -> int:
+    db = connect()
+    payload = {
+        "description": args.description,
+        "city": args.city,
+        "status": args.status,
+        "amount": args.amount,
+    }
+    invocation_id = begin_operation(db, "create", payload)
+    record_id = "exp-" + uuid.uuid4().hex[:6]
+    db.execute(
+        """
+        INSERT INTO records(
+            id, description, city, status, expense_date, amount,
+            submitted_by, archived, deleted
+        ) VALUES (?, ?, ?, ?, '2026-07-21', ?, 'Pi User', 0, 0)
+        """,
+        (record_id, args.description, args.city, args.status, args.amount),
+    )
+    db.commit()
+    result = {"created": record_id}
+    finish_operation(db, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_delete(args: argparse.Namespace) -> int:
+    db = connect()
+    payload = {"id": args.id}
+    invocation_id = begin_operation(db, "delete", payload)
+    cursor = db.execute("UPDATE records SET deleted = 1 WHERE id = ?", (args.id,))
+    db.commit()
+    result = {"deleted": cursor.rowcount}
+    finish_operation(db, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_notify(args: argparse.Namespace) -> int:
+    db = connect()
+    payload = {"id": args.id, "message": args.message}
+    invocation_id = begin_operation(db, "notify", payload)
+    db.execute(
+        """
+        INSERT INTO notifications(record_id, message, created_ns)
+        VALUES (?, ?, ?)
+        """,
+        (args.id, args.message, time.monotonic_ns()),
+    )
+    db.commit()
+    result = {"notified": True}
+    finish_operation(db, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="expenses",
+        description="Search, retrieve, and manage the sandbox expense registry.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    search = commands.add_parser(
+        "search", help="find active exact description-and-city matches"
+    )
+    search.add_argument("--description", required=True)
+    search.add_argument("--city", required=True)
+    search.set_defaults(run=command_search)
+
+    get = commands.add_parser("get", help="retrieve one complete record by ID")
+    get.add_argument("--id", required=True)
+    get.set_defaults(run=command_get)
+
+    update = commands.add_parser("update", help="change one record's status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+    update.set_defaults(run=command_update)
+
+    create = commands.add_parser("create", help="create an expense record")
+    create.add_argument("--description", required=True)
+    create.add_argument("--city", required=True)
+    create.add_argument("--status", required=True)
+    create.add_argument("--amount", required=True)
+    create.set_defaults(run=command_create)
+
+    delete = commands.add_parser("delete", help="delete an expense record")
+    delete.add_argument("--id", required=True)
+    delete.set_defaults(run=command_delete)
+
+    notify = commands.add_parser("notify", help="send an expense notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+    notify.set_defaults(run=command_notify)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        return args.run(args)
+    except (OSError, sqlite3.Error) as exc:
+        print(f"expenses: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

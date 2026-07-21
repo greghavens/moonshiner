@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""SQLite-backed order desk used by the procurement audit exercise."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sqlite3
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+DATABASE = ROOT / "orders.db"
+AUDIT_LOG = ROOT / ".orderdesk" / "audit.jsonl"
+
+
+def connect(*, writable: bool = False) -> sqlite3.Connection:
+    mode = "rw" if writable else "ro"
+    connection = sqlite3.connect(f"file:{DATABASE}?mode={mode}", uri=True)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+def as_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    return dict(row) if row is not None else None
+
+
+def emit(payload: dict[str, Any]) -> None:
+    print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+
+
+def record(operation: str, requests: list[dict[str, Any]],
+           results: list[Any]) -> None:
+    AUDIT_LOG.parent.mkdir(exist_ok=True)
+    sequence = 1
+    if AUDIT_LOG.exists():
+        with AUDIT_LOG.open(encoding="utf-8") as source:
+            sequence += sum(1 for line in source if line.strip())
+    event = {
+        "operation": operation,
+        "requests": requests,
+        "results": results,
+        "sequence": sequence,
+    }
+    with AUDIT_LOG.open("a", encoding="utf-8", newline="\n") as destination:
+        destination.write(json.dumps(event, sort_keys=True,
+                                     separators=(",", ":")) + "\n")
+
+
+def search_one(request: dict[str, str]) -> dict[str, Any]:
+    with connect() as connection:
+        rows = connection.execute(
+            "SELECT id, name, location FROM orders "
+            "WHERE name = ? AND location = ? ORDER BY id",
+            (request["name"], request["location"]),
+        ).fetchall()
+    return {"matches": [dict(row) for row in rows], **request}
+
+
+def get_one(request: dict[str, str]) -> dict[str, Any] | None:
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT id, name, location, status, order_date AS date "
+            "FROM orders WHERE id = ?", (request["id"],)
+        ).fetchone()
+    return as_dict(row)
+
+
+def run_parallel(function, requests: list[dict[str, str]]) -> list[Any]:
+    with ThreadPoolExecutor(max_workers=len(requests)) as pool:
+        return list(pool.map(function, requests))
+
+
+def search_batch(args: argparse.Namespace) -> None:
+    if len(args.name) != len(args.location):
+        raise SystemExit("search-batch requires one --location for every --name")
+    requests = [
+        {"name": name, "location": location}
+        for name, location in zip(args.name, args.location, strict=True)
+    ]
+    results = run_parallel(search_one, requests)
+    record("search-batch", requests, results)
+    emit({"searches": results})
+
+
+def get_batch(args: argparse.Namespace) -> None:
+    requests = [{"id": order_id} for order_id in args.id]
+    results = run_parallel(get_one, requests)
+    record("get-batch", requests, results)
+    emit({"records": results})
+
+
+def list_orders(_args: argparse.Namespace) -> None:
+    with connect() as connection:
+        results = [dict(row) for row in connection.execute(
+            "SELECT id, name, location, status, order_date AS date "
+            "FROM orders ORDER BY id"
+        ).fetchall()]
+    record("list", [{}], results)
+    emit({"records": results})
+
+
+def preferences(_args: argparse.Namespace) -> None:
+    with connect() as connection:
+        results = [dict(row) for row in connection.execute(
+            "SELECT key, value FROM saved_preferences ORDER BY key"
+        ).fetchall()]
+    record("preferences", [{}], results)
+    emit({"preferences": results})
+
+
+def availability(args: argparse.Namespace) -> None:
+    requests = [{"item": args.item, "location": args.location}]
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT item, location, units FROM availability "
+            "WHERE item = ? AND location = ?",
+            (args.item, args.location),
+        ).fetchone()
+    results = [as_dict(row)]
+    record("availability", requests, results)
+    emit({"availability": results[0]})
+
+
+def create_order(args: argparse.Namespace) -> None:
+    request = {
+        "id": args.id,
+        "name": args.name,
+        "location": args.location,
+        "status": args.status,
+        "date": args.date,
+    }
+    with connect(writable=True) as connection:
+        connection.execute(
+            "INSERT INTO orders(id, name, location, status, order_date) "
+            "VALUES(:id, :name, :location, :status, :date)", request
+        )
+        connection.commit()
+    record("create", [request], [request])
+    emit({"record": request})
+
+
+def update_order(args: argparse.Namespace) -> None:
+    request = {"id": args.id, "status": args.status}
+    with connect(writable=True) as connection:
+        changed = connection.execute(
+            "UPDATE orders SET status = :status WHERE id = :id", request
+        ).rowcount
+        connection.commit()
+    result = {"changed": changed, **request}
+    record("update", [request], [result])
+    emit(result)
+
+
+def cancel_order(args: argparse.Namespace) -> None:
+    request = {"id": args.id}
+    with connect(writable=True) as connection:
+        changed = connection.execute(
+            "UPDATE orders SET status = 'canceled' WHERE id = ?", (args.id,)
+        ).rowcount
+        connection.commit()
+    result = {"changed": changed, "id": args.id, "status": "canceled"}
+    record("cancel", [request], [result])
+    emit(result)
+
+
+def notify(args: argparse.Namespace) -> None:
+    request = {"id": args.id, "message": args.message}
+    with connect(writable=True) as connection:
+        notification_id = connection.execute(
+            "INSERT INTO notifications(order_id, message) VALUES(?, ?)",
+            (args.id, args.message),
+        ).lastrowid
+        connection.commit()
+    result = {"notification_id": notification_id, **request}
+    record("notify", [request], [result])
+    emit(result)
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        prog="orderdesk",
+        description="Execute order-desk operations against the local SQLite service.",
+    )
+    commands = root.add_subparsers(dest="command", required=True)
+
+    search = commands.add_parser(
+        "search-batch",
+        help="search one or more exact name/location pairs concurrently",
+    )
+    search.add_argument("--name", action="append", required=True)
+    search.add_argument("--location", action="append", required=True)
+    search.set_defaults(handler=search_batch)
+
+    get = commands.add_parser(
+        "get-batch", help="retrieve one or more stable IDs concurrently"
+    )
+    get.add_argument("--id", action="append", required=True)
+    get.set_defaults(handler=get_batch)
+
+    commands.add_parser("list", help="list the complete order collection").set_defaults(
+        handler=list_orders
+    )
+    commands.add_parser(
+        "preferences", help="read saved operator preferences"
+    ).set_defaults(handler=preferences)
+
+    stock = commands.add_parser("availability", help="check item availability")
+    stock.add_argument("--item", required=True)
+    stock.add_argument("--location", required=True)
+    stock.set_defaults(handler=availability)
+
+    create = commands.add_parser("create", help="create an order")
+    create.add_argument("--id", required=True)
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--status", required=True)
+    create.add_argument("--date", required=True)
+    create.set_defaults(handler=create_order)
+
+    update = commands.add_parser("update", help="update an order status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+    update.set_defaults(handler=update_order)
+
+    cancel = commands.add_parser("cancel", help="cancel an order")
+    cancel.add_argument("--id", required=True)
+    cancel.set_defaults(handler=cancel_order)
+
+    message = commands.add_parser("notify", help="send an order notification")
+    message.add_argument("--id", required=True)
+    message.add_argument("--message", required=True)
+    message.set_defaults(handler=notify)
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        args.handler(args)
+    except sqlite3.Error as error:
+        print(f"orderdesk: database error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

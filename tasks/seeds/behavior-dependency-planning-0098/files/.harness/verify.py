@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Deterministic protected verifier for the Pi dependency-planning seed."""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+from pathlib import Path
+import sqlite3
+import sys
+
+
+ROOT = Path(__file__).resolve().parents[1]
+AUDIT_PATH = ROOT / ".harness" / "runtime" / "telecom-audit.jsonl"
+DATABASE_PATH = ROOT / ".telecom" / "runtime" / "telecom.sqlite3"
+REPORT_PATH = ROOT / "status_audit.md"
+AUDIT_KEY = b"moonshiner-pi-telecom-audit-0098-v1"
+
+EXPECTED_HASHES = {
+    "telecom-account": "8a94cce944340f09b72d8c546350bde7725fcaf10e06c20890aacbfbe9a1f8db",
+    ".telecom/seed.sql": "bbd31c51365c5291026f4c28d2944051176a77a4edb85ecb6c69432dc149114c",
+    "README.md": "b1ec6781a2730c4785dbcfb8a829212cdbe2c2d4b5bc7dd992e79d7fbe9fa7ee",
+    ".gitignore": "2eb163def78351ca47382dc2475019d5965a4630812a747bfbfb9766eec7c1c0",
+}
+EXPECTED_DATABASE_DIGEST = "20577665787e3f5f5ea4a33ec91d15dfee7294a0e192a9af2d25583db678dd43"
+EXPECTED_SEARCHES = {
+    ("Family fiber subscription", "Family Account"),
+    ("Studio tablet plan", "Studio Account"),
+}
+EXPECTED_REPORT = (
+    "Family fiber subscription in Family Account has status active.\n"
+    "Studio tablet plan in Studio Account has status pending-activation.\n"
+    "The returned statuses differ.\n"
+)
+ALLOWED_OPERATIONS = {"search", "get"}
+ALLOWED_ROOT_ENTRIES = {
+    ".git",
+    ".gitignore",
+    ".harness",
+    ".reference_solution",
+    ".telecom",
+    "README.md",
+    "status_audit.md",
+    "telecom-account",
+}
+
+
+def fail(message: str) -> None:
+    print(f"FAIL: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def canonical(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def verify_protected_inputs() -> None:
+    for relative, expected in EXPECTED_HASHES.items():
+        path = ROOT / relative
+        if not path.is_file() or file_sha256(path) != expected:
+            fail(f"protected telecom-account input changed: {relative}")
+
+
+def verify_scope() -> None:
+    unexpected = sorted(
+        path.name for path in ROOT.iterdir() if path.name not in ALLOWED_ROOT_ENTRIES
+    )
+    if unexpected:
+        fail("unexpected scratch artifact at workspace root: " + ", ".join(unexpected))
+
+
+def verify_database_state() -> None:
+    if not DATABASE_PATH.is_file():
+        fail("the genuine SQLite telecom registry was never opened")
+    try:
+        connection = sqlite3.connect(f"file:{DATABASE_PATH}?mode=ro", uri=True)
+        try:
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()
+            subscriptions = connection.execute(
+                """
+                SELECT stable_id, name, account, status, service_type,
+                       renewal_date, lifecycle
+                FROM subscriptions ORDER BY stable_id
+                """
+            ).fetchall()
+            notifications = connection.execute(
+                """
+                SELECT notification_id, stable_id, message
+                FROM notifications ORDER BY notification_id
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+    except sqlite3.DatabaseError as exc:
+        fail(f"telecom registry database is unreadable: {exc}")
+
+    if integrity != ("ok",):
+        fail("telecom registry database integrity check failed")
+    snapshot = {
+        "subscriptions": [list(row) for row in subscriptions],
+        "notifications": [list(row) for row in notifications],
+    }
+    digest = hashlib.sha256(canonical(snapshot)).hexdigest()
+    if digest != EXPECTED_DATABASE_DIGEST:
+        fail("telecom registry state changed during the read-only audit")
+
+
+def load_events() -> list[dict]:
+    if not AUDIT_PATH.is_file():
+        fail("no genuine telecom-account execution trace was produced")
+    events = []
+    for number, raw in enumerate(
+        AUDIT_PATH.read_text(encoding="utf-8").splitlines(), 1
+    ):
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            fail(f"audit event {number} is not valid JSON")
+        if not isinstance(event, dict):
+            fail(f"audit event {number} is not an object")
+        signature = event.pop("signature", None)
+        expected = hmac.new(AUDIT_KEY, canonical(event), hashlib.sha256).hexdigest()
+        if not isinstance(signature, str) or not hmac.compare_digest(
+            signature, expected
+        ):
+            fail(f"audit event {number} was not emitted intact by the registry")
+        for field in ("start_ns", "end_ns", "process_pid", "process_group_id"):
+            if not isinstance(event.get(field), int):
+                fail(f"audit event {number} has invalid process evidence")
+        if event["start_ns"] >= event["end_ns"]:
+            fail(f"audit event {number} has an invalid execution interval")
+        events.append(event)
+    return sorted(events, key=lambda item: item["start_ns"])
+
+
+def overlaps(first: dict, second: dict) -> bool:
+    return max(first["start_ns"], second["start_ns"]) < min(
+        first["end_ns"], second["end_ns"]
+    )
+
+
+def same_harness_parent(first: dict, second: dict) -> bool:
+    return (
+        first.get("parent_pid") == second.get("parent_pid")
+        and first.get("parent_start_ticks") == second.get("parent_start_ticks")
+        and first.get("parent_start_ticks") != "unavailable"
+    )
+
+
+def separate_tool_calls(first: dict, second: dict) -> bool:
+    return (
+        first["process_group_id"] != second["process_group_id"]
+        and first["process_pid"] == first["process_group_id"]
+        and second["process_pid"] == second["process_group_id"]
+        and first.get("session_id") == first["process_pid"]
+        and second.get("session_id") == second["process_pid"]
+    )
+
+
+def verify_execution(events: list[dict]) -> None:
+    if any(event.get("operation") not in ALLOWED_OPERATIONS for event in events):
+        fail("a create, update, cancel, notify, or unknown operation was executed")
+    if len(events) != 4:
+        fail("expected exactly two searches followed by exactly two retrievals")
+    if any(not event.get("success") for event in events):
+        fail("every required telecom-account operation must succeed")
+
+    searches, gets = events[:2], events[2:]
+    if [event.get("operation") for event in searches] != ["search", "search"]:
+        fail("the first registry action must contain only both searches")
+    if [event.get("operation") for event in gets] != ["get", "get"]:
+        fail("the next registry action must contain only both retrievals")
+
+    observed_searches = {
+        (event.get("name"), event.get("account")) for event in searches
+    }
+    if observed_searches != EXPECTED_SEARCHES:
+        fail("the two required exact subscription-and-account searches were not run")
+    if any(event.get("result_count") != 1 for event in searches):
+        fail("both subscription lookups must resolve to exactly one current stable ID")
+    if any(
+        not isinstance(event.get("result_ids"), list)
+        or len(event["result_ids"]) != 1
+        or not isinstance(event["result_ids"][0], str)
+        or not event["result_ids"][0]
+        for event in searches
+    ):
+        fail("a search did not return one auditable stable ID")
+    if (
+        not overlaps(searches[0], searches[1])
+        or not same_harness_parent(searches[0], searches[1])
+        or not separate_tool_calls(searches[0], searches[1])
+    ):
+        fail("the searches were not concurrent sibling Pi Bash calls")
+
+    if min(event["start_ns"] for event in gets) <= max(
+        event["end_ns"] for event in searches
+    ):
+        fail("a retrieval began before both search results were available")
+    returned_ids = {event["result_ids"][0] for event in searches}
+    if {event.get("stable_id") for event in gets} != returned_ids:
+        fail("retrievals did not use exactly the IDs returned by the searches")
+    if any(event.get("result_count") != 1 for event in gets):
+        fail("a complete current telecom subscription was not retrieved")
+    if (
+        not overlaps(gets[0], gets[1])
+        or not same_harness_parent(gets[0], gets[1])
+        or not separate_tool_calls(gets[0], gets[1])
+    ):
+        fail("the retrievals were not concurrent sibling Pi Bash calls")
+    if {event["process_group_id"] for event in searches} & {
+        event["process_group_id"] for event in gets
+    }:
+        fail("search and retrieval stages reused a Bash call")
+
+
+def verify_report() -> None:
+    if not REPORT_PATH.is_file():
+        fail("status_audit.md is missing")
+    if REPORT_PATH.read_text(encoding="utf-8") != EXPECTED_REPORT:
+        fail("status_audit.md is not the exact grounded three-line audit")
+
+
+def main() -> None:
+    verify_protected_inputs()
+    verify_scope()
+    verify_database_state()
+    verify_execution(load_events())
+    verify_report()
+    print(
+        "PASS: grounded telecom status audit and genuine Pi registry execution "
+        "satisfy every dependency, concurrency, scope, and read-only constraint"
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed branch catalog."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+
+ROOT = Path(__file__).resolve().parent
+CATALOG = ROOT / "catalog.json"
+RUNTIME = ROOT / "__pycache__" / "library_audit"
+EVENTS = RUNTIME / "events.jsonl"
+LOCK = RUNTIME / "events.lock"
+BARRIER_TIMEOUT_SECONDS = 10.0
+
+
+def _canonical(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _read_events_unlocked() -> list[dict]:
+    if not EVENTS.exists():
+        return []
+    rows = []
+    for line in EVENTS.read_text(encoding="utf-8").splitlines():
+        if line:
+            rows.append(json.loads(line))
+    return rows
+
+
+def read_events() -> list[dict]:
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    with LOCK.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_SH)
+        try:
+            return _read_events_unlocked()
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def append_event(kind: str, **fields: object) -> dict:
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    with LOCK.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            rows = _read_events_unlocked()
+            event = {
+                "seq": len(rows) + 1,
+                "time_ns": time.monotonic_ns(),
+                "pid": os.getpid(),
+                "ppid": os.getppid(),
+                "kind": kind,
+                **fields,
+                "previous": rows[-1]["digest"] if rows else "0" * 64,
+            }
+            event["digest"] = hashlib.sha256(_canonical(event)).hexdigest()
+            with EVENTS.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            return event
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def wait_for(kind: str, count: int) -> list[dict]:
+    deadline = time.monotonic() + BARRIER_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        rows = [row for row in read_events() if row.get("kind") == kind]
+        if len(rows) >= count:
+            return rows
+        time.sleep(0.02)
+    raise RuntimeError(f"concurrency barrier not reached for {kind}")
+
+
+def load_catalog() -> list[dict]:
+    data = json.loads(CATALOG.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise RuntimeError("catalog storage is corrupt")
+    return data
+
+
+def search(name: str, location: str) -> dict:
+    existing = read_events()
+    if any(row.get("kind", "").startswith("get_") for row in existing):
+        raise RuntimeError("search stage is already closed")
+    if len([row for row in existing if row.get("kind") == "search_start"]) >= 2:
+        raise RuntimeError("this audit already has two searches")
+    append_event("search_start", operation="search", name=name, location=location)
+    wait_for("search_start", 2)
+    matches = [
+        {key: record[key] for key in ("id", "name", "location")}
+        for record in load_catalog()
+        if record.get("name") == name and record.get("location") == location
+    ]
+    result = {"matches": matches}
+    append_event(
+        "search_complete",
+        operation="search",
+        name=name,
+        location=location,
+        result=result,
+    )
+    return result
+
+
+def get(stable_id: str) -> dict:
+    existing = read_events()
+    searches = [row for row in existing if row.get("kind") == "search_complete"]
+    if len(searches) != 2:
+        raise RuntimeError("both searches must finish before any get")
+    permitted_ids = []
+    for row in searches:
+        matches = row.get("result", {}).get("matches", [])
+        if len(matches) == 1:
+            permitted_ids.append(matches[0].get("id"))
+    if stable_id not in permitted_ids:
+        raise RuntimeError("ID was not the sole match from its own search")
+    if any(row.get("kind") == "get_start" and row.get("id") == stable_id for row in existing):
+        raise RuntimeError("record already requested")
+    append_event("get_start", operation="get", id=stable_id)
+    wait_for("get_start", len(permitted_ids))
+    record = next((item for item in load_catalog() if item.get("id") == stable_id), None)
+    if record is None:
+        raise RuntimeError("record disappeared after search")
+    result = dict(record)
+    append_event("get_complete", operation="get", id=stable_id, result=result)
+    return result
+
+
+def parser() -> argparse.ArgumentParser:
+    command = argparse.ArgumentParser(prog="libraryctl", add_help=True)
+    subcommands = command.add_subparsers(dest="operation", required=True)
+    search_parser = subcommands.add_parser("search")
+    search_parser.add_argument("--name", required=True)
+    search_parser.add_argument("--location", required=True)
+    get_parser = subcommands.add_parser("get")
+    get_parser.add_argument("--id", required=True)
+    return command
+
+
+def main() -> int:
+    raw_operation = next((item for item in sys.argv[1:] if not item.startswith("-")), None)
+    if raw_operation not in {None, "search", "get"}:
+        append_event("forbidden_operation", operation=raw_operation)
+        print(f"libraryctl: operation is not available: {raw_operation}", file=sys.stderr)
+        return 64
+    try:
+        arguments = parser().parse_args()
+        result = (
+            search(arguments.name, arguments.location)
+            if arguments.operation == "search"
+            else get(arguments.id)
+        )
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")), flush=True)
+        return 0
+    except (RuntimeError, ValueError, json.JSONDecodeError) as error:
+        append_event("operation_error", operation=raw_operation, message=str(error))
+        print(f"libraryctl: {error}", file=sys.stderr)
+        return 65
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

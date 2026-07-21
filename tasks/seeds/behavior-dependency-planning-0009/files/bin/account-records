@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed account-records database."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DB_PATH = ROOT / "data" / "accounts.sqlite3"
+LEDGER_PATH = ROOT / ".crm" / "session.jsonl"
+SIGNING_KEY = b"moonshiner-pi-account-audit-v1-6f8c1da2"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="account-records",
+        description="Query and administer the sandboxed CRM account store.",
+    )
+    subparsers = parser.add_subparsers(dest="action", required=True)
+
+    search = subparsers.add_parser("search", help="search account summaries")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+
+    get = subparsers.add_parser("get", help="retrieve one full account record")
+    get.add_argument("--id", required=True, dest="stable_id")
+
+    subparsers.add_parser("list", help="list the account collection")
+    subparsers.add_parser("preferences", help="read saved user preferences")
+
+    availability = subparsers.add_parser(
+        "availability", help="check review availability"
+    )
+    availability.add_argument("--location", required=True)
+
+    create = subparsers.add_parser("create", help="create an account")
+    create.add_argument("--id", required=True, dest="stable_id")
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--status", required=True)
+
+    update = subparsers.add_parser("update", help="update an account status")
+    update.add_argument("--id", required=True, dest="stable_id")
+    update.add_argument("--status", required=True)
+
+    cancel = subparsers.add_parser("cancel", help="cancel an account")
+    cancel.add_argument("--id", required=True, dest="stable_id")
+
+    notify = subparsers.add_parser("notify", help="send an account notification")
+    notify.add_argument("--id", required=True, dest="stable_id")
+    notify.add_argument("--message", required=True)
+    return parser
+
+
+def connect(*, writable: bool = False) -> sqlite3.Connection:
+    mode = "rw" if writable else "ro"
+    database_uri = f"file:{DB_PATH}?mode={mode}"
+    connection = sqlite3.connect(database_uri, uri=True, timeout=5)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def account_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "stable_id": row["stable_id"],
+        "name": row["name"],
+        "location": row["location"],
+        "status": row["status"],
+        "owner": row["owner"],
+        "segment": row["segment"],
+        "last_reviewed": row["last_reviewed"],
+    }
+
+
+def execute(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
+    action = args.action
+    if action == "search":
+        request = {"name": args.name, "location": args.location}
+        with connect() as database:
+            rows = database.execute(
+                """
+                SELECT stable_id, name, location
+                FROM accounts
+                WHERE name = ? AND location = ?
+                ORDER BY stable_id
+                """,
+                (args.name, args.location),
+            ).fetchall()
+        matches = [
+            {
+                "stable_id": row["stable_id"],
+                "name": row["name"],
+                "location": row["location"],
+            }
+            for row in rows
+        ]
+        return request, {"count": len(matches), "matches": matches}
+
+    if action == "get":
+        request = {"stable_id": args.stable_id}
+        with connect() as database:
+            row = database.execute(
+                "SELECT * FROM accounts WHERE stable_id = ?", (args.stable_id,)
+            ).fetchone()
+        return request, {"account": account_dict(row) if row is not None else None}
+
+    if action == "list":
+        with connect() as database:
+            rows = database.execute(
+                "SELECT stable_id, name, location FROM accounts ORDER BY stable_id"
+            ).fetchall()
+        return {}, {
+            "accounts": [
+                {
+                    "stable_id": row["stable_id"],
+                    "name": row["name"],
+                    "location": row["location"],
+                }
+                for row in rows
+            ]
+        }
+
+    if action == "preferences":
+        with connect() as database:
+            rows = database.execute(
+                "SELECT preference_key, preference_value FROM preferences ORDER BY preference_key"
+            ).fetchall()
+        return {}, {row["preference_key"]: row["preference_value"] for row in rows}
+
+    if action == "availability":
+        request = {"location": args.location}
+        with connect() as database:
+            rows = database.execute(
+                "SELECT review_date FROM availability WHERE location = ? ORDER BY review_date",
+                (args.location,),
+            ).fetchall()
+        return request, {"dates": [row["review_date"] for row in rows]}
+
+    if action == "create":
+        request = {
+            "stable_id": args.stable_id,
+            "name": args.name,
+            "location": args.location,
+            "status": args.status,
+        }
+        with connect(writable=True) as database:
+            database.execute(
+                """
+                INSERT INTO accounts
+                    (stable_id, name, location, status, owner, segment, last_reviewed)
+                VALUES (?, ?, ?, ?, 'Unassigned', 'Unclassified', 'Never')
+                """,
+                (args.stable_id, args.name, args.location, args.status),
+            )
+        return request, {"created": args.stable_id}
+
+    if action == "update":
+        request = {"stable_id": args.stable_id, "status": args.status}
+        with connect(writable=True) as database:
+            cursor = database.execute(
+                "UPDATE accounts SET status = ? WHERE stable_id = ?",
+                (args.status, args.stable_id),
+            )
+        return request, {"updated": cursor.rowcount}
+
+    if action == "cancel":
+        request = {"stable_id": args.stable_id}
+        with connect(writable=True) as database:
+            cursor = database.execute(
+                "UPDATE accounts SET status = 'Cancelled' WHERE stable_id = ?",
+                (args.stable_id,),
+            )
+        return request, {"cancelled": cursor.rowcount}
+
+    if action == "notify":
+        request = {"stable_id": args.stable_id, "message": args.message}
+        with connect(writable=True) as database:
+            database.execute(
+                "INSERT INTO notifications (stable_id, message) VALUES (?, ?)",
+                (args.stable_id, args.message),
+            )
+        return request, {"notified": args.stable_id}
+
+    raise AssertionError(f"unhandled action: {action}")
+
+
+def sign(record: dict[str, Any]) -> str:
+    payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+    return hmac.new(SIGNING_KEY, payload, hashlib.sha256).hexdigest()
+
+
+def append_event(record: dict[str, Any]) -> None:
+    LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    signed = dict(record)
+    signed["signature"] = sign(record)
+    line = json.dumps(signed, sort_keys=True, separators=(",", ":")) + "\n"
+    with LEDGER_PATH.open("a", encoding="utf-8") as ledger:
+        fcntl.flock(ledger.fileno(), fcntl.LOCK_EX)
+        ledger.write(line)
+        ledger.flush()
+        os.fsync(ledger.fileno())
+        fcntl.flock(ledger.fileno(), fcntl.LOCK_UN)
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    started_ns = time.monotonic_ns()
+    try:
+        request, result = execute(args)
+    except (sqlite3.Error, OSError) as error:
+        print(json.dumps({"error": str(error)}, sort_keys=True), file=sys.stderr)
+        return 2
+
+    # The brief delay makes independent process overlap observable without
+    # coupling either query to the other process.
+    time.sleep(0.35)
+    finished_ns = time.monotonic_ns()
+    append_event(
+        {
+            "version": 1,
+            "action": args.action,
+            "pid": os.getpid(),
+            "parent_pid": os.getppid(),
+            "started_ns": started_ns,
+            "finished_ns": finished_ns,
+            "request": request,
+            "result": result,
+        }
+    )
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

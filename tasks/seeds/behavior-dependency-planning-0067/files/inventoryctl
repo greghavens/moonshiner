@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed inventory registry."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import hmac
+import json
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+DATABASE = ROOT / ".inventory-runtime" / "inventory.sqlite3"
+KEY = ROOT / ".protected" / "audit.key"
+PAIR_TIMEOUT_SECONDS = 8.0
+POLL_SECONDS = 0.025
+FORBIDDEN = {
+    "list",
+    "preferences",
+    "availability",
+    "create",
+    "update",
+    "cancel",
+    "notify",
+}
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def digest(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def connect() -> sqlite3.Connection:
+    if not DATABASE.is_file():
+        raise RuntimeError("inventory sandbox is not initialized")
+    database = sqlite3.connect(DATABASE, timeout=10.0, isolation_level=None)
+    database.row_factory = sqlite3.Row
+    database.execute("PRAGMA busy_timeout = 10000")
+    return database
+
+
+def emit(value: Any) -> None:
+    print(canonical_json(value), flush=True)
+
+
+def begin_event(
+    database: sqlite3.Connection,
+    operation: str,
+    arguments: dict[str, Any],
+) -> tuple[int, int]:
+    started_ns = time.time_ns()
+    database.execute("BEGIN IMMEDIATE")
+    try:
+        cursor = database.execute(
+            """
+            INSERT INTO operation_journal
+                (operation, arguments_json, started_ns, pid, parent_pid, violation)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                operation,
+                canonical_json(arguments),
+                started_ns,
+                os.getpid(),
+                os.getppid(),
+                int(operation in FORBIDDEN),
+            ),
+        )
+        database.commit()
+    except Exception:
+        database.rollback()
+        raise
+    return int(cursor.lastrowid), started_ns
+
+
+def finish_event(
+    database: sqlite3.Connection,
+    sequence: int,
+    *,
+    result: Any | None = None,
+    result_count: int | None = None,
+    sole_id: str | None = None,
+    error: str | None = None,
+) -> None:
+    finished_ns = time.time_ns()
+    result_digest = digest(result) if error is None and result is not None else None
+    row = database.execute(
+        """
+        SELECT operation, arguments_json, started_ns, pid, parent_pid, violation
+          FROM operation_journal
+         WHERE sequence = ?
+        """,
+        (sequence,),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("operation journal entry disappeared")
+    signed = {
+        "arguments_json": row["arguments_json"],
+        "error": error,
+        "finished_ns": finished_ns,
+        "operation": row["operation"],
+        "parent_pid": row["parent_pid"],
+        "pid": row["pid"],
+        "result_count": result_count,
+        "result_digest": result_digest,
+        "sequence": sequence,
+        "sole_id": sole_id,
+        "started_ns": row["started_ns"],
+        "violation": row["violation"],
+    }
+    signature = hmac.new(
+        KEY.read_bytes(), canonical_json(signed).encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    database.execute(
+        """
+        UPDATE operation_journal
+           SET finished_ns = ?, result_count = ?, sole_id = ?,
+               result_digest = ?, error = ?, signature = ?
+         WHERE sequence = ?
+        """,
+        (
+            finished_ns,
+            result_count,
+            sole_id,
+            result_digest,
+            error,
+            signature,
+            sequence,
+        ),
+    )
+
+
+def fail(database: sqlite3.Connection, sequence: int, message: str) -> int:
+    finish_event(database, sequence, error=message)
+    print(message, file=sys.stderr)
+    return 2
+
+
+def phase_rows(database: sqlite3.Connection, operation: str) -> list[sqlite3.Row]:
+    return database.execute(
+        """
+        SELECT sequence, arguments_json, started_ns, finished_ns,
+               pid, parent_pid, error
+          FROM operation_journal
+         WHERE operation = ?
+         ORDER BY sequence
+        """,
+        (operation,),
+    ).fetchall()
+
+
+def wait_for_pair(
+    database: sqlite3.Connection,
+    operation: str,
+) -> tuple[bool, str]:
+    deadline = time.monotonic() + PAIR_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        rows = phase_rows(database, operation)
+        if len(rows) == 2:
+            if len({int(row["pid"]) for row in rows}) != 2:
+                return False, f"the two {operation} operations must be separate processes"
+            if len({int(row["parent_pid"]) for row in rows}) != 1:
+                return False, f"the two {operation} processes must share one shell-tool action"
+            time.sleep(0.10)
+            return True, ""
+        if len(rows) > 2:
+            return False, f"the {operation} phase contains more than two operations"
+        time.sleep(POLL_SECONDS)
+    return False, f"timed out waiting for the concurrent {operation} process"
+
+
+def run_search(database: sqlite3.Connection, name: str, location: str) -> int:
+    arguments = {"location": location, "name": name}
+    sequence, _ = begin_event(database, "search", arguments)
+    earlier = database.execute(
+        "SELECT operation, finished_ns, error "
+        "FROM operation_journal WHERE sequence < ? ORDER BY sequence",
+        (sequence,),
+    ).fetchall()
+    help_events = [row for row in earlier if row["operation"] == "help"]
+    data_events = [row for row in earlier if row["operation"] != "help"]
+    if not help_events or any(
+        row["finished_ns"] is None or row["error"] is not None for row in help_events
+    ):
+        return fail(database, sequence, "built-in help must be viewed before inventory data")
+    if len(data_events) >= 2 or any(
+        row["operation"] != "search" for row in data_events
+    ):
+        return fail(database, sequence, "searches must be the first two inventory operations")
+
+    paired, message = wait_for_pair(database, "search")
+    if not paired:
+        return fail(database, sequence, message)
+
+    rows = database.execute(
+        """
+        SELECT id, name, location
+          FROM inventory_items
+         WHERE name = ? AND location = ?
+         ORDER BY id
+        """,
+        (name, location),
+    ).fetchall()
+    matches = [dict(row) for row in rows]
+    result = {"matches": matches}
+    finish_event(
+        database,
+        sequence,
+        result=result,
+        result_count=len(matches),
+        sole_id=str(rows[0]["id"]) if len(rows) == 1 else None,
+    )
+    emit(result)
+    return 0
+
+
+def full_record(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "binCode": row["bin_code"],
+        "id": row["id"],
+        "internalNote": row["internal_note"],
+        "location": row["location"],
+        "name": row["name"],
+        "quantity": row["quantity"],
+        "sku": row["sku"],
+        "status": row["status"],
+    }
+
+
+def run_get(database: sqlite3.Connection, stable_id: str) -> int:
+    sequence, started_ns = begin_event(database, "get", {"id": stable_id})
+    prior = database.execute(
+        "SELECT * FROM operation_journal WHERE sequence < ? ORDER BY sequence",
+        (sequence,),
+    ).fetchall()
+    data_prior = [row for row in prior if row["operation"] != "help"]
+    searches = [row for row in data_prior if row["operation"] == "search"]
+    gets = [row for row in data_prior if row["operation"] == "get"]
+    resolved_searches = [
+        row
+        for row in searches
+        if row["result_count"] == 1
+        and isinstance(row["sole_id"], str)
+        and row["sole_id"]
+    ]
+    expected_get_count = len(resolved_searches)
+    if (
+        len(searches) != 2
+        or expected_get_count not in {1, 2}
+        or len(data_prior) != 2 + len(gets)
+        or len(gets) >= expected_get_count
+    ):
+        return fail(database, sequence, "retrievals must immediately follow the two searches")
+    if any(row["finished_ns"] is None or row["error"] is not None for row in searches):
+        return fail(database, sequence, "both search results must return before retrieval")
+    if started_ns <= max(int(row["finished_ns"]) for row in searches):
+        return fail(database, sequence, "retrieval started before both searches returned")
+    matching = [row for row in resolved_searches if row["sole_id"] == stable_id]
+    if len(matching) != 1:
+        return fail(database, sequence, "retrieval ID was not the sole ID from its search")
+
+    if expected_get_count == 2:
+        paired, message = wait_for_pair(database, "get")
+        if not paired:
+            return fail(database, sequence, message)
+
+    get_rows = database.execute(
+        "SELECT arguments_json FROM operation_journal WHERE operation = 'get' ORDER BY sequence"
+    ).fetchall()
+    requested_ids = [json.loads(row["arguments_json"])["id"] for row in get_rows]
+    if len(requested_ids) != expected_get_count or len(set(requested_ids)) != len(requested_ids):
+        return fail(database, sequence, "each resolved branch must be retrieved exactly once")
+
+    row = database.execute(
+        """
+        SELECT id, name, location, status, sku, quantity, bin_code, internal_note
+          FROM inventory_items
+         WHERE id = ?
+        """,
+        (stable_id,),
+    ).fetchone()
+    record = None if row is None else full_record(row)
+    result = {"record": record}
+    finish_event(
+        database,
+        sequence,
+        result=result,
+        result_count=int(record is not None),
+        sole_id=stable_id if record is not None else None,
+    )
+    emit(result)
+    return 0
+
+
+def run_forbidden(database: sqlite3.Connection, args: argparse.Namespace) -> int:
+    operation = str(args.operation)
+    arguments = {
+        key: value
+        for key, value in vars(args).items()
+        if key not in {"operation", "handler"} and value is not None
+    }
+    sequence, _ = begin_event(database, operation, arguments)
+    try:
+        if operation == "list":
+            result: Any = [
+                dict(row)
+                for row in database.execute(
+                    "SELECT id, name, location, status FROM inventory_items ORDER BY id"
+                )
+            ]
+        elif operation == "preferences":
+            row = database.execute(
+                "SELECT owner, preference FROM saved_preferences WHERE owner = ?",
+                (args.owner,),
+            ).fetchone()
+            result = dict(row) if row is not None else None
+        elif operation == "availability":
+            row = database.execute(
+                "SELECT location, receiving_slots FROM availability WHERE location = ?",
+                (args.location,),
+            ).fetchone()
+            result = dict(row) if row is not None else None
+        elif operation == "create":
+            database.execute(
+                """
+                INSERT INTO inventory_items
+                    (id, name, location, status, sku, quantity, bin_code, internal_note)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    args.id,
+                    args.name,
+                    args.location,
+                    args.status,
+                    args.sku,
+                    args.quantity,
+                    args.bin,
+                    args.note,
+                ),
+            )
+            result = {"created": args.id}
+        elif operation == "update":
+            database.execute(
+                "UPDATE inventory_items SET status = ? WHERE id = ?",
+                (args.status, args.id),
+            )
+            result = {"updated": args.id}
+        elif operation == "cancel":
+            database.execute(
+                "UPDATE inventory_items SET status = 'canceled' WHERE id = ?",
+                (args.id,),
+            )
+            result = {"canceled": args.id}
+        else:
+            database.execute(
+                "INSERT INTO notifications (item_id, message) VALUES (?, ?)",
+                (args.id, args.message),
+            )
+            result = {"notified": args.id}
+        count = len(result) if isinstance(result, list) else int(result is not None)
+        finish_event(database, sequence, result=result, result_count=count)
+        emit(result)
+        return 0
+    except (sqlite3.Error, ValueError) as error:
+        return fail(database, sequence, str(error))
+
+
+def record_help(argv: list[str]) -> None:
+    """Record successful built-in help discovery without treating it as data access."""
+    database = connect()
+    try:
+        sequence, _ = begin_event(database, "help", {"argv": argv})
+        finish_event(
+            database,
+            sequence,
+            result={"interfaceHelp": True},
+            result_count=1,
+        )
+    finally:
+        database.close()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="inventoryctl",
+        description="Query the sandboxed inventory registry.",
+    )
+    subcommands = parser.add_subparsers(dest="operation", required=True)
+
+    search = subcommands.add_parser(
+        "search", help="search item summaries by exact name and location"
+    )
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+    search.set_defaults(handler=lambda db, ns: run_search(db, ns.name, ns.location))
+
+    get = subcommands.add_parser("get", help="retrieve one full item by stable ID")
+    get.add_argument("--id", required=True)
+    get.set_defaults(handler=lambda db, ns: run_get(db, ns.id))
+
+    subcommands.add_parser("list", help="list the inventory collection").set_defaults(
+        handler=run_forbidden
+    )
+    preferences = subcommands.add_parser("preferences", help="read saved preferences")
+    preferences.add_argument("--owner", default="stockroom-lead")
+    preferences.set_defaults(handler=run_forbidden)
+    availability = subcommands.add_parser("availability", help="check receiving availability")
+    availability.add_argument("--location", required=True)
+    availability.set_defaults(handler=run_forbidden)
+    create = subcommands.add_parser("create", help="create an inventory item")
+    create.add_argument("--id", required=True)
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--status", required=True)
+    create.add_argument("--sku", required=True)
+    create.add_argument("--quantity", required=True, type=int)
+    create.add_argument("--bin", required=True)
+    create.add_argument("--note", required=True)
+    create.set_defaults(handler=run_forbidden)
+    update = subcommands.add_parser("update", help="update an item status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+    update.set_defaults(handler=run_forbidden)
+    cancel = subcommands.add_parser("cancel", help="cancel an inventory item")
+    cancel.add_argument("--id", required=True)
+    cancel.set_defaults(handler=run_forbidden)
+    notify = subcommands.add_parser("notify", help="send an inventory notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+    notify.set_defaults(handler=run_forbidden)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    argv = sys.argv[1:]
+    if any(argument in {"-h", "--help"} for argument in argv):
+        try:
+            parser.parse_args(argv)
+        except SystemExit as exit_request:
+            if exit_request.code == 0:
+                try:
+                    record_help(argv)
+                except (RuntimeError, sqlite3.Error) as error:
+                    print(str(error), file=sys.stderr)
+                    return 2
+            return int(exit_request.code or 0)
+    args = parser.parse_args(argv)
+    try:
+        database = connect()
+    except (RuntimeError, sqlite3.Error) as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    try:
+        return int(args.handler(database, args))
+    except (RuntimeError, sqlite3.Error, json.JSONDecodeError) as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    finally:
+        database.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

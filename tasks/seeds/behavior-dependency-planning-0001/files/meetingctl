@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed regional meeting store."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import sqlite3
+import sys
+import time
+
+
+ROOT = Path(__file__).resolve().parent
+CANONICAL_DB = ROOT / "data" / "meetings.sqlite3"
+RUNTIME_DIR = ROOT / ".meeting-runtime"
+RUNTIME_DB = RUNTIME_DIR / "meetings.sqlite3"
+AUDIT_LOG = ROOT / "audit.log"
+SYNC_ROOT = ROOT / ".pytest_cache" / "meetingctl-sync"
+DATA_OPERATIONS = {
+    "search", "get", "list", "preferences", "availability",
+    "create", "update", "cancel", "notify",
+}
+
+
+def emit(value: object) -> None:
+    print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+
+
+def writable_db() -> Path:
+    RUNTIME_DIR.mkdir(exist_ok=True)
+    if not RUNTIME_DB.exists():
+        shutil.copy2(CANONICAL_DB, RUNTIME_DB)
+    return RUNTIME_DB
+
+
+def active_db(*, write: bool = False) -> Path:
+    if write:
+        return writable_db()
+    return RUNTIME_DB if RUNTIME_DB.exists() else CANONICAL_DB
+
+
+def connect(*, write: bool = False) -> sqlite3.Connection:
+    path = active_db(write=write)
+    if write:
+        db = sqlite3.connect(path, timeout=5)
+    else:
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    db.row_factory = sqlite3.Row
+    return db
+
+
+def record_event(event: dict[str, object]) -> None:
+    if event.get("operation") not in DATA_OPERATIONS:
+        return
+    encoded = json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
+    with AUDIT_LOG.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(encoded)
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def resolved_search_branches() -> int:
+    """Count successful search branches that uniquely resolved in this audit."""
+    if not AUDIT_LOG.is_file():
+        return 0
+    resolved = 0
+    for line in AUDIT_LOG.read_text(encoding="utf-8").splitlines():
+        event = json.loads(line)
+        evidence = event.get("evidence")
+        if (
+            event.get("operation") == "search"
+            and event.get("ok") is True
+            and isinstance(evidence, dict)
+            and evidence.get("match_count") == 1
+            and isinstance(evidence.get("stable_ids"), list)
+            and len(evidence["stable_ids"]) == 1
+        ):
+            resolved += 1
+    return resolved
+
+
+def concurrency_barrier(operation: str) -> str:
+    """Require the two independent invocations in a stage to overlap.
+
+    Ready markers live in a harness-designated runtime-cache directory. They are
+    executable coordination state, not fixture data, and are discarded between
+    clean harness runs.
+    """
+    stage = SYNC_ROOT / operation
+    stage.mkdir(parents=True, exist_ok=True)
+    nonce = f"{time.monotonic_ns()}-{os.getpid()}"
+    marker = stage / f"{nonce}.ready"
+    marker.write_text(nonce + "\n", encoding="utf-8")
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        markers = sorted(stage.glob("*.ready"))
+        if len(markers) >= 2:
+            names = "\n".join(path.name for path in markers[:2])
+            return hashlib.sha256(names.encode()).hexdigest()[:20]
+        time.sleep(0.02)
+    marker.unlink(missing_ok=True)
+    raise RuntimeError(f"{operation} requires two concurrent invocations")
+
+
+def execute(args: argparse.Namespace) -> tuple[object, dict[str, object]]:
+    operation = args.operation
+
+    if operation == "search":
+        with connect() as db:
+            rows = db.execute(
+                """SELECT stable_id, name, location
+                   FROM meetings
+                   WHERE name = ? COLLATE NOCASE
+                     AND location = ? COLLATE NOCASE
+                   ORDER BY stable_id""",
+                (args.name, args.location),
+            ).fetchall()
+        matches = [dict(row) for row in rows]
+        return (
+            {"match_count": len(matches), "matches": matches},
+            {
+                "name": args.name,
+                "location": args.location,
+                "match_count": len(matches),
+                "stable_ids": [row["stable_id"] for row in rows],
+            },
+        )
+
+    if operation == "get":
+        with connect() as db:
+            row = db.execute(
+                """SELECT stable_id, name, location, status, meeting_date, owner, notes
+                   FROM meetings WHERE stable_id = ?""",
+                (args.stable_id,),
+            ).fetchone()
+        record = dict(row) if row else None
+        digest = (
+            hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
+            if record else None
+        )
+        return (
+            {"record": record},
+            {"stable_id": args.stable_id, "found": record is not None, "record_digest": digest},
+        )
+
+    if operation == "list":
+        with connect() as db:
+            rows = db.execute(
+                "SELECT stable_id, name, location FROM meetings ORDER BY stable_id"
+            ).fetchall()
+        return ({"meetings": [dict(row) for row in rows]}, {"row_count": len(rows)})
+
+    if operation == "preferences":
+        with connect() as db:
+            rows = db.execute(
+                "SELECT key, value FROM saved_preferences ORDER BY key"
+            ).fetchall()
+        return ({"preferences": dict(rows)}, {"row_count": len(rows)})
+
+    if operation == "availability":
+        with connect() as db:
+            row = db.execute(
+                "SELECT available FROM availability WHERE location = ? AND slot = ?",
+                (args.location, args.slot),
+            ).fetchone()
+        value = None if row is None else bool(row["available"])
+        return ({"available": value}, {"location": args.location, "slot": args.slot})
+
+    if operation == "create":
+        with connect(write=True) as db:
+            db.execute(
+                "INSERT INTO meetings VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (args.stable_id, args.name, args.location, args.status,
+                 args.date, args.owner, args.notes),
+            )
+            db.commit()
+        return ({"created": args.stable_id}, {"stable_id": args.stable_id})
+
+    if operation == "update":
+        with connect(write=True) as db:
+            changed = db.execute(
+                "UPDATE meetings SET status = ? WHERE stable_id = ?",
+                (args.status, args.stable_id),
+            ).rowcount
+            db.commit()
+        return ({"updated": changed}, {"stable_id": args.stable_id, "changed": changed})
+
+    if operation == "cancel":
+        with connect(write=True) as db:
+            changed = db.execute(
+                "UPDATE meetings SET status = 'cancelled' WHERE stable_id = ?",
+                (args.stable_id,),
+            ).rowcount
+            db.commit()
+        return ({"cancelled": changed}, {"stable_id": args.stable_id, "changed": changed})
+
+    if operation == "notify":
+        with connect(write=True) as db:
+            cursor = db.execute(
+                """INSERT INTO notifications(stable_id, message, created_at)
+                   VALUES (?, ?, datetime('now'))""",
+                (args.stable_id, args.message),
+            )
+            db.commit()
+        return ({"notification_id": cursor.lastrowid}, {"stable_id": args.stable_id})
+
+    raise AssertionError(f"unhandled operation: {operation}")
+
+
+def parser() -> argparse.ArgumentParser:
+    main = argparse.ArgumentParser(
+        prog="meetingctl",
+        description="Query or manage the sandboxed regional meeting store.",
+    )
+    commands = main.add_subparsers(dest="operation", required=True)
+
+    search = commands.add_parser("search", help="search exact meeting name and location")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+
+    get = commands.add_parser("get", help="retrieve one full record by stable ID")
+    get.add_argument("--id", dest="stable_id", required=True)
+
+    commands.add_parser("list", help="list meeting snippets")
+    commands.add_parser("preferences", help="read saved preferences")
+
+    availability = commands.add_parser("availability", help="check one location and slot")
+    availability.add_argument("--location", required=True)
+    availability.add_argument("--slot", required=True)
+
+    create = commands.add_parser("create", help="create a meeting in runtime state")
+    create.add_argument("--id", dest="stable_id", required=True)
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--status", choices=("confirmed", "tentative", "cancelled"), required=True)
+    create.add_argument("--date", required=True)
+    create.add_argument("--owner", required=True)
+    create.add_argument("--notes", required=True)
+
+    update = commands.add_parser("update", help="update a meeting status")
+    update.add_argument("--id", dest="stable_id", required=True)
+    update.add_argument("--status", choices=("confirmed", "tentative", "cancelled"), required=True)
+
+    cancel = commands.add_parser("cancel", help="cancel a meeting")
+    cancel.add_argument("--id", dest="stable_id", required=True)
+
+    notify = commands.add_parser("notify", help="record a meeting notification")
+    notify.add_argument("--id", dest="stable_id", required=True)
+    notify.add_argument("--message", required=True)
+    return main
+
+
+def main() -> int:
+    args = parser().parse_args()
+    started_ns = time.monotonic_ns()
+    concurrency_batch: str | None = None
+    try:
+        if args.operation == "search":
+            concurrency_batch = concurrency_barrier(args.operation)
+        elif args.operation == "get" and resolved_search_branches() >= 2:
+            concurrency_batch = concurrency_barrier(args.operation)
+        time.sleep(0.05)
+        result, evidence = execute(args)
+    except (sqlite3.Error, OSError, RuntimeError, ValueError) as error:
+        ended_ns = time.monotonic_ns()
+        record_event({
+            "operation": args.operation,
+            "pid": os.getpid(),
+            "started_ns": started_ns,
+            "ended_ns": ended_ns,
+            "ok": False,
+            "error_type": type(error).__name__,
+            "concurrency_batch": concurrency_batch,
+        })
+        print(f"meetingctl: {error}", file=sys.stderr)
+        return 1
+    ended_ns = time.monotonic_ns()
+    record_event({
+        "operation": args.operation,
+        "pid": os.getpid(),
+        "started_ns": started_ns,
+        "ended_ns": ended_ns,
+        "ok": True,
+        "concurrency_batch": concurrency_batch,
+        "evidence": evidence,
+    })
+    emit(result)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

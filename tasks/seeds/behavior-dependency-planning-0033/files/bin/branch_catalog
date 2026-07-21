@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""Executable branch-catalog client used by the Pi task environment."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+
+
+ROOT = Path(__file__).resolve().parents[1]
+RUNTIME = ROOT / ".branch_catalog"
+DATABASE = RUNTIME / "catalog.sqlite"
+AUDIT_LOG = RUNTIME / "audit.jsonl"
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        prog="branch_catalog",
+        description=(
+            "Query the sandboxed branch catalog. Independent requests may be "
+            "launched concurrently as separate processes; each prints one JSON document."
+        ),
+    )
+    commands = result.add_subparsers(dest="operation", required=True)
+
+    search = commands.add_parser("search", help="search by exact title name and branch location")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+
+    get = commands.add_parser("get", help="retrieve one record by stable ID")
+    get.add_argument("--stable-id", required=True)
+
+    commands.add_parser("list", help="list the collection")
+    commands.add_parser("preferences", help="read saved preferences")
+
+    availability = commands.add_parser("availability", help="check current availability")
+    availability.add_argument("--stable-id", required=True)
+
+    create = commands.add_parser("create", help="create a catalog record")
+    create.add_argument("--stable-id", required=True)
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--status", required=True)
+    create.add_argument("--date", required=True)
+
+    update = commands.add_parser("update", help="update a record status")
+    update.add_argument("--stable-id", required=True)
+    update.add_argument("--status", required=True)
+
+    cancel = commands.add_parser("cancel", help="cancel a record")
+    cancel.add_argument("--stable-id", required=True)
+
+    notify = commands.add_parser("notify", help="send a record notification")
+    notify.add_argument("--stable-id", required=True)
+    notify.add_argument("--message", required=True)
+    return result
+
+
+def public_arguments(namespace: argparse.Namespace) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in vars(namespace).items()
+        if key != "operation" and value is not None
+    }
+
+
+def record_audit(entry: dict) -> None:
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    encoded = json.dumps(entry, sort_keys=True, separators=(",", ":")) + "\n"
+    with AUDIT_LOG.open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def row_to_record(row: sqlite3.Row) -> dict[str, str]:
+    return {
+        "stable_id": row["stable_id"],
+        "name": row["name"],
+        "location": row["location"],
+        "status": row["status"],
+        "date": row["record_date"],
+    }
+
+
+def execute(namespace: argparse.Namespace) -> object:
+    connection = sqlite3.connect(DATABASE, timeout=5)
+    connection.row_factory = sqlite3.Row
+    operation = namespace.operation
+    try:
+        if operation == "search":
+            rows = connection.execute(
+                """SELECT stable_id, name, location
+                   FROM records WHERE name = ? AND location = ?
+                   ORDER BY stable_id""",
+                (namespace.name, namespace.location),
+            ).fetchall()
+            return {
+                "matches": [
+                    {
+                        "stable_id": row["stable_id"],
+                        "name": row["name"],
+                        "location": row["location"],
+                    }
+                    for row in rows
+                ]
+            }
+        if operation == "get":
+            row = connection.execute(
+                """SELECT stable_id, name, location, status, record_date
+                   FROM records WHERE stable_id = ?""",
+                (namespace.stable_id,),
+            ).fetchone()
+            return {"record": row_to_record(row) if row is not None else None}
+        if operation == "list":
+            rows = connection.execute(
+                """SELECT stable_id, name, location, status, record_date
+                   FROM records ORDER BY stable_id"""
+            ).fetchall()
+            return {"records": [row_to_record(row) for row in rows]}
+        if operation == "preferences":
+            rows = connection.execute(
+                "SELECT preference_key, preference_value FROM saved_preferences ORDER BY preference_key"
+            ).fetchall()
+            return {"preferences": {row[0]: row[1] for row in rows}}
+        if operation == "availability":
+            row = connection.execute(
+                "SELECT status FROM records WHERE stable_id = ?", (namespace.stable_id,)
+            ).fetchone()
+            return {"stable_id": namespace.stable_id, "status": row[0] if row else None}
+        if operation == "create":
+            connection.execute(
+                "INSERT INTO records VALUES (?, ?, ?, ?, ?)",
+                (
+                    namespace.stable_id,
+                    namespace.name,
+                    namespace.location,
+                    namespace.status,
+                    namespace.date,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO mutation_log(operation, stable_id) VALUES ('create', ?)",
+                (namespace.stable_id,),
+            )
+            connection.commit()
+            return {"created": namespace.stable_id}
+        if operation in {"update", "cancel"}:
+            status = namespace.status if operation == "update" else "cancelled"
+            connection.execute(
+                "UPDATE records SET status = ? WHERE stable_id = ?",
+                (status, namespace.stable_id),
+            )
+            connection.execute(
+                "INSERT INTO mutation_log(operation, stable_id) VALUES (?, ?)",
+                (operation, namespace.stable_id),
+            )
+            connection.commit()
+            return {"updated": namespace.stable_id, "status": status}
+        if operation == "notify":
+            connection.execute(
+                "INSERT INTO notifications(stable_id, message) VALUES (?, ?)",
+                (namespace.stable_id, namespace.message),
+            )
+            connection.commit()
+            return {"notified": namespace.stable_id}
+        raise RuntimeError(f"unsupported operation: {operation}")
+    finally:
+        connection.close()
+
+
+def main() -> int:
+    namespace = parser().parse_args()
+    if not DATABASE.is_file():
+        print("branch_catalog: environment is not initialized", file=sys.stderr)
+        return 70
+
+    started_ns = time.monotonic_ns()
+    outcome = "ok"
+    result: object = None
+    error = None
+    try:
+        # The short service-latency window makes truly concurrent client requests
+        # observably overlap without relying on audit-line append order.
+        time.sleep(0.30)
+        result = execute(namespace)
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+        return_code = 0
+    except Exception as exc:  # audit recognized operations even on failure
+        outcome = "error"
+        error = f"{type(exc).__name__}: {exc}"
+        print(f"branch_catalog: {error}", file=sys.stderr)
+        return_code = 1
+    finished_ns = time.monotonic_ns()
+    record_audit(
+        {
+            "operation": namespace.operation,
+            "arguments": public_arguments(namespace),
+            "started_ns": started_ns,
+            "finished_ns": finished_ns,
+            "pid": os.getpid(),
+            "ppid": os.getppid(),
+            "outcome": outcome,
+            "result": result,
+            "error": error,
+        }
+    )
+    return return_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

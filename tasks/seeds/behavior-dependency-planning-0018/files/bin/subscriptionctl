@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""Executable client for the local subscription account-review sandbox."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import sqlite3
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent.parent
+DATA_DB = ROOT / "data" / "subscriptions.sqlite3"
+JOURNAL_DB = ROOT / "var" / "subscription-executions.sqlite3"
+PAIR_TIMEOUT_SECONDS = 4.0
+POLL_SECONDS = 0.025
+
+FORBIDDEN_OPERATIONS = {
+    "list",
+    "preferences",
+    "availability",
+    "create",
+    "update",
+    "cancel",
+    "notify",
+}
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def digest(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def journal_connection() -> sqlite3.Connection:
+    JOURNAL_DB.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(JOURNAL_DB, timeout=10, isolation_level=None)
+    connection.execute("PRAGMA busy_timeout = 10000")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS executions (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation TEXT NOT NULL,
+            arguments_json TEXT NOT NULL,
+            started_ns INTEGER NOT NULL,
+            ended_ns INTEGER,
+            succeeded INTEGER,
+            result_digest TEXT,
+            error_text TEXT
+        )
+        """
+    )
+    return connection
+
+
+def start_event(operation: str, arguments: dict[str, Any]) -> int:
+    with journal_connection() as connection:
+        cursor = connection.execute(
+            "INSERT INTO executions(operation, arguments_json, started_ns) VALUES (?, ?, ?)",
+            (operation, canonical_json(arguments), time.time_ns()),
+        )
+        return int(cursor.lastrowid)
+
+
+def finish_event(
+    event_id: int,
+    *,
+    succeeded: bool,
+    result: Any | None = None,
+    error: str | None = None,
+) -> None:
+    with journal_connection() as connection:
+        connection.execute(
+            """
+            UPDATE executions
+               SET ended_ns = ?, succeeded = ?, result_digest = ?, error_text = ?
+             WHERE event_id = ?
+            """,
+            (
+                time.time_ns(),
+                int(succeeded),
+                digest(result) if succeeded else None,
+                error,
+                event_id,
+            ),
+        )
+
+
+def operation_count(operation: str) -> int:
+    with journal_connection() as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) FROM executions WHERE operation = ?", (operation,)
+        ).fetchone()
+    return int(row[0])
+
+
+def completed_success_count(operation: str) -> int:
+    with journal_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT COUNT(*)
+              FROM executions
+             WHERE operation = ? AND ended_ns IS NOT NULL AND succeeded = 1
+            """,
+            (operation,),
+        ).fetchone()
+    return int(row[0])
+
+
+def wait_for_pair(operation: str) -> None:
+    deadline = time.monotonic() + PAIR_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        count = operation_count(operation)
+        if count == 2:
+            # Keep both real client processes alive briefly, making overlap an
+            # observable invariant instead of relying on scheduler luck.
+            time.sleep(0.12)
+            return
+        if count > 2:
+            raise RuntimeError(f"{operation} phase contains more than two requests")
+        time.sleep(POLL_SECONDS)
+    raise RuntimeError(f"{operation} request did not receive its concurrent peer")
+
+
+def query_search(name: str, location: str) -> dict[str, Any]:
+    with sqlite3.connect(f"file:{DATA_DB}?mode=ro", uri=True) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            """
+            SELECT stable_id, name, location
+              FROM subscriptions
+             WHERE name = ? AND location = ?
+             ORDER BY stable_id
+            """,
+            (name, location),
+        ).fetchall()
+    matches = [
+        {"id": row["stable_id"], "location": row["location"], "name": row["name"]}
+        for row in rows
+    ]
+    return {"count": len(matches), "matches": matches}
+
+
+def query_get(stable_id: str) -> dict[str, Any]:
+    with sqlite3.connect(f"file:{DATA_DB}?mode=ro", uri=True) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            """
+            SELECT stable_id, name, location, record_date, status,
+                   account_reference, service_tier
+              FROM subscriptions
+             WHERE stable_id = ?
+            """,
+            (stable_id,),
+        ).fetchone()
+    if row is None:
+        return {"record": None}
+    return {
+        "record": {
+            "accountReference": row["account_reference"],
+            "date": row["record_date"],
+            "id": row["stable_id"],
+            "location": row["location"],
+            "name": row["name"],
+            "serviceTier": row["service_tier"],
+            "status": row["status"],
+        }
+    }
+
+
+def emit(value: Any) -> None:
+    print(canonical_json(value), flush=True)
+
+
+def run_search(args: argparse.Namespace) -> int:
+    arguments = {"location": args.location, "name": args.name}
+    event_id = start_event("search", arguments)
+    try:
+        result = query_search(args.name, args.location)
+        wait_for_pair("search")
+    except Exception as exc:
+        finish_event(event_id, succeeded=False, error=str(exc))
+        print(str(exc), file=sys.stderr)
+        return 2
+    finish_event(event_id, succeeded=True, result=result)
+    emit(result)
+    return 0
+
+
+def run_get(args: argparse.Namespace) -> int:
+    if completed_success_count("search") != 2 or operation_count("search") != 2:
+        event_id = start_event("get", {"id": args.id})
+        message = "retrieval requires exactly two completed successful searches"
+        finish_event(event_id, succeeded=False, error=message)
+        print(message, file=sys.stderr)
+        return 2
+
+    event_id = start_event("get", {"id": args.id})
+    try:
+        result = query_get(args.id)
+        wait_for_pair("get")
+    except Exception as exc:
+        finish_event(event_id, succeeded=False, error=str(exc))
+        print(str(exc), file=sys.stderr)
+        return 2
+    finish_event(event_id, succeeded=True, result=result)
+    emit(result)
+    return 0
+
+
+def run_forbidden(args: argparse.Namespace) -> int:
+    operation = args.operation
+    event_id = start_event(operation, {})
+    message = f"operation {operation!r} is disabled in this read-only sandbox"
+    finish_event(event_id, succeeded=False, error=message)
+    print(message, file=sys.stderr)
+    return 3
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="subscriptionctl")
+    subparsers = parser.add_subparsers(dest="operation", required=True)
+
+    search = subparsers.add_parser("search", help="search by exact name and location")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+    search.set_defaults(handler=run_search)
+
+    get = subparsers.add_parser("get", help="retrieve one full record by stable ID")
+    get.add_argument("--id", required=True)
+    get.set_defaults(handler=run_get)
+
+    for operation in sorted(FORBIDDEN_OPERATIONS):
+        blocked = subparsers.add_parser(operation)
+        blocked.set_defaults(handler=run_forbidden)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    return int(args.handler(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

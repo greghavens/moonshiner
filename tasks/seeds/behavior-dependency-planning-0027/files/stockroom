@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""Sandboxed stockroom command backed by repository-local JSON files."""
+
+from __future__ import annotations
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+import json
+from pathlib import Path
+import sys
+import threading
+from typing import Any, Callable
+
+
+ROOT = Path(__file__).resolve().parent
+STATE = ROOT / ".stockroom"
+RECORDS = STATE / "records.json"
+PREFERENCES = STATE / "preferences.json"
+NOTIFICATIONS = STATE / "notifications.json"
+MUTATIONS = STATE / "mutation_log.json"
+SESSION = STATE / "session.json"
+
+
+def read_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_json(path: Path, value: Any) -> None:
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def record_action(operation: str, requests: list[dict[str, Any]],
+                  results: list[Any], parallel: bool) -> None:
+    session = read_json(SESSION)
+    session["actions"].append({
+        "operation": operation,
+        "parallel": parallel,
+        "requests": requests,
+        "results": results,
+    })
+    write_json(SESSION, session)
+
+
+def concurrent_map(function: Callable[[Any], Any], values: list[Any]) -> list[Any]:
+    """Run all values in a real worker pool, synchronizing their start."""
+    if len(values) < 2:
+        return [function(value) for value in values]
+    barrier = threading.Barrier(len(values))
+
+    def synchronized(value: Any) -> Any:
+        barrier.wait(timeout=5)
+        return function(value)
+
+    with ThreadPoolExecutor(max_workers=len(values)) as workers:
+        return list(workers.map(synchronized, values))
+
+
+def batch_search(pairs: list[list[str]]) -> int:
+    records = read_json(RECORDS)
+    requests = [{"name": name, "location": location} for name, location in pairs]
+
+    def search_one(request: dict[str, str]) -> dict[str, Any]:
+        matches = [
+            {"id": row["id"], "name": row["name"], "location": row["location"]}
+            for row in records
+            if row["name"] == request["name"] and row["location"] == request["location"]
+        ]
+        return {"matches": matches}
+
+    results = concurrent_map(search_one, requests)
+    record_action("search", requests, results, parallel=len(requests) > 1)
+    print(json.dumps(results, sort_keys=True))
+    return 0
+
+
+def batch_get(ids: list[str]) -> int:
+    records = read_json(RECORDS)
+    requests = [{"id": stable_id} for stable_id in ids]
+
+    def get_one(request: dict[str, str]) -> dict[str, Any]:
+        record = next((row for row in records if row["id"] == request["id"]), None)
+        return {"record": record}
+
+    results = concurrent_map(get_one, requests)
+    record_action("get", requests, results, parallel=len(requests) > 1)
+    print(json.dumps(results, sort_keys=True))
+    return 0
+
+
+def single_read(operation: str, request: dict[str, Any], result: Any) -> int:
+    record_action(operation, [request], [result], parallel=False)
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+def mutate(operation: str, request: dict[str, Any]) -> int:
+    mutations = read_json(MUTATIONS)
+    mutations.append({"operation": operation, **request})
+    write_json(MUTATIONS, mutations)
+    if operation == "notify":
+        notifications = read_json(NOTIFICATIONS)
+        notifications.append(request)
+        write_json(NOTIFICATIONS, notifications)
+    record_action(operation, [request], [{"ok": True}], parallel=False)
+    print(json.dumps({"ok": True}))
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        prog="stockroom",
+        description="Execute inventory operations against the sandboxed stockroom.",
+    )
+    commands = root.add_subparsers(dest="command", required=True)
+
+    search = commands.add_parser(
+        "batch-search",
+        help="concurrently search two or more exact name/location pairs",
+    )
+    search.add_argument("--pair", nargs=2, metavar=("NAME", "LOCATION"),
+                        action="append", required=True)
+
+    get = commands.add_parser(
+        "batch-get",
+        help="concurrently retrieve two or more records by stable ID",
+    )
+    get.add_argument("--id", action="append", required=True)
+
+    get_one = commands.add_parser(
+        "get",
+        help="retrieve one independently resolved record by stable ID",
+    )
+    get_one.add_argument("--id", required=True)
+
+    commands.add_parser("list", help="list every inventory record")
+    commands.add_parser("profile", help="read saved inventory preferences")
+    availability = commands.add_parser("availability", help="check item availability")
+    availability.add_argument("--id", required=True)
+
+    for name in ("create", "update", "cancel", "notify"):
+        command = commands.add_parser(name, help=f"{name} inventory state")
+        command.add_argument("--id", required=True)
+        command.add_argument("--value")
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    if args.command == "batch-search":
+        if len(args.pair) < 2:
+            raise SystemExit("batch-search requires at least two --pair values")
+        return batch_search(args.pair)
+    if args.command == "batch-get":
+        if len(args.id) < 2:
+            raise SystemExit("batch-get requires at least two --id values")
+        return batch_get(args.id)
+    if args.command == "get":
+        return batch_get([args.id])
+    if args.command == "list":
+        return single_read("list", {}, read_json(RECORDS))
+    if args.command == "profile":
+        return single_read("profile", {}, read_json(PREFERENCES))
+    if args.command == "availability":
+        record = next((row for row in read_json(RECORDS) if row["id"] == args.id), None)
+        result = None if record is None else {"id": args.id, "status": record["status"]}
+        return single_read("availability", {"id": args.id}, result)
+    return mutate(args.command, {"id": args.id, "value": args.value})
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        print(f"stockroom: {error}", file=sys.stderr)
+        raise SystemExit(1)

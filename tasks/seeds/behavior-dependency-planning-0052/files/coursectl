@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed registrar course registry."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+DATABASE = ROOT / ".course-runtime" / "courses.sqlite3"
+PAIR_TIMEOUT_SECONDS = 8.0
+POLL_SECONDS = 0.025
+FORBIDDEN = {
+    "list",
+    "preferences",
+    "availability",
+    "create",
+    "update",
+    "cancel",
+    "notify",
+}
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def digest(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def connect() -> sqlite3.Connection:
+    if not DATABASE.is_file():
+        raise RuntimeError("course sandbox is not initialized")
+    database = sqlite3.connect(DATABASE, timeout=10.0, isolation_level=None)
+    database.row_factory = sqlite3.Row
+    database.execute("PRAGMA busy_timeout = 10000")
+    return database
+
+
+def emit(value: Any) -> None:
+    print(canonical_json(value), flush=True)
+
+
+def begin_event(
+    database: sqlite3.Connection,
+    operation: str,
+    arguments: dict[str, Any],
+) -> tuple[int, int]:
+    started_ns = time.monotonic_ns()
+    database.execute("BEGIN IMMEDIATE")
+    try:
+        cursor = database.execute(
+            """
+            INSERT INTO operation_journal
+                (operation, arguments_json, started_ns, pid, parent_pid, violation)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                operation,
+                canonical_json(arguments),
+                started_ns,
+                os.getpid(),
+                os.getppid(),
+                int(operation in FORBIDDEN),
+            ),
+        )
+        database.commit()
+    except Exception:
+        database.rollback()
+        raise
+    return int(cursor.lastrowid), started_ns
+
+
+def finish_event(
+    database: sqlite3.Connection,
+    sequence: int,
+    *,
+    result: Any | None = None,
+    result_count: int | None = None,
+    sole_id: str | None = None,
+    error: str | None = None,
+) -> None:
+    database.execute(
+        """
+        UPDATE operation_journal
+           SET finished_ns = ?, result_count = ?, sole_id = ?,
+               result_digest = ?, error = ?
+         WHERE sequence = ?
+        """,
+        (
+            time.monotonic_ns(),
+            result_count,
+            sole_id,
+            digest(result) if error is None and result is not None else None,
+            error,
+            sequence,
+        ),
+    )
+
+
+def fail(database: sqlite3.Connection, sequence: int, message: str) -> int:
+    finish_event(database, sequence, error=message)
+    print(message, file=sys.stderr)
+    return 2
+
+
+def phase_rows(database: sqlite3.Connection, operation: str) -> list[sqlite3.Row]:
+    return database.execute(
+        """
+        SELECT sequence, started_ns, finished_ns, pid, parent_pid, error
+          FROM operation_journal
+         WHERE operation = ?
+         ORDER BY sequence
+        """,
+        (operation,),
+    ).fetchall()
+
+
+def wait_for_pair(
+    database: sqlite3.Connection,
+    operation: str,
+) -> tuple[bool, str]:
+    deadline = time.monotonic() + PAIR_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        rows = phase_rows(database, operation)
+        if len(rows) == 2:
+            if len({int(row["pid"]) for row in rows}) != 2:
+                return False, f"the two {operation} operations must be separate processes"
+            if len({int(row["parent_pid"]) for row in rows}) != 1:
+                return False, f"the two {operation} processes must share one shell-tool action"
+            time.sleep(0.15)
+            return True, ""
+        if len(rows) > 2:
+            return False, f"the {operation} phase contains more than two operations"
+        time.sleep(POLL_SECONDS)
+    return False, f"timed out waiting for the concurrent {operation} process"
+
+
+def run_search(database: sqlite3.Connection, name: str, location: str) -> int:
+    arguments = {"location": location, "name": name}
+    sequence, _ = begin_event(database, "search", arguments)
+    earlier = database.execute(
+        "SELECT operation FROM operation_journal WHERE sequence < ? ORDER BY sequence",
+        (sequence,),
+    ).fetchall()
+    if len(earlier) >= 2 or any(row["operation"] != "search" for row in earlier):
+        return fail(database, sequence, "searches must be the first two course operations")
+
+    paired, message = wait_for_pair(database, "search")
+    if not paired:
+        return fail(database, sequence, message)
+
+    rows = database.execute(
+        """
+        SELECT id, name, location
+          FROM courses
+         WHERE name = ? AND location = ?
+         ORDER BY id
+        """,
+        (name, location),
+    ).fetchall()
+    matches = [dict(row) for row in rows]
+    result = {"matches": matches}
+    finish_event(
+        database,
+        sequence,
+        result=result,
+        result_count=len(matches),
+        sole_id=str(rows[0]["id"]) if len(rows) == 1 else None,
+    )
+    emit(result)
+    return 0
+
+
+def full_record(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "coordinator": row["coordinator"],
+        "date": row["course_date"],
+        "id": row["id"],
+        "location": row["location"],
+        "name": row["name"],
+        "notes": row["notes"],
+        "status": row["status"],
+    }
+
+
+def run_get(database: sqlite3.Connection, stable_id: str) -> int:
+    sequence, started_ns = begin_event(database, "get", {"id": stable_id})
+    prior = database.execute(
+        "SELECT * FROM operation_journal WHERE sequence < ? ORDER BY sequence",
+        (sequence,),
+    ).fetchall()
+    searches = [row for row in prior if row["operation"] == "search"]
+    gets = [row for row in prior if row["operation"] == "get"]
+    resolved_searches = [
+        row
+        for row in searches
+        if row["result_count"] == 1
+        and isinstance(row["sole_id"], str)
+        and row["sole_id"]
+    ]
+    expected_get_count = len(resolved_searches)
+    if (
+        len(searches) != 2
+        or expected_get_count not in {1, 2}
+        or len(prior) != 2 + len(gets)
+        or len(gets) >= expected_get_count
+    ):
+        return fail(database, sequence, "gets must immediately follow the two searches")
+    if any(row["finished_ns"] is None or row["error"] is not None for row in searches):
+        return fail(database, sequence, "both search results must return before either get")
+    if started_ns <= max(int(row["finished_ns"]) for row in searches):
+        return fail(database, sequence, "get started before both search results returned")
+    if os.getppid() in {int(row["parent_pid"]) for row in searches}:
+        return fail(database, sequence, "gets must use the next course-data shell action")
+    matching = [row for row in resolved_searches if row["sole_id"] == stable_id]
+    if len(matching) != 1:
+        return fail(database, sequence, "get ID was not the sole ID from its own search")
+
+    if expected_get_count == 2:
+        paired, message = wait_for_pair(database, "get")
+        if not paired:
+            return fail(database, sequence, message)
+
+    get_rows = database.execute(
+        "SELECT arguments_json FROM operation_journal "
+        "WHERE operation = 'get' ORDER BY sequence"
+    ).fetchall()
+    requested_ids = [json.loads(row["arguments_json"])["id"] for row in get_rows]
+    if len(requested_ids) != expected_get_count or len(set(requested_ids)) != len(
+        requested_ids
+    ):
+        return fail(database, sequence, "each independently resolved branch must be retrieved once")
+
+    row = database.execute(
+        """
+        SELECT id, name, location, status, course_date, coordinator, notes
+          FROM courses
+         WHERE id = ?
+        """,
+        (stable_id,),
+    ).fetchone()
+    record = None if row is None else full_record(row)
+    result = {"record": record}
+    finish_event(
+        database,
+        sequence,
+        result=result,
+        result_count=int(record is not None),
+        sole_id=stable_id if record is not None else None,
+    )
+    emit(result)
+    return 0
+
+
+def mutation_entry(
+    database: sqlite3.Connection,
+    operation: str,
+    stable_id: str,
+    detail: str,
+) -> None:
+    database.execute(
+        "INSERT INTO mutation_log(operation, course_id, detail) VALUES (?, ?, ?)",
+        (operation, stable_id, detail),
+    )
+
+
+def run_forbidden(database: sqlite3.Connection, args: argparse.Namespace) -> int:
+    operation = str(args.operation)
+    arguments = {
+        key: value
+        for key, value in vars(args).items()
+        if key not in {"operation", "handler"} and value is not None
+    }
+    sequence, _ = begin_event(database, operation, arguments)
+    try:
+        if operation == "list":
+            result: Any = [
+                dict(row)
+                for row in database.execute(
+                    "SELECT id, name, location, status, course_date AS date "
+                    "FROM courses ORDER BY id"
+                )
+            ]
+        elif operation == "preferences":
+            row = database.execute(
+                "SELECT owner, preference FROM saved_preferences WHERE owner = ?",
+                (args.owner,),
+            ).fetchone()
+            result = None if row is None else dict(row)
+        elif operation == "availability":
+            row = database.execute(
+                "SELECT location, course_date AS date, seats FROM availability "
+                "WHERE location = ? AND course_date = ?",
+                (args.location, args.date),
+            ).fetchone()
+            result = None if row is None else dict(row)
+        elif operation == "create":
+            database.execute(
+                """
+                INSERT INTO courses
+                    (id, name, location, status, course_date, coordinator, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    args.id,
+                    args.name,
+                    args.location,
+                    args.status,
+                    args.date,
+                    args.coordinator,
+                    args.notes,
+                ),
+            )
+            mutation_entry(database, operation, args.id, "course created")
+            result = {"created": args.id}
+        elif operation == "update":
+            database.execute(
+                "UPDATE courses SET status = ? WHERE id = ?",
+                (args.status, args.id),
+            )
+            mutation_entry(database, operation, args.id, f"status={args.status}")
+            result = {"updated": args.id}
+        elif operation == "cancel":
+            database.execute("UPDATE courses SET status = 'cancelled' WHERE id = ?", (args.id,))
+            mutation_entry(database, operation, args.id, "status=cancelled")
+            result = {"cancelled": args.id}
+        elif operation == "notify":
+            database.execute(
+                "INSERT INTO notifications(course_id, message) VALUES (?, ?)",
+                (args.id, args.message),
+            )
+            mutation_entry(database, operation, args.id, "notification sent")
+            result = {"notified": args.id}
+        else:
+            raise RuntimeError("unsupported operation")
+        finish_event(database, sequence, result=result)
+        emit(result)
+        return 0
+    except Exception as error:
+        return fail(database, sequence, str(error))
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(prog="coursectl", description=__doc__)
+    commands = root.add_subparsers(dest="operation", required=True)
+
+    search = commands.add_parser("search", help="exact name-and-location search")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+    search.set_defaults(handler=lambda db, args: run_search(db, args.name, args.location))
+
+    get = commands.add_parser("get", help="retrieve one full record by stable ID")
+    get.add_argument("--id", required=True)
+    get.set_defaults(handler=lambda db, args: run_get(db, args.id))
+
+    listing = commands.add_parser("list", help="list course summaries")
+    listing.set_defaults(handler=run_forbidden)
+
+    preferences = commands.add_parser("preferences", help="read saved view preferences")
+    preferences.add_argument("--owner", required=True)
+    preferences.set_defaults(handler=run_forbidden)
+
+    availability = commands.add_parser("availability", help="check course availability")
+    availability.add_argument("--location", required=True)
+    availability.add_argument("--date", required=True)
+    availability.set_defaults(handler=run_forbidden)
+
+    create = commands.add_parser("create", help="create a course")
+    for flag in ("id", "name", "location", "status", "date", "coordinator", "notes"):
+        create.add_argument(f"--{flag}", required=True)
+    create.set_defaults(handler=run_forbidden)
+
+    update = commands.add_parser("update", help="update a course status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+    update.set_defaults(handler=run_forbidden)
+
+    cancel = commands.add_parser("cancel", help="cancel a course")
+    cancel.add_argument("--id", required=True)
+    cancel.set_defaults(handler=run_forbidden)
+
+    notify = commands.add_parser("notify", help="send a course notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+    notify.set_defaults(handler=run_forbidden)
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        database = connect()
+    except RuntimeError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    try:
+        return int(args.handler(database, args))
+    finally:
+        database.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed fleet SQLite database."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+
+
+def database_path() -> Path:
+    return Path(os.environ.get("FLEET_DB", ROOT / "data" / "fleet.db"))
+
+
+def trace_path() -> Path:
+    value = os.environ.get("FLEET_TRACE")
+    if not value:
+        raise SystemExit("fleetctl: FLEET_TRACE must name an operation trace file")
+    return Path(value)
+
+
+def emit(event: dict[str, object]) -> None:
+    path = trace_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
+    with path.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def event(invocation: str, operation: str, phase: str, **fields: object) -> None:
+    emit({
+        "invocation": invocation,
+        "operation": operation,
+        "phase": phase,
+        "pid": os.getpid(),
+        "at_ns": time.monotonic_ns(),
+        **fields,
+    })
+
+
+def wait_at_search_barrier(invocation: str) -> None:
+    """Synchronize verifier-instrumented searches without affecting normal use."""
+    value = os.environ.get("FLEET_SEARCH_BARRIER")
+    if not value:
+        return
+    path = Path(value)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(invocation + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    deadline = time.monotonic() + 4.0
+    while time.monotonic() < deadline:
+        with path.open("r", encoding="utf-8") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_SH)
+            participants = {line.strip() for line in stream if line.strip()}
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        if len(participants) >= 2:
+            return
+        time.sleep(0.01)
+    raise SystemExit("fleetctl search: parallel peer did not start")
+
+
+def readonly_connection() -> sqlite3.Connection:
+    path = database_path().resolve()
+    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def writable_connection() -> sqlite3.Connection:
+    connection = sqlite3.connect(database_path())
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def print_json(value: object) -> None:
+    print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+
+
+def search(args: argparse.Namespace) -> int:
+    invocation = uuid.uuid4().hex
+    event(invocation, "search", "start", name=args.name, location=args.location)
+    wait_at_search_barrier(invocation)
+    # A small index delay keeps the normal command representative of an
+    # external lookup; verifier runs additionally use the barrier above.
+    time.sleep(0.05)
+    with readonly_connection() as connection:
+        rows = connection.execute(
+            "SELECT id, name, location FROM records "
+            "WHERE name = ? AND location = ? ORDER BY id",
+            (args.name, args.location),
+        ).fetchall()
+    matches = [dict(row) for row in rows]
+    event(
+        invocation,
+        "search",
+        "end",
+        name=args.name,
+        location=args.location,
+        match_count=len(matches),
+        ids=[row["id"] for row in matches],
+    )
+    print_json({"matches": matches})
+    return 0
+
+
+def get_records(args: argparse.Namespace) -> int:
+    invocation = uuid.uuid4().hex
+    event(invocation, "get", "start", ids=args.ids)
+    records: list[dict[str, object]] = []
+    with readonly_connection() as connection:
+        for record_id in args.ids:
+            row = connection.execute(
+                "SELECT id, name, location, status FROM records WHERE id = ?",
+                (record_id,),
+            ).fetchone()
+            if row is not None:
+                records.append(dict(row))
+    event(
+        invocation,
+        "get",
+        "end",
+        ids=args.ids,
+        record_count=len(records),
+        returned_ids=[row["id"] for row in records],
+    )
+    print_json({"records": records})
+    return 0
+
+
+def create(args: argparse.Namespace) -> int:
+    invocation = uuid.uuid4().hex
+    event(invocation, "create", "start", id=args.id)
+    with writable_connection() as connection:
+        connection.execute(
+            "INSERT INTO records(id, name, location, status) VALUES (?, ?, ?, ?)",
+            (args.id, args.name, args.location, args.status),
+        )
+    event(invocation, "create", "end", id=args.id)
+    print_json({"created": args.id})
+    return 0
+
+
+def update(args: argparse.Namespace) -> int:
+    changes = {
+        key: value
+        for key, value in (("name", args.name), ("location", args.location),
+                           ("status", args.status))
+        if value is not None
+    }
+    if not changes:
+        raise SystemExit("fleetctl update: provide at least one changed field")
+    invocation = uuid.uuid4().hex
+    event(invocation, "update", "start", id=args.id, fields=sorted(changes))
+    assignment = ", ".join(f"{field} = ?" for field in changes)
+    with writable_connection() as connection:
+        cursor = connection.execute(
+            f"UPDATE records SET {assignment} WHERE id = ?",
+            [*changes.values(), args.id],
+        )
+    event(invocation, "update", "end", id=args.id, changed=cursor.rowcount)
+    print_json({"updated": args.id, "changed": cursor.rowcount})
+    return 0
+
+
+def cancel(args: argparse.Namespace) -> int:
+    invocation = uuid.uuid4().hex
+    event(invocation, "cancel", "start", id=args.id)
+    with writable_connection() as connection:
+        cursor = connection.execute(
+            "UPDATE records SET status = 'cancelled' WHERE id = ?", (args.id,)
+        )
+    event(invocation, "cancel", "end", id=args.id, changed=cursor.rowcount)
+    print_json({"cancelled": args.id, "changed": cursor.rowcount})
+    return 0
+
+
+def notify(args: argparse.Namespace) -> int:
+    invocation = uuid.uuid4().hex
+    event(invocation, "notify", "start", id=args.id)
+    with writable_connection() as connection:
+        cursor = connection.execute(
+            "INSERT INTO notifications(record_id, message) VALUES (?, ?)",
+            (args.id, args.message),
+        )
+    event(invocation, "notify", "end", id=args.id, notification_id=cursor.lastrowid)
+    print_json({"notification_id": cursor.lastrowid})
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(prog="fleetctl")
+    commands = root.add_subparsers(dest="command", required=True)
+
+    search_parser = commands.add_parser("search", help="find records by exact name and location")
+    search_parser.add_argument("--name", required=True)
+    search_parser.add_argument("--location", required=True)
+    search_parser.set_defaults(handler=search)
+
+    get_parser = commands.add_parser("get", help="retrieve one or more records by stable ID")
+    get_parser.add_argument("--id", dest="ids", action="append", required=True)
+    get_parser.set_defaults(handler=get_records)
+
+    create_parser = commands.add_parser("create", help="create a fleet record")
+    create_parser.add_argument("--id", required=True)
+    create_parser.add_argument("--name", required=True)
+    create_parser.add_argument("--location", required=True)
+    create_parser.add_argument("--status", required=True)
+    create_parser.set_defaults(handler=create)
+
+    update_parser = commands.add_parser("update", help="change an existing fleet record")
+    update_parser.add_argument("--id", required=True)
+    update_parser.add_argument("--name")
+    update_parser.add_argument("--location")
+    update_parser.add_argument("--status")
+    update_parser.set_defaults(handler=update)
+
+    cancel_parser = commands.add_parser("cancel", help="cancel an existing fleet record")
+    cancel_parser.add_argument("--id", required=True)
+    cancel_parser.set_defaults(handler=cancel)
+
+    notify_parser = commands.add_parser("notify", help="send a record notification")
+    notify_parser.add_argument("--id", required=True)
+    notify_parser.add_argument("--message", required=True)
+    notify_parser.set_defaults(handler=notify)
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    return int(args.handler(args))
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except sqlite3.Error as error:
+        print(f"fleetctl: database error: {error}", file=sys.stderr)
+        raise SystemExit(1)
