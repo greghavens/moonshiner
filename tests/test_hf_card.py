@@ -89,8 +89,15 @@ class Card(unittest.TestCase):
                         self.card.index("Behavior-preserving"))
 
     def test_teacher_and_judge_from_config(self):
-        self.assertIn("Claude Fable 5", self.card)
-        self.assertIn("Codex", self.card)
+        config = {
+            **CONFIG,
+            "teacher": {**CONFIG.get("teacher", {}),
+                        "model": "anthropic/claude-fable-5"},
+        }
+        with mock.patch.object(card, "CONFIG", config):
+            text = card.build_card(_coding_and_security())
+        self.assertIn("Claude Fable 5", text)
+        self.assertIn("Codex", text)
 
     def test_kimi_project_card_contains_no_fable_branding(self):
         config = {
