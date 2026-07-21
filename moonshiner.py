@@ -329,26 +329,51 @@ def _setup(argv: list[str] | None = None) -> int:
         description="Configure the models, login, and storage Moonshiner will use.")
     parser.add_argument("--reconfigure", action="store_true",
                         help="Ask every setup question again.")
-    parser.parse_args(argv or [])
+    args = parser.parse_args(argv or [])
     from configuration import load_config, update_local
     config = load_config()
     harnesses = ["pi", "codex", "claude-code"]
     print("Welcome to Moonshiner. Let's set it up.\n")
     choices = []
-    for label, key in (("Trace author", "teacher"), ("Trace judge", "judge")):
+    roles = (("Trace author", "teacher"), ("Trace judge", "judge")) if args.reconfigure else (("Trace author", "teacher"),)
+    for label, key in roles:
         current = config[key]
         current_runtime = current["runtime"]
         default_harness = "pi" if current_runtime.startswith("pi") else current_runtime
-        print("Available harnesses: " + ", ".join(harnesses))
-        harness = _ask(f"{label} harness", default_harness)
+        if args.reconfigure:
+            print("Available harnesses: " + ", ".join(harnesses))
+            harness = _ask(f"{label} harness", default_harness)
+        else:
+            harness = "pi"
         if harness not in harnesses:
             raise SystemExit(f"Unknown harness {harness!r}. Choose: {', '.join(harnesses)}")
         runtime = harness
         if harness == "pi":
             runtime, _ = _configure_pi_provider(config, current_runtime)
-        model = _ask(f"{label} model", current["model"])
+        model = (_ask(f"{label} model", current["model"])
+                 if args.reconfigure else current["model"])
         reasoning = str(current.get("reasoning") or "default")
         choices.append((key, runtime, model, reasoning))
+
+    if not args.reconfigure:
+        judge = config["judge"]
+        choices.append(("judge", judge["runtime"], judge["model"],
+                        str(judge.get("reasoning") or "default")))
+    workflow = (_ask("Project workflow (trace-only or author-and-trace)",
+                     "trace-only").lower() if args.reconfigure else "trace-only")
+    if workflow not in {"trace-only", "author-and-trace"}:
+        raise SystemExit("Project workflow must be trace-only or author-and-trace")
+    current_publish = config.get("publish") or {}
+    hf_dataset = _ask(
+        "Hugging Face dataset to resume and append to (owner/name)",
+        str(current_publish.get("hf_dataset") or ""))
+    if workflow == "trace-only" and not hf_dataset:
+        raise SystemExit("A trace-only project needs its existing Hugging Face dataset")
+    trace_workers = int(_ask("Parallel trace workers", "2")) if args.reconfigure else 2
+    trace_attempts = int(_ask("Maximum attempts per individual trace", "2")) if args.reconfigure else 2
+    publish_batch = int(_ask("Upload after this many accepted traces", "10")) if args.reconfigure else 10
+    if not 1 <= trace_workers <= 64 or trace_attempts < 1 or not 1 <= publish_batch <= 1000:
+        raise SystemExit("Invalid worker, attempt, or upload-batch value")
 
     from configuration import PROJECT_STATE
     print(f"This project's config and output stay in {PROJECT_STATE}.\n")
@@ -356,6 +381,13 @@ def _setup(argv: list[str] | None = None) -> int:
         update_local(f"{key}.runtime", runtime)
         update_local(f"{key}.model", model)
         update_local(f"{key}.reasoning", reasoning)
+        runtime_config = config["runtimes"].get(runtime) or {}
+        provider = str(runtime_config.get("provider") or "").strip()
+        if provider:
+            model_slug = re.sub(r"[^a-z0-9]+", "-", model.lower()).strip("-")
+            provider_slug = re.sub(r"[^a-z0-9]+", "-", provider.lower()).strip("-")
+            update_local(f"runtimes.{runtime}.key_file_name",
+                         f"moonshiner-{provider_slug}-{model_slug}-key")
     # Seed creation uses the same author/judge unless the user later changes it.
     for source, target in ((choices[0], "seed_author"), (choices[1], "seed_judge")):
         _, runtime, model, reasoning = source
@@ -363,6 +395,21 @@ def _setup(argv: list[str] | None = None) -> int:
         update_local(f"{target}.model", model)
         update_local(f"{target}.reasoning", reasoning)
     update_local("storage.root", str(PROJECT_STATE))
+    update_local("pipeline.queues.seed_authoring", workflow == "author-and-trace")
+    update_local("pipeline.queues.tracing", True)
+    update_local("pipeline.trace.workers", trace_workers)
+    update_local("pipeline.trace.max_attempts", trace_attempts)
+    update_local("publish.batch_size", publish_batch)
+    update_local("publish.hf_dataset", hf_dataset or None)
+    update_local("publish.private", False)
+    teacher_model = choices[0][2]
+    display = "Kimi K3" if "kimi-k3" in teacher_model.lower() else (
+        "Fable 5" if "fable-5" in teacher_model.lower() else teacher_model.rsplit("/", 1)[-1])
+    update_local("publish.model_display", display)
+    update_local("publish.pretty_name",
+                 f"{display} Coding, Tool Use & Instruction Following Traces")
+    if display == "Kimi K3":
+        update_local("publish.banner_source", "assets/kimi-k3-dataset-banner.png")
     os.environ["MOONSHINER_HOME"] = str(PROJECT_STATE)
 
     # Ask for provider keys only when the chosen runtime actually uses one.
@@ -405,6 +452,10 @@ def _setup(argv: list[str] | None = None) -> int:
             subprocess.run([npm, "install", "--no-audit", "--no-fund", "--prefix",
                             str(ROOT), f"@earendil-works/pi-coding-agent@{version}"],
                            check=True)
+    if hf_dataset:
+        print(f"Importing existing completion state from {hf_dataset}…")
+        from import_existing import main as import_existing
+        import_existing(["--hf", hf_dataset])
     update_local("onboarding.complete", True)
     print("\nSetup complete.\n")
     return 0

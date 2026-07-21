@@ -1,5 +1,7 @@
 """The single-process orchestrator: phase registry integrity and run planning."""
 import pathlib
+import json
+import tempfile
 import sys
 import unittest
 from unittest import mock
@@ -14,6 +16,31 @@ import run_state  # noqa: E402
 
 
 class FrontDoor(unittest.TestCase):
+    def test_first_run_wizard_uses_trace_only_defaults_and_resumes_dataset(self):
+        config = json.loads((_ROOT / "config.json").read_text())
+        updates = {}
+        with tempfile.TemporaryDirectory() as directory:
+            key_path = pathlib.Path(directory) / "key"
+            with mock.patch.object(configuration, "load_config", return_value=config), \
+                 mock.patch.object(configuration, "update_local",
+                                   side_effect=lambda key, value: updates.__setitem__(key, value)), \
+                 mock.patch.object(m, "_ask",
+                                   side_effect=["openrouter", "owner/kimi-data"]) as ask, \
+                 mock.patch.object(m.getpass, "getpass", return_value="secret"), \
+                 mock.patch.object(m.shutil, "which", return_value="/usr/bin/pi"), \
+                 mock.patch("common.key_env_name", return_value="OPENROUTER_API_KEY"), \
+                 mock.patch("common.key_persist_path", return_value=key_path), \
+                 mock.patch("import_existing.main", return_value=0) as resume:
+                self.assertEqual(m._setup([]), 0)
+        self.assertEqual(ask.call_count, 2)
+        self.assertFalse(updates["pipeline.queues.seed_authoring"])
+        self.assertTrue(updates["pipeline.queues.tracing"])
+        self.assertEqual(updates["pipeline.trace.workers"], 2)
+        self.assertEqual(updates["pipeline.trace.max_attempts"], 2)
+        self.assertEqual(updates["publish.batch_size"], 10)
+        self.assertEqual(updates["judge.runtime"], "codex")
+        resume.assert_called_once_with(["--hf", "owner/kimi-data"])
+
     def test_help_leads_with_normal_jobs_not_phases(self):
         text = m._help()
         self.assertIn("moonshiner setup", text)
