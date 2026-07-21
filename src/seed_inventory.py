@@ -56,6 +56,15 @@ def bundled_plan_record(seed_id: str) -> dict | None:
                  if record["id"] == seed_id), None)
 
 
+def inventory_sets() -> tuple[set[str], set[str], set[str]]:
+    """Load the unified seed catalog once and classify its execution readiness."""
+    seeds = select_seeds()
+    catalogued = {seed["id"] for seed in seeds}
+    replacements = {seed["id"] for seed in seeds
+                    if synthetic_tool_contract(seed) is not None}
+    return catalogued, catalogued - replacements, replacements
+
+
 def authored_ids() -> set[str]:
     # Legacy simulator recipes are replacement work, not authored executable
     # seeds. Keeping their files preserves the original work and IDs while the
@@ -69,7 +78,7 @@ def catalogued_ids() -> set[str]:
     return {seed["id"] for seed in select_seeds()}
 
 
-def documented_plan_ids() -> set[str]:
+def documented_plan_ids(replacement_ids: set[str] | None = None) -> set[str]:
     """Return IDs from every imported documented plan, deduplicated by ID."""
     from author_explicit_waves import catalog_items
     from author_matrix_waves import matrix_items
@@ -88,8 +97,9 @@ def documented_plan_ids() -> set[str]:
                     ids.update(seed_id for seed_id, _, _ in catalog_items(path))
             except (OSError, ValueError):
                 continue
-    ids.update(seed["id"] for seed in select_seeds()
-               if synthetic_tool_contract(seed))
+    ids.update(replacement_ids if replacement_ids is not None else
+               (seed["id"] for seed in select_seeds()
+                if synthetic_tool_contract(seed)))
     return ids
 
 
@@ -131,10 +141,12 @@ def documented_plan_items() -> dict[str, str]:
     return items
 
 
-def planned_ids() -> set[str]:
+def planned_ids(catalogued: set[str] | None = None,
+                replacement_ids: set[str] | None = None) -> set[str]:
     # Existing catalog entries are documented plans too. Imported planning
     # documents extend the denominator before their artifacts are authored.
-    return catalogued_ids() | documented_plan_ids()
+    return ((catalogued if catalogued is not None else catalogued_ids())
+            | documented_plan_ids(replacement_ids))
 
 
 def retired_seed_ids(db=None) -> set[str]:
@@ -185,11 +197,13 @@ def accepted_ids(db=None) -> set[str]:
     return accepted
 
 
-def trace_state(max_attempts: int) -> dict[str, set[str]]:
-    target = catalogued_ids()
-    ready = authored_ids()
+def trace_state(max_attempts: int, *, target: set[str] | None = None,
+                ready: set[str] | None = None,
+                accepted: set[str] | None = None) -> dict[str, set[str]]:
+    target = target if target is not None else catalogued_ids()
+    ready = ready if ready is not None else authored_ids()
     needs_reauthoring = target - ready
-    accepted = accepted_ids() & ready
+    accepted = (accepted if accepted is not None else accepted_ids()) & ready
     from run_state import connect, now
     db = connect()
     active = {row[0] for row in db.execute(

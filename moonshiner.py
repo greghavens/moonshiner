@@ -607,10 +607,12 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
     if not inspect and not args.run_id and not args.all:
         from common import DATA
         from configuration import load_config
-        from seed_inventory import (authored_ids, catalogued_ids, planned_ids,
+        from seed_inventory import (accepted_ids, inventory_sets, planned_ids,
                                     retired_seed_ids, trace_state)
-        catalogued = catalogued_ids(); authored = authored_ids(); planned = planned_ids()
+        catalogued, authored, replacements = inventory_sets()
+        planned = planned_ids(catalogued, replacements)
         retired = retired_seed_ids()
+        accepted = accepted_ids(db)
         seed_counts = _seed_status_counts(
             planned=planned, catalogued=catalogued, ready=authored,
             retired=retired)
@@ -633,7 +635,7 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
                     (ack_state.get("published_attempts") or {}).items()}
             except (OSError, json.JSONDecodeError): pass
         from publish_queue import accepted_tasks
-        waiting_for_upload = sum(1 for _, task, attempt in accepted_tasks()
+        waiting_for_upload = sum(1 for _, task, attempt in accepted_tasks(accepted)
             if task not in acknowledged
             or attempt > acknowledged_attempts.get(task, attempt))
         published_file = DATA / "hf-publish" / "traces.jsonl"
@@ -645,7 +647,8 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
         config = load_config()
         workers = int(((config.get("pipeline") or {}).get("trace") or {}).get("workers", 1))
         max_attempts = int(((config.get("pipeline") or {}).get("trace") or {}).get("max_attempts", 2))
-        traced = trace_state(max_attempts)
+        traced = trace_state(max_attempts, target=catalogued, ready=authored,
+                             accepted=accepted)
         units = []
         service_result = subprocess.run(
             ["systemctl", "--user", "list-units", "--type=service", "--state=running",

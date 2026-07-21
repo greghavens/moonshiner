@@ -45,6 +45,14 @@ def _coding_and_security():
 
 
 class Units(unittest.TestCase):
+    def test_kimi_banner_is_packaged_at_the_configurable_asset_path(self):
+        banner = _ROOT / "assets" / "kimi-k3-dataset-banner.png"
+        self.assertTrue(banner.is_file())
+        header = banner.read_bytes()[:24]
+        self.assertEqual(header[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertEqual(int.from_bytes(header[16:20], "big"), 2048)
+        self.assertEqual(int.from_bytes(header[20:24], "big"), 820)
+
     def test_headline_size_uses_only_published_trace_data(self):
         with tempfile.TemporaryDirectory() as directory:
             traces = pathlib.Path(directory) / "traces.jsonl"

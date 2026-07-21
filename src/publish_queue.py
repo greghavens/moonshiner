@@ -74,12 +74,13 @@ def restore_hidden_acceptances() -> list[str]:
     return restored
 
 
-def accepted_tasks() -> list[tuple[float, str, int]]:
+def accepted_tasks(accepted: set[str] | None = None) -> list[tuple[float, str, int]]:
     from run_state import connect
     db = connect()
     try:
-        from seed_inventory import accepted_ids
-        accepted = accepted_ids(db)
+        if accepted is None:
+            from seed_inventory import accepted_ids
+            accepted = accepted_ids(db)
         versions = {str(row[0]): int(row[1]) for row in db.execute(
             "SELECT a.seed_id,MAX(a.id) FROM attempts a "
             "JOIN runs r ON r.id=a.run_id "

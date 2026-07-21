@@ -13,6 +13,22 @@ import run_state  # noqa: E402
 
 
 class SeedInventoryCounts(unittest.TestCase):
+    def test_inventory_sets_load_the_seed_catalog_once(self):
+        seeds = [
+            {"id": "ready", "prompt": "Do the task"},
+            {"id": "replace", "tool_results": {"fake": "result"}},
+        ]
+        with mock.patch.object(seed_inventory, "select_seeds",
+                               return_value=seeds) as load, \
+                mock.patch.object(seed_inventory, "synthetic_tool_contract",
+                                  side_effect=lambda seed: (
+                                      "synthetic" if seed["id"] == "replace" else None)):
+            catalogued, ready, replacements = seed_inventory.inventory_sets()
+        load.assert_called_once_with()
+        self.assertEqual(catalogued, {"ready", "replace"})
+        self.assertEqual(ready, {"ready"})
+        self.assertEqual(replacements, {"replace"})
+
     def test_bundled_round_three_plan_is_exactly_1000_unique_genuine_harness_scenarios(self):
         records = seed_inventory.bundled_plan_records()
         round_three = [record for record in records
