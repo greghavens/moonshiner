@@ -8,7 +8,7 @@ import shutil
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from common import CONFIG
+from common import CONFIG, load_seeds, synthetic_tool_contract
 from configuration import PROJECT_ROOT
 from seed_inventory import authored_ids, documented_plan_items
 
@@ -39,8 +39,12 @@ def main(argv=None) -> int:
     def author(seed_id: str) -> tuple[str, int]:
         if seed_id in authored_ids():
             return seed_id, 0
+        existing = next((seed for seed in load_seeds(only={seed_id})
+                         if synthetic_tool_contract(seed)), None)
         command = [_moonshiner(), "seed", "run", "--id", seed_id,
                    "--brief", plans[seed_id], "--yes"]
+        if existing:
+            command.append("--replace-synthetic")
         return seed_id, subprocess.run(command, cwd=PROJECT_ROOT).returncode
 
     failed = 0

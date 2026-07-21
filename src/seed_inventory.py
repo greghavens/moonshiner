@@ -4,12 +4,17 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from common import RUNS, STORAGE_ROOT, TRACES, select_seeds
+from common import (RUNS, STORAGE_ROOT, TRACES, select_seeds,
+                    synthetic_tool_contract)
 from review_contract import is_accepted
 
 
 def authored_ids() -> set[str]:
-    return {seed["id"] for seed in select_seeds()}
+    # Legacy simulator recipes are replacement work, not authored executable
+    # seeds. Keeping their files preserves the original work and IDs while the
+    # one authoring queue replaces them in place.
+    return {seed["id"] for seed in select_seeds()
+            if synthetic_tool_contract(seed) is None}
 
 
 def documented_plan_ids() -> set[str]:
@@ -30,6 +35,8 @@ def documented_plan_ids() -> set[str]:
                     ids.update(seed_id for seed_id, _, _ in catalog_items(path))
             except (OSError, ValueError):
                 continue
+    ids.update(seed["id"] for seed in select_seeds()
+               if synthetic_tool_contract(seed))
     return ids
 
 
@@ -54,6 +61,18 @@ def documented_plan_items() -> dict[str, str]:
                     items.setdefault(seed_id, f"Wave {wave}, chunk {chunk}. {text}")
         except (OSError, ValueError):
             continue
+    for seed in select_seeds():
+        if synthetic_tool_contract(seed):
+            tags = ", ".join(seed.get("training_tags") or [])
+            items[seed["id"]] = (
+                "Reauthor this existing objective as a pure Pi-harness seed. "
+                "Preserve the ID, capability objective, category, and training "
+                f"tags ({tags}). Use only genuine tools installed and executed "
+                "by Pi. Do not embed tool results, initial service state, answer "
+                "keys, expected call arguments, fictional tool schemas, mock "
+                "services, or .invalid URLs. For research, require live web "
+                "search and real fetched sources. Original objective: "
+                + str(seed.get("prompt") or ""))
     return items
 
 

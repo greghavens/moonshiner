@@ -21,6 +21,21 @@ CANDIDATES = STORAGE_ROOT / "tasks" / "candidates"
 
 AUTHOR_SYSTEM = """You author deterministic coding repair seeds for Moonshiner. Work only in the current workspace. Create exactly task.json, files/, and reference_fix.patch at the workspace root. The starting files must contain one focused defect; protected tests must expose it; the reference patch must fix it without modifying tests. Commands must be offline and deterministic. Do not run another coding agent."""
 
+REAUTHOR_SYSTEM = """You reauthor one contaminated Moonshiner seed as a pure
+Pi-harness task. Work only in the current workspace. Create exactly task.json,
+files/, and reference_fix.patch at the workspace root. Preserve the supplied
+seed ID, capability objective, category, and training tags. The task must make
+the agent use Pi's genuine executable tools against the provided sandboxed
+environment. The environment and its data may be simulated; tool execution
+must never be simulated. Never embed tool calls, tool results, expected call
+arguments, answer-key response maps, initial service state, fictional tool
+schemas, or .invalid URLs in task.json. Use actual files, databases, commands,
+or local services under files/ when controlled state is needed. A web-research
+task must require genuine network research against real reachable sources via
+the harness, never fixtures. Create deterministic protected verification and a
+reference patch proving the requested deliverable can be produced. Do not run
+another coding agent."""
+
 
 def _init_workspace(seed_id: str) -> Path:
     workspace = WORKSPACES / f"author-{seed_id}-{uuid.uuid4().hex[:10]}"
@@ -61,6 +76,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--yes", action="store_true",
                         help="Authorize metered author and judge calls.")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--replace-synthetic", action="store_true",
+                        help="Replace an existing legacy synthetic-tool seed in place.")
     args = parser.parse_args(argv)
     if args.max_attempts < 1:
         parser.error("--max-attempts must be at least 1")
@@ -69,6 +86,16 @@ def main(argv: list[str] | None = None) -> int:
     destination = SEEDS_DIR / args.id
     if destination.exists():
         print(f"refusing to replace existing seed: {destination}", file=sys.stderr); return 2
+    legacy_path = None
+    if args.replace_synthetic:
+        from common import load_seeds, synthetic_tool_contract
+        legacy = next((seed for seed in load_seeds(only={args.id})
+                       if synthetic_tool_contract(seed)), None)
+        if legacy is None or "_path" not in legacy:
+            print("refusing replacement: no legacy synthetic seed with that ID",
+                  file=sys.stderr)
+            return 2
+        legacy_path = Path(legacy["_path"])
     author, judge = get_seed_author(), get_seed_judge()
     print(f"seed plan: author {author.name}/{author.role['model']} → validate → "
           f"judge/fix {judge.name}/{judge.role['model']} → promote {args.id}")
@@ -88,8 +115,9 @@ def main(argv: list[str] | None = None) -> int:
         dummy = {"id": f"seed-author-{args.id}"}
         (TRACES / "raw").mkdir(parents=True, exist_ok=True)
         (TRACES / "reviews").mkdir(parents=True, exist_ok=True)
+        author_system = REAUTHOR_SYSTEM if args.replace_synthetic else AUTHOR_SYSTEM
         authored = author.run_trace(dummy, workspace, out_dir=TRACES / "raw",
-                                    system_prompt=AUTHOR_SYSTEM, prompt=args.brief)
+                                    system_prompt=author_system, prompt=args.brief)
         if (authored.unavailable or authored.timed_out or authored.safeguard_refusal
                 or authored.return_code not in (0, None)):
             raise RuntimeError(authored.unavailable or authored.error
@@ -133,6 +161,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"candidate retained at {candidate}")
             return 1
         shutil.copytree(candidate, destination)
+        if legacy_path is not None:
+            archive = STORAGE_ROOT / "tasks" / "replaced-synthetic-seeds"
+            archive.mkdir(parents=True, exist_ok=True)
+            archived = archive / legacy_path.name
+            if not archived.exists():
+                shutil.copy2(legacy_path, archived)
+            legacy_path.unlink()
         from corpus import write_catalog
         write_catalog(SEEDS_DIR)
         set_run_status(db, run_id, "complete")

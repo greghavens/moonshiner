@@ -120,6 +120,19 @@ class LoadSeeds(unittest.TestCase):
         self.assertEqual([seed["id"] for seed in selected],
                          ["behavior-tool-selection-0001"])
 
+    def test_embedded_tool_results_are_never_executable_seed_contracts(self):
+        reason = common.synthetic_tool_contract({
+            "tool_results": {"search_1": {"records": []}},
+            "initial_state": {},
+        })
+        self.assertIn("tool_results", reason)
+        self.assertIn("initial_state", reason)
+
+    def test_trace_pipeline_has_no_synthetic_dispatcher(self):
+        source = (_ROOT / "src" / "trace_pipeline.py").read_text()
+        self.assertNotIn("behavior_trace", source)
+        self.assertNotIn("uses_tool_interaction", source)
+
 
 if __name__ == "__main__":
     unittest.main()

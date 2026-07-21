@@ -271,12 +271,7 @@ def main(argv: list[str] | None = None) -> int:
     if sync.get("status") not in {"unconfigured", "local_append"}:
         print(f"HF local dataset: {sync.get('status')} ({sync.get('origin', 'existing')})")
 
-    from common import uses_tool_interaction
-    if all(uses_tool_interaction(seed) for seed in seeds):
-        from runtimes.auth import load_provider_key
-        load_provider_key(teacher.runtime_config)
-    else:
-        teacher.preflight(require_auth=True)
+    teacher.preflight(require_auth=True)
     judge.preflight(require_auth=True)
     ensure_publish_queue()
     limits = {"seeds": len(seeds), "max_attempts": args.max_attempts}
@@ -321,7 +316,13 @@ def main(argv: list[str] | None = None) -> int:
             set_job(worker_db, run_id, seed["id"], "exhausted", claim["attempts"],
                     claim.get("last_error") or "attempt ceiling reached")
             return
-        from common import preflight_seed_environment
+        from common import preflight_seed_environment, synthetic_tool_contract
+        synthetic = synthetic_tool_contract(seed)
+        if synthetic:
+            set_job(worker_db, run_id, seed["id"], "infrastructure_blocked",
+                    claim["attempts"], synthetic)
+            print(f"[infrastructure blocked] {seed['id']}: {synthetic}", flush=True)
+            return
         environment_ok, environment_detail = preflight_seed_environment(seed)
         if not environment_ok:
             set_job(worker_db, run_id, seed["id"], "infrastructure_blocked",
@@ -354,22 +355,14 @@ def main(argv: list[str] | None = None) -> int:
                 stopped.set(); thread.join()
 
         with lease_heartbeat():
-            if uses_tool_interaction(seed):
-                from behavior_trace import trace_task as behavior_trace_task
-                record = behavior_trace_task(seed, worker_teacher, feedback=feedback)
-            else:
-                record = trace_task(seed, worker_teacher, force=True, feedback=feedback)
+            record = trace_task(seed, worker_teacher, force=True, feedback=feedback)
         usage = (record.get("teacher") or {}).get("usage") or {}
         # Candidate checks are evidence for the trace judge, never a separate
         # rejection gate. Every completed candidate proceeds to judgment.
         record_model_call(worker_db, run_id)
         print(f"[{seed['id']}] attempt {number}/{args.max_attempts}: judge", flush=True)
         with lease_heartbeat():
-            if uses_tool_interaction(seed):
-                from behavior_trace import judge_trace
-                review = judge_trace(seed, worker_judge)
-            else:
-                review = screen(seed, worker_judge)
+            review = screen(seed, worker_judge)
         if is_judge_error(review):
             artifact = _archive_attempt(run_id, seed["id"], number)
             reason = str(review.get("reason") or "judge execution failed")

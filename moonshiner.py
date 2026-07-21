@@ -593,6 +593,13 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
         if ack.is_file():
             try: acknowledged_tasks = len(json.loads(ack.read_text()).get("published_tasks") or [])
             except (OSError, json.JSONDecodeError): pass
+        acknowledged = set()
+        if ack.is_file():
+            try: acknowledged = set(json.loads(ack.read_text()).get("published_tasks") or [])
+            except (OSError, json.JSONDecodeError): pass
+        from publish_queue import accepted_tasks
+        waiting_for_upload = sum(1 for _, task in accepted_tasks()
+                                 if task not in acknowledged)
         published_file = DATA / "hf-publish" / "traces.jsonl"
         published = 0
         published_rows = 0
@@ -629,13 +636,15 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
             "tracing": {"workers": workers, "target": len(traced["target"]),
                         "accepted": len(traced["accepted"]),
                         "active": len(traced["active"]),
+                        "waiting_for_judgment": 0,
                         "exhausted": len(traced["exhausted"]),
                         "waiting": len(traced["waiting"]), "active_runs": active},
             "publishing": {"dataset": (config.get("publish") or {}).get("hf_dataset"),
                            "batch_size": int((config.get("publish") or {}).get("batch_size", 1)),
                            "published_trajectories": published,
                            "published_rows": published_rows,
-                           "acknowledged_tasks": acknowledged_tasks},
+                           "acknowledged_tasks": acknowledged_tasks,
+                           "waiting_for_upload": waiting_for_upload},
             "services": sorted(units),
         }
         if args.json:
@@ -646,6 +655,7 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
         print(f"Traces: {len(traced['accepted'])}/{len(traced['target'])} accepted; "
               f"{len(traced['active'])} active; {len(traced['waiting'])} waiting; "
               f"{len(traced['exhausted'])} exhausted; {workers} workers configured")
+        print("  waiting for judgment: 0 (judgment runs inline in each trace worker)")
         for row in active:
             jobs = job_rows(db, row["id"])
             accepted = int(row.get("accepted") or 0)
@@ -663,7 +673,8 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
                   f"retraced={retrace_rate:.1f}%")
         print(f"Publishing: {published} trajectories; {published_rows} rows in local HF mirror; "
               f"{acknowledged_tasks} unique tasks acknowledged; batch size "
-              f"{payload['publishing']['batch_size']}; {payload['publishing']['dataset'] or 'disabled'}")
+              f"{payload['publishing']['batch_size']}; {waiting_for_upload} accepted waiting for upload; "
+              f"{payload['publishing']['dataset'] or 'disabled'}")
         print("Services: " + (", ".join(sorted(units)) if units else "none"))
         return 0
     if not rows:

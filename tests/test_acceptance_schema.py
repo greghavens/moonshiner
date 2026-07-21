@@ -16,7 +16,6 @@ from review_contract import is_accepted, verdict_accepts  # noqa: E402
 import publish_queue  # noqa: E402
 import trace_pipeline  # noqa: E402
 import run_state  # noqa: E402
-import behavior_trace  # noqa: E402
 import build_dataset  # noqa: E402
 
 
@@ -170,31 +169,12 @@ class AcceptanceSchemaTests(unittest.TestCase):
                             return_value=set()):
                 self.assertEqual(trace_pipeline._selected(args), [])
 
-    def test_behavior_judge_verdict_routes_to_acceptance(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory)
-            raw = root / "raw"
-            reviews = root / "reviews"
-            raw.mkdir(); reviews.mkdir()
-            seed_path = root / "task.json"
-            seed_path.write_text("{}")
-            seed = {"id": "tool-seed", "prompt": "do it", "_path": seed_path}
-            (raw / "tool-seed.jsonl").write_text(
-                json.dumps({"role": "assistant", "content": "done"}) + "\n")
-            result = SimpleNamespace(
-                verdict={"accepted": True, "reason": "correct"},
-                return_code=0, timed_out=False, model_attested=True, error=None)
-            judge = SimpleNamespace(
-                name="test-judge", role={"model": "judge-model"},
-                run_review=mock.Mock(return_value=result))
-            with mock.patch.object(behavior_trace, "RAW", raw), \
-                 mock.patch.object(behavior_trace, "REVIEWS", reviews), \
-                 mock.patch.object(behavior_trace, "grade",
-                                   return_value={"accepted": False,
-                                                 "reason": "diagnostic mismatch"}):
-                review = behavior_trace.judge_trace(seed, judge)
-            self.assertTrue(is_accepted(review))
-            self.assertEqual(review["reason"], "correct")
+    def test_synthetic_trace_format_cannot_build_a_dataset_row(self):
+        row, error = build_dataset.build_row(
+            {"id": "tool-seed"},
+            {"trace_format": "moonshiner-behavior-openai-v1"})
+        self.assertIsNone(row)
+        self.assertEqual(error, "synthetic tool transcript is prohibited")
 
     def test_publisher_subprocess_uses_project_storage_context(self):
         with mock.patch.object(publish_queue.subprocess, "run") as run:

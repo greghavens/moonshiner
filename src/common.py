@@ -324,10 +324,24 @@ def select_seeds(*, only: set[str] | None = None,
 
 
 def uses_tool_interaction(seed: dict) -> bool:
-    """Return whether the catalog recipe declares the simulated tool harness."""
+    """Identify legacy seeds that embed the removed synthetic tool harness.
+
+    This predicate is retained only so old artifacts can be identified and
+    excluded.  It must never select a tracing or publishing implementation.
+    Every new trace runs through the configured agent runtime.
+    """
     return (isinstance(seed.get("available_tools"), list)
             and isinstance(seed.get("initial_state"), dict)
             and isinstance(seed.get("expected"), dict))
+
+
+def synthetic_tool_contract(seed: dict) -> str | None:
+    """Explain why a legacy seed cannot be executed as a genuine agent trace."""
+    fields = [name for name in ("tool_results", "initial_state", "failure_injections")
+              if name in seed]
+    if fields:
+        return "embedded synthetic tool contract: " + ", ".join(fields)
+    return None
 
 
 def seed_fingerprint(seed: dict) -> str:

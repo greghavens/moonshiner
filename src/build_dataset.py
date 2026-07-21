@@ -20,7 +20,7 @@ import json
 from pathlib import Path
 
 from common import (CONFIG, DATA, SECRET_RE, SYSTEM_PROMPT, TRACES, load_seeds,
-                    scrub_text, uses_tool_interaction)
+                    scrub_text)
 from normalize import parse_trace, tool_schemas_for
 from screen_traces import validate_reviewer_verdict
 from privacy import sanitize_object
@@ -127,6 +127,8 @@ def training_tags(seed: dict, turns: list[dict], info: dict) -> list[str]:
 
 
 def build_row(seed: dict, info: dict) -> tuple[dict | None, str | None]:
+    if info.get("trace_format") == "moonshiner-behavior-openai-v1":
+        return None, "synthetic tool transcript is prohibited"
     raw = raw_trace_path(seed["id"], info)
     if not raw.exists():
         return None, "no raw trace"
@@ -138,10 +140,7 @@ def build_row(seed: dict, info: dict) -> tuple[dict | None, str | None]:
     if not any(message["role"] == "assistant" for message in turns):
         return None, "no assistant turns"
 
-    system_prompt = SYSTEM_PROMPT
-    if uses_tool_interaction(seed):
-        from behavior_trace import SYSTEM as system_prompt
-    session = ([{"role": "system", "content": system_prompt},
+    session = ([{"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content":
                  info.get("prompt") or seed["prompt"]}] + turns)
     session = sanitize_object(scrub_session(session))
@@ -152,11 +151,7 @@ def build_row(seed: dict, info: dict) -> tuple[dict | None, str | None]:
     used = sorted({call["function"]["name"]
                    for message in turns if message["role"] == "assistant"
                    for call in message.get("tool_calls") or []})
-    if uses_tool_interaction(seed):
-        from behavior_trace import schemas_for_seed
-        tools = schemas_for_seed(seed, set(seed["available_tools"]))
-    else:
-        tools = tool_schemas_for(trace_format, turns)
+    tools = tool_schemas_for(trace_format, turns)
 
     teacher = info.get("teacher") or {}
     observed = teacher.get("observed_models") or (
@@ -165,7 +160,7 @@ def build_row(seed: dict, info: dict) -> tuple[dict | None, str | None]:
         "task": seed["id"],
         "lang": seed.get("lang"),
         "category": seed.get("category"),
-        "domain": "tool_behavior" if uses_tool_interaction(seed) else "coding",
+        "domain": seed.get("domain") or "agent",
         "passed": info.get("passed"),
         "tools_used": used,
         "tags": training_tags(seed, turns, info),

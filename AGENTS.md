@@ -2,6 +2,12 @@
 
 These are explicit project-owner requirements and apply to every change:
 
+1. **DO NOT ASSUME. NEVER ADD A FEATURE, BEHAVIOR, REQUIREMENT, POLICY,
+   ABSTRACTION, GATE, OR WORKFLOW CHANGE THAT THE USER DID NOT EXPLICITLY
+   REQUEST.** If an implementation decision would expand or alter the requested
+   product behavior, stop and ask instead of inventing it. This is the first
+   and controlling implementation invariant.
+
 - Implement only behavior and features the user explicitly requests.
 - Never add an approval gate, eligibility gate, fingerprint gate, intake gate,
   holdout, rejection path, spending ceiling, call ceiling, or workflow policy
@@ -15,6 +21,25 @@ These are explicit project-owner requirements and apply to every change:
   the same time. Each remains individually owned, judged, retried, completed,
   and recorded.
 - Only the configured trace judge may reject a generated trace.
+- Every trace must be a native trace from the configured agent harness. The
+  harness itself must execute 100% of tool calls and return 100% of tool
+  results. Moonshiner must never intercept, emulate, replay, synthesize,
+  manufacture, or substitute an agent tool call or tool result.
+- A task environment may be safely simulated: fixtures, sandboxed files,
+  local services, test accounts, databases, and reversible state are valid.
+  The tools operating on that environment must nevertheless be genuine,
+  executable harness tools, and their results must be computed by execution
+  against the environment rather than selected from an embedded answer key.
+- Web research is never simulated. Research traces must perform real searches,
+  fetch real reachable sources, and preserve the harness's genuine search and
+  fetch events. Fake domains, `.invalid` URLs, embedded search results, and
+  exact-query response maps are prohibited.
+- Never call a model API directly to construct a tool transcript. The required
+  path is always: seed -> configured harness -> genuine tool execution ->
+  native harness trace -> judge -> publisher.
+- A trace without native evidence for each recorded tool call and corresponding
+  result is infrastructure failure, not training data, and must never be
+  judged as a candidate or published.
 - A trace gets at most two total attempts for its one seed across every
   resumption. Any limit applies only to that individual seed/trace. Starting a
   new process must never reset the trace's lifetime count.

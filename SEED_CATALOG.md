@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-2904 seeds grouped into 365 categories. This file is generated; edit each seed's source, then regenerate it.
+2907 seeds grouped into 365 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -8,11 +8,11 @@
 | --- | ---: | --- |
 | **Instruction following** | 970 | Honor constraints, formats, corrections, state, context, memory, relevance, and abstention. |
 | **Tool calling** | 785 | Select tools, construct grounded arguments, run independent calls together, and stage dependent calls. |
-| **Building** | 332 | Implement complete libraries, services, CLIs, workflows, and systems from specifications. |
-| **Debugging** | 270 | Diagnose failures, repair defects, resolve compiler/runtime issues, and preserve regressions. |
-| **Project & integration** | 188 | Coordinate multi-file, repository-scale, migration, and integration work. |
 | **Error recovery** | 135 | Recover from tool failures, partial results, retries, and idempotency hazards. |
 | **Clarification** | 110 | Recognize missing information, ask only when required, and never invent parameters. |
+| **Building** | 332 | Implement complete libraries, services, CLIs, workflows, and systems from specifications. |
+| **Debugging** | 270 | Diagnose failures, repair defects, resolve compiler/runtime issues, and preserve regressions. |
+| **Project & integration** | 191 | Coordinate multi-file, repository-scale, migration, and integration work. |
 | **Feature development** | 91 | Extend working systems while preserving existing behavior. |
 | **Refactoring & performance** | 22 | Restructure safely and improve measured performance without behavior drift. |
 | **Other verified work** | 1 | Verified work not yet assigned to one of the primary programs. |
@@ -1886,9 +1886,12 @@
 ## full-distill/data-migration
 
 - **cpp-index-layout-move** (`cpp`) — Repair the v1-to-v2 migration in `src/index_store.cpp`. The legacy index is a checksummed single file in insertion order. Version 2 is a checksummed, stable key-ordered data/offset pair selected by…
+- **csharp-encrypted-field-rotation** (`csharp`) — Repair the encrypted-field rotation workflow. Each persisted secret has ciphertext plus a key-version value. Rotation must decrypt legacy rows with the key named by their stored version, re-encrypt…
 - **csharp-tenant-key-rollout** (`csharp`) — Repair the online tenant-key migration in `src/TenantKeyRollout/TenantKeyMigration.cs`. Existing records are backfilled in bounded, restartable batches with a tenant-scoped key, and duplicate exter…
+- **java-json-column-version** (`java`) — The JSON-column migrator upgrades each document according to its own `_schemaVersion` and quarantines malformed documents while continuing the scan. It also records a checkpoint after each configur…
 - **java-ledger-decimal-move** (`java`) — Repair the ledger amount migration in `src/main/java/com/moonshiner/ledger/LedgerAmountMigration.java`. Version 1 rows store a canonical signed base-10 integer count of cents; migrating them must p…
 - **py-customer-expand-contract** (`python`) — Repair the interrupted customer-name migration in `customer_names.migration`. The database begins with one required `customers.name` field and must move through an expand/backfill/contract rollout…
+- **rb-slug-unique-rollout** (`ruby`) — Repair the online slug rollout in `SlugUniqueRollout` without changing its public API or the protected tests. During the expanded phase, both new posts and backfilled legacy posts must receive uniq…
 - **rb-status-enum-backfill** (`ruby`) — The status rollout in StatusEnumMigration replaces legacy free-form status strings with the versioned v1 enum catalog. Repair the migration without changing its public API or the tests. New writes…
 
 ## full-distill/version-migration
