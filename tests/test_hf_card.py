@@ -62,6 +62,13 @@ class Units(unittest.TestCase):
     def test_display_model_upcases_short_version(self):
         self.assertEqual(card._display_model("moonshotai/kimi-k3"), "Kimi K3")
 
+    def test_project_can_select_a_model_specific_banner(self):
+        config = {"publish": {"banner_source": "assets/kimi-k3-dataset-banner.png"}}
+        with mock.patch.object(card, "CONFIG", config), \
+                mock.patch.object(card, "ROOT", pathlib.Path("/package")):
+            self.assertEqual(card._banner_source(),
+                             pathlib.Path("/package/assets/kimi-k3-dataset-banner.png"))
+
 class Card(unittest.TestCase):
     def setUp(self):
         self.card = card.build_card(_coding_and_security())
@@ -84,6 +91,23 @@ class Card(unittest.TestCase):
     def test_teacher_and_judge_from_config(self):
         self.assertIn("Claude Fable 5", self.card)
         self.assertIn("Codex", self.card)
+
+    def test_kimi_project_card_contains_no_fable_branding(self):
+        config = {
+            **CONFIG,
+            "teacher": {**CONFIG.get("teacher", {}),
+                        "model": "moonshotai/kimi-k3"},
+            "publish": {**CONFIG.get("publish", {}),
+                        "hf_dataset": "greghavens/kimi-k3-coding-and-debugging-traces",
+                        "pretty_name": "Kimi K3 Coding, Tool Use & Instruction Following Traces",
+                        "model_display": "Kimi K3"},
+        }
+        with mock.patch.object(card, "CONFIG", config):
+            text = card.build_card(_coding_and_security())
+        self.assertIn("Kimi K3", text)
+        self.assertIn("`moonshotai/kimi-k3`", text)
+        self.assertNotIn("Fable", text)
+        self.assertNotIn("claude-fable-5", text)
 
     def test_schema_and_mix_present(self):
         self.assertIn("## Schema", self.card)

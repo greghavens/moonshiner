@@ -572,6 +572,29 @@ def _update(argv: list[str]) -> int:
     return subprocess.run([executable, "--version"]).returncode
 
 
+def _published_counts(path: Path, acknowledged_tasks: int) -> tuple[int, int]:
+    """Count published rows without decoding the large nested JSONL corpus."""
+    rows = 0
+    if path.is_file():
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                rows += block.count(b"\n")
+    return acknowledged_tasks, rows
+
+
+def _seed_status_counts(*, planned: set[str], catalogued: set[str],
+                        ready: set[str], retired: set[str]) -> dict[str, int]:
+    """Keep catalog presence, usable authorship, and replacement work distinct."""
+    requires_reauthoring = catalogued - ready
+    waiting_first = planned - catalogued - retired
+    return {"planned": len(planned), "catalogued": len(catalogued),
+            "authored": len(ready),
+            "requires_reauthoring": len(requires_reauthoring),
+            "retired": len(retired),
+            "waiting_first_authorship": len(waiting_first),
+            "waiting_total": len((planned - ready) - retired)}
+
+
 def _status(argv: list[str], *, inspect: bool = False) -> int:
     from run_state import connect, job_rows, summaries
     parser = argparse.ArgumentParser(prog=f"moonshiner {'inspect' if inspect else 'status'}")
@@ -584,10 +607,13 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
     if not inspect and not args.run_id and not args.all:
         from common import DATA
         from configuration import load_config
-        from seed_inventory import (catalogued_ids, planned_ids,
+        from seed_inventory import (authored_ids, catalogued_ids, planned_ids,
                                     retired_seed_ids, trace_state)
-        authored = catalogued_ids(); planned = planned_ids()
+        catalogued = catalogued_ids(); authored = authored_ids(); planned = planned_ids()
         retired = retired_seed_ids()
+        seed_counts = _seed_status_counts(
+            planned=planned, catalogued=catalogued, ready=authored,
+            retired=retired)
         from run_state import live_trace_run_ids
         live_trace_runs = live_trace_run_ids(db)
         active = [row for row in rows if row["id"] in live_trace_runs]
@@ -611,22 +637,11 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
             if task not in acknowledged
             or attempt > acknowledged_attempts.get(task, attempt))
         published_file = DATA / "hf-publish" / "traces.jsonl"
-        published = 0
-        published_rows = 0
-        if published_file.is_file():
-            try:
-                published_tasks = set()
-                with published_file.open() as handle:
-                    for line in handle:
-                        if not line.strip():
-                            continue
-                        published_rows += 1
-                        task = json.loads(line).get("task")
-                        if isinstance(task, str):
-                            published_tasks.add(task)
-                published = len(published_tasks)
-            except (OSError, json.JSONDecodeError):
-                pass
+        try:
+            published, published_rows = _published_counts(
+                published_file, acknowledged_tasks)
+        except OSError:
+            published, published_rows = acknowledged_tasks, 0
         config = load_config()
         workers = int(((config.get("pipeline") or {}).get("trace") or {}).get("workers", 1))
         max_attempts = int(((config.get("pipeline") or {}).get("trace") or {}).get("max_attempts", 2))
@@ -640,9 +655,7 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
             if name.startswith("moonshiner-"):
                 units.append(name.removesuffix(".service"))
         payload = {
-            "seeds": {"planned": len(planned), "authored": len(authored),
-                      "retired": len(retired),
-                      "waiting": len(planned - authored - retired)},
+            "seeds": seed_counts,
             "authoring": {"active_runs": author_runs},
             "tracing": {"workers": workers, "target": len(traced["target"]),
                         "accepted": len(traced["accepted"]),
@@ -662,8 +675,11 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
         if args.json:
             print(json.dumps(payload, indent=2)); return 0
         print("Moonshiner status")
-        print(f"Seeds: {len(authored)}/{len(planned)} authored; {len(retired)} retired; "
-              f"{len(planned-authored-retired)} waiting")
+        print(f"Seeds: {seed_counts['authored']}/{seed_counts['planned']} authored and "
+              f"trace-ready; {seed_counts['catalogued']} catalogued; "
+              f"{seed_counts['requires_reauthoring']} require reauthoring; "
+              f"{seed_counts['waiting_first_authorship']} await first authorship; "
+              f"{seed_counts['retired']} retired")
         print(f"Authoring: {len(author_runs)} seed job(s) in progress")
         print(f"Traces: {len(traced['accepted'])}/{len(traced['target'])} accepted; "
               f"{len(traced['active'])} active; {len(traced['waiting'])} waiting; "

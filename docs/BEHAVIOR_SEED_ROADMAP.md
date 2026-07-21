@@ -55,13 +55,17 @@ abstention cases, 75 recovery cases, and 175 long-context, web, memory, and
 format cases. Every addition carries `round:2`, its `weakness:*` behavior tag,
 and exactly one of `source:breadth-reserve` or `source:benchmark-informed`.
 
-### Round 3: 4,000 total
+### Round 3: 3,000 total
 
-- Cross lanes with nested objects, arrays, enums, optional values, dates,
-  timezones, units, and identifiers.
-- Add more cross-domain workflows and partially parallel DAGs.
-- Expand uncertain commits, idempotency, partial success, and recovery.
-- Vary prompt and tool-documentation formats across at least half the corpus.
+- Add exactly 1,000 longer composite scenarios from the bundled
+  `instruction-following-round-3` plan.
+- Emphasize multi-turn correction, live web research followed by synthesis and
+  revision, parallel retrieval followed by dependent action, persistent state,
+  partial failure and recovery, and combined formatting/scope/ordering/negative
+  constraints.
+- Execute every scenario through the selected unmodified agent harness. Web
+  research uses real reachable sources; tools and tool results are never
+  simulated or embedded.
 
 ### Round 4: 8,000 total
 

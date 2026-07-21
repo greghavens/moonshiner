@@ -2,6 +2,7 @@
 import pathlib
 import sys
 import unittest
+from collections import Counter
 from unittest import mock
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -12,6 +13,59 @@ import run_state  # noqa: E402
 
 
 class SeedInventoryCounts(unittest.TestCase):
+    def test_bundled_round_three_plan_is_exactly_1000_unique_genuine_harness_scenarios(self):
+        records = seed_inventory.bundled_plan_records()
+        round_three = [record for record in records
+                       if record.get("plan") == "instruction-following-round-3"]
+        self.assertEqual(len(round_three), 1000)
+        self.assertEqual(len({record["id"] for record in round_three}), 1000)
+        self.assertEqual(len({record["brief"] for record in round_three}), 1000)
+        self.assertEqual({record["artifact_contract"] for record in round_three},
+                         {"genuine_harness_task"})
+        required = {"multi-turn-correction", "web-research-synthesis-revision",
+                    "parallel-retrieval-dependent-action", "persistent-state",
+                    "partial-failure-recovery", "compound-constraints"}
+        self.assertEqual({record["scenario"] for record in round_three}, required)
+        self.assertTrue(all("real reachable sources" in record["brief"]
+                            for record in round_three
+                            if record["scenario"] == "web-research-synthesis-revision"))
+        self.assertEqual(Counter(record["program"] for record in round_three), {
+            "Instruction following": 680,
+            "Tool calling": 170,
+            "Error recovery": 150,
+        })
+        expected_categories = {
+            "multi-turn-correction": "multi-turn-state",
+            "web-research-synthesis-revision": "web-research",
+            "parallel-retrieval-dependent-action": "dependency-planning",
+            "persistent-state": "persistent-memory",
+            "partial-failure-recovery": "error-recovery",
+            "compound-constraints": "long-context-composite",
+        }
+        prohibited = {"behavior", "bfcl", "full-distill"}
+        for record in round_three:
+            self.assertEqual(record["category"],
+                             expected_categories[record["scenario"]])
+            self.assertTrue(record["training_tags"])
+            labels = {record["program"].casefold(), record["category"].casefold(),
+                      *(tag.casefold() for tag in record["training_tags"])}
+            self.assertTrue(prohibited.isdisjoint(labels))
+            self.assertIn(f'Program: {record["program"]}.', record["brief"])
+            self.assertIn(f'Category: {record["category"]}.', record["brief"])
+            self.assertIn("Training tags: " + ", ".join(record["training_tags"]),
+                          record["brief"])
+
+    def test_bundled_plan_extends_documented_inventory_without_cataloguing_unwritten_seeds(self):
+        records = [{"id": "planned-new", "brief": "A new scenario",
+                    "artifact_contract": "genuine_harness_task"}]
+        with mock.patch.object(seed_inventory, "bundled_plan_records", return_value=records), \
+             mock.patch.object(seed_inventory, "select_seeds", return_value=[]), \
+             mock.patch.object(pathlib.Path, "is_dir", return_value=False):
+            self.assertIn("planned-new", seed_inventory.documented_plan_ids())
+            self.assertNotIn("planned-new", seed_inventory.catalogued_ids())
+            self.assertEqual(seed_inventory.documented_plan_items()["planned-new"],
+                             "A new scenario")
+
     def test_catalogued_counts_every_present_seed_while_ready_excludes_replacement(self):
         seeds = [
             {"id": "ready", "prompt": "Do the task"},

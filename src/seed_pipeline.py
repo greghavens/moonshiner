@@ -15,11 +15,12 @@ from run_state import (connect, create_run, finish_attempt, set_run_status,
 from runtimes import get_seed_author, get_seed_judge
 from validate_seeds import validate_report
 from audit_seeds import check as audit_seed
+from seed_inventory import bundled_plan_record
 
 SCHEMA = json.loads((ROOT / "schemas" / "author_review_verdict.schema.json").read_text())
 CANDIDATES = STORAGE_ROOT / "tasks" / "candidates"
 
-AUTHOR_SYSTEM = """You author deterministic coding repair seeds for Moonshiner. Work only in the current workspace. Create exactly task.json, files/, and reference_fix.patch at the workspace root. The starting files must contain one focused defect; protected tests must expose it; the reference patch must fix it without modifying tests. Commands must be offline and deterministic. Do not run another coding agent."""
+AUTHOR_SYSTEM = """You author one Moonshiner seed for the selected unmodified agent harness. Work only in the current workspace. Create exactly task.json, files/, and reference_fix.patch at the workspace root. The task may provide a safely simulated environment through fixtures, local services, or reversible state, but the harness's tools and their results must never be simulated, intercepted, embedded, or replaced. Never embed tool calls, tool results, expected call arguments, answer-key response maps, fictional tool schemas, initial service state, or .invalid URLs. A web-research task must require genuine network research against real reachable sources using the harness. Provide deterministic protected verification and a reference patch proving the requested deliverable can be produced. Do not run another coding agent."""
 
 REAUTHOR_SYSTEM = """You reauthor one contaminated Moonshiner seed for the
 selected unmodified agent harness. Work only in the current workspace. Create exactly task.json,
@@ -35,6 +36,17 @@ task must require genuine network research against real reachable sources via
 the harness, never fixtures. Create deterministic protected verification and a
 reference patch proving the requested deliverable can be produced. Do not run
 another coding agent."""
+
+
+def _author_system(seed_id: str, replace_synthetic: bool = False) -> str:
+    """Select the uniform artifact contract named by bundled plan metadata."""
+    if replace_synthetic:
+        return REAUTHOR_SYSTEM
+    record = bundled_plan_record(seed_id)
+    if record and record.get("artifact_contract") != "genuine_harness_task":
+        raise ValueError("unsupported seed artifact contract: "
+                         + str(record.get("artifact_contract")))
+    return AUTHOR_SYSTEM
 
 
 def _init_workspace(seed_id: str) -> Path:
@@ -115,7 +127,7 @@ def main(argv: list[str] | None = None) -> int:
         dummy = {"id": f"seed-author-{args.id}"}
         (TRACES / "raw").mkdir(parents=True, exist_ok=True)
         (TRACES / "reviews").mkdir(parents=True, exist_ok=True)
-        author_system = REAUTHOR_SYSTEM if args.replace_synthetic else AUTHOR_SYSTEM
+        author_system = _author_system(args.id, args.replace_synthetic)
         authored = author.run_trace(dummy, workspace, out_dir=TRACES / "raw",
                                     system_prompt=author_system, prompt=args.brief)
         if (authored.unavailable or authored.timed_out or authored.safeguard_refusal

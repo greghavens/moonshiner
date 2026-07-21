@@ -4,9 +4,56 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from common import (RUNS, STORAGE_ROOT, TRACES, select_seeds,
+from common import (ROOT, RUNS, STORAGE_ROOT, TRACES, select_seeds,
                     synthetic_tool_contract)
 from review_contract import is_accepted
+
+
+PLANS = ROOT / "plans"
+
+
+def bundled_plan_records(directory: Path | None = None) -> list[dict]:
+    """Expand bundled, data-only authoring plans into unique seed briefs."""
+    directory = directory or PLANS
+    records: list[dict] = []
+    for path in sorted(directory.glob("*.json")):
+        plan = json.loads(path.read_text())
+        dimensions = plan.get("dimensions") or {}
+        domains = dimensions.get("domains") or ["general assistance"]
+        constraints = dimensions.get("constraint_sets") or ["follow every instruction"]
+        turns = dimensions.get("turn_patterns") or ["a multi-turn exchange"]
+        serial = 0
+        for family in plan.get("families") or []:
+            for offset in range(int(family["count"])):
+                serial += 1
+                seed_id = f'{plan["id_prefix"]}{serial:04d}'
+                brief = family["template"].format(
+                    domain=domains[offset % len(domains)],
+                    constraint=constraints[(offset // len(domains)) % len(constraints)],
+                    turn_pattern=turns[(offset // (len(domains) * len(constraints)))
+                                       % len(turns)])
+                metadata = (f'Program: {family["program"]}. '
+                            f'Category: {family["category"]}. '
+                            "Training tags: "
+                            + ", ".join(family["training_tags"]) + ". ")
+                records.append({"id": seed_id, "brief": brief,
+                                "plan": plan["plan"],
+                                "scenario": family["scenario"],
+                                "program": family["program"],
+                                "category": family["category"],
+                                "training_tags": list(family["training_tags"]),
+                                "artifact_contract": plan["artifact_contract"]})
+                records[-1]["brief"] = metadata + records[-1]["brief"]
+    ids = [record["id"] for record in records]
+    if len(ids) != len(set(ids)):
+        raise ValueError("bundled seed plans contain duplicate IDs")
+    return records
+
+
+def bundled_plan_record(seed_id: str) -> dict | None:
+    """Return bundled metadata for one planned seed without affecting queue order."""
+    return next((record for record in bundled_plan_records()
+                 if record["id"] == seed_id), None)
 
 
 def authored_ids() -> set[str]:
@@ -27,6 +74,7 @@ def documented_plan_ids() -> set[str]:
     from author_explicit_waves import catalog_items
     from author_matrix_waves import matrix_items
     ids: set[str] = set()
+    ids.update(record["id"] for record in bundled_plan_records())
     imports = STORAGE_ROOT / "imports"
     if imports.is_dir():
         for path in sorted(imports.glob("**/WAVE*_USECASES.md")):
@@ -50,6 +98,8 @@ def documented_plan_items() -> dict[str, str]:
     from author_explicit_waves import catalog_items
     from author_matrix_waves import matrix_items
     items: dict[str, str] = {}
+    items.update((record["id"], record["brief"])
+                 for record in bundled_plan_records())
     imports = STORAGE_ROOT / "imports"
     if not imports.is_dir():
         return items

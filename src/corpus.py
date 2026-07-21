@@ -16,8 +16,20 @@ from common import ROOT, SEEDS_DIR, STORAGE_ROOT
 CORPORA = STORAGE_ROOT / "corpora"
 RELEASES_API = "https://api.github.com/repos/greghavens/moonshiner/releases"
 
+
+def _seed_program_overrides() -> dict[str, str]:
+    """Load explicit per-ID catalog corrections; never infer classification."""
+    path = ROOT / "catalog-overrides.json"
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {str(seed_id): str(program)
+            for seed_id, program in (data.get("seed_programs") or {}).items()}
+
 def catalog(seed_dir: Path = SEEDS_DIR) -> tuple[str, dict]:
     """Build the human recipe book and its machine-readable twin."""
+    program_overrides = _seed_program_overrides()
     catalog_path = seed_dir.parent.parent / "SEED_CATALOG.json"
     try:
         existing_catalog = json.loads(catalog_path.read_text())
@@ -43,7 +55,8 @@ def catalog(seed_dir: Path = SEEDS_DIR) -> tuple[str, dict]:
                 "category": task.get("category") or "uncategorized",
                 "training_tags": task.get("training_tags") or task.get("tags") or [],
                 "summary": summary, "verify_command": task.get("verify_cmd")}
-        item["program"] = (task.get("program")
+        item["program"] = (program_overrides.get(item["id"])
+                           or task.get("program")
                            or existing_items.get(item["id"], {}).get("program")
                            or "Uncategorized")
         groups[item["category"]].append(item)
@@ -57,7 +70,8 @@ def catalog(seed_dir: Path = SEEDS_DIR) -> tuple[str, dict]:
                 "category": task.get("category") or "uncategorized",
                 "training_tags": task.get("training_tags") or [],
                 "summary": summary, "verify_command": None}
-        item["program"] = (task.get("program")
+        item["program"] = (program_overrides.get(item["id"])
+                           or task.get("program")
                            or existing_items.get(item["id"], {}).get("program")
                            or "Uncategorized")
         groups[item["category"]].append(item)
