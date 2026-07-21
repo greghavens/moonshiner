@@ -481,31 +481,30 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int):
 
 
 def preflight_seed_environment(seed: dict) -> tuple[bool, str]:
-    """Validate a seed's setup in the real verifier sandbox before model spend."""
+    """Validate the baseline toolchain in the verifier sandbox before model spend.
+
+    ``reference_setup`` belongs to post-patch reference validation. It may
+    legitimately invoke a file created by ``reference_fix.patch`` and must
+    never run against the intentionally broken baseline used for tracing.
+    """
     workspace = materialize(seed, name=f"environment-{seed['id']}")
-    ok, detail = run_setup(seed, workspace)
     from toolchains import missing_executables, provision
-    missing = missing_executables(detail)
     # The baseline is expected to fail verification; only missing executable
     # evidence is an environment defect. This also discovers nested tools used
     # by shell/Python verifier wrappers without mistaking the intended test
     # failure for an infrastructure failure.
     _, verify_detail = run_verify(seed, workspace)
-    missing.extend(tool for tool in missing_executables(verify_detail)
-                   if tool not in missing)
+    missing = missing_executables(verify_detail)
     if missing:
         deployed, deployment_detail = provision(missing)
         if not deployed:
             return False, deployment_detail
         retry_workspace = materialize(seed, name=f"environment-{seed['id']}-provisioned")
-        ok, detail = run_setup(seed, retry_workspace)
         _, verify_detail = run_verify(seed, retry_workspace)
-        still_missing = missing_executables(detail + "\n" + verify_detail)
+        still_missing = missing_executables(verify_detail)
         if still_missing:
             return False, "toolchain remains unavailable in verifier sandbox: " + ", ".join(still_missing)
-    if not ok:
-        return False, f"reference setup failed before trace generation: {detail}"
-    return True, detail
+    return True, verify_detail
 
 
 def protected_hashes(seed: dict, workspace: Path) -> dict[str, str | None]:
