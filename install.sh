@@ -15,7 +15,13 @@ while [ "$#" -gt 0 ]; do
 done
 command -v python3 >/dev/null || { echo "Python 3.11+ is required" >&2; exit 1; }
 if [ "$version" = latest ]; then
-  version="$(curl -fsSL "https://api.github.com/repos/$repo/releases" | python3 -c 'import json,re,sys; print(next(r["tag_name"][1:] for r in json.load(sys.stdin) if re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", r["tag_name"])))')"
+  latest_url="$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+    "https://github.com/$repo/releases/latest")"
+  version="${latest_url##*/v}"
+  case "$version" in
+    [0-9]*.[0-9]*.[0-9]*) ;;
+    *) echo "could not resolve the latest Moonshiner release" >&2; exit 1;;
+  esac
 fi
 base="https://github.com/$repo/releases/download/v$version"
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
