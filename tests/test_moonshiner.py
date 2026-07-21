@@ -55,6 +55,7 @@ class FrontDoor(unittest.TestCase):
              mock.patch("seed_inventory.trace_state", return_value={
                  "target": set(), "accepted": set(), "active": set(),
                  "waiting": set(), "exhausted": set()}), \
+             mock.patch("publish_queue.accepted_tasks", return_value=[]), \
              mock.patch.object(m.subprocess, "run", return_value=service_result), \
              mock.patch("builtins.print") as output:
             self.assertEqual(m._status([]), 0)

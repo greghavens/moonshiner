@@ -73,7 +73,16 @@ def restore_hidden_acceptances() -> list[str]:
     return restored
 
 
-def accepted_tasks() -> list[tuple[float, str]]:
+def accepted_tasks() -> list[tuple[float, str, int]]:
+    from run_state import connect
+    db = connect()
+    try:
+        versions = {str(row[0]): int(row[1]) for row in db.execute(
+            "SELECT a.seed_id,MAX(a.id) FROM attempts a "
+            "JOIN runs r ON r.id=a.run_id "
+            "WHERE r.kind='trace' AND a.status='accepted' GROUP BY a.seed_id")}
+    finally:
+        db.close()
     ready = []
     for path in (TRACES / "reviews").glob("*.json"):
         try:
@@ -82,7 +91,8 @@ def accepted_tasks() -> list[tuple[float, str]]:
             continue
         if (is_accepted(review)
                 and (TRACES / "meta" / path.name).is_file()):
-            ready.append((path.stat().st_mtime, path.stem))
+            ready.append((path.stat().st_mtime, path.stem,
+                          versions.get(path.stem, 0)))
     return sorted(ready)
 
 
@@ -154,10 +164,11 @@ def tracing_has_unfinished_work() -> bool:
         db.close()
 
 
-def save_acknowledged(path: Path, tasks: set[str]) -> None:
+def save_acknowledged(path: Path, attempts: dict[str, int]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     pending = path.with_suffix(".pending")
-    pending.write_text(json.dumps({"published_tasks": sorted(tasks)}, indent=2) + "\n")
+    pending.write_text(json.dumps({"published_tasks": sorted(attempts),
+        "published_attempts": dict(sorted(attempts.items()))}, indent=2) + "\n")
     pending.replace(path)
 
 
@@ -179,19 +190,31 @@ def main() -> int:
     output = DATA / "hf-publish" / "traces.jsonl"
     acknowledgements = DATA / "hf-sync" / "published-trajectories.json"
     if acknowledgements.is_file():
-        known = set(json.loads(acknowledgements.read_text()).get("published_tasks") or [])
+        state = json.loads(acknowledgements.read_text())
+        known = set(state.get("published_tasks") or [])
+        published_attempts = {str(k): int(v) for k, v in
+                              (state.get("published_attempts") or {}).items()}
+        if not published_attempts:
+            current = {task: version for _, task, version in accepted_tasks()}
+            published_attempts = {task: current.get(task, 0) for task in known}
+            save_acknowledged(acknowledgements, published_attempts)
     else:
         # The local canonical was downloaded from HF before append-only operation;
         # record that baseline once. Thereafter only remote-verified commits advance it.
         from hf_sync import ensure_local_dataset
         baseline = ensure_local_dataset(target=output)
         known = published_tasks(output, int(baseline.get("bootstrap_rows") or 0))
-        save_acknowledged(acknowledgements, known)
+        current = {task: version for _, task, version in accepted_tasks()}
+        published_attempts = {task: current.get(task, 0) for task in known}
+        save_acknowledged(acknowledgements, published_attempts)
     print(f"publish queue active: {dataset}; {len(known)} existing tasks", flush=True)
     blocked: set[str] = set()
     while True:
-        pending = [(stamp, task) for stamp, task in accepted_tasks()
-                   if task not in known and task not in blocked]
+        pending = [(stamp, task, version)
+                   for stamp, task, version in accepted_tasks()
+                   if (task not in known
+                       or version > published_attempts.get(task, -1))
+                   and task not in blocked]
         if not pending:
             time.sleep(2)
             continue
@@ -199,7 +222,8 @@ def main() -> int:
         if len(pending) < size and tracing_has_unfinished_work():
             time.sleep(2)
             continue
-        tasks = [task for _, task in pending[:size]]
+        batch = pending[:size]
+        tasks = [task for _, task, _ in batch]
         label = tasks[0] if len(tasks) == 1 else f"{tasks[0]}…{tasks[-1]} ({len(tasks)})"
         print(f"[publish] {label}: format", flush=True)
         run("src/build_dataset.py", "--quiet")
@@ -226,7 +250,10 @@ def main() -> int:
             title)
         verify_remote(dataset, title)
         known.update(tasks)
-        save_acknowledged(acknowledgements, known)
+        for _, task, version in batch:
+            if task in tasks:
+                published_attempts[task] = version
+        save_acknowledged(acknowledgements, published_attempts)
         print(f"[published] {label}", flush=True)
 
 

@@ -13,7 +13,7 @@ import hf_sync  # noqa: E402
 
 
 def row(source="trajectory-a", step=1, content="answer"):
-    return {"source_trajectory_id": source, "assistant_step": step,
+    return {"task": source, "source_trajectory_id": source, "assistant_step": step,
             "messages": [{"role": "assistant", "content": content}]}
 
 
@@ -57,25 +57,30 @@ class LocalFirstBootstrap(unittest.TestCase):
                 self.assertEqual(target.read_text(), "remote\n")
 
 
-class AppendOnlyExport(unittest.TestCase):
+class TaskKeyedExport(unittest.TestCase):
     def test_appends_new_identity_and_keeps_existing_bytes(self):
         with tempfile.TemporaryDirectory() as name:
             root = pathlib.Path(name); output = root / "traces.jsonl"; journal = root / "journal.jsonl"
             old = json.dumps(row()) + "\n"; output.write_text(old)
             journal.write_text(json.dumps(row()) + "\n" + json.dumps(row("trajectory-b")) + "\n")
-            appended, skipped = export.append_journal(output, journal)
-            self.assertEqual((appended, skipped), (1, 1))
-            self.assertTrue(output.read_text().startswith(old))
+            written, replaced = export.upsert_journal(output, journal)
+            self.assertEqual((written, replaced), (2, 1))
             self.assertEqual(len(output.read_text().splitlines()), 2)
 
-    def test_refuses_to_replace_existing_identity(self):
+    def test_replaces_only_rows_for_the_same_task(self):
         with tempfile.TemporaryDirectory() as name:
             root = pathlib.Path(name); output = root / "traces.jsonl"; journal = root / "journal.jsonl"
-            output.write_text(json.dumps(row(content="old")) + "\n")
-            journal.write_text(json.dumps(row(content="changed")) + "\n")
-            with self.assertRaisesRegex(ValueError, "refusing to replace"):
-                export.append_journal(output, journal)
-            self.assertIn('"old"', output.read_text())
+            output.write_text(json.dumps(row(content="old")) + "\n" +
+                              json.dumps(row("trajectory-b", content="keep")) + "\n")
+            replacement = row(content="changed")
+            journal.write_text(json.dumps(replacement) + "\n")
+            written, replaced = export.upsert_journal(output, journal)
+            self.assertEqual((written, replaced), (1, 1))
+            rows = [json.loads(line) for line in output.read_text().splitlines()]
+            self.assertEqual({item["source_trajectory_id"] for item in rows},
+                             {"trajectory-a", "trajectory-b"})
+            self.assertIn("changed", {item["messages"][0]["content"] for item in rows})
+            self.assertIn("keep", {item["messages"][0]["content"] for item in rows})
 
 
 if __name__ == "__main__":

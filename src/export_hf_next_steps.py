@@ -172,49 +172,37 @@ def row_identity(row: dict) -> tuple[str, int]:
     return source_id, step
 
 
-def append_journal(output: Path, journal: Path) -> tuple[int, int]:
-    """Append only unseen rows; reject an identity whose content changed."""
-    existing: dict[tuple[str, int], str] = {}
+def upsert_journal(output: Path, journal: Path) -> tuple[int, int]:
+    """Atomically replace rows by their central task identity.
+
+    A task has one accepted trajectory. New task IDs append naturally; a new
+    accepted attempt for an existing task replaces only that task's rows. No
+    content hash, category rule, or alternate publication path is involved.
+    """
+    journal_lines = [line for line in journal.read_text().splitlines() if line.strip()]
+    replacement_tasks = {json.loads(line).get("task") for line in journal_lines}
+    if None in replacement_tasks:
+        raise ValueError("journal row is missing task identity")
+    retained: list[str] = []
+    replaced_rows = 0
     if output.exists():
-        with output.open() as handle:
-            for number, line in enumerate(handle, 1):
+        with output.open() as source:
+            for line in source:
                 if not line.strip():
                     continue
-                row = json.loads(line)
-                key = row_identity(row)
-                digest = hashlib.sha256(
-                    json.dumps(row, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-                prior = existing.setdefault(key, digest)
-                if prior != digest:
-                    raise ValueError(f"existing local file has conflicting duplicate at line {number}")
-    appended = skipped = 0
+                if json.loads(line).get("task") in replacement_tasks:
+                    replaced_rows += 1
+                else:
+                    retained.append(line.rstrip("\n"))
     output.parent.mkdir(parents=True, exist_ok=True)
-    needs_separator=False
-    if output.exists() and output.stat().st_size:
-        with output.open("rb") as existing_handle:
-            existing_handle.seek(-1,os.SEEK_END)
-            needs_separator=existing_handle.read(1) != b"\n"
-    with output.open("a") as destination, journal.open() as source:
-        for line in source:
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            key = row_identity(row)
-            digest = hashlib.sha256(
-                json.dumps(row, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-            if key in existing:
-                if existing[key] != digest:
-                    raise ValueError(f"refusing to replace existing published row {key}")
-                skipped += 1
-                continue
-            if needs_separator:
-                destination.write("\n"); needs_separator=False
-            destination.write(json.dumps(row, ensure_ascii=False) + "\n")
-            existing[key] = digest
-            appended += 1
+    pending = output.with_suffix(output.suffix + ".upsert.pending")
+    with pending.open("w") as destination:
+        for line in [*retained, *journal_lines]:
+            destination.write(line + "\n")
         destination.flush()
         os.fsync(destination.fileno())
-    return appended, skipped
+    pending.replace(output)
+    return len(journal_lines), replaced_rows
 
 
 def main() -> None:
@@ -261,9 +249,9 @@ def main() -> None:
         if missing:
             raise ValueError(f"accepted trajectories are not buildable: {sorted(missing)}")
     validate_export(journal)
-    appended, skipped = append_journal(args.output, journal)
+    written, replaced = upsert_journal(args.output, journal)
     validation = validate_export(args.output)
-    print(f"append-only export {args.output}: appended={appended} existing={skipped}; "
+    print(f"task-keyed export {args.output}: written={written} replaced={replaced}; "
           f"candidate rows={sum(counts.values())} "
           f"({', '.join(f'{key}={value}' for key, value in counts.items())}); "
           f"validated {validation['trajectories']} cumulative trajectories")

@@ -594,12 +594,18 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
             try: acknowledged_tasks = len(json.loads(ack.read_text()).get("published_tasks") or [])
             except (OSError, json.JSONDecodeError): pass
         acknowledged = set()
+        acknowledged_attempts = {}
         if ack.is_file():
-            try: acknowledged = set(json.loads(ack.read_text()).get("published_tasks") or [])
+            try:
+                ack_state = json.loads(ack.read_text())
+                acknowledged = set(ack_state.get("published_tasks") or [])
+                acknowledged_attempts = {str(k): int(v) for k, v in
+                    (ack_state.get("published_attempts") or {}).items()}
             except (OSError, json.JSONDecodeError): pass
         from publish_queue import accepted_tasks
-        waiting_for_upload = sum(1 for _, task in accepted_tasks()
-                                 if task not in acknowledged)
+        waiting_for_upload = sum(1 for _, task, attempt in accepted_tasks()
+            if task not in acknowledged
+            or attempt > acknowledged_attempts.get(task, attempt))
         published_file = DATA / "hf-publish" / "traces.jsonl"
         published = 0
         published_rows = 0

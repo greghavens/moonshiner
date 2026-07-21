@@ -56,7 +56,7 @@ class AcceptanceSchemaTests(unittest.TestCase):
             (traces / "meta" / "coding-seed.json").write_text("{}")
             with mock.patch.object(publish_queue, "TRACES", traces):
                 ready = publish_queue.accepted_tasks()
-            self.assertEqual([task for _, task in ready], ["coding-seed"])
+            self.assertEqual([task for _, task, _ in ready], ["coding-seed"])
 
     def test_durable_acceptance_can_never_be_selected_again(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -144,7 +144,7 @@ class AcceptanceSchemaTests(unittest.TestCase):
                                    side_effect=lambda: real_connect(database)):
                 self.assertEqual(publish_queue.restore_hidden_acceptances(), [seed_id])
                 ready = publish_queue.accepted_tasks()
-            self.assertEqual([task for _, task in ready], [seed_id])
+            self.assertEqual([task for _, task, _ in ready], [seed_id])
             restored = json.loads(
                 (traces / "reviews" / f"{seed_id}.json").read_text())
             self.assertTrue(is_accepted(restored))
