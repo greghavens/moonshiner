@@ -38,7 +38,24 @@ def _load_config() -> dict:
 
 CONFIG = _load_config()
 _installed_seeds = STORAGE_ROOT / "corpora" / "active" / "tasks" / "seeds"
-SEEDS_DIR = _installed_seeds if _installed_seeds.is_dir() else ROOT / "tasks" / "seeds"
+_bundled_seeds = ROOT / "tasks" / "seeds"
+def _corpus_version(root: Path) -> str:
+    try:
+        return str(json.loads((root / "corpus-version.json").read_text())["version"])
+    except (OSError, KeyError, TypeError, json.JSONDecodeError):
+        return "0"
+
+_authoring_enabled = bool((((CONFIG.get("pipeline") or {}).get("queues") or {})
+                           .get("seed_authoring")))
+_active_root = STORAGE_ROOT / "corpora" / "active"
+def prefer_active_corpus(installed: bool, authoring: bool,
+                         active_version: str, bundled_version: str) -> bool:
+    return installed and (authoring or active_version >= bundled_version)
+
+_use_active = prefer_active_corpus(
+    _installed_seeds.is_dir(), _authoring_enabled,
+    _corpus_version(_active_root), _corpus_version(ROOT))
+SEEDS_DIR = _installed_seeds if _use_active else _bundled_seeds
 BEHAVIOR_SEEDS_DIR = (SEEDS_DIR.parent / "behavior-seeds"
                       if (SEEDS_DIR.parent / "behavior-seeds").is_dir()
                       else ROOT / "tasks" / "behavior-seeds")

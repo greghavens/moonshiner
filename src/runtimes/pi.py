@@ -80,6 +80,11 @@ class PiRuntime(Runtime):
     name = "pi"
     trace_formats = ("pi-coding-agent-json-v3",)
 
+    @staticmethod
+    def _managed_cli() -> Path:
+        base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+        return base / "moonshiner" / "toolchains" / "pi" / "node_modules" / ".bin" / "pi"
+
     def _cli_path(self) -> Path:
         configured = Path(self.runtime_config.get("cli", "pi"))
         if configured.is_absolute():
@@ -98,7 +103,7 @@ class PiRuntime(Runtime):
             return existing_managed
         # Preserve Moonshiner's existing managed-install option. Native PATH
         # resolution always wins; this is only the explicit setup fallback.
-        return ROOT / "node_modules" / ".bin" / "pi"
+        return self._managed_cli()
 
     def _managed_node_modules(self) -> Path | None:
         cli = self._cli_path()

@@ -449,8 +449,11 @@ def _setup(argv: list[str] | None = None) -> int:
                 raise SystemExit("The selected Pi runtime needs Node.js 22 or newer. Install Node.js, then run `moonshiner` again.")
             version = config["runtimes"]["pi"].get("runtime_version", "0.80.7")
             print(f"Installing the Pi runtime {version}…")
+            data_home = Path(os.environ.get("XDG_DATA_HOME",
+                                             Path.home() / ".local" / "share"))
+            prefix = data_home / "moonshiner" / "toolchains" / "pi"
             subprocess.run([npm, "install", "--no-audit", "--no-fund", "--prefix",
-                            str(ROOT), f"@earendil-works/pi-coding-agent@{version}"],
+                            str(prefix), f"@earendil-works/pi-coding-agent@{version}"],
                            check=True)
     if hf_dataset:
         print(f"Importing existing completion state from {hf_dataset}…")

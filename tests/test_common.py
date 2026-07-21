@@ -39,6 +39,12 @@ class Fingerprint(unittest.TestCase):
 
 
 class LoadSeeds(unittest.TestCase):
+    def test_trace_only_project_uses_newer_bundled_corpus(self):
+        self.assertFalse(common.prefer_active_corpus(
+            True, False, "2026.07.20.1", "2026.07.21.1"))
+        self.assertTrue(common.prefer_active_corpus(
+            True, True, "2026.07.20.1", "2026.07.21.1"))
+
     def test_installed_seed_loader_uses_corpus_catalog_priority(self):
         with tempfile.TemporaryDirectory() as directory:
             corpus = pathlib.Path(directory) / "corpus"

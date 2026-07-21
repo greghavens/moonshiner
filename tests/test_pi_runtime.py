@@ -28,6 +28,21 @@ def _provider_entry(runtime_config: dict) -> dict:
 
 
 class ModelsJson(unittest.TestCase):
+    def test_managed_fallback_is_stable_user_data_not_the_versioned_bundle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = PiRuntime(
+                {"workspace": {"confirmed_root": directory},
+                 "runtimes": {"pi": {"provider": "openrouter"}}},
+                {"model": "moonshotai/kimi-k3"})
+            runtime.runtime_config = {"provider": "openrouter", "cli": "pi"}
+            data = pathlib.Path(directory) / "data"
+            with mock.patch.dict("os.environ", {"XDG_DATA_HOME": str(data)}), \
+             mock.patch("runtimes.pi.shutil.which", return_value=None):
+                path = runtime._cli_path()
+        self.assertEqual(path, data / "moonshiner" /
+                         "toolchains" / "pi" / "node_modules" / ".bin" / "pi")
+        self.assertNotIn("moonshiner_app/bundle", str(path))
+
     def test_output_budget_defaults_beyond_pi_16k(self):
         # pi fills in maxTokens=16384 when the entry omits it; reasoning-max
         # turns overrun that and get truncated with stopReason "length", so
