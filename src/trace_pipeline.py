@@ -74,8 +74,10 @@ def _selected(args) -> list[dict]:
     # Catalog membership is the only seed intake gate. Quality decisions belong
     # to the trace judge, and lifetime exhaustion prevents paid retry loops.
     ledger = connect()
-    accepted.update(str(row[0]) for row in ledger.execute(
-        "SELECT DISTINCT seed_id FROM attempts WHERE status='accepted'"))
+    accepted.update(str(row[0]) for row in ledger.execute("""
+        SELECT DISTINCT a.seed_id FROM attempts a
+        JOIN runs r ON r.id=a.run_id
+        WHERE r.kind='trace' AND a.status='accepted'"""))
     attempts = {row["seed_id"]: int(row["attempts"])
                 for row in ledger.execute("""SELECT j.seed_id, COUNT(a.id) attempts
                   FROM jobs j JOIN runs r ON r.id=j.run_id

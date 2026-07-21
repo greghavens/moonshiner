@@ -91,6 +91,29 @@ class AcceptanceSchemaTests(unittest.TestCase):
                             return_value=set()):
                 self.assertEqual(trace_pipeline._selected(args), [])
 
+    def test_seed_author_acceptance_does_not_complete_trace_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = pathlib.Path(directory) / "runs.sqlite3"
+            real_connect = run_state.connect
+            db = real_connect(database)
+            run_id = run_state.create_run(db, "seed-author", {}, {},
+                                          ["new-security-seed"])
+            run_state.start_attempt(db, run_id, "new-security-seed", 1)
+            run_state.finish_attempt(db, run_id, "new-security-seed", 1,
+                                     "accepted")
+            db.close()
+            args = SimpleNamespace(only=None, category=None, tag=None,
+                                   kind="all", name=None, max_attempts=2,
+                                   limit=0, all=True)
+            seed = {"id": "new-security-seed"}
+            with mock.patch.object(trace_pipeline, "connect",
+                                   side_effect=lambda: real_connect(database)), \
+                    mock.patch.object(trace_pipeline, "select_seeds",
+                                      return_value=[seed]), \
+                    mock.patch("import_existing.imported_task_ids",
+                               return_value=set()):
+                self.assertEqual(trace_pipeline._selected(args), [seed])
+
     def test_hidden_accepted_artifact_is_restored_for_publication(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
