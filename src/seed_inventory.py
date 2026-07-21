@@ -17,6 +17,11 @@ def authored_ids() -> set[str]:
             if synthetic_tool_contract(seed) is None}
 
 
+def catalogued_ids() -> set[str]:
+    """Return every authored seed record present in the seed catalog."""
+    return {seed["id"] for seed in select_seeds()}
+
+
 def documented_plan_ids() -> set[str]:
     """Return IDs from every imported documented plan, deduplicated by ID."""
     from author_explicit_waves import catalog_items
@@ -79,7 +84,7 @@ def documented_plan_items() -> dict[str, str]:
 def planned_ids() -> set[str]:
     # Existing catalog entries are documented plans too. Imported planning
     # documents extend the denominator before their artifacts are authored.
-    return authored_ids() | documented_plan_ids()
+    return catalogued_ids() | documented_plan_ids()
 
 
 def accepted_ids() -> set[str]:
@@ -101,8 +106,10 @@ def accepted_ids() -> set[str]:
 
 
 def trace_state(max_attempts: int) -> dict[str, set[str]]:
-    target = authored_ids()
-    accepted = accepted_ids() & target
+    target = catalogued_ids()
+    ready = authored_ids()
+    needs_reauthoring = target - ready
+    accepted = accepted_ids() & ready
     from run_state import connect
     db = connect()
     active = {row[0] for row in db.execute(
@@ -112,9 +119,10 @@ def trace_state(max_attempts: int) -> dict[str, set[str]]:
         "SELECT seed_id,COUNT(*) FROM attempts "
         "WHERE status IN ('accepted','retry','exhausted') GROUP BY seed_id")}
     db.close()
-    active &= target - accepted
-    exhausted = {seed_id for seed_id in target - accepted - active
+    active &= ready - accepted
+    exhausted = {seed_id for seed_id in ready - accepted - active
                  if attempts.get(seed_id, 0) >= max_attempts}
-    waiting = target - accepted - active - exhausted
+    waiting = ready - accepted - active - exhausted
     return {"target": target, "accepted": accepted, "active": active,
-            "exhausted": exhausted, "waiting": waiting}
+            "exhausted": exhausted, "waiting": waiting,
+            "needs_reauthoring": needs_reauthoring}

@@ -584,8 +584,8 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
     if not inspect and not args.run_id and not args.all:
         from common import DATA
         from configuration import load_config
-        from seed_inventory import authored_ids, planned_ids, trace_state
-        authored = authored_ids(); planned = planned_ids()
+        from seed_inventory import catalogued_ids, planned_ids, trace_state
+        authored = catalogued_ids(); planned = planned_ids()
         active = [row for row in rows if row["status"] == "running" and row["kind"] == "trace"]
         author_runs = [row for row in rows if row["status"] == "running" and row["kind"] == "seed"]
         ack = DATA / "hf-sync" / "published-trajectories.json"
@@ -643,6 +643,7 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
                         "accepted": len(traced["accepted"]),
                         "active": len(traced["active"]),
                         "waiting_for_judgment": 0,
+                        "needs_seed_reauthoring": len(traced["needs_reauthoring"]),
                         "exhausted": len(traced["exhausted"]),
                         "waiting": len(traced["waiting"]), "active_runs": active},
             "publishing": {"dataset": (config.get("publish") or {}).get("hf_dataset"),
@@ -661,6 +662,7 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
         print(f"Traces: {len(traced['accepted'])}/{len(traced['target'])} accepted; "
               f"{len(traced['active'])} active; {len(traced['waiting'])} waiting; "
               f"{len(traced['exhausted'])} exhausted; {workers} workers configured")
+        print(f"  needs seed reauthoring: {len(traced['needs_reauthoring'])}")
         print("  waiting for judgment: 0 (judgment runs inline in each trace worker)")
         for row in active:
             jobs = job_rows(db, row["id"])

@@ -50,11 +50,12 @@ class FrontDoor(unittest.TestCase):
                        "model": None}
         with mock.patch.object(run_state, "connect", return_value=db), \
              mock.patch.object(run_state, "summaries", return_value=[]), \
-             mock.patch("seed_inventory.authored_ids", return_value=set()), \
+             mock.patch("seed_inventory.catalogued_ids", return_value=set()), \
              mock.patch("seed_inventory.planned_ids", return_value=set()), \
              mock.patch("seed_inventory.trace_state", return_value={
                  "target": set(), "accepted": set(), "active": set(),
-                 "waiting": set(), "exhausted": set()}), \
+                 "waiting": set(), "exhausted": set(),
+                 "needs_reauthoring": set()}), \
              mock.patch("publish_queue.accepted_tasks", return_value=[]), \
              mock.patch.object(m.subprocess, "run", return_value=service_result), \
              mock.patch("builtins.print") as output:
