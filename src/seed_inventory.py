@@ -167,16 +167,17 @@ def retired_seed_ids(db=None) -> set[str]:
     return retired
 
 
-def accepted_ids(db=None) -> set[str]:
+def accepted_ids(db=None, *, include_review_files: bool = True) -> set[str]:
     from import_existing import imported_task_ids
     accepted = set(imported_task_ids())
-    for path in (TRACES / "reviews").glob("*.json"):
-        try:
-            review = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        if is_accepted(review):
-            accepted.add(path.stem)
+    if include_review_files:
+        for path in (TRACES / "reviews").glob("*.json"):
+            try:
+                review = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if is_accepted(review):
+                accepted.add(path.stem)
     owns_db = db is None
     if owns_db:
         from run_state import connect

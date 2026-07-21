@@ -53,7 +53,7 @@ class FrontDoor(unittest.TestCase):
              mock.patch("seed_inventory.inventory_sets",
                         return_value=(set(), set(), set())), \
              mock.patch("seed_inventory.planned_ids", return_value=set()), \
-             mock.patch("seed_inventory.accepted_ids", return_value=set()), \
+             mock.patch("seed_inventory.accepted_ids", return_value=set()) as accepted, \
              mock.patch("seed_inventory.retired_seed_ids", return_value=set()), \
              mock.patch("seed_inventory.trace_state", return_value={
                  "target": set(), "accepted": set(), "active": set(),
@@ -65,6 +65,7 @@ class FrontDoor(unittest.TestCase):
              mock.patch("builtins.print") as output:
             self.assertEqual(m._status([]), 0)
         summaries.assert_called_once_with(db, None, running_only=True)
+        accepted.assert_called_once_with(db, include_review_files=False)
         self.assertTrue(any(call.args == ("Moonshiner status",)
                             for call in output.call_args_list))
 

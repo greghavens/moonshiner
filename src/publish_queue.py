@@ -74,7 +74,8 @@ def restore_hidden_acceptances() -> list[str]:
     return restored
 
 
-def accepted_tasks(accepted: set[str] | None = None) -> list[tuple[float, str, int]]:
+def accepted_tasks(accepted: set[str] | None = None, *,
+                   validate_artifacts: bool = True) -> list[tuple[float, str, int]]:
     from run_state import connect
     db = connect()
     try:
@@ -87,6 +88,9 @@ def accepted_tasks(accepted: set[str] | None = None) -> list[tuple[float, str, i
             "WHERE r.kind='trace' AND a.status='accepted' GROUP BY a.seed_id")}
     finally:
         db.close()
+    if not validate_artifacts:
+        return sorted((0.0, task, versions[task]) for task in accepted
+                      if task in versions)
     ready = []
     for path in (TRACES / "reviews").glob("*.json"):
         try:

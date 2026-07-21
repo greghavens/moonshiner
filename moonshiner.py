@@ -614,7 +614,10 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
         catalogued, authored, replacements = inventory_sets()
         planned = planned_ids(catalogued, replacements)
         retired = retired_seed_ids()
-        accepted = accepted_ids(db)
+        # Published/imported task IDs and durable accepted trace attempts are
+        # sufficient for status. The publisher independently validates every
+        # canonical artifact before it uploads it.
+        accepted = accepted_ids(db, include_review_files=False)
         seed_counts = _seed_status_counts(
             planned=planned, catalogued=catalogued, ready=authored,
             retired=retired)
@@ -637,7 +640,8 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
                     (ack_state.get("published_attempts") or {}).items()}
             except (OSError, json.JSONDecodeError): pass
         from publish_queue import accepted_tasks
-        waiting_for_upload = sum(1 for _, task, attempt in accepted_tasks(accepted)
+        waiting_for_upload = sum(1 for _, task, attempt in accepted_tasks(
+            accepted, validate_artifacts=False)
             if task not in acknowledged
             or attempt > acknowledged_attempts.get(task, attempt))
         published_file = DATA / "hf-publish" / "traces.jsonl"
