@@ -89,7 +89,9 @@ class Card(unittest.TestCase):
         self.assertIn("## Schema", self.card)
         self.assertIn("`task`", self.card)
         self.assertIn("## Task mix", self.card)
-        self.assertIn("Uncategorized", self.card)
+        self.assertIn("| Build |", self.card)
+        self.assertIn("| Security |", self.card)
+        self.assertNotIn("| Uncategorized |", self.card)
         self.assertNotIn("## Tool surface", self.card)
 
     def test_task_mix_includes_row_share_without_row_counts(self):
@@ -101,6 +103,33 @@ class Card(unittest.TestCase):
         self.assertIn("| Tool calling | 2 | 66.7% | 33.3% |", table)
         self.assertIn("| Building | 1 | 33.3% | 66.7% |", table)
         self.assertNotIn("| rows |", table)
+
+    def test_uncatalogued_rows_keep_their_explicit_category(self):
+        rows = [
+            _row("author-1", "seed-author-w5", "seed-authoring",
+                 "seed-authoring", None, "train", 2),
+            _row("author-1", "seed-author-w5", "seed-authoring",
+                 "seed-authoring", None, "train", 2),
+        ]
+        with mock.patch.object(card, "_program_assignments", return_value={}):
+            text = card.build_card(rows)
+        self.assertIn("| Seed authoring | 1 | 100.0% | 100.0% |", text)
+        self.assertNotIn("| Uncategorized |", text)
+
+    def test_installed_catalog_supplements_missing_source_assignment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = pathlib.Path(directory) / "data"
+            active = data.parent / "corpora" / "active"
+            active.mkdir(parents=True)
+            (active / "SEED_CATALOG.json").write_text(json.dumps({
+                "categories": {"debug": [{
+                    "id": "bash-it-certinventory", "program": "Debugging"
+                }]}
+            }))
+            with mock.patch.object(card, "DATA", data), \
+                    mock.patch.object(card, "ROOT", pathlib.Path(directory) / "missing"):
+                assignments = card._program_assignments()
+        self.assertEqual(assignments["bash-it-certinventory"], "Debugging")
 
     def test_security_domain_switches_on_security_framing(self):
         self.assertIn("question-answering", self.card)   # extra task category

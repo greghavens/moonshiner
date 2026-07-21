@@ -247,31 +247,47 @@ def _mix_table(counter: Counter, total: int, head: str) -> str:
     return "\n".join(lines)
 
 
+def _program_assignments() -> dict[str, str]:
+    """Load catalog assignments, supplementing the source catalog with the
+    installed corpus catalog so resumed traces retain their original labels."""
+    by_id: dict[str, str] = {}
+    paths = (DATA.parent / "corpora" / "active" / "SEED_CATALOG.json",
+             ROOT / "SEED_CATALOG.json")
+    for path in paths:
+        try:
+            catalog = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        by_id.update({item.get("id"): item.get("program")
+                      for items in (catalog.get("categories") or {}).values()
+                      for item in items
+                      if isinstance(item, dict) and item.get("id") and item.get("program")})
+    return by_id
+
+
+def _published_program(task: str | None, category: str | None,
+                       by_id: dict[str, str]) -> str:
+    if task in by_id:
+        return by_id[task]
+    if category and category != "unknown":
+        return str(category).replace("-", " ").capitalize()
+    return "Uncategorized"
+
+
 def _program_mix(trajectories: dict[str, dict]) -> Counter:
-    """Use the catalog's explicit program assignment without inference."""
-    try:
-        catalog = json.loads((ROOT / "SEED_CATALOG.json").read_text())
-    except (OSError, json.JSONDecodeError):
-        catalog = {}
-    by_id = {item.get("id"): item.get("program")
-             for items in (catalog.get("categories") or {}).values()
-             for item in items if isinstance(item, dict)}
+    """Use catalog programs, falling back to explicit published categories."""
+    by_id = _program_assignments()
     result: Counter = Counter()
     for entry in trajectories.values():
-        result[by_id.get(entry.get("task")) or "Uncategorized"] += 1
+        result[_published_program(entry.get("task"), entry.get("category"), by_id)] += 1
     return result
 
 
 def _program_row_mix(rows: list[dict]) -> Counter:
     """Count training rows using the catalog's explicit program assignment."""
-    try:
-        catalog = json.loads((ROOT / "SEED_CATALOG.json").read_text())
-    except (OSError, json.JSONDecodeError):
-        catalog = {}
-    by_id = {item.get("id"): item.get("program")
-             for items in (catalog.get("categories") or {}).values()
-             for item in items if isinstance(item, dict)}
-    return Counter(by_id.get(row.get("task")) or "Uncategorized" for row in rows)
+    by_id = _program_assignments()
+    return Counter(_published_program(row.get("task"), row.get("category"), by_id)
+                   for row in rows)
 
 
 def _program_table(counter: Counter, total: int, row_counter: Counter,
@@ -287,7 +303,7 @@ def _program_table(counter: Counter, total: int, row_counter: Counter,
             lines.append(
                 f"| {name} | {count:,} | {_pct1(count, total)} | "
                 f"{_pct1(row_counter.get(name, 0), total_rows)} | "
-                f"{programs.get(name, {}).get('description', 'Not assigned in the seed catalog.')} |")
+                f"{programs.get(name, {}).get('description', 'Accepted trajectories grouped by their explicit published dataset category.')} |")
     return "\n".join(lines)
 
 
