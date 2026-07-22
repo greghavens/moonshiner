@@ -93,6 +93,19 @@ class ParquetPublication(unittest.TestCase):
             self.assertEqual({item["task"] for item in parquet.read_active_rows(root)},
                              {"task-a", "task-b"})
 
+    def test_changed_row_count_is_discovered_without_hashes(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = pathlib.Path(name); source = root / "traces.jsonl"
+            self.write_rows(source, [row("task-a")])
+            parquet.sync(source, root, changed_tasks={"task-a"})
+            replacement = [row("task-a", 1, 2, "first"),
+                           row("task-a", 2, 2, "second")]
+            self.write_rows(source, replacement)
+            manifest = parquet.sync(source, root, changed_tasks=set())
+            self.assertEqual(manifest["row_count"], 2)
+            self.assertEqual([item["assistant_step"]
+                              for item in parquet.read_active_rows(root)], [1, 2])
+
     def test_every_active_shard_has_the_exact_same_arrow_schema(self):
         with tempfile.TemporaryDirectory() as name:
             root = pathlib.Path(name); source = root / "traces.jsonl"
