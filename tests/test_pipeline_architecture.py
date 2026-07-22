@@ -97,6 +97,52 @@ class OnePipelineInvariant(unittest.TestCase):
             self.assertTrue(path.with_name("traces.jsonl.pre-canonical").is_file())
             self.assertEqual(json.loads(marker.read_text())["bootstrap_rows"], 2)
 
+    def test_historical_canonical_rows_are_upgraded_without_trace_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = pathlib.Path(directory)
+            messages = [{"role": "user", "content": "inspect the repository"},
+                        {"role": "assistant", "content": "I will inspect it."}]
+            tools = [{"type": "function", "function": {
+                "name": "read_file", "parameters": {"type": "object"}}}]
+            historical = {
+                "task": "historical-one", "source_trajectory_id": "source-one",
+                "source_trajectory_sha256": "a" * 64, "lang": "en",
+                "category": "Debugging", "kind": "trace", "domain": "coding",
+                "security_task": False, "verifier": "judge", "split": "train",
+                "session_id": "session-one", "teacher_model": "acme/model",
+                "reasoning_effort": "high", "trace_format": "native-rollout",
+                "tools_used": ["read_file"], "trace_part": 1, "trace_parts": 1,
+                "continuation": False, "derivation": "cumulative-next-assistant-v1",
+                "assistant_step": 1, "assistant_steps": 1,
+                "target_message_index": 1, "original_n_messages": 2,
+                "n_messages": 2, "messages": messages,
+                "tools": json.dumps(tools)}
+            path = data / "traces.jsonl"
+            path.write_text(json.dumps(historical) + "\n")
+            with mock.patch.object(migrate_canonical_dataset, "DATA", data), \
+                 mock.patch.object(migrate_canonical_dataset, "CONFIG", {}):
+                self.assertEqual(migrate_canonical_dataset.migrate(path), (1, 1))
+            row = json.loads(path.read_text())
+            self.assertEqual(list(row), export_hf_next_steps.PUBLISH_KEY_ORDER)
+            self.assertEqual(row["messages"], messages)
+            self.assertEqual(json.loads(row["tools"]), tools)
+            self.assertEqual(row["source_trajectory_id"], "source-one")
+            self.assertEqual(row["source_trajectory_sha256"], "a" * 64)
+            self.assertIsNone(row["teacher_runtime"])
+            self.assertIsNone(row["provider"])
+            self.assertFalse(row["model_attested"])
+
+    def test_migration_uses_the_single_imported_source_when_mirror_is_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = pathlib.Path(directory)
+            imported = data / "imported" / "owner-dataset" / "rows.jsonl"
+            imported.parent.mkdir(parents=True)
+            imported.write_text("{}\n")
+            expected = data / "hf-publish" / "traces.jsonl"
+            with mock.patch.object(migrate_canonical_dataset, "DATA", data):
+                self.assertEqual(migrate_canonical_dataset.migration_path(), expected)
+            self.assertEqual(expected.read_text(), "{}\n")
+
 
 if __name__ == "__main__":
     unittest.main()

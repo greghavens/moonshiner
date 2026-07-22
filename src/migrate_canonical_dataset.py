@@ -43,7 +43,10 @@ def _advance_baseline(path: Path, validation: dict) -> None:
     marker_name = hashlib.sha256(f"{dataset}:{filename}".encode()).hexdigest()[:16]
     marker = DATA / "hf-sync" / f"{marker_name}.json"
     if not marker.is_file():
-        raise ValueError("HF append baseline is missing; refusing migration")
+        # A freshly imported dataset has not been bootstrapped by the publisher
+        # yet.  The first publish records this already-local canonical file as
+        # its baseline before uploading it.
+        return
     state = json.loads(marker.read_text())
     state.update({"bootstrap_sha256": sha256(path),
                   "bootstrap_size": path.stat().st_size,
@@ -55,12 +58,86 @@ def _advance_baseline(path: Path, validation: dict) -> None:
     pending_marker.replace(marker)
 
 
+def migration_path() -> Path:
+    """Return the one canonical migration target, seeding it from one import."""
+    target = DATA / "hf-publish" / "traces.jsonl"
+    if target.is_file():
+        return target
+    imported = sorted((DATA / "imported").glob("*/rows.jsonl"))
+    if not imported:
+        return target
+    if len(imported) != 1:
+        raise ValueError(
+            "multiple imported datasets exist; migrate each in a separate project")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(imported[0], target)
+    return target
+
+
+def _historical_canonical(rows: list[dict]) -> list[dict] | None:
+    """Upgrade the former canonical columns without altering trace content."""
+    required = {
+        "task", "source_trajectory_id", "source_trajectory_sha256", "split",
+        "derivation", "assistant_step", "assistant_steps",
+        "target_message_index", "original_n_messages", "messages", "tools",
+    }
+    if not all(required <= set(row) for row in rows):
+        return None
+    converted = []
+    for row in rows:
+        tools = row.get("tools")
+        if not isinstance(tools, str):
+            tools = json.dumps(tools or [], ensure_ascii=False)
+        model = row.get("teacher_model")
+        converted.append({
+            "task": row["task"],
+            "source_trajectory_id": row["source_trajectory_id"],
+            "source_trajectory_sha256": row["source_trajectory_sha256"],
+            "lang": row.get("lang"),
+            "category": row.get("category"),
+            "domain": row.get("domain", "coding"),
+            "verifier": row.get("verifier", "acceptance-tests+quality-review"),
+            "split": row["split"],
+            "teacher_runtime": row.get("teacher_runtime"),
+            "teacher_model": model,
+            "reasoning_effort": row.get("reasoning_effort"),
+            "provider": row.get("provider"),
+            "observed_models": row.get("observed_models") or ([model] if model else []),
+            "model_attested": bool(row.get("model_attested")),
+            "trace_format": row.get("trace_format"),
+            "tools_used": row.get("tools_used") or [],
+            "derivation": row["derivation"],
+            "assistant_step": row["assistant_step"],
+            "assistant_steps": row["assistant_steps"],
+            "target_message_index": row["target_message_index"],
+            "original_n_messages": row["original_n_messages"],
+            "n_messages": len(row["messages"]),
+            "messages": row["messages"],
+            "tools": tools,
+        })
+    return converted
+
+
 def migrate(path: Path) -> tuple[int, int]:
     rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     if not rows:
         raise ValueError("dataset is empty")
     if all(list(row) == PUBLISH_KEY_ORDER for row in rows):
         validation = validate_export(path)
+        _advance_baseline(path, validation)
+        return validation["trajectories"], validation["rows"]
+    historical = _historical_canonical(rows)
+    if historical is not None:
+        backup = path.with_name(path.name + ".pre-canonical")
+        if not backup.exists():
+            shutil.copy2(path, backup)
+        pending = path.with_suffix(path.suffix + ".canonical.pending")
+        with pending.open("x") as handle:
+            for row in historical:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            handle.flush(); os.fsync(handle.fileno())
+        validation = validate_export(pending)
+        pending.replace(path)
         _advance_baseline(path, validation)
         return validation["trajectories"], validation["rows"]
     if any("source_trajectory_id" in row or "assistant_step" in row for row in rows):
@@ -117,7 +194,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     if not args.yes:
         parser.error("migration requires --yes")
-    path = DATA / "hf-publish" / "traces.jsonl"
+    path = migration_path()
     trajectories, rows = migrate(path)
     print(f"canonical dataset ready: {trajectories} trajectories, {rows} training rows")
     return 0

@@ -282,6 +282,20 @@ Import an existing Hugging Face dataset:
 moonshiner trace import --hf owner/dataset --revision COMMIT
 ```
 
+Convert imported prepared rows to Moonshiner's current canonical schema, then
+publish them with the project's configured JSONL or Parquet-shard format:
+
+```bash
+moonshiner migrate-dataset --yes
+```
+
+```bash
+moonshiner publish --yes
+```
+
+Migration preserves existing messages and tools. It does not generate or infer
+missing trace content such as model reasoning.
+
 For the configured Hugging Face target, Moonshiner downloads the remote trace file only when the matching local file does not yet exist. Later accepted traces append to the local canonical file. Existing rows are never replaced.
 
 Enable a remote revision check before each append when you need it:
