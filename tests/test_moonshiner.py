@@ -16,6 +16,16 @@ import run_state  # noqa: E402
 
 
 class FrontDoor(unittest.TestCase):
+    def test_trace_stepdown_default_is_enabled_and_trace_only(self):
+        config = json.loads((_ROOT / "config.json").read_text())
+        self.assertTrue(config["pipeline"]["trace"][
+            "step_down_reasoning_on_failure"])
+        self.assertEqual(config["pipeline"]["trace"]["max_attempts"], 3)
+        self.assertNotIn("step_down_reasoning_on_failure",
+                         config["pipeline"]["seed"])
+        self.assertNotIn("step_down_reasoning_on_failure",
+                         config["synthetic_corrections"])
+
     def test_first_run_wizard_uses_trace_only_defaults_and_resumes_dataset(self):
         config = json.loads((_ROOT / "config.json").read_text())
         updates = {}
@@ -37,7 +47,8 @@ class FrontDoor(unittest.TestCase):
         self.assertFalse(updates["pipeline.queues.seed_authoring"])
         self.assertTrue(updates["pipeline.queues.tracing"])
         self.assertEqual(updates["pipeline.trace.workers"], 2)
-        self.assertEqual(updates["pipeline.trace.max_attempts"], 2)
+        self.assertEqual(updates["pipeline.trace.max_attempts"], 3)
+        self.assertTrue(updates["pipeline.trace.step_down_reasoning_on_failure"])
         self.assertEqual(updates["publish.batch_size"], 10)
         self.assertEqual(updates["judge.runtime"], "codex")
         self.assertEqual(updates["teacher.model"], "acme/orion-7b")

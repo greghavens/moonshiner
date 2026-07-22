@@ -387,6 +387,16 @@ def build_card(rows: list[dict], *, stage: str = "release",
     reasoning = teacher.get("reasoning", "max")
     judge_model = judge.get("model", "an independent reviewer")
     judge_runtime = judge.get("runtime", "codex")
+    trace_config = (config.get("pipeline") or {}).get("trace") or {}
+    stepdown_enabled = bool(trace_config.get("step_down_reasoning_on_failure", True))
+    stepdown_note = ""
+    if stepdown_enabled:
+        stepdown_note = (
+            "\n- **Reasoning-effort step-down.** Failed trace attempts proceed "
+            "through `xhigh → medium → low` (up to the configured attempt count) and "
+            "stop at the first judge-accepted trace. If higher reasoning fails a "
+            "task that lower reasoning succeeds on, the lower-effort trace is retained."
+        )
     profile = config.get("model_profile") or {}
     model_display = (publish.get("model_display")
                      or (profile.get("display_name")
@@ -632,6 +642,7 @@ programs and substantially more sessions will be added to this same repo.
   protected-file checks. Instruction-following sessions must pass deterministic
   tool-call, staging, argument, and response-constraint checks. Every retained
   trajectory also clears independent review.
+{stepdown_note}
 
 ## Task mix
 

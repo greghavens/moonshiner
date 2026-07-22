@@ -153,7 +153,17 @@ moonshiner config set pipeline.trace.workers 3
 Set the maximum attempts for each individual trace:
 
 ```bash
-moonshiner config set pipeline.trace.max_attempts 2
+moonshiner config set pipeline.trace.max_attempts 3
+```
+
+Trace retries step down reasoning effort by default: `xhigh`, then `medium`,
+then `low`. Each later attempt runs only after the preceding attempt is rejected,
+and the first judge-accepted trace is retained. Attempt counts above three repeat
+that cycle. To keep the teacher's configured reasoning effort unchanged across
+all trace attempts:
+
+```bash
+moonshiner config set pipeline.trace.step_down_reasoning_on_failure false
 ```
 
 Set Hugging Face publication batch size:
@@ -211,7 +221,9 @@ moonshiner synthetic-corrections run --yes
 ```
 
 Moonshiner examines up to three preserved failures for each use case but creates
-at most one corrected trajectory. A use case is excluded if any current-revision
+at most one corrected trajectory. The eligibility reviewer chooses the correctable
+failure requiring the smallest valid change; correction retries continue from that
+same preserved attempt. A use case is excluded if any current-revision
 trace ever passed. The source reasoning must remain unchanged, the correction
 must be minimal, and the corrected trace must pass normal verification and the
 normal independent trace judge. A judge rejection returns the item to the end of

@@ -149,29 +149,48 @@ def eligible_exhausted_attempts(db) -> list[dict]:
 
 
 def eligibility_prompt(seed: dict, review: dict, trace_excerpt: str) -> str:
+    failures = list(review.get("failures") or [])[:3]
+    presented = "\n\n".join(
+        f"FAILURE {index}\nREVIEW: {json.dumps(item.get('review') or {}, sort_keys=True)}"
+        f"\nTRACE: {str(item.get('trace') or '')[-12000:]}"
+        for index, item in enumerate(failures)) or trace_excerpt[-12000:]
     return scrub_text(f"""You are deciding whether a failed agent trace is eligible for a
 narrow synthetic correction. Return ineligible unless the reasoning is already substantially correct
 and the only defect is missing an obvious tool call, an action clearly implied by the
 reasoning, or minor broken code. No refactoring, redesign, broad replanning, or invented work.
 Code edits must be small; one or two files may be added only when genuinely missing. The final
 correction must be thoroughly tested. If uncertain, return ineligible.
+Compare every presented failure and select the one requiring the smallest valid correction. Only
+one failure may be corrected. source_failure_index is its zero-based FAILURE number.
 Return only JSON with: eligible (boolean), reasoning_already_correct (boolean), minor_change
-(boolean), and repair_instructions (string). The instructions must identify only the minimal fix.
+(boolean), source_failure_index (integer), and repair_instructions (string). The instructions must
+identify only the minimal fix.
 
 TASK: {seed.get('prompt', '')}
-REJECTION: {json.dumps(review, sort_keys=True)}
-FAILED TRACE EXCERPT: {trace_excerpt[-12000:]}
+PRESERVED FAILURES:\n{presented}
 """)
 
 
-def validate_eligibility(verdict: dict | None) -> tuple[bool, str]:
+def validate_eligibility(verdict: dict | None, *,
+                         failure_count: int = 1) -> tuple[bool, str]:
     if not isinstance(verdict, dict):
         return False, "missing verdict"
+    index = verdict.get("source_failure_index")
     required = (verdict.get("eligible") is True
                 and verdict.get("reasoning_already_correct") is True
                 and verdict.get("minor_change") is True
+                and isinstance(index, int) and not isinstance(index, bool)
+                and 0 <= index < failure_count
                 and bool(str(verdict.get("repair_instructions") or "").strip()))
     return (True, "") if required else (False, "not narrowly eligible")
+
+
+def selected_failure(candidate: dict, verdict: dict) -> dict:
+    failures = candidate.get("failures") or []
+    valid, reason = validate_eligibility(verdict, failure_count=len(failures))
+    if not valid:
+        raise ValueError(reason)
+    return failures[int(verdict["source_failure_index"])]
 
 
 def _reasoning(messages: list[dict]) -> list[str]:
@@ -565,8 +584,11 @@ def run(*, dry_run: bool = False, config: dict | None = None,
             set_run_status(db, run_id, "failed", error)
             db.close()
             raise RuntimeError(error)
-        eligible, _ = validate_eligibility(eligibility.verdict)
+        eligible, _ = validate_eligibility(
+            eligibility.verdict, failure_count=len(candidate["failures"]))
         if eligible:
+            candidate["selected_failure_index"] = int(
+                eligibility.verdict["source_failure_index"])
             queue.pending.append(QueueItem(seed["id"], 1,
                 eligibility.verdict["repair_instructions"]))
         else:
@@ -578,7 +600,9 @@ def run(*, dry_run: bool = False, config: dict | None = None,
     while queue.pending:
         item = queue.pop()
         seed = seeds[item.seed_id]
-        source = Path(candidate_by_id[item.seed_id]["failures"][0]["artifact_path"])
+        candidate = candidate_by_id[item.seed_id]
+        selected = int(candidate["selected_failure_index"])
+        source = Path(candidate["failures"][selected]["artifact_path"])
         start_attempt(db, run_id, item.seed_id, item.attempt)
         review = correct_once(seed, runtime, judge, STORAGE_ROOT,
                               item.feedback or "", source)

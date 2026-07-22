@@ -211,12 +211,31 @@ def trace_state(max_attempts: int, *, target: set[str] | None = None,
         "SELECT DISTINCT j.seed_id FROM jobs j JOIN runs r ON r.id=j.run_id "
         "WHERE r.kind='trace' AND r.status='running' AND j.status='running' "
         "AND j.lease_expires_at IS NOT NULL AND j.lease_expires_at>?", (now(),))}
-    from run_state import trace_attempt_counts_for_current_seed_revision
+    from run_state import (trace_attempt_counts_for_current_seed_revision,
+                           trace_reasoning_efforts_for_current_seed_revision)
     attempts = trace_attempt_counts_for_current_seed_revision(db)
+    from common import CONFIG
+    trace_config = ((CONFIG.get("pipeline") or {}).get("trace") or {})
+    stepdown = bool(trace_config.get("step_down_reasoning_on_failure", True))
+    remaining = None
+    if stepdown:
+        from reasoning_stepdown import next_reasoning_stage, reasoning_schedule
+        effort = str((CONFIG.get("teacher") or {}).get("reasoning") or "max")
+        required = reasoning_schedule(max_attempts, True, effort)
+        remaining = {
+            seed_id for seed_id in ready - accepted - active
+            if next_reasoning_stage(
+                required,
+                trace_reasoning_efforts_for_current_seed_revision(db, seed_id))
+            is not None
+        }
     db.close()
     active &= ready - accepted
-    exhausted = {seed_id for seed_id in ready - accepted - active
-                 if attempts.get(seed_id, 0) >= max_attempts}
+    if remaining is None:
+        exhausted = {seed_id for seed_id in ready - accepted - active
+                     if attempts.get(seed_id, 0) >= max_attempts}
+    else:
+        exhausted = ready - accepted - active - remaining
     waiting = ready - accepted - active - exhausted
     return {"target": target, "accepted": accepted, "active": active,
             "exhausted": exhausted, "waiting": waiting,

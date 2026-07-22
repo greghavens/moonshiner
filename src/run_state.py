@@ -42,13 +42,17 @@ def connect(path: Path = DB_PATH) -> sqlite3.Connection:
       seed_id TEXT NOT NULL, number INTEGER NOT NULL, status TEXT NOT NULL,
       started_at TEXT NOT NULL, finished_at TEXT, teacher_usage_json TEXT,
       review_json TEXT, error TEXT,
-      artifact_path TEXT,
+      artifact_path TEXT, reasoning_stage TEXT, reasoning_effort TEXT,
       UNIQUE(run_id, seed_id, number)
     );
     """)
     columns={row[1] for row in db.execute("PRAGMA table_info(attempts)")}
     if "artifact_path" not in columns:
         db.execute("ALTER TABLE attempts ADD COLUMN artifact_path TEXT")
+    if "reasoning_stage" not in columns:
+        db.execute("ALTER TABLE attempts ADD COLUMN reasoning_stage TEXT")
+    if "reasoning_effort" not in columns:
+        db.execute("ALTER TABLE attempts ADD COLUMN reasoning_effort TEXT")
     run_columns={row[1] for row in db.execute("PRAGMA table_info(runs)")}
     if "model_calls" not in run_columns:
         db.execute("ALTER TABLE runs ADD COLUMN model_calls INTEGER NOT NULL DEFAULT 0")
@@ -189,9 +193,13 @@ def set_job(db, run_id: str, seed_id: str, status: str,
     db.commit()
 
 
-def start_attempt(db, run_id: str, seed_id: str, number: int) -> None:
-    db.execute("INSERT INTO attempts(run_id, seed_id, number, status, started_at) "
-               "VALUES (?, ?, ?, 'running', ?)", (run_id, seed_id, number, now()))
+def start_attempt(db, run_id: str, seed_id: str, number: int, *,
+                  reasoning_stage: str | None = None,
+                  reasoning_effort: str | None = None) -> None:
+    db.execute("INSERT INTO attempts(run_id, seed_id, number, status, started_at, "
+               "reasoning_stage, reasoning_effort) "
+               "VALUES (?, ?, ?, 'running', ?, ?, ?)",
+               (run_id, seed_id, number, now(), reasoning_stage, reasoning_effort))
     db.execute("UPDATE jobs SET attempts=?,updated_at=? WHERE run_id=? AND seed_id=?",
                (number, now(), run_id, seed_id))
     db.commit()
@@ -205,6 +213,33 @@ def finish_attempt(db, run_id: str, seed_id: str, number: int, status: str,
                (status, now(), json.dumps(usage or {}), json.dumps(review or {}),
                 error, artifact_path, run_id, seed_id, number))
     set_job(db, run_id, seed_id, status, number, error)
+
+
+def trace_reasoning_efforts_for_current_seed_revision(
+        db: sqlite3.Connection, seed_id: str) -> list[str]:
+    """Return recorded ordinary trace efforts for the current seed revision."""
+    rows = db.execute("""
+        SELECT a.reasoning_stage,a.reasoning_effort,a.artifact_path
+        FROM attempts a JOIN runs r ON r.id=a.run_id
+        WHERE r.kind='trace' AND a.seed_id=?
+          AND a.status IN ('accepted','retry','exhausted')
+          AND a.id > COALESCE((SELECT MAX(sa.id) FROM attempts sa
+            JOIN runs sr ON sr.id=sa.run_id WHERE sr.kind='seed'
+            AND sa.status='accepted' AND sa.seed_id=a.seed_id),0)
+        ORDER BY a.id""", (seed_id,)).fetchall()
+    efforts = []
+    for row in rows:
+        effort = row[0] or row[1]
+        if not effort and row[2]:
+            meta = Path(row[2]) / "meta.json"
+            try:
+                effort = (json.loads(meta.read_text()).get("teacher") or {}).get(
+                    "reasoning")
+            except (OSError, json.JSONDecodeError):
+                effort = None
+        if effort:
+            efforts.append(str(effort))
+    return efforts
 
 
 def summaries(db, run_id: str | None = None, *,

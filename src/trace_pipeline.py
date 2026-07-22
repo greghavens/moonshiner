@@ -23,6 +23,8 @@ from run_state import (connect, create_run, finish_attempt, set_job,
                        abandon_claim, claim_job, renew_lease, record_model_call)
 from runtimes import get_judge, get_teacher
 from screen_traces import feedback_from_review, screen
+from reasoning_stepdown import (native_effort, next_reasoning_stage,
+                                reasoning_schedule, runtime_for_stage)
 
 
 def _moonshiner_executable() -> str:
@@ -98,15 +100,27 @@ def _selected(args) -> list[dict]:
             JOIN runs sr ON sr.id=sa.run_id WHERE sr.kind='seed'
             AND sa.status='accepted' AND sa.seed_id=latest.seed_id
             AND sa.finished_at>=latest.updated_at)""")}
-    ledger.close()
     maximum = int(getattr(args, "max_attempts", 3))
+    trace_config = (CONFIG.get("pipeline", {}).get("trace") or {})
+    stepdown = bool(trace_config.get("step_down_reasoning_on_failure", True))
+    configured_effort = str((CONFIG.get("teacher") or {}).get("reasoning") or "max")
+    required = reasoning_schedule(maximum, stepdown, configured_effort)
+    from run_state import trace_reasoning_efforts_for_current_seed_revision
+
+    def has_remaining(seed_id: str) -> bool:
+        if not stepdown:
+            return attempts.get(seed_id, 0) < maximum
+        completed = trace_reasoning_efforts_for_current_seed_revision(ledger, seed_id)
+        return next_reasoning_stage(required, completed) is not None
+
     seeds = [seed for seed in select_seeds(only=only,
                                            categories=categories, tags=tags,
                                            name=getattr(args, "name", None))
              if synthetic_tool_contract(seed) is None
              and seed["id"] not in accepted
              and seed["id"] not in blocked
-             and attempts.get(seed["id"], 0) < maximum]
+             and has_remaining(seed["id"])]
+    ledger.close()
     retry_order = str((CONFIG.get("pipeline", {}).get("trace") or {})
                       .get("retry_order", "immediate"))
     if retry_order not in {"immediate", "tail"}:
@@ -184,6 +198,7 @@ def _run_individual_trace_jobs(seeds: list[dict], args, workers: int) -> int:
 def main(argv: list[str] | None = None) -> int:
     original_argv = list(argv or [])
     defaults = CONFIG.get("pipeline", {}).get("trace", {})
+    stepdown_enabled = bool(defaults.get("step_down_reasoning_on_failure", True))
     parser = argparse.ArgumentParser(
         prog="moonshiner run",
         description="Run the bounded trace quality loop with a durable ledger.")
@@ -230,6 +245,8 @@ def main(argv: list[str] | None = None) -> int:
              if j["status"] in {"pending","running","retry"}}
         prior_limits=json.loads(prior["limits_json"])
         seeds=select_seeds(only=ids); args.max_attempts=prior_limits["max_attempts"]
+        stepdown_enabled = bool(prior_limits.get(
+            "step_down_reasoning_on_failure", stepdown_enabled))
     else:
         seeds = _selected(args)
     if not seeds:
@@ -237,6 +254,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     teacher = get_teacher()
     judge = get_judge()
+    if stepdown_enabled:
+        for stage in dict.fromkeys(reasoning_schedule(
+                args.max_attempts, True, str(teacher.role.get("reasoning") or "max"))):
+            runtime_for_stage(teacher, stage)
     print(f"trace plan: {len(seeds)} seed(s), up to {args.max_attempts} attempt(s) "
           f"each; no run-wide model-call ceiling")
     print(f"  author: {teacher.name}/{teacher.role['model']} "
@@ -288,6 +309,7 @@ def main(argv: list[str] | None = None) -> int:
     judge.preflight(require_auth=True)
     ensure_publish_queue()
     limits = {"seeds": len(seeds), "max_attempts": args.max_attempts}
+    limits["step_down_reasoning_on_failure"] = stepdown_enabled
     retry_order = str(defaults.get("retry_order", "immediate"))
     if retry_order not in {"immediate", "tail"}:
         raise ValueError("pipeline.trace.retry_order must be immediate or tail")
@@ -326,10 +348,23 @@ def main(argv: list[str] | None = None) -> int:
     def process_claim(worker_db, owner: str, claim: dict, worker_teacher, worker_judge):
         seed = seed_by_id[claim["seed_id"]]
         number = claim["attempts"] + 1
-        if number > args.max_attempts:
+        configured_effort = str(worker_teacher.role.get("reasoning") or "max")
+        required_stages = reasoning_schedule(args.max_attempts, stepdown_enabled,
+                                             configured_effort)
+        from run_state import trace_reasoning_efforts_for_current_seed_revision
+        completed_stages = trace_reasoning_efforts_for_current_seed_revision(
+            worker_db, seed["id"])
+        stage = (next_reasoning_stage(required_stages, completed_stages)
+                 if stepdown_enabled else configured_effort)
+        if stage is None or (not stepdown_enabled and number > args.max_attempts):
             set_job(worker_db, run_id, seed["id"], "exhausted", claim["attempts"],
                     claim.get("last_error") or "attempt ceiling reached")
             return
+        effort = native_effort(worker_teacher.name, stage)
+        attempt_teacher = (runtime_for_stage(worker_teacher, stage)
+                           if stepdown_enabled else worker_teacher)
+        has_more = next_reasoning_stage(required_stages,
+                                        [*completed_stages, stage]) is not None
         from common import preflight_seed_environment, synthetic_tool_contract
         synthetic = synthetic_tool_contract(seed)
         if synthetic:
@@ -344,7 +379,6 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[infrastructure blocked] {seed['id']}: {environment_detail}",
                   flush=True)
             return
-        feedback = claim.get("last_error")
         @contextmanager
         def lease_heartbeat():
             stopped = threading.Event()
@@ -367,7 +401,8 @@ def main(argv: list[str] | None = None) -> int:
 
         with lease_heartbeat():
             if claim["attempts"] == 0 and existing_harness_trace(seed["id"]):
-                start_attempt(worker_db, run_id, seed["id"], number)
+                start_attempt(worker_db, run_id, seed["id"], number,
+                              reasoning_stage=stage, reasoning_effort=effort)
                 record_model_call(worker_db, run_id)
                 print(f"[{seed['id']}] existing harness trace: judge", flush=True)
                 review = screen(seed, worker_judge)
@@ -387,21 +422,22 @@ def main(argv: list[str] | None = None) -> int:
                 artifact = _archive_attempt(run_id, seed["id"], number)
                 reason = feedback_from_review(review)
                 finish_attempt(worker_db, run_id, seed["id"], number,
-                               "retry" if number < args.max_attempts else "exhausted",
+                               "retry" if has_more else "exhausted",
                                review=review, error=reason, artifact_path=artifact)
-                if number < args.max_attempts and retry_order == "tail":
+                if has_more and retry_order == "tail":
                     set_job(worker_db, run_id, seed["id"], "deferred", number, reason)
                 print(f"[rejected existing trace] {seed['id']}: {reason}", flush=True)
                 return
             record_model_call(worker_db, run_id)
-            start_attempt(worker_db, run_id, seed["id"], number)
-            print(f"[{seed['id']}] attempt {number}/{args.max_attempts}: author", flush=True)
-            record = trace_task(seed, worker_teacher, force=True, feedback=feedback)
+            start_attempt(worker_db, run_id, seed["id"], number,
+                          reasoning_stage=stage, reasoning_effort=effort)
+            print(f"[{seed['id']}] attempt {number} ({stage}): author", flush=True)
+            record = trace_task(seed, attempt_teacher, force=True)
         usage = (record.get("teacher") or {}).get("usage") or {}
         # Candidate checks are evidence for the trace judge, never a separate
         # rejection gate. Every completed candidate proceeds to judgment.
         record_model_call(worker_db, run_id)
-        print(f"[{seed['id']}] attempt {number}/{args.max_attempts}: judge", flush=True)
+        print(f"[{seed['id']}] attempt {number} ({stage}): judge", flush=True)
         with lease_heartbeat():
             review = screen(seed, worker_judge)
         if is_judge_error(review):
@@ -420,7 +456,7 @@ def main(argv: list[str] | None = None) -> int:
                            usage, review, artifact_path=artifact)
             print(f"[accepted] {seed['id']}", flush=True)
             return
-        status = "retry" if number < args.max_attempts else "exhausted"
+        status = "retry" if has_more else "exhausted"
         artifact = _archive_attempt(run_id, seed["id"], number)
         reason = feedback_from_review(review)
         finish_attempt(worker_db, run_id, seed["id"], number, status, usage,

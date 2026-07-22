@@ -45,6 +45,27 @@ def _coding_and_security():
 
 
 class Units(unittest.TestCase):
+    def test_card_discloses_enabled_first_success_stepdown_policy(self):
+        config = {
+            "publish": {}, "teacher": {"reasoning": "max"}, "judge": {},
+            "pipeline": {"trace": {
+                "max_attempts": 3,
+                "step_down_reasoning_on_failure": True,
+            }},
+        }
+        text = card.build_card(_coding_and_security(), config=config)
+        self.assertIn("Reasoning-effort step-down", text)
+        self.assertIn("xhigh → medium → low", text)
+        self.assertIn("first judge-accepted trace", text)
+        self.assertIn("lower-effort trace is retained", text)
+
+    def test_card_omits_stepdown_note_when_disabled(self):
+        config = {"publish": {}, "teacher": {"reasoning": "max"}, "judge": {},
+                  "pipeline": {"trace": {
+                      "step_down_reasoning_on_failure": False}}}
+        self.assertNotIn("Reasoning-effort step-down",
+                         card.build_card(_coding_and_security(), config=config))
+
     def test_catalog_never_publishes_full_distill_as_a_program(self):
         catalog = json.loads((_ROOT / "SEED_CATALOG.json").read_text())
         programs = {str(item.get("program") or "").casefold()

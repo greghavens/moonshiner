@@ -94,8 +94,31 @@ class SyntheticCorrectionContracts(unittest.TestCase):
         self.assertFalse(corrections.validate_eligibility(None)[0])
         self.assertFalse(corrections.validate_eligibility({"eligible": True})[0])
         valid = {"eligible": True, "reasoning_already_correct": True,
-                 "minor_change": True, "repair_instructions": "Make the missing call."}
-        self.assertTrue(corrections.validate_eligibility(valid)[0])
+                 "minor_change": True, "source_failure_index": 1,
+                 "repair_instructions": "Make the missing call."}
+        self.assertTrue(corrections.validate_eligibility(valid, failure_count=3)[0])
+
+    def test_eligibility_selects_one_of_three_failures_needing_least_correction(self):
+        failures = [
+            {"review": {"reason": "large"}, "trace": "attempt zero"},
+            {"review": {"reason": "one missing call"}, "trace": "attempt one"},
+            {"review": {"reason": "broken design"}, "trace": "attempt two"},
+        ]
+        prompt = corrections.eligibility_prompt(
+            {"id": "one", "prompt": "Do the task"}, {"failures": failures}, "")
+        self.assertIn("source_failure_index", prompt)
+        self.assertIn("smallest valid correction", prompt)
+        self.assertIn("FAILURE 0", prompt)
+        self.assertIn("FAILURE 2", prompt)
+        self.assertFalse(corrections.validate_eligibility({
+            "eligible": True, "reasoning_already_correct": True,
+            "minor_change": True, "source_failure_index": 3,
+            "repair_instructions": "fix"}, failure_count=3)[0])
+        verdict = {"eligible": True, "reasoning_already_correct": True,
+                   "minor_change": True, "source_failure_index": 1,
+                   "repair_instructions": "one missing call"}
+        self.assertEqual(corrections.selected_failure(
+            {"failures": failures}, verdict), failures[1])
 
     def test_outputs_are_isolated_from_primary(self):
         paths = corrections.correction_paths(self.root)

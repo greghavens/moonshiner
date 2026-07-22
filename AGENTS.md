@@ -81,9 +81,17 @@ These are explicit project-owner requirements and apply to every change:
   use the one existing formatter, validator, card generator, and publication
   queue but an explicit isolated companion-dataset target; they never enter or
   mutate the primary dataset.
-- A trace gets at most two total attempts for its one seed across every
-  resumption. Any limit applies only to that individual seed/trace. Starting a
-  new process must never reset the trace's lifetime count.
+- A trace gets only its configured per-seed maximum attempts across every
+  resumption (three by default). Any limit applies only to that individual
+  seed/trace. Starting a new process must never reset the trace's lifetime
+  history or repeat a completed reasoning-effort attempt.
+- Ordinary trace attempts use the configurable reasoning-effort step-down by
+  default: xhigh, then medium, then low, repeating that cycle only when the
+  configured per-trace maximum exceeds three. Each attempt is conditional on
+  rejection of the preceding attempt; the first judge-accepted trace ends the
+  lifecycle. Judge feedback is recorded but never changes the ordinary trace
+  prompt. Synthetic correction remains an independently enabled action after
+  ordinary attempts are exhausted.
 - Valid distillation work has no queue-wide, batch-wide, session-wide, or
   run-wide model-call ceiling.
 - Never stop, cancel, restart, pause, or interrupt an in-flight model call or

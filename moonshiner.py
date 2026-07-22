@@ -266,6 +266,7 @@ def _config(argv: list[str]) -> int:
     value = parse_value(args.value)
     bounded = {"pipeline.trace.workers": (1, 64),
                "pipeline.seed.workers": (1, 64),
+               "pipeline.trace.max_attempts": (1, 1000),
                "publish.batch_size": (1, 1000)}
     if args.key in bounded:
         low, high = bounded[args.key]
@@ -273,6 +274,8 @@ def _config(argv: list[str]) -> int:
             parser.error(f"{args.key} must be an integer from {low} through {high}")
     if args.key == "pipeline.trace.retry_order" and value not in {"immediate", "tail"}:
         parser.error("pipeline.trace.retry_order must be immediate or tail")
+    if args.key == "pipeline.trace.step_down_reasoning_on_failure" and not isinstance(value, bool):
+        parser.error("pipeline.trace.step_down_reasoning_on_failure must be true or false")
     if args.key == "synthetic_corrections.max_attempts" and (
             isinstance(value, bool) or not isinstance(value, int) or value < 1):
         parser.error("synthetic_corrections.max_attempts must be a positive integer")
@@ -380,7 +383,11 @@ def _setup(argv: list[str] | None = None) -> int:
     if workflow == "trace-only" and not hf_dataset:
         raise SystemExit("A trace-only project needs its existing Hugging Face dataset")
     trace_workers = int(_ask("Parallel trace workers", "2")) if args.reconfigure else 2
-    trace_attempts = int(_ask("Maximum attempts per individual trace", "2")) if args.reconfigure else 2
+    trace_attempts = int(_ask("Maximum attempts per individual trace", "3")) if args.reconfigure else 3
+    trace_stepdown = (_ask("Step down trace reasoning after rejection (yes/no)", "yes")
+                      .strip().lower() if args.reconfigure else "yes")
+    if trace_stepdown not in {"yes", "no"}:
+        raise SystemExit("Trace reasoning step-down must be yes or no")
     publish_batch = int(_ask("Upload after this many accepted traces", "10")) if args.reconfigure else 10
     publish_format = (_ask(
         "Hugging Face publication format (jsonl, jsonl-hf-parquet, or parquet-shards)",
@@ -416,6 +423,8 @@ def _setup(argv: list[str] | None = None) -> int:
     update_local("pipeline.queues.tracing", True)
     update_local("pipeline.trace.workers", trace_workers)
     update_local("pipeline.trace.max_attempts", trace_attempts)
+    update_local("pipeline.trace.step_down_reasoning_on_failure",
+                 trace_stepdown == "yes")
     update_local("publish.batch_size", publish_batch)
     update_local("publish.format", publish_format)
     update_local("publish.hf_dataset", hf_dataset or None)
