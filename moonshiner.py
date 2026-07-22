@@ -345,12 +345,14 @@ def _setup(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv or [])
     from configuration import load_config, update_local
     config = load_config()
-    from runtimes import runtime_names
-    harnesses = runtime_names()
+    from runtimes import runtime_names, source_runtime_names
+    judge_harnesses = runtime_names()
+    source_harnesses = source_runtime_names()
     print("Welcome to Moonshiner. Let's set it up.\n")
     choices = []
     roles = (("Trace author", "teacher"), ("Trace judge", "judge")) if args.reconfigure else (("Trace author", "teacher"),)
     for label, key in roles:
+        harnesses = judge_harnesses if key == "judge" else source_harnesses
         current = config[key]
         current_runtime = current["runtime"]
         default_harness = "pi" if current_runtime.startswith("pi") else current_runtime

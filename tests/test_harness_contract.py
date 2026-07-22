@@ -13,12 +13,25 @@ sys.path.insert(0, str(ROOT / "src"))
 import generate_traces  # noqa: E402
 import seed_pipeline  # noqa: E402
 import trace_pipeline  # noqa: E402
-from runtimes import REGISTRY, runtime_names  # noqa: E402
+from runtimes import (REGISTRY, get_judge, get_seed_author, get_teacher,
+                      runtime_names, source_runtime_names)  # noqa: E402
 
 
 class HarnessContract(unittest.TestCase):
     def test_current_supported_trace_harnesses_are_explicit(self):
         self.assertEqual(set(runtime_names()), {"claude-code", "codex", "pi"})
+        self.assertEqual(set(source_runtime_names()), {"codex", "pi"})
+
+    def test_claude_code_is_judge_only(self):
+        config = {"teacher": {"runtime": "claude-code", "model": "claude"},
+                  "judge": {"runtime": "claude-code", "model": "claude"},
+                  "seed_author": {"runtime": "claude-code", "model": "claude"},
+                  "runtimes": {"claude-code": {}}}
+        with self.assertRaisesRegex(SystemExit, "judge-only"):
+            get_teacher(config)
+        with self.assertRaisesRegex(SystemExit, "judge-only"):
+            get_seed_author(config)
+        self.assertEqual(get_judge(config).name, "claude-code")
 
     def test_pipeline_calls_the_selected_runtime_adapter(self):
         source = inspect.getsource(generate_traces.trace_task)

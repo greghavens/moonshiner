@@ -12,7 +12,7 @@ from runtimes.base import ReviewResult, Runtime, TraceResult
 
 __all__ = ["Runtime", "TraceResult", "ReviewResult", "REGISTRY",
            "get_runtime", "get_teacher", "get_judge", "get_seed_author",
-           "get_seed_judge", "runtime_names"]
+           "get_seed_judge", "runtime_names", "source_runtime_names"]
 
 
 def _build_registry() -> dict[str, type[Runtime]]:
@@ -27,6 +27,11 @@ REGISTRY = _build_registry()
 
 def runtime_names() -> list[str]:
     return sorted(REGISTRY)
+
+
+def source_runtime_names() -> list[str]:
+    """Runtimes allowed to author seeds or produce training traces."""
+    return sorted(name for name in REGISTRY if name != "claude-code")
 
 
 def get_runtime(role: str, config: dict | None = None) -> Runtime:
@@ -47,7 +52,10 @@ def get_runtime(role: str, config: dict | None = None) -> Runtime:
 
 
 def get_teacher(config: dict | None = None) -> Runtime:
-    return get_runtime("teacher", config)
+    runtime = get_runtime("teacher", config)
+    if runtime.name == "claude-code":
+        raise SystemExit("claude-code is judge-only and cannot produce trace sources")
+    return runtime
 
 
 def get_judge(config: dict | None = None) -> Runtime:
@@ -55,7 +63,10 @@ def get_judge(config: dict | None = None) -> Runtime:
 
 
 def get_seed_author(config: dict | None = None) -> Runtime:
-    return get_runtime("seed_author", config)
+    runtime = get_runtime("seed_author", config)
+    if runtime.name == "claude-code":
+        raise SystemExit("claude-code is judge-only and cannot author seeds")
+    return runtime
 
 
 def get_seed_judge(config: dict | None = None) -> Runtime:

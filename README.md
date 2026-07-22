@@ -36,7 +36,11 @@ Moonshiner asks:
 - the Hugging Face dataset target, when publishing is enabled.
 - the Hugging Face publication format when changing advanced setup choices.
 
-Codex and Claude Code can use their existing login sessions. Pi is a harness, so Moonshiner asks which provider Pi should call and configures the matching endpoint, protocol, model, and credential.
+Trace and seed sources may use Pi or Codex. Claude Code is supported only as a
+judge because its native trace output does not expose readable reasoning text.
+Codex and Claude Code can use their existing login sessions. Pi is a harness,
+so Moonshiner asks which provider Pi should call and configures the matching
+endpoint, protocol, model, and credential.
 
 After setup, `moonshiner` starts every enabled queue for that project. Seed authoring, tracing, judging, retries, formatting, privacy checks, local append-only storage, and Hugging Face publication continue independently. Active model calls are allowed to finish.
 
