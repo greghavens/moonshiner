@@ -937,6 +937,8 @@ CREATE TRAINING DATA
                               Inspect token, category, tag, and behavior mix
   moonshiner dataset readiness --source PATH
                               Report training risks without blocking work
+  moonshiner maintenance prune-hf-history --keep 10
+                              Preview removal of old Hugging Face LFS history
 
 AUTHOR SEEDS
   moonshiner seed run --id NAME --brief "WHAT TO BUILD" --yes
@@ -1011,6 +1013,13 @@ def main(argv: list[str] | None = None) -> int:
         return _service(rest)
     if command == "update":
         return _update(rest)
+    if command == "maintenance":
+        if not rest or rest[0] != "prune-hf-history":
+            print("usage: moonshiner maintenance prune-hf-history [--keep N] [--yes]",
+                  file=sys.stderr)
+            return 2
+        from hf_history_maintenance import main as maintenance_main
+        return maintenance_main(rest[1:])
     if command == "inspect":
         return _status(rest, inspect=True)
     if command == "auth":

@@ -191,6 +191,25 @@ canonical JSONL locally.
 
 These settings are reread between work items. Reducing concurrency does not cancel active model calls.
 
+Hugging Face keeps old LFS objects in repository history. To preview an
+occasional history cleanup while retaining the newest 10 complete, distinct
+dataset snapshots:
+
+```bash
+moonshiner maintenance prune-hf-history --keep 10
+```
+
+The preview lists every retained snapshot and the exact amount eligible for
+deletion. After reviewing it, run the permanent history rewrite explicitly:
+
+```bash
+moonshiner maintenance prune-hf-history --keep 10 --yes
+```
+
+This maintenance action is never automatic. It refuses incomplete snapshots
+and repositories with user-managed tags, pull requests, or branches besides
+`main`, and it lets an active publish finish before rewriting history.
+
 ## Synthetic corrections companion
 
 Synthetic corrections are optional and disabled by default. They are intended

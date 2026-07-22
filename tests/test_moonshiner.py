@@ -16,6 +16,9 @@ import run_state  # noqa: E402
 
 
 class FrontDoor(unittest.TestCase):
+    def test_help_exposes_manual_hf_history_maintenance(self):
+        self.assertIn("maintenance prune-hf-history --keep 10", m._help())
+
     def test_trace_stepdown_default_is_enabled_and_trace_only(self):
         config = json.loads((_ROOT / "config.json").read_text())
         self.assertTrue(config["pipeline"]["trace"][
