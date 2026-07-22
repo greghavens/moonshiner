@@ -70,7 +70,7 @@ moonshiner config show
 Configure a role directly:
 
 ```bash
-moonshiner config role trace-author pi anthropic/claude-fable-5 max
+moonshiner config role trace-author pi PROVIDER/MODEL REASONING
 ```
 
 ```bash

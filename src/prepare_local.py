@@ -8,10 +8,10 @@ NO length filtering: every cumulative next-step row is rendered and kept. Token
 length percentiles are REPORTED so the training run can pick its ``max_seq`` —
 that decision is the user's, not this script's.
 
-The base model and output directory default to ``config.student``. Run inside the
-finetune conda env (needs transformers + HF access):
+The base model comes from ``--model`` or ``config.student.base_model``. Run inside
+an environment with transformers and Hugging Face access:
   python3 src/expand_next_steps.py
-  conda run -n nemotron-ft python src/prepare_local.py
+  python src/prepare_local.py --model OWNER/MODEL
 """
 from __future__ import annotations
 
@@ -29,12 +29,13 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data", default=str(DATA / "next_step"))
     parser.add_argument("--out", default=os.path.expanduser(
-        student.get("output_dir", "~/nemotron-super-finetune/data-moonshiner")))
-    parser.add_argument("--model", default=student.get(
-        "base_model", "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B"))
+        student.get("output_dir") or str(DATA / "trainer-ready")))
+    parser.add_argument("--model", default=student.get("base_model"))
     parser.add_argument("--trust-remote-code", action="store_true",
                         help="Explicitly allow model repository Python code.")
     args = parser.parse_args()
+    if not args.model:
+        parser.error("--model is required when config.student.base_model is unset")
 
     from transformers import AutoTokenizer  # deferred: heavy, env-specific
     tokenizer = AutoTokenizer.from_pretrained(

@@ -44,7 +44,7 @@ class Phase:
 PHASES: tuple[Phase, ...] = (
     Phase("import", 1, "Import seed corpus (canonical + fallback)",
           "import_seeds"),
-    Phase("sec-import", 1.1, "Import fable-secure security cases (catalog + keys)",
+    Phase("sec-import", 1.1, "Import configured security cases (catalog + keys)",
           "import_security_cases", optional=True),
     Phase("sec-fetch", 1.2, "Hydrate the pinned security-review repositories",
           "fetch_security_corpus", optional=True),
@@ -332,7 +332,8 @@ def _setup(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv or [])
     from configuration import load_config, update_local
     config = load_config()
-    harnesses = ["pi", "codex", "claude-code"]
+    from runtimes import runtime_names
+    harnesses = runtime_names()
     print("Welcome to Moonshiner. Let's set it up.\n")
     choices = []
     roles = (("Trace author", "teacher"), ("Trace judge", "judge")) if args.reconfigure else (("Trace author", "teacher"),)
@@ -350,8 +351,9 @@ def _setup(argv: list[str] | None = None) -> int:
         runtime = harness
         if harness == "pi":
             runtime, _ = _configure_pi_provider(config, current_runtime)
-        model = (_ask(f"{label} model", current["model"])
-                 if args.reconfigure else current["model"])
+        model = _ask(f"{label} model ID", str(current.get("model") or ""))
+        if not model:
+            raise SystemExit("A model ID is required")
         reasoning = str(current.get("reasoning") or "default")
         choices.append((key, runtime, model, reasoning))
 
@@ -403,13 +405,23 @@ def _setup(argv: list[str] | None = None) -> int:
     update_local("publish.hf_dataset", hf_dataset or None)
     update_local("publish.private", False)
     teacher_model = choices[0][2]
-    display = "Kimi K3" if "kimi-k3" in teacher_model.lower() else (
-        "Fable 5" if "fable-5" in teacher_model.lower() else teacher_model.rsplit("/", 1)[-1])
+    from model_profile import build as build_model_profile
+    aliases = []
+    display_override = None
+    banner_source = None
+    if args.reconfigure:
+        display_override = _ask("Model display name", "") or None
+        aliases = [value.strip() for value in
+                   _ask("Attestation aliases (comma-separated, blank for none)", "").split(",")]
+        banner_source = _ask("Banner asset path", "assets/moonshiner-dataset-banner.png")
+    profile = build_model_profile(teacher_model, display=display_override,
+                                  aliases=aliases, banner_source=banner_source)
+    update_local("model_profile", profile)
+    display = profile["display_name"]
     update_local("publish.model_display", display)
     update_local("publish.pretty_name",
-                 f"{display} Coding, Tool Use & Instruction Following Traces")
-    if display == "Kimi K3":
-        update_local("publish.banner_source", "assets/kimi-k3-dataset-banner.png")
+                 f"{display} Agent Traces")
+    update_local("publish.banner_source", profile["banner_source"])
     os.environ["MOONSHINER_HOME"] = str(PROJECT_STATE)
 
     # Ask for provider keys only when the chosen runtime actually uses one.
@@ -447,7 +459,7 @@ def _setup(argv: list[str] | None = None) -> int:
             npm = shutil.which("npm")
             if not npm:
                 raise SystemExit("The selected Pi runtime needs Node.js 22 or newer. Install Node.js, then run `moonshiner` again.")
-            version = config["runtimes"]["pi"].get("runtime_version", "0.80.7")
+            version = config["runtimes"]["pi"].get("managed_runtime_version", "0.80.7")
             print(f"Installing the Pi runtime {version}…")
             data_home = Path(os.environ.get("XDG_DATA_HOME",
                                              Path.home() / ".local" / "share"))
@@ -490,7 +502,7 @@ def _ensure_configured_pi() -> None:
     npm = shutil.which("npm")
     if not npm:
         raise SystemExit("Pi requires Node.js 22 or newer")
-    version = profile.get("runtime_version") or "0.80.7"
+    version = profile.get("managed_runtime_version") or "0.80.7"
     print(f"Installing the Pi runtime {version}…")
     subprocess.run([npm, "install", "--no-audit", "--no-fund", "--prefix",
                     str(prefix), f"@earendil-works/pi-coding-agent@{version}"],

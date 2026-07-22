@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Unattended sol-code -> moonshiner seed sync.
+# Unattended configured-source -> Moonshiner seed sync.
 #
 # Runs from the seed-sync.timer systemd user unit (every 5 minutes, survives
 # reboots via loginctl linger); also safe to run by hand. Canonical unit
@@ -11,7 +11,7 @@
 #   loginctl enable-linger "$USER"
 #
 # Per run:
-#   - A seed present in sol-code/tasks/seeds but not here is copied only after
+#   - A seed present in the configured source but not here is copied only after
 #     two consecutive runs observe an identical content snapshot, so a seed
 #     the authoring pipeline is still writing is never taken half-done.
 #   - Copies are gated behind scripts/check.sh. Green: committed with the
@@ -19,7 +19,7 @@
 #     committed, the unit fails visibly, and the next tick re-copies fresh.
 #   - A failed push (offline; keyring still locked right after boot) leaves
 #     the commit local and is retried on every subsequent run.
-#   - sol-code is strictly read-only.
+#   - The configured source is strictly read-only.
 set -euo pipefail
 
 SRC=${MOONSHINER_SEED_SOURCE:-}
@@ -107,9 +107,8 @@ if [ "${#copy[@]}" -gt 0 ]; then
     for name in "${copy[@]}"; do paths+=("tasks/seeds/$name"); done
     git add -- "${paths[@]}"
     git commit \
-      -m "Bring in ${#copy[@]} new seed${plural} from sol-code: $names" \
-      -m "Direct copy from ../sol-code/tasks/seeds (sol-code version, as intended), via the seed-sync systemd timer. Corpus $before -> $after; check.sh green." \
-      -m "Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>" \
+      -m "Bring in ${#copy[@]} new seed${plural} from configured source: $names" \
+      -m "Reviewed copy from the configured seed source via the seed-sync service. Corpus $before -> $after; check.sh green." \
       -- "${paths[@]}"
     echo "committed ${#copy[@]} seed(s): $names"
   else

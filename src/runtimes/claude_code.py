@@ -2,7 +2,7 @@
 
 The teacher streams ``stream-json`` events; the ``system/init`` event carries the
 model actually loaded, which we compare against the requested model for
-attestation. A Fable safeguard refusal (``model_refusal_no_fallback``) is not a
+attestation. A model safeguard refusal (``model_refusal_no_fallback``) is not a
 generation we want to distill and not a failure to retry blindly, so it is
 surfaced as ``safeguard_refusal`` for the caller to defer. Multi-turn seeds use
 ``--input-format stream-json --replay-user-messages``; seed-scoped MCP tools use
@@ -119,7 +119,7 @@ class ClaudeCodeRuntime(Runtime):
         block = availability.record_block(self.name, stderr, "claude-teacher-stderr")
 
         model_fallback = bool(meta["observed_model"]
-                              and meta["observed_model"] != self.role["model"])
+                              and not self.model_matches(meta["observed_model"]))
         return TraceResult(
             raw_path=events_path,
             trace_format="claude-stream-json",
@@ -224,7 +224,7 @@ class ClaudeCodeRuntime(Runtime):
             timed_out=timed_out,
             duration_s=duration,
             observed_model=meta["observed_model"],
-            model_attested=meta["observed_model"] == self.role["model"],
+            model_attested=self.model_matches(meta["observed_model"]),
         )
 
     def _final_text(self, stdout: str) -> str:

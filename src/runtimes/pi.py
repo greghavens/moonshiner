@@ -117,6 +117,7 @@ class PiRuntime(Runtime):
         if shutil.which("bwrap") is None:
             raise SystemExit("bwrap (bubblewrap) required for the pi sandbox")
         version = self._runtime_version(cli)
+        self._observed_runtime_version = version
         pinned = self.runtime_config.get("runtime_version")
         if pinned and version and version != pinned:
             raise SystemExit(f"pi version {version} != pinned {pinned}")
@@ -302,7 +303,10 @@ class PiRuntime(Runtime):
         compact_events_file(events_path)
         stderr_path.write_text(stderr)
         meta = _parse_stream_meta(stdout)
-        attested = _model_attested(self.role["model"], meta, audit)
+        profile = self.config.get("model_profile") or {}
+        aliases = ((profile.get("attestation_aliases") or [])
+                   if profile.get("id") == self.role["model"] else [])
+        attested = _model_attested(self.role["model"], meta, audit, aliases)
         # Retain the project-local runtime/session directory for audit and
         # reproducibility. It contains only the proxy dummy credential; the
         # real provider key never enters the sandbox.
@@ -324,7 +328,8 @@ class PiRuntime(Runtime):
                 "provider": self.runtime_config.get("display_provider")
                     or self._provider(),
                 "runtime": self.runtime_config.get("runtime", "pi-coding-agent"),
-                "runtime_version": self.runtime_config.get("runtime_version"),
+                "runtime_version": getattr(self, "_observed_runtime_version", None)
+                    or self.runtime_config.get("runtime_version"),
                 "pi_observed_models": meta["observed_models"],
                 "upstream_response_models": audit["response_models"],
                 "upstream_audit": audit,
@@ -451,10 +456,14 @@ def _parse_stream_meta(text: str) -> dict:
             "usage": usage, "error": error, "stream_success": stream_success}
 
 
-def _model_attested(expected: str, meta: dict, audit: dict) -> bool:
-    pi_ok = expected in meta.get("observed_models", [])
-    upstream_ok = audit.get("had_success") and expected in audit.get(
-        "response_models", [])
+def _model_attested(expected: str, meta: dict, audit: dict,
+                    aliases: list[str] | None = None) -> bool:
+    from model_profile import matches
+    pi_ok = any(matches(expected, value, aliases)
+                for value in meta.get("observed_models", []))
+    upstream_ok = audit.get("had_success") and any(
+        matches(expected, value, aliases)
+        for value in audit.get("response_models", []))
     return bool(pi_ok and upstream_ok)
 
 

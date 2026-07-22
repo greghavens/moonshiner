@@ -159,7 +159,7 @@ class CodexRuntime(Runtime):
             stream_success=bool(messages) and not error and not timed_out,
             observed_model=observed_model,
             observed_models=observed_models,
-            model_attested=self.role["model"] in observed_models,
+            model_attested=any(self.model_matches(model) for model in observed_models),
             usage=usage,
             error=error,
             unavailable=(f"codex usage limit until {block['retry_at']}"
@@ -253,7 +253,7 @@ class CodexRuntime(Runtime):
             timed_out=timed_out,
             duration_s=duration,
             observed_model=observed_model,
-            model_attested=self.role["model"] in observed_models,
+            model_attested=any(self.model_matches(model) for model in observed_models),
             error=event_error or (stderr.strip() if return_code not in (0, None) else None),
         )
 

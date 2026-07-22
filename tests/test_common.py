@@ -97,15 +97,16 @@ class LoadSeeds(unittest.TestCase):
         self.assertEqual(observed, sorted(observed))
 
     def test_holdout_excluded_by_default(self):
-        holdout = set(common.CONFIG.get("holdout_tasks", []))
-        self.assertTrue(holdout, "config should declare holdout tasks")
-        ids = {seed["id"] for seed in common.load_seeds()}
-        self.assertFalse(ids & holdout)
+        seed_id = common.load_seeds(include_holdout=True)[0]["id"]
+        with mock.patch.dict(common.CONFIG, {"holdout_tasks": [seed_id]}):
+            ids = {seed["id"] for seed in common.load_seeds()}
+        self.assertNotIn(seed_id, ids)
 
     def test_holdout_included_with_flag(self):
-        holdout = set(common.CONFIG.get("holdout_tasks", []))
-        ids = {seed["id"] for seed in common.load_seeds(include_holdout=True)}
-        self.assertTrue(holdout <= ids)
+        seed_id = common.load_seeds(include_holdout=True)[0]["id"]
+        with mock.patch.dict(common.CONFIG, {"holdout_tasks": [seed_id]}):
+            ids = {seed["id"] for seed in common.load_seeds(include_holdout=True)}
+        self.assertIn(seed_id, ids)
 
     def test_seeds_carry_one_source_path_and_only_filter(self):
         seeds = common.load_seeds()

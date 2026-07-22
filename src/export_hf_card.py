@@ -48,8 +48,10 @@ ATTRIBUTION = (
 
 def _banner_source() -> Path:
     """Resolve this project's configured banner while keeping one Hub filename."""
-    configured = str((CONFIG.get("publish") or {}).get(
-        "banner_source") or "assets/moonshiner-dataset-banner.png")
+    profile = CONFIG.get("model_profile") or {}
+    configured = str((CONFIG.get("publish") or {}).get("banner_source")
+                     or profile.get("banner_source")
+                     or "assets/moonshiner-dataset-banner.png")
     path = Path(configured).expanduser()
     return path if path.is_absolute() else ROOT / path
 
@@ -163,11 +165,8 @@ def _human_size(size: int) -> str:
 
 
 def _display_model(model_id: str) -> str:
-    """`moonshotai/kimi-k3` -> `Kimi K3` for the human-facing title."""
-    tail = (model_id or "").split("/")[-1]
-    return " ".join(word.upper() if word.isdigit() or len(word) <= 2
-                    else word.capitalize()
-                    for word in tail.replace("_", "-").split("-")) or model_id
+    from model_profile import display_name
+    return display_name(model_id)
 
 
 def _capability_seed_ids() -> set[str]:
@@ -368,13 +367,13 @@ def build_card(rows: list[dict], *, stage: str = "release") -> str:
     reasoning = teacher.get("reasoning", "max")
     judge_model = judge.get("model", "an independent reviewer")
     judge_runtime = judge.get("runtime", "codex")
-    model_display = publish.get("model_display") or _display_model(teacher_model)
+    profile = CONFIG.get("model_profile") or {}
+    model_display = (publish.get("model_display")
+                     or (profile.get("display_name")
+                         if profile.get("id") == teacher_model else None)
+                     or _display_model(teacher_model))
 
-    default_pretty = (f"{model_display} Coding, Tool Use & Instruction Following Traces"
-                      if instruction_trajectories else
-                      f"{model_display} Coding & Defensive-Security Agent Traces"
-                      if has_security
-                      else f"{model_display} Coding & Debugging Agent Traces")
+    default_pretty = f"{model_display} Agent Traces"
     pretty_name = publish.get("pretty_name") or default_pretty
     license_id = publish.get("license") or "cc-by-4.0"
     hub_id = publish.get("hf_dataset") or "<namespace>/<dataset>"
@@ -552,11 +551,10 @@ def build_card(rows: list[dict], *, stage: str = "release") -> str:
 
 {ATTRIBUTION}
 
-Behavior-preserving **instruction-following, tool-calling, coding, and debugging
-trajectories** from **{model_display}** (`{teacher_model}`). The corpus combines
-autonomous software-engineering sessions with non-code scenarios covering
-parallel and dependent tool calls, multi-turn state, clarification, precise
-constraints, error recovery, memory, research, and grounded completion.
+Behavior-preserving **instruction-following, tool-use, and agent trajectories**
+from **{model_display}** (`{teacher_model}`). The category and row-share tables
+below describe the actual mix seen during training rather than assuming a
+particular task domain.
 
 **This is an actively growing dataset. More is coming**: additional training
 programs and substantially more sessions will be added to this same repo.

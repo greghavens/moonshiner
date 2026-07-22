@@ -182,7 +182,9 @@ class Card(unittest.TestCase):
         text = card.build_card(coding)
         self.assertNotIn("question-answering", text)
         self.assertNotIn("Authorization scope", text)
-        self.assertIn("Coding & Debugging", text)
+        self.assertIn("Claude Fable 5 Agent Traces", text)
+        self.assertIn("| Build |", text)
+        self.assertIn("| Debug |", text)
 
     def test_banner_and_numbers_are_directly_below_title(self):
         for text in (self.card, card.build_card([], stage="preview")):

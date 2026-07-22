@@ -68,6 +68,13 @@ class Runtime(abc.ABC):
         self.role = role_config
         self.runtime_config = config.get("runtimes", {}).get(self.name, {})
 
+    def model_matches(self, observed: str | None) -> bool:
+        from model_profile import matches
+        profile = self.config.get("model_profile") or {}
+        aliases = ((profile.get("attestation_aliases") or [])
+                   if profile.get("id") == self.role.get("model") else [])
+        return matches(str(self.role.get("model") or ""), observed, aliases)
+
     @staticmethod
     def require_persistent_workspace(workspace: Path) -> Path:
         """Refuse to launch any model inside an ephemeral temp directory."""

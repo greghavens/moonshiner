@@ -25,21 +25,26 @@ class FrontDoor(unittest.TestCase):
                  mock.patch.object(configuration, "update_local",
                                    side_effect=lambda key, value: updates.__setitem__(key, value)), \
                  mock.patch.object(m, "_ask",
-                                   side_effect=["openrouter", "owner/kimi-data"]) as ask, \
+                                   side_effect=["openrouter", "acme/orion-7b",
+                                                "owner/orion-data"]) as ask, \
                  mock.patch.object(m.getpass, "getpass", return_value="secret"), \
                  mock.patch.object(m.shutil, "which", return_value="/usr/bin/pi"), \
                  mock.patch("common.key_env_name", return_value="OPENROUTER_API_KEY"), \
                  mock.patch("common.key_persist_path", return_value=key_path), \
                  mock.patch("import_existing.main", return_value=0) as resume:
                 self.assertEqual(m._setup([]), 0)
-        self.assertEqual(ask.call_count, 2)
+        self.assertEqual(ask.call_count, 3)
         self.assertFalse(updates["pipeline.queues.seed_authoring"])
         self.assertTrue(updates["pipeline.queues.tracing"])
         self.assertEqual(updates["pipeline.trace.workers"], 2)
         self.assertEqual(updates["pipeline.trace.max_attempts"], 2)
         self.assertEqual(updates["publish.batch_size"], 10)
         self.assertEqual(updates["judge.runtime"], "codex")
-        resume.assert_called_once_with(["--hf", "owner/kimi-data"])
+        self.assertEqual(updates["teacher.model"], "acme/orion-7b")
+        self.assertEqual(updates["model_profile"]["display_name"], "Orion 7B")
+        self.assertNotIn("Kimi", json.dumps(updates))
+        self.assertNotIn("Fable", json.dumps(updates))
+        resume.assert_called_once_with(["--hf", "owner/orion-data"])
 
     def test_help_leads_with_normal_jobs_not_phases(self):
         text = m._help()
@@ -82,7 +87,7 @@ class FrontDoor(unittest.TestCase):
     def test_normal_start_provisions_missing_pi_in_stable_user_toolchain(self):
         config = {"teacher": {"runtime": "pi-openrouter"},
                   "runtimes": {"pi-openrouter": {"cli": "pi",
-                                                   "runtime_version": "1.2.3"}}}
+                                                   "managed_runtime_version": "1.2.3"}}}
         completed = mock.Mock(returncode=0)
         with tempfile.TemporaryDirectory() as directory, \
              mock.patch.object(configuration, "load_config", return_value=config), \

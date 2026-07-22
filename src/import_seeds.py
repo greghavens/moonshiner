@@ -5,10 +5,10 @@ The moonshiner seed corpus is tracked in-tree under ``tasks/seeds``. Rather than
 author seeds here, we take the latest vetted corpus from a canonical source and,
 where the canonical seed is missing or broken, from a fallback source.
 
-  * ``config.source.seed_repository``  — the CANONICAL source (default
-    ``../fable-code``). Its version of a seed wins whenever it is complete.
-  * ``config.source.fallback_repository`` — an optional FALLBACK source (e.g.
-    ``../sol-code``). Used only for a seed the canonical source lacks or left
+  * ``config.source.seed_repository`` — an optional canonical external source.
+    Without one, the bundled corpus is canonical.
+  * ``config.source.fallback_repository`` — an optional fallback source. Used
+    only for a seed the canonical source lacks or left
     incomplete (an authoring agent that died mid-write, a safeguard-rejected
     stub). This encodes the rule "canonical unless it is off, then fall back".
 
@@ -48,8 +48,8 @@ def seeds_dir(repo: str) -> Path:
 
 def source_seeds_dir(source: str | None = None) -> Path:
     """The canonical source ``tasks/seeds`` directory (config or override)."""
-    repo = source or CONFIG.get("source", {}).get("seed_repository", "../fable-code")
-    return seeds_dir(repo)
+    repo = source or CONFIG.get("source", {}).get("seed_repository")
+    return seeds_dir(repo) if repo else ROOT / "tasks" / "seeds"
 
 
 def seed_complete(directory: Path) -> str | None:
