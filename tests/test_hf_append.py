@@ -94,8 +94,7 @@ class TaskKeyedExport(unittest.TestCase):
                 "provider": "openrouter", "reasoning_effort": "max",
                 "model_attested": True, "observed_models": ["acme/old"],
                 "trace_format": "native", "n_messages": 1,
-                "messages": [{"role": "assistant", "content": "old"}],
-                "tools": "[]"}) + "\n")
+                "messages": [{"role": "assistant", "content": "old"}]}) + "\n")
             full = root / "full"; full.mkdir()
             record = {"meta": {"task": "new", "lang": "en",
                 "category": "tool-calling", "teacher_runtime": "pi",
@@ -114,6 +113,7 @@ class TaskKeyedExport(unittest.TestCase):
             self.assertEqual(list(rows[0]), list(rows[1]))
             self.assertEqual(rows[1]["task"], "new")
             self.assertNotIn("assistant_step", rows[1])
+            self.assertNotIn("tools", rows[1])
             with mock.patch.object(validate_hf_export, "ROOT", root):
                 self.assertEqual(validate_hf_export.validate(output), 2)
 

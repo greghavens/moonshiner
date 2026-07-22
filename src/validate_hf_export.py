@@ -50,7 +50,7 @@ def validate(path: Path, *, trusted_prefix_rows: int = 0) -> int:
             messages = row.get("messages")
             if not isinstance(messages, list) or not messages:
                 raise ValueError(f"line {number}: messages must be non-empty")
-            if not isinstance(json.loads(row.get("tools", "null")), list):
+            if "tools" in row and not isinstance(json.loads(row["tools"]), list):
                 raise ValueError(f"line {number}: tools must encode a list")
             if number > trusted_prefix_rows:
                 if "teacher_model" in row and not str(row["teacher_model"]).strip():
