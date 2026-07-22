@@ -358,7 +358,9 @@ def build_card(rows: list[dict], *, stage: str = "release") -> str:
     attest_pct = _pct(attested, total_rows)
     has_security = domains.get("security", 0) > 0
 
-    teacher_model = teacher.get("model", "the teacher model")
+    teacher_model = (teacher.get("model")
+                     or (rows[0].get("teacher_model") if rows else None)
+                     or "configured-model")
     teacher_runtime = teacher.get("runtime", "pi")
     runtime_config = (CONFIG.get("runtimes") or {}).get(teacher_runtime) or {}
     provider = (rows[0].get("provider") if rows else None) \

@@ -179,10 +179,12 @@ class Card(unittest.TestCase):
             _row("t1", "py-build", "python", "build", "coding", "train", 1),
             _row("t2", "go-fix", "go", "debug", "coding", "val", 1),
         ]
-        text = card.build_card(coding)
+        clean_config = {**card.CONFIG, "teacher": {"model": ""}, "publish": {}}
+        with mock.patch.object(card, "CONFIG", clean_config):
+            text = card.build_card(coding)
         self.assertNotIn("question-answering", text)
         self.assertNotIn("Authorization scope", text)
-        self.assertIn("Claude Fable 5 Agent Traces", text)
+        self.assertIn("Configured Model Agent Traces", text)
         self.assertIn("| Build |", text)
         self.assertIn("| Debug |", text)
 
