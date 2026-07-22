@@ -14,7 +14,7 @@ from expand_next_steps import expand_record
 from export_hf_next_steps import PUBLISH_KEY_ORDER, build_row, validate_export
 
 
-def _tool_schemas() -> dict[tuple[str, str], list[dict]]:
+def _tool_schemas() -> dict[str, list[dict]]:
     schemas = {}
     for split in ("train", "val"):
         path = DATA / "next_step" / f"{split}.jsonl"
@@ -28,8 +28,7 @@ def _tool_schemas() -> dict[tuple[str, str], list[dict]]:
                 meta = record.get("meta") or {}
                 tools = record.get("tools") or []
                 if tools:
-                    schemas[(str(meta.get("teacher_runtime") or ""),
-                             str(meta.get("trace_format") or ""))] = tools
+                    schemas[str(meta.get("trace_format") or "")] = tools
     return schemas
 
 
@@ -49,7 +48,7 @@ def migrate(path: Path) -> tuple[int, int]:
     for row in rows:
         runtime = str(row.get("teacher_runtime") or "")
         trace_format = str(row.get("trace_format") or "")
-        tools = schemas.get((runtime, trace_format))
+        tools = schemas.get(trace_format)
         if not tools:
             raise ValueError(
                 f"{row.get('task')}: no genuine tool schema is available for "

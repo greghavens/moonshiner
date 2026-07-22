@@ -55,13 +55,13 @@ class OnePipelineInvariant(unittest.TestCase):
             next_step = data / "next_step"; next_step.mkdir()
             tools = [{"type": "function", "function": {
                 "name": "search", "parameters": {"type": "object"}}}]
-            source = {"meta": {"teacher_runtime": "native",
+            source = {"meta": {"teacher_runtime": "native-current",
                                 "trace_format": "native-v1"}, "tools": tools}
             (next_step / "train.jsonl").write_text(json.dumps(source) + "\n")
             (next_step / "val.jsonl").write_text("")
             path = data / "traces.jsonl"
             path.write_text(json.dumps({"task": "research-one", "lang": "en",
-                "category": "Tool calling", "teacher_runtime": "native",
+                "category": "Tool calling", "teacher_runtime": "native-legacy",
                 "teacher_model": "acme/model", "provider": "provider",
                 "reasoning_effort": "max", "model_attested": True,
                 "observed_models": ["acme/model"], "trace_format": "native-v1",
