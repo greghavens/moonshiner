@@ -289,11 +289,22 @@ def _program_mix(trajectories: dict[str, dict]) -> Counter:
     return result
 
 
+def _training_row_weight(row: dict) -> int:
+    """Number of supervised assistant targets represented by one stored row."""
+    if row.get("source_trajectory_id"):
+        return 1
+    return sum(message.get("role") == "assistant"
+               for message in (row.get("messages") or []))
+
+
 def _program_row_mix(rows: list[dict]) -> Counter:
     """Count training rows using the catalog's explicit program assignment."""
     by_id = _program_assignments()
-    return Counter(_published_program(row.get("task"), row.get("category"), by_id)
-                   for row in rows)
+    result: Counter = Counter()
+    for row in rows:
+        result[_published_program(row.get("task"), row.get("category"), by_id)] += \
+            _training_row_weight(row)
+    return result
 
 
 def _program_table(counter: Counter, total: int, row_counter: Counter,
@@ -340,8 +351,10 @@ def build_card(rows: list[dict], *, stage: str = "release") -> str:
 
     trajectories = _trajectories(rows)
     total_traj = len(trajectories)
-    total_rows = len(rows)
-    row_splits = Counter(row.get("split") for row in rows)
+    total_rows = sum(_training_row_weight(row) for row in rows)
+    row_splits = Counter()
+    for row in rows:
+        row_splits[row.get("split")] += _training_row_weight(row)
     traj_splits = Counter(entry["split"] for entry in trajectories.values())
     categories = _program_mix(trajectories)
     category_rows = _program_row_mix(rows)
@@ -355,7 +368,7 @@ def build_card(rows: list[dict], *, stage: str = "release") -> str:
                          for tool in entry["tools_used"]})
     offered_tools = _offered_tools(rows)
     attested = sum(1 for row in rows if row.get("model_attested"))
-    attest_pct = _pct(attested, total_rows)
+    attest_pct = _pct(attested, len(rows))
     has_security = domains.get("security", 0) > 0
 
     teacher_model = (teacher.get("model")
@@ -651,7 +664,8 @@ def main() -> None:
     if banner_source.is_file():
         shutil.copy2(banner_source, BANNER)
     CARD.write_text(build_card(rows))
-    print(f"wrote {CARD}: dataset card for {len(rows):,} rows "
+    print(f"wrote {CARD}: dataset card for "
+          f"{sum(_training_row_weight(row) for row in rows):,} training rows "
           f"({len(_trajectories(rows)):,} trajectories)")
 
 

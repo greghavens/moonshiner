@@ -949,6 +949,9 @@ def main(argv: list[str] | None = None) -> int:
     if command == "publish":
         from publish import main as publish_main
         return publish_main(rest)
+    if command == "migrate-dataset":
+        from migrate_canonical_dataset import main as migrate_main
+        return migrate_main(rest)
     if command == "publish-queue-worker":
         return _publish_queue_worker(rest)
     if command in {"seed", "seed-run"}:

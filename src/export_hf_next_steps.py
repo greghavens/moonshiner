@@ -34,9 +34,6 @@ PUBLISH_KEY_ORDER = [
     "trace_format", "tools_used", "derivation", "assistant_step",
     "assistant_steps", "target_message_index", "original_n_messages",
     "n_messages", "messages", "tools"]
-LEGACY_KEY_ORDER = ["task", "lang", "category", "split", "assistant_step",
-                    "assistant_steps", "target_message_index", "n_messages",
-                    "messages", "tools"]
 
 
 def sha256(path: Path) -> str:
@@ -66,21 +63,8 @@ def validate_manifest(input_dir: Path, source_dir: Path) -> None:
             raise ValueError(f"next-step output is stale for {split}")
 
 
-def build_row(record: dict, split: str, *, legacy: bool = False) -> dict:
+def build_row(record: dict, split: str) -> dict:
     meta = record["meta"]
-    if legacy:
-        return {
-            "task": meta["task"],
-            "lang": meta.get("lang") or "en",
-            "category": meta.get("category") or "uncategorized",
-            "split": split,
-            "assistant_step": meta["assistant_step"],
-            "assistant_steps": meta["assistant_steps"],
-            "target_message_index": meta["target_message_index"],
-            "n_messages": len(record["messages"]),
-            "messages": record["messages"],
-            "tools": json.dumps(record.get("tools") or []),
-        }
     return {
         "task": meta["task"],
         "source_trajectory_id": meta["source_trajectory_id"],
@@ -134,8 +118,7 @@ def validate_export(path: Path) -> dict:
                 raise ValueError(f"line {number}: assistant context count mismatch")
             if not isinstance(json.loads(row.get("tools", "null")), list):
                 raise ValueError(f"line {number}: tools must encode a list")
-            source_id = row.get("source_trajectory_id") or (
-                "legacy:" + row.get("task", "") if row.get("task") else None)
+            source_id = row.get("source_trajectory_id")
             if not isinstance(source_id, str) or not source_id:
                 raise ValueError(f"line {number}: source trajectory id is missing")
             prior_split = split_by_source.setdefault(source_id, row.get("split"))
@@ -165,8 +148,6 @@ def validate_export(path: Path) -> dict:
 
 def row_identity(row: dict) -> tuple[str, int]:
     source_id, step = row.get("source_trajectory_id"), row.get("assistant_step")
-    if not source_id and isinstance(row.get("task"), str):
-        source_id = "legacy:" + row["task"]
     if not isinstance(source_id, str) or not source_id or not isinstance(step, int):
         raise ValueError("published row lacks source trajectory/assistant step identity")
     return source_id, step
@@ -216,12 +197,6 @@ def main() -> None:
 
     validate_manifest(args.input, args.source)
     ensure_local_dataset(target=args.output)
-    legacy_output = False
-    if args.output.is_file() and args.output.stat().st_size:
-        with args.output.open() as existing_handle:
-            first_existing = next((json.loads(line) for line in existing_handle
-                                   if line.strip()), None)
-        legacy_output = bool(first_existing and list(first_existing) == LEGACY_KEY_ORDER)
     journal_dir = RUNS / "export-journals"
     journal_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -241,7 +216,7 @@ def main() -> None:
                         continue
                     selected_tasks.add((record.get("meta") or {}).get("task"))
                     output_handle.write(json.dumps(
-                        build_row(record, split, legacy=legacy_output),
+                        build_row(record, split),
                         ensure_ascii=False) + "\n")
                     counts[split] += 1
     if args.task:

@@ -17,7 +17,7 @@ from pathlib import Path
 from common import ROOT, _staged_secret_values, provider_key_env_names
 from privacy import findings
 from expand_next_steps import DERIVATION
-from export_hf_next_steps import DEFAULT_OUTPUT, PUBLISH_KEY_ORDER, LEGACY_KEY_ORDER
+from export_hf_next_steps import DEFAULT_OUTPUT, PUBLISH_KEY_ORDER
 
 # Static names plus every configured runtime's key_env, so a newly configured
 # provider is covered by the privacy gate without editing this list.
@@ -32,52 +32,20 @@ def validate(path: Path, *, trusted_prefix_rows: int = 0) -> int:
     groups: dict = {}
     split_by_trajectory: dict = {}
     forbidden_paths = (str(ROOT), str(Path.home()))
-    expected_whole_keys = None
     with path.open() as input_handle:
       for number, line in enumerate(input_handle, 1):
         if not line.strip():
             continue
         row = json.loads(line)
-        whole = "assistant_step" not in row
-        if whole:
-            expected_whole_keys = expected_whole_keys or list(row)
-            if list(row) != expected_whole_keys:
-                raise ValueError(f"line {number}: whole-trajectory schema changed")
-        legacy = not whole and list(row) == LEGACY_KEY_ORDER
-        if whole:
-            if not isinstance(row.get("task"), str) or not row["task"]:
-                raise ValueError(f"line {number}: task is missing")
-            messages = row.get("messages")
-            if not isinstance(messages, list) or not messages:
-                raise ValueError(f"line {number}: messages must be non-empty")
-            if "tools" in row and not isinstance(json.loads(row["tools"]), list):
-                raise ValueError(f"line {number}: tools must encode a list")
-            if number > trusted_prefix_rows:
-                if "teacher_model" in row and not str(row["teacher_model"]).strip():
-                    raise ValueError(f"line {number}: teacher_model is empty")
-                if "provider" in row and not str(row["provider"]).strip():
-                    raise ValueError(f"line {number}: provider is empty")
-                if "model_attested" in row and row["model_attested"] is not True:
-                    raise ValueError(f"line {number}: teacher model is not attested")
-                serialized = json.dumps(row, ensure_ascii=False)
-                privacy_hits = findings(
-                    serialized, exact_secrets=_staged_secret_values(),
-                    forbidden_paths=forbidden_paths)
-                if privacy_hits:
-                    raise ValueError(f"line {number}: privacy findings: {privacy_hits}")
-                if any(marker in serialized for marker in FORBIDDEN_SUBSTRINGS):
-                    raise ValueError(f"line {number}: private harness material")
-            count += 1
-            continue
-        if not legacy and list(row) != PUBLISH_KEY_ORDER:
+        if list(row) != PUBLISH_KEY_ORDER:
             raise ValueError(f"line {number}: unexpected schema {list(row)}")
-        if not legacy and not str(row.get("teacher_model") or "").strip():
+        if not str(row.get("teacher_model") or "").strip():
             raise ValueError(f"line {number}: teacher_model is empty")
-        if not legacy and not str(row.get("provider") or "").strip():
+        if not str(row.get("provider") or "").strip():
             raise ValueError(f"line {number}: provider is empty")
-        if not legacy and row.get("model_attested") is not True:
+        if row.get("model_attested") is not True:
             raise ValueError(f"line {number}: teacher model is not attested")
-        if not legacy and not isinstance(row.get("observed_models"), list):
+        if not isinstance(row.get("observed_models"), list):
             raise ValueError(f"line {number}: observed_models must be a list")
         if row["split"] not in {"train", "val"}:
             raise ValueError(f"line {number}: invalid split")
@@ -85,7 +53,7 @@ def validate(path: Path, *, trusted_prefix_rows: int = 0) -> int:
             raise ValueError(f"line {number}: lang is empty/null")
         if not str(row.get("category") or "").strip():
             raise ValueError(f"line {number}: category is empty/null")
-        if not legacy and row.get("derivation") != DERIVATION:
+        if row.get("derivation") != DERIVATION:
             raise ValueError(f"line {number}: invalid derivation")
 
         messages = row.get("messages")
@@ -101,8 +69,8 @@ def validate(path: Path, *, trusted_prefix_rows: int = 0) -> int:
             raise ValueError(f"line {number}: invalid assistant-step metadata")
         if sum(message.get("role") == "assistant" for message in messages) != step:
             raise ValueError(f"line {number}: assistant count does not match step")
-        source_hash = row.get("source_trajectory_sha256") or ("legacy:" + row["task"])
-        if not legacy and (not isinstance(source_hash, str) or len(source_hash) != 64):
+        source_hash = row.get("source_trajectory_sha256")
+        if not isinstance(source_hash, str) or len(source_hash) != 64:
             raise ValueError(f"line {number}: invalid source trajectory hash")
         if not isinstance(json.loads(row["tools"]), list):
             raise ValueError(f"line {number}: tools must encode a list")

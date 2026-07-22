@@ -45,6 +45,15 @@ def _coding_and_security():
 
 
 class Units(unittest.TestCase):
+    def test_whole_trajectory_counts_each_assistant_turn_as_a_training_row(self):
+        row = _preview_row("multi-turn", "en", "tool-calling")
+        text = card.build_card([row])
+        self.assertIn("1 TRAJECTORIES · 2 TRAINING ROWS", text)
+
+    def test_cumulative_prefix_counts_each_stored_record_once(self):
+        text = card.build_card(_coding_and_security())
+        self.assertIn("2 TRAJECTORIES · 3 TRAINING ROWS", text)
+
     def test_kimi_banner_is_packaged_at_the_configurable_asset_path(self):
         banner = _ROOT / "assets" / "kimi-k3-dataset-banner.png"
         self.assertTrue(banner.is_file())
@@ -231,7 +240,7 @@ class PreviewCard(unittest.TestCase):
 
     def test_in_progress_snapshot_no_release_claims(self):
         self.assertIn("2 TRAJECTORIES", self.card)
-        self.assertIn("2 TRAINING ROWS", self.card)
+        self.assertIn("4 TRAINING ROWS", self.card)
 
     def test_preview_schema_and_mix_from_rows(self):
         self.assertIn("Building", self.card)
