@@ -224,7 +224,8 @@ def sync(source: Path, root: Path, *, changed_tasks: set[str],
                 task = str(row["task"])
                 all_tasks.add(task)
                 total_rows += 1
-                if existing is None or task in rebuild_tasks:
+                if (existing is None or task in rebuild_tasks
+                        or task not in task_to_shard):
                     selected.append(row)
     finally:
         normalized.unlink(missing_ok=True)

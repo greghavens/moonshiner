@@ -80,6 +80,19 @@ class ParquetPublication(unittest.TestCase):
             self.assertEqual(mtimes, {p: (root / p).stat().st_mtime_ns
                                      for p in second["active_shards"]})
 
+    def test_new_canonical_task_is_discovered_without_explicit_task_argument(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = pathlib.Path(name); source = root / "traces.jsonl"
+            original = [row("task-a")]
+            self.write_rows(source, original)
+            parquet.sync(source, root, changed_tasks={"task-a"})
+            expanded = original + [row("task-b")]
+            self.write_rows(source, expanded)
+            manifest = parquet.sync(source, root, changed_tasks=set())
+            self.assertEqual(manifest["trajectory_count"], 2)
+            self.assertEqual({item["task"] for item in parquet.read_active_rows(root)},
+                             {"task-a", "task-b"})
+
     def test_every_active_shard_has_the_exact_same_arrow_schema(self):
         with tempfile.TemporaryDirectory() as name:
             root = pathlib.Path(name); source = root / "traces.jsonl"
