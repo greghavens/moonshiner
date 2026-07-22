@@ -11,12 +11,28 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from reasoning_stepdown import (next_reasoning_stage, reasoning_schedule,
                                 runtime_for_stage)  # noqa: E402
-from run_state import connect, create_run, finish_attempt, start_attempt  # noqa: E402
+from run_state import (connect, create_run, finish_attempt, start_attempt,
+                       trace_reasoning_efforts_for_current_seed_revisions)  # noqa: E402
 from unittest import mock
 import seed_inventory  # noqa: E402
+import build_dataset  # noqa: E402
+import export_hf_next_steps  # noqa: E402
 
 
 class ReasoningScheduleContracts(unittest.TestCase):
+    def test_accepted_stage_overrides_native_runtime_name_in_canonical_row(self):
+        info = {"teacher": {"reasoning": "max", "reasoning_stage": "medium"}}
+        self.assertEqual(build_dataset.recorded_reasoning_effort(info), "medium")
+        record = {"meta": {
+            "task": "task", "source_trajectory_id": "task", "source_sha256": "a" * 64,
+            "reasoning_effort": "medium", "derivation": "next",
+            "assistant_step": 1, "assistant_steps": 1,
+            "target_message_index": 1, "original_n_messages": 2},
+            "messages": [{"role": "user", "content": "go"},
+                         {"role": "assistant", "content": "done"}], "tools": []}
+        self.assertEqual(export_hf_next_steps.build_row(record, "train")
+                         ["reasoning_effort"], "medium")
+
     def test_ordinary_trace_path_never_feeds_judge_feedback_to_author(self):
         tree = ast.parse((ROOT / "src" / "trace_pipeline.py").read_text())
         calls = [node for node in ast.walk(tree)
@@ -24,6 +40,8 @@ class ReasoningScheduleContracts(unittest.TestCase):
                  and getattr(node.func, "id", None) == "trace_task"]
         self.assertTrue(calls)
         self.assertTrue(all("feedback" not in {item.arg for item in call.keywords}
+                            for call in calls))
+        self.assertTrue(all("reasoning_stage" in {item.arg for item in call.keywords}
                             for call in calls))
 
     def test_disabled_policy_never_changes_configured_effort(self):
@@ -81,6 +99,19 @@ class ReasoningScheduleContracts(unittest.TestCase):
 
 
 class ReasoningLedgerContracts(unittest.TestCase):
+    def test_bulk_reasoning_history_reads_all_seeds_in_one_query_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db = connect(pathlib.Path(directory) / "ledger.sqlite3")
+            run_id = create_run(db, "trace", {}, {"max_attempts": 3}, ["a", "b"])
+            start_attempt(db, run_id, "a", 1, reasoning_stage="xhigh")
+            finish_attempt(db, run_id, "a", 1, "retry")
+            start_attempt(db, run_id, "b", 1, reasoning_stage="medium")
+            finish_attempt(db, run_id, "b", 1, "retry")
+            self.assertEqual(
+                trace_reasoning_efforts_for_current_seed_revisions(db, {"a", "b"}),
+                {"a": ["xhigh"], "b": ["medium"]})
+            db.close()
+
     def test_status_uses_missing_stages_not_legacy_physical_attempt_count(self):
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "ledger.sqlite3"

@@ -218,27 +218,39 @@ def finish_attempt(db, run_id: str, seed_id: str, number: int, status: str,
 def trace_reasoning_efforts_for_current_seed_revision(
         db: sqlite3.Connection, seed_id: str) -> list[str]:
     """Return recorded ordinary trace efforts for the current seed revision."""
+    return trace_reasoning_efforts_for_current_seed_revisions(
+        db, {seed_id}).get(seed_id, [])
+
+
+def trace_reasoning_efforts_for_current_seed_revisions(
+        db: sqlite3.Connection, seed_ids: set[str]) -> dict[str, list[str]]:
+    """Bulk-read ordinary trace efforts without one query per catalog seed."""
+    if not seed_ids:
+        return {}
     rows = db.execute("""
-        SELECT a.reasoning_stage,a.reasoning_effort,a.artifact_path
+        SELECT a.seed_id,a.reasoning_stage,a.reasoning_effort,a.artifact_path
         FROM attempts a JOIN runs r ON r.id=a.run_id
-        WHERE r.kind='trace' AND a.seed_id=?
+        WHERE r.kind='trace'
           AND a.status IN ('accepted','retry','exhausted')
           AND a.id > COALESCE((SELECT MAX(sa.id) FROM attempts sa
             JOIN runs sr ON sr.id=sa.run_id WHERE sr.kind='seed'
             AND sa.status='accepted' AND sa.seed_id=a.seed_id),0)
-        ORDER BY a.id""", (seed_id,)).fetchall()
-    efforts = []
+        ORDER BY a.id""").fetchall()
+    efforts: dict[str, list[str]] = {}
     for row in rows:
-        effort = row[0] or row[1]
-        if not effort and row[2]:
-            meta = Path(row[2]) / "meta.json"
+        seed_id = str(row[0])
+        if seed_id not in seed_ids:
+            continue
+        effort = row[1] or row[2]
+        if not effort and row[3]:
+            meta = Path(row[3]) / "meta.json"
             try:
                 effort = (json.loads(meta.read_text()).get("teacher") or {}).get(
                     "reasoning")
             except (OSError, json.JSONDecodeError):
                 effort = None
         if effort:
-            efforts.append(str(effort))
+            efforts.setdefault(seed_id, []).append(str(effort))
     return efforts
 
 

@@ -105,17 +105,19 @@ def _selected(args) -> list[dict]:
     stepdown = bool(trace_config.get("step_down_reasoning_on_failure", True))
     configured_effort = str((CONFIG.get("teacher") or {}).get("reasoning") or "max")
     required = reasoning_schedule(maximum, stepdown, configured_effort)
-    from run_state import trace_reasoning_efforts_for_current_seed_revision
+    from run_state import trace_reasoning_efforts_for_current_seed_revisions
+    selected = select_seeds(only=only, categories=categories, tags=tags,
+                            name=getattr(args, "name", None))
+    histories = trace_reasoning_efforts_for_current_seed_revisions(
+        ledger, {seed["id"] for seed in selected}) if stepdown else {}
 
     def has_remaining(seed_id: str) -> bool:
         if not stepdown:
             return attempts.get(seed_id, 0) < maximum
-        completed = trace_reasoning_efforts_for_current_seed_revision(ledger, seed_id)
+        completed = histories.get(seed_id, [])
         return next_reasoning_stage(required, completed) is not None
 
-    seeds = [seed for seed in select_seeds(only=only,
-                                           categories=categories, tags=tags,
-                                           name=getattr(args, "name", None))
+    seeds = [seed for seed in selected
              if synthetic_tool_contract(seed) is None
              and seed["id"] not in accepted
              and seed["id"] not in blocked
@@ -403,6 +405,10 @@ def main(argv: list[str] | None = None) -> int:
             if claim["attempts"] == 0 and existing_harness_trace(seed["id"]):
                 start_attempt(worker_db, run_id, seed["id"], number,
                               reasoning_stage=stage, reasoning_effort=effort)
+                meta_path = TRACES / "meta" / f"{seed['id']}.json"
+                meta = json.loads(meta_path.read_text())
+                meta.setdefault("teacher", {})["reasoning_stage"] = stage
+                meta_path.write_text(json.dumps(meta, indent=2) + "\n")
                 record_model_call(worker_db, run_id)
                 print(f"[{seed['id']}] existing harness trace: judge", flush=True)
                 review = screen(seed, worker_judge)
@@ -432,7 +438,8 @@ def main(argv: list[str] | None = None) -> int:
             start_attempt(worker_db, run_id, seed["id"], number,
                           reasoning_stage=stage, reasoning_effort=effort)
             print(f"[{seed['id']}] attempt {number} ({stage}): author", flush=True)
-            record = trace_task(seed, attempt_teacher, force=True)
+            record = trace_task(seed, attempt_teacher, force=True,
+                                reasoning_stage=stage)
         usage = (record.get("teacher") or {}).get("usage") or {}
         # Candidate checks are evidence for the trace judge, never a separate
         # rejection gate. Every completed candidate proceeds to judgment.

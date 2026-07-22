@@ -130,6 +130,12 @@ def training_tags(seed: dict, turns: list[dict], info: dict) -> list[str]:
     return sorted(tags)
 
 
+def recorded_reasoning_effort(info: dict) -> str | None:
+    """Return the canonical effort of the accepted attempt, with legacy fallback."""
+    teacher = info.get("teacher") or {}
+    return teacher.get("reasoning_stage") or teacher.get("reasoning")
+
+
 def build_row(seed: dict, info: dict,
               traces_root: Path | None = None) -> tuple[dict | None, str | None]:
     traces_root = traces_root or TRACES
@@ -172,7 +178,7 @@ def build_row(seed: dict, info: dict,
         "tags": training_tags(seed, turns, info),
         "teacher_runtime": teacher.get("runtime"),
         "teacher_model": teacher.get("model"),
-        "reasoning_effort": teacher.get("reasoning"),
+        "reasoning_effort": recorded_reasoning_effort(info),
         "observed_models": observed,
         "model_attested": bool(teacher.get("model_attested")),
         "provider": _provider(teacher.get("runtime", "")),

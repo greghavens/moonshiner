@@ -212,7 +212,7 @@ def trace_state(max_attempts: int, *, target: set[str] | None = None,
         "WHERE r.kind='trace' AND r.status='running' AND j.status='running' "
         "AND j.lease_expires_at IS NOT NULL AND j.lease_expires_at>?", (now(),))}
     from run_state import (trace_attempt_counts_for_current_seed_revision,
-                           trace_reasoning_efforts_for_current_seed_revision)
+                           trace_reasoning_efforts_for_current_seed_revisions)
     attempts = trace_attempt_counts_for_current_seed_revision(db)
     from common import CONFIG
     trace_config = ((CONFIG.get("pipeline") or {}).get("trace") or {})
@@ -222,11 +222,12 @@ def trace_state(max_attempts: int, *, target: set[str] | None = None,
         from reasoning_stepdown import next_reasoning_stage, reasoning_schedule
         effort = str((CONFIG.get("teacher") or {}).get("reasoning") or "max")
         required = reasoning_schedule(max_attempts, True, effort)
+        histories = trace_reasoning_efforts_for_current_seed_revisions(
+            db, ready - accepted - active)
         remaining = {
             seed_id for seed_id in ready - accepted - active
             if next_reasoning_stage(
-                required,
-                trace_reasoning_efforts_for_current_seed_revision(db, seed_id))
+                required, histories.get(seed_id, []))
             is not None
         }
     db.close()

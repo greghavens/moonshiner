@@ -67,6 +67,7 @@ def _interaction_turns(seed: dict) -> list[str] | None:
 
 def trace_task(seed: dict, teacher=None, *, force: bool = False,
                attempts: int = 1, feedback: str | None = None,
+               reasoning_stage: str | None = None,
                traces_root: Path | None = None) -> dict:
     """Generate (and verify) one trace for ``seed``; return its meta record."""
     traces_root = traces_root or TRACES
@@ -152,6 +153,7 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
                 "runtime": teacher.name,
                 "model": teacher.role["model"],
                 "reasoning": teacher.role.get("reasoning"),
+                "reasoning_stage": reasoning_stage,
                 "observed_model": result.observed_model,
                 "observed_models": result.observed_models,
                 "model_attested": result.model_attested,

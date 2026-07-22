@@ -30,6 +30,18 @@ def row(task, step=1, total=1, answer="ok"):
 
 
 class ParquetPublication(unittest.TestCase):
+    def test_reasoning_effort_is_identical_in_jsonl_and_parquet(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = pathlib.Path(name); source = root / "traces.jsonl"
+            rows = [row("task-xhigh"), row("task-medium"), row("task-low")]
+            for item, effort in zip(rows, ("xhigh", "medium", "low")):
+                item["reasoning_effort"] = effort
+            self.write_rows(source, rows)
+            parquet.sync(source, root, changed_tasks={item["task"] for item in rows})
+            rebuilt = parquet.read_active_rows(root)
+            self.assertEqual([item["reasoning_effort"] for item in rebuilt],
+                             ["xhigh", "medium", "low"])
+
     def write_rows(self, path, rows):
         path.write_text("".join(json.dumps(item) + "\n" for item in rows))
 
