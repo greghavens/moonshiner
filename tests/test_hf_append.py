@@ -18,6 +18,15 @@ def row(source="trajectory-a", step=1, content="answer"):
             "messages": [{"role": "assistant", "content": content}]}
 
 
+def published_row(task="trajectory-a", step=1, total=1):
+    messages = [{"role": "user", "content": "do it"},
+                {"role": "assistant", "content": "done"}]
+    return {"task": task, "lang": "en", "category": "Tool calling",
+            "split": "train", "assistant_step": step,
+            "assistant_steps": total, "target_message_index": 1,
+            "n_messages": 2, "messages": messages, "tools": "[]"}
+
+
 class LocalFirstBootstrap(unittest.TestCase):
     def test_existing_local_file_is_kept_and_later_runs_do_not_check_remote(self):
         with tempfile.TemporaryDirectory() as name:
@@ -82,6 +91,22 @@ class TaskKeyedExport(unittest.TestCase):
                              {"trajectory-a", "trajectory-b"})
             self.assertIn("changed", {item["messages"][0]["content"] for item in rows})
             self.assertIn("keep", {item["messages"][0]["content"] for item in rows})
+
+
+class PublishedDatasetValidation(unittest.TestCase):
+    def test_accepts_the_exact_existing_fable_public_schema(self):
+        with tempfile.TemporaryDirectory() as name:
+            path = pathlib.Path(name) / "traces.jsonl"
+            path.write_text(json.dumps(published_row()) + "\n")
+            self.assertEqual(validate_hf_export.validate(path), 1)
+
+    def test_rejects_an_unrecognized_schema(self):
+        with tempfile.TemporaryDirectory() as name:
+            path = pathlib.Path(name) / "traces.jsonl"
+            item = published_row(); item["invented"] = True
+            path.write_text(json.dumps(item) + "\n")
+            with self.assertRaisesRegex(ValueError, "unexpected schema"):
+                validate_hf_export.validate(path)
 
 
 if __name__ == "__main__":

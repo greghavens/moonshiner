@@ -86,7 +86,7 @@ class RemoteCardVerification(unittest.TestCase):
             for name in ("traces.jsonl", "README.md", "moonshiner-dataset-banner.png",
                          "traces.jsonl.pre-1661"):
                 (root / name).write_bytes(b"fixture")
-            self.assertEqual({path.name for path in publication_files(root)},
+            self.assertEqual({path.name for path in publication_files(root, "jsonl")},
                              {"traces.jsonl", "README.md",
                               "moonshiner-dataset-banner.png"})
 
@@ -114,7 +114,7 @@ class RemoteCardVerification(unittest.TestCase):
             self.assertIn("path: viewer/train-*.jsonl", text)
             self.assertIn("# Dataset", text)
             self.assertEqual(
-                {path.relative_to(root).as_posix() for path in publication_files(root)},
+                {path.relative_to(root).as_posix() for path in publication_files(root, "jsonl")},
                 {"README.md", "traces.jsonl"})
 
     def test_generated_viewer_shards_do_not_create_a_second_privacy_gate(self):

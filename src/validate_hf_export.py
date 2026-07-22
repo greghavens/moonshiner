@@ -19,6 +19,12 @@ from privacy import findings
 from expand_next_steps import DERIVATION
 from export_hf_next_steps import DEFAULT_OUTPUT, PUBLISH_KEY_ORDER
 
+PUBLIC_KEY_ORDER = [
+    "task", "lang", "category", "split", "assistant_step",
+    "assistant_steps", "target_message_index", "n_messages", "messages",
+    "tools",
+]
+
 # Static names plus every configured runtime's key_env, so a newly configured
 # provider is covered by the privacy gate without editing this list.
 FORBIDDEN_SUBSTRINGS = tuple(dict.fromkeys(
@@ -37,23 +43,26 @@ def validate(path: Path, *, trusted_prefix_rows: int = 0) -> int:
         if not line.strip():
             continue
         row = json.loads(line)
-        if list(row) != PUBLISH_KEY_ORDER:
+        schema = list(row)
+        if schema not in (PUBLIC_KEY_ORDER, PUBLISH_KEY_ORDER):
             raise ValueError(f"line {number}: unexpected schema {list(row)}")
-        if not str(row.get("teacher_model") or "").strip():
-            raise ValueError(f"line {number}: teacher_model is empty")
-        if not str(row.get("provider") or "").strip():
-            raise ValueError(f"line {number}: provider is empty")
-        if row.get("model_attested") is not True:
-            raise ValueError(f"line {number}: teacher model is not attested")
-        if not isinstance(row.get("observed_models"), list):
-            raise ValueError(f"line {number}: observed_models must be a list")
+        enriched = schema == PUBLISH_KEY_ORDER
+        if enriched:
+            if not str(row.get("teacher_model") or "").strip():
+                raise ValueError(f"line {number}: teacher_model is empty")
+            if not str(row.get("provider") or "").strip():
+                raise ValueError(f"line {number}: provider is empty")
+            if row.get("model_attested") is not True:
+                raise ValueError(f"line {number}: teacher model is not attested")
+            if not isinstance(row.get("observed_models"), list):
+                raise ValueError(f"line {number}: observed_models must be a list")
         if row["split"] not in {"train", "val"}:
             raise ValueError(f"line {number}: invalid split")
         if not str(row.get("lang") or "").strip():
             raise ValueError(f"line {number}: lang is empty/null")
         if not str(row.get("category") or "").strip():
             raise ValueError(f"line {number}: category is empty/null")
-        if row.get("derivation") != DERIVATION:
+        if enriched and row.get("derivation") != DERIVATION:
             raise ValueError(f"line {number}: invalid derivation")
 
         messages = row.get("messages")
@@ -70,7 +79,7 @@ def validate(path: Path, *, trusted_prefix_rows: int = 0) -> int:
         if sum(message.get("role") == "assistant" for message in messages) != step:
             raise ValueError(f"line {number}: assistant count does not match step")
         source_hash = row.get("source_trajectory_sha256")
-        if not isinstance(source_hash, str) or len(source_hash) != 64:
+        if enriched and (not isinstance(source_hash, str) or len(source_hash) != 64):
             raise ValueError(f"line {number}: invalid source trajectory hash")
         if not isinstance(json.loads(row["tools"]), list):
             raise ValueError(f"line {number}: tools must encode a list")
@@ -89,7 +98,7 @@ def validate(path: Path, *, trusted_prefix_rows: int = 0) -> int:
         if previous_split != row["split"]:
             raise ValueError(f"line {number}: trajectory crosses splits")
         groups.setdefault((row["split"], *trajectory), []).append(
-            (step, total, source_hash, messages, number))
+            (step, total, source_hash, messages, number, enriched))
         count += 1
 
     if count == 0:
@@ -97,8 +106,8 @@ def validate(path: Path, *, trusted_prefix_rows: int = 0) -> int:
     for key, entries in groups.items():
         entries.sort(key=lambda item: item[0])
         totals = {entry[1] for entry in entries}
-        hashes = {entry[2] for entry in entries}
-        if len(totals) != 1 or len(hashes) != 1:
+        hashes = {entry[2] for entry in entries if entry[5]}
+        if len(totals) != 1 or len(hashes) > 1:
             raise ValueError(f"trajectory {key}: inconsistent derivation metadata")
         total = totals.pop()
         if [entry[0] for entry in entries] != list(range(1, total + 1)):
