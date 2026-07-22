@@ -68,15 +68,25 @@ class OnePipelineInvariant(unittest.TestCase):
                 "messages": [{"role": "user", "content": "research"},
                     {"role": "assistant", "content": "first"},
                     {"role": "assistant", "content": "final"}]}) + "\n")
+            sync = data / "hf-sync"; sync.mkdir()
+            dataset = "owner/model-traces"
+            marker_name = __import__("hashlib").sha256(
+                f"{dataset}:traces.jsonl".encode()).hexdigest()[:16]
+            marker = sync / f"{marker_name}.json"
+            marker.write_text(json.dumps({"dataset": dataset,
+                                          "filename": "traces.jsonl"}))
             with mock.patch.object(migrate_canonical_dataset, "DATA", data), \
                  mock.patch.object(migrate_canonical_dataset, "CONFIG",
-                                   {"build": {"val_frac": 0.0}}):
+                                   {"build": {"val_frac": 0.0}, "publish": {
+                                       "hf_dataset": dataset,
+                                       "filename": "traces.jsonl"}}):
                 self.assertEqual(migrate_canonical_dataset.migrate(path), (1, 2))
             rows = [json.loads(line) for line in path.read_text().splitlines()]
             self.assertEqual(len(rows), 2)
             self.assertTrue(all(list(row) == export_hf_next_steps.PUBLISH_KEY_ORDER
                                 for row in rows))
             self.assertTrue(path.with_name("traces.jsonl.pre-canonical").is_file())
+            self.assertEqual(json.loads(marker.read_text())["bootstrap_rows"], 2)
 
 
 if __name__ == "__main__":

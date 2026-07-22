@@ -7,11 +7,13 @@ import hashlib
 import json
 import os
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 
 from common import CONFIG, DATA
 from expand_next_steps import expand_record
 from export_hf_next_steps import PUBLISH_KEY_ORDER, build_row, validate_export
+from hf_sync import sha256
 
 
 def _tool_schemas() -> dict[str, list[dict]]:
@@ -32,12 +34,34 @@ def _tool_schemas() -> dict[str, list[dict]]:
     return schemas
 
 
+def _advance_baseline(path: Path, validation: dict) -> None:
+    publish = CONFIG.get("publish") or {}
+    dataset = publish.get("hf_dataset")
+    filename = str(publish.get("filename") or path.name)
+    if not dataset:
+        return
+    marker_name = hashlib.sha256(f"{dataset}:{filename}".encode()).hexdigest()[:16]
+    marker = DATA / "hf-sync" / f"{marker_name}.json"
+    if not marker.is_file():
+        raise ValueError("HF append baseline is missing; refusing migration")
+    state = json.loads(marker.read_text())
+    state.update({"bootstrap_sha256": sha256(path),
+                  "bootstrap_size": path.stat().st_size,
+                  "bootstrap_rows": validation["rows"],
+                  "canonical_migrated_at": datetime.now(timezone.utc).isoformat(
+                      timespec="seconds")})
+    pending_marker = marker.with_suffix(".pending")
+    pending_marker.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+    pending_marker.replace(marker)
+
+
 def migrate(path: Path) -> tuple[int, int]:
     rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     if not rows:
         raise ValueError("dataset is empty")
     if all(list(row) == PUBLISH_KEY_ORDER for row in rows):
         validation = validate_export(path)
+        _advance_baseline(path, validation)
         return validation["trajectories"], validation["rows"]
     if any("source_trajectory_id" in row or "assistant_step" in row for row in rows):
         raise ValueError("dataset mixes canonical and non-canonical rows")
@@ -83,6 +107,7 @@ def migrate(path: Path) -> tuple[int, int]:
         handle.flush(); os.fsync(handle.fileno())
     validation = validate_export(pending)
     pending.replace(path)
+    _advance_baseline(path, validation)
     return validation["trajectories"], validation["rows"]
 
 
