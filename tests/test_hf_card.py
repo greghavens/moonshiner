@@ -51,6 +51,9 @@ class Units(unittest.TestCase):
                     for items in catalog["categories"].values()
                     for item in items}
         self.assertNotIn("full-distill", programs)
+        self.assertNotIn("full-distill", catalog["programs"])
+        self.assertNotIn("awaiting description",
+                         catalog["programs"]["Security"]["description"])
 
     def test_whole_trajectory_counts_each_assistant_turn_as_a_training_row(self):
         row = _preview_row("multi-turn", "en", "tool-calling")
