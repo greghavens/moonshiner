@@ -97,10 +97,15 @@ class LoadSeeds(unittest.TestCase):
         self.assertEqual(observed, sorted(observed))
 
     def test_holdout_excluded_by_default(self):
-        seed_id = common.load_seeds(include_holdout=True)[0]["id"]
-        with mock.patch.dict(common.CONFIG, {"holdout_tasks": [seed_id]}):
+        seeds = common.load_seeds(include_holdout=True)
+        representatives = {
+            next(seed["id"] for seed in seeds if "_dir" in seed),
+            next(seed["id"] for seed in seeds if "_path" in seed),
+        }
+        with mock.patch.dict(common.CONFIG,
+                             {"holdout_tasks": sorted(representatives)}):
             ids = {seed["id"] for seed in common.load_seeds()}
-        self.assertNotIn(seed_id, ids)
+        self.assertTrue(representatives.isdisjoint(ids))
 
     def test_holdout_included_with_flag(self):
         seed_id = common.load_seeds(include_holdout=True)[0]["id"]

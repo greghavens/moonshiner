@@ -306,6 +306,8 @@ def load_seeds(only: set[str] | None = None, include_holdout: bool = False) -> l
         seed = json.loads(path.read_text())
         if only and seed["id"] not in only:
             continue
+        if not include_holdout and seed["id"] in holdouts:
+            continue
         seed["_path"] = path
         seeds.append(seed)
 
