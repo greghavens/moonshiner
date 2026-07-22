@@ -273,6 +273,9 @@ def _config(argv: list[str]) -> int:
             parser.error(f"{args.key} must be an integer from {low} through {high}")
     if args.key == "pipeline.trace.retry_order" and value not in {"immediate", "tail"}:
         parser.error("pipeline.trace.retry_order must be immediate or tail")
+    if args.key == "synthetic_corrections.max_attempts" and (
+            isinstance(value, bool) or not isinstance(value, int) or value < 1):
+        parser.error("synthetic_corrections.max_attempts must be a positive integer")
     if args.key == "publish.format" and value not in {
             "jsonl", "jsonl-hf-parquet", "parquet-shards"}:
         parser.error("publish.format must be jsonl, jsonl-hf-parquet, or parquet-shards")
@@ -500,8 +503,13 @@ def _ensure_configured_pi() -> None:
     """Provision the stable managed Pi fallback when native/project Pi is absent."""
     from configuration import PROJECT_ROOT, load_config
     config = load_config()
-    runtime = str((config.get("teacher") or {}).get("runtime") or "")
-    if not runtime.startswith("pi"):
+    runtimes = [str((config.get("teacher") or {}).get("runtime") or "")]
+    correction = config.get("synthetic_corrections") or {}
+    if correction.get("enabled"):
+        runtimes.append(str(correction.get("runtime") or
+                            (config.get("judge") or {}).get("runtime") or ""))
+    runtime = next((name for name in runtimes if name.startswith("pi")), "")
+    if not runtime:
         return
     profile = (config.get("runtimes") or {}).get(runtime) or {}
     cli = str(profile.get("cli") or "pi")
@@ -558,8 +566,27 @@ def _start_default_queues() -> int:
                        "--setenv=MOONSHINER_SUPERVISED=1", str(executable),
                        "run", "--all", "--yes"]
             subprocess.run(command, check=True)
+    correction = CONFIG.get("synthetic_corrections") or {}
+    if correction.get("enabled"):
+        unit = f"moonshiner-synthetic-corrections-{project_key}"
+        active = subprocess.run(["systemctl", "--user", "is-active", "--quiet",
+                                 f"{unit}.service"]).returncode == 0
+        if not active:
+            from common import RUNS
+            log_dir = RUNS / "synthetic-corrections"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            executable = Path(sys.executable).parent / "moonshiner"
+            subprocess.run(["systemd-run", "--user", "--collect", f"--unit={unit}",
+                            f"--property=WorkingDirectory={PROJECT_ROOT}",
+                            "--property=Restart=always", "--property=RestartSec=10s",
+                            f"--property=StandardOutput=append:{log_dir / 'run.log'}",
+                            f"--property=StandardError=append:{log_dir / 'run.log'}",
+                            f"--setenv=PATH={os.environ.get('PATH', '')}",
+                            str(executable), "synthetic-corrections", "run", "--yes"],
+                           check=True)
     print("Moonshiner queues are running: author (when enabled), trace/judge/retrace, "
-          "format/privacy, append, HF upload, and remote verification.")
+          "synthetic corrections (when enabled), format/privacy, append, HF upload, "
+          "and remote verification.")
     return 0
 
 
@@ -759,6 +786,20 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
         max_attempts = int(((config.get("pipeline") or {}).get("trace") or {}).get("max_attempts", 2))
         traced = trace_state(max_attempts, target=catalogued, ready=authored,
                              accepted=accepted)
+        correction_config = config.get("synthetic_corrections") or {}
+        correction_status = {"enabled": bool(correction_config.get("enabled", False)),
+                             "eligible": 0, "accepted": 0, "exhausted": 0,
+                             "dataset": correction_config.get("hf_dataset")}
+        if correction_status["enabled"]:
+            from synthetic_corrections import (KIND, eligible_exhausted_attempts,
+                                               settings as correction_settings)
+            correction_status["eligible"] = len(eligible_exhausted_attempts(db))
+            for status_name in ("accepted", "exhausted"):
+                correction_status[status_name] = int(db.execute(
+                    "SELECT COUNT(DISTINCT a.seed_id) FROM attempts a "
+                    "JOIN runs r ON r.id=a.run_id WHERE r.kind=? AND a.status=?",
+                    (KIND, status_name)).fetchone()[0])
+            correction_status["dataset"] = correction_settings(config)["hf_dataset"]
         units = []
         service_result = subprocess.run(
             ["systemctl", "--user", "list-units", "--type=service", "--state=running",
@@ -783,6 +824,7 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
                            "published_rows": published_rows,
                            "acknowledged_tasks": acknowledged_tasks,
                            "waiting_for_upload": waiting_for_upload},
+            "synthetic_corrections": correction_status,
             "services": sorted(units),
         }
         if args.json:
@@ -818,6 +860,11 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
               f"{acknowledged_tasks} unique tasks acknowledged; batch size "
               f"{payload['publishing']['batch_size']}; {waiting_for_upload} accepted waiting for upload; "
               f"{payload['publishing']['dataset'] or 'disabled'}")
+        if correction_status["enabled"]:
+            print(f"Synthetic corrections: {correction_status['eligible']} eligible; "
+                  f"{correction_status['accepted']} accepted; "
+                  f"{correction_status['exhausted']} exhausted; "
+                  f"{correction_status['dataset'] or 'dataset not configured'}")
         print("Services: " + (", ".join(sorted(units)) if units else "none"))
         return 0
     if not rows:
@@ -865,6 +912,10 @@ CREATE TRAINING DATA
   moonshiner trace repair-infrastructure
                               Requeue only verified, repaired infrastructure failures
   moonshiner status           Show current and previous runs
+  moonshiner synthetic-corrections configure
+                              Configure the optional correction companion
+  moonshiner synthetic-corrections run --dry-run
+                              Preview narrowly correctable exhausted traces
   moonshiner service stop NAME
                               Stop one named Moonshiner service
   moonshiner service drain NAME
@@ -942,6 +993,9 @@ def main(argv: list[str] | None = None) -> int:
         return trace_main(rest)
     if command == "status":
         return _status(rest)
+    if command == "synthetic-corrections":
+        from synthetic_corrections import main as corrections_main
+        return corrections_main(rest)
     if command == "service":
         return _service(rest)
     if command == "update":

@@ -43,9 +43,11 @@ def _provider(runtime_name: str) -> str:
                                                                runtime_name)
 
 
-def screening_acceptance(task_id: str, info: dict) -> tuple[bool, str | None]:
+def screening_acceptance(task_id: str, info: dict,
+                         traces_root: Path | None = None) -> tuple[bool, str | None]:
     """The judge's accepted decision is the only dataset-routing gate."""
-    path = REVIEWS / f"{task_id}.json"
+    traces_root = traces_root or TRACES
+    path = traces_root / "reviews" / f"{task_id}.json"
     if not path.exists():
         return False, "judge review is missing"
     try:
@@ -79,12 +81,14 @@ def est_tokens(message: dict, chars_per_token: float = 3.3) -> int:
     return int(size / chars_per_token) + 8
 
 
-def raw_trace_path(task_id: str, info: dict) -> Path:
+def raw_trace_path(task_id: str, info: dict,
+                   traces_root: Path | None = None) -> Path:
     """Use the exact raw artifact path recorded by the trace runtime."""
+    traces_root = traces_root or TRACES
     recorded = info.get("raw_path")
     if recorded:
-        return TRACES.parent / str(recorded)
-    return RAW / f"{task_id}.jsonl"
+        return traces_root.parent / str(recorded)
+    return traces_root / "raw" / f"{task_id}.jsonl"
 
 
 def training_tags(seed: dict, turns: list[dict], info: dict) -> list[str]:
@@ -126,17 +130,19 @@ def training_tags(seed: dict, turns: list[dict], info: dict) -> list[str]:
     return sorted(tags)
 
 
-def build_row(seed: dict, info: dict) -> tuple[dict | None, str | None]:
+def build_row(seed: dict, info: dict,
+              traces_root: Path | None = None) -> tuple[dict | None, str | None]:
+    traces_root = traces_root or TRACES
     if info.get("trace_format") == "moonshiner-behavior-openai-v1":
         return None, "synthetic tool transcript is prohibited"
-    raw = raw_trace_path(seed["id"], info)
+    raw = raw_trace_path(seed["id"], info, traces_root)
     if not raw.exists():
         return None, "no raw trace"
     trace_format = info.get("trace_format") or (info.get("teacher") or {}).get(
         "trace_format")
     if not trace_format:
         return None, "trace has no recorded trace_format"
-    turns, _ = parse_trace(raw, trace_format, workspace=None)
+    turns, parsed = parse_trace(raw, trace_format, workspace=None)
     if not any(message["role"] == "assistant" for message in turns):
         return None, "no assistant turns"
 
@@ -151,7 +157,7 @@ def build_row(seed: dict, info: dict) -> tuple[dict | None, str | None]:
     used = sorted({call["function"]["name"]
                    for message in turns if message["role"] == "assistant"
                    for call in message.get("tool_calls") or []})
-    tools = tool_schemas_for(trace_format, turns)
+    tools = (parsed or {}).get("tools") or tool_schemas_for(trace_format, turns)
 
     teacher = info.get("teacher") or {}
     observed = teacher.get("observed_models") or (

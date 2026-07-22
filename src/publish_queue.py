@@ -75,30 +75,36 @@ def restore_hidden_acceptances() -> list[str]:
 
 
 def accepted_tasks(accepted: set[str] | None = None, *,
-                   validate_artifacts: bool = True) -> list[tuple[float, str, int]]:
+                   validate_artifacts: bool = True, kind: str = "trace",
+                   traces_root: Path | None = None) -> list[tuple[float, str, int]]:
+    traces_root = traces_root or TRACES
     from run_state import connect
     db = connect()
     try:
-        if accepted is None:
+        if accepted is None and kind == "trace":
             from seed_inventory import accepted_ids
             accepted = accepted_ids(db)
+        elif accepted is None:
+            accepted = {str(row[0]) for row in db.execute(
+                "SELECT DISTINCT a.seed_id FROM attempts a JOIN runs r ON r.id=a.run_id "
+                "WHERE r.kind=? AND a.status='accepted'", (kind,))}
         versions = {str(row[0]): int(row[1]) for row in db.execute(
             "SELECT a.seed_id,MAX(a.id) FROM attempts a "
             "JOIN runs r ON r.id=a.run_id "
-            "WHERE r.kind='trace' AND a.status='accepted' GROUP BY a.seed_id")}
+            "WHERE r.kind=? AND a.status='accepted' GROUP BY a.seed_id", (kind,))}
     finally:
         db.close()
     if not validate_artifacts:
         return sorted((0.0, task, versions[task]) for task in accepted
                       if task in versions)
     ready = []
-    for path in (TRACES / "reviews").glob("*.json"):
+    for path in (traces_root / "reviews").glob("*.json"):
         try:
             review = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
             continue
         if (path.stem in accepted and is_accepted(review)
-                and (TRACES / "meta" / path.name).is_file()):
+                and (traces_root / "meta" / path.name).is_file()):
             ready.append((path.stat().st_mtime, path.stem,
                           versions.get(path.stem, 0)))
     return sorted(ready)
@@ -158,15 +164,15 @@ def batch_size() -> int:
     return value
 
 
-def tracing_has_unfinished_work() -> bool:
+def tracing_has_unfinished_work(kind: str = "trace") -> bool:
     """Ledger state, not service liveness, decides final partial-batch flushes."""
     from run_state import connect
     db = connect()
     try:
         row = db.execute(
             "SELECT COUNT(*) FROM jobs j JOIN runs r ON r.id=j.run_id "
-            "WHERE r.kind='trace' AND r.status='running' "
-            "AND j.status IN ('pending','retry','running')").fetchone()
+            "WHERE r.kind=? AND r.status='running' "
+            "AND j.status IN ('pending','retry','running')", (kind,)).fetchone()
         return bool(row and row[0])
     finally:
         db.close()
@@ -178,6 +184,54 @@ def save_acknowledged(path: Path, attempts: dict[str, int]) -> None:
     pending.write_text(json.dumps({"published_tasks": sorted(attempts),
         "published_attempts": dict(sorted(attempts.items()))}, indent=2) + "\n")
     pending.replace(path)
+
+
+def process_companion_once() -> bool:
+    """Process one companion batch inside the existing publication queue."""
+    from synthetic_corrections import (KIND, build_companion, correction_paths,
+                                       settings)
+    config = load_config()
+    opts = settings(config)
+    if not opts["enabled"] or not opts["hf_dataset"]:
+        return False
+    paths = correction_paths()
+    acknowledgements = paths.root / "published-trajectories.json"
+    ready = accepted_tasks(kind=KIND, traces_root=paths.traces)
+    if not ready:
+        return False
+    from hf_sync import ensure_local_dataset
+    output = paths.publish / "traces.jsonl"
+    ensure_local_dataset(target=output, dataset=opts["hf_dataset"],
+                         filename="traces.jsonl")
+    state = json.loads(acknowledgements.read_text()) if acknowledgements.is_file() else {}
+    published = {str(key): int(value) for key, value in
+                 (state.get("published_attempts") or {}).items()}
+    if not acknowledgements.is_file():
+        versions = {task: version for _, task, version in ready}
+        published = {task: versions.get(task, 0) for task in published_tasks(output)}
+        save_acknowledged(acknowledgements, published)
+    pending = [(stamp, task, version) for stamp, task, version in ready
+               if version > published.get(task, -1)]
+    if not pending:
+        return False
+    if len(pending) < batch_size() and tracing_has_unfinished_work(KIND):
+        return False
+    batch = pending[:batch_size()]
+    tasks = [task for _, task, _ in batch]
+    build_companion(paths, config)
+    title = (f"Add synthetic correction {tasks[0]}" if len(tasks) == 1 else
+             f"Add {len(tasks)} synthetic corrections: {tasks[0]} through {tasks[-1]}")
+    args = ["moonshiner.py", "publish", "--dataset", opts["hf_dataset"],
+            "--dir", str(paths.publish), "--yes", "--commit-message", title]
+    for task in tasks:
+        args.extend(["--task", task])
+    run(*args)
+    verify_remote(opts["hf_dataset"], title)
+    for _, task, version in batch:
+        published[task] = version
+    save_acknowledged(acknowledgements, published)
+    print(f"[published synthetic corrections] {len(tasks)}", flush=True)
+    return True
 
 
 def main() -> int:
@@ -218,13 +272,15 @@ def main() -> int:
     print(f"publish queue active: {dataset}; {len(known)} existing tasks", flush=True)
     blocked: set[str] = set()
     while True:
+        published_correction = process_companion_once()
         pending = [(stamp, task, version)
                    for stamp, task, version in accepted_tasks()
                    if (task not in known
                        or version > published_attempts.get(task, -1))
                    and task not in blocked]
         if not pending:
-            time.sleep(2)
+            if not published_correction:
+                time.sleep(2)
             continue
         size = batch_size()
         if len(pending) < size and tracing_has_unfinished_work():

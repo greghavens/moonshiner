@@ -177,6 +177,57 @@ together. `jsonl-hf-parquet` publishes JSONL for Hugging Face to convert, while
 
 These settings are reread between work items. Reducing concurrency does not cancel active model calls.
 
+## Synthetic corrections companion
+
+Synthetic corrections are optional and disabled by default. They are intended
+only for traces that exhausted their normal trace attempts, never passed the
+trace judge, and missed an otherwise correct result by a small, obvious defect.
+Examples include an omitted tool call, a one-line code fix, or a genuinely
+missing small file. Rewritten reasoning, refactoring, broad replanning, invented
+work, and unrelated changes are rejected.
+
+Configure the feature:
+
+```bash
+moonshiner synthetic-corrections configure
+```
+
+The correction harness and model default to the current trace judge. Moonshiner
+asks for another provider credential only if the selected runtime needs one and
+no credential is already configured. The companion Hugging Face target defaults
+to the primary dataset name with `-synthetic-corrections` appended. Each trace
+gets at most two correction attempts by default.
+
+Preview eligible work without model calls:
+
+```bash
+moonshiner synthetic-corrections run --dry-run
+```
+
+Start paid correction processing explicitly:
+
+```bash
+moonshiner synthetic-corrections run --yes
+```
+
+Moonshiner examines up to three preserved failures for each use case but creates
+at most one corrected trajectory. A use case is excluded if any current-revision
+trace ever passed. The source reasoning must remain unchanged, the correction
+must be minimal, and the corrected trace must pass normal verification and the
+normal independent trace judge. A judge rejection returns the item to the end of
+the correction queue with feedback while attempts remain.
+
+Corrections use the existing judge path and publication queue. Accepted corrections
+are routed explicitly to an isolated companion dataset with the same canonical
+schema, publication format, generated card, and banner as the primary dataset.
+They never enter or modify the primary dataset.
+
+Show correction status:
+
+```bash
+moonshiner synthetic-corrections status
+```
+
 ## Resume existing work
 
 Import an existing directory of traces or prepared rows:

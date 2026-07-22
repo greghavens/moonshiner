@@ -10,7 +10,7 @@ from pathlib import Path
 from common import RUNS
 
 DB_PATH = RUNS / "moonshiner.sqlite3"
-RUN_KINDS = {"seed", "trace"}
+RUN_KINDS = {"seed", "trace", "synthetic-correction"}
 
 
 def now() -> str:

@@ -88,11 +88,13 @@ def _backfill_baseline(state: dict, marker: Path) -> dict:
 
 
 def ensure_local_dataset(*, check_remote: bool | None = None,
-                         target: Path | None = None) -> dict:
+                         target: Path | None = None,
+                         dataset: str | None = None,
+                         filename: str | None = None) -> dict:
     """Bootstrap the canonical file once; thereafter trust and append locally."""
     publish = CONFIG.get("publish") or {}
-    dataset = publish.get("hf_dataset")
-    filename = str(publish.get("filename") or "traces.jsonl")
+    dataset = dataset or publish.get("hf_dataset")
+    filename = str(filename or publish.get("filename") or "traces.jsonl")
     target = target or DATA / "hf-publish" / filename
     marker_name = hashlib.sha256(f"{dataset}:{filename}".encode()).hexdigest()[:16]
     marker = DATA / "hf-sync" / f"{marker_name}.json"

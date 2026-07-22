@@ -71,6 +71,16 @@ These are explicit project-owner requirements and apply to every change:
 - A trace without native evidence for each recorded tool call and corresponding
   result is infrastructure failure, not training data, and must never be
   judged as a candidate or published.
+- The sole explicit exception is the opt-in `synthetic-correction` action queue.
+  It may correct only current-revision trace rejections that never passed, must
+  preserve the failed trace's reasoning unchanged, and may make only the
+  smallest obvious repair. It examines at most three preserved failures per use
+  case, creates at most one companion trajectory, defaults to two per-trace
+  correction attempts, and sends every correction through the normal trace
+  judge. Rejections return to the tail with judge feedback. Accepted corrections
+  use the one existing formatter, validator, card generator, and publication
+  queue but an explicit isolated companion-dataset target; they never enter or
+  mutate the primary dataset.
 - A trace gets at most two total attempts for its one seed across every
   resumption. Any limit applies only to that individual seed/trace. Starting a
   new process must never reset the trace's lifetime count.

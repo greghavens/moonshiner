@@ -84,6 +84,22 @@ class FrontDoor(unittest.TestCase):
         self.assertIn(f"--unit=moonshiner-trace-continuous-{project_key}",
                       commands[1])
 
+    def test_enabled_synthetic_correction_queue_starts_with_moonshiner(self):
+        config = {"pipeline": {"queues": {"seed_authoring": False,
+                                             "tracing": False}},
+                  "synthetic_corrections": {"enabled": True}}
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch("common.CONFIG", config), \
+             mock.patch("common.RUNS", pathlib.Path(directory)), \
+             mock.patch.object(m, "_ensure_configured_pi"), \
+             mock.patch.object(m.subprocess, "run",
+                               side_effect=[mock.Mock(returncode=3),
+                                            mock.Mock(returncode=0)]) as run:
+            self.assertEqual(m._start_default_queues(), 0)
+        command = run.call_args_list[1].args[0]
+        self.assertIn("synthetic-corrections", command)
+        self.assertEqual(command[-3:], ["synthetic-corrections", "run", "--yes"])
+
     def test_normal_start_provisions_missing_pi_in_stable_user_toolchain(self):
         config = {"teacher": {"runtime": "pi-openrouter"},
                   "runtimes": {"pi-openrouter": {"cli": "pi",

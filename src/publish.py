@@ -167,7 +167,8 @@ def main(argv=None)->int:
     if not args.dataset:parser.error("--dataset is required")
     if not args.yes:parser.error("publishing requires --yes")
     traces=args.dir/"traces.jsonl"
-    sync = ensure_local_dataset(target=traces)
+    sync = ensure_local_dataset(target=traces, dataset=args.dataset,
+                                filename=traces.name)
     if sync.get("dataset") and sync.get("dataset") != args.dataset:
         raise RuntimeError("publish target differs from the local append baseline")
     marker_name=hashlib.sha256(f"{args.dataset}:{traces.name}".encode()).hexdigest()[:16]
@@ -214,16 +215,17 @@ def main(argv=None)->int:
         if hits:raise ValueError(f"{path}: privacy findings {hits}")
     private=bool(CONFIG.get("publish",{}).get("private",True))
     auth_token = token()
+    from huggingface_hub import (CommitOperationAdd, CommitOperationDelete,
+                                 HfApi)
+    api = HfApi(token=auth_token)
+    api.create_repo(args.dataset, repo_type="dataset", private=private, exist_ok=True)
     request=urllib.request.Request(f"https://huggingface.co/api/datasets/{args.dataset}/settings",
         data=json.dumps({"private":private}).encode(),headers={"Authorization":f"Bearer {auth_token}","Content-Type":"application/json"},method="PUT")
     with urllib.request.urlopen(request) as response:
         if response.status//100!=2:raise RuntimeError("dataset visibility update failed")
-    from huggingface_hub import (CommitOperationAdd, CommitOperationDelete,
-                                 HfApi)
     operations = [CommitOperationAdd(
         path_in_repo=path.relative_to(args.dir).as_posix(),
         path_or_fileobj=str(path)) for path in files]
-    api = HfApi(token=auth_token)
     remote = set(api.list_repo_files(args.dataset, repo_type="dataset"))
     active_remote = {path.relative_to(args.dir).as_posix() for path in files}
     operations.extend(CommitOperationDelete(path_in_repo=path)

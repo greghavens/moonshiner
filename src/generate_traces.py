@@ -66,11 +66,16 @@ def _interaction_turns(seed: dict) -> list[str] | None:
 
 
 def trace_task(seed: dict, teacher=None, *, force: bool = False,
-               attempts: int = 1, feedback: str | None = None) -> dict:
+               attempts: int = 1, feedback: str | None = None,
+               traces_root: Path | None = None) -> dict:
     """Generate (and verify) one trace for ``seed``; return its meta record."""
-    for directory in (RAW, META, DIFFS):
+    traces_root = traces_root or TRACES
+    raw_dir = traces_root / "raw"
+    meta_dir = traces_root / "meta"
+    diffs_dir = traces_root / "diffs"
+    for directory in (raw_dir, meta_dir, diffs_dir):
         directory.mkdir(parents=True, exist_ok=True)
-    meta_path = META / f"{seed['id']}.json"
+    meta_path = meta_dir / f"{seed['id']}.json"
     if meta_path.exists() and not force:
         existing = json.loads(meta_path.read_text())
         if existing.get("passed"):
@@ -88,7 +93,7 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
         protected_before = protected_hashes(seed, workspace)
         try:
             result = teacher.run_trace(
-                seed, workspace, out_dir=RAW, system_prompt=SYSTEM_PROMPT,
+                seed, workspace, out_dir=raw_dir, system_prompt=SYSTEM_PROMPT,
                 prompt=prompt, interaction=interaction,
                 security=False, tools=tools)
         except ModelUnavailable as blocked:
@@ -111,7 +116,7 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
         protected_after = protected_hashes(seed, workspace)
         protected_intact = protected_before == protected_after
         diff = git_diff(workspace)
-        (DIFFS / f"{seed['id']}.patch").write_text(diff)
+        (diffs_dir / f"{seed['id']}.patch").write_text(diff)
 
         raw_text = result.raw_path.read_text(errors="replace") \
             if result.raw_path.exists() else ""
@@ -139,8 +144,9 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
             "protected_hashes": protected_before,
             "raw_sha256": _sha256(raw_text),
             "diff_sha256": _sha256(diff),
-            "raw_path": str(result.raw_path.relative_to(TRACES.parent)),
-            "diff_path": f"traces/diffs/{seed['id']}.patch",
+            "raw_path": str(result.raw_path.relative_to(traces_root.parent)),
+            "diff_path": str((diffs_dir / f"{seed['id']}.patch").relative_to(
+                traces_root.parent)),
             "feedback_used": bool(feedback),
             "teacher": {
                 "runtime": teacher.name,

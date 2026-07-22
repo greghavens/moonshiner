@@ -341,13 +341,18 @@ def _front_matter(pretty_name: str, license_id: str, tags: list[str],
     return "\n".join(lines)
 
 
-def build_card(rows: list[dict], *, stage: str = "release") -> str:
+def build_card(rows: list[dict], *, stage: str = "release",
+               config: dict | None = None, publish_dir: Path | None = None,
+               companion_primary: str | None = None) -> str:
     if stage not in ("release", "preview"):
         raise ValueError(f"unknown card stage: {stage!r}")
     preview = stage == "preview"
-    publish = CONFIG.get("publish", {})
-    teacher = CONFIG.get("teacher", {})
-    judge = CONFIG.get("judge", {})
+    config = config or CONFIG
+    explicit_publish_dir = publish_dir is not None
+    publish_dir = publish_dir or PUBLISH_DIR
+    publish = config.get("publish", {})
+    teacher = config.get("teacher", {})
+    judge = config.get("judge", {})
 
     trajectories = _trajectories(rows)
     total_traj = len(trajectories)
@@ -375,14 +380,14 @@ def build_card(rows: list[dict], *, stage: str = "release") -> str:
                      or (rows[0].get("teacher_model") if rows else None)
                      or "configured-model")
     teacher_runtime = teacher.get("runtime", "pi")
-    runtime_config = (CONFIG.get("runtimes") or {}).get(teacher_runtime) or {}
+    runtime_config = (config.get("runtimes") or {}).get(teacher_runtime) or {}
     provider = (rows[0].get("provider") if rows else None) \
         or teacher.get("provider") or runtime_config.get("display_provider") \
         or runtime_config.get("provider") or "the serving provider"
     reasoning = teacher.get("reasoning", "max")
     judge_model = judge.get("model", "an independent reviewer")
     judge_runtime = judge.get("runtime", "codex")
-    profile = CONFIG.get("model_profile") or {}
+    profile = config.get("model_profile") or {}
     model_display = (publish.get("model_display")
                      or (profile.get("display_name")
                          if profile.get("id") == teacher_model else None)
@@ -553,12 +558,13 @@ def build_card(rows: list[dict], *, stage: str = "release") -> str:
         "\n- Training or evaluating **defensive secure-coding and code-review** "
         "agents." if has_security else "")
 
-    publish_mode = str((CONFIG.get("publish") or {}).get(
+    publish_mode = str((config.get("publish") or {}).get(
         "format", "jsonl-hf-parquet"))
-    manifest_path = PUBLISH_DIR / "dataset-manifest.json"
+    traces_path = publish_dir / "traces.jsonl" if explicit_publish_dir else TRACES
+    manifest_path = publish_dir / "dataset-manifest.json"
     if publish_mode == "parquet-shards" and manifest_path.is_file():
         file_size = int(json.loads(manifest_path.read_text()).get("bytes") or 0)
-        jsonl_size = TRACES.stat().st_size if TRACES.is_file() else 0
+        jsonl_size = traces_path.stat().st_size if traces_path.is_file() else 0
         size_label = (f"{_human_size(file_size)} PARQUET · "
                       f"{_human_size(jsonl_size)} JSONL")
         layout = ("The Hugging Face viewer reads the validated active Parquet "
@@ -566,9 +572,32 @@ def build_card(rows: list[dict], *, stage: str = "release") -> str:
                   "canonical `traces.jsonl` is also published for direct "
                   "download and conversion.")
     else:
-        file_size = TRACES.stat().st_size if TRACES.is_file() else 0
+        file_size = traces_path.stat().st_size if traces_path.is_file() else 0
         size_label = _human_size(file_size)
         layout = "Everything ships in one data file: `traces.jsonl`."
+    companion = (f"\n> **Synthetic Corrections companion dataset.** The original dataset is "
+                 f"[{companion_primary}](https://huggingface.co/datasets/{companion_primary}). "
+                 "These are narrowly, synthetically corrected, independently re-judged traces that never "
+                 "passed in the original dataset.\n" if companion_primary else "")
+    trace_claim = (
+        "- **Narrowly corrected failed trajectories.** Every row starts from a genuine model "
+        "session that never passed the primary trace judge. The source reasoning is preserved "
+        "unchanged; only a minimal, explicitly disclosed synthetic correction is retained."
+        if companion_primary else
+        f"- **All real model trajectories.** Every row is a cumulative prefix of a genuine\n"
+        f"  {model_display} session captured end-to-end. The agent's causal exploration, tool\n"
+        "  arguments, results, corrections, and final responses are retained.")
+    provenance = (
+        f"Source failures were generated with {model_display} (`{teacher_model}`). "
+        f"The configured correction model made only narrowly eligible synthetic repairs, "
+        f"after which deterministic verification and the independent `{judge_model}` trace "
+        "judge were run again. Source reasoning is preserved unchanged. Provider credentials, "
+        "user keys, and host-identifying data are scrubbed before publication."
+        if companion_primary else
+        f"Generated with {model_display} (`{teacher_model}`), then filtered by deterministic verification and\n"
+        "explicit Codex acceptance review. Codex supplies no demonstration content; it\n"
+        "only judges or requests replacement of candidate traces. Provider credentials,\n"
+        "user keys, and host-identifying data are scrubbed before publication.")
     return f"""{_front_matter(pretty_name, license_id, tags, size_cat, has_security)}
 
 # {pretty_name}
@@ -580,6 +609,7 @@ def build_card(rows: list[dict], *, stage: str = "release") -> str:
 </div>
 
 {ATTRIBUTION}
+{companion}
 
 Behavior-preserving **instruction-following, tool-use, and agent trajectories**
 from **{model_display}** (`{teacher_model}`). The category and row-share tables
@@ -591,9 +621,7 @@ programs and substantially more sessions will be added to this same repo.
 
 ## What makes it different
 
-- **All real model trajectories.** Every row is a cumulative prefix of a genuine
-  {model_display} session captured end-to-end. The agent's causal exploration, tool
-  arguments, results, corrections, and final responses are retained.
+{trace_claim}
 - **One next step per row.** A trajectory with N assistant turns produces N
   rows. Row k contains the complete context through assistant turn k; that final
   assistant message is the sole training target.
@@ -654,10 +682,7 @@ state tracking, build-test-fix loops, and verification-driven completion.
 
 ## Provenance
 
-Generated with {model_display} (`{teacher_model}`), then filtered by deterministic verification and
-explicit Codex acceptance review. Codex supplies no demonstration content; it
-only judges or requests replacement of candidate traces. Provider credentials,
-user keys, and host-identifying data are scrubbed before publication.
+{provenance}
 
 ## License
 

@@ -226,13 +226,16 @@ def apply_candidate_patch(workspace: Path, patch: str) -> tuple[bool, str]:
     return False, proc.stderr.strip()[:2000]
 
 
-def deterministic_screen(seed: dict, meta: dict) -> dict:
+def deterministic_screen(seed: dict, meta: dict,
+                         traces_root: Path | None = None) -> dict:
     """Fail-closed gates that need no model. Returns a structured result."""
     failures: list[str] = []
     gates: dict = {}
 
     # Artifact hashes associate diagnostics with the exact generated trace.
-    raw_path = RAW / Path(meta.get("raw_path", f"raw/{seed['id']}.jsonl")).name
+    traces_root = traces_root or TRACES
+    raw_dir, diffs_dir = traces_root / "raw", traces_root / "diffs"
+    raw_path = raw_dir / Path(meta.get("raw_path", f"raw/{seed['id']}.jsonl")).name
     if raw_path.exists():
         gates["raw_fresh"] = _sha256_text(
             raw_path.read_text(errors="replace")) == meta.get("raw_sha256")
@@ -241,7 +244,7 @@ def deterministic_screen(seed: dict, meta: dict) -> dict:
     if not gates["raw_fresh"]:
         failures.append("stale: raw trace hash mismatch or missing")
 
-    patch_path = DIFFS / f"{seed['id']}.patch"
+    patch_path = diffs_dir / f"{seed['id']}.patch"
     patch = patch_path.read_text() if patch_path.exists() else ""
     gates["diff_fresh"] = _sha256_text(patch) == meta.get("diff_sha256")
     if not gates["diff_fresh"]:
@@ -331,6 +334,22 @@ def reviewer_prompt(seed: dict, meta: dict, messages: list[dict],
                               for message in messages
                               for call in message.get("tool_calls") or []}),
     }
+    correction = meta.get("synthetic_correction") or {}
+    correction_audit = ""
+    if correction:
+        correction_audit = (
+            "\n\nSYNTHETIC CORRECTION AUDIT\n"
+            "This companion-dataset candidate must preserve the failed source "
+            "reasoning exactly and make only the smallest obvious correction. "
+            "Rewritten reasoning, refactoring, broad message replacement, invented "
+            "tool results, or unrelated edits are automatic rejection. Independently "
+            "confirm both reasoning preservation and minimality; do not rely only on "
+            "the machine delta.\n"
+            f"<delta>\n{json.dumps(correction.get('delta') or {}, indent=2)}\n</delta>\n"
+            f"<failed_source_trace>\n{correction.get('source_trace', '')}\n"
+            "</failed_source_trace>\n"
+            f"<corrected_trace>\n{json.dumps(messages, ensure_ascii=False)}\n"
+            "</corrected_trace>")
     return scrub_text(
         "You are an independent, read-only reviewer judging whether an autonomous "
         "coding agent's solution should be accepted for distillation training.\n\n"
@@ -342,7 +361,7 @@ def reviewer_prompt(seed: dict, meta: dict, messages: list[dict],
         f"TASK\n<task>\n{task}\n</task>\n\n"
         f"DETERMINISTIC AUDIT (already run by the harness)\n"
         f"<audit>\n{json.dumps(audit, indent=2)}\n</audit>\n\n"
-        f"AGENT FINAL SUMMARY\n<final>\n{final}\n</final>\n\n"
+        f"AGENT FINAL SUMMARY\n<final>\n{final}\n</final>{correction_audit}\n\n"
         "Inspect the workspace as needed (read-only), then return only the JSON "
         "verdict object required by the schema.")
 
@@ -451,11 +470,14 @@ def pending_first_pass_seeds(seeds: list[dict], limit: int = 0) -> list[dict]:
     return pending[:limit] if limit else pending
 
 
-def screen(seed: dict, judge=None) -> dict:
+def screen(seed: dict, judge=None, *, traces_root: Path | None = None) -> dict:
     """Run the deterministic screen and, if it passes, the independent judge."""
-    REVIEWS.mkdir(parents=True, exist_ok=True)
-    meta = json.loads((META / f"{seed['id']}.json").read_text())
-    deterministic = deterministic_screen(seed, meta)
+    traces_root = traces_root or TRACES
+    raw_dir, meta_dir = traces_root / "raw", traces_root / "meta"
+    diffs_dir, reviews_dir = traces_root / "diffs", traces_root / "reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    meta = json.loads((meta_dir / f"{seed['id']}.json").read_text())
+    deterministic = deterministic_screen(seed, meta, traces_root)
 
     review: dict = {
         "id": seed["id"],
@@ -464,14 +486,14 @@ def screen(seed: dict, judge=None) -> dict:
         "deterministic": deterministic,
     }
     judge = judge or get_judge()
-    raw_path = RAW / Path(meta.get("raw_path", f"raw/{seed['id']}.jsonl")).name
+    raw_path = raw_dir / Path(meta.get("raw_path", f"raw/{seed['id']}.jsonl")).name
     messages, _ = parse_trace(raw_path, meta.get("trace_format", ""), workspace=None)
     workspace = materialize(seed, name=f"review-{seed['id']}")
     run_setup(seed, workspace)
-    apply_candidate_patch(workspace, (DIFFS / f"{seed['id']}.patch").read_text()
-                          if (DIFFS / f"{seed['id']}.patch").exists() else "")
+    apply_candidate_patch(workspace, (diffs_dir / f"{seed['id']}.patch").read_text()
+                          if (diffs_dir / f"{seed['id']}.patch").exists() else "")
     try:
-        review_artifacts = REVIEWS / seed["id"]
+        review_artifacts = reviews_dir / seed["id"]
         review_artifacts.mkdir(parents=True, exist_ok=True)
         result = judge.run_review(
             reviewer_prompt(seed, meta, messages, deterministic), workspace,
@@ -487,13 +509,13 @@ def screen(seed: dict, judge=None) -> dict:
     status = "accepted" if accepted else "review_reject"
     reason = error or "all categories clear; requirements met"
     if not healthy_judge:
-        attempts = _prior_judge_errors(seed["id"], meta) + 1
+        attempts = _prior_judge_errors(seed["id"], meta, reviews_dir) + 1
         status = "judge_error"
         reason = (f"judge execution or model attestation failed "
                   f"(attempt {attempts}/{JUDGE_ERROR_LIMIT})")
         review["judge_errors"] = attempts
     elif not accepted and verdict_is_malformed(result.verdict):
-        attempts = _prior_judge_errors(seed["id"], meta) + 1
+        attempts = _prior_judge_errors(seed["id"], meta, reviews_dir) + 1
         if attempts < JUDGE_ERROR_LIMIT:
             status = "judge_error"
             reason = (f"judge verdict malformed ({error}); will re-review "
@@ -513,14 +535,16 @@ def screen(seed: dict, judge=None) -> dict:
                   "model_attested": result.model_attested,
                   "timed_out": result.timed_out},
     })
-    _write_review(seed["id"], review)
+    _write_review(seed["id"], review, reviews_dir)
     return review
 
 
-def _prior_judge_errors(seed_id: str, meta: dict) -> int:
+def _prior_judge_errors(seed_id: str, meta: dict,
+                        reviews_dir: Path | None = None) -> int:
     """Malformed-verdict count already recorded for exactly this trace."""
+    reviews_dir = reviews_dir or REVIEWS
     try:
-        review = json.loads((REVIEWS / f"{seed_id}.json").read_text())
+        review = json.loads((reviews_dir / f"{seed_id}.json").read_text())
     except (FileNotFoundError, json.JSONDecodeError):
         return 0
     if not is_judge_error(review):
@@ -531,8 +555,8 @@ def _prior_judge_errors(seed_id: str, meta: dict) -> int:
     return int(review.get("judge_errors", 1))
 
 
-def _write_review(seed_id: str, review: dict) -> None:
-    path = REVIEWS / f"{seed_id}.json"
+def _write_review(seed_id: str, review: dict, reviews_dir: Path = REVIEWS) -> None:
+    path = reviews_dir / f"{seed_id}.json"
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(review, indent=2) + "\n")
     tmp.replace(path)
