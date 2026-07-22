@@ -49,24 +49,27 @@ def select_snapshots(commits: Iterable, loader: Callable, *, keep: int) -> list[
         f"requested {keep} snapshots but only {len(selected)} verified snapshots exist")
 
 
-def deletion_plan(lfs_files: Iterable, retained: Iterable[Snapshot]) -> DeletionPlan:
-    protected = {oid for snapshot in retained for oid in snapshot.lfs_oids}
+def deletion_plan(lfs_files: Iterable, retained: Iterable[Snapshot], *,
+                  protected_oids: Iterable[str] = ()) -> DeletionPlan:
+    protected = ({oid for snapshot in retained for oid in snapshot.lfs_oids}
+                 | set(protected_oids))
     files = sorted((item for item in lfs_files if item.file_oid not in protected),
                    key=lambda item: (item.filename, item.file_oid))
     return DeletionPlan(files, sum(int(item.size) for item in files))
 
 
-def validate_repo_refs(refs) -> None:
-    """Refuse to rewrite history that has user-managed references off main."""
-    unexpected_branches = [ref.ref for ref in refs.branches
-                           if ref.ref != "refs/heads/main"]
-    tags = [ref.ref for ref in refs.tags]
-    pull_requests = [ref.ref for ref in (refs.pull_requests or [])]
-    unexpected = unexpected_branches + tags + pull_requests
-    if unexpected:
-        raise HistorySafetyError(
-            "history rewrite refused because these additional refs may retain "
-            "different snapshots: " + ", ".join(sorted(unexpected)))
+def extra_ref_oids(api, dataset: str, refs, token) -> tuple[set[str], list[str]]:
+    references = list(refs.branches) + list(refs.tags) + list(refs.converts)
+    references += list(refs.pull_requests or [])
+    names = sorted({item.ref for item in references
+                    if item.ref != "refs/heads/main"})
+    oids: set[str] = set()
+    for name in names:
+        tree = api.list_repo_tree(dataset, recursive=True, revision=name,
+                                  repo_type="dataset", token=token)
+        oids.update(item.lfs.sha256 for item in tree
+                    if getattr(item, "lfs", None) is not None)
+    return oids, names
 
 
 def validate_manifest(manifest: object, available_paths: set[str]) -> bool:
@@ -173,19 +176,24 @@ def run(dataset: str, *, keep: int, execute: bool) -> int:
     from publish import token as load_token
     auth = load_token()
     api = HfApi(token=auth)
-    validate_repo_refs(api.list_repo_refs(
-        dataset, repo_type="dataset", include_pull_requests=True, token=auth))
+    protected_oids, protected_refs = extra_ref_oids(
+        api, dataset, api.list_repo_refs(
+            dataset, repo_type="dataset", include_pull_requests=True, token=auth),
+        auth)
     commits = api.list_repo_commits(dataset, repo_type="dataset", token=auth)
     retained = select_snapshots(
         commits, lambda commit: _tree_snapshot(api, dataset, commit, auth),
         keep=keep)
     plan = deletion_plan(api.list_lfs_files(
-        dataset, repo_type="dataset", token=auth), retained)
+        dataset, repo_type="dataset", token=auth), retained,
+        protected_oids=protected_oids)
     print(f"HF history maintenance: {dataset}")
     print(f"Retain: {len(retained)} verified snapshots")
     for snapshot in retained:
         stamp = snapshot.created_at.isoformat() if snapshot.created_at else "unknown"
         print(f"  {snapshot.commit_id[:12]}  {stamp}  {snapshot.title}")
+    print(f"Protect: {len(protected_oids)} LFS objects reachable from "
+          f"{len(protected_refs)} additional refs")
     print(f"Delete: {len(plan.files)} unretained LFS objects "
           f"({_format_bytes(plan.bytes)})")
     if not execute:

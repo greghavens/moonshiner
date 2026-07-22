@@ -9,7 +9,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from hf_history_maintenance import (HistorySafetyError, Snapshot,
                                     deletion_plan, select_snapshots,
-                                    validate_manifest, validate_repo_refs)
+                                    extra_ref_oids, validate_manifest)
 
 
 def commit(name):
@@ -78,17 +78,30 @@ class SnapshotRetention(unittest.TestCase):
         self.assertFalse(validate_manifest(missing, {
             "README.md", "dataset-manifest.json", "data/a.parquet"}))
 
-    def test_history_rewrite_refuses_user_managed_refs(self):
+    def test_history_rewrite_protects_objects_reachable_from_every_extra_ref(self):
         ref = lambda name: SimpleNamespace(ref=name)
-        safe = SimpleNamespace(branches=[ref("refs/heads/main")], tags=[],
-                               pull_requests=[], converts=[ref("refs/convert/parquet")])
-        validate_repo_refs(safe)
-        unsafe = SimpleNamespace(
+        refs = SimpleNamespace(
             branches=[ref("refs/heads/main"), ref("refs/heads/archive")],
             tags=[ref("refs/tags/v1")], pull_requests=[ref("refs/pr/1")],
-            converts=[])
-        with self.assertRaisesRegex(HistorySafetyError, "refs/heads/archive"):
-            validate_repo_refs(unsafe)
+            converts=[ref("refs/convert/parquet")])
+        trees = {
+            "refs/heads/archive": [SimpleNamespace(lfs=SimpleNamespace(sha256="a"))],
+            "refs/tags/v1": [SimpleNamespace(lfs=SimpleNamespace(sha256="b"))],
+            "refs/pr/1": [SimpleNamespace(lfs=SimpleNamespace(sha256="c"))],
+            "refs/convert/parquet": [SimpleNamespace(lfs=None)],
+        }
+        api = SimpleNamespace(list_repo_tree=lambda dataset, **kwargs:
+                              trees[kwargs["revision"]])
+        oids, names = extra_ref_oids(api, "owner/data", refs, "token")
+        self.assertEqual(oids, {"a", "b", "c"})
+        self.assertEqual(names, sorted(trees))
+
+    def test_deletion_plan_keeps_extra_ref_objects(self):
+        retained = [Snapshot("a", "a", None, "a", {"snapshot"})]
+        files = [SimpleNamespace(file_oid=oid, size=10, filename=oid)
+                 for oid in ("snapshot", "pull-request", "obsolete")]
+        plan = deletion_plan(files, retained, protected_oids={"pull-request"})
+        self.assertEqual([item.file_oid for item in plan.files], ["obsolete"])
 
 
 if __name__ == "__main__":

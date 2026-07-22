@@ -206,9 +206,10 @@ deletion. After reviewing it, run the permanent history rewrite explicitly:
 moonshiner maintenance prune-hf-history --keep 10 --yes
 ```
 
-This maintenance action is never automatic. It refuses incomplete snapshots
-and repositories with user-managed tags, pull requests, or branches besides
-`main`, and it lets an active publish finish before rewriting history.
+This maintenance action is never automatic. It refuses incomplete snapshots,
+preserves LFS objects reachable from tags, pull requests, conversion refs, and
+branches besides `main`, and lets an active publish finish before rewriting
+history.
 
 ## Synthetic corrections companion
 
