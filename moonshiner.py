@@ -995,6 +995,9 @@ def main(argv: list[str] | None = None) -> int:
     if command == "storage":
         return _storage(rest)
     if command in {"run", "trace", "trace-run"}:
+        if command == "trace" and rest and rest[0] == "queue":
+            from trace_queue_cli import main as trace_queue_main
+            return trace_queue_main(rest[1:])
         if command == "trace" and rest and rest[0] == "import":
             from import_existing import main as import_main
             return import_main(rest[1:])

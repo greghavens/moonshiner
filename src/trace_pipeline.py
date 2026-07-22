@@ -122,6 +122,9 @@ def _selected(args) -> list[dict]:
              and seed["id"] not in accepted
              and seed["id"] not in blocked
              and has_remaining(seed["id"])]
+    from run_state import pending_trace_queue_entries
+    queue_order = {entry["seed_id"]: index for index, entry in enumerate(
+        pending_trace_queue_entries(ledger))}
     ledger.close()
     retry_order = str((CONFIG.get("pipeline", {}).get("trace") or {})
                       .get("retry_order", "immediate"))
@@ -129,6 +132,8 @@ def _selected(args) -> list[dict]:
         raise ValueError("pipeline.trace.retry_order must be immediate or tail")
     if retry_order == "tail":
         seeds.sort(key=lambda seed: attempts.get(seed["id"], 0))
+    seeds.sort(key=lambda seed: (seed["id"] not in queue_order,
+                                queue_order.get(seed["id"], 0)))
     if args.limit:
         seeds = seeds[:args.limit]
     elif not args.all and not only:

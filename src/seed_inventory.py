@@ -182,9 +182,10 @@ def accepted_ids(db=None, *, include_review_files: bool = True) -> set[str]:
     if owns_db:
         from run_state import connect
         db = connect()
-    from run_state import accepted_attempt_versions
+    from run_state import accepted_attempt_versions, pending_trace_queue_entries
     seed_versions = accepted_attempt_versions(db, "seed")
     trace_versions = accepted_attempt_versions(db, "trace")
+    queued = {entry["seed_id"] for entry in pending_trace_queue_entries(db)}
     if owns_db:
         db.close()
     # Imported rows and filesystem reviews are baseline acceptances. Once the
@@ -195,6 +196,7 @@ def accepted_ids(db=None, *, include_review_files: bool = True) -> set[str]:
             accepted.discard(seed_id)
     accepted.update(seed_id for seed_id, trace_version in trace_versions.items()
                     if trace_version > seed_versions.get(seed_id, 0))
+    accepted.difference_update(queued)
     return accepted
 
 

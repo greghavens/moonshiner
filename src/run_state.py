@@ -45,6 +45,11 @@ def connect(path: Path = DB_PATH) -> sqlite3.Connection:
       artifact_path TEXT, reasoning_stage TEXT, reasoning_effort TEXT,
       UNIQUE(run_id, seed_id, number)
     );
+    CREATE TABLE IF NOT EXISTS trace_queue_entries (
+      seed_id TEXT PRIMARY KEY, after_attempt_id INTEGER NOT NULL,
+      priority INTEGER NOT NULL DEFAULT 0, fresh_attempts INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
     """)
     columns={row[1] for row in db.execute("PRAGMA table_info(attempts)")}
     if "artifact_path" not in columns:
@@ -75,6 +80,33 @@ def accepted_attempt_versions(db: sqlite3.Connection, kind: str) -> dict[str, in
         WHERE r.kind=? AND a.status='accepted' GROUP BY a.seed_id""", (kind,))}
 
 
+def enqueue_traces(db: sqlite3.Connection, seed_ids: list[str], *,
+                   front: bool, fresh_attempts: bool) -> int:
+    timestamp = now()
+    priority = 1 if front else 0
+    rows = []
+    for seed_id in dict.fromkeys(seed_ids):
+        floor = db.execute("""SELECT COALESCE(MAX(a.id),0) FROM attempts a
+            JOIN runs r ON r.id=a.run_id WHERE r.kind='trace' AND a.seed_id=?""",
+            (seed_id,)).fetchone()[0]
+        rows.append((seed_id, int(floor), priority, int(fresh_attempts), timestamp))
+    db.executemany("""INSERT INTO trace_queue_entries
+        (seed_id,after_attempt_id,priority,fresh_attempts,created_at)
+        VALUES (?,?,?,?,?) ON CONFLICT(seed_id) DO UPDATE SET
+          after_attempt_id=excluded.after_attempt_id,priority=excluded.priority,
+          fresh_attempts=excluded.fresh_attempts,created_at=excluded.created_at""", rows)
+    db.commit()
+    return len(rows)
+
+
+def pending_trace_queue_entries(db: sqlite3.Connection) -> list[dict]:
+    return [dict(row) for row in db.execute("""SELECT q.* FROM trace_queue_entries q
+        WHERE NOT EXISTS (SELECT 1 FROM attempts a JOIN runs r ON r.id=a.run_id
+          WHERE r.kind='trace' AND a.seed_id=q.seed_id AND a.status='accepted'
+            AND a.id>q.after_attempt_id)
+        ORDER BY q.priority DESC,q.created_at,q.seed_id""")]
+
+
 def trace_attempt_counts_for_current_seed_revision(
         db: sqlite3.Connection) -> dict[str, int]:
     """Count trace attempts only after the latest accepted seed revision."""
@@ -82,9 +114,11 @@ def trace_attempt_counts_for_current_seed_revision(
         SELECT a.seed_id,COUNT(a.id) FROM attempts a
         JOIN runs r ON r.id=a.run_id
         WHERE r.kind='trace' AND a.status IN ('accepted','retry','exhausted')
-          AND a.id > COALESCE((SELECT MAX(sa.id) FROM attempts sa
+          AND a.id > MAX(COALESCE((SELECT MAX(sa.id) FROM attempts sa
             JOIN runs sr ON sr.id=sa.run_id WHERE sr.kind='seed'
-            AND sa.status='accepted' AND sa.seed_id=a.seed_id),0)
+            AND sa.status='accepted' AND sa.seed_id=a.seed_id),0),
+            COALESCE((SELECT CASE WHEN q.fresh_attempts=1 THEN q.after_attempt_id ELSE 0 END
+              FROM trace_queue_entries q WHERE q.seed_id=a.seed_id),0))
         GROUP BY a.seed_id""")}
 
 
@@ -232,9 +266,11 @@ def trace_reasoning_efforts_for_current_seed_revisions(
         FROM attempts a JOIN runs r ON r.id=a.run_id
         WHERE r.kind='trace'
           AND a.status IN ('accepted','retry','exhausted')
-          AND a.id > COALESCE((SELECT MAX(sa.id) FROM attempts sa
+          AND a.id > MAX(COALESCE((SELECT MAX(sa.id) FROM attempts sa
             JOIN runs sr ON sr.id=sa.run_id WHERE sr.kind='seed'
-            AND sa.status='accepted' AND sa.seed_id=a.seed_id),0)
+            AND sa.status='accepted' AND sa.seed_id=a.seed_id),0),
+            COALESCE((SELECT CASE WHEN q.fresh_attempts=1 THEN q.after_attempt_id ELSE 0 END
+              FROM trace_queue_entries q WHERE q.seed_id=a.seed_id),0))
         ORDER BY a.id""").fetchall()
     efforts: dict[str, list[str]] = {}
     for row in rows:

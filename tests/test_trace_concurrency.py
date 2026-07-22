@@ -13,11 +13,33 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from run_state import (abandon_claim, claim_job, connect, create_run, finish_attempt,
-                       live_trace_run_ids, set_job, start_attempt)  # noqa: E402
+                       enqueue_traces, live_trace_run_ids, pending_trace_queue_entries,
+                       set_job, start_attempt,
+                       trace_attempt_counts_for_current_seed_revision,
+                       trace_reasoning_efforts_for_current_seed_revision)  # noqa: E402
 import trace_pipeline  # noqa: E402
 
 
 class TraceConcurrency(unittest.TestCase):
+    def test_generic_fresh_queue_entry_requires_new_acceptance(self):
+        db = connect(self.path)
+        start_attempt(db, self.run_id, "seed-00", 1,
+                      reasoning_stage="xhigh", reasoning_effort="max")
+        finish_attempt(db, self.run_id, "seed-00", 1, "accepted")
+        enqueue_traces(db, ["seed-00"], front=True, fresh_attempts=True)
+        self.assertEqual([row["seed_id"] for row in pending_trace_queue_entries(db)],
+                         ["seed-00"])
+        self.assertEqual(trace_attempt_counts_for_current_seed_revision(db).get(
+            "seed-00", 0), 0)
+        self.assertEqual(trace_reasoning_efforts_for_current_seed_revision(
+            db, "seed-00"), [])
+        second = create_run(db, "trace", {}, {"max_attempts": 3}, ["seed-00"])
+        start_attempt(db, second, "seed-00", 1,
+                      reasoning_stage="xhigh", reasoning_effort="max")
+        finish_attempt(db, second, "seed-00", 1, "accepted")
+        self.assertEqual(pending_trace_queue_entries(db), [])
+        db.close()
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.path = pathlib.Path(self.directory.name) / "ledger.sqlite3"
@@ -68,6 +90,22 @@ class TraceConcurrency(unittest.TestCase):
              mock.patch.object(trace_pipeline, "select_seeds", return_value=seeds), \
              mock.patch.object(trace_pipeline, "CONFIG",
                                {"pipeline": {"trace": {"retry_order": "tail"}}}), \
+             mock.patch("seed_inventory.accepted_ids", return_value=set()), \
+             mock.patch("common.synthetic_tool_contract", return_value=None):
+            selected = trace_pipeline._selected(args)
+        self.assertEqual([seed["id"] for seed in selected], ["seed-01", "seed-00"])
+
+    def test_front_queue_entry_precedes_ordinary_catalog_work(self):
+        db = connect(self.path)
+        enqueue_traces(db, ["seed-01"], front=True, fresh_attempts=True)
+        db.close()
+        args = type("Args", (), {"only": None, "category": None, "tag": None,
+            "name": None, "max_attempts": 3, "limit": 0, "all": True})()
+        seeds = [{"id": "seed-00"}, {"id": "seed-01"}]
+        with mock.patch.object(trace_pipeline, "connect", side_effect=lambda: connect(self.path)), \
+             mock.patch.object(trace_pipeline, "select_seeds", return_value=seeds), \
+             mock.patch.object(trace_pipeline, "CONFIG",
+                               {"pipeline": {"trace": {"retry_order": "immediate"}}}), \
              mock.patch("seed_inventory.accepted_ids", return_value=set()), \
              mock.patch("common.synthetic_tool_contract", return_value=None):
             selected = trace_pipeline._selected(args)
