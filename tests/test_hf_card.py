@@ -45,6 +45,13 @@ def _coding_and_security():
 
 
 class Units(unittest.TestCase):
+    def test_catalog_never_publishes_full_distill_as_a_program(self):
+        catalog = json.loads((_ROOT / "SEED_CATALOG.json").read_text())
+        programs = {str(item.get("program") or "").casefold()
+                    for items in catalog["categories"].values()
+                    for item in items}
+        self.assertNotIn("full-distill", programs)
+
     def test_whole_trajectory_counts_each_assistant_turn_as_a_training_row(self):
         row = _preview_row("multi-turn", "en", "tool-calling")
         text = card.build_card([row])
