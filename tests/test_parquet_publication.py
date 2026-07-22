@@ -93,6 +93,28 @@ class ParquetPublication(unittest.TestCase):
                        for path in manifest["active_shards"]]
             self.assertTrue(all(schema.equals(schemas[0]) for schema in schemas))
 
+    def test_late_nested_message_fields_are_preserved_losslessly(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = pathlib.Path(name); source = root / "traces.jsonl"
+            rows = [row("task-a"), row("task-b")]
+            rows[1]["messages"][-1]["tool_calls"] = [{
+                "id": "call-1", "type": "function",
+                "function": {"name": "search", "arguments": '{"q":"x"}'},
+            }]
+            rows[1]["messages"][-1]["reasoning_details"] = [{
+                "type": "text", "text": "inspect", "index": 0,
+            }]
+            self.write_rows(source, rows)
+            parquet.sync(source, root,
+                         changed_tasks={item["task"] for item in rows})
+            rebuilt = parquet.read_active_rows(root)
+            self.assertEqual([item["task"] for item in rebuilt],
+                             [item["task"] for item in rows])
+            self.assertEqual(rebuilt[1]["messages"][-1]["tool_calls"],
+                             rows[1]["messages"][-1]["tool_calls"])
+            self.assertEqual(rebuilt[1]["messages"][-1]["reasoning_details"],
+                             rows[1]["messages"][-1]["reasoning_details"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -39,12 +39,85 @@ def _schema_from_text(value: str):
     return pa.ipc.read_schema(pa.BufferReader(base64.b64decode(value)))
 
 
+def _describe(value):
+    if value is None:
+        return ("null",)
+    if isinstance(value, bool):
+        return ("bool",)
+    if isinstance(value, int):
+        return ("int",)
+    if isinstance(value, float):
+        return ("float",)
+    if isinstance(value, str):
+        return ("string",)
+    if isinstance(value, list):
+        item = ("null",)
+        for value_item in value:
+            item = _merge_descriptions(item, _describe(value_item))
+        return ("list", item)
+    if isinstance(value, dict):
+        return ("struct", {key: _describe(item) for key, item in value.items()})
+    raise ValueError(f"unsupported JSON value type: {type(value).__name__}")
+
+
+def _merge_descriptions(left, right):
+    if left[0] == "null":
+        return right
+    if right[0] == "null":
+        return left
+    if {left[0], right[0]} == {"int", "float"}:
+        return ("float",)
+    if left[0] != right[0]:
+        raise ValueError(f"incompatible JSON types: {left[0]} and {right[0]}")
+    if left[0] == "list":
+        return ("list", _merge_descriptions(left[1], right[1]))
+    if left[0] == "struct":
+        fields = dict(left[1])
+        for key, value in right[1].items():
+            fields[key] = (_merge_descriptions(fields[key], value)
+                           if key in fields else value)
+        return ("struct", fields)
+    return left
+
+
+def _arrow_type(description):
+    pa, _, _ = _arrow()
+    kind = description[0]
+    scalars = {"null": pa.null(), "bool": pa.bool_(), "int": pa.int64(),
+               "float": pa.float64(), "string": pa.string()}
+    if kind in scalars:
+        return scalars[kind]
+    if kind == "list":
+        return pa.list_(_arrow_type(description[1]))
+    if kind == "struct":
+        return pa.struct([pa.field(key, _arrow_type(value))
+                          for key, value in description[1].items()])
+    raise ValueError(f"unsupported schema description: {kind}")
+
+
+def _discover_schema(source: Path):
+    pa, _, _ = _arrow()
+    description = ("null",)
+    with source.open() as handle:
+        for number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                raise ValueError(f"line {number}: row must be an object")
+            description = _merge_descriptions(description, _describe(value))
+    if description[0] != "struct":
+        raise ValueError("canonical JSONL contains no rows")
+    return pa.schema([pa.field(key, _arrow_type(value))
+                      for key, value in description[1].items()])
+
+
 def _read_rows(source: Path, schema=None):
     _, paj, _ = _arrow()
+    schema = schema or _discover_schema(source)
     read = paj.ReadOptions(block_size=64 * 1024 * 1024)
-    parse = (paj.ParseOptions(explicit_schema=schema,
-                              unexpected_field_behavior="error")
-             if schema is not None else None)
+    parse = paj.ParseOptions(explicit_schema=schema,
+                             unexpected_field_behavior="error")
     reader = paj.open_json(source, read_options=read, parse_options=parse)
     return reader.schema, reader
 
