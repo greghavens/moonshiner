@@ -53,6 +53,17 @@ TOOL_REGISTRY = {
 # call.
 OFFERED_TOOLS = ("read", "write", "edit", "bash", "grep", "find", "ls")
 
+
+def run_streamed(command: list[str], *, workspace: Path, turn: str,
+                 stdout_path: Path, stderr_path: Path, timeout: int,
+                 environment: dict[str, str]) -> subprocess.CompletedProcess:
+    """Run Pi with bounded parent memory by streaming both output channels."""
+    with stdout_path.open("a", encoding="utf-8") as output, \
+         stderr_path.open("a", encoding="utf-8") as errors:
+        return subprocess.run(command, cwd=workspace, input=turn,
+                              stdout=output, stderr=errors, text=True,
+                              timeout=timeout, env=environment)
+
 # A tiny extension that fails any bash call still running past the ceiling, so a
 # hung command cannot consume the whole turn budget.
 BASH_TIMEOUT_GUARD = """export default function (pi) {
@@ -264,8 +275,8 @@ class PiRuntime(Runtime):
             # `schema` has no CLI channel in pi 0.80.7; judge instructions
             # embed the expected JSON shape and run_review parses the last
             # assistant message.
-            outputs: list[str] = []
-            errors: list[str] = []
+            events_path.write_text("")
+            stderr_path.write_text("")
             return_code = 0
             for turn_index, turn in enumerate([prompt, *(interaction or [])]):
                 inner = self._pi_cmd(runtime_dir, system_prompt=system_prompt,
@@ -273,35 +284,27 @@ class PiRuntime(Runtime):
                                      continue_session=turn_index > 0)
                 cmd = self._sandbox_cmd(inner, workspace, runtime_dir)
                 try:
-                    proc = subprocess.run(
-                        cmd, cwd=workspace, input=turn, capture_output=True,
-                        text=True, timeout=int(self.role.get("timeout_s", 3600)),
-                        env=self._child_env())
+                    proc = run_streamed(
+                        cmd, workspace=workspace, turn=turn,
+                        stdout_path=events_path, stderr_path=stderr_path,
+                        timeout=int(self.role.get("timeout_s", 3600)),
+                        environment=self._child_env())
                     return_code = proc.returncode
-                    outputs.append(proc.stdout)
-                    errors.append(proc.stderr)
+                    compact_events_file(events_path)
                     if return_code != 0:
                         break
-                except subprocess.TimeoutExpired as exc:
+                except subprocess.TimeoutExpired:
                     timed_out, return_code = True, None
-                    outputs.append((exc.stdout or b"").decode()
-                                   if isinstance(exc.stdout, bytes) else (exc.stdout or ""))
-                    errors.append((exc.stderr or b"").decode()
-                                  if isinstance(exc.stderr, bytes) else (exc.stderr or ""))
+                    compact_events_file(events_path)
                     break
-            stdout = "\n".join(outputs)
-            stderr = "\n".join(errors)
+            stdout = events_path.read_text(errors="replace")
             audit = proxy.snapshot()
         finally:
             proxy.stop()
         duration = time.monotonic() - started
 
-        events_path.write_text(stdout)
-        # Drop the ~99% of raw bytes that are cumulative *_update snapshots
-        # before anything hashes the file, so raw_sha256 matches the stored
-        # (compacted) trace and multi-GB captures never hit disk long-term.
-        compact_events_file(events_path)
-        stderr_path.write_text(stderr)
+        # Output was streamed and compacted per turn, so parent memory stays
+        # bounded and raw_sha256 sees the retained finalized event stream.
         meta = _parse_stream_meta(stdout)
         profile = self.config.get("model_profile") or {}
         aliases = ((profile.get("attestation_aliases") or [])

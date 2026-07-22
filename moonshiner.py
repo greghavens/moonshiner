@@ -282,6 +282,8 @@ def _config(argv: list[str]) -> int:
     if args.key == "publish.format" and value not in {
             "jsonl", "jsonl-hf-parquet", "parquet-shards"}:
         parser.error("publish.format must be jsonl, jsonl-hf-parquet, or parquet-shards")
+    if args.key == "publish.include_jsonl" and not isinstance(value, bool):
+        parser.error("publish.include_jsonl must be true or false")
     path = update_local(args.key, value)
     print(f"set {args.key} in {path}")
     return 0

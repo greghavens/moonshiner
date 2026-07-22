@@ -147,8 +147,13 @@ class FrontDoor(unittest.TestCase):
         with self.assertRaises(SystemExit):
             m._config(["set", "publish.format", "model-specific-format"])
 
+    def test_publish_include_jsonl_config_requires_boolean(self):
+        with self.assertRaises(SystemExit):
+            m._config(["set", "publish.include_jsonl", "sometimes"])
+
     def test_status_reports_project_even_before_first_ledger_run(self):
         db = mock.Mock()
+        db.execute.return_value.fetchone.return_value = [0]
         service_result = mock.Mock(stdout="", returncode=0)
         seed_status = {"total": 0, "sol_authored": 0, "remaining": 0,
                        "model": None}
@@ -165,6 +170,8 @@ class FrontDoor(unittest.TestCase):
                  "needs_reauthoring": set()}), \
              mock.patch("run_state.live_trace_run_ids", return_value=set()), \
              mock.patch("publish_queue.accepted_tasks", return_value=[]), \
+             mock.patch("synthetic_corrections.eligible_exhausted_attempts",
+                        return_value=[]), \
              mock.patch.object(m.subprocess, "run", return_value=service_result), \
              mock.patch("builtins.print") as output:
             self.assertEqual(m._status([]), 0)

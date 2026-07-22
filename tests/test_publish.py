@@ -42,7 +42,8 @@ class RemoteCardVerification(unittest.TestCase):
                   "viewer/train-00000.jsonl", "data/train-00000.parquet",
                   "data/train-00001.parquet"}
         self.assertEqual(inactive_remote_paths(
-            "parquet-shards", remote, {"data/train-00001.parquet"}),
+            "parquet-shards", remote,
+            {"traces.jsonl", "data/train-00001.parquet"}),
             ["data/train-00000.parquet", "viewer/train-00000.jsonl"])
         self.assertEqual(inactive_remote_paths("jsonl", remote, {"traces.jsonl"}),
                          ["data/train-00000.parquet", "data/train-00001.parquet",
@@ -96,7 +97,7 @@ class RemoteCardVerification(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "required publication artifact"):
                 publication_files(root, "jsonl")
 
-    def test_parquet_mode_publishes_jsonl_but_viewer_uses_only_shards(self):
+    def test_parquet_mode_can_omit_jsonl_and_remove_remote_monolith(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "README.md").write_text("card")
@@ -107,9 +108,16 @@ class RemoteCardVerification(unittest.TestCase):
                 "active_shards": ["data/train-00000.parquet"]}))
             self.assertEqual(
                 {path.relative_to(root).as_posix()
-                 for path in publication_files(root, "parquet-shards")},
-                {"README.md", "traces.jsonl", "dataset-manifest.json",
+                 for path in publication_files(root, "parquet-shards",
+                                                include_jsonl=False)},
+                {"README.md", "dataset-manifest.json",
                  "data/train-00000.parquet"})
+            remote = {"README.md", "traces.jsonl", "dataset-manifest.json",
+                      "data/train-00000.parquet"}
+            self.assertEqual(inactive_remote_paths(
+                "parquet-shards", remote,
+                {"README.md", "dataset-manifest.json", "data/train-00000.parquet"}),
+                ["traces.jsonl"])
 
     def test_card_selects_viewer_shards_without_hiding_canonical_download(self):
         with tempfile.TemporaryDirectory() as directory:
