@@ -32,12 +32,43 @@ def validate(path: Path, *, trusted_prefix_rows: int = 0) -> int:
     groups: dict = {}
     split_by_trajectory: dict = {}
     forbidden_paths = (str(ROOT), str(Path.home()))
+    expected_whole_keys = None
     with path.open() as input_handle:
       for number, line in enumerate(input_handle, 1):
         if not line.strip():
             continue
         row = json.loads(line)
-        legacy = list(row) == LEGACY_KEY_ORDER
+        whole = "assistant_step" not in row
+        if whole:
+            expected_whole_keys = expected_whole_keys or list(row)
+            if list(row) != expected_whole_keys:
+                raise ValueError(f"line {number}: whole-trajectory schema changed")
+        legacy = not whole and list(row) == LEGACY_KEY_ORDER
+        if whole:
+            if not isinstance(row.get("task"), str) or not row["task"]:
+                raise ValueError(f"line {number}: task is missing")
+            messages = row.get("messages")
+            if not isinstance(messages, list) or not messages:
+                raise ValueError(f"line {number}: messages must be non-empty")
+            if not isinstance(json.loads(row.get("tools", "null")), list):
+                raise ValueError(f"line {number}: tools must encode a list")
+            if number > trusted_prefix_rows:
+                if "teacher_model" in row and not str(row["teacher_model"]).strip():
+                    raise ValueError(f"line {number}: teacher_model is empty")
+                if "provider" in row and not str(row["provider"]).strip():
+                    raise ValueError(f"line {number}: provider is empty")
+                if "model_attested" in row and row["model_attested"] is not True:
+                    raise ValueError(f"line {number}: teacher model is not attested")
+                serialized = json.dumps(row, ensure_ascii=False)
+                privacy_hits = findings(
+                    serialized, exact_secrets=_staged_secret_values(),
+                    forbidden_paths=forbidden_paths)
+                if privacy_hits:
+                    raise ValueError(f"line {number}: privacy findings: {privacy_hits}")
+                if any(marker in serialized for marker in FORBIDDEN_SUBSTRINGS):
+                    raise ValueError(f"line {number}: private harness material")
+            count += 1
+            continue
         if not legacy and list(row) != PUBLISH_KEY_ORDER:
             raise ValueError(f"line {number}: unexpected schema {list(row)}")
         if not legacy and not str(row.get("teacher_model") or "").strip():

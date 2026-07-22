@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
 import subprocess
 import shutil
 import sys
@@ -137,6 +138,58 @@ def built_tasks() -> set[str]:
     return tasks
 
 
+def publication_shape(path: Path) -> str:
+    """Preserve the schema already established by the remote dataset."""
+    if not path.is_file():
+        return "next-step"
+    with path.open() as handle:
+        first = next((json.loads(line) for line in handle if line.strip()), None)
+    return "next-step" if not first or "assistant_step" in first else "whole"
+
+
+def export_whole_trajectories(path: Path, tasks: list[str]) -> None:
+    """Task-keyed append using the existing whole-trajectory column layout."""
+    from export_hf import build_row
+    with path.open() as handle:
+        first = next(json.loads(line) for line in handle if line.strip())
+    keys = list(first)
+    replacements = {}
+    for split in ("train", "val"):
+        source = DATA / "full" / f"{split}.jsonl"
+        with source.open() as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                task = (record.get("meta") or {}).get("task")
+                if task not in tasks:
+                    continue
+                canonical = build_row(record, split)
+                missing = [key for key in keys if key not in canonical]
+                if missing:
+                    raise ValueError(
+                        f"existing whole-trajectory schema is unsupported: {missing}")
+                row = {key: canonical[key] for key in keys}
+                if any(value is None for value in row.values()):
+                    raise ValueError(f"{task}: whole-trajectory row contains null values")
+                replacements[task] = json.dumps(row, ensure_ascii=False)
+    missing_tasks = set(tasks) - set(replacements)
+    if missing_tasks:
+        raise ValueError(f"accepted trajectories are not buildable: {sorted(missing_tasks)}")
+    retained = []
+    with path.open() as handle:
+        for line in handle:
+            if line.strip() and json.loads(line).get("task") not in replacements:
+                retained.append(line.rstrip("\n"))
+    pending = path.with_suffix(path.suffix + ".upsert.pending")
+    with pending.open("w") as handle:
+        for line in [*retained, *(replacements[task] for task in tasks)]:
+            handle.write(line + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    pending.replace(path)
+
+
 def run(*args: str) -> None:
     script, *rest = args
     subprocess.run([sys.executable, str(ROOT / script), *rest],
@@ -247,10 +300,13 @@ def main() -> int:
         if not tasks:
             continue
         label = tasks[0] if len(tasks) == 1 else f"{tasks[0]}…{tasks[-1]} ({len(tasks)})"
-        export_args = ["src/export_hf_next_steps.py"]
-        for task in tasks:
-            export_args.extend(["--task", task])
-        run(*export_args)
+        if publication_shape(output) == "whole":
+            export_whole_trajectories(output, tasks)
+        else:
+            export_args = ["src/export_hf_next_steps.py"]
+            for task in tasks:
+                export_args.extend(["--task", task])
+            run(*export_args)
         title = (f"Add trajectory {tasks[0]}" if len(tasks) == 1 else
                  f"Add {len(tasks)} trajectories: {tasks[0]} through {tasks[-1]}")
         print(f"[publish] {label}: upload", flush=True)

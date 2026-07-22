@@ -10,6 +10,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import export_hf_next_steps as export  # noqa: E402
 import hf_sync  # noqa: E402
+import publish_queue  # noqa: E402
+import validate_hf_export  # noqa: E402
 
 
 def row(source="trajectory-a", step=1, content="answer"):
@@ -81,6 +83,39 @@ class TaskKeyedExport(unittest.TestCase):
                              {"trajectory-a", "trajectory-b"})
             self.assertIn("changed", {item["messages"][0]["content"] for item in rows})
             self.assertIn("keep", {item["messages"][0]["content"] for item in rows})
+
+    def test_existing_whole_trajectory_schema_is_preserved(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = pathlib.Path(name)
+            output = root / "traces.jsonl"
+            output.write_text(json.dumps({
+                "task": "old", "lang": "en", "category": "building",
+                "teacher_runtime": "pi", "teacher_model": "acme/old",
+                "provider": "openrouter", "reasoning_effort": "max",
+                "model_attested": True, "observed_models": ["acme/old"],
+                "trace_format": "native", "n_messages": 1,
+                "messages": [{"role": "assistant", "content": "old"}],
+                "tools": "[]"}) + "\n")
+            full = root / "full"; full.mkdir()
+            record = {"meta": {"task": "new", "lang": "en",
+                "category": "tool-calling", "teacher_runtime": "pi",
+                "teacher_model": "acme/new", "provider": "openrouter",
+                "reasoning_effort": "max", "model_attested": True,
+                "observed_models": ["acme/new"], "trace_format": "native"},
+                "messages": [{"role": "assistant", "content": "new"}],
+                "tools": []}
+            (full / "train.jsonl").write_text(json.dumps(record) + "\n")
+            (full / "val.jsonl").write_text("")
+            with mock.patch.object(publish_queue, "DATA", root):
+                self.assertEqual(publish_queue.publication_shape(output), "whole")
+                publish_queue.export_whole_trajectories(output, ["new"])
+            rows = [json.loads(line) for line in output.read_text().splitlines()]
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(list(rows[0]), list(rows[1]))
+            self.assertEqual(rows[1]["task"], "new")
+            self.assertNotIn("assistant_step", rows[1])
+            with mock.patch.object(validate_hf_export, "ROOT", root):
+                self.assertEqual(validate_hf_export.validate(output), 2)
 
 
 if __name__ == "__main__":

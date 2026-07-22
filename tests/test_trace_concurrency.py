@@ -56,6 +56,23 @@ class TraceConcurrency(unittest.TestCase):
         self.assertEqual(len(claimed), 20)
         self.assertEqual(len(set(claimed)), 20)
 
+    def test_tail_retry_selection_prefers_every_first_attempt(self):
+        db = connect(self.path)
+        start_attempt(db, self.run_id, "seed-00", 1)
+        finish_attempt(db, self.run_id, "seed-00", 1, "retry")
+        db.close()
+        args = type("Args", (), {"only": None, "category": None, "tag": None,
+            "name": None, "max_attempts": 2, "limit": 0, "all": True})()
+        seeds = [{"id": "seed-00"}, {"id": "seed-01"}]
+        with mock.patch.object(trace_pipeline, "connect", side_effect=lambda: connect(self.path)), \
+             mock.patch.object(trace_pipeline, "select_seeds", return_value=seeds), \
+             mock.patch.object(trace_pipeline, "CONFIG",
+                               {"pipeline": {"trace": {"retry_order": "tail"}}}), \
+             mock.patch("seed_inventory.accepted_ids", return_value=set()), \
+             mock.patch("common.synthetic_tool_contract", return_value=None):
+            selected = trace_pipeline._selected(args)
+        self.assertEqual([seed["id"] for seed in selected], ["seed-01", "seed-00"])
+
     def test_queue_dispatches_one_seed_per_process(self):
         args = type("Args", (), {"max_attempts": 3})()
         completed = mock.Mock(returncode=0)

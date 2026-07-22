@@ -107,6 +107,12 @@ def _selected(args) -> list[dict]:
              and seed["id"] not in accepted
              and seed["id"] not in blocked
              and attempts.get(seed["id"], 0) < maximum]
+    retry_order = str((CONFIG.get("pipeline", {}).get("trace") or {})
+                      .get("retry_order", "immediate"))
+    if retry_order not in {"immediate", "tail"}:
+        raise ValueError("pipeline.trace.retry_order must be immediate or tail")
+    if retry_order == "tail":
+        seeds.sort(key=lambda seed: attempts.get(seed["id"], 0))
     if args.limit:
         seeds = seeds[:args.limit]
     elif not args.all and not only:
@@ -282,6 +288,9 @@ def main(argv: list[str] | None = None) -> int:
     judge.preflight(require_auth=True)
     ensure_publish_queue()
     limits = {"seeds": len(seeds), "max_attempts": args.max_attempts}
+    retry_order = str(defaults.get("retry_order", "immediate"))
+    if retry_order not in {"immediate", "tail"}:
+        raise ValueError("pipeline.trace.retry_order must be immediate or tail")
     roles = {"author": {"runtime": teacher.name, **teacher.role},
              "judge": {"runtime": judge.name, **judge.role}}
     run_id = args.resume or create_run(db, "trace", roles, limits, [s["id"] for s in seeds])
@@ -380,6 +389,8 @@ def main(argv: list[str] | None = None) -> int:
                 finish_attempt(worker_db, run_id, seed["id"], number,
                                "retry" if number < args.max_attempts else "exhausted",
                                review=review, error=reason, artifact_path=artifact)
+                if number < args.max_attempts and retry_order == "tail":
+                    set_job(worker_db, run_id, seed["id"], "deferred", number, reason)
                 print(f"[rejected existing trace] {seed['id']}: {reason}", flush=True)
                 return
             record_model_call(worker_db, run_id)
@@ -414,6 +425,9 @@ def main(argv: list[str] | None = None) -> int:
         reason = feedback_from_review(review)
         finish_attempt(worker_db, run_id, seed["id"], number, status, usage,
                        review, reason, artifact_path=artifact)
+        if status == "retry" and retry_order == "tail":
+            set_job(worker_db, run_id, seed["id"], "deferred", number, reason)
+            status = "deferred"
         print(f"[{status}] {seed['id']}: {reason}", flush=True)
 
     def worker(index: int):
@@ -473,9 +487,10 @@ def main(argv: list[str] | None = None) -> int:
         set_run_status(db, run_id, "failed", f"{type(error).__name__}: {error}")
         raise
     calls = int((run_row(db, run_id) or {}).get("model_calls") or 0)
+    deferred = sum(row["status"] == "deferred" for row in rows)
     print(f"trace run complete: {accepted}/{total_jobs} accepted; {calls} model calls")
     print(f"inspect: moonshiner inspect {run_id}")
-    return 0 if accepted == total_jobs else 1
+    return 0 if accepted + deferred == total_jobs else 1
 
 def _archive_attempt(run_id: str, seed_id: str, number: int) -> str:
     from common import RUNS, TRACES

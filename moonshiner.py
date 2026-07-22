@@ -271,6 +271,8 @@ def _config(argv: list[str]) -> int:
         low, high = bounded[args.key]
         if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
             parser.error(f"{args.key} must be an integer from {low} through {high}")
+    if args.key == "pipeline.trace.retry_order" and value not in {"immediate", "tail"}:
+        parser.error("pipeline.trace.retry_order must be immediate or tail")
     path = update_local(args.key, value)
     print(f"set {args.key} in {path}")
     return 0
