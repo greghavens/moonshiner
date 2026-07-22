@@ -97,9 +97,13 @@ class ParquetPublication(unittest.TestCase):
         with tempfile.TemporaryDirectory() as name:
             root = pathlib.Path(name); source = root / "traces.jsonl"
             rows = [row("task-a"), row("task-b")]
+            rows[0]["messages"][-1]["tool_calls"] = [{
+                "id": "call-0", "type": "function",
+                "function": {"name": "search", "arguments": '{"q":"x"}'},
+            }]
             rows[1]["messages"][-1]["tool_calls"] = [{
                 "id": "call-1", "type": "function",
-                "function": {"name": "search", "arguments": '{"q":"x"}'},
+                "function": {"name": "search", "arguments": {"q": "x"}},
             }]
             rows[1]["messages"][-1]["reasoning_details"] = [{
                 "type": "text", "text": "inspect", "index": 0,
@@ -110,8 +114,10 @@ class ParquetPublication(unittest.TestCase):
             rebuilt = parquet.read_active_rows(root)
             self.assertEqual([item["task"] for item in rebuilt],
                              [item["task"] for item in rows])
-            self.assertEqual(rebuilt[1]["messages"][-1]["tool_calls"],
-                             rows[1]["messages"][-1]["tool_calls"])
+            arguments = [item["messages"][-1]["tool_calls"][0]
+                         ["function"]["arguments"] for item in rebuilt]
+            self.assertEqual([json.loads(item) for item in arguments],
+                             [{"q": "x"}, {"q": "x"}])
             self.assertEqual(rebuilt[1]["messages"][-1]["reasoning_details"],
                              rows[1]["messages"][-1]["reasoning_details"])
 

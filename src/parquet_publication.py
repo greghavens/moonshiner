@@ -60,7 +60,9 @@ def _describe(value):
     raise ValueError(f"unsupported JSON value type: {type(value).__name__}")
 
 
-def _merge_descriptions(left, right):
+def _merge_descriptions(left, right, path="row"):
+    if left[0] == "json" or right[0] == "json":
+        return ("json",)
     if left[0] == "null":
         return right
     if right[0] == "null":
@@ -68,13 +70,13 @@ def _merge_descriptions(left, right):
     if {left[0], right[0]} == {"int", "float"}:
         return ("float",)
     if left[0] != right[0]:
-        raise ValueError(f"incompatible JSON types: {left[0]} and {right[0]}")
+        return ("json",)
     if left[0] == "list":
-        return ("list", _merge_descriptions(left[1], right[1]))
+        return ("list", _merge_descriptions(left[1], right[1], f"{path}[]"))
     if left[0] == "struct":
         fields = dict(left[1])
         for key, value in right[1].items():
-            fields[key] = (_merge_descriptions(fields[key], value)
+            fields[key] = (_merge_descriptions(fields[key], value, f"{path}.{key}")
                            if key in fields else value)
         return ("struct", fields)
     return left
@@ -84,7 +86,8 @@ def _arrow_type(description):
     pa, _, _ = _arrow()
     kind = description[0]
     scalars = {"null": pa.null(), "bool": pa.bool_(), "int": pa.int64(),
-               "float": pa.float64(), "string": pa.string()}
+               "float": pa.float64(), "string": pa.string(),
+               "json": pa.string()}
     if kind in scalars:
         return scalars[kind]
     if kind == "list":
@@ -108,18 +111,53 @@ def _discover_schema(source: Path):
             description = _merge_descriptions(description, _describe(value))
     if description[0] != "struct":
         raise ValueError("canonical JSONL contains no rows")
-    return pa.schema([pa.field(key, _arrow_type(value))
-                      for key, value in description[1].items()])
+    return (pa.schema([pa.field(key, _arrow_type(value))
+                       for key, value in description[1].items()]), description)
+
+
+def _normalize(value, description):
+    kind = description[0]
+    if kind == "json":
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                pass
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if value is None:
+        return None
+    if kind == "list":
+        return [_normalize(item, description[1]) for item in value]
+    if kind == "struct":
+        return {key: _normalize(value.get(key), item)
+                for key, item in description[1].items() if key in value}
+    return value
+
+
+def _normalized_source(source: Path, description) -> Path:
+    pending = source.with_name(".parquet-source.pending.jsonl")
+    with source.open() as input_handle, pending.open("w") as output_handle:
+        for line in input_handle:
+            if not line.strip():
+                continue
+            row = _normalize(json.loads(line), description)
+            output_handle.write(json.dumps(
+                row, ensure_ascii=False, separators=(",", ":")) + "\n")
+    return pending
 
 
 def _read_rows(source: Path, schema=None):
     _, paj, _ = _arrow()
-    schema = schema or _discover_schema(source)
+    discovered, description = _discover_schema(source)
+    if schema is not None and not discovered.equals(schema):
+        raise ValueError("canonical row schema changed across Parquet shards")
+    schema = schema or discovered
+    normalized = _normalized_source(source, description)
     read = paj.ReadOptions(block_size=64 * 1024 * 1024)
     parse = paj.ParseOptions(explicit_schema=schema,
                              unexpected_field_behavior="error")
-    reader = paj.open_json(source, read_options=read, parse_options=parse)
-    return reader.schema, reader
+    reader = paj.open_json(normalized, read_options=read, parse_options=parse)
+    return reader.schema, reader, normalized
 
 
 def _write_shard(root: Path, sequence: int, rows: list[dict], schema) -> dict:
@@ -173,21 +211,23 @@ def sync(source: Path, root: Path, *, changed_tasks: set[str],
             rebuild_tasks.update(shard["tasks"])
 
     stored_schema = ((existing or {}).get("arrow_schema") or None)
-    schema, batches = _read_rows(source,
-                                 _schema_from_text(stored_schema)
-                                 if stored_schema else None)
+    schema, batches, normalized = _read_rows(
+        source, _schema_from_text(stored_schema) if stored_schema else None)
     if stored_schema and _schema_text(schema) != stored_schema:
         raise ValueError("canonical row schema changed across Parquet shards")
     selected = []
     all_tasks = set()
     total_rows = 0
-    for batch in batches:
-        for row in batch.to_pylist():
-            task = str(row["task"])
-            all_tasks.add(task)
-            total_rows += 1
-            if existing is None or task in rebuild_tasks:
-                selected.append(row)
+    try:
+        for batch in batches:
+            for row in batch.to_pylist():
+                task = str(row["task"])
+                all_tasks.add(task)
+                total_rows += 1
+                if existing is None or task in rebuild_tasks:
+                    selected.append(row)
+    finally:
+        normalized.unlink(missing_ok=True)
     missing = rebuild_tasks - all_tasks
     if missing:
         raise ValueError(f"changed trajectories missing from canonical rows: {sorted(missing)}")
