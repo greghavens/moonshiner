@@ -24,8 +24,6 @@ def inactive_remote_paths(mode: str, remote: set[str],
     """Return current-branch artifacts belonging to an inactive format."""
     deleted = set()
     if mode == "parquet-shards":
-        if "traces.jsonl" in remote:
-            deleted.add("traces.jsonl")
         deleted.update(path for path in remote if path.startswith("viewer/"))
         deleted.update(path for path in remote
                        if path.startswith("data/") and path.endswith(".parquet")
@@ -46,6 +44,7 @@ def publication_files(directory: Path, mode: str | None = None) -> list[Path]:
     if mode in {"jsonl", "jsonl-hf-parquet"}:
         required.append(directory / "traces.jsonl")
     else:
+        required.append(directory / "traces.jsonl")
         manifest_path = directory / PARQUET_MANIFEST
         required.append(manifest_path)
         if not manifest_path.is_file():

@@ -561,8 +561,10 @@ def build_card(rows: list[dict], *, stage: str = "release") -> str:
         jsonl_size = TRACES.stat().st_size if TRACES.is_file() else 0
         size_label = (f"{_human_size(file_size)} PARQUET · "
                       f"{_human_size(jsonl_size)} JSONL")
-        layout = ("The dataset is published as validated, active Parquet shards "
-                  "listed in `dataset-manifest.json`.")
+        layout = ("The Hugging Face viewer reads the validated active Parquet "
+                  "shards listed in `dataset-manifest.json`. The equivalent "
+                  "canonical `traces.jsonl` is also published for direct "
+                  "download and conversion.")
     else:
         file_size = TRACES.stat().st_size if TRACES.is_file() else 0
         size_label = _human_size(file_size)

@@ -169,10 +169,11 @@ moonshiner config set publish.format parquet-shards
 ```
 
 Supported values are `jsonl`, `jsonl-hf-parquet`, and `parquet-shards`.
-All three publish the same validated canonical rows. `parquet-shards` writes
-compressed active shards locally and commits the shards, manifest, and updated
-dataset card together. `jsonl-hf-parquet` publishes JSONL for Hugging Face to
-convert, while `jsonl` keeps JSONL as the configured source format.
+All three publish the same validated canonical rows. `parquet-shards` publishes
+both the canonical JSONL and compressed active shards, points the viewer only at
+the shards, and commits the JSONL, shards, manifest, and updated dataset card
+together. `jsonl-hf-parquet` publishes JSONL for Hugging Face to convert, while
+`jsonl` keeps JSONL as the configured source format.
 
 These settings are reread between work items. Reducing concurrency does not cancel active model calls.
 

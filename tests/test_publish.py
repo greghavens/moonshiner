@@ -43,8 +43,7 @@ class RemoteCardVerification(unittest.TestCase):
                   "data/train-00001.parquet"}
         self.assertEqual(inactive_remote_paths(
             "parquet-shards", remote, {"data/train-00001.parquet"}),
-            ["data/train-00000.parquet", "traces.jsonl",
-             "viewer/train-00000.jsonl"])
+            ["data/train-00000.parquet", "viewer/train-00000.jsonl"])
         self.assertEqual(inactive_remote_paths("jsonl", remote, {"traces.jsonl"}),
                          ["data/train-00000.parquet", "data/train-00001.parquet",
                           "dataset-manifest.json", "viewer/train-00000.jsonl"])
@@ -96,6 +95,21 @@ class RemoteCardVerification(unittest.TestCase):
             (root / "README.md").write_text("card")
             with self.assertRaisesRegex(ValueError, "required publication artifact"):
                 publication_files(root, "jsonl")
+
+    def test_parquet_mode_publishes_jsonl_but_viewer_uses_only_shards(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text("card")
+            (root / "traces.jsonl").write_text("{}\n")
+            shard = root / "data" / "train-00000.parquet"
+            shard.parent.mkdir(); shard.write_bytes(b"parquet")
+            (root / "dataset-manifest.json").write_text(json.dumps({
+                "active_shards": ["data/train-00000.parquet"]}))
+            self.assertEqual(
+                {path.relative_to(root).as_posix()
+                 for path in publication_files(root, "parquet-shards")},
+                {"README.md", "traces.jsonl", "dataset-manifest.json",
+                 "data/train-00000.parquet"})
 
     def test_card_selects_viewer_shards_without_hiding_canonical_download(self):
         with tempfile.TemporaryDirectory() as directory:
