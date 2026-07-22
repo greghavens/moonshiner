@@ -2,8 +2,9 @@
 # Maintain a read-only, persistent sparse checkout of the accepted seed source.
 set -euo pipefail
 
-repo=${MOONSHINER_SEED_REPOSITORY:-https://github.com/greghavens/sol-code.git}
-checkout=${MOONSHINER_SEED_CHECKOUT:-"$(cd "$(dirname "$0")/.." && pwd)/.moonshiner/imports/sol-code-seeds"}
+: "${MOONSHINER_SEED_REPOSITORY:?set MOONSHINER_SEED_REPOSITORY to the configured seed-source repository}"
+repo=$MOONSHINER_SEED_REPOSITORY
+checkout=${MOONSHINER_SEED_CHECKOUT:-"$(cd "$(dirname "$0")/.." && pwd)/.moonshiner/imports/seed-source"}
 mkdir -p "$(dirname "$checkout")"
 
 exec 9>"${checkout}.update.lock"

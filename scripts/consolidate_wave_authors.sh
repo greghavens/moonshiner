@@ -25,4 +25,4 @@ done
 
 exec "$root/scripts/batch.sh" all-waves \
   /home/linuxbrew/.linuxbrew/bin/python3 "$root/src/author_all_waves.py" \
-  --catalog-dir "$root/.moonshiner/imports/sol-code/tasks" --yes
+  --catalog-dir "${MOONSHINER_SEED_CATALOG_DIR:-$root/tasks}" --yes
