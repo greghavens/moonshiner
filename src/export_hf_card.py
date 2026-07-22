@@ -553,7 +553,16 @@ def build_card(rows: list[dict], *, stage: str = "release") -> str:
         "\n- Training or evaluating **defensive secure-coding and code-review** "
         "agents." if has_security else "")
 
-    file_size = TRACES.stat().st_size if TRACES.is_file() else 0
+    publish_mode = str((CONFIG.get("publish") or {}).get(
+        "format", "jsonl-hf-parquet"))
+    manifest_path = PUBLISH_DIR / "dataset-manifest.json"
+    if publish_mode == "parquet-shards" and manifest_path.is_file():
+        file_size = int(json.loads(manifest_path.read_text()).get("bytes") or 0)
+        layout = ("The dataset is published as validated, active Parquet shards "
+                  "listed in `dataset-manifest.json`.")
+    else:
+        file_size = TRACES.stat().st_size if TRACES.is_file() else 0
+        layout = "Everything ships in one data file: `traces.jsonl`."
     return f"""{_front_matter(pretty_name, license_id, tags, size_cat, has_security)}
 
 # {pretty_name}
@@ -623,7 +632,7 @@ are heterogeneous.
 
 ## Layout
 
-Everything ships in one data file: `traces.jsonl`. It currently contains
+{layout} It currently contains
 {total_rows:,} cumulative next-step rows derived from {total_traj:,} accepted
 trajectories over disjoint train and validation tasks.
 

@@ -71,6 +71,19 @@ class Units(unittest.TestCase):
                 text = card.build_card(_coding_and_security())
             self.assertIn("1 kB</h2>", text)
 
+    def test_parquet_headline_uses_active_manifest_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "dataset-manifest.json").write_text(json.dumps({
+                "bytes": 2_000, "row_count": 3, "trajectory_count": 2}))
+            config = {**CONFIG, "publish": {
+                **CONFIG.get("publish", {}), "format": "parquet-shards"}}
+            with mock.patch.object(card, "CONFIG", config), \
+                 mock.patch.object(card, "PUBLISH_DIR", root):
+                text = card.build_card(_coding_and_security())
+            self.assertIn("2 kB</h2>", text)
+            self.assertIn("active Parquet shards", text)
+
     def test_size_category_boundaries(self):
         self.assertEqual(card._size_category(3), "n<1K")
         self.assertEqual(card._size_category(1_000), "1K<n<10K")

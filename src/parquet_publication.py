@@ -1,0 +1,164 @@
+"""Append-oriented Parquet artifacts for the canonical Moonshiner row stream."""
+from __future__ import annotations
+
+import base64
+import json
+from pathlib import Path
+
+MANIFEST = "dataset-manifest.json"
+FORMAT = "moonshiner-parquet-shards-v1"
+
+
+def _arrow():
+    try:
+        import pyarrow as pa
+        import pyarrow.json as paj
+        import pyarrow.parquet as pq
+    except ImportError as error:
+        raise RuntimeError(
+            "Parquet publication requires pyarrow; reinstall Moonshiner") from error
+    return pa, paj, pq
+
+
+def _load_manifest(root: Path) -> dict | None:
+    path = root / MANIFEST
+    if not path.is_file():
+        return None
+    value = json.loads(path.read_text())
+    if value.get("schema_version") != 1 or value.get("format") != FORMAT:
+        raise ValueError("unsupported Parquet publication manifest")
+    return value
+
+
+def _schema_text(schema) -> str:
+    return base64.b64encode(schema.serialize().to_pybytes()).decode("ascii")
+
+
+def _schema_from_text(value: str):
+    pa, _, _ = _arrow()
+    return pa.ipc.read_schema(pa.BufferReader(base64.b64decode(value)))
+
+
+def _read_rows(source: Path, schema=None):
+    _, paj, _ = _arrow()
+    read = paj.ReadOptions(block_size=64 * 1024 * 1024)
+    parse = (paj.ParseOptions(explicit_schema=schema,
+                              unexpected_field_behavior="error")
+             if schema is not None else None)
+    reader = paj.open_json(source, read_options=read, parse_options=parse)
+    return reader.schema, reader
+
+
+def _write_shard(root: Path, sequence: int, rows: list[dict], schema) -> dict:
+    pa, _, pq = _arrow()
+    relative = f"data/train-{sequence:05d}.parquet"
+    destination = root / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    pending = destination.with_suffix(".parquet.pending")
+    table = pa.Table.from_pylist(rows, schema=schema)
+    pq.write_table(table, pending, compression="zstd", use_dictionary=True)
+    pending.replace(destination)
+    tasks = list(dict.fromkeys(str(row["task"]) for row in rows))
+    return {"path": relative, "tasks": tasks, "trajectory_count": len(tasks),
+            "row_count": len(rows), "bytes": destination.stat().st_size}
+
+
+def _chunks_by_task(rows: list[dict], size: int):
+    groups: dict[str, list[dict]] = {}
+    order = []
+    for row in rows:
+        task = str(row["task"])
+        if task not in groups:
+            groups[task] = []
+            order.append(task)
+        groups[task].append(row)
+    for offset in range(0, len(order), size):
+        tasks = order[offset:offset + size]
+        yield [row for task in tasks for row in groups[task]]
+
+
+def sync(source: Path, root: Path, *, changed_tasks: set[str],
+         trajectories_per_shard: int = 10) -> dict:
+    """Update the active immutable shard set from canonical JSONL rows.
+
+    Replacements retire the affected active shard logically and carry its
+    unaffected neighbors into a new shard. Retired shard bytes remain locally
+    and remotely recoverable but are absent from the active manifest/card.
+    """
+    if trajectories_per_shard < 1:
+        raise ValueError("trajectories_per_shard must be positive")
+    _, _, pq = _arrow()
+    root.mkdir(parents=True, exist_ok=True)
+    existing = _load_manifest(root)
+    active = list((existing or {}).get("shards") or [])
+    task_to_shard = {task: shard for shard in active for task in shard["tasks"]}
+    impacted_paths = {task_to_shard[task]["path"] for task in changed_tasks
+                      if task in task_to_shard}
+    rebuild_tasks = set(changed_tasks)
+    for shard in active:
+        if shard["path"] in impacted_paths:
+            rebuild_tasks.update(shard["tasks"])
+
+    stored_schema = ((existing or {}).get("arrow_schema") or None)
+    schema, batches = _read_rows(source,
+                                 _schema_from_text(stored_schema)
+                                 if stored_schema else None)
+    if stored_schema and _schema_text(schema) != stored_schema:
+        raise ValueError("canonical row schema changed across Parquet shards")
+    selected = []
+    all_tasks = set()
+    total_rows = 0
+    for batch in batches:
+        for row in batch.to_pylist():
+            task = str(row["task"])
+            all_tasks.add(task)
+            total_rows += 1
+            if existing is None or task in rebuild_tasks:
+                selected.append(row)
+    missing = rebuild_tasks - all_tasks
+    if missing:
+        raise ValueError(f"changed trajectories missing from canonical rows: {sorted(missing)}")
+
+    kept = [shard for shard in active if shard["path"] not in impacted_paths]
+    sequence = int((existing or {}).get("next_sequence", 0))
+    added = []
+    for rows in _chunks_by_task(selected, trajectories_per_shard):
+        added.append(_write_shard(root, sequence, rows, schema))
+        sequence += 1
+    shards = kept + added
+    active_task_list = [task for shard in shards for task in shard["tasks"]]
+    active_tasks = set(active_task_list)
+    if len(active_task_list) != len(active_tasks):
+        raise ValueError("a trajectory appears in more than one active Parquet shard")
+    if active_tasks != all_tasks:
+        raise ValueError("active Parquet shards do not cover canonical trajectories exactly")
+    if sum(int(item["row_count"]) for item in shards) != total_rows:
+        raise ValueError("active Parquet shard row count differs from canonical rows")
+    for shard in shards:
+        path = root / shard["path"]
+        if not path.is_file() or path.stat().st_size != int(shard["bytes"]):
+            raise ValueError(f"active Parquet shard is missing or changed: {shard['path']}")
+        if not pq.read_schema(path).equals(schema):
+            raise ValueError(f"active Parquet shard schema differs: {shard['path']}")
+    manifest = {
+        "schema_version": 1, "format": FORMAT,
+        "arrow_schema": _schema_text(schema), "next_sequence": sequence,
+        "active_shards": [item["path"] for item in shards], "shards": shards,
+        "trajectory_count": len(all_tasks), "row_count": total_rows,
+        "bytes": sum(item["bytes"] for item in shards),
+    }
+    pending = root / f"{MANIFEST}.pending"
+    pending.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    pending.replace(root / MANIFEST)
+    return manifest
+
+
+def read_active_rows(root: Path) -> list[dict]:
+    _, _, pq = _arrow()
+    manifest = _load_manifest(root)
+    if not manifest:
+        return []
+    rows = []
+    for relative in manifest["active_shards"]:
+        rows.extend(pq.read_table(root / relative).to_pylist())
+    return rows

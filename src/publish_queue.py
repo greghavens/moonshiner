@@ -254,8 +254,11 @@ def main() -> int:
         title = (f"Add trajectory {tasks[0]}" if len(tasks) == 1 else
                  f"Add {len(tasks)} trajectories: {tasks[0]} through {tasks[-1]}")
         print(f"[publish] {label}: upload", flush=True)
-        run("moonshiner.py", "publish", "--yes", "--commit-message",
-            title)
+        publish_args = ["moonshiner.py", "publish", "--yes", "--commit-message",
+                        title]
+        for task in tasks:
+            publish_args.extend(["--task", task])
+        run(*publish_args)
         verify_remote(dataset, title)
         known.update(tasks)
         for _, task, version in batch:

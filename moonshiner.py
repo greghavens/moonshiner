@@ -273,6 +273,9 @@ def _config(argv: list[str]) -> int:
             parser.error(f"{args.key} must be an integer from {low} through {high}")
     if args.key == "pipeline.trace.retry_order" and value not in {"immediate", "tail"}:
         parser.error("pipeline.trace.retry_order must be immediate or tail")
+    if args.key == "publish.format" and value not in {
+            "jsonl", "jsonl-hf-parquet", "parquet-shards"}:
+        parser.error("publish.format must be jsonl, jsonl-hf-parquet, or parquet-shards")
     path = update_local(args.key, value)
     print(f"set {args.key} in {path}")
     return 0
@@ -376,6 +379,13 @@ def _setup(argv: list[str] | None = None) -> int:
     trace_workers = int(_ask("Parallel trace workers", "2")) if args.reconfigure else 2
     trace_attempts = int(_ask("Maximum attempts per individual trace", "2")) if args.reconfigure else 2
     publish_batch = int(_ask("Upload after this many accepted traces", "10")) if args.reconfigure else 10
+    publish_format = (_ask(
+        "Hugging Face publication format (jsonl, jsonl-hf-parquet, or parquet-shards)",
+        str(current_publish.get("format") or "jsonl-hf-parquet"))
+        if args.reconfigure else str(current_publish.get("format") or
+                                     "jsonl-hf-parquet"))
+    if publish_format not in {"jsonl", "jsonl-hf-parquet", "parquet-shards"}:
+        raise SystemExit("Invalid Hugging Face publication format")
     if not 1 <= trace_workers <= 64 or trace_attempts < 1 or not 1 <= publish_batch <= 1000:
         raise SystemExit("Invalid worker, attempt, or upload-batch value")
 
@@ -404,6 +414,7 @@ def _setup(argv: list[str] | None = None) -> int:
     update_local("pipeline.trace.workers", trace_workers)
     update_local("pipeline.trace.max_attempts", trace_attempts)
     update_local("publish.batch_size", publish_batch)
+    update_local("publish.format", publish_format)
     update_local("publish.hf_dataset", hf_dataset or None)
     update_local("publish.private", False)
     teacher_model = choices[0][2]

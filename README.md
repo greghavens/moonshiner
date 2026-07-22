@@ -34,6 +34,7 @@ Moonshiner asks:
 - which provider Pi should use;
 - the provider credential, when that provider requires one;
 - the Hugging Face dataset target, when publishing is enabled.
+- the Hugging Face publication format when changing advanced setup choices.
 
 Codex and Claude Code can use their existing login sessions. Pi is a harness, so Moonshiner asks which provider Pi should call and configures the matching endpoint, protocol, model, and credential.
 
@@ -161,6 +162,18 @@ Set Hugging Face publication batch size:
 moonshiner config set publish.batch_size 10
 ```
 
+Choose the Hugging Face publication format:
+
+```bash
+moonshiner config set publish.format parquet-shards
+```
+
+Supported values are `jsonl`, `jsonl-hf-parquet`, and `parquet-shards`.
+All three publish the same validated canonical rows. `parquet-shards` writes
+compressed active shards locally and commits the shards, manifest, and updated
+dataset card together. `jsonl-hf-parquet` publishes JSONL for Hugging Face to
+convert, while `jsonl` keeps JSONL as the configured source format.
+
 These settings are reread between work items. Reducing concurrency does not cancel active model calls.
 
 ## Resume existing work
@@ -260,6 +273,12 @@ moonshiner config set publish.hf_dataset owner/dataset
 ```
 
 Log in with the Hugging Face CLI or save the token through Moonshiner. Accepted trajectories are appended locally and published in configured batches. Dataset-card counts and percentages regenerate from the exact published rows.
+
+Parquet publication keeps `dataset-manifest.json` as the authoritative active
+shard list. Replaced trajectories supersede their prior active shard without
+losing neighboring trajectories; superseded shard content remains recoverable
+from repository history. Every publish commit contains the data artifacts,
+manifest, and matching card together.
 
 Manual publication is available for repair or verification:
 

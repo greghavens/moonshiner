@@ -116,6 +116,10 @@ class FrontDoor(unittest.TestCase):
         with self.assertRaises(SystemExit):
             m._config(["set", "publish.batch_size", "1001"])
 
+    def test_publication_format_config_fails_closed(self):
+        with self.assertRaises(SystemExit):
+            m._config(["set", "publish.format", "model-specific-format"])
+
     def test_status_reports_project_even_before_first_ledger_run(self):
         db = mock.Mock()
         service_result = mock.Mock(stdout="", returncode=0)

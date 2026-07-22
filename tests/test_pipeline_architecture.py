@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "src"))
 import export_hf_next_steps  # noqa: E402
 import publish_queue  # noqa: E402
 import migrate_canonical_dataset  # noqa: E402
+import publish  # noqa: E402
 
 
 class OnePipelineInvariant(unittest.TestCase):
@@ -24,6 +25,14 @@ class OnePipelineInvariant(unittest.TestCase):
                 "teacher_model ==", "teacher_model in", "hf_dataset =="):
             self.assertNotIn(forbidden, source)
         self.assertNotIn("migrate_canonical_dataset", source)
+
+    def test_publication_format_never_dispatches_on_model_or_dataset(self):
+        source = inspect.getsource(publish)
+        self.assertNotIn("teacher_model ==", source)
+        self.assertNotIn("hf_dataset ==", source)
+        self.assertIn("publication_format", source)
+        self.assertEqual(source.count(".create_commit("), 1)
+        self.assertNotIn('"hf", "upload"', source)
 
     def test_every_model_emits_the_identical_canonical_columns(self):
         def record(model):

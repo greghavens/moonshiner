@@ -9,8 +9,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from publish import (_verify_remote_card, build_viewer_shards,
-                     configure_viewer_card, publication_files,
-                     privacy_scan_files, viewer_dataset_config)
+                     configure_viewer_card, inactive_remote_paths, publication_files,
+                     privacy_scan_files, publication_format,
+                     viewer_dataset_config)
 
 
 class _Response:
@@ -28,6 +29,26 @@ class _Response:
 
 
 class RemoteCardVerification(unittest.TestCase):
+    def test_all_three_publication_modes_are_explicit_and_model_independent(self):
+        for mode in ("jsonl", "jsonl-hf-parquet", "parquet-shards"):
+            self.assertEqual(publication_format({
+                "teacher": {"model": "anything"},
+                "publish": {"hf_dataset": "any/dataset", "format": mode}}), mode)
+        with self.assertRaisesRegex(ValueError, "publish.format"):
+            publication_format({"publish": {"format": "invented"}})
+
+    def test_switching_formats_removes_only_inactive_current_artifacts(self):
+        remote = {"README.md", "traces.jsonl", "dataset-manifest.json",
+                  "viewer/train-00000.jsonl", "data/train-00000.parquet",
+                  "data/train-00001.parquet"}
+        self.assertEqual(inactive_remote_paths(
+            "parquet-shards", remote, {"data/train-00001.parquet"}),
+            ["data/train-00000.parquet", "traces.jsonl",
+             "viewer/train-00000.jsonl"])
+        self.assertEqual(inactive_remote_paths("jsonl", remote, {"traces.jsonl"}),
+                         ["data/train-00000.parquet", "data/train-00001.parquet",
+                          "dataset-manifest.json", "viewer/train-00000.jsonl"])
+
     def test_viewer_shards_preserve_canonical_rows_and_bound_file_size(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -69,6 +90,13 @@ class RemoteCardVerification(unittest.TestCase):
                              {"traces.jsonl", "README.md",
                               "moonshiner-dataset-banner.png"})
 
+    def test_publication_files_fail_when_required_artifact_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "README.md").write_text("card")
+            with self.assertRaisesRegex(ValueError, "required publication artifact"):
+                publication_files(root, "jsonl")
+
     def test_card_selects_viewer_shards_without_hiding_canonical_download(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -87,7 +115,7 @@ class RemoteCardVerification(unittest.TestCase):
             self.assertIn("# Dataset", text)
             self.assertEqual(
                 {path.relative_to(root).as_posix() for path in publication_files(root)},
-                {"README.md", "traces.jsonl", "viewer/train-00000.jsonl"})
+                {"README.md", "traces.jsonl"})
 
     def test_generated_viewer_shards_do_not_create_a_second_privacy_gate(self):
         with tempfile.TemporaryDirectory() as directory:

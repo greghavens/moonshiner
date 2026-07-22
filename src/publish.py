@@ -1,19 +1,61 @@
 """Publish only a validated immutable Hugging Face staging directory."""
 from __future__ import annotations
-import argparse, hashlib, json, os, subprocess, urllib.parse, urllib.request
+import argparse, hashlib, json, os, urllib.parse, urllib.request
 from pathlib import Path
 from common import CONFIG, DATA, ROOT, _staged_secret_values
 from privacy import findings
 from validate_hf_export import validate
 from hf_sync import ensure_local_dataset
+from parquet_publication import MANIFEST as PARQUET_MANIFEST, sync as sync_parquet
+
+PUBLICATION_FORMATS = {"jsonl", "jsonl-hf-parquet", "parquet-shards"}
 
 
-def publication_files(directory: Path) -> list[Path]:
+def publication_format(config: dict | None = None) -> str:
+    value = str(((config or CONFIG).get("publish") or {}).get(
+        "format", "jsonl-hf-parquet"))
+    if value not in PUBLICATION_FORMATS:
+        raise ValueError(f"publish.format must be one of {sorted(PUBLICATION_FORMATS)}")
+    return value
+
+
+def inactive_remote_paths(mode: str, remote: set[str],
+                          active: set[str]) -> list[str]:
+    """Return current-branch artifacts belonging to an inactive format."""
+    deleted = set()
+    if mode == "parquet-shards":
+        if "traces.jsonl" in remote:
+            deleted.add("traces.jsonl")
+        deleted.update(path for path in remote if path.startswith("viewer/"))
+        deleted.update(path for path in remote
+                       if path.startswith("data/") and path.endswith(".parquet")
+                       and path not in active)
+    else:
+        if "dataset-manifest.json" in remote:
+            deleted.add("dataset-manifest.json")
+        deleted.update(path for path in remote
+                       if path.startswith("data/") or path.startswith("viewer/"))
+    return sorted(deleted)
+
+
+def publication_files(directory: Path, mode: str | None = None) -> list[Path]:
     """Return only the dataset artifacts intentionally published to the Hub."""
-    fixed = (directory / "traces.jsonl", directory / "README.md",
-             directory / "moonshiner-dataset-banner.png")
-    return ([path for path in fixed if path.is_file()]
-            + sorted((directory / "viewer").glob("train-*.jsonl")))
+    mode = mode or publication_format()
+    required = [directory / "README.md"]
+    optional = [directory / "moonshiner-dataset-banner.png"]
+    if mode in {"jsonl", "jsonl-hf-parquet"}:
+        required.append(directory / "traces.jsonl")
+    else:
+        manifest_path = directory / PARQUET_MANIFEST
+        required.append(manifest_path)
+        if not manifest_path.is_file():
+            raise ValueError("Parquet publication manifest is missing")
+        manifest = json.loads(manifest_path.read_text())
+        required.extend(directory / path for path in manifest["active_shards"])
+    missing = [path for path in required if not path.is_file()]
+    if missing:
+        raise ValueError(f"required publication artifact is missing: {missing[0]}")
+    return required + [path for path in optional if path.is_file()]
 
 
 def privacy_scan_files(directory: Path) -> list[Path]:
@@ -70,7 +112,7 @@ def build_viewer_shards(source: Path, directory: Path, *, max_bytes: int) -> lis
     return final_paths
 
 
-def configure_viewer_card(card: Path, pattern: str) -> None:
+def configure_viewer_card(card: Path, paths: str | list[str]) -> None:
     """Point the Hub viewer at bounded shards while retaining the monolith."""
     text = card.read_text()
     if not text.startswith("---\n"):
@@ -78,11 +120,13 @@ def configure_viewer_card(card: Path, pattern: str) -> None:
     closing = text.find("\n---\n", 4)
     if closing < 0:
         raise ValueError("dataset card YAML front matter is not closed")
-    block = ("\nconfigs:\n"
-             "  - config_name: default\n"
-             "    data_files:\n"
-             "      - split: train\n"
-             f"        path: {pattern}\n")
+    if isinstance(paths, str):
+        rendered_path = f"        path: {paths}\n"
+    else:
+        rendered_path = ("        path:\n" +
+                         "".join(f"          - {path}\n" for path in paths))
+    block = ("\nconfigs:\n  - config_name: default\n    data_files:\n"
+             "      - split: train\n" + rendered_path)
     card.write_text(text[:closing] + block + text[closing:])
 
 
@@ -119,6 +163,7 @@ def main(argv=None)->int:
     parser=argparse.ArgumentParser(prog="moonshiner publish")
     parser.add_argument("--dataset",default=CONFIG.get("publish",{}).get("hf_dataset")); parser.add_argument("--dir",type=Path,default=DATA/"hf-publish")
     parser.add_argument("--commit-message")
+    parser.add_argument("--task", action="append", default=[])
     parser.add_argument("--yes",action="store_true"); args=parser.parse_args(argv)
     if not args.dataset:parser.error("--dataset is required")
     if not args.yes:parser.error("publishing requires --yes")
@@ -142,19 +187,27 @@ def main(argv=None)->int:
         if digest.hexdigest()!=state.get("bootstrap_sha256"):
             raise RuntimeError("local HF prefix differs from downloaded append baseline")
     validate(traces,trusted_prefix_rows=trusted_rows)
+    mode = publication_format()
+    manifest = None
+    if mode == "parquet-shards":
+        manifest = sync_parquet(
+            traces, args.dir, changed_tasks=set(args.task),
+            trajectories_per_shard=int((CONFIG.get("publish") or {}).get(
+                "parquet_shard_trajectories", 10)))
     # The card is derived from the exact cumulative file being uploaded. Build
     # it on every append batch so counts, percentages, and capability mix never
     # become stale.
     if args.dir == DATA/"hf-publish":
         from export_hf_card import main as render_card
         render_card()
-    shard_bytes = int((CONFIG.get("publish") or {}).get(
-        "viewer_shard_bytes", 64_000_000))
-    build_viewer_shards(traces, args.dir / "viewer", max_bytes=shard_bytes)
     card = args.dir / "README.md"
     if card.is_file():
-        configure_viewer_card(card, "viewer/train-*.jsonl")
-    for path in publication_files(args.dir):
+        if mode == "parquet-shards":
+            configure_viewer_card(card, manifest["active_shards"])
+        elif mode == "jsonl-hf-parquet":
+            configure_viewer_card(card, "traces.jsonl")
+    files = publication_files(args.dir, mode)
+    for path in files:
         if path.is_symlink():
             raise ValueError(f"upload artifact is a prohibited symlink: {path}")
     for path in privacy_scan_files(args.dir):
@@ -166,23 +219,19 @@ def main(argv=None)->int:
         data=json.dumps({"private":private}).encode(),headers={"Authorization":f"Bearer {auth_token}","Content-Type":"application/json"},method="PUT")
     with urllib.request.urlopen(request) as response:
         if response.status//100!=2:raise RuntimeError("dataset visibility update failed")
-    command = ["hf", "upload", args.dataset, str(args.dir), ".",
-               "--repo-type", "dataset",
-               "--include", "traces.jsonl",
-               "--include", "moonshiner-dataset-banner.png",
-               "--include", "viewer/*.jsonl",
-               "--delete", "viewer/*.jsonl"]
-    if args.commit_message:
-        command.extend(["--commit-message", args.commit_message])
-    subprocess.run(command, check=True)
-    # Folder uploads use a local resumable-transfer cache. A regenerated card
-    # must never be skipped because that cache remembers an older upload, so
-    # commit README.md explicitly and then compare the live Hub bytes.
+    from huggingface_hub import (CommitOperationAdd, CommitOperationDelete,
+                                 HfApi)
+    operations = [CommitOperationAdd(
+        path_in_repo=path.relative_to(args.dir).as_posix(),
+        path_or_fileobj=str(path)) for path in files]
+    api = HfApi(token=auth_token)
+    remote = set(api.list_repo_files(args.dataset, repo_type="dataset"))
+    active_remote = {path.relative_to(args.dir).as_posix() for path in files}
+    operations.extend(CommitOperationDelete(path_in_repo=path)
+                      for path in inactive_remote_paths(mode, remote, active_remote))
+    api.create_commit(
+        repo_id=args.dataset, repo_type="dataset", operations=operations,
+        commit_message=args.commit_message or "Publish validated Moonshiner dataset")
     if card.is_file():
-        card_command = ["hf", "upload", args.dataset, str(card), "README.md",
-                        "--repo-type", "dataset"]
-        if args.commit_message:
-            card_command.extend(["--commit-message", args.commit_message])
-        subprocess.run(card_command, check=True)
         _verify_remote_card(args.dataset, card, auth_token)
     print(f"published validated dataset -> {args.dataset}");return 0
