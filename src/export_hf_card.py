@@ -291,7 +291,7 @@ def _program_mix(trajectories: dict[str, dict]) -> Counter:
 
 def _training_row_weight(row: dict) -> int:
     """Number of supervised assistant targets represented by one stored row."""
-    if row.get("source_trajectory_id"):
+    if row.get("source_trajectory_id") or isinstance(row.get("assistant_step"), int):
         return 1
     return sum(message.get("role") == "assistant"
                for message in (row.get("messages") or []))
@@ -558,10 +558,14 @@ def build_card(rows: list[dict], *, stage: str = "release") -> str:
     manifest_path = PUBLISH_DIR / "dataset-manifest.json"
     if publish_mode == "parquet-shards" and manifest_path.is_file():
         file_size = int(json.loads(manifest_path.read_text()).get("bytes") or 0)
+        jsonl_size = TRACES.stat().st_size if TRACES.is_file() else 0
+        size_label = (f"{_human_size(file_size)} PARQUET · "
+                      f"{_human_size(jsonl_size)} JSONL")
         layout = ("The dataset is published as validated, active Parquet shards "
                   "listed in `dataset-manifest.json`.")
     else:
         file_size = TRACES.stat().st_size if TRACES.is_file() else 0
+        size_label = _human_size(file_size)
         layout = "Everything ships in one data file: `traces.jsonl`."
     return f"""{_front_matter(pretty_name, license_id, tags, size_cat, has_security)}
 
@@ -570,7 +574,7 @@ def build_card(rows: list[dict], *, stage: str = "release") -> str:
 ![Moonshiner — {model_display} instruction following, tool use, and coding](./{BANNER.name})
 
 <div align="center">
-  <h2>{total_traj:,} TRAJECTORIES · {total_rows:,} TRAINING ROWS · {_human_size(file_size)}</h2>
+  <h2>{total_traj:,} TRAJECTORIES · {total_rows:,} TRAINING ROWS · {size_label}</h2>
 </div>
 
 {ATTRIBUTION}

@@ -54,6 +54,23 @@ class Units(unittest.TestCase):
         text = card.build_card(_coding_and_security())
         self.assertIn("2 TRAJECTORIES · 3 TRAINING ROWS", text)
 
+    def test_public_ten_field_prefix_rows_are_not_counted_again(self):
+        rows = []
+        for step in (1, 2):
+            rows.append({
+                "task": "public-task", "lang": "en", "category": "Building",
+                "split": "train", "assistant_step": step,
+                "assistant_steps": 2, "target_message_index": step * 2 - 1,
+                "n_messages": step * 2,
+                "messages": ([{"role": "user", "content": "go"},
+                              {"role": "assistant", "content": "done"}] * step),
+                "tools": "[]",
+            })
+        text = card.build_card(rows)
+        self.assertIn("1 TRAJECTORIES · 2 TRAINING ROWS", text)
+        self.assertIn("10K<n<100K", card._front_matter(
+            "name", "cc-by-4.0", [], card._size_category(13_138), False))
+
     def test_kimi_banner_is_packaged_at_the_configurable_asset_path(self):
         banner = _ROOT / "assets" / "kimi-k3-dataset-banner.png"
         self.assertTrue(banner.is_file())
@@ -67,21 +84,27 @@ class Units(unittest.TestCase):
             traces = pathlib.Path(directory) / "traces.jsonl"
             traces.write_bytes(b"x" * 1_000)
             (pathlib.Path(directory) / "traces.jsonl.backup").write_bytes(b"x" * 10_000)
-            with mock.patch.object(card, "TRACES", traces):
+            config = {**CONFIG, "publish": {
+                **CONFIG.get("publish", {}), "format": "jsonl"}}
+            with mock.patch.object(card, "TRACES", traces), \
+                 mock.patch.object(card, "CONFIG", config):
                 text = card.build_card(_coding_and_security())
             self.assertIn("1 kB</h2>", text)
 
     def test_parquet_headline_uses_active_manifest_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
+            traces = root / "traces.jsonl"
+            traces.write_bytes(b"x" * 5_000)
             (root / "dataset-manifest.json").write_text(json.dumps({
                 "bytes": 2_000, "row_count": 3, "trajectory_count": 2}))
             config = {**CONFIG, "publish": {
                 **CONFIG.get("publish", {}), "format": "parquet-shards"}}
             with mock.patch.object(card, "CONFIG", config), \
-                 mock.patch.object(card, "PUBLISH_DIR", root):
+                 mock.patch.object(card, "PUBLISH_DIR", root), \
+                 mock.patch.object(card, "TRACES", traces):
                 text = card.build_card(_coding_and_security())
-            self.assertIn("2 kB</h2>", text)
+            self.assertIn("2 kB PARQUET · 5 kB JSONL</h2>", text)
             self.assertIn("active Parquet shards", text)
 
     def test_size_category_boundaries(self):
