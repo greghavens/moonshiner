@@ -28,6 +28,13 @@ def published_row(task="trajectory-a", step=1, total=1):
 
 
 class LocalFirstBootstrap(unittest.TestCase):
+    def test_dataset_file_detection_uses_remote_siblings(self):
+        info = {"siblings": [{"rfilename": "README.md"},
+                              {"rfilename": "traces.jsonl"}]}
+        with mock.patch.object(hf_sync, "_dataset_info", return_value=info):
+            self.assertTrue(hf_sync.dataset_has_file("owner/data", "traces.jsonl"))
+            self.assertFalse(hf_sync.dataset_has_file("owner/data", "missing.jsonl"))
+
     def test_existing_local_file_is_kept_and_later_runs_do_not_check_remote(self):
         with tempfile.TemporaryDirectory() as name:
             root = pathlib.Path(name)

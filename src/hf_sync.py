@@ -51,6 +51,12 @@ def _dataset_info(dataset: str) -> dict | None:
         raise
 
 
+def dataset_has_file(dataset: str, filename: str = "traces.jsonl") -> bool:
+    info = _dataset_info(dataset)
+    return bool(info and filename in {
+        item.get("rfilename") for item in info.get("siblings", [])})
+
+
 def _remote_file_url(dataset: str, revision: str, filename: str) -> str:
     return ("https://huggingface.co/datasets/" + urllib.parse.quote(dataset, safe="/")
             + "/resolve/" + urllib.parse.quote(revision, safe="") + "/"

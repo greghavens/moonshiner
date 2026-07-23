@@ -77,7 +77,7 @@ def migration_path() -> Path:
 def _historical_canonical(rows: list[dict]) -> list[dict] | None:
     """Upgrade the former canonical columns without altering trace content."""
     required = {
-        "task", "source_trajectory_id", "source_trajectory_sha256", "split",
+        "task", "source_trajectory_id", "split",
         "derivation", "assistant_step", "assistant_steps",
         "target_message_index", "original_n_messages", "messages", "tools",
     }
@@ -92,7 +92,7 @@ def _historical_canonical(rows: list[dict]) -> list[dict] | None:
         converted.append({
             "task": row["task"],
             "source_trajectory_id": row["source_trajectory_id"],
-            "source_trajectory_sha256": row["source_trajectory_sha256"],
+            "source_trajectory_sha256": row.get("source_trajectory_sha256"),
             "lang": row.get("lang"),
             "category": row.get("category"),
             "domain": row.get("domain", "coding"),

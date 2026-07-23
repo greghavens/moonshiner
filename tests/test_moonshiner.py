@@ -44,6 +44,8 @@ class FrontDoor(unittest.TestCase):
                  mock.patch.object(m.shutil, "which", return_value="/usr/bin/pi"), \
                  mock.patch("common.key_env_name", return_value="OPENROUTER_API_KEY"), \
                  mock.patch("common.key_persist_path", return_value=key_path), \
+                 mock.patch("hf_sync.dataset_has_file", return_value=True), \
+                 mock.patch.object(m, "_yes", return_value=True) as confirm_resume, \
                  mock.patch("import_existing.main", return_value=0) as resume:
                 self.assertEqual(m._setup([]), 0)
         self.assertEqual(ask.call_count, 3)
@@ -59,6 +61,36 @@ class FrontDoor(unittest.TestCase):
         self.assertNotIn("Kimi", json.dumps(updates))
         self.assertNotIn("Fable", json.dumps(updates))
         resume.assert_called_once_with(["--hf", "owner/orion-data"])
+        confirm_resume.assert_called_once_with(
+            "Existing dataset owner/orion-data found. Resume it", True)
+
+    def test_zai_is_a_first_class_provider_without_custom_url_questions(self):
+        config = json.loads((_ROOT / "config.json").read_text())
+        updates = {}
+        prompts = []
+
+        def answer(prompt, default):
+            prompts.append(prompt)
+            return {"Pi API provider (openrouter, openai, anthropic, zai, or custom)": "zai",
+                    "Z.AI key type (standard or coding-plan)": "coding-plan"}[prompt]
+
+        with mock.patch.object(m, "_ask", side_effect=answer), \
+             mock.patch.object(configuration, "update_local",
+                               side_effect=lambda key, value: updates.__setitem__(key, value)):
+            profile, runtime = m._configure_pi_provider(config, "pi")
+        self.assertEqual(profile, "pi-zai")
+        self.assertEqual(runtime["base_url"], "https://api.z.ai/api/coding/paas/v4")
+        self.assertEqual(runtime["key_env"], "ZAI_API_KEY")
+        self.assertEqual(runtime["thinking_format"], "zai")
+        self.assertFalse(any("URL" in prompt for prompt in prompts))
+
+    def test_dataset_build_help_never_executes_build(self):
+        with mock.patch.object(m, "_run") as run, \
+             mock.patch("builtins.print") as output:
+            self.assertEqual(m.main(["dataset", "build", "--help"]), 0)
+        run.assert_not_called()
+        self.assertTrue(any("moonshiner dataset build" in str(call)
+                            for call in output.call_args_list))
 
     def test_help_leads_with_normal_jobs_not_phases(self):
         text = m._help()
@@ -134,7 +166,7 @@ class FrontDoor(unittest.TestCase):
         self.assertIn("@earendil-works/pi-coding-agent@1.2.3", command)
 
     def test_provider_presets_include_endpoint_protocol_and_key(self):
-        for provider in ("openrouter", "openai", "anthropic"):
+        for provider in ("openrouter", "openai", "anthropic", "zai"):
             preset = m.PROVIDER_PRESETS[provider]
             self.assertIn("base_url", preset)
             self.assertIn("api", preset)

@@ -106,7 +106,7 @@ class OnePipelineInvariant(unittest.TestCase):
                 "name": "read_file", "parameters": {"type": "object"}}}]
             historical = {
                 "task": "historical-one", "source_trajectory_id": "source-one",
-                "source_trajectory_sha256": "a" * 64, "lang": "en",
+                "lang": "en",
                 "category": "Debugging", "kind": "trace", "domain": "coding",
                 "security_task": False, "verifier": "judge", "split": "train",
                 "session_id": "session-one", "teacher_model": "acme/model",
@@ -127,7 +127,7 @@ class OnePipelineInvariant(unittest.TestCase):
             self.assertEqual(row["messages"], messages)
             self.assertEqual(json.loads(row["tools"]), tools)
             self.assertEqual(row["source_trajectory_id"], "source-one")
-            self.assertEqual(row["source_trajectory_sha256"], "a" * 64)
+            self.assertIsNone(row["source_trajectory_sha256"])
             self.assertIsNone(row["teacher_runtime"])
             self.assertIsNone(row["provider"])
             self.assertFalse(row["model_attested"])

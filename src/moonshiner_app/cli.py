@@ -11,6 +11,14 @@ def _is_read_only(argv: list[str]) -> bool:
             and argv[1] in {"status", "verify", "list", "catalog", "manifest"})
     ))
 
+
+def _run_application(application_main) -> int:
+    try:
+        return int(application_main())
+    except KeyboardInterrupt:
+        print("Exiting.")
+        return 130
+
 def main() -> int:
     bundle = Path(__file__).resolve().parent / "bundle"
     os.environ.setdefault("MOONSHINER_BUNDLE_ROOT", str(bundle))
@@ -23,7 +31,7 @@ def main() -> int:
     os.environ["MOONSHINER_HOME"] = str(storage)
     if read_only:
         from moonshiner import main as application_main
-        return int(application_main())
+        return _run_application(application_main)
     active = storage.expanduser() / "corpora" / "active"
     if not (active / "tasks" / "seeds").is_dir():
         active.parent.mkdir(parents=True, exist_ok=True)
@@ -53,4 +61,4 @@ def main() -> int:
         shutil.copy2(bundle / "tasks" / "behavior-worlds.json",
                      active / "tasks" / "behavior-worlds.json")
     from moonshiner import main as application_main
-    return int(application_main())
+    return _run_application(application_main)

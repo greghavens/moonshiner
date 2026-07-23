@@ -310,14 +310,25 @@ PROVIDER_PRESETS = {
     "anthropic": {"display_provider": "Anthropic", "base_url": "https://api.anthropic.com",
                   "api": "anthropic-messages", "thinking_format": "anthropic",
                   "key_env": "ANTHROPIC_API_KEY"},
+    "zai": {"display_provider": "Z.AI", "base_url": "https://api.z.ai/api/paas/v4",
+            "api": "openai-completions", "thinking_format": "zai",
+            "key_env": "ZAI_API_KEY"},
 }
 
 
 def _configure_pi_provider(config: dict, current_runtime: str) -> tuple[str, dict]:
     existing = (config.get("runtimes") or {}).get(current_runtime) or config["runtimes"]["pi"]
     default = str(existing.get("provider") or current_runtime.removeprefix("pi-") or "openrouter")
-    provider = _ask("Pi API provider (openrouter, openai, anthropic, or custom)", default).lower()
+    provider = _ask(
+        "Pi API provider (openrouter, openai, anthropic, zai, or custom)",
+        default).lower()
     preset = dict(PROVIDER_PRESETS.get(provider) or {})
+    if provider == "zai":
+        key_type = _ask("Z.AI key type (standard or coding-plan)", "standard").lower()
+        if key_type not in {"standard", "coding-plan"}:
+            raise SystemExit("Z.AI key type must be standard or coding-plan")
+        if key_type == "coding-plan":
+            preset["base_url"] = "https://api.z.ai/api/coding/paas/v4"
     if not preset:
         preset = {
             "display_provider": _ask("Provider display name", provider),
@@ -386,6 +397,18 @@ def _setup(argv: list[str] | None = None) -> int:
         str(current_publish.get("hf_dataset") or ""))
     if workflow == "trace-only" and not hf_dataset:
         raise SystemExit("A trace-only project needs its existing Hugging Face dataset")
+    resume_existing = False
+    if hf_dataset:
+        from common import DATA
+        filename = str(current_publish.get("filename") or "traces.jsonl")
+        local_exists = (DATA / "hf-publish" / filename).is_file()
+        from hf_sync import dataset_has_file
+        remote_exists = dataset_has_file(hf_dataset, filename)
+        if local_exists or remote_exists:
+            resume_existing = _yes(
+                f"Existing dataset {hf_dataset} found. Resume it", True)
+            if not resume_existing:
+                raise SystemExit("Setup cancelled; existing dataset was not resumed")
     trace_workers = int(_ask("Parallel trace workers", "2")) if args.reconfigure else 2
     trace_attempts = int(_ask("Maximum attempts per individual trace", "3")) if args.reconfigure else 3
     trace_stepdown = (_ask("Step down trace reasoning after rejection (yes/no)", "yes")
@@ -496,7 +519,7 @@ def _setup(argv: list[str] | None = None) -> int:
             subprocess.run([npm, "install", "--no-audit", "--no-fund", "--prefix",
                             str(prefix), f"@earendil-works/pi-coding-agent@{version}"],
                            check=True)
-    if hf_dataset:
+    if resume_existing:
         print(f"Importing existing completion state from {hf_dataset}…")
         from import_existing import main as import_existing
         import_existing(["--hf", hf_dataset])
@@ -1062,6 +1085,11 @@ def main(argv: list[str] | None = None) -> int:
         if not rest or rest[0] not in {"build", "export"}:
             print("usage: moonshiner dataset {build,export,analyze,compose,readiness,prepare}", file=sys.stderr)
             return 2
+        if any(value in {"-h", "--help"} for value in rest[1:]):
+            print("usage: moonshiner dataset build\n\n"
+                  "Build, validate, shard, and render the local dataset from "
+                  "accepted traces.")
+            return 0
         return _run(["--from", "build"])
     if command in BY_KEY:
         return _dispatch(BY_KEY[command], rest)
