@@ -14,6 +14,7 @@ import export_hf_next_steps  # noqa: E402
 import publish_queue  # noqa: E402
 import migrate_canonical_dataset  # noqa: E402
 import publish  # noqa: E402
+import canonical_dataset  # noqa: E402
 
 
 class OnePipelineInvariant(unittest.TestCase):
@@ -57,6 +58,55 @@ class OnePipelineInvariant(unittest.TestCase):
         self.assertEqual(keys[0], keys[1])
         self.assertEqual(keys[1], keys[2])
         self.assertEqual(keys[0], export_hf_next_steps.PUBLISH_KEY_ORDER)
+
+    def test_every_model_emits_identical_canonical_messages_and_category(self):
+        def record(model, reasoning_field, category):
+            assistant = {
+                "role": "assistant", "content": "",
+                reasoning_field: "native reasoning",
+                "tool_calls": [{"id": "call-1", "type": "function",
+                                "function": {"name": "read",
+                                             "arguments": {"path": "a.txt"}}}],
+                "refusal": None,
+                "reasoning_details": [{"type": "text", "text": "duplicate"}],
+            }
+            return {"meta": {
+                "task": "same-task", "source_trajectory_id": "source-id",
+                "source_sha256": "a" * 64, "lang": "en",
+                "category": category, "domain": "agent",
+                "verifier": "judge", "teacher_runtime": "native-harness",
+                "teacher_model": model, "reasoning_effort": "max",
+                "provider": "configured-provider", "observed_models": [model],
+                "model_attested": True, "trace_format": "native-v1",
+                "tools_used": ["read"],
+                "derivation": "cumulative-next-assistant-v1",
+                "assistant_step": 1, "assistant_steps": 1,
+                "target_message_index": 1, "original_n_messages": 2},
+                "messages": [{"role": "user", "content": "research"}, assistant],
+                "tools": []}
+        with mock.patch.object(
+                canonical_dataset, "catalog_categories",
+                return_value={"same-task": "Catalog category"}):
+            rows = [
+                export_hf_next_steps.build_row(
+                    record("fable", "reasoning_content", "Legacy Fable"), "train"),
+                export_hf_next_steps.build_row(
+                    record("kimi", "reasoning", "Legacy Kimi"), "train"),
+                export_hf_next_steps.build_row(
+                    record("glm", "reasoning_content", "Legacy GLM"), "train"),
+            ]
+        self.assertEqual({row["category"] for row in rows}, {"Catalog category"})
+        expected = canonical_dataset.MESSAGE_KEY_ORDER
+        for row in rows:
+            self.assertTrue(all(list(message) == expected
+                                for message in row["messages"]))
+            assistant = row["messages"][-1]
+            self.assertEqual(assistant["reasoning_content"], "native reasoning")
+            self.assertNotIn("reasoning", assistant)
+            self.assertNotIn("reasoning_details", assistant)
+            self.assertEqual(
+                assistant["tool_calls"][0]["function"]["arguments"],
+                '{"path":"a.txt"}')
 
     def test_one_time_migration_feeds_the_one_canonical_schema(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -124,13 +174,118 @@ class OnePipelineInvariant(unittest.TestCase):
                 self.assertEqual(migrate_canonical_dataset.migrate(path), (1, 1))
             row = json.loads(path.read_text())
             self.assertEqual(list(row), export_hf_next_steps.PUBLISH_KEY_ORDER)
-            self.assertEqual(row["messages"], messages)
+            self.assertEqual(
+                [(message["role"], message["content"])
+                 for message in row["messages"]],
+                [(message["role"], message["content"]) for message in messages])
+            self.assertTrue(all(
+                list(message) == canonical_dataset.MESSAGE_KEY_ORDER
+                for message in row["messages"]))
             self.assertEqual(json.loads(row["tools"]), tools)
             self.assertEqual(row["source_trajectory_id"], "source-one")
-            self.assertIsNone(row["source_trajectory_sha256"])
-            self.assertIsNone(row["teacher_runtime"])
-            self.assertIsNone(row["provider"])
+            self.assertEqual(len(row["source_trajectory_sha256"]), 64)
+            self.assertEqual(row["teacher_runtime"], "historical")
+            self.assertEqual(row["provider"], "historical")
             self.assertFalse(row["model_attested"])
+
+    def test_already_canonical_top_level_rows_still_normalize_nested_messages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = pathlib.Path(directory)
+            row = {key: None for key in export_hf_next_steps.PUBLISH_KEY_ORDER}
+            row.update({
+                "task": "historical-one", "source_trajectory_id": "source-one",
+                "split": "train", "derivation": "cumulative-next-assistant-v1",
+                "assistant_step": 1, "assistant_steps": 1,
+                "target_message_index": 1, "original_n_messages": 2,
+                "n_messages": 2, "tools": "[]",
+                "messages": [
+                    {"role": "user", "content": "inspect"},
+                    {"role": "assistant", "content": "",
+                     "reasoning": "native reasoning", "refusal": None},
+                ],
+            })
+            path = data / "traces.jsonl"
+            path.write_text(json.dumps(row) + "\n")
+            with mock.patch.object(migrate_canonical_dataset, "DATA", data), \
+                 mock.patch.object(migrate_canonical_dataset, "CONFIG", {}), \
+                 mock.patch.object(canonical_dataset, "catalog_categories",
+                                   return_value={"historical-one": "Debugging"}):
+                self.assertEqual(migrate_canonical_dataset.migrate(path), (1, 1))
+            normalized = json.loads(path.read_text())
+            self.assertEqual(normalized["category"], "Debugging")
+            self.assertEqual(
+                normalized["messages"][-1]["reasoning_content"],
+                "native reasoning")
+            self.assertNotIn("reasoning", normalized["messages"][-1])
+
+    def test_mixed_historical_generations_normalize_in_one_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = pathlib.Path(directory)
+            legacy = {
+                "task": "legacy", "lang": "en", "category": "Old",
+                "split": "train", "assistant_step": 1, "assistant_steps": 1,
+                "target_message_index": 1, "n_messages": 2,
+                "messages": [{"role": "user", "content": "do"},
+                             {"role": "assistant", "content": "done",
+                              "reasoning": "legacy thought"}],
+                "tools": "[]",
+            }
+            current = {key: None for key in export_hf_next_steps.PUBLISH_KEY_ORDER}
+            current.update({
+                "task": "current", "source_trajectory_id": "current:source",
+                "source_trajectory_sha256": "c" * 64, "lang": "en",
+                "category": "Old", "domain": "agent",
+                "verifier": "published-baseline", "split": "train",
+                "teacher_runtime": "pi", "teacher_model": "model",
+                "reasoning_effort": "max", "provider": "provider",
+                "observed_models": ["model"], "model_attested": False,
+                "trace_format": "native", "tools_used": [],
+                "derivation": "cumulative-next-assistant-v1",
+                "assistant_step": 1, "assistant_steps": 1,
+                "target_message_index": 1, "original_n_messages": 2,
+                "n_messages": 2,
+                "messages": [{"role": "user", "content": "do"},
+                             {"role": "assistant", "content": "done",
+                              "reasoning_content": "current thought"}],
+                "tools": "[]",
+            })
+            path = data / "traces.jsonl"
+            path.write_text(json.dumps(legacy) + "\n" + json.dumps(current) + "\n")
+            with mock.patch.object(migrate_canonical_dataset, "DATA", data), \
+                 mock.patch.object(migrate_canonical_dataset, "CONFIG", {
+                     "teacher": {"runtime": "pi", "model": "model",
+                                 "reasoning": "max"},
+                     "runtimes": {"pi": {"provider": "provider"}}}), \
+                 mock.patch.object(canonical_dataset, "catalog_categories",
+                                   return_value={"legacy": "Building",
+                                                 "current": "Debugging"}):
+                self.assertEqual(migrate_canonical_dataset.migrate(path), (2, 2))
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            self.assertTrue(all(list(row) == export_hf_next_steps.PUBLISH_KEY_ORDER
+                                for row in rows))
+            self.assertEqual([row["category"] for row in rows],
+                             ["Building", "Debugging"])
+            self.assertEqual(
+                [row["messages"][-1]["reasoning_content"] for row in rows],
+                ["legacy thought", "current thought"])
+
+    def test_export_validation_rejects_source_specific_message_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "traces.jsonl"
+            row = {key: None for key in export_hf_next_steps.PUBLISH_KEY_ORDER}
+            row.update({
+                "task": "one", "source_trajectory_id": "one:source",
+                "split": "train", "derivation": "cumulative-next-assistant-v1",
+                "assistant_step": 1, "assistant_steps": 1,
+                "target_message_index": 1, "original_n_messages": 1,
+                "n_messages": 1, "tools": "[]",
+                "messages": [{"role": "assistant", "content": "done",
+                              "reasoning": "source-specific"}],
+            })
+            path.write_text(json.dumps(row) + "\n")
+            with self.assertRaisesRegex(ValueError,
+                                        "non-canonical message fields"):
+                export_hf_next_steps.validate_export(path)
 
     def test_migration_uses_the_single_imported_source_when_mirror_is_absent(self):
         with tempfile.TemporaryDirectory() as directory:

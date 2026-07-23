@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 from common import DATA
+from canonical_dataset import canonical_category, normalize_messages
 from trace_provenance import value as provenance
 
 FULL = DATA / "full"
@@ -35,7 +36,7 @@ def build_row(record: dict, split: str) -> dict:
     return {
         "task": meta["task"],
         "lang": meta.get("lang"),
-        "category": meta.get("category"),
+        "category": canonical_category(meta["task"], meta.get("category")),
         "domain": meta.get("domain", "coding"),
         "verifier": meta.get("verifier", "acceptance-tests+protected-file-hash"),
         "split": split,
@@ -48,7 +49,7 @@ def build_row(record: dict, split: str) -> dict:
         "trace_format": provenance(record, "trace_format"),
         "tools_used": meta.get("tools_used", []),
         "n_messages": len(record["messages"]),
-        "messages": record["messages"],
+        "messages": normalize_messages(record["messages"]),
         "tools": json.dumps(record.get("tools", [])),
     }
 

@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from common import DATA, RUNS
+from canonical_dataset import (MESSAGE_KEY_ORDER, PUBLISH_KEY_ORDER,
+                               canonical_category, normalize_messages)
 from expand_next_steps import DERIVATION
 from hf_sync import ensure_local_dataset
 from trace_provenance import value as provenance
@@ -26,16 +28,6 @@ DEFAULT_INPUT = DATA / "next_step"
 DEFAULT_SOURCE = DATA / "full"
 DEFAULT_OUTPUT = DATA / "hf-publish" / "traces.jsonl"
 SPLITS = ("train", "val")
-
-# The exact key order build_row() emits; the validator gates on this.
-PUBLISH_KEY_ORDER = [
-    "task", "source_trajectory_id", "source_trajectory_sha256", "lang",
-    "category", "domain", "verifier", "split", "teacher_runtime", "teacher_model",
-    "reasoning_effort", "provider", "observed_models", "model_attested",
-    "trace_format", "tools_used", "derivation", "assistant_step",
-    "assistant_steps", "target_message_index", "original_n_messages",
-    "n_messages", "messages", "tools"]
-
 
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -71,7 +63,7 @@ def build_row(record: dict, split: str) -> dict:
         "source_trajectory_id": meta["source_trajectory_id"],
         "source_trajectory_sha256": meta["source_sha256"],
         "lang": meta.get("lang"),
-        "category": meta.get("category"),
+        "category": canonical_category(meta["task"], meta.get("category")),
         "domain": meta.get("domain", "coding"),
         "verifier": meta.get("verifier", "acceptance-tests+quality-review"),
         "split": split,
@@ -89,7 +81,7 @@ def build_row(record: dict, split: str) -> dict:
         "target_message_index": meta["target_message_index"],
         "original_n_messages": meta["original_n_messages"],
         "n_messages": len(record["messages"]),
-        "messages": record["messages"],
+        "messages": normalize_messages(record["messages"]),
         "tools": json.dumps(record.get("tools") or []),
     }
 
@@ -103,9 +95,13 @@ def validate_export(path: Path) -> dict:
             if not line.strip():
                 continue
             row = json.loads(line)
+            if list(row) != PUBLISH_KEY_ORDER:
+                raise ValueError(f"line {number}: non-canonical row fields")
             messages = row.get("messages")
             if not isinstance(messages, list) or not messages:
                 raise ValueError(f"line {number}: messages must be non-empty")
+            if any(list(message) != MESSAGE_KEY_ORDER for message in messages):
+                raise ValueError(f"line {number}: non-canonical message fields")
             if messages[-1].get("role") != "assistant":
                 raise ValueError(f"line {number}: target is not assistant")
             if row.get("target_message_index") != len(messages) - 1:

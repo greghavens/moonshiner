@@ -10,6 +10,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import export_hf_next_steps as export  # noqa: E402
 import hf_sync  # noqa: E402
+import migrate_canonical_dataset  # noqa: E402
 import validate_hf_export  # noqa: E402
 
 
@@ -75,22 +76,30 @@ class LocalFirstBootstrap(unittest.TestCase):
 
 
 class TaskKeyedExport(unittest.TestCase):
-    def test_retained_legacy_next_step_rows_validate_by_central_task_identity(self):
+    def test_legacy_rows_must_be_normalized_before_append(self):
         with tempfile.TemporaryDirectory() as name:
             root = pathlib.Path(name)
             output = root / "traces.jsonl"
             journal = root / "journal.jsonl"
             legacy = published_row("legacy-task")
             output.write_text(json.dumps(legacy) + "\n")
-            current = published_row("new-task")
-            current["source_trajectory_id"] = "new-task"
+            with self.assertRaisesRegex(ValueError, "non-canonical row fields"):
+                export.validate_export(output)
+            with mock.patch.object(migrate_canonical_dataset, "DATA", root), \
+                 mock.patch.object(migrate_canonical_dataset, "CONFIG", {
+                     "teacher": {"runtime": "pi", "model": "model", "reasoning": "max"},
+                     "runtimes": {"pi": {"provider": "provider"}}}):
+                migrate_canonical_dataset.migrate(output)
+            self.assertEqual(validate_hf_export.validate(output), 1)
+            current = json.loads(output.read_text())
+            current.update({
+                "task": "new-task", "source_trajectory_id": "new-task",
+                "source_trajectory_sha256": "b" * 64,
+            })
             journal.write_text(json.dumps(current) + "\n")
-
             export.upsert_journal(output, journal)
-
             rows = [json.loads(line) for line in output.read_text().splitlines()]
-            retained = next(item for item in rows if item["task"] == "legacy-task")
-            self.assertNotIn("source_trajectory_id", retained)
+            self.assertTrue(all(list(item) == export.PUBLISH_KEY_ORDER for item in rows))
             self.assertEqual(export.validate_export(output)["trajectories"], 2)
 
     def test_appends_new_identity_and_keeps_existing_bytes(self):
@@ -119,11 +128,12 @@ class TaskKeyedExport(unittest.TestCase):
 
 
 class PublishedDatasetValidation(unittest.TestCase):
-    def test_accepts_the_exact_existing_fable_public_schema(self):
+    def test_rejects_legacy_public_schema_until_normalized(self):
         with tempfile.TemporaryDirectory() as name:
             path = pathlib.Path(name) / "traces.jsonl"
             path.write_text(json.dumps(published_row()) + "\n")
-            self.assertEqual(validate_hf_export.validate(path), 1)
+            with self.assertRaisesRegex(ValueError, "unexpected schema"):
+                validate_hf_export.validate(path)
 
     def test_rejects_an_unrecognized_schema(self):
         with tempfile.TemporaryDirectory() as name:

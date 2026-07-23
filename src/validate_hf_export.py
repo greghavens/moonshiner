@@ -15,15 +15,10 @@ import json
 from pathlib import Path
 
 from common import ROOT, _staged_secret_values, provider_key_env_names
+from canonical_dataset import MESSAGE_KEY_ORDER
 from privacy import findings
 from expand_next_steps import DERIVATION
 from export_hf_next_steps import DEFAULT_OUTPUT, PUBLISH_KEY_ORDER
-
-PUBLIC_KEY_ORDER = [
-    "task", "lang", "category", "split", "assistant_step",
-    "assistant_steps", "target_message_index", "n_messages", "messages",
-    "tools",
-]
 
 # Static names plus every configured runtime's key_env, so a newly configured
 # provider is covered by the privacy gate without editing this list.
@@ -44,10 +39,11 @@ def validate(path: Path, *, trusted_prefix_rows: int = 0) -> int:
             continue
         row = json.loads(line)
         schema = list(row)
-        if schema not in (PUBLIC_KEY_ORDER, PUBLISH_KEY_ORDER):
+        if schema != PUBLISH_KEY_ORDER:
             raise ValueError(f"line {number}: unexpected schema {list(row)}")
-        enriched = schema == PUBLISH_KEY_ORDER
-        if enriched:
+        enriched = True
+        historical = row.get("verifier") == "published-baseline"
+        if not historical:
             if not str(row.get("teacher_model") or "").strip():
                 raise ValueError(f"line {number}: teacher_model is empty")
             if not str(row.get("provider") or "").strip():
@@ -68,6 +64,8 @@ def validate(path: Path, *, trusted_prefix_rows: int = 0) -> int:
         messages = row.get("messages")
         if not isinstance(messages, list) or not messages:
             raise ValueError(f"line {number}: messages must be non-empty")
+        if any(list(message) != MESSAGE_KEY_ORDER for message in messages):
+            raise ValueError(f"line {number}: non-canonical message fields")
         if messages[-1].get("role") != "assistant":
             raise ValueError(f"line {number}: target is not final assistant")
         if row.get("target_message_index") != len(messages) - 1:

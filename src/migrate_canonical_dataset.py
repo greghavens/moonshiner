@@ -11,8 +11,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from common import CONFIG, DATA
+from canonical_dataset import PUBLISH_KEY_ORDER, normalize_public_row
 from expand_next_steps import expand_record
-from export_hf_next_steps import PUBLISH_KEY_ORDER, build_row, validate_export
+from export_hf_next_steps import build_row, validate_export
 from hf_sync import sha256
 
 
@@ -74,7 +75,9 @@ def migration_path() -> Path:
     return target
 
 
-def _historical_canonical(rows: list[dict]) -> list[dict] | None:
+def _historical_canonical(
+        rows: list[dict], source_hashes: dict[str, str] | None = None
+        ) -> list[dict] | None:
     """Upgrade the former canonical columns without altering trace content."""
     required = {
         "task", "source_trajectory_id", "split",
@@ -83,27 +86,46 @@ def _historical_canonical(rows: list[dict]) -> list[dict] | None:
     }
     if not all(required <= set(row) for row in rows):
         return None
+    teacher = CONFIG.get("teacher") or {}
+    configured_runtime = str(teacher.get("runtime") or "historical")
+    runtime_config = (CONFIG.get("runtimes") or {}).get(configured_runtime) or {}
+    final_by_source = {}
+    for row in rows:
+        source = row["source_trajectory_id"]
+        prior = final_by_source.get(source)
+        if prior is None or row["assistant_step"] > prior["assistant_step"]:
+            final_by_source[source] = row
+    source_hashes = source_hashes or {
+        source: _source_hash(final) for source, final in final_by_source.items()}
     converted = []
     for row in rows:
         tools = row.get("tools")
         if not isinstance(tools, str):
             tools = json.dumps(tools or [], ensure_ascii=False)
-        model = row.get("teacher_model")
-        converted.append({
+        runtime = row.get("teacher_runtime") or configured_runtime
+        model = row.get("teacher_model") or teacher.get("model")
+        provider = row.get("provider") or (
+            ((CONFIG.get("runtimes") or {}).get(str(runtime)) or {}).get("provider")
+            or runtime_config.get("provider") or "historical")
+        attested = bool(row.get("model_attested"))
+        converted.append(normalize_public_row({
             "task": row["task"],
             "source_trajectory_id": row["source_trajectory_id"],
-            "source_trajectory_sha256": row.get("source_trajectory_sha256"),
+            "source_trajectory_sha256": (
+                row.get("source_trajectory_sha256")
+                or source_hashes[row["source_trajectory_id"]]),
             "lang": row.get("lang"),
             "category": row.get("category"),
             "domain": row.get("domain", "coding"),
-            "verifier": row.get("verifier", "acceptance-tests+quality-review"),
+            "verifier": (row.get("verifier", "acceptance-tests+quality-review")
+                         if attested else "published-baseline"),
             "split": row["split"],
-            "teacher_runtime": row.get("teacher_runtime"),
+            "teacher_runtime": runtime,
             "teacher_model": model,
-            "reasoning_effort": row.get("reasoning_effort"),
-            "provider": row.get("provider"),
+            "reasoning_effort": row.get("reasoning_effort") or teacher.get("reasoning"),
+            "provider": provider,
             "observed_models": row.get("observed_models") or ([model] if model else []),
-            "model_attested": bool(row.get("model_attested")),
+            "model_attested": attested,
             "trace_format": row.get("trace_format"),
             "tools_used": row.get("tools_used") or [],
             "derivation": row["derivation"],
@@ -114,32 +136,192 @@ def _historical_canonical(rows: list[dict]) -> list[dict] | None:
             "n_messages": len(row["messages"]),
             "messages": row["messages"],
             "tools": tools,
-        })
+        }))
     return converted
 
 
+def _legacy_public(
+        rows: list[dict], source_hashes: dict[str, str] | None = None,
+        source_lengths: dict[str, int] | None = None,
+        ) -> list[dict] | None:
+    """Upgrade the original ten-column public rows without inventing trace data."""
+    required = {
+        "task", "lang", "category", "split", "assistant_step",
+        "assistant_steps", "target_message_index", "n_messages", "messages", "tools",
+    }
+    if not all(required == set(row) for row in rows):
+        return None
+    teacher = CONFIG.get("teacher") or {}
+    runtime = str(teacher.get("runtime") or "historical")
+    runtime_config = (CONFIG.get("runtimes") or {}).get(runtime) or {}
+    model = teacher.get("model")
+    provider = runtime_config.get("provider") or "historical"
+    final_by_task = {}
+    for row in rows:
+        prior = final_by_task.get(row["task"])
+        if prior is None or row["assistant_step"] > prior["assistant_step"]:
+            final_by_task[row["task"]] = row
+    source_hashes = source_hashes or {
+        task: _source_hash(final) for task, final in final_by_task.items()}
+    source_lengths = source_lengths or {
+        task: len(final["messages"]) for task, final in final_by_task.items()}
+    converted = []
+    for row in rows:
+        calls = [call for message in row["messages"]
+                 for call in (message.get("tool_calls") or [])]
+        converted.append(normalize_public_row({
+            "task": row["task"],
+            "source_trajectory_id": row["task"],
+            "source_trajectory_sha256": source_hashes[row["task"]],
+            "lang": row.get("lang"),
+            "category": row.get("category"),
+            "domain": "agent",
+            "verifier": "published-baseline",
+            "split": row["split"],
+            "teacher_runtime": runtime,
+            "teacher_model": model,
+            "reasoning_effort": teacher.get("reasoning"),
+            "provider": provider,
+            "observed_models": [model] if model else [],
+            "model_attested": False,
+            "trace_format": "historical-canonical",
+            "tools_used": sorted({
+                str((call.get("function") or {}).get("name"))
+                for call in calls if (call.get("function") or {}).get("name")}),
+            "derivation": "cumulative-next-assistant-v1",
+            "assistant_step": row["assistant_step"],
+            "assistant_steps": row["assistant_steps"],
+            "target_message_index": row["target_message_index"],
+            "original_n_messages": source_lengths[row["task"]],
+            "n_messages": len(row["messages"]),
+            "messages": row["messages"],
+            "tools": row["tools"],
+        }))
+    return converted
+
+
+def _source_hash(row: dict) -> str:
+    return hashlib.sha256(json.dumps(
+        {"messages": row["messages"], "tools": row["tools"]},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _generation(row: dict) -> str | None:
+    public_keys = {
+        "task", "lang", "category", "split", "assistant_step",
+        "assistant_steps", "target_message_index", "n_messages", "messages", "tools",
+    }
+    historical_required = {
+        "task", "source_trajectory_id", "split", "derivation",
+        "assistant_step", "assistant_steps", "target_message_index",
+        "original_n_messages", "messages", "tools",
+    }
+    if set(row) == public_keys:
+        return "public"
+    if list(row) == PUBLISH_KEY_ORDER:
+        return "current"
+    if historical_required <= set(row):
+        return "historical"
+    return None
+
+
+def _recognized_canonical(rows: list[dict]) -> list[dict] | None:
+    """Normalize a file containing any mixture of known published generations."""
+    public, current, historical = [], [], []
+    for row in rows:
+        generation = _generation(row)
+        if generation == "public":
+            public.append(row)
+        elif generation == "current":
+            current.append(row)
+        elif generation == "historical":
+            historical.append(row)
+    if len(public) + len(current) + len(historical) != len(rows):
+        return None
+    public_converted = iter(_legacy_public(public) or [])
+    historical_converted = iter(_historical_canonical(historical) or [])
+    public_ids = {id(row) for row in public}
+    current_ids = {id(row) for row in current}
+    normalized = []
+    for row in rows:
+        if id(row) in public_ids:
+            normalized.append(next(public_converted))
+        elif id(row) in current_ids:
+            normalized.append(normalize_public_row(row))
+        else:
+            normalized.append(next(historical_converted))
+    return normalized
+
+
+def _migrate_recognized_stream(path: Path) -> tuple[int, int] | None:
+    """Normalize large published files in two bounded-memory passes."""
+    final: dict[tuple[str, str], tuple[int, str, int]] = {}
+    count = 0
+    with path.open() as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            generation = _generation(row)
+            if generation is None:
+                return None
+            count += 1
+            if generation == "public":
+                identity = str(row["task"])
+            elif generation == "historical":
+                identity = str(row["source_trajectory_id"])
+            else:
+                continue
+            step = int(row["assistant_step"])
+            prior = final.get((generation, identity))
+            if prior is None or step > prior[0]:
+                final[(generation, identity)] = (
+                    step, _source_hash(row), len(row["messages"]))
+    if not count:
+        raise ValueError("dataset is empty")
+    public_hashes = {
+        identity: value[1] for (generation, identity), value in final.items()
+        if generation == "public"}
+    public_lengths = {
+        identity: value[2] for (generation, identity), value in final.items()
+        if generation == "public"}
+    historical_hashes = {
+        identity: value[1] for (generation, identity), value in final.items()
+        if generation == "historical"}
+    backup = path.with_name(path.name + ".pre-normalized")
+    if not backup.exists():
+        shutil.copy2(path, backup)
+    pending = path.with_suffix(path.suffix + ".canonical.pending")
+    with path.open() as source, pending.open("x") as destination:
+        for line in source:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            generation = _generation(row)
+            if generation == "public":
+                normalized = _legacy_public(
+                    [row], public_hashes, public_lengths)[0]
+            elif generation == "historical":
+                normalized = _historical_canonical([row], historical_hashes)[0]
+            else:
+                normalized = normalize_public_row(row)
+            destination.write(json.dumps(normalized, ensure_ascii=False) + "\n")
+        destination.flush()
+        os.fsync(destination.fileno())
+    validation = validate_export(pending)
+    pending.replace(path)
+    _advance_baseline(path, validation)
+    return validation["trajectories"], validation["rows"]
+
+
 def migrate(path: Path) -> tuple[int, int]:
+    streamed = _migrate_recognized_stream(path)
+    if streamed is not None:
+        return streamed
     rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     if not rows:
         raise ValueError("dataset is empty")
-    if all(list(row) == PUBLISH_KEY_ORDER for row in rows):
-        validation = validate_export(path)
-        _advance_baseline(path, validation)
-        return validation["trajectories"], validation["rows"]
-    historical = _historical_canonical(rows)
-    if historical is not None:
-        backup = path.with_name(path.name + ".pre-canonical")
-        if not backup.exists():
-            shutil.copy2(path, backup)
-        pending = path.with_suffix(path.suffix + ".canonical.pending")
-        with pending.open("x") as handle:
-            for row in historical:
-                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-            handle.flush(); os.fsync(handle.fileno())
-        validation = validate_export(pending)
-        pending.replace(path)
-        _advance_baseline(path, validation)
-        return validation["trajectories"], validation["rows"]
     if any("source_trajectory_id" in row or "assistant_step" in row for row in rows):
         raise ValueError("dataset mixes canonical and non-canonical rows")
 
