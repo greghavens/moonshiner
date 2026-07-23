@@ -8,7 +8,7 @@ from unittest import mock
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from privacy import findings, redact
+from privacy import findings, redact, sanitize_object
 
 
 class Privacy(unittest.TestCase):
@@ -17,6 +17,11 @@ class Privacy(unittest.TestCase):
         self.assertEqual(redacted, "[REDACTED_SECRET]")
         self.assertEqual(count, 1)
         self.assertEqual(findings(redacted), [])
+
+    def test_dictionary_keys_are_scrubbed(self):
+        scrubbed = sanitize_object({"person@example.com": "value"})
+        self.assertEqual(scrubbed, {"[REDACTED_EMAIL]": "value"})
+        self.assertEqual(findings(str(scrubbed)), [])
 
     def test_live_secret_rotation_is_seen_without_cache(self):
         with mock.patch.dict(os.environ, {"VENDOR_API_KEY": "rotated-secret-value"}):

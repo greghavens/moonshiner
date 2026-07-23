@@ -45,5 +45,11 @@ def findings(text: str, *, exact_secrets: Iterable[str] = (), forbidden_paths=()
 def sanitize_object(value, *, exact_secrets: Iterable[str] = ()):
     if isinstance(value, str): return redact(value, exact_secrets=exact_secrets)[0]
     if isinstance(value, list): return [sanitize_object(v, exact_secrets=exact_secrets) for v in value]
-    if isinstance(value, dict): return {k: sanitize_object(v, exact_secrets=exact_secrets) for k, v in value.items()}
+    if isinstance(value, dict):
+        return {
+            (redact(k, exact_secrets=exact_secrets)[0]
+             if isinstance(k, str) else k):
+            sanitize_object(v, exact_secrets=exact_secrets)
+            for k, v in value.items()
+        }
     return value
