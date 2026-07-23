@@ -8,7 +8,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from publish import (_verify_remote_card, build_viewer_shards,
+from publish import (_verify_remote_card, _verify_trusted_prefix, build_viewer_shards,
                      configure_viewer_card, inactive_remote_paths, publication_files,
                      privacy_scan_files, publication_format,
                      viewer_dataset_config)
@@ -29,6 +29,20 @@ class _Response:
 
 
 class RemoteCardVerification(unittest.TestCase):
+    def test_task_keyed_replacements_do_not_require_byte_prefix_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            traces = Path(directory) / "traces.jsonl"
+            traces.write_bytes(b"replacement\n")
+            state = {
+                "bootstrap_size": len(b"original\n"),
+                "bootstrap_sha256": __import__("hashlib").sha256(
+                    b"original\n").hexdigest(),
+            }
+            _verify_trusted_prefix(traces, state, allow_task_replacements=True)
+            with self.assertRaisesRegex(RuntimeError, "prefix differs"):
+                _verify_trusted_prefix(
+                    traces, state, allow_task_replacements=False)
+
     def test_all_three_publication_modes_are_explicit_and_model_independent(self):
         for mode in ("jsonl", "jsonl-hf-parquet", "parquet-shards"):
             self.assertEqual(publication_format({

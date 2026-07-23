@@ -165,6 +165,24 @@ def token():
         if path.exists() and path.read_text().strip():return path.read_text().strip()
     raise RuntimeError("Hugging Face authentication is missing")
 
+def _verify_trusted_prefix(traces: Path, state: dict, *,
+                           allow_task_replacements: bool) -> None:
+    """Protect append-only runs while permitting explicit task replacements."""
+    trusted_size = int(state.get("bootstrap_size") or 0)
+    if not trusted_size or allow_task_replacements:
+        return
+    digest = hashlib.sha256()
+    with traces.open("rb") as handle:
+        remaining = trusted_size
+        while remaining:
+            block = handle.read(min(1024 * 1024, remaining))
+            if not block:
+                raise RuntimeError("local HF file is shorter than trusted baseline")
+            digest.update(block)
+            remaining -= len(block)
+    if digest.hexdigest() != state.get("bootstrap_sha256"):
+        raise RuntimeError("local HF prefix differs from downloaded append baseline")
+
 def main(argv=None)->int:
     parser=argparse.ArgumentParser(prog="moonshiner publish")
     parser.add_argument("--dataset",default=CONFIG.get("publish",{}).get("hf_dataset")); parser.add_argument("--dir",type=Path,default=DATA/"hf-publish")
@@ -182,17 +200,8 @@ def main(argv=None)->int:
     marker=DATA/"hf-sync"/f"{marker_name}.json"
     state=json.loads(marker.read_text()) if marker.is_file() else {}
     trusted_rows=int(state.get("bootstrap_rows") or 0)
-    trusted_size=int(state.get("bootstrap_size") or 0)
-    if trusted_size:
-        digest=hashlib.sha256()
-        with traces.open("rb") as handle:
-            remaining=trusted_size
-            while remaining:
-                block=handle.read(min(1024*1024,remaining))
-                if not block:raise RuntimeError("local HF file is shorter than trusted baseline")
-                digest.update(block);remaining-=len(block)
-        if digest.hexdigest()!=state.get("bootstrap_sha256"):
-            raise RuntimeError("local HF prefix differs from downloaded append baseline")
+    _verify_trusted_prefix(
+        traces, state, allow_task_replacements=bool(args.task))
     validate(traces,trusted_prefix_rows=trusted_rows)
     mode = publication_format()
     manifest = None

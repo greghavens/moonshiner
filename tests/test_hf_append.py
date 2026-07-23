@@ -75,20 +75,23 @@ class LocalFirstBootstrap(unittest.TestCase):
 
 
 class TaskKeyedExport(unittest.TestCase):
-    def test_retained_legacy_next_step_rows_use_central_task_identity(self):
+    def test_retained_legacy_next_step_rows_validate_by_central_task_identity(self):
         with tempfile.TemporaryDirectory() as name:
             root = pathlib.Path(name)
             output = root / "traces.jsonl"
             journal = root / "journal.jsonl"
             legacy = published_row("legacy-task")
             output.write_text(json.dumps(legacy) + "\n")
-            journal.write_text(json.dumps(row("new-task")) + "\n")
+            current = published_row("new-task")
+            current["source_trajectory_id"] = "new-task"
+            journal.write_text(json.dumps(current) + "\n")
 
             export.upsert_journal(output, journal)
 
             rows = [json.loads(line) for line in output.read_text().splitlines()]
             retained = next(item for item in rows if item["task"] == "legacy-task")
-            self.assertEqual(retained["source_trajectory_id"], "legacy-task")
+            self.assertNotIn("source_trajectory_id", retained)
+            self.assertEqual(export.validate_export(output)["trajectories"], 2)
 
     def test_appends_new_identity_and_keeps_existing_bytes(self):
         with tempfile.TemporaryDirectory() as name:

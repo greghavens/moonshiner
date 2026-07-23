@@ -119,7 +119,10 @@ def validate_export(path: Path) -> dict:
                 raise ValueError(f"line {number}: assistant context count mismatch")
             if not isinstance(json.loads(row.get("tools", "null")), list):
                 raise ValueError(f"line {number}: tools must encode a list")
-            source_id = row.get("source_trajectory_id")
+            # The first public next-step schema predates this explicit column.
+            # It still has exactly one accepted trajectory per central task,
+            # making task the lossless source identity for validation.
+            source_id = row.get("source_trajectory_id") or row.get("task")
             if not isinstance(source_id, str) or not source_id:
                 raise ValueError(f"line {number}: source trajectory id is missing")
             prior_split = split_by_source.setdefault(source_id, row.get("split"))
@@ -176,13 +179,7 @@ def upsert_journal(output: Path, journal: Path) -> tuple[int, int]:
                 if row.get("task") in replacement_tasks:
                     replaced_rows += 1
                 else:
-                    # Early canonical next-step rows predate the explicit
-                    # source ID. Moonshiner has always kept one accepted
-                    # trajectory per central task identity, so the task ID is
-                    # the lossless source identity for those retained rows.
-                    if not row.get("source_trajectory_id") and row.get("task"):
-                        row["source_trajectory_id"] = row["task"]
-                    retained.append(json.dumps(row, ensure_ascii=False))
+                    retained.append(line.rstrip("\n"))
     output.parent.mkdir(parents=True, exist_ok=True)
     pending = output.with_suffix(output.suffix + ".upsert.pending")
     with pending.open("w") as destination:
