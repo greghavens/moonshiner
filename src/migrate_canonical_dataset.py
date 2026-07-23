@@ -373,6 +373,7 @@ def _migrate_recognized_stream(path: Path) -> tuple[int, int] | None:
             else:
                 normalized = _current_canonical(
                     row, current_hashes[str(row["source_trajectory_id"])])
+            normalized = sanitize_object(normalized)
             destination.write(json.dumps(normalized, ensure_ascii=False) + "\n")
         destination.flush()
         os.fsync(destination.fileno())

@@ -11,6 +11,7 @@ sys.path.insert(0, str(_ROOT / "src"))
 import migrate_canonical_dataset as migration  # noqa: E402
 from canonical_dataset import normalize_messages  # noqa: E402
 from generate_traces import with_action_boundary  # noqa: E402
+from privacy import findings  # noqa: E402
 
 _generation = migration._generation
 _legacy_enriched = migration._legacy_enriched
@@ -20,7 +21,7 @@ class MixedSchemaMigrationTest(unittest.TestCase):
     def test_current_historical_row_is_scrubbed_during_migration(self):
         messages = normalize_messages([
             {"role": "user", "content": "Use api_key=supersecretvalue"},
-            {"role": "assistant", "content": "Done"},
+            {"role": "assistant", "content": "Contact person@example.com"},
         ])
         row = {
             "task": "credential-fixture",
@@ -54,6 +55,7 @@ class MixedSchemaMigrationTest(unittest.TestCase):
             migrated = json.loads(path.read_text())
         self.assertNotIn("supersecretvalue", json.dumps(migrated))
         self.assertIn("[REDACTED_SECRET]", json.dumps(migrated))
+        self.assertEqual(findings(json.dumps(migrated)), [])
 
     def test_future_trace_prompt_is_exactly_the_authored_seed_prompt(self):
         prompt = "\nUse the available tools to complete this task.\n"
