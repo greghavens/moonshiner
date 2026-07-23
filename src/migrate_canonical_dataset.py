@@ -223,6 +223,14 @@ def _generation(row: dict) -> str | None:
         return "current"
     if historical_required <= set(row):
         return "historical"
+    # Published rows from an earlier Moonshiner release may already carry a
+    # source trajectory identity while lacking one or more columns introduced
+    # by a later schema revision.  They are canonical rows to normalize, not
+    # whole-session source records.  The shared normalizer supplies the current
+    # shape and the validator remains the authority on whether the result is
+    # publishable.
+    if {"task", "source_trajectory_id", "messages", "tools"} <= set(row):
+        return "current"
     return None
 
 
