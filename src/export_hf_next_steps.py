@@ -172,10 +172,17 @@ def upsert_journal(output: Path, journal: Path) -> tuple[int, int]:
             for line in source:
                 if not line.strip():
                     continue
-                if json.loads(line).get("task") in replacement_tasks:
+                row = json.loads(line)
+                if row.get("task") in replacement_tasks:
                     replaced_rows += 1
                 else:
-                    retained.append(line.rstrip("\n"))
+                    # Early canonical next-step rows predate the explicit
+                    # source ID. Moonshiner has always kept one accepted
+                    # trajectory per central task identity, so the task ID is
+                    # the lossless source identity for those retained rows.
+                    if not row.get("source_trajectory_id") and row.get("task"):
+                        row["source_trajectory_id"] = row["task"]
+                    retained.append(json.dumps(row, ensure_ascii=False))
     output.parent.mkdir(parents=True, exist_ok=True)
     pending = output.with_suffix(output.suffix + ".upsert.pending")
     with pending.open("w") as destination:
