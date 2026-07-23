@@ -12,6 +12,12 @@ from privacy import findings, redact
 
 
 class Privacy(unittest.TestCase):
+    def test_redacted_credential_assignment_is_clean(self):
+        redacted, count = redact("api_key=supersecretvalue")
+        self.assertEqual(redacted, "[REDACTED_SECRET]")
+        self.assertEqual(count, 1)
+        self.assertEqual(findings(redacted), [])
+
     def test_live_secret_rotation_is_seen_without_cache(self):
         with mock.patch.dict(os.environ, {"VENDOR_API_KEY": "rotated-secret-value"}):
             cleaned, count = redact("token=rotated-secret-value")

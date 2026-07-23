@@ -16,6 +16,7 @@ from canonical_dataset import (INTERNAL_CONTENT_MARKERS, PUBLISH_KEY_ORDER,
 from expand_next_steps import expand_record
 from export_hf_next_steps import build_row, validate_export
 from hf_sync import sha256
+from privacy import sanitize_object
 
 
 def _advance_baseline(path: Path, validation: dict) -> None:
@@ -192,7 +193,7 @@ def _legacy_enriched(
     return normalize_public_row(values)
 
 
-def _current_canonical(row: dict) -> dict:
+def _current_canonical(row: dict, source_hash: str | None = None) -> dict:
     """Fill missing project provenance on an otherwise canonical row."""
     teacher = CONFIG.get("teacher") or {}
     runtime = row.get("teacher_runtime") or teacher.get("runtime")
@@ -200,6 +201,8 @@ def _current_canonical(row: dict) -> dict:
     model = row.get("teacher_model") or teacher.get("model")
     values = dict(row)
     values.update({
+        "source_trajectory_sha256": (
+            source_hash or row.get("source_trajectory_sha256")),
         "teacher_runtime": runtime,
         "teacher_model": model,
         "reasoning_effort": (
@@ -312,7 +315,7 @@ def _migrate_recognized_stream(path: Path) -> tuple[int, int] | None:
         for line in handle:
             if not line.strip():
                 continue
-            row = json.loads(line)
+            row = sanitize_object(json.loads(line))
             generation = _generation(row)
             if generation is None:
                 return None
@@ -321,7 +324,7 @@ def _migrate_recognized_stream(path: Path) -> tuple[int, int] | None:
             count += 1
             if generation in {"public", "enriched"}:
                 identity = str(row["task"])
-            elif generation == "historical":
+            elif generation in {"historical", "current"}:
                 identity = str(row["source_trajectory_id"])
             else:
                 continue
@@ -344,6 +347,9 @@ def _migrate_recognized_stream(path: Path) -> tuple[int, int] | None:
     historical_hashes = {
         identity: value[1] for (generation, identity), value in final.items()
         if generation == "historical"}
+    current_hashes = {
+        identity: value[1] for (generation, identity), value in final.items()
+        if generation == "current"}
     backup = path.with_name(path.name + ".pre-normalized")
     if not backup.exists():
         shutil.copy2(path, backup)
@@ -352,7 +358,7 @@ def _migrate_recognized_stream(path: Path) -> tuple[int, int] | None:
         for line in source:
             if not line.strip():
                 continue
-            row = json.loads(line)
+            row = sanitize_object(json.loads(line))
             if str(row["task"]) in contaminated_tasks:
                 continue
             generation = _generation(row)
@@ -365,7 +371,8 @@ def _migrate_recognized_stream(path: Path) -> tuple[int, int] | None:
             elif generation == "historical":
                 normalized = _historical_canonical([row], historical_hashes)[0]
             else:
-                normalized = _current_canonical(row)
+                normalized = _current_canonical(
+                    row, current_hashes[str(row["source_trajectory_id"])])
             destination.write(json.dumps(normalized, ensure_ascii=False) + "\n")
         destination.flush()
         os.fsync(destination.fileno())
@@ -379,7 +386,8 @@ def migrate(path: Path) -> tuple[int, int]:
     streamed = _migrate_recognized_stream(path)
     if streamed is not None:
         return streamed
-    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    rows = [sanitize_object(json.loads(line))
+            for line in path.read_text().splitlines() if line.strip()]
     if not rows:
         raise ValueError("dataset is empty")
     contaminated_tasks = {

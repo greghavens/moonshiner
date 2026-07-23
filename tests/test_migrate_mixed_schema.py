@@ -1,5 +1,7 @@
+import json
 import pathlib
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -15,6 +17,44 @@ _legacy_enriched = migration._legacy_enriched
 
 
 class MixedSchemaMigrationTest(unittest.TestCase):
+    def test_current_historical_row_is_scrubbed_during_migration(self):
+        messages = normalize_messages([
+            {"role": "user", "content": "Use api_key=supersecretvalue"},
+            {"role": "assistant", "content": "Done"},
+        ])
+        row = {
+            "task": "credential-fixture",
+            "source_trajectory_id": "credential-fixture",
+            "source_trajectory_sha256": "a" * 64,
+            "lang": "en",
+            "category": "Building",
+            "domain": "coding",
+            "verifier": "published-baseline",
+            "split": "train",
+            "teacher_runtime": "historical",
+            "teacher_model": None,
+            "reasoning_effort": None,
+            "provider": "historical",
+            "observed_models": [],
+            "model_attested": False,
+            "trace_format": "historical-canonical",
+            "tools_used": [],
+            "derivation": "cumulative-next-assistant-v1",
+            "assistant_step": 1,
+            "assistant_steps": 1,
+            "target_message_index": 1,
+            "original_n_messages": 2,
+            "n_messages": 2,
+            "messages": messages,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "traces.jsonl"
+            path.write_text(json.dumps(row) + "\n")
+            self.assertEqual(migration.migrate(path), (1, 1))
+            migrated = json.loads(path.read_text())
+        self.assertNotIn("supersecretvalue", json.dumps(migrated))
+        self.assertIn("[REDACTED_SECRET]", json.dumps(migrated))
+
     def test_future_trace_prompt_is_exactly_the_authored_seed_prompt(self):
         prompt = "\nUse the available tools to complete this task.\n"
         self.assertEqual(
