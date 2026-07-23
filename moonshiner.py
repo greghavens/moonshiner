@@ -988,6 +988,12 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] in ("-h", "--help", "help"):
         print(_help())
         return 0
+    if argv == ["dataset", "build", "--help"] or \
+            argv == ["dataset", "build", "-h"]:
+        print("usage: moonshiner dataset build\n\n"
+              "Build, validate, shard, and render the local dataset from "
+              "accepted traces.")
+        return 0
     # Corpus discovery and release metadata are read-only package operations;
     # they do not require creating or confirming a project directory.
     if argv and argv[0] == "seeds" and len(argv) > 1 and argv[1] in {
@@ -1085,11 +1091,6 @@ def main(argv: list[str] | None = None) -> int:
         if not rest or rest[0] not in {"build", "export"}:
             print("usage: moonshiner dataset {build,export,analyze,compose,readiness,prepare}", file=sys.stderr)
             return 2
-        if any(value in {"-h", "--help"} for value in rest[1:]):
-            print("usage: moonshiner dataset build\n\n"
-                  "Build, validate, shard, and render the local dataset from "
-                  "accepted traces.")
-            return 0
         return _run(["--from", "build"])
     if command in BY_KEY:
         return _dispatch(BY_KEY[command], rest)

@@ -7,6 +7,8 @@ from pathlib import Path
 def _is_read_only(argv: list[str]) -> bool:
     return bool(argv and (
         argv[0] in {"-h", "--help", "help", "--version"}
+        or argv in (["dataset", "build", "--help"],
+                    ["dataset", "build", "-h"])
         or (argv[0] == "seeds" and len(argv) > 1
             and argv[1] in {"status", "verify", "list", "catalog", "manifest"})
     ))
