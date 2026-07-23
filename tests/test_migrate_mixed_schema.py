@@ -51,6 +51,8 @@ class MixedSchemaMigrationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "traces.jsonl"
             path.write_text(json.dumps(row) + "\n")
+            path.with_suffix(
+                path.suffix + ".canonical.pending").write_text("stale")
             self.assertEqual(migration.migrate(path), (1, 1))
             migrated = json.loads(path.read_text())
         self.assertNotIn("supersecretvalue", json.dumps(migrated))

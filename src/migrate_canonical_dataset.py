@@ -360,7 +360,7 @@ def _migrate_recognized_stream(path: Path) -> tuple[int, int] | None:
     if not backup.exists():
         shutil.copy2(path, backup)
     pending = path.with_suffix(path.suffix + ".canonical.pending")
-    with path.open() as source, pending.open("x") as destination:
+    with path.open() as source, pending.open("w") as destination:
         for line in source:
             if not line.strip():
                 continue
