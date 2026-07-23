@@ -155,15 +155,14 @@ def _normalized_source(source: Path, description) -> Path:
 def _read_rows(source: Path, schema=None):
     _, paj, _ = _arrow()
     discovered, description, task_counts = _discover_schema(source)
-    if schema is not None and not discovered.equals(schema):
-        raise ValueError("canonical row schema changed across Parquet shards")
-    schema = schema or discovered
+    schema_changed = schema is not None and not discovered.equals(schema)
+    schema = discovered if schema_changed else (schema or discovered)
     normalized = _normalized_source(source, description)
     read = paj.ReadOptions(block_size=64 * 1024 * 1024)
     parse = paj.ParseOptions(explicit_schema=schema,
                              unexpected_field_behavior="error")
     reader = paj.open_json(normalized, read_options=read, parse_options=parse)
-    return reader.schema, reader, normalized, task_counts
+    return reader.schema, reader, normalized, task_counts, schema_changed
 
 
 def _write_shard(root: Path, sequence: int, rows: list[dict], schema) -> dict:
@@ -210,7 +209,7 @@ def sync(source: Path, root: Path, *, changed_tasks: set[str],
     active = list((existing or {}).get("shards") or [])
     task_to_shard = {task: shard for shard in active for task in shard["tasks"]}
     stored_schema = ((existing or {}).get("arrow_schema") or None)
-    schema, batches, normalized, canonical_task_counts = _read_rows(
+    schema, batches, normalized, canonical_task_counts, schema_changed = _read_rows(
         source, _schema_from_text(stored_schema) if stored_schema else None)
     active_task_counts: dict[str, int] = {}
     for shard in active:
@@ -225,10 +224,18 @@ def sync(source: Path, root: Path, *, changed_tasks: set[str],
     impacted_paths = {task_to_shard[task]["path"] for task in changed_tasks
                       if task in task_to_shard}
     rebuild_tasks = set(changed_tasks)
+    if schema_changed:
+        missing_from_canonical = set(active_task_counts) - set(canonical_task_counts)
+        if missing_from_canonical:
+            raise ValueError(
+                "schema migration would remove active trajectories: "
+                f"{sorted(missing_from_canonical)}")
+        impacted_paths = {shard["path"] for shard in active}
+        rebuild_tasks = set(canonical_task_counts)
     for shard in active:
         if shard["path"] in impacted_paths:
             rebuild_tasks.update(shard["tasks"])
-    if stored_schema and _schema_text(schema) != stored_schema:
+    if stored_schema and not schema_changed and _schema_text(schema) != stored_schema:
         raise ValueError("canonical row schema changed across Parquet shards")
     selected = []
     all_tasks = set()

@@ -131,6 +131,30 @@ class ParquetPublication(unittest.TestCase):
                        for path in manifest["active_shards"]]
             self.assertTrue(all(schema.equals(schemas[0]) for schema in schemas))
 
+    def test_schema_evolution_rebuilds_every_active_shard_once(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = pathlib.Path(name); source = root / "traces.jsonl"
+            original = [row("task-a"), row("task-b")]
+            for item in original:
+                item.pop("reasoning_effort")
+            self.write_rows(source, original)
+            first = parquet.sync(
+                source, root, changed_tasks={"task-a", "task-b"})
+
+            evolved = [dict(item, reasoning_effort="xhigh")
+                       for item in original]
+            self.write_rows(source, evolved)
+            second = parquet.sync(
+                source, root, changed_tasks={"task-a"})
+
+            self.assertTrue(
+                set(first["active_shards"]).isdisjoint(second["active_shards"]))
+            rebuilt = parquet.read_active_rows(root)
+            self.assertEqual({item["task"] for item in rebuilt},
+                             {"task-a", "task-b"})
+            self.assertTrue(all(item["reasoning_effort"] == "xhigh"
+                                for item in rebuilt))
+
     def test_late_nested_message_fields_are_preserved_losslessly(self):
         with tempfile.TemporaryDirectory() as name:
             root = pathlib.Path(name); source = root / "traces.jsonl"
