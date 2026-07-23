@@ -45,16 +45,8 @@ def _sha256(text: str) -> str:
 
 def with_action_boundary(prompt: str, seed: dict,
                          feedback: str | None = None) -> str:
-    """Compose the user turn: reminders, the boundary sentinel, then the task."""
-    parts = []
-    if (seed.get("research") or {}).get("required"):
-        parts.append(RESEARCH_REMINDER)
-    parts.append(TRACE_ACTION_BOUNDARY)
-    parts.append(prompt.strip())
-    if feedback:
-        parts.append("\nPRIOR ATTEMPT FEEDBACK (address before finishing):\n"
-                     + feedback.strip())
-    return "\n\n".join(parts)
+    """Return exactly the authored seed prompt for the native harness trace."""
+    return prompt.strip()
 
 
 def _interaction_turns(seed: dict) -> list[str] | None:

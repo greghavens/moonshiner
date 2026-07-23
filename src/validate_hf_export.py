@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 
 from common import ROOT, _staged_secret_values, provider_key_env_names
-from canonical_dataset import MESSAGE_KEY_ORDER
+from canonical_dataset import INTERNAL_CONTENT_MARKERS, MESSAGE_KEY_ORDER
 from privacy import findings
 from expand_next_steps import DERIVATION
 from export_hf_next_steps import DEFAULT_OUTPUT, PUBLISH_KEY_ORDER
@@ -66,6 +66,9 @@ def validate(path: Path, *, trusted_prefix_rows: int = 0) -> int:
             raise ValueError(f"line {number}: messages must be non-empty")
         if any(list(message) != MESSAGE_KEY_ORDER for message in messages):
             raise ValueError(f"line {number}: non-canonical message fields")
+        if any(marker in message["content"]
+               for message in messages for marker in INTERNAL_CONTENT_MARKERS):
+            raise ValueError(f"line {number}: Moonshiner control text in content")
         if messages[-1].get("role") != "assistant":
             raise ValueError(f"line {number}: target is not final assistant")
         if row.get("target_message_index") != len(messages) - 1:

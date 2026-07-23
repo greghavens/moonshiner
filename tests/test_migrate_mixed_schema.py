@@ -7,12 +7,42 @@ _ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "src"))
 
 import migrate_canonical_dataset as migration  # noqa: E402
+from canonical_dataset import normalize_messages  # noqa: E402
+from generate_traces import with_action_boundary  # noqa: E402
 
 _generation = migration._generation
 _legacy_enriched = migration._legacy_enriched
 
 
 class MixedSchemaMigrationTest(unittest.TestCase):
+    def test_future_trace_prompt_is_exactly_the_authored_seed_prompt(self):
+        prompt = "Use the available tools to complete this task."
+        self.assertEqual(
+            with_action_boundary(
+                prompt,
+                {"research": {"required": True}},
+                feedback="The prior attempt failed."),
+            prompt)
+
+    def test_historical_control_wrapper_marks_entire_trajectory_for_removal(self):
+        prompt = "Use the available tools to complete this task."
+        wrapped = (
+            "TRACE EXECUTION INTEGRITY REMINDER: This task requires consulting "
+            "official documentation. Use WebSearch and WebFetch to read the "
+            "official source before the first source-code mutation, and keep "
+            "every action inside the provided task workspace.\n\n"
+            "=== MOONSHINER TASK BOUNDARY ===\n\n"
+            f"{prompt}\n\n"
+            "PRIOR ATTEMPT FEEDBACK (address before finishing):\nfailed")
+        row = {"messages": [
+            {"role": "user", "content": wrapped},
+            {"role": "assistant", "content": "Done",
+             "reasoning": "Native reasoning"},
+        ]}
+        self.assertTrue(migration._contains_internal_control(row))
+        messages = normalize_messages(row["messages"])
+        self.assertEqual(messages[0]["content"], wrapped)
+
     def test_prior_canonical_revision_is_normalized_as_current(self):
         row = {
             "task": "example",

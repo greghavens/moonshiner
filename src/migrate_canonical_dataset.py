@@ -11,7 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from common import CONFIG, DATA
-from canonical_dataset import PUBLISH_KEY_ORDER, normalize_public_row
+from canonical_dataset import (INTERNAL_CONTENT_MARKERS, PUBLISH_KEY_ORDER,
+                               normalize_public_row)
 from expand_next_steps import expand_record
 from export_hf_next_steps import build_row, validate_export
 from hf_sync import sha256
@@ -244,6 +245,13 @@ def _source_hash(row: dict) -> str:
     ).hexdigest()
 
 
+def _contains_internal_control(row: dict) -> bool:
+    return any(
+        marker in str(message.get("content") or "")
+        for message in (row.get("messages") or [])
+        for marker in INTERNAL_CONTENT_MARKERS)
+
+
 def _generation(row: dict) -> str | None:
     public_keys = {
         "task", "lang", "category", "split", "assistant_step",
@@ -321,6 +329,7 @@ def _recognized_canonical(rows: list[dict]) -> list[dict] | None:
 def _migrate_recognized_stream(path: Path) -> tuple[int, int] | None:
     """Normalize large published files in two bounded-memory passes."""
     final: dict[tuple[str, str], tuple[int, str, int]] = {}
+    contaminated_tasks: set[str] = set()
     count = 0
     with path.open() as handle:
         for line in handle:
@@ -330,6 +339,8 @@ def _migrate_recognized_stream(path: Path) -> tuple[int, int] | None:
             generation = _generation(row)
             if generation is None:
                 return None
+            if _contains_internal_control(row):
+                contaminated_tasks.add(str(row["task"]))
             count += 1
             if generation in {"public", "enriched"}:
                 identity = str(row["task"])
@@ -365,6 +376,8 @@ def _migrate_recognized_stream(path: Path) -> tuple[int, int] | None:
             if not line.strip():
                 continue
             row = json.loads(line)
+            if str(row["task"]) in contaminated_tasks:
+                continue
             generation = _generation(row)
             if generation == "public":
                 normalized = _legacy_public(
@@ -392,6 +405,11 @@ def migrate(path: Path) -> tuple[int, int]:
     rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     if not rows:
         raise ValueError("dataset is empty")
+    contaminated_tasks = {
+        str(row["task"]) for row in rows if _contains_internal_control(row)}
+    rows = [row for row in rows if str(row["task"]) not in contaminated_tasks]
+    if not rows:
+        raise ValueError("dataset contains no uncontaminated trajectories")
     if any("source_trajectory_id" in row or "assistant_step" in row for row in rows):
         raise ValueError("dataset mixes canonical and non-canonical rows")
 

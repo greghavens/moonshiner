@@ -15,6 +15,16 @@ PUBLISH_KEY_ORDER = [
 MESSAGE_KEY_ORDER = [
     "role", "content", "reasoning_content", "tool_calls", "tool_call_id", "name"]
 
+TRACE_ACTION_BOUNDARY = "=== MOONSHINER TASK BOUNDARY ==="
+RESEARCH_REMINDER = (
+    "TRACE EXECUTION INTEGRITY REMINDER: This task requires consulting official "
+    "documentation. Use WebSearch and WebFetch to read the official source before "
+    "the first source-code mutation, and keep every action inside the provided "
+    "task workspace.")
+FEEDBACK_MARKER = "PRIOR ATTEMPT FEEDBACK (address before finishing):"
+INTERNAL_CONTENT_MARKERS = (
+    TRACE_ACTION_BOUNDARY, RESEARCH_REMINDER, FEEDBACK_MARKER)
+
 
 @lru_cache(maxsize=1)
 def catalog_categories() -> dict[str, str]:

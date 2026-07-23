@@ -5,6 +5,7 @@ import sys
 import unittest
 import json
 import tempfile
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -38,6 +39,50 @@ class HarnessContract(unittest.TestCase):
         self.assertIn("teacher.run_trace(", source)
         self.assertNotIn("behavior_trace", source)
         self.assertNotIn("openrouter", source.casefold())
+
+    def test_trace_task_passes_authored_prompt_to_harness_byte_for_byte(self):
+        teacher = mock.Mock()
+        teacher.name = "native-harness"
+        teacher.role = {"model": "model", "reasoning": "xhigh"}
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            seed_dir = root / "seed"
+            seed_dir.mkdir()
+            (seed_dir / "task.json").write_text("{}\n")
+            seed = {
+                "id": "seed",
+                "prompt": "Research this exact task, then complete it.",
+                "research": {"required": True},
+                "_dir": seed_dir,
+            }
+            workspace = root / "workspace"
+            workspace.mkdir()
+            raw = root / "native.jsonl"
+            raw.write_text("{}\n")
+            teacher.run_trace.return_value = SimpleNamespace(
+                unavailable=None, safeguard_refusal=False, return_code=0,
+                timed_out=False, stream_success=True, error=None,
+                raw_path=raw, trace_format="native-v1", duration_s=1,
+                observed_model="model", observed_models=["model"],
+                model_attested=True, model_fallback=False, usage={},
+                provenance={})
+            with mock.patch.object(generate_traces, "materialize",
+                                   return_value=workspace), \
+                 mock.patch.object(generate_traces, "run_setup",
+                                   return_value=(True, "")), \
+                 mock.patch.object(generate_traces, "protected_hashes",
+                                   return_value={}), \
+                 mock.patch.object(generate_traces, "clear_runtime_caches"), \
+                 mock.patch.object(generate_traces, "run_verify",
+                                   return_value=(True, "")), \
+                 mock.patch.object(generate_traces, "git_diff",
+                                   return_value=""):
+                generate_traces.trace_task(
+                    seed, teacher, force=True,
+                    feedback="Judge feedback must not alter the prompt.",
+                    traces_root=root / "traces")
+        self.assertEqual(
+            teacher.run_trace.call_args.kwargs["prompt"], seed["prompt"])
 
     def test_generic_pipeline_has_no_runtime_specific_dispatch(self):
         source = inspect.getsource(trace_pipeline)

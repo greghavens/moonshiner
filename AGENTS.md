@@ -24,6 +24,14 @@ These are explicit project-owner requirements and apply to every change:
    if model identity or input schema introduces a second product path. Never add
    a test that legitimizes an alternate path forbidden by these invariants.
 
+4. **THE AUTHORED SEED PROMPT MUST REACH THE CONFIGURED HARNESS BYTE-FOR-BYTE
+   UNCHANGED.** Moonshiner must never prepend, append, wrap, annotate, rewrite,
+   enrich, or otherwise modify an ordinary trace prompt. No boundary sentinel,
+   research reminder, judge feedback, retry text, metadata, or Moonshiner
+   control text may enter the harness prompt or any published message content.
+   Tests must assert the actual argument passed by `trace_task` to
+   `teacher.run_trace`, not merely test a prompt helper in isolation.
+
 - Implement only behavior and features the user explicitly requests.
 - Never add an approval gate, eligibility gate, fingerprint gate, intake gate,
   holdout, rejection path, spending ceiling, call ceiling, or workflow policy
