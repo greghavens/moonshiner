@@ -15,7 +15,8 @@ _ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "src"))
 
 from runtimes.credential_proxy import DUMMY_TOKEN  # noqa: E402
-from runtimes.pi import PiRuntime, compact_events_file, run_streamed  # noqa: E402
+from runtimes.pi import (PiRuntime, _parse_pi_stream, compact_events_file,
+                         run_streamed)  # noqa: E402
 
 
 def _provider_entry(runtime_config: dict) -> dict:
@@ -79,6 +80,24 @@ class ModelsJson(unittest.TestCase):
         self.assertIn("--continue", follow_up)
         self.assertEqual(first[first.index("--session-dir") + 1],
                          follow_up[follow_up.index("--session-dir") + 1])
+
+
+class NativeToolArguments(unittest.TestCase):
+    def test_openai_completions_arguments_are_preserved(self):
+        event = {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "toolCall", "id": "read_0",
+                             "name": "read",
+                             "arguments": {"path": "PROJECTS.md"}}],
+            },
+        }
+        messages, stats = _parse_pi_stream(json.dumps(event), None)
+        call = messages[0]["tool_calls"][0]
+        self.assertEqual(json.loads(call["function"]["arguments"]),
+                         {"path": "PROJECTS.md"})
+        self.assertEqual(stats["tool_calls"], 1)
 
 
 class CompactEventsFile(unittest.TestCase):

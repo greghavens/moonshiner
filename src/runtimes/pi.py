@@ -534,13 +534,16 @@ def _parse_pi_stream(text: str, workspace: str | None) -> tuple[list[dict], dict
                             assistant.get("reasoning_content", "") + reasoning)
                         stats["reasoning_blocks"] += 1
                 elif btype == "toolCall":
+                    arguments = block.get("arguments")
+                    if arguments is None:
+                        arguments = block.get("input")
                     assistant.setdefault("tool_calls", []).append({
                         "id": block.get("id") or f"call_{stats['tool_calls']}",
                         "type": "function",
                         "function": {
                             "name": block.get("name") or "bash",
                             "arguments": scrub_text(
-                                json.dumps(block.get("input") or {}), workspace),
+                                json.dumps(arguments or {}), workspace),
                         },
                     })
                     stats["tool_calls"] += 1
