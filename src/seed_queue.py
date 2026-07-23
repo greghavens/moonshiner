@@ -2,15 +2,18 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import subprocess
 import sys
 import shutil
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from common import CONFIG, load_seeds, synthetic_tool_contract
+from common import CONFIG, STORAGE_ROOT, load_seeds, synthetic_tool_contract
 from configuration import PROJECT_ROOT
 from seed_inventory import authored_ids, documented_plan_items, retired_seed_ids
+
+CLAIMS = STORAGE_ROOT / "locks" / "seed-authoring"
 
 
 def _moonshiner() -> str:
@@ -18,6 +21,22 @@ def _moonshiner() -> str:
     if not executable:
         raise FileNotFoundError("the installed moonshiner executable was not found")
     return executable
+
+
+def author_one(seed_id: str, plans: dict[str, str]) -> tuple[str, int]:
+    """Run one seed exactly once, even with competing queue coordinators."""
+    CLAIMS.mkdir(parents=True, exist_ok=True)
+    with (CLAIMS / f"{seed_id}.lock").open("a+") as claim:
+        fcntl.flock(claim, fcntl.LOCK_EX)
+        if seed_id in authored_ids():
+            return seed_id, 0
+        existing = next((seed for seed in load_seeds(only={seed_id})
+                         if synthetic_tool_contract(seed)), None)
+        command = [_moonshiner(), "seed", "run", "--id", seed_id,
+                   "--brief", plans[seed_id], "--yes"]
+        if existing:
+            command.append("--replace-synthetic")
+        return seed_id, subprocess.run(command, cwd=PROJECT_ROOT).returncode
 
 
 def main(argv=None) -> int:
@@ -39,20 +58,9 @@ def main(argv=None) -> int:
         return 0
     if not args.yes:
         parser.error("metered seed authoring requires --yes")
-    def author(seed_id: str) -> tuple[str, int]:
-        if seed_id in authored_ids():
-            return seed_id, 0
-        existing = next((seed for seed in load_seeds(only={seed_id})
-                         if synthetic_tool_contract(seed)), None)
-        command = [_moonshiner(), "seed", "run", "--id", seed_id,
-                   "--brief", plans[seed_id], "--yes"]
-        if existing:
-            command.append("--replace-synthetic")
-        return seed_id, subprocess.run(command, cwd=PROJECT_ROOT).returncode
-
     failed = 0
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="seed-worker") as pool:
-        futures = {pool.submit(author, seed_id) for seed_id in missing}
+        futures = {pool.submit(author_one, seed_id, plans) for seed_id in missing}
         for future in as_completed(futures):
             seed_id, code = future.result()
             failed += bool(code)

@@ -84,6 +84,48 @@ class FrontDoor(unittest.TestCase):
         self.assertEqual(runtime["thinking_format"], "zai")
         self.assertFalse(any("URL" in prompt for prompt in prompts))
 
+    def test_reconfigure_infers_model_metadata_without_advanced_prompts(self):
+        config = json.loads((_ROOT / "config.json").read_text())
+        updates = {}
+        prompts = []
+
+        def answer(prompt, default):
+            prompts.append(prompt)
+            values = {
+                "Trace author harness": "pi",
+                "Pi API provider (openrouter, openai, anthropic, zai, or custom)": "zai",
+                "Z.AI key type (standard or coding-plan)": "coding-plan",
+                "Trace author model ID": "glm-5.2",
+                "Trace judge harness": "codex",
+                "Trace judge model ID": "gpt-5.6-sol",
+                "Project workflow (trace-only or author-and-trace)": "trace-only",
+                "Hugging Face dataset to resume and append to (owner/name)": "owner/glm-traces",
+            }
+            return values.get(prompt, default)
+
+        with tempfile.TemporaryDirectory() as directory:
+            key_path = pathlib.Path(directory) / "key"
+            key_path.write_text("already-configured")
+            with mock.patch.object(configuration, "load_config", return_value=config), \
+                 mock.patch.object(configuration, "update_local",
+                                   side_effect=lambda key, value: updates.__setitem__(key, value)), \
+                 mock.patch.object(m, "_ask", side_effect=answer), \
+                 mock.patch.object(m.shutil, "which", return_value="/usr/bin/pi"), \
+                 mock.patch("common.key_env_name", return_value="ZAI_API_KEY"), \
+                 mock.patch("common.key_persist_path", return_value=key_path), \
+                 mock.patch("hf_sync.dataset_has_file", return_value=False), \
+                 mock.patch.object(m, "_yes", return_value=True), \
+                 mock.patch("import_existing.main", return_value=0):
+                self.assertEqual(m._setup(["--reconfigure"]), 0)
+
+        self.assertNotIn("Model display name", prompts)
+        self.assertFalse(any("Attestation" in prompt for prompt in prompts))
+        self.assertNotIn("Banner asset path", prompts)
+        self.assertEqual(updates["model_profile"]["display_name"], "GLM 5.2")
+        self.assertEqual(updates["model_profile"]["attestation_aliases"], [])
+        self.assertEqual(updates["model_profile"]["banner_source"],
+                         "assets/glm-5.2-dataset-banner.png")
+
     def test_dataset_build_help_never_executes_build(self):
         with mock.patch.object(m, "_run") as run, \
              mock.patch("builtins.print") as output:

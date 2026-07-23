@@ -242,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             fcntl.flock(coordinator_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            coordinator_lock.close()
             print("a trace coordinator is already running for this project", file=sys.stderr)
             return 2
     db = connect()

@@ -458,16 +458,12 @@ def _setup(argv: list[str] | None = None) -> int:
     update_local("publish.private", False)
     teacher_model = choices[0][2]
     from model_profile import build as build_model_profile
-    aliases = []
-    display_override = None
-    banner_source = None
-    if args.reconfigure:
-        display_override = _ask("Model display name", "") or None
-        aliases = [value.strip() for value in
-                   _ask("Attestation aliases (comma-separated, blank for none)", "").split(",")]
-        banner_source = _ask("Banner asset path", "assets/moonshiner-dataset-banner.png")
-    profile = build_model_profile(teacher_model, display=display_override,
-                                  aliases=aliases, banner_source=banner_source)
+    model_slug = re.sub(r"[^a-z0-9._-]+", "-",
+                        teacher_model.rsplit("/", 1)[-1].lower()).strip("-.")
+    model_banner = f"assets/{model_slug}-dataset-banner.png"
+    banner_source = (model_banner if (Path(__file__).parent / model_banner).is_file()
+                     else "assets/moonshiner-dataset-banner.png")
+    profile = build_model_profile(teacher_model, banner_source=banner_source)
     update_local("model_profile", profile)
     display = profile["display_name"]
     update_local("publish.model_display", display)

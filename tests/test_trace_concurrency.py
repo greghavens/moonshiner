@@ -7,6 +7,7 @@ import tempfile
 import threading
 import unittest
 import sqlite3
+import fcntl
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -21,6 +22,19 @@ import trace_pipeline  # noqa: E402
 
 
 class TraceConcurrency(unittest.TestCase):
+    def test_second_project_coordinator_exits_before_selecting_or_tracing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runs = pathlib.Path(directory)
+            lock = (runs / "trace-coordinator.lock").open("a+")
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with mock.patch("common.RUNS", runs), \
+                 mock.patch.object(trace_pipeline, "_selected") as selected, \
+                 mock.patch.object(trace_pipeline, "get_teacher") as teacher:
+                self.assertEqual(trace_pipeline.main(["--all", "--dry-run"]), 2)
+            selected.assert_not_called()
+            teacher.assert_not_called()
+            lock.close()
+
     def test_generic_fresh_queue_entry_requires_new_acceptance(self):
         db = connect(self.path)
         start_attempt(db, self.run_id, "seed-00", 1,
