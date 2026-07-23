@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 from common import DATA
+from trace_provenance import value as provenance
 
 FULL = DATA / "full"
 OUT = DATA / "hf" / "traces.jsonl"
@@ -31,8 +32,6 @@ def build_row(record: dict, split: str) -> dict:
     ``messages`` stays native JSON; ``tools`` is serialized to a JSON string.
     """
     meta = record["meta"]
-    def provenance(key: str, default=None):
-        return meta.get(key, record.get(key, default))
     return {
         "task": meta["task"],
         "lang": meta.get("lang"),
@@ -40,13 +39,13 @@ def build_row(record: dict, split: str) -> dict:
         "domain": meta.get("domain", "coding"),
         "verifier": meta.get("verifier", "acceptance-tests+protected-file-hash"),
         "split": split,
-        "teacher_runtime": provenance("teacher_runtime"),
-        "teacher_model": provenance("teacher_model"),
-        "reasoning_effort": provenance("reasoning_effort"),
-        "provider": provenance("provider"),
-        "observed_models": provenance("observed_models", []),
-        "model_attested": bool(provenance("model_attested", False)),
-        "trace_format": provenance("trace_format"),
+        "teacher_runtime": provenance(record, "teacher_runtime"),
+        "teacher_model": provenance(record, "teacher_model"),
+        "reasoning_effort": provenance(record, "reasoning_effort"),
+        "provider": provenance(record, "provider"),
+        "observed_models": provenance(record, "observed_models", []),
+        "model_attested": bool(provenance(record, "model_attested", False)),
+        "trace_format": provenance(record, "trace_format"),
         "tools_used": meta.get("tools_used", []),
         "n_messages": len(record["messages"]),
         "messages": record["messages"],

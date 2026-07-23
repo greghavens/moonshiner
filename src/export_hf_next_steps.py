@@ -20,6 +20,7 @@ from pathlib import Path
 from common import DATA, RUNS
 from expand_next_steps import DERIVATION
 from hf_sync import ensure_local_dataset
+from trace_provenance import value as provenance
 
 DEFAULT_INPUT = DATA / "next_step"
 DEFAULT_SOURCE = DATA / "full"
@@ -74,13 +75,13 @@ def build_row(record: dict, split: str) -> dict:
         "domain": meta.get("domain", "coding"),
         "verifier": meta.get("verifier", "acceptance-tests+quality-review"),
         "split": split,
-        "teacher_runtime": meta.get("teacher_runtime"),
-        "teacher_model": meta.get("teacher_model"),
-        "reasoning_effort": meta.get("reasoning_effort"),
-        "provider": meta.get("provider"),
-        "observed_models": meta.get("observed_models", []),
-        "model_attested": bool(meta.get("model_attested")),
-        "trace_format": meta.get("trace_format"),
+        "teacher_runtime": provenance(record, "teacher_runtime"),
+        "teacher_model": provenance(record, "teacher_model"),
+        "reasoning_effort": provenance(record, "reasoning_effort"),
+        "provider": provenance(record, "provider"),
+        "observed_models": provenance(record, "observed_models", []),
+        "model_attested": bool(provenance(record, "model_attested", False)),
+        "trace_format": provenance(record, "trace_format"),
         "tools_used": meta.get("tools_used", []),
         "derivation": meta["derivation"],
         "assistant_step": meta["assistant_step"],
