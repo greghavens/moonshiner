@@ -16,7 +16,13 @@ from canonical_dataset import (INTERNAL_CONTENT_MARKERS, PUBLISH_KEY_ORDER,
 from expand_next_steps import expand_record
 from export_hf_next_steps import build_row, validate_export
 from hf_sync import sha256
-from privacy import sanitize_object
+from privacy import redact, sanitize_object
+
+
+def _privacy_scrub_row(row: dict) -> dict:
+    scrubbed = sanitize_object(row)
+    serialized = json.dumps(scrubbed, ensure_ascii=False)
+    return json.loads(redact(serialized)[0])
 
 
 def _advance_baseline(path: Path, validation: dict) -> None:
@@ -373,7 +379,7 @@ def _migrate_recognized_stream(path: Path) -> tuple[int, int] | None:
             else:
                 normalized = _current_canonical(
                     row, current_hashes[str(row["source_trajectory_id"])])
-            normalized = sanitize_object(normalized)
+            normalized = _privacy_scrub_row(normalized)
             destination.write(json.dumps(normalized, ensure_ascii=False) + "\n")
         destination.flush()
         os.fsync(destination.fileno())

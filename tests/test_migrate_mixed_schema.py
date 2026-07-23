@@ -57,6 +57,11 @@ class MixedSchemaMigrationTest(unittest.TestCase):
         self.assertIn("[REDACTED_SECRET]", json.dumps(migrated))
         self.assertEqual(findings(json.dumps(migrated)), [])
 
+    def test_final_serialized_row_is_scrubbed_at_validator_boundary(self):
+        row = {"messages": [{"content": "person@example.com"}]}
+        scrubbed = migration._privacy_scrub_row(row)
+        self.assertEqual(findings(json.dumps(scrubbed)), [])
+
     def test_future_trace_prompt_is_exactly_the_authored_seed_prompt(self):
         prompt = "\nUse the available tools to complete this task.\n"
         self.assertEqual(
