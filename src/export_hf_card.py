@@ -31,7 +31,6 @@ from pathlib import Path
 from statistics import median
 
 from common import CONFIG, DATA, ROOT
-from runtimes.pi import OFFERED_TOOLS
 
 PUBLISH_DIR = DATA / "hf-publish"
 TRACES = PUBLISH_DIR / "traces.jsonl"
@@ -86,8 +85,6 @@ COLUMN_DOCS: tuple[tuple[str, str, str], ...] = (
     ("n_messages", "int", "Message count in this cumulative-prefix row."),
     ("messages", "list[object]",
      "The conversation (system/user/assistant/tool) in OpenAI chat format."),
-    ("tools", "string",
-     "JSON-encoded tool schemas — the full offered action space for the row."),
 )
 
 # The interim shape published while generation runs: one row per verified,
@@ -230,20 +227,6 @@ def _trajectories(rows: list[dict]) -> dict[str, dict]:
     return view
 
 
-def _offered_tools(rows: list[dict]) -> list[str]:
-    for row in rows:
-        try:
-            schemas = json.loads(row.get("tools") or "[]")
-        except json.JSONDecodeError:
-            continue
-        names = [s.get("function", {}).get("name") for s in schemas
-                 if isinstance(s, dict)]
-        names = [n for n in names if n]
-        if names:
-            return names
-    return list(OFFERED_TOOLS)
-
-
 def _mix_table(counter: Counter, total: int, head: str) -> str:
     lines = [f"| {head} | Trajectories | Share |", "| --- | ---: | ---: |"]
     for key, count in counter.most_common():
@@ -371,7 +354,6 @@ def build_card(rows: list[dict], *, stage: str = "release",
                    if entry["steps"]]
     used_tools = sorted({tool for entry in trajectories.values()
                          for tool in entry["tools_used"]})
-    offered_tools = _offered_tools(rows)
     attested = sum(1 for row in rows if row.get("model_attested"))
     attest_pct = _pct(attested, len(rows))
     has_security = domains.get("security", 0) > 0
@@ -478,15 +460,6 @@ def build_card(rows: list[dict], *, stage: str = "release",
         f"- **Independent judge.** A separate reviewer (`{judge_model}`) "
         "screens each\n  trajectory for quality; the teacher does not grade "
         "itself.")
-
-    tools_bullet = (
-        "- **One tool surface for every task.** Each trajectory ran with the "
-        "same offered\n  action space (listed below); the release export "
-        "carries the full JSON tool\n  schemas per row."
-        if preview else
-        "- **Full offered tool surface.** Every row's `tools` lists the "
-        "complete action\n  space the teacher had, not only the tools a given "
-        "trajectory happened to call.")
 
     schema_docs = PREVIEW_COLUMN_DOCS if preview else COLUMN_DOCS
     schema_rows = "\n".join(
@@ -670,10 +643,8 @@ Each row:
 | `target_message_index` | int | index of the final assistant target |
 | `n_messages` | int | cumulative message count through the target |
 | `messages` | list of objects | cumulative context ending at the target |
-| `tools` | string (JSON) | tool schemas available in the session |
 
-`messages` is native JSON. `tools` is JSON-encoded because parameter schemas
-are heterogeneous.
+`messages` is native JSON.
 
 ## Layout
 

@@ -1,5 +1,4 @@
 """Map a trace's ``trace_format`` to the adapter that can normalize it.
-
 Screening and dataset building both need to turn a raw trace into OpenAI-style
 messages without knowing which runtime produced it. The producing runtime is
 recorded as ``trace_format`` in each trace's meta; this module routes to the
@@ -33,7 +32,3 @@ def parser_for(trace_format: str):
 def parse_trace(path: Path, trace_format: str,
                 workspace: str | None) -> tuple[list[dict], dict]:
     return parser_for(trace_format).parse_stream(Path(path), workspace)
-
-
-def tool_schemas_for(trace_format: str, messages: list[dict]) -> list[dict]:
-    return parser_for(trace_format).tool_schemas(messages)

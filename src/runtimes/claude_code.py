@@ -17,21 +17,12 @@ import subprocess
 import time
 from pathlib import Path
 
-from common import PAID_RUN_UNLOCK, schemas_for, scrub_text, stub
+from common import PAID_RUN_UNLOCK, scrub_text
 from runtimes import availability
 from runtimes.base import ReviewResult, Runtime, TraceResult
 
 REFUSAL_MARKERS = ("model_refusal_no_fallback", "model_refusal")
 READ_ONLY_DISALLOW = "Edit Write NotebookEdit Bash MultiEdit"
-
-# The full default tool surface a headless ``claude -p`` teacher is offered. The
-# teacher path runs with ``--dangerously-skip-permissions`` and no
-# ``--allowedTools`` restriction, so the model sees the complete default set.
-# Declared so every exported row lists the whole action space the teacher had,
-# not just the tools a given trace happened to call.
-OFFERED_TOOLS = ("Task", "Bash", "Glob", "Grep", "Read", "Edit", "Write",
-                 "NotebookEdit", "WebFetch", "WebSearch", "TodoWrite")
-
 
 def _scrub_env() -> dict:
     """Drop CLAUDE* variables so the CLI uses its own configured auth."""
@@ -302,21 +293,6 @@ class ClaudeCodeRuntime(Runtime):
                         messages.append({"role": "user",
                                          "content": scrub_text(block, workspace)})
         return messages, stats
-
-    @staticmethod
-    def tool_schemas(messages: list[dict]) -> list[dict]:
-        # Start from the full offered surface, then fold in any other tool
-        # actually observed in the stream, so the row always carries the
-        # complete tool list — not only what this trace happened to call.
-        names: list[str] = list(OFFERED_TOOLS)
-        for message in messages:
-            for call in message.get("tool_calls") or []:
-                name = call.get("function", {}).get("name")
-                if name and name not in names:
-                    names.append(name)
-        # Claude's built-in tool schemas are not modeled in detail; stub by name.
-        return [stub(name) for name in names]
-
 
 def _parse_json(text: str) -> dict | None:
     """Extract the judge's JSON verdict from its final text.

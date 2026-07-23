@@ -16,7 +16,7 @@ _legacy_enriched = migration._legacy_enriched
 
 class MixedSchemaMigrationTest(unittest.TestCase):
     def test_future_trace_prompt_is_exactly_the_authored_seed_prompt(self):
-        prompt = "Use the available tools to complete this task."
+        prompt = "\nUse the available tools to complete this task.\n"
         self.assertEqual(
             with_action_boundary(
                 prompt,

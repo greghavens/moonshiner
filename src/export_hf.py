@@ -24,7 +24,7 @@ SPLITS = ("train", "val")
 KEY_ORDER = ["task", "lang", "category", "domain", "verifier", "split",
              "teacher_runtime", "teacher_model", "reasoning_effort", "provider",
              "observed_models", "model_attested", "trace_format", "tools_used",
-             "n_messages", "messages", "tools"]
+             "n_messages", "messages"]
 
 
 def build_row(record: dict, split: str) -> dict:
@@ -50,7 +50,6 @@ def build_row(record: dict, split: str) -> dict:
         "tools_used": meta.get("tools_used", []),
         "n_messages": len(record["messages"]),
         "messages": normalize_messages(record["messages"]),
-        "tools": json.dumps(record.get("tools", [])),
     }
 
 
@@ -79,7 +78,6 @@ def main() -> None:
             if list(row.keys()) != KEY_ORDER:
                 raise AssertionError(
                     f"line {number}: key order {list(row.keys())} != {KEY_ORDER}")
-            json.loads(row["tools"])
             seen[row["split"]] += 1
     if seen != counts:
         raise AssertionError(f"re-read counts {seen} != written {counts}")

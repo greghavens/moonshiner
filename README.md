@@ -170,6 +170,11 @@ all trace attempts:
 moonshiner config set pipeline.trace.step_down_reasoning_on_failure false
 ```
 
+For catalogued coding programs, Moonshiner appends its coding guidance to Pi's
+native system prompt by default. It does not replace Pi's native prompt, disable
+Pi skills or project context, restrict Pi's native tools, or alter authored seed
+turns.
+
 Set Hugging Face publication batch size:
 
 ```bash

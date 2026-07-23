@@ -20,7 +20,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from common import ROOT, RUNS, fn, schemas_for, scrub_text, stub
+from common import ROOT, RUNS, scrub_text
 from runtimes.auth import load_provider_key
 from runtimes.base import ReviewResult, Runtime, TraceResult
 from runtimes.credential_proxy import DUMMY_TOKEN, ProxySession
@@ -28,31 +28,12 @@ from runtimes.credential_proxy import DUMMY_TOKEN, ProxySession
 RUNTIME_ROOT = RUNS / "pi-runtime"
 DEFAULT_TIMEOUT_SECONDS = 300
 MAX_TIMEOUT_SECONDS = 600
-
-TOOL_REGISTRY = {
-    "read": fn("read", "Read a file from the workspace.",
-               {"path": {"type": "string"}}, ["path"]),
-    "write": fn("write", "Write a file in the workspace.",
-                {"path": {"type": "string"}, "content": {"type": "string"}},
-                ["path", "content"]),
-    "edit": fn("edit", "Edit a file in the workspace.",
-               {"path": {"type": "string"}, "old": {"type": "string"},
-                "new": {"type": "string"}}, ["path", "old", "new"]),
-    "bash": fn("bash", "Run a shell command in the workspace.",
-               {"command": {"type": "string"}}, ["command"]),
-    "grep": fn("grep", "Search file contents in the workspace.",
-               {"pattern": {"type": "string"}}, ["pattern"]),
-    "find": fn("find", "Find files by name in the workspace.",
-               {"pattern": {"type": "string"}}, ["pattern"]),
-    "ls": fn("ls", "List a directory in the workspace.",
-             {"path": {"type": "string"}}, ["path"]),
+CODING_PROGRAMS = {
+    "Building", "Debugging", "Project & integration", "Feature development",
+    "Refactoring & performance", "Security",
 }
-
-# The full Pi coding-agent tool surface. Declared so every exported row lists the
-# complete action space the teacher had, not just the tools a trace happened to
-# call.
-OFFERED_TOOLS = ("read", "write", "edit", "bash", "grep", "find", "ls")
-
+CODING_GUIDANCE = (
+    Path(__file__).parent.parent / "coding-agent-guidance.md").read_text()
 
 def run_streamed(command: list[str], *, workspace: Path, turn: str,
                  stdout_path: Path, stderr_path: Path, timeout: int,
@@ -63,19 +44,6 @@ def run_streamed(command: list[str], *, workspace: Path, turn: str,
         return subprocess.run(command, cwd=workspace, input=turn,
                               stdout=output, stderr=errors, text=True,
                               timeout=timeout, env=environment)
-
-# A tiny extension that fails any bash call still running past the ceiling, so a
-# hung command cannot consume the whole turn budget.
-BASH_TIMEOUT_GUARD = """export default function (pi) {
-  const CEIL = %d * 1000;
-  pi.on("tool_call", (event) => {
-    if (event.toolName === "bash" && !event.input?.timeout) {
-      event.input = { ...(event.input || {}), timeout: %d };
-    }
-  });
-}
-""" % (MAX_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_SECONDS * 1000)
-
 
 def _hidden_mounts() -> list[str]:
     hidden = [str(Path.home())]
@@ -181,7 +149,6 @@ class PiRuntime(Runtime):
             "compaction": {"enabled": False},
             "defaultProjectTrust": "never",
         }, indent=2))
-        (config / "bash-timeout-guard.js").write_text(BASH_TIMEOUT_GUARD)
 
     def _sandbox_cmd(self, inner: list[str], workspace: Path,
                      runtime_dir: Path) -> list[str]:
@@ -206,7 +173,8 @@ class PiRuntime(Runtime):
 
     def _pi_cmd(self, runtime_dir: Path, *, system_prompt: str,
                 tools: list[str] | None, read_only: bool,
-                continue_session: bool = False) -> list[str]:
+                continue_session: bool = False,
+                append_system_prompt: str | None = None) -> list[str]:
         # pi 0.80.7: the agent config dir (models.json/settings.json) is
         # selected via the PI_CODING_AGENT_DIR env var set in _sandbox_cmd —
         # there is no --config-dir flag, and no --output-schema (a judge
@@ -222,16 +190,20 @@ class PiRuntime(Runtime):
                "--model", self.role["model"],
                "--api-key", DUMMY_TOKEN,
                "--thinking", self.role.get("reasoning", "max"),
-               "--system-prompt", system_prompt,
-               "--session-dir", str(runtime_dir / "home" / "session"),
-               "--offline", "--no-skills", "--no-context-files", "--no-approve"]
-        if tools is not None:
-            cmd += ["--tools", ",".join(tools)]
+               "--session-dir", str(runtime_dir / "home" / "session")]
+        if append_system_prompt:
+            cmd += ["--append-system-prompt", append_system_prompt]
         if continue_session:
             cmd += ["--continue"]
-        if not read_only:
-            cmd += ["--extension", str(runtime_dir / "config" / "bash-timeout-guard.js")]
         return cmd
+
+    def _coding_guidance(self, seed: dict) -> str | None:
+        trace = ((self.config.get("pipeline") or {}).get("trace") or {})
+        if not trace.get("coding_system_prompt_append", True):
+            return None
+        programs = set(trace.get("coding_system_prompt_programs")
+                       or CODING_PROGRAMS)
+        return CODING_GUIDANCE if seed.get("_catalog_program") in programs else None
 
     def _child_env(self) -> dict:
         """Strip every real credential; the child only reaches the proxy.
@@ -253,12 +225,14 @@ class PiRuntime(Runtime):
         return self._run(prompt=f"{prompt}", workspace=workspace, out_dir=out_dir,
                          system_prompt=system_prompt, tools=tools,
                          schema=None, read_only=False, artifact_id=seed["id"],
-                         interaction=interaction)
+                         interaction=interaction,
+                         append_system_prompt=self._coding_guidance(seed))
 
     def _run(self, *, prompt: str, workspace: Path, out_dir: Path,
              system_prompt: str, tools: list[str] | None, schema: dict | None,
              read_only: bool, artifact_id: str,
-             interaction: list[str] | None = None) -> TraceResult:
+             interaction: list[str] | None = None,
+             append_system_prompt: str | None = None) -> TraceResult:
         real_key = load_provider_key(self.runtime_config)
         RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
         runtime_dir = Path(tempfile.mkdtemp(prefix="run-", dir=RUNTIME_ROOT))
@@ -281,7 +255,8 @@ class PiRuntime(Runtime):
             for turn_index, turn in enumerate([prompt, *(interaction or [])]):
                 inner = self._pi_cmd(runtime_dir, system_prompt=system_prompt,
                                      tools=tools, read_only=read_only,
-                                     continue_session=turn_index > 0)
+                                     continue_session=turn_index > 0,
+                                     append_system_prompt=append_system_prompt)
                 cmd = self._sandbox_cmd(inner, workspace, runtime_dir)
                 try:
                     proc = run_streamed(
@@ -346,7 +321,8 @@ class PiRuntime(Runtime):
                    schema: dict | None = None,
                    read_only: bool = True) -> ReviewResult:
         workspace = self.require_persistent_workspace(workspace)
-        review_tools = ["read", "grep", "find", "ls"] if read_only else list(OFFERED_TOOLS)
+        review_tools = (["read", "grep", "find", "ls"] if read_only else
+                        ["read", "write", "edit", "bash", "grep", "find", "ls"])
         result = self._run(prompt=instruction, workspace=workspace, out_dir=out_dir,
                            system_prompt=("You are an independent read-only reviewer."
                                           if read_only else
@@ -370,20 +346,6 @@ class PiRuntime(Runtime):
     @staticmethod
     def parse_stream(path: Path, workspace: str | None) -> tuple[list[dict], dict]:
         return _parse_pi_stream(path.read_text(errors="replace"), workspace)
-
-    @staticmethod
-    def tool_schemas(messages: list[dict]) -> list[dict]:
-        # Start from the full offered surface, then fold in any other tool
-        # actually observed in the stream, so the row always carries the
-        # complete tool list — not only what this trace happened to call.
-        names: list[str] = list(OFFERED_TOOLS)
-        for message in messages:
-            for call in message.get("tool_calls") or []:
-                name = call.get("function", {}).get("name")
-                if name and name not in names:
-                    names.append(name)
-        return schemas_for(names, TOOL_REGISTRY)
-
 
 # --------------------------------------------------------------------------- #
 # Pi event helpers                                                            #

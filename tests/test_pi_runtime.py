@@ -30,6 +30,65 @@ def _provider_entry(runtime_config: dict) -> dict:
 
 
 class ModelsJson(unittest.TestCase):
+    def test_trace_command_does_not_modify_native_pi_behavior(self):
+        runtime = PiRuntime(
+            {"workspace": {"confirmed_root": str(_ROOT)},
+             "runtimes": {"pi": {"provider": "openrouter"}}},
+            {"model": "anthropic/claude-fable-5", "reasoning": "max"})
+        runtime.runtime_config = {"provider": "openrouter", "cli": "pi"}
+        with mock.patch.object(runtime, "_cli_path",
+                               return_value=pathlib.Path("/usr/bin/pi")):
+            command = runtime._pi_cmd(
+                pathlib.Path("/runtime"), system_prompt="must not be used",
+                tools=["read"], read_only=False)
+        prohibited = {
+            "--system-prompt", "--tools", "--offline", "--no-skills",
+            "--no-context-files", "--no-approve", "--extension",
+        }
+        self.assertTrue(prohibited.isdisjoint(command))
+
+    def test_coding_guidance_appends_without_replacing_native_prompt(self):
+        runtime = PiRuntime(
+            {"workspace": {"confirmed_root": str(_ROOT)},
+             "runtimes": {"pi": {"provider": "openrouter"}}},
+            {"model": "anthropic/claude-fable-5", "reasoning": "max"})
+        runtime.runtime_config = {"provider": "openrouter", "cli": "pi"}
+        with mock.patch.object(runtime, "_cli_path",
+                               return_value=pathlib.Path("/usr/bin/pi")):
+            command = runtime._pi_cmd(
+                pathlib.Path("/runtime"), system_prompt="ignored",
+                tools=None, read_only=False,
+                append_system_prompt="coding guidance")
+        self.assertNotIn("--system-prompt", command)
+        self.assertEqual(
+            command[command.index("--append-system-prompt") + 1],
+            "coding guidance")
+
+    def test_coding_guidance_selection_uses_catalog_program_data(self):
+        runtime = PiRuntime(
+            {"pipeline": {"trace": {"coding_system_prompt_append": True}}},
+            {"model": "anthropic/claude-fable-5"})
+        self.assertTrue(runtime._coding_guidance(
+            {"_catalog_program": "Building"}))
+        self.assertIsNone(runtime._coding_guidance(
+            {"_catalog_program": "Instruction following"}))
+        runtime.config["pipeline"]["trace"]["coding_system_prompt_append"] = False
+        self.assertIsNone(runtime._coding_guidance(
+            {"_catalog_program": "Building"}))
+
+    def test_runtime_does_not_install_a_tool_execution_extension(self):
+        runtime = PiRuntime(
+            {"runtimes": {"pi": {"provider": "openrouter"}}},
+            {"model": "anthropic/claude-fable-5"})
+        runtime.runtime_config = {
+            "provider": "openrouter", "base_url": "http://127.0.0.1:1",
+            "api": "openai-completions",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            runtime._prepare_runtime(root, "http://127.0.0.1:1")
+            self.assertFalse((root / "config" / "bash-timeout-guard.js").exists())
+
     def test_managed_fallback_is_stable_user_data_not_the_versioned_bundle(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = PiRuntime(

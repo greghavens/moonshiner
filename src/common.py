@@ -2,7 +2,7 @@
 
 Single source of truth for repository paths, configuration, seed loading and
 materialization, verification, protected-file hashing, workspace diffing,
-output scrubbing, and the portable student system prompt. Teacher- and
+output scrubbing, and catalog metadata. Teacher- and
 judge-runtime specifics (Claude Code, Codex, Pi/GLM) live in ``src/runtimes``;
 everything runtime-agnostic lives here so one pipeline can distill any model.
 """
@@ -73,26 +73,6 @@ QUARANTINE_DIR = TRACES / "quarantine"
 # provider key (Z.ai, OpenRouter, …). Guarded launchers refuse to run without
 # this exact value.
 PAID_RUN_UNLOCK = "CREDITS_PURCHASED"
-
-# The portable contract baked into every training row's system turn. Whatever
-# harness eventually serves the distilled student should reuse this verbatim —
-# the train/deploy prompt match is part of why the fine-tune transfers.
-SYSTEM_PROMPT = """You are an autonomous coding agent working in the current directory of a real repository on the user's machine.
-
-Use your tools to read, search, create, and edit files and to run shell commands (tests, builds, type-checkers). Some tools may be deferred (only their names are known until you load their schemas) and some may be unavailable or offline; if a tool call fails, adapt and continue with what is available. Never guess at the contents of a file you have not read, and never claim a fix works without running the verification yourself.
-
-Method:
-1. Reproduce first. Read the relevant code and run the failing command before changing anything.
-2. Form a hypothesis about the root cause; make the smallest edit that tests it.
-3. Verify. Rerun the tests/build after every meaningful change. If it still fails, re-read the output carefully — do not repeat the same edit.
-4. Fix the cause, not the symptom.
-
-Rules:
-- Never modify tests merely to make them pass, unless the user explicitly says the tests are wrong.
-- Keep every read, write, fixture, probe, and shell working directory inside the current repository; do not use /tmp, /var/tmp, $HOME, a sibling repository, or any other external path.
-- Do not install global software or mutate Git state with commit, stash, reset, checkout, or clean.
-- Keep edits minimal and consistent with the existing code style.
-- End with a brief summary: the root cause, what you changed, and proof that it passes."""
 
 # Secret shapes dropped from any exported row. Kept broad on purpose.
 SECRET_RE = re.compile(
@@ -207,46 +187,6 @@ DIFF_EXCLUDE_PATTERNS = (
 
 
 # --------------------------------------------------------------------------- #
-# OpenAI-style tool-schema helpers (used by runtime adapters + build_dataset)  #
-# --------------------------------------------------------------------------- #
-def fn(name: str, description: str, properties: dict | None = None,
-       required: list | None = None) -> dict:
-    """Build one OpenAI-compatible function tool schema."""
-    return {"type": "function", "function": {
-        "name": name,
-        "description": description,
-        "parameters": {
-            "type": "object",
-            "properties": properties or {},
-            "required": required or [],
-            "additionalProperties": False,
-        },
-    }}
-
-
-def stub(name: str,
-         description: str = "Tool observed in a teacher trace; load its schema "
-                            "with ToolSearch before calling it.") -> dict:
-    """Represent a trace tool whose detailed schema is not modeled."""
-    schema = fn(name, description)
-    schema["function"]["parameters"]["additionalProperties"] = True
-    return schema
-
-
-def schemas_for(names, registry: dict, warn: list | None = None) -> list:
-    """Map tool names to schemas from ``registry``, auto-stubbing unknowns."""
-    out = []
-    for name in names:
-        if name in registry:
-            out.append(registry[name])
-        else:
-            if warn is not None:
-                warn.append(name)
-            out.append(stub(name))
-    return out
-
-
-# --------------------------------------------------------------------------- #
 # Quarantine (fail-closed training exclusions)                                 #
 # --------------------------------------------------------------------------- #
 def active_quarantines(directory: Path | None = None) -> list[dict]:
@@ -317,13 +257,21 @@ def load_seeds(only: set[str] | None = None, include_holdout: bool = False) -> l
     try:
         catalog = json.loads(catalog_path.read_text())
         programs = catalog.get("programs") or {}
+        catalog_items = {
+            item["id"]: item
+            for items in (catalog.get("categories") or {}).values()
+            for item in items
+        }
         rank = {item["id"]: (int(programs.get(item.get("program"), {}).get(
                     "priority", 1_000_000)), position)
                 for position, item in enumerate(
                     entry for items in (catalog.get("categories") or {}).values()
                     for entry in items)}
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        rank = {}
+        rank, catalog_items = {}, {}
+    for seed in seeds:
+        seed["_catalog_program"] = (
+            catalog_items.get(seed["id"]) or {}).get("program")
     return sorted(seeds, key=lambda seed: (*rank.get(seed["id"], (1_000_000, 0)),
                                            seed["id"]))
 

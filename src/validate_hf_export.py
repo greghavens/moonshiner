@@ -82,9 +82,6 @@ def validate(path: Path, *, trusted_prefix_rows: int = 0) -> int:
         source_hash = row.get("source_trajectory_sha256")
         if enriched and (not isinstance(source_hash, str) or len(source_hash) != 64):
             raise ValueError(f"line {number}: invalid source trajectory hash")
-        if not isinstance(json.loads(row["tools"]), list):
-            raise ValueError(f"line {number}: tools must encode a list")
-
         serialized = json.dumps(row, ensure_ascii=False)
         if number > trusted_prefix_rows:
             privacy_hits = findings(serialized, exact_secrets=_staged_secret_values(),

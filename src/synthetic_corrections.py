@@ -16,7 +16,7 @@ from common import (CONFIG, RUNS, STORAGE_ROOT, clear_runtime_caches, git_diff,
 from run_state import (connect, create_run, finish_attempt, set_run_status,
                        start_attempt)
 from runtimes import get_judge, get_runtime
-from normalize import parse_trace, tool_schemas_for
+from normalize import parse_trace
 from screen_traces import (apply_candidate_patch, feedback_from_review, screen)
 import publish_queue
 
@@ -276,20 +276,20 @@ CORRECTED TRACE:\n{corrected[-12000:]}
 """)
 
 
-def write_corrected_trace(path: Path, messages: list[dict], tools: list[dict]) -> None:
+def write_corrected_trace(path: Path, messages: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     pending = path.with_suffix(path.suffix + ".pending")
-    pending.write_text(json.dumps({"messages": messages, "tools": tools},
+    pending.write_text(json.dumps({"messages": messages},
                                   ensure_ascii=False) + "\n")
     pending.replace(path)
 
 
-def read_corrected_trace(path: Path) -> tuple[list[dict], list[dict]]:
+def read_corrected_trace(path: Path) -> tuple[list[dict], dict]:
     value = json.loads(path.read_text())
-    messages, tools = value.get("messages"), value.get("tools")
-    if not isinstance(messages, list) or not isinstance(tools, list):
-        raise ValueError("corrected trace must contain messages and tools lists")
-    return messages, tools
+    messages = value.get("messages")
+    if not isinstance(messages, list):
+        raise ValueError("corrected trace must contain a messages list")
+    return messages, {}
 
 
 def validate_tool_pairs(messages: list[dict]) -> tuple[bool, str]:
@@ -306,12 +306,6 @@ def validate_tool_pairs(messages: list[dict]) -> tuple[bool, str]:
     return True, ""
 
 
-def validate_tools_unchanged(source: list[dict], corrected: list[dict]) -> tuple[bool, str]:
-    if json.dumps(source, sort_keys=True) != json.dumps(corrected, sort_keys=True):
-        return False, "offered tool schemas changed"
-    return True, ""
-
-
 def _source_artifact(artifact: Path) -> tuple[dict, Path, Path]:
     meta = json.loads((artifact / "meta.json").read_text())
     raw_name = Path(str(meta.get("raw_path") or "")).name
@@ -322,18 +316,17 @@ def _source_artifact(artifact: Path) -> tuple[dict, Path, Path]:
     return meta, raw, patch
 
 
-def _correction_prompt(seed: dict, source_messages: list[dict], tools: list[dict],
+def _correction_prompt(seed: dict, source_messages: list[dict],
                        feedback: str) -> str:
     return scrub_text(f"""Repair this failed trace with the smallest possible correction.
 The assistant reasoning_content values are immutable: copy each byte-for-byte. Do not refactor,
 rewrite reasoning, or improve unrelated material. You may insert only an obvious missing tool
 call/result, fix a tiny code defect, or add a genuinely missing small file. Thoroughly run the
-task's existing verification. Return ONLY JSON with the key corrected_messages. Moonshiner
-preserves the offered schemas itself. Every tool call needs its matching real result.
+task's existing verification. Return ONLY JSON with the key corrected_messages. Every tool call
+needs its matching real result.
 
 TASK: {seed.get('prompt', '')}
 JUDGE FEEDBACK: {feedback}
-OFFERED TOOLS: {json.dumps(tools, ensure_ascii=False)}
 FAILED MESSAGES: {json.dumps(source_messages, ensure_ascii=False)}
 """)
 
@@ -346,10 +339,8 @@ def create_candidate(seed: dict, runtime, storage_root: Path, feedback: str,
                       paths.traces / "diffs", paths.traces / "reviews"):
         directory.mkdir(parents=True, exist_ok=True)
     source_meta, source_raw, source_patch = _source_artifact(source_artifact)
-    source_messages, parsed = parse_trace(
+    source_messages, _ = parse_trace(
         source_raw, source_meta["trace_format"], workspace=None)
-    tools = (parsed or {}).get("tools") or tool_schemas_for(
-        source_meta["trace_format"], source_messages)
     workspace = materialize(seed, name=f"synthetic-correction-{seed['id']}")
     setup_ok, setup_output = run_setup(seed, workspace)
     protected_before = protected_hashes(seed, workspace)
@@ -360,17 +351,15 @@ def create_candidate(seed: dict, runtime, storage_root: Path, feedback: str,
     out_dir = paths.root / "runtime" / seed["id"]
     out_dir.mkdir(parents=True, exist_ok=True)
     result = runtime.run_review(
-        _correction_prompt(seed, source_messages, tools, feedback), workspace,
+        _correction_prompt(seed, source_messages, feedback), workspace,
         out_dir=out_dir, schema=None, read_only=False)
     verdict = result.verdict or {}
     corrected = verdict.get("corrected_messages")
-    corrected_tools = tools
     if not isinstance(corrected, list):
         return {"passed": False, "reason": "correction runtime returned no corrected trace"}
     delta = correction_delta(source_messages, corrected)
     delta_ok, delta_error = validate_correction_delta(delta)
     pairs_ok, pairs_error = validate_tool_pairs(corrected)
-    tools_ok, tools_error = validate_tools_unchanged(tools, corrected_tools)
     clear_runtime_caches(workspace)
     verified_once, verify_output = run_verify(seed, workspace)
     verified_twice, _ = run_verify(seed, workspace)
@@ -381,10 +370,10 @@ def create_candidate(seed: dict, runtime, storage_root: Path, feedback: str,
     delta_ok, delta_error = validate_correction_delta(delta)
     passed = bool(result.return_code == 0 and not result.timed_out and not result.error
                   and result.model_attested and delta_ok
-                  and pairs_ok and tools_ok and verified_once and verified_twice
+                  and pairs_ok and verified_once and verified_twice
                   and protected_intact)
     raw_path = paths.traces / "raw" / f"{seed['id']}.synthetic-correction.json"
-    write_corrected_trace(raw_path, corrected, corrected_tools)
+    write_corrected_trace(raw_path, corrected)
     patch_path = paths.traces / "diffs" / f"{seed['id']}.patch"
     patch_path.write_text(final_patch)
     raw_text = raw_path.read_text()
@@ -400,7 +389,7 @@ def create_candidate(seed: dict, runtime, storage_root: Path, feedback: str,
                 "delta": delta, "source_trace": source_raw.read_text(errors="replace")[-12000:],
                 "correction_runtime": runtime.name,
                 "correction_model": runtime.role.get("model")},
-            "correction_failure": delta_error or pairs_error or tools_error or None}
+            "correction_failure": delta_error or pairs_error or None}
     meta_path = paths.traces / "meta" / f"{seed['id']}.json"
     meta_path.write_text(json.dumps(meta, indent=2) + "\n")
     return meta

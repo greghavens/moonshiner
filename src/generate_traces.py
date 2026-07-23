@@ -20,7 +20,7 @@ import json
 import sys
 from pathlib import Path
 
-from common import (TRACES, SYSTEM_PROMPT, clear_runtime_caches, git_diff,
+from common import (TRACES, clear_runtime_caches, git_diff,
                     load_seeds, materialize, protected_hashes, quarantined_tasks,
                     run_setup, run_verify, scrub_text, seed_fingerprint)
 from runtimes import get_teacher
@@ -30,15 +30,6 @@ RAW = TRACES / "raw"
 META = TRACES / "meta"
 DIFFS = TRACES / "diffs"
 
-TRACE_ACTION_BOUNDARY = "=== MOONSHINER TASK BOUNDARY ==="
-
-RESEARCH_REMINDER = (
-    "TRACE EXECUTION INTEGRITY REMINDER: This task requires consulting official "
-    "documentation. Use WebSearch and WebFetch to read the official source before "
-    "the first source-code mutation, and keep every action inside the provided "
-    "task workspace.")
-
-
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
@@ -46,15 +37,15 @@ def _sha256(text: str) -> str:
 def with_action_boundary(prompt: str, seed: dict,
                          feedback: str | None = None) -> str:
     """Return exactly the authored seed prompt for the native harness trace."""
-    return prompt.strip()
+    return prompt
 
 
-def _interaction_turns(seed: dict) -> list[str] | None:
+def _trace_turns(seed: dict) -> tuple[str, list[str] | None]:
     turns = (seed.get("interaction") or {}).get("turns")
     if not turns:
-        return None
-    # First turn is the initial prompt; the rest are replayed follow-ups.
-    return [str(turn.get("content", turn)) for turn in turns[1:]] or None
+        return seed["prompt"], None
+    authored = [str(turn.get("content", turn)) for turn in turns]
+    return authored[0], authored[1:] or None
 
 
 def trace_task(seed: dict, teacher=None, *, force: bool = False,
@@ -75,9 +66,7 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
             return existing
 
     teacher = teacher or get_teacher()
-    prompt = with_action_boundary(seed["prompt"], seed, feedback)
-    interaction = _interaction_turns(seed)
-    tools = (seed.get("tool_harness") or {}).get("tools")
+    prompt, interaction = _trace_turns(seed)
 
     best: dict | None = None
     for attempt in range(1, max(1, attempts) + 1):
@@ -86,9 +75,9 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
         protected_before = protected_hashes(seed, workspace)
         try:
             result = teacher.run_trace(
-                seed, workspace, out_dir=raw_dir, system_prompt=SYSTEM_PROMPT,
+                seed, workspace, out_dir=raw_dir, system_prompt="",
                 prompt=prompt, interaction=interaction,
-                security=False, tools=tools)
+                security=False, tools=None)
         except ModelUnavailable as blocked:
             record = _deferral(seed, prompt, teacher, "unavailable", str(blocked))
             _write_meta(meta_path, record)

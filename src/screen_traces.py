@@ -33,7 +33,7 @@ from pathlib import Path
 from common import (ROOT, TRACES, clear_runtime_caches, load_seeds, materialize,
                     protected_hashes, run_setup, run_verify, scrub_text,
                     DIFF_EXCLUDE_PATTERNS)
-from generate_traces import TRACE_ACTION_BOUNDARY
+from canonical_dataset import TRACE_ACTION_BOUNDARY
 from normalize import parse_trace
 from runtimes import get_judge
 from review_contract import is_accepted, is_judge_error

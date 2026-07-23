@@ -10,7 +10,7 @@ PUBLISH_KEY_ORDER = [
     "reasoning_effort", "provider", "observed_models", "model_attested",
     "trace_format", "tools_used", "derivation", "assistant_step",
     "assistant_steps", "target_message_index", "original_n_messages",
-    "n_messages", "messages", "tools"]
+    "n_messages", "messages"]
 
 MESSAGE_KEY_ORDER = [
     "role", "content", "reasoning_content", "tool_calls", "tool_call_id", "name"]
@@ -112,8 +112,4 @@ def normalize_public_row(row: dict) -> dict:
         values.get("task"), values.get("category"))
     values["messages"] = normalize_messages(values.get("messages") or [])
     values["n_messages"] = len(values["messages"])
-    tools = values.get("tools")
-    if not isinstance(tools, str):
-        tools = json.dumps(tools or [], ensure_ascii=False, separators=(",", ":"))
-    values["tools"] = tools
     return {key: values.get(key) for key in PUBLISH_KEY_ORDER}

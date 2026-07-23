@@ -19,7 +19,7 @@ class Routing(unittest.TestCase):
             self.assertIn(fmt, normalize._BY_FORMAT)
             parser = normalize.parser_for(fmt)
             self.assertTrue(hasattr(parser, "parse_stream"))
-            self.assertTrue(hasattr(parser, "tool_schemas"))
+            self.assertFalse(hasattr(parser, "tool_schemas"))
 
     def test_unknown_format_raises_valueerror(self):
         with self.assertRaises(ValueError):

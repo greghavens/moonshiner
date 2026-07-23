@@ -18,24 +18,6 @@ from export_hf_next_steps import build_row, validate_export
 from hf_sync import sha256
 
 
-def _tool_schemas() -> dict[str, list[dict]]:
-    schemas = {}
-    for split in ("train", "val"):
-        path = DATA / "next_step" / f"{split}.jsonl"
-        if not path.is_file():
-            continue
-        with path.open() as handle:
-            for line in handle:
-                if not line.strip():
-                    continue
-                record = json.loads(line)
-                meta = record.get("meta") or {}
-                tools = record.get("tools") or []
-                if tools:
-                    schemas[str(meta.get("trace_format") or "")] = tools
-    return schemas
-
-
 def _advance_baseline(path: Path, validation: dict) -> None:
     publish = CONFIG.get("publish") or {}
     dataset = publish.get("hf_dataset")
@@ -100,9 +82,6 @@ def _historical_canonical(
         source: _source_hash(final) for source, final in final_by_source.items()}
     converted = []
     for row in rows:
-        tools = row.get("tools")
-        if not isinstance(tools, str):
-            tools = json.dumps(tools or [], ensure_ascii=False)
         runtime = row.get("teacher_runtime") or configured_runtime
         model = row.get("teacher_model") or teacher.get("model")
         provider = row.get("provider") or (
@@ -136,7 +115,6 @@ def _historical_canonical(
             "original_n_messages": row["original_n_messages"],
             "n_messages": len(row["messages"]),
             "messages": row["messages"],
-            "tools": tools,
         }))
     return converted
 
@@ -196,7 +174,6 @@ def _legacy_public(
             "original_n_messages": source_lengths[row["task"]],
             "n_messages": len(row["messages"]),
             "messages": row["messages"],
-            "tools": row["tools"],
         }))
     return converted
 
@@ -240,7 +217,7 @@ def _current_canonical(row: dict) -> dict:
 
 def _source_hash(row: dict) -> str:
     return hashlib.sha256(json.dumps(
-        {"messages": row["messages"], "tools": row["tools"]},
+        {"messages": row["messages"]},
         ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
 
@@ -413,23 +390,17 @@ def migrate(path: Path) -> tuple[int, int]:
     if any("source_trajectory_id" in row or "assistant_step" in row for row in rows):
         raise ValueError("dataset mixes canonical and non-canonical rows")
 
-    schemas = _tool_schemas()
     val_fraction = float((CONFIG.get("build") or {}).get("val_frac", 0.08))
     converted = []
     for row in rows:
         runtime = str(row.get("teacher_runtime") or "")
         trace_format = str(row.get("trace_format") or "")
-        tools = schemas.get(trace_format)
-        if not tools:
-            raise ValueError(
-                f"{row.get('task')}: no genuine tool schema is available for "
-                f"{runtime}/{trace_format}")
         messages = row.get("messages") or []
         used = sorted({call.get("function", {}).get("name")
                        for message in messages
                        for call in (message.get("tool_calls") or [])
                        if call.get("function", {}).get("name")})
-        record = {"messages": messages, "tools": tools, "meta": {
+        record = {"messages": messages, "meta": {
             "task": row["task"], "lang": row.get("lang") or "en",
             "category": row.get("category") or "Other verified work",
             "domain": row.get("domain") or "coding",

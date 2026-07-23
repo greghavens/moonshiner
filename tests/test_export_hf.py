@@ -12,7 +12,7 @@ import export_hf_next_steps  # noqa: E402
 
 
 class ImportedCanonicalCompatibility(unittest.TestCase):
-    def test_missing_tool_schema_field_exports_as_empty_list(self):
+    def test_export_does_not_invent_a_tool_schema_field(self):
         record = {
             "meta": {"task": "imported"},
             "teacher_runtime": "pi",
@@ -25,7 +25,7 @@ class ImportedCanonicalCompatibility(unittest.TestCase):
             "messages": [{"role": "user", "content": "hello"}],
         }
         row = export_hf.build_row(record, "train")
-        self.assertEqual(json.loads(row["tools"]), [])
+        self.assertNotIn("tools", row)
         for key in ("teacher_runtime", "teacher_model", "provider",
                     "reasoning_effort", "model_attested", "observed_models",
                     "trace_format"):
@@ -38,6 +38,7 @@ class ImportedCanonicalCompatibility(unittest.TestCase):
             "original_n_messages": 1,
         })
         next_row = export_hf_next_steps.build_row(record, "train")
+        self.assertNotIn("tools", next_row)
         for key in ("teacher_runtime", "teacher_model", "provider",
                     "reasoning_effort", "model_attested", "observed_models",
                     "trace_format"):

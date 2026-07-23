@@ -14,10 +14,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from build_dataset import est_tokens
-from common import CONFIG, DATA, _staged_secret_values, schemas_for
+from common import CONFIG, DATA, _staged_secret_values
 from privacy import findings, sanitize_object
 from normalize import parse_trace
-from runtimes.codex import TOOL_REGISTRY as CODEX_TOOL_REGISTRY
 from security_runtime import SECURITY
 
 CATALOG = SECURITY / "catalog"
@@ -30,9 +29,6 @@ OUT = DATA / "security"
 # (no web_search), so its full offered surface is read/patch/plan. Every row lists
 # this whole surface, unioned with any tool actually observed — the same
 # full-tool-list contract the runtime adapters enforce for the coding lane.
-SECURITY_OFFERED_TOOLS = ("exec", "apply_patch", "update_plan")
-
-
 def load_jsonl(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
@@ -92,9 +88,6 @@ def build_row(case: dict, meta: dict) -> tuple[dict | None, str | None]:
         for message in turns if message.get("role") == "assistant"
         for call in message.get("tool_calls") or []
     })
-    unknown: list[str] = []
-    tools = schemas_for(list(dict.fromkeys(list(SECURITY_OFFERED_TOOLS) + used)),
-                        CODEX_TOOL_REGISTRY, warn=unknown)
     source_meta = case.get("meta") or {}
     security_task = (
         "whole_repo_review" if case["kind"] == "repo_review"
@@ -107,7 +100,6 @@ def build_row(case: dict, meta: dict) -> tuple[dict | None, str | None]:
     )
     return {
         "messages": session,
-        "tools": tools,
         "meta": {
             "task": case["id"],
             "lang": language_for(case),

@@ -3,10 +3,10 @@
 
 Runtime-agnostic: each trace records the ``trace_format`` of the runtime that
 produced it, and :mod:`normalize` routes that format to the adapter which turns
-the raw stream into ``messages`` + tool schemas. One build path therefore serves
+the raw stream into canonical messages. One build path therefore serves
 a Codex, Claude Code, or Pi/GLM teacher without change.
 
-Every row carries ``messages``, ``tools``, and provenance ``meta`` (including the
+Every row carries ``messages`` and provenance ``meta`` (including the
 teacher runtime/model and its stream attestation). The judge is the sole quality
 decision. Host paths and secrets are still scrubbed before output. Whole trajectories are kept
 here as immutable derivation sources; Hugging Face receives cumulative
@@ -19,9 +19,9 @@ import hashlib
 import json
 from pathlib import Path
 
-from common import (CONFIG, DATA, SECRET_RE, SYSTEM_PROMPT, TRACES, load_seeds,
+from common import (CONFIG, DATA, SECRET_RE, TRACES, load_seeds,
                     scrub_text)
-from normalize import parse_trace, tool_schemas_for
+from normalize import parse_trace
 from screen_traces import validate_reviewer_verdict
 from privacy import sanitize_object
 from review_contract import is_accepted
@@ -152,9 +152,7 @@ def build_row(seed: dict, info: dict,
     if not any(message["role"] == "assistant" for message in turns):
         return None, "no assistant turns"
 
-    session = ([{"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content":
-                 info.get("prompt") or seed["prompt"]}] + turns)
+    session = turns
     session = sanitize_object(scrub_session(session))
     session, secret_redactions = redact_secret_matches(session)
     if SECRET_RE.search(json.dumps(session, ensure_ascii=False)):
@@ -163,8 +161,6 @@ def build_row(seed: dict, info: dict,
     used = sorted({call["function"]["name"]
                    for message in turns if message["role"] == "assistant"
                    for call in message.get("tool_calls") or []})
-    tools = (parsed or {}).get("tools") or tool_schemas_for(trace_format, turns)
-
     teacher = info.get("teacher") or {}
     observed = teacher.get("observed_models") or (
         [teacher["observed_model"]] if teacher.get("observed_model") else [])
@@ -188,7 +184,7 @@ def build_row(seed: dict, info: dict,
     }
     if secret_redactions:
         meta["secret_redactions"] = secret_redactions
-    return {"messages": session, "tools": tools, "meta": meta}, None
+    return {"messages": session, "meta": meta}, None
 
 
 def accepted_author_rows(traces_dir: Path = TRACES, quiet: bool = True):

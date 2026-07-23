@@ -181,7 +181,7 @@ class OnePipelineInvariant(unittest.TestCase):
             self.assertTrue(all(
                 list(message) == canonical_dataset.MESSAGE_KEY_ORDER
                 for message in row["messages"]))
-            self.assertEqual(json.loads(row["tools"]), tools)
+            self.assertNotIn("tools", row)
             self.assertEqual(row["source_trajectory_id"], "source-one")
             self.assertEqual(len(row["source_trajectory_sha256"]), 64)
             self.assertEqual(row["teacher_runtime"], "historical")
@@ -278,7 +278,7 @@ class OnePipelineInvariant(unittest.TestCase):
                 "split": "train", "derivation": "cumulative-next-assistant-v1",
                 "assistant_step": 1, "assistant_steps": 1,
                 "target_message_index": 1, "original_n_messages": 1,
-                "n_messages": 1, "tools": "[]",
+                "n_messages": 1,
                 "messages": [{"role": "assistant", "content": "done",
                               "reasoning": "source-specific"}],
             })

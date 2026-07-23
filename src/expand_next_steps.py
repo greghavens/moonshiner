@@ -66,7 +66,6 @@ def expand_record(record: dict) -> list[dict]:
         }
         expanded.append({
             "messages": copy.deepcopy(messages[:target_index + 1]),
-            "tools": record.get("tools") or [],
             "meta": meta,
         })
     return expanded

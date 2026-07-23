@@ -150,8 +150,7 @@ def _normalize(row: dict, source: str, index: int, *, privacy_mode: str = "block
     for key in ("source_trajectory_id", "assistant_step", "assistant_steps", "lang", "domain"):
         if row.get(key) is not None:
             meta[key] = row[key]
-    tools = row.get("tools") or []
-    result = sanitize_object({"messages": normalized, "tools": tools, "meta": meta})
+    result = sanitize_object({"messages": normalized, "meta": meta})
     serialized = json.dumps(result, ensure_ascii=False)
     hits = findings(serialized, exact_secrets=_staged_secret_values())
     if hits and privacy_mode == "block":

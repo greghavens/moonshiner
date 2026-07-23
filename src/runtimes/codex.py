@@ -16,37 +16,11 @@ import subprocess
 import time
 from pathlib import Path
 
-from common import SECRET_RE, fn, schemas_for, scrub_text, stub
+from common import SECRET_RE, scrub_text
 from runtimes import availability
 from runtimes.base import ReviewResult, Runtime, TraceResult
 
 CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
-
-# OpenAI-style schemas for the built-in Codex tools we normalize by name.
-TOOL_REGISTRY = {
-    "exec": fn("exec", "Run a shell command in the workspace.",
-               {"command": {"type": "string"}}, ["command"]),
-    "exec_command": fn("exec_command", "Run a shell command in the workspace.",
-                       {"command": {"type": "string"}}, ["command"]),
-    "shell": fn("shell", "Run a shell command in the workspace.",
-                {"command": {"type": "array", "items": {"type": "string"}}},
-                ["command"]),
-    "apply_patch": fn("apply_patch", "Apply a unified patch to the workspace.",
-                      {"input": {"type": "string"}}, ["input"]),
-    "update_plan": fn("update_plan", "Record or update the task plan.",
-                      {"plan": {"type": "array", "items": {"type": "object"}}},
-                      ["plan"]),
-    "web_search": fn("web_search", "Search the web for current information.",
-                     {"query": {"type": "string"}}, ["query"]),
-    "web__run": stub("web__run", "Codex web tool (search/open)."),
-    "image_generation": stub("image_generation", "Generate an image."),
-}
-
-# The full tool surface a Codex teacher is offered (config runs web_search live).
-# Declared so every exported row lists the complete action space the teacher had,
-# not just the tools a given trace happened to call.
-OFFERED_TOOLS = ("exec", "apply_patch", "update_plan", "web_search")
-
 
 def _scrub_env() -> dict:
     """Allowlist non-secret process state; Codex uses its auth file."""
@@ -279,20 +253,6 @@ class CodexRuntime(Runtime):
                                                         "session_meta", "turn_context"}:
             return _parse_rollout(text, workspace)
         return _parse_exec_events(text, workspace)
-
-    @staticmethod
-    def tool_schemas(messages: list[dict]) -> list[dict]:
-        # Start from the full offered surface, then fold in any other tool
-        # actually observed in the stream, so the row always carries the
-        # complete tool list — not only what this trace happened to call.
-        names: list[str] = list(OFFERED_TOOLS)
-        for message in messages:
-            for call in message.get("tool_calls") or []:
-                name = call.get("function", {}).get("name")
-                if name and name not in names:
-                    names.append(name)
-        return schemas_for(names, TOOL_REGISTRY)
-
 
 # --------------------------------------------------------------------------- #
 # Rollout / event-stream normalizers                                          #

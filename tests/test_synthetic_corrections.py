@@ -278,13 +278,12 @@ class SyntheticCorrectionContracts(unittest.TestCase):
                                      "function": {"name": "search",
                                                   "arguments": "{}"}}]},
                     {"role": "tool", "tool_call_id": "one", "content": "result"}]
-        tools = [{"type": "function", "function": {"name": "search",
-                                                     "parameters": {"type": "object"}}}]
         path = self.root / "corrected.json"
-        corrections.write_corrected_trace(path, messages, tools)
+        corrections.write_corrected_trace(path, messages)
         parsed, parsed_tools = corrections.read_corrected_trace(path)
         self.assertEqual(parsed, messages)
-        self.assertEqual(parsed_tools, tools)
+        self.assertEqual(parsed_tools, {})
+        self.assertNotIn("tools", json.loads(path.read_text()))
 
     def test_added_tool_call_requires_a_matching_result(self):
         bad = [{"role": "assistant", "tool_calls": [{"id": "x", "type": "function",
@@ -292,12 +291,6 @@ class SyntheticCorrectionContracts(unittest.TestCase):
         self.assertFalse(corrections.validate_tool_pairs(bad)[0])
         bad.append({"role": "tool", "tool_call_id": "x", "content": "result"})
         self.assertTrue(corrections.validate_tool_pairs(bad)[0])
-
-    def test_correction_cannot_change_the_offered_tool_schema(self):
-        tools = [{"type": "function", "function": {"name": "search"}}]
-        self.assertTrue(corrections.validate_tools_unchanged(tools, list(tools))[0])
-        self.assertFalse(corrections.validate_tools_unchanged(
-            tools, [{"type": "function", "function": {"name": "invented"}}])[0])
 
     def test_card_is_labeled_and_links_primary(self):
         rendered = corrections.companion_notice("owner/source", "Model Name")

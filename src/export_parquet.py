@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Export cumulative next-step rows to optional Parquet files.
 
-Column design: ``messages`` and ``tools`` are JSON-encoded strings, NOT nested
-Parquet structs — tool-call arguments and tool schemas vary per row, so a
-unified struct type would either explode or silently null fields. Consumers do
+Column design: ``messages`` is JSON-encoded rather than a nested Parquet struct
+because tool-call arguments vary per row. Consumers do
 ``json.loads(row["messages"])``. Flat metadata (including teacher provenance)
 rides as real columns. Rows pass through verbatim from ``data/next_step`` after
 source verification and cumulative expansion; this adds nothing and drops nothing.
@@ -32,7 +31,7 @@ def export(src: Path, dst: Path) -> int:
     columns: dict = {name: [] for name in STRING_COLUMNS}
     columns.update({name: [] for name in INT_COLUMNS})
     columns.update({"tools_used": [], "observed_models": [],
-                    "model_attested": [], "messages": [], "tools": []})
+                    "model_attested": [], "messages": []})
     for line in src.read_text().splitlines():
         if not line.strip():
             continue
@@ -49,7 +48,6 @@ def export(src: Path, dst: Path) -> int:
         columns["observed_models"].append(meta.get("observed_models", []))
         columns["model_attested"].append(bool(meta.get("model_attested")))
         columns["messages"].append(json.dumps(row["messages"], ensure_ascii=False))
-        columns["tools"].append(json.dumps(row.get("tools", []), ensure_ascii=False))
 
     table = pa.table({
         **{name: pa.array(columns[name], pa.string()) for name in STRING_COLUMNS},
@@ -58,7 +56,6 @@ def export(src: Path, dst: Path) -> int:
         "observed_models": pa.array(columns["observed_models"], pa.list_(pa.string())),
         "model_attested": pa.array(columns["model_attested"], pa.bool_()),
         "messages": pa.array(columns["messages"], pa.string()),
-        "tools": pa.array(columns["tools"], pa.string()),
     })
     dst.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, dst, compression="zstd")

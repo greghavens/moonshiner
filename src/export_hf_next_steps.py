@@ -82,7 +82,6 @@ def build_row(record: dict, split: str) -> dict:
         "original_n_messages": meta["original_n_messages"],
         "n_messages": len(record["messages"]),
         "messages": normalize_messages(record["messages"]),
-        "tools": json.dumps(record.get("tools") or []),
     }
 
 
@@ -113,8 +112,6 @@ def validate_export(path: Path) -> dict:
             if sum(message.get("role") == "assistant"
                    for message in messages) != step:
                 raise ValueError(f"line {number}: assistant context count mismatch")
-            if not isinstance(json.loads(row.get("tools", "null")), list):
-                raise ValueError(f"line {number}: tools must encode a list")
             # The first public next-step schema predates this explicit column.
             # It still has exactly one accepted trajectory per central task,
             # making task the lossless source identity for validation.
