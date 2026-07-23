@@ -1,11 +1,15 @@
 import pathlib
 import sys
 import unittest
+from unittest import mock
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "src"))
 
-from migrate_canonical_dataset import _generation, _legacy_enriched  # noqa: E402
+import migrate_canonical_dataset as migration  # noqa: E402
+
+_generation = migration._generation
+_legacy_enriched = migration._legacy_enriched
 
 
 class MixedSchemaMigrationTest(unittest.TestCase):
@@ -71,3 +75,40 @@ class MixedSchemaMigrationTest(unittest.TestCase):
         self.assertEqual(
             normalized["messages"][1]["tool_calls"][0]["function"]["arguments"],
             '{"path":"a.txt"}')
+
+    def test_current_row_gets_missing_project_provenance_not_attestation(self):
+        row = {
+            key: None for key in migration.PUBLISH_KEY_ORDER
+        }
+        row.update({
+            "task": "example",
+            "source_trajectory_id": "example",
+            "source_trajectory_sha256": "a" * 64,
+            "split": "train",
+            "assistant_step": 0,
+            "assistant_steps": 1,
+            "target_message_index": 1,
+            "original_n_messages": 2,
+            "messages": [{"role": "assistant", "content": "done"}],
+            "tools": "[]",
+        })
+        config = {
+            "teacher": {
+                "runtime": "pi-openrouter",
+                "model": "moonshotai/kimi-k3",
+                "reasoning": "xhigh",
+            },
+            "runtimes": {
+                "pi-openrouter": {"provider": "openrouter"},
+            },
+        }
+
+        with mock.patch.object(migration, "CONFIG", config):
+            normalized = migration._current_canonical(row)
+
+        self.assertEqual(normalized["teacher_runtime"], "pi-openrouter")
+        self.assertEqual(normalized["teacher_model"], "moonshotai/kimi-k3")
+        self.assertEqual(normalized["reasoning_effort"], "xhigh")
+        self.assertEqual(normalized["provider"], "openrouter")
+        self.assertEqual(normalized["observed_models"], ["moonshotai/kimi-k3"])
+        self.assertFalse(normalized["model_attested"])

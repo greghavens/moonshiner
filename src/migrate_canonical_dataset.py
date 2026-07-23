@@ -214,6 +214,29 @@ def _legacy_enriched(
     return normalize_public_row(values)
 
 
+def _current_canonical(row: dict) -> dict:
+    """Fill missing project provenance on an otherwise canonical row."""
+    teacher = CONFIG.get("teacher") or {}
+    runtime = row.get("teacher_runtime") or teacher.get("runtime")
+    runtime_config = ((CONFIG.get("runtimes") or {}).get(str(runtime)) or {})
+    model = row.get("teacher_model") or teacher.get("model")
+    values = dict(row)
+    values.update({
+        "teacher_runtime": runtime,
+        "teacher_model": model,
+        "reasoning_effort": (
+            row.get("reasoning_effort") or teacher.get("reasoning")),
+        "provider": (
+            row.get("provider") or runtime_config.get("provider") or runtime),
+        "observed_models": (
+            row.get("observed_models") or ([model] if model else [])),
+        # Missing provenance may be restored from explicit project
+        # configuration, but attestation is never inferred.
+        "model_attested": bool(row.get("model_attested")),
+    })
+    return normalize_public_row(values)
+
+
 def _source_hash(row: dict) -> str:
     return hashlib.sha256(json.dumps(
         {"messages": row["messages"], "tools": row["tools"]},
@@ -286,7 +309,7 @@ def _recognized_canonical(rows: list[dict]) -> list[dict] | None:
         if id(row) in public_ids:
             normalized.append(next(public_converted))
         elif id(row) in current_ids:
-            normalized.append(normalize_public_row(row))
+            normalized.append(_current_canonical(row))
         elif id(row) in enriched_ids:
             normalized.append(_legacy_enriched(
                 row, enriched_lengths[row["task"]]))
@@ -352,7 +375,7 @@ def _migrate_recognized_stream(path: Path) -> tuple[int, int] | None:
             elif generation == "historical":
                 normalized = _historical_canonical([row], historical_hashes)[0]
             else:
-                normalized = normalize_public_row(row)
+                normalized = _current_canonical(row)
             destination.write(json.dumps(normalized, ensure_ascii=False) + "\n")
         destination.flush()
         os.fsync(destination.fileno())
