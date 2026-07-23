@@ -984,9 +984,11 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] in ("-h", "--help", "help"):
         print(_help())
         return 0
-    if argv == ["dataset", "build", "--help"] or \
-            argv == ["dataset", "build", "-h"]:
-        print("usage: moonshiner dataset build\n\n"
+    if len(argv) == 3 and argv[:2] in (
+            ["dataset", "build"], ["dataset", "export"]) \
+            and argv[2] in ("-h", "--help"):
+        action = argv[1]
+        print(f"usage: moonshiner dataset {action}\n\n"
               "Build, validate, shard, and render the local dataset from "
               "accepted traces.")
         return 0

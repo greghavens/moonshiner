@@ -21,6 +21,7 @@ from pathlib import Path
 
 from common import (CONFIG, DATA, SECRET_RE, TRACES, load_seeds,
                     scrub_text)
+from canonical_dataset import INTERNAL_CONTENT_MARKERS
 from normalize import parse_trace
 from screen_traces import validate_reviewer_verdict
 from privacy import sanitize_object
@@ -70,6 +71,11 @@ def redact_secret_matches(value):
 def scrub_session(session: list[dict]) -> list[dict]:
     """Strip host-specific paths from every string in the assembled session."""
     return json.loads(scrub_text(json.dumps(session, ensure_ascii=False)))
+
+
+def has_internal_content(session: list[dict]) -> bool:
+    serialized = json.dumps(session, ensure_ascii=False)
+    return any(marker in serialized for marker in INTERNAL_CONTENT_MARKERS)
 
 
 def est_tokens(message: dict, chars_per_token: float = 3.3) -> int:
@@ -151,6 +157,8 @@ def build_row(seed: dict, info: dict,
     turns, parsed = parse_trace(raw, trace_format, workspace=None)
     if not any(message["role"] == "assistant" for message in turns):
         return None, "no assistant turns"
+    if has_internal_content(turns):
+        return None, "Moonshiner-injected prompt content is prohibited"
 
     session = turns
     session = sanitize_object(scrub_session(session))

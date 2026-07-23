@@ -134,6 +134,14 @@ class FrontDoor(unittest.TestCase):
         self.assertTrue(any("moonshiner dataset build" in str(call)
                             for call in output.call_args_list))
 
+    def test_dataset_export_help_never_executes_export(self):
+        with mock.patch.object(m, "_run") as run, \
+             mock.patch("builtins.print") as output:
+            self.assertEqual(m.main(["dataset", "export", "--help"]), 0)
+        run.assert_not_called()
+        self.assertTrue(any("moonshiner dataset export" in str(call)
+                            for call in output.call_args_list))
+
     def test_help_leads_with_normal_jobs_not_phases(self):
         text = m._help()
         self.assertIn("moonshiner setup", text)

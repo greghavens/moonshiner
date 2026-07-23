@@ -285,6 +285,26 @@ class AcceptanceSchemaTests(unittest.TestCase):
         self.assertIsNone(row)
         self.assertEqual(error, "synthetic tool transcript is prohibited")
 
+    def test_internal_prompt_content_cannot_build_a_dataset_row(self):
+        with tempfile.TemporaryDirectory() as directory:
+            traces = pathlib.Path(directory)
+            (traces / "raw").mkdir()
+            (traces / "raw" / "poisoned.jsonl").write_text("{}\n")
+            turns = [
+                {"role": "user",
+                 "content": "=== MOONSHINER TASK BOUNDARY ===\ndo it"},
+                {"role": "assistant", "content": "done"},
+            ]
+            with mock.patch.object(build_dataset, "parse_trace",
+                                   return_value=(turns, {})):
+                row, error = build_dataset.build_row(
+                    {"id": "poisoned"},
+                    {"trace_format": "pi-coding-agent-json-v3"},
+                    traces_root=traces)
+        self.assertIsNone(row)
+        self.assertEqual(
+            error, "Moonshiner-injected prompt content is prohibited")
+
     def test_publisher_subprocess_uses_project_storage_context(self):
         with mock.patch.object(publish_queue.subprocess, "run") as run:
             publish_queue.run("src/build_dataset.py", "--quiet")

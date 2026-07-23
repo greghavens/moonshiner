@@ -14,6 +14,14 @@ import expand_next_steps as ex  # noqa: E402
 
 
 class Redaction(unittest.TestCase):
+    def test_internal_moonshiner_prompt_content_is_rejected(self):
+        session = [
+            {"role": "user",
+             "content": "=== MOONSHINER TASK BOUNDARY ===\ndo the task"},
+            {"role": "assistant", "content": "done"},
+        ]
+        self.assertTrue(bd.has_internal_content(session))
+
     def test_redact_secret_matches_counts_and_strips(self):
         redacted, count = bd.redact_secret_matches(
             {"log": "key AKIAIOSFODNN7EXAMPLE end"})
