@@ -16,13 +16,13 @@ from canonical_dataset import (INTERNAL_CONTENT_MARKERS, PUBLISH_KEY_ORDER,
 from expand_next_steps import expand_record
 from export_hf_next_steps import build_row, validate_export
 from hf_sync import sha256
-from privacy import redact, sanitize_object
+from privacy import EMAIL_RE, sanitize_object
 
 
 def _privacy_scrub_row(row: dict) -> dict:
     scrubbed = sanitize_object(row)
     serialized = json.dumps(scrubbed, ensure_ascii=False)
-    return json.loads(redact(serialized)[0])
+    return json.loads(EMAIL_RE.sub("[REDACTED_EMAIL]", serialized))
 
 
 def _advance_baseline(path: Path, validation: dict) -> None:

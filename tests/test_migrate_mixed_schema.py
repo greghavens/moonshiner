@@ -58,9 +58,11 @@ class MixedSchemaMigrationTest(unittest.TestCase):
         self.assertEqual(findings(json.dumps(migrated)), [])
 
     def test_final_serialized_row_is_scrubbed_at_validator_boundary(self):
-        row = {"messages": [{"content": "person@example.com"}]}
+        row = {"messages": [{"content": r"C:\work person@example.com"}]}
         scrubbed = migration._privacy_scrub_row(row)
         self.assertEqual(findings(json.dumps(scrubbed)), [])
+        self.assertEqual(
+            scrubbed["messages"][0]["content"], r"C:\work [REDACTED_EMAIL]")
 
     def test_future_trace_prompt_is_exactly_the_authored_seed_prompt(self):
         prompt = "\nUse the available tools to complete this task.\n"
