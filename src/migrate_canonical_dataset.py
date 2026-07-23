@@ -200,6 +200,20 @@ def _legacy_public(
     return converted
 
 
+def _legacy_enriched(
+        row: dict, source_length: int,
+        ) -> dict:
+    """Upgrade the pre-source-identity enriched public row."""
+    values = dict(row)
+    values.update({
+        "source_trajectory_id": row["task"],
+        "teacher_runtime": row.get("teacher_runtime") or row.get("runtime"),
+        "model_attested": bool(row.get("model_attested")),
+        "original_n_messages": source_length,
+    })
+    return normalize_public_row(values)
+
+
 def _source_hash(row: dict) -> str:
     return hashlib.sha256(json.dumps(
         {"messages": row["messages"], "tools": row["tools"]},
@@ -217,12 +231,19 @@ def _generation(row: dict) -> str | None:
         "assistant_step", "assistant_steps", "target_message_index",
         "original_n_messages", "messages", "tools",
     }
+    enriched_required = {
+        "task", "source_trajectory_sha256", "split", "derivation",
+        "assistant_step", "assistant_steps", "target_message_index",
+        "messages", "tools",
+    }
     if set(row) == public_keys:
         return "public"
     if list(row) == PUBLISH_KEY_ORDER:
         return "current"
     if historical_required <= set(row):
         return "historical"
+    if enriched_required <= set(row):
+        return "enriched"
     # Published rows from an earlier Moonshiner release may already carry a
     # source trajectory identity while lacking one or more columns introduced
     # by a later schema revision.  They are canonical rows to normalize, not
@@ -236,7 +257,7 @@ def _generation(row: dict) -> str | None:
 
 def _recognized_canonical(rows: list[dict]) -> list[dict] | None:
     """Normalize a file containing any mixture of known published generations."""
-    public, current, historical = [], [], []
+    public, current, historical, enriched = [], [], [], []
     for row in rows:
         generation = _generation(row)
         if generation == "public":
@@ -245,18 +266,30 @@ def _recognized_canonical(rows: list[dict]) -> list[dict] | None:
             current.append(row)
         elif generation == "historical":
             historical.append(row)
-    if len(public) + len(current) + len(historical) != len(rows):
+        elif generation == "enriched":
+            enriched.append(row)
+    if len(public) + len(current) + len(historical) + len(enriched) != len(rows):
         return None
     public_converted = iter(_legacy_public(public) or [])
     historical_converted = iter(_historical_canonical(historical) or [])
     public_ids = {id(row) for row in public}
     current_ids = {id(row) for row in current}
+    enriched_ids = {id(row) for row in enriched}
+    enriched_lengths = {
+        row["task"]: max(
+            len(candidate["messages"])
+            for candidate in enriched if candidate["task"] == row["task"])
+        for row in enriched
+    }
     normalized = []
     for row in rows:
         if id(row) in public_ids:
             normalized.append(next(public_converted))
         elif id(row) in current_ids:
             normalized.append(normalize_public_row(row))
+        elif id(row) in enriched_ids:
+            normalized.append(_legacy_enriched(
+                row, enriched_lengths[row["task"]]))
         else:
             normalized.append(next(historical_converted))
     return normalized
@@ -275,7 +308,7 @@ def _migrate_recognized_stream(path: Path) -> tuple[int, int] | None:
             if generation is None:
                 return None
             count += 1
-            if generation == "public":
+            if generation in {"public", "enriched"}:
                 identity = str(row["task"])
             elif generation == "historical":
                 identity = str(row["source_trajectory_id"])
@@ -294,6 +327,9 @@ def _migrate_recognized_stream(path: Path) -> tuple[int, int] | None:
     public_lengths = {
         identity: value[2] for (generation, identity), value in final.items()
         if generation == "public"}
+    enriched_lengths = {
+        identity: value[2] for (generation, identity), value in final.items()
+        if generation == "enriched"}
     historical_hashes = {
         identity: value[1] for (generation, identity), value in final.items()
         if generation == "historical"}
@@ -310,6 +346,9 @@ def _migrate_recognized_stream(path: Path) -> tuple[int, int] | None:
             if generation == "public":
                 normalized = _legacy_public(
                     [row], public_hashes, public_lengths)[0]
+            elif generation == "enriched":
+                normalized = _legacy_enriched(
+                    row, enriched_lengths[str(row["task"])])
             elif generation == "historical":
                 normalized = _historical_canonical([row], historical_hashes)[0]
             else:

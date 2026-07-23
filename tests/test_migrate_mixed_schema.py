@@ -1,31 +1,73 @@
 import pathlib
 import sys
+import unittest
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "src"))
 
-from migrate_canonical_dataset import _generation  # noqa: E402
+from migrate_canonical_dataset import _generation, _legacy_enriched  # noqa: E402
 
 
-def test_prior_canonical_revision_is_normalized_as_current():
-    row = {
-        "task": "example",
-        "source_trajectory_id": "example",
-        "messages": [{"role": "user", "content": "Do the task"}],
-        "tools": "[]",
-        # Deliberately omit columns added by the current published schema.
-        "assistant_step": 0,
-    }
+class MixedSchemaMigrationTest(unittest.TestCase):
+    def test_prior_canonical_revision_is_normalized_as_current(self):
+        row = {
+            "task": "example",
+            "source_trajectory_id": "example",
+            "messages": [{"role": "user", "content": "Do the task"}],
+            "tools": "[]",
+            # Deliberately omit columns added by the current published schema.
+            "assistant_step": 0,
+        }
+        self.assertEqual(_generation(row), "current")
 
-    assert _generation(row) == "current"
+    def test_whole_session_source_record_is_not_mistaken_for_published_row(self):
+        row = {
+            "task": "example",
+            "messages": [{"role": "user", "content": "Do the task"}],
+            "tools": [],
+            "teacher_runtime": "pi",
+        }
+        self.assertIsNone(_generation(row))
 
+    def test_pre_source_identity_enriched_row_preserves_trace(self):
+        row = {
+            "task": "example",
+            "source_trajectory_sha256": "a" * 64,
+            "lang": "en",
+            "category": "Building",
+            "domain": "coding",
+            "verifier": "published-baseline",
+            "split": "train",
+            "provider": "zai",
+            "teacher_model": "glm-5.2",
+            "observed_models": ["glm-5.2"],
+            "reasoning_effort": "xhigh",
+            "runtime": "pi-zai",
+            "trace_format": "pi-jsonl",
+            "tools_used": ["read"],
+            "derivation": "cumulative-next-assistant-v1",
+            "assistant_step": 0,
+            "assistant_steps": 1,
+            "target_message_index": 1,
+            "n_messages": 2,
+            "messages": [
+                {"role": "user", "content": "Inspect it"},
+                {"role": "assistant", "reasoning": "I should inspect it",
+                 "tool_calls": [{"id": "1", "type": "function",
+                                 "function": {"name": "read",
+                                              "arguments": {"path": "a.txt"}}}]},
+            ],
+            "tools": [],
+        }
 
-def test_whole_session_source_record_is_not_mistaken_for_published_row():
-    row = {
-        "task": "example",
-        "messages": [{"role": "user", "content": "Do the task"}],
-        "tools": [],
-        "teacher_runtime": "pi",
-    }
-
-    assert _generation(row) is None
+        self.assertEqual(_generation(row), "enriched")
+        normalized = _legacy_enriched(row, 2)
+        self.assertEqual(normalized["source_trajectory_id"], "example")
+        self.assertEqual(normalized["teacher_runtime"], "pi-zai")
+        self.assertEqual(normalized["original_n_messages"], 2)
+        self.assertEqual(
+            normalized["messages"][1]["reasoning_content"],
+            "I should inspect it")
+        self.assertEqual(
+            normalized["messages"][1]["tool_calls"][0]["function"]["arguments"],
+            '{"path":"a.txt"}')
