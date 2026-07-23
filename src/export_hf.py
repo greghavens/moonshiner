@@ -48,7 +48,7 @@ def build_row(record: dict, split: str) -> dict:
         "tools_used": meta.get("tools_used", []),
         "n_messages": len(record["messages"]),
         "messages": record["messages"],
-        "tools": json.dumps(record["tools"]),
+        "tools": json.dumps(record.get("tools", [])),
     }
 
 
