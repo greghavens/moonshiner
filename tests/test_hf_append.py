@@ -76,6 +76,11 @@ class LocalFirstBootstrap(unittest.TestCase):
 
 
 class TaskKeyedExport(unittest.TestCase):
+    def test_export_entrypoint_accepts_dispatcher_argv(self):
+        with mock.patch.object(export, "validate_manifest"):
+            with self.assertRaises(SystemExit):
+                export.main(["--replace", "--task", "task-a"])
+
     def test_legacy_rows_must_be_normalized_before_append(self):
         with tempfile.TemporaryDirectory() as name:
             root = pathlib.Path(name)

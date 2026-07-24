@@ -198,7 +198,7 @@ def replace_from_journal(output: Path, journal: Path) -> int:
     return len(journal_lines)
 
 
-def main() -> None:
+def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
@@ -208,7 +208,7 @@ def main() -> None:
     parser.add_argument(
         "--replace", action="store_true",
         help="Explicitly replace the cumulative mirror with current accepted traces")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     validate_manifest(args.input, args.source)
     if args.replace and args.task:
