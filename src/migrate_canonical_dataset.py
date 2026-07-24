@@ -310,9 +310,7 @@ def _recognized_canonical(rows: list[dict]) -> list[dict] | None:
     return normalized
 
 
-def _migrate_recognized_stream(
-        path: Path, *, preserve_contaminated: bool = False,
-        ) -> tuple[int, int] | None:
+def _migrate_recognized_stream(path: Path) -> tuple[int, int] | None:
     """Normalize large published files in two bounded-memory passes."""
     final: dict[tuple[str, str], tuple[int, str, int]] = {}
     contaminated_tasks: set[str] = set()
@@ -365,8 +363,7 @@ def _migrate_recognized_stream(
             if not line.strip():
                 continue
             row = sanitize_object(json.loads(line))
-            if (not preserve_contaminated
-                    and str(row["task"]) in contaminated_tasks):
+            if str(row["task"]) in contaminated_tasks:
                 continue
             generation = _generation(row)
             if generation == "public":
@@ -378,13 +375,8 @@ def _migrate_recognized_stream(
             elif generation == "historical":
                 normalized = _historical_canonical([row], historical_hashes)[0]
             else:
-                source_id = str(row["source_trajectory_id"])
                 normalized = _current_canonical(
-                    row, current_hashes.get(source_id) or _source_hash(row))
-            if (preserve_contaminated
-                    and str(row["task"]) in contaminated_tasks):
-                normalized["verifier"] = "published-baseline"
-                normalized["model_attested"] = False
+                    row, current_hashes[str(row["source_trajectory_id"])])
             normalized = _privacy_scrub_row(normalized)
             destination.write(json.dumps(normalized, ensure_ascii=False) + "\n")
         destination.flush()
@@ -395,9 +387,8 @@ def _migrate_recognized_stream(
     return validation["trajectories"], validation["rows"]
 
 
-def migrate(path: Path, *, preserve_contaminated: bool = False) -> tuple[int, int]:
-    streamed = _migrate_recognized_stream(
-        path, preserve_contaminated=preserve_contaminated)
+def migrate(path: Path) -> tuple[int, int]:
+    streamed = _migrate_recognized_stream(path)
     if streamed is not None:
         return streamed
     rows = [sanitize_object(json.loads(line))
@@ -406,8 +397,7 @@ def migrate(path: Path, *, preserve_contaminated: bool = False) -> tuple[int, in
         raise ValueError("dataset is empty")
     contaminated_tasks = {
         str(row["task"]) for row in rows if _contains_internal_control(row)}
-    if not preserve_contaminated:
-        rows = [row for row in rows if str(row["task"]) not in contaminated_tasks]
+    rows = [row for row in rows if str(row["task"]) not in contaminated_tasks]
     if not rows:
         raise ValueError("dataset contains no uncontaminated trajectories")
     if any("source_trajectory_id" in row or "assistant_step" in row for row in rows):
@@ -455,25 +445,11 @@ def migrate(path: Path, *, preserve_contaminated: bool = False) -> tuple[int, in
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="moonshiner migrate-dataset")
     parser.add_argument("--yes", action="store_true")
-    parser.add_argument(
-        "--preserve-contaminated", action="store_true",
-        help="normalize existing rows without removing contaminated tasks")
-    parser.add_argument(
-        "--restore-pre-normalized", action="store_true",
-        help="restore the retained pre-normalization file before migrating")
     args = parser.parse_args(argv)
     if not args.yes:
         parser.error("migration requires --yes")
     path = migration_path()
-    if args.restore_pre_normalized:
-        backup = path.with_name(path.name + ".pre-normalized")
-        if not backup.is_file():
-            raise ValueError(f"pre-normalization backup is missing: {backup}")
-        pending = path.with_suffix(path.suffix + ".restore.pending")
-        shutil.copy2(backup, pending)
-        pending.replace(path)
-    trajectories, rows = migrate(
-        path, preserve_contaminated=args.preserve_contaminated)
+    trajectories, rows = migrate(path)
     print(f"canonical dataset ready: {trajectories} trajectories, {rows} training rows")
     return 0
 

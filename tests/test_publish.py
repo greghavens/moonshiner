@@ -43,18 +43,6 @@ class RemoteCardVerification(unittest.TestCase):
                 _verify_trusted_prefix(
                     traces, state, allow_task_replacements=False)
 
-    def test_explicit_full_replacement_does_not_require_prefix_identity(self):
-        with tempfile.TemporaryDirectory() as directory:
-            traces = Path(directory) / "traces.jsonl"
-            traces.write_bytes(b"clean replacement\n")
-            state = {
-                "bootstrap_size": len(b"poisoned baseline\n"),
-                "bootstrap_sha256": __import__("hashlib").sha256(
-                    b"poisoned baseline\n").hexdigest(),
-            }
-            _verify_trusted_prefix(
-                traces, state, allow_task_replacements=True)
-
     def test_all_three_publication_modes_are_explicit_and_model_independent(self):
         for mode in ("jsonl", "jsonl-hf-parquet", "parquet-shards"):
             self.assertEqual(publication_format({

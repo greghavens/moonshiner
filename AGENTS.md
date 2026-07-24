@@ -18,6 +18,8 @@ These are explicit project-owner requirements and apply to every change:
    the unmodified harness and normalizes its genuine trace into Moonshiner's one
    canonical representation.
 
+   **NEVER CHANGE ANY SCHEMA OR DATA MODEL OF ANY TYPE WITHOUT THE PROJECT OWNER'S EXPLICIT APPROVAL.**
+
 3. **TEST THE ARCHITECTURE, NOT JUST EACH OUTPUT IN ISOLATION.** The test suite
    must prove that multiple configured models and harnesses traverse the same
    seed, trace, judge, format, validate, publish, and card code. Tests must fail

@@ -68,7 +68,7 @@ PHASES: tuple[Phase, ...] = (
           "expand_next_steps", takes_argv=False),
     Phase("export", 7, "Export the HF dataset", "export_hf", takes_argv=False),
     Phase("export-next", 8, "Export the HF next-steps dataset",
-          "export_hf_next_steps"),
+          "export_hf_next_steps", takes_argv=False),
     Phase("verify-export", 9, "Validate the exported dataset",
           "validate_hf_export", takes_argv=False),
     Phase("parquet", 10, "Export validated Parquet shards", "export_parquet",
