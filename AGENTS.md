@@ -8,6 +8,9 @@ These are explicit project-owner requirements and apply to every change:
    product behavior, stop and ask instead of inventing it. This is the first
    and controlling implementation invariant.
 
+   **NEVER EDIT ANY LINE OF CODE WITHOUT FIRST PRESENTING THE EXACT PROPOSED
+   CHANGE TO THE PROJECT OWNER AND RECEIVING EXPLICIT APPROVAL.**
+
 2. **ONE PIPELINE, ONE CODE PATH, ONE CANONICAL TRACE REPRESENTATION, ONE
    DATASET SCHEMA, ONE FORMATTER, ONE VALIDATOR, ONE PUBLISHER, AND ONE DATASET
    CARD GENERATOR FOR EVERY MODEL.** Model name, provider, dataset, category,

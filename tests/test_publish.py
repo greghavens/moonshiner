@@ -10,40 +10,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from publish import (_verify_remote_card, _verify_trusted_prefix, build_viewer_shards,
                      configure_viewer_card, inactive_remote_paths, publication_files,
-                     merge_task_replacements, privacy_scan_files, publication_format,
+                     privacy_scan_files, publication_format,
                      viewer_dataset_config)
-from canonical_dataset import normalize_public_row
-
-
-def replacement_row(task, content="done"):
-    return normalize_public_row({
-        "task": task,
-        "source_trajectory_id": f"{task}:accepted",
-        "source_trajectory_sha256": "a" * 64,
-        "lang": "en",
-        "category": "Tool calling",
-        "domain": "coding",
-        "verifier": "acceptance-tests+quality-review",
-        "split": "train",
-        "teacher_runtime": "pi",
-        "teacher_model": "configured/model",
-        "reasoning_effort": "max",
-        "provider": "configured",
-        "observed_models": ["configured/model"],
-        "model_attested": True,
-        "trace_format": "pi-coding-agent-json-v3",
-        "tools_used": [],
-        "derivation": "cumulative-next-assistant-v1",
-        "assistant_step": 1,
-        "assistant_steps": 1,
-        "target_message_index": 1,
-        "original_n_messages": 2,
-        "n_messages": 2,
-        "messages": [
-            {"role": "user", "content": "do it"},
-            {"role": "assistant", "content": content},
-        ],
-    })
 
 
 class _Response:
@@ -61,55 +29,6 @@ class _Response:
 
 
 class RemoteCardVerification(unittest.TestCase):
-    def test_task_merge_replaces_exact_name_and_preserves_other_bytes(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            remote = root / "remote.jsonl"
-            local = root / "local.jsonl"
-            output = root / "merged.jsonl"
-            unrelated = b' { "task" : "other", "legacy" : true } \r\n'
-            prefix = b'{"task":"task-a-prefix","legacy":true}\n'
-            old = b'{"task":"task-a","legacy":"old"}\n'
-            remote.write_bytes(unrelated + old + prefix)
-            replacement = (
-                json.dumps(replacement_row("task-a"), ensure_ascii=False) + "\n"
-            ).encode()
-            local.write_bytes(replacement)
-
-            written, replaced = merge_task_replacements(
-                remote, local, output, {"task-a"})
-
-            self.assertEqual((written, replaced), (1, 1))
-            self.assertEqual(output.read_bytes(), unrelated + prefix + replacement)
-
-    def test_task_merge_requires_every_requested_identity(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            remote = root / "remote.jsonl"
-            local = root / "local.jsonl"
-            output = root / "merged.jsonl"
-            remote.write_text('{"task":"task-a"}\n')
-            local.write_text(
-                json.dumps(replacement_row("task-a")) + "\n")
-            with self.assertRaisesRegex(
-                    ValueError, "not every requested task"):
-                merge_task_replacements(
-                    remote, local, output, {"task-a", "task-b"})
-
-    def test_task_merge_strictly_rejects_poisoned_replacement(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            remote = root / "remote.jsonl"
-            local = root / "local.jsonl"
-            output = root / "merged.jsonl"
-            remote.write_text('{"task":"task-a"}\n')
-            poisoned = replacement_row(
-                "task-a", "=== MOONSHINER TASK BOUNDARY ===")
-            local.write_text(json.dumps(poisoned) + "\n")
-            with self.assertRaisesRegex(ValueError, "control text"):
-                merge_task_replacements(
-                    remote, local, output, {"task-a"})
-
     def test_task_keyed_replacements_do_not_require_byte_prefix_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             traces = Path(directory) / "traces.jsonl"

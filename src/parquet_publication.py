@@ -218,7 +218,6 @@ def sync(source: Path, root: Path, *, changed_tasks: set[str],
             task = str(task)
             active_task_counts[task] = active_task_counts.get(task, 0) + 1
     changed_tasks = set(changed_tasks)
-    full_corpus = not changed_tasks
     changed_tasks.update(
         task for task in set(active_task_counts) | set(canonical_task_counts)
         if active_task_counts.get(task, 0) != canonical_task_counts.get(task, 0))
@@ -227,7 +226,7 @@ def sync(source: Path, root: Path, *, changed_tasks: set[str],
     rebuild_tasks = set(changed_tasks)
     if schema_changed:
         missing_from_canonical = set(active_task_counts) - set(canonical_task_counts)
-        if missing_from_canonical and not full_corpus:
+        if missing_from_canonical:
             raise ValueError(
                 "schema migration would remove active trajectories: "
                 f"{sorted(missing_from_canonical)}")
@@ -252,7 +251,7 @@ def sync(source: Path, root: Path, *, changed_tasks: set[str],
                     selected.append(row)
     finally:
         normalized.unlink(missing_ok=True)
-    missing = set() if full_corpus else rebuild_tasks - all_tasks
+    missing = rebuild_tasks - all_tasks
     if missing:
         raise ValueError(f"changed trajectories missing from canonical rows: {sorted(missing)}")
 

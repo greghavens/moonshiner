@@ -79,37 +79,6 @@ class ParquetPublication(unittest.TestCase):
             self.assertTrue(old_paths - set(second["active_shards"]))
             self.assertTrue(all((root / path).is_file() for path in old_paths))
 
-    def test_full_corpus_sync_removes_tasks_absent_from_canonical_rows(self):
-        with tempfile.TemporaryDirectory() as name:
-            root = pathlib.Path(name); source = root / "traces.jsonl"
-            original = [row("task-keep"), row("task-remove")]
-            self.write_rows(source, original)
-            parquet.sync(
-                source, root,
-                changed_tasks={item["task"] for item in original})
-
-            self.write_rows(source, [row("task-keep", answer="replacement")])
-            manifest = parquet.sync(source, root, changed_tasks=set())
-
-            self.assertEqual(manifest["trajectory_count"], 1)
-            self.assertEqual(
-                [item["task"] for item in parquet.read_active_rows(root)],
-                ["task-keep"])
-
-    def test_task_scoped_sync_fails_when_requested_task_is_absent(self):
-        with tempfile.TemporaryDirectory() as name:
-            root = pathlib.Path(name); source = root / "traces.jsonl"
-            self.write_rows(source, [row("task-keep"), row("task-missing")])
-            parquet.sync(
-                source, root,
-                changed_tasks={"task-keep", "task-missing"})
-            self.write_rows(source, [row("task-keep")])
-
-            with self.assertRaisesRegex(
-                    ValueError, "changed trajectories missing.*task-missing"):
-                parquet.sync(
-                    source, root, changed_tasks={"task-missing"})
-
     def test_noop_sync_does_not_rewrite_active_shards(self):
         with tempfile.TemporaryDirectory() as name:
             root = pathlib.Path(name); source = root / "traces.jsonl"
