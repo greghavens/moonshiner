@@ -378,8 +378,9 @@ def _migrate_recognized_stream(
             elif generation == "historical":
                 normalized = _historical_canonical([row], historical_hashes)[0]
             else:
+                source_id = str(row["source_trajectory_id"])
                 normalized = _current_canonical(
-                    row, current_hashes[str(row["source_trajectory_id"])])
+                    row, current_hashes.get(source_id) or _source_hash(row))
             normalized = _privacy_scrub_row(normalized)
             destination.write(json.dumps(normalized, ensure_ascii=False) + "\n")
         destination.flush()
