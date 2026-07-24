@@ -10,7 +10,7 @@ Seed authoring, trace distillation, and training dataset preparation for coding-
 - `src/moonshiner_app/` — installed package (`cli.py`, `__init__.py`)
 - `src/configuration.py` — config loading; `config.json` (defaults), `config.local.json` (overrides)
 - `schemas/` — JSON schemas
-- `tasks/seeds/`, `tasks/behavior-seeds/`, `tasks/retired-seeds/` — seed corpus
+- `tasks/seeds/`, `tasks/retired-seeds/` — seed corpus
 - `tests/` — pytest test suite
 - `scripts/` — batch/utility scripts
 - `.moonshiner/` — per-project runtime state (database, runs, traces, HF sync)

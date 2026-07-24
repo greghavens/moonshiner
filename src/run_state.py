@@ -206,12 +206,12 @@ def renew_lease(db, run_id: str, seed_id: str, owner: str,
 
 
 def abandon_claim(db, run_id: str, seed_id: str, owner: str, error: str) -> None:
-    """Return a failed worker's claim immediately; no lease timeout is required."""
+    """Block a failed worker's claim immediately; infrastructure never retries."""
     timestamp = now()
-    db.execute("UPDATE attempts SET status='abandoned',finished_at=?,error=? "
+    db.execute("UPDATE attempts SET status='infrastructure_error',finished_at=?,error=? "
                "WHERE run_id=? AND seed_id=? AND status='running'",
                (timestamp, error, run_id, seed_id))
-    db.execute("UPDATE jobs SET status='retry',last_error=?,updated_at=?,"
+    db.execute("UPDATE jobs SET status='infrastructure_blocked',last_error=?,updated_at=?,"
                "lease_owner=NULL,lease_expires_at=NULL WHERE run_id=? AND seed_id=? "
                "AND status='running' AND lease_owner=?",
                (error, timestamp, run_id, seed_id, owner))

@@ -20,6 +20,7 @@ import canonical_dataset  # noqa: E402
 class OnePipelineInvariant(unittest.TestCase):
     def test_publisher_has_exactly_one_formatter_and_no_schema_dispatch(self):
         source = inspect.getsource(publish_queue)
+        self.assertFalse(any("published-" + "baseline" in path.read_text() for path in (ROOT / "src").rglob("*.py")))
         self.assertEqual(source.count('"src/export_hf_next_steps.py"'), 1)
         for forbidden in (
                 "publication_shape", "export_whole_trajectories",

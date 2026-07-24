@@ -56,9 +56,6 @@ _use_active = prefer_active_corpus(
     _installed_seeds.is_dir(), _authoring_enabled,
     _corpus_version(_active_root), _corpus_version(ROOT))
 SEEDS_DIR = _installed_seeds if _use_active else _bundled_seeds
-BEHAVIOR_SEEDS_DIR = (SEEDS_DIR.parent / "behavior-seeds"
-                      if (SEEDS_DIR.parent / "behavior-seeds").is_dir()
-                      else ROOT / "tasks" / "behavior-seeds")
 BEHAVIOR_WORLDS = (SEEDS_DIR.parent / "behavior-worlds.json"
                    if (SEEDS_DIR.parent / "behavior-worlds.json").is_file()
                    else ROOT / "tasks" / "behavior-worlds.json")
@@ -242,15 +239,6 @@ def load_seeds(only: set[str] | None = None, include_holdout: bool = False) -> l
         if not include_holdout and seed["id"] in holdouts:
             continue
         seeds.append(seed)
-    for path in sorted(BEHAVIOR_SEEDS_DIR.glob("behavior-*.json")):
-        seed = json.loads(path.read_text())
-        if only and seed["id"] not in only:
-            continue
-        if not include_holdout and seed["id"] in holdouts:
-            continue
-        seed["_path"] = path
-        seeds.append(seed)
-
     installed_catalog = SEEDS_DIR.parents[1] / "SEED_CATALOG.json"
     catalog_path = (installed_catalog if installed_catalog.is_file()
                     else ROOT / "SEED_CATALOG.json")
@@ -318,8 +306,6 @@ def seed_fingerprint(seed: dict) -> str:
     boundary ambiguities, so a stale review is detected if any byte changes.
     """
     digest = hashlib.sha256()
-    if "_path" in seed:
-        return hashlib.sha256(Path(seed["_path"]).read_bytes()).hexdigest()
     task_path = seed["_dir"] / "task.json"
     for path in [task_path, *sorted((seed["_dir"] / "files").rglob("*"))]:
         if not path.is_file():
@@ -546,7 +532,6 @@ def scrub_text(value: str, workspace: str | None = None) -> str:
     if workspace:
         value = value.replace(workspace + "/", "").replace(workspace, ".")
     value = value.replace(str(ROOT), "/repo")
-    value = value.replace(str(Path.home()), "~")
     value = RUNTIME_PATH_RE.sub("/runtime", value)
     static_names = ("ZAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
                     "OPENROUTER_API_KEY", "HF_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")

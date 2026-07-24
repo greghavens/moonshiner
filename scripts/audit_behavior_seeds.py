@@ -10,9 +10,9 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from common import BEHAVIOR_SEEDS_DIR, BEHAVIOR_WORLDS  # noqa: E402
+from common import BEHAVIOR_WORLDS, SEEDS_DIR  # noqa: E402
 
-SEEDS = BEHAVIOR_SEEDS_DIR
+SEEDS = SEEDS_DIR
 SCHEMA = ROOT / "schemas" / "behavior_seed.schema.json"
 WORLDS = BEHAVIOR_WORLDS
 
@@ -35,7 +35,7 @@ def audit() -> tuple[list[str], dict]:
     parallel = 0
     required = set(schema["required"])
     top_allowed = set(schema["properties"])
-    for path in sorted(SEEDS.glob("behavior-*.json")):
+    for path in sorted(SEEDS.glob("behavior-*/task.json")):
         try:
             serialized = path.read_text()
             seed = json.loads(serialized)

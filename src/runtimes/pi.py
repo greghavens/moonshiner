@@ -16,16 +16,14 @@ import json
 import os
 import shutil
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 
-from common import ROOT, RUNS, scrub_text
+from common import ROOT, scrub_text
 from runtimes.auth import load_provider_key
 from runtimes.base import ReviewResult, Runtime, TraceResult
 from runtimes.credential_proxy import DUMMY_TOKEN, ProxySession
 
-RUNTIME_ROOT = RUNS / "pi-runtime"
 DEFAULT_TIMEOUT_SECONDS = 300
 MAX_TIMEOUT_SECONDS = 600
 CODING_PROGRAMS = {
@@ -162,8 +160,12 @@ class PiRuntime(Runtime):
         managed = self._managed_node_modules()
         if managed is not None:
             cmd += ["--ro-bind", str(managed), str(runtime_dir / "node_modules")]
+        environment = self.teacher_environment(workspace)
+        for name in ("HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME",
+                     "XDG_DATA_HOME", "DOTNET_CLI_HOME", "NUGET_PACKAGES",
+                     "GOCACHE", "GOMODCACHE", "GOPATH"):
+            cmd += ["--setenv", name, environment[name]]
         cmd += [
-                "--setenv", "HOME", str(runtime_dir / "home"),
                 "--setenv", "USER", "moonshiner-agent",
                 "--setenv", "LOGNAME", "moonshiner-agent",
                 "--setenv", "XDG_RUNTIME_DIR", str(runtime_dir / "run"),
@@ -205,16 +207,6 @@ class PiRuntime(Runtime):
                        or CODING_PROGRAMS)
         return CODING_GUIDANCE if seed.get("_catalog_program") in programs else None
 
-    def _child_env(self) -> dict:
-        """Strip every real credential; the child only reaches the proxy.
-
-        The configured provider key (``key_env``) is stripped generically, so a
-        new provider (OpenRouter, Fireworks, …) is covered without editing this
-        list — the sandbox only ever sees the loopback proxy's dummy token.
-        """
-        return {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL", "TERM")
-                if k in os.environ}
-
     # -- teacher ------------------------------------------------------------ #
     def run_trace(self, seed: dict, workspace: Path, *, out_dir: Path,
                   system_prompt: str, prompt: str,
@@ -234,8 +226,8 @@ class PiRuntime(Runtime):
              interaction: list[str] | None = None,
              append_system_prompt: str | None = None) -> TraceResult:
         real_key = load_provider_key(self.runtime_config)
-        RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
-        runtime_dir = Path(tempfile.mkdtemp(prefix="run-", dir=RUNTIME_ROOT))
+        runtime_dir = workspace / ".sandbox-home" / "pi-runtime"
+        runtime_dir.mkdir(parents=True, exist_ok=True)
         events_path = out_dir / f"{artifact_id}.events.jsonl"
         stderr_path = out_dir / f"{artifact_id}.stderr"
         auth_style = ("x-api-key" if self.runtime_config.get("api") == "anthropic-messages"
@@ -246,9 +238,6 @@ class PiRuntime(Runtime):
         timed_out = False
         try:
             self._prepare_runtime(runtime_dir, proxy.base_url)
-            # `schema` has no CLI channel in pi 0.80.7; judge instructions
-            # embed the expected JSON shape and run_review parses the last
-            # assistant message.
             events_path.write_text("")
             stderr_path.write_text("")
             return_code = 0
@@ -263,7 +252,7 @@ class PiRuntime(Runtime):
                         cmd, workspace=workspace, turn=turn,
                         stdout_path=events_path, stderr_path=stderr_path,
                         timeout=int(self.role.get("timeout_s", 3600)),
-                        environment=self._child_env())
+                        environment=self.teacher_environment(workspace))
                     return_code = proc.returncode
                     compact_events_file(events_path)
                     if return_code != 0:
@@ -278,17 +267,11 @@ class PiRuntime(Runtime):
             proxy.stop()
         duration = time.monotonic() - started
 
-        # Output was streamed and compacted per turn, so parent memory stays
-        # bounded and raw_sha256 sees the retained finalized event stream.
         meta = _parse_stream_meta(stdout)
         profile = self.config.get("model_profile") or {}
         aliases = ((profile.get("attestation_aliases") or [])
                    if profile.get("id") == self.role["model"] else [])
         attested = _model_attested(self.role["model"], meta, audit, aliases)
-        # Retain the project-local runtime/session directory for audit and
-        # reproducibility. It contains only the proxy dummy credential; the
-        # real provider key never enters the sandbox.
-
         return TraceResult(
             raw_path=events_path,
             trace_format="pi-coding-agent-json-v3",

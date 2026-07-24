@@ -23,6 +23,8 @@ def published_row(task="trajectory-a", step=1, total=1):
     messages = [{"role": "user", "content": "do it"},
                 {"role": "assistant", "content": "done"}]
     return {"task": task, "lang": "en", "category": "Tool calling",
+            "model_attested": True,
+            "source_trajectory_id": task, "derivation": "cumulative-next-assistant-v1", "original_n_messages": 2,
             "split": "train", "assistant_step": step,
             "assistant_steps": total, "target_message_index": 1,
             "n_messages": 2, "messages": messages, "tools": "[]"}

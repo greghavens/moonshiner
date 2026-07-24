@@ -9,6 +9,7 @@ name from ``config.json`` so a full distill can be run against any model.
 from __future__ import annotations
 
 import abc
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -85,6 +86,25 @@ class Runtime(abc.ABC):
                 raise RuntimeError(
                     f"model workspace must be persistent; temporary path prohibited: {resolved}")
         return resolved
+
+    @staticmethod
+    def teacher_environment(workspace: Path) -> dict[str, str]:
+        """Confine every teacher-owned writable cache to its workspace."""
+        home = Path(workspace) / ".sandbox-home"
+        home.mkdir(parents=True, exist_ok=True)
+        environment = {key: os.environ[key]
+                       for key in ("PATH", "LANG", "LC_ALL", "TERM")
+                       if key in os.environ}
+        environment.update({
+            key: str(home / suffix) for key, suffix in {
+                "HOME": "", "XDG_CACHE_HOME": ".cache",
+                "XDG_CONFIG_HOME": ".config", "XDG_DATA_HOME": ".local/share",
+                "DOTNET_CLI_HOME": ".dotnet", "NUGET_PACKAGES": ".nuget/packages",
+                "GOCACHE": ".cache/go-build", "GOMODCACHE": "go/pkg/mod",
+                "GOPATH": "go"}.items()})
+        environment["CODEX_HOME"] = str(Path.home() / ".codex")
+        environment["CLAUDE_CONFIG_DIR"] = str(Path.home() / ".claude")
+        return environment
 
     # -- lifecycle ---------------------------------------------------------- #
     @abc.abstractmethod

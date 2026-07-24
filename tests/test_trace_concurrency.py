@@ -110,6 +110,27 @@ class TraceConcurrency(unittest.TestCase):
         self.assertEqual(output.getvalue(),
                          "[ALERT infrastructure failure] task-a: disk full\n")
 
+    def test_setup_failure_finishes_once_and_blocks_retry(self):
+        db = connect(self.path)
+        claim = claim_job(db, self.run_id, "worker")
+        start_attempt(db, self.run_id, claim["seed_id"], 1)
+        output = io.StringIO()
+        with mock.patch.object(trace_pipeline.sys, "stderr", output):
+            trace_pipeline.finish_infrastructure_failure(
+                db, self.run_id, claim["seed_id"], 1,
+                {"deterministic": {
+                    "failures": ["setup failed: DNS unavailable"]}})
+        job = db.execute(
+            "SELECT status,attempts FROM jobs WHERE run_id=? AND seed_id=?",
+            (self.run_id, claim["seed_id"])).fetchone()
+        self.assertEqual(tuple(job), ("infrastructure_blocked", 1))
+        self.assertNotEqual(claim_job(db, self.run_id, "replacement")["seed_id"],
+                            claim["seed_id"])
+        self.assertEqual(output.getvalue(),
+                         f"[ALERT infrastructure failure] {claim['seed_id']}: "
+                         "- setup failed: DNS unavailable\n")
+        db.close()
+
     def test_parallel_claims_are_unique(self):
         claimed = []
         lock = threading.Lock()
@@ -223,13 +244,22 @@ class TraceConcurrency(unittest.TestCase):
         self.assertIn(self.run_id, live_trace_run_ids(db))
         db.close()
 
-    def test_failed_worker_returns_claim_immediately(self):
+    def test_failed_worker_blocks_claim_without_retry(self):
         db = connect(self.path)
         first = claim_job(db, self.run_id, "failed-worker")
+        start_attempt(db, self.run_id, first["seed_id"], 1)
         abandon_claim(db, self.run_id, first["seed_id"], "failed-worker", "transport failed")
+        job = db.execute(
+            "SELECT status,last_error FROM jobs WHERE run_id=? AND seed_id=?",
+            (self.run_id, first["seed_id"])).fetchone()
+        attempt = db.execute(
+            "SELECT status,error FROM attempts WHERE run_id=? AND seed_id=?",
+            (self.run_id, first["seed_id"])).fetchone()
+        self.assertEqual(tuple(job), ("infrastructure_blocked", "transport failed"))
+        self.assertEqual(tuple(attempt),
+                         ("infrastructure_error", "transport failed"))
         replacement = claim_job(db, self.run_id, "replacement")
-        self.assertEqual(replacement["seed_id"], first["seed_id"])
-        self.assertEqual(replacement["last_error"], "transport failed")
+        self.assertNotEqual(replacement["seed_id"], first["seed_id"])
         db.close()
 
     def test_existing_ledger_migrates_lease_columns_without_losing_jobs(self):

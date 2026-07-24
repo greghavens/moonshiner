@@ -60,22 +60,6 @@ def ensure_publish_queue() -> None:
         subprocess.run(command, check=True)
 
 
-def existing_harness_trace(seed_id: str) -> bool:
-    """Return true only for a buildable trace emitted by a registered harness."""
-    meta_path = TRACES / "meta" / f"{seed_id}.json"
-    try:
-        meta = json.loads(meta_path.read_text())
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return False
-    from normalize import _BY_FORMAT
-    if meta.get("trace_format") not in _BY_FORMAT:
-        return False
-    raw_path = Path(str(meta.get("raw_path") or ""))
-    if not raw_path.is_absolute():
-        raw_path = TRACES.parent / raw_path
-    return bool(meta.get("passed") and raw_path.is_file())
-
-
 def remove_completed_workspace(record: dict) -> None:
     """Remove the materialized workspace after durable attempt completion."""
     value = record.get("_workspace_path")
@@ -90,6 +74,13 @@ def remove_completed_workspace(record: dict) -> None:
 def alert_infrastructure_failure(seed_id: str, reason: str) -> None:
     print(f"[ALERT infrastructure failure] {seed_id}: {reason}",
           file=sys.stderr, flush=True)
+
+
+def finish_infrastructure_failure(db, run_id, seed_id, number, review, usage=None, artifact=None):
+    reason = feedback_from_review(review)
+    finish_attempt(db, run_id, seed_id, number, "infrastructure_error", usage, review, reason, artifact)
+    set_job(db, run_id, seed_id, "infrastructure_blocked", number, reason)
+    alert_infrastructure_failure(seed_id, reason)
 
 
 def _selected(args) -> list[dict]:
@@ -423,39 +414,6 @@ def main(argv: list[str] | None = None) -> int:
                 stopped.set(); thread.join()
 
         with lease_heartbeat():
-            if claim["attempts"] == 0 and existing_harness_trace(seed["id"]):
-                start_attempt(worker_db, run_id, seed["id"], number,
-                              reasoning_stage=stage, reasoning_effort=effort)
-                meta_path = TRACES / "meta" / f"{seed['id']}.json"
-                meta = json.loads(meta_path.read_text())
-                meta.setdefault("teacher", {})["reasoning_stage"] = stage
-                meta_path.write_text(json.dumps(meta, indent=2) + "\n")
-                record_model_call(worker_db, run_id)
-                print(f"[{seed['id']}] existing harness trace: judge", flush=True)
-                review = screen(seed, worker_judge)
-                if is_judge_error(review):
-                    reason = str(review.get("reason") or "judge execution failed")
-                    finish_attempt(worker_db, run_id, seed["id"], number,
-                                   "infrastructure_error", review=review, error=reason)
-                    set_job(worker_db, run_id, seed["id"], "infrastructure_blocked",
-                            claim["attempts"], reason)
-                    alert_infrastructure_failure(seed["id"], reason)
-                    return
-                if is_accepted(review):
-                    artifact = _archive_attempt(run_id, seed["id"], number)
-                    finish_attempt(worker_db, run_id, seed["id"], number, "accepted",
-                                   review=review, artifact_path=artifact)
-                    print(f"[accepted existing trace] {seed['id']}", flush=True)
-                    return
-                artifact = _archive_attempt(run_id, seed["id"], number)
-                reason = feedback_from_review(review)
-                finish_attempt(worker_db, run_id, seed["id"], number,
-                               "retry" if has_more else "exhausted",
-                               review=review, error=reason, artifact_path=artifact)
-                if has_more and retry_order == "tail":
-                    set_job(worker_db, run_id, seed["id"], "deferred", number, reason)
-                print(f"[rejected existing trace] {seed['id']}: {reason}", flush=True)
-                return
             record_model_call(worker_db, run_id)
             start_attempt(worker_db, run_id, seed["id"], number,
                           reasoning_stage=stage, reasoning_effort=effort)
@@ -471,13 +429,8 @@ def main(argv: list[str] | None = None) -> int:
             review = screen(seed, worker_judge)
         if is_judge_error(review):
             artifact = _archive_attempt(run_id, seed["id"], number)
-            reason = str(review.get("reason") or "judge execution failed")
-            finish_attempt(worker_db, run_id, seed["id"], number,
-                           "infrastructure_error", usage, review, reason,
-                           artifact_path=artifact)
-            set_job(worker_db, run_id, seed["id"], "infrastructure_blocked",
-                    claim["attempts"], reason)
-            alert_infrastructure_failure(seed["id"], reason)
+            finish_infrastructure_failure(worker_db, run_id, seed["id"], number,
+                                          review, usage, artifact)
             return
         if is_accepted(review):
             artifact = _archive_attempt(run_id, seed["id"], number)
@@ -512,8 +465,9 @@ def main(argv: list[str] | None = None) -> int:
                 process_claim(worker_db, owner, claim, worker_teacher, worker_judge)
         except BaseException as error:
             if claim is not None:
-                abandon_claim(worker_db, run_id, claim["seed_id"], owner,
-                              f"{type(error).__name__}: {error}")
+                reason = f"{type(error).__name__}: {error}"
+                abandon_claim(worker_db, run_id, claim["seed_id"], owner, reason)
+                alert_infrastructure_failure(claim["seed_id"], reason)
             with error_lock:
                 worker_errors.append(error)
             stop_claiming.set()

@@ -40,9 +40,6 @@ def main() -> int:
         staging = active.with_name(f".active-staging-{uuid.uuid4().hex}")
         (staging / "tasks").mkdir(parents=True)
         shutil.copytree(bundle / "tasks" / "seeds", staging / "tasks" / "seeds")
-        if (bundle / "tasks" / "behavior-seeds").is_dir():
-            shutil.copytree(bundle / "tasks" / "behavior-seeds",
-                            staging / "tasks" / "behavior-seeds")
         if (bundle / "tasks" / "behavior-worlds.json").is_file():
             shutil.copy2(bundle / "tasks" / "behavior-worlds.json",
                          staging / "tasks" / "behavior-worlds.json")
@@ -50,14 +47,7 @@ def main() -> int:
             if (bundle / name).is_file(): shutil.copy2(bundle / name, staging / name)
         try: staging.replace(active)
         except FileExistsError: shutil.rmtree(staging, ignore_errors=True)
-    # An application upgrade can add a new independently versioned seed kind
-    # to an already initialized storage root. Hydrate only the missing kind;
-    # never replace the user's active coding or behavioral corpus.
     (active / "tasks").mkdir(parents=True, exist_ok=True)
-    if not (active / "tasks" / "behavior-seeds").is_dir() and \
-            (bundle / "tasks" / "behavior-seeds").is_dir():
-        shutil.copytree(bundle / "tasks" / "behavior-seeds",
-                        active / "tasks" / "behavior-seeds")
     if not (active / "tasks" / "behavior-worlds.json").is_file() and \
             (bundle / "tasks" / "behavior-worlds.json").is_file():
         shutil.copy2(bundle / "tasks" / "behavior-worlds.json",

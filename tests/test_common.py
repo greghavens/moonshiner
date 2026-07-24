@@ -26,6 +26,12 @@ class ScrubText(unittest.TestCase):
     def test_clean_text_is_unchanged(self):
         self.assertEqual(common.scrub_text("hello world"), "hello world")
 
+    def test_does_not_manufacture_var_tilde_path(self):
+        path = "/var/home/venom/work/file"
+        scrubbed = common.scrub_text(path)
+        self.assertEqual(scrubbed, path)
+        self.assertNotIn("/var~", scrubbed)
+
 
 class Fingerprint(unittest.TestCase):
     def test_stable_and_distinct(self):
@@ -49,13 +55,12 @@ class LoadSeeds(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             corpus = pathlib.Path(directory) / "corpus"
             seeds = corpus / "tasks" / "seeds"
-            behavior = corpus / "tasks" / "behavior-seeds"
             (seeds / "repo-seed").mkdir(parents=True)
-            behavior.mkdir(parents=True)
+            (seeds / "behavior-first").mkdir(parents=True)
             (seeds / "repo-seed" / "task.json").write_text(json.dumps({
                 "id": "repo-seed", "category": "repo"
             }))
-            (behavior / "behavior-first.json").write_text(json.dumps({
+            (seeds / "behavior-first" / "task.json").write_text(json.dumps({
                 "id": "behavior-first", "category": "behavior"
             }))
             (corpus / "SEED_CATALOG.json").write_text(json.dumps({
@@ -68,22 +73,18 @@ class LoadSeeds(unittest.TestCase):
                     "behavior": [{"id": "behavior-first", "program": "Behavior"}],
                 },
             }))
-            with mock.patch.object(common, "SEEDS_DIR", seeds), \
-                    mock.patch.object(common, "BEHAVIOR_SEEDS_DIR", behavior):
+            with mock.patch.object(common, "SEEDS_DIR", seeds):
                 ordered = common.load_seeds(include_holdout=True)
         self.assertEqual([seed["id"] for seed in ordered],
                          ["repo-seed", "behavior-first"])
 
-    def test_single_file_seed_needs_no_repository_fixture_directory(self):
-        self.assertIsNone(common._seed_files({"id": "catalog-seed", "_path": pathlib.Path("seed.json")}))
-
     def test_one_loader_contains_every_seed_once_in_catalog_priority(self):
         self.assertFalse(hasattr(common, "load_behavior_seeds"))
+        self.assertFalse(hasattr(common, "BEHAVIOR_SEEDS_DIR"))
+        self.assertFalse((_ROOT / "tasks" / "behavior-seeds").exists())
         seeds = common.load_seeds(include_holdout=True)
         ids = [seed["id"] for seed in seeds]
         expected = {path.parent.name for path in common.SEEDS_DIR.glob("*/task.json")}
-        expected.update(path.stem for path in common.BEHAVIOR_SEEDS_DIR.glob(
-            "behavior-*.json"))
         self.assertEqual(set(ids), expected)
         self.assertEqual(len(ids), len(set(ids)))
         catalog = json.loads(
@@ -96,11 +97,26 @@ class LoadSeeds(unittest.TestCase):
         observed = [ranks.get(seed["id"], 1_000_000) for seed in seeds]
         self.assertEqual(observed, sorted(observed))
 
+    def test_authored_seed_metadata_is_the_only_loaded_record(self):
+        matches = [seed for seed in common.load_seeds(include_holdout=True)
+                   if seed["id"] == "behavior-dependency-planning-0001"]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["lang"], "English")
+        self.assertNotIn("initial_state", matches[0])
+
+    def test_every_pipeline_consumer_uses_the_same_loader(self):
+        import build_dataset
+        import generate_traces
+        import seed_queue
+        import trace_queue_cli
+        for module in (build_dataset, generate_traces, seed_queue, trace_queue_cli):
+            self.assertIs(module.load_seeds, common.load_seeds)
+
     def test_holdout_excluded_by_default(self):
         seeds = common.load_seeds(include_holdout=True)
         representatives = {
-            next(seed["id"] for seed in seeds if "_dir" in seed),
-            next(seed["id"] for seed in seeds if "_path" in seed),
+            seeds[0]["id"],
+            seeds[-1]["id"],
         }
         with mock.patch.dict(common.CONFIG,
                              {"holdout_tasks": sorted(representatives)}):
@@ -115,7 +131,7 @@ class LoadSeeds(unittest.TestCase):
 
     def test_seeds_carry_one_source_path_and_only_filter(self):
         seeds = common.load_seeds()
-        self.assertTrue(all(("_dir" in seed) != ("_path" in seed) for seed in seeds))
+        self.assertTrue(all("_dir" in seed and "_path" not in seed for seed in seeds))
         pick = common.load_seeds(only={"py-config-merge"})
         self.assertEqual([seed["id"] for seed in pick], ["py-config-merge"])
 

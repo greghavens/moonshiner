@@ -36,7 +36,6 @@ PUBLISH_DIR = DATA / "hf-publish"
 TRACES = PUBLISH_DIR / "traces.jsonl"
 CARD = PUBLISH_DIR / "README.md"
 SEEDS_DIR = ROOT / "tasks" / "seeds"
-CAPABILITY_SEEDS_DIR = ROOT / "tasks" / "behavior-seeds"
 BANNER = PUBLISH_DIR / "moonshiner-dataset-banner.png"
 
 MOONSHINER_URL = "https://github.com/greghavens/moonshiner"
@@ -169,13 +168,13 @@ def _display_model(model_id: str) -> str:
 def _capability_seed_ids() -> set[str]:
     """Identify instruction-following/tool-use trajectories in legacy rows."""
     ids: set[str] = set()
-    for path in CAPABILITY_SEEDS_DIR.glob("*.json"):
+    for path in SEEDS_DIR.glob("*/task.json"):
         try:
-            seed_id = json.loads(path.read_text()).get("id")
+            seed = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        if isinstance(seed_id, str):
-            ids.add(seed_id)
+        if seed.get("kind") == "tool_behavior" and isinstance(seed.get("id"), str):
+            ids.add(seed["id"])
     return ids
 
 

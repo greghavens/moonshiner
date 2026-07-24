@@ -19,4 +19,4 @@ def verdict_accepts(verdict: dict | None) -> bool:
 
 def is_judge_error(review: dict | None) -> bool:
     """Judge execution failures are infrastructure blocks, not rejections."""
-    return bool(review) and review.get(STATUS) == JUDGE_ERROR
+    return bool(review) and (review.get(STATUS) == JUDGE_ERROR or ((review.get("deterministic") or {}).get("gates") or {}).get("setup_ok") is False)

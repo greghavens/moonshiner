@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+#
+# Compare a captured file-service root with an approved manifest, repair drift
+# from local fixtures, and write deterministic chain-of-custody evidence.
+set -u
+
+usage() {
+    printf '%s\n' 'usage: file-integrity --manifest FILE --root DIR --fixtures DIR --quarantine DIR --evidence DIR' >&2
+    exit 64
+}
+
+die() {
+    printf 'file-integrity: %s\n' "$*" >&2
+    exit 1
+}
+
+manifest=
+service_root=
+fixture_root=
+quarantine_root=
+evidence_root=
+
+while (($#)); do
+    case $1 in
+        --manifest|--root|--fixtures|--quarantine|--evidence)
+            (($# >= 2)) || usage
+            case $1 in
+                --manifest) manifest=$2 ;;
+                --root) service_root=$2 ;;
+                --fixtures) fixture_root=$2 ;;
+                --quarantine) quarantine_root=$2 ;;
+                --evidence) evidence_root=$2 ;;
+            esac
+            shift 2
+            ;;
+        *) usage ;;
+    esac
+done
+
+[[ -n $manifest && -n $service_root && -n $fixture_root &&
+   -n $quarantine_root && -n $evidence_root ]] || usage
+[[ -f $manifest && ! -L $manifest ]] || die "manifest is not a regular file"
+[[ -d $service_root && ! -L $service_root ]] || die "service root is not a directory"
+[[ -d $fixture_root && ! -L $fixture_root ]] || die "fixture root is not a directory"
+[[ ! -e $quarantine_root && ! -L $quarantine_root ]] ||
+    die "quarantine destination already exists"
+[[ ! -e $evidence_root && ! -L $evidence_root ]] ||
+    die "evidence destination already exists"
+
+service_root=${service_root%/}
+fixture_root=${fixture_root%/}
+quarantine_root=${quarantine_root%/}
+evidence_root=${evidence_root%/}
+
+valid_relative_path() {
+    local path=$1 component
+    local -a components
+    [[ -n $path && $path != /* && $path != *$'\n'* ]] || return 1
+    IFS=/ read -r -a components <<< "$path"
+    ((${#components[@]} > 0)) || return 1
+    for component in "${components[@]}"; do
+        [[ -n $component && $component != . && $component != .. ]] || return 1
+    done
+}
+
+path_has_symlink_component() {
+    local base=$1 relative=$2 component current
+    local -a components
+    current=$base
+    IFS=/ read -r -a components <<< "$relative"
+    for component in "${components[@]}"; do
+        current=$current/$component
+        [[ ! -L $current ]] || return 0
+    done
+    return 1
+}
+
+file_sha256() {
+    sha256sum -- "$1" | {
+        local digest ignored
+        read -r digest ignored
+        printf '%s' "$digest"
+    }
+}
+
+declare -a paths=() expected_hashes=() expected_uids=() expected_gids=()
+declare -a expected_modes=() quarantine_policies=()
+declare -a observed_hashes=() observed_owners=() observed_modes=() states=()
+declare -A seen=()
+
+line_number=0
+while IFS=$'\t' read -r path expected_hash expected_uid expected_gid expected_mode quarantine_policy extra ||
+      [[ -n ${path:-} ]]; do
+    line_number=$((line_number + 1))
+    [[ -n ${path:-} ]] || die "manifest line $line_number is empty"
+    [[ ${path:0:1} == '#' ]] && continue
+    [[ -z ${extra:-} && -n ${expected_hash:-} && -n ${expected_uid:-} &&
+       -n ${expected_gid:-} && -n ${expected_mode:-} &&
+       -n ${quarantine_policy:-} ]] ||
+        die "malformed manifest line $line_number"
+    valid_relative_path "$path" || die "unsafe path on manifest line $line_number"
+    [[ -z ${seen[$path]+set} ]] || die "duplicate path on manifest line $line_number"
+    seen[$path]=1
+    [[ $expected_hash =~ ^[0-9a-f]{64}$ ]] ||
+        die "invalid SHA-256 on manifest line $line_number"
+    [[ $expected_uid =~ ^[0-9]+$ && $expected_gid =~ ^[0-9]+$ ]] ||
+        die "invalid owner on manifest line $line_number"
+    [[ $expected_mode =~ ^0?[0-7]{3}$ ]] ||
+        die "invalid mode on manifest line $line_number"
+    [[ $quarantine_policy == yes || $quarantine_policy == no ]] ||
+        die "invalid quarantine policy on manifest line $line_number"
+    path_has_symlink_component "$fixture_root" "$path" &&
+        die "fixture path traverses a symlink: $path"
+    [[ -f $fixture_root/$path ]] || die "restore fixture is missing: $path"
+    fixture_hash=$(file_sha256 "$fixture_root/$path") ||
+        die "cannot hash restore fixture: $path"
+    [[ $fixture_hash == "$expected_hash" ]] ||
+        die "restore fixture hash mismatch: $path"
+    path_has_symlink_component "$service_root" "$path" &&
+        die "managed path traverses a symlink: $path"
+    if [[ -e $service_root/$path && ! -f $service_root/$path ]]; then
+        die "managed path is not a regular file: $path"
+    fi
+
+    normalized_mode=$(printf '%03o' "$((8#$expected_mode))") ||
+        die "invalid mode on manifest line $line_number"
+    paths+=("$path")
+    expected_hashes+=("$expected_hash")
+    expected_uids+=("$expected_uid")
+    expected_gids+=("$expected_gid")
+    expected_modes+=("$normalized_mode")
+    quarantine_policies+=("$quarantine_policy")
+done < "$manifest"
+
+((${#paths[@]} > 0)) || die "manifest has no records"
+
+# Capture the complete pre-repair view before creating output or staging paths.
+for ((i=0; i<${#paths[@]}; i++)); do
+    path=${paths[i]}
+    if [[ ! -e $service_root/$path ]]; then
+        observed_hashes[i]=-
+        observed_owners[i]=-
+        observed_modes[i]=-
+        states[i]=missing
+        continue
+    fi
+    observed_hashes[i]=$(file_sha256 "$service_root/$path") ||
+        die "cannot hash managed file: $path"
+    observed_uid=$(stat -c '%u' -- "$service_root/$path") ||
+        die "cannot stat managed file: $path"
+    observed_gid=$(stat -c '%g' -- "$service_root/$path") ||
+        die "cannot stat managed file: $path"
+    observed_owners[i]=$observed_uid:$observed_gid
+    observed_modes[i]=$(stat -c '%a' -- "$service_root/$path") ||
+        die "cannot stat managed file: $path"
+    if [[ ${observed_hashes[i]} != "${expected_hashes[i]}" ]]; then
+        states[i]=content-mismatch
+    elif [[ ${observed_owners[i]} != "${expected_uids[i]}:${expected_gids[i]}" ||
+            ${observed_modes[i]} != "${expected_modes[i]}" ]]; then
+        states[i]=metadata-mismatch
+    else
+        states[i]=ok
+    fi
+done
+
+stage_root=$(mktemp -d "$service_root/.file-integrity.stage.XXXXXX") ||
+    die "cannot create staging directory"
+cleanup_stage() {
+    rm -rf -- "$stage_root"
+}
+trap cleanup_stage EXIT HUP INT TERM
+
+# Stage every possible replacement and validate its installed metadata before
+# any managed file is changed.
+for ((i=0; i<${#paths[@]}; i++)); do
+    [[ ${states[i]} != ok ]] || continue
+    path=${paths[i]}
+    mkdir -p -- "$stage_root/${path%/*}" ||
+        die "cannot create staging parent: $path"
+    cp -- "$fixture_root/$path" "$stage_root/$path" ||
+        die "cannot stage restore fixture: $path"
+    chmod "${expected_modes[i]}" -- "$stage_root/$path" ||
+        die "cannot set staged mode: $path"
+    stage_uid=$(stat -c '%u' -- "$stage_root/$path") || die "cannot stat staged file: $path"
+    stage_gid=$(stat -c '%g' -- "$stage_root/$path") || die "cannot stat staged file: $path"
+    if [[ $stage_uid != "${expected_uids[i]}" || $stage_gid != "${expected_gids[i]}" ]]; then
+        chown "${expected_uids[i]}:${expected_gids[i]}" -- "$stage_root/$path" ||
+            die "cannot set staged owner: $path"
+    fi
+done
+
+mkdir -p -- "$quarantine_root" "$evidence_root" ||
+    die "cannot create output directories"
+audit=$evidence_root/audit.tsv
+ledger=$evidence_root/custody.tsv
+printf 'path\tinitial_state\texpected_sha256\tbefore_sha256\tafter_sha256\texpected_owner\tbefore_owner\tafter_owner\texpected_mode\tbefore_mode\tafter_mode\taction\n' > "$audit" ||
+    die "cannot create audit"
+printf 'sequence\taction\tpath\tbefore_sha256\tafter_sha256\tquarantine_path\tprevious_link\tlink\n' > "$ledger" ||
+    die "cannot create custody ledger"
+
+sequence=0
+previous_link=GENESIS
+repaired=0
+quarantined=0
+verified=0
+
+for ((i=0; i<${#paths[@]}; i++)); do
+    path=${paths[i]}
+    state=${states[i]}
+    action=verified
+    quarantine_path=-
+
+    if [[ $state == ok ]]; then
+        verified=$((verified + 1))
+    else
+        mkdir -p -- "$service_root/${path%/*}" ||
+            die "cannot create managed parent: $path"
+
+        # Retain an authorized present copy before installing its replacement.
+        if [[ ${quarantine_policies[i]} == yes && ${observed_hashes[i]} != - ]]; then
+            quarantine_path=$path.corrupt
+            mkdir -p -- "$quarantine_root/${path%/*}" ||
+                die "cannot create quarantine parent: $path"
+            [[ ! -e $quarantine_root/$quarantine_path &&
+               ! -L $quarantine_root/$quarantine_path ]] ||
+                die "quarantine target already exists: $quarantine_path"
+            mv -- "$service_root/$path" "$quarantine_root/$quarantine_path" ||
+                die "cannot quarantine managed file: $path"
+            mv -- "$stage_root/$path" "$service_root/$path" ||
+                die "cannot install restored file: $path"
+            action=quarantine-restore
+            quarantined=$((quarantined + 1))
+        elif [[ $state == metadata-mismatch ]]; then
+            chmod "${expected_modes[i]}" -- "$service_root/$path" ||
+                die "cannot repair mode: $path"
+            current_uid=$(stat -c '%u' -- "$service_root/$path") ||
+                die "cannot stat managed file: $path"
+            current_gid=$(stat -c '%g' -- "$service_root/$path") ||
+                die "cannot stat managed file: $path"
+            if [[ $current_uid != "${expected_uids[i]}" ||
+                  $current_gid != "${expected_gids[i]}" ]]; then
+                chown "${expected_uids[i]}:${expected_gids[i]}" -- "$service_root/$path" ||
+                    die "cannot repair owner: $path"
+            fi
+            action=metadata-repair
+        else
+            mv -f -- "$stage_root/$path" "$service_root/$path" ||
+                die "cannot install restored file: $path"
+            if [[ $state == missing ]]; then
+                action=create
+            else
+                action=restore
+            fi
+        fi
+        repaired=$((repaired + 1))
+    fi
+
+    after_hash=$(file_sha256 "$service_root/$path") ||
+        die "cannot verify managed file: $path"
+    after_uid=$(stat -c '%u' -- "$service_root/$path") ||
+        die "cannot verify managed owner: $path"
+    after_gid=$(stat -c '%g' -- "$service_root/$path") ||
+        die "cannot verify managed group: $path"
+    after_owner=$after_uid:$after_gid
+    after_mode=$(stat -c '%a' -- "$service_root/$path") ||
+        die "cannot verify managed mode: $path"
+    [[ $after_hash == "${expected_hashes[i]}" &&
+       $after_owner == "${expected_uids[i]}:${expected_gids[i]}" &&
+       $after_mode == "${expected_modes[i]}" ]] ||
+        die "post-repair verification failed: $path"
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$path" "$state" "${expected_hashes[i]}" "${observed_hashes[i]}" \
+        "$after_hash" "${expected_uids[i]}:${expected_gids[i]}" \
+        "${observed_owners[i]}" "$after_owner" "${expected_modes[i]}" \
+        "${observed_modes[i]}" "$after_mode" "$action" >> "$audit" ||
+        die "cannot append audit"
+
+    if [[ $action != verified ]]; then
+        sequence=$((sequence + 1))
+        record=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+            "$sequence" "$action" "$path" "${observed_hashes[i]}" \
+            "$after_hash" "$quarantine_path" "$previous_link")
+        link=$(printf '%s' "$record" | sha256sum)
+        link=${link%% *}
+        printf '%s\t%s\n' "$record" "$link" >> "$ledger" ||
+            die "cannot append custody ledger"
+        previous_link=$link
+    fi
+done
+
+cleanup_stage
+trap - EXIT HUP INT TERM
+printf 'file-integrity: verified=%d repaired=%d quarantined=%d\n' \
+    "$verified" "$repaired" "$quarantined"

@@ -50,26 +50,13 @@ def catalog(seed_dir: Path = SEEDS_DIR) -> tuple[str, dict]:
         task = json.loads(task_path.read_text())
         prompt = " ".join(str(task.get("prompt") or "").split())
         summary = prompt[:197].rstrip() + ("…" if len(prompt) > 197 else "")
-        item = {"id": task["id"], "kind": "coding_repair",
-                "language": task.get("lang") or "unknown",
+        item = {"id": task["id"], "kind": task.get("kind") or "coding_repair",
+                "language": task.get("lang") or (
+                    "English" if task.get("kind") == "tool_behavior" else "unknown"),
+                "world": task.get("world"),
                 "category": task.get("category") or "uncategorized",
                 "training_tags": task.get("training_tags") or task.get("tags") or [],
                 "summary": summary, "verify_command": task.get("verify_cmd")}
-        item["program"] = (program_overrides.get(item["id"])
-                           or task.get("program")
-                           or existing_items.get(item["id"], {}).get("program")
-                           or "Uncategorized")
-        groups[item["category"]].append(item)
-    behavior_dir = seed_dir.parent / "behavior-seeds"
-    for task_path in sorted(behavior_dir.glob("behavior-*.json")):
-        task = json.loads(task_path.read_text())
-        prompt = " ".join(str(task.get("prompt") or "").split())
-        summary = prompt[:197].rstrip() + ("…" if len(prompt) > 197 else "")
-        item = {"id": task["id"], "kind": "tool_behavior",
-                "language": "English", "world": task.get("world"),
-                "category": task.get("category") or "uncategorized",
-                "training_tags": task.get("training_tags") or [],
-                "summary": summary, "verify_command": None}
         item["program"] = (program_overrides.get(item["id"])
                            or task.get("program")
                            or existing_items.get(item["id"], {}).get("program")
@@ -132,10 +119,17 @@ def manifest(seed_dir: Path = SEEDS_DIR, *, version: str | None = None) -> dict:
         "schema_version": 1, "minimum_moonshiner": "0.1.0"}
     if version:
         header["version"] = version
-    entries = []
+    entries, behavior_entries = [], []
     for task in sorted(seed_dir.glob("*/task.json")):
         directory = task.parent
         spec = json.loads(task.read_text())
+        if spec.get("kind") == "tool_behavior":
+            behavior_entries.append({
+                "id": spec["id"], "category": spec.get("category"),
+                "world": spec.get("world"),
+                "fingerprint": hashlib.sha256(task.read_bytes()).hexdigest(),
+                "file": f"{directory.name}/task.json"})
+            continue
         files = {}
         for path in sorted(directory.rglob("*")):
             if path.is_symlink():
@@ -146,13 +140,6 @@ def manifest(seed_dir: Path = SEEDS_DIR, *, version: str | None = None) -> dict:
         entries.append({"id": directory.name, "lang": spec.get("lang"),
                         "category": spec.get("category"), "fingerprint": digest,
                         "files": files})
-    behavior_entries = []
-    for path in sorted((seed_dir.parent / "behavior-seeds").glob("behavior-*.json")):
-        spec = json.loads(path.read_text())
-        behavior_entries.append({"id": spec["id"], "category": spec.get("category"),
-                                 "world": spec.get("world"),
-                                 "fingerprint": hashlib.sha256(path.read_bytes()).hexdigest(),
-                                 "file": path.name})
     worlds = seed_dir.parent / "behavior-worlds.json"
     return {**header, "seed_count": len(entries) + len(behavior_entries),
             "coding_seed_count": len(entries),

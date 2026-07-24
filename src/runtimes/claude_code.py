@@ -24,12 +24,6 @@ from runtimes.base import ReviewResult, Runtime, TraceResult
 REFUSAL_MARKERS = ("model_refusal_no_fallback", "model_refusal")
 READ_ONLY_DISALLOW = "Edit Write NotebookEdit Bash MultiEdit"
 
-def _scrub_env() -> dict:
-    """Drop CLAUDE* variables so the CLI uses its own configured auth."""
-    return {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "LC_ALL", "TERM")
-            if k in os.environ}
-
-
 class ClaudeCodeRuntime(Runtime):
     name = "claude-code"
     trace_formats = ("claude-stream-json",)
@@ -96,7 +90,7 @@ class ClaudeCodeRuntime(Runtime):
         try:
             proc = subprocess.run(cmd, cwd=workspace, input=stdin_text,
                                   capture_output=True, text=True, timeout=timeout,
-                                  env=_scrub_env())
+                                  env=self.teacher_environment(workspace))
             return_code, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
         except subprocess.TimeoutExpired as exc:
             timed_out, return_code = True, None
@@ -194,7 +188,10 @@ class ClaudeCodeRuntime(Runtime):
             proc = subprocess.run(cmd, cwd=workspace, input=prompt,
                                   capture_output=True, text=True,
                                   timeout=int(self.role.get("timeout_s", 1800)),
-                                  env=_scrub_env())
+                                  env={k: os.environ[k]
+                                       for k in ("PATH", "HOME", "LANG",
+                                                 "LC_ALL", "TERM")
+                                       if k in os.environ})
             return_code, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
         except subprocess.TimeoutExpired as exc:
             timed_out, return_code = True, None

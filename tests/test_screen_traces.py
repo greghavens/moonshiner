@@ -72,6 +72,38 @@ class PatchReplay(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(detail, "(empty patch)")
 
+    def test_candidate_replay_does_not_run_reference_setup(self):
+        workspace = self._workspace()
+        subprocess.run(["git", "-c", "user.email=test@example.com", "-c",
+                        "user.name=test", "commit", "-qm", "baseline"],
+                       cwd=workspace, check=True)
+        seed = {
+            "id": "reference-created-helper",
+            "reference_setup": "definitely-missing-reference-command",
+        }
+        patch = ("diff --git a/hello.txt b/hello.txt\n"
+                 "--- a/hello.txt\n+++ b/hello.txt\n"
+                 "@@ -1 +1 @@\n-one\n+new\n")
+        traces = pathlib.Path(tempfile.mkdtemp(prefix="moonshiner-traces-test-"))
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(traces)]))
+        for directory in ("raw", "diffs"):
+            (traces / directory).mkdir(parents=True)
+        (traces / "raw" / "reference-created-helper.jsonl").write_text("{}\n")
+        (traces / "diffs" / "reference-created-helper.patch").write_text(patch)
+        meta = {
+            "raw_path": "raw/reference-created-helper.jsonl",
+            "raw_sha256": scr._sha256_text("{}\n"),
+            "diff_sha256": scr._sha256_text(patch),
+            "teacher": {"model_attested": True},
+        }
+        with mock.patch.object(scr, "materialize", return_value=workspace), \
+             mock.patch.object(scr, "run_verify", return_value=(True, "")), \
+             mock.patch.object(scr, "protected_hashes", return_value={}), \
+             mock.patch.object(scr, "parse_trace", return_value=([], {})):
+            result = scr.deterministic_screen(seed, meta, traces)
+        self.assertTrue(result["gates"]["patch_applies"], result["failures"])
+        self.assertTrue(result["gates"]["verify_double_pass"])
+
 
 class Feedback(unittest.TestCase):
     def test_deterministic_failures_become_bullets(self):

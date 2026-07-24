@@ -12,7 +12,7 @@ from types import SimpleNamespace
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from review_contract import is_accepted, verdict_accepts  # noqa: E402
+from review_contract import is_accepted, is_judge_error, verdict_accepts  # noqa: E402
 import publish_queue  # noqa: E402
 import trace_pipeline  # noqa: E402
 import run_state  # noqa: E402
@@ -42,6 +42,16 @@ class AcceptanceSchemaTests(unittest.TestCase):
         self.assertFalse(is_accepted(
             {"accepted": True, "status": "deterministic_pass"}))
         self.assertTrue(verdict_accepts({"accepted": True, "reason": "ok"}))
+
+    def test_setup_failure_is_infrastructure_not_a_judge_rejection(self):
+        review = {
+            "status": "review_reject",
+            "deterministic": {
+                "gates": {"setup_ok": False},
+                "failures": ["setup failed: DNS unavailable"],
+            },
+        }
+        self.assertTrue(is_judge_error(review))
 
     def test_publisher_discovers_accepted_coding_review(self):
         with tempfile.TemporaryDirectory() as directory:

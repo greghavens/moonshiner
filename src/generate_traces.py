@@ -22,7 +22,7 @@ from pathlib import Path
 
 from common import (TRACES, clear_runtime_caches, git_diff,
                     load_seeds, materialize, protected_hashes, quarantined_tasks,
-                    run_setup, run_verify, scrub_text, seed_fingerprint)
+                    run_verify, scrub_text, seed_fingerprint)
 from runtimes import get_teacher
 from runtimes.availability import ModelUnavailable
 
@@ -71,7 +71,6 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
     best: dict | None = None
     for attempt in range(1, max(1, attempts) + 1):
         workspace = materialize(seed)
-        setup_ok, setup_output = run_setup(seed, workspace)
         protected_before = protected_hashes(seed, workspace)
         try:
             result = teacher.run_trace(
@@ -109,14 +108,14 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
             "id": seed["id"],
             "lang": seed.get("lang"),
             "category": seed.get("category"),
-            "passed": (bool(passed) and protected_intact and setup_ok
+            "passed": (bool(passed) and protected_intact
                        and result.return_code == 0 and not result.timed_out
                        and result.stream_success and not result.error),
             "verify_passed": passed,
             "protected_intact": protected_intact,
             "verify_output": scrub_text(verify_output)[:8000],
-            "setup_ok": setup_ok,
-            "setup_output": scrub_text(setup_output)[:2000],
+            "setup_ok": True,
+            "setup_output": "",
             "attempt": attempt,
             "return_code": result.return_code,
             "timed_out": result.timed_out,

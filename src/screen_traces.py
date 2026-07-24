@@ -31,7 +31,7 @@ import sys
 from pathlib import Path
 
 from common import (ROOT, TRACES, clear_runtime_caches, load_seeds, materialize,
-                    protected_hashes, run_setup, run_verify, scrub_text,
+                    protected_hashes, run_verify, scrub_text,
                     DIFF_EXCLUDE_PATTERNS)
 from canonical_dataset import TRACE_ACTION_BOUNDARY
 from normalize import parse_trace
@@ -261,10 +261,7 @@ def deterministic_screen(seed: dict, meta: dict,
     runtime_caches_removed: list[str] = []
     if gates["diff_fresh"]:
         workspace = materialize(seed, name=f"screen-{seed['id']}")
-        setup_ok, setup_detail = run_setup(seed, workspace)
-        gates["setup_ok"] = setup_ok
-        if not setup_ok:
-            failures.append(f"setup failed: {setup_detail}")
+        gates["setup_ok"] = True
         protected_before = protected_hashes(seed, workspace)
         applied, apply_detail = apply_candidate_patch(workspace, patch)
         gates["patch_applies"] = applied
@@ -489,7 +486,6 @@ def screen(seed: dict, judge=None, *, traces_root: Path | None = None) -> dict:
     raw_path = raw_dir / Path(meta.get("raw_path", f"raw/{seed['id']}.jsonl")).name
     messages, _ = parse_trace(raw_path, meta.get("trace_format", ""), workspace=None)
     workspace = materialize(seed, name=f"review-{seed['id']}")
-    run_setup(seed, workspace)
     apply_candidate_patch(workspace, (diffs_dir / f"{seed['id']}.patch").read_text()
                           if (diffs_dir / f"{seed['id']}.patch").exists() else "")
     try:

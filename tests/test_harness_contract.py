@@ -46,6 +46,9 @@ class HarnessContract(unittest.TestCase):
         teacher.role = {"model": "model", "reasoning": "xhigh"}
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
+            traces = root / "traces"
+            (traces / "meta").mkdir(parents=True)
+            (traces / "raw").mkdir()
             seed_dir = root / "seed"
             seed_dir.mkdir()
             (seed_dir / "task.json").write_text("{}\n")
@@ -53,12 +56,18 @@ class HarnessContract(unittest.TestCase):
                 "id": "seed",
                 "prompt": "Research this exact task, then complete it.",
                 "research": {"required": True},
+                "reference_setup": "definitely-missing-reference-command",
                 "_dir": seed_dir,
             }
             workspace = root / "workspace"
             workspace.mkdir()
-            raw = root / "native.jsonl"
-            raw.write_text("{}\n")
+            old_raw = traces / "raw" / "seed.old.jsonl"
+            old_raw.write_text('{"old":true}\n')
+            (traces / "meta" / "seed.json").write_text(json.dumps({
+                "id": "seed", "passed": True, "trace_format": "native-v1",
+                "raw_path": "traces/raw/seed.old.jsonl"}))
+            raw = traces / "raw" / "seed.events.jsonl"
+            raw.write_text('{"fresh":true}\n')
             teacher.run_trace.return_value = SimpleNamespace(
                 unavailable=None, safeguard_refusal=False, return_code=0,
                 timed_out=False, stream_success=True, error=None,
@@ -68,8 +77,6 @@ class HarnessContract(unittest.TestCase):
                 provenance={})
             with mock.patch.object(generate_traces, "materialize",
                                    return_value=workspace), \
-                 mock.patch.object(generate_traces, "run_setup",
-                                   return_value=(True, "")), \
                  mock.patch.object(generate_traces, "protected_hashes",
                                    return_value={}), \
                  mock.patch.object(generate_traces, "clear_runtime_caches"), \
@@ -77,12 +84,15 @@ class HarnessContract(unittest.TestCase):
                                    return_value=(True, "")), \
                  mock.patch.object(generate_traces, "git_diff",
                                    return_value=""):
-                generate_traces.trace_task(
+                record = generate_traces.trace_task(
                     seed, teacher, force=True,
                     feedback="Judge feedback must not alter the prompt.",
-                    traces_root=root / "traces")
+                    traces_root=traces)
+        teacher.run_trace.assert_called_once()
         self.assertEqual(
             teacher.run_trace.call_args.kwargs["prompt"], seed["prompt"])
+        self.assertEqual(record["raw_sha256"],
+                         generate_traces._sha256('{"fresh":true}\n'))
 
     def test_generic_pipeline_has_no_runtime_specific_dispatch(self):
         source = inspect.getsource(trace_pipeline)
@@ -102,36 +112,11 @@ class HarnessContract(unittest.TestCase):
             with self.subTest(runtime=name):
                 self.assertTrue(runtime.trace_formats)
                 self.assertTrue(callable(runtime.run_trace))
-
-    def test_existing_registered_harness_trace_is_judged_before_retrace(self):
-        with tempfile.TemporaryDirectory() as directory:
-            traces = pathlib.Path(directory) / "traces"
-            (traces / "meta").mkdir(parents=True)
-            (traces / "raw").mkdir()
-            raw = traces / "raw" / "seed.jsonl"
-            raw.write_text("{}\n")
-            (traces / "meta" / "seed.json").write_text(json.dumps({
-                "id": "seed", "passed": True,
-                "trace_format": "codex-exec-events",
-                "raw_path": "traces/raw/seed.jsonl"}))
-            with mock.patch.object(trace_pipeline, "TRACES", traces):
-                self.assertTrue(trace_pipeline.existing_harness_trace("seed"))
-
-    def test_synthetic_or_missing_trace_cannot_take_judge_first_path(self):
-        with tempfile.TemporaryDirectory() as directory:
-            traces = pathlib.Path(directory) / "traces"
-            (traces / "meta").mkdir(parents=True)
-            (traces / "meta" / "seed.json").write_text(json.dumps({
-                "id": "seed", "passed": True,
-                "trace_format": "moonshiner-behavior-openai-v1",
-                "raw_path": "traces/raw/seed.jsonl"}))
-            with mock.patch.object(trace_pipeline, "TRACES", traces):
-                self.assertFalse(trace_pipeline.existing_harness_trace("seed"))
-
-    def test_claim_processor_checks_existing_trace_before_teacher_call(self):
+    def test_claim_processor_has_only_the_forced_native_trace_path(self):
         source = inspect.getsource(trace_pipeline.main)
-        self.assertLess(source.index("existing_harness_trace(seed[\"id\"])") ,
-                        source.index("record = trace_task("))
+        self.assertNotIn("existing_harness_trace", source)
+        self.assertEqual(source.count("record = trace_task("), 1)
+        self.assertIn("record = trace_task(seed, attempt_teacher, force=True", source)
 
 
 if __name__ == "__main__":

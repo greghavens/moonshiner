@@ -22,11 +22,6 @@ from runtimes.base import ReviewResult, Runtime, TraceResult
 
 CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
 
-def _scrub_env() -> dict:
-    """Allowlist non-secret process state; Codex uses its auth file."""
-    return {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "LC_ALL", "TERM")
-            if k in os.environ}
-
 
 class CodexRuntime(Runtime):
     name = "codex"
@@ -92,7 +87,8 @@ class CodexRuntime(Runtime):
         try:
             proc = subprocess.run(
                 cmd, cwd=workspace, input=full_prompt, capture_output=True,
-                text=True, timeout=timeout, env=_scrub_env())
+                text=True, timeout=timeout,
+                env=self.teacher_environment(workspace))
             return_code = proc.returncode
             stdout, stderr = proc.stdout, proc.stderr
         except subprocess.TimeoutExpired as exc:
@@ -199,7 +195,9 @@ class CodexRuntime(Runtime):
             proc = subprocess.run(
                 cmd, cwd=workspace, input=instruction, capture_output=True,
                 text=True, timeout=int(self.role.get("timeout_s", 1800)),
-                env=_scrub_env())
+                env={k: os.environ[k]
+                     for k in ("PATH", "HOME", "LANG", "LC_ALL", "TERM")
+                     if k in os.environ})
             return_code, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
         except subprocess.TimeoutExpired as exc:
             timed_out, return_code = True, None
