@@ -15,7 +15,7 @@ from pathlib import Path
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 
-from common import CONFIG, TRACES, select_seeds
+from common import CONFIG, TRACES, WORKSPACES, select_seeds
 from review_contract import is_accepted, is_judge_error
 from generate_traces import trace_task
 from run_state import (connect, create_run, finish_attempt, set_job,
@@ -74,6 +74,17 @@ def existing_harness_trace(seed_id: str) -> bool:
     if not raw_path.is_absolute():
         raw_path = TRACES.parent / raw_path
     return bool(meta.get("passed") and raw_path.is_file())
+
+
+def remove_accepted_workspace(record: dict) -> None:
+    """Remove only the materialized workspace for a durably accepted attempt."""
+    value = record.get("_workspace_path")
+    if not value:
+        return
+    workspace = Path(str(value))
+    if workspace.resolve().parent != WORKSPACES.resolve():
+        raise ValueError(f"refusing to remove workspace outside {WORKSPACES}: {workspace}")
+    shutil.rmtree(workspace)
 
 
 def _selected(args) -> list[dict]:
@@ -467,6 +478,7 @@ def main(argv: list[str] | None = None) -> int:
             artifact = _archive_attempt(run_id, seed["id"], number)
             finish_attempt(worker_db, run_id, seed["id"], number, "accepted",
                            usage, review, artifact_path=artifact)
+            remove_accepted_workspace(record)
             print(f"[accepted] {seed['id']}", flush=True)
             return
         status = "retry" if has_more else "exhausted"

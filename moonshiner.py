@@ -1044,10 +1044,15 @@ def main(argv: list[str] | None = None) -> int:
     if command == "update":
         return _update(rest)
     if command == "maintenance":
-        if not rest or rest[0] != "prune-hf-history":
-            print("usage: moonshiner maintenance prune-hf-history [--keep N] [--yes]",
+        if not rest or rest[0] not in {
+                "prune-hf-history", "prune-accepted-workspaces"}:
+            print("usage: moonshiner maintenance "
+                  "{prune-hf-history,prune-accepted-workspaces}",
                   file=sys.stderr)
             return 2
+        if rest[0] == "prune-accepted-workspaces":
+            from workspace_maintenance import main as workspace_maintenance_main
+            return workspace_maintenance_main(rest[1:])
         from hf_history_maintenance import main as maintenance_main
         return maintenance_main(rest[1:])
     if command == "inspect":

@@ -146,6 +146,9 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
             },
         }
         _write_meta(meta_path, record)
+        # The workspace is process-local lifecycle state.  Return it to the
+        # queue runner without persisting it in canonical trace metadata.
+        record["_workspace_path"] = str(workspace)
         best = record
         if record["passed"]:
             break

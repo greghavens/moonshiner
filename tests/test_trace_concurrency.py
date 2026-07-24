@@ -74,6 +74,28 @@ class TraceConcurrency(unittest.TestCase):
             self.assertEqual(trace_pipeline._moonshiner_executable(),
                              "/installed/runtime/bin/moonshiner")
 
+    def test_accepted_workspace_is_removed_after_durable_acceptance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspaces = pathlib.Path(directory) / "workspaces"
+            workspace = workspaces / "seed-a"
+            workspace.mkdir(parents=True)
+            (workspace / "large-flat-file").write_text("trace workspace")
+            with mock.patch.object(trace_pipeline, "WORKSPACES", workspaces):
+                trace_pipeline.remove_accepted_workspace(
+                    {"_workspace_path": str(workspace)})
+            self.assertFalse(workspace.exists())
+
+    def test_accepted_workspace_cleanup_refuses_paths_outside_workspace_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            workspaces = root / "workspaces"; workspaces.mkdir()
+            outside = root / "canonical-traces"; outside.mkdir()
+            with mock.patch.object(trace_pipeline, "WORKSPACES", workspaces):
+                with self.assertRaisesRegex(ValueError, "outside"):
+                    trace_pipeline.remove_accepted_workspace(
+                        {"_workspace_path": str(outside)})
+            self.assertTrue(outside.exists())
+
     def test_parallel_claims_are_unique(self):
         claimed = []
         lock = threading.Lock()
