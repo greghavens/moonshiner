@@ -102,7 +102,7 @@ class MixedSchemaMigrationTest(unittest.TestCase):
                 feedback="The prior attempt failed."),
             prompt)
 
-    def test_historical_control_wrapper_marks_entire_trajectory_for_removal(self):
+    def test_migration_preserves_rows_with_historical_control_text(self):
         prompt = "Use the available tools to complete this task."
         wrapped = (
             "TRACE EXECUTION INTEGRITY REMINDER: This task requires consulting "
@@ -112,14 +112,24 @@ class MixedSchemaMigrationTest(unittest.TestCase):
             "=== MOONSHINER TASK BOUNDARY ===\n\n"
             f"{prompt}\n\n"
             "PRIOR ATTEMPT FEEDBACK (address before finishing):\nfailed")
-        row = {"messages": [
-            {"role": "user", "content": wrapped},
-            {"role": "assistant", "content": "Done",
-             "reasoning": "Native reasoning"},
-        ]}
-        self.assertTrue(migration._contains_internal_control(row))
-        messages = normalize_messages(row["messages"])
-        self.assertEqual(messages[0]["content"], wrapped)
+        rows = [
+            {"task": "marked", "lang": "en", "category": "Debugging",
+             "messages": [{"role": "user", "content": wrapped},
+                          {"role": "assistant", "content": "Done"}]},
+            {"task": "clean", "lang": "en", "category": "Debugging",
+             "messages": [{"role": "user", "content": prompt},
+                          {"role": "assistant", "content": "Done"}]},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "traces.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            with mock.patch.object(migration, "CONFIG", {
+                    "build": {"val_frac": 0.0}}):
+                self.assertEqual(migration.migrate(path), (2, 2))
+            migrated = [
+                json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual({row["task"] for row in migrated}, {"marked", "clean"})
+        self.assertIn(wrapped, [row["messages"][0]["content"] for row in migrated])
 
     def test_prior_canonical_revision_is_normalized_as_current(self):
         row = {
