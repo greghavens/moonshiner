@@ -188,9 +188,14 @@ def main(argv=None)->int:
     parser.add_argument("--dataset",default=CONFIG.get("publish",{}).get("hf_dataset")); parser.add_argument("--dir",type=Path,default=DATA/"hf-publish")
     parser.add_argument("--commit-message")
     parser.add_argument("--task", action="append", default=[])
+    parser.add_argument(
+        "--replace", action="store_true",
+        help="Explicitly publish the validated local corpus as the full dataset")
     parser.add_argument("--yes",action="store_true"); args=parser.parse_args(argv)
     if not args.dataset:parser.error("--dataset is required")
     if not args.yes:parser.error("publishing requires --yes")
+    if args.replace and args.task:
+        parser.error("--replace cannot be combined with --task")
     traces=args.dir/"traces.jsonl"
     sync = ensure_local_dataset(target=traces, dataset=args.dataset,
                                 filename=traces.name)
@@ -201,7 +206,8 @@ def main(argv=None)->int:
     state=json.loads(marker.read_text()) if marker.is_file() else {}
     trusted_rows=int(state.get("bootstrap_rows") or 0)
     _verify_trusted_prefix(
-        traces, state, allow_task_replacements=bool(args.task))
+        traces, state,
+        allow_task_replacements=bool(args.task) or args.replace)
     validate(traces,trusted_prefix_rows=trusted_rows)
     mode = publication_format()
     manifest = None

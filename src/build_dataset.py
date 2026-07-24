@@ -174,7 +174,7 @@ def build_row(seed: dict, info: dict,
         [teacher["observed_model"]] if teacher.get("observed_model") else [])
     meta = {
         "task": seed["id"],
-        "lang": seed.get("lang"),
+        "lang": seed.get("lang") or "en",
         "category": seed.get("category"),
         "domain": seed.get("domain") or "agent",
         "passed": info.get("passed"),

@@ -18,6 +18,53 @@ _legacy_enriched = migration._legacy_enriched
 
 
 class MixedSchemaMigrationTest(unittest.TestCase):
+    def test_explicit_preserve_mode_keeps_contaminated_baseline_tasks(self):
+        def row(task, prompt):
+            messages = normalize_messages([
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": "Done"},
+            ])
+            return {
+                "task": task,
+                "source_trajectory_id": task,
+                "source_trajectory_sha256": "a" * 64,
+                "lang": "en",
+                "category": "Building",
+                "domain": "coding",
+                "verifier": "published-baseline",
+                "split": "train",
+                "teacher_runtime": "historical",
+                "teacher_model": None,
+                "reasoning_effort": None,
+                "provider": "historical",
+                "observed_models": [],
+                "model_attested": False,
+                "trace_format": "historical-canonical",
+                "tools_used": [],
+                "derivation": "cumulative-next-assistant-v1",
+                "assistant_step": 1,
+                "assistant_steps": 1,
+                "target_message_index": 1,
+                "original_n_messages": 2,
+                "n_messages": 2,
+                "messages": messages,
+            }
+
+        rows = [
+            row("contaminated", "=== MOONSHINER TASK BOUNDARY ==="),
+            row("clean", "Implement the task"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "traces.jsonl"
+            path.write_text("".join(json.dumps(item) + "\n" for item in rows))
+            self.assertEqual(
+                migration.migrate(path, preserve_contaminated=True), (2, 2))
+            tasks = {
+                json.loads(line)["task"]
+                for line in path.read_text().splitlines()
+            }
+        self.assertEqual(tasks, {"contaminated", "clean"})
+
     def test_current_historical_row_is_scrubbed_during_migration(self):
         messages = normalize_messages([
             {"role": "user", "content": "Use api_key=supersecretvalue"},

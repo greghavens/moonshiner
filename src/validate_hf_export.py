@@ -54,9 +54,9 @@ def validate(path: Path, *, trusted_prefix_rows: int = 0) -> int:
                 raise ValueError(f"line {number}: observed_models must be a list")
         if row["split"] not in {"train", "val"}:
             raise ValueError(f"line {number}: invalid split")
-        if not str(row.get("lang") or "").strip():
+        if not historical and not str(row.get("lang") or "").strip():
             raise ValueError(f"line {number}: lang is empty/null")
-        if not str(row.get("category") or "").strip():
+        if not historical and not str(row.get("category") or "").strip():
             raise ValueError(f"line {number}: category is empty/null")
         if enriched and row.get("derivation") != DERIVATION:
             raise ValueError(f"line {number}: invalid derivation")
@@ -66,8 +66,10 @@ def validate(path: Path, *, trusted_prefix_rows: int = 0) -> int:
             raise ValueError(f"line {number}: messages must be non-empty")
         if any(list(message) != MESSAGE_KEY_ORDER for message in messages):
             raise ValueError(f"line {number}: non-canonical message fields")
-        if any(marker in message["content"]
-               for message in messages for marker in INTERNAL_CONTENT_MARKERS):
+        if (not historical
+                and any(marker in message["content"]
+                        for message in messages
+                        for marker in INTERNAL_CONTENT_MARKERS)):
             raise ValueError(f"line {number}: Moonshiner control text in content")
         if messages[-1].get("role") != "assistant":
             raise ValueError(f"line {number}: target is not final assistant")

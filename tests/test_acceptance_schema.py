@@ -305,6 +305,24 @@ class AcceptanceSchemaTests(unittest.TestCase):
         self.assertEqual(
             error, "Moonshiner-injected prompt content is prohibited")
 
+    def test_instruction_seed_without_language_builds_as_english(self):
+        with tempfile.TemporaryDirectory() as directory:
+            traces = pathlib.Path(directory)
+            (traces / "raw").mkdir()
+            (traces / "raw" / "instruction.jsonl").write_text("{}\n")
+            turns = [
+                {"role": "user", "content": "Plan the change"},
+                {"role": "assistant", "content": "Done"},
+            ]
+            with mock.patch.object(build_dataset, "parse_trace",
+                                   return_value=(turns, {})):
+                row, error = build_dataset.build_row(
+                    {"id": "instruction"},
+                    {"trace_format": "pi-coding-agent-json-v3"},
+                    traces_root=traces)
+        self.assertIsNone(error)
+        self.assertEqual(row["meta"]["lang"], "en")
+
     def test_publisher_subprocess_uses_project_storage_context(self):
         with mock.patch.object(publish_queue.subprocess, "run") as run:
             publish_queue.run("src/build_dataset.py", "--quiet")

@@ -126,8 +126,52 @@ class TaskKeyedExport(unittest.TestCase):
             self.assertIn("changed", {item["messages"][0]["content"] for item in rows})
             self.assertIn("keep", {item["messages"][0]["content"] for item in rows})
 
+    def test_explicit_replace_recovers_from_malformed_existing_mirror(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = pathlib.Path(name)
+            output = root / "traces.jsonl"
+            journal = root / "journal.jsonl"
+            output.write_text("\nnot-json\n")
+            journal.write_text(json.dumps(row("replacement")) + "\n")
+
+            written = export.replace_from_journal(output, journal)
+
+            self.assertEqual(written, 1)
+            self.assertEqual(json.loads(output.read_text())["task"], "replacement")
+
 
 class PublishedDatasetValidation(unittest.TestCase):
+    def test_preserved_historical_control_text_is_allowed_until_replacement(self):
+        with tempfile.TemporaryDirectory() as name:
+            path = pathlib.Path(name) / "traces.jsonl"
+            item = published_row()
+            item["lang"] = None
+            item["messages"][0]["content"] = (
+                "=== MOONSHINER TASK BOUNDARY ===")
+            path.write_text(json.dumps(item) + "\n")
+            with mock.patch.object(migrate_canonical_dataset, "DATA",
+                                   pathlib.Path(name)), \
+                 mock.patch.object(migrate_canonical_dataset, "CONFIG", {
+                     "teacher": {"runtime": "pi", "model": "model",
+                                 "reasoning": "xhigh"},
+                     "runtimes": {"pi": {"provider": "provider"}}}):
+                migrate_canonical_dataset.migrate(
+                    path, preserve_contaminated=True)
+            self.assertEqual(validate_hf_export.validate(path), 1)
+
+            replacement = json.loads(path.read_text())
+            replacement.update({
+                "lang": "python",
+                "verifier": "acceptance-tests+quality-review",
+                "teacher_model": "model",
+                "provider": "provider",
+                "observed_models": ["model"],
+                "model_attested": True,
+            })
+            path.write_text(json.dumps(replacement) + "\n")
+            with self.assertRaisesRegex(ValueError, "control text"):
+                validate_hf_export.validate(path)
+
     def test_rejects_email_in_a_canonical_field_value(self):
         with tempfile.TemporaryDirectory() as name:
             path = pathlib.Path(name) / "traces.jsonl"

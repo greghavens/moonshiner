@@ -184,6 +184,20 @@ def upsert_journal(output: Path, journal: Path) -> tuple[int, int]:
     return len(journal_lines), replaced_rows
 
 
+def replace_from_journal(output: Path, journal: Path) -> int:
+    """Atomically replace the cumulative mirror with the validated journal."""
+    journal_lines = [line for line in journal.read_text().splitlines() if line.strip()]
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pending = output.with_suffix(output.suffix + ".replace.pending")
+    with pending.open("w") as destination:
+        for line in journal_lines:
+            destination.write(line + "\n")
+        destination.flush()
+        os.fsync(destination.fileno())
+    pending.replace(output)
+    return len(journal_lines)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
@@ -191,10 +205,16 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--task", action="append",
                         help="Append only this accepted trajectory (repeatable)")
+    parser.add_argument(
+        "--replace", action="store_true",
+        help="Explicitly replace the cumulative mirror with current accepted traces")
     args = parser.parse_args()
 
     validate_manifest(args.input, args.source)
-    ensure_local_dataset(target=args.output)
+    if args.replace and args.task:
+        parser.error("--replace cannot be combined with --task")
+    if not args.replace:
+        ensure_local_dataset(target=args.output)
     journal_dir = RUNS / "export-journals"
     journal_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -222,7 +242,11 @@ def main() -> None:
         if missing:
             raise ValueError(f"accepted trajectories are not buildable: {sorted(missing)}")
     validate_export(journal)
-    written, replaced = upsert_journal(args.output, journal)
+    if args.replace:
+        written = replace_from_journal(args.output, journal)
+        replaced = 0
+    else:
+        written, replaced = upsert_journal(args.output, journal)
     validation = validate_export(args.output)
     print(f"task-keyed export {args.output}: written={written} replaced={replaced}; "
           f"candidate rows={sum(counts.values())} "

@@ -310,7 +310,9 @@ def _recognized_canonical(rows: list[dict]) -> list[dict] | None:
     return normalized
 
 
-def _migrate_recognized_stream(path: Path) -> tuple[int, int] | None:
+def _migrate_recognized_stream(
+        path: Path, *, preserve_contaminated: bool = False,
+        ) -> tuple[int, int] | None:
     """Normalize large published files in two bounded-memory passes."""
     final: dict[tuple[str, str], tuple[int, str, int]] = {}
     contaminated_tasks: set[str] = set()
@@ -363,7 +365,8 @@ def _migrate_recognized_stream(path: Path) -> tuple[int, int] | None:
             if not line.strip():
                 continue
             row = sanitize_object(json.loads(line))
-            if str(row["task"]) in contaminated_tasks:
+            if (not preserve_contaminated
+                    and str(row["task"]) in contaminated_tasks):
                 continue
             generation = _generation(row)
             if generation == "public":
@@ -387,8 +390,9 @@ def _migrate_recognized_stream(path: Path) -> tuple[int, int] | None:
     return validation["trajectories"], validation["rows"]
 
 
-def migrate(path: Path) -> tuple[int, int]:
-    streamed = _migrate_recognized_stream(path)
+def migrate(path: Path, *, preserve_contaminated: bool = False) -> tuple[int, int]:
+    streamed = _migrate_recognized_stream(
+        path, preserve_contaminated=preserve_contaminated)
     if streamed is not None:
         return streamed
     rows = [sanitize_object(json.loads(line))
@@ -397,7 +401,8 @@ def migrate(path: Path) -> tuple[int, int]:
         raise ValueError("dataset is empty")
     contaminated_tasks = {
         str(row["task"]) for row in rows if _contains_internal_control(row)}
-    rows = [row for row in rows if str(row["task"]) not in contaminated_tasks]
+    if not preserve_contaminated:
+        rows = [row for row in rows if str(row["task"]) not in contaminated_tasks]
     if not rows:
         raise ValueError("dataset contains no uncontaminated trajectories")
     if any("source_trajectory_id" in row or "assistant_step" in row for row in rows):
@@ -445,11 +450,15 @@ def migrate(path: Path) -> tuple[int, int]:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="moonshiner migrate-dataset")
     parser.add_argument("--yes", action="store_true")
+    parser.add_argument(
+        "--preserve-contaminated", action="store_true",
+        help="normalize existing rows without removing contaminated tasks")
     args = parser.parse_args(argv)
     if not args.yes:
         parser.error("migration requires --yes")
     path = migration_path()
-    trajectories, rows = migrate(path)
+    trajectories, rows = migrate(
+        path, preserve_contaminated=args.preserve_contaminated)
     print(f"canonical dataset ready: {trajectories} trajectories, {rows} training rows")
     return 0
 
