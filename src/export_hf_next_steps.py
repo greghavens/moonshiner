@@ -150,7 +150,7 @@ def row_identity(row: dict) -> tuple[str, int]:
     return source_id, step
 
 
-def upsert_journal(output: Path, journal: Path) -> tuple[int, int]:
+def upsert_journal(output: Path, journal: Path) -> tuple[int, int, dict]:
     """Atomically replace rows by their central task identity.
 
     A task has one accepted trajectory. New task IDs append naturally; a new
@@ -180,8 +180,9 @@ def upsert_journal(output: Path, journal: Path) -> tuple[int, int]:
             destination.write(line + "\n")
         destination.flush()
         os.fsync(destination.fileno())
+    validation = validate_export(pending)
     pending.replace(output)
-    return len(journal_lines), replaced_rows
+    return len(journal_lines), replaced_rows, validation
 
 
 def main() -> None:
@@ -222,8 +223,7 @@ def main() -> None:
         if missing:
             raise ValueError(f"accepted trajectories are not buildable: {sorted(missing)}")
     validate_export(journal)
-    written, replaced = upsert_journal(args.output, journal)
-    validation = validate_export(args.output)
+    written, replaced, validation = upsert_journal(args.output, journal)
     print(f"task-keyed export {args.output}: written={written} replaced={replaced}; "
           f"candidate rows={sum(counts.values())} "
           f"({', '.join(f'{key}={value}' for key, value in counts.items())}); "

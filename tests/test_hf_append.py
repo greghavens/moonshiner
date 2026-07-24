@@ -15,8 +15,22 @@ import validate_hf_export  # noqa: E402
 
 
 def row(source="trajectory-a", step=1, content="answer"):
-    return {"task": source, "source_trajectory_id": source, "assistant_step": step,
-            "messages": [{"role": "assistant", "content": content}]}
+    return {
+        "task": source, "source_trajectory_id": source,
+        "source_trajectory_sha256": "a" * 64, "lang": "en",
+        "category": "Tool calling", "domain": "coding",
+        "verifier": "acceptance-tests+quality-review", "split": "train",
+        "teacher_runtime": "pi", "teacher_model": "model",
+        "reasoning_effort": "max", "provider": "provider",
+        "observed_models": ["model"], "model_attested": True,
+        "trace_format": "native", "tools_used": [],
+        "derivation": "cumulative-next-assistant-v1",
+        "assistant_step": step, "assistant_steps": step,
+        "target_message_index": 0, "original_n_messages": 1,
+        "n_messages": 1, "messages": [{
+            "role": "assistant", "content": content, "reasoning_content": "",
+            "tool_calls": [], "tool_call_id": "", "name": ""}],
+    }
 
 
 def published_row(task="trajectory-a", step=1, total=1):
@@ -109,7 +123,7 @@ class TaskKeyedExport(unittest.TestCase):
             root = pathlib.Path(name); output = root / "traces.jsonl"; journal = root / "journal.jsonl"
             old = json.dumps(row()) + "\n"; output.write_text(old)
             journal.write_text(json.dumps(row()) + "\n" + json.dumps(row("trajectory-b")) + "\n")
-            written, replaced = export.upsert_journal(output, journal)
+            written, replaced, _ = export.upsert_journal(output, journal)
             self.assertEqual((written, replaced), (2, 1))
             self.assertEqual(len(output.read_text().splitlines()), 2)
 
@@ -120,13 +134,27 @@ class TaskKeyedExport(unittest.TestCase):
                               json.dumps(row("trajectory-b", content="keep")) + "\n")
             replacement = row(content="changed")
             journal.write_text(json.dumps(replacement) + "\n")
-            written, replaced = export.upsert_journal(output, journal)
+            written, replaced, _ = export.upsert_journal(output, journal)
             self.assertEqual((written, replaced), (1, 1))
             rows = [json.loads(line) for line in output.read_text().splitlines()]
             self.assertEqual({item["source_trajectory_id"] for item in rows},
                              {"trajectory-a", "trajectory-b"})
             self.assertIn("changed", {item["messages"][0]["content"] for item in rows})
             self.assertIn("keep", {item["messages"][0]["content"] for item in rows})
+
+    def test_invalid_replacement_leaves_canonical_bytes_unchanged(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = pathlib.Path(name)
+            output = root / "traces.jsonl"
+            journal = root / "journal.jsonl"
+            output.write_text(json.dumps(row(content="original")) + "\n")
+            original = output.read_bytes()
+            invalid = row(content="invalid")
+            invalid.pop("source_trajectory_sha256")
+            journal.write_text(json.dumps(invalid) + "\n")
+            with self.assertRaisesRegex(ValueError, "non-canonical row fields"):
+                export.upsert_journal(output, journal)
+            self.assertEqual(output.read_bytes(), original)
 
 
 class PublishedDatasetValidation(unittest.TestCase):
