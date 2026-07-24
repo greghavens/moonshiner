@@ -26,10 +26,10 @@ def _privacy_scrub_row(row: dict) -> dict:
 def _advance_baseline(path: Path, validation: dict) -> None:
     publish = CONFIG.get("publish") or {}
     dataset = publish.get("hf_dataset")
-    filename = str(publish.get("filename") or path.name)
     if not dataset:
         return
-    marker_name = hashlib.sha256(f"{dataset}:{filename}".encode()).hexdigest()[:16]
+    marker_name = hashlib.sha256(
+        f"{dataset}:{path.name}".encode()).hexdigest()[:16]
     marker = DATA / "hf-sync" / f"{marker_name}.json"
     if not marker.is_file():
         # A freshly imported dataset has not been bootstrapped by the publisher

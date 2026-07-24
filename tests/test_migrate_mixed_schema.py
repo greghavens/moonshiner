@@ -59,6 +59,30 @@ class MixedSchemaMigrationTest(unittest.TestCase):
         self.assertIn("[REDACTED_SECRET]", json.dumps(migrated))
         self.assertEqual(findings(json.dumps(migrated)), [])
 
+    def test_migration_advances_the_canonical_traces_append_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            path = root / "hf-publish" / "traces.jsonl"
+            path.parent.mkdir()
+            path.write_text("{}\n")
+            marker_name = migration.hashlib.sha256(
+                b"owner/dataset:traces.jsonl").hexdigest()[:16]
+            marker = root / "hf-sync" / f"{marker_name}.json"
+            marker.parent.mkdir()
+            marker.write_text("{}")
+            with mock.patch.object(migration, "DATA", root), \
+                 mock.patch.object(migration, "CONFIG", {
+                     "publish": {
+                         "hf_dataset": "owner/dataset",
+                         "filename": "legacy-name.jsonl",
+                     },
+                 }):
+                migration._advance_baseline(path, {"rows": 1})
+            state = json.loads(marker.read_text())
+            expected_sha256 = migration.sha256(path)
+        self.assertEqual(state["bootstrap_sha256"], expected_sha256)
+        self.assertEqual(state["bootstrap_rows"], 1)
+
     def test_final_serialized_row_is_scrubbed_at_validator_boundary(self):
         row = {"messages": [{
             "content": r'C:\work person@example.com \"quoted\"',
