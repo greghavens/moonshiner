@@ -453,10 +453,20 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--preserve-contaminated", action="store_true",
         help="normalize existing rows without removing contaminated tasks")
+    parser.add_argument(
+        "--restore-pre-normalized", action="store_true",
+        help="restore the retained pre-normalization file before migrating")
     args = parser.parse_args(argv)
     if not args.yes:
         parser.error("migration requires --yes")
     path = migration_path()
+    if args.restore_pre_normalized:
+        backup = path.with_name(path.name + ".pre-normalized")
+        if not backup.is_file():
+            raise ValueError(f"pre-normalization backup is missing: {backup}")
+        pending = path.with_suffix(path.suffix + ".restore.pending")
+        shutil.copy2(backup, pending)
+        pending.replace(path)
     trajectories, rows = migrate(
         path, preserve_contaminated=args.preserve_contaminated)
     print(f"canonical dataset ready: {trajectories} trajectories, {rows} training rows")

@@ -18,6 +18,24 @@ _legacy_enriched = migration._legacy_enriched
 
 
 class MixedSchemaMigrationTest(unittest.TestCase):
+    def test_explicit_restore_uses_retained_pre_normalization_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "traces.jsonl"
+            path.write_text("current\n")
+            path.with_name(path.name + ".pre-normalized").write_text("original\n")
+            with mock.patch.object(migration, "migration_path",
+                                   return_value=path), \
+                 mock.patch.object(migration, "migrate",
+                                   return_value=(2, 3)) as migrate:
+                self.assertEqual(migration.main([
+                    "--restore-pre-normalized",
+                    "--preserve-contaminated",
+                    "--yes",
+                ]), 0)
+            self.assertEqual(path.read_text(), "original\n")
+            migrate.assert_called_once_with(
+                path, preserve_contaminated=True)
+
     def test_explicit_preserve_mode_keeps_contaminated_baseline_tasks(self):
         def row(task, prompt):
             messages = normalize_messages([
