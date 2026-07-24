@@ -130,12 +130,13 @@ class TaskKeyedExport(unittest.TestCase):
     def test_replaces_only_rows_for_the_same_task(self):
         with tempfile.TemporaryDirectory() as name:
             root = pathlib.Path(name); output = root / "traces.jsonl"; journal = root / "journal.jsonl"
-            output.write_text(json.dumps(row(content="old")) + "\n" +
-                              json.dumps(row("trajectory-b", content="keep")) + "\n")
+            untouched = json.dumps(row("trajectory-b", content="keep"))
+            output.write_text(json.dumps(row(content="old")) + "\n" + untouched + "\n")
             replacement = row(content="changed")
             journal.write_text(json.dumps(replacement) + "\n")
             written, replaced, _ = export.upsert_journal(output, journal)
             self.assertEqual((written, replaced), (1, 1))
+            self.assertIn(untouched + "\n", output.read_text())
             rows = [json.loads(line) for line in output.read_text().splitlines()]
             self.assertEqual({item["source_trajectory_id"] for item in rows},
                              {"trajectory-a", "trajectory-b"})

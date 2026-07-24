@@ -69,21 +69,23 @@ def _task_id(row: dict) -> str | None:
     return None
 
 
+def _cumulative_record(row: dict) -> dict | None:
+    step, total = row.get("assistant_step"), row.get("assistant_steps")
+    if (row.get("derivation") != "cumulative-next-assistant-v1"
+            or not isinstance(step, int) or not isinstance(total, int)):
+        return row
+    if step != total:
+        return None
+    return {"messages": row["messages"],
+            "meta": {key: value for key, value in row.items() if key != "messages"}}
+
+
 def _import_prepared(directory: Path, source_slug: str) -> tuple[int, set[str]]:
     output = DATA / "imported" / source_slug / "rows.jsonl"
     output.parent.mkdir(parents=True, exist_ok=True)
-    rows, ids, seen = [], set(), set()
-    if output.exists():
-        for line in output.read_text().splitlines():
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            rows.append(row)
-            meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
-            seen.add(meta.get("import_fingerprint") or
-                     hashlib.sha256(json.dumps(row, sort_keys=True).encode()).hexdigest())
-            ids.add(_task_id(row) or "")
-    for path in sorted(directory.rglob("*.jsonl")):
+    ordinary, cumulative = {}, {}
+    paths = ([output] if output.exists() else []) + sorted(directory.rglob("*.jsonl"))
+    for path in paths:
         # Raw runtime streams are handled as artifacts, not training rows.
         if any(part in {"raw", "reviews", "meta", "diffs"} for part in path.parts):
             continue
@@ -98,21 +100,26 @@ def _import_prepared(directory: Path, source_slug: str) -> tuple[int, set[str]]:
                 continue
             row = _safe_row(value)
             fingerprint = hashlib.sha256(json.dumps(row, sort_keys=True).encode()).hexdigest()
-            if fingerprint in seen:
+            record = _cumulative_record(row)
+            if record is None:
                 continue
-            seen.add(fingerprint)
-            task_id = _task_id(row) or f"imported-{fingerprint[:16]}"
-            meta = row.setdefault("meta", {})
+            task_id = _task_id(record) or f"imported-{fingerprint[:16]}"
+            meta = record.setdefault("meta", {})
             if not isinstance(meta, dict):
                 raise RuntimeError(f"{path}:{lineno}: meta must be an object")
             meta.setdefault("task", task_id)
             meta.setdefault("imported_source", source_slug)
             meta.setdefault("import_fingerprint", fingerprint)
-            rows.append(row)
-            ids.add(task_id)
+            if record is row:
+                ordinary[meta["import_fingerprint"]] = record
+            else:
+                cumulative[task_id] = record
+    rows = [row for row in ordinary.values()
+            if _task_id(row) not in cumulative] + list(cumulative.values())
     payload = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
     output.write_text(payload)
-    ids.discard("")
+    ids = {_task_id(row) for row in rows}
+    ids.discard(None)
     return len(rows), ids
 
 
