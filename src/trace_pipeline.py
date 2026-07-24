@@ -76,8 +76,8 @@ def existing_harness_trace(seed_id: str) -> bool:
     return bool(meta.get("passed") and raw_path.is_file())
 
 
-def remove_accepted_workspace(record: dict) -> None:
-    """Remove only the materialized workspace for a durably accepted attempt."""
+def remove_completed_workspace(record: dict) -> None:
+    """Remove the materialized workspace after durable attempt completion."""
     value = record.get("_workspace_path")
     if not value:
         return
@@ -85,6 +85,11 @@ def remove_accepted_workspace(record: dict) -> None:
     if workspace.resolve().parent != WORKSPACES.resolve():
         raise ValueError(f"refusing to remove workspace outside {WORKSPACES}: {workspace}")
     shutil.rmtree(workspace)
+
+
+def alert_infrastructure_failure(seed_id: str, reason: str) -> None:
+    print(f"[ALERT infrastructure failure] {seed_id}: {reason}",
+          file=sys.stderr, flush=True)
 
 
 def _selected(args) -> list[dict]:
@@ -389,14 +394,13 @@ def main(argv: list[str] | None = None) -> int:
         if synthetic:
             set_job(worker_db, run_id, seed["id"], "infrastructure_blocked",
                     claim["attempts"], synthetic)
-            print(f"[infrastructure blocked] {seed['id']}: {synthetic}", flush=True)
+            alert_infrastructure_failure(seed["id"], synthetic)
             return
         environment_ok, environment_detail = preflight_seed_environment(seed)
         if not environment_ok:
             set_job(worker_db, run_id, seed["id"], "infrastructure_blocked",
                     claim["attempts"], environment_detail)
-            print(f"[infrastructure blocked] {seed['id']}: {environment_detail}",
-                  flush=True)
+            alert_infrastructure_failure(seed["id"], environment_detail)
             return
         @contextmanager
         def lease_heartbeat():
@@ -435,6 +439,7 @@ def main(argv: list[str] | None = None) -> int:
                                    "infrastructure_error", review=review, error=reason)
                     set_job(worker_db, run_id, seed["id"], "infrastructure_blocked",
                             claim["attempts"], reason)
+                    alert_infrastructure_failure(seed["id"], reason)
                     return
                 if is_accepted(review):
                     artifact = _archive_attempt(run_id, seed["id"], number)
@@ -472,13 +477,13 @@ def main(argv: list[str] | None = None) -> int:
                            artifact_path=artifact)
             set_job(worker_db, run_id, seed["id"], "infrastructure_blocked",
                     claim["attempts"], reason)
-            print(f"[infrastructure blocked] {seed['id']}: {reason}", flush=True)
+            alert_infrastructure_failure(seed["id"], reason)
             return
         if is_accepted(review):
             artifact = _archive_attempt(run_id, seed["id"], number)
             finish_attempt(worker_db, run_id, seed["id"], number, "accepted",
                            usage, review, artifact_path=artifact)
-            remove_accepted_workspace(record)
+            remove_completed_workspace(record)
             print(f"[accepted] {seed['id']}", flush=True)
             return
         status = "retry" if has_more else "exhausted"
@@ -486,6 +491,7 @@ def main(argv: list[str] | None = None) -> int:
         reason = feedback_from_review(review)
         finish_attempt(worker_db, run_id, seed["id"], number, status, usage,
                        review, reason, artifact_path=artifact)
+        remove_completed_workspace(record)
         if status == "retry" and retry_order == "tail":
             set_job(worker_db, run_id, seed["id"], "deferred", number, reason)
             status = "deferred"

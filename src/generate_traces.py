@@ -81,16 +81,19 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
         except ModelUnavailable as blocked:
             record = _deferral(seed, prompt, teacher, "unavailable", str(blocked))
             _write_meta(meta_path, record)
+            record["_workspace_path"] = str(workspace)
             return record
 
         if result.unavailable:
             record = _deferral(seed, prompt, teacher, "unavailable", result.unavailable)
             _write_meta(meta_path, record)
+            record["_workspace_path"] = str(workspace)
             return record
         if result.safeguard_refusal:
             record = _deferral(seed, prompt, teacher, "safeguard_refusal",
                                "teacher issued a safeguard refusal")
             _write_meta(meta_path, record)
+            record["_workspace_path"] = str(workspace)
             return record
 
         clear_runtime_caches(workspace)

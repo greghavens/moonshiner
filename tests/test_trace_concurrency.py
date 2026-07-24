@@ -8,6 +8,8 @@ import threading
 import unittest
 import sqlite3
 import fcntl
+import inspect
+import io
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -74,14 +76,14 @@ class TraceConcurrency(unittest.TestCase):
             self.assertEqual(trace_pipeline._moonshiner_executable(),
                              "/installed/runtime/bin/moonshiner")
 
-    def test_accepted_workspace_is_removed_after_durable_acceptance(self):
+    def test_completed_workspace_is_removed_after_durable_attempt(self):
         with tempfile.TemporaryDirectory() as directory:
             workspaces = pathlib.Path(directory) / "workspaces"
             workspace = workspaces / "seed-a"
             workspace.mkdir(parents=True)
             (workspace / "large-flat-file").write_text("trace workspace")
             with mock.patch.object(trace_pipeline, "WORKSPACES", workspaces):
-                trace_pipeline.remove_accepted_workspace(
+                trace_pipeline.remove_completed_workspace(
                     {"_workspace_path": str(workspace)})
             self.assertFalse(workspace.exists())
 
@@ -92,9 +94,21 @@ class TraceConcurrency(unittest.TestCase):
             outside = root / "canonical-traces"; outside.mkdir()
             with mock.patch.object(trace_pipeline, "WORKSPACES", workspaces):
                 with self.assertRaisesRegex(ValueError, "outside"):
-                    trace_pipeline.remove_accepted_workspace(
+                    trace_pipeline.remove_completed_workspace(
                         {"_workspace_path": str(outside)})
             self.assertTrue(outside.exists())
+
+    def test_every_completed_generated_attempt_path_removes_its_workspace(self):
+        source = inspect.getsource(trace_pipeline.main)
+        generated = source[source.index("record = trace_task("):]
+        self.assertEqual(generated.count("remove_completed_workspace(record)"), 2)
+
+    def test_infrastructure_failure_alert_is_immediate_and_high_visibility(self):
+        output = io.StringIO()
+        with mock.patch.object(trace_pipeline.sys, "stderr", output):
+            trace_pipeline.alert_infrastructure_failure("task-a", "disk full")
+        self.assertEqual(output.getvalue(),
+                         "[ALERT infrastructure failure] task-a: disk full\n")
 
     def test_parallel_claims_are_unique(self):
         claimed = []

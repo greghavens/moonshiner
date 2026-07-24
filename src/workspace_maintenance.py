@@ -46,8 +46,9 @@ def prune_old(workspaces: Path = WORKSPACES) -> tuple[int, int]:
     try:
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         active = {str(row[0]) for row in db.execute(
-            "SELECT seed_id FROM jobs WHERE status='running' "
-            "AND lease_expires_at IS NOT NULL AND lease_expires_at>?", (now,))}
+            "SELECT seed_id FROM jobs WHERE status='infrastructure_blocked' OR "
+            "(status='running' AND lease_expires_at IS NOT NULL "
+            "AND lease_expires_at>?)", (now,))}
     finally:
         db.close()
     removed = 0
