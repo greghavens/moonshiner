@@ -128,6 +128,23 @@ class TaskKeyedExport(unittest.TestCase):
 
 
 class PublishedDatasetValidation(unittest.TestCase):
+    def test_rejects_email_in_a_canonical_field_value(self):
+        with tempfile.TemporaryDirectory() as name:
+            path = pathlib.Path(name) / "traces.jsonl"
+            path.write_text(json.dumps(published_row()) + "\n")
+            with mock.patch.object(migrate_canonical_dataset, "DATA",
+                                   pathlib.Path(name)), \
+                 mock.patch.object(migrate_canonical_dataset, "CONFIG", {
+                     "teacher": {"runtime": "pi", "model": "model",
+                                 "reasoning": "xhigh"},
+                     "runtimes": {"pi": {"provider": "provider"}}}):
+                migrate_canonical_dataset.migrate(path)
+            item = json.loads(path.read_text())
+            item["messages"][0]["content"] = "Contact person@example.com"
+            path.write_text(json.dumps(item) + "\n")
+            with self.assertRaisesRegex(ValueError, "email address"):
+                validate_hf_export.validate(path)
+
     def test_rejects_legacy_public_schema_until_normalized(self):
         with tempfile.TemporaryDirectory() as name:
             path = pathlib.Path(name) / "traces.jsonl"

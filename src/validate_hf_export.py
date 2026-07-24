@@ -16,7 +16,7 @@ from pathlib import Path
 
 from common import ROOT, _staged_secret_values, provider_key_env_names
 from canonical_dataset import INTERNAL_CONTENT_MARKERS, MESSAGE_KEY_ORDER
-from privacy import findings
+from privacy import object_findings
 from expand_next_steps import DERIVATION
 from export_hf_next_steps import DEFAULT_OUTPUT, PUBLISH_KEY_ORDER
 
@@ -82,12 +82,13 @@ def validate(path: Path, *, trusted_prefix_rows: int = 0) -> int:
         source_hash = row.get("source_trajectory_sha256")
         if enriched and (not isinstance(source_hash, str) or len(source_hash) != 64):
             raise ValueError(f"line {number}: invalid source trajectory hash")
-        serialized = json.dumps(row, ensure_ascii=False)
         if number > trusted_prefix_rows:
-            privacy_hits = findings(serialized, exact_secrets=_staged_secret_values(),
-                                    forbidden_paths=forbidden_paths)
+            privacy_hits = object_findings(
+                row, exact_secrets=_staged_secret_values(),
+                forbidden_paths=forbidden_paths)
             if privacy_hits:
                 raise ValueError(f"line {number}: privacy findings: {privacy_hits}")
+            serialized = json.dumps(row, ensure_ascii=False)
             if any(marker in serialized for marker in FORBIDDEN_SUBSTRINGS):
                 raise ValueError(f"line {number}: private harness material")
 

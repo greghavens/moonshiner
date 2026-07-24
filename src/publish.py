@@ -227,7 +227,19 @@ def main(argv=None)->int:
         if path.is_symlink():
             raise ValueError(f"upload artifact is a prohibited symlink: {path}")
     for path in privacy_scan_files(args.dir):
-        hits=findings(path.read_text(errors="replace"),exact_secrets=_staged_secret_values(),forbidden_paths=(str(ROOT),str(Path.home())))
+        if path.suffix == ".jsonl":
+            from privacy import object_findings
+            hits = []
+            with path.open() as handle:
+                for line in handle:
+                    if line.strip():
+                        hits.extend(object_findings(
+                            json.loads(line),
+                            exact_secrets=_staged_secret_values(),
+                            forbidden_paths=(str(ROOT), str(Path.home()))))
+            hits = sorted(set(hits))
+        else:
+            hits=findings(path.read_text(errors="replace"),exact_secrets=_staged_secret_values(),forbidden_paths=(str(ROOT),str(Path.home())))
         if hits:raise ValueError(f"{path}: privacy findings {hits}")
     private=bool(CONFIG.get("publish",{}).get("private",True))
     auth_token = token()

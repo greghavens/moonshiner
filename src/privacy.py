@@ -42,6 +42,29 @@ def findings(text: str, *, exact_secrets: Iterable[str] = (), forbidden_paths=()
     if len(host) >= 4 and host in text: hits.append("host name")
     return sorted(set(hits))
 
+def object_findings(value, *, exact_secrets: Iterable[str] = (),
+                    forbidden_paths=()):
+    hits = []
+    if isinstance(value, str):
+        hits.extend(findings(
+            value, exact_secrets=exact_secrets,
+            forbidden_paths=forbidden_paths))
+    elif isinstance(value, list):
+        for item in value:
+            hits.extend(object_findings(
+                item, exact_secrets=exact_secrets,
+                forbidden_paths=forbidden_paths))
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str):
+                hits.extend(findings(
+                    key, exact_secrets=exact_secrets,
+                    forbidden_paths=forbidden_paths))
+            hits.extend(object_findings(
+                item, exact_secrets=exact_secrets,
+                forbidden_paths=forbidden_paths))
+    return sorted(set(hits))
+
 def sanitize_object(value, *, exact_secrets: Iterable[str] = ()):
     if isinstance(value, str): return redact(value, exact_secrets=exact_secrets)[0]
     if isinstance(value, list): return [sanitize_object(v, exact_secrets=exact_secrets) for v in value]

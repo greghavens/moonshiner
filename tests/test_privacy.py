@@ -8,7 +8,7 @@ from unittest import mock
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from privacy import findings, redact, sanitize_object
+from privacy import findings, object_findings, redact, sanitize_object
 
 
 class Privacy(unittest.TestCase):
@@ -33,6 +33,13 @@ class Privacy(unittest.TestCase):
         text = "contact person@example.com\n-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----"
         self.assertIn("credential pattern", findings(text))
         self.assertIn("email address", findings(text))
+
+    def test_object_findings_checks_values_without_json_escape_boundaries(self):
+        clean = {"messages": [{"content": r'C:\work \"quoted\"'}]}
+        self.assertEqual(object_findings(clean), [])
+        self.assertIn(
+            "email address",
+            object_findings({"messages": [{"content": "person@example.com"}]}))
 
 
 if __name__ == "__main__":
