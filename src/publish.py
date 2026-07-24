@@ -184,10 +184,9 @@ def _verify_trusted_prefix(traces: Path, state: dict, *,
         raise RuntimeError("local HF prefix differs from downloaded append baseline")
 
 
-def merge_task_replacements(remote: Path, local: Path, output: Path,
-                            requested: set[str]) -> tuple[int, int]:
-    """Replace exact task rows while copying every unrelated remote byte."""
-    replacements = output.with_suffix(output.suffix + ".replacements")
+def validated_task_replacements(local: Path,
+                                requested: set[str]) -> list[bytes]:
+    """Return the exact requested rows after strict replacement validation."""
     lines = []
     with local.open("rb") as source:
         for line in source:
@@ -196,9 +195,20 @@ def merge_task_replacements(remote: Path, local: Path, output: Path,
     found = {json.loads(line).get("task") for line in lines}
     if found != requested:
         raise ValueError("not every requested task has replacement rows")
+    replacements = local.with_suffix(local.suffix + ".replacements")
     replacements.write_bytes(b"".join(lines))
     try:
         validate(replacements)
+    finally:
+        replacements.unlink(missing_ok=True)
+    return lines
+
+
+def merge_task_replacements(remote: Path, local: Path, output: Path,
+                            requested: set[str]) -> tuple[int, int]:
+    """Replace exact task rows while copying every unrelated remote byte."""
+    lines = validated_task_replacements(local, requested)
+    try:
         replaced = 0
         with remote.open("rb") as source, output.open("wb") as destination:
             for line in source:
@@ -210,8 +220,9 @@ def merge_task_replacements(remote: Path, local: Path, output: Path,
                 destination.write(line if line.endswith(b"\n") else line + b"\n")
             destination.flush()
             os.fsync(destination.fileno())
-    finally:
-        replacements.unlink(missing_ok=True)
+    except BaseException:
+        output.unlink(missing_ok=True)
+        raise
     return len(lines), replaced
 
 
@@ -239,18 +250,26 @@ def main(argv=None)->int:
         revision = info.get("sha")
         if not revision:
             raise RuntimeError("cannot resolve the current remote revision")
-        remote = traces.with_suffix(".remote.jsonl")
-        remote.unlink(missing_ok=True)
-        _download(args.dataset, revision, traces.name, remote)
-        pending = traces.with_suffix(".remote-merge.pending")
-        merge_task_replacements(remote, traces, pending, set(args.task))
-        pending.replace(traces)
-        remote.unlink()
+        remote_files = {
+            item.get("rfilename") for item in info.get("siblings", [])
+        }
+        task_jsonl = traces.name in remote_files
+        if task_jsonl:
+            remote = traces.with_suffix(".remote.jsonl")
+            remote.unlink(missing_ok=True)
+            _download(args.dataset, revision, traces.name, remote)
+            pending = traces.with_suffix(".remote-merge.pending")
+            merge_task_replacements(remote, traces, pending, set(args.task))
+            pending.replace(traces)
+            remote.unlink()
+        else:
+            validated_task_replacements(traces, set(args.task))
     else:
+        task_jsonl = False
         validate(traces,trusted_prefix_rows=trusted_rows)
     mode = publication_format()
     manifest = None
-    if mode == "parquet-shards" and not args.task:
+    if mode == "parquet-shards":
         manifest = sync_parquet(
             traces, args.dir, changed_tasks=set(args.task),
             trajectories_per_shard=int((CONFIG.get("publish") or {}).get(
@@ -258,7 +277,7 @@ def main(argv=None)->int:
     # The card is derived from the exact cumulative file being uploaded. Build
     # it on every append batch so counts, percentages, and capability mix never
     # become stale.
-    if args.dir == DATA/"hf-publish" and not args.task:
+    if args.dir == DATA/"hf-publish" and not task_jsonl:
         from export_hf_card import main as render_card
         render_card()
     card = args.dir / "README.md"
@@ -267,7 +286,7 @@ def main(argv=None)->int:
             configure_viewer_card(card, manifest["active_shards"])
         elif mode == "jsonl-hf-parquet":
             configure_viewer_card(card, "traces.jsonl")
-    files = [traces] if args.task else publication_files(args.dir, mode)
+    files = [traces] if task_jsonl else publication_files(args.dir, mode)
     for path in files:
         if path.is_symlink():
             raise ValueError(f"upload artifact is a prohibited symlink: {path}")
@@ -308,6 +327,6 @@ def main(argv=None)->int:
     api.create_commit(
         repo_id=args.dataset, repo_type="dataset", operations=operations,
         commit_message=args.commit_message or "Publish validated Moonshiner dataset")
-    if card.is_file() and not args.task:
+    if card.is_file() and card in files:
         _verify_remote_card(args.dataset, card, auth_token)
     print(f"published validated dataset -> {args.dataset}");return 0
