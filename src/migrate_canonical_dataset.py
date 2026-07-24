@@ -102,8 +102,8 @@ def _historical_canonical(
             "lang": row.get("lang"),
             "category": row.get("category"),
             "domain": row.get("domain", "coding"),
-            "verifier": (row.get("verifier", "acceptance-tests+quality-review")
-                         if attested else "published-baseline"),
+            "verifier": row.get(
+                "verifier", "acceptance-tests+quality-review"),
             "split": row["split"],
             "teacher_runtime": runtime,
             "teacher_model": model,
@@ -160,7 +160,6 @@ def _legacy_public(
             "lang": row.get("lang"),
             "category": row.get("category"),
             "domain": "agent",
-            "verifier": "published-baseline",
             "split": row["split"],
             "teacher_runtime": runtime,
             "teacher_model": model,
@@ -417,7 +416,6 @@ def migrate(path: Path) -> tuple[int, int]:
             "task": row["task"], "lang": row.get("lang") or "en",
             "category": row.get("category") or "Other verified work",
             "domain": row.get("domain") or "coding",
-            "verifier": row.get("verifier") or "published-baseline",
             "teacher_runtime": runtime, "teacher_model": row.get("teacher_model"),
             "reasoning_effort": row.get("reasoning_effort"),
             "provider": row.get("provider"),

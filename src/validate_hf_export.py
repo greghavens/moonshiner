@@ -42,16 +42,14 @@ def validate(path: Path, *, trusted_prefix_rows: int = 0) -> int:
         if schema != PUBLISH_KEY_ORDER:
             raise ValueError(f"line {number}: unexpected schema {list(row)}")
         enriched = True
-        historical = row.get("verifier") == "published-baseline"
-        if not historical:
-            if not str(row.get("teacher_model") or "").strip():
-                raise ValueError(f"line {number}: teacher_model is empty")
-            if not str(row.get("provider") or "").strip():
-                raise ValueError(f"line {number}: provider is empty")
-            if row.get("model_attested") is not True:
-                raise ValueError(f"line {number}: teacher model is not attested")
-            if not isinstance(row.get("observed_models"), list):
-                raise ValueError(f"line {number}: observed_models must be a list")
+        if not str(row.get("teacher_model") or "").strip():
+            raise ValueError(f"line {number}: teacher_model is empty")
+        if not str(row.get("provider") or "").strip():
+            raise ValueError(f"line {number}: provider is empty")
+        if row.get("model_attested") is not True:
+            raise ValueError(f"line {number}: teacher model is not attested")
+        if not isinstance(row.get("observed_models"), list):
+            raise ValueError(f"line {number}: observed_models must be a list")
         if row["split"] not in {"train", "val"}:
             raise ValueError(f"line {number}: invalid split")
         if not str(row.get("lang") or "").strip():
