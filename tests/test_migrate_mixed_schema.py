@@ -72,6 +72,8 @@ class MixedSchemaMigrationTest(unittest.TestCase):
             row("contaminated", "=== MOONSHINER TASK BOUNDARY ==="),
             row("clean", "Implement the task"),
         ]
+        rows[0]["verifier"] = "acceptance-tests+quality-review"
+        rows[0]["model_attested"] = True
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "traces.jsonl"
             path.write_text("".join(json.dumps(item) + "\n" for item in rows))
@@ -81,7 +83,14 @@ class MixedSchemaMigrationTest(unittest.TestCase):
                 json.loads(line)["task"]
                 for line in path.read_text().splitlines()
             }
+            migrated = [
+                json.loads(line) for line in path.read_text().splitlines()
+            ]
         self.assertEqual(tasks, {"contaminated", "clean"})
+        contaminated = next(
+            item for item in migrated if item["task"] == "contaminated")
+        self.assertEqual(contaminated["verifier"], "published-baseline")
+        self.assertFalse(contaminated["model_attested"])
 
     def test_current_historical_row_is_scrubbed_during_migration(self):
         messages = normalize_messages([

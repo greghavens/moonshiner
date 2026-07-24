@@ -381,6 +381,10 @@ def _migrate_recognized_stream(
                 source_id = str(row["source_trajectory_id"])
                 normalized = _current_canonical(
                     row, current_hashes.get(source_id) or _source_hash(row))
+            if (preserve_contaminated
+                    and str(row["task"]) in contaminated_tasks):
+                normalized["verifier"] = "published-baseline"
+                normalized["model_attested"] = False
             normalized = _privacy_scrub_row(normalized)
             destination.write(json.dumps(normalized, ensure_ascii=False) + "\n")
         destination.flush()
