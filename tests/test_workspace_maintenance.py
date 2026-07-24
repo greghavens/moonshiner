@@ -30,6 +30,20 @@ class AcceptedWorkspaceMaintenance(unittest.TestCase):
             self.assertFalse(accepted_review.exists())
             self.assertTrue(pending.exists())
 
+    def test_all_old_removes_abandoned_and_preserves_live_leased_workspace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            abandoned = root / "task-a"; abandoned.mkdir()
+            live = root / "task-b"; live.mkdir()
+            db = mock.MagicMock()
+            db.execute.return_value = [("task-b",)]
+            with mock.patch.object(workspace_maintenance, "connect",
+                                   return_value=db):
+                removed, _ = workspace_maintenance.prune_old(root)
+            self.assertEqual(removed, 1)
+            self.assertFalse(abandoned.exists())
+            self.assertTrue(live.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
