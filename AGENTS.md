@@ -111,6 +111,10 @@ These are explicit project-owner requirements and apply to every change:
   product change: test it, commit it, push it, publish a release, install that
   release, and only then run it. Never operate the product from an uncommitted
   checkout, a locally rebuilt unreleased wheel, or source-tree entry points.
+- The operational skill `moonshiner-runner` lives in two places and both must
+  stay in sync: `skills/moonshiner-runner/SKILL.md` (for Codex and other coding
+  agents) and `.claude/skills/moonshiner-runner.md` (for Claude Code). When
+  updating the skill, edit both files.
 - Invoke every Moonshiner product operation through the released `moonshiner`
   command. This includes status, setup, seed authoring, trace generation,
   judging, retracing, formatting, privacy processing, publishing, importing,

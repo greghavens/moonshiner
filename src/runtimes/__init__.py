@@ -44,8 +44,9 @@ def get_runtime(role: str, config: dict | None = None) -> Runtime:
         raise SystemExit(
             f"unknown {role} runtime {name!r}; choose from {runtime_names()}") from None
     runtime = cls(config, role_config)
-    # Pi provider profiles share one adapter but retain distinct configuration
-    # and provenance identities (pi-openrouter, pi-openai, pi-anthropic, ...).
+    # Legacy configs may carry pi-openrouter / pi-zai names; all resolve to the
+    # same PiRuntime class.  Provider, key, and base URL come from the runtime
+    # config block — the name itself has no behavioural effect.
     runtime.name = name
     runtime.runtime_config = config.get("runtimes", {}).get(name, {})
     return runtime

@@ -78,7 +78,7 @@ class FrontDoor(unittest.TestCase):
              mock.patch.object(configuration, "update_local",
                                side_effect=lambda key, value: updates.__setitem__(key, value)):
             profile, runtime = m._configure_pi_provider(config, "pi")
-        self.assertEqual(profile, "pi-zai")
+        self.assertEqual(profile, "pi")
         self.assertEqual(runtime["base_url"], "https://api.z.ai/api/coding/paas/v4")
         self.assertEqual(runtime["key_env"], "ZAI_API_KEY")
         self.assertEqual(runtime["thinking_format"], "zai")

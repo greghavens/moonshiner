@@ -22,9 +22,9 @@ def live_secret_values(extra: Iterable[str] = ()) -> tuple[str, ...]:
     values.extend(v for v in extra if v and len(v) >= 6)
     return tuple(sorted(set(values), key=len, reverse=True))
 
-def redact(text: str, *, exact_secrets: Iterable[str] = (), redact_email=True):
+def _redact(text: str, secret_values: tuple[str, ...], redact_email=True):
     text, count = str(text).replace("\x00", ""), 0
-    for value in live_secret_values(exact_secrets):
+    for value in secret_values:
         n = text.count(value); text = text.replace(value, "[REDACTED_SECRET]"); count += n
     for pattern in SECRET_PATTERNS:
         text, n = pattern.subn("[REDACTED_SECRET]", text); count += n
@@ -32,9 +32,12 @@ def redact(text: str, *, exact_secrets: Iterable[str] = (), redact_email=True):
         text, n = EMAIL_RE.subn("[REDACTED_EMAIL]", text); count += n
     return text, count
 
-def findings(text: str, *, exact_secrets: Iterable[str] = (), forbidden_paths=()):
+def redact(text: str, *, exact_secrets: Iterable[str] = (), redact_email=True):
+    return _redact(text, live_secret_values(exact_secrets), redact_email)
+
+def _findings(text: str, secret_values: tuple[str, ...], forbidden_paths=()):
     hits = []
-    if any(v in text for v in live_secret_values(exact_secrets)): hits.append("live credential value")
+    if any(v in text for v in secret_values): hits.append("live credential value")
     if any(p.search(text) for p in SECRET_PATTERNS): hits.append("credential pattern")
     if EMAIL_RE.search(text): hits.append("email address")
     if any(v and v in text for v in forbidden_paths): hits.append("host path")
@@ -42,37 +45,42 @@ def findings(text: str, *, exact_secrets: Iterable[str] = (), forbidden_paths=()
     if len(host) >= 4 and host in text: hits.append("host name")
     return sorted(set(hits))
 
+def findings(text: str, *, exact_secrets: Iterable[str] = (), forbidden_paths=()):
+    return _findings(
+        text, live_secret_values(exact_secrets), forbidden_paths)
+
 def object_findings(value, *, exact_secrets: Iterable[str] = (),
                     forbidden_paths=()):
+    secret_values = live_secret_values(exact_secrets)
+    return _object_findings(value, secret_values, forbidden_paths)
+
+def _object_findings(value, secret_values, forbidden_paths):
     hits = []
     if isinstance(value, str):
-        hits.extend(findings(
-            value, exact_secrets=exact_secrets,
-            forbidden_paths=forbidden_paths))
+        hits.extend(_findings(value, secret_values, forbidden_paths))
     elif isinstance(value, list):
         for item in value:
-            hits.extend(object_findings(
-                item, exact_secrets=exact_secrets,
-                forbidden_paths=forbidden_paths))
+            hits.extend(_object_findings(
+                item, secret_values, forbidden_paths))
     elif isinstance(value, dict):
         for key, item in value.items():
             if isinstance(key, str):
-                hits.extend(findings(
-                    key, exact_secrets=exact_secrets,
-                    forbidden_paths=forbidden_paths))
-            hits.extend(object_findings(
-                item, exact_secrets=exact_secrets,
-                forbidden_paths=forbidden_paths))
+                hits.extend(_findings(key, secret_values, forbidden_paths))
+            hits.extend(_object_findings(
+                item, secret_values, forbidden_paths))
     return sorted(set(hits))
 
 def sanitize_object(value, *, exact_secrets: Iterable[str] = ()):
-    if isinstance(value, str): return redact(value, exact_secrets=exact_secrets)[0]
-    if isinstance(value, list): return [sanitize_object(v, exact_secrets=exact_secrets) for v in value]
+    return _sanitize_object(value, live_secret_values(exact_secrets))
+
+def _sanitize_object(value, secret_values):
+    if isinstance(value, str): return _redact(value, secret_values)[0]
+    if isinstance(value, list): return [_sanitize_object(v, secret_values) for v in value]
     if isinstance(value, dict):
         return {
-            (redact(k, exact_secrets=exact_secrets)[0]
+            (_redact(k, secret_values)[0]
              if isinstance(k, str) else k):
-            sanitize_object(v, exact_secrets=exact_secrets)
+            _sanitize_object(v, secret_values)
             for k, v in value.items()
         }
     return value

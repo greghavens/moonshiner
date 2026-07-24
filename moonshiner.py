@@ -336,14 +336,12 @@ def _configure_pi_provider(config: dict, current_runtime: str) -> tuple[str, dic
             "api": _ask("Pi API protocol", str(existing.get("api") or "openai-completions")),
             "key_env": _ask("Credential environment variable", str(existing.get("key_env") or provider.upper() + "_API_KEY")),
         }
-    profile = f"pi-{provider}"
     runtime_config = {**config["runtimes"]["pi"], **preset, "provider": provider}
+    from configuration import update_local
     for key, value in runtime_config.items():
-        update_path = f"runtimes.{profile}.{key}"
-        from configuration import update_local
-        update_local(update_path, value)
-    config["runtimes"][profile] = runtime_config
-    return profile, runtime_config
+        update_local(f"runtimes.pi.{key}", value)
+    config["runtimes"]["pi"] = runtime_config
+    return "pi", runtime_config
 
 
 def _setup(argv: list[str] | None = None) -> int:

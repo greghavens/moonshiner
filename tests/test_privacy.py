@@ -41,6 +41,20 @@ class Privacy(unittest.TestCase):
             "email address",
             object_findings({"messages": [{"content": "person@example.com"}]}))
 
+    def test_nested_object_scrub_resolves_live_secrets_once(self):
+        value = {"a": ["one", {"b": "two"}], "c": "three"}
+        with mock.patch("privacy.live_secret_values",
+                        return_value=()) as resolve:
+            sanitize_object(value)
+        resolve.assert_called_once()
+
+    def test_nested_object_validation_resolves_live_secrets_once(self):
+        value = {"a": ["one", {"b": "two"}], "c": "three"}
+        with mock.patch("privacy.live_secret_values",
+                        return_value=()) as resolve:
+            object_findings(value)
+        resolve.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

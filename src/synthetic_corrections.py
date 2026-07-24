@@ -657,7 +657,7 @@ def main(argv: list[str] | None = None) -> int:
         config = load_config()
         judge = config["judge"]
         runtime = input(f"Correction harness [{judge['runtime']}]: ").strip() or judge["runtime"]
-        if runtime == "pi":
+        if runtime.startswith("pi"):
             import moonshiner
             runtime, _ = moonshiner._configure_pi_provider(config, runtime)
             config = load_config()
