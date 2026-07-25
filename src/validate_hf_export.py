@@ -42,6 +42,14 @@ def validate(path: Path, *, trusted_prefix_rows: int = 0,
         schema = list(row)
         if schema != PUBLISH_KEY_ORDER:
             raise ValueError(f"line {number}: unexpected schema {list(row)}")
+        messages = row.get("messages")
+        if not isinstance(messages, list) or not messages:
+            raise ValueError(f"line {number}: messages must be non-empty")
+        if any(list(message) != MESSAGE_KEY_ORDER for message in messages):
+            raise ValueError(f"line {number}: non-canonical message fields")
+        count += 1
+        if tasks is not None and row.get("task") not in tasks:
+            continue
         enriched = True
         if not str(row.get("teacher_model") or "").strip():
             raise ValueError(f"line {number}: teacher_model is empty")
@@ -60,13 +68,7 @@ def validate(path: Path, *, trusted_prefix_rows: int = 0,
         if enriched and row.get("derivation") != DERIVATION:
             raise ValueError(f"line {number}: invalid derivation")
 
-        messages = row.get("messages")
-        if not isinstance(messages, list) or not messages:
-            raise ValueError(f"line {number}: messages must be non-empty")
-        if any(list(message) != MESSAGE_KEY_ORDER for message in messages):
-            raise ValueError(f"line {number}: non-canonical message fields")
-        if (tasks is None or row.get("task") in tasks) and any(
-                marker in message["content"]
+        if any(marker in message["content"]
                 for message in messages for marker in INTERNAL_CONTENT_MARKERS):
             raise ValueError(f"line {number}: Moonshiner control text in content")
         if messages[-1].get("role") != "assistant":
@@ -96,10 +98,8 @@ def validate(path: Path, *, trusted_prefix_rows: int = 0,
         previous_split = split_by_trajectory.setdefault(trajectory, row["split"])
         if previous_split != row["split"]:
             raise ValueError(f"line {number}: trajectory crosses splits")
-        if tasks is None or row.get("task") in tasks:
-            groups.setdefault((row["split"], *trajectory), []).append(
-                (step, total, source_hash, messages, number, enriched))
-        count += 1
+        groups.setdefault((row["split"], *trajectory), []).append(
+            (step, total, source_hash, messages, number, enriched))
 
     if count == 0:
         raise ValueError("export contains no accepted rows")

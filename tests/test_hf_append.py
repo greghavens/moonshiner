@@ -209,6 +209,9 @@ class PublishedDatasetValidation(unittest.TestCase):
             historical = row("historical")
             historical["assistant_steps"] = 2
             historical["messages"][0]["content"] = "MOONSHINER TASK BOUNDARY"
+            historical["model_attested"] = False
+            historical["provider"] = ""
+            historical["lang"] = None
             replacement = row("replacement")
             path.write_text(
                 json.dumps(historical) + "\n" + json.dumps(replacement) + "\n")
