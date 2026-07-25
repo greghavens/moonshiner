@@ -332,10 +332,16 @@ class AcceptanceSchemaTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             data = pathlib.Path(directory)
             (data / "next_step").mkdir()
+            def record(task, **overrides):
+                meta = {"task": task, "teacher_model": "model",
+                        "provider": "provider", "model_attested": True}
+                meta.update(overrides)
+                return {"meta": meta}
             (data / "next_step" / "train.jsonl").write_text(
-                json.dumps({"meta": {"task": "ready-one"}}) + "\n")
+                json.dumps(record("ready-one")) + "\n")
             (data / "next_step" / "val.jsonl").write_text(
-                json.dumps({"meta": {"task": "ready-two"}}) + "\n")
+                json.dumps(record("ready-two")) + "\n"
+                + json.dumps(record("invalid", teacher_model=None)) + "\n")
             with mock.patch.object(publish_queue, "DATA", data):
                 self.assertEqual(publish_queue.built_tasks(),
                                  {"ready-one", "ready-two"})

@@ -129,6 +129,8 @@ def published_tasks(path: Path, max_rows: int | None = None) -> set[str]:
 def built_tasks() -> set[str]:
     """Return trajectories that the formatter actually produced."""
     tasks = set()
+    invalid = set()
+    from trace_provenance import value as provenance
     for split in ("train", "val"):
         path = DATA / "next_step" / f"{split}.jsonl"
         if not path.is_file():
@@ -137,10 +139,15 @@ def built_tasks() -> set[str]:
             for line in handle:
                 if not line.strip():
                     continue
-                task = (json.loads(line).get("meta") or {}).get("task")
-                if isinstance(task, str):
+                record = json.loads(line)
+                task = (record.get("meta") or {}).get("task")
+                if (not provenance(record, "teacher_model")
+                        or not provenance(record, "provider")
+                        or provenance(record, "model_attested") is not True):
+                    invalid.add(task)
+                elif isinstance(task, str):
                     tasks.add(task)
-    return tasks
+    return tasks - invalid
 
 
 def run(*args: str) -> None:
