@@ -212,7 +212,12 @@ def sync(source: Path, root: Path, *, changed_tasks: set[str],
     schema, batches, normalized, canonical_task_counts, schema_changed = _read_rows(
         source, _schema_from_text(stored_schema) if stored_schema else None)
     active_task_counts: dict[str, int] = {}
+    damaged_paths = set()
     for shard in active:
+        path = root / shard["path"]
+        if not path.is_file() or path.stat().st_size != int(shard["bytes"]):
+            damaged_paths.add(shard["path"])
+            continue
         for task in pq.read_table(root / shard["path"], columns=["task"])[
                 "task"].to_pylist():
             task = str(task)
@@ -222,8 +227,11 @@ def sync(source: Path, root: Path, *, changed_tasks: set[str],
         task for task in set(active_task_counts) | set(canonical_task_counts)
         if active_task_counts.get(task, 0) != canonical_task_counts.get(task, 0))
     impacted_paths = {task_to_shard[task]["path"] for task in changed_tasks
-                      if task in task_to_shard}
+                      if task in task_to_shard} | damaged_paths
     rebuild_tasks = set(changed_tasks)
+    for shard in active:
+        if shard["path"] in damaged_paths:
+            rebuild_tasks.update(shard["tasks"])
     if schema_changed:
         missing_from_canonical = set(active_task_counts) - set(canonical_task_counts)
         if missing_from_canonical:

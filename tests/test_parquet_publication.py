@@ -92,6 +92,17 @@ class ParquetPublication(unittest.TestCase):
             self.assertEqual(mtimes, {p: (root / p).stat().st_mtime_ns
                                      for p in second["active_shards"]})
 
+    def test_changed_local_shard_is_rebuilt_from_canonical_json(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = pathlib.Path(name); source = root / "traces.jsonl"
+            rows = [row("task-a"), row("task-b")]
+            self.write_rows(source, rows)
+            first = parquet.sync(source, root, changed_tasks={"task-a", "task-b"})
+            (root / first["active_shards"][0]).write_bytes(b"changed")
+            second = parquet.sync(source, root, changed_tasks=set())
+            self.assertEqual(parquet.read_active_rows(root), rows)
+            self.assertNotEqual(first["active_shards"], second["active_shards"])
+
     def test_new_canonical_task_is_discovered_without_explicit_task_argument(self):
         with tempfile.TemporaryDirectory() as name:
             root = pathlib.Path(name); source = root / "traces.jsonl"
