@@ -531,7 +531,15 @@ def scrub_text(value: str, workspace: str | None = None) -> str:
     value = value.replace("\x00", "")
     if workspace:
         value = value.replace(workspace + "/", "").replace(workspace, ".")
+    from configuration import PROJECT_ROOT
+    if PROJECT_ROOT != ROOT:
+        value = value.replace(str(PROJECT_ROOT), "/repo")
     value = value.replace(str(ROOT), "/repo")
+    home = Path.home()
+    resolved_home = home.resolve()
+    if resolved_home != home:
+        value = value.replace(str(resolved_home), "/home/user")
+    value = value.replace(str(home), "/home/user")
     value = RUNTIME_PATH_RE.sub("/runtime", value)
     static_names = ("ZAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
                     "OPENROUTER_API_KEY", "HF_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")

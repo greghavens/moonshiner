@@ -253,6 +253,10 @@ def main() -> None:
 
     # Prepared rows imported from a pre-Moonshiner directory or Hugging Face
     # dataset were already sanitized and deduplicated by import_existing.
+    # Skip imported rows for tasks that already have a Moonshiner-built trace;
+    # those have full provenance and correct single-trajectory format.
+    built_task_ids = {row["meta"]["task"] for row in rows
+                      if row.get("meta", {}).get("task")}
     imported_seen = {hashlib.sha256(json.dumps(row, sort_keys=True).encode()).hexdigest()
                      for row in rows}
     for imported_path in sorted((DATA / "imported").glob("*/rows.jsonl")):
@@ -260,6 +264,9 @@ def main() -> None:
             if not line.strip():
                 continue
             imported = sanitize_object(json.loads(line))
+            task = (imported.get("meta") or {}).get("task")
+            if task in built_task_ids:
+                continue
             fingerprint = hashlib.sha256(
                 json.dumps(imported, sort_keys=True).encode()).hexdigest()
             if fingerprint in imported_seen:

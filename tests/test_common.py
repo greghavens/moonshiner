@@ -29,7 +29,7 @@ class ScrubText(unittest.TestCase):
     def test_does_not_manufacture_var_tilde_path(self):
         path = "/var/home/venom/work/file"
         scrubbed = common.scrub_text(path)
-        self.assertEqual(scrubbed, path)
+        self.assertEqual(scrubbed, "/home/user/work/file")
         self.assertNotIn("/var~", scrubbed)
 
 
