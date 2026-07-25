@@ -46,6 +46,12 @@ def published_row(task="trajectory-a", step=1, total=1):
 
 
 class LocalFirstBootstrap(unittest.TestCase):
+    def test_headers_use_hugging_face_cli_login(self):
+        with mock.patch.dict(hf_sync.os.environ, {}, clear=True), \
+             mock.patch("huggingface_hub.get_token", return_value="cli-token"):
+            self.assertEqual(
+                hf_sync._headers()["Authorization"], "Bearer cli-token")
+
     def test_download_retries_a_new_revision_until_hf_serves_it(self):
         with tempfile.TemporaryDirectory() as name:
             target = pathlib.Path(name) / "traces.jsonl"

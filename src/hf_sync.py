@@ -28,6 +28,9 @@ def _headers() -> dict:
     headers = {"User-Agent": "moonshiner/0.2"}
     token = os.environ.get("HF_TOKEN", "").strip()
     if not token:
+        from huggingface_hub import get_token
+        token = (get_token() or "").strip()
+    if not token:
         from common import key_file_path, key_persist_path
         runtime = {"provider": "huggingface", "key_env": "HF_TOKEN",
                    "key_file_name": "moonshiner-huggingface-key"}
