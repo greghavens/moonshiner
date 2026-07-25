@@ -11,6 +11,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from huggingface_hub.errors import EntryNotFoundError
 
 from common import CONFIG, DATA, RUNS
 
@@ -123,7 +124,12 @@ def ensure_local_dataset(*, check_remote: bool | None = None,
         if check_remote and revision != state.get("remote_revision"):
             pending = target.with_suffix(target.suffix + ".remote.pending")
             pending.unlink(missing_ok=True)
-            _download(dataset, "main", filename, pending)
+            try:
+                _download(dataset, "main", filename, pending)
+            except EntryNotFoundError:
+                if not target.is_file():
+                    raise
+                return {**state, "status": "remote_unavailable"}
             pending.replace(target)
             with target.open() as handle:
                 rows = sum(1 for _ in handle)

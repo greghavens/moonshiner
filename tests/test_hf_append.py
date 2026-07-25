@@ -138,6 +138,31 @@ class LocalFirstBootstrap(unittest.TestCase):
             self.assertEqual(target.read_text(), "remote\n")
             self.assertEqual(fetch.call_args.args[1], "main")
 
+    def test_remote_missing_keeps_existing_canonical_mirror(self):
+        from huggingface_hub.errors import EntryNotFoundError
+        with tempfile.TemporaryDirectory() as name:
+            root = pathlib.Path(name); target = root / "publish/traces.jsonl"
+            target.parent.mkdir(); target.write_text("canonical\n")
+            config = {"publish": {"hf_dataset": "owner/data",
+                                  "filename": "traces.jsonl"}}
+            info = {"sha": "old", "siblings": [{"rfilename": "traces.jsonl"}]}
+            with mock.patch.object(hf_sync, "CONFIG", config), \
+                 mock.patch.object(hf_sync, "DATA", root), \
+                 mock.patch.object(hf_sync, "RUNS", root / "runs"), \
+                 mock.patch.object(hf_sync, "_dataset_info", return_value=info):
+                hf_sync.ensure_local_dataset(target=target)
+            info["sha"] = "new"
+            with mock.patch.object(hf_sync, "CONFIG", config), \
+                 mock.patch.object(hf_sync, "DATA", root), \
+                 mock.patch.object(hf_sync, "RUNS", root / "runs"), \
+                 mock.patch.object(hf_sync, "_dataset_info", return_value=info), \
+                 mock.patch.object(hf_sync, "_download",
+                                   side_effect=EntryNotFoundError("missing")):
+                result = hf_sync.ensure_local_dataset(
+                    target=target, check_remote=True)
+            self.assertEqual(result["status"], "remote_unavailable")
+            self.assertEqual(target.read_text(), "canonical\n")
+
 
 class TaskKeyedExport(unittest.TestCase):
     def test_legacy_rows_must_be_normalized_before_append(self):
