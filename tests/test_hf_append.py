@@ -130,10 +130,11 @@ class LocalFirstBootstrap(unittest.TestCase):
                                     return_value={"sha": "new", "siblings": [
                                         {"rfilename": "traces.jsonl"}]}),
                   mock.patch.object(hf_sync, "_download",
-                                    side_effect=download)):
+                                    side_effect=download) as fetch):
                 hf_sync.ensure_local_dataset(
                     target=target, check_remote=True)
             self.assertEqual(target.read_text(), "remote\n")
+            self.assertEqual(fetch.call_args.args[1], "main")
 
 
 class TaskKeyedExport(unittest.TestCase):

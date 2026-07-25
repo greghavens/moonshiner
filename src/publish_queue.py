@@ -130,6 +130,8 @@ def built_tasks() -> set[str]:
     """Return trajectories that the formatter actually produced."""
     tasks = set()
     invalid = set()
+    from common import ROOT, _staged_secret_values
+    from privacy import object_findings
     from trace_provenance import value as provenance
     for split in ("train", "val"):
         path = DATA / "next_step" / f"{split}.jsonl"
@@ -143,7 +145,11 @@ def built_tasks() -> set[str]:
                 task = (record.get("meta") or {}).get("task")
                 if (not provenance(record, "teacher_model")
                         or not provenance(record, "provider")
-                        or provenance(record, "model_attested") is not True):
+                        or provenance(record, "model_attested") is not True
+                        or object_findings(
+                            record.get("messages", []),
+                            exact_secrets=_staged_secret_values(),
+                            forbidden_paths=(str(ROOT), str(Path.home())))):
                     invalid.add(task)
                 elif isinstance(task, str):
                     tasks.add(task)

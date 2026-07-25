@@ -133,7 +133,7 @@ def ensure_local_dataset(*, check_remote: bool | None = None,
         if check_remote and revision != state.get("remote_revision"):
             pending = target.with_suffix(target.suffix + ".remote.pending")
             pending.unlink(missing_ok=True)
-            _download(dataset, revision, filename, pending)
+            _download(dataset, "main", filename, pending)
             pending.replace(target)
             with target.open() as handle:
                 rows = sum(1 for _ in handle)

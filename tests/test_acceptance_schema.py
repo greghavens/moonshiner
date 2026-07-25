@@ -341,7 +341,13 @@ class AcceptanceSchemaTests(unittest.TestCase):
                 json.dumps(record("ready-one")) + "\n")
             (data / "next_step" / "val.jsonl").write_text(
                 json.dumps(record("ready-two")) + "\n"
-                + json.dumps(record("invalid", teacher_model=None)) + "\n")
+                + json.dumps(record("invalid", teacher_model=None)) + "\n"
+                + json.dumps({
+                    **record("private"),
+                    "messages": [{
+                        "role": "assistant",
+                        "content": str(publish_queue.ROOT / "secret")}],
+                }) + "\n")
             with mock.patch.object(publish_queue, "DATA", data):
                 self.assertEqual(publish_queue.built_tasks(),
                                  {"ready-one", "ready-two"})
