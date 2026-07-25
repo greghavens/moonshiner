@@ -157,6 +157,7 @@ def upsert_journal(output: Path, journal: Path) -> tuple[int, int, dict]:
     accepted attempt for an existing task replaces only that task's rows. No
     content hash, category rule, or alternate publication path is involved.
     """
+    validation = validate_export(journal)
     journal_lines = [line for line in journal.read_text().splitlines() if line.strip()]
     replacement_tasks = {json.loads(line).get("task") for line in journal_lines}
     if None in replacement_tasks:
@@ -180,7 +181,6 @@ def upsert_journal(output: Path, journal: Path) -> tuple[int, int, dict]:
             destination.write(line + "\n")
         destination.flush()
         os.fsync(destination.fileno())
-    validation = validate_export(pending)
     pending.replace(output)
     return len(journal_lines), replaced_rows, validation
 
@@ -195,7 +195,7 @@ def main() -> None:
     args = parser.parse_args()
 
     validate_manifest(args.input, args.source)
-    ensure_local_dataset(target=args.output)
+    ensure_local_dataset(target=args.output, check_remote=True)
     journal_dir = RUNS / "export-journals"
     journal_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -222,7 +222,6 @@ def main() -> None:
         missing = set(args.task) - selected_tasks
         if missing:
             raise ValueError(f"accepted trajectories are not buildable: {sorted(missing)}")
-    validate_export(journal)
     written, replaced, validation = upsert_journal(args.output, journal)
     print(f"task-keyed export {args.output}: written={written} replaced={replaced}; "
           f"candidate rows={sum(counts.values())} "

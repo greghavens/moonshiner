@@ -28,7 +28,8 @@ FORBIDDEN_SUBSTRINGS = tuple(dict.fromkeys(
     + provider_key_env_names()))
 
 
-def validate(path: Path, *, trusted_prefix_rows: int = 0) -> int:
+def validate(path: Path, *, trusted_prefix_rows: int = 0,
+             tasks: set[str] | None = None) -> int:
     count = 0
     groups: dict = {}
     split_by_trajectory: dict = {}
@@ -94,8 +95,9 @@ def validate(path: Path, *, trusted_prefix_rows: int = 0) -> int:
         previous_split = split_by_trajectory.setdefault(trajectory, row["split"])
         if previous_split != row["split"]:
             raise ValueError(f"line {number}: trajectory crosses splits")
-        groups.setdefault((row["split"], *trajectory), []).append(
-            (step, total, source_hash, messages, number, enriched))
+        if tasks is None or row.get("task") in tasks:
+            groups.setdefault((row["split"], *trajectory), []).append(
+                (step, total, source_hash, messages, number, enriched))
         count += 1
 
     if count == 0:

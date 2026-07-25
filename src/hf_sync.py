@@ -127,9 +127,19 @@ def ensure_local_dataset(*, check_remote: bool | None = None,
         if state.get("dataset") != dataset or state.get("filename") != filename:
             raise RuntimeError("local HF bootstrap belongs to a different configured target")
         if check_remote and revision != state.get("remote_revision"):
-            raise RuntimeError(
-                "configured pre-append check found a newer HF revision; "
-                "explicitly resynchronize before appending")
+            pending = target.with_suffix(target.suffix + ".remote.pending")
+            pending.unlink(missing_ok=True)
+            _download(dataset, revision, filename, pending)
+            pending.replace(target)
+            with target.open() as handle:
+                rows = sum(1 for _ in handle)
+            state.update({
+                "remote_revision": revision,
+                "bootstrap_sha256": sha256(target),
+                "bootstrap_size": target.stat().st_size,
+                "bootstrap_rows": rows,
+            })
+            marker.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
         return {**state, "status": "remote_checked"}
 
     target.parent.mkdir(parents=True, exist_ok=True)

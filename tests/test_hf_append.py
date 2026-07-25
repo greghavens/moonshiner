@@ -90,6 +90,35 @@ class LocalFirstBootstrap(unittest.TestCase):
                 self.assertEqual(fetch.call_count, 1)
                 self.assertEqual(target.read_text(), "remote\n")
 
+    def test_remote_check_refreshes_the_canonical_before_replacement(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = pathlib.Path(name)
+            target = root / "publish" / "traces.jsonl"
+            target.parent.mkdir()
+            target.write_text("stale\n")
+            config = {"publish": {"hf_dataset": "owner/data",
+                                  "filename": "traces.jsonl"}}
+            with (mock.patch.object(hf_sync, "CONFIG", config),
+                  mock.patch.object(hf_sync, "DATA", root),
+                  mock.patch.object(hf_sync, "RUNS", root / "runs"),
+                  mock.patch.object(hf_sync, "_dataset_info",
+                                    return_value={"sha": "old", "siblings": [
+                                        {"rfilename": "traces.jsonl"}]})):
+                hf_sync.ensure_local_dataset(target=target)
+            def download(dataset, revision, filename, destination):
+                destination.write_text("remote\n")
+            with (mock.patch.object(hf_sync, "CONFIG", config),
+                  mock.patch.object(hf_sync, "DATA", root),
+                  mock.patch.object(hf_sync, "RUNS", root / "runs"),
+                  mock.patch.object(hf_sync, "_dataset_info",
+                                    return_value={"sha": "new", "siblings": [
+                                        {"rfilename": "traces.jsonl"}]}),
+                  mock.patch.object(hf_sync, "_download",
+                                    side_effect=download)):
+                hf_sync.ensure_local_dataset(
+                    target=target, check_remote=True)
+            self.assertEqual(target.read_text(), "remote\n")
+
 
 class TaskKeyedExport(unittest.TestCase):
     def test_legacy_rows_must_be_normalized_before_append(self):
@@ -157,8 +186,34 @@ class TaskKeyedExport(unittest.TestCase):
                 export.upsert_journal(output, journal)
             self.assertEqual(output.read_bytes(), original)
 
+    def test_unrelated_historical_sequence_does_not_block_replacement(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = pathlib.Path(name)
+            output = root / "traces.jsonl"
+            journal = root / "journal.jsonl"
+            historical = row("historical")
+            historical["assistant_step"] = 2
+            historical["assistant_steps"] = 2
+            output.write_text(json.dumps(historical) + "\n")
+            journal.write_text(json.dumps(row("replacement")) + "\n")
+            export.upsert_journal(output, journal)
+            rows = [json.loads(line) for line in output.read_text().splitlines()]
+            self.assertEqual({item["task"] for item in rows},
+                             {"historical", "replacement"})
+
 
 class PublishedDatasetValidation(unittest.TestCase):
+    def test_changed_task_validation_ignores_unrelated_incomplete_history(self):
+        with tempfile.TemporaryDirectory() as name:
+            path = pathlib.Path(name) / "traces.jsonl"
+            historical = row("historical")
+            historical["assistant_steps"] = 2
+            replacement = row("replacement")
+            path.write_text(
+                json.dumps(historical) + "\n" + json.dumps(replacement) + "\n")
+            self.assertEqual(
+                validate_hf_export.validate(path, tasks={"replacement"}), 2)
+
     def test_rejects_email_in_a_canonical_field_value(self):
         with tempfile.TemporaryDirectory() as name:
             path = pathlib.Path(name) / "traces.jsonl"

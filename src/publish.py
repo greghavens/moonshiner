@@ -202,7 +202,8 @@ def main(argv=None)->int:
     trusted_rows=int(state.get("bootstrap_rows") or 0)
     _verify_trusted_prefix(
         traces, state, allow_task_replacements=bool(args.task))
-    validate(traces,trusted_prefix_rows=trusted_rows)
+    validate(traces, trusted_prefix_rows=trusted_rows,
+             tasks=set(args.task) or None)
     mode = publication_format()
     manifest = None
     if mode == "parquet-shards":
