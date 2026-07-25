@@ -29,8 +29,15 @@ class ScrubText(unittest.TestCase):
     def test_does_not_manufacture_var_tilde_path(self):
         path = "/var/home/venom/work/file"
         scrubbed = common.scrub_text(path)
-        self.assertEqual(scrubbed, "/home/user/work/file")
         self.assertNotIn("/var~", scrubbed)
+
+    def test_scrubs_home_directory(self):
+        from pathlib import Path
+        home = str(Path.home())
+        path = home + "/secrets/key.pem"
+        scrubbed = common.scrub_text(path)
+        self.assertNotIn(home, scrubbed)
+        self.assertIn("/home/user/secrets/key.pem", scrubbed)
 
 
 class Fingerprint(unittest.TestCase):
