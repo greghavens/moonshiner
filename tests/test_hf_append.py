@@ -1,4 +1,3 @@
-import io
 import json
 import pathlib
 import sys
@@ -52,20 +51,17 @@ class LocalFirstBootstrap(unittest.TestCase):
             self.assertEqual(
                 hf_sync._headers()["Authorization"], "Bearer cli-token")
 
-    def test_download_retries_a_new_revision_until_hf_serves_it(self):
+    def test_download_uses_official_hugging_face_file_transport(self):
         with tempfile.TemporaryDirectory() as name:
-            target = pathlib.Path(name) / "traces.jsonl"
-            pending = hf_sync.urllib.error.HTTPError(
-                "url", 404, "pending", {}, None)
-            with mock.patch.object(
-                    hf_sync.urllib.request, "urlopen",
-                    side_effect=[pending, io.BytesIO(b"ready\n")]) as fetch, \
-                 mock.patch.object(hf_sync.time, "sleep") as sleep:
+            root = pathlib.Path(name)
+            source = root / "source.jsonl"; source.write_text("ready\n")
+            target = root / "traces.jsonl"
+            with mock.patch("huggingface_hub.hf_hub_download",
+                            return_value=str(source)) as fetch:
                 hf_sync._download("owner/data", "revision", "traces.jsonl",
                                   target)
             self.assertEqual(target.read_bytes(), b"ready\n")
-            self.assertEqual(fetch.call_count, 2)
-            sleep.assert_called_once_with(2)
+            fetch.assert_called_once()
 
     def test_dataset_file_detection_uses_remote_siblings(self):
         info = {"siblings": [{"rfilename": "README.md"},

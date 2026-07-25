@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import shutil
-import time
 import uuid
 import urllib.error
 import urllib.parse
@@ -61,26 +60,14 @@ def dataset_has_file(dataset: str, filename: str = "traces.jsonl") -> bool:
         item.get("rfilename") for item in info.get("siblings", [])})
 
 
-def _remote_file_url(dataset: str, revision: str, filename: str) -> str:
-    return ("https://huggingface.co/datasets/" + urllib.parse.quote(dataset, safe="/")
-            + "/resolve/" + urllib.parse.quote(revision, safe="") + "/"
-            + urllib.parse.quote(filename, safe="/") + "?download=true")
-
-
 def _download(dataset: str, revision: str, filename: str, destination: Path) -> None:
+    from huggingface_hub import hf_hub_download
     destination.parent.mkdir(parents=True, exist_ok=True)
-    request = urllib.request.Request(_remote_file_url(dataset, revision, filename),
-                                     headers=_headers())
-    for attempt in range(6):
-        try:
-            with urllib.request.urlopen(request, timeout=120) as response, \
-                    destination.open("xb") as output:
-                shutil.copyfileobj(response, output, length=1024 * 1024)
-            return
-        except urllib.error.HTTPError as error:
-            if error.code != 404 or attempt == 5:
-                raise
-            time.sleep(2)
+    source = hf_hub_download(
+        repo_id=dataset, filename=filename, repo_type="dataset",
+        revision=revision, token=_headers().get("Authorization", "").removeprefix("Bearer "),
+        force_download=True)
+    shutil.copy2(source, destination)
 
 
 def _backfill_baseline(state: dict, marker: Path) -> dict:
