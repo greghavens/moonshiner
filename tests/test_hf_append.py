@@ -208,6 +208,7 @@ class PublishedDatasetValidation(unittest.TestCase):
             path = pathlib.Path(name) / "traces.jsonl"
             historical = row("historical")
             historical["assistant_steps"] = 2
+            historical["messages"][0]["content"] = "MOONSHINER TASK BOUNDARY"
             replacement = row("replacement")
             path.write_text(
                 json.dumps(historical) + "\n" + json.dumps(replacement) + "\n")
