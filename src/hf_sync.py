@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shutil
+import time
 import uuid
 import urllib.error
 import urllib.parse
@@ -67,13 +68,16 @@ def _download(dataset: str, revision: str, filename: str, destination: Path) -> 
     destination.parent.mkdir(parents=True, exist_ok=True)
     request = urllib.request.Request(_remote_file_url(dataset, revision, filename),
                                      headers=_headers())
-    with urllib.request.urlopen(request, timeout=120) as response, \
-            destination.open("xb") as output:
-        while True:
-            block = response.read(1024 * 1024)
-            if not block:
-                break
-            output.write(block)
+    for attempt in range(6):
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response, \
+                    destination.open("xb") as output:
+                shutil.copyfileobj(response, output, length=1024 * 1024)
+            return
+        except urllib.error.HTTPError as error:
+            if error.code != 404 or attempt == 5:
+                raise
+            time.sleep(2)
 
 
 def _backfill_baseline(state: dict, marker: Path) -> dict:

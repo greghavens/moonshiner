@@ -1,3 +1,4 @@
+import io
 import json
 import pathlib
 import sys
@@ -45,6 +46,21 @@ def published_row(task="trajectory-a", step=1, total=1):
 
 
 class LocalFirstBootstrap(unittest.TestCase):
+    def test_download_retries_a_new_revision_until_hf_serves_it(self):
+        with tempfile.TemporaryDirectory() as name:
+            target = pathlib.Path(name) / "traces.jsonl"
+            pending = hf_sync.urllib.error.HTTPError(
+                "url", 404, "pending", {}, None)
+            with mock.patch.object(
+                    hf_sync.urllib.request, "urlopen",
+                    side_effect=[pending, io.BytesIO(b"ready\n")]) as fetch, \
+                 mock.patch.object(hf_sync.time, "sleep") as sleep:
+                hf_sync._download("owner/data", "revision", "traces.jsonl",
+                                  target)
+            self.assertEqual(target.read_bytes(), b"ready\n")
+            self.assertEqual(fetch.call_count, 2)
+            sleep.assert_called_once_with(2)
+
     def test_dataset_file_detection_uses_remote_siblings(self):
         info = {"siblings": [{"rfilename": "README.md"},
                               {"rfilename": "traces.jsonl"}]}
