@@ -263,11 +263,18 @@ def main(argv=None)->int:
             pending.replace(traces)
             remote.unlink()
         else:
-            validated_task_replacements(traces, set(args.task))
+            validate(traces, trusted_prefix_rows=trusted_rows)
     else:
         task_jsonl = False
+        remote_files = set()
         validate(traces,trusted_prefix_rows=trusted_rows)
     mode = publication_format()
+    if (args.task and not task_jsonl and mode == "parquet-shards"
+            and PARQUET_MANIFEST in remote_files
+            and not (args.dir / PARQUET_MANIFEST).is_file()):
+        raise RuntimeError(
+            "task publish without remote traces.jsonl requires the local "
+            "Parquet manifest for the active dataset")
     manifest = None
     if mode == "parquet-shards":
         manifest = sync_parquet(

@@ -124,6 +124,49 @@ class RemoteCardVerification(unittest.TestCase):
                 _verify_trusted_prefix(
                     traces, state, allow_task_replacements=False)
 
+
+    def test_task_publish_without_remote_jsonl_validates_full_export(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            publish_dir = root / "hf-publish"
+            publish_dir.mkdir()
+            traces = publish_dir / "traces.jsonl"
+            valid = replacement_row("requested-task")
+            invalid = replacement_row("unrequested-task")
+            invalid["model_attested"] = False
+            traces.write_text(
+                json.dumps(valid) + "\n" + json.dumps(invalid) + "\n")
+
+            import publish
+            with patch.object(publish, "DATA", root), \
+                 patch.object(publish, "ensure_local_dataset", return_value={}), \
+                 patch.object(publish, "_dataset_info", return_value={
+                     "sha": "remote-revision", "siblings": []}):
+                with self.assertRaisesRegex(ValueError, "teacher model is not attested"):
+                    publish.main([
+                        "--dataset", "owner/data", "--dir", str(publish_dir),
+                        "--task", "requested-task", "--yes"])
+
+    def test_parquet_task_publish_without_jsonl_requires_local_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            publish_dir = root / "hf-publish"
+            publish_dir.mkdir()
+            traces = publish_dir / "traces.jsonl"
+            traces.write_text(json.dumps(replacement_row("requested-task")) + "\n")
+
+            import publish
+            with patch.object(publish, "DATA", root), \
+                 patch.object(publish, "CONFIG", {"publish": {"format": "parquet-shards"}}), \
+                 patch.object(publish, "ensure_local_dataset", return_value={}), \
+                 patch.object(publish, "_dataset_info", return_value={
+                     "sha": "remote-revision",
+                     "siblings": [{"rfilename": "dataset-manifest.json"}]}):
+                with self.assertRaisesRegex(RuntimeError, "requires the local Parquet manifest"):
+                    publish.main([
+                        "--dataset", "owner/data", "--dir", str(publish_dir),
+                        "--task", "requested-task", "--yes"])
+
     def test_all_three_publication_modes_are_explicit_and_model_independent(self):
         for mode in ("jsonl", "jsonl-hf-parquet", "parquet-shards"):
             self.assertEqual(publication_format({
