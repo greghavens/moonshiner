@@ -1,0 +1,167 @@
+diff --git a/migration.go b/migration.go
+--- a/migration.go
++++ b/migration.go
+@@ -2,6 +2,7 @@ package blobrollout
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ )
+ 
+@@ -54,49 +55,126 @@ func (m *Migrator) Run(
+ 		return stats, nil
+ 	}
+ 
+-	// BUG: a restart incorrectly begins at the first page.
+-	cursor := ""
++	cursor := checkpoint.Cursor
+ 	for {
+ 		page, err := m.store.ListPage(ctx, cursor, m.pageSize)
+ 		if err != nil {
+-			return stats, fmt.Errorf("list page: %w", err)
++			return stats, fmt.Errorf("list page at cursor %q: %w", cursor, err)
+ 		}
+ 
+-		complete := page.NextCursor == ""
+-		// BUG: recording the page boundary before its blobs can skip failed work.
+-		if err := m.store.SaveCheckpoint(
++		for _, listed := range page.Blobs {
++			stats.Scanned++
++			current := listed
++			retries := 0
++			for {
++				metadata, changed := backfilledMetadata(current)
++				if !changed {
++					stats.Unchanged++
++					break
++				}
++
++				err := m.store.ReplaceMetadata(
++					ctx,
++					current.Key,
++					current.Version,
++					metadata,
++				)
++				if err == nil {
++					stats.Updated++
++					break
++				}
++				if !errors.Is(err, ErrVersionConflict) {
++					return stats, fmt.Errorf(
++						"replace metadata for %q: %w",
++						current.Key,
++						err,
++					)
++				}
++
++				stats.Conflicts++
++				if retries >= m.maxConflictRetries {
++					return stats, fmt.Errorf(
++						"replace metadata for %q after %d conflict retries: %w",
++						current.Key,
++						retries,
++						err,
++					)
++				}
++				retries++
++				current, err = m.store.GetBlob(ctx, current.Key)
++				if err != nil {
++					return stats, fmt.Errorf(
++						"reload blob %q after version conflict: %w",
++						listed.Key,
++						err,
++					)
++				}
++			}
++		}
++
++		next := page.NextCursor
++		complete := next == ""
++		err = m.store.SaveCheckpoint(
+ 			ctx,
+ 			rolloutID,
+ 			checkpoint.Version,
+-			page.NextCursor,
++			next,
+ 			complete,
+-		); err != nil {
+-			return stats, fmt.Errorf("save checkpoint: %w", err)
+-		}
+-		checkpoint.Version++
+-		stats.Pages++
+-
+-		for _, blob := range page.Blobs {
+-			stats.Scanned++
+-			if blob.Metadata == nil {
+-				blob.Metadata = make(map[string]string)
++		)
++		if err != nil {
++			saveErr := err
++			durable, loadErr := m.store.LoadCheckpoint(ctx, rolloutID)
++			if loadErr != nil {
++				return stats, fmt.Errorf(
++					"save checkpoint: %w (could not reconcile outcome: %v)",
++					saveErr,
++					loadErr,
++				)
+ 			}
+-			// BUG: listed values and maps are stale and existing keys are replaced.
+-			blob.Metadata[contentTypeKey] = blob.ContentType
+-			blob.Metadata[checksumKey] = blob.Checksum
+-			if err := m.store.ReplaceMetadata(
+-				ctx,
+-				blob.Key,
+-				blob.Version,
+-				blob.Metadata,
+-			); err != nil {
+-				return stats, fmt.Errorf("replace metadata for %q: %w", blob.Key, err)
++			if durable.Cursor != next || durable.Complete != complete {
++				return stats, fmt.Errorf("save checkpoint: %w", saveErr)
++			}
++			checkpoint = durable
++		} else {
++			checkpoint = Checkpoint{
++				Cursor:   next,
++				Complete: complete,
++				Version:  checkpoint.Version + 1,
+ 			}
+-			stats.Updated++
+ 		}
++		stats.Pages++
++
+ 		if complete {
+ 			return stats, nil
+ 		}
+-		cursor = page.NextCursor
++		cursor = next
++	}
++}
++
++func backfilledMetadata(blob Blob) (map[string]string, bool) {
++	addContentType := false
++	if _, exists := blob.Metadata[contentTypeKey]; !exists &&
++		blob.ContentType != "" {
++		addContentType = true
++	}
++	addChecksum := false
++	if _, exists := blob.Metadata[checksumKey]; !exists &&
++		blob.Checksum != "" {
++		addChecksum = true
++	}
++	if !addContentType && !addChecksum {
++		return nil, false
++	}
++
++	metadata := make(map[string]string, len(blob.Metadata)+2)
++	for key, value := range blob.Metadata {
++		metadata[key] = value
++	}
++	if addContentType {
++		metadata[contentTypeKey] = blob.ContentType
++	}
++	if addChecksum {
++		metadata[checksumKey] = blob.Checksum
+ 	}
++	return metadata, true
+ }

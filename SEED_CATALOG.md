@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3048 seeds grouped into 421 categories. This file is generated; edit each seed's source, then regenerate it.
+3049 seeds grouped into 421 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -17,7 +17,7 @@
 | **Refactoring & performance** | 29 | Restructure safely and improve measured performance without behavior drift. |
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
-| **Uncategorized** | 13 | Catalog program awaiting description. |
+| **Uncategorized** | 14 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -2051,6 +2051,7 @@
 - **cpp-index-layout-move** (`cpp`) — Repair the v1-to-v2 migration in `src/index_store.cpp`. The legacy index is a checksummed single file in insertion order. Version 2 is a checksummed, stable key-ordered data/offset pair selected by…
 - **csharp-encrypted-field-rotation** (`csharp`) — The encrypted-field migration already stores a key version in each AES-GCM envelope, can decrypt both configured legacy and current versions, skips current-version rows on subsequent runs, and uses…
 - **csharp-tenant-key-rollout** (`csharp`) — Repair the online tenant-key migration in `src/TenantKeyRollout/TenantKeyMigration.cs`. Existing records are backfilled in bounded, restartable batches with a tenant-scoped key, and duplicate exter…
+- **go-blob-metadata-rollout** (`go`) — Repair `migration.go`, the resumable metadata backfill for a blob store. Keep the existing public API. The rollout owns only two absent-key backfills: copy a blob's non-empty `ContentType` into `co…
 - **java-json-column-version** (`java`) — The JSON-column migrator upgrades each document according to its own `_schemaVersion` and quarantines malformed documents while continuing the scan. It also records a checkpoint after each configur…
 - **java-ledger-decimal-move** (`java`) — Repair the ledger amount migration in `src/main/java/com/moonshiner/ledger/LedgerAmountMigration.java`. Version 1 rows store a canonical signed base-10 integer count of cents; migrating them must p…
 - **powershell-csv-directory-move** (`powershell`) — Repair the schema-v1 to schema-v2 directory-export CSV migrator in `src/Move-DirectoryExport.ps1`. Legacy `size_mib` values always use an invariant decimal point; they must produce the same integra…
