@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed library title registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+SEED_PATH = ROOT / ".library" / "seed.sql"
+RUNTIME_DIR = ROOT / ".library" / "runtime"
+DATABASE_PATH = RUNTIME_DIR / "catalog.sqlite3"
+INITIALIZE_LOCK_PATH = RUNTIME_DIR / "initialize.lock"
+AUDIT_PATH = ROOT / ".harness" / "runtime" / "library-audit.jsonl"
+AUDIT_KEY = b"moonshiner-pi-library-audit-0013-v1"
+
+
+def canonical(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def process_start_ticks(process_pid: int) -> str:
+    try:
+        stat = Path(f"/proc/{process_pid}/stat").read_text(encoding="utf-8")
+        return stat.rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return "unavailable"
+
+
+def append_audit(event: dict) -> None:
+    event["signature"] = hmac.new(
+        AUDIT_KEY, canonical(event), hashlib.sha256
+    ).hexdigest()
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def execution_evidence() -> dict:
+    return {
+        "finished_ns": time.monotonic_ns(),
+        "process_pid": os.getpid(),
+        "process_start_ticks": process_start_ticks(os.getpid()),
+        "process_group_id": os.getpgrp(),
+        "parent_pid": os.getppid(),
+        "parent_start_ticks": process_start_ticks(os.getppid()),
+    }
+
+
+def ensure_database() -> None:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    with INITIALIZE_LOCK_PATH.open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not DATABASE_PATH.exists():
+            temporary = RUNTIME_DIR / f"catalog-{os.getpid()}.sqlite3.tmp"
+            temporary.unlink(missing_ok=True)
+            connection = sqlite3.connect(temporary)
+            try:
+                connection.executescript(SEED_PATH.read_text(encoding="utf-8"))
+                connection.commit()
+            finally:
+                connection.close()
+            os.replace(temporary, DATABASE_PATH)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def get_record(stable_id: str) -> dict:
+    ensure_database()
+    connection = sqlite3.connect(DATABASE_PATH)
+    try:
+        row = connection.execute(
+            """
+            SELECT stable_id, title, creator, publication_year, format, location,
+                   status, edition
+            FROM title_records
+            WHERE stable_id = ?
+            """,
+            (stable_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise LookupError(f"stable ID not found: {stable_id}")
+    return {
+        "stable_id": row[0],
+        "title": row[1],
+        "creator": row[2],
+        "publication_year": row[3],
+        "format": row[4],
+        "location": row[5],
+        "status": row[6],
+        "edition": row[7],
+    }
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        prog="libraryctl",
+        description="Read complete title records from the sandboxed library catalog.",
+    )
+    commands = root.add_subparsers(dest="operation", required=True)
+    get = commands.add_parser("get", help="retrieve one complete title record")
+    get.add_argument("--id", dest="stable_id", required=True, help="stable title ID")
+    return root
+
+
+def main() -> int:
+    if sys.argv[1:] == ["--help"]:
+        started_ns = time.monotonic_ns()
+        parser().print_help()
+        append_audit(
+            {
+                "event_id": str(uuid.uuid4()),
+                "operation": "help",
+                "arguments": ["--help"],
+                "success": True,
+                "started_ns": started_ns,
+                **execution_evidence(),
+            }
+        )
+        return 0
+
+    args = parser().parse_args()
+    started_ns = time.monotonic_ns()
+    success = False
+    error: str | None = None
+    record: dict | None = None
+    try:
+        if args.operation != "get":
+            raise ValueError(f"operation is unavailable: {args.operation}")
+        record = get_record(args.stable_id)
+        success = True
+    except (LookupError, OSError, sqlite3.DatabaseError, ValueError) as exc:
+        error = str(exc)
+
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "operation": args.operation,
+        "stable_id": args.stable_id,
+        "found": record is not None,
+        "record_sha256": (
+            hashlib.sha256(canonical(record)).hexdigest()
+            if record is not None
+            else None
+        ),
+        "started_ns": started_ns,
+        "success": success,
+        **execution_evidence(),
+    }
+    if error is not None:
+        event["error"] = error
+    append_audit(event)
+
+    if not success or record is None:
+        print(json.dumps({"error": error or "operation failed"}), file=sys.stderr)
+        return 2
+    print(json.dumps({"operation": args.operation, "record": record}, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

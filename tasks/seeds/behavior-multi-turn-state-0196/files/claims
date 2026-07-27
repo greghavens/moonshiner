@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed claims registry."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import date
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+DATABASE = ROOT / "claims.sqlite3"
+KEY = ROOT / ".protected" / "audit.key"
+CLAIM_FIELDS = (
+    "id",
+    "name",
+    "office",
+    "review_date",
+    "status",
+    "canceled",
+)
+
+
+def canonical(value: dict[str, Any]) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def record_from_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    record = {field: row[field] for field in CLAIM_FIELDS}
+    record["canceled"] = bool(record["canceled"])
+    return record
+
+
+def connect() -> sqlite3.Connection:
+    connection = sqlite3.connect(DATABASE, timeout=10)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+def audit(connection: sqlite3.Connection, event: dict[str, Any]) -> None:
+    sequence = int(
+        connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM audit"
+        ).fetchone()[0]
+    )
+    payload = {"sequence": sequence, **event}
+    key = KEY.read_bytes().strip()
+    seal = hmac.new(key, canonical(payload), hashlib.sha256).hexdigest()
+    connection.execute(
+        "INSERT INTO audit(sequence, payload, seal) VALUES (?, ?, ?)",
+        (
+            sequence,
+            canonical(payload).decode("utf-8"),
+            seal,
+        ),
+    )
+
+
+def require_iso_date(value: str) -> str:
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError("date must use YYYY-MM-DD") from error
+    if parsed.isoformat() != value:
+        raise ValueError("date must use YYYY-MM-DD")
+    return value
+
+
+def get_claim(claim_id: str) -> dict[str, Any]:
+    started = time.monotonic_ns()
+    with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT id,name,office,review_date,status,canceled "
+            "FROM claims WHERE id = ?",
+            (claim_id,),
+        ).fetchone()
+        record = record_from_row(row)
+        finished = time.monotonic_ns()
+        audit(
+            connection,
+            {
+                "operation": "get",
+                "pid": os.getpid(),
+                "started_ns": started,
+                "finished_ns": finished,
+                "id": claim_id,
+                "found": record is not None,
+                "record": record,
+            },
+        )
+    if record is None:
+        raise LookupError(f"claim not found: {claim_id}")
+    return record
+
+
+def set_review_date(claim_id: str, review_date: str) -> dict[str, Any]:
+    requested_date = require_iso_date(review_date)
+    started = time.monotonic_ns()
+    with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT id,name,office,review_date,status,canceled "
+            "FROM claims WHERE id = ?",
+            (claim_id,),
+        ).fetchone()
+        before = record_from_row(row)
+        if before is None:
+            finished = time.monotonic_ns()
+            audit(
+                connection,
+                {
+                    "operation": "set-review-date",
+                    "pid": os.getpid(),
+                    "started_ns": started,
+                    "finished_ns": finished,
+                    "id": claim_id,
+                    "date": requested_date,
+                    "found": False,
+                },
+            )
+            raise LookupError(f"claim not found: {claim_id}")
+        connection.execute(
+            "UPDATE claims SET review_date = ? WHERE id = ?",
+            (requested_date, claim_id),
+        )
+        after = record_from_row(
+            connection.execute(
+                "SELECT id,name,office,review_date,status,canceled "
+                "FROM claims WHERE id = ?",
+                (claim_id,),
+            ).fetchone()
+        )
+        finished = time.monotonic_ns()
+        audit(
+            connection,
+            {
+                "operation": "set-review-date",
+                "pid": os.getpid(),
+                "started_ns": started,
+                "finished_ns": finished,
+                "id": claim_id,
+                "date": requested_date,
+                "found": True,
+                "before": before,
+                "after": after,
+            },
+        )
+    return {"changed": before != after, "claim": after}
+
+
+def cancel_claim(claim_id: str) -> dict[str, Any]:
+    started = time.monotonic_ns()
+    with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT id,name,office,review_date,status,canceled "
+            "FROM claims WHERE id = ?",
+            (claim_id,),
+        ).fetchone()
+        before = record_from_row(row)
+        if before is None:
+            raise LookupError(f"claim not found: {claim_id}")
+        connection.execute(
+            "UPDATE claims SET status = 'canceled', canceled = 1 WHERE id = ?",
+            (claim_id,),
+        )
+        after = record_from_row(
+            connection.execute(
+                "SELECT id,name,office,review_date,status,canceled "
+                "FROM claims WHERE id = ?",
+                (claim_id,),
+            ).fetchone()
+        )
+        audit(
+            connection,
+            {
+                "operation": "cancel",
+                "pid": os.getpid(),
+                "started_ns": started,
+                "finished_ns": time.monotonic_ns(),
+                "id": claim_id,
+                "before": before,
+                "after": after,
+            },
+        )
+    return {"changed": before != after, "claim": after}
+
+
+def notify(claim_id: str, message: str) -> dict[str, Any]:
+    started = time.monotonic_ns()
+    with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        exists = connection.execute(
+            "SELECT 1 FROM claims WHERE id = ?", (claim_id,)
+        ).fetchone()
+        if exists is None:
+            raise LookupError(f"claim not found: {claim_id}")
+        cursor = connection.execute(
+            "INSERT INTO notifications(claim_id, message) VALUES (?, ?)",
+            (claim_id, message),
+        )
+        result = {
+            "notification_id": int(cursor.lastrowid),
+            "claim_id": claim_id,
+            "message": message,
+        }
+        audit(
+            connection,
+            {
+                "operation": "notify",
+                "pid": os.getpid(),
+                "started_ns": started,
+                "finished_ns": time.monotonic_ns(),
+                **result,
+            },
+        )
+    return result
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="claims")
+    commands = parser.add_subparsers(dest="operation", required=True)
+
+    get_parser = commands.add_parser("get")
+    get_parser.add_argument("--id", required=True)
+
+    update_parser = commands.add_parser("set-review-date")
+    update_parser.add_argument("--id", required=True)
+    update_parser.add_argument("--date", required=True)
+
+    cancel_parser = commands.add_parser("cancel")
+    cancel_parser.add_argument("--id", required=True)
+
+    notify_parser = commands.add_parser("notify")
+    notify_parser.add_argument("--id", required=True)
+    notify_parser.add_argument("--message", required=True)
+    return parser
+
+
+def main() -> int:
+    arguments = build_parser().parse_args()
+    try:
+        if arguments.operation == "get":
+            result = get_claim(arguments.id)
+        elif arguments.operation == "set-review-date":
+            result = set_review_date(arguments.id, arguments.date)
+        elif arguments.operation == "cancel":
+            result = cancel_claim(arguments.id)
+        else:
+            result = notify(arguments.id, arguments.message)
+        print(
+            json.dumps(
+                result,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        return 0
+    except (LookupError, OSError, sqlite3.Error, ValueError) as error:
+        print(f"claims: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

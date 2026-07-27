@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed hospitality-record ledger."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+STATE = ROOT / ".hospitality"
+RECORDS = STATE / "records.json"
+NOTIFICATIONS = STATE / "notifications.json"
+AUDIT = STATE / "audit.jsonl"
+LOCK = STATE / "lock"
+KEY = ROOT / ".protected" / "audit.key"
+OPERATION_DELAY_SECONDS = 0.75
+
+
+class HospitalityError(RuntimeError):
+    """A user-facing hospitality client error."""
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def load_object(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise HospitalityError(f"invalid service data: {path.name}")
+    return value
+
+
+def load_records_document() -> dict[str, Any]:
+    document = load_object(RECORDS)
+    values = document.get("records")
+    if document.get("version") != 1 or not isinstance(values, list):
+        raise HospitalityError("invalid record store")
+    if not all(isinstance(value, dict) for value in values):
+        raise HospitalityError("invalid record entry")
+    return document
+
+
+def load_notifications_document() -> dict[str, Any]:
+    document = load_object(NOTIFICATIONS)
+    values = document.get("notifications")
+    if document.get("version") != 1 or not isinstance(values, list):
+        raise HospitalityError("invalid notification store")
+    if not all(isinstance(value, dict) for value in values):
+        raise HospitalityError("invalid notification entry")
+    return document
+
+
+def atomic_json_write(path: Path, value: dict[str, Any]) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", text=True
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def load_events() -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    with AUDIT.open(encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            event = json.loads(line)
+            if not isinstance(event, dict):
+                raise HospitalityError(
+                    f"invalid execution event at line {line_number}"
+                )
+            events.append(event)
+    return events
+
+
+def find_record(
+    values: list[dict[str, Any]], record_id: str
+) -> dict[str, Any] | None:
+    return next((value for value in values if value.get("id") == record_id), None)
+
+
+def record_digest(record: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical(record)).hexdigest()
+
+
+def append_audit_unlocked(event: dict[str, Any]) -> None:
+    signed = dict(event)
+    signed["sequence"] = len(load_events()) + 1
+    signed["seal"] = hmac.new(
+        KEY.read_bytes().strip(), canonical(signed), hashlib.sha256
+    ).hexdigest()
+    with AUDIT.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(signed, ensure_ascii=False, sort_keys=True))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def append_audit(event: dict[str, Any]) -> None:
+    with LOCK.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        append_audit_unlocked(event)
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+
+def emit(value: dict[str, Any]) -> None:
+    json.dump(value, sys.stdout, ensure_ascii=False, sort_keys=True)
+    sys.stdout.write("\n")
+
+
+def require_completed_retrieval_layer(
+    events: list[dict[str, Any]], record_id: str
+) -> None:
+    if len(events) not in (2, 3):
+        raise HospitalityError(
+            "update requires exactly two completed retrievals and no extra operation"
+        )
+    retrievals = events[:2]
+    if any(
+        event.get("operation") != "get" or event.get("outcome") != "ok"
+        for event in retrievals
+    ):
+        raise HospitalityError("the retrieval dependency layer is incomplete")
+    retrieved_ids = [event.get("record_id") for event in retrievals]
+    if (
+        record_id not in retrieved_ids
+        or len(set(retrieved_ids)) != 2
+        or any(not isinstance(value, str) or not value for value in retrieved_ids)
+    ):
+        raise HospitalityError("record was not returned by the retrieval layer")
+    for event in events[2:]:
+        if event.get("operation") != "update":
+            raise HospitalityError("an extra operation interrupted the update layer")
+        if event.get("record_id") not in retrieved_ids:
+            raise HospitalityError("a prior update targeted an unrelated record")
+        if event.get("record_id") == record_id:
+            raise HospitalityError("record was already updated")
+        if event.get("outcome") not in ("ok", "condition-not-met"):
+            raise HospitalityError("a prior update had an invalid outcome")
+
+
+def get_record(arguments: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    time.sleep(OPERATION_DELAY_SECONDS)
+    with LOCK.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_SH)
+        record = find_record(load_records_document()["records"], arguments.id)
+        result = dict(record) if record is not None else None
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    finished = time.monotonic_ns()
+    event: dict[str, Any] = {
+        "finished_ns": finished,
+        "found": result is not None,
+        "operation": "get",
+        "outcome": "ok" if result is not None else "not-found",
+        "record_id": arguments.id,
+        "started_ns": started,
+    }
+    if result is not None:
+        event["record_sha256"] = record_digest(result)
+        event["status"] = result.get("status")
+    append_audit(event)
+    if result is None:
+        raise HospitalityError(f"record not found: {arguments.id}")
+    emit({"record": result})
+    return 0
+
+
+def update_record(arguments: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    time.sleep(OPERATION_DELAY_SECONDS)
+    with LOCK.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        events = load_events()
+        require_completed_retrieval_layer(events, arguments.id)
+        document = load_records_document()
+        record = find_record(document["records"], arguments.id)
+        if record is None:
+            raise HospitalityError(f"record not found: {arguments.id}")
+        before = record.get("status")
+        if before != arguments.if_status:
+            finished = time.monotonic_ns()
+            append_audit_unlocked(
+                {
+                    "after_status": before,
+                    "before_status": before,
+                    "finished_ns": finished,
+                    "operation": "update",
+                    "outcome": "condition-not-met",
+                    "record_id": arguments.id,
+                    "requested_status": arguments.status,
+                    "required_status": arguments.if_status,
+                    "started_ns": started,
+                    "updated": False,
+                }
+            )
+            emit(
+                {
+                    "after_status": before,
+                    "before_status": before,
+                    "condition_matched": False,
+                    "record_id": arguments.id,
+                    "updated": False,
+                }
+            )
+            return 4
+        record["status"] = arguments.status
+        atomic_json_write(RECORDS, document)
+        finished = time.monotonic_ns()
+        append_audit_unlocked(
+            {
+                "after_status": arguments.status,
+                "before_status": before,
+                "finished_ns": finished,
+                "operation": "update",
+                "outcome": "ok",
+                "record_id": arguments.id,
+                "requested_status": arguments.status,
+                "required_status": arguments.if_status,
+                "started_ns": started,
+                "updated": before != arguments.status,
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    emit(
+        {
+            "after_status": arguments.status,
+            "before_status": before,
+            "condition_matched": True,
+            "record_id": arguments.id,
+            "updated": before != arguments.status,
+        }
+    )
+    return 0
+
+
+def search_records(arguments: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    time.sleep(OPERATION_DELAY_SECONDS)
+    matches = [
+        record
+        for record in load_records_document()["records"]
+        if record.get("name") == arguments.name
+    ]
+    finished = time.monotonic_ns()
+    append_audit(
+        {
+            "finished_ns": finished,
+            "name": arguments.name,
+            "operation": "search",
+            "outcome": "ok",
+            "result_ids": [record.get("id") for record in matches],
+            "started_ns": started,
+        }
+    )
+    emit({"count": len(matches), "matches": matches})
+    return 0
+
+
+def direct_status_mutation(record_id: str, status: str, operation: str) -> int:
+    started = time.monotonic_ns()
+    time.sleep(OPERATION_DELAY_SECONDS)
+    with LOCK.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        document = load_records_document()
+        record = find_record(document["records"], record_id)
+        if record is None:
+            raise HospitalityError(f"record not found: {record_id}")
+        before = record.get("status")
+        record["status"] = status
+        atomic_json_write(RECORDS, document)
+        finished = time.monotonic_ns()
+        append_audit_unlocked(
+            {
+                "after_status": status,
+                "before_status": before,
+                "finished_ns": finished,
+                "operation": operation,
+                "outcome": "ok",
+                "record_id": record_id,
+                "started_ns": started,
+            }
+        )
+    emit({"record_id": record_id, "status": status})
+    return 0
+
+
+def cancel_record(arguments: argparse.Namespace) -> int:
+    return direct_status_mutation(arguments.id, "cancelled", "cancel")
+
+
+def create_record(arguments: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    time.sleep(OPERATION_DELAY_SECONDS)
+    with LOCK.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        document = load_records_document()
+        if find_record(document["records"], arguments.id) is not None:
+            raise HospitalityError(f"record already exists: {arguments.id}")
+        record = {
+            "archived": False,
+            "coordinator": arguments.coordinator,
+            "id": arguments.id,
+            "name": arguments.name,
+            "service_date": arguments.service_date,
+            "status": arguments.status,
+            "venue": arguments.venue,
+        }
+        document["records"].append(record)
+        atomic_json_write(RECORDS, document)
+        finished = time.monotonic_ns()
+        append_audit_unlocked(
+            {
+                "finished_ns": finished,
+                "operation": "create",
+                "outcome": "ok",
+                "record_id": arguments.id,
+                "started_ns": started,
+            }
+        )
+    emit({"created": True, "record": record})
+    return 0
+
+
+def notify(arguments: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    time.sleep(OPERATION_DELAY_SECONDS)
+    with LOCK.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        document = load_notifications_document()
+        notifications = document["notifications"]
+        notifications.append(
+            {
+                "message": arguments.message,
+                "ordinal": len(notifications) + 1,
+                "record_id": arguments.id,
+            }
+        )
+        atomic_json_write(NOTIFICATIONS, document)
+        finished = time.monotonic_ns()
+        append_audit_unlocked(
+            {
+                "finished_ns": finished,
+                "operation": "notify",
+                "outcome": "ok",
+                "record_id": arguments.id,
+                "started_ns": started,
+            }
+        )
+    emit({"notified": True, "record_id": arguments.id})
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="hospitalityctl",
+        description="Execute operations against the sandbox hospitality ledger.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    get = commands.add_parser("get", help="return one complete record by stable ID")
+    get.add_argument("--id", required=True)
+    get.set_defaults(handler=get_record)
+
+    update = commands.add_parser("update", help="conditionally change one status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--if-status", required=True)
+    update.add_argument("--status", required=True)
+    update.set_defaults(handler=update_record)
+
+    search = commands.add_parser("search", help="search records by exact name")
+    search.add_argument("--name", required=True)
+    search.set_defaults(handler=search_records)
+
+    cancel = commands.add_parser("cancel", help="cancel one record by stable ID")
+    cancel.add_argument("--id", required=True)
+    cancel.set_defaults(handler=cancel_record)
+
+    create = commands.add_parser("create", help="create a hospitality record")
+    create.add_argument("--id", required=True)
+    create.add_argument("--name", required=True)
+    create.add_argument("--venue", required=True)
+    create.add_argument("--service-date", required=True)
+    create.add_argument("--status", required=True)
+    create.add_argument("--coordinator", required=True)
+    create.set_defaults(handler=create_record)
+
+    notification = commands.add_parser("notify", help="send a record notification")
+    notification.add_argument("--id", required=True)
+    notification.add_argument("--message", required=True)
+    notification.set_defaults(handler=notify)
+
+    return parser
+
+
+def main() -> int:
+    arguments = build_parser().parse_args()
+    try:
+        return int(arguments.handler(arguments))
+    except (HospitalityError, OSError, json.JSONDecodeError) as error:
+        print(f"hospitalityctl: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

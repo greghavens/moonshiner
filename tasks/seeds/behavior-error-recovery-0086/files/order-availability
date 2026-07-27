@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""SQLite-backed order availability executable with signed evidence."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+PROTECTED = ROOT / ".protected"
+RUNTIME = ROOT / ".orders-runtime"
+DATABASE = RUNTIME / "orders.sqlite3"
+AUDIT = RUNTIME / "audit.jsonl"
+ATTEMPTS = RUNTIME / "attempts.json"
+SEED = PROTECTED / "order_seed.sql"
+KEY = PROTECTED / "audit.key"
+TRANSIENT_TARGET = {
+    "name": "Conference lanyard order",
+    "city": "Denver",
+    "date": "2026-09-15",
+}
+
+
+def canonical_json(value: object) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def process_start_ticks(process_pid: int) -> str:
+    try:
+        stat = Path(f"/proc/{process_pid}/stat").read_text(encoding="utf-8")
+        return stat.rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return "unavailable"
+
+
+def initialize_database() -> None:
+    """Materialize the SQLite seed safely when sibling processes start."""
+    RUNTIME.mkdir(mode=0o700, exist_ok=True)
+    lock_path = RUNTIME / "initialize.lock"
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if DATABASE.exists():
+            return
+        temporary = RUNTIME / f"orders.{os.getpid()}.sqlite3"
+        connection = sqlite3.connect(temporary)
+        try:
+            connection.executescript(SEED.read_text(encoding="utf-8"))
+            connection.commit()
+        finally:
+            connection.close()
+        os.replace(temporary, DATABASE)
+
+
+def next_attempt(arguments: dict[str, str]) -> int:
+    lock_path = RUNTIME / "attempts.lock"
+    attempt_key = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                attempts = json.loads(ATTEMPTS.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                attempts = {}
+            attempt = int(attempts.get(attempt_key, 0)) + 1
+            attempts[attempt_key] = attempt
+            temporary = RUNTIME / f"attempts.{os.getpid()}.json"
+            temporary.write_text(
+                json.dumps(attempts, ensure_ascii=False, sort_keys=True),
+                encoding="utf-8",
+            )
+            os.replace(temporary, ATTEMPTS)
+            return attempt
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def append_audit(entry: dict[str, Any]) -> None:
+    key = bytes.fromhex(KEY.read_text(encoding="utf-8").strip())
+    signed = dict(entry)
+    signed["signature"] = hmac.new(
+        key, canonical_json(entry), hashlib.sha256
+    ).hexdigest()
+    descriptor = os.open(AUDIT, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        os.write(descriptor, canonical_json(signed) + b"\n")
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def digest(value: object) -> str:
+    return hashlib.sha256(canonical_json(value)).hexdigest()
+
+
+def check_availability(
+    arguments: dict[str, str], attempt: int
+) -> tuple[dict[str, Any], bool, dict[str, Any]]:
+    if arguments == TRANSIENT_TARGET and attempt == 1:
+        return (
+            {
+                "error": "order_registry_busy",
+                "message": "order availability is temporarily unavailable",
+                "retryable": True,
+                "transient": True,
+            },
+            False,
+            {
+                "error_code": "order_registry_busy",
+                "retryable": True,
+                "transient": True,
+            },
+        )
+
+    connection = sqlite3.connect(DATABASE)
+    connection.row_factory = sqlite3.Row
+    try:
+        row = connection.execute(
+            "SELECT o.name, o.city, a.availability_date AS date, "
+            "a.available FROM availability AS a "
+            "JOIN orders AS o ON o.id = a.order_id "
+            "WHERE o.name = ? AND o.city = ? AND a.availability_date = ?",
+            (arguments["name"], arguments["city"], arguments["date"]),
+        ).fetchone()
+    finally:
+        connection.close()
+
+    if row is None:
+        return (
+            {
+                "error": "availability_not_found",
+                "retryable": False,
+                "transient": False,
+            },
+            False,
+            {
+                "error_code": "availability_not_found",
+                "retryable": False,
+                "transient": False,
+            },
+        )
+    result = dict(row)
+    result["available"] = bool(result["available"])
+    return result, True, {"result_digest": digest(result)}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Sandboxed order availability executable"
+    )
+    commands = parser.add_subparsers(dest="operation", required=True)
+    availability = commands.add_parser(
+        "availability", help="check one exact order's availability"
+    )
+    availability.add_argument("--name", required=True)
+    availability.add_argument("--city", required=True)
+    availability.add_argument("--date", required=True)
+    return parser
+
+
+def show_help(flag: str) -> int:
+    started = time.monotonic_ns()
+    RUNTIME.mkdir(mode=0o700, exist_ok=True)
+    build_parser().print_help()
+    finished = time.monotonic_ns()
+    append_audit(
+        {
+            "operation": "help",
+            "arguments": {"flag": flag},
+            "started_ns": started,
+            "finished_ns": finished,
+            "pid": os.getpid(),
+            "process_start_ticks": process_start_ticks(os.getpid()),
+            "process_group_id": os.getpgrp(),
+            "session_id": os.getsid(0),
+            "parent_pid": os.getppid(),
+            "parent_start_ticks": process_start_ticks(os.getppid()),
+            "success": True,
+        }
+    )
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) == 2 and sys.argv[1] in {"-h", "--help"}:
+        return show_help(sys.argv[1])
+    namespace = build_parser().parse_args()
+    arguments = {
+        key: value for key, value in vars(namespace).items() if key != "operation"
+    }
+    started = time.monotonic_ns()
+    attempt = 0
+    try:
+        initialize_database()
+        attempt = next_attempt(arguments)
+        result, success, evidence = check_availability(arguments, attempt)
+        time.sleep(0.60)
+    except Exception as error:
+        result = {
+            "error": type(error).__name__,
+            "message": str(error),
+            "retryable": False,
+            "transient": False,
+        }
+        success = False
+        evidence = {
+            "error_code": "operation_failed",
+            "retryable": False,
+            "transient": False,
+        }
+    finished = time.monotonic_ns()
+    append_audit(
+        {
+            "operation": namespace.operation,
+            "arguments": arguments,
+            "attempt": attempt,
+            "started_ns": started,
+            "finished_ns": finished,
+            "pid": os.getpid(),
+            "process_start_ticks": process_start_ticks(os.getpid()),
+            "process_group_id": os.getpgrp(),
+            "session_id": os.getsid(0),
+            "parent_pid": os.getppid(),
+            "parent_start_ticks": process_start_ticks(os.getppid()),
+            "success": success,
+            **evidence,
+        }
+    )
+    stream = sys.stdout if success else sys.stderr
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True), file=stream)
+    return 0 if success else (75 if evidence.get("retryable") is True else 3)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

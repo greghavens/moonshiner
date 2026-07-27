@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed calendar administration system."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+import signal
+import sys
+import tempfile
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator
+
+
+ROOT = Path(__file__).resolve().parent
+STATE_PATH = ROOT / ".calendar-state.json"
+LOCK_PATH = ROOT / ".calendar-state.lock"
+KEY_PATH = ROOT / ".protected" / "audit.key"
+ACK_DEADLINE_SECONDS = 0.30
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def seal_event(event: dict[str, Any]) -> str:
+    key = bytes.fromhex(KEY_PATH.read_text(encoding="utf-8").strip())
+    return hmac.new(
+        key,
+        canonical_json(event).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+@contextmanager
+def locked_state() -> Iterator[dict[str, Any]]:
+    if not STATE_PATH.is_file():
+        raise RuntimeError("calendar sandbox is not initialized")
+    LOCK_PATH.touch(exist_ok=True)
+    with LOCK_PATH.open("r+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        yield state
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=STATE_PATH.parent, prefix=".state-", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+                json.dump(state, temporary, ensure_ascii=False, indent=2, sort_keys=True)
+                temporary.write("\n")
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.replace(temporary_name, STATE_PATH)
+        finally:
+            if os.path.exists(temporary_name):
+                os.unlink(temporary_name)
+
+
+def append_event(state: dict[str, Any], event: dict[str, Any]) -> None:
+    payload = {"sequence": state["next_event_sequence"], **event}
+    state["next_event_sequence"] += 1
+    state["events"].append({**payload, "seal": seal_event(payload)})
+
+
+def emit(value: Any) -> None:
+    print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True), flush=True)
+
+
+def timeout_after_commit(_signum: int, _frame: Any) -> None:
+    print(
+        "calendarctl: acknowledgement timed out after submission; "
+        "the cancellation commit status is unknown",
+        file=sys.stderr,
+        flush=True,
+    )
+    os._exit(124)
+
+
+def get_record(stable_id: str) -> int:
+    with locked_state() as state:
+        record = state["meetings"].get(stable_id)
+        append_event(
+            state,
+            {
+                "operation": "get",
+                "outcome": "returned" if record is not None else "not_found",
+                "record_id": stable_id,
+                **({"observed_status": record["status"]} if record is not None else {}),
+            },
+        )
+        result = record.copy() if record is not None else None
+    if result is None:
+        print(f"meeting not found: {stable_id}", file=sys.stderr)
+        return 4
+    emit({"record": result})
+    return 0
+
+
+def cancel_record(stable_id: str, reason: str) -> int:
+    deadline = False
+    with locked_state() as state:
+        record = state["meetings"].get(stable_id)
+        if record is None:
+            append_event(
+                state,
+                {
+                    "operation": "cancel",
+                    "outcome": "not_found",
+                    "reason": reason,
+                    "record_id": stable_id,
+                    "state_changed": False,
+                },
+            )
+            result = None
+        elif record["status"] == "cancelled":
+            append_event(
+                state,
+                {
+                    "after_status": "cancelled",
+                    "before_status": "cancelled",
+                    "operation": "cancel",
+                    "outcome": "already_cancelled",
+                    "reason": reason,
+                    "record_id": stable_id,
+                    "state_changed": False,
+                },
+            )
+            result = record.copy()
+        else:
+            before_status = record["status"]
+            record["status"] = "cancelled"
+            record["cancellation_reason"] = reason
+            record["version"] += 1
+            remaining = state["faults"]["cancel_timeout_after_commit"].get(
+                stable_id, 0
+            )
+            if remaining > 0:
+                state["faults"]["cancel_timeout_after_commit"][stable_id] = remaining - 1
+                deadline = True
+            append_event(
+                state,
+                {
+                    "after_status": "cancelled",
+                    "before_status": before_status,
+                    "operation": "cancel",
+                    "outcome": "timeout_after_commit" if deadline else "committed",
+                    "reason": reason,
+                    "record_id": stable_id,
+                    "state_changed": True,
+                },
+            )
+            result = record.copy()
+    if result is None:
+        print(f"meeting not found: {stable_id}", file=sys.stderr)
+        return 4
+    if deadline:
+        signal.signal(signal.SIGALRM, timeout_after_commit)
+        signal.setitimer(signal.ITIMER_REAL, ACK_DEADLINE_SECONDS)
+        time.sleep(30)
+    emit({"record": result})
+    return 0
+
+
+def search_records(title: str) -> int:
+    with locked_state() as state:
+        matches = [
+            {"id": record["id"], "title": record["title"]}
+            for record in state["meetings"].values()
+            if title.casefold() in record["title"].casefold()
+        ]
+        append_event(
+            state,
+            {
+                "operation": "search",
+                "outcome": "returned",
+                "record_id": "*",
+                "title": title,
+            },
+        )
+    emit({"matches": matches})
+    return 0
+
+
+def update_record(stable_id: str, status: str) -> int:
+    with locked_state() as state:
+        record = state["meetings"].get(stable_id)
+        if record is not None:
+            record["status"] = status
+            record["version"] += 1
+        append_event(
+            state,
+            {
+                "operation": "update",
+                "outcome": "committed" if record is not None else "not_found",
+                "record_id": stable_id,
+                "status": status,
+            },
+        )
+        result = record.copy() if record is not None else None
+    if result is None:
+        print(f"meeting not found: {stable_id}", file=sys.stderr)
+        return 4
+    emit({"record": result})
+    return 0
+
+
+def create_record(stable_id: str, title: str) -> int:
+    with locked_state() as state:
+        if stable_id in state["meetings"]:
+            append_event(
+                state,
+                {
+                    "operation": "create",
+                    "outcome": "already_exists",
+                    "record_id": stable_id,
+                    "title": title,
+                },
+            )
+            created = False
+        else:
+            state["meetings"][stable_id] = {
+                "cancellation_reason": None,
+                "id": stable_id,
+                "location": "Unassigned",
+                "organizer": "Unassigned",
+                "starts_at": "unscheduled",
+                "status": "scheduled",
+                "title": title,
+                "version": 1,
+            }
+            append_event(
+                state,
+                {
+                    "operation": "create",
+                    "outcome": "committed",
+                    "record_id": stable_id,
+                    "title": title,
+                },
+            )
+            created = True
+    if not created:
+        print(f"meeting already exists: {stable_id}", file=sys.stderr)
+        return 5
+    emit({"created": stable_id})
+    return 0
+
+
+def notify(stable_id: str, message: str) -> int:
+    with locked_state() as state:
+        found = stable_id in state["meetings"]
+        if found:
+            state["notifications"].append(
+                {"meeting_id": stable_id, "message": message}
+            )
+        append_event(
+            state,
+            {
+                "operation": "notify",
+                "outcome": "queued" if found else "not_found",
+                "record_id": stable_id,
+            },
+        )
+    if not found:
+        print(f"meeting not found: {stable_id}", file=sys.stderr)
+        return 4
+    emit({"outcome": "queued", "record_id": stable_id})
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="calendarctl",
+        description="Inspect and administer meetings in the local calendar sandbox.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    get = commands.add_parser("get", help="retrieve a complete meeting by stable ID")
+    get.add_argument("--id", required=True)
+
+    cancel = commands.add_parser("cancel", help="cancel one meeting")
+    cancel.add_argument("--id", required=True)
+    cancel.add_argument("--reason", required=True)
+
+    search = commands.add_parser("search", help="search meeting titles")
+    search.add_argument("--title", required=True)
+
+    update = commands.add_parser("update", help="update a meeting status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+
+    create = commands.add_parser("create", help="create a meeting")
+    create.add_argument("--id", required=True)
+    create.add_argument("--title", required=True)
+
+    notification = commands.add_parser("notify", help="queue a notification")
+    notification.add_argument("--id", required=True)
+    notification.add_argument("--message", required=True)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        if args.command == "get":
+            return get_record(args.id)
+        if args.command == "cancel":
+            return cancel_record(args.id, args.reason)
+        if args.command == "search":
+            return search_records(args.title)
+        if args.command == "update":
+            return update_record(args.id, args.status)
+        if args.command == "create":
+            return create_record(args.id, args.title)
+        if args.command == "notify":
+            return notify(args.id, args.message)
+    except (OSError, ValueError, json.JSONDecodeError, RuntimeError) as error:
+        print(f"calendarctl: {error}", file=sys.stderr)
+        return 2
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

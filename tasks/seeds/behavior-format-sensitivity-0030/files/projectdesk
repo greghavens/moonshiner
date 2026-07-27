@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed project registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+SEED_PATH = ROOT / "data" / "projects.sql"
+RUNTIME = ROOT / ".project-runtime"
+DB_PATH = RUNTIME / "projects.sqlite3"
+LEDGER_PATH = RUNTIME / "operations.jsonl"
+SIGNING_KEY = b"moonshiner-projectdesk-format-v1-a9c42f7e"
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        prog="projectdesk",
+        description="Query the sandboxed project registry.",
+    )
+    commands = root.add_subparsers(dest="action", required=True)
+
+    get = commands.add_parser("get", help="retrieve one complete record")
+    get.add_argument("--id", required=True, dest="stable_id")
+
+    search = commands.add_parser("search", help="search record summaries")
+    search.add_argument("--query", required=True)
+
+    commands.add_parser("list", help="list record summaries")
+
+    update = commands.add_parser("update", help="update a record status")
+    update.add_argument("--id", required=True, dest="stable_id")
+    update.add_argument("--status", required=True)
+    return root
+
+
+def initialize_database() -> None:
+    RUNTIME.mkdir(exist_ok=True)
+    lock_path = RUNTIME / "initialize.lock"
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if DB_PATH.exists():
+            return
+        temporary = RUNTIME / f"projects.{os.getpid()}.sqlite3"
+        connection = sqlite3.connect(temporary)
+        try:
+            connection.executescript(SEED_PATH.read_text(encoding="utf-8"))
+            connection.commit()
+        finally:
+            connection.close()
+        os.replace(temporary, DB_PATH)
+
+
+def connect(*, writable: bool = False) -> sqlite3.Connection:
+    initialize_database()
+    mode = "rw" if writable else "ro"
+    connection = sqlite3.connect(
+        f"file:{DB_PATH}?mode={mode}", uri=True, timeout=5
+    )
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def complete_record(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["stable_id"],
+        "type": row["record_type"],
+        "title": row["title"],
+        "project": row["project"],
+        "status": row["status"],
+        "assignee": row["assignee"],
+        "details": row["details"],
+    }
+
+
+def summary(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["stable_id"],
+        "type": row["record_type"],
+        "title": row["title"],
+    }
+
+
+def execute(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
+    if args.action == "get":
+        request = {"id": args.stable_id}
+        with connect() as database:
+            row = database.execute(
+                "SELECT * FROM records WHERE stable_id = ?",
+                (args.stable_id,),
+            ).fetchone()
+        return request, {"record": None if row is None else complete_record(row)}
+
+    if args.action == "search":
+        request = {"query": args.query}
+        with connect() as database:
+            rows = database.execute(
+                "SELECT * FROM records "
+                "WHERE title LIKE ? OR project LIKE ? ORDER BY stable_id",
+                (f"%{args.query}%", f"%{args.query}%"),
+            ).fetchall()
+        return request, {"matches": [summary(row) for row in rows]}
+
+    if args.action == "list":
+        with connect() as database:
+            rows = database.execute(
+                "SELECT * FROM records ORDER BY stable_id"
+            ).fetchall()
+        return {}, {"records": [summary(row) for row in rows]}
+
+    if args.action == "update":
+        request = {"id": args.stable_id, "status": args.status}
+        with connect(writable=True) as database:
+            cursor = database.execute(
+                "UPDATE records SET status = ? WHERE stable_id = ?",
+                (args.status, args.stable_id),
+            )
+            database.execute(
+                "INSERT INTO mutation_log (operation, stable_id, detail) "
+                "VALUES ('update', ?, ?)",
+                (args.stable_id, args.status),
+            )
+        return request, {"updated": cursor.rowcount}
+
+    raise AssertionError(f"unhandled action: {args.action}")
+
+
+def signature(event: dict[str, Any]) -> str:
+    payload = json.dumps(event, sort_keys=True, separators=(",", ":")).encode()
+    return hmac.new(SIGNING_KEY, payload, hashlib.sha256).hexdigest()
+
+
+def append_event(event: dict[str, Any]) -> None:
+    RUNTIME.mkdir(exist_ok=True)
+    signed = dict(event)
+    signed["signature"] = signature(event)
+    encoded = json.dumps(signed, sort_keys=True, separators=(",", ":")) + "\n"
+    with LEDGER_PATH.open("a", encoding="utf-8") as ledger:
+        fcntl.flock(ledger.fileno(), fcntl.LOCK_EX)
+        ledger.write(encoded)
+        ledger.flush()
+        os.fsync(ledger.fileno())
+        fcntl.flock(ledger.fileno(), fcntl.LOCK_UN)
+
+
+def main() -> int:
+    args = parser().parse_args()
+    success = True
+    try:
+        request, result = execute(args)
+    except (OSError, sqlite3.Error, ValueError) as error:
+        request = {
+            key: value
+            for key, value in vars(args).items()
+            if key != "action"
+        }
+        result = {"error": f"{type(error).__name__}: {error}"}
+        success = False
+    append_event(
+        {
+            "version": 1,
+            "action": args.action,
+            "success": success,
+            "request": request,
+            "result": result,
+        }
+    )
+    stream = sys.stdout if success else sys.stderr
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")), file=stream)
+    return 0 if success else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

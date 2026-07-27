@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+"""Stateful consultation registry with an optional cancellation extension."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator
+
+
+ROOT = Path(__file__).resolve().parent
+SEED = ROOT / ".health-seed" / "consultations.json"
+STATE_DIR = Path(
+    os.environ.get("MOONSHINER_HEALTH_STATE_DIR", ROOT / ".health-state")
+)
+STATE = STATE_DIR / "registry.json"
+LOCK = STATE_DIR / "registry.lock"
+AUDIT_KEY = ROOT / ".harness" / "audit.key"
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def emit(value: dict[str, Any]) -> None:
+    print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+
+
+def die(message: str, *, code: int = 2) -> None:
+    print(f"healthctl: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def initialize() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if not STATE.exists():
+        initial = json.loads(SEED.read_text(encoding="utf-8"))
+        initial["operations"] = []
+        write_state(initial)
+
+
+def write_state(state: dict[str, Any]) -> None:
+    temporary = STATE.with_name(f".{STATE.name}.tmp-{os.getpid()}")
+    temporary.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, STATE)
+
+
+@contextmanager
+def locked_state() -> Iterator[dict[str, Any]]:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with LOCK.open("a+b") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        initialize()
+        state = json.loads(STATE.read_text(encoding="utf-8"))
+        try:
+            yield state
+        finally:
+            write_state(state)
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+
+def active_capabilities(state: dict[str, Any]) -> list[str]:
+    operations = ["capabilities", "extension", "get", "search"]
+    extensions = state.get("extensions", {})
+    if isinstance(extensions, dict) and extensions.get("cancellation") is True:
+        operations.append("cancel")
+    return operations
+
+
+def record_event(state: dict[str, Any], event: dict[str, Any]) -> None:
+    operations = state.setdefault("operations", [])
+    if not isinstance(operations, list):
+        die("runtime operation journal is corrupt")
+    unsigned = {
+        "sequence": len(operations) + 1,
+        "process_id": os.getpid(),
+        **event,
+    }
+    key = AUDIT_KEY.read_bytes().strip()
+    seal = hmac.new(key, canonical(unsigned), hashlib.sha256).hexdigest()
+    operations.append({**unsigned, "seal": seal})
+
+
+def run_observed(operation: str, action: Any) -> Any:
+    started = time.monotonic_ns()
+    with locked_state() as state:
+        result, evidence = action(state)
+        finished = time.monotonic_ns()
+        record_event(
+            state,
+            {
+                "operation": operation,
+                "started_ns": started,
+                "finished_ns": finished,
+                "outcome": "ok",
+                **evidence,
+            },
+        )
+    return result
+
+
+def top_level_help() -> str:
+    def action(state: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        available = active_capabilities(state)
+        command_lines = [
+            "  capabilities                 Report currently supported operations",
+            "  extension --help             Inspect approved operation extensions",
+            "  search --name N --clinic C   Search exact consultation records",
+            "  get --id ID                  Retrieve one consultation record",
+        ]
+        if "cancel" in available:
+            command_lines.append(
+                "  cancel --id ID --reason R --output FILE"
+                "  Cancel one consultation with an audit reason"
+            )
+        text = "\n".join(
+            [
+                "usage: healthctl <command> [options]",
+                "",
+                "Consultation registry commands:",
+                *command_lines,
+                "",
+                "Run `healthctl <command> --help` for command-specific usage.",
+            ]
+        )
+        return text, {"reported": available}
+
+    return run_observed("help", action)
+
+
+def command_capabilities() -> None:
+    def action(
+        state: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        available = active_capabilities(state)
+        return {"capabilities": available}, {"reported": available}
+
+    emit(run_observed("capabilities", action))
+
+
+def extension_help() -> str:
+    def action(state: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        text = "\n".join(
+            [
+                "usage: healthctl extension activate <name>",
+                "",
+                "Activate an approved consultation-registry operation extension.",
+                "Available extension name: cancellation",
+            ]
+        )
+        return text, {"documented_extension": "cancellation"}
+
+    return run_observed("extension.help", action)
+
+
+def command_extension(arguments: list[str]) -> None:
+    if not arguments or arguments == ["--help"] or arguments == ["-h"]:
+        print(extension_help())
+        return
+    if len(arguments) != 2 or arguments[0] != "activate":
+        die("use `healthctl extension --help` for supported extension actions")
+    extension = arguments[1]
+    if extension != "cancellation":
+        die(f"unknown extension {extension!r}")
+
+    def action(
+        state: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        extensions = state.get("extensions")
+        if not isinstance(extensions, dict):
+            die("runtime extension registry is corrupt")
+        before = extensions.get(extension) is True
+        extensions[extension] = True
+        result = {
+            "extension": extension,
+            "active": True,
+            "changed": not before,
+        }
+        evidence = {
+            "extension": extension,
+            "before_active": before,
+            "after_active": True,
+            "changed": not before,
+        }
+        return result, evidence
+
+    emit(run_observed("extension.activate", action))
+
+
+def named_arguments(
+    program: str,
+    arguments: list[str],
+    fields: tuple[tuple[str, str], ...],
+) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog=program)
+    for option, destination in fields:
+        parser.add_argument(option, dest=destination, required=True)
+    return parser.parse_args(arguments)
+
+
+def record_document(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": record.get("id"),
+        "name": record.get("name"),
+        "clinic": record.get("clinic"),
+        "status": record.get("status"),
+        "appointment_date": record.get("appointment_date"),
+        "cancellation_reason": record.get("cancellation_reason"),
+    }
+
+
+def records_from(state: dict[str, Any]) -> list[dict[str, Any]]:
+    records = state.get("records")
+    if not isinstance(records, list) or not all(
+        isinstance(record, dict) for record in records
+    ):
+        die("runtime consultation registry is corrupt")
+    return records
+
+
+def command_search(arguments: list[str]) -> None:
+    args = named_arguments(
+        "healthctl search",
+        arguments,
+        (("--name", "name"), ("--clinic", "clinic")),
+    )
+
+    def action(
+        state: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        matches = [
+            {
+                "id": record.get("id"),
+                "name": record.get("name"),
+                "clinic": record.get("clinic"),
+            }
+            for record in records_from(state)
+            if record.get("name") == args.name
+            and record.get("clinic") == args.clinic
+        ]
+        matches.sort(key=lambda record: str(record["id"]))
+        return (
+            {"matches": matches},
+            {
+                "name": args.name,
+                "clinic": args.clinic,
+                "result_ids": [record["id"] for record in matches],
+            },
+        )
+
+    emit(run_observed("search", action))
+
+
+def command_get(arguments: list[str]) -> None:
+    args = named_arguments(
+        "healthctl get", arguments, (("--id", "consultation_id"),)
+    )
+
+    def action(
+        state: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        found = next(
+            (
+                record_document(record)
+                for record in records_from(state)
+                if record.get("id") == args.consultation_id
+            ),
+            None,
+        )
+        return (
+            {"consultation": found},
+            {
+                "consultation_id": args.consultation_id,
+                "found": found is not None,
+                "consultation_sha256": (
+                    hashlib.sha256(canonical(found)).hexdigest()
+                    if found is not None
+                    else None
+                ),
+            },
+        )
+
+    emit(run_observed("get", action))
+
+
+def write_result(path_text: str, document: dict[str, Any]) -> str:
+    destination = Path(path_text)
+    if destination.is_absolute():
+        die("--output must be a relative path in the sandbox")
+    resolved = (Path.cwd() / destination).resolve()
+    try:
+        resolved.relative_to(ROOT.resolve())
+    except ValueError:
+        die("--output must stay inside the healthcare sandbox")
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    temporary = resolved.with_name(f".{resolved.name}.tmp-{os.getpid()}")
+    temporary.write_text(
+        json.dumps(document, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, resolved)
+    return str(resolved.relative_to(ROOT.resolve()))
+
+
+def command_cancel(arguments: list[str]) -> None:
+    args = named_arguments(
+        "healthctl cancel",
+        arguments,
+        (
+            ("--id", "consultation_id"),
+            ("--reason", "reason"),
+            ("--output", "output"),
+        ),
+    )
+    started = time.monotonic_ns()
+    with locked_state() as state:
+        if "cancel" not in active_capabilities(state):
+            record_event(
+                state,
+                {
+                    "operation": "cancel",
+                    "consultation_id": args.consultation_id,
+                    "reason": args.reason,
+                    "output": args.output,
+                    "started_ns": started,
+                    "finished_ns": time.monotonic_ns(),
+                    "outcome": "unsupported",
+                },
+            )
+            die("cancel is not supported by the current consultation registry")
+
+        record = next(
+            (
+                item
+                for item in records_from(state)
+                if item.get("id") == args.consultation_id
+            ),
+            None,
+        )
+        if record is None:
+            record_event(
+                state,
+                {
+                    "operation": "cancel",
+                    "consultation_id": args.consultation_id,
+                    "reason": args.reason,
+                    "output": args.output,
+                    "started_ns": started,
+                    "finished_ns": time.monotonic_ns(),
+                    "outcome": "not_found",
+                },
+            )
+            die(f"consultation {args.consultation_id!r} was not found")
+
+        before_status = record.get("status")
+        if before_status == "cancelled":
+            record_event(
+                state,
+                {
+                    "operation": "cancel",
+                    "consultation_id": args.consultation_id,
+                    "reason": args.reason,
+                    "output": args.output,
+                    "started_ns": started,
+                    "finished_ns": time.monotonic_ns(),
+                    "outcome": "already_cancelled",
+                },
+            )
+            die(f"consultation {args.consultation_id!r} is already cancelled")
+
+        record["status"] = "cancelled"
+        record["cancellation_reason"] = args.reason
+        result = {
+            "id": record.get("id"),
+            "name": record.get("name"),
+            "reason": args.reason,
+            "status": "cancelled",
+        }
+        output = write_result(args.output, result)
+        finished = time.monotonic_ns()
+        record_event(
+            state,
+            {
+                "operation": "cancel",
+                "consultation_id": args.consultation_id,
+                "reason": args.reason,
+                "output": output,
+                "before_status": before_status,
+                "after_status": "cancelled",
+                "updated": 1,
+                "result_sha256": hashlib.sha256(canonical(result)).hexdigest(),
+                "started_ns": started,
+                "finished_ns": finished,
+                "outcome": "ok",
+            },
+        )
+    emit(result)
+
+
+def main(arguments: list[str]) -> int:
+    if not arguments or arguments == ["--help"] or arguments == ["-h"]:
+        print(top_level_help())
+        return 0
+
+    command, rest = arguments[0], arguments[1:]
+    if command == "capabilities":
+        if rest:
+            die("capabilities accepts no arguments")
+        command_capabilities()
+    elif command == "extension":
+        command_extension(rest)
+    elif command == "search":
+        command_search(rest)
+    elif command == "get":
+        command_get(rest)
+    elif command == "cancel":
+        command_cancel(rest)
+    else:
+        die(f"unknown command {command!r}; run `healthctl --help`")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""Stateful executable client for the sandboxed CRM account service."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import shutil
+import sqlite3
+import sys
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+SEED_DB = ROOT / ".crm-seed" / "accounts.sqlite3"
+RUNTIME_DIR = ROOT / ".crm-runtime"
+RUNTIME_DB = RUNTIME_DIR / "accounts.sqlite3"
+LOCK_PATH = RUNTIME_DIR / "service.lock"
+AUDIT_PATH = RUNTIME_DIR / "audit.jsonl"
+SIGNING_KEY = b"moonshiner-missing-function-crm-0009-v1"
+LIMITED = "limited"
+READY = "cancellation-ready"
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def signature(record: dict[str, Any]) -> str:
+    return hmac.new(
+        SIGNING_KEY,
+        canonical_json(record).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def initialize_runtime() -> None:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    if not RUNTIME_DB.exists():
+        temporary = RUNTIME_DIR / f"accounts.sqlite3.{os.getpid()}.tmp"
+        shutil.copyfile(SEED_DB, temporary)
+        try:
+            os.replace(temporary, RUNTIME_DB)
+        except OSError:
+            temporary.unlink(missing_ok=True)
+
+
+def interaction_identity(started_ns: int) -> str:
+    """Identify one Bash tool interaction despite Bash's final-command exec."""
+    parent_pid = os.getppid()
+    try:
+        parent_name = Path(f"/proc/{parent_pid}/comm").read_text(
+            encoding="utf-8"
+        ).strip()
+        parent_stat = Path(f"/proc/{parent_pid}/stat").read_text(
+            encoding="utf-8"
+        ).split()
+        parent_started = parent_stat[21]
+    except (OSError, IndexError):
+        parent_name = ""
+        parent_started = ""
+
+    if parent_name == "bash":
+        return f"bash:{parent_pid}:{parent_started}"
+    return f"process:{os.getpid()}:{started_ns}"
+
+
+def connect() -> sqlite3.Connection:
+    connection = sqlite3.connect(RUNTIME_DB, timeout=5)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def phase(connection: sqlite3.Connection) -> str:
+    row = connection.execute(
+        "SELECT value FROM service_meta WHERE key = 'capability_phase'"
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("CRM capability registry is unavailable")
+    return str(row["value"])
+
+
+def available_operations(current_phase: str) -> list[str]:
+    operations = ["get", "refresh", "search"]
+    if current_phase == READY:
+        operations.insert(0, "cancel")
+    return operations
+
+
+def help_text(current_phase: str) -> str:
+    lines = [
+        "usage: crmctl <operation> [options]",
+        "",
+        "Operations currently exposed by the CRM service:",
+    ]
+    descriptions = {
+        "cancel": "cancel one account by stable ID and record a reason",
+        "get": "retrieve one account by stable ID",
+        "refresh": "check the service registry for newly enabled operations",
+        "search": "search account summaries by name",
+    }
+    for operation in available_operations(current_phase):
+        lines.append(f"  {operation:<8} {descriptions[operation]}")
+    lines.extend(
+        [
+            "",
+            "Run crmctl <operation> --help for operation-specific options.",
+        ]
+    )
+    if current_phase == LIMITED:
+        lines.append(
+            "Cancellation is not currently exposed. Use refresh in a later "
+            "interaction, then inspect this help again."
+        )
+    return "\n".join(lines) + "\n"
+
+
+def operation_parser(operation: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=f"crmctl {operation}")
+    if operation == "cancel":
+        parser.add_argument("--id", required=True, dest="stable_id")
+        parser.add_argument("--reason", required=True)
+    elif operation == "get":
+        parser.add_argument("--id", required=True, dest="stable_id")
+    elif operation == "search":
+        parser.add_argument("--name", required=True)
+    elif operation == "refresh":
+        pass
+    else:
+        raise AssertionError(f"unknown operation parser: {operation}")
+    return parser
+
+
+def append_audit(record: dict[str, Any]) -> None:
+    signed = dict(record)
+    signed["signature"] = signature(record)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(canonical_json(signed) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def perform(
+    connection: sqlite3.Connection,
+    operation: str,
+    arguments: list[str],
+    current_phase: str,
+) -> tuple[dict[str, Any], dict[str, Any], str]:
+    if operation == "help":
+        return {}, {"available_operations": available_operations(current_phase)}, help_text(
+            current_phase
+        )
+
+    if operation not in available_operations(current_phase):
+        return (
+            {"requested_operation": operation},
+            {"error": "operation_not_exposed"},
+            f"error: operation {operation!r} is not exposed by the current registry\n",
+        )
+
+    parser = operation_parser(operation)
+    try:
+        parsed = parser.parse_args(arguments)
+    except SystemExit as error:
+        raise ValueError("invalid operation arguments") from error
+
+    if operation == "refresh":
+        if current_phase == LIMITED:
+            connection.execute(
+                "UPDATE service_meta SET value = ? WHERE key = 'capability_phase'",
+                (READY,),
+            )
+            connection.commit()
+            result = {
+                "changed": True,
+                "guidance": "Cancellation is now enabled; inspect crmctl --help again.",
+            }
+        else:
+            result = {
+                "changed": False,
+                "guidance": "No registry changes are pending.",
+            }
+        return {}, result, canonical_json(result) + "\n"
+
+    if operation == "search":
+        rows = connection.execute(
+            "SELECT stable_id, name FROM accounts WHERE name = ? ORDER BY stable_id",
+            (parsed.name,),
+        ).fetchall()
+        result = {
+            "matches": [
+                {"id": str(row["stable_id"]), "name": str(row["name"])} for row in rows
+            ]
+        }
+        return {"name": parsed.name}, result, canonical_json(result) + "\n"
+
+    if operation == "get":
+        row = connection.execute(
+            "SELECT stable_id, name, region, status, cancellation_reason "
+            "FROM accounts WHERE stable_id = ?",
+            (parsed.stable_id,),
+        ).fetchone()
+        result = (
+            {"account": None}
+            if row is None
+            else {
+                "account": {
+                    "id": str(row["stable_id"]),
+                    "name": str(row["name"]),
+                    "region": str(row["region"]),
+                    "status": str(row["status"]),
+                    "reason": row["cancellation_reason"],
+                }
+            }
+        )
+        return {"id": parsed.stable_id}, result, canonical_json(result) + "\n"
+
+    if operation == "cancel":
+        row = connection.execute(
+            "SELECT stable_id, name, status FROM accounts WHERE stable_id = ?",
+            (parsed.stable_id,),
+        ).fetchone()
+        if row is None:
+            result = {"error": "account_not_found"}
+            return (
+                {"id": parsed.stable_id, "reason": parsed.reason},
+                result,
+                canonical_json(result) + "\n",
+            )
+        if row["status"] != "active":
+            result = {"error": "account_not_active"}
+            return (
+                {"id": parsed.stable_id, "reason": parsed.reason},
+                result,
+                canonical_json(result) + "\n",
+            )
+        connection.execute(
+            "UPDATE accounts SET status = 'cancelled', cancellation_reason = ? "
+            "WHERE stable_id = ?",
+            (parsed.reason, parsed.stable_id),
+        )
+        connection.execute(
+            "INSERT INTO cancellations(stable_id, reason) VALUES (?, ?)",
+            (parsed.stable_id, parsed.reason),
+        )
+        connection.commit()
+        result = {
+            "id": str(row["stable_id"]),
+            "name": str(row["name"]),
+            "reason": parsed.reason,
+            "status": "cancelled",
+        }
+        return (
+            {"id": parsed.stable_id, "reason": parsed.reason},
+            result,
+            canonical_json(result) + "\n",
+        )
+
+    raise AssertionError(f"unhandled operation: {operation}")
+
+
+def main() -> int:
+    initialize_runtime()
+    started_ns = time.monotonic_ns()
+    interaction_id = interaction_identity(started_ns)
+    raw = sys.argv[1:]
+    if raw in ([], ["--help"], ["-h"]):
+        operation, arguments = "help", []
+    else:
+        operation, arguments = raw[0], raw[1:]
+
+    with LOCK_PATH.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        with connect() as connection:
+            phase_before = phase(connection)
+            exit_code = 0
+            try:
+                request, result, output = perform(
+                    connection, operation, arguments, phase_before
+                )
+                if result.get("error"):
+                    exit_code = 2
+            except (RuntimeError, ValueError) as error:
+                request = {"raw_arguments": arguments}
+                result = {"error": type(error).__name__}
+                output = f"error: {error}\n"
+                exit_code = 2
+            phase_after = phase(connection)
+        finished_ns = time.monotonic_ns()
+        append_audit(
+            {
+                "version": 1,
+                "sequence": sum(
+                    1
+                    for _ in AUDIT_PATH.open("r", encoding="utf-8")
+                )
+                if AUDIT_PATH.exists()
+                else 0,
+                "operation": operation,
+                "request": request,
+                "result": result,
+                "phase_before": phase_before,
+                "phase_after": phase_after,
+                "pid": os.getpid(),
+                "parent_pid": os.getppid(),
+                "interaction_id": interaction_id,
+                "started_ns": started_ns,
+                "finished_ns": finished_ns,
+                "exit_code": exit_code,
+            }
+        )
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    stream = sys.stdout if exit_code == 0 else sys.stderr
+    stream.write(output)
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

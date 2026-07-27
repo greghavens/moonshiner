@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed project-task registry."""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+TASKS_PATH = ROOT / ".projects" / "tasks.json"
+AUDIT_KEY_PATH = ROOT / ".protected" / "audit.key"
+AUDIT_PATH = ROOT / ".protected" / "runtime" / "project-task-audit.jsonl"
+FULL_FIELDS = {
+    "assignee",
+    "description",
+    "due_on",
+    "id",
+    "lifecycle",
+    "location",
+    "name",
+    "priority",
+    "project",
+    "status",
+}
+
+
+def canonical(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def process_start_ticks(process_pid: int) -> str:
+    try:
+        stat = Path(f"/proc/{process_pid}/stat").read_text(encoding="utf-8")
+        return stat.rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return "unavailable"
+
+
+def load_tasks() -> list[dict]:
+    document = json.loads(TASKS_PATH.read_text(encoding="utf-8"))
+    tasks = document.get("tasks")
+    if not isinstance(tasks, list) or not all(
+        isinstance(record, dict) and set(record) == FULL_FIELDS for record in tasks
+    ):
+        raise RuntimeError("project-task registry is malformed")
+    return tasks
+
+
+def current_by_id(tasks: list[dict], stable_id: str) -> dict:
+    matches = [
+        record
+        for record in tasks
+        if record["id"] == stable_id and record["lifecycle"] == "current"
+    ]
+    if len(matches) != 1:
+        raise LookupError(f"current stable ID not found: {stable_id}")
+    return matches[0]
+
+
+def require_option(arguments: list[str], option: str) -> str:
+    if len(arguments) != 2 or arguments[0] != option:
+        raise ValueError(f"expected {option} followed by one value")
+    return arguments[1]
+
+
+def execute(operation: str, arguments: list[str]) -> tuple[dict, dict]:
+    tasks = load_tasks()
+
+    if operation == "get":
+        stable_id = require_option(arguments, "--id")
+        record = current_by_id(tasks, stable_id)
+        output = {"task": record}
+        return output, {
+            "argument_type": type(stable_id).__name__,
+            "output_digest": sha256_bytes(canonical(output)),
+            "result_count": 1,
+            "result_fields": sorted(record),
+            "result_id": record["id"],
+            "stable_id": stable_id,
+        }
+
+    if operation == "profile":
+        stable_id = require_option(arguments, "--id")
+        record = current_by_id(tasks, stable_id)
+        output = {
+            "profile": {
+                "id": record["id"],
+                "location": record["location"],
+                "name": record["name"],
+            }
+        }
+        return output, {
+            "argument_type": type(stable_id).__name__,
+            "output_digest": sha256_bytes(canonical(output)),
+            "result_count": 1,
+            "result_id": record["id"],
+            "stable_id": stable_id,
+        }
+
+    if operation == "search":
+        name = require_option(arguments, "--name")
+        matches = [
+            {
+                "id": record["id"],
+                "location": record["location"],
+                "name": record["name"],
+            }
+            for record in tasks
+            if record["name"] == name and record["lifecycle"] == "current"
+        ]
+        output = {"matches": matches}
+        return output, {
+            "name": name,
+            "output_digest": sha256_bytes(canonical(output)),
+            "result_count": len(matches),
+            "result_ids": [record["id"] for record in matches],
+        }
+
+    if operation == "list":
+        if arguments:
+            raise ValueError("list accepts no arguments")
+        visible = [
+            {"id": record["id"], "name": record["name"]}
+            for record in tasks
+            if record["lifecycle"] == "current"
+        ]
+        output = {"tasks": visible}
+        return output, {
+            "output_digest": sha256_bytes(canonical(output)),
+            "result_count": len(visible),
+            "result_ids": [record["id"] for record in visible],
+        }
+
+    raise ValueError(f"operation is unavailable: {operation}")
+
+
+def append_audit(event: dict) -> None:
+    key = AUDIT_KEY_PATH.read_bytes()
+    event["signature"] = hmac.new(key, canonical(event), hashlib.sha256).hexdigest()
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def main() -> int:
+    operation = sys.argv[1] if len(sys.argv) > 1 else "(missing)"
+    start_ns = time.monotonic_ns()
+    parent_pid = os.getppid()
+    before_digest = sha256_bytes(TASKS_PATH.read_bytes())
+    details: dict = {}
+    output: dict | None = None
+    error: str | None = None
+    success = False
+
+    try:
+        output, details = execute(operation, sys.argv[2:])
+        success = True
+    except (
+        json.JSONDecodeError,
+        LookupError,
+        OSError,
+        RuntimeError,
+        ValueError,
+    ) as exc:
+        error = str(exc)
+
+    after_digest = sha256_bytes(TASKS_PATH.read_bytes())
+    event = {
+        "end_ns": time.monotonic_ns(),
+        "event_id": str(uuid.uuid4()),
+        "operation": operation,
+        "parent_pid": parent_pid,
+        "parent_start_ticks": process_start_ticks(parent_pid),
+        "process_group_id": os.getpgrp(),
+        "process_pid": os.getpid(),
+        "process_start_ticks": process_start_ticks(os.getpid()),
+        "reference_run": os.environ.get("MOONSHINER_REFERENCE_RUN") == "1",
+        "session_id": os.getsid(0),
+        "start_ns": start_ns,
+        "success": success,
+        "task_data_digest_after": after_digest,
+        "task_data_digest_before": before_digest,
+        **details,
+    }
+    if error is not None:
+        event["error"] = error
+    append_audit(event)
+
+    if success:
+        print(json.dumps(output, sort_keys=True, separators=(",", ":")))
+        return 0
+    print(json.dumps({"error": error or "operation failed"}), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

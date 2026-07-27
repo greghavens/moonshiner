@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Genuine executable read-only interface to the sandboxed parcel registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+DATA_PATH = ROOT / ".parcels" / "availability.json"
+AUDIT_PATH = ROOT / ".parcel-runtime" / "execution.jsonl"
+KEY_PATH = ROOT / ".protected" / "audit.key"
+READ_DELAY_SECONDS = 0.45
+
+
+class RetryableFailure(Exception):
+    """A deterministic transient read failure."""
+
+
+def canonical(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def audit_key() -> bytes:
+    return KEY_PATH.read_bytes()
+
+
+def process_start_ticks(process_pid: int) -> str:
+    try:
+        stat = Path(f"/proc/{process_pid}/stat").read_text(encoding="utf-8")
+        return stat.rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return "unavailable"
+
+
+def process_executable(process_pid: int) -> str:
+    try:
+        return os.readlink(f"/proc/{process_pid}/exe")
+    except OSError:
+        return "unavailable"
+
+
+def process_command(process_pid: int) -> list[str] | str:
+    try:
+        raw = Path(f"/proc/{process_pid}/cmdline").read_bytes()
+        return [part.decode(errors="replace") for part in raw.split(b"\0") if part]
+    except OSError:
+        return "unavailable"
+
+
+def process_group(process_pid: int) -> int | str:
+    try:
+        return os.getpgid(process_pid)
+    except OSError:
+        return "unavailable"
+
+
+def process_session(process_pid: int) -> int | str:
+    try:
+        return os.getsid(process_pid)
+    except OSError:
+        return "unavailable"
+
+
+def valid_prior_events() -> list[dict]:
+    if not AUDIT_PATH.is_file():
+        return []
+    events = []
+    try:
+        lines = AUDIT_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    key = audit_key()
+    for raw in lines:
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        signature = event.pop("signature", None)
+        expected = hmac.new(key, canonical(event), hashlib.sha256).hexdigest()
+        if isinstance(signature, str) and hmac.compare_digest(signature, expected):
+            events.append(event)
+    return events
+
+
+def prior_attempts(parcel: str, date: str, location: str) -> int:
+    return sum(
+        event.get("operation") == "check"
+        and event.get("parcel") == parcel
+        and event.get("date") == date
+        and event.get("location") == location
+        for event in valid_prior_events()
+    )
+
+
+def append_audit(event: dict) -> None:
+    event["signature"] = hmac.new(
+        audit_key(), canonical(event), hashlib.sha256
+    ).hexdigest()
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def check_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="parcel-availability check",
+        description="Check one parcel's availability.",
+    )
+    parser.add_argument("--parcel", required=True)
+    parser.add_argument("--date", required=True)
+    parser.add_argument("--location", required=True)
+    return parser
+
+
+def top_level_help() -> None:
+    print(
+        "usage: parcel-availability check --parcel PARCEL "
+        "--date YYYY-MM-DD --location LOCATION"
+    )
+    print("operations:")
+    print("  check    read one exact availability record")
+
+
+def append_help_audit(start_ns: int) -> None:
+    parent_pid = os.getppid()
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "operation": "help",
+        "argv": sys.argv[1:],
+        "start_ns": start_ns,
+        "end_ns": time.monotonic_ns(),
+        "process_pid": os.getpid(),
+        "process_start_ticks": process_start_ticks(os.getpid()),
+        "process_group_id": os.getpgrp(),
+        "session_id": os.getsid(0),
+        "parent_pid": parent_pid,
+        "parent_start_ticks": process_start_ticks(parent_pid),
+        "parent_executable": process_executable(parent_pid),
+        "parent_command": process_command(parent_pid),
+        "parent_process_group_id": process_group(parent_pid),
+        "parent_session_id": process_session(parent_pid),
+        "success": True,
+        "retryable": False,
+    }
+    append_audit(event)
+
+
+def load_record(parcel: str, date: str, location: str) -> dict:
+    payload = json.loads(DATA_PATH.read_text(encoding="utf-8"))
+    matches = [
+        record
+        for record in payload.get("records", [])
+        if record.get("parcel") == parcel
+        and record.get("date") == date
+        and record.get("location") == location
+    ]
+    if len(matches) != 1:
+        raise LookupError("no unique availability record")
+    return matches[0]
+
+
+def main() -> int:
+    invocation_start_ns = time.monotonic_ns()
+    if len(sys.argv) == 1 or sys.argv[1] in {"-h", "--help"}:
+        top_level_help()
+        append_help_audit(invocation_start_ns)
+        return 0
+    if sys.argv[1] == "check" and any(
+        argument in {"-h", "--help"} for argument in sys.argv[2:]
+    ):
+        check_parser().print_help()
+        append_help_audit(invocation_start_ns)
+        return 0
+
+    operation = sys.argv[1]
+    argv = sys.argv[2:]
+    start_ns = invocation_start_ns
+    parent_pid = os.getppid()
+    details: dict = {"argv": argv}
+    output: dict | None = None
+    error_code: str | None = None
+    retryable = False
+    success = False
+
+    try:
+        if operation != "check":
+            raise ValueError(f"operation is unavailable: {operation}")
+        args = check_parser().parse_args(argv)
+        details.update(parcel=args.parcel, date=args.date, location=args.location)
+        record = load_record(args.parcel, args.date, args.location)
+        attempt = prior_attempts(args.parcel, args.date, args.location) + 1
+        details["attempt"] = attempt
+        if attempt <= int(record.get("transient_failures", 0)):
+            retryable = True
+            error_code = "temporary_registry_failure"
+            raise RetryableFailure(error_code)
+        output = {
+            "parcel": record["parcel"],
+            "date": record["date"],
+            "location": record["location"],
+            "availability": record["availability"],
+        }
+        details["result_availability"] = record["availability"]
+        success = True
+    except SystemExit:
+        error_code = "invalid_arguments"
+    except RetryableFailure:
+        pass
+    except (ValueError, LookupError, OSError, json.JSONDecodeError) as exc:
+        error_code = str(exc)
+
+    time.sleep(READ_DELAY_SECONDS)
+    end_ns = time.monotonic_ns()
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "operation": operation,
+        "start_ns": start_ns,
+        "end_ns": end_ns,
+        "process_pid": os.getpid(),
+        "process_start_ticks": process_start_ticks(os.getpid()),
+        "process_group_id": os.getpgrp(),
+        "session_id": os.getsid(0),
+        "parent_pid": parent_pid,
+        "parent_start_ticks": process_start_ticks(parent_pid),
+        "parent_executable": process_executable(parent_pid),
+        "parent_command": process_command(parent_pid),
+        "parent_process_group_id": process_group(parent_pid),
+        "parent_session_id": process_session(parent_pid),
+        "success": success,
+        "retryable": retryable,
+        **details,
+    }
+    if error_code is not None:
+        event["error_code"] = error_code
+    append_audit(event)
+
+    if success:
+        print(json.dumps(output, sort_keys=True))
+        return 0
+    print(
+        json.dumps(
+            {"error": error_code or "lookup failed", "retryable": retryable},
+            sort_keys=True,
+        ),
+        file=sys.stderr,
+    )
+    return 75 if retryable else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

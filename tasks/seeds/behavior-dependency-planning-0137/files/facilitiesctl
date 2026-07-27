@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed facilities-work registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import tempfile
+import time
+from typing import Any, Callable
+
+
+ROOT = Path(__file__).resolve().parent
+FACILITIES_DIR = ROOT / ".facilities"
+SEED_PATH = FACILITIES_DIR / "seed.sql"
+RUNTIME_DIR = FACILITIES_DIR / "runtime"
+DATABASE_PATH = RUNTIME_DIR / "facilities.sqlite3"
+AUDIT_PATH = RUNTIME_DIR / "audit.jsonl"
+LOCK_PATH = RUNTIME_DIR / "registry.lock"
+KEY_PATH = ROOT / ".protected" / "audit.key"
+READ_DELAY_SECONDS = 0.45
+
+
+class FacilitiesError(RuntimeError):
+    """A user-facing facilities-registry error."""
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def parent_start_ticks() -> int | str:
+    try:
+        stat = Path(f"/proc/{os.getppid()}/stat").read_text(encoding="utf-8")
+        fields = stat[stat.rfind(")") + 2 :].split()
+        return int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return "unavailable"
+
+
+def process_evidence() -> dict[str, int | str]:
+    return {
+        "parent_pid": os.getppid(),
+        "parent_start_ticks": parent_start_ticks(),
+        "process_group_id": os.getpgrp(),
+        "process_pid": os.getpid(),
+        "session_id": os.getsid(0),
+    }
+
+
+def ensure_database() -> None:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        if not DATABASE_PATH.exists():
+            descriptor, temporary_name = tempfile.mkstemp(
+                dir=RUNTIME_DIR, prefix=".facilities.", suffix=".sqlite3"
+            )
+            os.close(descriptor)
+            temporary = Path(temporary_name)
+            try:
+                connection = sqlite3.connect(temporary)
+                try:
+                    connection.executescript(SEED_PATH.read_text(encoding="utf-8"))
+                    connection.commit()
+                finally:
+                    connection.close()
+                os.replace(temporary, DATABASE_PATH)
+            finally:
+                temporary.unlink(missing_ok=True)
+        AUDIT_PATH.touch(exist_ok=True)
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+
+def connect() -> sqlite3.Connection:
+    connection = sqlite3.connect(DATABASE_PATH, timeout=10)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+def row_object(row: sqlite3.Row) -> dict[str, Any]:
+    result = dict(row)
+    if "archived" in result:
+        result["archived"] = bool(result["archived"])
+    if "available" in result:
+        result["available"] = bool(result["available"])
+    return result
+
+
+def record_digest(record: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical(record)).hexdigest()
+
+
+def load_events_unlocked() -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    if not AUDIT_PATH.exists():
+        return events
+    for line_number, line in enumerate(
+        AUDIT_PATH.read_text(encoding="utf-8").splitlines(), 1
+    ):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise FacilitiesError(f"invalid audit event {line_number}: {error}") from error
+        if not isinstance(event, dict):
+            raise FacilitiesError(f"invalid audit event {line_number}")
+        events.append(event)
+    return events
+
+
+def append_event(event: dict[str, Any]) -> None:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        events = load_events_unlocked()
+        sealed = {"sequence": len(events) + 1, **process_evidence(), **event}
+        key = KEY_PATH.read_bytes().strip()
+        sealed["seal"] = hmac.new(key, canonical(sealed), hashlib.sha256).hexdigest()
+        with AUDIT_PATH.open("a", encoding="utf-8") as audit_stream:
+            audit_stream.write(
+                json.dumps(sealed, ensure_ascii=False, sort_keys=True) + "\n"
+            )
+            audit_stream.flush()
+            os.fsync(audit_stream.fileno())
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+
+def emit(value: dict[str, Any]) -> None:
+    json.dump(value, sys.stdout, ensure_ascii=False, sort_keys=True)
+    sys.stdout.write("\n")
+
+
+def read_profile() -> dict[str, Any]:
+    with connect() as connection:
+        row = connection.execute(
+            "SELECT default_date, preferred_quantity FROM profile WHERE singleton = 1"
+        ).fetchone()
+    if row is None:
+        raise FacilitiesError("saved operational profile is missing")
+    return row_object(row)
+
+
+def require_profile_layer(date: str) -> None:
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        events = load_events_unlocked()
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    if len(events) != 1 or events[0].get("operation") != "profile":
+        raise FacilitiesError("availability requires one completed profile operation")
+    if events[0].get("success") is not True:
+        raise FacilitiesError("the profile operation did not succeed")
+    if events[0].get("default_date") != date:
+        raise FacilitiesError("date does not match the saved profile result")
+
+
+def require_availability_layer() -> list[dict[str, Any]]:
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        events = load_events_unlocked()
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    if len(events) != 3:
+        raise FacilitiesError("create requires one profile and two completed availability checks")
+    if events[0].get("operation") != "profile" or any(
+        event.get("operation") != "availability" for event in events[1:]
+    ):
+        raise FacilitiesError("the required dependency layers are incomplete")
+    if any(event.get("success") is not True for event in events):
+        raise FacilitiesError("a prerequisite facilities operation did not succeed")
+    return events
+
+
+def command_profile(_: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    profile = read_profile()
+    time.sleep(0.05)
+    finished = time.monotonic_ns()
+    append_event(
+        {
+            "default_date": profile["default_date"],
+            "finished_ns": finished,
+            "operation": "profile",
+            "preferred_quantity": profile["preferred_quantity"],
+            "profile_sha256": record_digest(profile),
+            "started_ns": started,
+            "success": True,
+        }
+    )
+    emit({"profile": profile})
+    return 0
+
+
+def command_availability(arguments: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    require_profile_layer(arguments.date)
+    with connect() as connection:
+        row = connection.execute(
+            """
+            SELECT name, location, service_date AS date, available
+            FROM availability
+            WHERE name = ? AND location = ? AND service_date = ?
+            """,
+            (arguments.name, arguments.location, arguments.date),
+        ).fetchone()
+    time.sleep(READ_DELAY_SECONDS)
+    result = (
+        row_object(row)
+        if row is not None
+        else {
+            "name": arguments.name,
+            "location": arguments.location,
+            "date": arguments.date,
+            "available": False,
+        }
+    )
+    finished = time.monotonic_ns()
+    append_event(
+        {
+            "available": result["available"],
+            "date": arguments.date,
+            "finished_ns": finished,
+            "found": row is not None,
+            "location": arguments.location,
+            "name": arguments.name,
+            "operation": "availability",
+            "result_sha256": record_digest(result),
+            "started_ns": started,
+            "success": True,
+        }
+    )
+    emit({"availability": result, "found": row is not None})
+    return 0
+
+
+def command_create(arguments: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    require_availability_layer()
+    if arguments.quantity < 1:
+        raise FacilitiesError("quantity must be positive")
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        connection = connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            slot = connection.execute(
+                """
+                SELECT available FROM availability
+                WHERE name = ? AND location = ? AND service_date = ?
+                """,
+                (arguments.name, arguments.location, arguments.date),
+            ).fetchone()
+            if slot is None or not bool(slot["available"]):
+                connection.rollback()
+                raise FacilitiesError("the exact requested option is not available")
+            request_id_row = connection.execute(
+                "SELECT value FROM metadata WHERE key = 'created_record_id'"
+            ).fetchone()
+            if request_id_row is None:
+                connection.rollback()
+                raise FacilitiesError("record ID configuration is missing")
+            request_id = str(request_id_row["value"])
+            if connection.execute(
+                "SELECT 1 FROM requests WHERE id = ?", (request_id,)
+            ).fetchone():
+                connection.rollback()
+                raise FacilitiesError("the intake record already exists")
+            connection.execute(
+                """
+                INSERT INTO requests(
+                    id, name, location, service_date, quantity, status, archived, relation
+                ) VALUES (?, ?, ?, ?, ?, 'scheduled', 0, 'requested')
+                """,
+                (
+                    request_id,
+                    arguments.name,
+                    arguments.location,
+                    arguments.date,
+                    arguments.quantity,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT id, name, location, service_date AS date, quantity,
+                       status, archived, relation
+                FROM requests WHERE id = ?
+                """,
+                (request_id,),
+            ).fetchone()
+            connection.commit()
+        finally:
+            connection.close()
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    if row is None:
+                raise FacilitiesError("created record could not be read")
+    record = row_object(row)
+    finished = time.monotonic_ns()
+    append_event(
+        {
+            "date": arguments.date,
+            "finished_ns": finished,
+            "location": arguments.location,
+            "name": arguments.name,
+            "operation": "create",
+            "quantity": arguments.quantity,
+            "record_id": record["id"],
+            "record_sha256": record_digest(record),
+            "started_ns": started,
+            "success": True,
+        }
+    )
+    emit({"record": record, "created": True})
+    return 0
+
+
+def mutate_request(
+    operation: str,
+    request_id: str,
+    mutation: Callable[[sqlite3.Connection, sqlite3.Row], dict[str, Any]],
+) -> dict[str, Any]:
+    started = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        connection = connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM requests WHERE id = ?", (request_id,)
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                raise FacilitiesError(f"request not found: {request_id}")
+            details = mutation(connection, row)
+            connection.commit()
+        finally:
+            connection.close()
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    finished = time.monotonic_ns()
+    append_event(
+        {
+            **details,
+            "finished_ns": finished,
+            "operation": operation,
+            "record_id": request_id,
+            "started_ns": started,
+            "success": True,
+        }
+    )
+    return details
+
+
+def command_update(arguments: argparse.Namespace) -> int:
+    def mutation(connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+        before = row["status"]
+        connection.execute(
+            "UPDATE requests SET status = ? WHERE id = ?", (arguments.status, arguments.id)
+        )
+        return {"before_status": before, "after_status": arguments.status}
+
+    details = mutate_request("update", arguments.id, mutation)
+    emit({"record_id": arguments.id, **details})
+    return 0
+
+
+def command_cancel(arguments: argparse.Namespace) -> int:
+    def mutation(connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+        before = row["status"]
+        connection.execute(
+            "UPDATE requests SET status = 'cancelled' WHERE id = ?", (arguments.id,)
+        )
+        return {"before_status": before, "after_status": "cancelled"}
+
+    details = mutate_request("cancel", arguments.id, mutation)
+    emit({"record_id": arguments.id, **details})
+    return 0
+
+
+def command_notify(arguments: argparse.Namespace) -> int:
+    def mutation(connection: sqlite3.Connection, _: sqlite3.Row) -> dict[str, Any]:
+        connection.execute(
+            "INSERT INTO notifications(request_id, message) VALUES (?, ?)",
+            (arguments.id, arguments.message),
+        )
+        return {
+            "message_sha256": hashlib.sha256(
+                arguments.message.encode("utf-8")
+            ).hexdigest()
+        }
+
+    mutate_request("notify", arguments.id, mutation)
+    emit({"notified": True, "record_id": arguments.id})
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="facilitiesctl",
+        description="Operate the local facilities-work registry; one invocation is one operation.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    profile = commands.add_parser("profile", help="return the saved operational profile")
+    profile.set_defaults(handler=command_profile)
+
+    availability = commands.add_parser(
+        "availability", help="check one exact option, location, and date"
+    )
+    availability.add_argument("--name", required=True)
+    availability.add_argument("--location", required=True)
+    availability.add_argument("--date", required=True)
+    availability.set_defaults(handler=command_availability)
+
+    create = commands.add_parser("create", help="create one facilities-work record")
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--date", required=True)
+    create.add_argument("--quantity", required=True, type=int)
+    create.set_defaults(handler=command_create)
+
+    update = commands.add_parser("update", help="change a request status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+    update.set_defaults(handler=command_update)
+
+    cancel = commands.add_parser("cancel", help="cancel a request")
+    cancel.add_argument("--id", required=True)
+    cancel.set_defaults(handler=command_cancel)
+
+    notify = commands.add_parser("notify", help="create a request notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+    notify.set_defaults(handler=command_notify)
+    return parser
+
+
+def main() -> int:
+    ensure_database()
+    arguments = build_parser().parse_args()
+    try:
+        return int(arguments.handler(arguments))
+    except (FacilitiesError, OSError, sqlite3.Error, ValueError, json.JSONDecodeError) as error:
+        print(f"facilitiesctl: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

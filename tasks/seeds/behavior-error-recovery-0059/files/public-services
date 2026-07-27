@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed public-services registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+SEED_PATH = ROOT / ".public_services" / "seed.sql"
+REGISTRY_RUNTIME = ROOT / ".public_services" / "runtime"
+DATABASE_PATH = REGISTRY_RUNTIME / "public-services.sqlite3"
+INITIALIZE_LOCK_PATH = REGISTRY_RUNTIME / "initialize.lock"
+AUDIT_PATH = ROOT / ".harness" / "runtime" / "public-services-audit.jsonl"
+AUDIT_KEY = b"moonshiner-pi-public-services-error-recovery-0059-v1"
+TIMEOUT_DELAY_SECONDS = 0.35
+OPERATIONS = ("get", "search", "cancel", "create", "update", "notify")
+
+
+def canonical(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def append_audit(event: dict) -> None:
+    event["signature"] = hmac.new(
+        AUDIT_KEY, canonical(event), hashlib.sha256
+    ).hexdigest()
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def ensure_database() -> None:
+    REGISTRY_RUNTIME.mkdir(parents=True, exist_ok=True)
+    with INITIALIZE_LOCK_PATH.open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not DATABASE_PATH.exists():
+            temporary = REGISTRY_RUNTIME / f"public-services-{os.getpid()}.sqlite3.tmp"
+            temporary.unlink(missing_ok=True)
+            connection = sqlite3.connect(temporary)
+            try:
+                connection.executescript(SEED_PATH.read_text(encoding="utf-8"))
+                connection.commit()
+            finally:
+                connection.close()
+            os.replace(temporary, DATABASE_PATH)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def operation_parser(operation: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=f"public-services {operation}")
+    if operation == "get":
+        parser.add_argument("--id", dest="stable_id", required=True)
+    elif operation == "search":
+        parser.add_argument("--name", required=True)
+        parser.add_argument("--location", required=True)
+    elif operation == "cancel":
+        parser.add_argument("--id", dest="stable_id", required=True)
+        parser.add_argument("--reason", required=True)
+    elif operation == "create":
+        parser.add_argument("--name", required=True)
+        parser.add_argument("--location", required=True)
+        parser.add_argument("--status", required=True)
+    elif operation == "update":
+        parser.add_argument("--id", dest="stable_id", required=True)
+        parser.add_argument("--status", required=True)
+    elif operation == "notify":
+        parser.add_argument("--id", dest="stable_id", required=True)
+        parser.add_argument("--message", required=True)
+    return parser
+
+
+def record_for_id(connection: sqlite3.Connection, stable_id: str) -> dict:
+    row = connection.execute(
+        """
+        SELECT stable_id, name, location, status, cancellation_reason
+        FROM records WHERE stable_id = ?
+        """,
+        (stable_id,),
+    ).fetchone()
+    if row is None:
+        raise LookupError(f"stable ID not found: {stable_id}")
+    return {
+        "stable_id": row[0],
+        "name": row[1],
+        "location": row[2],
+        "status": row[3],
+        "cancellation_reason": row[4],
+    }
+
+
+def execute(operation: str, argv: list[str]) -> tuple[dict, dict]:
+    ensure_database()
+    args = operation_parser(operation).parse_args(argv)
+    connection = sqlite3.connect(DATABASE_PATH, timeout=10)
+    try:
+        if operation == "get":
+            record = record_for_id(connection, args.stable_id)
+            return {"record": record}, {
+                "stable_id": args.stable_id,
+                "returned_status": record["status"],
+            }
+
+        if operation == "search":
+            rows = connection.execute(
+                """
+                SELECT stable_id, name, location
+                FROM records WHERE name = ? AND location = ?
+                ORDER BY stable_id
+                """,
+                (args.name, args.location),
+            ).fetchall()
+            matches = [
+                {"stable_id": row[0], "name": row[1], "location": row[2]}
+                for row in rows
+            ]
+            return {"matches": matches}, {
+                "name": args.name,
+                "location": args.location,
+                "result_count": len(matches),
+            }
+
+        if operation == "cancel":
+            record_for_id(connection, args.stable_id)
+            prior_attempts = connection.execute(
+                "SELECT COUNT(*) FROM cancellation_requests WHERE stable_id = ?",
+                (args.stable_id,),
+            ).fetchone()[0]
+            attempt = prior_attempts + 1
+            if args.stable_id == "pub-159" and attempt == 1:
+                connection.execute(
+                    """
+                    INSERT INTO cancellation_requests
+                        (stable_id, reason, outcome)
+                    VALUES (?, ?, 'timed_out_before_commit')
+                    """,
+                    (args.stable_id, args.reason),
+                )
+                connection.commit()
+                time.sleep(TIMEOUT_DELAY_SECONDS)
+                raise TimeoutError(
+                    "gateway timeout after request reached registry; "
+                    "commit status unknown"
+                )
+
+            connection.execute(
+                """
+                INSERT INTO cancellation_requests (stable_id, reason, outcome)
+                VALUES (?, ?, 'committed')
+                """,
+                (args.stable_id, args.reason),
+            )
+            connection.execute(
+                """
+                UPDATE records
+                SET status = 'cancelled', cancellation_reason = ?
+                WHERE stable_id = ?
+                """,
+                (args.reason, args.stable_id),
+            )
+            connection.commit()
+            record = record_for_id(connection, args.stable_id)
+            return {"record": record}, {
+                "stable_id": args.stable_id,
+                "reason": args.reason,
+                "service_attempt": attempt,
+                "returned_status": record["status"],
+            }
+
+        if operation == "create":
+            stable_id = "pub-" + uuid.uuid4().hex[:8]
+            connection.execute(
+                """
+                INSERT INTO records
+                    (stable_id, name, location, status, cancellation_reason)
+                VALUES (?, ?, ?, ?, NULL)
+                """,
+                (stable_id, args.name, args.location, args.status),
+            )
+            connection.commit()
+            record = record_for_id(connection, stable_id)
+            return {"record": record}, {
+                "stable_id": stable_id,
+                "returned_status": record["status"],
+            }
+
+        if operation == "update":
+            record_for_id(connection, args.stable_id)
+            connection.execute(
+                "UPDATE records SET status = ? WHERE stable_id = ?",
+                (args.status, args.stable_id),
+            )
+            connection.commit()
+            record = record_for_id(connection, args.stable_id)
+            return {"record": record}, {
+                "stable_id": args.stable_id,
+                "returned_status": record["status"],
+            }
+
+        if operation == "notify":
+            record_for_id(connection, args.stable_id)
+            cursor = connection.execute(
+                "INSERT INTO notifications (stable_id, message) VALUES (?, ?)",
+                (args.stable_id, args.message),
+            )
+            connection.commit()
+            return {
+                "notification": {
+                    "notification_id": cursor.lastrowid,
+                    "stable_id": args.stable_id,
+                    "message": args.message,
+                }
+            }, {"stable_id": args.stable_id}
+    finally:
+        connection.close()
+
+    raise ValueError(f"operation is unavailable: {operation}")
+
+
+def usage() -> None:
+    print(
+        "usage: public-services {" + ",".join(OPERATIONS) + "} ...",
+        file=sys.stderr,
+    )
+
+
+def main() -> int:
+    if len(sys.argv) == 1 or sys.argv[1] in {"-h", "--help"}:
+        usage()
+        return 2
+
+    operation = sys.argv[1]
+    start_ns = time.monotonic_ns()
+    details: dict = {}
+    output: dict | None = None
+    error: str | None = None
+    success = False
+    exit_status = 0
+
+    try:
+        if operation not in OPERATIONS:
+            raise ValueError(f"operation is unavailable: {operation}")
+        output, details = execute(operation, sys.argv[2:])
+        success = True
+    except TimeoutError as exc:
+        error = str(exc)
+        exit_status = 75
+        details = {
+            "stable_id": getattr(locals().get("args", None), "stable_id", None),
+        }
+        # Parse only the known cancellation form so the timeout event preserves
+        # the request values that reached the registry.
+        if operation == "cancel":
+            parsed = operation_parser(operation).parse_args(sys.argv[2:])
+            details = {
+                "stable_id": parsed.stable_id,
+                "reason": parsed.reason,
+                "service_attempt": 1,
+                "service_reached": True,
+                "may_have_committed": True,
+            }
+    except (LookupError, sqlite3.DatabaseError, ValueError) as exc:
+        error = str(exc)
+        exit_status = 1
+
+    end_ns = time.monotonic_ns()
+    event = {
+        "operation": operation,
+        "success": success,
+        "error": error,
+        "start_ns": start_ns,
+        "end_ns": end_ns,
+        "process_pid": os.getpid(),
+        **details,
+    }
+    append_audit(event)
+
+    if success and output is not None:
+        print(json.dumps(output, sort_keys=True, separators=(",", ":")))
+    elif error is not None:
+        print(error, file=sys.stderr)
+    return exit_status
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

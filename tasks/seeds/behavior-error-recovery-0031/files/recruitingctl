@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed recruiting candidate registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+import signal
+import sys
+import tempfile
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator
+
+
+ROOT = Path(__file__).resolve().parent
+STATE_PATH = ROOT / ".recruiting" / "state.json"
+LOCK_PATH = ROOT / ".recruiting" / "state.lock"
+KEY_PATH = ROOT / ".protected" / "audit.key"
+ACK_DEADLINE_SECONDS = 0.25
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def seal_event(event: dict[str, Any]) -> str:
+    key = bytes.fromhex(KEY_PATH.read_text(encoding="utf-8").strip())
+    return hmac.new(
+        key,
+        canonical_json(event).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+@contextmanager
+def locked_state() -> Iterator[dict[str, Any]]:
+    if not STATE_PATH.is_file():
+        raise RuntimeError("recruiting sandbox is not initialized")
+    LOCK_PATH.touch(exist_ok=True)
+    with LOCK_PATH.open("r+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(state, dict) or state.get("schema_version") != 1:
+            raise RuntimeError("recruiting state has an unsupported schema")
+        yield state
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=STATE_PATH.parent, prefix=".state-", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+                json.dump(state, temporary, ensure_ascii=False, indent=2, sort_keys=True)
+                temporary.write("\n")
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.replace(temporary_name, STATE_PATH)
+        finally:
+            if os.path.exists(temporary_name):
+                os.unlink(temporary_name)
+
+
+def append_event(state: dict[str, Any], event: dict[str, Any]) -> None:
+    payload = {"sequence": state["next_event_sequence"], **event}
+    state["next_event_sequence"] += 1
+    state["events"].append({**payload, "seal": seal_event(payload)})
+
+
+def emit(value: Any) -> None:
+    print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True), flush=True)
+
+
+def timeout_with_unknown_outcome(_signum: int, _frame: Any) -> None:
+    print(
+        "recruitingctl: acknowledgement deadline exceeded after submission; "
+        "the cancellation outcome is unknown",
+        file=sys.stderr,
+        flush=True,
+    )
+    os._exit(124)
+
+
+def get_record(stable_id: str) -> int:
+    with locked_state() as state:
+        record = state["records"].get(stable_id)
+        append_event(
+            state,
+            {
+                "operation": "get",
+                "outcome": "returned" if record is not None else "not_found",
+                "record_id": stable_id,
+                **({"observed_status": record["status"]} if record is not None else {}),
+            },
+        )
+        result = record.copy() if record is not None else None
+    if result is None:
+        print(f"candidate record not found: {stable_id}", file=sys.stderr)
+        return 4
+    emit({"record": result})
+    return 0
+
+
+def cancel_record(stable_id: str, reason: str) -> int:
+    deadline = False
+    conflict: str | None = None
+    with locked_state() as state:
+        record = state["records"].get(stable_id)
+        if record is None:
+            append_event(
+                state,
+                {
+                    "operation": "cancel",
+                    "outcome": "not_found",
+                    "reason": reason,
+                    "record_id": stable_id,
+                    "state_changed": False,
+                },
+            )
+            result = None
+        elif record["status"] == "cancelled":
+            same_reason = record.get("cancellation_reason") == reason
+            append_event(
+                state,
+                {
+                    "after_status": "cancelled",
+                    "before_status": "cancelled",
+                    "operation": "cancel",
+                    "outcome": "already_cancelled" if same_reason else "reason_conflict",
+                    "reason": reason,
+                    "record_id": stable_id,
+                    "state_changed": False,
+                },
+            )
+            if not same_reason:
+                conflict = "cancelled with a different reason"
+            result = record.copy()
+        elif record["status"] != "active":
+            conflict = f"status {record['status']}"
+            append_event(
+                state,
+                {
+                    "after_status": record["status"],
+                    "before_status": record["status"],
+                    "operation": "cancel",
+                    "outcome": "invalid_status",
+                    "reason": reason,
+                    "record_id": stable_id,
+                    "state_changed": False,
+                },
+            )
+            result = record.copy()
+        else:
+            remaining = state["faults"]["cancel_timeout_without_commit"].get(
+                stable_id, 0
+            )
+            if remaining > 0:
+                state["faults"]["cancel_timeout_without_commit"][stable_id] = (
+                    remaining - 1
+                )
+                deadline = True
+                append_event(
+                    state,
+                    {
+                        "after_status": "active",
+                        "before_status": "active",
+                        "operation": "cancel",
+                        "outcome": "timeout_unknown",
+                        "reason": reason,
+                        "record_id": stable_id,
+                        "state_changed": False,
+                    },
+                )
+            else:
+                record["status"] = "cancelled"
+                record["cancellation_reason"] = reason
+                record["version"] += 1
+                append_event(
+                    state,
+                    {
+                        "after_status": "cancelled",
+                        "before_status": "active",
+                        "operation": "cancel",
+                        "outcome": "committed",
+                        "reason": reason,
+                        "record_id": stable_id,
+                        "state_changed": True,
+                    },
+                )
+            result = record.copy()
+    if result is None:
+        print(f"candidate record not found: {stable_id}", file=sys.stderr)
+        return 4
+    if conflict is not None:
+        print(
+            f"candidate record {stable_id} cannot be cancelled: {conflict}",
+            file=sys.stderr,
+        )
+        return 6
+    if deadline:
+        signal.signal(signal.SIGALRM, timeout_with_unknown_outcome)
+        signal.setitimer(signal.ITIMER_REAL, ACK_DEADLINE_SECONDS)
+        time.sleep(30)
+    emit({"record": result})
+    return 0
+
+
+def search_records(query: str) -> int:
+    with locked_state() as state:
+        folded = query.casefold()
+        matches = [
+            {
+                "candidate_name": record["candidate_name"],
+                "id": record["id"],
+                "location": record["location"],
+            }
+            for record in state["records"].values()
+            if folded in record["candidate_name"].casefold()
+        ]
+        append_event(
+            state,
+            {
+                "operation": "search",
+                "outcome": "returned",
+                "query": query,
+                "record_id": "*",
+            },
+        )
+    emit({"matches": matches})
+    return 0
+
+
+def list_records() -> int:
+    with locked_state() as state:
+        records = [
+            {
+                "candidate_name": record["candidate_name"],
+                "id": record["id"],
+                "status": record["status"],
+            }
+            for record in state["records"].values()
+        ]
+        append_event(
+            state,
+            {"operation": "list", "outcome": "returned", "record_id": "*"},
+        )
+    emit({"records": records})
+    return 0
+
+
+def update_status(stable_id: str, status: str) -> int:
+    with locked_state() as state:
+        record = state["records"].get(stable_id)
+        before_status = record["status"] if record is not None else None
+        if record is not None:
+            record["status"] = status
+            record["version"] += 1
+        append_event(
+            state,
+            {
+                "after_status": status if record is not None else None,
+                "before_status": before_status,
+                "operation": "update",
+                "outcome": "committed" if record is not None else "not_found",
+                "record_id": stable_id,
+            },
+        )
+        result = record.copy() if record is not None else None
+    if result is None:
+        print(f"candidate record not found: {stable_id}", file=sys.stderr)
+        return 4
+    emit({"record": result})
+    return 0
+
+
+def create_record(stable_id: str, name: str, location: str) -> int:
+    with locked_state() as state:
+        exists = stable_id in state["records"]
+        if not exists:
+            state["records"][stable_id] = {
+                "candidate_name": name,
+                "cancellation_reason": None,
+                "coordinator": "Unassigned",
+                "id": stable_id,
+                "location": location,
+                "status": "active",
+                "version": 1,
+            }
+        append_event(
+            state,
+            {
+                "operation": "create",
+                "outcome": "conflict" if exists else "committed",
+                "record_id": stable_id,
+            },
+        )
+        result = state["records"][stable_id].copy()
+    if exists:
+        print(f"candidate record already exists: {stable_id}", file=sys.stderr)
+        return 6
+    emit({"record": result})
+    return 0
+
+
+def notify(stable_id: str, message: str) -> int:
+    with locked_state() as state:
+        found = stable_id in state["records"]
+        if found:
+            state["notifications"].append(
+                {"message": message, "record_id": stable_id}
+            )
+        append_event(
+            state,
+            {
+                "operation": "notify",
+                "outcome": "queued" if found else "not_found",
+                "record_id": stable_id,
+            },
+        )
+    if not found:
+        print(f"candidate record not found: {stable_id}", file=sys.stderr)
+        return 4
+    emit({"outcome": "queued", "record_id": stable_id})
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="recruitingctl",
+        description="Inspect and administer recruiting candidate records in the local sandbox.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    get_parser = commands.add_parser("get", help="retrieve one complete record by ID")
+    get_parser.add_argument("--id", required=True, dest="stable_id")
+
+    cancel_parser = commands.add_parser("cancel", help="cancel one candidate record")
+    cancel_parser.add_argument("--id", required=True, dest="stable_id")
+    cancel_parser.add_argument("--reason", required=True)
+
+    search_parser = commands.add_parser("search", help="search records by candidate name")
+    search_parser.add_argument("--query", required=True)
+
+    commands.add_parser("list", help="list recruiting candidate records")
+
+    update_parser = commands.add_parser("update", help="replace a record status")
+    update_parser.add_argument("--id", required=True, dest="stable_id")
+    update_parser.add_argument("--status", required=True)
+
+    create_parser = commands.add_parser("create", help="create a candidate record")
+    create_parser.add_argument("--id", required=True, dest="stable_id")
+    create_parser.add_argument("--name", required=True)
+    create_parser.add_argument("--location", required=True)
+
+    notify_parser = commands.add_parser("notify", help="queue a candidate notification")
+    notify_parser.add_argument("--id", required=True, dest="stable_id")
+    notify_parser.add_argument("--message", required=True)
+    return parser
+
+
+def main() -> int:
+    arguments = build_parser().parse_args()
+    if arguments.command == "get":
+        return get_record(arguments.stable_id)
+    if arguments.command == "cancel":
+        return cancel_record(arguments.stable_id, arguments.reason)
+    if arguments.command == "search":
+        return search_records(arguments.query)
+    if arguments.command == "list":
+        return list_records()
+    if arguments.command == "update":
+        return update_status(arguments.stable_id, arguments.status)
+    if arguments.command == "create":
+        return create_record(arguments.stable_id, arguments.name, arguments.location)
+    return notify(arguments.stable_id, arguments.message)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        print(f"recruitingctl: {error}", file=sys.stderr)
+        raise SystemExit(70)

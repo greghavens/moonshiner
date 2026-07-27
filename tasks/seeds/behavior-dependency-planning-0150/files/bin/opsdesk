@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""Sandboxed operational client for the dependency-planning task."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DATA = ROOT / ".opsdesk"
+RUNTIME = DATA / "runtime"
+SEED_PATH = DATA / "seed.json"
+RECORDS_PATH = RUNTIME / "records.json"
+AUDIT_PATH = RUNTIME / "audit.jsonl"
+LOCK_PATH = RUNTIME / "runtime.lock"
+AUDIT_KEY_PATH = ROOT / ".moonshiner" / "audit.key"
+
+
+def load_json(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def emit(value: dict[str, Any]) -> None:
+    print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+
+
+def audit_entries() -> list[dict[str, Any]]:
+    if not AUDIT_PATH.exists():
+        return []
+    entries: list[dict[str, Any]] = []
+    with AUDIT_PATH.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                entries.append(json.loads(line))
+    return entries
+
+
+def append_audit(entry: dict[str, Any]) -> None:
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        with AUDIT_PATH.open("a", encoding="utf-8") as audit_handle:
+            audit_handle.write(json.dumps(entry, sort_keys=True, separators=(",", ":")) + "\n")
+            audit_handle.flush()
+            os.fsync(audit_handle.fileno())
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
+def signature(entry: dict[str, Any]) -> str:
+    payload = json.dumps(entry, sort_keys=True, separators=(",", ":")).encode()
+    return hmac.new(AUDIT_KEY_PATH.read_bytes(), payload, hashlib.sha256).hexdigest()
+
+
+def event(operation: str, started_ns: int, result: dict[str, Any]) -> dict[str, Any]:
+    entry = {
+        "operation": operation,
+        "pid": os.getpid(),
+        "started_ns": started_ns,
+        "ended_ns": time.time_ns(),
+        "result": result,
+        "reference_solution_present": (ROOT / ".reference_solution").is_file(),
+    }
+    entry["signature"] = signature(entry)
+    return entry
+
+
+def fail(operation: str, started_ns: int, message: str) -> None:
+    result = {"error": message}
+    append_audit(event(operation + ".rejected", started_ns, result))
+    emit(result)
+    raise SystemExit(2)
+
+
+def profile(_: argparse.Namespace) -> None:
+    started_ns = time.time_ns()
+    seed = load_json(SEED_PATH)
+    result = {"default_date": seed["profiles"]["saved-operational"]["default_date"]}
+    append_audit(event("profile.get", started_ns, result))
+    emit(result)
+
+
+def availability(args: argparse.Namespace) -> None:
+    started_ns = time.time_ns()
+    entries = audit_entries()
+    profile_reads = [entry for entry in entries if entry.get("operation") == "profile.get"]
+    if not profile_reads:
+        fail("availability.check", started_ns, "profile result required before availability checks")
+    default_date = profile_reads[-1]["result"]["default_date"]
+    if args.date != default_date:
+        fail("availability.check", started_ns, "date does not match the saved profile result")
+
+    seed = load_json(SEED_PATH)
+    match = next(
+        (
+            option
+            for option in seed["options"]
+            if option["team"] == args.team and option["option"] == args.option
+        ),
+        None,
+    )
+    if match is None:
+        fail("availability.check", started_ns, "unknown team and option pair")
+
+    # A fixed delay makes true process overlap observable without making results random.
+    time.sleep(0.8)
+    result = {
+        "available": bool(match["availability"].get(args.date, False)),
+        "date": args.date,
+        "option": match["option"],
+        "option_id": match["option_id"],
+        "team": match["team"],
+    }
+    append_audit(event("availability.check", started_ns, result))
+    emit(result)
+
+
+def create(args: argparse.Namespace) -> None:
+    started_ns = time.time_ns()
+    entries = audit_entries()
+    checks = [
+        entry["result"]
+        for entry in entries
+        if entry.get("operation") == "availability.check"
+        and entry.get("result", {}).get("date") == args.date
+    ]
+    seed = load_json(SEED_PATH)
+    options = seed["options"]
+    checked_ids = {check.get("option_id") for check in checks}
+    required_ids = {option["option_id"] for option in options}
+    if checked_ids != required_ids:
+        fail("record.create", started_ns, "both availability results are required before create")
+
+    available_ids = {
+        check["option_id"] for check in checks if check.get("available") is True
+    }
+    chosen = next(
+        (option for option in options if option["option_id"] in available_ids),
+        None,
+    )
+    if chosen is None:
+        fail("record.create", started_ns, "no option is available")
+    if args.option_id != chosen["option_id"]:
+        fail("record.create", started_ns, "requested option is not the first available option")
+    if args.quantity != 1:
+        fail("record.create", started_ns, "quantity must be 1")
+
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        records = load_json(RECORDS_PATH) if RECORDS_PATH.exists() else []
+        if records:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            fail("record.create", started_ns, "a record already exists")
+        result = {
+            "date": args.date,
+            "location": None,
+            "option": chosen["option"],
+            "quantity": args.quantity,
+            "record_id": "REC-20260917-001",
+            "team": chosen["team"],
+        }
+        records.append(result)
+        temp_path = RECORDS_PATH.with_suffix(".tmp")
+        with temp_path.open("w", encoding="utf-8") as handle:
+            json.dump(records, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, RECORDS_PATH)
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+    append_audit(event("record.create", started_ns, result))
+    emit(result)
+
+
+def notify(args: argparse.Namespace) -> None:
+    started_ns = time.time_ns()
+    result = {"channel": args.channel, "notified": True}
+    append_audit(event("notification.send", started_ns, result))
+    emit(result)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="opsdesk",
+        description="Operational profile, availability, and record client",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    profile_parser = commands.add_parser("profile", help="return the saved operational profile")
+    profile_parser.set_defaults(handler=profile)
+
+    availability_parser = commands.add_parser("availability", help="check one option on one date")
+    availability_parser.add_argument("--team", required=True)
+    availability_parser.add_argument("--option", required=True)
+    availability_parser.add_argument("--date", required=True)
+    availability_parser.set_defaults(handler=availability)
+
+    create_parser = commands.add_parser("create", help="create one record")
+    create_parser.add_argument("--option-id", required=True)
+    create_parser.add_argument("--date", required=True)
+    create_parser.add_argument("--quantity", required=True, type=int)
+    create_parser.set_defaults(handler=create)
+
+    notify_parser = commands.add_parser("notify", help="send an optional notification")
+    notify_parser.add_argument("--channel", required=True)
+    notify_parser.set_defaults(handler=notify)
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    if sys.argv[1:] == ["--help"]:
+        started_ns = time.time_ns()
+        parser.print_help()
+        append_audit(event("interface.help", started_ns, {"program": "opsdesk"}))
+        return
+    args = parser.parse_args()
+    args.handler(args)
+
+
+if __name__ == "__main__":
+    main()

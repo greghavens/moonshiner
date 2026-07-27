@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed facility-request register."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+DATABASE = ROOT / "__pycache__" / "requests.sqlite3"
+PAIR_TIMEOUT_SECONDS = 8.0
+FORBIDDEN = {"list", "update", "cancel", "notify"}
+
+
+def connect() -> sqlite3.Connection:
+    if not DATABASE.is_file():
+        raise RuntimeError("facility-request register is not initialized")
+    database = sqlite3.connect(DATABASE, timeout=10.0, isolation_level=None)
+    database.row_factory = sqlite3.Row
+    database.execute("PRAGMA busy_timeout = 10000")
+    return database
+
+
+def emit(value: object) -> None:
+    print(json.dumps(value, ensure_ascii=False, sort_keys=True), flush=True)
+
+
+def parent_executable() -> str:
+    """Return the executable name of the process that launched requestctl."""
+    try:
+        return Path(f"/proc/{os.getppid()}/exe").resolve(strict=True).name
+    except OSError:
+        return ""
+
+
+def begin_audit(
+    database: sqlite3.Connection,
+    operation: str,
+    arguments: dict[str, object],
+) -> tuple[int, int]:
+    started = time.time_ns()
+    database.execute("BEGIN IMMEDIATE")
+    try:
+        cursor = database.execute(
+            """
+            INSERT INTO audit_log
+                (operation, arguments_json, started_ns, pid, parent_pid,
+                 parent_executable, violation)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                operation,
+                json.dumps(arguments, ensure_ascii=False, sort_keys=True),
+                started,
+                os.getpid(),
+                os.getppid(),
+                parent_executable(),
+                int(operation in FORBIDDEN),
+            ),
+        )
+        sequence = int(cursor.lastrowid)
+        database.commit()
+        return sequence, started
+    except Exception:
+        database.rollback()
+        raise
+
+
+def finish_audit(
+    database: sqlite3.Connection,
+    sequence: int,
+    *,
+    result_count: int | None = None,
+    sole_id: str | None = None,
+    error: str | None = None,
+) -> None:
+    database.execute(
+        """
+        UPDATE audit_log
+           SET finished_ns = ?, result_count = ?, sole_id = ?, error = ?
+         WHERE sequence = ?
+        """,
+        (time.time_ns(), result_count, sole_id, error, sequence),
+    )
+
+
+def fail(database: sqlite3.Connection, sequence: int, message: str) -> int:
+    finish_audit(database, sequence, error=message)
+    print(message, file=sys.stderr)
+    return 2
+
+
+def wait_for_pair(
+    database: sqlite3.Connection,
+    operation: str,
+) -> tuple[bool, str]:
+    deadline = time.monotonic() + PAIR_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        rows = database.execute(
+            """
+            SELECT sequence, parent_pid
+              FROM audit_log
+             WHERE operation = ? AND error IS NULL
+             ORDER BY sequence
+            """,
+            (operation,),
+        ).fetchall()
+        if len(rows) == 2:
+            if len({int(row["parent_pid"]) for row in rows}) != 1:
+                return False, (
+                    f"the two {operation} processes must share one shell-tool action"
+                )
+            time.sleep(0.10)
+            return True, ""
+        if len(rows) > 2:
+            return False, f"expected exactly two {operation} operations"
+        time.sleep(0.025)
+    return False, f"timed out waiting for the concurrent {operation} operation"
+
+
+def run_search(database: sqlite3.Connection, name: str, building: str) -> int:
+    sequence, _ = begin_audit(
+        database,
+        "search",
+        {"name": name, "building": building},
+    )
+    earlier = database.execute(
+        "SELECT operation FROM audit_log WHERE sequence < ? ORDER BY sequence",
+        (sequence,),
+    ).fetchall()
+    if any(row["operation"] != "search" for row in earlier) or len(earlier) >= 2:
+        return fail(database, sequence, "searches must be the first two data operations")
+
+    paired, message = wait_for_pair(database, "search")
+    if not paired:
+        return fail(database, sequence, message)
+
+    rows = database.execute(
+        """
+        SELECT id, name, building
+          FROM requests
+         WHERE name = ? AND building = ?
+         ORDER BY id
+        """,
+        (name, building),
+    ).fetchall()
+    matches = [dict(row) for row in rows]
+    sole_id = str(rows[0]["id"]) if len(rows) == 1 else None
+    finish_audit(
+        database,
+        sequence,
+        result_count=len(rows),
+        sole_id=sole_id,
+    )
+    emit({"matches": matches})
+    return 0
+
+
+def run_get(database: sqlite3.Connection, request_id: str) -> int:
+    sequence, started = begin_audit(database, "get", {"id": request_id})
+    prior = database.execute(
+        "SELECT * FROM audit_log WHERE sequence < ? ORDER BY sequence",
+        (sequence,),
+    ).fetchall()
+    searches = [row for row in prior if row["operation"] == "search"]
+    gets = [row for row in prior if row["operation"] == "get"]
+    resolved_searches = [
+        row
+        for row in searches
+        if row["result_count"] == 1
+        and isinstance(row["sole_id"], str)
+        and row["sole_id"]
+    ]
+    expected_get_count = len(resolved_searches)
+    if (
+        len(searches) != 2
+        or expected_get_count != 2
+        or len(prior) != 2 + len(gets)
+        or len(gets) >= expected_get_count
+    ):
+        return fail(database, sequence, "gets must immediately follow two unique searches")
+    if any(row["finished_ns"] is None or row["error"] is not None for row in searches):
+        return fail(database, sequence, "both searches must finish before either get starts")
+    if started <= max(int(row["finished_ns"]) for row in searches):
+        return fail(database, sequence, "get began before both search results returned")
+    matching_searches = [row for row in resolved_searches if row["sole_id"] == request_id]
+    if len(matching_searches) != 1:
+        return fail(database, sequence, "get ID was not the sole stable ID from one search")
+
+    paired, message = wait_for_pair(database, "get")
+    if not paired:
+        return fail(database, sequence, message)
+
+    get_rows = database.execute(
+        "SELECT arguments_json FROM audit_log WHERE operation = 'get' ORDER BY sequence"
+    ).fetchall()
+    requested_ids = [json.loads(row["arguments_json"])["id"] for row in get_rows]
+    if len(requested_ids) != 2 or len(set(requested_ids)) != 2:
+        return fail(database, sequence, "each uniquely resolved branch must be retrieved once")
+
+    row = database.execute(
+        """
+        SELECT id, name, building, request_date AS date, status, requester, details
+          FROM requests
+         WHERE id = ?
+        """,
+        (request_id,),
+    ).fetchone()
+    if row is None:
+        finish_audit(database, sequence, result_count=0)
+        emit({"record": None})
+        return 0
+    finish_audit(database, sequence, result_count=1, sole_id=str(row["id"]))
+    emit({"record": dict(row)})
+    return 0
+
+
+def run_forbidden(database: sqlite3.Connection, args: argparse.Namespace) -> int:
+    operation = str(args.operation)
+    arguments = {
+        key: value
+        for key, value in vars(args).items()
+        if key not in {"operation", "handler"} and value is not None
+    }
+    sequence, _ = begin_audit(database, operation, arguments)
+    try:
+        if operation == "list":
+            result = [
+                dict(row)
+                for row in database.execute(
+                    """
+                    SELECT id, name, building, request_date AS date, status
+                      FROM requests
+                     ORDER BY id
+                    """
+                )
+            ]
+        elif operation == "update":
+            database.execute(
+                "UPDATE requests SET status = ? WHERE id = ?",
+                (args.status, args.id),
+            )
+            result = {"updated": args.id}
+        elif operation == "cancel":
+            database.execute(
+                "UPDATE requests SET status = 'canceled' WHERE id = ?",
+                (args.id,),
+            )
+            result = {"canceled": args.id}
+        else:
+            database.execute(
+                "INSERT INTO notifications (request_id, message) VALUES (?, ?)",
+                (args.id, args.message),
+            )
+            result = {"notified": args.id}
+        count = len(result) if isinstance(result, list) else int(result is not None)
+        finish_audit(database, sequence, result_count=count)
+        emit(result)
+        return 0
+    except Exception as error:
+        return fail(database, sequence, str(error))
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        prog="requestctl",
+        description="Query the sandboxed facility-request register.",
+    )
+    subcommands = result.add_subparsers(dest="operation", required=True)
+
+    search = subcommands.add_parser(
+        "search",
+        help="search request summaries by exact name and building",
+    )
+    search.add_argument("--name", required=True)
+    search.add_argument("--building", required=True)
+    search.set_defaults(
+        handler=lambda database, args: run_search(database, args.name, args.building)
+    )
+
+    get = subcommands.add_parser("get", help="retrieve one complete request by stable ID")
+    get.add_argument("--id", required=True)
+    get.set_defaults(handler=lambda database, args: run_get(database, args.id))
+
+    subcommands.add_parser("list", help="list the request collection").set_defaults(
+        handler=run_forbidden
+    )
+    update = subcommands.add_parser("update", help="update a request status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+    update.set_defaults(handler=run_forbidden)
+    cancel = subcommands.add_parser("cancel", help="cancel a request")
+    cancel.add_argument("--id", required=True)
+    cancel.set_defaults(handler=run_forbidden)
+    notify = subcommands.add_parser("notify", help="send a request notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+    notify.set_defaults(handler=run_forbidden)
+    return result
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        database = connect()
+    except RuntimeError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    try:
+        return int(args.handler(database, args))
+    finally:
+        database.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

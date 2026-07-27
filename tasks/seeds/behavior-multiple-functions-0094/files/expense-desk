@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed expenses service."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+SEED_PATH = ROOT / ".expenses" / "seed.sql"
+RUNTIME_DIR = ROOT / ".expenses" / "runtime"
+DATABASE_PATH = RUNTIME_DIR / "expenses.sqlite3"
+INITIALIZE_LOCK_PATH = RUNTIME_DIR / "initialize.lock"
+AUDIT_PATH = ROOT / ".protected" / "runtime" / "expense-audit.jsonl"
+AUDIT_KEY_PATH = ROOT / ".protected" / "audit.key"
+OPERATIONS = (
+    "profile",
+    "search",
+    "list",
+    "open",
+    "availability",
+    "create",
+    "update",
+    "cancel",
+    "update-profile",
+    "notify",
+)
+PUBLIC_EXPENSE_FIELDS = (
+    "id",
+    "description",
+    "amount_cents",
+    "status",
+    "location",
+    "expense_date",
+)
+
+
+def canonical(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def append_audit(event: dict) -> None:
+    key = AUDIT_KEY_PATH.read_bytes().rstrip(b"\n")
+    event["signature"] = hmac.new(
+        key, canonical(event), hashlib.sha256
+    ).hexdigest()
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(
+            json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def initialize_database() -> None:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    with INITIALIZE_LOCK_PATH.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if DATABASE_PATH.exists():
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            return
+        temporary = RUNTIME_DIR / (
+            f"expenses.sqlite3.initialize-{os.getpid()}-{uuid.uuid4().hex}"
+        )
+        try:
+            connection = sqlite3.connect(temporary)
+            try:
+                connection.executescript(SEED_PATH.read_text(encoding="utf-8"))
+                connection.commit()
+            finally:
+                connection.close()
+            os.replace(temporary, DATABASE_PATH)
+        finally:
+            temporary.unlink(missing_ok=True)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def connect() -> sqlite3.Connection:
+    initialize_database()
+    connection = sqlite3.connect(DATABASE_PATH)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+def operation_parser(operation: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=f"expense-desk {operation}")
+    if operation in {"open", "cancel"}:
+        parser.add_argument("--id", required=True)
+    elif operation == "search":
+        parser.add_argument("--query", required=True)
+    elif operation == "list":
+        parser.add_argument("--status")
+        parser.add_argument("--location")
+    elif operation == "availability":
+        parser.add_argument("--location", required=True)
+        parser.add_argument("--date", required=True)
+    elif operation == "create":
+        parser.add_argument("--description", required=True)
+        parser.add_argument("--amount-cents", required=True, type=int)
+        parser.add_argument("--status", required=True)
+        parser.add_argument("--location", required=True)
+        parser.add_argument("--expense-date", required=True)
+    elif operation == "update":
+        parser.add_argument("--id", required=True)
+        parser.add_argument("--status", required=True)
+    elif operation == "update-profile":
+        parser.add_argument("--field", required=True)
+        parser.add_argument("--value", required=True)
+    elif operation == "notify":
+        parser.add_argument("--id", required=True)
+        parser.add_argument("--message", required=True)
+    return parser
+
+
+def public_expense(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["stable_id"],
+        "description": row["description"],
+        "amount_cents": row["amount_cents"],
+        "status": row["status"],
+        "location": row["location"],
+        "expense_date": row["expense_date"],
+    }
+
+
+def current_expense(
+    connection: sqlite3.Connection, stable_id: str
+) -> sqlite3.Row:
+    rows = connection.execute(
+        """
+        SELECT stable_id, description, amount_cents, status, location,
+               expense_date
+        FROM expense_records
+        WHERE stable_id = ? AND lifecycle = 'current'
+        """,
+        (stable_id,),
+    ).fetchall()
+    if len(rows) != 1:
+        raise LookupError(f"expense ID not found: {stable_id}")
+    return rows[0]
+
+
+def result_evidence(expenses: list[dict]) -> dict:
+    return {
+        "result_count": len(expenses),
+        "result_ids": [expense["id"] for expense in expenses],
+        "result_sha256": hashlib.sha256(canonical(expenses)).hexdigest(),
+    }
+
+
+def execute(operation: str, argv: list[str]) -> tuple[dict, dict]:
+    args = operation_parser(operation).parse_args(argv)
+    connection = connect()
+    try:
+        if operation == "profile":
+            field_rows = connection.execute(
+                """
+                SELECT field_name
+                FROM preference_fields
+                ORDER BY display_order
+                """
+            ).fetchall()
+            setting_rows = connection.execute(
+                """
+                SELECT p.field_name, p.field_value
+                FROM profile_preferences AS p
+                JOIN preference_fields AS f
+                  ON f.field_name = p.field_name
+                WHERE p.profile_id = 'primary'
+                ORDER BY f.display_order
+                """
+            ).fetchall()
+            requested_fields = [row["field_name"] for row in field_rows]
+            preferences = {
+                row["field_name"]: row["field_value"] for row in setting_rows
+            }
+            output = {
+                "requested_fields": requested_fields,
+                "preferences": preferences,
+            }
+            return output, {
+                "profile_id": "primary",
+                "requested_fields": requested_fields,
+                "returned_fields": list(preferences),
+                "result_count": len(preferences),
+                "result_sha256": hashlib.sha256(canonical(output)).hexdigest(),
+            }
+
+        if operation == "search":
+            needle = args.query.casefold()
+            rows = connection.execute(
+                """
+                SELECT stable_id, description, amount_cents, status, location,
+                       expense_date
+                FROM expense_records
+                WHERE lifecycle = 'current'
+                ORDER BY stable_id
+                """
+            ).fetchall()
+            matches = [
+                {
+                    "id": row["stable_id"],
+                    "description": row["description"],
+                    "location": row["location"],
+                }
+                for row in rows
+                if needle
+                in " ".join(
+                    (row["stable_id"], row["description"], row["location"])
+                ).casefold()
+            ]
+            return {"matches": matches}, {
+                "query": args.query,
+                "result_count": len(matches),
+                "result_ids": [match["id"] for match in matches],
+            }
+
+        if operation == "list":
+            clauses = ["lifecycle = 'current'"]
+            values: list[str] = []
+            if args.status is not None:
+                clauses.append("status = ?")
+                values.append(args.status)
+            if args.location is not None:
+                clauses.append("location = ?")
+                values.append(args.location)
+            rows = connection.execute(
+                """
+                SELECT stable_id, description, amount_cents, status, location,
+                       expense_date
+                FROM expense_records
+                WHERE
+                """
+                + " AND ".join(clauses)
+                + " ORDER BY stable_id",
+                values,
+            ).fetchall()
+            expenses = [public_expense(row) for row in rows]
+            return {"expenses": expenses}, {
+                "status": args.status,
+                "location": args.location,
+                **result_evidence(expenses),
+            }
+
+        if operation == "open":
+            expense = public_expense(current_expense(connection, args.id))
+            return {"expense": expense}, {
+                "expense_id": args.id,
+                **result_evidence([expense]),
+                "returned_fields": sorted(expense),
+            }
+
+        if operation == "availability":
+            rows = connection.execute(
+                """
+                SELECT location, available_date, reviewer_capacity
+                FROM availability
+                WHERE location = ? AND available_date = ?
+                ORDER BY location, available_date
+                """,
+                (args.location, args.date),
+            ).fetchall()
+            availability = [dict(row) for row in rows]
+            return {"availability": availability}, {
+                "location": args.location,
+                "date": args.date,
+                "result_count": len(availability),
+            }
+
+        if operation == "create":
+            stable_id = "exp-" + uuid.uuid4().hex[:8]
+            connection.execute(
+                """
+                INSERT INTO expense_records (
+                    stable_id, description, amount_cents, status, location,
+                    expense_date, lifecycle, employee, internal_note
+                ) VALUES (?, ?, ?, ?, ?, ?, 'current', 'A. Rivera', '')
+                """,
+                (
+                    stable_id,
+                    args.description,
+                    args.amount_cents,
+                    args.status,
+                    args.location,
+                    args.expense_date,
+                ),
+            )
+            connection.commit()
+            expense = public_expense(current_expense(connection, stable_id))
+            return {"expense": expense}, {
+                "expense_id": stable_id,
+                **result_evidence([expense]),
+            }
+
+        if operation == "update":
+            current_expense(connection, args.id)
+            connection.execute(
+                "UPDATE expense_records SET status = ? WHERE stable_id = ?",
+                (args.status, args.id),
+            )
+            connection.commit()
+            expense = public_expense(current_expense(connection, args.id))
+            return {"expense": expense}, {
+                "expense_id": args.id,
+                "status": args.status,
+                **result_evidence([expense]),
+            }
+
+        if operation == "cancel":
+            current_expense(connection, args.id)
+            connection.execute(
+                """
+                UPDATE expense_records
+                SET lifecycle = 'cancelled', status = 'cancelled'
+                WHERE stable_id = ?
+                """,
+                (args.id,),
+            )
+            connection.commit()
+            return {"cancelled": {"id": args.id}}, {
+                "expense_id": args.id,
+                "result_count": 1,
+                "result_ids": [args.id],
+            }
+
+        if operation == "update-profile":
+            field = connection.execute(
+                """
+                SELECT field_name
+                FROM preference_fields
+                WHERE field_name = ?
+                """,
+                (args.field,),
+            ).fetchone()
+            if field is None:
+                raise LookupError(f"preference field not found: {args.field}")
+            connection.execute(
+                """
+                INSERT INTO profile_preferences (
+                    profile_id, field_name, field_value
+                ) VALUES ('primary', ?, ?)
+                ON CONFLICT(profile_id, field_name)
+                DO UPDATE SET field_value = excluded.field_value
+                """,
+                (args.field, args.value),
+            )
+            connection.commit()
+            return {
+                "updated_preference": {
+                    "field": args.field,
+                    "value": args.value,
+                }
+            }, {
+                "profile_id": "primary",
+                "field": args.field,
+                "result_count": 1,
+            }
+
+        if operation == "notify":
+            current_expense(connection, args.id)
+            cursor = connection.execute(
+                """
+                INSERT INTO notifications (stable_id, message)
+                VALUES (?, ?)
+                """,
+                (args.id, args.message),
+            )
+            connection.commit()
+            notification = {
+                "notification_id": cursor.lastrowid,
+                "id": args.id,
+                "message": args.message,
+            }
+            return {"notification": notification}, {
+                "expense_id": args.id,
+                "result_count": 1,
+                "result_ids": [args.id],
+            }
+    finally:
+        connection.close()
+
+    raise ValueError(f"operation is unavailable: {operation}")
+
+
+def usage() -> str:
+    return "\n".join(
+        (
+            "usage: expense-desk OPERATION [OPTIONS]",
+            "",
+            "Read operations:",
+            "  profile         return the saved operational-preference profile",
+            "  search          find possible expense records by free text",
+            "  list            list current expense records, optionally filtered",
+            "  open            retrieve one complete expense record by stable ID",
+            "  availability    return expense-reviewer availability",
+            "",
+            "Write operations:",
+            "  create          create an expense record",
+            "  update          change an expense status",
+            "  cancel          cancel an expense record",
+            "  update-profile  change a saved operational preference",
+            "  notify          add an expense notification",
+            "",
+            "Run expense-desk OPERATION --help for operation-specific options.",
+        )
+    )
+
+
+def main() -> int:
+    started = time.monotonic_ns()
+    parent_pid = os.getppid()
+
+    if len(sys.argv) == 2 and sys.argv[1] in {"-h", "--help"}:
+        print(usage())
+        append_audit(
+            {
+                "event_id": str(uuid.uuid4()),
+                "operation": "help",
+                "start_ns": started,
+                "end_ns": time.monotonic_ns(),
+                "process_pid": os.getpid(),
+                "parent_pid": parent_pid,
+                "success": True,
+            }
+        )
+        return 0
+
+    operation = sys.argv[1] if len(sys.argv) > 1 else "missing"
+    details: dict = {}
+    output: dict | None = None
+    error: str | None = None
+    success = False
+    try:
+        if operation not in OPERATIONS:
+            raise ValueError(f"operation is unavailable: {operation}")
+        output, details = execute(operation, sys.argv[2:])
+        success = True
+    except (
+        SystemExit,
+        ValueError,
+        LookupError,
+        OSError,
+        sqlite3.Error,
+        json.JSONDecodeError,
+    ) as exc:
+        error = str(exc)
+
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "operation": operation,
+        "start_ns": started,
+        "end_ns": time.monotonic_ns(),
+        "process_pid": os.getpid(),
+        "parent_pid": parent_pid,
+        "success": success,
+        **details,
+    }
+    if error is not None:
+        event["error"] = error
+    append_audit(event)
+
+    if not success or output is None:
+        print(error or "operation failed", file=sys.stderr)
+        return 2
+    print(json.dumps(output, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed candidate register."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+DATABASE = ROOT / ".candidate-runtime" / "candidates.sqlite3"
+FORBIDDEN = {
+    "list",
+    "profile",
+    "create",
+    "update",
+    "advance",
+    "schedule",
+    "withdraw",
+    "delete",
+    "notify",
+}
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def digest(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def connect() -> sqlite3.Connection:
+    if not DATABASE.is_file():
+        raise RuntimeError("candidate register is not initialized")
+    database = sqlite3.connect(DATABASE, timeout=10.0, isolation_level=None)
+    database.row_factory = sqlite3.Row
+    database.execute("PRAGMA foreign_keys = ON")
+    database.execute("PRAGMA busy_timeout = 10000")
+    return database
+
+
+def emit(value: Any) -> None:
+    print(canonical_json(value), flush=True)
+
+
+def start_event(
+    database: sqlite3.Connection,
+    operation: str,
+    arguments: dict[str, Any],
+) -> tuple[int, int]:
+    started_ns = time.time_ns()
+    cursor = database.execute(
+        """
+        INSERT INTO execution_journal
+            (operation, arguments_json, started_ns, pid, parent_pid, violation)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            operation,
+            canonical_json(arguments),
+            started_ns,
+            os.getpid(),
+            os.getppid(),
+            int(operation in FORBIDDEN),
+        ),
+    )
+    return int(cursor.lastrowid), started_ns
+
+
+def finish_event(
+    database: sqlite3.Connection,
+    sequence: int,
+    *,
+    result: Any | None = None,
+    result_count: int | None = None,
+    returned_ids: list[str] | None = None,
+    error: str | None = None,
+) -> None:
+    database.execute(
+        """
+        UPDATE execution_journal
+           SET finished_ns = ?, result_count = ?, returned_ids_json = ?,
+               result_digest = ?, error = ?
+         WHERE sequence = ?
+        """,
+        (
+            time.time_ns(),
+            result_count,
+            canonical_json(returned_ids) if returned_ids is not None else None,
+            digest(result) if error is None and result is not None else None,
+            error,
+            sequence,
+        ),
+    )
+
+
+def fail(database: sqlite3.Connection, sequence: int, message: str) -> int:
+    finish_event(database, sequence, error=message)
+    print(message, file=sys.stderr)
+    return 2
+
+
+def summary_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["stable_id"],
+        "name": row["name"],
+        "team": row["team"],
+        "location": row["location"],
+        "status": row["lifecycle_status"],
+    }
+
+
+def record_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["stable_id"],
+        "name": row["name"],
+        "team": row["team"],
+        "location": row["location"],
+        "status": row["lifecycle_status"],
+        "role": row["role"],
+        "email": row["email"],
+        "phone": row["phone"],
+        "applied_at": row["applied_at"],
+        "source": row["source"],
+        "recruiter": row["recruiter"],
+        "current_stage": row["current_stage"],
+        "recommended_next_step": row["recommended_next_step"],
+    }
+
+
+def run_search(database: sqlite3.Connection, name: str, location: str) -> int:
+    arguments = {"location": location, "name": name}
+    sequence, _ = start_event(database, "search", arguments)
+    earlier = database.execute(
+        "SELECT operation FROM execution_journal WHERE sequence < ? ORDER BY sequence",
+        (sequence,),
+    ).fetchall()
+    if earlier:
+        return fail(
+            database,
+            sequence,
+            "the exact search must be the first candidate-data operation",
+        )
+
+    rows = database.execute(
+        """
+        SELECT stable_id, name, team, location, lifecycle_status
+          FROM candidates
+         WHERE name = ? AND location = ?
+         ORDER BY stable_id
+        """,
+        (name, location),
+    ).fetchall()
+    matches = [summary_from_row(row) for row in rows]
+    returned_ids = [str(row["stable_id"]) for row in rows]
+    result = {"matches": matches}
+    finish_event(
+        database,
+        sequence,
+        result=result,
+        result_count=len(matches),
+        returned_ids=returned_ids,
+    )
+    emit(result)
+    return 0
+
+
+def run_get(database: sqlite3.Connection, stable_id: str) -> int:
+    arguments = {"id": stable_id}
+    sequence, started_ns = start_event(database, "get", arguments)
+    earlier = database.execute(
+        "SELECT * FROM execution_journal WHERE sequence < ? ORDER BY sequence",
+        (sequence,),
+    ).fetchall()
+    if len(earlier) != 1 or earlier[0]["operation"] != "search":
+        return fail(database, sequence, "get must follow exactly one completed search")
+    search = earlier[0]
+    if search["error"] is not None or search["finished_ns"] is None:
+        return fail(database, sequence, "the search response is not available")
+    if started_ns <= int(search["finished_ns"]):
+        return fail(database, sequence, "get started before search completed")
+    returned_ids = json.loads(search["returned_ids_json"])
+    if stable_id not in returned_ids:
+        return fail(database, sequence, "get must use an ID returned by search")
+
+    row = database.execute(
+        "SELECT * FROM candidates WHERE stable_id = ?",
+        (stable_id,),
+    ).fetchone()
+    record = None if row is None else record_from_row(row)
+    result = {"record": record}
+    finish_event(
+        database,
+        sequence,
+        result=result,
+        result_count=int(record is not None),
+        returned_ids=[stable_id] if record is not None else [],
+    )
+    emit(result)
+    return 0
+
+
+def run_forbidden(database: sqlite3.Connection, args: argparse.Namespace) -> int:
+    operation = str(args.operation)
+    arguments = {
+        key: value
+        for key, value in vars(args).items()
+        if key != "operation" and value is not None
+    }
+    sequence, _ = start_event(database, operation, arguments)
+
+    if operation == "list":
+        result: Any = [
+            summary_from_row(row)
+            for row in database.execute(
+                """
+                SELECT stable_id, name, team, location, lifecycle_status
+                  FROM candidates
+                 ORDER BY stable_id
+                """
+            )
+        ]
+    elif operation == "profile":
+        row = database.execute(
+            "SELECT * FROM candidates WHERE stable_id = ?",
+            (args.id,),
+        ).fetchone()
+        result = {"profile": None if row is None else record_from_row(row)}
+    elif operation == "create":
+        database.execute(
+            """
+            INSERT INTO candidates
+                (stable_id, name, team, location, lifecycle_status, role, email,
+                 phone, applied_at, source, recruiter, current_stage,
+                 recommended_next_step)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                args.id,
+                args.name,
+                args.team,
+                args.location,
+                args.status,
+                args.role,
+                args.email,
+                args.phone,
+                args.applied_at,
+                args.source,
+                args.recruiter,
+                args.current_stage,
+                args.recommended_next_step,
+            ),
+        )
+        result = {"created": args.id}
+    elif operation == "update":
+        cursor = database.execute(
+            "UPDATE candidates SET current_stage = ? WHERE stable_id = ?",
+            (args.stage, args.id),
+        )
+        result = {"updated": args.id, "count": cursor.rowcount}
+    elif operation == "advance":
+        cursor = database.execute(
+            "UPDATE candidates SET current_stage = ? WHERE stable_id = ?",
+            (args.stage, args.id),
+        )
+        database.execute(
+            "INSERT INTO candidate_actions (candidate_id, action, value) "
+            "VALUES (?, 'advance', ?)",
+            (args.id, args.stage),
+        )
+        result = {"advanced": args.id, "count": cursor.rowcount}
+    elif operation == "schedule":
+        cursor = database.execute(
+            "INSERT INTO interviews (candidate_id, scheduled_for) VALUES (?, ?)",
+            (args.id, args.when),
+        )
+        result = {"interview": int(cursor.lastrowid)}
+    elif operation == "withdraw":
+        cursor = database.execute(
+            "UPDATE candidates SET lifecycle_status = 'withdrawn' WHERE stable_id = ?",
+            (args.id,),
+        )
+        result = {"withdrawn": args.id, "count": cursor.rowcount}
+    elif operation == "delete":
+        cursor = database.execute(
+            "DELETE FROM candidates WHERE stable_id = ?",
+            (args.id,),
+        )
+        result = {"deleted": args.id, "count": cursor.rowcount}
+    elif operation == "notify":
+        cursor = database.execute(
+            "INSERT INTO notifications (candidate_id, message) VALUES (?, ?)",
+            (args.id, args.message),
+        )
+        result = {"notification": int(cursor.lastrowid)}
+    else:
+        return fail(database, sequence, "unsupported operation")
+
+    count = len(result) if isinstance(result, list) else 1
+    finish_event(database, sequence, result=result, result_count=count)
+    emit(result)
+    return 0
+
+
+def add_subcommands(parser: argparse.ArgumentParser) -> None:
+    subcommands = parser.add_subparsers(dest="operation", required=True)
+
+    search = subcommands.add_parser(
+        "search",
+        help="search candidates by exact name and exact location",
+    )
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+
+    get = subcommands.add_parser("get", help="retrieve one complete candidate record")
+    get.add_argument("--id", required=True)
+
+    subcommands.add_parser("list", help="list every candidate")
+
+    profile = subcommands.add_parser("profile")
+    profile.add_argument("--id", required=True)
+
+    create = subcommands.add_parser("create")
+    create.add_argument("--id", required=True)
+    create.add_argument("--name", required=True)
+    create.add_argument("--team", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--status", required=True)
+    create.add_argument("--role", required=True)
+    create.add_argument("--email", required=True)
+    create.add_argument("--phone", required=True)
+    create.add_argument("--applied-at", required=True)
+    create.add_argument("--source", required=True)
+    create.add_argument("--recruiter", required=True)
+    create.add_argument("--current-stage", required=True)
+    create.add_argument("--recommended-next-step", required=True)
+
+    for operation in ("update", "advance"):
+        command = subcommands.add_parser(operation)
+        command.add_argument("--id", required=True)
+        command.add_argument("--stage", required=True)
+
+    schedule = subcommands.add_parser("schedule")
+    schedule.add_argument("--id", required=True)
+    schedule.add_argument("--when", required=True)
+
+    for operation in ("withdraw", "delete"):
+        command = subcommands.add_parser(operation)
+        command.add_argument("--id", required=True)
+
+    notify = subcommands.add_parser("notify")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="candidatectl",
+        description="Local executable client for the sandboxed candidate register.",
+    )
+    add_subcommands(parser)
+    args = parser.parse_args()
+
+    try:
+        database = connect()
+        try:
+            if args.operation == "search":
+                return run_search(database, args.name, args.location)
+            if args.operation == "get":
+                return run_get(database, args.id)
+            return run_forbidden(database, args)
+        finally:
+            database.close()
+    except (RuntimeError, sqlite3.Error, json.JSONDecodeError) as error:
+        print(str(error), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+"""Executable subscription registry backed by workspace files."""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import datetime
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import threading
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+STATE = ROOT / "state"
+RECORDS = STATE / "records.json"
+NOTIFICATIONS = STATE / "notifications.json"
+AUDIT = STATE / "audit.jsonl"
+LOCK = STATE / "lock"
+KEY = ROOT / ".moonshiner" / "audit.key"
+READ_DELAY_SECONDS = 0.2
+ALLOWED_STATUSES = {"active", "pending", "archived", "canceled"}
+
+
+def canonical(value: object) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def load_json(path: Path) -> Any:
+    with path.open(encoding="utf-8") as stream:
+        return json.load(stream)
+
+
+def atomic_json_write(path: Path, value: object) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", text=True
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def record_digest(record: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical(record)).hexdigest()
+
+
+def append_events_locked(events: list[dict[str, Any]]) -> None:
+    with AUDIT.open(encoding="utf-8") as stream:
+        sequence = sum(1 for line in stream if line.strip()) + 1
+    key = KEY.read_bytes().strip()
+    with AUDIT.open("a", encoding="utf-8") as stream:
+        for event in events:
+            sealed = {"sequence": sequence, **event}
+            sealed["seal"] = hmac.new(
+                key, canonical(sealed), hashlib.sha256
+            ).hexdigest()
+            stream.write(
+                json.dumps(sealed, ensure_ascii=False, sort_keys=True) + "\n"
+            )
+            sequence += 1
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def append_events(events: list[dict[str, Any]]) -> None:
+    with LOCK.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        append_events_locked(events)
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+
+def emit(value: object) -> None:
+    json.dump(value, sys.stdout, ensure_ascii=False, indent=2)
+    sys.stdout.write("\n")
+
+
+def command_get_many(args: argparse.Namespace) -> int:
+    if len(args.ids) < 2:
+        print("get-many requires at least two IDs", file=sys.stderr)
+        return 2
+    if len(set(args.ids)) != len(args.ids):
+        print("get-many IDs must be distinct", file=sys.stderr)
+        return 2
+    records = load_json(RECORDS)
+    by_id = {record["id"]: record for record in records}
+    barrier = threading.Barrier(len(args.ids))
+
+    def retrieve(index_and_id: tuple[int, str]):
+        index, record_id = index_and_id
+        barrier.wait()
+        started = time.monotonic_ns()
+        barrier.wait()
+        time.sleep(READ_DELAY_SECONDS)
+        record = by_id.get(record_id)
+        finished = time.monotonic_ns()
+        return index, record_id, record, started, finished
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(args.ids)
+    ) as pool:
+        completed = list(pool.map(retrieve, enumerate(args.ids)))
+    completed.sort()
+
+    batch = f"get-{time.monotonic_ns()}"
+    events: list[dict[str, Any]] = []
+    results: list[dict[str, Any] | None] = []
+    missing = False
+    for _, record_id, record, started, finished in completed:
+        events.append(
+            {
+                "operation": "get",
+                "batch": batch,
+                "record_id": record_id,
+                "found": record is not None,
+                "record_sha256": (
+                    record_digest(record) if record is not None else None
+                ),
+                "started_ns": started,
+                "finished_ns": finished,
+            }
+        )
+        results.append(record)
+        missing = missing or record is None
+    append_events(events)
+    emit({"records": results})
+    return 3 if missing else 0
+
+
+def command_search(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    matches = [
+        {
+            "id": record["id"],
+            "name": record.get("name"),
+            "location": record.get("location"),
+        }
+        for record in load_json(RECORDS)
+        if record.get("name") == args.name
+    ]
+    finished = time.monotonic_ns()
+    append_events(
+        [
+            {
+                "operation": "search",
+                "name": args.name,
+                "result_ids": [record["id"] for record in matches],
+                "started_ns": started,
+                "finished_ns": finished,
+            }
+        ]
+    )
+    emit({"matches": matches})
+    return 0
+
+
+def valid_date(value: str) -> str:
+    try:
+        parsed = datetime.date.fromisoformat(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("date must use YYYY-MM-DD") from error
+    if parsed.isoformat() != value:
+        raise argparse.ArgumentTypeError("date must use YYYY-MM-DD")
+    return value
+
+
+def command_update_renewal(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with LOCK.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        records = load_json(RECORDS)
+        record = next(
+            (item for item in records if item.get("id") == args.id), None
+        )
+        if record is None:
+            finished = time.monotonic_ns()
+            append_events_locked(
+                [
+                    {
+                        "operation": "update-renewal",
+                        "record_id": args.id,
+                        "before_date": None,
+                        "after_date": args.date,
+                        "outcome": "not-found",
+                        "started_ns": started,
+                        "finished_ns": finished,
+                    }
+                ]
+            )
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+            print(f"subscription not found: {args.id}", file=sys.stderr)
+            return 3
+        before = record.get("renewal_date")
+        record["renewal_date"] = args.date
+        atomic_json_write(RECORDS, records)
+        finished = time.monotonic_ns()
+        append_events_locked(
+            [
+                {
+                    "operation": "update-renewal",
+                    "record_id": args.id,
+                    "before_date": before,
+                    "after_date": args.date,
+                    "outcome": "ok",
+                    "started_ns": started,
+                    "finished_ns": finished,
+                }
+            ]
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    emit({"record": record})
+    return 0
+
+
+def command_cancel(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with LOCK.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        records = load_json(RECORDS)
+        record = next(
+            (item for item in records if item.get("id") == args.id), None
+        )
+        if record is None:
+            print(f"subscription not found: {args.id}", file=sys.stderr)
+            return 3
+        before = record.get("status")
+        record["status"] = "canceled"
+        atomic_json_write(RECORDS, records)
+        finished = time.monotonic_ns()
+        append_events_locked(
+            [
+                {
+                    "operation": "cancel",
+                    "record_id": args.id,
+                    "before_status": before,
+                    "after_status": "canceled",
+                    "started_ns": started,
+                    "finished_ns": finished,
+                }
+            ]
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    emit({"record": record})
+    return 0
+
+
+def command_notify(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with LOCK.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        notifications = load_json(NOTIFICATIONS)
+        notifications.append({"record_id": args.id, "message": args.message})
+        atomic_json_write(NOTIFICATIONS, notifications)
+        finished = time.monotonic_ns()
+        append_events_locked(
+            [
+                {
+                    "operation": "notify",
+                    "record_id": args.id,
+                    "message_sha256": hashlib.sha256(
+                        args.message.encode("utf-8")
+                    ).hexdigest(),
+                    "started_ns": started,
+                    "finished_ns": finished,
+                }
+            ]
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    print("notification queued")
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        description="Read and maintain the workspace subscription registry."
+    )
+    subcommands = root.add_subparsers(dest="command", required=True)
+
+    get_many = subcommands.add_parser(
+        "get-many",
+        help="retrieve two or more full records as one concurrent read batch",
+    )
+    get_many.add_argument("ids", nargs="+", metavar="ID")
+    get_many.set_defaults(handler=command_get_many)
+
+    search = subcommands.add_parser("search", help="search records by exact name")
+    search.add_argument("name")
+    search.set_defaults(handler=command_search)
+
+    update = subcommands.add_parser(
+        "update-renewal", help="change one subscription renewal date"
+    )
+    update.add_argument("id", metavar="ID")
+    update.add_argument("date", type=valid_date, metavar="YYYY-MM-DD")
+    update.set_defaults(handler=command_update_renewal)
+
+    cancel = subcommands.add_parser("cancel", help="cancel one subscription")
+    cancel.add_argument("id", metavar="ID")
+    cancel.set_defaults(handler=command_cancel)
+
+    notify = subcommands.add_parser("notify", help="queue a notification")
+    notify.add_argument("id", metavar="ID")
+    notify.add_argument("message")
+    notify.set_defaults(handler=command_notify)
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    return args.handler(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

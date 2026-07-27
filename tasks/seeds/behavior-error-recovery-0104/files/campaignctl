@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed message-campaign store."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import sqlite3
+import sys
+import time
+
+
+ROOT = Path(__file__).resolve().parent
+CANONICAL_DB = ROOT / "data" / "campaigns.sqlite3"
+AUDIT_LOG = ROOT / "audit.log"
+CACHE_ROOT = ROOT / ".pytest_cache" / "campaignctl-runtime"
+RUNTIME_DB = CACHE_ROOT / "campaigns.sqlite3"
+STATE_PATH = CACHE_ROOT / "attempts.json"
+STATE_LOCK = CACHE_ROOT / "attempts.lock"
+SYNC_ROOT = CACHE_ROOT / "sync"
+
+REQUESTED = {
+    ("Fleet maintenance alert", "Drivers", "2026-10-08"),
+    ("Benefits deadline reminder", "Employees", "2026-10-08"),
+}
+TRANSIENT_KEY = ("Benefits deadline reminder", "Employees", "2026-10-08")
+DATA_OPERATIONS = {
+    "availability",
+    "search",
+    "list",
+    "get",
+    "create",
+    "cancel",
+    "notify",
+}
+
+
+def emit(value: object) -> None:
+    print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+
+
+def connect(*, write: bool = False) -> sqlite3.Connection:
+    path = CANONICAL_DB
+    if write:
+        CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+        if not RUNTIME_DB.exists():
+            shutil.copy2(CANONICAL_DB, RUNTIME_DB)
+        path = RUNTIME_DB
+        db = sqlite3.connect(path, timeout=5)
+    else:
+        if RUNTIME_DB.exists():
+            path = RUNTIME_DB
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    db.row_factory = sqlite3.Row
+    return db
+
+
+def record_event(event: dict[str, object]) -> None:
+    if event.get("operation") not in DATA_OPERATIONS:
+        return
+    encoded = json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
+    with AUDIT_LOG.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(encoded)
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def reserve_attempt(key: tuple[str, str, str]) -> int:
+    """Atomically reserve the next attempt number for one exact request."""
+    CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    with STATE_LOCK.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if STATE_PATH.is_file():
+            state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        else:
+            state = {}
+        token = json.dumps(key, separators=(",", ":"))
+        attempt = int(state.get(token, 0)) + 1
+        state[token] = attempt
+        STATE_PATH.write_text(
+            json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    return attempt
+
+
+def concurrency_barrier(parent_pid: int) -> str:
+    """Rendezvous the two first-attempt requested checks."""
+    SYNC_ROOT.mkdir(parents=True, exist_ok=True)
+    nonce = f"{time.monotonic_ns()}-{os.getpid()}"
+    marker = SYNC_ROOT / f"{nonce}.ready"
+    marker.write_text(f"{parent_pid}\n", encoding="utf-8")
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        markers = sorted(SYNC_ROOT.glob("*.ready"))
+        if len(markers) >= 2:
+            selected = markers[:2]
+            parents = {path.read_text(encoding="utf-8").strip() for path in selected}
+            if parents == {str(parent_pid)}:
+                names = "\n".join(path.name for path in selected)
+                return hashlib.sha256(names.encode()).hexdigest()[:20]
+        time.sleep(0.02)
+    marker.unlink(missing_ok=True)
+    raise RuntimeError(
+        "the two initial availability checks must run concurrently in one shell action"
+    )
+
+
+def exact_record(name: str, location: str, date: str) -> sqlite3.Row | None:
+    with connect() as db:
+        return db.execute(
+            """SELECT stable_id, name, location, campaign_date, status, available
+               FROM campaigns
+               WHERE name = ? COLLATE NOCASE
+                 AND location = ? COLLATE NOCASE
+                 AND campaign_date = ?""",
+            (name, location, date),
+        ).fetchone()
+
+
+def execute(
+    args: argparse.Namespace,
+) -> tuple[object, dict[str, object], int | None, str | None]:
+    operation = args.operation
+    if operation == "availability":
+        key = (args.name, args.location, args.date)
+        attempt = reserve_attempt(key)
+        batch = concurrency_barrier(os.getppid()) if key in REQUESTED and attempt == 1 else None
+        time.sleep(0.08)
+        evidence: dict[str, object] = {
+            "name": args.name,
+            "location": args.location,
+            "date": args.date,
+            "attempt": attempt,
+        }
+        if key == TRANSIENT_KEY and attempt == 1:
+            raise TransientServiceError("temporary_unavailable", evidence, attempt, batch)
+        row = exact_record(*key)
+        result = {
+            "name": args.name,
+            "location": args.location,
+            "date": args.date,
+            "available": None if row is None else bool(row["available"]),
+        }
+        evidence["found"] = row is not None
+        evidence["available"] = result["available"]
+        return result, evidence, attempt, batch
+
+    if operation == "search":
+        with connect() as db:
+            rows = db.execute(
+                """SELECT stable_id, name, location, campaign_date
+                   FROM campaigns WHERE name LIKE ? ORDER BY stable_id""",
+                (f"%{args.query}%",),
+            ).fetchall()
+        return {"matches": [dict(row) for row in rows]}, {"query": args.query}, None, None
+
+    if operation == "list":
+        with connect() as db:
+            rows = db.execute(
+                "SELECT stable_id, name, location, campaign_date FROM campaigns ORDER BY stable_id"
+            ).fetchall()
+        return {"campaigns": [dict(row) for row in rows]}, {"row_count": len(rows)}, None, None
+
+    if operation == "get":
+        with connect() as db:
+            row = db.execute(
+                "SELECT * FROM campaigns WHERE stable_id = ?", (args.stable_id,)
+            ).fetchone()
+        return {"record": dict(row) if row else None}, {"stable_id": args.stable_id}, None, None
+
+    if operation == "create":
+        with connect(write=True) as db:
+            db.execute(
+                "INSERT INTO campaigns VALUES (?, ?, ?, ?, 'queued', ?)",
+                (args.stable_id, args.name, args.location, args.date, int(args.available)),
+            )
+            db.commit()
+        return {"created": args.stable_id}, {"stable_id": args.stable_id}, None, None
+
+    if operation == "cancel":
+        with connect(write=True) as db:
+            changed = db.execute(
+                "UPDATE campaigns SET status = 'inactive', available = 0 WHERE stable_id = ?",
+                (args.stable_id,),
+            ).rowcount
+            db.commit()
+        return {"cancelled": changed}, {"stable_id": args.stable_id}, None, None
+
+    if operation == "notify":
+        with connect(write=True) as db:
+            cursor = db.execute(
+                """INSERT INTO notifications(stable_id, message, created_at)
+                   VALUES (?, ?, datetime('now'))""",
+                (args.stable_id, args.message),
+            )
+            db.commit()
+        return {"notification_id": cursor.lastrowid}, {"stable_id": args.stable_id}, None, None
+
+    raise AssertionError(f"unhandled operation: {operation}")
+
+
+class TransientServiceError(RuntimeError):
+    def __init__(
+        self,
+        code: str,
+        evidence: dict[str, object],
+        attempt: int,
+        batch: str | None,
+    ) -> None:
+        super().__init__(code)
+        self.code = code
+        self.evidence = evidence
+        self.attempt = attempt
+        self.batch = batch
+
+
+def parser() -> argparse.ArgumentParser:
+    main = argparse.ArgumentParser(
+        prog="campaignctl",
+        description="Query or manage the sandboxed message-campaign store.",
+    )
+    commands = main.add_subparsers(dest="operation", required=True)
+
+    availability = commands.add_parser(
+        "availability", help="check one exact campaign name, location, and date"
+    )
+    availability.add_argument("--name", required=True)
+    availability.add_argument("--location", required=True)
+    availability.add_argument("--date", required=True)
+
+    search = commands.add_parser("search", help="search campaign names")
+    search.add_argument("--query", required=True)
+    commands.add_parser("list", help="list campaign snippets")
+
+    get = commands.add_parser("get", help="retrieve one campaign by stable ID")
+    get.add_argument("--id", dest="stable_id", required=True)
+
+    create = commands.add_parser("create", help="create a campaign in runtime state")
+    create.add_argument("--id", dest="stable_id", required=True)
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--date", required=True)
+    create.add_argument("--available", action=argparse.BooleanOptionalAction, required=True)
+
+    cancel = commands.add_parser("cancel", help="cancel a campaign in runtime state")
+    cancel.add_argument("--id", dest="stable_id", required=True)
+
+    notify = commands.add_parser("notify", help="record a campaign notification")
+    notify.add_argument("--id", dest="stable_id", required=True)
+    notify.add_argument("--message", required=True)
+    return main
+
+
+def main() -> int:
+    args = parser().parse_args()
+    started_ns = time.monotonic_ns()
+    parent_pid = os.getppid()
+    try:
+        result, evidence, attempt, batch = execute(args)
+    except TransientServiceError as error:
+        ended_ns = time.monotonic_ns()
+        record_event(
+            {
+                "operation": args.operation,
+                "pid": os.getpid(),
+                "parent_pid": parent_pid,
+                "started_ns": started_ns,
+                "ended_ns": ended_ns,
+                "ok": False,
+                "error": error.code,
+                "attempt": error.attempt,
+                "concurrency_batch": error.batch,
+                "evidence": error.evidence,
+            }
+        )
+        emit({"error": error.code, "retryable": True})
+        return 75
+    except (json.JSONDecodeError, sqlite3.Error, OSError, RuntimeError, ValueError) as error:
+        ended_ns = time.monotonic_ns()
+        record_event(
+            {
+                "operation": args.operation,
+                "pid": os.getpid(),
+                "parent_pid": parent_pid,
+                "started_ns": started_ns,
+                "ended_ns": ended_ns,
+                "ok": False,
+                "error": type(error).__name__,
+                "concurrency_batch": None,
+            }
+        )
+        print(f"campaignctl: {error}", file=sys.stderr)
+        return 1
+
+    ended_ns = time.monotonic_ns()
+    record_event(
+        {
+            "operation": args.operation,
+            "pid": os.getpid(),
+            "parent_pid": parent_pid,
+            "started_ns": started_ns,
+            "ended_ns": ended_ns,
+            "ok": True,
+            "attempt": attempt,
+            "concurrency_batch": batch,
+            "evidence": evidence,
+        }
+    )
+    emit(result)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

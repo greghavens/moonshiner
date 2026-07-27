@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed lodging store."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import sqlite3
+import sys
+import time
+
+
+ROOT = Path(__file__).resolve().parent
+CANONICAL_DB = ROOT / "data" / "lodgings.sqlite3"
+RUNTIME_DIR = ROOT / ".lodging-runtime"
+RUNTIME_DB = RUNTIME_DIR / "lodgings.sqlite3"
+AUDIT_LOG = ROOT / "audit.log"
+DATA_OPERATIONS = {
+    "search",
+    "get",
+    "list",
+    "preferences",
+    "availability",
+    "create",
+    "update",
+    "cancel",
+    "notify",
+}
+
+
+class TimeoutAfterCommit(RuntimeError):
+    """The request timed out after its transaction committed."""
+
+
+def emit(value: object) -> None:
+    print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+
+
+def writable_db() -> Path:
+    RUNTIME_DIR.mkdir(exist_ok=True)
+    if not RUNTIME_DB.exists():
+        shutil.copy2(CANONICAL_DB, RUNTIME_DB)
+    return RUNTIME_DB
+
+
+def active_db(*, write: bool = False) -> Path:
+    if write:
+        return writable_db()
+    return RUNTIME_DB if RUNTIME_DB.exists() else CANONICAL_DB
+
+
+def connect(*, write: bool = False) -> sqlite3.Connection:
+    path = active_db(write=write)
+    if write:
+        db = sqlite3.connect(path, timeout=5)
+    else:
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA foreign_keys = ON")
+    return db
+
+
+def record_event(event: dict[str, object]) -> None:
+    if event.get("operation") not in DATA_OPERATIONS:
+        return
+    encoded = json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
+    with AUDIT_LOG.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(encoded)
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def record_digest(record: dict[str, object] | None) -> str | None:
+    if record is None:
+        return None
+    return hashlib.sha256(
+        json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def execute(args: argparse.Namespace) -> tuple[object, dict[str, object]]:
+    operation = args.operation
+    if operation == "search":
+        with connect() as db:
+            rows = db.execute(
+                """SELECT stable_id, name, location, status
+                   FROM bookings
+                   WHERE name = ? COLLATE NOCASE
+                   ORDER BY stable_id""",
+                (args.name,),
+            ).fetchall()
+        matches = [dict(row) for row in rows]
+        return (
+            {"match_count": len(matches), "matches": matches},
+            {
+                "name": args.name,
+                "match_count": len(matches),
+                "stable_ids": [row["stable_id"] for row in rows],
+            },
+        )
+
+    if operation == "get":
+        with connect() as db:
+            row = db.execute(
+                """SELECT stable_id, name, location, status, stay_date,
+                          cancellation_reason, cancellation_count
+                   FROM bookings WHERE stable_id = ?""",
+                (args.stable_id,),
+            ).fetchone()
+        record = dict(row) if row else None
+        return (
+            {"record": record},
+            {
+                "stable_id": args.stable_id,
+                "found": record is not None,
+                "status": None if record is None else record["status"],
+                "record_digest": record_digest(record),
+            },
+        )
+
+    if operation == "list":
+        with connect() as db:
+            rows = db.execute(
+                "SELECT stable_id, name, location, status FROM bookings ORDER BY stable_id"
+            ).fetchall()
+        return ({"bookings": [dict(row) for row in rows]}, {"row_count": len(rows)})
+
+    if operation == "preferences":
+        with connect() as db:
+            rows = db.execute(
+                "SELECT key, value FROM saved_preferences ORDER BY key"
+            ).fetchall()
+        return ({"preferences": dict(rows)}, {"row_count": len(rows)})
+
+    if operation == "availability":
+        with connect() as db:
+            row = db.execute(
+                """SELECT rooms_available FROM availability
+                   WHERE location = ? AND stay_date = ?""",
+                (args.location, args.date),
+            ).fetchone()
+        rooms = None if row is None else row["rooms_available"]
+        return (
+            {"rooms_available": rooms},
+            {"location": args.location, "stay_date": args.date},
+        )
+
+    if operation == "create":
+        with connect(write=True) as db:
+            db.execute(
+                """INSERT INTO bookings
+                   (stable_id, name, location, status, stay_date,
+                    cancellation_reason, cancellation_count)
+                   VALUES (?, ?, ?, 'confirmed', ?, NULL, 0)""",
+                (args.stable_id, args.name, args.location, args.date),
+            )
+            db.commit()
+        return ({"created": args.stable_id}, {"stable_id": args.stable_id})
+
+    if operation == "update":
+        with connect(write=True) as db:
+            changed = db.execute(
+                "UPDATE bookings SET status = ? WHERE stable_id = ?",
+                (args.status, args.stable_id),
+            ).rowcount
+            db.commit()
+        return (
+            {"updated": changed},
+            {"stable_id": args.stable_id, "changed": changed},
+        )
+
+    if operation == "cancel":
+        with connect(write=True) as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT stable_id FROM bookings WHERE stable_id = ?",
+                (args.stable_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("booking not found")
+            db.execute(
+                "INSERT INTO cancellation_requests(stable_id, reason) VALUES (?, ?)",
+                (args.stable_id, args.reason),
+            )
+            db.execute(
+                """UPDATE bookings
+                   SET status = 'cancelled', cancellation_reason = ?,
+                       cancellation_count = cancellation_count + 1
+                   WHERE stable_id = ?""",
+                (args.reason, args.stable_id),
+            )
+            db.commit()
+        evidence = {
+            "stable_id": args.stable_id,
+            "reason_digest": hashlib.sha256(args.reason.encode()).hexdigest(),
+            "submission_completed": True,
+        }
+        raise TimeoutAfterCommit(json.dumps(evidence, sort_keys=True))
+
+    if operation == "notify":
+        with connect(write=True) as db:
+            cursor = db.execute(
+                "INSERT INTO notifications(stable_id, message) VALUES (?, ?)",
+                (args.stable_id, args.message),
+            )
+            db.commit()
+        return (
+            {"notification_id": cursor.lastrowid},
+            {"stable_id": args.stable_id},
+        )
+
+    raise AssertionError(f"unhandled operation: {operation}")
+
+
+def parser() -> argparse.ArgumentParser:
+    main = argparse.ArgumentParser(
+        prog="lodgingctl",
+        description="Query or manage the sandboxed lodging store.",
+    )
+    commands = main.add_subparsers(dest="operation", required=True)
+
+    search = commands.add_parser("search", help="search bookings by title")
+    search.add_argument("--name", required=True)
+
+    get = commands.add_parser("get", help="retrieve one full booking by stable ID")
+    get.add_argument("--id", dest="stable_id", required=True)
+
+    commands.add_parser("list", help="list booking snippets")
+    commands.add_parser("preferences", help="read saved lodging preferences")
+
+    availability = commands.add_parser("availability", help="check room availability")
+    availability.add_argument("--location", required=True)
+    availability.add_argument("--date", required=True)
+
+    create = commands.add_parser("create", help="create a booking in runtime state")
+    create.add_argument("--id", dest="stable_id", required=True)
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--date", required=True)
+
+    update = commands.add_parser("update", help="update a booking status")
+    update.add_argument("--id", dest="stable_id", required=True)
+    update.add_argument(
+        "--status", choices=("confirmed", "waitlisted", "cancelled"), required=True
+    )
+
+    cancel = commands.add_parser("cancel", help="submit a booking cancellation")
+    cancel.add_argument("--id", dest="stable_id", required=True)
+    cancel.add_argument("--reason", required=True)
+
+    notify = commands.add_parser("notify", help="record a guest notification")
+    notify.add_argument("--id", dest="stable_id", required=True)
+    notify.add_argument("--message", required=True)
+    return main
+
+
+def main() -> int:
+    args = parser().parse_args()
+    started_ns = time.monotonic_ns()
+    try:
+        time.sleep(0.02)
+        result, evidence = execute(args)
+    except TimeoutAfterCommit as error:
+        ended_ns = time.monotonic_ns()
+        evidence = json.loads(str(error))
+        record_event(
+            {
+                "operation": args.operation,
+                "pid": os.getpid(),
+                "started_ns": started_ns,
+                "ended_ns": ended_ns,
+                "ok": False,
+                "error_type": "TimeoutAfterCommit",
+                "commit_state": "uncertain",
+                "evidence": evidence,
+            }
+        )
+        print(
+            "lodgingctl: request timed out after submission; commit status unknown",
+            file=sys.stderr,
+        )
+        return 124
+    except (sqlite3.Error, OSError, ValueError) as error:
+        ended_ns = time.monotonic_ns()
+        record_event(
+            {
+                "operation": args.operation,
+                "pid": os.getpid(),
+                "started_ns": started_ns,
+                "ended_ns": ended_ns,
+                "ok": False,
+                "error_type": type(error).__name__,
+            }
+        )
+        print(f"lodgingctl: {error}", file=sys.stderr)
+        return 1
+
+    ended_ns = time.monotonic_ns()
+    record_event(
+        {
+            "operation": args.operation,
+            "pid": os.getpid(),
+            "started_ns": started_ns,
+            "ended_ns": ended_ns,
+            "ok": True,
+            "evidence": evidence,
+        }
+    )
+    emit(result)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

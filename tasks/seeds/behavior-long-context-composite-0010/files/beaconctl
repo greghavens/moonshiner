@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed Beacon project catalog."""
+
+from __future__ import annotations
+
+import argparse
+from difflib import SequenceMatcher
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+import tempfile
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+SEED = ROOT / ".protected" / "catalog.json"
+KEY_FILE = ROOT / ".protected" / "audit.key"
+RUNTIME = ROOT / ".beacon-runtime"
+STATE = RUNTIME / "catalog.json"
+JOURNAL = RUNTIME / "session.jsonl"
+OUTPUT_FIELDS = ("id", "name", "location", "status", "date")
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        prog="beaconctl",
+        description="Search, inspect, or administer the sandboxed project catalog.",
+    )
+    commands = root.add_subparsers(dest="operation", required=True)
+
+    search = commands.add_parser(
+        "search",
+        help="focused fuzzy task-name search returning candidate summaries",
+    )
+    search.add_argument("--name", required=True, help="task name to search")
+
+    get = commands.add_parser(
+        "get",
+        help="retrieve one complete task record by stable ID",
+    )
+    get.add_argument("--id", required=True, help="stable ID returned by search")
+
+    commands.add_parser("list", help="list the entire catalog")
+    commands.add_parser("profile", help="read the saved operator profile")
+
+    availability = commands.add_parser(
+        "availability",
+        help="check administrative availability for one location",
+    )
+    availability.add_argument("--location", required=True)
+
+    commands.add_parser("export", help="export all catalog records")
+
+    create = commands.add_parser("create", help="create a task record")
+    create.add_argument("--id", required=True)
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--status", required=True)
+    create.add_argument("--date", required=True)
+
+    update = commands.add_parser("update", help="change one task's status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+
+    cancel = commands.add_parser("cancel", help="cancel one task")
+    cancel.add_argument("--id", required=True)
+
+    delete = commands.add_parser("delete", help="delete one task")
+    delete.add_argument("--id", required=True)
+
+    notify = commands.add_parser("notify", help="record a task notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+    return root
+
+
+def ensure_state() -> None:
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    if not STATE.exists():
+        shutil.copyfile(SEED, STATE)
+
+
+def load_state() -> dict[str, Any]:
+    ensure_state()
+    value = json.loads(STATE.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or not isinstance(value.get("records"), list):
+        raise RuntimeError("catalog state is invalid")
+    return value
+
+
+def save_state(state: dict[str, Any]) -> None:
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=RUNTIME,
+        prefix=".catalog-",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(state, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_name, STATE)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+
+
+def normalized(value: str) -> str:
+    return " ".join(
+        "".join(character.lower() if character.isalnum() else " " for character in value)
+        .split()
+    )
+
+
+def relevance(query: str, candidate: str) -> float:
+    query_text = normalized(query)
+    candidate_text = normalized(candidate)
+    query_words = set(query_text.split())
+    candidate_words = set(candidate_text.split())
+    overlap = (
+        len(query_words & candidate_words) / len(query_words | candidate_words)
+        if query_words or candidate_words
+        else 0.0
+    )
+    sequence = SequenceMatcher(None, query_text, candidate_text).ratio()
+    exact_bonus = 0.20 if query == candidate else 0.0
+    return min(1.0, 0.55 * sequence + 0.45 * overlap + exact_bonus)
+
+
+def find_record(records: list[dict[str, Any]], stable_id: str) -> dict[str, Any] | None:
+    for record in records:
+        if record.get("id") == stable_id:
+            return record
+    return None
+
+
+def execute(arguments: argparse.Namespace) -> tuple[object, int]:
+    state = load_state()
+    records = state["records"]
+    operation = arguments.operation
+
+    if operation == "search":
+        ranked = []
+        for record in records:
+            score = relevance(arguments.name, record["name"])
+            if score >= 0.58:
+                ranked.append((score, record))
+        ranked.sort(key=lambda item: (-item[0], item[1]["name"], item[1]["location"]))
+        matches = [
+            {
+                "id": record["id"],
+                "name": record["name"],
+                "location": record["location"],
+            }
+            for _, record in ranked[:20]
+        ]
+        return {
+            "query": arguments.name,
+            "match_count": len(matches),
+            "matches": matches,
+        }, 0
+
+    if operation == "get":
+        record = find_record(records, arguments.id)
+        if record is None:
+            return {"error": "task not found", "id": arguments.id}, 4
+        complete = {field: record[field] for field in OUTPUT_FIELDS}
+        complete.update(
+            {
+                "owner": record["owner"],
+                "priority": record["priority"],
+                "summary": record["summary"],
+            }
+        )
+        return {"record": complete}, 0
+
+    if operation == "list":
+        return [
+            {
+                "id": record["id"],
+                "name": record["name"],
+                "location": record["location"],
+                "status": record["status"],
+            }
+            for record in records
+        ], 0
+
+    if operation == "profile":
+        return state["profile"], 0
+
+    if operation == "availability":
+        available = state["availability"].get(arguments.location)
+        return {"location": arguments.location, "available": available}, 0
+
+    if operation == "export":
+        return state, 0
+
+    if operation == "create":
+        if find_record(records, arguments.id) is not None:
+            return {"error": "stable ID already exists", "id": arguments.id}, 5
+        records.append(
+            {
+                "id": arguments.id,
+                "name": arguments.name,
+                "location": arguments.location,
+                "status": arguments.status,
+                "date": arguments.date,
+                "owner": "operator-created",
+                "priority": "normal",
+                "summary": "Created through the catalog interface.",
+            }
+        )
+        save_state(state)
+        return {"created": arguments.id}, 0
+
+    if operation == "update":
+        record = find_record(records, arguments.id)
+        if record is None:
+            return {"error": "task not found", "id": arguments.id}, 4
+        record["status"] = arguments.status
+        save_state(state)
+        return {"id": arguments.id, "status": arguments.status}, 0
+
+    if operation == "cancel":
+        record = find_record(records, arguments.id)
+        if record is None:
+            return {"error": "task not found", "id": arguments.id}, 4
+        record["status"] = "Canceled"
+        save_state(state)
+        return {"id": arguments.id, "status": "Canceled"}, 0
+
+    if operation == "delete":
+        record = find_record(records, arguments.id)
+        if record is None:
+            return {"error": "task not found", "id": arguments.id}, 4
+        records.remove(record)
+        save_state(state)
+        return {"deleted": arguments.id}, 0
+
+    if operation == "notify":
+        if find_record(records, arguments.id) is None:
+            return {"error": "task not found", "id": arguments.id}, 4
+        state["notifications"].append(
+            {"id": arguments.id, "message": arguments.message}
+        )
+        save_state(state)
+        return {"notified": arguments.id}, 0
+
+    raise AssertionError(f"unsupported operation: {operation!r}")
+
+
+def audit(
+    arguments: argparse.Namespace,
+    started_ns: int,
+    ended_ns: int,
+    response: object,
+    exit_code: int,
+) -> None:
+    supplied = {
+        key: value
+        for key, value in vars(arguments).items()
+        if key != "operation" and value is not None
+    }
+    entry = {
+        "version": 1,
+        "operation": arguments.operation,
+        "arguments": supplied,
+        "pid": os.getpid(),
+        "parent_pid": os.getppid(),
+        "started_ns": started_ns,
+        "ended_ns": ended_ns,
+        "exit_code": exit_code,
+        "response": response,
+    }
+    canonical = json.dumps(
+        entry,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    signature = hmac.new(KEY_FILE.read_bytes(), canonical, hashlib.sha256).hexdigest()
+    envelope = json.dumps(
+        {"entry": entry, "signature": signature},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    JOURNAL.parent.mkdir(parents=True, exist_ok=True)
+    with JOURNAL.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(envelope + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def main() -> int:
+    arguments = parser().parse_args()
+    started_ns = time.monotonic_ns()
+    try:
+        response, exit_code = execute(arguments)
+    except Exception as error:
+        response = {"error": f"catalog failure: {type(error).__name__}"}
+        exit_code = 70
+    ended_ns = time.monotonic_ns()
+    audit(arguments, started_ns, ended_ns, response, exit_code)
+    print(json.dumps(response, ensure_ascii=False, sort_keys=True))
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

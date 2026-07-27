@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed public-services permit queue."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+STATE_PATH = ROOT / ".permit-state.json"
+
+
+def load_state() -> dict[str, Any]:
+    try:
+        state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"permit service state is unavailable: {error}") from error
+    if not isinstance(state, dict) or state.get("schema_version") != 1:
+        raise RuntimeError("permit service state has an unsupported schema")
+    return state
+
+
+def save_state(state: dict[str, Any]) -> None:
+    temporary = STATE_PATH.with_name(STATE_PATH.name + ".next")
+    payload = json.dumps(state, indent=2, sort_keys=True) + "\n"
+    temporary.write_text(payload, encoding="utf-8")
+    os.replace(temporary, STATE_PATH)
+
+
+def application_by_id(state: dict[str, Any], application_id: str) -> dict[str, Any] | None:
+    return next(
+        (item for item in state["applications"] if item.get("id") == application_id),
+        None,
+    )
+
+
+def fingerprint(application_id: str, reason: str) -> str:
+    canonical = json.dumps(
+        {"application_id": application_id, "reason": reason},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def append_event(state: dict[str, Any], event: dict[str, Any]) -> None:
+    event = {"sequence": len(state["audit"]) + 1, **event}
+    state["audit"].append(event)
+
+
+def emit_record(record: dict[str, Any]) -> None:
+    print(json.dumps({"record": record}, sort_keys=True))
+
+
+def get_application(args: argparse.Namespace) -> int:
+    state = load_state()
+    record = application_by_id(state, args.id)
+    if record is None:
+        append_event(
+            state,
+            {
+                "application_id": args.id,
+                "operation": "get",
+                "outcome": "not_found",
+            },
+        )
+        save_state(state)
+        print(f"application not found: {args.id}", file=sys.stderr)
+        return 4
+    append_event(
+        state,
+        {
+            "application_id": args.id,
+            "observed_status": record["status"],
+            "operation": "get",
+            "outcome": "returned",
+        },
+    )
+    save_state(state)
+    emit_record(record)
+    return 0
+
+
+def cancel_application(args: argparse.Namespace) -> int:
+    state = load_state()
+    record = application_by_id(state, args.id)
+    request_fingerprint = fingerprint(args.id, args.reason)
+    if record is None:
+        append_event(
+            state,
+            {
+                "application_id": args.id,
+                "operation": "cancel",
+                "outcome": "not_found",
+                "reason": args.reason,
+                "request_fingerprint": request_fingerprint,
+            },
+        )
+        save_state(state)
+        print(f"application not found: {args.id}", file=sys.stderr)
+        return 4
+
+    before_status = record["status"]
+    if before_status == "active":
+        record["status"] = "cancelled"
+        record["cancellation_reason"] = args.reason
+        remaining = state["faults"]["cancel_timeout_after_commit"].get(args.id, 0)
+        outcome = "cancelled"
+        if remaining > 0:
+            state["faults"]["cancel_timeout_after_commit"][args.id] = remaining - 1
+            outcome = "timeout_after_commit"
+        append_event(
+            state,
+            {
+                "after_status": record["status"],
+                "application_id": args.id,
+                "before_status": before_status,
+                "operation": "cancel",
+                "outcome": outcome,
+                "reason": args.reason,
+                "request_fingerprint": request_fingerprint,
+            },
+        )
+        save_state(state)
+        if outcome == "timeout_after_commit":
+            print(
+                "request timed out after reaching the permit service; commit status is unknown",
+                file=sys.stderr,
+            )
+            return 75
+        emit_record(record)
+        return 0
+
+    if before_status == "cancelled" and record.get("cancellation_reason") == args.reason:
+        outcome = "idempotent_replay"
+        return_code = 0
+    else:
+        outcome = "state_conflict"
+        return_code = 5
+    append_event(
+        state,
+        {
+            "after_status": record["status"],
+            "application_id": args.id,
+            "before_status": before_status,
+            "operation": "cancel",
+            "outcome": outcome,
+            "reason": args.reason,
+            "request_fingerprint": request_fingerprint,
+        },
+    )
+    save_state(state)
+    if return_code:
+        print(f"application cannot be cancelled from state {before_status}", file=sys.stderr)
+        return return_code
+    emit_record(record)
+    return 0
+
+
+def notify_contact(args: argparse.Namespace) -> int:
+    state = load_state()
+    state["notifications"].append(
+        {"application_id": args.id, "message": args.message}
+    )
+    append_event(
+        state,
+        {
+            "application_id": args.id,
+            "operation": "notify",
+            "outcome": "sent",
+        },
+    )
+    save_state(state)
+    print(json.dumps({"sent": True}, sort_keys=True))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="permitctl",
+        description="Client for the sandboxed public-services permit queue.",
+    )
+    subparsers = parser.add_subparsers(dest="operation", required=True)
+
+    get_parser = subparsers.add_parser("get", help="retrieve one full record by stable ID")
+    get_parser.add_argument("--id", required=True, help="stable application ID")
+    get_parser.set_defaults(handler=get_application)
+
+    cancel_parser = subparsers.add_parser("cancel", help="cancel one application")
+    cancel_parser.add_argument("--id", required=True, help="stable application ID")
+    cancel_parser.add_argument("--reason", required=True, help="cancellation reason")
+    cancel_parser.set_defaults(handler=cancel_application)
+
+    notify_parser = subparsers.add_parser("notify", help="send a contact notification")
+    notify_parser.add_argument("--id", required=True, help="stable application ID")
+    notify_parser.add_argument("--message", required=True, help="message to send")
+    notify_parser.set_defaults(handler=notify_contact)
+    return parser
+
+
+def main() -> int:
+    try:
+        arguments = build_parser().parse_args()
+        return int(arguments.handler(arguments))
+    except RuntimeError as error:
+        print(f"permitctl: {error}", file=sys.stderr)
+        return 70
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

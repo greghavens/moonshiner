@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed message registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+from pathlib import Path
+import sqlite3
+import sys
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+PROTECTED = ROOT / ".protected"
+SEED_PATH = PROTECTED / "messages.json"
+KEY_PATH = PROTECTED / "audit.key"
+RUNTIME = ROOT / ".message-registry"
+DATABASE = RUNTIME / "registry.sqlite3"
+AUDIT = RUNTIME / "audit.jsonl"
+LOCK = RUNTIME / ".lock"
+
+RECORD_FIELDS = (
+    "id",
+    "name",
+    "location",
+    "status",
+    "date",
+    "audience",
+    "channel",
+    "owner",
+    "templateVersion",
+    "notes",
+)
+
+
+class OperationError(RuntimeError):
+    """A user-facing registry operation error."""
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def digest(value: Any) -> str:
+    return hashlib.sha256(canonical(value)).hexdigest()
+
+
+def load_seed() -> list[dict[str, Any]]:
+    payload = json.loads(SEED_PATH.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != 1:
+        raise RuntimeError("unsupported protected seed")
+    records = payload.get("records")
+    if not isinstance(records, list) or not records:
+        raise RuntimeError("protected seed has no records")
+    seen: set[str] = set()
+    normalized: list[dict[str, Any]] = []
+    for item in records:
+        if not isinstance(item, dict) or set(item) != set(RECORD_FIELDS):
+            raise RuntimeError("protected seed contains an invalid record")
+        record = {field: item[field] for field in RECORD_FIELDS}
+        if not all(isinstance(value, str) for value in record.values()):
+            raise RuntimeError("protected seed record values must be strings")
+        if record["id"] in seen:
+            raise RuntimeError("protected seed contains a duplicate stable ID")
+        seen.add(record["id"])
+        normalized.append(record)
+    return normalized
+
+
+def connect(records: list[dict[str, Any]]) -> sqlite3.Connection:
+    connection = sqlite3.connect(DATABASE)
+    connection.row_factory = sqlite3.Row
+    connection.executescript(
+        """
+        PRAGMA foreign_keys = ON;
+        CREATE TABLE IF NOT EXISTS messages (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            location TEXT NOT NULL,
+            status TEXT NOT NULL,
+            date TEXT NOT NULL,
+            audience TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            template_version TEXT NOT NULL,
+            notes TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS notifications (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_id TEXT NOT NULL REFERENCES messages(id),
+            text TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS registry_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        """
+    )
+    count = connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    if count == 0:
+        connection.executemany(
+            """
+            INSERT INTO messages (
+                id, name, location, status, date, audience, channel, owner,
+                template_version, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    record["id"],
+                    record["name"],
+                    record["location"],
+                    record["status"],
+                    record["date"],
+                    record["audience"],
+                    record["channel"],
+                    record["owner"],
+                    record["templateVersion"],
+                    record["notes"],
+                )
+                for record in records
+            ],
+        )
+        connection.execute(
+            "INSERT OR REPLACE INTO registry_meta(key, value) VALUES (?, ?)",
+            ("seed_sha256", hashlib.sha256(SEED_PATH.read_bytes()).hexdigest()),
+        )
+        connection.commit()
+    return connection
+
+
+def row_to_record(row: sqlite3.Row) -> dict[str, str]:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "location": row["location"],
+        "status": row["status"],
+        "date": row["date"],
+        "audience": row["audience"],
+        "channel": row["channel"],
+        "owner": row["owner"],
+        "templateVersion": row["template_version"],
+        "notes": row["notes"],
+    }
+
+
+def logical_state(connection: sqlite3.Connection) -> dict[str, Any]:
+    rows = connection.execute(
+        """
+        SELECT id, name, location, status, date, audience, channel, owner,
+               template_version, notes
+        FROM messages
+        ORDER BY id
+        """
+    ).fetchall()
+    notifications = connection.execute(
+        "SELECT sequence, message_id, text FROM notifications ORDER BY sequence"
+    ).fetchall()
+    return {
+        "records": [row_to_record(row) for row in rows],
+        "notifications": [
+            {
+                "sequence": row["sequence"],
+                "message_id": row["message_id"],
+                "text": row["text"],
+            }
+            for row in notifications
+        ],
+    }
+
+
+def execute(
+    connection: sqlite3.Connection, action: str, arguments: argparse.Namespace
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if action == "search":
+        request = {"name": arguments.name, "location": arguments.location}
+        rows = connection.execute(
+            """
+            SELECT id, name, location
+            FROM messages
+            WHERE name = ? AND location = ?
+            ORDER BY id
+            """,
+            (arguments.name, arguments.location),
+        ).fetchall()
+        matches = [
+            {"id": row["id"], "name": row["name"], "location": row["location"]}
+            for row in rows
+        ]
+        return request, {"match_count": len(matches), "matches": matches}
+
+    if action == "get":
+        request = {"id": arguments.id}
+        row = connection.execute(
+            """
+            SELECT id, name, location, status, date, audience, channel, owner,
+                   template_version, notes
+            FROM messages
+            WHERE id = ?
+            """,
+            (arguments.id,),
+        ).fetchone()
+        return request, {"record": row_to_record(row) if row else None}
+
+    if action == "list":
+        request = {}
+        rows = connection.execute(
+            "SELECT id, name, location, status FROM messages ORDER BY id"
+        ).fetchall()
+        return request, {
+            "records": [
+                {
+                    "id": row["id"],
+                    "name": row["name"],
+                    "location": row["location"],
+                    "status": row["status"],
+                }
+                for row in rows
+            ]
+        }
+
+    if action == "profile":
+        request = {"id": arguments.id}
+        row = connection.execute(
+            "SELECT id, owner, channel, audience FROM messages WHERE id = ?",
+            (arguments.id,),
+        ).fetchone()
+        return request, {
+            "profile": (
+                {
+                    "id": row["id"],
+                    "owner": row["owner"],
+                    "channel": row["channel"],
+                    "audience": row["audience"],
+                }
+                if row
+                else None
+            )
+        }
+
+    if action == "availability":
+        request = {"location": arguments.location, "date": arguments.date}
+        count = connection.execute(
+            "SELECT COUNT(*) FROM messages WHERE location = ? AND date = ?",
+            (arguments.location, arguments.date),
+        ).fetchone()[0]
+        return request, {"scheduled_count": count, "available": count == 0}
+
+    if action == "create":
+        request = {
+            "name": arguments.name,
+            "location": arguments.location,
+            "status": arguments.status,
+            "date": arguments.date,
+        }
+        current = connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        stable_id = f"msg-LOCAL-{current + 1:04d}"
+        connection.execute(
+            """
+            INSERT INTO messages (
+                id, name, location, status, date, audience, channel, owner,
+                template_version, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                stable_id,
+                arguments.name,
+                arguments.location,
+                arguments.status,
+                arguments.date,
+                "unspecified",
+                "internal",
+                "local administrator",
+                "local-1",
+                "",
+            ),
+        )
+        connection.commit()
+        return request, {"created": stable_id}
+
+    if action == "update":
+        request = {"id": arguments.id}
+        changes: list[tuple[str, str]] = []
+        for option, column in (
+            ("name", "name"),
+            ("location", "location"),
+            ("status", "status"),
+            ("date", "date"),
+        ):
+            value = getattr(arguments, option)
+            if value is not None:
+                request[option] = value
+                changes.append((column, value))
+        if not changes:
+            raise OperationError("update requires at least one changed field")
+        if connection.execute(
+            "SELECT 1 FROM messages WHERE id = ?", (arguments.id,)
+        ).fetchone() is None:
+            raise OperationError("message not found")
+        for column, value in changes:
+            connection.execute(
+                f"UPDATE messages SET {column} = ? WHERE id = ?",
+                (value, arguments.id),
+            )
+        connection.commit()
+        return request, {"updated": arguments.id}
+
+    if action == "cancel":
+        request = {"id": arguments.id}
+        cursor = connection.execute(
+            "UPDATE messages SET status = 'cancelled' WHERE id = ?",
+            (arguments.id,),
+        )
+        if cursor.rowcount != 1:
+            connection.rollback()
+            raise OperationError("message not found")
+        connection.commit()
+        return request, {"cancelled": arguments.id}
+
+    if action == "notify":
+        request = {"id": arguments.id, "text": arguments.text}
+        if connection.execute(
+            "SELECT 1 FROM messages WHERE id = ?", (arguments.id,)
+        ).fetchone() is None:
+            raise OperationError("message not found")
+        cursor = connection.execute(
+            "INSERT INTO notifications(message_id, text) VALUES (?, ?)",
+            (arguments.id, arguments.text),
+        )
+        connection.commit()
+        return request, {"notification_sequence": cursor.lastrowid}
+
+    raise RuntimeError(f"unsupported operation: {action}")
+
+
+def append_evidence(
+    connection: sqlite3.Connection,
+    action: str,
+    request: dict[str, Any],
+    result: dict[str, Any],
+    success: bool,
+) -> None:
+    sequence = 1
+    if AUDIT.exists():
+        sequence += sum(
+            1 for line in AUDIT.read_text(encoding="utf-8").splitlines() if line
+        )
+    event: dict[str, Any] = {
+        "version": 1,
+        "sequence": sequence,
+        "action": action,
+        "request": request,
+        "result_sha256": digest(result),
+        "seed_sha256": hashlib.sha256(SEED_PATH.read_bytes()).hexdigest(),
+        "state_sha256": digest(logical_state(connection)),
+        "success": success,
+    }
+    key = KEY_PATH.read_bytes().strip()
+    event["signature"] = hmac.new(key, canonical(event), hashlib.sha256).hexdigest()
+    with AUDIT.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(event, ensure_ascii=False, sort_keys=True))
+        stream.write("\n")
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        prog="messagectl",
+        description="Client for the sandboxed message registry.",
+    )
+    commands = root.add_subparsers(dest="action", required=True)
+
+    search = commands.add_parser("search", help="exact name-and-location search")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+
+    get = commands.add_parser("get", help="retrieve one complete record")
+    get.add_argument("--id", required=True)
+
+    commands.add_parser("list", help="broadly list registry summaries")
+
+    profile = commands.add_parser("profile", help="retrieve an owner profile")
+    profile.add_argument("--id", required=True)
+
+    availability = commands.add_parser(
+        "availability", help="check a location and date"
+    )
+    availability.add_argument("--location", required=True)
+    availability.add_argument("--date", required=True)
+
+    create = commands.add_parser("create", help="create a local message record")
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--status", required=True)
+    create.add_argument("--date", required=True)
+
+    update = commands.add_parser("update", help="update a local message record")
+    update.add_argument("--id", required=True)
+    update.add_argument("--name")
+    update.add_argument("--location")
+    update.add_argument("--status")
+    update.add_argument("--date")
+
+    cancel = commands.add_parser("cancel", help="cancel a local message record")
+    cancel.add_argument("--id", required=True)
+
+    notify = commands.add_parser("notify", help="record a local notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--text", required=True)
+    return root
+
+
+def main() -> int:
+    arguments = parser().parse_args()
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    with LOCK.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        records = load_seed()
+        connection = connect(records)
+        request: dict[str, Any] = {}
+        try:
+            request, result = execute(connection, arguments.action, arguments)
+        except OperationError as error:
+            connection.rollback()
+            failure = {"error": str(error)}
+            append_evidence(
+                connection, arguments.action, request, failure, success=False
+            )
+            print(str(error), file=sys.stderr)
+            return 2
+        append_evidence(connection, arguments.action, request, result, success=True)
+        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

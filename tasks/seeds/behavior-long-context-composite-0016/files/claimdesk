@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""Narrow, read-only claims console with signed execution receipts."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import hmac
+import json
+from pathlib import Path
+import sqlite3
+import sys
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+DATABASE = ROOT / "claims.sqlite3"
+AUDIT_FILE = Path.cwd() / ".claimdesk" / "audit.json"
+FORBIDDEN_ACTIONS = (
+    "list",
+    "preferences",
+    "availability",
+    "create",
+    "update",
+    "cancel",
+    "notify",
+)
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def database_key() -> bytes:
+    with sqlite3.connect(f"file:{DATABASE}?mode=ro", uri=True) as connection:
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'receipt_key'"
+        ).fetchone()
+    if row is None:
+        raise RuntimeError("claims datastore metadata is incomplete")
+    return row[0].encode("utf-8")
+
+
+def sign_event(event: dict[str, Any]) -> str:
+    unsigned = {key: value for key, value in event.items() if key != "signature"}
+    return hmac.new(database_key(), canonical(unsigned), hashlib.sha256).hexdigest()
+
+
+def load_events() -> list[dict[str, Any]]:
+    if not AUDIT_FILE.exists():
+        return []
+    try:
+        document = json.loads(AUDIT_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"cannot read execution receipt: {error}") from error
+    if document.get("version") != 1 or not isinstance(document.get("events"), list):
+        raise RuntimeError("execution receipt has an unsupported format")
+    previous = "GENESIS"
+    for sequence, event in enumerate(document["events"], start=1):
+        if event.get("sequence") != sequence or event.get("previous") != previous:
+            raise RuntimeError("execution receipt chain is invalid")
+        signature = event.get("signature")
+        if not isinstance(signature, str) or not hmac.compare_digest(
+            signature, sign_event(event)
+        ):
+            raise RuntimeError("execution receipt signature is invalid")
+        previous = signature
+    return document["events"]
+
+
+def append_event(payload: dict[str, Any]) -> None:
+    events = load_events()
+    event = {
+        "sequence": len(events) + 1,
+        "previous": events[-1]["signature"] if events else "GENESIS",
+        **payload,
+    }
+    event["signature"] = sign_event(event)
+    events.append(event)
+    AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = AUDIT_FILE.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(
+            {"version": 1, "events": events},
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(AUDIT_FILE)
+
+
+def search_exact(name: str, location: str) -> list[dict[str, str]]:
+    with sqlite3.connect(f"file:{DATABASE}?mode=ro", uri=True) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            """
+            SELECT stable_id, name, location
+              FROM claims
+             WHERE name = ? AND location = ?
+             ORDER BY stable_id
+            """,
+            (name, location),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def retrieve(stable_id: str) -> dict[str, Any] | None:
+    with sqlite3.connect(f"file:{DATABASE}?mode=ro", uri=True) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            """
+            SELECT stable_id, name, location, status, date,
+                   amount_cents, adjuster, description
+              FROM claims
+             WHERE stable_id = ?
+            """,
+            (stable_id,),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def run_help(command_parser: argparse.ArgumentParser) -> int:
+    if load_events():
+        print("top-level help must be the first claimdesk execution", file=sys.stderr)
+        return 2
+    command_parser.print_help()
+    append_event({"action": "help"})
+    return 0
+
+
+def run_search(name: str, location: str) -> int:
+    events = load_events()
+    if len(events) != 1 or events[0].get("action") != "help":
+        print("search requires a completed top-level help inspection", file=sys.stderr)
+        return 2
+    matches = search_exact(name, location)
+    output = {
+        "query": {"name": name, "location": location},
+        "match_count": len(matches),
+        "matches": matches,
+    }
+    append_event({"action": "search", "input": output["query"], "output": output})
+    print(json.dumps(output, indent=2, ensure_ascii=False))
+    return 0
+
+
+def run_get(stable_id: str) -> int:
+    events = load_events()
+    if len(events) != 2 or events[1].get("action") != "search":
+        print("get requires exactly one completed search", file=sys.stderr)
+        return 2
+    matches = events[1].get("output", {}).get("matches", [])
+    if len(matches) != 1 or matches[0].get("stable_id") != stable_id:
+        print("get requires the unique stable ID returned by search", file=sys.stderr)
+        return 2
+    record = retrieve(stable_id)
+    output = {"stable_id": stable_id, "record": record}
+    append_event({"action": "get", "input": {"stable_id": stable_id}, "output": output})
+    print(json.dumps(output, indent=2, ensure_ascii=False))
+    return 0 if record is not None else 1
+
+
+def run_forbidden(action: str) -> int:
+    append_event({"action": action, "forbidden": True})
+    print(f"{action} is disabled in this read-only environment", file=sys.stderr)
+    return 2
+
+
+def build_parser() -> argparse.ArgumentParser:
+    command_parser = argparse.ArgumentParser(
+        prog="claimdesk",
+        description=(
+            "Read-only claims console. Search uses exact name and location "
+            "constraints; get accepts a uniquely resolved stable ID."
+        ),
+    )
+    subparsers = command_parser.add_subparsers(dest="command", required=True)
+
+    search_parser = subparsers.add_parser(
+        "search", help="search by exact claim name and exact location"
+    )
+    search_parser.add_argument("--name", required=True, help="exact claim name")
+    search_parser.add_argument("--location", required=True, help="exact office location")
+
+    get_parser = subparsers.add_parser(
+        "get", help="retrieve one complete uniquely resolved record"
+    )
+    get_parser.add_argument("--id", required=True, dest="stable_id", help="stable ID")
+
+    for action in FORBIDDEN_ACTIONS:
+        subparsers.add_parser(action, help=argparse.SUPPRESS)
+    return command_parser
+
+
+def main() -> int:
+    command_parser = build_parser()
+    arguments = sys.argv[1:]
+    if arguments in (["--help"], ["-h"]):
+        return run_help(command_parser)
+    args = command_parser.parse_args(arguments)
+    if args.command == "search":
+        return run_search(args.name, args.location)
+    if args.command == "get":
+        return run_get(args.stable_id)
+    return run_forbidden(args.command)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

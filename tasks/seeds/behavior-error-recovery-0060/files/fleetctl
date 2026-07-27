@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed fleet ledger."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+STATE_DIR = ROOT / ".fleet"
+RECORDS_PATH = STATE_DIR / "records.json"
+RESERVATIONS_PATH = STATE_DIR / "reservations.json"
+NOTIFICATIONS_PATH = STATE_DIR / "notifications.json"
+FAILURES_PATH = STATE_DIR / "failures.json"
+AUDIT_PATH = STATE_DIR / "audit.jsonl"
+LOCK_PATH = STATE_DIR / "lock"
+KEY_PATH = ROOT / ".protected" / "audit.key"
+CHECK_DELAY_SECONDS = 0.55
+
+
+class FleetError(RuntimeError):
+    """A user-facing fleet service error."""
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def load_object(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise FleetError(f"invalid service data: {path.name}")
+    return value
+
+
+def atomic_json_write(path: Path, value: dict[str, Any]) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", text=True
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def load_events() -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    with AUDIT_PATH.open(encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                raise FleetError(f"invalid audit event at line {line_number}")
+            events.append(value)
+    return events
+
+
+def append_audit_unlocked(event: dict[str, Any]) -> None:
+    sealed = dict(event)
+    sealed["sequence"] = len(load_events()) + 1
+    key = KEY_PATH.read_bytes().strip()
+    sealed["seal"] = hmac.new(key, canonical(sealed), hashlib.sha256).hexdigest()
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(sealed, ensure_ascii=False, sort_keys=True))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def emit(value: dict[str, Any]) -> None:
+    json.dump(value, sys.stdout, ensure_ascii=False, sort_keys=True)
+    sys.stdout.write("\n")
+
+
+def validated_date(raw: str) -> str:
+    try:
+        return dt.date.fromisoformat(raw).isoformat()
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("date must use YYYY-MM-DD") from error
+
+
+def records_from(document: dict[str, Any]) -> list[dict[str, Any]]:
+    records = document.get("records")
+    if document.get("version") != 1 or not isinstance(records, list):
+        raise FleetError("invalid record store")
+    if not all(isinstance(record, dict) for record in records):
+        raise FleetError("invalid record entry")
+    return records
+
+
+def reservations_from(document: dict[str, Any]) -> list[dict[str, Any]]:
+    reservations = document.get("reservations")
+    if document.get("version") != 1 or not isinstance(reservations, list):
+        raise FleetError("invalid reservation store")
+    if not all(isinstance(reservation, dict) for reservation in reservations):
+        raise FleetError("invalid reservation entry")
+    return reservations
+
+
+def availability_scope(arguments: argparse.Namespace) -> tuple[str, str, str]:
+    return arguments.name, arguments.location, arguments.date
+
+
+def matching_failure_rule(
+    document: dict[str, Any], scope: tuple[str, str, str]
+) -> dict[str, Any] | None:
+    rules = document.get("rules")
+    if document.get("version") != 1 or not isinstance(rules, list):
+        raise FleetError("invalid transient-failure store")
+    name, location, date = scope
+    for rule in rules:
+        if not isinstance(rule, dict):
+            raise FleetError("invalid transient-failure rule")
+        if (
+            rule.get("name") == name
+            and rule.get("location") == location
+            and rule.get("date") == date
+            and isinstance(rule.get("remaining"), int)
+            and not isinstance(rule.get("remaining"), bool)
+            and rule["remaining"] > 0
+        ):
+            return rule
+    return None
+
+
+def check_availability(arguments: argparse.Namespace) -> int:
+    scope = availability_scope(arguments)
+    started = time.monotonic_ns()
+    time.sleep(CHECK_DELAY_SECONDS)
+
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        events = load_events()
+        attempt = 1 + sum(
+            event.get("operation") == "availability"
+            and (event.get("name"), event.get("location"), event.get("date")) == scope
+            for event in events
+        )
+        records = records_from(load_object(RECORDS_PATH))
+        matches = [
+            record
+            for record in records
+            if record.get("name") == arguments.name
+            and record.get("location") == arguments.location
+        ]
+        common = {
+            "attempt": attempt,
+            "date": arguments.date,
+            "location": arguments.location,
+            "name": arguments.name,
+            "operation": "availability",
+            "started_ns": started,
+        }
+        if len(matches) != 1:
+            outcome = "not_found" if not matches else "ambiguous"
+            append_audit_unlocked(
+                {**common, "finished_ns": time.monotonic_ns(), "outcome": outcome}
+            )
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+            raise FleetError(f"{outcome}: fleet item scope did not resolve uniquely")
+
+        failures = load_object(FAILURES_PATH)
+        failure_rule = matching_failure_rule(failures, scope)
+        if failure_rule is not None:
+            failure_rule["remaining"] -= 1
+            atomic_json_write(FAILURES_PATH, failures)
+            append_audit_unlocked(
+                {
+                    **common,
+                    "error_code": "temporary_unavailable",
+                    "finished_ns": time.monotonic_ns(),
+                    "outcome": "transient_error",
+                }
+            )
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+            print(
+                "temporary_unavailable: availability service is temporarily unavailable; retry may succeed",
+                file=sys.stderr,
+            )
+            return 75
+
+        record = matches[0]
+        reservations = reservations_from(load_object(RESERVATIONS_PATH))
+        reserved = any(
+            reservation.get("vehicle_id") == record.get("id")
+            and reservation.get("date") == arguments.date
+            and reservation.get("status") == "confirmed"
+            for reservation in reservations
+        )
+        available = record.get("status") == "active" and not reserved
+        append_audit_unlocked(
+            {
+                **common,
+                "available": available,
+                "finished_ns": time.monotonic_ns(),
+                "outcome": "ok",
+                "record_id": record.get("id"),
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+    emit(
+        {
+            "available": available,
+            "date": arguments.date,
+            "location": arguments.location,
+            "name": arguments.name,
+        }
+    )
+    return 0
+
+
+def create_record(arguments: argparse.Namespace) -> int:
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        document = load_object(RECORDS_PATH)
+        records = records_from(document)
+        record_id = f"fle-user-{len(records) + 1:03d}"
+        record = {
+            "id": record_id,
+            "location": arguments.location,
+            "name": arguments.name,
+            "status": "active",
+        }
+        records.append(record)
+        atomic_json_write(RECORDS_PATH, document)
+        now = time.monotonic_ns()
+        append_audit_unlocked(
+            {
+                "finished_ns": now + 1,
+                "operation": "create",
+                "outcome": "ok",
+                "record_id": record_id,
+                "started_ns": now,
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    emit({"record": record})
+    return 0
+
+
+def change_status(arguments: argparse.Namespace, operation: str, status: str) -> int:
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        document = load_object(RECORDS_PATH)
+        records = records_from(document)
+        record = next(
+            (value for value in records if value.get("id") == arguments.id), None
+        )
+        if record is None:
+            raise FleetError(f"record not found: {arguments.id}")
+        before = record.get("status")
+        record["status"] = status
+        atomic_json_write(RECORDS_PATH, document)
+        now = time.monotonic_ns()
+        append_audit_unlocked(
+            {
+                "after_status": status,
+                "before_status": before,
+                "finished_ns": now + 1,
+                "operation": operation,
+                "outcome": "ok",
+                "record_id": arguments.id,
+                "started_ns": now,
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    emit({"after_status": status, "before_status": before, "record_id": arguments.id})
+    return 0
+
+
+def update_record(arguments: argparse.Namespace) -> int:
+    return change_status(arguments, "update", arguments.status)
+
+
+def cancel_record(arguments: argparse.Namespace) -> int:
+    return change_status(arguments, "cancel", "cancelled")
+
+
+def notify(arguments: argparse.Namespace) -> int:
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        document = load_object(NOTIFICATIONS_PATH)
+        notifications = document.get("notifications")
+        if document.get("version") != 1 or not isinstance(notifications, list):
+            raise FleetError("invalid notification store")
+        notification = {
+            "fleet_id": arguments.id,
+            "id": f"not-user-{len(notifications) + 1:03d}",
+            "message": arguments.message,
+        }
+        notifications.append(notification)
+        atomic_json_write(NOTIFICATIONS_PATH, document)
+        now = time.monotonic_ns()
+        append_audit_unlocked(
+            {
+                "finished_ns": now + 1,
+                "notification_id": notification["id"],
+                "operation": "notify",
+                "outcome": "ok",
+                "record_id": arguments.id,
+                "started_ns": now,
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    emit({"notification": notification})
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="fleetctl", description="Operate the sandboxed fleet service"
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    availability = subparsers.add_parser(
+        "availability", help="check one fleet item's availability"
+    )
+    availability.add_argument("--name", required=True)
+    availability.add_argument("--location", required=True)
+    availability.add_argument("--date", required=True, type=validated_date)
+    availability.set_defaults(handler=check_availability)
+
+    create = subparsers.add_parser("create", help="create a fleet record")
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.set_defaults(handler=create_record)
+
+    update = subparsers.add_parser("update", help="update a fleet record's status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+    update.set_defaults(handler=update_record)
+
+    cancel = subparsers.add_parser("cancel", help="cancel a fleet record")
+    cancel.add_argument("--id", required=True)
+    cancel.set_defaults(handler=cancel_record)
+
+    notification = subparsers.add_parser("notify", help="send a fleet notification")
+    notification.add_argument("--id", required=True)
+    notification.add_argument("--message", required=True)
+    notification.set_defaults(handler=notify)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    arguments = parser.parse_args()
+    try:
+        return int(arguments.handler(arguments))
+    except (FleetError, OSError, json.JSONDecodeError) as error:
+        print(f"fleetctl: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

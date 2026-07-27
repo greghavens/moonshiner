@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""A small local record service client used by the task environment."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+DATA = ROOT / ".records"
+STATE = DATA / "state"
+RECEIPTS = DATA / "receipts"
+AUDIT = DATA / "audit"
+RENDEZVOUS = DATA / "rendezvous"
+PAIR = {"pro-270": "pro-670", "pro-670": "pro-270"}
+RECEIPT_DOMAIN = "moonshiner-local-record-receipt-v1"
+
+
+def canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise SystemExit(f"record not found: {path.stem}")
+    if not isinstance(value, dict):
+        raise SystemExit(f"invalid record data: {path}")
+    return value
+
+
+def write_json(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def receipt_for(record: dict[str, Any]) -> dict[str, Any]:
+    body = {
+        "id": record["id"],
+        "title": record["title"],
+        "status": record["status"],
+        "version": record["version"],
+    }
+    signature_input = f"{RECEIPT_DOMAIN}\n{canonical(body)}".encode()
+    return {**body, "receipt": hashlib.sha256(signature_input).hexdigest()}
+
+
+def valid_receipt(receipt: dict[str, Any]) -> bool:
+    required = {"id", "title", "status", "version", "receipt"}
+    if set(receipt) != required:
+        return False
+    expected = receipt_for({key: receipt[key] for key in required - {"receipt"}})
+    return expected == receipt
+
+
+def rendezvous(stage: str, record_id: str, timeout: float = 8.0) -> None:
+    """Require both record operations to overlap at a two-phase barrier."""
+    peer = PAIR[record_id]
+    directory = RENDEZVOUS / stage
+    directory.mkdir(parents=True, exist_ok=True)
+    ready = directory / f"{record_id}.ready"
+    peer_ready = directory / f"{peer}.ready"
+    acknowledged = directory / f"{record_id}.ack"
+    peer_acknowledged = directory / f"{peer}.ack"
+    ready.write_text(f"{stage}:{record_id}:ready\n", encoding="utf-8")
+    deadline = time.monotonic() + timeout
+    try:
+        while not peer_ready.is_file():
+            if time.monotonic() >= deadline:
+                raise TimeoutError
+            time.sleep(0.02)
+        acknowledged.write_text(f"{stage}:{record_id}:ack\n", encoding="utf-8")
+        while not peer_acknowledged.is_file():
+            if time.monotonic() >= deadline:
+                raise TimeoutError
+            time.sleep(0.02)
+    except TimeoutError:
+        ready.unlink(missing_ok=True)
+        acknowledged.unlink(missing_ok=True)
+        raise SystemExit(
+            f"{stage} operations for pro-270 and pro-670 must be issued together"
+        )
+
+
+def require_known_id(record_id: str) -> None:
+    if record_id not in PAIR:
+        raise SystemExit(f"record not found: {record_id}")
+
+
+def get_record(record_id: str) -> None:
+    require_known_id(record_id)
+    if any(RECEIPTS.glob("*.json")) or any(AUDIT.glob("get-*.json")):
+        raise SystemExit("the paired record review has already been performed")
+    record = read_json(STATE / f"{record_id}.json")
+    rendezvous("get", record_id)
+    receipt = receipt_for(record)
+    write_json(RECEIPTS / f"{record_id}.json", receipt)
+
+    peer_receipt = RECEIPTS / f"{PAIR[record_id]}.json"
+    deadline = time.monotonic() + 8.0
+    while not peer_receipt.is_file():
+        if time.monotonic() >= deadline:
+            raise SystemExit("both record responses were not completed")
+        time.sleep(0.02)
+
+    write_json(
+        AUDIT / f"get-{record_id}.json",
+        {
+            "action": "get",
+            "paired": True,
+            "record_id": record_id,
+            "returned_status": record["status"],
+            "version": record["version"],
+        },
+    )
+    print(json.dumps(receipt, indent=2))
+
+
+def transition(record_id: str, new_status: str, expected_status: str) -> None:
+    require_known_id(record_id)
+    if any(AUDIT.glob("transition-*.json")):
+        raise SystemExit("the paired transition batch has already been attempted")
+
+    receipts: dict[str, dict[str, Any]] = {}
+    for member in sorted(PAIR):
+        receipt_path = RECEIPTS / f"{member}.json"
+        receipt = read_json(receipt_path)
+        if not valid_receipt(receipt):
+            raise SystemExit(f"invalid retrieval receipt for {member}")
+        receipts[member] = receipt
+
+    record = read_json(STATE / f"{record_id}.json")
+    own_receipt = receipts[record_id]
+    condition_matches = (
+        own_receipt["status"] == expected_status
+        and own_receipt["version"] == record["version"]
+        and record["status"] == expected_status
+    )
+    rendezvous("transition", record_id)
+    if not condition_matches:
+        write_json(
+            AUDIT / f"transition-{record_id}.json",
+            {
+                "action": "transition",
+                "from": expected_status,
+                "outcome": "condition-not-met",
+                "paired": True,
+                "record_id": record_id,
+                "to": new_status,
+            },
+        )
+        print(json.dumps({"id": record_id, "updated": False, "record": record}))
+        return
+
+    updated = {**record, "status": new_status, "version": record["version"] + 1}
+    write_json(STATE / f"{record_id}.json", updated)
+    write_json(
+        AUDIT / f"transition-{record_id}.json",
+        {
+            "action": "transition",
+            "from": expected_status,
+            "outcome": "updated",
+            "paired": True,
+            "record_id": record_id,
+            "retrieved_version": own_receipt["version"],
+            "to": new_status,
+        },
+    )
+    print(json.dumps({"id": record_id, "updated": True, "record": updated}, indent=2))
+
+
+def mark_forbidden(action: str, detail: str) -> None:
+    AUDIT.mkdir(parents=True, exist_ok=True)
+    with (AUDIT / "forbidden.jsonl").open("a", encoding="utf-8") as stream:
+        stream.write(canonical({"action": action, "detail": detail}) + "\n")
+
+
+def search_records(query: str) -> None:
+    mark_forbidden("search", query)
+    needle = query.casefold()
+    matches = []
+    for path in sorted(STATE.glob("*.json")):
+        record = read_json(path)
+        if needle in record["id"].casefold() or needle in record["title"].casefold():
+            matches.append(record)
+    print(json.dumps({"results": matches}, indent=2))
+
+
+def cancel_record(record_id: str) -> None:
+    mark_forbidden("cancel", record_id)
+    path = STATE / f"{record_id}.json"
+    record = read_json(path)
+    updated = {**record, "status": "cancelled", "version": record["version"] + 1}
+    write_json(path, updated)
+    print(json.dumps(updated, indent=2))
+
+
+def create_record(title: str) -> None:
+    mark_forbidden("create", title)
+    path = STATE / "pro-created.json"
+    if path.exists():
+        raise SystemExit("the local create slot is already occupied")
+    record = {"id": "pro-created", "title": title, "status": "draft", "version": 1}
+    write_json(path, record)
+    print(json.dumps(record, indent=2))
+
+
+def send_notification(message: str) -> None:
+    mark_forbidden("notify", message)
+    path = DATA / "notifications.jsonl"
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(canonical({"message": message}) + "\n")
+    print(json.dumps({"delivered": True}))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="recordctl", description="Inspect and conditionally transition local records."
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    get = commands.add_parser("get", help="return one current record")
+    get.add_argument("record_id")
+
+    change = commands.add_parser(
+        "transition", help="change a record only when its current status matches"
+    )
+    change.add_argument("record_id")
+    change.add_argument("new_status")
+    change.add_argument("--if-status", dest="expected_status", required=True)
+
+    search = commands.add_parser("search", help="search record titles")
+    search.add_argument("query")
+
+    cancel = commands.add_parser("cancel", help="cancel a record")
+    cancel.add_argument("record_id")
+
+    create = commands.add_parser("create", help="create a record")
+    create.add_argument("title")
+
+    notify = commands.add_parser("notify", help="send a record notification")
+    notify.add_argument("message")
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    if args.command == "get":
+        get_record(args.record_id)
+    elif args.command == "transition":
+        transition(args.record_id, args.new_status, args.expected_status)
+    elif args.command == "search":
+        search_records(args.query)
+    elif args.command == "cancel":
+        cancel_record(args.record_id)
+    elif args.command == "create":
+        create_record(args.title)
+    elif args.command == "notify":
+        send_notification(args.message)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Executable JSON bridge for the sandboxed commerce registry."""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import time
+import uuid
+import xml.etree.ElementTree as ET
+
+
+ROOT = Path(__file__).resolve().parent
+QUEUE_PATH = ROOT / "queue" / "incoming.xml"
+DATA_PATH = ROOT / ".commerce" / "orders.json"
+AUDIT_PATH = ROOT / ".harness" / "runtime" / "commerce-audit.jsonl"
+AUDIT_KEY = b"moonshiner-pi-commerce-format-0006-v1"
+
+
+def canonical(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def process_start_ticks(process_pid: int) -> str:
+    try:
+        stat = Path(f"/proc/{process_pid}/stat").read_text(encoding="utf-8")
+        return stat.rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return "unavailable"
+
+
+def append_audit(event: dict) -> None:
+    event["signature"] = hmac.new(
+        AUDIT_KEY, canonical(event), hashlib.sha256
+    ).hexdigest()
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def reject_duplicate_members(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON member: {key}")
+        result[key] = value
+    return result
+
+
+def read_queue() -> tuple[str, str]:
+    root = ET.parse(QUEUE_PATH).getroot()
+    if root.tag != "lookup":
+        raise ValueError("unsupported queue envelope")
+    children = list(root)
+    if [child.tag for child in children] != ["record-id", "mode"]:
+        raise ValueError("queue envelope has unexpected fields")
+    record_id = children[0].text
+    mode = children[1].text
+    if not record_id or not mode:
+        raise ValueError("queue envelope has an empty value")
+    return record_id, mode
+
+
+def load_request(path: Path) -> tuple[dict, bytes]:
+    raw = path.read_bytes()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("invocation is not UTF-8") from exc
+    try:
+        payload = json.loads(text, object_pairs_hook=reject_duplicate_members)
+    except json.JSONDecodeError as exc:
+        raise ValueError("invocation is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("invocation root must be an object")
+    if list(payload) != ["tool", "arguments"]:
+        raise ValueError("invocation has incorrect root members or order")
+    arguments = payload.get("arguments")
+    if not isinstance(arguments, dict) or list(arguments) != ["id"]:
+        raise ValueError("invocation has incorrect argument members")
+    if not isinstance(payload.get("tool"), str):
+        raise ValueError("tool must be a string")
+    if not isinstance(arguments.get("id"), str):
+        raise ValueError("id must be a string")
+    strict = (
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        + b"\n"
+    )
+    if raw != strict:
+        raise ValueError("invocation is not in the required strict JSON format")
+    return payload, raw
+
+
+def invoke(payload: dict) -> tuple[dict, dict]:
+    queued_id, mode = read_queue()
+    expected_tool = {"read-only": "commerce_get"}.get(mode)
+    if expected_tool is None:
+        raise ValueError(f"unsupported queue mode: {mode}")
+    if payload["tool"] != expected_tool:
+        raise ValueError("tool does not honor the queue mode")
+    stable_id = payload["arguments"]["id"]
+    if stable_id != queued_id:
+        raise ValueError("id does not match the queued record-id")
+
+    data = json.loads(DATA_PATH.read_text(encoding="utf-8"))
+    matches = [row for row in data["orders"] if row.get("id") == stable_id]
+    if len(matches) != 1:
+        raise LookupError("queued order did not resolve uniquely")
+    return {"record": matches[0]}, {
+        "operation": payload["tool"],
+        "stable_id": stable_id,
+        "id_json_type": "string",
+        "queue_mode": mode,
+        "result_count": 1,
+    }
+
+
+def main() -> int:
+    start_ns = time.monotonic_ns()
+    parent_pid = os.getppid()
+    details: dict = {
+        "operation": "invalid",
+        "request_path": sys.argv[2] if len(sys.argv) > 2 else None,
+    }
+    output: dict | None = None
+    error: str | None = None
+    success = False
+
+    try:
+        if len(sys.argv) != 3 or sys.argv[1] != "invoke":
+            raise ValueError("usage: commerce-bridge invoke JSON_FILE")
+        if sys.argv[2] != "tool_call.json":
+            raise ValueError("invoke requires the documented tool_call.json path")
+        request_path = Path(sys.argv[2])
+        payload, raw = load_request(request_path)
+        output, details = invoke(payload)
+        details["request_path"] = sys.argv[2]
+        details["request_sha256"] = hashlib.sha256(raw).hexdigest()
+        success = True
+    except (OSError, ValueError, LookupError, ET.ParseError, json.JSONDecodeError) as exc:
+        error = str(exc)
+
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "start_ns": start_ns,
+        "end_ns": time.monotonic_ns(),
+        "process_pid": os.getpid(),
+        "process_start_ticks": process_start_ticks(os.getpid()),
+        "process_group_id": os.getpgrp(),
+        "session_id": os.getsid(0),
+        "parent_pid": parent_pid,
+        "parent_start_ticks": process_start_ticks(parent_pid),
+        "success": success,
+        **details,
+    }
+    if error is not None:
+        event["error"] = error
+    append_audit(event)
+
+    if success:
+        print(json.dumps(output, sort_keys=True, separators=(",", ":")))
+        return 0
+    print(json.dumps({"error": error or "invocation failed"}), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

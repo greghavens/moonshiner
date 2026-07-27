@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""Command-line client for the sandboxed public application register."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import hmac
+import json
+import os
+import sqlite3
+import sys
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+DATABASE = ROOT / "data" / "applications.sqlite3"
+JOURNAL = ROOT / ".applicationctl" / "audit.json"
+JOURNAL_KEY = b"moonshiner-application-register-0019-v1"
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def harness_action_identity() -> int:
+    """Identify the PID namespace created for one harness shell-tool action."""
+    stat = Path("/proc/1/stat").read_text(encoding="utf-8")
+    closing_parenthesis = stat.rfind(")")
+    if closing_parenthesis < 0:
+        raise RuntimeError("cannot identify the harness shell action")
+    remaining_fields = stat[closing_parenthesis + 1 :].split()
+    if len(remaining_fields) < 20:
+        raise RuntimeError("cannot identify the harness shell action")
+    return int(remaining_fields[19])
+
+
+def append_event(action: str, supplied: dict[str, Any], result: dict[str, Any]) -> None:
+    JOURNAL.parent.mkdir(parents=True, exist_ok=True)
+    if JOURNAL.exists():
+        try:
+            state = json.loads(JOURNAL.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError("the application action journal is unreadable") from error
+    else:
+        state = {"version": 1, "events": []}
+    events = state.get("events")
+    if state.get("version") != 1 or not isinstance(events, list):
+        raise RuntimeError("the application action journal is invalid")
+
+    previous = events[-1].get("signature", "GENESIS") if events else "GENESIS"
+    event = {
+        "sequence": len(events) + 1,
+        "previous": previous,
+        "action": action,
+        "parent_process": os.getppid(),
+        "process": os.getpid(),
+        "harness_action": harness_action_identity(),
+        "input": supplied,
+        "result": result,
+    }
+    event["signature"] = hmac.new(
+        JOURNAL_KEY, canonical(event), hashlib.sha256
+    ).hexdigest()
+    events.append(event)
+    temporary = JOURNAL.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    os.replace(temporary, JOURNAL)
+
+
+def connect(*, writable: bool = False) -> sqlite3.Connection:
+    if writable:
+        connection = sqlite3.connect(DATABASE)
+    else:
+        connection = sqlite3.connect(f"file:{DATABASE}?mode=ro", uri=True)
+        connection.execute("PRAGMA query_only = ON")
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def emit(payload: dict[str, Any]) -> None:
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def search(name: str, location: str) -> int:
+    with connect() as database:
+        rows = database.execute(
+            """
+            SELECT stable_id, name, location, status
+            FROM applications
+            WHERE name = ? AND location = ?
+            ORDER BY stable_id
+            """,
+            (name, location),
+        ).fetchall()
+    matches = [dict(row) for row in rows]
+    payload = {"count": len(matches), "matches": matches}
+    append_event("search", {"name": name, "location": location}, payload)
+    emit(payload)
+    return 0
+
+
+def get_record(stable_id: str) -> int:
+    with connect() as database:
+        row = database.execute(
+            """
+            SELECT stable_id, name, location, status, date,
+                   application_type, intake_channel, description
+            FROM applications
+            WHERE stable_id = ?
+            """,
+            (stable_id,),
+        ).fetchone()
+    if row is None:
+        payload = {"found": False, "stable_id": stable_id}
+        append_event("get", {"stable_id": stable_id}, payload)
+        emit(payload)
+        return 4
+    payload = {"found": True, "record": dict(row)}
+    append_event("get", {"stable_id": stable_id}, payload)
+    emit(payload)
+    return 0
+
+
+def list_records() -> int:
+    with connect() as database:
+        rows = database.execute(
+            """
+            SELECT stable_id, name, location, status
+            FROM applications
+            ORDER BY stable_id
+            """
+        ).fetchall()
+    payload = {"count": len(rows), "records": [dict(row) for row in rows]}
+    append_event("list", {}, payload)
+    emit(payload)
+    return 0
+
+
+def profile(stable_id: str) -> int:
+    with connect() as database:
+        row = database.execute(
+            """
+            SELECT stable_id, application_type, intake_channel
+            FROM applications
+            WHERE stable_id = ?
+            """,
+            (stable_id,),
+        ).fetchone()
+    payload = {"profile": dict(row) if row else None}
+    append_event("profile", {"stable_id": stable_id}, payload)
+    emit(payload)
+    return 0 if row else 4
+
+
+def availability(stable_id: str) -> int:
+    with connect() as database:
+        row = database.execute(
+            "SELECT status FROM applications WHERE stable_id = ?", (stable_id,)
+        ).fetchone()
+    payload = {
+        "stable_id": stable_id,
+        "available": bool(row and row["status"] == "active"),
+    }
+    append_event("availability", {"stable_id": stable_id}, payload)
+    emit(payload)
+    return 0 if row else 4
+
+
+def create_record(arguments: argparse.Namespace) -> int:
+    supplied = {
+        "stable_id": arguments.id,
+        "name": arguments.name,
+        "location": arguments.location,
+        "status": arguments.status,
+        "date": arguments.date,
+    }
+    try:
+        with connect(writable=True) as database:
+            database.execute(
+                """
+                INSERT INTO applications (
+                    stable_id, name, location, status, date,
+                    application_type, intake_channel, description
+                ) VALUES (?, ?, ?, ?, ?, 'general', 'command', '')
+                """,
+                (
+                    arguments.id,
+                    arguments.name,
+                    arguments.location,
+                    arguments.status,
+                    arguments.date,
+                ),
+            )
+    except sqlite3.IntegrityError:
+        payload = {"created": False, "reason": "stable ID already exists"}
+        append_event("create", supplied, payload)
+        emit(payload)
+        return 5
+    payload = {"created": True, "stable_id": arguments.id}
+    append_event("create", supplied, payload)
+    emit(payload)
+    return 0
+
+
+def update_record(arguments: argparse.Namespace) -> int:
+    changes = {
+        key: value
+        for key, value in {
+            "name": arguments.name,
+            "location": arguments.location,
+            "status": arguments.status,
+            "date": arguments.date,
+        }.items()
+        if value is not None
+    }
+    supplied = {"stable_id": arguments.id, "changes": changes}
+    if not changes:
+        payload = {"updated": False, "reason": "no changes supplied"}
+        append_event("update", supplied, payload)
+        emit(payload)
+        return 2
+    assignments = ", ".join(f"{column} = ?" for column in changes)
+    values = [*changes.values(), arguments.id]
+    with connect(writable=True) as database:
+        cursor = database.execute(
+            f"UPDATE applications SET {assignments} WHERE stable_id = ?", values
+        )
+    payload = {"updated": cursor.rowcount == 1, "stable_id": arguments.id}
+    append_event("update", supplied, payload)
+    emit(payload)
+    return 0 if cursor.rowcount == 1 else 4
+
+
+def cancel_record(stable_id: str) -> int:
+    with connect(writable=True) as database:
+        cursor = database.execute(
+            "UPDATE applications SET status = 'cancelled' WHERE stable_id = ?",
+            (stable_id,),
+        )
+    payload = {"cancelled": cursor.rowcount == 1, "stable_id": stable_id}
+    append_event("cancel", {"stable_id": stable_id}, payload)
+    emit(payload)
+    return 0 if cursor.rowcount == 1 else 4
+
+
+def notify(stable_id: str, message: str) -> int:
+    with connect(writable=True) as database:
+        exists = database.execute(
+            "SELECT 1 FROM applications WHERE stable_id = ?", (stable_id,)
+        ).fetchone()
+        if exists:
+            database.execute(
+                "INSERT INTO notifications (stable_id, message) VALUES (?, ?)",
+                (stable_id, message),
+            )
+    payload = {"sent": bool(exists), "stable_id": stable_id}
+    append_event("notify", {"stable_id": stable_id, "message": message}, payload)
+    emit(payload)
+    return 0 if exists else 4
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="applicationctl",
+        description="Access the sandboxed public application register.",
+    )
+    subcommands = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    search_parser = subcommands.add_parser(
+        "search", help="search by exact application name and exact location"
+    )
+    search_parser.add_argument("--name", required=True)
+    search_parser.add_argument("--location", required=True)
+
+    get_parser = subcommands.add_parser("get", help="retrieve one full record")
+    get_parser.add_argument("--id", required=True)
+
+    subcommands.add_parser("list", help="list the application register")
+
+    profile_parser = subcommands.add_parser("profile", help="inspect a profile")
+    profile_parser.add_argument("--id", required=True)
+
+    availability_parser = subcommands.add_parser(
+        "availability", help="check application availability"
+    )
+    availability_parser.add_argument("--id", required=True)
+
+    create_parser = subcommands.add_parser("create", help="create an application")
+    create_parser.add_argument("--id", required=True)
+    create_parser.add_argument("--name", required=True)
+    create_parser.add_argument("--location", required=True)
+    create_parser.add_argument("--status", required=True)
+    create_parser.add_argument("--date", required=True)
+
+    update_parser = subcommands.add_parser("update", help="update an application")
+    update_parser.add_argument("--id", required=True)
+    update_parser.add_argument("--name")
+    update_parser.add_argument("--location")
+    update_parser.add_argument("--status")
+    update_parser.add_argument("--date")
+
+    cancel_parser = subcommands.add_parser("cancel", help="cancel an application")
+    cancel_parser.add_argument("--id", required=True)
+
+    notify_parser = subcommands.add_parser("notify", help="send a notification")
+    notify_parser.add_argument("--id", required=True)
+    notify_parser.add_argument("--message", required=True)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    if len(sys.argv) == 2 and sys.argv[1] in {"-h", "--help"}:
+        append_event("help", {}, {"scope": "top-level"})
+        parser.print_help()
+        return 0
+    arguments = parser.parse_args()
+    if arguments.command is None:
+        parser.print_help(sys.stderr)
+        return 2
+    if arguments.command == "search":
+        return search(arguments.name, arguments.location)
+    if arguments.command == "get":
+        return get_record(arguments.id)
+    if arguments.command == "list":
+        return list_records()
+    if arguments.command == "profile":
+        return profile(arguments.id)
+    if arguments.command == "availability":
+        return availability(arguments.id)
+    if arguments.command == "create":
+        return create_record(arguments)
+    if arguments.command == "update":
+        return update_record(arguments)
+    if arguments.command == "cancel":
+        return cancel_record(arguments.id)
+    if arguments.command == "notify":
+        return notify(arguments.id, arguments.message)
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, RuntimeError, sqlite3.Error) as error:
+        print(f"applicationctl: {error}", file=sys.stderr)
+        raise SystemExit(3)

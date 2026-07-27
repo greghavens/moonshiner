@@ -1,0 +1,522 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed support registry."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import hmac
+import json
+import os
+import signal
+import sqlite3
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+DATABASE = ROOT / ".support-runtime" / "support.sqlite3"
+RECEIPT = ROOT / "cancellation.receipt.json"
+RECEIPT_KEY_PATH = ROOT / ".protected" / "receipt.key"
+CANCEL_DEADLINE_SECONDS = 0.25
+
+_deadline_database: sqlite3.Connection | None = None
+_deadline_sequence: int | None = None
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def digest(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def connect() -> sqlite3.Connection:
+    if not DATABASE.is_file():
+        raise RuntimeError("support sandbox is not initialized")
+    database = sqlite3.connect(DATABASE, timeout=10.0, isolation_level=None)
+    database.row_factory = sqlite3.Row
+    database.execute("PRAGMA busy_timeout = 10000")
+    return database
+
+
+def emit(value: Any) -> None:
+    print(canonical_json(value), flush=True)
+
+
+def begin_event(
+    database: sqlite3.Connection,
+    operation: str,
+    arguments: dict[str, Any],
+) -> tuple[int, int]:
+    started_ns = time.time_ns()
+    cursor = database.execute(
+        """
+        INSERT INTO operation_journal
+            (operation, arguments_json, started_ns, pid)
+        VALUES (?, ?, ?, ?)
+        """,
+        (operation, canonical_json(arguments), started_ns, os.getpid()),
+    )
+    return int(cursor.lastrowid), started_ns
+
+
+def finish_event(
+    database: sqlite3.Connection,
+    sequence: int,
+    *,
+    result: Any | None = None,
+    error_kind: str | None = None,
+    committed: bool = False,
+) -> None:
+    database.execute(
+        """
+        UPDATE operation_journal
+           SET finished_ns = ?, committed = ?, result_digest = ?, error_kind = ?
+         WHERE sequence = ?
+        """,
+        (
+            time.time_ns(),
+            int(committed),
+            digest(result) if result is not None and error_kind is None else None,
+            error_kind,
+            sequence,
+        ),
+    )
+
+
+def fail(
+    database: sqlite3.Connection,
+    sequence: int,
+    message: str,
+    *,
+    error_kind: str = "invalid_request",
+) -> int:
+    finish_event(database, sequence, error_kind=error_kind)
+    print(message, file=sys.stderr)
+    return 2
+
+
+def full_record(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "requester": row["requester"],
+        "status": row["status"],
+        "summary": row["summary"],
+        "title": row["title"],
+        "workspace": row["workspace"],
+    }
+
+
+def support_state(database: sqlite3.Connection) -> dict[str, list[list[Any]]]:
+    return {
+        "availability": [
+            list(row)
+            for row in database.execute(
+                """
+                SELECT queue_name, queue_date, open_slots
+                  FROM availability
+                 ORDER BY queue_name, queue_date
+                """
+            )
+        ],
+        "cases": [
+            list(row)
+            for row in database.execute(
+                """
+                SELECT id, title, workspace, status, requester, summary
+                  FROM support_cases
+                 ORDER BY id
+                """
+            )
+        ],
+        "notifications": [
+            list(row)
+            for row in database.execute(
+                """
+                SELECT sequence, case_id, recipient, message
+                  FROM notifications
+                 ORDER BY sequence
+                """
+            )
+        ],
+        "preferences": [
+            list(row)
+            for row in database.execute(
+                "SELECT owner, preference FROM saved_preferences ORDER BY owner"
+            )
+        ],
+    }
+
+
+def state_digest(database: sqlite3.Connection) -> str:
+    return digest(support_state(database))
+
+
+def receipt_payload(database: sqlite3.Connection) -> dict[str, Any] | None:
+    rows = database.execute(
+        "SELECT * FROM operation_journal ORDER BY sequence"
+    ).fetchall()
+    if len(rows) != 2 or [row["operation"] for row in rows] != ["cancel", "get"]:
+        return None
+    cancellation, retrieval = rows
+    if (
+        int(cancellation["committed"]) != 1
+        or cancellation["error_kind"] != "deadline_exceeded"
+        or cancellation["finished_ns"] is None
+        or retrieval["error_kind"] is not None
+        or retrieval["finished_ns"] is None
+        or retrieval["result_digest"] is None
+    ):
+        return None
+    return {
+        "events": [
+            {
+                "arguments": json.loads(cancellation["arguments_json"]),
+                "committed": True,
+                "error_kind": cancellation["error_kind"],
+                "operation": "cancel",
+            },
+            {
+                "arguments": json.loads(retrieval["arguments_json"]),
+                "operation": "get",
+                "result_digest": retrieval["result_digest"],
+            },
+        ],
+        "state_sha256": state_digest(database),
+        "version": 1,
+    }
+
+
+def maybe_write_receipt(database: sqlite3.Connection) -> None:
+    payload = receipt_payload(database)
+    if payload is None:
+        return
+    key = bytes.fromhex(RECEIPT_KEY_PATH.read_text(encoding="utf-8").strip())
+    receipt = dict(payload)
+    receipt["signature"] = hmac.new(
+        key,
+        canonical_json(payload).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    temporary = RECEIPT.with_name(f"{RECEIPT.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, RECEIPT)
+
+
+def deadline_handler(_signum: int, _frame: Any) -> None:
+    database = _deadline_database
+    sequence = _deadline_sequence
+    if database is not None and sequence is not None:
+        finish_event(
+            database,
+            sequence,
+            error_kind="deadline_exceeded",
+            committed=True,
+        )
+    print(
+        "support client deadline exceeded; cancellation commit state is unknown",
+        file=sys.stderr,
+        flush=True,
+    )
+    os._exit(124)
+
+
+def run_cancel(database: sqlite3.Connection, stable_id: str) -> int:
+    global _deadline_database, _deadline_sequence
+
+    sequence, _ = begin_event(database, "cancel", {"id": stable_id})
+    row = database.execute(
+        "SELECT id FROM support_cases WHERE id = ?", (stable_id,)
+    ).fetchone()
+    if row is None:
+        return fail(
+            database,
+            sequence,
+            f"support case not found: {stable_id}",
+            error_kind="not_found",
+        )
+
+    database.execute("BEGIN IMMEDIATE")
+    try:
+        database.execute(
+            "UPDATE support_cases SET status = 'cancelled' WHERE id = ?",
+            (stable_id,),
+        )
+        database.commit()
+    except Exception:
+        database.rollback()
+        raise
+    database.execute(
+        "UPDATE operation_journal SET committed = 1 WHERE sequence = ?",
+        (sequence,),
+    )
+
+    _deadline_database = database
+    _deadline_sequence = sequence
+    signal.signal(signal.SIGALRM, deadline_handler)
+    signal.setitimer(signal.ITIMER_REAL, CANCEL_DEADLINE_SECONDS)
+    while True:
+        signal.pause()
+
+
+def run_get(database: sqlite3.Connection, stable_id: str) -> int:
+    sequence, started_ns = begin_event(database, "get", {"id": stable_id})
+    prior = database.execute(
+        "SELECT * FROM operation_journal WHERE sequence < ? ORDER BY sequence",
+        (sequence,),
+    ).fetchall()
+    if (
+        len(prior) != 1
+        or prior[0]["operation"] != "cancel"
+        or prior[0]["finished_ns"] is None
+        or started_ns <= int(prior[0]["finished_ns"])
+    ):
+        return fail(
+            database,
+            sequence,
+            "verification get must follow one completed cancellation attempt",
+        )
+
+    row = database.execute(
+        """
+        SELECT id, title, workspace, status, requester, summary
+          FROM support_cases
+         WHERE id = ?
+        """,
+        (stable_id,),
+    ).fetchone()
+    if row is None:
+        return fail(
+            database,
+            sequence,
+            f"support case not found: {stable_id}",
+            error_kind="not_found",
+        )
+    result = {"record": full_record(row)}
+    finish_event(database, sequence, result=result)
+    emit(result)
+    maybe_write_receipt(database)
+    return 0
+
+
+def run_search(database: sqlite3.Connection, title: str, workspace: str | None) -> int:
+    arguments = {"title": title}
+    if workspace is not None:
+        arguments["workspace"] = workspace
+    sequence, _ = begin_event(database, "search", arguments)
+    if workspace is None:
+        rows = database.execute(
+            """
+            SELECT id, title, workspace FROM support_cases
+             WHERE title = ? ORDER BY id
+            """,
+            (title,),
+        ).fetchall()
+    else:
+        rows = database.execute(
+            """
+            SELECT id, title, workspace FROM support_cases
+             WHERE title = ? AND workspace = ? ORDER BY id
+            """,
+            (title, workspace),
+        ).fetchall()
+    result = {"matches": [dict(row) for row in rows]}
+    finish_event(database, sequence, result=result)
+    emit(result)
+    return 0
+
+
+def run_list(database: sqlite3.Connection) -> int:
+    sequence, _ = begin_event(database, "list", {})
+    result = {
+        "cases": [
+            dict(row)
+            for row in database.execute(
+                "SELECT id, title, workspace, status FROM support_cases ORDER BY id"
+            )
+        ]
+    }
+    finish_event(database, sequence, result=result)
+    emit(result)
+    return 0
+
+
+def run_preferences(database: sqlite3.Connection) -> int:
+    sequence, _ = begin_event(database, "preferences", {})
+    result = {
+        "preferences": [
+            dict(row)
+            for row in database.execute(
+                "SELECT owner, preference FROM saved_preferences ORDER BY owner"
+            )
+        ]
+    }
+    finish_event(database, sequence, result=result)
+    emit(result)
+    return 0
+
+
+def run_availability(database: sqlite3.Connection, queue: str, date: str) -> int:
+    arguments = {"date": date, "queue": queue}
+    sequence, _ = begin_event(database, "availability", arguments)
+    rows = database.execute(
+        """
+        SELECT queue_name AS queue, queue_date AS date, open_slots
+          FROM availability
+         WHERE queue_name = ? AND queue_date = ?
+        """,
+        (queue, date),
+    ).fetchall()
+    result = {"availability": [dict(row) for row in rows]}
+    finish_event(database, sequence, result=result)
+    emit(result)
+    return 0
+
+
+def run_create(database: sqlite3.Connection, args: argparse.Namespace) -> int:
+    arguments = {
+        "id": args.id,
+        "requester": args.requester,
+        "title": args.title,
+        "workspace": args.workspace,
+    }
+    sequence, _ = begin_event(database, "create", arguments)
+    try:
+        database.execute(
+            """
+            INSERT INTO support_cases
+                (id, title, workspace, status, requester, summary)
+            VALUES (?, ?, ?, 'open', ?, '')
+            """,
+            (args.id, args.title, args.workspace, args.requester),
+        )
+    except sqlite3.IntegrityError:
+        return fail(database, sequence, f"support case already exists: {args.id}")
+    result = {"created": args.id}
+    finish_event(database, sequence, result=result, committed=True)
+    emit(result)
+    return 0
+
+
+def run_update(database: sqlite3.Connection, stable_id: str, status: str) -> int:
+    arguments = {"id": stable_id, "status": status}
+    sequence, _ = begin_event(database, "update", arguments)
+    cursor = database.execute(
+        "UPDATE support_cases SET status = ? WHERE id = ?",
+        (status, stable_id),
+    )
+    if cursor.rowcount != 1:
+        return fail(
+            database,
+            sequence,
+            f"support case not found: {stable_id}",
+            error_kind="not_found",
+        )
+    result = {"updated": stable_id}
+    finish_event(database, sequence, result=result, committed=True)
+    emit(result)
+    return 0
+
+
+def run_notify(
+    database: sqlite3.Connection,
+    stable_id: str,
+    recipient: str,
+    message: str,
+) -> int:
+    arguments = {"id": stable_id, "message": message, "recipient": recipient}
+    sequence, _ = begin_event(database, "notify", arguments)
+    database.execute(
+        """
+        INSERT INTO notifications (case_id, recipient, message)
+        VALUES (?, ?, ?)
+        """,
+        (stable_id, recipient, message),
+    )
+    result = {"notified": recipient}
+    finish_event(database, sequence, result=result, committed=True)
+    emit(result)
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        prog="supportctl",
+        description="Operate the sandboxed support registry.",
+    )
+    operations = root.add_subparsers(dest="operation", required=True)
+
+    cancel = operations.add_parser("cancel", help="cancel one case by stable ID")
+    cancel.add_argument("--id", required=True, help="stable support case ID")
+
+    get = operations.add_parser("get", help="retrieve one complete case by stable ID")
+    get.add_argument("--id", required=True, help="stable support case ID")
+
+    search = operations.add_parser("search", help="search by exact title")
+    search.add_argument("--title", required=True)
+    search.add_argument("--workspace")
+
+    operations.add_parser("list", help="list support cases")
+    operations.add_parser("preferences", help="read saved preferences")
+
+    availability = operations.add_parser("availability", help="check queue slots")
+    availability.add_argument("--queue", required=True)
+    availability.add_argument("--date", required=True)
+
+    create = operations.add_parser("create", help="create a support case")
+    create.add_argument("--id", required=True)
+    create.add_argument("--title", required=True)
+    create.add_argument("--workspace", required=True)
+    create.add_argument("--requester", required=True)
+
+    update = operations.add_parser("update", help="update a case status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+
+    notify = operations.add_parser("notify", help="send a support notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--recipient", required=True)
+    notify.add_argument("--message", required=True)
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        database = connect()
+    except RuntimeError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    try:
+        if args.operation == "cancel":
+            return run_cancel(database, args.id)
+        if args.operation == "get":
+            return run_get(database, args.id)
+        if args.operation == "search":
+            return run_search(database, args.title, args.workspace)
+        if args.operation == "list":
+            return run_list(database)
+        if args.operation == "preferences":
+            return run_preferences(database)
+        if args.operation == "availability":
+            return run_availability(database, args.queue, args.date)
+        if args.operation == "create":
+            return run_create(database, args)
+        if args.operation == "update":
+            return run_update(database, args.id, args.status)
+        if args.operation == "notify":
+            return run_notify(database, args.id, args.recipient, args.message)
+        raise AssertionError(f"unhandled operation: {args.operation}")
+    finally:
+        database.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

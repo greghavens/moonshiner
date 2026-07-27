@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed education course registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+SEED_PATH = ROOT / ".courses" / "seed.sql"
+RUNTIME_DIR = ROOT / ".courses" / "runtime"
+DATABASE_PATH = RUNTIME_DIR / "courses.sqlite3"
+INITIALIZE_LOCK_PATH = RUNTIME_DIR / "initialize.lock"
+AUDIT_PATH = ROOT / ".protected" / "runtime" / "course-audit.jsonl"
+AUDIT_KEY_PATH = ROOT / ".protected" / "audit.key"
+OPERATIONS = (
+    "open",
+    "search",
+    "list",
+    "profile",
+    "availability",
+    "create",
+    "update",
+    "cancel",
+    "notify",
+)
+PUBLIC_FIELDS = ("id", "title", "status", "location", "start_date")
+
+
+def canonical(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def append_audit(event: dict) -> None:
+    key = AUDIT_KEY_PATH.read_bytes().rstrip(b"\n")
+    event["signature"] = hmac.new(
+        key, canonical(event), hashlib.sha256
+    ).hexdigest()
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def initialize_database() -> None:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    with INITIALIZE_LOCK_PATH.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if DATABASE_PATH.exists():
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            return
+        temporary = RUNTIME_DIR / (
+            f"courses.sqlite3.initialize-{os.getpid()}-{uuid.uuid4().hex}"
+        )
+        try:
+            connection = sqlite3.connect(temporary)
+            try:
+                connection.executescript(SEED_PATH.read_text(encoding="utf-8"))
+                connection.commit()
+            finally:
+                connection.close()
+            os.replace(temporary, DATABASE_PATH)
+        finally:
+            temporary.unlink(missing_ok=True)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def connect() -> sqlite3.Connection:
+    initialize_database()
+    connection = sqlite3.connect(DATABASE_PATH)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+def operation_parser(operation: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=f"course-registry {operation}")
+    if operation in {"open", "cancel"}:
+        parser.add_argument("--id", required=True)
+    elif operation == "search":
+        parser.add_argument("--query", required=True)
+    elif operation == "list":
+        parser.add_argument("--status")
+        parser.add_argument("--location")
+    elif operation == "availability":
+        parser.add_argument("--location", required=True)
+        parser.add_argument("--date", required=True)
+    elif operation == "create":
+        parser.add_argument("--title", required=True)
+        parser.add_argument("--status", required=True)
+        parser.add_argument("--location", required=True)
+        parser.add_argument("--start-date", required=True)
+    elif operation == "update":
+        parser.add_argument("--id", required=True)
+        parser.add_argument("--status", required=True)
+    elif operation == "notify":
+        parser.add_argument("--id", required=True)
+        parser.add_argument("--message", required=True)
+    return parser
+
+
+def public_course(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["stable_id"],
+        "title": row["title"],
+        "status": row["status"],
+        "location": row["location"],
+        "start_date": row["start_date"],
+    }
+
+
+def current_course(
+    connection: sqlite3.Connection, stable_id: str
+) -> sqlite3.Row:
+    rows = connection.execute(
+        """
+        SELECT stable_id, title, status, location, start_date
+        FROM courses
+        WHERE stable_id = ? AND lifecycle = 'current'
+        """,
+        (stable_id,),
+    ).fetchall()
+    if len(rows) != 1:
+        raise LookupError(f"course ID not found: {stable_id}")
+    return rows[0]
+
+
+def result_evidence(courses: list[dict]) -> dict:
+    return {
+        "result_count": len(courses),
+        "result_ids": [course["id"] for course in courses],
+        "result_sha256": hashlib.sha256(canonical(courses)).hexdigest(),
+    }
+
+
+def execute(operation: str, argv: list[str]) -> tuple[dict, dict]:
+    args = operation_parser(operation).parse_args(argv)
+    connection = connect()
+    try:
+        if operation == "open":
+            course = public_course(current_course(connection, args.id))
+            return {"course": course}, {
+                "course_id": args.id,
+                **result_evidence([course]),
+                "returned_fields": sorted(course),
+            }
+
+        if operation == "search":
+            needle = args.query.casefold()
+            rows = connection.execute(
+                """
+                SELECT stable_id, title, location
+                FROM courses
+                WHERE lifecycle = 'current'
+                ORDER BY stable_id
+                """
+            ).fetchall()
+            matches = [
+                {
+                    "id": row["stable_id"],
+                    "title": row["title"],
+                    "location": row["location"],
+                }
+                for row in rows
+                if needle
+                in " ".join(
+                    (row["stable_id"], row["title"], row["location"])
+                ).casefold()
+            ]
+            return {"matches": matches}, {
+                "query": args.query,
+                "result_count": len(matches),
+                "result_ids": [match["id"] for match in matches],
+            }
+
+        if operation == "list":
+            clauses = ["lifecycle = 'current'"]
+            values: list[str] = []
+            if args.status is not None:
+                clauses.append("status = ?")
+                values.append(args.status)
+            if args.location is not None:
+                clauses.append("location = ?")
+                values.append(args.location)
+            rows = connection.execute(
+                """
+                SELECT stable_id, title, status, location, start_date
+                FROM courses
+                WHERE
+                """
+                + " AND ".join(clauses)
+                + " ORDER BY stable_id",
+                values,
+            ).fetchall()
+            courses = [public_course(row) for row in rows]
+            return {"courses": courses}, {
+                "status": args.status,
+                "location": args.location,
+                **result_evidence(courses),
+            }
+
+        if operation == "profile":
+            rows = connection.execute(
+                """
+                SELECT profile_id, default_location, notification_channel
+                FROM profiles ORDER BY profile_id
+                """
+            ).fetchall()
+            profiles = [dict(row) for row in rows]
+            return {"profiles": profiles}, {"result_count": len(profiles)}
+
+        if operation == "availability":
+            rows = connection.execute(
+                """
+                SELECT location, session_date, open_seats
+                FROM availability
+                WHERE location = ? AND session_date = ?
+                ORDER BY location, session_date
+                """,
+                (args.location, args.date),
+            ).fetchall()
+            slots = [dict(row) for row in rows]
+            return {"availability": slots}, {
+                "location": args.location,
+                "date": args.date,
+                "result_count": len(slots),
+            }
+
+        if operation == "create":
+            stable_id = "edu-" + uuid.uuid4().hex[:8]
+            connection.execute(
+                """
+                INSERT INTO courses (
+                    stable_id, title, status, location, start_date, lifecycle,
+                    instructor, capacity, internal_note
+                ) VALUES (?, ?, ?, ?, ?, 'current', 'unassigned', 0, '')
+                """,
+                (
+                    stable_id,
+                    args.title,
+                    args.status,
+                    args.location,
+                    args.start_date,
+                ),
+            )
+            connection.commit()
+            course = public_course(current_course(connection, stable_id))
+            return {"course": course}, {
+                "course_id": stable_id,
+                **result_evidence([course]),
+            }
+
+        if operation == "update":
+            current_course(connection, args.id)
+            connection.execute(
+                "UPDATE courses SET status = ? WHERE stable_id = ?",
+                (args.status, args.id),
+            )
+            connection.commit()
+            course = public_course(current_course(connection, args.id))
+            return {"course": course}, {
+                "course_id": args.id,
+                "status": args.status,
+                **result_evidence([course]),
+            }
+
+        if operation == "cancel":
+            current_course(connection, args.id)
+            connection.execute(
+                "UPDATE courses SET lifecycle = 'archived' WHERE stable_id = ?",
+                (args.id,),
+            )
+            connection.commit()
+            return {"cancelled": {"id": args.id}}, {
+                "course_id": args.id,
+                "result_count": 1,
+                "result_ids": [args.id],
+            }
+
+        if operation == "notify":
+            current_course(connection, args.id)
+            cursor = connection.execute(
+                "INSERT INTO notifications (stable_id, message) VALUES (?, ?)",
+                (args.id, args.message),
+            )
+            connection.commit()
+            notification = {
+                "notification_id": cursor.lastrowid,
+                "id": args.id,
+                "message": args.message,
+            }
+            return {"notification": notification}, {
+                "course_id": args.id,
+                "result_count": 1,
+                "result_ids": [args.id],
+            }
+    finally:
+        connection.close()
+
+    raise ValueError(f"operation is unavailable: {operation}")
+
+
+def usage() -> str:
+    return "\n".join(
+        (
+            "usage: course-registry OPERATION [OPTIONS]",
+            "",
+            "Read operations:",
+            "  open          retrieve one complete course by stable ID",
+            "  search        find possible courses by free-text query",
+            "  list          list current courses, optionally filtered",
+            "  profile       return saved education workspace profiles",
+            "  availability  return course-session availability",
+            "",
+            "Write operations:",
+            "  create        create a course",
+            "  update        change a course status",
+            "  cancel        cancel a course",
+            "  notify        add a course notification",
+            "",
+            "Run course-registry OPERATION --help for operation-specific options.",
+        )
+    )
+
+
+def main() -> int:
+    started = time.monotonic_ns()
+    parent_pid = os.getppid()
+
+    if len(sys.argv) == 2 and sys.argv[1] in {"-h", "--help"}:
+        print(usage())
+        append_audit(
+            {
+                "event_id": str(uuid.uuid4()),
+                "operation": "help",
+                "start_ns": started,
+                "end_ns": time.monotonic_ns(),
+                "process_pid": os.getpid(),
+                "parent_pid": parent_pid,
+                "success": True,
+            }
+        )
+        return 0
+
+    operation = sys.argv[1] if len(sys.argv) > 1 else "missing"
+    details: dict = {}
+    output: dict | None = None
+    error: str | None = None
+    success = False
+    try:
+        if operation not in OPERATIONS:
+            raise ValueError(f"operation is unavailable: {operation}")
+        output, details = execute(operation, sys.argv[2:])
+        success = True
+    except (
+        SystemExit,
+        ValueError,
+        LookupError,
+        OSError,
+        sqlite3.Error,
+        json.JSONDecodeError,
+    ) as exc:
+        error = str(exc)
+
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "operation": operation,
+        "start_ns": started,
+        "end_ns": time.monotonic_ns(),
+        "process_pid": os.getpid(),
+        "parent_pid": parent_pid,
+        "success": success,
+        **details,
+    }
+    if error is not None:
+        event["error"] = error
+    append_audit(event)
+
+    if success:
+        print(json.dumps(output, sort_keys=True, ensure_ascii=False))
+        return 0
+    print(json.dumps({"error": error or "operation failed"}), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

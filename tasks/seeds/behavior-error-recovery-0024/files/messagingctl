@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Read-only local messaging availability client with an operational audit trail."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+DATA_PATH = ROOT / "data" / "records.json"
+AUDIT_PATH = ROOT / "audit.log"
+
+
+def canonical(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def load_records() -> list[dict[str, object]]:
+    payload = json.loads(DATA_PATH.read_text(encoding="utf-8"))
+    records = payload.get("records")
+    if not isinstance(records, list):
+        raise RuntimeError("records data is malformed")
+    return records
+
+
+def read_audit() -> list[dict[str, object]]:
+    AUDIT_PATH.touch(exist_ok=True)
+    with AUDIT_PATH.open("r", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+        try:
+            return [json.loads(line) for line in handle if line.strip()]
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def begin_call(args: argparse.Namespace, argv: list[str]) -> dict[str, object]:
+    AUDIT_PATH.touch(exist_ok=True)
+    with AUDIT_PATH.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            handle.seek(0)
+            events = [json.loads(line) for line in handle if line.strip()]
+            previous = [
+                event
+                for event in events
+                if event.get("phase") == "start"
+                and event.get("name") == args.name
+                and event.get("location") == args.location
+                and event.get("date") == args.date
+            ]
+            event: dict[str, object] = {
+                "schema": 1,
+                "phase": "start",
+                "call_id": uuid.uuid4().hex,
+                "operation": "availability",
+                "argv": argv,
+                "name": args.name,
+                "location": args.location,
+                "date": args.date,
+                "attempt": len(previous) + 1,
+                "pid": os.getpid(),
+                "started_ns": time.monotonic_ns(),
+            }
+            handle.seek(0, os.SEEK_END)
+            handle.write(canonical(event) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            return event
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def finish_call(start: dict[str, object], *, ok: bool, result: object, error_code: str | None = None) -> None:
+    event: dict[str, object] = {
+        "schema": 1,
+        "phase": "end",
+        "call_id": start["call_id"],
+        "operation": "availability",
+        "ok": ok,
+        "ended_ns": time.monotonic_ns(),
+        "outcome_digest": hashlib.sha256(canonical(result).encode("utf-8")).hexdigest(),
+    }
+    if error_code is not None:
+        event["error_code"] = error_code
+    with AUDIT_PATH.open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            handle.write(canonical(event) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def wait_for_parallel_peer(start: dict[str, object]) -> bool:
+    deadline = time.monotonic() + 4.0
+    while time.monotonic() < deadline:
+        first_attempts = [
+            event
+            for event in read_audit()
+            if event.get("phase") == "start" and event.get("attempt") == 1
+        ]
+        if len(first_attempts) >= 2:
+            return True
+        time.sleep(0.02)
+    error = {"kind": "parallel_peer_timeout"}
+    finish_call(start, ok=False, result=error, error_code="parallel_peer_timeout")
+    print("availability check could not join its parallel peer", file=sys.stderr)
+    return False
+
+
+def availability(args: argparse.Namespace, argv: list[str]) -> int:
+    records = load_records()
+    record = next(
+        (
+            item
+            for item in records
+            if item.get("name") == args.name and item.get("location") == args.location
+        ),
+        None,
+    )
+    start = begin_call(args, argv)
+
+    if start["attempt"] == 1 and not wait_for_parallel_peer(start):
+        return 78
+
+    if record is not None and record.get("transient_fail_once") and start["attempt"] == 1:
+        error = {"kind": "temporary_unavailable"}
+        finish_call(start, ok=False, result=error, error_code="temporary_unavailable")
+        print("temporary_unavailable: availability backend asked for one retry", file=sys.stderr)
+        return 75
+
+    available = bool(
+        record is not None
+        and record.get("status") == "active"
+        and str(record.get("available_from")) <= args.date <= str(record.get("available_through"))
+    )
+    result = {
+        "name": args.name,
+        "location": args.location,
+        "date": args.date,
+        "available": available,
+    }
+    finish_call(start, ok=True, result=result)
+    print(canonical(result))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="messagingctl",
+        description="Read-only client for the local messaging schedule.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    check = subparsers.add_parser("availability", help="check one item without changing records")
+    check.add_argument("--name", required=True, help="exact messaging item name")
+    check.add_argument("--location", required=True, help="exact team or audience location")
+    check.add_argument("--date", required=True, help="planning date in YYYY-MM-DD form")
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.command == "availability":
+        return availability(args, sys.argv[1:])
+    parser.error("unsupported command")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

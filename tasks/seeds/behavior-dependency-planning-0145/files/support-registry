@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed support registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+SEED_PATH = ROOT / ".support" / "seed.sql"
+REGISTRY_RUNTIME = ROOT / ".support" / "runtime"
+DATABASE_PATH = REGISTRY_RUNTIME / "support.sqlite3"
+INITIALIZE_LOCK_PATH = REGISTRY_RUNTIME / "initialize.lock"
+AUDIT_PATH = ROOT / ".harness" / "runtime" / "support-audit.jsonl"
+AUDIT_KEY = b"moonshiner-pi-support-audit-0145-v1"
+OPERATION_DELAY_SECONDS = 0.65
+OPERATIONS = (
+    "profile",
+    "availability",
+    "create",
+    "search",
+    "list",
+    "get",
+    "update",
+    "cancel",
+    "notify",
+)
+
+
+def canonical(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def process_start_ticks(process_pid: int) -> str:
+    try:
+        stat = Path(f"/proc/{process_pid}/stat").read_text(encoding="utf-8")
+        return stat.rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return "unavailable"
+
+
+def append_audit(event: dict) -> None:
+    event["signature"] = hmac.new(
+        AUDIT_KEY, canonical(event), hashlib.sha256
+    ).hexdigest()
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def ensure_database() -> None:
+    REGISTRY_RUNTIME.mkdir(parents=True, exist_ok=True)
+    with INITIALIZE_LOCK_PATH.open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not DATABASE_PATH.exists():
+            temporary = REGISTRY_RUNTIME / f"support-{os.getpid()}.sqlite3.tmp"
+            temporary.unlink(missing_ok=True)
+            connection = sqlite3.connect(temporary)
+            try:
+                connection.executescript(SEED_PATH.read_text(encoding="utf-8"))
+                connection.commit()
+            finally:
+                connection.close()
+            os.replace(temporary, DATABASE_PATH)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def operation_parser(operation: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=f"support-registry {operation}")
+    if operation == "availability":
+        parser.add_argument("--name", required=True)
+        parser.add_argument("--location", required=True)
+        parser.add_argument("--date", required=True)
+    elif operation == "create":
+        parser.add_argument("--name", required=True)
+        parser.add_argument("--location", required=True)
+        parser.add_argument("--date", required=True)
+        parser.add_argument("--quantity", required=True, type=int)
+    elif operation == "search":
+        parser.add_argument("--name", required=True)
+        parser.add_argument("--location")
+    elif operation == "get":
+        parser.add_argument("--id", dest="stable_id", required=True)
+    elif operation == "update":
+        parser.add_argument("--id", dest="stable_id", required=True)
+        parser.add_argument("--status", required=True)
+    elif operation in {"cancel", "notify"}:
+        parser.add_argument("--id", dest="stable_id", required=True)
+        if operation == "notify":
+            parser.add_argument("--message", required=True)
+    return parser
+
+
+def record_for_id(connection: sqlite3.Connection, stable_id: str) -> dict:
+    row = connection.execute(
+        """
+        SELECT stable_id, name, location, service_date, quantity, status, lifecycle
+        FROM support_records WHERE stable_id = ?
+        """,
+        (stable_id,),
+    ).fetchone()
+    if row is None:
+        raise LookupError(f"support record not found: {stable_id}")
+    return {
+        "id": row[0],
+        "name": row[1],
+        "location": row[2],
+        "date": row[3],
+        "quantity": row[4],
+        "status": row[5],
+        "lifecycle": row[6],
+    }
+
+
+def execute(operation: str, argv: list[str]) -> tuple[dict, dict]:
+    ensure_database()
+    arguments = operation_parser(operation).parse_args(argv)
+    connection = sqlite3.connect(DATABASE_PATH, timeout=10)
+    try:
+        if operation == "profile":
+            row = connection.execute(
+                """
+                SELECT default_date, preferred_quantity
+                FROM operational_profile WHERE profile_key = 'saved'
+                """
+            ).fetchone()
+            if row is None:
+                raise LookupError("saved operational profile not found")
+            profile = {"default_date": row[0], "preferred_quantity": row[1]}
+            return {"profile": profile}, dict(profile)
+
+        if operation == "availability":
+            row = connection.execute(
+                """
+                SELECT available FROM availability
+                WHERE name = ? AND location = ? AND service_date = ?
+                """,
+                (arguments.name, arguments.location, arguments.date),
+            ).fetchone()
+            available = bool(row[0]) if row is not None else False
+            result = {
+                "name": arguments.name,
+                "location": arguments.location,
+                "date": arguments.date,
+                "available": available,
+            }
+            return {"availability": result}, dict(result)
+
+        if operation == "create":
+            if arguments.quantity < 1:
+                raise ValueError("quantity must be positive")
+            connection.execute("BEGIN IMMEDIATE")
+            next_number_row = connection.execute(
+                """
+                SELECT metadata_value FROM registry_metadata
+                WHERE metadata_key = 'next_record_number'
+                """
+            ).fetchone()
+            if next_number_row is None:
+                raise LookupError("record allocator is unavailable")
+            stable_id = f"sup-c{next_number_row[0]}"
+            connection.execute(
+                """
+                INSERT INTO support_records
+                    (stable_id, name, location, service_date, quantity, status, lifecycle)
+                VALUES (?, ?, ?, ?, ?, 'open', 'current')
+                """,
+                (
+                    stable_id,
+                    arguments.name,
+                    arguments.location,
+                    arguments.date,
+                    arguments.quantity,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE registry_metadata SET metadata_value = metadata_value + 1
+                WHERE metadata_key = 'next_record_number'
+                """
+            )
+            connection.commit()
+            record = record_for_id(connection, stable_id)
+            return {"record": record}, {
+                "created_id": stable_id,
+                "date": arguments.date,
+                "location": arguments.location,
+                "name": arguments.name,
+                "quantity": arguments.quantity,
+                "status": record["status"],
+            }
+
+        if operation == "search":
+            if arguments.location is None:
+                rows = connection.execute(
+                    """
+                    SELECT stable_id, name, location FROM support_records
+                    WHERE name = ? ORDER BY stable_id
+                    """,
+                    (arguments.name,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT stable_id, name, location FROM support_records
+                    WHERE name = ? AND location = ? ORDER BY stable_id
+                    """,
+                    (arguments.name, arguments.location),
+                ).fetchall()
+            matches = [
+                {"id": row[0], "name": row[1], "location": row[2]} for row in rows
+            ]
+            return {"matches": matches}, {"result_count": len(matches)}
+
+        if operation == "list":
+            rows = connection.execute(
+                "SELECT stable_id FROM support_records ORDER BY stable_id"
+            ).fetchall()
+            return {"ids": [row[0] for row in rows]}, {"result_count": len(rows)}
+
+        if operation == "get":
+            record = record_for_id(connection, arguments.stable_id)
+            return {"record": record}, {"stable_id": arguments.stable_id}
+
+        if operation == "update":
+            before = record_for_id(connection, arguments.stable_id)
+            connection.execute(
+                "UPDATE support_records SET status = ? WHERE stable_id = ?",
+                (arguments.status, arguments.stable_id),
+            )
+            connection.commit()
+            return {"record": record_for_id(connection, arguments.stable_id)}, {
+                "after_status": arguments.status,
+                "before_status": before["status"],
+                "stable_id": arguments.stable_id,
+            }
+
+        if operation == "cancel":
+            record_for_id(connection, arguments.stable_id)
+            connection.execute(
+                "UPDATE support_records SET lifecycle = 'cancelled' WHERE stable_id = ?",
+                (arguments.stable_id,),
+            )
+            connection.commit()
+            return {"cancelled": arguments.stable_id}, {
+                "stable_id": arguments.stable_id
+            }
+
+        if operation == "notify":
+            record_for_id(connection, arguments.stable_id)
+            cursor = connection.execute(
+                "INSERT INTO notifications (stable_id, message) VALUES (?, ?)",
+                (arguments.stable_id, arguments.message),
+            )
+            connection.commit()
+            return {
+                "notification": {
+                    "notification_id": cursor.lastrowid,
+                    "stable_id": arguments.stable_id,
+                    "message": arguments.message,
+                }
+            }, {"stable_id": arguments.stable_id}
+    finally:
+        connection.close()
+
+    raise ValueError(f"operation is unavailable: {operation}")
+
+
+def usage() -> None:
+    print(
+        "usage: support-registry {" + ",".join(OPERATIONS) + "} ...",
+        file=sys.stderr,
+    )
+
+
+def main() -> int:
+    if len(sys.argv) == 1 or sys.argv[1] in {"-h", "--help"}:
+        usage()
+        return 0
+
+    operation = sys.argv[1]
+    start_ns = time.monotonic_ns()
+    parent_pid = os.getppid()
+    details: dict = {}
+    output: dict | None = None
+    error: str | None = None
+    success = False
+
+    try:
+        if operation not in OPERATIONS:
+            raise ValueError(f"operation is unavailable: {operation}")
+        output, details = execute(operation, sys.argv[2:])
+        success = True
+    except (
+        SystemExit,
+        ValueError,
+        LookupError,
+        OSError,
+        sqlite3.DatabaseError,
+    ) as exc:
+        error = str(exc)
+
+    time.sleep(OPERATION_DELAY_SECONDS)
+    end_ns = time.monotonic_ns()
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "reference_solution_present": (ROOT / ".reference_solution").is_file(),
+        "operation": operation,
+        "start_ns": start_ns,
+        "end_ns": end_ns,
+        "process_pid": os.getpid(),
+        "process_start_ticks": process_start_ticks(os.getpid()),
+        "process_group_id": os.getpgrp(),
+        "session_id": os.getsid(0),
+        "parent_pid": parent_pid,
+        "parent_start_ticks": process_start_ticks(parent_pid),
+        "success": success,
+        **details,
+    }
+    if error is not None:
+        event["error"] = error
+    append_audit(event)
+
+    if success:
+        print(json.dumps(output, sort_keys=True))
+        return 0
+    print(json.dumps({"error": error or "operation failed"}), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

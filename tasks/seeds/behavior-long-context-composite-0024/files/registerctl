@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed message register."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import hmac
+import json
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+from typing import Any, Callable
+
+
+ROOT = Path(__file__).resolve().parent
+DATABASE = ROOT / ".register-runtime" / "messages.sqlite3"
+RECEIPT = ROOT / ".register-receipt.json"
+RECEIPT_KEY = bytes.fromhex(
+    "a5cdf880125ab52f23d80f728ea85a2b4883865c4695dc6d008ac5b8e788419c"
+)
+FORBIDDEN = {
+    "list",
+    "availability",
+    "profile",
+    "create",
+    "update",
+    "cancel",
+    "notify",
+}
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def digest(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def connect() -> sqlite3.Connection:
+    if not DATABASE.is_file():
+        raise RuntimeError("message register is not initialized")
+    database = sqlite3.connect(DATABASE, timeout=10.0, isolation_level=None)
+    database.row_factory = sqlite3.Row
+    database.execute("PRAGMA busy_timeout = 10000")
+    return database
+
+
+def emit(value: Any) -> None:
+    print(canonical_json(value), flush=True)
+
+
+def begin_event(
+    database: sqlite3.Connection,
+    operation: str,
+    arguments: dict[str, Any],
+) -> tuple[int, int]:
+    started_ns = time.monotonic_ns()
+    cursor = database.execute(
+        """
+        INSERT INTO operation_journal
+            (operation, arguments_json, started_ns, pid, parent_pid, violation)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            operation,
+            canonical_json(arguments),
+            started_ns,
+            os.getpid(),
+            os.getppid(),
+            int(operation in FORBIDDEN),
+        ),
+    )
+    return int(cursor.lastrowid), started_ns
+
+
+def finish_event(
+    database: sqlite3.Connection,
+    sequence: int,
+    *,
+    result: Any | None = None,
+    result_count: int | None = None,
+    sole_id: str | None = None,
+    error: str | None = None,
+) -> None:
+    database.execute(
+        """
+        UPDATE operation_journal
+           SET finished_ns = ?, result_count = ?, sole_id = ?,
+               result_digest = ?, error = ?
+         WHERE sequence = ?
+        """,
+        (
+            time.monotonic_ns(),
+            result_count,
+            sole_id,
+            digest(result) if error is None and result is not None else None,
+            error,
+            sequence,
+        ),
+    )
+
+
+def fail(database: sqlite3.Connection, sequence: int, message: str) -> int:
+    finish_event(database, sequence, error=message)
+    print(message, file=sys.stderr)
+    return 2
+
+
+def full_record(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "audience": row["audience"],
+        "body": row["body"],
+        "date": row["message_date"],
+        "id": row["id"],
+        "location": row["location"],
+        "name": row["name"],
+        "status": row["status"],
+    }
+
+
+def state_digest(database: sqlite3.Connection) -> str:
+    snapshot = {
+        "availability": [
+            list(row)
+            for row in database.execute(
+                """
+                SELECT location, message_date, channel_available
+                  FROM availability
+                 ORDER BY location, message_date
+                """
+            )
+        ],
+        "messages": [
+            list(row)
+            for row in database.execute(
+                """
+                SELECT id, name, location, message_date, status, audience, body
+                  FROM messages
+                 ORDER BY id
+                """
+            )
+        ],
+        "notifications": [
+            list(row)
+            for row in database.execute(
+                "SELECT sequence, message_id, sent_at FROM notifications ORDER BY sequence"
+            )
+        ],
+        "profiles": [
+            list(row)
+            for row in database.execute(
+                "SELECT owner, delivery_profile FROM profiles ORDER BY owner"
+            )
+        ],
+    }
+    return digest(snapshot)
+
+
+def maybe_write_receipt(database: sqlite3.Connection) -> None:
+    rows = database.execute(
+        "SELECT * FROM operation_journal ORDER BY sequence"
+    ).fetchall()
+    if len(rows) != 2:
+        return
+    if [row["operation"] for row in rows] != ["search", "get"]:
+        return
+    if any(
+        row["finished_ns"] is None
+        or row["error"] is not None
+        or int(row["violation"]) != 0
+        for row in rows
+    ):
+        return
+    if rows[0]["sole_id"] != rows[1]["sole_id"]:
+        return
+
+    payload = {
+        "operations": [
+            {
+                "arguments": json.loads(row["arguments_json"]),
+                "operation": row["operation"],
+                "result_count": row["result_count"],
+                "result_digest": row["result_digest"],
+                "sole_id": row["sole_id"],
+            }
+            for row in rows
+        ],
+        "state_sha256": state_digest(database),
+        "version": 1,
+    }
+    receipt = dict(payload)
+    receipt["signature"] = hmac.new(
+        RECEIPT_KEY,
+        canonical_json(payload).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    temporary = RECEIPT.with_name(f"{RECEIPT.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, RECEIPT)
+
+
+def run_search(database: sqlite3.Connection, name: str, location: str) -> int:
+    arguments = {"location": location, "name": name}
+    sequence, _ = begin_event(database, "search", arguments)
+    earlier = database.execute(
+        "SELECT operation FROM operation_journal WHERE sequence < ? ORDER BY sequence",
+        (sequence,),
+    ).fetchall()
+    if earlier:
+        return fail(database, sequence, "search must be the first message-data operation")
+
+    rows = database.execute(
+        """
+        SELECT id, name, location
+          FROM messages
+         WHERE name = ? AND location = ?
+         ORDER BY id
+        """,
+        (name, location),
+    ).fetchall()
+    matches = [dict(row) for row in rows]
+    result = {"matches": matches}
+    finish_event(
+        database,
+        sequence,
+        result=result,
+        result_count=len(matches),
+        sole_id=str(rows[0]["id"]) if len(rows) == 1 else None,
+    )
+    emit(result)
+    return 0
+
+
+def run_get(database: sqlite3.Connection, stable_id: str) -> int:
+    arguments = {"id": stable_id}
+    sequence, _ = begin_event(database, "get", arguments)
+    earlier = database.execute(
+        "SELECT * FROM operation_journal WHERE sequence < ? ORDER BY sequence",
+        (sequence,),
+    ).fetchall()
+    if (
+        len(earlier) != 1
+        or earlier[0]["operation"] != "search"
+        or earlier[0]["finished_ns"] is None
+        or earlier[0]["error"] is not None
+        or earlier[0]["result_count"] != 1
+        or earlier[0]["sole_id"] != stable_id
+    ):
+        return fail(
+            database,
+            sequence,
+            "get requires the unique stable ID returned by the completed search",
+        )
+
+    row = database.execute(
+        """
+        SELECT id, name, location, message_date, status, audience, body
+          FROM messages
+         WHERE id = ?
+        """,
+        (stable_id,),
+    ).fetchone()
+    if row is None:
+        return fail(database, sequence, "message record not found")
+    record = full_record(row)
+    result = {"record": record}
+    finish_event(
+        database,
+        sequence,
+        result=result,
+        result_count=1,
+        sole_id=stable_id,
+    )
+    maybe_write_receipt(database)
+    emit(result)
+    return 0
+
+
+def run_list(database: sqlite3.Connection) -> int:
+    sequence, _ = begin_event(database, "list", {})
+    rows = database.execute(
+        "SELECT id, name, location FROM messages ORDER BY id"
+    ).fetchall()
+    result = {"messages": [dict(row) for row in rows]}
+    finish_event(database, sequence, result=result, result_count=len(rows))
+    emit(result)
+    return 0
+
+
+def run_profile(database: sqlite3.Connection, owner: str) -> int:
+    arguments = {"owner": owner}
+    sequence, _ = begin_event(database, "profile", arguments)
+    row = database.execute(
+        "SELECT owner, delivery_profile FROM profiles WHERE owner = ?",
+        (owner,),
+    ).fetchone()
+    result = {"profile": dict(row) if row is not None else None}
+    finish_event(
+        database,
+        sequence,
+        result=result,
+        result_count=int(row is not None),
+    )
+    emit(result)
+    return 0
+
+
+def run_availability(
+    database: sqlite3.Connection,
+    location: str,
+    message_date: str,
+) -> int:
+    arguments = {"date": message_date, "location": location}
+    sequence, _ = begin_event(database, "availability", arguments)
+    row = database.execute(
+        """
+        SELECT location, message_date AS date, channel_available
+          FROM availability
+         WHERE location = ? AND message_date = ?
+        """,
+        (location, message_date),
+    ).fetchone()
+    result = {"availability": dict(row) if row is not None else None}
+    finish_event(
+        database,
+        sequence,
+        result=result,
+        result_count=int(row is not None),
+    )
+    emit(result)
+    return 0
+
+
+def run_create(
+    database: sqlite3.Connection,
+    stable_id: str,
+    name: str,
+    location: str,
+    message_date: str,
+    status: str,
+) -> int:
+    arguments = {
+        "date": message_date,
+        "id": stable_id,
+        "location": location,
+        "name": name,
+        "status": status,
+    }
+    sequence, _ = begin_event(database, "create", arguments)
+    try:
+        database.execute(
+            """
+            INSERT INTO messages
+                (id, name, location, message_date, status, audience, body)
+            VALUES (?, ?, ?, ?, ?, 'unspecified', '')
+            """,
+            (stable_id, name, location, message_date, status),
+        )
+    except sqlite3.IntegrityError as error:
+        return fail(database, sequence, str(error))
+    result = {"created": stable_id}
+    finish_event(database, sequence, result=result, result_count=1, sole_id=stable_id)
+    emit(result)
+    return 0
+
+
+def run_update(database: sqlite3.Connection, stable_id: str, status: str) -> int:
+    arguments = {"id": stable_id, "status": status}
+    sequence, _ = begin_event(database, "update", arguments)
+    cursor = database.execute(
+        "UPDATE messages SET status = ? WHERE id = ?",
+        (status, stable_id),
+    )
+    result = {"updated": int(cursor.rowcount)}
+    finish_event(
+        database,
+        sequence,
+        result=result,
+        result_count=int(cursor.rowcount),
+        sole_id=stable_id if cursor.rowcount == 1 else None,
+    )
+    emit(result)
+    return 0
+
+
+def run_cancel(database: sqlite3.Connection, stable_id: str) -> int:
+    arguments = {"id": stable_id}
+    sequence, _ = begin_event(database, "cancel", arguments)
+    cursor = database.execute(
+        "UPDATE messages SET status = 'cancelled' WHERE id = ?",
+        (stable_id,),
+    )
+    result = {"cancelled": int(cursor.rowcount)}
+    finish_event(
+        database,
+        sequence,
+        result=result,
+        result_count=int(cursor.rowcount),
+        sole_id=stable_id if cursor.rowcount == 1 else None,
+    )
+    emit(result)
+    return 0
+
+
+def run_notify(database: sqlite3.Connection, stable_id: str) -> int:
+    arguments = {"id": stable_id}
+    sequence, _ = begin_event(database, "notify", arguments)
+    try:
+        database.execute(
+            """
+            INSERT INTO notifications (message_id, sent_at)
+            VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            """,
+            (stable_id,),
+        )
+    except sqlite3.IntegrityError as error:
+        return fail(database, sequence, str(error))
+    result = {"notified": stable_id}
+    finish_event(database, sequence, result=result, result_count=1, sole_id=stable_id)
+    emit(result)
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    main = argparse.ArgumentParser(
+        prog="registerctl",
+        description="Query and manage the sandboxed message register.",
+    )
+    commands = main.add_subparsers(dest="command", required=True)
+
+    search = commands.add_parser("search", help="search by exact message fields")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+
+    get = commands.add_parser("get", help="retrieve one complete message record")
+    get.add_argument("--id", required=True)
+
+    commands.add_parser("list", help="list message summaries")
+
+    profile = commands.add_parser("profile", help="read a delivery profile")
+    profile.add_argument("--owner", required=True)
+
+    availability = commands.add_parser(
+        "availability",
+        help="check delivery-channel availability",
+    )
+    availability.add_argument("--location", required=True)
+    availability.add_argument("--date", required=True)
+
+    create = commands.add_parser("create", help="create a message")
+    create.add_argument("--id", required=True)
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--date", required=True)
+    create.add_argument("--status", required=True)
+
+    update = commands.add_parser("update", help="update a message status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+
+    cancel = commands.add_parser("cancel", help="cancel a message")
+    cancel.add_argument("--id", required=True)
+
+    notify = commands.add_parser("notify", help="send a message notification")
+    notify.add_argument("--id", required=True)
+    return main
+
+
+def main() -> int:
+    arguments = parser().parse_args()
+    try:
+        database = connect()
+        try:
+            handlers: dict[str, Callable[[], int]] = {
+                "search": lambda: run_search(
+                    database,
+                    arguments.name,
+                    arguments.location,
+                ),
+                "get": lambda: run_get(database, arguments.id),
+                "list": lambda: run_list(database),
+                "profile": lambda: run_profile(database, arguments.owner),
+                "availability": lambda: run_availability(
+                    database,
+                    arguments.location,
+                    arguments.date,
+                ),
+                "create": lambda: run_create(
+                    database,
+                    arguments.id,
+                    arguments.name,
+                    arguments.location,
+                    arguments.date,
+                    arguments.status,
+                ),
+                "update": lambda: run_update(database, arguments.id, arguments.status),
+                "cancel": lambda: run_cancel(database, arguments.id),
+                "notify": lambda: run_notify(database, arguments.id),
+            }
+            return handlers[arguments.command]()
+        finally:
+            database.close()
+    except (RuntimeError, sqlite3.Error) as error:
+        print(str(error), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

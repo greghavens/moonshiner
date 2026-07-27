@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""Executable availability gateway for the insurance planning sandbox."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+
+ROOT = Path(__file__).resolve().parent
+DATA_PATH = ROOT / ".claims" / "availability.json"
+RUNTIME_PATH = ROOT / ".harness" / "runtime"
+AUDIT_PATH = RUNTIME_PATH / "availability-audit.jsonl"
+ATTEMPT_PATH = RUNTIME_PATH / "north-attempts"
+ARRIVAL_PATH = RUNTIME_PATH / "initial-arrivals.jsonl"
+AUDIT_KEY = b"moonshiner-pi-insurance-recovery-0016-v1"
+INITIAL_BARRIER_TIMEOUT_SECONDS = 10.0
+INITIAL_TARGETS = {
+    ("2026-11-25", "Theft claim", "West Office"),
+    ("2026-11-25", "Windshield claim", "North Office"),
+}
+TRANSIENT_TARGET = ("2026-11-25", "Windshield claim", "North Office")
+
+
+def canonical(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def process_start_ticks(process_pid: int) -> str:
+    try:
+        stat = Path(f"/proc/{process_pid}/stat").read_text(encoding="utf-8")
+        return stat.rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return "unavailable"
+
+
+def append_audit(event: dict) -> None:
+    event["signature"] = hmac.new(
+        AUDIT_KEY, canonical(event), hashlib.sha256
+    ).hexdigest()
+    RUNTIME_PATH.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def next_transient_attempt() -> int:
+    RUNTIME_PATH.mkdir(parents=True, exist_ok=True)
+    with ATTEMPT_PATH.open("a+", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.seek(0)
+        raw = stream.read().strip()
+        current = int(raw) if raw else 0
+        attempt = current + 1
+        stream.seek(0)
+        stream.truncate()
+        stream.write(str(attempt) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    return attempt
+
+
+def parse_registered_targets(lines: list[str]) -> set[tuple[str, str, str]]:
+    registered: set[tuple[str, str, str]] = set()
+    for raw in lines:
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, list) and len(value) == 3 and all(
+            isinstance(part, str) for part in value
+        ):
+            registered.add(tuple(value))
+    return registered
+
+
+def registered_initial_targets() -> set[tuple[str, str, str]]:
+    try:
+        lines = ARRIVAL_PATH.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return set()
+    return parse_registered_targets(lines)
+
+
+def await_initial_sibling(target: tuple[str, str, str], attempt: int) -> None:
+    if target not in INITIAL_TARGETS or attempt != 1:
+        return
+    RUNTIME_PATH.mkdir(parents=True, exist_ok=True)
+    with ARRIVAL_PATH.open("a+", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.seek(0)
+        existing = parse_registered_targets(stream.read().splitlines())
+        if target not in existing:
+            stream.write(json.dumps(list(target), separators=(",", ":")) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+    deadline = time.monotonic() + INITIAL_BARRIER_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if registered_initial_targets() == INITIAL_TARGETS:
+            return
+        time.sleep(0.01)
+
+
+def load_entries() -> list[dict]:
+    with DATA_PATH.open(encoding="utf-8") as stream:
+        payload = json.load(stream)
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        raise ValueError("availability store is malformed")
+    return entries
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="claim-availability",
+        description="Check one exact insurance-item availability. Results are JSON.",
+    )
+    commands = parser.add_subparsers(dest="operation", required=True)
+    check = commands.add_parser("check", help="check one exact date, item, and office")
+    check.add_argument("--date", required=True)
+    check.add_argument("--item", required=True)
+    check.add_argument("--office", required=True)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    invocation_start_ns = time.monotonic_ns()
+    try:
+        args = parser.parse_args()
+    except SystemExit as exc:
+        if exc.code == 0 and sys.argv[1:] == ["--help"]:
+            parent_pid = os.getppid()
+            append_audit(
+                {
+                    "operation": "help",
+                    "start_ns": invocation_start_ns,
+                    "end_ns": time.monotonic_ns(),
+                    "process_pid": os.getpid(),
+                    "process_start_ticks": process_start_ticks(os.getpid()),
+                    "process_group_id": os.getpgrp(),
+                    "session_id": os.getsid(0),
+                    "parent_pid": parent_pid,
+                    "parent_start_ticks": process_start_ticks(parent_pid),
+                    "success": True,
+                }
+            )
+        raise
+    target = (args.date, args.item, args.office)
+    start_ns = invocation_start_ns
+    parent_pid = os.getppid()
+    attempt = next_transient_attempt() if target == TRANSIENT_TARGET else 1
+    await_initial_sibling(target, attempt)
+    success = False
+    availability: str | None = None
+    error: str | None = None
+    retryable = False
+
+    try:
+        matches = [
+            entry
+            for entry in load_entries()
+            if (entry.get("date"), entry.get("item"), entry.get("office")) == target
+        ]
+        if len(matches) != 1:
+            raise LookupError("no unique exact availability record")
+        if target == TRANSIENT_TARGET and attempt == 1:
+            error = "temporary_failure"
+            retryable = True
+        else:
+            value = matches[0].get("availability")
+            if not isinstance(value, str) or not value:
+                raise ValueError("availability record has no result")
+            availability = value
+            success = True
+    except (OSError, ValueError, LookupError, json.JSONDecodeError) as exc:
+        error = str(exc)
+
+    end_ns = time.monotonic_ns()
+    event = {
+        "operation": args.operation,
+        "date": args.date,
+        "item": args.item,
+        "office": args.office,
+        "attempt": attempt,
+        "start_ns": start_ns,
+        "end_ns": end_ns,
+        "process_pid": os.getpid(),
+        "process_start_ticks": process_start_ticks(os.getpid()),
+        "process_group_id": os.getpgrp(),
+        "session_id": os.getsid(0),
+        "parent_pid": parent_pid,
+        "parent_start_ticks": process_start_ticks(parent_pid),
+        "success": success,
+        "retryable": retryable,
+    }
+    if availability is not None:
+        event["availability"] = availability
+    if error is not None:
+        event["error"] = error
+    append_audit(event)
+
+    if success:
+        print(
+            json.dumps(
+                {
+                    "date": args.date,
+                    "item": args.item,
+                    "office": args.office,
+                    "availability": availability,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    print(
+        json.dumps(
+            {
+                "error": error or "availability_check_failed",
+                "retryable": retryable,
+            },
+            sort_keys=True,
+        ),
+        file=sys.stderr,
+    )
+    return 75 if retryable else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

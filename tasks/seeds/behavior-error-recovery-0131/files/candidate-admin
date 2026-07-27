@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""Candidate administration command for the local recruiting records store."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / ".candidate_data"
+RECORDS_PATH = DATA_DIR / "records.json"
+OPERATIONS_PATH = DATA_DIR / "operations.jsonl"
+CLIENT_DEADLINE_SECONDS = 0.6
+DELAYED_RESPONSE_SECONDS = 30
+
+
+def load_records() -> dict[str, Any]:
+    with RECORDS_PATH.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def save_records(records: dict[str, Any]) -> None:
+    temporary = RECORDS_PATH.with_suffix(".json.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(records, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, RECORDS_PATH)
+
+
+def read_operations() -> list[dict[str, Any]]:
+    if not OPERATIONS_PATH.exists():
+        return []
+    operations: list[dict[str, Any]] = []
+    with OPERATIONS_PATH.open(encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                operations.append(json.loads(line))
+    return operations
+
+
+def append_operation(event: dict[str, Any]) -> None:
+    event = {"sequence": len(read_operations()) + 1, **event}
+    with OPERATIONS_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def find_record(records: dict[str, Any], record_id: str) -> dict[str, Any]:
+    for record in records["records"]:
+        if record["record_id"] == record_id:
+            return record
+    raise LookupError(record_id)
+
+
+def command_show(args: argparse.Namespace) -> int:
+    records = load_records()
+    try:
+        record = find_record(records, args.record_id)
+    except LookupError:
+        print(f"candidate record not found: {args.record_id}", file=sys.stderr)
+        return 3
+    append_operation(
+        {
+            "event": "record_retrieved",
+            "record_id": args.record_id,
+            "observed_status": record["status"],
+        }
+    )
+    print(json.dumps(record, indent=2, sort_keys=True))
+    return 0
+
+
+def command_list(_: argparse.Namespace) -> int:
+    records = load_records()
+    summary = [
+        {
+            "candidate_number": record["candidate_number"],
+            "name": record["name"],
+            "record_id": record["record_id"],
+            "status": record["status"],
+        }
+        for record in records["records"]
+    ]
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return 0
+
+
+def command_create(args: argparse.Namespace) -> int:
+    records = load_records()
+    record_id = f"rec-{records['next_record_number']}"
+    records["next_record_number"] += 1
+    records["records"].append(
+        {
+            "approved_for_removal": False,
+            "candidate_number": args.candidate_number,
+            "duplicate_of": None,
+            "name": args.name,
+            "record_id": record_id,
+            "status": "active",
+        }
+    )
+    save_records(records)
+    append_operation({"event": "candidate_created", "record_id": record_id})
+    print(record_id)
+    return 0
+
+
+def command_cancel(args: argparse.Namespace) -> int:
+    records = load_records()
+    try:
+        record = find_record(records, args.record_id)
+    except LookupError:
+        print(f"candidate record not found: {args.record_id}", file=sys.stderr)
+        return 3
+
+    append_operation(
+        {
+            "event": "cancel_requested",
+            "observed_status": record["status"],
+            "reason": args.reason,
+            "record_id": args.record_id,
+        }
+    )
+
+    if not record["approved_for_removal"]:
+        append_operation(
+            {
+                "event": "cancel_rejected",
+                "record_id": args.record_id,
+                "reason": "removal_not_approved",
+            }
+        )
+        print("candidate is not approved for removal", file=sys.stderr)
+        return 4
+    if record["status"] != "active":
+        append_operation(
+            {
+                "event": "cancel_rejected",
+                "record_id": args.record_id,
+                "reason": f"status_{record['status']}",
+            }
+        )
+        print(f"candidate status is already {record['status']}", file=sys.stderr)
+        return 5
+
+    readiness_reader, readiness_writer = os.pipe()
+    try:
+        worker = subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "_commit-cancel",
+                args.record_id,
+                "--reason",
+                args.reason,
+                "--ready-fd",
+                str(readiness_writer),
+            ],
+            pass_fds=(readiness_writer,),
+        )
+    except OSError as error:
+        os.close(readiness_reader)
+        os.close(readiness_writer)
+        print(f"cancellation worker failed to start: {error}", file=sys.stderr)
+        return 1
+
+    os.close(readiness_writer)
+    with os.fdopen(readiness_reader, "rb", buffering=0) as readiness:
+        committed = readiness.read(1)
+    if committed != b"1":
+        return_code = worker.wait()
+        print(
+            f"cancellation worker failed with exit code {return_code}",
+            file=sys.stderr,
+        )
+        return return_code or 1
+
+    try:
+        worker.wait(timeout=CLIENT_DEADLINE_SECONDS)
+    except subprocess.TimeoutExpired:
+        worker.kill()
+        worker.wait()
+        append_operation(
+            {
+                "event": "cancel_timed_out",
+                "record_id": args.record_id,
+            }
+        )
+        print(
+            f"cancellation request timed out after {CLIENT_DEADLINE_SECONDS:.1f}s; "
+            "commit status is unknown",
+            file=sys.stderr,
+        )
+        return 124
+
+    if worker.returncode:
+        print(
+            f"cancellation worker failed with exit code {worker.returncode}",
+            file=sys.stderr,
+        )
+        return worker.returncode
+
+    print(json.dumps(find_record(load_records(), args.record_id), indent=2, sort_keys=True))
+    return 0
+
+
+def command_commit_cancel(args: argparse.Namespace) -> int:
+    records = load_records()
+    try:
+        record = find_record(records, args.record_id)
+    except LookupError:
+        return 3
+    if record["status"] != "active":
+        return 5
+
+    record["status"] = "cancelled"
+    record["cancellation_reason"] = args.reason
+    record["cancellation_count"] = record.get("cancellation_count", 0) + 1
+    save_records(records)
+    append_operation(
+        {
+            "event": "cancel_committed",
+            "from_status": "active",
+            "reason": args.reason,
+            "record_id": args.record_id,
+            "to_status": "cancelled",
+        }
+    )
+    if args.ready_fd is not None:
+        os.write(args.ready_fd, b"1")
+        os.close(args.ready_fd)
+
+    # The durable write is complete, but this worker deliberately cannot deliver its
+    # response before the parent client's real subprocess deadline.
+    time.sleep(DELAYED_RESPONSE_SECONDS)
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        prog="candidate-admin",
+        description="Read and administer candidate records in the local recruiting store.",
+    )
+    commands = root.add_subparsers(dest="command", required=True)
+
+    show = commands.add_parser("show", help="retrieve one authoritative candidate record")
+    show.add_argument("record_id")
+    show.set_defaults(handler=command_show)
+
+    listing = commands.add_parser("list", help="list candidate record summaries")
+    listing.set_defaults(handler=command_list)
+
+    cancel = commands.add_parser("cancel", help="cancel an approved active candidate record")
+    cancel.add_argument("record_id")
+    cancel.add_argument("--reason", required=True, choices=["duplicate"])
+    cancel.set_defaults(handler=command_cancel)
+
+    create = commands.add_parser("create", help="create a new candidate profile")
+    create.add_argument("--name", required=True)
+    create.add_argument("--candidate-number", required=True, type=int)
+    create.set_defaults(handler=command_create)
+
+    internal = commands.add_parser("_commit-cancel", help=argparse.SUPPRESS)
+    internal.add_argument("record_id")
+    internal.add_argument("--reason", required=True, choices=["duplicate"])
+    internal.add_argument("--ready-fd", type=int)
+    internal.set_defaults(handler=command_commit_cancel)
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    return args.handler(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+"""Executable appointment registry for the Pi harness task."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+STATE_DIR = ROOT / ".clinic"
+APPOINTMENTS_PATH = STATE_DIR / "appointments.json"
+NOTIFICATIONS_PATH = STATE_DIR / "notifications.json"
+RECEIPTS_PATH = STATE_DIR / "receipts.json"
+AUDIT_PATH = STATE_DIR / "audit.jsonl"
+LOCK_PATH = STATE_DIR / "lock"
+KEY_PATH = ROOT / ".protected" / "audit.key"
+READ_DELAY_SECONDS = 0.24
+
+
+def canonical(value: object) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def load_document(path: Path, collection: str) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as stream:
+        value = json.load(stream)
+    if (
+        not isinstance(value, dict)
+        or value.get("version") != 1
+        or not isinstance(value.get(collection), list)
+        or not all(isinstance(item, dict) for item in value[collection])
+    ):
+        raise RuntimeError(f"invalid clinic store: {path.name}")
+    return value
+
+
+def atomic_write(path: Path, value: dict[str, Any]) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", text=True
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def event_digest(record: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical(record)).hexdigest()
+
+
+def append_event_locked(event: dict[str, Any]) -> None:
+    with AUDIT_PATH.open(encoding="utf-8") as stream:
+        sequence = sum(1 for line in stream if line.strip()) + 1
+    sealed = dict(event)
+    sealed["sequence"] = sequence
+    key = KEY_PATH.read_bytes().strip()
+    sealed["seal"] = hmac.new(key, canonical(sealed), hashlib.sha256).hexdigest()
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(sealed, ensure_ascii=False, sort_keys=True))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def append_event(event: dict[str, Any]) -> None:
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        append_event_locked(event)
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+
+def emit(value: dict[str, Any]) -> None:
+    json.dump(value, sys.stdout, ensure_ascii=False, sort_keys=True, indent=2)
+    sys.stdout.write("\n")
+
+
+def search(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    appointments = load_document(APPOINTMENTS_PATH, "appointments")["appointments"]
+    matches = [
+        {
+            "id": record["id"],
+            "appointment": record["appointment"],
+            "patient": record["patient"],
+            "location": record["location"],
+        }
+        for record in appointments
+        if record.get("appointment") == args.appointment
+        and record.get("patient") == args.patient
+        and record.get("location") == args.location
+    ]
+    matches.sort(key=lambda record: record["id"])
+    time.sleep(READ_DELAY_SECONDS)
+    finished = time.monotonic_ns()
+    append_event(
+        {
+            "operation": "search",
+            "appointment": args.appointment,
+            "patient": args.patient,
+            "location": args.location,
+            "process_id": os.getpid(),
+            "parent_process_id": os.getppid(),
+            "started_ns": started,
+            "finished_ns": finished,
+            "outcome": "ok",
+            "result_ids": [record["id"] for record in matches],
+        }
+    )
+    emit(
+        {
+            "query": {
+                "appointment": args.appointment,
+                "patient": args.patient,
+                "location": args.location,
+            },
+            "matches": matches,
+        }
+    )
+    return 0
+
+
+def get_record(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    appointments = load_document(APPOINTMENTS_PATH, "appointments")["appointments"]
+    record = next(
+        (record for record in appointments if record.get("id") == args.id), None
+    )
+    time.sleep(READ_DELAY_SECONDS)
+    finished = time.monotonic_ns()
+    event: dict[str, Any] = {
+        "operation": "get",
+        "record_id": args.id,
+        "process_id": os.getpid(),
+        "parent_process_id": os.getppid(),
+        "started_ns": started,
+        "finished_ns": finished,
+    }
+    if record is None:
+        event.update({"outcome": "not-found", "found": False})
+        append_event(event)
+        print(f"appointment not found: {args.id}", file=sys.stderr)
+        return 3
+    event.update(
+        {
+            "outcome": "ok",
+            "found": True,
+            "record_sha256": event_digest(record),
+            "status": record.get("status"),
+        }
+    )
+    append_event(event)
+    emit({"record": record})
+    return 0
+
+
+def cancel(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        appointments_document = load_document(APPOINTMENTS_PATH, "appointments")
+        appointments = appointments_document["appointments"]
+        record = next(
+            (record for record in appointments if record.get("id") == args.id), None
+        )
+        before = record.get("status") if record is not None else None
+        if record is None or before != args.if_status:
+            finished = time.monotonic_ns()
+            append_event_locked(
+                {
+                    "operation": "cancel",
+                    "record_id": args.id,
+                    "conditional_status": args.if_status,
+                    "before_status": before,
+                    "after_status": before,
+                    "reason": args.reason,
+                    "receipt": None,
+                    "process_id": os.getpid(),
+                    "parent_process_id": os.getppid(),
+                    "started_ns": started,
+                    "finished_ns": finished,
+                    "outcome": (
+                        "not-found" if record is None else "condition-not-met"
+                    ),
+                    "cancelled": False,
+                }
+            )
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+            emit(
+                {
+                    "cancelled": False,
+                    "id": args.id,
+                    "status": before,
+                    "reason": "condition not met",
+                }
+            )
+            return 4
+
+        receipt = "can-" + hashlib.sha256(
+            f"{args.id}\0{args.reason}\0{started}\0{os.getpid()}".encode("utf-8")
+        ).hexdigest()[:20]
+        record["status"] = "cancelled"
+        record["cancellation_reason"] = args.reason
+        receipts_document = load_document(RECEIPTS_PATH, "receipts")
+        receipts_document["receipts"].append(
+            {
+                "receipt": receipt,
+                "appointment_id": args.id,
+                "from_status": args.if_status,
+                "to_status": "cancelled",
+                "reason": args.reason,
+                "consumed": False,
+            }
+        )
+        atomic_write(APPOINTMENTS_PATH, appointments_document)
+        atomic_write(RECEIPTS_PATH, receipts_document)
+        finished = time.monotonic_ns()
+        append_event_locked(
+            {
+                "operation": "cancel",
+                "record_id": args.id,
+                "conditional_status": args.if_status,
+                "before_status": before,
+                "after_status": "cancelled",
+                "reason": args.reason,
+                "receipt": receipt,
+                "process_id": os.getpid(),
+                "parent_process_id": os.getppid(),
+                "started_ns": started,
+                "finished_ns": finished,
+                "outcome": "ok",
+                "cancelled": True,
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    emit(
+        {
+            "cancelled": True,
+            "record": record,
+            "transition": {
+                "from_status": args.if_status,
+                "to_status": "cancelled",
+            },
+            "cancellation_reason": args.reason,
+            "mutation_receipt": receipt,
+        }
+    )
+    return 0
+
+
+def notify(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        receipts_document = load_document(RECEIPTS_PATH, "receipts")
+        receipt = next(
+            (
+                item
+                for item in receipts_document["receipts"]
+                if item.get("receipt") == args.after_receipt
+            ),
+            None,
+        )
+        appointments = load_document(APPOINTMENTS_PATH, "appointments")[
+            "appointments"
+        ]
+        record = (
+            next(
+                (
+                    item
+                    for item in appointments
+                    if item.get("id") == receipt.get("appointment_id")
+                ),
+                None,
+            )
+            if receipt is not None
+            else None
+        )
+        valid = (
+            receipt is not None
+            and receipt.get("consumed") is False
+            and record is not None
+            and record.get("status") == receipt.get("to_status")
+            and record.get("cancellation_reason") == receipt.get("reason")
+        )
+        if not valid:
+            finished = time.monotonic_ns()
+            append_event_locked(
+                {
+                    "operation": "notify",
+                    "record_id": receipt.get("appointment_id") if receipt else None,
+                    "recipient": args.recipient,
+                    "receipt": args.after_receipt,
+                    "process_id": os.getpid(),
+                    "parent_process_id": os.getppid(),
+                    "started_ns": started,
+                    "finished_ns": finished,
+                    "outcome": "no-successful-mutation",
+                    "delivered": False,
+                }
+            )
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+            print(
+                "notification rejected: no unconsumed successful cancellation receipt",
+                file=sys.stderr,
+            )
+            return 4
+
+        subject = f"Cancellation outcome: {record['appointment']} — {record['patient']}"
+        message = (
+            f"{record['appointment']} for {record['patient']} at {record['location']} "
+            f"was cancelled. Reason: {receipt['reason']}"
+        )
+        notifications_document = load_document(NOTIFICATIONS_PATH, "notifications")
+        notifications_document["notifications"].append(
+            {
+                "ordinal": len(notifications_document["notifications"]) + 1,
+                "recipient": args.recipient,
+                "appointment_id": receipt["appointment_id"],
+                "mutation_receipt": receipt["receipt"],
+                "subject": subject,
+                "message": message,
+            }
+        )
+        receipt["consumed"] = True
+        atomic_write(NOTIFICATIONS_PATH, notifications_document)
+        atomic_write(RECEIPTS_PATH, receipts_document)
+        finished = time.monotonic_ns()
+        append_event_locked(
+            {
+                "operation": "notify",
+                "record_id": receipt["appointment_id"],
+                "recipient": args.recipient,
+                "receipt": receipt["receipt"],
+                "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                "process_id": os.getpid(),
+                "parent_process_id": os.getppid(),
+                "started_ns": started,
+                "finished_ns": finished,
+                "outcome": "ok",
+                "delivered": True,
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    emit(
+        {
+            "delivered": True,
+            "recipient": args.recipient,
+            "record_id": receipt["appointment_id"],
+            "mutation_receipt": receipt["receipt"],
+            "subject": subject,
+            "message": message,
+        }
+    )
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="clinicctl",
+        description="Search, retrieve, conditionally cancel, and notify for clinic appointments.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    search_parser = subparsers.add_parser(
+        "search", help="find exact appointment, patient, and location matches"
+    )
+    search_parser.add_argument("--appointment", required=True)
+    search_parser.add_argument("--patient", required=True)
+    search_parser.add_argument("--location", required=True)
+    search_parser.set_defaults(handler=search)
+
+    get_parser = subparsers.add_parser("get", help="retrieve one complete appointment")
+    get_parser.add_argument("--id", required=True)
+    get_parser.set_defaults(handler=get_record)
+
+    cancel_parser = subparsers.add_parser(
+        "cancel", help="conditionally cancel one appointment and return mutation evidence"
+    )
+    cancel_parser.add_argument("--id", required=True)
+    cancel_parser.add_argument("--if-status", required=True)
+    cancel_parser.add_argument("--reason", required=True)
+    cancel_parser.set_defaults(handler=cancel)
+
+    notify_parser = subparsers.add_parser(
+        "notify", help="notify after a successful cancellation using its mutation evidence"
+    )
+    notify_parser.add_argument("--recipient", required=True)
+    notify_parser.add_argument("--after-receipt", required=True)
+    notify_parser.set_defaults(handler=notify)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        return int(args.handler(args))
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+        print(f"clinicctl: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

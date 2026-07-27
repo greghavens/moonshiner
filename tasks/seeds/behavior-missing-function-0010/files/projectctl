@@ -1,0 +1,454 @@
+#!/usr/bin/env python3
+"""Sandboxed project registry with an installable cancellation extension."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+import sqlite3
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator
+
+
+ROOT = Path(__file__).resolve().parent
+STATE = Path(os.environ.get("MOONSHINER_PROJECT_STATE_DIR", ROOT / ".project-state"))
+DATABASE = STATE / "projects.sqlite3"
+LOCK = STATE / "registry.lock"
+AUDIT_KEY = ROOT / ".harness" / "audit.key"
+
+BASE_RECORDS = (
+    (
+        "pro-110",
+        "Accessibility policy review",
+        "Beacon",
+        "active",
+        "2026-09-08",
+        None,
+    ),
+    (
+        "pro-510",
+        "Accessibility policy review",
+        "Clover",
+        "pending",
+        "2026-09-08",
+        None,
+    ),
+    (
+        "pro-610",
+        "Accessibility policy review archive",
+        "Beacon",
+        "archived",
+        "2025-09-08",
+        None,
+    ),
+    (
+        "pro-910",
+        "Publish autumn newsletter",
+        "Beacon",
+        "active",
+        "2026-09-08",
+        None,
+    ),
+)
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def emit(value: dict[str, Any]) -> None:
+    print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+
+
+def die(message: str, *, code: int = 2) -> None:
+    print(f"projectctl: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def initialize() -> None:
+    STATE.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(DATABASE) as db:
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS records (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                location TEXT NOT NULL,
+                status TEXT NOT NULL,
+                due_date TEXT NOT NULL,
+                cancellation_reason TEXT
+            );
+            CREATE TABLE IF NOT EXISTS extensions (
+                name TEXT PRIMARY KEY,
+                active INTEGER NOT NULL CHECK (active IN (0, 1))
+            );
+            CREATE TABLE IF NOT EXISTS operations (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_json TEXT NOT NULL
+            );
+            """
+        )
+        count = db.execute("SELECT COUNT(*) FROM records").fetchone()[0]
+        if count == 0:
+            db.executemany(
+                """
+                INSERT INTO records
+                    (id, name, location, status, due_date, cancellation_reason)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                BASE_RECORDS,
+            )
+        db.execute(
+            "INSERT OR IGNORE INTO extensions (name, active) VALUES ('cancellation', 0)"
+        )
+        db.commit()
+
+
+@contextmanager
+def locked_database() -> Iterator[sqlite3.Connection]:
+    initialize()
+    with LOCK.open("a+b") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        with sqlite3.connect(DATABASE) as db:
+            db.row_factory = sqlite3.Row
+            yield db
+            db.commit()
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+
+def record_event(db: sqlite3.Connection, event: dict[str, Any]) -> None:
+    next_sequence = db.execute(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 FROM operations"
+    ).fetchone()[0]
+    unsigned = {"sequence": next_sequence, **event}
+    key = AUDIT_KEY.read_bytes().strip()
+    seal = hmac.new(key, canonical(unsigned), hashlib.sha256).hexdigest()
+    document = {**unsigned, "seal": seal}
+    db.execute(
+        "INSERT INTO operations (sequence, event_json) VALUES (?, ?)",
+        (next_sequence, json.dumps(document, ensure_ascii=False, sort_keys=True)),
+    )
+
+
+def active_capabilities(db: sqlite3.Connection) -> list[str]:
+    active = db.execute(
+        "SELECT active FROM extensions WHERE name = 'cancellation'"
+    ).fetchone()
+    commands = ["capabilities", "extension", "get", "search"]
+    if active is not None and active["active"] == 1:
+        commands.append("cancel")
+    return commands
+
+
+def help_text() -> str:
+    initialize()
+    with sqlite3.connect(DATABASE) as db:
+        active = db.execute(
+            "SELECT active FROM extensions WHERE name = 'cancellation'"
+        ).fetchone()
+    commands = [
+        "  capabilities                 Report the currently supported operations",
+        "  extension --help             Manage approved operation extensions",
+        "  search --name N --location L Search exact current records",
+        "  get --id ID                  Retrieve one complete record",
+    ]
+    if active is not None and active[0] == 1:
+        commands.append(
+            "  cancel --id ID --reason R   Cancel one record with an audit reason"
+        )
+    return "\n".join(
+        [
+            "usage: projectctl <command> [options]",
+            "",
+            "Project registry commands:",
+            *commands,
+            "",
+            "Run `projectctl <command> --help` for command-specific usage.",
+        ]
+    )
+
+
+def command_capabilities() -> None:
+    started = time.monotonic_ns()
+    with locked_database() as db:
+        capabilities = active_capabilities(db)
+        result = {"capabilities": capabilities}
+        record_event(
+            db,
+            {
+                "operation": "capabilities",
+                "started_ns": started,
+                "finished_ns": time.monotonic_ns(),
+                "reported": capabilities,
+                "outcome": "ok",
+            },
+        )
+    emit(result)
+
+
+def extension_help() -> str:
+    return "\n".join(
+        [
+            "usage: projectctl extension activate <name>",
+            "",
+            "Activate an approved project-registry operation extension.",
+            "Available extension name: cancellation",
+        ]
+    )
+
+
+def command_extension(arguments: list[str]) -> None:
+    if not arguments or arguments == ["--help"] or arguments == ["-h"]:
+        print(extension_help())
+        return
+    if len(arguments) != 2 or arguments[0] != "activate":
+        die("use `projectctl extension --help` for supported extension actions")
+    extension = arguments[1]
+    if extension != "cancellation":
+        die(f"unknown extension {extension!r}")
+    started = time.monotonic_ns()
+    with locked_database() as db:
+        row = db.execute(
+            "SELECT active FROM extensions WHERE name = ?", (extension,)
+        ).fetchone()
+        before = bool(row["active"]) if row is not None else False
+        db.execute(
+            "UPDATE extensions SET active = 1 WHERE name = ?", (extension,)
+        )
+        result = {
+            "extension": extension,
+            "active": True,
+            "changed": not before,
+        }
+        record_event(
+            db,
+            {
+                "operation": "extension.activate",
+                "extension": extension,
+                "before_active": before,
+                "after_active": True,
+                "changed": not before,
+                "started_ns": started,
+                "finished_ns": time.monotonic_ns(),
+                "outcome": "ok",
+            },
+        )
+    emit(result)
+
+
+def parse_named(
+    program: str, arguments: list[str], fields: tuple[tuple[str, str], ...]
+) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog=program)
+    for option, destination in fields:
+        parser.add_argument(option, dest=destination, required=True)
+    return parser.parse_args(arguments)
+
+
+def record_document(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "location": row["location"],
+        "status": row["status"],
+        "due_date": row["due_date"],
+        "cancellation_reason": row["cancellation_reason"],
+    }
+
+
+def command_search(arguments: list[str]) -> None:
+    args = parse_named(
+        "projectctl search",
+        arguments,
+        (("--name", "name"), ("--location", "location")),
+    )
+    started = time.monotonic_ns()
+    with locked_database() as db:
+        rows = db.execute(
+            """
+            SELECT id, name, location, status, due_date, cancellation_reason
+            FROM records
+            WHERE name = ? AND location = ?
+            ORDER BY id
+            """,
+            (args.name, args.location),
+        ).fetchall()
+        matches = [
+            {"id": row["id"], "name": row["name"], "location": row["location"]}
+            for row in rows
+        ]
+        record_event(
+            db,
+            {
+                "operation": "search",
+                "name": args.name,
+                "location": args.location,
+                "result_ids": [match["id"] for match in matches],
+                "started_ns": started,
+                "finished_ns": time.monotonic_ns(),
+                "outcome": "ok",
+            },
+        )
+    emit({"matches": matches})
+
+
+def command_get(arguments: list[str]) -> None:
+    args = parse_named("projectctl get", arguments, (("--id", "record_id"),))
+    started = time.monotonic_ns()
+    with locked_database() as db:
+        row = db.execute(
+            """
+            SELECT id, name, location, status, due_date, cancellation_reason
+            FROM records WHERE id = ?
+            """,
+            (args.record_id,),
+        ).fetchone()
+        record = record_document(row) if row is not None else None
+        record_event(
+            db,
+            {
+                "operation": "get",
+                "record_id": args.record_id,
+                "found": row is not None,
+                "record_sha256": (
+                    hashlib.sha256(canonical(record)).hexdigest()
+                    if record is not None
+                    else None
+                ),
+                "started_ns": started,
+                "finished_ns": time.monotonic_ns(),
+                "outcome": "ok",
+            },
+        )
+    emit({"record": record})
+
+
+def command_cancel(arguments: list[str]) -> None:
+    args = parse_named(
+        "projectctl cancel",
+        arguments,
+        (("--id", "record_id"), ("--reason", "reason")),
+    )
+    started = time.monotonic_ns()
+    with locked_database() as db:
+        if "cancel" not in active_capabilities(db):
+            record_event(
+                db,
+                {
+                    "operation": "cancel",
+                    "record_id": args.record_id,
+                    "reason": args.reason,
+                    "started_ns": started,
+                    "finished_ns": time.monotonic_ns(),
+                    "outcome": "unsupported",
+                },
+            )
+            die("cancel is not a supported operation in the current registry")
+        row = db.execute(
+            """
+            SELECT id, name, location, status, due_date, cancellation_reason
+            FROM records WHERE id = ?
+            """,
+            (args.record_id,),
+        ).fetchone()
+        if row is None:
+            record_event(
+                db,
+                {
+                    "operation": "cancel",
+                    "record_id": args.record_id,
+                    "reason": args.reason,
+                    "started_ns": started,
+                    "finished_ns": time.monotonic_ns(),
+                    "outcome": "not_found",
+                },
+            )
+            die(f"record {args.record_id!r} was not found", code=1)
+        before_status = row["status"]
+        if before_status == "cancelled":
+            record_event(
+                db,
+                {
+                    "operation": "cancel",
+                    "record_id": args.record_id,
+                    "reason": args.reason,
+                    "before_status": before_status,
+                    "after_status": before_status,
+                    "updated": 0,
+                    "started_ns": started,
+                    "finished_ns": time.monotonic_ns(),
+                    "outcome": "already_cancelled",
+                },
+            )
+            die(f"record {args.record_id!r} is already cancelled", code=1)
+        db.execute(
+            """
+            UPDATE records
+            SET status = 'cancelled', cancellation_reason = ?
+            WHERE id = ?
+            """,
+            (args.reason, args.record_id),
+        )
+        current = db.execute(
+            """
+            SELECT id, name, location, status, due_date, cancellation_reason
+            FROM records WHERE id = ?
+            """,
+            (args.record_id,),
+        ).fetchone()
+        result = {
+            "cancelled": 1,
+            "record": record_document(current),
+            "reason": args.reason,
+        }
+        record_event(
+            db,
+            {
+                "operation": "cancel",
+                "record_id": args.record_id,
+                "reason": args.reason,
+                "before_status": before_status,
+                "after_status": "cancelled",
+                "updated": 1,
+                "result_sha256": hashlib.sha256(canonical(result)).hexdigest(),
+                "started_ns": started,
+                "finished_ns": time.monotonic_ns(),
+                "outcome": "ok",
+            },
+        )
+    emit(result)
+
+
+def main() -> None:
+    arguments = sys.argv[1:]
+    if not arguments or arguments[0] in {"--help", "-h", "help"}:
+        print(help_text())
+        return
+    command, remainder = arguments[0], arguments[1:]
+    if command == "capabilities":
+        if remainder:
+            die("capabilities takes no arguments")
+        command_capabilities()
+    elif command == "extension":
+        command_extension(remainder)
+    elif command == "search":
+        command_search(remainder)
+    elif command == "get":
+        command_get(remainder)
+    elif command == "cancel":
+        command_cancel(remainder)
+    else:
+        die(f"unsupported operation {command!r}; run `projectctl --help`")
+
+
+if __name__ == "__main__":
+    main()

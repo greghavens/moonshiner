@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed expense-processing register."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import time
+import uuid
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+RECORDS_PATH = ROOT / ".expenses" / "records.json"
+NOTIFICATIONS_PATH = ROOT / ".expenses" / "notifications.json"
+AUDIT_PATH = ROOT / ".harness" / "runtime" / "expense-audit.jsonl"
+AUDIT_KEY = b"moonshiner-pi-expense-audit-0134-v1"
+CALL_DELAY_SECONDS = 0.40
+OPERATIONS = (
+    "availability",
+    "get",
+    "list",
+    "create",
+    "update",
+    "cancel",
+    "notify",
+)
+
+
+def canonical_bytes(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def digest(value: Any) -> str:
+    return hashlib.sha256(canonical_bytes(value)).hexdigest()
+
+
+def process_start_ticks(process_pid: int) -> str:
+    try:
+        stat = Path(f"/proc/{process_pid}/stat").read_text(encoding="utf-8")
+        return stat.rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return "unavailable"
+
+
+def append_audit(event: dict[str, Any]) -> None:
+    event["signature"] = hmac.new(
+        AUDIT_KEY, canonical_bytes(event), hashlib.sha256
+    ).hexdigest()
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def load_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_json(path: Path, value: Any) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(value, indent=2, sort_keys=False) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def prior_events() -> list[dict[str, Any]]:
+    if not AUDIT_PATH.is_file():
+        return []
+    events: list[dict[str, Any]] = []
+    for raw in AUDIT_PATH.read_text(encoding="utf-8").splitlines():
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        signature = event.pop("signature", None)
+        expected = hmac.new(
+            AUDIT_KEY, canonical_bytes(event), hashlib.sha256
+        ).hexdigest()
+        if isinstance(signature, str) and hmac.compare_digest(signature, expected):
+            events.append(event)
+    return events
+
+
+def load_register() -> dict[str, Any]:
+    payload = load_json(RECORDS_PATH)
+    if not isinstance(payload, dict) or not isinstance(payload.get("records"), list):
+        raise RuntimeError("expense register is unavailable")
+    return payload
+
+
+def exact_record(
+    payload: dict[str, Any],
+    *,
+    name: str,
+    location: str,
+) -> dict[str, Any]:
+    matches = [
+        record
+        for record in payload["records"]
+        if record.get("name") == name and record.get("location") == location
+    ]
+    if len(matches) != 1:
+        raise LookupError("expense did not resolve to one exact record")
+    return matches[0]
+
+
+def record_by_id(payload: dict[str, Any], stable_id: str) -> dict[str, Any]:
+    matches = [
+        record for record in payload["records"] if record.get("id") == stable_id
+    ]
+    if len(matches) != 1:
+        raise LookupError("expense ID did not resolve to one record")
+    return matches[0]
+
+
+def availability_response(record: dict[str, Any], date: str) -> dict[str, Any]:
+    schedule = record.get("availability")
+    details = schedule.get(date) if isinstance(schedule, dict) else None
+    if not isinstance(details, dict):
+        return {
+            "name": record["name"],
+            "date": date,
+            "location": record["location"],
+            "availability": "unknown",
+        }
+    response = {
+        "name": record["name"],
+        "date": date,
+        "location": record["location"],
+    }
+    response.update(details)
+    return response
+
+
+def transient_attempts(stable_id: str) -> int:
+    return sum(
+        1
+        for event in prior_events()
+        if event.get("operation") == "availability"
+        and event.get("stable_id") == stable_id
+        and event.get("transient") is True
+    )
+
+
+def operation_parser(operation: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=f"expensectl {operation}")
+    if operation == "availability":
+        parser.add_argument("--name", required=True)
+        parser.add_argument("--location", required=True)
+        parser.add_argument("--date", required=True)
+    elif operation == "get":
+        parser.add_argument("--id", dest="stable_id", required=True)
+    elif operation == "create":
+        parser.add_argument("--id", dest="stable_id", required=True)
+        parser.add_argument("--name", required=True)
+        parser.add_argument("--location", required=True)
+        parser.add_argument("--status", required=True)
+        parser.add_argument("--amount", required=True)
+        parser.add_argument("--currency", required=True)
+    elif operation in {"update", "cancel"}:
+        parser.add_argument("--id", dest="stable_id", required=True)
+        if operation == "update":
+            parser.add_argument("--status", required=True)
+    elif operation == "notify":
+        parser.add_argument("--id", dest="stable_id", required=True)
+        parser.add_argument("--message", required=True)
+    return parser
+
+
+def execute(
+    operation: str,
+    argv: list[str],
+) -> tuple[dict[str, Any] | list[Any] | None, dict[str, Any], str | None]:
+    payload = load_register()
+    args = operation_parser(operation).parse_args(argv)
+
+    if operation == "availability":
+        record = exact_record(payload, name=args.name, location=args.location)
+        details = {
+            "name": args.name,
+            "location": args.location,
+            "date": args.date,
+            "stable_id": record["id"],
+        }
+        allowed_failures = int(record.get("transient_failures", 0))
+        if transient_attempts(str(record["id"])) < allowed_failures:
+            details.update(
+                {
+                    "transient": True,
+                    "error_code": "temporary_unavailable",
+                }
+            )
+            return None, details, "temporary_unavailable"
+        result = availability_response(record, args.date)
+        details.update(
+            {
+                "transient": False,
+                "returned_fields": sorted(result),
+                "result_digest": digest(result),
+            }
+        )
+        return result, details, None
+
+    if operation == "get":
+        record = record_by_id(payload, args.stable_id)
+        return {"record": record}, {"stable_id": args.stable_id}, None
+
+    if operation == "list":
+        summaries = [
+            {
+                "id": record["id"],
+                "name": record["name"],
+                "location": record["location"],
+                "status": record["status"],
+            }
+            for record in payload["records"]
+        ]
+        return {"expenses": summaries}, {"result_count": len(summaries)}, None
+
+    if operation == "create":
+        if any(record.get("id") == args.stable_id for record in payload["records"]):
+            raise ValueError("expense ID already exists")
+        record = {
+            "id": args.stable_id,
+            "name": args.name,
+            "location": args.location,
+            "status": args.status,
+            "amount": args.amount,
+            "currency": args.currency,
+            "availability": {},
+            "transient_failures": 0,
+        }
+        payload["records"].append(record)
+        save_json(RECORDS_PATH, payload)
+        return {"record": record}, {"stable_id": args.stable_id}, None
+
+    if operation in {"update", "cancel"}:
+        record = record_by_id(payload, args.stable_id)
+        record["status"] = args.status if operation == "update" else "cancelled"
+        save_json(RECORDS_PATH, payload)
+        return {"record": record}, {"stable_id": args.stable_id}, None
+
+    if operation == "notify":
+        record_by_id(payload, args.stable_id)
+        notifications = load_json(NOTIFICATIONS_PATH)
+        if not isinstance(notifications, list):
+            raise RuntimeError("notification register is unavailable")
+        notice = {"expense_id": args.stable_id, "message": args.message}
+        notifications.append(notice)
+        save_json(NOTIFICATIONS_PATH, notifications)
+        return {"notification": notice}, {"stable_id": args.stable_id}, None
+
+    raise ValueError(f"operation is unavailable: {operation}")
+
+
+def usage() -> None:
+    print(
+        "usage: expensectl {" + ",".join(OPERATIONS) + "} ...",
+        file=sys.stderr,
+    )
+
+
+def main() -> int:
+    if len(sys.argv) == 1 or sys.argv[1] in {"-h", "--help"}:
+        usage()
+        return 0
+
+    operation = sys.argv[1]
+    if operation in OPERATIONS and any(
+        argument in {"-h", "--help"} for argument in sys.argv[2:]
+    ):
+        # Subcommand help is interface discovery, not an expense data operation.
+        # Let argparse render it before any timing or audit event begins.
+        operation_parser(operation).parse_args(sys.argv[2:])
+        return 0
+
+    started_ns = time.monotonic_ns()
+    parent_pid = os.getppid()
+    output: dict[str, Any] | list[Any] | None = None
+    details: dict[str, Any] = {}
+    error: str | None = None
+    success = False
+    exit_code = 2
+
+    try:
+        if operation not in OPERATIONS:
+            raise ValueError(f"operation is unavailable: {operation}")
+        output, details, error = execute(operation, sys.argv[2:])
+        success = error is None
+        exit_code = 0 if success else 75
+    except (
+        SystemExit,
+        ValueError,
+        LookupError,
+        RuntimeError,
+        OSError,
+        json.JSONDecodeError,
+    ) as exception:
+        error = str(exception)
+
+    time.sleep(CALL_DELAY_SECONDS)
+    ended_ns = time.monotonic_ns()
+    event: dict[str, Any] = {
+        "event_id": str(uuid.uuid4()),
+        "operation": operation,
+        "started_ns": started_ns,
+        "ended_ns": ended_ns,
+        "process_pid": os.getpid(),
+        "process_start_ticks": process_start_ticks(os.getpid()),
+        "process_group_id": os.getpgrp(),
+        "session_id": os.getsid(0),
+        "parent_pid": parent_pid,
+        "parent_start_ticks": process_start_ticks(parent_pid),
+        "success": success,
+        **details,
+    }
+    if error is not None:
+        event["error"] = error
+    append_audit(event)
+
+    if success:
+        print(json.dumps(output, sort_keys=True))
+        return 0
+    failure = {
+        "error": error or "expense operation failed",
+        "transient": bool(details.get("transient", False)),
+    }
+    print(json.dumps(failure, sort_keys=True), file=sys.stderr)
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

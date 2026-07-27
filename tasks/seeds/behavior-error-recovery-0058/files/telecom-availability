@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""Executable, SQLite-backed telecom availability client."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+
+
+ROOT = Path(__file__).resolve().parent
+PROTECTED = ROOT / ".protected"
+RUNTIME = ROOT / ".telecom-runtime"
+DATABASE = RUNTIME / "telecom.sqlite3"
+AUDIT = RUNTIME / "audit.jsonl"
+ATTEMPTS = RUNTIME / "attempts.json"
+SEED = PROTECTED / "telecom_seed.sql"
+KEY = PROTECTED / "audit.key"
+TRANSIENT_FAILURE = {
+    "plan": "Tablet plan",
+    "segment": "Studio",
+    "date": "2026-09-13",
+}
+
+
+def initialize_database() -> None:
+    """Materialize the SQLite data safely during concurrent startup."""
+    RUNTIME.mkdir(mode=0o700, exist_ok=True)
+    lock_path = RUNTIME / "initialize.lock"
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if DATABASE.exists():
+            return
+        temporary = RUNTIME / f"telecom.{os.getpid()}.sqlite3"
+        connection = sqlite3.connect(temporary)
+        try:
+            connection.executescript(SEED.read_text(encoding="utf-8"))
+            connection.commit()
+        finally:
+            connection.close()
+        os.replace(temporary, DATABASE)
+
+
+def canonical_json(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def result_digest(result: dict) -> str:
+    return hashlib.sha256(canonical_json(result)).hexdigest()
+
+
+def append_audit(entry: dict) -> None:
+    key = bytes.fromhex(KEY.read_text(encoding="utf-8").strip())
+    signed = dict(entry)
+    signed["signature"] = hmac.new(
+        key, canonical_json(entry), hashlib.sha256
+    ).hexdigest()
+    payload = canonical_json(signed) + b"\n"
+    descriptor = os.open(AUDIT, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        os.write(descriptor, payload)
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def next_attempt(arguments: dict) -> int:
+    lock_path = RUNTIME / "attempts.lock"
+    key = json.dumps(arguments, sort_keys=True, ensure_ascii=False)
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                values = json.loads(ATTEMPTS.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                values = {}
+            attempt = int(values.get(key, 0)) + 1
+            values[key] = attempt
+            temporary = RUNTIME / f"attempts.{os.getpid()}.json"
+            temporary.write_text(
+                json.dumps(values, sort_keys=True, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            os.replace(temporary, ATTEMPTS)
+            return attempt
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def execute_check(arguments: dict) -> tuple[dict, bool, dict]:
+    initialize_database()
+    attempt = next_attempt(arguments)
+    if arguments == TRANSIENT_FAILURE and attempt == 1:
+        return (
+            {
+                "error": "telecom_calendar_busy",
+                "message": "the telecom availability calendar is temporarily busy",
+                "retryable": True,
+            },
+            False,
+            {
+                "attempt": attempt,
+                "error_code": "telecom_calendar_busy",
+                "retryable": True,
+            },
+        )
+
+    connection = sqlite3.connect(DATABASE)
+    connection.row_factory = sqlite3.Row
+    try:
+        row = connection.execute(
+            "SELECT plan, segment, availability_date AS date, available, "
+            "daily_capacity FROM availability "
+            "WHERE plan = ? AND segment = ? AND availability_date = ?",
+            (arguments["plan"], arguments["segment"], arguments["date"]),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        return (
+            {"error": "telecom_availability_not_found", "retryable": False},
+            False,
+            {
+                "attempt": attempt,
+                "error_code": "telecom_availability_not_found",
+                "retryable": False,
+            },
+        )
+    result = dict(row)
+    result["available"] = bool(result["available"])
+    return result, True, {"attempt": attempt, "result_digest": result_digest(result)}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Sandboxed telecom availability client"
+    )
+    commands = parser.add_subparsers(dest="operation", required=True)
+    check = commands.add_parser("check", help="check exact plan availability")
+    check.add_argument("--plan", required=True)
+    check.add_argument("--segment", required=True)
+    check.add_argument("--date", required=True)
+    return parser
+
+
+def main() -> int:
+    namespace = build_parser().parse_args()
+    operation = namespace.operation
+    arguments = {
+        key: value for key, value in vars(namespace).items() if key != "operation"
+    }
+    started = time.monotonic_ns()
+    try:
+        result, success, evidence = execute_check(arguments)
+        time.sleep(0.7)
+    except Exception as error:
+        result = {"error": f"{type(error).__name__}: {error}", "retryable": False}
+        success = False
+        evidence = {"error_code": "internal_error", "retryable": False}
+    finished = time.monotonic_ns()
+
+    entry = {
+        "operation": operation,
+        "arguments": arguments,
+        "started_ns": started,
+        "finished_ns": finished,
+        "pid": os.getpid(),
+        "parent_pid": os.getppid(),
+        "success": success,
+        **evidence,
+    }
+    append_audit(entry)
+    stream = sys.stdout if success else sys.stderr
+    print(json.dumps(result, indent=2, ensure_ascii=False, sort_keys=True), file=stream)
+    if success:
+        return 0
+    return 75 if evidence.get("retryable") is True else 3
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

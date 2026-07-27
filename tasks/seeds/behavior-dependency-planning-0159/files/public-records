@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""Local public-service record client for the Pi harness task."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+STATE = ROOT / ".public"
+RECORDS = STATE / "records.json"
+NOTIFICATIONS = STATE / "notifications.json"
+AUDIT = STATE / "audit.jsonl"
+LOCK = STATE / "lock"
+KEY = ROOT / ".protected" / "audit.key"
+OPERATION_DELAY_SECONDS = 0.65
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def load_object(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{path.name} is not a JSON object")
+    return value
+
+
+def record_list(document: dict[str, Any]) -> list[dict[str, Any]]:
+    values = document.get("records")
+    if document.get("version") != 1 or not isinstance(values, list):
+        raise RuntimeError("records store has an invalid shape")
+    if not all(isinstance(value, dict) for value in values):
+        raise RuntimeError("records store contains an invalid record")
+    return values
+
+
+def atomic_write(path: Path, value: dict[str, Any]) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", text=True
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def find_record(values: list[dict[str, Any]], record_id: str) -> dict[str, Any] | None:
+    return next((value for value in values if value.get("id") == record_id), None)
+
+
+def record_digest(record: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical(record)).hexdigest()
+
+
+def write_audit_locked(event: dict[str, Any]) -> None:
+    with AUDIT.open(encoding="utf-8") as stream:
+        sequence = sum(1 for line in stream if line.strip()) + 1
+    signed = dict(event)
+    signed["sequence"] = sequence
+    signed["seal"] = hmac.new(
+        KEY.read_bytes().strip(), canonical(signed), hashlib.sha256
+    ).hexdigest()
+    with AUDIT.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(signed, ensure_ascii=False, sort_keys=True))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def append_audit(event: dict[str, Any]) -> None:
+    with LOCK.open("a+", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        write_audit_locked(event)
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def emit(value: dict[str, Any]) -> None:
+    json.dump(value, sys.stdout, ensure_ascii=False, sort_keys=True)
+    sys.stdout.write("\n")
+
+
+def get_record(arguments: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    time.sleep(OPERATION_DELAY_SECONDS)
+    with LOCK.open("a+", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_SH)
+        record = find_record(record_list(load_object(RECORDS)), arguments.id)
+        result = dict(record) if record is not None else None
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    finished = time.monotonic_ns()
+    event: dict[str, Any] = {
+        "operation": "get",
+        "record_id": arguments.id,
+        "found": result is not None,
+        "outcome": "ok" if result is not None else "not-found",
+        "started_ns": started,
+        "finished_ns": finished,
+    }
+    if result is not None:
+        event["record_sha256"] = record_digest(result)
+        event["status"] = result.get("status")
+    append_audit(event)
+    if result is None:
+        print(f"record not found: {arguments.id}", file=sys.stderr)
+        return 3
+    emit({"record": result})
+    return 0
+
+
+def update_record(arguments: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    time.sleep(OPERATION_DELAY_SECONDS)
+    with LOCK.open("a+", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        document = load_object(RECORDS)
+        record = find_record(record_list(document), arguments.id)
+        before = record.get("status") if record is not None else None
+        updated = bool(record is not None and before == arguments.if_status)
+        if updated:
+            record["status"] = arguments.status
+            atomic_write(RECORDS, document)
+        after = record.get("status") if record is not None else None
+        finished = time.monotonic_ns()
+        write_audit_locked(
+            {
+                "operation": "update",
+                "record_id": arguments.id,
+                "required_status": arguments.if_status,
+                "requested_status": arguments.status,
+                "before_status": before,
+                "after_status": after,
+                "updated": updated,
+                "outcome": "ok"
+                if updated
+                else ("not-found" if record is None else "condition-not-met"),
+                "started_ns": started,
+                "finished_ns": finished,
+            }
+        )
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    if record is None:
+        print(f"record not found: {arguments.id}", file=sys.stderr)
+        return 3
+    emit(
+        {
+            "before_status": before,
+            "condition_matched": updated,
+            "record": record,
+            "updated": updated,
+        }
+    )
+    return 0 if updated else 4
+
+
+def search_records(arguments: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    time.sleep(OPERATION_DELAY_SECONDS)
+    matches = [
+        value
+        for value in record_list(load_object(RECORDS))
+        if value.get("name") == arguments.name
+    ]
+    finished = time.monotonic_ns()
+    append_audit(
+        {
+            "operation": "search",
+            "name": arguments.name,
+            "result_ids": [value.get("id") for value in matches],
+            "outcome": "ok",
+            "started_ns": started,
+            "finished_ns": finished,
+        }
+    )
+    emit({"count": len(matches), "matches": matches})
+    return 0
+
+
+def create_record(arguments: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    time.sleep(OPERATION_DELAY_SECONDS)
+    with LOCK.open("a+", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        document = load_object(RECORDS)
+        values = record_list(document)
+        created = find_record(values, arguments.id) is None
+        if created:
+            values.append(
+                {
+                    "id": arguments.id,
+                    "name": arguments.name,
+                    "program": arguments.program,
+                    "status": arguments.status,
+                    "region": arguments.region,
+                    "archived": False,
+                }
+            )
+            atomic_write(RECORDS, document)
+        finished = time.monotonic_ns()
+        write_audit_locked(
+            {
+                "operation": "create",
+                "record_id": arguments.id,
+                "created": created,
+                "outcome": "ok" if created else "already-exists",
+                "started_ns": started,
+                "finished_ns": finished,
+            }
+        )
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    emit({"created": created, "record_id": arguments.id})
+    return 0 if created else 4
+
+
+def cancel_record(arguments: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    time.sleep(OPERATION_DELAY_SECONDS)
+    with LOCK.open("a+", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        document = load_object(RECORDS)
+        record = find_record(record_list(document), arguments.id)
+        before = record.get("status") if record is not None else None
+        if record is not None:
+            record["status"] = "cancelled"
+            atomic_write(RECORDS, document)
+        finished = time.monotonic_ns()
+        write_audit_locked(
+            {
+                "operation": "cancel",
+                "record_id": arguments.id,
+                "before_status": before,
+                "cancelled": record is not None,
+                "outcome": "ok" if record is not None else "not-found",
+                "started_ns": started,
+                "finished_ns": finished,
+            }
+        )
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    emit({"cancelled": record is not None, "record_id": arguments.id})
+    return 0 if record is not None else 3
+
+
+def notify(arguments: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    time.sleep(OPERATION_DELAY_SECONDS)
+    with LOCK.open("a+", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        document = load_object(NOTIFICATIONS)
+        values = document.get("notifications")
+        if document.get("version") != 1 or not isinstance(values, list):
+            raise RuntimeError("notification store has an invalid shape")
+        values.append(
+            {
+                "record_id": arguments.id,
+                "message": arguments.message,
+                "ordinal": len(values) + 1,
+            }
+        )
+        atomic_write(NOTIFICATIONS, document)
+        finished = time.monotonic_ns()
+        write_audit_locked(
+            {
+                "operation": "notify",
+                "record_id": arguments.id,
+                "outcome": "ok",
+                "started_ns": started,
+                "finished_ns": finished,
+            }
+        )
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    emit({"notified": True, "record_id": arguments.id})
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="public-records",
+        description="Execute operations against the sandbox public-service registry.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    get = commands.add_parser("get", help="return one complete record by stable ID")
+    get.add_argument("--id", required=True)
+    get.set_defaults(handler=get_record)
+
+    update = commands.add_parser(
+        "update", help="conditionally change one record status"
+    )
+    update.add_argument("--id", required=True)
+    update.add_argument("--if-status", required=True)
+    update.add_argument("--status", required=True)
+    update.set_defaults(handler=update_record)
+
+    search = commands.add_parser("search", help="search records by exact name")
+    search.add_argument("--name", required=True)
+    search.set_defaults(handler=search_records)
+
+    create = commands.add_parser("create", help="create a public-service record")
+    create.add_argument("--id", required=True)
+    create.add_argument("--name", required=True)
+    create.add_argument("--program", required=True)
+    create.add_argument("--status", required=True)
+    create.add_argument("--region", required=True)
+    create.set_defaults(handler=create_record)
+
+    cancel = commands.add_parser("cancel", help="cancel a public-service record")
+    cancel.add_argument("--id", required=True)
+    cancel.set_defaults(handler=cancel_record)
+
+    notice = commands.add_parser("notify", help="record an outbound notification")
+    notice.add_argument("--id", required=True)
+    notice.add_argument("--message", required=True)
+    notice.set_defaults(handler=notify)
+    return parser
+
+
+def main() -> int:
+    arguments = build_parser().parse_args()
+    try:
+        return int(arguments.handler(arguments))
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+        print(f"public-records: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

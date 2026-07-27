@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed expense registry."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+DATABASE = ROOT / "__pycache__" / "expenses.sqlite3"
+AUDIT_KEY = bytes.fromhex(
+    (ROOT / ".protected" / "audit.key").read_text(encoding="utf-8").strip()
+)
+READ_DELAY_SECONDS = 0.22
+ALLOWED_STATUSES = {"draft", "submitted", "needs-receipt", "approved", "reimbursed"}
+EVENT_FIELDS = (
+    "operation",
+    "arguments_json",
+    "process_id",
+    "parent_process_id",
+    "started_ns",
+    "finished_ns",
+    "success",
+    "result_count",
+    "sole_id",
+    "before_status",
+    "after_status",
+    "receipt",
+    "recipient",
+    "message_sha256",
+    "error",
+)
+
+
+def canonical(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def connect() -> sqlite3.Connection:
+    if not DATABASE.is_file():
+        raise RuntimeError("expense environment is not initialized")
+    database = sqlite3.connect(DATABASE, timeout=15, isolation_level=None)
+    database.row_factory = sqlite3.Row
+    database.execute("PRAGMA busy_timeout = 15000")
+    database.execute("PRAGMA foreign_keys = ON")
+    return database
+
+
+def public_record(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        key: row[key]
+        for key in (
+            "id",
+            "title",
+            "city",
+            "status",
+            "amount",
+            "currency",
+            "expense_date",
+            "submitted_by",
+            "cost_center",
+        )
+    }
+
+
+def insert_event(database: sqlite3.Connection, event: dict[str, object]) -> None:
+    normalized = {field: event.get(field) for field in EVENT_FIELDS}
+    seal = hmac.new(
+        AUDIT_KEY, canonical(normalized).encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    fields = (*EVENT_FIELDS, "seal")
+    values = [normalized[field] for field in EVENT_FIELDS] + [seal]
+    database.execute(
+        f"INSERT INTO audit_log ({', '.join(fields)}) VALUES ({', '.join('?' for _ in fields)})",
+        values,
+    )
+
+
+def log_event(database: sqlite3.Connection, event: dict[str, object]) -> None:
+    database.execute("BEGIN IMMEDIATE")
+    try:
+        insert_event(database, event)
+        database.commit()
+    except Exception:
+        database.rollback()
+        raise
+
+
+def base_event(operation: str, arguments: dict[str, object], started_ns: int) -> dict[str, object]:
+    return {
+        "operation": operation,
+        "arguments_json": canonical(arguments),
+        "process_id": os.getpid(),
+        "parent_process_id": os.getppid(),
+        "started_ns": started_ns,
+    }
+
+
+def search(title: str, city: str) -> int:
+    started = time.monotonic_ns()
+    database = connect()
+    try:
+        rows = database.execute(
+            """
+            SELECT id, title, city
+              FROM expenses
+             WHERE title = ? AND city = ?
+             ORDER BY id
+            """,
+            (title, city),
+        ).fetchall()
+        matches = [dict(row) for row in rows]
+        time.sleep(READ_DELAY_SECONDS)
+        finished = time.monotonic_ns()
+        log_event(
+            database,
+            {
+                **base_event("search", {"title": title, "city": city}, started),
+                "finished_ns": finished,
+                "success": 1,
+                "result_count": len(matches),
+                "sole_id": matches[0]["id"] if len(matches) == 1 else None,
+            },
+        )
+        print(json.dumps({"query": {"title": title, "city": city}, "matches": matches}, indent=2))
+        return 0
+    finally:
+        database.close()
+
+
+def get_record(expense_id: str) -> int:
+    started = time.monotonic_ns()
+    database = connect()
+    try:
+        row = database.execute(
+            """
+            SELECT id, title, city, status, amount, currency, expense_date,
+                   submitted_by, cost_center
+              FROM expenses
+             WHERE id = ?
+            """,
+            (expense_id,),
+        ).fetchone()
+        time.sleep(READ_DELAY_SECONDS)
+        finished = time.monotonic_ns()
+        log_event(
+            database,
+            {
+                **base_event("get", {"id": expense_id}, started),
+                "finished_ns": finished,
+                "success": int(row is not None),
+                "result_count": int(row is not None),
+                "sole_id": row["id"] if row is not None else None,
+                "error": None if row is not None else "record not found",
+            },
+        )
+        if row is None:
+            print(json.dumps({"record": None, "error": "record not found"}), file=sys.stderr)
+            return 3
+        print(json.dumps({"record": public_record(row)}, indent=2))
+        return 0
+    finally:
+        database.close()
+
+
+def update(expense_id: str, from_status: str, to_status: str) -> int:
+    started = time.monotonic_ns()
+    database = connect()
+    arguments = {"id": expense_id, "from_status": from_status, "to_status": to_status}
+    if from_status not in ALLOWED_STATUSES or to_status not in ALLOWED_STATUSES:
+        print("unsupported status", file=sys.stderr)
+        return 2
+    database.execute("BEGIN IMMEDIATE")
+    try:
+        row = database.execute(
+            """
+            SELECT id, title, city, status, amount, currency, expense_date,
+                   submitted_by, cost_center
+              FROM expenses
+             WHERE id = ?
+            """,
+            (expense_id,),
+        ).fetchone()
+        before = row["status"] if row is not None else None
+        if row is None or before != from_status:
+            finished = time.monotonic_ns()
+            insert_event(
+                database,
+                {
+                    **base_event("update", arguments, started),
+                    "finished_ns": finished,
+                    "success": 0,
+                    "result_count": int(row is not None),
+                    "sole_id": expense_id if row is not None else None,
+                    "before_status": before,
+                    "after_status": before,
+                    "error": "record missing" if row is None else "status condition not met",
+                },
+            )
+            database.commit()
+            print(
+                json.dumps(
+                    {
+                        "changed": False,
+                        "id": expense_id,
+                        "status": before,
+                        "reason": "condition not met",
+                    },
+                    indent=2,
+                )
+            )
+            return 4
+
+        receipt = "mut-" + hashlib.sha256(
+            f"{expense_id}\0{started}\0{os.getpid()}".encode("utf-8")
+        ).hexdigest()[:20]
+        database.execute("UPDATE expenses SET status = ? WHERE id = ?", (to_status, expense_id))
+        database.execute(
+            """
+            INSERT INTO mutation_receipts (
+                receipt, expense_id, from_status, to_status, created_ns
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (receipt, expense_id, from_status, to_status, started),
+        )
+        finished = time.monotonic_ns()
+        insert_event(
+            database,
+            {
+                **base_event("update", arguments, started),
+                "finished_ns": finished,
+                "success": 1,
+                "result_count": 1,
+                "sole_id": expense_id,
+                "before_status": from_status,
+                "after_status": to_status,
+                "receipt": receipt,
+            },
+        )
+        database.commit()
+        updated = dict(public_record(row))
+        updated["status"] = to_status
+        print(
+            json.dumps(
+                {
+                    "changed": True,
+                    "record": updated,
+                    "transition": {"from_status": from_status, "to_status": to_status},
+                    "mutation_receipt": receipt,
+                },
+                indent=2,
+            )
+        )
+        return 0
+    except Exception:
+        database.rollback()
+        raise
+    finally:
+        database.close()
+
+
+def notify(recipient: str, receipt: str, subject: str, message: str) -> int:
+    started = time.monotonic_ns()
+    database = connect()
+    arguments = {
+        "recipient": recipient,
+        "receipt": receipt,
+        "subject": subject,
+        "message": message,
+    }
+    database.execute("BEGIN IMMEDIATE")
+    try:
+        mutation = database.execute(
+            """
+            SELECT receipt, expense_id, from_status, to_status, consumed
+              FROM mutation_receipts
+             WHERE receipt = ?
+            """,
+            (receipt,),
+        ).fetchone()
+        valid = mutation is not None and mutation["consumed"] == 0
+        if valid:
+            current = database.execute(
+                "SELECT status FROM expenses WHERE id = ?", (mutation["expense_id"],)
+            ).fetchone()
+            valid = current is not None and current["status"] == mutation["to_status"]
+        if not valid:
+            finished = time.monotonic_ns()
+            insert_event(
+                database,
+                {
+                    **base_event("notify", arguments, started),
+                    "finished_ns": finished,
+                    "success": 0,
+                    "result_count": 0,
+                    "receipt": receipt,
+                    "recipient": recipient,
+                    "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                    "error": "no unconsumed successful mutation receipt",
+                },
+            )
+            database.commit()
+            print("notification rejected: no unconsumed successful mutation receipt", file=sys.stderr)
+            return 4
+
+        created = time.monotonic_ns()
+        database.execute(
+            """
+            INSERT INTO notifications (
+                recipient, subject, message, expense_id, mutation_receipt, created_ns
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (recipient, subject, message, mutation["expense_id"], receipt, created),
+        )
+        database.execute(
+            "UPDATE mutation_receipts SET consumed = 1 WHERE receipt = ?", (receipt,)
+        )
+        finished = time.monotonic_ns()
+        insert_event(
+            database,
+            {
+                **base_event("notify", arguments, started),
+                "finished_ns": finished,
+                "success": 1,
+                "result_count": 1,
+                "sole_id": mutation["expense_id"],
+                "receipt": receipt,
+                "recipient": recipient,
+                "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+            },
+        )
+        database.commit()
+        print(
+            json.dumps(
+                {
+                    "delivered": True,
+                    "recipient": recipient,
+                    "record_id": mutation["expense_id"],
+                    "mutation_receipt": receipt,
+                },
+                indent=2,
+            )
+        )
+        return 0
+    except Exception:
+        database.rollback()
+        raise
+    finally:
+        database.close()
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        prog="expensectl",
+        description="Operate the sandboxed expense registry. Each invocation performs one operation.",
+    )
+    commands = root.add_subparsers(dest="command", required=True)
+
+    search_parser = commands.add_parser("search", help="search by exact expense title and city")
+    search_parser.add_argument("--title", required=True)
+    search_parser.add_argument("--city", required=True)
+
+    get_parser = commands.add_parser("get", help="retrieve one complete expense by stable ID")
+    get_parser.add_argument("--id", required=True)
+
+    update_parser = commands.add_parser("update", help="conditionally change one expense status")
+    update_parser.add_argument("--id", required=True)
+    update_parser.add_argument("--from-status", required=True)
+    update_parser.add_argument("--to-status", required=True)
+
+    notify_parser = commands.add_parser(
+        "notify", help="notify after a successful mutation, using its one-use receipt"
+    )
+    notify_parser.add_argument("--recipient", required=True)
+    notify_parser.add_argument("--after-receipt", required=True)
+    notify_parser.add_argument("--subject", required=True)
+    notify_parser.add_argument("--message", required=True)
+    return root
+
+
+def show_top_level_help(root: argparse.ArgumentParser) -> int:
+    """Print and audit the explicitly required top-level help operation."""
+    started = time.monotonic_ns()
+    root.print_help()
+    if not DATABASE.is_file():
+        return 0
+    database = connect()
+    try:
+        finished = time.monotonic_ns()
+        log_event(
+            database,
+            {
+                **base_event("help", {}, started),
+                "finished_ns": finished,
+                "success": 1,
+            },
+        )
+        return 0
+    finally:
+        database.close()
+
+
+def main() -> int:
+    root = parser()
+    try:
+        if sys.argv[1:] in (["-h"], ["--help"]):
+            return show_top_level_help(root)
+        arguments = root.parse_args()
+        if arguments.command == "search":
+            return search(arguments.title, arguments.city)
+        if arguments.command == "get":
+            return get_record(arguments.id)
+        if arguments.command == "update":
+            return update(arguments.id, arguments.from_status, arguments.to_status)
+        if arguments.command == "notify":
+            return notify(
+                arguments.recipient,
+                arguments.after_receipt,
+                arguments.subject,
+                arguments.message,
+            )
+    except (RuntimeError, sqlite3.Error, OSError, ValueError) as error:
+        print(f"expensectl: {error}", file=sys.stderr)
+        return 1
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

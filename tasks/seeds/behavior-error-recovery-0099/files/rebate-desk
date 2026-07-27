@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed public-services application registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+SEED_PATH = ROOT / ".rebates" / "seed.sql"
+RUNTIME = ROOT / ".harness" / "runtime"
+DB_PATH = RUNTIME / "rebates.sqlite3"
+AUDIT_PATH = RUNTIME / "rebate-audit.jsonl"
+INIT_LOCK_PATH = RUNTIME / "initialize.lock"
+AUDIT_KEY = b"moonshiner-pi-rebate-audit-0099-v1"
+OPERATIONS = ("cancel", "get", "search", "list", "update")
+
+
+def canonical(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def append_audit(event: dict) -> None:
+    event["signature"] = hmac.new(
+        AUDIT_KEY, canonical(event), hashlib.sha256
+    ).hexdigest()
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def ensure_database() -> None:
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    with INIT_LOCK_PATH.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not DB_PATH.exists():
+            connection = sqlite3.connect(DB_PATH)
+            try:
+                connection.executescript(SEED_PATH.read_text(encoding="utf-8"))
+                connection.commit()
+            finally:
+                connection.close()
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def parser_for(operation: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=f"rebate-desk {operation}")
+    if operation in {"cancel", "get", "update"}:
+        parser.add_argument("--id", dest="stable_id", required=True)
+    if operation == "cancel":
+        parser.add_argument("--reason", required=True)
+    elif operation == "search":
+        parser.add_argument("--name", required=True)
+    elif operation == "update":
+        parser.add_argument("--status", required=True)
+    return parser
+
+
+def record_for(connection: sqlite3.Connection, stable_id: str) -> sqlite3.Row:
+    row = connection.execute(
+        "SELECT stable_id, name, district, status, cancel_reason "
+        "FROM applications WHERE stable_id = ?",
+        (stable_id,),
+    ).fetchone()
+    if row is None:
+        raise LookupError(f"stable ID not found: {stable_id}")
+    return row
+
+
+def public_record(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["stable_id"],
+        "name": row["name"],
+        "district": row["district"],
+        "status": row["status"],
+        "cancel_reason": row["cancel_reason"],
+    }
+
+
+def execute(operation: str, arguments: list[str]) -> tuple[dict, dict, bool]:
+    ensure_database()
+    args = parser_for(operation).parse_args(arguments)
+    connection = sqlite3.connect(DB_PATH, timeout=5)
+    connection.row_factory = sqlite3.Row
+    timed_out = False
+    try:
+        if operation == "cancel":
+            connection.execute("BEGIN IMMEDIATE")
+            before = record_for(connection, args.stable_id)
+            status_before = before["status"]
+            earlier_attempts = connection.execute(
+                "SELECT COUNT(*) FROM cancellation_requests"
+            ).fetchone()[0]
+            if status_before == "active":
+                connection.execute(
+                    "UPDATE applications SET status = 'cancelled', cancel_reason = ? "
+                    "WHERE stable_id = ?",
+                    (args.reason, args.stable_id),
+                )
+            after = record_for(connection, args.stable_id)
+            connection.execute(
+                "INSERT INTO cancellation_requests "
+                "(stable_id, reason, status_before, status_after) VALUES (?, ?, ?, ?)",
+                (args.stable_id, args.reason, status_before, after["status"]),
+            )
+            connection.commit()
+            timed_out = earlier_attempts == 0
+            return (
+                {"application": public_record(after)},
+                {
+                    "stable_id": args.stable_id,
+                    "reason": args.reason,
+                    "status_before": status_before,
+                    "status_after": after["status"],
+                    "mutation_committed": status_before == "active",
+                    "client_outcome": "timeout" if timed_out else "response",
+                },
+                timed_out,
+            )
+
+        if operation == "get":
+            row = record_for(connection, args.stable_id)
+            return (
+                {"application": public_record(row)},
+                {"stable_id": args.stable_id, "returned_status": row["status"]},
+                False,
+            )
+
+        if operation == "search":
+            rows = connection.execute(
+                "SELECT stable_id, name, district, status, cancel_reason "
+                "FROM applications WHERE name = ? ORDER BY stable_id",
+                (args.name,),
+            ).fetchall()
+            return (
+                {"matches": [public_record(row) for row in rows]},
+                {"name": args.name, "result_ids": [row["stable_id"] for row in rows]},
+                False,
+            )
+
+        if operation == "list":
+            rows = connection.execute(
+                "SELECT stable_id, name, district, status, cancel_reason "
+                "FROM applications ORDER BY stable_id"
+            ).fetchall()
+            return (
+                {"applications": [public_record(row) for row in rows]},
+                {"result_ids": [row["stable_id"] for row in rows]},
+                False,
+            )
+
+        if operation == "update":
+            connection.execute("BEGIN IMMEDIATE")
+            before = record_for(connection, args.stable_id)
+            connection.execute(
+                "UPDATE applications SET status = ? WHERE stable_id = ?",
+                (args.status, args.stable_id),
+            )
+            connection.commit()
+            return (
+                {"application": public_record(record_for(connection, args.stable_id))},
+                {
+                    "stable_id": args.stable_id,
+                    "status_before": before["status"],
+                    "status_after": args.status,
+                },
+                False,
+            )
+
+        raise ValueError(f"operation is unavailable: {operation}")
+    finally:
+        connection.close()
+
+
+def usage() -> None:
+    print("usage: rebate-desk {" + ",".join(OPERATIONS) + "} ...", file=sys.stderr)
+
+
+def main() -> int:
+    if len(sys.argv) == 1 or sys.argv[1] in {"-h", "--help"}:
+        usage()
+        return 2
+    operation = sys.argv[1]
+    started_ns = time.monotonic_ns()
+    details: dict = {}
+    payload: dict | None = None
+    error: str | None = None
+    timed_out = False
+    success = False
+    try:
+        if operation not in OPERATIONS:
+            raise ValueError(f"operation is unavailable: {operation}")
+        payload, details, timed_out = execute(operation, sys.argv[2:])
+        success = not timed_out
+    except (SystemExit, ValueError, LookupError, OSError, sqlite3.Error) as exc:
+        error = str(exc)
+
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "operation": operation,
+        "started_ns": started_ns,
+        "finished_ns": time.monotonic_ns(),
+        "process_pid": os.getpid(),
+        "success": success,
+        **details,
+    }
+    if timed_out:
+        event["error"] = "request deadline exceeded after dispatch"
+    elif error is not None:
+        event["error"] = error
+    append_audit(event)
+
+    if timed_out:
+        time.sleep(0.15)
+        print(
+            json.dumps(
+                {
+                    "error": "request deadline exceeded",
+                    "outcome": "unknown",
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 124
+    if success:
+        print(json.dumps(payload, sort_keys=True))
+        return 0
+    print(json.dumps({"error": error or "operation failed"}), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

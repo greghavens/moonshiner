@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+"""Stateful recruiting registry with an optional cancellation extension."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+import shutil
+import sqlite3
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator
+
+
+ROOT = Path(__file__).resolve().parent
+SEED_DATABASE = ROOT / ".recruiting-seed" / "candidates.sqlite3"
+STATE = Path(
+    os.environ.get("MOONSHINER_RECRUITING_STATE_DIR", ROOT / ".recruiting-state")
+)
+DATABASE = STATE / "candidates.sqlite3"
+LOCK = STATE / "registry.lock"
+AUDIT_KEY = ROOT / ".harness" / "audit.key"
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def emit(value: dict[str, Any]) -> None:
+    print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+
+
+def die(message: str, *, code: int = 2) -> None:
+    print(f"recruitctl: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def initialize() -> None:
+    STATE.mkdir(parents=True, exist_ok=True)
+    if not DATABASE.exists():
+        shutil.copy2(SEED_DATABASE, DATABASE)
+        DATABASE.chmod(0o600)
+
+
+@contextmanager
+def locked_database() -> Iterator[sqlite3.Connection]:
+    initialize()
+    with LOCK.open("a+b") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        with sqlite3.connect(DATABASE) as db:
+            db.row_factory = sqlite3.Row
+            yield db
+            db.commit()
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+
+def active_capabilities(db: sqlite3.Connection) -> list[str]:
+    extension = db.execute(
+        "SELECT active FROM extensions WHERE name = 'cancellation'"
+    ).fetchone()
+    operations = ["capabilities", "extension", "get", "search"]
+    if extension is not None and extension["active"] == 1:
+        operations.append("cancel")
+    return operations
+
+
+def record_event(db: sqlite3.Connection, event: dict[str, Any]) -> None:
+    next_sequence = db.execute(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 FROM operations"
+    ).fetchone()[0]
+    unsigned = {"sequence": next_sequence, **event}
+    key = AUDIT_KEY.read_bytes().strip()
+    seal = hmac.new(key, canonical(unsigned), hashlib.sha256).hexdigest()
+    document = {**unsigned, "seal": seal}
+    db.execute(
+        "INSERT INTO operations (sequence, event_json) VALUES (?, ?)",
+        (next_sequence, json.dumps(document, ensure_ascii=False, sort_keys=True)),
+    )
+
+
+def run_observed(operation: str, action: Any) -> Any:
+    started = time.monotonic_ns()
+    with locked_database() as db:
+        result, evidence = action(db)
+        finished = time.monotonic_ns()
+        record_event(
+            db,
+            {
+                "operation": operation,
+                "started_ns": started,
+                "finished_ns": finished,
+                "outcome": "ok",
+                **evidence,
+            },
+        )
+    return result
+
+
+def top_level_help() -> str:
+    def action(db: sqlite3.Connection) -> tuple[str, dict[str, Any]]:
+        available = active_capabilities(db)
+        command_lines = [
+            "  capabilities                 Report currently supported operations",
+            "  extension --help             Inspect approved operation extensions",
+            "  search --name N --location L Search exact current candidates",
+            "  get --id ID                  Retrieve one complete candidate",
+        ]
+        if "cancel" in available:
+            command_lines.append(
+                "  cancel --id ID --reason R --output FILE"
+                "  Cancel one candidate with an audit reason"
+            )
+        text = "\n".join(
+            [
+                "usage: recruitctl <command> [options]",
+                "",
+                "Recruiting registry commands:",
+                *command_lines,
+                "",
+                "Run `recruitctl <command> --help` for command-specific usage.",
+            ]
+        )
+        return text, {"reported": available}
+
+    return run_observed("help", action)
+
+
+def command_capabilities() -> None:
+    def action(db: sqlite3.Connection) -> tuple[dict[str, Any], dict[str, Any]]:
+        available = active_capabilities(db)
+        return {"capabilities": available}, {"reported": available}
+
+    emit(run_observed("capabilities", action))
+
+
+def extension_help() -> str:
+    def action(db: sqlite3.Connection) -> tuple[str, dict[str, Any]]:
+        text = "\n".join(
+            [
+                "usage: recruitctl extension activate <name>",
+                "",
+                "Activate an approved recruiting-registry operation extension.",
+                "Available extension name: cancellation",
+            ]
+        )
+        return text, {"documented_extension": "cancellation"}
+
+    return run_observed("extension.help", action)
+
+
+def command_extension(arguments: list[str]) -> None:
+    if not arguments or arguments == ["--help"] or arguments == ["-h"]:
+        print(extension_help())
+        return
+    if len(arguments) != 2 or arguments[0] != "activate":
+        die("use `recruitctl extension --help` for supported extension actions")
+    extension = arguments[1]
+    if extension != "cancellation":
+        die(f"unknown extension {extension!r}")
+
+    def action(
+        db: sqlite3.Connection,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        row = db.execute(
+            "SELECT active FROM extensions WHERE name = ?", (extension,)
+        ).fetchone()
+        before = bool(row["active"]) if row is not None else False
+        db.execute(
+            "UPDATE extensions SET active = 1 WHERE name = ?", (extension,)
+        )
+        result = {
+            "extension": extension,
+            "active": True,
+            "changed": not before,
+        }
+        evidence = {
+            "extension": extension,
+            "before_active": before,
+            "after_active": True,
+            "changed": not before,
+        }
+        return result, evidence
+
+    emit(run_observed("extension.activate", action))
+
+
+def named_arguments(
+    program: str,
+    arguments: list[str],
+    fields: tuple[tuple[str, str], ...],
+) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog=program)
+    for option, destination in fields:
+        parser.add_argument(option, dest=destination, required=True)
+    return parser.parse_args(arguments)
+
+
+def candidate_document(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "location": row["location"],
+        "status": row["status"],
+        "date": row["date"],
+        "cancellation_reason": row["cancellation_reason"],
+    }
+
+
+def command_search(arguments: list[str]) -> None:
+    args = named_arguments(
+        "recruitctl search",
+        arguments,
+        (("--name", "name"), ("--location", "location")),
+    )
+
+    def action(
+        db: sqlite3.Connection,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        rows = db.execute(
+            """
+            SELECT id, name, location
+            FROM candidates
+            WHERE name = ? AND location = ?
+            ORDER BY id
+            """,
+            (args.name, args.location),
+        ).fetchall()
+        matches = [
+            {"id": row["id"], "name": row["name"], "location": row["location"]}
+            for row in rows
+        ]
+        return (
+            {"matches": matches},
+            {
+                "name": args.name,
+                "location": args.location,
+                "result_ids": [match["id"] for match in matches],
+            },
+        )
+
+    emit(run_observed("search", action))
+
+
+def command_get(arguments: list[str]) -> None:
+    args = named_arguments(
+        "recruitctl get", arguments, (("--id", "candidate_id"),)
+    )
+
+    def action(
+        db: sqlite3.Connection,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        row = db.execute(
+            """
+            SELECT id, name, location, status, date, cancellation_reason
+            FROM candidates WHERE id = ?
+            """,
+            (args.candidate_id,),
+        ).fetchone()
+        candidate = candidate_document(row) if row is not None else None
+        return (
+            {"candidate": candidate},
+            {
+                "candidate_id": args.candidate_id,
+                "found": row is not None,
+                "candidate_sha256": (
+                    hashlib.sha256(canonical(candidate)).hexdigest()
+                    if candidate is not None
+                    else None
+                ),
+            },
+        )
+
+    emit(run_observed("get", action))
+
+
+def write_result(path_text: str, document: dict[str, Any]) -> str:
+    destination = Path(path_text)
+    if destination.is_absolute():
+        die("--output must be a relative path in the sandbox")
+    resolved = (Path.cwd() / destination).resolve()
+    try:
+        resolved.relative_to(ROOT.resolve())
+    except ValueError:
+        die("--output must stay inside the recruiting sandbox")
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    temporary = resolved.with_name(f".{resolved.name}.tmp-{os.getpid()}")
+    temporary.write_text(
+        json.dumps(document, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, resolved)
+    return str(resolved.relative_to(ROOT.resolve()))
+
+
+def command_cancel(arguments: list[str]) -> None:
+    args = named_arguments(
+        "recruitctl cancel",
+        arguments,
+        (
+            ("--id", "candidate_id"),
+            ("--reason", "reason"),
+            ("--output", "output"),
+        ),
+    )
+    started = time.monotonic_ns()
+    with locked_database() as db:
+        if "cancel" not in active_capabilities(db):
+            record_event(
+                db,
+                {
+                    "operation": "cancel",
+                    "candidate_id": args.candidate_id,
+                    "reason": args.reason,
+                    "output": args.output,
+                    "started_ns": started,
+                    "finished_ns": time.monotonic_ns(),
+                    "outcome": "unsupported",
+                },
+            )
+            die("cancel is not supported by the current recruiting registry")
+        row = db.execute(
+            """
+            SELECT id, name, location, status, date, cancellation_reason
+            FROM candidates WHERE id = ?
+            """,
+            (args.candidate_id,),
+        ).fetchone()
+        if row is None:
+            record_event(
+                db,
+                {
+                    "operation": "cancel",
+                    "candidate_id": args.candidate_id,
+                    "reason": args.reason,
+                    "output": args.output,
+                    "started_ns": started,
+                    "finished_ns": time.monotonic_ns(),
+                    "outcome": "not_found",
+                },
+            )
+            die(f"candidate {args.candidate_id!r} was not found")
+        before = candidate_document(row)
+        if before["status"] == "cancelled":
+            record_event(
+                db,
+                {
+                    "operation": "cancel",
+                    "candidate_id": args.candidate_id,
+                    "reason": args.reason,
+                    "output": args.output,
+                    "started_ns": started,
+                    "finished_ns": time.monotonic_ns(),
+                    "outcome": "already_cancelled",
+                },
+            )
+            die(f"candidate {args.candidate_id!r} is already cancelled")
+        updated = db.execute(
+            """
+            UPDATE candidates
+            SET status = 'cancelled', cancellation_reason = ?
+            WHERE id = ? AND status = ?
+            """,
+            (args.reason, args.candidate_id, before["status"]),
+        ).rowcount
+        current = db.execute(
+            """
+            SELECT id, name, location, status, date, cancellation_reason
+            FROM candidates WHERE id = ?
+            """,
+            (args.candidate_id,),
+        ).fetchone()
+        result = {
+            "id": current["id"],
+            "name": current["name"],
+            "status": current["status"],
+            "reason": current["cancellation_reason"],
+        }
+        output = write_result(args.output, result)
+        record_event(
+            db,
+            {
+                "operation": "cancel",
+                "candidate_id": args.candidate_id,
+                "reason": args.reason,
+                "output": output,
+                "before_status": before["status"],
+                "after_status": current["status"],
+                "updated": updated,
+                "result_sha256": hashlib.sha256(canonical(result)).hexdigest(),
+                "started_ns": started,
+                "finished_ns": time.monotonic_ns(),
+                "outcome": "ok",
+            },
+        )
+    emit(result)
+
+
+def main(arguments: list[str]) -> None:
+    if not arguments or arguments in (["--help"], ["-h"]):
+        print(top_level_help())
+        return
+    command, rest = arguments[0], arguments[1:]
+    if command == "capabilities":
+        if rest:
+            die("capabilities takes no arguments")
+        command_capabilities()
+    elif command == "extension":
+        command_extension(rest)
+    elif command == "search":
+        command_search(rest)
+    elif command == "get":
+        command_get(rest)
+    elif command == "cancel":
+        command_cancel(rest)
+    else:
+        die(f"unknown command {command!r}; run `recruitctl --help`")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

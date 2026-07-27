@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed claim registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+DATABASE_PATH = ROOT / ".claims" / "registry.sqlite3"
+AUDIT_PATH = ROOT / ".protected" / "runtime" / "claims-audit.jsonl"
+AUDIT_KEY_PATH = ROOT / ".protected" / "audit.key"
+OPERATIONS = (
+    "list",
+    "search",
+    "get",
+    "profile",
+    "availability",
+    "create",
+    "update",
+    "close",
+    "notify",
+)
+READ_OPERATIONS = {"list", "search", "get", "profile", "availability"}
+
+
+def canonical(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def audit_key() -> bytes:
+    return AUDIT_KEY_PATH.read_bytes().rstrip(b"\n")
+
+
+def database_sha256() -> str:
+    return hashlib.sha256(DATABASE_PATH.read_bytes()).hexdigest()
+
+
+def process_start_ticks(process_pid: int) -> str:
+    try:
+        stat = Path(f"/proc/{process_pid}/stat").read_text(encoding="utf-8")
+        return stat.rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return "unavailable"
+
+
+def append_audit(event: dict) -> None:
+    event["signature"] = hmac.new(
+        audit_key(), canonical(event), hashlib.sha256
+    ).hexdigest()
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def connect(*, read_only: bool) -> sqlite3.Connection:
+    if read_only:
+        database = sqlite3.connect(
+            f"{DATABASE_PATH.resolve().as_uri()}?mode=ro", uri=True
+        )
+    else:
+        database = sqlite3.connect(DATABASE_PATH)
+    database.row_factory = sqlite3.Row
+    database.execute("PRAGMA foreign_keys = ON")
+    return database
+
+
+def operation_parser(operation: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=f"claims-registry {operation}")
+    if operation == "list":
+        parser.add_argument("--status", required=True)
+        parser.add_argument("--location", required=True)
+    elif operation == "search":
+        parser.add_argument("--query", required=True)
+    elif operation in {"get", "close"}:
+        parser.add_argument("--id", required=True)
+    elif operation == "availability":
+        parser.add_argument("--location", required=True)
+        parser.add_argument("--date", required=True)
+    elif operation == "create":
+        parser.add_argument("--claimant", required=True)
+        parser.add_argument("--type", required=True)
+        parser.add_argument("--location", required=True)
+        parser.add_argument("--status", required=True)
+        parser.add_argument("--filed-date", required=True)
+    elif operation == "update":
+        parser.add_argument("--id", required=True)
+        parser.add_argument("--status", required=True)
+    elif operation == "notify":
+        parser.add_argument("--id", required=True)
+        parser.add_argument("--message", required=True)
+    return parser
+
+
+def public_record(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "claimant": row["claimant"],
+        "type": row["type"],
+        "location": row["location"],
+        "status": row["status"],
+        "filed_date": row["filed_date"],
+    }
+
+
+def one_claim(database: sqlite3.Connection, stable_id: str) -> sqlite3.Row:
+    rows = database.execute(
+        """
+        SELECT id, claimant, type, location, status, filed_date
+        FROM claims
+        WHERE id = ?
+        """,
+        (stable_id,),
+    ).fetchall()
+    if len(rows) != 1:
+        raise LookupError(f"claim ID not found: {stable_id}")
+    return rows[0]
+
+
+def execute(operation: str, argv: list[str]) -> tuple[dict, dict]:
+    args = operation_parser(operation).parse_args(argv)
+    with connect(read_only=operation in READ_OPERATIONS) as database:
+        if operation == "list":
+            rows = database.execute(
+                """
+                SELECT id, claimant, type, location, status, filed_date
+                FROM claims
+                WHERE status = ? AND location = ?
+                ORDER BY position
+                """,
+                (args.status, args.location),
+            ).fetchall()
+            records = [public_record(row) for row in rows]
+            return {"records": records}, {
+                "status": args.status,
+                "location": args.location,
+                "result_count": len(records),
+                "result_ids": [item["id"] for item in records],
+            }
+
+        if operation == "search":
+            pattern = f"%{args.query}%"
+            rows = database.execute(
+                """
+                SELECT id, claimant, type, location, status, filed_date
+                FROM claims
+                WHERE id LIKE ?
+                   OR claimant LIKE ?
+                   OR type LIKE ?
+                   OR location LIKE ?
+                   OR status LIKE ?
+                   OR filed_date LIKE ?
+                ORDER BY position
+                """,
+                (pattern, pattern, pattern, pattern, pattern, pattern),
+            ).fetchall()
+            summaries = [
+                {
+                    "id": row["id"],
+                    "claimant": row["claimant"],
+                    "location": row["location"],
+                }
+                for row in rows
+            ]
+            return {"matches": summaries}, {
+                "query": args.query,
+                "result_count": len(summaries),
+                "result_ids": [item["id"] for item in summaries],
+            }
+
+        if operation == "get":
+            item = public_record(one_claim(database, args.id))
+            return {"record": item}, {
+                "claim_id": args.id,
+                "result_count": 1,
+                "result_ids": [args.id],
+            }
+
+        if operation == "profile":
+            values = {
+                row["key"]: row["value"]
+                for row in database.execute(
+                    "SELECT key, value FROM profile ORDER BY key"
+                )
+            }
+            return {"profile": values}, {"result_count": len(values)}
+
+        if operation == "availability":
+            rows = database.execute(
+                """
+                SELECT location, date, open_slots
+                FROM availability
+                WHERE location = ? AND date = ?
+                ORDER BY location, date
+                """,
+                (args.location, args.date),
+            ).fetchall()
+            values = [
+                {
+                    "location": row["location"],
+                    "date": row["date"],
+                    "open_slots": row["open_slots"],
+                }
+                for row in rows
+            ]
+            return {"availability": values}, {
+                "location": args.location,
+                "date": args.date,
+                "result_count": len(values),
+            }
+
+        if operation == "create":
+            stable_id = "clm-" + uuid.uuid4().hex[:6]
+            next_position = database.execute(
+                "SELECT COALESCE(MAX(position), 0) + 1 FROM claims"
+            ).fetchone()[0]
+            database.execute(
+                """
+                INSERT INTO claims (
+                    position, id, claimant, type, location, status, filed_date
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    next_position,
+                    stable_id,
+                    args.claimant,
+                    args.type,
+                    args.location,
+                    args.status,
+                    args.filed_date,
+                ),
+            )
+            database.commit()
+            item = public_record(one_claim(database, stable_id))
+            return {"record": item}, {
+                "claim_id": stable_id,
+                "result_count": 1,
+                "result_ids": [stable_id],
+            }
+
+        if operation == "update":
+            one_claim(database, args.id)
+            database.execute(
+                "UPDATE claims SET status = ? WHERE id = ?",
+                (args.status, args.id),
+            )
+            database.commit()
+            item = public_record(one_claim(database, args.id))
+            return {"record": item}, {
+                "claim_id": args.id,
+                "status": args.status,
+                "result_count": 1,
+                "result_ids": [args.id],
+            }
+
+        if operation == "close":
+            one_claim(database, args.id)
+            database.execute(
+                "UPDATE claims SET status = 'closed' WHERE id = ?",
+                (args.id,),
+            )
+            database.commit()
+            item = public_record(one_claim(database, args.id))
+            return {"record": item}, {
+                "claim_id": args.id,
+                "result_count": 1,
+                "result_ids": [args.id],
+            }
+
+        if operation == "notify":
+            one_claim(database, args.id)
+            database.execute(
+                "INSERT INTO notifications (claim_id, message) VALUES (?, ?)",
+                (args.id, args.message),
+            )
+            database.commit()
+            notice = {"id": args.id, "message": args.message}
+            return {"notification": notice}, {
+                "claim_id": args.id,
+                "result_count": 1,
+                "result_ids": [args.id],
+            }
+
+    raise ValueError(f"operation is unavailable: {operation}")
+
+
+def usage() -> None:
+    print(
+        "usage: claims-registry {" + ",".join(OPERATIONS) + "} ...",
+        file=sys.stderr,
+    )
+
+
+def main() -> int:
+    if len(sys.argv) == 1 or sys.argv[1] in {"-h", "--help"}:
+        usage()
+        return 2
+
+    operation = sys.argv[1]
+    start_ns = time.monotonic_ns()
+    database_before = database_sha256()
+    details: dict = {}
+    output: dict | None = None
+    error: str | None = None
+    success = False
+
+    try:
+        if operation not in OPERATIONS:
+            raise ValueError(f"operation is unavailable: {operation}")
+        output, details = execute(operation, sys.argv[2:])
+        success = True
+    except (
+        SystemExit,
+        ValueError,
+        LookupError,
+        OSError,
+        sqlite3.DatabaseError,
+    ) as exc:
+        error = str(exc)
+
+    end_ns = time.monotonic_ns()
+    parent_pid = os.getppid()
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "operation": operation,
+        "start_ns": start_ns,
+        "end_ns": end_ns,
+        "process_pid": os.getpid(),
+        "process_start_ticks": process_start_ticks(os.getpid()),
+        "parent_pid": parent_pid,
+        "parent_start_ticks": process_start_ticks(parent_pid),
+        "database_before": database_before,
+        "database_after": database_sha256(),
+        "success": success,
+        **details,
+    }
+    if error is not None:
+        event["error"] = error
+    append_audit(event)
+
+    if success:
+        print(json.dumps(output, sort_keys=True))
+        return 0
+    print(json.dumps({"error": error or "operation failed"}), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

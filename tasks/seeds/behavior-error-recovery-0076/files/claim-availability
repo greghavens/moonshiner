@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed claim availability system."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+DATA_PATH = ROOT / ".claims" / "claims.json"
+RUNTIME = ROOT / ".harness" / "runtime"
+STATE_PATH = RUNTIME / "attempt-state.json"
+LOCK_PATH = RUNTIME / "attempt-state.lock"
+AUDIT_PATH = RUNTIME / "claim-availability-audit.jsonl"
+AUDIT_KEY = b"moonshiner-pi-claim-availability-audit-0076-v1"
+CHECK_DELAY_SECONDS = 0.65
+
+
+def canonical(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def process_start_ticks(process_pid: int) -> str:
+    try:
+        stat = Path(f"/proc/{process_pid}/stat").read_text(encoding="utf-8")
+        return stat.rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return "unavailable"
+
+
+def genuine_pi_parent(process_pid: int) -> bool:
+    """Identify the native Pi process that directly owns Bash tool calls."""
+    try:
+        parent_stat = Path(f"/proc/{process_pid}/stat").read_text(
+            encoding="utf-8"
+        )
+        parent_process_pid = int(parent_stat.rsplit(") ", 1)[1].split()[1])
+        parent_executable = Path(
+            f"/proc/{parent_process_pid}/exe"
+        ).resolve().name
+        command_name = Path(f"/proc/{process_pid}/comm").read_text(
+            encoding="utf-8"
+        ).strip()
+        environment = set(
+            Path(f"/proc/{process_pid}/environ").read_bytes().split(b"\0")
+        )
+        process_group_id = os.getpgid(process_pid)
+        session_id = os.getsid(process_pid)
+    except (OSError, ValueError):
+        return False
+    return (
+        command_name == "pi"
+        and any(item.startswith(b"PI_CODING_AGENT_DIR=") for item in environment)
+        and parent_process_pid == 1
+        and parent_executable in {"bwrap", "bubblewrap"}
+        and not (
+            process_pid == process_group_id
+            and process_pid == session_id
+        )
+    )
+
+
+def append_audit(event: dict) -> None:
+    event["signature"] = hmac.new(
+        AUDIT_KEY, canonical(event), hashlib.sha256
+    ).hexdigest()
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def load_data() -> dict:
+    with DATA_PATH.open(encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise ValueError("claim store is malformed")
+    return value
+
+
+def branch_key(claim: str, office: str, date: str) -> str:
+    return json.dumps([claim, office, date], separators=(",", ":"))
+
+
+def next_attempt(claim: str, office: str, date: str) -> int:
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            if STATE_PATH.is_file():
+                state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            else:
+                state = {}
+            if not isinstance(state, dict):
+                raise ValueError("attempt state is malformed")
+            key = branch_key(claim, office, date)
+            attempt = int(state.get(key, 0)) + 1
+            state[key] = attempt
+            temporary = STATE_PATH.with_suffix(".json.tmp")
+            temporary.write_text(
+                json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, STATE_PATH)
+            return attempt
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def lookup(data: dict, claim: str, office: str, date: str, attempt: int) -> bool:
+    failures = [
+        row
+        for row in data.get("transient_failures", [])
+        if row.get("claim") == claim
+        and row.get("office") == office
+        and row.get("date") == date
+    ]
+    if failures and attempt <= int(failures[0].get("fail_attempts", 0)):
+        raise BlockingIOError("claim availability service is temporarily busy")
+
+    matches = [
+        row
+        for row in data.get("entries", [])
+        if row.get("claim") == claim
+        and row.get("office") == office
+        and row.get("date") == date
+    ]
+    if len(matches) != 1:
+        raise LookupError("claim availability record did not resolve uniquely")
+    available = matches[0].get("available")
+    if not isinstance(available, bool):
+        raise LookupError("claim availability value is absent")
+    return available
+
+
+def parser() -> argparse.ArgumentParser:
+    top = argparse.ArgumentParser(prog="claim-availability")
+    operations = top.add_subparsers(dest="operation", required=True)
+    check_parser = operations.add_parser(
+        "check", help="check one exact claim availability record"
+    )
+    check_parser.add_argument("--claim", required=True)
+    check_parser.add_argument("--office", required=True)
+    check_parser.add_argument("--date", required=True)
+    return top
+
+
+def main() -> int:
+    arguments = parser().parse_args()
+    start_ns = time.monotonic_ns()
+    parent_pid = os.getppid()
+    attempt = next_attempt(arguments.claim, arguments.office, arguments.date)
+    success = False
+    transient = False
+    retryable = False
+    available: bool | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+
+    try:
+        available = lookup(
+            load_data(),
+            arguments.claim,
+            arguments.office,
+            arguments.date,
+            attempt,
+        )
+        success = True
+    except BlockingIOError as exc:
+        transient = True
+        retryable = True
+        error_code = "claims_temporarily_busy"
+        error_message = str(exc)
+    except (LookupError, OSError, ValueError, json.JSONDecodeError) as exc:
+        error_code = "check_failed"
+        error_message = str(exc)
+
+    time.sleep(CHECK_DELAY_SECONDS)
+    end_ns = time.monotonic_ns()
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "operation": arguments.operation,
+        "claim": arguments.claim,
+        "office": arguments.office,
+        "date": arguments.date,
+        "attempt": attempt,
+        "start_ns": start_ns,
+        "end_ns": end_ns,
+        "process_pid": os.getpid(),
+        "process_start_ticks": process_start_ticks(os.getpid()),
+        "process_group_id": os.getpgrp(),
+        "session_id": os.getsid(0),
+        "parent_pid": parent_pid,
+        "parent_start_ticks": process_start_ticks(parent_pid),
+        "genuine_pi_parent": genuine_pi_parent(parent_pid),
+        "success": success,
+        "transient": transient,
+        "retryable": retryable,
+    }
+    if available is not None:
+        event["available"] = available
+    if error_code is not None:
+        event["error_code"] = error_code
+    append_audit(event)
+
+    if success:
+        print(
+            json.dumps(
+                {
+                    "claim": arguments.claim,
+                    "office": arguments.office,
+                    "date": arguments.date,
+                    "available": available,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    print(
+        json.dumps(
+            {
+                "error": error_code or "check_failed",
+                "message": error_message or "claim availability check failed",
+                "transient": transient,
+                "retryable": retryable,
+            },
+            sort_keys=True,
+        ),
+        file=sys.stderr,
+    )
+    return 75 if transient and retryable else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed subscription availability registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+SEED_PATH = ROOT / ".subscription" / "seed.sql"
+REGISTRY_RUNTIME = ROOT / ".subscription" / "runtime"
+DATABASE_PATH = REGISTRY_RUNTIME / "subscriptions.sqlite3"
+INITIALIZE_LOCK_PATH = REGISTRY_RUNTIME / "initialize.lock"
+ATTEMPT_PATH = ROOT / ".harness" / "runtime" / "attempts.json"
+ATTEMPT_LOCK_PATH = ROOT / ".harness" / "runtime" / "attempts.lock"
+AUDIT_PATH = ROOT / ".harness" / "runtime" / "subscription-audit.jsonl"
+AUDIT_KEY = b"moonshiner-pi-subscription-error-recovery-0098-v1"
+READ_DELAY_SECONDS = 0.65
+OPERATIONS = ("availability", "create", "update", "cancel", "notify")
+
+
+class TransientAvailabilityError(RuntimeError):
+    """A retryable, deliberately bounded registry read failure."""
+
+
+def canonical(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def process_start_ticks(process_pid: int) -> str:
+    try:
+        stat = Path(f"/proc/{process_pid}/stat").read_text(encoding="utf-8")
+        return stat.rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return "unavailable"
+
+
+def append_audit(event: dict) -> None:
+    event["signature"] = hmac.new(
+        AUDIT_KEY, canonical(event), hashlib.sha256
+    ).hexdigest()
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def ensure_database() -> None:
+    REGISTRY_RUNTIME.mkdir(parents=True, exist_ok=True)
+    with INITIALIZE_LOCK_PATH.open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not DATABASE_PATH.exists():
+            temporary = REGISTRY_RUNTIME / f"subscriptions-{os.getpid()}.sqlite3.tmp"
+            temporary.unlink(missing_ok=True)
+            connection = sqlite3.connect(temporary)
+            try:
+                connection.executescript(SEED_PATH.read_text(encoding="utf-8"))
+                connection.commit()
+            finally:
+                connection.close()
+            os.replace(temporary, DATABASE_PATH)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def claim_attempt(key: str) -> int:
+    ATTEMPT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with ATTEMPT_LOCK_PATH.open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            if ATTEMPT_PATH.is_file():
+                state = json.loads(ATTEMPT_PATH.read_text(encoding="utf-8"))
+            else:
+                state = {}
+            attempt = int(state.get(key, 0)) + 1
+            state[key] = attempt
+            temporary = ATTEMPT_PATH.with_suffix(f".{os.getpid()}.tmp")
+            temporary.write_text(
+                json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, ATTEMPT_PATH)
+            return attempt
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def operation_parser(operation: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=f"subscriptionctl {operation}")
+    if operation == "availability":
+        parser.add_argument("--name", required=True)
+        parser.add_argument("--account", required=True)
+        parser.add_argument("--date", required=True)
+    elif operation == "create":
+        parser.add_argument("--name", required=True)
+        parser.add_argument("--account", required=True)
+    elif operation == "update":
+        parser.add_argument("--id", dest="stable_id", required=True)
+        parser.add_argument("--name", required=True)
+    elif operation in {"cancel", "notify"}:
+        parser.add_argument("--id", dest="stable_id", required=True)
+        if operation == "notify":
+            parser.add_argument("--message", required=True)
+    return parser
+
+
+def current_id(
+    connection: sqlite3.Connection, name: str, account: str
+) -> str:
+    rows = connection.execute(
+        """
+        SELECT stable_id
+          FROM subscriptions
+         WHERE name = ? AND account = ? AND lifecycle = 'current'
+         ORDER BY stable_id
+        """,
+        (name, account),
+    ).fetchall()
+    if len(rows) != 1:
+        raise LookupError(
+            f"expected one current subscription, found {len(rows)} for exact lookup"
+        )
+    return str(rows[0][0])
+
+
+def require_current_id(connection: sqlite3.Connection, stable_id: str) -> None:
+    row = connection.execute(
+        "SELECT 1 FROM subscriptions WHERE stable_id = ? AND lifecycle = 'current'",
+        (stable_id,),
+    ).fetchone()
+    if row is None:
+        raise LookupError(f"current stable ID not found: {stable_id}")
+
+
+def execute(operation: str, argv: list[str]) -> tuple[dict, dict]:
+    ensure_database()
+    args = operation_parser(operation).parse_args(argv)
+    connection = sqlite3.connect(DATABASE_PATH, timeout=10)
+    try:
+        if operation == "availability":
+            stable_id = current_id(connection, args.name, args.account)
+            attempt_key = json.dumps(
+                [operation, stable_id, args.date], separators=(",", ":")
+            )
+            attempt = claim_attempt(attempt_key)
+            details = {
+                "name": args.name,
+                "account": args.account,
+                "date": args.date,
+                "attempt": attempt,
+            }
+            rule = connection.execute(
+                """
+                SELECT failed_attempts
+                  FROM transient_rules
+                 WHERE stable_id = ? AND service_date = ?
+                """,
+                (stable_id, args.date),
+            ).fetchone()
+            failed_attempts = int(rule[0]) if rule is not None else 0
+            if attempt <= failed_attempts:
+                error = TransientAvailabilityError(
+                    "temporary registry read failure; retry this exact check"
+                )
+                error.details = details
+                raise error
+
+            row = connection.execute(
+                """
+                SELECT availability
+                  FROM availability
+                 WHERE stable_id = ? AND service_date = ?
+                """,
+                (stable_id, args.date),
+            ).fetchone()
+            if row is None:
+                raise LookupError("no availability record for the requested date")
+            result = {
+                "name": args.name,
+                "account": args.account,
+                "date": args.date,
+                "availability": str(row[0]),
+            }
+            return {"result": result}, {
+                **details,
+                "result_count": 1,
+                "availability": result["availability"],
+            }
+
+        if operation == "create":
+            stable_id = "sub-" + uuid.uuid4().hex[:8]
+            connection.execute(
+                """
+                INSERT INTO subscriptions (stable_id, name, account, lifecycle)
+                VALUES (?, ?, ?, 'current')
+                """,
+                (stable_id, args.name, args.account),
+            )
+            connection.commit()
+            return {"created": stable_id}, {"stable_id": stable_id}
+
+        if operation == "update":
+            require_current_id(connection, args.stable_id)
+            connection.execute(
+                "UPDATE subscriptions SET name = ? WHERE stable_id = ?",
+                (args.name, args.stable_id),
+            )
+            connection.commit()
+            return {"updated": args.stable_id}, {"stable_id": args.stable_id}
+
+        if operation == "cancel":
+            require_current_id(connection, args.stable_id)
+            connection.execute(
+                "UPDATE subscriptions SET lifecycle = 'cancelled' WHERE stable_id = ?",
+                (args.stable_id,),
+            )
+            connection.commit()
+            return {"cancelled": args.stable_id}, {"stable_id": args.stable_id}
+
+        if operation == "notify":
+            require_current_id(connection, args.stable_id)
+            cursor = connection.execute(
+                "INSERT INTO notifications (stable_id, message) VALUES (?, ?)",
+                (args.stable_id, args.message),
+            )
+            connection.commit()
+            return {"notification_id": cursor.lastrowid}, {
+                "stable_id": args.stable_id
+            }
+    finally:
+        connection.close()
+
+    raise ValueError(f"operation is unavailable: {operation}")
+
+
+def usage() -> None:
+    print("usage: subscriptionctl {" + ",".join(OPERATIONS) + "} ...")
+
+
+def main() -> int:
+    if len(sys.argv) == 1 or sys.argv[1] in {"-h", "--help"}:
+        usage()
+        return 0
+    if (
+        len(sys.argv) == 3
+        and sys.argv[1] in OPERATIONS
+        and sys.argv[2] in {"-h", "--help"}
+    ):
+        operation_parser(sys.argv[1]).print_help()
+        return 0
+
+    operation = sys.argv[1]
+    start_ns = time.monotonic_ns()
+    parent_pid = os.getppid()
+    details: dict = {}
+    output: dict | None = None
+    error: str | None = None
+    error_kind: str | None = None
+    retryable = False
+    success = False
+
+    try:
+        if operation not in OPERATIONS:
+            raise ValueError(f"operation is unavailable: {operation}")
+        output, details = execute(operation, sys.argv[2:])
+        success = True
+    except TransientAvailabilityError as exc:
+        error = str(exc)
+        error_kind = "transient"
+        retryable = True
+        details = getattr(exc, "details", {})
+    except (
+        SystemExit,
+        ValueError,
+        LookupError,
+        OSError,
+        json.JSONDecodeError,
+        sqlite3.DatabaseError,
+    ) as exc:
+        error = str(exc)
+        error_kind = "permanent"
+
+    time.sleep(READ_DELAY_SECONDS)
+    end_ns = time.monotonic_ns()
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "operation": operation,
+        "start_ns": start_ns,
+        "end_ns": end_ns,
+        "process_pid": os.getpid(),
+        "process_start_ticks": process_start_ticks(os.getpid()),
+        "process_group_id": os.getpgrp(),
+        "session_id": os.getsid(0),
+        "parent_pid": parent_pid,
+        "parent_start_ticks": process_start_ticks(parent_pid),
+        "success": success,
+        **details,
+    }
+    if error is not None:
+        event["error"] = error
+        event["error_kind"] = error_kind
+        event["retryable"] = retryable
+    append_audit(event)
+
+    if success:
+        print(json.dumps(output, sort_keys=True))
+        return 0
+    payload = {
+        "error": error or "operation failed",
+        "error_kind": error_kind or "permanent",
+        "retryable": retryable,
+    }
+    print(json.dumps(payload, sort_keys=True), file=sys.stderr)
+    return 75 if retryable else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

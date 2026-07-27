@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed shipment registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+DATA_PATH = ROOT / ".shipping" / "records.json"
+AUDIT_PATH = ROOT / ".harness" / "runtime" / "shipping-audit.jsonl"
+AUDIT_KEY = b"moonshiner-pi-shipping-audit-0088-v1"
+OPERATIONS = (
+    "list",
+    "search",
+    "get",
+    "profile",
+    "availability",
+    "create",
+    "update",
+    "cancel",
+    "notify",
+)
+
+
+def canonical(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def append_audit(event: dict) -> None:
+    event["signature"] = hmac.new(
+        AUDIT_KEY, canonical(event), hashlib.sha256
+    ).hexdigest()
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def load_payload() -> dict:
+    with DATA_PATH.open(encoding="utf-8") as stream:
+        return json.load(stream)
+
+
+def save_payload(payload: dict) -> None:
+    temporary = DATA_PATH.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, DATA_PATH)
+
+
+def operation_parser(operation: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=f"shipping-registry {operation}")
+    if operation == "list":
+        parser.add_argument("--status", required=True)
+        parser.add_argument("--location", required=True)
+    elif operation == "search":
+        parser.add_argument("--query", required=True)
+    elif operation in {"get", "cancel"}:
+        parser.add_argument("--id", required=True)
+    elif operation == "availability":
+        parser.add_argument("--location", required=True)
+        parser.add_argument("--date", required=True)
+    elif operation == "create":
+        parser.add_argument("--name", required=True)
+        parser.add_argument("--location", required=True)
+        parser.add_argument("--status", required=True)
+        parser.add_argument("--date", required=True)
+    elif operation == "update":
+        parser.add_argument("--id", required=True)
+        parser.add_argument("--status", required=True)
+    elif operation == "notify":
+        parser.add_argument("--id", required=True)
+        parser.add_argument("--message", required=True)
+    return parser
+
+
+def public_record(record: dict) -> dict:
+    return {
+        field: record[field]
+        for field in ("id", "name", "location", "status", "date")
+    }
+
+
+def unique_record(payload: dict, shipment_id: str) -> dict:
+    matches = [
+        record
+        for record in payload["records"]
+        if record["id"] == shipment_id and record["lifecycle"] == "current"
+    ]
+    if len(matches) != 1:
+        raise LookupError(f"shipment ID not found: {shipment_id}")
+    return matches[0]
+
+
+def execute(operation: str, argv: list[str]) -> tuple[dict, dict]:
+    payload = load_payload()
+    args = operation_parser(operation).parse_args(argv)
+
+    if operation == "list":
+        records = sorted(
+            (
+                public_record(record)
+                for record in payload["records"]
+                if record["lifecycle"] == "current"
+                and record["status"] == args.status
+                and record["location"] == args.location
+            ),
+            key=lambda record: record["id"],
+        )
+        return {"records": records}, {
+            "status": args.status,
+            "location": args.location,
+            "result_count": len(records),
+            "result_ids": [record["id"] for record in records],
+        }
+
+    if operation == "search":
+        needle = args.query.casefold()
+        records = [
+            {
+                "id": record["id"],
+                "name": record["name"],
+                "location": record["location"],
+            }
+            for record in payload["records"]
+            if record["lifecycle"] == "current"
+            and needle
+            in " ".join(
+                (
+                    record["id"],
+                    record["name"],
+                    record["location"],
+                    record["status"],
+                    record["date"],
+                )
+            ).casefold()
+        ]
+        return {"matches": records}, {
+            "query": args.query,
+            "result_count": len(records),
+            "result_ids": [record["id"] for record in records],
+        }
+
+    if operation == "get":
+        record = unique_record(payload, args.id)
+        return {"record": public_record(record)}, {
+            "shipment_id": args.id,
+            "result_count": 1,
+            "result_ids": [args.id],
+        }
+
+    if operation == "profile":
+        return {"profile": payload["profile"]}, {"result_count": 1}
+
+    if operation == "availability":
+        matches = [
+            row
+            for row in payload["availability"]
+            if row["location"] == args.location and row["date"] == args.date
+        ]
+        return {"availability": matches}, {
+            "location": args.location,
+            "date": args.date,
+            "result_count": len(matches),
+        }
+
+    if operation == "create":
+        shipment_id = "shi-" + uuid.uuid4().hex[:6]
+        record = {
+            "id": shipment_id,
+            "name": args.name,
+            "location": args.location,
+            "status": args.status,
+            "date": args.date,
+            "lifecycle": "current",
+        }
+        payload["records"].append(record)
+        save_payload(payload)
+        return {"record": public_record(record)}, {
+            "shipment_id": shipment_id,
+            "result_count": 1,
+            "result_ids": [shipment_id],
+        }
+
+    if operation == "update":
+        record = unique_record(payload, args.id)
+        record["status"] = args.status
+        save_payload(payload)
+        return {"record": public_record(record)}, {
+            "shipment_id": args.id,
+            "status": args.status,
+            "result_count": 1,
+            "result_ids": [args.id],
+        }
+
+    if operation == "cancel":
+        record = unique_record(payload, args.id)
+        record["lifecycle"] = "cancelled"
+        save_payload(payload)
+        return {"record": public_record(record)}, {
+            "shipment_id": args.id,
+            "result_count": 1,
+            "result_ids": [args.id],
+        }
+
+    if operation == "notify":
+        unique_record(payload, args.id)
+        notification = {"id": args.id, "message": args.message}
+        payload["notifications"].append(notification)
+        save_payload(payload)
+        return {"notification": notification}, {
+            "shipment_id": args.id,
+            "result_count": 1,
+            "result_ids": [args.id],
+        }
+
+    raise ValueError(f"operation is unavailable: {operation}")
+
+
+def usage() -> None:
+    print(
+        "usage: shipping-registry {" + ",".join(OPERATIONS) + "} ...",
+        file=sys.stderr,
+    )
+
+
+def main() -> int:
+    if len(sys.argv) == 1 or sys.argv[1] in {"-h", "--help"}:
+        usage()
+        return 2
+
+    operation = sys.argv[1]
+    start_ns = time.monotonic_ns()
+    details: dict = {}
+    output: dict | None = None
+    error: str | None = None
+    success = False
+
+    try:
+        if operation not in OPERATIONS:
+            raise ValueError(f"operation is unavailable: {operation}")
+        output, details = execute(operation, sys.argv[2:])
+        success = True
+    except (SystemExit, ValueError, LookupError, OSError, json.JSONDecodeError) as exc:
+        error = str(exc)
+
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "operation": operation,
+        "start_ns": start_ns,
+        "end_ns": time.monotonic_ns(),
+        "process_pid": os.getpid(),
+        "success": success,
+        **details,
+    }
+    if error is not None:
+        event["error"] = error
+    append_audit(event)
+
+    if success:
+        print(json.dumps(output, sort_keys=True))
+        return 0
+    print(json.dumps({"error": error or "operation failed"}), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

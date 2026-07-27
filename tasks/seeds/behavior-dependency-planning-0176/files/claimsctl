@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""Local claim registry executable for the Pi dependency-planning task."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+STATE_DIR = ROOT / ".claims"
+RECORDS_PATH = STATE_DIR / "records.json"
+AUDIT_PATH = STATE_DIR / "audit.jsonl"
+NOTIFICATIONS_PATH = STATE_DIR / "notifications.json"
+LOCK_PATH = STATE_DIR / "lock"
+KEY_PATH = ROOT / ".protected" / "audit.key"
+READ_DELAY_SECONDS = 0.45
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise RuntimeError(f"invalid service file: {path.name}")
+    return value
+
+
+def atomic_json_write(path: Path, value: dict[str, Any]) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", text=True
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def read_records() -> list[dict[str, Any]]:
+    document = load_json(RECORDS_PATH)
+    records = document.get("records")
+    if document.get("version") != 1 or not isinstance(records, list):
+        raise RuntimeError("invalid claim store")
+    if not all(isinstance(record, dict) for record in records):
+        raise RuntimeError("invalid claim entry")
+    return records
+
+
+def record_digest(record: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical(record)).hexdigest()
+
+
+def append_audit_locked(event: dict[str, Any]) -> dict[str, Any]:
+    with AUDIT_PATH.open(encoding="utf-8") as stream:
+        sequence = sum(1 for line in stream if line.strip()) + 1
+    sealed = dict(event)
+    sealed["sequence"] = sequence
+    key = KEY_PATH.read_bytes().strip()
+    sealed["seal"] = hmac.new(key, canonical(sealed), hashlib.sha256).hexdigest()
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(sealed, ensure_ascii=False, sort_keys=True))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    return sealed
+
+
+def append_audit(event: dict[str, Any]) -> dict[str, Any]:
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        sealed = append_audit_locked(event)
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    return sealed
+
+
+def audit_events_locked() -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    with AUDIT_PATH.open(encoding="utf-8") as stream:
+        for line in stream:
+            if line.strip():
+                value = json.loads(line)
+                if not isinstance(value, dict):
+                    raise RuntimeError("invalid operation journal")
+                events.append(value)
+    return events
+
+
+def emit(value: dict[str, Any]) -> None:
+    json.dump(value, sys.stdout, ensure_ascii=False, sort_keys=True)
+    sys.stdout.write("\n")
+
+
+def search(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    time.sleep(READ_DELAY_SECONDS)
+    matches = [
+        {
+            "id": record["id"],
+            "name": record["name"],
+            "office": record["office"],
+        }
+        for record in read_records()
+        if record.get("name") == args.name
+        and record.get("office") == args.office
+        and record.get("archived") is False
+        and record.get("closed") is False
+    ]
+    matches.sort(key=lambda record: record["id"])
+    finished = time.monotonic_ns()
+    append_audit(
+        {
+            "operation": "search",
+            "name": args.name,
+            "office": args.office,
+            "pid": os.getpid(),
+            "started_ns": started,
+            "finished_ns": finished,
+            "outcome": "ok",
+            "result_ids": [record["id"] for record in matches],
+        }
+    )
+    emit({"count": len(matches), "matches": matches})
+    return 0
+
+
+def get_claim(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    time.sleep(READ_DELAY_SECONDS)
+    record = next(
+        (
+            record
+            for record in read_records()
+            if record.get("id") == args.id
+            and record.get("archived") is False
+            and record.get("closed") is False
+        ),
+        None,
+    )
+    finished = time.monotonic_ns()
+    event: dict[str, Any] = {
+        "operation": "get",
+        "claim_id": args.id,
+        "pid": os.getpid(),
+        "started_ns": started,
+        "finished_ns": finished,
+    }
+    if record is None:
+        event.update({"outcome": "not-found", "found": False})
+        append_audit(event)
+        print(f"claim not found: {args.id}", file=sys.stderr)
+        return 3
+    event.update(
+        {
+            "outcome": "ok",
+            "found": True,
+            "record_sha256": record_digest(record),
+            "status": record.get("status"),
+        }
+    )
+    append_audit(event)
+    emit({"record": record})
+    return 0
+
+
+def update_claim(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        document = load_json(RECORDS_PATH)
+        records = document.get("records")
+        if not isinstance(records, list):
+            raise RuntimeError("invalid claim store")
+        record = next(
+            (
+                record
+                for record in records
+                if record.get("id") == args.id
+                and record.get("archived") is False
+                and record.get("closed") is False
+            ),
+            None,
+        )
+        if record is None:
+            before = None
+            updated = 0
+            result = "not-found"
+        else:
+            before = record.get("status")
+            record["status"] = args.status
+            atomic_json_write(RECORDS_PATH, document)
+            updated = 1
+            result = "ok"
+        finished = time.monotonic_ns()
+        append_audit_locked(
+            {
+                "operation": "update",
+                "claim_id": args.id,
+                "before_status": before,
+                "after_status": args.status,
+                "pid": os.getpid(),
+                "started_ns": started,
+                "finished_ns": finished,
+                "outcome": result,
+                "updated": updated,
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    if record is None:
+        print(f"claim not found: {args.id}", file=sys.stderr)
+        return 3
+    emit({"before_status": before, "record": record, "updated": updated})
+    return 0
+
+
+def notify_desk(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        records = read_records()
+        record = next(
+            (
+                record
+                for record in records
+                if record.get("id") == args.id
+                and record.get("archived") is False
+                and record.get("closed") is False
+            ),
+            None,
+        )
+        events = audit_events_locked()
+        prior = events[-1] if events else {}
+        permitted = (
+            record is not None
+            and record.get("status") == args.outcome
+            and prior.get("operation") == "update"
+            and prior.get("outcome") == "ok"
+            and prior.get("updated") == 1
+            and prior.get("claim_id") == args.id
+            and prior.get("before_status") == "documents-needed"
+            and prior.get("after_status") == args.outcome
+        )
+        if permitted:
+            document = load_json(NOTIFICATIONS_PATH)
+            notifications = document.get("notifications")
+            if not isinstance(notifications, list):
+                raise RuntimeError("invalid notice store")
+            notifications.append(
+                {
+                    "ordinal": len(notifications) + 1,
+                    "desk": args.desk,
+                    "claim_id": args.id,
+                    "outcome": args.outcome,
+                }
+            )
+            atomic_json_write(NOTIFICATIONS_PATH, document)
+            delivered = 1
+            result = "ok"
+        else:
+            delivered = 0
+            result = "blocked"
+        finished = time.monotonic_ns()
+        append_audit_locked(
+            {
+                "operation": "notify",
+                "desk": args.desk,
+                "claim_id": args.id,
+                "notice_outcome": args.outcome,
+                "pid": os.getpid(),
+                "started_ns": started,
+                "finished_ns": finished,
+                "outcome": result,
+                "delivered": delivered,
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    if not permitted:
+        print("notice blocked: no immediately preceding successful eligible update", file=sys.stderr)
+        return 4
+    emit(
+        {
+            "claim_id": args.id,
+            "desk": args.desk,
+            "notified": delivered,
+            "outcome": args.outcome,
+        }
+    )
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="claimsctl",
+        description=(
+            "Search and retrieve claim records, change a claim status, and notify "
+            "a claims desk. Search results are summaries; use get for full records."
+        ),
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    search_parser = subparsers.add_parser(
+        "search", help="search active claims by exact name and office"
+    )
+    search_parser.add_argument("--name", required=True, help="exact claim name")
+    search_parser.add_argument("--office", required=True, help="exact office name")
+    search_parser.set_defaults(handler=search)
+
+    get_parser = subparsers.add_parser("get", help="retrieve one complete active claim")
+    get_parser.add_argument("--id", required=True, help="stable claim ID")
+    get_parser.set_defaults(handler=get_claim)
+
+    update_parser = subparsers.add_parser("update", help="change one claim's status")
+    update_parser.add_argument("--id", required=True, help="stable claim ID")
+    update_parser.add_argument("--status", required=True, help="new status")
+    update_parser.set_defaults(handler=update_claim)
+
+    notify_parser = subparsers.add_parser(
+        "notify",
+        help=(
+            "notify claims desk after an immediately preceding successful "
+            "documents-needed status transition"
+        ),
+    )
+    notify_parser.add_argument(
+        "--desk", required=True, choices=("claims-desk",), help="destination desk"
+    )
+    notify_parser.add_argument("--id", required=True, help="updated stable claim ID")
+    notify_parser.add_argument(
+        "--outcome", required=True, help="successful final claim status"
+    )
+    notify_parser.set_defaults(handler=notify_desk)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        return int(args.handler(args))
+    except (OSError, RuntimeError, json.JSONDecodeError) as error:
+        print(f"claimsctl error: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

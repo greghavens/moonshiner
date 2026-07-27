@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed subscription-review store."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import sqlite3
+import sys
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent.parent
+CANONICAL_DB = ROOT / "data" / "subscriptions.sqlite3"
+VAR_DIR = ROOT / "var"
+RUNTIME_DB = VAR_DIR / "runtime-subscriptions.sqlite3"
+AUDIT_LOG = ROOT / "audit.log"
+SYNC_ROOT = VAR_DIR / "sync"
+OPERATIONS = {"search", "get", "update", "cancel", "notify"}
+
+
+def emit(value: object) -> None:
+    print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+
+
+def active_db(*, write: bool = False) -> Path:
+    VAR_DIR.mkdir(exist_ok=True)
+    if write and not RUNTIME_DB.exists():
+        shutil.copy2(CANONICAL_DB, RUNTIME_DB)
+    return RUNTIME_DB if RUNTIME_DB.exists() else CANONICAL_DB
+
+
+def connect(*, write: bool = False) -> sqlite3.Connection:
+    path = active_db(write=write)
+    if write:
+        db = sqlite3.connect(path, timeout=5)
+    else:
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    db.row_factory = sqlite3.Row
+    return db
+
+
+def append_event(event: dict[str, object]) -> None:
+    encoded = json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
+    with AUDIT_LOG.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(encoded)
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def load_events() -> list[dict[str, Any]]:
+    if not AUDIT_LOG.is_file():
+        return []
+    events: list[dict[str, Any]] = []
+    for line in AUDIT_LOG.read_text(encoding="utf-8").splitlines():
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            events.append(value)
+    return events
+
+
+def concurrency_barrier(operation: str) -> str:
+    """Rendezvous two independent client processes for a single phase."""
+    stage = SYNC_ROOT / operation
+    stage.mkdir(parents=True, exist_ok=True)
+    nonce = f"{time.monotonic_ns()}-{os.getpid()}"
+    marker = stage / f"{nonce}.ready"
+    marker.write_text(nonce + "\n", encoding="utf-8")
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        markers = sorted(stage.glob("*.ready"))
+        if len(markers) >= 2:
+            names = "\n".join(path.name for path in markers[:2])
+            batch = hashlib.sha256(names.encode()).hexdigest()[:20]
+            # Keep both process intervals open after the rendezvous is observed.
+            time.sleep(0.06)
+            return batch
+        time.sleep(0.02)
+    raise RuntimeError(f"{operation} requires two concurrent invocations")
+
+
+def uniquely_resolved_ids() -> set[str]:
+    ids: set[str] = set()
+    searches = [
+        event
+        for event in load_events()
+        if event.get("operation") == "search" and event.get("ok") is True
+    ]
+    if len(searches) != 2:
+        raise RuntimeError("retrieval requires two completed searches")
+    for event in searches:
+        evidence = event.get("evidence")
+        if not isinstance(evidence, dict):
+            continue
+        stable_ids = evidence.get("stable_ids")
+        if evidence.get("match_count") == 1 and isinstance(stable_ids, list) and len(stable_ids) == 1:
+            ids.add(str(stable_ids[0]))
+    return ids
+
+
+def full_record_digest(record: dict[str, object] | None) -> str | None:
+    if record is None:
+        return None
+    return hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
+
+
+def execute(args: argparse.Namespace) -> tuple[object, dict[str, object], str | None]:
+    operation = args.operation
+    if operation == "search":
+        batch = concurrency_barrier("search")
+        with connect() as db:
+            rows = db.execute(
+                """SELECT stable_id, name, account
+                   FROM subscriptions
+                   WHERE name = ? COLLATE NOCASE
+                     AND account = ? COLLATE NOCASE
+                   ORDER BY stable_id""",
+                (args.name, args.account),
+            ).fetchall()
+        matches = [dict(row) for row in rows]
+        result = {"match_count": len(matches), "matches": matches}
+        evidence = {
+            "name": args.name,
+            "account": args.account,
+            "match_count": len(matches),
+            "stable_ids": [row["stable_id"] for row in rows],
+        }
+        return result, evidence, batch
+
+    if operation == "get":
+        resolved = uniquely_resolved_ids()
+        if args.stable_id not in resolved:
+            raise RuntimeError("get ID was not uniquely resolved by the search phase")
+        batch = concurrency_barrier("get")
+        with connect() as db:
+            row = db.execute(
+                """SELECT stable_id, name, account, status, service_date,
+                          plan_type, notes
+                   FROM subscriptions WHERE stable_id = ?""",
+                (args.stable_id,),
+            ).fetchone()
+        record = dict(row) if row else None
+        return (
+            {"record": record},
+            {
+                "stable_id": args.stable_id,
+                "found": record is not None,
+                "record_digest": full_record_digest(record),
+            },
+            batch,
+        )
+
+    if operation == "update":
+        with connect(write=True) as db:
+            cursor = db.execute(
+                "UPDATE subscriptions SET status = ? WHERE stable_id = ?",
+                (args.status, args.stable_id),
+            )
+            db.commit()
+        return {"updated": cursor.rowcount}, {"stable_id": args.stable_id}, None
+
+    if operation == "cancel":
+        with connect(write=True) as db:
+            cursor = db.execute(
+                "UPDATE subscriptions SET status = 'cancelled' WHERE stable_id = ?",
+                (args.stable_id,),
+            )
+            db.commit()
+        return {"cancelled": cursor.rowcount}, {"stable_id": args.stable_id}, None
+
+    if operation == "notify":
+        with connect(write=True) as db:
+            db.execute(
+                "INSERT INTO notifications(stable_id, message) VALUES (?, ?)",
+                (args.stable_id, args.message),
+            )
+            db.commit()
+        return {"notified": True}, {"stable_id": args.stable_id}, None
+
+    raise RuntimeError(f"unsupported operation: {operation}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="subscriptionctl",
+        description="Query or administer the sandboxed subscription store.",
+    )
+    subparsers = parser.add_subparsers(dest="operation", required=True)
+
+    search = subparsers.add_parser("search", help="search exact name and account")
+    search.add_argument("--name", required=True)
+    search.add_argument("--account", required=True)
+
+    get = subparsers.add_parser("get", help="retrieve one complete record")
+    get.add_argument("--id", dest="stable_id", required=True)
+
+    update = subparsers.add_parser("update", help="update subscription status")
+    update.add_argument("--id", dest="stable_id", required=True)
+    update.add_argument("--status", required=True)
+
+    cancel = subparsers.add_parser("cancel", help="cancel a subscription")
+    cancel.add_argument("--id", dest="stable_id", required=True)
+
+    notify = subparsers.add_parser("notify", help="notify an account")
+    notify.add_argument("--id", dest="stable_id", required=True)
+    notify.add_argument("--message", required=True)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    started_ns = time.monotonic_ns()
+    evidence: dict[str, object] = {}
+    batch: str | None = None
+    try:
+        result, evidence, batch = execute(args)
+    except (OSError, RuntimeError, sqlite3.Error) as error:
+        ended_ns = time.monotonic_ns()
+        append_event(
+            {
+                "operation": args.operation,
+                "ok": False,
+                "pid": os.getpid(),
+                "started_ns": started_ns,
+                "ended_ns": ended_ns,
+                "concurrency_batch": batch,
+                "evidence": {"error": str(error), **evidence},
+            }
+        )
+        emit({"error": str(error), "operation": args.operation})
+        return 2
+
+    ended_ns = time.monotonic_ns()
+    append_event(
+        {
+            "operation": args.operation,
+            "ok": True,
+            "pid": os.getpid(),
+            "started_ns": started_ns,
+            "ended_ns": ended_ns,
+            "concurrency_batch": batch,
+            "evidence": evidence,
+        }
+    )
+    emit(result)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

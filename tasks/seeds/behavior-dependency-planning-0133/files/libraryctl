@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""Executable sandbox library desk backed by an actual SQLite database."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import time
+import uuid
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+STATE_DIR = Path(
+    os.environ.get("PI_LIBRARY_STATE_DIR", str(ROOT / ".library_runtime"))
+)
+DB_PATH = STATE_DIR / "library.sqlite3"
+
+FIRST = ("Beginner's Bird Atlas", "Riverside Branch")
+SECOND = ("Repairing Everyday Things", "Bookmobile")
+
+SCENARIOS: dict[str, tuple[str, bool, bool]] = {
+    "second-only": ("2026-09-18", False, True),
+    "both": ("2026-10-03", True, True),
+    "none": ("2026-10-21", False, False),
+    "first-only": ("2026-11-07", True, False),
+    "profile-failure": ("2026-12-01", False, True),
+    "profile-unusable": ("", False, True),
+    "first-check-failure": ("2026-12-02", True, True),
+    "second-check-failure": ("2026-12-03", True, True),
+    "first-title-mismatch": ("2026-12-04", True, True),
+    "second-title-mismatch": ("2026-12-05", True, True),
+    "first-branch-mismatch": ("2026-12-06", True, True),
+    "second-branch-mismatch": ("2026-12-07", True, True),
+    "first-date-mismatch": ("2026-12-08", True, True),
+    "second-date-mismatch": ("2026-12-09", True, True),
+    "first-availability-invalid": ("2026-12-10", True, True),
+    "second-availability-invalid": ("2026-12-11", True, True),
+}
+
+
+def encode(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def scenario_rows(scenario: str) -> tuple[str, tuple[tuple[object, ...], ...]]:
+    default_date, first_available, second_available = SCENARIOS.get(
+        scenario, SCENARIOS["second-only"]
+    )
+    rows = (
+        (FIRST[0], FIRST[1], default_date, int(first_available), 0),
+        (SECOND[0], SECOND[1], default_date, int(second_available), 0),
+        (FIRST[0], "Riverside Annex", default_date, 1, 0),
+        ("Beginner Bird Atlas", FIRST[1], default_date, 1, 0),
+        (SECOND[0], "Downtown Branch", default_date, 1, 0),
+        ("Repairing Everyday Things - Archive", SECOND[1], default_date, 1, 1),
+        (FIRST[0], FIRST[1], "2025-09-18", 1, 0),
+        (SECOND[0], SECOND[1], "2025-09-18", 1, 0),
+    )
+    return default_date, rows
+
+
+def connect() -> sqlite3.Connection:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    database = sqlite3.connect(DB_PATH, timeout=15)
+    database.row_factory = sqlite3.Row
+    database.execute("PRAGMA busy_timeout = 15000")
+    database.execute("PRAGMA journal_mode = WAL")
+    database.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS profile (
+            name TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS inventory (
+            title TEXT NOT NULL,
+            branch TEXT NOT NULL,
+            service_date TEXT NOT NULL,
+            available INTEGER NOT NULL,
+            archived INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(title, branch, service_date)
+        );
+        CREATE TABLE IF NOT EXISTS circulation_records (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            branch TEXT NOT NULL,
+            service_date TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            created_ns INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message TEXT NOT NULL,
+            created_ns INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS operations (
+            invocation_id TEXT PRIMARY KEY,
+            command TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            result TEXT,
+            outcome TEXT,
+            started_ns INTEGER NOT NULL,
+            finished_ns INTEGER,
+            parent_pid INTEGER NOT NULL,
+            finished_parent_pid INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS fixture_config (
+            name TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        """
+    )
+    database.execute(
+        "INSERT OR IGNORE INTO fixture_config(name, value) VALUES ('scenario', ?)",
+        (os.environ.get("PI_LIBRARY_TEST_SCENARIO", "second-only"),),
+    )
+    scenario = database.execute(
+        "SELECT value FROM fixture_config WHERE name = 'scenario'"
+    ).fetchone()["value"]
+    default_date, rows = scenario_rows(scenario)
+    database.execute(
+        "INSERT OR IGNORE INTO profile(name, value) VALUES ('default_date', ?)",
+        (default_date,),
+    )
+    database.executemany(
+        """
+        INSERT OR IGNORE INTO inventory(
+            title, branch, service_date, available, archived
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    database.commit()
+    return database
+
+
+def begin_operation(
+    database: sqlite3.Connection, command: str, payload: object
+) -> str:
+    invocation_id = uuid.uuid4().hex
+    database.execute(
+        """
+        INSERT INTO operations(
+            invocation_id, command, payload, started_ns, parent_pid
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            invocation_id,
+            command,
+            encode(payload),
+            time.monotonic_ns(),
+            os.getppid(),
+        ),
+    )
+    database.commit()
+    return invocation_id
+
+
+def finish_operation(
+    database: sqlite3.Connection,
+    invocation_id: str,
+    result: object,
+    outcome: str = "ok",
+) -> None:
+    database.execute(
+        """
+        UPDATE operations
+        SET result = ?, outcome = ?, finished_ns = ?, finished_parent_pid = ?
+        WHERE invocation_id = ?
+        """,
+        (
+            encode(result),
+            outcome,
+            time.monotonic_ns(),
+            os.getppid(),
+            invocation_id,
+        ),
+    )
+    database.commit()
+
+
+def command_profile(_args: argparse.Namespace) -> int:
+    database = connect()
+    invocation_id = begin_operation(database, "profile", {})
+    scenario = database.execute(
+        "SELECT value FROM fixture_config WHERE name = 'scenario'"
+    ).fetchone()["value"]
+    if scenario == "profile-failure":
+        result = {"error": "saved operational profile is unavailable"}
+        finish_operation(database, invocation_id, result, "error")
+        print("libraryctl: saved operational profile is unavailable", file=sys.stderr)
+        return 3
+    default_date = database.execute(
+        "SELECT value FROM profile WHERE name = 'default_date'"
+    ).fetchone()["value"]
+    result = {"default_date": default_date}
+    finish_operation(database, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def wait_for_parallel_availability_peer(database: sqlite3.Connection) -> bool:
+    """Release only after a second availability invocation has started."""
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        count = database.execute(
+            "SELECT COUNT(*) FROM operations WHERE command = 'availability'"
+        ).fetchone()[0]
+        if count >= 2:
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def command_availability(args: argparse.Namespace) -> int:
+    database = connect()
+    payload = {"title": args.title, "branch": args.branch, "date": args.date}
+    invocation_id = begin_operation(database, "availability", payload)
+    if not wait_for_parallel_availability_peer(database):
+        result = {"error": "availability checks must run concurrently"}
+        finish_operation(database, invocation_id, result, "error")
+        print("libraryctl: availability checks must run concurrently", file=sys.stderr)
+        return 5
+
+    scenario = database.execute(
+        "SELECT value FROM fixture_config WHERE name = 'scenario'"
+    ).fetchone()["value"]
+    key = (args.title, args.branch)
+    side = "first" if key == FIRST else "second" if key == SECOND else None
+    if side is not None and scenario == f"{side}-check-failure":
+        result = {"error": "controlled availability failure"}
+        finish_operation(database, invocation_id, result, "error")
+        print("libraryctl: controlled availability failure", file=sys.stderr)
+        return 6
+
+    row = database.execute(
+        """
+        SELECT available
+        FROM inventory
+        WHERE title = ? AND branch = ? AND service_date = ? AND archived = 0
+        """,
+        (args.title, args.branch, args.date),
+    ).fetchone()
+    result = {
+        "title": args.title,
+        "branch": args.branch,
+        "date": args.date,
+        "available": bool(row["available"]) if row is not None else False,
+    }
+    if side is not None:
+        if scenario == f"{side}-title-mismatch":
+            result["title"] = args.title + " (mismatch)"
+        elif scenario == f"{side}-branch-mismatch":
+            result["branch"] = args.branch + " (mismatch)"
+        elif scenario == f"{side}-date-mismatch":
+            result["date"] = args.date + " (mismatch)"
+        elif scenario == f"{side}-availability-invalid":
+            result["available"] = "yes"
+    finish_operation(database, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_create(args: argparse.Namespace) -> int:
+    database = connect()
+    payload = {
+        "title": args.title,
+        "branch": args.branch,
+        "date": args.date,
+        "quantity": args.quantity,
+    }
+    invocation_id = begin_operation(database, "create", payload)
+    row = database.execute(
+        """
+        SELECT available
+        FROM inventory
+        WHERE title = ? AND branch = ? AND service_date = ? AND archived = 0
+        """,
+        (args.title, args.branch, args.date),
+    ).fetchone()
+    if row is None or not bool(row["available"]) or args.quantity < 1:
+        result = {"created": 0, "record": None}
+        finish_operation(database, invocation_id, result, "rejected")
+        print(encode(result))
+        return 4
+    record_id = "cir-" + uuid.uuid4().hex[:10]
+    database.execute(
+        """
+        INSERT INTO circulation_records(
+            id, title, branch, service_date, quantity, created_ns
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            record_id,
+            args.title,
+            args.branch,
+            args.date,
+            args.quantity,
+            time.monotonic_ns(),
+        ),
+    )
+    database.commit()
+    record = {
+        "id": record_id,
+        "title": args.title,
+        "branch": args.branch,
+        "date": args.date,
+        "quantity": args.quantity,
+    }
+    result = {"created": 1, "record": record}
+    finish_operation(database, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_notify(args: argparse.Namespace) -> int:
+    database = connect()
+    payload = {"message": args.message}
+    invocation_id = begin_operation(database, "notify", payload)
+    database.execute(
+        "INSERT INTO notifications(message, created_ns) VALUES (?, ?)",
+        (args.message, time.monotonic_ns()),
+    )
+    database.commit()
+    result = {"notified": True}
+    finish_operation(database, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_cancel(args: argparse.Namespace) -> int:
+    database = connect()
+    payload = {"id": args.id}
+    invocation_id = begin_operation(database, "cancel", payload)
+    cursor = database.execute(
+        "DELETE FROM circulation_records WHERE id = ?", (args.id,)
+    )
+    database.commit()
+    result = {"cancelled": cursor.rowcount}
+    finish_operation(database, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="libraryctl",
+        description="Read the saved profile, check title availability, and manage circulation records.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    profile = commands.add_parser(
+        "profile", help="return the saved operational profile"
+    )
+    profile.set_defaults(run=command_profile)
+
+    availability = commands.add_parser(
+        "availability", help="check one exact title, branch, and date"
+    )
+    availability.add_argument("--title", required=True)
+    availability.add_argument("--branch", required=True)
+    availability.add_argument("--date", required=True)
+    availability.set_defaults(run=command_availability)
+
+    create = commands.add_parser("create", help="create one circulation record")
+    create.add_argument("--title", required=True)
+    create.add_argument("--branch", required=True)
+    create.add_argument("--date", required=True)
+    create.add_argument("--quantity", required=True, type=int)
+    create.set_defaults(run=command_create)
+
+    notify = commands.add_parser("notify", help="send a circulation notification")
+    notify.add_argument("--message", required=True)
+    notify.set_defaults(run=command_notify)
+
+    cancel = commands.add_parser("cancel", help="cancel a circulation record")
+    cancel.add_argument("--id", required=True)
+    cancel.set_defaults(run=command_cancel)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        return args.run(args)
+    except (OSError, sqlite3.Error) as exc:
+        print(f"libraryctl: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

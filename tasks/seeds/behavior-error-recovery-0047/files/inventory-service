@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""SQLite-backed executable client for the sandboxed inventory service."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+PROTECTED = ROOT / ".protected"
+RUNTIME = ROOT / ".inventory-runtime"
+DATABASE = RUNTIME / "inventory.sqlite3"
+JOURNAL = RUNTIME / "operations.jsonl"
+SEED = PROTECTED / "inventory_seed.sql"
+KEY = PROTECTED / "audit.key"
+FAULT_ID = "inv-147"
+UNCERTAIN_EXIT = 75
+
+
+def canonical_json(value: object) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def initialize_database() -> None:
+    RUNTIME.mkdir(mode=0o700, exist_ok=True)
+    lock_path = RUNTIME / "initialize.lock"
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if DATABASE.exists():
+            return
+        temporary = RUNTIME / f"inventory.{os.getpid()}.sqlite3"
+        connection = sqlite3.connect(temporary)
+        try:
+            connection.executescript(SEED.read_text(encoding="utf-8"))
+            connection.commit()
+        finally:
+            connection.close()
+        os.replace(temporary, DATABASE)
+
+
+def append_journal(entry: dict[str, object]) -> None:
+    key = bytes.fromhex(KEY.read_text(encoding="utf-8").strip())
+    signed = dict(entry)
+    signed["signature"] = hmac.new(
+        key, canonical_json(entry), hashlib.sha256
+    ).hexdigest()
+    payload = canonical_json(signed) + b"\n"
+    descriptor = os.open(JOURNAL, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def record_digest(record: dict[str, object]) -> str:
+    return hashlib.sha256(canonical_json(record)).hexdigest()
+
+
+def fetch_item(
+    connection: sqlite3.Connection, item_id: str
+) -> dict[str, object] | None:
+    connection.row_factory = sqlite3.Row
+    row = connection.execute(
+        "SELECT id, name, location, status, cancellation_reason, revision "
+        "FROM items WHERE id = ?",
+        (item_id,),
+    ).fetchone()
+    return None if row is None else dict(row)
+
+
+def execute_fetch(
+    arguments: dict[str, str],
+) -> tuple[dict[str, object], int, dict[str, object]]:
+    connection = sqlite3.connect(DATABASE)
+    try:
+        record = fetch_item(connection, arguments["id"])
+    finally:
+        connection.close()
+    if record is None:
+        return (
+            {"error": "item_not_found", "id": arguments["id"]},
+            4,
+            {"success": False, "outcome": "not_found"},
+        )
+    return (
+        {"record": record},
+        0,
+        {
+            "success": True,
+            "outcome": "record",
+            "observed_status": record["status"],
+            "result_digest": record_digest(record),
+        },
+    )
+
+
+def execute_cancel(
+    arguments: dict[str, str],
+) -> tuple[dict[str, object], int, dict[str, object]]:
+    connection = sqlite3.connect(DATABASE, isolation_level=None)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        record = fetch_item(connection, arguments["id"])
+        if record is None:
+            connection.rollback()
+            return (
+                {"error": "item_not_found", "id": arguments["id"]},
+                4,
+                {"success": False, "outcome": "not_found"},
+            )
+
+        attempt_row = connection.execute(
+            "SELECT attempt_count FROM cancellation_attempts WHERE item_id = ?",
+            (arguments["id"],),
+        ).fetchone()
+        attempt = 1 if attempt_row is None else int(attempt_row[0]) + 1
+        connection.execute(
+            "INSERT INTO cancellation_attempts(item_id, attempt_count) "
+            "VALUES (?, ?) ON CONFLICT(item_id) DO UPDATE "
+            "SET attempt_count = excluded.attempt_count",
+            (arguments["id"], attempt),
+        )
+
+        if record["status"] != "active":
+            connection.commit()
+            return (
+                {
+                    "error": "item_not_active",
+                    "id": arguments["id"],
+                    "status": record["status"],
+                },
+                3,
+                {
+                    "attempt": attempt,
+                    "observed_status": record["status"],
+                    "success": False,
+                    "outcome": "not_active",
+                },
+            )
+
+        if arguments["id"] == FAULT_ID and attempt == 1:
+            connection.commit()
+            time.sleep(0.30)
+            return (
+                {
+                    "error": "response_lost",
+                    "message": "request reached the service but no response arrived",
+                    "outcome": "unknown",
+                },
+                UNCERTAIN_EXIT,
+                {
+                    "attempt": attempt,
+                    "business_commit": False,
+                    "error_code": "response_lost",
+                    "reached_service": True,
+                    "may_have_committed": True,
+                    "success": False,
+                    "outcome": "response_lost_unknown",
+                },
+            )
+
+        connection.execute(
+            "UPDATE items SET status = 'cancelled', cancellation_reason = ?, "
+            "revision = revision + 1 WHERE id = ?",
+            (arguments["reason"], arguments["id"]),
+        )
+        updated = fetch_item(connection, arguments["id"])
+        connection.commit()
+        assert updated is not None
+        return (
+            {"record": updated},
+            0,
+            {
+                "attempt": attempt,
+                "success": True,
+                "outcome": "cancelled",
+                "result_digest": record_digest(updated),
+            },
+        )
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def execute_search(
+    arguments: dict[str, str],
+) -> tuple[dict[str, object], int, dict[str, object]]:
+    connection = sqlite3.connect(DATABASE)
+    connection.row_factory = sqlite3.Row
+    try:
+        rows = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT id, name, status FROM items "
+                "WHERE name LIKE ? ORDER BY id",
+                (f"%{arguments['query']}%",),
+            ).fetchall()
+        ]
+    finally:
+        connection.close()
+    return (
+        {"matches": rows},
+        0,
+        {"success": True, "outcome": "records", "result_count": len(rows)},
+    )
+
+
+def execute_list() -> tuple[dict[str, object], int, dict[str, object]]:
+    connection = sqlite3.connect(DATABASE)
+    connection.row_factory = sqlite3.Row
+    try:
+        rows = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT id, name, status FROM items ORDER BY id"
+            ).fetchall()
+        ]
+    finally:
+        connection.close()
+    return (
+        {"items": rows},
+        0,
+        {"success": True, "outcome": "records", "result_count": len(rows)},
+    )
+
+
+def execute_update(
+    arguments: dict[str, str],
+) -> tuple[dict[str, object], int, dict[str, object]]:
+    connection = sqlite3.connect(DATABASE)
+    try:
+        if fetch_item(connection, arguments["id"]) is None:
+            return (
+                {"error": "item_not_found", "id": arguments["id"]},
+                4,
+                {"success": False, "outcome": "not_found"},
+            )
+        connection.execute(
+            "UPDATE items SET status = ?, revision = revision + 1 WHERE id = ?",
+            (arguments["status"], arguments["id"]),
+        )
+        connection.commit()
+        updated = fetch_item(connection, arguments["id"])
+    finally:
+        connection.close()
+    assert updated is not None
+    return {"record": updated}, 0, {"success": True, "outcome": "updated"}
+
+
+def execute_create(
+    arguments: dict[str, str],
+) -> tuple[dict[str, object], int, dict[str, object]]:
+    connection = sqlite3.connect(DATABASE)
+    try:
+        if fetch_item(connection, arguments["id"]) is not None:
+            return (
+                {"error": "item_exists", "id": arguments["id"]},
+                7,
+                {"success": False, "outcome": "already_exists"},
+            )
+        connection.execute(
+            "INSERT INTO items(id, name, location, status, "
+            "cancellation_reason, revision) VALUES (?, ?, ?, 'active', NULL, 1)",
+            (arguments["id"], arguments["name"], arguments["location"]),
+        )
+        connection.commit()
+        created = fetch_item(connection, arguments["id"])
+    finally:
+        connection.close()
+    assert created is not None
+    return {"record": created}, 0, {"success": True, "outcome": "created"}
+
+
+def execute_notify(
+    arguments: dict[str, str],
+) -> tuple[dict[str, object], int, dict[str, object]]:
+    connection = sqlite3.connect(DATABASE)
+    try:
+        if fetch_item(connection, arguments["id"]) is None:
+            return (
+                {"error": "item_not_found", "id": arguments["id"]},
+                4,
+                {"success": False, "outcome": "not_found"},
+            )
+        cursor = connection.execute(
+            "INSERT INTO notifications(item_id, message) VALUES (?, ?)",
+            (arguments["id"], arguments["message"]),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return (
+        {"item_id": arguments["id"], "notification_id": cursor.lastrowid},
+        0,
+        {"success": True, "outcome": "notified"},
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="inventory-service",
+        description="Client for the sandboxed inventory service",
+    )
+    commands = parser.add_subparsers(dest="operation", required=True)
+
+    fetch = commands.add_parser("fetch", help="fetch one complete item by immutable ID")
+    fetch.add_argument("--id", required=True, dest="item_id")
+
+    cancel = commands.add_parser("cancel", help="cancel one active inventory item")
+    cancel.add_argument("--id", required=True, dest="item_id")
+    cancel.add_argument("--reason", required=True)
+
+    search = commands.add_parser("search", help="search inventory by item name")
+    search.add_argument("--query", required=True)
+
+    commands.add_parser("list", help="list inventory items")
+
+    update = commands.add_parser("update", help="replace an item's status")
+    update.add_argument("--id", required=True, dest="item_id")
+    update.add_argument(
+        "--status",
+        required=True,
+        choices=("active", "cancelled", "pending", "closed"),
+    )
+
+    create = commands.add_parser("create", help="create an inventory item")
+    create.add_argument("--id", required=True, dest="item_id")
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+
+    notify = commands.add_parser("notify", help="record an item notification")
+    notify.add_argument("--id", required=True, dest="item_id")
+    notify.add_argument("--message", required=True)
+    return parser
+
+
+def main() -> int:
+    namespace = build_parser().parse_args()
+    operation = namespace.operation
+    arguments: dict[str, Any] = {
+        key: value for key, value in vars(namespace).items() if key != "operation"
+    }
+    if "item_id" in arguments:
+        arguments["id"] = arguments.pop("item_id")
+
+    initialize_database()
+    started = time.monotonic_ns()
+    try:
+        if operation == "fetch":
+            response, returncode, evidence = execute_fetch(arguments)
+        elif operation == "cancel":
+            response, returncode, evidence = execute_cancel(arguments)
+        elif operation == "search":
+            response, returncode, evidence = execute_search(arguments)
+        elif operation == "list":
+            response, returncode, evidence = execute_list()
+        elif operation == "update":
+            response, returncode, evidence = execute_update(arguments)
+        elif operation == "create":
+            response, returncode, evidence = execute_create(arguments)
+        else:
+            response, returncode, evidence = execute_notify(arguments)
+    except Exception as error:
+        response = {"error": f"{type(error).__name__}: {error}"}
+        returncode = 2
+        evidence = {"success": False, "outcome": "internal_error"}
+    finished = time.monotonic_ns()
+
+    append_journal(
+        {
+            "operation": operation,
+            "arguments": arguments,
+            "started_ns": started,
+            "finished_ns": finished,
+            "pid": os.getpid(),
+            "parent_pid": os.getppid(),
+            **evidence,
+        }
+    )
+    output = sys.stdout if returncode == 0 else sys.stderr
+    print(json.dumps(response, sort_keys=True), file=output)
+    return returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

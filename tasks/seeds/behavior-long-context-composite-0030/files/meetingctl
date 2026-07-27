@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed meeting register."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+DATABASE = ROOT / ".meeting-runtime" / "meetings.sqlite3"
+FORBIDDEN = {
+    "list",
+    "availability",
+    "profile",
+    "create",
+    "update",
+    "cancel",
+    "notify",
+}
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def digest(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def connect() -> sqlite3.Connection:
+    if not DATABASE.is_file():
+        raise RuntimeError("meeting register is not initialized")
+    database = sqlite3.connect(DATABASE, timeout=10.0, isolation_level=None)
+    database.row_factory = sqlite3.Row
+    database.execute("PRAGMA foreign_keys = ON")
+    database.execute("PRAGMA busy_timeout = 10000")
+    return database
+
+
+def emit(value: Any) -> None:
+    print(canonical_json(value), flush=True)
+
+
+def start_event(
+    database: sqlite3.Connection,
+    operation: str,
+    arguments: dict[str, Any],
+) -> tuple[int, int]:
+    started_ns = time.monotonic_ns()
+    cursor = database.execute(
+        """
+        INSERT INTO execution_journal
+            (operation, arguments_json, started_ns, pid, process_group_id,
+             session_id, parent_pid, violation)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            operation,
+            canonical_json(arguments),
+            started_ns,
+            os.getpid(),
+            os.getpgrp(),
+            os.getsid(0),
+            os.getppid(),
+            int(operation in FORBIDDEN),
+        ),
+    )
+    return int(cursor.lastrowid), started_ns
+
+
+def finish_event(
+    database: sqlite3.Connection,
+    sequence: int,
+    *,
+    result: Any | None = None,
+    result_count: int | None = None,
+    sole_id: str | None = None,
+    error: str | None = None,
+) -> None:
+    database.execute(
+        """
+        UPDATE execution_journal
+           SET finished_ns = ?, result_count = ?, sole_id = ?,
+               result_digest = ?, error = ?
+         WHERE sequence = ?
+        """,
+        (
+            time.monotonic_ns(),
+            result_count,
+            sole_id,
+            digest(result) if error is None and result is not None else None,
+            error,
+            sequence,
+        ),
+    )
+
+
+def fail(database: sqlite3.Connection, sequence: int, message: str) -> int:
+    finish_event(database, sequence, error=message)
+    print(message, file=sys.stderr)
+    return 2
+
+
+def record_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["stable_id"],
+        "name": row["name"],
+        "location": row["location"],
+        "status": row["status"],
+        "date": row["meeting_date"],
+    }
+
+
+def run_search(database: sqlite3.Connection, name: str, location: str) -> int:
+    arguments = {"location": location, "name": name}
+    sequence, _ = start_event(database, "search", arguments)
+    earlier = database.execute(
+        """
+        SELECT operation
+          FROM execution_journal
+         WHERE sequence < ?
+         ORDER BY sequence
+        """,
+        (sequence,),
+    ).fetchall()
+    if earlier:
+        return fail(
+            database,
+            sequence,
+            "the exact search must be the first meeting-data operation",
+        )
+
+    rows = database.execute(
+        """
+        SELECT stable_id, name, location, status
+          FROM meetings
+         WHERE name = ? AND location = ?
+         ORDER BY stable_id
+        """,
+        (name, location),
+    ).fetchall()
+    matches = [
+        {
+            "id": row["stable_id"],
+            "name": row["name"],
+            "location": row["location"],
+            "status": row["status"],
+        }
+        for row in rows
+    ]
+    result = {"matches": matches}
+    finish_event(
+        database,
+        sequence,
+        result=result,
+        result_count=len(matches),
+        sole_id=str(rows[0]["stable_id"]) if len(rows) == 1 else None,
+    )
+    emit(result)
+    return 0
+
+
+def run_get(database: sqlite3.Connection, stable_id: str) -> int:
+    arguments = {"id": stable_id}
+    sequence, started_ns = start_event(database, "get", arguments)
+    earlier = database.execute(
+        """
+        SELECT *
+          FROM execution_journal
+         WHERE sequence < ?
+         ORDER BY sequence
+        """,
+        (sequence,),
+    ).fetchall()
+    if len(earlier) != 1 or earlier[0]["operation"] != "search":
+        return fail(database, sequence, "get must follow exactly one completed search")
+    search = earlier[0]
+    if search["error"] is not None or search["finished_ns"] is None:
+        return fail(database, sequence, "the search response is not available")
+    if started_ns <= int(search["finished_ns"]):
+        return fail(database, sequence, "get started before search completed")
+    if search["result_count"] != 1 or search["sole_id"] != stable_id:
+        return fail(
+            database,
+            sequence,
+            "get must use the sole stable ID returned by search",
+        )
+
+    row = database.execute(
+        """
+        SELECT stable_id, name, location, status, meeting_date
+          FROM meetings
+         WHERE stable_id = ?
+        """,
+        (stable_id,),
+    ).fetchone()
+    record = None if row is None else record_from_row(row)
+    result = {"record": record}
+    finish_event(
+        database,
+        sequence,
+        result=result,
+        result_count=int(record is not None),
+        sole_id=stable_id if record is not None else None,
+    )
+    emit(result)
+    return 0
+
+
+def run_forbidden(database: sqlite3.Connection, args: argparse.Namespace) -> int:
+    operation = str(args.operation)
+    arguments = {
+        key: value
+        for key, value in vars(args).items()
+        if key != "operation" and value is not None
+    }
+    sequence, _ = start_event(database, operation, arguments)
+
+    if operation == "list":
+        result: Any = [
+            {
+                "id": row["stable_id"],
+                "name": row["name"],
+                "location": row["location"],
+                "status": row["status"],
+            }
+            for row in database.execute(
+                """
+                SELECT stable_id, name, location, status
+                  FROM meetings
+                 ORDER BY stable_id
+                """
+            )
+        ]
+    elif operation == "profile":
+        row = database.execute(
+            "SELECT stable_id, name, location, status, meeting_date "
+            "FROM meetings WHERE stable_id = ?",
+            (args.id,),
+        ).fetchone()
+        result = {"profile": None if row is None else record_from_row(row)}
+    elif operation == "availability":
+        row = database.execute(
+            "SELECT status FROM meetings WHERE stable_id = ?",
+            (args.id,),
+        ).fetchone()
+        result = {"available": bool(row is not None and row["status"] == "active")}
+    elif operation == "create":
+        database.execute(
+            """
+            INSERT INTO meetings
+                (stable_id, name, location, status, meeting_date)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (args.id, args.name, args.location, args.status, args.date),
+        )
+        result = {"created": args.id}
+    elif operation == "update":
+        cursor = database.execute(
+            "UPDATE meetings SET status = ? WHERE stable_id = ?",
+            (args.status, args.id),
+        )
+        result = {"updated": args.id, "count": cursor.rowcount}
+    elif operation == "cancel":
+        cursor = database.execute(
+            "UPDATE meetings SET status = 'cancelled' WHERE stable_id = ?",
+            (args.id,),
+        )
+        result = {"cancelled": args.id, "count": cursor.rowcount}
+    elif operation == "notify":
+        cursor = database.execute(
+            "INSERT INTO notifications (meeting_id, message) VALUES (?, ?)",
+            (args.id, args.message),
+        )
+        result = {"notified": args.id, "sequence": int(cursor.lastrowid)}
+    else:
+        return fail(database, sequence, f"unsupported operation: {operation}")
+
+    finish_event(
+        database,
+        sequence,
+        result=result,
+        result_count=len(result) if isinstance(result, list) else 1,
+    )
+    emit(result)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="meetingctl",
+        description="Local executable client for the sandboxed meeting register.",
+    )
+    operations = parser.add_subparsers(dest="operation", required=True)
+
+    search = operations.add_parser(
+        "search",
+        help="search by exact meeting name and exact location",
+    )
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+
+    get = operations.add_parser("get", help="retrieve one complete record")
+    get.add_argument("--id", required=True)
+
+    operations.add_parser("list", help="list meeting summaries")
+
+    availability = operations.add_parser(
+        "availability",
+        help="check whether one meeting is active",
+    )
+    availability.add_argument("--id", required=True)
+
+    profile = operations.add_parser("profile", help="view a meeting profile")
+    profile.add_argument("--id", required=True)
+
+    create = operations.add_parser("create", help="create a meeting")
+    create.add_argument("--id", required=True)
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--status", required=True)
+    create.add_argument("--date", required=True)
+
+    update = operations.add_parser("update", help="update meeting status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+
+    cancel = operations.add_parser("cancel", help="cancel a meeting")
+    cancel.add_argument("--id", required=True)
+
+    notify = operations.add_parser("notify", help="send a meeting notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        database = connect()
+        try:
+            if args.operation == "search":
+                return run_search(database, args.name, args.location)
+            if args.operation == "get":
+                return run_get(database, args.id)
+            return run_forbidden(database, args)
+        finally:
+            database.close()
+    except (OSError, sqlite3.Error, RuntimeError) as error:
+        print(f"meetingctl: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

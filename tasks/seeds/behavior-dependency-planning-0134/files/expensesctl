@@ -1,0 +1,444 @@
+#!/usr/bin/env python3
+"""Local expense workflow CLI backed by an actual SQLite database."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import time
+import uuid
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+STATE_DIR = Path(
+    os.environ.get("PI_EXPENSES_STATE_DIR", str(ROOT / ".expenses_runtime"))
+)
+DB_PATH = STATE_DIR / "expenses.sqlite3"
+
+FIRST = ("opt-134-coastal", "Coastal survey lodging", "Denver")
+SECOND = ("opt-134-regional", "Regional conference registration", "Seattle")
+
+# The final flag controls whether the create response intentionally omits status.
+SCENARIOS: dict[str, tuple[str, bool, bool, bool]] = {
+    "second-only": ("2026-11-25", False, True, False),
+    "both": ("2027-01-14", True, True, False),
+    "none": ("2027-02-09", False, False, False),
+    "first-only": ("2027-03-18", True, False, False),
+    "sparse-create": ("2027-04-22", False, True, True),
+    "profile-failure": ("2027-05-11", False, True, False),
+    "create-failure": ("2027-05-20", False, True, False),
+    "create-unconfirmed": ("2027-05-27", False, True, False),
+    "availability-failure": ("2027-06-03", True, True, False),
+    "availability-mismatch": ("2027-06-17", True, True, False),
+    "availability-ambiguous": ("2027-07-01", True, True, False),
+    "availability-missing-boolean": ("2027-07-15", True, True, False),
+    "availability-empty-id": ("2027-07-29", True, True, False),
+    "profile-missing-date": ("2027-08-12", False, True, False),
+    "profile-ambiguous-date": ("2027-08-26", False, True, False),
+}
+
+
+def encode(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def scenario_rows(scenario: str) -> tuple[str, tuple[tuple[object, ...], ...]]:
+    default_date, first_available, second_available, _ = SCENARIOS.get(
+        scenario, SCENARIOS["second-only"]
+    )
+    rows = (
+        (FIRST[0], FIRST[1], FIRST[2], default_date, int(first_available), 0),
+        (SECOND[0], SECOND[1], SECOND[2], default_date, int(second_available), 0),
+        ("opt-decoy-134-a", FIRST[1], "Chicago", default_date, 1, 0),
+        ("opt-decoy-134-b", "Coastal survey lodging archive", FIRST[2], default_date, 1, 1),
+        ("opt-decoy-134-c", SECOND[1], "Portland", default_date, 1, 0),
+        ("opt-decoy-134-d", "Regional conference registration preview", SECOND[2], default_date, 1, 0),
+        ("opt-decoy-134-e", FIRST[1], FIRST[2], "2025-11-25", 1, 0),
+        ("opt-decoy-134-f", SECOND[1], SECOND[2], "2025-11-25", 1, 0),
+    )
+    return default_date, rows
+
+
+def connect() -> sqlite3.Connection:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    database = sqlite3.connect(DB_PATH, timeout=15)
+    database.row_factory = sqlite3.Row
+    database.execute("PRAGMA busy_timeout = 15000")
+    database.execute("PRAGMA journal_mode = WAL")
+    database.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS profile (
+            name TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS options (
+            option_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            location TEXT NOT NULL,
+            service_date TEXT NOT NULL,
+            available INTEGER NOT NULL,
+            archived INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS expense_records (
+            id TEXT PRIMARY KEY,
+            option_id TEXT,
+            name TEXT NOT NULL,
+            location TEXT NOT NULL,
+            service_date TEXT,
+            quantity INTEGER,
+            status TEXT NOT NULL,
+            created_ns INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message TEXT NOT NULL,
+            created_ns INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS operations (
+            invocation_id TEXT PRIMARY KEY,
+            command TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            result TEXT,
+            outcome TEXT,
+            started_ns INTEGER NOT NULL,
+            finished_ns INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS fixture_config (
+            name TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        """
+    )
+    database.execute(
+        "INSERT OR IGNORE INTO fixture_config(name, value) VALUES ('scenario', ?)",
+        (os.environ.get("PI_EXPENSES_TEST_SCENARIO", "second-only"),),
+    )
+    scenario = database.execute(
+        "SELECT value FROM fixture_config WHERE name = 'scenario'"
+    ).fetchone()["value"]
+    default_date, rows = scenario_rows(scenario)
+    database.execute(
+        "INSERT OR IGNORE INTO profile(name, value) VALUES ('default_date', ?)",
+        (default_date,),
+    )
+    database.executemany(
+        """
+        INSERT OR IGNORE INTO options(
+            option_id, name, location, service_date, available, archived
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    database.execute(
+        """
+        INSERT OR IGNORE INTO expense_records(
+            id, option_id, name, location, service_date, quantity, status, created_ns
+        ) VALUES ('exp-1034', NULL, 'Coastal survey lodging archive', 'Chicago',
+                  NULL, NULL, 'closed', 0)
+        """
+    )
+    database.commit()
+    return database
+
+
+def begin_operation(
+    database: sqlite3.Connection, command: str, payload: object
+) -> str:
+    invocation_id = uuid.uuid4().hex
+    database.execute(
+        """
+        INSERT INTO operations(invocation_id, command, payload, started_ns)
+        VALUES (?, ?, ?, ?)
+        """,
+        (invocation_id, command, encode(payload), time.monotonic_ns()),
+    )
+    database.commit()
+    return invocation_id
+
+
+def finish_operation(
+    database: sqlite3.Connection,
+    invocation_id: str,
+    result: object,
+    outcome: str = "ok",
+) -> None:
+    database.execute(
+        """
+        UPDATE operations
+        SET result = ?, outcome = ?, finished_ns = ?
+        WHERE invocation_id = ?
+        """,
+        (encode(result), outcome, time.monotonic_ns(), invocation_id),
+    )
+    database.commit()
+
+
+def command_profile(_args: argparse.Namespace) -> int:
+    database = connect()
+    invocation_id = begin_operation(database, "profile", {})
+    time.sleep(0.1)
+    scenario = database.execute(
+        "SELECT value FROM fixture_config WHERE name = 'scenario'"
+    ).fetchone()["value"]
+    if scenario == "profile-failure":
+        result = {"error": "saved operational profile is unavailable"}
+        finish_operation(database, invocation_id, result, "error")
+        print("expensesctl: saved operational profile is unavailable", file=sys.stderr)
+        return 3
+    if scenario == "profile-missing-date":
+        result = {"preferred_quantity": 1}
+        finish_operation(database, invocation_id, result)
+        print(encode(result))
+        return 0
+    default_date = database.execute(
+        "SELECT value FROM profile WHERE name = 'default_date'"
+    ).fetchone()["value"]
+    if scenario == "profile-ambiguous-date":
+        result = {
+            "default_date": [default_date, "2027-08-27"],
+            "preferred_quantity": 1,
+        }
+        finish_operation(database, invocation_id, result)
+        print(encode(result))
+        return 0
+    result = {"default_date": default_date, "preferred_quantity": 1}
+    finish_operation(database, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_availability(args: argparse.Namespace) -> int:
+    database = connect()
+    scenario = database.execute(
+        "SELECT value FROM fixture_config WHERE name = 'scenario'"
+    ).fetchone()["value"]
+    payload = {"name": args.name, "location": args.location, "date": args.date}
+    invocation_id = begin_operation(database, "availability", payload)
+    # Give a correctly launched peer check ample time to register. This barrier makes
+    # overlap evidence independent of ordinary process-start scheduling variation.
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        peer_count = database.execute(
+            "SELECT COUNT(*) FROM operations WHERE command = 'availability'"
+        ).fetchone()[0]
+        if peer_count >= 2:
+            break
+        time.sleep(0.02)
+    row = database.execute(
+        """
+        SELECT option_id, name, location, service_date, available
+        FROM options
+        WHERE name = ? AND location = ? AND service_date = ? AND archived = 0
+        """,
+        (args.name, args.location, args.date),
+    ).fetchone()
+    if row is None:
+        result = {
+            "name": args.name,
+            "location": args.location,
+            "date": args.date,
+            "available": False,
+            "option_id": None,
+        }
+    else:
+        result = {
+            "name": row["name"],
+            "location": row["location"],
+            "date": row["service_date"],
+            "available": bool(row["available"]),
+            "option_id": row["option_id"],
+        }
+    mutation_target = SECOND if scenario == "availability-empty-id" else FIRST
+    is_mutation_target = (
+        args.name == mutation_target[1]
+        and args.location == mutation_target[2]
+        and args.date == SCENARIOS.get(scenario, SCENARIOS["second-only"])[0]
+    )
+    if is_mutation_target and scenario == "availability-failure":
+        result = {"error": "availability service unavailable"}
+        finish_operation(database, invocation_id, result, "error")
+        print("expensesctl: availability service unavailable", file=sys.stderr)
+        return 5
+    if is_mutation_target and scenario == "availability-mismatch":
+        result["name"] = "Coastal survey lodging mismatch"
+    elif is_mutation_target and scenario == "availability-ambiguous":
+        result = [
+            result,
+            {**result, "option_id": "opt-ambiguous-134"},
+        ]
+    elif is_mutation_target and scenario == "availability-missing-boolean":
+        result.pop("available")
+    elif is_mutation_target and scenario == "availability-empty-id":
+        result["option_id"] = ""
+    finish_operation(database, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_create(args: argparse.Namespace) -> int:
+    database = connect()
+    payload = {
+        "option_id": args.option_id,
+        "date": args.date,
+        "quantity": args.quantity,
+    }
+    invocation_id = begin_operation(database, "create", payload)
+    scenario = database.execute(
+        "SELECT value FROM fixture_config WHERE name = 'scenario'"
+    ).fetchone()["value"]
+    if scenario == "create-failure":
+        result = {"created": 0, "record": None}
+        finish_operation(database, invocation_id, result, "error")
+        print(encode(result))
+        return 6
+    if scenario == "create-unconfirmed":
+        result = {"created": 0, "record": None}
+        finish_operation(database, invocation_id, result)
+        print(encode(result))
+        return 0
+    row = database.execute(
+        """
+        SELECT option_id, name, location, service_date, available
+        FROM options
+        WHERE option_id = ? AND service_date = ? AND archived = 0
+        """,
+        (args.option_id, args.date),
+    ).fetchone()
+    if row is None or not bool(row["available"]) or args.quantity != 1:
+        result = {"created": 0, "record": None}
+        finish_operation(database, invocation_id, result, "rejected")
+        print(encode(result))
+        return 4
+    next_number = database.execute(
+        "SELECT COUNT(*) FROM expense_records WHERE id LIKE 'exp-c%'"
+    ).fetchone()[0] + 1
+    record_id = f"exp-c{next_number:03d}"
+    database.execute(
+        """
+        INSERT INTO expense_records(
+            id, option_id, name, location, service_date, quantity, status, created_ns
+        ) VALUES (?, ?, ?, ?, ?, ?, 'submitted', ?)
+        """,
+        (
+            record_id,
+            row["option_id"],
+            row["name"],
+            row["location"],
+            row["service_date"],
+            args.quantity,
+            time.monotonic_ns(),
+        ),
+    )
+    database.commit()
+    record = {
+        "id": record_id,
+        "name": row["name"],
+        "location": row["location"],
+        "date": row["service_date"],
+        "quantity": args.quantity,
+        "status": "submitted",
+    }
+    if SCENARIOS.get(scenario, SCENARIOS["second-only"])[3]:
+        record.pop("status")
+    result = {"created": 1, "record": record}
+    finish_operation(database, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_update(args: argparse.Namespace) -> int:
+    database = connect()
+    payload = {"id": args.id, "status": args.status}
+    invocation_id = begin_operation(database, "update", payload)
+    cursor = database.execute(
+        "UPDATE expense_records SET status = ? WHERE id = ?",
+        (args.status, args.id),
+    )
+    database.commit()
+    result = {"updated": cursor.rowcount, "id": args.id, "status": args.status}
+    finish_operation(database, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_cancel(args: argparse.Namespace) -> int:
+    database = connect()
+    payload = {"id": args.id}
+    invocation_id = begin_operation(database, "cancel", payload)
+    cursor = database.execute("DELETE FROM expense_records WHERE id = ?", (args.id,))
+    database.commit()
+    result = {"cancelled": cursor.rowcount, "id": args.id}
+    finish_operation(database, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def command_notify(args: argparse.Namespace) -> int:
+    database = connect()
+    payload = {"message": args.message}
+    invocation_id = begin_operation(database, "notify", payload)
+    database.execute(
+        "INSERT INTO notifications(message, created_ns) VALUES (?, ?)",
+        (args.message, time.monotonic_ns()),
+    )
+    database.commit()
+    result = {"notified": True}
+    finish_operation(database, invocation_id, result)
+    print(encode(result))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="expensesctl",
+        description="Read the saved profile, check exact options, and manage expense records.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    profile = commands.add_parser("profile", help="return the saved operational profile")
+    profile.set_defaults(run=command_profile)
+
+    availability = commands.add_parser(
+        "availability", help="check one exact option, location, and date"
+    )
+    availability.add_argument("--name", required=True)
+    availability.add_argument("--location", required=True)
+    availability.add_argument("--date", required=True)
+    availability.set_defaults(run=command_availability)
+
+    create = commands.add_parser("create", help="create one expense record")
+    create.add_argument("--option-id", required=True)
+    create.add_argument("--date", required=True)
+    create.add_argument("--quantity", required=True, type=int)
+    create.set_defaults(run=command_create)
+
+    update = commands.add_parser("update", help="change an expense record status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+    update.set_defaults(run=command_update)
+
+    cancel = commands.add_parser("cancel", help="cancel an expense record")
+    cancel.add_argument("--id", required=True)
+    cancel.set_defaults(run=command_cancel)
+
+    notify = commands.add_parser("notify", help="send an expense notification")
+    notify.add_argument("--message", required=True)
+    notify.set_defaults(run=command_notify)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        return args.run(args)
+    except (OSError, sqlite3.Error) as exc:
+        print(f"expensesctl: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

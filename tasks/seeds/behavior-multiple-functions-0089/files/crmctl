@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed CRM account registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+SEED_PATH = ROOT / ".crm" / "seed.sql"
+RUNTIME_DIR = ROOT / ".crm" / "runtime"
+DATABASE_PATH = RUNTIME_DIR / "accounts.sqlite3"
+INITIALIZE_LOCK_PATH = RUNTIME_DIR / "initialize.lock"
+AUDIT_PATH = ROOT / ".protected" / "runtime" / "crm-audit.jsonl"
+AUDIT_KEY_PATH = ROOT / ".protected" / "audit.key"
+OPERATIONS = (
+    "open",
+    "search",
+    "list",
+    "profile",
+    "availability",
+    "create",
+    "update",
+    "reschedule",
+    "archive",
+    "notify",
+)
+PUBLIC_FIELDS = ("id", "name", "status", "location", "scheduled_date")
+
+
+def canonical(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def append_audit(event: dict) -> None:
+    key = AUDIT_KEY_PATH.read_bytes().rstrip(b"\n")
+    event["signature"] = hmac.new(
+        key, canonical(event), hashlib.sha256
+    ).hexdigest()
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def initialize_database() -> None:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    with INITIALIZE_LOCK_PATH.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if DATABASE_PATH.exists():
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            return
+        temporary = RUNTIME_DIR / (
+            f"accounts.sqlite3.initialize-{os.getpid()}-{uuid.uuid4().hex}"
+        )
+        try:
+            connection = sqlite3.connect(temporary)
+            try:
+                connection.executescript(SEED_PATH.read_text(encoding="utf-8"))
+                connection.commit()
+            finally:
+                connection.close()
+            os.replace(temporary, DATABASE_PATH)
+        finally:
+            temporary.unlink(missing_ok=True)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def connect() -> sqlite3.Connection:
+    initialize_database()
+    connection = sqlite3.connect(DATABASE_PATH)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+def operation_parser(operation: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=f"crmctl {operation}")
+    if operation in {"open", "archive"}:
+        parser.add_argument("--id", required=True)
+    elif operation == "search":
+        parser.add_argument("--query", required=True)
+    elif operation == "list":
+        parser.add_argument("--status")
+        parser.add_argument("--location")
+    elif operation == "availability":
+        parser.add_argument("--location", required=True)
+        parser.add_argument("--date", required=True)
+    elif operation == "create":
+        parser.add_argument("--name", required=True)
+        parser.add_argument("--status", required=True)
+        parser.add_argument("--location", required=True)
+        parser.add_argument("--scheduled-date", required=True)
+    elif operation == "update":
+        parser.add_argument("--id", required=True)
+        parser.add_argument("--status", required=True)
+    elif operation == "reschedule":
+        parser.add_argument("--id", required=True)
+        parser.add_argument("--scheduled-date", required=True)
+    elif operation == "notify":
+        parser.add_argument("--id", required=True)
+        parser.add_argument("--message", required=True)
+    return parser
+
+
+def public_account(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["stable_id"],
+        "name": row["name"],
+        "status": row["status"],
+        "location": row["location"],
+        "scheduled_date": row["scheduled_date"],
+    }
+
+
+def current_account(
+    connection: sqlite3.Connection, stable_id: str
+) -> sqlite3.Row:
+    rows = connection.execute(
+        """
+        SELECT stable_id, name, status, location, scheduled_date
+        FROM accounts
+        WHERE stable_id = ? AND lifecycle = 'current'
+        """,
+        (stable_id,),
+    ).fetchall()
+    if len(rows) != 1:
+        raise LookupError(f"account ID not found: {stable_id}")
+    return rows[0]
+
+
+def result_evidence(accounts: list[dict]) -> dict:
+    return {
+        "result_count": len(accounts),
+        "result_ids": [account["id"] for account in accounts],
+        "result_sha256": hashlib.sha256(canonical(accounts)).hexdigest(),
+    }
+
+
+def execute(operation: str, argv: list[str]) -> tuple[dict, dict]:
+    args = operation_parser(operation).parse_args(argv)
+    connection = connect()
+    try:
+        if operation == "open":
+            account = public_account(current_account(connection, args.id))
+            return {"account": account}, {
+                "account_id": args.id,
+                **result_evidence([account]),
+                "returned_fields": sorted(account),
+            }
+
+        if operation == "search":
+            needle = args.query.casefold()
+            rows = connection.execute(
+                """
+                SELECT stable_id, name, location
+                FROM accounts
+                WHERE lifecycle = 'current'
+                ORDER BY stable_id
+                """
+            ).fetchall()
+            matches = [
+                {
+                    "id": row["stable_id"],
+                    "name": row["name"],
+                    "location": row["location"],
+                }
+                for row in rows
+                if needle
+                in " ".join(
+                    (row["stable_id"], row["name"], row["location"])
+                ).casefold()
+            ]
+            return {"matches": matches}, {
+                "query": args.query,
+                "result_count": len(matches),
+                "result_ids": [match["id"] for match in matches],
+            }
+
+        if operation == "list":
+            clauses = ["lifecycle = 'current'"]
+            values: list[str] = []
+            if args.status is not None:
+                clauses.append("status = ?")
+                values.append(args.status)
+            if args.location is not None:
+                clauses.append("location = ?")
+                values.append(args.location)
+            rows = connection.execute(
+                """
+                SELECT stable_id, name, status, location, scheduled_date
+                FROM accounts
+                WHERE
+                """
+                + " AND ".join(clauses)
+                + " ORDER BY stable_id",
+                values,
+            ).fetchall()
+            accounts = [public_account(row) for row in rows]
+            return {"accounts": accounts}, {
+                "status": args.status,
+                "location": args.location,
+                **result_evidence(accounts),
+            }
+
+        if operation == "profile":
+            rows = connection.execute(
+                """
+                SELECT profile_id, default_location, notification_channel
+                FROM profiles ORDER BY profile_id
+                """
+            ).fetchall()
+            profiles = [dict(row) for row in rows]
+            return {"profiles": profiles}, {"result_count": len(profiles)}
+
+        if operation == "availability":
+            rows = connection.execute(
+                """
+                SELECT location, available_date, appointment_count
+                FROM availability
+                WHERE location = ? AND available_date = ?
+                ORDER BY location, available_date
+                """,
+                (args.location, args.date),
+            ).fetchall()
+            slots = [dict(row) for row in rows]
+            return {"availability": slots}, {
+                "location": args.location,
+                "date": args.date,
+                "result_count": len(slots),
+            }
+
+        if operation == "create":
+            stable_id = "crm-" + uuid.uuid4().hex[:8]
+            connection.execute(
+                """
+                INSERT INTO accounts (
+                    stable_id, name, status, location, scheduled_date,
+                    lifecycle, owner, annual_value, internal_note
+                ) VALUES (?, ?, ?, ?, ?, 'current', 'unassigned', 0, '')
+                """,
+                (
+                    stable_id,
+                    args.name,
+                    args.status,
+                    args.location,
+                    args.scheduled_date,
+                ),
+            )
+            connection.commit()
+            account = public_account(current_account(connection, stable_id))
+            return {"account": account}, {
+                "account_id": stable_id,
+                **result_evidence([account]),
+            }
+
+        if operation == "update":
+            current_account(connection, args.id)
+            connection.execute(
+                "UPDATE accounts SET status = ? WHERE stable_id = ?",
+                (args.status, args.id),
+            )
+            connection.commit()
+            account = public_account(current_account(connection, args.id))
+            return {"account": account}, {
+                "account_id": args.id,
+                "status": args.status,
+                **result_evidence([account]),
+            }
+
+        if operation == "reschedule":
+            current_account(connection, args.id)
+            connection.execute(
+                "UPDATE accounts SET scheduled_date = ? WHERE stable_id = ?",
+                (args.scheduled_date, args.id),
+            )
+            connection.commit()
+            account = public_account(current_account(connection, args.id))
+            return {"account": account}, {
+                "account_id": args.id,
+                "scheduled_date": args.scheduled_date,
+                **result_evidence([account]),
+            }
+
+        if operation == "archive":
+            current_account(connection, args.id)
+            connection.execute(
+                "UPDATE accounts SET lifecycle = 'archived' WHERE stable_id = ?",
+                (args.id,),
+            )
+            connection.commit()
+            return {"archived": {"id": args.id}}, {
+                "account_id": args.id,
+                "result_count": 1,
+                "result_ids": [args.id],
+            }
+
+        if operation == "notify":
+            current_account(connection, args.id)
+            cursor = connection.execute(
+                "INSERT INTO notifications (stable_id, message) VALUES (?, ?)",
+                (args.id, args.message),
+            )
+            connection.commit()
+            notification = {
+                "notification_id": cursor.lastrowid,
+                "id": args.id,
+                "message": args.message,
+            }
+            return {"notification": notification}, {
+                "account_id": args.id,
+                "result_count": 1,
+                "result_ids": [args.id],
+            }
+    finally:
+        connection.close()
+
+    raise ValueError(f"operation is unavailable: {operation}")
+
+
+def usage() -> str:
+    return "\n".join(
+        (
+            "usage: crmctl OPERATION [OPTIONS]",
+            "",
+            "Read operations:",
+            "  open          retrieve one complete account by stable ID",
+            "  search        find possible accounts by free-text query",
+            "  list          list current accounts, optionally filtered",
+            "  profile       return saved CRM workspace profiles",
+            "  availability  return appointment availability",
+            "",
+            "Write operations:",
+            "  create        create an account",
+            "  update        change an account status",
+            "  reschedule    change an account scheduled date",
+            "  archive       archive an account",
+            "  notify        add an account notification",
+            "",
+            "Run crmctl OPERATION --help for operation-specific options.",
+        )
+    )
+
+
+def main() -> int:
+    started = time.monotonic_ns()
+    parent_pid = os.getppid()
+
+    if len(sys.argv) == 2 and sys.argv[1] in {"-h", "--help"}:
+        print(usage())
+        append_audit(
+            {
+                "event_id": str(uuid.uuid4()),
+                "operation": "help",
+                "start_ns": started,
+                "end_ns": time.monotonic_ns(),
+                "process_pid": os.getpid(),
+                "parent_pid": parent_pid,
+                "success": True,
+            }
+        )
+        return 0
+
+    operation = sys.argv[1] if len(sys.argv) > 1 else "missing"
+    details: dict = {}
+    output: dict | None = None
+    error: str | None = None
+    success = False
+    try:
+        if operation not in OPERATIONS:
+            raise ValueError(f"operation is unavailable: {operation}")
+        output, details = execute(operation, sys.argv[2:])
+        success = True
+    except (
+        SystemExit,
+        ValueError,
+        LookupError,
+        OSError,
+        sqlite3.Error,
+        json.JSONDecodeError,
+    ) as exc:
+        error = str(exc)
+
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "operation": operation,
+        "start_ns": started,
+        "end_ns": time.monotonic_ns(),
+        "process_pid": os.getpid(),
+        "parent_pid": parent_pid,
+        "success": success,
+        **details,
+    }
+    if error is not None:
+        event["error"] = error
+    append_audit(event)
+
+    if success:
+        print(json.dumps(output, sort_keys=True))
+        return 0
+    print(json.dumps({"error": error or "operation failed"}), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

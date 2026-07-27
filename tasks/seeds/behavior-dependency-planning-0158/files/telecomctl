@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""File-backed telecom registry client for a Moonshiner Pi task."""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import time
+from typing import Any, Iterator
+
+
+ROOT = Path(__file__).resolve().parent
+STATE = ROOT / ".telecom"
+RECORDS = STATE / "records.json"
+NOTIFICATIONS = STATE / "notifications.json"
+AUDIT = STATE / "audit.jsonl"
+LOCK = STATE / "lock"
+KEY = ROOT / ".protected" / "audit.key"
+PARALLEL_WINDOW_SECONDS = 0.55
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def load_object(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{path.name} is not a JSON object")
+    return value
+
+
+def atomic_write(path: Path, value: dict[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(value, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+@contextmanager
+def state_lock(exclusive: bool) -> Iterator[None]:
+    with LOCK.open("a+b") as stream:
+        mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        fcntl.flock(stream.fileno(), mode)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def records(document: dict[str, Any]) -> list[dict[str, Any]]:
+    value = document.get("records")
+    if document.get("version") != 1 or not isinstance(value, list):
+        raise RuntimeError("records store has an invalid shape")
+    if not all(isinstance(item, dict) for item in value):
+        raise RuntimeError("records store contains an invalid record")
+    return value
+
+
+def find_record(items: list[dict[str, Any]], record_id: str) -> dict[str, Any] | None:
+    return next((item for item in items if item.get("id") == record_id), None)
+
+
+def record_digest(record: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical(record)).hexdigest()
+
+
+def append_event(event: dict[str, Any]) -> None:
+    with state_lock(True):
+        try:
+            existing = [line for line in AUDIT.read_text(encoding="utf-8").splitlines() if line]
+        except FileNotFoundError:
+            existing = []
+        signed = dict(event)
+        signed["sequence"] = len(existing) + 1
+        key = KEY.read_bytes().strip()
+        signed["seal"] = hmac.new(key, canonical(signed), hashlib.sha256).hexdigest()
+        with AUDIT.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(signed, ensure_ascii=False, sort_keys=True))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+
+
+def emit(value: Any) -> None:
+    json.dump(value, sys.stdout, ensure_ascii=False, sort_keys=True)
+    sys.stdout.write("\n")
+
+
+def interval_start() -> int:
+    started = time.monotonic_ns()
+    time.sleep(PARALLEL_WINDOW_SECONDS)
+    return started
+
+
+def get_record(record_id: str) -> int:
+    started = interval_start()
+    with state_lock(False):
+        document = load_object(RECORDS)
+        record = find_record(records(document), record_id)
+        result = dict(record) if record is not None else None
+    finished = time.monotonic_ns()
+    event: dict[str, Any] = {
+        "operation": "get",
+        "record_id": record_id,
+        "found": result is not None,
+        "outcome": "ok" if result is not None else "not-found",
+        "started_ns": started,
+        "finished_ns": finished,
+    }
+    if result is not None:
+        event["record_sha256"] = record_digest(result)
+        event["status"] = result.get("status")
+    append_event(event)
+    emit({"record": result})
+    return 0 if result is not None else 2
+
+
+def update_record(record_id: str, from_status: str, to_status: str) -> int:
+    started = interval_start()
+    with state_lock(True):
+        document = load_object(RECORDS)
+        record = find_record(records(document), record_id)
+        before = record.get("status") if record is not None else None
+        updated = bool(record is not None and before == from_status)
+        if updated:
+            record["status"] = to_status
+            atomic_write(RECORDS, document)
+        result = dict(record) if record is not None else None
+    finished = time.monotonic_ns()
+    append_event({
+        "operation": "update",
+        "record_id": record_id,
+        "required_status": from_status,
+        "before_status": before,
+        "after_status": result.get("status") if result is not None else None,
+        "updated": updated,
+        "outcome": "ok" if updated else ("not-found" if result is None else "precondition-failed"),
+        "started_ns": started,
+        "finished_ns": finished,
+    })
+    emit({"record": result, "updated": updated})
+    return 0 if result is not None else 2
+
+
+def search_records(name: str, location: str) -> int:
+    started = interval_start()
+    with state_lock(False):
+        items = records(load_object(RECORDS))
+        matches = [
+            {key: item.get(key) for key in ("id", "name", "location")}
+            for item in items
+            if item.get("name") == name and item.get("location") == location
+        ]
+    finished = time.monotonic_ns()
+    append_event({
+        "operation": "search",
+        "name": name,
+        "location": location,
+        "result_ids": [item.get("id") for item in matches],
+        "outcome": "ok",
+        "started_ns": started,
+        "finished_ns": finished,
+    })
+    emit({"matches": matches})
+    return 0
+
+
+def list_records() -> int:
+    started = interval_start()
+    with state_lock(False):
+        items = records(load_object(RECORDS))
+        summaries = [
+            {key: item.get(key) for key in ("id", "name", "location", "status")}
+            for item in items
+        ]
+    finished = time.monotonic_ns()
+    append_event({
+        "operation": "list",
+        "result_count": len(summaries),
+        "outcome": "ok",
+        "started_ns": started,
+        "finished_ns": finished,
+    })
+    emit({"records": summaries})
+    return 0
+
+
+def profile() -> int:
+    started = interval_start()
+    result = {"default_location": "Community Center", "review_window": "weekly"}
+    finished = time.monotonic_ns()
+    append_event({
+        "operation": "profile",
+        "outcome": "ok",
+        "started_ns": started,
+        "finished_ns": finished,
+    })
+    emit(result)
+    return 0
+
+
+def availability(record_id: str) -> int:
+    started = interval_start()
+    with state_lock(False):
+        record = find_record(records(load_object(RECORDS)), record_id)
+        available = bool(record is not None and record.get("status") in {"active", "pending-activation"})
+    finished = time.monotonic_ns()
+    append_event({
+        "operation": "availability",
+        "record_id": record_id,
+        "found": record is not None,
+        "outcome": "ok" if record is not None else "not-found",
+        "started_ns": started,
+        "finished_ns": finished,
+    })
+    emit({"id": record_id, "available": available} if record is not None else {"id": record_id, "available": None})
+    return 0 if record is not None else 2
+
+
+def create_record(record_id: str, name: str, location: str, status: str) -> int:
+    started = interval_start()
+    with state_lock(True):
+        document = load_object(RECORDS)
+        items = records(document)
+        created = find_record(items, record_id) is None
+        if created:
+            item = {"id": record_id, "name": name, "location": location, "status": status}
+            items.append(item)
+            atomic_write(RECORDS, document)
+        else:
+            item = None
+    finished = time.monotonic_ns()
+    append_event({
+        "operation": "create",
+        "record_id": record_id,
+        "created": created,
+        "outcome": "ok" if created else "conflict",
+        "started_ns": started,
+        "finished_ns": finished,
+    })
+    emit({"record": item, "created": created})
+    return 0 if created else 3
+
+
+def cancel_record(record_id: str) -> int:
+    started = interval_start()
+    with state_lock(True):
+        document = load_object(RECORDS)
+        record = find_record(records(document), record_id)
+        before = record.get("status") if record is not None else None
+        if record is not None:
+            record["status"] = "cancelled"
+            atomic_write(RECORDS, document)
+        result = dict(record) if record is not None else None
+    finished = time.monotonic_ns()
+    append_event({
+        "operation": "cancel",
+        "record_id": record_id,
+        "before_status": before,
+        "outcome": "ok" if record is not None else "not-found",
+        "started_ns": started,
+        "finished_ns": finished,
+    })
+    emit({"record": result, "cancelled": record is not None})
+    return 0 if record is not None else 2
+
+
+def notify(record_id: str, message: str) -> int:
+    started = interval_start()
+    with state_lock(True):
+        document = load_object(NOTIFICATIONS)
+        values = document.get("notifications")
+        if not isinstance(values, list):
+            raise RuntimeError("notification store has an invalid shape")
+        values.append({"record_id": record_id, "message": message})
+        atomic_write(NOTIFICATIONS, document)
+    finished = time.monotonic_ns()
+    append_event({
+        "operation": "notify",
+        "record_id": record_id,
+        "outcome": "ok",
+        "started_ns": started,
+        "finished_ns": finished,
+    })
+    emit({"notified": True, "record_id": record_id})
+    return 0
+
+
+def show_help() -> int:
+    started = time.monotonic_ns()
+    parser().print_help()
+    finished = time.monotonic_ns()
+    append_event({
+        "operation": "help",
+        "scope": "top-level",
+        "outcome": "ok",
+        "started_ns": started,
+        "finished_ns": finished,
+    })
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        prog="telecomctl",
+        description="Execute operations against the sandbox telecom registry.",
+    )
+    commands = result.add_subparsers(dest="operation", required=True)
+
+    get = commands.add_parser("get", help="return one complete record by stable ID")
+    get.add_argument("--id", required=True)
+
+    update = commands.add_parser("update", help="conditionally replace one record status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--from-status", required=True)
+    update.add_argument("--to-status", required=True)
+
+    search = commands.add_parser("search", help="find summaries by exact name and location")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+
+    commands.add_parser("list", help="list record summaries")
+    commands.add_parser("profile", help="return saved operating defaults")
+
+    available = commands.add_parser("availability", help="check availability by stable ID")
+    available.add_argument("--id", required=True)
+
+    create = commands.add_parser("create", help="create a record")
+    create.add_argument("--id", required=True)
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--status", required=True)
+
+    cancel = commands.add_parser("cancel", help="cancel one record")
+    cancel.add_argument("--id", required=True)
+
+    notice = commands.add_parser("notify", help="record an outbound notification")
+    notice.add_argument("--id", required=True)
+    notice.add_argument("--message", required=True)
+    return result
+
+
+def main() -> int:
+    if sys.argv[1:] in (["-h"], ["--help"]):
+        return show_help()
+    arguments = parser().parse_args()
+    if arguments.operation == "get":
+        return get_record(arguments.id)
+    if arguments.operation == "update":
+        return update_record(arguments.id, arguments.from_status, arguments.to_status)
+    if arguments.operation == "search":
+        return search_records(arguments.name, arguments.location)
+    if arguments.operation == "list":
+        return list_records()
+    if arguments.operation == "profile":
+        return profile()
+    if arguments.operation == "availability":
+        return availability(arguments.id)
+    if arguments.operation == "create":
+        return create_record(arguments.id, arguments.name, arguments.location, arguments.status)
+    if arguments.operation == "cancel":
+        return cancel_record(arguments.id)
+    if arguments.operation == "notify":
+        return notify(arguments.id, arguments.message)
+    raise RuntimeError("unhandled operation")
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, RuntimeError, json.JSONDecodeError) as error:
+        print(f"telecomctl: {error}", file=sys.stderr)
+        raise SystemExit(1)

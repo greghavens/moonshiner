@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""Sandboxed public-services records bridge."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import hmac
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+STATE_DIR = ROOT / ".records"
+APPLICATIONS_PATH = STATE_DIR / "applications.json"
+NOTIFICATIONS_PATH = STATE_DIR / "notifications.json"
+PROFILE_PATH = STATE_DIR / "profile.json"
+AUDIT_PATH = STATE_DIR / "audit.jsonl"
+AUDIT_KEY_PATH = ROOT / ".protected" / "audit.key"
+
+
+def compact(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def load_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def applications() -> list[dict[str, Any]]:
+    value = load_json(APPLICATIONS_PATH)
+    records = value.get("applications")
+    if not isinstance(records, list):
+        raise RuntimeError("applications state is malformed")
+    return records
+
+
+def notifications() -> list[dict[str, Any]]:
+    value = load_json(NOTIFICATIONS_PATH)
+    records = value.get("notifications")
+    if not isinstance(records, list):
+        raise RuntimeError("notifications state is malformed")
+    return records
+
+
+def next_sequence() -> int:
+    if not AUDIT_PATH.exists():
+        return 1
+    return sum(1 for line in AUDIT_PATH.read_text(encoding="utf-8").splitlines() if line) + 1
+
+
+def audit(fields: dict[str, Any]) -> None:
+    event = {"sequence": next_sequence(), **fields}
+    key = bytes.fromhex(AUDIT_KEY_PATH.read_text(encoding="utf-8").strip())
+    event["seal"] = hmac.new(
+        key, compact(event).encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    with AUDIT_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(compact(event) + "\n")
+
+
+def find_record(record_id: str) -> dict[str, Any] | None:
+    return next(
+        (record for record in applications() if record.get("id") == record_id),
+        None,
+    )
+
+
+def record_hash(record: dict[str, Any]) -> str:
+    return hashlib.sha256(compact(record).encode("utf-8")).hexdigest()
+
+
+def parser() -> argparse.ArgumentParser:
+    bridge = argparse.ArgumentParser(
+        prog="records-bridge",
+        description=(
+            "Execute public-services operations against the sandboxed application queue.\n"
+            "public-services_get is inherently read-only.\n"
+            "Literal envelope grammar (no spaces or newline outside the tags):\n"
+            '<tool_call>FUNCTION(id="STABLE_ID")</tool_call>'
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    commands = bridge.add_subparsers(dest="operation", required=True)
+
+    get = commands.add_parser(
+        "public-services_get", help="retrieve one complete application by stable ID"
+    )
+    get.add_argument("--id", required=True, dest="record_id")
+
+    search = commands.add_parser(
+        "public-services_search", help="search applications by exact name and location"
+    )
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+
+    commands.add_parser("public-services_list", help="list application summaries")
+    commands.add_parser("public-services_profile", help="show the saved operator profile")
+
+    update = commands.add_parser(
+        "public-services_update", help="change one application's status"
+    )
+    update.add_argument("--id", required=True, dest="record_id")
+    update.add_argument("--status", required=True)
+
+    cancel = commands.add_parser(
+        "public-services_cancel", help="mark one application cancelled"
+    )
+    cancel.add_argument("--id", required=True, dest="record_id")
+
+    notify = commands.add_parser(
+        "public-services_notify", help="send a notification about one application"
+    )
+    notify.add_argument("--id", required=True, dest="record_id")
+    notify.add_argument("--message", required=True)
+    return bridge
+
+
+def run(args: argparse.Namespace) -> dict[str, Any]:
+    operation = args.operation
+
+    if operation == "public-services_get":
+        record = find_record(args.record_id)
+        audit(
+            {
+                "found": record is not None,
+                "operation": operation,
+                "read_only": True,
+                "record_id": args.record_id,
+                "record_sha256": record_hash(record) if record is not None else None,
+            }
+        )
+        return {"record": record}
+
+    if operation == "public-services_search":
+        matches = [
+            {
+                "id": record["id"],
+                "location": record["location"],
+                "name": record["name"],
+            }
+            for record in applications()
+            if record.get("name") == args.name
+            and record.get("location") == args.location
+        ]
+        audit(
+            {
+                "location": args.location,
+                "name": args.name,
+                "operation": operation,
+                "read_only": True,
+                "result_ids": [match["id"] for match in matches],
+            }
+        )
+        return {"matches": matches}
+
+    if operation == "public-services_list":
+        summaries = [
+            {
+                "id": record["id"],
+                "location": record["location"],
+                "name": record["name"],
+            }
+            for record in applications()
+        ]
+        audit(
+            {
+                "operation": operation,
+                "read_only": True,
+                "result_ids": [record["id"] for record in summaries],
+            }
+        )
+        return {"applications": summaries}
+
+    if operation == "public-services_profile":
+        profile = load_json(PROFILE_PATH)
+        audit({"operation": operation, "read_only": True})
+        return {"profile": profile}
+
+    records = applications()
+    record = next(
+        (item for item in records if item.get("id") == args.record_id), None
+    )
+    if record is None:
+        audit(
+            {
+                "found": False,
+                "operation": operation,
+                "read_only": False,
+                "record_id": args.record_id,
+            }
+        )
+        return {"error": "application not found"}
+
+    if operation == "public-services_update":
+        before = record.get("status")
+        record["status"] = args.status
+        save_json(APPLICATIONS_PATH, {"applications": records})
+        audit(
+            {
+                "after_status": args.status,
+                "before_status": before,
+                "found": True,
+                "operation": operation,
+                "read_only": False,
+                "record_id": args.record_id,
+            }
+        )
+        return {"record": record, "updated": True}
+
+    if operation == "public-services_cancel":
+        before = record.get("status")
+        record["status"] = "cancelled"
+        save_json(APPLICATIONS_PATH, {"applications": records})
+        audit(
+            {
+                "after_status": "cancelled",
+                "before_status": before,
+                "found": True,
+                "operation": operation,
+                "read_only": False,
+                "record_id": args.record_id,
+            }
+        )
+        return {"cancelled": True, "record": record}
+
+    if operation == "public-services_notify":
+        queued = notifications()
+        queued.append({"id": args.record_id, "message": args.message})
+        save_json(NOTIFICATIONS_PATH, {"notifications": queued})
+        audit(
+            {
+                "found": True,
+                "message_sha256": hashlib.sha256(
+                    args.message.encode("utf-8")
+                ).hexdigest(),
+                "operation": operation,
+                "read_only": False,
+                "record_id": args.record_id,
+            }
+        )
+        return {"notified": True, "record_id": args.record_id}
+
+    raise RuntimeError(f"unsupported operation: {operation}")
+
+
+def main() -> int:
+    try:
+        if sys.argv[1:] == ["--help"]:
+            audit({"operation": "help", "read_only": True})
+        result = run(parser().parse_args())
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+        print(compact({"error": str(error)}), file=sys.stderr)
+        return 1
+    print(compact(result))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed campus course register."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+SEED_PATH = ROOT / ".course_data" / "seed.sql"
+RUNTIME = ROOT / ".course_data" / "runtime"
+DATABASE_PATH = RUNTIME / "courses.sqlite3"
+INITIALIZE_LOCK = RUNTIME / "initialize.lock"
+AUDIT_PATH = ROOT / ".protected" / "runtime" / "course-audit.jsonl"
+AUDIT_KEY = b"moonshiner-pi-course-audit-0192-v1"
+OPERATION_DELAY_SECONDS = 0.5
+OPERATIONS = ("search", "get", "update", "cancel", "notify")
+
+
+def canonical(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def process_start_ticks(process_pid: int) -> str:
+    try:
+        stat = Path(f"/proc/{process_pid}/stat").read_text(encoding="utf-8")
+        return stat.rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return "unavailable"
+
+
+def append_audit(event: dict) -> None:
+    event["signature"] = hmac.new(
+        AUDIT_KEY, canonical(event), hashlib.sha256
+    ).hexdigest()
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def ensure_database() -> None:
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    with INITIALIZE_LOCK.open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not DATABASE_PATH.exists():
+            temporary = RUNTIME / f"courses-{os.getpid()}.sqlite3.tmp"
+            temporary.unlink(missing_ok=True)
+            connection = sqlite3.connect(temporary)
+            try:
+                connection.executescript(SEED_PATH.read_text(encoding="utf-8"))
+                connection.commit()
+            finally:
+                connection.close()
+            os.replace(temporary, DATABASE_PATH)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        prog="coursectl",
+        description="Query the sandboxed campus course register.",
+    )
+    subcommands = result.add_subparsers(dest="operation", required=True)
+
+    search = subcommands.add_parser(
+        "search", help="find current courses by exact name and campus"
+    )
+    search.add_argument("--name", required=True)
+    search.add_argument("--campus", required=True)
+
+    get = subcommands.add_parser("get", help="retrieve one complete current record")
+    get.add_argument("--id", dest="stable_id", required=True)
+
+    update = subcommands.add_parser("update", help="change a course status")
+    update.add_argument("--id", dest="stable_id", required=True)
+    update.add_argument("--status", required=True)
+
+    cancel = subcommands.add_parser("cancel", help="cancel a course")
+    cancel.add_argument("--id", dest="stable_id", required=True)
+
+    notify = subcommands.add_parser("notify", help="send a course notification")
+    notify.add_argument("--id", dest="stable_id", required=True)
+    notify.add_argument("--message", required=True)
+    return result
+
+
+def record_for_id(connection: sqlite3.Connection, stable_id: str) -> dict:
+    row = connection.execute(
+        """
+        SELECT stable_id, name, campus, status, course_date, instructor, room,
+               lifecycle
+          FROM course_records
+         WHERE stable_id = ? AND lifecycle = 'current'
+        """,
+        (stable_id,),
+    ).fetchone()
+    if row is None:
+        raise LookupError(f"current stable ID not found: {stable_id}")
+    fields = (
+        "stable_id",
+        "name",
+        "campus",
+        "status",
+        "date",
+        "instructor",
+        "room",
+        "lifecycle",
+    )
+    return dict(zip(fields, row, strict=True))
+
+
+def execute(args: argparse.Namespace) -> tuple[dict, dict]:
+    ensure_database()
+    connection = sqlite3.connect(DATABASE_PATH, timeout=10)
+    try:
+        if args.operation == "search":
+            rows = connection.execute(
+                """
+                SELECT stable_id, name, campus
+                  FROM course_records
+                 WHERE name = ? AND campus = ? AND lifecycle = 'current'
+                 ORDER BY stable_id
+                """,
+                (args.name, args.campus),
+            ).fetchall()
+            matches = [
+                {"stable_id": row[0], "name": row[1], "campus": row[2]}
+                for row in rows
+            ]
+            return {"matches": matches}, {
+                "name": args.name,
+                "campus": args.campus,
+                "result_count": len(matches),
+                "result_ids": [match["stable_id"] for match in matches],
+            }
+
+        if args.operation == "get":
+            record = record_for_id(connection, args.stable_id)
+            return {"record": record}, {
+                "stable_id": args.stable_id,
+                "result_count": 1,
+            }
+
+        if args.operation == "update":
+            record_for_id(connection, args.stable_id)
+            connection.execute(
+                "UPDATE course_records SET status = ? WHERE stable_id = ?",
+                (args.status, args.stable_id),
+            )
+            connection.commit()
+            return {"record": record_for_id(connection, args.stable_id)}, {
+                "stable_id": args.stable_id,
+                "result_count": 1,
+            }
+
+        if args.operation == "cancel":
+            record_for_id(connection, args.stable_id)
+            connection.execute(
+                "UPDATE course_records SET status = 'cancelled' WHERE stable_id = ?",
+                (args.stable_id,),
+            )
+            connection.commit()
+            return {"cancelled": args.stable_id}, {
+                "stable_id": args.stable_id,
+                "result_count": 1,
+            }
+
+        if args.operation == "notify":
+            record_for_id(connection, args.stable_id)
+            cursor = connection.execute(
+                "INSERT INTO notifications (stable_id, message) VALUES (?, ?)",
+                (args.stable_id, args.message),
+            )
+            connection.commit()
+            return {
+                "notification": {
+                    "notification_id": cursor.lastrowid,
+                    "stable_id": args.stable_id,
+                }
+            }, {"stable_id": args.stable_id, "result_count": 1}
+    finally:
+        connection.close()
+    raise ValueError(f"operation is unavailable: {args.operation}")
+
+
+def main() -> int:
+    args = parser().parse_args()
+    start_ns = time.monotonic_ns()
+    parent_pid = os.getppid()
+    details: dict = {}
+    output: dict | None = None
+    error: str | None = None
+    success = False
+    try:
+        output, details = execute(args)
+        success = True
+    except (ValueError, LookupError, OSError, sqlite3.DatabaseError) as exception:
+        error = str(exception)
+
+    time.sleep(OPERATION_DELAY_SECONDS)
+    end_ns = time.monotonic_ns()
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "operation": args.operation,
+        "start_ns": start_ns,
+        "end_ns": end_ns,
+        "process_pid": os.getpid(),
+        "process_start_ticks": process_start_ticks(os.getpid()),
+        "process_group_id": os.getpgrp(),
+        "session_id": os.getsid(0),
+        "parent_pid": parent_pid,
+        "parent_start_ticks": process_start_ticks(parent_pid),
+        "success": success,
+        **details,
+    }
+    if error is not None:
+        event["error"] = error
+    append_audit(event)
+
+    if success:
+        print(json.dumps(output, sort_keys=True))
+        return 0
+    print(json.dumps({"error": error or "operation failed"}), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

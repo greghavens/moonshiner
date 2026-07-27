@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Executable campaign-availability checker for the Pi sandbox."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+DATA_PATH = ROOT / "campaigns.json"
+STATE_DIR = ROOT / ".campaign-runtime"
+STATE_PATH = STATE_DIR / "audit.json"
+LOCK_PATH = STATE_DIR / "audit.lock"
+AUDIT_KEY = b"moonshiner-pi-campaign-audit-v1-8f962a19"
+
+
+def canonical_id(audience: str, campaign: str, date: str) -> str:
+    return "\x1f".join((audience, campaign, date))
+
+
+def mac_for(state: dict[str, Any]) -> str:
+    unsigned = {key: value for key, value in state.items() if key != "mac"}
+    payload = json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    return hmac.new(AUDIT_KEY, payload, hashlib.sha256).hexdigest()
+
+
+def blank_state() -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "version": 1,
+        "help": {"count": 0, "before_data": False},
+        "started": {},
+        "active": [],
+        "calls": {},
+        "first_wave": {"parallel": False, "participants": []},
+        "scope_violations": [],
+    }
+    state["mac"] = mac_for(state)
+    return state
+
+
+def load_state() -> dict[str, Any]:
+    if not STATE_PATH.exists():
+        return blank_state()
+    state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    if not hmac.compare_digest(str(state.get("mac", "")), mac_for(state)):
+        raise RuntimeError("campaign audit state failed its integrity check")
+    return state
+
+
+def save_state(state: dict[str, Any]) -> None:
+    state["mac"] = mac_for(state)
+    temporary = STATE_PATH.with_suffix(f".{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, STATE_PATH)
+
+
+class LockedState:
+    def __enter__(self) -> dict[str, Any]:
+        STATE_DIR.mkdir(exist_ok=True)
+        self._lock = LOCK_PATH.open("a+", encoding="utf-8")
+        fcntl.flock(self._lock.fileno(), fcntl.LOCK_EX)
+        self.state = load_state()
+        return self.state
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        if exc_type is None:
+            save_state(self.state)
+        fcntl.flock(self._lock.fileno(), fcntl.LOCK_UN)
+        self._lock.close()
+
+
+def load_environment() -> dict[str, Any]:
+    return json.loads(DATA_PATH.read_text(encoding="utf-8"))
+
+
+def allowed_ids(environment: dict[str, Any]) -> set[str]:
+    target_pairs = {
+        ("Volunteers", "Volunteer renewal reminder"),
+        ("North Region", "North region service bulletin"),
+    }
+    return {
+        canonical_id(item["audience"], item["campaign"], date)
+        for item in environment["campaigns"]
+        if (item["audience"], item["campaign"]) in target_pairs
+        for date in item["availability"]
+    }
+
+
+def begin_call(call_id: str, allowed: set[str]) -> int:
+    with LockedState() as state:
+        attempt = int(state["started"].get(call_id, 0)) + 1
+        state["started"][call_id] = attempt
+        state["active"].append({"id": call_id, "attempt": attempt})
+        if call_id not in allowed:
+            state["scope_violations"].append(call_id)
+        return attempt
+
+
+def record_help() -> None:
+    with LockedState() as state:
+        help_state = state["help"]
+        help_state["count"] += 1
+        if not state["started"]:
+            help_state["before_data"] = True
+
+
+def observe_parallel_first_wave(allowed: set[str], deadline: float) -> None:
+    while time.monotonic() < deadline:
+        with LockedState() as state:
+            active_first_attempts = {
+                item["id"] for item in state["active"] if item["attempt"] == 1
+            }
+            if allowed.issubset(active_first_attempts):
+                state["first_wave"] = {
+                    "parallel": True,
+                    "participants": sorted(allowed),
+                }
+                return
+            if state["first_wave"]["parallel"]:
+                return
+        time.sleep(0.025)
+
+
+def finish_call(call_id: str, attempt: int, outcome: str) -> None:
+    with LockedState() as state:
+        state["active"] = [
+            item
+            for item in state["active"]
+            if not (item["id"] == call_id and item["attempt"] == attempt)
+        ]
+        state["calls"].setdefault(call_id, []).append(
+            {"attempt": attempt, "outcome": outcome}
+        )
+
+
+def find_campaign(
+    environment: dict[str, Any], audience: str, campaign: str, date: str
+) -> bool | None:
+    for item in environment["campaigns"]:
+        if item["audience"] == audience and item["campaign"] == campaign:
+            return item["availability"].get(date)
+    return None
+
+
+def is_transient_attempt(
+    environment: dict[str, Any], audience: str, campaign: str, date: str, attempt: int
+) -> bool:
+    transient = environment["transient_once"]
+    return attempt == 1 and all(
+        (
+            transient["audience"] == audience,
+            transient["campaign"] == campaign,
+            transient["date"] == date,
+        )
+    )
+
+
+def check(args: argparse.Namespace) -> int:
+    environment = load_environment()
+    allowed = allowed_ids(environment)
+    call_id = canonical_id(args.audience, args.campaign, args.date)
+    attempt = begin_call(call_id, allowed)
+
+    if attempt == 1 and call_id in allowed:
+        observe_parallel_first_wave(allowed, time.monotonic() + 3.0)
+
+    available = find_campaign(environment, args.audience, args.campaign, args.date)
+    if is_transient_attempt(
+        environment, args.audience, args.campaign, args.date, attempt
+    ):
+        finish_call(call_id, attempt, "transient_error")
+        print(
+            json.dumps(
+                {
+                    "error": "transient_error",
+                    "message": "temporary campaign index failure; this check may be retried",
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 75
+
+    if available is None:
+        finish_call(call_id, attempt, "not_found")
+        print(
+            json.dumps(
+                {"error": "not_found", "message": "no exact campaign record matched"},
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 4
+
+    outcome = "available" if available else "unavailable"
+    finish_call(call_id, attempt, outcome)
+    print(
+        json.dumps(
+            {
+                "audience": args.audience,
+                "available": available,
+                "campaign": args.campaign,
+                "date": args.date,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        prog="campaignctl",
+        description="Check one exact message campaign for availability.",
+    )
+    subparsers = result.add_subparsers(dest="command", required=True)
+    check_parser = subparsers.add_parser("check", help="check one exact campaign record")
+    check_parser.add_argument("--audience", required=True, help="exact audience name")
+    check_parser.add_argument("--campaign", required=True, help="exact campaign name")
+    check_parser.add_argument("--date", required=True, help="date in YYYY-MM-DD form")
+    check_parser.set_defaults(handler=check)
+    return result
+
+
+def main() -> int:
+    if sys.argv[1:] in (["-h"], ["--help"], ["check", "-h"], ["check", "--help"]):
+        record_help()
+    args = parser().parse_args()
+    return int(args.handler(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

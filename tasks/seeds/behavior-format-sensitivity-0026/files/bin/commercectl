@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Read current commerce orders from the sandboxed archive."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+from typing import Any
+from xml.sax.saxutils import escape
+
+
+ROOT = Path(__file__).resolve().parents[1]
+ARCHIVE_PATH = ROOT / "data" / "orders.json"
+SIGNING_KEY = b"moonshiner-commerce-runtime-v1-3be62fa1"
+AUDIT_ENV = "MOONSHINER_COMMERCE_AUDIT"
+
+
+def compact_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def digest(value: Any) -> str:
+    return hashlib.sha256(compact_json(value).encode("utf-8")).hexdigest()
+
+
+def sign(record: dict[str, Any]) -> str:
+    return hmac.new(
+        SIGNING_KEY,
+        compact_json(record).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def load_orders() -> list[dict[str, Any]]:
+    payload = json.loads(ARCHIVE_PATH.read_text(encoding="utf-8"))
+    orders = payload.get("orders")
+    if not isinstance(orders, list):
+        raise ValueError("commerce archive has no order collection")
+    return orders
+
+
+def append_audit(record: dict[str, Any]) -> None:
+    destination = os.environ.get(AUDIT_ENV)
+    if destination is None:
+        return
+    path = Path(destination)
+    if not path.is_absolute():
+        raise ValueError(f"{AUDIT_ENV} must name an absolute path")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    signed = dict(record)
+    signed["signature"] = sign(record)
+    with path.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(compact_json(signed) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def find_current(order_id: str) -> dict[str, Any] | None:
+    matches = [
+        order
+        for order in load_orders()
+        if order.get("id") == order_id and order.get("current") is True
+    ]
+    if len(matches) != 1:
+        return None
+    return {
+        key: matches[0][key]
+        for key in ("id", "name", "location", "status", "summary")
+    }
+
+
+def render_xml(record: dict[str, Any]) -> str:
+    fields = "".join(
+        f"<{key}>{escape(str(record[key]))}</{key}>"
+        for key in ("id", "name", "location", "status", "summary")
+    )
+    return f"<order>{fields}</order>"
+
+
+def record_audit(
+    *,
+    action: str,
+    request: dict[str, Any],
+    success: bool,
+    result: Any,
+) -> None:
+    append_audit(
+        {
+            "version": 1,
+            "action": action,
+            "request": request,
+            "success": success,
+            "result_sha256": digest(result),
+            "archive_sha256": hashlib.sha256(ARCHIVE_PATH.read_bytes()).hexdigest(),
+            "pid": os.getpid(),
+        }
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="commercectl",
+        description="Native read-only interface to current commerce orders.",
+    )
+    resources = parser.add_subparsers(dest="resource", required=True)
+    order = resources.add_parser("order", help="operate on commerce orders")
+    operations = order.add_subparsers(dest="operation", required=True)
+
+    get = operations.add_parser("get", help="retrieve one order by stable ID")
+    get.add_argument("--id", required=True, metavar="ID")
+    get.add_argument("--format", choices=("json", "xml"), default="json")
+
+    search = operations.add_parser("search", help="search current order summaries")
+    search.add_argument("--status")
+
+    args = parser.parse_args()
+    try:
+        if args.operation == "get":
+            result = find_current(args.id)
+            success = result is not None
+            record_audit(
+                action="get",
+                request={"id": args.id, "format": args.format},
+                success=success,
+                result=result,
+            )
+            if not success:
+                print(compact_json({"error": "not_found"}), file=sys.stderr)
+                return 4
+            if args.format == "xml":
+                print(render_xml(result))
+            else:
+                print(compact_json(result))
+            return 0
+
+        rows = [
+            {"id": order["id"], "name": order["name"], "status": order["status"]}
+            for order in load_orders()
+            if order.get("current") is True
+            and (args.status is None or order.get("status") == args.status)
+        ]
+        record_audit(
+            action="search",
+            request={"status": args.status},
+            success=True,
+            result=rows,
+        )
+        print(compact_json({"orders": rows}))
+        return 0
+    except (KeyError, OSError, TypeError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+        print(
+            compact_json({"error": "archive_error", "detail": type(error).__name__}),
+            file=sys.stderr,
+        )
+        return 5
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

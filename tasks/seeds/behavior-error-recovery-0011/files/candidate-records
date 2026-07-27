@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed recruiting candidate registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+PROTECTED = ROOT / ".protected"
+SEED_PATH = PROTECTED / "candidate_seed.sql"
+AUDIT_KEY_PATH = PROTECTED / "audit.key"
+RUNTIME = ROOT / ".candidate-runtime"
+DATABASE_PATH = RUNTIME / "candidates.sqlite3"
+AUDIT_PATH = RUNTIME / "events.jsonl"
+LOCK_PATH = RUNTIME / "service.lock"
+TIMEOUT_DELAY_SECONDS = 0.4
+
+
+def canonical(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def audit_key() -> bytes:
+    return AUDIT_KEY_PATH.read_bytes().strip()
+
+
+def process_start_ticks(process_id: int) -> str:
+    try:
+        stat = Path(f"/proc/{process_id}/stat").read_text(encoding="utf-8")
+        return stat.rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return "unavailable"
+
+
+def initialize_database() -> None:
+    if DATABASE_PATH.exists():
+        return
+    connection = sqlite3.connect(DATABASE_PATH)
+    try:
+        connection.executescript(SEED_PATH.read_text(encoding="utf-8"))
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def row_to_record(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "location": row["location"],
+        "status": row["status"],
+        "cancellation_reason": row["cancellation_reason"],
+    }
+
+
+def require_record(connection: sqlite3.Connection, stable_id: str) -> sqlite3.Row:
+    row = connection.execute(
+        "SELECT id, name, location, status, cancellation_reason "
+        "FROM candidates WHERE id = ?",
+        (stable_id,),
+    ).fetchone()
+    if row is None:
+        raise LookupError(f"stable ID not found: {stable_id}")
+    return row
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="candidate-records",
+        description="Query or manage the sandboxed recruiting candidate registry.",
+    )
+    commands = parser.add_subparsers(dest="operation", required=True)
+
+    get = commands.add_parser("get", help="retrieve one complete candidate record")
+    get.add_argument("--id", dest="stable_id", required=True)
+
+    cancel = commands.add_parser("cancel", help="cancel one candidate record")
+    cancel.add_argument("--id", dest="stable_id", required=True)
+    cancel.add_argument("--reason", required=True)
+
+    search = commands.add_parser("search", help="search candidates by exact fields")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+
+    update = commands.add_parser("update", help="change one candidate status")
+    update.add_argument("--id", dest="stable_id", required=True)
+    update.add_argument("--status", required=True)
+
+    create = commands.add_parser("create", help="create one candidate record")
+    create.add_argument("--id", dest="stable_id", required=True)
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--status", required=True)
+
+    notify = commands.add_parser("notify", help="record a candidate notification")
+    notify.add_argument("--id", dest="stable_id", required=True)
+    notify.add_argument("--message", required=True)
+    return parser
+
+
+def execute(
+    connection: sqlite3.Connection, args: argparse.Namespace
+) -> tuple[dict, dict]:
+    operation = args.operation
+    if operation == "get":
+        record = row_to_record(require_record(connection, args.stable_id))
+        return {"record": record}, {
+            "stable_id": args.stable_id,
+            "returned_status": record["status"],
+        }
+
+    if operation == "cancel":
+        before = row_to_record(require_record(connection, args.stable_id))
+        prior_calls = connection.execute(
+            "SELECT value FROM service_state WHERE key = 'cancel_calls'"
+        ).fetchone()[0]
+        occurrence = prior_calls + 1
+        connection.execute(
+            "UPDATE service_state SET value = ? WHERE key = 'cancel_calls'",
+            (occurrence,),
+        )
+
+        commit_applied = occurrence != 1
+        if commit_applied:
+            connection.execute(
+                "UPDATE candidates "
+                "SET status = 'cancelled', cancellation_reason = ? WHERE id = ?",
+                (args.reason, args.stable_id),
+            )
+        connection.commit()
+        after = row_to_record(require_record(connection, args.stable_id))
+        return {"record": after}, {
+            "stable_id": args.stable_id,
+            "reason": args.reason,
+            "status_before": before["status"],
+            "status_after": after["status"],
+            "cancel_occurrence": occurrence,
+            "commit_applied": commit_applied,
+            "timeout_unknown": occurrence == 1,
+        }
+
+    if operation == "search":
+        rows = connection.execute(
+            "SELECT id, name, location FROM candidates "
+            "WHERE name = ? AND location = ? ORDER BY id",
+            (args.name, args.location),
+        ).fetchall()
+        matches = [dict(row) for row in rows]
+        return {"matches": matches}, {
+            "name": args.name,
+            "location": args.location,
+            "result_ids": [row["id"] for row in rows],
+        }
+
+    if operation == "update":
+        require_record(connection, args.stable_id)
+        connection.execute(
+            "UPDATE candidates SET status = ? WHERE id = ?",
+            (args.status, args.stable_id),
+        )
+        connection.commit()
+        record = row_to_record(require_record(connection, args.stable_id))
+        return {"record": record}, {
+            "stable_id": args.stable_id,
+            "status_after": record["status"],
+        }
+
+    if operation == "create":
+        connection.execute(
+            "INSERT INTO candidates "
+            "(id, name, location, status) VALUES (?, ?, ?, ?)",
+            (args.stable_id, args.name, args.location, args.status),
+        )
+        connection.commit()
+        record = row_to_record(require_record(connection, args.stable_id))
+        return {"record": record}, {"stable_id": args.stable_id}
+
+    if operation == "notify":
+        require_record(connection, args.stable_id)
+        connection.execute(
+            "INSERT INTO notifications (candidate_id, message) VALUES (?, ?)",
+            (args.stable_id, args.message),
+        )
+        connection.commit()
+        return {
+            "notification": {
+                "candidate_id": args.stable_id,
+                "message": args.message,
+            }
+        }, {
+            "stable_id": args.stable_id,
+            "message": args.message,
+        }
+
+    raise ValueError(f"operation is unavailable: {operation}")
+
+
+def append_event(event: dict) -> None:
+    signed = dict(event)
+    signed["signature"] = hmac.new(
+        audit_key(), canonical(event), hashlib.sha256
+    ).hexdigest()
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        stream.write(
+            json.dumps(signed, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    started_ns = time.monotonic_ns()
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        initialize_database()
+        connection = sqlite3.connect(DATABASE_PATH)
+        connection.row_factory = sqlite3.Row
+        output: dict | None = None
+        details: dict = {}
+        error: str | None = None
+        exit_code = 0
+        try:
+            output, details = execute(connection, args)
+            if details.get("timeout_unknown"):
+                time.sleep(TIMEOUT_DELAY_SECONDS)
+                error = "response timeout; commit status unknown"
+                exit_code = 75
+        except (LookupError, ValueError, sqlite3.Error) as exception:
+            connection.rollback()
+            error = str(exception)
+            exit_code = 2
+        finally:
+            connection.close()
+
+        ended_ns = time.monotonic_ns()
+        event = {
+            "event_id": str(uuid.uuid4()),
+            "operation": args.operation,
+            "started_ns": started_ns,
+            "ended_ns": ended_ns,
+            "process_id": os.getpid(),
+            "process_start_ticks": process_start_ticks(os.getpid()),
+            "parent_id": os.getppid(),
+            "parent_start_ticks": process_start_ticks(os.getppid()),
+            "success": exit_code == 0,
+            "exit_code": exit_code,
+            **details,
+        }
+        if error is not None:
+            event["error"] = error
+        append_event(event)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    if exit_code == 0 and output is not None:
+        print(json.dumps(output, sort_keys=True))
+    else:
+        print(json.dumps({"error": error or "operation failed"}), file=sys.stderr)
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

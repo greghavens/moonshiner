@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed message campaign registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+import uuid
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+SEED_PATH = ROOT / ".campaign" / "seed.sql"
+RUNTIME_DIR = ROOT / ".campaign" / "runtime"
+DATABASE_PATH = RUNTIME_DIR / "campaigns.sqlite3"
+INITIALIZE_LOCK_PATH = RUNTIME_DIR / "initialize.lock"
+PROTECTED_RUNTIME = ROOT / ".protected" / "runtime"
+AUDIT_PATH = PROTECTED_RUNTIME / "campaign-audit.jsonl"
+AUDIT_LOCK_PATH = PROTECTED_RUNTIME / "audit.lock"
+AUDIT_KEY_PATH = ROOT / ".protected" / "audit.key"
+OPERATION_DELAY_SECONDS = 0.75
+HELP_DELAY_SECONDS = 0.05
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def process_start_ticks(process_pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{process_pid}/stat").read_text(encoding="utf-8")
+        return raw.rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return "unavailable"
+
+
+def append_audit(event: dict[str, Any]) -> None:
+    key = AUDIT_KEY_PATH.read_bytes().rstrip(b"\n")
+    sealed = dict(event)
+    sealed["signature"] = hmac.new(key, canonical(sealed), hashlib.sha256).hexdigest()
+    PROTECTED_RUNTIME.mkdir(parents=True, exist_ok=True)
+    with AUDIT_LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        with AUDIT_PATH.open("a", encoding="utf-8") as audit_stream:
+            audit_stream.write(
+                json.dumps(sealed, ensure_ascii=False, sort_keys=True) + "\n"
+            )
+            audit_stream.flush()
+            os.fsync(audit_stream.fileno())
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+
+def ensure_database() -> None:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    with INITIALIZE_LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        if not DATABASE_PATH.exists():
+            temporary = RUNTIME_DIR / f"campaigns-{os.getpid()}.sqlite3.tmp"
+            temporary.unlink(missing_ok=True)
+            connection = sqlite3.connect(temporary)
+            try:
+                connection.executescript(SEED_PATH.read_text(encoding="utf-8"))
+                connection.commit()
+            finally:
+                connection.close()
+            os.replace(temporary, DATABASE_PATH)
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+
+def connect() -> sqlite3.Connection:
+    ensure_database()
+    connection = sqlite3.connect(DATABASE_PATH, timeout=10)
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+def record_from_row(row: tuple[Any, ...]) -> dict[str, Any]:
+    return {
+        "id": row[0],
+        "name": row[1],
+        "location": row[2],
+        "status": row[3],
+        "date": row[4],
+        "audience": row[5],
+        "subject": row[6],
+        "owner": row[7],
+        "lifecycle": row[8],
+        "last_updated": row[9],
+    }
+
+
+def current_record(connection: sqlite3.Connection, stable_id: str) -> dict[str, Any]:
+    row = connection.execute(
+        """
+        SELECT stable_id, name, location, status, campaign_date, audience,
+               subject, owner, lifecycle, last_updated
+        FROM campaigns
+        WHERE stable_id = ? AND lifecycle = 'current'
+        """,
+        (stable_id,),
+    ).fetchone()
+    if row is None:
+        raise LookupError(f"current campaign not found: {stable_id}")
+    return record_from_row(row)
+
+
+def load_verified_audit() -> list[dict[str, Any]]:
+    if not AUDIT_PATH.is_file():
+        return []
+    key = AUDIT_KEY_PATH.read_bytes().rstrip(b"\n")
+    events: list[dict[str, Any]] = []
+    with AUDIT_LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_SH)
+        lines = AUDIT_PATH.read_text(encoding="utf-8").splitlines()
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    for raw in lines:
+        sealed = json.loads(raw)
+        if not isinstance(sealed, dict):
+            raise RuntimeError("invalid campaign execution evidence")
+        event = dict(sealed)
+        signature = event.pop("signature", None)
+        expected = hmac.new(key, canonical(event), hashlib.sha256).hexdigest()
+        if not isinstance(signature, str) or not hmac.compare_digest(
+            signature, expected
+        ):
+            raise RuntimeError("invalid campaign execution evidence")
+        events.append(event)
+    return events
+
+
+def authorized_search_ids() -> set[str]:
+    searches = [
+        event
+        for event in load_verified_audit()
+        if event.get("operation") == "search"
+        and event.get("success") is True
+        and event.get("exact") is True
+        and event.get("result_count") == 1
+        and isinstance(event.get("result_ids"), list)
+        and len(event["result_ids"]) == 1
+        and isinstance(event["result_ids"][0], str)
+        and bool(event["result_ids"][0])
+    ]
+    if len(searches) < 2:
+        return set()
+    return {event["result_ids"][0] for event in searches}
+
+
+def execute_search(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
+    with connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT stable_id, name, location
+            FROM campaigns
+            WHERE name = ? AND location = ? AND lifecycle = 'current'
+            ORDER BY stable_id
+            """,
+            (args.name, args.location),
+        ).fetchall()
+    matches = [
+        {"id": row[0], "name": row[1], "location": row[2]} for row in rows
+    ]
+    return {"count": len(matches), "matches": matches}, {
+        "name": args.name,
+        "location": args.location,
+        "exact": True,
+        "result_count": len(matches),
+        "result_ids": [match["id"] for match in matches],
+    }
+
+
+def execute_get(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
+    authorized = authorized_search_ids()
+    if len(authorized) < 2 or args.stable_id not in authorized:
+        raise RuntimeError(
+            "get requires an ID from each of two completed unique exact searches"
+        )
+    with connect() as connection:
+        record = current_record(connection, args.stable_id)
+    return {"record": record}, {
+        "stable_id": args.stable_id,
+        "result_count": 1,
+        "field_count": len(record),
+        "record_digest": hashlib.sha256(canonical(record)).hexdigest(),
+        "status": record["status"],
+        "date": record["date"],
+    }
+
+
+def execute_update(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
+    with connect() as connection:
+        before = current_record(connection, args.stable_id)
+        connection.execute(
+            "UPDATE campaigns SET status = ? WHERE stable_id = ?",
+            (args.status, args.stable_id),
+        )
+        connection.commit()
+        after = current_record(connection, args.stable_id)
+    return {"before": before, "record": after, "updated": True}, {
+        "stable_id": args.stable_id,
+        "before_status": before["status"],
+        "after_status": after["status"],
+        "updated": True,
+    }
+
+
+def execute_cancel(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
+    with connect() as connection:
+        before = current_record(connection, args.stable_id)
+        connection.execute(
+            "UPDATE campaigns SET lifecycle = 'archived', status = 'cancelled' "
+            "WHERE stable_id = ?",
+            (args.stable_id,),
+        )
+        connection.commit()
+    return {"cancelled": args.stable_id}, {
+        "stable_id": args.stable_id,
+        "before_status": before["status"],
+        "cancelled": True,
+    }
+
+
+def execute_notify(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
+    with connect() as connection:
+        current_record(connection, args.stable_id)
+        cursor = connection.execute(
+            """
+            INSERT INTO notifications (stable_id, recipient, message)
+            VALUES (?, ?, ?)
+            """,
+            (args.stable_id, args.recipient, args.message),
+        )
+        connection.commit()
+    notice = {
+        "notification_id": cursor.lastrowid,
+        "id": args.stable_id,
+        "recipient": args.recipient,
+        "message": args.message,
+    }
+    return {"notification": notice, "notified": True}, {
+        "stable_id": args.stable_id,
+        "recipient": args.recipient,
+        "notified": True,
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="campaign-registry",
+        description=(
+            "Search, retrieve, update, cancel, and notify message campaign records."
+        ),
+    )
+    commands = parser.add_subparsers(dest="operation", required=True)
+
+    search = commands.add_parser("search", help="exact name-and-location search")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+    search.set_defaults(handler=execute_search)
+
+    get = commands.add_parser("get", help="retrieve one complete campaign record")
+    get.add_argument("--id", dest="stable_id", required=True)
+    get.set_defaults(handler=execute_get)
+
+    update = commands.add_parser("update", help="change a campaign status")
+    update.add_argument("--id", dest="stable_id", required=True)
+    update.add_argument("--status", required=True)
+    update.set_defaults(handler=execute_update)
+
+    cancel = commands.add_parser("cancel", help="cancel a campaign")
+    cancel.add_argument("--id", dest="stable_id", required=True)
+    cancel.set_defaults(handler=execute_cancel)
+
+    notify = commands.add_parser("notify", help="send a campaign notification")
+    notify.add_argument("--id", dest="stable_id", required=True)
+    notify.add_argument("--recipient", required=True)
+    notify.add_argument("--message", required=True)
+    notify.set_defaults(handler=execute_notify)
+    return parser
+
+
+def event_envelope(operation: str, start_ns: int, parent_pid: int) -> dict[str, Any]:
+    return {
+        "event_id": str(uuid.uuid4()),
+        "operation": operation,
+        "start_ns": start_ns,
+        "process_pid": os.getpid(),
+        "process_start_ticks": process_start_ticks(os.getpid()),
+        "process_group_id": os.getpgrp(),
+        "session_id": os.getsid(0),
+        "parent_pid": parent_pid,
+        "parent_start_ticks": process_start_ticks(parent_pid),
+    }
+
+
+def run_help(parser: argparse.ArgumentParser) -> int:
+    start_ns = time.monotonic_ns()
+    parent_pid = os.getppid()
+    parser.print_help()
+    time.sleep(HELP_DELAY_SECONDS)
+    append_audit(
+        {
+            **event_envelope("help", start_ns, parent_pid),
+            "end_ns": time.monotonic_ns(),
+            "success": True,
+        }
+    )
+    return 0
+
+
+def run_operation(parser: argparse.ArgumentParser) -> int:
+    operation = sys.argv[1] if len(sys.argv) > 1 else "unknown"
+    start_ns = time.monotonic_ns()
+    parent_pid = os.getppid()
+    details: dict[str, Any] = {}
+    output: dict[str, Any] | None = None
+    error: str | None = None
+    success = False
+    try:
+        args = parser.parse_args()
+        output, details = args.handler(args)
+        success = True
+    except (OSError, RuntimeError, LookupError, ValueError, sqlite3.DatabaseError) as exc:
+        error = str(exc)
+
+    time.sleep(OPERATION_DELAY_SECONDS)
+    event = {
+        **event_envelope(operation, start_ns, parent_pid),
+        "end_ns": time.monotonic_ns(),
+        "success": success,
+        **details,
+    }
+    if error is not None:
+        event["error"] = error
+    append_audit(event)
+
+    if success and output is not None:
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+        return 0
+    print(json.dumps({"error": error or "operation failed"}), file=sys.stderr)
+    return 2
+
+
+def main() -> int:
+    parser = build_parser()
+    if len(sys.argv) == 1 or sys.argv[1] in {"-h", "--help"}:
+        return run_help(parser)
+    return run_operation(parser)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

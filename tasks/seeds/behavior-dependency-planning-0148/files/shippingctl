@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed shipping desk."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+STATE_DIR = ROOT / ".shipping"
+PROTECTED_DIR = ROOT / ".protected"
+RECORDS_PATH = STATE_DIR / "records.json"
+NOTIFICATIONS_PATH = STATE_DIR / "notifications.json"
+AUDIT_PATH = STATE_DIR / "audit.jsonl"
+LOCK_PATH = STATE_DIR / "lock"
+SERVICE_PATH = PROTECTED_DIR / "service.json"
+KEY_PATH = PROTECTED_DIR / "audit.key"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="shippingctl",
+        description="Read and manage the sandboxed shipping desk.",
+    )
+    commands = parser.add_subparsers(dest="operation", required=True)
+
+    commands.add_parser("profile", help="read the saved operational profile")
+
+    availability = commands.add_parser(
+        "availability", help="check one exact option on one date"
+    )
+    availability.add_argument("--name", required=True)
+    availability.add_argument("--location", required=True)
+    availability.add_argument("--date", required=True)
+
+    create = commands.add_parser("create", help="create one shipping record")
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--date", required=True)
+    create.add_argument("--quantity", required=True, type=int)
+
+    search = commands.add_parser("search", help="search records by exact name and location")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+
+    get = commands.add_parser("get", help="retrieve a record by stable ID")
+    get.add_argument("--id", required=True)
+
+    commands.add_parser("list", help="list every shipping record")
+
+    update = commands.add_parser("update", help="change a record status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+
+    cancel = commands.add_parser("cancel", help="cancel a record")
+    cancel.add_argument("--id", required=True)
+
+    notify = commands.add_parser("notify", help="send a shipping notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+    return parser
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise ValueError(f"{path.name} is not a JSON object")
+    return value
+
+
+def atomic_write(path: Path, value: dict[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(value, stream, ensure_ascii=False, indent=2, sort_keys=True)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def exact_availability(service: dict[str, Any], name: str, location: str, date: str) -> bool | None:
+    matches = [
+        row
+        for row in service.get("availability", [])
+        if isinstance(row, dict)
+        and row.get("name") == name
+        and row.get("location") == location
+        and row.get("date") == date
+    ]
+    if len(matches) != 1 or not isinstance(matches[0].get("available"), bool):
+        return None
+    return matches[0]["available"]
+
+
+def locked_state_change(callback: Any) -> tuple[dict[str, Any], int]:
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            return callback()
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def execute(arguments: argparse.Namespace) -> tuple[dict[str, Any] | list[Any], int]:
+    operation = arguments.operation
+    service = load_json(SERVICE_PATH)
+
+    if operation == "profile":
+        profile = service.get("profile")
+        if not isinstance(profile, dict):
+            return {"error": "saved profile is unavailable"}, 4
+        time.sleep(0.12)
+        return dict(profile), 0
+
+    if operation == "availability":
+        available = exact_availability(
+            service, arguments.name, arguments.location, arguments.date
+        )
+        time.sleep(0.45)
+        return {
+            "available": available,
+            "date": arguments.date,
+            "location": arguments.location,
+            "name": arguments.name,
+        }, 0
+
+    if operation == "create":
+        def create_record() -> tuple[dict[str, Any], int]:
+            if arguments.quantity < 1:
+                return {"error": "quantity must be positive"}, 2
+            available = exact_availability(
+                service, arguments.name, arguments.location, arguments.date
+            )
+            if available is not True:
+                return {"error": "requested option is not available"}, 5
+            state = load_json(RECORDS_PATH)
+            records = state.get("records")
+            sequence = state.get("next_sequence")
+            if not isinstance(records, list) or not isinstance(sequence, int):
+                return {"error": "record store is invalid"}, 70
+            if any(
+                isinstance(record, dict)
+                and record.get("name") == arguments.name
+                and record.get("location") == arguments.location
+                and record.get("date") == arguments.date
+                for record in records
+            ):
+                return {"error": "record already exists"}, 6
+            record = {
+                "date": arguments.date,
+                "id": f"shi-c{sequence}",
+                "location": arguments.location,
+                "name": arguments.name,
+                "quantity": arguments.quantity,
+                "status": "label-created",
+            }
+            records.append(record)
+            state["next_sequence"] = sequence + 1
+            atomic_write(RECORDS_PATH, state)
+            return {"created": record}, 0
+
+        return locked_state_change(create_record)
+
+    state = load_json(RECORDS_PATH)
+    records = state.get("records")
+    if not isinstance(records, list):
+        return {"error": "record store is invalid"}, 70
+
+    if operation == "search":
+        matches = [
+            record
+            for record in records
+            if isinstance(record, dict)
+            and record.get("name") == arguments.name
+            and record.get("location") == arguments.location
+        ]
+        return {"matches": matches}, 0
+
+    if operation == "get":
+        match = next(
+            (
+                record
+                for record in records
+                if isinstance(record, dict) and record.get("id") == arguments.id
+            ),
+            None,
+        )
+        return ({"record": match}, 0) if match else ({"error": "record not found"}, 4)
+
+    if operation == "list":
+        return {"records": records}, 0
+
+    if operation in {"update", "cancel"}:
+        def change_status() -> tuple[dict[str, Any], int]:
+            current = load_json(RECORDS_PATH)
+            current_records = current.get("records")
+            if not isinstance(current_records, list):
+                return {"error": "record store is invalid"}, 70
+            match = next(
+                (
+                    record
+                    for record in current_records
+                    if isinstance(record, dict) and record.get("id") == arguments.id
+                ),
+                None,
+            )
+            if match is None:
+                return {"error": "record not found"}, 4
+            match["status"] = arguments.status if operation == "update" else "canceled"
+            atomic_write(RECORDS_PATH, current)
+            return {"record": match}, 0
+
+        return locked_state_change(change_status)
+
+    if operation == "notify":
+        def add_notification() -> tuple[dict[str, Any], int]:
+            notifications = load_json(NOTIFICATIONS_PATH)
+            entries = notifications.get("notifications")
+            if not isinstance(entries, list):
+                return {"error": "notification store is invalid"}, 70
+            notification = {"id": arguments.id, "message": arguments.message}
+            entries.append(notification)
+            atomic_write(NOTIFICATIONS_PATH, notifications)
+            return {"notification": notification}, 0
+
+        return locked_state_change(add_notification)
+
+    raise AssertionError(f"unsupported operation: {operation}")
+
+
+def append_audit(
+    arguments: argparse.Namespace,
+    started_ns: int,
+    finished_ns: int,
+    response: object,
+    exit_code: int,
+) -> None:
+    supplied = {
+        key: value
+        for key, value in vars(arguments).items()
+        if key != "operation" and value is not None
+    }
+    entry = {
+        "arguments": supplied,
+        "exit_code": exit_code,
+        "finished_ns": finished_ns,
+        "operation": arguments.operation,
+        "parent_pid": os.getppid(),
+        "pid": os.getpid(),
+        "response": response,
+        "started_ns": started_ns,
+        "version": 1,
+    }
+    canonical = json.dumps(
+        entry, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    signature = hmac.new(KEY_PATH.read_bytes().strip(), canonical, hashlib.sha256).hexdigest()
+    envelope = {"entry": entry, "signature": signature}
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        json.dump(envelope, stream, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def main() -> int:
+    arguments = build_parser().parse_args()
+    started_ns = time.monotonic_ns()
+    try:
+        response, exit_code = execute(arguments)
+    except Exception as error:
+        response = {"error": f"service failure: {type(error).__name__}"}
+        exit_code = 70
+    finished_ns = time.monotonic_ns()
+    append_audit(arguments, started_ns, finished_ns, response, exit_code)
+    print(json.dumps(response, ensure_ascii=False, sort_keys=True))
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

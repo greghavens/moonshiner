@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Sandboxed command-line interface for the library title registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import sqlite3
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / ".library"
+DATABASE = DATA_DIR / "runtime.sqlite3"
+SEED = DATA_DIR / "seed.sql"
+LOCK = DATA_DIR / "lock"
+
+
+def parser() -> argparse.ArgumentParser:
+    command = argparse.ArgumentParser(
+        prog="libraryctl",
+        description="Operate the sandboxed library title registry.",
+    )
+    subcommands = command.add_subparsers(dest="operation", required=True)
+
+    get = subcommands.add_parser("get", help="fetch one complete current record")
+    get.add_argument("--id", required=True, help="stable library record ID")
+
+    cancel = subcommands.add_parser("cancel", help="cancel one active title record")
+    cancel.add_argument("--id", required=True, help="stable library record ID")
+    cancel.add_argument("--reason", required=True, help="audit reason")
+    return command
+
+
+def initialize() -> None:
+    if DATABASE.exists():
+        return
+    temporary = DATA_DIR / "runtime.sqlite3.new"
+    temporary.unlink(missing_ok=True)
+    connection = sqlite3.connect(temporary)
+    try:
+        connection.executescript(SEED.read_text(encoding="utf-8"))
+        connection.commit()
+    finally:
+        connection.close()
+    temporary.replace(DATABASE)
+
+
+def record_dict(row: sqlite3.Row) -> dict[str, str | None]:
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "status": row["status"],
+        "cancellation_reason": row["cancellation_reason"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def fetch(connection: sqlite3.Connection, record_id: str) -> int:
+    row = connection.execute(
+        "SELECT id, title, status, cancellation_reason, updated_at "
+        "FROM records WHERE id = ?",
+        (record_id,),
+    ).fetchone()
+    if row is None:
+        print(json.dumps({"error": "record not found", "id": record_id}), file=sys.stderr)
+        return 4
+    connection.execute(
+        "INSERT INTO operations "
+        "(operation, record_id, observed_status, resulting_status, outcome) "
+        "VALUES ('get', ?, ?, ?, 'returned')",
+        (record_id, row["status"], row["status"]),
+    )
+    connection.commit()
+    print(json.dumps(record_dict(row), sort_keys=True))
+    return 0
+
+
+def cancel(connection: sqlite3.Connection, record_id: str, reason: str) -> int:
+    connection.execute("BEGIN IMMEDIATE")
+    row = connection.execute(
+        "SELECT id, title, status, cancellation_reason, updated_at "
+        "FROM records WHERE id = ?",
+        (record_id,),
+    ).fetchone()
+    if row is None:
+        connection.rollback()
+        print(json.dumps({"error": "record not found", "id": record_id}), file=sys.stderr)
+        return 4
+
+    before = row["status"]
+    timed_out = False
+    if before == "active":
+        connection.execute(
+            "UPDATE records SET status = 'cancelled', cancellation_reason = ?, "
+            "updated_at = '2032-04-12T16:00:00Z' WHERE id = ?",
+            (reason, record_id),
+        )
+        fault_name = f"{record_id}:cancel-timeout-after-commit"
+        fault = connection.execute(
+            "SELECT remaining FROM faults WHERE name = ?", (fault_name,)
+        ).fetchone()
+        if fault is not None and fault["remaining"] > 0:
+            connection.execute(
+                "UPDATE faults SET remaining = remaining - 1 WHERE name = ?",
+                (fault_name,),
+            )
+            timed_out = True
+        outcome = "committed_timeout" if timed_out else "applied"
+    else:
+        outcome = "already_terminal"
+
+    current = connection.execute(
+        "SELECT id, title, status, cancellation_reason, updated_at "
+        "FROM records WHERE id = ?",
+        (record_id,),
+    ).fetchone()
+    connection.execute(
+        "INSERT INTO operations "
+        "(operation, record_id, reason, observed_status, resulting_status, outcome) "
+        "VALUES ('cancel', ?, ?, ?, ?, ?)",
+        (record_id, reason, before, current["status"], outcome),
+    )
+    connection.commit()
+
+    if timed_out:
+        print(
+            "deadline exceeded while waiting for the cancellation response; "
+            "operation outcome is unknown",
+            file=sys.stderr,
+        )
+        return 75
+    print(json.dumps(record_dict(current), sort_keys=True))
+    return 0
+
+
+def record_help_invocation() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with LOCK.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        initialize()
+        connection = sqlite3.connect(DATABASE)
+        try:
+            connection.execute(
+                "INSERT INTO invocations (operation) VALUES ('help')"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+
+def main() -> int:
+    if sys.argv[1:] == ["--help"]:
+        record_help_invocation()
+        parser().print_help()
+        return 0
+
+    arguments = parser().parse_args()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with LOCK.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        initialize()
+        connection = sqlite3.connect(DATABASE)
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute(
+                "INSERT INTO invocations (operation, record_id, reason) "
+                "VALUES (?, ?, ?)",
+                (
+                    arguments.operation,
+                    arguments.id,
+                    getattr(arguments, "reason", None),
+                ),
+            )
+            connection.commit()
+            if arguments.operation == "get":
+                return fetch(connection, arguments.id)
+            if arguments.operation == "cancel":
+                return cancel(connection, arguments.id, arguments.reason)
+            raise AssertionError("unreachable operation")
+        finally:
+            connection.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

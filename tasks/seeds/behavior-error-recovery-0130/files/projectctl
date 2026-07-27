@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed project registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+SEED_PROJECTS_PATH = ROOT / ".projects" / "projects.json"
+TRANSIENT_POLICY_PATH = ROOT / ".projects" / "transient_policy.json"
+RUNTIME_DIR = ROOT / ".protected" / "runtime"
+PROJECTS_PATH = RUNTIME_DIR / "projects.json"
+ATTEMPTS_PATH = RUNTIME_DIR / "availability-attempts.json"
+AUDIT_PATH = RUNTIME_DIR / "project-audit.jsonl"
+HELP_PATH = RUNTIME_DIR / "project-help.json"
+NOTIFICATIONS_PATH = RUNTIME_DIR / "notifications.jsonl"
+LOCK_PATH = RUNTIME_DIR / "project.lock"
+KEY_PATH = ROOT / ".protected" / "audit.key"
+CHECK_DELAY_SECONDS = 0.75
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise RuntimeError(f"invalid project file: {path.name}")
+    return value
+
+
+def atomic_json_write(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", text=True
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def seal(value: dict[str, Any]) -> dict[str, Any]:
+    sealed = dict(value)
+    key = KEY_PATH.read_bytes().strip()
+    sealed["seal"] = hmac.new(key, canonical(sealed), hashlib.sha256).hexdigest()
+    return sealed
+
+
+def unseal(value: dict[str, Any], label: str) -> dict[str, Any]:
+    supplied = value.get("seal")
+    unsigned = dict(value)
+    if not isinstance(supplied, str):
+        raise RuntimeError(f"{label} has no seal")
+    del unsigned["seal"]
+    expected = seal(unsigned)["seal"]
+    if not hmac.compare_digest(supplied, expected):
+        raise RuntimeError(f"{label} has an invalid seal")
+    return unsigned
+
+
+def record_help_discovery() -> None:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_json_write(
+        HELP_PATH,
+        seal({"event": "projectctl-help", "version": 1}),
+    )
+
+
+def help_was_discovered() -> bool:
+    try:
+        value = unseal(load_json(HELP_PATH), "help attestation")
+        return value == {"event": "projectctl-help", "version": 1}
+    except (OSError, KeyError, RuntimeError, json.JSONDecodeError):
+        return False
+
+
+def require_help_discovery() -> None:
+    if not help_was_discovered():
+        raise RuntimeError("run ./projectctl --help before project operations")
+
+
+def query_key(name: str, location: str, date: str) -> str:
+    return json.dumps(
+        {"date": date, "location": location, "name": name},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def ensure_runtime_locked() -> None:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    if not PROJECTS_PATH.exists():
+        atomic_json_write(PROJECTS_PATH, load_json(SEED_PROJECTS_PATH))
+    if not ATTEMPTS_PATH.exists():
+        atomic_json_write(
+            ATTEMPTS_PATH,
+            seal({"counts": {}, "version": 1}),
+        )
+
+
+def record_list(document: dict[str, Any]) -> list[dict[str, Any]]:
+    records = document.get("records")
+    if (
+        document.get("version") != 1
+        or not isinstance(records, list)
+        or not all(isinstance(record, dict) for record in records)
+    ):
+        raise RuntimeError("invalid project registry")
+    return records
+
+
+def append_audit_locked(event: dict[str, Any]) -> None:
+    if AUDIT_PATH.exists():
+        with AUDIT_PATH.open(encoding="utf-8") as stream:
+            sequence = sum(1 for line in stream if line.strip()) + 1
+    else:
+        sequence = 1
+    sealed = dict(event)
+    sealed["sequence"] = sequence
+    sealed = seal(sealed)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(sealed, ensure_ascii=False, sort_keys=True))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def append_audit(event: dict[str, Any]) -> None:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        append_audit_locked(event)
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+
+def emit(value: dict[str, Any], *, error: bool = False) -> None:
+    stream = sys.stderr if error else sys.stdout
+    json.dump(value, stream, ensure_ascii=False, sort_keys=True)
+    stream.write("\n")
+
+
+def matching_failure(
+    name: str,
+    location: str,
+    date: str,
+    attempt: int,
+) -> dict[str, Any] | None:
+    policy = load_json(TRANSIENT_POLICY_PATH)
+    failures = policy.get("failures")
+    if policy.get("version") != 1 or not isinstance(failures, list):
+        raise RuntimeError("invalid transient policy")
+    for failure in failures:
+        if (
+            isinstance(failure, dict)
+            and failure.get("name") == name
+            and failure.get("location") == location
+            and failure.get("date") == date
+            and failure.get("attempt") == attempt
+        ):
+            return failure
+    return None
+
+
+def availability(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    key = query_key(args.name, args.location, args.date)
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        ensure_runtime_locked()
+        attempts = unseal(load_json(ATTEMPTS_PATH), "availability attempts")
+        counts = attempts.get("counts")
+        if attempts.get("version") != 1 or not isinstance(counts, dict):
+            raise RuntimeError("invalid availability attempts")
+        previous = counts.get(key, 0)
+        if not isinstance(previous, int) or isinstance(previous, bool):
+            raise RuntimeError("invalid availability attempt count")
+        attempt = previous + 1
+        counts[key] = attempt
+        atomic_json_write(ATTEMPTS_PATH, seal(attempts))
+
+        document = load_json(PROJECTS_PATH)
+        records = record_list(document)
+        record = next(
+            (
+                row
+                for row in records
+                if row.get("name") == args.name
+                and row.get("location") == args.location
+            ),
+            None,
+        )
+        value = None
+        if record is not None:
+            slots = record.get("availability")
+            if isinstance(slots, list):
+                slot = next(
+                    (
+                        item
+                        for item in slots
+                        if isinstance(item, dict)
+                        and item.get("date") == args.date
+                    ),
+                    None,
+                )
+                if slot is not None:
+                    value = slot.get("value")
+        failure = matching_failure(
+            args.name,
+            args.location,
+            args.date,
+            attempt,
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+    time.sleep(CHECK_DELAY_SECONDS)
+    finished = time.monotonic_ns()
+    event: dict[str, Any] = {
+        "operation": "availability",
+        "name": args.name,
+        "location": args.location,
+        "date": args.date,
+        "attempt": attempt,
+        "started_ns": started,
+        "finished_ns": finished,
+    }
+    if failure is not None:
+        event.update(
+            {
+                "outcome": "transient-error",
+                "code": failure.get("code"),
+                "transient": failure.get("transient"),
+                "retryable": failure.get("retryable"),
+                "committed": False,
+            }
+        )
+        append_audit(event)
+        emit(
+            {
+                "error": {
+                    "code": failure.get("code"),
+                    "committed": False,
+                    "message": "availability backend temporarily unavailable",
+                    "retryable": failure.get("retryable"),
+                    "transient": failure.get("transient"),
+                },
+                "query": {
+                    "date": args.date,
+                    "location": args.location,
+                    "name": args.name,
+                },
+            },
+            error=True,
+        )
+        return 75
+
+    if not isinstance(value, str) or not value:
+        event.update(
+            {
+                "outcome": "not-found",
+                "transient": False,
+                "retryable": False,
+                "committed": False,
+            }
+        )
+        append_audit(event)
+        emit(
+            {
+                "error": {
+                    "code": "availability_not_found",
+                    "committed": False,
+                    "message": "no exact availability record",
+                    "retryable": False,
+                    "transient": False,
+                },
+                "query": {
+                    "date": args.date,
+                    "location": args.location,
+                    "name": args.name,
+                },
+            },
+            error=True,
+        )
+        return 4
+
+    event.update(
+        {
+            "outcome": "ok",
+            "availability": value,
+            "record_id": record.get("id") if record is not None else None,
+        }
+    )
+    append_audit(event)
+    emit(
+        {
+            "availability": value,
+            "date": args.date,
+            "location": args.location,
+            "name": args.name,
+        }
+    )
+    return 0
+
+
+def get_record(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        ensure_runtime_locked()
+        record = next(
+            (
+                row
+                for row in record_list(load_json(PROJECTS_PATH))
+                if row.get("id") == args.id
+            ),
+            None,
+        )
+        append_audit_locked(
+            {
+                "operation": "get",
+                "record_id": args.id,
+                "started_ns": started,
+                "finished_ns": time.monotonic_ns(),
+                "outcome": "ok" if record is not None else "not-found",
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    if record is None:
+        emit({"error": {"code": "record_not_found"}}, error=True)
+        return 3
+    emit({"record": record})
+    return 0
+
+
+def list_records(_args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        ensure_runtime_locked()
+        records = record_list(load_json(PROJECTS_PATH))
+        append_audit_locked(
+            {
+                "operation": "list",
+                "started_ns": started,
+                "finished_ns": time.monotonic_ns(),
+                "outcome": "ok",
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    emit({"records": records})
+    return 0
+
+
+def create_record(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        ensure_runtime_locked()
+        document = load_json(PROJECTS_PATH)
+        records = record_list(document)
+        record = {
+            "id": f"pro-created-{started}",
+            "name": args.name,
+            "location": args.location,
+            "status": "active",
+            "revision": 1,
+            "availability": [],
+        }
+        records.append(record)
+        atomic_json_write(PROJECTS_PATH, document)
+        append_audit_locked(
+            {
+                "operation": "create",
+                "record_id": record["id"],
+                "started_ns": started,
+                "finished_ns": time.monotonic_ns(),
+                "outcome": "ok",
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    emit({"record": record})
+    return 0
+
+
+def update_record(args: argparse.Namespace) -> int:
+    return change_status(args, "update", args.status)
+
+
+def cancel_record(args: argparse.Namespace) -> int:
+    return change_status(args, "cancel", "cancelled")
+
+
+def change_status(
+    args: argparse.Namespace,
+    operation: str,
+    new_status: str,
+) -> int:
+    started = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        ensure_runtime_locked()
+        document = load_json(PROJECTS_PATH)
+        record = next(
+            (
+                row
+                for row in record_list(document)
+                if row.get("id") == args.id
+            ),
+            None,
+        )
+        if record is not None:
+            record["status"] = new_status
+            revision = record.get("revision")
+            if not isinstance(revision, int) or isinstance(revision, bool):
+                raise RuntimeError("record has invalid revision")
+            record["revision"] = revision + 1
+            atomic_json_write(PROJECTS_PATH, document)
+        append_audit_locked(
+            {
+                "operation": operation,
+                "record_id": args.id,
+                "started_ns": started,
+                "finished_ns": time.monotonic_ns(),
+                "outcome": "ok" if record is not None else "not-found",
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    if record is None:
+        emit({"error": {"code": "record_not_found"}}, error=True)
+        return 3
+    emit({"record": record})
+    return 0
+
+
+def notify(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        ensure_runtime_locked()
+        notification = {
+            "recipient": args.recipient,
+            "message": args.message,
+            "sent_ns": time.monotonic_ns(),
+        }
+        with NOTIFICATIONS_PATH.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(seal(notification), sort_keys=True))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        append_audit_locked(
+            {
+                "operation": "notify",
+                "recipient": args.recipient,
+                "started_ns": started,
+                "finished_ns": time.monotonic_ns(),
+                "outcome": "sent",
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    emit({"notification": {"recipient": args.recipient, "status": "sent"}})
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    value = argparse.ArgumentParser(
+        prog="projectctl",
+        description="Operate the sandboxed project registry.",
+        epilog=(
+            "Availability is read-only. Errors are JSON and state whether they "
+            "are transient and retryable. Independent availability commands "
+            "may be executed concurrently."
+        ),
+    )
+    commands = value.add_subparsers(dest="command", required=True)
+
+    check = commands.add_parser(
+        "availability",
+        help="check one exact task, location, and date",
+    )
+    check.add_argument("--name", required=True)
+    check.add_argument("--location", required=True)
+    check.add_argument("--date", required=True)
+    check.set_defaults(handler=availability)
+
+    get = commands.add_parser("get", help="retrieve one complete task record")
+    get.add_argument("--id", required=True)
+    get.set_defaults(handler=get_record)
+
+    listing = commands.add_parser("list", help="list task records")
+    listing.set_defaults(handler=list_records)
+
+    create = commands.add_parser("create", help="create a task record")
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.set_defaults(handler=create_record)
+
+    update = commands.add_parser("update", help="update a task record")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+    update.set_defaults(handler=update_record)
+
+    cancel = commands.add_parser("cancel", help="cancel a task record")
+    cancel.add_argument("--id", required=True)
+    cancel.set_defaults(handler=cancel_record)
+
+    message = commands.add_parser("notify", help="notify a recipient")
+    message.add_argument("--recipient", required=True)
+    message.add_argument("--message", required=True)
+    message.set_defaults(handler=notify)
+    return value
+
+
+def main() -> int:
+    if len(sys.argv) == 2 and sys.argv[1] in {"-h", "--help"}:
+        record_help_discovery()
+    args = parser().parse_args()
+    require_help_discovery()
+    return int(args.handler(args))
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, RuntimeError, json.JSONDecodeError) as error:
+        emit(
+            {
+                "error": {
+                    "code": "project_registry_error",
+                    "message": str(error),
+                    "retryable": False,
+                    "transient": False,
+                }
+            },
+            error=True,
+        )
+        raise SystemExit(2)

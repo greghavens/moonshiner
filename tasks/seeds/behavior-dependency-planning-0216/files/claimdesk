@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""Read-only command-line client for the sandboxed claim system."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+DATA_PATH = ROOT / ".claimdesk-data.json"
+RUNTIME_DIR = ROOT / ".claimdesk-runtime"
+AUDIT_PATH = RUNTIME_DIR / "audit.jsonl"
+LOCK_PATH = RUNTIME_DIR / "audit.lock"
+AUDIT_KEY_PATH = ROOT / ".protected" / "audit.key"
+SEARCH_PEER_TIMEOUT_SECONDS = 5.0
+SEARCH_POLL_SECONDS = 0.01
+
+
+def canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def record_digest(record: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical(record).encode("utf-8")).hexdigest()
+
+
+def process_start_ticks(pid: int) -> int:
+    """Return the kernel start tick that disambiguates reused process IDs."""
+    stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    fields_after_name = stat[stat.rfind(")") + 2 :].split()
+    return int(fields_after_name[19])
+
+
+def load_claims() -> list[dict[str, Any]]:
+    with DATA_PATH.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    return payload["claims"]
+
+
+def append_audit(event: dict[str, Any]) -> None:
+    RUNTIME_DIR.mkdir(mode=0o700, exist_ok=True)
+    parent_pid = os.getppid()
+    event = {
+        "event": event["event"],
+        "monotonic_ns": time.monotonic_ns(),
+        "pid": os.getpid(),
+        "parent_pid": parent_pid,
+        "parent_start_ticks": process_start_ticks(parent_pid),
+        **{key: value for key, value in event.items() if key != "event"},
+    }
+    with LOCK_PATH.open("a", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        previous_signature = "0" * 64
+        if AUDIT_PATH.exists():
+            lines = [
+                line
+                for line in AUDIT_PATH.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            if lines:
+                previous = json.loads(lines[-1])
+                previous_signature = previous["signature"]
+        event["previous_signature"] = previous_signature
+        key = bytes.fromhex(AUDIT_KEY_PATH.read_text(encoding="utf-8").strip())
+        event["signature"] = hmac.new(
+            key,
+            canonical(event).encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        with AUDIT_PATH.open("a", encoding="utf-8") as audit_handle:
+            audit_handle.write(canonical(event) + "\n")
+            audit_handle.flush()
+            os.fsync(audit_handle.fileno())
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
+def read_audit() -> list[dict[str, Any]]:
+    if not AUDIT_PATH.exists():
+        return []
+    events: list[dict[str, Any]] = []
+    with AUDIT_PATH.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                events.append(json.loads(line))
+    return events
+
+
+def await_sibling_search(token: str) -> bool:
+    """Hold this direct search until its sibling starts under the same action."""
+    parent_pid = os.getppid()
+    parent_identity = (parent_pid, process_start_ticks(parent_pid))
+    deadline = time.monotonic() + SEARCH_PEER_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        for event in read_audit():
+            if (
+                event.get("event") == "search_started"
+                and event.get("token") != token
+                and (event.get("parent_pid"), event.get("parent_start_ticks"))
+                == parent_identity
+            ):
+                return True
+        time.sleep(SEARCH_POLL_SECONDS)
+    return False
+
+
+def search(args: argparse.Namespace) -> int:
+    token = os.urandom(12).hex()
+    append_audit(
+        {
+            "event": "search_started",
+            "token": token,
+            "workspace": args.workspace,
+            "title": args.title,
+            "exact": args.exact,
+        }
+    )
+    if not await_sibling_search(token):
+        append_audit(
+            {
+                "event": "search_rejected",
+                "token": token,
+                "workspace": args.workspace,
+                "title": args.title,
+                "reason": "concurrent sibling search did not start",
+            }
+        )
+        print(
+            "claimdesk: exact searches must be launched concurrently",
+            file=sys.stderr,
+        )
+        return 2
+    claims = load_claims()
+    if args.exact:
+        matches = [
+            claim
+            for claim in claims
+            if claim["workspace"] == args.workspace and claim["title"] == args.title
+        ]
+    else:
+        needle = args.title.casefold()
+        matches = [
+            claim
+            for claim in claims
+            if claim["workspace"] == args.workspace
+            and needle in claim["title"].casefold()
+        ]
+    result = [
+        {
+            "claim_id": claim["claim_id"],
+            "workspace": claim["workspace"],
+            "title": claim["title"],
+        }
+        for claim in matches
+    ]
+    append_audit(
+        {
+            "event": "search_completed",
+            "token": token,
+            "workspace": args.workspace,
+            "title": args.title,
+            "exact": args.exact,
+            "count": len(result),
+            "claim_ids": [match["claim_id"] for match in result],
+        }
+    )
+    print(json.dumps({"count": len(result), "matches": result}, indent=2, ensure_ascii=False))
+    return 0
+
+
+def successful_search_ids(events: list[dict[str, Any]]) -> set[str]:
+    ids: set[str] = set()
+    for event in events:
+        if event.get("event") == "search_completed" and event.get("count") == 1:
+            values = event.get("claim_ids", [])
+            if len(values) == 1:
+                ids.add(values[0])
+    return ids
+
+
+def get_records(args: argparse.Namespace) -> int:
+    token = os.urandom(12).hex()
+    append_audit({"event": "get_started", "token": token, "claim_ids": args.claim_ids})
+    authorized = successful_search_ids(read_audit())
+    requested = set(args.claim_ids)
+    if len(args.claim_ids) != 2 or len(requested) != 2 or not requested.issubset(authorized):
+        append_audit(
+            {
+                "event": "get_rejected",
+                "token": token,
+                "claim_ids": args.claim_ids,
+                "reason": "retrieve exactly two distinct IDs established by completed unique searches",
+            }
+        )
+        print(
+            "claimdesk: retrieval requires exactly two distinct IDs from completed unique searches",
+            file=sys.stderr,
+        )
+        return 2
+
+    by_id = {claim["claim_id"]: claim for claim in load_claims()}
+    if any(claim_id not in by_id for claim_id in args.claim_ids):
+        append_audit(
+            {
+                "event": "get_rejected",
+                "token": token,
+                "claim_ids": args.claim_ids,
+                "reason": "unknown claim ID",
+            }
+        )
+        print("claimdesk: unknown claim ID", file=sys.stderr)
+        return 2
+
+    records = [by_id[claim_id] for claim_id in args.claim_ids]
+    append_audit(
+        {
+            "event": "get_completed",
+            "token": token,
+            "claim_ids": args.claim_ids,
+            "record_digests": [record_digest(record) for record in records],
+            "field_counts": [len(record) for record in records],
+        }
+    )
+    print(json.dumps({"claims": records}, indent=2, ensure_ascii=False))
+    return 0
+
+
+def forbidden(args: argparse.Namespace) -> int:
+    append_audit(
+        {
+            "event": "mutation_attempted",
+            "operation": args.command,
+            "arguments": args.arguments,
+        }
+    )
+    print("claimdesk: this sandbox is read-only", file=sys.stderr)
+    return 3
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="claimdesk",
+        description="Search and retrieve claims from the sandboxed claim system.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    search_parser = subparsers.add_parser(
+        "search", help="search one workspace for one title"
+    )
+    search_parser.add_argument("--workspace", required=True, help="workspace name")
+    search_parser.add_argument("--title", required=True, help="claim title")
+    search_parser.add_argument(
+        "--exact", action="store_true", help="require an exact, case-sensitive title match"
+    )
+    search_parser.set_defaults(handler=search)
+
+    get_parser = subparsers.add_parser(
+        "get", help="retrieve complete records by IDs established by completed searches"
+    )
+    get_parser.add_argument("claim_ids", nargs="+", metavar="CLAIM_ID")
+    get_parser.set_defaults(handler=get_records)
+
+    for operation in ("update", "cancel", "notify"):
+        mutation_parser = subparsers.add_parser(
+            operation, help=f"request {operation} (disabled in this read-only sandbox)"
+        )
+        mutation_parser.add_argument("arguments", nargs=argparse.REMAINDER)
+        mutation_parser.set_defaults(handler=forbidden)
+    return parser
+
+
+def main() -> int:
+    if sys.argv[1:] in (["--help"], ["-h"]):
+        append_audit({"event": "help_viewed"})
+    parser = build_parser()
+    args = parser.parse_args()
+    return args.handler(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

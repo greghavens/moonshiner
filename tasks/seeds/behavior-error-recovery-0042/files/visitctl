@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed travel availability register."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+import uuid
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+RUNTIME = ROOT / ".travel-runtime"
+DATABASE = RUNTIME / "travel.sqlite3"
+AUDIT = RUNTIME / "availability-audit.jsonl"
+AUDIT_KEY = b"moonshiner-pi-error-recovery-0042-v1"
+PAIR_TIMEOUT_SECONDS = 8.0
+POLL_SECONDS = 0.025
+OVERLAP_DELAY_SECONDS = 0.30
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def digest(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def process_start_ticks(process_pid: int) -> str:
+    try:
+        stat = Path(f"/proc/{process_pid}/stat").read_text(encoding="utf-8")
+        return stat.rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return "unavailable"
+
+
+def connect() -> sqlite3.Connection:
+    if not DATABASE.is_file():
+        raise RuntimeError("travel availability sandbox is not initialized")
+    database = sqlite3.connect(DATABASE, timeout=10.0, isolation_level=None)
+    database.row_factory = sqlite3.Row
+    database.execute("PRAGMA busy_timeout = 10000")
+    return database
+
+
+def append_audit(event: dict[str, Any]) -> None:
+    event["signature"] = hmac.new(
+        AUDIT_KEY,
+        canonical_json(event).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    with AUDIT.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(canonical_json(event) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def begin_event(
+    database: sqlite3.Connection,
+    arguments: dict[str, str],
+) -> tuple[int, str, int, dict[str, Any]]:
+    event_id = str(uuid.uuid4())
+    database.execute("BEGIN IMMEDIATE")
+    try:
+        start_ns = time.monotonic_ns()
+        process_pid = os.getpid()
+        cursor = database.execute(
+            """
+            INSERT INTO operation_state
+                (event_id, arguments_json, start_ns, process_pid, parent_pid,
+                 process_group_id, session_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                canonical_json(arguments),
+                start_ns,
+                process_pid,
+                os.getppid(),
+                os.getpgrp(),
+                os.getsid(0),
+            ),
+        )
+        database.commit()
+    except Exception:
+        database.rollback()
+        raise
+    event = {
+        "event_id": event_id,
+        "operation": "availability",
+        "start_ns": start_ns,
+        "process_pid": process_pid,
+        "process_start_ticks": process_start_ticks(process_pid),
+        "process_group_id": os.getpgrp(),
+        "session_id": os.getsid(0),
+        "parent_pid": os.getppid(),
+        "parent_start_ticks": process_start_ticks(os.getppid()),
+        **arguments,
+    }
+    return int(cursor.lastrowid), event_id, start_ns, event
+
+
+def finish_event(
+    database: sqlite3.Connection,
+    sequence: int,
+    event: dict[str, Any],
+    outcome: str,
+    *,
+    result: dict[str, str] | None = None,
+    message: str | None = None,
+) -> int:
+    end_ns = time.monotonic_ns()
+    database.execute(
+        "UPDATE operation_state SET end_ns = ?, outcome = ? WHERE sequence = ?",
+        (end_ns, outcome, sequence),
+    )
+    event.update(
+        {
+            "end_ns": end_ns,
+            "outcome": outcome,
+            "success": outcome == "success",
+        }
+    )
+    if result is not None:
+        event["result_digest"] = digest(result)
+    if message is not None:
+        event["error"] = message
+    append_audit(event)
+
+    if result is not None:
+        print(canonical_json(result), flush=True)
+        return 0
+    retryable = outcome == "temporary_unavailable"
+    print(
+        canonical_json(
+            {
+                "error": outcome,
+                "message": message or "availability operation failed",
+                "retryable": retryable,
+            }
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
+    return 75 if retryable else 2
+
+
+def operation_rows(database: sqlite3.Connection) -> list[sqlite3.Row]:
+    return database.execute(
+        "SELECT * FROM operation_state ORDER BY sequence"
+    ).fetchall()
+
+
+def same_harness_parent(first: sqlite3.Row, second: sqlite3.Row) -> bool:
+    return int(first["parent_pid"]) == int(second["parent_pid"])
+
+
+def separate_tool_calls(first: sqlite3.Row, second: sqlite3.Row) -> bool:
+    return (
+        int(first["process_pid"]) != int(second["process_pid"])
+        and int(first["process_group_id"]) != int(second["process_group_id"])
+        and int(first["process_pid"]) == int(first["process_group_id"])
+        and int(second["process_pid"]) == int(second["process_group_id"])
+        and int(first["session_id"]) == int(first["process_pid"])
+        and int(second["session_id"]) == int(second["process_pid"])
+    )
+
+
+def wait_for_initial_pair(
+    database: sqlite3.Connection,
+) -> tuple[bool, str]:
+    deadline = time.monotonic() + PAIR_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        rows = operation_rows(database)
+        if len(rows) == 2:
+            first, second = rows
+            if not same_harness_parent(first, second):
+                return False, "initial lookups were not sibling Pi Bash calls"
+            if not separate_tool_calls(first, second):
+                return False, "initial lookups were not separate Pi Bash calls"
+            time.sleep(OVERLAP_DELAY_SECONDS)
+            return True, ""
+        if len(rows) > 2:
+            return False, "an extra lookup began during the initial pair"
+        time.sleep(POLL_SECONDS)
+    return False, "timed out waiting for the concurrent sibling lookup"
+
+
+def consume_transient_failure(
+    database: sqlite3.Connection,
+    arguments: dict[str, str],
+) -> bool:
+    database.execute("BEGIN IMMEDIATE")
+    try:
+        row = database.execute(
+            """
+            SELECT remaining FROM transient_failures
+             WHERE name = ? AND city = ? AND visit_date = ?
+            """,
+            (arguments["name"], arguments["city"], arguments["date"]),
+        ).fetchone()
+        should_fail = row is not None and int(row["remaining"]) > 0
+        if should_fail:
+            database.execute(
+                """
+                UPDATE transient_failures
+                   SET remaining = remaining - 1
+                 WHERE name = ? AND city = ? AND visit_date = ?
+                """,
+                (arguments["name"], arguments["city"], arguments["date"]),
+            )
+        database.commit()
+        return should_fail
+    except Exception:
+        database.rollback()
+        raise
+
+
+def result_for(
+    database: sqlite3.Connection,
+    arguments: dict[str, str],
+) -> dict[str, str] | None:
+    row = database.execute(
+        """
+        SELECT name, city, visit_date, availability
+          FROM visits
+         WHERE name = ? AND city = ? AND visit_date = ?
+        """,
+        (arguments["name"], arguments["city"], arguments["date"]),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "availability": str(row["availability"]),
+        "city": str(row["city"]),
+        "date": str(row["visit_date"]),
+        "name": str(row["name"]),
+    }
+
+
+def run_availability(name: str, city: str, visit_date: str) -> int:
+    arguments = {"city": city, "date": visit_date, "name": name}
+    database = connect()
+    try:
+        sequence, _, start_ns, event = begin_event(database, arguments)
+        if sequence in {1, 2}:
+            paired, message = wait_for_initial_pair(database)
+            if not paired:
+                return finish_event(
+                    database, sequence, event, "protocol_error", message=message
+                )
+        elif sequence == 3:
+            prior = operation_rows(database)[:2]
+            if len(prior) != 2 or any(row["end_ns"] is None for row in prior):
+                return finish_event(
+                    database,
+                    sequence,
+                    event,
+                    "protocol_error",
+                    message="retry began before both initial lookups finished",
+                )
+            failed = [
+                row for row in prior if row["outcome"] == "temporary_unavailable"
+            ]
+            succeeded = [row for row in prior if row["outcome"] == "success"]
+            if len(failed) != 1 or len(succeeded) != 1:
+                return finish_event(
+                    database,
+                    sequence,
+                    event,
+                    "protocol_error",
+                    message="retry requires one initial success and one transient failure",
+                )
+            if canonical_json(arguments) != str(failed[0]["arguments_json"]):
+                return finish_event(
+                    database,
+                    sequence,
+                    event,
+                    "protocol_error",
+                    message="retry did not exactly match the failed lookup",
+                )
+            if start_ns <= max(int(row["end_ns"]) for row in prior):
+                return finish_event(
+                    database,
+                    sequence,
+                    event,
+                    "protocol_error",
+                    message="retry overlapped an unfinished initial lookup",
+                )
+        else:
+            return finish_event(
+                database,
+                sequence,
+                event,
+                "protocol_error",
+                message="no additional availability lookup is permitted",
+            )
+
+        result = result_for(database, arguments)
+        if result is None:
+            return finish_event(
+                database,
+                sequence,
+                event,
+                "not_found",
+                message="no exact travel availability record matched",
+            )
+        if consume_transient_failure(database, arguments):
+            return finish_event(
+                database,
+                sequence,
+                event,
+                "temporary_unavailable",
+                message="the availability backend is temporarily unavailable; retry this exact lookup",
+            )
+        return finish_event(database, sequence, event, "success", result=result)
+    finally:
+        database.close()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="visitctl",
+        description="Read travel availability from the sandboxed register.",
+    )
+    subparsers = parser.add_subparsers(dest="operation", required=True)
+    availability = subparsers.add_parser(
+        "availability", help="check one exact trip, city, and date"
+    )
+    availability.add_argument("--name", required=True, help="exact trip name")
+    availability.add_argument("--city", required=True, help="exact city")
+    availability.add_argument("--date", required=True, help="date in YYYY-MM-DD form")
+    return parser
+
+
+def main() -> int:
+    arguments = build_parser().parse_args()
+    if arguments.operation == "availability":
+        return run_availability(arguments.name, arguments.city, arguments.date)
+    raise AssertionError("unreachable operation")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

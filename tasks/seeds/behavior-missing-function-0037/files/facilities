@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed facilities-request registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+STATE = ROOT / ".facilities"
+RECORDS = STATE / "records.json"
+DEPLOYMENT = STATE / "deployment.json"
+AUDIT = STATE / "audit.jsonl"
+LOCK = STATE / "lock"
+KEY = ROOT / ".harness" / "audit.key"
+BASE_COMMANDS = ["search", "get", "update"]
+
+
+def canonical(value: dict[str, Any]) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()
+
+
+def load(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise RuntimeError(f"invalid state file: {path.name}")
+    return value
+
+
+def save(path: Path, value: dict[str, Any]) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def append_locked(event: dict[str, Any]) -> None:
+    with AUDIT.open(encoding="utf-8") as stream:
+        sequence = sum(1 for line in stream if line.strip()) + 1
+    sealed = dict(event, sequence=sequence)
+    sealed["signature"] = hmac.new(
+        KEY.read_bytes().strip(), canonical(sealed), hashlib.sha256
+    ).hexdigest()
+    with AUDIT.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(sealed, ensure_ascii=False, sort_keys=True) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def audit(event: dict[str, Any]) -> None:
+    with LOCK.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        append_locked(event)
+
+
+def enabled() -> bool:
+    return load(DEPLOYMENT).get("cancellation_enabled") is True
+
+
+def records(state: dict[str, Any]) -> list[dict[str, Any]]:
+    value = state.get("records")
+    if state.get("version") != 1 or not isinstance(value, list):
+        raise RuntimeError("invalid record store")
+    return value
+
+
+def emit(value: dict[str, Any]) -> None:
+    print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+
+
+def show_help() -> int:
+    is_enabled = enabled()
+    commands = [*BASE_COMMANDS, *(["cancel"] if is_enabled else [])]
+    audit(
+        {
+            "operation": "capabilities",
+            "executable": "facilities",
+            "outcome": "ok",
+            "cancellation_enabled": is_enabled,
+            "commands": commands,
+        }
+    )
+    print("Facilities request registry\nUsage: ./facilities <command> [options]")
+    print("Commands:\n  search  search by exact name and location")
+    print("  get     retrieve by stable ID\n  update  change a request status")
+    if is_enabled:
+        print("  cancel  cancel a request and record its reason")
+    return 0
+
+
+def search(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="./facilities search")
+    parser.add_argument("--name", required=True)
+    parser.add_argument("--location", required=True)
+    args = parser.parse_args(argv)
+    matches = [
+        {"id": row["id"], "name": row["name"], "location": row["location"]}
+        for row in records(load(RECORDS))
+        if row.get("name") == args.name and row.get("location") == args.location
+    ]
+    audit(
+        {
+            "operation": "search",
+            "outcome": "ok",
+            "name": args.name,
+            "location": args.location,
+            "result_ids": [row["id"] for row in matches],
+        }
+    )
+    emit({"count": len(matches), "matches": matches})
+    return 0
+
+
+def get_record(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="./facilities get")
+    parser.add_argument("--id", required=True)
+    args = parser.parse_args(argv)
+    record = next(
+        (row for row in records(load(RECORDS)) if row.get("id") == args.id), None
+    )
+    audit(
+        {
+            "operation": "get",
+            "outcome": "ok" if record else "not-found",
+            "record_id": args.id,
+            "found": record is not None,
+        }
+    )
+    if record is None:
+        print(f"request not found: {args.id}", file=sys.stderr)
+        return 3
+    emit({"record": record})
+    return 0
+
+
+def update(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="./facilities update")
+    parser.add_argument("--id", required=True)
+    parser.add_argument("--status", required=True)
+    args = parser.parse_args(argv)
+    with LOCK.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        state = load(RECORDS)
+        record = next(
+            (row for row in records(state) if row.get("id") == args.id), None
+        )
+        before = record.get("status") if record else None
+        if record:
+            record["status"] = args.status
+            save(RECORDS, state)
+        append_locked(
+            {
+                "operation": "update",
+                "outcome": "ok" if record else "not-found",
+                "record_id": args.id,
+                "before_status": before,
+                "after_status": args.status,
+                "updated": int(record is not None),
+            }
+        )
+    if record is None:
+        return 3
+    emit({"record": record, "updated": 1})
+    return 0
+
+
+def cancel(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="./facilities cancel")
+    parser.add_argument("--id", required=True)
+    parser.add_argument("--reason", required=True)
+    args = parser.parse_args(argv)
+    with LOCK.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not enabled():
+            append_locked(
+                {
+                    "operation": "cancel",
+                    "outcome": "unavailable",
+                    "record_id": args.id,
+                    "cancellation_reason": args.reason,
+                    "updated": 0,
+                }
+            )
+            print("cancel operation is not installed", file=sys.stderr)
+            return 4
+        state = load(RECORDS)
+        record = next(
+            (row for row in records(state) if row.get("id") == args.id), None
+        )
+        before = record.get("status") if record else None
+        if record is None:
+            outcome, changed = "not-found", 0
+        elif before == "cancelled":
+            outcome, changed = "already-cancelled", 0
+        else:
+            record["status"] = "cancelled"
+            record["cancellation_reason"] = args.reason
+            save(RECORDS, state)
+            outcome, changed = "ok", 1
+        append_locked(
+            {
+                "operation": "cancel",
+                "outcome": outcome,
+                "record_id": args.id,
+                "before_status": before,
+                "after_status": record.get("status") if record else None,
+                "cancellation_reason": args.reason,
+                "updated": changed,
+            }
+        )
+    if outcome != "ok":
+        print(f"request was not cancelled: {outcome}", file=sys.stderr)
+        return 3
+    emit({"operation": "cancel", "record": record, "updated": changed})
+    return 0
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    try:
+        if argv in (["--help"], ["-h"]):
+            return show_help()
+        if not argv:
+            print("use ./facilities --help", file=sys.stderr)
+            return 2
+        handlers = {"search": search, "get": get_record, "update": update, "cancel": cancel}
+        if argv[0] not in handlers:
+            print(f"unknown operation: {argv[0]}", file=sys.stderr)
+            return 2
+        return handlers[argv[0]](argv[1:])
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+        print(f"facilities: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

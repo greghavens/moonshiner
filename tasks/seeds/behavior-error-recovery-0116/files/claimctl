@@ -1,0 +1,535 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed claim-availability database."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import tempfile
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+RUNTIME = ROOT / ".claim-runtime"
+DATABASE = RUNTIME / "claims.sqlite3"
+INIT_LOCK = RUNTIME / "initialize.lock"
+SEED = ROOT / ".protected" / "claim_seed.sql"
+RECEIPT = ROOT / ".claim-audit.receipt.json"
+KEY_PATH = ROOT / ".protected" / "audit.key"
+PAIR_TIMEOUT_SECONDS = 8.0
+POLL_SECONDS = 0.025
+READ_DELAY_SECONDS = 0.45
+
+
+class ClaimServiceError(RuntimeError):
+    """An expected user-facing claim service error."""
+
+    def __init__(self, code: str, message: str, *, retryable: bool = False):
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def digest(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def audit_key() -> bytes:
+    try:
+        return bytes.fromhex(KEY_PATH.read_text(encoding="ascii").strip())
+    except (OSError, ValueError) as error:
+        raise ClaimServiceError(
+            "SERVICE_STATE_ERROR", "audit state is unavailable"
+        ) from error
+
+
+def ensure_database() -> None:
+    RUNTIME.mkdir(mode=0o700, exist_ok=True)
+    with INIT_LOCK.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if DATABASE.is_file():
+            return
+        temporary = RUNTIME / f"claims.{os.getpid()}.sqlite3"
+        database = sqlite3.connect(temporary)
+        try:
+            database.executescript(SEED.read_text(encoding="utf-8"))
+            database.execute("PRAGMA journal_mode = WAL")
+            database.commit()
+        except Exception:
+            database.close()
+            if temporary.exists():
+                temporary.unlink()
+            raise
+        else:
+            database.close()
+            os.replace(temporary, DATABASE)
+
+
+def connect() -> sqlite3.Connection:
+    ensure_database()
+    database = sqlite3.connect(DATABASE, timeout=10.0, isolation_level=None)
+    database.row_factory = sqlite3.Row
+    database.execute("PRAGMA busy_timeout = 10000")
+    return database
+
+
+def event_payload(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "arguments": json.loads(row["arguments_json"]),
+        "error_code": row["error_code"],
+        "finished_ns": row["finished_ns"],
+        "operation": row["operation"],
+        "outcome": row["outcome"],
+        "parent_pid": row["parent_pid"],
+        "pid": row["pid"],
+        "result_digest": row["result_digest"],
+        "retryable": None if row["retryable"] is None else bool(row["retryable"]),
+        "sequence": row["sequence"],
+        "started_ns": row["started_ns"],
+    }
+
+
+def begin_event(
+    database: sqlite3.Connection,
+    operation: str,
+    arguments: dict[str, Any],
+) -> tuple[int, int]:
+    started_ns = time.monotonic_ns()
+    cursor = database.execute(
+        """
+        INSERT INTO operation_journal
+            (operation, arguments_json, started_ns, pid, parent_pid)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (operation, canonical_json(arguments), started_ns, os.getpid(), os.getppid()),
+    )
+    return int(cursor.lastrowid), started_ns
+
+
+def finish_event(
+    database: sqlite3.Connection,
+    sequence: int,
+    *,
+    outcome: str,
+    error_code: str | None = None,
+    retryable: bool | None = None,
+    result: Any | None = None,
+) -> None:
+    finished_ns = time.monotonic_ns()
+    result_digest = digest(result) if result is not None else None
+    database.execute(
+        """
+        UPDATE operation_journal
+           SET finished_ns = ?, outcome = ?, error_code = ?, retryable = ?,
+               result_digest = ?
+         WHERE sequence = ?
+        """,
+        (
+            finished_ns,
+            outcome,
+            error_code,
+            None if retryable is None else int(retryable),
+            result_digest,
+            sequence,
+        ),
+    )
+    row = database.execute(
+        "SELECT * FROM operation_journal WHERE sequence = ?", (sequence,)
+    ).fetchone()
+    if row is None:
+        raise ClaimServiceError(
+            "SERVICE_STATE_ERROR", "operation journal is unavailable"
+        )
+    seal = hmac.new(
+        audit_key(), canonical_json(event_payload(row)).encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    database.execute(
+        "UPDATE operation_journal SET seal = ? WHERE sequence = ?", (seal, sequence)
+    )
+
+
+def fail_event(
+    database: sqlite3.Connection,
+    sequence: int,
+    error: ClaimServiceError,
+) -> int:
+    finish_event(
+        database,
+        sequence,
+        outcome="transient_error" if error.retryable else "error",
+        error_code=error.code,
+        retryable=error.retryable,
+    )
+    print(
+        canonical_json(
+            {
+                "error": {
+                    "code": error.code,
+                    "message": str(error),
+                    "retryable": error.retryable,
+                }
+            }
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
+    return 75 if error.retryable else 2
+
+
+def wait_for_initial_pair(database: sqlite3.Connection) -> None:
+    deadline = time.monotonic() + PAIR_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        rows = database.execute(
+            "SELECT sequence, operation FROM operation_journal ORDER BY sequence"
+        ).fetchall()
+        if len(rows) >= 2:
+            if len(rows) != 2 or any(row["operation"] != "availability" for row in rows):
+                raise ClaimServiceError(
+                    "WORKFLOW_ERROR",
+                    "initial phase must contain exactly two availability checks",
+                )
+            return
+        time.sleep(POLL_SECONDS)
+    raise ClaimServiceError(
+        "CONCURRENCY_REQUIRED",
+        "timed out waiting for the other concurrent availability check",
+    )
+
+
+def require_retry_scope(
+    database: sqlite3.Connection,
+    arguments: dict[str, Any],
+) -> None:
+    rows = database.execute(
+        "SELECT * FROM operation_journal WHERE sequence < 3 ORDER BY sequence"
+    ).fetchall()
+    if len(rows) != 2 or any(row["finished_ns"] is None for row in rows):
+        raise ClaimServiceError(
+            "WORKFLOW_ERROR", "retry requires both initial checks to have completed"
+        )
+    if sorted(row["outcome"] for row in rows) != ["ok", "transient_error"]:
+        raise ClaimServiceError(
+            "WORKFLOW_ERROR", "retry requires exactly one transient initial failure"
+        )
+    failed = next(row for row in rows if row["outcome"] == "transient_error")
+    if json.loads(failed["arguments_json"]) != arguments:
+        raise ClaimServiceError(
+            "WORKFLOW_ERROR",
+            "only the transiently failed availability scope may be retried",
+        )
+
+
+def consume_transient_failure(
+    database: sqlite3.Connection,
+    arguments: dict[str, Any],
+) -> bool:
+    database.execute("BEGIN IMMEDIATE")
+    try:
+        cursor = database.execute(
+            """
+            UPDATE transient_failures
+               SET remaining = remaining - 1
+             WHERE claim_name = ? AND office = ? AND availability_date = ?
+               AND remaining > 0
+            """,
+            (arguments["claim"], arguments["office"], arguments["date"]),
+        )
+        database.commit()
+    except Exception:
+        database.rollback()
+        raise
+    return cursor.rowcount == 1
+
+
+def availability_record(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "availability": row["availability"],
+        "claim": row["claim_name"],
+        "date": row["availability_date"],
+        "office": row["office"],
+        "slots_available": row["slots_available"],
+    }
+
+
+def table_state(
+    database: sqlite3.Connection,
+    query: str,
+) -> list[list[Any]]:
+    return [list(row) for row in database.execute(query)]
+
+
+def read_only_state(database: sqlite3.Connection) -> dict[str, str]:
+    return {
+        "availability_sha256": digest(
+            table_state(
+                database,
+                """
+                SELECT claim_name, office, availability_date, availability,
+                       slots_available
+                  FROM claim_availability
+                 ORDER BY claim_name, office, availability_date
+                """,
+            )
+        ),
+        "claims_sha256": digest(
+            table_state(
+                database,
+                """
+                SELECT id, claim_name, office, loss_type, status, claimant,
+                       reserve_cents, assigned_adjuster
+                  FROM claims
+                 ORDER BY id
+                """,
+            )
+        ),
+        "mutations_sha256": digest(
+            table_state(
+                database,
+                """
+                SELECT sequence, operation, claim_id, detail
+                  FROM mutation_log
+                 ORDER BY sequence
+                """,
+            )
+        ),
+        "transient_sha256": digest(
+            table_state(
+                database,
+                """
+                SELECT claim_name, office, availability_date, remaining
+                  FROM transient_failures
+                 ORDER BY claim_name, office, availability_date
+                """,
+            )
+        ),
+    }
+
+
+def maybe_write_receipt(database: sqlite3.Connection) -> None:
+    rows = database.execute(
+        "SELECT * FROM operation_journal ORDER BY sequence"
+    ).fetchall()
+    if len(rows) != 3 or any(row["seal"] is None for row in rows):
+        return
+    payload = {
+        **read_only_state(database),
+        "events": [event_payload(row) | {"seal": row["seal"]} for row in rows],
+        "version": 1,
+    }
+    receipt = dict(payload)
+    receipt["signature"] = hmac.new(
+        audit_key(), canonical_json(payload).encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=ROOT, prefix=f".{RECEIPT.name}.", text=True
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(receipt, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, RECEIPT)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def run_availability(
+    database: sqlite3.Connection,
+    args: argparse.Namespace,
+) -> int:
+    arguments = {"claim": args.claim, "date": args.date, "office": args.office}
+    sequence, _ = begin_event(database, "availability", arguments)
+    try:
+        if sequence <= 2:
+            wait_for_initial_pair(database)
+        elif sequence == 3:
+            require_retry_scope(database, arguments)
+        else:
+            raise ClaimServiceError(
+                "WORKFLOW_ERROR", "no additional availability checks are permitted"
+            )
+
+        time.sleep(READ_DELAY_SECONDS)
+        if consume_transient_failure(database, arguments):
+            raise ClaimServiceError(
+                "TRANSIENT_SERVICE_ERROR",
+                "claim availability service is temporarily unavailable",
+                retryable=True,
+            )
+
+        row = database.execute(
+            """
+            SELECT claim_name, office, availability_date, availability,
+                   slots_available
+              FROM claim_availability
+             WHERE claim_name = ? AND office = ? AND availability_date = ?
+            """,
+            (args.claim, args.office, args.date),
+        ).fetchone()
+        if row is None:
+            raise ClaimServiceError(
+                "AVAILABILITY_SCOPE_NOT_FOUND",
+                "no exact claim-availability record matched the scope",
+            )
+        result = {"record": availability_record(row)}
+        finish_event(database, sequence, outcome="ok", result=result)
+        maybe_write_receipt(database)
+        print(canonical_json(result), flush=True)
+        return 0
+    except ClaimServiceError as error:
+        return fail_event(database, sequence, error)
+
+
+def run_get(database: sqlite3.Connection, args: argparse.Namespace) -> int:
+    arguments = {"claim": args.claim, "office": args.office}
+    sequence, _ = begin_event(database, "get", arguments)
+    row = database.execute(
+        """
+        SELECT id, claim_name, office, loss_type, status, claimant, reserve_cents,
+               assigned_adjuster
+          FROM claims
+         WHERE claim_name = ? AND office = ?
+        """,
+        (args.claim, args.office),
+    ).fetchone()
+    result = {"record": dict(row) if row is not None else None}
+    finish_event(database, sequence, outcome="ok", result=result)
+    print(canonical_json(result), flush=True)
+    return 0
+
+
+def run_set_status(database: sqlite3.Connection, args: argparse.Namespace) -> int:
+    arguments = {"id": args.id, "status": args.status}
+    sequence, _ = begin_event(database, "set_status", arguments)
+    database.execute("BEGIN IMMEDIATE")
+    try:
+        changed = database.execute(
+            "UPDATE claims SET status = ? WHERE id = ?",
+            (args.status, args.id),
+        ).rowcount
+        database.execute(
+            "INSERT INTO mutation_log(operation, claim_id, detail) VALUES (?, ?, ?)",
+            ("set_status", args.id, canonical_json(arguments)),
+        )
+        database.commit()
+    except Exception:
+        database.rollback()
+        raise
+    result = {"updated": changed == 1}
+    finish_event(database, sequence, outcome="ok", result=result)
+    print(canonical_json(result), flush=True)
+    return 0
+
+
+def run_assign(database: sqlite3.Connection, args: argparse.Namespace) -> int:
+    arguments = {"adjuster": args.adjuster, "id": args.id}
+    sequence, _ = begin_event(database, "assign", arguments)
+    database.execute("BEGIN IMMEDIATE")
+    try:
+        changed = database.execute(
+            "UPDATE claims SET assigned_adjuster = ? WHERE id = ?",
+            (args.adjuster, args.id),
+        ).rowcount
+        database.execute(
+            "INSERT INTO mutation_log(operation, claim_id, detail) VALUES (?, ?, ?)",
+            ("assign", args.id, canonical_json(arguments)),
+        )
+        database.commit()
+    except Exception:
+        database.rollback()
+        raise
+    result = {"updated": changed == 1}
+    finish_event(database, sequence, outcome="ok", result=result)
+    print(canonical_json(result), flush=True)
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    main = argparse.ArgumentParser(
+        prog="claimctl",
+        description="Client for the sandboxed insurance-claims registry",
+        epilog=(
+            "An availability success is JSON on stdout. Errors are JSON on stderr. "
+            "TRANSIENT_SERVICE_ERROR with retryable true exits 75 and permits one "
+            "failed-scope-only retry after both initial checks finish."
+        ),
+    )
+    commands = main.add_subparsers(dest="operation", required=True)
+
+    availability = commands.add_parser(
+        "availability",
+        help="read one exact availability slot without retrieving a claim",
+    )
+    availability.add_argument("--claim", required=True)
+    availability.add_argument("--office", required=True)
+    availability.add_argument("--date", required=True)
+
+    get = commands.add_parser("get", help="retrieve a claim (administrative)")
+    get.add_argument("--claim", required=True)
+    get.add_argument("--office", required=True)
+
+    set_status = commands.add_parser(
+        "set-status", help="change a claim status (administrative)"
+    )
+    set_status.add_argument("--id", required=True)
+    set_status.add_argument("--status", required=True)
+
+    assign = commands.add_parser(
+        "assign", help="assign a claim adjuster (administrative)"
+    )
+    assign.add_argument("--id", required=True)
+    assign.add_argument("--adjuster", required=True)
+    return main
+
+
+def main() -> int:
+    try:
+        ensure_database()
+        args = parser().parse_args()
+        database = connect()
+        try:
+            if args.operation == "availability":
+                return run_availability(database, args)
+            if args.operation == "get":
+                return run_get(database, args)
+            if args.operation == "set-status":
+                return run_set_status(database, args)
+            if args.operation == "assign":
+                return run_assign(database, args)
+            raise AssertionError(f"unhandled operation: {args.operation}")
+        finally:
+            database.close()
+    except ClaimServiceError as error:
+        print(
+            canonical_json(
+                {
+                    "error": {
+                        "code": error.code,
+                        "message": str(error),
+                        "retryable": error.retryable,
+                    }
+                }
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+        return 75 if error.retryable else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

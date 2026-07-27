@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed account registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator
+
+
+ROOT = Path(__file__).resolve().parent
+PRIVATE = ROOT / ".harness"
+RUNTIME = PRIVATE / "runtime"
+SEED = PRIVATE / "seed.json"
+RECORDS = RUNTIME / "records.json"
+AUDIT = RUNTIME / "audit.json"
+NOTICES = RUNTIME / "notices.json"
+HELP = RUNTIME / "help.json"
+BARRIERS = RUNTIME / "barriers"
+LOCK = PRIVATE / "lock"
+
+
+def read_object(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"CRM state is unavailable: {path.name}") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError(f"CRM state is malformed: {path.name}")
+    return value
+
+
+def write_object(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(value, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+@contextmanager
+def exclusive() -> Iterator[None]:
+    with LOCK.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def append_operation(operation: dict[str, Any]) -> dict[str, Any]:
+    history = read_object(AUDIT)
+    rows = history.get("operations")
+    if history.get("version") != 1 or not isinstance(rows, list):
+        raise RuntimeError("CRM operation history is malformed")
+    saved = {"sequence": len(rows) + 1, **operation}
+    rows.append(saved)
+    write_object(AUDIT, history)
+    return saved
+
+
+def records_from(state: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = state.get("records")
+    if state.get("version") != 1 or not isinstance(rows, list):
+        raise RuntimeError("CRM records are malformed")
+    if not all(isinstance(row, dict) for row in rows):
+        raise RuntimeError("CRM records are malformed")
+    return rows
+
+
+def ensure_runtime() -> None:
+    if RECORDS.exists() and AUDIT.exists() and NOTICES.exists():
+        return
+    if any(path.exists() for path in (RECORDS, AUDIT, NOTICES)):
+        raise RuntimeError("CRM runtime is incomplete")
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    seed = read_object(SEED)
+    records_from(seed)
+    write_object(RECORDS, seed)
+    write_object(AUDIT, {"version": 1, "operations": []})
+    write_object(NOTICES, {"version": 1, "notices": []})
+
+
+def emit(value: Any) -> None:
+    print(json.dumps(value, indent=2, ensure_ascii=False))
+
+
+def record_help_read() -> None:
+    started = time.monotonic_ns()
+    with exclusive():
+        ensure_runtime()
+        if HELP.exists():
+            history = read_object(HELP)
+        else:
+            history = {"version": 1, "calls": []}
+        calls = history.get("calls")
+        if history.get("version") != 1 or not isinstance(calls, list):
+            raise RuntimeError("CRM help history is malformed")
+        calls.append(
+            {
+                "pid": os.getpid(),
+                "started_ns": started,
+                "finished_ns": time.monotonic_ns(),
+            }
+        )
+        write_object(HELP, history)
+
+
+def await_stage_peer(stage: str) -> None:
+    """Make genuine concurrent invocations leave deterministic overlap evidence."""
+    with exclusive():
+        BARRIERS.mkdir(parents=True, exist_ok=True)
+        (BARRIERS / f"{stage}-{os.getpid()}").touch()
+
+    deadline = time.monotonic() + 5
+    while True:
+        if len(list(BARRIERS.glob(f"{stage}-*"))) >= 2:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"{stage} requires a concurrent peer")
+        time.sleep(0.01)
+
+
+def command_search(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with exclusive():
+        ensure_runtime()
+        rows = records_from(read_object(RECORDS))
+        matches = [
+            {"id": row.get("id"), "name": row.get("name"), "region": row.get("region")}
+            for row in rows
+            if row.get("name") == args.name and row.get("region") == args.region
+        ]
+
+    await_stage_peer("search")
+    finished = time.monotonic_ns()
+    with exclusive():
+        append_operation(
+            {
+                "operation": "search",
+                "kind": "read",
+                "pid": os.getpid(),
+                "name": args.name,
+                "region": args.region,
+                "result_ids": [row["id"] for row in matches],
+                "outcome": "ok",
+                "started_ns": started,
+                "finished_ns": finished,
+            }
+        )
+    emit({"matches": matches})
+    return 0
+
+
+def command_get(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with exclusive():
+        ensure_runtime()
+        rows = records_from(read_object(RECORDS))
+        record = next((dict(row) for row in rows if row.get("id") == args.record_id), None)
+
+    await_stage_peer("get")
+    finished = time.monotonic_ns()
+    with exclusive():
+        append_operation(
+            {
+                "operation": "get",
+                "kind": "read",
+                "pid": os.getpid(),
+                "record_id": args.record_id,
+                "record": record,
+                "outcome": "ok" if record is not None else "missing",
+                "started_ns": started,
+                "finished_ns": finished,
+            }
+        )
+    if record is None:
+        print("record not found", file=sys.stderr)
+        return 3
+    emit(record)
+    return 0
+
+
+def receipt_for(record_id: str, sequence: int) -> str:
+    material = f"qualification|{record_id}|prospect|qualified|{sequence}"
+    return "qual-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:20]
+
+
+def command_qualify(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with exclusive():
+        ensure_runtime()
+        state = read_object(RECORDS)
+        rows = records_from(state)
+        record = next((row for row in rows if row.get("id") == args.record_id), None)
+        before = None if record is None else record.get("status")
+
+        if record is None:
+            saved = append_operation(
+                {
+                    "operation": "qualify",
+                    "kind": "write",
+                    "record_id": args.record_id,
+                    "previous_status": None,
+                    "new_status": "qualified",
+                    "changed": False,
+                    "outcome": "missing",
+                    "started_ns": started,
+                    "finished_ns": time.monotonic_ns(),
+                }
+            )
+            emit({"changed": False, "sequence": saved["sequence"]})
+            return 3
+
+        if before != "prospect":
+            saved = append_operation(
+                {
+                    "operation": "qualify",
+                    "kind": "write",
+                    "record_id": args.record_id,
+                    "previous_status": before,
+                    "new_status": "qualified",
+                    "changed": False,
+                    "outcome": "skipped",
+                    "started_ns": started,
+                    "finished_ns": time.monotonic_ns(),
+                }
+            )
+            emit(
+                {
+                    "changed": False,
+                    "status": before,
+                    "sequence": saved["sequence"],
+                }
+            )
+            return 0
+
+        faults = state.get("faults", {})
+        if isinstance(faults, dict) and faults.get("qualify") is True:
+            append_operation(
+                {
+                    "operation": "qualify",
+                    "kind": "write",
+                    "record_id": args.record_id,
+                    "previous_status": before,
+                    "new_status": "qualified",
+                    "changed": False,
+                    "outcome": "error",
+                    "started_ns": started,
+                    "finished_ns": time.monotonic_ns(),
+                }
+            )
+            print("qualification failed", file=sys.stderr)
+            return 5
+
+        history = read_object(AUDIT)
+        operations = history.get("operations")
+        if not isinstance(operations, list):
+            raise RuntimeError("CRM operation history is malformed")
+        sequence = len(operations) + 1
+        receipt = receipt_for(args.record_id, sequence)
+        record["status"] = "qualified"
+        finished = time.monotonic_ns()
+        operations.append(
+            {
+                "sequence": sequence,
+                "operation": "qualify",
+                "kind": "write",
+                "record_id": args.record_id,
+                "previous_status": before,
+                "new_status": "qualified",
+                "changed": True,
+                "receipt": receipt,
+                "outcome": "ok",
+                "started_ns": started,
+                "finished_ns": finished,
+            }
+        )
+        write_object(RECORDS, state)
+        write_object(AUDIT, history)
+
+    emit(
+        {
+            "changed": True,
+            "record_id": args.record_id,
+            "previous_status": before,
+            "status": "qualified",
+            "receipt": receipt,
+        }
+    )
+    return 0
+
+
+def command_notify(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with exclusive():
+        ensure_runtime()
+        history = read_object(AUDIT)
+        operations = history.get("operations")
+        if not isinstance(operations, list):
+            raise RuntimeError("CRM operation history is malformed")
+        update = next(
+            (
+                row
+                for row in operations
+                if row.get("operation") == "qualify"
+                and row.get("outcome") == "ok"
+                and row.get("changed") is True
+                and row.get("receipt") == args.receipt
+            ),
+            None,
+        )
+        notices = read_object(NOTICES)
+        sent = notices.get("notices")
+        if notices.get("version") != 1 or not isinstance(sent, list):
+            raise RuntimeError("CRM notices are malformed")
+
+        if update is None or any(row.get("receipt") == args.receipt for row in sent):
+            append_operation(
+                {
+                    "operation": "notify",
+                    "kind": "notification",
+                    "audience": "account team",
+                    "receipt": args.receipt,
+                    "outcome": "error",
+                    "started_ns": started,
+                    "finished_ns": time.monotonic_ns(),
+                }
+            )
+            print("notification requires an unused successful-change receipt", file=sys.stderr)
+            return 6
+
+        record_id = update["record_id"]
+        state = read_object(RECORDS)
+        faults = state.get("faults", {})
+        if isinstance(faults, dict) and faults.get("notify") is True:
+            append_operation(
+                {
+                    "operation": "notify",
+                    "kind": "notification",
+                    "audience": "account team",
+                    "record_id": record_id,
+                    "receipt": args.receipt,
+                    "outcome": "error",
+                    "started_ns": started,
+                    "finished_ns": time.monotonic_ns(),
+                }
+            )
+            print("notification failed", file=sys.stderr)
+            return 6
+
+        state_rows = records_from(state)
+        record = next((row for row in state_rows if row.get("id") == record_id), None)
+        if record is None:
+            print("notification record is unavailable", file=sys.stderr)
+            return 6
+        message = (
+            f'{record.get("name")} changed from {update.get("previous_status")} '
+            f'to {update.get("new_status")}.'
+        )
+        finished = time.monotonic_ns()
+        notice = {
+            "audience": "account team",
+            "record_id": record_id,
+            "message": message,
+            "receipt": args.receipt,
+        }
+        sent.append(notice)
+        operations.append(
+            {
+                "sequence": len(operations) + 1,
+                "operation": "notify",
+                "kind": "notification",
+                "audience": "account team",
+                "record_id": record_id,
+                "receipt": args.receipt,
+                "outcome": "ok",
+                "started_ns": started,
+                "finished_ns": finished,
+            }
+        )
+        write_object(NOTICES, notices)
+        write_object(AUDIT, history)
+
+    emit({"notified": True, **notice})
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    value = argparse.ArgumentParser(
+        prog="crmctl",
+        description="Operate the sandboxed CRM account registry.",
+    )
+    commands = value.add_subparsers(dest="command", required=True)
+
+    search = commands.add_parser("search", help="search by exact account name and region")
+    search.add_argument("--name", required=True)
+    search.add_argument("--region", required=True)
+    search.set_defaults(handler=command_search)
+
+    get = commands.add_parser("get", help="retrieve one complete account record")
+    get.add_argument("record_id")
+    get.set_defaults(handler=command_get)
+
+    qualify = commands.add_parser(
+        "qualify",
+        help="change one prospect account to qualified and return a success receipt",
+    )
+    qualify.add_argument("record_id")
+    qualify.set_defaults(handler=command_qualify)
+
+    notify = commands.add_parser(
+        "notify",
+        help="notify account team using an unused successful-change receipt",
+    )
+    notify.add_argument("--receipt", required=True)
+    notify.set_defaults(handler=command_notify)
+    return value
+
+
+def main() -> int:
+    value = parser()
+    if sys.argv[1:] in (["--help"], ["-h"]):
+        value.print_help()
+        try:
+            record_help_read()
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        return 0
+    args = value.parse_args()
+    try:
+        return int(args.handler(args))
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

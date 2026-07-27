@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""Audited command-line access to a sandboxed hospitality reservation store."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import select
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+BASELINE_DATABASE = ROOT / "reservations.db"
+RUNTIME_DIR = ROOT / ".reservation-runtime"
+RUNTIME_DATABASE = RUNTIME_DIR / "reservations.db"
+AUDIT_LOG = RUNTIME_DIR / "operations.jsonl"
+LOCK_FILE = RUNTIME_DIR / "operations.lock"
+CLIENT_TIMEOUT_SECONDS = 0.35
+WORKER_RESPONSE_DELAY_SECONDS = 2.0
+
+
+def _with_lock(callback):
+    RUNTIME_DIR.mkdir(exist_ok=True)
+    with LOCK_FILE.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            if not RUNTIME_DATABASE.exists():
+                shutil.copyfile(BASELINE_DATABASE, RUNTIME_DATABASE)
+            return callback()
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _read_events() -> list[dict]:
+    if not AUDIT_LOG.exists():
+        return []
+    return [json.loads(line) for line in AUDIT_LOG.read_text(encoding="utf-8").splitlines()
+            if line]
+
+
+def _append_locked(event: dict) -> dict:
+    recorded = {"seq": len(_read_events()) + 1, **event}
+    with AUDIT_LOG.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(recorded, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    return recorded
+
+
+def _append(event: dict) -> dict:
+    return _with_lock(lambda: _append_locked(event))
+
+
+def _connect() -> sqlite3.Connection:
+    connection = sqlite3.connect(RUNTIME_DATABASE)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def _cancel_worker(record_id: str, reason: str, request_id: str, notify_fd: int) -> int:
+    def commit() -> tuple[int, dict | None]:
+        with _connect() as connection:
+            row = connection.execute(
+                "SELECT id, name, status FROM reservations WHERE id = ?", (record_id,)
+            ).fetchone()
+            _append_locked({
+                "type": "cancel_start",
+                "request_id": request_id,
+                "id": record_id,
+                "reason": reason,
+                "observed_status": None if row is None else row["status"],
+            })
+            if row is None:
+                _append_locked({
+                    "type": "cancel_rejected",
+                    "request_id": request_id,
+                    "id": record_id,
+                    "reason": "not_found",
+                })
+                return 4, None
+            if row["status"] != "active":
+                _append_locked({
+                    "type": "cancel_rejected",
+                    "request_id": request_id,
+                    "id": record_id,
+                    "reason": "not_active",
+                    "status": row["status"],
+                })
+                return 9, dict(row)
+            connection.execute(
+                """
+                UPDATE reservations
+                   SET status = 'cancellation-pending',
+                       cancellation_reason = ?,
+                       cancellation_requests = cancellation_requests + 1
+                 WHERE id = ?
+                """,
+                (reason, record_id),
+            )
+            connection.commit()
+            updated = connection.execute(
+                """
+                SELECT id, name, status, cancellation_reason, cancellation_requests,
+                       scheduled_for, room
+                  FROM reservations
+                 WHERE id = ?
+                """,
+                (record_id,),
+            ).fetchone()
+            _append_locked({
+                "type": "cancel_commit",
+                "request_id": request_id,
+                "id": record_id,
+                "previous_status": "active",
+                "status": updated["status"],
+                "reason": updated["cancellation_reason"],
+                "cancellation_requests": updated["cancellation_requests"],
+            })
+            return 0, dict(updated)
+
+    code, record = _with_lock(commit)
+    if code != 0:
+        os.write(notify_fd, b"E")
+        os.close(notify_fd)
+        if record is None:
+            print(json.dumps({"error": "reservation not found", "id": record_id}))
+        else:
+            print(json.dumps({"error": "reservation is not active", "record": record},
+                             sort_keys=True))
+        return code
+
+    # Tell the real client that the durable mutation completed before delaying
+    # the response. This removes scheduler-speed races from the timeout fault.
+    os.write(notify_fd, b"C")
+    os.close(notify_fd)
+    # The durable write is complete, but this deliberately delayed response is
+    # longer than the real client's wait budget. The client kills this worker on
+    # timeout, so no success response is manufactured or delivered.
+    time.sleep(WORKER_RESPONSE_DELAY_SECONDS)
+    print(json.dumps({"record": record}, sort_keys=True))
+    return 0
+
+
+def cancel(record_id: str, reason: str) -> int:
+    request_id = uuid.uuid4().hex
+    read_fd, write_fd = os.pipe()
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "__cancel_worker",
+        record_id,
+        reason,
+        request_id,
+        str(write_fd),
+    ]
+    process = subprocess.Popen(
+        command,
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        pass_fds=(write_fd,),
+    )
+    os.close(write_fd)
+    ready, _, _ = select.select([read_fd], [], [], 5.0)
+    signal = os.read(read_fd, 1) if ready else b""
+    os.close(read_fd)
+    if signal != b"C":
+        if process.poll() is None:
+            process.kill()
+        stdout, stderr = process.communicate()
+        if stdout:
+            print(stdout, end="")
+        if stderr:
+            print(stderr, end="", file=sys.stderr)
+        return process.returncode if process.returncode not in (None, 0) else 70
+    try:
+        stdout, stderr = process.communicate(timeout=CLIENT_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        _append({
+            "type": "client_timeout",
+            "request_id": request_id,
+            "id": record_id,
+        })
+        print(
+            "reservationctl: cancellation response timed out; commit state is unknown",
+            file=sys.stderr,
+        )
+        return 124
+    if stdout:
+        print(stdout, end="")
+    if stderr:
+        print(stderr, end="", file=sys.stderr)
+    return process.returncode
+
+
+def get(record_id: str) -> int:
+    invocation = uuid.uuid4().hex
+
+    def retrieve() -> dict | None:
+        with _connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, name, status, cancellation_reason, cancellation_requests,
+                       scheduled_for, room
+                  FROM reservations
+                 WHERE id = ?
+                """,
+                (record_id,),
+            ).fetchone()
+        record = None if row is None else dict(row)
+        _append_locked({
+            "type": "get",
+            "invocation": invocation,
+            "id": record_id,
+            "found": record is not None,
+            "name": None if record is None else record["name"],
+            "status": None if record is None else record["status"],
+            "reason": None if record is None else record["cancellation_reason"],
+        })
+        return record
+
+    record = _with_lock(retrieve)
+    print(json.dumps({"record": record}, sort_keys=True))
+    return 0 if record is not None else 4
+
+
+def search(name: str) -> int:
+    invocation = uuid.uuid4().hex
+
+    def query() -> list[dict]:
+        with _connect() as connection:
+            rows = connection.execute(
+                "SELECT id, name FROM reservations WHERE name LIKE ? ORDER BY id",
+                (f"%{name}%",),
+            ).fetchall()
+        matches = [dict(row) for row in rows]
+        _append_locked({
+            "type": "search",
+            "invocation": invocation,
+            "name": name,
+            "match_ids": [row["id"] for row in matches],
+        })
+        return matches
+
+    print(json.dumps({"matches": _with_lock(query)}, sort_keys=True))
+    return 0
+
+
+def list_records() -> int:
+    def query() -> list[dict]:
+        with _connect() as connection:
+            rows = connection.execute(
+                "SELECT id, name, status FROM reservations ORDER BY id"
+            ).fetchall()
+        records = [dict(row) for row in rows]
+        _append_locked({"type": "list", "record_ids": [row["id"] for row in records]})
+        return records
+
+    print(json.dumps({"records": _with_lock(query)}, sort_keys=True))
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        prog="reservationctl",
+        description="Retrieve and manage reservations in the sandboxed hospitality store.",
+    )
+    commands = result.add_subparsers(dest="command", required=True)
+    get_parser = commands.add_parser("get", help="retrieve one full reservation by stable ID")
+    get_parser.add_argument("id", help="stable reservation ID")
+    cancel_parser = commands.add_parser("cancel", help="request cancellation by stable ID")
+    cancel_parser.add_argument("id", help="stable reservation ID")
+    cancel_parser.add_argument("--reason", required=True, help="cancellation reason")
+    search_parser = commands.add_parser("search", help="find abbreviated records by name")
+    search_parser.add_argument("--name", required=True, help="name fragment")
+    commands.add_parser("list", help="list abbreviated reservation records")
+    return result
+
+
+def main() -> int:
+    if len(sys.argv) == 6 and sys.argv[1] == "__cancel_worker":
+        return _cancel_worker(sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]))
+    arguments = parser().parse_args()
+    if arguments.command == "get":
+        return get(arguments.id)
+    if arguments.command == "cancel":
+        return cancel(arguments.id, arguments.reason)
+    if arguments.command == "search":
+        return search(arguments.name)
+    return list_records()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

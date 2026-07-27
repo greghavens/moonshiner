@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Open one account through the sandboxed CRM record interface."""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+
+
+ROOT = Path(__file__).resolve().parent
+SEED_PATH = ROOT / ".crm" / "seed.sql"
+RUNTIME_DIR = ROOT / ".crm" / "runtime"
+DATABASE_PATH = RUNTIME_DIR / "accounts.sqlite3"
+INITIALIZE_LOCK_PATH = RUNTIME_DIR / "initialize.lock"
+AUDIT_PATH = ROOT / ".harness" / "runtime" / "crm-audit.jsonl"
+OUTPUT_PATH = ROOT / "account-opened.txt"
+AUDIT_KEY = b"moonshiner-pi-crm-format-0029-v1"
+
+
+def canonical(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def append_audit(event: dict) -> None:
+    event["signature"] = hmac.new(
+        AUDIT_KEY, canonical(event), hashlib.sha256
+    ).hexdigest()
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def ensure_database() -> None:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    with INITIALIZE_LOCK_PATH.open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not DATABASE_PATH.exists():
+            temporary = RUNTIME_DIR / f"accounts-{os.getpid()}.sqlite3.tmp"
+            temporary.unlink(missing_ok=True)
+            connection = sqlite3.connect(temporary)
+            try:
+                connection.executescript(SEED_PATH.read_text(encoding="utf-8"))
+                connection.commit()
+            finally:
+                connection.close()
+            os.replace(temporary, DATABASE_PATH)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def account_for_id(stable_id: str) -> dict:
+    connection = sqlite3.connect(f"file:{DATABASE_PATH}?mode=ro", uri=True)
+    try:
+        row = connection.execute(
+            """
+            SELECT stable_id, name, region, status
+            FROM accounts
+            WHERE stable_id = ? AND lifecycle = 'current'
+            """,
+            (stable_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise LookupError(f"current account not found: {stable_id}")
+    return {
+        "id": row[0],
+        "name": row[1],
+        "region": row[2],
+        "status": row[3],
+    }
+
+
+def main() -> int:
+    started = time.monotonic_ns()
+    stable_id = sys.argv[1] if len(sys.argv) == 2 else None
+    event = {
+        "operation": "open",
+        "stable_id": stable_id,
+        "argument_count": len(sys.argv) - 1,
+        "process_pid": os.getpid(),
+        "parent_pid": os.getppid(),
+        "process_group_id": os.getpgrp(),
+        "session_id": os.getsid(0),
+        "start_ns": started,
+        "success": False,
+        "result_count": 0,
+    }
+
+    try:
+        ensure_database()
+        if stable_id is None:
+            raise ValueError("usage: crm-account ACCOUNT_ID")
+        account = account_for_id(stable_id)
+        rendered = (
+            f"{account['id']} | {account['name']} | "
+            f"{account['region']} | {account['status']}\n"
+        )
+        OUTPUT_PATH.write_text(rendered, encoding="utf-8")
+        event.update(
+            {
+                "success": True,
+                "result_count": 1,
+                "result_digest": hashlib.sha256(canonical(account)).hexdigest(),
+            }
+        )
+        print(json.dumps(account, sort_keys=True, separators=(",", ":")))
+        return 0
+    except (LookupError, OSError, sqlite3.DatabaseError, ValueError) as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    finally:
+        event["end_ns"] = time.monotonic_ns()
+        append_audit(event)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

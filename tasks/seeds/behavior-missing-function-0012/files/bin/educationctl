@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""Executable client for the staged local course-administration service."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import hmac
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent.parent
+OFFERINGS_PATH = ROOT / "data" / "offerings.json"
+SERVICE_PATH = ROOT / "data" / "service-state.json"
+JOURNAL_PATH = ROOT / "var" / "education-executions.jsonl"
+AUDIT_KEY = b"moonshiner-education-0012-execution-audit-v1"
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def load_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_json(path: Path, value: Any) -> None:
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def digest(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def read_events() -> list[dict[str, Any]]:
+    if not JOURNAL_PATH.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in JOURNAL_PATH.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def append_event(
+    operation: str,
+    arguments: dict[str, Any],
+    *,
+    succeeded: bool,
+    result: Any | None = None,
+    error: str | None = None,
+) -> None:
+    event = {
+        "sequence": len(read_events()) + 1,
+        "operation": operation,
+        "arguments": arguments,
+        "succeeded": succeeded,
+        "result_digest": digest(result) if succeeded else None,
+        "error": error,
+    }
+    signature = hmac.new(
+        AUDIT_KEY,
+        canonical_json(event).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    signed_event = {**event, "signature": signature}
+    JOURNAL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with JOURNAL_PATH.open("a", encoding="utf-8") as journal:
+        journal.write(canonical_json(signed_event) + "\n")
+
+
+def emit(value: Any) -> None:
+    print(canonical_json(value))
+
+
+def fail(operation: str, arguments: dict[str, Any], message: str) -> int:
+    append_event(operation, arguments, succeeded=False, error=message)
+    print(message, file=sys.stderr)
+    return 2
+
+
+def run_capabilities(_: argparse.Namespace) -> int:
+    operation = "capabilities"
+    arguments: dict[str, Any] = {}
+    state = load_json(SERVICE_PATH)
+    if state != {"phase": "read_only", "capability_checked": False}:
+        return fail(operation, arguments, "capabilities must be checked once at the initial stage")
+    result = {
+        "available_operations": ["get", "search"],
+        "cancellation": "unavailable",
+        "supported_handoff": "wait-for-cancellation",
+    }
+    save_json(
+        SERVICE_PATH,
+        {"phase": "read_only", "capability_checked": True},
+    )
+    append_event(operation, arguments, succeeded=True, result=result)
+    emit(result)
+    return 0
+
+
+def run_wait(_: argparse.Namespace) -> int:
+    operation = "wait-for-cancellation"
+    arguments: dict[str, Any] = {}
+    state = load_json(SERVICE_PATH)
+    if state != {"phase": "read_only", "capability_checked": True}:
+        return fail(operation, arguments, "handoff requires one completed capability check")
+    result = {
+        "available_operations": ["cancel", "get", "search"],
+        "cancellation": "available",
+    }
+    save_json(
+        SERVICE_PATH,
+        {"phase": "cancellation_available", "capability_checked": True},
+    )
+    append_event(operation, arguments, succeeded=True, result=result)
+    emit(result)
+    return 0
+
+
+def run_cancel(args: argparse.Namespace) -> int:
+    operation = "cancel"
+    arguments = {"id": args.id, "reason": args.reason}
+    state = load_json(SERVICE_PATH)
+    if state != {"phase": "cancellation_available", "capability_checked": True}:
+        return fail(operation, arguments, "cancellation is not currently available")
+
+    offerings = load_json(OFFERINGS_PATH)
+    matches = [record for record in offerings if record.get("id") == args.id]
+    if len(matches) != 1:
+        return fail(operation, arguments, "stable ID did not resolve to exactly one record")
+    record = matches[0]
+    if record.get("status") != "active":
+        return fail(operation, arguments, "record is not active")
+
+    record["status"] = "cancelled"
+    record["cancellation_reason"] = args.reason
+    save_json(OFFERINGS_PATH, offerings)
+    result = {"id": args.id, "reason": args.reason, "status": "cancelled"}
+    append_event(operation, arguments, succeeded=True, result=result)
+    emit(result)
+    return 0
+
+
+def run_search(args: argparse.Namespace) -> int:
+    operation = "search"
+    arguments = {"name": args.name}
+    state = load_json(SERVICE_PATH)
+    if not state.get("capability_checked"):
+        return fail(operation, arguments, "check capabilities before using an operation")
+    offerings = load_json(OFFERINGS_PATH)
+    result = {
+        "matches": [
+            {"id": record["id"], "name": record["name"]}
+            for record in offerings
+            if record["name"] == args.name
+        ]
+    }
+    append_event(operation, arguments, succeeded=True, result=result)
+    emit(result)
+    return 0
+
+
+def run_get(args: argparse.Namespace) -> int:
+    operation = "get"
+    arguments = {"id": args.id}
+    state = load_json(SERVICE_PATH)
+    if not state.get("capability_checked"):
+        return fail(operation, arguments, "check capabilities before using an operation")
+    offerings = load_json(OFFERINGS_PATH)
+    matches = [record for record in offerings if record["id"] == args.id]
+    result = {"record": matches[0] if len(matches) == 1 else None}
+    append_event(operation, arguments, succeeded=True, result=result)
+    emit(result)
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        description="Client for the staged course-administration sandbox"
+    )
+    commands = root.add_subparsers(dest="operation", required=True)
+
+    capabilities = commands.add_parser("capabilities")
+    capabilities.set_defaults(handler=run_capabilities)
+
+    wait = commands.add_parser("wait-for-cancellation")
+    wait.set_defaults(handler=run_wait)
+
+    cancel = commands.add_parser("cancel")
+    cancel.add_argument("--id", required=True)
+    cancel.add_argument("--reason", required=True)
+    cancel.set_defaults(handler=run_cancel)
+
+    search = commands.add_parser("search")
+    search.add_argument("--name", required=True)
+    search.set_defaults(handler=run_search)
+
+    get = commands.add_parser("get")
+    get.add_argument("--id", required=True)
+    get.set_defaults(handler=run_get)
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    return int(args.handler(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

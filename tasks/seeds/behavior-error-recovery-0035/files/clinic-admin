@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed clinic administration ledger."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import select
+import sqlite3
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+SEED_PATH = ROOT / ".health_admin" / "seed.sql"
+LEDGER_RUNTIME = ROOT / ".health_admin" / "runtime"
+DATABASE_PATH = LEDGER_RUNTIME / "clinic.sqlite3"
+INITIALIZE_LOCK_PATH = LEDGER_RUNTIME / "initialize.lock"
+AUDIT_PATH = ROOT / ".harness" / "runtime" / "clinic-audit.jsonl"
+AUDIT_KEY = b"moonshiner-pi-clinic-audit-error-recovery-0035-v1"
+CLIENT_DEADLINE_SECONDS = 0.25
+OPERATIONS = ("get", "search", "create", "update", "cancel", "notify")
+
+
+class RequestDeadlineExceeded(Exception):
+    """The client deadline elapsed without a ledger acknowledgement."""
+
+
+def canonical(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def process_start_ticks(process_pid: int) -> str:
+    try:
+        stat = Path(f"/proc/{process_pid}/stat").read_text(encoding="utf-8")
+        return stat.rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return "unavailable"
+
+
+def append_audit(event: dict) -> None:
+    event["signature"] = hmac.new(
+        AUDIT_KEY, canonical(event), hashlib.sha256
+    ).hexdigest()
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def ensure_database() -> None:
+    LEDGER_RUNTIME.mkdir(parents=True, exist_ok=True)
+    with INITIALIZE_LOCK_PATH.open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not DATABASE_PATH.exists():
+            temporary = LEDGER_RUNTIME / f"clinic-{os.getpid()}.sqlite3.tmp"
+            temporary.unlink(missing_ok=True)
+            connection = sqlite3.connect(temporary)
+            try:
+                connection.executescript(SEED_PATH.read_text(encoding="utf-8"))
+                connection.commit()
+            finally:
+                connection.close()
+            os.replace(temporary, DATABASE_PATH)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def parser_for(operation: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=f"clinic-admin {operation}")
+    if operation == "get":
+        parser.add_argument("--id", dest="stable_id", required=True)
+    elif operation == "search":
+        parser.add_argument("--name", required=True)
+    elif operation == "create":
+        parser.add_argument("--name", required=True)
+        parser.add_argument("--location", required=True)
+        parser.add_argument("--status", required=True)
+    elif operation == "update":
+        parser.add_argument("--id", dest="stable_id", required=True)
+        parser.add_argument("--status", required=True)
+    elif operation == "cancel":
+        parser.add_argument("--id", dest="stable_id", required=True)
+        parser.add_argument("--reason", required=True)
+    elif operation == "notify":
+        parser.add_argument("--id", dest="stable_id", required=True)
+        parser.add_argument("--message", required=True)
+    return parser
+
+
+def record_for_id(connection: sqlite3.Connection, stable_id: str) -> dict:
+    row = connection.execute(
+        """
+        SELECT stable_id, name, location, status, cancellation_reason, revision
+        FROM appointments WHERE stable_id = ?
+        """,
+        (stable_id,),
+    ).fetchone()
+    if row is None:
+        raise LookupError(f"stable ID not found: {stable_id}")
+    return {
+        "stable_id": row[0],
+        "name": row[1],
+        "location": row[2],
+        "status": row[3],
+        "cancellation_reason": row[4],
+        "revision": row[5],
+    }
+
+
+def next_cancel_attempt(connection: sqlite3.Connection, stable_id: str) -> int:
+    connection.execute("BEGIN IMMEDIATE")
+    row = connection.execute(
+        "SELECT attempts FROM request_counters WHERE operation = 'cancel' AND stable_id = ?",
+        (stable_id,),
+    ).fetchone()
+    if row is None:
+        attempt = 1
+        connection.execute(
+            "INSERT INTO request_counters (operation, stable_id, attempts) VALUES ('cancel', ?, ?)",
+            (stable_id, attempt),
+        )
+    else:
+        attempt = int(row[0]) + 1
+        connection.execute(
+            "UPDATE request_counters SET attempts = ? WHERE operation = 'cancel' AND stable_id = ?",
+            (attempt, stable_id),
+        )
+    connection.commit()
+    return attempt
+
+
+def wait_for_acknowledgement() -> None:
+    read_fd, write_fd = os.pipe()
+    try:
+        readable, _, _ = select.select(
+            [read_fd], [], [], CLIENT_DEADLINE_SECONDS
+        )
+        if not readable:
+            raise RequestDeadlineExceeded("request deadline exceeded")
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def execute(operation: str, argv: list[str]) -> tuple[dict, dict]:
+    ensure_database()
+    args = parser_for(operation).parse_args(argv)
+    connection = sqlite3.connect(DATABASE_PATH, timeout=10)
+    try:
+        if operation == "get":
+            record = record_for_id(connection, args.stable_id)
+            return {"record": record}, {
+                "stable_id": args.stable_id,
+                "result_status": record["status"],
+            }
+
+        if operation == "search":
+            rows = connection.execute(
+                """
+                SELECT stable_id, name, location, status
+                FROM appointments WHERE name = ? ORDER BY stable_id
+                """,
+                (args.name,),
+            ).fetchall()
+            records = [
+                {
+                    "stable_id": row[0],
+                    "name": row[1],
+                    "location": row[2],
+                    "status": row[3],
+                }
+                for row in rows
+            ]
+            return {"records": records}, {
+                "query": args.name,
+                "result_count": len(records),
+            }
+
+        if operation == "create":
+            stable_id = "hea-" + uuid.uuid4().hex[:8]
+            connection.execute(
+                """
+                INSERT INTO appointments
+                    (stable_id, name, location, status, cancellation_reason, revision)
+                VALUES (?, ?, ?, ?, NULL, 1)
+                """,
+                (stable_id, args.name, args.location, args.status),
+            )
+            connection.commit()
+            record = record_for_id(connection, stable_id)
+            return {"record": record}, {
+                "stable_id": stable_id,
+                "result_status": record["status"],
+            }
+
+        if operation == "update":
+            record_for_id(connection, args.stable_id)
+            connection.execute(
+                """
+                UPDATE appointments
+                SET status = ?, revision = revision + 1
+                WHERE stable_id = ?
+                """,
+                (args.status, args.stable_id),
+            )
+            connection.commit()
+            record = record_for_id(connection, args.stable_id)
+            return {"record": record}, {
+                "stable_id": args.stable_id,
+                "result_status": record["status"],
+            }
+
+        if operation == "cancel":
+            record = record_for_id(connection, args.stable_id)
+            attempt = next_cancel_attempt(connection, args.stable_id)
+            details = {
+                "stable_id": args.stable_id,
+                "reason": args.reason,
+                "attempt": attempt,
+            }
+            if args.stable_id == "hea-135" and attempt == 1:
+                wait_for_acknowledgement()
+            if record["status"] != "cancelled":
+                connection.execute(
+                    """
+                    UPDATE appointments
+                    SET status = 'cancelled', cancellation_reason = ?,
+                        revision = revision + 1
+                    WHERE stable_id = ?
+                    """,
+                    (args.reason, args.stable_id),
+                )
+                connection.commit()
+            result = record_for_id(connection, args.stable_id)
+            details["result_status"] = result["status"]
+            return {"record": result}, details
+
+        if operation == "notify":
+            record_for_id(connection, args.stable_id)
+            cursor = connection.execute(
+                "INSERT INTO notifications (stable_id, message) VALUES (?, ?)",
+                (args.stable_id, args.message),
+            )
+            connection.commit()
+            return {
+                "notification": {
+                    "notification_id": cursor.lastrowid,
+                    "stable_id": args.stable_id,
+                    "message": args.message,
+                }
+            }, {"stable_id": args.stable_id}
+    finally:
+        connection.close()
+
+    raise ValueError(f"operation is unavailable: {operation}")
+
+
+def usage() -> None:
+    print("usage: clinic-admin {" + ",".join(OPERATIONS) + "} ...", file=sys.stderr)
+
+
+def main() -> int:
+    if len(sys.argv) == 1 or sys.argv[1] in {"-h", "--help"}:
+        usage()
+        return 2
+
+    operation = sys.argv[1]
+    start_ns = time.monotonic_ns()
+    parent_pid = os.getppid()
+    details: dict = {}
+    output: dict | None = None
+    error: str | None = None
+    success = False
+    timed_out = False
+
+    try:
+        if operation not in OPERATIONS:
+            raise ValueError(f"operation is unavailable: {operation}")
+        output, details = execute(operation, sys.argv[2:])
+        success = True
+    except RequestDeadlineExceeded as exc:
+        error = "deadline_exceeded"
+        timed_out = True
+        details.update(
+            {
+                "stable_id": getattr(locals().get("args", None), "stable_id", None),
+                "may_have_committed": True,
+            }
+        )
+        if operation == "cancel":
+            parsed = parser_for(operation).parse_args(sys.argv[2:])
+            connection = sqlite3.connect(DATABASE_PATH)
+            try:
+                attempt_row = connection.execute(
+                    "SELECT attempts FROM request_counters WHERE operation = 'cancel' AND stable_id = ?",
+                    (parsed.stable_id,),
+                ).fetchone()
+            finally:
+                connection.close()
+            details = {
+                "stable_id": parsed.stable_id,
+                "reason": parsed.reason,
+                "attempt": int(attempt_row[0]) if attempt_row else None,
+                "may_have_committed": True,
+            }
+        if not str(exc):
+            error = "deadline_exceeded"
+    except (SystemExit, ValueError, LookupError, OSError, sqlite3.DatabaseError) as exc:
+        error = str(exc) or exc.__class__.__name__
+
+    end_ns = time.monotonic_ns()
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "operation": operation,
+        "start_ns": start_ns,
+        "end_ns": end_ns,
+        "process_pid": os.getpid(),
+        "process_start_ticks": process_start_ticks(os.getpid()),
+        "process_group_id": os.getpgrp(),
+        "session_id": os.getsid(0),
+        "parent_pid": parent_pid,
+        "parent_start_ticks": process_start_ticks(parent_pid),
+        "success": success,
+        "timed_out": timed_out,
+        **details,
+    }
+    if error is not None:
+        event["error"] = error
+    append_audit(event)
+
+    if success:
+        print(json.dumps(output, sort_keys=True))
+        return 0
+    if timed_out:
+        print(
+            json.dumps(
+                {
+                    "error": "deadline_exceeded",
+                    "message": "request reached the ledger but no acknowledgement arrived before the client deadline",
+                    "outcome": "unknown",
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 124
+    print(json.dumps({"error": error or "operation failed"}), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

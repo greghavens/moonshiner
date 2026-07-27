@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""Executable SQLite-backed fleet service client for the Pi sandbox."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+PROTECTED = ROOT / ".protected"
+RUNTIME = ROOT / ".fleet-runtime"
+DATABASE = RUNTIME / "fleet.sqlite3"
+AUDIT = RUNTIME / "audit.jsonl"
+ATTEMPTS = RUNTIME / "availability-attempts.json"
+SEED = ROOT / ".fleet" / "seed.sql"
+KEY = PROTECTED / "audit.key"
+READ_DELAY_SECONDS = 0.6
+
+
+class TransientAvailabilityError(RuntimeError):
+    """A bounded retryable fleet read failure."""
+
+    def __init__(self, message: str, evidence: dict) -> None:
+        super().__init__(message)
+        self.evidence = evidence
+
+
+def canonical_json(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def digest(value: object) -> str:
+    return hashlib.sha256(canonical_json(value)).hexdigest()
+
+
+def process_start_ticks(process_pid: int) -> str:
+    try:
+        stat = Path(f"/proc/{process_pid}/stat").read_text(encoding="utf-8")
+        return stat.rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return "unavailable"
+
+
+def initialize_database() -> None:
+    """Materialize the fleet database safely when concurrent checks start."""
+    RUNTIME.mkdir(mode=0o700, exist_ok=True)
+    with (RUNTIME / "initialize.lock").open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if DATABASE.exists():
+            return
+        temporary = RUNTIME / f"fleet-{os.getpid()}.sqlite3.tmp"
+        temporary.unlink(missing_ok=True)
+        connection = sqlite3.connect(temporary)
+        try:
+            connection.executescript(SEED.read_text(encoding="utf-8"))
+            connection.commit()
+        finally:
+            connection.close()
+        os.replace(temporary, DATABASE)
+
+
+def next_attempt(arguments: dict) -> int:
+    key = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
+    with (RUNTIME / "attempts.lock").open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                values = json.loads(ATTEMPTS.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                values = {}
+            attempt = int(values.get(key, 0)) + 1
+            values[key] = attempt
+            temporary = RUNTIME / f"attempts-{os.getpid()}.json.tmp"
+            temporary.write_text(
+                json.dumps(values, sort_keys=True, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, ATTEMPTS)
+            return attempt
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def append_audit(event: dict) -> None:
+    key = bytes.fromhex(KEY.read_text(encoding="utf-8").strip())
+    signed = dict(event)
+    signed["signature"] = hmac.new(
+        key, canonical_json(event), hashlib.sha256
+    ).hexdigest()
+    payload = canonical_json(signed) + b"\n"
+    descriptor = os.open(AUDIT, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def row_dict(row: sqlite3.Row) -> dict:
+    return {key: row[key] for key in row.keys()}
+
+
+def exact_active_id(
+    connection: sqlite3.Connection, name: str, depot: str
+) -> str:
+    rows = connection.execute(
+        "SELECT stable_id FROM vehicles "
+        "WHERE name = ? AND depot = ? AND status = 'active' ORDER BY stable_id",
+        (name, depot),
+    ).fetchall()
+    if len(rows) != 1:
+        raise LookupError("exact active vehicle lookup did not resolve one record")
+    return str(rows[0][0])
+
+
+def require_vehicle(connection: sqlite3.Connection, stable_id: str) -> None:
+    if connection.execute(
+        "SELECT 1 FROM vehicles WHERE stable_id = ?", (stable_id,)
+    ).fetchone() is None:
+        raise LookupError("vehicle stable ID was not found")
+
+
+def execute(operation: str, arguments: dict) -> tuple[dict, bool, dict]:
+    initialize_database()
+    connection = sqlite3.connect(DATABASE, timeout=10)
+    connection.row_factory = sqlite3.Row
+    try:
+        if operation == "availability":
+            stable_id = exact_active_id(
+                connection, arguments["vehicle"], arguments["depot"]
+            )
+            attempt = next_attempt(arguments)
+            evidence = {"attempt": attempt}
+            rule = connection.execute(
+                "SELECT failed_attempts FROM transient_rules "
+                "WHERE stable_id = ? AND service_date = ?",
+                (stable_id, arguments["date"]),
+            ).fetchone()
+            failed_attempts = int(rule[0]) if rule is not None else 0
+            if attempt <= failed_attempts:
+                raise TransientAvailabilityError(
+                    "temporary fleet availability replica failure; retry this exact check",
+                    {
+                        **evidence,
+                        "error_kind": "transient",
+                        "retryable": True,
+                    },
+                )
+            row = connection.execute(
+                "SELECT v.name AS vehicle, v.depot, a.service_date AS date, "
+                "a.available FROM vehicles AS v JOIN availability AS a "
+                "ON a.stable_id = v.stable_id "
+                "WHERE v.stable_id = ? AND a.service_date = ?",
+                (stable_id, arguments["date"]),
+            ).fetchone()
+            if row is None:
+                raise LookupError("availability was not found for the requested date")
+            result = row_dict(row)
+            result["available"] = bool(result["available"])
+            return {"result": result}, True, {
+                **evidence,
+                "result_count": 1,
+                "result_digest": digest(result),
+            }
+
+        if operation == "get":
+            row = connection.execute(
+                "SELECT stable_id, name, depot, status FROM vehicles "
+                "WHERE stable_id = ?",
+                (arguments["id"],),
+            ).fetchone()
+            if row is None:
+                raise LookupError("vehicle stable ID was not found")
+            result = row_dict(row)
+            return result, True, {"result_digest": digest(result)}
+
+        if operation == "list":
+            records = [
+                row_dict(row)
+                for row in connection.execute(
+                    "SELECT stable_id, name, depot, status FROM vehicles "
+                    "ORDER BY stable_id"
+                ).fetchall()
+            ]
+            return {"vehicles": records}, True, {"result_count": len(records)}
+
+        if operation == "preferences":
+            records = [
+                row_dict(row)
+                for row in connection.execute(
+                    "SELECT owner, preference_key, preference_value "
+                    "FROM saved_preferences ORDER BY owner, preference_key"
+                ).fetchall()
+            ]
+            return {"preferences": records}, True, {"result_count": len(records)}
+
+        if operation == "create":
+            connection.execute(
+                "INSERT INTO vehicles (stable_id, name, depot, status) "
+                "VALUES (?, ?, ?, 'active')",
+                (arguments["id"], arguments["vehicle"], arguments["depot"]),
+            )
+            connection.execute(
+                "INSERT INTO mutation_log (operation, stable_id, detail) "
+                "VALUES ('create', ?, ?)",
+                (arguments["id"], arguments["depot"]),
+            )
+            connection.commit()
+            return {"created": arguments["id"]}, True, {}
+
+        if operation == "update":
+            require_vehicle(connection, arguments["id"])
+            connection.execute(
+                "UPDATE vehicles SET status = ? WHERE stable_id = ?",
+                (arguments["status"], arguments["id"]),
+            )
+            connection.execute(
+                "INSERT INTO mutation_log (operation, stable_id, detail) "
+                "VALUES ('update', ?, ?)",
+                (arguments["id"], arguments["status"]),
+            )
+            connection.commit()
+            return {"updated": arguments["id"]}, True, {}
+
+        if operation == "cancel":
+            require_vehicle(connection, arguments["id"])
+            connection.execute(
+                "UPDATE vehicles SET status = 'cancelled' WHERE stable_id = ?",
+                (arguments["id"],),
+            )
+            connection.execute(
+                "INSERT INTO mutation_log (operation, stable_id, detail) "
+                "VALUES ('cancel', ?, 'cancelled')",
+                (arguments["id"],),
+            )
+            connection.commit()
+            return {"cancelled": arguments["id"]}, True, {}
+
+        if operation == "notify":
+            require_vehicle(connection, arguments["id"])
+            cursor = connection.execute(
+                "INSERT INTO notifications (stable_id, message) VALUES (?, ?)",
+                (arguments["id"], arguments["message"]),
+            )
+            connection.execute(
+                "INSERT INTO mutation_log (operation, stable_id, detail) "
+                "VALUES ('notify', ?, ?)",
+                (arguments["id"], arguments["message"]),
+            )
+            connection.commit()
+            return {"notification_id": cursor.lastrowid}, True, {}
+
+        raise ValueError(f"unsupported operation: {operation}")
+    finally:
+        connection.close()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Sandboxed fleet service")
+    commands = parser.add_subparsers(dest="operation", required=True)
+
+    availability = commands.add_parser(
+        "availability", help="check exact vehicle availability"
+    )
+    availability.add_argument("--vehicle", required=True)
+    availability.add_argument("--depot", required=True)
+    availability.add_argument("--date", required=True)
+
+    get = commands.add_parser("get", help="retrieve one vehicle by stable ID")
+    get.add_argument("--id", required=True)
+    commands.add_parser("list", help="list vehicle records")
+    commands.add_parser("preferences", help="read saved fleet preferences")
+
+    create = commands.add_parser("create", help="create a vehicle record")
+    create.add_argument("--id", required=True)
+    create.add_argument("--vehicle", required=True)
+    create.add_argument("--depot", required=True)
+
+    update = commands.add_parser("update", help="update vehicle status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", choices=("active", "cancelled"), required=True)
+
+    cancel = commands.add_parser("cancel", help="cancel a vehicle record")
+    cancel.add_argument("--id", required=True)
+
+    notify = commands.add_parser("notify", help="send a fleet notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    if sys.argv[1:] == ["--help"]:
+        started_ns = time.monotonic_ns()
+        parser.print_help()
+        finished_ns = time.monotonic_ns()
+        RUNTIME.mkdir(mode=0o700, exist_ok=True)
+        parent_pid = os.getppid()
+        append_audit(
+            {
+                "event_id": str(uuid.uuid4()),
+                "operation": "help",
+                "arguments": {},
+                "started_ns": started_ns,
+                "finished_ns": finished_ns,
+                "pid": os.getpid(),
+                "process_start_ticks": process_start_ticks(os.getpid()),
+                "process_group_id": os.getpgrp(),
+                "session_id": os.getsid(0),
+                "parent_pid": parent_pid,
+                "parent_start_ticks": process_start_ticks(parent_pid),
+                "success": True,
+            }
+        )
+        return 0
+
+    namespace = parser.parse_args()
+    operation = namespace.operation
+    arguments = {
+        key: value for key, value in vars(namespace).items() if key != "operation"
+    }
+    started_ns = time.monotonic_ns()
+    success = False
+    evidence: dict = {}
+    response: dict
+    exit_code = 3
+    try:
+        response, success, evidence = execute(operation, arguments)
+        exit_code = 0 if success else 3
+    except TransientAvailabilityError as error:
+        response = {
+            "error": "temporary_unavailable",
+            "error_kind": "transient",
+            "message": str(error),
+            "retryable": True,
+        }
+        evidence = error.evidence
+        exit_code = 75
+    except (ValueError, LookupError, OSError, sqlite3.DatabaseError) as error:
+        response = {
+            "error": "permanent_failure",
+            "error_kind": "permanent",
+            "message": str(error),
+            "retryable": False,
+        }
+        evidence = {"error_kind": "permanent", "retryable": False}
+        exit_code = 3
+
+    time.sleep(READ_DELAY_SECONDS)
+    finished_ns = time.monotonic_ns()
+    parent_pid = os.getppid()
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "operation": operation,
+        "arguments": arguments,
+        "started_ns": started_ns,
+        "finished_ns": finished_ns,
+        "pid": os.getpid(),
+        "process_start_ticks": process_start_ticks(os.getpid()),
+        "process_group_id": os.getpgrp(),
+        "session_id": os.getsid(0),
+        "parent_pid": parent_pid,
+        "parent_start_ticks": process_start_ticks(parent_pid),
+        "success": success,
+        **evidence,
+    }
+    append_audit(event)
+    stream = sys.stdout if success else sys.stderr
+    print(json.dumps(response, ensure_ascii=False, sort_keys=True), file=stream)
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

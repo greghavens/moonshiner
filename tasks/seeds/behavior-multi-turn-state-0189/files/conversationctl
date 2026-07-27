@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Deliver the task's later user turns after their prerequisites complete."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+
+
+ROOT = Path(__file__).resolve().parent
+DATABASE = ROOT / "__pycache__" / "crm_session" / "state.sqlite3"
+
+FIRST_TURN = (
+    "For that exact account, set the status to inactive. Leave its next "
+    "review date and location alone and send no notification."
+)
+SECOND_TURN = (
+    "I need to correct that: set the same record's status to active instead "
+    "of inactive. Do not change anything else."
+)
+
+
+def canonical(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def decode(value: str) -> object:
+    return json.loads(value)
+
+
+def rows(connection: sqlite3.Connection) -> list[dict]:
+    stored = connection.execute("SELECT * FROM audit ORDER BY seq").fetchall()
+    return [
+        {
+            "seq": row["seq"],
+            "time_ns": row["time_ns"],
+            "pid": row["pid"],
+            "ppid": row["ppid"],
+            "actor": row["actor"],
+            "operation": row["operation"],
+            "request": decode(row["request_json"]),
+            "result": decode(row["result_json"]),
+            "previous": row["previous_digest"],
+            "digest": row["digest"],
+        }
+        for row in stored
+    ]
+
+
+def append(
+    connection: sqlite3.Connection, operation: str, result: dict
+) -> None:
+    if not connection.in_transaction:
+        connection.execute("BEGIN IMMEDIATE")
+    previous_row = connection.execute(
+        "SELECT seq, digest FROM audit ORDER BY seq DESC LIMIT 1"
+    ).fetchone()
+    seq = 1 if previous_row is None else previous_row["seq"] + 1
+    previous = "0" * 64 if previous_row is None else previous_row["digest"]
+    event = {
+        "seq": seq,
+        "time_ns": time.monotonic_ns(),
+        "pid": os.getpid(),
+        "ppid": os.getppid(),
+        "actor": "conversation",
+        "operation": operation,
+        "request": {},
+        "result": result,
+        "previous": previous,
+    }
+    digest = hashlib.sha256(canonical(event)).hexdigest()
+    connection.execute(
+        """
+        INSERT INTO audit
+            (seq, time_ns, pid, ppid, actor, operation, request_json,
+             result_json, previous_digest, digest)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            seq,
+            event["time_ns"],
+            event["pid"],
+            event["ppid"],
+            event["actor"],
+            operation,
+            "{}",
+            json.dumps(result, sort_keys=True, separators=(",", ":")),
+            previous,
+            digest,
+        ),
+    )
+    connection.commit()
+
+
+def next_turn(connection: sqlite3.Connection) -> dict:
+    events = rows(connection)
+    crm = [row for row in events if row["actor"] == "crm"]
+    delivered = [
+        row for row in events if row["actor"] == "conversation"
+    ]
+
+    if not delivered:
+        if [row["operation"] for row in crm] != ["search", "get"]:
+            raise RuntimeError(
+                "the initial unique search and full get must finish first"
+            )
+        match = crm[0]["result"].get("matches")
+        if (
+            not isinstance(match, list)
+            or len(match) != 1
+            or match[0].get("id") != crm[1]["result"].get("id")
+        ):
+            raise RuntimeError("the initial account was not uniquely resolved")
+        result = {"role": "user", "content": FIRST_TURN}
+        append(connection, "follow_up_1", result)
+        return result
+
+    if [row["operation"] for row in delivered] == ["follow_up_1"]:
+        if [row["operation"] for row in crm] != [
+            "search",
+            "get",
+            "update",
+        ]:
+            raise RuntimeError("the first relayed update must finish first")
+        if crm[-1]["request"].get("status") != "inactive":
+            raise RuntimeError("the first relayed status was not applied")
+        if crm[-1]["request"].get("id") != crm[1]["result"].get("id"):
+            raise RuntimeError("the update did not remain on the same account")
+        result = {"role": "user", "content": SECOND_TURN}
+        append(connection, "follow_up_2", result)
+        return result
+
+    raise RuntimeError("there are no more user turns")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="conversationctl")
+    commands = parser.add_subparsers(dest="operation", required=True)
+    commands.add_parser("next")
+    arguments = parser.parse_args()
+    if arguments.operation != "next":
+        return 64
+    if not DATABASE.is_file():
+        print("conversationctl: CRM session is not initialized", file=sys.stderr)
+        return 65
+    try:
+        connection = sqlite3.connect(DATABASE, timeout=10)
+        connection.row_factory = sqlite3.Row
+        try:
+            result = next_turn(connection)
+        finally:
+            connection.close()
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+        return 0
+    except (RuntimeError, sqlite3.Error, json.JSONDecodeError) as error:
+        print(f"conversationctl: {error}", file=sys.stderr)
+        return 65
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

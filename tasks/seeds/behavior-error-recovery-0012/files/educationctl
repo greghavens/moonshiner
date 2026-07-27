@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""Executable, SQLite-backed education service for the availability task."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+
+
+ROOT = Path(__file__).resolve().parent
+PROTECTED = ROOT / ".protected"
+RUNTIME = ROOT / ".education-runtime"
+DATABASE = RUNTIME / "education.sqlite3"
+AUDIT = RUNTIME / "audit.jsonl"
+ATTEMPTS = RUNTIME / "availability-attempts.json"
+SEED = PROTECTED / "education_seed.sql"
+KEY = PROTECTED / "audit.key"
+TEMPORARY_FAILURE = {
+    "name": "Microeconomics",
+    "location": "Downtown",
+    "date": "2026-11-21",
+}
+
+
+def initialize_database() -> None:
+    """Materialize the SQLite service safely during concurrent startup."""
+    RUNTIME.mkdir(mode=0o700, exist_ok=True)
+    lock_path = RUNTIME / "initialize.lock"
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if DATABASE.exists():
+            return
+        temporary = RUNTIME / f"education.{os.getpid()}.sqlite3"
+        connection = sqlite3.connect(temporary)
+        try:
+            connection.executescript(SEED.read_text(encoding="utf-8"))
+            connection.commit()
+        finally:
+            connection.close()
+        os.replace(temporary, DATABASE)
+
+
+def canonical_json(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def result_digest(result: dict) -> str:
+    return hashlib.sha256(canonical_json(result)).hexdigest()
+
+
+def append_audit(entry: dict) -> None:
+    key = bytes.fromhex(KEY.read_text(encoding="utf-8").strip())
+    signed = dict(entry)
+    signed["signature"] = hmac.new(
+        key, canonical_json(entry), hashlib.sha256
+    ).hexdigest()
+    payload = canonical_json(signed) + b"\n"
+    descriptor = os.open(AUDIT, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        os.write(descriptor, payload)
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def next_attempt(arguments: dict) -> int:
+    lock_path = RUNTIME / "attempts.lock"
+    key = json.dumps(arguments, sort_keys=True, ensure_ascii=False)
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                values = json.loads(ATTEMPTS.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                values = {}
+            attempt = int(values.get(key, 0)) + 1
+            values[key] = attempt
+            temporary = RUNTIME / f"attempts.{os.getpid()}.json"
+            temporary.write_text(
+                json.dumps(values, sort_keys=True, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            os.replace(temporary, ATTEMPTS)
+            return attempt
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def row_dict(row: sqlite3.Row) -> dict:
+    return {key: row[key] for key in row.keys()}
+
+
+def execute(operation: str, arguments: dict) -> tuple[dict, bool, dict]:
+    initialize_database()
+    connection = sqlite3.connect(DATABASE)
+    connection.row_factory = sqlite3.Row
+    try:
+        if operation == "availability":
+            attempt = next_attempt(arguments)
+            if arguments == TEMPORARY_FAILURE and attempt == 1:
+                return (
+                    {
+                        "error": "temporary_unavailable",
+                        "message": "education availability replica is restarting",
+                        "retryable": True,
+                    },
+                    False,
+                    {
+                        "attempt": attempt,
+                        "error_code": "temporary_unavailable",
+                        "retryable": True,
+                    },
+                )
+            row = connection.execute(
+                "SELECT course_name AS name, location, availability_date AS date, "
+                "available, seats_remaining FROM availability "
+                "WHERE course_name = ? AND location = ? AND availability_date = ?",
+                (arguments["name"], arguments["location"], arguments["date"]),
+            ).fetchone()
+            if row is None:
+                return (
+                    {"error": "availability_not_found", "retryable": False},
+                    False,
+                    {
+                        "attempt": attempt,
+                        "error_code": "availability_not_found",
+                        "retryable": False,
+                    },
+                )
+            result = row_dict(row)
+            result["available"] = bool(result["available"])
+            return (
+                result,
+                True,
+                {"attempt": attempt, "result_digest": result_digest(result)},
+            )
+
+        if operation == "search":
+            rows = connection.execute(
+                "SELECT id, course_name AS name, location FROM courses "
+                "WHERE course_name = ? AND location = ? ORDER BY id",
+                (arguments["name"], arguments["location"]),
+            ).fetchall()
+            return {"matches": [row_dict(row) for row in rows]}, True, {}
+
+        if operation == "get":
+            row = connection.execute(
+                "SELECT id, course_name AS name, location, status, department, notes "
+                "FROM courses WHERE id = ?",
+                (arguments["id"],),
+            ).fetchone()
+            if row is None:
+                return (
+                    {"error": "course_not_found", "retryable": False},
+                    False,
+                    {"error_code": "course_not_found", "retryable": False},
+                )
+            return row_dict(row), True, {}
+
+        if operation == "list":
+            rows = connection.execute(
+                "SELECT id, course_name AS name, location, status "
+                "FROM courses ORDER BY id"
+            ).fetchall()
+            return {"courses": [row_dict(row) for row in rows]}, True, {}
+
+        if operation == "preferences":
+            rows = connection.execute(
+                "SELECT owner, preference_key, preference_value "
+                "FROM saved_preferences ORDER BY owner, preference_key"
+            ).fetchall()
+            return {"preferences": [row_dict(row) for row in rows]}, True, {}
+
+        if operation == "create":
+            connection.execute(
+                "INSERT INTO courses "
+                "(id, course_name, location, status, department, notes) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    arguments["id"],
+                    arguments["name"],
+                    arguments["location"],
+                    arguments["status"],
+                    arguments["department"],
+                    arguments["notes"],
+                ),
+            )
+            connection.execute(
+                "INSERT INTO mutation_log (operation, course_id, detail) "
+                "VALUES (?, ?, ?)",
+                (operation, arguments["id"], arguments["status"]),
+            )
+            connection.commit()
+            return {"created": arguments["id"]}, True, {}
+
+        if operation == "update":
+            cursor = connection.execute(
+                "UPDATE courses SET status = ? WHERE id = ?",
+                (arguments["status"], arguments["id"]),
+            )
+            connection.execute(
+                "INSERT INTO mutation_log (operation, course_id, detail) "
+                "VALUES (?, ?, ?)",
+                (operation, arguments["id"], arguments["status"]),
+            )
+            connection.commit()
+            return {"updated": cursor.rowcount == 1, "id": arguments["id"]}, True, {}
+
+        if operation == "cancel":
+            cursor = connection.execute(
+                "UPDATE courses SET status = 'cancelled' WHERE id = ?",
+                (arguments["id"],),
+            )
+            connection.execute(
+                "INSERT INTO mutation_log (operation, course_id, detail) "
+                "VALUES (?, ?, ?)",
+                (operation, arguments["id"], "cancelled"),
+            )
+            connection.commit()
+            return {"cancelled": cursor.rowcount == 1, "id": arguments["id"]}, True, {}
+
+        if operation == "notify":
+            connection.execute(
+                "INSERT INTO notifications (course_id, recipient, message) "
+                "VALUES (?, ?, ?)",
+                (arguments["id"], arguments["recipient"], arguments["message"]),
+            )
+            connection.execute(
+                "INSERT INTO mutation_log (operation, course_id, detail) "
+                "VALUES (?, ?, ?)",
+                (operation, arguments["id"], arguments["message"]),
+            )
+            connection.commit()
+            return {"notified": arguments["id"]}, True, {}
+
+        raise ValueError(f"unsupported operation: {operation}")
+    finally:
+        connection.close()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Sandboxed education service")
+    commands = parser.add_subparsers(dest="operation", required=True)
+
+    availability = commands.add_parser(
+        "availability", help="check course availability"
+    )
+    availability.add_argument("--name", required=True)
+    availability.add_argument("--location", required=True)
+    availability.add_argument("--date", required=True)
+
+    search = commands.add_parser(
+        "search", help="search courses by exact name and location"
+    )
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+
+    get = commands.add_parser("get", help="retrieve one course by stable ID")
+    get.add_argument("--id", required=True)
+    commands.add_parser("list", help="list course summaries")
+    commands.add_parser("preferences", help="read saved registrar preferences")
+
+    create = commands.add_parser("create", help="create a course")
+    create.add_argument("--id", required=True)
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--status", required=True)
+    create.add_argument("--department", required=True)
+    create.add_argument("--notes", required=True)
+
+    update = commands.add_parser("update", help="update a course status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+
+    cancel = commands.add_parser("cancel", help="cancel a course")
+    cancel.add_argument("--id", required=True)
+
+    notify = commands.add_parser("notify", help="send a course notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--recipient", required=True)
+    notify.add_argument("--message", required=True)
+    return parser
+
+
+def main() -> int:
+    namespace = build_parser().parse_args()
+    operation = namespace.operation
+    arguments = {
+        key: value for key, value in vars(namespace).items() if key != "operation"
+    }
+    started = time.monotonic_ns()
+    try:
+        result, success, evidence = execute(operation, arguments)
+        time.sleep(0.45)
+    except Exception as error:
+        result = {"error": f"{type(error).__name__}: {error}", "retryable": False}
+        success = False
+        evidence = {"error_code": "internal_error", "retryable": False}
+    finished = time.monotonic_ns()
+
+    entry = {
+        "operation": operation,
+        "arguments": arguments,
+        "started_ns": started,
+        "finished_ns": finished,
+        "pid": os.getpid(),
+        "parent_pid": os.getppid(),
+        "success": success,
+        **evidence,
+    }
+    append_audit(entry)
+    stream = sys.stdout if success else sys.stderr
+    print(json.dumps(result, indent=2, ensure_ascii=False, sort_keys=True), file=stream)
+    if success:
+        return 0
+    return 75 if evidence.get("retryable") is True else 3
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

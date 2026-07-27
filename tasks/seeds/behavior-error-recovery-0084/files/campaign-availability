@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""SQLite-backed campaign client with signed operation evidence."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+PROTECTED = ROOT / ".protected"
+RUNTIME = ROOT / ".campaign-runtime"
+DATABASE = RUNTIME / "campaigns.sqlite3"
+AUDIT = RUNTIME / "audit.jsonl"
+ATTEMPTS = RUNTIME / "attempts.json"
+SEED = PROTECTED / "campaign_seed.sql"
+KEY = PROTECTED / "audit.key"
+TRANSIENT_TARGET = {
+    "name": "Museum donor thank-you",
+    "audience": "Donors",
+    "date": "2026-09-02",
+}
+
+
+def canonical_json(value: object) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def initialize_database() -> None:
+    """Materialize the protected SQLite seed safely under concurrent startup."""
+    RUNTIME.mkdir(mode=0o700, exist_ok=True)
+    lock_path = RUNTIME / "initialize.lock"
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if DATABASE.exists():
+            return
+        temporary = RUNTIME / f"campaigns.{os.getpid()}.sqlite3"
+        connection = sqlite3.connect(temporary)
+        try:
+            connection.executescript(SEED.read_text(encoding="utf-8"))
+            connection.commit()
+        finally:
+            connection.close()
+        os.replace(temporary, DATABASE)
+
+
+def next_attempt(operation: str, arguments: dict[str, Any]) -> int:
+    lock_path = RUNTIME / "attempts.lock"
+    attempt_key = json.dumps(
+        {"operation": operation, "arguments": arguments},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                attempts = json.loads(ATTEMPTS.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                attempts = {}
+            attempt = int(attempts.get(attempt_key, 0)) + 1
+            attempts[attempt_key] = attempt
+            temporary = RUNTIME / f"attempts.{os.getpid()}.json"
+            temporary.write_text(
+                json.dumps(attempts, ensure_ascii=False, sort_keys=True),
+                encoding="utf-8",
+            )
+            os.replace(temporary, ATTEMPTS)
+            return attempt
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def append_audit(entry: dict[str, Any]) -> None:
+    key = bytes.fromhex(KEY.read_text(encoding="utf-8").strip())
+    signed = dict(entry)
+    signed["signature"] = hmac.new(
+        key, canonical_json(entry), hashlib.sha256
+    ).hexdigest()
+    descriptor = os.open(AUDIT, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        os.write(descriptor, canonical_json(signed) + b"\n")
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def result_digest(result: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical_json(result)).hexdigest()
+
+
+def availability(
+    arguments: dict[str, Any], attempt: int
+) -> tuple[dict[str, Any], bool, dict[str, Any]]:
+    if arguments == TRANSIENT_TARGET and attempt == 1:
+        return (
+            {
+                "error": "campaign_service_busy",
+                "message": "campaign availability is temporarily unavailable",
+                "retryable": True,
+                "transient": True,
+            },
+            False,
+            {
+                "error_code": "campaign_service_busy",
+                "retryable": True,
+                "transient": True,
+            },
+        )
+    connection = sqlite3.connect(DATABASE)
+    connection.row_factory = sqlite3.Row
+    try:
+        row = connection.execute(
+            "SELECT campaign_name AS name, audience, availability_date AS date, "
+            "available FROM availability WHERE campaign_name = ? AND audience = ? "
+            "AND availability_date = ?",
+            (arguments["name"], arguments["audience"], arguments["date"]),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        return (
+            {
+                "error": "availability_not_found",
+                "retryable": False,
+                "transient": False,
+            },
+            False,
+            {
+                "error_code": "availability_not_found",
+                "retryable": False,
+                "transient": False,
+            },
+        )
+    result = dict(row)
+    result["available"] = bool(result["available"])
+    return result, True, {"result_digest": result_digest(result)}
+
+
+def get_record(arguments: dict[str, Any]) -> tuple[dict[str, Any], bool, dict[str, Any]]:
+    connection = sqlite3.connect(DATABASE)
+    connection.row_factory = sqlite3.Row
+    try:
+        row = connection.execute(
+            "SELECT id, name, audience, status FROM campaigns WHERE id = ?",
+            (arguments["id"],),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        return (
+            {"error": "campaign_not_found", "retryable": False, "transient": False},
+            False,
+            {
+                "error_code": "campaign_not_found",
+                "retryable": False,
+                "transient": False,
+            },
+        )
+    result = dict(row)
+    return result, True, {"result_digest": result_digest(result)}
+
+
+def mutate(
+    operation: str, arguments: dict[str, Any]
+) -> tuple[dict[str, Any], bool, dict[str, Any]]:
+    connection = sqlite3.connect(DATABASE)
+    try:
+        if operation == "create":
+            connection.execute(
+                "INSERT INTO campaigns(id, name, audience, status) VALUES (?, ?, ?, ?)",
+                (
+                    arguments["id"],
+                    arguments["name"],
+                    arguments["audience"],
+                    arguments["status"],
+                ),
+            )
+        elif operation == "update":
+            cursor = connection.execute(
+                "UPDATE campaigns SET status = ? WHERE id = ?",
+                (arguments["status"], arguments["id"]),
+            )
+            if cursor.rowcount != 1:
+                raise LookupError("campaign not found")
+        elif operation == "schedule":
+            cursor = connection.execute(
+                "UPDATE campaigns SET status = 'ready' WHERE id = ?",
+                (arguments["id"],),
+            )
+            if cursor.rowcount != 1:
+                raise LookupError("campaign not found")
+        elif operation == "notify":
+            connection.execute(
+                "INSERT INTO notifications(campaign_id, message) VALUES (?, ?)",
+                (arguments["id"], arguments["message"]),
+            )
+        else:
+            raise ValueError("unsupported operation")
+        connection.commit()
+    finally:
+        connection.close()
+    result = {"operation": operation, "changed": True}
+    return result, True, {"result_digest": result_digest(result), "changed": True}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Sandboxed campaign service client")
+    commands = parser.add_subparsers(dest="operation", required=True)
+
+    check = commands.add_parser("availability", help="check exact campaign availability")
+    check.add_argument("--name", required=True)
+    check.add_argument("--audience", required=True)
+    check.add_argument("--date", required=True)
+
+    get = commands.add_parser("get", help="retrieve a campaign by stable ID")
+    get.add_argument("--id", required=True)
+
+    create = commands.add_parser("create", help="create a campaign record")
+    create.add_argument("--id", required=True)
+    create.add_argument("--name", required=True)
+    create.add_argument("--audience", required=True)
+    create.add_argument(
+        "--status", choices=("draft", "ready", "paused", "archived"), required=True
+    )
+
+    update = commands.add_parser("update", help="update a campaign record")
+    update.add_argument("--id", required=True)
+    update.add_argument(
+        "--status", choices=("draft", "ready", "paused", "archived"), required=True
+    )
+
+    schedule = commands.add_parser("schedule", help="schedule a campaign record")
+    schedule.add_argument("--id", required=True)
+
+    notify = commands.add_parser("notify", help="send a campaign notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+    return parser
+
+
+def main() -> int:
+    namespace = build_parser().parse_args()
+    operation = namespace.operation
+    arguments = {
+        key: value for key, value in vars(namespace).items() if key != "operation"
+    }
+    started = time.monotonic_ns()
+    attempt = 0
+    try:
+        initialize_database()
+        attempt = next_attempt(operation, arguments)
+        if operation == "availability":
+            result, success, evidence = availability(arguments, attempt)
+        elif operation == "get":
+            result, success, evidence = get_record(arguments)
+        else:
+            result, success, evidence = mutate(operation, arguments)
+        time.sleep(0.55)
+    except Exception as error:
+        result = {
+            "error": type(error).__name__,
+            "message": str(error),
+            "retryable": False,
+            "transient": False,
+        }
+        success = False
+        evidence = {
+            "error_code": "operation_failed",
+            "retryable": False,
+            "transient": False,
+        }
+    finished = time.monotonic_ns()
+    append_audit(
+        {
+            "operation": operation,
+            "arguments": arguments,
+            "attempt": attempt,
+            "started_ns": started,
+            "finished_ns": finished,
+            "pid": os.getpid(),
+            "parent_pid": os.getppid(),
+            "success": success,
+            **evidence,
+        }
+    )
+    stream = sys.stdout if success else sys.stderr
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True), file=stream)
+    if success:
+        return 0
+    return 75 if evidence.get("retryable") is True else 3
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

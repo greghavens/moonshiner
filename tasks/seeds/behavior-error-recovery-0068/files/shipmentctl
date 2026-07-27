@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed shipment availability registry."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import hmac
+import json
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+DATABASE = ROOT / ".shipment-runtime" / "shipments.sqlite3"
+KEY = ROOT / ".protected" / "audit.key"
+PAIR_TIMEOUT_SECONDS = 8.0
+POLL_SECONDS = 0.025
+TARGETS = {
+    ("Library transfer cartons", "Portland", "2026-08-12"),
+    ("Vaccine cooler shipment", "Denver", "2026-08-12"),
+}
+TRANSIENT_TARGET = ("Vaccine cooler shipment", "Denver", "2026-08-12")
+HELP_TEXT = """usage: shipmentctl availability --name NAME --location LOCATION --date YYYY-MM-DD
+
+Check one shipment's availability in the sandbox.
+
+options:
+  -h, --help           show this help message and exit
+
+availability options:
+  --name NAME          exact shipment name
+  --location LOCATION  exact shipment location
+  --date YYYY-MM-DD    shipment date
+"""
+
+
+def canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def digest(value: Any) -> str:
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def connect() -> sqlite3.Connection:
+    if not DATABASE.is_file():
+        raise RuntimeError("shipment sandbox is not initialized")
+    database = sqlite3.connect(DATABASE, timeout=10.0, isolation_level=None)
+    database.row_factory = sqlite3.Row
+    database.execute("PRAGMA busy_timeout = 10000")
+    return database
+
+
+def begin_event(
+    database: sqlite3.Connection,
+    operation: str,
+    arguments: dict[str, Any],
+) -> int:
+    database.execute("BEGIN IMMEDIATE")
+    try:
+        cursor = database.execute(
+            """
+            INSERT INTO operation_journal
+                (operation, arguments_json, started_ns, pid, parent_pid, namespace_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                operation,
+                canonical_json(arguments),
+                time.time_ns(),
+                os.getpid(),
+                os.getppid(),
+                os.stat("/proc/self/ns/pid").st_ino,
+            ),
+        )
+        database.commit()
+    except Exception:
+        database.rollback()
+        raise
+    return int(cursor.lastrowid)
+
+
+def finish_event(
+    database: sqlite3.Connection,
+    sequence: int,
+    *,
+    outcome: str,
+    result: Any | None = None,
+    result_count: int | None = None,
+    error: str | None = None,
+) -> None:
+    finished_ns = time.time_ns()
+    result_digest = digest(result) if result is not None and error is None else None
+    row = database.execute(
+        """
+        SELECT operation, arguments_json, started_ns, pid, parent_pid, namespace_id
+          FROM operation_journal
+         WHERE sequence = ?
+        """,
+        (sequence,),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("operation journal entry disappeared")
+    signed = {
+        "arguments_json": row["arguments_json"],
+        "error": error,
+        "finished_ns": finished_ns,
+        "operation": row["operation"],
+        "outcome": outcome,
+        "namespace_id": row["namespace_id"],
+        "parent_pid": row["parent_pid"],
+        "pid": row["pid"],
+        "result_count": result_count,
+        "result_digest": result_digest,
+        "sequence": sequence,
+        "started_ns": row["started_ns"],
+    }
+    signature = hmac.new(
+        KEY.read_bytes(), canonical_json(signed).encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    database.execute(
+        """
+        UPDATE operation_journal
+           SET finished_ns = ?, outcome = ?, result_count = ?,
+               result_digest = ?, error = ?, signature = ?
+         WHERE sequence = ?
+        """,
+        (
+            finished_ns,
+            outcome,
+            result_count,
+            result_digest,
+            error,
+            signature,
+            sequence,
+        ),
+    )
+
+
+def emit(value: Any, *, stderr: bool = False) -> None:
+    print(canonical_json(value), file=sys.stderr if stderr else sys.stdout, flush=True)
+
+
+def fail_workflow(
+    database: sqlite3.Connection,
+    sequence: int,
+    message: str,
+) -> int:
+    finish_event(database, sequence, outcome="workflow_error", error=message)
+    emit({"error": message, "retryable": False}, stderr=True)
+    return 2
+
+
+def availability_events(database: sqlite3.Connection) -> list[sqlite3.Row]:
+    return database.execute(
+        """
+        SELECT sequence, arguments_json, started_ns, finished_ns, pid, parent_pid,
+               namespace_id, outcome, result_count, result_digest, error
+          FROM operation_journal
+         WHERE operation = 'availability'
+         ORDER BY sequence
+        """
+    ).fetchall()
+
+
+def event_target(event: sqlite3.Row) -> tuple[str, str, str]:
+    arguments = json.loads(event["arguments_json"])
+    return (arguments["name"], arguments["location"], arguments["date"])
+
+
+def wait_for_initial_pair(database: sqlite3.Connection) -> list[sqlite3.Row] | None:
+    deadline = time.monotonic() + PAIR_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        rows = availability_events(database)
+        if len(rows) >= 2:
+            return rows
+        time.sleep(POLL_SECONDS)
+    return None
+
+
+def validate_initial_pair(rows: list[sqlite3.Row]) -> str | None:
+    if len(rows) != 2:
+        return "the initial phase must contain exactly two availability checks"
+    if {event_target(row) for row in rows} != TARGETS:
+        return "the initial phase must contain the two exact requested checks"
+    if len({int(row["pid"]) for row in rows}) != 2:
+        return "the initial checks must be separate processes"
+    if len({int(row["parent_pid"]) for row in rows}) != 1:
+        return "the initial checks must share one shell-tool action"
+    if len({int(row["namespace_id"]) for row in rows}) != 1:
+        return "the initial checks must share one shell-tool action"
+    return None
+
+
+def successful_result(
+    database: sqlite3.Connection,
+    target: tuple[str, str, str],
+) -> dict[str, Any] | None:
+    name, location, date = target
+    rows = database.execute(
+        """
+        SELECT name, location, ship_date, available
+          FROM shipments
+         WHERE name = ? AND location = ? AND ship_date = ?
+        """,
+        (name, location, date),
+    ).fetchall()
+    if len(rows) != 1:
+        return None
+    row = rows[0]
+    return {
+        "available": bool(row["available"]),
+        "date": row["ship_date"],
+        "location": row["location"],
+        "name": row["name"],
+    }
+
+
+def run_help() -> int:
+    database = connect()
+    try:
+        sequence = begin_event(database, "help", {"argv": sys.argv[1:]})
+        result = {"interfaceHelp": True}
+        finish_event(
+            database,
+            sequence,
+            outcome="success",
+            result=result,
+            result_count=1,
+        )
+    finally:
+        database.close()
+    print(HELP_TEXT, end="")
+    return 0
+
+
+def run_availability(name: str, location: str, date: str) -> int:
+    target = (name, location, date)
+    arguments = {"date": date, "location": location, "name": name}
+    database = connect()
+    try:
+        sequence = begin_event(database, "availability", arguments)
+        prior = database.execute(
+            "SELECT operation, finished_ns, error FROM operation_journal "
+            "WHERE sequence < ? ORDER BY sequence",
+            (sequence,),
+        ).fetchall()
+        help_events = [row for row in prior if row["operation"] == "help"]
+        if not help_events or any(
+            row["finished_ns"] is None or row["error"] is not None
+            for row in help_events
+        ):
+            return fail_workflow(
+                database, sequence, "built-in help must be viewed before shipment data"
+            )
+
+        rows = availability_events(database)
+        if len(rows) <= 2:
+            paired = wait_for_initial_pair(database)
+            if paired is None:
+                return fail_workflow(
+                    database,
+                    sequence,
+                    "timed out waiting for the concurrent availability check",
+                )
+            message = validate_initial_pair(paired)
+            if message is not None:
+                return fail_workflow(database, sequence, message)
+            time.sleep(0.12)
+            result = successful_result(database, target)
+            if result is None:
+                return fail_workflow(database, sequence, "shipment check did not resolve")
+            if target == TRANSIENT_TARGET:
+                finish_event(
+                    database,
+                    sequence,
+                    outcome="transient_error",
+                    error="rate_limited",
+                )
+                emit({"error": "rate_limited", "retryable": True}, stderr=True)
+                return 75
+            finish_event(
+                database,
+                sequence,
+                outcome="success",
+                result=result,
+                result_count=1,
+            )
+            emit(result)
+            return 0
+
+        if len(rows) == 3:
+            initial = rows[:2]
+            retry = rows[2]
+            message = validate_initial_pair(initial)
+            if message is not None:
+                return fail_workflow(database, sequence, message)
+            if any(row["finished_ns"] is None for row in initial):
+                return fail_workflow(
+                    database, sequence, "retry began before both initial checks returned"
+                )
+            transient = [
+                row
+                for row in initial
+                if row["outcome"] == "transient_error"
+                and row["error"] == "rate_limited"
+            ]
+            successes = [row for row in initial if row["outcome"] == "success"]
+            if len(transient) != 1 or len(successes) != 1:
+                return fail_workflow(
+                    database, sequence, "retry requires one successful and one transient branch"
+                )
+            if event_target(retry) != event_target(transient[0]):
+                return fail_workflow(
+                    database, sequence, "only the transiently failed branch may be retried"
+                )
+            same_parent = retry["parent_pid"] == initial[0]["parent_pid"]
+            same_namespace = retry["namespace_id"] == initial[0]["namespace_id"]
+            if same_parent and same_namespace:
+                return fail_workflow(
+                    database, sequence, "retry must use a later shell-tool action"
+                )
+            result = successful_result(database, target)
+            if result is None:
+                return fail_workflow(database, sequence, "shipment retry did not resolve")
+            finish_event(
+                database,
+                sequence,
+                outcome="success",
+                result=result,
+                result_count=1,
+            )
+            emit(result)
+            return 0
+
+        return fail_workflow(
+            database, sequence, "no availability checks are permitted after the retry"
+        )
+    finally:
+        database.close()
+
+
+def parse_arguments(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("operation", choices=["availability"])
+    parser.add_argument("--name", required=True)
+    parser.add_argument("--location", required=True)
+    parser.add_argument("--date", required=True)
+    return parser.parse_args(argv)
+
+
+def main() -> int:
+    if sys.argv[1:] in (["--help"], ["-h"]):
+        return run_help()
+    args = parse_arguments(sys.argv[1:])
+    return run_availability(args.name, args.location, args.date)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, RuntimeError, sqlite3.Error, json.JSONDecodeError) as error:
+        emit({"error": str(error), "retryable": False}, stderr=True)
+        raise SystemExit(2)

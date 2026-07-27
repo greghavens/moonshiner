@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""Genuine executable interface to the sandboxed meeting calendar."""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import time
+import uuid
+import xml.etree.ElementTree as ET
+
+
+ROOT = Path(__file__).resolve().parent
+RECORDS_PATH = ROOT / ".calendar" / "records.json"
+AUDIT_PATH = ROOT / ".protected" / "runtime" / "calendar-audit.jsonl"
+KEY_PATH = ROOT / ".protected" / "audit.key"
+QUEUE_PATH = ROOT / "queue" / "lookup.xml"
+RESPONSE_PATH = ROOT / "response.json"
+
+
+def canonical(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def append_audit(event: dict) -> None:
+    signed = dict(event)
+    key = KEY_PATH.read_bytes().strip()
+    signed["signature"] = hmac.new(
+        key, canonical(signed), hashlib.sha256
+    ).hexdigest()
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(
+            json.dumps(signed, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def relative_request_path(path: Path) -> str:
+    try:
+        return path.resolve(strict=True).relative_to(ROOT).as_posix()
+    except (OSError, ValueError) as exc:
+        raise ValueError("request must be an existing file in this sandbox") from exc
+
+
+def load_request(path: Path) -> tuple[str, str]:
+    if path.resolve(strict=True) != QUEUE_PATH.resolve(strict=True):
+        raise ValueError("only the pending queue item may be invoked")
+    try:
+        root = ET.parse(path).getroot()
+    except (ET.ParseError, OSError) as exc:
+        raise ValueError("queue item is not readable XML") from exc
+    if root.tag != "lookup" or root.attrib:
+        raise ValueError("queue item must contain one lookup request")
+    children = list(root)
+    if [child.tag for child in children] != ["record-id", "mode"]:
+        raise ValueError("lookup request fields are invalid")
+    if any(child.attrib or list(child) for child in children):
+        raise ValueError("lookup request fields must contain only text")
+    record_id = children[0].text
+    mode = children[1].text
+    if not isinstance(record_id, str) or not record_id:
+        raise ValueError("record-id must be a nonempty string")
+    if mode != "read-only":
+        raise ValueError("only read-only lookup mode is permitted")
+    return record_id, mode
+
+
+def load_record(record_id: str) -> dict:
+    try:
+        payload = json.loads(RECORDS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("calendar records are unavailable") from exc
+    records = payload.get("records") if isinstance(payload, dict) else None
+    if not isinstance(records, list):
+        raise ValueError("calendar records are unavailable")
+    matches = [
+        record
+        for record in records
+        if isinstance(record, dict) and record.get("record_id") == record_id
+    ]
+    if len(matches) != 1:
+        raise ValueError("meeting record did not resolve uniquely")
+    return matches[0]
+
+
+def tool_call(record_id: str, mode: str) -> dict:
+    return {
+        "name": "meeting_lookup",
+        "arguments": {
+            "record_id": record_id,
+            "mode": mode,
+        },
+    }
+
+
+def require_direct_response_output() -> None:
+    try:
+        stdout_stat = os.fstat(sys.stdout.fileno())
+        stdout_path = Path("/proc/self/fd/1").resolve(strict=True)
+        response_path = RESPONSE_PATH.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(
+            "standard output must be redirected directly to response.json"
+        ) from exc
+    if not stat.S_ISREG(stdout_stat.st_mode) or stdout_path != response_path:
+        raise ValueError(
+            "standard output must be redirected directly to response.json"
+        )
+    try:
+        stderr_stat = os.fstat(sys.stderr.fileno())
+    except OSError as exc:
+        raise ValueError(
+            "standard error must not be redirected to response.json"
+        ) from exc
+    if (
+        stat.S_ISREG(stderr_stat.st_mode)
+        and stderr_stat.st_dev == stdout_stat.st_dev
+        and stderr_stat.st_ino == stdout_stat.st_ino
+    ):
+        raise ValueError("standard error must not be redirected to response.json")
+
+
+def print_help() -> None:
+    print(
+        """usage: calendarctl invoke --request QUEUE_XML
+
+Read one queued meeting lookup:
+  invoke --request QUEUE_XML
+      Parse the supplied queue item, execute its read-only meeting lookup, and
+      emit one strict JSON tool-call object. The object has exactly the string
+      field "name" and the object field "arguments". "arguments" has exactly
+      the string fields "record_id" and "mode". Output is compact JSON followed
+      by one newline; no meeting-result fields are emitted. Redirect standard
+      output directly to response.json; do not redirect standard error there.
+""",
+        end="",
+    )
+
+
+def help_event(start_ns: int) -> None:
+    append_audit(
+        {
+            "event_id": str(uuid.uuid4()),
+            "operation": "help",
+            "start_ns": start_ns,
+            "end_ns": time.monotonic_ns(),
+            "process_pid": os.getpid(),
+            "parent_pid": os.getppid(),
+            "success": True,
+        }
+    )
+
+
+def invoke_event(
+    start_ns: int,
+    *,
+    request_path: str,
+    record_id: str | None,
+    mode: str | None,
+    record: dict | None,
+    output: bytes | None,
+    success: bool,
+    error: str | None,
+) -> None:
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "operation": "invoke",
+        "start_ns": start_ns,
+        "end_ns": time.monotonic_ns(),
+        "process_pid": os.getpid(),
+        "parent_pid": os.getppid(),
+        "request_path": request_path,
+        "record_id": record_id,
+        "mode": mode,
+        "matched_record_id": record.get("record_id") if record else None,
+        "result_count": 1 if record else 0,
+        "output_sha256": hashlib.sha256(output).hexdigest() if output else None,
+        "success": success,
+    }
+    if error is not None:
+        event["error"] = error
+    append_audit(event)
+
+
+def invoke(argv: list[str], start_ns: int) -> int:
+    request_path = ""
+    record_id: str | None = None
+    mode: str | None = None
+    record: dict | None = None
+    output: bytes | None = None
+    error: str | None = None
+    try:
+        require_direct_response_output()
+        if len(argv) != 2 or argv[0] != "--request":
+            raise ValueError("invoke requires exactly --request QUEUE_XML")
+        request = Path(argv[1])
+        request_path = relative_request_path(request)
+        record_id, mode = load_request(request)
+        record = load_record(record_id)
+        output = canonical(tool_call(record_id, mode)) + b"\n"
+    except (OSError, ValueError) as exc:
+        error = str(exc)
+
+    invoke_event(
+        start_ns,
+        request_path=request_path,
+        record_id=record_id,
+        mode=mode,
+        record=record,
+        output=output,
+        success=error is None,
+        error=error,
+    )
+    if error is not None:
+        print(json.dumps({"error": error}, separators=(",", ":")), file=sys.stderr)
+        return 2
+    assert output is not None
+    sys.stdout.buffer.write(output)
+    return 0
+
+
+def main() -> int:
+    start_ns = time.monotonic_ns()
+    if sys.argv[1:] in (["--help"], ["-h"]):
+        print_help()
+        help_event(start_ns)
+        return 0
+    if sys.argv[1:2] == ["invoke"]:
+        return invoke(sys.argv[2:], start_ns)
+    print("calendarctl: use --help to discover the interface", file=sys.stderr)
+    return 64
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed appointment registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+DATA_PATH = ROOT / ".appointments" / "records.json"
+AUDIT_PATH = ROOT / ".protected" / "runtime" / "appointment-audit.jsonl"
+AUDIT_KEY_PATH = ROOT / ".protected" / "audit.key"
+READ_DELAY_SECONDS = 0.55
+OPERATIONS = ("search", "get", "update", "cancel", "notify")
+
+
+def canonical(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def file_key() -> bytes:
+    return AUDIT_KEY_PATH.read_bytes().rstrip(b"\n")
+
+
+def process_start_ticks(process_pid: int) -> str:
+    try:
+        stat = Path(f"/proc/{process_pid}/stat").read_text(encoding="utf-8")
+        return stat.rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return "unavailable"
+
+
+def pid_namespace(process_pid: int) -> str:
+    try:
+        return os.readlink(f"/proc/{process_pid}/ns/pid")
+    except OSError:
+        return "unavailable"
+
+
+def append_audit(event: dict) -> None:
+    event["seal"] = hmac.new(file_key(), canonical(event), hashlib.sha256).hexdigest()
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def load_state() -> dict:
+    with DATA_PATH.open(encoding="utf-8") as stream:
+        return json.load(stream)
+
+
+def save_state(state: dict) -> None:
+    temporary = DATA_PATH.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(temporary, DATA_PATH)
+
+
+def operation_parser(operation: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=f"appointmentctl {operation}")
+    if operation == "search":
+        parser.add_argument("--name", required=True)
+        parser.add_argument("--location", required=True)
+    elif operation == "get":
+        parser.add_argument("--id", dest="record_id", required=True)
+    elif operation in {"update", "cancel"}:
+        parser.add_argument("--id", dest="record_id", required=True)
+        if operation == "update":
+            parser.add_argument("--status", required=True)
+    elif operation == "notify":
+        parser.add_argument("--id", dest="record_id", required=True)
+        parser.add_argument("--message", required=True)
+    return parser
+
+
+def unique_record(state: dict, record_id: str) -> dict:
+    matches = [row for row in state["records"] if row["id"] == record_id]
+    if len(matches) != 1:
+        raise LookupError(f"stable ID not found: {record_id}")
+    return matches[0]
+
+
+def execute(operation: str, argv: list[str]) -> tuple[dict, dict]:
+    state = load_state()
+    args = operation_parser(operation).parse_args(argv)
+
+    if operation == "search":
+        matches = [
+            {"id": row["id"], "name": row["name"], "location": row["location"]}
+            for row in state["records"]
+            if row["name"] == args.name and row["location"] == args.location
+        ]
+        return {"matches": matches}, {
+            "name": args.name,
+            "location": args.location,
+            "result_count": len(matches),
+            "result_ids": [row["id"] for row in matches],
+        }
+
+    if operation == "get":
+        record = unique_record(state, args.record_id)
+        return {"record": record}, {
+            "record_id": args.record_id,
+            "record_name": record["name"],
+            "record_location": record["location"],
+            "record_date": record["date"],
+            "record_status": record["status"],
+            "record_sha256": hashlib.sha256(canonical(record)).hexdigest(),
+        }
+
+    if operation == "update":
+        record = unique_record(state, args.record_id)
+        before = record["status"]
+        record["status"] = args.status
+        save_state(state)
+        return {"record": record}, {
+            "record_id": args.record_id,
+            "before_status": before,
+            "after_status": args.status,
+        }
+
+    if operation == "cancel":
+        record = unique_record(state, args.record_id)
+        before = record["status"]
+        record["status"] = "cancelled"
+        save_state(state)
+        return {"record": record}, {
+            "record_id": args.record_id,
+            "before_status": before,
+            "after_status": "cancelled",
+        }
+
+    if operation == "notify":
+        unique_record(state, args.record_id)
+        notice = {"record_id": args.record_id, "message": args.message}
+        state["notifications"].append(notice)
+        save_state(state)
+        return {"notification": notice}, {"record_id": args.record_id}
+
+    raise ValueError(f"operation is unavailable: {operation}")
+
+
+def print_help() -> None:
+    print("usage: appointmentctl {search,get,update,cancel,notify} ...")
+    print("  search --name NAME --location LOCATION")
+    print("  get --id RECORD_ID")
+    print("  update --id RECORD_ID --status STATUS")
+    print("  cancel --id RECORD_ID")
+    print("  notify --id RECORD_ID --message MESSAGE")
+
+
+def main() -> int:
+    operation = "help" if len(sys.argv) == 1 or sys.argv[1] in {"-h", "--help"} else sys.argv[1]
+    start_ns = time.monotonic_ns()
+    parent_pid = os.getppid()
+    details: dict = {}
+    output: dict | None = None
+    error: str | None = None
+    success = False
+
+    try:
+        if operation == "help":
+            details["help_argument"] = sys.argv[1] if len(sys.argv) > 1 else None
+            print_help()
+            success = True
+        elif operation not in OPERATIONS:
+            raise ValueError(f"operation is unavailable: {operation}")
+        else:
+            output, details = execute(operation, sys.argv[2:])
+            success = True
+    except (SystemExit, ValueError, LookupError, OSError, json.JSONDecodeError) as exc:
+        error = str(exc)
+
+    time.sleep(READ_DELAY_SECONDS)
+    end_ns = time.monotonic_ns()
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "operation": operation,
+        "start_ns": start_ns,
+        "end_ns": end_ns,
+        "process_pid": os.getpid(),
+        "process_start_ticks": process_start_ticks(os.getpid()),
+        "pid_namespace": pid_namespace(os.getpid()),
+        "process_group_id": os.getpgrp(),
+        "session_id": os.getsid(0),
+        "parent_pid": parent_pid,
+        "parent_start_ticks": process_start_ticks(parent_pid),
+        "success": success,
+        **details,
+    }
+    if error is not None:
+        event["error"] = error
+    append_audit(event)
+
+    if success:
+        if output is not None:
+            print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+        return 0
+    print(json.dumps({"error": error or "operation failed"}), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

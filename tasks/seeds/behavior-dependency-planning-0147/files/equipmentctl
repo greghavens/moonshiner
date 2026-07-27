@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""Command-line interface to the sandboxed equipment registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+STATE_DIR = ROOT / ".equipment"
+PROFILE_PATH = STATE_DIR / "profile.json"
+AVAILABILITY_PATH = STATE_DIR / "availability.json"
+RECORDS_PATH = STATE_DIR / "records.json"
+NOTIFICATIONS_PATH = STATE_DIR / "notifications.json"
+AUDIT_PATH = STATE_DIR / "audit.jsonl"
+LOCK_PATH = STATE_DIR / "lock"
+KEY_PATH = ROOT / ".protected" / "audit.key"
+PROFILE_DELAY_SECONDS = 0.12
+CHECK_DELAY_SECONDS = 0.55
+
+
+class EquipmentError(RuntimeError):
+    """A user-facing equipment-registry error."""
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def digest(value: Any) -> str:
+    return hashlib.sha256(canonical(value)).hexdigest()
+
+
+def load_object(path: Path) -> dict[str, Any]:
+    try:
+        with path.open(encoding="utf-8") as stream:
+            value = json.load(stream)
+    except (OSError, json.JSONDecodeError) as error:
+        raise EquipmentError(f"cannot read registry data {path.name}: {error}") from error
+    if not isinstance(value, dict):
+        raise EquipmentError(f"invalid registry data: {path.name}")
+    return value
+
+
+def atomic_json_write(path: Path, value: dict[str, Any]) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", text=True
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def read_profile() -> dict[str, Any]:
+    document = load_object(PROFILE_PATH)
+    profile = document.get("profile")
+    if document.get("version") != 1 or not isinstance(profile, dict):
+        raise EquipmentError("invalid operational profile")
+    return profile
+
+
+def read_options() -> list[dict[str, Any]]:
+    document = load_object(AVAILABILITY_PATH)
+    options = document.get("options")
+    if document.get("version") != 1 or not isinstance(options, list):
+        raise EquipmentError("invalid availability store")
+    if not all(isinstance(option, dict) for option in options):
+        raise EquipmentError("invalid availability entry")
+    return options
+
+
+def read_records_document() -> dict[str, Any]:
+    document = load_object(RECORDS_PATH)
+    records = document.get("records")
+    if document.get("version") != 1 or not isinstance(records, list):
+        raise EquipmentError("invalid reservation-record store")
+    if not all(isinstance(record, dict) for record in records):
+        raise EquipmentError("invalid reservation-record entry")
+    return document
+
+
+def load_events() -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    if not AUDIT_PATH.exists():
+        return events
+    try:
+        with AUDIT_PATH.open(encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, 1):
+                if not line.strip():
+                    continue
+                event = json.loads(line)
+                if not isinstance(event, dict):
+                    raise EquipmentError(f"invalid audit event at line {line_number}")
+                events.append(event)
+    except (OSError, json.JSONDecodeError) as error:
+        raise EquipmentError(f"cannot read registry audit: {error}") from error
+    return events
+
+
+def append_audit_unlocked(event: dict[str, Any]) -> None:
+    sealed = dict(event)
+    sealed["sequence"] = len(load_events()) + 1
+    key = KEY_PATH.read_bytes().strip()
+    sealed["seal"] = hmac.new(key, canonical(sealed), hashlib.sha256).hexdigest()
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(sealed, ensure_ascii=False, sort_keys=True))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def append_audit(event: dict[str, Any]) -> None:
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        append_audit_unlocked(event)
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+
+def emit(value: dict[str, Any]) -> None:
+    json.dump(value, sys.stdout, ensure_ascii=False, sort_keys=True)
+    sys.stdout.write("\n")
+
+
+def require_profile_layer(date: str) -> None:
+    events = load_events()
+    if len(events) != 1:
+        raise EquipmentError(
+            "availability requires exactly one completed profile operation"
+        )
+    event = events[0]
+    if (
+        event.get("operation") != "profile"
+        or event.get("outcome") != "ok"
+        or event.get("default_date") != date
+    ):
+        raise EquipmentError("availability date must come from the completed profile")
+
+
+def require_check_layer(
+    events: list[dict[str, Any]], asset_id: str, date: str
+) -> None:
+    if len(events) != 3:
+        raise EquipmentError(
+            "reserve requires one profile operation and two completed availability checks"
+        )
+    if events[0].get("operation") != "profile" or events[0].get("outcome") != "ok":
+        raise EquipmentError("profile prerequisite is incomplete")
+    checks = events[1:]
+    if any(
+        event.get("operation") != "availability" or event.get("outcome") != "ok"
+        for event in checks
+    ):
+        raise EquipmentError("availability prerequisites are incomplete")
+    if any(event.get("date") != date for event in checks):
+        raise EquipmentError("reservation date does not match both availability checks")
+    matching = [event for event in checks if event.get("asset_id") == asset_id]
+    if len(matching) != 1 or matching[0].get("available") is not True:
+        raise EquipmentError("reserve requires an available asset returned by a check")
+
+
+def show_profile(_arguments: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    profile = read_profile()
+    default_date = profile.get("default_date")
+    if not isinstance(default_date, str) or not default_date:
+        raise EquipmentError("operational profile has no default date")
+    time.sleep(PROFILE_DELAY_SECONDS)
+    finished = time.monotonic_ns()
+    append_audit(
+        {
+            "default_date": default_date,
+            "finished_ns": finished,
+            "operation": "profile",
+            "outcome": "ok",
+            "profile_sha256": digest(profile),
+            "started_ns": started,
+        }
+    )
+    emit({"profile": profile})
+    return 0
+
+
+def check_availability(arguments: argparse.Namespace) -> int:
+    require_profile_layer(arguments.date)
+    started = time.monotonic_ns()
+    time.sleep(CHECK_DELAY_SECONDS)
+    matches = [
+        option
+        for option in read_options()
+        if option.get("item") == arguments.item
+        and option.get("location") == arguments.location
+        and option.get("date") == arguments.date
+    ]
+    finished = time.monotonic_ns()
+    if len(matches) != 1:
+        append_audit(
+            {
+                "date": arguments.date,
+                "finished_ns": finished,
+                "item": arguments.item,
+                "location": arguments.location,
+                "match_count": len(matches),
+                "operation": "availability",
+                "outcome": "ambiguous",
+                "started_ns": started,
+            }
+        )
+        raise EquipmentError(f"availability check matched {len(matches)} options")
+    option = matches[0]
+    available = option.get("available")
+    asset_id = option.get("asset_id")
+    if not isinstance(available, bool) or not isinstance(asset_id, str) or not asset_id:
+        raise EquipmentError("availability result is incomplete")
+    append_audit(
+        {
+            "asset_id": asset_id,
+            "available": available,
+            "date": arguments.date,
+            "finished_ns": finished,
+            "item": arguments.item,
+            "location": arguments.location,
+            "match_count": 1,
+            "operation": "availability",
+            "option_sha256": digest(option),
+            "outcome": "ok",
+            "started_ns": started,
+        }
+    )
+    emit({"availability": option})
+    return 0
+
+
+def next_reservation_id(records: list[dict[str, Any]]) -> str:
+    ordinals: list[int] = []
+    for record in records:
+        reservation_id = record.get("id")
+        if isinstance(reservation_id, str) and reservation_id.startswith("res-"):
+            suffix = reservation_id.removeprefix("res-")
+            if suffix.isdigit():
+                ordinals.append(int(suffix))
+    return f"res-{max(ordinals, default=200) + 1:03d}"
+
+
+def reserve(arguments: argparse.Namespace) -> int:
+    if arguments.quantity < 1:
+        raise EquipmentError("quantity must be a positive integer")
+    started = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        events = load_events()
+        require_check_layer(events, arguments.asset_id, arguments.date)
+        matching = [
+            option
+            for option in read_options()
+            if option.get("asset_id") == arguments.asset_id
+            and option.get("date") == arguments.date
+        ]
+        if len(matching) != 1 or matching[0].get("available") is not True:
+            raise EquipmentError("selected asset is not available for that date")
+        option = matching[0]
+        document = read_records_document()
+        records = document["records"]
+        before_count = len(records)
+        record = {
+            "asset_id": option["asset_id"],
+            "created_at": f"{arguments.date}T14:00:00Z",
+            "date": arguments.date,
+            "id": next_reservation_id(records),
+            "item": option["item"],
+            "location": option["location"],
+            "quantity": arguments.quantity,
+            "status": "reserved",
+        }
+        records.append(record)
+        atomic_json_write(RECORDS_PATH, document)
+        finished = time.monotonic_ns()
+        append_audit_unlocked(
+            {
+                "after_count": len(records),
+                "asset_id": arguments.asset_id,
+                "before_count": before_count,
+                "date": arguments.date,
+                "finished_ns": finished,
+                "operation": "reserve",
+                "outcome": "ok",
+                "quantity": arguments.quantity,
+                "record_sha256": digest(record),
+                "reservation_id": record["id"],
+                "started_ns": started,
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    emit({"reservation": record})
+    return 0
+
+
+def notify(arguments: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        document = load_object(NOTIFICATIONS_PATH)
+        notifications = document.get("notifications")
+        if document.get("version") != 1 or not isinstance(notifications, list):
+            raise EquipmentError("invalid notification store")
+        notifications.append(
+            {
+                "message": arguments.message,
+                "ordinal": len(notifications) + 1,
+                "reservation_id": arguments.reservation_id,
+            }
+        )
+        atomic_json_write(NOTIFICATIONS_PATH, document)
+        finished = time.monotonic_ns()
+        append_audit_unlocked(
+            {
+                "finished_ns": finished,
+                "operation": "notify",
+                "outcome": "ok",
+                "reservation_id": arguments.reservation_id,
+                "started_ns": started,
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    emit({"notified": True, "reservation_id": arguments.reservation_id})
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Read the saved profile, check exact equipment availability, and "
+            "create equipment reservations."
+        )
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    profile_parser = commands.add_parser(
+        "profile", help="return the saved operational profile"
+    )
+    profile_parser.set_defaults(handler=show_profile)
+
+    availability_parser = commands.add_parser(
+        "availability", help="check one exact item, location, and date"
+    )
+    availability_parser.add_argument("--item", required=True, help="exact item name")
+    availability_parser.add_argument(
+        "--location", required=True, help="exact storage location"
+    )
+    availability_parser.add_argument(
+        "--date", required=True, help="date in YYYY-MM-DD form"
+    )
+    availability_parser.set_defaults(handler=check_availability)
+
+    reserve_parser = commands.add_parser(
+        "reserve", help="create one reservation for a checked available asset"
+    )
+    reserve_parser.add_argument(
+        "--asset-id", required=True, help="stable asset ID returned by availability"
+    )
+    reserve_parser.add_argument("--date", required=True, help="checked date")
+    reserve_parser.add_argument(
+        "--quantity", required=True, type=int, help="reservation quantity"
+    )
+    reserve_parser.set_defaults(handler=reserve)
+
+    notify_parser = commands.add_parser(
+        "notify", help="send a notification associated with a reservation"
+    )
+    notify_parser.add_argument(
+        "--reservation-id", required=True, help="reservation record ID"
+    )
+    notify_parser.add_argument("--message", required=True, help="notification text")
+    notify_parser.set_defaults(handler=notify)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    arguments = parser.parse_args()
+    try:
+        return int(arguments.handler(arguments))
+    except (EquipmentError, OSError) as error:
+        print(f"equipmentctl: error: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

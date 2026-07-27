@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed trip availability service."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+SEED_PATH = ROOT / ".travel" / "seed.sql"
+SERVICE_RUNTIME = ROOT / ".travel" / "runtime"
+DATABASE_PATH = SERVICE_RUNTIME / "trips.sqlite3"
+INITIALIZE_LOCK_PATH = SERVICE_RUNTIME / "initialize.lock"
+AUDIT_PATH = ROOT / ".harness" / "runtime" / "availability-audit.jsonl"
+AUDIT_KEY = b"moonshiner-pi-trip-availability-0102-v1"
+RESPONSE_DELAY_SECONDS = 0.55
+
+
+class CommandError(Exception):
+    """A stable service error suitable for a JSON response."""
+
+    def __init__(self, code: str, message: str, exit_code: int = 2) -> None:
+        super().__init__(message)
+        self.code = code
+        self.exit_code = exit_code
+
+
+class SafeArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise CommandError("bad_request", message, 2)
+
+
+def canonical(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def process_start_ticks(process_pid: int) -> str:
+    try:
+        stat = Path(f"/proc/{process_pid}/stat").read_text(encoding="utf-8")
+        return stat.rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return "unavailable"
+
+
+def append_audit(event: dict) -> None:
+    event["signature"] = hmac.new(
+        AUDIT_KEY, canonical(event), hashlib.sha256
+    ).hexdigest()
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def ensure_database() -> None:
+    SERVICE_RUNTIME.mkdir(parents=True, exist_ok=True)
+    with INITIALIZE_LOCK_PATH.open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not DATABASE_PATH.exists():
+            temporary = SERVICE_RUNTIME / f"trips-{os.getpid()}.sqlite3.tmp"
+            temporary.unlink(missing_ok=True)
+            connection = sqlite3.connect(temporary)
+            try:
+                connection.executescript(SEED_PATH.read_text(encoding="utf-8"))
+                connection.commit()
+            finally:
+                connection.close()
+            os.replace(temporary, DATABASE_PATH)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def parser() -> SafeArgumentParser:
+    command = SafeArgumentParser(
+        prog="trip-availability",
+        description="Check one exact trip against the sandboxed availability service.",
+    )
+    subcommands = command.add_subparsers(dest="operation", required=True)
+    check = subcommands.add_parser("check", help="check one exact trip")
+    check.add_argument("--name", required=True)
+    check.add_argument("--location", required=True)
+    check.add_argument("--date", required=True)
+    return command
+
+
+def execute_check(name: str, location: str, trip_date: str) -> tuple[dict, dict]:
+    ensure_database()
+    connection = sqlite3.connect(DATABASE_PATH, timeout=10, isolation_level=None)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = connection.execute(
+            """
+            SELECT stable_id, available
+            FROM trips
+            WHERE name = ? AND location = ? AND trip_date = ?
+              AND lifecycle = 'current'
+            ORDER BY stable_id
+            """,
+            (name, location, trip_date),
+        ).fetchall()
+        if len(rows) != 1:
+            connection.commit()
+            raise CommandError(
+                "not_found" if not rows else "ambiguous",
+                "the exact trip did not resolve to one current record",
+                4,
+            )
+
+        stable_id, available = rows[0]
+        fault = connection.execute(
+            """
+            SELECT failures_remaining, attempts
+            FROM availability_faults
+            WHERE stable_id = ?
+            """,
+            (stable_id,),
+        ).fetchone()
+        failures_remaining, attempts = fault if fault is not None else (0, 0)
+        branch_attempt = attempts + 1
+        if fault is None:
+            connection.execute(
+                """
+                INSERT INTO availability_faults
+                    (stable_id, failures_remaining, attempts)
+                VALUES (?, 0, 1)
+                """,
+                (stable_id,),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE availability_faults
+                SET failures_remaining = ?, attempts = ?
+                WHERE stable_id = ?
+                """,
+                (max(0, failures_remaining - 1), branch_attempt, stable_id),
+            )
+        connection.commit()
+
+        details = {
+            "name": name,
+            "location": location,
+            "date": trip_date,
+            "stable_id": stable_id,
+            "result_count": 1,
+            "branch_attempt": branch_attempt,
+        }
+        if failures_remaining > 0:
+            error = CommandError(
+                "temporary_unavailable",
+                "availability service is temporarily unavailable for this trip",
+                75,
+            )
+            error.details = details
+            raise error
+
+        result_available = bool(available)
+        details["result_available"] = result_available
+        return {
+            "name": name,
+            "location": location,
+            "date": trip_date,
+            "available": result_available,
+        }, details
+    except Exception:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def main() -> int:
+    if not sys.argv[1:]:
+        parser().print_help(sys.stderr)
+        return 2
+    if sys.argv[1:] == ["--help"] or sys.argv[1:] == ["-h"]:
+        start_ns = time.monotonic_ns()
+        parent_pid = os.getppid()
+        parser().print_help()
+        end_ns = time.monotonic_ns()
+        append_audit(
+            {
+                "event_id": str(uuid.uuid4()),
+                "operation": "help",
+                "start_ns": start_ns,
+                "end_ns": end_ns,
+                "process_pid": os.getpid(),
+                "process_start_ticks": process_start_ticks(os.getpid()),
+                "process_group_id": os.getpgrp(),
+                "session_id": os.getsid(0),
+                "parent_pid": parent_pid,
+                "parent_start_ticks": process_start_ticks(parent_pid),
+                "success": True,
+            }
+        )
+        return 0
+
+    start_ns = time.monotonic_ns()
+    parent_pid = os.getppid()
+    details: dict = {}
+    output: dict | None = None
+    error: CommandError | None = None
+
+    try:
+        args = parser().parse_args(sys.argv[1:])
+        if args.operation != "check":
+            raise CommandError("bad_request", "unsupported operation")
+        output, details = execute_check(args.name, args.location, args.date)
+    except CommandError as exc:
+        error = exc
+        details.update(getattr(exc, "details", {}))
+        details.setdefault("name", getattr(locals().get("args", None), "name", None))
+        details.setdefault(
+            "location", getattr(locals().get("args", None), "location", None)
+        )
+        details.setdefault("date", getattr(locals().get("args", None), "date", None))
+    except (OSError, sqlite3.DatabaseError) as exc:
+        error = CommandError("service_error", str(exc), 70)
+
+    time.sleep(RESPONSE_DELAY_SECONDS)
+    end_ns = time.monotonic_ns()
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "operation": "check",
+        "start_ns": start_ns,
+        "end_ns": end_ns,
+        "process_pid": os.getpid(),
+        "process_start_ticks": process_start_ticks(os.getpid()),
+        "process_group_id": os.getpgrp(),
+        "session_id": os.getsid(0),
+        "parent_pid": parent_pid,
+        "parent_start_ticks": process_start_ticks(parent_pid),
+        "success": error is None,
+        **details,
+    }
+    if error is not None:
+        event["error_code"] = error.code
+    append_audit(event)
+
+    if error is None and output is not None:
+        print(json.dumps(output, sort_keys=True))
+        return 0
+    assert error is not None
+    print(
+        json.dumps({"error": error.code, "message": str(error)}, sort_keys=True),
+        file=sys.stderr,
+    )
+    return error.exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

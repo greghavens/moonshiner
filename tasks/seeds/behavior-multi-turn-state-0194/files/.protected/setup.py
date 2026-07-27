@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""Initialize a fresh disposable expense registry for one trace."""
+
+from __future__ import annotations
+
+import shutil
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent.parent
+RUNTIME = ROOT / ".expense-runtime"
+DATABASE = RUNTIME / "expenses.sqlite3"
+SEED = ROOT / ".protected" / "expenses_seed.sql"
+REPORT = ROOT / "expense-report.txt"
+
+
+def main() -> int:
+    if RUNTIME.exists():
+        shutil.rmtree(RUNTIME)
+    RUNTIME.mkdir(mode=0o700)
+    if REPORT.exists():
+        REPORT.unlink()
+
+    database = sqlite3.connect(DATABASE)
+    try:
+        database.executescript(SEED.read_text(encoding="utf-8"))
+        database.commit()
+    finally:
+        database.close()
+
+    driver = ROOT / "reference_driver.py"
+    if driver.is_file():
+        subprocess.run(
+            [sys.executable, "-B", str(driver)],
+            cwd=ROOT,
+            check=True,
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

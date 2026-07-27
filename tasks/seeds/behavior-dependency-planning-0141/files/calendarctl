@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""Executable interface to a sandboxed calendar record ledger."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+STATE_DIR = ROOT / ".calendar"
+PROFILE_PATH = STATE_DIR / "profile.json"
+STATE_PATH = STATE_DIR / "state.json"
+AUDIT_PATH = STATE_DIR / "audit.jsonl"
+NOTIFICATIONS_PATH = STATE_DIR / "notifications.json"
+LOCK_PATH = STATE_DIR / "lock"
+KEY_PATH = ROOT / ".protected" / "audit.key"
+READ_DELAY_SECONDS = 0.55
+PRIORITY = (
+    ("Museum partnership call", "Room Atlas"),
+    ("Autumn campaign planning", "Video conference"),
+)
+
+
+class CalendarError(RuntimeError):
+    """A user-facing calendar service error."""
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def load_object(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise CalendarError(f"invalid service data: {path.name}")
+    return value
+
+
+def atomic_json_write(path: Path, value: dict[str, Any]) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", text=True
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def load_events() -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    with AUDIT_PATH.open(encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            event = json.loads(line)
+            if not isinstance(event, dict):
+                raise CalendarError(f"invalid audit event at line {line_number}")
+            events.append(event)
+    return events
+
+
+def append_audit_unlocked(event: dict[str, Any]) -> None:
+    sealed = dict(event)
+    sealed["sequence"] = len(load_events()) + 1
+    key = KEY_PATH.read_bytes().strip()
+    sealed["seal"] = hmac.new(key, canonical(sealed), hashlib.sha256).hexdigest()
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(sealed, ensure_ascii=False, sort_keys=True))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def append_audit(event: dict[str, Any]) -> None:
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        append_audit_unlocked(event)
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+
+def emit(value: dict[str, Any]) -> None:
+    json.dump(value, sys.stdout, ensure_ascii=False, sort_keys=True)
+    sys.stdout.write("\n")
+
+
+def profile_digest(profile: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical(profile)).hexdigest()
+
+
+def read_profile(_: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    time.sleep(0.15)
+    profile = load_object(PROFILE_PATH)
+    if (
+        profile.get("version") != 1
+        or not isinstance(profile.get("profile_id"), str)
+        or not isinstance(profile.get("default_date"), str)
+    ):
+        raise CalendarError("saved operational profile is invalid")
+    finished = time.monotonic_ns()
+    append_audit(
+        {
+            "default_date": profile["default_date"],
+            "finished_ns": finished,
+            "operation": "profile",
+            "outcome": "ok",
+            "profile_id": profile["profile_id"],
+            "profile_sha256": profile_digest(profile),
+            "started_ns": started,
+        }
+    )
+    emit({"profile": profile})
+    return 0
+
+
+def require_profile_layer(date: str) -> None:
+    events = load_events()
+    if len(events) != 1 or events[0].get("operation") != "profile":
+        raise CalendarError("availability requires one completed profile read")
+    if events[0].get("outcome") != "ok" or events[0].get("default_date") != date:
+        raise CalendarError("date must be the saved profile default")
+
+
+def read_options() -> list[dict[str, Any]]:
+    document = load_object(STATE_PATH)
+    options = document.get("options")
+    if document.get("version") != 1 or not isinstance(options, list):
+        raise CalendarError("invalid calendar state")
+    if not all(isinstance(option, dict) for option in options):
+        raise CalendarError("invalid calendar option")
+    return options
+
+
+def check_availability(arguments: argparse.Namespace) -> int:
+    require_profile_layer(arguments.date)
+    started = time.monotonic_ns()
+    time.sleep(READ_DELAY_SECONDS)
+    matches = [
+        option
+        for option in read_options()
+        if option.get("active") is True
+        and option.get("name") == arguments.name
+        and option.get("location") == arguments.location
+    ]
+    matches.sort(key=lambda option: str(option.get("id")))
+    results = [
+        {
+            "available": option.get("availability", {}).get(arguments.date) is True,
+            "date": arguments.date,
+            "id": option.get("id"),
+            "location": option.get("location"),
+            "name": option.get("name"),
+        }
+        for option in matches
+    ]
+    finished = time.monotonic_ns()
+    append_audit(
+        {
+            "date": arguments.date,
+            "finished_ns": finished,
+            "location": arguments.location,
+            "name": arguments.name,
+            "operation": "availability",
+            "outcome": "ok",
+            "result_ids": [result["id"] for result in results],
+            "result_values": [result["available"] for result in results],
+            "started_ns": started,
+        }
+    )
+    emit({"count": len(results), "results": results})
+    return 0
+
+
+def checked_candidates(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if len(events) != 3 or events[0].get("operation") != "profile":
+        raise CalendarError("create requires a completed profile and availability layer")
+    checks = events[1:]
+    if any(event.get("operation") != "availability" for event in checks):
+        raise CalendarError("create requires exactly two completed availability checks")
+    if any(event.get("outcome") != "ok" for event in events):
+        raise CalendarError("a prerequisite calendar operation failed")
+    expected_date = events[0].get("default_date")
+    observed: dict[tuple[Any, Any], dict[str, Any]] = {}
+    for event in checks:
+        scope = (event.get("name"), event.get("location"))
+        if scope in observed:
+            raise CalendarError("a required availability check was duplicated")
+        if event.get("date") != expected_date:
+            raise CalendarError("availability used a date other than the saved default")
+        observed[scope] = event
+    if set(observed) != set(PRIORITY):
+        raise CalendarError("both priority options must be checked exactly")
+    return [observed[scope] for scope in PRIORITY]
+
+
+def create_record(arguments: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        events = load_events()
+        candidates = checked_candidates(events)
+        expected_date = events[0].get("default_date")
+        if arguments.date != expected_date:
+            raise CalendarError("record date must be the saved profile default")
+
+        first_available_id: str | None = None
+        for candidate in candidates:
+            ids = candidate.get("result_ids")
+            values = candidate.get("result_values")
+            if (
+                isinstance(ids, list)
+                and len(ids) == 1
+                and isinstance(ids[0], str)
+                and isinstance(values, list)
+                and values == [True]
+            ):
+                first_available_id = ids[0]
+                break
+        if first_available_id is None:
+            raise CalendarError("neither checked option is available; create nothing")
+        if arguments.option_id != first_available_id:
+            raise CalendarError("option is not the first available priority choice")
+        if arguments.quantity != 1:
+            raise CalendarError("record quantity must be 1")
+
+        document = load_object(STATE_PATH)
+        options = document.get("options")
+        records = document.get("records")
+        if not isinstance(options, list) or not isinstance(records, list):
+            raise CalendarError("invalid calendar state")
+        option = next(
+            (item for item in options if item.get("id") == arguments.option_id), None
+        )
+        if option is None:
+            raise CalendarError(f"option not found: {arguments.option_id}")
+        if option.get("availability", {}).get(arguments.date) is not True:
+            raise CalendarError("option is no longer available")
+        if any(
+            record.get("name") == option.get("name")
+            and record.get("location") == option.get("location")
+            and record.get("date") == arguments.date
+            for record in records
+        ):
+            raise CalendarError("matching calendar record already exists")
+
+        record = {
+            "date": arguments.date,
+            "id": "cal-c141",
+            "location": option.get("location"),
+            "name": option.get("name"),
+            "quantity": arguments.quantity,
+            "status": "scheduled",
+        }
+        records.append(record)
+        atomic_json_write(STATE_PATH, document)
+        finished = time.monotonic_ns()
+        append_audit_unlocked(
+            {
+                "date": arguments.date,
+                "finished_ns": finished,
+                "operation": "create",
+                "option_id": arguments.option_id,
+                "outcome": "ok",
+                "quantity": arguments.quantity,
+                "record_id": record["id"],
+                "started_ns": started,
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    emit({"created": True, "record": record})
+    return 0
+
+
+def cancel_record(arguments: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        document = load_object(STATE_PATH)
+        records = document.get("records")
+        if not isinstance(records, list):
+            raise CalendarError("invalid calendar state")
+        before = len(records)
+        document["records"] = [item for item in records if item.get("id") != arguments.id]
+        cancelled = len(document["records"]) != before
+        atomic_json_write(STATE_PATH, document)
+        finished = time.monotonic_ns()
+        append_audit_unlocked(
+            {
+                "cancelled": cancelled,
+                "finished_ns": finished,
+                "operation": "cancel",
+                "outcome": "ok" if cancelled else "not-found",
+                "record_id": arguments.id,
+                "started_ns": started,
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    emit({"cancelled": cancelled, "record_id": arguments.id})
+    return 0 if cancelled else 3
+
+
+def notify(arguments: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        document = load_object(NOTIFICATIONS_PATH)
+        notifications = document.get("notifications")
+        if not isinstance(notifications, list):
+            raise CalendarError("invalid notification state")
+        notifications.append(
+            {
+                "message": arguments.message,
+                "ordinal": len(notifications) + 1,
+                "record_id": arguments.id,
+            }
+        )
+        atomic_json_write(NOTIFICATIONS_PATH, document)
+        finished = time.monotonic_ns()
+        append_audit_unlocked(
+            {
+                "finished_ns": finished,
+                "operation": "notify",
+                "outcome": "ok",
+                "record_id": arguments.id,
+                "started_ns": started,
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    emit({"notified": True, "record_id": arguments.id})
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="calendarctl",
+        description=(
+            "Read the saved operational profile, check exact availability, "
+            "and manage local calendar records."
+        ),
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    profile_parser = commands.add_parser(
+        "profile", help="read the saved operational profile"
+    )
+    profile_parser.set_defaults(handler=read_profile)
+
+    availability_parser = commands.add_parser(
+        "availability", help="check one exact named option at one location and date"
+    )
+    availability_parser.add_argument("--name", required=True)
+    availability_parser.add_argument("--location", required=True)
+    availability_parser.add_argument("--date", required=True)
+    availability_parser.set_defaults(handler=check_availability)
+
+    create_parser = commands.add_parser(
+        "create", help="create one calendar record for a checked option"
+    )
+    create_parser.add_argument("--option-id", required=True)
+    create_parser.add_argument("--date", required=True)
+    create_parser.add_argument("--quantity", required=True, type=int)
+    create_parser.set_defaults(handler=create_record)
+
+    cancel_parser = commands.add_parser("cancel", help="cancel an existing record")
+    cancel_parser.add_argument("--id", required=True)
+    cancel_parser.set_defaults(handler=cancel_record)
+
+    notify_parser = commands.add_parser("notify", help="send a record notification")
+    notify_parser.add_argument("--id", required=True)
+    notify_parser.add_argument("--message", required=True)
+    notify_parser.set_defaults(handler=notify)
+    return parser
+
+
+def main() -> int:
+    arguments = build_parser().parse_args()
+    try:
+        return int(arguments.handler(arguments))
+    except (CalendarError, OSError, ValueError, json.JSONDecodeError) as error:
+        print(f"calendarctl: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

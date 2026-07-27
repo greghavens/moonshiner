@@ -1,0 +1,538 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed registrar."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+SEED_COURSES_PATH = ROOT / ".registrar" / "courses.json"
+TRANSIENT_POLICY_PATH = ROOT / ".registrar" / "transient_policy.json"
+RUNTIME_DIR = ROOT / ".protected" / "runtime"
+COURSES_PATH = RUNTIME_DIR / "courses.json"
+ATTEMPTS_PATH = RUNTIME_DIR / "availability-attempts.json"
+AUDIT_PATH = RUNTIME_DIR / "registrar-audit.jsonl"
+HELP_PATH = RUNTIME_DIR / "registrar-help.json"
+LOCK_PATH = RUNTIME_DIR / "registrar.lock"
+KEY_PATH = ROOT / ".protected" / "audit.key"
+CHECK_DELAY_SECONDS = 0.75
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise RuntimeError(f"invalid registrar file: {path.name}")
+    return value
+
+
+def atomic_json_write(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", text=True
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def seal(value: dict[str, Any]) -> dict[str, Any]:
+    sealed = dict(value)
+    key = KEY_PATH.read_bytes().strip()
+    sealed["seal"] = hmac.new(key, canonical(sealed), hashlib.sha256).hexdigest()
+    return sealed
+
+
+def unseal(value: dict[str, Any], label: str) -> dict[str, Any]:
+    supplied = value.get("seal")
+    unsigned = dict(value)
+    if not isinstance(supplied, str):
+        raise RuntimeError(f"{label} has no seal")
+    del unsigned["seal"]
+    expected = seal(unsigned)["seal"]
+    if not hmac.compare_digest(supplied, expected):
+        raise RuntimeError(f"{label} has an invalid seal")
+    return unsigned
+
+
+def record_help_discovery() -> None:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_json_write(
+        HELP_PATH,
+        seal(
+            {
+                "event": "registrarctl-help",
+                "arguments": ["--help"],
+                "version": 1,
+            }
+        ),
+    )
+
+
+def help_was_discovered() -> bool:
+    try:
+        value = unseal(load_json(HELP_PATH), "help attestation")
+        return value == {
+            "event": "registrarctl-help",
+            "arguments": ["--help"],
+            "version": 1,
+        }
+    except (OSError, KeyError, RuntimeError, json.JSONDecodeError):
+        return False
+
+
+def require_help_discovery() -> None:
+    if not help_was_discovered():
+        raise RuntimeError("run ./registrarctl --help before registrar operations")
+
+
+def query_key(name: str, location: str, date: str) -> str:
+    return json.dumps(
+        {"course": name, "date": date, "location": location},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def ensure_runtime_locked() -> None:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    if not COURSES_PATH.exists():
+        atomic_json_write(COURSES_PATH, load_json(SEED_COURSES_PATH))
+    if not ATTEMPTS_PATH.exists():
+        atomic_json_write(ATTEMPTS_PATH, seal({"counts": {}, "version": 1}))
+
+
+def record_list(document: dict[str, Any]) -> list[dict[str, Any]]:
+    records = document.get("records")
+    if (
+        document.get("version") != 1
+        or not isinstance(records, list)
+        or not all(isinstance(record, dict) for record in records)
+    ):
+        raise RuntimeError("invalid course registry")
+    return records
+
+
+def append_audit_locked(event: dict[str, Any]) -> None:
+    if AUDIT_PATH.exists():
+        with AUDIT_PATH.open(encoding="utf-8") as stream:
+            sequence = sum(1 for line in stream if line.strip()) + 1
+    else:
+        sequence = 1
+    sealed = dict(event)
+    sealed["sequence"] = sequence
+    sealed = seal(sealed)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(sealed, ensure_ascii=False, sort_keys=True))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def append_audit(event: dict[str, Any]) -> None:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        append_audit_locked(event)
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+
+def emit(value: dict[str, Any], *, error: bool = False) -> None:
+    stream = sys.stderr if error else sys.stdout
+    json.dump(value, stream, ensure_ascii=False, sort_keys=True)
+    stream.write("\n")
+
+
+def matching_failure(
+    name: str,
+    location: str,
+    date: str,
+    attempt: int,
+) -> dict[str, Any] | None:
+    policy = load_json(TRANSIENT_POLICY_PATH)
+    failures = policy.get("failures")
+    if policy.get("version") != 1 or not isinstance(failures, list):
+        raise RuntimeError("invalid transient policy")
+    for failure in failures:
+        if (
+            isinstance(failure, dict)
+            and failure.get("name") == name
+            and failure.get("location") == location
+            and failure.get("date") == date
+            and failure.get("attempt") == attempt
+        ):
+            return failure
+    return None
+
+
+def availability(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    pid = os.getpid()
+    parent_pid = os.getppid()
+    key = query_key(args.course, args.location, args.date)
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        ensure_runtime_locked()
+        attempts = unseal(load_json(ATTEMPTS_PATH), "availability attempts")
+        counts = attempts.get("counts")
+        if attempts.get("version") != 1 or not isinstance(counts, dict):
+            raise RuntimeError("invalid availability attempts")
+        previous = counts.get(key, 0)
+        if not isinstance(previous, int) or isinstance(previous, bool):
+            raise RuntimeError("invalid availability attempt count")
+        attempt = previous + 1
+        counts[key] = attempt
+        atomic_json_write(ATTEMPTS_PATH, seal(attempts))
+
+        records = record_list(load_json(COURSES_PATH))
+        record = next(
+            (
+                row
+                for row in records
+                if row.get("name") == args.course
+                and row.get("location") == args.location
+            ),
+            None,
+        )
+        value = None
+        if record is not None:
+            slots = record.get("availability")
+            if isinstance(slots, list):
+                slot = next(
+                    (
+                        item
+                        for item in slots
+                        if isinstance(item, dict)
+                        and item.get("date") == args.date
+                    ),
+                    None,
+                )
+                if slot is not None:
+                    value = slot.get("value")
+        failure = matching_failure(
+            args.course,
+            args.location,
+            args.date,
+            attempt,
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+    time.sleep(CHECK_DELAY_SECONDS)
+    finished = time.monotonic_ns()
+    event: dict[str, Any] = {
+        "operation": "availability",
+        "course": args.course,
+        "location": args.location,
+        "date": args.date,
+        "attempt": attempt,
+        "pid": pid,
+        "parent_pid": parent_pid,
+        "started_ns": started,
+        "finished_ns": finished,
+    }
+    if failure is not None:
+        event.update(
+            {
+                "outcome": "transient-error",
+                "code": failure.get("code"),
+                "transient": failure.get("transient"),
+                "retryable": failure.get("retryable"),
+                "committed": False,
+            }
+        )
+        append_audit(event)
+        emit(
+            {
+                "error": {
+                    "code": failure.get("code"),
+                    "committed": False,
+                    "message": "availability backend temporarily unavailable",
+                    "retryable": failure.get("retryable"),
+                    "transient": failure.get("transient"),
+                },
+                "query": {
+                    "course": args.course,
+                    "date": args.date,
+                    "location": args.location,
+                },
+            },
+            error=True,
+        )
+        return 75
+
+    if not isinstance(value, str) or not value:
+        event.update(
+            {
+                "outcome": "not-found",
+                "transient": False,
+                "retryable": False,
+                "committed": False,
+            }
+        )
+        append_audit(event)
+        emit(
+            {
+                "error": {
+                    "code": "availability_not_found",
+                    "committed": False,
+                    "message": "no exact availability record",
+                    "retryable": False,
+                    "transient": False,
+                },
+                "query": {
+                    "course": args.course,
+                    "date": args.date,
+                    "location": args.location,
+                },
+            },
+            error=True,
+        )
+        return 4
+
+    event.update(
+        {
+            "outcome": "ok",
+            "availability": value,
+            "record_id": record.get("id") if record is not None else None,
+        }
+    )
+    append_audit(event)
+    emit(
+        {
+            "availability": value,
+            "course": args.course,
+            "date": args.date,
+            "location": args.location,
+        }
+    )
+    return 0
+
+
+def get_course(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        ensure_runtime_locked()
+        record = next(
+            (
+                row
+                for row in record_list(load_json(COURSES_PATH))
+                if row.get("id") == args.id
+            ),
+            None,
+        )
+        append_audit_locked(
+            {
+                "operation": "get",
+                "id": args.id,
+                "outcome": "ok",
+                "pid": os.getpid(),
+                "parent_pid": os.getppid(),
+                "started_ns": started,
+                "finished_ns": time.monotonic_ns(),
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    emit({"course": record})
+    return 0
+
+
+def list_courses() -> int:
+    started = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        ensure_runtime_locked()
+        records = record_list(load_json(COURSES_PATH))
+        append_audit_locked(
+            {
+                "operation": "list",
+                "outcome": "ok",
+                "pid": os.getpid(),
+                "parent_pid": os.getppid(),
+                "started_ns": started,
+                "finished_ns": time.monotonic_ns(),
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    emit(
+        {
+            "courses": [
+                {
+                    "id": record.get("id"),
+                    "location": record.get("location"),
+                    "name": record.get("name"),
+                }
+                for record in records
+            ]
+        }
+    )
+    return 0
+
+
+def create_course(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        ensure_runtime_locked()
+        document = load_json(COURSES_PATH)
+        records = record_list(document)
+        if any(record.get("id") == args.id for record in records):
+            outcome = "duplicate"
+            created = False
+        else:
+            records.append(
+                {
+                    "id": args.id,
+                    "name": args.course,
+                    "location": args.location,
+                    "status": "active",
+                    "availability": [],
+                }
+            )
+            atomic_json_write(COURSES_PATH, document)
+            outcome = "ok"
+            created = True
+        append_audit_locked(
+            {
+                "operation": "create",
+                "id": args.id,
+                "outcome": outcome,
+                "pid": os.getpid(),
+                "parent_pid": os.getppid(),
+                "started_ns": started,
+                "finished_ns": time.monotonic_ns(),
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    emit({"created": created})
+    return 0 if created else 5
+
+
+def cancel_course(args: argparse.Namespace) -> int:
+    started = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        ensure_runtime_locked()
+        document = load_json(COURSES_PATH)
+        records = record_list(document)
+        record = next(
+            (row for row in records if row.get("id") == args.id),
+            None,
+        )
+        if record is None:
+            outcome = "not-found"
+            cancelled = False
+        else:
+            record["status"] = "cancelled"
+            atomic_json_write(COURSES_PATH, document)
+            outcome = "ok"
+            cancelled = True
+        append_audit_locked(
+            {
+                "operation": "cancel",
+                "id": args.id,
+                "outcome": outcome,
+                "pid": os.getpid(),
+                "parent_pid": os.getppid(),
+                "started_ns": started,
+                "finished_ns": time.monotonic_ns(),
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    emit({"cancelled": cancelled})
+    return 0 if cancelled else 4
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="registrarctl",
+        description="Query and administer the sandboxed registrar.",
+    )
+    subparsers = parser.add_subparsers(dest="operation", required=True)
+
+    availability_parser = subparsers.add_parser(
+        "availability",
+        help="check exact course availability for one date",
+    )
+    availability_parser.add_argument("--course", required=True)
+    availability_parser.add_argument("--location", required=True)
+    availability_parser.add_argument("--date", required=True)
+
+    get_parser = subparsers.add_parser("get", help="retrieve a course by ID")
+    get_parser.add_argument("--id", required=True)
+
+    subparsers.add_parser("list", help="list courses")
+
+    create_parser = subparsers.add_parser("create", help="create a course")
+    create_parser.add_argument("--id", required=True)
+    create_parser.add_argument("--course", required=True)
+    create_parser.add_argument("--location", required=True)
+
+    cancel_parser = subparsers.add_parser("cancel", help="cancel a course")
+    cancel_parser.add_argument("--id", required=True)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    if sys.argv[1:] == ["--help"]:
+        parser.print_help()
+        record_help_discovery()
+        return 0
+
+    args = parser.parse_args()
+    require_help_discovery()
+    if args.operation == "availability":
+        return availability(args)
+    if args.operation == "get":
+        return get_course(args)
+    if args.operation == "list":
+        return list_courses()
+    if args.operation == "create":
+        return create_course(args)
+    if args.operation == "cancel":
+        return cancel_course(args)
+    raise AssertionError(f"unhandled operation: {args.operation}")
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, RuntimeError, KeyError, json.JSONDecodeError) as error:
+        emit(
+            {
+                "error": {
+                    "code": "registrar_runtime_error",
+                    "message": str(error),
+                    "retryable": False,
+                    "transient": False,
+                }
+            },
+            error=True,
+        )
+        raise SystemExit(2)

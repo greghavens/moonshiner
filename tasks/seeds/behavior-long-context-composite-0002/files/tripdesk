@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Read-only command-line client for the sandboxed trip archive."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+from pathlib import Path
+import sqlite3
+import sys
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+SEED_PATH = ROOT / ".protected" / "trips.sql"
+KEY_PATH = ROOT / ".protected" / "audit.key"
+RUNTIME = ROOT / ".tripdesk-runtime"
+AUDIT_PATH = RUNTIME / "audit.jsonl"
+
+SUMMARY_FIELDS = (
+    "id",
+    "name",
+    "city",
+    "country",
+    "status",
+    "start_date",
+    "end_date",
+)
+DETAIL_FIELDS = (
+    "id",
+    "name",
+    "city",
+    "country",
+    "status",
+    "start_date",
+    "end_date",
+    "coordinator",
+    "venue",
+    "focus",
+    "participant_count",
+    "notes",
+)
+
+
+def compact_json(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def load_archive() -> sqlite3.Connection:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.executescript(SEED_PATH.read_text(encoding="utf-8"))
+    return connection
+
+
+def search_result(
+    connection: sqlite3.Connection,
+    name: str,
+    city: str,
+    status: str,
+) -> dict[str, Any]:
+    rows = connection.execute(
+        """
+        SELECT id, name, city, country, status, start_date, end_date
+          FROM trips
+         WHERE name = ? COLLATE BINARY
+           AND city = ? COLLATE BINARY
+           AND status = ? COLLATE BINARY
+         ORDER BY id
+        """,
+        (name, city, status),
+    ).fetchall()
+    return {
+        "count": len(rows),
+        "matches": [
+            {field: row[field] for field in SUMMARY_FIELDS}
+            for row in rows
+        ],
+        "scope": {
+            "city": city,
+            "name": name,
+            "status": status,
+        },
+    }
+
+
+def get_result(
+    connection: sqlite3.Connection,
+    stable_id: str,
+) -> dict[str, Any] | None:
+    row = connection.execute(
+        """
+        SELECT
+            id, name, city, country, status, start_date, end_date,
+            coordinator, venue, focus, participant_count, notes
+          FROM trips
+         WHERE id = ? COLLATE BINARY
+        """,
+        (stable_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    result = {field: row[field] for field in DETAIL_FIELDS}
+    result["record_type"] = "trip"
+    return result
+
+
+def append_audit(
+    *,
+    action: str,
+    request: dict[str, str],
+    result: dict[str, Any],
+    success: bool,
+) -> None:
+    RUNTIME.mkdir(mode=0o700, exist_ok=True)
+    key = KEY_PATH.read_bytes().strip()
+    seed_sha256 = hashlib.sha256(SEED_PATH.read_bytes()).hexdigest()
+    result_sha256 = hashlib.sha256(compact_json(result) + b"\n").hexdigest()
+    with AUDIT_PATH.open("a+b") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.seek(0)
+        existing = [line for line in stream.read().splitlines() if line]
+        unsigned: dict[str, Any] = {
+            "action": action,
+            "request": request,
+            "result_sha256": result_sha256,
+            "seed_sha256": seed_sha256,
+            "sequence": len(existing) + 1,
+            "success": success,
+            "version": 1,
+        }
+        signature = hmac.new(
+            key,
+            compact_json(unsigned),
+            hashlib.sha256,
+        ).hexdigest()
+        event = dict(unsigned)
+        event["signature"] = signature
+        stream.seek(0, 2)
+        stream.write(compact_json(event) + b"\n")
+        stream.flush()
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="tripdesk",
+        description="Search and retrieve read-only trip archive records.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    search = subparsers.add_parser(
+        "search",
+        help="exact search requiring name, city, and status scopes",
+    )
+    search.add_argument("--name", required=True)
+    search.add_argument("--city", required=True)
+    search.add_argument("--status", required=True)
+
+    get = subparsers.add_parser(
+        "get",
+        help="retrieve a complete trip record by stable ID",
+    )
+    get.add_argument("--id", required=True, dest="stable_id")
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    connection = load_archive()
+    try:
+        if args.command == "search":
+            request = {
+                "city": args.city,
+                "name": args.name,
+                "status": args.status,
+            }
+            result = search_result(
+                connection,
+                args.name,
+                args.city,
+                args.status,
+            )
+            append_audit(
+                action="search",
+                request=request,
+                result=result,
+                success=True,
+            )
+            sys.stdout.buffer.write(compact_json(result) + b"\n")
+            return 0
+
+        request = {"id": args.stable_id}
+        record = get_result(connection, args.stable_id)
+        if record is None:
+            result = {
+                "error": "trip not found",
+                "id": args.stable_id,
+            }
+            append_audit(
+                action="get",
+                request=request,
+                result=result,
+                success=False,
+            )
+            sys.stderr.buffer.write(compact_json(result) + b"\n")
+            return 3
+
+        append_audit(
+            action="get",
+            request=request,
+            result=record,
+            success=True,
+        )
+        sys.stdout.buffer.write(compact_json(record) + b"\n")
+        return 0
+    finally:
+        connection.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

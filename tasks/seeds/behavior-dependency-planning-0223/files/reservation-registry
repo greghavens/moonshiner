@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed reservation registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import time
+import uuid
+from typing import Any, Callable
+
+
+ROOT = Path(__file__).resolve().parent
+STATE_DIR = ROOT / ".reservation"
+RESERVATIONS_PATH = STATE_DIR / "reservations.json"
+NOTIFICATIONS_PATH = STATE_DIR / "notifications.json"
+LOCK_PATH = STATE_DIR / "lock"
+AUDIT_PATH = ROOT / ".protected" / "runtime" / "reservation-audit.jsonl"
+KEY_PATH = ROOT / ".protected" / "audit.key"
+OPERATION_DELAY_SECONDS = 0.55
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def load_document(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise RuntimeError(f"invalid data document: {path.name}")
+    return value
+
+
+def load_reservations() -> list[dict[str, Any]]:
+    document = load_document(RESERVATIONS_PATH)
+    reservations = document.get("reservations")
+    if document.get("version") != 1 or not isinstance(reservations, list):
+        raise RuntimeError("invalid reservation store")
+    if not all(isinstance(record, dict) for record in reservations):
+        raise RuntimeError("invalid reservation record")
+    return reservations
+
+
+def atomic_write(path: Path, value: dict[str, Any]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(value, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def process_start_ticks(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        return raw.rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return "unavailable"
+
+
+def append_audit(event: dict[str, Any]) -> None:
+    key = KEY_PATH.read_bytes().rstrip(b"\n")
+    sealed = dict(event)
+    sealed["signature"] = hmac.new(key, canonical(sealed), hashlib.sha256).hexdigest()
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        with AUDIT_PATH.open("a", encoding="utf-8") as audit_stream:
+            audit_stream.write(json.dumps(sealed, ensure_ascii=False, sort_keys=True))
+            audit_stream.write("\n")
+            audit_stream.flush()
+            os.fsync(audit_stream.fileno())
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+
+def load_verified_audit() -> list[dict[str, Any]]:
+    if not AUDIT_PATH.is_file():
+        return []
+    key = KEY_PATH.read_bytes().rstrip(b"\n")
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_SH)
+        lines = AUDIT_PATH.read_text(encoding="utf-8").splitlines()
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    events: list[dict[str, Any]] = []
+    for raw in lines:
+        sealed = json.loads(raw)
+        if not isinstance(sealed, dict):
+            raise RuntimeError("invalid execution evidence")
+        event = dict(sealed)
+        signature = event.pop("signature", None)
+        expected = hmac.new(key, canonical(event), hashlib.sha256).hexdigest()
+        if not isinstance(signature, str) or not hmac.compare_digest(signature, expected):
+            raise RuntimeError("invalid execution evidence")
+        events.append(event)
+    return events
+
+
+def record_digest(record: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical(record)).hexdigest()
+
+
+def exact_record(stable_id: str) -> dict[str, Any]:
+    matches = [row for row in load_reservations() if row.get("id") == stable_id]
+    if len(matches) != 1:
+        raise LookupError(f"reservation not found: {stable_id}")
+    return matches[0]
+
+
+def authorized_search_ids() -> set[str]:
+    authorized: set[str] = set()
+    for event in load_verified_audit():
+        result_ids = event.get("result_ids")
+        if (
+            event.get("operation") == "search"
+            and event.get("success") is True
+            and event.get("exact") is True
+            and event.get("result_count") == 1
+            and isinstance(result_ids, list)
+            and len(result_ids) == 1
+            and isinstance(result_ids[0], str)
+            and result_ids[0]
+        ):
+            authorized.add(result_ids[0])
+    return authorized
+
+
+def execute_search(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
+    matches = [
+        {"id": row["id"], "name": row["name"], "city": row["city"]}
+        for row in load_reservations()
+        if row.get("name") == args.name and row.get("city") == args.city
+    ]
+    matches.sort(key=lambda row: row["id"])
+    return {"count": len(matches), "matches": matches}, {
+        "name": args.name,
+        "city": args.city,
+        "exact": True,
+        "result_count": len(matches),
+        "result_ids": [row["id"] for row in matches],
+    }
+
+
+def execute_get(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
+    authorized = authorized_search_ids()
+    if len(authorized) < 2 or args.id not in authorized:
+        raise RuntimeError(
+            "retrieval requires IDs from two completed unique exact searches"
+        )
+    record = exact_record(args.id)
+    return {"record": record}, {
+        "stable_id": args.id,
+        "found": True,
+        "field_count": len(record),
+        "record_sha256": record_digest(record),
+        "status": record.get("status"),
+        "date": record.get("date"),
+    }
+
+
+def execute_update(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        document = load_document(RESERVATIONS_PATH)
+        reservations = document.get("reservations")
+        if not isinstance(reservations, list):
+            raise RuntimeError("invalid reservation store")
+        matches = [row for row in reservations if row.get("id") == args.id]
+        if len(matches) != 1:
+            raise LookupError(f"reservation not found: {args.id}")
+        record = matches[0]
+        before = record.get("status")
+        record["status"] = args.status
+        atomic_write(RESERVATIONS_PATH, document)
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    return {"before_status": before, "record": record, "updated": True}, {
+        "stable_id": args.id,
+        "before_status": before,
+        "after_status": args.status,
+        "updated": True,
+    }
+
+
+def execute_cancel(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
+    args.status = "cancelled"
+    output, details = execute_update(args)
+    output["cancelled"] = True
+    return output, details
+
+
+def execute_notify(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
+    exact_record(args.id)
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        document = load_document(NOTIFICATIONS_PATH)
+        notifications = document.get("notifications")
+        if not isinstance(notifications, list):
+            raise RuntimeError("invalid notification store")
+        notice = {
+            "reservation_id": args.id,
+            "message": args.message,
+            "ordinal": len(notifications) + 1,
+        }
+        notifications.append(notice)
+        atomic_write(NOTIFICATIONS_PATH, document)
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    return {"notification": notice, "notified": True}, {
+        "stable_id": args.id,
+        "notified": True,
+    }
+
+
+def run_operation(
+    operation: str,
+    handler: Callable[[argparse.Namespace], tuple[dict[str, Any], dict[str, Any]]],
+    args: argparse.Namespace,
+) -> int:
+    started_ns = time.monotonic_ns()
+    parent_pid = os.getppid()
+    details: dict[str, Any] = {}
+    output: dict[str, Any] | None = None
+    error: str | None = None
+    success = False
+    try:
+        output, details = handler(args)
+        success = True
+    except (OSError, RuntimeError, LookupError, ValueError, json.JSONDecodeError) as exc:
+        error = str(exc)
+
+    time.sleep(OPERATION_DELAY_SECONDS)
+    finished_ns = time.monotonic_ns()
+    event: dict[str, Any] = {
+        "event_id": str(uuid.uuid4()),
+        "operation": operation,
+        "started_ns": started_ns,
+        "finished_ns": finished_ns,
+        "process_pid": os.getpid(),
+        "process_start_ticks": process_start_ticks(os.getpid()),
+        "process_group_id": os.getpgrp(),
+        "session_id": os.getsid(0),
+        "parent_pid": parent_pid,
+        "parent_start_ticks": process_start_ticks(parent_pid),
+        "success": success,
+        **details,
+    }
+    if error is not None:
+        event["error"] = error
+    append_audit(event)
+
+    if success and output is not None:
+        print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+        return 0
+    print(json.dumps({"error": error or "operation failed"}), file=sys.stderr)
+    return 2
+
+
+def run_help(parser: argparse.ArgumentParser) -> int:
+    started_ns = time.monotonic_ns()
+    parent_pid = os.getppid()
+    parser.print_help()
+    finished_ns = time.monotonic_ns()
+    append_audit(
+        {
+            "event_id": str(uuid.uuid4()),
+            "operation": "help",
+            "started_ns": started_ns,
+            "finished_ns": finished_ns,
+            "process_pid": os.getpid(),
+            "process_start_ticks": process_start_ticks(os.getpid()),
+            "process_group_id": os.getpgrp(),
+            "session_id": os.getsid(0),
+            "parent_pid": parent_pid,
+            "parent_start_ticks": process_start_ticks(parent_pid),
+            "success": True,
+        }
+    )
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="reservation-registry",
+        description="Search, retrieve, update, cancel, and notify reservation records.",
+    )
+    commands = parser.add_subparsers(dest="operation", required=True)
+
+    search = commands.add_parser("search", help="exact name-and-city search")
+    search.add_argument("--name", required=True)
+    search.add_argument("--city", required=True)
+    search.set_defaults(handler=execute_search)
+
+    get = commands.add_parser("get", help="retrieve one complete reservation")
+    get.add_argument("--id", required=True)
+    get.set_defaults(handler=execute_get)
+
+    update = commands.add_parser("update", help="change a reservation status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+    update.set_defaults(handler=execute_update)
+
+    cancel = commands.add_parser("cancel", help="cancel a reservation")
+    cancel.add_argument("--id", required=True)
+    cancel.set_defaults(handler=execute_cancel)
+
+    notify = commands.add_parser("notify", help="send a reservation notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+    notify.set_defaults(handler=execute_notify)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    if sys.argv[1:] in (["-h"], ["--help"]):
+        return run_help(parser)
+    args = parser.parse_args()
+    return run_operation(args.operation, args.handler, args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

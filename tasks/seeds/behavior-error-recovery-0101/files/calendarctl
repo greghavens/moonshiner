@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed calendar service."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import sys
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+CANONICAL_STATE = ROOT / "data" / "calendar.json"
+RUNTIME_DIR = ROOT / ".calendar-runtime"
+RUNTIME_STATE = RUNTIME_DIR / "state.json"
+LOCK_PATH = RUNTIME_DIR / "calendar.lock"
+AUDIT_PATH = ROOT / "audit.log"
+
+
+class ResponseDeadlineExceeded(TimeoutError):
+    """Raised when the local client loses a response after dispatch."""
+
+
+class AuditedArgumentParser(argparse.ArgumentParser):
+    """Record use of the executable's built-in help interface."""
+
+    def print_help(self, file: Any = None) -> None:
+        append_event({"operation": "help"})
+        super().print_help(file)
+
+
+def compact(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def emit(value: object) -> None:
+    print(compact(value))
+
+
+def digest(value: object) -> str:
+    return hashlib.sha256(compact(value).encode("utf-8")).hexdigest()
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"{path.name} must contain a JSON object")
+    return value
+
+
+def active_state() -> dict[str, Any]:
+    path = RUNTIME_STATE if RUNTIME_STATE.is_file() else CANONICAL_STATE
+    return read_json(path)
+
+
+def writable_state() -> dict[str, Any]:
+    RUNTIME_DIR.mkdir(exist_ok=True)
+    if not RUNTIME_STATE.exists():
+        shutil.copy2(CANONICAL_STATE, RUNTIME_STATE)
+    return read_json(RUNTIME_STATE)
+
+
+def save_state(state: dict[str, Any]) -> None:
+    temporary = RUNTIME_DIR / f".state-{os.getpid()}.tmp"
+    temporary.write_text(
+        json.dumps(state, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, RUNTIME_STATE)
+
+
+def append_event(event: dict[str, Any]) -> None:
+    with AUDIT_PATH.open("a+", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.seek(0)
+        sequence = sum(1 for line in stream if line.strip()) + 1
+        event = {"seq": sequence, **event}
+        stream.seek(0, os.SEEK_END)
+        stream.write(compact(event) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def response_deadline_expires() -> bool:
+    """Exercise a real process deadline after the durable service commit."""
+
+    def expire(_signum: int, _frame: object) -> None:
+        raise ResponseDeadlineExceeded("response deadline exceeded")
+
+    previous = signal.signal(signal.SIGALRM, expire)
+    signal.setitimer(signal.ITIMER_REAL, 0.03)
+    try:
+        time.sleep(0.15)
+    except ResponseDeadlineExceeded:
+        return True
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+    return False
+
+
+def get_record(stable_id: str) -> int:
+    state = active_state()
+    record = state.get("meetings", {}).get(stable_id)
+    append_event({
+        "found": isinstance(record, dict),
+        "observed_status": record.get("status") if isinstance(record, dict) else None,
+        "operation": "get",
+        "record_digest": digest(record) if isinstance(record, dict) else None,
+        "stable_id": stable_id,
+    })
+    if not isinstance(record, dict):
+        print(f"calendarctl: no meeting with stable ID {stable_id}", file=sys.stderr)
+        return 2
+    emit({"record": record})
+    return 0
+
+
+def cancel_record(stable_id: str, reason: str) -> int:
+    RUNTIME_DIR.mkdir(exist_ok=True)
+    with LOCK_PATH.open("r+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        state = writable_state()
+        record = state.get("meetings", {}).get(stable_id)
+        if not isinstance(record, dict):
+            append_event({
+                "committed": False,
+                "operation": "cancel",
+                "outcome": "not-found",
+                "reason_digest": digest(reason),
+                "stable_id": stable_id,
+            })
+            print(f"calendarctl: no meeting with stable ID {stable_id}", file=sys.stderr)
+            return 2
+
+        before = record.get("status")
+        record["cancellation_attempts"] = int(record.get("cancellation_attempts", 0)) + 1
+        if before == "active":
+            record["status"] = "cancelled"
+            record["cancellation_reason"] = reason
+
+        transport = state.get("transport")
+        timeout_after_commit = bool(
+            isinstance(transport, dict)
+            and transport.get("first_cancel_response") == "timeout-after-commit"
+            and transport.get("first_cancel_response_consumed") is False
+        )
+        if timeout_after_commit:
+            transport["first_cancel_response_consumed"] = True
+        save_state(state)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    outcome = "completed"
+    if timeout_after_commit and response_deadline_expires():
+        outcome = "response-timeout"
+    append_event({
+        "committed": True,
+        "operation": "cancel",
+        "outcome": outcome,
+        "post_status": record.get("status"),
+        "pre_status": before,
+        "reason_digest": digest(reason),
+        "stable_id": stable_id,
+    })
+    if outcome == "response-timeout":
+        print(
+            "calendarctl: response deadline exceeded after dispatch; outcome unknown",
+            file=sys.stderr,
+        )
+        return 124
+    emit({"record": record})
+    return 0
+
+
+def search_records(name: str) -> int:
+    state = active_state()
+    matches = [
+        {"name": record.get("name"), "stable_id": stable_id}
+        for stable_id, record in sorted(state.get("meetings", {}).items())
+        if isinstance(record, dict) and record.get("name", "").casefold() == name.casefold()
+    ]
+    append_event({
+        "match_count": len(matches),
+        "operation": "search",
+        "query_digest": digest(name),
+    })
+    emit({"matches": matches})
+    return 0
+
+
+def list_records() -> int:
+    state = active_state()
+    meetings = [
+        {"name": record.get("name"), "stable_id": stable_id}
+        for stable_id, record in sorted(state.get("meetings", {}).items())
+        if isinstance(record, dict)
+    ]
+    append_event({"operation": "list", "row_count": len(meetings)})
+    emit({"meetings": meetings})
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    main = AuditedArgumentParser(
+        prog="calendarctl",
+        description=(
+            "Retrieve and manage meetings in the sandboxed local calendar service. "
+            "Exit 124 means the client response deadline expired and the commit "
+            "outcome must be resolved with an exact-ID get."
+        ),
+    )
+    commands = main.add_subparsers(dest="operation", required=True)
+
+    get = commands.add_parser("get", help="retrieve one meeting by exact stable ID")
+    get.add_argument("--id", dest="stable_id", required=True)
+
+    cancel = commands.add_parser("cancel", help="cancel one meeting by exact stable ID")
+    cancel.add_argument("--id", dest="stable_id", required=True)
+    cancel.add_argument("--reason", required=True)
+
+    search = commands.add_parser("search", help="search meetings by exact name")
+    search.add_argument("--name", required=True)
+
+    commands.add_parser("list", help="list meeting snippets")
+    return main
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        if args.operation == "get":
+            return get_record(args.stable_id)
+        if args.operation == "cancel":
+            return cancel_record(args.stable_id, args.reason)
+        if args.operation == "search":
+            return search_records(args.name)
+        if args.operation == "list":
+            return list_records()
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        print(f"calendarctl: {error}", file=sys.stderr)
+        return 1
+    raise AssertionError(f"unhandled operation: {args.operation}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

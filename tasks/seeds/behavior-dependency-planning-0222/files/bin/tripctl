@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""Executable trip-record client used by the Pi dependency-planning seed."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+import sys
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Callable
+
+
+FILES_ROOT = Path(__file__).resolve().parents[1]
+DATA_PATH = FILES_ROOT / "data" / "trips.json"
+RUNTIME_DIR = FILES_ROOT / ".runtime"
+STATE_PATH = RUNTIME_DIR / "workflow.json"
+LOCK_PATH = RUNTIME_DIR / "workflow.lock"
+OUTBOX_PATH = RUNTIME_DIR / "notifications.jsonl"
+KEY_PATH = FILES_ROOT / ".protected" / "audit.key"
+PAIR_WAIT_SECONDS = 20.0
+
+
+class ToolError(RuntimeError):
+    pass
+
+
+def _empty_state() -> dict[str, Any]:
+    return {"version": 1, "invocations": []}
+
+
+def _canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _load_key() -> bytes:
+    return KEY_PATH.read_bytes().strip()
+
+
+def _invocation_mac(invocation: dict[str, Any]) -> str:
+    payload = {key: value for key, value in invocation.items() if key != "mac"}
+    return hmac.new(
+        _load_key(), _canonical(payload).encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+
+
+def _sign_invocation(invocation: dict[str, Any]) -> None:
+    invocation["mac"] = _invocation_mac(invocation)
+
+
+def _validate_state(state: Any) -> None:
+    if not isinstance(state, dict) or state.get("version") != 1:
+        raise ToolError("execution evidence is malformed")
+    invocations = state.get("invocations")
+    if not isinstance(invocations, list):
+        raise ToolError("execution evidence is malformed")
+    for invocation in invocations:
+        if not isinstance(invocation, dict) or not isinstance(
+            invocation.get("mac"), str
+        ):
+            raise ToolError("execution evidence is malformed")
+        if not hmac.compare_digest(invocation["mac"], _invocation_mac(invocation)):
+            raise ToolError("execution evidence failed its integrity check")
+
+
+def _with_state(change: Callable[[dict[str, Any]], Any]) -> Any:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if STATE_PATH.exists():
+            state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        else:
+            state = _empty_state()
+        _validate_state(state)
+        result = change(state)
+        temporary = STATE_PATH.with_suffix(f".{os.getpid()}.tmp")
+        temporary.write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        os.replace(temporary, STATE_PATH)
+        return result
+
+
+def _snapshot() -> dict[str, Any]:
+    return _with_state(lambda state: json.loads(json.dumps(state)))
+
+
+def _load_records() -> list[dict[str, Any]]:
+    return json.loads(DATA_PATH.read_text(encoding="utf-8"))
+
+
+def _store_records(records: list[dict[str, Any]]) -> None:
+    temporary = DATA_PATH.with_suffix(f".{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(records, indent=2, sort_keys=False) + "\n", encoding="utf-8"
+    )
+    os.replace(temporary, DATA_PATH)
+
+
+def _parent_start_ticks(parent_pid: int) -> int:
+    stat_text = Path(f"/proc/{parent_pid}/stat").read_text(encoding="utf-8")
+    fields_after_name = stat_text.rsplit(")", 1)[1].split()
+    return int(fields_after_name[19])
+
+
+def _begin(operation: str, arguments: dict[str, Any]) -> str:
+    token = uuid.uuid4().hex
+    started_ns = time.monotonic_ns()
+    parent_pid = os.getppid()
+
+    def append(state: dict[str, Any]) -> None:
+        invocation = {
+            "token": token,
+            "operation": operation,
+            "arguments": arguments,
+            "pid": os.getpid(),
+            "parent_pid": parent_pid,
+            "parent_start_ticks": _parent_start_ticks(parent_pid),
+            "started_ns": started_ns,
+            "finished_ns": None,
+            "success": None,
+            "result": None,
+        }
+        _sign_invocation(invocation)
+        state["invocations"].append(invocation)
+
+    _with_state(append)
+    return token
+
+
+def _finish(token: str, success: bool, result: Any) -> None:
+    def finish(state: dict[str, Any]) -> None:
+        for invocation in state["invocations"]:
+            if invocation["token"] == token:
+                invocation["finished_ns"] = time.monotonic_ns()
+                invocation["success"] = success
+                invocation["result"] = result
+                _sign_invocation(invocation)
+                return
+        raise ToolError("execution evidence was unexpectedly removed")
+
+    _with_state(finish)
+
+
+def _wait_for_parallel_peer(token: str, operation: str) -> bool:
+    deadline = time.monotonic() + PAIR_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        state = _snapshot()
+        current = next(
+            item for item in state["invocations"] if item["token"] == token
+        )
+        peers = [
+            item
+            for item in state["invocations"]
+            if item["token"] != token
+            and item["operation"] == operation
+            and (
+                item["finished_ns"] is None
+                or item["finished_ns"] >= current["started_ns"]
+            )
+            and item["arguments"] != current["arguments"]
+        ]
+        if peers:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _successful_search_ids() -> set[str]:
+    state = _snapshot()
+    identifiers: set[str] = set()
+    for invocation in state["invocations"]:
+        if invocation["operation"] != "search" or invocation["success"] is not True:
+            continue
+        result = invocation.get("result") or {}
+        if result.get("count") == 1:
+            identifiers.update(result.get("ids", []))
+    return identifiers
+
+
+def command_search(args: argparse.Namespace) -> int:
+    token = _begin("search", {"name": args.name, "city": args.city})
+    if not _wait_for_parallel_peer(token, "search"):
+        message = "search requires a distinct concurrent search invocation"
+        _finish(token, False, {"error": message})
+        raise ToolError(message)
+
+    matches = [
+        record
+        for record in _load_records()
+        if record["name"] == args.name and record["city"] == args.city
+    ]
+    result = {"count": len(matches), "ids": [record["id"] for record in matches]}
+    _finish(token, True, result)
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+def command_get(args: argparse.Namespace) -> int:
+    token = _begin("get", {"id": args.id})
+    searchable = _successful_search_ids()
+    if len(searchable) < 2 or args.id not in searchable:
+        message = "retrieval is unavailable until both unique searches have completed"
+        _finish(token, False, {"error": message})
+        raise ToolError(message)
+
+    if not _wait_for_parallel_peer(token, "get"):
+        message = "retrieval requires a distinct concurrent retrieval invocation"
+        _finish(token, False, {"error": message})
+        raise ToolError(message)
+
+    record = next(
+        (record for record in _load_records() if record["id"] == args.id), None
+    )
+    if record is None:
+        result = {"found": False, "record": None}
+    else:
+        result = {"found": True, "record": record}
+    _finish(token, True, result)
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+def _mutation(operation: str, identifier: str, apply: Callable[[dict[str, Any]], None]) -> int:
+    token = _begin(operation, {"id": identifier})
+    records = _load_records()
+    record = next((item for item in records if item["id"] == identifier), None)
+    if record is None:
+        _finish(token, False, {"error": "record not found"})
+        raise ToolError("record not found")
+    apply(record)
+    _store_records(records)
+    _finish(token, True, {"id": identifier, "changed": True})
+    print(json.dumps({"id": identifier, "changed": True}, sort_keys=True))
+    return 0
+
+
+def command_update_status(args: argparse.Namespace) -> int:
+    return _mutation(
+        "update-status", args.id, lambda record: record.__setitem__("status", args.status)
+    )
+
+
+def command_cancel(args: argparse.Namespace) -> int:
+    return _mutation(
+        "cancel", args.id, lambda record: record.__setitem__("status", "cancelled")
+    )
+
+
+def command_notify(args: argparse.Namespace) -> int:
+    token = _begin("notify", {"id": args.id})
+    records = _load_records()
+    if not any(record["id"] == args.id for record in records):
+        _finish(token, False, {"error": "record not found"})
+        raise ToolError("record not found")
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    with OUTBOX_PATH.open("a", encoding="utf-8") as outbox:
+        outbox.write(json.dumps({"id": args.id, "message": args.message}) + "\n")
+    _finish(token, True, {"id": args.id, "queued": True})
+    print(json.dumps({"id": args.id, "queued": True}, sort_keys=True))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="tripctl", description="Search, retrieve, and administer trip records."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    search = subparsers.add_parser("search", help="search trip records")
+    search.add_argument("--name", required=True, help="exact trip name")
+    search.add_argument("--city", required=True, help="exact city")
+    search.set_defaults(handler=command_search)
+
+    get = subparsers.add_parser("get", help="retrieve one complete record")
+    get.add_argument("--id", required=True, help="record identifier")
+    get.set_defaults(handler=command_get)
+
+    update = subparsers.add_parser("update-status", help="change a record status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+    update.set_defaults(handler=command_update_status)
+
+    cancel = subparsers.add_parser("cancel", help="cancel a record")
+    cancel.add_argument("--id", required=True)
+    cancel.set_defaults(handler=command_cancel)
+
+    notify = subparsers.add_parser("notify", help="queue a traveler notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+    notify.set_defaults(handler=command_notify)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    if sys.argv[1:] in (["--help"], ["-h"]):
+        token = _begin("help", {"arguments": sys.argv[1:]})
+        parser.print_help()
+        _finish(token, True, {"shown": True})
+        return 0
+    args = parser.parse_args()
+    try:
+        return args.handler(args)
+    except (ToolError, json.JSONDecodeError, OSError) as error:
+        print(f"tripctl: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

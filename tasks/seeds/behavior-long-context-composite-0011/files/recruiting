@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""Executable boundary for the sandboxed recruiting database."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import sqlite3
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent
+STATE = ROOT / ".recruiting"
+DATABASE = STATE / "candidates.sqlite3"
+AUDIT = STATE / "audit.jsonl"
+OUTBOX = STATE / "outbox.jsonl"
+RECEIPT_NAMESPACE = "moonshiner-recruiting-evidence-v1"
+
+FULL_COLUMNS = (
+    "stable_id",
+    "name",
+    "location",
+    "status",
+    "role",
+    "stage",
+    "interview_date",
+    "recruiter",
+    "source_updated_at",
+)
+
+
+def fail(message: str, code: int = 2) -> "NoReturn":
+    print(f"recruiting: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def connect(*, writable: bool = False) -> sqlite3.Connection:
+    if writable:
+        connection = sqlite3.connect(DATABASE)
+    else:
+        connection = sqlite3.connect(f"file:{DATABASE}?mode=ro", uri=True)
+        connection.execute("PRAGMA query_only = ON")
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def read_audit() -> list[dict]:
+    if not AUDIT.exists():
+        return []
+    events: list[dict] = []
+    try:
+        for line in AUDIT.read_text(encoding="utf-8").splitlines():
+            if line:
+                events.append(json.loads(line))
+    except (OSError, json.JSONDecodeError) as error:
+        fail(f"audit trail is unreadable: {error}")
+    return events
+
+
+def append_event(event: dict) -> None:
+    events = read_audit()
+    event = {"sequence": len(events) + 1, **event}
+    STATE.mkdir(exist_ok=True)
+    with AUDIT.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+
+
+def receipt_for(name: str, location: str, stable_id: str) -> str:
+    material = "\0".join((RECEIPT_NAMESPACE, name, location, stable_id))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+def record_digest(record: dict) -> str:
+    payload = json.dumps(record, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def print_json(value: object) -> None:
+    print(json.dumps(value, indent=2, sort_keys=True))
+
+
+def command_search(args: argparse.Namespace) -> None:
+    with connect() as database:
+        rows = database.execute(
+            """
+            SELECT stable_id, name, location, status
+            FROM candidates
+            WHERE name = ? AND location = ?
+            ORDER BY stable_id
+            """,
+            (args.name, args.location),
+        ).fetchall()
+    matches = [dict(row) for row in rows]
+    receipt = (
+        receipt_for(args.name, args.location, matches[0]["stable_id"])
+        if len(matches) == 1
+        else None
+    )
+    append_event(
+        {
+            "operation": "search",
+            "filters": {"location": args.location, "name": args.name},
+            "match_count": len(matches),
+            "returned_stable_ids": [row["stable_id"] for row in matches],
+            "receipt": receipt,
+        }
+    )
+    print_json({"match_count": len(matches), "matches": matches, "receipt": receipt})
+
+
+def command_get(args: argparse.Namespace) -> None:
+    events = read_audit()
+    if not events or events[-1].get("operation") != "search":
+        fail("get requires a completed focused search immediately beforehand")
+    search = events[-1]
+    ids = search.get("returned_stable_ids")
+    if search.get("match_count") != 1 or not isinstance(ids, list) or ids != [args.id]:
+        fail("stable ID is not the unique result of the preceding search")
+    filters = search.get("filters") or {}
+    expected = receipt_for(
+        str(filters.get("name", "")),
+        str(filters.get("location", "")),
+        args.id,
+    )
+    if args.receipt != expected or search.get("receipt") != expected:
+        fail("receipt does not bind this ID to the preceding search")
+
+    with connect() as database:
+        row = database.execute(
+            f"SELECT {', '.join(FULL_COLUMNS)} FROM candidates WHERE stable_id = ?",
+            (args.id,),
+        ).fetchone()
+    if row is None:
+        fail("candidate no longer exists", 4)
+    record = dict(row)
+    if record["name"] != filters.get("name") or record["location"] != filters.get("location"):
+        fail("candidate changed after search; evidence is stale", 4)
+    append_event(
+        {
+            "operation": "get",
+            "stable_id": args.id,
+            "search_receipt": args.receipt,
+            "record_sha256": record_digest(record),
+        }
+    )
+    print_json({"candidate": record})
+
+
+def command_list(args: argparse.Namespace) -> None:
+    clauses: list[str] = []
+    values: list[str] = []
+    if args.location:
+        clauses.append("location = ?")
+        values.append(args.location)
+    if args.status:
+        clauses.append("status = ?")
+        values.append(args.status)
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    with connect() as database:
+        rows = database.execute(
+            "SELECT stable_id, name, location, status FROM candidates"
+            + where
+            + " ORDER BY stable_id",
+            values,
+        ).fetchall()
+    append_event(
+        {
+            "operation": "list",
+            "filters": {"location": args.location, "status": args.status},
+            "returned_count": len(rows),
+        }
+    )
+    print_json({"candidates": [dict(row) for row in rows], "count": len(rows)})
+
+
+def command_profile(_args: argparse.Namespace) -> None:
+    append_event({"operation": "profile"})
+    print_json(
+        {
+            "operator": "sandbox-reviewer",
+            "default_location": "Operations",
+            "saved_view": "weekly-intake",
+        }
+    )
+
+
+def command_availability(args: argparse.Namespace) -> None:
+    with connect() as database:
+        exists = database.execute(
+            "SELECT 1 FROM candidates WHERE stable_id = ?", (args.id,)
+        ).fetchone()
+    if not exists:
+        fail("unknown stable ID", 4)
+    available = int(hashlib.sha256(f"{args.id}:{args.date}".encode()).hexdigest(), 16) % 2 == 0
+    append_event(
+        {
+            "operation": "availability",
+            "stable_id": args.id,
+            "date": args.date,
+            "available": available,
+        }
+    )
+    print_json({"available": available, "date": args.date, "stable_id": args.id})
+
+
+def command_create(args: argparse.Namespace) -> None:
+    with connect(writable=True) as database:
+        try:
+            database.execute(
+                """
+                INSERT INTO candidates (
+                    stable_id, name, location, status, role, stage,
+                    interview_date, recruiter, source_updated_at
+                ) VALUES (?, ?, ?, 'pending', ?, 'intake', ?, ?, ?)
+                """,
+                (
+                    args.id,
+                    args.name,
+                    args.location,
+                    args.role,
+                    args.interview_date,
+                    args.recruiter,
+                    args.updated_at,
+                ),
+            )
+            database.commit()
+        except sqlite3.IntegrityError:
+            fail("stable ID already exists", 4)
+    append_event({"operation": "create", "stable_id": args.id})
+    print_json({"created": args.id})
+
+
+def command_update(args: argparse.Namespace) -> None:
+    allowed = {"role", "stage", "interview_date", "recruiter"}
+    if args.field not in allowed:
+        fail("field is not mutable")
+    with connect(writable=True) as database:
+        cursor = database.execute(
+            f"UPDATE candidates SET {args.field} = ? WHERE stable_id = ?",
+            (args.value, args.id),
+        )
+        database.commit()
+    if cursor.rowcount != 1:
+        fail("unknown stable ID", 4)
+    append_event(
+        {
+            "operation": "update",
+            "stable_id": args.id,
+            "field": args.field,
+        }
+    )
+    print_json({"updated": args.id})
+
+
+def command_cancel(args: argparse.Namespace) -> None:
+    with connect(writable=True) as database:
+        cursor = database.execute(
+            "UPDATE candidates SET status = 'cancelled' WHERE stable_id = ?",
+            (args.id,),
+        )
+        database.commit()
+    if cursor.rowcount != 1:
+        fail("unknown stable ID", 4)
+    append_event(
+        {"operation": "cancel", "stable_id": args.id, "reason": args.reason}
+    )
+    print_json({"cancelled": args.id})
+
+
+def command_notify(args: argparse.Namespace) -> None:
+    event = {"operation": "notify", "stable_id": args.id, "message": args.message}
+    STATE.mkdir(exist_ok=True)
+    with OUTBOX.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(event, sort_keys=True) + "\n")
+    append_event(event)
+    print_json({"queued": True, "stable_id": args.id})
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        prog="./recruiting",
+        description="Query or administer the sandboxed recruiting system.",
+    )
+    commands = result.add_subparsers(dest="command", required=True)
+
+    search = commands.add_parser("search", help="find exact candidate summaries")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+    search.set_defaults(handler=command_search)
+
+    get = commands.add_parser("get", help="retrieve one search-resolved full record")
+    get.add_argument("--id", required=True)
+    get.add_argument("--receipt", required=True)
+    get.set_defaults(handler=command_get)
+
+    listing = commands.add_parser("list", help="list a collection of candidates")
+    listing.add_argument("--location")
+    listing.add_argument("--status")
+    listing.set_defaults(handler=command_list)
+
+    profile = commands.add_parser("profile", help="read the current operator profile")
+    profile.set_defaults(handler=command_profile)
+
+    availability = commands.add_parser("availability", help="check a proposed date")
+    availability.add_argument("--id", required=True)
+    availability.add_argument("--date", required=True)
+    availability.set_defaults(handler=command_availability)
+
+    create = commands.add_parser("create", help="create a candidate record")
+    create.add_argument("--id", required=True)
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--role", required=True)
+    create.add_argument("--interview-date", required=True)
+    create.add_argument("--recruiter", required=True)
+    create.add_argument("--updated-at", required=True)
+    create.set_defaults(handler=command_create)
+
+    update = commands.add_parser("update", help="update one candidate field")
+    update.add_argument("--id", required=True)
+    update.add_argument("--field", required=True)
+    update.add_argument("--value", required=True)
+    update.set_defaults(handler=command_update)
+
+    cancel = commands.add_parser("cancel", help="cancel a candidate record")
+    cancel.add_argument("--id", required=True)
+    cancel.add_argument("--reason", required=True)
+    cancel.set_defaults(handler=command_cancel)
+
+    notify = commands.add_parser("notify", help="queue a candidate notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+    notify.set_defaults(handler=command_notify)
+
+    return result
+
+
+def main() -> None:
+    args = parser().parse_args()
+    args.handler(args)
+
+
+if __name__ == "__main__":
+    main()

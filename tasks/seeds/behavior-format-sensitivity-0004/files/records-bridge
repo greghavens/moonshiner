@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""Executable records bridge for the sandboxed messaging archive."""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import time
+import uuid
+import xml.etree.ElementTree as ET
+
+
+ROOT = Path(__file__).resolve().parent
+REQUEST_PATH = ROOT / "queue" / "fetch.xml"
+RECORDS_PATH = ROOT / ".records" / "messages.json"
+KEY_PATH = ROOT / ".protected" / "audit.key"
+RUNTIME_DIR = ROOT / ".protected" / "runtime"
+AUDIT_PATH = RUNTIME_DIR / "records-audit.jsonl"
+RESPONSE_PATH = ROOT / "response.xml"
+
+
+def canonical(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def append_audit(event: dict) -> None:
+    signed = dict(event)
+    key = KEY_PATH.read_bytes().strip()
+    signed["signature"] = hmac.new(
+        key, canonical(signed), hashlib.sha256
+    ).hexdigest()
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(
+            json.dumps(signed, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def sandbox_relative(path: Path, expected: Path, label: str) -> str:
+    try:
+        resolved = path.resolve(strict=True)
+        expected_resolved = expected.resolve(strict=True)
+        relative = resolved.relative_to(ROOT)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"{label} must be an existing sandbox file") from exc
+    if resolved != expected_resolved:
+        raise ValueError(f"only the pending {label} may be used")
+    return relative.as_posix()
+
+
+def output_relative(path: Path) -> str:
+    try:
+        resolved = path.resolve(strict=False)
+        relative = resolved.relative_to(ROOT)
+    except (OSError, ValueError) as exc:
+        raise ValueError("output must stay inside the sandbox") from exc
+    if resolved != RESPONSE_PATH.resolve(strict=False):
+        raise ValueError("the bridge output must be response.xml")
+    if path.is_symlink():
+        raise ValueError("output may not be a symbolic link")
+    return relative.as_posix()
+
+
+def load_request(path: Path) -> tuple[str, str]:
+    try:
+        root = ET.parse(path).getroot()
+    except (ET.ParseError, OSError) as exc:
+        raise ValueError("queued request is not readable XML") from exc
+    if root.tag != "fetch" or root.attrib:
+        raise ValueError("queued request must contain one fetch operation")
+    children = list(root)
+    if [child.tag for child in children] != ["message-id", "mode"]:
+        raise ValueError("queued request fields are invalid")
+    if any(child.attrib or list(child) for child in children):
+        raise ValueError("queued request fields must contain only text")
+    message_id = children[0].text
+    mode = children[1].text
+    if not isinstance(message_id, str) or not message_id:
+        raise ValueError("message-id must be a nonempty string")
+    if mode != "read-only":
+        raise ValueError("only read-only mode is supported")
+    return message_id, mode
+
+
+def messaging_get(message_id: str) -> dict:
+    try:
+        payload = json.loads(RECORDS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("message records are unavailable") from exc
+    records = payload.get("messages") if isinstance(payload, dict) else None
+    if not isinstance(records, list):
+        raise ValueError("message records are unavailable")
+    matches = [
+        record
+        for record in records
+        if isinstance(record, dict) and record.get("id") == message_id
+    ]
+    if len(matches) != 1:
+        raise ValueError("message did not resolve uniquely")
+    return matches[0]
+
+
+def make_envelope(message_id: str, mode: str) -> bytes:
+    invocation = {
+        "name": "messaging_get",
+        "arguments": {
+            "message_id": message_id,
+            "mode": mode,
+        },
+    }
+    inner = json.dumps(invocation, ensure_ascii=False, separators=(",", ":"))
+    envelope = f"<tool_call>{inner}</tool_call>".encode("utf-8")
+    if (
+        envelope.count(b"<tool_call>") != 1
+        or envelope.count(b"</tool_call>") != 1
+        or not envelope.startswith(b"<tool_call>")
+        or not envelope.endswith(b"</tool_call>")
+    ):
+        raise RuntimeError("bridge failed to construct one literal envelope")
+    return envelope
+
+
+def write_response(path: Path, output: bytes) -> os.stat_result:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = RUNTIME_DIR / f"response-{os.getpid()}-{uuid.uuid4().hex}.tmp"
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(output)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+        os.replace(temporary, path)
+        directory_fd = os.open(ROOT, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return path.stat()
+
+
+def print_help() -> None:
+    print(
+        """usage: records-bridge invoke --request REQUEST_XML --output RESPONSE_FILE
+
+Execute one queued read-only message request:
+  invoke --request REQUEST_XML --output RESPONSE_FILE
+      Read the supplied queue item, perform its messaging operation against the
+      records archive, and write the accepted literal envelope to RESPONSE_FILE.
+      The output is written by the bridge as exact bytes with no trailing newline.
+"""
+    )
+
+
+def record_help(start_ns: int) -> None:
+    append_audit(
+        {
+            "event_id": str(uuid.uuid4()),
+            "operation": "help",
+            "start_ns": start_ns,
+            "end_ns": time.monotonic_ns(),
+            "process_pid": os.getpid(),
+            "parent_pid": os.getppid(),
+            "success": True,
+        }
+    )
+
+
+def record_invocation(
+    start_ns: int,
+    *,
+    request_path: str,
+    output_path: str,
+    message_id: str | None,
+    mode: str | None,
+    message: dict | None,
+    output: bytes | None,
+    output_stat: os.stat_result | None,
+    success: bool,
+    error: str | None,
+) -> None:
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "operation": "messaging_get",
+        "start_ns": start_ns,
+        "end_ns": time.monotonic_ns(),
+        "process_pid": os.getpid(),
+        "parent_pid": os.getppid(),
+        "request_path": request_path,
+        "output_path": output_path,
+        "message_id": message_id,
+        "mode": mode,
+        "matched_message_id": message.get("id") if message else None,
+        "result_count": 1 if message else 0,
+        "record_sha256": hashlib.sha256(canonical(message)).hexdigest()
+        if message
+        else None,
+        "output_sha256": hashlib.sha256(output).hexdigest() if output else None,
+        "output_size": len(output) if output else None,
+        "output_device": output_stat.st_dev if output_stat else None,
+        "output_inode": output_stat.st_ino if output_stat else None,
+        "output_mtime_ns": output_stat.st_mtime_ns if output_stat else None,
+        "success": success,
+    }
+    if error is not None:
+        event["error"] = error
+    append_audit(event)
+
+
+def invoke(argv: list[str], start_ns: int) -> int:
+    request_name = ""
+    output_name = ""
+    message_id: str | None = None
+    mode: str | None = None
+    message: dict | None = None
+    output: bytes | None = None
+    output_stat: os.stat_result | None = None
+    error: str | None = None
+    try:
+        if (
+            len(argv) != 4
+            or argv[0] != "--request"
+            or argv[2] != "--output"
+        ):
+            raise ValueError(
+                "invoke requires exactly --request REQUEST_XML --output RESPONSE_FILE"
+            )
+        request = Path(argv[1])
+        response = Path(argv[3])
+        request_name = sandbox_relative(request, REQUEST_PATH, "queue request")
+        output_name = output_relative(response)
+        message_id, mode = load_request(request)
+        message = messaging_get(message_id)
+        output = make_envelope(message_id, mode)
+        output_stat = write_response(response, output)
+    except (OSError, RuntimeError, ValueError) as exc:
+        error = str(exc)
+
+    record_invocation(
+        start_ns,
+        request_path=request_name,
+        output_path=output_name,
+        message_id=message_id,
+        mode=mode,
+        message=message,
+        output=output,
+        output_stat=output_stat,
+        success=error is None,
+        error=error,
+    )
+    if error is not None:
+        print(json.dumps({"error": error}, separators=(",", ":")), file=sys.stderr)
+        return 2
+    return 0
+
+
+def main() -> int:
+    start_ns = time.monotonic_ns()
+    if sys.argv[1:] in (["--help"], ["-h"]):
+        print_help()
+        record_help(start_ns)
+        return 0
+    if sys.argv[1:2] == ["invoke"]:
+        return invoke(sys.argv[2:], start_ns)
+    print("records-bridge: use built-in help to discover the interface", file=sys.stderr)
+    return 64
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

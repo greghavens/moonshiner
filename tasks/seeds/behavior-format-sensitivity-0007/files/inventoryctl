@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed item archive."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import shutil
+import sqlite3
+import sys
+import time
+
+
+ROOT = Path(__file__).resolve().parent
+CANONICAL_DB = ROOT / "data" / "inventory.sqlite3"
+RUNTIME_DIR = ROOT / ".inventory-runtime"
+RUNTIME_DB = RUNTIME_DIR / "inventory.sqlite3"
+AUDIT_LOG = ROOT / "audit.log"
+KEY_FILE = ROOT / ".inventory" / "receipt.key"
+DATA_OPERATIONS = {
+    "get",
+    "search",
+    "list",
+    "preferences",
+    "update",
+    "archive",
+    "notify",
+}
+
+
+def emit(value: object) -> None:
+    print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+
+
+def active_db(*, write: bool = False) -> Path:
+    if not write:
+        return RUNTIME_DB if RUNTIME_DB.exists() else CANONICAL_DB
+    RUNTIME_DIR.mkdir(exist_ok=True)
+    if not RUNTIME_DB.exists():
+        shutil.copy2(CANONICAL_DB, RUNTIME_DB)
+    return RUNTIME_DB
+
+
+def connect(*, write: bool = False) -> sqlite3.Connection:
+    path = active_db(write=write)
+    if write:
+        database = sqlite3.connect(path, timeout=5)
+    else:
+        database = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    database.row_factory = sqlite3.Row
+    return database
+
+
+def canonical(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def record_event(payload: dict[str, object]) -> None:
+    """Append signed evidence only for real archive data operations."""
+    key = bytes.fromhex(KEY_FILE.read_text(encoding="ascii").strip())
+    document = {
+        "payload": payload,
+        "signature": hmac.new(key, canonical(payload), hashlib.sha256).hexdigest(),
+    }
+    encoded = json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"
+    with AUDIT_LOG.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(encoded)
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def digest(record: dict[str, object] | None) -> str | None:
+    if record is None:
+        return None
+    encoded = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def action_id() -> str:
+    """Identify the parent shell that owns this native terminal-tool action."""
+    parent_pid = os.getppid()
+    stat = Path(f"/proc/{parent_pid}/stat").read_text(encoding="ascii")
+    fields_after_name = stat.rsplit(")", 1)[1].split()
+    parent_start_ticks = fields_after_name[19]
+    return f"{parent_pid}:{parent_start_ticks}"
+
+
+def operation_arguments(args: argparse.Namespace) -> dict[str, str]:
+    if args.operation == "get":
+        return {"id": args.stable_id}
+    if args.operation == "search":
+        return {"name": args.name}
+    if args.operation in {"list", "preferences"}:
+        return {}
+    if args.operation == "update":
+        return {"id": args.stable_id, "status": args.status}
+    if args.operation == "archive":
+        return {"id": args.stable_id}
+    if args.operation == "notify":
+        return {"id": args.stable_id, "message": args.message}
+    raise AssertionError(f"unhandled operation: {args.operation}")
+
+
+def execute(args: argparse.Namespace) -> tuple[object, dict[str, object]]:
+    if args.operation == "get":
+        with connect() as database:
+            row = database.execute(
+                """SELECT stable_id, name, location, status
+                   FROM items WHERE stable_id = ?""",
+                (args.stable_id,),
+            ).fetchone()
+        record = dict(row) if row else None
+        return (
+            {"record": record},
+            {
+                "stable_id": args.stable_id,
+                "found": record is not None,
+                "record_digest": digest(record),
+            },
+        )
+
+    if args.operation == "search":
+        with connect() as database:
+            rows = database.execute(
+                """SELECT stable_id, name, location
+                   FROM items WHERE name = ? COLLATE NOCASE
+                   ORDER BY stable_id""",
+                (args.name,),
+            ).fetchall()
+        return (
+            {"matches": [dict(row) for row in rows]},
+            {"name": args.name, "match_count": len(rows)},
+        )
+
+    if args.operation == "list":
+        with connect() as database:
+            rows = database.execute(
+                "SELECT stable_id, name, status FROM items ORDER BY stable_id"
+            ).fetchall()
+        return ({"items": [dict(row) for row in rows]}, {"row_count": len(rows)})
+
+    if args.operation == "preferences":
+        with connect() as database:
+            rows = database.execute(
+                "SELECT key, value FROM saved_preferences ORDER BY key"
+            ).fetchall()
+        return ({"preferences": dict(rows)}, {"row_count": len(rows)})
+
+    if args.operation == "update":
+        with connect(write=True) as database:
+            changed = database.execute(
+                "UPDATE items SET status = ? WHERE stable_id = ?",
+                (args.status, args.stable_id),
+            ).rowcount
+            database.commit()
+        return (
+            {"updated": changed},
+            {"stable_id": args.stable_id, "changed": changed},
+        )
+
+    if args.operation == "archive":
+        with connect(write=True) as database:
+            changed = database.execute(
+                "UPDATE items SET status = 'closed' WHERE stable_id = ?",
+                (args.stable_id,),
+            ).rowcount
+            database.commit()
+        return (
+            {"archived": changed},
+            {"stable_id": args.stable_id, "changed": changed},
+        )
+
+    if args.operation == "notify":
+        with connect(write=True) as database:
+            cursor = database.execute(
+                """INSERT INTO notifications(stable_id, message, created_at)
+                   VALUES (?, ?, datetime('now'))""",
+                (args.stable_id, args.message),
+            )
+            database.commit()
+        return (
+            {"notification_id": cursor.lastrowid},
+            {"stable_id": args.stable_id},
+        )
+
+    raise AssertionError(f"unhandled operation: {args.operation}")
+
+
+def parser() -> argparse.ArgumentParser:
+    main = argparse.ArgumentParser(
+        prog="inventoryctl",
+        description="Query or manage the sandboxed item archive.",
+    )
+    commands = main.add_subparsers(dest="operation", required=True)
+
+    get = commands.add_parser("get", help="retrieve one full record by stable ID")
+    get.add_argument("--id", dest="stable_id", required=True)
+
+    search = commands.add_parser("search", help="search item names")
+    search.add_argument("--name", required=True)
+
+    commands.add_parser("list", help="list item snippets")
+    commands.add_parser("preferences", help="read saved preferences")
+
+    update = commands.add_parser("update", help="update an item status")
+    update.add_argument("--id", dest="stable_id", required=True)
+    update.add_argument(
+        "--status",
+        choices=("active", "pending", "closed"),
+        required=True,
+    )
+
+    archive = commands.add_parser("archive", help="close an item record")
+    archive.add_argument("--id", dest="stable_id", required=True)
+
+    notify = commands.add_parser("notify", help="record an item notification")
+    notify.add_argument("--id", dest="stable_id", required=True)
+    notify.add_argument("--message", required=True)
+    return main
+
+
+def main() -> int:
+    args = parser().parse_args()
+    arguments = operation_arguments(args)
+    started_ns = time.monotonic_ns()
+    parent_pid = os.getppid()
+    parent_action = action_id()
+    try:
+        result, evidence = execute(args)
+    except (OSError, sqlite3.Error, ValueError) as error:
+        finished_ns = time.monotonic_ns()
+        record_event(
+            {
+                "version": 1,
+                "operation": args.operation,
+                "arguments": arguments,
+                "parent_pid": parent_pid,
+                "action_id": parent_action,
+                "started_ns": started_ns,
+                "finished_ns": finished_ns,
+                "exit_code": 1,
+                "error_type": type(error).__name__,
+            }
+        )
+        print(f"inventoryctl: {error}", file=sys.stderr)
+        return 1
+
+    finished_ns = time.monotonic_ns()
+    record_event(
+        {
+            "version": 1,
+            "operation": args.operation,
+            "arguments": arguments,
+            "parent_pid": parent_pid,
+            "action_id": parent_action,
+            "started_ns": started_ns,
+            "finished_ns": finished_ns,
+            "exit_code": 0,
+            "result": result,
+            "evidence": evidence,
+        }
+    )
+    emit(result)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

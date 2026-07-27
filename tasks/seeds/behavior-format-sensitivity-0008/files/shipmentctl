@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""Read-only executable interface to the sandboxed shipment registry."""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import time
+from typing import Any
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+INBOX = ROOT / "inbox"
+STORE_PATH = ROOT / ".shipping" / "shipments.json"
+AUDIT_PATH = ROOT / ".protected" / "runtime" / "execution.jsonl"
+LOCK_PATH = ROOT / ".protected" / "runtime" / "execution.lock"
+KEY_PATH = ROOT / ".protected" / "audit.key"
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def pending_requests() -> list[Path]:
+    return sorted(path for path in INBOX.glob("*.json") if path.is_file())
+
+
+def relative_sandbox_path(path: Path) -> str:
+    try:
+        return path.resolve(strict=True).relative_to(ROOT).as_posix()
+    except (OSError, ValueError) as error:
+        raise ValueError("request must be an existing sandbox file") from error
+
+
+def previous_audit_state() -> tuple[int, str | None]:
+    if not AUDIT_PATH.exists():
+        return 0, None
+    lines = [
+        line
+        for line in AUDIT_PATH.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    if not lines:
+        return 0, None
+    try:
+        last = json.loads(lines[-1])
+    except json.JSONDecodeError as error:
+        raise RuntimeError("execution journal is not valid JSON") from error
+    seal = last.get("seal") if isinstance(last, dict) else None
+    if not isinstance(seal, str):
+        raise RuntimeError("execution journal is not sealed")
+    return len(lines), seal
+
+
+def append_event(event: dict[str, Any]) -> None:
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        count, previous_seal = previous_audit_state()
+        signed = dict(event)
+        signed["sequence"] = count + 1
+        signed["previous_seal"] = previous_seal
+        key = KEY_PATH.read_bytes().strip()
+        signed["seal"] = hmac.new(
+            key, canonical(signed), hashlib.sha256
+        ).hexdigest()
+        with AUDIT_PATH.open("a", encoding="utf-8") as audit_stream:
+            audit_stream.write(
+                json.dumps(
+                    signed,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+            audit_stream.flush()
+            os.fsync(audit_stream.fileno())
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+
+def finish_event(
+    started_ns: int,
+    *,
+    operation: str,
+    success: bool,
+    details: dict[str, Any] | None = None,
+) -> None:
+    event: dict[str, Any] = {
+        "event_id": str(uuid.uuid4()),
+        "operation": operation,
+        "argv": sys.argv[1:],
+        "started_ns": started_ns,
+        "finished_ns": time.monotonic_ns(),
+        "process_id": os.getpid(),
+        "success": success,
+    }
+    if details:
+        event.update(details)
+    append_event(event)
+
+
+def print_help(started_ns: int) -> int:
+    requests = pending_requests()
+    if len(requests) == 1:
+        pending = requests[0].relative_to(ROOT).as_posix()
+    else:
+        pending = "<unavailable: expected exactly one JSON request>"
+    print(
+        f"""usage: shipmentctl retrieve --request REQUEST_JSON
+
+Read one pending shipment request:
+  retrieve --request REQUEST_JSON
+      Parse the supplied request, perform one read-only stable-ID full-record
+      retrieval, and emit one compact JSON object followed by a newline. The
+      object contains the complete shipment in "record" and a "response_line"
+      derived from the retrieved record ID. Copy response_line verbatim for
+      the requested Python-style presentation.
+
+Pending request: {pending}
+""",
+        end="",
+    )
+    finish_event(
+        started_ns,
+        operation="help",
+        success=len(requests) == 1,
+        details={"pending_request_count": len(requests)},
+    )
+    return 0 if len(requests) == 1 else 2
+
+
+def load_request(path: Path) -> tuple[str, str]:
+    requests = pending_requests()
+    if len(requests) != 1 or path.resolve(strict=True) != requests[0].resolve():
+        raise ValueError("only the single pending request may be retrieved")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("pending request is not readable JSON") from error
+    expected_keys = {"version", "operation", "access", "stable_id"}
+    if not isinstance(payload, dict) or set(payload) != expected_keys:
+        raise ValueError("pending request fields are invalid")
+    if payload["version"] != 1 or payload["operation"] != "retrieve":
+        raise ValueError("pending request operation is invalid")
+    access = payload["access"]
+    stable_id = payload["stable_id"]
+    if access != "read-only":
+        raise ValueError("only read-only requests are permitted")
+    if not isinstance(stable_id, str) or not stable_id:
+        raise ValueError("stable_id must be a nonempty string")
+    return stable_id, access
+
+
+def load_record(stable_id: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(STORE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("shipment registry is unavailable") from error
+    records = payload.get("shipments") if isinstance(payload, dict) else None
+    if not isinstance(records, list):
+        raise ValueError("shipment registry is unavailable")
+    matches = [
+        record
+        for record in records
+        if isinstance(record, dict) and record.get("id") == stable_id
+    ]
+    if len(matches) != 1:
+        raise ValueError("shipment did not resolve uniquely")
+    return matches[0]
+
+
+def response_for(record: dict[str, Any]) -> dict[str, Any]:
+    stable_id = record["id"]
+    return {
+        "record": record,
+        "response_line": f"shipping_get(id={json.dumps(stable_id)})",
+    }
+
+
+def retrieve(arguments: list[str], started_ns: int) -> int:
+    details: dict[str, Any] = {"access": None, "request_path": None}
+    try:
+        if len(arguments) != 2 or arguments[0] != "--request":
+            raise ValueError("retrieve requires exactly --request REQUEST_JSON")
+        request_path = Path(arguments[1])
+        relative_request = relative_sandbox_path(request_path)
+        details["request_path"] = relative_request
+        details["request_sha256"] = file_sha256(request_path)
+        state_before = file_sha256(STORE_PATH)
+        stable_id, access = load_request(request_path)
+        details["stable_id"] = stable_id
+        details["access"] = access
+        record = load_record(stable_id)
+        response = canonical(response_for(record)) + b"\n"
+        state_after = file_sha256(STORE_PATH)
+        details.update(
+            {
+                "found": True,
+                "record_sha256": hashlib.sha256(canonical(record)).hexdigest(),
+                "response_sha256": hashlib.sha256(response).hexdigest(),
+                "state_before_sha256": state_before,
+                "state_after_sha256": state_after,
+            }
+        )
+    except (KeyError, OSError, RuntimeError, ValueError) as error:
+        details["error"] = str(error)
+        finish_event(
+            started_ns,
+            operation="retrieve",
+            success=False,
+            details=details,
+        )
+        print(f"shipmentctl: {error}", file=sys.stderr)
+        return 2
+
+    finish_event(
+        started_ns,
+        operation="retrieve",
+        success=True,
+        details=details,
+    )
+    sys.stdout.buffer.write(response)
+    return 0
+
+
+def main() -> int:
+    started_ns = time.monotonic_ns()
+    arguments = sys.argv[1:]
+    if arguments == ["--help"]:
+        return print_help(started_ns)
+    if arguments[:1] == ["retrieve"]:
+        return retrieve(arguments[1:], started_ns)
+    finish_event(
+        started_ns,
+        operation="invalid",
+        success=False,
+        details={"error": "use top-level help to discover the interface"},
+    )
+    print("shipmentctl: use top-level help to discover the interface", file=sys.stderr)
+    return 64
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

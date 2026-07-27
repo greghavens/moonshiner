@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""Executable interface to the sandboxed calendar record store."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+STATE_DIR = ROOT / ".calendar"
+RECORDS_PATH = STATE_DIR / "records.json"
+AUDIT_PATH = STATE_DIR / "audit.jsonl"
+NOTIFICATIONS_PATH = STATE_DIR / "notifications.json"
+LOCK_PATH = STATE_DIR / "service.lock"
+KEY_PATH = ROOT / ".protected" / "audit.key"
+OPERATION_DELAY_SECONDS = 0.40
+ALLOWED_STATUSES = {
+    "tentative",
+    "confirmed",
+    "completed",
+    "cancelled",
+    "closed",
+}
+
+
+class CalendarError(RuntimeError):
+    """A user-facing calendar service failure."""
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def load_object(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise CalendarError(f"invalid service data: {path.name}")
+    return value
+
+
+def load_records() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    document = load_object(RECORDS_PATH)
+    records = document.get("records")
+    if document.get("version") != 1 or not isinstance(records, list):
+        raise CalendarError("invalid calendar record store")
+    if not all(isinstance(record, dict) for record in records):
+        raise CalendarError("invalid calendar record entry")
+    return document, records
+
+
+def load_events() -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    with AUDIT_PATH.open(encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            event = json.loads(line)
+            if not isinstance(event, dict):
+                raise CalendarError(f"invalid audit event at line {line_number}")
+            events.append(event)
+    return events
+
+
+def atomic_json_write(path: Path, value: dict[str, Any]) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", text=True
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def parent_start_ticks() -> int | None:
+    try:
+        stat = Path(f"/proc/{os.getppid()}/stat").read_text(encoding="utf-8")
+        fields_after_name = stat[stat.rfind(")") + 2 :].split()
+        return int(fields_after_name[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def record_digest(record: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical(record)).hexdigest()
+
+
+def event_base(operation: str, started_ns: int, finished_ns: int) -> dict[str, Any]:
+    return {
+        "finished_ns": finished_ns,
+        "operation": operation,
+        "parent_pid": os.getppid(),
+        "parent_start_ticks": parent_start_ticks(),
+        "pid": os.getpid(),
+        "started_ns": started_ns,
+    }
+
+
+def append_audit_unlocked(event: dict[str, Any]) -> None:
+    events = load_events()
+    numbered = {"sequence": len(events) + 1, **event}
+    key = KEY_PATH.read_bytes().strip()
+    numbered["seal"] = hmac.new(key, canonical(numbered), hashlib.sha256).hexdigest()
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(numbered, ensure_ascii=False, sort_keys=True))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def append_audit(event: dict[str, Any]) -> None:
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        append_audit_unlocked(event)
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+
+def emit(value: dict[str, Any]) -> None:
+    print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+
+
+def command_get(arguments: argparse.Namespace) -> int:
+    started_ns = time.monotonic_ns()
+    time.sleep(OPERATION_DELAY_SECONDS)
+    _, records = load_records()
+    record = next((item for item in records if item.get("id") == arguments.id), None)
+    finished_ns = time.monotonic_ns()
+    event = {
+        **event_base("get", started_ns, finished_ns),
+        "found": record is not None,
+        "record_id": arguments.id,
+        "record_sha256": record_digest(record) if record is not None else None,
+        "status": record.get("status") if record is not None else None,
+        "outcome": "ok" if record is not None else "not-found",
+    }
+    append_audit(event)
+    if record is None:
+        raise CalendarError(f"record not found: {arguments.id}")
+    emit({"record": record})
+    return 0
+
+
+def completed_gets_for_update(
+    events: list[dict[str, Any]], record_id: str, expected_status: str, started_ns: int
+) -> None:
+    gets = [event for event in events if event.get("operation") == "get"]
+    if len(gets) != 2 or any(event.get("outcome") != "ok" for event in gets):
+        raise CalendarError("update requires two successful completed gets")
+    retrieved = next((event for event in gets if event.get("record_id") == record_id), None)
+    if retrieved is None:
+        raise CalendarError("record was not retrieved in the completed get layer")
+    if retrieved.get("status") != expected_status:
+        raise CalendarError("conditional status does not match the retrieved status")
+    try:
+        latest_finish = max(int(event["finished_ns"]) for event in gets)
+    except (KeyError, TypeError, ValueError) as error:
+        raise CalendarError("get completion evidence is invalid") from error
+    if started_ns <= latest_finish:
+        raise CalendarError("update started before both gets completed")
+
+
+def command_update(arguments: argparse.Namespace) -> int:
+    if arguments.status not in ALLOWED_STATUSES:
+        raise CalendarError(f"unsupported status: {arguments.status}")
+    if arguments.if_status not in ALLOWED_STATUSES:
+        raise CalendarError(f"unsupported conditional status: {arguments.if_status}")
+
+    started_ns = time.monotonic_ns()
+    time.sleep(OPERATION_DELAY_SECONDS)
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        events = load_events()
+        completed_gets_for_update(events, arguments.id, arguments.if_status, started_ns)
+        document, records = load_records()
+        record = next((item for item in records if item.get("id") == arguments.id), None)
+        if record is None:
+            raise CalendarError(f"record not found: {arguments.id}")
+        before_status = record.get("status")
+        precondition_matched = before_status == arguments.if_status
+        changed = precondition_matched and before_status != arguments.status
+        if changed:
+            record["status"] = arguments.status
+            atomic_json_write(RECORDS_PATH, document)
+        finished_ns = time.monotonic_ns()
+        event = {
+            **event_base("update", started_ns, finished_ns),
+            "after_status": record.get("status"),
+            "before_status": before_status,
+            "changed": changed,
+            "expected_status": arguments.if_status,
+            "outcome": "ok" if precondition_matched else "precondition-failed",
+            "precondition_matched": precondition_matched,
+            "record_id": arguments.id,
+            "requested_status": arguments.status,
+        }
+        append_audit_unlocked(event)
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+    emit(
+        {
+            "after_status": record.get("status"),
+            "before_status": before_status,
+            "changed": changed,
+            "expected_status": arguments.if_status,
+            "precondition_matched": precondition_matched,
+            "record_id": arguments.id,
+        }
+    )
+    return 0 if precondition_matched else 4
+
+
+def command_search(arguments: argparse.Namespace) -> int:
+    started_ns = time.monotonic_ns()
+    time.sleep(OPERATION_DELAY_SECONDS)
+    _, records = load_records()
+    matches = [record for record in records if record.get("name") == arguments.name]
+    finished_ns = time.monotonic_ns()
+    append_audit(
+        {
+            **event_base("search", started_ns, finished_ns),
+            "name": arguments.name,
+            "outcome": "ok",
+            "result_ids": [record.get("id") for record in matches],
+        }
+    )
+    emit({"matches": matches})
+    return 0
+
+
+def command_cancel(arguments: argparse.Namespace) -> int:
+    started_ns = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        document, records = load_records()
+        record = next((item for item in records if item.get("id") == arguments.id), None)
+        if record is None:
+            raise CalendarError(f"record not found: {arguments.id}")
+        before_status = record.get("status")
+        record["status"] = "cancelled"
+        atomic_json_write(RECORDS_PATH, document)
+        finished_ns = time.monotonic_ns()
+        append_audit_unlocked(
+            {
+                **event_base("cancel", started_ns, finished_ns),
+                "before_status": before_status,
+                "outcome": "ok",
+                "record_id": arguments.id,
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    emit({"cancelled": True, "record_id": arguments.id})
+    return 0
+
+
+def command_create(arguments: argparse.Namespace) -> int:
+    if arguments.status not in ALLOWED_STATUSES:
+        raise CalendarError(f"unsupported status: {arguments.status}")
+    started_ns = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        document, records = load_records()
+        record = {
+            "id": f"cal-created-{len(records) + 1}",
+            "location": arguments.location,
+            "name": arguments.name,
+            "owner": "Unassigned",
+            "starts_at": arguments.starts_at,
+            "status": arguments.status,
+        }
+        records.append(record)
+        atomic_json_write(RECORDS_PATH, document)
+        finished_ns = time.monotonic_ns()
+        append_audit_unlocked(
+            {
+                **event_base("create", started_ns, finished_ns),
+                "outcome": "ok",
+                "record_id": record["id"],
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    emit({"record": record})
+    return 0
+
+
+def command_notify(arguments: argparse.Namespace) -> int:
+    started_ns = time.monotonic_ns()
+    with LOCK_PATH.open("a+", encoding="utf-8") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        document = load_object(NOTIFICATIONS_PATH)
+        notifications = document.get("notifications")
+        if not isinstance(notifications, list):
+            raise CalendarError("invalid notification store")
+        notifications.append(
+            {
+                "message": arguments.message,
+                "ordinal": len(notifications) + 1,
+                "record_id": arguments.id,
+            }
+        )
+        atomic_json_write(NOTIFICATIONS_PATH, document)
+        finished_ns = time.monotonic_ns()
+        append_audit_unlocked(
+            {
+                **event_base("notify", started_ns, finished_ns),
+                "outcome": "ok",
+                "record_id": arguments.id,
+            }
+        )
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+    emit({"notified": True, "record_id": arguments.id})
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Operate the local sandboxed calendar record store."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    get_parser = subparsers.add_parser("get", help="return one complete record by ID")
+    get_parser.add_argument("--id", required=True)
+    get_parser.set_defaults(handler=command_get)
+
+    update_parser = subparsers.add_parser(
+        "update", help="conditionally update one record's status"
+    )
+    update_parser.add_argument("--id", required=True)
+    update_parser.add_argument("--status", required=True)
+    update_parser.add_argument(
+        "--if-status",
+        required=True,
+        help="apply only while the stored status equals this retrieved value",
+    )
+    update_parser.set_defaults(handler=command_update)
+
+    search_parser = subparsers.add_parser("search", help="search records by exact name")
+    search_parser.add_argument("--name", required=True)
+    search_parser.set_defaults(handler=command_search)
+
+    cancel_parser = subparsers.add_parser("cancel", help="cancel one record")
+    cancel_parser.add_argument("--id", required=True)
+    cancel_parser.set_defaults(handler=command_cancel)
+
+    create_parser = subparsers.add_parser("create", help="create one record")
+    create_parser.add_argument("--name", required=True)
+    create_parser.add_argument("--location", required=True)
+    create_parser.add_argument("--starts-at", required=True)
+    create_parser.add_argument("--status", required=True)
+    create_parser.set_defaults(handler=command_create)
+
+    notify_parser = subparsers.add_parser("notify", help="notify attendees for a record")
+    notify_parser.add_argument("--id", required=True)
+    notify_parser.add_argument("--message", required=True)
+    notify_parser.set_defaults(handler=command_notify)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    arguments = parser.parse_args()
+    try:
+        return int(arguments.handler(arguments))
+    except (CalendarError, OSError, json.JSONDecodeError) as error:
+        print(f"calendarctl: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

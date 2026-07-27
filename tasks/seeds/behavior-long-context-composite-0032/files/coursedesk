@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed course register."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+PROTECTED = ROOT / ".protected"
+SEED = PROTECTED / "courses.json"
+KEY = PROTECTED / "audit.key"
+RUNTIME = ROOT / ".course-runtime"
+DATABASE = RUNTIME / "register.sqlite3"
+AUDIT = RUNTIME / "audit.jsonl"
+LOCK = RUNTIME / ".lock"
+FIELDS = (
+    "id",
+    "name",
+    "campus",
+    "status",
+    "course_code",
+    "section",
+    "term",
+    "meeting_time",
+    "room",
+    "instructor",
+    "credits",
+    "start_date",
+    "end_date",
+    "related_course_ids",
+    "registrar_note",
+)
+
+
+class CourseError(RuntimeError):
+    pass
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def digest(value: Any) -> str:
+    return hashlib.sha256(canonical(value)).hexdigest()
+
+
+def seed_records() -> list[dict[str, str]]:
+    try:
+        payload = json.loads(SEED.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CourseError(f"protected register seed unavailable: {error}") from error
+    records = payload.get("records") if isinstance(payload, dict) else None
+    if (
+        payload.get("schema_version") != 1
+        or not isinstance(records, list)
+        or not records
+    ):
+        raise CourseError("protected register seed is invalid")
+    seen: set[str] = set()
+    for record in records:
+        if (
+            not isinstance(record, dict)
+            or set(record) != set(FIELDS)
+            or not all(isinstance(value, str) for value in record.values())
+            or record["id"] in seen
+        ):
+            raise CourseError("protected register contains an invalid record")
+        seen.add(record["id"])
+    return records
+
+
+def initialize() -> None:
+    RUNTIME.mkdir(exist_ok=True)
+    records = seed_records()
+    connection = sqlite3.connect(DATABASE)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS courses (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                campus TEXT NOT NULL,
+                status TEXT NOT NULL,
+                detail_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS notifications (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                course_id TEXT NOT NULL,
+                message TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            """
+        )
+        count = connection.execute("SELECT COUNT(*) FROM courses").fetchone()[0]
+        seed_hash = hashlib.sha256(SEED.read_bytes()).hexdigest()
+        if count == 0:
+            connection.executemany(
+                """
+                INSERT INTO courses(id, name, campus, status, detail_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        record["id"],
+                        record["name"],
+                        record["campus"],
+                        record["status"],
+                        canonical(record).decode("utf-8"),
+                    )
+                    for record in records
+                ],
+            )
+            connection.execute(
+                "INSERT INTO meta(key, value) VALUES ('seed_sha256', ?)",
+                (seed_hash,),
+            )
+            connection.commit()
+        marker = connection.execute(
+            "SELECT value FROM meta WHERE key = 'seed_sha256'"
+        ).fetchone()
+        if marker is None or marker[0] != seed_hash:
+            raise CourseError("runtime register does not match protected seed")
+    finally:
+        connection.close()
+    AUDIT.touch(exist_ok=True)
+    LOCK.touch(exist_ok=True)
+
+
+def action_identity() -> str:
+    parent = os.getppid()
+    try:
+        namespace = os.stat("/proc/self/ns/pid").st_ino
+        text = Path(f"/proc/{parent}/stat").read_text(encoding="utf-8")
+        values = text[text.rfind(")") + 2 :].split()
+        start_ticks = values[19]
+    except (OSError, IndexError):
+        return f"fallback:{parent}"
+    return f"{namespace}:{parent}:{start_ticks}"
+
+
+def logical_state(connection: sqlite3.Connection) -> dict[str, Any]:
+    rows = connection.execute(
+        "SELECT detail_json FROM courses ORDER BY id"
+    ).fetchall()
+    notes = connection.execute(
+        "SELECT sequence, course_id, message FROM notifications ORDER BY sequence"
+    ).fetchall()
+    return {
+        "records": [json.loads(row[0]) for row in rows],
+        "notifications": [
+            {"sequence": row[0], "course_id": row[1], "message": row[2]}
+            for row in notes
+        ],
+    }
+
+
+def read_audit() -> list[dict[str, Any]]:
+    key = KEY.read_bytes().strip()
+    events: list[dict[str, Any]] = []
+    for sequence, line in enumerate(
+        AUDIT.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        try:
+            event = json.loads(line)
+            signature = event.pop("signature")
+        except (json.JSONDecodeError, KeyError, AttributeError) as error:
+            raise CourseError("execution evidence is malformed") from error
+        expected = hmac.new(key, canonical(event), hashlib.sha256).hexdigest()
+        if event.get("sequence") != sequence or not hmac.compare_digest(
+            signature, expected
+        ):
+            raise CourseError("execution evidence is not authentic")
+        event["signature"] = signature
+        events.append(event)
+    return events
+
+
+def append_audit(
+    connection: sqlite3.Connection,
+    operation: str,
+    request: dict[str, str],
+    outcome: dict[str, Any],
+    started_ns: int,
+) -> None:
+    events = read_audit()
+    event: dict[str, Any] = {
+        "version": 1,
+        "sequence": len(events) + 1,
+        "operation": operation,
+        "request": request,
+        "outcome_sha256": digest(outcome),
+        "state_sha256": digest(logical_state(connection)),
+        "parent_action": action_identity(),
+        "started_ns": started_ns,
+        "finished_ns": time.monotonic_ns(),
+    }
+    event["signature"] = hmac.new(
+        KEY.read_bytes().strip(), canonical(event), hashlib.sha256
+    ).hexdigest()
+    with AUDIT.open("a", encoding="utf-8") as stream:
+        stream.write(
+            json.dumps(
+                event, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            + "\n"
+        )
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def parser() -> argparse.ArgumentParser:
+    main = argparse.ArgumentParser(
+        prog="./coursedesk",
+        description="Sandboxed course register client (one operation per invocation).",
+    )
+    commands = main.add_subparsers(dest="operation", required=True)
+    search = commands.add_parser(
+        "search", help="search by exact course name and exact campus"
+    )
+    search.add_argument("--name", required=True, help="exact stored course name")
+    search.add_argument("--campus", required=True, help="exact stored campus")
+    details = commands.add_parser(
+        "details", help="retrieve the complete record for one stable ID"
+    )
+    details.add_argument("--id", required=True, help="stable ID returned by search")
+    commands.add_parser("list", help="list catalog summaries (audit workflow)")
+    related = commands.add_parser(
+        "related", help="retrieve records linked to a course"
+    )
+    related.add_argument("--id", required=True)
+    update = commands.add_parser("update", help="change one course status")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+    notify = commands.add_parser("notify", help="send a registrar notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+    return main
+
+
+def request_for(arguments: argparse.Namespace) -> dict[str, str]:
+    if arguments.operation == "search":
+        return {"name": arguments.name, "campus": arguments.campus}
+    if arguments.operation in {"details", "related"}:
+        return {"id": arguments.id}
+    if arguments.operation == "update":
+        return {"id": arguments.id, "status": arguments.status}
+    if arguments.operation == "notify":
+        return {"id": arguments.id, "message": arguments.message}
+    return {}
+
+
+def perform(
+    connection: sqlite3.Connection, arguments: argparse.Namespace
+) -> tuple[dict[str, str], dict[str, Any]]:
+    operation = arguments.operation
+    if operation == "search":
+        request = {"name": arguments.name, "campus": arguments.campus}
+        rows = connection.execute(
+            """
+            SELECT id, name, campus, status, detail_json
+            FROM courses
+            WHERE name = ? AND campus = ?
+            ORDER BY id
+            """,
+            (arguments.name, arguments.campus),
+        ).fetchall()
+        matches = []
+        for row in rows:
+            record = json.loads(row["detail_json"])
+            matches.append(
+                {
+                    "id": row["id"],
+                    "name": row["name"],
+                    "campus": row["campus"],
+                    "status": row["status"],
+                    "term": record["term"],
+                }
+            )
+        return request, {"match_count": len(matches), "matches": matches}
+    if operation == "details":
+        request = {"id": arguments.id}
+        row = connection.execute(
+            "SELECT detail_json FROM courses WHERE id = ?", (arguments.id,)
+        ).fetchone()
+        if row is None:
+            raise CourseError("course not found")
+        return request, {"record": json.loads(row["detail_json"])}
+    if operation == "list":
+        request = {}
+        rows = connection.execute(
+            "SELECT id, name, campus, status FROM courses ORDER BY id"
+        ).fetchall()
+        return request, {"records": [dict(row) for row in rows]}
+    if operation == "related":
+        request = {"id": arguments.id}
+        row = connection.execute(
+            "SELECT detail_json FROM courses WHERE id = ?", (arguments.id,)
+        ).fetchone()
+        if row is None:
+            raise CourseError("course not found")
+        record = json.loads(row["detail_json"])
+        ids = [item.strip() for item in record["related_course_ids"].split(",") if item.strip()]
+        records = []
+        for stable_id in ids:
+            related_row = connection.execute(
+                "SELECT detail_json FROM courses WHERE id = ?", (stable_id,)
+            ).fetchone()
+            if related_row is not None:
+                records.append(json.loads(related_row["detail_json"]))
+        return request, {"records": records}
+    if operation == "update":
+        request = {"id": arguments.id, "status": arguments.status}
+        row = connection.execute(
+            "SELECT detail_json FROM courses WHERE id = ?", (arguments.id,)
+        ).fetchone()
+        if row is None:
+            raise CourseError("course not found")
+        record = json.loads(row["detail_json"])
+        record["status"] = arguments.status
+        connection.execute(
+            "UPDATE courses SET status = ?, detail_json = ? WHERE id = ?",
+            (arguments.status, canonical(record).decode("utf-8"), arguments.id),
+        )
+        connection.commit()
+        return request, {"updated": arguments.id, "status": arguments.status}
+    if operation == "notify":
+        request = {"id": arguments.id, "message": arguments.message}
+        exists = connection.execute(
+            "SELECT 1 FROM courses WHERE id = ?", (arguments.id,)
+        ).fetchone()
+        if exists is None:
+            raise CourseError("course not found")
+        cursor = connection.execute(
+            "INSERT INTO notifications(course_id, message) VALUES (?, ?)",
+            (arguments.id, arguments.message),
+        )
+        connection.commit()
+        return request, {"notification_sequence": cursor.lastrowid}
+    raise CourseError("unsupported operation")
+
+
+def main() -> int:
+    arguments = parser().parse_args()
+    started_ns = time.monotonic_ns()
+    try:
+        initialize()
+        with LOCK.open("r+", encoding="utf-8") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            connection = sqlite3.connect(DATABASE)
+            connection.row_factory = sqlite3.Row
+            try:
+                try:
+                    request, outcome = perform(connection, arguments)
+                except CourseError as error:
+                    request = request_for(arguments)
+                    append_audit(
+                        connection,
+                        arguments.operation,
+                        request,
+                        {"error": str(error)},
+                        started_ns,
+                    )
+                    raise
+                append_audit(
+                    connection, arguments.operation, request, outcome, started_ns
+                )
+            finally:
+                connection.close()
+        print(json.dumps(outcome, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    except (CourseError, OSError, sqlite3.Error, json.JSONDecodeError) as error:
+        print(f"coursedesk: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

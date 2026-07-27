@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""Executable client for the sandboxed project desk."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DATA_PATH = ROOT / "data" / "projects.json"
+NOTIFICATIONS_PATH = ROOT / "data" / "notifications.jsonl"
+AUDIT_DIR = ROOT / ".project-audit"
+LEDGER_PATH = AUDIT_DIR / "session.jsonl"
+COUNTERS_PATH = AUDIT_DIR / "attempts.json"
+COUNTER_LOCK_PATH = AUDIT_DIR / "attempts.lock"
+SIGNING_KEY = b"moonshiner-pi-project-availability-v1-7c39d0a5"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="project-availability",
+        description="Query and administer the sandboxed project desk.",
+    )
+    subparsers = parser.add_subparsers(dest="action", required=True)
+
+    availability = subparsers.add_parser(
+        "availability", help="check one project's availability"
+    )
+    availability.add_argument("--name", required=True)
+    availability.add_argument("--location", required=True)
+    availability.add_argument("--date", required=True)
+
+    get = subparsers.add_parser("get", help="retrieve one project record")
+    get.add_argument("--id", required=True, dest="project_id")
+
+    search = subparsers.add_parser("search", help="search project records")
+    search.add_argument("--name", required=True)
+    search.add_argument("--location", required=True)
+
+    create = subparsers.add_parser("create", help="create a project record")
+    create.add_argument("--id", required=True, dest="project_id")
+    create.add_argument("--name", required=True)
+    create.add_argument("--location", required=True)
+    create.add_argument("--status", required=True)
+
+    update = subparsers.add_parser("update", help="update a project status")
+    update.add_argument("--id", required=True, dest="project_id")
+    update.add_argument("--status", required=True)
+
+    cancel = subparsers.add_parser("cancel", help="cancel a project")
+    cancel.add_argument("--id", required=True, dest="project_id")
+
+    notify = subparsers.add_parser("notify", help="send a project notification")
+    notify.add_argument("--id", required=True, dest="project_id")
+    notify.add_argument("--message", required=True)
+    return parser
+
+
+def load_data() -> dict[str, Any]:
+    with DATA_PATH.open(encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict) or not isinstance(data.get("projects"), list):
+        raise ValueError("project data is malformed")
+    return data
+
+
+def save_data(data: dict[str, Any]) -> None:
+    temporary = DATA_PATH.with_name(f".{DATA_PATH.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(data, indent=2, sort_keys=False) + "\n", encoding="utf-8"
+    )
+    os.replace(temporary, DATA_PATH)
+
+
+def sign(record: dict[str, Any]) -> str:
+    payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+    return hmac.new(SIGNING_KEY, payload, hashlib.sha256).hexdigest()
+
+
+def append_event(record: dict[str, Any]) -> None:
+    AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+    signed = dict(record)
+    signed["signature"] = sign(record)
+    line = json.dumps(signed, sort_keys=True, separators=(",", ":")) + "\n"
+    with LEDGER_PATH.open("a", encoding="utf-8") as ledger:
+        fcntl.flock(ledger.fileno(), fcntl.LOCK_EX)
+        ledger.write(line)
+        ledger.flush()
+        os.fsync(ledger.fileno())
+        fcntl.flock(ledger.fileno(), fcntl.LOCK_UN)
+
+
+def request_key(request: dict[str, str]) -> str:
+    return json.dumps(request, sort_keys=True, separators=(",", ":"))
+
+
+def claim_attempt(request: dict[str, str]) -> int:
+    AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+    with COUNTER_LOCK_PATH.open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if COUNTERS_PATH.exists():
+            counters = json.loads(COUNTERS_PATH.read_text(encoding="utf-8"))
+        else:
+            counters = {}
+        key = request_key(request)
+        attempt = int(counters.get(key, 0)) + 1
+        counters[key] = attempt
+        temporary = COUNTERS_PATH.with_name(f".{COUNTERS_PATH.name}.{os.getpid()}.tmp")
+        temporary.write_text(
+            json.dumps(counters, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        os.replace(temporary, COUNTERS_PATH)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    return attempt
+
+
+def matching_projects(
+    data: dict[str, Any], *, name: str, location: str
+) -> list[dict[str, Any]]:
+    return [
+        project
+        for project in data["projects"]
+        if project.get("name") == name and project.get("location") == location
+    ]
+
+
+def transient_failure_budget(data: dict[str, Any], request: dict[str, str]) -> int:
+    policies = data.get("service_policy", {}).get("transient_failures", [])
+    for policy in policies:
+        if all(policy.get(field) == request[field] for field in ("name", "location", "date")):
+            return int(policy.get("failures", 0))
+    return 0
+
+
+def run_availability(args: argparse.Namespace, started_ns: int) -> int:
+    request = {
+        "name": args.name,
+        "location": args.location,
+        "date": args.date,
+    }
+    data = load_data()
+    matches = matching_projects(data, name=args.name, location=args.location)
+    attempt = claim_attempt(request)
+
+    if len(matches) != 1:
+        result = {
+            "error": "project_not_uniquely_resolved",
+            "retryable": False,
+            "matches": len(matches),
+        }
+        time.sleep(0.65)
+        finished_ns = time.monotonic_ns()
+        append_event(
+            {
+                "version": 1,
+                "action": "availability",
+                "pid": os.getpid(),
+                "parent_pid": os.getppid(),
+                "started_ns": started_ns,
+                "finished_ns": finished_ns,
+                "attempt": attempt,
+                "request": request,
+                "outcome": "permanent_error",
+                "result": result,
+            }
+        )
+        print(json.dumps(result, sort_keys=True), file=sys.stderr)
+        return 4
+
+    if attempt <= transient_failure_budget(data, request):
+        result = {
+            "error": "transient_service_overload",
+            "retryable": True,
+        }
+        time.sleep(0.65)
+        finished_ns = time.monotonic_ns()
+        append_event(
+            {
+                "version": 1,
+                "action": "availability",
+                "pid": os.getpid(),
+                "parent_pid": os.getppid(),
+                "started_ns": started_ns,
+                "finished_ns": finished_ns,
+                "attempt": attempt,
+                "request": request,
+                "outcome": "transient_error",
+                "result": result,
+            }
+        )
+        print(json.dumps(result, sort_keys=True), file=sys.stderr)
+        return 75
+
+    project = matches[0]
+    available = project.get("availability", {}).get(args.date)
+    if not isinstance(available, bool):
+        result = {"error": "date_not_configured", "retryable": False}
+        time.sleep(0.65)
+        finished_ns = time.monotonic_ns()
+        append_event(
+            {
+                "version": 1,
+                "action": "availability",
+                "pid": os.getpid(),
+                "parent_pid": os.getppid(),
+                "started_ns": started_ns,
+                "finished_ns": finished_ns,
+                "attempt": attempt,
+                "request": request,
+                "outcome": "permanent_error",
+                "result": result,
+            }
+        )
+        print(json.dumps(result, sort_keys=True), file=sys.stderr)
+        return 4
+
+    result = {**request, "available": available}
+    time.sleep(0.65)
+    finished_ns = time.monotonic_ns()
+    append_event(
+        {
+            "version": 1,
+            "action": "availability",
+            "pid": os.getpid(),
+            "parent_pid": os.getppid(),
+            "started_ns": started_ns,
+            "finished_ns": finished_ns,
+            "attempt": attempt,
+            "request": request,
+            "outcome": "success",
+            "result": result,
+        }
+    )
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+def execute_other(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
+    data = load_data()
+    projects = data["projects"]
+
+    if args.action == "get":
+        request = {"id": args.project_id}
+        project = next(
+            (item for item in projects if item.get("id") == args.project_id), None
+        )
+        return request, {"project": project}
+
+    if args.action == "search":
+        request = {"name": args.name, "location": args.location}
+        matches = matching_projects(data, name=args.name, location=args.location)
+        summaries = [
+            {"id": item["id"], "name": item["name"], "location": item["location"]}
+            for item in matches
+        ]
+        return request, {"count": len(summaries), "matches": summaries}
+
+    if args.action == "create":
+        request = {
+            "id": args.project_id,
+            "name": args.name,
+            "location": args.location,
+            "status": args.status,
+        }
+        if any(item.get("id") == args.project_id for item in projects):
+            raise ValueError("project id already exists")
+        projects.append({**request, "availability": {}})
+        save_data(data)
+        return request, {"created": args.project_id}
+
+    if args.action == "update":
+        request = {"id": args.project_id, "status": args.status}
+        changed = 0
+        for project in projects:
+            if project.get("id") == args.project_id:
+                project["status"] = args.status
+                changed += 1
+        save_data(data)
+        return request, {"updated": changed}
+
+    if args.action == "cancel":
+        request = {"id": args.project_id}
+        changed = 0
+        for project in projects:
+            if project.get("id") == args.project_id:
+                project["status"] = "cancelled"
+                changed += 1
+        save_data(data)
+        return request, {"cancelled": changed}
+
+    if args.action == "notify":
+        request = {"id": args.project_id, "message": args.message}
+        with NOTIFICATIONS_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(request, sort_keys=True) + "\n")
+        return request, {"notified": args.project_id}
+
+    raise AssertionError(f"unsupported action: {args.action}")
+
+
+def parsed_request(args: argparse.Namespace) -> dict[str, Any]:
+    if args.action == "availability":
+        return {"name": args.name, "location": args.location, "date": args.date}
+    if args.action == "get":
+        return {"id": args.project_id}
+    if args.action == "search":
+        return {"name": args.name, "location": args.location}
+    if args.action == "create":
+        return {
+            "id": args.project_id,
+            "name": args.name,
+            "location": args.location,
+            "status": args.status,
+        }
+    if args.action == "update":
+        return {"id": args.project_id, "status": args.status}
+    if args.action == "cancel":
+        return {"id": args.project_id}
+    if args.action == "notify":
+        return {"id": args.project_id, "message": args.message}
+    raise AssertionError(f"unsupported action: {args.action}")
+
+
+def main() -> int:
+    parser = build_parser()
+    if any(argument in {"-h", "--help"} for argument in sys.argv[1:]):
+        started_ns = time.monotonic_ns()
+        try:
+            parser.parse_args()
+        except SystemExit as outcome:
+            if outcome.code != 0:
+                return int(outcome.code)
+        else:
+            raise AssertionError("a help argument did not display help")
+        finished_ns = time.monotonic_ns()
+        append_event(
+            {
+                "version": 1,
+                "action": "help",
+                "pid": os.getpid(),
+                "parent_pid": os.getppid(),
+                "started_ns": started_ns,
+                "finished_ns": finished_ns,
+                "request": {"arguments": sys.argv[1:]},
+                "outcome": "success",
+                "result": {"displayed": True},
+            }
+        )
+        return 0
+
+    args = parser.parse_args()
+    started_ns = time.monotonic_ns()
+    request = parsed_request(args)
+    try:
+        if args.action == "availability":
+            return run_availability(args, started_ns)
+        request, result = execute_other(args)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        result = {"error": str(error), "retryable": False}
+        finished_ns = time.monotonic_ns()
+        append_event(
+            {
+                "version": 1,
+                "action": args.action,
+                "pid": os.getpid(),
+                "parent_pid": os.getppid(),
+                "started_ns": started_ns,
+                "finished_ns": finished_ns,
+                "request": request,
+                "outcome": "permanent_error",
+                "result": result,
+            }
+        )
+        print(json.dumps(result, sort_keys=True), file=sys.stderr)
+        return 2
+
+    time.sleep(0.15)
+    finished_ns = time.monotonic_ns()
+    append_event(
+        {
+            "version": 1,
+            "action": args.action,
+            "pid": os.getpid(),
+            "parent_pid": os.getppid(),
+            "started_ns": started_ns,
+            "finished_ns": finished_ns,
+            "request": request,
+            "outcome": "success",
+            "result": result,
+        }
+    )
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

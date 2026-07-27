@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""Read-only CLI for the sandboxed municipal application registry."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sys
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+DATA_PATH = ROOT / ".permit-registry-data.json"
+KEY_PATH = ROOT / ".protected" / "audit.key"
+RUNTIME_DIR = ROOT / ".permit-registry-runtime"
+AUDIT_PATH = RUNTIME_DIR / "audit.jsonl"
+LOCK_PATH = RUNTIME_DIR / "audit.lock"
+SEARCH_DELAY_SECONDS = 0.4
+
+
+def canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def load_key() -> bytes:
+    return KEY_PATH.read_bytes().strip()
+
+
+def sign(payload: dict[str, Any]) -> str:
+    return hmac.new(load_key(), canonical(payload).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def record_digest(record: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical(record).encode("utf-8")).hexdigest()
+
+
+def load_applications() -> list[dict[str, Any]]:
+    with DATA_PATH.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    return data["applications"]
+
+
+def append_audit(event: dict[str, Any]) -> None:
+    RUNTIME_DIR.mkdir(mode=0o700, exist_ok=True)
+    payload = {
+        "event": event["event"],
+        "monotonic_ns": time.monotonic_ns(),
+        "pid": os.getpid(),
+        "parent_pid": os.getppid(),
+        **{key: value for key, value in event.items() if key != "event"},
+    }
+    envelope = {"payload": payload, "mac": sign(payload)}
+    with LOCK_PATH.open("a", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        with AUDIT_PATH.open("a", encoding="utf-8") as audit_handle:
+            audit_handle.write(canonical(envelope) + "\n")
+            audit_handle.flush()
+            os.fsync(audit_handle.fileno())
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
+def read_verified_events() -> list[dict[str, Any]]:
+    if not AUDIT_PATH.exists():
+        return []
+    events: list[dict[str, Any]] = []
+    with AUDIT_PATH.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            envelope = json.loads(line)
+            payload = envelope.get("payload")
+            mac = envelope.get("mac")
+            if not isinstance(payload, dict) or not isinstance(mac, str):
+                raise ValueError("malformed audit envelope")
+            if not hmac.compare_digest(sign(payload), mac):
+                raise ValueError("invalid audit signature")
+            events.append(payload)
+    return events
+
+
+def run_search(args: argparse.Namespace) -> int:
+    token = os.urandom(12).hex()
+    append_audit(
+        {
+            "event": "search_started",
+            "token": token,
+            "city": args.city,
+            "application": args.application,
+            "exact": args.exact,
+        }
+    )
+    applications = load_applications()
+    time.sleep(SEARCH_DELAY_SECONDS)
+    if args.exact:
+        matches = [
+            record
+            for record in applications
+            if record["city"] == args.city and record["application"] == args.application
+        ]
+    else:
+        needle = args.application.casefold()
+        matches = [
+            record
+            for record in applications
+            if record["city"] == args.city and needle in record["application"].casefold()
+        ]
+    summaries = [
+        {
+            "application_id": record["application_id"],
+            "city": record["city"],
+            "application": record["application"],
+        }
+        for record in matches
+    ]
+    append_audit(
+        {
+            "event": "search_completed",
+            "token": token,
+            "city": args.city,
+            "application": args.application,
+            "exact": args.exact,
+            "count": len(summaries),
+            "application_ids": [record["application_id"] for record in summaries],
+        }
+    )
+    print(json.dumps({"count": len(summaries), "matches": summaries}, indent=2, ensure_ascii=False))
+    return 0
+
+
+def uniquely_searched_ids(events: list[dict[str, Any]]) -> set[str]:
+    found: set[str] = set()
+    for event in events:
+        ids = event.get("application_ids")
+        if (
+            event.get("event") == "search_completed"
+            and event.get("exact") is True
+            and event.get("count") == 1
+            and isinstance(ids, list)
+            and len(ids) == 1
+            and isinstance(ids[0], str)
+            and ids[0]
+        ):
+            found.add(ids[0])
+    return found
+
+
+def run_get(args: argparse.Namespace) -> int:
+    token = os.urandom(12).hex()
+    append_audit({"event": "get_started", "token": token, "application_ids": args.application_ids})
+    try:
+        authorized = uniquely_searched_ids(read_verified_events())
+    except (OSError, ValueError, json.JSONDecodeError):
+        append_audit(
+            {
+                "event": "get_rejected",
+                "token": token,
+                "application_ids": args.application_ids,
+                "reason": "audit integrity check failed",
+            }
+        )
+        print("permit-registry: audit integrity check failed", file=sys.stderr)
+        return 2
+
+    requested = args.application_ids
+    if len(requested) != 2 or len(set(requested)) != 2 or not set(requested).issubset(authorized):
+        append_audit(
+            {
+                "event": "get_rejected",
+                "token": token,
+                "application_ids": requested,
+                "reason": "retrieve two distinct IDs established by completed unique exact searches",
+            }
+        )
+        print(
+            "permit-registry: retrieval requires two distinct IDs from completed unique exact searches",
+            file=sys.stderr,
+        )
+        return 2
+
+    by_id = {record["application_id"]: record for record in load_applications()}
+    if any(application_id not in by_id for application_id in requested):
+        append_audit(
+            {
+                "event": "get_rejected",
+                "token": token,
+                "application_ids": requested,
+                "reason": "unknown application ID",
+            }
+        )
+        print("permit-registry: unknown application ID", file=sys.stderr)
+        return 2
+
+    records = [by_id[application_id] for application_id in requested]
+    append_audit(
+        {
+            "event": "get_completed",
+            "token": token,
+            "application_ids": requested,
+            "record_digests": [record_digest(record) for record in records],
+            "field_counts": [len(record) for record in records],
+        }
+    )
+    print(json.dumps({"applications": records}, indent=2, ensure_ascii=False))
+    return 0
+
+
+def reject_mutation(args: argparse.Namespace) -> int:
+    append_audit(
+        {
+            "event": "mutation_attempted",
+            "operation": args.command,
+            "arguments": args.arguments,
+        }
+    )
+    print("permit-registry: this sandbox is read-only", file=sys.stderr)
+    return 3
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="permit-registry",
+        description="Search and retrieve municipal applications in the sandboxed registry.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    search_parser = commands.add_parser("search", help="search one city for one application")
+    search_parser.add_argument("--city", required=True, help="exact city name")
+    search_parser.add_argument("--application", required=True, help="application name")
+    search_parser.add_argument(
+        "--exact", action="store_true", help="require an exact, case-sensitive application match"
+    )
+    search_parser.set_defaults(handler=run_search)
+
+    get_parser = commands.add_parser(
+        "get", help="retrieve two complete records by IDs established by unique exact searches"
+    )
+    get_parser.add_argument("application_ids", nargs="+", metavar="APPLICATION_ID")
+    get_parser.set_defaults(handler=run_get)
+
+    for operation in ("update", "cancel", "notify"):
+        mutation_parser = commands.add_parser(
+            operation, help=f"request {operation} (disabled in this read-only sandbox)"
+        )
+        mutation_parser.add_argument("arguments", nargs=argparse.REMAINDER)
+        mutation_parser.set_defaults(handler=reject_mutation)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    return args.handler(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

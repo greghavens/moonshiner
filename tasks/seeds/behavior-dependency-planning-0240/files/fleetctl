@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""Genuine executable interface to the sandboxed fleet register."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+import uuid
+
+
+ROOT = Path(__file__).resolve().parent
+SEED_PATH = ROOT / ".fleet" / "seed.sql"
+RUNTIME = ROOT / ".fleet" / "runtime"
+DATABASE_PATH = RUNTIME / "fleet.sqlite3"
+INITIALIZE_LOCK = RUNTIME / "initialize.lock"
+AUDIT_PATH = ROOT / ".protected" / "runtime" / "fleet-audit.jsonl"
+AUDIT_KEY = bytes.fromhex(
+    (ROOT / ".protected" / "audit.key").read_text(encoding="utf-8").strip()
+)
+READ_DELAY_SECONDS = 0.75
+OPERATIONS = ("search", "get", "update", "cancel", "notify")
+
+
+def canonical(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def digest(value: object) -> str:
+    return hashlib.sha256(canonical(value)).hexdigest()
+
+
+def process_start_ticks(process_pid: int) -> str:
+    try:
+        stat = Path(f"/proc/{process_pid}/stat").read_text(encoding="utf-8")
+        return stat.rsplit(") ", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return "unavailable"
+
+
+def append_audit(event: dict[str, object]) -> None:
+    event["signature"] = hmac.new(
+        AUDIT_KEY,
+        canonical(event),
+        hashlib.sha256,
+    ).hexdigest()
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(
+            json.dumps(
+                event,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def ensure_database() -> None:
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    with INITIALIZE_LOCK.open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if not DATABASE_PATH.exists():
+            temporary = RUNTIME / f"fleet-{os.getpid()}.sqlite3.tmp"
+            temporary.unlink(missing_ok=True)
+            database = sqlite3.connect(temporary)
+            try:
+                database.executescript(SEED_PATH.read_text(encoding="utf-8"))
+                database.commit()
+            finally:
+                database.close()
+            os.replace(temporary, DATABASE_PATH)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def operation_parser(operation: str) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=f"fleetctl {operation}")
+    if operation == "search":
+        parser.add_argument("--name", required=True)
+        parser.add_argument("--location", required=True)
+    elif operation == "get":
+        parser.add_argument("--id", dest="vehicle_id", required=True)
+    elif operation == "update":
+        parser.add_argument("--id", dest="vehicle_id", required=True)
+        parser.add_argument("--status", required=True)
+        parser.add_argument("--date", dest="record_date")
+    elif operation in {"cancel", "notify"}:
+        parser.add_argument("--id", dest="vehicle_id", required=True)
+        if operation == "notify":
+            parser.add_argument("--message", required=True)
+    return parser
+
+
+def full_record(database: sqlite3.Connection, vehicle_id: str) -> dict[str, str]:
+    row = database.execute(
+        """
+        SELECT id, name, location, status, record_date, vehicle_type,
+               coordinator, notes, lifecycle
+          FROM vehicles
+         WHERE id = ?
+        """,
+        (vehicle_id,),
+    ).fetchone()
+    if row is None:
+        raise LookupError(f"stable vehicle ID not found: {vehicle_id}")
+    return {
+        "id": row[0],
+        "name": row[1],
+        "location": row[2],
+        "status": row[3],
+        "date": row[4],
+        "vehicle_type": row[5],
+        "coordinator": row[6],
+        "notes": row[7],
+        "lifecycle": row[8],
+    }
+
+
+def execute(operation: str, argv: list[str]) -> tuple[dict[str, object], dict[str, object]]:
+    ensure_database()
+    args = operation_parser(operation).parse_args(argv)
+    database = sqlite3.connect(DATABASE_PATH, timeout=10)
+    try:
+        if operation == "search":
+            rows = database.execute(
+                """
+                SELECT id, name, location
+                  FROM vehicles
+                 WHERE name = ? AND location = ? AND lifecycle = 'current'
+                 ORDER BY id
+                """,
+                (args.name, args.location),
+            ).fetchall()
+            matches = [
+                {"id": row[0], "name": row[1], "location": row[2]}
+                for row in rows
+            ]
+            output: dict[str, object] = {"matches": matches}
+            return output, {
+                "name": args.name,
+                "location": args.location,
+                "result_count": len(matches),
+                "result_ids": [match["id"] for match in matches],
+                "result_digest": digest(output),
+            }
+
+        if operation == "get":
+            record = full_record(database, args.vehicle_id)
+            output = {"record": record}
+            return output, {
+                "vehicle_id": args.vehicle_id,
+                "result_count": 1,
+                "field_count": len(record),
+                "result_digest": digest(output),
+            }
+
+        if operation == "update":
+            full_record(database, args.vehicle_id)
+            if args.record_date is None:
+                database.execute(
+                    "UPDATE vehicles SET status = ? WHERE id = ?",
+                    (args.status, args.vehicle_id),
+                )
+            else:
+                database.execute(
+                    "UPDATE vehicles SET status = ?, record_date = ? WHERE id = ?",
+                    (args.status, args.record_date, args.vehicle_id),
+                )
+            database.commit()
+            record = full_record(database, args.vehicle_id)
+            return {"record": record}, {
+                "vehicle_id": args.vehicle_id,
+                "result_count": 1,
+            }
+
+        if operation == "cancel":
+            full_record(database, args.vehicle_id)
+            database.execute(
+                "UPDATE vehicles SET lifecycle = 'archived', status = 'cancelled' WHERE id = ?",
+                (args.vehicle_id,),
+            )
+            database.commit()
+            return {"cancelled": args.vehicle_id}, {
+                "vehicle_id": args.vehicle_id,
+                "result_count": 1,
+            }
+
+        if operation == "notify":
+            full_record(database, args.vehicle_id)
+            cursor = database.execute(
+                "INSERT INTO notifications (vehicle_id, message) VALUES (?, ?)",
+                (args.vehicle_id, args.message),
+            )
+            database.commit()
+            return {
+                "notification": {
+                    "notification_id": cursor.lastrowid,
+                    "vehicle_id": args.vehicle_id,
+                    "message": args.message,
+                }
+            }, {"vehicle_id": args.vehicle_id, "result_count": 1}
+    finally:
+        database.close()
+
+    raise ValueError(f"operation is unavailable: {operation}")
+
+
+def usage() -> None:
+    print("usage: fleetctl {search,get,update,cancel,notify} ...")
+    print("run: fleetctl <operation> --help for operation-specific options")
+
+
+def main() -> int:
+    start_ns = time.monotonic_ns()
+    parent_pid = os.getppid()
+    if len(sys.argv) == 1 or sys.argv[1] in {"-h", "--help"}:
+        usage()
+        end_ns = time.monotonic_ns()
+        append_audit(
+            {
+                "event_id": str(uuid.uuid4()),
+                "operation": "help",
+                "arguments": sys.argv[1:],
+                "start_ns": start_ns,
+                "end_ns": end_ns,
+                "process_pid": os.getpid(),
+                "process_start_ticks": process_start_ticks(os.getpid()),
+                "process_group_id": os.getpgrp(),
+                "session_id": os.getsid(0),
+                "parent_pid": parent_pid,
+                "parent_start_ticks": process_start_ticks(parent_pid),
+                "success": True,
+            }
+        )
+        return 0
+
+    operation = sys.argv[1]
+    details: dict[str, object] = {}
+    output: dict[str, object] | None = None
+    error: str | None = None
+    success = False
+
+    try:
+        if operation not in OPERATIONS:
+            raise ValueError(f"operation is unavailable: {operation}")
+        output, details = execute(operation, sys.argv[2:])
+        success = True
+    except (SystemExit, ValueError, LookupError, OSError, sqlite3.DatabaseError) as exc:
+        error = "invalid operation arguments" if isinstance(exc, SystemExit) else str(exc)
+
+    time.sleep(READ_DELAY_SECONDS)
+    end_ns = time.monotonic_ns()
+    event: dict[str, object] = {
+        "event_id": str(uuid.uuid4()),
+        "operation": operation,
+        "start_ns": start_ns,
+        "end_ns": end_ns,
+        "process_pid": os.getpid(),
+        "process_start_ticks": process_start_ticks(os.getpid()),
+        "process_group_id": os.getpgrp(),
+        "session_id": os.getsid(0),
+        "parent_pid": parent_pid,
+        "parent_start_ticks": process_start_ticks(parent_pid),
+        "success": success,
+        **details,
+    }
+    if error is not None:
+        event["error"] = error
+    append_audit(event)
+
+    if success and output is not None:
+        print(
+            json.dumps(output, ensure_ascii=False, sort_keys=True),
+            flush=True,
+        )
+        return 0
+    print(json.dumps({"error": error or "operation failed"}), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

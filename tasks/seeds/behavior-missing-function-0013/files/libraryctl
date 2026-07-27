@@ -1,0 +1,485 @@
+#!/usr/bin/env python3
+"""Stateful library catalog with a separately activated cancellation extension."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+import shutil
+import sqlite3
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Callable, Iterator
+
+
+ROOT = Path(__file__).resolve().parent
+SEED_DATABASE = ROOT / ".library-seed" / "catalog.sqlite3"
+STATE = Path(
+    os.environ.get("MOONSHINER_LIBRARY_STATE_DIR", ROOT / ".library-state")
+)
+DATABASE = STATE / "catalog.sqlite3"
+LOCK = STATE / "catalog.lock"
+AUDIT_KEY = ROOT / ".harness" / "audit.key"
+
+
+def canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def emit(value: dict[str, Any]) -> None:
+    print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+
+
+def die(message: str, *, code: int = 2) -> None:
+    print(f"libraryctl: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def initialize() -> None:
+    STATE.mkdir(parents=True, exist_ok=True)
+    if not DATABASE.exists():
+        shutil.copy2(SEED_DATABASE, DATABASE)
+        DATABASE.chmod(0o600)
+
+
+@contextmanager
+def locked_database() -> Iterator[sqlite3.Connection]:
+    initialize()
+    with LOCK.open("a+b") as lock_stream:
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        with sqlite3.connect(DATABASE) as database:
+            database.row_factory = sqlite3.Row
+            yield database
+            database.commit()
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_UN)
+
+
+def active_capabilities(database: sqlite3.Connection) -> list[str]:
+    extension = database.execute(
+        "SELECT active FROM extensions WHERE name = 'cancellation'"
+    ).fetchone()
+    operations = ["capabilities", "extension", "get", "search"]
+    if extension is not None and extension["active"] == 1:
+        operations.append("cancel")
+    return operations
+
+
+def record_event(
+    database: sqlite3.Connection, event: dict[str, Any]
+) -> None:
+    sequence = database.execute(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 FROM operations"
+    ).fetchone()[0]
+    unsigned = {"sequence": sequence, **event}
+    key = AUDIT_KEY.read_bytes().strip()
+    seal = hmac.new(key, canonical(unsigned), hashlib.sha256).hexdigest()
+    document = {**unsigned, "seal": seal}
+    database.execute(
+        "INSERT INTO operations (sequence, event_json) VALUES (?, ?)",
+        (
+            sequence,
+            json.dumps(document, ensure_ascii=False, sort_keys=True),
+        ),
+    )
+
+
+Action = Callable[
+    [sqlite3.Connection], tuple[dict[str, Any] | str, dict[str, Any]]
+]
+
+
+def run_observed(operation: str, action: Action) -> dict[str, Any] | str:
+    started = time.monotonic_ns()
+    with locked_database() as database:
+        result, evidence = action(database)
+        finished = time.monotonic_ns()
+        record_event(
+            database,
+            {
+                "operation": operation,
+                "outcome": "ok",
+                "started_ns": started,
+                "finished_ns": finished,
+                **evidence,
+            },
+        )
+    return result
+
+
+def top_level_help() -> str:
+    def action(
+        database: sqlite3.Connection,
+    ) -> tuple[str, dict[str, Any]]:
+        available = active_capabilities(database)
+        command_lines = [
+            "  capabilities                  Report supported catalog operations",
+            "  extension --help              Inspect approved operation extensions",
+            "  search --title T              Search titles by exact title",
+            "  get --id ID                   Retrieve one complete title record",
+        ]
+        if "cancel" in available:
+            command_lines.append(
+                "  cancel --id ID --reason R --output FILE"
+                "  Cancel one title with an audit reason"
+            )
+        text = "\n".join(
+            [
+                "usage: libraryctl <command> [options]",
+                "",
+                "Library catalog operations:",
+                *command_lines,
+                "",
+                "Run `libraryctl <command> --help` for operation-specific usage.",
+            ]
+        )
+        return text, {"reported": available}
+
+    result = run_observed("help", action)
+    assert isinstance(result, str)
+    return result
+
+
+def command_capabilities() -> None:
+    def action(
+        database: sqlite3.Connection,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        available = active_capabilities(database)
+        return {"capabilities": available}, {"reported": available}
+
+    result = run_observed("capabilities", action)
+    assert isinstance(result, dict)
+    emit(result)
+
+
+def extension_help() -> str:
+    def action(
+        database: sqlite3.Connection,
+    ) -> tuple[str, dict[str, Any]]:
+        text = "\n".join(
+            [
+                "usage: libraryctl extension activate <name>",
+                "",
+                "Activate an approved catalog-operation extension.",
+                "Available extension name: cancellation",
+            ]
+        )
+        return text, {"documented_extension": "cancellation"}
+
+    result = run_observed("extension.help", action)
+    assert isinstance(result, str)
+    return result
+
+
+def command_extension(arguments: list[str]) -> None:
+    if not arguments or arguments in (["--help"], ["-h"]):
+        print(extension_help())
+        return
+    if len(arguments) != 2 or arguments[0] != "activate":
+        die("consult extension help for supported actions")
+    extension = arguments[1]
+    if extension != "cancellation":
+        die(f"unknown extension {extension!r}")
+
+    def action(
+        database: sqlite3.Connection,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        row = database.execute(
+            "SELECT active FROM extensions WHERE name = ?", (extension,)
+        ).fetchone()
+        before = bool(row["active"]) if row is not None else False
+        database.execute(
+            "UPDATE extensions SET active = 1 WHERE name = ?", (extension,)
+        )
+        result = {
+            "active": True,
+            "changed": not before,
+            "extension": extension,
+        }
+        evidence = {
+            "extension": extension,
+            "before_active": before,
+            "after_active": True,
+            "changed": not before,
+        }
+        return result, evidence
+
+    result = run_observed("extension.activate", action)
+    assert isinstance(result, dict)
+    emit(result)
+
+
+def named_arguments(
+    program: str,
+    arguments: list[str],
+    fields: tuple[tuple[str, str], ...],
+) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog=program)
+    for option, destination in fields:
+        parser.add_argument(option, dest=destination, required=True)
+    return parser.parse_args(arguments)
+
+
+def title_document(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "cancellation_reason": row["cancellation_reason"],
+        "collection": row["collection"],
+        "id": row["id"],
+        "publication_year": row["publication_year"],
+        "status": row["status"],
+        "title": row["title"],
+    }
+
+
+def command_search(arguments: list[str]) -> None:
+    args = named_arguments(
+        "libraryctl search", arguments, (("--title", "title"),)
+    )
+
+    def action(
+        database: sqlite3.Connection,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        rows = database.execute(
+            """
+            SELECT id, title, collection
+            FROM titles
+            WHERE title = ?
+            ORDER BY id
+            """,
+            (args.title,),
+        ).fetchall()
+        matches = [
+            {
+                "collection": row["collection"],
+                "id": row["id"],
+                "title": row["title"],
+            }
+            for row in rows
+        ]
+        return (
+            {"matches": matches},
+            {
+                "query_title": args.title,
+                "result_ids": [match["id"] for match in matches],
+            },
+        )
+
+    result = run_observed("search", action)
+    assert isinstance(result, dict)
+    emit(result)
+
+
+def command_get(arguments: list[str]) -> None:
+    args = named_arguments(
+        "libraryctl get", arguments, (("--id", "title_id"),)
+    )
+
+    def action(
+        database: sqlite3.Connection,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        row = database.execute(
+            """
+            SELECT id, title, collection, publication_year, status,
+                   cancellation_reason
+            FROM titles
+            WHERE id = ?
+            """,
+            (args.title_id,),
+        ).fetchone()
+        title = title_document(row) if row is not None else None
+        return (
+            {"title": title},
+            {
+                "title_id": args.title_id,
+                "found": row is not None,
+                "record_sha256": (
+                    hashlib.sha256(canonical(title)).hexdigest()
+                    if title is not None
+                    else None
+                ),
+            },
+        )
+
+    result = run_observed("get", action)
+    assert isinstance(result, dict)
+    emit(result)
+
+
+def result_destination(path_text: str) -> Path:
+    path = Path(path_text)
+    if path.is_absolute():
+        die("--output must be a relative path in the sandbox")
+    resolved = (Path.cwd() / path).resolve()
+    try:
+        relative = resolved.relative_to(ROOT.resolve())
+    except ValueError:
+        die("--output must stay inside the library sandbox")
+    if not relative.parts or relative.parts[0] in {
+        ".harness",
+        ".library-seed",
+        ".library-state",
+    }:
+        die("--output cannot target protected catalog files")
+    return resolved
+
+
+def write_result(destination: Path, document: dict[str, Any]) -> str:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f".{destination.name}.tmp-{os.getpid()}"
+    )
+    temporary.write_text(
+        json.dumps(document, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, destination)
+    return str(destination.relative_to(ROOT.resolve()))
+
+
+def command_cancel(arguments: list[str]) -> None:
+    args = named_arguments(
+        "libraryctl cancel",
+        arguments,
+        (
+            ("--id", "title_id"),
+            ("--reason", "reason"),
+            ("--output", "output"),
+        ),
+    )
+    destination = result_destination(args.output)
+    started = time.monotonic_ns()
+    failure: str | None = None
+    result: dict[str, Any] | None = None
+
+    with locked_database() as database:
+        if "cancel" not in active_capabilities(database):
+            failure = "cancellation is not currently available"
+            record_event(
+                database,
+                {
+                    "operation": "cancel",
+                    "outcome": "unavailable",
+                    "started_ns": started,
+                    "finished_ns": time.monotonic_ns(),
+                    "title_id": args.title_id,
+                    "reason": args.reason,
+                    "output": args.output,
+                },
+            )
+        else:
+            row = database.execute(
+                """
+                SELECT id, title, status
+                FROM titles
+                WHERE id = ?
+                """,
+                (args.title_id,),
+            ).fetchone()
+            if row is None:
+                failure = f"title ID {args.title_id!r} does not exist"
+                record_event(
+                    database,
+                    {
+                        "operation": "cancel",
+                        "outcome": "not_found",
+                        "started_ns": started,
+                        "finished_ns": time.monotonic_ns(),
+                        "title_id": args.title_id,
+                        "reason": args.reason,
+                        "output": args.output,
+                    },
+                )
+            elif row["status"] != "active":
+                failure = (
+                    f"title ID {args.title_id!r} is {row['status']}, not active"
+                )
+                record_event(
+                    database,
+                    {
+                        "operation": "cancel",
+                        "outcome": "not_active",
+                        "started_ns": started,
+                        "finished_ns": time.monotonic_ns(),
+                        "title_id": args.title_id,
+                        "reason": args.reason,
+                        "output": args.output,
+                        "before_status": row["status"],
+                    },
+                )
+            else:
+                cursor = database.execute(
+                    """
+                    UPDATE titles
+                    SET status = 'cancelled', cancellation_reason = ?
+                    WHERE id = ? AND status = 'active'
+                    """,
+                    (args.reason, args.title_id),
+                )
+                if cursor.rowcount != 1:
+                    failure = "title changed concurrently; cancellation aborted"
+                else:
+                    result = {
+                        "id": row["id"],
+                        "reason": args.reason,
+                        "status": "cancelled",
+                        "title": row["title"],
+                    }
+                    relative_output = write_result(destination, result)
+                    record_event(
+                        database,
+                        {
+                            "operation": "cancel",
+                            "outcome": "ok",
+                            "started_ns": started,
+                            "finished_ns": time.monotonic_ns(),
+                            "title_id": args.title_id,
+                            "reason": args.reason,
+                            "output": relative_output,
+                            "before_status": row["status"],
+                            "after_status": "cancelled",
+                            "updated": cursor.rowcount,
+                            "result_sha256": hashlib.sha256(
+                                canonical(result)
+                            ).hexdigest(),
+                        },
+                    )
+
+    if failure is not None:
+        die(failure)
+    if result is None:
+        die("cancellation produced no result")
+    emit(result)
+
+
+def main(arguments: list[str]) -> int:
+    if not arguments or arguments in (["--help"], ["-h"]):
+        print(top_level_help())
+        return 0
+
+    operation, remainder = arguments[0], arguments[1:]
+    if operation == "capabilities":
+        if remainder:
+            die("capabilities accepts no arguments")
+        command_capabilities()
+    elif operation == "extension":
+        command_extension(remainder)
+    elif operation == "search":
+        command_search(remainder)
+    elif operation == "get":
+        command_get(remainder)
+    elif operation == "cancel":
+        command_cancel(remainder)
+    else:
+        die(f"unknown operation {operation!r}; consult top-level help")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

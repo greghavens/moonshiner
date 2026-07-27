@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""Executable interface for the task's disposable shipment register."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent
+STATE = ROOT / ".state"
+DATABASE = STATE / "shipments.sqlite3"
+HISTORY = STATE / "operations.jsonl"
+HELP_MARKER = STATE / "help-used"
+AUDIT_KEY = ROOT / ".protected" / "audit.key"
+READ_DELAY_SECONDS = 0.55
+
+
+def build_parser() -> argparse.ArgumentParser:
+    command = argparse.ArgumentParser(
+        prog="shipmentctl",
+        description="Search, retrieve, or manage the local shipment register.",
+    )
+    subcommands = command.add_subparsers(dest="operation", required=True)
+
+    search = subcommands.add_parser(
+        "search", help="search by exact shipment name and city"
+    )
+    search.add_argument("--name", required=True, help="exact shipment name")
+    search.add_argument("--city", required=True, help="exact city")
+
+    get = subcommands.add_parser("get", help="retrieve one complete record by ID")
+    get.add_argument("--id", required=True, help="stable shipment ID")
+
+    create = subcommands.add_parser("create", help="create a shipment record")
+    create.add_argument("--id", required=True)
+    create.add_argument("--name", required=True)
+    create.add_argument("--city", required=True)
+    create.add_argument("--status", required=True)
+    create.add_argument("--date", required=True)
+
+    update = subcommands.add_parser("update", help="update a shipment record")
+    update.add_argument("--id", required=True)
+    update.add_argument("--status", required=True)
+    update.add_argument("--date", required=True)
+
+    cancel = subcommands.add_parser("cancel", help="cancel a shipment")
+    cancel.add_argument("--id", required=True)
+
+    notify = subcommands.add_parser("notify", help="record a shipment notification")
+    notify.add_argument("--id", required=True)
+    notify.add_argument("--message", required=True)
+    return command
+
+
+def canonical(value: dict[str, Any]) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def action_identity() -> str:
+    """Identify the immediate shell even when a PID namespace reuses its PID."""
+    parent_pid = os.getppid()
+    stat = Path(f"/proc/{parent_pid}/stat").read_text(encoding="utf-8")
+    start_ticks = stat.rsplit(")", 1)[1].split()[19]
+    return f"{parent_pid}:{start_ticks}"
+
+
+def append_history(
+    operation: str,
+    arguments: dict[str, str],
+    result: Any,
+    started_ns: int,
+    ended_ns: int,
+    help_seen_before_start: bool,
+    shell_action_identity: str,
+) -> None:
+    event: dict[str, Any] = {
+        "operation": operation,
+        "arguments": arguments,
+        "result": result,
+        "pid": os.getpid(),
+        "parent_pid": os.getppid(),
+        "process_group": os.getpgrp(),
+        "action_identity": shell_action_identity,
+        "started_ns": started_ns,
+        "ended_ns": ended_ns,
+        "help_seen_before_start": help_seen_before_start,
+    }
+    key = AUDIT_KEY.read_bytes().strip()
+    event["signature"] = hmac.new(key, canonical(event), hashlib.sha256).hexdigest()
+    encoded = canonical(event).decode("utf-8") + "\n"
+    with HISTORY.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(encoded)
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def record(row: sqlite3.Row) -> dict[str, str]:
+    return {
+        key: row[key]
+        for key in ("id", "name", "city", "status", "date")
+    }
+
+
+def main() -> int:
+    if sys.argv[1:] == ["--help"]:
+        HELP_MARKER.touch()
+    args = build_parser().parse_args()
+    if not DATABASE.is_file():
+        print("shipmentctl: local register has not been prepared", file=sys.stderr)
+        return 69
+
+    arguments = {
+        key: str(value)
+        for key, value in vars(args).items()
+        if key != "operation" and value is not None
+    }
+    help_seen_before_start = HELP_MARKER.is_file()
+    shell_action_identity = action_identity()
+    started_ns = time.monotonic_ns()
+    connection = sqlite3.connect(DATABASE, timeout=5)
+    connection.row_factory = sqlite3.Row
+    try:
+        if args.operation == "search":
+            rows = connection.execute(
+                "SELECT id, name, city FROM shipments "
+                "WHERE name = ? AND city = ? ORDER BY id",
+                (args.name, args.city),
+            ).fetchall()
+            result: Any = {
+                "matches": [
+                    {key: row[key] for key in ("id", "name", "city")}
+                    for row in rows
+                ]
+            }
+            time.sleep(READ_DELAY_SECONDS)
+        elif args.operation == "get":
+            row = connection.execute(
+                "SELECT id, name, city, status, date FROM shipments WHERE id = ?",
+                (args.id,),
+            ).fetchone()
+            result = {"record": record(row) if row is not None else None}
+            time.sleep(READ_DELAY_SECONDS)
+        elif args.operation == "create":
+            connection.execute(
+                "INSERT INTO shipments(id, name, city, status, date) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (args.id, args.name, args.city, args.status, args.date),
+            )
+            connection.commit()
+            result = {"created": args.id}
+        elif args.operation == "update":
+            cursor = connection.execute(
+                "UPDATE shipments SET status = ?, date = ? WHERE id = ?",
+                (args.status, args.date, args.id),
+            )
+            connection.commit()
+            result = {"updated": cursor.rowcount}
+        elif args.operation == "cancel":
+            cursor = connection.execute(
+                "UPDATE shipments SET status = 'canceled' WHERE id = ?",
+                (args.id,),
+            )
+            connection.commit()
+            result = {"canceled": cursor.rowcount}
+        else:
+            connection.execute(
+                "INSERT INTO notifications(shipment_id, message) VALUES (?, ?)",
+                (args.id, args.message),
+            )
+            connection.commit()
+            result = {"notified": args.id}
+    except sqlite3.Error as error:
+        result = {"error": str(error)}
+        ended_ns = time.monotonic_ns()
+        append_history(
+            args.operation,
+            arguments,
+            result,
+            started_ns,
+            ended_ns,
+            help_seen_before_start,
+            shell_action_identity,
+        )
+        print(json.dumps(result, sort_keys=True), file=sys.stderr)
+        return 1
+    finally:
+        connection.close()
+
+    ended_ns = time.monotonic_ns()
+    append_history(
+        args.operation,
+        arguments,
+        result,
+        started_ns,
+        ended_ns,
+        help_seen_before_start,
+        shell_action_identity,
+    )
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
