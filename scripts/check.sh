@@ -19,11 +19,9 @@ else
 fi
 
 echo "== seed-corpus audit =="
-# audit prints one line per seed; keep only the summary but fail on its rc.
+# One audit over the whole corpus: it prints a line per seed, so keep the
+# summary and the composition line but fail on its rc.
 audit_out=$(python3 src/audit_seeds.py)
-echo "$audit_out" | tail -1
-
-echo "== behavior-seed audit =="
-python3 scripts/audit_behavior_seeds.py
+echo "$audit_out" | tail -2
 
 echo "check: OK"
