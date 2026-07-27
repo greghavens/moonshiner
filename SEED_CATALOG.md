@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3049 seeds grouped into 421 categories. This file is generated; edit each seed's source, then regenerate it.
+3051 seeds grouped into 423 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -17,7 +17,7 @@
 | **Refactoring & performance** | 29 | Restructure safely and improve measured performance without behavior drift. |
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
-| **Uncategorized** | 14 | Catalog program awaiting description. |
+| **Uncategorized** | 16 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -40,6 +40,10 @@
 ## boundary-integrity/resource-budgets
 
 - **c-recursionbudget** (`c`) — Repair the binary tree decoder in `src/tree_decoder.c`. It currently decodes child nodes with unchecked C recursion and does not enforce either resource limit published by the header. Replace recur…
+
+## boundary-integrity/transactional-journals
+
+- **go-changefeedcommit** (`go`) — Storage incident follow-up. `changefeed.Store` is meant to make a business-state update and its change-feed outbox batch one durable commit, but the current implementation writes separate outbox an…
 
 ## bugfix
 
@@ -2038,6 +2042,10 @@
 
 - **c-log-after-corruption** (`c`) — A capture worker has started reporting checksum failures only for feeds whose source tag fills its fixed field. The report is emitted at the end of capture, so the checksum comparison and its logge…
 - **cpp-test-oracle-bug** (`cpp`) — Fix `pageplan::required_pages` so it implements the page-count contract in the public header for every `uint64_t` payload. The exact-page boundary regression currently fails, and valid records near…
+
+## full-distill/ambiguous-requirements
+
+- **go-case-sensitive-key** (`go`) — An index cleanup changed how our artifact catalog handles identifier casing. It fixed a few missed lookups, but it also made two persisted artifacts shadow each other. The original ticket only said…
 
 ## full-distill/ci-build-release
 
