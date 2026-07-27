@@ -13,6 +13,7 @@ from common import CONFIG, ROOT, SEEDS_DIR, STORAGE_ROOT, TRACES, WORKSPACES
 from run_state import (connect, create_run, finish_attempt, set_run_status,
                        start_attempt)
 from runtimes import get_seed_author, get_seed_judge
+from runtimes.availability import USAGE_LIMIT_EXIT, ModelUnavailable
 from validate_seeds import validate_report
 from audit_seeds import check as audit_seed
 from seed_inventory import bundled_plan_record
@@ -130,9 +131,11 @@ def main(argv: list[str] | None = None) -> int:
         author_system = _author_system(args.id, args.replace_synthetic)
         authored = author.run_trace(dummy, workspace, out_dir=TRACES / "raw",
                                     system_prompt=author_system, prompt=args.brief)
-        if (authored.unavailable or authored.timed_out or authored.safeguard_refusal
+        if authored.unavailable:
+            raise ModelUnavailable(f"{author.name}: {authored.unavailable}")
+        if (authored.timed_out or authored.safeguard_refusal
                 or authored.return_code not in (0, None)):
-            raise RuntimeError(authored.unavailable or authored.error
+            raise RuntimeError(authored.error
                                or "seed author failed to complete")
         candidate.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(workspace, candidate, ignore=shutil.ignore_patterns(".git"))
@@ -185,6 +188,10 @@ def main(argv: list[str] | None = None) -> int:
         set_run_status(db, run_id, "complete")
         print(f"promoted seed: {destination}")
         return 0
+    except ModelUnavailable as blocked:
+        set_run_status(db, run_id, "stopped", str(blocked))
+        print(f"stopping: {blocked}", file=sys.stderr)
+        return USAGE_LIMIT_EXIT
     except Exception as error:
         set_run_status(db, run_id, "failed", f"{type(error).__name__}: {error}")
         raise

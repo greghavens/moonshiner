@@ -50,6 +50,11 @@ class CodexRuntime(Runtime):
             cmd.append("--ignore-user-config")
         if self.runtime_config.get("ignore_rules", True):
             cmd.append("--ignore-rules")
+        # Reviews run against archived attempt directories, which are plain
+        # file copies rather than checkouts. Codex refuses an untrusted
+        # non-repository working directory unless this is passed.
+        if self.runtime_config.get("skip_git_repo_check", True):
+            cmd.append("--skip-git-repo-check")
         if sandbox == "danger-full-access":
             cmd.append("--dangerously-bypass-approvals-and-sandbox")
         else:
@@ -65,7 +70,6 @@ class CodexRuntime(Runtime):
                   security: bool = False,
                   tools: list[str] | None = None) -> TraceResult:
         workspace = self.require_persistent_workspace(workspace)
-        availability.require_available(self.name)
         sandbox = self.runtime_config.get("sandbox", "workspace-write")
         if security:
             sandbox = "workspace-write"
@@ -102,9 +106,7 @@ class CodexRuntime(Runtime):
         stderr_path.write_text(stderr)
         thread_id, usage, error, messages = self._scan_events(stdout)
 
-        block = availability.record_block(self.name, stderr, "codex-teacher-stderr")
-        if not block and error:
-            block = availability.record_block(self.name, error, "codex-teacher-turn")
+        limit = availability.find_usage_limit(stderr, error)
 
         raw_path = out_dir / f"{seed['id']}.jsonl"
         trace_format = "codex-exec-events"
@@ -132,8 +134,7 @@ class CodexRuntime(Runtime):
             model_attested=any(self.model_matches(model) for model in observed_models),
             usage=usage,
             error=error,
-            unavailable=(f"codex usage limit until {block['retry_at']}"
-                         if block else None),
+            unavailable=limit,
             provenance={"thread_id": thread_id, "sandbox": sandbox,
                         "reasoning": self.role.get("reasoning")},
         )
@@ -180,7 +181,6 @@ class CodexRuntime(Runtime):
                    schema: dict | None = None,
                    read_only: bool = True) -> ReviewResult:
         workspace = self.require_persistent_workspace(workspace)
-        availability.require_available(self.name)
         schema_path = None
         if schema is not None:
             schema_path = out_dir / "review.schema.json"
@@ -207,7 +207,9 @@ class CodexRuntime(Runtime):
 
         (out_dir / "judge.events.jsonl").write_text(stdout)
         (out_dir / "judge.stderr").write_text(stderr)
-        availability.record_block(self.name, stderr, "codex-judge-stderr")
+        limit = availability.find_usage_limit(stderr)
+        if limit:
+            raise availability.ModelUnavailable(f"{self.name}: {limit}")
 
         last_message = self._last_message(stdout)
         verdict = _parse_json_object(last_message)

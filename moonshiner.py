@@ -207,19 +207,16 @@ def _preflight(argv: list[str]) -> int:
     parser.parse_args(argv)
 
     from runtimes import get_judge, get_teacher       # lazy: offline cmds skip
-    from runtimes.availability import (ModelUnavailable,  # noqa: F401
-                                       active_block, require_available)
+    from runtimes.availability import purge_legacy_markers
+
+    # Quota is never cached, so a stale block from an older release must not
+    # outlive the upgrade that stopped writing them.
+    purge_legacy_markers()
 
     ok = True
     seen: dict[str, str] = {}
     for role, runtime in (("teacher", get_teacher()), ("judge", get_judge())):
         label = f"{role}: {runtime.name}"
-        block = active_block(runtime.name)
-        if block:
-            print(f"[{label}] UNAVAILABLE until {block.get('retry_at', '?')}: "
-                  f"{block.get('reason', '')}", file=sys.stderr)
-            ok = False
-            continue
         # Two roles can share one runtime — preflight it once.
         if runtime.name in seen:
             print(f"[{label}] {seen[runtime.name]} (shared with earlier role)")
@@ -565,9 +562,16 @@ def _start_default_queues() -> int:
     from common import CONFIG
     _ensure_configured_pi()
     from configuration import PROJECT_ROOT
+    from runtimes.availability import USAGE_LIMIT_EXIT, purge_legacy_markers
+    # Starting the product is the point at which quota is re-tested for real.
+    purge_legacy_markers()
     project_key = hashlib.sha256(str(PROJECT_ROOT).encode()).hexdigest()[:12]
     queues = ((CONFIG.get("pipeline") or {}).get("queues") or {})
     if queues.get("seed_authoring"):
+        # Authoring writes accepted seeds straight into the repository, so the
+        # clone has to exist before the first seed is promoted.
+        from seed_repo import ensure as ensure_seed_repo
+        ensure_seed_repo()
         unit = f"moonshiner-seed-queue-{project_key}"
         running = subprocess.run(["systemctl", "--user", "is-active", "--quiet",
                                   f"{unit}.service"]).returncode == 0
@@ -590,6 +594,7 @@ def _start_default_queues() -> int:
                        f"--unit={unit}",
                        f"--property=WorkingDirectory={PROJECT_ROOT}",
                        "--property=Restart=always", "--property=RestartSec=10s",
+                       f"--property=RestartPreventExitStatus={USAGE_LIMIT_EXIT}",
                        f"--property=StandardOutput=append:{log_dir / 'run.log'}",
                        f"--property=StandardError=append:{log_dir / 'run.log'}",
                        f"--setenv=PATH={os.environ.get('PATH', '')}",
@@ -609,6 +614,7 @@ def _start_default_queues() -> int:
             subprocess.run(["systemd-run", "--user", "--collect", f"--unit={unit}",
                             f"--property=WorkingDirectory={PROJECT_ROOT}",
                             "--property=Restart=always", "--property=RestartSec=10s",
+                            f"--property=RestartPreventExitStatus={USAGE_LIMIT_EXIT}",
                             f"--property=StandardOutput=append:{log_dir / 'run.log'}",
                             f"--property=StandardError=append:{log_dir / 'run.log'}",
                             f"--setenv=PATH={os.environ.get('PATH', '')}",
@@ -634,6 +640,73 @@ def _storage(argv: list[str]) -> int:
     print("Moonshiner storage is tied to the current directory. Change to the "
           "desired project directory and run `moonshiner` there.", file=sys.stderr)
     return 2
+
+
+def _seed_sync(argv: list[str]) -> int:
+    """Publish authored seeds from this project's clone, and install its timer."""
+    parser = argparse.ArgumentParser(
+        prog="moonshiner seed-sync",
+        description="Commit and push seeds this project has authored.")
+    sub = parser.add_subparsers(dest="action", required=True)
+    sub.add_parser("run", help="Commit and push any newly authored seeds.")
+    sub.add_parser("status", help="Show the seed repository and pending seeds.")
+    sub.add_parser("install", help="Install and enable the seed-sync timer.")
+    args = parser.parse_args(argv)
+
+    from configuration import PROJECT_ROOT
+    import seed_repo
+
+    if args.action == "status":
+        path = seed_repo.configured_path()
+        print(f"seed repository: {path}")
+        if not (path / ".git").is_dir():
+            print("not cloned yet; `moonshiner seed-sync run` creates it")
+            return 0
+        print(f"branch: {seed_repo.current_branch(path)}")
+        pending = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard", "--directory",
+             "tasks/seeds/"], cwd=path, capture_output=True, text=True)
+        # Exactly one component: --directory also collapses untracked
+        # subdirectories inside already-tracked seeds, which are not new seeds.
+        names = [match.group(1) for match in
+                 (re.fullmatch(r"tasks/seeds/([^/]+)/", line.strip())
+                  for line in pending.stdout.splitlines() if line.strip())
+                 if match]
+        print(f"awaiting publication: {len(names)}"
+              + (f" ({', '.join(names[:10])}"
+                 + (", …" if len(names) > 10 else "") + ")" if names else ""))
+        return 0
+
+    if args.action == "install":
+        units = Path.home() / ".config" / "systemd" / "user"
+        units.mkdir(parents=True, exist_ok=True)
+        for name in ("seed-sync.service", "seed-sync.timer"):
+            text = (ROOT / "scripts" / name).read_text()
+            # The launcher is project-scoped, so the unit must name the project
+            # it publishes for rather than inheriting the user manager's cwd.
+            if name.endswith(".service"):
+                text = text.replace(
+                    "[Service]\n",
+                    f"[Service]\nWorkingDirectory={PROJECT_ROOT}\n", 1)
+            (units / name).write_text(text)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+        from common import CONFIG
+        authoring = (((CONFIG.get("pipeline") or {}).get("queues") or {})
+                     .get("seed_authoring"))
+        if not authoring:
+            print("installed seed-sync units; not enabling the timer because "
+                  "pipeline.queues.seed_authoring is off for this project")
+            return 0
+        subprocess.run(["systemctl", "--user", "enable", "--now",
+                        "seed-sync.timer"], check=True)
+        print(f"seed-sync installed for {PROJECT_ROOT} from moonshiner {VERSION}")
+        return 0
+
+    repository = seed_repo.ensure()
+    script = ROOT / "scripts" / "sync_seeds.sh"
+    return subprocess.run(
+        ["bash", str(script)],
+        env={**os.environ, "MOONSHINER_SEED_REPO_PATH": str(repository)}).returncode
 
 
 def _service(argv: list[str]) -> int:
@@ -675,12 +748,14 @@ def _service(argv: list[str]) -> int:
         subprocess.run(["systemctl", "--user", "reset-failed", f"{name}.service"])
         from common import RUNS
         from configuration import PROJECT_ROOT
+        from runtimes.availability import USAGE_LIMIT_EXIT
         log_dir = RUNS / "trace-continuous"
         log_dir.mkdir(parents=True, exist_ok=True)
         executable = Path(sys.executable).parent / "moonshiner"
         command = ["systemd-run", "--user", "--collect", f"--unit={name}",
                    f"--property=WorkingDirectory={PROJECT_ROOT}",
                    "--property=Restart=always", "--property=RestartSec=10s",
+                   f"--property=RestartPreventExitStatus={USAGE_LIMIT_EXIT}",
                    f"--property=StandardOutput=append:{log_dir / 'run.log'}",
                    f"--property=StandardError=append:{log_dir / 'run.log'}",
                    f"--setenv=PATH={os.environ.get('PATH', '')}",
@@ -1039,6 +1114,8 @@ def main(argv: list[str] | None = None) -> int:
     if command == "synthetic-corrections":
         from synthetic_corrections import main as corrections_main
         return corrections_main(rest)
+    if command == "seed-sync":
+        return _seed_sync(rest)
     if command == "service":
         return _service(rest)
     if command == "update":

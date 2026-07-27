@@ -55,7 +55,25 @@ def prefer_active_corpus(installed: bool, authoring: bool,
 _use_active = prefer_active_corpus(
     _installed_seeds.is_dir(), _authoring_enabled,
     _corpus_version(_active_root), _corpus_version(ROOT))
-SEEDS_DIR = _installed_seeds if _use_active else _bundled_seeds
+_corpus_seeds = _installed_seeds if _use_active else _bundled_seeds
+
+
+def _authoring_seeds_dir() -> Path | None:
+    """The clone's seed directory, once it exists.
+
+    Authoring writes accepted seeds straight into the repository, so the clone
+    is authoritative whenever it is present. Resolution stays read-only: the
+    clone is created by ``seed_repo.ensure`` at authoring startup, never as an
+    import side effect of an unrelated command.
+    """
+    if not _authoring_enabled:
+        return None
+    from seed_repo import seeds_dir
+    candidate = seeds_dir(CONFIG)
+    return candidate if candidate.is_dir() else None
+
+
+SEEDS_DIR = _authoring_seeds_dir() or _corpus_seeds
 BEHAVIOR_WORLDS = (SEEDS_DIR.parent / "behavior-worlds.json"
                    if (SEEDS_DIR.parent / "behavior-worlds.json").is_file()
                    else ROOT / "tasks" / "behavior-worlds.json")

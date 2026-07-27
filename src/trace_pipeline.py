@@ -22,6 +22,7 @@ from run_state import (connect, create_run, finish_attempt, set_job,
                        set_run_status, start_attempt, run_row, job_rows,
                        abandon_claim, claim_job, renew_lease, record_model_call)
 from runtimes import get_judge, get_teacher
+from runtimes.availability import USAGE_LIMIT_EXIT, ModelUnavailable
 from screen_traces import feedback_from_review, screen
 from reasoning_stepdown import (native_effort, next_reasoning_stage,
                                 reasoning_schedule, runtime_for_stage)
@@ -502,6 +503,14 @@ def main(argv: list[str] | None = None) -> int:
         for thread in threads.values(): thread.join()
         set_run_status(db, run_id, "interrupted", "keyboard interrupt")
         return 130
+    except ModelUnavailable as blocked:
+        # Out of quota is a live condition, not a failure to retry against: stop
+        # the run and let the next start find out whether quota has returned.
+        stop_claiming.set()
+        for thread in threads.values(): thread.join()
+        set_run_status(db, run_id, "stopped", str(blocked))
+        print(f"stopping: {blocked}", file=sys.stderr)
+        return USAGE_LIMIT_EXIT
     except BaseException as error:
         stop_claiming.set()
         for thread in threads.values(): thread.join()

@@ -7,6 +7,7 @@ import getpass
 import hashlib
 import shutil
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from common import (CONFIG, RUNS, STORAGE_ROOT, clear_runtime_caches, git_diff,
 from run_state import (connect, create_run, finish_attempt, set_run_status,
                        start_attempt)
 from runtimes import get_judge, get_runtime
+from runtimes.availability import USAGE_LIMIT_EXIT, ModelUnavailable
 from normalize import parse_trace
 from screen_traces import (apply_candidate_patch, feedback_from_review, screen)
 import publish_queue
@@ -702,5 +704,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if not args.dry_run and not args.yes:
         parser.error("paid correction processing requires --yes (or use --dry-run)")
-    print(json.dumps(run(dry_run=args.dry_run), indent=2))
+    try:
+        print(json.dumps(run(dry_run=args.dry_run), indent=2))
+    except ModelUnavailable as blocked:
+        # Stop rather than restart into a wall; quota is re-tested on next start.
+        print(f"stopping: {blocked}", file=sys.stderr)
+        return USAGE_LIMIT_EXIT
     return 0

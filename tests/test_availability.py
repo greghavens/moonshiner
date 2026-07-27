@@ -1,8 +1,11 @@
-"""Usage-limit backoff: reset-time parsing and marker lifecycle. Model-free."""
+"""Usage-limit detection. Live-only: nothing about a limit is ever persisted."""
+import contextlib
+import json
 import pathlib
 import sys
+import tempfile
 import unittest
-from datetime import datetime
+from unittest import mock
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "src"))
@@ -10,48 +13,66 @@ sys.path.insert(0, str(_ROOT))
 
 from runtimes import availability as av  # noqa: E402
 
-FIXED_NOW = datetime(2030, 1, 1, 9, 0).astimezone()
-LIMIT_MSG = "you've hit your usage limit. try again at Jan 2nd, 2030 5:00 PM."
+
+@contextlib.contextmanager
+def _isolated_runs():
+    """Point the module at a scratch runs/ directory.
+
+    ``common.RUNS`` resolves to the real project state, and purging markers is
+    a destructive operation — a test must never reach live pipeline state.
+    """
+    with tempfile.TemporaryDirectory() as name:
+        runs = pathlib.Path(name)
+        with mock.patch.object(av, "RUNS", runs):
+            yield runs
+
+LIMIT_MSG = ("You've hit your usage limit. Visit https://example.invalid/usage "
+             "to purchase more credits or try again at Jan 2nd, 2030 5:00 PM.")
 
 
-class ParseRetryAt(unittest.TestCase):
-    def test_parses_usage_limit_reset(self):
-        got = av.parse_retry_at(LIMIT_MSG, FIXED_NOW)
-        self.assertIsNotNone(got)
-        self.assertEqual((got.year, got.month, got.day, got.hour),
-                         (2030, 1, 2, 17))
+class DetectUsageLimit(unittest.TestCase):
+    def test_detects_usage_limit_notice(self):
+        self.assertTrue(av.is_usage_limit(LIMIT_MSG))
 
-    def test_non_limit_message_is_ignored(self):
-        self.assertIsNone(av.parse_retry_at("connection reset by peer", FIXED_NOW))
+    def test_ignores_unrelated_errors(self):
+        self.assertFalse(av.is_usage_limit("connection reset by peer"))
+        self.assertFalse(av.is_usage_limit(""))
+        self.assertFalse(av.is_usage_limit(None))
 
-    def test_limit_without_reset_time_is_none(self):
-        self.assertIsNone(av.parse_retry_at("you've hit your usage limit", FIXED_NOW))
+    def test_find_returns_first_matching_message(self):
+        self.assertEqual(av.find_usage_limit("", None, LIMIT_MSG), LIMIT_MSG.strip())
+        self.assertIsNone(av.find_usage_limit("boom", None))
 
 
-class MarkerLifecycle(unittest.TestCase):
-    RUNTIME = "unit-test-fake"
+class NeverPersisted(unittest.TestCase):
+    """A quoted reset time must never become durable state.
 
-    def tearDown(self):
-        av._marker(self.RUNTIME).unlink(missing_ok=True)
+    Providers move reset times and credits can be purchased mid-run, so a
+    persisted block outlives the condition it describes and blocks a product
+    that is no longer limited.
+    """
 
-    def test_future_block_is_active_and_fails_closed(self):
-        self.assertIsNotNone(
-            av.record_block(self.RUNTIME, LIMIT_MSG, "test", FIXED_NOW))
-        self.assertIsNotNone(av.active_block(self.RUNTIME, FIXED_NOW))
-        with self.assertRaises(av.ModelUnavailable):
-            av.require_available(self.RUNTIME, FIXED_NOW)
+    def test_module_exposes_no_marker_or_block_api(self):
+        for removed in ("_marker", "record_block", "active_block",
+                        "require_available", "parse_retry_at",
+                        "record_from_messages"):
+            self.assertFalse(hasattr(av, removed),
+                             f"{removed} reintroduces persisted usage limits")
 
-    def test_expired_block_clears_and_allows(self):
-        av.record_block(self.RUNTIME, LIMIT_MSG, "test", FIXED_NOW)
-        later = datetime(2030, 1, 3, 9, 0).astimezone()
-        self.assertIsNone(av.active_block(self.RUNTIME, later))
-        self.assertFalse(av._marker(self.RUNTIME).exists())
-        av.require_available(self.RUNTIME, later)  # must not raise
+    def test_detection_writes_nothing_under_runs(self):
+        with _isolated_runs() as runs:
+            av.find_usage_limit(LIMIT_MSG)
+            self.assertEqual(list(runs.iterdir()), [])
 
-    def test_non_limit_message_records_nothing(self):
-        self.assertIsNone(
-            av.record_block(self.RUNTIME, "random error", "test", FIXED_NOW))
-        self.assertFalse(av._marker(self.RUNTIME).exists())
+    def test_purge_removes_markers_left_by_earlier_releases(self):
+        with _isolated_runs() as runs:
+            marker = runs / "model-unavailable-codex.json"
+            marker.write_text(json.dumps({"retry_at": "2030-01-02T17:00:00"}))
+            keep = runs / "trace-run-notes.json"
+            keep.write_text("{}")
+            self.assertEqual(av.purge_legacy_markers(), [marker])
+            self.assertFalse(marker.exists())
+            self.assertTrue(keep.exists(), "purge must not touch unrelated state")
 
 
 if __name__ == "__main__":

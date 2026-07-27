@@ -11,7 +11,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from common import CONFIG, STORAGE_ROOT, load_seeds, synthetic_tool_contract
 from configuration import PROJECT_ROOT
+from runtimes.availability import USAGE_LIMIT_EXIT
 from seed_inventory import authored_ids, documented_plan_items, retired_seed_ids
+from seed_repo import ensure as ensure_seed_repo
 
 CLAIMS = STORAGE_ROOT / "locks" / "seed-authoring"
 
@@ -45,6 +47,10 @@ def main(argv=None) -> int:
     parser.add_argument("--yes", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
+    # Accepted seeds are promoted into the repository, so it must be on disk
+    # before any authoring starts.
+    if not args.dry_run:
+        ensure_seed_repo()
     workers = args.workers or int((CONFIG.get("pipeline", {}).get("seed") or {}).get("workers", 1))
     if not 1 <= workers <= 64:
         parser.error("--workers must be from 1 through 64")
@@ -59,10 +65,21 @@ def main(argv=None) -> int:
     if not args.yes:
         parser.error("metered seed authoring requires --yes")
     failed = 0
+    out_of_quota = False
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="seed-worker") as pool:
         futures = {pool.submit(author_one, seed_id, plans) for seed_id in missing}
         for future in as_completed(futures):
             seed_id, code = future.result()
+            # One seed reporting no quota means every remaining seed would too.
+            if code == USAGE_LIMIT_EXIT:
+                out_of_quota = True
+                for pending in futures:
+                    pending.cancel()
+                print(f"[seed stopped] {seed_id}: runtime out of quota",
+                      file=sys.stderr, flush=True)
+                continue
             failed += bool(code)
             print(f"[seed {'failed' if code else 'authored'}] {seed_id}", flush=True)
+    if out_of_quota:
+        return USAGE_LIMIT_EXIT
     return 1 if failed else 0

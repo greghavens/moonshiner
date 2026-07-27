@@ -72,22 +72,16 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
     for attempt in range(1, max(1, attempts) + 1):
         workspace = materialize(seed)
         protected_before = protected_hashes(seed, workspace)
-        try:
-            result = teacher.run_trace(
-                seed, workspace, out_dir=raw_dir, system_prompt="",
-                prompt=prompt, interaction=interaction,
-                security=False, tools=None)
-        except ModelUnavailable as blocked:
-            record = _deferral(seed, prompt, teacher, "unavailable", str(blocked))
-            _write_meta(meta_path, record)
-            record["_workspace_path"] = str(workspace)
-            return record
+        result = teacher.run_trace(
+            seed, workspace, out_dir=raw_dir, system_prompt="",
+            prompt=prompt, interaction=interaction,
+            security=False, tools=None)
 
+        # Out of quota is not this seed's problem: deferring it would march
+        # through the corpus marking every remaining seed deferred. Stop, and
+        # let the next start discover whether quota has returned.
         if result.unavailable:
-            record = _deferral(seed, prompt, teacher, "unavailable", result.unavailable)
-            _write_meta(meta_path, record)
-            record["_workspace_path"] = str(workspace)
-            return record
+            raise ModelUnavailable(f"{teacher.name}: {result.unavailable}")
         if result.safeguard_refusal:
             record = _deferral(seed, prompt, teacher, "safeguard_refusal",
                                "teacher issued a safeguard refusal")

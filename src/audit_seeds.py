@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Integrity audit for the tracked seed corpus.
 
-A seed is COMPLETE when its ``task.json`` parses and carries every required
-field, its ``id`` matches the directory name, ``files/`` exists and contains
-every protected ``test_files`` entry, and a non-empty ``reference_fix.patch``
-proves local solvability. Holdout tasks are patch-exempt: they are vetted by
-held-out evaluation, not by a shipped reference fix.
+A seed is COMPLETE when its ``task.json`` parses, carries an ``id`` matching its
+directory name, a ``category``, and a ``prompt``, and honours whatever else it
+declares: a seed naming ``test_files`` ships them under ``files/``, and a seed
+naming a ``verify_cmd`` ships a non-empty ``reference_fix.patch`` proving local
+solvability. Holdout tasks are patch-exempt: they are vetted by held-out
+evaluation, not by a shipped reference fix.
+
+A seed is a seed. ``category`` is reference, not a loading type, so this audits
+the whole corpus through one path rather than sorting seeds into kinds.
 
 A partial seed (an authoring agent that died mid-write) poisons trace batches
 and blocks re-import, so this prints one line per seed and exits non-zero if any
@@ -24,7 +28,11 @@ from pathlib import Path
 
 from common import CONFIG, SEEDS_DIR
 
-REQUIRED = ("id", "lang", "category", "prompt", "verify_cmd", "test_files")
+# Every seed carries these, and nothing else is universal. Seeds differ in what
+# they declare, not in what they are: a seed that declares test files must ship
+# them, a seed that declares a verify command must prove it passes. Auditing
+# what is declared keeps one code path over the whole corpus.
+REQUIRED = ("id", "category", "prompt")
 # Pre-spec pilot seeds predate the reference-patch requirement; their
 # solvability is proven by actual passing teacher traces, not a shipped fix.
 PILOT_EXEMPT = {"py-lru-eviction", "py-config-merge", "go-worker-pool",
@@ -46,16 +54,17 @@ def check(directory: Path) -> str | None:
         return f"task.json missing {missing}"
     if task["id"] != directory.name:
         return f"id {task['id']!r} != dir name"
-    files = directory / "files"
-    if not files.is_dir():
-        return "no files/"
-    absent = [name for name in task["test_files"] if not (files / name).exists()]
-    if absent:
-        return f"test files absent: {absent}"
-    patch = directory / "reference_fix.patch"
-    if directory.name not in PATCH_EXEMPT and (
-            not patch.exists() or patch.stat().st_size == 0):
-        return "reference_fix.patch missing/empty"
+    if task.get("test_files"):
+        files = directory / "files"
+        if not files.is_dir():
+            return "no files/"
+        absent = [name for name in task["test_files"] if not (files / name).exists()]
+        if absent:
+            return f"test files absent: {absent}"
+    if task.get("verify_cmd") and directory.name not in PATCH_EXEMPT:
+        patch = directory / "reference_fix.patch"
+        if not patch.exists() or patch.stat().st_size == 0:
+            return "reference_fix.patch missing/empty"
     return None
 
 

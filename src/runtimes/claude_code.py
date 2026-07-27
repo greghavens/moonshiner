@@ -68,7 +68,6 @@ class ClaudeCodeRuntime(Runtime):
         if not self.runtime_config.get("unsafe_host_access", False):
             raise RuntimeError("claude-code teacher disabled until a contained runtime is configured")
         self._require_unlock()
-        availability.require_available(self.name)
         cmd = self._base_cmd()
         cmd += ["--append-system-prompt", system_prompt]
 
@@ -101,7 +100,7 @@ class ClaudeCodeRuntime(Runtime):
         events_path.write_text(stdout)
         stderr_path.write_text(stderr)
         meta = self._result_meta(stdout, stderr)
-        block = availability.record_block(self.name, stderr, "claude-teacher-stderr")
+        limit = availability.find_usage_limit(stderr)
 
         model_fallback = bool(meta["observed_model"]
                               and not self.model_matches(meta["observed_model"]))
@@ -119,8 +118,7 @@ class ClaudeCodeRuntime(Runtime):
             safeguard_refusal=meta["safeguard_refusal"],
             usage=meta["usage"],
             error=meta["error"],
-            unavailable=(f"claude usage limit until {block['retry_at']}"
-                         if block else None),
+            unavailable=limit,
             provenance={"session_id": meta["session_id"],
                         "init_tools": meta["init_tools"]},
         )
@@ -176,7 +174,6 @@ class ClaudeCodeRuntime(Runtime):
                    read_only: bool = True) -> ReviewResult:
         workspace = self.require_persistent_workspace(workspace)
         self._require_unlock()
-        availability.require_available(self.name)
         cmd = self._base_cmd(disallowed=READ_ONLY_DISALLOW if read_only else None)
         prompt = instruction
         if schema is not None:
@@ -203,6 +200,9 @@ class ClaudeCodeRuntime(Runtime):
         # needed to adjudicate this one.
         (out_dir / f"{workspace.name}.judge.jsonl").write_text(stdout)
         (out_dir / f"{workspace.name}.judge.stderr").write_text(stderr)
+        limit = availability.find_usage_limit(stderr)
+        if limit:
+            raise availability.ModelUnavailable(f"{self.name}: {limit}")
         meta = self._result_meta(stdout, stderr)
         last = self._final_text(stdout)
         return ReviewResult(

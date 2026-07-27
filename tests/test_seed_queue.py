@@ -43,6 +43,7 @@ class SeedQueueSelection(unittest.TestCase):
              mock.patch.object(seed_queue, "retired_seed_ids", return_value=set()), \
              mock.patch.object(seed_queue, "load_seeds", return_value=[]), \
              mock.patch.object(seed_queue, "_moonshiner", return_value="moonshiner"), \
+             mock.patch.object(seed_queue, "ensure_seed_repo"), \
              mock.patch.object(seed_queue.subprocess, "run", side_effect=run):
             self.assertEqual(seed_queue.main(["--yes", "--workers", "2"]), 0)
         self.assertEqual(peak, 2)

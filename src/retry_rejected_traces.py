@@ -25,7 +25,7 @@ from pathlib import Path
 from common import TRACES, load_seeds
 from generate_traces import trace_task
 from runtimes import get_judge, get_teacher
-from runtimes.availability import ModelUnavailable, require_available
+from runtimes.availability import ModelUnavailable
 from screen_traces import feedback_from_review, screen
 from review_contract import is_accepted
 
@@ -118,8 +118,6 @@ def main(argv: list[str] | None = None) -> int:
 
     teacher = get_teacher()
     judge = get_judge()
-    require_available(teacher.name)
-    require_available(judge.name)
     teacher.preflight(require_auth=True)
     judge.preflight(require_auth=True)
 
