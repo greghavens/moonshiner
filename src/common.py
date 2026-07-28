@@ -343,6 +343,42 @@ def _seed_files(seed: dict) -> Path | None:
     return Path(directory) / "files" if directory is not None else None
 
 
+def remove_workspace(path: Path, *, workspaces: Path | None = None) -> None:
+    """Delete a materialized workspace. Refuse anything that is not one.
+
+    A workspace is the only thing this project ever deletes. The repository,
+    project state, a caller's mistake, a test double handing back the wrong
+    path — all of it must fail loudly rather than be removed. Deleting the
+    wrong tree is unrecoverable, so the check is a hard precondition rather
+    than a best-effort filter, and it is deliberately the single door every
+    workspace removal goes through.
+    """
+    target = Path(path)
+    root = (workspaces if workspaces is not None else WORKSPACES).resolve()
+    try:
+        resolved = target.resolve()
+    except OSError as error:
+        raise ValueError(f"refusing to remove an unresolvable path: {target}") from error
+    if resolved == root or root not in resolved.parents:
+        raise ValueError(
+            f"refusing to remove a path outside {root}: {resolved}")
+    if target.is_symlink():
+        raise ValueError(f"refusing to remove a symlinked workspace: {target}")
+    if not resolved.exists():
+        return
+    # Verifier toolchains write read-only trees (Go's module cache); clear the
+    # bit and retry rather than abandoning the removal half-done.
+    def force_writable(function, failed, _excinfo):
+        for item in (Path(failed).parent, Path(failed)):
+            try:
+                item.chmod(0o700)
+            except OSError:
+                pass
+        function(failed)
+
+    shutil.rmtree(resolved, onexc=force_writable)
+
+
 def materialize(seed: dict, name: str | None = None) -> Path:
     """Copy a seed's files into a fresh, committed Git workspace.
 
@@ -460,6 +496,22 @@ def preflight_seed_environment(seed: dict) -> tuple[bool, str]:
     """
     workspace = materialize(seed, name=f"environment-{seed['id']}")
     from toolchains import missing_executables, provision
+    # Preflight sandboxes are scratch: one per claim, yielding a verdict rather
+    # than an artifact. Unremoved they outweigh the traces. A failed one is kept
+    # because it is the evidence an infrastructure failure is diagnosed from.
+    # remove_workspace refuses anything that is not a workspace, so a caller or
+    # test double handing back the wrong path fails loudly instead of deleting.
+    scratch: list[Path] = [workspace]
+
+    def finish(ok: bool, detail: str) -> tuple[bool, str]:
+        if ok:
+            for path in scratch:
+                try:
+                    remove_workspace(path)
+                except ValueError:
+                    pass
+        return ok, detail
+
     # The baseline is expected to fail verification; only missing executable
     # evidence is an environment defect. This also discovers nested tools used
     # by shell/Python verifier wrappers without mistaking the intended test
@@ -469,13 +521,15 @@ def preflight_seed_environment(seed: dict) -> tuple[bool, str]:
     if missing:
         deployed, deployment_detail = provision(missing)
         if not deployed:
-            return False, deployment_detail
+            return finish(False, deployment_detail)
         retry_workspace = materialize(seed, name=f"environment-{seed['id']}-provisioned")
+        scratch.append(retry_workspace)
         _, verify_detail = run_verify(seed, retry_workspace)
         still_missing = missing_executables(verify_detail)
         if still_missing:
-            return False, "toolchain remains unavailable in verifier sandbox: " + ", ".join(still_missing)
-    return True, verify_detail
+            return finish(False, "toolchain remains unavailable in verifier sandbox: "
+                          + ", ".join(still_missing))
+    return finish(True, verify_detail)
 
 
 def protected_hashes(seed: dict, workspace: Path) -> dict[str, str | None]:

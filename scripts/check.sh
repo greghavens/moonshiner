@@ -12,8 +12,14 @@ echo "== byte-compile (src, moonshiner.py$( [ -d tests ] && echo ', tests')) =="
 python3 -m compileall -q src moonshiner.py $( [ -d tests ] && echo tests )
 
 echo "== unit tests =="
+# Run the suite against throwaway project state. A checkout is often also a
+# live project, and a test that resolves STORAGE_ROOT/WORKSPACES would then be
+# pointed at real traces, ledgers and workspaces. Isolating it means no test can
+# reach them whatever it does.
 if [ -d tests ] && ls tests/test_*.py >/dev/null 2>&1; then
-  python3 -m unittest discover -s tests -v
+  test_home=$(mktemp -d -t moonshiner-check-XXXXXX)
+  trap 'rm -rf "$test_home"' EXIT
+  MOONSHINER_HOME="$test_home" python3 -m unittest discover -s tests -v
 else
   echo "(no tests yet)"
 fi

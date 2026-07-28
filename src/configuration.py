@@ -11,7 +11,11 @@ ROOT = Path(os.environ.get("MOONSHINER_BUNDLE_ROOT",
                            Path(__file__).resolve().parent.parent)).resolve()
 DEFAULT_PATH = ROOT / "config.json"
 PROJECT_ROOT = Path.cwd().resolve()
-PROJECT_STATE = PROJECT_ROOT / ".moonshiner"
+# MOONSHINER_HOME relocates this project's state. A checkout is often also a
+# live project, so the test suite points it at a throwaway directory: no test
+# can then reach real traces, ledgers or workspaces whatever it does.
+PROJECT_STATE = Path(os.environ["MOONSHINER_HOME"]).resolve() \
+    if os.environ.get("MOONSHINER_HOME") else PROJECT_ROOT / ".moonshiner"
 LOCAL_PATH = PROJECT_STATE / "config.json"
 
 

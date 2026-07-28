@@ -170,6 +170,12 @@ def verify_remote(dataset: str, title: str) -> None:
         raise RuntimeError(f"remote commit verification failed: {title}")
 
 
+# Each poll re-reads the whole trace store, so do not spin on it.
+POLL_SECONDS = 10
+# How long a partial batch may wait for company before it publishes.
+PARTIAL_BATCH_WAIT_SECONDS = 900
+
+
 def batch_size() -> int:
     value = int((load_config().get("publish") or {}).get("batch_size", 1))
     if not 1 <= value <= 1000:
@@ -284,6 +290,7 @@ def main() -> int:
         save_acknowledged(acknowledgements, published_attempts)
     print(f"publish queue active: {dataset}; {len(known)} existing tasks", flush=True)
     blocked: set[str] = set()
+    waiting_since: float | None = None
     while True:
         published_correction = process_companion_once()
         pending = [(stamp, task, version)
@@ -292,13 +299,21 @@ def main() -> int:
                        or version > published_attempts.get(task, -1))
                    and task not in blocked]
         if not pending:
+            waiting_since = None
             if not published_correction:
-                time.sleep(2)
+                time.sleep(POLL_SECONDS)
             continue
         size = batch_size()
-        if len(pending) < size and tracing_has_unfinished_work():
-            time.sleep(2)
+        # Waiting for tracing to run out of work never happens on a queue with
+        # thousands of seeds, so accepted trajectories sat unpublished for
+        # hours. Hold a partial batch only for a bounded time.
+        if waiting_since is None:
+            waiting_since = time.monotonic()
+        if (len(pending) < size and tracing_has_unfinished_work()
+                and time.monotonic() - waiting_since < PARTIAL_BATCH_WAIT_SECONDS):
+            time.sleep(POLL_SECONDS)
             continue
+        waiting_since = None
         batch = pending[:size]
         tasks = [task for _, task, _ in batch]
         label = tasks[0] if len(tasks) == 1 else f"{tasks[0]}…{tasks[-1]} ({len(tasks)})"

@@ -66,10 +66,8 @@ def remove_completed_workspace(record: dict) -> None:
     value = record.get("_workspace_path")
     if not value:
         return
-    workspace = Path(str(value))
-    if workspace.resolve().parent != WORKSPACES.resolve():
-        raise ValueError(f"refusing to remove workspace outside {WORKSPACES}: {workspace}")
-    shutil.rmtree(workspace)
+    from common import remove_workspace
+    remove_workspace(Path(str(value)), workspaces=WORKSPACES)
 
 
 def alert_infrastructure_failure(seed_id: str, reason: str) -> None:

@@ -26,8 +26,9 @@ def _force_writable(function, path, _excinfo) -> None:
     function(path)
 
 
-def _remove_tree(path: Path) -> int:
-    """Delete a workspace, returning the bytes reclaimed."""
+def _remove_tree(path: Path, workspaces: Path) -> int:
+    """Delete a workspace through the guarded door, returning bytes reclaimed."""
+    from common import remove_workspace
     reclaimed = 0
     for item in path.rglob("*"):
         try:
@@ -35,7 +36,7 @@ def _remove_tree(path: Path) -> int:
                 reclaimed += item.stat().st_size
         except OSError:
             continue
-    shutil.rmtree(path, onexc=_force_writable)
+    remove_workspace(path, workspaces=workspaces)
     return reclaimed
 
 
@@ -61,7 +62,7 @@ def prune(workspaces: Path = WORKSPACES) -> tuple[int, int]:
             continue
         if path.resolve().parent != workspaces.resolve():
             raise ValueError(f"unsafe workspace path: {path}")
-        reclaimed += _remove_tree(path)
+        reclaimed += _remove_tree(path, workspaces)
         removed += 1
     return removed, reclaimed
 
@@ -87,7 +88,7 @@ def prune_old(workspaces: Path = WORKSPACES) -> tuple[int, int]:
             continue
         if path.resolve().parent != workspaces.resolve():
             raise ValueError(f"unsafe workspace path: {path}")
-        reclaimed += _remove_tree(path)
+        reclaimed += _remove_tree(path, workspaces)
         removed += 1
     return removed, reclaimed
 

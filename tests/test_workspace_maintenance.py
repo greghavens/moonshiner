@@ -70,5 +70,5 @@ class ReadOnlyTrees(unittest.TestCase):
             cache.parent.chmod(0o555)
             with self.assertRaises(PermissionError):
                 shutil.rmtree(workspace)
-            _remove_tree(workspace)
+            _remove_tree(workspace, workspace.parent)
             self.assertFalse(workspace.exists())
