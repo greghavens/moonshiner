@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3051 seeds grouped into 423 categories. This file is generated; edit each seed's source, then regenerate it.
+3052 seeds grouped into 424 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -17,7 +17,7 @@
 | **Refactoring & performance** | 29 | Restructure safely and improve measured performance without behavior drift. |
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
-| **Uncategorized** | 16 | Catalog program awaiting description. |
+| **Uncategorized** | 17 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -32,6 +32,10 @@
 - **behavior-dependency-planning-0142** (`bash`) `#planning:multi-step` `#execution:parallel` `#if:grounded-response` `#if:negative-constraint` `#planning:dependency-dag` `#round:2` `#source:breadth-reserve` `#weakness:dependency-planning` — Use the genuine executable interface documented in README.md. Do not inspect or edit the backing state or protected verification files directly. Obtain the default date from my saved operational pr…
 - **behavior-dependency-planning-0170** (`python`) `#planning:multi-step` `#execution:parallel` `#if:negative-constraint` `#planning:dependency-dag` `#round:2` `#source:benchmark-informed` `#weakness:dependency-planning` — Use the executable ./recordctl in this workspace to carry out the following request. Review record pro-270 (Annual report edits) and record pro-670 (Workshop feedback summary) together. Wait until…
 - **behavior-dependency-planning-0216** (`bash`, `claims`) `#planning:multi-step` `#execution:parallel` `#if:negative-constraint` `#if:scope-boundary` `#planning:dependency-dag` `#round:2` `#source:benchmark-informed` `#weakness:dependency-planning` — Prepare a handoff comparison for exactly two claim records in the sandboxed claim system: “Water damage claim — archive room” in Central Office and “Lost baggage claim — conference trip” in Travel…
+
+## boundary-integrity/atomic-publication
+
+- **go-concurrentartifact** (`go`) — Repair the content-addressed artifact store in `store.go`. Its sequential happy path works, but publication currently uses a `Stat`-then-`Rename` sequence. Concurrent publishers can all report that…
 
 ## boundary-integrity/capability-scoping
 
