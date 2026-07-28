@@ -785,7 +785,13 @@ def _service(argv: list[str]) -> int:
 MOONSHINER_UNIT = re.compile(r"^moonshiner-[a-z-]+-[0-9a-f]{12}\.service$")
 # A claimed job holds a lease and represents real metered spend; a coordinator
 # paused mid-claim resumes without losing it. These are the child processes.
-JOB_MARKERS = ("run --only", "seed run --id")
+# A trace attempt is checkpointed in the ledger, so a job paused between two
+# attempts keeps everything it has earned. Seed authoring has no such
+# checkpoint: one job is one indivisible piece of paid work, and stopping it
+# part way discards all of it and pays again from the start.
+TRACE_MARKER = "run --only"
+SEED_MARKER = "seed run --id"
+JOB_MARKERS = (TRACE_MARKER, SEED_MARKER)
 
 
 def _running_units() -> list[str]:
@@ -834,7 +840,7 @@ def _jobs() -> list[tuple[int, bool]]:
     output = getattr(listing, "stdout", "")
     if not isinstance(output, str):
         return []
-    claimed: list[str] = []
+    claimed: list[tuple[str, bool]] = []
     parents: set[str] = set()
     for line in output.splitlines():
         fields = line.split(maxsplit=2)
@@ -842,8 +848,11 @@ def _jobs() -> list[tuple[int, bool]]:
             continue
         parents.add(fields[1])
         if any(marker in fields[2] for marker in JOB_MARKERS):
-            claimed.append(fields[0])
-    return [(int(pid), pid in parents) for pid in claimed]
+            claimed.append((fields[0], SEED_MARKER in fields[2]))
+    # An authoring job is working for as long as it exists; only a trace job
+    # may be caught in the pause between its attempts.
+    return [(int(pid), True if indivisible else pid in parents)
+            for pid, indivisible in claimed]
 
 
 def _hold_between_attempts(pid: int) -> bool:

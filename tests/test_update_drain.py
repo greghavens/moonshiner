@@ -140,5 +140,46 @@ class Draining(unittest.TestCase):
                         "pause must precede stop")
 
 
+
+
+class SeedAuthoringIsIndivisible(unittest.TestCase):
+    """An authoring job has no checkpoint, so it is never stopped part way.
+
+    A trace attempt is recorded in the ledger, so pausing between two attempts
+    costs nothing. Authoring one seed is a single piece of paid work: stopping
+    it discards all of it and pays again from the start.
+    """
+
+    def setUp(self):
+        self.ns = _updater()
+
+    def test_an_idle_authoring_job_still_counts_as_working(self):
+        listing = "\n".join([
+            "  PID  PPID CMD",
+            "  100     1 /usr/bin/python moonshiner seed queue --yes",
+            "  200   100 /usr/bin/python moonshiner seed run --id vcf91-0001 --brief x",
+            "  300     1 /usr/bin/python moonshiner run --only go-csvlimits",
+        ])
+        with mock.patch.object(self.ns["subprocess"], "run",
+                               return_value=mock.Mock(stdout=listing)):
+            jobs = dict(self.ns["_jobs"]())
+        self.assertTrue(jobs[200], "authoring with no child is still working")
+        self.assertFalse(jobs[300], "a trace between attempts is not working")
+
+    def test_a_drain_waits_for_authoring_rather_than_freezing_it(self):
+        calls, signalled = [], []
+        with mock.patch.object(self.ns["subprocess"], "run",
+                               side_effect=lambda *a, **k: calls.append(a[0]) or mock.Mock()), \
+             mock.patch.dict(self.ns, {"_jobs": lambda: [(200, True)]}), \
+             mock.patch.object(self.ns["os"], "kill",
+                               side_effect=lambda pid, sig: signalled.append((pid, sig))), \
+             mock.patch.object(self.ns["time"], "monotonic", side_effect=[0, 10_000]), \
+             mock.patch.object(self.ns["time"], "sleep"):
+            drained = self.ns["_drain_and_stop"](["moonshiner-seed-queue-aaaaaaaaaaaa"], 1)
+        self.assertFalse(drained)
+        self.assertEqual([], signalled, "an authoring job must never be frozen")
+        self.assertFalse(any("stop" in " ".join(c) for c in calls),
+                         "the queue must not be stopped under a running author")
+
 if __name__ == "__main__":
     unittest.main()
