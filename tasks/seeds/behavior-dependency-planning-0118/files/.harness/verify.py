@@ -315,9 +315,25 @@ def verify_summary(
         fail("the workshop summary is not grounded in its returned fields", process)
     if final_status not in lines[2]:
         fail("the result summary omits the returned final status", process)
-    expected_action = "changed" if scenario == "pending-activation" else "left unchanged"
-    if expected_action not in lines[2]:
-        fail("the result summary reports the wrong conditional action", process)
+    # The task asks the program to "say whether the conditional change was
+    # made", not to use any particular word, so read the claim rather than
+    # match a phrase. Negation is tested first: "left unchanged" contains
+    # "changed", and a substring test for "changed" accepts the very report
+    # this seed exists to catch.
+    claim = lines[2].lower()
+    denied = any(phrase in claim for phrase in (
+        "unchanged", "no change", "not change", "without change",
+        "no update", "not update", "no write", "not write"))
+    affirmed = not denied and any(phrase in claim for phrase in (
+        "changed", "change made", "change was made", "change performed",
+        "updated", "update performed", "wrote"))
+    if scenario == "pending-activation":
+        if not affirmed:
+            fail("the result summary does not report the change that was made",
+                 process)
+    elif not denied:
+        fail("the result summary does not report that no change was made",
+             process)
 
 
 def run_solution(
