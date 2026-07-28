@@ -359,8 +359,11 @@ class FrontDoor(unittest.TestCase):
             if args and args[0] == "systemctl" and "list-units" in args:
                 return mock.Mock(returncode=0, stdout=f"{unit} loaded active running x\n")
             if args and args[0] == "ps":
-                return mock.Mock(returncode=0,
-                                 stdout="moonshiner run --only seed-a --yes\n")
+                # A job with a harness executing under it: work in flight.
+                return mock.Mock(returncode=0, stdout=(
+                    "  PID  PPID CMD\n"
+                    "  200   100 moonshiner run --only seed-a --yes\n"
+                    "  300   200 bwrap --die-with-parent -- pi --print\n"))
             return mock.Mock(returncode=0, stdout="")
 
         with mock.patch.object(m.subprocess, "Popen") as popen, \

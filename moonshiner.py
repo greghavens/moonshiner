@@ -7,6 +7,7 @@ import getpass
 import importlib
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -822,33 +823,86 @@ def _unit_project(unit: str) -> Path | None:
         return None
 
 
-def _live_jobs() -> int:
-    """Child jobs still running under any coordinator."""
-    listing = subprocess.run(["ps", "-eo", "cmd"], capture_output=True, text=True)
+def _jobs() -> list[tuple[int, bool]]:
+    """Every claimed job as ``(pid, working)``.
+
+    A job process outlives its own attempts, so its presence proves nothing.
+    It is working only while something executes beneath it — a harness, a
+    verifier, a judge. The gap between two attempts is the queue standing
+    still, and that gap is what draining is waiting for.
+    """
+    listing = subprocess.run(["ps", "-eo", "pid,ppid,cmd"],
+                             capture_output=True, text=True)
     output = getattr(listing, "stdout", "")
     if not isinstance(output, str):
-        return 0
-    return sum(1 for line in output.splitlines()
-               if any(marker in line for marker in JOB_MARKERS))
+        return []
+    claimed: list[str] = []
+    parents: set[str] = set()
+    for line in output.splitlines():
+        fields = line.split(maxsplit=2)
+        if len(fields) < 3 or not fields[0].isdigit():
+            continue
+        parents.add(fields[1])
+        if any(marker in fields[2] for marker in JOB_MARKERS):
+            claimed.append(fields[0])
+    return [(int(pid), pid in parents) for pid in claimed]
+
+
+def _hold_between_attempts(pid: int) -> bool:
+    """Freeze an idle job in the gap so it cannot start another attempt.
+
+    False if it started one in the moment between the check and the signal, in
+    which case it is resumed and the queue is not drained yet.
+    """
+    try:
+        os.kill(pid, signal.SIGSTOP)
+    except OSError:
+        return True
+    if any(other == pid and working for other, working in _jobs()):
+        try:
+            os.kill(pid, signal.SIGCONT)
+        except OSError:
+            pass
+        return False
+    return True
 
 
 def _drain_and_stop(units: list[str], timeout_s: int) -> bool:
-    """Pause claiming, let running jobs finish, then stop. True if fully drained."""
+    """Pause claiming, wait for the queue to stand still, then stop.
+
+    Draining is a property of the queue, not of a job. The moment nothing is
+    executing in it — including between two attempts of one long job — the
+    queue is drained. A job frozen in that gap keeps its lease and its
+    remaining attempts, so nothing is forfeited by stopping there.
+    """
     for unit in units:
         subprocess.run(["systemctl", "--user", "kill", "--kill-whom=main",
                         "--signal=SIGSTOP", f"{unit}.service"],
                        capture_output=True)
-    print(f"draining {len(units)} queue(s); running jobs finish first", flush=True)
+    print(f"draining {len(units)} queue(s); waiting for the work in flight to "
+          "finish", flush=True)
     deadline = time.monotonic() + timeout_s
-    remaining = _live_jobs()
-    while remaining and time.monotonic() < deadline:
-        print(f"  {remaining} job(s) still running…", flush=True)
-        time.sleep(15)
-        remaining = _live_jobs()
+    held: set[int] = set()
+    while True:
+        remaining = 0
+        for pid, working in _jobs():
+            if working:
+                remaining += 1
+            elif pid not in held and _hold_between_attempts(pid):
+                held.add(pid)
+        if not remaining or time.monotonic() >= deadline:
+            break
+        print(f"  {remaining} job(s) still working…", flush=True)
+        time.sleep(1)
     drained = remaining == 0
     if not drained:
-        print(f"{remaining} job(s) did not finish within {timeout_s}s; "
+        print(f"{remaining} job(s) did not reach a pause within {timeout_s}s; "
               "leaving queues untouched so nothing is lost", file=sys.stderr)
+        for pid in held:
+            try:
+                os.kill(pid, signal.SIGCONT)
+            except OSError:
+                pass
         for unit in units:
             subprocess.run(["systemctl", "--user", "kill", "--kill-whom=main",
                             "--signal=SIGCONT", f"{unit}.service"],
@@ -870,7 +924,8 @@ def _update(argv: list[str]) -> int:
         prog="moonshiner update",
         description="Drain running queues, install the latest release, restart them.")
     parser.add_argument("--drain-timeout", type=int, default=3600,
-                        help="Seconds to wait for running jobs (default 3600).")
+                        help="Seconds to wait for the queue to stand still "
+                             "(default 3600).")
     parser.add_argument("--no-restart", action="store_true",
                         help="Leave queues stopped after updating.")
     args = parser.parse_args(argv)
@@ -883,8 +938,8 @@ def _update(argv: list[str]) -> int:
             projects.append(project)
     if units:
         print(f"queues running: {', '.join(units)}", flush=True)
-        # A killed job forfeits its lease and its metered attempt, so refuse to
-        # update rather than interrupt one.
+        # Interrupting work in flight forfeits a lease and a metered attempt,
+        # so refuse to update rather than cut one short.
         if not _drain_and_stop(units, args.drain_timeout):
             return 1
 
