@@ -185,3 +185,46 @@ class RemoteCardVerification(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PublishingNeverShrinksTheCorpus(unittest.TestCase):
+    """The published dataset is the product; a local mirror is not.
+
+    Fable's mirror was destroyed and rebuilt from nothing. Publishing it
+    replaced 11,487 rows on the Hub with the 239 the rebuilt mirror happened
+    to hold, deleting the Parquet shards that held the rest.
+    """
+
+    def test_publishing_fewer_rows_than_are_published_is_a_shrink(self):
+        from publish import shrinks_the_dataset
+        self.assertTrue(shrinks_the_dataset(239, 11487))
+
+    def test_growing_or_holding_steady_is_not(self):
+        from publish import shrinks_the_dataset
+        self.assertFalse(shrinks_the_dataset(11726, 11487))
+        self.assertFalse(shrinks_the_dataset(11487, 11487))
+
+    def test_the_first_publication_of_a_dataset_is_not_a_shrink(self):
+        from publish import shrinks_the_dataset
+        self.assertFalse(shrinks_the_dataset(50, 0))
+
+    def test_the_row_count_comes_from_the_manifest_then_the_jsonl(self):
+        import json as _json, pathlib, tempfile
+        from publish import publishing_row_count
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = pathlib.Path(tmp)
+            (directory / "traces.jsonl").write_text('{"a":1}\n{"a":2}\n')
+            self.assertEqual(2, publishing_row_count(directory))
+            (directory / "dataset-manifest.json").write_text(
+                _json.dumps({"row_count": 11726}))
+            self.assertEqual(11726, publishing_row_count(directory),
+                             "the manifest is authoritative when present")
+
+    def test_the_guard_runs_before_the_commit_and_can_be_overridden(self):
+        import pathlib
+        source = (pathlib.Path(__file__).resolve().parents[1]
+                  / "src" / "publish.py").read_text()
+        self.assertLess(source.index("shrinks_the_dataset(publishing, published)"),
+                        source.index("api.create_commit("),
+                        "the check must precede the commit that would delete rows")
+        self.assertIn("--allow-shrink", source)

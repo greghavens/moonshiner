@@ -38,6 +38,48 @@ def inactive_remote_paths(mode: str, remote: set[str],
     return sorted(deleted)
 
 
+def published_row_count(api, dataset: str) -> int:
+    """Rows currently published, as the last publication recorded them.
+
+    Read from the remote manifest rather than counted locally, because the
+    question being asked is what a consumer of the dataset would lose.
+    """
+    from huggingface_hub import hf_hub_download
+    try:
+        path = hf_hub_download(dataset, "dataset-manifest.json",
+                               repo_type="dataset", token=api.token)
+        return int(json.loads(Path(path).read_text()).get("row_count") or 0)
+    except Exception:
+        return 0
+
+
+def publishing_row_count(directory: Path) -> int:
+    """Rows this publication is about to put in place of them."""
+    manifest = directory / "dataset-manifest.json"
+    if manifest.is_file():
+        try:
+            return int(json.loads(manifest.read_text()).get("row_count") or 0)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return 0
+    traces = directory / "traces.jsonl"
+    if traces.is_file():
+        with traces.open("rb") as handle:
+            return sum(1 for line in handle if line.strip())
+    return 0
+
+
+def shrinks_the_dataset(publishing: int, published: int) -> bool:
+    """A publication that would leave a consumer with fewer rows than before.
+
+    The published corpus is the product. A local mirror can be rebuilt, lost
+    or truncated, and when it is, publishing it replaces the corpus with the
+    remains. Removing rows on purpose is real work — retiring poisoned traces
+    is exactly that — so this refuses rather than decides, and --allow-shrink
+    says it was meant.
+    """
+    return bool(published) and publishing < published
+
+
 def publication_files(directory: Path, mode: str | None = None, *,
                       include_jsonl: bool | None = None) -> list[Path]:
     """Return only the dataset artifacts intentionally published to the Hub."""
@@ -188,6 +230,8 @@ def main(argv=None)->int:
     parser.add_argument("--dataset",default=CONFIG.get("publish",{}).get("hf_dataset")); parser.add_argument("--dir",type=Path,default=DATA/"hf-publish")
     parser.add_argument("--commit-message")
     parser.add_argument("--task", action="append", default=[])
+    parser.add_argument("--allow-shrink", action="store_true",
+                        help="Publish even though it removes rows already published.")
     parser.add_argument("--yes",action="store_true"); args=parser.parse_args(argv)
     if not args.dataset:parser.error("--dataset is required")
     if not args.yes:parser.error("publishing requires --yes")
@@ -259,6 +303,14 @@ def main(argv=None)->int:
     active_remote = {path.relative_to(args.dir).as_posix() for path in files}
     operations.extend(CommitOperationDelete(path_in_repo=path)
                       for path in inactive_remote_paths(mode, remote, active_remote))
+    published = published_row_count(api, args.dataset)
+    publishing = publishing_row_count(args.dir)
+    if shrinks_the_dataset(publishing, published) and not args.allow_shrink:
+        raise ValueError(
+            f"refusing to publish {publishing} rows over {published} already "
+            f"published: {published - publishing} would be removed. Rebuild the "
+            "local mirror from the published dataset, or pass --allow-shrink if "
+            "the removal is intended.")
     api.create_commit(
         repo_id=args.dataset, repo_type="dataset", operations=operations,
         commit_message=args.commit_message or "Publish validated Moonshiner dataset")
