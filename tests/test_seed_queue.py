@@ -85,3 +85,42 @@ class PlanPriority(unittest.TestCase):
                              key=lambda s: (-priorities.get(s, 0), s))
             self.assertEqual(["zzz-0001", "zzz-0002", "aaa-0001", "aaa-0002"],
                              ordered)
+
+
+class TracePriorityIsSeparate(unittest.TestCase):
+    """Authoring order and tracing order are different questions.
+
+    A plan is often worth authoring ahead of the queue while its traces wait
+    behind work already in flight, so one field cannot answer both.
+    """
+
+    def _write(self, directory, name, prefix, **fields):
+        plan = {"plan": name, "id_prefix": prefix,
+                "artifact_contract": "genuine_harness_task",
+                "families": [{"scenario": name, "program": name,
+                              "category": "feature-integration",
+                              "training_tags": [name], "count": 2,
+                              "template": "Author {domain} with {constraint}."}],
+                **fields}
+        (directory / f"{name}.json").write_text(json.dumps(plan))
+
+    def test_authoring_priority_does_not_imply_tracing_priority(self):
+        import tempfile
+        from seed_inventory import plan_priorities, plan_trace_priorities
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = pathlib.Path(tmp)
+            self._write(directory, "urgent", "aaa-", priority=110)
+            self._write(directory, "later", "bbb-", priority=100, trace_priority=50)
+            self.assertEqual({"aaa-0001": 110, "aaa-0002": 110,
+                              "bbb-0001": 100, "bbb-0002": 100},
+                             plan_priorities(directory))
+            self.assertEqual({"bbb-0001": 50, "bbb-0002": 50},
+                             plan_trace_priorities(directory),
+                             "a plan authored first is not traced first by default")
+
+    def test_the_pipeline_orders_by_trace_priority_under_explicit_entries(self):
+        source = (ROOT / "src" / "trace_pipeline.py").read_text()
+        block = source[source.index("queue_order = {entry"):source.index("if args.limit")]
+        self.assertIn("plan_trace_priorities", block)
+        self.assertLess(block.index("queue_order.get"), block.index("trace_priority.get"),
+                        "an explicit queue entry must outrank a plan's priority")

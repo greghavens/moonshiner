@@ -138,8 +138,14 @@ def _selected(args) -> list[dict]:
         raise ValueError("pipeline.trace.retry_order must be immediate or tail")
     if retry_order == "tail":
         seeds.sort(key=lambda seed: attempts.get(seed["id"], 0))
+    # Explicit queue entries win, then a plan's declared tracing priority, then
+    # the order seeds loaded in. A seed authored from a prioritised plan reaches
+    # the front without anyone remembering to enqueue it by hand.
+    from seed_inventory import plan_trace_priorities
+    trace_priority = plan_trace_priorities()
     seeds.sort(key=lambda seed: (seed["id"] not in queue_order,
-                                queue_order.get(seed["id"], 0)))
+                                queue_order.get(seed["id"], 0),
+                                -trace_priority.get(seed["id"], 0)))
     if args.limit:
         seeds = seeds[:args.limit]
     elif not args.all and not only:

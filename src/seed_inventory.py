@@ -109,11 +109,15 @@ def plan_priorities(directory: Path | None = None) -> dict[str, int]:
     A plan carrying a competence the model needs now would otherwise wait
     behind every alphabetically earlier ID in a corpus of thousands.
     """
+    return _plan_priorities("priority", directory)
+
+
+def _plan_priorities(field: str, directory: Path | None = None) -> dict[str, int]:
     directory = directory or PLANS
     priorities: dict[str, int] = {}
     for path in sorted(directory.glob("*.json")):
         plan = json.loads(path.read_text())
-        priority = int(plan.get("priority") or 0)
+        priority = int(plan.get(field) or 0)
         if not priority:
             continue
         serial = 0
@@ -122,6 +126,16 @@ def plan_priorities(directory: Path | None = None) -> dict[str, int]:
                 serial += 1
                 priorities[f'{plan["id_prefix"]}{serial:04d}'] = priority
     return priorities
+
+
+def plan_trace_priorities(directory: Path | None = None) -> dict[str, int]:
+    """Tracing order for planned IDs; higher goes first, default 0.
+
+    Kept separate from the authoring priority. A plan is often worth authoring
+    ahead of the queue while its traces wait behind work already in flight,
+    and one field cannot say both.
+    """
+    return _plan_priorities("trace_priority", directory)
 
 
 def documented_plan_items() -> dict[str, str]:
