@@ -61,6 +61,32 @@ class Configuration(unittest.TestCase):
 
 
 class RunLedger(unittest.TestCase):
+    def test_a_stale_outcome_cannot_replay_an_attempt_number(self):
+        """A late set_job must not lower the attempt counter.
+
+        A worker finishing an attempt races the next claim, and the deferred
+        requeue re-states an older number. Lowering the counter makes the next
+        claim reuse an existing (run_id, seed_id, number), whose IntegrityError
+        took down the whole coordinator rather than just the seed.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            db = run_state.connect(pathlib.Path(tmp) / "state.sqlite3")
+            run_id = run_state.create_run(db, "trace", {}, {}, ["a"])
+            first = run_state.claim_job(db, run_id, "worker-1")["attempts"] + 1
+            run_state.start_attempt(db, run_id, "a", first)
+            run_state.finish_attempt(db, run_id, "a", first, "retry")
+            second = run_state.claim_job(db, run_id, "worker-2")["attempts"] + 1
+            run_state.start_attempt(db, run_id, "a", second)
+            # The first worker's requeue lands late, carrying its old number.
+            run_state.set_job(db, run_id, "a", "deferred", first, "late")
+            db.execute("UPDATE jobs SET status='retry' WHERE run_id=? AND seed_id=?",
+                       (run_id, "a"))
+            db.commit()
+            third = run_state.claim_job(db, run_id, "worker-3")["attempts"] + 1
+            self.assertGreater(third, second)
+            run_state.start_attempt(db, run_id, "a", third)  # must not raise
+            db.close()
+
     def test_run_job_attempt_lifecycle(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = run_state.connect(pathlib.Path(tmp) / "state.sqlite3")

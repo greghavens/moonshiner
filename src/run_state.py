@@ -220,8 +220,17 @@ def abandon_claim(db, run_id: str, seed_id: str, owner: str, error: str) -> None
 
 def set_job(db, run_id: str, seed_id: str, status: str,
             attempts: int, error: str | None = None) -> None:
-    db.execute("UPDATE jobs SET status=?, attempts=?, last_error=?, updated_at=?, "
-               "lease_owner=NULL,lease_expires_at=NULL "
+    """Record a job's outcome. The attempt counter never moves backwards.
+
+    Callers pass the attempt number they knew about, which can be stale by the
+    time it lands: a worker finishing an attempt races the next claim, and the
+    deferred requeue re-states an older number. Lowering the counter makes the
+    next claim recompute a number that already exists, and the insert fails the
+    (run_id, seed_id, number) uniqueness constraint — taking down the whole
+    coordinator, not just the seed.
+    """
+    db.execute("UPDATE jobs SET status=?, attempts=MAX(attempts, ?), last_error=?, "
+               "updated_at=?, lease_owner=NULL,lease_expires_at=NULL "
                "WHERE run_id=? AND seed_id=?",
                (status, attempts, error, now(), run_id, seed_id))
     db.commit()

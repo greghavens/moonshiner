@@ -49,3 +49,26 @@ class AcceptedWorkspaceMaintenance(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReadOnlyTrees(unittest.TestCase):
+    def test_a_read_only_module_cache_does_not_abort_the_sweep(self):
+        """Go writes its module cache read-only.
+
+        One such workspace used to raise PermissionError and abandon the whole
+        sweep, so reclamation never got past the first Go seed.
+        """
+        import shutil
+        from workspace_maintenance import _remove_tree
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = pathlib.Path(tmp) / "ws"
+            cache = workspace / "go" / "pkg" / "mod" / "dep@v1"
+            cache.mkdir(parents=True)
+            (cache / "x.go").write_text("package x\n")
+            (cache / "x.go").chmod(0o444)
+            cache.chmod(0o555)
+            cache.parent.chmod(0o555)
+            with self.assertRaises(PermissionError):
+                shutil.rmtree(workspace)
+            _remove_tree(workspace)
+            self.assertFalse(workspace.exists())

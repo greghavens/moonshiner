@@ -11,6 +11,34 @@ from run_state import connect
 from seed_inventory import accepted_ids
 
 
+def _force_writable(function, path, _excinfo) -> None:
+    """Retry a removal after clearing a read-only bit.
+
+    Go writes its module cache read-only, so any workspace that ever built Go
+    code refuses to delete. One such workspace used to abort the whole sweep,
+    which is why reclamation never got past the first Go seed.
+    """
+    for target in (Path(path).parent, Path(path)):
+        try:
+            target.chmod(0o700)
+        except OSError:
+            pass
+    function(path)
+
+
+def _remove_tree(path: Path) -> int:
+    """Delete a workspace, returning the bytes reclaimed."""
+    reclaimed = 0
+    for item in path.rglob("*"):
+        try:
+            if item.is_file() and not item.is_symlink():
+                reclaimed += item.stat().st_size
+        except OSError:
+            continue
+    shutil.rmtree(path, onexc=_force_writable)
+    return reclaimed
+
+
 def _belongs_to(seed_id: str, name: str) -> bool:
     prefix = r"(?:environment-|screen-|review-|validate-)?"
     suffix = r"(?:-provisioned)?(?:-[0-9a-f]{10})?"
@@ -33,9 +61,7 @@ def prune(workspaces: Path = WORKSPACES) -> tuple[int, int]:
             continue
         if path.resolve().parent != workspaces.resolve():
             raise ValueError(f"unsafe workspace path: {path}")
-        reclaimed += sum(item.stat().st_size for item in path.rglob("*")
-                         if item.is_file())
-        shutil.rmtree(path)
+        reclaimed += _remove_tree(path)
         removed += 1
     return removed, reclaimed
 
@@ -61,9 +87,7 @@ def prune_old(workspaces: Path = WORKSPACES) -> tuple[int, int]:
             continue
         if path.resolve().parent != workspaces.resolve():
             raise ValueError(f"unsafe workspace path: {path}")
-        reclaimed += sum(item.stat().st_size for item in path.rglob("*")
-                         if item.is_file())
-        shutil.rmtree(path)
+        reclaimed += _remove_tree(path)
         removed += 1
     return removed, reclaimed
 
