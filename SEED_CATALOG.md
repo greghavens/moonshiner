@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3052 seeds grouped into 424 categories. This file is generated; edit each seed's source, then regenerate it.
+3053 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -17,7 +17,7 @@
 | **Refactoring & performance** | 29 | Restructure safely and improve measured performance without behavior drift. |
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
-| **Uncategorized** | 17 | Catalog program awaiting description. |
+| **Uncategorized** | 18 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -40,6 +40,10 @@
 ## boundary-integrity/capability-scoping
 
 - **csharp-modulefacade** (`csharp`) — Checkout platform incident. OrdersModule in our modular monolith was wired directly to the application's root IServiceProvider. With scope validation enabled, the first order request now fails whil…
+
+## boundary-integrity/literal-process-boundaries
+
+- **go-commandbatch** (`go`) — Release-runner incident: `commandbatch.Run` receives commands that have already been tokenized into an executable path and an argument vector, but the current implementation turns each command back…
 
 ## boundary-integrity/resource-budgets
 
