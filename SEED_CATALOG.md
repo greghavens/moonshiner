@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3059 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3060 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -17,7 +17,7 @@
 | **Refactoring & performance** | 29 | Restructure safely and improve measured performance without behavior drift. |
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
-| **Uncategorized** | 24 | Catalog program awaiting description. |
+| **Uncategorized** | 25 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -2153,6 +2153,7 @@
 
 - **cpp-ownership-raii-move** (`cpp`) — `Pipeline` still hand-manages the source, decoder, and sink handles returned by the legacy C subsystem. Its user-declared destructor suppresses implicit moves, so the owner cannot be transferred in…
 - **csharp-notification-dispatch** (`csharp`) — Refactor the shipment-release workflow so notification orchestration is owned by one internal dispatcher instead of `ShipmentReleaseService` calling handlers directly. Introduce an internal dispatc…
+- **go-interface-slimming** (`go`) — The dispatch provider's exported `dispatch.Service` interface has grown into a six-method grab bag. The two packages that consume it now have the wrong dependency shape: `internal/httpapi` needs on…
 
 ## full-distill/security-remediation
 
