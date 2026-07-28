@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3057 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3059 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -17,7 +17,7 @@
 | **Refactoring & performance** | 29 | Restructure safely and improve measured performance without behavior drift. |
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
-| **Uncategorized** | 22 | Catalog program awaiting description. |
+| **Uncategorized** | 24 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -2028,6 +2028,7 @@
 ## full-distill-security-remediation
 
 - **csharp-cookie-hardening** (`csharp`) — Security remediation for the Cedar portal. A compatibility profile was applied to both our authentication and session cookies during the last browser rollout. Login still looks healthy in same-site…
+- **go-hmac-compare** (`go`) — A security review found that the webhook authentication in `webhook/` does not actually authenticate the bytes received on the wire, is unsafe during signing-key rotation, compares attacker-control…
 
 ## full-distill-systems-embedded
 
@@ -2062,6 +2063,7 @@
 - **bash-release-status** (`bash`) — Release incident: `release.sh` mirrors the distribution build through `tee` so CI has live output and `dist/build.log`, but a build that exits 23 is currently reported as a successful release. The…
 - **cpp-exported-targets** (`cpp`) — BeaconQueue builds and tests successfully in its own CMake tree, but a clean downstream project cannot consume the installed package. The exported `Beacon::queue` target retains its required `Threa…
 - **go-crosscompile-assets** (`go`) — The release pipeline in scripts/build-release.sh successfully cross-compiles distill for linux/amd64 and windows/amd64, but the Windows executable does not contain the generated index asset. Fix th…
+- **go-generated-drift-gate** (`go`) — Repair the generated-artifact workflow in this small Go repository. The event schema is the source of truth, and the checked-in Go and Markdown artifacts are currently stale. Keep the existing `mak…
 - **java-multirelease-jar** (`java`) — Release engineering ticket. Our runtime-greeter artifact is meant to be a multi-release JAR: Java 8 consumers get the base service provider, while Java 11 and newer consumers get the optimized prov…
 
 ## full-distill/data-migration
