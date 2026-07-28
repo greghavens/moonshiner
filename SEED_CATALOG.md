@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3053 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3054 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -17,7 +17,7 @@
 | **Refactoring & performance** | 29 | Restructure safely and improve measured performance without behavior drift. |
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
-| **Uncategorized** | 18 | Catalog program awaiting description. |
+| **Uncategorized** | 19 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -2124,6 +2124,7 @@
 ## full-distill/observability-operability
 
 - **cpp-startup-capability-summary** (`cpp`) — The service's startup capability line is intended to give operators one stable account of what was compiled in, what became usable at runtime, and why anything was disabled. It currently rediscover…
+- **go-correlation-boundary** (`go`) — Production traces from the export service are being stitched together under the wrong request. The HTTP layer copies any X-Correlation-ID it is given, stores the active value through package-global…
 
 ## full-distill/performance-profiling
 
