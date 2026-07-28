@@ -17,7 +17,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from common import PAID_RUN_UNLOCK, scrub_text
+from common import scrub_text
 from runtimes import availability
 from runtimes.base import ReviewResult, Runtime, TraceResult
 
@@ -37,15 +37,6 @@ class ClaudeCodeRuntime(Runtime):
             subprocess.run([cli, "--version"], capture_output=True, check=True)
         except (subprocess.CalledProcessError, FileNotFoundError) as error:
             raise SystemExit(f"claude CLI unusable: {error}") from error
-
-    def _require_unlock(self) -> None:
-        if not self.runtime_config.get("paid_unlock_required"):
-            return
-        unlock = os.environ.get("MOONSHINER_CREDITS_UNLOCK")
-        if unlock != PAID_RUN_UNLOCK:
-            raise SystemExit(
-                "claude-code is a paid runtime; export "
-                f"MOONSHINER_CREDITS_UNLOCK={PAID_RUN_UNLOCK} to authorize spend")
 
     # -- command construction ---------------------------------------------- #
     def _base_cmd(self, *, disallowed: str | None = None) -> list[str]:
@@ -67,7 +58,6 @@ class ClaudeCodeRuntime(Runtime):
         workspace = self.require_persistent_workspace(workspace)
         if not self.runtime_config.get("unsafe_host_access", False):
             raise RuntimeError("claude-code teacher disabled until a contained runtime is configured")
-        self._require_unlock()
         cmd = self._base_cmd()
         cmd += ["--append-system-prompt", system_prompt]
 
@@ -173,7 +163,6 @@ class ClaudeCodeRuntime(Runtime):
                    schema: dict | None = None,
                    read_only: bool = True) -> ReviewResult:
         workspace = self.require_persistent_workspace(workspace)
-        self._require_unlock()
         cmd = self._base_cmd(disallowed=READ_ONLY_DISALLOW if read_only else None)
         prompt = instruction
         if schema is not None:

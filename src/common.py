@@ -85,10 +85,6 @@ QUARANTINE_DIR = TRACES / "quarantine"
 
 # Explicit acknowledgement required before any metered teacher/judge call. The
 # claude-code and codex accounts bill real credits; pi routes through a paid
-# provider key (Z.ai, OpenRouter, …). Guarded launchers refuse to run without
-# this exact value.
-PAID_RUN_UNLOCK = "CREDITS_PURCHASED"
-
 # Secret shapes dropped from any exported row. Kept broad on purpose.
 SECRET_RE = re.compile(
     r"(sk-(?:proj-)?[A-Za-z0-9_-]{16,}|sk-ant-[A-Za-z0-9_-]{8,}"

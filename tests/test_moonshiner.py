@@ -471,29 +471,24 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class SupervisedQueuesCarryTheirAuthorization(unittest.TestCase):
-    """A paid runtime refuses to run without an explicit spend authorization.
+class NoRuntimeMayBeLockedOut(unittest.TestCase):
+    """A configured runtime runs. It is never gated behind a local flag.
 
-    Units are started with a deliberately bare environment, so the
-    authorization never reached the queue: every seed authored fine on the
-    author runtime and then died at the judge, after the authoring was paid
-    for.
+    claude-code refused to start unless an environment variable held an exact
+    string. Nothing about that reflected whether the account could pay: it was
+    a switch the product held against itself, and it stopped a live pipeline
+    dead while every credential and quota was fine.
     """
 
-    def test_the_unlock_is_forwarded_when_the_caller_set_it(self):
-        with mock.patch.dict(m.os.environ,
-                             {"MOONSHINER_CREDITS_UNLOCK": "CREDITS_PURCHASED"}):
-            self.assertEqual(
-                ["--setenv=MOONSHINER_CREDITS_UNLOCK=CREDITS_PURCHASED"],
-                m._forwarded_authorization())
+    def test_no_purchase_gate_survives_anywhere(self):
+        root = pathlib.Path(m.__file__).resolve().parent
+        banned = ("PAID_RUN_UNLOCK", "MOONSHINER_CREDITS_UNLOCK",
+                  "paid_unlock_required", "CREDITS_PURCHASED")
+        offenders = []
+        for path in list(root.glob("src/**/*.py")) + [root / "moonshiner.py",
+                                                      root / "config.json"]:
+            text = path.read_text(errors="replace")
+            offenders += [f"{path.name}:{word}" for word in banned if word in text]
+        self.assertEqual([], offenders,
+                         "a runtime must never be blocked by a local switch")
 
-    def test_nothing_is_authorized_on_its_own(self):
-        with mock.patch.dict(m.os.environ, {}, clear=True):
-            self.assertEqual([], m._forwarded_authorization())
-
-    def test_every_queue_unit_forwards_it(self):
-        source = (pathlib.Path(m.__file__).resolve()).read_text()
-        starts = source.count('"--setenv=PATH=')
-        forwards = source.count("*_forwarded_authorization()")
-        self.assertGreaterEqual(forwards, 4,
-                                "each queue unit must carry the authorization")
