@@ -22,6 +22,7 @@ from normalize import parse_trace
 from screen_traces import (apply_candidate_patch, feedback_from_review, screen)
 import publish_queue
 
+MAX_CONSECUTIVE_REVIEWER_FAILURES = 3
 KIND = "synthetic-correction"
 
 
@@ -141,6 +142,12 @@ def eligible_exhausted_attempts(db) -> list[dict]:
     first: dict[str, int] = {}
     for row in rows:
         item = dict(row)
+        # The ledger records where an artifact was archived; the directory can
+        # be gone (pruned run, reclaimed storage). A correction cannot be
+        # reviewed without it, and one missing directory must not take the
+        # whole queue down with it.
+        if not Path(item["artifact_path"]).is_dir():
+            continue
         grouped.setdefault(item["seed_id"], []).append(item)
         first.setdefault(item["seed_id"], item["id"])
     candidates = []
@@ -544,6 +551,7 @@ def run(*, dry_run: bool = False, config: dict | None = None,
         [candidate["seed_id"] for candidate in candidates])
     queue = CorrectionQueue([], max_attempts=opts["max_attempts"])
     candidate_by_id = {candidate["seed_id"]: candidate for candidate in candidates}
+    consecutive_reviewer_failures = 0
     for candidate in candidates:
         seed = seeds.get(candidate["seed_id"])
         if not seed:
@@ -571,10 +579,23 @@ def run(*, dry_run: bool = False, config: dict | None = None,
         report["model_calls"] += 1
         if (eligibility.return_code != 0 or eligibility.timed_out
                 or not eligibility.model_attested or eligibility.error):
-            error = "correction eligibility reviewer failed or was not model-attested"
-            set_run_status(db, run_id, "failed", error)
-            db.close()
-            raise RuntimeError(error)
+            # One candidate the reviewer could not judge is not a reason to
+            # abandon the rest, and an unattested verdict is never trusted:
+            # leave the candidate untouched so it stays eligible next pass.
+            # Consecutive failures mean the reviewer itself is broken, and
+            # continuing would spend a metered call per remaining candidate.
+            report["reviewer_failures"] = report.get("reviewer_failures", 0) + 1
+            consecutive_reviewer_failures += 1
+            if consecutive_reviewer_failures >= MAX_CONSECUTIVE_REVIEWER_FAILURES:
+                error = ("correction eligibility reviewer failed "
+                         f"{consecutive_reviewer_failures} times in a row")
+                set_run_status(db, run_id, "failed", error)
+                db.close()
+                raise RuntimeError(error)
+            print(f"[skipped] {seed['id']}: eligibility reviewer failed",
+                  file=sys.stderr, flush=True)
+            continue
+        consecutive_reviewer_failures = 0
         eligible, _ = validate_eligibility(
             eligibility.verdict, failure_count=len(candidate["failures"]))
         if eligible:

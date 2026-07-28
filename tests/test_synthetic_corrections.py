@@ -61,6 +61,21 @@ class SyntheticCorrectionContracts(unittest.TestCase):
         self.assertEqual([item["seed_id"] for item in selected], ["oldest", "later"])
         db.close()
 
+    def test_candidate_whose_archived_artifact_is_gone_is_skipped(self):
+        """A pruned run directory must not take the whole queue down.
+
+        The ledger records where an artifact was archived; storage reclamation
+        can remove it. Such a candidate cannot be reviewed, so it is dropped
+        rather than handed to the reviewer as a nonexistent working directory.
+        """
+        db = connect(self.db_path)
+        present = self.root / "present"; present.mkdir()
+        self._attempt(db, "trace", "kept", "exhausted", present)
+        self._attempt(db, "trace", "vanished", "exhausted", self.root / "gone")
+        selected = corrections.eligible_exhausted_attempts(db)
+        self.assertEqual([item["seed_id"] for item in selected], ["kept"])
+        db.close()
+
     def test_any_current_revision_acceptance_excludes_all_failures(self):
         db = connect(self.db_path)
         self._attempt(db, "trace", "passed-first", "accepted")
@@ -119,6 +134,45 @@ class SyntheticCorrectionContracts(unittest.TestCase):
                    "repair_instructions": "one missing call"}
         self.assertEqual(corrections.selected_failure(
             {"failures": failures}, verdict), failures[1])
+
+    def _reviewer_failure_run(self, candidates: int):
+        """Run the queue with a reviewer that fails on every candidate."""
+        db = connect(self.db_path)
+        names = [f"seed-{index}" for index in range(candidates)]
+        for name in names:
+            artifact = self.root / name; artifact.mkdir()
+            self._attempt(db, "trace", name, "exhausted", artifact)
+        db.close()
+        runtime = mock.Mock()
+        runtime.run_review.return_value = mock.Mock(
+            return_code=1, timed_out=False, model_attested=False,
+            error="reviewer exploded", verdict=None)
+        config = {"synthetic_corrections": {"enabled": True, "max_attempts": 2,
+                                            "hf_dataset": "owner/x-corrections"},
+                  "judge": {"runtime": "codex", "model": "j", "reasoning": "xhigh"}}
+        paths = corrections.CorrectionPaths(
+            self.root / "c", self.root / "c" / "traces", self.root / "c" / "pub")
+        with mock.patch.object(corrections, "load_seeds",
+                               return_value=[{"id": n, "prompt": "p"} for n in names]), \
+             mock.patch.object(corrections, "correction_paths", return_value=paths), \
+             mock.patch.object(corrections, "_correction_runtime", return_value=runtime):
+            return runtime, corrections.run(config=config, db_path=self.db_path,
+                                            runtime=runtime, judge=mock.Mock())
+
+    def test_one_unjudgeable_candidate_does_not_abandon_the_rest(self):
+        """A reviewer failure is per-candidate, not fatal to the queue."""
+        runtime, report = self._reviewer_failure_run(
+            corrections.MAX_CONSECUTIVE_REVIEWER_FAILURES - 1)
+        self.assertEqual(runtime.run_review.call_count,
+                         corrections.MAX_CONSECUTIVE_REVIEWER_FAILURES - 1)
+        self.assertEqual(report["reviewer_failures"],
+                         corrections.MAX_CONSECUTIVE_REVIEWER_FAILURES - 1)
+
+    def test_a_broken_reviewer_stops_before_spending_on_every_candidate(self):
+        """Consecutive failures mean the reviewer itself is broken."""
+        with self.assertRaises(RuntimeError):
+            self._reviewer_failure_run(
+                corrections.MAX_CONSECUTIVE_REVIEWER_FAILURES + 5)
 
     def test_outputs_are_isolated_from_primary(self):
         paths = corrections.correction_paths(self.root)
