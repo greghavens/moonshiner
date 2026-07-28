@@ -967,9 +967,15 @@ def _update(argv: list[str]) -> int:
         if units and args.no_restart:
             print("queues left stopped; run `moonshiner` in each project to resume")
         return version.returncode
+    # MOONSHINER_HOME points at the state of the project this process was
+    # started in, and children inherit it. Carrying it into another project
+    # resolves that project's state to this one's directory, where its
+    # confirmed root does not match, and its queues silently fail to start.
+    environment = {name: value for name, value in os.environ.items()
+                   if name != "MOONSHINER_HOME"}
     for project in projects:
         print(f"restarting queues in {project}", flush=True)
-        subprocess.run([executable], cwd=project)
+        subprocess.run([executable], cwd=project, env=environment)
     return version.returncode
 
 

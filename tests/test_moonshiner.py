@@ -351,6 +351,43 @@ class FrontDoor(unittest.TestCase):
         self.assertIn(["/bin/bash"], commands)
         self.assertEqual(commands[-1][-1], "--version")
 
+    def test_update_restarts_each_project_with_its_own_state(self):
+        """MOONSHINER_HOME must not follow the updater into another project.
+
+        The updater runs in one project, so its environment names that
+        project's state. Passing it on makes the next project resolve its
+        state to the wrong directory, fail its confirmed-root check, and
+        silently decline to start.
+        """
+        pipe = mock.Mock()
+        pipe.stdout = mock.Mock()
+        pipe.wait.return_value = 0
+        unit = "moonshiner-trace-continuous-b5ae23d72506.service"
+
+        def dispatch(args, **_kwargs):
+            if args and args[0] == "systemctl" and "list-units" in args:
+                return mock.Mock(returncode=0, stdout=f"{unit} loaded active running x\n")
+            if args and args[0] == "systemctl" and "show" in args:
+                return mock.Mock(returncode=0, stdout="4242\n")
+            if args and args[0] == "ps":
+                return mock.Mock(returncode=0, stdout="  PID  PPID CMD\n")
+            return mock.Mock(returncode=0, stdout="")
+
+        with mock.patch.dict(m.os.environ, {"MOONSHINER_HOME": "/fable/.moonshiner"}), \
+             mock.patch.object(m.os, "readlink", return_value="/kimi"), \
+             mock.patch.object(m.shutil, "which", side_effect=[
+                 "/usr/bin/curl", "/bin/bash", "/installed/bin/moonshiner"]), \
+             mock.patch.object(m.subprocess, "Popen", return_value=pipe), \
+             mock.patch.object(m.time, "sleep"), \
+             mock.patch.object(m.subprocess, "run", side_effect=dispatch) as run:
+            self.assertEqual(m._update([]), 0)
+        restarts = [call for call in run.call_args_list
+                    if call.args[0] == ["/installed/bin/moonshiner"]]
+        self.assertTrue(restarts, "the discovered project must be restarted")
+        for call in restarts:
+            self.assertNotIn("MOONSHINER_HOME", call.kwargs.get("env", {}),
+                             "a restart must resolve state from its own directory")
+
     def test_update_refuses_to_replace_the_release_under_a_running_job(self):
         """A killed job forfeits its lease and its metered attempt."""
         unit = "moonshiner-trace-continuous-39fd2040b76f.service"
