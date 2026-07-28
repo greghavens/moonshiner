@@ -469,3 +469,31 @@ class Plan(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SupervisedQueuesCarryTheirAuthorization(unittest.TestCase):
+    """A paid runtime refuses to run without an explicit spend authorization.
+
+    Units are started with a deliberately bare environment, so the
+    authorization never reached the queue: every seed authored fine on the
+    author runtime and then died at the judge, after the authoring was paid
+    for.
+    """
+
+    def test_the_unlock_is_forwarded_when_the_caller_set_it(self):
+        with mock.patch.dict(m.os.environ,
+                             {"MOONSHINER_CREDITS_UNLOCK": "CREDITS_PURCHASED"}):
+            self.assertEqual(
+                ["--setenv=MOONSHINER_CREDITS_UNLOCK=CREDITS_PURCHASED"],
+                m._forwarded_authorization())
+
+    def test_nothing_is_authorized_on_its_own(self):
+        with mock.patch.dict(m.os.environ, {}, clear=True):
+            self.assertEqual([], m._forwarded_authorization())
+
+    def test_every_queue_unit_forwards_it(self):
+        source = (pathlib.Path(m.__file__).resolve()).read_text()
+        starts = source.count('"--setenv=PATH=')
+        forwards = source.count("*_forwarded_authorization()")
+        self.assertGreaterEqual(forwards, 4,
+                                "each queue unit must carry the authorization")

@@ -579,6 +579,7 @@ def _start_default_queues() -> int:
             subprocess.run(["systemd-run", "--user", "--collect", f"--unit={unit}",
                             f"--property=WorkingDirectory={PROJECT_ROOT}",
                             f"--setenv=PATH={os.environ.get('PATH', '')}",
+                            *_forwarded_authorization(),
                             str(executable), "seed", "queue", "--yes"], check=True)
     if queues.get("tracing", True):
         unit = f"moonshiner-trace-continuous-{project_key}"
@@ -597,7 +598,7 @@ def _start_default_queues() -> int:
                        f"--property=StandardOutput=append:{log_dir / 'run.log'}",
                        f"--property=StandardError=append:{log_dir / 'run.log'}",
                        f"--setenv=PATH={os.environ.get('PATH', '')}",
-                       "--setenv=MOONSHINER_SUPERVISED=1", str(executable),
+                       "--setenv=MOONSHINER_SUPERVISED=1", *_forwarded_authorization(), str(executable),
                        "run", "--all", "--yes"]
             subprocess.run(command, check=True)
     correction = CONFIG.get("synthetic_corrections") or {}
@@ -617,6 +618,7 @@ def _start_default_queues() -> int:
                             f"--property=StandardOutput=append:{log_dir / 'run.log'}",
                             f"--property=StandardError=append:{log_dir / 'run.log'}",
                             f"--setenv=PATH={os.environ.get('PATH', '')}",
+                            *_forwarded_authorization(),
                             str(executable), "synthetic-corrections", "run", "--watch", "--yes"],
                            check=True)
     print("Moonshiner queues are running: author (when enabled), trace/judge/retrace, "
@@ -758,7 +760,7 @@ def _service(argv: list[str]) -> int:
                    f"--property=StandardOutput=append:{log_dir / 'run.log'}",
                    f"--property=StandardError=append:{log_dir / 'run.log'}",
                    f"--setenv=PATH={os.environ.get('PATH', '')}",
-                   "--setenv=MOONSHINER_SUPERVISED=1", str(executable),
+                   "--setenv=MOONSHINER_SUPERVISED=1", *_forwarded_authorization(), str(executable),
                    "run", "--all", "--yes"]
         result = subprocess.run(command)
         if result.returncode == 0:
@@ -780,6 +782,19 @@ def _service(argv: list[str]) -> int:
     if result.returncode == 0:
         print(message)
     return result.returncode
+
+
+def _forwarded_authorization() -> list[str]:
+    """Carry an explicit spend authorization into a supervised queue.
+
+    A paid runtime refuses to run without MOONSHINER_CREDITS_UNLOCK. Units are
+    started with a deliberately bare environment, so the authorization never
+    reached the queue and every job needing that runtime failed after the work
+    before it had already been paid for. Only a value the caller actually set
+    is forwarded; nothing here authorizes anything on its own.
+    """
+    unlock = os.environ.get("MOONSHINER_CREDITS_UNLOCK")
+    return [f"--setenv=MOONSHINER_CREDITS_UNLOCK={unlock}"] if unlock else []
 
 
 MOONSHINER_UNIT = re.compile(r"^moonshiner-[a-z-]+-[0-9a-f]{12}\.service$")
