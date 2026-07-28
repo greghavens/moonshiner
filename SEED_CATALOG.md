@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3054 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3056 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -17,7 +17,7 @@
 | **Refactoring & performance** | 29 | Restructure safely and improve measured performance without behavior drift. |
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
-| **Uncategorized** | 19 | Catalog program awaiting description. |
+| **Uncategorized** | 21 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -48,6 +48,7 @@
 ## boundary-integrity/resource-budgets
 
 - **c-recursionbudget** (`c`) — Repair the binary tree decoder in `src/tree_decoder.c`. It currently decodes child nodes with unchecked C recursion and does not enforce either resource limit published by the header. Replace recur…
+- **go-csvlimits** (`go`) — Repair `import.go`, the streaming CSV importer, without changing the public API in `model.go`. The current implementation asks `encoding/csv` to materialize each complete record before checking lim…
 
 ## boundary-integrity/transactional-journals
 
@@ -2068,6 +2069,7 @@
 - **csharp-encrypted-field-rotation** (`csharp`) — The encrypted-field migration already stores a key version in each AES-GCM envelope, can decrypt both configured legacy and current versions, skips current-version rows on subsequent runs, and uses…
 - **csharp-tenant-key-rollout** (`csharp`) — Repair the online tenant-key migration in `src/TenantKeyRollout/TenantKeyMigration.cs`. Existing records are backfilled in bounded, restartable batches with a tenant-scoped key, and duplicate exter…
 - **go-blob-metadata-rollout** (`go`) — Repair `migration.go`, the resumable metadata backfill for a blob store. Keep the existing public API. The rollout owns only two absent-key backfills: copy a blob's non-empty `ContentType` into `co…
+- **go-event-version-backfill** (`go`) — Repair `migration.go`, the bounded v1-to-v2 event backfill. Keep the existing public API. Each `RunBatch` call may process at most one store batch. Load its durable checkpoint first and return with…
 - **java-json-column-version** (`java`) — The JSON-column migrator upgrades each document according to its own `_schemaVersion` and quarantines malformed documents while continuing the scan. It also records a checkpoint after each configur…
 - **java-ledger-decimal-move** (`java`) — Repair the ledger amount migration in `src/main/java/com/moonshiner/ledger/LedgerAmountMigration.java`. Version 1 rows store a canonical signed base-10 integer count of cents; migrating them must p…
 - **powershell-csv-directory-move** (`powershell`) — Repair the schema-v1 to schema-v2 directory-export CSV migrator in `src/Move-DirectoryExport.ps1`. Legacy `size_mib` values always use an invariant decimal point; they must produce the same integra…

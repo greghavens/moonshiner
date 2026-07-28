@@ -1,0 +1,383 @@
+diff --git a/import.go b/import.go
+index c9d0009..40abd58 100644
+--- a/import.go
++++ b/import.go
+@@ -1,17 +1,16 @@
+ package csvlimits
+ 
+ import (
++	"bufio"
+ 	"context"
+-	"encoding/csv"
+ 	"errors"
+ 	"fmt"
+ 	"io"
+ )
+ 
+-// Import reads CSV records and offers valid rows to accept.
+-//
+-// This implementation performs its resource checks after encoding/csv has
+-// materialized a complete record. It is retained from the original importer.
++// Import reads CSV records and offers valid rows to accept. It retains at most
++// MaxDiagnostics diagnostics and never accumulates data past a row's first
++// resource violation.
+ func Import(
+ 	ctx context.Context,
+ 	src io.Reader,
+@@ -30,77 +29,307 @@ func Import(
+ 		limits.MaxFields <= 0 ||
+ 		limits.MaxFieldBytes <= 0 ||
+ 		limits.MaxDiagnostics < 0 {
+-		return result, fmt.Errorf("%w: all byte and field limits must be positive", ErrInvalidLimits)
++		return result, fmt.Errorf(
++			"%w: row bytes, fields, and field bytes must be positive; diagnostics cannot be negative",
++			ErrInvalidLimits,
++		)
+ 	}
++	result.Diagnostics = make([]Diagnostic, 0, min(limits.MaxDiagnostics, 16))
+ 
+-	reader := csv.NewReader(src)
+-	reader.FieldsPerRecord = -1
+-	reader.ReuseRecord = true
+-
++	stream := newCSVStream(src)
+ 	for record := 1; ; record++ {
+-		if err := ctx.Err(); err != nil {
++		if err := cancellationCause(ctx); err != nil {
+ 			return result, err
+ 		}
+ 
+-		row, err := reader.Read()
+-		if errors.Is(err, io.EOF) {
+-			return result, nil
+-		}
++		row, diagnostic, found, err := readRecord(ctx, stream, limits, record)
+ 		if err != nil {
+-			var parseErr *csv.ParseError
+-			if errors.As(err, &parseErr) {
+-				return result, &SyntaxError{
+-					Position: Position{Record: record, Line: parseErr.Line, Column: parseErr.Column},
+-					Reason:   parseErr.Err.Error(),
+-				}
++			if errors.Is(err, io.EOF) && !found {
++				return result, nil
++			}
++			var syntaxErr *SyntaxError
++			if errors.As(err, &syntaxErr) {
++				return result, syntaxErr
+ 			}
+ 			return result, fmt.Errorf("read record %d: %w", record, err)
+ 		}
+-
+-		var diagnostic *Diagnostic
+-		rowBytes := len(row) - 1
+-		for _, field := range row {
+-			rowBytes += len(field)
+-		}
+-		if rowBytes > limits.MaxRowBytes {
+-			line, column := reader.FieldPos(0)
+-			diagnostic = &Diagnostic{
+-				Violation: RowBytes,
+-				Position:  Position{Record: record, Line: line, Column: column},
+-			}
+-		} else if len(row) > limits.MaxFields {
+-			line, column := reader.FieldPos(limits.MaxFields)
+-			diagnostic = &Diagnostic{
+-				Violation: FieldCount,
+-				Position:  Position{Record: record, Line: line, Column: column},
+-			}
+-		} else {
+-			for i, field := range row {
+-				if len(field) > limits.MaxFieldBytes {
+-					line, column := reader.FieldPos(i)
+-					diagnostic = &Diagnostic{
+-						Violation: FieldBytes,
+-						Position:  Position{Record: record, Line: line, Column: column},
+-					}
+-					break
+-				}
+-			}
++		if !found {
++			return result, nil
+ 		}
+ 
+ 		if diagnostic != nil {
+ 			result.Rejected++
+-			result.Diagnostics = append(result.Diagnostics, *diagnostic)
++			if len(result.Diagnostics) < limits.MaxDiagnostics {
++				result.Diagnostics = append(result.Diagnostics, *diagnostic)
++			} else {
++				result.Suppressed++
++			}
+ 			continue
+ 		}
+ 
+-		result.Accepted++
+-		if progress != nil {
+-			progress(result.Accepted)
++		if err := cancellationCause(ctx); err != nil {
++			return result, err
+ 		}
+ 		if accept != nil {
+ 			if err := accept(ctx, row); err != nil {
+ 				return result, fmt.Errorf("accept record %d: %w", record, err)
+ 			}
+ 		}
++		result.Accepted++
++		if err := cancellationCause(ctx); err != nil {
++			return result, err
++		}
++		if progress != nil {
++			progress(result.Accepted)
++		}
++	}
++}
++
++func cancellationCause(ctx context.Context) error {
++	if ctx.Err() == nil {
++		return nil
++	}
++	if cause := context.Cause(ctx); cause != nil {
++		return cause
++	}
++	return ctx.Err()
++}
++
++type csvByte struct {
++	value  byte
++	line   int
++	column int
++}
++
++type csvStream struct {
++	reader *bufio.Reader
++	line   int
++	column int
++}
++
++func newCSVStream(src io.Reader) *csvStream {
++	return &csvStream{
++		reader: bufio.NewReader(src),
++		line:   1,
++		column: 1,
++	}
++}
++
++func (s *csvStream) next(ctx context.Context) (csvByte, error) {
++	if err := cancellationCause(ctx); err != nil {
++		return csvByte{}, err
++	}
++	value, err := s.reader.ReadByte()
++	if err != nil {
++		return csvByte{}, err
++	}
++	if err := cancellationCause(ctx); err != nil {
++		return csvByte{}, err
++	}
++
++	token := csvByte{value: value, line: s.line, column: s.column}
++	if value == '\n' {
++		s.line++
++		s.column = 1
++	} else {
++		s.column++
++	}
++	return token, nil
++}
++
++func (s *csvStream) eofPosition(record int) Position {
++	return Position{Record: record, Line: s.line, Column: s.column}
++}
++
++type csvState uint8
++
++const (
++	atFieldStart csvState = iota
++	inUnquotedField
++	inQuotedField
++	afterQuotedField
++)
++
++func readRecord(
++	ctx context.Context,
++	stream *csvStream,
++	limits Limits,
++	record int,
++) ([]string, *Diagnostic, bool, error) {
++	var (
++		state      = atFieldStart
++		rowBytes   int
++		fieldBytes int
++		fieldCount = 1
++		field      []byte
++		fields     = make([]string, 0, min(limits.MaxFields, 16))
++		diagnostic *Diagnostic
++		sawAnyByte bool
++		pending    *csvByte
++	)
++
++	position := func(token csvByte) Position {
++		return Position{Record: record, Line: token.line, Column: token.column}
++	}
++	reject := func(violation Violation, token csvByte) {
++		if diagnostic != nil {
++			return
++		}
++		diagnostic = &Diagnostic{Violation: violation, Position: position(token)}
++		field = nil
++		fields = nil
++	}
++	consumeRaw := func(token csvByte) {
++		if diagnostic != nil {
++			return
++		}
++		if rowBytes >= limits.MaxRowBytes {
++			reject(RowBytes, token)
++			return
++		}
++		rowBytes++
++	}
++	appendDecoded := func(value byte, token csvByte) {
++		if diagnostic != nil {
++			return
++		}
++		if fieldBytes >= limits.MaxFieldBytes {
++			reject(FieldBytes, token)
++			return
++		}
++		field = append(field, value)
++		fieldBytes++
++	}
++	endField := func() {
++		if diagnostic == nil {
++			fields = append(fields, string(field))
++		}
++		field = nil
++		fieldBytes = 0
++	}
++	finish := func() ([]string, *Diagnostic, bool, error) {
++		if diagnostic == nil {
++			endField()
++		}
++		return fields, diagnostic, true, nil
++	}
++	syntax := func(token csvByte, reason string) ([]string, *Diagnostic, bool, error) {
++		return nil, nil, true, &SyntaxError{Position: position(token), Reason: reason}
++	}
++
++	for {
++		var token csvByte
++		var err error
++		if pending != nil {
++			token = *pending
++			pending = nil
++		} else {
++			token, err = stream.next(ctx)
++			if err != nil {
++				if !errors.Is(err, io.EOF) {
++					return nil, nil, sawAnyByte, err
++				}
++				if !sawAnyByte {
++					return nil, nil, false, io.EOF
++				}
++				if state == inQuotedField {
++					return nil, nil, true, &SyntaxError{
++						Position: stream.eofPosition(record),
++						Reason:   "unterminated quoted field",
++					}
++				}
++				return finish()
++			}
++		}
++		sawAnyByte = true
++
++		switch state {
++		case inQuotedField:
++			consumeRaw(token)
++			if token.value == '"' {
++				state = afterQuotedField
++			} else {
++				appendDecoded(token.value, token)
++			}
++
++		case afterQuotedField:
++			switch token.value {
++			case '"':
++				consumeRaw(token)
++				appendDecoded('"', token)
++				state = inQuotedField
++			case ',':
++				consumeRaw(token)
++				if diagnostic == nil {
++					if fieldCount >= limits.MaxFields {
++						reject(FieldCount, token)
++					} else {
++						endField()
++						fieldCount++
++					}
++				}
++				state = atFieldStart
++			case '\n':
++				return finish()
++			case '\r':
++				next, nextErr := stream.next(ctx)
++				if nextErr != nil {
++					if errors.Is(nextErr, io.EOF) {
++						return syntax(token, "unexpected carriage return after closing quote")
++					}
++					return nil, nil, true, nextErr
++				}
++				if next.value == '\n' {
++					return finish()
++				}
++				return syntax(token, "unexpected carriage return after closing quote")
++			default:
++				return syntax(token, "unexpected byte after closing quote")
++			}
++
++		case atFieldStart, inUnquotedField:
++			switch token.value {
++			case '"':
++				if state != atFieldStart {
++					return syntax(token, "quote in unquoted field")
++				}
++				consumeRaw(token)
++				state = inQuotedField
++			case ',':
++				consumeRaw(token)
++				if diagnostic == nil {
++					if fieldCount >= limits.MaxFields {
++						reject(FieldCount, token)
++					} else {
++						endField()
++						fieldCount++
++					}
++				}
++				state = atFieldStart
++			case '\n':
++				return finish()
++			case '\r':
++				next, nextErr := stream.next(ctx)
++				if nextErr != nil {
++					if !errors.Is(nextErr, io.EOF) {
++						return nil, nil, true, nextErr
++					}
++					consumeRaw(token)
++					appendDecoded('\r', token)
++					return finish()
++				}
++				if next.value == '\n' {
++					return finish()
++				}
++				consumeRaw(token)
++				appendDecoded('\r', token)
++				state = inUnquotedField
++				pending = &next
++			default:
++				consumeRaw(token)
++				appendDecoded(token.value, token)
++				state = inUnquotedField
++			}
++		}
+ 	}
+ }
