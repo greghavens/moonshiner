@@ -1,0 +1,252 @@
+diff --git a/migration.go b/migration.go
+--- a/migration.go
++++ b/migration.go
+@@ -2,9 +2,11 @@ package eventbackfill
+ 
+ import (
+ 	"context"
++	"crypto/sha256"
++	"encoding/hex"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+-	"sort"
+ )
+ 
+ type Migrator struct {
+@@ -52,84 +54,188 @@ func (m *Migrator) RunBatch(
+ 		return stats, nil
+ 	}
+ 
+-	// BUG: restarts discard the durable opaque token.
+-	batch, err := m.store.ListBatch(ctx, "", m.batchSize)
++	batch, err := m.store.ListBatch(ctx, checkpoint.Token, m.batchSize)
+ 	if err != nil {
+-		return stats, fmt.Errorf("list batch: %w", err)
++		return stats, fmt.Errorf(
++			"list batch from checkpoint token: %w",
++			err,
++		)
++	}
++	if len(batch.Events) > m.batchSize {
++		return stats, fmt.Errorf(
++			"%w: got %d events for limit %d",
++			ErrBatchTooLarge,
++			len(batch.Events),
++			m.batchSize,
++		)
++	}
++
++	for _, event := range batch.Events {
++		stats.Scanned++
++		if err := m.rewriteEvent(
++			ctx,
++			migrationID,
++			event,
++			&stats,
++		); err != nil {
++			return stats, err
++		}
+ 	}
+ 
+-	// BUG: deriving completion from token spelling and saving before the
+-	// rewrites can skip a partially applied batch.
+-	complete := batch.NextToken == ""
+-	if err := m.store.SaveCheckpoint(
++	saveErr := m.store.SaveCheckpoint(
+ 		ctx,
+ 		migrationID,
+ 		checkpoint.Revision,
+ 		batch.NextToken,
+-		complete,
+-	); err != nil {
+-		return stats, fmt.Errorf("save checkpoint: %w", err)
++		batch.Complete,
++	)
++	if saveErr != nil {
++		durable, loadErr := m.store.LoadCheckpoint(ctx, migrationID)
++		if loadErr != nil {
++			return stats, fmt.Errorf(
++				"save checkpoint: %w (could not reconcile: %v)",
++				saveErr,
++				loadErr,
++			)
++		}
++		if durable.Token != batch.NextToken ||
++			durable.Complete != batch.Complete {
++			return stats, fmt.Errorf("save checkpoint: %w", saveErr)
++		}
+ 	}
+ 	stats.Batches++
++	return stats, nil
++}
+ 
+-	// BUG: storage order is part of the event log contract.
+-	sort.Slice(batch.Events, func(i, j int) bool {
+-		return batch.Events[i].ID < batch.Events[j].ID
+-	})
+-	for _, event := range batch.Events {
+-		stats.Scanned++
+-		if event.SchemaVersion == 2 {
++func (m *Migrator) rewriteEvent(
++	ctx context.Context,
++	migrationID string,
++	listed Event,
++	stats *Stats,
++) error {
++	operationID := rewriteOperationID(migrationID, listed.ID)
++	current := listed
++	writeRetries := 0
++	conflictRetries := 0
++
++	for {
++		switch current.SchemaVersion {
++		case 2:
+ 			stats.AlreadyV2++
+-			continue
++			return nil
++		case 1:
++			// Continue below.
++		default:
++			return fmt.Errorf(
++				"event %q: %w: %d",
++				current.ID,
++				ErrUnsupportedVersion,
++				current.SchemaVersion,
++			)
+ 		}
+ 
+-		payload, err := UpgradePayloadV1(event.Payload)
++		payload, err := UpgradePayloadV1(current.Payload)
+ 		if err != nil {
+-			return stats, fmt.Errorf("upgrade event %q: %w", event.ID, err)
++			return fmt.Errorf("upgrade event %q: %w", current.ID, err)
+ 		}
+-		operationID := fmt.Sprintf(
+-			"%s/%s/revision-%d",
+-			migrationID,
+-			event.ID,
+-			event.Revision,
+-		)
+-		if _, err := m.store.RewriteV2(
++		_, err = m.store.RewriteV2(
+ 			ctx,
+-			event.ID,
+-			event.Revision,
++			current.ID,
++			current.Revision,
+ 			operationID,
+ 			payload,
+-		); err != nil {
+-			return stats, fmt.Errorf("rewrite event %q: %w", event.ID, err)
++		)
++		if err == nil {
++			stats.Rewritten++
++			return nil
++		}
++
++		if errors.Is(err, ErrTransient) {
++			if writeRetries >= m.maxWriteRetries {
++				return fmt.Errorf(
++					"rewrite event %q after %d write retries: %w",
++					current.ID,
++					writeRetries,
++					err,
++				)
++			}
++			writeRetries++
++			stats.WriteRetries++
++			continue
++		}
++		if !errors.Is(err, ErrVersionConflict) {
++			return fmt.Errorf("rewrite event %q: %w", current.ID, err)
++		}
++
++		stats.Conflicts++
++		if conflictRetries >= m.maxConflictRetries {
++			return fmt.Errorf(
++				"rewrite event %q after %d conflict retries: %w",
++				current.ID,
++				conflictRetries,
++				err,
++			)
++		}
++		conflictRetries++
++		current, err = m.store.GetEvent(ctx, listed.ID)
++		if err != nil {
++			return fmt.Errorf(
++				"reload event %q after conflict: %w",
++				listed.ID,
++				err,
++			)
+ 		}
+-		stats.Rewritten++
+ 	}
+-	return stats, nil
++}
++
++func rewriteOperationID(migrationID string, eventID string) string {
++	sum := sha256.Sum256([]byte(migrationID + "\x00" + eventID))
++	return "event-v2:" + hex.EncodeToString(sum[:])
+ }
+ 
+ // UpgradePayloadV1 creates the additive v2 fields. The legacy fields must
+ // remain so an old reader can continue consuming newly migrated records.
+ func UpgradePayloadV1(payload []byte) ([]byte, error) {
+-	// BUG: decoding through a narrow struct drops legacy and unknown fields.
+-	var legacy struct {
+-		Type      string `json:"type"`
+-		Timestamp string `json:"timestamp"`
+-	}
+-	if err := json.Unmarshal(payload, &legacy); err != nil {
++	var object map[string]json.RawMessage
++	if err := json.Unmarshal(payload, &object); err != nil {
+ 		return nil, fmt.Errorf("decode v1 payload: %w", err)
+ 	}
+-	if legacy.Type == "" || legacy.Timestamp == "" {
+-		return nil, fmt.Errorf("v1 payload is missing type or timestamp")
++	if object == nil {
++		return nil, fmt.Errorf("v1 payload must be a JSON object")
+ 	}
+-	current := struct {
+-		EventType  string `json:"event_type"`
+-		OccurredAt string `json:"occurred_at"`
+-	}{
+-		EventType: legacy.Type, OccurredAt: legacy.Timestamp,
++
++	eventType, err := requiredStringField(object, "type")
++	if err != nil {
++		return nil, err
+ 	}
+-	upgraded, err := json.Marshal(current)
++	occurredAt, err := requiredStringField(object, "timestamp")
++	if err != nil {
++		return nil, err
++	}
++	object["event_type"] = eventType
++	object["occurred_at"] = occurredAt
++
++	upgraded, err := json.Marshal(object)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("encode v2 payload: %w", err)
+ 	}
+ 	return upgraded, nil
+ }
++
++func requiredStringField(
++	object map[string]json.RawMessage,
++	name string,
++) (json.RawMessage, error) {
++	raw, exists := object[name]
++	if !exists {
++		return nil, fmt.Errorf("v1 payload is missing %q", name)
++	}
++	var value string
++	if err := json.Unmarshal(raw, &value); err != nil {
++		return nil, fmt.Errorf("v1 payload field %q must be a string: %w", name, err)
++	}
++	if value == "" {
++		return nil, fmt.Errorf("v1 payload field %q cannot be empty", name)
++	}
++	return append(json.RawMessage(nil), raw...), nil
++}
