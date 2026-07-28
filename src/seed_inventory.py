@@ -103,6 +103,27 @@ def documented_plan_ids(replacement_ids: set[str] | None = None) -> set[str]:
     return ids
 
 
+def plan_priorities(directory: Path | None = None) -> dict[str, int]:
+    """Authoring order for planned IDs; higher goes first, default 0.
+
+    A plan carrying a competence the model needs now would otherwise wait
+    behind every alphabetically earlier ID in a corpus of thousands.
+    """
+    directory = directory or PLANS
+    priorities: dict[str, int] = {}
+    for path in sorted(directory.glob("*.json")):
+        plan = json.loads(path.read_text())
+        priority = int(plan.get("priority") or 0)
+        if not priority:
+            continue
+        serial = 0
+        for family in plan.get("families") or []:
+            for _ in range(int(family["count"])):
+                serial += 1
+                priorities[f'{plan["id_prefix"]}{serial:04d}'] = priority
+    return priorities
+
+
 def documented_plan_items() -> dict[str, str]:
     """Return one exact authoring brief per documented, not-yet-cataloged ID."""
     from author_explicit_waves import catalog_items

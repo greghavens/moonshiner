@@ -1,4 +1,5 @@
 """The single seed queue honors authored and retired terminal states."""
+import json
 import pathlib
 import sys
 import unittest
@@ -51,3 +52,36 @@ class SeedQueueSelection(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PlanPriority(unittest.TestCase):
+    """A plan can claim the front of the authoring queue.
+
+    Ordering was alphabetical, so a competence needed now waited behind every
+    alphabetically earlier ID — a thousand of them in this corpus.
+    """
+
+    def _plan(self, directory, name, prefix, priority=None):
+        plan = {"plan": name, "id_prefix": prefix,
+                "artifact_contract": "genuine_harness_task",
+                "families": [{"scenario": name, "program": name,
+                              "category": "feature-integration",
+                              "training_tags": [name], "count": 2,
+                              "template": "Author {domain} with {constraint}."}]}
+        if priority is not None:
+            plan["priority"] = priority
+        (directory / f"{name}.json").write_text(json.dumps(plan))
+
+    def test_a_prioritised_plan_is_authored_before_the_alphabet(self):
+        import tempfile
+        from seed_inventory import plan_priorities
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = pathlib.Path(tmp)
+            self._plan(directory, "aardvark", "aaa-")
+            self._plan(directory, "urgent", "zzz-", priority=100)
+            priorities = plan_priorities(directory)
+            planned = ["aaa-0001", "aaa-0002", "zzz-0001", "zzz-0002"]
+            ordered = sorted(planned,
+                             key=lambda s: (-priorities.get(s, 0), s))
+            self.assertEqual(["zzz-0001", "zzz-0002", "aaa-0001", "aaa-0002"],
+                             ordered)

@@ -12,7 +12,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from common import CONFIG, STORAGE_ROOT, load_seeds, synthetic_tool_contract
 from configuration import PROJECT_ROOT
 from runtimes.availability import USAGE_LIMIT_EXIT
-from seed_inventory import authored_ids, documented_plan_items, retired_seed_ids
+from seed_inventory import (authored_ids, documented_plan_items, plan_priorities,
+                            retired_seed_ids)
 from seed_repo import ensure as ensure_seed_repo
 
 CLAIMS = STORAGE_ROOT / "locks" / "seed-authoring"
@@ -57,7 +58,9 @@ def main(argv=None) -> int:
     plans = documented_plan_items()
     authored = authored_ids()
     retired = retired_seed_ids()
-    missing = sorted(set(plans) - authored - retired)
+    priorities = plan_priorities()
+    missing = sorted(set(plans) - authored - retired,
+                     key=lambda seed_id: (-priorities.get(seed_id, 0), seed_id))
     print(f"seed queue: authored={len(authored)}, retired={len(retired)}, "
           f"waiting={len(missing)}, workers={workers}")
     if not missing or args.dry_run:
