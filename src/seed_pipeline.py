@@ -42,12 +42,23 @@ another coding agent."""
 def _author_system(seed_id: str, replace_synthetic: bool = False) -> str:
     """Select the uniform artifact contract named by bundled plan metadata."""
     if replace_synthetic:
-        return REAUTHOR_SYSTEM
+        return _with_required_id(REAUTHOR_SYSTEM, seed_id)
     record = bundled_plan_record(seed_id)
     if record and record.get("artifact_contract") != "genuine_harness_task":
         raise ValueError("unsupported seed artifact contract: "
                          + str(record.get("artifact_contract")))
-    return AUTHOR_SYSTEM
+    return _with_required_id(AUTHOR_SYSTEM, seed_id)
+
+
+def _with_required_id(system: str, seed_id: str) -> str:
+    """State the id the seed must carry.
+
+    The author was told what to build but never which id to build it under,
+    leaving it to infer one from the workspace directory name. When it infers
+    a descriptive id instead, the finished seed is rejected on load and the
+    whole authoring job is thrown away.
+    """
+    return f'{system} The task.json "id" must be exactly "{seed_id}".'
 
 
 def _init_workspace(seed_id: str) -> Path:
