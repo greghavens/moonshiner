@@ -783,9 +783,111 @@ def _service(argv: list[str]) -> int:
     return result.returncode
 
 
+MOONSHINER_UNIT = re.compile(r"^moonshiner-[a-z-]+-[0-9a-f]{12}\.service$")
+# A claimed job holds a lease and represents real metered spend; a coordinator
+# paused mid-claim resumes without losing it. These are the child processes.
+JOB_MARKERS = ("run --only", "seed run --id")
+
+
+def _running_units() -> list[str]:
+    """Every live Moonshiner queue unit on this user's manager."""
+    listing = subprocess.run(
+        ["systemctl", "--user", "list-units", "--type=service", "--no-legend",
+         # A queue restarting between attempts is still a queue: match
+         # activating too, or the updater would stop it mid-cycle.
+         "--plain", "--state=active,activating", "moonshiner-*.service"],
+        capture_output=True, text=True)
+    output = getattr(listing, "stdout", "")
+    if not isinstance(output, str):
+        # No systemd, or nothing parseable: there is nothing to drain.
+        return []
+    units = []
+    for line in output.splitlines():
+        name = line.split()[0] if line.split() else ""
+        if MOONSHINER_UNIT.match(name):
+            units.append(name.removesuffix(".service"))
+    return sorted(units)
+
+
+def _unit_project(unit: str) -> Path | None:
+    """The project directory a unit is working in, via its main process."""
+    shown = subprocess.run(["systemctl", "--user", "show", f"{unit}.service",
+                            "-p", "MainPID", "--value"],
+                           capture_output=True, text=True).stdout.strip()
+    if not shown.isdigit() or shown == "0":
+        return None
+    try:
+        return Path(os.readlink(f"/proc/{shown}/cwd"))
+    except OSError:
+        return None
+
+
+def _live_jobs() -> int:
+    """Child jobs still running under any coordinator."""
+    listing = subprocess.run(["ps", "-eo", "cmd"], capture_output=True, text=True)
+    output = getattr(listing, "stdout", "")
+    if not isinstance(output, str):
+        return 0
+    return sum(1 for line in output.splitlines()
+               if any(marker in line for marker in JOB_MARKERS))
+
+
+def _drain_and_stop(units: list[str], timeout_s: int) -> bool:
+    """Pause claiming, let running jobs finish, then stop. True if fully drained."""
+    for unit in units:
+        subprocess.run(["systemctl", "--user", "kill", "--kill-whom=main",
+                        "--signal=SIGSTOP", f"{unit}.service"],
+                       capture_output=True)
+    print(f"draining {len(units)} queue(s); running jobs finish first", flush=True)
+    deadline = time.monotonic() + timeout_s
+    remaining = _live_jobs()
+    while remaining and time.monotonic() < deadline:
+        print(f"  {remaining} job(s) still running…", flush=True)
+        time.sleep(15)
+        remaining = _live_jobs()
+    drained = remaining == 0
+    if not drained:
+        print(f"{remaining} job(s) did not finish within {timeout_s}s; "
+              "leaving queues untouched so nothing is lost", file=sys.stderr)
+        for unit in units:
+            subprocess.run(["systemctl", "--user", "kill", "--kill-whom=main",
+                            "--signal=SIGCONT", f"{unit}.service"],
+                           capture_output=True)
+        return False
+    for unit in units:
+        subprocess.run(["systemctl", "--user", "kill", "--kill-whom=main",
+                        "--signal=SIGCONT", f"{unit}.service"], capture_output=True)
+        subprocess.run(["systemctl", "--user", "stop", f"{unit}.service"],
+                       capture_output=True)
+    subprocess.run(["systemctl", "--user", "reset-failed"], capture_output=True)
+    print("all queues stopped cleanly", flush=True)
+    return True
+
+
 def _update(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="moonshiner update")
-    parser.parse_args(argv)
+    """Update in place without losing work: drain, stop, install, restart."""
+    parser = argparse.ArgumentParser(
+        prog="moonshiner update",
+        description="Drain running queues, install the latest release, restart them.")
+    parser.add_argument("--drain-timeout", type=int, default=3600,
+                        help="Seconds to wait for running jobs (default 3600).")
+    parser.add_argument("--no-restart", action="store_true",
+                        help="Leave queues stopped after updating.")
+    args = parser.parse_args(argv)
+
+    units = _running_units()
+    projects: list[Path] = []
+    for unit in units:
+        project = _unit_project(unit)
+        if project is not None and project not in projects:
+            projects.append(project)
+    if units:
+        print(f"queues running: {', '.join(units)}", flush=True)
+        # A killed job forfeits its lease and its metered attempt, so refuse to
+        # update rather than interrupt one.
+        if not _drain_and_stop(units, args.drain_timeout):
+            return 1
+
     installer = "https://raw.githubusercontent.com/greghavens/moonshiner/main/install.sh"
     curl = shutil.which("curl")
     bash = shutil.which("bash")
@@ -805,7 +907,15 @@ def _update(argv: list[str]) -> int:
     if not executable:
         print("updated successfully; reopen your shell to refresh moonshiner", file=sys.stderr)
         return 0
-    return subprocess.run([executable, "--version"]).returncode
+    version = subprocess.run([executable, "--version"])
+    if args.no_restart or not projects:
+        if units and args.no_restart:
+            print("queues left stopped; run `moonshiner` in each project to resume")
+        return version.returncode
+    for project in projects:
+        print(f"restarting queues in {project}", flush=True)
+        subprocess.run([executable], cwd=project)
+    return version.returncode
 
 
 def _published_counts(path: Path, acknowledged_tasks: int) -> tuple[int, int]:

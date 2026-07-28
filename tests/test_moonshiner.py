@@ -330,16 +330,46 @@ class FrontDoor(unittest.TestCase):
         pipe = mock.Mock()
         pipe.stdout = mock.Mock()
         pipe.wait.return_value = 0
-        installed = mock.Mock(returncode=0)
-        version = mock.Mock(returncode=0)
+
+        def dispatch(args, **_kwargs):
+            # No queues running: discovery finds nothing and the update
+            # proceeds straight to the installer.
+            if args and args[0] == "systemctl":
+                return mock.Mock(returncode=0, stdout="")
+            if args and args[0] == "ps":
+                return mock.Mock(returncode=0, stdout="")
+            return mock.Mock(returncode=0)
+
         with mock.patch.object(m.shutil, "which", side_effect=[
                  "/usr/bin/curl", "/bin/bash", "/installed/bin/moonshiner"]), \
              mock.patch.object(m.subprocess, "Popen", return_value=pipe) as popen, \
-             mock.patch.object(m.subprocess, "run", side_effect=[installed, version]) as run:
+             mock.patch.object(m.subprocess, "run", side_effect=dispatch) as run:
             self.assertEqual(m._update([]), 0)
         self.assertIn("greghavens/moonshiner/main/install.sh", popen.call_args.args[0][-1])
-        self.assertEqual(run.call_args_list[0].args[0], ["/bin/bash"])
-        self.assertEqual(run.call_args_list[1].args[0][-1], "--version")
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn(["/bin/bash"], commands)
+        self.assertEqual(commands[-1][-1], "--version")
+
+    def test_update_refuses_to_replace_the_release_under_a_running_job(self):
+        """A killed job forfeits its lease and its metered attempt."""
+        unit = "moonshiner-trace-continuous-39fd2040b76f.service"
+
+        def dispatch(args, **_kwargs):
+            if args and args[0] == "systemctl" and "list-units" in args:
+                return mock.Mock(returncode=0, stdout=f"{unit} loaded active running x\n")
+            if args and args[0] == "ps":
+                return mock.Mock(returncode=0,
+                                 stdout="moonshiner run --only seed-a --yes\n")
+            return mock.Mock(returncode=0, stdout="")
+
+        with mock.patch.object(m.subprocess, "Popen") as popen, \
+             mock.patch.object(m.time, "sleep"), \
+             mock.patch.object(m.subprocess, "run", side_effect=dispatch) as run:
+            self.assertEqual(m._update(["--drain-timeout", "0"]), 1)
+        popen.assert_not_called()
+        commands = [" ".join(call.args[0]) for call in run.call_args_list]
+        self.assertFalse(any(" stop " in f" {c} " for c in commands),
+                         "must not stop a queue while a job is running")
 
 
 class Registry(unittest.TestCase):
