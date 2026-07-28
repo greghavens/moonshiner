@@ -30,3 +30,36 @@ class CredentialTargets(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DoctorCoversSeedAuthoring(unittest.TestCase):
+    """A project that authors seeds has four runtimes, not two.
+
+    Preflighting only the tracing pair reported a healthy system while every
+    seed failed on an unauthenticated or missing seed runtime.
+    """
+
+    def _run(self, seed_authoring):
+        import control_cli
+        ready = mock.Mock(name="ready")
+        ready.name = "codex"
+        ready.role = {"model": "gpt-5.6-sol"}
+        config = {"pipeline": {"queues": {"seed_authoring": seed_authoring}}}
+        with mock.patch.dict(control_cli.CONFIG, config, clear=False), \
+             mock.patch.object(control_cli, "get_teacher", return_value=ready), \
+             mock.patch.object(control_cli, "get_judge", return_value=ready), \
+             mock.patch.object(control_cli, "get_seed_author", return_value=ready) as author, \
+             mock.patch.object(control_cli, "get_seed_judge", return_value=ready) as judge, \
+             mock.patch("builtins.print"):
+            control_cli.doctor_main([])
+        return author, judge
+
+    def test_the_seed_runtimes_are_checked_when_the_queue_is_on(self):
+        author, judge = self._run(True)
+        author.assert_called_once()
+        judge.assert_called_once()
+
+    def test_they_are_not_checked_when_the_queue_is_off(self):
+        author, judge = self._run(False)
+        author.assert_not_called()
+        judge.assert_not_called()

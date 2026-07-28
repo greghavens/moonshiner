@@ -9,7 +9,8 @@ import sys
 
 from common import (CONFIG, SEEDS_DIR, STORAGE_ROOT, key_env_name, key_file_path,
                     key_persist_path)
-from runtimes import get_judge, get_teacher
+from runtimes import (get_judge, get_seed_author, get_seed_judge,
+                      get_teacher)
 
 
 def _provider_label(value: str) -> str:
@@ -87,7 +88,19 @@ def doctor_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     checks = []
-    for role, runtime in (("author", get_teacher()), ("judge", get_judge())):
+    # Seed authoring runs on its own two runtimes, and a project can be
+    # configured so they differ from the tracing pair. Preflighting only the
+    # tracing pair reports a healthy system while every seed fails.
+    roles = [("author", get_teacher), ("judge", get_judge)]
+    if bool(((CONFIG.get("pipeline") or {}).get("queues") or {})
+            .get("seed_authoring")):
+        roles += [("seed author", get_seed_author), ("seed judge", get_seed_judge)]
+    for role, resolve in roles:
+        try:
+            runtime = resolve()
+        except BaseException as error:
+            checks.append({"check": role, "ok": False, "detail": str(error)})
+            continue
         try:
             runtime.preflight(require_auth=True)
             checks.append({"check": role, "ok": True,
