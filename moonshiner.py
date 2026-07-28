@@ -898,6 +898,19 @@ def _hold_between_attempts(pid: int, inline: list[int] | None = None) -> bool:
     return True
 
 
+def _resume(units: list[str], held: set[int]) -> None:
+    """Undo every pause this drain applied."""
+    for pid in held:
+        try:
+            os.kill(pid, signal.SIGCONT)
+        except OSError:
+            pass
+    for unit in units:
+        subprocess.run(["systemctl", "--user", "kill", "--kill-whom=main",
+                        "--signal=SIGCONT", f"{unit}.service"],
+                       capture_output=True)
+
+
 def _drain_and_stop(units: list[str], timeout_s: int) -> bool:
     """Pause claiming, wait for the queue to stand still, then stop.
 
@@ -906,6 +919,28 @@ def _drain_and_stop(units: list[str], timeout_s: int) -> bool:
     queue is drained. A job frozen in that gap keeps its lease and its
     remaining attempts, so nothing is forfeited by stopping there.
     """
+    held: set[int] = set()
+    # A pause is only ever safe if it is certain to be undone. An updater that
+    # is interrupted after pausing and before stopping leaves every queue
+    # frozen, with nothing running and nothing to notice it, until someone
+    # resumes them by hand.
+    def _release(_signum=None, _frame=None):
+        _resume(units, held)
+        if _signum is not None:
+            raise SystemExit(130)
+    previous = {number: signal.signal(number, _release)
+                for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    try:
+        return _drain_within(units, timeout_s, held)
+    except BaseException:
+        _resume(units, held)
+        raise
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+
+
+def _drain_within(units: list[str], timeout_s: int, held: set[int]) -> bool:
     for unit in units:
         subprocess.run(["systemctl", "--user", "kill", "--kill-whom=main",
                         "--signal=SIGSTOP", f"{unit}.service"],
@@ -914,7 +949,6 @@ def _drain_and_stop(units: list[str], timeout_s: int) -> bool:
           "finish", flush=True)
     deadline = time.monotonic() + timeout_s
     inline = _inline_workers(units)
-    held: set[int] = set()
     while True:
         remaining = 0
         for pid, working in _jobs(inline):
@@ -930,15 +964,7 @@ def _drain_and_stop(units: list[str], timeout_s: int) -> bool:
     if not drained:
         print(f"{remaining} job(s) did not reach a pause within {timeout_s}s; "
               "leaving queues untouched so nothing is lost", file=sys.stderr)
-        for pid in held:
-            try:
-                os.kill(pid, signal.SIGCONT)
-            except OSError:
-                pass
-        for unit in units:
-            subprocess.run(["systemctl", "--user", "kill", "--kill-whom=main",
-                            "--signal=SIGCONT", f"{unit}.service"],
-                           capture_output=True)
+        _resume(units, held)
         return False
     for unit in units:
         subprocess.run(["systemctl", "--user", "kill", "--kill-whom=main",

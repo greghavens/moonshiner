@@ -217,5 +217,36 @@ class InlineWorkersAreDrainedToo(unittest.TestCase):
         self.assertFalse(jobs[999], "an idle watcher is not working")
 
 
+class APauseIsAlwaysUndone(unittest.TestCase):
+    """An interrupted update must not leave the queues frozen.
+
+    The drain pauses every coordinator before it can stop them. An updater
+    killed in that window left seven coordinators in T state with nothing
+    running and nothing to notice, until they were resumed by hand.
+    """
+
+    def setUp(self):
+        self.ns = _updater()
+
+    def test_an_exception_mid_drain_resumes_everything(self):
+        calls = []
+        boom = RuntimeError("killed mid-drain")
+        with mock.patch.object(self.ns["subprocess"], "run",
+                               side_effect=lambda *a, **k: calls.append(a[0]) or mock.Mock()), \
+             mock.patch.dict(self.ns, {"_drain_within": mock.Mock(side_effect=boom)}), \
+             self.assertRaises(RuntimeError):
+            self.ns["_drain_and_stop"](["moonshiner-trace-continuous-aaaaaaaaaaaa"], 60)
+        flat = [" ".join(c) for c in calls]
+        self.assertTrue(any("SIGCONT" in c for c in flat),
+                        "the coordinator must be resumed when the drain dies")
+
+    def test_a_termination_signal_resumes_before_exiting(self):
+        source = (ROOT / "moonshiner.py").read_text()
+        block = source[source.index("def _drain_and_stop"):source.index("def _drain_within")]
+        for name in ("SIGINT", "SIGTERM", "SIGHUP"):
+            self.assertIn(name, block, f"{name} must not leave a queue paused")
+        self.assertIn("finally:", block)
+
+
 if __name__ == "__main__":
     unittest.main()
