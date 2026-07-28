@@ -68,15 +68,21 @@ def publishing_row_count(directory: Path) -> int:
     return 0
 
 
-def shrinks_the_dataset(publishing: int, published: int) -> bool:
+def shrinks_the_dataset(publishing: int, published: int, *,
+                        replacing_tasks: bool = False) -> bool:
     """A publication that would leave a consumer with fewer rows than before.
 
     The published corpus is the product. A local mirror can be rebuilt, lost
     or truncated, and when it is, publishing it replaces the corpus with the
-    remains. Removing rows on purpose is real work — retiring poisoned traces
-    is exactly that — so this refuses rather than decides, and --allow-shrink
-    says it was meant.
+    remains.
+
+    Replacing named tasks is the opposite case and must not be blocked:
+    retracing a poisoned trajectory routinely yields fewer rows than the
+    trajectory it replaces, and that is the retrace working. ``--task`` already
+    declares that intent to the trusted-prefix check, and declares it here too.
     """
+    if replacing_tasks:
+        return False
     return bool(published) and publishing < published
 
 
@@ -305,7 +311,9 @@ def main(argv=None)->int:
                       for path in inactive_remote_paths(mode, remote, active_remote))
     published = published_row_count(api, args.dataset)
     publishing = publishing_row_count(args.dir)
-    if shrinks_the_dataset(publishing, published) and not args.allow_shrink:
+    if (shrinks_the_dataset(publishing, published,
+                            replacing_tasks=bool(args.task))
+            and not args.allow_shrink):
         raise ValueError(
             f"refusing to publish {publishing} rows over {published} already "
             f"published: {published - publishing} would be removed. Rebuild the "

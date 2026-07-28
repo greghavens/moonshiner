@@ -204,6 +204,18 @@ class PublishingNeverShrinksTheCorpus(unittest.TestCase):
         self.assertFalse(shrinks_the_dataset(11726, 11487))
         self.assertFalse(shrinks_the_dataset(11487, 11487))
 
+    def test_replacing_a_task_is_never_blocked(self):
+        """Retracing a poisoned trajectory usually yields fewer rows.
+
+        That is the retrace working, not a corpus being lost, and blocking it
+        would make the poisoned traces unreplaceable.
+        """
+        from publish import shrinks_the_dataset
+        self.assertFalse(shrinks_the_dataset(11475, 11487, replacing_tasks=True))
+        self.assertFalse(shrinks_the_dataset(1, 11487, replacing_tasks=True))
+        self.assertTrue(shrinks_the_dataset(11475, 11487, replacing_tasks=False),
+                        "the same shrink without --task is still refused")
+
     def test_the_first_publication_of_a_dataset_is_not_a_shrink(self):
         from publish import shrinks_the_dataset
         self.assertFalse(shrinks_the_dataset(50, 0))
@@ -224,7 +236,7 @@ class PublishingNeverShrinksTheCorpus(unittest.TestCase):
         import pathlib
         source = (pathlib.Path(__file__).resolve().parents[1]
                   / "src" / "publish.py").read_text()
-        self.assertLess(source.index("shrinks_the_dataset(publishing, published)"),
+        self.assertLess(source.index("shrinks_the_dataset(publishing, published,"),
                         source.index("api.create_commit("),
                         "the check must precede the commit that would delete rows")
         self.assertIn("--allow-shrink", source)
