@@ -46,6 +46,22 @@ class CorpusDelivery(unittest.TestCase):
             self.assertTrue((mine / "task.json").is_file(),
                             "a seed authored here must survive the update")
 
+    def test_a_read_only_fixture_does_not_stop_the_update(self):
+        """Seeds ship protected verifiers, keys and fixture databases 0444.
+
+        A copy onto one of those raises PermissionError, and that aborted the
+        whole start-up: the project's queues never ran.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            active = root / "active"
+            install_corpus(_bundle(root, "old"), active, release="0.6.6")
+            protected = active / "tasks" / "seeds" / "go-csvlimits" / "verify.py"
+            protected.chmod(0o444)
+            install_corpus(_bundle(root / "next", "corrected"), active,
+                           release="0.6.7")
+            self.assertEqual("corrected", protected.read_text())
+
     def test_the_same_release_leaves_the_corpus_alone(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)

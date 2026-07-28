@@ -1,6 +1,6 @@
 """Installed console entry point."""
 from __future__ import annotations
-import os, shutil, sys, uuid
+import os, shutil, stat, sys, uuid
 from pathlib import Path
 
 from . import __version__
@@ -14,6 +14,20 @@ def _is_read_only(argv: list[str]) -> bool:
         or (argv[0] == "seeds" and len(argv) > 1
             and argv[1] in {"status", "verify", "list", "catalog", "manifest"})
     ))
+
+
+def _replace_file(source: str, destination: str) -> None:
+    """Copy over a seed fixture that may itself be read-only.
+
+    Seeds ship protected verifiers, keys and fixture databases with the write
+    bit cleared, so a plain copy onto an installed corpus fails with
+    PermissionError and takes the whole update down with it.
+    """
+    try:
+        os.chmod(destination, os.stat(destination).st_mode | stat.S_IWUSR)
+    except OSError:
+        pass
+    shutil.copy2(source, destination)
 
 
 def _read_stamp(path: Path) -> str:
@@ -56,7 +70,7 @@ def install_corpus(bundle: Path, active: Path, release: str = __version__) -> No
         return
     else:
         shutil.copytree(bundle / "tasks" / "seeds", active / "tasks" / "seeds",
-                        dirs_exist_ok=True)
+                        dirs_exist_ok=True, copy_function=_replace_file)
         for name in ("corpus-version.json", "SEED_CATALOG.md", "SEED_CATALOG.json"):
             if (bundle / name).is_file(): shutil.copy2(bundle / name, active / name)
     _stamp(stamp, release)
