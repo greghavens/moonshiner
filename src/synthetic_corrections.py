@@ -11,7 +11,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from common import (CONFIG, RUNS, STORAGE_ROOT, clear_runtime_caches, git_diff,
+from common import (jsonl_lines, CONFIG, RUNS, STORAGE_ROOT, clear_runtime_caches, git_diff,
                     load_seeds, materialize, protected_hashes, run_setup,
                     run_verify, scrub_text)
 from run_state import (connect, create_run, finish_attempt, set_run_status,
@@ -465,12 +465,12 @@ def build_companion(paths: CorrectionPaths, config: dict | None = None) -> dict:
     output = paths.publish / "traces.jsonl"
     generated_rows = []
     for split in ("train", "val"):
-        for line in (next_step / f"{split}.jsonl").read_text().splitlines():
+        for line in jsonl_lines(next_step / f"{split}.jsonl"):
             if line.strip():
                 generated_rows.append(export_row(json.loads(line), split))
     existing_rows = []
     if output.is_file():
-        existing_rows = [json.loads(line) for line in output.read_text().splitlines()
+        existing_rows = [json.loads(line) for line in jsonl_lines(output)
                          if line.strip()]
     merged_rows = merge_canonical_rows(existing_rows, generated_rows)
     pending = output.with_suffix(".jsonl.pending")
@@ -481,7 +481,7 @@ def build_companion(paths: CorrectionPaths, config: dict | None = None) -> dict:
     validation = validate_export(output) if output.stat().st_size else {"trajectories": 0}
     if output.stat().st_size:
         from export_hf_card import build_card, _banner_source
-        rows = [json.loads(line) for line in output.read_text().splitlines() if line.strip()]
+        rows = [json.loads(line) for line in jsonl_lines(output)]
         companion_config = json.loads(json.dumps(config))
         companion_config.setdefault("publish", {})["hf_dataset"] = settings(config)["hf_dataset"]
         display = companion_config["publish"].get("model_display") or "Model"

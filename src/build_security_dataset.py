@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from build_dataset import est_tokens
-from common import CONFIG, DATA, _staged_secret_values
+from common import CONFIG, DATA, _staged_secret_values, jsonl_lines
 from privacy import findings, sanitize_object
 from normalize import parse_trace
 from security_runtime import SECURITY
@@ -30,7 +30,7 @@ OUT = DATA / "security"
 # this whole surface, unioned with any tool actually observed — the same
 # full-tool-list contract the runtime adapters enforce for the coding lane.
 def load_jsonl(path: Path) -> list[dict]:
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    return [json.loads(line) for line in jsonl_lines(path)]
 
 
 def language_for(case: dict) -> str:

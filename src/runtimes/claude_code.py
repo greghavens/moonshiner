@@ -144,7 +144,7 @@ class ClaudeCodeRuntime(Runtime):
         success = False
         safeguard = any(marker in stdout or marker in stderr
                         for marker in REFUSAL_MARKERS)
-        for line in stdout.splitlines():
+        for line in stdout.split("\n"):
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
@@ -217,7 +217,7 @@ class ClaudeCodeRuntime(Runtime):
 
     def _final_text(self, stdout: str) -> str:
         last = ""
-        for line in stdout.splitlines():
+        for line in stdout.split("\n"):
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
@@ -236,7 +236,7 @@ class ClaudeCodeRuntime(Runtime):
         messages: list[dict] = []
         stats = {"reasoning_blocks": 0, "tool_calls": 0}
         pending_tools: dict[str, str] = {}
-        for line in path.read_text(errors="replace").splitlines():
+        for line in path.read_text(errors="replace").split("\n"):
             line = line.strip()
             if not line:
                 continue

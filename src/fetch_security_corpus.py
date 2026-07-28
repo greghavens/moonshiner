@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Hydrate the 18 pinned security-review repositories from their public remotes."""
 from __future__ import annotations
+from common import jsonl_lines
 
 import argparse
 import json
@@ -21,7 +22,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(
             f"{CATALOG} is missing; run `moonshiner.py sec-import` first")
     wanted = set(args.only.split(",")) if args.only else None
-    reviews = [json.loads(line) for line in CATALOG.read_text().splitlines() if line.strip()]
+    reviews = [json.loads(line) for line in jsonl_lines(CATALOG)]
     for review in reviews:
         clone_dir = review["clone_dir"]
         if wanted and clone_dir not in wanted:

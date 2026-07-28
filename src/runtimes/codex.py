@@ -144,7 +144,7 @@ class CodexRuntime(Runtime):
         usage: dict = {}
         error = None
         messages = []
-        for line in stdout.splitlines():
+        for line in stdout.split("\n"):
             line = line.strip()
             if not line:
                 continue
@@ -233,7 +233,7 @@ class CodexRuntime(Runtime):
 
     def _last_message(self, stdout: str) -> str:
         last = ""
-        for line in stdout.splitlines():
+        for line in stdout.split("\n"):
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
@@ -248,7 +248,7 @@ class CodexRuntime(Runtime):
     @staticmethod
     def parse_stream(path: Path, workspace: str | None) -> tuple[list[dict], dict]:
         text = path.read_text(errors="replace")
-        first = next((json.loads(l) for l in text.splitlines() if l.strip()), {})
+        first = next((json.loads(l) for l in text.split("\n") if l.strip()), {})
         if "payload" in first or first.get("type") in {"response_item",
                                                         "session_meta", "turn_context"}:
             return _parse_rollout(text, workspace)
@@ -294,7 +294,7 @@ def _observed_models(text: str) -> list[str]:
                     visit(child)
         elif isinstance(value, list):
             for child in value: visit(child)
-    for line in text.splitlines():
+    for line in text.split("\n"):
         try: visit(json.loads(line))
         except json.JSONDecodeError: continue
     return found
@@ -321,7 +321,7 @@ def _parse_rollout(text: str, workspace: str | None) -> tuple[list[dict], dict]:
     messages: list[dict] = []
     assistant: dict | None = None
     stats = {"reasoning_blocks": 0, "tool_calls": 0}
-    for line in text.splitlines():
+    for line in text.split("\n"):
         line = line.strip()
         if not line:
             continue
@@ -389,7 +389,7 @@ def _parse_exec_events(text: str, workspace: str | None) -> tuple[list[dict], di
     messages: list[dict] = []
     assistant: dict | None = None
     stats = {"reasoning_blocks": 0, "tool_calls": 0}
-    for line in text.splitlines():
+    for line in text.split("\n"):
         line = line.strip()
         if not line:
             continue

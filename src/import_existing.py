@@ -8,7 +8,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from common import DATA, SECRET_RE, STORAGE_ROOT, TRACES
+from common import DATA, SECRET_RE, STORAGE_ROOT, TRACES, jsonl_lines
 from privacy import sanitize_object
 
 INDEX = TRACES / "imported_index.json"
@@ -89,7 +89,7 @@ def _import_prepared(directory: Path, source_slug: str) -> tuple[int, set[str]]:
         # Raw runtime streams are handled as artifacts, not training rows.
         if any(part in {"raw", "reviews", "meta", "diffs"} for part in path.parts):
             continue
-        for lineno, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
+        for lineno, line in enumerate(jsonl_lines(path, errors="replace"), 1):
             if not line.strip():
                 continue
             try:

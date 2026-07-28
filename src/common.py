@@ -343,6 +343,19 @@ def _seed_files(seed: dict) -> Path | None:
     return Path(directory) / "files" if directory is not None else None
 
 
+def jsonl_lines(path: Path, *, errors: str | None = None) -> list[str]:
+    """Split a JSONL file on newlines only, returning non-empty lines.
+
+    ``str.splitlines`` breaks on every Unicode line boundary — U+2028, U+2029,
+    \x0b, \x85 and more — all of which appear legitimately inside JSON string
+    values. Using it on JSONL tears objects in half and the parse fails on
+    valid data: one imported corpus split into 2273 fragments instead of 2201
+    rows. JSONL is newline-delimited and nothing else.
+    """
+    text = path.read_text(errors=errors) if errors else path.read_text()
+    return [line for line in text.split("\n") if line.strip()]
+
+
 def remove_workspace(path: Path, *, workspaces: Path | None = None) -> None:
     """Delete a materialized workspace. Refuse anything that is not one.
 

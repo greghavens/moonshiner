@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from common import CONFIG, RUNS
+from common import CONFIG, RUNS, jsonl_lines
 from security_runtime import ROOT, SECURITY, run_codex
 
 CATALOG = SECURITY / "catalog"
@@ -33,7 +33,7 @@ WORK_ROOT = Path(os.environ.get("MOONSHINER_SECURITY_WORK_ROOT",
 
 
 def load_jsonl(path: Path) -> list[dict]:
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    return [json.loads(line) for line in jsonl_lines(path)]
 
 
 def write_json(path: Path, value) -> None:

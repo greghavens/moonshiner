@@ -18,7 +18,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from common import DATA
+from common import DATA, jsonl_lines
 
 STRING_COLUMNS = ("task", "source_trajectory_id", "source_sha256", "lang",
                   "category", "domain", "teacher_runtime", "teacher_model",
@@ -32,7 +32,7 @@ def export(src: Path, dst: Path) -> int:
     columns.update({name: [] for name in INT_COLUMNS})
     columns.update({"tools_used": [], "observed_models": [],
                     "model_attested": [], "messages": []})
-    for line in src.read_text().splitlines():
+    for line in jsonl_lines(src):
         if not line.strip():
             continue
         row = json.loads(line)

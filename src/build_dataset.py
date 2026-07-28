@@ -20,7 +20,7 @@ import json
 from pathlib import Path
 
 from common import (CONFIG, DATA, SECRET_RE, TRACES, load_seeds,
-                    scrub_text)
+                    scrub_text, jsonl_lines)
 from canonical_dataset import INTERNAL_CONTENT_MARKERS
 from normalize import parse_trace
 from screen_traces import validate_reviewer_verdict
@@ -260,7 +260,7 @@ def main() -> None:
     imported_seen = {hashlib.sha256(json.dumps(row, sort_keys=True).encode()).hexdigest()
                      for row in rows}
     for imported_path in sorted((DATA / "imported").glob("*/rows.jsonl")):
-        for line in imported_path.read_text().splitlines():
+        for line in jsonl_lines(imported_path):
             if not line.strip():
                 continue
             imported = sanitize_object(json.loads(line))
@@ -297,7 +297,7 @@ def main() -> None:
             source_path = source_dir / f"{split}.jsonl"
             if not source_path.exists():
                 continue
-            for line in source_path.read_text().splitlines():
+            for line in jsonl_lines(source_path):
                 if line.strip():
                     partition.append(sanitize_object(json.loads(line)))
                     extra_counts[source_name][split] += 1

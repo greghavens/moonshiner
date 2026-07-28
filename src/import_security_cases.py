@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Import every training/evaluation use case from the sibling fable-secure repo.
+from common import jsonl_lines
 
 The import deliberately separates teacher-visible catalogs from held-out answers:
 
@@ -80,7 +81,7 @@ def import_answer_cases(source: Path, repo_index: dict[str, dict]) -> tuple[list
     seen: set[str] = set()
     for split in ("train", "val"):
         path = source / "pipeline" / "dataset" / f"{split}.jsonl"
-        for line in path.read_text().splitlines():
+        for line in jsonl_lines(path):
             if not line.strip():
                 continue
             row = json.loads(line)

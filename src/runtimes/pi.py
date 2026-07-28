@@ -334,7 +334,7 @@ class PiRuntime(Runtime):
 # Pi event helpers                                                            #
 # --------------------------------------------------------------------------- #
 def _iter_events(text: str):
-    for line in text.splitlines():
+    for line in text.split("\n"):
         line = line.strip()
         if not line:
             continue

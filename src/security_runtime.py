@@ -25,7 +25,7 @@ import threading
 import time
 from pathlib import Path
 
-from common import RUNS
+from common import RUNS, jsonl_lines
 
 ROOT = Path(__file__).resolve().parent.parent
 SECURITY = ROOT / "security"
@@ -109,7 +109,7 @@ def extract_last_message(events_path: Path) -> str:
     last = ""
     if not events_path.exists():
         return last
-    for line in events_path.read_text(errors="replace").splitlines():
+    for line in jsonl_lines(events_path, errors="replace"):
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
@@ -252,7 +252,7 @@ def run_codex(
     # copied auth file was unlinked before tools ran and again above.
 
     observed_models = []
-    for line in events_path.read_text(errors="replace").splitlines():
+    for line in jsonl_lines(events_path, errors="replace"):
         try: event = json.loads(line)
         except json.JSONDecodeError: continue
         stack = [event]

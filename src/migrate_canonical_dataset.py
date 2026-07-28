@@ -10,7 +10,7 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
-from common import CONFIG, DATA
+from common import CONFIG, DATA, jsonl_lines
 from canonical_dataset import PUBLISH_KEY_ORDER, normalize_public_row
 from expand_next_steps import expand_record
 from export_hf_next_steps import build_row, validate_export
@@ -378,7 +378,7 @@ def migrate(path: Path) -> tuple[int, int]:
     if streamed is not None:
         return streamed
     rows = [sanitize_object(json.loads(line))
-            for line in path.read_text().splitlines() if line.strip()]
+            for line in jsonl_lines(path)]
     if not rows:
         raise ValueError("dataset is empty")
     if any("source_trajectory_id" in row or "assistant_step" in row for row in rows):

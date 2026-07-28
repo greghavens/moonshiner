@@ -17,7 +17,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from common import DATA, RUNS
+from common import DATA, RUNS, jsonl_lines
 from canonical_dataset import (MESSAGE_KEY_ORDER, PUBLISH_KEY_ORDER,
                                canonical_category, normalize_messages)
 from expand_next_steps import DERIVATION
@@ -158,7 +158,7 @@ def upsert_journal(output: Path, journal: Path) -> tuple[int, int, dict]:
     content hash, category rule, or alternate publication path is involved.
     """
     validation = validate_export(journal)
-    journal_lines = [line for line in journal.read_text().splitlines() if line.strip()]
+    journal_lines = jsonl_lines(journal)
     replacement_tasks = {json.loads(line).get("task") for line in journal_lines}
     if None in replacement_tasks:
         raise ValueError("journal row is missing task identity")

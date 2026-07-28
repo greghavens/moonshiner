@@ -20,7 +20,7 @@ import json
 import os
 from pathlib import Path
 
-from common import CONFIG, DATA
+from common import CONFIG, DATA, jsonl_lines
 
 
 def main() -> None:
@@ -48,7 +48,7 @@ def main() -> None:
         if not source.exists():
             continue
         kept, errors, lengths = [], 0, []
-        for line in source.read_text().splitlines():
+        for line in jsonl_lines(source):
             if not line.strip():
                 continue
             row = json.loads(line)
