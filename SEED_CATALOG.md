@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3056 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3057 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -17,7 +17,7 @@
 | **Refactoring & performance** | 29 | Restructure safely and improve measured performance without behavior drift. |
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
-| **Uncategorized** | 21 | Catalog program awaiting description. |
+| **Uncategorized** | 22 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -2051,6 +2051,7 @@
 
 - **c-log-after-corruption** (`c`) — A capture worker has started reporting checksum failures only for feeds whose source tag fills its fixed field. The report is emitted at the end of capture, so the checksum comparison and its logge…
 - **cpp-test-oracle-bug** (`cpp`) — Fix `pageplan::required_pages` so it implements the page-count contract in the public header for every `uint64_t` payload. The exact-page boundary regression currently fails, and valid records near…
+- **go-generated-code-trap** (`go`) — Catalog syncs started aborting with `pagination token cycle: "after:widget-1+blue"` after the client was regenerated. The service team confirms that both requests reached `GET /v1/widgets`, but the…
 
 ## full-distill/ambiguous-requirements
 
