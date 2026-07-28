@@ -18,8 +18,14 @@ class DistributionNeutralityTest(unittest.TestCase):
 
     def test_default_config_does_not_select_a_target_model_or_external_seed_repo(self):
         config = json.loads((ROOT / "config.json").read_text())
+        # The target model is the teacher, and the shipped config must not
+        # pick one. seed_author is asserted here no longer: it was tied to the
+        # teacher, which is exactly what made seed authoring spend the budget
+        # that exists to buy traces. It is an infrastructure role now, like
+        # the judge, and ships configured.
         self.assertEqual(config["teacher"]["model"], "")
-        self.assertEqual(config["seed_author"]["model"], "")
+        self.assertNotEqual(config["seed_author"]["runtime"],
+                            config["teacher"]["runtime"])
         self.assertEqual(config["source"], {})
 
     def test_no_external_seed_source_exists(self):

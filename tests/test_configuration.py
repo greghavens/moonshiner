@@ -146,3 +146,26 @@ class SafeSelection(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SeedRolesAreConfiguration(unittest.TestCase):
+    """The teacher's metered budget buys traces, and nothing else.
+
+    Setup overwrote seed_author with the teacher pick, so every project
+    authored seeds on the account funding the traces of the model being
+    distilled. The seed roles come from configuration.
+    """
+
+    def test_setup_does_not_overwrite_the_seed_roles(self):
+        source = (pathlib.Path(__file__).resolve().parents[1]
+                  / "moonshiner.py").read_text()
+        setup = source[source.index("def _setup"):]
+        setup = setup[:setup.index('update_local("storage.root"')]
+        self.assertNotIn('update_local(f"{target}.runtime"', setup)
+        self.assertNotIn('"seed_author"', setup)
+
+    def test_the_shipped_default_does_not_author_on_the_teacher(self):
+        config = json.loads((pathlib.Path(__file__).resolve().parents[1]
+                             / "config.json").read_text())
+        self.assertNotEqual(config["teacher"]["runtime"],
+                            config["seed_author"]["runtime"])

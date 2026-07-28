@@ -435,12 +435,10 @@ def _setup(argv: list[str] | None = None) -> int:
             provider_slug = re.sub(r"[^a-z0-9]+", "-", provider.lower()).strip("-")
             update_local(f"runtimes.{runtime}.key_file_name",
                          f"moonshiner-{provider_slug}-{model_slug}-key")
-    # Seed creation uses the same author/judge unless the user later changes it.
-    for source, target in ((choices[0], "seed_author"), (choices[1], "seed_judge")):
-        _, runtime, model, reasoning = source
-        update_local(f"{target}.runtime", runtime)
-        update_local(f"{target}.model", model)
-        update_local(f"{target}.reasoning", reasoning)
+    # The seed roles are configuration. Setup used to overwrite seed_author
+    # with the teacher pick, which pointed seed authoring at the metered
+    # account that exists to buy traces of the model being distilled. They are
+    # left to config.json and `moonshiner config set` instead.
     update_local("storage.root", str(PROJECT_STATE))
     update_local("pipeline.queues.seed_authoring", workflow == "author-and-trace")
     update_local("pipeline.queues.tracing", True)
