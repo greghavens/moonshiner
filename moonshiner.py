@@ -827,7 +827,27 @@ def _unit_project(unit: str) -> Path | None:
         return None
 
 
-def _jobs() -> list[tuple[int, bool]]:
+def _inline_workers(units: list[str]) -> list[int]:
+    """Main PIDs of queues that do their metered work in their own process.
+
+    The correction queue reviews and corrects inline rather than spawning a
+    job process, so nothing in the process table names it as work. Stopping it
+    mid-correction discards a metered review exactly as stopping a trace would.
+    """
+    pids = []
+    for unit in units:
+        if "synthetic-corrections" not in unit:
+            continue
+        shown = subprocess.run(["systemctl", "--user", "show", f"{unit}.service",
+                                "-p", "MainPID", "--value"],
+                               capture_output=True, text=True).stdout
+        shown = shown.strip() if isinstance(shown, str) else ""
+        if shown.isdigit() and shown != "0":
+            pids.append(int(shown))
+    return pids
+
+
+def _jobs(inline: list[int] | None = None) -> list[tuple[int, bool]]:
     """Every claimed job as ``(pid, working)``.
 
     A job process outlives its own attempts, so its presence proves nothing.
@@ -851,11 +871,15 @@ def _jobs() -> list[tuple[int, bool]]:
             claimed.append((fields[0], SEED_MARKER in fields[2]))
     # An authoring job is working for as long as it exists; only a trace job
     # may be caught in the pause between its attempts.
-    return [(int(pid), True if indivisible else pid in parents)
+    jobs = [(int(pid), True if indivisible else pid in parents)
             for pid, indivisible in claimed]
+    # An inline worker is idle between passes and working while a runtime runs
+    # beneath it, so it takes the same pause a trace does.
+    jobs += [(pid, str(pid) in parents) for pid in inline or []]
+    return jobs
 
 
-def _hold_between_attempts(pid: int) -> bool:
+def _hold_between_attempts(pid: int, inline: list[int] | None = None) -> bool:
     """Freeze an idle job in the gap so it cannot start another attempt.
 
     False if it started one in the moment between the check and the signal, in
@@ -865,7 +889,7 @@ def _hold_between_attempts(pid: int) -> bool:
         os.kill(pid, signal.SIGSTOP)
     except OSError:
         return True
-    if any(other == pid and working for other, working in _jobs()):
+    if any(other == pid and working for other, working in _jobs(inline)):
         try:
             os.kill(pid, signal.SIGCONT)
         except OSError:
@@ -889,13 +913,14 @@ def _drain_and_stop(units: list[str], timeout_s: int) -> bool:
     print(f"draining {len(units)} queue(s); waiting for the work in flight to "
           "finish", flush=True)
     deadline = time.monotonic() + timeout_s
+    inline = _inline_workers(units)
     held: set[int] = set()
     while True:
         remaining = 0
-        for pid, working in _jobs():
+        for pid, working in _jobs(inline):
             if working:
                 remaining += 1
-            elif pid not in held and _hold_between_attempts(pid):
+            elif pid not in held and _hold_between_attempts(pid, inline):
                 held.add(pid)
         if not remaining or time.monotonic() >= deadline:
             break

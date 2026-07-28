@@ -80,7 +80,7 @@ class Draining(unittest.TestCase):
         calls = []
         with mock.patch.object(self.ns["subprocess"], "run",
                                side_effect=lambda *a, **k: calls.append(a[0]) or mock.Mock()), \
-             mock.patch.dict(self.ns, {"_jobs": lambda: [(11, True), (12, True)]}), \
+             mock.patch.dict(self.ns, {"_jobs": lambda *_: [(11, True), (12, True)]}), \
              mock.patch.object(self.ns["time"], "monotonic", side_effect=[0, 10_000]), \
              mock.patch.object(self.ns["time"], "sleep"):
             drained = self.ns["_drain_and_stop"](["moonshiner-trace-continuous-aaaaaaaaaaaa"], 1)
@@ -101,7 +101,7 @@ class Draining(unittest.TestCase):
         calls, signalled = [], []
         with mock.patch.object(self.ns["subprocess"], "run",
                                side_effect=lambda *a, **k: calls.append(a[0]) or mock.Mock()), \
-             mock.patch.dict(self.ns, {"_jobs": lambda: [(4242, False)]}), \
+             mock.patch.dict(self.ns, {"_jobs": lambda *_: [(4242, False)]}), \
              mock.patch.object(self.ns["os"], "kill",
                                side_effect=lambda pid, sig: signalled.append((pid, sig))), \
              mock.patch.object(self.ns["time"], "sleep"):
@@ -116,7 +116,7 @@ class Draining(unittest.TestCase):
         """Losing the race must cost nothing: resume it and keep waiting."""
         states = [[(4242, False)], [(4242, True)]]
         signalled = []
-        with mock.patch.dict(self.ns, {"_jobs": lambda: states[-1]}), \
+        with mock.patch.dict(self.ns, {"_jobs": lambda *_: states[-1]}), \
              mock.patch.object(self.ns["os"], "kill",
                                side_effect=lambda pid, sig: signalled.append((pid, sig))):
             held = self.ns["_hold_between_attempts"](4242)
@@ -128,7 +128,7 @@ class Draining(unittest.TestCase):
         calls = []
         with mock.patch.object(self.ns["subprocess"], "run",
                                side_effect=lambda *a, **k: calls.append(a[0]) or mock.Mock()), \
-             mock.patch.dict(self.ns, {"_jobs": lambda: []}), \
+             mock.patch.dict(self.ns, {"_jobs": lambda *_: []}), \
              mock.patch.object(self.ns["time"], "sleep"):
             drained = self.ns["_drain_and_stop"](["moonshiner-trace-continuous-aaaaaaaaaaaa"], 60)
         self.assertTrue(drained)
@@ -170,7 +170,7 @@ class SeedAuthoringIsIndivisible(unittest.TestCase):
         calls, signalled = [], []
         with mock.patch.object(self.ns["subprocess"], "run",
                                side_effect=lambda *a, **k: calls.append(a[0]) or mock.Mock()), \
-             mock.patch.dict(self.ns, {"_jobs": lambda: [(200, True)]}), \
+             mock.patch.dict(self.ns, {"_jobs": lambda *_: [(200, True)]}), \
              mock.patch.object(self.ns["os"], "kill",
                                side_effect=lambda pid, sig: signalled.append((pid, sig))), \
              mock.patch.object(self.ns["time"], "monotonic", side_effect=[0, 10_000]), \
@@ -180,6 +180,42 @@ class SeedAuthoringIsIndivisible(unittest.TestCase):
         self.assertEqual([], signalled, "an authoring job must never be frozen")
         self.assertFalse(any("stop" in " ".join(c) for c in calls),
                          "the queue must not be stopped under a running author")
+
+class InlineWorkersAreDrainedToo(unittest.TestCase):
+    """The correction queue does its metered work in its own process.
+
+    Nothing in the process table names it as a job, so the drain did not see
+    it and the update stopped its unit mid-correction — a metered review
+    thrown away for exactly the reason this feature exists to prevent.
+    """
+
+    def setUp(self):
+        self.ns = _updater()
+
+    def test_the_correction_queue_main_process_is_watched(self):
+        def dispatch(args, **_kwargs):
+            if args[:2] == ["systemctl", "--user"] and "show" in args:
+                return mock.Mock(stdout="777\n")
+            return mock.Mock(stdout="")
+        with mock.patch.object(self.ns["subprocess"], "run", side_effect=dispatch):
+            pids = self.ns["_inline_workers"](
+                ["moonshiner-synthetic-corrections-aaaaaaaaaaaa",
+                 "moonshiner-trace-continuous-aaaaaaaaaaaa"])
+        self.assertEqual([777], pids, "only in-process queues are watched this way")
+
+    def test_it_is_working_while_a_runtime_runs_beneath_it(self):
+        listing = "\n".join([
+            "  PID  PPID CMD",
+            "  777     1 /usr/bin/python moonshiner synthetic-corrections run --watch --yes",
+            "  888   777 node /usr/bin/codex exec --json --model gpt-5.6-sol",
+            "  999     1 /usr/bin/python moonshiner synthetic-corrections run --watch --yes",
+        ])
+        with mock.patch.object(self.ns["subprocess"], "run",
+                               return_value=mock.Mock(stdout=listing)):
+            jobs = dict(self.ns["_jobs"]([777, 999]))
+        self.assertTrue(jobs[777], "a correction in progress is working")
+        self.assertFalse(jobs[999], "an idle watcher is not working")
+
 
 if __name__ == "__main__":
     unittest.main()
