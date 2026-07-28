@@ -16,7 +16,16 @@ from pathlib import Path
 
 from common import RUNS
 
-LIMIT_PHRASE = "you've hit your usage limit"
+LIMIT_PHRASES = (
+    "you've hit your usage limit",
+    # OpenRouter answers 402 when the account cannot afford the request it was
+    # asked to make. That is the same live condition as any other quota block:
+    # nothing to spend now, possibly funded a minute later. Treated as a
+    # per-job failure instead, it burns one of a seed's limited attempts on
+    # every seed in the queue while never reaching the model at all.
+    "requires more credits",
+    "insufficient credits",
+)
 
 # Exit status used when a queue stops because its runtime is out of quota. The
 # systemd units list it in RestartPreventExitStatus so the supervisor does not
@@ -29,7 +38,8 @@ class ModelUnavailable(RuntimeError):
 
 
 def is_usage_limit(message: str | None) -> bool:
-    return bool(message) and LIMIT_PHRASE in message.lower()
+    lowered = (message or "").lower()
+    return any(phrase in lowered for phrase in LIMIT_PHRASES)
 
 
 def find_usage_limit(*messages: str | None) -> str | None:

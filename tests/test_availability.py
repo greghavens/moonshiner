@@ -77,3 +77,33 @@ class NeverPersisted(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CreditExhaustion(unittest.TestCase):
+    """A provider that cannot afford the request is out of quota.
+
+    OpenRouter answers 402 without reaching the model. Read as an ordinary
+    failure it costs one of the seed's limited attempts, on every seed in the
+    queue, for a condition that clears the moment credits are added.
+    """
+
+    def test_openrouter_402_is_a_usage_limit(self):
+        message = ('402: {"message":"This request requires more credits, or '
+                   'fewer max_tokens. You requested up to 122247 tokens, but '
+                   'can only afford 84288.","code":402}')
+        self.assertTrue(av.is_usage_limit(message))
+        self.assertEqual(message, av.find_usage_limit(None, message))
+
+    def test_an_ordinary_failure_is_not_a_usage_limit(self):
+        self.assertFalse(av.is_usage_limit("connection reset by peer"))
+        self.assertFalse(av.is_usage_limit(None))
+
+    def test_pi_reports_a_quota_block_from_the_turn_error(self):
+        """The reason arrives on the turn, not on a result event."""
+        source = (pathlib.Path(__file__).resolve().parents[1]
+                  / "src" / "runtimes" / "pi.py").read_text()
+        block = source[source.index("def _parse_stream_meta"):
+                       source.index("def _model_attested")]
+        self.assertIn("errorMessage", block)
+        self.assertIn("unavailable=availability.find_usage_limit",
+                      source)

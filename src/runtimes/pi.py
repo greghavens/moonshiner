@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 
 from common import ROOT, scrub_text
+from runtimes import availability
 from runtimes.auth import load_provider_key
 from runtimes.base import ReviewResult, Runtime, TraceResult
 from runtimes.credential_proxy import DUMMY_TOKEN, ProxySession
@@ -284,6 +285,7 @@ class PiRuntime(Runtime):
             model_attested=attested,
             usage=meta["usage"],
             error=meta["error"],
+            unavailable=availability.find_usage_limit(meta["error"]),
             provenance={
                 "session_id": meta["session_id"],
                 "provider": self.runtime_config.get("display_provider")
@@ -400,6 +402,11 @@ def _parse_stream_meta(text: str) -> dict:
         if kind == "message_end" and message.get("role") == "assistant":
             if message.get("stopReason") in {"stop", "end_turn", None}:
                 stream_success = True
+            # A provider refusal arrives here, not as a result event: the turn
+            # ends with stopReason "error" and the reason in errorMessage. Left
+            # unread, a quota block looks like an ordinary failed attempt.
+            elif message.get("stopReason") == "error" and not error:
+                error = str(message.get("errorMessage") or "")
     return {"observed_models": observed, "session_id": session_id,
             "usage": usage, "error": error, "stream_success": stream_success}
 
