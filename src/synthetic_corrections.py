@@ -8,6 +8,7 @@ import hashlib
 import shutil
 import json
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,6 +24,10 @@ from screen_traces import (apply_candidate_patch, feedback_from_review, screen)
 import publish_queue
 
 MAX_CONSECUTIVE_REVIEWER_FAILURES = 3
+# How long a watching queue waits when nothing is eligible. Supervised, a
+# one-shot pass exits and is restarted seconds later, and every restart
+# re-reads the whole corpus and ledger for nothing.
+IDLE_POLL_SECONDS = 60
 KIND = "synthetic-correction"
 
 
@@ -667,6 +672,8 @@ def main(argv: list[str] | None = None) -> int:
     run_parser = sub.add_parser("run", help="process the correction queue")
     run_parser.add_argument("--dry-run", action="store_true",
                             help="show eligible exhausted traces without model calls")
+    run_parser.add_argument("--watch", action="store_true",
+                            help="Keep running, waiting for new candidates.")
     run_parser.add_argument("--yes", action="store_true",
                             help="authorize configured provider/model calls")
     sub.add_parser("status", help="show correction configuration and candidate count")
@@ -725,10 +732,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if not args.dry_run and not args.yes:
         parser.error("paid correction processing requires --yes (or use --dry-run)")
-    try:
-        print(json.dumps(run(dry_run=args.dry_run), indent=2))
-    except ModelUnavailable as blocked:
-        # Stop rather than restart into a wall; quota is re-tested on next start.
-        print(f"stopping: {blocked}", file=sys.stderr)
-        return USAGE_LIMIT_EXIT
-    return 0
+    while True:
+        try:
+            report = run(dry_run=args.dry_run)
+        except ModelUnavailable as blocked:
+            # Stop rather than restart into a wall; quota is re-tested on next start.
+            print(f"stopping: {blocked}", file=sys.stderr)
+            return USAGE_LIMIT_EXIT
+        print(json.dumps(report, indent=2), flush=True)
+        if not args.watch:
+            return 0
+        if not report.get("eligible"):
+            time.sleep(IDLE_POLL_SECONDS)

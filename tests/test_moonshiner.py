@@ -194,7 +194,8 @@ class FrontDoor(unittest.TestCase):
             self.assertEqual(m._start_default_queues(), 0)
         command = run.call_args_list[1].args[0]
         self.assertIn("synthetic-corrections", command)
-        self.assertEqual(command[-3:], ["synthetic-corrections", "run", "--yes"])
+        self.assertEqual(command[-4:],
+                         ["synthetic-corrections", "run", "--watch", "--yes"])
 
     def test_normal_start_provisions_missing_pi_in_stable_user_toolchain(self):
         config = {"teacher": {"runtime": "pi-openrouter"},

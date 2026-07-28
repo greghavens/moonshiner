@@ -412,3 +412,38 @@ class SyntheticCorrectionContracts(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WatchMode(unittest.TestCase):
+    """A supervised queue with nothing to do must wait, not exit and respawn.
+
+    Restart=always turns a one-shot pass into a restart every ten seconds, and
+    each restart re-reads the whole corpus and ledger. Fable's queue churned
+    through 108 restarts that way without doing any work.
+    """
+
+    def test_one_shot_by_default(self):
+        with mock.patch.object(corrections, "run",
+                               return_value={"enabled": True, "eligible": 0}), \
+             mock.patch.object(corrections.time, "sleep") as sleep:
+            self.assertEqual(corrections.main(["run", "--yes"]), 0)
+        sleep.assert_not_called()
+
+    def test_watch_waits_instead_of_exiting_when_nothing_is_eligible(self):
+        calls = []
+
+        def once(**_kwargs):
+            calls.append(1)
+            if len(calls) >= 2:
+                raise KeyboardInterrupt        # end the loop for the test
+            return {"enabled": True, "eligible": 0}
+
+        with mock.patch.object(corrections, "run", side_effect=once), \
+             mock.patch.object(corrections.time, "sleep") as sleep:
+            with self.assertRaises(KeyboardInterrupt):
+                corrections.main(["run", "--watch", "--yes"])
+        sleep.assert_called_once_with(corrections.IDLE_POLL_SECONDS)
+
+    def test_the_supervised_unit_asks_for_watch(self):
+        source = (pathlib.Path(__file__).resolve().parents[1] / "moonshiner.py").read_text()
+        self.assertIn('"synthetic-corrections", "run", "--watch", "--yes"', source)

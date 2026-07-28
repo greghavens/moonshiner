@@ -618,7 +618,7 @@ def _start_default_queues() -> int:
                             f"--property=StandardOutput=append:{log_dir / 'run.log'}",
                             f"--property=StandardError=append:{log_dir / 'run.log'}",
                             f"--setenv=PATH={os.environ.get('PATH', '')}",
-                            str(executable), "synthetic-corrections", "run", "--yes"],
+                            str(executable), "synthetic-corrections", "run", "--watch", "--yes"],
                            check=True)
     print("Moonshiner queues are running: author (when enabled), trace/judge/retrace, "
           "synthetic corrections (when enabled), format/privacy, append, HF upload, "
