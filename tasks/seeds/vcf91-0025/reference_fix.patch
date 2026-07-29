@@ -1,0 +1,325 @@
+diff --git a/client.go b/client.go
+new file mode 100644
+index 0000000..8cad85d
+--- /dev/null
++++ b/client.go
+@@ -0,0 +1,111 @@
++package backupwait
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
++)
++
++// Client talks to a single SDDC Manager endpoint.
++type Client struct {
++	baseURL  string
++	token    string
++	http     *http.Client
++	maxPolls int
++	pace     func(context.Context, int) error
++}
++
++// NewClient validates config and constructs an SDDC Manager client.
++func NewClient(config Config) (*Client, error) {
++	parsed, err := url.Parse(config.BaseURL)
++	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
++		return nil, fmt.Errorf("BaseURL must be an absolute HTTP(S) URL")
++	}
++	if config.Token == "" {
++		return nil, fmt.Errorf("Token must not be empty")
++	}
++	if config.MaxPolls < 1 {
++		return nil, fmt.Errorf("MaxPolls must be at least 1")
++	}
++	httpClient := config.HTTPClient
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++	pace := config.Pace
++	if pace == nil {
++		pace = func(context.Context, int) error { return nil }
++	}
++	return &Client{
++		baseURL:  strings.TrimRight(config.BaseURL, "/"),
++		token:    config.Token,
++		http:     httpClient,
++		maxPolls: config.MaxPolls,
++		pace:     pace,
++	}, nil
++}
++
++func (c *Client) request(ctx context.Context, method, path string, body any) (*http.Response, []byte, error) {
++	var reader io.Reader
++	if body != nil {
++		payload, err := json.Marshal(body)
++		if err != nil {
++			return nil, nil, fmt.Errorf("encode request body: %w", err)
++		}
++		reader = bytes.NewReader(payload)
++	}
++	request, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
++	if err != nil {
++		return nil, nil, fmt.Errorf("build request: %w", err)
++	}
++	request.Header.Set("Authorization", "Bearer "+c.token)
++	request.Header.Set("Accept", "application/json")
++	if body != nil {
++		request.Header.Set("Content-Type", "application/json")
++	}
++	response, err := c.http.Do(request)
++	if err != nil {
++		return nil, nil, fmt.Errorf("send %s %s: %w", method, path, err)
++	}
++	defer response.Body.Close()
++	payload, err := io.ReadAll(response.Body)
++	if err != nil {
++		return nil, nil, fmt.Errorf("read %s %s response: %w", method, path, err)
++	}
++	return response, payload, nil
++}
++
++func decodeAPIError(status int, payload []byte) *APIError {
++	result := &APIError{StatusCode: status}
++	_ = json.Unmarshal(payload, result)
++	return result
++}
++
++// UpdateBackupConfiguration submits the PATCH and then waits for its returned
++// task to reach a terminal state.
++func (c *Client) UpdateBackupConfiguration(ctx context.Context, spec BackupConfigurationSpec) (Task, error) {
++	response, payload, err := c.request(
++		ctx,
++		http.MethodPatch,
++		"/v1/system/backup-configuration",
++		spec,
++	)
++	if err != nil {
++		return Task{}, err
++	}
++	if response.StatusCode != http.StatusAccepted {
++		return Task{}, decodeAPIError(response.StatusCode, payload)
++	}
++	var accepted Task
++	if err := json.Unmarshal(payload, &accepted); err != nil {
++		return Task{}, fmt.Errorf("decode accepted task: %w", err)
++	}
++	if accepted.ID == "" {
++		return Task{}, fmt.Errorf("accepted Task is missing id")
++	}
++	return c.waitForTask(ctx, accepted.ID)
++}
+diff --git a/polling.go b/polling.go
+new file mode 100644
+index 0000000..2ef0792
+--- /dev/null
++++ b/polling.go
+@@ -0,0 +1,80 @@
++package backupwait
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/url"
++)
++
++var successfulTerminal = map[string]bool{
++	"SUCCESSFUL":             true,
++	"COMPLETED_WITH_WARNING": true,
++}
++
++var unsuccessfulTerminal = map[string]bool{
++	"FAILED":    true,
++	"CANCELLED": true,
++	"SKIPPED":   true,
++	"TIMED_OUT": true,
++}
++
++var nonTerminal = map[string]bool{
++	"PENDING":     true,
++	"QUEUED":      true,
++	"IN_PROGRESS": true,
++}
++
++func (c *Client) getTask(ctx context.Context, taskID string) (Task, error) {
++	path := "/v1/tasks/" + url.PathEscape(taskID)
++	response, payload, err := c.request(ctx, http.MethodGet, path, nil)
++	if err != nil {
++		return Task{}, err
++	}
++	if response.StatusCode != http.StatusOK {
++		return Task{}, decodeAPIError(response.StatusCode, payload)
++	}
++	var task Task
++	if err := json.Unmarshal(payload, &task); err != nil {
++		return Task{}, fmt.Errorf("decode task %s: %w", taskID, err)
++	}
++	return task, nil
++}
++
++func (c *Client) waitForTask(ctx context.Context, taskID string) (Task, error) {
++	var last Task
++	for completedPolls := 1; completedPolls <= c.maxPolls; completedPolls++ {
++		if err := ctx.Err(); err != nil {
++			return last, err
++		}
++		task, err := c.getTask(ctx, taskID)
++		if err != nil {
++			return last, err
++		}
++		last = task
++		switch {
++		case successfulTerminal[task.Status]:
++			return task, nil
++		case unsuccessfulTerminal[task.Status]:
++			return task, &TaskTerminalError{Task: task}
++		case !nonTerminal[task.Status]:
++			return task, fmt.Errorf("task %s returned unrecognized status %q", taskID, task.Status)
++		}
++
++		if completedPolls == c.maxPolls {
++			return task, &PollLimitError{
++				TaskID:     taskID,
++				MaxPolls:   c.maxPolls,
++				LastStatus: task.Status,
++			}
++		}
++		if err := ctx.Err(); err != nil {
++			return task, err
++		}
++		if err := c.pace(ctx, completedPolls); err != nil {
++			return task, err
++		}
++	}
++	panic("unreachable")
++}
+diff --git a/types.go b/types.go
+new file mode 100644
+index 0000000..ba85179
+--- /dev/null
++++ b/types.go
+@@ -0,0 +1,116 @@
++// Package backupwait submits a VCF 9.1 SDDC Manager backup-configuration
++// update and follows its asynchronous task to a terminal state.
++package backupwait
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++)
++
++// Config configures one SDDC Manager client.
++type Config struct {
++	BaseURL    string
++	Token      string
++	HTTPClient *http.Client
++	MaxPolls   int
++	Pace       func(context.Context, int) error
++}
++
++// BackupConfigurationSpec is the request body used by
++// updateBackupConfiguration.
++type BackupConfigurationSpec struct {
++	Encryption      *Encryption      `json:"encryption,omitempty"`
++	BackupLocations []BackupLocation `json:"backupLocations,omitempty"`
++	BackupSchedules []BackupSchedule `json:"backupSchedules,omitempty"`
++}
++
++type Encryption struct {
++	Passphrase string `json:"passphrase"`
++}
++
++type BackupLocation struct {
++	Server         string `json:"server"`
++	Port           int32  `json:"port"`
++	Protocol       string `json:"protocol"`
++	Username       string `json:"username"`
++	Password       string `json:"password,omitempty"`
++	DirectoryPath  string `json:"directoryPath"`
++	SSHFingerprint string `json:"sshFingerprint,omitempty"`
++}
++
++type BackupSchedule struct {
++	ResourceType            string                 `json:"resourceType"`
++	TakeScheduledBackups    *bool                  `json:"takeScheduledBackups,omitempty"`
++	Frequency               string                 `json:"frequency"`
++	DaysOfWeek              []string               `json:"daysOfWeek,omitempty"`
++	HourOfDay               *int32                 `json:"hourOfDay,omitempty"`
++	MinuteOfHour            *int32                 `json:"minuteOfHour,omitempty"`
++	TakeBackupOnStateChange *bool                  `json:"takeBackupOnStateChange,omitempty"`
++	RetentionPolicy         *BackupRetentionPolicy `json:"retentionPolicy,omitempty"`
++}
++
++type BackupRetentionPolicy struct {
++	NumberOfMostRecentBackups   int32  `json:"numberOfMostRecentBackups"`
++	NumberOfDaysOfHourlyBackups *int32 `json:"numberOfDaysOfHourlyBackups,omitempty"`
++	NumberOfDaysOfDailyBackups  *int32 `json:"numberOfDaysOfDailyBackups,omitempty"`
++}
++
++// Task is the subset of the VCF Task model used by this workflow.
++type Task struct {
++	ID                  string     `json:"id"`
++	Name                string     `json:"name"`
++	Type                string     `json:"type,omitempty"`
++	Status              string     `json:"status"`
++	CreationTimestamp   string     `json:"creationTimestamp"`
++	CompletionTimestamp string     `json:"completionTimestamp,omitempty"`
++	Errors              []VCFError `json:"errors,omitempty"`
++	ResolutionStatus    string     `json:"resolutionStatus,omitempty"`
++	IsCancellable       bool       `json:"isCancellable,omitempty"`
++	IsRetryable         bool       `json:"isRetryable,omitempty"`
++}
++
++// VCFError retains the common error fields exposed by the specification.
++type VCFError struct {
++	ErrorCode          string `json:"errorCode"`
++	Message            string `json:"message"`
++	RemediationMessage string `json:"remediationMessage"`
++	ReferenceToken     string `json:"referenceToken"`
++}
++
++// APIError is returned for a non-success HTTP response.
++type APIError struct {
++	StatusCode         int    `json:"-"`
++	ErrorCode          string `json:"errorCode"`
++	Message            string `json:"message"`
++	RemediationMessage string `json:"remediationMessage"`
++	ReferenceToken     string `json:"referenceToken"`
++}
++
++func (e *APIError) Error() string {
++	return fmt.Sprintf("SDDC Manager returned HTTP %d (%s): %s",
++		e.StatusCode, e.ErrorCode, e.Message)
++}
++
++// TaskTerminalError carries a task that ended unsuccessfully.
++type TaskTerminalError struct {
++	Task Task
++}
++
++func (e *TaskTerminalError) Error() string {
++	return fmt.Sprintf("SDDC Manager task %s reached terminal status %s",
++		e.Task.ID, e.Task.Status)
++}
++
++// PollLimitError reports a task that remained non-terminal at the configured
++// GET-request bound.
++type PollLimitError struct {
++	TaskID     string
++	MaxPolls   int
++	LastStatus string
++}
++
++func (e *PollLimitError) Error() string {
++	return fmt.Sprintf("SDDC Manager task %s still %s after %d polls",
++		e.TaskID, e.LastStatus, e.MaxPolls)
++}
