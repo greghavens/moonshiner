@@ -1,0 +1,367 @@
+--- a/client.go
++++ b/client.go
+@@ -1,11 +1,17 @@
+ package nsxpolicy
+ 
+ import (
++	"bufio"
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"io"
+ 	"net/http"
++	"net/url"
++	"strconv"
++	"strings"
+ )
+ 
+ // ErrNoDiagnosticEvidence means that the controller log and NSX data did not
+@@ -21,7 +27,12 @@
+ }
+ 
+ // Client calls the VCF 9.1 NSX Policy API.
+-type Client struct{}
++type Client struct {
++	origin     string
++	username   string
++	password   string
++	httpClient *http.Client
++}
+ 
+ // SegmentPatch is the supported subset of the NSX Segment request.
+ type SegmentPatch struct {
+@@ -78,16 +89,329 @@
+ 
+ // New constructs a client.
+ func New(cfg Config) (*Client, error) {
+-	return nil, errors.New("not implemented")
++	if strings.TrimSpace(cfg.BaseURL) == "" {
++		return nil, errors.New("BaseURL is required")
++	}
++	if cfg.Username == "" {
++		return nil, errors.New("Username is required")
++	}
++	if cfg.Password == "" {
++		return nil, errors.New("Password is required")
++	}
++	parsed, err := url.Parse(cfg.BaseURL)
++	if err != nil {
++		return nil, fmt.Errorf("invalid BaseURL: %w", err)
++	}
++	if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
++		return nil, errors.New("BaseURL must be an absolute http or https origin")
++	}
++	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
++		return nil, errors.New("BaseURL must not contain userinfo, query, or fragment")
++	}
++	if parsed.Path != "" && parsed.Path != "/" {
++		return nil, errors.New("BaseURL must be an origin without a path")
++	}
++	parsed.Path = ""
++	parsed.RawPath = ""
++	client := cfg.HTTPClient
++	if client == nil {
++		client = http.DefaultClient
++	}
++	return &Client{
++		origin:     strings.TrimSuffix(parsed.String(), "/"),
++		username:   cfg.Username,
++		password:   cfg.Password,
++		httpClient: client,
++	}, nil
+ }
+ 
+ // PatchSegment calls PatchInfraSegment.
+ func (c *Client) PatchSegment(ctx context.Context, segmentID string, patch SegmentPatch) error {
+-	return errors.New("not implemented")
++	if segmentID == "" {
++		return errors.New("segmentID is required")
++	}
++	return c.doJSON(
++		ctx,
++		"PatchInfraSegment",
++		http.MethodPatch,
++		"/infra/segments/"+url.PathEscape(segmentID),
++		nil,
++		patch,
++		nil,
++	)
+ }
+ 
+ // DiagnoseSegment correlates a failed controller log record with realized
+ // entities and alarms rather than inferring a cause.
+ func (c *Client) DiagnoseSegment(ctx context.Context, segmentID string, controllerLog io.Reader, options DiagnosticsOptions) (DiagnosticReport, error) {
+-	return DiagnosticReport{}, errors.New("not implemented")
++	if segmentID == "" {
++		return DiagnosticReport{}, errors.New("segmentID is required")
++	}
++	if controllerLog == nil {
++		return DiagnosticReport{}, fmt.Errorf("%w: controller log is required", ErrNoDiagnosticEvidence)
++	}
++	if options.PageSize != nil && (*options.PageSize < 0 || *options.PageSize > 1000) {
++		return DiagnosticReport{}, fmt.Errorf("page_size %d is outside the contract range 0..1000", *options.PageSize)
++	}
++
++	expectedIntentPath := "/infra/segments/" + segmentID
++	logRecord, err := findFailedPatchLog(controllerLog, segmentID, expectedIntentPath)
++	if err != nil {
++		return DiagnosticReport{}, err
++	}
++
++	realized, err := c.getRealizedEntity(ctx, expectedIntentPath, options.SitePath)
++	if err != nil {
++		return DiagnosticReport{}, err
++	}
++	alarm, err := c.getCorrelatedAlarm(ctx, expectedIntentPath, options)
++	if err != nil {
++		return DiagnosticReport{}, err
++	}
++
++	return DiagnosticReport{
++		CorrelationID:     logRecord.CorrelationID,
++		IntentPath:        logRecord.IntentPath,
++		ControllerMessage: logRecord.Message,
++		RealizedEntityID:  realized.ID,
++		RealizationState:  realized.State,
++		AlarmID:           alarm.ID,
++		Severity:          alarm.Severity,
++		Cause:             alarm.Message,
++	}, nil
++}
++
++type controllerLogRecord struct {
++	OperationID   string `json:"operation_id"`
++	SegmentID     string `json:"segment_id"`
++	IntentPath    string `json:"intent_path"`
++	CorrelationID string `json:"correlation_id"`
++	Status        string `json:"status"`
++	Message       string `json:"message"`
++}
++
++func findFailedPatchLog(reader io.Reader, segmentID, intentPath string) (controllerLogRecord, error) {
++	scanner := bufio.NewScanner(reader)
++	scanner.Buffer(make([]byte, 4096), 1024*1024)
++	var match controllerLogRecord
++	found := false
++	line := 0
++	for scanner.Scan() {
++		line++
++		if len(bytes.TrimSpace(scanner.Bytes())) == 0 {
++			continue
++		}
++		var record controllerLogRecord
++		if err := json.Unmarshal(scanner.Bytes(), &record); err != nil {
++			return controllerLogRecord{}, fmt.Errorf("decode controller log line %d: %w", line, err)
++		}
++		if record.OperationID == "PatchInfraSegment" &&
++			record.SegmentID == segmentID &&
++			record.IntentPath == intentPath &&
++			record.Status == "failed" {
++			match = record
++			found = true
++		}
++	}
++	if err := scanner.Err(); err != nil {
++		return controllerLogRecord{}, fmt.Errorf("read controller log: %w", err)
++	}
++	if !found {
++		return controllerLogRecord{}, fmt.Errorf("%w: no matching failed PatchInfraSegment log record", ErrNoDiagnosticEvidence)
++	}
++	return match, nil
++}
++
++type realizedEntityList struct {
++	Results []realizedEntity `json:"results"`
++}
++
++type realizedEntity struct {
++	ID          string   `json:"id"`
++	IntentPaths []string `json:"intent_paths"`
++	State       string   `json:"state"`
++}
++
++func (c *Client) getRealizedEntity(ctx context.Context, intentPath, sitePath string) (realizedEntity, error) {
++	query := url.Values{}
++	query.Set("intent_path", intentPath)
++	if sitePath != "" {
++		query.Set("site_path", sitePath)
++	}
++	var response realizedEntityList
++	if err := c.doJSON(
++		ctx,
++		"ListRealizedEntities",
++		http.MethodGet,
++		"/infra/realized-state/realized-entities",
++		query,
++		nil,
++		&response,
++	); err != nil {
++		return realizedEntity{}, err
++	}
++
++	var firstMatch *realizedEntity
++	for index := range response.Results {
++		candidate := &response.Results[index]
++		if !containsExact(candidate.IntentPaths, intentPath) {
++			continue
++		}
++		if candidate.State == "ERROR" {
++			return *candidate, nil
++		}
++		if firstMatch == nil {
++			firstMatch = candidate
++		}
++	}
++	if firstMatch != nil {
++		return *firstMatch, nil
++	}
++	return realizedEntity{}, fmt.Errorf("%w: no realized entity for %s", ErrNoDiagnosticEvidence, intentPath)
++}
++
++type alarmList struct {
++	Cursor  string  `json:"cursor"`
++	Results []alarm `json:"results"`
++}
++
++type alarm struct {
++	ID              string   `json:"id"`
++	IntentPaths     []string `json:"intent_paths"`
++	Message         string   `json:"message"`
++	Severity        string   `json:"severity"`
++	SourceReference string   `json:"source_reference"`
++}
++
++func (c *Client) getCorrelatedAlarm(ctx context.Context, intentPath string, options DiagnosticsOptions) (alarm, error) {
++	baseQuery := url.Values{}
++	if options.IncludedFields != "" {
++		baseQuery.Set("included_fields", options.IncludedFields)
++	}
++	if options.PageSize != nil {
++		baseQuery.Set("page_size", strconv.FormatInt(*options.PageSize, 10))
++	}
++	if options.SortAscending != nil {
++		baseQuery.Set("sort_ascending", strconv.FormatBool(*options.SortAscending))
++	}
++	if options.SortBy != "" {
++		baseQuery.Set("sort_by", options.SortBy)
++	}
++
++	cursor := ""
++	seenCursors := make(map[string]bool)
++	var matching *alarm
++	for {
++		query := cloneValues(baseQuery)
++		if cursor != "" {
++			query.Set("cursor", cursor)
++		}
++		var response alarmList
++		if err := c.doJSON(
++			ctx,
++			"ListAlarms",
++			http.MethodGet,
++			"/infra/realized-state/alarms",
++			query,
++			nil,
++			&response,
++		); err != nil {
++			return alarm{}, err
++		}
++		for index := range response.Results {
++			candidate := &response.Results[index]
++			if candidate.Severity == "ERROR" && containsExact(candidate.IntentPaths, intentPath) && matching == nil {
++				copy := *candidate
++				matching = &copy
++			}
++		}
++		if response.Cursor == "" {
++			break
++		}
++		if seenCursors[response.Cursor] {
++			return alarm{}, fmt.Errorf("ListAlarms returned repeated cursor %q", response.Cursor)
++		}
++		seenCursors[response.Cursor] = true
++		cursor = response.Cursor
++	}
++	if matching == nil {
++		return alarm{}, fmt.Errorf("%w: no ERROR alarm for %s", ErrNoDiagnosticEvidence, intentPath)
++	}
++	return *matching, nil
++}
++
++func cloneValues(source url.Values) url.Values {
++	result := make(url.Values, len(source))
++	for key, values := range source {
++		result[key] = append([]string(nil), values...)
++	}
++	return result
++}
++
++func containsExact(values []string, wanted string) bool {
++	for _, value := range values {
++		if value == wanted {
++			return true
++		}
++	}
++	return false
++}
++
++func (c *Client) doJSON(
++	ctx context.Context,
++	operationID string,
++	method string,
++	apiPath string,
++	query url.Values,
++	requestValue any,
++	responseValue any,
++) error {
++	var body io.Reader
++	if requestValue != nil {
++		encoded, err := json.Marshal(requestValue)
++		if err != nil {
++			return fmt.Errorf("%s encode request: %w", operationID, err)
++		}
++		body = bytes.NewReader(encoded)
++	}
++
++	endpoint := c.origin + "/policy/api/v1" + apiPath
++	if encodedQuery := query.Encode(); encodedQuery != "" {
++		endpoint += "?" + encodedQuery
++	}
++	request, err := http.NewRequestWithContext(ctx, method, endpoint, body)
++	if err != nil {
++		return fmt.Errorf("%s build request: %w", operationID, err)
++	}
++	request.Header.Set("Accept", "application/json")
++	if requestValue != nil {
++		request.Header.Set("Content-Type", "application/json")
++	}
++	request.SetBasicAuth(c.username, c.password)
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return fmt.Errorf("%s request: %w", operationID, err)
++	}
++	defer response.Body.Close()
++	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 4<<20))
++	if err != nil {
++		return fmt.Errorf("%s read response: %w", operationID, err)
++	}
++	if response.StatusCode < 200 || response.StatusCode >= 300 {
++		apiError := &APIError{StatusCode: response.StatusCode}
++		if err := json.Unmarshal(responseBody, apiError); err != nil || apiError.ErrorMessage == "" {
++			apiError.ErrorMessage = http.StatusText(response.StatusCode)
++		}
++		return apiError
++	}
++	if responseValue != nil {
++		if len(bytes.TrimSpace(responseBody)) == 0 {
++			return fmt.Errorf("%s decode response: empty body", operationID)
++		}
++		if err := json.Unmarshal(responseBody, responseValue); err != nil {
++			return fmt.Errorf("%s decode response: %w", operationID, err)
++		}
++	}
++	return nil
+ }

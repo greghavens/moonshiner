@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3122 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3123 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 34 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 53 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 54 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -3678,6 +3678,7 @@
 - **vcf91-0072** (`go`) `#vcf-9-1` `#nsx-policy` `#go` `#rest-contract` `#spec-derived` — Implement the standard-library-only Go package in `nsxpolicy/client.go`. A VCF network bootstrapper creates or updates a named NSX Policy IP address block. The connection can disappear after NSX ha…
 - **vcf91-0073** (`go`) `#vcf-9-1` `#nsx-policy` `#go` `#rest-contract` `#spec-derived` — Implement the unfinished Go package in this repository. It applies a small VCF 9.1 NSX distributed-firewall change in three ordered steps: patch the source group, patch the destination group, then…
 - **vcf91-0074** (`go`) `#vcf-9-1` `#nsx-policy` `#go` `#rest-contract` `#spec-derived` — Implement the standard-library-only root Go package `nsxpolicy` in `client.go`. The VCF network automation workflow enables an existing NSX Policy infra segment only after an immediate read prechec…
+- **vcf91-0076** (`go`) `#vcf-9-1` `#nsx-policy` `#go` `#rest-contract` `#spec-derived` — Platform networking incident ticket. Our VCF 9.1 segment reconciler reports only `NSX Policy returned 500; realization outcome unknown` after patching `app-seg`. Do not guess from that message: `fi…
 
 ## project-io
 
