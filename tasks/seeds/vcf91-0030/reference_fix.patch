@@ -1,0 +1,378 @@
+--- a/client.go
++++ b/client.go
+@@ -2,13 +2,20 @@
+ package albdeploy
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
++	"net"
+ 	"net/http"
++	"net/url"
++	"strconv"
++	"strings"
+ )
+ 
+-// ErrNotImplemented is returned by the initial scaffold.
+-var ErrNotImplemented = errors.New("guarded ALB deployment is not implemented")
++const maxResponseBytes = 1 << 20
+ 
+ // Config configures an SDDC Manager client.
+ type Config struct {
+@@ -75,7 +82,7 @@
+ }
+ 
+ func (e *APIError) Error() string {
+-	return "SDDC Manager API request failed"
++	return fmt.Sprintf("%s failed with HTTP status %d", e.OperationID, e.StatusCode)
+ }
+ 
+ // TransportError represents a request transport failure.
+@@ -84,7 +91,7 @@
+ }
+ 
+ func (e *TransportError) Error() string {
+-	return "SDDC Manager transport request failed"
++	return e.OperationID + " transport failure"
+ }
+ 
+ // PrecheckError reports a contract-valid precheck result that blocks mutation.
+@@ -103,15 +110,60 @@
+ }
+ 
+ func (e *ProtocolError) Error() string {
+-	return "SDDC Manager success response violated the contract"
++	return e.OperationID + " returned a malformed success response"
+ }
+ 
+ // Client performs a guarded ALB deployment.
+-type Client struct{}
++type Client struct {
++	baseURL     *url.URL
++	accessToken string
++	httpClient  *http.Client
++}
+ 
+ // NewClient validates configuration without performing network I/O.
+ func NewClient(config Config) (*Client, error) {
+-	return nil, ErrNotImplemented
++	parsed, err := url.Parse(config.BaseURL)
++	if err != nil {
++		return nil, errors.New("BaseURL must be an HTTP(S) origin")
++	}
++	scheme := strings.ToLower(parsed.Scheme)
++	if (scheme != "http" && scheme != "https") ||
++		parsed.Host == "" ||
++		parsed.Hostname() == "" ||
++		parsed.User != nil ||
++		parsed.Opaque != "" ||
++		(parsed.Path != "" && parsed.Path != "/") ||
++		(parsed.EscapedPath() != "" && parsed.EscapedPath() != "/") ||
++		parsed.RawQuery != "" ||
++		parsed.ForceQuery ||
++		parsed.Fragment != "" {
++		return nil, errors.New("BaseURL must be an HTTP(S) origin")
++	}
++	if config.AccessToken == "" ||
++		strings.ContainsAny(config.AccessToken, " \t\r\n\v\f") {
++		return nil, errors.New("AccessToken must be non-empty and contain no ASCII whitespace")
++	}
++
++	httpClient := config.HTTPClient
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++	httpClientCopy := *httpClient
++	httpClientCopy.CheckRedirect = func(
++		_ *http.Request,
++		_ []*http.Request,
++	) error {
++		return http.ErrUseLastResponse
++	}
++
++	return &Client{
++		baseURL: &url.URL{
++			Scheme: scheme,
++			Host:   parsed.Host,
++		},
++		accessToken: config.AccessToken,
++		httpClient:  &httpClientCopy,
++	}, nil
+ }
+ 
+ // DeployALBCluster validates the request and invokes the deployment mutation
+@@ -121,5 +173,269 @@
+ 	spec AlbControllerClusterSpec,
+ 	options DeployOptions,
+ ) (Result, error) {
+-	return Result{}, ErrNotImplemented
++	if c == nil || c.baseURL == nil || c.httpClient == nil {
++		return Result{}, errors.New("client is not initialized")
++	}
++	if ctx == nil {
++		return Result{}, errors.New("context must not be nil")
++	}
++	if err := ctx.Err(); err != nil {
++		return Result{}, err
++	}
++	if err := validateSpec(spec); err != nil {
++		return Result{}, err
++	}
++
++	body, err := json.Marshal(spec)
++	if err != nil {
++		return Result{}, errors.New("cannot encode AlbControllerClusterSpec")
++	}
++	rawQuery := ""
++	if options.SkipCompatibilityCheck != nil {
++		rawQuery = "skipCompatibilityCheck=" +
++			strconv.FormatBool(*options.SkipCompatibilityCheck)
++	}
++
++	const validateOperation = "validateALBControllerClusterCreationSpec"
++	status, responseBody, err := c.post(
++		ctx,
++		validateOperation,
++		"/v1/alb-clusters/validations",
++		rawQuery,
++		body,
++	)
++	if err != nil {
++		return Result{}, err
++	}
++	if status != http.StatusOK {
++		return Result{}, decodeAPIError(validateOperation, status, responseBody)
++	}
++	var validation Validation
++	if err := decodeSuccess(
++		validateOperation,
++		responseBody,
++		&validation,
++		"id",
++		"description",
++		"executionStatus",
++		"resultStatus",
++	); err != nil {
++		return Result{}, err
++	}
++	result := Result{Validation: validation}
++	if validation.ExecutionStatus != "COMPLETED" ||
++		validation.ResultStatus != "SUCCEEDED" {
++		return result, &PrecheckError{Validation: validation}
++	}
++
++	const deployOperation = "deployALBCluster"
++	status, responseBody, err = c.post(
++		ctx,
++		deployOperation,
++		"/v1/alb-clusters",
++		rawQuery,
++		body,
++	)
++	if err != nil {
++		return result, err
++	}
++	if status != http.StatusAccepted {
++		return result, decodeAPIError(deployOperation, status, responseBody)
++	}
++	var task Task
++	if err := decodeSuccess(
++		deployOperation,
++		responseBody,
++		&task,
++		"id",
++		"name",
++		"status",
++		"creationTimestamp",
++	); err != nil {
++		return result, err
++	}
++	result.Task = &task
++	result.Deployed = true
++	return result, nil
++}
++
++func validateSpec(spec AlbControllerClusterSpec) error {
++	if len(spec.NSXIDs) != 1 ||
++		spec.NSXIDs[0] == "" ||
++		spec.NSXIDs[0] != strings.TrimSpace(spec.NSXIDs[0]) {
++		return errors.New("NSXIDs must contain exactly one non-empty trimmed ID")
++	}
++	if spec.ClusterName == "" ||
++		spec.ClusterName != strings.TrimSpace(spec.ClusterName) ||
++		len(spec.ClusterName) > 80 {
++		return errors.New("ClusterName must be a non-empty trimmed string of at most 80 bytes")
++	}
++	if !validFQDN(spec.ClusterFQDN) {
++		return errors.New("ClusterFQDN must match the contract FQDN syntax")
++	}
++	switch spec.FormFactor {
++	case "XLARGE", "LARGE", "MEDIUM", "SMALL":
++	default:
++		return errors.New("FormFactor is not supported by the contract")
++	}
++	if spec.AdminPassword == "" {
++		return errors.New("AdminPassword must be non-empty")
++	}
++	if spec.BundleID == "" || spec.BundleID != strings.TrimSpace(spec.BundleID) {
++		return errors.New("BundleID must be a non-empty trimmed string")
++	}
++	if spec.Nodes != nil {
++		if len(*spec.Nodes) < 1 || len(*spec.Nodes) > 3 {
++			return errors.New("Nodes must contain between one and three nodes when set")
++		}
++		for _, node := range *spec.Nodes {
++			ip := net.ParseIP(node.IPAddress)
++			if ip == nil || ip.To4() == nil ||
++				node.IPAddress != strings.TrimSpace(node.IPAddress) {
++				return errors.New("each node IPAddress must be an IPv4 address")
++			}
++		}
++	}
++	if spec.VCFOpsAdminPassword != nil &&
++		*spec.VCFOpsAdminPassword == "" {
++		return errors.New("VCFOpsAdminPassword must be non-empty when set")
++	}
++	return nil
++}
++
++func validFQDN(value string) bool {
++	if value == "" || value != strings.TrimSpace(value) {
++		return false
++	}
++	for _, label := range strings.Split(value, ".") {
++		if len(label) < 1 || len(label) > 63 ||
++			!asciiLetterOrDigit(label[0]) ||
++			!asciiLetterOrDigit(label[len(label)-1]) {
++			return false
++		}
++		for index := 1; index < len(label)-1; index++ {
++			if !asciiLetterOrDigit(label[index]) && label[index] != '-' {
++				return false
++			}
++		}
++	}
++	return true
++}
++
++func asciiLetterOrDigit(value byte) bool {
++	return value >= 'a' && value <= 'z' ||
++		value >= 'A' && value <= 'Z' ||
++		value >= '0' && value <= '9'
++}
++
++func (c *Client) post(
++	ctx context.Context,
++	operationID string,
++	path string,
++	rawQuery string,
++	body []byte,
++) (int, []byte, error) {
++	target := *c.baseURL
++	target.Path = path
++	target.RawQuery = rawQuery
++	request, err := http.NewRequestWithContext(
++		ctx,
++		http.MethodPost,
++		target.String(),
++		bytes.NewReader(body),
++	)
++	if err != nil {
++		return 0, nil, errors.New("cannot create SDDC Manager request")
++	}
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set("Authorization", "Bearer "+c.accessToken)
++	request.Header.Set("Content-Type", "application/json")
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		if response != nil && response.Body != nil {
++			_ = response.Body.Close()
++		}
++		if contextErr := ctx.Err(); contextErr != nil {
++			return 0, nil, contextErr
++		}
++		return 0, nil, &TransportError{OperationID: operationID}
++	}
++	defer response.Body.Close()
++	responseBody, err := io.ReadAll(
++		io.LimitReader(response.Body, maxResponseBytes+1),
++	)
++	if err != nil {
++		if contextErr := ctx.Err(); contextErr != nil {
++			return 0, nil, contextErr
++		}
++		return 0, nil, &TransportError{OperationID: operationID}
++	}
++	if len(responseBody) > maxResponseBytes {
++		return 0, nil, &ProtocolError{
++			OperationID: operationID,
++			Reason:      "response body exceeded limit",
++		}
++	}
++	return response.StatusCode, responseBody, nil
++}
++
++func decodeSuccess(
++	operationID string,
++	body []byte,
++	target any,
++	required ...string,
++) error {
++	var object map[string]json.RawMessage
++	if err := json.Unmarshal(body, &object); err != nil || object == nil {
++		return &ProtocolError{
++			OperationID: operationID,
++			Reason:      "success body is not a JSON object",
++		}
++	}
++	for _, name := range required {
++		value, exists := object[name]
++		if !exists {
++			return &ProtocolError{
++				OperationID: operationID,
++				Reason:      "success body omitted a required property",
++			}
++		}
++		var text string
++		if err := json.Unmarshal(value, &text); err != nil || text == "" {
++			return &ProtocolError{
++				OperationID: operationID,
++				Reason:      "required success property is not a non-empty string",
++			}
++		}
++	}
++	if err := json.Unmarshal(body, target); err != nil {
++		return &ProtocolError{
++			OperationID: operationID,
++			Reason:      "success body could not be decoded",
++		}
++	}
++	return nil
++}
++
++func decodeAPIError(
++	operationID string,
++	statusCode int,
++	body []byte,
++) *APIError {
++	var envelope struct {
++		ErrorCode          string `json:"errorCode"`
++		Message            string `json:"message"`
++		RemediationMessage string `json:"remediationMessage"`
++		ReferenceToken     string `json:"referenceToken"`
++	}
++	_ = json.Unmarshal(body, &envelope)
++	return &APIError{
++		OperationID:        operationID,
++		StatusCode:         statusCode,
++		ErrorCode:          envelope.ErrorCode,
++		Message:            envelope.Message,
++		RemediationMessage: envelope.RemediationMessage,
++		ReferenceToken:     envelope.ReferenceToken,
++	}
+ }
