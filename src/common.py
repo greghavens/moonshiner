@@ -187,15 +187,17 @@ _staged_secret_values.cache_clear = lambda: None
 # Runtime-only artifacts: excluded from candidate diffs and cleaned before an
 # independent screening replay. Verification can recreate them after the agent
 # has already cleaned its workspace, and their binary diffs do not replay.
-# .sandbox-home is the throwaway HOME the sandbox points a run at. It is
+# .sandbox-home is the throwaway HOME the sandbox points a run at, and
+# .toolchain holds the cargo and rustup state a run provisions for itself. It is
 # created fresh for every run and is never seed content, but pwsh, go, cargo
 # and dconf all write caches and telemetry into it, which made a verified
 # workspace look dirty and rejected otherwise sound seeds.
 RUNTIME_CACHE_DIR_NAMES = {"__pycache__", ".pytest_cache", ".mypy_cache",
-                          ".ruff_cache", "node_modules", ".sandbox-home"}
+                          ".ruff_cache", "node_modules", ".sandbox-home",
+                          ".toolchain"}
 RUNTIME_CACHE_SUFFIXES = {".pyc", ".pyo"}
 DIFF_EXCLUDE_PATTERNS = (
-    "**/.sandbox-home/**",
+    "**/.sandbox-home/**", "**/.toolchain/**",
     "**/__pycache__/**", "**/*.pyc", "**/*.pyo", "**/.pytest_cache/**",
     "**/.mypy_cache/**", "**/.ruff_cache/**", "node_modules/**",
     ".venv/**", "env/**", "target/**", "**/bin/**", "**/obj/**",

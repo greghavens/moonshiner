@@ -198,6 +198,9 @@ class TheSandboxHomeIsNeverSeedContent(unittest.TestCase):
             self.assertTrue((workspace / "keep.ps1").exists(),
                             "seed content must survive the sweep")
 
-    def test_it_is_excluded_from_captured_diffs(self):
-        from common import DIFF_EXCLUDE_PATTERNS
-        self.assertIn("**/.sandbox-home/**", DIFF_EXCLUDE_PATTERNS)
+    def test_every_runtime_home_is_excluded_from_captured_diffs(self):
+        """A 254 MB patch of base85 cargo cache OOM-killed a whole queue."""
+        from common import DIFF_EXCLUDE_PATTERNS, RUNTIME_CACHE_DIR_NAMES
+        for name in (".sandbox-home", ".toolchain"):
+            self.assertIn(f"**/{name}/**", DIFF_EXCLUDE_PATTERNS)
+            self.assertIn(name, RUNTIME_CACHE_DIR_NAMES)
