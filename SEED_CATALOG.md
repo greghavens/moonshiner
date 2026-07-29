@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3078 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3079 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 30 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 13 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 14 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -3634,6 +3634,7 @@
 - **vcf91-0025** (`go`) `#vcf-9-1` `#sddc-manager` `#go` `#rest-contract` `#spec-derived` — Backup automation ticket for our VCF 9.1 management domain. Updating SDDC Manager's backup configuration is asynchronous, but the current caller treats the accepted response as completion. Implemen…
 - **vcf91-0026** (`go`) `#vcf-9-1` `#sddc-manager` `#go` `#rest-contract` `#spec-derived` — Implement the root Go package `domainsnapshot` (module `vcf91-0026`, standard library only) as a VMware Cloud Foundation 9.1 SDDC Manager integration. An inventory access token expires after page 0…
 - **vcf91-0027** (`go`) `#vcf-9-1` `#sddc-manager` `#go` `#rest-contract` `#spec-derived` — Implement the Go package in this repository as a focused VMware Cloud Foundation 9.1 SDDC Manager REST integration. Research the official Apache-2.0 `vmware/vcf-api-specs` repository at commit `394…
+- **vcf91-0028** (`go`) `#vcf-9-1` `#sddc-manager` `#go` `#rest-contract` `#spec-derived` — Implement the root Go package `depotdelete` (module `vcf91-0028`, standard library only) as a focused VMware Cloud Foundation 9.1 SDDC Manager REST integration. The protected `docs/contract.json` i…
 
 ## project-io
 

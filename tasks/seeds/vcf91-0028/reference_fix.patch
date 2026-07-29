@@ -1,0 +1,220 @@
+--- a/client.go
++++ b/client.go
+@@ -3,12 +3,16 @@
+ 
+ import (
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
++	"strings"
+ )
+ 
+-// ErrNotImplemented is returned by the initial scaffold.
+-var ErrNotImplemented = errors.New("SDDC Manager depot deletion is not implemented")
++const maxErrorBodyBytes = 1 << 20
+ 
+ // Config configures a depot deletion client.
+ type Config struct {
+@@ -41,7 +45,7 @@
+ }
+ 
+ func (e *APIError) Error() string {
+-	return "SDDC Manager API request failed"
++	return fmt.Sprintf("%s failed with HTTP status %d", e.OperationID, e.StatusCode)
+ }
+ 
+ // TransportError represents a terminal request transport failure.
+@@ -50,15 +54,69 @@
+ }
+ 
+ func (e *TransportError) Error() string {
+-	return "SDDC Manager transport request failed"
++	return e.OperationID + " transport failure"
+ }
+ 
+ // Client deletes SDDC Manager depot settings.
+-type Client struct{}
++type Client struct {
++	baseURL     *url.URL
++	accessToken string
++	httpClient  *http.Client
++	maxAttempts int
++	beforeRetry func(context.Context, int) error
++}
+ 
+ // NewClient validates config without performing network I/O.
+ func NewClient(config Config) (*Client, error) {
+-	return nil, ErrNotImplemented
++	parsed, err := url.Parse(config.BaseURL)
++	if err != nil {
++		return nil, errors.New("BaseURL must be an HTTP(S) origin")
++	}
++	scheme := strings.ToLower(parsed.Scheme)
++	if (scheme != "http" && scheme != "https") ||
++		parsed.Host == "" ||
++		parsed.Hostname() == "" ||
++		parsed.User != nil ||
++		parsed.Opaque != "" ||
++		(parsed.Path != "" && parsed.Path != "/") ||
++		(parsed.EscapedPath() != "" && parsed.EscapedPath() != "/") ||
++		parsed.RawQuery != "" ||
++		parsed.ForceQuery ||
++		parsed.Fragment != "" {
++		return nil, errors.New("BaseURL must be an HTTP(S) origin")
++	}
++	if config.AccessToken == "" ||
++		strings.ContainsAny(config.AccessToken, " \t\r\n\v\f") {
++		return nil, errors.New("AccessToken must be non-empty and contain no ASCII whitespace")
++	}
++	if config.MaxAttempts < 1 {
++		return nil, errors.New("MaxAttempts must be at least one")
++	}
++
++	httpClient := config.HTTPClient
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++	httpClientCopy := *httpClient
++	httpClientCopy.CheckRedirect = func(
++		_ *http.Request,
++		_ []*http.Request,
++	) error {
++		return http.ErrUseLastResponse
++	}
++
++	beforeRetry := config.BeforeRetry
++	if beforeRetry == nil {
++		beforeRetry = func(context.Context, int) error { return nil }
++	}
++	baseURL := &url.URL{Scheme: scheme, Host: parsed.Host}
++	return &Client{
++		baseURL:     baseURL,
++		accessToken: config.AccessToken,
++		httpClient:  &httpClientCopy,
++		maxAttempts: config.MaxAttempts,
++		beforeRetry: beforeRetry,
++	}, nil
+ }
+ 
+ // DeleteDepotSettings safely retries the idempotent deleteDepotSettings call.
+@@ -66,5 +124,115 @@
+ 	ctx context.Context,
+ 	options DeleteDepotOptions,
+ ) (Result, error) {
+-	return Result{}, ErrNotImplemented
++	if c == nil ||
++		c.baseURL == nil ||
++		c.httpClient == nil ||
++		c.beforeRetry == nil ||
++		c.maxAttempts < 1 {
++		return Result{}, errors.New("client is not initialized")
++	}
++	if ctx == nil {
++		return Result{}, errors.New("context must not be nil")
++	}
++	if err := ctx.Err(); err != nil {
++		return Result{}, err
++	}
++
++	target := *c.baseURL
++	target.Path = "/v1/system/settings/depot"
++	if options.DepotType != nil {
++		depotType := *options.DepotType
++		if depotType == "" || depotType != strings.TrimSpace(depotType) {
++			return Result{}, errors.New("DepotType must be a non-empty trimmed string")
++		}
++		query := make(url.Values)
++		query.Set("depotType", depotType)
++		target.RawQuery = query.Encode()
++	}
++	targetURL := target.String()
++
++	for attempt := 1; attempt <= c.maxAttempts; attempt++ {
++		request, err := http.NewRequestWithContext(
++			ctx,
++			http.MethodDelete,
++			targetURL,
++			nil,
++		)
++		if err != nil {
++			return Result{}, errors.New("cannot create deleteDepotSettings request")
++		}
++		request.Header.Set("Accept", "application/json")
++		request.Header.Set("Authorization", "Bearer "+c.accessToken)
++
++		response, requestErr := c.httpClient.Do(request)
++		result := Result{Attempts: attempt, Retried: attempt > 1}
++		var terminalError error
++		retryable := false
++
++		if requestErr != nil {
++			if response != nil && response.Body != nil {
++				_ = response.Body.Close()
++			}
++			if contextErr := ctx.Err(); contextErr != nil {
++				return result, contextErr
++			}
++			terminalError = &TransportError{
++				OperationID: "deleteDepotSettings",
++			}
++			retryable = true
++		} else {
++			body, readErr := readAndClose(response)
++			if readErr != nil {
++				if contextErr := ctx.Err(); contextErr != nil {
++					return result, contextErr
++				}
++				terminalError = &TransportError{
++					OperationID: "deleteDepotSettings",
++				}
++				retryable = true
++			} else if response.StatusCode == http.StatusNoContent {
++				return result, nil
++			} else {
++				terminalError = decodeAPIError(response.StatusCode, body)
++				retryable = response.StatusCode == http.StatusInternalServerError
++			}
++		}
++
++		if !retryable || attempt == c.maxAttempts {
++			return result, terminalError
++		}
++		if err := c.beforeRetry(ctx, attempt); err != nil {
++			return result, err
++		}
++		if err := ctx.Err(); err != nil {
++			return result, err
++		}
++	}
++
++	panic("unreachable")
++}
++
++func readAndClose(response *http.Response) ([]byte, error) {
++	defer response.Body.Close()
++	return io.ReadAll(io.LimitReader(response.Body, maxErrorBodyBytes+1))
++}
++
++func decodeAPIError(statusCode int, body []byte) *APIError {
++	var envelope struct {
++		ErrorCode          string `json:"errorCode"`
++		Message            string `json:"message"`
++		RemediationMessage string `json:"remediationMessage"`
++		ReferenceToken     string `json:"referenceToken"`
++	}
++	if len(body) <= maxErrorBodyBytes {
++		_ = json.Unmarshal(body, &envelope)
++	}
++	return &APIError{
++		OperationID:        "deleteDepotSettings",
++		StatusCode:         statusCode,
++		ErrorCode:          envelope.ErrorCode,
++		Message:            envelope.Message,
++		RemediationMessage: envelope.RemediationMessage,
++		ReferenceToken:     envelope.ReferenceToken,
++	}
+ }
