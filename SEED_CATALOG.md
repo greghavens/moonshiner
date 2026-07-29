@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3082 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3083 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 30 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 17 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 18 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -3638,6 +3638,7 @@
 - **vcf91-0029** (`go`) `#vcf-9-1` `#sddc-manager` `#go` `#rest-contract` `#spec-derived` — Complete the root Go package `systembaseline` (module `vcf91-0029`, standard library only) as a focused VMware Cloud Foundation 9.1 SDDC Manager REST integration. The package applies an ordered two…
 - **vcf91-0030** (`go`) `#vcf-9-1` `#sddc-manager` `#go` `#rest-contract` `#spec-derived` — Implement the root Go package `albdeploy` (module `vcf91-0030`, standard library only) as a focused VMware Cloud Foundation 9.1 SDDC Manager REST integration. The ALB deployment mutation must be ga…
 - **vcf91-0031** (`go`) `#vcf-9-1` `#sddc-manager` `#go` `#rest-contract` `#spec-derived` — Complete the root Go package `credentialgate` (module `vcf91-0031`, standard library only) as a focused VMware Cloud Foundation 9.1 SDDC Manager REST integration. The package owns a currently usabl…
+- **vcf91-0032** (`go`) `#vcf-9-1` `#sddc-manager` `#go` `#rest-contract` `#spec-derived` — Complete the root Go package `taskdiagnosis` (module `vcf91-0032`, standard library only) as a focused VMware Cloud Foundation 9.1 SDDC Manager REST integration. Operators currently guess from a fa…
 
 ## project-io
 

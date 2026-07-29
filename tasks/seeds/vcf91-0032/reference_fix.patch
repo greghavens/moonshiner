@@ -1,0 +1,355 @@
+--- a/client.go
++++ b/client.go
+@@ -1,6 +1,10 @@
+ package taskdiagnosis
+ 
+ import (
++	"archive/tar"
++	"bufio"
++	"bytes"
++	"compress/gzip"
+ 	"context"
+ 	"encoding/json"
+ 	"errors"
+@@ -9,6 +13,7 @@
+ 	"mime"
+ 	"net/http"
+ 	"net/url"
++	"path"
+ 	"strings"
+ )
+ 
+@@ -20,9 +25,6 @@
+ 	maxArchiveExpanded   = 4 << 20
+ )
+ 
+-// ErrNotImplemented marks the two incomplete workflow functions.
+-var ErrNotImplemented = errors.New("task failure diagnosis is not implemented")
+-
+ // PaceFunc is called only between support-bundle status polls.
+ type PaceFunc func(ctx context.Context, operationID string, completedPolls int) error
+ 
+@@ -313,22 +315,319 @@
+ 	}
+ }
+ 
+-// DiagnoseTaskFailure is the incomplete public workflow.
++// DiagnoseTaskFailure retrieves and correlates task, event, and log evidence.
+ func (c *Client) DiagnoseTaskFailure(
+ 	ctx context.Context,
+ 	taskID string,
+ ) (Report, error) {
+-	return Report{}, ErrNotImplemented
++	var report Report
++	if c == nil ||
++		c.httpClient == nil ||
++		c.pace == nil ||
++		c.maxPolls < 1 {
++		return report, errors.New("client is not initialized")
++	}
++	if ctx == nil {
++		return report, errors.New("context must not be nil")
++	}
++	if err := ctx.Err(); err != nil {
++		return report, err
++	}
++	if strings.TrimSpace(taskID) == "" || strings.TrimSpace(taskID) != taskID {
++		return report, errors.New("taskID must be nonblank with no surrounding whitespace")
++	}
++
++	var task Task
++	if err := c.doJSON(
++		ctx,
++		"getTask",
++		http.MethodGet,
++		"/v1/tasks/"+url.PathEscape(taskID),
++		nil,
++		http.StatusOK,
++		&task,
++	); err != nil {
++		return report, err
++	}
++	report.Task = task
++	if task.ID == "" ||
++		task.ID != taskID ||
++		task.Name == "" ||
++		task.Status == "" ||
++		task.CreationTimestamp == "" {
++		return report, &ProtocolError{
++			OperationID: "getTask",
++			Detail:      "required task fields are missing or inconsistent",
++		}
++	}
++	if normalizeStatus(task.Status) != "FAILED" {
++		return report, &TaskStateError{Task: task}
++	}
++
++	resourceIDs := make(map[string]struct{})
++	for _, resource := range task.Resources {
++		if resource.ResourceID != "" {
++			resourceIDs[resource.ResourceID] = struct{}{}
++		}
++	}
++	referenceTokens := make(map[string]struct{})
++	for _, taskError := range task.Errors {
++		if taskError.ReferenceToken != "" {
++			referenceTokens[taskError.ReferenceToken] = struct{}{}
++		}
++	}
++	if len(resourceIDs) == 0 || len(referenceTokens) == 0 {
++		return report, &ProtocolError{
++			OperationID: "getTask",
++			Detail:      "failed task lacks correlation fields",
++		}
++	}
++
++	var notifications []Notification
++	if err := c.doJSON(
++		ctx,
++		"getNotifications",
++		http.MethodGet,
++		"/v1/notifications",
++		nil,
++		http.StatusOK,
++		&notifications,
++	); err != nil {
++		return report, err
++	}
++	eventIDs := make(map[string]struct{})
++	for _, notification := range notifications {
++		relevant := false
++		for _, resource := range notification.Resources {
++			if _, ok := resourceIDs[resource.ID]; ok {
++				relevant = true
++				break
++			}
++		}
++		if !relevant {
++			continue
++		}
++		report.RelevantEvents = append(report.RelevantEvents, notification)
++		if notification.Message.ID != "" {
++			eventIDs[notification.Message.ID] = struct{}{}
++		}
++	}
++	if len(eventIDs) == 0 {
++		return report, &EvidenceError{TaskID: taskID}
++	}
++
++	selected := true
++	requestSpec := SupportBundleSpec{
++		Logs: &Logs{
++			SDDCManagerLogs: &selected,
++			APILogs:         &selected,
++		},
++	}
++	var accepted SupportBundle
++	if err := c.doJSON(
++		ctx,
++		"startSupportBundle",
++		http.MethodPost,
++		"/v1/system/support-bundles",
++		requestSpec,
++		http.StatusAccepted,
++		&accepted,
++	); err != nil {
++		return report, err
++	}
++	report.Bundle = accepted
++	if accepted.ID == "" {
++		return report, &ProtocolError{
++			OperationID: "startSupportBundle",
++			Detail:      "accepted support bundle has no id",
++		}
++	}
++
++	for poll := 1; poll <= c.maxPolls; poll++ {
++		var current SupportBundle
++		if err := c.doJSON(
++			ctx,
++			"getSupportBundleStatus",
++			http.MethodGet,
++			"/v1/system/support-bundles/"+url.PathEscape(accepted.ID),
++			nil,
++			http.StatusOK,
++			&current,
++		); err != nil {
++			return report, err
++		}
++		report.Bundle = current
++		if current.ID == "" || current.ID != accepted.ID || current.Status == "" {
++			return report, &ProtocolError{
++				OperationID: "getSupportBundleStatus",
++				Detail:      "bundle status fields are missing or inconsistent",
++			}
++		}
++
++		switch normalizeStatus(current.Status) {
++		case "COMPLETED_WITH_SUCCESS":
++			archive, err := c.downloadArchive(
++				ctx,
++				"/v1/system/support-bundles/"+
++					url.PathEscape(accepted.ID)+
++					"/data",
++			)
++			if err != nil {
++				return report, err
++			}
++			cause, evidencePath, eventID, err := inspectEvidence(
++				archive,
++				taskID,
++				referenceTokens,
++				eventIDs,
++			)
++			if err != nil {
++				return report, err
++			}
++			report.Cause = cause
++			report.EvidencePath = evidencePath
++			report.EventID = eventID
++			return report, nil
++		case "COMPLETED_WITH_FAILURE":
++			return report, &BundleTerminalError{Bundle: current}
++		case "PENDING", "IN_PROGRESS":
++			if poll == c.maxPolls {
++				return report, &PollLimitError{
++					BundleID:   accepted.ID,
++					Bound:      c.maxPolls,
++					LastStatus: current.Status,
++				}
++			}
++			if err := c.pace(ctx, "getSupportBundleStatus", poll); err != nil {
++				return report, err
++			}
++			if err := ctx.Err(); err != nil {
++				return report, err
++			}
++		default:
++			return report, &ProtocolError{
++				OperationID: "getSupportBundleStatus",
++				Detail:      "unknown bundle status",
++			}
++		}
++	}
++	panic("unreachable")
+ }
+ 
+-// inspectEvidence is the incomplete bounded tar.gz evidence reader.
++// inspectEvidence reads bounded regular .log entries in archive order.
+ func inspectEvidence(
+ 	archive []byte,
+ 	taskID string,
+ 	referenceTokens map[string]struct{},
+ 	eventIDs map[string]struct{},
+ ) (cause string, evidencePath string, eventID string, err error) {
+-	return "", "", "", ErrNotImplemented
++	const operationID = "exportSupportBundleByID"
++	gzipReader, openErr := gzip.NewReader(bytes.NewReader(archive))
++	if openErr != nil {
++		return "", "", "", &ProtocolError{
++			OperationID: operationID,
++			Detail:      "malformed gzip archive",
++		}
++	}
++	defer gzipReader.Close()
++
++	tarReader := tar.NewReader(gzipReader)
++	entryCount := 0
++	var expandedBytes int64
++	for {
++		header, nextErr := tarReader.Next()
++		if errors.Is(nextErr, io.EOF) {
++			break
++		}
++		if nextErr != nil {
++			return "", "", "", &ProtocolError{
++				OperationID: operationID,
++				Detail:      "malformed tar archive",
++			}
++		}
++		entryCount++
++		if entryCount > maxArchiveEntries {
++			return "", "", "", &ProtocolError{
++				OperationID: operationID,
++				Detail:      "archive entry limit exceeded",
++			}
++		}
++		cleanName := path.Clean(header.Name)
++		if header.Name == "" ||
++			path.IsAbs(header.Name) ||
++			cleanName == ".." ||
++			strings.HasPrefix(cleanName, "../") {
++			return "", "", "", &ProtocolError{
++				OperationID: operationID,
++				Detail:      "archive contains an unsafe path",
++			}
++		}
++		if header.Typeflag != tar.TypeReg && header.Typeflag != tar.TypeRegA {
++			continue
++		}
++		if header.Size < 0 || header.Size > maxArchiveFileBytes {
++			return "", "", "", &ProtocolError{
++				OperationID: operationID,
++				Detail:      "archive file size limit exceeded",
++			}
++		}
++		expandedBytes += header.Size
++		if expandedBytes > maxArchiveExpanded {
++			return "", "", "", &ProtocolError{
++				OperationID: operationID,
++				Detail:      "archive expanded size limit exceeded",
++			}
++		}
++		if !strings.HasSuffix(strings.ToLower(cleanName), ".log") {
++			continue
++		}
++
++		data, readErr := io.ReadAll(io.LimitReader(
++			tarReader,
++			maxArchiveFileBytes+1,
++		))
++		if readErr != nil || int64(len(data)) != header.Size {
++			return "", "", "", &ProtocolError{
++				OperationID: operationID,
++				Detail:      "archive file is truncated",
++			}
++		}
++		scanner := bufio.NewScanner(bytes.NewReader(data))
++		scanner.Buffer(make([]byte, 64<<10), maxArchiveFileBytes)
++		for scanner.Scan() {
++			var record struct {
++				TaskID         string `json:"taskId"`
++				ReferenceToken string `json:"referenceToken"`
++				EventID        string `json:"eventId"`
++				Cause          string `json:"cause"`
++			}
++			if json.Unmarshal(scanner.Bytes(), &record) != nil {
++				continue
++			}
++			if record.TaskID != taskID ||
++				strings.TrimSpace(record.Cause) == "" {
++				continue
++			}
++			if _, ok := referenceTokens[record.ReferenceToken]; !ok {
++				continue
++			}
++			if _, ok := eventIDs[record.EventID]; !ok {
++				continue
++			}
++			return record.Cause, cleanName, record.EventID, nil
++		}
++		if scanner.Err() != nil {
++			return "", "", "", &ProtocolError{
++				OperationID: operationID,
++				Detail:      "archive log line exceeds size limit",
++			}
++		}
++	}
++	return "", "", "", &EvidenceError{TaskID: taskID}
++}
++
++func normalizeStatus(status string) string {
++	return strings.ReplaceAll(strings.ToUpper(strings.TrimSpace(status)), " ", "_")
+ }
+ 
+ func (c *Client) doJSON(
