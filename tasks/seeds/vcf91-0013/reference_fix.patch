@@ -1,0 +1,344 @@
+diff --git a/vcf_backup/__init__.py b/vcf_backup/__init__.py
+new file mode 100644
+index 0000000..0bab72b
+--- /dev/null
++++ b/vcf_backup/__init__.py
+@@ -0,0 +1,16 @@
++"""Stdlib client for VCF 9.1 backup-configuration task operations."""
++
++from .client import SddcManagerClient
++from .errors import ProtocolError, TaskFailedError, TaskTimeoutError, VcfApiError
++from .models import BackupConfigurationPatch, BackupLocation, Task
++
++__all__ = [
++    "BackupConfigurationPatch",
++    "BackupLocation",
++    "ProtocolError",
++    "SddcManagerClient",
++    "Task",
++    "TaskFailedError",
++    "TaskTimeoutError",
++    "VcfApiError",
++]
+diff --git a/vcf_backup/errors.py b/vcf_backup/errors.py
+new file mode 100644
+index 0000000..8707dec
+--- /dev/null
++++ b/vcf_backup/errors.py
+@@ -0,0 +1,39 @@
++"""Typed failures raised by the VCF backup client."""
++
++
++class VcfApiError(Exception):
++    """An HTTP failure carrying the decoded SDDC Manager Error envelope."""
++
++    def __init__(self, status_code, envelope):
++        self.status_code = status_code
++        self.envelope = envelope if isinstance(envelope, dict) else {}
++        self.error_code = self.envelope.get("errorCode")
++        self.message = self.envelope.get("message")
++        self.remediation_message = self.envelope.get("remediationMessage")
++        self.reference_token = self.envelope.get("referenceToken")
++        detail = self.message or "SDDC Manager request failed"
++        if self.error_code:
++            detail = f"{self.error_code}: {detail}"
++        super().__init__(f"HTTP {status_code}: {detail}")
++
++
++class ProtocolError(Exception):
++    """The service returned a response outside the pinned contract."""
++
++
++class TaskFailedError(Exception):
++    """The asynchronous operation reached a failed terminal state."""
++
++    def __init__(self, task):
++        self.task = task
++        super().__init__(f"task {task.id} reached {task.status}")
++
++
++class TaskTimeoutError(Exception):
++    """The task remained nonterminal for the complete poll budget."""
++
++    def __init__(self, task):
++        self.task = task
++        super().__init__(
++            f"task {task.id} was still {task.status} after the polling budget"
++        )
+diff --git a/vcf_backup/models.py b/vcf_backup/models.py
+new file mode 100644
+index 0000000..f88ded2
+--- /dev/null
++++ b/vcf_backup/models.py
+@@ -0,0 +1,102 @@
++"""Wire models for the two-operation SDDC Manager contract."""
++
++from __future__ import annotations
++
++import copy
++from dataclasses import dataclass
++from typing import Any
++
++
++def _required_string(name: str, value: str) -> str:
++    if not isinstance(value, str) or not value.strip():
++        raise ValueError(f"{name} must be a non-blank string")
++    return value
++
++
++def _without_none(value):
++    if isinstance(value, dict):
++        return {key: _without_none(item) for key, item in value.items() if item is not None}
++    if isinstance(value, list):
++        return [_without_none(item) for item in value]
++    return copy.deepcopy(value)
++
++
++@dataclass(frozen=True)
++class BackupLocation:
++    server: str
++    port: int
++    protocol: str
++    username: str
++    directory_path: str
++    password: str | None = None
++    ssh_fingerprint: str | None = None
++
++    def to_wire(self) -> dict[str, Any]:
++        if isinstance(self.port, bool) or not isinstance(self.port, int):
++            raise ValueError("port must be an integer")
++        if not 1 <= self.port <= 65535:
++            raise ValueError("port must be between 1 and 65535")
++        wire = {
++            "server": _required_string("server", self.server),
++            "port": self.port,
++            "protocol": _required_string("protocol", self.protocol),
++            "username": _required_string("username", self.username),
++        }
++        if self.password is not None:
++            wire["password"] = self.password
++        wire["directoryPath"] = _required_string(
++            "directory_path", self.directory_path
++        )
++        if self.ssh_fingerprint is not None:
++            wire["sshFingerprint"] = self.ssh_fingerprint
++        return wire
++
++
++@dataclass(frozen=True)
++class BackupConfigurationPatch:
++    encryption: dict[str, Any] | None = None
++    backup_locations: list[BackupLocation] | None = None
++    backup_schedules: list[dict[str, Any]] | None = None
++
++    def to_wire(self) -> dict[str, Any]:
++        wire: dict[str, Any] = {}
++        if self.encryption is not None:
++            wire["encryption"] = _without_none(self.encryption)
++        if self.backup_locations is not None:
++            wire["backupLocations"] = [
++                location.to_wire() for location in self.backup_locations
++            ]
++        if self.backup_schedules is not None:
++            wire["backupSchedules"] = _without_none(self.backup_schedules)
++        if not wire:
++            raise ValueError("at least one backup configuration field must be set")
++        return wire
++
++
++@dataclass(frozen=True)
++class Task:
++    id: str
++    name: str
++    status: str
++    creation_timestamp: str
++    raw: dict[str, Any]
++
++    @classmethod
++    def from_wire(cls, value: Any) -> "Task":
++        if not isinstance(value, dict):
++            raise ValueError("Task response must be a JSON object")
++        required = {
++            "id": value.get("id"),
++            "name": value.get("name"),
++            "status": value.get("status"),
++            "creationTimestamp": value.get("creationTimestamp"),
++        }
++        for name, field_value in required.items():
++            _required_string(f"Task.{name}", field_value)
++        return cls(
++            id=required["id"],
++            name=required["name"],
++            status=required["status"],
++            creation_timestamp=required["creationTimestamp"],
++            raw=copy.deepcopy(value),
++        )
+diff --git a/vcf_backup/client.py b/vcf_backup/client.py
+new file mode 100644
+index 0000000..4cc9eb0
+--- /dev/null
++++ b/vcf_backup/client.py
+@@ -0,0 +1,163 @@
++"""HTTP transport and asynchronous Task lifecycle for VCF backup settings."""
++
++from __future__ import annotations
++
++import json
++import time
++import urllib.error
++import urllib.parse
++import urllib.request
++
++from .errors import ProtocolError, TaskFailedError, TaskTimeoutError, VcfApiError
++from .models import BackupConfigurationPatch, Task
++
++NONTERMINAL_STATUSES = frozenset({"PENDING", "QUEUED", "IN_PROGRESS"})
++SUCCESSFUL_TERMINAL_STATUSES = frozenset(
++    {"SUCCESSFUL", "COMPLETED_WITH_WARNING", "SKIPPED"}
++)
++FAILED_TERMINAL_STATUSES = frozenset({"FAILED", "CANCELLED", "TIMED_OUT"})
++
++
++class SddcManagerClient:
++    """Bearer-authenticated client limited to the pinned two-operation surface."""
++
++    def __init__(
++        self,
++        base_url,
++        access_token,
++        *,
++        sleep=time.sleep,
++        poll_interval=1.0,
++        max_polls=60,
++        timeout=10.0,
++    ):
++        if not isinstance(base_url, str) or not base_url.strip():
++            raise ValueError("base_url must be a non-blank string")
++        parsed = urllib.parse.urlsplit(base_url)
++        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
++            raise ValueError("base_url must be an absolute HTTP(S) URL")
++        if parsed.query or parsed.fragment:
++            raise ValueError("base_url must not contain a query or fragment")
++        if not isinstance(access_token, str) or not access_token:
++            raise ValueError("access_token must not be empty")
++        if isinstance(max_polls, bool) or not isinstance(max_polls, int):
++            raise ValueError("max_polls must be an integer")
++        if max_polls < 1:
++            raise ValueError("max_polls must be at least 1")
++        if poll_interval < 0:
++            raise ValueError("poll_interval must not be negative")
++        if timeout <= 0:
++            raise ValueError("timeout must be positive")
++        if not callable(sleep):
++            raise ValueError("sleep must be callable")
++
++        self.base_url = base_url.rstrip("/")
++        self.access_token = access_token
++        self.sleep = sleep
++        self.poll_interval = poll_interval
++        self.max_polls = max_polls
++        self.timeout = timeout
++
++    def _request(self, method, path, *, body=None, expected_status):
++        headers = {
++            "Authorization": f"Bearer {self.access_token}",
++            "Accept": "application/json",
++        }
++        data = None
++        if body is not None:
++            data = json.dumps(
++                body, ensure_ascii=False, separators=(",", ":")
++            ).encode("utf-8")
++            headers["Content-Type"] = "application/json"
++        request = urllib.request.Request(
++            self.base_url + path,
++            data=data,
++            headers=headers,
++            method=method,
++        )
++        try:
++            with urllib.request.urlopen(request, timeout=self.timeout) as response:
++                status = response.status
++                raw = response.read()
++        except urllib.error.HTTPError as error:
++            raw = error.read()
++            raise self._api_error(error.code, raw) from None
++        except urllib.error.URLError as error:
++            raise ProtocolError(f"transport failed: {error.reason}") from error
++
++        payload = self._decode_json(raw)
++        if status != expected_status:
++            raise VcfApiError(status, payload)
++        return payload
++
++    @staticmethod
++    def _decode_json(raw):
++        if not raw:
++            raise ProtocolError("expected a JSON response body")
++        try:
++            value = json.loads(raw.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError) as error:
++            raise ProtocolError("response body is not valid UTF-8 JSON") from error
++        return value
++
++    @classmethod
++    def _api_error(cls, status, raw):
++        try:
++            envelope = json.loads(raw.decode("utf-8")) if raw else {}
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            envelope = {}
++        return VcfApiError(status, envelope)
++
++    def update_backup_configuration(
++        self, patch: BackupConfigurationPatch
++    ) -> Task:
++        if not isinstance(patch, BackupConfigurationPatch):
++            raise TypeError("patch must be a BackupConfigurationPatch")
++        payload = self._request(
++            "PATCH",
++            "/v1/system/backup-configuration",
++            body=patch.to_wire(),
++            expected_status=202,
++        )
++        try:
++            return Task.from_wire(payload)
++        except ValueError as error:
++            raise ProtocolError(str(error)) from error
++
++    def get_task(self, task_id: str) -> Task:
++        if not isinstance(task_id, str) or not task_id.strip():
++            raise ValueError("task_id must be a non-blank string")
++        encoded = urllib.parse.quote(task_id, safe="")
++        payload = self._request(
++            "GET", f"/v1/tasks/{encoded}", expected_status=200
++        )
++        try:
++            task = Task.from_wire(payload)
++        except ValueError as error:
++            raise ProtocolError(str(error)) from error
++        if task.id != task_id:
++            raise ProtocolError(
++                f"requested task {task_id!r} but response identified {task.id!r}"
++            )
++        return task
++
++    def wait_for_task(self, task_id: str) -> Task:
++        last_task = None
++        for poll_index in range(self.max_polls):
++            current = self.get_task(task_id)
++            last_task = current
++            if current.status in SUCCESSFUL_TERMINAL_STATUSES:
++                return current
++            if current.status in FAILED_TERMINAL_STATUSES:
++                raise TaskFailedError(current)
++            if current.status not in NONTERMINAL_STATUSES:
++                raise ProtocolError(f"unknown Task status: {current.status!r}")
++            if poll_index + 1 < self.max_polls:
++                self.sleep(self.poll_interval)
++        raise TaskTimeoutError(last_task)
++
++    def update_backup_and_wait(
++        self, patch: BackupConfigurationPatch
++    ) -> Task:
++        accepted = self.update_backup_configuration(patch)
++        return self.wait_for_task(accepted.id)
