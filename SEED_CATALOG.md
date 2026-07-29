@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3127 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3128 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -17,7 +17,7 @@
 | **Refactoring & performance** | 29 | Restructure safely and improve measured performance without behavior drift. |
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
-| **Uncategorized** | 37 | Catalog program awaiting description. |
+| **Uncategorized** | 38 | Catalog program awaiting description. |
 | **VMware Cloud Foundation 9.1** | 55 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
@@ -3683,6 +3683,7 @@
 - **vcf91-0079** (`java`) `#vcf-9-1` `#nsx-policy` `#java` `#rest-contract` `#spec-derived` — Implement `NsxPolicyClient.java`, a dependency-free single-file Java client for the two VCF 9.1 NSX Policy operations recorded in `docs/contract.json`: `PatchSegment` and `ReadIntentStatus`. Do not…
 - **vcf91-0080** (`java`) `#vcf-9-1` `#nsx-policy` `#java` `#rest-contract` `#spec-derived` — Finish the single-file Java NSX Policy client in src/NsxPolicyClient.java. The client must PATCH a Group using the VCF 9.1 Policy API contract in docs/contract.json, then survive a 401 on the follo…
 - **vcf91-0081** (`java`) `#vcf-9-1` `#nsx-policy` `#java` `#rest-contract` `#spec-derived` — Finish `NsxPolicyClient.java`, a dependency-free, single-file Java 17 client for the VCF 9.1 NSX Policy operation pinned in `docs/contract.json`. The contract is a focused extraction of `specificat…
+- **vcf91-0082** (`java`) `#vcf-9-1` `#nsx-policy` `#java` `#rest-contract` `#spec-derived` — Network-automation ticket. A provisioning worker must create or replace one NSX Policy infra segment, but an NSX Manager can commit the mutation and then return a transient 503. The current client…
 
 ## project-io
 
