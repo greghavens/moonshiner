@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3111 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3113 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 32 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 44 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 46 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -3667,6 +3667,8 @@
 - **vcf91-0060** (`python`) `#vcf-9-1` `#nsx-policy` `#python` `#rest-contract` `#spec-derived` — The network platform team needs a dependency-free VMware Cloud Foundation 9.1 NSX Policy client for an idempotent IP-group rollout. The current job successfully PATCHes a group, but when its access…
 - **vcf91-0061** (`python`) `#vcf-9-1` `#nsx-policy` `#python` `#rest-contract` `#spec-derived` — The network platform team needs a deterministic VMware Cloud Foundation 9.1 NSX Policy group inventory. Implement a standard-library-only Python package named `vcf_nsx_inventory`. Do not add third-…
 - **vcf91-0062** (`python`) `#vcf-9-1` `#nsx-policy` `#python` `#rest-contract` `#spec-derived` — A network rollout lost the HTTP response to an NSX Policy group write. The caller cannot tell whether the manager committed the write, so retrying with a collection-style create could duplicate the…
+- **vcf91-0063** (`python`) `#vcf-9-1` `#nsx-policy` `#python` `#rest-contract` `#spec-derived` — Implement `apply_firewall_change` in `nsx_partial_rollout/client.py` as a standard-library-only Python package for VMware Cloud Foundation 9.1 NSX Policy. Read the protected `docs/contract.json` an…
+- **vcf91-0064** (`python`) `#vcf-9-1` `#nsx-policy` `#python` `#rest-contract` `#spec-derived` — The network platform team needs a guarded VMware Cloud Foundation 9.1 NSX Policy change. Finish the stdlib-only Python package `nsx_tier1_guard` so a Tier-1 gateway description is PATCHed only afte…
 
 ## project-io
 

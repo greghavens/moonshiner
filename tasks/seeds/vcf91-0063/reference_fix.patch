@@ -1,0 +1,508 @@
+diff --git a/nsx_partial_rollout/client.py b/nsx_partial_rollout/client.py
+--- a/nsx_partial_rollout/client.py
++++ b/nsx_partial_rollout/client.py
+@@ -2,8 +2,389 @@
+ 
+ from __future__ import annotations
+ 
++import base64
++import json
++import math
++import os
++import tempfile
++from collections.abc import Mapping, Sequence
+ from os import PathLike
+-from typing import Any, Mapping
++from pathlib import Path
++from typing import Any
++from urllib.error import HTTPError, URLError
++from urllib.parse import SplitResult, quote, urlsplit
++from urllib.request import (
++    HTTPRedirectHandler,
++    ProxyHandler,
++    Request,
++    build_opener,
++)
++
++
++_BASE_PATH = "/policy/api/v1"
++_GROUP_PATH = "/infra/domains/{domain_id}/groups/{group_id}"
++_POLICY_PATH = (
++    "/infra/domains/{domain_id}/security-policies/{security_policy_id}"
++)
++_JSON_HEADERS = {
++    "Accept": "application/json",
++    "Content-Type": "application/json",
++}
++
++
++class _NoRedirectHandler(HTTPRedirectHandler):
++    def redirect_request(
++        self,
++        req: Request,
++        fp: Any,
++        code: int,
++        msg: str,
++        headers: Any,
++        newurl: str,
++    ) -> None:
++        del req, fp, code, msg, headers, newurl
++        return None
++
++
++class _HttpFailure(Exception):
++    def __init__(
++        self,
++        operation_id: str,
++        status: int,
++        envelope: object,
++    ) -> None:
++        self.operation_id = operation_id
++        self.status = status
++        self.envelope = envelope
++        super().__init__(f"{operation_id} failed with HTTP status {status}")
++
++
++def _validated_origin(base_url: str) -> str:
++    if not isinstance(base_url, str) or not base_url:
++        raise ValueError("base_url must be a non-empty HTTP(S) origin")
++    parts: SplitResult = urlsplit(base_url)
++    if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
++        raise ValueError("base_url must be a non-empty HTTP(S) origin")
++    if parts.username is not None or parts.password is not None:
++        raise ValueError("base_url must not contain credentials")
++    if parts.path not in {"", "/"} or parts.query or parts.fragment:
++        raise ValueError(
++            "base_url must not contain a non-root path, query, or fragment"
++        )
++    try:
++        parts.port
++    except ValueError:
++        raise ValueError("base_url contains an invalid port") from None
++    return f"{parts.scheme.lower()}://{parts.netloc}"
++
++
++def _nonblank(
++    name: str,
++    value: object,
++    *,
++    max_length: int | None = None,
++) -> str:
++    if not isinstance(value, str) or not value.strip():
++        raise ValueError(f"{name} must be a non-blank string")
++    if max_length is not None and len(value) > max_length:
++        raise ValueError(f"{name} must not exceed {max_length} characters")
++    return value
++
++
++def _optional_nonblank(
++    mapping: Mapping[str, Any],
++    key: str,
++    *,
++    max_length: int,
++) -> str | None:
++    value = mapping.get(key)
++    if value is None:
++        return None
++    return _nonblank(key, value, max_length=max_length)
++
++
++def _exact_mapping(
++    name: str,
++    value: object,
++    *,
++    required: set[str],
++    optional: set[str],
++) -> Mapping[str, Any]:
++    if not isinstance(value, Mapping):
++        raise TypeError(f"{name} must be a mapping")
++    if any(not isinstance(key, str) for key in value):
++        raise ValueError(f"{name} keys must be strings")
++    keys = set(value)
++    missing = required - keys
++    unknown = keys - required - optional
++    if missing:
++        raise ValueError(f"{name} is missing required fields")
++    if unknown:
++        raise ValueError(f"{name} contains unknown fields")
++    return value
++
++
++def _integer(
++    name: str,
++    value: object,
++    *,
++    minimum: int,
++    maximum: int,
++) -> int:
++    if (
++        isinstance(value, bool)
++        or not isinstance(value, int)
++        or not minimum <= value <= maximum
++    ):
++        raise ValueError(
++            f"{name} must be an integer from {minimum} through {maximum}"
++        )
++    return value
++
++
++def _build_bodies(
++    plan: Mapping[str, Any],
++    *,
++    domain_id: str,
++    group_id: str,
++) -> tuple[dict[str, Any], dict[str, Any]]:
++    root = _exact_mapping(
++        "plan",
++        plan,
++        required={"group", "policy"},
++        optional=set(),
++    )
++    group = _exact_mapping(
++        "plan.group",
++        root["group"],
++        required={"display_name", "ip_addresses"},
++        optional={"description"},
++    )
++    policy = _exact_mapping(
++        "plan.policy",
++        root["policy"],
++        required={
++            "display_name",
++            "rule_display_name",
++            "destination_group_path",
++            "sequence_number",
++            "rule_sequence_number",
++        },
++        optional={"description", "rule_notes"},
++    )
++
++    group_display_name = _nonblank(
++        "plan.group.display_name",
++        group["display_name"],
++        max_length=255,
++    )
++    addresses = group["ip_addresses"]
++    if (
++        isinstance(addresses, (str, bytes, bytearray))
++        or not isinstance(addresses, Sequence)
++        or not 1 <= len(addresses) <= 25000
++    ):
++        raise ValueError(
++            "plan.group.ip_addresses must contain 1 through 25000 strings"
++        )
++    projected_addresses = [
++        _nonblank(f"plan.group.ip_addresses[{index}]", address)
++        for index, address in enumerate(addresses)
++    ]
++    group_description = _optional_nonblank(
++        group,
++        "description",
++        max_length=1024,
++    )
++
++    policy_display_name = _nonblank(
++        "plan.policy.display_name",
++        policy["display_name"],
++        max_length=255,
++    )
++    rule_display_name = _nonblank(
++        "plan.policy.rule_display_name",
++        policy["rule_display_name"],
++        max_length=255,
++    )
++    destination_path = _nonblank(
++        "plan.policy.destination_group_path",
++        policy["destination_group_path"],
++    )
++    policy_sequence = _integer(
++        "plan.policy.sequence_number",
++        policy["sequence_number"],
++        minimum=0,
++        maximum=999999,
++    )
++    rule_sequence = _integer(
++        "plan.policy.rule_sequence_number",
++        policy["rule_sequence_number"],
++        minimum=0,
++        maximum=2**31 - 1,
++    )
++    policy_description = _optional_nonblank(
++        policy,
++        "description",
++        max_length=1024,
++    )
++    rule_notes = _optional_nonblank(
++        policy,
++        "rule_notes",
++        max_length=2048,
++    )
++
++    group_body: dict[str, Any] = {
++        "resource_type": "Group",
++        "display_name": group_display_name,
++        "expression": [
++            {
++                "resource_type": "IPAddressExpression",
++                "ip_addresses": projected_addresses,
++            }
++        ],
++    }
++    if group_description is not None:
++        group_body["description"] = group_description
++
++    source_path = f"/infra/domains/{domain_id}/groups/{group_id}"
++    rule: dict[str, Any] = {
++        "resource_type": "Rule",
++        "display_name": rule_display_name,
++        "sequence_number": rule_sequence,
++        "source_groups": [source_path],
++        "destination_groups": [destination_path],
++        "services": ["ANY"],
++        "scope": ["ANY"],
++        "action": "ALLOW",
++        "direction": "IN_OUT",
++    }
++    if rule_notes is not None:
++        rule["notes"] = rule_notes
++
++    policy_body: dict[str, Any] = {
++        "resource_type": "SecurityPolicy",
++        "display_name": policy_display_name,
++        "category": "Application",
++        "sequence_number": policy_sequence,
++        "stateful": True,
++        "rules": [rule],
++    }
++    if policy_description is not None:
++        policy_body["description"] = policy_description
++    return group_body, policy_body
++
++
++def _compact_json(value: Mapping[str, Any]) -> bytes:
++    return json.dumps(
++        value,
++        ensure_ascii=False,
++        separators=(",", ":"),
++    ).encode("utf-8")
++
++
++def _decode_error(body: bytes) -> object:
++    if not body:
++        return None
++    try:
++        return json.loads(body.decode("utf-8"))
++    except (UnicodeDecodeError, json.JSONDecodeError):
++        return None
++
++
++def _request(
++    opener: Any,
++    *,
++    origin: str,
++    operation_id: str,
++    path: str,
++    body: bytes,
++    authorization: str,
++    timeout: float,
++) -> None:
++    headers = dict(_JSON_HEADERS)
++    headers["Authorization"] = authorization
++    request = Request(
++        origin + _BASE_PATH + path,
++        data=body,
++        headers=headers,
++        method="PATCH",
++    )
++    try:
++        with opener.open(request, timeout=timeout) as response:
++            status = response.status
++            response.read()
++    except HTTPError as error:
++        try:
++            error_body = error.read()
++        except OSError:
++            error_body = b""
++        raise _HttpFailure(
++            operation_id,
++            error.code,
++            _decode_error(error_body),
++        ) from None
++    except (URLError, OSError):
++        raise RuntimeError(f"{operation_id} transport failed") from None
++    if status != 200:
++        raise _HttpFailure(operation_id, status, None)
++
++
++def _failed_step(
++    name: str,
++    operation_id: str,
++    failure: _HttpFailure,
++) -> dict[str, Any]:
++    step: dict[str, Any] = {
++        "name": name,
++        "operationId": operation_id,
++        "status": "failed",
++        "http_status": failure.status,
++    }
++    if isinstance(failure.envelope, dict):
++        error_code = failure.envelope.get("error_code")
++        if isinstance(error_code, int) and not isinstance(error_code, bool):
++            step["error_code"] = error_code
++    return step
++
++
++def _make_report(steps: list[dict[str, Any]]) -> dict[str, Any]:
++    succeeded = sum(step["status"] == "succeeded" for step in steps)
++    failed = sum(step["status"] == "failed" for step in steps)
++    if failed == 0:
++        status = "succeeded"
++    elif succeeded:
++        status = "partial_failure"
++    else:
++        status = "failed"
++    return {
++        "status": status,
++        "succeeded": succeeded,
++        "failed": failed,
++        "steps": steps,
++    }
++
++
++def _write_report(destination: Path, report: Mapping[str, Any]) -> None:
++    destination.parent.mkdir(parents=True, exist_ok=True)
++    encoded = _compact_json(report) + b"\n"
++    descriptor, temporary_name = tempfile.mkstemp(
++        prefix=f".{destination.name}.",
++        suffix=".tmp",
++        dir=destination.parent,
++    )
++    try:
++        with os.fdopen(descriptor, "wb") as temporary:
++            temporary.write(encoded)
++            temporary.flush()
++            os.fsync(temporary.fileno())
++        os.replace(temporary_name, destination)
++    except BaseException:
++        try:
++            os.unlink(temporary_name)
++        except FileNotFoundError:
++            pass
++        raise
+ 
+ 
+ def apply_firewall_change(
+@@ -20,4 +401,112 @@
+ ) -> dict[str, Any]:
+     """Apply the two-step change and return its deterministic outcome report."""
+ 
+-    raise NotImplementedError("implement the contract-pinned workflow")
++    origin = _validated_origin(base_url)
++    username = _nonblank("username", username)
++    if ":" in username:
++        raise ValueError("username must not contain ':'")
++    if not isinstance(password, str) or not password:
++        raise ValueError("password must be a non-empty string")
++    domain_id = _nonblank("domain_id", domain_id)
++    group_id = _nonblank("group_id", group_id)
++    security_policy_id = _nonblank(
++        "security_policy_id",
++        security_policy_id,
++    )
++    if (
++        isinstance(timeout, bool)
++        or not isinstance(timeout, (int, float))
++        or not math.isfinite(timeout)
++        or timeout <= 0
++    ):
++        raise ValueError("timeout must be a finite positive number")
++    try:
++        destination = Path(report_path)
++    except TypeError:
++        raise TypeError("report_path must be path-like") from None
++    if not destination.name:
++        raise ValueError("report_path must name a file")
++
++    group_body, policy_body = _build_bodies(
++        plan,
++        domain_id=domain_id,
++        group_id=group_id,
++    )
++    group_bytes = _compact_json(group_body)
++    policy_bytes = _compact_json(policy_body)
++    credentials = f"{username}:{password}".encode("utf-8")
++    authorization = (
++        "Basic " + base64.b64encode(credentials).decode("ascii")
++    )
++    encoded_domain = quote(domain_id, safe="")
++    group_path = _GROUP_PATH.format(
++        domain_id=encoded_domain,
++        group_id=quote(group_id, safe=""),
++    )
++    policy_path = _POLICY_PATH.format(
++        domain_id=encoded_domain,
++        security_policy_id=quote(security_policy_id, safe=""),
++    )
++    opener = build_opener(ProxyHandler({}), _NoRedirectHandler())
++
++    steps: list[dict[str, Any]] = []
++    try:
++        _request(
++            opener,
++            origin=origin,
++            operation_id="PatchGroupForDomain",
++            path=group_path,
++            body=group_bytes,
++            authorization=authorization,
++            timeout=float(timeout),
++        )
++    except _HttpFailure as failure:
++        steps.append(
++            _failed_step(
++                "source-group",
++                "PatchGroupForDomain",
++                failure,
++            )
++        )
++        report = _make_report(steps)
++        _write_report(destination, report)
++        return report
++    steps.append(
++        {
++            "name": "source-group",
++            "operationId": "PatchGroupForDomain",
++            "status": "succeeded",
++        }
++    )
++
++    try:
++        _request(
++            opener,
++            origin=origin,
++            operation_id="PatchSecurityPolicyForDomain",
++            path=policy_path,
++            body=policy_bytes,
++            authorization=authorization,
++            timeout=float(timeout),
++        )
++    except _HttpFailure as failure:
++        steps.append(
++            _failed_step(
++                "security-policy",
++                "PatchSecurityPolicyForDomain",
++                failure,
++            )
++        )
++        report = _make_report(steps)
++        _write_report(destination, report)
++        return report
++    steps.append(
++        {
++            "name": "security-policy",
++            "operationId": "PatchSecurityPolicyForDomain",
++            "status": "succeeded",
++        }
++    )
++    report = _make_report(steps)
++    _write_report(destination, report)
++    return report
