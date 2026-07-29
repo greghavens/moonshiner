@@ -1,0 +1,345 @@
+diff --git a/vcf91_change/client.py b/vcf91_change/client.py
+--- a/vcf91_change/client.py
++++ b/vcf91_change/client.py
+@@ -1,10 +1,238 @@
+ """VCF 9.1 SDDC Manager landing-zone change workflow."""
+ 
+ from __future__ import annotations
+ 
+-from os import PathLike
+-from typing import Any, Mapping
++import json
++import os
++import tempfile
++from collections.abc import Mapping
++from os import PathLike
++from pathlib import Path
++from typing import Any
++from urllib.error import HTTPError, URLError
++from urllib.parse import SplitResult, urlsplit
++from urllib.request import (
++    HTTPRedirectHandler,
++    ProxyHandler,
++    Request,
++    build_opener,
++)
++
++
++_JSON_HEADERS = {
++    "Accept": "application/json",
++    "Content-Type": "application/json",
++}
++
++
++class _NoRedirectHandler(HTTPRedirectHandler):
++    def redirect_request(
++        self,
++        req: Request,
++        fp: Any,
++        code: int,
++        msg: str,
++        headers: Any,
++        newurl: str,
++    ) -> None:
++        del req, fp, code, msg, headers, newurl
++        return None
++
++
++class _VcfHttpFailure(Exception):
++    def __init__(self, operation_id: str, status: int) -> None:
++        self.operation_id = operation_id
++        self.status = status
++        super().__init__(
++            f"{operation_id} failed with HTTP status {status}"
++        )
++
++
++def _validated_origin(service_root: str) -> str:
++    if not isinstance(service_root, str) or not service_root:
++        raise ValueError("service_root must be a non-empty HTTP(S) origin")
++    parts: SplitResult = urlsplit(service_root)
++    if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
++        raise ValueError("service_root must be a non-empty HTTP(S) origin")
++    if parts.username is not None or parts.password is not None:
++        raise ValueError("service_root must not contain credentials")
++    if parts.path not in {"", "/"} or parts.query or parts.fragment:
++        raise ValueError(
++            "service_root must not contain a non-root path, query, or fragment"
++        )
++    try:
++        parts.port
++    except ValueError:
++        raise ValueError("service_root contains an invalid port") from None
++    return f"{parts.scheme.lower()}://{parts.netloc}"
++
++
++def _validate_plan(
++    plan: Mapping[str, Any],
++) -> tuple[dict[str, Any], dict[str, Any]]:
++    if not isinstance(plan, Mapping):
++        raise TypeError("plan must be a mapping")
++
++    limit = plan.get("maxAllowedDomainsInSubscription")
++    if (
++        isinstance(limit, bool)
++        or not isinstance(limit, int)
++        or not -(2**31) <= limit <= 2**31 - 1
++    ):
++        raise ValueError(
++            "maxAllowedDomainsInSubscription must be an int32 integer"
++        )
++
++    proxy = plan.get("proxy")
++    if not isinstance(proxy, Mapping):
++        raise ValueError("plan.proxy must be a mapping")
++    enabled = proxy.get("isEnabled")
++    if not isinstance(enabled, bool):
++        raise ValueError("plan.proxy.isEnabled must be boolean")
++    host = proxy.get("host")
++    if not isinstance(host, str) or not host:
++        raise ValueError("plan.proxy.host must be a non-empty string")
++    port = proxy.get("port")
++    if (
++        isinstance(port, bool)
++        or not isinstance(port, int)
++        or not 1 <= port <= 65535
++    ):
++        raise ValueError("plan.proxy.port must be an integer from 1 to 65535")
++
++    proxy_body: dict[str, Any] = {
++        "isEnabled": enabled,
++        "host": host,
++        "port": port,
++    }
++
++    protocol = proxy.get("transferProtocol")
++    if protocol not in (None, ""):
++        if protocol not in {"HTTP", "HTTPS"}:
++            raise ValueError("transferProtocol must be HTTP or HTTPS")
++        proxy_body["transferProtocol"] = protocol
++
++    proxy_username = proxy.get("username")
++    proxy_password = proxy.get("password")
++    if proxy_username == "":
++        proxy_username = None
++    if proxy_password == "":
++        proxy_password = None
++    if proxy_username is not None and not isinstance(proxy_username, str):
++        raise ValueError("proxy username must be a string when supplied")
++    if proxy_password is not None and not isinstance(proxy_password, str):
++        raise ValueError("proxy password must be a string when supplied")
++    if (proxy_username is None) != (proxy_password is None):
++        raise ValueError("proxy username and password must be supplied together")
++    if proxy_username is not None:
++        proxy_body["username"] = proxy_username
++        proxy_body["password"] = proxy_password
++        proxy_body["isAuthenticated"] = True
++
++    return (
++        {"maxAllowedDomainsInSubscription": limit},
++        proxy_body,
++    )
++
++
++def _encode_json(body: Mapping[str, Any]) -> bytes:
++    return json.dumps(
++        body,
++        ensure_ascii=False,
++        separators=(",", ":"),
++    ).encode("utf-8")
++
++
++def _request(
++    opener: Any,
++    *,
++    origin: str,
++    operation_id: str,
++    method: str,
++    path: str,
++    body: Mapping[str, Any],
++    expected_status: int,
++    timeout: float,
++    access_token: str | None = None,
++) -> Any:
++    headers = dict(_JSON_HEADERS)
++    if access_token is not None:
++        headers["Authorization"] = f"Bearer {access_token}"
++    request = Request(
++        origin + path,
++        data=_encode_json(body),
++        headers=headers,
++        method=method,
++    )
++    try:
++        with opener.open(request, timeout=timeout) as response:
++            status = response.status
++            response_body = response.read()
++    except HTTPError as error:
++        try:
++            error.read(65536)
++        except OSError:
++            pass
++        raise _VcfHttpFailure(operation_id, error.code) from None
++    except (URLError, OSError):
++        raise RuntimeError(f"{operation_id} transport failed") from None
++
++    if status != expected_status:
++        raise _VcfHttpFailure(operation_id, status)
++    if not response_body:
++        return None
++    try:
++        return json.loads(response_body.decode("utf-8"))
++    except (UnicodeDecodeError, json.JSONDecodeError):
++        raise RuntimeError(
++            f"{operation_id} returned an invalid JSON response"
++        ) from None
++
++
++def _make_report(steps: list[dict[str, str]]) -> dict[str, Any]:
++    succeeded = sum(step["status"] == "succeeded" for step in steps)
++    failed = sum(step["status"] == "failed" for step in steps)
++    if failed == 0:
++        status = "succeeded"
++    elif succeeded:
++        status = "partial_failure"
++    else:
++        status = "failed"
++    return {
++        "status": status,
++        "succeeded": succeeded,
++        "failed": failed,
++        "steps": steps,
++    }
++
++
++def _write_report(
++    report_path: str | PathLike[str],
++    report: Mapping[str, Any],
++) -> None:
++    destination = Path(report_path)
++    destination.parent.mkdir(parents=True, exist_ok=True)
++    encoded = (
++        json.dumps(report, ensure_ascii=False, indent=2) + "\n"
++    ).encode("utf-8")
++    descriptor, temporary_name = tempfile.mkstemp(
++        prefix=f".{destination.name}.",
++        suffix=".tmp",
++        dir=destination.parent,
++    )
++    try:
++        with os.fdopen(descriptor, "wb") as temporary:
++            temporary.write(encoded)
++            temporary.flush()
++            os.fsync(temporary.fileno())
++        os.replace(temporary_name, destination)
++    except BaseException:
++        try:
++            os.unlink(temporary_name)
++        except FileNotFoundError:
++            pass
++        raise
+ 
+ 
+ def apply_landing_zone_change(
+     service_root: str,
+@@ -16,5 +244,99 @@ def apply_landing_zone_change(
+     timeout: float = 5.0,
+ ) -> dict[str, Any]:
+     """Apply the two-step change and return its deterministic outcome report."""
+ 
+-    raise NotImplementedError("implement the contract-pinned workflow")
++    origin = _validated_origin(service_root)
++    if not isinstance(username, str) or not username:
++        raise ValueError("username must be a non-empty string")
++    if not isinstance(password, str) or not password:
++        raise ValueError("password must be a non-empty string")
++    if (
++        isinstance(timeout, bool)
++        or not isinstance(timeout, (int, float))
++        or timeout <= 0
++    ):
++        raise ValueError("timeout must be a positive number")
++    system_body, proxy_body = _validate_plan(plan)
++
++    opener = build_opener(ProxyHandler({}), _NoRedirectHandler())
++    token_pair = _request(
++        opener,
++        origin=origin,
++        operation_id="createToken",
++        method="POST",
++        path="/v1/tokens",
++        body={"username": username, "password": password},
++        expected_status=201,
++        timeout=float(timeout),
++    )
++    if not isinstance(token_pair, dict):
++        raise RuntimeError("createToken returned an invalid token response")
++    access_token = token_pair.get("accessToken")
++    if not isinstance(access_token, str) or not access_token:
++        raise RuntimeError("createToken returned an empty access token")
++
++    steps: list[dict[str, str]] = []
++    try:
++        _request(
++            opener,
++            origin=origin,
++            operation_id="updateSystemConfiguration",
++            method="PATCH",
++            path="/v1/system",
++            body=system_body,
++            expected_status=200,
++            timeout=float(timeout),
++            access_token=access_token,
++        )
++    except _VcfHttpFailure:
++        steps.append(
++            {
++                "name": "subscription-domain-limit",
++                "operationId": "updateSystemConfiguration",
++                "status": "failed",
++            }
++        )
++        report = _make_report(steps)
++        _write_report(report_path, report)
++        return report
++    steps.append(
++        {
++            "name": "subscription-domain-limit",
++            "operationId": "updateSystemConfiguration",
++            "status": "succeeded",
++        }
++    )
++
++    try:
++        _request(
++            opener,
++            origin=origin,
++            operation_id="updateProxyConfiguration",
++            method="PATCH",
++            path="/v1/system/proxy-configuration",
++            body=proxy_body,
++            expected_status=202,
++            timeout=float(timeout),
++            access_token=access_token,
++        )
++    except _VcfHttpFailure:
++        steps.append(
++            {
++                "name": "outbound-proxy",
++                "operationId": "updateProxyConfiguration",
++                "status": "failed",
++            }
++        )
++        report = _make_report(steps)
++        _write_report(report_path, report)
++        return report
++    steps.append(
++        {
++            "name": "outbound-proxy",
++            "operationId": "updateProxyConfiguration",
++            "status": "succeeded",
++        }
++    )
++    report = _make_report(steps)
++    _write_report(report_path, report)
++    return report
