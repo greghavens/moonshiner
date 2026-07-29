@@ -1,0 +1,220 @@
+--- a/src/VcfVCenterAutomation/VcfVCenterAutomation.psm1
++++ b/src/VcfVCenterAutomation/VcfVCenterAutomation.psm1
+@@ -18,9 +18,120 @@
+         [switch] $SkipCertificateCheck
+     )
+ 
+-    throw [System.NotImplementedException]::new(
+-        'Create the contract-backed vCenter Automation API client.'
++    if ($PSCmdlet.ParameterSetName -eq 'Connection') {
++        $httpClient = $Connection.GetClient()
++        if ($null -eq $httpClient) {
++            throw 'The VMware PowerCLI connection did not provide an HttpClient.'
++        }
++
++        $baseUri = if ($PSBoundParameters.ContainsKey('Server')) {
++            $Server
++        }
++        else {
++            $Connection.ServerUri
++        }
++        if ($null -eq $baseUri) {
++            throw 'The VMware PowerCLI connection did not provide a server URI.'
++        }
++
++        return [pscustomobject]@{
++            PSTypeName = 'VcfVCenterAutomation.Client'
++            BaseUri    = [uri] $baseUri
++            HttpClient = $httpClient
++            OwnsClient = $false
++        }
++    }
++
++    $handler = [System.Net.Http.HttpClientHandler]::new()
++    if ($SkipCertificateCheck) {
++        $handler.ServerCertificateCustomValidationCallback = {
++            param($RequestMessage, $Certificate, $Chain, $SslPolicyErrors)
++            return $true
++        }
++    }
++
++    $httpClient = [System.Net.Http.HttpClient]::new($handler, $true)
++    $httpClient.DefaultRequestHeaders.Accept.Add(
++        [System.Net.Http.Headers.MediaTypeWithQualityHeaderValue]::new(
++            'application/json'
++        )
+     )
++    $null = $httpClient.DefaultRequestHeaders.TryAddWithoutValidation(
++        'vmware-api-session-id',
++        $SessionToken
++    )
++
++    [pscustomobject]@{
++        PSTypeName = 'VcfVCenterAutomation.Client'
++        BaseUri    = [uri] $Server
++        HttpClient = $httpClient
++        OwnsClient = $true
++    }
++}
++
++function Invoke-VcfVCenterRequest {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [psobject] $Client,
++
++        [Parameter(Mandatory)]
++        [ValidateSet('GET', 'POST')]
++        [string] $Method,
++
++        [Parameter(Mandatory)]
++        [ValidateNotNullOrEmpty()]
++        [string] $Target,
++
++        [System.Collections.IDictionary] $Body
++    )
++
++    if ($null -eq $Client.HttpClient -or $null -eq $Client.BaseUri) {
++        throw 'Client must be created by New-VcfVCenterClient.'
++    }
++
++    $baseText = $Client.BaseUri.AbsoluteUri.TrimEnd('/')
++    $uri = [uri] ($baseText + '/' + $Target.TrimStart('/'))
++    $request = [System.Net.Http.HttpRequestMessage]::new(
++        [System.Net.Http.HttpMethod]::new($Method),
++        $uri
++    )
++
++    if ($PSBoundParameters.ContainsKey('Body')) {
++        $json = $Body | ConvertTo-Json -Depth 20 -Compress
++        $request.Content = [System.Net.Http.StringContent]::new(
++            $json,
++            [System.Text.Encoding]::UTF8,
++            'application/json'
++        )
++    }
++
++    $response = $null
++    try {
++        $response = $Client.HttpClient.SendAsync($request).GetAwaiter().GetResult()
++        $responseText = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
++        if (-not $response.IsSuccessStatusCode) {
++            $message = 'vCenter Automation {0} {1} failed with HTTP {2} ({3})' -f
++                $Method,
++                $uri.PathAndQuery,
++                [int] $response.StatusCode,
++                $response.ReasonPhrase
++            if (-not [string]::IsNullOrWhiteSpace($responseText)) {
++                $message += ': ' + $responseText
++            }
++            throw $message
++        }
++
++        if (-not [string]::IsNullOrWhiteSpace($responseText)) {
++            return ($responseText | ConvertFrom-Json -Depth 100)
++        }
++    }
++    finally {
++        if ($null -ne $response) {
++            $response.Dispose()
++        }
++        $request.Dispose()
++    }
+ }
+ 
+ function Invoke-VcfVmClone {
+@@ -61,9 +172,91 @@
+         [int] $PollIntervalMilliseconds = 1000
+     )
+ 
+-    throw [System.NotImplementedException]::new(
+-        'Submit Vcenter.VM_clone$Task and poll Cis.Tasks_get to a terminal state.'
+-    )
++    $body = [ordered]@{
++        source = $SourceVm
++        name   = $Name
++    }
++
++    $placement = [ordered]@{}
++    $placementParameters = [ordered]@{
++        Folder       = 'folder'
++        ResourcePool = 'resource_pool'
++        Host         = 'host'
++        Cluster      = 'cluster'
++        Datastore    = 'datastore'
++    }
++    foreach ($parameter in $placementParameters.GetEnumerator()) {
++        if ($PSBoundParameters.ContainsKey($parameter.Key)) {
++            $placement[$parameter.Value] = Get-Variable `
++                -Name $parameter.Key `
++                -ValueOnly
++        }
++    }
++    if ($placement.Count -gt 0) {
++        $body['placement'] = $placement
++    }
++    if ($PSBoundParameters.ContainsKey('PowerOn')) {
++        $body['power_on'] = [bool] $PowerOn
++    }
++
++    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
++    $taskId = [string] (Invoke-VcfVCenterRequest `
++        -Client $Client `
++        -Method POST `
++        -Target '/api/vcenter/vm?action=clone&vmw-task=true' `
++        -Body $body)
++    if ([string]::IsNullOrWhiteSpace($taskId)) {
++        throw 'Vcenter.VM_clone$Task returned no task identifier.'
++    }
++
++    $pollCount = 0
++    $encodedTaskId = [uri]::EscapeDataString($taskId)
++    while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
++        $pollCount++
++        $task = Invoke-VcfVCenterRequest `
++            -Client $Client `
++            -Method GET `
++            -Target ('/api/cis/tasks/{0}' -f $encodedTaskId)
++        $status = [string] $task.status
++
++        switch ($status) {
++            'SUCCEEDED' {
++                $resultProperty = $task.PSObject.Properties['result']
++                return [pscustomobject]@{
++                    TaskId   = $taskId
++                    Status   = $status
++                    Result   = if ($null -ne $resultProperty) {
++                        $resultProperty.Value
++                    }
++                    else {
++                        $null
++                    }
++                    PollCount = $pollCount
++                }
++            }
++            'FAILED' {
++                $errorProperty = $task.PSObject.Properties['error']
++                $detail = if ($null -ne $errorProperty) {
++                    $errorProperty.Value | ConvertTo-Json -Depth 20 -Compress
++                }
++                else {
++                    'no error detail'
++                }
++                throw "vCenter clone task '$taskId' failed: $detail"
++            }
++            { $_ -in @('PENDING', 'RUNNING', 'BLOCKED') } {
++                if ($PollIntervalMilliseconds -gt 0) {
++                    Start-Sleep -Milliseconds $PollIntervalMilliseconds
++                }
++                continue
++            }
++            default {
++                throw "vCenter clone task '$taskId' returned unexpected status '$status'."
++            }
++        }
++    }
++
++    throw "Timed out waiting for vCenter clone task '$taskId'."
+ }
+ 
+ Export-ModuleMember -Function @(
