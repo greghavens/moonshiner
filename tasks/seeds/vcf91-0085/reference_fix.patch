@@ -1,0 +1,342 @@
+--- a/NsxPolicyClient.java
++++ b/NsxPolicyClient.java
+@@ -1,10 +1,24 @@
+ import java.io.IOException;
++import java.net.URI;
++import java.net.URISyntaxException;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
+ import java.time.Duration;
++import java.util.Base64;
++import java.util.Locale;
++import java.util.Objects;
++import java.util.concurrent.locks.ReentrantLock;
+ 
+ /**
+  * Complete this dependency-free VCF 9.1 NSX Policy client.
+  */
+ public final class NsxPolicyClient {
++    private static final String API_BASE_PATH = "/policy/api/v1";
++    private static final String LIST_TIER1_PATH = "/infra/tier-1s";
++    private static final char[] HEX = "0123456789ABCDEF".toCharArray();
++
+     public record Credentials(String username, String password) {
+     }
+ 
+@@ -61,20 +75,80 @@
+         }
+     }
+ 
++    private static final class CredentialState {
++        private final Credentials credential;
++        private final String authorization;
++        private final long generation;
++        private int inFlight;
++
++        private CredentialState(Credentials credential, long generation) {
++            this.credential = credential;
++            this.authorization = authorization(credential);
++            this.generation = generation;
++        }
++    }
++
++    private final String managerOrigin;
++    private final Duration requestTimeout;
++    private final HttpClient httpClient;
++    private final Object requestMonitor = new Object();
++    private final ReentrantLock rotationLock = new ReentrantLock();
++    private CredentialState current;
++
+     public NsxPolicyClient(
+             String managerBaseUrl,
+             Credentials initialCredentials,
+             Duration requestTimeout) {
+-        throw new UnsupportedOperationException("TODO");
++        this.managerOrigin = validateOrigin(managerBaseUrl);
++        Credentials checked = validateCredentials(initialCredentials);
++        this.requestTimeout = validateDuration(
++                "requestTimeout", requestTimeout);
++        this.httpClient = HttpClient.newBuilder()
++                .connectTimeout(requestTimeout)
++                .followRedirects(HttpClient.Redirect.NEVER)
++                .build();
++        this.current = new CredentialState(checked, 1);
+     }
+ 
+     public long credentialGeneration() {
+-        throw new UnsupportedOperationException("TODO");
++        synchronized (requestMonitor) {
++            return current.generation;
++        }
+     }
+ 
+     public String listTier1s(String cursor, Long pageSize)
+             throws IOException, InterruptedException {
+-        throw new UnsupportedOperationException("TODO");
++        String target = listTarget(cursor, pageSize);
++        CredentialState leased = acquire();
++        try {
++            HttpRequest request = HttpRequest.newBuilder(
++                            URI.create(
++                                    managerOrigin
++                                            + API_BASE_PATH
++                                            + target))
++                    .timeout(requestTimeout)
++                    .header("Authorization", leased.authorization)
++                    .header("Accept", "application/json")
++                    .GET()
++                    .build();
++            HttpResponse<String> response;
++            try {
++                response = httpClient.send(
++                        request,
++                        HttpResponse.BodyHandlers.ofString(
++                                StandardCharsets.UTF_8));
++            } catch (InterruptedException exception) {
++                Thread.currentThread().interrupt();
++                throw exception;
++            }
++            if (response.statusCode() != 200) {
++                throw new NsxPolicyException(
++                        response.statusCode(), response.body());
++            }
++            return response.body();
++        } finally {
++            release(leased);
++        }
+     }
+ 
+     public RotationResult rotateCredentials(
+@@ -82,6 +156,229 @@
+             Duration drainTimeout,
+             Runnable retireOld)
+             throws InterruptedException, RotationTimeoutException {
+-        throw new UnsupportedOperationException("TODO");
++        Credentials checked = validateCredentials(replacement);
++        Duration timeout = validateDuration("drainTimeout", drainTimeout);
++        Objects.requireNonNull(retireOld, "retireOld");
++
++        try {
++            rotationLock.lockInterruptibly();
++            try {
++                CredentialState previous;
++                CredentialState next;
++                synchronized (requestMonitor) {
++                    previous = current;
++                    if (sameCredential(previous.credential, checked)) {
++                        throw new IllegalArgumentException(
++                                "replacement credentials must differ");
++                    }
++                    next = new CredentialState(
++                            checked, previous.generation + 1);
++                    current = next;
++                }
++
++                waitForDrain(previous, next, timeout);
++                retireOld.run();
++                return new RotationResult(
++                        previous.generation, next.generation, true);
++            } finally {
++                rotationLock.unlock();
++            }
++        } catch (InterruptedException exception) {
++            Thread.currentThread().interrupt();
++            throw exception;
++        }
++    }
++
++    private CredentialState acquire() {
++        synchronized (requestMonitor) {
++            CredentialState leased = current;
++            leased.inFlight++;
++            return leased;
++        }
++    }
++
++    private void release(CredentialState leased) {
++        synchronized (requestMonitor) {
++            if (leased.inFlight <= 0) {
++                throw new IllegalStateException("credential lease underflow");
++            }
++            leased.inFlight--;
++            requestMonitor.notifyAll();
++        }
++    }
++
++    private void waitForDrain(
++            CredentialState previous,
++            CredentialState next,
++            Duration timeout)
++            throws InterruptedException, RotationTimeoutException {
++        long timeoutNanos;
++        try {
++            timeoutNanos = timeout.toNanos();
++        } catch (ArithmeticException tooLarge) {
++            timeoutNanos = Long.MAX_VALUE;
++        }
++        long started = System.nanoTime();
++        synchronized (requestMonitor) {
++            while (previous.inFlight > 0) {
++                long elapsed = System.nanoTime() - started;
++                long remaining = timeoutNanos - elapsed;
++                if (remaining <= 0) {
++                    throw new RotationTimeoutException(
++                            previous.generation,
++                            next.generation,
++                            previous.inFlight);
++                }
++                long millis = remaining / 1_000_000L;
++                int nanos = (int) (remaining % 1_000_000L);
++                requestMonitor.wait(millis, nanos);
++            }
++        }
++    }
++
++    private static String validateOrigin(String raw) {
++        if (raw == null
++                || raw.isEmpty()
++                || !raw.equals(raw.trim())) {
++            throw new IllegalArgumentException(
++                    "managerBaseUrl must be an HTTP(S) origin");
++        }
++        URI uri;
++        try {
++            uri = new URI(raw);
++        } catch (URISyntaxException exception) {
++            throw new IllegalArgumentException(
++                    "managerBaseUrl must be an HTTP(S) origin");
++        }
++        String scheme = uri.getScheme();
++        String path = uri.getRawPath();
++        if (uri.isOpaque()
++                || scheme == null
++                || (!scheme.equalsIgnoreCase("http")
++                && !scheme.equalsIgnoreCase("https"))
++                || uri.getHost() == null
++                || uri.getRawAuthority() == null
++                || uri.getRawUserInfo() != null
++                || uri.getRawQuery() != null
++                || uri.getRawFragment() != null
++                || (path != null && !path.isEmpty() && !path.equals("/"))) {
++            throw new IllegalArgumentException(
++                    "managerBaseUrl must be an HTTP(S) origin");
++        }
++        return scheme.toLowerCase(Locale.ROOT)
++                + "://"
++                + uri.getRawAuthority();
++    }
++
++    private static Credentials validateCredentials(Credentials credential) {
++        Objects.requireNonNull(credential, "credentials");
++        String username = credential.username();
++        String password = credential.password();
++        if (username == null || username.isBlank()) {
++            throw new IllegalArgumentException(
++                    "username must be non-blank");
++        }
++        if (username.indexOf(':') >= 0) {
++            throw new IllegalArgumentException(
++                    "username must not contain ':'");
++        }
++        if (password == null || password.isBlank()) {
++            throw new IllegalArgumentException(
++                    "password must be non-blank");
++        }
++        return credential;
++    }
++
++    private static Duration validateDuration(String name, Duration value) {
++        Objects.requireNonNull(value, name);
++        if (value.isZero() || value.isNegative()) {
++            throw new IllegalArgumentException(name + " must be positive");
++        }
++        return value;
++    }
++
++    private static boolean sameCredential(
++            Credentials left, Credentials right) {
++        return left.username().equals(right.username())
++                && left.password().equals(right.password());
++    }
++
++    private static String authorization(Credentials credential) {
++        String plain = credential.username() + ":" + credential.password();
++        return "Basic " + Base64.getEncoder().encodeToString(
++                plain.getBytes(StandardCharsets.UTF_8));
++    }
++
++    private static String listTarget(String cursor, Long pageSize) {
++        StringBuilder query = new StringBuilder();
++        if (cursor != null) {
++            if (cursor.isBlank()) {
++                throw new IllegalArgumentException(
++                        "cursor must be non-blank when set");
++            }
++            requireWellFormedUnicode(cursor);
++            appendQuery(query, "cursor", cursor);
++        }
++        if (pageSize != null) {
++            if (pageSize < 0 || pageSize > 1000) {
++                throw new IllegalArgumentException(
++                        "pageSize must be between 0 and 1000");
++            }
++            appendQuery(query, "page_size", Long.toString(pageSize));
++        }
++        if (query.isEmpty()) {
++            return LIST_TIER1_PATH;
++        }
++        return LIST_TIER1_PATH + "?" + query;
++    }
++
++    private static void appendQuery(
++            StringBuilder query, String name, String value) {
++        if (!query.isEmpty()) {
++            query.append('&');
++        }
++        query.append(encodeComponent(name))
++                .append('=')
++                .append(encodeComponent(value));
++    }
++
++    private static String encodeComponent(String value) {
++        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
++        StringBuilder result = new StringBuilder(bytes.length);
++        for (byte item : bytes) {
++            int unsigned = item & 0xff;
++            if ((unsigned >= 'a' && unsigned <= 'z')
++                    || (unsigned >= 'A' && unsigned <= 'Z')
++                    || (unsigned >= '0' && unsigned <= '9')
++                    || unsigned == '-'
++                    || unsigned == '.'
++                    || unsigned == '_'
++                    || unsigned == '~') {
++                result.append((char) unsigned);
++            } else {
++                result.append('%')
++                        .append(HEX[unsigned >>> 4])
++                        .append(HEX[unsigned & 0x0f]);
++            }
++        }
++        return result.toString();
++    }
++
++    private static void requireWellFormedUnicode(String value) {
++        for (int index = 0; index < value.length(); index++) {
++            char current = value.charAt(index);
++            if (Character.isHighSurrogate(current)) {
++                if (index + 1 >= value.length()
++                        || !Character.isLowSurrogate(
++                                value.charAt(index + 1))) {
++                    throw new IllegalArgumentException(
++                            "cursor must contain well-formed Unicode");
++                }
++                index++;
++            } else if (Character.isLowSurrogate(current)) {
++                throw new IllegalArgumentException(
++                        "cursor must contain well-formed Unicode");
++            }
++        }
+     }
+ }
