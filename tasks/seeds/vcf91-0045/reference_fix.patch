@@ -1,0 +1,383 @@
+--- a/VcfHostRefreshClient.java
++++ b/VcfHostRefreshClient.java
+@@ -1,18 +1,38 @@
+ import java.io.IOException;
+ import java.net.URI;
+ import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
+ import java.time.Duration;
+ import java.util.ArrayList;
++import java.util.Comparator;
+ import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Locale;
+ import java.util.Map;
+ import java.util.Objects;
++import java.util.Set;
+ 
+ /**
+  * Minimal Java 17 client for the VCF 9.1 SDDC Manager operations projected in
+  * docs/contract.json.
+  */
+ public final class VcfHostRefreshClient {
++    private static final char[] HEX = "0123456789ABCDEF".toCharArray();
++    private static final Set<String> CONTINUING = Set.of(
++            "PENDING",
++            "IN_PROGRESS",
++            "QUEUED");
++    private static final Set<String> SUCCESSFUL = Set.of(
++            "SUCCESSFUL",
++            "COMPLETED_WITH_WARNING",
++            "SKIPPED");
++    private static final Set<String> FAILED = Set.of(
++            "FAILED",
++            "CANCELLED",
++            "TIMED_OUT");
++
+     private final URI baseUri;
+     private final String accessToken;
+     private final Duration requestTimeout;
+@@ -46,8 +66,29 @@
+         this.baseUri = Objects.requireNonNull(baseUri, "baseUri");
+         this.accessToken = Objects.requireNonNull(accessToken, "accessToken");
+         this.requestTimeout = Objects.requireNonNull(requestTimeout, "requestTimeout");
++        String scheme = baseUri.getScheme();
++        String path = baseUri.getRawPath();
++        if (baseUri.isOpaque()
++                || scheme == null
++                || (!scheme.equalsIgnoreCase("http")
++                        && !scheme.equalsIgnoreCase("https"))
++                || baseUri.getHost() == null
++                || baseUri.getUserInfo() != null
++                || baseUri.getRawQuery() != null
++                || baseUri.getRawFragment() != null
++                || (path != null && !path.isEmpty() && !path.equals("/"))) {
++            throw new IllegalArgumentException("baseUri must be an HTTP(S) origin");
++        }
++        if (!isSafeBearer(accessToken)) {
++            throw new IllegalArgumentException(
++                    "accessToken must be a safe non-blank header value");
++        }
++        if (requestTimeout.isZero() || requestTimeout.isNegative()) {
++            throw new IllegalArgumentException("requestTimeout must be positive");
++        }
+         this.http = HttpClient.newBuilder()
+                 .connectTimeout(requestTimeout)
++                .followRedirects(HttpClient.Redirect.NEVER)
+                 .build();
+     }
+ 
+@@ -59,8 +100,309 @@
+             RefreshRequest request,
+             int maxPolls,
+             Duration pollInterval) throws IOException, InterruptedException {
+-        // TODO: implement updateHosts, terminal getTask polling, and sorted getHosts.
+-        throw new UnsupportedOperationException("Not implemented");
++        validateCall(request, maxPolls, pollInterval);
++
++        HttpRequest update = request("/v1/hosts")
++                .header("Content-Type", "application/json")
++                .method(
++                        "PATCH",
++                        HttpRequest.BodyPublishers.ofString(
++                                updateBody(request),
++                                StandardCharsets.UTF_8))
++                .build();
++        HttpResponse<String> updateResponse = send(update, "updateHosts");
++        requireSuccess(updateResponse, 202, "updateHosts");
++        Task accepted = parseTask(updateResponse.body(), "updateHosts");
++
++        Task current = null;
++        for (int poll = 0; poll < maxPolls; poll++) {
++            if (poll > 0) {
++                sleep(pollInterval);
++            }
++            current = getTask(accepted.id());
++            if (!current.id().equals(accepted.id())) {
++                throw new IOException("getTask changed task identity");
++            }
++
++            String status = normalizeStatus(current.status());
++            if (CONTINUING.contains(status)) {
++                continue;
++            }
++            if (SUCCESSFUL.contains(status)) {
++                return new RefreshResult(current, getHosts());
++            }
++            if (FAILED.contains(status)) {
++                throw new IOException("getTask reached a failed terminal status");
++            }
++            throw new IOException("getTask returned an unknown task status");
++        }
++        throw new IOException("getTask exhausted maxPolls before a terminal state");
++    }
++
++    private Task getTask(String taskId) throws IOException, InterruptedException {
++        HttpRequest request = request("/v1/tasks/" + encodePathSegment(taskId))
++                .GET()
++                .build();
++        HttpResponse<String> response = send(request, "getTask");
++        requireSuccess(response, 200, "getTask");
++        return parseTask(response.body(), "getTask");
++    }
++
++    private List<Host> getHosts() throws IOException, InterruptedException {
++        HttpRequest request = request("/v1/hosts")
++                .GET()
++                .build();
++        HttpResponse<String> response = send(request, "getHosts");
++        requireSuccess(response, 200, "getHosts");
++
++        Map<String, Object> page = jsonObject(response.body(), "getHosts");
++        Object elementsValue = page.get("elements");
++        if (!(elementsValue instanceof List<?> elements)) {
++            throw new IOException("getHosts returned malformed JSON");
++        }
++        ArrayList<Host> hosts = new ArrayList<>(elements.size());
++        for (Object element : elements) {
++            if (!(element instanceof Map<?, ?> rawHost)) {
++                throw new IOException("getHosts returned malformed JSON");
++            }
++            Map<String, Object> host = stringMap(rawHost, "getHosts");
++            hosts.add(new Host(
++                    requiredString(host, "id", "getHosts"),
++                    requiredString(host, "fqdn", "getHosts"),
++                    requiredString(host, "status", "getHosts")));
++        }
++        hosts.sort(Comparator.comparing(Host::fqdn).thenComparing(Host::id));
++        return List.copyOf(hosts);
++    }
++
++    private HttpRequest.Builder request(String path) {
++        return HttpRequest.newBuilder(baseUri.resolve(path))
++                .timeout(requestTimeout)
++                .header("Accept", "application/json")
++                .header("Authorization", "Bearer " + accessToken);
++    }
++
++    private HttpResponse<String> send(
++            HttpRequest request,
++            String operation) throws IOException, InterruptedException {
++        try {
++            return http.send(
++                    request,
++                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++        } catch (IOException transport) {
++            throw new IOException(operation + " transport failure");
++        }
++    }
++
++    private static void validateCall(
++            RefreshRequest request,
++            int maxPolls,
++            Duration pollInterval) {
++        Objects.requireNonNull(request, "request");
++        List<String> hostIds = Objects.requireNonNull(
++                request.hostIds(),
++                "request.hostIds");
++        Objects.requireNonNull(pollInterval, "pollInterval");
++        if (hostIds.isEmpty() || hostIds.size() > 100) {
++            throw new IllegalArgumentException("hostIds must contain 1 through 100 values");
++        }
++        for (String hostId : hostIds) {
++            if (hostId == null
++                    || hostId.isBlank()
++                    || !hostId.equals(hostId.trim())) {
++                throw new IllegalArgumentException(
++                        "hostIds must be non-blank without surrounding whitespace");
++            }
++        }
++        if (maxPolls <= 0) {
++            throw new IllegalArgumentException("maxPolls must be positive");
++        }
++        if (pollInterval.isNegative()) {
++            throw new IllegalArgumentException("pollInterval must not be negative");
++        }
++    }
++
++    private static String updateBody(RefreshRequest request) {
++        StringBuilder json = new StringBuilder("{\"hostIds\":[");
++        for (int index = 0; index < request.hostIds().size(); index++) {
++            if (index > 0) {
++                json.append(',');
++            }
++            json.append(jsonString(request.hostIds().get(index)));
++        }
++        json.append(']');
++        if (request.forceRefresh() != null) {
++            json.append(",\"hostsRefreshSpec\":{\"forceRefresh\":")
++                    .append(request.forceRefresh())
++                    .append('}');
++        }
++        return json.append('}').toString();
++    }
++
++    private static String jsonString(String value) {
++        StringBuilder encoded = new StringBuilder(value.length() + 2).append('"');
++        for (int index = 0; index < value.length(); index++) {
++            char current = value.charAt(index);
++            switch (current) {
++                case '"' -> encoded.append("\\\"");
++                case '\\' -> encoded.append("\\\\");
++                case '\b' -> encoded.append("\\b");
++                case '\f' -> encoded.append("\\f");
++                case '\n' -> encoded.append("\\n");
++                case '\r' -> encoded.append("\\r");
++                case '\t' -> encoded.append("\\t");
++                default -> {
++                    if (current < 0x20) {
++                        encoded.append("\\u");
++                        encoded.append(HEX[(current >>> 12) & 0xf]);
++                        encoded.append(HEX[(current >>> 8) & 0xf]);
++                        encoded.append(HEX[(current >>> 4) & 0xf]);
++                        encoded.append(HEX[current & 0xf]);
++                    } else {
++                        encoded.append(current);
++                    }
++                }
++            }
++        }
++        return encoded.append('"').toString();
++    }
++
++    private static String encodePathSegment(String value) {
++        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
++        StringBuilder encoded = new StringBuilder(bytes.length);
++        for (byte item : bytes) {
++            int current = item & 0xff;
++            if ((current >= 'a' && current <= 'z')
++                    || (current >= 'A' && current <= 'Z')
++                    || (current >= '0' && current <= '9')
++                    || current == '-'
++                    || current == '.'
++                    || current == '_'
++                    || current == '~') {
++                encoded.append((char) current);
++            } else {
++                encoded.append('%')
++                        .append(HEX[current >>> 4])
++                        .append(HEX[current & 0xf]);
++            }
++        }
++        return encoded.toString();
++    }
++
++    private static Task parseTask(String body, String operation) throws IOException {
++        Map<String, Object> task = jsonObject(body, operation);
++        return new Task(
++                requiredString(task, "id", operation),
++                requiredString(task, "name", operation),
++                requiredString(task, "status", operation),
++                requiredString(task, "creationTimestamp", operation),
++                optionalString(task, "completionTimestamp", operation));
++    }
++
++    private static Map<String, Object> jsonObject(
++            String body,
++            String operation) throws IOException {
++        Object parsed;
++        try {
++            parsed = parseJson(body);
++        } catch (IOException malformed) {
++            throw new IOException(operation + " returned malformed JSON");
++        }
++        if (!(parsed instanceof Map<?, ?> raw)) {
++            throw new IOException(operation + " returned malformed JSON");
++        }
++        return stringMap(raw, operation);
++    }
++
++    private static Map<String, Object> stringMap(
++            Map<?, ?> raw,
++            String operation) throws IOException {
++        LinkedHashMap<String, Object> result = new LinkedHashMap<>();
++        for (Map.Entry<?, ?> entry : raw.entrySet()) {
++            if (!(entry.getKey() instanceof String key)) {
++                throw new IOException(operation + " returned malformed JSON");
++            }
++            result.put(key, entry.getValue());
++        }
++        return result;
++    }
++
++    private static String requiredString(
++            Map<String, Object> object,
++            String field,
++            String operation) throws IOException {
++        Object value = object.get(field);
++        if (!(value instanceof String string) || string.isBlank()) {
++            throw new IOException(operation + " returned malformed JSON");
++        }
++        return string;
++    }
++
++    private static String optionalString(
++            Map<String, Object> object,
++            String field,
++            String operation) throws IOException {
++        Object value = object.get(field);
++        if (value == null) {
++            return null;
++        }
++        if (!(value instanceof String string)) {
++            throw new IOException(operation + " returned malformed JSON");
++        }
++        return string;
++    }
++
++    private static void requireSuccess(
++            HttpResponse<String> response,
++            int expectedStatus,
++            String operation) throws IOException {
++        if (response.statusCode() != expectedStatus) {
++            throw new IOException(
++                    operation + " returned HTTP " + response.statusCode());
++        }
++        String contentType = response.headers()
++                .firstValue("Content-Type")
++                .orElse("");
++        int separator = contentType.indexOf(';');
++        String mediaType = separator < 0
++                ? contentType.trim()
++                : contentType.substring(0, separator).trim();
++        if (!mediaType.equalsIgnoreCase("application/json")) {
++            throw new IOException(operation + " returned an unexpected media type");
++        }
++    }
++
++    private static String normalizeStatus(String status) {
++        return status.trim()
++                .toUpperCase(Locale.ROOT)
++                .replace(' ', '_');
++    }
++
++    private static boolean isSafeBearer(String token) {
++        if (token.isBlank()) {
++            return false;
++        }
++        for (int index = 0; index < token.length(); index++) {
++            char current = token.charAt(index);
++            if (current <= 0x20 || current == 0x7f) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    private static void sleep(Duration duration) throws InterruptedException {
++        if (duration.isZero()) {
++            return;
++        }
++        long milliseconds;
++        try {
++            milliseconds = duration.toMillis();
++        } catch (ArithmeticException tooLarge) {
++            milliseconds = Long.MAX_VALUE;
++        }
++        int nanoseconds = duration.toNanosPart() % 1_000_000;
++        Thread.sleep(milliseconds, nanoseconds);
+     }
+ 
+     /**
