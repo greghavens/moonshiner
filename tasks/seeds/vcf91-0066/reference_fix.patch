@@ -1,0 +1,283 @@
+diff --git a/nsx_idfw_evidence/__init__.py b/nsx_idfw_evidence/__init__.py
+--- a/nsx_idfw_evidence/__init__.py
++++ b/nsx_idfw_evidence/__init__.py
+@@ -1,3 +1,276 @@
+-"""Complete the stdlib-only NSX IDFW evidence client described by the task."""
+-
+-# TODO: implement the public API in this module.
++"""Collect evidence for NSX Identity Firewall event-log ingestion failures."""
++
++from __future__ import annotations
++
++import base64
++import http.client
++import json
++import math
++import urllib.error
++import urllib.parse
++import urllib.request
++from dataclasses import dataclass
++from typing import Any
++
++
++__all__ = [
++    "FailureEvidence",
++    "NsxApiError",
++    "NsxPolicyClient",
++    "ProtocolError",
++]
++
++_BASE_PATH = "/policy/api/v1"
++_COLLECTOR_PATH = (
++    "/infra/identity-firewall-stores/{store_id}"
++    "/event-log-servers/{server_id}"
++)
++_EVENTS_PATH = "/infra/settings/firewall/idfw/user-stats/{user_id}"
++
++
++def _nonblank(name: str, value: object) -> str:
++    if not isinstance(value, str) or not value.strip():
++        raise ValueError(f"{name} must be a non-blank string")
++    return value
++
++
++def _segment(name: str, value: object) -> str:
++    return urllib.parse.quote(_nonblank(name, value), safe="")
++
++
++class ProtocolError(Exception):
++    """The NSX response did not satisfy the pinned contract."""
++
++
++class NsxApiError(Exception):
++    """An HTTP failure carrying the decoded NSX ApiError envelope."""
++
++    def __init__(self, status_code: int, envelope: Any):
++        self.status_code = status_code
++        self.envelope = envelope
++        fields = envelope if isinstance(envelope, dict) else {}
++        self.error_code = fields.get("error_code")
++        self.error_message = fields.get("error_message")
++        self.module_name = fields.get("module_name")
++        self.details = fields.get("details")
++        super().__init__(f"NSX Policy request failed with HTTP {status_code}")
++
++
++@dataclass(frozen=True)
++class FailureEvidence:
++    """Evidence returned by the two-operation IDFW diagnostic workflow."""
++
++    identity_firewall_store_id: str
++    event_log_server_id: str
++    user_id: str
++    collector: dict[str, Any]
++    relevant_login_events: tuple[dict[str, Any], ...]
++    evidence_message: str | None
++
++
++class _NoRedirect(urllib.request.HTTPRedirectHandler):
++    def redirect_request(
++        self,
++        req: urllib.request.Request,
++        fp: Any,
++        code: int,
++        msg: str,
++        headers: Any,
++        newurl: str,
++    ) -> None:
++        return None
++
++
++class NsxPolicyClient:
++    """Client restricted to the two contract-pinned IDFW evidence reads."""
++
++    def __init__(
++        self,
++        base_url: str,
++        username: str,
++        password: str,
++        *,
++        timeout: float = 5.0,
++    ):
++        if not isinstance(base_url, str) or not base_url.strip():
++            raise ValueError("base_url must be a non-blank string")
++        try:
++            parsed = urllib.parse.urlsplit(base_url)
++            hostname = parsed.hostname
++            parsed.port
++        except ValueError as error:
++            raise ValueError(
++                "base_url must contain a valid HTTP(S) origin"
++            ) from error
++        if (
++            parsed.scheme not in {"http", "https"}
++            or not parsed.netloc
++            or hostname is None
++            or parsed.username is not None
++            or parsed.password is not None
++            or parsed.path not in {"", "/"}
++            or parsed.query
++            or parsed.fragment
++        ):
++            raise ValueError(
++                "base_url must be an HTTP(S) origin without credentials"
++            )
++
++        username_value = _nonblank("username", username)
++        if ":" in username_value:
++            raise ValueError("username must not contain ':'")
++        password_value = _nonblank("password", password)
++        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
++            raise TypeError("timeout must be a number")
++        timeout_value = float(timeout)
++        if timeout_value <= 0 or not math.isfinite(timeout_value):
++            raise ValueError("timeout must be positive and finite")
++
++        credentials = f"{username_value}:{password_value}".encode("utf-8")
++        self._authorization = (
++            "Basic " + base64.b64encode(credentials).decode("ascii")
++        )
++        self._base_url = base_url.rstrip("/")
++        self._timeout = timeout_value
++        self._opener = urllib.request.build_opener(
++            urllib.request.ProxyHandler({}),
++            _NoRedirect(),
++        )
++
++    @staticmethod
++    def _decode_success(data: bytes, operation_id: str) -> dict[str, Any]:
++        try:
++            value = json.loads(data.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError) as error:
++            raise ProtocolError(
++                f"{operation_id} response was not UTF-8 JSON"
++            ) from error
++        if not isinstance(value, dict):
++            raise ProtocolError(f"{operation_id} response must be an object")
++        return value
++
++    @staticmethod
++    def _decode_error(data: bytes) -> Any:
++        if not data:
++            return None
++        try:
++            return json.loads(data.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            return None
++
++    def _get(self, operation_id: str, target: str) -> dict[str, Any]:
++        request = urllib.request.Request(
++            self._base_url + _BASE_PATH + target,
++            method="GET",
++            headers={
++                "Authorization": self._authorization,
++                "Accept": "application/json",
++            },
++        )
++        try:
++            with self._opener.open(request, timeout=self._timeout) as response:
++                status = response.status
++                body = response.read()
++        except urllib.error.HTTPError as error:
++            status = error.code
++            try:
++                body = error.read()
++            except (http.client.HTTPException, OSError) as read_error:
++                raise ProtocolError(
++                    f"{operation_id} error response was interrupted"
++                ) from read_error
++        except (
++            urllib.error.URLError,
++            http.client.HTTPException,
++            OSError,
++        ) as error:
++            raise ProtocolError(
++                f"{operation_id} failed before a complete HTTP response"
++            ) from error
++
++        if status != 200:
++            raise NsxApiError(status, self._decode_error(body))
++        return self._decode_success(body, operation_id)
++
++    def collect_failure_evidence(
++        self,
++        identity_firewall_store_id: str,
++        event_log_server_id: str,
++        user_id: str,
++        *,
++        enforcement_point_path: str | None = None,
++    ) -> FailureEvidence:
++        encoded_store = _segment(
++            "identity_firewall_store_id", identity_firewall_store_id
++        )
++        encoded_server = _segment("event_log_server_id", event_log_server_id)
++        encoded_user = _segment("user_id", user_id)
++        if enforcement_point_path is None:
++            query = ""
++        else:
++            query = "?enforcement_point_path=" + urllib.parse.quote(
++                _nonblank("enforcement_point_path", enforcement_point_path),
++                safe="",
++            )
++
++        collector = self._get(
++            "GetFirewallIdentityStoreEventLogServer",
++            _COLLECTOR_PATH.format(
++                store_id=encoded_store,
++                server_id=encoded_server,
++            )
++            + query,
++        )
++        if collector.get("id") != event_log_server_id:
++            raise ProtocolError("collector response identity did not match")
++        status_document = collector.get("status")
++        if not isinstance(status_document, dict):
++            raise ProtocolError("collector response status must be an object")
++        collector_status = status_document.get("status")
++        if collector_status not in {"OK", "ERROR"}:
++            raise ProtocolError("collector response status was invalid")
++        error_message = status_document.get("error_message")
++        if error_message is not None:
++            if not isinstance(error_message, str) or not error_message.strip():
++                raise ProtocolError(
++                    "collector error_message must be a non-blank string"
++                )
++
++        statistics = self._get(
++            "GetUserLoginEvents",
++            _EVENTS_PATH.format(user_id=encoded_user) + query,
++        )
++        if statistics.get("user_id") != user_id:
++            raise ProtocolError("user statistics identity did not match")
++        active = statistics.get("active_sessions")
++        archived = statistics.get("archived_sessions", [])
++        if not isinstance(active, list) or not isinstance(archived, list):
++            raise ProtocolError("session collections must be arrays")
++
++        relevant: list[dict[str, Any]] = []
++        for item in [*active, *archived]:
++            if not isinstance(item, dict):
++                raise ProtocolError("session collection contained a non-object")
++            if (
++                item.get("user_id") == user_id
++                and item.get("session_source") == "ELS"
++            ):
++                event_id = item.get("id")
++                login_time = item.get("login_time")
++                if not isinstance(event_id, str) or not event_id.strip():
++                    raise ProtocolError("relevant event id was invalid")
++                if isinstance(login_time, bool) or not isinstance(login_time, int):
++                    raise ProtocolError("relevant event login_time was invalid")
++                relevant.append(item)
++        relevant.sort(key=lambda item: (-item["login_time"], item["id"]))
++
++        return FailureEvidence(
++            identity_firewall_store_id=identity_firewall_store_id,
++            event_log_server_id=event_log_server_id,
++            user_id=user_id,
++            collector=collector,
++            relevant_login_events=tuple(relevant),
++            evidence_message=(
++                error_message if collector_status == "ERROR" else None
++            ),
++        )

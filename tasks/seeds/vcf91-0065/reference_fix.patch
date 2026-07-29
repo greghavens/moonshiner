@@ -1,0 +1,343 @@
+diff --git a/nsx_rotating_client/__init__.py b/nsx_rotating_client/__init__.py
+--- a/nsx_rotating_client/__init__.py
++++ b/nsx_rotating_client/__init__.py
+@@ -1,3 +1,336 @@
+-"""Complete the stdlib-only rotating NSX Policy client described by the task."""
+-
+-# TODO: implement the public API in this module.
++"""Thread-safe, standard-library NSX Policy client with credential draining."""
++
++from __future__ import annotations
++
++import base64
++import http.client
++import json
++import math
++import threading
++import time
++import urllib.parse
++from dataclasses import dataclass
++from typing import Any, Callable
++
++
++__all__ = [
++    "CredentialRetirementError",
++    "NsxApiError",
++    "NsxPolicyClient",
++    "ProtocolError",
++    "RotationResult",
++    "RotationTimeout",
++]
++
++_BASE_PATH = "/policy/api/v1"
++_LIST_TIER1_PATH = "/infra/tier-1s"
++
++
++def _nonblank(name: str, value: object) -> str:
++    if not isinstance(value, str) or not value.strip():
++        raise ValueError(f"{name} must be a non-blank string")
++    return value
++
++
++def _authorization(username: object, password: object) -> str:
++    username_value = _nonblank("username", username)
++    if ":" in username_value:
++        raise ValueError("username must not contain ':'")
++    password_value = _nonblank("password", password)
++    encoded = base64.b64encode(
++        f"{username_value}:{password_value}".encode("utf-8")
++    ).decode("ascii")
++    return "Basic " + encoded
++
++
++def _positive_finite(name: str, value: object) -> float:
++    if isinstance(value, bool) or not isinstance(value, (int, float)):
++        raise TypeError(f"{name} must be a number")
++    result = float(value)
++    if result <= 0 or not math.isfinite(result):
++        raise ValueError(f"{name} must be positive and finite")
++    return result
++
++
++class ProtocolError(Exception):
++    """The service response or transport did not satisfy the contract."""
++
++
++class NsxApiError(Exception):
++    """A non-success HTTP response with its decoded NSX error envelope."""
++
++    def __init__(self, status_code: int, envelope: Any):
++        self.status_code = status_code
++        self.envelope = envelope
++        fields = envelope if isinstance(envelope, dict) else {}
++        self.error_code = fields.get("error_code")
++        self.error_message = fields.get("error_message")
++        self.module_name = fields.get("module_name")
++        self.details = fields.get("details")
++        super().__init__(f"NSX Policy request failed with HTTP {status_code}")
++
++
++class RotationTimeout(Exception):
++    """The previous credential generation did not drain before the deadline."""
++
++    def __init__(
++        self,
++        old_generation: int,
++        new_generation: int,
++        pending_requests: int,
++    ):
++        self.old_generation = old_generation
++        self.new_generation = new_generation
++        self.pending_requests = pending_requests
++        super().__init__(
++            "credential rotation timed out while requests remained in flight "
++            f"(old_generation={old_generation}, "
++            f"new_generation={new_generation}, "
++            f"pending_requests={pending_requests})"
++        )
++
++
++class CredentialRetirementError(Exception):
++    """The caller's old-credential retirement action failed."""
++
++    def __init__(self, old_generation: int, new_generation: int):
++        self.old_generation = old_generation
++        self.new_generation = new_generation
++        super().__init__(
++            "old credential retirement failed "
++            f"(old_generation={old_generation}, "
++            f"new_generation={new_generation})"
++        )
++
++
++@dataclass(frozen=True)
++class RotationResult:
++    """A completed credential publication and retirement."""
++
++    old_generation: int
++    new_generation: int
++    retired: bool
++
++
++@dataclass(frozen=True)
++class _Credential:
++    generation: int
++    authorization: str
++
++
++class NsxPolicyClient:
++    """Client restricted to ListTier1 with generation-safe Basic credentials."""
++
++    def __init__(
++        self,
++        base_url: str,
++        username: str,
++        password: str,
++        *,
++        timeout: float = 5.0,
++    ):
++        if not isinstance(base_url, str) or not base_url.strip():
++            raise ValueError("base_url must be a non-blank string")
++        try:
++            parsed = urllib.parse.urlsplit(base_url)
++            hostname = parsed.hostname
++            port = parsed.port
++        except ValueError as error:
++            raise ValueError(
++                "base_url must contain a valid HTTP(S) origin"
++            ) from error
++        if (
++            parsed.scheme not in {"http", "https"}
++            or not parsed.netloc
++            or hostname is None
++            or parsed.username is not None
++            or parsed.password is not None
++            or parsed.path not in {"", "/"}
++            or parsed.query
++            or parsed.fragment
++        ):
++            raise ValueError(
++                "base_url must be an HTTP(S) origin without credentials"
++            )
++
++        authorization = _authorization(username, password)
++        self._timeout = _positive_finite("timeout", timeout)
++        self._scheme = parsed.scheme
++        self._hostname = hostname
++        self._port = port
++        self._condition = threading.Condition(threading.Lock())
++        self._rotation_lock = threading.Lock()
++        self._credential = _Credential(1, authorization)
++        self._in_flight: dict[int, int] = {}
++
++    @property
++    def credential_generation(self) -> int:
++        """Return the currently published credential generation."""
++        with self._condition:
++            return self._credential.generation
++
++    def _lease(self) -> _Credential:
++        with self._condition:
++            credential = self._credential
++            self._in_flight[credential.generation] = (
++                self._in_flight.get(credential.generation, 0) + 1
++            )
++            return credential
++
++    def _release(self, credential: _Credential) -> None:
++        with self._condition:
++            count = self._in_flight.get(credential.generation, 0)
++            if count <= 1:
++                self._in_flight.pop(credential.generation, None)
++            else:
++                self._in_flight[credential.generation] = count - 1
++            self._condition.notify_all()
++
++    @staticmethod
++    def _decode_error(body: bytes) -> Any:
++        if not body:
++            return None
++        try:
++            return json.loads(body.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            return None
++
++    def _request(self, target: str, credential: _Credential) -> bytes:
++        connection_type: type[http.client.HTTPConnection]
++        if self._scheme == "https":
++            connection_type = http.client.HTTPSConnection
++        else:
++            connection_type = http.client.HTTPConnection
++        connection = connection_type(
++            self._hostname, self._port, timeout=self._timeout
++        )
++        try:
++            connection.request(
++                "GET",
++                _BASE_PATH + target,
++                headers={
++                    "Authorization": credential.authorization,
++                    "Accept": "application/json",
++                },
++            )
++            response = connection.getresponse()
++            status = response.status
++            body = response.read()
++        except (http.client.HTTPException, OSError) as error:
++            raise ProtocolError(
++                "ListTier1 failed before a complete HTTP response"
++            ) from error
++        finally:
++            connection.close()
++
++        if status != 200:
++            raise NsxApiError(status, self._decode_error(body))
++        return body
++
++    def list_tier1s(
++        self,
++        *,
++        cursor: str | None = None,
++        page_size: int | None = None,
++    ) -> dict[str, Any]:
++        """Invoke one contract-pinned ListTier1 request."""
++        if cursor is not None:
++            cursor = _nonblank("cursor", cursor)
++        if page_size is not None:
++            if isinstance(page_size, bool) or not isinstance(page_size, int):
++                raise TypeError("page_size must be an integer")
++            if not 0 <= page_size <= 1000:
++                raise ValueError("page_size must be from 0 through 1000")
++
++        query: list[str] = []
++        if cursor is not None:
++            query.append("cursor=" + urllib.parse.quote(cursor, safe=""))
++        if page_size is not None:
++            query.append("page_size=" + str(page_size))
++        target = _LIST_TIER1_PATH
++        if query:
++            target += "?" + "&".join(query)
++
++        credential = self._lease()
++        try:
++            body = self._request(target, credential)
++        finally:
++            self._release(credential)
++
++        try:
++            document = json.loads(body.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError) as error:
++            raise ProtocolError(
++                "ListTier1 response was not UTF-8 JSON"
++            ) from error
++        if not isinstance(document, dict):
++            raise ProtocolError("ListTier1 response must be a JSON object")
++        if not isinstance(document.get("results"), list):
++            raise ProtocolError("ListTier1 response must contain a results array")
++        if "cursor" in document and not isinstance(document["cursor"], str):
++            raise ProtocolError("ListTier1 cursor must be a string when present")
++        if "result_count" in document and (
++            isinstance(document["result_count"], bool)
++            or not isinstance(document["result_count"], int)
++        ):
++            raise ProtocolError(
++                "ListTier1 result_count must be an integer when present"
++            )
++        return document
++
++    def rotate_credentials(
++        self,
++        username: str,
++        password: str,
++        retire_old: Callable[[], object],
++        *,
++        drain_timeout: float | None = None,
++    ) -> RotationResult:
++        """Publish a replacement, drain its predecessor, then retire it."""
++        new_authorization = _authorization(username, password)
++        if not callable(retire_old):
++            raise TypeError("retire_old must be callable")
++        timeout_value = (
++            None
++            if drain_timeout is None
++            else _positive_finite("drain_timeout", drain_timeout)
++        )
++
++        with self._rotation_lock:
++            with self._condition:
++                old = self._credential
++                if new_authorization == old.authorization:
++                    raise ValueError(
++                        "replacement credential must differ from current"
++                    )
++                new = _Credential(old.generation + 1, new_authorization)
++                self._credential = new
++                deadline = (
++                    None
++                    if timeout_value is None
++                    else time.monotonic() + timeout_value
++                )
++                while self._in_flight.get(old.generation, 0):
++                    if deadline is None:
++                        self._condition.wait()
++                        continue
++                    remaining = deadline - time.monotonic()
++                    if remaining <= 0:
++                        raise RotationTimeout(
++                            old.generation,
++                            new.generation,
++                            self._in_flight[old.generation],
++                        )
++                    self._condition.wait(remaining)
++
++            try:
++                retire_old()
++            except Exception as error:
++                raise CredentialRetirementError(
++                    old.generation, new.generation
++                ) from error
++            return RotationResult(
++                old_generation=old.generation,
++                new_generation=new.generation,
++                retired=True,
++            )
