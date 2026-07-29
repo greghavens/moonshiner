@@ -1,0 +1,408 @@
+--- a/VcfFailureDiagnosticsClient.java
++++ b/VcfFailureDiagnosticsClient.java
+@@ -1,6 +1,7 @@
+ import java.io.ByteArrayInputStream;
+ import java.io.IOException;
++import java.io.InputStream;
+ import java.net.URI;
+ import java.net.http.HttpClient;
+ import java.net.http.HttpRequest;
+ import java.net.http.HttpResponse;
+@@ -12,7 +13,9 @@
+ import java.util.ArrayList;
+ import java.util.Collections;
++import java.util.LinkedHashSet;
+ import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Locale;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Set;
+@@ -92,9 +95,155 @@
+     public Diagnosis diagnoseTaskFailure(String taskId)
+             throws IOException, InterruptedException {
+-        throw new UnsupportedOperationException("TODO: implement evidence-based diagnosis");
++        if (taskId == null
++                || taskId.isBlank()
++                || !taskId.equals(taskId.trim())) {
++            throw new IllegalArgumentException("taskId must be nonblank without surrounding whitespace");
++        }
++
++        Map<String, Object> task = object(
++                sendJson(
++                        "getTask",
++                        "GET",
++                        "/v1/tasks/" + encodePathSegment(taskId),
++                        null,
++                        200),
++                "Task");
++        String returnedTaskId = requiredString(task, "id", "Task");
++        requiredString(task, "name", "Task");
++        requiredString(task, "creationTimestamp", "Task");
++        String taskStatus = requiredString(task, "status", "Task");
++        if (!returnedTaskId.equals(taskId)) {
++            throw new IOException("getTask returned a different task");
++        }
++        if (!taskStatus.trim().equalsIgnoreCase("FAILED")) {
++            throw new IOException("getTask did not return a failed task");
++        }
++
++        LinkedHashSet<String> resourceIds = new LinkedHashSet<>();
++        for (Object rawResource : array(task.get("resources"), "Task resources")) {
++            Map<String, Object> resource = object(rawResource, "Resource");
++            resourceIds.add(requiredString(resource, "resourceId", "Resource"));
++            requiredString(resource, "type", "Resource");
++        }
++        if (resourceIds.isEmpty()) {
++            throw new IOException("failed Task has no resource evidence");
++        }
++
++        LinkedHashSet<String> referenceTokens = new LinkedHashSet<>();
++        for (Object rawError : array(task.get("errors"), "Task errors")) {
++            Map<String, Object> error = object(rawError, "Error");
++            String token = optionalString(error, "referenceToken");
++            if (token != null && !token.isBlank()) {
++                referenceTokens.add(token);
++            }
++        }
++        if (referenceTokens.isEmpty()) {
++            throw new IOException("failed Task has no log reference token");
++        }
++
++        List<Object> notifications = array(
++                sendJson(
++                        "getNotifications",
++                        "GET",
++                        "/v1/notifications",
++                        null,
++                        200),
++                "Notification list");
++        List<NotificationEvent> relevantEvents = new ArrayList<>();
++        LinkedHashSet<String> eventIds = new LinkedHashSet<>();
++        for (Object rawNotification : notifications) {
++            Map<String, Object> notification = object(rawNotification, "Notification");
++            Object rawResources = notification.get("resources");
++            if (rawResources == null) {
++                continue;
++            }
++            List<String> notificationResourceIds = new ArrayList<>();
++            boolean relevant = false;
++            for (Object rawResource : array(rawResources, "Notification resources")) {
++                Map<String, Object> resource = object(rawResource, "NotifiableResource");
++                String id = optionalString(resource, "id");
++                if (id != null) {
++                    notificationResourceIds.add(id);
++                    relevant |= resourceIds.contains(id);
++                }
++            }
++            if (!relevant) {
++                continue;
++            }
++            Map<String, Object> message = object(
++                    notification.get("message"), "Notification message");
++            String eventId = requiredString(message, "id", "Notification message");
++            eventIds.add(eventId);
++            relevantEvents.add(new NotificationEvent(
++                    eventId,
++                    optionalString(notification, "type"),
++                    optionalString(notification, "severity"),
++                    optionalString(message, "localizedMessage"),
++                    notificationResourceIds));
++        }
++        if (relevantEvents.isEmpty()) {
++            throw new IOException("no resource-correlated notification evidence");
++        }
++
++        String requestBody = "{\"logs\":{\"sddcManagerLogs\":true,\"apiLogs\":true}}";
++        Map<String, Object> accepted = object(
++                sendJson(
++                        "startSupportBundle",
++                        "POST",
++                        "/v1/system/support-bundles",
++                        requestBody,
++                        202),
++                "SupportBundle");
++        String bundleId = requiredString(accepted, "id", "SupportBundle");
++        String bundlePath =
++                "/v1/system/support-bundles/" + encodePathSegment(bundleId);
++
++        boolean completed = false;
++        for (int poll = 0; poll < maxPollAttempts; poll++) {
++            Map<String, Object> statusDocument = object(
++                    sendJson(
++                            "getSupportBundleStatus",
++                            "GET",
++                            bundlePath,
++                            null,
++                            200),
++                    "SupportBundle");
++            if (!requiredString(statusDocument, "id", "SupportBundle").equals(bundleId)) {
++                throw new IOException("getSupportBundleStatus returned a different bundle");
++            }
++            String status = requiredString(statusDocument, "status", "SupportBundle");
++            String normalized = status.trim().toUpperCase(Locale.ROOT);
++            if (normalized.equals("COMPLETED_WITH_SUCCESS")) {
++                completed = true;
++                break;
++            }
++            if (normalized.equals("COMPLETED_WITH_FAILURE")) {
++                throw new IOException("support bundle collection failed");
++            }
++            if (!(normalized.equals("PENDING") || normalized.equals("IN_PROGRESS"))) {
++                throw new IOException("unknown support bundle status");
++            }
++        }
++        if (!completed) {
++            throw new IOException("support bundle polling limit reached");
++        }
++
++        byte[] archive = sendBytes(
++                "exportSupportBundleByID",
++                bundlePath + "/data",
++                200);
++        Evidence evidence = findEvidence(
++                archive, taskId, referenceTokens, eventIds);
++        return new Diagnosis(
++                taskId,
++                evidence.cause(),
++                evidence.eventId(),
++                evidence.path(),
++                relevantEvents,
++                bundleId);
+     }
+ 
+-    private Map<String, Object> sendJson(
++    private Object sendJson(
+             String operationId,
+             String method,
+             String rawPath,
+@@ -102,4 +251,26 @@
+             int expectedStatus)
+             throws IOException, InterruptedException {
+-        throw new UnsupportedOperationException("TODO");
++        HttpRequest.Builder builder = HttpRequest.newBuilder(requestUri(rawPath))
++                .timeout(requestTimeout)
++                .header("Accept", "application/json")
++                .header("Authorization", "Bearer " + accessToken);
++        if (method.equals("GET") && body == null) {
++            builder.GET();
++        } else if (method.equals("POST") && body != null) {
++            builder.header("Content-Type", "application/json")
++                    .POST(HttpRequest.BodyPublishers.ofByteArray(
++                            body.getBytes(StandardCharsets.UTF_8)));
++        } else {
++            throw new IllegalArgumentException("unsupported request shape");
++        }
++        HttpResponse<byte[]> response =
++                http.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray());
++        if (response.statusCode() != expectedStatus) {
++            throw new IOException(
++                    operationId + " returned HTTP " + response.statusCode());
++        }
++        if (!mediaType(response).equals("application/json")) {
++            throw new IOException(operationId + " returned the wrong media type");
++        }
++        return Json.parse(decodeUtf8(response.body(), operationId + " response"));
+     }
+@@ -109,5 +280,20 @@
+             String rawPath,
+             int expectedStatus)
+             throws IOException, InterruptedException {
+-        throw new UnsupportedOperationException("TODO");
++        HttpRequest request = HttpRequest.newBuilder(requestUri(rawPath))
++                .timeout(requestTimeout)
++                .header("Accept", "application/octet-stream")
++                .header("Authorization", "Bearer " + accessToken)
++                .GET()
++                .build();
++        HttpResponse<byte[]> response =
++                http.send(request, HttpResponse.BodyHandlers.ofByteArray());
++        if (response.statusCode() != expectedStatus) {
++            throw new IOException(
++                    operationId + " returned HTTP " + response.statusCode());
++        }
++        if (!mediaType(response).equals("application/octet-stream")) {
++            throw new IOException(operationId + " returned the wrong media type");
++        }
++        return response.body();
+     }
+@@ -118,7 +304,178 @@
+             Set<String> referenceTokens,
+             Set<String> eventIds)
+             throws IOException {
+-        throw new UnsupportedOperationException("TODO");
++        if (archive.length == 0 || archive.length > MAX_COMPRESSED_BYTES) {
++            throw new IOException("support archive exceeds its compressed size limit");
++        }
++        int entries = 0;
++        int expanded = 0;
++        try (GZIPInputStream input =
++                new GZIPInputStream(new ByteArrayInputStream(archive))) {
++            while (true) {
++                byte[] header = readBlockOrEof(input);
++                if (header == null || allZero(header)) {
++                    break;
++                }
++                entries++;
++                if (entries > MAX_ARCHIVE_ENTRIES) {
++                    throw new IOException("support archive has too many entries");
++                }
++
++                String name = tarText(header, 0, 100);
++                String prefix = tarText(header, 345, 155);
++                if (!prefix.isEmpty()) {
++                    name = prefix + "/" + name;
++                }
++                requireSafeArchivePath(name);
++                long size = tarSize(header, 124, 12);
++                if (size < 0 || size > MAX_FILE_BYTES) {
++                    throw new IOException("support archive entry exceeds its size limit");
++                }
++                expanded += (int) size;
++                if (expanded > MAX_EXPANDED_BYTES) {
++                    throw new IOException("support archive exceeds its expanded size limit");
++                }
++
++                byte[] data = readExactly(input, (int) size);
++                int padding = (int) ((512 - (size % 512)) % 512);
++                readExactly(input, padding);
++                byte type = header[156];
++                if (!((type == 0 || type == '0') && name.endsWith(".log"))) {
++                    continue;
++                }
++
++                String log = decodeUtf8(data, "support log");
++                for (String line : log.split("\\r?\\n", -1)) {
++                    if (line.isBlank()) {
++                        continue;
++                    }
++                    Map<String, Object> record = object(
++                            Json.parse(line), "support log record");
++                    String recordTask = optionalString(record, "taskId");
++                    String reference = optionalString(record, "referenceToken");
++                    String event = optionalString(record, "eventId");
++                    String cause = optionalString(record, "cause");
++                    if (taskId.equals(recordTask)
++                            && referenceTokens.contains(reference)
++                            && eventIds.contains(event)
++                            && cause != null
++                            && !cause.isBlank()) {
++                        return new Evidence(cause, event, name);
++                    }
++                }
++            }
++        } catch (IOException error) {
++            throw new IOException("malformed or unsafe support archive");
++        }
++        throw new IOException("no fully correlated task, event, and log evidence");
+     }
++
++    private URI requestUri(String rawPath) throws IOException {
++        if (rawPath == null || !rawPath.startsWith("/") || rawPath.contains("?")) {
++            throw new IOException("invalid operation path");
++        }
++        try {
++            return URI.create(
++                    baseUri.getScheme()
++                            + "://"
++                            + baseUri.getRawAuthority()
++                            + rawPath);
++        } catch (IllegalArgumentException error) {
++            throw new IOException("invalid operation path");
++        }
++    }
++
++    private static String encodePathSegment(String value) {
++        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
++        StringBuilder result = new StringBuilder(bytes.length);
++        char[] hex = "0123456789ABCDEF".toCharArray();
++        for (byte raw : bytes) {
++            int current = raw & 0xff;
++            if ((current >= 'a' && current <= 'z')
++                    || (current >= 'A' && current <= 'Z')
++                    || (current >= '0' && current <= '9')
++                    || current == '-'
++                    || current == '.'
++                    || current == '_'
++                    || current == '~') {
++                result.append((char) current);
++            } else {
++                result.append('%')
++                        .append(hex[current >>> 4])
++                        .append(hex[current & 0x0f]);
++            }
++        }
++        return result.toString();
++    }
++
++    private static byte[] readBlockOrEof(InputStream input) throws IOException {
++        int first = input.read();
++        if (first < 0) {
++            return null;
++        }
++        byte[] block = new byte[512];
++        block[0] = (byte) first;
++        byte[] rest = readExactly(input, 511);
++        System.arraycopy(rest, 0, block, 1, rest.length);
++        return block;
++    }
++
++    private static byte[] readExactly(InputStream input, int count) throws IOException {
++        byte[] result = input.readNBytes(count);
++        if (result.length != count) {
++            throw new IOException("truncated support archive");
++        }
++        return result;
++    }
++
++    private static boolean allZero(byte[] block) {
++        for (byte value : block) {
++            if (value != 0) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    private static String tarText(byte[] block, int offset, int length) {
++        int end = offset;
++        while (end < offset + length && block[end] != 0) {
++            end++;
++        }
++        return new String(block, offset, end - offset, StandardCharsets.UTF_8);
++    }
++
++    private static long tarSize(byte[] block, int offset, int length)
++            throws IOException {
++        int end = offset + length;
++        int index = offset;
++        while (index < end && (block[index] == 0 || block[index] == ' ')) {
++            index++;
++        }
++        long value = 0;
++        boolean sawDigit = false;
++        while (index < end && block[index] >= '0' && block[index] <= '7') {
++            sawDigit = true;
++            value = Math.addExact(
++                    Math.multiplyExact(value, 8),
++                    block[index] - '0');
++            index++;
++        }
++        if (!sawDigit) {
++            throw new IOException("invalid tar size");
++        }
++        return value;
++    }
++
++    private static void requireSafeArchivePath(String path) throws IOException {
++        if (path.isEmpty() || path.startsWith("/") || path.contains("\\")) {
++            throw new IOException("unsafe support archive path");
++        }
++        for (String part : path.split("/", -1)) {
++            if (part.isEmpty() || part.equals(".") || part.equals("..")) {
++                throw new IOException("unsafe support archive path");
++            }
++        }
++    }
+ 
+     private record Evidence(String cause, String eventId, String path) {}
