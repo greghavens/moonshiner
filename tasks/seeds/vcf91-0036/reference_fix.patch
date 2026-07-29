@@ -1,0 +1,502 @@
+--- a/client.go
++++ b/client.go
+@@ -3,10 +3,18 @@
+ package networkpoolensure
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"io"
++	"math"
++	"mime"
+ 	"net/http"
++	"net/url"
++	"sort"
++	"strings"
+ )
+ 
+ const maxResponseBytes = 1 << 20
+@@ -176,16 +184,49 @@
+ }
+ 
+ // Client is a focused getNetworkPool/createNetworkPool client.
+-type Client struct{}
++type Client struct {
++	baseURL     string
++	accessToken string
++	httpClient  *http.Client
++	ensureGate  chan struct{}
++}
+ 
+ // NewClient validates configuration without network traffic.
+ func NewClient(config Config) (*Client, error) {
+-	return nil, ErrNotImplemented
++	origin, err := validateOrigin(config.BaseURL)
++	if err != nil {
++		return nil, err
++	}
++	if strings.TrimSpace(config.AccessToken) == "" ||
++		containsASCIIWhitespace(config.AccessToken) {
++		return nil, errors.New("access token must be nonblank and contain no ASCII whitespace")
++	}
++
++	selected := config.HTTPClient
++	if selected == nil {
++		selected = http.DefaultClient
++	}
++	copied := *selected
++	copied.CheckRedirect = func(
++		_ *http.Request,
++		_ []*http.Request,
++	) error {
++		return http.ErrUseLastResponse
++	}
++	return &Client{
++		baseURL:     origin,
++		accessToken: config.AccessToken,
++		httpClient:  &copied,
++		ensureGate:  make(chan struct{}, 1),
++	}, nil
+ }
+ 
+ // ListNetworkPools returns the complete collection in stable order.
+ func (c *Client) ListNetworkPools(ctx context.Context) ([]NetworkPool, error) {
+-	return nil, ErrNotImplemented
++	if err := c.validateCall(ctx); err != nil {
++		return nil, err
++	}
++	return c.listNetworkPools(ctx)
+ }
+ 
+ // EnsureNetworkPool creates an absent pool and safely adopts an equal one.
+@@ -193,5 +234,426 @@
+ 	ctx context.Context,
+ 	spec NetworkPoolSpec,
+ ) (EnsureResult, error) {
+-	return EnsureResult{}, ErrNotImplemented
++	if err := c.validateCall(ctx); err != nil {
++		return EnsureResult{}, err
++	}
++	if err := validateSpec(spec); err != nil {
++		return EnsureResult{}, err
++	}
++	body, err := json.Marshal(spec)
++	if err != nil {
++		return EnsureResult{}, errors.New("encode network-pool request")
++	}
++
++	select {
++	case c.ensureGate <- struct{}{}:
++		defer func() { <-c.ensureGate }()
++	case <-ctx.Done():
++		return EnsureResult{}, ctx.Err()
++	}
++	if err := ctx.Err(); err != nil {
++		return EnsureResult{}, err
++	}
++
++	pools, err := c.listNetworkPools(ctx)
++	if err != nil {
++		return EnsureResult{}, err
++	}
++	var matches []NetworkPool
++	for _, pool := range pools {
++		if pool.Name == spec.Name {
++			matches = append(matches, pool)
++		}
++	}
++	if len(matches) > 1 {
++		return EnsureResult{}, &AmbiguousMatchError{
++			Name:  spec.Name,
++			Count: len(matches),
++		}
++	}
++	if len(matches) == 1 {
++		if !sameWritableConfiguration(matches[0], spec) {
++			return EnsureResult{}, &DriftError{
++				Existing: matches[0],
++				Desired:  spec,
++			}
++		}
++		return EnsureResult{Pool: matches[0], Created: false}, nil
++	}
++
++	var created NetworkPool
++	if err := c.doJSON(
++		ctx,
++		http.MethodPost,
++		"createNetworkPool",
++		body,
++		http.StatusCreated,
++		&created,
++	); err != nil {
++		return EnsureResult{}, err
++	}
++	if err := validateCreatedPool(created, spec); err != nil {
++		return EnsureResult{}, err
++	}
++	return EnsureResult{Pool: created, Created: true}, nil
++}
++
++type networkPoolPageWire struct {
++	Elements     *[]NetworkPool `json:"elements"`
++	PageMetadata *PageMetadata  `json:"pageMetadata"`
++}
++
++func (c *Client) listNetworkPools(
++	ctx context.Context,
++) ([]NetworkPool, error) {
++	var page networkPoolPageWire
++	if err := c.doJSON(
++		ctx,
++		http.MethodGet,
++		"getNetworkPool",
++		nil,
++		http.StatusOK,
++		&page,
++	); err != nil {
++		return nil, err
++	}
++	if page.Elements == nil || page.PageMetadata == nil {
++		return nil, protocol("getNetworkPool", "required page members are absent")
++	}
++	pools := *page.Elements
++	if err := validatePage(pools, *page.PageMetadata); err != nil {
++		return nil, err
++	}
++	result := append([]NetworkPool(nil), pools...)
++	if result == nil {
++		result = make([]NetworkPool, 0)
++	}
++	sort.Slice(result, func(left, right int) bool {
++		if result[left].Name != result[right].Name {
++			return result[left].Name < result[right].Name
++		}
++		return result[left].ID < result[right].ID
++	})
++	return result, nil
++}
++
++func (c *Client) validateCall(ctx context.Context) error {
++	if c == nil ||
++		c.baseURL == "" ||
++		c.httpClient == nil ||
++		c.ensureGate == nil {
++		return errors.New("client is nil or uninitialized")
++	}
++	if ctx == nil {
++		return errors.New("context must not be nil")
++	}
++	return ctx.Err()
++}
++
++func (c *Client) doJSON(
++	ctx context.Context,
++	method string,
++	operationID string,
++	body []byte,
++	wantStatus int,
++	output any,
++) error {
++	var reader io.Reader
++	if body != nil {
++		reader = bytes.NewReader(body)
++	}
++	request, err := http.NewRequestWithContext(
++		ctx,
++		method,
++		c.baseURL+"/v1/network-pools",
++		reader,
++	)
++	if err != nil {
++		return &TransportError{OperationID: operationID, Err: err}
++	}
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set("Authorization", "Bearer "+c.accessToken)
++	if body != nil {
++		request.Header.Set("Content-Type", "application/json")
++	}
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return &TransportError{OperationID: operationID, Err: err}
++	}
++	content, readErr := io.ReadAll(
++		io.LimitReader(response.Body, maxResponseBytes+1),
++	)
++	closeErr := response.Body.Close()
++	if readErr != nil {
++		return &TransportError{OperationID: operationID, Err: readErr}
++	}
++	if closeErr != nil {
++		return &TransportError{OperationID: operationID, Err: closeErr}
++	}
++	if len(content) > maxResponseBytes {
++		return protocol(operationID, "response body exceeds the size limit")
++	}
++	if response.StatusCode != wantStatus {
++		var envelope VCFError
++		_ = decodeOne(content, &envelope, false)
++		return &APIError{
++			OperationID:        operationID,
++			Status:             response.StatusCode,
++			ErrorCode:          envelope.ErrorCode,
++			Message:            envelope.Message,
++			RemediationMessage: envelope.RemediationMessage,
++			ReferenceToken:     envelope.ReferenceToken,
++		}
++	}
++	mediaType, _, err := mime.ParseMediaType(
++		response.Header.Get("Content-Type"),
++	)
++	if err != nil || mediaType != "application/json" {
++		return protocol(operationID, "success response is not application/json")
++	}
++	if err := decodeOne(content, output, true); err != nil {
++		return protocol(operationID, "success body is not one valid JSON document")
++	}
++	return nil
++}
++
++func validateOrigin(raw string) (string, error) {
++	if strings.TrimSpace(raw) == "" {
++		return "", errors.New("base URL must be a nonblank HTTP(S) origin")
++	}
++	parsed, err := url.Parse(raw)
++	if err != nil ||
++		(parsed.Scheme != "http" && parsed.Scheme != "https") ||
++		parsed.Host == "" ||
++		parsed.User != nil ||
++		parsed.RawQuery != "" ||
++		parsed.ForceQuery ||
++		parsed.Fragment != "" ||
++		parsed.Opaque != "" ||
++		(parsed.Path != "" && parsed.Path != "/") ||
++		parsed.RawPath != "" {
++		return "", errors.New("base URL must be an HTTP(S) origin without credentials, path, query, or fragment")
++	}
++	return parsed.Scheme + "://" + parsed.Host, nil
++}
++
++func containsASCIIWhitespace(value string) bool {
++	for index := 0; index < len(value); index++ {
++		switch value[index] {
++		case ' ', '\t', '\n', '\v', '\f', '\r':
++			return true
++		}
++	}
++	return false
++}
++
++func validateSpec(spec NetworkPoolSpec) error {
++	if strings.TrimSpace(spec.Name) == "" ||
++		spec.Name != strings.TrimSpace(spec.Name) {
++		return errors.New("network-pool name must be nonblank with no surrounding whitespace")
++	}
++	if spec.Networks == nil {
++		return errors.New("networks must be a non-nil array")
++	}
++	for index, network := range spec.Networks {
++		if strings.TrimSpace(network.Type) == "" ||
++			network.Type != strings.TrimSpace(network.Type) {
++			return fmt.Errorf("network %d type must be nonblank with no surrounding whitespace", index)
++		}
++		if network.VLANID < math.MinInt32 ||
++			network.VLANID > math.MaxInt32 {
++			return fmt.Errorf("network %d vlanId must fit signed int32", index)
++		}
++		if network.MTU < math.MinInt32 ||
++			network.MTU > math.MaxInt32 {
++			return fmt.Errorf("network %d mtu must fit signed int32", index)
++		}
++		if err := validateOptional(
++			"ipAddressVersion",
++			network.IPAddressVersion,
++			"IPv4",
++			"IPv6",
++		); err != nil {
++			return fmt.Errorf("network %d: %w", index, err)
++		}
++		if err := validateOptional(
++			"ipAddressAssignmentMode",
++			network.IPAddressAssignmentMode,
++			"STATIC",
++			"DHCP",
++			"SLAAC",
++		); err != nil {
++			return fmt.Errorf("network %d: %w", index, err)
++		}
++		for name, value := range map[string]*string{
++			"subnet":  network.Subnet,
++			"mask":    network.Mask,
++			"gateway": network.Gateway,
++		} {
++			if err := validateOptional(name, value); err != nil {
++				return fmt.Errorf("network %d: %w", index, err)
++			}
++		}
++		for poolIndex, pool := range network.IPPools {
++			if strings.TrimSpace(pool.Start) == "" ||
++				pool.Start != strings.TrimSpace(pool.Start) ||
++				strings.TrimSpace(pool.End) == "" ||
++				pool.End != strings.TrimSpace(pool.End) {
++				return fmt.Errorf(
++					"network %d IP pool %d requires trimmed nonblank start and end",
++					index,
++					poolIndex,
++				)
++			}
++		}
++	}
++	return nil
++}
++
++func validateOptional(
++	name string,
++	value *string,
++	allowed ...string,
++) error {
++	if value == nil {
++		return nil
++	}
++	if strings.TrimSpace(*value) == "" ||
++		*value != strings.TrimSpace(*value) {
++		return fmt.Errorf("%s must be nonblank with no surrounding whitespace", name)
++	}
++	if len(allowed) == 0 {
++		return nil
++	}
++	for _, candidate := range allowed {
++		if *value == candidate {
++			return nil
++		}
++	}
++	return fmt.Errorf("%s has an unsupported value", name)
++}
++
++func validatePage(
++	pools []NetworkPool,
++	metadata PageMetadata,
++) error {
++	values := []int{
++		metadata.PageNumber,
++		metadata.PageSize,
++		metadata.TotalElements,
++		metadata.TotalPages,
++	}
++	for _, value := range values {
++		if value < 0 || int64(value) > math.MaxInt32 {
++			return protocol("getNetworkPool", "page metadata is outside signed int32")
++		}
++	}
++	wantPages := 1
++	if len(pools) == 0 {
++		wantPages = 0
++	}
++	if metadata.PageNumber != 0 ||
++		metadata.PageSize != len(pools) ||
++		metadata.TotalElements != len(pools) ||
++		metadata.TotalPages != wantPages {
++		return protocol("getNetworkPool", "one-page metadata is inconsistent")
++	}
++	seenIDs := make(map[string]struct{}, len(pools))
++	for _, pool := range pools {
++		if strings.TrimSpace(pool.ID) == "" ||
++			strings.TrimSpace(pool.Name) == "" ||
++			pool.Networks == nil {
++			return protocol("getNetworkPool", "a network pool lacks required response fields")
++		}
++		if _, exists := seenIDs[pool.ID]; exists {
++			return protocol("getNetworkPool", "network pool IDs are not unique")
++		}
++		seenIDs[pool.ID] = struct{}{}
++	}
++	return nil
++}
++
++func validateCreatedPool(
++	created NetworkPool,
++	spec NetworkPoolSpec,
++) error {
++	if strings.TrimSpace(created.ID) == "" ||
++		strings.TrimSpace(created.Name) == "" ||
++		created.Networks == nil {
++		return protocol("createNetworkPool", "created pool lacks required response fields")
++	}
++	if !sameWritableConfiguration(created, spec) {
++		return protocol("createNetworkPool", "created pool differs from the request")
++	}
++	return nil
++}
++
++func sameWritableConfiguration(
++	existing NetworkPool,
++	desired NetworkPoolSpec,
++) bool {
++	if existing.Name != desired.Name ||
++		len(existing.Networks) != len(desired.Networks) {
++		return false
++	}
++	for index, actual := range existing.Networks {
++		want := desired.Networks[index]
++		if actual.Type != want.Type ||
++			!sameOptional(actual.IPAddressVersion, want.IPAddressVersion) ||
++			!sameOptional(
++				actual.IPAddressAssignmentMode,
++				want.IPAddressAssignmentMode,
++			) ||
++			actual.VLANID != want.VLANID ||
++			actual.MTU != want.MTU ||
++			!sameOptional(actual.Subnet, want.Subnet) ||
++			!sameOptional(actual.Mask, want.Mask) ||
++			!sameOptional(actual.Gateway, want.Gateway) ||
++			!sameIPPools(actual.IPPools, want.IPPools) {
++			return false
++		}
++	}
++	return true
++}
++
++func sameOptional(left, right *string) bool {
++	if left == nil || right == nil {
++		return left == nil && right == nil
++	}
++	return *left == *right
++}
++
++func sameIPPools(left, right []IPPool) bool {
++	if len(left) != len(right) {
++		return false
++	}
++	for index := range left {
++		if left[index] != right[index] {
++			return false
++		}
++	}
++	return true
++}
++
++func decodeOne(content []byte, output any, strict bool) error {
++	decoder := json.NewDecoder(bytes.NewReader(content))
++	if strict {
++		decoder.DisallowUnknownFields()
++	}
++	if err := decoder.Decode(output); err != nil {
++		return err
++	}
++	var trailing any
++	if err := decoder.Decode(&trailing); err != io.EOF {
++		if err == nil {
++			return errors.New("trailing JSON")
++		}
++		return err
++	}
++	return nil
++}
++
++func protocol(operationID, reason string) *ProtocolError {
++	return &ProtocolError{OperationID: operationID, Reason: reason}
+ }
