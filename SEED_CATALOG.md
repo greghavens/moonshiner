@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3076 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3077 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 30 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 11 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 12 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -3632,6 +3632,7 @@
 - **vcf91-0023** (`python`) `#vcf-9-1` `#sddc-manager` `#python` `#rest-contract` `#spec-derived` — Implement `vcf_cluster_inventory/client.py` as a standard-library-only Python integration for the VMware Cloud Foundation 9.1 SDDC Manager REST API. The protected `docs/contract.json` is a focused…
 - **vcf91-0024** (`python`) `#vcf-9-1` `#sddc-manager` `#python` `#rest-contract` `#spec-derived` — Implement `vcf_user_access/client.py` as a standard-library-only Python integration for VMware Cloud Foundation 9.1 SDDC Manager. The protected `docs/contract.json` is a focused projection of `spec…
 - **vcf91-0025** (`go`) `#vcf-9-1` `#sddc-manager` `#go` `#rest-contract` `#spec-derived` — Backup automation ticket for our VCF 9.1 management domain. Updating SDDC Manager's backup configuration is asynchronous, but the current caller treats the accepted response as completion. Implemen…
+- **vcf91-0026** (`go`) `#vcf-9-1` `#sddc-manager` `#go` `#rest-contract` `#spec-derived` — Implement the root Go package `domainsnapshot` (module `vcf91-0026`, standard library only) as a VMware Cloud Foundation 9.1 SDDC Manager integration. An inventory access token expires after page 0…
 
 ## project-io
 

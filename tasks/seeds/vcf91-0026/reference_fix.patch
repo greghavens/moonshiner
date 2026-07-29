@@ -1,0 +1,406 @@
+--- a/client.go
++++ b/client.go
+@@ -2,11 +2,19 @@
+ package domainsnapshot
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
++	"strings"
+ )
+ 
++const maxResponseBytes = 8 << 20
++
+ // Config configures an SDDC Manager client.
+ type Config struct {
+ 	BaseURL    string
+@@ -35,7 +43,9 @@
+ 	Message     string
+ }
+ 
+-func (e *APIError) Error() string { return "SDDC Manager API request failed" }
++func (e *APIError) Error() string {
++	return fmt.Sprintf("%s failed with HTTP status %d", e.OperationID, e.StatusCode)
++}
+ 
+ // ProtocolError represents a malformed or inconsistent success response.
+ type ProtocolError struct {
+@@ -43,17 +53,368 @@
+ 	Reason      string
+ }
+ 
+-func (e *ProtocolError) Error() string { return "SDDC Manager response violated the contract" }
++func (e *ProtocolError) Error() string {
++	return fmt.Sprintf("%s response violated the SDDC Manager contract", e.OperationID)
++}
+ 
+ // Client is an SDDC Manager domain snapshot client.
+-type Client struct{}
++type Client struct {
++	baseURL    string
++	username   string
++	password   string
++	httpClient *http.Client
++	pageSize   int
++}
+ 
+ // NewClient validates config without performing network I/O.
+ func NewClient(config Config) (*Client, error) {
+-	return nil, errors.New("not implemented")
++	parsed, err := url.Parse(config.BaseURL)
++	if err != nil {
++		return nil, errors.New("BaseURL must be an HTTP(S) origin")
++	}
++	scheme := strings.ToLower(parsed.Scheme)
++	if (scheme != "http" && scheme != "https") ||
++		parsed.Host == "" ||
++		parsed.Hostname() == "" ||
++		parsed.User != nil ||
++		parsed.Opaque != "" ||
++		(parsed.Path != "" && parsed.Path != "/") ||
++		(parsed.EscapedPath() != "" && parsed.EscapedPath() != "/") ||
++		parsed.RawQuery != "" ||
++		parsed.ForceQuery ||
++		parsed.Fragment != "" {
++		return nil, errors.New("BaseURL must be an HTTP(S) origin")
++	}
++	if strings.TrimSpace(config.Username) == "" {
++		return nil, errors.New("Username must not be blank")
++	}
++	if strings.TrimSpace(config.Password) == "" {
++		return nil, errors.New("Password must not be blank")
++	}
++	if config.PageSize < 1 || int64(config.PageSize) > int64(^uint32(0)>>1) {
++		return nil, errors.New("PageSize must be a positive signed-int32 value")
++	}
++
++	httpClient := config.HTTPClient
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++	clientCopy := *httpClient
++	clientCopy.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
++		return http.ErrUseLastResponse
++	}
++
++	return &Client{
++		baseURL:    scheme + "://" + parsed.Host,
++		username:   config.Username,
++		password:   config.Password,
++		httpClient: &clientCopy,
++		pageSize:   config.PageSize,
++	}, nil
+ }
+ 
+ // ListDomains returns the complete domain collection.
+ func (c *Client) ListDomains(ctx context.Context) ([]Domain, error) {
+-	return nil, errors.New("not implemented")
++	accessToken, refreshTokenID, err := c.createToken(ctx)
++	if err != nil {
++		return nil, err
++	}
++
++	domains := make([]Domain, 0)
++	pageNumber := 0
++	refreshed := false
++	expectedTotalElements := -1
++	expectedTotalPages := -1
++
++	for {
++		body, err := c.getDomainsPage(ctx, pageNumber, accessToken)
++		if err != nil {
++			var apiError *APIError
++			if errors.As(err, &apiError) &&
++				apiError.StatusCode == http.StatusUnauthorized &&
++				!refreshed {
++				accessToken, err = c.refreshAccessToken(ctx, refreshTokenID)
++				if err != nil {
++					return nil, err
++				}
++				refreshed = true
++				body, err = c.getDomainsPage(ctx, pageNumber, accessToken)
++			}
++			if err != nil {
++				return nil, err
++			}
++		}
++
++		page, err := c.validatePage(body, pageNumber)
++		if err != nil {
++			return nil, err
++		}
++		if pageNumber == 0 {
++			expectedTotalElements = page.totalElements
++			expectedTotalPages = page.totalPages
++		} else if page.totalElements != expectedTotalElements ||
++			page.totalPages != expectedTotalPages {
++			return nil, protocolError("pagination totals changed")
++		}
++		if len(domains)+len(page.elements) > expectedTotalElements {
++			return nil, protocolError("page elements exceed totalElements")
++		}
++		domains = append(domains, page.elements...)
++
++		if expectedTotalPages == 0 || pageNumber == expectedTotalPages-1 {
++			if len(domains) != expectedTotalElements {
++				return nil, protocolError("final element count does not equal totalElements")
++			}
++			return domains, nil
++		}
++		pageNumber++
++	}
++}
++
++func (c *Client) createToken(ctx context.Context) (string, string, error) {
++	body, err := json.Marshal(TokenCreationSpec{
++		Username: c.username,
++		Password: c.password,
++	})
++	if err != nil {
++		return "", "", protocolErrorFor("createToken", "cannot encode token request")
++	}
++	responseBody, err := c.request(
++		ctx,
++		"createToken",
++		http.MethodPost,
++		"/v1/tokens",
++		body,
++		"",
++		http.StatusCreated,
++	)
++	if err != nil {
++		return "", "", err
++	}
++	var pair struct {
++		AccessToken  string `json:"accessToken"`
++		RefreshToken *struct {
++			ID string `json:"id"`
++		} `json:"refreshToken"`
++	}
++	if err := json.Unmarshal(responseBody, &pair); err != nil ||
++		pair.AccessToken == "" ||
++		pair.RefreshToken == nil ||
++		pair.RefreshToken.ID == "" {
++		return "", "", protocolErrorFor("createToken", "invalid token pair")
++	}
++	return pair.AccessToken, pair.RefreshToken.ID, nil
++}
++
++func (c *Client) refreshAccessToken(ctx context.Context, refreshTokenID string) (string, error) {
++	body, err := json.Marshal(refreshTokenID)
++	if err != nil {
++		return "", protocolErrorFor("refreshAccessToken", "cannot encode refresh request")
++	}
++	responseBody, err := c.request(
++		ctx,
++		"refreshAccessToken",
++		http.MethodPatch,
++		"/v1/tokens/access-token/refresh",
++		body,
++		"",
++		http.StatusOK,
++	)
++	if err != nil {
++		return "", err
++	}
++	var accessToken string
++	if err := json.Unmarshal(responseBody, &accessToken); err != nil || accessToken == "" {
++		return "", protocolErrorFor("refreshAccessToken", "invalid access token")
++	}
++	return accessToken, nil
++}
++
++func (c *Client) getDomainsPage(
++	ctx context.Context,
++	pageNumber int,
++	accessToken string,
++) ([]byte, error) {
++	target := fmt.Sprintf(
++		"/v1/domains?pageNumber=%d&pageSize=%d",
++		pageNumber,
++		c.pageSize,
++	)
++	return c.request(
++		ctx,
++		"getDomains",
++		http.MethodGet,
++		target,
++		nil,
++		accessToken,
++		http.StatusOK,
++	)
++}
++
++func (c *Client) request(
++	ctx context.Context,
++	operationID string,
++	method string,
++	target string,
++	body []byte,
++	accessToken string,
++	expectedStatus int,
++) ([]byte, error) {
++	var reader io.Reader
++	if body != nil {
++		reader = bytes.NewReader(body)
++	}
++	request, err := http.NewRequestWithContext(
++		ctx,
++		method,
++		c.baseURL+target,
++		reader,
++	)
++	if err != nil {
++		if ctx != nil && ctx.Err() != nil {
++			return nil, ctx.Err()
++		}
++		return nil, errors.New(operationID + " request could not be created")
++	}
++	request.Header.Set("Accept", "application/json")
++	if body != nil {
++		request.Header.Set("Content-Type", "application/json")
++	}
++	if accessToken != "" {
++		request.Header.Set("Authorization", "Bearer "+accessToken)
++	}
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		if ctx != nil && ctx.Err() != nil {
++			return nil, ctx.Err()
++		}
++		return nil, errors.New(operationID + " transport request failed")
++	}
++	defer response.Body.Close()
++
++	responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
++	if readErr != nil {
++		return nil, errors.New(operationID + " response could not be read")
++	}
++	if len(responseBody) > maxResponseBytes {
++		return nil, protocolErrorFor(operationID, "response body is too large")
++	}
++	if response.StatusCode != expectedStatus {
++		var envelope struct {
++			ErrorCode string `json:"errorCode"`
++			Message   string `json:"message"`
++		}
++		_ = json.Unmarshal(responseBody, &envelope)
++		return nil, &APIError{
++			OperationID: operationID,
++			StatusCode:  response.StatusCode,
++			ErrorCode:   envelope.ErrorCode,
++			Message:     envelope.Message,
++		}
++	}
++	return responseBody, nil
++}
++
++type validatedPage struct {
++	elements      []Domain
++	totalElements int
++	totalPages    int
++}
++
++func (c *Client) validatePage(body []byte, requestedPage int) (validatedPage, error) {
++	var envelope struct {
++		Elements     json.RawMessage `json:"elements"`
++		PageMetadata json.RawMessage `json:"pageMetadata"`
++	}
++	if err := json.Unmarshal(body, &envelope); err != nil {
++		return validatedPage{}, protocolError("page is not a JSON object")
++	}
++	if len(envelope.Elements) == 0 || string(envelope.Elements) == "null" {
++		return validatedPage{}, protocolError("elements is missing or null")
++	}
++	if len(envelope.PageMetadata) == 0 || string(envelope.PageMetadata) == "null" {
++		return validatedPage{}, protocolError("pageMetadata is missing or null")
++	}
++
++	var rawElements []json.RawMessage
++	if err := json.Unmarshal(envelope.Elements, &rawElements); err != nil ||
++		rawElements == nil {
++		return validatedPage{}, protocolError("elements is not an array")
++	}
++	var metadata struct {
++		PageNumber    *int32 `json:"pageNumber"`
++		PageSize      *int32 `json:"pageSize"`
++		TotalElements *int32 `json:"totalElements"`
++		TotalPages    *int32 `json:"totalPages"`
++	}
++	if err := json.Unmarshal(envelope.PageMetadata, &metadata); err != nil ||
++		metadata.PageNumber == nil ||
++		metadata.PageSize == nil ||
++		metadata.TotalElements == nil ||
++		metadata.TotalPages == nil {
++		return validatedPage{}, protocolError("pageMetadata fields are missing or invalid")
++	}
++	if *metadata.PageNumber < 0 ||
++		*metadata.PageSize < 0 ||
++		*metadata.TotalElements < 0 ||
++		*metadata.TotalPages < 0 {
++		return validatedPage{}, protocolError("pageMetadata contains a negative value")
++	}
++	if int(*metadata.PageNumber) != requestedPage {
++		return validatedPage{}, protocolError("returned pageNumber does not match request")
++	}
++	if int(*metadata.PageSize) != len(rawElements) {
++		return validatedPage{}, protocolError("returned pageSize does not match element count")
++	}
++	if len(rawElements) > c.pageSize {
++		return validatedPage{}, protocolError("page exceeds requested pageSize")
++	}
++
++	totalElements := int(*metadata.TotalElements)
++	totalPages := int(*metadata.TotalPages)
++	calculatedPages := 0
++	if totalElements > 0 {
++		calculatedPages = (totalElements + c.pageSize - 1) / c.pageSize
++	}
++	if totalPages != calculatedPages {
++		return validatedPage{}, protocolError("totalPages is inconsistent with totalElements")
++	}
++	if totalPages == 0 {
++		if requestedPage != 0 || len(rawElements) != 0 {
++			return validatedPage{}, protocolError("empty collection metadata is inconsistent")
++		}
++	} else {
++		if requestedPage >= totalPages {
++			return validatedPage{}, protocolError("pageNumber is outside totalPages")
++		}
++		if requestedPage < totalPages-1 && len(rawElements) != c.pageSize {
++			return validatedPage{}, protocolError("non-final page is short or empty")
++		}
++		if requestedPage == totalPages-1 && len(rawElements) == 0 {
++			return validatedPage{}, protocolError("final page is empty")
++		}
++	}
++
++	elements := make([]Domain, len(rawElements))
++	for index, rawElement := range rawElements {
++		var domain map[string]any
++		if err := json.Unmarshal(rawElement, &domain); err != nil || domain == nil {
++			return validatedPage{}, protocolError("elements contains a non-object")
++		}
++		elements[index] = Domain(domain)
++	}
++	return validatedPage{
++		elements:      elements,
++		totalElements: totalElements,
++		totalPages:    totalPages,
++	}, nil
++}
++
++func protocolError(reason string) *ProtocolError {
++	return protocolErrorFor("getDomains", reason)
++}
++
++func protocolErrorFor(operationID, reason string) *ProtocolError {
++	return &ProtocolError{OperationID: operationID, Reason: reason}
+ }
