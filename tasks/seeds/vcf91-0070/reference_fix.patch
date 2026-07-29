@@ -1,0 +1,324 @@
+--- a/nsxpolicy/client.go
++++ b/nsxpolicy/client.go
+@@ -3,8 +3,21 @@
+ package nsxpolicy
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
++	"strings"
++	"sync"
++)
++
++const (
++	policyBasePath  = "/policy/api/v1"
++	maxResponseSize = 4 << 20
+ )
+ 
+ // RefreshFunc exchanges an access token rejected by the server for a new one.
+@@ -27,7 +40,14 @@
+ }
+ 
+ // Client invokes the focused NSX Policy contract.
+-type Client struct{}
++type Client struct {
++	origin     string
++	httpClient *http.Client
++	refresh    RefreshFunc
++
++	tokenMu sync.Mutex
++	token   string
++}
+ 
+ // APIError represents a non-successful HTTP response.
+ type APIError struct {
+@@ -39,7 +59,22 @@
+ }
+ 
+ func (e *APIError) Error() string {
+-	return "NSX Policy request failed"
++	if e.ErrorMessage != "" && e.ErrorCode != 0 {
++		return fmt.Sprintf(
++			"NSX Policy request failed with HTTP %d (%d): %s",
++			e.StatusCode,
++			e.ErrorCode,
++			e.ErrorMessage,
++		)
++	}
++	if e.ErrorMessage != "" {
++		return fmt.Sprintf(
++			"NSX Policy request failed with HTTP %d: %s",
++			e.StatusCode,
++			e.ErrorMessage,
++		)
++	}
++	return fmt.Sprintf("NSX Policy request failed with HTTP %d", e.StatusCode)
+ }
+ 
+ // ProtocolError reports a successful response that violates the contract.
+@@ -53,10 +88,257 @@
+ 
+ // NewClient validates cfg and returns an independent client.
+ func NewClient(cfg Config) (*Client, error) {
+-	return nil, &ProtocolError{Message: "TODO: validate configuration and create the client"}
++	origin, err := validatedOrigin(cfg.BaseURL)
++	if err != nil {
++		return nil, err
++	}
++	if !validToken(cfg.AccessToken) {
++		return nil, errors.New("access token must be non-blank and header-safe")
++	}
++	if cfg.Refresh == nil {
++		return nil, errors.New("refresh function is required")
++	}
++
++	source := cfg.HTTPClient
++	if source == nil {
++		source = http.DefaultClient
++	}
++	httpClient := *source
++	httpClient.CheckRedirect = func(
++		_ *http.Request,
++		_ []*http.Request,
++	) error {
++		return http.ErrUseLastResponse
++	}
++
++	return &Client{
++		origin:     origin,
++		httpClient: &httpClient,
++		refresh:    cfg.Refresh,
++		token:      cfg.AccessToken,
++	}, nil
+ }
+ 
+ // ListAllGroups lists every page for one domain.
+ func (c *Client) ListAllGroups(ctx context.Context, domainID string) ([]Group, error) {
+-	return nil, &ProtocolError{Message: "TODO: implement ListGroupForDomain pagination and token refresh"}
++	if c == nil || c.httpClient == nil || c.refresh == nil {
++		return nil, errors.New("client is not initialized")
++	}
++	if ctx == nil {
++		return nil, errors.New("context is required")
++	}
++	if strings.TrimSpace(domainID) == "" {
++		return nil, errors.New("domain ID must be non-blank")
++	}
++
++	path := policyBasePath +
++		"/infra/domains/" +
++		url.PathEscape(domainID) +
++		"/groups"
++	var groups []Group
++	cursor := ""
++	seenCursors := make(map[string]struct{})
++
++	for {
++		target := c.origin + path
++		if cursor != "" {
++			query := url.Values{}
++			query.Set("cursor", cursor)
++			target += "?" + query.Encode()
++		}
++
++		page, err := c.getPage(ctx, target)
++		if err != nil {
++			return nil, err
++		}
++		groups = append(groups, page.Results...)
++		if page.Cursor == "" {
++			return groups, nil
++		}
++		if _, exists := seenCursors[page.Cursor]; exists {
++			return nil, &ProtocolError{
++				Message: "ListGroupForDomain returned a repeated cursor",
++			}
++		}
++		seenCursors[page.Cursor] = struct{}{}
++		cursor = page.Cursor
++	}
++}
++
++type groupPage struct {
++	Cursor  string  `json:"cursor"`
++	Results []Group `json:"results"`
++}
++
++type apiErrorEnvelope struct {
++	ErrorCode    int64  `json:"error_code"`
++	ErrorMessage string `json:"error_message"`
++	ModuleName   string `json:"module_name"`
++	Details      string `json:"details"`
++}
++
++func validatedOrigin(raw string) (string, error) {
++	if raw == "" || strings.TrimSpace(raw) != raw {
++		return "", errors.New("base URL must be an HTTP(S) origin")
++	}
++	parsed, err := url.Parse(raw)
++	if err != nil {
++		return "", errors.New("base URL must be an HTTP(S) origin")
++	}
++	if (parsed.Scheme != "http" && parsed.Scheme != "https") ||
++		parsed.Host == "" ||
++		parsed.Hostname() == "" ||
++		parsed.Opaque != "" ||
++		parsed.User != nil ||
++		(parsed.Path != "" && parsed.Path != "/") ||
++		parsed.RawQuery != "" ||
++		parsed.ForceQuery ||
++		parsed.Fragment != "" {
++		return "", errors.New(
++			"base URL must be an HTTP(S) origin without credentials, path, query, or fragment",
++		)
++	}
++	return parsed.Scheme + "://" + parsed.Host, nil
++}
++
++func validToken(token string) bool {
++	if strings.TrimSpace(token) == "" {
++		return false
++	}
++	return !strings.ContainsAny(token, "\r\n\x00")
++}
++
++func (c *Client) currentToken() string {
++	c.tokenMu.Lock()
++	defer c.tokenMu.Unlock()
++	return c.token
++}
++
++func (c *Client) refreshToken(
++	ctx context.Context,
++	stale string,
++) (string, error) {
++	c.tokenMu.Lock()
++	defer c.tokenMu.Unlock()
++
++	if c.token != stale {
++		return c.token, nil
++	}
++	fresh, err := c.refresh(ctx, stale)
++	if err != nil {
++		return "", fmt.Errorf("refresh access token: %w", err)
++	}
++	if !validToken(fresh) || fresh == stale {
++		return "", errors.New(
++			"refresh function returned an invalid replacement access token",
++		)
++	}
++	c.token = fresh
++	return fresh, nil
++}
++
++func (c *Client) getPage(
++	ctx context.Context,
++	target string,
++) (groupPage, error) {
++	token := c.currentToken()
++	for attempt := 0; attempt < 2; attempt++ {
++		request, err := http.NewRequestWithContext(
++			ctx,
++			http.MethodGet,
++			target,
++			nil,
++		)
++		if err != nil {
++			return groupPage{}, fmt.Errorf(
++				"create ListGroupForDomain request: %w",
++				err,
++			)
++		}
++		request.Header.Set("Accept", "application/json")
++		request.Header.Set("Authorization", "Bearer "+token)
++
++		response, err := c.httpClient.Do(request)
++		if err != nil {
++			return groupPage{}, fmt.Errorf(
++				"ListGroupForDomain transport failure: %w",
++				err,
++			)
++		}
++		if response.StatusCode == http.StatusUnauthorized && attempt == 0 {
++			_, _ = io.Copy(
++				io.Discard,
++				io.LimitReader(response.Body, maxResponseSize),
++			)
++			_ = response.Body.Close()
++			token, err = c.refreshToken(ctx, token)
++			if err != nil {
++				return groupPage{}, err
++			}
++			continue
++		}
++
++		body, readErr := io.ReadAll(
++			io.LimitReader(response.Body, maxResponseSize+1),
++		)
++		closeErr := response.Body.Close()
++		if readErr != nil {
++			return groupPage{}, fmt.Errorf(
++				"read ListGroupForDomain response: %w",
++				readErr,
++			)
++		}
++		if closeErr != nil {
++			return groupPage{}, fmt.Errorf(
++				"close ListGroupForDomain response: %w",
++				closeErr,
++			)
++		}
++		if len(body) > maxResponseSize {
++			return groupPage{}, &ProtocolError{
++				Message: "ListGroupForDomain response exceeds size limit",
++			}
++		}
++		if response.StatusCode != http.StatusOK {
++			return groupPage{}, decodeAPIError(response.StatusCode, body)
++		}
++		return decodePage(body)
++	}
++	return groupPage{}, &ProtocolError{
++		Message: "ListGroupForDomain exhausted its authentication retry",
++	}
++}
++
++func decodeAPIError(status int, body []byte) error {
++	var envelope apiErrorEnvelope
++	_ = json.Unmarshal(body, &envelope)
++	return &APIError{
++		StatusCode:   status,
++		ErrorCode:    envelope.ErrorCode,
++		ErrorMessage: envelope.ErrorMessage,
++		ModuleName:   envelope.ModuleName,
++		Details:      envelope.Details,
++	}
++}
++
++func decodePage(body []byte) (groupPage, error) {
++	var page groupPage
++	decoder := json.NewDecoder(bytes.NewReader(body))
++	if err := decoder.Decode(&page); err != nil {
++		return groupPage{}, &ProtocolError{
++			Message: "ListGroupForDomain returned malformed JSON",
++		}
++	}
++	var extra any
++	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
++		return groupPage{}, &ProtocolError{
++			Message: "ListGroupForDomain returned trailing JSON",
++		}
++	}
++	if page.Results == nil {
++		return groupPage{}, &ProtocolError{
++			Message: "ListGroupForDomain response is missing non-null results",
++		}
++	}
++	return page, nil
+ }
