@@ -1,0 +1,197 @@
+diff --git a/vcf_traceflow/__init__.py b/vcf_traceflow/__init__.py
+new file mode 100644
+index 0000000..59492a6
+--- /dev/null
++++ b/vcf_traceflow/__init__.py
+@@ -0,0 +1,8 @@
++"""Small stdlib-only client for project-scoped NSX Policy Traceflow."""
++
++from .client import (
++    NsxPolicyError,
++    NsxPolicyTraceflowClient,
++    TraceflowFailed,
++    TraceflowTimeout,
++)
+diff --git a/vcf_traceflow/client.py b/vcf_traceflow/client.py
+new file mode 100644
+index 0000000..897a1e4
+--- /dev/null
++++ b/vcf_traceflow/client.py
+@@ -0,0 +1,177 @@
++"""VCF 9.1 NSX Policy Traceflow HTTP client using only the Python stdlib."""
++
++from __future__ import annotations
++
++import base64
++import json
++import time
++import urllib.error
++import urllib.parse
++import urllib.request
++from typing import Any
++
++
++class NsxPolicyError(RuntimeError):
++    """An HTTP or transport error returned while calling NSX Policy."""
++
++    def __init__(self, message: str, status_code: int | None = None):
++        super().__init__(message)
++        self.status_code = status_code
++
++
++class TraceflowFailed(RuntimeError):
++    """The asynchronous traceflow reached an unsuccessful terminal state."""
++
++
++class TraceflowTimeout(RuntimeError):
++    """The traceflow did not reach a terminal state within the poll bound."""
++
++
++class NsxPolicyTraceflowClient:
++    """Client for the three project Traceflow operations in the pinned contract."""
++
++    _BASE_PATH = "/policy/api/v1"
++    _TRACEFLOW_PATH = (
++        "/orgs/{org_id}/projects/{project_id}/infra/traceflows/{traceflow_id}"
++    )
++
++    def __init__(
++        self,
++        base_url: str,
++        username: str,
++        password: str,
++        *,
++        poll_interval: float = 0.1,
++        request_timeout: float = 30,
++    ):
++        if poll_interval < 0:
++            raise ValueError("poll_interval must be non-negative")
++        if request_timeout <= 0:
++            raise ValueError("request_timeout must be positive")
++        self.base_url = base_url.rstrip("/")
++        self.poll_interval = poll_interval
++        self.request_timeout = request_timeout
++        credentials = f"{username}:{password}".encode("utf-8")
++        self._authorization = "Basic " + base64.b64encode(credentials).decode("ascii")
++
++    def run_project_traceflow(
++        self,
++        *,
++        org_id: str,
++        project_id: str,
++        traceflow_id: str,
++        config: dict[str, Any],
++        enforcement_point_path: str | None = None,
++        max_polls: int = 60,
++    ) -> dict[str, Any]:
++        """Start, poll, and collect one project-scoped traceflow."""
++        if max_polls <= 0:
++            raise ValueError("max_polls must be positive")
++        path = self._TRACEFLOW_PATH.format(
++            org_id=self._segment(org_id),
++            project_id=self._segment(project_id),
++            traceflow_id=self._segment(traceflow_id),
++        )
++        query = (
++            {"enforcement_point_path": enforcement_point_path}
++            if enforcement_point_path is not None
++            else None
++        )
++        self._request("PUT", path, query=query, body=config)
++
++        final_status: dict[str, Any] | None = None
++        for poll_number in range(max_polls):
++            status = self._request("GET", path + "/status", query=query)
++            operation_state = status.get("operation_state")
++            request_status = status.get("request_status")
++            if operation_state == "FAILED":
++                raise TraceflowFailed(
++                    f"traceflow {traceflow_id!r} failed: {request_status or 'UNKNOWN'}"
++                )
++            if operation_state == "FINISHED":
++                if request_status != "SUCCESS":
++                    raise TraceflowFailed(
++                        f"traceflow {traceflow_id!r} finished unsuccessfully: "
++                        f"{request_status or 'UNKNOWN'}"
++                    )
++                final_status = status
++                break
++            if poll_number + 1 < max_polls and self.poll_interval:
++                time.sleep(self.poll_interval)
++        if final_status is None:
++            raise TraceflowTimeout(
++                f"traceflow {traceflow_id!r} was not terminal after {max_polls} polls"
++            )
++
++        collection = self._request("GET", path + "/observations", query=query)
++        results = collection.get("results")
++        if not isinstance(results, list):
++            raise NsxPolicyError("observation response does not contain a results list")
++        observations = sorted(
++            results,
++            key=lambda item: (
++                item.get("sequence_no", 2**63 - 1),
++                item.get("timestamp_micro", 2**63 - 1),
++                item.get("transport_node_id", ""),
++            ),
++        )
++        return {
++            "traceflow_id": traceflow_id,
++            "operation_state": final_status["operation_state"],
++            "request_status": final_status["request_status"],
++            "observations": observations,
++        }
++
++    @staticmethod
++    def _segment(value: str) -> str:
++        if not isinstance(value, str) or not value:
++            raise ValueError("path identifiers must be non-empty strings")
++        return urllib.parse.quote(value, safe="")
++
++    def _request(
++        self,
++        method: str,
++        path: str,
++        *,
++        query: dict[str, str] | None = None,
++        body: dict[str, Any] | None = None,
++    ) -> dict[str, Any]:
++        url = self.base_url + self._BASE_PATH + path
++        if query:
++            url += "?" + urllib.parse.urlencode(query)
++        data = None
++        headers = {
++            "Accept": "application/json",
++            "Authorization": self._authorization,
++        }
++        if body is not None:
++            data = json.dumps(body, separators=(",", ":")).encode("utf-8")
++            headers["Content-Type"] = "application/json"
++        request = urllib.request.Request(url, data=data, headers=headers, method=method)
++        try:
++            with urllib.request.urlopen(request, timeout=self.request_timeout) as response:
++                raw = response.read()
++        except urllib.error.HTTPError as error:
++            detail = self._error_detail(error)
++            raise NsxPolicyError(
++                f"NSX Policy returned HTTP {error.code}: {detail}", error.code
++            ) from error
++        except urllib.error.URLError as error:
++            raise NsxPolicyError(f"NSX Policy request failed: {error.reason}") from error
++        try:
++            payload = json.loads(raw)
++        except (UnicodeDecodeError, json.JSONDecodeError) as error:
++            raise NsxPolicyError("NSX Policy returned invalid JSON") from error
++        if not isinstance(payload, dict):
++            raise NsxPolicyError("NSX Policy returned a non-object JSON response")
++        return payload
++
++    @staticmethod
++    def _error_detail(error: urllib.error.HTTPError) -> str:
++        try:
++            payload = json.loads(error.read())
++        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
++            return str(error.reason)
++        if isinstance(payload, dict):
++            return str(payload.get("error_message") or payload.get("message") or error.reason)
++        return str(error.reason)

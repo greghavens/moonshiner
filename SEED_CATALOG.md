@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3115 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3117 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -17,8 +17,8 @@
 | **Refactoring & performance** | 29 | Restructure safely and improve measured performance without behavior drift. |
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
-| **Uncategorized** | 32 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 48 | Catalog program awaiting description. |
+| **Uncategorized** | 33 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 49 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -3671,6 +3671,8 @@
 - **vcf91-0064** (`python`) `#vcf-9-1` `#nsx-policy` `#python` `#rest-contract` `#spec-derived` — The network platform team needs a guarded VMware Cloud Foundation 9.1 NSX Policy change. Finish the stdlib-only Python package `nsx_tier1_guard` so a Tier-1 gateway description is PATCHed only afte…
 - **vcf91-0065** (`python`) `#vcf-9-1` `#nsx-policy` `#python` `#rest-contract` `#spec-derived` — The network platform team rotates its VMware Cloud Foundation 9.1 NSX service credential while inventory workers are active. Finish the stdlib-only Python package `nsx_rotating_client` so new reque…
 - **vcf91-0066** (`python`) `#vcf-9-1` `#nsx-policy` `#python` `#rest-contract` `#spec-derived` — An Identity Firewall incident says a user's current login is not reaching NSX. The existing automation guesses that the directory is down from the missing session alone. Finish the stdlib-only Pyth…
+- **vcf91-0067** (`python`) `#vcf-9-1` `#nsx-policy` `#python` `#rest-contract` `#spec-derived` — We need a small, dependency-free integration package for project-scoped NSX Policy Traceflow in VMware Cloud Foundation 9.1. The authoritative subset is already checked in as docs/contract.json, de…
+- **vcf91-0068** (`python`) `#vcf-9-1` `#nsx-policy` `#python` `#rest-contract` `#spec-derived` — Platform engineering ticket. Our VCF 9.1 provisioning job writes several NSX segments in one run. Its access token can expire after an earlier segment has already been accepted, and the current scr…
 
 ## project-io
 
