@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3141 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3142 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 38 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 68 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 69 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -3616,6 +3616,7 @@
 - **ts-snowflake-cancel** (`ts`) — Orchestration team ticket. Our Node workers kick off heavy Snowflake statements (history compaction, partition-stat rebuilds) and today they fire-and-forget: when a run blows its slot budget we jus…
 - **ts-splunk-kvstore-pages** (`ts`) — Ops tooling ticket. Our floor_ops Splunk app keeps asset-sweep checkpoints in a KV Store collection, and the nightly export job that mirrors it into the data lake is a pile of curl in cron that dou…
 - **ts-tfe-state-download** (`ts`) — SRE ticket. Our DR tooling snapshots Terraform Enterprise state by scraping the UI with a headless browser (yes, really), and it broke again when the login page changed. Replace it with a small Typ…
+- **vcf91-0001** (`powershell`) `#vcf-9-1` `#sddc-manager` `#powershell` `#rest-contract` `#spec-derived` — Platform automation ticket for our VMware Cloud Foundation 9.1 estate. Build `VcfHostCommission.psm1` at the workspace root. It must submit one ESXi host for SDDC Manager commissioning and wait for…
 - **vcf91-0009** (`powershell`) `#vcf-9-1` `#sddc-manager` `#powershell` `#rest-contract` `#spec-derived` — VCF platform automation ticket. Our bundle-download runbook currently reads whatever order SDDC Manager happens to return, starts the first matching bundle, and treats the accepted response as comp…
 - **vcf91-0011** (`powershell`) `#vcf-9-1` `#sddc-manager` `#powershell` `#rest-contract` `#spec-derived` — Platform engineering needs a deterministic VMware Cloud Foundation 9.1 domain inventory for a Git-tracked daily report. The existing `VcfDomainInventory` PowerShell module retrieves the records, bu…
 - **vcf91-0012** (`powershell`) `#vcf-9-1` `#sddc-manager` `#powershell` `#rest-contract` `#spec-derived` — The platform-access team needs a small PowerShell module for VMware Cloud Foundation 9.1 SDDC Manager. Implement VcfUserAccess.psm1 at the workspace root. The VMware.Sdk.Vcf.SddcManager PowerCLI mo…
