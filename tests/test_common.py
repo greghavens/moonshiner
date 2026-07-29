@@ -171,3 +171,33 @@ class LoadSeeds(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheSandboxHomeIsNeverSeedContent(unittest.TestCase):
+    """A run's throwaway HOME must not make a verified workspace look dirty.
+
+    pwsh writes StartupProfileData and telemetry.uuid into $HOME the moment it
+    starts. With HOME pointed inside the workspace, a seed that verified
+    perfectly was rejected for an unclean tree, and every PowerShell seed in
+    the corpus would have gone the same way.
+    """
+
+    def test_the_cache_sweep_removes_it(self):
+        import subprocess
+        from common import clear_runtime_caches
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = pathlib.Path(tmp)
+            subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+            cache = workspace / ".sandbox-home" / ".cache" / "powershell"
+            cache.mkdir(parents=True)
+            (cache / "telemetry.uuid").write_text("x")
+            (workspace / "keep.ps1").write_text("# seed content")
+            removed = clear_runtime_caches(workspace)
+            self.assertIn(".sandbox-home", removed)
+            self.assertFalse((workspace / ".sandbox-home").exists())
+            self.assertTrue((workspace / "keep.ps1").exists(),
+                            "seed content must survive the sweep")
+
+    def test_it_is_excluded_from_captured_diffs(self):
+        from common import DIFF_EXCLUDE_PATTERNS
+        self.assertIn("**/.sandbox-home/**", DIFF_EXCLUDE_PATTERNS)
