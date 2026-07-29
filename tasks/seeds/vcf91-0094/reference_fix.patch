@@ -1,0 +1,361 @@
+diff --git a/VcfEvcSafety.psm1 b/VcfEvcSafety.psm1
+index 9ac2532..1a0e3c0 100644
+--- a/VcfEvcSafety.psm1
++++ b/VcfEvcSafety.psm1
+@@ -1,5 +1,260 @@
+ Set-StrictMode -Version Latest
+ 
++class VcfEvcPrecheckException : System.Exception {
++    [string] $TaskId
++
++    VcfEvcPrecheckException([string] $message, [string] $taskId) : base($message) {
++        $this.TaskId = $taskId
++    }
++}
++
++class VcfEvcHttpException : System.Exception {
++    [int] $StatusCode
++
++    VcfEvcHttpException([string] $message, [int] $statusCode) : base($message) {
++        $this.StatusCode = $statusCode
++    }
++}
++
++function Get-ContractMember {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [object] $InputObject,
++
++        [Parameter(Mandatory)]
++        [string] $Name
++    )
++
++    if ($InputObject -is [System.Collections.IDictionary]) {
++        if ($InputObject.Contains($Name)) {
++            return [pscustomobject]@{ Found = $true; Value = $InputObject[$Name] }
++        }
++        return [pscustomobject]@{ Found = $false; Value = $null }
++    }
++
++    $property = $InputObject.PSObject.Properties[$Name]
++    if ($null -eq $property) {
++        return [pscustomobject]@{ Found = $false; Value = $null }
++    }
++    return [pscustomobject]@{ Found = $true; Value = $property.Value }
++}
++
++function ConvertTo-EvcSetSpec {
++    [CmdletBinding()]
++    param(
++        [Parameter()]
++        [AllowNull()]
++        [object] $EvcMode,
++
++        [Parameter(Mandatory)]
++        [bool] $EvcModeWasBound
++    )
++
++    $spec = [ordered]@{}
++    if (-not $EvcModeWasBound) {
++        return $spec
++    }
++    if ($null -eq $EvcMode) {
++        throw [System.ArgumentException]::new(
++            'EvcMode cannot be null when the parameter is supplied.'
++        )
++    }
++
++    $keyMember = Get-ContractMember -InputObject $EvcMode -Name 'key'
++    $masksMember = Get-ContractMember -InputObject $EvcMode -Name 'masks'
++    if (
++        -not $keyMember.Found -or
++        [string]::IsNullOrWhiteSpace([string] $keyMember.Value) -or
++        -not $masksMember.Found -or
++        $null -eq $masksMember.Value
++    ) {
++        throw [System.ArgumentException]::new(
++            'EvcMode requires non-empty key and masks properties.'
++        )
++    }
++
++    if (
++        $masksMember.Value -is [string] -or
++        $masksMember.Value -isnot [System.Collections.IEnumerable]
++    ) {
++        throw [System.ArgumentException]::new('EvcMode.masks must be an array.')
++    }
++
++    $normalizedMasks = @(
++        foreach ($mask in @($masksMember.Value)) {
++            if ($null -eq $mask) {
++                throw [System.ArgumentException]::new(
++                    'EvcMode.masks cannot contain null.'
++                )
++            }
++            $maskKey = Get-ContractMember -InputObject $mask -Name 'key'
++            $maskName = Get-ContractMember -InputObject $mask -Name 'name'
++            $maskValue = Get-ContractMember -InputObject $mask -Name 'value'
++            if (-not $maskKey.Found -or -not $maskName.Found -or -not $maskValue.Found) {
++                throw [System.ArgumentException]::new(
++                    'Each EvcMode mask requires key, name, and value.'
++                )
++            }
++            [ordered]@{
++                key = [string] $maskKey.Value
++                name = [string] $maskName.Value
++                value = [string] $maskValue.Value
++            }
++        }
++    )
++
++    $spec['evc_mode'] = [ordered]@{
++        key = [string] $keyMember.Value
++        masks = $normalizedMasks
++    }
++    return $spec
++}
++
++function Invoke-VcfEvcContractRequest {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [ValidateSet('GET', 'POST', 'PUT')]
++        [string] $Method,
++
++        [Parameter(Mandatory)]
++        [uri] $Uri,
++
++        [Parameter(Mandatory)]
++        [string] $ApiToken,
++
++        [Parameter()]
++        [AllowNull()]
++        [string] $JsonBody,
++
++        [Parameter(Mandatory)]
++        [int] $ExpectedStatus
++    )
++
++    $client = [System.Net.Http.HttpClient]::new()
++    $request = [System.Net.Http.HttpRequestMessage]::new(
++        [System.Net.Http.HttpMethod]::new($Method),
++        $Uri
++    )
++    $response = $null
++    try {
++        [void] $request.Headers.TryAddWithoutValidation(
++            'vmware-api-session-id',
++            $ApiToken
++        )
++        [void] $request.Headers.TryAddWithoutValidation('Accept', 'application/json')
++        if ($PSBoundParameters.ContainsKey('JsonBody')) {
++            $request.Content = [System.Net.Http.StringContent]::new(
++                $JsonBody,
++                [System.Text.Encoding]::UTF8,
++                'application/json'
++            )
++        }
++
++        $response = $client.SendAsync($request).GetAwaiter().GetResult()
++        $content = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
++        $statusCode = [int] $response.StatusCode
++        if ($statusCode -ne $ExpectedStatus) {
++            throw [VcfEvcHttpException]::new(
++                "$Method $($Uri.AbsolutePath) returned HTTP $statusCode.",
++                $statusCode
++            )
++        }
++        if ([string]::IsNullOrWhiteSpace($content)) {
++            return $null
++        }
++        try {
++            return $content | ConvertFrom-Json -Depth 32
++        }
++        catch {
++            throw [VcfEvcHttpException]::new(
++                "$Method $($Uri.AbsolutePath) returned malformed JSON.",
++                $statusCode
++            )
++        }
++    }
++    finally {
++        if ($null -ne $response) {
++            $response.Dispose()
++        }
++        $request.Dispose()
++        $client.Dispose()
++    }
++}
++
++function Wait-VcfEvcPrecheck {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [string] $ServiceRoot,
++
++        [Parameter(Mandatory)]
++        [string] $ApiToken,
++
++        [Parameter(Mandatory)]
++        [string] $TaskId,
++
++        [Parameter(Mandatory)]
++        [int] $TimeoutSeconds,
++
++        [Parameter(Mandatory)]
++        [int] $PollIntervalMilliseconds
++    )
++
++    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
++    $encodedTask = [uri]::EscapeDataString($TaskId)
++    $taskUri = [uri] "$ServiceRoot/api/cis/tasks/$encodedTask"
++    while ($true) {
++        $info = Invoke-VcfEvcContractRequest `
++            -Method GET `
++            -Uri $taskUri `
++            -ApiToken $ApiToken `
++            -ExpectedStatus 200
++
++        if ($null -eq $info) {
++            throw [VcfEvcPrecheckException]::new(
++                'The EVC precheck returned no task information.',
++                $TaskId
++            )
++        }
++        $statusProperty = $info.PSObject.Properties['status']
++        if ($null -eq $statusProperty -or [string]::IsNullOrWhiteSpace(
++            [string] $statusProperty.Value
++        )) {
++            throw [VcfEvcPrecheckException]::new(
++                'The EVC precheck task response has no status.',
++                $TaskId
++            )
++        }
++
++        switch ([string] $statusProperty.Value) {
++            'SUCCEEDED' {
++                return $info
++            }
++            'PENDING' {}
++            'RUNNING' {}
++            'BLOCKED' {}
++            default {
++                throw [VcfEvcPrecheckException]::new(
++                    "The EVC precheck task ended in status $($statusProperty.Value).",
++                    $TaskId
++                )
++            }
++        }
++
++        if ([DateTime]::UtcNow -ge $deadline) {
++            throw [VcfEvcPrecheckException]::new(
++                'Timed out waiting for the EVC precheck task.',
++                $TaskId
++            )
++        }
++        if ($PollIntervalMilliseconds -gt 0) {
++            Start-Sleep -Milliseconds $PollIntervalMilliseconds
++        }
++    }
++}
++
+ function Set-VcfClusterEvcModeSafely {
+     [CmdletBinding()]
+     param(
+@@ -24,9 +279,92 @@ function Set-VcfClusterEvcModeSafely {
+         [int] $PollIntervalMilliseconds = 25
+     )
+ 
+-    throw [System.NotImplementedException]::new(
+-        'Implement the spec-derived precheck gate in VcfEvcSafety.psm1.'
+-    )
++    if ($null -eq (Get-Module -Name 'VMware.Sdk.Vcf.SddcManager')) {
++        throw [System.InvalidOperationException]::new(
++            'The required VMware.Sdk.Vcf.SddcManager module is not imported.'
++        )
++    }
++
++    $serviceRoot = $BaseUrl.AbsoluteUri.TrimEnd('/')
++    $encodedCluster = [uri]::EscapeDataString($ClusterId)
++    $modeWasBound = $PSBoundParameters.ContainsKey('EvcMode')
++    $setSpec = ConvertTo-EvcSetSpec `
++        -EvcMode $EvcMode `
++        -EvcModeWasBound $modeWasBound
++    $jsonBody = $setSpec | ConvertTo-Json -Depth 16 -Compress
++
++    $precheckUri = [uri] (
++        "$serviceRoot/api/vcenter/cluster/$encodedCluster/evc-mode" +
++        '?action=check-set&vmw-task=true'
++    )
++    $precheckTaskId = Invoke-VcfEvcContractRequest `
++        -Method POST `
++        -Uri $precheckUri `
++        -ApiToken $ApiToken `
++        -JsonBody $jsonBody `
++        -ExpectedStatus 202
++
++    if (
++        $precheckTaskId -isnot [string] -or
++        [string]::IsNullOrWhiteSpace($precheckTaskId)
++    ) {
++        throw [VcfEvcPrecheckException]::new(
++            'The EVC precheck did not return a task identifier.',
++            ''
++        )
++    }
++
++    $taskInfo = Wait-VcfEvcPrecheck `
++        -ServiceRoot $serviceRoot `
++        -ApiToken $ApiToken `
++        -TaskId $precheckTaskId `
++        -TimeoutSeconds $TaskTimeoutSeconds `
++        -PollIntervalMilliseconds $PollIntervalMilliseconds
++
++    $resultProperty = $taskInfo.PSObject.Properties['result']
++    if ($null -ne $resultProperty -and $null -ne $resultProperty.Value) {
++        $operationResult = $resultProperty.Value
++        if ($operationResult -isnot [System.Collections.IList]) {
++            throw [VcfEvcPrecheckException]::new(
++                'The EVC precheck returned a malformed operation result.',
++                $precheckTaskId
++            )
++        }
++        if ($operationResult.Count -ne 0) {
++            throw [VcfEvcPrecheckException]::new(
++                'The EVC precheck rejected the requested change.',
++                $precheckTaskId
++            )
++        }
++    }
++
++    $mutationUri = [uri] (
++        "$serviceRoot/api/vcenter/cluster/$encodedCluster/evc-mode" +
++        '?vmw-task=true'
++    )
++    $mutationTaskId = Invoke-VcfEvcContractRequest `
++        -Method PUT `
++        -Uri $mutationUri `
++        -ApiToken $ApiToken `
++        -JsonBody $jsonBody `
++        -ExpectedStatus 202
++
++    if (
++        $mutationTaskId -isnot [string] -or
++        [string]::IsNullOrWhiteSpace($mutationTaskId)
++    ) {
++        throw [VcfEvcHttpException]::new(
++            'The EVC mutation did not return a task identifier.',
++            202
++        )
++    }
++
++    return [pscustomobject][ordered]@{
++        ClusterId = $ClusterId
++        Action = if ($modeWasBound) { 'Set' } else { 'Clear' }
++        PrecheckTaskId = $precheckTaskId
++        MutationTaskId = $mutationTaskId
++    }
+ }
+ 
+ Export-ModuleMember -Function Set-VcfClusterEvcModeSafely

@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3139 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3140 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 38 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 66 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 67 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -3695,6 +3695,7 @@
 - **vcf91-0091** (`powershell`) `#vcf-9-1` `#vcenter-automation` `#powershell` `#rest-contract` `#spec-derived` — Platform engineering needs a reproducible vCenter authorization-role inventory even when the server splits the collection across several pages and returns roles in an arbitrary order. Complete `Vcf…
 - **vcf91-0092** (`powershell`) `#vcf-9-1` `#vcenter-automation` `#powershell` `#rest-contract` `#spec-derived` — Platform engineering needs a retry-safe way to converge a virtual machine on a requested CPU count when a mutating response may be ambiguous. Complete `VcfVcenterCpuReconciler/VcfVcenterCpuReconcil…
 - **vcf91-0093** (`powershell`) `#vcf-9-1` `#vcenter-automation` `#powershell` `#rest-contract` `#spec-derived` — Platform engineering resizes a powered-off VM and then starts it. A power-on failure must not erase the evidence that the CPU and memory changes already succeeded. Complete `VcfVcenterResizeReport/…
+- **vcf91-0094** (`powershell`) `#vcf-9-1` `#vcenter-automation` `#powershell` `#rest-contract` `#spec-derived` — VMware platform engineering needs a safe Enhanced vMotion Compatibility (EVC) rollout primitive for VCF 9.1. Implement the PowerShell module in VcfEvcSafety.psm1. It must expose Set-VcfClusterEvcMo…
 
 ## project-io
 
