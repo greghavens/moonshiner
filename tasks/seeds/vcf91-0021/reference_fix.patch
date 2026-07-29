@@ -1,0 +1,304 @@
+diff --git a/vcf_sddc/__init__.py b/vcf_sddc/__init__.py
+new file mode 100644
+index 0000000..75a2fad
+--- /dev/null
++++ b/vcf_sddc/__init__.py
+@@ -0,0 +1,15 @@
++"""Small standard-library client for the pinned VCF 9.1 SDDC Manager subset."""
++
++from .client import (
++    SddcManagerClient,
++    SddcManagerError,
++    TaskFailedError,
++    TaskTimeoutError,
++)
++
++__all__ = [
++    "SddcManagerClient",
++    "SddcManagerError",
++    "TaskFailedError",
++    "TaskTimeoutError",
++]
+diff --git a/vcf_sddc/client.py b/vcf_sddc/client.py
+new file mode 100644
+index 0000000..81c22f8
+--- /dev/null
++++ b/vcf_sddc/client.py
+@@ -0,0 +1,277 @@
++"""HTTP client for three VCF 9.1 SDDC Manager OpenAPI operations."""
++
++from __future__ import annotations
++
++import json
++import time
++from collections.abc import Mapping
++from typing import Any
++from urllib.error import HTTPError, URLError
++from urllib.parse import quote
++from urllib.request import Request, urlopen
++
++
++class SddcManagerError(RuntimeError):
++    """A transport, HTTP, or response-contract failure."""
++
++    def __init__(
++        self,
++        message: str,
++        *,
++        method: str | None = None,
++        url: str | None = None,
++        status: int | None = None,
++        body: object = None,
++    ) -> None:
++        super().__init__(message)
++        self.method = method
++        self.url = url
++        self.status = status
++        self.body = body
++
++
++class TaskFailedError(RuntimeError):
++    """An asynchronous SDDC Manager task reached an unsuccessful terminal state."""
++
++    def __init__(self, task: dict[str, Any]) -> None:
++        self.task = task
++        status = task.get("status", "unknown")
++        task_id = task.get("id", "unknown")
++        super().__init__(f"SDDC Manager task {task_id} ended with status {status}")
++
++
++class TaskTimeoutError(TimeoutError):
++    """Polling did not reach a terminal state before the caller's deadline."""
++
++    def __init__(
++        self,
++        task_id: str,
++        timeout: float,
++        last_task: dict[str, Any] | None,
++    ) -> None:
++        self.task_id = task_id
++        self.timeout = timeout
++        self.last_task = last_task
++        super().__init__(
++            f"SDDC Manager task {task_id} did not finish within {timeout} seconds"
++        )
++
++
++class SddcManagerClient:
++    """A dependency-free client for createDomain, getTask, and getDomains."""
++
++    _WAITING = {"PENDING", "QUEUED", "IN_PROGRESS"}
++    _SUCCEEDED = {"SUCCESSFUL", "COMPLETED_WITH_WARNING"}
++    _FAILED = {"FAILED", "CANCELLED", "SKIPPED", "TIMED_OUT"}
++
++    def __init__(
++        self,
++        base_url: str,
++        bearer_token: str,
++        timeout: float = 10.0,
++    ) -> None:
++        if not isinstance(base_url, str) or not base_url.strip():
++            raise ValueError("base_url must be a non-empty string")
++        if not isinstance(bearer_token, str) or not bearer_token:
++            raise ValueError("bearer_token must be a non-empty string")
++        if timeout <= 0:
++            raise ValueError("timeout must be positive")
++        self.base_url = base_url.rstrip("/")
++        self.bearer_token = bearer_token
++        self.timeout = float(timeout)
++
++    def _url(self, path: str) -> str:
++        return self.base_url + "/" + path.lstrip("/")
++
++    @staticmethod
++    def _decode_body(raw: bytes) -> object:
++        if not raw:
++            return None
++        text = raw.decode("utf-8", errors="replace")
++        try:
++            return json.loads(text)
++        except json.JSONDecodeError:
++            return text
++
++    def _request(
++        self,
++        method: str,
++        path: str,
++        body: Mapping[str, Any] | None = None,
++    ) -> dict[str, Any]:
++        url = self._url(path)
++        headers = {
++            "Accept": "application/json",
++            "Authorization": f"Bearer {self.bearer_token}",
++        }
++        encoded = None
++        if body is not None:
++            headers["Content-Type"] = "application/json"
++            try:
++                encoded = json.dumps(
++                    dict(body),
++                    ensure_ascii=False,
++                    separators=(",", ":"),
++                ).encode("utf-8")
++            except (TypeError, ValueError) as error:
++                raise SddcManagerError(
++                    f"{method} {url} body is not JSON serializable: {error}",
++                    method=method,
++                    url=url,
++                    body=dict(body),
++                ) from error
++
++        request = Request(url, data=encoded, headers=headers, method=method)
++        try:
++            with urlopen(request, timeout=self.timeout) as response:
++                status = response.status
++                raw = response.read()
++        except HTTPError as error:
++            raw = error.read()
++            decoded = self._decode_body(raw)
++            raise SddcManagerError(
++                f"{method} {url} returned HTTP {error.code}",
++                method=method,
++                url=url,
++                status=error.code,
++                body=decoded,
++            ) from error
++        except URLError as error:
++            raise SddcManagerError(
++                f"{method} {url} failed: {error.reason}",
++                method=method,
++                url=url,
++                body=error.reason,
++            ) from error
++        except OSError as error:
++            raise SddcManagerError(
++                f"{method} {url} failed: {error}",
++                method=method,
++                url=url,
++                body=str(error),
++            ) from error
++
++        decoded = self._decode_body(raw)
++        if not 200 <= status < 300:
++            raise SddcManagerError(
++                f"{method} {url} returned HTTP {status}",
++                method=method,
++                url=url,
++                status=status,
++                body=decoded,
++            )
++        if not isinstance(decoded, dict):
++            raise SddcManagerError(
++                f"{method} {url} returned malformed JSON object",
++                method=method,
++                url=url,
++                status=status,
++                body=decoded,
++            )
++        return decoded
++
++    @staticmethod
++    def _require_task(payload: object, operation: str) -> dict[str, Any]:
++        if not isinstance(payload, dict):
++            raise SddcManagerError(f"{operation} response is not a JSON object")
++        task_id = payload.get("id")
++        status = payload.get("status")
++        if not isinstance(task_id, str) or not task_id:
++            raise SddcManagerError(f"{operation} response has no task id", body=payload)
++        if not isinstance(status, str) or not status.strip():
++            raise SddcManagerError(
++                f"{operation} response has no task status", body=payload
++            )
++        return payload
++
++    @staticmethod
++    def _normalize_status(status: str) -> str:
++        return "_".join(status.strip().upper().split())
++
++    def create_domain(self, spec: Mapping[str, Any]) -> dict[str, Any]:
++        """Submit DomainCreationSpec through the createDomain operation."""
++        if not isinstance(spec, Mapping):
++            raise TypeError("spec must be a mapping")
++        return self._require_task(
++            self._request("POST", "/v1/domains", spec),
++            "createDomain",
++        )
++
++    def get_task(self, task_id: str) -> dict[str, Any]:
++        """Read a task through getTask, safely quoting its path parameter."""
++        if not isinstance(task_id, str) or not task_id:
++            raise ValueError("task_id must be a non-empty string")
++        safe_id = quote(task_id, safe="")
++        return self._require_task(
++            self._request("GET", f"/v1/tasks/{safe_id}"),
++            "getTask",
++        )
++
++    def list_domains(self) -> list[dict[str, Any]]:
++        """Return getDomains elements in deterministic name/id order."""
++        page = self._request("GET", "/v1/domains")
++        elements = page.get("elements")
++        if not isinstance(elements, list):
++            raise SddcManagerError(
++                "getDomains response has no elements array",
++                body=page,
++            )
++        result: list[dict[str, Any]] = []
++        for index, element in enumerate(elements):
++            if not isinstance(element, dict):
++                raise SddcManagerError(
++                    f"getDomains element {index} is not an object",
++                    body=element,
++                )
++            if not isinstance(element.get("name"), str):
++                raise SddcManagerError(
++                    f"getDomains element {index} has no string name",
++                    body=element,
++                )
++            if not isinstance(element.get("id"), str):
++                raise SddcManagerError(
++                    f"getDomains element {index} has no string id",
++                    body=element,
++                )
++            result.append(dict(element))
++        result.sort(key=lambda item: (item["name"].casefold(), item["id"]))
++        return result
++
++    def create_domain_and_wait(
++        self,
++        spec: Mapping[str, Any],
++        *,
++        poll_interval: float = 1.0,
++        timeout: float = 900.0,
++    ) -> dict[str, Any]:
++        """Submit a domain and poll its Task until a known terminal state."""
++        if poll_interval < 0:
++            raise ValueError("poll_interval must not be negative")
++        if timeout < 0:
++            raise ValueError("timeout must not be negative")
++        timeout_value = float(timeout)
++        deadline = time.monotonic() + timeout_value
++        submitted = self.create_domain(spec)
++        task_id = submitted["id"]
++        last_task: dict[str, Any] | None = submitted
++
++        while True:
++            if time.monotonic() > deadline:
++                raise TaskTimeoutError(task_id, timeout_value, last_task)
++            current = self.get_task(task_id)
++            last_task = current
++            status = self._normalize_status(current["status"])
++            if status in self._SUCCEEDED:
++                return current
++            if status in self._FAILED:
++                raise TaskFailedError(current)
++            if status not in self._WAITING:
++                raise SddcManagerError(
++                    f"getTask returned unknown status {current['status']!r}",
++                    body=current,
++                )
++
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise TaskTimeoutError(task_id, timeout_value, last_task)
++            time.sleep(min(float(poll_interval), remaining))
