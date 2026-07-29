@@ -1,0 +1,426 @@
+--- a/client.go
++++ b/client.go
+@@ -2,14 +2,24 @@
+ package runsnapshot
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"io"
++	"mime"
+ 	"net/http"
++	"net/url"
++	"sort"
++	"strings"
++	"sync"
+ )
+ 
+-// ErrNotImplemented marks the incomplete integration.
+-var ErrNotImplemented = errors.New("run snapshot is not implemented")
++const (
++	collectionPageSize = 100
++	maxResponseBytes   = 1 << 20
++)
+ 
+ // Config configures a Client.
+ type Config struct {
+@@ -110,15 +120,393 @@
+ }
+ 
+ // Client is a focused getDomains/getTasks client with token refresh.
+-type Client struct{}
++type Client struct {
++	baseURL        string
++	refreshTokenID string
++	httpClient     *http.Client
++
++	tokenMu     sync.RWMutex
++	accessToken string
++	refreshMu   sync.Mutex
++}
+ 
+ // NewClient validates config without network traffic.
+ func NewClient(config Config) (*Client, error) {
+-	return nil, ErrNotImplemented
++	parsed, err := url.Parse(config.BaseURL)
++	if err != nil ||
++		(parsed.Scheme != "http" && parsed.Scheme != "https") ||
++		parsed.Host == "" ||
++		parsed.User != nil ||
++		parsed.Opaque != "" ||
++		parsed.RawQuery != "" ||
++		parsed.ForceQuery ||
++		parsed.Fragment != "" ||
++		parsed.RawPath != "" ||
++		(parsed.Path != "" && parsed.Path != "/") {
++		return nil, errors.New("BaseURL must be an HTTP(S) origin")
++	}
++	if strings.TrimSpace(config.AccessToken) == "" ||
++		containsASCIIWhitespace(config.AccessToken) {
++		return nil, errors.New(
++			"AccessToken must be nonblank and contain no ASCII whitespace",
++		)
++	}
++	if strings.TrimSpace(config.RefreshTokenID) == "" ||
++		containsASCIIWhitespace(config.RefreshTokenID) {
++		return nil, errors.New(
++			"RefreshTokenID must be nonblank and contain no ASCII whitespace",
++		)
++	}
++
++	baseClient := config.HTTPClient
++	if baseClient == nil {
++		baseClient = http.DefaultClient
++	}
++	clientCopy := *baseClient
++	clientCopy.CheckRedirect = func(
++		_ *http.Request,
++		_ []*http.Request,
++	) error {
++		return http.ErrUseLastResponse
++	}
++	return &Client{
++		baseURL:        strings.TrimSuffix(parsed.String(), "/"),
++		refreshTokenID: config.RefreshTokenID,
++		httpClient:     &clientCopy,
++		accessToken:    config.AccessToken,
++	}, nil
+ }
+ 
+ // Snapshot retrieves both collections, refreshing an expired access token
+ // without repeating a collection that already succeeded.
+ func (c *Client) Snapshot(ctx context.Context) (Snapshot, error) {
+-	return Snapshot{}, ErrNotImplemented
++	var snapshot Snapshot
++	if c == nil || c.httpClient == nil {
++		return snapshot, errors.New("client is not initialized")
++	}
++	if ctx == nil {
++		return snapshot, errors.New("context must not be nil")
++	}
++	if err := ctx.Err(); err != nil {
++		return snapshot, err
++	}
++
++	refreshed := false
++	domains, err := c.getDomains(ctx, &refreshed)
++	if err != nil {
++		return snapshot, err
++	}
++	snapshot.Domains = domains
++
++	tasks, err := c.getTasks(ctx, &refreshed)
++	if err != nil {
++		return snapshot, err
++	}
++	snapshot.Tasks = tasks
++	return snapshot, nil
++}
++
++type pageMetadataWire struct {
++	PageNumber    *int `json:"pageNumber"`
++	PageSize      *int `json:"pageSize"`
++	TotalElements *int `json:"totalElements"`
++	TotalPages    *int `json:"totalPages"`
++}
++
++type pageWire struct {
++	Elements     json.RawMessage   `json:"elements"`
++	PageMetadata *pageMetadataWire `json:"pageMetadata"`
++}
++
++func (c *Client) getDomains(
++	ctx context.Context,
++	refreshed *bool,
++) ([]Domain, error) {
++	data, err := c.getCollection(
++		ctx,
++		"getDomains",
++		"/v1/domains?pageNumber=0&pageSize=100",
++		refreshed,
++	)
++	if err != nil {
++		return nil, err
++	}
++	var page pageWire
++	if err := decodeOneJSON(data, &page); err != nil {
++		return nil, protocol("getDomains", "success body was not one JSON object")
++	}
++	var domains []Domain
++	if !jsonArray(page.Elements) ||
++		json.Unmarshal(page.Elements, &domains) != nil {
++		return nil, protocol("getDomains", "elements was not an array")
++	}
++	if err := validatePage("getDomains", page.PageMetadata, len(domains)); err != nil {
++		return nil, err
++	}
++	ids := make(map[string]struct{}, len(domains))
++	for _, domain := range domains {
++		if strings.TrimSpace(domain.ID) == "" ||
++			strings.TrimSpace(domain.Name) == "" {
++			return nil, protocol("getDomains", "an element lacked id or name")
++		}
++		if _, duplicate := ids[domain.ID]; duplicate {
++			return nil, protocol("getDomains", "duplicate domain id")
++		}
++		ids[domain.ID] = struct{}{}
++	}
++	sort.Slice(domains, func(left, right int) bool {
++		if domains[left].Name == domains[right].Name {
++			return domains[left].ID < domains[right].ID
++		}
++		return domains[left].Name < domains[right].Name
++	})
++	return domains, nil
++}
++
++func (c *Client) getTasks(
++	ctx context.Context,
++	refreshed *bool,
++) ([]Task, error) {
++	data, err := c.getCollection(
++		ctx,
++		"getTasks",
++		"/v1/tasks?pageNumber=0&pageSize=100",
++		refreshed,
++	)
++	if err != nil {
++		return nil, err
++	}
++	var page pageWire
++	if err := decodeOneJSON(data, &page); err != nil {
++		return nil, protocol("getTasks", "success body was not one JSON object")
++	}
++	var tasks []Task
++	if !jsonArray(page.Elements) ||
++		json.Unmarshal(page.Elements, &tasks) != nil {
++		return nil, protocol("getTasks", "elements was not an array")
++	}
++	if err := validatePage("getTasks", page.PageMetadata, len(tasks)); err != nil {
++		return nil, err
++	}
++	ids := make(map[string]struct{}, len(tasks))
++	for _, task := range tasks {
++		if strings.TrimSpace(task.ID) == "" ||
++			strings.TrimSpace(task.Name) == "" ||
++			strings.TrimSpace(task.Status) == "" ||
++			strings.TrimSpace(task.CreationTimestamp) == "" {
++			return nil, protocol("getTasks", "an element lacked a required Task field")
++		}
++		if _, duplicate := ids[task.ID]; duplicate {
++			return nil, protocol("getTasks", "duplicate task id")
++		}
++		ids[task.ID] = struct{}{}
++	}
++	sort.Slice(tasks, func(left, right int) bool {
++		if tasks[left].Name == tasks[right].Name {
++			return tasks[left].ID < tasks[right].ID
++		}
++		return tasks[left].Name < tasks[right].Name
++	})
++	return tasks, nil
++}
++
++func (c *Client) getCollection(
++	ctx context.Context,
++	operationID string,
++	target string,
++	refreshed *bool,
++) ([]byte, error) {
++	token := c.currentToken()
++	data, err := c.doJSON(
++		ctx,
++		operationID,
++		http.MethodGet,
++		target,
++		token,
++		nil,
++		http.StatusOK,
++	)
++	if err == nil {
++		return data, nil
++	}
++	var apiError *APIError
++	if !errors.As(err, &apiError) ||
++		apiError.StatusCode != http.StatusUnauthorized ||
++		*refreshed {
++		return nil, err
++	}
++
++	*refreshed = true
++	if err := c.refresh(ctx, token); err != nil {
++		return nil, err
++	}
++	return c.doJSON(
++		ctx,
++		operationID,
++		http.MethodGet,
++		target,
++		c.currentToken(),
++		nil,
++		http.StatusOK,
++	)
++}
++
++func (c *Client) refresh(ctx context.Context, staleToken string) error {
++	c.refreshMu.Lock()
++	defer c.refreshMu.Unlock()
++	if c.currentToken() != staleToken {
++		return nil
++	}
++
++	body, _ := json.Marshal(c.refreshTokenID)
++	data, err := c.doJSON(
++		ctx,
++		"refreshAccessToken",
++		http.MethodPatch,
++		"/v1/tokens/access-token/refresh",
++		"",
++		body,
++		http.StatusOK,
++	)
++	if err != nil {
++		return err
++	}
++	var newToken string
++	if err := decodeOneJSON(data, &newToken); err != nil ||
++		strings.TrimSpace(newToken) == "" ||
++		containsASCIIWhitespace(newToken) {
++		return protocol(
++			"refreshAccessToken",
++			"success body was not a usable JSON access-token string",
++		)
++	}
++	c.tokenMu.Lock()
++	c.accessToken = newToken
++	c.tokenMu.Unlock()
++	return nil
++}
++
++func (c *Client) currentToken() string {
++	c.tokenMu.RLock()
++	defer c.tokenMu.RUnlock()
++	return c.accessToken
++}
++
++func (c *Client) doJSON(
++	ctx context.Context,
++	operationID string,
++	method string,
++	target string,
++	accessToken string,
++	body []byte,
++	successStatus int,
++) ([]byte, error) {
++	var reader io.Reader
++	if body != nil {
++		reader = bytes.NewReader(body)
++	}
++	request, err := http.NewRequestWithContext(
++		ctx,
++		method,
++		c.baseURL+target,
++		reader,
++	)
++	if err != nil {
++		return nil, protocol(operationID, "request target could not be constructed")
++	}
++	request.Header.Set("Accept", "application/json")
++	if accessToken != "" {
++		request.Header.Set("Authorization", "Bearer "+accessToken)
++	}
++	if body != nil {
++		request.Header.Set("Content-Type", "application/json")
++	}
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return nil, &TransportError{OperationID: operationID, Err: err}
++	}
++	defer response.Body.Close()
++	data, readErr := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
++	if readErr != nil {
++		return nil, protocol(operationID, "response body could not be read")
++	}
++	if len(data) > maxResponseBytes {
++		return nil, protocol(operationID, "response body exceeded the size limit")
++	}
++	if response.StatusCode != successStatus {
++		var envelope VCFError
++		_ = decodeOneJSON(data, &envelope)
++		return nil, &APIError{
++			OperationID:        operationID,
++			StatusCode:         response.StatusCode,
++			ErrorCode:          envelope.ErrorCode,
++			Message:            envelope.Message,
++			RemediationMessage: envelope.RemediationMessage,
++			ReferenceToken:     envelope.ReferenceToken,
++		}
++	}
++	mediaType, _, mediaErr := mime.ParseMediaType(response.Header.Get("Content-Type"))
++	if mediaErr != nil || mediaType != "application/json" {
++		return nil, protocol(operationID, "success response was not application/json")
++	}
++	return data, nil
++}
++
++func validatePage(
++	operationID string,
++	metadata *pageMetadataWire,
++	elementCount int,
++) error {
++	if metadata == nil ||
++		metadata.PageNumber == nil ||
++		metadata.PageSize == nil ||
++		metadata.TotalElements == nil ||
++		metadata.TotalPages == nil {
++		return protocol(operationID, "pageMetadata was incomplete")
++	}
++	totalPages := 0
++	if elementCount > 0 {
++		totalPages = 1
++	}
++	if *metadata.PageNumber != 0 ||
++		*metadata.PageSize != elementCount ||
++		*metadata.TotalElements != elementCount ||
++		*metadata.TotalPages != totalPages ||
++		elementCount > collectionPageSize {
++		return protocol(operationID, "pageMetadata was inconsistent")
++	}
++	return nil
++}
++
++func jsonArray(data json.RawMessage) bool {
++	trimmed := bytes.TrimSpace(data)
++	return len(trimmed) > 0 && trimmed[0] == '['
++}
++
++func decodeOneJSON(data []byte, out any) error {
++	decoder := json.NewDecoder(bytes.NewReader(data))
++	if err := decoder.Decode(out); err != nil {
++		return err
++	}
++	var extra any
++	if err := decoder.Decode(&extra); err != io.EOF {
++		return errors.New("JSON response contained trailing data")
++	}
++	return nil
++}
++
++func protocol(operationID, reason string) *ProtocolError {
++	return &ProtocolError{OperationID: operationID, Reason: reason}
++}
++
++func containsASCIIWhitespace(value string) bool {
++	return strings.IndexFunc(value, func(character rune) bool {
++		switch character {
++		case ' ', '\t', '\n', '\r', '\v', '\f':
++			return true
++		default:
++			return false
++		}
++	}) >= 0
+ }

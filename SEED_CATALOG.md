@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3084 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3086 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 30 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 19 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 21 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -3640,6 +3640,8 @@
 - **vcf91-0031** (`go`) `#vcf-9-1` `#sddc-manager` `#go` `#rest-contract` `#spec-derived` — Complete the root Go package `credentialgate` (module `vcf91-0031`, standard library only) as a focused VMware Cloud Foundation 9.1 SDDC Manager REST integration. The package owns a currently usabl…
 - **vcf91-0032** (`go`) `#vcf-9-1` `#sddc-manager` `#go` `#rest-contract` `#spec-derived` — Complete the root Go package `taskdiagnosis` (module `vcf91-0032`, standard library only) as a focused VMware Cloud Foundation 9.1 SDDC Manager REST integration. Operators currently guess from a fa…
 - **vcf91-0033** (`go`) `#vcf-9-1` `#sddc-manager` `#go` `#rest-contract` `#spec-derived` — Complete the root Go package `hostrefresh` (module `vcf91-0033`, standard library only) as a focused VMware Cloud Foundation 9.1 SDDC Manager REST integration. An operator selects hosts whose SDDC…
+- **vcf91-0034** (`go`) `#vcf-9-1` `#sddc-manager` `#go` `#rest-contract` `#spec-derived` — Complete the root Go package `runsnapshot` (module `vcf91-0034`, standard library only) as a focused VMware Cloud Foundation 9.1 SDDC Manager REST integration. A monitoring run retrieves domains an…
+- **vcf91-0035** (`go`) `#vcf-9-1` `#sddc-manager` `#go` `#rest-contract` `#spec-derived` — Complete the root Go package `domaininventory` (module `vcf91-0035`, standard library only) as a focused VMware Cloud Foundation 9.1 SDDC Manager REST integration. The operator needs one complete d…
 
 ## project-io
 

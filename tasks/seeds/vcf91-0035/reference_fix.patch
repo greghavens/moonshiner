@@ -1,0 +1,280 @@
+--- a/client.go
++++ b/client.go
+@@ -3,17 +3,26 @@
+ package domaininventory
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"io"
++	"math"
++	"mime"
+ 	"net/http"
++	"net/url"
++	"sort"
++	"strconv"
++	"strings"
+ )
+ 
+ const maxResponseBytes = 1 << 20
+ 
+ // ErrNotImplemented marks the incomplete integration.
+ var ErrNotImplemented = errors.New("domain inventory is not implemented")
+ 
+ // Config configures a Client.
+ type Config struct {
+ 	BaseURL     string
+@@ -112,14 +121,247 @@
+ }
+ 
+ // Client is a focused getDomains client.
+-type Client struct{}
++type Client struct {
++	baseURL     string
++	accessToken string
++	httpClient  *http.Client
++	pageSize    int
++}
+ 
+ // NewClient validates configuration without network traffic.
+ func NewClient(config Config) (*Client, error) {
+-	return nil, ErrNotImplemented
++	parsed, err := url.Parse(config.BaseURL)
++	if err != nil ||
++		(parsed.Scheme != "http" && parsed.Scheme != "https") ||
++		parsed.Host == "" ||
++		parsed.User != nil ||
++		parsed.RawQuery != "" ||
++		parsed.ForceQuery ||
++		parsed.Fragment != "" ||
++		(parsed.Path != "" && parsed.Path != "/") {
++		return nil, errors.New("BaseURL must be an HTTP(S) origin")
++	}
++	if strings.TrimSpace(config.AccessToken) == "" ||
++		containsASCIIWhitespace(config.AccessToken) {
++		return nil, errors.New(
++			"AccessToken must be nonblank and contain no ASCII whitespace",
++		)
++	}
++	if config.PageSize < 1 || config.PageSize > math.MaxInt32 {
++		return nil, errors.New("PageSize must be a positive int32")
++	}
++
++	baseClient := config.HTTPClient
++	if baseClient == nil {
++		baseClient = http.DefaultClient
++	}
++	clientCopy := *baseClient
++	clientCopy.CheckRedirect = func(
++		_ *http.Request,
++		_ []*http.Request,
++	) error {
++		return http.ErrUseLastResponse
++	}
++
++	return &Client{
++		baseURL:     strings.TrimSuffix(parsed.String(), "/"),
++		accessToken: config.AccessToken,
++		httpClient:  &clientCopy,
++		pageSize:    config.PageSize,
++	}, nil
+ }
+ 
+ // ListDomains retrieves every getDomains page and returns a stable collection.
+ func (c *Client) ListDomains(ctx context.Context) ([]Domain, error) {
+-	return nil, ErrNotImplemented
++	if c == nil ||
++		c.httpClient == nil ||
++		c.pageSize < 1 ||
++		c.pageSize > math.MaxInt32 {
++		return nil, errors.New("client is not initialized")
++	}
++	if ctx == nil {
++		return nil, errors.New("context must not be nil")
++	}
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++
++	domains := make([]Domain, 0)
++	totalPages := -1
++	totalElements := -1
++	for pageNumber := 0; ; pageNumber++ {
++		page, err := c.getDomainsPage(ctx, pageNumber)
++		if err != nil {
++			return nil, err
++		}
++		if err := validatePage(page, pageNumber); err != nil {
++			return nil, err
++		}
++
++		metadata := page.PageMetadata
++		if pageNumber == 0 {
++			totalPages = metadata.TotalPages
++			totalElements = metadata.TotalElements
++		} else if metadata.TotalPages != totalPages ||
++			metadata.TotalElements != totalElements {
++			return nil, protocolError("pagination totals changed between pages")
++		}
++
++		domains = append(domains, page.Elements...)
++		if totalPages == 0 || pageNumber+1 == totalPages {
++			break
++		}
++	}
++	if len(domains) != totalElements {
++		return nil, protocolError(
++			"retrieved element count did not match totalElements",
++		)
++	}
++
++	sort.Slice(domains, func(left, right int) bool {
++		if domains[left].Name != domains[right].Name {
++			return domains[left].Name < domains[right].Name
++		}
++		return domains[left].ID < domains[right].ID
++	})
++	return domains, nil
++}
++
++func (c *Client) getDomainsPage(
++	ctx context.Context,
++	pageNumber int,
++) (DomainPage, error) {
++	query := url.Values{}
++	query.Set("pageNumber", strconv.Itoa(pageNumber))
++	query.Set("pageSize", strconv.Itoa(c.pageSize))
++	target := c.baseURL + "/v1/domains?" + query.Encode()
++
++	request, err := http.NewRequestWithContext(
++		ctx,
++		http.MethodGet,
++		target,
++		nil,
++	)
++	if err != nil {
++		return DomainPage{}, protocolError(
++			"request target could not be constructed",
++		)
++	}
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set("Authorization", "Bearer "+c.accessToken)
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return DomainPage{}, &TransportError{
++			OperationID: "getDomains",
++			Err:         err,
++		}
++	}
++	defer response.Body.Close()
++
++	content, err := io.ReadAll(
++		io.LimitReader(response.Body, maxResponseBytes+1),
++	)
++	if err != nil {
++		return DomainPage{}, &TransportError{
++			OperationID: "getDomains",
++			Err:         err,
++		}
++	}
++	if len(content) > maxResponseBytes {
++		return DomainPage{}, protocolError("response exceeded the size limit")
++	}
++	if response.StatusCode != http.StatusOK {
++		var decoded VCFError
++		_ = decodeOneJSON(content, &decoded)
++		return DomainPage{}, &APIError{
++			OperationID:        "getDomains",
++			Status:             response.StatusCode,
++			ErrorCode:          decoded.ErrorCode,
++			Message:            decoded.Message,
++			RemediationMessage: decoded.RemediationMessage,
++			ReferenceToken:     decoded.ReferenceToken,
++		}
++	}
++
++	mediaType, _, err := mime.ParseMediaType(
++		response.Header.Get("Content-Type"),
++	)
++	if err != nil || mediaType != "application/json" {
++		return DomainPage{}, protocolError(
++			"success response was not application/json",
++		)
++	}
++
++	var page DomainPage
++	if err := decodeOneJSON(content, &page); err != nil {
++		return DomainPage{}, protocolError(
++			"success response was not one JSON document",
++		)
++	}
++	return page, nil
++}
++
++func validatePage(page DomainPage, requestedPage int) error {
++	metadata := page.PageMetadata
++	if metadata.PageNumber < 0 ||
++		metadata.PageSize < 0 ||
++		metadata.TotalElements < 0 ||
++		metadata.TotalPages < 0 ||
++		metadata.PageNumber > math.MaxInt32 ||
++		metadata.PageSize > math.MaxInt32 ||
++		metadata.TotalElements > math.MaxInt32 ||
++		metadata.TotalPages > math.MaxInt32 {
++		return protocolError("pagination metadata was outside int32 bounds")
++	}
++	if metadata.PageNumber != requestedPage {
++		return protocolError("pageNumber did not match the requested page")
++	}
++	if metadata.PageSize != len(page.Elements) {
++		return protocolError("pageSize did not match the returned element count")
++	}
++	if metadata.TotalPages == 0 {
++		if requestedPage != 0 ||
++			metadata.TotalElements != 0 ||
++			metadata.PageSize != 0 {
++			return protocolError("zero-page collection metadata was inconsistent")
++		}
++		return nil
++	}
++	if requestedPage >= metadata.TotalPages {
++		return protocolError("pageNumber was outside totalPages")
++	}
++	return nil
++}
++
++func protocolError(reason string) *ProtocolError {
++	return &ProtocolError{
++		OperationID: "getDomains",
++		Reason:      reason,
++	}
++}
++
++func decodeOneJSON(content []byte, out any) error {
++	decoder := json.NewDecoder(bytes.NewReader(content))
++	if err := decoder.Decode(out); err != nil {
++		return err
++	}
++	var trailing any
++	if err := decoder.Decode(&trailing); err != io.EOF {
++		if err == nil {
++			return errors.New("trailing JSON value")
++		}
++		return err
++	}
++	return nil
++}
++
++func containsASCIIWhitespace(value string) bool {
++	for index := 0; index < len(value); index++ {
++		switch value[index] {
++		case ' ', '\t', '\n', '\r', '\v', '\f':
++			return true
++		}
++	}
++	return false
+ }
