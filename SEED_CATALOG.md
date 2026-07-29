@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3124 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3125 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -17,7 +17,7 @@
 | **Refactoring & performance** | 29 | Restructure safely and improve measured performance without behavior drift. |
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
-| **Uncategorized** | 34 | Catalog program awaiting description. |
+| **Uncategorized** | 35 | Catalog program awaiting description. |
 | **VMware Cloud Foundation 9.1** | 55 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
@@ -3680,6 +3680,7 @@
 - **vcf91-0074** (`go`) `#vcf-9-1` `#nsx-policy` `#go` `#rest-contract` `#spec-derived` — Implement the standard-library-only root Go package `nsxpolicy` in `client.go`. The VCF network automation workflow enables an existing NSX Policy infra segment only after an immediate read prechec…
 - **vcf91-0076** (`go`) `#vcf-9-1` `#nsx-policy` `#go` `#rest-contract` `#spec-derived` — Platform networking incident ticket. Our VCF 9.1 segment reconciler reports only `NSX Policy returned 500; realization outcome unknown` after patching `app-seg`. Do not guess from that message: `fi…
 - **vcf91-0078** (`go`) `#vcf-9-1` `#nsx-policy` `#go` `#rest-contract` `#spec-derived` — Implement the standard-library-only root Go package `nsxpolicy` in `client.go`. It must collect every page of VCF 9.1 NSX Policy infra segments while an access token expires after the first page. R…
+- **vcf91-0079** (`java`) `#vcf-9-1` `#nsx-policy` `#java` `#rest-contract` `#spec-derived` — Implement `NsxPolicyClient.java`, a dependency-free single-file Java client for the two VCF 9.1 NSX Policy operations recorded in `docs/contract.json`: `PatchSegment` and `ReadIntentStatus`. Do not…
 
 ## project-io
 

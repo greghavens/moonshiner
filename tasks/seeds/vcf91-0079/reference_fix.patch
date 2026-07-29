@@ -1,0 +1,220 @@
+diff --git a/NsxPolicyClient.java b/NsxPolicyClient.java
+index 2ff3c1f..bfd9311 100644
+--- a/NsxPolicyClient.java
++++ b/NsxPolicyClient.java
+@@ -1,12 +1,23 @@
+ import java.io.IOException;
+ import java.net.URI;
++import java.net.URLEncoder;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
+ import java.time.Duration;
++import java.util.Base64;
+ import java.util.Objects;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
+ 
+ /**
+  * Minimal NSX Policy client. Implement patchSegmentAndWait using docs/contract.json.
+  */
+ public final class NsxPolicyClient {
++    private static final Pattern PUBLISH_STATUS = Pattern.compile(
++            "\"publish_status\"\\s*:\\s*\"([^\"]+)\"");
++
+     @FunctionalInterface
+     public interface Sleeper {
+         void sleep(Duration duration) throws InterruptedException;
+@@ -17,6 +28,7 @@ public final class NsxPolicyClient {
+     private final String password;
+     private final Duration requestTimeout;
+     private final Sleeper sleeper;
++    private final HttpClient httpClient;
+ 
+     public NsxPolicyClient(
+             URI baseUri,
+@@ -29,6 +41,19 @@ public final class NsxPolicyClient {
+         this.password = Objects.requireNonNull(password, "password");
+         this.requestTimeout = Objects.requireNonNull(requestTimeout, "requestTimeout");
+         this.sleeper = Objects.requireNonNull(sleeper, "sleeper");
++        if (!"http".equalsIgnoreCase(baseUri.getScheme())
++                && !"https".equalsIgnoreCase(baseUri.getScheme())) {
++            throw new IllegalArgumentException("baseUri must use http or https");
++        }
++        if (baseUri.getRawQuery() != null || baseUri.getRawFragment() != null) {
++            throw new IllegalArgumentException("baseUri must not contain a query or fragment");
++        }
++        if (requestTimeout.isZero() || requestTimeout.isNegative()) {
++            throw new IllegalArgumentException("requestTimeout must be positive");
++        }
++        this.httpClient = HttpClient.newBuilder()
++                .connectTimeout(requestTimeout)
++                .build();
+     }
+ 
+     /**
+@@ -45,6 +70,162 @@ public final class NsxPolicyClient {
+             String dhcpConfigPath,
+             Duration pollInterval,
+             int maxPolls) throws IOException, InterruptedException {
+-        throw new UnsupportedOperationException("TODO");
++        Objects.requireNonNull(tier1Id, "tier1Id");
++        Objects.requireNonNull(segmentId, "segmentId");
++        Objects.requireNonNull(displayName, "displayName");
++        Objects.requireNonNull(gatewayAddress, "gatewayAddress");
++        Objects.requireNonNull(pollInterval, "pollInterval");
++        if (pollInterval.isNegative()) {
++            throw new IllegalArgumentException("pollInterval must not be negative");
++        }
++        if (maxPolls <= 0) {
++            throw new IllegalArgumentException("maxPolls must be positive");
++        }
++
++        String intentPath = "/infra/tier-1s/" + tier1Id + "/segments/" + segmentId;
++        String patchPath = "/policy/api/v1/infra/tier-1s/"
++                + encodePathSegment(tier1Id)
++                + "/segments/"
++                + encodePathSegment(segmentId);
++        String payload = segmentPayload(
++                displayName, gatewayAddress, description, dhcpConfigPath);
++
++        HttpResponse<String> patchResponse = send(
++                request(patchPath)
++                        .header("Content-Type", "application/json")
++                        .method(
++                                "PATCH",
++                                HttpRequest.BodyPublishers.ofString(
++                                        payload, StandardCharsets.UTF_8))
++                        .build());
++        requireStatus(patchResponse, 200, "PatchSegment");
++
++        String statusPath = "/policy/api/v1/infra/realized-state/status?intent_path="
++                + URLEncoder.encode(intentPath, StandardCharsets.UTF_8);
++        for (int poll = 1; poll <= maxPolls; poll++) {
++            HttpResponse<String> statusResponse = send(
++                    request(statusPath).GET().build());
++            requireStatus(statusResponse, 200, "ReadIntentStatus");
++
++            Matcher matcher = PUBLISH_STATUS.matcher(statusResponse.body());
++            if (!matcher.find()) {
++                throw new IOException("ReadIntentStatus response is missing publish_status");
++            }
++            String status = matcher.group(1);
++            if ("REALIZED".equals(status)) {
++                return status;
++            }
++            if ("ERROR".equals(status)) {
++                throw new IOException("NSX intent realization ended in ERROR");
++            }
++            if (!"UNAVAILABLE".equals(status) && !"UNREALIZED".equals(status)) {
++                throw new IOException("Unknown NSX publish_status: " + status);
++            }
++            if (poll < maxPolls) {
++                sleeper.sleep(pollInterval);
++            }
++        }
++        throw new IOException("NSX intent was not realized after " + maxPolls + " polls");
++    }
++
++    private HttpRequest.Builder request(String pathAndQuery) {
++        return HttpRequest.newBuilder(endpoint(pathAndQuery))
++                .timeout(requestTimeout)
++                .header("Accept", "application/json")
++                .header("Authorization", basicAuthorization());
++    }
++
++    private HttpResponse<String> send(HttpRequest request)
++            throws IOException, InterruptedException {
++        return httpClient.send(
++                request,
++                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++    }
++
++    private static void requireStatus(
++            HttpResponse<?> response, int expected, String operation) throws IOException {
++        if (response.statusCode() != expected) {
++            throw new IOException(
++                    operation + " returned HTTP " + response.statusCode()
++                            + ", expected " + expected);
++        }
++    }
++
++    private URI endpoint(String pathAndQuery) {
++        String value = baseUri.toString();
++        while (value.endsWith("/")) {
++            value = value.substring(0, value.length() - 1);
++        }
++        return URI.create(value + pathAndQuery);
++    }
++
++    private String basicAuthorization() {
++        String credentials = username + ":" + password;
++        return "Basic " + Base64.getEncoder().encodeToString(
++                credentials.getBytes(StandardCharsets.UTF_8));
++    }
++
++    private static String encodePathSegment(String value) {
++        return URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20");
++    }
++
++    private static String segmentPayload(
++            String displayName,
++            String gatewayAddress,
++            String description,
++            String dhcpConfigPath) {
++        StringBuilder json = new StringBuilder();
++        json.append("{\"resource_type\":\"Segment\",\"display_name\":\"")
++                .append(jsonEscape(displayName))
++                .append("\",\"subnets\":[{\"gateway_address\":\"")
++                .append(jsonEscape(gatewayAddress))
++                .append("\"}]");
++        if (description != null) {
++            json.append(",\"description\":\"")
++                    .append(jsonEscape(description))
++                    .append('"');
++        }
++        if (dhcpConfigPath != null) {
++            json.append(",\"dhcp_config_path\":\"")
++                    .append(jsonEscape(dhcpConfigPath))
++                    .append('"');
++        }
++        return json.append('}').toString();
++    }
++
++    private static String jsonEscape(String value) {
++        StringBuilder escaped = new StringBuilder(value.length() + 16);
++        for (int index = 0; index < value.length(); index++) {
++            char current = value.charAt(index);
++            switch (current) {
++                case '"' -> escaped.append("\\\"");
++                case '\\' -> escaped.append("\\\\");
++                case '\b' -> escaped.append("\\b");
++                case '\f' -> escaped.append("\\f");
++                case '\n' -> escaped.append("\\n");
++                case '\r' -> escaped.append("\\r");
++                case '\t' -> escaped.append("\\t");
++                default -> {
++                    if (current < 0x20) {
++                        appendUnicodeEscape(escaped, current);
++                    } else if (Character.isHighSurrogate(current)
++                            && index + 1 < value.length()
++                            && Character.isLowSurrogate(value.charAt(index + 1))) {
++                        escaped.append(current).append(value.charAt(++index));
++                    } else if (Character.isSurrogate(current)) {
++                        appendUnicodeEscape(escaped, current);
++                    } else {
++                        escaped.append(current);
++                    }
++                }
++            }
++        }
++        return escaped.toString();
++    }
++
++    private static void appendUnicodeEscape(StringBuilder output, char value) {
++        output.append("\\u");
++        String hex = Integer.toHexString(value);
++        output.append("0".repeat(4 - hex.length())).append(hex);
+     }
+ }
