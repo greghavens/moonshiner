@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3099 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3100 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 31 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 33 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 34 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -3655,6 +3655,7 @@
 - **vcf91-0046** (`java`) `#vcf-9-1` `#sddc-manager` `#java` `#rest-contract` `#spec-derived` — Implement src/VcfSddcClient.java as a single-file, Java 17 standard-library client for the pinned VMware Cloud Foundation 9.1 SDDC Manager contract in docs/contract.json. listDomainsSorted() must c…
 - **vcf91-0047** (`java`) `#vcf-9-1` `#sddc-manager` `#java` `#rest-contract` `#spec-derived` — Inventory integration ticket. Our SDDC Manager domain inventory currently reads only the first response page and writes rows in whatever order the appliance returned. That makes domains disappear f…
 - **vcf91-0048** (`java`) `#vcf-9-1` `#sddc-manager` `#java` `#rest-contract` `#spec-derived` — Our certificate bootstrap job needs a small, dependency-free SDDC Manager client that can be run again after an uncertain result without installing the same trusted certificate twice. Implement the…
+- **vcf91-0050** (`powershell`) `#vcf-9-1` `#nsx-policy` `#powershell` `#rest-contract` `#spec-derived` — Our VCF 9.1 application rollout creates an NSX group and then a distributed-firewall security policy. The current automation loses its place when its access token expires between those two writes:…
 
 ## project-io
 
