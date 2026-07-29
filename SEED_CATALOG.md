@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3105 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3106 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 31 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 39 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 40 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -3661,6 +3661,7 @@
 - **vcf91-0054** (`powershell`) `#vcf-9-1` `#nsx-policy` `#powershell` `#rest-contract` `#spec-derived` — Platform engineering needs a guarded NSX Policy group rename for VMware Cloud Foundation 9.1. Finish the `VcfNsxGroupGuard` PowerShell module so the current group is read and checked before the upd…
 - **vcf91-0055** (`powershell`) `#vcf-9-1` `#nsx-policy` `#powershell` `#rest-contract` `#spec-derived` — Platform engineering rotates the Basic credential used by an NSX Policy client while inventory requests may still be in flight. Finish the `VcfNsxCredentialGate` PowerShell module so a cutover queu…
 - **vcf91-0056** (`powershell`) `#vcf-9-1` `#nsx-policy` `#powershell` `#rest-contract` `#spec-derived` — Platform engineering has an NSX Policy intent whose consolidated realization status is only the generic `ERROR`. Finish the `VcfNsxFailureEvidence` PowerShell module so the incident report is based…
+- **vcf91-0058** (`powershell`) `#vcf-9-1` `#nsx-policy` `#powershell` `#rest-contract` `#spec-derived` — The network platform team needs a deterministic NSX Policy inventory module for VCF 9.1. Create `VcfNsxPolicyInventory.psm1`. VCF PowerCLI is an environment prerequisite; use its official `VMware.S…
 
 ## project-io
 
