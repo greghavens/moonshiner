@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3091 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3092 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 30 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 26 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 27 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -3647,6 +3647,7 @@
 - **vcf91-0038** (`java`) `#vcf-9-1` `#sddc-manager` `#java` `#rest-contract` `#spec-derived` — Complete `VcfDomainClient.java` as a single-file Java 17, standard-library-only client for VMware Cloud Foundation 9.1 SDDC Manager. The protected `docs/contract.json` is a focused projection of `s…
 - **vcf91-0039** (`java`) `#vcf-9-1` `#sddc-manager` `#java` `#rest-contract` `#spec-derived` — Complete `VcfDomainInventoryClient.java` as a single-file Java 17, standard-library-only client for VMware Cloud Foundation 9.1 SDDC Manager. The protected `docs/contract.json` is a focused project…
 - **vcf91-0040** (`java`) `#vcf-9-1` `#sddc-manager` `#java` `#rest-contract` `#spec-derived` — Complete `VcfDepotClient.java` as a single-file Java 17, standard-library-only client for VMware Cloud Foundation 9.1 SDDC Manager. The protected `docs/contract.json` is a focused projection of `sp…
+- **vcf91-0042** (`java`) `#vcf-9-1` `#sddc-manager` `#java` `#rest-contract` `#spec-derived` — Complete `VcfIdentityProviderClient.java` as a single-file Java 17, standard-library-only client for VMware Cloud Foundation 9.1 SDDC Manager. The protected `docs/contract.json` is a focused projec…
 
 ## project-io
 
