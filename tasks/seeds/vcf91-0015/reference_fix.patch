@@ -1,0 +1,255 @@
+diff --git a/vcf_domain_inventory/__init__.py b/vcf_domain_inventory/__init__.py
+new file mode 100644
+index 0000000..dce23e5
+--- /dev/null
++++ b/vcf_domain_inventory/__init__.py
+@@ -0,0 +1,12 @@
++"""Deterministic domain inventory export for VCF 9.1 SDDC Manager."""
++
++from .client import SddcClient
++from .errors import PaginationError, SddcApiError
++from .export import export_domains
++
++__all__ = [
++    "PaginationError",
++    "SddcApiError",
++    "SddcClient",
++    "export_domains",
++]
+diff --git a/vcf_domain_inventory/errors.py b/vcf_domain_inventory/errors.py
+new file mode 100644
+index 0000000..afb18c3
+--- /dev/null
++++ b/vcf_domain_inventory/errors.py
+@@ -0,0 +1,21 @@
++"""Public exception types for the domain inventory client."""
++
++
++class SddcApiError(Exception):
++    """A non-success response from SDDC Manager."""
++
++    def __init__(self, status_code, error_code=None, message=None, payload=None):
++        self.status_code = status_code
++        self.error_code = error_code
++        self.message = message
++        self.payload = payload
++        text = "SDDC Manager returned HTTP %s" % status_code
++        if error_code:
++            text += " (%s)" % error_code
++        if message:
++            text += ": %s" % message
++        super().__init__(text)
++
++
++class PaginationError(ValueError):
++    """A successful response did not satisfy the pagination contract."""
+diff --git a/vcf_domain_inventory/client.py b/vcf_domain_inventory/client.py
+new file mode 100644
+index 0000000..f46a26f
+--- /dev/null
++++ b/vcf_domain_inventory/client.py
+@@ -0,0 +1,186 @@
++"""Stdlib HTTP client for OpenAPI operationId getDomains."""
++
++import json
++import urllib.error
++import urllib.parse
++import urllib.request
++
++from .errors import PaginationError, SddcApiError
++
++
++_STRING_FILTERS = (
++    ("type", "domain_type"),
++    ("name", "name"),
++    ("vcFqdn", "vc_fqdn"),
++    ("vcInstanceId", "vc_instance_id"),
++)
++
++
++class SddcClient:
++    """Bearer-authenticated client for one SDDC Manager."""
++
++    def __init__(self, base_url, access_token, *, timeout=10.0):
++        self.base_url = base_url.rstrip("/")
++        self.access_token = access_token
++        self.timeout = timeout
++
++    def _request_page(self, query):
++        target = self.base_url + "/v1/domains?" + urllib.parse.urlencode(query)
++        request = urllib.request.Request(
++            target,
++            headers={
++                "Authorization": "Bearer " + self.access_token,
++                "Accept": "application/json",
++            },
++            method="GET",
++        )
++        try:
++            with urllib.request.urlopen(request, timeout=self.timeout) as response:
++                raw = response.read()
++        except urllib.error.HTTPError as exc:
++            raw = exc.read()
++            payload = None
++            try:
++                payload = json.loads(raw.decode("utf-8"))
++            except (UnicodeDecodeError, json.JSONDecodeError):
++                pass
++            error_code = payload.get("errorCode") if isinstance(payload, dict) else None
++            message = payload.get("message") if isinstance(payload, dict) else None
++            raise SddcApiError(
++                exc.code,
++                error_code=error_code,
++                message=message,
++                payload=payload,
++            ) from None
++
++        try:
++            return json.loads(raw.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++            raise PaginationError("getDomains returned malformed JSON") from exc
++
++    @staticmethod
++    def _validate_page(page, requested_page):
++        if not isinstance(page, dict):
++            raise PaginationError("getDomains response must be a JSON object")
++        elements = page.get("elements")
++        metadata = page.get("pageMetadata")
++        if not isinstance(elements, list):
++            raise PaginationError("page elements must be a list")
++        if not isinstance(metadata, dict):
++            raise PaginationError("pageMetadata must be an object")
++
++        values = {}
++        for key in ("pageNumber", "pageSize", "totalElements", "totalPages"):
++            value = metadata.get(key)
++            if isinstance(value, bool) or not isinstance(value, int):
++                raise PaginationError("%s must be an integer" % key)
++            if value < 0:
++                raise PaginationError("%s must not be negative" % key)
++            values[key] = value
++        if values["pageNumber"] != requested_page:
++            raise PaginationError(
++                "expected pageNumber %d, got %d"
++                % (requested_page, values["pageNumber"])
++            )
++        if values["pageSize"] != len(elements):
++            raise PaginationError("pageSize does not match the current elements")
++        if values["totalPages"] == 0 and elements:
++            raise PaginationError("a zero-page collection cannot contain elements")
++        return elements, values
++
++    def list_domains(
++        self,
++        *,
++        domain_type=None,
++        name=None,
++        vc_fqdn=None,
++        vc_instance_id=None,
++        is_management_sso_domain=None,
++        use_cache=None,
++        page_size=100
++    ):
++        """Fetch all getDomains pages and return complete objects stably sorted."""
++        if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size <= 0:
++            raise ValueError("page_size must be a positive integer")
++
++        supplied = {
++            "domain_type": domain_type,
++            "name": name,
++            "vc_fqdn": vc_fqdn,
++            "vc_instance_id": vc_instance_id,
++        }
++        fixed = []
++        for wire_name, local_name in _STRING_FILTERS:
++            value = supplied[local_name]
++            if value is not None:
++                if not isinstance(value, str) or value == "":
++                    raise ValueError("%s must be a non-empty string" % local_name)
++                fixed.append((wire_name, value))
++
++        for local_name, value in (
++            ("is_management_sso_domain", is_management_sso_domain),
++            ("use_cache", use_cache),
++        ):
++            if value is not None and not isinstance(value, bool):
++                raise ValueError("%s must be a boolean" % local_name)
++
++        page_number = 0
++        domains = []
++        expected_total_pages = None
++        expected_total_elements = None
++
++        while True:
++            query = list(fixed)
++            if is_management_sso_domain is not None:
++                query.append(
++                    (
++                        "isManagementSsoDomain",
++                        "true" if is_management_sso_domain else "false",
++                    )
++                )
++            query.extend((("pageNumber", page_number), ("pageSize", page_size)))
++            if use_cache is not None:
++                query.append(("useCache", "true" if use_cache else "false"))
++
++            page = self._request_page(query)
++            elements, metadata = self._validate_page(page, page_number)
++            if expected_total_pages is None:
++                expected_total_pages = metadata["totalPages"]
++                expected_total_elements = metadata["totalElements"]
++            elif (
++                metadata["totalPages"] != expected_total_pages
++                or metadata["totalElements"] != expected_total_elements
++            ):
++                raise PaginationError("pagination totals changed between pages")
++
++            domains.extend(elements)
++            if page_number + 1 >= expected_total_pages:
++                break
++            page_number += 1
++
++        if len(domains) != expected_total_elements:
++            raise PaginationError(
++                "received %d elements, expected %d"
++                % (len(domains), expected_total_elements)
++            )
++
++        def stable_key(domain):
++            if not isinstance(domain, dict):
++                raise PaginationError("each Domain element must be an object")
++            name_value = domain.get("name")
++            id_value = domain.get("id")
++            canonical = json.dumps(
++                domain, ensure_ascii=False, sort_keys=True, separators=(",", ":")
++            )
++            return (
++                name_value.casefold() if isinstance(name_value, str) else "",
++                id_value if isinstance(id_value, str) else "",
++                canonical,
++            )
++
++        try:
++            return sorted(domains, key=stable_key)
++        except (TypeError, ValueError) as exc:
++            if isinstance(exc, PaginationError):
++                raise
++            raise PaginationError("Domain elements must be JSON values") from exc
+diff --git a/vcf_domain_inventory/export.py b/vcf_domain_inventory/export.py
+new file mode 100644
+index 0000000..a329336
+--- /dev/null
++++ b/vcf_domain_inventory/export.py
+@@ -0,0 +1,12 @@
++"""Stable JSON emission for complete domain inventories."""
++
++import json
++
++
++def export_domains(client, stream, **list_options):
++    """Fetch all domains, write canonical pretty JSON, and return the list."""
++    domains = client.list_domains(**list_options)
++    stream.write(
++        json.dumps(domains, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
++    )
++    return domains
