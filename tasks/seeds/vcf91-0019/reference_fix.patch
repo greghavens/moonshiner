@@ -1,0 +1,512 @@
+--- a/vcf_credential_rotation/client.py
++++ b/vcf_credential_rotation/client.py
+@@ -2,14 +2,38 @@
+ 
+ from __future__ import annotations
+ 
++import json
++import math
++import threading
+ import time
+-from contextlib import AbstractContextManager
++from contextlib import AbstractContextManager, contextmanager
+ from typing import Any, Callable
++from urllib.error import HTTPError, URLError
++from urllib.parse import quote, urlsplit
++from urllib.request import (
++    HTTPRedirectHandler,
++    ProxyHandler,
++    Request,
++    build_opener,
++)
+ 
+ 
+ class SddcManagerError(RuntimeError):
+     """An SDDC Manager HTTP operation returned a non-success response."""
+ 
++    def __init__(
++        self,
++        status_code: int | None,
++        payload: Any = None,
++    ) -> None:
++        self.status_code = status_code
++        self.payload = payload
++        if status_code is None:
++            message = "SDDC Manager transport failed"
++        else:
++            message = f"SDDC Manager returned HTTP {status_code}"
++        super().__init__(message)
++
+ 
+ class ProtocolError(RuntimeError):
+     """An SDDC Manager success response violated the pinned contract."""
+@@ -18,27 +42,130 @@
+ class RotationFailedError(RuntimeError):
+     """The credential task reached an unsuccessful terminal state."""
+ 
++    def __init__(self, task: dict[str, Any]) -> None:
++        self.task = task
++        super().__init__(
++            f"credential rotation task failed with status {task.get('status')}"
++        )
++
+ 
+ class RotationTimeoutError(RuntimeError):
+     """The credential task exhausted its polling budget."""
+ 
++    def __init__(self, task: dict[str, Any]) -> None:
++        self.task = task
++        super().__init__(
++            f"credential rotation polling exhausted at {task.get('status')}"
++        )
++
++
++class _NoRedirectHandler(HTTPRedirectHandler):
++    def redirect_request(
++        self,
++        req: Request,
++        fp: Any,
++        code: int,
++        msg: str,
++        headers: Any,
++        newurl: str,
++    ) -> None:
++        del req, fp, code, msg, headers, newurl
++        return None
++
++
++def _nonempty_string(value: Any, name: str) -> str:
++    if not isinstance(value, str) or not value:
++        raise ValueError(f"{name} must be a non-empty string")
++    return value
++
++
++def _number(
++    value: Any,
++    name: str,
++    *,
++    allow_zero: bool,
++) -> float:
++    if (
++        isinstance(value, bool)
++        or not isinstance(value, (int, float))
++        or not math.isfinite(value)
++        or value < 0
++        or (value == 0 and not allow_zero)
++    ):
++        qualifier = "non-negative" if allow_zero else "positive"
++        raise ValueError(f"{name} must be a {qualifier} number")
++    return float(value)
++
++
++def _origin(base_url: Any) -> str:
++    _nonempty_string(base_url, "base_url")
++    parts = urlsplit(base_url)
++    if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
++        raise ValueError("base_url must be an HTTP(S) origin")
++    if parts.username is not None or parts.password is not None:
++        raise ValueError("base_url must not contain credentials")
++    if parts.path not in {"", "/"} or parts.query or parts.fragment:
++        raise ValueError(
++            "base_url must not contain a path, query, or fragment"
++        )
++    try:
++        parts.port
++    except ValueError:
++        raise ValueError("base_url contains an invalid port") from None
++    return f"{parts.scheme.lower()}://{parts.netloc}"
++
+ 
+ class ManagedCredential:
+     """A managed secret whose users acquire concurrency-safe leases."""
+ 
+     def __init__(self, initial_secret: str) -> None:
+-        raise NotImplementedError("implement the managed credential gate")
++        self._secret = _nonempty_string(initial_secret, "initial_secret")
++        self._condition = threading.Condition(threading.Lock())
++        self._active_leases = 0
++        self._rotating = False
+ 
++    @contextmanager
+     def lease(self) -> AbstractContextManager[str]:
+-        raise NotImplementedError("implement credential leasing")
++        with self._condition:
++            while self._rotating:
++                self._condition.wait()
++            self._active_leases += 1
++            secret = self._secret
++        try:
++            yield secret
++        finally:
++            with self._condition:
++                self._active_leases -= 1
++                if self._active_leases == 0:
++                    self._condition.notify_all()
+ 
+     @property
+     def is_rotating(self) -> bool:
+-        raise NotImplementedError("implement rotation state reporting")
++        with self._condition:
++            return self._rotating
++
++    def _begin_rotation(self) -> None:
++        with self._condition:
++            if self._rotating:
++                raise RuntimeError(
++                    "a rotation is already pending for this credential"
++                )
++            self._rotating = True
++            while self._active_leases:
++                self._condition.wait()
++
++    def _finish_rotation(self, replacement: str | None) -> None:
++        with self._condition:
++            if not self._rotating:
++                raise RuntimeError("credential rotation gate is not closed")
++            if replacement is not None:
++                self._secret = replacement
++            self._rotating = False
++            self._condition.notify_all()
+ 
+ 
+ class SddcManagerCredentialRotator:
+-    """Coordinate a VCF password update with local credential leases."""
++    """Coordinate a VCF password rotation with local credential leases."""
+ 
+     def __init__(
+         self,
+@@ -50,7 +177,205 @@
+         max_polls: int = 60,
+         timeout: float = 10.0,
+     ) -> None:
+-        raise NotImplementedError("implement the contract-pinned client")
++        self._base_url = _origin(base_url)
++        self._access_token = _nonempty_string(
++            access_token,
++            "access_token",
++        )
++        if not callable(sleep):
++            raise TypeError("sleep must be callable")
++        self._sleep = sleep
++        self._poll_interval = _number(
++            poll_interval,
++            "poll_interval",
++            allow_zero=True,
++        )
++        if (
++            isinstance(max_polls, bool)
++            or not isinstance(max_polls, int)
++            or max_polls < 1
++        ):
++            raise ValueError("max_polls must be a positive integer")
++        self._max_polls = max_polls
++        self._timeout = _number(
++            timeout,
++            "timeout",
++            allow_zero=False,
++        )
++        self._opener = build_opener(
++            ProxyHandler({}),
++            _NoRedirectHandler(),
++        )
++
++    @staticmethod
++    def _decode_payload(body: bytes) -> Any:
++        if not body:
++            return None
++        try:
++            return json.loads(body.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            return None
++
++    def _request(
++        self,
++        *,
++        method: str,
++        path: str,
++        expected_status: int,
++        body: dict[str, Any] | None = None,
++    ) -> Any:
++        headers = {
++            "Authorization": f"Bearer {self._access_token}",
++            "Accept": "application/json",
++        }
++        encoded: bytes | None = None
++        if body is not None:
++            encoded = json.dumps(
++                body,
++                ensure_ascii=False,
++                separators=(",", ":"),
++            ).encode("utf-8")
++            headers["Content-Type"] = "application/json"
++
++        request = Request(
++            self._base_url + path,
++            data=encoded,
++            headers=headers,
++            method=method,
++        )
++        try:
++            with self._opener.open(
++                request,
++                timeout=self._timeout,
++            ) as response:
++                status = response.status
++                response_body = response.read()
++        except HTTPError as error:
++            try:
++                error_body = error.read(1024 * 1024)
++            except OSError:
++                error_body = b""
++            raise SddcManagerError(
++                error.code,
++                self._decode_payload(error_body),
++            ) from None
++        except (URLError, OSError):
++            raise SddcManagerError(None, None) from None
++
++        payload = self._decode_payload(response_body)
++        if status != expected_status:
++            raise SddcManagerError(status, payload)
++        if payload is None:
++            raise ProtocolError(
++                f"{method} {path} returned a malformed success body"
++            )
++        return payload
++
++    @staticmethod
++    def _validated_rotation_arguments(
++        *,
++        credential: ManagedCredential,
++        resource_type: Any,
++        username: Any,
++        resource_id: Any,
++        resource_name: Any,
++        credential_type: Any,
++        account_type: Any,
++    ) -> tuple[
++        str,
++        str,
++        str | None,
++        str | None,
++        str | None,
++        str | None,
++    ]:
++        if not isinstance(credential, ManagedCredential):
++            raise TypeError("credential must be a ManagedCredential")
++        resource_type = _nonempty_string(resource_type, "resource_type")
++        username = _nonempty_string(username, "username")
++
++        if resource_id is not None:
++            resource_id = _nonempty_string(resource_id, "resource_id")
++        if resource_name is not None:
++            resource_name = _nonempty_string(resource_name, "resource_name")
++        if (resource_id is None) == (resource_name is None):
++            raise ValueError(
++                "exactly one of resource_id and resource_name is required"
++            )
++        if credential_type is not None:
++            credential_type = _nonempty_string(
++                credential_type,
++                "credential_type",
++            )
++        if account_type is not None:
++            account_type = _nonempty_string(account_type, "account_type")
++        return (
++            resource_type,
++            username,
++            resource_id,
++            resource_name,
++            credential_type,
++            account_type,
++        )
++
++    @staticmethod
++    def _new_secret_from_resource_credentials(
++        payload: Any,
++        *,
++        resource_type: str,
++        resource_id: str | None,
++        resource_name: str | None,
++        username: str,
++        credential_type: str | None,
++        account_type: str | None,
++    ) -> str:
++        if not isinstance(payload, list):
++            raise ProtocolError(
++                "getCredentialTaskByResourceID did not return an array"
++            )
++        matches: list[str] = []
++        for resource in payload:
++            if not isinstance(resource, dict):
++                continue
++            if resource.get("resourceType") != resource_type:
++                continue
++            if (
++                resource_id is not None
++                and resource.get("resourceId") != resource_id
++            ):
++                continue
++            if (
++                resource_name is not None
++                and resource.get("resourceName") != resource_name
++            ):
++                continue
++            credentials = resource.get("credentials")
++            if not isinstance(credentials, list):
++                continue
++            for item in credentials:
++                if not isinstance(item, dict):
++                    continue
++                if item.get("username") != username:
++                    continue
++                if (
++                    credential_type is not None
++                    and item.get("credentialType") != credential_type
++                ):
++                    continue
++                if (
++                    account_type is not None
++                    and item.get("accountType") != account_type
++                ):
++                    continue
++                password = item.get("password")
++                if isinstance(password, str) and password:
++                    matches.append(password)
++        if len(matches) != 1:
++            raise ProtocolError(
++                "getCredentialTaskByResourceID did not identify exactly "
++                "one matching non-empty password"
++            )
++        return matches[0]
+ 
+     def rotate(
+         self,
+@@ -63,4 +388,126 @@
+         credential_type: str | None = None,
+         account_type: str | None = None,
+     ) -> dict[str, Any]:
+-        raise NotImplementedError("implement drain, update, poll, and publish")
++        (
++            resource_type,
++            username,
++            resource_id,
++            resource_name,
++            credential_type,
++            account_type,
++        ) = self._validated_rotation_arguments(
++            credential=credential,
++            resource_type=resource_type,
++            username=username,
++            resource_id=resource_id,
++            resource_name=resource_name,
++            credential_type=credential_type,
++            account_type=account_type,
++        )
++
++        credential_wire: dict[str, Any] = {"username": username}
++        if credential_type is not None:
++            credential_wire["credentialType"] = credential_type
++        if account_type is not None:
++            credential_wire["accountType"] = account_type
++
++        resource_wire: dict[str, Any] = {}
++        if resource_id is not None:
++            resource_wire["resourceId"] = resource_id
++        if resource_name is not None:
++            resource_wire["resourceName"] = resource_name
++        resource_wire["resourceType"] = resource_type
++        resource_wire["credentials"] = [credential_wire]
++
++        request_body = {
++            "operationType": "ROTATE",
++            "elements": [resource_wire],
++        }
++
++        credential._begin_rotation()
++        replacement: str | None = None
++        try:
++            accepted = self._request(
++                method="PATCH",
++                path="/v1/credentials",
++                expected_status=202,
++                body=request_body,
++            )
++            if not isinstance(accepted, dict):
++                raise ProtocolError(
++                    "updateOrRotatePasswords returned a malformed task"
++                )
++            task_id = accepted.get("id")
++            if not isinstance(task_id, str) or not task_id:
++                raise ProtocolError(
++                    "updateOrRotatePasswords returned an invalid task id"
++                )
++            encoded_task_id = quote(task_id, safe="")
++            task_path = "/v1/credentials/tasks/" + encoded_task_id
++
++            last_task: dict[str, Any] | None = None
++            terminal_task: dict[str, Any] | None = None
++            for poll_number in range(self._max_polls):
++                task = self._request(
++                    method="GET",
++                    path=task_path,
++                    expected_status=200,
++                )
++                if not isinstance(task, dict):
++                    raise ProtocolError(
++                        "getCredentialsTask returned a malformed task"
++                    )
++                if task.get("id") != task_id:
++                    raise ProtocolError(
++                        "getCredentialsTask returned a mismatched task id"
++                    )
++                status = task.get("status")
++                if not isinstance(status, str) or not status:
++                    raise ProtocolError(
++                        "getCredentialsTask returned an invalid status"
++                    )
++                last_task = task
++
++                if status == "SUCCESSFUL":
++                    terminal_task = task
++                    break
++                if status in {
++                    "FAILED",
++                    "USER_CANCELLED",
++                    "INCONSISTENT",
++                }:
++                    raise RotationFailedError(task)
++                if status not in {"PENDING", "IN_PROGRESS"}:
++                    raise ProtocolError(
++                        f"getCredentialsTask returned unknown status {status!r}"
++                    )
++                if poll_number + 1 < self._max_polls:
++                    self._sleep(self._poll_interval)
++
++            if terminal_task is None:
++                if last_task is None:
++                    raise ProtocolError(
++                        "credential task polling produced no response"
++                    )
++                raise RotationTimeoutError(last_task)
++
++            resource_credentials = self._request(
++                method="GET",
++                path=(
++                    task_path
++                    + "/resource-credentials"
++                ),
++                expected_status=200,
++            )
++            replacement = self._new_secret_from_resource_credentials(
++                resource_credentials,
++                resource_type=resource_type,
++                resource_id=resource_id,
++                resource_name=resource_name,
++                username=username,
++                credential_type=credential_type,
++                account_type=account_type,
++            )
++            return terminal_task
++        finally:
++            credential._finish_rotation(replacement)

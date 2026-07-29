@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3069 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3070 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 29 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 5 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 6 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -3625,6 +3625,7 @@
 - **vcf91-0016** (`python`) `#vcf-9-1` `#sddc-manager` `#python` `#rest-contract` `#spec-derived` — Complete the stdlib-only `vcf_depot` Python package by implementing `src/vcf_depot/client.py`, following README.md. The package issues the VMware Cloud Foundation 9.1 SDDC Manager `updateDepotSetti…
 - **vcf91-0017** (`python`) `#vcf-9-1` `#sddc-manager` `#python` `#rest-contract` `#spec-derived` — Implement `apply_landing_zone_change` in `vcf91_change/client.py` as a standard-library-only Python integration for VMware Cloud Foundation 9.1 SDDC Manager. The protected `docs/contract.json` is a…
 - **vcf91-0018** (`python`) `#vcf-9-1` `#sddc-manager` `#python` `#rest-contract` `#spec-derived` — Platform automation ticket. We need a small, stdlib-only Python package named `vcf_commission` for VMware Cloud Foundation 9.1 SDDC Manager. It must commission one or more ESXi hosts only after the…
+- **vcf91-0019** (`python`) `#vcf-9-1` `#sddc-manager` `#python` `#rest-contract` `#spec-derived` — Implement `vcf_credential_rotation/client.py` as a standard-library-only VMware Cloud Foundation 9.1 SDDC Manager integration. The package coordinates a system-generated password rotation with loca…
 
 ## project-io
 
