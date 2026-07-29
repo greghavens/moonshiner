@@ -1,0 +1,283 @@
+--- a/client.go
++++ b/client.go
+@@ -1,21 +1,271 @@
+ package nsxpolicy
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
++	"unicode/utf8"
+ )
+ 
+-var errNotImplemented = errors.New("client.go is not implemented")
++const (
++	policyBasePath     = "/policy/api/v1"
++	segmentPath        = "/infra/segments/{segment-id}"
++	maxResponseBodyLen = 1 << 20
++)
++
++var errResponseTooLarge = errors.New("response exceeds limit")
++
++// Client is a focused client for the two operations named by the protected
++// contract.
++type Client struct {
++	baseURL    string
++	username   string
++	password   string
++	httpClient *http.Client
++}
++
++// NewClient validates configuration without making a request.
++func NewClient(config Config) (*Client, error) {
++	if strings.TrimSpace(config.Username) == "" ||
++		strings.TrimSpace(config.Password) == "" ||
++		strings.Contains(config.Username, ":") {
++		return nil, errors.New("invalid NSX Policy client configuration")
++	}
++	parsed, err := url.Parse(config.BaseURL)
++	if err != nil ||
++		(parsed.Scheme != "http" && parsed.Scheme != "https") ||
++		parsed.Host == "" ||
++		parsed.User != nil ||
++		parsed.Opaque != "" ||
++		parsed.RawQuery != "" ||
++		parsed.ForceQuery ||
++		parsed.Fragment != "" ||
++		(parsed.Path != "" && parsed.Path != "/") ||
++		parsed.RawPath != "" {
++		return nil, errors.New("invalid NSX Policy client configuration")
++	}
++
++	selected := config.HTTPClient
++	if selected == nil {
++		selected = http.DefaultClient
++	}
++	httpClient := *selected
++	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
++		return http.ErrUseLastResponse
++	}
++
++	return &Client{
++		baseURL:    parsed.Scheme + "://" + parsed.Host + policyBasePath,
++		username:   config.Username,
++		password:   config.Password,
++		httpClient: &httpClient,
++	}, nil
++}
++
++// EnableSegment performs the read gate and issues one minimal PATCH only after
++// all precheck conditions have passed.
++func (c *Client) EnableSegment(ctx context.Context, segmentID string, request EnableRequest) (Result, error) {
++	if c == nil {
++		return Result{}, errors.New("nil NSX Policy client")
++	}
++	if ctx == nil {
++		return Result{}, errors.New("nil context")
++	}
++	if err := ctx.Err(); err != nil {
++		return Result{}, err
++	}
++	if strings.TrimSpace(segmentID) == "" ||
++		request.ExpectedRevision < 0 ||
++		strings.TrimSpace(request.ExpectedConnectivityPath) == "" {
++		return Result{}, errors.New("invalid segment enable request")
++	}
++	if request.Description != nil {
++		if strings.TrimSpace(*request.Description) == "" ||
++			utf8.RuneCountInString(*request.Description) > 1024 {
++			return Result{}, errors.New("invalid segment enable request")
++		}
++	}
++
++	target := c.baseURL + strings.ReplaceAll(segmentPath, "{segment-id}", url.PathEscape(segmentID))
++	status, body, err := c.do(ctx, ReadInfraSegmentOperation, http.MethodGet, target, nil)
++	if err != nil {
++		return Result{}, err
++	}
++	if status != http.StatusOK {
++		return Result{}, decodeAPIError(ReadInfraSegmentOperation, status, body)
++	}
++
++	segment, err := decodeSegmentPrecheck(body)
++	if err != nil {
++		return Result{}, err
++	}
++	if *segment.ID != segmentID {
++		return Result{}, &PrecheckError{SegmentID: segmentID, Reason: "identity does not match"}
++	}
++	if *segment.Revision != request.ExpectedRevision {
++		return Result{}, &PrecheckError{SegmentID: segmentID, Reason: "revision does not match"}
++	}
++	if *segment.ConnectivityPath != request.ExpectedConnectivityPath {
++		return Result{}, &PrecheckError{SegmentID: segmentID, Reason: "connectivity path does not match"}
++	}
++	if *segment.AdminState != "DOWN" {
++		return Result{}, &PrecheckError{SegmentID: segmentID, Reason: "administrative state is not DOWN"}
++	}
++	if *segment.Protection != "NOT_PROTECTED" {
++		return Result{}, &PrecheckError{SegmentID: segmentID, Reason: "resource is not writable"}
++	}
++
++	wireBody, err := json.Marshal(segmentPatch{
++		ResourceType: "Segment",
++		Revision:     *segment.Revision,
++		AdminState:   "UP",
++		Description:  request.Description,
++	})
++	if err != nil {
++		return Result{}, &ProtocolError{
++			OperationID: PatchInfraSegmentOperation,
++			Reason:      "request serialization failed",
++		}
++	}
++	status, body, err = c.do(ctx, PatchInfraSegmentOperation, http.MethodPatch, target, wireBody)
++	if err != nil {
++		return Result{}, err
++	}
++	if status != http.StatusOK {
++		return Result{}, decodeAPIError(PatchInfraSegmentOperation, status, body)
++	}
+ 
+-// Client is completed by the task solution.
+-type Client struct{}
++	return Result{
++		SegmentID:           segmentID,
++		Revision:            *segment.Revision,
++		PreviousAdminState:  "DOWN",
++		AdminState:          "UP",
++		Changed:             true,
++		ReadOperationID:     ReadInfraSegmentOperation,
++		MutationOperationID: PatchInfraSegmentOperation,
++	}, nil
++}
++
++type segmentPrecheck struct {
++	ID               *string `json:"id"`
++	Revision         *int32  `json:"_revision"`
++	ConnectivityPath *string `json:"connectivity_path"`
++	AdminState       *string `json:"admin_state"`
++	Protection       *string `json:"_protection"`
++}
++
++type segmentPatch struct {
++	ResourceType string  `json:"resource_type"`
++	Revision     int32   `json:"_revision"`
++	AdminState   string  `json:"admin_state"`
++	Description  *string `json:"description,omitempty"`
++}
++
++func decodeSegmentPrecheck(body []byte) (segmentPrecheck, error) {
++	var segment segmentPrecheck
++	decoder := json.NewDecoder(bytes.NewReader(body))
++	if err := decoder.Decode(&segment); err != nil {
++		return segmentPrecheck{}, &ProtocolError{
++			OperationID: ReadInfraSegmentOperation,
++			Reason:      "malformed JSON object",
++		}
++	}
++	var trailing any
++	if err := decoder.Decode(&trailing); err != io.EOF {
++		return segmentPrecheck{}, &ProtocolError{
++			OperationID: ReadInfraSegmentOperation,
++			Reason:      "trailing JSON data",
++		}
++	}
++	if segment.ID == nil ||
++		segment.Revision == nil ||
++		segment.ConnectivityPath == nil ||
++		segment.AdminState == nil ||
++		segment.Protection == nil {
++		return segmentPrecheck{}, &ProtocolError{
++			OperationID: ReadInfraSegmentOperation,
++			Reason:      "required precheck property is missing or invalid",
++		}
++	}
++	return segment, nil
++}
++
++func (c *Client) do(ctx context.Context, operationID, method, target string, body []byte) (int, []byte, error) {
++	var reader io.Reader
++	if body != nil {
++		reader = bytes.NewReader(body)
++	}
++	request, err := http.NewRequestWithContext(ctx, method, target, reader)
++	if err != nil {
++		return 0, nil, &TransportError{OperationID: operationID, Cause: err}
++	}
++	request.Header.Set("Accept", "application/json")
++	request.SetBasicAuth(c.username, c.password)
++	if body != nil {
++		request.Header.Set("Content-Type", "application/json")
++	}
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		if response != nil && response.Body != nil {
++			_ = response.Body.Close()
++		}
++		return 0, nil, &TransportError{OperationID: operationID, Cause: err}
++	}
++	defer response.Body.Close()
++	responseBody, err := readBounded(response.Body)
++	if err != nil {
++		return 0, nil, &TransportError{OperationID: operationID, Cause: err}
++	}
++	return response.StatusCode, responseBody, nil
++}
+ 
+-// NewClient is completed by the task solution.
+-func NewClient(Config) (*Client, error) {
+-	return nil, errNotImplemented
++func readBounded(reader io.Reader) ([]byte, error) {
++	body, err := io.ReadAll(io.LimitReader(reader, maxResponseBodyLen+1))
++	if err != nil {
++		return nil, err
++	}
++	if len(body) > maxResponseBodyLen {
++		return nil, errResponseTooLarge
++	}
++	return body, nil
+ }
+ 
+-// EnableSegment is completed by the task solution.
+-func (c *Client) EnableSegment(context.Context, string, EnableRequest) (Result, error) {
+-	return Result{}, errNotImplemented
++func decodeAPIError(operationID string, status int, body []byte) *APIError {
++	apiError := &APIError{
++		OperationID: operationID,
++		StatusCode:  status,
++	}
++	if len(body) == 0 {
++		return apiError
++	}
++
++	decoder := json.NewDecoder(bytes.NewReader(body))
++	decoder.UseNumber()
++	var envelope any
++	if err := decoder.Decode(&envelope); err == nil {
++		var trailing any
++		if err := decoder.Decode(&trailing); err == io.EOF {
++			apiError.Envelope = envelope
++		}
++	}
++
++	var fields struct {
++		ErrorCode    *int64 `json:"error_code"`
++		ErrorMessage string `json:"error_message"`
++		ModuleName   string `json:"module_name"`
++		Details      string `json:"details"`
++	}
++	if err := json.Unmarshal(body, &fields); err == nil {
++		apiError.ErrorCode = fields.ErrorCode
++		apiError.ErrorMessage = fields.ErrorMessage
++		apiError.ModuleName = fields.ModuleName
++		apiError.Details = fields.Details
++	}
++	return apiError
+ }

@@ -1,0 +1,492 @@
+diff --git a/change.go b/change.go
+index 5e1a91d..7211d30 100644
+--- a/change.go
++++ b/change.go
+@@ -1,6 +1,15 @@
+ package nsxchange
+ 
+-import "context"
++import (
++	"context"
++	"fmt"
++	"net/url"
++)
++
++const (
++	patchGroupForDomain          = "PatchGroupForDomain"
++	patchSecurityPolicyForDomain = "PatchSecurityPolicyForDomain"
++)
+ 
+ type GroupChange struct {
+ 	ID          string
+@@ -45,5 +54,67 @@ type Report struct {
+ 
+ // Apply applies source group, destination group, and security policy in order.
+ func (c *Client) Apply(ctx context.Context, change Change) (Report, error) {
+-	return Report{}, ErrNotImplemented
++	domainID := url.PathEscape(change.DomainID)
++	sourceID := url.PathEscape(change.SourceGroup.ID)
++	destinationID := url.PathEscape(change.DestinationGroup.ID)
++	policyID := url.PathEscape(change.Policy.ID)
++
++	sourcePath := fmt.Sprintf("/policy/api/v1/infra/domains/%s/groups/%s", domainID, sourceID)
++	destinationPath := fmt.Sprintf("/policy/api/v1/infra/domains/%s/groups/%s", domainID, destinationID)
++	policyPath := fmt.Sprintf("/policy/api/v1/infra/domains/%s/security-policies/%s", domainID, policyID)
++
++	report := Report{Steps: make([]StepResult, 0, 3)}
++	apply := func(name, operationID, path string, body any) error {
++		status, err := c.patch(ctx, operationID, path, body)
++		step := StepResult{
++			Name: name, OperationID: operationID, ResourcePath: path,
++			Status: StepApplied, HTTPStatus: status,
++		}
++		if err != nil {
++			step.Status = StepFailed
++		}
++		report.Steps = append(report.Steps, step)
++		return err
++	}
++
++	if err := apply("source-group", patchGroupForDomain, sourcePath, groupBody(change.SourceGroup)); err != nil {
++		return report, err
++	}
++	if err := apply("destination-group", patchGroupForDomain, destinationPath, groupBody(change.DestinationGroup)); err != nil {
++		return report, err
++	}
++
++	groupPrefix := fmt.Sprintf("/infra/domains/%s/groups/", domainID)
++	policy := SecurityPolicy{
++		DisplayName: change.Policy.DisplayName,
++		Category:    change.Policy.Category,
++		Rules: []Rule{
++			{
++				DisplayName:       change.Policy.RuleDisplayName,
++				Action:            "ALLOW",
++				SourceGroups:      []string{groupPrefix + sourceID},
++				DestinationGroups: []string{groupPrefix + destinationID},
++				Services:          []string{change.Policy.ServicePath},
++			},
++		},
++	}
++	if err := apply("security-policy", patchSecurityPolicyForDomain, policyPath, policy); err != nil {
++		return report, err
++	}
++	return report, nil
++}
++
++func groupBody(change GroupChange) Group {
++	return Group{
++		DisplayName: change.DisplayName,
++		Expression: []Condition{
++			{
++				ResourceType: "Condition",
++				MemberType:   "VirtualMachine",
++				Key:          "Tag",
++				Operator:     "EQUALS",
++				Value:        change.TagScope + "|" + change.TagValue,
++			},
++		},
++	}
+ }
+diff --git a/client.go b/client.go
+index b15de37..5d06159 100644
+--- a/client.go
++++ b/client.go
+@@ -1,14 +1,17 @@
+ package nsxchange
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
++	"strings"
+ )
+ 
+-var ErrNotImplemented = errors.New("nsxchange: not implemented")
+-
+ // HTTPDoer is satisfied by *http.Client.
+ type HTTPDoer interface {
+ 	Do(*http.Request) (*http.Response, error)
+@@ -26,7 +29,14 @@ func NewClient(baseURL string, httpClient HTTPDoer) (*Client, error) {
+ 	if httpClient == nil {
+ 		return nil, errors.New("nsxchange: HTTP client is required")
+ 	}
+-	return &Client{baseURL: baseURL, http: httpClient}, nil
++	parsed, err := url.Parse(baseURL)
++	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
++		return nil, errors.New("nsxchange: base URL must be an absolute HTTP URL")
++	}
++	if parsed.RawQuery != "" || parsed.Fragment != "" {
++		return nil, errors.New("nsxchange: base URL must not contain a query or fragment")
++	}
++	return &Client{baseURL: strings.TrimRight(baseURL, "/"), http: httpClient}, nil
+ }
+ 
+ // APIError is returned for a non-2xx NSX response.
+@@ -44,5 +54,39 @@ func (e *APIError) Error() string {
+ }
+ 
+ func (c *Client) patch(ctx context.Context, operationID, path string, body any) (int, error) {
+-	return 0, ErrNotImplemented
++	payload, err := json.Marshal(body)
++	if err != nil {
++		return 0, fmt.Errorf("%s: encode request: %w", operationID, err)
++	}
++	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, c.baseURL+path, bytes.NewReader(payload))
++	if err != nil {
++		return 0, fmt.Errorf("%s: build request: %w", operationID, err)
++	}
++	req.Header.Set("Accept", "application/json")
++	req.Header.Set("Content-Type", "application/json")
++
++	resp, err := c.http.Do(req)
++	if err != nil {
++		return 0, fmt.Errorf("%s: send request: %w", operationID, err)
++	}
++	defer resp.Body.Close()
++	responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
++	if readErr != nil {
++		return resp.StatusCode, fmt.Errorf("%s: read response: %w", operationID, readErr)
++	}
++	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
++		return resp.StatusCode, nil
++	}
++
++	apiErr := &APIError{OperationID: operationID, StatusCode: resp.StatusCode}
++	if len(responseBody) != 0 {
++		_ = json.Unmarshal(responseBody, apiErr)
++	}
++	if apiErr.Message == "" {
++		apiErr.Message = strings.TrimSpace(string(responseBody))
++	}
++	if apiErr.Message == "" {
++		apiErr.Message = http.StatusText(resp.StatusCode)
++	}
++	return resp.StatusCode, apiErr
+ }
+diff --git a/docs/contract.json b/docs/contract.json
+new file mode 100644
+index 0000000..e010f46
+--- /dev/null
++++ b/docs/contract.json
+@@ -0,0 +1,47 @@
++{
++  "base_path": "/policy/api/v1",
++  "operations": [
++    {
++      "operation_id": "PatchGroupForDomain",
++      "method": "PATCH",
++      "path": "/infra/domains/{domain-id}/groups/{group-id}",
++      "path_parameters": [
++        "domain-id",
++        "group-id"
++      ],
++      "request_schema": "#/definitions/Group",
++      "success_status": 200,
++      "error_statuses": [
++        301,
++        307,
++        400,
++        403,
++        409,
++        412,
++        500,
++        503
++      ]
++    },
++    {
++      "operation_id": "PatchSecurityPolicyForDomain",
++      "method": "PATCH",
++      "path": "/infra/domains/{domain-id}/security-policies/{security-policy-id}",
++      "path_parameters": [
++        "domain-id",
++        "security-policy-id"
++      ],
++      "request_schema": "#/definitions/SecurityPolicy",
++      "success_status": 200,
++      "error_statuses": [
++        301,
++        307,
++        400,
++        403,
++        409,
++        412,
++        500,
++        503
++      ]
++    }
++  ]
++}
+diff --git a/docs/official_sources.json b/docs/official_sources.json
+new file mode 100644
+index 0000000..12cdabe
+--- /dev/null
++++ b/docs/official_sources.json
+@@ -0,0 +1,21 @@
++{
++  "repository": "https://github.com/vmware/vcf-api-specs",
++  "commit": "3949fc33339fc5ea1b77eadb258f1cf49aa88e26",
++  "spec_path": "specifications/nsx/openapi-2.0/nsx_policy_api.yaml",
++  "license": "Apache-2.0",
++  "repository_commit_url": "https://github.com/vmware/vcf-api-specs/commit/3949fc33339fc5ea1b77eadb258f1cf49aa88e26",
++  "sources": [
++    {
++      "operation_id": "PatchGroupForDomain",
++      "spec_path": "specifications/nsx/openapi-2.0/nsx_policy_api.yaml",
++      "commit": "3949fc33339fc5ea1b77eadb258f1cf49aa88e26",
++      "source_url": "https://github.com/vmware/vcf-api-specs/blob/3949fc33339fc5ea1b77eadb258f1cf49aa88e26/specifications/nsx/openapi-2.0/nsx_policy_api.yaml"
++    },
++    {
++      "operation_id": "PatchSecurityPolicyForDomain",
++      "spec_path": "specifications/nsx/openapi-2.0/nsx_policy_api.yaml",
++      "commit": "3949fc33339fc5ea1b77eadb258f1cf49aa88e26",
++      "source_url": "https://github.com/vmware/vcf-api-specs/blob/3949fc33339fc5ea1b77eadb258f1cf49aa88e26/specifications/nsx/openapi-2.0/nsx_policy_api.yaml"
++    }
++  ]
++}
+diff --git a/internal/nsxmock/server.go b/internal/nsxmock/server.go
+index 25ca1e7..d336b72 100644
+--- a/internal/nsxmock/server.go
++++ b/internal/nsxmock/server.go
+@@ -1,12 +1,16 @@
+ package nsxmock
+ 
+ import (
+-	"errors"
++	"encoding/json"
++	"fmt"
++	"io"
+ 	"net/http"
++	"net/http/httptest"
++	"os"
++	"strings"
++	"sync"
+ )
+ 
+-var ErrNotImplemented = errors.New("nsxmock: not implemented")
+-
+ type Failure struct {
+ 	OperationID string
+ 	Path        string
+@@ -24,25 +28,210 @@ type Request struct {
+ 	Body        []byte
+ }
+ 
+-type Server struct{}
++type operation struct {
++	OperationID   string `json:"operation_id"`
++	Method        string `json:"method"`
++	Path          string `json:"path"`
++	SuccessStatus int    `json:"success_status"`
++	ErrorStatuses []int  `json:"error_statuses"`
++	fullPath      string
++}
++
++type contract struct {
++	BasePath   string      `json:"base_path"`
++	Operations []operation `json:"operations"`
++}
++
++type Server struct {
++	server  *httptest.Server
++	url     string
++	client  *http.Client
++	routes  []operation
++	failure *Failure
++	mu      sync.Mutex
++	log     []Request
++}
+ 
+ // New loads the derived contract, starts a loopback-only server, and optionally
+ // configures one operation/path to fail.
+ func New(contractPath string, failure *Failure) (*Server, error) {
+-	return nil, ErrNotImplemented
++	data, err := os.ReadFile(contractPath)
++	if err != nil {
++		return nil, fmt.Errorf("nsxmock: read contract: %w", err)
++	}
++	var spec contract
++	if err := json.Unmarshal(data, &spec); err != nil {
++		return nil, fmt.Errorf("nsxmock: decode contract: %w", err)
++	}
++	if spec.BasePath == "" || len(spec.Operations) == 0 {
++		return nil, fmt.Errorf("nsxmock: contract has no routes")
++	}
++
++	seen := make(map[string]struct{}, len(spec.Operations))
++	for i := range spec.Operations {
++		route := &spec.Operations[i]
++		if route.OperationID == "" || route.Method == "" || route.Path == "" || route.SuccessStatus == 0 {
++			return nil, fmt.Errorf("nsxmock: incomplete contract operation")
++		}
++		if _, duplicate := seen[route.OperationID]; duplicate {
++			return nil, fmt.Errorf("nsxmock: duplicate operationId %q", route.OperationID)
++		}
++		seen[route.OperationID] = struct{}{}
++		route.fullPath = spec.BasePath + route.Path
++	}
++
++	if failure != nil {
++		var matched *operation
++		for i := range spec.Operations {
++			if spec.Operations[i].OperationID == failure.OperationID &&
++				matchPath(spec.Operations[i].fullPath, failure.Path) {
++				matched = &spec.Operations[i]
++				break
++			}
++		}
++		if matched == nil {
++			return nil, fmt.Errorf("nsxmock: failure does not name a contract route")
++		}
++		if !containsStatus(matched.ErrorStatuses, failure.Status) {
++			return nil, fmt.Errorf("nsxmock: failure status %d is not declared for %s", failure.Status, failure.OperationID)
++		}
++	}
++
++	s := &Server{routes: spec.Operations, failure: failure}
++	handler := http.HandlerFunc(s.handle)
++	s.server = startLoopback(handler)
++	if s.server != nil {
++		s.url = s.server.URL
++		s.client = s.server.Client()
++	} else {
++		// Some build sandboxes deny socket(2), including loopback sockets. Keep
++		// the identical HTTP handler testable there; ordinary environments use
++		// the real httptest server above.
++		s.url = "http://127.0.0.1"
++		s.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
++			recorder := httptest.NewRecorder()
++			handler.ServeHTTP(recorder, req)
++			return recorder.Result(), nil
++		})}
++	}
++	return s, nil
+ }
+ 
+ func (s *Server) URL() string {
+-	return ""
++	return s.url
+ }
+ 
+ func (s *Server) Client() *http.Client {
+-	return nil
++	return s.client
+ }
+ 
+-func (s *Server) Close() {}
++func (s *Server) Close() {
++	if s.server != nil {
++		s.server.Close()
++	}
++}
+ 
+ // Requests returns a deep copy of the request log.
+ func (s *Server) Requests() []Request {
+-	return nil
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	out := make([]Request, len(s.log))
++	for i, request := range s.log {
++		out[i] = request
++		out[i].Header = request.Header.Clone()
++		out[i].Body = append([]byte(nil), request.Body...)
++	}
++	return out
++}
++
++func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
++	if r.Body == nil {
++		r.Body = http.NoBody
++	}
++	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
++	if err != nil {
++		http.Error(w, "request body could not be read", http.StatusBadRequest)
++		return
++	}
++	operationID := ""
++	var matched *operation
++	for i := range s.routes {
++		route := &s.routes[i]
++		if r.Method == route.Method && matchPath(route.fullPath, r.URL.Path) {
++			matched = route
++			operationID = route.OperationID
++			break
++		}
++	}
++
++	s.mu.Lock()
++	s.log = append(s.log, Request{
++		OperationID: operationID,
++		Method:      r.Method,
++		RequestURI:  r.URL.RequestURI(),
++		Header:      r.Header.Clone(),
++		Body:        append([]byte(nil), body...),
++	})
++	s.mu.Unlock()
++
++	if matched == nil {
++		http.NotFound(w, r)
++		return
++	}
++	if s.failure != nil && s.failure.OperationID == matched.OperationID && s.failure.Path == r.URL.Path {
++		w.Header().Set("Content-Type", "application/json")
++		w.WriteHeader(s.failure.Status)
++		_ = json.NewEncoder(w).Encode(map[string]any{
++			"error_code":    s.failure.ErrorCode,
++			"error_message": s.failure.Message,
++			"module_name":   s.failure.ModuleName,
++		})
++		return
++	}
++	w.WriteHeader(matched.SuccessStatus)
++}
++
++func matchPath(template, path string) bool {
++	templateParts := strings.Split(strings.Trim(template, "/"), "/")
++	pathParts := strings.Split(strings.Trim(path, "/"), "/")
++	if len(templateParts) != len(pathParts) {
++		return false
++	}
++	for i := range templateParts {
++		part := templateParts[i]
++		if strings.HasPrefix(part, "{") && strings.HasSuffix(part, "}") {
++			if pathParts[i] == "" {
++				return false
++			}
++			continue
++		}
++		if part != pathParts[i] {
++			return false
++		}
++	}
++	return true
++}
++
++func containsStatus(statuses []int, status int) bool {
++	for _, candidate := range statuses {
++		if candidate == status {
++			return true
++		}
++	}
++	return false
++}
++
++func startLoopback(handler http.Handler) (server *httptest.Server) {
++	defer func() {
++		if recover() != nil {
++			server = nil
++		}
++	}()
++	return httptest.NewServer(handler)
++}
++
++type roundTripFunc func(*http.Request) (*http.Response, error)
++
++func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
++	return fn(req)
+ }
