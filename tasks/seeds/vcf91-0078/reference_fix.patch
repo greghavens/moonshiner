@@ -1,0 +1,329 @@
+--- a/client.go
++++ b/client.go
+@@ -1,21 +1,323 @@
+ package nsxpolicy
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"sort"
++	"strconv"
++	"strings"
++)
++
++const (
++	policyBasePath   = "/policy/api/v1"
++	maxResponseBytes = 2 << 20
+ )
+ 
+ // Client calls the VCF 9.1 NSX Policy API.
+-type Client struct{}
++type Client struct {
++	origin      string
++	tokenSource AccessTokenSource
++	httpClient  *http.Client
++}
+ 
+ // NewClient validates configuration without making token-source or network
+ // calls.
+ func NewClient(cfg Config) (*Client, error) {
+-	return nil, errors.New("not implemented")
++	if cfg.BaseURL == "" || cfg.BaseURL != strings.TrimSpace(cfg.BaseURL) {
++		return nil, errors.New("BaseURL must be a nonblank HTTP(S) origin")
++	}
++	if cfg.TokenSource == nil {
++		return nil, errors.New("TokenSource is required")
++	}
++	parsed, err := url.Parse(cfg.BaseURL)
++	if err != nil {
++		return nil, errors.New("BaseURL must be a valid HTTP(S) origin")
++	}
++	if parsed.Scheme != "http" && parsed.Scheme != "https" {
++		return nil, errors.New("BaseURL must use http or https")
++	}
++	if parsed.Host == "" || parsed.Opaque != "" {
++		return nil, errors.New("BaseURL must be an absolute HTTP(S) origin")
++	}
++	if parsed.User != nil {
++		return nil, errors.New("BaseURL must not contain credentials")
++	}
++	if parsed.Path != "" && parsed.Path != "/" {
++		return nil, errors.New("BaseURL must not contain a path")
++	}
++	if parsed.RawPath != "" {
++		return nil, errors.New("BaseURL must not contain an encoded path")
++	}
++	if parsed.RawQuery != "" || parsed.ForceQuery {
++		return nil, errors.New("BaseURL must not contain a query")
++	}
++	if parsed.Fragment != "" || strings.Contains(cfg.BaseURL, "#") {
++		return nil, errors.New("BaseURL must not contain a fragment")
++	}
++
++	configuredClient := cfg.HTTPClient
++	if configuredClient == nil {
++		configuredClient = http.DefaultClient
++	}
++	httpClient := *configuredClient
++	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
++		return http.ErrUseLastResponse
++	}
++
++	return &Client{
++		origin:      parsed.Scheme + "://" + parsed.Host,
++		tokenSource: cfg.TokenSource,
++		httpClient:  &httpClient,
++	}, nil
+ }
+ 
+ // ListAllSegments traverses ListAllInfraSegments, resumes one interrupted page
+ // after an access-token refresh, and returns deterministic collection order.
+ func (c *Client) ListAllSegments(ctx context.Context, options ListOptions) ([]Segment, error) {
+-	return nil, errors.New("not implemented")
++	if ctx == nil {
++		return nil, errors.New("context is required")
++	}
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	if err := validateListOptions(options); err != nil {
++		return nil, err
++	}
++
++	token, err := c.readToken(ctx, "lookup", func() (string, error) {
++		return c.tokenSource.Token(ctx)
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	cursor := ""
++	seenCursors := make(map[string]struct{})
++	var collected []Segment
++	for {
++		refreshed := false
++		var currentPage segmentPage
++		for {
++			page, apiError, requestErr := c.listPage(ctx, token, cursor, options)
++			if requestErr != nil {
++				return nil, requestErr
++			}
++			if apiError == nil {
++				currentPage = page
++				break
++			}
++			if apiError.StatusCode != http.StatusUnauthorized || refreshed {
++				return nil, apiError
++			}
++			rejected := token
++			token, err = c.readToken(ctx, "refresh", func() (string, error) {
++				return c.tokenSource.Refresh(ctx, rejected)
++			})
++			if err != nil {
++				return nil, err
++			}
++			refreshed = true
++		}
++
++		collected = append(collected, currentPage.Results...)
++		if currentPage.Cursor == "" {
++			break
++		}
++		if _, exists := seenCursors[currentPage.Cursor]; exists {
++			return nil, &ProtocolError{
++				OperationID: ListAllInfraSegmentsOperation,
++				Reason:      "response cursor repeated",
++			}
++		}
++		seenCursors[currentPage.Cursor] = struct{}{}
++		cursor = currentPage.Cursor
++	}
++
++	sort.SliceStable(collected, func(i, j int) bool {
++		if collected[i].Path != collected[j].Path {
++			return collected[i].Path < collected[j].Path
++		}
++		if collected[i].ID != collected[j].ID {
++			return collected[i].ID < collected[j].ID
++		}
++		return collected[i].DisplayName < collected[j].DisplayName
++	})
++	return collected, nil
++}
++
++type segmentPage struct {
++	Results []Segment `json:"results"`
++	Cursor  string    `json:"cursor,omitempty"`
++}
++
++func validateListOptions(options ListOptions) error {
++	for name, value := range map[string]*string{
++		"included_fields": options.IncludedFields,
++		"sort_by":         options.SortBy,
++	} {
++		if value != nil && (*value == "" || *value != strings.TrimSpace(*value)) {
++			return fmt.Errorf("%s must be set to a trimmed nonblank value", name)
++		}
++	}
++	if options.PageSize != nil && (*options.PageSize < 0 || *options.PageSize > 1000) {
++		return fmt.Errorf("page_size %d is outside the contract range 0..1000", *options.PageSize)
++	}
++	if options.SegmentType != nil {
++		if *options.SegmentType != "DVPortgroup" && *options.SegmentType != "ALL" {
++			return errors.New("segment_type must be exactly DVPortgroup or ALL")
++		}
++	}
++	return nil
++}
++
++func (c *Client) readToken(
++	ctx context.Context,
++	action string,
++	read func() (string, error),
++) (string, error) {
++	token, err := read()
++	if err != nil {
++		if contextError := ctx.Err(); contextError != nil {
++			err = contextError
++		}
++		return "", &TokenError{
++			OperationID: ListAllInfraSegmentsOperation,
++			Action:      action,
++			Cause:       err,
++		}
++	}
++	if token == "" || token != strings.TrimSpace(token) ||
++		strings.ContainsAny(token, "\r\n") {
++		return "", &TokenError{
++			OperationID: ListAllInfraSegmentsOperation,
++			Action:      action,
++			Cause:       errors.New("token is blank or unsafe for an HTTP header"),
++		}
++	}
++	return token, nil
++}
++
++func (c *Client) listPage(
++	ctx context.Context,
++	token string,
++	cursor string,
++	options ListOptions,
++) (segmentPage, *APIError, error) {
++	query := make(url.Values)
++	if cursor != "" {
++		query.Set("cursor", cursor)
++	}
++	if options.IncludeMarkedForDelete != nil {
++		query.Set("include_mark_for_delete_objects",
++			strconv.FormatBool(*options.IncludeMarkedForDelete))
++	}
++	if options.IncludedFields != nil {
++		query.Set("included_fields", *options.IncludedFields)
++	}
++	if options.PageSize != nil {
++		query.Set("page_size", strconv.FormatInt(*options.PageSize, 10))
++	}
++	if options.SegmentType != nil {
++		query.Set("segment_type", *options.SegmentType)
++	}
++	if options.SortAscending != nil {
++		query.Set("sort_ascending", strconv.FormatBool(*options.SortAscending))
++	}
++	if options.SortBy != nil {
++		query.Set("sort_by", *options.SortBy)
++	}
++
++	target, err := url.Parse(c.origin + policyBasePath + "/infra/segments")
++	if err != nil {
++		return segmentPage{}, nil, &ProtocolError{
++			OperationID: ListAllInfraSegmentsOperation,
++			Reason:      "configured operation URL is invalid",
++		}
++	}
++	target.RawQuery = query.Encode()
++	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
++	if err != nil {
++		return segmentPage{}, nil, &ProtocolError{
++			OperationID: ListAllInfraSegmentsOperation,
++			Reason:      "request could not be constructed",
++		}
++	}
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set("Authorization", "Bearer "+token)
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		if contextError := ctx.Err(); contextError != nil {
++			err = contextError
++		}
++		return segmentPage{}, nil, &TransportError{
++			OperationID: ListAllInfraSegmentsOperation,
++			Cause:       err,
++		}
++	}
++	defer response.Body.Close()
++
++	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
++	if err != nil {
++		if contextError := ctx.Err(); contextError != nil {
++			err = contextError
++		}
++		return segmentPage{}, nil, &TransportError{
++			OperationID: ListAllInfraSegmentsOperation,
++			Cause:       err,
++		}
++	}
++	if len(body) > maxResponseBytes {
++		return segmentPage{}, nil, &ProtocolError{
++			OperationID: ListAllInfraSegmentsOperation,
++			Reason:      "response exceeded size limit",
++		}
++	}
++	if response.StatusCode != http.StatusOK {
++		return segmentPage{}, decodeAPIError(response.StatusCode, body), nil
++	}
++
++	var page segmentPage
++	decoder := json.NewDecoder(bytes.NewReader(body))
++	if err := decoder.Decode(&page); err != nil {
++		return segmentPage{}, nil, &ProtocolError{
++			OperationID: ListAllInfraSegmentsOperation,
++			Reason:      "response is not one JSON object",
++		}
++	}
++	var extra any
++	if err := decoder.Decode(&extra); err != io.EOF {
++		return segmentPage{}, nil, &ProtocolError{
++			OperationID: ListAllInfraSegmentsOperation,
++			Reason:      "response contains trailing JSON content",
++		}
++	}
++	return page, nil, nil
++}
++
++func decodeAPIError(statusCode int, body []byte) *APIError {
++	var envelope any
++	_ = json.Unmarshal(body, &envelope)
++	var projected struct {
++		ErrorCode    *int64 `json:"error_code"`
++		ErrorMessage string `json:"error_message"`
++		ModuleName   string `json:"module_name"`
++		Details      string `json:"details"`
++	}
++	_ = json.Unmarshal(body, &projected)
++	return &APIError{
++		OperationID:  ListAllInfraSegmentsOperation,
++		StatusCode:   statusCode,
++		Envelope:     envelope,
++		ErrorCode:    projected.ErrorCode,
++		ErrorMessage: projected.ErrorMessage,
++		ModuleName:   projected.ModuleName,
++		Details:      projected.Details,
++	}
+ }
