@@ -1,0 +1,272 @@
+--- a/client.go
++++ b/client.go
+@@ -9,16 +9,15 @@
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"mime"
+ 	"net/http"
+ 	"net/url"
++	"sort"
+ 	"strings"
+ )
+ 
+ const maxResponseBytes = 1 << 20
+ 
+-// ErrNotImplemented is returned by the incomplete workflow.
+-var ErrNotImplemented = errors.New("host refresh workflow is not implemented")
+-
+ // PaceFunc is invoked only between consecutive getTask requests.
+ type PaceFunc func(
+ 	ctx context.Context,
+@@ -238,7 +237,36 @@
+ 	ctx context.Context,
+ 	request RefreshRequest,
+ ) (RefreshResult, error) {
+-	return RefreshResult{}, ErrNotImplemented
++	var result RefreshResult
++	if c == nil || c.httpClient == nil || c.pace == nil {
++		return result, errors.New("client is not initialized")
++	}
++	if ctx == nil {
++		return result, errors.New("context must not be nil")
++	}
++	if err := ctx.Err(); err != nil {
++		return result, err
++	}
++	if err := validateRefreshRequest(request); err != nil {
++		return result, err
++	}
++
++	accepted, err := c.submitRefresh(ctx, request)
++	result.Task = accepted
++	if err != nil {
++		return result, err
++	}
++	terminal, err := c.waitForTask(ctx, accepted)
++	result.Task = terminal
++	if err != nil {
++		return result, err
++	}
++	hosts, err := c.listHosts(ctx)
++	if err != nil {
++		return result, err
++	}
++	result.Hosts = hosts
++	return result, nil
+ }
+ 
+ type hostsRefreshWire struct {
+@@ -251,25 +279,123 @@
+ }
+ 
+ func validateRefreshRequest(request RefreshRequest) error {
+-	return ErrNotImplemented
++	if len(request.HostIDs) < 1 || len(request.HostIDs) > 100 {
++		return errors.New("HostIDs must contain between 1 and 100 entries")
++	}
++	for _, hostID := range request.HostIDs {
++		if strings.TrimSpace(hostID) == "" ||
++			strings.TrimSpace(hostID) != hostID {
++			return errors.New("HostIDs must be nonblank with no surrounding whitespace")
++		}
++	}
++	return nil
+ }
+ 
+ func (c *Client) submitRefresh(
+ 	ctx context.Context,
+ 	request RefreshRequest,
+ ) (Task, error) {
+-	return Task{}, ErrNotImplemented
++	wire := hostsUpdateWire{
++		HostIDs: append([]string(nil), request.HostIDs...),
++	}
++	if request.ForceRefresh != nil {
++		wire.HostsRefreshSpec = &hostsRefreshWire{
++			ForceRefresh: *request.ForceRefresh,
++		}
++	}
++	var accepted Task
++	if err := c.doJSON(
++		ctx,
++		"updateHosts",
++		http.MethodPatch,
++		"/v1/hosts",
++		wire,
++		http.StatusAccepted,
++		&accepted,
++	); err != nil {
++		return Task{}, err
++	}
++	if strings.TrimSpace(accepted.ID) == "" {
++		return accepted, &ProtocolError{
++			OperationID: "updateHosts",
++			Reason:      "accepted Task did not contain an id",
++		}
++	}
++	return accepted, nil
+ }
+ 
+ func (c *Client) waitForTask(
+ 	ctx context.Context,
+ 	accepted Task,
+ ) (Task, error) {
+-	return Task{}, ErrNotImplemented
++	last := accepted
++	path := "/v1/tasks/" + url.PathEscape(accepted.ID)
++	for poll := 1; poll <= c.maxPolls; poll++ {
++		var task Task
++		if err := c.doJSON(
++			ctx,
++			"getTask",
++			http.MethodGet,
++			path,
++			nil,
++			http.StatusOK,
++			&task,
++		); err != nil {
++			return last, err
++		}
++		last = task
++		if err := validatePolledTask(task, accepted.ID); err != nil {
++			return last, err
++		}
++
++		switch normalizeTaskStatus(task.Status) {
++		case "SUCCESSFUL", "COMPLETED_WITH_WARNING", "SKIPPED":
++			return last, nil
++		case "FAILED", "CANCELLED", "TIMED_OUT":
++			return last, &TaskTerminalError{Task: task}
++		case "PENDING", "IN_PROGRESS", "QUEUED":
++			if poll == c.maxPolls {
++				return last, &PollLimitError{
++					TaskID:     accepted.ID,
++					Limit:      c.maxPolls,
++					LastStatus: task.Status,
++				}
++			}
++		default:
++			return last, &ProtocolError{
++				OperationID: "getTask",
++				Reason:      "Task contained an unknown status",
++			}
++		}
++
++		if err := c.pace(ctx, "getTask", poll); err != nil {
++			return last, err
++		}
++	}
++	panic("unreachable polling state")
+ }
+ 
+ func (c *Client) listHosts(ctx context.Context) ([]Host, error) {
+-	return nil, ErrNotImplemented
++	var page HostPage
++	if err := c.doJSON(
++		ctx,
++		"getHosts",
++		http.MethodGet,
++		"/v1/hosts",
++		nil,
++		http.StatusOK,
++		&page,
++	); err != nil {
++		return nil, err
++	}
++	hosts := append([]Host(nil), page.Elements...)
++	sort.Slice(hosts, func(left, right int) bool {
++		if hosts[left].FQDN != hosts[right].FQDN {
++			return hosts[left].FQDN < hosts[right].FQDN
++		}
++		return hosts[left].ID < hosts[right].ID
++	})
++	return hosts, nil
+ }
+ 
+ func (c *Client) doJSON(
+@@ -281,7 +407,83 @@
+ 	successStatus int,
+ 	out any,
+ ) error {
+-	return ErrNotImplemented
++	var encoded []byte
++	var err error
++	if body != nil {
++		encoded, err = json.Marshal(body)
++		if err != nil {
++			return &ProtocolError{
++				OperationID: operationID,
++				Reason:      "request could not be encoded",
++			}
++		}
++	}
++
++	var reader io.Reader
++	if body != nil {
++		reader = bytes.NewReader(encoded)
++	}
++	httpRequest, err := http.NewRequestWithContext(
++		ctx,
++		method,
++		c.baseURL+path,
++		reader,
++	)
++	if err != nil {
++		return &ProtocolError{
++			OperationID: operationID,
++			Reason:      "request target could not be constructed",
++		}
++	}
++	httpRequest.Header.Set("Accept", "application/json")
++	httpRequest.Header.Set("Authorization", "Bearer "+c.accessToken)
++	if body != nil {
++		httpRequest.Header.Set("Content-Type", "application/json")
++	}
++
++	response, err := c.httpClient.Do(httpRequest)
++	if err != nil {
++		return &TransportError{OperationID: operationID, Err: err}
++	}
++	defer response.Body.Close()
++
++	data, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
++	if err != nil {
++		return &TransportError{OperationID: operationID, Err: err}
++	}
++	if len(data) > maxResponseBytes {
++		return &ProtocolError{
++			OperationID: operationID,
++			Reason:      "response exceeded the size limit",
++		}
++	}
++	if response.StatusCode != successStatus {
++		var decoded VCFError
++		_ = decodeOneJSON(data, &decoded)
++		return &APIError{
++			OperationID:        operationID,
++			Status:             response.StatusCode,
++			ErrorCode:          decoded.ErrorCode,
++			Message:            decoded.Message,
++			RemediationMessage: decoded.RemediationMessage,
++			ReferenceToken:     decoded.ReferenceToken,
++		}
++	}
++
++	mediaType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
++	if err != nil || mediaType != "application/json" {
++		return &ProtocolError{
++			OperationID: operationID,
++			Reason:      "success response was not application/json",
++		}
++	}
++	if out == nil || decodeOneJSON(data, out) != nil {
++		return &ProtocolError{
++			OperationID: operationID,
++			Reason:      "success response was not one JSON document",
++		}
++	}
++	return nil
+ }
+ 
+ func validatePolledTask(task Task, taskID string) error {
