@@ -1,0 +1,429 @@
+diff --git a/vcf_user_access/client.py b/vcf_user_access/client.py
+--- a/vcf_user_access/client.py
++++ b/vcf_user_access/client.py
+@@ -2,7 +2,35 @@
+ 
+ from __future__ import annotations
+ 
++import json
++import math
+ from typing import Any
++from urllib.error import HTTPError, URLError
++from urllib.parse import urlsplit
++from urllib.request import (
++    HTTPRedirectHandler,
++    ProxyHandler,
++    Request,
++    build_opener,
++)
++
++
++_INT32_MAX = 2**31 - 1
++_MAX_RESPONSE_BYTES = 1_048_576
++_ASCII_WHITESPACE = frozenset(" \t\r\n\v\f")
++
++
++class _NoRedirects(HTTPRedirectHandler):
++    def redirect_request(
++        self,
++        req: Any,
++        fp: Any,
++        code: int,
++        msg: str,
++        headers: Any,
++        newurl: str,
++    ) -> None:
++        return None
+ 
+ 
+ class SddcManagerError(RuntimeError):
+@@ -40,12 +68,59 @@
+         *,
+         timeout: float = 10.0,
+     ) -> None:
+-        raise NotImplementedError
++        if not isinstance(base_url, str) or not base_url:
++            raise ValueError("base_url must be an HTTP(S) origin")
++        try:
++            parsed = urlsplit(base_url)
++            parsed_port = parsed.port
++        except ValueError as exc:
++            raise ValueError("base_url must be an HTTP(S) origin") from exc
++        if (
++            parsed.scheme not in {"http", "https"}
++            or parsed.hostname is None
++            or parsed.username is not None
++            or parsed.password is not None
++            or parsed.path not in {"", "/"}
++            or parsed.query
++            or parsed.fragment
++        ):
++            raise ValueError("base_url must be an HTTP(S) origin")
++        if parsed_port is not None and not 1 <= parsed_port <= 65535:
++            raise ValueError("base_url port is invalid")
++        if (
++            not isinstance(access_token, str)
++            or not access_token
++            or any(char in _ASCII_WHITESPACE for char in access_token)
++        ):
++            raise ValueError(
++                "access_token must be non-empty and contain no ASCII whitespace"
++            )
++        if (
++            isinstance(timeout, bool)
++            or not isinstance(timeout, (int, float))
++            or not math.isfinite(float(timeout))
++            or timeout <= 0
++        ):
++            raise ValueError("timeout must be a positive finite number")
++
++        self._base_url = f"{parsed.scheme}://{parsed.netloc}"
++        self._access_token = access_token
++        self._timeout = float(timeout)
++        self._opener = build_opener(ProxyHandler({}), _NoRedirects())
+ 
+     def list_users(self) -> list[dict[str, Any]]:
+         """Return every observed user in deterministic order."""
+ 
+-        raise NotImplementedError
++        payload = self._request_json(
++            operation_id="getUsers",
++            method="GET",
++            expected_status=200,
++        )
++        return self._validated_users(
++            payload,
++            operation_id="getUsers",
++            status_code=200,
++        )
+ 
+     def ensure_user_access(
+         self,
+@@ -56,4 +131,326 @@
+     ) -> list[dict[str, Any]]:
+         """Ensure one identity-to-role grant without duplicate mutation."""
+ 
+-        raise NotImplementedError
++        self._validate_grant_arguments(
++            name,
++            domain,
++            principal_type,
++            role_id,
++        )
++        observed = self.list_users()
++        match_state = self._match_state(
++            observed,
++            name,
++            domain,
++            principal_type,
++            role_id,
++        )
++        if match_state == "present":
++            return observed
++        if match_state == "conflict":
++            self._raise_access_conflict()
++
++        requested_user = {
++            "name": name,
++            "domain": domain,
++            "type": principal_type,
++            "role": {"id": role_id},
++        }
++        try:
++            payload = self._request_json(
++                operation_id="addUsers",
++                method="POST",
++                expected_status=201,
++                body=[requested_user],
++            )
++        except SddcManagerError as original_error:
++            status = original_error.status_code
++            if status is not None and status < 500:
++                raise
++            try:
++                reconciled = self.list_users()
++            except SddcManagerError:
++                raise original_error from None
++            reconciled_state = self._match_state(
++                reconciled,
++                name,
++                domain,
++                principal_type,
++                role_id,
++            )
++            if reconciled_state == "present":
++                return reconciled
++            raise original_error from None
++
++        return self._validated_users(
++            payload,
++            operation_id="addUsers",
++            status_code=201,
++        )
++
++    @staticmethod
++    def _validate_grant_arguments(
++        name: str,
++        domain: str,
++        principal_type: str,
++        role_id: str,
++    ) -> None:
++        for label, value in (
++            ("name", name),
++            ("domain", domain),
++            ("principal_type", principal_type),
++            ("role_id", role_id),
++        ):
++            if (
++                not isinstance(value, str)
++                or not value
++                or value != value.strip()
++            ):
++                raise ValueError(
++                    f"{label} must be a non-blank, trimmed string"
++                )
++        if principal_type not in {"USER", "GROUP", "SERVICE"}:
++            raise ValueError(
++                "principal_type must be USER, GROUP, or SERVICE"
++            )
++
++    @classmethod
++    def _match_state(
++        cls,
++        users: list[dict[str, Any]],
++        name: str,
++        domain: str,
++        principal_type: str,
++        role_id: str,
++    ) -> str:
++        identity = (
++            name.casefold(),
++            domain.casefold(),
++            principal_type.casefold(),
++        )
++        matches = [
++            user
++            for user in users
++            if cls._user_identity(user) == identity
++        ]
++        if not matches:
++            return "absent"
++        for user in matches:
++            role = user.get("role")
++            existing_id = (
++                role.get("id") if isinstance(role, dict) else None
++            )
++            if not isinstance(existing_id, str) or existing_id != role_id:
++                return "conflict"
++        return "present"
++
++    @staticmethod
++    def _user_identity(
++        user: dict[str, Any],
++    ) -> tuple[str, str, str] | None:
++        parts = [user.get(key) for key in ("name", "domain", "type")]
++        if any(not isinstance(part, str) for part in parts):
++            return None
++        return (
++            parts[0].casefold(),
++            parts[1].casefold(),
++            parts[2].casefold(),
++        )
++
++    @staticmethod
++    def _raise_access_conflict() -> None:
++        raise AccessConflictError(
++            "addUsers was not attempted because the identity has another role",
++            operation_id="addUsers",
++            status_code=None,
++            payload=None,
++        )
++
++    def _request_json(
++        self,
++        *,
++        operation_id: str,
++        method: str,
++        expected_status: int,
++        body: Any = None,
++    ) -> Any:
++        headers = {
++            "Accept": "application/json",
++            "Authorization": "Bearer " + self._access_token,
++        }
++        data: bytes | None = None
++        if method == "POST":
++            data = json.dumps(
++                body,
++                ensure_ascii=False,
++                separators=(",", ":"),
++            ).encode("utf-8")
++            headers["Content-Type"] = "application/json"
++        request = Request(
++            self._base_url + "/v1/users",
++            data=data,
++            headers=headers,
++            method=method,
++        )
++
++        try:
++            response = self._opener.open(request, timeout=self._timeout)
++            with response:
++                status = response.getcode()
++                raw = response.read(_MAX_RESPONSE_BYTES + 1)
++        except HTTPError as exc:
++            try:
++                raw = exc.read(_MAX_RESPONSE_BYTES + 1)
++            except OSError:
++                raw = b""
++            payload = self._decode_error_payload(raw)
++            raise SddcManagerError(
++                f"{operation_id} failed with HTTP status {exc.code}",
++                operation_id=operation_id,
++                status_code=int(exc.code),
++                payload=payload,
++            ) from None
++        except (URLError, OSError, TimeoutError):
++            raise SddcManagerError(
++                f"{operation_id} transport failure",
++                operation_id=operation_id,
++                status_code=None,
++                payload=None,
++            ) from None
++
++        if status != expected_status:
++            payload = self._decode_error_payload(raw)
++            raise SddcManagerError(
++                f"{operation_id} failed with HTTP status {status}",
++                operation_id=operation_id,
++                status_code=int(status),
++                payload=payload,
++            )
++        if len(raw) > _MAX_RESPONSE_BYTES:
++            self._raise_protocol(
++                operation_id,
++                expected_status,
++                "success response is too large",
++            )
++        try:
++            return json.loads(raw.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            self._raise_protocol(
++                operation_id,
++                expected_status,
++                "success response is not valid JSON",
++            )
++
++    @staticmethod
++    def _decode_error_payload(raw: bytes) -> Any:
++        if not raw or len(raw) > _MAX_RESPONSE_BYTES:
++            return None
++        try:
++            return json.loads(raw.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            return None
++
++    @classmethod
++    def _validated_users(
++        cls,
++        payload: Any,
++        *,
++        operation_id: str,
++        status_code: int,
++    ) -> list[dict[str, Any]]:
++        if not isinstance(payload, dict):
++            cls._raise_protocol(
++                operation_id,
++                status_code,
++                "success response must be a JSON object",
++            )
++        elements = payload.get("elements")
++        metadata = payload.get("pageMetadata")
++        if not isinstance(elements, list) or not isinstance(metadata, dict):
++            cls._raise_protocol(
++                operation_id,
++                status_code,
++                "success response has invalid PageOfUser members",
++            )
++        if any(not isinstance(element, dict) for element in elements):
++            cls._raise_protocol(
++                operation_id,
++                status_code,
++                "PageOfUser elements must all be objects",
++            )
++
++        values = {
++            key: metadata.get(key)
++            for key in (
++                "pageNumber",
++                "pageSize",
++                "totalElements",
++                "totalPages",
++            )
++        }
++        for label, value in values.items():
++            if (
++                isinstance(value, bool)
++                or not isinstance(value, int)
++                or not 0 <= value <= _INT32_MAX
++            ):
++                cls._raise_protocol(
++                    operation_id,
++                    status_code,
++                    f"{label} must be a non-negative int32 integer",
++                )
++
++        count = len(elements)
++        expected_pages = 0 if count == 0 else 1
++        if (
++            values["pageNumber"] != 0
++            or values["pageSize"] != count
++            or values["totalElements"] != count
++            or values["totalPages"] != expected_pages
++        ):
++            cls._raise_protocol(
++                operation_id,
++                status_code,
++                "PageOfUser metadata is internally inconsistent",
++            )
++        return sorted(elements, key=cls._user_sort_key)
++
++    @staticmethod
++    def _string_pair(value: Any) -> tuple[str, str]:
++        text = value if isinstance(value, str) else ""
++        return (text.casefold(), text)
++
++    @classmethod
++    def _user_sort_key(
++        cls,
++        user: dict[str, Any],
++    ) -> tuple[str, ...]:
++        role = user.get("role")
++        role_id = role.get("id") if isinstance(role, dict) else ""
++        canonical = json.dumps(
++            user,
++            ensure_ascii=False,
++            sort_keys=True,
++            separators=(",", ":"),
++        )
++        return (
++            *cls._string_pair(user.get("domain")),
++            *cls._string_pair(user.get("name")),
++            *cls._string_pair(user.get("type")),
++            *cls._string_pair(role_id),
++            *cls._string_pair(user.get("id")),
++            canonical,
++        )
++
++    @staticmethod
++    def _raise_protocol(
++        operation_id: str,
++        status_code: int,
++        message: str,
++    ) -> None:
++        raise ProtocolError(
++            message,
++            operation_id=operation_id,
++            status_code=status_code,
++            payload=None,
++        )
