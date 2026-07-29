@@ -1,0 +1,505 @@
+--- a/NsxPolicyClient.java
++++ b/NsxPolicyClient.java
+@@ -1,11 +1,29 @@
+ import java.io.IOException;
++import java.net.ProtocolException;
++import java.net.URI;
++import java.net.URISyntaxException;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
+ import java.time.Duration;
++import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.HashSet;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Map;
++import java.util.Objects;
++import java.util.Set;
+ 
+ /**
+  * Complete this dependency-free VCF 9.1 NSX Policy client.
+  */
+ public final class NsxPolicyClient {
++    private static final String API_BASE_PATH = "/policy/api/v1";
++    private static final String SEGMENTS_PATH = "/infra/segments";
++    private static final char[] HEX = "0123456789ABCDEF".toCharArray();
++
+     public record Segment(String id, String displayName) {
+     }
+ 
+@@ -34,15 +52,469 @@
+         }
+     }
+ 
++    private record Page(List<Segment> segments, String cursor) {
++    }
++
++    private final String managerOrigin;
++    private final AccessTokenProvider tokenProvider;
++    private final Duration requestTimeout;
++    private final HttpClient httpClient;
++    private final Object tokenMonitor = new Object();
++    private String accessToken;
++
+     public NsxPolicyClient(
+             String managerBaseUrl,
+             AccessTokenProvider tokenProvider,
+             Duration requestTimeout) {
+-        throw new UnsupportedOperationException("TODO");
++        this.managerOrigin = validateOrigin(managerBaseUrl);
++        this.tokenProvider = Objects.requireNonNull(
++                tokenProvider, "tokenProvider");
++        if (requestTimeout == null
++                || requestTimeout.isZero()
++                || requestTimeout.isNegative()) {
++            throw new IllegalArgumentException(
++                    "requestTimeout must be positive");
++        }
++        this.requestTimeout = requestTimeout;
++        this.httpClient = HttpClient.newBuilder()
++                .connectTimeout(requestTimeout)
++                .followRedirects(HttpClient.Redirect.NEVER)
++                .build();
+     }
+ 
+     public List<Segment> listAllSegments()
+             throws IOException, InterruptedException {
+-        throw new UnsupportedOperationException("TODO");
++        List<Segment> collected = new ArrayList<>();
++        Set<String> seenCursors = new HashSet<>();
++        String cursor = null;
++        do {
++            URI target = pageUri(cursor);
++            Page page = readPageWithRefresh(target);
++            collected.addAll(page.segments());
++            cursor = page.cursor();
++            if (cursor != null
++                    && !cursor.isEmpty()
++                    && !seenCursors.add(cursor)) {
++                throw protocol("server repeated a collection cursor");
++            }
++        } while (cursor != null && !cursor.isEmpty());
++
++        collected.sort(Comparator
++                .comparing(Segment::displayName)
++                .thenComparing(Segment::id));
++        return List.copyOf(collected);
++    }
++
++    private Page readPageWithRefresh(URI target)
++            throws IOException, InterruptedException {
++        String token = currentAccessToken();
++        HttpResponse<String> response = send(target, token);
++        if (response.statusCode() == 401) {
++            token = refreshAccessToken(token);
++            response = send(target, token);
++        }
++        if (response.statusCode() != 200) {
++            throw new NsxPolicyException(
++                    response.statusCode(), response.body());
++        }
++        return parsePage(response.body());
++    }
++
++    private HttpResponse<String> send(URI target, String token)
++            throws IOException, InterruptedException {
++        HttpRequest request = HttpRequest.newBuilder(target)
++                .timeout(requestTimeout)
++                .header("Authorization", "Bearer " + token)
++                .header("Accept", "application/json")
++                .GET()
++                .build();
++        try {
++            return httpClient.send(
++                    request,
++                    HttpResponse.BodyHandlers.ofString(
++                            StandardCharsets.UTF_8));
++        } catch (InterruptedException exception) {
++            Thread.currentThread().interrupt();
++            throw exception;
++        }
++    }
++
++    private String currentAccessToken() throws IOException {
++        synchronized (tokenMonitor) {
++            if (accessToken == null) {
++                accessToken = validateToken(
++                        tokenProvider.initialAccessToken());
++            }
++            return accessToken;
++        }
++    }
++
++    private String refreshAccessToken(String expiredToken)
++            throws IOException {
++        synchronized (tokenMonitor) {
++            if (!Objects.equals(accessToken, expiredToken)) {
++                return accessToken;
++            }
++            String refreshed = validateToken(
++                    tokenProvider.refreshAccessToken(expiredToken));
++            accessToken = refreshed;
++            return refreshed;
++        }
++    }
++
++    private URI pageUri(String cursor) {
++        StringBuilder target = new StringBuilder()
++                .append(managerOrigin)
++                .append(API_BASE_PATH)
++                .append(SEGMENTS_PATH)
++                .append('?');
++        if (cursor != null) {
++            target.append("cursor=")
++                    .append(encodeQueryComponent(cursor))
++                    .append('&');
++        }
++        target.append("page_size=2");
++        return URI.create(target.toString());
++    }
++
++    private static String validateOrigin(String text) {
++        Objects.requireNonNull(text, "managerBaseUrl");
++        final URI parsed;
++        try {
++            parsed = new URI(text);
++        } catch (URISyntaxException exception) {
++            throw new IllegalArgumentException(
++                    "managerBaseUrl must be a valid HTTP(S) origin",
++                    exception);
++        }
++        String scheme = parsed.getScheme();
++        if (scheme == null
++                || (!scheme.equalsIgnoreCase("http")
++                    && !scheme.equalsIgnoreCase("https"))
++                || parsed.getHost() == null
++                || parsed.getRawUserInfo() != null
++                || parsed.getRawQuery() != null
++                || parsed.getRawFragment() != null
++                || (parsed.getRawPath() != null
++                    && !parsed.getRawPath().isEmpty()
++                    && !parsed.getRawPath().equals("/"))) {
++            throw new IllegalArgumentException(
++                    "managerBaseUrl must be an HTTP(S) origin");
++        }
++        try {
++            return new URI(
++                    scheme.toLowerCase(),
++                    null,
++                    parsed.getHost(),
++                    parsed.getPort(),
++                    null,
++                    null,
++                    null).toASCIIString();
++        } catch (URISyntaxException impossible) {
++            throw new IllegalArgumentException(
++                    "managerBaseUrl must be an HTTP(S) origin",
++                    impossible);
++        }
++    }
++
++    private static String validateToken(String token) throws IOException {
++        if (token == null || token.isEmpty()) {
++            throw new IOException(
++                    "access token provider returned an invalid token");
++        }
++        for (int index = 0; index < token.length(); index++) {
++            char value = token.charAt(index);
++            if (value < 0x21 || value > 0x7e) {
++                throw new IOException(
++                        "access token provider returned an invalid token");
++            }
++        }
++        return token;
++    }
++
++    private static String encodeQueryComponent(String value) {
++        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
++        StringBuilder encoded = new StringBuilder(bytes.length);
++        for (byte item : bytes) {
++            int current = item & 0xff;
++            if ((current >= 'a' && current <= 'z')
++                    || (current >= 'A' && current <= 'Z')
++                    || (current >= '0' && current <= '9')
++                    || current == '-'
++                    || current == '.'
++                    || current == '_'
++                    || current == '~') {
++                encoded.append((char) current);
++            } else {
++                encoded.append('%')
++                        .append(HEX[current >>> 4])
++                        .append(HEX[current & 0x0f]);
++            }
++        }
++        return encoded.toString();
++    }
++
++    private static Page parsePage(String body) throws ProtocolException {
++        final Object root;
++        try {
++            root = new JsonParser(body).parse();
++        } catch (IllegalArgumentException exception) {
++            throw protocol("malformed collection JSON");
++        }
++        if (!(root instanceof Map<?, ?> object)) {
++            throw protocol("collection response must be a JSON object");
++        }
++        Object rawResults = object.get("results");
++        if (!(rawResults instanceof List<?> results)) {
++            throw protocol("collection results must be an array");
++        }
++        List<Segment> segments = new ArrayList<>(results.size());
++        for (Object rawResult : results) {
++            if (!(rawResult instanceof Map<?, ?> result)) {
++                throw protocol("collection result must be an object");
++            }
++            Object rawId = result.get("id");
++            Object rawName = result.get("display_name");
++            if (!(rawId instanceof String id)
++                    || id.isEmpty()
++                    || !(rawName instanceof String displayName)
++                    || displayName.isEmpty()) {
++                throw protocol(
++                        "segment id and display_name must be non-empty strings");
++            }
++            segments.add(new Segment(id, displayName));
++        }
++
++        Object rawCursor = object.get("cursor");
++        String cursor = null;
++        if (rawCursor != null) {
++            if (!(rawCursor instanceof String stringCursor)) {
++                throw protocol("collection cursor must be a string");
++            }
++            cursor = stringCursor;
++        }
++        return new Page(List.copyOf(segments), cursor);
++    }
++
++    private static ProtocolException protocol(String message) {
++        return new ProtocolException(message);
++    }
++
++    private static final class JsonParser {
++        private final String text;
++        private int index;
++
++        private JsonParser(String text) {
++            this.text = Objects.requireNonNull(text, "response body");
++        }
++
++        private Object parse() {
++            skipWhitespace();
++            Object value = readValue();
++            skipWhitespace();
++            if (index != text.length()) {
++                throw invalid();
++            }
++            return value;
++        }
++
++        private Object readValue() {
++            if (index >= text.length()) {
++                throw invalid();
++            }
++            return switch (text.charAt(index)) {
++                case '{' -> readObject();
++                case '[' -> readArray();
++                case '"' -> readString();
++                case 't' -> readLiteral("true", Boolean.TRUE);
++                case 'f' -> readLiteral("false", Boolean.FALSE);
++                case 'n' -> readLiteral("null", null);
++                default -> readNumber();
++            };
++        }
++
++        private Map<String, Object> readObject() {
++            expect('{');
++            skipWhitespace();
++            Map<String, Object> object = new LinkedHashMap<>();
++            if (consume('}')) {
++                return object;
++            }
++            while (true) {
++                skipWhitespace();
++                String key = readString();
++                skipWhitespace();
++                expect(':');
++                skipWhitespace();
++                Object value = readValue();
++                if (object.putIfAbsent(key, value) != null) {
++                    throw invalid();
++                }
++                skipWhitespace();
++                if (consume('}')) {
++                    return object;
++                }
++                expect(',');
++                skipWhitespace();
++            }
++        }
++
++        private List<Object> readArray() {
++            expect('[');
++            skipWhitespace();
++            List<Object> values = new ArrayList<>();
++            if (consume(']')) {
++                return values;
++            }
++            while (true) {
++                skipWhitespace();
++                values.add(readValue());
++                skipWhitespace();
++                if (consume(']')) {
++                    return values;
++                }
++                expect(',');
++                skipWhitespace();
++            }
++        }
++
++        private String readString() {
++            expect('"');
++            StringBuilder value = new StringBuilder();
++            while (index < text.length()) {
++                char current = text.charAt(index++);
++                if (current == '"') {
++                    return value.toString();
++                }
++                if (current == '\\') {
++                    if (index >= text.length()) {
++                        throw invalid();
++                    }
++                    char escaped = text.charAt(index++);
++                    switch (escaped) {
++                        case '"', '\\', '/' -> value.append(escaped);
++                        case 'b' -> value.append('\b');
++                        case 'f' -> value.append('\f');
++                        case 'n' -> value.append('\n');
++                        case 'r' -> value.append('\r');
++                        case 't' -> value.append('\t');
++                        case 'u' -> value.append(readUnicodeEscape());
++                        default -> throw invalid();
++                    }
++                } else {
++                    if (current < 0x20) {
++                        throw invalid();
++                    }
++                    value.append(current);
++                }
++            }
++            throw invalid();
++        }
++
++        private char readUnicodeEscape() {
++            if (index + 4 > text.length()) {
++                throw invalid();
++            }
++            int value = 0;
++            for (int count = 0; count < 4; count++) {
++                int digit = Character.digit(text.charAt(index++), 16);
++                if (digit < 0) {
++                    throw invalid();
++                }
++                value = (value << 4) | digit;
++            }
++            return (char) value;
++        }
++
++        private Object readLiteral(String literal, Object value) {
++            if (!text.startsWith(literal, index)) {
++                throw invalid();
++            }
++            index += literal.length();
++            return value;
++        }
++
++        private Number readNumber() {
++            int start = index;
++            if (consume('-') && index >= text.length()) {
++                throw invalid();
++            }
++            if (consume('0')) {
++                if (index < text.length()
++                        && Character.isDigit(text.charAt(index))) {
++                    throw invalid();
++                }
++            } else {
++                readDigits();
++            }
++            boolean fractional = false;
++            if (consume('.')) {
++                fractional = true;
++                readDigits();
++            }
++            if (index < text.length()
++                    && (text.charAt(index) == 'e'
++                        || text.charAt(index) == 'E')) {
++                fractional = true;
++                index++;
++                if (index < text.length()
++                        && (text.charAt(index) == '+'
++                            || text.charAt(index) == '-')) {
++                    index++;
++                }
++                readDigits();
++            }
++            String number = text.substring(start, index);
++            try {
++                return fractional
++                        ? Double.valueOf(number)
++                        : Long.valueOf(number);
++            } catch (NumberFormatException exception) {
++                throw invalid();
++            }
++        }
++
++        private void readDigits() {
++            int start = index;
++            while (index < text.length()
++                    && Character.isDigit(text.charAt(index))) {
++                index++;
++            }
++            if (start == index) {
++                throw invalid();
++            }
++        }
++
++        private void skipWhitespace() {
++            while (index < text.length()) {
++                char current = text.charAt(index);
++                if (current == ' '
++                        || current == '\n'
++                        || current == '\r'
++                        || current == '\t') {
++                    index++;
++                } else {
++                    return;
++                }
++            }
++        }
++
++        private void expect(char expected) {
++            if (!consume(expected)) {
++                throw invalid();
++            }
++        }
++
++        private boolean consume(char expected) {
++            if (index < text.length() && text.charAt(index) == expected) {
++                index++;
++                return true;
++            }
++            return false;
++        }
++
++        private IllegalArgumentException invalid() {
++            return new IllegalArgumentException("invalid JSON");
++        }
+     }
+ }
+
