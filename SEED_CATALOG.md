@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3107 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3109 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 32 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 40 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 42 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -3663,6 +3663,8 @@
 - **vcf91-0056** (`powershell`) `#vcf-9-1` `#nsx-policy` `#powershell` `#rest-contract` `#spec-derived` — Platform engineering has an NSX Policy intent whose consolidated realization status is only the generic `ERROR`. Finish the `VcfNsxFailureEvidence` PowerShell module so the incident report is based…
 - **vcf91-0057** (`powershell`) `#vcf-9-1` `#nsx-policy` `#powershell` `#rest-contract` `#spec-derived` — Complete src/VcfNsxPolicy/VcfNsxPolicy.psm1. The module must use the preinstalled VMware.Sdk.Vcf.SddcManager PowerCLI module declared by its manifest; do not install, copy, or vendor any VMware mod…
 - **vcf91-0058** (`powershell`) `#vcf-9-1` `#nsx-policy` `#powershell` `#rest-contract` `#spec-derived` — The network platform team needs a deterministic NSX Policy inventory module for VCF 9.1. Create `VcfNsxPolicyInventory.psm1`. VCF PowerCLI is an environment prerequisite; use its official `VMware.S…
+- **vcf91-0059** (`python`) `#vcf-9-1` `#nsx-policy` `#python` `#rest-contract` `#spec-derived` — Network automation ticket. A provisioning job currently treats a successful NSX Policy PUT as proof that a segment is usable. That is wrong: policy intent is realized asynchronously, and the last r…
+- **vcf91-0060** (`python`) `#vcf-9-1` `#nsx-policy` `#python` `#rest-contract` `#spec-derived` — The network platform team needs a dependency-free VMware Cloud Foundation 9.1 NSX Policy client for an idempotent IP-group rollout. The current job successfully PATCHes a group, but when its access…
 
 ## project-io
 

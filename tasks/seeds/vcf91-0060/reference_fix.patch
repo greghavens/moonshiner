@@ -1,0 +1,305 @@
+diff --git a/vcf_nsx_policy/__init__.py b/vcf_nsx_policy/__init__.py
+new file mode 100644
+index 0000000..1e602a2
+--- /dev/null
++++ b/vcf_nsx_policy/__init__.py
+@@ -0,0 +1,13 @@
++"""Standard-library NSX Policy client for the pinned VCF 9.1 contract."""
++
++from .client import NsxPolicyClient
++from .errors import NsxApiError, ProtocolError
++from .models import EnsureGroupResult, IPAddressGroup
++
++__all__ = [
++    "EnsureGroupResult",
++    "IPAddressGroup",
++    "NsxApiError",
++    "NsxPolicyClient",
++    "ProtocolError",
++]
+diff --git a/vcf_nsx_policy/errors.py b/vcf_nsx_policy/errors.py
+new file mode 100644
+index 0000000..d47f87e
+--- /dev/null
++++ b/vcf_nsx_policy/errors.py
+@@ -0,0 +1,26 @@
++"""Typed failures raised by the NSX Policy client."""
++
++from __future__ import annotations
++
++from typing import Any
++
++
++class NsxApiError(Exception):
++    """An HTTP failure carrying the decoded NSX ApiError envelope."""
++
++    def __init__(self, status_code: int, envelope: Any):
++        self.status_code = status_code
++        self.envelope = envelope
++        fields = envelope if isinstance(envelope, dict) else {}
++        self.error_code = fields.get("error_code")
++        self.error_message = fields.get("error_message")
++        self.module_name = fields.get("module_name")
++        self.details = fields.get("details")
++        message = self.error_message or "NSX Policy request failed"
++        if self.error_code is not None:
++            message = f"{self.error_code}: {message}"
++        super().__init__(f"HTTP {status_code}: {message}")
++
++
++class ProtocolError(Exception):
++    """The service returned data outside the pinned REST contract."""
+diff --git a/vcf_nsx_policy/models.py b/vcf_nsx_policy/models.py
+new file mode 100644
+index 0000000..c79da70
+--- /dev/null
++++ b/vcf_nsx_policy/models.py
+@@ -0,0 +1,78 @@
++"""Wire models for the two-operation NSX Policy contract."""
++
++from __future__ import annotations
++
++import copy
++from dataclasses import dataclass
++from typing import Any, Sequence
++
++
++def _nonblank(name: str, value: str) -> str:
++    if not isinstance(value, str) or not value.strip():
++        raise ValueError(f"{name} must be a non-blank string")
++    return value
++
++
++@dataclass(frozen=True)
++class IPAddressGroup:
++    """Desired Group containing one IPAddressExpression."""
++
++    display_name: str
++    ip_addresses: Sequence[str]
++    description: str | None = None
++
++    def to_wire(self) -> dict[str, Any]:
++        display_name = _nonblank("display_name", self.display_name)
++        if len(display_name) > 255:
++            raise ValueError("display_name must not exceed 255 characters")
++        if isinstance(self.ip_addresses, (str, bytes)) or not isinstance(
++            self.ip_addresses, Sequence
++        ):
++            raise TypeError("ip_addresses must be a sequence of strings")
++        if not self.ip_addresses:
++            raise ValueError("ip_addresses must contain at least one address")
++        if len(self.ip_addresses) > 25000:
++            raise ValueError("ip_addresses must not contain more than 25000 items")
++
++        addresses = [
++            _nonblank(f"ip_addresses[{index}]", address)
++            for index, address in enumerate(self.ip_addresses)
++        ]
++        wire: dict[str, Any] = {
++            "resource_type": "Group",
++            "display_name": display_name,
++            "expression": [
++                {
++                    "resource_type": "IPAddressExpression",
++                    "ip_addresses": addresses,
++                }
++            ],
++        }
++        if self.description is not None:
++            description = _nonblank("description", self.description)
++            if len(description) > 1024:
++                raise ValueError("description must not exceed 1024 characters")
++            wire["description"] = description
++        return wire
++
++
++@dataclass(frozen=True)
++class EnsureGroupResult:
++    """Confirmation result and workflow-resume metadata."""
++
++    group: dict[str, Any]
++    token_refreshes: int
++    completed_operations: tuple[str, ...]
++
++    @classmethod
++    def create(
++        cls,
++        group: dict[str, Any],
++        token_refreshes: int,
++        completed_operations: list[str],
++    ) -> "EnsureGroupResult":
++        return cls(
++            group=copy.deepcopy(group),
++            token_refreshes=token_refreshes,
++            completed_operations=tuple(completed_operations),
++        )
+diff --git a/vcf_nsx_policy/client.py b/vcf_nsx_policy/client.py
+new file mode 100644
+index 0000000..ef1f526
+--- /dev/null
++++ b/vcf_nsx_policy/client.py
+@@ -0,0 +1,164 @@
++"""Bearer-authenticated HTTP transport for a focused NSX Policy workflow."""
++
++from __future__ import annotations
++
++import json
++import urllib.error
++import urllib.parse
++import urllib.request
++from typing import Any
++
++from .errors import NsxApiError, ProtocolError
++from .models import EnsureGroupResult, IPAddressGroup
++
++_BASE_PATH = "/policy/api/v1"
++_GROUP_PATH = "/infra/domains/{domain_id}/groups/{group_id}"
++
++
++def _segment(name: str, value: str) -> str:
++    if not isinstance(value, str) or not value.strip():
++        raise ValueError(f"{name} must be a non-blank string")
++    return urllib.parse.quote(value, safe="")
++
++
++class NsxPolicyClient:
++    """Client limited to PatchGroupForDomain and ReadGroupForDomain."""
++
++    def __init__(
++        self,
++        base_url: str,
++        access_token_provider,
++        *,
++        timeout: float = 10.0,
++    ):
++        if not isinstance(base_url, str) or not base_url.strip():
++            raise ValueError("base_url must be a non-blank string")
++        parsed = urllib.parse.urlsplit(base_url)
++        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
++            raise ValueError("base_url must be an absolute HTTP(S) origin")
++        if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
++            raise ValueError("base_url must be an HTTP(S) origin without path or query")
++        if not callable(access_token_provider):
++            raise TypeError("access_token_provider must be callable")
++        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
++            raise TypeError("timeout must be a number")
++        if timeout <= 0:
++            raise ValueError("timeout must be positive")
++
++        self.base_url = base_url.rstrip("/")
++        self._access_token_provider = access_token_provider
++        self.timeout = float(timeout)
++        self._access_token: str | None = None
++        self._token_refreshes = 0
++
++    def _provide_token(self) -> str:
++        token = self._access_token_provider()
++        if not isinstance(token, str) or not token.strip():
++            raise ValueError("access_token_provider must return a non-empty string")
++        return token
++
++    def _token(self) -> str:
++        if self._access_token is None:
++            self._access_token = self._provide_token()
++        return self._access_token
++
++    @staticmethod
++    def _decode_json(data: bytes, context: str) -> Any:
++        if not data or not data.strip():
++            return None
++        try:
++            return json.loads(data.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError) as error:
++            raise ProtocolError(f"{context} was not valid UTF-8 JSON") from error
++
++    def _request(
++        self,
++        method: str,
++        path: str,
++        *,
++        body: dict[str, Any] | None = None,
++        expected_status: int = 200,
++    ) -> Any:
++        data = None
++        if body is not None:
++            data = json.dumps(
++                body, ensure_ascii=False, separators=(",", ":")
++            ).encode("utf-8")
++
++        for attempt in range(2):
++            headers = {
++                "Authorization": f"Bearer {self._token()}",
++                "Accept": "application/json",
++            }
++            if data is not None:
++                headers["Content-Type"] = "application/json"
++            request = urllib.request.Request(
++                self.base_url + _BASE_PATH + path,
++                data=data,
++                method=method,
++                headers=headers,
++            )
++
++            try:
++                with urllib.request.urlopen(request, timeout=self.timeout) as response:
++                    status = response.status
++                    response_data = response.read()
++            except urllib.error.HTTPError as error:
++                status = error.code
++                response_data = error.read()
++            except urllib.error.URLError as error:
++                raise ProtocolError(
++                    f"{method} {path} failed before an HTTP response"
++                ) from error
++
++            if status == 401 and attempt == 0:
++                self._access_token = self._provide_token()
++                self._token_refreshes += 1
++                continue
++
++            decoded = self._decode_json(
++                response_data, f"HTTP {status} response for {method} {path}"
++            )
++            if status != expected_status:
++                raise NsxApiError(status, decoded)
++            return decoded
++
++        raise AssertionError("unreachable request retry state")
++
++    @staticmethod
++    def _group_path(domain_id: str, group_id: str) -> str:
++        return _GROUP_PATH.format(
++            domain_id=_segment("domain_id", domain_id),
++            group_id=_segment("group_id", group_id),
++        )
++
++    def patch_group(
++        self, domain_id: str, group_id: str, group: IPAddressGroup
++    ) -> Any:
++        path = self._group_path(domain_id, group_id)
++        if not isinstance(group, IPAddressGroup):
++            raise TypeError("group must be an IPAddressGroup")
++        body = group.to_wire()
++        return self._request("PATCH", path, body=body, expected_status=200)
++
++    def read_group(self, domain_id: str, group_id: str) -> dict[str, Any]:
++        path = self._group_path(domain_id, group_id)
++        value = self._request("GET", path, expected_status=200)
++        if not isinstance(value, dict):
++            raise ProtocolError("ReadGroupForDomain response must be a JSON object")
++        return value
++
++    def ensure_ip_group(
++        self, domain_id: str, group_id: str, group: IPAddressGroup
++    ) -> EnsureGroupResult:
++        refreshes_before = self._token_refreshes
++        completed: list[str] = []
++        self.patch_group(domain_id, group_id, group)
++        completed.append("PatchGroupForDomain")
++        confirmed = self.read_group(domain_id, group_id)
++        completed.append("ReadGroupForDomain")
++        return EnsureGroupResult.create(
++            confirmed,
++            self._token_refreshes - refreshes_before,
++            completed,
++        )

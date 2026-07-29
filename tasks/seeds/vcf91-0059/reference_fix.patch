@@ -1,0 +1,369 @@
+diff --git a/nsx_segment_realizer/__init__.py b/nsx_segment_realizer/__init__.py
+new file mode 100644
+index 0000000..6e82a3d
+--- /dev/null
++++ b/nsx_segment_realizer/__init__.py
+@@ -0,0 +1,23 @@
++"""Stdlib-only NSX Policy segment client with realization polling."""
++
++from .client import NsxPolicyClient
++from .errors import (
++    NsxApiError,
++    NsxProtocolError,
++    RealizationFailed,
++    RealizationTimeout,
++    SpecError,
++)
++from .models import SegmentSpec
++from .realize import realize_segment
++
++__all__ = [
++    "NsxPolicyClient",
++    "SegmentSpec",
++    "realize_segment",
++    "NsxApiError",
++    "NsxProtocolError",
++    "RealizationFailed",
++    "RealizationTimeout",
++    "SpecError",
++]
+diff --git a/nsx_segment_realizer/client.py b/nsx_segment_realizer/client.py
+new file mode 100644
+index 0000000..ca71537
+--- /dev/null
++++ b/nsx_segment_realizer/client.py
+@@ -0,0 +1,152 @@
++"""HTTP client for the two pinned NSX Policy operations."""
++
++from __future__ import annotations
++
++import base64
++import json
++import time
++import urllib.error
++import urllib.parse
++import urllib.request
++
++from .errors import (
++    NsxApiError,
++    NsxProtocolError,
++    RealizationFailed,
++    RealizationTimeout,
++    SpecError,
++)
++from .models import SegmentSpec
++
++
++BASE_PATH = "/policy/api/v1"
++PENDING = frozenset({"UNAVAILABLE", "UNREALIZED"})
++SUCCESS = "REALIZED"
++FAILURE = "ERROR"
++
++
++class NsxPolicyClient:
++    """Basic-authenticated client bound to one NSX Manager."""
++
++    def __init__(
++        self,
++        base_url,
++        username,
++        password,
++        sleep=time.sleep,
++        poll_interval=1.0,
++        max_polls=60,
++    ):
++        if not isinstance(max_polls, int) or isinstance(max_polls, bool) or max_polls < 1:
++            raise ValueError("max_polls must be a positive integer")
++        if poll_interval < 0:
++            raise ValueError("poll_interval must be non-negative")
++        self.base_url = base_url.rstrip("/")
++        credentials = f"{username}:{password}".encode("utf-8")
++        self._authorization = (
++            "Basic " + base64.b64encode(credentials).decode("ascii")
++        )
++        self.sleep = sleep
++        self.poll_interval = poll_interval
++        self.max_polls = max_polls
++
++    def create_or_replace_segment(self, segment_id, spec):
++        if not isinstance(spec, SegmentSpec):
++            raise SpecError("spec must be a SegmentSpec")
++        if not isinstance(segment_id, str) or not segment_id:
++            raise SpecError("segment_id must be a non-empty string")
++        encoded_id = urllib.parse.quote(segment_id, safe="")
++        status, document = self._request(
++            "PUT",
++            f"{BASE_PATH}/infra/segments/{encoded_id}",
++            body=spec.to_wire(),
++        )
++        if status != 200:
++            raise NsxProtocolError(
++                f"CreateOrReplaceInfraSegment returned HTTP {status}, expected 200"
++            )
++        if not isinstance(document, dict):
++            raise NsxProtocolError(
++                "CreateOrReplaceInfraSegment returned a non-object response"
++            )
++        return document
++
++    def read_intent_status(
++        self,
++        intent_path,
++        include_enforced_status=None,
++        site_path=None,
++    ):
++        if not isinstance(intent_path, str) or not intent_path:
++            raise SpecError("intent_path must be a non-empty string")
++        query = [("intent_path", intent_path)]
++        if include_enforced_status is not None:
++            if not isinstance(include_enforced_status, bool):
++                raise SpecError("include_enforced_status must be bool or None")
++            query.append(
++                (
++                    "include_enforced_status",
++                    "true" if include_enforced_status else "false",
++                )
++            )
++        if site_path is not None:
++            if not isinstance(site_path, str) or not site_path:
++                raise SpecError("site_path must be a non-empty string or None")
++            query.append(("site_path", site_path))
++        target = (
++            f"{BASE_PATH}/infra/realized-state/status?"
++            + urllib.parse.urlencode(query)
++        )
++        status, document = self._request("GET", target)
++        if status != 200:
++            raise NsxProtocolError(
++                f"ReadIntentStatus returned HTTP {status}, expected 200"
++            )
++        if not isinstance(document, dict):
++            raise NsxProtocolError("ReadIntentStatus returned a non-object response")
++        return document
++
++    def wait_for_realization(self, intent_path):
++        for poll in range(1, self.max_polls + 1):
++            document = self.read_intent_status(intent_path)
++            status = document.get("publish_status")
++            if status == SUCCESS:
++                return document
++            if status == FAILURE:
++                raise RealizationFailed(intent_path, document)
++            if status not in PENDING:
++                raise NsxProtocolError(
++                    f"ReadIntentStatus returned unknown publish_status {status!r}"
++                )
++            if poll < self.max_polls:
++                self.sleep(self.poll_interval)
++        raise RealizationTimeout(intent_path, self.max_polls)
++
++    def _request(self, method, path, body=None):
++        data = None
++        headers = {
++            "Authorization": self._authorization,
++            "Accept": "application/json",
++        }
++        if body is not None:
++            data = json.dumps(body, separators=(",", ":")).encode("utf-8")
++            headers["Content-Type"] = "application/json"
++        request = urllib.request.Request(
++            self.base_url + path,
++            data=data,
++            headers=headers,
++            method=method,
++        )
++        try:
++            with urllib.request.urlopen(request) as response:
++                raw = response.read()
++                document = json.loads(raw.decode("utf-8")) if raw else None
++                return response.status, document
++        except urllib.error.HTTPError as exc:
++            try:
++                document = json.loads(exc.read().decode("utf-8"))
++            except (UnicodeDecodeError, ValueError):
++                document = {}
++            raise NsxApiError(exc.code, document) from None
++        except (UnicodeDecodeError, ValueError) as exc:
++            raise NsxProtocolError("NSX returned invalid JSON") from exc
+diff --git a/nsx_segment_realizer/errors.py b/nsx_segment_realizer/errors.py
+new file mode 100644
+index 0000000..64eaa90
+--- /dev/null
++++ b/nsx_segment_realizer/errors.py
+@@ -0,0 +1,45 @@
++"""Typed failures for NSX request, contract, and realization errors."""
++
++
++class SpecError(ValueError):
++    """A caller value cannot be projected into the pinned OpenAPI contract."""
++
++
++class NsxProtocolError(RuntimeError):
++    """The peer's successful response violates the pinned REST contract."""
++
++
++class NsxApiError(RuntimeError):
++    """NSX ApiError response with the structured document preserved."""
++
++    def __init__(self, status, document):
++        self.status = status
++        self.document = document if isinstance(document, dict) else {}
++        self.error_code = self.document.get("error_code")
++        self.error_message = self.document.get("error_message", "")
++        self.details = self.document.get("details", "")
++        self.module_name = self.document.get("module_name", "")
++        self.related_errors = list(self.document.get("related_errors") or [])
++        super().__init__(
++            f"NSX API HTTP {status}: {self.error_message or 'request failed'}"
++        )
++
++
++class RealizationFailed(RuntimeError):
++    """Policy intent reached the terminal ERROR publish status."""
++
++    def __init__(self, intent_path, document):
++        self.intent_path = intent_path
++        self.document = document
++        super().__init__(f"NSX intent {intent_path!r} reached ERROR")
++
++
++class RealizationTimeout(TimeoutError):
++    """Policy intent stayed nonterminal for all allowed polls."""
++
++    def __init__(self, intent_path, polls):
++        self.intent_path = intent_path
++        self.polls = polls
++        super().__init__(
++            f"NSX intent {intent_path!r} was not terminal after {polls} polls"
++        )
+diff --git a/nsx_segment_realizer/models.py b/nsx_segment_realizer/models.py
+new file mode 100644
+index 0000000..871c81a
+--- /dev/null
++++ b/nsx_segment_realizer/models.py
+@@ -0,0 +1,103 @@
++"""Explicit wire projection for the selected Segment schema fields."""
++
++from __future__ import annotations
++
++from collections.abc import Mapping
++from dataclasses import KW_ONLY, dataclass
++
++from .errors import SpecError
++
++
++_SEGMENT_OPTIONAL_FIELDS = (
++    "description",
++    "connectivity_path",
++    "subnets",
++    "transport_zone_path",
++    "vlan_ids",
++    "admin_state",
++    "replication_mode",
++    "tags",
++)
++_SUBNET_FIELDS = ("dhcp_config", "dhcp_ranges", "gateway_address")
++_SUBNET_READ_ONLY = frozenset({"network"})
++
++
++@dataclass(frozen=True)
++class SegmentSpec:
++    """Supported writable projection of the OpenAPI Segment model.
++
++    None means unset and is omitted. API defaults are deliberately not copied
++    into the request.
++    """
++
++    display_name: str
++    _: KW_ONLY
++    description: str | None = None
++    connectivity_path: str | None = None
++    subnets: object = None
++    transport_zone_path: str | None = None
++    vlan_ids: object = None
++    admin_state: str | None = None
++    replication_mode: str | None = None
++    tags: object = None
++
++    def to_wire(self):
++        if not isinstance(self.display_name, str) or not self.display_name:
++            raise SpecError("display_name must be a non-empty string")
++        if len(self.display_name) > 255:
++            raise SpecError("display_name exceeds the OpenAPI maxLength of 255")
++        if self.description is not None and (
++            not isinstance(self.description, str) or len(self.description) > 1024
++        ):
++            raise SpecError("description must be a string of at most 1024 characters")
++        if self.admin_state is not None and self.admin_state not in {"UP", "DOWN"}:
++            raise SpecError("admin_state must be UP or DOWN")
++        if (
++            self.replication_mode is not None
++            and self.replication_mode not in {"MTEP", "SOURCE"}
++        ):
++            raise SpecError("replication_mode must be MTEP or SOURCE")
++
++        wire = {"display_name": self.display_name}
++        for field in _SEGMENT_OPTIONAL_FIELDS:
++            value = getattr(self, field)
++            if value is None:
++                continue
++            if field == "subnets":
++                value = self._project_subnets(value)
++            elif field in {"vlan_ids", "tags"}:
++                if not isinstance(value, (list, tuple)):
++                    raise SpecError(f"{field} must be a list or tuple")
++                value = [dict(item) if isinstance(item, Mapping) else item for item in value]
++            wire[field] = value
++        return wire
++
++    @staticmethod
++    def _project_subnets(subnets):
++        if not isinstance(subnets, (list, tuple)):
++            raise SpecError("subnets must be a list or tuple")
++        projected = []
++        allowed = set(_SUBNET_FIELDS)
++        for index, subnet in enumerate(subnets):
++            if not isinstance(subnet, Mapping):
++                raise SpecError(f"subnets[{index}] must be a mapping")
++            keys = set(subnet)
++            read_only = keys & _SUBNET_READ_ONLY
++            if read_only:
++                names = ", ".join(sorted(read_only))
++                raise SpecError(
++                    f"subnets[{index}] contains read-only field(s): {names}"
++                )
++            unknown = keys - allowed
++            if unknown:
++                names = ", ".join(sorted(unknown))
++                raise SpecError(
++                    f"subnets[{index}] contains unsupported field(s): {names}"
++                )
++            item = {}
++            for field in _SUBNET_FIELDS:
++                value = subnet.get(field)
++                if value is not None:
++                    item[field] = value
++            projected.append(item)
++        return projected
+diff --git a/nsx_segment_realizer/realize.py b/nsx_segment_realizer/realize.py
+new file mode 100644
+index 0000000..3b3fa18
+--- /dev/null
++++ b/nsx_segment_realizer/realize.py
+@@ -0,0 +1,16 @@
++"""End-to-end segment intent and realization workflow."""
++
++from .models import SegmentSpec
++
++
++def realize_segment(client, segment_id, spec):
++    """Create/replace a segment, then wait for terminal policy realization."""
++    if not isinstance(spec, SegmentSpec):
++        # Keep validation ahead of any request even for alternate client objects.
++        from .errors import SpecError
++
++        raise SpecError("spec must be a SegmentSpec")
++    segment = client.create_or_replace_segment(segment_id, spec)
++    intent_path = f"/infra/segments/{segment_id}"
++    realization = client.wait_for_realization(intent_path)
++    return {"segment": segment, "realization": realization}
