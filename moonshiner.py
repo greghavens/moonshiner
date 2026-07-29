@@ -578,7 +578,7 @@ def _start_default_queues() -> int:
             executable = Path(sys.executable).parent / "moonshiner"
             subprocess.run(["systemd-run", "--user", "--collect", f"--unit={unit}",
                             f"--property=WorkingDirectory={PROJECT_ROOT}",
-                            f"--setenv=PATH={os.environ.get('PATH', '')}",
+                            *_memory_ceiling(), f"--setenv=PATH={os.environ.get('PATH', '')}",
                             str(executable), "seed", "queue", "--yes"], check=True)
     if queues.get("tracing", True):
         unit = f"moonshiner-trace-continuous-{project_key}"
@@ -596,7 +596,7 @@ def _start_default_queues() -> int:
                        f"--property=RestartPreventExitStatus={USAGE_LIMIT_EXIT}",
                        f"--property=StandardOutput=append:{log_dir / 'run.log'}",
                        f"--property=StandardError=append:{log_dir / 'run.log'}",
-                       f"--setenv=PATH={os.environ.get('PATH', '')}",
+                       *_memory_ceiling(), f"--setenv=PATH={os.environ.get('PATH', '')}",
                        "--setenv=MOONSHINER_SUPERVISED=1", str(executable),
                        "run", "--all", "--yes"]
             subprocess.run(command, check=True)
@@ -616,7 +616,7 @@ def _start_default_queues() -> int:
                             f"--property=RestartPreventExitStatus={USAGE_LIMIT_EXIT}",
                             f"--property=StandardOutput=append:{log_dir / 'run.log'}",
                             f"--property=StandardError=append:{log_dir / 'run.log'}",
-                            f"--setenv=PATH={os.environ.get('PATH', '')}",
+                            *_memory_ceiling(), f"--setenv=PATH={os.environ.get('PATH', '')}",
                             str(executable), "synthetic-corrections", "run", "--watch", "--yes"],
                            check=True)
     print("Moonshiner queues are running: author (when enabled), trace/judge/retrace, "
@@ -757,7 +757,7 @@ def _service(argv: list[str]) -> int:
                    f"--property=RestartPreventExitStatus={USAGE_LIMIT_EXIT}",
                    f"--property=StandardOutput=append:{log_dir / 'run.log'}",
                    f"--property=StandardError=append:{log_dir / 'run.log'}",
-                   f"--setenv=PATH={os.environ.get('PATH', '')}",
+                   *_memory_ceiling(), f"--setenv=PATH={os.environ.get('PATH', '')}",
                    "--setenv=MOONSHINER_SUPERVISED=1", str(executable),
                    "run", "--all", "--yes"]
         result = subprocess.run(command)
@@ -780,6 +780,21 @@ def _service(argv: list[str]) -> int:
     if result.returncode == 0:
         print(message)
     return result.returncode
+
+
+def _memory_ceiling() -> list[str]:
+    """Cap a queue's memory so a runaway job fails alone.
+
+    One trace captured a sandbox HOME full of cargo caches into its diff and
+    grew to 18 GB. The kernel killed the whole unit, so a single bad artifact
+    took the queue down and every job in it with it. A ceiling turns that into
+    one failed job. Set pipeline.memory_max to "" or "infinity" to remove it.
+    """
+    from common import CONFIG
+    value = str((CONFIG.get("pipeline") or {}).get("memory_max", "8G")).strip()
+    if not value or value.lower() == "infinity":
+        return []
+    return [f"--property=MemoryMax={value}", f"--property=MemorySwapMax={value}"]
 
 
 MOONSHINER_UNIT = re.compile(r"^moonshiner-[a-z-]+-[0-9a-f]{12}\.service$")

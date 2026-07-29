@@ -492,3 +492,26 @@ class NoRuntimeMayBeLockedOut(unittest.TestCase):
         self.assertEqual([], offenders,
                          "a runtime must never be blocked by a local switch")
 
+
+
+class ARunawayJobMustNotKillItsQueue(unittest.TestCase):
+    """One artifact grew to 18 GB and the kernel killed the whole unit.
+
+    A trace captured a sandbox HOME of cargo caches into its diff. Without a
+    ceiling the queue died with it and every job it held was lost; with one,
+    the single job fails and the queue keeps working.
+    """
+
+    def test_a_ceiling_is_applied_by_default(self):
+        self.assertEqual(["--property=MemoryMax=8G", "--property=MemorySwapMax=8G"],
+                         m._memory_ceiling())
+
+    def test_it_can_be_removed_deliberately(self):
+        import common
+        for value in ("", "infinity"):
+            with mock.patch.dict(common.CONFIG, {"pipeline": {"memory_max": value}}):
+                self.assertEqual([], m._memory_ceiling())
+
+    def test_every_queue_unit_gets_it(self):
+        source = (pathlib.Path(m.__file__).resolve()).read_text()
+        self.assertGreaterEqual(source.count("*_memory_ceiling()"), 4)
