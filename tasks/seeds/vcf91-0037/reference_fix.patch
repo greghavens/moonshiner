@@ -1,0 +1,228 @@
+--- a/VcfBackupClient.java
++++ b/VcfBackupClient.java
+@@ -1,8 +1,16 @@
+ import java.io.IOException;
+ import java.net.URI;
++import java.net.URLEncoder;
+ import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
+ import java.time.Duration;
++import java.util.Locale;
+ import java.util.Objects;
++import java.util.Set;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
+ 
+ /**
+  * Minimal client for the VCF 9.1 SDDC Manager operations selected in
+@@ -10,6 +18,14 @@
+  * library.
+  */
+ public final class VcfBackupClient {
++    private static final Set<String> TERMINAL_STATUSES = Set.of(
++            "SUCCESSFUL",
++            "FAILED",
++            "CANCELLED",
++            "COMPLETED_WITH_WARNING",
++            "SKIPPED",
++            "TIMED_OUT");
++
+     private final URI baseUri;
+     private final String accessToken;
+     private final Duration requestTimeout;
+@@ -50,7 +66,191 @@
+             BackupLocation location,
+             int maxPolls,
+             Duration pollInterval) throws IOException, InterruptedException {
+-        // TODO: implement the spec-derived request body, PATCH, and polling loop.
+-        throw new UnsupportedOperationException("Not implemented");
++        Objects.requireNonNull(location, "location");
++        Objects.requireNonNull(pollInterval, "pollInterval");
++        if (maxPolls <= 0) {
++            throw new IllegalArgumentException("maxPolls must be positive");
++        }
++        if (pollInterval.isNegative()) {
++            throw new IllegalArgumentException("pollInterval must not be negative");
++        }
++
++        String requestBody = backupConfigurationJson(location);
++        HttpRequest update = request("/v1/system/backup-configuration")
++                .header("Content-Type", "application/json")
++                .method("PATCH", HttpRequest.BodyPublishers.ofString(
++                        requestBody, StandardCharsets.UTF_8))
++                .build();
++        HttpResponse<String> updateResponse = http.send(
++                update, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++        requireStatus(updateResponse, 202, "updateBackupConfiguration");
++
++        Task current = parseTask(updateResponse.body());
++        int polls = 0;
++        while (!isTerminal(current.status())) {
++            if (polls >= maxPolls) {
++                throw new IOException(
++                        "Task " + current.id() + " did not reach a terminal state after "
++                                + maxPolls + " polls");
++            }
++            sleep(pollInterval);
++            current = getTask(current.id());
++            polls++;
++        }
++        return current;
++    }
++
++    private Task getTask(String taskId) throws IOException, InterruptedException {
++        String encodedId = URLEncoder.encode(taskId, StandardCharsets.UTF_8)
++                .replace("+", "%20");
++        HttpRequest get = request("/v1/tasks/" + encodedId)
++                .GET()
++                .build();
++        HttpResponse<String> response = http.send(
++                get, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++        requireStatus(response, 200, "getTask");
++        return parseTask(response.body());
++    }
++
++    private HttpRequest.Builder request(String path) {
++        return HttpRequest.newBuilder(baseUri.resolve(path))
++                .timeout(requestTimeout)
++                .header("Accept", "application/json")
++                .header("Authorization", "Bearer " + accessToken);
++    }
++
++    private static String backupConfigurationJson(BackupLocation location) {
++        StringBuilder json = new StringBuilder();
++        json.append("{\"backupLocations\":[{")
++                .append("\"server\":").append(quote(required(location.server(), "server")))
++                .append(",\"port\":").append(location.port())
++                .append(",\"protocol\":").append(quote(required(location.protocol(), "protocol")))
++                .append(",\"username\":").append(quote(required(location.username(), "username")))
++                .append(",\"directoryPath\":")
++                .append(quote(required(location.directoryPath(), "directoryPath")));
++        if (location.password() != null) {
++            json.append(",\"password\":").append(quote(location.password()));
++        }
++        if (location.sshFingerprint() != null) {
++            json.append(",\"sshFingerprint\":").append(quote(location.sshFingerprint()));
++        }
++        return json.append("}]}").toString();
++    }
++
++    private static String required(String value, String field) {
++        if (value == null) {
++            throw new IllegalArgumentException(field + " must not be null");
++        }
++        return value;
++    }
++
++    private static String quote(String value) {
++        StringBuilder encoded = new StringBuilder(value.length() + 2).append('"');
++        for (int index = 0; index < value.length(); index++) {
++            char character = value.charAt(index);
++            switch (character) {
++                case '"' -> encoded.append("\\\"");
++                case '\\' -> encoded.append("\\\\");
++                case '\b' -> encoded.append("\\b");
++                case '\f' -> encoded.append("\\f");
++                case '\n' -> encoded.append("\\n");
++                case '\r' -> encoded.append("\\r");
++                case '\t' -> encoded.append("\\t");
++                default -> {
++                    if (character < 0x20) {
++                        encoded.append(String.format("\\u%04x", (int) character));
++                    } else {
++                        encoded.append(character);
++                    }
++                }
++            }
++        }
++        return encoded.append('"').toString();
++    }
++
++    private static Task parseTask(String json) throws IOException {
++        return new Task(
++                jsonString(json, "id", true),
++                jsonString(json, "name", true),
++                jsonString(json, "status", true),
++                jsonString(json, "creationTimestamp", true),
++                jsonString(json, "completionTimestamp", false));
++    }
++
++    private static String jsonString(String json, String field, boolean required)
++            throws IOException {
++        Pattern pattern = Pattern.compile(
++                "\"" + Pattern.quote(field)
++                        + "\"\\s*:\\s*\"((?:\\\\(?:[\"\\\\/bfnrt]|u[0-9a-fA-F]{4})|[^\"\\\\])*)\"");
++        Matcher matcher = pattern.matcher(json);
++        if (!matcher.find()) {
++            if (required) {
++                throw new IOException("Task response is missing string field " + field);
++            }
++            return null;
++        }
++        return unescape(matcher.group(1));
++    }
++
++    private static String unescape(String value) throws IOException {
++        StringBuilder decoded = new StringBuilder(value.length());
++        for (int index = 0; index < value.length(); index++) {
++            char character = value.charAt(index);
++            if (character != '\\') {
++                decoded.append(character);
++                continue;
++            }
++            if (++index >= value.length()) {
++                throw new IOException("Invalid JSON escape");
++            }
++            char escape = value.charAt(index);
++            switch (escape) {
++                case '"' -> decoded.append('"');
++                case '\\' -> decoded.append('\\');
++                case '/' -> decoded.append('/');
++                case 'b' -> decoded.append('\b');
++                case 'f' -> decoded.append('\f');
++                case 'n' -> decoded.append('\n');
++                case 'r' -> decoded.append('\r');
++                case 't' -> decoded.append('\t');
++                case 'u' -> {
++                    if (index + 4 >= value.length()) {
++                        throw new IOException("Invalid JSON unicode escape");
++                    }
++                    try {
++                        decoded.append((char) Integer.parseInt(
++                                value.substring(index + 1, index + 5), 16));
++                    } catch (NumberFormatException error) {
++                        throw new IOException("Invalid JSON unicode escape", error);
++                    }
++                    index += 4;
++                }
++                default -> throw new IOException("Invalid JSON escape");
++            }
++        }
++        return decoded.toString();
++    }
++
++    private static boolean isTerminal(String status) {
++        String normalized = status.toUpperCase(Locale.ROOT).replace(' ', '_');
++        return TERMINAL_STATUSES.contains(normalized);
++    }
++
++    private static void requireStatus(
++            HttpResponse<String> response, int expected, String operation) throws IOException {
++        if (response.statusCode() != expected) {
++            throw new IOException(
++                    operation + " returned HTTP " + response.statusCode() + ": "
++                            + response.body());
++        }
++    }
++
++    private static void sleep(Duration duration) throws InterruptedException {
++        if (duration.isZero()) {
++            return;
++        }
++        long milliseconds = duration.toMillis();
++        int extraNanoseconds = duration.toNanosPart() % 1_000_000;
++        Thread.sleep(milliseconds, extraNanoseconds);
+     }
+ }
