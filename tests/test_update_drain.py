@@ -248,5 +248,29 @@ class APauseIsAlwaysUndone(unittest.TestCase):
         self.assertIn("finally:", block)
 
 
+class TheDrainMustOutlastTheLongestJob(unittest.TestCase):
+    """An update that cannot wait out one job can never roll anything over.
+
+    A trace may run its full timeout and then be judged for the judge's own.
+    The drain defaulted to a flat hour, which is shorter than that sum, so
+    every rollout attempted while a long trace was in flight timed out,
+    refused, and left the queues on the old release.
+    """
+
+    def test_the_default_exceeds_a_trace_plus_its_judging(self):
+        import moonshiner as m
+        import common
+        with mock.patch.dict(common.CONFIG, {"teacher": {"timeout_s": 3600},
+                                             "judge": {"timeout_s": 1800}}):
+            self.assertGreater(m._drain_default(), 3600 + 1800)
+
+    def test_it_follows_the_configured_timeouts(self):
+        import moonshiner as m
+        import common
+        with mock.patch.dict(common.CONFIG, {"teacher": {"timeout_s": 100},
+                                             "judge": {"timeout_s": 100}}):
+            self.assertEqual(300, m._drain_default())
+
+
 if __name__ == "__main__":
     unittest.main()

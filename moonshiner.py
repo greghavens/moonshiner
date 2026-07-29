@@ -782,6 +782,22 @@ def _service(argv: list[str]) -> int:
     return result.returncode
 
 
+def _drain_default() -> int:
+    """How long a queue can legitimately take to stand still.
+
+    A trace may run its full timeout and then be judged for the judge's own,
+    so the worst-case job outlasts either alone. A fixed hour was shorter than
+    that sum, which meant an update could never complete while a long trace
+    was in flight: the drain timed out, refused, and left every queue on the
+    old release. Four rollouts failed that way before the arithmetic was
+    noticed.
+    """
+    from common import CONFIG
+    trace = int((CONFIG.get("teacher") or {}).get("timeout_s") or 3600)
+    judge = int((CONFIG.get("judge") or {}).get("timeout_s") or 1800)
+    return int((trace + judge) * 1.5)
+
+
 def _memory_ceiling() -> list[str]:
     """Cap a queue's memory so a runaway job fails alone.
 
@@ -996,9 +1012,10 @@ def _update(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="moonshiner update",
         description="Drain running queues, install the latest release, restart them.")
-    parser.add_argument("--drain-timeout", type=int, default=3600,
+    parser.add_argument("--drain-timeout", type=int, default=_drain_default(),
                         help="Seconds to wait for the queue to stand still "
-                             "(default 3600).")
+                             f"(default {_drain_default()}, from the configured "
+                             "job timeouts).")
     parser.add_argument("--no-restart", action="store_true",
                         help="Leave queues stopped after updating.")
     args = parser.parse_args(argv)
