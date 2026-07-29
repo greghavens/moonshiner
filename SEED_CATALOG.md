@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3129 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3130 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 38 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 56 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 57 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -3685,6 +3685,7 @@
 - **vcf91-0081** (`java`) `#vcf-9-1` `#nsx-policy` `#java` `#rest-contract` `#spec-derived` — Finish `NsxPolicyClient.java`, a dependency-free, single-file Java 17 client for the VCF 9.1 NSX Policy operation pinned in `docs/contract.json`. The contract is a focused extraction of `specificat…
 - **vcf91-0082** (`java`) `#vcf-9-1` `#nsx-policy` `#java` `#rest-contract` `#spec-derived` — Network-automation ticket. A provisioning worker must create or replace one NSX Policy infra segment, but an NSX Manager can commit the mutation and then return a transient 503. The current client…
 - **vcf91-0083** (`java`) `#vcf-9-1` `#nsx-policy` `#java` `#rest-contract` `#spec-derived` — Implement `NsxPolicyClient.java`, a dependency-free single-file Java 17 client for a two-step VMware Cloud Foundation 9.1 NSX Policy change. Read the protected `docs/contract.json` and `docs/offici…
+- **vcf91-0084** (`java`) `#vcf-9-1` `#nsx-policy` `#java` `#rest-contract` `#spec-derived` — Implement `NsxPolicyClient.java`, a dependency-free single-file Java 17 client for a guarded VMware Cloud Foundation 9.1 NSX Policy change. Read the protected `docs/contract.json` and `docs/officia…
 
 ## project-io
 
