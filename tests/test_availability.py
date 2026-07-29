@@ -107,3 +107,28 @@ class CreditExhaustion(unittest.TestCase):
         self.assertIn("errorMessage", block)
         self.assertIn("unavailable=availability.find_usage_limit",
                       source)
+
+
+class AQuotaBlockCostsNoAttempt(unittest.TestCase):
+    """A request the provider refused to serve is not an attempt.
+
+    Attempts are a scarce, metered resource. A 402 never reaches the model,
+    so recording one against the seed spends something for nothing — and a
+    corpus-wide outage would exhaust every seed it touched.
+    """
+
+    def test_the_unavailable_check_precedes_any_record_of_the_attempt(self):
+        source = (_ROOT / "src" / "generate_traces.py").read_text()
+        body = source[source.index("def trace_task"):]
+        raised = body.index("raise ModelUnavailable")
+        for recorded in ("_write_meta(", "_deferral("):
+            self.assertLess(raised, body.index(recorded),
+                            f"{recorded} must not run before the quota check")
+
+    def test_the_run_stops_rather_than_marking_the_seed(self):
+        source = (_ROOT / "src" / "trace_pipeline.py").read_text()
+        handler = source[source.index("except ModelUnavailable as blocked:"):]
+        handler = handler[:handler.index("except BaseException")]
+        self.assertIn("stop_claiming.set()", handler)
+        self.assertNotIn("finish_attempt", handler)
+        self.assertNotIn("set_job", handler)
