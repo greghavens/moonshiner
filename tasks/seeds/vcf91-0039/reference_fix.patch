@@ -1,0 +1,301 @@
+--- a/VcfDomainInventoryClient.java
++++ b/VcfDomainInventoryClient.java
+@@ -1,9 +1,16 @@
+ import java.io.IOException;
+ import java.net.URI;
+ import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
+ import java.time.Duration;
++import java.util.ArrayList;
++import java.util.Comparator;
+ import java.util.List;
+ import java.util.Objects;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
+ 
+ /**
+  * Minimal client for the VCF 9.1 SDDC Manager operation selected in
+@@ -29,6 +36,28 @@
+         this.accessToken = Objects.requireNonNull(accessToken, "accessToken");
+         this.pageSize = pageSize;
+         this.requestTimeout = Objects.requireNonNull(requestTimeout, "requestTimeout");
++        String scheme = baseUri.getScheme();
++        String path = baseUri.getRawPath();
++        if (scheme == null
++                || (!scheme.equalsIgnoreCase("http") && !scheme.equalsIgnoreCase("https"))
++                || baseUri.getRawAuthority() == null
++                || baseUri.getUserInfo() != null
++                || baseUri.getRawQuery() != null
++                || baseUri.getRawFragment() != null
++                || (path != null && !path.isEmpty() && !path.equals("/"))) {
++            throw new IllegalArgumentException("baseUri must be an HTTP(S) origin");
++        }
++        if (accessToken.isBlank()
++                || accessToken.indexOf('\r') >= 0
++                || accessToken.indexOf('\n') >= 0) {
++            throw new IllegalArgumentException("accessToken must not be blank");
++        }
++        if (pageSize <= 0) {
++            throw new IllegalArgumentException("pageSize must be positive");
++        }
++        if (requestTimeout.isZero() || requestTimeout.isNegative()) {
++            throw new IllegalArgumentException("requestTimeout must be positive");
++        }
+         this.http = HttpClient.newBuilder()
+                 .connectTimeout(requestTimeout)
+                 .build();
+@@ -38,7 +67,250 @@
+      * Retrieves every getDomains page and returns one deterministic inventory.
+      */
+     public List<Domain> listAllDomains() throws IOException, InterruptedException {
+-        // TODO: implement the spec-derived paginated collection workflow.
+-        throw new UnsupportedOperationException("Not implemented");
++        List<Domain> collected = new ArrayList<>();
++        Integer expectedTotalPages = null;
++        Integer expectedTotalElements = null;
++        int requestedPage = 0;
++
++        while (true) {
++            Page page = getPage(requestedPage);
++            validateNonNegative(page);
++            if (page.pageNumber() != requestedPage) {
++                throw new IOException("getDomains returned a mismatched pageNumber");
++            }
++            if (page.pageSize() != page.elements().size()) {
++                throw new IOException("getDomains returned a mismatched pageSize");
++            }
++
++            if (expectedTotalPages == null) {
++                expectedTotalPages = page.totalPages();
++                expectedTotalElements = page.totalElements();
++                if (expectedTotalPages == 0
++                        && (!page.elements().isEmpty() || expectedTotalElements != 0)) {
++                    throw new IOException("getDomains returned inconsistent empty pagination");
++                }
++            } else if (page.totalPages() != expectedTotalPages
++                    || page.totalElements() != expectedTotalElements) {
++                throw new IOException("getDomains pagination totals changed");
++            }
++
++            collected.addAll(page.elements());
++            if (expectedTotalPages == 0 || requestedPage + 1 >= expectedTotalPages) {
++                break;
++            }
++            requestedPage++;
++        }
++
++        if (collected.size() != expectedTotalElements) {
++            throw new IOException("getDomains element count does not match totalElements");
++        }
++        collected.sort(Comparator
++                .comparing(Domain::name)
++                .thenComparing(Domain::id));
++        return List.copyOf(collected);
++    }
++
++    private Page getPage(int pageNumber) throws IOException, InterruptedException {
++        String target = "/v1/domains?pageNumber=" + pageNumber
++                + "&pageSize=" + pageSize;
++        HttpRequest request = HttpRequest.newBuilder(baseUri.resolve(target))
++                .timeout(requestTimeout)
++                .header("Accept", "application/json")
++                .header("Authorization", "Bearer " + accessToken)
++                .GET()
++                .build();
++        HttpResponse<String> response = http.send(
++                request,
++                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++        if (response.statusCode() != 200) {
++            throw new IOException(
++                    "getDomains returned HTTP " + response.statusCode());
++        }
++        String contentType = response.headers()
++                .firstValue("Content-Type")
++                .orElse("");
++        int separator = contentType.indexOf(';');
++        String mediaType = (separator < 0
++                ? contentType
++                : contentType.substring(0, separator)).trim();
++        if (!mediaType.equalsIgnoreCase("application/json")) {
++            throw new IOException("getDomains returned a non-JSON response");
++        }
++        return parsePage(response.body());
++    }
++
++    private static Page parsePage(String json) throws IOException {
++        String elementsJson = jsonContainer(json, "elements", '[', ']');
++        List<Domain> elements = new ArrayList<>();
++        for (String object : jsonObjects(elementsJson)) {
++            elements.add(new Domain(
++                    jsonString(object, "id"),
++                    jsonString(object, "name"),
++                    jsonString(object, "status"),
++                    jsonString(object, "type")));
++        }
++
++        String metadata = jsonContainer(json, "pageMetadata", '{', '}');
++        return new Page(
++                List.copyOf(elements),
++                jsonInteger(metadata, "pageNumber"),
++                jsonInteger(metadata, "pageSize"),
++                jsonInteger(metadata, "totalElements"),
++                jsonInteger(metadata, "totalPages"));
++    }
++
++    private static String jsonContainer(
++            String json, String field, char opening, char closing) throws IOException {
++        Pattern pattern = Pattern.compile(
++                "\"" + Pattern.quote(field) + "\"\\s*:\\s*"
++                        + Pattern.quote(String.valueOf(opening)));
++        Matcher matcher = pattern.matcher(json);
++        if (!matcher.find()) {
++            throw new IOException("getDomains response is missing field " + field);
++        }
++        int start = matcher.end() - 1;
++        int end = matchingDelimiter(json, start, opening, closing);
++        return json.substring(start + 1, end);
++    }
++
++    private static List<String> jsonObjects(String json) throws IOException {
++        List<String> objects = new ArrayList<>();
++        int index = skipWhitespace(json, 0);
++        while (index < json.length()) {
++            if (json.charAt(index) != '{') {
++                throw new IOException("getDomains elements is malformed");
++            }
++            int end = matchingDelimiter(json, index, '{', '}');
++            objects.add(json.substring(index + 1, end));
++            index = skipWhitespace(json, end + 1);
++            if (index == json.length()) {
++                break;
++            }
++            if (json.charAt(index) != ',') {
++                throw new IOException("getDomains elements is malformed");
++            }
++            index = skipWhitespace(json, index + 1);
++            if (index == json.length()) {
++                throw new IOException("getDomains elements is malformed");
++            }
++        }
++        return objects;
++    }
++
++    private static int matchingDelimiter(
++            String json, int start, char opening, char closing) throws IOException {
++        int depth = 0;
++        boolean inString = false;
++        boolean escaped = false;
++        for (int index = start; index < json.length(); index++) {
++            char character = json.charAt(index);
++            if (inString) {
++                if (escaped) {
++                    escaped = false;
++                } else if (character == '\\') {
++                    escaped = true;
++                } else if (character == '"') {
++                    inString = false;
++                }
++                continue;
++            }
++            if (character == '"') {
++                inString = true;
++            } else if (character == opening) {
++                depth++;
++            } else if (character == closing && --depth == 0) {
++                return index;
++            }
++        }
++        throw new IOException("getDomains response has an unterminated JSON container");
++    }
++
++    private static int skipWhitespace(String value, int index) {
++        while (index < value.length()
++                && Character.isWhitespace(value.charAt(index))) {
++            index++;
++        }
++        return index;
++    }
++
++    private static int jsonInteger(String json, String field) throws IOException {
++        Pattern pattern = Pattern.compile(
++                "\"" + Pattern.quote(field) + "\"\\s*:\\s*(-?(?:0|[1-9][0-9]*))");
++        Matcher matcher = pattern.matcher(json);
++        if (!matcher.find()) {
++            throw new IOException("getDomains response is missing integer field " + field);
++        }
++        try {
++            return Integer.parseInt(matcher.group(1));
++        } catch (NumberFormatException error) {
++            throw new IOException("getDomains response integer is outside int32", error);
++        }
++    }
++
++    private static String jsonString(String json, String field) throws IOException {
++        Pattern pattern = Pattern.compile(
++                "\"" + Pattern.quote(field)
++                        + "\"\\s*:\\s*\"((?:\\\\(?:[\"\\\\/bfnrt]|u[0-9a-fA-F]{4})|[^\"\\\\])*)\"");
++        Matcher matcher = pattern.matcher(json);
++        if (!matcher.find()) {
++            throw new IOException("getDomains response is missing string field " + field);
++        }
++        return unescape(matcher.group(1));
++    }
++
++    private static String unescape(String value) throws IOException {
++        StringBuilder decoded = new StringBuilder(value.length());
++        for (int index = 0; index < value.length(); index++) {
++            char character = value.charAt(index);
++            if (character != '\\') {
++                decoded.append(character);
++                continue;
++            }
++            if (++index >= value.length()) {
++                throw new IOException("Invalid JSON escape");
++            }
++            char escape = value.charAt(index);
++            switch (escape) {
++                case '"' -> decoded.append('"');
++                case '\\' -> decoded.append('\\');
++                case '/' -> decoded.append('/');
++                case 'b' -> decoded.append('\b');
++                case 'f' -> decoded.append('\f');
++                case 'n' -> decoded.append('\n');
++                case 'r' -> decoded.append('\r');
++                case 't' -> decoded.append('\t');
++                case 'u' -> {
++                    if (index + 4 >= value.length()) {
++                        throw new IOException("Invalid JSON unicode escape");
++                    }
++                    try {
++                        decoded.append((char) Integer.parseInt(
++                                value.substring(index + 1, index + 5), 16));
++                    } catch (NumberFormatException error) {
++                        throw new IOException("Invalid JSON unicode escape", error);
++                    }
++                    index += 4;
++                }
++                default -> throw new IOException("Invalid JSON escape");
++            }
++        }
++        return decoded.toString();
++    }
++
++    private static void validateNonNegative(Page page) throws IOException {
++        if (page.pageNumber() < 0
++                || page.pageSize() < 0
++                || page.totalElements() < 0
++                || page.totalPages() < 0) {
++            throw new IOException("getDomains returned negative pagination metadata");
++        }
++    }
++
++    private record Page(
++            List<Domain> elements,
++            int pageNumber,
++            int pageSize,
++            int totalElements,
++            int totalPages) {
+     }
+ }
