@@ -1,0 +1,562 @@
+diff --git a/vcf_failure_diagnostics/client.py b/vcf_failure_diagnostics/client.py
+new file mode 100644
+--- /dev/null
++++ b/vcf_failure_diagnostics/client.py
+@@ -0,0 +1,557 @@
++"""Stdlib-only SDDC Manager failure-evidence workflow."""
++
++from __future__ import annotations
++
++from collections.abc import Sequence
++from dataclasses import dataclass
++from datetime import datetime
++import io
++import json
++import tarfile
++import time
++import urllib.error
++import urllib.parse
++import urllib.request
++
++
++_UNSET = object()
++_NONTERMINAL_BUNDLE_STATUSES = frozenset({"PENDING", "IN_PROGRESS"})
++
++
++class SddcManagerError(Exception):
++    """A transport, HTTP, or exact-status failure."""
++
++    def __init__(self, status_code, payload=None):
++        self.status_code = status_code
++        self.payload = payload
++        label = "SDDC Manager request failed"
++        if status_code is not None:
++            label += f" with HTTP {status_code}"
++        super().__init__(label)
++
++
++class ProtocolError(Exception):
++    """A success response violated the protected REST contract."""
++
++
++class EvidenceError(Exception):
++    """The available evidence cannot support one unambiguous diagnosis."""
++
++
++class PollTimeoutError(EvidenceError):
++    """Support-bundle collection exceeded its configured poll budget."""
++
++    def __init__(self, bundle_id, max_polls, last_status):
++        self.bundle_id = bundle_id
++        self.max_polls = max_polls
++        self.last_status = last_status
++        super().__init__(
++            f"support bundle {bundle_id!r} exceeded "
++            f"poll budget of {max_polls}"
++        )
++
++
++@dataclass(frozen=True)
++class SupportBundleSelection:
++    """OpenAPI wire projection for the evidence bundle request."""
++
++    domain_name: str
++    cluster_names: Sequence[str] | None = None
++    sddc_manager_logs: bool | None = None
++    nsx_logs: bool | None = None
++    api_logs: bool | None = None
++    include_free_hosts: bool | None = None
++    force: bool | None = None
++    summary_report: bool | None = None
++
++    def __post_init__(self):
++        _require_nonempty_string(self.domain_name, "domain_name")
++
++        if self.cluster_names is not None:
++            if isinstance(self.cluster_names, (str, bytes)) or not isinstance(
++                self.cluster_names,
++                Sequence,
++            ):
++                raise TypeError("cluster_names must be a sequence of strings")
++            normalized = tuple(self.cluster_names)
++            for index, name in enumerate(normalized):
++                _require_nonempty_string(
++                    name,
++                    f"cluster_names[{index}]",
++                )
++            object.__setattr__(self, "cluster_names", normalized)
++
++        for name in (
++            "sddc_manager_logs",
++            "nsx_logs",
++            "api_logs",
++            "include_free_hosts",
++            "force",
++            "summary_report",
++        ):
++            value = getattr(self, name)
++            if value is not None and type(value) is not bool:
++                raise TypeError(f"{name} must be a boolean when supplied")
++
++    def to_wire(self):
++        """Build compactable JSON while preserving false and empty arrays."""
++        body = {}
++
++        options = {}
++        if self.force is not None:
++            options["config"] = {"force": self.force}
++        if self.summary_report is not None:
++            options["include"] = {
++                "summaryReport": self.summary_report,
++            }
++        if options:
++            body["options"] = options
++
++        scope = {}
++        if self.include_free_hosts is not None:
++            scope["includeFreeHosts"] = self.include_free_hosts
++        domain = {"domainName": self.domain_name}
++        if self.cluster_names is not None:
++            domain["clusterNames"] = list(self.cluster_names)
++        scope["domains"] = [domain]
++        body["scope"] = scope
++
++        logs = {}
++        if self.nsx_logs is not None:
++            logs["nsxLogs"] = self.nsx_logs
++        if self.sddc_manager_logs is not None:
++            logs["sddcManagerLogs"] = self.sddc_manager_logs
++        if self.api_logs is not None:
++            logs["apiLogs"] = self.api_logs
++        if logs:
++            body["logs"] = logs
++
++        return body
++
++
++class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
++    def redirect_request(self, req, fp, code, msg, headers, newurl):
++        return None
++
++
++class SddcManagerClient:
++    """Bearer-authenticated client for the five-operation evidence contract."""
++
++    def __init__(
++        self,
++        base_url,
++        access_token,
++        *,
++        sleep=time.sleep,
++        poll_interval=1.0,
++        max_polls=20,
++        timeout=10.0,
++    ):
++        self.base_url = _validated_origin(base_url)
++        _require_nonempty_string(access_token, "access_token")
++        if not callable(sleep):
++            raise TypeError("sleep must be callable")
++        if (
++            isinstance(poll_interval, bool)
++            or not isinstance(poll_interval, (int, float))
++            or poll_interval <= 0
++        ):
++            raise ValueError("poll_interval must be a positive number")
++        if (
++            isinstance(max_polls, bool)
++            or not isinstance(max_polls, int)
++            or max_polls < 1
++        ):
++            raise ValueError("max_polls must be a positive integer")
++        if (
++            isinstance(timeout, bool)
++            or not isinstance(timeout, (int, float))
++            or timeout <= 0
++        ):
++            raise ValueError("timeout must be a positive number")
++
++        self._access_token = access_token
++        self._sleep = sleep
++        self.poll_interval = float(poll_interval)
++        self.max_polls = max_polls
++        self.timeout = float(timeout)
++        self._opener = urllib.request.build_opener(
++            urllib.request.ProxyHandler({}),
++            _NoRedirectHandler(),
++        )
++
++    def diagnose_failed_task(self, task_id, selection):
++        """Collect events and logs, then return their unique diagnosis."""
++        _require_nonempty_string(task_id, "task_id")
++        if not isinstance(selection, SupportBundleSelection):
++            raise TypeError("selection must be a SupportBundleSelection")
++
++        task = self._get_task(task_id)
++        reference_token, resource_ids, created, completed = (
++            self._validate_failed_task(task, task_id)
++        )
++
++        notifications = self._get_notifications()
++        events = self._correlated_events(
++            notifications,
++            resource_ids,
++            created,
++            completed,
++        )
++        if not events:
++            raise EvidenceError(
++                "no notification correlates to the failed task"
++            )
++
++        accepted = self._start_support_bundle(selection.to_wire())
++        if not isinstance(accepted, dict):
++            raise ProtocolError(
++                "support-bundle acceptance must be a JSON object"
++            )
++        bundle_id = accepted.get("id")
++        if not isinstance(bundle_id, str) or not bundle_id.strip():
++            raise ProtocolError(
++                "support-bundle acceptance is missing a non-empty id"
++            )
++
++        last_status = None
++        for poll_index in range(self.max_polls):
++            status_body = self._get_support_bundle_status(bundle_id)
++            if not isinstance(status_body, dict):
++                raise ProtocolError(
++                    "support-bundle status must be a JSON object"
++                )
++            if status_body.get("id") != bundle_id:
++                raise ProtocolError("support-bundle status id mismatch")
++            last_status = status_body.get("status")
++            if last_status == "COMPLETED_WITH_SUCCESS":
++                break
++            if last_status == "COMPLETED_WITH_FAILURE":
++                raise EvidenceError("support-bundle collection failed")
++            if last_status not in _NONTERMINAL_BUNDLE_STATUSES:
++                raise ProtocolError(
++                    "support-bundle status is missing or unknown"
++                )
++            if poll_index + 1 < self.max_polls:
++                self._sleep(self.poll_interval)
++        else:
++            raise PollTimeoutError(
++                bundle_id,
++                self.max_polls,
++                last_status,
++            )
++
++        archive_bytes = self._export_support_bundle(bundle_id)
++        root_cause = _find_root_cause(
++            archive_bytes,
++            task_id,
++            reference_token,
++        )
++        return {
++            "taskId": task_id,
++            "taskStatus": "FAILED",
++            "referenceToken": reference_token,
++            "supportBundleId": bundle_id,
++            "rootCause": root_cause,
++            "events": events,
++        }
++
++    def _request(
++        self,
++        method,
++        path,
++        *,
++        expected_status,
++        body=_UNSET,
++        accept="application/json",
++        decode_json=True,
++    ):
++        headers = {
++            "Authorization": f"Bearer {self._access_token}",
++            "Accept": accept,
++        }
++        data = None
++        if body is not _UNSET:
++            data = json.dumps(
++                body,
++                ensure_ascii=False,
++                separators=(",", ":"),
++            ).encode("utf-8")
++            headers["Content-Type"] = "application/json"
++
++        request = urllib.request.Request(
++            self.base_url + path,
++            data=data,
++            headers=headers,
++            method=method,
++        )
++        try:
++            with self._opener.open(
++                request,
++                timeout=self.timeout,
++            ) as response:
++                status = response.status
++                raw = response.read()
++        except urllib.error.HTTPError as error:
++            raw = error.read()
++            raise SddcManagerError(
++                error.code,
++                _decode_possible_json(raw),
++            ) from None
++        except (urllib.error.URLError, OSError):
++            raise SddcManagerError(None) from None
++
++        if status != expected_status:
++            raise SddcManagerError(
++                status,
++                _decode_possible_json(raw),
++            )
++        if not decode_json:
++            return raw
++        try:
++            return json.loads(raw.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            raise ProtocolError(
++                "success response was not valid UTF-8 JSON"
++            ) from None
++
++    def _get_task(self, task_id):
++        encoded = urllib.parse.quote(task_id, safe="")
++        return self._request(
++            "GET",
++            f"/v1/tasks/{encoded}",
++            expected_status=200,
++        )
++
++    def _get_notifications(self):
++        return self._request(
++            "GET",
++            "/v1/notifications",
++            expected_status=200,
++        )
++
++    def _start_support_bundle(self, body):
++        return self._request(
++            "POST",
++            "/v1/system/support-bundles",
++            body=body,
++            expected_status=202,
++        )
++
++    def _get_support_bundle_status(self, bundle_id):
++        encoded = urllib.parse.quote(bundle_id, safe="")
++        return self._request(
++            "GET",
++            f"/v1/system/support-bundles/{encoded}",
++            expected_status=200,
++        )
++
++    def _export_support_bundle(self, bundle_id):
++        encoded = urllib.parse.quote(bundle_id, safe="")
++        return self._request(
++            "GET",
++            f"/v1/system/support-bundles/{encoded}/data",
++            expected_status=200,
++            accept="application/octet-stream",
++            decode_json=False,
++        )
++
++    @staticmethod
++    def _validate_failed_task(task, task_id):
++        if not isinstance(task, dict):
++            raise ProtocolError("getTask must return a JSON object")
++        if task.get("id") != task_id:
++            raise ProtocolError("task id mismatch")
++        if task.get("status") != "FAILED":
++            raise EvidenceError("task is not in FAILED status")
++
++        errors = task.get("errors")
++        if not isinstance(errors, list):
++            raise ProtocolError("failed task errors must be an array")
++        tokens = [
++            error.get("referenceToken")
++            for error in errors
++            if isinstance(error, dict)
++            and isinstance(error.get("referenceToken"), str)
++            and error["referenceToken"].strip()
++        ]
++        if len(tokens) != 1:
++            raise EvidenceError(
++                "failed task must contain exactly one reference token"
++            )
++
++        resources = task.get("resources")
++        if not isinstance(resources, list):
++            raise ProtocolError("failed task resources must be an array")
++        resource_ids = {
++            resource["resourceId"]
++            for resource in resources
++            if isinstance(resource, dict)
++            and isinstance(resource.get("resourceId"), str)
++            and resource["resourceId"].strip()
++        }
++        if not resource_ids:
++            raise EvidenceError(
++                "failed task has no resource ids for event correlation"
++            )
++
++        created = _parse_timestamp(
++            task.get("creationTimestamp"),
++            "task creationTimestamp",
++        )
++        completed = _parse_timestamp(
++            task.get("completionTimestamp"),
++            "task completionTimestamp",
++        )
++        if completed < created:
++            raise ProtocolError(
++                "task completionTimestamp precedes creationTimestamp"
++            )
++        return tokens[0], resource_ids, created, completed
++
++    @staticmethod
++    def _correlated_events(
++        notifications,
++        resource_ids,
++        created,
++        completed,
++    ):
++        if not isinstance(notifications, list):
++            raise ProtocolError(
++                "getNotifications must return a JSON array"
++            )
++        relevant = []
++        for notification in notifications:
++            if not isinstance(notification, dict):
++                continue
++            try:
++                timestamp = _parse_timestamp(
++                    notification.get("creationTimestamp"),
++                    "notification creationTimestamp",
++                )
++            except ProtocolError:
++                continue
++            if not created <= timestamp <= completed:
++                continue
++            resources = notification.get("resources")
++            if not isinstance(resources, list):
++                continue
++            if any(
++                isinstance(resource, dict)
++                and resource.get("id") in resource_ids
++                for resource in resources
++            ):
++                relevant.append(notification)
++        return relevant
++
++
++def _require_nonempty_string(value, name):
++    if not isinstance(value, str) or not value.strip():
++        raise ValueError(f"{name} must be a non-empty string")
++
++
++def _validated_origin(base_url):
++    _require_nonempty_string(base_url, "base_url")
++    try:
++        parsed = urllib.parse.urlsplit(base_url)
++        port = parsed.port
++    except ValueError:
++        raise ValueError("base_url is not a valid HTTP(S) origin") from None
++    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
++        raise ValueError("base_url must be an HTTP(S) origin")
++    if parsed.username is not None or parsed.password is not None:
++        raise ValueError("base_url must not contain credentials")
++    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
++        raise ValueError(
++            "base_url must not contain a path, query, or fragment"
++        )
++    if parsed.hostname is None or (
++        port is not None and not 1 <= port <= 65535
++    ):
++        raise ValueError("base_url is not a valid HTTP(S) origin")
++    return f"{parsed.scheme}://{parsed.netloc}"
++
++
++def _decode_possible_json(raw):
++    if not raw:
++        return None
++    try:
++        return json.loads(raw.decode("utf-8"))
++    except (UnicodeDecodeError, json.JSONDecodeError):
++        return None
++
++
++def _parse_timestamp(value, label):
++    if not isinstance(value, str) or not value.strip():
++        raise ProtocolError(f"{label} must be a non-empty string")
++    try:
++        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
++    except ValueError:
++        raise ProtocolError(f"{label} is not valid ISO 8601") from None
++    if parsed.tzinfo is None:
++        raise ProtocolError(f"{label} must include a timezone")
++    return parsed
++
++
++def _find_root_cause(
++    archive_bytes,
++    task_id,
++    reference_token,
++):
++    matches = []
++    try:
++        with tarfile.open(
++            fileobj=io.BytesIO(archive_bytes),
++            mode="r:gz",
++        ) as archive:
++            for member in archive:
++                if not member.isfile() or not member.name.lower().endswith(
++                    ".log"
++                ):
++                    continue
++                stream = archive.extractfile(member)
++                if stream is None:
++                    continue
++                text = stream.read().decode("utf-8")
++                for line in text.splitlines():
++                    try:
++                        record = json.loads(line)
++                    except json.JSONDecodeError:
++                        continue
++                    if not isinstance(record, dict):
++                        continue
++                    if (
++                        record.get("referenceToken") != reference_token
++                        or record.get("taskId") != task_id
++                    ):
++                        continue
++                    cause_code = record.get("causeCode")
++                    cause = record.get("cause")
++                    if (
++                        isinstance(cause_code, str)
++                        and cause_code.strip()
++                        and isinstance(cause, str)
++                        and cause.strip()
++                    ):
++                        matches.append(
++                            {
++                                "code": cause_code,
++                                "message": cause,
++                                "logPath": member.name,
++                            }
++                        )
++    except (
++        tarfile.TarError,
++        OSError,
++        EOFError,
++        UnicodeDecodeError,
++    ):
++        raise EvidenceError(
++            "support bundle is not a readable UTF-8 tar.gz archive"
++        ) from None
++
++    if len(matches) != 1:
++        raise EvidenceError(
++            "support bundle does not contain one unique diagnostic record"
++        )
++    return matches[0]
