@@ -1,0 +1,530 @@
+--- a/NsxPolicyClient.java
++++ b/NsxPolicyClient.java
+@@ -1,6 +1,23 @@
+ import java.io.IOException;
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.AtomicMoveNotSupportedException;
++import java.nio.file.Files;
++import java.nio.file.OpenOption;
+ import java.nio.file.Path;
++import java.nio.file.StandardCopyOption;
++import java.nio.file.StandardOpenOption;
++import java.time.Duration;
++import java.util.ArrayList;
++import java.util.Base64;
+ import java.util.List;
++import java.util.Locale;
++import java.util.Objects;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
+ 
+ /**
+  * Dependency-free VCF 9.1 NSX Policy client.
+@@ -8,6 +25,20 @@
+  * <p>Implement this file only. The public API below is exercised by TestMain.
+  */
+ public final class NsxPolicyClient {
++    private static final String BASE_PATH = "/policy/api/v1";
++    private static final String GROUP_PATH =
++            "/infra/domains/%s/groups/%s";
++    private static final String POLICY_PATH =
++            "/infra/domains/%s/security-policies/%s";
++    private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(5);
++    private static final Pattern ERROR_CODE = Pattern.compile(
++            "\"error_code\"\\s*:\\s*(-?[0-9]+)");
++    private static final char[] HEX = "0123456789ABCDEF".toCharArray();
++
++    private final URI origin;
++    private final String authorization;
++    private final HttpClient httpClient;
++
+     public record GroupSpec(
+             String displayName,
+             List<String> ipAddresses,
+@@ -40,13 +71,32 @@
+             int succeeded,
+             int failed,
+             List<StepResult> steps) {
++        public ChangeReport {
++            steps = List.copyOf(steps);
++        }
+     }
+ 
+     public NsxPolicyClient(
+             String managerBaseUrl,
+             String username,
+             String password) {
+-        // TODO: validate and retain connection settings.
++        this.origin = validateOrigin(managerBaseUrl);
++        Objects.requireNonNull(username, "username");
++        Objects.requireNonNull(password, "password");
++        if (username.indexOf('\r') >= 0
++                || username.indexOf('\n') >= 0
++                || password.indexOf('\r') >= 0
++                || password.indexOf('\n') >= 0) {
++            throw new IllegalArgumentException(
++                    "credentials must not contain line breaks");
++        }
++        String credentials = username + ":" + password;
++        this.authorization = "Basic " + Base64.getEncoder().encodeToString(
++                credentials.getBytes(StandardCharsets.UTF_8));
++        this.httpClient = HttpClient.newBuilder()
++                .connectTimeout(REQUEST_TIMEOUT)
++                .followRedirects(HttpClient.Redirect.NEVER)
++                .build();
+     }
+ 
+     public ChangeReport applyChange(
+@@ -55,6 +105,447 @@
+             String securityPolicyId,
+             ChangePlan plan,
+             Path reportPath) throws IOException, InterruptedException {
+-        throw new UnsupportedOperationException("TODO");
++        String checkedDomain = nonBlank("domainId", domainId, null);
++        String checkedGroup = nonBlank("groupId", groupId, null);
++        String checkedPolicy = nonBlank(
++                "securityPolicyId", securityPolicyId, null);
++        Objects.requireNonNull(reportPath, "reportPath");
++        if (reportPath.getFileName() == null) {
++            throw new IllegalArgumentException(
++                    "reportPath must identify a file");
++        }
++
++        PreparedChange prepared = prepare(
++                plan, checkedDomain, checkedGroup);
++        URI groupUri = endpoint(
++                GROUP_PATH.formatted(
++                        encodeSegment(checkedDomain),
++                        encodeSegment(checkedGroup)));
++        URI policyUri = endpoint(
++                POLICY_PATH.formatted(
++                        encodeSegment(checkedDomain),
++                        encodeSegment(checkedPolicy)));
++
++        List<StepResult> steps = new ArrayList<>(2);
++        HttpResponse<byte[]> groupResponse = patch(
++                groupUri, prepared.groupBody());
++        if (groupResponse.statusCode() != 200) {
++            steps.add(failedStep(
++                    "source-group",
++                    "PatchGroupForDomain",
++                    groupResponse));
++            return writeAndReturn(
++                    new ChangeReport("failed", 0, 1, steps),
++                    reportPath);
++        }
++        steps.add(new StepResult(
++                "source-group",
++                "PatchGroupForDomain",
++                "succeeded",
++                null,
++                null));
++
++        HttpResponse<byte[]> policyResponse = patch(
++                policyUri, prepared.policyBody());
++        if (policyResponse.statusCode() != 200) {
++            steps.add(failedStep(
++                    "security-policy",
++                    "PatchSecurityPolicyForDomain",
++                    policyResponse));
++            return writeAndReturn(
++                    new ChangeReport(
++                            "partial_failure", 1, 1, steps),
++                    reportPath);
++        }
++        steps.add(new StepResult(
++                "security-policy",
++                "PatchSecurityPolicyForDomain",
++                "succeeded",
++                null,
++                null));
++        return writeAndReturn(
++                new ChangeReport("succeeded", 2, 0, steps),
++                reportPath);
++    }
++
++    private static URI validateOrigin(String managerBaseUrl) {
++        if (managerBaseUrl == null || managerBaseUrl.isEmpty()) {
++            throw new IllegalArgumentException(
++                    "managerBaseUrl must be an HTTP(S) origin");
++        }
++        final URI parsed;
++        try {
++            parsed = URI.create(managerBaseUrl);
++        } catch (IllegalArgumentException error) {
++            throw new IllegalArgumentException(
++                    "managerBaseUrl must be an HTTP(S) origin");
++        }
++        String scheme = parsed.getScheme();
++        if (scheme == null
++                || (!scheme.equalsIgnoreCase("http")
++                && !scheme.equalsIgnoreCase("https"))
++                || parsed.getHost() == null
++                || parsed.getRawAuthority() == null) {
++            throw new IllegalArgumentException(
++                    "managerBaseUrl must be an HTTP(S) origin");
++        }
++        if (parsed.getRawUserInfo() != null) {
++            throw new IllegalArgumentException(
++                    "managerBaseUrl must not contain credentials");
++        }
++        String path = parsed.getRawPath();
++        if ((path != null && !path.isEmpty() && !path.equals("/"))
++                || parsed.getRawQuery() != null
++                || parsed.getRawFragment() != null) {
++            throw new IllegalArgumentException(
++                    "managerBaseUrl must not contain a non-root path, "
++                    + "query, or fragment");
++        }
++        return URI.create(
++                scheme.toLowerCase(Locale.ROOT)
++                + "://"
++                + parsed.getRawAuthority());
++    }
++
++    private URI endpoint(String operationPath) {
++        return URI.create(origin.toASCIIString() + BASE_PATH + operationPath);
++    }
++
++    private HttpResponse<byte[]> patch(
++            URI uri,
++            byte[] body) throws IOException, InterruptedException {
++        HttpRequest request = HttpRequest.newBuilder(uri)
++                .timeout(REQUEST_TIMEOUT)
++                .header("Authorization", authorization)
++                .header("Accept", "application/json")
++                .header("Content-Type", "application/json")
++                .method(
++                        "PATCH",
++                        HttpRequest.BodyPublishers.ofByteArray(body))
++                .build();
++        try {
++            return httpClient.send(
++                    request, HttpResponse.BodyHandlers.ofByteArray());
++        } catch (InterruptedException error) {
++            Thread.currentThread().interrupt();
++            throw error;
++        }
++    }
++
++    private static PreparedChange prepare(
++            ChangePlan plan,
++            String domainId,
++            String groupId) {
++        if (plan == null || plan.group() == null || plan.policy() == null) {
++            throw new IllegalArgumentException(
++                    "plan, group, and policy are required");
++        }
++        GroupSpec group = plan.group();
++        PolicySpec policy = plan.policy();
++
++        String groupDisplayName = nonBlank(
++                "group.displayName", group.displayName(), 255);
++        List<String> addresses = group.ipAddresses();
++        if (addresses == null
++                || addresses.isEmpty()
++                || addresses.size() > 25_000) {
++            throw new IllegalArgumentException(
++                    "group.ipAddresses must contain 1 through 25000 values");
++        }
++        List<String> checkedAddresses = new ArrayList<>(addresses.size());
++        for (int index = 0; index < addresses.size(); index++) {
++            checkedAddresses.add(nonBlank(
++                    "group.ipAddresses[" + index + "]",
++                    addresses.get(index),
++                    null));
++        }
++        String groupDescription = optionalNonBlank(
++                "group.description", group.description(), 1_024);
++
++        String policyDisplayName = nonBlank(
++                "policy.displayName", policy.displayName(), 255);
++        String ruleDisplayName = nonBlank(
++                "policy.ruleDisplayName", policy.ruleDisplayName(), 255);
++        String destinationGroupPath = nonBlank(
++                "policy.destinationGroupPath",
++                policy.destinationGroupPath(),
++                null);
++        if (policy.sequenceNumber() < 0
++                || policy.sequenceNumber() > 999_999) {
++            throw new IllegalArgumentException(
++                    "policy.sequenceNumber must be from 0 through 999999");
++        }
++        if (policy.ruleSequenceNumber() < 0) {
++            throw new IllegalArgumentException(
++                    "policy.ruleSequenceNumber must be non-negative");
++        }
++        String policyDescription = optionalNonBlank(
++                "policy.description", policy.description(), 1_024);
++        String ruleNotes = optionalNonBlank(
++                "policy.ruleNotes", policy.ruleNotes(), 2_048);
++
++        String sourceGroupPath = "/infra/domains/"
++                + domainId
++                + "/groups/"
++                + groupId;
++        return new PreparedChange(
++                groupBody(
++                        groupDisplayName,
++                        checkedAddresses,
++                        groupDescription),
++                policyBody(
++                        policyDisplayName,
++                        ruleDisplayName,
++                        destinationGroupPath,
++                        policy.sequenceNumber(),
++                        policy.ruleSequenceNumber(),
++                        policyDescription,
++                        ruleNotes,
++                        sourceGroupPath));
++    }
++
++    private static String nonBlank(
++            String name,
++            String value,
++            Integer maximumLength) {
++        if (value == null || value.isBlank()) {
++            throw new IllegalArgumentException(
++                    name + " must be a non-blank string");
++        }
++        if (maximumLength != null && value.length() > maximumLength) {
++            throw new IllegalArgumentException(
++                    name + " must not exceed "
++                    + maximumLength
++                    + " characters");
++        }
++        return value;
++    }
++
++    private static String optionalNonBlank(
++            String name,
++            String value,
++            int maximumLength) {
++        return value == null
++                ? null
++                : nonBlank(name, value, maximumLength);
++    }
++
++    private static byte[] groupBody(
++            String displayName,
++            List<String> addresses,
++            String description) {
++        StringBuilder json = new StringBuilder(192);
++        json.append("{\"resource_type\":\"Group\",\"display_name\":");
++        appendString(json, displayName);
++        json.append(",\"expression\":[{\"resource_type\":"
++                + "\"IPAddressExpression\",\"ip_addresses\":");
++        appendStringArray(json, addresses);
++        json.append("}]");
++        if (description != null) {
++            json.append(",\"description\":");
++            appendString(json, description);
++        }
++        json.append('}');
++        return json.toString().getBytes(StandardCharsets.UTF_8);
++    }
++
++    private static byte[] policyBody(
++            String displayName,
++            String ruleDisplayName,
++            String destinationGroupPath,
++            int sequenceNumber,
++            int ruleSequenceNumber,
++            String description,
++            String ruleNotes,
++            String sourceGroupPath) {
++        StringBuilder json = new StringBuilder(384);
++        json.append(
++                "{\"resource_type\":\"SecurityPolicy\",\"display_name\":");
++        appendString(json, displayName);
++        json.append(",\"category\":\"Application\",\"sequence_number\":")
++                .append(sequenceNumber)
++                .append(",\"stateful\":true,\"rules\":[{\"resource_type\":"
++                        + "\"Rule\",\"display_name\":");
++        appendString(json, ruleDisplayName);
++        json.append(",\"sequence_number\":")
++                .append(ruleSequenceNumber)
++                .append(",\"source_groups\":[");
++        appendString(json, sourceGroupPath);
++        json.append("],\"destination_groups\":[");
++        appendString(json, destinationGroupPath);
++        json.append("],\"services\":[\"ANY\"],\"scope\":[\"ANY\"],"
++                + "\"action\":\"ALLOW\",\"direction\":\"IN_OUT\"");
++        if (ruleNotes != null) {
++            json.append(",\"notes\":");
++            appendString(json, ruleNotes);
++        }
++        json.append("}]");
++        if (description != null) {
++            json.append(",\"description\":");
++            appendString(json, description);
++        }
++        json.append('}');
++        return json.toString().getBytes(StandardCharsets.UTF_8);
++    }
++
++    private static void appendStringArray(
++            StringBuilder json,
++            List<String> values) {
++        json.append('[');
++        for (int index = 0; index < values.size(); index++) {
++            if (index > 0) {
++                json.append(',');
++            }
++            appendString(json, values.get(index));
++        }
++        json.append(']');
++    }
++
++    private static void appendString(
++            StringBuilder json,
++            String value) {
++        json.append('"');
++        for (int index = 0; index < value.length(); index++) {
++            char character = value.charAt(index);
++            switch (character) {
++                case '"' -> json.append("\\\"");
++                case '\\' -> json.append("\\\\");
++                case '\b' -> json.append("\\b");
++                case '\f' -> json.append("\\f");
++                case '\n' -> json.append("\\n");
++                case '\r' -> json.append("\\r");
++                case '\t' -> json.append("\\t");
++                default -> {
++                    if (character < 0x20) {
++                        json.append("\\u00")
++                                .append(HEX[(character >>> 4) & 0x0f])
++                                .append(HEX[character & 0x0f]);
++                    } else {
++                        json.append(character);
++                    }
++                }
++            }
++        }
++        json.append('"');
++    }
++
++    private static String encodeSegment(String value) {
++        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
++        StringBuilder encoded = new StringBuilder(bytes.length);
++        for (byte element : bytes) {
++            int octet = element & 0xff;
++            if ((octet >= 'a' && octet <= 'z')
++                    || (octet >= 'A' && octet <= 'Z')
++                    || (octet >= '0' && octet <= '9')
++                    || octet == '-'
++                    || octet == '.'
++                    || octet == '_'
++                    || octet == '~') {
++                encoded.append((char) octet);
++            } else {
++                encoded.append('%')
++                        .append(HEX[octet >>> 4])
++                        .append(HEX[octet & 0x0f]);
++            }
++        }
++        return encoded.toString();
++    }
++
++    private static StepResult failedStep(
++            String name,
++            String operationId,
++            HttpResponse<byte[]> response) {
++        return new StepResult(
++                name,
++                operationId,
++                "failed",
++                response.statusCode(),
++                errorCode(response.body()));
++    }
++
++    private static Long errorCode(byte[] responseBody) {
++        Matcher matcher = ERROR_CODE.matcher(
++                new String(responseBody, StandardCharsets.UTF_8));
++        if (!matcher.find()) {
++            return null;
++        }
++        try {
++            return Long.valueOf(matcher.group(1));
++        } catch (NumberFormatException ignored) {
++            return null;
++        }
++    }
++
++    private static ChangeReport writeAndReturn(
++            ChangeReport report,
++            Path reportPath) throws IOException {
++        byte[] bytes = (reportJson(report) + "\n")
++                .getBytes(StandardCharsets.UTF_8);
++        Path absolute = reportPath.toAbsolutePath();
++        Path parent = absolute.getParent();
++        if (parent == null) {
++            throw new IOException("reportPath has no parent directory");
++        }
++        Files.createDirectories(parent);
++        Path temporary = Files.createTempFile(
++                parent, ".nsx-change-report-", ".tmp");
++        try {
++            OpenOption[] options = {
++                StandardOpenOption.WRITE,
++                StandardOpenOption.TRUNCATE_EXISTING
++            };
++            Files.write(temporary, bytes, options);
++            try {
++                Files.move(
++                        temporary,
++                        absolute,
++                        StandardCopyOption.ATOMIC_MOVE,
++                        StandardCopyOption.REPLACE_EXISTING);
++            } catch (AtomicMoveNotSupportedException error) {
++                throw new IOException(
++                        "atomic report replacement is not supported");
++            }
++        } finally {
++            Files.deleteIfExists(temporary);
++        }
++        return report;
++    }
++
++    private static String reportJson(ChangeReport report) {
++        StringBuilder json = new StringBuilder(256);
++        json.append("{\"status\":");
++        appendString(json, report.status());
++        json.append(",\"succeeded\":")
++                .append(report.succeeded())
++                .append(",\"failed\":")
++                .append(report.failed())
++                .append(",\"steps\":[");
++        for (int index = 0; index < report.steps().size(); index++) {
++            if (index > 0) {
++                json.append(',');
++            }
++            StepResult step = report.steps().get(index);
++            json.append("{\"name\":");
++            appendString(json, step.name());
++            json.append(",\"operationId\":");
++            appendString(json, step.operationId());
++            json.append(",\"status\":");
++            appendString(json, step.status());
++            if (step.httpStatus() != null) {
++                json.append(",\"http_status\":")
++                        .append(step.httpStatus());
++            }
++            if (step.errorCode() != null) {
++                json.append(",\"error_code\":")
++                        .append(step.errorCode());
++            }
++            json.append('}');
++        }
++        return json.append("]}").toString();
++    }
++
++    private record PreparedChange(
++            byte[] groupBody,
++            byte[] policyBody) {
+     }
+ }
