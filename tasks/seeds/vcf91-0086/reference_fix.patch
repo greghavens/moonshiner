@@ -1,0 +1,401 @@
+--- a/NsxPolicyClient.java
++++ b/NsxPolicyClient.java
+@@ -1,13 +1,15 @@
+ import java.io.IOException;
+ import java.net.URI;
+-import java.net.URLEncoder;
+ import java.net.http.HttpClient;
+ import java.net.http.HttpRequest;
+ import java.net.http.HttpResponse;
+ import java.nio.charset.StandardCharsets;
+ import java.time.Duration;
++import java.util.ArrayList;
+ import java.util.Base64;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Map;
+ import java.util.Objects;
+ 
+ /**
+@@ -60,29 +62,19 @@ public final class NsxPolicyClient {
+ 
+     /**
+      * Diagnose a connectivity failure from NSX evidence.
+-     *
+-     * <p>The current implementation is the production regression: it asks only
+-     * for traceflow data, sends an unset query parameter as an empty value, uses
+-     * form encoding for a URI path segment, and then guesses that a firewall
+-     * rule was responsible.</p>
+      */
+     public DiagnosticReport diagnoseConnectivityFailure(String traceflowId)
+             throws IOException, InterruptedException {
+         Objects.requireNonNull(traceflowId, "traceflowId");
++        String alarmsJson = get(POLICY_BASE + "/infra/realized-state/alarms");
++        List<AlarmEvidence> alarms = readErrorAlarms(alarmsJson);
+ 
+-        String encodedId = URLEncoder.encode(traceflowId, StandardCharsets.UTF_8);
+-        String path = POLICY_BASE + "/infra/traceflows/" + encodedId
+-                + "/observations?enforcement_point_path=";
+-        get(path);
+-
+-        return new DiagnosticReport(
+-                traceflowId,
+-                List.of(new AlarmEvidence(
+-                        "GUESSED_FIREWALL_FAILURE",
+-                        "ERROR",
+-                        "Traffic was probably blocked by a firewall rule",
+-                        "")),
+-                List.of());
++        String observationsPath = POLICY_BASE + "/infra/traceflows/"
++                + encodePathSegment(traceflowId) + "/observations";
++        String observationsJson = get(observationsPath);
++        List<DropEvidence> drops = readDroppedPackets(observationsJson);
++
++        return new DiagnosticReport(traceflowId, alarms, drops);
+     }
+ 
+     private String get(String path) throws IOException, InterruptedException {
+@@ -97,11 +89,91 @@ public final class NsxPolicyClient {
+                 request,
+                 HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+         if (response.statusCode() < 200 || response.statusCode() >= 300) {
+-            throw new IOException("NSX Policy GET failed with HTTP " + response.statusCode());
++            throw new IOException(
++                    "NSX Policy GET " + path + " failed with HTTP " + response.statusCode());
+         }
+         return response.body();
+     }
+ 
++    private static List<AlarmEvidence> readErrorAlarms(String body) throws IOException {
++        Map<String, Object> root = Json.object(Json.parse(body), "ListAlarms response");
++        List<Object> results = Json.array(root.get("results"), "ListAlarms results");
++        List<AlarmEvidence> alarms = new ArrayList<>();
++        for (int index = 0; index < results.size(); index++) {
++            Map<String, Object> item = Json.object(
++                    results.get(index), "ListAlarms results[" + index + "]");
++            String severity = Json.string(
++                    item.get("severity"), "ListAlarms severity");
++            if ("ERROR".equals(severity)) {
++                alarms.add(new AlarmEvidence(
++                        Json.string(item.get("id"), "ListAlarms id"),
++                        severity,
++                        Json.string(item.get("message"), "ListAlarms message"),
++                        Json.string(
++                                item.get("source_reference"),
++                                "ListAlarms source_reference")));
++            }
++        }
++        return alarms;
++    }
++
++    private static List<DropEvidence> readDroppedPackets(String body) throws IOException {
++        Map<String, Object> root = Json.object(
++                Json.parse(body), "ListTraceflowObservations response");
++        List<Object> results = Json.array(
++                root.get("results"), "ListTraceflowObservations results");
++        List<DropEvidence> drops = new ArrayList<>();
++        for (int index = 0; index < results.size(); index++) {
++            Map<String, Object> item = Json.object(
++                    results.get(index),
++                    "ListTraceflowObservations results[" + index + "]");
++            String resourceType = Json.string(
++                    item.get("resource_type"),
++                    "ListTraceflowObservations resource_type");
++            if ("TraceflowObservationDropped".equals(resourceType)
++                    || "TraceflowObservationDroppedLogical".equals(resourceType)) {
++                drops.add(new DropEvidence(
++                        resourceType,
++                        Json.string(
++                                item.get("reason"),
++                                "ListTraceflowObservations reason"),
++                        Json.string(
++                                item.get("component_name"),
++                                "ListTraceflowObservations component_name"),
++                        Json.string(
++                                item.get("transport_node_name"),
++                                "ListTraceflowObservations transport_node_name"),
++                        Json.longValue(
++                                item.get("sequence_no"),
++                                "ListTraceflowObservations sequence_no")));
++            }
++        }
++        return drops;
++    }
++
++    private static String encodePathSegment(String value) {
++        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
++        StringBuilder encoded = new StringBuilder(bytes.length);
++        char[] hex = "0123456789ABCDEF".toCharArray();
++        for (byte raw : bytes) {
++            int current = raw & 0xff;
++            if ((current >= 'a' && current <= 'z')
++                    || (current >= 'A' && current <= 'Z')
++                    || (current >= '0' && current <= '9')
++                    || current == '-'
++                    || current == '.'
++                    || current == '_'
++                    || current == '~') {
++                encoded.append((char) current);
++            } else {
++                encoded.append('%');
++                encoded.append(hex[current >>> 4]);
++                encoded.append(hex[current & 0x0f]);
++            }
++        }
++        return encoded.toString();
++    }
++
+     private static String stripTrailingSlash(String value) {
+         int end = value.length();
+         while (end > 0 && value.charAt(end - 1) == '/') {
+@@ -109,4 +181,250 @@ public final class NsxPolicyClient {
+         }
+         return value.substring(0, end);
+     }
++
++    /**
++     * Small strict JSON reader used to keep this client dependency-free.
++     */
++    private static final class Json {
++        private final String source;
++        private int offset;
++
++        private Json(String source) {
++            this.source = Objects.requireNonNull(source, "source");
++        }
++
++        static Object parse(String source) throws IOException {
++            Json reader = new Json(source);
++            Object value = reader.readValue();
++            reader.skipWhitespace();
++            if (reader.offset != reader.source.length()) {
++                throw reader.error("unexpected trailing content");
++            }
++            return value;
++        }
++
++        @SuppressWarnings("unchecked")
++        static Map<String, Object> object(Object value, String context) throws IOException {
++            if (!(value instanceof Map<?, ?>)) {
++                throw new IOException("Malformed " + context + ": expected an object");
++            }
++            return (Map<String, Object>) value;
++        }
++
++        @SuppressWarnings("unchecked")
++        static List<Object> array(Object value, String context) throws IOException {
++            if (!(value instanceof List<?>)) {
++                throw new IOException("Malformed " + context + ": expected an array");
++            }
++            return (List<Object>) value;
++        }
++
++        static String string(Object value, String context) throws IOException {
++            if (!(value instanceof String result)) {
++                throw new IOException("Malformed " + context + ": expected a string");
++            }
++            return result;
++        }
++
++        static long longValue(Object value, String context) throws IOException {
++            if (!(value instanceof Long result)) {
++                throw new IOException("Malformed " + context + ": expected an integer");
++            }
++            return result;
++        }
++
++        private Object readValue() throws IOException {
++            skipWhitespace();
++            if (offset >= source.length()) {
++                throw error("expected a JSON value");
++            }
++            return switch (source.charAt(offset)) {
++                case '{' -> readObject();
++                case '[' -> readArray();
++                case '"' -> readString();
++                case 't' -> readLiteral("true", Boolean.TRUE);
++                case 'f' -> readLiteral("false", Boolean.FALSE);
++                case 'n' -> readLiteral("null", null);
++                default -> readNumber();
++            };
++        }
++
++        private Map<String, Object> readObject() throws IOException {
++            offset++;
++            skipWhitespace();
++            Map<String, Object> result = new LinkedHashMap<>();
++            if (consume('}')) {
++                return result;
++            }
++            while (true) {
++                skipWhitespace();
++                if (offset >= source.length() || source.charAt(offset) != '"') {
++                    throw error("expected an object key");
++                }
++                String key = readString();
++                skipWhitespace();
++                expect(':');
++                if (result.containsKey(key)) {
++                    throw error("duplicate object key " + key);
++                }
++                result.put(key, readValue());
++                skipWhitespace();
++                if (consume('}')) {
++                    return result;
++                }
++                expect(',');
++            }
++        }
++
++        private List<Object> readArray() throws IOException {
++            offset++;
++            skipWhitespace();
++            List<Object> result = new ArrayList<>();
++            if (consume(']')) {
++                return result;
++            }
++            while (true) {
++                result.add(readValue());
++                skipWhitespace();
++                if (consume(']')) {
++                    return result;
++                }
++                expect(',');
++            }
++        }
++
++        private String readString() throws IOException {
++            expect('"');
++            StringBuilder result = new StringBuilder();
++            while (offset < source.length()) {
++                char current = source.charAt(offset++);
++                if (current == '"') {
++                    return result.toString();
++                }
++                if (current == '\\') {
++                    if (offset >= source.length()) {
++                        throw error("unterminated escape");
++                    }
++                    char escaped = source.charAt(offset++);
++                    switch (escaped) {
++                        case '"' -> result.append('"');
++                        case '\\' -> result.append('\\');
++                        case '/' -> result.append('/');
++                        case 'b' -> result.append('\b');
++                        case 'f' -> result.append('\f');
++                        case 'n' -> result.append('\n');
++                        case 'r' -> result.append('\r');
++                        case 't' -> result.append('\t');
++                        case 'u' -> result.append(readUnicodeEscape());
++                        default -> throw error("invalid string escape");
++                    }
++                } else {
++                    if (current < 0x20) {
++                        throw error("unescaped control character in string");
++                    }
++                    result.append(current);
++                }
++            }
++            throw error("unterminated string");
++        }
++
++        private char readUnicodeEscape() throws IOException {
++            if (offset + 4 > source.length()) {
++                throw error("incomplete unicode escape");
++            }
++            int value = 0;
++            for (int index = 0; index < 4; index++) {
++                int digit = Character.digit(source.charAt(offset++), 16);
++                if (digit < 0) {
++                    throw error("invalid unicode escape");
++                }
++                value = (value << 4) | digit;
++            }
++            return (char) value;
++        }
++
++        private Object readNumber() throws IOException {
++            int start = offset;
++            if (consume('-') && offset >= source.length()) {
++                throw error("incomplete number");
++            }
++            if (consume('0')) {
++                if (offset < source.length() && Character.isDigit(source.charAt(offset))) {
++                    throw error("leading zero in number");
++                }
++            } else {
++                readDigits();
++            }
++            boolean fractional = false;
++            if (consume('.')) {
++                fractional = true;
++                readDigits();
++            }
++            if (offset < source.length()
++                    && (source.charAt(offset) == 'e' || source.charAt(offset) == 'E')) {
++                fractional = true;
++                offset++;
++                if (offset < source.length()
++                        && (source.charAt(offset) == '+' || source.charAt(offset) == '-')) {
++                    offset++;
++                }
++                readDigits();
++            }
++            String number = source.substring(start, offset);
++            try {
++                if (fractional) {
++                    return Double.valueOf(number);
++                }
++                return Long.valueOf(number);
++            } catch (NumberFormatException exception) {
++                throw error("invalid number");
++            }
++        }
++
++        private void readDigits() throws IOException {
++            int start = offset;
++            while (offset < source.length() && Character.isDigit(source.charAt(offset))) {
++                offset++;
++            }
++            if (start == offset) {
++                throw error("expected a digit");
++            }
++        }
++
++        private Object readLiteral(String literal, Object value) throws IOException {
++            if (!source.startsWith(literal, offset)) {
++                throw error("invalid literal");
++            }
++            offset += literal.length();
++            return value;
++        }
++
++        private void skipWhitespace() {
++            while (offset < source.length()) {
++                char current = source.charAt(offset);
++                if (current != ' ' && current != '\n' && current != '\r' && current != '\t') {
++                    break;
++                }
++                offset++;
++            }
++        }
++
++        private boolean consume(char expected) {
++            if (offset < source.length() && source.charAt(offset) == expected) {
++                offset++;
++                return true;
++            }
++            return false;
++        }
++
++        private void expect(char expected) throws IOException {
++            if (!consume(expected)) {
++                throw error("expected '" + expected + "'");
++            }
++        }
++
++        private IOException error(String message) {
++            return new IOException("Malformed JSON at offset " + offset + ": " + message);
++        }
++    }
+ }
