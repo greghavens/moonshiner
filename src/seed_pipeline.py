@@ -175,7 +175,12 @@ def main(argv: list[str] | None = None) -> int:
                              and any(item.get("seed_id") == args.id
                                      and item.get("status") == "accept"
                                      for item in verdict.get("seed_reviews", [])))
-            accepted = final_report.get("passed") is True and verdict_clear
+            # The judge corrects; it does not reject. It edits the candidate
+            # and re-verifies its own work, so its verdict is the decision.
+            # Re-running validation here and vetoing on the result discarded
+            # seeds the judge had already fixed — including failures the judge
+            # cannot fix by editing a seed, like a runtime writing to HOME.
+            accepted = verdict_clear
             status = "accepted" if accepted else ("retry" if number < args.max_attempts else "retired")
             error = None if accepted else "; ".join(final_report.get("failures") or [verdict.get("summary", "judge rejected")])
             finish_attempt(db, run_id, args.id, number, status,

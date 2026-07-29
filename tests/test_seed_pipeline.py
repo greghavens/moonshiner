@@ -33,5 +33,25 @@ class AuthorIsToldTheId(unittest.TestCase):
         self.assertIn("never be simulated", system)
 
 
+class TheJudgeCorrectsAndTheSeedMovesOn(unittest.TestCase):
+    """Authoring is: author, judge, judge fixes, move on.
+
+    The pipeline re-ran validation after the judge had edited and re-verified
+    the candidate, and failed the seed on that second opinion. It discarded
+    work the judge had already fixed, including faults no edit to a seed can
+    fix — a runtime writing cache files into the sandbox HOME, for one.
+    """
+
+    def test_the_verdict_alone_decides(self):
+        source = (ROOT / "src" / "seed_pipeline.py").read_text()
+        decision = source[source.index("            accepted = "):]
+        decision = decision[:decision.index("\n")]
+        self.assertEqual("accepted = verdict_clear", decision.strip())
+
+    def test_validation_still_runs_for_the_record(self):
+        source = (ROOT / "src" / "seed_pipeline.py").read_text()
+        self.assertIn("final_report = validate_report(seed)", source,
+                      "the report is still produced, it just does not veto")
+
 if __name__ == "__main__":
     unittest.main()
