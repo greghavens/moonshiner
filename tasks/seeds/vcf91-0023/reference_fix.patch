@@ -1,0 +1,277 @@
+diff --git a/vcf_cluster_inventory/client.py b/vcf_cluster_inventory/client.py
+--- a/vcf_cluster_inventory/client.py
++++ b/vcf_cluster_inventory/client.py
+@@ -2,7 +2,33 @@
+ 
+ from __future__ import annotations
+ 
++import json
++import math
+ from typing import Any
++from urllib.error import HTTPError, URLError
++from urllib.parse import urlencode, urlsplit
++from urllib.request import (
++    HTTPRedirectHandler,
++    ProxyHandler,
++    Request,
++    build_opener,
++)
++
++
++_INT32_MAX = 2**31 - 1
++
++
++class _NoRedirects(HTTPRedirectHandler):
++    def redirect_request(
++        self,
++        req: Any,
++        fp: Any,
++        code: int,
++        msg: str,
++        headers: Any,
++        newurl: str,
++    ) -> None:
++        return None
+ 
+ 
+ class SddcManagerError(RuntimeError):
+@@ -39,7 +65,43 @@
+         *,
+         timeout: float = 10.0,
+     ) -> None:
+-        raise NotImplementedError
++        if not isinstance(base_url, str) or not base_url:
++            raise ValueError("base_url must be an HTTP(S) origin")
++        try:
++            parsed = urlsplit(base_url)
++            parsed_port = parsed.port
++        except ValueError as exc:
++            raise ValueError("base_url must be an HTTP(S) origin") from exc
++        if (
++            parsed.scheme not in {"http", "https"}
++            or parsed.hostname is None
++            or parsed.username is not None
++            or parsed.password is not None
++            or parsed.path not in {"", "/"}
++            or parsed.query
++            or parsed.fragment
++        ):
++            raise ValueError("base_url must be an HTTP(S) origin")
++        if parsed_port is not None and not 1 <= parsed_port <= 65535:
++            raise ValueError("base_url port is invalid")
++        if (
++            not isinstance(access_token, str)
++            or not access_token
++            or not access_token.strip()
++        ):
++            raise ValueError("access_token must be a non-blank string")
++        if (
++            isinstance(timeout, bool)
++            or not isinstance(timeout, (int, float))
++            or not math.isfinite(float(timeout))
++            or timeout <= 0
++        ):
++            raise ValueError("timeout must be a positive finite number")
++
++        self._base_url = f"{parsed.scheme}://{parsed.netloc}"
++        self._access_token = access_token
++        self._timeout = float(timeout)
++        self._opener = build_opener(ProxyHandler({}), _NoRedirects())
+ 
+     def list_clusters(
+         self,
+@@ -48,4 +110,193 @@
+     ) -> list[dict[str, Any]]:
+         """Return every cluster in deterministic order."""
+ 
+-        raise NotImplementedError
++        if (
++            isinstance(page_size, bool)
++            or not isinstance(page_size, int)
++            or not 1 <= page_size <= _INT32_MAX
++        ):
++            raise ValueError("page_size must be a positive int32 integer")
++
++        collected: list[dict[str, Any]] = []
++        requested_page = 0
++        expected_total_elements: int | None = None
++        expected_total_pages: int | None = None
++
++        while True:
++            page = self._request_json(
++                page_number=requested_page,
++                page_size=page_size,
++            )
++            if not isinstance(page, dict):
++                self._protocol_error("success response must be a JSON object")
++            elements = page.get("elements")
++            metadata = page.get("pageMetadata")
++            if not isinstance(elements, list) or not isinstance(metadata, dict):
++                self._protocol_error(
++                    "success response has invalid page members"
++                )
++            if any(not isinstance(element, dict) for element in elements):
++                self._protocol_error("page elements must all be objects")
++
++            page_number = metadata.get("pageNumber")
++            returned_size = metadata.get("pageSize")
++            total_elements = metadata.get("totalElements")
++            total_pages = metadata.get("totalPages")
++            for name, value in [
++                ("pageNumber", page_number),
++                ("pageSize", returned_size),
++                ("totalElements", total_elements),
++                ("totalPages", total_pages),
++            ]:
++                if (
++                    isinstance(value, bool)
++                    or not isinstance(value, int)
++                    or not 0 <= value <= _INT32_MAX
++                ):
++                    self._protocol_error(
++                        f"{name} must be a non-negative int32 integer"
++                    )
++
++            if page_number != requested_page:
++                self._protocol_error(
++                    "returned page number does not match the request"
++                )
++            if returned_size != len(elements):
++                self._protocol_error(
++                    "pageSize does not match the returned elements"
++                )
++            if len(elements) > page_size:
++                self._protocol_error(
++                    "response contains more than the requested page size"
++                )
++            calculated_pages = (
++                (total_elements + page_size - 1) // page_size
++                if total_elements
++                else 0
++            )
++            if total_pages != calculated_pages:
++                self._protocol_error(
++                    "totalPages is inconsistent with totalElements"
++                )
++            if total_pages == 0:
++                if page_number != 0 or total_elements != 0 or elements:
++                    self._protocol_error(
++                        "zero totalPages is inconsistent with the page"
++                    )
++            elif page_number >= total_pages:
++                self._protocol_error(
++                    "returned page number is outside totalPages"
++                )
++            if (
++                total_pages > 0
++                and page_number + 1 < total_pages
++                and len(elements) != page_size
++            ):
++                self._protocol_error(
++                    "a non-final page did not contain a full page"
++                )
++
++            if expected_total_elements is None:
++                expected_total_elements = total_elements
++                expected_total_pages = total_pages
++            elif (
++                total_elements != expected_total_elements
++                or total_pages != expected_total_pages
++            ):
++                self._protocol_error(
++                    "pagination totals changed between pages"
++                )
++            if len(collected) + len(elements) > total_elements:
++                self._protocol_error(
++                    "page elements overshoot totalElements"
++                )
++            collected.extend(elements)
++
++            if total_pages == 0 or page_number + 1 == total_pages:
++                break
++            requested_page = page_number + 1
++
++        if expected_total_elements is None:
++            self._protocol_error("pagination totals are missing")
++        if len(collected) != expected_total_elements:
++            self._protocol_error(
++                "final element count does not equal totalElements"
++            )
++        return sorted(collected, key=self._cluster_sort_key)
++
++    def _request_json(
++        self,
++        *,
++        page_number: int,
++        page_size: int,
++    ) -> Any:
++        query = urlencode(
++            [
++                ("pageSize", str(page_size)),
++                ("pageNumber", str(page_number)),
++            ]
++        )
++        request = Request(
++            f"{self._base_url}/v1/clusters?{query}",
++            method="GET",
++            headers={
++                "Accept": "application/json",
++                "Authorization": "Bearer " + self._access_token,
++            },
++        )
++        try:
++            with self._opener.open(request, timeout=self._timeout) as response:
++                status = response.getcode()
++                raw = response.read()
++        except HTTPError as exc:
++            try:
++                raw = exc.read()
++            except OSError:
++                raw = b""
++            raise SddcManagerError(
++                "getClusters",
++                exc.code,
++                self._decode_error_payload(raw),
++            ) from None
++        except (URLError, OSError, ValueError):
++            raise SddcManagerError("getClusters", None, None) from None
++
++        if status != 200:
++            raise SddcManagerError(
++                "getClusters",
++                status,
++                self._decode_error_payload(raw),
++            )
++        try:
++            return json.loads(raw.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            self._protocol_error("success response is not valid UTF-8 JSON")
++
++    @staticmethod
++    def _decode_error_payload(raw: bytes) -> Any:
++        try:
++            return json.loads(raw.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            return None
++
++    @staticmethod
++    def _cluster_sort_key(
++        item: dict[str, Any],
++    ) -> tuple[str, str, str]:
++        name = item.get("name")
++        cluster_id = item.get("id")
++        canonical = json.dumps(
++            item,
++            ensure_ascii=False,
++            sort_keys=True,
++            separators=(",", ":"),
++        )
++        return (
++            name.casefold() if isinstance(name, str) else "",
++            cluster_id if isinstance(cluster_id, str) else "",
++            canonical,
++        )
++
++    @staticmethod
++    def _protocol_error(message: str) -> None:
++        raise ProtocolError("getClusters", message)
