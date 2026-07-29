@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3109 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3111 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 32 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 42 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 44 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -3665,6 +3665,8 @@
 - **vcf91-0058** (`powershell`) `#vcf-9-1` `#nsx-policy` `#powershell` `#rest-contract` `#spec-derived` — The network platform team needs a deterministic NSX Policy inventory module for VCF 9.1. Create `VcfNsxPolicyInventory.psm1`. VCF PowerCLI is an environment prerequisite; use its official `VMware.S…
 - **vcf91-0059** (`python`) `#vcf-9-1` `#nsx-policy` `#python` `#rest-contract` `#spec-derived` — Network automation ticket. A provisioning job currently treats a successful NSX Policy PUT as proof that a segment is usable. That is wrong: policy intent is realized asynchronously, and the last r…
 - **vcf91-0060** (`python`) `#vcf-9-1` `#nsx-policy` `#python` `#rest-contract` `#spec-derived` — The network platform team needs a dependency-free VMware Cloud Foundation 9.1 NSX Policy client for an idempotent IP-group rollout. The current job successfully PATCHes a group, but when its access…
+- **vcf91-0061** (`python`) `#vcf-9-1` `#nsx-policy` `#python` `#rest-contract` `#spec-derived` — The network platform team needs a deterministic VMware Cloud Foundation 9.1 NSX Policy group inventory. Implement a standard-library-only Python package named `vcf_nsx_inventory`. Do not add third-…
+- **vcf91-0062** (`python`) `#vcf-9-1` `#nsx-policy` `#python` `#rest-contract` `#spec-derived` — A network rollout lost the HTTP response to an NSX Policy group write. The caller cannot tell whether the manager committed the write, so retrying with a collection-style create could duplicate the…
 
 ## project-io
 

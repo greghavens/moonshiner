@@ -1,0 +1,285 @@
+diff --git a/nsx_group_retry/__init__.py b/nsx_group_retry/__init__.py
+--- a/nsx_group_retry/__init__.py
++++ b/nsx_group_retry/__init__.py
+@@ -1,3 +1,278 @@
+-"""Complete the stdlib-only NSX Policy retry client described by the task."""
+-
+-# TODO: implement the public API in this module.
++"""Standard-library client for one idempotent NSX Policy group operation."""
++
++from __future__ import annotations
++
++import base64
++import copy
++import http.client
++import json
++import math
++import socket
++import urllib.error
++import urllib.parse
++import urllib.request
++from dataclasses import dataclass
++from typing import Any, Sequence
++
++__all__ = [
++    "AmbiguousWriteError",
++    "GroupSpec",
++    "GroupTag",
++    "NsxApiError",
++    "NsxPolicyClient",
++    "ProtocolError",
++    "UpdateResult",
++]
++
++_BASE_PATH = "/policy/api/v1"
++_GROUP_PATH = "/infra/domains/{domain_id}/groups/{group_id}"
++
++
++def _nonblank(name: str, value: object, *, max_length: int | None = None) -> str:
++    if not isinstance(value, str) or not value.strip():
++        raise ValueError(f"{name} must be a non-blank string")
++    if max_length is not None and len(value) > max_length:
++        raise ValueError(f"{name} must not exceed {max_length} characters")
++    return value
++
++
++def _path_segment(name: str, value: object) -> str:
++    return urllib.parse.quote(_nonblank(name, value), safe="")
++
++
++class ProtocolError(Exception):
++    """The service response did not satisfy the pinned contract."""
++
++
++class AmbiguousWriteError(Exception):
++    """No response was received and the write may have committed."""
++
++    def __init__(self, attempts: int):
++        self.attempts = attempts
++        super().__init__(
++            f"NSX Policy write remained ambiguous after {attempts} attempt(s)"
++        )
++
++
++class NsxApiError(Exception):
++    """An HTTP error carrying the decoded NSX ApiError envelope."""
++
++    def __init__(self, status_code: int, envelope: Any):
++        self.status_code = status_code
++        self.envelope = envelope
++        fields = envelope if isinstance(envelope, dict) else {}
++        self.error_code = fields.get("error_code")
++        self.error_message = fields.get("error_message")
++        self.module_name = fields.get("module_name")
++        self.details = fields.get("details")
++        message = self.error_message or "NSX Policy request failed"
++        if self.error_code is not None:
++            message = f"{self.error_code}: {message}"
++        super().__init__(f"HTTP {status_code}: {message}")
++
++
++@dataclass(frozen=True)
++class GroupTag:
++    """One caller-defined NSX resource tag."""
++
++    tag: str
++    scope: str | None = None
++
++    def to_wire(self) -> dict[str, str]:
++        wire = {"tag": _nonblank("tag", self.tag)}
++        if self.scope is not None:
++            wire["scope"] = _nonblank("scope", self.scope, max_length=128)
++        return wire
++
++
++@dataclass(frozen=True)
++class GroupSpec:
++    """Writable subset of the contract's Group model."""
++
++    display_name: str
++    description: str | None = None
++    tags: Sequence[GroupTag] | None = None
++
++    def to_wire(self) -> dict[str, Any]:
++        wire: dict[str, Any] = {
++            "resource_type": "Group",
++            "display_name": _nonblank(
++                "display_name", self.display_name, max_length=255
++            ),
++        }
++        if self.description is not None:
++            wire["description"] = _nonblank(
++                "description", self.description, max_length=1024
++            )
++        if self.tags is not None:
++            if isinstance(self.tags, (str, bytes)) or not isinstance(
++                self.tags, Sequence
++            ):
++                raise TypeError("tags must be a sequence of GroupTag values")
++            if not self.tags:
++                raise ValueError("tags must not be empty when explicitly set")
++            if len(self.tags) > 30:
++                raise ValueError("tags must not contain more than 30 items")
++            projected: list[dict[str, str]] = []
++            for index, tag in enumerate(self.tags):
++                if not isinstance(tag, GroupTag):
++                    raise TypeError(f"tags[{index}] must be a GroupTag")
++                projected.append(tag.to_wire())
++            wire["tags"] = projected
++        return wire
++
++
++@dataclass(frozen=True)
++class UpdateResult:
++    """Successful response plus the ambiguous-retry count."""
++
++    group: dict[str, Any]
++    attempts: int
++    ambiguous_retries: int
++
++
++class NsxPolicyClient:
++    """Client restricted to the UpdateGroupForDomain contract operation."""
++
++    def __init__(
++        self,
++        base_url: str,
++        username: str,
++        password: str,
++        *,
++        timeout: float = 5.0,
++        max_attempts: int = 2,
++    ):
++        if not isinstance(base_url, str) or not base_url.strip():
++            raise ValueError("base_url must be a non-blank string")
++        try:
++            parsed = urllib.parse.urlsplit(base_url)
++            hostname = parsed.hostname
++            parsed.port
++        except ValueError as error:
++            raise ValueError("base_url must contain a valid HTTP(S) origin") from error
++        if (
++            parsed.scheme not in {"http", "https"}
++            or not parsed.netloc
++            or hostname is None
++            or parsed.username is not None
++            or parsed.password is not None
++            or parsed.path not in {"", "/"}
++            or parsed.query
++            or parsed.fragment
++        ):
++            raise ValueError("base_url must be an HTTP(S) origin without credentials")
++        username = _nonblank("username", username)
++        if ":" in username:
++            raise ValueError("username must not contain ':'")
++        password = _nonblank("password", password)
++        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
++            raise TypeError("timeout must be a number")
++        timeout_value = float(timeout)
++        if timeout_value <= 0 or not math.isfinite(timeout_value):
++            raise ValueError("timeout must be positive and finite")
++        if isinstance(max_attempts, bool) or not isinstance(max_attempts, int):
++            raise TypeError("max_attempts must be an integer")
++        if max_attempts < 1:
++            raise ValueError("max_attempts must be at least one")
++
++        self.base_url = base_url.rstrip("/")
++        self.timeout = timeout_value
++        self.max_attempts = max_attempts
++        credentials = f"{username}:{password}".encode("utf-8")
++        self._authorization = "Basic " + base64.b64encode(credentials).decode("ascii")
++
++    @staticmethod
++    def _decode_success(data: bytes) -> dict[str, Any]:
++        if not data:
++            raise ProtocolError("UpdateGroupForDomain returned an empty response")
++        try:
++            value = json.loads(data.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError) as error:
++            raise ProtocolError(
++                "UpdateGroupForDomain response was not UTF-8 JSON"
++            ) from error
++        if not isinstance(value, dict) or value.get("resource_type") != "Group":
++            raise ProtocolError(
++                "UpdateGroupForDomain response was not a Group object"
++            )
++        return value
++
++    @staticmethod
++    def _decode_error(data: bytes) -> Any:
++        if not data:
++            return None
++        try:
++            return json.loads(data.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            return None
++
++    def _put_once(self, target: str, body: bytes) -> tuple[int, bytes]:
++        request = urllib.request.Request(
++            self.base_url + target,
++            data=body,
++            method="PUT",
++            headers={
++                "Authorization": self._authorization,
++                "Accept": "application/json",
++                "Content-Type": "application/json",
++            },
++        )
++        try:
++            response = urllib.request.urlopen(request, timeout=self.timeout)
++        except urllib.error.HTTPError as error:
++            try:
++                response_body = error.read()
++            except (http.client.HTTPException, OSError) as read_error:
++                raise ProtocolError(
++                    "NSX Policy HTTP error response body was interrupted"
++                ) from read_error
++            return error.code, response_body
++
++        try:
++            with response:
++                return response.status, response.read()
++        except (http.client.HTTPException, OSError) as read_error:
++            raise ProtocolError(
++                "NSX Policy success response body was interrupted"
++            ) from read_error
++
++    def update_group(
++        self, domain_id: str, group_id: str, group: GroupSpec
++    ) -> UpdateResult:
++        domain = _path_segment("domain_id", domain_id)
++        group_identifier = _path_segment("group_id", group_id)
++        if not isinstance(group, GroupSpec):
++            raise TypeError("group must be a GroupSpec")
++        wire = group.to_wire()
++        body = json.dumps(
++            wire, ensure_ascii=False, separators=(",", ":")
++        ).encode("utf-8")
++        target = _BASE_PATH + _GROUP_PATH.format(
++            domain_id=domain, group_id=group_identifier
++        )
++
++        for attempt in range(1, self.max_attempts + 1):
++            try:
++                status, response_body = self._put_once(target, body)
++            except (
++                urllib.error.URLError,
++                http.client.HTTPException,
++                socket.timeout,
++                TimeoutError,
++                OSError,
++            ) as error:
++                if attempt < self.max_attempts:
++                    continue
++                raise AmbiguousWriteError(attempt) from error
++
++            if status != 200:
++                raise NsxApiError(status, self._decode_error(response_body))
++            decoded = self._decode_success(response_body)
++            return UpdateResult(
++                group=copy.deepcopy(decoded),
++                attempts=attempt,
++                ambiguous_retries=attempt - 1,
++            )
++
++        raise AssertionError("unreachable retry state")
