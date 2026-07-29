@@ -1,0 +1,398 @@
+diff --git a/vcf_domain_snapshot/client.py b/vcf_domain_snapshot/client.py
+--- a/vcf_domain_snapshot/client.py
++++ b/vcf_domain_snapshot/client.py
+@@ -2,7 +2,34 @@
+ 
+ from __future__ import annotations
+ 
++import json
++import math
+ from typing import Any
++from urllib.error import HTTPError, URLError
++from urllib.parse import urlencode, urlsplit
++from urllib.request import (
++    HTTPRedirectHandler,
++    ProxyHandler,
++    Request,
++    build_opener,
++)
++
++
++_NO_BODY = object()
++_INT32_MAX = 2**31 - 1
++
++
++class _NoRedirects(HTTPRedirectHandler):
++    def redirect_request(
++        self,
++        req: Any,
++        fp: Any,
++        code: int,
++        msg: str,
++        headers: Any,
++        newurl: str,
++    ) -> None:
++        return None
+ 
+ 
+ class SddcManagerError(RuntimeError):
+@@ -37,7 +64,45 @@
+         *,
+         timeout: float = 10.0,
+     ) -> None:
+-        raise NotImplementedError
++        if not isinstance(base_url, str) or not base_url:
++            raise ValueError("base_url must be an HTTP(S) origin")
++        try:
++            parsed = urlsplit(base_url)
++            parsed_port = parsed.port
++        except ValueError as exc:
++            raise ValueError("base_url must be an HTTP(S) origin") from exc
++        if (
++            parsed.scheme not in {"http", "https"}
++            or parsed.hostname is None
++            or parsed.username is not None
++            or parsed.password is not None
++            or parsed.path not in {"", "/"}
++            or parsed.query
++            or parsed.fragment
++        ):
++            raise ValueError("base_url must be an HTTP(S) origin")
++        if parsed_port is not None and not 1 <= parsed_port <= 65535:
++            raise ValueError("base_url port is invalid")
++        if not isinstance(username, str) or not username:
++            raise ValueError("username must be a non-empty string")
++        if not isinstance(password, str) or not password:
++            raise ValueError("password must be a non-empty string")
++        if (
++            isinstance(timeout, bool)
++            or not isinstance(timeout, (int, float))
++            or not math.isfinite(float(timeout))
++            or timeout <= 0
++        ):
++            raise ValueError("timeout must be a positive finite number")
++
++        self._base_url = f"{parsed.scheme}://{parsed.netloc}"
++        self._username = username
++        self._password = password
++        self._timeout = float(timeout)
++        self._opener = build_opener(ProxyHandler({}), _NoRedirects())
++        self._access_token: str | None = None
++        self._refresh_token_id: str | None = None
++        self._refresh_used = False
+ 
+     def list_domains(
+         self,
+@@ -46,4 +111,311 @@
+     ) -> list[dict[str, Any]]:
+         """Return every domain in deterministic order."""
+ 
+-        raise NotImplementedError
++        if (
++            isinstance(page_size, bool)
++            or not isinstance(page_size, int)
++            or not 1 <= page_size <= _INT32_MAX
++        ):
++            raise ValueError("page_size must be a positive int32 integer")
++
++        self._ensure_authenticated()
++        collected: list[dict[str, Any]] = []
++        requested_page = 0
++        expected_total_elements: int | None = None
++        expected_total_pages: int | None = None
++
++        while True:
++            page = self._request_json(
++                operation_id="getDomains",
++                method="GET",
++                path="/v1/domains",
++                expected_status=200,
++                query=[
++                    ("pageNumber", str(requested_page)),
++                    ("pageSize", str(page_size)),
++                ],
++                authenticated=True,
++                allow_refresh=True,
++            )
++            if not isinstance(page, dict):
++                self._protocol_error(
++                    "getDomains",
++                    "success response must be a JSON object",
++                )
++            elements = page.get("elements")
++            metadata = page.get("pageMetadata")
++            if not isinstance(elements, list) or not isinstance(metadata, dict):
++                self._protocol_error(
++                    "getDomains",
++                    "success response has invalid page members",
++                )
++            if any(not isinstance(element, dict) for element in elements):
++                self._protocol_error(
++                    "getDomains",
++                    "page elements must all be objects",
++                )
++
++            page_number = metadata.get("pageNumber")
++            returned_size = metadata.get("pageSize")
++            total_elements = metadata.get("totalElements")
++            total_pages = metadata.get("totalPages")
++            for name, value in [
++                ("pageNumber", page_number),
++                ("pageSize", returned_size),
++                ("totalElements", total_elements),
++                ("totalPages", total_pages),
++            ]:
++                if (
++                    isinstance(value, bool)
++                    or not isinstance(value, int)
++                    or not 0 <= value <= _INT32_MAX
++                ):
++                    self._protocol_error(
++                        "getDomains",
++                        f"{name} must be a non-negative int32 integer",
++                    )
++
++            if page_number != requested_page:
++                self._protocol_error(
++                    "getDomains",
++                    "returned page number does not match the request",
++                )
++            if returned_size != len(elements):
++                self._protocol_error(
++                    "getDomains",
++                    "pageSize does not match the returned elements",
++                )
++            if total_pages == 0:
++                if page_number != 0 or total_elements != 0 or elements:
++                    self._protocol_error(
++                        "getDomains",
++                        "zero totalPages is inconsistent with the page",
++                    )
++            elif page_number >= total_pages:
++                self._protocol_error(
++                    "getDomains",
++                    "returned page number is outside totalPages",
++                )
++
++            if expected_total_elements is None:
++                expected_total_elements = total_elements
++                expected_total_pages = total_pages
++            elif (
++                total_elements != expected_total_elements
++                or total_pages != expected_total_pages
++            ):
++                self._protocol_error(
++                    "getDomains",
++                    "pagination totals changed between pages",
++                )
++
++            if len(collected) + len(elements) > total_elements:
++                self._protocol_error(
++                    "getDomains",
++                    "page elements overshoot totalElements",
++                )
++            collected.extend(elements)
++
++            if total_pages == 0 or page_number + 1 == total_pages:
++                break
++            if not elements:
++                self._protocol_error(
++                    "getDomains",
++                    "empty page made no progress before completion",
++                )
++            requested_page = page_number + 1
++
++        if expected_total_elements is None:
++            self._protocol_error(
++                "getDomains",
++                "pagination totals are missing",
++            )
++        if len(collected) != expected_total_elements:
++            self._protocol_error(
++                "getDomains",
++                "final element count does not equal totalElements",
++            )
++        return sorted(collected, key=self._domain_sort_key)
++
++    def _ensure_authenticated(self) -> None:
++        if self._access_token is not None:
++            return
++        pair = self._request_json(
++            operation_id="createToken",
++            method="POST",
++            path="/v1/tokens",
++            expected_status=201,
++            body={
++                "username": self._username,
++                "password": self._password,
++            },
++            authenticated=False,
++        )
++        if not isinstance(pair, dict):
++            self._protocol_error(
++                "createToken",
++                "success response must be a JSON object",
++            )
++        access_token = pair.get("accessToken")
++        refresh_token = pair.get("refreshToken")
++        refresh_id = (
++            refresh_token.get("id")
++            if isinstance(refresh_token, dict)
++            else None
++        )
++        if (
++            not isinstance(access_token, str)
++            or not access_token
++            or not isinstance(refresh_id, str)
++            or not refresh_id
++        ):
++            self._protocol_error(
++                "createToken",
++                "success response is missing token values",
++            )
++        self._access_token = access_token
++        self._refresh_token_id = refresh_id
++
++    def _refresh_access_token(self) -> None:
++        if self._refresh_token_id is None:
++            self._protocol_error(
++                "refreshAccessToken",
++                "refresh token is unavailable",
++            )
++        new_access_token = self._request_json(
++            operation_id="refreshAccessToken",
++            method="PATCH",
++            path="/v1/tokens/access-token/refresh",
++            expected_status=200,
++            body=self._refresh_token_id,
++            authenticated=False,
++        )
++        if not isinstance(new_access_token, str) or not new_access_token:
++            self._protocol_error(
++                "refreshAccessToken",
++                "success response must be a non-empty JSON string",
++            )
++        self._access_token = new_access_token
++        self._refresh_used = True
++
++    def _request_json(
++        self,
++        *,
++        operation_id: str,
++        method: str,
++        path: str,
++        expected_status: int,
++        query: list[tuple[str, str]] | None = None,
++        body: Any = _NO_BODY,
++        authenticated: bool,
++        allow_refresh: bool = False,
++    ) -> Any:
++        target = self._base_url + path
++        if query:
++            target += "?" + urlencode(query)
++        headers = {"Accept": "application/json"}
++        encoded: bytes | None = None
++        if body is not _NO_BODY:
++            encoded = json.dumps(
++                body,
++                ensure_ascii=False,
++                separators=(",", ":"),
++            ).encode("utf-8")
++            headers["Content-Type"] = "application/json"
++        if authenticated:
++            if self._access_token is None:
++                self._protocol_error(
++                    operation_id,
++                    "authenticated request has no access token",
++                )
++            headers["Authorization"] = "Bearer " + self._access_token
++        request = Request(
++            target,
++            data=encoded,
++            headers=headers,
++            method=method,
++        )
++
++        try:
++            with self._opener.open(
++                request,
++                timeout=self._timeout,
++            ) as response:
++                status = response.getcode()
++                raw = response.read()
++        except HTTPError as exc:
++            raw = exc.read()
++            payload = self._decode_error_payload(raw)
++            if (
++                exc.code == 401
++                and operation_id == "getDomains"
++                and authenticated
++                and allow_refresh
++                and not self._refresh_used
++            ):
++                self._refresh_access_token()
++                return self._request_json(
++                    operation_id=operation_id,
++                    method=method,
++                    path=path,
++                    expected_status=expected_status,
++                    query=query,
++                    body=body,
++                    authenticated=authenticated,
++                    allow_refresh=False,
++                )
++            raise SddcManagerError(
++                f"{operation_id} failed with HTTP {exc.code}",
++                operation_id=operation_id,
++                status_code=exc.code,
++                payload=payload,
++            ) from None
++        except (URLError, OSError):
++            raise SddcManagerError(
++                f"{operation_id} transport failed",
++                operation_id=operation_id,
++            ) from None
++
++        if status != expected_status:
++            raise SddcManagerError(
++                f"{operation_id} returned unexpected HTTP {status}",
++                operation_id=operation_id,
++                status_code=status,
++                payload=self._decode_error_payload(raw),
++            )
++        try:
++            return json.loads(raw.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            self._protocol_error(
++                operation_id,
++                "success response is not valid JSON",
++            )
++
++    @staticmethod
++    def _decode_error_payload(raw: bytes) -> Any:
++        try:
++            return json.loads(raw.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            return None
++
++    @staticmethod
++    def _domain_sort_key(
++        domain: dict[str, Any],
++    ) -> tuple[str, str, str]:
++        name = domain.get("name")
++        identifier = domain.get("id")
++        canonical = json.dumps(
++            domain,
++            ensure_ascii=False,
++            sort_keys=True,
++            separators=(",", ":"),
++        )
++        return (
++            name.casefold() if isinstance(name, str) else "",
++            identifier if isinstance(identifier, str) else "",
++            canonical,
++        )
++
++    @staticmethod
++    def _protocol_error(operation_id: str, message: str) -> None:
++        raise ProtocolError(message, operation_id=operation_id)
