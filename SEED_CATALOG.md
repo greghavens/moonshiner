@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3136 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3137 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 38 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 63 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 64 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -3692,6 +3692,7 @@
 - **vcf91-0088** (`java`) `#vcf-9-1` `#nsx-policy` `#java` `#rest-contract` `#spec-derived` — Complete `NsxPolicyClient.java` as a dependency-free, single-file Java 17 client that collects the VMware Cloud Foundation 9.1 NSX Policy segment inventory while an access token expires between pag…
 - **vcf91-0089** (`powershell`) `#vcf-9-1` `#vcenter-automation` `#powershell` `#rest-contract` `#spec-derived` — Complete src/VcfVCenterAutomation/VcfVCenterAutomation.psm1. The PowerShell module must use the preinstalled VMware.Sdk.Vcf.SddcManager PowerCLI module declared by its manifest; do not install, cop…
 - **vcf91-0090** (`powershell`) `#vcf-9-1` `#vcenter-automation` `#powershell` `#rest-contract` `#spec-derived` — Platform engineering needs a deterministic inventory of vCenter authorization roles, but its authenticated SDK handle's access token can expire on a continuation page. Finish the `VcfVcenterRoleInv…
+- **vcf91-0091** (`powershell`) `#vcf-9-1` `#vcenter-automation` `#powershell` `#rest-contract` `#spec-derived` — Platform engineering needs a reproducible vCenter authorization-role inventory even when the server splits the collection across several pages and returns roles in an arbitrary order. Complete `Vcf…
 
 ## project-io
 
