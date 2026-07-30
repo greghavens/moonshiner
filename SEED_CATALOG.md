@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3148 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3151 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 38 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 75 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 78 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -3704,6 +3704,9 @@
 - **vcf91-0099** (`python`) `#vcf-9-1` `#vcenter-automation` `#python` `#rest-contract` `#spec-derived` — Implement `vcf_supervisor_backup/client.py` as a standard-library-only Python package for the vSphere Automation API exposed by vCenter in VMware Cloud Foundation 9.1. Read the protected `docs/cont…
 - **vcf91-0100** (`python`) `#vcf-9-1` `#vcenter-automation` `#python` `#rest-contract` `#spec-derived` — Platform engineering resizes a powered-off VM and then starts it, but the short-lived vCenter API access credential can expire between changes. Build a standard-library-only Python package named `v…
 - **vcf91-0101** (`python`) `#vcf-9-1` `#vcenter-automation` `#python` `#rest-contract` `#spec-derived` — Implement `vcf_vcenter_roles/client.py` as a standard-library-only Python package for the vSphere Automation API exposed by vCenter in VMware Cloud Foundation 9.1. Read the protected `docs/contract…
+- **vcf91-0102** (`python`) `#vcf-9-1` `#vcenter-automation` `#python` `#rest-contract` `#spec-derived` — Implement `vcf_cpu_retry/client.py` as a standard-library-only Python package for the vSphere Automation API exposed by vCenter in VMware Cloud Foundation 9.1. Read the protected `docs/contract.jso…
+- **vcf91-0103** (`python`) `#vcf-9-1` `#vcenter-automation` `#python` `#rest-contract` `#spec-derived` — Implement `vcf_resize_report/client.py` as a standard-library-only Python package for the vSphere Automation API exposed by vCenter in VMware Cloud Foundation 9.1. Read the protected `docs/contract…
+- **vcf91-0104** (`python`) `#vcf-9-1` `#vcenter-automation` `#python` `#rest-contract` `#spec-derived` — Platform engineering needs a safe CPU reconfiguration primitive for a vCenter-managed VM in VMware Cloud Foundation 9.1. Build the standard-library-only Python package `vcf_vcenter_cpu_guard`. The…
 
 ## project-io
 

@@ -1,0 +1,260 @@
+diff --git a/vcf_cpu_retry/client.py b/vcf_cpu_retry/client.py
+--- a/vcf_cpu_retry/client.py
++++ b/vcf_cpu_retry/client.py
+@@ -1,8 +1,16 @@
+-"""Implement the contract-pinned vCenter CPU update client here."""
++"""Retry-safe client for one declarative vCenter CPU mutation."""
+ 
+ from __future__ import annotations
+ 
++import http.client
++import json
++import math
+ from dataclasses import dataclass
++from urllib.parse import quote, urlsplit
++
++
++_OPERATION_ID = "Vcenter.Vm.Hardware.Cpu_update"
++_MAX_SIGNED_INT64 = 2**63 - 1
+ 
+ 
+ @dataclass(frozen=True)
+@@ -16,17 +24,127 @@ class CpuUpdateResult:
+ class VcenterError(RuntimeError):
+     """An HTTP failure returned by vCenter."""
+ 
++    def __init__(
++        self,
++        message: str,
++        *,
++        operation_id: str,
++        status_code: int,
++        payload: object,
++    ) -> None:
++        super().__init__(message)
++        self.operation_id = operation_id
++        self.status_code = status_code
++        self.payload = payload
++
+ 
+ class ProtocolError(RuntimeError):
+     """A successful response violated the focused contract."""
+ 
++    def __init__(self, message: str, *, operation_id: str) -> None:
++        super().__init__(message)
++        self.operation_id = operation_id
++
+ 
+ class RetryExhaustedError(RuntimeError):
+     """Both attempts ended before an HTTP response was available."""
+ 
++    def __init__(
++        self,
++        message: str,
++        *,
++        operation_id: str,
++        attempts: int,
++    ) -> None:
++        super().__init__(message)
++        self.operation_id = operation_id
++        self.attempts = attempts
++
++
++def _validated_origin(base_url: object) -> tuple[str, str, int | None]:
++    if not isinstance(base_url, str) or not base_url:
++        raise ValueError("base_url must be an HTTP(S) origin")
++    if any(ord(character) < 0x20 or ord(character) == 0x7F
++           for character in base_url):
++        raise ValueError("base_url contains an unsafe character")
++    if "?" in base_url or "#" in base_url:
++        raise ValueError("base_url must not contain a query or fragment")
++    try:
++        split = urlsplit(base_url)
++        port = split.port
++    except ValueError as error:
++        raise ValueError("base_url must be an HTTP(S) origin") from error
++    if (
++        split.scheme not in {"http", "https"}
++        or not split.netloc
++        or not split.hostname
++        or split.username is not None
++        or split.password is not None
++        or split.path not in {"", "/"}
++        or split.query
++        or split.fragment
++    ):
++        raise ValueError(
++            "base_url must be an HTTP(S) origin without credentials, "
++            "path, query, or fragment"
++        )
++    return split.scheme, split.hostname, port
++
++
++def _validated_token(session_token: object) -> str:
++    if not isinstance(session_token, str) or not session_token.strip():
++        raise ValueError("session_token must be a nonblank string")
++    if any(ord(character) < 0x20 or ord(character) == 0x7F
++           for character in session_token):
++        raise ValueError("session_token contains an unsafe header character")
++    try:
++        session_token.encode("latin-1")
++    except UnicodeEncodeError as error:
++        raise ValueError(
++            "session_token contains an unsafe header character"
++        ) from error
++    return session_token
++
++
++def _validated_timeout(timeout: object) -> float:
++    if (
++        not isinstance(timeout, (int, float))
++        or isinstance(timeout, bool)
++        or not math.isfinite(timeout)
++        or timeout <= 0
++    ):
++        raise ValueError("timeout must be a positive finite number")
++    return float(timeout)
++
++
++def _validated_vm(vm: object) -> str:
++    if not isinstance(vm, str) or not vm.strip():
++        raise ValueError("vm must be a nonblank string")
++    return vm
++
++
++def _validated_count(count: object) -> int:
++    if (
++        not isinstance(count, int)
++        or isinstance(count, bool)
++        or count < 1
++        or count > _MAX_SIGNED_INT64
++    ):
++        raise ValueError("count must be a positive signed-int64")
++    return count
++
++
++def _decode_json(raw: bytes) -> object:
++    if not raw:
++        return None
++    try:
++        return json.loads(raw.decode("utf-8"))
++    except (UnicodeDecodeError, json.JSONDecodeError):
++        return None
++
+ 
+ class CpuUpdateClient:
+-    """TODO: implement the public client described in task.json."""
++    """A direct, proxy-free client for the focused vCenter operation."""
+ 
+     def __init__(
+         self,
+@@ -35,7 +153,107 @@ class CpuUpdateClient:
+         *,
+         timeout: float = 10.0,
+     ) -> None:
+-        raise NotImplementedError
++        self._scheme, self._host, self._port = _validated_origin(base_url)
++        self._session_token = _validated_token(session_token)
++        self._timeout = _validated_timeout(timeout)
++
++    def _connection(
++        self,
++    ) -> http.client.HTTPConnection | http.client.HTTPSConnection:
++        connection_type: type[http.client.HTTPConnection]
++        if self._scheme == "https":
++            connection_type = http.client.HTTPSConnection
++        else:
++            connection_type = http.client.HTTPConnection
++        return connection_type(
++            self._host,
++            self._port,
++            timeout=self._timeout,
++        )
++
++    def _attempt(self, target: str, body: bytes) -> tuple[int, bytes]:
++        connection = self._connection()
++        response: http.client.HTTPResponse | None = None
++        try:
++            try:
++                connection.putrequest(
++                    "PATCH",
++                    target,
++                    skip_accept_encoding=True,
++                )
++                connection.putheader("Accept", "application/json")
++                connection.putheader("Content-Type", "application/json")
++                connection.putheader(
++                    "vmware-api-session-id",
++                    self._session_token,
++                )
++                connection.putheader("Content-Length", str(len(body)))
++                connection.endheaders(body)
++                response = connection.getresponse()
++            except (OSError, http.client.HTTPException):
++                raise _NoResponseAvailable from None
++
++            try:
++                raw = response.read()
++            except (OSError, http.client.HTTPException):
++                raise ProtocolError(
++                    f"{_OPERATION_ID} response could not be read",
++                    operation_id=_OPERATION_ID,
++                ) from None
++            return response.status, raw
++        finally:
++            try:
++                connection.close()
++            except OSError:
++                pass
+ 
+     def set_cpu_count(self, vm: str, count: int) -> CpuUpdateResult:
+-        raise NotImplementedError
++        checked_vm = _validated_vm(vm)
++        checked_count = _validated_count(count)
++        target = (
++            "/api/vcenter/vm/"
++            + quote(checked_vm, safe="")
++            + "/hardware/cpu"
++        )
++        body = json.dumps(
++            {"count": checked_count},
++            separators=(",", ":"),
++            ensure_ascii=False,
++        ).encode("utf-8")
++
++        for attempts in (1, 2):
++            try:
++                status, raw = self._attempt(target, body)
++            except _NoResponseAvailable:
++                if attempts == 1:
++                    continue
++                raise RetryExhaustedError(
++                    f"{_OPERATION_ID} exhausted its safe retry",
++                    operation_id=_OPERATION_ID,
++                    attempts=2,
++                ) from None
++
++            if status != 204:
++                raise VcenterError(
++                    f"{_OPERATION_ID} returned HTTP {status}",
++                    operation_id=_OPERATION_ID,
++                    status_code=status,
++                    payload=_decode_json(raw),
++                )
++            if raw:
++                raise ProtocolError(
++                    f"{_OPERATION_ID} returned a nonempty HTTP 204 response",
++                    operation_id=_OPERATION_ID,
++                )
++            return CpuUpdateResult(
++                vm=checked_vm,
++                count=checked_count,
++                attempts=attempts,
++                operation_id=_OPERATION_ID,
++            )
++
++        raise AssertionError("unreachable retry state")
++
++
++class _NoResponseAvailable(Exception):
++    """Internal marker for a transport failure before response headers."""

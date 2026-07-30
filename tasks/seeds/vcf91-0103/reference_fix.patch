@@ -1,0 +1,321 @@
+diff --git a/vcf_resize_report/client.py b/vcf_resize_report/client.py
+index 09de4d1..d26d3c5 100644
+--- a/vcf_resize_report/client.py
++++ b/vcf_resize_report/client.py
+@@ -1,8 +1,32 @@
+-"""Implement the contract-pinned vCenter resize reporting client here."""
++"""Contract-pinned client that reports partial vCenter workflow progress."""
+ 
+ from __future__ import annotations
+ 
++import http.client
++import json
++import math
+ from dataclasses import dataclass
++from urllib.error import HTTPError, URLError
++from urllib.parse import quote, urlsplit
++from urllib.request import (
++    HTTPRedirectHandler,
++    ProxyHandler,
++    Request,
++    build_opener,
++)
++
++
++_CPU_UPDATE = "Vcenter.Vm.Hardware.Cpu_update"
++_MEMORY_UPDATE = "Vcenter.Vm.Hardware.Memory_update"
++_POWER_START = "Vcenter.Vm.Power_start"
++_INT64_MAX = (1 << 63) - 1
++
++
++class _NoRedirectHandler(HTTPRedirectHandler):
++    """Keep every response attached to the operation that produced it."""
++
++    def redirect_request(self, req, fp, code, msg, headers, newurl):
++        return None
+ 
+ 
+ @dataclass(frozen=True)
+@@ -25,25 +49,278 @@ class ResizeReport:
+ 
+ 
+ class ProtocolError(RuntimeError):
+-    """Transport or response data violated the focused contract."""
++    """Transport or response data violated the focused contract."""
++
++    def __init__(
++        self,
++        message: str = "vCenter protocol failure",
++        *,
++        operation_id: str | None = None,
++    ) -> None:
++        super().__init__(message)
++        self.operation_id = operation_id
++
++
++def _server_origin(base_url: object) -> str:
++    if not isinstance(base_url, str) or not base_url:
++        raise ValueError("base_url must be an HTTP(S) server origin")
++    try:
++        split = urlsplit(base_url)
++        split.port
++    except ValueError as error:
++        raise ValueError("base_url must be an HTTP(S) server origin") from error
++    if (
++        split.scheme not in {"http", "https"}
++        or not split.netloc
++        or not split.hostname
++        or split.username is not None
++        or split.password is not None
++        or split.path not in {"", "/"}
++        or split.query
++        or split.fragment
++    ):
++        raise ValueError(
++            "base_url must be an HTTP(S) origin without credentials, "
++            "path, query, or fragment"
++        )
++    return split._replace(path="", query="", fragment="").geturl().rstrip("/")
++
++
++def _session_token(value: object) -> str:
++    if (
++        not isinstance(value, str)
++        or not value.strip()
++        or any(ord(character) < 32 or ord(character) > 126 for character in value)
++    ):
++        raise ValueError(
++            "session_token must be nonblank and safe for an HTTP header"
++        )
++    return value
++
++
++def _positive_int64(value: object, name: str) -> int:
++    if type(value) is not int or not 1 <= value <= _INT64_MAX:
++        raise ValueError(f"{name} must be a positive signed-int64 integer")
++    return value
++
++
++def _compact_json(value: dict[str, int]) -> bytes:
++    return json.dumps(
++        value,
++        separators=(",", ":"),
++        ensure_ascii=False,
++    ).encode("utf-8")
+ 
+ 
+ class ResizeClient:
+-    """TODO: implement the public client described in task.json."""
++    """Perform the three-operation resize workflow without hiding progress."""
+ 
+     def __init__(
+         self,
+         base_url: str,
+         session_token: str,
+         *,
+         timeout: float = 10.0,
+     ) -> None:
+-        raise NotImplementedError
++        if (
++            not isinstance(timeout, (int, float))
++            or isinstance(timeout, bool)
++            or not math.isfinite(timeout)
++            or timeout <= 0
++        ):
++            raise ValueError("timeout must be a positive finite number")
++        self._base_url = _server_origin(base_url)
++        self._session_token = _session_token(session_token)
++        self._timeout = float(timeout)
++        self._opener = build_opener(
++            ProxyHandler({}),
++            _NoRedirectHandler(),
++        )
++
++    def _protocol_error(
++        self,
++        operation_id: str,
++        reason: str,
++    ) -> ProtocolError:
++        return ProtocolError(
++            f"{operation_id}: {reason}",
++            operation_id=operation_id,
++        )
++
++    def _decode_error(
++        self,
++        operation_id: str,
++        raw: bytes,
++    ) -> tuple[str, str]:
++        try:
++            payload = json.loads(raw.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            raise self._protocol_error(
++                operation_id,
++                "malformed standard vAPI error response",
++            ) from None
++        if not isinstance(payload, dict):
++            raise self._protocol_error(
++                operation_id,
++                "malformed standard vAPI error response",
++            )
++        error_type = payload.get("error_type")
++        messages = payload.get("messages")
++        if (
++            not isinstance(error_type, str)
++            or not error_type.strip()
++            or not isinstance(messages, list)
++            or not messages
++            or not isinstance(messages[0], dict)
++        ):
++            raise self._protocol_error(
++                operation_id,
++                "malformed standard vAPI error response",
++            )
++        default_message = messages[0].get("default_message")
++        if (
++            not isinstance(default_message, str)
++            or not default_message.strip()
++        ):
++            raise self._protocol_error(
++                operation_id,
++                "malformed standard vAPI error response",
++            )
++        return error_type, default_message
++
++    def _request_step(
++        self,
++        *,
++        name: str,
++        operation_id: str,
++        method: str,
++        path: str,
++        body: bytes | None,
++    ) -> StepResult:
++        headers = {
++            "Accept": "application/json",
++            "vmware-api-session-id": self._session_token,
++        }
++        if body is not None:
++            headers["Content-Type"] = "application/json"
++        request = Request(
++            self._base_url + path,
++            data=body,
++            headers=headers,
++            method=method,
++        )
++        try:
++            try:
++                with self._opener.open(
++                    request, timeout=self._timeout
++                ) as response:
++                    status = response.getcode()
++                    raw = response.read()
++            except HTTPError as error:
++                status = error.code
++                raw = error.read()
++                error.close()
++        except (
++            URLError,
++            OSError,
++            TimeoutError,
++            http.client.HTTPException,
++        ):
++            raise self._protocol_error(
++                operation_id,
++                "transport failure",
++            ) from None
++
++        if type(status) is not int:
++            raise self._protocol_error(
++                operation_id,
++                "response has no integer HTTP status",
++            )
++        if status == 204:
++            if raw:
++                raise self._protocol_error(
++                    operation_id,
++                    "HTTP 204 response was not empty",
++                )
++            return StepResult(
++                name=name,
++                operation_id=operation_id,
++                state="SUCCEEDED",
++                http_status=204,
++                error_type=None,
++                message=None,
++            )
++
++        error_type, message = self._decode_error(operation_id, raw)
++        return StepResult(
++            name=name,
++            operation_id=operation_id,
++            state="FAILED",
++            http_status=status,
++            error_type=error_type,
++            message=message,
++        )
+ 
+     def resize_and_start(
+         self,
+         vm: str,
+         cpu_count: int,
+         memory_mib: int,
+     ) -> ResizeReport:
+-        raise NotImplementedError
++        if not isinstance(vm, str) or not vm.strip():
++            raise ValueError("vm must be a nonblank string")
++        cpu_count = _positive_int64(cpu_count, "cpu_count")
++        memory_mib = _positive_int64(memory_mib, "memory_mib")
++        encoded_vm = quote(vm, safe="")
++        operations = (
++            (
++                "Cpu",
++                _CPU_UPDATE,
++                "PATCH",
++                f"/api/vcenter/vm/{encoded_vm}/hardware/cpu",
++                _compact_json({"count": cpu_count}),
++            ),
++            (
++                "Memory",
++                _MEMORY_UPDATE,
++                "PATCH",
++                f"/api/vcenter/vm/{encoded_vm}/hardware/memory",
++                _compact_json({"size_mib": memory_mib}),
++            ),
++            (
++                "PowerStart",
++                _POWER_START,
++                "POST",
++                f"/api/vcenter/vm/{encoded_vm}/power?action=start",
++                None,
++            ),
++        )
++
++        steps: list[StepResult] = []
++        completed = 0
++        for name, operation_id, method, path, body in operations:
++            step = self._request_step(
++                name=name,
++                operation_id=operation_id,
++                method=method,
++                path=path,
++                body=body,
++            )
++            steps.append(step)
++            if step.state == "FAILED":
++                return ResizeReport(
++                    vm=vm,
++                    overall_state="FAILED",
++                    completed_step_count=completed,
++                    failed_operation_id=operation_id,
++                    steps=tuple(steps),
++                )
++            completed += 1
++
++        return ResizeReport(
++            vm=vm,
++            overall_state="SUCCEEDED",
++            completed_step_count=completed,
++            failed_operation_id=None,
++            steps=tuple(steps),
++        )

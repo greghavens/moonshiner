@@ -1,0 +1,283 @@
+diff --git a/vcf_vcenter_cpu_guard/client.py b/vcf_vcenter_cpu_guard/client.py
+new file mode 100644
+index 0000000..5f4bf07
+--- /dev/null
++++ b/vcf_vcenter_cpu_guard/client.py
+@@ -0,0 +1,277 @@
++"""Stdlib-only client for a guarded vCenter VM CPU update."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++import json
++import math
++from typing import Any
++from urllib.error import HTTPError, URLError
++from urllib.parse import quote, urlsplit
++from urllib.request import (
++    HTTPRedirectHandler,
++    ProxyHandler,
++    Request,
++    build_opener,
++)
++
++
++POWER_OPERATION_ID = "Vcenter.Vm.Power_get"
++UPDATE_OPERATION_ID = "Vcenter.Vm.Hardware.Cpu_update"
++_POWER_STATES = {"POWERED_OFF", "POWERED_ON", "SUSPENDED"}
++_INT64_MAX = 2**63 - 1
++
++
++class _NoRedirects(HTTPRedirectHandler):
++    def redirect_request(
++        self,
++        req: Any,
++        fp: Any,
++        code: int,
++        msg: str,
++        headers: Any,
++        newurl: str,
++    ) -> None:
++        return None
++
++
++class VcenterError(RuntimeError):
++    """An HTTP or transport failure from one focused vCenter operation."""
++
++    def __init__(
++        self,
++        operation_id: str,
++        status_code: int | None,
++        payload: Any,
++    ) -> None:
++        self.operation_id = operation_id
++        self.status_code = status_code
++        self.payload = payload
++        detail = (
++            f"HTTP {status_code}"
++            if status_code is not None
++            else "transport failure"
++        )
++        super().__init__(f"{operation_id} failed: {detail}")
++
++
++class ProtocolError(RuntimeError):
++    """A malformed success response from a focused vCenter operation."""
++
++    def __init__(self, operation_id: str, message: str) -> None:
++        self.operation_id = operation_id
++        super().__init__(f"{operation_id} returned an invalid success response: {message}")
++
++
++class PrecheckFailed(RuntimeError):
++    """The VM power-state precondition did not permit a CPU update."""
++
++    def __init__(self, vm: str, observed_state: str) -> None:
++        self.vm = vm
++        self.observed_state = observed_state
++        super().__init__(
++            "power-state precheck failed: expected POWERED_OFF, "
++            f"observed {observed_state}"
++        )
++
++
++@dataclass(frozen=True)
++class CpuUpdateResult:
++    """Evidence that the precheck and CPU update completed in order."""
++
++    vm: str
++    previous_power_state: str
++    cpu_count: int
++    completed_operation_ids: tuple[str, str]
++
++
++class VCenterClient:
++    """Minimal vSphere Automation API client for one guarded mutation."""
++
++    def __init__(
++        self,
++        base_url: str,
++        session_token: str,
++        *,
++        timeout: float = 10.0,
++    ) -> None:
++        if not isinstance(base_url, str) or not base_url:
++            raise ValueError("base_url must be an HTTP(S) origin")
++        try:
++            parsed = urlsplit(base_url)
++            parsed_port = parsed.port
++        except ValueError as exc:
++            raise ValueError("base_url must be an HTTP(S) origin") from exc
++        if (
++            parsed.scheme not in {"http", "https"}
++            or parsed.hostname is None
++            or parsed.username is not None
++            or parsed.password is not None
++            or parsed.path not in {"", "/"}
++            or parsed.query
++            or parsed.fragment
++        ):
++            raise ValueError("base_url must be an HTTP(S) origin")
++        if parsed_port is not None and not 1 <= parsed_port <= 65535:
++            raise ValueError("base_url port is invalid")
++        if (
++            not isinstance(session_token, str)
++            or not session_token.strip()
++            or "\r" in session_token
++            or "\n" in session_token
++        ):
++            raise ValueError("session_token must be a nonblank safe header value")
++        if (
++            isinstance(timeout, bool)
++            or not isinstance(timeout, (int, float))
++            or not math.isfinite(float(timeout))
++            or timeout <= 0
++        ):
++            raise ValueError("timeout must be a positive finite number")
++
++        self._base_url = f"{parsed.scheme}://{parsed.netloc}"
++        self._session_token = session_token
++        self._timeout = float(timeout)
++        self._opener = build_opener(ProxyHandler({}), _NoRedirects())
++
++    def set_cpu_count_if_powered_off(
++        self,
++        vm: str,
++        cpu_count: int,
++    ) -> CpuUpdateResult:
++        """Update CPU count only after a successful powered-off precheck."""
++
++        if not isinstance(vm, str) or not vm.strip():
++            raise ValueError("vm must be a nonblank string")
++        if (
++            isinstance(cpu_count, bool)
++            or not isinstance(cpu_count, int)
++            or not 1 <= cpu_count <= _INT64_MAX
++        ):
++            raise ValueError("cpu_count must be a positive signed-int64 integer")
++
++        encoded_vm = quote(vm, safe="")
++        power_status, power_raw = self._request(
++            POWER_OPERATION_ID,
++            "GET",
++            f"/api/vcenter/vm/{encoded_vm}/power",
++        )
++        if power_status != 200:
++            raise VcenterError(
++                POWER_OPERATION_ID,
++                power_status,
++                self._decode_error_payload(power_raw),
++            )
++        power_info = self._decode_power_info(power_raw)
++        observed_state = power_info["state"]
++        if observed_state != "POWERED_OFF":
++            raise PrecheckFailed(vm, observed_state)
++
++        body = f'{{"count":{cpu_count}}}'.encode("ascii")
++        update_status, update_raw = self._request(
++            UPDATE_OPERATION_ID,
++            "PATCH",
++            f"/api/vcenter/vm/{encoded_vm}/hardware/cpu",
++            body=body,
++            content_type="application/json",
++        )
++        if update_status != 204:
++            raise VcenterError(
++                UPDATE_OPERATION_ID,
++                update_status,
++                self._decode_error_payload(update_raw),
++            )
++        if update_raw:
++            raise ProtocolError(UPDATE_OPERATION_ID, "HTTP 204 body was not empty")
++
++        return CpuUpdateResult(
++            vm=vm,
++            previous_power_state=observed_state,
++            cpu_count=cpu_count,
++            completed_operation_ids=(
++                POWER_OPERATION_ID,
++                UPDATE_OPERATION_ID,
++            ),
++        )
++
++    def _request(
++        self,
++        operation_id: str,
++        method: str,
++        path: str,
++        *,
++        body: bytes | None = None,
++        content_type: str | None = None,
++    ) -> tuple[int, bytes]:
++        headers = {
++            "Accept": "application/json",
++            "vmware-api-session-id": self._session_token,
++        }
++        if content_type is not None:
++            headers["Content-Type"] = content_type
++        request = Request(
++            self._base_url + path,
++            data=body,
++            headers=headers,
++            method=method,
++        )
++        try:
++            with self._opener.open(request, timeout=self._timeout) as response:
++                return response.getcode(), response.read()
++        except HTTPError as exc:
++            try:
++                raw = exc.read()
++            except OSError:
++                raw = b""
++            finally:
++                exc.close()
++            raise VcenterError(
++                operation_id,
++                exc.code,
++                self._decode_error_payload(raw),
++            ) from None
++        except (URLError, OSError, ValueError):
++            raise VcenterError(operation_id, None, None) from None
++
++    @staticmethod
++    def _decode_power_info(raw: bytes) -> dict[str, Any]:
++        try:
++            value = json.loads(
++                raw.decode("utf-8"),
++                parse_constant=VCenterClient._reject_json_constant,
++            )
++        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
++            raise ProtocolError(
++                POWER_OPERATION_ID,
++                "body is not strict UTF-8 JSON",
++            ) from None
++        if not isinstance(value, dict):
++            raise ProtocolError(POWER_OPERATION_ID, "body must be an object")
++        state = value.get("state")
++        if not isinstance(state, str) or state not in _POWER_STATES:
++            raise ProtocolError(POWER_OPERATION_ID, "state is missing or unknown")
++        if "clean_power_off" in value and not isinstance(
++            value["clean_power_off"],
++            bool,
++        ):
++            raise ProtocolError(
++                POWER_OPERATION_ID,
++                "clean_power_off must be boolean when present",
++            )
++        return value
++
++    @staticmethod
++    def _decode_error_payload(raw: bytes) -> Any:
++        if not raw:
++            return None
++        try:
++            return json.loads(
++                raw.decode("utf-8"),
++                parse_constant=VCenterClient._reject_json_constant,
++            )
++        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
++            return None
++
++    @staticmethod
++    def _reject_json_constant(value: str) -> None:
++        raise ValueError(f"non-standard JSON constant: {value}")
