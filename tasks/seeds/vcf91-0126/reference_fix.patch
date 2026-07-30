@@ -1,0 +1,474 @@
+--- a/VcenterAttestationDiagnosticsClient.java
++++ b/VcenterAttestationDiagnosticsClient.java
+@@ -1,4 +1,16 @@
++import java.io.IOException;
++import java.io.UncheckedIOException;
++import java.net.URI;
+ import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.Base64;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Objects;
+ 
+ /**
+  * Dependency-free client for the focused VCF 9.1 vCenter attestation
+@@ -35,11 +47,17 @@
+         }
+     }
+ 
++    private final String origin;
++    private final String sessionId;
++    private final HttpClient httpClient;
++
+     public VcenterAttestationDiagnosticsClient(
+             String vcenterBaseUrl,
+             String sessionId,
+             HttpClient httpClient) {
+-        throw new UnsupportedOperationException("TODO");
++        this.origin = normalizeOrigin(vcenterBaseUrl);
++        this.sessionId = requireNonBlank(sessionId, "sessionId");
++        this.httpClient = Objects.requireNonNull(httpClient, "httpClient");
+     }
+ 
+     public Diagnosis diagnoseFailedAttestation(
+@@ -47,6 +65,434 @@
+             String hostId,
+             String tpmId,
+             String supportDescription) {
+-        throw new UnsupportedOperationException("TODO");
++        taskId = requireNonBlank(taskId, "taskId");
++        hostId = requireNonBlank(hostId, "hostId");
++        tpmId = requireNonBlank(tpmId, "tpmId");
++        supportDescription = requireNonBlank(supportDescription, "supportDescription");
++
++        HttpResponse<String> taskResponse = send(
++                request("/api/cis/tasks/" + encodePathSegment(taskId)).GET().build());
++        requireStatus(taskResponse, 200);
++        Map<String, Object> task = object(Json.parse(taskResponse.body()), "task response");
++        String taskStatus = string(task.get("status"), "task.status");
++        if (!"FAILED".equals(taskStatus)) {
++            throw new IllegalStateException(
++                    "task status must be FAILED before diagnostics; got " + taskStatus);
++        }
++        Map<String, Object> taskError = object(task.get("error"), "task.error");
++        String taskErrorType = string(taskError.get("error_type"), "task.error.error_type");
++        List<Object> taskMessages = array(taskError.get("messages"), "task.error.messages");
++        if (taskMessages.isEmpty()) {
++            throw malformed("task.error.messages must contain at least one message");
++        }
++        Map<String, Object> firstMessage =
++                object(taskMessages.get(0), "task.error.messages[0]");
++        String taskMessage = string(
++                firstMessage.get("default_message"),
++                "task.error.messages[0].default_message");
++
++        String eventPath = "/api/vcenter/trusted-infrastructure/hosts/"
++                + encodePathSegment(hostId)
++                + "/hardware/tpm/"
++                + encodePathSegment(tpmId)
++                + "/event-log";
++        HttpResponse<String> eventResponse = send(request(eventPath).GET().build());
++        requireStatus(eventResponse, 200);
++        Map<String, Object> event =
++                object(Json.parse(eventResponse.body()), "event log response");
++        String eventLogType = string(event.get("type"), "event.type");
++        String encodedData = string(event.get("data"), "event.data");
++        boolean truncated = bool(event.get("truncated"), "event.truncated");
++        array(event.get("banks"), "event.banks");
++
++        byte[] evidenceBytes;
++        try {
++            evidenceBytes = Base64.getDecoder().decode(encodedData);
++        } catch (IllegalArgumentException invalidBase64) {
++            throw malformed("event.data is not valid base64", invalidBase64);
++        }
++        String eventEvidence = new String(evidenceBytes, StandardCharsets.UTF_8);
++        String rootCause = eventEvidence.contains("SECURE_BOOT_DISABLED")
++                ? "SECURE_BOOT_DISABLED"
++                : "UNDETERMINED";
++
++        String supportBody = "{\"description\":"
++                + jsonString(supportDescription)
++                + ",\"content_type\":\"LOGS\"}";
++        HttpRequest supportRequest = request(
++                "/api/appliance/support-bundle?vmw-task=true")
++                .header("Content-Type", "application/json")
++                .POST(HttpRequest.BodyPublishers.ofString(
++                        supportBody, StandardCharsets.UTF_8))
++                .build();
++        HttpResponse<String> supportResponse = send(supportRequest);
++        requireStatus(supportResponse, 202);
++        Object supportValue = Json.parse(supportResponse.body());
++        String supportTaskId = string(supportValue, "support bundle task response");
++        if (supportTaskId.isBlank()) {
++            throw malformed("support bundle task response must not be blank");
++        }
++
++        return new Diagnosis(
++                taskStatus,
++                taskErrorType,
++                taskMessage,
++                eventLogType,
++                eventEvidence,
++                truncated,
++                rootCause,
++                supportTaskId);
++    }
++
++    private HttpRequest.Builder request(String relativeTarget) {
++        return HttpRequest.newBuilder(URI.create(origin + relativeTarget))
++                .header("Accept", "application/json")
++                .header("vmware-api-session-id", sessionId);
++    }
++
++    private HttpResponse<String> send(HttpRequest request) {
++        try {
++            return httpClient.send(
++                    request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++        } catch (InterruptedException interrupted) {
++            Thread.currentThread().interrupt();
++            throw new IllegalStateException("vCenter request was interrupted", interrupted);
++        } catch (IOException io) {
++            throw new UncheckedIOException("vCenter request failed", io);
++        }
++    }
++
++    private static void requireStatus(HttpResponse<String> response, int expected) {
++        if (response.statusCode() != expected) {
++            throw new VcenterApiException(response.statusCode(), response.body());
++        }
++    }
++
++    private static String normalizeOrigin(String value) {
++        value = requireNonBlank(value, "vcenterBaseUrl");
++        final URI uri;
++        try {
++            uri = URI.create(value);
++        } catch (IllegalArgumentException invalidUri) {
++            throw new IllegalArgumentException("vcenterBaseUrl must be an HTTP(S) origin",
++                    invalidUri);
++        }
++        String scheme = uri.getScheme();
++        if (scheme == null
++                || (!scheme.equalsIgnoreCase("http") && !scheme.equalsIgnoreCase("https"))
++                || uri.getRawAuthority() == null
++                || uri.getHost() == null
++                || uri.getRawUserInfo() != null
++                || uri.getRawQuery() != null
++                || uri.getRawFragment() != null
++                || !(uri.getRawPath().isEmpty() || "/".equals(uri.getRawPath()))) {
++            throw new IllegalArgumentException("vcenterBaseUrl must be an HTTP(S) origin");
++        }
++        return scheme.toLowerCase(java.util.Locale.ROOT) + "://" + uri.getRawAuthority();
++    }
++
++    private static String requireNonBlank(String value, String name) {
++        Objects.requireNonNull(value, name);
++        if (value.isBlank()) {
++            throw new IllegalArgumentException(name + " must not be blank");
++        }
++        return value;
++    }
++
++    private static String encodePathSegment(String value) {
++        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
++        StringBuilder encoded = new StringBuilder(bytes.length);
++        final char[] hex = "0123456789ABCDEF".toCharArray();
++        for (byte item : bytes) {
++            int octet = item & 0xff;
++            if ((octet >= 'a' && octet <= 'z')
++                    || (octet >= 'A' && octet <= 'Z')
++                    || (octet >= '0' && octet <= '9')
++                    || octet == '-'
++                    || octet == '.'
++                    || octet == '_'
++                    || octet == '~') {
++                encoded.append((char) octet);
++            } else {
++                encoded.append('%')
++                        .append(hex[octet >>> 4])
++                        .append(hex[octet & 0x0f]);
++            }
++        }
++        return encoded.toString();
++    }
++
++    private static String jsonString(String value) {
++        StringBuilder out = new StringBuilder(value.length() + 2).append('"');
++        final char[] hex = "0123456789abcdef".toCharArray();
++        for (int index = 0; index < value.length(); index++) {
++            char ch = value.charAt(index);
++            switch (ch) {
++                case '"' -> out.append("\\\"");
++                case '\\' -> out.append("\\\\");
++                case '\b' -> out.append("\\b");
++                case '\f' -> out.append("\\f");
++                case '\n' -> out.append("\\n");
++                case '\r' -> out.append("\\r");
++                case '\t' -> out.append("\\t");
++                default -> {
++                    if (ch < 0x20) {
++                        out.append("\\u")
++                                .append(hex[(ch >>> 12) & 0x0f])
++                                .append(hex[(ch >>> 8) & 0x0f])
++                                .append(hex[(ch >>> 4) & 0x0f])
++                                .append(hex[ch & 0x0f]);
++                    } else {
++                        out.append(ch);
++                    }
++                }
++            }
++        }
++        return out.append('"').toString();
++    }
++
++    @SuppressWarnings("unchecked")
++    private static Map<String, Object> object(Object value, String label) {
++        if (!(value instanceof Map<?, ?>)) {
++            throw malformed(label + " must be a JSON object");
++        }
++        return (Map<String, Object>) value;
++    }
++
++    @SuppressWarnings("unchecked")
++    private static List<Object> array(Object value, String label) {
++        if (!(value instanceof List<?>)) {
++            throw malformed(label + " must be a JSON array");
++        }
++        return (List<Object>) value;
++    }
++
++    private static String string(Object value, String label) {
++        if (!(value instanceof String text)) {
++            throw malformed(label + " must be a JSON string");
++        }
++        return text;
++    }
++
++    private static boolean bool(Object value, String label) {
++        if (!(value instanceof Boolean result)) {
++            throw malformed(label + " must be a JSON boolean");
++        }
++        return result;
++    }
++
++    private static IllegalStateException malformed(String message) {
++        return new IllegalStateException("malformed vCenter response: " + message);
++    }
++
++    private static IllegalStateException malformed(String message, Throwable cause) {
++        return new IllegalStateException("malformed vCenter response: " + message, cause);
++    }
++
++    private static final class Json {
++        private final String source;
++        private int offset;
++
++        private Json(String source) {
++            this.source = Objects.requireNonNull(source, "JSON response");
++        }
++
++        static Object parse(String source) {
++            Json parser = new Json(source);
++            Object value = parser.value();
++            parser.whitespace();
++            if (parser.offset != parser.source.length()) {
++                throw parser.error("trailing content");
++            }
++            return value;
++        }
++
++        private Object value() {
++            whitespace();
++            if (offset >= source.length()) {
++                throw error("expected a value");
++            }
++            return switch (source.charAt(offset)) {
++                case '{' -> object();
++                case '[' -> array();
++                case '"' -> string();
++                case 't' -> literal("true", Boolean.TRUE);
++                case 'f' -> literal("false", Boolean.FALSE);
++                case 'n' -> literal("null", null);
++                default -> number();
++            };
++        }
++
++        private Map<String, Object> object() {
++            expect('{');
++            LinkedHashMap<String, Object> result = new LinkedHashMap<>();
++            whitespace();
++            if (take('}')) {
++                return result;
++            }
++            while (true) {
++                whitespace();
++                if (offset >= source.length() || source.charAt(offset) != '"') {
++                    throw error("expected an object key");
++                }
++                String key = string();
++                whitespace();
++                expect(':');
++                if (result.putIfAbsent(key, value()) != null) {
++                    throw error("duplicate object key");
++                }
++                whitespace();
++                if (take('}')) {
++                    return result;
++                }
++                expect(',');
++            }
++        }
++
++        private List<Object> array() {
++            expect('[');
++            ArrayList<Object> result = new ArrayList<>();
++            whitespace();
++            if (take(']')) {
++                return result;
++            }
++            while (true) {
++                result.add(value());
++                whitespace();
++                if (take(']')) {
++                    return result;
++                }
++                expect(',');
++            }
++        }
++
++        private String string() {
++            expect('"');
++            StringBuilder result = new StringBuilder();
++            while (offset < source.length()) {
++                char ch = source.charAt(offset++);
++                if (ch == '"') {
++                    return result.toString();
++                }
++                if (ch == '\\') {
++                    if (offset >= source.length()) {
++                        throw error("unterminated string escape");
++                    }
++                    char escape = source.charAt(offset++);
++                    switch (escape) {
++                        case '"' -> result.append('"');
++                        case '\\' -> result.append('\\');
++                        case '/' -> result.append('/');
++                        case 'b' -> result.append('\b');
++                        case 'f' -> result.append('\f');
++                        case 'n' -> result.append('\n');
++                        case 'r' -> result.append('\r');
++                        case 't' -> result.append('\t');
++                        case 'u' -> result.append(unicode());
++                        default -> throw error("invalid string escape");
++                    }
++                } else {
++                    if (ch < 0x20) {
++                        throw error("unescaped control character");
++                    }
++                    result.append(ch);
++                }
++            }
++            throw error("unterminated string");
++        }
++
++        private char unicode() {
++            if (offset + 4 > source.length()) {
++                throw error("short unicode escape");
++            }
++            int value = 0;
++            for (int index = 0; index < 4; index++) {
++                int digit = Character.digit(source.charAt(offset++), 16);
++                if (digit < 0) {
++                    throw error("invalid unicode escape");
++                }
++                value = (value << 4) | digit;
++            }
++            return (char) value;
++        }
++
++        private Object literal(String token, Object value) {
++            if (!source.startsWith(token, offset)) {
++                throw error("invalid literal");
++            }
++            offset += token.length();
++            return value;
++        }
++
++        private Number number() {
++            int start = offset;
++            take('-');
++            if (take('0')) {
++                // A single leading zero is valid.
++            } else {
++                digits();
++            }
++            boolean decimal = false;
++            if (take('.')) {
++                decimal = true;
++                digits();
++            }
++            if (take('e') || take('E')) {
++                decimal = true;
++                take('+');
++                take('-');
++                digits();
++            }
++            if (start == offset) {
++                throw error("invalid value");
++            }
++            String token = source.substring(start, offset);
++            try {
++                return decimal ? Double.valueOf(token) : Long.valueOf(token);
++            } catch (NumberFormatException invalidNumber) {
++                throw error("invalid number");
++            }
++        }
++
++        private void digits() {
++            int start = offset;
++            while (offset < source.length()
++                    && source.charAt(offset) >= '0'
++                    && source.charAt(offset) <= '9') {
++                offset++;
++            }
++            if (start == offset) {
++                throw error("expected a digit");
++            }
++        }
++
++        private void whitespace() {
++            while (offset < source.length()) {
++                char ch = source.charAt(offset);
++                if (ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t') {
++                    offset++;
++                } else {
++                    return;
++                }
++            }
++        }
++
++        private boolean take(char expected) {
++            if (offset < source.length() && source.charAt(offset) == expected) {
++                offset++;
++                return true;
++            }
++            return false;
++        }
++
++        private void expect(char expected) {
++            if (!take(expected)) {
++                throw error("expected '" + expected + "'");
++            }
++        }
++
++        private IllegalStateException error(String message) {
++            return malformed(message + " at character " + offset);
++        }
+     }
+ }

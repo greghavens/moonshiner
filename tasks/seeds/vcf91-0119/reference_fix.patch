@@ -1,0 +1,579 @@
+--- a/VcenterCloneClient.java
++++ b/VcenterCloneClient.java
+@@ -1,10 +1,24 @@
+ import java.io.IOException;
++import java.math.BigDecimal;
++import java.net.URI;
++import java.net.URISyntaxException;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
+ import java.time.Duration;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
+ 
+ /**
+  * Complete this dependency-free VCF 9.1 vCenter Automation client.
+  */
+ public final class VcenterCloneClient {
++    private static final char[] HEX =
++            "0123456789ABCDEF".toCharArray();
++
+     public record CloneOutcome(
+             String taskId,
+             String virtualMachineId,
+@@ -35,13 +49,27 @@
+         void sleep(Duration duration) throws InterruptedException;
+     }
+ 
++    private final String apiRoot;
++    private final String sessionId;
++    private final Duration requestTimeout;
++    private final Duration pollInterval;
++    private final int maxPolls;
++    private final Sleeper sleeper;
++    private final HttpClient httpClient;
++
+     public VcenterCloneClient(
+             String apiRoot,
+             String sessionId,
+             Duration requestTimeout,
+             Duration pollInterval,
+             int maxPolls) {
+-        throw new UnsupportedOperationException("TODO");
++        this(
++                apiRoot,
++                sessionId,
++                requestTimeout,
++                pollInterval,
++                maxPolls,
++                VcenterCloneClient::sleepThread);
+     }
+ 
+     public VcenterCloneClient(
+@@ -51,11 +79,520 @@
+             Duration pollInterval,
+             int maxPolls,
+             Sleeper sleeper) {
+-        throw new UnsupportedOperationException("TODO");
++        this.apiRoot = validateApiRoot(apiRoot);
++        this.sessionId = validateSessionId(sessionId);
++        this.requestTimeout = positiveDuration(
++                requestTimeout, "requestTimeout");
++        this.pollInterval = positiveDuration(
++                pollInterval, "pollInterval");
++        if (maxPolls <= 0) {
++            throw new IllegalArgumentException("maxPolls must be positive");
++        }
++        if (sleeper == null) {
++            throw new IllegalArgumentException("sleeper must not be null");
++        }
++        this.maxPolls = maxPolls;
++        this.sleeper = sleeper;
++        this.httpClient = HttpClient.newBuilder()
++                .connectTimeout(requestTimeout)
++                .followRedirects(HttpClient.Redirect.NEVER)
++                .build();
+     }
+ 
+     public CloneOutcome cloneAndWait(String source, String name)
+             throws IOException, InterruptedException {
+-        throw new UnsupportedOperationException("TODO");
++        requireNonEmpty(source, "source");
++        requireNonEmpty(name, "name");
++        String requestBody = "{"
++                + quoteJson("source") + ":" + quoteJson(source) + ","
++                + quoteJson("name") + ":" + quoteJson(name)
++                + "}";
++        HttpRequest cloneRequest = baseRequest(
++                URI.create(
++                        apiRoot
++                        + "/vcenter/vm?action=clone&vmw-task=true"))
++                .header("Content-Type", "application/json")
++                .POST(HttpRequest.BodyPublishers.ofString(
++                        requestBody,
++                        StandardCharsets.UTF_8))
++                .build();
++        HttpResponse<String> cloneResponse = send(cloneRequest);
++        requireStatus(cloneResponse, 202);
++        Object taskValue = parseJson(cloneResponse.body());
++        if (!(taskValue instanceof String taskId)
++                || taskId.isEmpty()) {
++            throw protocol("clone response is not a non-empty task handle");
++        }
++
++        URI taskUri = URI.create(
++                apiRoot + "/cis/tasks/" + encodePathSegment(taskId));
++        for (int poll = 1; poll <= maxPolls; poll++) {
++            HttpRequest taskRequest = baseRequest(taskUri).GET().build();
++            HttpResponse<String> taskResponse = send(taskRequest);
++            requireStatus(taskResponse, 200);
++            Object parsed = parseJson(taskResponse.body());
++            if (!(parsed instanceof Map<?, ?> taskInfo)) {
++                throw protocol("task response is not a JSON object");
++            }
++            Object statusValue = taskInfo.get("status");
++            if (!(statusValue instanceof String status)) {
++                throw protocol("task response has no string status");
++            }
++            switch (status) {
++                case "SUCCEEDED" -> {
++                    Object resultValue = taskInfo.get("result");
++                    if (!(resultValue instanceof String vmId)
++                            || vmId.isEmpty()) {
++                        throw protocol(
++                                "successful task has no string result");
++                    }
++                    return new CloneOutcome(taskId, vmId, poll);
++                }
++                case "FAILED" ->
++                        throw protocol("vCenter clone task failed");
++                case "PENDING", "RUNNING", "BLOCKED" -> {
++                    if (poll == maxPolls) {
++                        throw protocol(
++                                "vCenter clone task did not complete");
++                    }
++                    sleepBeforeNextPoll();
++                }
++                default ->
++                        throw protocol("task response has unknown status");
++            }
++        }
++        throw new AssertionError("unreachable");
++    }
++
++    private HttpRequest.Builder baseRequest(URI target) {
++        return HttpRequest.newBuilder(target)
++                .timeout(requestTimeout)
++                .header("vmware-api-session-id", sessionId)
++                .header("Accept", "application/json");
++    }
++
++    private HttpResponse<String> send(HttpRequest request)
++            throws IOException, InterruptedException {
++        try {
++            return httpClient.send(
++                    request,
++                    HttpResponse.BodyHandlers.ofString(
++                            StandardCharsets.UTF_8));
++        } catch (InterruptedException exception) {
++            Thread.currentThread().interrupt();
++            throw exception;
++        }
++    }
++
++    private void sleepBeforeNextPoll() throws InterruptedException {
++        try {
++            sleeper.sleep(pollInterval);
++        } catch (InterruptedException exception) {
++            Thread.currentThread().interrupt();
++            throw exception;
++        }
++    }
++
++    private static void requireStatus(
++            HttpResponse<String> response,
++            int expected) throws VcenterApiException {
++        if (response.statusCode() != expected) {
++            throw new VcenterApiException(
++                    response.statusCode(),
++                    response.body());
++        }
++    }
++
++    private static String validateApiRoot(String value) {
++        if (value == null) {
++            throw new IllegalArgumentException(
++                    "apiRoot must be an HTTP(S) /api URL");
++        }
++        final URI parsed;
++        try {
++            parsed = new URI(value);
++        } catch (URISyntaxException exception) {
++            throw new IllegalArgumentException(
++                    "apiRoot must be an HTTP(S) /api URL",
++                    exception);
++        }
++        String scheme = parsed.getScheme();
++        String path = parsed.getRawPath();
++        if (scheme == null
++                || (!scheme.equalsIgnoreCase("http")
++                    && !scheme.equalsIgnoreCase("https"))
++                || parsed.getHost() == null
++                || parsed.getRawUserInfo() != null
++                || parsed.getRawQuery() != null
++                || parsed.getRawFragment() != null
++                || (!"/api".equals(path) && !"/api/".equals(path))) {
++            throw new IllegalArgumentException(
++                    "apiRoot must be an HTTP(S) /api URL");
++        }
++        try {
++            return new URI(
++                    scheme.toLowerCase(),
++                    null,
++                    parsed.getHost(),
++                    parsed.getPort(),
++                    "/api",
++                    null,
++                    null).toASCIIString();
++        } catch (URISyntaxException impossible) {
++            throw new IllegalArgumentException(
++                    "apiRoot must be an HTTP(S) /api URL",
++                    impossible);
++        }
++    }
++
++    private static String validateSessionId(String value) {
++        if (value == null || value.isEmpty()) {
++            throw new IllegalArgumentException("invalid session ID");
++        }
++        for (int index = 0; index < value.length(); index++) {
++            char item = value.charAt(index);
++            if (item < 0x21 || item > 0x7e) {
++                throw new IllegalArgumentException("invalid session ID");
++            }
++        }
++        return value;
++    }
++
++    private static Duration positiveDuration(
++            Duration value,
++            String name) {
++        if (value == null || value.isZero() || value.isNegative()) {
++            throw new IllegalArgumentException(name + " must be positive");
++        }
++        return value;
++    }
++
++    private static void requireNonEmpty(String value, String name) {
++        if (value == null || value.isEmpty() || !wellFormed(value)) {
++            throw new IllegalArgumentException(
++                    name + " must be a non-empty Unicode string");
++        }
++    }
++
++    private static void sleepThread(Duration duration)
++            throws InterruptedException {
++        long millis = duration.toMillis();
++        int nanos = duration.getNano() % 1_000_000;
++        Thread.sleep(millis, nanos);
++    }
++
++    private static String encodePathSegment(String value)
++            throws IOException {
++        if (!wellFormed(value)) {
++            throw protocol("task handle is not valid Unicode");
++        }
++        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
++        StringBuilder result = new StringBuilder(bytes.length);
++        for (byte item : bytes) {
++            int current = item & 0xff;
++            if ((current >= 'a' && current <= 'z')
++                    || (current >= 'A' && current <= 'Z')
++                    || (current >= '0' && current <= '9')
++                    || current == '-'
++                    || current == '.'
++                    || current == '_'
++                    || current == '~') {
++                result.append((char) current);
++            } else {
++                result.append('%')
++                        .append(HEX[current >>> 4])
++                        .append(HEX[current & 0x0f]);
++            }
++        }
++        return result.toString();
++    }
++
++    private static String quoteJson(String value) {
++        if (!wellFormed(value)) {
++            throw new IllegalArgumentException(
++                    "JSON string is not valid Unicode");
++        }
++        StringBuilder result = new StringBuilder(value.length() + 2);
++        result.append('"');
++        for (int index = 0; index < value.length(); index++) {
++            char item = value.charAt(index);
++            switch (item) {
++                case '"' -> result.append("\\\"");
++                case '\\' -> result.append("\\\\");
++                case '\b' -> result.append("\\b");
++                case '\f' -> result.append("\\f");
++                case '\n' -> result.append("\\n");
++                case '\r' -> result.append("\\r");
++                case '\t' -> result.append("\\t");
++                default -> {
++                    if (item < 0x20) {
++                        result.append("\\u")
++                                .append(HEX[(item >>> 12) & 0xf])
++                                .append(HEX[(item >>> 8) & 0xf])
++                                .append(HEX[(item >>> 4) & 0xf])
++                                .append(HEX[item & 0xf]);
++                    } else {
++                        result.append(item);
++                    }
++                }
++            }
++        }
++        return result.append('"').toString();
++    }
++
++    private static boolean wellFormed(String value) {
++        for (int index = 0; index < value.length(); index++) {
++            char item = value.charAt(index);
++            if (Character.isHighSurrogate(item)) {
++                if (index + 1 >= value.length()
++                        || !Character.isLowSurrogate(
++                                value.charAt(index + 1))) {
++                    return false;
++                }
++                index++;
++            } else if (Character.isLowSurrogate(item)) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    private static Object parseJson(String text) throws IOException {
++        if (text == null) {
++            throw protocol("response body is missing");
++        }
++        JsonParser parser = new JsonParser(text);
++        Object value = parser.parseValue(0);
++        parser.skipWhitespace();
++        if (!parser.atEnd()) {
++            throw protocol("response has trailing JSON data");
++        }
++        return value;
++    }
++
++    private static IOException protocol(String message) {
++        return new IOException("vCenter protocol error: " + message);
++    }
++
++    private static final class JsonParser {
++        private final String text;
++        private int index;
++
++        private JsonParser(String text) {
++            this.text = text;
++        }
++
++        private Object parseValue(int depth) throws IOException {
++            if (depth > 100) {
++                throw error("JSON nesting is too deep");
++            }
++            skipWhitespace();
++            if (atEnd()) {
++                throw error("unexpected end of JSON");
++            }
++            return switch (text.charAt(index)) {
++                case '"' -> parseString();
++                case '{' -> parseObject(depth + 1);
++                case '[' -> parseArray(depth + 1);
++                case 't' -> {
++                    consume("true");
++                    yield Boolean.TRUE;
++                }
++                case 'f' -> {
++                    consume("false");
++                    yield Boolean.FALSE;
++                }
++                case 'n' -> {
++                    consume("null");
++                    yield null;
++                }
++                default -> parseNumber();
++            };
++        }
++
++        private Map<String, Object> parseObject(int depth)
++                throws IOException {
++            index++;
++            skipWhitespace();
++            Map<String, Object> result = new LinkedHashMap<>();
++            if (take('}')) {
++                return result;
++            }
++            while (true) {
++                skipWhitespace();
++                if (atEnd() || text.charAt(index) != '"') {
++                    throw error("object key must be a string");
++                }
++                String key = parseString();
++                skipWhitespace();
++                expect(':');
++                Object value = parseValue(depth);
++                if (result.containsKey(key)) {
++                    throw error("duplicate object property");
++                }
++                result.put(key, value);
++                skipWhitespace();
++                if (take('}')) {
++                    return result;
++                }
++                expect(',');
++            }
++        }
++
++        private List<Object> parseArray(int depth) throws IOException {
++            index++;
++            skipWhitespace();
++            List<Object> result = new ArrayList<>();
++            if (take(']')) {
++                return result;
++            }
++            while (true) {
++                result.add(parseValue(depth));
++                skipWhitespace();
++                if (take(']')) {
++                    return result;
++                }
++                expect(',');
++            }
++        }
++
++        private String parseString() throws IOException {
++            expect('"');
++            StringBuilder result = new StringBuilder();
++            while (!atEnd()) {
++                char item = text.charAt(index++);
++                if (item == '"') {
++                    String value = result.toString();
++                    if (!wellFormed(value)) {
++                        throw error("string is not valid Unicode");
++                    }
++                    return value;
++                }
++                if (item < 0x20) {
++                    throw error("unescaped control character");
++                }
++                if (item != '\\') {
++                    result.append(item);
++                    continue;
++                }
++                if (atEnd()) {
++                    throw error("unterminated escape");
++                }
++                char escaped = text.charAt(index++);
++                switch (escaped) {
++                    case '"' -> result.append('"');
++                    case '\\' -> result.append('\\');
++                    case '/' -> result.append('/');
++                    case 'b' -> result.append('\b');
++                    case 'f' -> result.append('\f');
++                    case 'n' -> result.append('\n');
++                    case 'r' -> result.append('\r');
++                    case 't' -> result.append('\t');
++                    case 'u' -> result.append(parseUnicodeEscape());
++                    default -> throw error("invalid string escape");
++                }
++            }
++            throw error("unterminated string");
++        }
++
++        private char parseUnicodeEscape() throws IOException {
++            if (index + 4 > text.length()) {
++                throw error("short Unicode escape");
++            }
++            int value = 0;
++            for (int count = 0; count < 4; count++) {
++                int digit = Character.digit(text.charAt(index++), 16);
++                if (digit < 0) {
++                    throw error("invalid Unicode escape");
++                }
++                value = (value << 4) | digit;
++            }
++            return (char) value;
++        }
++
++        private BigDecimal parseNumber() throws IOException {
++            int start = index;
++            if (take('-') && atEnd()) {
++                throw error("invalid number");
++            }
++            if (take('0')) {
++                if (!atEnd() && Character.isDigit(text.charAt(index))) {
++                    throw error("leading zero in number");
++                }
++            } else {
++                requireDigits();
++            }
++            if (take('.')) {
++                requireDigits();
++            }
++            if (!atEnd()
++                    && (text.charAt(index) == 'e'
++                        || text.charAt(index) == 'E')) {
++                index++;
++                if (!atEnd()
++                        && (text.charAt(index) == '+'
++                            || text.charAt(index) == '-')) {
++                    index++;
++                }
++                requireDigits();
++            }
++            try {
++                return new BigDecimal(text.substring(start, index));
++            } catch (NumberFormatException exception) {
++                throw error("invalid number");
++            }
++        }
++
++        private void requireDigits() throws IOException {
++            int start = index;
++            while (!atEnd() && Character.isDigit(text.charAt(index))) {
++                index++;
++            }
++            if (start == index) {
++                throw error("invalid number");
++            }
++        }
++
++        private void consume(String literal) throws IOException {
++            if (!text.startsWith(literal, index)) {
++                throw error("invalid literal");
++            }
++            index += literal.length();
++        }
++
++        private void expect(char expected) throws IOException {
++            if (!take(expected)) {
++                throw error("expected '" + expected + "'");
++            }
++        }
++
++        private boolean take(char expected) {
++            if (!atEnd() && text.charAt(index) == expected) {
++                index++;
++                return true;
++            }
++            return false;
++        }
++
++        private void skipWhitespace() {
++            while (!atEnd()) {
++                char item = text.charAt(index);
++                if (item != ' '
++                        && item != '\n'
++                        && item != '\r'
++                        && item != '\t') {
++                    return;
++                }
++                index++;
++            }
++        }
++
++        private boolean atEnd() {
++            return index >= text.length();
++        }
++
++        private IOException error(String message) {
++            return protocol(message);
++        }
+     }
+ }

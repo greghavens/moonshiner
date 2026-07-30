@@ -1,0 +1,635 @@
+--- a/vcenter/client.go
++++ b/vcenter/client.go
+@@ -1,2 +1,495 @@
+-// TODO: implement the contract-pinned client described in README.md.
++// Package vcenter implements the focused VCF 9.1 inventory contract.
+ package vcenter
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"io"
++	"net/http"
++	"net/url"
++	"sort"
++	"strings"
++	"unicode/utf8"
++)
++
++const (
++	sessionCreateOperationID  = "Cis.Session_create"
++	datacenterListOperationID = "Vcenter.Datacenter_list"
++	vmListOperationID         = "Vcenter.VM_list"
++	maxResponseBytes          = 1 << 20
++)
++
++// NewClient validates its inputs and creates the initial API session.
++func NewClient(
++	ctx context.Context,
++	baseURL, username, password string,
++	httpClient *http.Client,
++) (*Client, error) {
++	if ctx == nil {
++		return nil, errors.New("vcenter: context is required")
++	}
++	origin, err := validateOrigin(baseURL)
++	if err != nil {
++		return nil, err
++	}
++	if err := validateCredential("username", username); err != nil {
++		return nil, err
++	}
++	if strings.Contains(username, ":") {
++		return nil, errors.New("vcenter: username must not contain ':'")
++	}
++	if err := validateCredential("password", password); err != nil {
++		return nil, err
++	}
++
++	clientCopy := http.Client{}
++	if httpClient != nil {
++		clientCopy = *httpClient
++	} else {
++		clientCopy = *http.DefaultClient
++		if transport, ok := http.DefaultTransport.(*http.Transport); ok {
++			transportCopy := transport.Clone()
++			transportCopy.Proxy = nil
++			clientCopy.Transport = transportCopy
++		}
++	}
++	clientCopy.CheckRedirect = func(
++		_request *http.Request,
++		_via []*http.Request,
++	) error {
++		return http.ErrUseLastResponse
++	}
++
++	client := &Client{
++		baseURL:    origin,
++		username:   username,
++		password:   password,
++		httpClient: &clientCopy,
++	}
++	token, err := client.createSession(ctx)
++	if err != nil {
++		return nil, err
++	}
++	client.sessionID = token
++	return client, nil
++}
++
++// ListDatacenters calls Vcenter.Datacenter_list.
++func (c *Client) ListDatacenters(
++	ctx context.Context,
++	filter DatacenterFilter,
++) ([]DatacenterSummary, error) {
++	if ctx == nil {
++		return nil, errors.New("vcenter: context is required")
++	}
++	query, err := datacenterQuery(filter)
++	if err != nil {
++		return nil, err
++	}
++	body, err := c.authenticatedGet(
++		ctx,
++		datacenterListOperationID,
++		"/api/vcenter/datacenter",
++		query,
++	)
++	if err != nil {
++		return nil, err
++	}
++	return decodeDatacenters(body)
++}
++
++// ListVMs calls Vcenter.VM_list.
++func (c *Client) ListVMs(
++	ctx context.Context,
++	filter VMFilter,
++) ([]VMSummary, error) {
++	if ctx == nil {
++		return nil, errors.New("vcenter: context is required")
++	}
++	query, err := vmQuery(filter)
++	if err != nil {
++		return nil, err
++	}
++	body, err := c.authenticatedGet(
++		ctx,
++		vmListOperationID,
++		"/api/vcenter/vm",
++		query,
++	)
++	if err != nil {
++		return nil, err
++	}
++	return decodeVMs(body)
++}
++
++// CollectInventory returns a snapshot, retaining datacenters if the VM stage
++// fails.
++func (c *Client) CollectInventory(
++	ctx context.Context,
++) (InventorySnapshot, error) {
++	var snapshot InventorySnapshot
++	datacenters, err := c.ListDatacenters(ctx, DatacenterFilter{})
++	if err != nil {
++		return snapshot, err
++	}
++	snapshot.Datacenters = datacenters
++
++	vms, err := c.ListVMs(ctx, VMFilter{})
++	if err != nil {
++		return snapshot, err
++	}
++	snapshot.VMs = vms
++	return snapshot, nil
++}
++
++func (c *Client) createSession(ctx context.Context) (string, error) {
++	request, err := http.NewRequestWithContext(
++		ctx,
++		http.MethodPost,
++		c.baseURL+"/api/session",
++		nil,
++	)
++	if err != nil {
++		return "", &APIError{OperationID: sessionCreateOperationID}
++	}
++	request.Header.Set("Accept", "application/json")
++	request.SetBasicAuth(c.username, c.password)
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		if contextError := ctx.Err(); contextError != nil {
++			return "", contextError
++		}
++		return "", &APIError{OperationID: sessionCreateOperationID}
++	}
++	defer response.Body.Close()
++	body, err := readBody(response.Body)
++	if err != nil {
++		return "", &APIError{OperationID: sessionCreateOperationID}
++	}
++	if response.StatusCode != http.StatusCreated {
++		return "", httpFailure(
++			sessionCreateOperationID,
++			response.StatusCode,
++			body,
++		)
++	}
++
++	var token string
++	if err := decodeSingleJSON(body, &token); err != nil ||
++		strings.TrimSpace(token) == "" ||
++		hasControl(token) {
++		return "", &ProtocolError{OperationID: sessionCreateOperationID}
++	}
++	return token, nil
++}
++
++func (c *Client) authenticatedGet(
++	ctx context.Context,
++	operationID, path, query string,
++) ([]byte, error) {
++	token := c.currentSession()
++	body, status, err := c.getOnce(ctx, operationID, path, query, token)
++	if err != nil {
++		return nil, err
++	}
++	if status != http.StatusUnauthorized {
++		if status != http.StatusOK {
++			return nil, httpFailure(operationID, status, body)
++		}
++		return body, nil
++	}
++
++	replacement, err := c.refreshSession(ctx, token)
++	if err != nil {
++		return nil, err
++	}
++	body, status, err = c.getOnce(
++		ctx,
++		operationID,
++		path,
++		query,
++		replacement,
++	)
++	if err != nil {
++		return nil, err
++	}
++	if status != http.StatusOK {
++		return nil, httpFailure(operationID, status, body)
++	}
++	return body, nil
++}
++
++func (c *Client) getOnce(
++	ctx context.Context,
++	operationID, path, query, token string,
++) ([]byte, int, error) {
++	target := c.baseURL + path
++	if query != "" {
++		target += "?" + query
++	}
++	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
++	if err != nil {
++		return nil, 0, &APIError{OperationID: operationID}
++	}
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set("vmware-api-session-id", token)
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		if contextError := ctx.Err(); contextError != nil {
++			return nil, 0, contextError
++		}
++		return nil, 0, &APIError{OperationID: operationID}
++	}
++	defer response.Body.Close()
++	body, err := readBody(response.Body)
++	if err != nil {
++		return nil, 0, &APIError{OperationID: operationID}
++	}
++	return body, response.StatusCode, nil
++}
++
++func (c *Client) currentSession() string {
++	c.sessionMu.Lock()
++	defer c.sessionMu.Unlock()
++	return c.sessionID
++}
++
++func (c *Client) refreshSession(
++	ctx context.Context,
++	failedToken string,
++) (string, error) {
++	c.sessionMu.Lock()
++	defer c.sessionMu.Unlock()
++	if c.sessionID != failedToken {
++		return c.sessionID, nil
++	}
++	token, err := c.createSession(ctx)
++	if err != nil {
++		return "", err
++	}
++	c.sessionID = token
++	return token, nil
++}
++
++type namedValues struct {
++	name   string
++	values []string
++}
++
++func datacenterQuery(filter DatacenterFilter) (string, error) {
++	fields := []namedValues{
++		{"datacenters", filter.Datacenters},
++		{"names", filter.Names},
++		{"folders", filter.Folders},
++	}
++	return encodeFields(fields)
++}
++
++func vmQuery(filter VMFilter) (string, error) {
++	powerStates := make([]string, len(filter.PowerStates))
++	for index, state := range filter.PowerStates {
++		if !validPowerState(state) {
++			return "", errors.New("vcenter: invalid power_states value")
++		}
++		powerStates[index] = string(state)
++	}
++	fields := []namedValues{
++		{"vms", filter.VMs},
++		{"names", filter.Names},
++		{"folders", filter.Folders},
++		{"datacenters", filter.Datacenters},
++		{"hosts", filter.Hosts},
++		{"clusters", filter.Clusters},
++		{"resource_pools", filter.ResourcePools},
++		{"power_states", powerStates},
++	}
++	return encodeFields(fields)
++}
++
++func encodeFields(fields []namedValues) (string, error) {
++	var query strings.Builder
++	first := true
++	for _, field := range fields {
++		seen := make(map[string]struct{}, len(field.values))
++		for _, value := range field.values {
++			if strings.TrimSpace(value) == "" || hasControl(value) {
++				return "", errors.New("vcenter: filter values must be nonblank")
++			}
++			if _, exists := seen[value]; exists {
++				return "", errors.New("vcenter: filter values must be unique")
++			}
++			seen[value] = struct{}{}
++			if !first {
++				query.WriteByte('&')
++			}
++			first = false
++			query.WriteString(field.name)
++			query.WriteByte('=')
++			query.WriteString(rfc3986QueryEscape(value))
++		}
++	}
++	return query.String(), nil
++}
++
++func rfc3986QueryEscape(value string) string {
++	return strings.ReplaceAll(url.QueryEscape(value), "+", "%20")
++}
++
++type datacenterWire struct {
++	Datacenter *string `json:"datacenter"`
++	Name       *string `json:"name"`
++}
++
++func decodeDatacenters(body []byte) ([]DatacenterSummary, error) {
++	var wire []datacenterWire
++	if err := decodeSingleJSON(body, &wire); err != nil || wire == nil {
++		return nil, &ProtocolError{OperationID: datacenterListOperationID}
++	}
++	result := make([]DatacenterSummary, len(wire))
++	for index, item := range wire {
++		if item.Datacenter == nil || item.Name == nil {
++			return nil, &ProtocolError{OperationID: datacenterListOperationID}
++		}
++		result[index] = DatacenterSummary{
++			Datacenter: *item.Datacenter,
++			Name:       *item.Name,
++		}
++	}
++	sort.Slice(result, func(left, right int) bool {
++		if result[left].Name != result[right].Name {
++			return result[left].Name < result[right].Name
++		}
++		return result[left].Datacenter < result[right].Datacenter
++	})
++	return result, nil
++}
++
++type vmWire struct {
++	VM            *string     `json:"vm"`
++	Name          *string     `json:"name"`
++	PowerState    *PowerState `json:"power_state"`
++	CPUCount      *int64      `json:"cpu_count"`
++	MemorySizeMiB *int64      `json:"memory_size_mib"`
++}
++
++func decodeVMs(body []byte) ([]VMSummary, error) {
++	var wire []vmWire
++	if err := decodeSingleJSON(body, &wire); err != nil || wire == nil {
++		return nil, &ProtocolError{OperationID: vmListOperationID}
++	}
++	result := make([]VMSummary, len(wire))
++	for index, item := range wire {
++		if item.VM == nil || item.Name == nil || item.PowerState == nil ||
++			!validPowerState(*item.PowerState) {
++			return nil, &ProtocolError{OperationID: vmListOperationID}
++		}
++		result[index] = VMSummary{
++			VM:            *item.VM,
++			Name:          *item.Name,
++			PowerState:    *item.PowerState,
++			CPUCount:      cloneInt64(item.CPUCount),
++			MemorySizeMiB: cloneInt64(item.MemorySizeMiB),
++		}
++	}
++	sort.Slice(result, func(left, right int) bool {
++		if result[left].Name != result[right].Name {
++			return result[left].Name < result[right].Name
++		}
++		return result[left].VM < result[right].VM
++	})
++	return result, nil
++}
++
++func cloneInt64(value *int64) *int64 {
++	if value == nil {
++		return nil
++	}
++	copy := *value
++	return &copy
++}
++
++func validPowerState(value PowerState) bool {
++	switch value {
++	case PowerStatePoweredOff, PowerStatePoweredOn, PowerStateSuspended:
++		return true
++	default:
++		return false
++	}
++}
++
++func validateOrigin(value string) (string, error) {
++	if value == "" || hasControl(value) || strings.TrimSpace(value) != value {
++		return "", errors.New("vcenter: base URL must be an HTTP(S) origin")
++	}
++	parsed, err := url.Parse(value)
++	if err != nil {
++		return "", errors.New("vcenter: base URL must be an HTTP(S) origin")
++	}
++	if (parsed.Scheme != "http" && parsed.Scheme != "https") ||
++		parsed.Host == "" ||
++		parsed.Hostname() == "" ||
++		parsed.User != nil ||
++		(parsed.Path != "" && parsed.Path != "/") ||
++		parsed.RawQuery != "" ||
++		parsed.Fragment != "" ||
++		parsed.Opaque != "" {
++		return "", errors.New("vcenter: base URL must be an HTTP(S) origin")
++	}
++	return parsed.Scheme + "://" + parsed.Host, nil
++}
++
++func validateCredential(name, value string) error {
++	if strings.TrimSpace(value) == "" || hasControl(value) {
++		return errors.New("vcenter: " + name + " must be nonblank without controls")
++	}
++	return nil
++}
++
++func hasControl(value string) bool {
++	if !utf8.ValidString(value) {
++		return true
++	}
++	for _, character := range value {
++		if character < 0x20 || character == 0x7f {
++			return true
++		}
++	}
++	return false
++}
++
++func readBody(reader io.Reader) ([]byte, error) {
++	limited := io.LimitReader(reader, maxResponseBytes+1)
++	body, err := io.ReadAll(limited)
++	if err != nil || len(body) > maxResponseBytes {
++		return nil, errors.New("response read failed")
++	}
++	return body, nil
++}
++
++func decodeSingleJSON(body []byte, destination any) error {
++	decoder := json.NewDecoder(bytes.NewReader(body))
++	if err := decoder.Decode(destination); err != nil {
++		return err
++	}
++	var trailing any
++	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
++		return errors.New("trailing JSON value")
++	}
++	return nil
++}
++
++func httpFailure(operationID string, status int, body []byte) *APIError {
++	var payload any
++	if err := decodeSingleJSON(body, &payload); err != nil {
++		payload = nil
++	}
++	return &APIError{
++		OperationID: operationID,
++		StatusCode:  status,
++		Payload:     payload,
++	}
++}
+--- /dev/null
++++ b/vcenter/client_test.go
+@@ -0,0 +1,133 @@
++package vcenter_test
++
++import (
++	"context"
++	"testing"
++
++	"example.com/vcfinventory/internal/mockvcenter"
++	"example.com/vcfinventory/vcenter"
++)
++
++func TestListFilterWireShapes(t *testing.T) {
++	testCases := []struct {
++		name      string
++		invoke    func(*vcenter.Client) error
++		wantQuery string
++	}{
++		{
++			name: "unset datacenter fields are omitted",
++			invoke: func(client *vcenter.Client) error {
++				_, err := client.ListDatacenters(
++					context.Background(),
++					vcenter.DatacenterFilter{},
++				)
++				return err
++			},
++			wantQuery: "",
++		},
++		{
++			name: "populated VM fields are exploded",
++			invoke: func(client *vcenter.Client) error {
++				_, err := client.ListVMs(context.Background(), vcenter.VMFilter{
++					Names:       []string{"web one", "web+two"},
++					PowerStates: []vcenter.PowerState{vcenter.PowerStatePoweredOn},
++				})
++				return err
++			},
++			wantQuery: "names=web%20one&names=web%2Btwo&power_states=POWERED_ON",
++		},
++	}
++
++	for _, testCase := range testCases {
++		t.Run(testCase.name, func(t *testing.T) {
++			scenario := unitScenario()
++			server, err := mockvcenter.New(scenario)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer server.Close()
++			client, err := vcenter.NewClient(
++				context.Background(),
++				server.URL(),
++				scenario.Username,
++				scenario.Password,
++				server.Client(),
++			)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if err := testCase.invoke(client); err != nil {
++				t.Fatal(err)
++			}
++			requests := server.Requests()
++			if len(requests) != 2 {
++				t.Fatalf("request count = %d, want 2", len(requests))
++			}
++			if requests[1].RawQuery != testCase.wantQuery {
++				t.Errorf("query = %q, want %q", requests[1].RawQuery, testCase.wantQuery)
++			}
++		})
++	}
++}
++
++func TestFilterValidationTable(t *testing.T) {
++	testCases := []struct {
++		name   string
++		filter vcenter.VMFilter
++	}{
++		{
++			name:   "blank value",
++			filter: vcenter.VMFilter{Names: []string{""}},
++		},
++		{
++			name:   "duplicate value",
++			filter: vcenter.VMFilter{Hosts: []string{"host-1", "host-1"}},
++		},
++		{
++			name:   "invalid power state",
++			filter: vcenter.VMFilter{PowerStates: []vcenter.PowerState{"PAUSED"}},
++		},
++	}
++
++	for _, testCase := range testCases {
++		t.Run(testCase.name, func(t *testing.T) {
++			scenario := unitScenario()
++			server, err := mockvcenter.New(scenario)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer server.Close()
++			client, err := vcenter.NewClient(
++				context.Background(),
++				server.URL(),
++				scenario.Username,
++				scenario.Password,
++				server.Client(),
++			)
++			if err != nil {
++				t.Fatal(err)
++			}
++			before := len(server.Requests())
++			if _, err := client.ListVMs(context.Background(), testCase.filter); err == nil {
++				t.Fatal("expected validation error")
++			}
++			if after := len(server.Requests()); after != before {
++				t.Errorf("request count changed from %d to %d", before, after)
++			}
++		})
++	}
++}
++
++func unitScenario() mockvcenter.Scenario {
++	return mockvcenter.Scenario{
++		Username: "unit-user",
++		Password: "unit-password",
++		Tokens:   []string{"unit-token-1", "unit-token-2"},
++		Datacenters: []mockvcenter.Datacenter{
++			{Datacenter: "datacenter-1", Name: "Primary"},
++		},
++		VMs: []mockvcenter.VM{
++			{VM: "vm-1", Name: "web", PowerState: "POWERED_ON"},
++		},
++	}
++}

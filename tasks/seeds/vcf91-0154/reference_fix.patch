@@ -1,0 +1,379 @@
+diff --git a/vksdiag/client.go b/vksdiag/client.go
+new file mode 100644
+index 0000000..421ce0d
+--- /dev/null
++++ b/vksdiag/client.go
+@@ -0,0 +1,373 @@
++package vksdiag
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"io"
++	"mime"
++	"net/http"
++	"net/url"
++	"regexp"
++	"strings"
++)
++
++const maxResponseBytes = 64 << 10
++
++var missingEnvironmentLine = regexp.MustCompile(
++	`(?m)^fatal: required environment variable ([A-Za-z_][A-Za-z0-9_]*) is not set\r?$`,
++)
++
++type Client struct {
++	vcenterURL            url.URL
++	kubernetesURL         url.URL
++	vcenterSessionID      string
++	kubernetesBearerToken string
++	httpClient            *http.Client
++}
++
++func NewClient(config Config) (*Client, error) {
++	vcenterURL, err := parseOrigin(config.VCenterURL)
++	if err != nil {
++		return nil, errors.New("invalid vCenter URL")
++	}
++	kubernetesURL, err := parseOrigin(config.KubernetesURL)
++	if err != nil {
++		return nil, errors.New("invalid Kubernetes URL")
++	}
++	if !validCredential(config.VCenterSessionID) {
++		return nil, errors.New("invalid vCenter session")
++	}
++	if !validCredential(config.KubernetesBearerToken) {
++		return nil, errors.New("invalid Kubernetes bearer token")
++	}
++
++	selected := config.HTTPClient
++	if selected == nil {
++		selected = http.DefaultClient
++	}
++	httpClient := *selected
++	httpClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
++		return http.ErrUseLastResponse
++	}
++
++	return &Client{
++		vcenterURL:            *vcenterURL,
++		kubernetesURL:         *kubernetesURL,
++		vcenterSessionID:      config.VCenterSessionID,
++		kubernetesBearerToken: config.KubernetesBearerToken,
++		httpClient:            &httpClient,
++	}, nil
++}
++
++func (client *Client) Diagnose(ctx context.Context, request DiagnoseRequest) (Diagnosis, error) {
++	if ctx == nil {
++		return Diagnosis{}, errors.New("nil context")
++	}
++	if strings.TrimSpace(request.Supervisor) == "" ||
++		strings.TrimSpace(request.Namespace) == "" ||
++		strings.TrimSpace(request.Pod) == "" {
++		return Diagnosis{}, errors.New("invalid diagnosis request")
++	}
++
++	if err := client.checkNamespace(ctx, request); err != nil {
++		return Diagnosis{}, err
++	}
++	eventName, err := client.readEvents(ctx, request)
++	if err != nil {
++		return Diagnosis{}, err
++	}
++	variable, err := client.readLog(ctx, request)
++	if err != nil {
++		return Diagnosis{}, err
++	}
++
++	if eventName != "" && variable != "" {
++		return Diagnosis{
++			Outcome:                    OutcomeConfirmed,
++			Cause:                      CauseMissingRequiredEnvironment,
++			MissingEnvironmentVariable: variable,
++			EventName:                  eventName,
++		}, nil
++	}
++	return Diagnosis{Outcome: OutcomeInconclusive}, nil
++}
++
++func (client *Client) checkNamespace(ctx context.Context, request DiagnoseRequest) error {
++	target := pathURL(
++		client.vcenterURL,
++		"/api/vcenter/namespaces/instances/v2/",
++		[]string{request.Namespace},
++		nil,
++	)
++	data, _, err := client.get(
++		ctx,
++		OperationGetSupervisorNamespace,
++		target,
++		client.vcenterSessionID,
++		false,
++	)
++	if err != nil {
++		return err
++	}
++
++	type namespaceStats struct {
++		CPUUsed     *int64 `json:"cpu_used"`
++		MemoryUsed  *int64 `json:"memory_used"`
++		StorageUsed *int64 `json:"storage_used"`
++	}
++	var response struct {
++		Supervisor   *string            `json:"supervisor"`
++		ConfigStatus *string            `json:"config_status"`
++		Description  *string            `json:"description"`
++		Messages     *[]json.RawMessage `json:"messages"`
++		Stats        *namespaceStats    `json:"stats"`
++		AccessList   *[]json.RawMessage `json:"access_list"`
++		StorageSpecs *[]json.RawMessage `json:"storage_specs"`
++	}
++	if err := json.Unmarshal(data, &response); err != nil ||
++		response.Supervisor == nil || *response.Supervisor == "" ||
++		response.ConfigStatus == nil ||
++		response.Description == nil ||
++		response.Messages == nil ||
++		response.Stats == nil ||
++		response.Stats.CPUUsed == nil ||
++		response.Stats.MemoryUsed == nil ||
++		response.Stats.StorageUsed == nil ||
++		response.AccessList == nil ||
++		response.StorageSpecs == nil {
++		return &ProtocolError{Operation: OperationGetSupervisorNamespace}
++	}
++	if *response.Supervisor != request.Supervisor {
++		return &ProtocolError{Operation: OperationGetSupervisorNamespace}
++	}
++
++	switch *response.ConfigStatus {
++	case "RUNNING":
++		return nil
++	case "CONFIGURING", "REMOVING", "ERROR":
++		return &NamespaceNotReadyError{
++			Operation: OperationGetSupervisorNamespace,
++			Status:    *response.ConfigStatus,
++		}
++	default:
++		return &ProtocolError{Operation: OperationGetSupervisorNamespace}
++	}
++}
++
++func (client *Client) readEvents(ctx context.Context, request DiagnoseRequest) (string, error) {
++	query := url.Values{}
++	query.Set(
++		"fieldSelector",
++		"involvedObject.kind=Pod,involvedObject.namespace="+request.Namespace+
++			",involvedObject.name="+request.Pod,
++	)
++	target := pathURL(
++		client.kubernetesURL,
++		"/api/v1/namespaces/",
++		[]string{request.Namespace, "events"},
++		query,
++	)
++	data, _, err := client.get(
++		ctx,
++		OperationListPodEvents,
++		target,
++		client.kubernetesBearerToken,
++		true,
++	)
++	if err != nil {
++		return "", err
++	}
++
++	type metadata struct {
++		Name      *string `json:"name"`
++		Namespace *string `json:"namespace"`
++	}
++	type objectReference struct {
++		Kind      *string `json:"kind"`
++		Namespace *string `json:"namespace"`
++		Name      *string `json:"name"`
++	}
++	type event struct {
++		APIVersion     *string          `json:"apiVersion"`
++		Kind           *string          `json:"kind"`
++		Metadata       *metadata        `json:"metadata"`
++		InvolvedObject *objectReference `json:"involvedObject"`
++		Type           string           `json:"type"`
++		Reason         string           `json:"reason"`
++		Message        string           `json:"message"`
++	}
++	var response struct {
++		APIVersion *string  `json:"apiVersion"`
++		Kind       *string  `json:"kind"`
++		Items      *[]event `json:"items"`
++	}
++	if err := json.Unmarshal(data, &response); err != nil ||
++		response.APIVersion == nil || *response.APIVersion != "v1" ||
++		response.Kind == nil || *response.Kind != "EventList" ||
++		response.Items == nil {
++		return "", &ProtocolError{Operation: OperationListPodEvents}
++	}
++
++	eventName := ""
++	for _, item := range *response.Items {
++		if item.APIVersion == nil || *item.APIVersion != "v1" ||
++			item.Kind == nil || *item.Kind != "Event" ||
++			item.Metadata == nil ||
++			item.Metadata.Name == nil || *item.Metadata.Name == "" ||
++			item.Metadata.Namespace == nil || *item.Metadata.Namespace != request.Namespace ||
++			item.InvolvedObject == nil ||
++			item.InvolvedObject.Kind == nil || *item.InvolvedObject.Kind == "" ||
++			item.InvolvedObject.Name == nil || *item.InvolvedObject.Name == "" {
++			return "", &ProtocolError{Operation: OperationListPodEvents}
++		}
++		if *item.InvolvedObject.Kind == "Pod" &&
++			item.InvolvedObject.Namespace != nil &&
++			*item.InvolvedObject.Namespace == request.Namespace &&
++			*item.InvolvedObject.Name == request.Pod &&
++			item.Type == "Warning" &&
++			item.Reason == "BackOff" &&
++			(eventName == "" || *item.Metadata.Name < eventName) {
++			eventName = *item.Metadata.Name
++		}
++	}
++	return eventName, nil
++}
++
++func (client *Client) readLog(ctx context.Context, request DiagnoseRequest) (string, error) {
++	query := url.Values{}
++	if request.Container != "" {
++		query.Set("container", request.Container)
++	}
++	if request.Previous != nil {
++		if *request.Previous {
++			query.Set("previous", "true")
++		} else {
++			query.Set("previous", "false")
++		}
++	}
++	target := pathURL(
++		client.kubernetesURL,
++		"/api/v1/namespaces/",
++		[]string{request.Namespace, "pods", request.Pod, "log"},
++		query,
++	)
++	data, contentType, err := client.get(
++		ctx,
++		OperationReadPodLog,
++		target,
++		client.kubernetesBearerToken,
++		true,
++	)
++	if err != nil {
++		return "", err
++	}
++	mediaType, _, err := mime.ParseMediaType(contentType)
++	if err != nil || mediaType != "text/plain" {
++		return "", &ProtocolError{Operation: OperationReadPodLog}
++	}
++
++	match := missingEnvironmentLine.FindSubmatch(data)
++	if len(match) != 2 {
++		return "", nil
++	}
++	return string(append([]byte(nil), match[1]...)), nil
++}
++
++func (client *Client) get(
++	ctx context.Context,
++	operation string,
++	target string,
++	credential string,
++	bearer bool,
++) ([]byte, string, error) {
++	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
++	if err != nil {
++		return nil, "", &ProtocolError{Operation: operation}
++	}
++	request.Header.Set("Accept", "application/json")
++	if bearer {
++		request.Header.Set("Authorization", "Bearer "+credential)
++	} else {
++		request.Header.Set("vmware-api-session-id", credential)
++	}
++
++	response, err := client.httpClient.Do(request)
++	if err != nil {
++		if ctx.Err() != nil {
++			return nil, "", ctx.Err()
++		}
++		return nil, "", &ProtocolError{Operation: operation}
++	}
++	defer response.Body.Close()
++
++	if response.StatusCode != http.StatusOK {
++		return nil, "", &APIError{
++			Operation:  operation,
++			StatusCode: response.StatusCode,
++		}
++	}
++	data, err := readBounded(response.Body)
++	if err != nil {
++		if ctx.Err() != nil {
++			return nil, "", ctx.Err()
++		}
++		return nil, "", &ProtocolError{Operation: operation}
++	}
++	return data, response.Header.Get("Content-Type"), nil
++}
++
++func readBounded(source io.Reader) ([]byte, error) {
++	data, err := io.ReadAll(io.LimitReader(source, maxResponseBytes+1))
++	if err != nil {
++		return nil, err
++	}
++	if len(data) > maxResponseBytes {
++		return nil, errors.New("response exceeds limit")
++	}
++	return data, nil
++}
++
++func pathURL(base url.URL, prefix string, segments []string, query url.Values) string {
++	decodedPath := prefix
++	escapedPath := prefix
++	for index, segment := range segments {
++		if index > 0 {
++			decodedPath += "/"
++			escapedPath += "/"
++		}
++		decodedPath += segment
++		escapedPath += url.PathEscape(segment)
++	}
++	base.Path = decodedPath
++	base.RawPath = escapedPath
++	if query != nil {
++		base.RawQuery = query.Encode()
++	} else {
++		base.RawQuery = ""
++	}
++	base.ForceQuery = false
++	return base.String()
++}
++
++func parseOrigin(raw string) (*url.URL, error) {
++	parsed, err := url.Parse(raw)
++	if err != nil ||
++		(parsed.Scheme != "http" && parsed.Scheme != "https") ||
++		parsed.Host == "" ||
++		parsed.User != nil ||
++		(parsed.Path != "" && parsed.Path != "/") ||
++		parsed.RawPath != "" ||
++		parsed.RawQuery != "" ||
++		parsed.ForceQuery ||
++		parsed.Fragment != "" {
++		return nil, errors.New("not an HTTP origin")
++	}
++	parsed.Path = ""
++	return parsed, nil
++}
++
++func validCredential(value string) bool {
++	return strings.TrimSpace(value) != "" &&
++		!strings.ContainsAny(value, "\r\n")
++}

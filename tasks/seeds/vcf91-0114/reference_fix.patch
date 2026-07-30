@@ -1,0 +1,332 @@
+diff --git a/client.go b/client.go
+--- a/client.go
++++ b/client.go
+@@ -3,20 +3,24 @@
+ package cpuguard
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
++	"strconv"
++	"strings"
+ )
+ 
+ const (
+ 	PowerGetOperation  = "Vcenter.Vm.Power_get"
+ 	CPUUpdateOperation = "Vcenter.Vm.Hardware.Cpu_update"
++	maxResponseBytes   = 1 << 20
+ )
+ 
+-// ErrNotImplemented is returned by the incomplete client scaffold.
+-var ErrNotImplemented = errors.New("guarded vCenter CPU update is not implemented")
+-
+ // Config configures one focused vCenter Automation API client.
+ type Config struct {
+ 	BaseURL      string
+@@ -95,19 +99,293 @@
+ }
+ 
+ // Client performs the two-operation guarded update.
+-type Client struct{}
++type Client struct {
++	baseURL      string
++	sessionToken string
++	httpClient   *http.Client
++}
+ 
+ // NewClient validates configuration without performing network I/O.
+-func NewClient(Config) (*Client, error) {
+-	return nil, ErrNotImplemented
++func NewClient(config Config) (*Client, error) {
++	parsed, err := url.Parse(config.BaseURL)
++	if err != nil {
++		return nil, invalid("BaseURL", "must be an HTTP(S) origin")
++	}
++	scheme := strings.ToLower(parsed.Scheme)
++	if (scheme != "http" && scheme != "https") ||
++		parsed.Host == "" ||
++		parsed.Hostname() == "" ||
++		parsed.User != nil ||
++		parsed.Opaque != "" ||
++		(parsed.Path != "" && parsed.Path != "/") ||
++		(parsed.EscapedPath() != "" && parsed.EscapedPath() != "/") ||
++		parsed.RawQuery != "" ||
++		parsed.ForceQuery ||
++		parsed.Fragment != "" {
++		return nil, invalid("BaseURL", "must be an HTTP(S) origin")
++	}
++	origin := scheme + "://" + parsed.Host
++	if _, err := http.NewRequest(http.MethodGet, origin, nil); err != nil {
++		return nil, invalid("BaseURL", "must be an HTTP(S) origin")
++	}
++	if !headerSafe(config.SessionToken) {
++		return nil, invalid("SessionToken", "must be nonblank and safe for an HTTP header")
++	}
++	selected := config.HTTPClient
++	if selected == nil {
++		selected = http.DefaultClient
++	}
++	httpClient := *selected
++	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
++		return http.ErrUseLastResponse
++	}
++	return &Client{
++		baseURL:      origin,
++		sessionToken: config.SessionToken,
++		httpClient:   &httpClient,
++	}, nil
++}
++
++func invalid(field, reason string) error {
++	return &ValidationError{Field: field, Reason: reason}
++}
++
++func headerSafe(value string) bool {
++	if value == "" || strings.TrimSpace(value) == "" || strings.TrimSpace(value) != value {
++		return false
++	}
++	for _, character := range value {
++		if character < 0x20 || character == 0x7f {
++			return false
++		}
++	}
++	return true
+ }
+ 
+ // SetCPUCountIfPoweredOff reads power state and updates count only when the
+ // observed state is exactly POWERED_OFF.
+ func (c *Client) SetCPUCountIfPoweredOff(
+-	context.Context,
+-	string,
+-	int64,
++	ctx context.Context,
++	vm string,
++	cpuCount int64,
+ ) (CPUUpdateResult, error) {
+-	return CPUUpdateResult{}, ErrNotImplemented
++	if ctx == nil {
++		return CPUUpdateResult{}, invalid("context", "must not be nil")
++	}
++	if strings.TrimSpace(vm) == "" {
++		return CPUUpdateResult{}, invalid("vm", "must be nonblank")
++	}
++	if cpuCount <= 0 {
++		return CPUUpdateResult{}, invalid("cpuCount", "must be positive")
++	}
++	if err := ctx.Err(); err != nil {
++		return CPUUpdateResult{}, err
++	}
++
++	escapedVM := url.PathEscape(vm)
++	powerPath := "/api/vcenter/vm/" + escapedVM + "/power"
++	powerBody, err := c.request(
++		ctx,
++		PowerGetOperation,
++		http.MethodGet,
++		powerPath,
++		nil,
++		http.StatusOK,
++	)
++	if err != nil {
++		return CPUUpdateResult{}, err
++	}
++	state, err := decodePowerInfo(powerBody)
++	if err != nil {
++		return CPUUpdateResult{}, &ProtocolError{
++			OperationID: PowerGetOperation,
++			Reason:      "malformed power information",
++		}
++	}
++	if state != "POWERED_OFF" {
++		return CPUUpdateResult{}, &PrecheckError{
++			VM:            vm,
++			ObservedState: state,
++		}
++	}
++
++	updateBody := []byte(`{"count":` + strconv.FormatInt(cpuCount, 10) + `}`)
++	updatePath := "/api/vcenter/vm/" + escapedVM + "/hardware/cpu"
++	responseBody, err := c.request(
++		ctx,
++		CPUUpdateOperation,
++		http.MethodPatch,
++		updatePath,
++		updateBody,
++		http.StatusNoContent,
++	)
++	if err != nil {
++		return CPUUpdateResult{}, err
++	}
++	if len(responseBody) != 0 {
++		return CPUUpdateResult{}, &ProtocolError{
++			OperationID: CPUUpdateOperation,
++			Reason:      "HTTP 204 response must be empty",
++		}
++	}
++	return CPUUpdateResult{
++		VM:                    vm,
++		PreviousPowerState:    state,
++		CPUCount:              cpuCount,
++		CompletedOperationIDs: []string{PowerGetOperation, CPUUpdateOperation},
++	}, nil
++}
++
++func (c *Client) request(
++	ctx context.Context,
++	operationID string,
++	method string,
++	path string,
++	body []byte,
++	successStatus int,
++) ([]byte, error) {
++	var reader io.Reader
++	if body != nil {
++		reader = bytes.NewReader(body)
++	}
++	request, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
++	if err != nil {
++		return nil, &TransportError{OperationID: operationID}
++	}
++	request.Header["Accept"] = []string{"application/json"}
++	request.Header["Vmware-Api-Session-Id"] = []string{c.sessionToken}
++	if body != nil {
++		request.Header["Content-Type"] = []string{"application/json"}
++	}
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		if response != nil && response.Body != nil {
++			_ = response.Body.Close()
++		}
++		return nil, transportFailure(operationID, ctx)
++	}
++	responseBody, readErr := readResponse(response)
++	if readErr != nil {
++		return nil, transportFailure(operationID, ctx)
++	}
++	if len(responseBody) > maxResponseBytes {
++		return nil, &ProtocolError{
++			OperationID: operationID,
++			Reason:      "response exceeded size limit",
++		}
++	}
++	if response.StatusCode != successStatus {
++		return nil, decodeAPIError(operationID, response.StatusCode, responseBody)
++	}
++	return responseBody, nil
++}
++
++func transportFailure(operationID string, ctx context.Context) error {
++	var cause error
++	if ctx != nil {
++		cause = ctx.Err()
++	}
++	return &TransportError{OperationID: operationID, cause: cause}
++}
++
++func readResponse(response *http.Response) ([]byte, error) {
++	defer response.Body.Close()
++	return io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
++}
++
++func decodePowerInfo(body []byte) (string, error) {
++	object, err := decodeObject(body)
++	if err != nil {
++		return "", err
++	}
++	stateJSON, ok := object["state"]
++	if !ok {
++		return "", errors.New("state is missing")
++	}
++	var state string
++	if err := json.Unmarshal(stateJSON, &state); err != nil {
++		return "", errors.New("state is not a string")
++	}
++	switch state {
++	case "POWERED_OFF", "POWERED_ON", "SUSPENDED":
++	default:
++		return "", errors.New("state is outside the contract enum")
++	}
++	if cleanJSON, ok := object["clean_power_off"]; ok {
++		var clean bool
++		if bytes.Equal(bytes.TrimSpace(cleanJSON), []byte("null")) ||
++			json.Unmarshal(cleanJSON, &clean) != nil {
++			return "", errors.New("clean_power_off is not a boolean")
++		}
++	}
++	return state, nil
++}
++
++func decodeAPIError(operationID string, statusCode int, body []byte) error {
++	object, err := decodeObject(body)
++	if err != nil {
++		return malformedError(operationID)
++	}
++	errorTypeJSON, ok := object["error_type"]
++	if !ok {
++		return malformedError(operationID)
++	}
++	var errorType string
++	if json.Unmarshal(errorTypeJSON, &errorType) != nil || strings.TrimSpace(errorType) == "" {
++		return malformedError(operationID)
++	}
++	messagesJSON, ok := object["messages"]
++	if !ok {
++		return malformedError(operationID)
++	}
++	var rawMessages []json.RawMessage
++	if json.Unmarshal(messagesJSON, &rawMessages) != nil || len(rawMessages) == 0 {
++		return malformedError(operationID)
++	}
++	messages := make([]LocalizableMessage, 0, len(rawMessages))
++	for _, rawMessage := range rawMessages {
++		messageObject, err := decodeObject(rawMessage)
++		if err != nil {
++			return malformedError(operationID)
++		}
++		idJSON, hasID := messageObject["id"]
++		defaultJSON, hasDefault := messageObject["default_message"]
++		if !hasID || !hasDefault ||
++			bytes.Equal(bytes.TrimSpace(idJSON), []byte("null")) ||
++			bytes.Equal(bytes.TrimSpace(defaultJSON), []byte("null")) {
++			return malformedError(operationID)
++		}
++		var message LocalizableMessage
++		if json.Unmarshal(idJSON, &message.ID) != nil ||
++			json.Unmarshal(defaultJSON, &message.DefaultMessage) != nil {
++			return malformedError(operationID)
++		}
++		messages = append(messages, message)
++	}
++	return &APIError{
++		OperationID: operationID,
++		StatusCode:  statusCode,
++		ErrorType:   errorType,
++		Messages:    messages,
++	}
++}
++
++func malformedError(operationID string) error {
++	return &ProtocolError{
++		OperationID: operationID,
++		Reason:      "malformed vAPI error response",
++	}
++}
++
++func decodeObject(body []byte) (map[string]json.RawMessage, error) {
++	decoder := json.NewDecoder(bytes.NewReader(body))
++	var object map[string]json.RawMessage
++	if err := decoder.Decode(&object); err != nil || object == nil {
++		return nil, errors.New("response is not a JSON object")
++	}
++	var trailing any
++	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
++		return nil, errors.New("response contains trailing data")
++	}
++	return object, nil
+ }

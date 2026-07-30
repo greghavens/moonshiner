@@ -1,0 +1,221 @@
+diff --git a/client.go b/client.go
+--- a/client.go
++++ b/client.go
+@@ -1,13 +1,214 @@
+ package vkschange
+ 
+ import (
++	"bytes"
+ 	"context"
+-	"errors"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
+ )
+ 
++const maxResponseBytes = 64 << 10
++
+ // Apply performs the ordered change documented in README.md and
+ // docs/contract.json.
+ func (c *Client) Apply(ctx context.Context, change Change) (Report, error) {
+-	// TODO: implement the contract.
+-	return newReport(), errors.New("not implemented")
++	report := newReport()
++	if err := c.validate(ctx, change); err != nil {
++		return report, err
++	}
++
++	namespacePath := "/vcenter/namespaces/instances/" + url.PathEscape(change.Namespace)
++	status, response, err := c.request(
++		ctx,
++		http.MethodGet,
++		joinURL(c.VCenterURL, namespacePath),
++		nil,
++		"application/json",
++		"",
++		c.SessionID,
++		"",
++	)
++	if err != nil {
++		return fail(report, 0, status, err)
++	}
++	var namespaceInfo struct {
++		Description string `json:"description"`
++	}
++	if err := json.Unmarshal(response, &namespaceInfo); err != nil {
++		return fail(report, 0, status, fmt.Errorf("decode namespace response: %w", err))
++	}
++	report.PreviousDescription = namespaceInfo.Description
++	succeed(&report.Steps[0], status)
++
++	namespaceBody, err := json.Marshal(struct {
++		Description            *string   `json:"description,omitempty"`
++		InfrastructurePolicies *[]string `json:"infrastructure_policies,omitempty"`
++	}{
++		Description:            change.NamespacePatch.Description,
++		InfrastructurePolicies: change.NamespacePatch.InfrastructurePolicies,
++	})
++	if err != nil {
++		return fail(report, 1, 0, fmt.Errorf("encode namespace update: %w", err))
++	}
++	status, _, err = c.request(
++		ctx,
++		http.MethodPatch,
++		joinURL(c.VCenterURL, namespacePath),
++		namespaceBody,
++		"application/json",
++		"application/json",
++		c.SessionID,
++		"",
++	)
++	if err != nil {
++		return fail(report, 1, status, err)
++	}
++	succeed(&report.Steps[1], status)
++
++	var clusterPatch struct {
++		Spec struct {
++			Topology struct {
++				Version string `json:"version"`
++			} `json:"topology"`
++		} `json:"spec"`
++	}
++	clusterPatch.Spec.Topology.Version = change.KubernetesVersion
++	clusterBody, err := json.Marshal(clusterPatch)
++	if err != nil {
++		return fail(report, 2, 0, fmt.Errorf("encode VKS cluster patch: %w", err))
++	}
++
++	clusterPath := "/apis/cluster.x-k8s.io/v1beta1/namespaces/" +
++		url.PathEscape(change.Namespace) + "/clusters/" + url.PathEscape(change.Cluster)
++	status, _, err = c.request(
++		ctx,
++		http.MethodPatch,
++		joinURL(c.KubernetesURL, clusterPath),
++		clusterBody,
++		"application/json",
++		"application/merge-patch+json",
++		"",
++		"Bearer "+c.BearerToken,
++	)
++	if err != nil {
++		return fail(report, 2, status, err)
++	}
++	succeed(&report.Steps[2], status)
++	return report, nil
++}
++
++func (c *Client) validate(ctx context.Context, change Change) error {
++	switch {
++	case ctx == nil:
++		return fmt.Errorf("context is required")
++	case c == nil:
++		return fmt.Errorf("client is required")
++	case strings.TrimSpace(c.VCenterURL) == "":
++		return fmt.Errorf("vCenter URL is required")
++	case strings.TrimSpace(c.KubernetesURL) == "":
++		return fmt.Errorf("Kubernetes URL is required")
++	case c.SessionID == "":
++		return fmt.Errorf("vCenter session ID is required")
++	case c.BearerToken == "":
++		return fmt.Errorf("Kubernetes bearer token is required")
++	case c.HTTPClient == nil:
++		return fmt.Errorf("HTTP client is required")
++	case strings.TrimSpace(change.Namespace) == "":
++		return fmt.Errorf("namespace is required")
++	case strings.TrimSpace(change.Cluster) == "":
++		return fmt.Errorf("cluster is required")
++	case change.NamespacePatch.Description == nil &&
++		change.NamespacePatch.InfrastructurePolicies == nil:
++		return fmt.Errorf("namespace patch must set at least one field")
++	case strings.TrimSpace(change.KubernetesVersion) == "":
++		return fmt.Errorf("Kubernetes version is required")
++	}
++	if err := validateBaseURL("vCenter", c.VCenterURL); err != nil {
++		return err
++	}
++	return validateBaseURL("Kubernetes", c.KubernetesURL)
++}
++
++func validateBaseURL(name, raw string) error {
++	parsed, err := url.Parse(raw)
++	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
++		return fmt.Errorf("%s URL must be an absolute URL", name)
++	}
++	if parsed.Scheme != "http" && parsed.Scheme != "https" {
++		return fmt.Errorf("%s URL must use http or https", name)
++	}
++	if parsed.RawQuery != "" || parsed.Fragment != "" {
++		return fmt.Errorf("%s URL must not contain a query or fragment", name)
++	}
++	return nil
++}
++
++func (c *Client) request(
++	ctx context.Context,
++	method string,
++	endpoint string,
++	body []byte,
++	accept string,
++	contentType string,
++	sessionID string,
++	authorization string,
++) (int, []byte, error) {
++	req, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(body))
++	if err != nil {
++		return 0, nil, fmt.Errorf("build request: %w", err)
++	}
++	req.Header.Set("Accept", accept)
++	if contentType != "" {
++		req.Header.Set("Content-Type", contentType)
++	}
++	if sessionID != "" {
++		req.Header.Set("vmware-api-session-id", sessionID)
++	}
++	if authorization != "" {
++		req.Header.Set("Authorization", authorization)
++	}
++
++	response, err := c.HTTPClient.Do(req)
++	if err != nil {
++		return 0, nil, fmt.Errorf("send request: %w", err)
++	}
++	defer response.Body.Close()
++
++	responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
++	if readErr != nil {
++		return response.StatusCode, nil, fmt.Errorf("read response: %w", readErr)
++	}
++	if len(responseBody) > maxResponseBytes {
++		return response.StatusCode, nil, fmt.Errorf("response body exceeds %d bytes", maxResponseBytes)
++	}
++	if response.StatusCode < 200 || response.StatusCode >= 300 {
++		summary := strings.TrimSpace(string(responseBody))
++		summary = strings.ReplaceAll(summary, c.SessionID, "[REDACTED]")
++		summary = strings.ReplaceAll(summary, c.BearerToken, "[REDACTED]")
++		if summary == "" {
++			return response.StatusCode, nil, fmt.Errorf("HTTP %d", response.StatusCode)
++		}
++		return response.StatusCode, nil, fmt.Errorf("HTTP %d: %s", response.StatusCode, summary)
++	}
++	return response.StatusCode, responseBody, nil
++}
++
++func joinURL(base, path string) string {
++	return strings.TrimRight(base, "/") + path
++}
++
++func succeed(step *StepResult, status int) {
++	step.State = StepSucceeded
++	step.HTTPStatus = status
++}
++
++func fail(report Report, index, status int, err error) (Report, error) {
++	report.Steps[index].State = StepFailed
++	report.Steps[index].HTTPStatus = status
++	report.Steps[index].Error = err.Error()
++	return report, fmt.Errorf("%s: %w", report.Steps[index].Operation, err)
+ }

@@ -1,0 +1,452 @@
+diff --git a/vcf_vks_rotation/client.py b/vcf_vks_rotation/client.py
+--- a/vcf_vks_rotation/client.py
++++ b/vcf_vks_rotation/client.py
+@@ -1,15 +1,186 @@
+-"""Implement the VCF 9.1 Supervisor/VKS session rotation here."""
++"""Standard-library VCF 9.1 Supervisor and VKS session rotation."""
+ 
+ from __future__ import annotations
+ 
++import base64
++import http.client
++import ipaddress
++import json
++import math
++import re
++import threading
++from dataclasses import dataclass
++from numbers import Real
++from typing import Any
++from urllib.parse import quote, urlsplit
++
++
++CREATE_SESSION = "Cis.Session_create"
++LIST_NAMESPACES = "Vcenter.Namespaces.User.Instances_list"
++DELETE_SESSION = "Cis.Session_delete"
++GET_CLUSTER = "cluster.x-k8s.io/v1beta2:namespaced-clusters:get"
++
+ 
+ class ApiError(RuntimeError):
+     """An HTTP or transport operation failed."""
+ 
++    def __init__(
++        self,
++        operation_id: str,
++        status_code: int | None,
++    ) -> None:
++        self.operation_id = operation_id
++        self.status_code = status_code
++        suffix = (
++            ""
++            if status_code is None
++            else f" with HTTP status {status_code}"
++        )
++        super().__init__(f"{operation_id} failed{suffix}")
++
+ 
+ class ProtocolError(RuntimeError):
+     """A successful response violated its operation contract."""
+ 
++    def __init__(self, operation_id: str) -> None:
++        self.operation_id = operation_id
++        super().__init__(f"{operation_id} returned an invalid response")
++
++
++@dataclass(frozen=True)
++class _Origin:
++    scheme: str
++    host: str
++    port: int | None
++
++
++@dataclass
++class _SessionState:
++    token: str
++    generation: int
++    active: int = 0
++
++
++def _required_string(value: object, name: str) -> str:
++    if not isinstance(value, str) or not value.strip():
++        raise ValueError(f"{name} must be a nonblank string")
++    return value
++
++
++def _header_value(value: object, name: str) -> str:
++    result = _required_string(value, name)
++    if "\r" in result or "\n" in result:
++        raise ValueError(f"{name} contains a header-unsafe character")
++    return result
++
++
++def _origin(value: object, name: str) -> _Origin:
++    text = _required_string(value, name)
++    if any(character.isspace() for character in text):
++        raise ValueError(f"{name} contains whitespace")
++    try:
++        parsed = urlsplit(text)
++    except ValueError:
++        raise ValueError(f"{name} must be an HTTP(S) origin") from None
++    if parsed.scheme not in {"http", "https"}:
++        raise ValueError(f"{name} must use http or https")
++    if (
++        not parsed.hostname
++        or parsed.username is not None
++        or parsed.password is not None
++        or parsed.path not in {"", "/"}
++        or "?" in text
++        or "#" in text
++        or parsed.netloc.endswith(":")
++    ):
++        raise ValueError(f"{name} must be an HTTP(S) origin")
++    try:
++        port = parsed.port
++    except ValueError:
++        raise ValueError(f"{name} contains an invalid port") from None
++    if port is not None and port == 0:
++        raise ValueError(f"{name} contains an invalid port")
++    return _Origin(parsed.scheme, parsed.hostname, port)
++
++
++def _authority(value: object, scheme: str) -> _Origin:
++    text = _required_string(value, "master_host")
++    if (
++        any(character.isspace() for character in text)
++        or any(character in text for character in "/?#\\")
++        or "@" in text
++    ):
++        raise ProtocolError(LIST_NAMESPACES)
++    try:
++        parsed = urlsplit("//" + text)
++    except ValueError:
++        raise ProtocolError(LIST_NAMESPACES) from None
++    if (
++        not parsed.hostname
++        or parsed.username is not None
++        or parsed.password is not None
++        or parsed.path
++        or parsed.query
++        or parsed.fragment
++        or text.endswith(":")
++    ):
++        raise ProtocolError(LIST_NAMESPACES)
++    try:
++        port = parsed.port
++    except ValueError:
++        raise ProtocolError(LIST_NAMESPACES) from None
++    if port is not None and port == 0:
++        raise ProtocolError(LIST_NAMESPACES)
++
++    host = parsed.hostname
++    try:
++        if ":" in host:
++            if not text.startswith("["):
++                raise ValueError
++            ipaddress.IPv6Address(host)
++        elif re.fullmatch(r"[0-9.]+", host):
++            ipaddress.IPv4Address(host)
++        else:
++            ascii_host = host.rstrip(".").encode("idna").decode("ascii")
++            if not ascii_host or len(ascii_host) > 253:
++                raise ValueError
++            for label in ascii_host.split("."):
++                if (
++                    not label
++                    or len(label) > 63
++                    or re.fullmatch(
++                        r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?",
++                        label,
++                    )
++                    is None
++                ):
++                    raise ValueError
++    except (UnicodeError, ValueError):
++        raise ProtocolError(LIST_NAMESPACES) from None
++    return _Origin(scheme, host, port)
++
++
++def _timeout(value: object) -> float:
++    if (
++        isinstance(value, bool)
++        or not isinstance(value, Real)
++        or not math.isfinite(float(value))
++        or float(value) <= 0
++    ):
++        raise ValueError("timeout must be a finite positive real number")
++    return float(value)
++
++
++def _segment(value: str) -> str:
++    return quote(value, safe="", encoding="utf-8", errors="strict")
++
++
++def _json_value(body: bytes, operation: str) -> Any:
++    try:
++        return json.loads(body.decode("utf-8"))
++    except (UnicodeDecodeError, json.JSONDecodeError):
++        raise ProtocolError(operation) from None
++
+ 
+ class RotatingVksClient:
+     """Read VKS Clusters while safely rotating the vCenter session."""
+@@ -23,12 +194,172 @@
+         kubernetes_scheme: str = "https",
+         timeout: float = 10.0,
+     ) -> None:
+-        raise NotImplementedError("complete RotatingVksClient")
++        self._vcenter = _origin(vcenter_url, "vcenter_url")
++        session = _header_value(
++            vcenter_session_id,
++            "vcenter_session_id",
++        )
++        self._kubernetes_token = _header_value(
++            kubernetes_token,
++            "kubernetes_token",
++        )
++        if kubernetes_scheme not in {"http", "https"}:
++            raise ValueError("kubernetes_scheme must be http or https")
++        self._kubernetes_scheme = kubernetes_scheme
++        self._timeout = _timeout(timeout)
++        self._condition = threading.Condition()
++        self._rotation_lock = threading.Lock()
++        self._current = _SessionState(session, 0)
+ 
+     @property
+     def session_generation(self) -> int:
+         """Return the currently published session generation."""
+-        raise NotImplementedError("complete session_generation")
++        with self._condition:
++            return self._current.generation
++
++    def _request(
++        self,
++        origin: _Origin,
++        operation: str,
++        method: str,
++        target: str,
++        authentication: tuple[str, str],
++        *,
++        zero_content_length: bool = False,
++    ) -> tuple[int, bytes]:
++        connection_type: type[
++            http.client.HTTPConnection
++        ] = (
++            http.client.HTTPSConnection
++            if origin.scheme == "https"
++            else http.client.HTTPConnection
++        )
++        connection = connection_type(
++            origin.host,
++            origin.port,
++            timeout=self._timeout,
++        )
++        try:
++            connection.putrequest(
++                method,
++                target,
++                skip_accept_encoding=True,
++            )
++            connection.putheader("Accept", "application/json")
++            connection.putheader(
++                authentication[0],
++                authentication[1],
++            )
++            if zero_content_length:
++                connection.putheader("Content-Length", "0")
++            connection.endheaders()
++            response = connection.getresponse()
++            response_body = response.read()
++            return response.status, response_body
++        except (
++            OSError,
++            TimeoutError,
++            http.client.HTTPException,
++        ):
++            raise ApiError(operation, None) from None
++        finally:
++            connection.close()
++
++    def _acquire_session(self) -> _SessionState:
++        with self._condition:
++            session = self._current
++            session.active += 1
++            return session
++
++    def _release_session(self, session: _SessionState) -> None:
++        with self._condition:
++            session.active -= 1
++            self._condition.notify_all()
++
++    def _list_namespace(
++        self,
++        session: _SessionState,
++        namespace: str,
++    ) -> _Origin:
++        status, body = self._request(
++            self._vcenter,
++            LIST_NAMESPACES,
++            "GET",
++            "/api/vcenter/namespaces-user/namespaces",
++            ("vmware-api-session-id", session.token),
++        )
++        if status != 200:
++            raise ApiError(LIST_NAMESPACES, status)
++        value = _json_value(body, LIST_NAMESPACES)
++        if not isinstance(value, list):
++            raise ProtocolError(LIST_NAMESPACES)
++
++        seen: set[str] = set()
++        selected: str | None = None
++        for item in value:
++            if not isinstance(item, dict):
++                raise ProtocolError(LIST_NAMESPACES)
++            actual_namespace = item.get("namespace")
++            master_host = item.get("master_host")
++            if (
++                not isinstance(actual_namespace, str)
++                or not actual_namespace.strip()
++                or not isinstance(master_host, str)
++                or not master_host.strip()
++                or actual_namespace in seen
++            ):
++                raise ProtocolError(LIST_NAMESPACES)
++            seen.add(actual_namespace)
++            if actual_namespace == namespace:
++                selected = master_host
++        if selected is None:
++            raise ProtocolError(LIST_NAMESPACES)
++        return _authority(selected, self._kubernetes_scheme)
++
++    def _get_cluster(
++        self,
++        origin: _Origin,
++        namespace: str,
++        cluster_name: str,
++    ) -> str:
++        target = (
++            "/apis/cluster.x-k8s.io/v1beta2/namespaces/"
++            f"{_segment(namespace)}/clusters/{_segment(cluster_name)}"
++        )
++        status, body = self._request(
++            origin,
++            GET_CLUSTER,
++            "GET",
++            target,
++            (
++                "Authorization",
++                f"Bearer {self._kubernetes_token}",
++            ),
++        )
++        if status != 200:
++            raise ApiError(GET_CLUSTER, status)
++        value = _json_value(body, GET_CLUSTER)
++        if not isinstance(value, dict):
++            raise ProtocolError(GET_CLUSTER)
++        metadata = value.get("metadata")
++        spec = value.get("spec")
++        topology = spec.get("topology") if isinstance(spec, dict) else None
++        version = (
++            topology.get("version")
++            if isinstance(topology, dict)
++            else None
++        )
++        if (
++            value.get("apiVersion") != "cluster.x-k8s.io/v1beta2"
++            or value.get("kind") != "Cluster"
++            or not isinstance(metadata, dict)
++            or metadata.get("namespace") != namespace
++            or metadata.get("name") != cluster_name
++            or not isinstance(version, str)
++            or not version.strip()
++        ):
++            raise ProtocolError(GET_CLUSTER)
++        return version
+ 
+     def get_cluster(
+         self,
+@@ -36,7 +367,26 @@
+         cluster_name: str,
+     ) -> dict[str, object]:
+         """Return one validated VKS Cluster summary."""
+-        raise NotImplementedError("complete get_cluster")
++        namespace = _required_string(namespace, "namespace")
++        cluster_name = _required_string(cluster_name, "cluster_name")
++        session = self._acquire_session()
++        try:
++            kubernetes = self._list_namespace(session, namespace)
++            topology_version = self._get_cluster(
++                kubernetes,
++                namespace,
++                cluster_name,
++            )
++            return {
++                "operationId": LIST_NAMESPACES,
++                "operationKey": GET_CLUSTER,
++                "namespace": namespace,
++                "name": cluster_name,
++                "sessionGeneration": session.generation,
++                "topologyVersion": topology_version,
++            }
++        finally:
++            self._release_session(session)
+ 
+     def rotate_vcenter_session(
+         self,
+@@ -44,4 +394,56 @@
+         password: str,
+     ) -> int:
+         """Publish a new session, drain the old generation, then delete it."""
+-        raise NotImplementedError("complete rotate_vcenter_session")
++        username = _header_value(username, "username")
++        password = _header_value(password, "password")
++        if ":" in username:
++            raise ValueError("username must not contain ':'")
++        encoded_credentials = base64.b64encode(
++            f"{username}:{password}".encode("utf-8")
++        ).decode("ascii")
++
++        with self._rotation_lock:
++            with self._condition:
++                replaced = self._current
++            status, body = self._request(
++                self._vcenter,
++                CREATE_SESSION,
++                "POST",
++                "/api/session",
++                ("Authorization", f"Basic {encoded_credentials}"),
++                zero_content_length=True,
++            )
++            if status != 201:
++                raise ApiError(CREATE_SESSION, status)
++            new_token = _json_value(body, CREATE_SESSION)
++            if (
++                not isinstance(new_token, str)
++                or not new_token.strip()
++                or "\r" in new_token
++                or "\n" in new_token
++                or new_token == replaced.token
++            ):
++                raise ProtocolError(CREATE_SESSION)
++
++            with self._condition:
++                if self._current is not replaced:
++                    raise RuntimeError("session rotation state changed")
++                new_generation = replaced.generation + 1
++                self._current = _SessionState(
++                    new_token,
++                    new_generation,
++                )
++                self._condition.notify_all()
++                while replaced.active:
++                    self._condition.wait()
++
++            status, _ = self._request(
++                self._vcenter,
++                DELETE_SESSION,
++                "DELETE",
++                "/api/session",
++                ("vmware-api-session-id", replaced.token),
++            )
++            if status != 204:
++                raise ApiError(DELETE_SESSION, status)
++            return new_generation

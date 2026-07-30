@@ -1,0 +1,560 @@
+diff --git a/vcf_vks/client.py b/vcf_vks/client.py
+index 6be94f8..b1e85c1 100644
+--- a/vcf_vks/client.py
++++ b/vcf_vks/client.py
+@@ -1,23 +1,73 @@
+-"""Implement the focused VCF 9.1 Supervisor-to-VKS workflow here."""
++"""Dependency-free VCF 9.1 Supervisor namespace to VKS workflow."""
+ 
+ from __future__ import annotations
+ 
++import json
++import time
++from collections.abc import Mapping
++from typing import Any
++from urllib.error import HTTPError, URLError
++from urllib.parse import quote
++from urllib.request import Request, urlopen
++
+ 
+ class ApiError(RuntimeError):
+     """Transport, HTTP, or response-contract failure."""
+ 
++    def __init__(
++        self,
++        message: str,
++        *,
++        method: str | None = None,
++        url: str | None = None,
++        status: int | None = None,
++        body: object = None,
++    ) -> None:
++        super().__init__(message)
++        self.method = method
++        self.url = url
++        self.status = status
++        self.body = body
++
+ 
+ class NamespaceFailedError(RuntimeError):
+     """The Supervisor namespace reached an unsuccessful terminal state."""
+ 
++    def __init__(self, namespace_info: dict[str, Any]) -> None:
++        self.namespace_info = namespace_info
++        status = namespace_info.get("config_status", "unknown")
++        super().__init__(f"Supervisor namespace ended with status {status}")
++
+ 
+ class ClusterFailedError(RuntimeError):
+     """The VKS Cluster resource reached an unsuccessful terminal state."""
+ 
++    def __init__(self, cluster: dict[str, Any]) -> None:
++        self.cluster = cluster
++        metadata = cluster.get("metadata")
++        name = metadata.get("name", "unknown") if isinstance(metadata, dict) else "unknown"
++        super().__init__(f"VKS Cluster {name} failed to provision")
++
+ 
+ class ProvisionTimeoutError(TimeoutError):
+     """The shared namespace/cluster polling deadline expired."""
+ 
++    def __init__(
++        self,
++        stage: str,
++        timeout: float,
++        last_response: dict[str, Any] | None,
++    ) -> None:
++        self.stage = stage
++        self.timeout = timeout
++        self.last_response = last_response
++        super().__init__(
++            f"VKS provisioning timed out in {stage} stage after {timeout} seconds"
++        )
++
++
++_NO_BODY = object()
++
+ 
+ class VksProvisioner:
+     """Provision a namespace and then a VKS cluster."""
+@@ -30,8 +80,476 @@ class VksProvisioner:
+         bearer_token: str,
+         timeout: float = 10.0,
+     ) -> None:
+-        raise NotImplementedError("complete VksProvisioner")
++        self.vcenter_url = self._service_root(vcenter_url, "vcenter_url")
++        self.supervisor_url = self._service_root(
++            supervisor_url, "supervisor_url"
++        )
++        self.session_id = self._string(session_id, "session_id")
++        self.bearer_token = self._string(bearer_token, "bearer_token")
++        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
++            raise TypeError("timeout must be a number")
++        if timeout <= 0:
++            raise ValueError("timeout must be positive")
++        self.timeout = float(timeout)
++
++    @staticmethod
++    def _string(value: object, name: str) -> str:
++        if not isinstance(value, str):
++            raise TypeError(f"{name} must be a string")
++        if not value.strip():
++            raise ValueError(f"{name} must not be blank")
++        return value
++
++    @classmethod
++    def _service_root(cls, value: object, name: str) -> str:
++        return cls._string(value, name).rstrip("/")
++
++    @staticmethod
++    def _decode(raw: bytes) -> object:
++        if not raw:
++            return None
++        try:
++            text = raw.decode("utf-8")
++        except UnicodeDecodeError:
++            return raw.decode("utf-8", errors="replace")
++        try:
++            return json.loads(text)
++        except json.JSONDecodeError:
++            return text
++
++    def _request(
++        self,
++        service: str,
++        method: str,
++        path: str,
++        expected_status: int,
++        *,
++        body: object = _NO_BODY,
++        request_timeout: float | None = None,
++        expect_object: bool = False,
++    ) -> dict[str, Any] | None:
++        if service == "vcenter":
++            root = self.vcenter_url
++            headers = {
++                "Accept": "application/json",
++                "vmware-api-session-id": self.session_id,
++            }
++        elif service == "supervisor":
++            root = self.supervisor_url
++            headers = {
++                "Accept": "application/json",
++                "Authorization": f"Bearer {self.bearer_token}",
++            }
++        else:
++            raise ValueError(f"unknown service {service!r}")
++
++        url = root + "/" + path.lstrip("/")
++        encoded = None
++        if body is not _NO_BODY:
++            headers["Content-Type"] = "application/json"
++            try:
++                encoded = json.dumps(
++                    body,
++                    ensure_ascii=False,
++                    separators=(",", ":"),
++                ).encode("utf-8")
++            except (TypeError, ValueError) as error:
++                raise ApiError(
++                    f"{method} {url} body is not JSON serializable: {error}",
++                    method=method,
++                    url=url,
++                    body=body,
++                ) from error
++
++        request = Request(url, data=encoded, headers=headers, method=method)
++        effective_timeout = (
++            self.timeout
++            if request_timeout is None
++            else min(self.timeout, request_timeout)
++        )
++        try:
++            with urlopen(request, timeout=effective_timeout) as response:
++                status = response.status
++                raw = response.read()
++        except HTTPError as error:
++            raw = error.read()
++            decoded = self._decode(raw)
++            raise ApiError(
++                f"{method} {url} returned HTTP {error.code}",
++                method=method,
++                url=url,
++                status=error.code,
++                body=decoded,
++            ) from error
++        except URLError as error:
++            raise ApiError(
++                f"{method} {url} failed: {error.reason}",
++                method=method,
++                url=url,
++                body=error.reason,
++            ) from error
++        except OSError as error:
++            raise ApiError(
++                f"{method} {url} failed: {error}",
++                method=method,
++                url=url,
++                body=str(error),
++            ) from error
++
++        decoded = self._decode(raw)
++        if status != expected_status:
++            raise ApiError(
++                f"{method} {url} returned HTTP {status}; expected {expected_status}",
++                method=method,
++                url=url,
++                status=status,
++                body=decoded,
++            )
++        if expected_status == 204:
++            if raw:
++                raise ApiError(
++                    f"{method} {url} returned a body for HTTP 204",
++                    method=method,
++                    url=url,
++                    status=status,
++                    body=decoded,
++                )
++            return None
++        if expect_object and not isinstance(decoded, dict):
++            raise ApiError(
++                f"{method} {url} did not return a JSON object",
++                method=method,
++                url=url,
++                status=status,
++                body=decoded,
++            )
++        return decoded if isinstance(decoded, dict) else None
++
++    @staticmethod
++    def _positive_integer(value: object, name: str) -> int:
++        if isinstance(value, bool) or not isinstance(value, int):
++            raise TypeError(f"{name} must be an integer")
++        if value <= 0:
++            raise ValueError(f"{name} must be positive")
++        return value
++
++    @staticmethod
++    def _duration(value: object, name: str, *, positive: bool) -> float:
++        if isinstance(value, bool) or not isinstance(value, (int, float)):
++            raise TypeError(f"{name} must be a number")
++        if positive and value <= 0:
++            raise ValueError(f"{name} must be positive")
++        if not positive and value < 0:
++            raise ValueError(f"{name} must be non-negative")
++        return float(value)
++
++    @staticmethod
++    def _remaining(
++        deadline: float,
++        *,
++        stage: str,
++        timeout: float,
++        last_response: dict[str, Any] | None,
++    ) -> float:
++        remaining = deadline - time.monotonic()
++        if remaining <= 0:
++            raise ProvisionTimeoutError(stage, timeout, last_response)
++        return remaining
++
++    @classmethod
++    def _pause(
++        cls,
++        interval: float,
++        deadline: float,
++        *,
++        stage: str,
++        timeout: float,
++        last_response: dict[str, Any] | None,
++    ) -> None:
++        remaining = cls._remaining(
++            deadline,
++            stage=stage,
++            timeout=timeout,
++            last_response=last_response,
++        )
++        if interval:
++            time.sleep(min(interval, remaining))
+ 
+-    def provision_cluster(self, **kwargs: object) -> dict[str, object]:
++    def provision_cluster(
++        self,
++        *,
++        namespace: str,
++        supervisor: str,
++        cluster_name: str,
++        kubernetes_version: str,
++        vm_class: str,
++        storage_class: str,
++        cluster_class: str = "builtin-generic-v3.6.0",
++        control_plane_replicas: int = 1,
++        worker_replicas: int = 3,
++        description: str | None = None,
++        namespace_storage_policy: str | None = None,
++        labels: Mapping[str, str] | None = None,
++        poll_interval: float = 1.0,
++        timeout: float = 900.0,
++    ) -> dict[str, object]:
+         """Create the namespace, wait, create the Cluster, and wait."""
+-        raise NotImplementedError("complete provision_cluster")
++        namespace = self._string(namespace, "namespace")
++        supervisor = self._string(supervisor, "supervisor")
++        cluster_name = self._string(cluster_name, "cluster_name")
++        kubernetes_version = self._string(
++            kubernetes_version, "kubernetes_version"
++        )
++        vm_class = self._string(vm_class, "vm_class")
++        storage_class = self._string(storage_class, "storage_class")
++        cluster_class = self._string(cluster_class, "cluster_class")
++        control_plane_replicas = self._positive_integer(
++            control_plane_replicas, "control_plane_replicas"
++        )
++        worker_replicas = self._positive_integer(
++            worker_replicas, "worker_replicas"
++        )
++        if description is not None and not isinstance(description, str):
++            raise TypeError("description must be a string or None")
++        if namespace_storage_policy is not None:
++            namespace_storage_policy = self._string(
++                namespace_storage_policy, "namespace_storage_policy"
++            )
++        if labels is not None:
++            if not isinstance(labels, Mapping):
++                raise TypeError("labels must be a mapping or None")
++            for key, value in labels.items():
++                if not isinstance(key, str) or not isinstance(value, str):
++                    raise TypeError("label keys and values must be strings")
++        poll_interval_value = self._duration(
++            poll_interval, "poll_interval", positive=False
++        )
++        timeout_value = self._duration(timeout, "timeout", positive=True)
++
++        namespace_body: dict[str, object] = {
++            "supervisor": supervisor,
++            "namespace": namespace,
++        }
++        if description is not None:
++            namespace_body["description"] = description
++        if namespace_storage_policy is not None:
++            namespace_body["storage_specs"] = [
++                {"policy": namespace_storage_policy}
++            ]
++
++        cluster_metadata: dict[str, object] = {
++            "name": cluster_name,
++            "namespace": namespace,
++        }
++        if labels:
++            cluster_metadata["labels"] = dict(labels)
++        cluster_body: dict[str, object] = {
++            "apiVersion": "cluster.x-k8s.io/v1beta2",
++            "kind": "Cluster",
++            "metadata": cluster_metadata,
++            "spec": {
++                "topology": {
++                    "class": cluster_class,
++                    "version": kubernetes_version,
++                    "controlPlane": {
++                        "replicas": control_plane_replicas,
++                    },
++                    "workers": {
++                        "machineDeployments": [
++                            {
++                                "class": "node-pool",
++                                "name": "workers",
++                                "replicas": worker_replicas,
++                            }
++                        ]
++                    },
++                    "variables": [
++                        {"name": "vmClass", "value": vm_class},
++                        {"name": "storageClass", "value": storage_class},
++                    ],
++                }
++            },
++        }
++
++        deadline = time.monotonic() + timeout_value
++        remaining = self._remaining(
++            deadline,
++            stage="namespace",
++            timeout=timeout_value,
++            last_response=None,
++        )
++        self._request(
++            "vcenter",
++            "POST",
++            "/api/vcenter/namespaces/instances/v2",
++            204,
++            body=namespace_body,
++            request_timeout=remaining,
++        )
++
++        escaped_namespace = quote(namespace, safe="")
++        namespace_path = (
++            f"/api/vcenter/namespaces/instances/v2/{escaped_namespace}"
++        )
++        last_namespace: dict[str, Any] | None = None
++        while True:
++            remaining = self._remaining(
++                deadline,
++                stage="namespace",
++                timeout=timeout_value,
++                last_response=last_namespace,
++            )
++            namespace_info = self._request(
++                "vcenter",
++                "GET",
++                namespace_path,
++                200,
++                request_timeout=remaining,
++                expect_object=True,
++            )
++            assert namespace_info is not None
++            last_namespace = namespace_info
++            config_status = namespace_info.get("config_status")
++            if config_status == "RUNNING":
++                break
++            if config_status in {"ERROR", "REMOVING"}:
++                raise NamespaceFailedError(namespace_info)
++            if config_status != "CONFIGURING":
++                raise ApiError(
++                    "getSupervisorNamespace returned an unknown config_status",
++                    method="GET",
++                    url=self.vcenter_url + namespace_path,
++                    status=200,
++                    body=namespace_info,
++                )
++            self._pause(
++                poll_interval_value,
++                deadline,
++                stage="namespace",
++                timeout=timeout_value,
++                last_response=last_namespace,
++            )
++
++        cluster_collection_path = (
++            "/apis/cluster.x-k8s.io/v1beta2/namespaces/"
++            f"{escaped_namespace}/clusters"
++        )
++        remaining = self._remaining(
++            deadline,
++            stage="cluster",
++            timeout=timeout_value,
++            last_response=None,
++        )
++        created_cluster = self._request(
++            "supervisor",
++            "POST",
++            cluster_collection_path,
++            201,
++            body=cluster_body,
++            request_timeout=remaining,
++            expect_object=True,
++        )
++        assert created_cluster is not None
++        last_cluster: dict[str, Any] | None = created_cluster
++
++        escaped_cluster = quote(cluster_name, safe="")
++        cluster_path = cluster_collection_path + "/" + escaped_cluster
++        while True:
++            remaining = self._remaining(
++                deadline,
++                stage="cluster",
++                timeout=timeout_value,
++                last_response=last_cluster,
++            )
++            cluster = self._request(
++                "supervisor",
++                "GET",
++                cluster_path,
++                200,
++                request_timeout=remaining,
++                expect_object=True,
++            )
++            assert cluster is not None
++            last_cluster = cluster
++            status_value = cluster.get("status")
++            if status_value is None:
++                ready = None
++                phase = None
++            elif not isinstance(status_value, dict):
++                raise ApiError(
++                    "getVksCluster returned a non-object status",
++                    method="GET",
++                    url=self.supervisor_url + cluster_path,
++                    status=200,
++                    body=cluster,
++                )
++            else:
++                phase = status_value.get("phase")
++                conditions = status_value.get("conditions")
++                if conditions is None:
++                    ready = None
++                elif not isinstance(conditions, list):
++                    raise ApiError(
++                        "getVksCluster returned non-array conditions",
++                        method="GET",
++                        url=self.supervisor_url + cluster_path,
++                        status=200,
++                        body=cluster,
++                    )
++                else:
++                    ready_matches = []
++                    for condition in conditions:
++                        if not isinstance(condition, dict):
++                            raise ApiError(
++                                "getVksCluster returned a malformed condition",
++                                method="GET",
++                                url=self.supervisor_url + cluster_path,
++                                status=200,
++                                body=cluster,
++                            )
++                        if condition.get("type") == "Ready":
++                            ready_matches.append(condition)
++                    if len(ready_matches) > 1:
++                        raise ApiError(
++                            "getVksCluster returned multiple Ready conditions",
++                            method="GET",
++                            url=self.supervisor_url + cluster_path,
++                            status=200,
++                            body=cluster,
++                        )
++                    ready = ready_matches[0] if ready_matches else None
++
++            if phase == "Failed":
++                raise ClusterFailedError(cluster)
++            if phase is not None and not isinstance(phase, str):
++                raise ApiError(
++                    "getVksCluster returned a non-string phase",
++                    method="GET",
++                    url=self.supervisor_url + cluster_path,
++                    status=200,
++                    body=cluster,
++                )
++            if ready is not None:
++                ready_status = ready.get("status")
++                if ready_status == "True":
++                    return cluster
++                if (
++                    ready_status == "False"
++                    and ready.get("reason") == "ProvisioningFailed"
++                ):
++                    raise ClusterFailedError(cluster)
++                if ready_status not in {"False", "Unknown"}:
++                    raise ApiError(
++                        "getVksCluster returned an unknown Ready status",
++                        method="GET",
++                        url=self.supervisor_url + cluster_path,
++                        status=200,
++                        body=cluster,
++                    )
++            self._pause(
++                poll_interval_value,
++                deadline,
++                stage="cluster",
++                timeout=timeout_value,
++                last_response=last_cluster,
++            )
+

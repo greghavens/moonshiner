@@ -1,0 +1,325 @@
+diff --git a/vksinventory/client.go b/vksinventory/client.go
+new file mode 100644
+index 0000000..e0d19d7
+--- /dev/null
++++ b/vksinventory/client.go
+@@ -0,0 +1,319 @@
++package vksinventory
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"mime"
++	"net/http"
++	"net/url"
++	"sort"
++	"strconv"
++	"strings"
++)
++
++const (
++	namespaceOperation = "vcenter.namespace.listAuthorized"
++	clusterOperation   = "kubernetes.cluster.list"
++
++	namespacePath = "/api/vcenter/namespaces-user/namespaces"
++	clusterPath   = "/apis/cluster.x-k8s.io/v1beta2/namespaces/"
++	apiVersion    = "cluster.x-k8s.io/v1beta2"
++
++	maxResponseBytes = 8 << 20
++)
++
++// Client is safe for concurrent use. Its configuration is immutable.
++type Client struct {
++	vcenterOrigin    string
++	namespace        string
++	sessionID        string
++	kubernetesScheme string
++	pageLimit        int64
++	http             *http.Client
++}
++
++// NewClient validates config without performing network traffic.
++func NewClient(config Config) (*Client, error) {
++	if strings.TrimSpace(config.VCenterURL) == "" {
++		return nil, errors.New("vksinventory: VCenterURL is required")
++	}
++	origin, err := url.Parse(config.VCenterURL)
++	if err != nil ||
++		(origin.Scheme != "http" && origin.Scheme != "https") ||
++		origin.Host == "" ||
++		origin.User != nil ||
++		origin.Opaque != "" ||
++		(origin.Path != "" && origin.Path != "/") ||
++		origin.RawQuery != "" ||
++		origin.ForceQuery ||
++		origin.Fragment != "" {
++		return nil, errors.New("vksinventory: VCenterURL must be an absolute HTTP(S) origin")
++	}
++	if strings.TrimSpace(config.Namespace) == "" {
++		return nil, errors.New("vksinventory: Namespace is required")
++	}
++	if strings.TrimSpace(config.SessionID) == "" || strings.ContainsAny(config.SessionID, "\r\n") {
++		return nil, errors.New("vksinventory: SessionID is invalid")
++	}
++	if config.KubernetesScheme != "http" && config.KubernetesScheme != "https" {
++		return nil, errors.New("vksinventory: KubernetesScheme must be http or https")
++	}
++	if config.PageLimit <= 0 {
++		return nil, errors.New("vksinventory: PageLimit must be positive")
++	}
++
++	selected := config.HTTPClient
++	if selected == nil {
++		selected = http.DefaultClient
++	}
++	httpCopy := *selected
++	httpCopy.CheckRedirect = func(*http.Request, []*http.Request) error {
++		return http.ErrUseLastResponse
++	}
++
++	return &Client{
++		vcenterOrigin:    origin.Scheme + "://" + origin.Host,
++		namespace:        config.Namespace,
++		sessionID:        config.SessionID,
++		kubernetesScheme: config.KubernetesScheme,
++		pageLimit:        config.PageLimit,
++		http:             &httpCopy,
++	}, nil
++}
++
++// ListClusters discovers the configured Supervisor namespace and consumes its
++// complete Kubernetes Cluster collection before sorting a fresh result.
++func (c *Client) ListClusters(ctx context.Context) ([]Cluster, error) {
++	if ctx == nil {
++		return nil, errors.New("vksinventory: nil context")
++	}
++
++	masterHost, err := c.discoverMasterHost(ctx)
++	if err != nil {
++		return nil, err
++	}
++	kubernetesOrigin, err := c.kubernetesOrigin(masterHost)
++	if err != nil {
++		return nil, err
++	}
++
++	result := make([]Cluster, 0)
++	names := make(map[string]struct{})
++	continuations := make(map[string]struct{})
++	continueToken := ""
++	for {
++		page, err := c.listPage(ctx, kubernetesOrigin, continueToken)
++		if err != nil {
++			return nil, err
++		}
++		for _, resource := range *page.Items {
++			if resource.APIVersion != apiVersion || resource.Kind != "Cluster" || resource.Metadata == nil {
++				return nil, protocol(clusterOperation, "Cluster identity is invalid")
++			}
++			metadata := resource.Metadata
++			if strings.TrimSpace(metadata.Name) == "" ||
++				metadata.Namespace != c.namespace ||
++				strings.TrimSpace(metadata.UID) == "" ||
++				strings.TrimSpace(metadata.ResourceVersion) == "" {
++				return nil, protocol(clusterOperation, "Cluster metadata is invalid")
++			}
++			if _, duplicate := names[metadata.Name]; duplicate {
++				return nil, protocol(clusterOperation, "duplicate Cluster name")
++			}
++			names[metadata.Name] = struct{}{}
++			result = append(result, Cluster{
++				Name:            metadata.Name,
++				UID:             metadata.UID,
++				ResourceVersion: metadata.ResourceVersion,
++			})
++		}
++
++		next := page.Metadata.Continue
++		if next == "" {
++			break
++		}
++		if _, repeated := continuations[next]; repeated {
++			return nil, protocol(clusterOperation, "repeated continuation token")
++		}
++		continuations[next] = struct{}{}
++		continueToken = next
++	}
++
++	sort.Slice(result, func(i, j int) bool {
++		return result[i].Name < result[j].Name
++	})
++	return result, nil
++}
++
++func (c *Client) discoverMasterHost(ctx context.Context) (string, error) {
++	payload, err := c.getJSON(
++		ctx,
++		namespaceOperation,
++		c.vcenterOrigin+namespacePath,
++		"vmware-api-session-id",
++		c.sessionID,
++	)
++	if err != nil {
++		return "", err
++	}
++
++	var summaries []namespaceSummary
++	if err := json.Unmarshal(payload, &summaries); err != nil {
++		return "", protocol(namespaceOperation, "response is not a JSON array")
++	}
++	matches := 0
++	masterHost := ""
++	for _, summary := range summaries {
++		if strings.TrimSpace(summary.Namespace) == "" || strings.TrimSpace(summary.MasterHost) == "" {
++			return "", protocol(namespaceOperation, "summary is missing required fields")
++		}
++		if summary.Namespace == c.namespace {
++			matches++
++			masterHost = summary.MasterHost
++		}
++	}
++	if matches != 1 {
++		return "", protocol(namespaceOperation, "selected namespace must match exactly once")
++	}
++	return masterHost, nil
++}
++
++func (c *Client) kubernetesOrigin(masterHost string) (string, error) {
++	if strings.TrimSpace(masterHost) != masterHost || masterHost == "" {
++		return "", protocol(namespaceOperation, "master_host is not a bare authority")
++	}
++	parsed, err := url.Parse(c.kubernetesScheme + "://" + masterHost)
++	if err != nil ||
++		parsed.Scheme != c.kubernetesScheme ||
++		parsed.Host == "" ||
++		parsed.Host != masterHost ||
++		parsed.Hostname() == "" ||
++		parsed.User != nil ||
++		parsed.Opaque != "" ||
++		parsed.Path != "" ||
++		parsed.RawQuery != "" ||
++		parsed.ForceQuery ||
++		parsed.Fragment != "" {
++		return "", protocol(namespaceOperation, "master_host is not a bare authority")
++	}
++	return parsed.Scheme + "://" + parsed.Host, nil
++}
++
++func (c *Client) listPage(ctx context.Context, origin, continueToken string) (*clusterList, error) {
++	query := url.Values{
++		"limit": {strconv.FormatInt(c.pageLimit, 10)},
++	}
++	if continueToken != "" {
++		query.Set("continue", continueToken)
++	}
++	target := origin +
++		clusterPath +
++		url.PathEscape(c.namespace) +
++		"/clusters?" +
++		query.Encode()
++	payload, err := c.getJSON(
++		ctx,
++		clusterOperation,
++		target,
++		"Authorization",
++		"Bearer "+c.sessionID,
++	)
++	if err != nil {
++		return nil, err
++	}
++
++	var page clusterList
++	if err := json.Unmarshal(payload, &page); err != nil {
++		return nil, protocol(clusterOperation, "response is not a JSON object")
++	}
++	if page.APIVersion != apiVersion || page.Kind != "ClusterList" || page.Metadata == nil || page.Items == nil {
++		return nil, protocol(clusterOperation, "ClusterList identity is invalid")
++	}
++	return &page, nil
++}
++
++func (c *Client) getJSON(
++	ctx context.Context,
++	operation string,
++	target string,
++	authHeader string,
++	authValue string,
++) ([]byte, error) {
++	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
++	if err != nil {
++		return nil, protocol(operation, "request target is invalid")
++	}
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set(authHeader, authValue)
++
++	response, err := c.http.Do(request)
++	if err != nil {
++		return nil, &requestError{operation: operation, cause: err}
++	}
++	defer response.Body.Close()
++
++	payload, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
++	if err != nil {
++		return nil, &requestError{operation: operation, cause: err}
++	}
++	if response.StatusCode != http.StatusOK {
++		return nil, &APIError{Operation: operation, StatusCode: response.StatusCode}
++	}
++	if len(payload) > maxResponseBytes {
++		return nil, protocol(operation, "response exceeds size limit")
++	}
++	mediaType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
++	if err != nil || mediaType != "application/json" {
++		return nil, protocol(operation, "response Content-Type is not application/json")
++	}
++	return payload, nil
++}
++
++func protocol(operation, problem string) *ProtocolError {
++	return &ProtocolError{Operation: operation, Problem: problem}
++}
++
++type requestError struct {
++	operation string
++	cause     error
++}
++
++func (e *requestError) Error() string {
++	return fmt.Sprintf("vksinventory: %s request failed", e.operation)
++}
++
++func (e *requestError) Unwrap() error {
++	return e.cause
++}
++
++type namespaceSummary struct {
++	Namespace  string `json:"namespace"`
++	MasterHost string `json:"master_host"`
++}
++
++type clusterList struct {
++	APIVersion string        `json:"apiVersion"`
++	Kind       string        `json:"kind"`
++	Metadata   *listMetadata `json:"metadata"`
++	Items      *[]clusterAPI `json:"items"`
++}
++
++type listMetadata struct {
++	Continue string `json:"continue"`
++}
++
++type clusterAPI struct {
++	APIVersion string           `json:"apiVersion"`
++	Kind       string           `json:"kind"`
++	Metadata   *clusterMetadata `json:"metadata"`
++}
++
++type clusterMetadata struct {
++	Name            string `json:"name"`
++	Namespace       string `json:"namespace"`
++	UID             string `json:"uid"`
++	ResourceVersion string `json:"resourceVersion"`
++}

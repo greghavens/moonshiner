@@ -162,9 +162,19 @@ def _escapes_workspace(target: str) -> bool:
     return target.startswith("/") or target.startswith("~") or "../" in target
 
 
+# Writing to the null device, or to the process's own streams, changes nothing
+# outside the workspace. Treating them as escapes rejected any trace that used
+# `2>/dev/null` — the commonest idiom in a shell — and every VCF trace did.
+DISCARD_TARGETS = {"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/fd/1",
+                   "/dev/fd/2", "/dev/tty"}
+
+
 def _redirects_outside(command: str) -> bool:
     for match in re.finditer(r">>?\s*([^\s|;&]+)", command):
-        if _escapes_workspace(match.group(1)):
+        target = match.group(1)
+        if target in DISCARD_TARGETS:
+            continue
+        if _escapes_workspace(target):
             return True
     return False
 

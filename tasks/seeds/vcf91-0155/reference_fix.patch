@@ -1,0 +1,445 @@
+--- a/namespacebackup/client.go
++++ b/namespacebackup/client.go
+@@ -1,16 +1,439 @@
+ package namespacebackup
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"fmt"
++	"io"
++	"mime"
++	"net/http"
++	"net/url"
++	"sort"
++	"strings"
++	"time"
+ )
+ 
++const maxResponseBytes = 64 << 10
++
+ // NewClient validates configuration without network traffic.
+ func NewClient(cfg Config) (*Client, error) {
+-	return nil, fmt.Errorf("TODO: implement NewClient")
++	vcenterURL, err := validateOrigin(cfg.VCenterURL, "VCenterURL")
++	if err != nil {
++		return nil, err
++	}
++	kubernetesURL, err := validateOrigin(cfg.KubernetesURL, "KubernetesURL")
++	if err != nil {
++		return nil, err
++	}
++	if err := validateCredential(cfg.SessionID, "SessionID"); err != nil {
++		return nil, err
++	}
++	if err := validateCredential(cfg.KubernetesToken, "KubernetesToken"); err != nil {
++		return nil, err
++	}
++	if cfg.PollInterval < 0 {
++		return nil, fmt.Errorf("PollInterval must be nonnegative")
++	}
++	if cfg.MaxPolls <= 0 {
++		return nil, fmt.Errorf("MaxPolls must be positive")
++	}
++
++	selected := cfg.HTTPClient
++	if selected == nil {
++		selected = http.DefaultClient
++	}
++	httpClient := *selected
++	httpClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
++		return http.ErrUseLastResponse
++	}
++
++	return &Client{
++		vcenterURL:      vcenterURL,
++		kubernetesURL:   kubernetesURL,
++		sessionID:       cfg.SessionID,
++		kubernetesToken: cfg.KubernetesToken,
++		httpClient:      &httpClient,
++		pollInterval:    cfg.PollInterval,
++		maxPolls:        cfg.MaxPolls,
++	}, nil
++}
++
++func validateOrigin(value, name string) (string, error) {
++	if value == "" || strings.TrimSpace(value) != value {
++		return "", fmt.Errorf("%s must be an absolute HTTP(S) origin", name)
++	}
++	parsed, err := url.Parse(value)
++	if err != nil ||
++		(parsed.Scheme != "http" && parsed.Scheme != "https") ||
++		parsed.Host == "" ||
++		parsed.Hostname() == "" ||
++		parsed.User != nil ||
++		parsed.Opaque != "" ||
++		(parsed.Path != "" && parsed.Path != "/") ||
++		parsed.RawQuery != "" ||
++		parsed.ForceQuery ||
++		parsed.Fragment != "" {
++		return "", fmt.Errorf("%s must be an absolute HTTP(S) origin", name)
++	}
++	parsed.Path = ""
++	parsed.RawPath = ""
++	return parsed.String(), nil
++}
++
++func validateCredential(value, name string) error {
++	if strings.TrimSpace(value) == "" || strings.ContainsAny(value, "\r\n") {
++		return fmt.Errorf("%s must be a nonblank, header-safe string", name)
++	}
++	return nil
+ }
+ 
+ // BackupNamespace performs the contract workflow.
+ func (c *Client) BackupNamespace(ctx context.Context, req BackupRequest) (Result, error) {
+-	return Result{}, fmt.Errorf("TODO: implement BackupNamespace")
++	if ctx == nil {
++		return Result{}, fmt.Errorf("context must not be nil")
++	}
++	if strings.TrimSpace(req.Namespace) == "" {
++		return Result{}, fmt.Errorf("Namespace must be nonblank")
++	}
++
++	supervisor, err := c.getNamespace(ctx, req.Namespace)
++	if err != nil {
++		return Result{}, err
++	}
++	before, err := c.listClusters(ctx, req.Namespace)
++	if err != nil {
++		return Result{}, err
++	}
++	taskID, err := c.createBackup(ctx, supervisor, req.Comment)
++	if err != nil {
++		return Result{}, err
++	}
++	task, err := c.pollTask(ctx, taskID)
++	if err != nil {
++		return Result{}, err
++	}
++	after, err := c.listClusters(ctx, req.Namespace)
++	if err != nil {
++		return Result{}, err
++	}
++	if !equalClusters(before, after) {
++		return Result{}, &ProtocolError{OperationID: OperationListClusters}
++	}
++
++	return Result{
++		Namespace:  req.Namespace,
++		Supervisor: supervisor,
++		Clusters:   append([]Cluster(nil), after...),
++		Backup: BackupResult{
++			OperationID:     OperationCreateBackup,
++			TaskOperationID: OperationGetTask,
++			TaskID:          taskID,
++			Status:          "SUCCEEDED",
++			PollCount:       task.pollCount,
++			Result:          task.result,
++		},
++	}, nil
++}
++
++type namespaceInfo struct {
++	Supervisor   *string            `json:"supervisor"`
++	ConfigStatus *string            `json:"config_status"`
++	Description  *string            `json:"description"`
++	Messages     *[]json.RawMessage `json:"messages"`
++	Stats        *namespaceStats    `json:"stats"`
++	AccessList   *[]json.RawMessage `json:"access_list"`
++	StorageSpecs *[]json.RawMessage `json:"storage_specs"`
++}
++
++type namespaceStats struct {
++	CPUUsed     *int64 `json:"cpu_used"`
++	MemoryUsed  *int64 `json:"memory_used"`
++	StorageUsed *int64 `json:"storage_used"`
++}
++
++func (c *Client) getNamespace(ctx context.Context, namespace string) (string, error) {
++	path := "/api/vcenter/namespaces/instances/v2/" + url.PathEscape(namespace)
++	data, err := c.do(ctx, c.vcenterURL, OperationGetNamespace, http.MethodGet, path, nil, false)
++	if err != nil {
++		return "", err
++	}
++	var info namespaceInfo
++	if err := decodeOne(data, &info); err != nil ||
++		info.Supervisor == nil ||
++		strings.TrimSpace(*info.Supervisor) == "" ||
++		info.ConfigStatus == nil ||
++		info.Description == nil ||
++		info.Messages == nil ||
++		info.Stats == nil ||
++		info.Stats.CPUUsed == nil ||
++		info.Stats.MemoryUsed == nil ||
++		info.Stats.StorageUsed == nil ||
++		info.AccessList == nil ||
++		info.StorageSpecs == nil {
++		return "", &ProtocolError{OperationID: OperationGetNamespace}
++	}
++	switch *info.ConfigStatus {
++	case "RUNNING":
++		return *info.Supervisor, nil
++	case "CONFIGURING", "REMOVING", "ERROR":
++		return "", &NamespaceNotReadyError{Status: *info.ConfigStatus}
++	default:
++		return "", &ProtocolError{OperationID: OperationGetNamespace}
++	}
++}
++
++type clusterList struct {
++	APIVersion *string        `json:"apiVersion"`
++	Kind       *string        `json:"kind"`
++	Items      *[]clusterItem `json:"items"`
++}
++
++type clusterItem struct {
++	APIVersion *string `json:"apiVersion"`
++	Kind       *string `json:"kind"`
++	Metadata   *struct {
++		Name      *string `json:"name"`
++		Namespace *string `json:"namespace"`
++	} `json:"metadata"`
++	Spec *struct {
++		Topology *struct {
++			Version *string `json:"version"`
++		} `json:"topology"`
++	} `json:"spec"`
++}
++
++func (c *Client) listClusters(ctx context.Context, namespace string) ([]Cluster, error) {
++	path := "/apis/cluster.x-k8s.io/v1beta2/namespaces/" + url.PathEscape(namespace) + "/clusters"
++	data, err := c.do(ctx, c.kubernetesURL, OperationListClusters, http.MethodGet, path, nil, true)
++	if err != nil {
++		return nil, err
++	}
++	var list clusterList
++	if err := decodeOne(data, &list); err != nil ||
++		list.APIVersion == nil || *list.APIVersion != "cluster.x-k8s.io/v1beta2" ||
++		list.Kind == nil || *list.Kind != "ClusterList" ||
++		list.Items == nil {
++		return nil, &ProtocolError{OperationID: OperationListClusters}
++	}
++
++	clusters := make([]Cluster, 0, len(*list.Items))
++	names := make(map[string]struct{}, len(*list.Items))
++	for _, item := range *list.Items {
++		if item.APIVersion == nil || *item.APIVersion != "cluster.x-k8s.io/v1beta2" ||
++			item.Kind == nil || *item.Kind != "Cluster" ||
++			item.Metadata == nil ||
++			item.Metadata.Name == nil || strings.TrimSpace(*item.Metadata.Name) == "" ||
++			item.Metadata.Namespace == nil || *item.Metadata.Namespace != namespace ||
++			item.Spec == nil || item.Spec.Topology == nil ||
++			item.Spec.Topology.Version == nil || strings.TrimSpace(*item.Spec.Topology.Version) == "" {
++			return nil, &ProtocolError{OperationID: OperationListClusters}
++		}
++		if _, duplicate := names[*item.Metadata.Name]; duplicate {
++			return nil, &ProtocolError{OperationID: OperationListClusters}
++		}
++		names[*item.Metadata.Name] = struct{}{}
++		clusters = append(clusters, Cluster{
++			Name:            *item.Metadata.Name,
++			TopologyVersion: *item.Spec.Topology.Version,
++		})
++	}
++	sort.Slice(clusters, func(i, j int) bool {
++		return clusters[i].Name < clusters[j].Name
++	})
++	return clusters, nil
++}
++
++func (c *Client) createBackup(ctx context.Context, supervisor string, comment *string) (string, error) {
++	body, err := encodeCreateSpec(comment)
++	if err != nil {
++		return "", &ProtocolError{OperationID: OperationCreateBackup}
++	}
++	path := "/api/vcenter/namespace-management/supervisors/" +
++		url.PathEscape(supervisor) + "/recovery/backup/jobs"
++	data, err := c.do(ctx, c.vcenterURL, OperationCreateBackup, http.MethodPost, path, body, false)
++	if err != nil {
++		return "", err
++	}
++	var taskID string
++	if err := decodeOne(data, &taskID); err != nil || strings.TrimSpace(taskID) == "" {
++		return "", &ProtocolError{OperationID: OperationCreateBackup}
++	}
++	return taskID, nil
++}
++
++func encodeCreateSpec(comment *string) ([]byte, error) {
++	payload := struct {
++		Comment *string `json:"comment,omitempty"`
++	}{Comment: comment}
++	var buffer bytes.Buffer
++	encoder := json.NewEncoder(&buffer)
++	encoder.SetEscapeHTML(false)
++	if err := encoder.Encode(payload); err != nil {
++		return nil, err
++	}
++	return bytes.TrimSuffix(buffer.Bytes(), []byte{'\n'}), nil
++}
++
++type taskInfo struct {
++	Cancelable  *bool               `json:"cancelable"`
++	Description *localizableMessage `json:"description"`
++	Operation   *string             `json:"operation"`
++	Service     *string             `json:"service"`
++	Status      *string             `json:"status"`
++	Result      json.RawMessage     `json:"result"`
++}
++
++type localizableMessage struct {
++	ID             *string   `json:"id"`
++	DefaultMessage *string   `json:"default_message"`
++	Args           *[]string `json:"args"`
++}
++
++type terminalTask struct {
++	pollCount int
++	result    any
++}
++
++func (c *Client) pollTask(ctx context.Context, taskID string) (terminalTask, error) {
++	path := "/api/cis/tasks/" + url.PathEscape(taskID)
++	for poll := 1; poll <= c.maxPolls; poll++ {
++		data, err := c.do(ctx, c.vcenterURL, OperationGetTask, http.MethodGet, path, nil, false)
++		if err != nil {
++			return terminalTask{}, err
++		}
++		var info taskInfo
++		if err := decodeOne(data, &info); err != nil ||
++			info.Cancelable == nil ||
++			info.Description == nil ||
++			info.Description.ID == nil ||
++			info.Description.DefaultMessage == nil ||
++			info.Description.Args == nil ||
++			info.Operation == nil ||
++			info.Service == nil ||
++			info.Status == nil {
++			return terminalTask{}, &ProtocolError{OperationID: OperationGetTask}
++		}
++
++		switch *info.Status {
++		case "SUCCEEDED":
++			var result any
++			if len(info.Result) != 0 {
++				if err := decodeOne(info.Result, &result); err != nil {
++					return terminalTask{}, &ProtocolError{OperationID: OperationGetTask}
++				}
++			}
++			return terminalTask{pollCount: poll, result: result}, nil
++		case "FAILED":
++			return terminalTask{}, &TaskFailedError{TaskID: taskID, Status: "FAILED"}
++		case "PENDING", "RUNNING", "BLOCKED":
++			if poll == c.maxPolls {
++				return terminalTask{}, &PollTimeoutError{TaskID: taskID, MaxPolls: c.maxPolls}
++			}
++			if err := waitForPoll(ctx, c.pollInterval); err != nil {
++				return terminalTask{}, err
++			}
++		default:
++			return terminalTask{}, &ProtocolError{OperationID: OperationGetTask}
++		}
++	}
++	panic("unreachable")
++}
++
++func waitForPoll(ctx context.Context, interval time.Duration) error {
++	if interval == 0 {
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		default:
++			return nil
++		}
++	}
++	timer := time.NewTimer(interval)
++	defer timer.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-timer.C:
++		return nil
++	}
++}
++
++func (c *Client) do(
++	ctx context.Context,
++	baseURL string,
++	operationID string,
++	method string,
++	path string,
++	body []byte,
++	kubernetes bool,
++) ([]byte, error) {
++	var reader io.Reader
++	if body != nil {
++		reader = bytes.NewReader(body)
++	}
++	request, err := http.NewRequestWithContext(ctx, method, baseURL+path, reader)
++	if err != nil {
++		return nil, &ProtocolError{OperationID: operationID}
++	}
++	request.Header.Set("Accept", "application/json")
++	if kubernetes {
++		request.Header.Set("Authorization", "Bearer "+c.kubernetesToken)
++	} else {
++		request.Header.Set("vmware-api-session-id", c.sessionID)
++	}
++	if body != nil {
++		request.Header.Set("Content-Type", "application/json")
++	}
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		if ctx.Err() != nil {
++			return nil, ctx.Err()
++		}
++		return nil, &APIError{OperationID: operationID}
++	}
++	defer response.Body.Close()
++	data, readErr := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
++	if response.StatusCode != http.StatusOK {
++		return nil, &APIError{OperationID: operationID, StatusCode: response.StatusCode}
++	}
++	if readErr != nil {
++		return nil, &APIError{OperationID: operationID}
++	}
++	if len(data) > maxResponseBytes {
++		return nil, &ProtocolError{OperationID: operationID}
++	}
++	mediaType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
++	if err != nil || mediaType != "application/json" {
++		return nil, &ProtocolError{OperationID: operationID}
++	}
++	return data, nil
++}
++
++func decodeOne(data []byte, destination any) error {
++	decoder := json.NewDecoder(bytes.NewReader(data))
++	if err := decoder.Decode(destination); err != nil {
++		return err
++	}
++	var extra any
++	if err := decoder.Decode(&extra); err != io.EOF {
++		if err == nil {
++			return fmt.Errorf("multiple JSON values")
++		}
++		return err
++	}
++	return nil
++}
++
++func equalClusters(left, right []Cluster) bool {
++	if len(left) != len(right) {
++		return false
++	}
++	for i := range left {
++		if left[i] != right[i] {
++			return false
++		}
++	}
++	return true
+ }
+

@@ -1,0 +1,447 @@
+diff --git a/vksapply/client.go b/vksapply/client.go
+new file mode 100644
+index 0000000..6736d15
+--- /dev/null
++++ b/vksapply/client.go
+@@ -0,0 +1,441 @@
++package vksapply
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"io"
++	"net"
++	"net/http"
++	"net/url"
++	"strconv"
++	"strings"
++)
++
++const (
++	namespacePathPrefix = "/api/vcenter/namespaces/instances/v2/"
++	clusterPathPrefix   = "/apis/cluster.x-k8s.io/v1beta2/namespaces/"
++	clusterAPIVersion   = "cluster.x-k8s.io/v1beta2"
++)
++
++// Client is safe for concurrent use. Its configuration is immutable.
++type Client struct {
++	vcenterOrigin    string
++	kubernetesOrigin string
++	session          string
++	token            string
++	http             *http.Client
++}
++
++// NewClient validates configuration without performing network traffic.
++func NewClient(config Config) (*Client, error) {
++	vcenterOrigin, err := parseOrigin("VCenterURL", config.VCenterURL)
++	if err != nil {
++		return nil, err
++	}
++	kubernetesOrigin, err := parseOrigin("KubernetesURL", config.KubernetesURL)
++	if err != nil {
++		return nil, err
++	}
++	if invalidCredential(config.VCenterSession) {
++		return nil, validation("VCenterSession", "must be nonblank and header-safe")
++	}
++	if invalidCredential(config.KubernetesToken) {
++		return nil, validation("KubernetesToken", "must be nonblank and header-safe")
++	}
++	if config.Timeout <= 0 {
++		return nil, validation("Timeout", "must be positive")
++	}
++
++	selected := config.HTTPClient
++	if selected == nil {
++		selected = http.DefaultClient
++	}
++	httpCopy := *selected
++	httpCopy.Timeout = config.Timeout
++	httpCopy.CheckRedirect = func(*http.Request, []*http.Request) error {
++		return http.ErrUseLastResponse
++	}
++
++	return &Client{
++		vcenterOrigin:    vcenterOrigin,
++		kubernetesOrigin: kubernetesOrigin,
++		session:          config.VCenterSession,
++		token:            config.KubernetesToken,
++		http:             &httpCopy,
++	}, nil
++}
++
++// Apply validates the Supervisor namespace and server-side applies one named
++// VKS Cluster. An ambiguous first PATCH transport failure is replayed once
++// with immutable request bytes.
++func (c *Client) Apply(ctx context.Context, request ApplyRequest) (ApplyResult, error) {
++	if err := validateApply(ctx, request); err != nil {
++		return ApplyResult{}, err
++	}
++	if err := ctx.Err(); err != nil {
++		return ApplyResult{}, &TransportError{Operation: NamespaceGetOperation, cause: err}
++	}
++	if err := c.requireRunningNamespace(ctx, request); err != nil {
++		return ApplyResult{}, err
++	}
++
++	body, err := buildApplyBody(request)
++	if err != nil {
++		return ApplyResult{}, &ProtocolError{
++			Operation: ClusterApplyOperation,
++			Problem:   "could not encode the validated desired state",
++		}
++	}
++	target := c.applyTarget(request)
++
++	for attempt := 1; attempt <= 2; attempt++ {
++		result, transportFailure, err := c.applyOnce(ctx, target, body, request)
++		if err == nil {
++			result.Attempts = attempt
++			return result, nil
++		}
++		if !transportFailure {
++			return ApplyResult{}, err
++		}
++		if ctx.Err() != nil {
++			return ApplyResult{}, &TransportError{
++				Operation: ClusterApplyOperation,
++				cause:     ctx.Err(),
++			}
++		}
++		if attempt == 2 {
++			return ApplyResult{}, &TransportError{
++				Operation: ClusterApplyOperation,
++				cause:     err,
++			}
++		}
++	}
++	panic("unreachable")
++}
++
++func parseOrigin(field, raw string) (string, error) {
++	if strings.TrimSpace(raw) == "" {
++		return "", validation(field, "must be an absolute HTTP(S) origin")
++	}
++	parsed, err := url.Parse(raw)
++	if err != nil {
++		return "", validation(field, "must be an absolute HTTP(S) origin")
++	}
++	scheme := strings.ToLower(parsed.Scheme)
++	if (scheme != "http" && scheme != "https") ||
++		parsed.Host == "" ||
++		parsed.Hostname() == "" ||
++		parsed.User != nil ||
++		parsed.Opaque != "" ||
++		(parsed.Path != "" && parsed.Path != "/") ||
++		parsed.RawQuery != "" ||
++		parsed.ForceQuery ||
++		strings.Contains(raw, "#") ||
++		parsed.Fragment != "" {
++		return "", validation(field, "must be an absolute HTTP(S) origin")
++	}
++	return scheme + "://" + parsed.Host, nil
++}
++
++func invalidCredential(value string) bool {
++	return strings.TrimSpace(value) == "" || strings.ContainsAny(value, "\r\n")
++}
++
++func validation(field, reason string) error {
++	return &ValidationError{Field: field, Reason: reason}
++}
++
++func validateApply(ctx context.Context, request ApplyRequest) error {
++	if ctx == nil {
++		return validation("context", "must not be nil")
++	}
++	required := []struct {
++		name  string
++		value string
++	}{
++		{"Supervisor", request.Supervisor},
++		{"Namespace", request.Namespace},
++		{"ClusterName", request.ClusterName},
++		{"FieldManager", request.FieldManager},
++		{"ClusterClass", request.ClusterClass},
++		{"KubernetesVersion", request.KubernetesVersion},
++		{"VMClass", request.VMClass},
++		{"StorageClass", request.StorageClass},
++	}
++	for _, field := range required {
++		if strings.TrimSpace(field.value) == "" {
++			return validation(field.name, "must be nonblank")
++		}
++	}
++	if request.ControlPlaneReplicas <= 0 {
++		return validation("ControlPlaneReplicas", "must be positive")
++	}
++	if request.WorkerReplicas != nil && *request.WorkerReplicas < 0 {
++		return validation("WorkerReplicas", "must be nonnegative when set")
++	}
++	if err := validateCIDRs("PodCIDRs", request.PodCIDRs); err != nil {
++		return err
++	}
++	if err := validateCIDRs("ServiceCIDRs", request.ServiceCIDRs); err != nil {
++		return err
++	}
++	return nil
++}
++
++func validateCIDRs(field string, values []string) error {
++	for _, value := range values {
++		if strings.TrimSpace(value) == "" {
++			return validation(field, "members must be nonblank CIDRs")
++		}
++		if _, _, err := net.ParseCIDR(value); err != nil {
++			return validation(field, "members must be valid CIDRs")
++		}
++	}
++	return nil
++}
++
++func (c *Client) requireRunningNamespace(ctx context.Context, request ApplyRequest) error {
++	target := c.vcenterOrigin + namespacePathPrefix + url.PathEscape(request.Namespace)
++	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
++	if err != nil {
++		return &ProtocolError{Operation: NamespaceGetOperation, Problem: "could not construct request"}
++	}
++	httpRequest.Header.Set("Accept", "application/json")
++	httpRequest.Header.Set("vmware-api-session-id", c.session)
++
++	response, err := c.http.Do(httpRequest)
++	if err != nil {
++		cause := err
++		if ctx.Err() != nil {
++			cause = ctx.Err()
++		}
++		return &TransportError{Operation: NamespaceGetOperation, cause: cause}
++	}
++	defer response.Body.Close()
++	body, readErr := readResponse(response.Body)
++	if readErr != nil {
++		return &ProtocolError{Operation: NamespaceGetOperation, Problem: "could not read response"}
++	}
++	if response.StatusCode != http.StatusOK {
++		return &APIError{
++			Operation:  NamespaceGetOperation,
++			StatusCode: response.StatusCode,
++			Body:       append([]byte(nil), body...),
++		}
++	}
++
++	var info struct {
++		Supervisor   *string `json:"supervisor"`
++		ConfigStatus *string `json:"config_status"`
++	}
++	if err := json.Unmarshal(body, &info); err != nil ||
++		info.Supervisor == nil ||
++		strings.TrimSpace(*info.Supervisor) == "" ||
++		info.ConfigStatus == nil ||
++		strings.TrimSpace(*info.ConfigStatus) == "" {
++		return &ProtocolError{Operation: NamespaceGetOperation, Problem: "required fields are missing"}
++	}
++	if *info.Supervisor != request.Supervisor {
++		return &ProtocolError{Operation: NamespaceGetOperation, Problem: "Supervisor identity does not match"}
++	}
++	switch *info.ConfigStatus {
++	case "RUNNING":
++		return nil
++	case "CONFIGURING", "REMOVING", "ERROR":
++		return &NamespaceNotReadyError{ConfigStatus: *info.ConfigStatus}
++	default:
++		return &ProtocolError{Operation: NamespaceGetOperation, Problem: "config_status is unknown"}
++	}
++}
++
++func (c *Client) applyTarget(request ApplyRequest) string {
++	query := url.Values{}
++	query.Set("fieldManager", request.FieldManager)
++	if request.Force != nil {
++		query.Set("force", strconv.FormatBool(*request.Force))
++	}
++	return c.kubernetesOrigin + clusterPathPrefix +
++		url.PathEscape(request.Namespace) + "/clusters/" +
++		url.PathEscape(request.ClusterName) + "?" + query.Encode()
++}
++
++func (c *Client) applyOnce(
++	ctx context.Context,
++	target string,
++	body []byte,
++	request ApplyRequest,
++) (ApplyResult, bool, error) {
++	httpRequest, err := http.NewRequestWithContext(
++		ctx,
++		http.MethodPatch,
++		target,
++		bytes.NewReader(body),
++	)
++	if err != nil {
++		return ApplyResult{}, false, &ProtocolError{
++			Operation: ClusterApplyOperation,
++			Problem:   "could not construct request",
++		}
++	}
++	httpRequest.Header.Set("Accept", "application/json")
++	httpRequest.Header.Set("Authorization", "Bearer "+c.token)
++	httpRequest.Header.Set("Content-Type", "application/apply-patch+yaml")
++
++	response, err := c.http.Do(httpRequest)
++	if err != nil {
++		return ApplyResult{}, true, err
++	}
++	defer response.Body.Close()
++	responseBody, readErr := readResponse(response.Body)
++	if readErr != nil {
++		return ApplyResult{}, false, &ProtocolError{
++			Operation: ClusterApplyOperation,
++			Problem:   "could not read response",
++		}
++	}
++	if response.StatusCode != http.StatusOK {
++		return ApplyResult{}, false, &APIError{
++			Operation:  ClusterApplyOperation,
++			StatusCode: response.StatusCode,
++			Body:       append([]byte(nil), responseBody...),
++		}
++	}
++
++	var resource struct {
++		APIVersion string `json:"apiVersion"`
++		Kind       string `json:"kind"`
++		Metadata   *struct {
++			Name            string `json:"name"`
++			Namespace       string `json:"namespace"`
++			UID             string `json:"uid"`
++			ResourceVersion string `json:"resourceVersion"`
++			Generation      *int64 `json:"generation"`
++		} `json:"metadata"`
++	}
++	if err := json.Unmarshal(responseBody, &resource); err != nil ||
++		resource.APIVersion != clusterAPIVersion ||
++		resource.Kind != "Cluster" ||
++		resource.Metadata == nil ||
++		resource.Metadata.Name != request.ClusterName ||
++		resource.Metadata.Namespace != request.Namespace ||
++		strings.TrimSpace(resource.Metadata.UID) == "" ||
++		strings.TrimSpace(resource.Metadata.ResourceVersion) == "" ||
++		resource.Metadata.Generation == nil ||
++		*resource.Metadata.Generation <= 0 {
++		return ApplyResult{}, false, &ProtocolError{
++			Operation: ClusterApplyOperation,
++			Problem:   "Cluster identity or metadata is invalid",
++		}
++	}
++	return ApplyResult{
++		UID:             resource.Metadata.UID,
++		ResourceVersion: resource.Metadata.ResourceVersion,
++		Generation:      *resource.Metadata.Generation,
++	}, false, nil
++}
++
++func readResponse(reader io.Reader) ([]byte, error) {
++	return io.ReadAll(reader)
++}
++
++type applyManifest struct {
++	APIVersion string        `json:"apiVersion"`
++	Kind       string        `json:"kind"`
++	Metadata   applyMetadata `json:"metadata"`
++	Spec       applySpec     `json:"spec"`
++}
++
++type applyMetadata struct {
++	Name      string `json:"name"`
++	Namespace string `json:"namespace"`
++}
++
++type applySpec struct {
++	Topology       applyTopology        `json:"topology"`
++	ClusterNetwork *applyClusterNetwork `json:"clusterNetwork,omitempty"`
++}
++
++type applyTopology struct {
++	Class        string            `json:"class"`
++	Version      string            `json:"version"`
++	Variables    []applyVariable   `json:"variables"`
++	ControlPlane applyControlPlane `json:"controlPlane"`
++	Workers      *applyWorkers     `json:"workers,omitempty"`
++}
++
++type applyVariable struct {
++	Name  string `json:"name"`
++	Value string `json:"value"`
++}
++
++type applyControlPlane struct {
++	Replicas int32 `json:"replicas"`
++}
++
++type applyWorkers struct {
++	MachineDeployments []applyMachineDeployment `json:"machineDeployments"`
++}
++
++type applyMachineDeployment struct {
++	Class    string `json:"class"`
++	Name     string `json:"name"`
++	Replicas int32  `json:"replicas"`
++}
++
++type applyClusterNetwork struct {
++	Pods     *applyCIDRBlocks `json:"pods,omitempty"`
++	Services *applyCIDRBlocks `json:"services,omitempty"`
++}
++
++type applyCIDRBlocks struct {
++	CIDRBlocks []string `json:"cidrBlocks"`
++}
++
++func buildApplyBody(request ApplyRequest) ([]byte, error) {
++	topology := applyTopology{
++		Class:   request.ClusterClass,
++		Version: request.KubernetesVersion,
++		Variables: []applyVariable{
++			{Name: "vmClass", Value: request.VMClass},
++			{Name: "storageClass", Value: request.StorageClass},
++		},
++		ControlPlane: applyControlPlane{Replicas: request.ControlPlaneReplicas},
++	}
++	if request.WorkerReplicas != nil {
++		topology.Workers = &applyWorkers{
++			MachineDeployments: []applyMachineDeployment{
++				{
++					Class:    "node-pool",
++					Name:     "worker",
++					Replicas: *request.WorkerReplicas,
++				},
++			},
++		}
++	}
++
++	spec := applySpec{Topology: topology}
++	if len(request.PodCIDRs) > 0 || len(request.ServiceCIDRs) > 0 {
++		spec.ClusterNetwork = &applyClusterNetwork{}
++		if len(request.PodCIDRs) > 0 {
++			spec.ClusterNetwork.Pods = &applyCIDRBlocks{
++				CIDRBlocks: append([]string(nil), request.PodCIDRs...),
++			}
++		}
++		if len(request.ServiceCIDRs) > 0 {
++			spec.ClusterNetwork.Services = &applyCIDRBlocks{
++				CIDRBlocks: append([]string(nil), request.ServiceCIDRs...),
++			}
++		}
++	}
++
++	return json.Marshal(applyManifest{
++		APIVersion: clusterAPIVersion,
++		Kind:       "Cluster",
++		Metadata: applyMetadata{
++			Name:      request.ClusterName,
++			Namespace: request.Namespace,
++		},
++		Spec: spec,
++	})
++}

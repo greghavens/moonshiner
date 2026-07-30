@@ -1,0 +1,497 @@
+--- a/vksprovision/client.go
++++ b/vksprovision/client.go
+@@ -1,17 +1,489 @@
+ package vksprovision
+ 
+ import (
++	"bytes"
+ 	"context"
+-	"errors"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
++	"time"
++)
++
++const maxResponseBody = 1 << 20
++
++type namespaceCreateBody struct {
++	Supervisor  string `json:"supervisor"`
++	Namespace   string `json:"namespace"`
++	Description string `json:"description,omitempty"`
++}
++
++type objectMetadata struct {
++	Name      string `json:"name"`
++	Namespace string `json:"namespace"`
++}
++
++type cidrBlockList struct {
++	CIDRBlocks []string `json:"cidrBlocks"`
++}
++
++type clusterNetwork struct {
++	Pods     *cidrBlockList `json:"pods,omitempty"`
++	Services *cidrBlockList `json:"services,omitempty"`
++}
++
++type topologyVariable struct {
++	Name  string `json:"name"`
++	Value string `json:"value"`
++}
++
++type controlPlane struct {
++	Replicas int32 `json:"replicas"`
++}
++
++type machineDeployment struct {
++	Class    string `json:"class"`
++	Name     string `json:"name"`
++	Replicas int32  `json:"replicas"`
++}
++
++type workers struct {
++	MachineDeployments []machineDeployment `json:"machineDeployments"`
++}
++
++type topology struct {
++	Class        string             `json:"class"`
++	Version      string             `json:"version"`
++	Variables    []topologyVariable `json:"variables"`
++	ControlPlane controlPlane       `json:"controlPlane"`
++	Workers      *workers           `json:"workers,omitempty"`
++}
++
++type clusterSpec struct {
++	ClusterNetwork *clusterNetwork `json:"clusterNetwork,omitempty"`
++	Topology       topology        `json:"topology"`
++}
++
++type clusterCreateBody struct {
++	APIVersion string         `json:"apiVersion"`
++	Kind       string         `json:"kind"`
++	Metadata   objectMetadata `json:"metadata"`
++	Spec       clusterSpec    `json:"spec"`
++}
++
++type clusterResponse struct {
++	APIVersion string `json:"apiVersion"`
++	Kind       string `json:"kind"`
++	Metadata   struct {
++		Name            string `json:"name"`
++		Namespace       string `json:"namespace"`
++		ResourceVersion string `json:"resourceVersion"`
++	} `json:"metadata"`
++	Status struct {
++		Conditions []struct {
++			Type    string `json:"type"`
++			Status  string `json:"status"`
++			Reason  string `json:"reason"`
++			Message string `json:"message"`
++		} `json:"conditions"`
++	} `json:"status"`
++}
++
++type observationState int
++
++const (
++	observationNonterminal observationState = iota
++	observationSucceeded
++	observationFailed
+ )
+ 
+ // NewClient constructs the focused VCF 9.1 client.
+-func NewClient(Config) (*Client, error) {
+-	return nil, errors.New("TODO: implement NewClient")
++func NewClient(config Config) (*Client, error) {
++	vcenterURL, err := validateOrigin(config.VCenterURL, "VCenterURL")
++	if err != nil {
++		return nil, err
++	}
++	kubernetesURL, err := validateOrigin(config.KubernetesURL, "KubernetesURL")
++	if err != nil {
++		return nil, err
++	}
++	if err := validateCredential(config.VCenterSession, "VCenterSession"); err != nil {
++		return nil, err
++	}
++	if err := validateCredential(config.KubernetesToken, "KubernetesToken"); err != nil {
++		return nil, err
++	}
++	if config.Timeout <= 0 {
++		return nil, &ValidationError{Field: "Timeout", Reason: "must be positive"}
++	}
++	if config.PollInterval < 0 {
++		return nil, &ValidationError{Field: "PollInterval", Reason: "must not be negative"}
++	}
++	if config.MaxPolls <= 0 {
++		return nil, &ValidationError{Field: "MaxPolls", Reason: "must be positive"}
++	}
++
++	selected := config.HTTPClient
++	if selected == nil {
++		selected = http.DefaultClient
++	}
++	httpClient := *selected
++	httpClient.Timeout = config.Timeout
++	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
++		return http.ErrUseLastResponse
++	}
++	return &Client{
++		vcenterURL:    vcenterURL,
++		kubernetesURL: kubernetesURL,
++		session:       config.VCenterSession,
++		token:         config.KubernetesToken,
++		httpClient:    &httpClient,
++		pollInterval:  config.PollInterval,
++		maxPolls:      config.MaxPolls,
++	}, nil
++}
++
++func validateOrigin(raw, field string) (string, error) {
++	parsed, err := url.Parse(raw)
++	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
++		return "", &ValidationError{Field: field, Reason: "must be an absolute HTTP(S) origin"}
++	}
++	if parsed.Scheme != "http" && parsed.Scheme != "https" {
++		return "", &ValidationError{Field: field, Reason: "must use HTTP or HTTPS"}
++	}
++	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" ||
++		(parsed.Path != "" && parsed.Path != "/") {
++		return "", &ValidationError{Field: field, Reason: "must be an origin without credentials, path, query, or fragment"}
++	}
++	return strings.TrimSuffix(raw, "/"), nil
++}
++
++func validateCredential(value, field string) error {
++	if strings.TrimSpace(value) == "" {
++		return &ValidationError{Field: field, Reason: "must be nonblank"}
++	}
++	if strings.ContainsAny(value, "\r\n") {
++		return &ValidationError{Field: field, Reason: "must be safe for an HTTP header"}
++	}
++	return nil
++}
++
++func validateRequest(request ProvisionRequest) error {
++	required := []struct {
++		name  string
++		value string
++	}{
++		{"Supervisor", request.Supervisor},
++		{"Namespace", request.Namespace},
++		{"ClusterName", request.ClusterName},
++		{"ClusterClass", request.ClusterClass},
++		{"KubernetesVersion", request.KubernetesVersion},
++		{"VMClass", request.VMClass},
++		{"StorageClass", request.StorageClass},
++	}
++	for _, field := range required {
++		if strings.TrimSpace(field.value) == "" {
++			return &ValidationError{Field: field.name, Reason: "must be nonblank"}
++		}
++	}
++	if request.ControlPlaneReplicas <= 0 {
++		return &ValidationError{Field: "ControlPlaneReplicas", Reason: "must be positive"}
++	}
++	return nil
+ }
+ 
+ // Provision creates the Supervisor Namespace and VKS Cluster, then waits for
+ // the Cluster's Available condition to reach a terminal state.
+-func (c *Client) Provision(context.Context, ProvisionRequest) (ProvisionResult, error) {
+-	return ProvisionResult{}, errors.New("TODO: implement Provision")
++func (c *Client) Provision(ctx context.Context, request ProvisionRequest) (ProvisionResult, error) {
++	if ctx == nil {
++		return ProvisionResult{}, &ValidationError{Field: "context", Reason: "must not be nil"}
++	}
++	if err := validateRequest(request); err != nil {
++		return ProvisionResult{}, err
++	}
++	if err := ctx.Err(); err != nil {
++		return ProvisionResult{}, fmt.Errorf("provision canceled before request: %w", err)
++	}
++
++	namespaceBody, err := json.Marshal(namespaceCreateBody{
++		Supervisor:  request.Supervisor,
++		Namespace:   request.Namespace,
++		Description: request.NamespaceDescription,
++	})
++	if err != nil {
++		return ProvisionResult{}, &ProtocolError{Operation: NamespaceCreateOperation, Reason: "could not encode request"}
++	}
++	if err := c.do(
++		ctx,
++		NamespaceCreateOperation,
++		http.MethodPost,
++		c.vcenterURL+"/api/vcenter/namespaces/instances/v2",
++		"vmware-api-session-id",
++		c.session,
++		namespaceBody,
++		http.StatusNoContent,
++		nil,
++	); err != nil {
++		return ProvisionResult{}, err
++	}
++
++	createBody, err := json.Marshal(buildClusterBody(request))
++	if err != nil {
++		return ProvisionResult{}, &ProtocolError{Operation: ClusterCreateOperation, Reason: "could not encode request"}
++	}
++	collectionURL := c.kubernetesURL +
++		"/apis/cluster.x-k8s.io/v1beta2/namespaces/" +
++		url.PathEscape(request.Namespace) + "/clusters"
++	var cluster clusterResponse
++	if err := c.do(
++		ctx,
++		ClusterCreateOperation,
++		http.MethodPost,
++		collectionURL,
++		"Authorization",
++		"Bearer "+c.token,
++		createBody,
++		http.StatusCreated,
++		&cluster,
++	); err != nil {
++		return ProvisionResult{}, err
++	}
++
++	state, condition, err := inspectCluster(ClusterCreateOperation, request, cluster)
++	if err != nil {
++		return ProvisionResult{}, err
++	}
++	if state == observationSucceeded {
++		return resultFrom(request, cluster, condition.Reason, condition.Message, 0), nil
++	}
++	if state == observationFailed {
++		return ProvisionResult{}, failedFrom(request, condition.Reason, condition.Message)
++	}
++
++	itemURL := collectionURL + "/" + url.PathEscape(request.ClusterName)
++	for polls := 0; ; {
++		if polls >= c.maxPolls {
++			return ProvisionResult{}, &PollLimitError{
++				Namespace: request.Namespace,
++				Name:      request.ClusterName,
++				MaxPolls:  c.maxPolls,
++			}
++		}
++		if err := waitForPoll(ctx, c.pollInterval); err != nil {
++			return ProvisionResult{}, fmt.Errorf("waiting to poll VKS Cluster: %w", err)
++		}
++		polls++
++		cluster = clusterResponse{}
++		if err := c.do(
++			ctx,
++			ClusterGetOperation,
++			http.MethodGet,
++			itemURL,
++			"Authorization",
++			"Bearer "+c.token,
++			nil,
++			http.StatusOK,
++			&cluster,
++		); err != nil {
++			return ProvisionResult{}, err
++		}
++		state, condition, err = inspectCluster(ClusterGetOperation, request, cluster)
++		if err != nil {
++			return ProvisionResult{}, err
++		}
++		switch state {
++		case observationSucceeded:
++			return resultFrom(request, cluster, condition.Reason, condition.Message, polls), nil
++		case observationFailed:
++			return ProvisionResult{}, failedFrom(request, condition.Reason, condition.Message)
++		}
++	}
++}
++
++func buildClusterBody(request ProvisionRequest) clusterCreateBody {
++	var network *clusterNetwork
++	if len(request.PodCIDRs) > 0 || len(request.ServiceCIDRs) > 0 {
++		network = &clusterNetwork{}
++		if len(request.PodCIDRs) > 0 {
++			network.Pods = &cidrBlockList{CIDRBlocks: request.PodCIDRs}
++		}
++		if len(request.ServiceCIDRs) > 0 {
++			network.Services = &cidrBlockList{CIDRBlocks: request.ServiceCIDRs}
++		}
++	}
++	var workerTopology *workers
++	if request.WorkerReplicas != nil {
++		workerTopology = &workers{MachineDeployments: []machineDeployment{
++			{Class: "node-pool", Name: "workers", Replicas: *request.WorkerReplicas},
++		}}
++	}
++	return clusterCreateBody{
++		APIVersion: "cluster.x-k8s.io/v1beta2",
++		Kind:       "Cluster",
++		Metadata: objectMetadata{
++			Name:      request.ClusterName,
++			Namespace: request.Namespace,
++		},
++		Spec: clusterSpec{
++			ClusterNetwork: network,
++			Topology: topology{
++				Class:   request.ClusterClass,
++				Version: request.KubernetesVersion,
++				Variables: []topologyVariable{
++					{Name: "vmClass", Value: request.VMClass},
++					{Name: "storageClass", Value: request.StorageClass},
++				},
++				ControlPlane: controlPlane{Replicas: request.ControlPlaneReplicas},
++				Workers:      workerTopology,
++			},
++		},
++	}
++}
++
++func (c *Client) do(
++	ctx context.Context,
++	operation, method, endpoint, credentialHeader, credential string,
++	body []byte,
++	expectedStatus int,
++	output any,
++) error {
++	var reader io.Reader
++	if body != nil {
++		reader = bytes.NewReader(body)
++	}
++	request, err := http.NewRequestWithContext(ctx, method, endpoint, reader)
++	if err != nil {
++		return &ValidationError{Field: "request URL", Reason: "could not construct request"}
++	}
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set(credentialHeader, credential)
++	if body != nil {
++		request.Header.Set("Content-Type", "application/json")
++	}
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return &TransportError{Operation: operation, cause: err}
++	}
++	defer response.Body.Close()
++	responseBody, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBody+1))
++	if err != nil {
++		return &TransportError{Operation: operation, cause: err}
++	}
++	if response.StatusCode != expectedStatus {
++		return &APIError{
++			Operation:  operation,
++			StatusCode: response.StatusCode,
++			Body:       append([]byte(nil), responseBody...),
++		}
++	}
++	if output == nil {
++		return nil
++	}
++	if len(responseBody) == 0 || len(responseBody) > maxResponseBody ||
++		json.Unmarshal(responseBody, output) != nil {
++		return &ProtocolError{Operation: operation, Reason: "response body is not one valid JSON object"}
++	}
++	return nil
++}
++
++func inspectCluster(
++	operation string,
++	request ProvisionRequest,
++	cluster clusterResponse,
++) (observationState, struct {
++	Type    string `json:"type"`
++	Status  string `json:"status"`
++	Reason  string `json:"reason"`
++	Message string `json:"message"`
++}, error) {
++	var zero struct {
++		Type    string `json:"type"`
++		Status  string `json:"status"`
++		Reason  string `json:"reason"`
++		Message string `json:"message"`
++	}
++	if cluster.APIVersion != "cluster.x-k8s.io/v1beta2" ||
++		cluster.Kind != "Cluster" ||
++		cluster.Metadata.Name != request.ClusterName ||
++		cluster.Metadata.Namespace != request.Namespace ||
++		strings.TrimSpace(cluster.Metadata.ResourceVersion) == "" {
++		return observationNonterminal, zero, &ProtocolError{
++			Operation: operation,
++			Reason:    "Cluster identity is missing or does not match the request",
++		}
++	}
++	var available = zero
++	count := 0
++	for _, condition := range cluster.Status.Conditions {
++		if condition.Type == "Available" {
++			count++
++			available = condition
++		}
++	}
++	if count != 1 || available.Reason == "" {
++		return observationNonterminal, zero, &ProtocolError{
++			Operation: operation,
++			Reason:    "Cluster must contain exactly one usable Available condition",
++		}
++	}
++	switch {
++	case available.Status == "True":
++		return observationSucceeded, available, nil
++	case available.Status == "False" && available.Reason == "ProvisioningFailed":
++		return observationFailed, available, nil
++	case available.Status == "False" &&
++		(available.Reason == "Provisioning" || available.Reason == "WaitingForInfrastructure"):
++		return observationNonterminal, available, nil
++	default:
++		return observationNonterminal, zero, &ProtocolError{
++			Operation: operation,
++			Reason:    "Available condition has an unsupported state",
++		}
++	}
++}
++
++func resultFrom(
++	request ProvisionRequest,
++	cluster clusterResponse,
++	reason, message string,
++	polls int,
++) ProvisionResult {
++	return ProvisionResult{
++		Namespace:        request.Namespace,
++		ClusterName:      request.ClusterName,
++		ResourceVersion:  cluster.Metadata.ResourceVersion,
++		AvailableReason:  reason,
++		AvailableMessage: message,
++		PollCount:        polls,
++	}
++}
++
++func failedFrom(request ProvisionRequest, reason, message string) error {
++	return &ClusterFailedError{
++		Namespace: request.Namespace,
++		Name:      request.ClusterName,
++		Reason:    reason,
++		Message:   message,
++	}
++}
++
++func waitForPoll(ctx context.Context, interval time.Duration) error {
++	if interval == 0 {
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		default:
++			return nil
++		}
++	}
++	timer := time.NewTimer(interval)
++	defer timer.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-timer.C:
++		return nil
++	}
+ }

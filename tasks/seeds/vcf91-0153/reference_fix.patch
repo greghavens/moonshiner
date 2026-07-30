@@ -1,0 +1,367 @@
+--- a/vksrotate/client.go
++++ b/vksrotate/client.go
+@@ -2,22 +2,360 @@
+ 
+ import (
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
++	"math"
++	"net/http"
++	"net/url"
++	"sort"
++	"strings"
+ )
+ 
+-var errNotImplemented = errors.New("vksrotate: not implemented")
++const (
++	namespacePathPrefix = "/api/vcenter/namespaces/instances/v2/"
++	clusterPathPrefix   = "/apis/cluster.x-k8s.io/v1beta2/namespaces/"
++	clusterPathSuffix   = "/clusters"
++	clusterAPIVersion   = "cluster.x-k8s.io/v1beta2"
++	maxResponseBytes    = 8 << 20
++)
+ 
+ // NewClient validates config and constructs a client without performing I/O.
+ func NewClient(config Config) (*Client, error) {
+-	return nil, errNotImplemented
++	vcenterOrigin, err := parseOrigin("vCenter", config.VCenterURL)
++	if err != nil {
++		return nil, err
++	}
++	kubernetesOrigin, err := parseOrigin("Kubernetes", config.KubernetesURL)
++	if err != nil {
++		return nil, err
++	}
++	if err := validateCredentials(config.Credentials); err != nil {
++		return nil, err
++	}
++
++	selected := config.HTTPClient
++	if selected == nil {
++		selected = http.DefaultClient
++	}
++	httpCopy := *selected
++	httpCopy.CheckRedirect = func(*http.Request, []*http.Request) error {
++		return http.ErrUseLastResponse
++	}
++	if httpCopy.Transport == nil {
++		transport := http.DefaultTransport.(*http.Transport).Clone()
++		transport.DisableCompression = true
++		httpCopy.Transport = transport
++	} else if transport, ok := httpCopy.Transport.(*http.Transport); ok {
++		transportCopy := transport.Clone()
++		transportCopy.DisableCompression = true
++		httpCopy.Transport = transportCopy
++	}
++
++	return &Client{
++		vcenterOrigin:    vcenterOrigin,
++		kubernetesOrigin: kubernetesOrigin,
++		httpClient:       &httpCopy,
++		credential: credentialGeneration{
++			value:      config.Credentials,
++			generation: 1,
++		},
++	}, nil
+ }
+ 
+ // Rotate atomically replaces both credentials without performing I/O.
+ func (c *Client) Rotate(credentials Credentials) error {
+-	return errNotImplemented
++	if c == nil {
++		return errors.New("vksrotate: nil client")
++	}
++	if err := validateCredentials(credentials); err != nil {
++		return err
++	}
++
++	c.credentialMu.Lock()
++	defer c.credentialMu.Unlock()
++	if c.credential.generation == math.MaxUint64 {
++		return errors.New("vksrotate: credential generation exhausted")
++	}
++	c.credential = credentialGeneration{
++		value:      credentials,
++		generation: c.credential.generation + 1,
++	}
++	return nil
+ }
+ 
+ // Inspect reads the Supervisor namespace and then its VKS Cluster collection.
+ func (c *Client) Inspect(ctx context.Context, namespace string) (Snapshot, error) {
+-	return Snapshot{}, errNotImplemented
++	var snapshot Snapshot
++	if c == nil {
++		return snapshot, errors.New("vksrotate: nil client")
++	}
++	if ctx == nil {
++		return snapshot, errors.New("vksrotate: nil context")
++	}
++	if err := ctx.Err(); err != nil {
++		return snapshot, fmt.Errorf("vksrotate: Inspect canceled: %w", err)
++	}
++	if strings.TrimSpace(namespace) == "" {
++		return snapshot, errors.New("vksrotate: namespace is required")
++	}
++
++	escapedNamespace := url.PathEscape(namespace)
++	namespaceBody, err := c.get(
++		ctx,
++		OperationGetSupervisorNamespace,
++		c.vcenterOrigin+namespacePathPrefix+escapedNamespace,
++		true,
++	)
++	if err != nil {
++		return snapshot, err
++	}
++	supervisor, configStatus, err := decodeNamespace(namespaceBody)
++	if err != nil {
++		return snapshot, err
++	}
++
++	clusterBody, err := c.get(
++		ctx,
++		OperationListVKSClusters,
++		c.kubernetesOrigin+clusterPathPrefix+escapedNamespace+clusterPathSuffix,
++		false,
++	)
++	if err != nil {
++		return snapshot, err
++	}
++	clusters, err := decodeClusters(clusterBody, namespace)
++	if err != nil {
++		return snapshot, err
++	}
++
++	return Snapshot{
++		Namespace:    namespace,
++		Supervisor:   supervisor,
++		ConfigStatus: configStatus,
++		Clusters:     clusters,
++	}, nil
++}
++
++func parseOrigin(name, raw string) (string, error) {
++	if strings.TrimSpace(raw) == "" {
++		return "", fmt.Errorf("vksrotate: %s URL is required", name)
++	}
++	parsed, err := url.Parse(raw)
++	if err != nil ||
++		(parsed.Scheme != "http" && parsed.Scheme != "https") ||
++		parsed.Host == "" ||
++		parsed.User != nil ||
++		parsed.Opaque != "" ||
++		(parsed.Path != "" && parsed.Path != "/") ||
++		parsed.RawPath != "" ||
++		parsed.RawQuery != "" ||
++		parsed.ForceQuery ||
++		parsed.Fragment != "" ||
++		parsed.RawFragment != "" {
++		return "", fmt.Errorf("vksrotate: %s URL must be an absolute HTTP(S) origin", name)
++	}
++	return parsed.Scheme + "://" + parsed.Host, nil
++}
++
++func validateCredentials(credentials Credentials) error {
++	if !validCredential(credentials.VCenterSessionID) {
++		return errors.New("vksrotate: vCenter session ID is invalid")
++	}
++	if !validCredential(credentials.KubernetesBearerToken) {
++		return errors.New("vksrotate: Kubernetes bearer token is invalid")
++	}
++	return nil
++}
++
++func validCredential(value string) bool {
++	return strings.TrimSpace(value) != "" && !strings.ContainsAny(value, "\r\n")
++}
++
++func (c *Client) get(ctx context.Context, operation, target string, vcenter bool) ([]byte, error) {
++	for attempt := 0; attempt < 2; attempt++ {
++		credentials := c.credentials()
++		request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
++		if err != nil {
++			return nil, &ProtocolError{Operation: operation, Problem: "request construction failed"}
++		}
++		request.Header.Set("Accept", "application/json")
++		// A nil User-Agent value suppresses net/http's automatic wire header.
++		request.Header["User-Agent"] = nil
++		if vcenter {
++			request.Header.Set("vmware-api-session-id", credentials.value.VCenterSessionID)
++		} else {
++			request.Header.Set("Authorization", "Bearer "+credentials.value.KubernetesBearerToken)
++		}
++
++		response, err := c.httpClient.Do(request)
++		if err != nil {
++			if ctxErr := ctx.Err(); ctxErr != nil {
++				return nil, fmt.Errorf("vksrotate: %s canceled: %w", operation, ctxErr)
++			}
++			return nil, fmt.Errorf("vksrotate: %s transport failure", operation)
++		}
++
++		if response.StatusCode == http.StatusUnauthorized &&
++			attempt == 0 &&
++			c.generationChanged(credentials.generation) {
++			discardAndClose(response.Body)
++			continue
++		}
++		if response.StatusCode != http.StatusOK {
++			discardAndClose(response.Body)
++			return nil, &APIError{Operation: operation, StatusCode: response.StatusCode}
++		}
++
++		body, readErr := readBounded(response.Body)
++		closeErr := response.Body.Close()
++		if readErr != nil || closeErr != nil {
++			return nil, &ProtocolError{Operation: operation, Problem: "response body could not be read"}
++		}
++		return body, nil
++	}
++	panic("unreachable")
++}
++
++func (c *Client) credentials() credentialGeneration {
++	c.credentialMu.RLock()
++	defer c.credentialMu.RUnlock()
++	return c.credential
++}
++
++func (c *Client) generationChanged(generation uint64) bool {
++	c.credentialMu.RLock()
++	defer c.credentialMu.RUnlock()
++	return c.credential.generation != generation
++}
++
++func readBounded(body io.Reader) ([]byte, error) {
++	limited := io.LimitReader(body, maxResponseBytes+1)
++	data, err := io.ReadAll(limited)
++	if err != nil {
++		return nil, err
++	}
++	if len(data) > maxResponseBytes {
++		return nil, errors.New("response exceeded size limit")
++	}
++	return data, nil
++}
++
++func discardAndClose(body io.ReadCloser) {
++	_, _ = io.Copy(io.Discard, io.LimitReader(body, 64<<10))
++	_ = body.Close()
++}
++
++func decodeNamespace(body []byte) (string, string, error) {
++	const operation = OperationGetSupervisorNamespace
++	var raw map[string]json.RawMessage
++	if err := json.Unmarshal(body, &raw); err != nil {
++		return "", "", &ProtocolError{Operation: operation, Problem: "response is not a JSON object"}
++	}
++	for _, field := range []string{
++		"access_list",
++		"config_status",
++		"description",
++		"messages",
++		"stats",
++		"storage_specs",
++		"supervisor",
++	} {
++		value, exists := raw[field]
++		if !exists || string(value) == "null" {
++			return "", "", &ProtocolError{Operation: operation, Problem: "required response field is missing"}
++		}
++	}
++
++	var payload struct {
++		Supervisor   string            `json:"supervisor"`
++		ConfigStatus string            `json:"config_status"`
++		Description  string            `json:"description"`
++		Messages     []json.RawMessage `json:"messages"`
++		Stats        struct {
++			CPUUsed     *int64 `json:"cpu_used"`
++			MemoryUsed  *int64 `json:"memory_used"`
++			StorageUsed *int64 `json:"storage_used"`
++		} `json:"stats"`
++		AccessList   []json.RawMessage `json:"access_list"`
++		StorageSpecs []json.RawMessage `json:"storage_specs"`
++	}
++	if err := json.Unmarshal(body, &payload); err != nil {
++		return "", "", &ProtocolError{Operation: operation, Problem: "response fields have invalid types"}
++	}
++	if strings.TrimSpace(payload.Supervisor) == "" {
++		return "", "", &ProtocolError{Operation: operation, Problem: "supervisor is blank"}
++	}
++	if payload.Stats.CPUUsed == nil ||
++		payload.Stats.MemoryUsed == nil ||
++		payload.Stats.StorageUsed == nil {
++		return "", "", &ProtocolError{Operation: operation, Problem: "namespace stats are incomplete"}
++	}
++	if payload.ConfigStatus != "RUNNING" {
++		return "", "", &ProtocolError{Operation: operation, Problem: "namespace is not running"}
++	}
++	return payload.Supervisor, payload.ConfigStatus, nil
++}
++
++func decodeClusters(body []byte, namespace string) ([]Cluster, error) {
++	const operation = OperationListVKSClusters
++	var raw map[string]json.RawMessage
++	if err := json.Unmarshal(body, &raw); err != nil {
++		return nil, &ProtocolError{Operation: operation, Problem: "response is not a JSON object"}
++	}
++	for _, field := range []string{"apiVersion", "kind", "items"} {
++		value, exists := raw[field]
++		if !exists || string(value) == "null" {
++			return nil, &ProtocolError{Operation: operation, Problem: "required list field is missing"}
++		}
++	}
++
++	var payload struct {
++		APIVersion string `json:"apiVersion"`
++		Kind       string `json:"kind"`
++		Items      []struct {
++			APIVersion string `json:"apiVersion"`
++			Kind       string `json:"kind"`
++			Metadata   struct {
++				Name            string `json:"name"`
++				Namespace       string `json:"namespace"`
++				UID             string `json:"uid"`
++				ResourceVersion string `json:"resourceVersion"`
++			} `json:"metadata"`
++		} `json:"items"`
++	}
++	if err := json.Unmarshal(body, &payload); err != nil {
++		return nil, &ProtocolError{Operation: operation, Problem: "list fields have invalid types"}
++	}
++	if payload.APIVersion != clusterAPIVersion || payload.Kind != "ClusterList" {
++		return nil, &ProtocolError{Operation: operation, Problem: "list identity is invalid"}
++	}
++
++	clusters := make([]Cluster, len(payload.Items))
++	names := make(map[string]struct{}, len(payload.Items))
++	for i, item := range payload.Items {
++		if item.APIVersion != clusterAPIVersion ||
++			item.Kind != "Cluster" ||
++			strings.TrimSpace(item.Metadata.Name) == "" ||
++			item.Metadata.Namespace != namespace ||
++			strings.TrimSpace(item.Metadata.UID) == "" ||
++			strings.TrimSpace(item.Metadata.ResourceVersion) == "" {
++			return nil, &ProtocolError{Operation: operation, Problem: "Cluster identity is invalid"}
++		}
++		if _, duplicate := names[item.Metadata.Name]; duplicate {
++			return nil, &ProtocolError{Operation: operation, Problem: "Cluster name is duplicated"}
++		}
++		names[item.Metadata.Name] = struct{}{}
++		clusters[i] = Cluster{
++			Name:            item.Metadata.Name,
++			Namespace:       item.Metadata.Namespace,
++			UID:             item.Metadata.UID,
++			ResourceVersion: item.Metadata.ResourceVersion,
++		}
++	}
++	sort.Slice(clusters, func(i, j int) bool {
++		return clusters[i].Name < clusters[j].Name
++	})
++	return clusters, nil
+ }

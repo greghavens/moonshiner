@@ -1,0 +1,464 @@
+--- a/src/VCenterCloneClient.java
++++ b/src/VCenterCloneClient.java
+@@ -1,8 +1,15 @@
+ import java.io.IOException;
+ import java.net.URI;
+ import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
+ import java.time.Duration;
++import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Map;
+ import java.util.Objects;
+ 
+ /**
+@@ -45,6 +52,444 @@
+             String cloneName,
+             Duration timeout,
+             Duration pollInterval) throws IOException, InterruptedException {
+-        throw new UnsupportedOperationException("TODO: implement the vCenter workflow");
++        requireNonBlank(sourceVm, "sourceVm");
++        requireNonBlank(cloneName, "cloneName");
++        Objects.requireNonNull(timeout, "timeout");
++        Objects.requireNonNull(pollInterval, "pollInterval");
++        if (timeout.isZero() || timeout.isNegative()) {
++            throw new IllegalArgumentException("timeout must be positive");
++        }
++        if (pollInterval.isNegative()) {
++            throw new IllegalArgumentException("pollInterval must not be negative");
++        }
++
++        long started = System.nanoTime();
++        long budget = toNanosSaturated(timeout);
++        String cloneBody = "{\"source\":" + jsonString(sourceVm)
++                + ",\"name\":" + jsonString(cloneName) + "}";
++        HttpRequest cloneRequest = request(
++                "/api/vcenter/vm?action=clone&vmw-task=true",
++                remaining(started, budget))
++                .header("Content-Type", "application/json")
++                .POST(HttpRequest.BodyPublishers.ofString(
++                        cloneBody, StandardCharsets.UTF_8))
++                .build();
++        Object submitted = parse(send(cloneRequest, 202));
++        if (!(submitted instanceof String task) || task.isBlank()) {
++            throw new IOException(
++                    "malformed clone response: task identifier must be a nonblank string");
++        }
++
++        String taskPath = "/api/cis/tasks/" + encodePathSegment(task);
++        while (true) {
++            HttpRequest pollRequest = request(
++                    taskPath, remaining(started, budget))
++                    .GET()
++                    .build();
++            Map<String, Object> taskInfo = object(
++                    parse(send(pollRequest, 200)), "task response");
++            validateTaskInfo(taskInfo);
++            String status = string(taskInfo.get("status"), "status");
++            if ("SUCCEEDED".equals(status)) {
++                break;
++            }
++            if ("FAILED".equals(status)) {
++                throw new IOException("vCenter clone task failed");
++            }
++            if (!"PENDING".equals(status)
++                    && !"RUNNING".equals(status)
++                    && !"BLOCKED".equals(status)) {
++                throw new IOException("unknown vCenter task status: " + status);
++            }
++            Duration left = remaining(started, budget);
++            Duration delay = pollInterval.compareTo(left) < 0
++                    ? pollInterval : left;
++            sleeper.sleep(delay);
++        }
++
++        HttpRequest listRequest = request(
++                "/api/vcenter/vm", remaining(started, budget))
++                .GET()
++                .build();
++        Object parsed = parse(send(listRequest, 200));
++        if (!(parsed instanceof List<?> values)) {
++            throw new IOException("malformed VM list response: expected an array");
++        }
++        List<VmSummary> summaries = new ArrayList<>(values.size());
++        for (int index = 0; index < values.size(); index++) {
++            Map<String, Object> item = object(
++                    values.get(index), "VM list item " + index);
++            String vm = string(item.get("vm"), "vm");
++            String name = string(item.get("name"), "name");
++            String powerState = string(item.get("power_state"), "power_state");
++            if (!"POWERED_OFF".equals(powerState)
++                    && !"POWERED_ON".equals(powerState)
++                    && !"SUSPENDED".equals(powerState)) {
++                throw new IOException("unknown VM power_state: " + powerState);
++            }
++            summaries.add(new VmSummary(vm, name, powerState));
++        }
++        summaries.sort(Comparator.comparing(VmSummary::name)
++                .thenComparing(VmSummary::vm));
++        return List.copyOf(summaries);
++    }
++
++    private HttpRequest.Builder request(String pathAndQuery, Duration timeout) {
++        return HttpRequest.newBuilder(resolve(pathAndQuery))
++                .timeout(timeout)
++                .header("Accept", "application/json")
++                .header("vmware-api-session-id", sessionToken);
++    }
++
++    private String send(HttpRequest request, int expectedStatus)
++            throws IOException, InterruptedException {
++        HttpResponse<String> response = httpClient.send(
++                request,
++                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++        if (response.statusCode() != expectedStatus) {
++            throw new IOException(
++                    "unexpected HTTP " + response.statusCode()
++                            + " for " + request.method() + " " + request.uri());
++        }
++        return response.body();
++    }
++
++    private URI resolve(String pathAndQuery) {
++        String prefix = baseUri.toString();
++        while (prefix.endsWith("/")) {
++            prefix = prefix.substring(0, prefix.length() - 1);
++        }
++        return URI.create(prefix + pathAndQuery);
++    }
++
++    private static void validateTaskInfo(Map<String, Object> taskInfo)
++            throws IOException {
++        object(taskInfo.get("description"), "description");
++        string(taskInfo.get("service"), "service");
++        string(taskInfo.get("operation"), "operation");
++        string(taskInfo.get("status"), "status");
++        if (!(taskInfo.get("cancelable") instanceof Boolean)) {
++            throw new IOException("malformed task response: cancelable must be boolean");
++        }
++    }
++
++    private static void requireNonBlank(String value, String name) {
++        Objects.requireNonNull(value, name);
++        if (value.isBlank()) {
++            throw new IllegalArgumentException(name + " must not be blank");
++        }
++    }
++
++    private static long toNanosSaturated(Duration duration) {
++        try {
++            return duration.toNanos();
++        } catch (ArithmeticException overflow) {
++            return Long.MAX_VALUE;
++        }
++    }
++
++    private static Duration remaining(long started, long budget)
++            throws IOException {
++        long elapsed = System.nanoTime() - started;
++        long nanos = budget - elapsed;
++        if (nanos <= 0) {
++            throw new IOException("timed out waiting for vCenter clone task");
++        }
++        return Duration.ofNanos(nanos);
++    }
++
++    private static String encodePathSegment(String value) {
++        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
++        StringBuilder encoded = new StringBuilder(bytes.length);
++        for (byte current : bytes) {
++            int octet = current & 0xff;
++            if ((octet >= 'a' && octet <= 'z')
++                    || (octet >= 'A' && octet <= 'Z')
++                    || (octet >= '0' && octet <= '9')
++                    || octet == '-' || octet == '.' || octet == '_'
++                    || octet == '~') {
++                encoded.append((char) octet);
++            } else {
++                encoded.append('%');
++                encoded.append(Character.toUpperCase(
++                        Character.forDigit((octet >>> 4) & 0xf, 16)));
++                encoded.append(Character.toUpperCase(
++                        Character.forDigit(octet & 0xf, 16)));
++            }
++        }
++        return encoded.toString();
++    }
++
++    private static String jsonString(String value) {
++        StringBuilder result = new StringBuilder(value.length() + 2);
++        result.append('"');
++        for (int index = 0; index < value.length(); index++) {
++            char current = value.charAt(index);
++            switch (current) {
++                case '"' -> result.append("\\\"");
++                case '\\' -> result.append("\\\\");
++                case '\b' -> result.append("\\b");
++                case '\f' -> result.append("\\f");
++                case '\n' -> result.append("\\n");
++                case '\r' -> result.append("\\r");
++                case '\t' -> result.append("\\t");
++                default -> {
++                    if (current < 0x20) {
++                        result.append(String.format("\\u%04x", (int) current));
++                    } else {
++                        result.append(current);
++                    }
++                }
++            }
++        }
++        return result.append('"').toString();
++    }
++
++    private static Object parse(String input) throws IOException {
++        try {
++            return new JsonParser(input).parseDocument();
++        } catch (IllegalArgumentException error) {
++            throw new IOException(
++                    "malformed JSON response: " + error.getMessage(), error);
++        }
++    }
++
++    @SuppressWarnings("unchecked")
++    private static Map<String, Object> object(Object value, String field)
++            throws IOException {
++        if (!(value instanceof Map<?, ?>)) {
++            throw new IOException(
++                    "malformed response: " + field + " must be an object");
++        }
++        return (Map<String, Object>) value;
++    }
++
++    private static String string(Object value, String field) throws IOException {
++        if (!(value instanceof String text)) {
++            throw new IOException(
++                    "malformed response: " + field + " must be a string");
++        }
++        return text;
++    }
++
++    private static final class JsonParser {
++        private final String input;
++        private int offset;
++
++        private JsonParser(String input) {
++            this.input = Objects.requireNonNull(input, "input");
++        }
++
++        private Object parseDocument() {
++            skipWhitespace();
++            Object value = parseValue();
++            skipWhitespace();
++            if (offset != input.length()) {
++                fail("trailing content");
++            }
++            return value;
++        }
++
++        private Object parseValue() {
++            if (offset >= input.length()) {
++                fail("unexpected end of input");
++            }
++            return switch (input.charAt(offset)) {
++                case '{' -> parseObject();
++                case '[' -> parseArray();
++                case '"' -> parseString();
++                case 't' -> {
++                    expectLiteral("true");
++                    yield Boolean.TRUE;
++                }
++                case 'f' -> {
++                    expectLiteral("false");
++                    yield Boolean.FALSE;
++                }
++                case 'n' -> {
++                    expectLiteral("null");
++                    yield null;
++                }
++                default -> parseNumber();
++            };
++        }
++
++        private Map<String, Object> parseObject() {
++            expect('{');
++            skipWhitespace();
++            Map<String, Object> result = new LinkedHashMap<>();
++            if (consume('}')) {
++                return result;
++            }
++            while (true) {
++                skipWhitespace();
++                if (offset >= input.length() || input.charAt(offset) != '"') {
++                    fail("object key must be a string");
++                }
++                String key = parseString();
++                skipWhitespace();
++                expect(':');
++                skipWhitespace();
++                Object value = parseValue();
++                if (result.putIfAbsent(key, value) != null) {
++                    fail("duplicate object key");
++                }
++                skipWhitespace();
++                if (consume('}')) {
++                    return result;
++                }
++                expect(',');
++                skipWhitespace();
++            }
++        }
++
++        private List<Object> parseArray() {
++            expect('[');
++            skipWhitespace();
++            List<Object> result = new ArrayList<>();
++            if (consume(']')) {
++                return result;
++            }
++            while (true) {
++                result.add(parseValue());
++                skipWhitespace();
++                if (consume(']')) {
++                    return result;
++                }
++                expect(',');
++                skipWhitespace();
++            }
++        }
++
++        private String parseString() {
++            expect('"');
++            StringBuilder result = new StringBuilder();
++            while (offset < input.length()) {
++                char current = input.charAt(offset++);
++                if (current == '"') {
++                    return result.toString();
++                }
++                if (current == '\\') {
++                    if (offset >= input.length()) {
++                        fail("unterminated string escape");
++                    }
++                    char escaped = input.charAt(offset++);
++                    switch (escaped) {
++                        case '"' -> result.append('"');
++                        case '\\' -> result.append('\\');
++                        case '/' -> result.append('/');
++                        case 'b' -> result.append('\b');
++                        case 'f' -> result.append('\f');
++                        case 'n' -> result.append('\n');
++                        case 'r' -> result.append('\r');
++                        case 't' -> result.append('\t');
++                        case 'u' -> result.append(parseUnicodeEscape());
++                        default -> fail("invalid string escape");
++                    }
++                } else {
++                    if (current < 0x20) {
++                        fail("unescaped control character");
++                    }
++                    result.append(current);
++                }
++            }
++            fail("unterminated string");
++            return null;
++        }
++
++        private char parseUnicodeEscape() {
++            if (offset + 4 > input.length()) {
++                fail("short unicode escape");
++            }
++            int value = 0;
++            for (int index = 0; index < 4; index++) {
++                int digit = Character.digit(input.charAt(offset++), 16);
++                if (digit < 0) {
++                    fail("invalid unicode escape");
++                }
++                value = (value << 4) | digit;
++            }
++            return (char) value;
++        }
++
++        private Number parseNumber() {
++            int start = offset;
++            if (consume('-') && offset >= input.length()) {
++                fail("incomplete number");
++            }
++            if (consume('0')) {
++                if (offset < input.length()
++                        && Character.isDigit(input.charAt(offset))) {
++                    fail("leading zero in number");
++                }
++            } else {
++                takeDigits(true);
++            }
++            boolean decimal = false;
++            if (consume('.')) {
++                decimal = true;
++                takeDigits(true);
++            }
++            if (consume('e') || consume('E')) {
++                decimal = true;
++                consume('+');
++                consume('-');
++                takeDigits(true);
++            }
++            String token = input.substring(start, offset);
++            try {
++                return decimal ? Double.valueOf(token) : Long.valueOf(token);
++            } catch (NumberFormatException error) {
++                fail("invalid number");
++                return null;
++            }
++        }
++
++        private void takeDigits(boolean requireOne) {
++            int start = offset;
++            while (offset < input.length()
++                    && Character.isDigit(input.charAt(offset))) {
++                offset++;
++            }
++            if (requireOne && start == offset) {
++                fail("expected digit");
++            }
++        }
++
++        private void expectLiteral(String literal) {
++            if (!input.startsWith(literal, offset)) {
++                fail("expected " + literal);
++            }
++            offset += literal.length();
++        }
++
++        private void expect(char expected) {
++            if (!consume(expected)) {
++                fail("expected '" + expected + "'");
++            }
++        }
++
++        private boolean consume(char expected) {
++            if (offset < input.length() && input.charAt(offset) == expected) {
++                offset++;
++                return true;
++            }
++            return false;
++        }
++
++        private void skipWhitespace() {
++            while (offset < input.length()) {
++                char current = input.charAt(offset);
++                if (current != ' ' && current != '\n'
++                        && current != '\r' && current != '\t') {
++                    return;
++                }
++                offset++;
++            }
++        }
++
++        private void fail(String message) {
++            throw new IllegalArgumentException(message + " at offset " + offset);
++        }
+     }
+ }

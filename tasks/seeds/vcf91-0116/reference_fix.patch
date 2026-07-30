@@ -1,0 +1,491 @@
+--- a/attestdiag/client.go
++++ b/attestdiag/client.go
+@@ -1,10 +1,66 @@
+ package attestdiag
+ 
+-import "context"
++import (
++	"bytes"
++	"context"
++	"encoding/base64"
++	"encoding/json"
++	"errors"
++	"io"
++	"net/http"
++	"net/url"
++	"strconv"
++	"strings"
++)
++
++const maxResponseBytes = 2 << 20
+ 
+ // NewClient validates cfg and returns an independent client.
+ func NewClient(cfg Config) (*Client, error) {
+-	return nil, &ValidationError{Field: "configuration: TODO"}
++	if cfg.BaseURL == "" ||
++		cfg.BaseURL != strings.TrimSpace(cfg.BaseURL) ||
++		hasControl(cfg.BaseURL) {
++		return nil, &ValidationError{Field: "BaseURL"}
++	}
++	base, err := url.Parse(cfg.BaseURL)
++	if err != nil ||
++		(base.Scheme != "http" && base.Scheme != "https") ||
++		base.Host == "" ||
++		base.Hostname() == "" ||
++		base.User != nil ||
++		base.Path != "/api" ||
++		base.RawPath != "" ||
++		base.RawQuery != "" ||
++		base.ForceQuery ||
++		base.Fragment != "" ||
++		base.Opaque != "" {
++		return nil, &ValidationError{Field: "BaseURL"}
++	}
++	if strings.TrimSpace(cfg.SessionID) == "" || hasControl(cfg.SessionID) {
++		return nil, &ValidationError{Field: "SessionID"}
++	}
++	if cfg.Timeout <= 0 {
++		return nil, &ValidationError{Field: "Timeout"}
++	}
++
++	source := cfg.HTTPClient
++	if source == nil {
++		source = http.DefaultClient
++	}
++	httpClient := *source
++	httpClient.Timeout = cfg.Timeout
++	httpClient.CheckRedirect = func(
++		_ *http.Request,
++		_ []*http.Request,
++	) error {
++		return http.ErrUseLastResponse
++	}
++
++	return &Client{
++		baseURL:    base.String(),
++		sessionID:  cfg.SessionID,
++		httpClient: &httpClient,
++	}, nil
+ }
+ 
+ // ListTPMs retrieves TPM summaries using only the focused list operation.
+@@ -13,7 +69,81 @@
+ 	host string,
+ 	options TPMListOptions,
+ ) ([]TPMSummary, error) {
+-	return nil, &ValidationError{Field: "ListTPMs: TODO"}
++	if err := validateCall(c, ctx); err != nil {
++		return nil, err
++	}
++	if !validIdentifier(host) {
++		return nil, &ValidationError{Field: "host"}
++	}
++	if options.MajorVersions != nil {
++		if len(options.MajorVersions) == 0 {
++			return nil, &ValidationError{Field: "MajorVersions"}
++		}
++		seen := make(map[int64]struct{}, len(options.MajorVersions))
++		for _, version := range options.MajorVersions {
++			if version <= 0 {
++				return nil, &ValidationError{Field: "MajorVersions"}
++			}
++			if _, duplicate := seen[version]; duplicate {
++				return nil, &ValidationError{Field: "MajorVersions"}
++			}
++			seen[version] = struct{}{}
++		}
++	}
++
++	var query strings.Builder
++	appendQuery := func(name string, value string) {
++		if query.Len() == 0 {
++			query.WriteByte('?')
++		} else {
++			query.WriteByte('&')
++		}
++		query.WriteString(name)
++		query.WriteByte('=')
++		query.WriteString(url.QueryEscape(value))
++	}
++	if options.Active != nil {
++		appendQuery("active", strconv.FormatBool(*options.Active))
++	}
++	for _, version := range options.MajorVersions {
++		appendQuery("major_versions", strconv.FormatInt(version, 10))
++	}
++
++	target := "/vcenter/trusted-infrastructure/hosts/" +
++		url.PathEscape(host) + "/hardware/tpm" + query.String()
++	body, err := c.request(
++		ctx,
++		OperationListTPMs,
++		http.MethodGet,
++		target,
++		nil,
++		http.StatusOK,
++	)
++	if err != nil {
++		return nil, err
++	}
++
++	var wireItems []tpmSummaryWire
++	if isJSONNull(body) || decodeJSON(body, &wireItems) != nil {
++		return nil, protocol(OperationListTPMs, "invalid TPM collection")
++	}
++	items := make([]TPMSummary, len(wireItems))
++	for index, item := range wireItems {
++		if item.TPM == nil ||
++			strings.TrimSpace(*item.TPM) == "" ||
++			item.MajorVersion == nil ||
++			item.MinorVersion == nil ||
++			item.Active == nil {
++			return nil, protocol(OperationListTPMs, "invalid TPM summary")
++		}
++		items[index] = TPMSummary{
++			TPM:          *item.TPM,
++			MajorVersion: *item.MajorVersion,
++			MinorVersion: *item.MinorVersion,
++			Active:       *item.Active,
++		}
++	}
++	return items, nil
+ }
+ 
+ // GetTPMEventLog retrieves the measured-boot event log for one TPM.
+@@ -22,7 +152,94 @@
+ 	host string,
+ 	tpm string,
+ ) (TPMEventLog, error) {
+-	return TPMEventLog{}, &ValidationError{Field: "GetTPMEventLog: TODO"}
++	if err := validateCall(c, ctx); err != nil {
++		return TPMEventLog{}, err
++	}
++	if !validIdentifier(host) {
++		return TPMEventLog{}, &ValidationError{Field: "host"}
++	}
++	if !validIdentifier(tpm) {
++		return TPMEventLog{}, &ValidationError{Field: "tpm"}
++	}
++
++	target := "/vcenter/trusted-infrastructure/hosts/" +
++		url.PathEscape(host) + "/hardware/tpm/" +
++		url.PathEscape(tpm) + "/event-log"
++	body, err := c.request(
++		ctx,
++		OperationGetTPMEventLog,
++		http.MethodGet,
++		target,
++		nil,
++		http.StatusOK,
++	)
++	if err != nil {
++		return TPMEventLog{}, err
++	}
++
++	var wire eventLogWire
++	if isJSONNull(body) ||
++		decodeJSON(body, &wire) != nil ||
++		wire.Type == nil ||
++		wire.Truncated == nil ||
++		wire.Banks == nil {
++		return TPMEventLog{}, protocol(
++			OperationGetTPMEventLog,
++			"invalid event log",
++		)
++	}
++	if *wire.Type != "EFI_TCG2_EVENT_LOG_FORMAT_TCG_2" {
++		return TPMEventLog{}, protocol(
++			OperationGetTPMEventLog,
++			"unknown event-log type",
++		)
++	}
++	if wire.Data != nil {
++		if _, err := base64.StdEncoding.DecodeString(*wire.Data); err != nil {
++			return TPMEventLog{}, protocol(
++				OperationGetTPMEventLog,
++				"invalid event-log data",
++			)
++		}
++	}
++
++	banks := make([]PCRBank, len(*wire.Banks))
++	for index, bank := range *wire.Banks {
++		if bank.Algorithm == nil || bank.PCRs == nil {
++			return TPMEventLog{}, protocol(
++				OperationGetTPMEventLog,
++				"invalid PCR bank",
++			)
++		}
++		switch *bank.Algorithm {
++		case "SHA256", "SHA384", "SHA512", "SM3_256":
++		default:
++			return TPMEventLog{}, protocol(
++				OperationGetTPMEventLog,
++				"unknown PCR-bank algorithm",
++			)
++		}
++		pcrs := make(map[string]string, len(*bank.PCRs))
++		for register, value := range *bank.PCRs {
++			if _, err := base64.StdEncoding.DecodeString(value); err != nil {
++				return TPMEventLog{}, protocol(
++					OperationGetTPMEventLog,
++					"invalid PCR value",
++				)
++			}
++			pcrs[register] = value
++		}
++		banks[index] = PCRBank{
++			Algorithm: *bank.Algorithm,
++			PCRs:      pcrs,
++		}
++	}
++	return TPMEventLog{
++		Type:      *wire.Type,
++		Data:      wire.Data,
++		Truncated: *wire.Truncated,
++		Banks:     banks,
++	}, nil
+ }
+ 
+ // CreateLogBundle requests a vCenter support bundle containing logs.
+@@ -31,7 +248,59 @@
+ 	description string,
+ 	options BundleOptions,
+ ) (string, error) {
+-	return "", &ValidationError{Field: "CreateLogBundle: TODO"}
++	if err := validateCall(c, ctx); err != nil {
++		return "", err
++	}
++	if strings.TrimSpace(description) == "" {
++		return "", &ValidationError{Field: "description"}
++	}
++	if options.Components != nil {
++		if len(options.Components) == 0 {
++			return "", &ValidationError{Field: "Components"}
++		}
++		for name, components := range options.Components {
++			if strings.TrimSpace(name) == "" || len(components) == 0 {
++				return "", &ValidationError{Field: "Components"}
++			}
++			for _, component := range components {
++				if strings.TrimSpace(component) == "" {
++					return "", &ValidationError{Field: "Components"}
++				}
++			}
++		}
++	}
++	if options.Partition != nil &&
++		strings.TrimSpace(*options.Partition) == "" {
++		return "", &ValidationError{Field: "Partition"}
++	}
++
++	requestBody, err := json.Marshal(bundleRequest{
++		Description: description,
++		Components:  options.Components,
++		ContentType: "LOGS",
++		Partition:   options.Partition,
++	})
++	if err != nil {
++		return "", &ValidationError{Field: "BundleOptions"}
++	}
++	body, err := c.request(
++		ctx,
++		OperationCreateBundle,
++		http.MethodPost,
++		"/appliance/support-bundle?vmw-task=true",
++		requestBody,
++		http.StatusAccepted,
++	)
++	if err != nil {
++		return "", err
++	}
++
++	var taskID string
++	if decodeJSON(body, &taskID) != nil ||
++		strings.TrimSpace(taskID) == "" {
++		return "", protocol(OperationCreateBundle, "invalid task identifier")
++	}
++	return taskID, nil
+ }
+ 
+ // CollectDiagnosis gathers evidence before classifying the reported failure.
+@@ -41,5 +310,178 @@
+ 	host string,
+ 	description string,
+ ) (DiagnosisReport, error) {
+-	return DiagnosisReport{}, &ValidationError{Field: "CollectDiagnosis: TODO"}
++	if client == nil {
++		return DiagnosisReport{}, &ValidationError{Field: "client"}
++	}
++	items, err := client.ListTPMs(ctx, host, TPMListOptions{})
++	if err != nil {
++		return DiagnosisReport{}, err
++	}
++	if len(items) != 1 {
++		return DiagnosisReport{}, protocol(
++			OperationListTPMs,
++			"expected exactly one TPM",
++		)
++	}
++	eventLog, err := client.GetTPMEventLog(ctx, host, items[0].TPM)
++	if err != nil {
++		return DiagnosisReport{}, err
++	}
++	taskID, err := client.CreateLogBundle(ctx, description, BundleOptions{})
++	if err != nil {
++		return DiagnosisReport{}, err
++	}
++
++	diagnosis := Diagnosis{
++		Code:    DiagnosisUnresolvedReview,
++		Summary: SummaryUnresolvedReview,
++	}
++	if !items[0].Active {
++		diagnosis.Code = DiagnosisTPMInactive
++		diagnosis.Summary = SummaryTPMInactive
++	} else if eventLog.Truncated {
++		diagnosis.Code = DiagnosisEventLogTruncated
++		diagnosis.Summary = SummaryEventLogTruncated
++	}
++	return DiagnosisReport{
++		Host:              host,
++		TPM:               items[0],
++		EventLog:          eventLog,
++		SupportBundleTask: taskID,
++		Diagnosis:         diagnosis,
++	}, nil
++}
++
++type tpmSummaryWire struct {
++	TPM          *string `json:"tpm"`
++	MajorVersion *int64  `json:"major_version"`
++	MinorVersion *int64  `json:"minor_version"`
++	Active       *bool   `json:"active"`
++}
++
++type eventLogWire struct {
++	Type      *string        `json:"type"`
++	Data      *string        `json:"data"`
++	Truncated *bool          `json:"truncated"`
++	Banks     *[]pcrBankWire `json:"banks"`
++}
++
++type pcrBankWire struct {
++	Algorithm *string            `json:"algorithm"`
++	PCRs      *map[string]string `json:"pcrs"`
++}
++
++type bundleRequest struct {
++	Description string              `json:"description"`
++	Components  map[string][]string `json:"components,omitempty"`
++	ContentType string              `json:"content_type"`
++	Partition   *string             `json:"partition,omitempty"`
++}
++
++func (c *Client) request(
++	ctx context.Context,
++	operationID string,
++	method string,
++	target string,
++	body []byte,
++	expectedStatus int,
++) ([]byte, error) {
++	var reader io.Reader
++	if body != nil {
++		reader = bytes.NewReader(body)
++	}
++	request, err := http.NewRequestWithContext(
++		ctx,
++		method,
++		c.baseURL+target,
++		reader,
++	)
++	if err != nil {
++		return nil, &TransportError{OperationID: operationID, Err: err}
++	}
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set("vmware-api-session-id", c.sessionID)
++	if body != nil {
++		request.Header.Set("Content-Type", "application/json")
++	}
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		cause := err
++		if ctxErr := ctx.Err(); ctxErr != nil {
++			cause = ctxErr
++		}
++		return nil, &TransportError{OperationID: operationID, Err: cause}
++	}
++	defer response.Body.Close()
++
++	responseBody, readErr := io.ReadAll(
++		io.LimitReader(response.Body, maxResponseBytes+1),
++	)
++	if readErr != nil {
++		cause := readErr
++		if ctxErr := ctx.Err(); ctxErr != nil {
++			cause = ctxErr
++		}
++		return nil, &TransportError{OperationID: operationID, Err: cause}
++	}
++	if response.StatusCode != expectedStatus {
++		return nil, &APIError{
++			OperationID: operationID,
++			StatusCode:  response.StatusCode,
++		}
++	}
++	if len(responseBody) > maxResponseBytes {
++		return nil, protocol(operationID, "response exceeds size limit")
++	}
++	return responseBody, nil
++}
++
++func validateCall(c *Client, ctx context.Context) error {
++	if c == nil ||
++		c.httpClient == nil ||
++		c.baseURL == "" ||
++		c.sessionID == "" {
++		return &ValidationError{Field: "client"}
++	}
++	if ctx == nil {
++		return &ValidationError{Field: "context"}
++	}
++	return nil
++}
++
++func validIdentifier(value string) bool {
++	return strings.TrimSpace(value) != "" && !hasControl(value)
++}
++
++func hasControl(value string) bool {
++	for _, character := range value {
++		if character < 32 || character == 127 {
++			return true
++		}
++	}
++	return false
++}
++
++func decodeJSON(body []byte, destination any) error {
++	decoder := json.NewDecoder(bytes.NewReader(body))
++	if err := decoder.Decode(destination); err != nil {
++		return err
++	}
++	var extra any
++	if err := decoder.Decode(&extra); err != io.EOF {
++		if err == nil {
++			return errors.New("trailing JSON value")
++		}
++		return err
++	}
++	return nil
++}
++
++func isJSONNull(body []byte) bool {
++	return string(bytes.TrimSpace(body)) == "null"
++}
++
++func protocol(operationID string, reason string) *ProtocolError {
++	return &ProtocolError{OperationID: operationID, Reason: reason}
+ }

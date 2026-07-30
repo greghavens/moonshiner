@@ -1,0 +1,459 @@
+--- a/vcf_namespace_backup/client.py
++++ b/vcf_namespace_backup/client.py
+@@ -2,7 +2,19 @@
+ 
+ from __future__ import annotations
+ 
++import json
++import math
++from numbers import Real
++import time
+ from typing import Any
++from urllib.error import HTTPError, URLError
++from urllib.parse import quote, urlsplit
++from urllib.request import (
++    HTTPRedirectHandler,
++    ProxyHandler,
++    Request,
++    build_opener,
++)
+ 
+ 
+ GET_NAMESPACE_OPERATION = "Vcenter.Namespaces.Instances_getV2"
+@@ -18,18 +30,168 @@
+ class ApiError(RuntimeError):
+     """An HTTP or transport failure."""
+ 
++    def __init__(
++        self,
++        operation_id: str,
++        status_code: int | None,
++    ) -> None:
++        self.operation_id = operation_id
++        self.status_code = status_code
++        if status_code is None:
++            message = f"{operation_id} transport failed"
++        else:
++            message = f"{operation_id} returned HTTP {status_code}"
++        super().__init__(message)
++
+ 
+ class ProtocolError(RuntimeError):
+     """A malformed successful response or inconsistent inventory."""
+ 
++    def __init__(self, operation_id: str, reason: str) -> None:
++        self.operation_id = operation_id
++        super().__init__(f"{operation_id} returned invalid data: {reason}")
++
+ 
+ class TaskFailedError(RuntimeError):
+     """A backup task that reached FAILED."""
+ 
++    def __init__(self, task_id: str, task_info: dict[str, Any]) -> None:
++        self.task_id = task_id
++        self.task_info = task_info
++        super().__init__("the Supervisor backup task failed")
++
+ 
+ class PollTimeoutError(RuntimeError):
+     """A backup task that did not terminate within the poll limit."""
+ 
++    def __init__(self, task_id: str, max_polls: int) -> None:
++        self.task_id = task_id
++        self.max_polls = max_polls
++        super().__init__(
++            f"the Supervisor backup task did not finish after {max_polls} polls"
++        )
++
++
++class _NoRedirect(HTTPRedirectHandler):
++    def redirect_request(
++        self,
++        req: Request,
++        fp: Any,
++        code: int,
++        msg: str,
++        headers: Any,
++        newurl: str,
++    ) -> None:
++        return None
++
++
++def _origin(value: str, name: str) -> str:
++    if (
++        not isinstance(value, str)
++        or not value
++        or any(character.isspace() or ord(character) < 32 for character in value)
++    ):
++        raise ValueError(f"{name} must be an HTTP(S) origin")
++    try:
++        parsed = urlsplit(value)
++        parsed_port = parsed.port
++    except ValueError as exc:
++        raise ValueError(f"{name} must be an HTTP(S) origin") from exc
++    if (
++        parsed.scheme not in {"http", "https"}
++        or not parsed.netloc
++        or parsed.hostname is None
++        or parsed.username is not None
++        or parsed.password is not None
++        or parsed.path not in {"", "/"}
++        or parsed.query
++        or parsed.fragment
++    ):
++        raise ValueError(f"{name} must be an HTTP(S) origin")
++    if parsed_port is not None and not 0 < parsed_port < 65536:
++        raise ValueError(f"{name} must be an HTTP(S) origin")
++    return f"{parsed.scheme}://{parsed.netloc}"
++
++
++def _credential(value: str, name: str) -> str:
++    if (
++        not isinstance(value, str)
++        or not value.strip()
++        or "\r" in value
++        or "\n" in value
++    ):
++        raise ValueError(f"{name} must be a nonblank safe header value")
++    return value
++
++
++def _number(
++    value: Any,
++    name: str,
++    *,
++    positive: bool,
++) -> float:
++    if isinstance(value, bool) or not isinstance(value, Real):
++        raise ValueError(f"{name} must be a finite real number")
++    converted = float(value)
++    if not math.isfinite(converted):
++        raise ValueError(f"{name} must be finite")
++    if positive and converted <= 0:
++        raise ValueError(f"{name} must be positive")
++    if not positive and converted < 0:
++        raise ValueError(f"{name} must not be negative")
++    return converted
++
++
++def _nonblank(value: Any, name: str) -> str:
++    if not isinstance(value, str) or not value.strip():
++        raise ValueError(f"{name} must be a nonblank string")
++    return value
++
++
++def _decode_json(raw: bytes, operation_id: str) -> Any:
++    try:
++        return json.loads(raw.decode("utf-8"))
++    except (UnicodeDecodeError, json.JSONDecodeError):
++        raise ProtocolError(
++            operation_id,
++            "response is not valid UTF-8 JSON",
++        ) from None
++
++
++def _task_info(value: Any) -> dict[str, Any]:
++    if not isinstance(value, dict):
++        raise ProtocolError(GET_TASK_OPERATION, "task information is not an object")
++    required = {"cancelable", "description", "operation", "service", "status"}
++    if not required.issubset(value):
++        raise ProtocolError(GET_TASK_OPERATION, "task information is incomplete")
++
++    description = value["description"]
++    if not isinstance(description, dict):
++        raise ProtocolError(GET_TASK_OPERATION, "description is not an object")
++    if not {"args", "default_message", "id"}.issubset(description):
++        raise ProtocolError(GET_TASK_OPERATION, "description is incomplete")
++    if (
++        not isinstance(description["args"], list)
++        or any(not isinstance(item, str) for item in description["args"])
++        or not isinstance(description["default_message"], str)
++        or not isinstance(description["id"], str)
++    ):
++        raise ProtocolError(
++            GET_TASK_OPERATION,
++            "description members have invalid types",
++        )
++    for field in ("operation", "service"):
++        if not isinstance(value[field], str) or not value[field].strip():
++            raise ProtocolError(GET_TASK_OPERATION, f"{field} is invalid")
++    if not isinstance(value["cancelable"], bool):
++        raise ProtocolError(GET_TASK_OPERATION, "cancelable is not boolean")
++    if (
++        not isinstance(value["status"], str)
++        or value["status"]
++        not in {"PENDING", "RUNNING", "BLOCKED", "SUCCEEDED", "FAILED"}
++    ):
++        raise ProtocolError(GET_TASK_OPERATION, "task status is unknown")
++    return value
+ 
+ class NamespaceBackupClient:
+     """Back up a namespace's Supervisor around a stable VKS inventory."""
+@@ -45,7 +207,30 @@
+         poll_interval: float = 0.0,
+         max_polls: int = 8,
+     ) -> None:
+-        raise NotImplementedError("Implement the contract-backed client.")
++        self._vcenter_url = _origin(vcenter_url, "vcenter_url")
++        self._kubernetes_url = _origin(kubernetes_url, "kubernetes_url")
++        self._vcenter_session_id = _credential(
++            vcenter_session_id,
++            "vcenter_session_id",
++        )
++        self._kubernetes_token = _credential(
++            kubernetes_token,
++            "kubernetes_token",
++        )
++        self._timeout = _number(timeout, "timeout", positive=True)
++        self._poll_interval = _number(
++            poll_interval,
++            "poll_interval",
++            positive=False,
++        )
++        if (
++            isinstance(max_polls, bool)
++            or not isinstance(max_polls, int)
++            or max_polls <= 0
++        ):
++            raise ValueError("max_polls must be a positive integer")
++        self._max_polls = max_polls
++        self._opener = build_opener(ProxyHandler({}), _NoRedirect())
+ 
+     def backup_namespace(
+         self,
+@@ -53,6 +238,233 @@
+         *,
+         comment: str | None = None,
+     ) -> dict[str, object]:
+-        raise NotImplementedError(
+-            "Inventory, submit, poll, and verify the namespace backup."
++        namespace = _nonblank(namespace, "namespace")
++        if comment is not None and not isinstance(comment, str):
++            raise ValueError("comment must be a string when set")
++
++        encoded_namespace = quote(namespace, safe="")
++        namespace_info = self._request_json(
++            origin=self._vcenter_url,
++            path=(
++                "/api/vcenter/namespaces/instances/v2/"
++                + encoded_namespace
++            ),
++            method="GET",
++            operation_id=GET_NAMESPACE_OPERATION,
++            expected_status=200,
++            kubernetes=False,
++        )
++        if not isinstance(namespace_info, dict):
++            raise ProtocolError(
++                GET_NAMESPACE_OPERATION,
++                "namespace information is not an object",
++            )
++        supervisor = namespace_info.get("supervisor")
++        if not isinstance(supervisor, str) or not supervisor.strip():
++            raise ProtocolError(
++                GET_NAMESPACE_OPERATION,
++                "Supervisor identifier is invalid",
++            )
++        if namespace_info.get("config_status") != "RUNNING":
++            raise ProtocolError(
++                GET_NAMESPACE_OPERATION,
++                "namespace configuration is not RUNNING",
++            )
++
++        before = self._list_clusters(namespace, encoded_namespace)
++        body_object = {} if comment is None else {"comment": comment}
++        body = json.dumps(
++            body_object,
++            separators=(",", ":"),
++            ensure_ascii=False,
++        ).encode("utf-8")
++        task_id = self._request_json(
++            origin=self._vcenter_url,
++            path=(
++                "/api/vcenter/namespace-management/supervisors/"
++                + quote(supervisor, safe="")
++                + "/recovery/backup/jobs"
++            ),
++            method="POST",
++            operation_id=CREATE_BACKUP_OPERATION,
++            expected_status=200,
++            kubernetes=False,
++            body=body,
++        )
++        if not isinstance(task_id, str) or not task_id.strip():
++            raise ProtocolError(
++                CREATE_BACKUP_OPERATION,
++                "task identifier is invalid",
++            )
++
++        task_info, poll_count = self._poll_task(task_id)
++        after = self._list_clusters(namespace, encoded_namespace)
++        if before != after:
++            raise ProtocolError(
++                LIST_CLUSTERS_OPERATION,
++                "Cluster inventory changed during the backup",
++            )
++
++        return {
++            "namespace": namespace,
++            "supervisor": supervisor,
++            "clusters": after,
++            "backup": {
++                "operationId": CREATE_BACKUP_OPERATION,
++                "taskOperationId": GET_TASK_OPERATION,
++                "taskId": task_id,
++                "status": "SUCCEEDED",
++                "pollCount": poll_count,
++                "result": task_info.get("result"),
++            },
++        }
++
++    def _list_clusters(
++        self,
++        namespace: str,
++        encoded_namespace: str,
++    ) -> list[dict[str, str]]:
++        value = self._request_json(
++            origin=self._kubernetes_url,
++            path=(
++                "/apis/cluster.x-k8s.io/v1beta2/namespaces/"
++                + encoded_namespace
++                + "/clusters"
++            ),
++            method="GET",
++            operation_id=LIST_CLUSTERS_OPERATION,
++            expected_status=200,
++            kubernetes=True,
++        )
++        if (
++            not isinstance(value, dict)
++            or value.get("apiVersion") != "cluster.x-k8s.io/v1beta2"
++            or value.get("kind") != "ClusterList"
++            or not isinstance(value.get("items"), list)
++        ):
++            raise ProtocolError(
++                LIST_CLUSTERS_OPERATION,
++                "response is not a ClusterList",
++            )
++
++        projected: list[dict[str, str]] = []
++        names: set[str] = set()
++        for item in value["items"]:
++            if (
++                not isinstance(item, dict)
++                or item.get("apiVersion") != "cluster.x-k8s.io/v1beta2"
++                or item.get("kind") != "Cluster"
++            ):
++                raise ProtocolError(
++                    LIST_CLUSTERS_OPERATION,
++                    "collection contains an invalid Cluster",
++                )
++            metadata = item.get("metadata")
++            if not isinstance(metadata, dict):
++                raise ProtocolError(
++                    LIST_CLUSTERS_OPERATION,
++                    "Cluster metadata is invalid",
++                )
++            name = metadata.get("name")
++            if (
++                not isinstance(name, str)
++                or not name.strip()
++                or metadata.get("namespace") != namespace
++            ):
++                raise ProtocolError(
++                    LIST_CLUSTERS_OPERATION,
++                    "Cluster identity is invalid",
++                )
++            if name in names:
++                raise ProtocolError(
++                    LIST_CLUSTERS_OPERATION,
++                    "Cluster names are not unique",
++                )
++            names.add(name)
++            spec = item.get("spec")
++            topology = spec.get("topology") if isinstance(spec, dict) else None
++            version = (
++                topology.get("version")
++                if isinstance(topology, dict)
++                else None
++            )
++            if not isinstance(version, str) or not version.strip():
++                raise ProtocolError(
++                    LIST_CLUSTERS_OPERATION,
++                    "Cluster topology version is invalid",
++                )
++            projected.append(
++                {
++                    "name": name,
++                    "topologyVersion": version,
++                }
++            )
++        projected.sort(key=lambda item: item["name"])
++        return projected
++
++    def _poll_task(self, task_id: str) -> tuple[dict[str, Any], int]:
++        target = "/api/cis/tasks/" + quote(task_id, safe="")
++        for poll_count in range(1, self._max_polls + 1):
++            value = self._request_json(
++                origin=self._vcenter_url,
++                path=target,
++                method="GET",
++                operation_id=GET_TASK_OPERATION,
++                expected_status=200,
++                kubernetes=False,
++            )
++            info = _task_info(value)
++            status = info["status"]
++            if status == "SUCCEEDED":
++                return info, poll_count
++            if status == "FAILED":
++                raise TaskFailedError(task_id, info)
++            if self._poll_interval and poll_count < self._max_polls:
++                time.sleep(self._poll_interval)
++        raise PollTimeoutError(task_id, self._max_polls)
++
++    def _request_json(
++        self,
++        *,
++        origin: str,
++        path: str,
++        method: str,
++        operation_id: str,
++        expected_status: int,
++        kubernetes: bool,
++        body: bytes | None = None,
++    ) -> Any:
++        headers = {"Accept": "application/json"}
++        if kubernetes:
++            headers["Authorization"] = f"Bearer {self._kubernetes_token}"
++        else:
++            headers["vmware-api-session-id"] = self._vcenter_session_id
++        if body is not None:
++            headers["Content-Type"] = "application/json"
++
++        request = Request(
++            origin + path,
++            data=body,
++            headers=headers,
++            method=method,
+         )
++        try:
++            response = self._opener.open(request, timeout=self._timeout)
++            try:
++                status = response.status
++                raw = response.read()
++            finally:
++                response.close()
++        except HTTPError as exc:
++            status = exc.code
++            try:
++                exc.read()
++            finally:
++                exc.close()
++            raise ApiError(operation_id, status) from None
++        except (URLError, OSError, TimeoutError):
++            raise ApiError(operation_id, None) from None
++
++        if status != expected_status:
++            raise ApiError(operation_id, status)
++        return _decode_json(raw, operation_id)

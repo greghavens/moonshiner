@@ -1,0 +1,466 @@
+diff --git a/vcf_vks_retry/client.py b/vcf_vks_retry/client.py
+--- a/vcf_vks_retry/client.py
++++ b/vcf_vks_retry/client.py
+@@ -1,25 +1,74 @@
+-"""Implement the contract-pinned VCF 9.1 retry workflow here."""
++"""Dependency-free client for duplicate-safe VKS maintenance mutations."""
+ 
+ from __future__ import annotations
+ 
++import http.client
++import json
++import math
++import ssl
+ from collections.abc import Iterable
++from dataclasses import dataclass
++from typing import Any
++from urllib.parse import quote, urlsplit
+ 
+ 
+ class ApiError(RuntimeError):
+-    """HTTP or transport failure."""
++    """HTTP or transport failure with credential-safe diagnostics."""
++
++    def __init__(
++        self,
++        operation_id: str,
++        status_code: int | None = None,
++    ) -> None:
++        self.operation_id = operation_id
++        self.status_code = status_code
++        if status_code is None:
++            message = f"{operation_id} transport failure"
++        else:
++            message = f"{operation_id} returned HTTP {status_code}"
++        super().__init__(message)
+ 
+ 
+ class ProtocolError(RuntimeError):
+     """Malformed success response."""
+ 
++    def __init__(self, operation_id: str, message: str) -> None:
++        self.operation_id = operation_id
++        super().__init__(f"{operation_id}: {message}")
++
+ 
+ class NamespaceNotReadyError(RuntimeError):
+     """The Supervisor namespace is not RUNNING."""
+ 
++    def __init__(self, config_status: str) -> None:
++        self.config_status = config_status
++        super().__init__(
++            f"Supervisor namespace is not RUNNING: {config_status}"
++        )
++
++
++class _TransportFailure(Exception):
++    """Internal marker for a request whose HTTP outcome is unknown."""
++
++
++@dataclass(frozen=True)
++class _Origin:
++    scheme: str
++    host: str
++    port: int
++    authority: str
++
+ 
+ class VksRetryClient:
+     """Safely reconcile maintenance annotations on VKS Clusters."""
+ 
++    _NAMESPACE_OPERATION = "Vcenter.Namespaces.Instances_getV2"
++    _CLUSTER_GET_OPERATION = "getVksCluster"
++    _CLUSTER_PATCH_OPERATION = "patchVksClusterMetadata"
++    _MAINTENANCE_ID = "platform.vcf.vmware.com/maintenance-id"
++    _MAINTENANCE_NOTE = "platform.vcf.vmware.com/maintenance-note"
++    _CONFIG_STATUSES = {"CONFIGURING", "REMOVING", "RUNNING", "ERROR"}
++
+     def __init__(
+         self,
+         vcenter_url: str,
+@@ -29,7 +78,323 @@
+         *,
+         timeout: float = 10.0,
+     ) -> None:
+-        raise NotImplementedError("complete VksRetryClient")
++        self._vcenter = self._parse_origin(vcenter_url, "vcenter_url")
++        self._supervisor = self._parse_origin(
++            supervisor_url, "supervisor_url"
++        )
++        self._vcenter_session_id = self._credential(
++            vcenter_session_id, "vcenter_session_id"
++        )
++        self._kubernetes_token = self._credential(
++            kubernetes_token, "kubernetes_token"
++        )
++        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
++            raise TypeError("timeout must be a number")
++        if not math.isfinite(timeout) or timeout <= 0:
++            raise ValueError("timeout must be finite and positive")
++        self._timeout = float(timeout)
++
++    @staticmethod
++    def _required_string(value: object, name: str) -> str:
++        if not isinstance(value, str):
++            raise TypeError(f"{name} must be a string")
++        if not value.strip():
++            raise ValueError(f"{name} must not be blank")
++        return value
++
++    @classmethod
++    def _credential(cls, value: object, name: str) -> str:
++        value = cls._required_string(value, name)
++        if "\r" in value or "\n" in value:
++            raise ValueError(f"{name} contains an unsafe header character")
++        return value
++
++    @classmethod
++    def _parse_origin(cls, value: object, name: str) -> _Origin:
++        value = cls._required_string(value, name)
++        if any(character.isspace() for character in value):
++            raise ValueError(f"{name} must not contain whitespace")
++        try:
++            parsed = urlsplit(value)
++            port = parsed.port
++        except ValueError as error:
++            raise ValueError(f"{name} is not a valid HTTP(S) origin") from error
++        scheme = parsed.scheme.lower()
++        if scheme not in {"http", "https"}:
++            raise ValueError(f"{name} must use http or https")
++        if (
++            not parsed.netloc
++            or parsed.hostname is None
++            or parsed.username is not None
++            or parsed.password is not None
++            or parsed.path not in {"", "/"}
++            or parsed.query
++            or parsed.fragment
++        ):
++            raise ValueError(f"{name} must be an HTTP(S) origin")
++        if port is None:
++            port = 443 if scheme == "https" else 80
++        return _Origin(scheme, parsed.hostname, port, parsed.netloc)
++
++    def _connection(self, origin: _Origin) -> http.client.HTTPConnection:
++        if origin.scheme == "https":
++            return http.client.HTTPSConnection(
++                origin.host,
++                origin.port,
++                timeout=self._timeout,
++                context=ssl.create_default_context(),
++            )
++        return http.client.HTTPConnection(
++            origin.host,
++            origin.port,
++            timeout=self._timeout,
++        )
++
++    def _raw_request(
++        self,
++        *,
++        origin: _Origin,
++        operation_id: str,
++        method: str,
++        target: str,
++        auth_name: str,
++        auth_value: str,
++        expected_status: int,
++        body: bytes | None = None,
++        content_type: str | None = None,
++    ) -> bytes:
++        connection = self._connection(origin)
++        try:
++            connection.putrequest(
++                method,
++                target,
++                skip_host=True,
++                skip_accept_encoding=True,
++            )
++            connection.putheader("Host", origin.authority)
++            connection.putheader("Accept", "application/json")
++            connection.putheader(auth_name, auth_value)
++            if body is not None:
++                if content_type is None:
++                    raise AssertionError("body requires a content type")
++                connection.putheader("Content-Type", content_type)
++                connection.putheader("Content-Length", str(len(body)))
++            connection.endheaders(body)
++            response = connection.getresponse()
++            status = response.status
++            response_body = response.read()
++        except (OSError, TimeoutError, http.client.HTTPException):
++            raise _TransportFailure from None
++        finally:
++            connection.close()
++        if status != expected_status:
++            raise ApiError(operation_id, status)
++        return response_body
++
++    def _json_request(
++        self,
++        *,
++        origin: _Origin,
++        operation_id: str,
++        method: str,
++        target: str,
++        auth_name: str,
++        auth_value: str,
++        expected_status: int,
++        body: bytes | None = None,
++        content_type: str | None = None,
++    ) -> dict[str, Any]:
++        raw = self._raw_request(
++            origin=origin,
++            operation_id=operation_id,
++            method=method,
++            target=target,
++            auth_name=auth_name,
++            auth_value=auth_value,
++            expected_status=expected_status,
++            body=body,
++            content_type=content_type,
++        )
++        try:
++            decoded = json.loads(raw.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            raise ProtocolError(operation_id, "success body is not JSON") from None
++        if not isinstance(decoded, dict):
++            raise ProtocolError(
++                operation_id, "success body is not a JSON object"
++            )
++        return decoded
++
++    @staticmethod
++    def _segment(value: str) -> str:
++        return quote(value, safe="")
++
++    def _get_namespace(self, namespace: str) -> dict[str, Any]:
++        target = (
++            "/api/vcenter/namespaces/instances/v2/"
++            + self._segment(namespace)
++        )
++        try:
++            info = self._json_request(
++                origin=self._vcenter,
++                operation_id=self._NAMESPACE_OPERATION,
++                method="GET",
++                target=target,
++                auth_name="vmware-api-session-id",
++                auth_value=self._vcenter_session_id,
++                expected_status=200,
++            )
++        except _TransportFailure:
++            raise ApiError(self._NAMESPACE_OPERATION) from None
++
++        supervisor = info.get("supervisor")
++        if not isinstance(supervisor, str) or not supervisor.strip():
++            raise ProtocolError(
++                self._NAMESPACE_OPERATION,
++                "supervisor is missing or blank",
++            )
++        config_status = info.get("config_status")
++        if (
++            not isinstance(config_status, str)
++            or config_status not in self._CONFIG_STATUSES
++        ):
++            raise ProtocolError(
++                self._NAMESPACE_OPERATION,
++                "config_status is missing or unrecognized",
++            )
++        if config_status != "RUNNING":
++            raise NamespaceNotReadyError(config_status)
++        return info
++
++    def _cluster_target(self, namespace: str, cluster_name: str) -> str:
++        return (
++            "/apis/cluster.x-k8s.io/v1beta2/namespaces/"
++            + self._segment(namespace)
++            + "/clusters/"
++            + self._segment(cluster_name)
++        )
++
++    def _validate_cluster(
++        self,
++        value: dict[str, Any],
++        *,
++        namespace: str,
++        cluster_name: str,
++        operation_id: str,
++    ) -> dict[str, Any]:
++        if value.get("apiVersion") != "cluster.x-k8s.io/v1beta2":
++            raise ProtocolError(operation_id, "Cluster apiVersion is invalid")
++        if value.get("kind") != "Cluster":
++            raise ProtocolError(operation_id, "Cluster kind is invalid")
++        metadata = value.get("metadata")
++        if not isinstance(metadata, dict):
++            raise ProtocolError(operation_id, "Cluster metadata is invalid")
++        if metadata.get("name") != cluster_name:
++            raise ProtocolError(operation_id, "Cluster name does not match")
++        if metadata.get("namespace") != namespace:
++            raise ProtocolError(operation_id, "Cluster namespace does not match")
++        for property_name in ("uid", "resourceVersion"):
++            property_value = metadata.get(property_name)
++            if (
++                not isinstance(property_value, str)
++                or not property_value.strip()
++            ):
++                raise ProtocolError(
++                    operation_id,
++                    f"Cluster metadata.{property_name} is missing or blank",
++                )
++        if "annotations" in metadata and not isinstance(
++            metadata["annotations"], dict
++        ):
++            raise ProtocolError(
++                operation_id, "Cluster metadata.annotations is invalid"
++            )
++        return value
++
++    def _get_cluster(
++        self, namespace: str, cluster_name: str
++    ) -> dict[str, Any]:
++        target = self._cluster_target(namespace, cluster_name)
++        try:
++            value = self._json_request(
++                origin=self._supervisor,
++                operation_id=self._CLUSTER_GET_OPERATION,
++                method="GET",
++                target=target,
++                auth_name="Authorization",
++                auth_value=f"Bearer {self._kubernetes_token}",
++                expected_status=200,
++            )
++        except _TransportFailure:
++            raise ApiError(self._CLUSTER_GET_OPERATION) from None
++        return self._validate_cluster(
++            value,
++            namespace=namespace,
++            cluster_name=cluster_name,
++            operation_id=self._CLUSTER_GET_OPERATION,
++        )
++
++    def _desired_annotations(
++        self,
++        maintenance_id: str,
++        note: str | None,
++    ) -> dict[str, str]:
++        annotations = {self._MAINTENANCE_ID: maintenance_id}
++        if note is not None:
++            annotations[self._MAINTENANCE_NOTE] = note
++        return annotations
++
++    @staticmethod
++    def _has_desired(
++        cluster: dict[str, Any], desired: dict[str, str]
++    ) -> bool:
++        metadata = cluster["metadata"]
++        annotations = metadata.get("annotations", {})
++        return all(annotations.get(key) == value for key, value in desired.items())
++
++    def _patch_cluster(
++        self,
++        *,
++        namespace: str,
++        cluster_name: str,
++        resource_version: str,
++        desired: dict[str, str],
++    ) -> dict[str, Any]:
++        patch = {
++            "metadata": {
++                "resourceVersion": resource_version,
++                "annotations": desired,
++            }
++        }
++        encoded = json.dumps(
++            patch,
++            ensure_ascii=False,
++            allow_nan=False,
++            separators=(",", ":"),
++        ).encode("utf-8")
++        value = self._json_request(
++            origin=self._supervisor,
++            operation_id=self._CLUSTER_PATCH_OPERATION,
++            method="PATCH",
++            target=self._cluster_target(namespace, cluster_name),
++            auth_name="Authorization",
++            auth_value=f"Bearer {self._kubernetes_token}",
++            expected_status=200,
++            body=encoded,
++            content_type="application/merge-patch+json",
++        )
++        cluster = self._validate_cluster(
++            value,
++            namespace=namespace,
++            cluster_name=cluster_name,
++            operation_id=self._CLUSTER_PATCH_OPERATION,
++        )
++        if not self._has_desired(cluster, desired):
++            raise ProtocolError(
++                self._CLUSTER_PATCH_OPERATION,
++                "PATCH response lacks the desired annotations",
++            )
++        return cluster
+ 
+     def mark_clusters(
+         self,
+@@ -40,4 +405,58 @@
+         note: str | None = None,
+     ) -> list[dict[str, object]]:
+         """Set the maintenance annotations and return final Cluster objects."""
+-        raise NotImplementedError("complete mark_clusters")
++        namespace = self._required_string(namespace, "namespace")
++        maintenance_id = self._required_string(
++            maintenance_id, "maintenance_id"
++        )
++        if note is not None:
++            note = self._required_string(note, "note")
++        if isinstance(cluster_names, (str, bytes)):
++            raise TypeError("cluster_names must be an iterable of strings")
++        try:
++            names = list(cluster_names)
++        except TypeError:
++            raise TypeError(
++                "cluster_names must be an iterable of strings"
++            ) from None
++        if not names:
++            raise ValueError("cluster_names must not be empty")
++        validated_names = [
++            self._required_string(name, "cluster name") for name in names
++        ]
++        if len(validated_names) != len(set(validated_names)):
++            raise ValueError("cluster_names must be unique")
++
++        self._get_namespace(namespace)
++        desired = self._desired_annotations(maintenance_id, note)
++        final: list[dict[str, object]] = []
++        for cluster_name in validated_names:
++            observed = self._get_cluster(namespace, cluster_name)
++            if self._has_desired(observed, desired):
++                final.append(observed)
++                continue
++            try:
++                updated = self._patch_cluster(
++                    namespace=namespace,
++                    cluster_name=cluster_name,
++                    resource_version=observed["metadata"]["resourceVersion"],
++                    desired=desired,
++                )
++            except _TransportFailure:
++                recovered = self._get_cluster(namespace, cluster_name)
++                if self._has_desired(recovered, desired):
++                    updated = recovered
++                else:
++                    try:
++                        updated = self._patch_cluster(
++                            namespace=namespace,
++                            cluster_name=cluster_name,
++                            resource_version=recovered["metadata"][
++                                "resourceVersion"
++                            ],
++                            desired=desired,
++                        )
++                    except _TransportFailure:
++                        raise ApiError(self._CLUSTER_PATCH_OPERATION) from None
++            final.append(updated)
++        return final
+

@@ -1,0 +1,392 @@
+diff --git a/VksSupervisorAuth.psd1 b/VksSupervisorAuth.psd1
+new file mode 100644
+index 0000000..b07fc3e
+--- /dev/null
++++ b/VksSupervisorAuth.psd1
+@@ -0,0 +1,21 @@
++@{
++    RootModule = 'VksSupervisorAuth.psm1'
++    ModuleVersion = '1.0.0'
++    GUID = 'd13f3218-6187-467c-b179-0e4017dd24a9'
++    Author = 'VCF Platform Engineering'
++    Description = 'Concurrency-safe vSphere Supervisor and VKS API session client.'
++    PowerShellVersion = '7.0'
++    RequiredModules = @('VMware.Sdk.Vcf.SddcManager')
++    FunctionsToExport = @(
++        'Connect-VksSupervisor',
++        'Disconnect-VksSupervisor',
++        'Get-VksKubeApiServerSettings',
++        'Get-VksSupervisorNamespaces',
++        'New-VksVcfCredentialUpdateSpec',
++        'Set-VksKubeApiServerSettings',
++        'Update-VksSupervisorCredential'
++    )
++    CmdletsToExport = @()
++    VariablesToExport = @()
++    AliasesToExport = @()
++}
+diff --git a/VksSupervisorAuth.psm1 b/VksSupervisorAuth.psm1
+new file mode 100644
+index 0000000..88a0eab
+--- /dev/null
++++ b/VksSupervisorAuth.psm1
+@@ -0,0 +1,359 @@
++Set-StrictMode -Version Latest
++
++function ConvertFrom-VksSecureString {
++    param([Parameter(Mandatory)][securestring]$Value)
++    return [System.Net.NetworkCredential]::new('', $Value).Password
++}
++
++function Assert-VksClient {
++    param([Parameter(Mandatory)]$Client)
++    if (-not (@($Client.PSObject.TypeNames) -contains 'VksSupervisorAuth.Client')) {
++        throw 'Client was not created by Connect-VksSupervisor'
++    }
++}
++
++function New-VksSession {
++    param(
++        [Parameter(Mandatory)][string]$BaseUrl,
++        [Parameter(Mandatory)][pscredential]$Credential
++    )
++    $password = ConvertFrom-VksSecureString -Value $Credential.Password
++    $request = $null
++    $response = $null
++    $httpClient = $null
++    try {
++        $pair = $Credential.UserName + ':' + $password
++        $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($pair))
++        $httpClient = [System.Net.Http.HttpClient]::new()
++        $request = [System.Net.Http.HttpRequestMessage]::new(
++            [System.Net.Http.HttpMethod]::Post,
++            "$BaseUrl/api/session"
++        )
++        $request.Headers.Authorization =
++            [System.Net.Http.Headers.AuthenticationHeaderValue]::new('Basic', $encoded)
++        $request.Headers.Accept.Add(
++            [System.Net.Http.Headers.MediaTypeWithQualityHeaderValue]::new('application/json')
++        )
++        $response = $httpClient.SendAsync($request).GetAwaiter().GetResult()
++        if ([int]$response.StatusCode -ne 201) {
++            throw "vCenter session creation failed with HTTP $([int]$response.StatusCode)"
++        }
++        $responseBody = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
++        $token = $responseBody | ConvertFrom-Json
++        if ($token -isnot [string] -or [string]::IsNullOrEmpty($token)) {
++            throw 'vCenter session creation returned an invalid token'
++        }
++        return $token
++    } finally {
++        if ($null -ne $response) { $response.Dispose() }
++        if ($null -ne $request) { $request.Dispose() }
++        if ($null -ne $httpClient) { $httpClient.Dispose() }
++        $password = $null
++        $pair = $null
++        $encoded = $null
++        $responseBody = $null
++    }
++}
++
++function Remove-VksSession {
++    param(
++        [Parameter(Mandatory)][string]$BaseUrl,
++        [Parameter(Mandatory)][string]$Session
++    )
++    $response = Invoke-WebRequest -Uri "$BaseUrl/api/session" -Method Delete `
++        -Headers @{
++            'vmware-api-session-id' = $Session
++            Accept = 'application/json'
++        } -SkipHttpErrorCheck
++    if ([int]$response.StatusCode -ne 204) {
++        throw "vCenter session deletion failed with HTTP $([int]$response.StatusCode)"
++    }
++}
++
++function Enter-VksSessionLease {
++    param([Parameter(Mandatory)]$Client)
++    Assert-VksClient -Client $Client
++    $lock = $Client._SyncRoot
++    $lock.EnterWriteLock()
++    try {
++        if ($Client._Closed) {
++            throw 'The VKS Supervisor client is closed'
++        }
++        $session = [string]$Client._CurrentSession
++        if ([string]::IsNullOrEmpty($session)) {
++            throw 'The VKS Supervisor client has no active session'
++        }
++        $count = 0
++        if ($Client._InFlight.ContainsKey($session)) {
++            $count = [int]$Client._InFlight[$session]
++        }
++        $Client._InFlight[$session] = $count + 1
++        return [pscustomobject]@{ Session = $session }
++    } finally {
++        $lock.ExitWriteLock()
++    }
++}
++
++function Exit-VksSessionLease {
++    param(
++        [Parameter(Mandatory)]$Client,
++        [Parameter(Mandatory)][string]$Session
++    )
++    $delete = $null
++    $lock = $Client._SyncRoot
++    $lock.EnterWriteLock()
++    try {
++        if (-not $Client._InFlight.ContainsKey($Session)) {
++            throw 'Session lease accounting is inconsistent'
++        }
++        $remaining = [int]$Client._InFlight[$Session] - 1
++        if ($remaining -lt 0) {
++            throw 'Session lease accounting is inconsistent'
++        }
++        if ($remaining -eq 0) {
++            $Client._InFlight.Remove($Session)
++            if ($Client._Retired.Contains($Session)) {
++                $Client._Retired.Remove($Session) > $null
++                $delete = $Session
++            }
++        } else {
++            $Client._InFlight[$Session] = $remaining
++        }
++    } finally {
++        $lock.ExitWriteLock()
++    }
++    if ($null -ne $delete) {
++        Remove-VksSession -BaseUrl $Client.BaseUrl -Session $delete
++    }
++}
++
++function Switch-VksSession {
++    param(
++        [Parameter(Mandatory)]$Client,
++        [Parameter(Mandatory)][string]$NewSession
++    )
++    $delete = $null
++    $lock = $Client._SyncRoot
++    $lock.EnterWriteLock()
++    try {
++        if ($Client._Closed) {
++            throw 'The VKS Supervisor client is closed'
++        }
++        $old = [string]$Client._CurrentSession
++        $Client._CurrentSession = $NewSession
++        $Client._Generation = [long]$Client._Generation + 1
++        if (-not [string]::IsNullOrEmpty($old)) {
++            $Client._Retired.Add($old) > $null
++            $oldCount = 0
++            if ($Client._InFlight.ContainsKey($old)) {
++                $oldCount = [int]$Client._InFlight[$old]
++            }
++            if ($oldCount -eq 0) {
++                $Client._Retired.Remove($old) > $null
++                $Client._InFlight.Remove($old)
++                $delete = $old
++            }
++        }
++    } finally {
++        $lock.ExitWriteLock()
++    }
++    return $delete
++}
++
++function Invoke-VksApi {
++    param(
++        [Parameter(Mandatory)]$Client,
++        [Parameter(Mandatory)][ValidateSet('GET', 'PATCH')][string]$Method,
++        [Parameter(Mandatory)][string]$Path,
++        [string]$JsonBody,
++        [Parameter(Mandatory)][int]$ExpectedStatus
++    )
++    $lease = Enter-VksSessionLease -Client $Client
++    try {
++        $parameters = @{
++            Uri = $Client.BaseUrl + '/api' + $Path
++            Method = $Method
++            Headers = @{
++                'vmware-api-session-id' = $lease.Session
++                Accept = 'application/json'
++            }
++            SkipHttpErrorCheck = $true
++        }
++        if ($PSBoundParameters.ContainsKey('JsonBody')) {
++            $parameters.Body = $JsonBody
++            $parameters.ContentType = 'application/json'
++        }
++        $response = Invoke-WebRequest @parameters
++        if ([int]$response.StatusCode -ne $ExpectedStatus) {
++            throw "vSphere Automation API request failed with HTTP $([int]$response.StatusCode)"
++        }
++        if (-not [string]::IsNullOrWhiteSpace($response.Content)) {
++            return $response.Content | ConvertFrom-Json
++        }
++    } finally {
++        Exit-VksSessionLease -Client $Client -Session $lease.Session
++    }
++}
++
++function New-VksVcfCredentialUpdateSpec {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)][string]$ResourceName,
++        [Parameter(Mandatory)][string]$ResourceId,
++        [Parameter(Mandatory)][string]$Username,
++        [Parameter(Mandatory)][securestring]$NewPassword
++    )
++    $password = ConvertFrom-VksSecureString -Value $NewPassword
++    try {
++        $credential = Initialize-VcfBaseCredential -CredentialType 'API' `
++            -AccountType 'SERVICE' -Username $Username -Password $password
++        $resource = Initialize-VcfResourceCredentials -ResourceName $ResourceName `
++            -ResourceId $ResourceId -ResourceType 'VCENTER' -Credentials $credential
++        $resources =
++            [System.Collections.Generic.List[VMware.Bindings.Vcf.SddcManager.Model.ResourceCredentials]]::new()
++        $resources.Add($resource)
++        return Initialize-VcfCredentialsUpdateSpec -OperationType 'UPDATE' -Elements $resources
++    } finally {
++        $password = $null
++    }
++}
++
++function Connect-VksSupervisor {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)][string]$BaseUrl,
++        [Parameter(Mandatory)][pscredential]$Credential
++    )
++    $base = $BaseUrl.TrimEnd('/')
++    $uri = $null
++    if (-not [uri]::TryCreate($BaseUrl, [UriKind]::Absolute, [ref]$uri) -or
++        $uri.Scheme -notin @('http', 'https') -or
++        $uri.AbsolutePath -cne '/' -or
++        -not [string]::IsNullOrEmpty($uri.Query) -or
++        -not [string]::IsNullOrEmpty($uri.Fragment)) {
++        throw 'BaseUrl must contain only an absolute HTTP or HTTPS scheme and authority'
++    }
++    $session = New-VksSession -BaseUrl $base -Credential $Credential
++    $client = [pscustomobject]@{
++        BaseUrl = $base
++        _SyncRoot = [System.Threading.ReaderWriterLockSlim]::new()
++        _CurrentSession = $session
++        _Generation = [long]0
++        _InFlight = @{}
++        _Retired = [System.Collections.Generic.HashSet[string]]::new(
++            [StringComparer]::Ordinal
++        )
++        _Closed = $false
++    }
++    $client.PSObject.TypeNames.Insert(0, 'VksSupervisorAuth.Client')
++    return $client
++}
++
++function Update-VksSupervisorCredential {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]$Client,
++        [Parameter(Mandatory)][pscredential]$Credential
++    )
++    Assert-VksClient -Client $Client
++    $newSession = New-VksSession -BaseUrl $Client.BaseUrl -Credential $Credential
++    try {
++        $oldToDelete = Switch-VksSession -Client $Client -NewSession $newSession
++    } catch {
++        Remove-VksSession -BaseUrl $Client.BaseUrl -Session $newSession
++        throw
++    }
++    if ($null -ne $oldToDelete) {
++        Remove-VksSession -BaseUrl $Client.BaseUrl -Session $oldToDelete
++    }
++}
++
++function Disconnect-VksSupervisor {
++    [CmdletBinding()]
++    param([Parameter(Mandatory)]$Client)
++    Assert-VksClient -Client $Client
++    $delete = $null
++    $lock = $Client._SyncRoot
++    $lock.EnterWriteLock()
++    try {
++        if ($Client._Closed) { return }
++        $Client._Closed = $true
++        $current = [string]$Client._CurrentSession
++        $Client._CurrentSession = $null
++        if (-not [string]::IsNullOrEmpty($current)) {
++            $Client._Retired.Add($current) > $null
++            $count = 0
++            if ($Client._InFlight.ContainsKey($current)) {
++                $count = [int]$Client._InFlight[$current]
++            }
++            if ($count -eq 0) {
++                $Client._Retired.Remove($current) > $null
++                $Client._InFlight.Remove($current)
++                $delete = $current
++            }
++        }
++    } finally {
++        $lock.ExitWriteLock()
++    }
++    if ($null -ne $delete) {
++        Remove-VksSession -BaseUrl $Client.BaseUrl -Session $delete
++    }
++}
++
++function Get-VksSupervisorNamespaces {
++    [CmdletBinding()]
++    param([Parameter(Mandatory)]$Client)
++    Invoke-VksApi -Client $Client -Method GET `
++        -Path '/vcenter/namespaces/instances/v2' -ExpectedStatus 200
++}
++
++function Get-VksKubeApiServerSettings {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]$Client,
++        [Parameter(Mandatory)][string]$Supervisor
++    )
++    $segment = [uri]::EscapeDataString($Supervisor)
++    Invoke-VksApi -Client $Client -Method GET `
++        -Path "/vcenter/namespace-management/supervisors/$segment/workloads/kube-api-server-settings" `
++        -ExpectedStatus 200
++}
++
++function Set-VksKubeApiServerSettings {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]$Client,
++        [Parameter(Mandatory)][string]$Supervisor,
++        [string[]]$CertificateDnsNamesToAdd,
++        [string[]]$CertificateDnsNamesToRemove,
++        [bool]$NamespaceApiFairnessEnabled
++    )
++    $update = [ordered]@{}
++    if ($PSBoundParameters.ContainsKey('CertificateDnsNamesToAdd')) {
++        $update['certificate_dns_names_to_add_list'] = @($CertificateDnsNamesToAdd)
++    }
++    if ($PSBoundParameters.ContainsKey('CertificateDnsNamesToRemove')) {
++        $update['certificate_dns_names_to_remove_list'] = @($CertificateDnsNamesToRemove)
++    }
++    if ($PSBoundParameters.ContainsKey('NamespaceApiFairnessEnabled')) {
++        $update['namespace_api_fairness_enabled'] = $NamespaceApiFairnessEnabled
++    }
++    if ($update.Count -eq 0) {
++        throw 'At least one Kubernetes API server setting must be supplied'
++    }
++    $segment = [uri]::EscapeDataString($Supervisor)
++    $json = ConvertTo-Json -InputObject $update -Compress -Depth 5
++    Invoke-VksApi -Client $Client -Method PATCH `
++        -Path "/vcenter/namespace-management/supervisors/$segment/workloads/kube-api-server-settings" `
++        -JsonBody $json -ExpectedStatus 204 > $null
++}
++
++Export-ModuleMember -Function @(
++    'Connect-VksSupervisor',
++    'Disconnect-VksSupervisor',
++    'Get-VksKubeApiServerSettings',
++    'Get-VksSupervisorNamespaces',
++    'New-VksVcfCredentialUpdateSpec',
++    'Set-VksKubeApiServerSettings',
++    'Update-VksSupervisorCredential'
++)

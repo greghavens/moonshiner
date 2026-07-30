@@ -1,0 +1,726 @@
+--- a/src/VcfVksPagedInventoryClient.java
++++ b/src/VcfVksPagedInventoryClient.java
+@@ -1,13 +1,47 @@
++import java.io.ByteArrayOutputStream;
+ import java.io.IOException;
++import java.io.InputStream;
++import java.math.BigDecimal;
+ import java.net.URI;
++import java.net.URISyntaxException;
+ import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.ByteBuffer;
++import java.nio.charset.CharacterCodingException;
++import java.nio.charset.CodingErrorAction;
++import java.nio.charset.StandardCharsets;
+ import java.time.Duration;
++import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.HashSet;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Map;
++import java.util.Set;
+ 
+ /**
+  * Single-file VCF 9.1 vSphere Supervisor and paginated VKS inventory client.
+  */
+ public final class VcfVksPagedInventoryClient {
++    private static final String VCENTER_OPERATION =
++            "Vcenter.Namespaces.User.Instances_list";
++    private static final String KUBERNETES_OPERATION =
++            "cluster.x-k8s.io/v1beta2:namespaced-clusters:list";
++    private static final String VCENTER_PATH =
++            "/vcenter/namespaces-user/namespaces";
++    private static final String CLUSTER_PREFIX =
++            "/apis/cluster.x-k8s.io/v1beta2/namespaces/";
++    private static final String CLUSTER_SUFFIX = "/clusters";
++    private static final int MAX_RESPONSE_BYTES = 64 * 1024;
++
++    private final URI vcenterApiBase;
++    private final String vcenterSessionId;
++    private final String kubernetesAccessToken;
++    private final int pageSize;
++    private final Duration timeout;
++    private final HttpClient httpClient;
++
+     public record ClusterRecord(
+             String supervisorNamespace,
+             URI supervisorEndpoint,
+@@ -24,11 +58,673 @@
+             int pageSize,
+             Duration timeout,
+             HttpClient httpClient) {
+-        throw new UnsupportedOperationException("TODO");
++        this.vcenterApiBase = requireVcenterApiBase(vcenterApiBase);
++        this.vcenterSessionId =
++                requireCredential(vcenterSessionId, "vCenter session");
++        this.kubernetesAccessToken =
++                requireCredential(kubernetesAccessToken, "Kubernetes token");
++        if (pageSize < 1 || pageSize > 1000) {
++            throw new IllegalArgumentException(
++                    "pageSize must be between 1 and 1000");
++        }
++        this.pageSize = pageSize;
++        if (timeout == null || timeout.isZero() || timeout.isNegative()) {
++            throw new IllegalArgumentException("timeout must be positive");
++        }
++        this.timeout = timeout;
++        if (httpClient == null
++                || httpClient.followRedirects() != HttpClient.Redirect.NEVER) {
++            throw new IllegalArgumentException(
++                    "httpClient must be non-null and reject redirects");
++        }
++        this.httpClient = httpClient;
+     }
+ 
+     public List<ClusterRecord> listInventory()
+             throws IOException, InterruptedException {
+-        throw new UnsupportedOperationException("TODO");
++        List<NamespaceSummary> namespaces = listNamespaces();
++        List<ClusterRecord> result = new ArrayList<>();
++
++        for (NamespaceSummary namespace : namespaces) {
++            Set<String> names = new HashSet<>();
++            Set<String> continuationTokens = new HashSet<>();
++            String continuation = null;
++            do {
++                Page page = listClusterPage(
++                        namespace, continuation, names);
++                result.addAll(page.records());
++                continuation = page.continuation();
++                if (continuation != null
++                        && !continuation.isEmpty()
++                        && !continuationTokens.add(continuation)) {
++                    throw protocolFailure(
++                            KUBERNETES_OPERATION,
++                            "repeated continuation token");
++                }
++            } while (continuation != null && !continuation.isEmpty());
++        }
++
++        result.sort(Comparator
++                .comparing(ClusterRecord::supervisorNamespace)
++                .thenComparing(ClusterRecord::name));
++        return List.copyOf(result);
++    }
++
++    private List<NamespaceSummary> listNamespaces()
++            throws IOException, InterruptedException {
++        URI uri = URI.create(vcenterApiBase.toString() + VCENTER_PATH);
++        HttpRequest request = HttpRequest.newBuilder(uri)
++                .timeout(timeout)
++                .header("Accept", "application/json")
++                .header("vmware-api-session-id", vcenterSessionId)
++                .GET()
++                .build();
++        byte[] body = exchange(request, 200, VCENTER_OPERATION);
++        List<Object> values = requireArray(
++                parseJson(body, VCENTER_OPERATION),
++                VCENTER_OPERATION,
++                "response");
++        List<NamespaceSummary> result = new ArrayList<>(values.size());
++        Set<String> names = new HashSet<>();
++        for (Object value : values) {
++            Map<String, Object> summary = requireObject(
++                    value, VCENTER_OPERATION, "namespace summary");
++            String namespace = requiredString(
++                    summary, "namespace", VCENTER_OPERATION);
++            String masterHost = requiredString(
++                    summary, "master_host", VCENTER_OPERATION);
++            if (!names.add(namespace)) {
++                throw protocolFailure(
++                        VCENTER_OPERATION, "duplicate namespace");
++            }
++            result.add(new NamespaceSummary(
++                    namespace, normalizeEndpoint(masterHost)));
++        }
++        result.sort(Comparator.comparing(NamespaceSummary::namespace));
++        return List.copyOf(result);
++    }
++
++    private Page listClusterPage(
++            NamespaceSummary namespace,
++            String continuation,
++            Set<String> names)
++            throws IOException, InterruptedException {
++        StringBuilder target = new StringBuilder()
++                .append(namespace.endpoint())
++                .append(CLUSTER_PREFIX)
++                .append(rfc3986(namespace.namespace()))
++                .append(CLUSTER_SUFFIX)
++                .append('?');
++        if (continuation != null) {
++            target.append("continue=")
++                    .append(rfc3986(continuation))
++                    .append('&');
++        }
++        target.append("limit=").append(pageSize);
++
++        HttpRequest request = HttpRequest.newBuilder(
++                        URI.create(target.toString()))
++                .timeout(timeout)
++                .header("Accept", "application/json")
++                .header(
++                        "Authorization",
++                        "Bearer " + kubernetesAccessToken)
++                .GET()
++                .build();
++        byte[] body = exchange(request, 200, KUBERNETES_OPERATION);
++        Map<String, Object> list = requireObject(
++                parseJson(body, KUBERNETES_OPERATION),
++                KUBERNETES_OPERATION,
++                "ClusterList");
++        requireExactString(
++                list,
++                "apiVersion",
++                "cluster.x-k8s.io/v1beta2",
++                KUBERNETES_OPERATION);
++        requireExactString(
++                list, "kind", "ClusterList", KUBERNETES_OPERATION);
++
++        String next = null;
++        if (list.containsKey("metadata")) {
++            Map<String, Object> metadata = requireObject(
++                    list.get("metadata"),
++                    KUBERNETES_OPERATION,
++                    "ClusterList.metadata");
++            if (metadata.containsKey("continue")) {
++                Object value = metadata.get("continue");
++                if (!(value instanceof String stringValue)) {
++                    throw protocolFailure(
++                            KUBERNETES_OPERATION,
++                            "metadata.continue must be a string");
++                }
++                next = stringValue;
++            }
++        }
++
++        List<Object> items = requireArray(
++                list.get("items"),
++                KUBERNETES_OPERATION,
++                "ClusterList.items");
++        List<ClusterRecord> records = new ArrayList<>(items.size());
++        for (Object value : items) {
++            Map<String, Object> cluster = requireObject(
++                    value, KUBERNETES_OPERATION, "Cluster");
++            requireExactString(
++                    cluster,
++                    "apiVersion",
++                    "cluster.x-k8s.io/v1beta2",
++                    KUBERNETES_OPERATION);
++            requireExactString(
++                    cluster, "kind", "Cluster", KUBERNETES_OPERATION);
++            Map<String, Object> metadata = requiredObject(
++                    cluster, "metadata", KUBERNETES_OPERATION);
++            requireExactString(
++                    metadata,
++                    "namespace",
++                    namespace.namespace(),
++                    KUBERNETES_OPERATION);
++            String name = requiredString(
++                    metadata, "name", KUBERNETES_OPERATION);
++            String uid = requiredString(
++                    metadata, "uid", KUBERNETES_OPERATION);
++            if (!names.add(name)) {
++                throw protocolFailure(
++                        KUBERNETES_OPERATION,
++                        "duplicate cluster name across pages");
++            }
++            Map<String, Object> spec = requiredObject(
++                    cluster, "spec", KUBERNETES_OPERATION);
++            Map<String, Object> topology = requiredObject(
++                    spec, "topology", KUBERNETES_OPERATION);
++            String version = requiredString(
++                    topology, "version", KUBERNETES_OPERATION);
++            Map<String, Object> status = requiredObject(
++                    cluster, "status", KUBERNETES_OPERATION);
++            String phase = requiredString(
++                    status, "phase", KUBERNETES_OPERATION);
++            records.add(new ClusterRecord(
++                    namespace.namespace(),
++                    namespace.endpoint(),
++                    name,
++                    uid,
++                    version,
++                    phase));
++        }
++        return new Page(List.copyOf(records), next);
++    }
++
++    private byte[] exchange(
++            HttpRequest request,
++            int expectedStatus,
++            String operation)
++            throws IOException, InterruptedException {
++        HttpResponse<InputStream> response;
++        try {
++            response = httpClient.send(
++                    request, HttpResponse.BodyHandlers.ofInputStream());
++        } catch (InterruptedException interrupted) {
++            Thread.currentThread().interrupt();
++            throw interrupted;
++        } catch (IOException failure) {
++            throw apiFailure(operation, "transport failure");
++        }
++
++        byte[] body;
++        try (InputStream stream = response.body()) {
++            body = readBounded(stream, operation);
++        } catch (IOException failure) {
++            throw apiFailure(operation, "response read failure");
++        }
++        if (response.statusCode() != expectedStatus) {
++            throw apiFailure(operation, "unexpected HTTP status");
++        }
++        List<String> contentTypes =
++                response.headers().allValues("Content-Type");
++        if (contentTypes.size() != 1
++                || !isJsonMediaType(contentTypes.get(0))) {
++            throw protocolFailure(operation, "response is not JSON");
++        }
++        return body;
++    }
++
++    private static byte[] readBounded(InputStream input, String operation)
++            throws IOException {
++        ByteArrayOutputStream output = new ByteArrayOutputStream();
++        byte[] buffer = new byte[8192];
++        int total = 0;
++        while (true) {
++            int read = input.read(buffer);
++            if (read == -1) {
++                return output.toByteArray();
++            }
++            total += read;
++            if (total > MAX_RESPONSE_BYTES) {
++                throw protocolFailure(operation, "response is too large");
++            }
++            output.write(buffer, 0, read);
++        }
++    }
++
++    private static boolean isJsonMediaType(String value) {
++        int semicolon = value.indexOf(';');
++        String mediaType =
++                (semicolon < 0 ? value : value.substring(0, semicolon)).trim();
++        return mediaType.equalsIgnoreCase("application/json");
++    }
++
++    private static URI requireVcenterApiBase(URI value) {
++        if (!isHttpOrigin(value)
++                || !"/api".equals(value.getRawPath())
++                || value.getRawQuery() != null
++                || value.getRawFragment() != null) {
++            throw new IllegalArgumentException(
++                    "vcenterApiBase must be an HTTP(S) /api URI");
++        }
++        return value;
++    }
++
++    private static URI normalizeEndpoint(String value) throws IOException {
++        URI parsed;
++        try {
++            parsed = value.contains("://")
++                    ? new URI(value)
++                    : new URI("https://" + value);
++        } catch (URISyntaxException failure) {
++            throw protocolFailure(
++                    VCENTER_OPERATION, "invalid master_host");
++        }
++        String path = parsed.getRawPath();
++        if (!isHttpOrigin(parsed)
++                || (path != null && !path.isEmpty() && !path.equals("/"))
++                || parsed.getRawQuery() != null
++                || parsed.getRawFragment() != null) {
++            throw protocolFailure(
++                    VCENTER_OPERATION, "invalid master_host");
++        }
++        try {
++            return new URI(
++                    parsed.getScheme().toLowerCase(),
++                    null,
++                    parsed.getHost(),
++                    parsed.getPort(),
++                    null,
++                    null,
++                    null);
++        } catch (URISyntaxException impossible) {
++            throw protocolFailure(
++                    VCENTER_OPERATION, "invalid master_host");
++        }
++    }
++
++    private static boolean isHttpOrigin(URI value) {
++        if (value == null || !value.isAbsolute()) {
++            return false;
++        }
++        String scheme = value.getScheme();
++        return ("http".equalsIgnoreCase(scheme)
++                || "https".equalsIgnoreCase(scheme))
++                && value.getHost() != null
++                && value.getRawUserInfo() == null;
++    }
++
++    private static String requireCredential(String value, String label) {
++        if (value == null
++                || value.isBlank()
++                || value.indexOf('\r') >= 0
++                || value.indexOf('\n') >= 0) {
++            throw new IllegalArgumentException(label + " is invalid");
++        }
++        return value;
++    }
++
++    private static String rfc3986(String value) {
++        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
++        StringBuilder encoded = new StringBuilder(bytes.length);
++        char[] hex = "0123456789ABCDEF".toCharArray();
++        for (byte item : bytes) {
++            int octet = item & 0xff;
++            if ((octet >= 'A' && octet <= 'Z')
++                    || (octet >= 'a' && octet <= 'z')
++                    || (octet >= '0' && octet <= '9')
++                    || octet == '-'
++                    || octet == '.'
++                    || octet == '_'
++                    || octet == '~') {
++                encoded.append((char) octet);
++            } else {
++                encoded.append('%')
++                        .append(hex[octet >>> 4])
++                        .append(hex[octet & 15]);
++            }
++        }
++        return encoded.toString();
++    }
++
++    private static Object parseJson(byte[] bytes, String operation)
++            throws IOException {
++        String text;
++        try {
++            text = StandardCharsets.UTF_8.newDecoder()
++                    .onMalformedInput(CodingErrorAction.REPORT)
++                    .onUnmappableCharacter(CodingErrorAction.REPORT)
++                    .decode(ByteBuffer.wrap(bytes))
++                    .toString();
++        } catch (CharacterCodingException failure) {
++            throw protocolFailure(operation, "response is not UTF-8");
++        }
++        try {
++            return new JsonParser(text).parse();
++        } catch (JsonFailure failure) {
++            throw protocolFailure(operation, "response is malformed JSON");
++        }
++    }
++
++    @SuppressWarnings("unchecked")
++    private static Map<String, Object> requireObject(
++            Object value, String operation, String label) throws IOException {
++        if (!(value instanceof Map<?, ?>)) {
++            throw protocolFailure(operation, label + " must be an object");
++        }
++        return (Map<String, Object>) value;
++    }
++
++    private static Map<String, Object> requiredObject(
++            Map<String, Object> owner, String key, String operation)
++            throws IOException {
++        if (!owner.containsKey(key)) {
++            throw protocolFailure(operation, "required object is absent");
++        }
++        return requireObject(owner.get(key), operation, key);
++    }
++
++    @SuppressWarnings("unchecked")
++    private static List<Object> requireArray(
++            Object value, String operation, String label) throws IOException {
++        if (!(value instanceof List<?>)) {
++            throw protocolFailure(operation, label + " must be an array");
++        }
++        return (List<Object>) value;
++    }
++
++    private static String requiredString(
++            Map<String, Object> owner, String key, String operation)
++            throws IOException {
++        Object value = owner.get(key);
++        if (!(value instanceof String stringValue)
++                || stringValue.isBlank()) {
++            throw protocolFailure(
++                    operation, "required string is absent");
++        }
++        return stringValue;
++    }
++
++    private static void requireExactString(
++            Map<String, Object> owner,
++            String key,
++            String expected,
++            String operation)
++            throws IOException {
++        Object value = owner.get(key);
++        if (!(value instanceof String stringValue)
++                || !stringValue.equals(expected)) {
++            throw protocolFailure(
++                    operation, "identity field is invalid");
++        }
++    }
++
++    private static IOException apiFailure(
++            String operation, String detail) {
++        return new IOException(operation + " request failed: " + detail);
++    }
++
++    private static IOException protocolFailure(
++            String operation, String detail) {
++        return new IOException(operation + " protocol violation: " + detail);
++    }
++
++    private record NamespaceSummary(String namespace, URI endpoint) {
++    }
++
++    private record Page(
++            List<ClusterRecord> records, String continuation) {
++    }
++
++    private static final class JsonFailure extends Exception {
++        private static final long serialVersionUID = 1L;
++
++        JsonFailure() {
++            super(null, null, false, false);
++        }
++    }
++
++    private static final class JsonParser {
++        private final String text;
++        private int index;
++        private int depth;
++
++        JsonParser(String text) {
++            this.text = text;
++        }
++
++        Object parse() throws JsonFailure {
++            Object value = value();
++            whitespace();
++            if (index != text.length()) {
++                throw new JsonFailure();
++            }
++            return value;
++        }
++
++        private Object value() throws JsonFailure {
++            whitespace();
++            if (index >= text.length() || depth > 128) {
++                throw new JsonFailure();
++            }
++            char current = text.charAt(index);
++            if (current == '{') {
++                return object();
++            }
++            if (current == '[') {
++                return array();
++            }
++            if (current == '"') {
++                return string();
++            }
++            if (current == 't') {
++                literal("true");
++                return Boolean.TRUE;
++            }
++            if (current == 'f') {
++                literal("false");
++                return Boolean.FALSE;
++            }
++            if (current == 'n') {
++                literal("null");
++                return null;
++            }
++            return number();
++        }
++
++        private Map<String, Object> object() throws JsonFailure {
++            index++;
++            depth++;
++            Map<String, Object> result = new LinkedHashMap<>();
++            whitespace();
++            if (take('}')) {
++                depth--;
++                return result;
++            }
++            while (true) {
++                whitespace();
++                if (index >= text.length() || text.charAt(index) != '"') {
++                    throw new JsonFailure();
++                }
++                String key = string();
++                whitespace();
++                require(':');
++                Object value = value();
++                if (result.containsKey(key)) {
++                    throw new JsonFailure();
++                }
++                result.put(key, value);
++                whitespace();
++                if (take('}')) {
++                    depth--;
++                    return result;
++                }
++                require(',');
++            }
++        }
++
++        private List<Object> array() throws JsonFailure {
++            index++;
++            depth++;
++            List<Object> result = new ArrayList<>();
++            whitespace();
++            if (take(']')) {
++                depth--;
++                return result;
++            }
++            while (true) {
++                result.add(value());
++                whitespace();
++                if (take(']')) {
++                    depth--;
++                    return result;
++                }
++                require(',');
++            }
++        }
++
++        private String string() throws JsonFailure {
++            require('"');
++            StringBuilder result = new StringBuilder();
++            while (index < text.length()) {
++                char current = text.charAt(index++);
++                if (current == '"') {
++                    return result.toString();
++                }
++                if (current == '\\') {
++                    if (index >= text.length()) {
++                        throw new JsonFailure();
++                    }
++                    char escaped = text.charAt(index++);
++                    switch (escaped) {
++                        case '"' -> result.append('"');
++                        case '\\' -> result.append('\\');
++                        case '/' -> result.append('/');
++                        case 'b' -> result.append('\b');
++                        case 'f' -> result.append('\f');
++                        case 'n' -> result.append('\n');
++                        case 'r' -> result.append('\r');
++                        case 't' -> result.append('\t');
++                        case 'u' -> result.append(unicode());
++                        default -> throw new JsonFailure();
++                    }
++                } else {
++                    if (current < 0x20) {
++                        throw new JsonFailure();
++                    }
++                    result.append(current);
++                }
++            }
++            throw new JsonFailure();
++        }
++
++        private char unicode() throws JsonFailure {
++            if (index + 4 > text.length()) {
++                throw new JsonFailure();
++            }
++            int value = 0;
++            for (int count = 0; count < 4; count++) {
++                int digit = Character.digit(text.charAt(index++), 16);
++                if (digit < 0) {
++                    throw new JsonFailure();
++                }
++                value = value * 16 + digit;
++            }
++            return (char) value;
++        }
++
++        private BigDecimal number() throws JsonFailure {
++            int start = index;
++            if (take('-')) {
++                // Sign consumed.
++            }
++            if (take('0')) {
++                if (index < text.length()
++                        && Character.isDigit(text.charAt(index))) {
++                    throw new JsonFailure();
++                }
++            } else {
++                digits();
++            }
++            if (take('.')) {
++                digits();
++            }
++            if (index < text.length()
++                    && (text.charAt(index) == 'e'
++                    || text.charAt(index) == 'E')) {
++                index++;
++                if (!take('+')) {
++                    take('-');
++                }
++                digits();
++            }
++            if (start == index) {
++                throw new JsonFailure();
++            }
++            try {
++                return new BigDecimal(text.substring(start, index));
++            } catch (NumberFormatException failure) {
++                throw new JsonFailure();
++            }
++        }
++
++        private void digits() throws JsonFailure {
++            int start = index;
++            while (index < text.length()
++                    && Character.isDigit(text.charAt(index))) {
++                index++;
++            }
++            if (start == index) {
++                throw new JsonFailure();
++            }
++        }
++
++        private void literal(String expected) throws JsonFailure {
++            if (!text.startsWith(expected, index)) {
++                throw new JsonFailure();
++            }
++            index += expected.length();
++        }
++
++        private void require(char expected) throws JsonFailure {
++            if (!take(expected)) {
++                throw new JsonFailure();
++            }
++        }
++
++        private boolean take(char expected) {
++            if (index < text.length() && text.charAt(index) == expected) {
++                index++;
++                return true;
++            }
++            return false;
++        }
++
++        private void whitespace() {
++            while (index < text.length()) {
++                char current = text.charAt(index);
++                if (current == ' '
++                        || current == '\n'
++                        || current == '\r'
++                        || current == '\t') {
++                    index++;
++                } else {
++                    return;
++                }
++            }
++        }
+     }
+ }

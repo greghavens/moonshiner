@@ -1,0 +1,643 @@
+--- a/VcenterEvcClient.java
++++ b/VcenterEvcClient.java
+@@ -1,16 +1,55 @@
+ import java.io.IOException;
++import java.math.BigDecimal;
+ import java.net.URI;
++import java.net.URISyntaxException;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.ByteBuffer;
++import java.nio.charset.CharacterCodingException;
++import java.nio.charset.CodingErrorAction;
++import java.nio.charset.StandardCharsets;
+ import java.time.Duration;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Map;
+ 
+ /**
+  * Complete this dependency-free VCF 9.1 vCenter Automation client.
+  */
+ public final class VcenterEvcClient {
++    private static final String CHECK_OPERATION =
++            "Vcenter.Cluster.EvcMode_checkSet$Task";
++    private static final String TASK_OPERATION = "Cis.Tasks_get";
++    private static final String SET_OPERATION =
++            "Vcenter.Cluster.EvcMode_set$Task";
++    private static final char[] HEX =
++            "0123456789ABCDEF".toCharArray();
++
+     public record FeatureMask(String key, String name, String value) {
++        public FeatureMask {
++            requireText(key, "mask key");
++            requireText(name, "mask name");
++            requireText(value, "mask value");
++        }
+     }
+ 
+     public record EvcMode(String key, List<FeatureMask> masks) {
++        public EvcMode {
++            requireText(key, "EVC key");
++            if (masks == null) {
++                throw new IllegalArgumentException(
++                        "masks must not be null");
++            }
++            for (FeatureMask mask : masks) {
++                if (mask == null) {
++                    throw new IllegalArgumentException(
++                            "masks must not contain null");
++                }
++            }
++            masks = List.copyOf(masks);
++        }
+     }
+ 
+     public record ApplyResult(
+@@ -77,17 +116,582 @@
+         }
+     }
+ 
++    private final String apiRoot;
++    private final String sessionId;
++    private final Duration requestTimeout;
++    private final int maxPolls;
++    private final HttpClient httpClient;
++
+     public VcenterEvcClient(
+             URI apiRoot,
+             String sessionId,
+             Duration requestTimeout,
+             int maxPolls) {
+-        throw new UnsupportedOperationException("TODO");
++        this.apiRoot = validateApiRoot(apiRoot);
++        this.sessionId = validateSessionId(sessionId);
++        if (requestTimeout == null
++                || requestTimeout.isZero()
++                || requestTimeout.isNegative()) {
++            throw new IllegalArgumentException(
++                    "requestTimeout must be positive");
++        }
++        if (maxPolls <= 0) {
++            throw new IllegalArgumentException(
++                    "maxPolls must be positive");
++        }
++        this.requestTimeout = requestTimeout;
++        this.maxPolls = maxPolls;
++        this.httpClient = HttpClient.newBuilder()
++                .connectTimeout(requestTimeout)
++                .followRedirects(HttpClient.Redirect.NEVER)
++                .build();
+     }
+ 
+     public ApplyResult applySafely(
+             String clusterId,
+             EvcMode desiredMode) throws IOException, InterruptedException {
+-        throw new UnsupportedOperationException("TODO");
++        requireText(clusterId, "clusterId");
++        byte[] setSpec = encodeSetSpec(desiredMode);
++        String cluster = encodePathSegment(clusterId);
++
++        URI checkUri = URI.create(
++                apiRoot + "/vcenter/cluster/" + cluster
++                + "/evc-mode?action=check-set&vmw-task=true");
++        HttpRequest checkRequest = jsonRequest(checkUri)
++                .POST(HttpRequest.BodyPublishers.ofByteArray(setSpec))
++                .build();
++        HttpResponse<byte[]> checkResponse = send(checkRequest);
++        requireStatus(CHECK_OPERATION, checkResponse, 202);
++
++        final String precheckTaskId;
++        try {
++            precheckTaskId = requireJsonString(
++                    checkResponse.body(), "precheck task");
++        } catch (IOException exception) {
++            throw precheckFailure(
++                    "precheck returned an invalid task handle",
++                    null, null, -1);
++        }
++        pollPrecheck(precheckTaskId);
++
++        URI setUri = URI.create(
++                apiRoot + "/vcenter/cluster/" + cluster
++                + "/evc-mode?vmw-task=true");
++        HttpRequest setRequest = jsonRequest(setUri)
++                .PUT(HttpRequest.BodyPublishers.ofByteArray(setSpec))
++                .build();
++        HttpResponse<byte[]> setResponse = send(setRequest);
++        requireStatus(SET_OPERATION, setResponse, 202);
++        String mutationTaskId = requireJsonString(
++                setResponse.body(), "mutation task");
++        return new ApplyResult(
++                precheckTaskId, mutationTaskId, desiredMode == null);
++    }
++
++    private void pollPrecheck(String taskId)
++            throws IOException, InterruptedException {
++        URI taskUri = URI.create(
++                apiRoot + "/cis/tasks/" + encodePathSegment(taskId));
++        for (int poll = 1; poll <= maxPolls; poll++) {
++            HttpRequest request = baseRequest(taskUri).GET().build();
++            HttpResponse<byte[]> response = send(request);
++            requireStatus(TASK_OPERATION, response, 200);
++
++            final Map<?, ?> task;
++            try {
++                Object parsed = parseJson(response.body());
++                if (!(parsed instanceof Map<?, ?> value)) {
++                    throw protocol("task response is not an object");
++                }
++                task = value;
++            } catch (IOException exception) {
++                throw precheckFailure(
++                        "precheck task response is malformed",
++                        taskId, null, -1);
++            }
++
++            Object statusValue = task.get("status");
++            if (!(statusValue instanceof String status)) {
++                throw precheckFailure(
++                        "precheck task has no string status",
++                        taskId, null, -1);
++            }
++            switch (status) {
++                case "PENDING", "RUNNING", "BLOCKED" -> {
++                    if (poll == maxPolls) {
++                        throw precheckFailure(
++                                "precheck poll limit was reached",
++                                taskId, status, -1);
++                    }
++                }
++                case "FAILED" -> throw precheckFailure(
++                        "precheck task failed",
++                        taskId, status, -1);
++                case "SUCCEEDED" -> {
++                    if (!task.containsKey("result")
++                            || task.get("result") == null) {
++                        return;
++                    }
++                    Object result = task.get("result");
++                    if (!(result instanceof List<?> checks)) {
++                        throw precheckFailure(
++                                "precheck result is not an array",
++                                taskId, status, -1);
++                    }
++                    if (!checks.isEmpty()) {
++                        throw precheckFailure(
++                                "precheck reported compatibility errors",
++                                taskId, status, checks.size());
++                    }
++                    return;
++                }
++                default -> throw precheckFailure(
++                        "precheck task has an unknown status",
++                        taskId, status, -1);
++            }
++        }
++        throw new AssertionError("unreachable");
++    }
++
++    private HttpRequest.Builder baseRequest(URI target) {
++        return HttpRequest.newBuilder(target)
++                .timeout(requestTimeout)
++                .header("vmware-api-session-id", sessionId)
++                .header("Accept", "application/json");
++    }
++
++    private HttpRequest.Builder jsonRequest(URI target) {
++        return baseRequest(target)
++                .header("Content-Type", "application/json");
++    }
++
++    private HttpResponse<byte[]> send(HttpRequest request)
++            throws IOException, InterruptedException {
++        try {
++            return httpClient.send(
++                    request, HttpResponse.BodyHandlers.ofByteArray());
++        } catch (InterruptedException exception) {
++            Thread.currentThread().interrupt();
++            throw exception;
++        }
++    }
++
++    private static void requireStatus(
++            String operationId,
++            HttpResponse<byte[]> response,
++            int expected) throws VcenterApiException {
++        if (response.statusCode() != expected) {
++            throw new VcenterApiException(
++                    operationId,
++                    response.statusCode(),
++                    response.body());
++        }
++    }
++
++    private static byte[] encodeSetSpec(EvcMode mode) {
++        if (mode == null) {
++            return "{}".getBytes(StandardCharsets.UTF_8);
++        }
++        StringBuilder json = new StringBuilder();
++        json.append("{\"evc_mode\":{\"key\":")
++                .append(quoteJson(mode.key()))
++                .append(",\"masks\":[");
++        for (int index = 0; index < mode.masks().size(); index++) {
++            if (index != 0) {
++                json.append(',');
++            }
++            FeatureMask mask = mode.masks().get(index);
++            json.append("{\"key\":")
++                    .append(quoteJson(mask.key()))
++                    .append(",\"name\":")
++                    .append(quoteJson(mask.name()))
++                    .append(",\"value\":")
++                    .append(quoteJson(mask.value()))
++                    .append('}');
++        }
++        return json.append("]}}")
++                .toString()
++                .getBytes(StandardCharsets.UTF_8);
++    }
++
++    private static String validateApiRoot(URI value) {
++        if (value == null
++                || !value.isAbsolute()
++                || value.isOpaque()
++                || value.getScheme() == null
++                || (!value.getScheme().equalsIgnoreCase("http")
++                    && !value.getScheme().equalsIgnoreCase("https"))
++                || value.getHost() == null
++                || value.getRawUserInfo() != null
++                || value.getRawQuery() != null
++                || value.getRawFragment() != null
++                || !"/api".equals(value.getRawPath())) {
++            throw new IllegalArgumentException(
++                    "apiRoot must be an HTTP(S) /api URL");
++        }
++        try {
++            return new URI(
++                    value.getScheme().toLowerCase(),
++                    null,
++                    value.getHost(),
++                    value.getPort(),
++                    "/api",
++                    null,
++                    null).toASCIIString();
++        } catch (URISyntaxException impossible) {
++            throw new IllegalArgumentException(
++                    "apiRoot must be an HTTP(S) /api URL",
++                    impossible);
++        }
++    }
++
++    private static String validateSessionId(String value) {
++        if (value == null || value.isBlank()) {
++            throw new IllegalArgumentException("invalid session ID");
++        }
++        for (int index = 0; index < value.length(); index++) {
++            char item = value.charAt(index);
++            if (item < 0x21 || item > 0x7e) {
++                throw new IllegalArgumentException("invalid session ID");
++            }
++        }
++        return value;
++    }
++
++    private static void requireText(String value, String name) {
++        if (value == null || value.isBlank() || !wellFormed(value)) {
++            throw new IllegalArgumentException(
++                    name + " must be nonblank valid Unicode");
++        }
++    }
++
++    private static boolean wellFormed(String value) {
++        for (int index = 0; index < value.length(); index++) {
++            char item = value.charAt(index);
++            if (Character.isHighSurrogate(item)) {
++                if (index + 1 >= value.length()
++                        || !Character.isLowSurrogate(
++                                value.charAt(index + 1))) {
++                    return false;
++                }
++                index++;
++            } else if (Character.isLowSurrogate(item)) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    private static String encodePathSegment(String value)
++            throws IOException {
++        if (!wellFormed(value)) {
++            throw protocol("path segment is not valid Unicode");
++        }
++        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
++        StringBuilder result = new StringBuilder(bytes.length);
++        for (byte item : bytes) {
++            int current = item & 0xff;
++            if ((current >= 'a' && current <= 'z')
++                    || (current >= 'A' && current <= 'Z')
++                    || (current >= '0' && current <= '9')
++                    || current == '-'
++                    || current == '.'
++                    || current == '_'
++                    || current == '~') {
++                result.append((char) current);
++            } else {
++                result.append('%')
++                        .append(HEX[current >>> 4])
++                        .append(HEX[current & 0x0f]);
++            }
++        }
++        return result.toString();
++    }
++
++    private static String quoteJson(String value) {
++        if (!wellFormed(value)) {
++            throw new IllegalArgumentException(
++                    "JSON string is not valid Unicode");
++        }
++        StringBuilder result = new StringBuilder(value.length() + 2);
++        result.append('"');
++        for (int index = 0; index < value.length(); index++) {
++            char item = value.charAt(index);
++            switch (item) {
++                case '"' -> result.append("\\\"");
++                case '\\' -> result.append("\\\\");
++                case '\b' -> result.append("\\b");
++                case '\f' -> result.append("\\f");
++                case '\n' -> result.append("\\n");
++                case '\r' -> result.append("\\r");
++                case '\t' -> result.append("\\t");
++                default -> {
++                    if (item < 0x20) {
++                        result.append("\\u")
++                                .append(HEX[(item >>> 12) & 0xf])
++                                .append(HEX[(item >>> 8) & 0xf])
++                                .append(HEX[(item >>> 4) & 0xf])
++                                .append(HEX[item & 0xf]);
++                    } else {
++                        result.append(item);
++                    }
++                }
++            }
++        }
++        return result.append('"').toString();
++    }
++
++    private static String requireJsonString(
++            byte[] bytes,
++            String label) throws IOException {
++        Object value = parseJson(bytes);
++        if (!(value instanceof String text) || text.isBlank()) {
++            throw protocol(label + " is not a nonblank JSON string");
++        }
++        return text;
++    }
++
++    private static Object parseJson(byte[] bytes) throws IOException {
++        final String text;
++        try {
++            text = StandardCharsets.UTF_8.newDecoder()
++                    .onMalformedInput(CodingErrorAction.REPORT)
++                    .onUnmappableCharacter(CodingErrorAction.REPORT)
++                    .decode(ByteBuffer.wrap(bytes))
++                    .toString();
++        } catch (CharacterCodingException exception) {
++            throw protocol("response is not valid UTF-8");
++        }
++        JsonParser parser = new JsonParser(text);
++        Object value = parser.parseValue(0);
++        parser.skipWhitespace();
++        if (!parser.atEnd()) {
++            throw protocol("response has trailing JSON data");
++        }
++        return value;
++    }
++
++    private static IOException protocol(String detail) {
++        return new IOException("vCenter protocol error: " + detail);
++    }
++
++    private static PrecheckFailedException precheckFailure(
++            String detail,
++            String taskId,
++            String status,
++            int checkCount) {
++        return new PrecheckFailedException(
++                "vCenter EVC precheck did not pass: " + detail,
++                taskId,
++                status,
++                checkCount);
++    }
++
++    private static final class JsonParser {
++        private final String text;
++        private int index;
++
++        JsonParser(String text) {
++            this.text = text;
++        }
++
++        boolean atEnd() {
++            return index == text.length();
++        }
++
++        void skipWhitespace() {
++            while (index < text.length()) {
++                char item = text.charAt(index);
++                if (item == ' ' || item == '\n'
++                        || item == '\r' || item == '\t') {
++                    index++;
++                } else {
++                    break;
++                }
++            }
++        }
++
++        Object parseValue(int depth) throws IOException {
++            if (depth > 64) {
++                throw protocol("JSON nesting is too deep");
++            }
++            skipWhitespace();
++            if (atEnd()) {
++                throw protocol("JSON value is missing");
++            }
++            return switch (text.charAt(index)) {
++                case '"' -> parseString();
++                case '{' -> parseObject(depth + 1);
++                case '[' -> parseArray(depth + 1);
++                case 't' -> parseLiteral("true", Boolean.TRUE);
++                case 'f' -> parseLiteral("false", Boolean.FALSE);
++                case 'n' -> parseLiteral("null", null);
++                default -> parseNumber();
++            };
++        }
++
++        private Map<String, Object> parseObject(int depth)
++                throws IOException {
++            index++;
++            LinkedHashMap<String, Object> result =
++                    new LinkedHashMap<>();
++            skipWhitespace();
++            if (take('}')) {
++                return result;
++            }
++            while (true) {
++                skipWhitespace();
++                if (atEnd() || text.charAt(index) != '"') {
++                    throw protocol("JSON object key is missing");
++                }
++                String key = parseString();
++                skipWhitespace();
++                require(':');
++                Object value = parseValue(depth);
++                if (result.containsKey(key)) {
++                    throw protocol("JSON object has a duplicate key");
++                }
++                result.put(key, value);
++                skipWhitespace();
++                if (take('}')) {
++                    return result;
++                }
++                require(',');
++            }
++        }
++
++        private List<Object> parseArray(int depth)
++                throws IOException {
++            index++;
++            ArrayList<Object> result = new ArrayList<>();
++            skipWhitespace();
++            if (take(']')) {
++                return result;
++            }
++            while (true) {
++                result.add(parseValue(depth));
++                skipWhitespace();
++                if (take(']')) {
++                    return result;
++                }
++                require(',');
++            }
++        }
++
++        private String parseString() throws IOException {
++            require('"');
++            StringBuilder result = new StringBuilder();
++            while (!atEnd()) {
++                char item = text.charAt(index++);
++                if (item == '"') {
++                    if (!wellFormed(result.toString())) {
++                        throw protocol("JSON string has invalid Unicode");
++                    }
++                    return result.toString();
++                }
++                if (item < 0x20) {
++                    throw protocol("JSON string has a control character");
++                }
++                if (item != '\\') {
++                    result.append(item);
++                    continue;
++                }
++                if (atEnd()) {
++                    throw protocol("JSON escape is incomplete");
++                }
++                char escaped = text.charAt(index++);
++                switch (escaped) {
++                    case '"' -> result.append('"');
++                    case '\\' -> result.append('\\');
++                    case '/' -> result.append('/');
++                    case 'b' -> result.append('\b');
++                    case 'f' -> result.append('\f');
++                    case 'n' -> result.append('\n');
++                    case 'r' -> result.append('\r');
++                    case 't' -> result.append('\t');
++                    case 'u' -> result.append(parseHexCodeUnit());
++                    default -> throw protocol("JSON escape is invalid");
++                }
++            }
++            throw protocol("JSON string is unterminated");
++        }
++
++        private char parseHexCodeUnit() throws IOException {
++            if (index + 4 > text.length()) {
++                throw protocol("JSON Unicode escape is incomplete");
++            }
++            int value = 0;
++            for (int count = 0; count < 4; count++) {
++                int digit = Character.digit(text.charAt(index++), 16);
++                if (digit < 0) {
++                    throw protocol("JSON Unicode escape is invalid");
++                }
++                value = (value << 4) | digit;
++            }
++            return (char) value;
++        }
++
++        private Object parseLiteral(
++                String literal,
++                Object value) throws IOException {
++            if (!text.startsWith(literal, index)) {
++                throw protocol("JSON literal is invalid");
++            }
++            index += literal.length();
++            return value;
++        }
++
++        private BigDecimal parseNumber() throws IOException {
++            int start = index;
++            if (take('-') && atEnd()) {
++                throw protocol("JSON number is incomplete");
++            }
++            if (take('0')) {
++                if (!atEnd() && Character.isDigit(text.charAt(index))) {
++                    throw protocol("JSON number has a leading zero");
++                }
++            } else {
++                takeDigits(true);
++            }
++            if (take('.')) {
++                takeDigits(true);
++            }
++            if (take('e') || take('E')) {
++                take('+');
++                take('-');
++                takeDigits(true);
++            }
++            try {
++                return new BigDecimal(text.substring(start, index));
++            } catch (NumberFormatException exception) {
++                throw protocol("JSON number is invalid");
++            }
++        }
++
++        private void takeDigits(boolean requireOne)
++                throws IOException {
++            int start = index;
++            while (!atEnd()
++                    && Character.isDigit(text.charAt(index))) {
++                index++;
++            }
++            if (requireOne && start == index) {
++                throw protocol("JSON number is incomplete");
++            }
++        }
++
++        private boolean take(char expected) {
++            if (!atEnd() && text.charAt(index) == expected) {
++                index++;
++                return true;
++            }
++            return false;
++        }
++
++        private void require(char expected) throws IOException {
++            if (!take(expected)) {
++                throw protocol("JSON syntax is invalid");
++            }
++        }
+     }
+ }

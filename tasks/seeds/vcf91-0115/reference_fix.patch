@@ -1,0 +1,519 @@
+--- a/client.go
++++ b/client.go
+@@ -1,30 +1,507 @@
+ package sessionrotation
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/base64"
++	"encoding/json"
++	"errors"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
++	"sync"
++)
++
++const (
++	automationBasePath = "/api"
++	maxResponseBytes   = 1 << 20
+ )
+ 
+ // NewClient validates cfg and creates the initial vCenter API session.
+-func NewClient(context.Context, Config) (*Client, error) {
+-	return nil, ErrNotImplemented
++func NewClient(ctx context.Context, cfg Config) (*Client, error) {
++	if ctx == nil {
++		return nil, &ValidationError{Field: "Context"}
++	}
++	origin, err := validateOrigin(cfg.BaseURL)
++	if err != nil {
++		return nil, err
++	}
++	if err := validateCredential("Username", cfg.Username, true); err != nil {
++		return nil, err
++	}
++	if err := validateCredential("Password", cfg.Password, false); err != nil {
++		return nil, err
++	}
++
++	source := cfg.HTTPClient
++	if source == nil {
++		source = http.DefaultClient
++	}
++	httpClient := *source
++	httpClient.CheckRedirect = func(
++		_ *http.Request,
++		_ []*http.Request,
++	) error {
++		return http.ErrUseLastResponse
++	}
++	client := &Client{
++		baseURL:    origin + automationBasePath,
++		username:   cfg.Username,
++		httpClient: &httpClient,
++	}
++	client.condition = sync.NewCond(&client.mu)
++	token, err := client.createSession(ctx, cfg.Password)
++	if err != nil {
++		return nil, err
++	}
++	client.active = &sessionGeneration{token: token}
++	return client, nil
+ }
+ 
+ // ListVMs lists virtual machines using the session generation captured when
+ // this call begins.
+ func (c *Client) ListVMs(
+-	context.Context,
+-	ListOptions,
++	ctx context.Context,
++	options ListOptions,
+ ) ([]VMSummary, error) {
+-	return nil, ErrNotImplemented
++	if ctx == nil {
++		return nil, &ValidationError{Field: "Context"}
++	}
++	query, err := encodeOptions(options)
++	if err != nil {
++		return nil, err
++	}
++	generation, err := c.captureGeneration()
++	if err != nil {
++		return nil, err
++	}
++	defer c.releaseGeneration(generation)
++
++	target := c.baseURL + "/vcenter/vm"
++	if query != "" {
++		target += "?" + query
++	}
++	raw, err := c.request(
++		ctx,
++		VMListOperation,
++		http.MethodGet,
++		target,
++		map[string]string{
++			"Accept":                "application/json",
++			"vmware-api-session-id": generation.token,
++		},
++		http.StatusOK,
++	)
++	if err != nil {
++		return nil, err
++	}
++	return decodeVMSummaries(raw)
+ }
+ 
+ // RotatePassword creates and publishes a replacement session, drains requests
+ // pinned to the old generation, and then retires the old session.
+-func (c *Client) RotatePassword(context.Context, string) error {
+-	return ErrNotImplemented
++func (c *Client) RotatePassword(
++	ctx context.Context,
++	newPassword string,
++) error {
++	if ctx == nil {
++		return &ValidationError{Field: "Context"}
++	}
++	if err := validateCredential("Password", newPassword, false); err != nil {
++		return err
++	}
++	if c == nil || c.httpClient == nil || c.condition == nil {
++		return &ValidationError{Field: "Client"}
++	}
++
++	c.rotationMu.Lock()
++	defer c.rotationMu.Unlock()
++	c.mu.Lock()
++	if c.closed || c.active == nil {
++		c.mu.Unlock()
++		return &ValidationError{Field: "ClientState"}
++	}
++	oldGeneration := c.active
++	c.mu.Unlock()
++
++	token, err := c.createSession(ctx, newPassword)
++	if err != nil {
++		return err
++	}
++	if token == oldGeneration.token {
++		return &ProtocolError{
++			OperationID: SessionCreateOperation,
++			Reason:      "replacement token reused the active token",
++		}
++	}
++
++	replacement := &sessionGeneration{token: token}
++	c.mu.Lock()
++	c.active = replacement
++	c.condition.Broadcast()
++	for oldGeneration.inFlight != 0 {
++		c.condition.Wait()
++	}
++	c.mu.Unlock()
++
++	return c.deleteSession(ctx, oldGeneration.token)
+ }
+ 
+ // Close prevents new work, drains the active generation, and retires it.
+-func (c *Client) Close(context.Context) error {
+-	return ErrNotImplemented
++func (c *Client) Close(ctx context.Context) error {
++	if ctx == nil {
++		return &ValidationError{Field: "Context"}
++	}
++	if c == nil || c.httpClient == nil || c.condition == nil {
++		return &ValidationError{Field: "Client"}
++	}
++
++	c.rotationMu.Lock()
++	defer c.rotationMu.Unlock()
++	c.mu.Lock()
++	if c.closed {
++		err := c.closeErr
++		c.mu.Unlock()
++		return err
++	}
++	c.closed = true
++	generation := c.active
++	for generation != nil && generation.inFlight != 0 {
++		c.condition.Wait()
++	}
++	c.mu.Unlock()
++
++	var err error
++	if generation != nil {
++		err = c.deleteSession(ctx, generation.token)
++	}
++	c.mu.Lock()
++	c.closeErr = err
++	c.mu.Unlock()
++	return err
++}
++
++func validateOrigin(value string) (string, error) {
++	if value == "" ||
++		value != strings.TrimSpace(value) ||
++		hasControl(value) {
++		return "", &ValidationError{Field: "BaseURL"}
++	}
++	parsed, err := url.Parse(value)
++	if err != nil ||
++		(parsed.Scheme != "http" && parsed.Scheme != "https") ||
++		parsed.Host == "" ||
++		parsed.Hostname() == "" ||
++		parsed.User != nil ||
++		(parsed.Path != "" && parsed.Path != "/") ||
++		parsed.RawPath != "" ||
++		parsed.RawQuery != "" ||
++		parsed.ForceQuery ||
++		parsed.Fragment != "" ||
++		parsed.Opaque != "" {
++		return "", &ValidationError{Field: "BaseURL"}
++	}
++	return strings.TrimSuffix(parsed.String(), "/"), nil
++}
++
++func validateCredential(
++	field string,
++	value string,
++	username bool,
++) error {
++	if strings.TrimSpace(value) == "" ||
++		hasControl(value) ||
++		username && strings.Contains(value, ":") {
++		return &ValidationError{Field: field}
++	}
++	return nil
++}
++
++func hasControl(value string) bool {
++	for _, character := range value {
++		if character < 32 || character == 127 {
++			return true
++		}
++	}
++	return false
++}
++
++type namedValues struct {
++	name   string
++	values []string
++}
++
++func encodeOptions(options ListOptions) (string, error) {
++	fields := []namedValues{
++		{"vms", options.VMs},
++		{"names", options.Names},
++		{"folders", options.Folders},
++		{"datacenters", options.Datacenters},
++		{"hosts", options.Hosts},
++		{"clusters", options.Clusters},
++		{"resource_pools", options.ResourcePools},
++		{"power_states", options.PowerStates},
++	}
++	var query strings.Builder
++	first := true
++	for _, field := range fields {
++		if field.values == nil {
++			continue
++		}
++		if len(field.values) == 0 {
++			return "", &ValidationError{Field: field.name}
++		}
++		seen := make(map[string]struct{}, len(field.values))
++		for _, value := range field.values {
++			if strings.TrimSpace(value) == "" {
++				return "", &ValidationError{Field: field.name}
++			}
++			if _, exists := seen[value]; exists {
++				return "", &ValidationError{Field: field.name}
++			}
++			seen[value] = struct{}{}
++			if field.name == "power_states" && !validPowerState(value) {
++				return "", &ValidationError{Field: field.name}
++			}
++			if !first {
++				query.WriteByte('&')
++			}
++			first = false
++			query.WriteString(rfc3986(field.name))
++			query.WriteByte('=')
++			query.WriteString(rfc3986(value))
++		}
++	}
++	return query.String(), nil
++}
++
++func rfc3986(value string) string {
++	const hexadecimal = "0123456789ABCDEF"
++	var encoded strings.Builder
++	for _, character := range []byte(value) {
++		if character >= 'a' && character <= 'z' ||
++			character >= 'A' && character <= 'Z' ||
++			character >= '0' && character <= '9' ||
++			character == '-' || character == '.' ||
++			character == '_' || character == '~' {
++			encoded.WriteByte(character)
++			continue
++		}
++		encoded.WriteByte('%')
++		encoded.WriteByte(hexadecimal[character>>4])
++		encoded.WriteByte(hexadecimal[character&15])
++	}
++	return encoded.String()
++}
++
++func validPowerState(value string) bool {
++	switch value {
++	case "POWERED_OFF", "POWERED_ON", "SUSPENDED":
++		return true
++	default:
++		return false
++	}
++}
++
++func (c *Client) captureGeneration() (*sessionGeneration, error) {
++	if c == nil || c.httpClient == nil || c.condition == nil {
++		return nil, &ValidationError{Field: "Client"}
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.closed || c.active == nil {
++		return nil, &ValidationError{Field: "ClientState"}
++	}
++	generation := c.active
++	generation.inFlight++
++	return generation, nil
++}
++
++func (c *Client) releaseGeneration(generation *sessionGeneration) {
++	c.mu.Lock()
++	generation.inFlight--
++	c.condition.Broadcast()
++	c.mu.Unlock()
++}
++
++func (c *Client) createSession(
++	ctx context.Context,
++	password string,
++) (string, error) {
++	authorization := "Basic " + base64.StdEncoding.EncodeToString(
++		[]byte(c.username+":"+password),
++	)
++	raw, err := c.request(
++		ctx,
++		SessionCreateOperation,
++		http.MethodPost,
++		c.baseURL+"/session",
++		map[string]string{
++			"Accept":        "application/json",
++			"Authorization": authorization,
++		},
++		http.StatusCreated,
++	)
++	if err != nil {
++		return "", err
++	}
++	var token string
++	if err := decodeSingleJSON(raw, &token, false); err != nil ||
++		strings.TrimSpace(token) == "" ||
++		hasControl(token) {
++		return "", &ProtocolError{
++			OperationID: SessionCreateOperation,
++			Reason:      "session token is not a header-safe JSON string",
++		}
++	}
++	return token, nil
++}
++
++func (c *Client) deleteSession(
++	ctx context.Context,
++	token string,
++) error {
++	raw, err := c.request(
++		ctx,
++		SessionDeleteOperation,
++		http.MethodDelete,
++		c.baseURL+"/session",
++		map[string]string{
++			"Accept":                "application/json",
++			"vmware-api-session-id": token,
++		},
++		http.StatusNoContent,
++	)
++	if err != nil {
++		return err
++	}
++	if len(raw) != 0 {
++		return &ProtocolError{
++			OperationID: SessionDeleteOperation,
++			Reason:      "204 response body is not empty",
++		}
++	}
++	return nil
++}
++
++func (c *Client) request(
++	ctx context.Context,
++	operationID string,
++	method string,
++	target string,
++	headers map[string]string,
++	expectedStatus int,
++) ([]byte, error) {
++	if err := ctx.Err(); err != nil {
++		return nil, &TransportError{
++			OperationID: operationID,
++			cause:       err,
++		}
++	}
++	request, err := http.NewRequestWithContext(ctx, method, target, nil)
++	if err != nil {
++		return nil, &TransportError{
++			OperationID: operationID,
++			cause:       err,
++		}
++	}
++	for name, value := range headers {
++		request.Header.Set(name, value)
++	}
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		if ctxErr := ctx.Err(); ctxErr != nil {
++			err = ctxErr
++		}
++		return nil, &TransportError{
++			OperationID: operationID,
++			cause:       err,
++		}
++	}
++	defer response.Body.Close()
++	raw, err := readResponse(response.Body)
++	if err != nil {
++		if ctxErr := ctx.Err(); ctxErr != nil {
++			err = ctxErr
++		}
++		return nil, &TransportError{
++			OperationID: operationID,
++			cause:       err,
++		}
++	}
++	if response.StatusCode != expectedStatus {
++		return nil, &APIError{
++			OperationID: operationID,
++			StatusCode:  response.StatusCode,
++			Payload:     decodeErrorPayload(raw),
++		}
++	}
++	return raw, nil
++}
++
++func readResponse(reader io.Reader) ([]byte, error) {
++	raw, err := io.ReadAll(io.LimitReader(reader, maxResponseBytes+1))
++	if err != nil {
++		return nil, err
++	}
++	if len(raw) > maxResponseBytes {
++		return nil, errors.New("vCenter response exceeded local limit")
++	}
++	return raw, nil
++}
++
++func decodeErrorPayload(raw []byte) any {
++	if len(raw) == 0 {
++		return nil
++	}
++	var payload any
++	if err := decodeSingleJSON(raw, &payload, false); err != nil {
++		return nil
++	}
++	return payload
++}
++
++func decodeVMSummaries(raw []byte) ([]VMSummary, error) {
++	var values []VMSummary
++	if err := decodeSingleJSON(raw, &values, true); err != nil ||
++		values == nil {
++		return nil, &ProtocolError{
++			OperationID: VMListOperation,
++			Reason:      "response is not one strict JSON array",
++		}
++	}
++	for _, value := range values {
++		if strings.TrimSpace(value.VM) == "" ||
++			strings.TrimSpace(value.Name) == "" ||
++			!validPowerState(value.PowerState) {
++			return nil, &ProtocolError{
++				OperationID: VMListOperation,
++				Reason:      "VM summary is missing a required value",
++			}
++		}
++	}
++	return values, nil
++}
++
++func decodeSingleJSON(
++	raw []byte,
++	target any,
++	disallowUnknown bool,
++) error {
++	decoder := json.NewDecoder(bytes.NewReader(raw))
++	if disallowUnknown {
++		decoder.DisallowUnknownFields()
++	}
++	if err := decoder.Decode(target); err != nil {
++		return err
++	}
++	var trailing any
++	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
++		if err == nil {
++			return errors.New("trailing JSON value")
++		}
++		return err
++	}
++	return nil
+ }

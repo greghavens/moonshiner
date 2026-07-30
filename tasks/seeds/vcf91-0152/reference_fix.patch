@@ -1,0 +1,400 @@
+diff --git a/vksguard/client.go b/vksguard/client.go
+index 124a261..c12f63a 100644
+--- a/vksguard/client.go
++++ b/vksguard/client.go
+@@ -1,16 +1,85 @@
+ package vksguard
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
+ )
+ 
+-// Client is the Supervisor-gated VKS Cluster client.
+-type Client struct{}
++const (
++	namespaceOperationName = "getSupervisorNamespace"
++	clusterOperationName   = "patchVksClusterVersion"
++
++	namespaceOperationID = "Vcenter.Namespaces.Instances_getV2"
++	clusterOperationKey  = "cluster.x-k8s.io/v1beta2:namespaced-clusters:patch"
++
++	namespacePath = "/api/vcenter/namespaces/instances/v2/"
++	clusterPath   = "/apis/cluster.x-k8s.io/v1beta2/namespaces/"
++	apiVersion    = "cluster.x-k8s.io/v1beta2"
++
++	maxResponseBytes = 4 << 20
++)
++
++// Client is safe for concurrent use. Its configuration is immutable.
++type Client struct {
++	vcenterOrigin    string
++	kubernetesOrigin string
++	vcenterSessionID string
++	kubernetesToken  string
++	http             *http.Client
++}
+ 
+ // NewClient validates config without performing network traffic.
+ func NewClient(config Config) (*Client, error) {
+-	return nil, errors.New("vksguard: implementation incomplete")
++	vcenterOrigin, err := parseOrigin(config.VCenterURL, "VCenterURL")
++	if err != nil {
++		return nil, err
++	}
++	kubernetesOrigin, err := parseOrigin(
++		config.KubernetesURL,
++		"KubernetesURL",
++	)
++	if err != nil {
++		return nil, err
++	}
++	if err := validateCredential(
++		config.VCenterSessionID,
++		"VCenterSessionID",
++	); err != nil {
++		return nil, err
++	}
++	if err := validateCredential(
++		config.KubernetesToken,
++		"KubernetesToken",
++	); err != nil {
++		return nil, err
++	}
++
++	selected := config.HTTPClient
++	if selected == nil {
++		selected = http.DefaultClient
++	}
++	httpCopy := *selected
++	httpCopy.CheckRedirect = func(
++		*http.Request,
++		[]*http.Request,
++	) error {
++		return http.ErrUseLastResponse
++	}
++
++	return &Client{
++		vcenterOrigin:    vcenterOrigin,
++		kubernetesOrigin: kubernetesOrigin,
++		vcenterSessionID: config.VCenterSessionID,
++		kubernetesToken:  config.KubernetesToken,
++		http:             &httpCopy,
++	}, nil
+ }
+ 
+ // ReconcileVersion applies targetVersion only when the namespace precheck passes.
+@@ -21,5 +90,305 @@ func (c *Client) ReconcileVersion(
+ 	clusterName string,
+ 	targetVersion string,
+ ) (Result, error) {
+-	return Result{}, errors.New("vksguard: implementation incomplete")
++	if ctx == nil {
++		return Result{}, errors.New("vksguard: nil context")
++	}
++	for name, value := range map[string]string{
++		"supervisor":    supervisor,
++		"namespace":     namespace,
++		"clusterName":   clusterName,
++		"targetVersion": targetVersion,
++	} {
++		if strings.TrimSpace(value) == "" {
++			return Result{}, fmt.Errorf(
++				"vksguard: %s must be nonblank",
++				name,
++			)
++		}
++	}
++	if err := ctx.Err(); err != nil {
++		return Result{}, err
++	}
++
++	status, err := c.precheck(ctx, supervisor, namespace)
++	if err != nil {
++		return Result{}, err
++	}
++	if status != "RUNNING" {
++		return outcome(status, false), nil
++	}
++	if err := c.patchVersion(
++		ctx,
++		namespace,
++		clusterName,
++		targetVersion,
++	); err != nil {
++		return Result{}, err
++	}
++	return outcome(status, true), nil
++}
++
++func (c *Client) precheck(
++	ctx context.Context,
++	supervisor string,
++	namespace string,
++) (string, error) {
++	target := c.vcenterOrigin + namespacePath + url.PathEscape(namespace)
++	payload, err := c.requestJSON(
++		ctx,
++		namespaceOperationName,
++		http.MethodGet,
++		target,
++		"vmware-api-session-id",
++		c.vcenterSessionID,
++		nil,
++		"",
++	)
++	if err != nil {
++		return "", err
++	}
++
++	var info struct {
++		Supervisor   any `json:"supervisor"`
++		ConfigStatus any `json:"config_status"`
++	}
++	if err := json.Unmarshal(payload, &info); err != nil {
++		return "", protocol(
++			namespaceOperationName,
++			"response is not a JSON object",
++		)
++	}
++	returnedSupervisor, ok := info.Supervisor.(string)
++	if !ok || strings.TrimSpace(returnedSupervisor) == "" {
++		return "", protocol(
++			namespaceOperationName,
++			"supervisor is missing or invalid",
++		)
++	}
++	if returnedSupervisor != supervisor {
++		return "", &PrecheckError{
++			Problem: "namespace belongs to a different Supervisor",
++		}
++	}
++	status, ok := info.ConfigStatus.(string)
++	if !ok {
++		return "", protocol(
++			namespaceOperationName,
++			"config_status is missing or invalid",
++		)
++	}
++	switch status {
++	case "CONFIGURING", "REMOVING", "RUNNING", "ERROR":
++		return status, nil
++	default:
++		return "", protocol(
++			namespaceOperationName,
++			"config_status is unknown",
++		)
++	}
++}
++
++func (c *Client) patchVersion(
++	ctx context.Context,
++	namespace string,
++	clusterName string,
++	targetVersion string,
++) error {
++	body, err := versionPatch(targetVersion)
++	if err != nil {
++		return protocol(clusterOperationName, "request body is invalid")
++	}
++	target := c.kubernetesOrigin +
++		clusterPath +
++		url.PathEscape(namespace) +
++		"/clusters/" +
++		url.PathEscape(clusterName)
++	payload, err := c.requestJSON(
++		ctx,
++		clusterOperationName,
++		http.MethodPatch,
++		target,
++		"Authorization",
++		"Bearer "+c.kubernetesToken,
++		body,
++		"application/merge-patch+json",
++	)
++	if err != nil {
++		return err
++	}
++
++	var cluster struct {
++		APIVersion any `json:"apiVersion"`
++		Kind       any `json:"kind"`
++		Metadata   any `json:"metadata"`
++		Spec       any `json:"spec"`
++	}
++	if err := json.Unmarshal(payload, &cluster); err != nil {
++		return protocol(
++			clusterOperationName,
++			"response is not a JSON object",
++		)
++	}
++	metadata, metadataOK := stringMap(cluster.Metadata)
++	spec, specOK := stringMap(cluster.Spec)
++	topology, topologyOK := stringMap(spec["topology"])
++	if cluster.APIVersion != apiVersion ||
++		cluster.Kind != "Cluster" ||
++		!metadataOK ||
++		!specOK ||
++		!topologyOK ||
++		metadata["namespace"] != namespace ||
++		metadata["name"] != clusterName ||
++		topology["version"] != targetVersion {
++		return protocol(
++			clusterOperationName,
++			"Cluster response does not match the mutation",
++		)
++	}
++	return nil
++}
++
++func (c *Client) requestJSON(
++	ctx context.Context,
++	operation string,
++	method string,
++	target string,
++	credentialName string,
++	credentialValue string,
++	body []byte,
++	contentType string,
++) ([]byte, error) {
++	var reader io.Reader
++	if body != nil {
++		reader = bytes.NewReader(body)
++	}
++	request, err := http.NewRequestWithContext(
++		ctx,
++		method,
++		target,
++		reader,
++	)
++	if err != nil {
++		return nil, protocol(operation, "request target is invalid")
++	}
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set(credentialName, credentialValue)
++	if contentType != "" {
++		request.Header.Set("Content-Type", contentType)
++	}
++
++	response, err := c.http.Do(request)
++	if err != nil {
++		return nil, &requestError{operation: operation, cause: err}
++	}
++	defer response.Body.Close()
++
++	if response.StatusCode != http.StatusOK {
++		_, _ = io.Copy(
++			io.Discard,
++			io.LimitReader(response.Body, maxResponseBytes+1),
++		)
++		return nil, &APIError{
++			Operation:  operation,
++			StatusCode: response.StatusCode,
++		}
++	}
++	payload, err := io.ReadAll(io.LimitReader(
++		response.Body,
++		maxResponseBytes+1,
++	))
++	if err != nil {
++		return nil, &requestError{operation: operation, cause: err}
++	}
++	if len(payload) > maxResponseBytes {
++		return nil, protocol(operation, "response exceeds size limit")
++	}
++	return payload, nil
++}
++
++func parseOrigin(value string, name string) (string, error) {
++	if strings.TrimSpace(value) == "" {
++		return "", fmt.Errorf("vksguard: %s is required", name)
++	}
++	parsed, err := url.Parse(value)
++	if err != nil ||
++		(parsed.Scheme != "http" && parsed.Scheme != "https") ||
++		parsed.Host == "" ||
++		parsed.User != nil ||
++		parsed.Opaque != "" ||
++		(parsed.Path != "" && parsed.Path != "/") ||
++		parsed.RawQuery != "" ||
++		parsed.ForceQuery ||
++		parsed.Fragment != "" {
++		return "", fmt.Errorf(
++			"vksguard: %s must be an absolute HTTP(S) origin",
++			name,
++		)
++	}
++	return parsed.Scheme + "://" + parsed.Host, nil
++}
++
++func validateCredential(value string, name string) error {
++	if strings.TrimSpace(value) == "" ||
++		strings.ContainsAny(value, "\r\n") {
++		return fmt.Errorf("vksguard: %s is invalid", name)
++	}
++	return nil
++}
++
++func versionPatch(version string) ([]byte, error) {
++	value := struct {
++		Spec struct {
++			Topology struct {
++				Version string `json:"version"`
++			} `json:"topology"`
++		} `json:"spec"`
++	}{}
++	value.Spec.Topology.Version = version
++
++	var output bytes.Buffer
++	encoder := json.NewEncoder(&output)
++	encoder.SetEscapeHTML(false)
++	if err := encoder.Encode(value); err != nil {
++		return nil, err
++	}
++	return bytes.TrimSuffix(output.Bytes(), []byte{'\n'}), nil
++}
++
++func stringMap(value any) (map[string]any, bool) {
++	result, ok := value.(map[string]any)
++	return result, ok
++}
++
++func outcome(configStatus string, changed bool) Result {
++	return Result{
++		Status:  map[bool]string{false: "Blocked", true: "Succeeded"}[changed],
++		Changed: changed,
++		Precheck: PrecheckResult{
++			OperationID:  namespaceOperationID,
++			Passed:       changed,
++			ConfigStatus: configStatus,
++		},
++		Mutation: MutationResult{
++			OperationKey: clusterOperationKey,
++			Attempted:    changed,
++		},
++	}
++}
++
++func protocol(operation string, problem string) *ProtocolError {
++	return &ProtocolError{Operation: operation, Problem: problem}
++}
++
++type requestError struct {
++	operation string
++	cause     error
++}
++
++func (e *requestError) Error() string {
++	return "vksguard: " + e.operation + " request failed"
++}
++
++func (e *requestError) Unwrap() error {
++	return e.cause
+ }

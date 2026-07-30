@@ -1,0 +1,430 @@
+diff --git a/vcenter/client.go b/vcenter/client.go
+new file mode 100644
+index 0000000..549ed21
+--- /dev/null
++++ b/vcenter/client.go
+@@ -0,0 +1,261 @@
++// Package vcenter implements the reduced asynchronous clone contract documented
++// in docs/contract.json.
++package vcenter
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
++	"time"
++)
++
++const maxResponseBytes = 1 << 20
++
++// Client calls the two vCenter operations in the reduced contract.
++type Client struct {
++	baseURL    string
++	sessionID  string
++	httpClient *http.Client
++}
++
++// NewClient constructs a client. baseURL is the vCenter origin, without /api.
++func NewClient(baseURL, sessionID string, httpClient *http.Client) (*Client, error) {
++	baseURL = strings.TrimSpace(baseURL)
++	if baseURL == "" {
++		return nil, errors.New("vcenter: base URL is required")
++	}
++	parsed, err := url.Parse(baseURL)
++	if err != nil {
++		return nil, fmt.Errorf("vcenter: parse base URL: %w", err)
++	}
++	if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
++		return nil, errors.New("vcenter: base URL must be an absolute HTTP or HTTPS URL")
++	}
++	if parsed.RawQuery != "" || parsed.Fragment != "" {
++		return nil, errors.New("vcenter: base URL must not contain a query or fragment")
++	}
++	if parsed.Path != "" && parsed.Path != "/" {
++		return nil, errors.New("vcenter: base URL must not contain a path")
++	}
++	if sessionID == "" {
++		return nil, errors.New("vcenter: session ID is required")
++	}
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++	return &Client{
++		baseURL:    strings.TrimRight(baseURL, "/"),
++		sessionID:  sessionID,
++		httpClient: httpClient,
++	}, nil
++}
++
++// CloneSpec is the request body for Vcenter.VM_clone$Task.
++type CloneSpec struct {
++	Source                 string                   `json:"source"`
++	Name                   string                   `json:"name"`
++	Placement              *ClonePlacementSpec      `json:"placement,omitempty"`
++	DisksToRemove          []string                 `json:"disks_to_remove,omitempty"`
++	DisksToUpdate          map[string]DiskCloneSpec `json:"disks_to_update,omitempty"`
++	PowerOn                *bool                    `json:"power_on,omitempty"`
++	GuestCustomizationSpec *GuestCustomizationSpec  `json:"guest_customization_spec,omitempty"`
++}
++
++// ClonePlacementSpec contains optional inventory placement selections.
++type ClonePlacementSpec struct {
++	Folder       string `json:"folder,omitempty"`
++	ResourcePool string `json:"resource_pool,omitempty"`
++	Host         string `json:"host,omitempty"`
++	Cluster      string `json:"cluster,omitempty"`
++	Datastore    string `json:"datastore,omitempty"`
++}
++
++// DiskCloneSpec contains a per-disk datastore override.
++type DiskCloneSpec struct {
++	Datastore string `json:"datastore,omitempty"`
++}
++
++// GuestCustomizationSpec names a vCenter guest customization specification.
++type GuestCustomizationSpec struct {
++	Name string `json:"name,omitempty"`
++}
++
++type taskInfo struct {
++	Description localizableMessage `json:"description"`
++	Service     string             `json:"service"`
++	Operation   string             `json:"operation"`
++	Status      string             `json:"status"`
++	Cancelable  bool               `json:"cancelable"`
++	Result      json.RawMessage    `json:"result"`
++	Error       json.RawMessage    `json:"error"`
++}
++
++type localizableMessage struct {
++	ID             string   `json:"id"`
++	DefaultMessage string   `json:"default_message"`
++	Args           []string `json:"args"`
++}
++
++// CloneAndWait starts a clone task and polls it to a terminal state.
++func (c *Client) CloneAndWait(
++	ctx context.Context,
++	spec CloneSpec,
++	pollInterval time.Duration,
++) (string, error) {
++	if ctx == nil {
++		return "", errors.New("vcenter: context is required")
++	}
++	if err := ctx.Err(); err != nil {
++		return "", fmt.Errorf("vcenter: clone canceled before request: %w", err)
++	}
++	if strings.TrimSpace(spec.Source) == "" {
++		return "", errors.New("vcenter: clone source is required")
++	}
++	if strings.TrimSpace(spec.Name) == "" {
++		return "", errors.New("vcenter: clone name is required")
++	}
++	if pollInterval < 0 {
++		return "", errors.New("vcenter: poll interval must not be negative")
++	}
++
++	body, err := json.Marshal(spec)
++	if err != nil {
++		return "", fmt.Errorf("vcenter: encode clone request: %w", err)
++	}
++	taskID, err := c.startClone(ctx, body)
++	if err != nil {
++		return "", err
++	}
++
++	for {
++		info, err := c.getTask(ctx, taskID)
++		if err != nil {
++			return "", err
++		}
++		switch info.Status {
++		case "PENDING", "RUNNING", "BLOCKED":
++			if err := wait(ctx, pollInterval); err != nil {
++				return "", fmt.Errorf("vcenter: wait for clone task %q: %w", taskID, err)
++			}
++		case "SUCCEEDED":
++			var vmID string
++			if len(info.Result) == 0 || string(info.Result) == "null" {
++				return "", fmt.Errorf("vcenter: clone task %q succeeded without a result", taskID)
++			}
++			if err := json.Unmarshal(info.Result, &vmID); err != nil || vmID == "" {
++				if err == nil {
++					err = errors.New("empty VM identifier")
++				}
++				return "", fmt.Errorf("vcenter: decode clone task %q result: %w", taskID, err)
++			}
++			return vmID, nil
++		case "FAILED":
++			detail := strings.TrimSpace(string(info.Error))
++			if detail == "" || detail == "null" {
++				detail = "no error detail"
++			}
++			return "", fmt.Errorf("vcenter: clone task %q failed: %s", taskID, detail)
++		default:
++			return "", fmt.Errorf("vcenter: clone task %q returned unknown status %q", taskID, info.Status)
++		}
++	}
++}
++
++func (c *Client) startClone(ctx context.Context, body []byte) (string, error) {
++	endpoint := c.baseURL + "/api/vcenter/vm?action=clone&vmw-task=true"
++	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
++	if err != nil {
++		return "", fmt.Errorf("vcenter: create clone request: %w", err)
++	}
++	c.setHeaders(request)
++	request.Header.Set("Content-Type", "application/json")
++
++	responseBody, err := c.do(request, http.StatusAccepted)
++	if err != nil {
++		return "", fmt.Errorf("vcenter: start clone: %w", err)
++	}
++	var taskID string
++	if err := json.Unmarshal(responseBody, &taskID); err != nil {
++		return "", fmt.Errorf("vcenter: decode clone task identifier: %w", err)
++	}
++	if taskID == "" {
++		return "", errors.New("vcenter: clone returned an empty task identifier")
++	}
++	return taskID, nil
++}
++
++func (c *Client) getTask(ctx context.Context, taskID string) (taskInfo, error) {
++	endpoint := c.baseURL + "/api/cis/tasks/" + url.PathEscape(taskID)
++	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
++	if err != nil {
++		return taskInfo{}, fmt.Errorf("vcenter: create task request: %w", err)
++	}
++	c.setHeaders(request)
++
++	responseBody, err := c.do(request, http.StatusOK)
++	if err != nil {
++		return taskInfo{}, fmt.Errorf("vcenter: get clone task %q: %w", taskID, err)
++	}
++	var info taskInfo
++	if err := json.Unmarshal(responseBody, &info); err != nil {
++		return taskInfo{}, fmt.Errorf("vcenter: decode clone task %q: %w", taskID, err)
++	}
++	if info.Description.ID == "" || info.Service == "" || info.Operation == "" || info.Status == "" {
++		return taskInfo{}, fmt.Errorf("vcenter: clone task %q response is missing required fields", taskID)
++	}
++	return info, nil
++}
++
++func (c *Client) setHeaders(request *http.Request) {
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set("vmware-api-session-id", c.sessionID)
++}
++
++func (c *Client) do(request *http.Request, expectedStatus int) ([]byte, error) {
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return nil, err
++	}
++	defer response.Body.Close()
++
++	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
++	if err != nil {
++		return nil, fmt.Errorf("read response: %w", err)
++	}
++	if len(body) > maxResponseBytes {
++		return nil, errors.New("response exceeds 1 MiB limit")
++	}
++	if response.StatusCode != expectedStatus {
++		detail := strings.TrimSpace(string(body))
++		if detail == "" {
++			detail = http.StatusText(response.StatusCode)
++		}
++		return nil, fmt.Errorf("unexpected HTTP status %d: %s", response.StatusCode, detail)
++	}
++	return body, nil
++}
++
++func wait(ctx context.Context, duration time.Duration) error {
++	if duration == 0 {
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		default:
++			return nil
++		}
++	}
++	timer := time.NewTimer(duration)
++	defer timer.Stop()
++	select {
++	case <-timer.C:
++		return nil
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++}
+diff --git a/vcenter/client_test.go b/vcenter/client_test.go
+new file mode 100644
+index 0000000..a7163ef
+--- /dev/null
++++ b/vcenter/client_test.go
+@@ -0,0 +1,157 @@
++package vcenter_test
++
++import (
++	"context"
++	"encoding/json"
++	"reflect"
++	"slices"
++	"testing"
++
++	"example.com/vcfasync/internal/mockvcenter"
++	"example.com/vcfasync/vcenter"
++)
++
++func TestCloneAndWaitRequestShapes(t *testing.T) {
++	powerOff := false
++	testCases := []struct {
++		name     string
++		spec     vcenter.CloneSpec
++		statuses []mockvcenter.Status
++		wantKeys []string
++		wantGets int
++	}{
++		{
++			name: "minimal omits empty optionals",
++			spec: vcenter.CloneSpec{
++				Source:        "vm-source-1",
++				Name:          "clone-minimal",
++				DisksToRemove: []string{},
++				DisksToUpdate: map[string]vcenter.DiskCloneSpec{},
++			},
++			statuses: []mockvcenter.Status{
++				mockvcenter.StatusRunning,
++				mockvcenter.StatusBlocked,
++				mockvcenter.StatusSucceeded,
++			},
++			wantKeys: []string{"name", "source"},
++			wantGets: 3,
++		},
++		{
++			name: "explicit and nested options",
++			spec: vcenter.CloneSpec{
++				Source:  "vm-source-2",
++				Name:    "clone-options",
++				PowerOn: &powerOff,
++				Placement: &vcenter.ClonePlacementSpec{
++					ResourcePool: "resgroup-7",
++					Datastore:    "datastore-8",
++				},
++				DisksToRemove: []string{"3000"},
++			},
++			statuses: []mockvcenter.Status{mockvcenter.StatusSucceeded},
++			wantKeys: []string{"disks_to_remove", "name", "placement", "power_on", "source"},
++			wantGets: 1,
++		},
++	}
++
++	for _, testCase := range testCases {
++		t.Run(testCase.name, func(t *testing.T) {
++			server, err := mockvcenter.New(mockvcenter.Scenario{
++				SessionID: "session-tests",
++				TaskID:    "task-tests",
++				ResultVM:  "vm-created",
++				Statuses:  testCase.statuses,
++			})
++			if err != nil {
++				t.Fatal(err)
++			}
++			t.Cleanup(server.Close)
++
++			client, err := vcenter.NewClient(
++				server.URL(),
++				"session-tests",
++				server.Client(),
++			)
++			if err != nil {
++				t.Fatal(err)
++			}
++			got, err := client.CloneAndWait(context.Background(), testCase.spec, 0)
++			if err != nil {
++				t.Fatalf("CloneAndWait: %v", err)
++			}
++			if got != "vm-created" {
++				t.Errorf("result = %q", got)
++			}
++
++			requests := server.Requests()
++			if len(requests) != 1+testCase.wantGets {
++				t.Fatalf("request count = %d, want %d", len(requests), 1+testCase.wantGets)
++			}
++			var body map[string]any
++			if err := json.Unmarshal(requests[0].Body, &body); err != nil {
++				t.Fatal(err)
++			}
++			keys := make([]string, 0, len(body))
++			for key := range body {
++				keys = append(keys, key)
++			}
++			slices.Sort(keys)
++			if !reflect.DeepEqual(keys, testCase.wantKeys) {
++				t.Errorf("body keys = %v, want %v", keys, testCase.wantKeys)
++			}
++			for _, request := range requests[1:] {
++				if request.RawQuery != "" {
++					t.Errorf("task GET query = %q, want empty", request.RawQuery)
++				}
++			}
++		})
++	}
++}
++
++func TestCloneAndWaitErrors(t *testing.T) {
++	testCases := []struct {
++		name      string
++		spec      vcenter.CloneSpec
++		statuses  []mockvcenter.Status
++		wantCalls int
++	}{
++		{
++			name:      "failed task",
++			spec:      vcenter.CloneSpec{Source: "vm-1", Name: "failed-clone"},
++			statuses:  []mockvcenter.Status{mockvcenter.StatusFailed},
++			wantCalls: 2,
++		},
++		{
++			name:      "invalid request",
++			spec:      vcenter.CloneSpec{Name: "missing-source"},
++			statuses:  []mockvcenter.Status{mockvcenter.StatusSucceeded},
++			wantCalls: 0,
++		},
++	}
++
++	for _, testCase := range testCases {
++		t.Run(testCase.name, func(t *testing.T) {
++			server, err := mockvcenter.New(mockvcenter.Scenario{
++				SessionID: "session-errors",
++				TaskID:    "task-errors",
++				ResultVM:  "vm-errors",
++				Statuses:  testCase.statuses,
++			})
++			if err != nil {
++				t.Fatal(err)
++			}
++			t.Cleanup(server.Close)
++			client, err := vcenter.NewClient(server.URL(), "session-errors", server.Client())
++			if err != nil {
++				t.Fatal(err)
++			}
++
++			if _, err := client.CloneAndWait(context.Background(), testCase.spec, 0); err == nil {
++				t.Fatal("CloneAndWait returned nil error")
++			}
++			if got := len(server.Requests()); got != testCase.wantCalls {
++				t.Errorf("request count = %d, want %d", got, testCase.wantCalls)
++			}
++		})
++	}
++}

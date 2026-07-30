@@ -1,0 +1,354 @@
+--- a/client.go
++++ b/client.go
+@@ -1,16 +1,349 @@
+ package supervisorvks
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
++	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
++)
++
++const (
++	getNamespaceOperation    = "Vcenter.Namespaces.Instances_getV2"
++	createNamespaceOperation = "Vcenter.Namespaces.Instances_createV2"
++	getClusterOperation      = "Kubernetes.Cluster.get"
++	createClusterOperation   = "Kubernetes.Cluster.create"
+ )
+ 
+ // NewClient constructs a client without performing I/O.
+ func NewClient(vcenterOrigin, kubeOrigin, sessionID string, tokens TokenSource, httpClient *http.Client) (*Client, error) {
+-	return nil, ErrNotImplemented
++	vcenter, err := parseOrigin("vCenter", vcenterOrigin)
++	if err != nil {
++		return nil, err
++	}
++	kube, err := parseOrigin("Kubernetes", kubeOrigin)
++	if err != nil {
++		return nil, err
++	}
++	if !safeHeaderValue(sessionID) {
++		return nil, fmt.Errorf("session ID must be non-empty and header-safe")
++	}
++	if tokens == nil {
++		return nil, fmt.Errorf("token source is required")
++	}
++
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++
++	return &Client{
++		vcenterOrigin: vcenter,
++		kubeOrigin:    kube,
++		sessionID:     sessionID,
++		tokens:        tokens,
++		httpClient:    httpClient,
++	}, nil
+ }
+ 
+ // Ensure creates missing resources and reports which resources it created.
+ func (c *Client) Ensure(ctx context.Context, namespace NamespaceSpec, cluster ClusterSpec) (Result, error) {
+-	return Result{}, ErrNotImplemented
++	var result Result
++	if err := validateSpecs(namespace, cluster); err != nil {
++		return result, err
++	}
++
++	namespacePath := "/api/vcenter/namespaces/instances/v2/" + url.PathEscape(namespace.Name)
++	status, err := c.do(ctx, getNamespaceOperation, http.MethodGet, c.vcenterOrigin.String()+namespacePath, nil, c.vcenterHeaders(false))
++	if err != nil {
++		return result, err
++	}
++	switch status {
++	case http.StatusOK:
++	case http.StatusNotFound:
++		payload, err := json.Marshal(struct {
++			Namespace  string `json:"namespace"`
++			Supervisor string `json:"supervisor"`
++		}{
++			Namespace:  namespace.Name,
++			Supervisor: namespace.Supervisor,
++		})
++		if err != nil {
++			return result, fmt.Errorf("%s: encode request: %w", createNamespaceOperation, err)
++		}
++		status, err = c.do(
++			ctx,
++			createNamespaceOperation,
++			http.MethodPost,
++			c.vcenterOrigin.String()+"/api/vcenter/namespaces/instances/v2",
++			payload,
++			c.vcenterHeaders(true),
++		)
++		if err != nil {
++			return result, err
++		}
++		if status != http.StatusNoContent {
++			return result, apiError(createNamespaceOperation, status)
++		}
++		result.NamespaceCreated = true
++	default:
++		return result, apiError(getNamespaceOperation, status)
++	}
++
++	token, err := c.tokens.Token(ctx, false)
++	if err != nil {
++		return result, fmt.Errorf("%s: obtain access token: %w", getClusterOperation, err)
++	}
++	if !safeHeaderValue(token) {
++		return result, fmt.Errorf("%s: token must be non-empty and header-safe", getClusterOperation)
++	}
++
++	clusterCollection := c.kubeOrigin.String() +
++		"/apis/cluster.x-k8s.io/v1beta2/namespaces/" + url.PathEscape(namespace.Name) +
++		"/clusters"
++	status, token, err = c.doKubernetes(
++		ctx,
++		getClusterOperation,
++		http.MethodGet,
++		clusterCollection+"/"+url.PathEscape(cluster.Name),
++		nil,
++		token,
++	)
++	if err != nil {
++		return result, err
++	}
++	switch status {
++	case http.StatusOK:
++		return result, nil
++	case http.StatusNotFound:
++	default:
++		return result, apiError(getClusterOperation, status)
++	}
++
++	payload, err := json.Marshal(clusterResource{
++		APIVersion: "cluster.x-k8s.io/v1beta2",
++		Kind:       "Cluster",
++		Metadata: clusterMetadata{
++			Name: cluster.Name,
++		},
++		Spec: clusterResourceSpec{
++			Topology: clusterTopology{
++				Class:   cluster.Class,
++				Version: cluster.Version,
++				ControlPlane: controlPlaneTopology{
++					Replicas: cluster.ControlPlaneReplicas,
++				},
++				Workers: workerTopology{
++					MachineDeployments: []machineDeployment{{
++						Class:    cluster.WorkerClass,
++						Name:     cluster.WorkerName,
++						Replicas: cluster.WorkerReplicas,
++					}},
++				},
++				Variables: []topologyVariable{
++					{Name: "vmClass", Value: cluster.VMClass},
++					{Name: "storageClass", Value: cluster.StorageClass},
++				},
++			},
++		},
++	})
++	if err != nil {
++		return result, fmt.Errorf("%s: encode request: %w", createClusterOperation, err)
++	}
++	status, _, err = c.doKubernetes(
++		ctx,
++		createClusterOperation,
++		http.MethodPost,
++		clusterCollection,
++		payload,
++		token,
++	)
++	if err != nil {
++		return result, err
++	}
++	if status != http.StatusCreated {
++		return result, apiError(createClusterOperation, status)
++	}
++	result.ClusterCreated = true
++	return result, nil
++}
++
++type clusterResource struct {
++	APIVersion string              `json:"apiVersion"`
++	Kind       string              `json:"kind"`
++	Metadata   clusterMetadata     `json:"metadata"`
++	Spec       clusterResourceSpec `json:"spec"`
++}
++
++type clusterMetadata struct {
++	Name string `json:"name"`
++}
++
++type clusterResourceSpec struct {
++	Topology clusterTopology `json:"topology"`
++}
++
++type clusterTopology struct {
++	Class        string               `json:"class"`
++	Version      string               `json:"version"`
++	ControlPlane controlPlaneTopology `json:"controlPlane"`
++	Workers      workerTopology       `json:"workers"`
++	Variables    []topologyVariable   `json:"variables"`
++}
++
++type controlPlaneTopology struct {
++	Replicas int `json:"replicas"`
++}
++
++type workerTopology struct {
++	MachineDeployments []machineDeployment `json:"machineDeployments"`
++}
++
++type machineDeployment struct {
++	Class    string `json:"class"`
++	Name     string `json:"name"`
++	Replicas int    `json:"replicas"`
++}
++
++type topologyVariable struct {
++	Name  string `json:"name"`
++	Value string `json:"value"`
++}
++
++func parseOrigin(label, raw string) (*url.URL, error) {
++	parsed, err := url.Parse(raw)
++	if err != nil {
++		return nil, fmt.Errorf("%s origin: %w", label, err)
++	}
++	if (parsed.Scheme != "http" && parsed.Scheme != "https") ||
++		parsed.Host == "" ||
++		parsed.User != nil ||
++		(parsed.Path != "" && parsed.Path != "/") ||
++		parsed.RawQuery != "" ||
++		parsed.Fragment != "" {
++		return nil, fmt.Errorf("%s origin must be an http(s) origin without credentials, path, query, or fragment", label)
++	}
++	parsed.Path = ""
++	parsed.RawPath = ""
++	return parsed, nil
++}
++
++func validateSpecs(namespace NamespaceSpec, cluster ClusterSpec) error {
++	fields := []struct {
++		name  string
++		value string
++	}{
++		{"namespace name", namespace.Name},
++		{"supervisor", namespace.Supervisor},
++		{"cluster name", cluster.Name},
++		{"cluster class", cluster.Class},
++		{"Kubernetes version", cluster.Version},
++		{"worker class", cluster.WorkerClass},
++		{"worker name", cluster.WorkerName},
++		{"VM class", cluster.VMClass},
++		{"storage class", cluster.StorageClass},
++	}
++	for _, field := range fields {
++		if field.value == "" {
++			return fmt.Errorf("%s is required", field.name)
++		}
++	}
++	if cluster.ControlPlaneReplicas <= 0 {
++		return fmt.Errorf("control-plane replicas must be positive")
++	}
++	if cluster.WorkerReplicas <= 0 {
++		return fmt.Errorf("worker replicas must be positive")
++	}
++	return nil
++}
++
++func safeHeaderValue(value string) bool {
++	if value == "" {
++		return false
++	}
++	for i := 0; i < len(value); i++ {
++		if value[i] != '\t' && (value[i] < ' ' || value[i] == 0x7f) {
++			return false
++		}
++	}
++	return true
++}
++
++func (c *Client) vcenterHeaders(content bool) http.Header {
++	headers := http.Header{
++		"Accept":                {"application/json"},
++		"Vmware-Api-Session-Id": {c.sessionID},
++	}
++	if content {
++		headers.Set("Content-Type", "application/json; charset=utf-8")
++	}
++	return headers
++}
++
++func kubernetesHeaders(token string, content bool) http.Header {
++	headers := http.Header{
++		"Accept":        {"application/json"},
++		"Authorization": {"Bearer " + token},
++	}
++	if content {
++		headers.Set("Content-Type", "application/json; charset=utf-8")
++	}
++	return headers
++}
++
++func (c *Client) doKubernetes(
++	ctx context.Context,
++	operationID string,
++	method string,
++	endpoint string,
++	body []byte,
++	token string,
++) (int, string, error) {
++	status, err := c.do(ctx, operationID, method, endpoint, body, kubernetesHeaders(token, body != nil))
++	if err != nil || status != http.StatusUnauthorized {
++		return status, token, err
++	}
++
++	refreshed, err := c.tokens.Token(ctx, true)
++	if err != nil {
++		return 0, token, fmt.Errorf("%s: refresh access token: %w", operationID, err)
++	}
++	if !safeHeaderValue(refreshed) {
++		return 0, token, fmt.Errorf("%s: refreshed token must be non-empty and header-safe", operationID)
++	}
++	status, err = c.do(ctx, operationID, method, endpoint, body, kubernetesHeaders(refreshed, body != nil))
++	return status, refreshed, err
++}
++
++func (c *Client) do(
++	ctx context.Context,
++	operationID string,
++	method string,
++	endpoint string,
++	body []byte,
++	headers http.Header,
++) (int, error) {
++	request, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(body))
++	if err != nil {
++		return 0, fmt.Errorf("%s: build request: %w", operationID, err)
++	}
++	request.Header = headers.Clone()
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return 0, fmt.Errorf("%s: %w", operationID, err)
++	}
++	_, copyErr := io.Copy(io.Discard, response.Body)
++	closeErr := response.Body.Close()
++	if copyErr != nil {
++		return 0, fmt.Errorf("%s: read response: %w", operationID, copyErr)
++	}
++	if closeErr != nil {
++		return 0, fmt.Errorf("%s: close response: %w", operationID, closeErr)
++	}
++	return response.StatusCode, nil
++}
++
++func apiError(operationID string, status int) error {
++	return &APIError{OperationID: operationID, StatusCode: status}
+ }

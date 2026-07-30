@@ -1,0 +1,444 @@
+diff --git a/cloneinventory/client.go b/cloneinventory/client.go
+--- a/cloneinventory/client.go
++++ b/cloneinventory/client.go
+@@ -1,20 +1,433 @@
+ package cloneinventory
+ 
+ import (
++	"bytes"
+ 	"context"
+-	"errors"
++	"encoding/json"
++	"io"
++	"net/http"
++	"net/url"
++	"sort"
++	"strings"
++	"time"
+ )
+ 
+-// ErrNotImplemented marks the incomplete implementation.
+-var ErrNotImplemented = errors.New("clone and inventory workflow is not implemented")
++const maxResponseBytes = 1 << 20
+ 
+ // NewClient validates configuration without performing network I/O.
+-func NewClient(Config) (*Client, error) {
+-	return nil, ErrNotImplemented
++func NewClient(config Config) (*Client, error) {
++	parsed, err := url.Parse(config.BaseURL)
++	if err != nil {
++		return nil, invalid("BaseURL", "must be an HTTP(S) origin")
++	}
++	scheme := strings.ToLower(parsed.Scheme)
++	if (scheme != "http" && scheme != "https") ||
++		parsed.Host == "" ||
++		parsed.Hostname() == "" ||
++		parsed.User != nil ||
++		parsed.Opaque != "" ||
++		(parsed.Path != "" && parsed.Path != "/") ||
++		(parsed.EscapedPath() != "" && parsed.EscapedPath() != "/") ||
++		parsed.RawQuery != "" ||
++		parsed.ForceQuery ||
++		parsed.Fragment != "" {
++		return nil, invalid("BaseURL", "must be an HTTP(S) origin")
++	}
++	origin := scheme + "://" + parsed.Host
++	if _, err := http.NewRequest(http.MethodGet, origin, nil); err != nil {
++		return nil, invalid("BaseURL", "must be an HTTP(S) origin")
++	}
++	if !headerSafe(config.SessionID) {
++		return nil, invalid("SessionID", "must be nonblank and safe for an HTTP header")
++	}
++	if config.Timeout <= 0 {
++		return nil, invalid("Timeout", "must be positive")
++	}
++	if config.PollInterval < 0 {
++		return nil, invalid("PollInterval", "must not be negative")
++	}
++	if config.MaxPolls <= 0 {
++		return nil, invalid("MaxPolls", "must be positive")
++	}
++
++	selected := config.HTTPClient
++	if selected == nil {
++		selected = http.DefaultClient
++	}
++	httpClient := *selected
++	httpClient.Timeout = config.Timeout
++	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
++		return http.ErrUseLastResponse
++	}
++	return &Client{
++		baseURL:      origin,
++		sessionID:    config.SessionID,
++		httpClient:   &httpClient,
++		pollInterval: config.PollInterval,
++		maxPolls:     config.MaxPolls,
++	}, nil
+ }
+ 
+ // CloneAndInventory submits one asynchronous clone, waits for terminal success,
+ // and returns contract-sorted VM inventory.
+-func (c *Client) CloneAndInventory(context.Context, CloneRequest) (CloneInventoryResult, error) {
+-	return CloneInventoryResult{}, ErrNotImplemented
++func (c *Client) CloneAndInventory(
++	ctx context.Context,
++	clone CloneRequest,
++) (CloneInventoryResult, error) {
++	if ctx == nil {
++		return CloneInventoryResult{}, invalid("context", "must not be nil")
++	}
++	if strings.TrimSpace(clone.SourceVM) == "" {
++		return CloneInventoryResult{}, invalid("SourceVM", "must be nonblank")
++	}
++	if strings.TrimSpace(clone.Name) == "" {
++		return CloneInventoryResult{}, invalid("Name", "must be nonblank")
++	}
++	if err := ctx.Err(); err != nil {
++		return CloneInventoryResult{}, err
++	}
++
++	cloneBody, err := json.Marshal(struct {
++		Source string `json:"source"`
++		Name   string `json:"name"`
++	}{
++		Source: clone.SourceVM,
++		Name:   clone.Name,
++	})
++	if err != nil {
++		return CloneInventoryResult{}, &ProtocolError{
++			OperationID: CloneTaskOperation,
++			Reason:      "cannot encode clone specification",
++		}
++	}
++	body, err := c.request(
++		ctx,
++		CloneTaskOperation,
++		http.MethodPost,
++		"/api/vcenter/vm?action=clone&vmw-task=true",
++		cloneBody,
++		http.StatusAccepted,
++	)
++	if err != nil {
++		return CloneInventoryResult{}, err
++	}
++	taskID, err := decodeTaskID(body)
++	if err != nil {
++		return CloneInventoryResult{}, &ProtocolError{
++			OperationID: CloneTaskOperation,
++			Reason:      "malformed task identifier",
++		}
++	}
++
++	for poll := 1; poll <= c.maxPolls; poll++ {
++		taskPath := "/api/cis/tasks/" + url.PathEscape(taskID)
++		body, err = c.request(
++			ctx,
++			TaskGetOperation,
++			http.MethodGet,
++			taskPath,
++			nil,
++			http.StatusOK,
++		)
++		if err != nil {
++			return CloneInventoryResult{}, err
++		}
++		taskInfo, err := decodeTaskInfo(body)
++		if err != nil {
++			return CloneInventoryResult{}, &ProtocolError{
++				OperationID: TaskGetOperation,
++				Reason:      "malformed task information",
++			}
++		}
++		switch taskInfo.Status {
++		case "SUCCEEDED":
++			vms, err := c.listVMs(ctx)
++			if err != nil {
++				return CloneInventoryResult{}, err
++			}
++			return CloneInventoryResult{
++				TaskID:     taskID,
++				TaskStatus: taskInfo.Status,
++				TaskResult: append(json.RawMessage(nil), taskInfo.Result...),
++				PollCount:  poll,
++				VMs:        vms,
++			}, nil
++		case "FAILED":
++			return CloneInventoryResult{}, &TaskFailedError{
++				TaskID:   taskID,
++				TaskInfo: taskInfo,
++			}
++		case "PENDING", "RUNNING", "BLOCKED":
++			if poll == c.maxPolls {
++				return CloneInventoryResult{}, &PollLimitError{
++					TaskID:  taskID,
++					MaxPolls: c.maxPolls,
++				}
++			}
++			if err := waitForPoll(ctx, c.pollInterval); err != nil {
++				return CloneInventoryResult{}, err
++			}
++		default:
++			return CloneInventoryResult{}, &ProtocolError{
++				OperationID: TaskGetOperation,
++				Reason:      "unknown task status",
++			}
++		}
++	}
++	panic("unreachable poll loop")
++}
++
++func invalid(field, reason string) error {
++	return &ValidationError{Field: field, Reason: reason}
++}
++
++func headerSafe(value string) bool {
++	if value == "" || strings.TrimSpace(value) == "" || strings.TrimSpace(value) != value {
++		return false
++	}
++	for _, character := range value {
++		if character < 0x20 || character == 0x7f {
++			return false
++		}
++	}
++	return true
++}
++
++func waitForPoll(ctx context.Context, interval time.Duration) error {
++	if interval == 0 {
++		return ctx.Err()
++	}
++	timer := time.NewTimer(interval)
++	defer timer.Stop()
++	select {
++	case <-timer.C:
++		return nil
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++}
++
++func (c *Client) listVMs(ctx context.Context) ([]VMSummary, error) {
++	body, err := c.request(
++		ctx,
++		VMListOperation,
++		http.MethodGet,
++		"/api/vcenter/vm",
++		nil,
++		http.StatusOK,
++	)
++	if err != nil {
++		return nil, err
++	}
++	vms, err := decodeVMs(body)
++	if err != nil {
++		return nil, &ProtocolError{
++			OperationID: VMListOperation,
++			Reason:      "malformed virtual machine summaries",
++		}
++	}
++	sort.Slice(vms, func(left, right int) bool {
++		if vms[left].Name == vms[right].Name {
++			return vms[left].VM < vms[right].VM
++		}
++		return vms[left].Name < vms[right].Name
++	})
++	return vms, nil
++}
++
++func (c *Client) request(
++	ctx context.Context,
++	operationID string,
++	method string,
++	path string,
++	body []byte,
++	successStatus int,
++) ([]byte, error) {
++	var reader io.Reader
++	if body != nil {
++		reader = bytes.NewReader(body)
++	}
++	request, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
++	if err != nil {
++		return nil, &TransportError{OperationID: operationID, cause: err}
++	}
++	request.Header["Accept"] = []string{"application/json"}
++	request.Header["Vmware-Api-Session-Id"] = []string{c.sessionID}
++	if body != nil {
++		request.Header["Content-Type"] = []string{"application/json"}
++	}
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		if ctxErr := ctx.Err(); ctxErr != nil {
++			return nil, ctxErr
++		}
++		return nil, &TransportError{OperationID: operationID, cause: err}
++	}
++	defer response.Body.Close()
++	responseBody, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
++	if err != nil {
++		if ctxErr := ctx.Err(); ctxErr != nil {
++			return nil, ctxErr
++		}
++		return nil, &TransportError{OperationID: operationID, cause: err}
++	}
++	if len(responseBody) > maxResponseBytes {
++		return nil, &ProtocolError{
++			OperationID: operationID,
++			Reason:      "response exceeds size limit",
++		}
++	}
++	if response.StatusCode != successStatus {
++		apiError, err := decodeAPIError(operationID, response.StatusCode, responseBody)
++		if err != nil {
++			return nil, &ProtocolError{
++				OperationID: operationID,
++				Reason:      "malformed vAPI error",
++			}
++		}
++		return nil, apiError
++	}
++	return responseBody, nil
++}
++
++func decodeTaskID(data []byte) (string, error) {
++	var taskID string
++	if err := decodeOne(data, &taskID); err != nil || strings.TrimSpace(taskID) == "" {
++		return "", io.ErrUnexpectedEOF
++	}
++	return taskID, nil
++}
++
++type localizableMessageWire struct {
++	ID             *string   `json:"id"`
++	DefaultMessage *string   `json:"default_message"`
++	Args           *[]string `json:"args"`
++}
++
++type taskInfoWire struct {
++	Description *localizableMessageWire `json:"description"`
++	Service     *string                 `json:"service"`
++	Operation   *string                 `json:"operation"`
++	Status      *string                 `json:"status"`
++	Cancelable  *bool                   `json:"cancelable"`
++	Result      json.RawMessage         `json:"result"`
++	ErrorData   json.RawMessage         `json:"error"`
++}
++
++func decodeTaskInfo(data []byte) (TaskInfo, error) {
++	var wire taskInfoWire
++	if err := decodeOne(data, &wire); err != nil ||
++		wire.Description == nil ||
++		wire.Description.ID == nil ||
++		wire.Description.DefaultMessage == nil ||
++		wire.Description.Args == nil ||
++		wire.Service == nil ||
++		wire.Operation == nil ||
++		wire.Status == nil ||
++		wire.Cancelable == nil {
++		return TaskInfo{}, io.ErrUnexpectedEOF
++	}
++	return TaskInfo{
++		Description: LocalizableMessage{
++			ID:             *wire.Description.ID,
++			DefaultMessage: *wire.Description.DefaultMessage,
++			Args:           append([]string(nil), (*wire.Description.Args)...),
++		},
++		Service:    *wire.Service,
++		Operation:  *wire.Operation,
++		Status:     *wire.Status,
++		Cancelable: *wire.Cancelable,
++		Result:     append(json.RawMessage(nil), wire.Result...),
++		ErrorData:  append(json.RawMessage(nil), wire.ErrorData...),
++	}, nil
++}
++
++type vmSummaryWire struct {
++	VM            *string `json:"vm"`
++	Name          *string `json:"name"`
++	PowerState    *string `json:"power_state"`
++	CPUCount      *int64  `json:"cpu_count"`
++	MemorySizeMiB *int64  `json:"memory_size_mib"`
++}
++
++func decodeVMs(data []byte) ([]VMSummary, error) {
++	if string(bytes.TrimSpace(data)) == "null" {
++		return nil, io.ErrUnexpectedEOF
++	}
++	var wireVMs []*vmSummaryWire
++	if err := decodeOne(data, &wireVMs); err != nil {
++		return nil, err
++	}
++	vms := make([]VMSummary, len(wireVMs))
++	for index, wire := range wireVMs {
++		if wire == nil || wire.VM == nil || wire.Name == nil || wire.PowerState == nil {
++			return nil, io.ErrUnexpectedEOF
++		}
++		switch *wire.PowerState {
++		case "POWERED_OFF", "POWERED_ON", "SUSPENDED":
++		default:
++			return nil, io.ErrUnexpectedEOF
++		}
++		vms[index] = VMSummary{
++			VM:            *wire.VM,
++			Name:          *wire.Name,
++			PowerState:    *wire.PowerState,
++			CPUCount:      copyInt64(wire.CPUCount),
++			MemorySizeMiB: copyInt64(wire.MemorySizeMiB),
++		}
++	}
++	return vms, nil
++}
++
++func copyInt64(value *int64) *int64 {
++	if value == nil {
++		return nil
++	}
++	copy := *value
++	return &copy
++}
++
++type apiErrorWire struct {
++	ErrorType *string                   `json:"error_type"`
++	Messages  *[]localizableMessageWire `json:"messages"`
++}
++
++func decodeAPIError(operationID string, status int, data []byte) (*APIError, error) {
++	var wire apiErrorWire
++	if err := decodeOne(data, &wire); err != nil || wire.ErrorType == nil || wire.Messages == nil {
++		return nil, io.ErrUnexpectedEOF
++	}
++	messages := make([]LocalizableMessage, len(*wire.Messages))
++	for index, message := range *wire.Messages {
++		if message.ID == nil || message.DefaultMessage == nil || message.Args == nil {
++			return nil, io.ErrUnexpectedEOF
++		}
++		messages[index] = LocalizableMessage{
++			ID:             *message.ID,
++			DefaultMessage: *message.DefaultMessage,
++			Args:           append([]string(nil), (*message.Args)...),
++		}
++	}
++	return &APIError{
++		OperationID: operationID,
++		StatusCode:  status,
++		ErrorType:   *wire.ErrorType,
++		Messages:    messages,
++	}, nil
++}
++
++func decodeOne(data []byte, target any) error {
++	decoder := json.NewDecoder(bytes.NewReader(data))
++	if err := decoder.Decode(target); err != nil {
++		return err
++	}
++	var trailing any
++	if err := decoder.Decode(&trailing); err != io.EOF {
++		if err == nil {
++			return io.ErrUnexpectedEOF
++		}
++		return err
++	}
++	return nil
+ }

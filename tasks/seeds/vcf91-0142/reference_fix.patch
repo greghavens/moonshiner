@@ -1,0 +1,371 @@
+diff --git a/vcf_vks_change/client.py b/vcf_vks_change/client.py
+--- a/vcf_vks_change/client.py
++++ b/vcf_vks_change/client.py
+@@ -1,7 +1,15 @@
+-"""Implement the VCF 9.1 Supervisor/VKS coordinated change here."""
++"""Standard-library VCF 9.1 Supervisor and VKS coordinated change."""
+ 
+ from __future__ import annotations
+ 
++import http.client
++import json
++import math
++from dataclasses import dataclass
++from numbers import Real
++from typing import Any
++from urllib.parse import quote, urlsplit
++
+ 
+ class ApiError(RuntimeError):
+     """A REST operation failed before a reliable ledger could be returned."""
+@@ -15,6 +23,74 @@
+     """The named Supervisor namespace or VKS Cluster failed preflight."""
+ 
+ 
++@dataclass(frozen=True)
++class _Origin:
++    scheme: str
++    host: str
++    port: int | None
++
++
++def _required_string(value: object, name: str) -> str:
++    if not isinstance(value, str) or not value.strip():
++        raise ValueError(f"{name} must be a nonblank string")
++    return value
++
++
++def _header_value(value: object, name: str) -> str:
++    result = _required_string(value, name)
++    if "\r" in result or "\n" in result:
++        raise ValueError(f"{name} contains a header-unsafe character")
++    return result
++
++
++def _origin(value: object, name: str) -> _Origin:
++    text = _required_string(value, name)
++    if any(character.isspace() or character in "?#" for character in text):
++        raise ValueError(f"{name} must be an absolute HTTP(S) origin")
++    if "\r" in text or "\n" in text:
++        raise ValueError(f"{name} contains a control character")
++    parsed = urlsplit(text)
++    if parsed.scheme not in {"http", "https"}:
++        raise ValueError(f"{name} must use http or https")
++    if (
++        not parsed.hostname
++        or parsed.username is not None
++        or parsed.password is not None
++        or parsed.path not in {"", "/"}
++        or parsed.query
++        or parsed.fragment
++    ):
++        raise ValueError(f"{name} must be an absolute HTTP(S) origin")
++    try:
++        port = parsed.port
++    except ValueError as error:
++        raise ValueError(f"{name} contains an invalid port") from error
++    return _Origin(parsed.scheme, parsed.hostname, port)
++
++
++def _timeout(value: object) -> float:
++    if (
++        isinstance(value, bool)
++        or not isinstance(value, Real)
++        or not math.isfinite(float(value))
++        or float(value) <= 0
++    ):
++        raise ValueError("timeout must be a finite positive real number")
++    return float(value)
++
++
++def _json_bytes(value: object) -> bytes:
++    return json.dumps(
++        value,
++        ensure_ascii=False,
++        separators=(",", ":"),
++    ).encode("utf-8")
++
++
++def _segment(value: str) -> str:
++    return quote(value, safe="", encoding="utf-8", errors="strict")
++
++
+ class CoordinatedChangeClient:
+     """Apply one vCenter namespace change followed by one VKS change."""
+ 
+@@ -27,7 +103,146 @@
+         *,
+         timeout: float = 10.0,
+     ) -> None:
+-        raise NotImplementedError("complete CoordinatedChangeClient")
++        self._vcenter = _origin(vcenter_url, "vcenter_url")
++        self._kubernetes = _origin(kubernetes_url, "kubernetes_url")
++        self._vcenter_session_id = _header_value(
++            vcenter_session_id,
++            "vcenter_session_id",
++        )
++        self._kubernetes_token = _header_value(
++            kubernetes_token,
++            "kubernetes_token",
++        )
++        self._timeout = _timeout(timeout)
++
++    def _request(
++        self,
++        origin: _Origin,
++        *,
++        method: str,
++        target: str,
++        credential_header: tuple[str, str],
++        body: bytes | None = None,
++        content_type: str | None = None,
++    ) -> tuple[int, bytes]:
++        connection_type: type[
++            http.client.HTTPConnection
++        ] = (
++            http.client.HTTPSConnection
++            if origin.scheme == "https"
++            else http.client.HTTPConnection
++        )
++        connection = connection_type(
++            origin.host,
++            origin.port,
++            timeout=self._timeout,
++        )
++        headers = {
++            "Accept": "application/json",
++            credential_header[0]: credential_header[1],
++        }
++        if content_type is not None:
++            headers["Content-Type"] = content_type
++        try:
++            connection.request(
++                method,
++                target,
++                body=body,
++                headers=headers,
++            )
++            response = connection.getresponse()
++            response_body = response.read()
++            return response.status, response_body
++        except (
++            OSError,
++            TimeoutError,
++            http.client.HTTPException,
++        ) as error:
++            raise ApiError("REST request failed") from None
++        finally:
++            connection.close()
++
++    def _vcenter_request(
++        self,
++        *,
++        method: str,
++        target: str,
++        body: bytes | None = None,
++        content_type: str | None = None,
++    ) -> tuple[int, bytes]:
++        return self._request(
++            self._vcenter,
++            method=method,
++            target=target,
++            credential_header=(
++                "vmware-api-session-id",
++                self._vcenter_session_id,
++            ),
++            body=body,
++            content_type=content_type,
++        )
++
++    def _kubernetes_request(
++        self,
++        *,
++        method: str,
++        target: str,
++        body: bytes | None = None,
++        content_type: str | None = None,
++    ) -> tuple[int, bytes]:
++        return self._request(
++            self._kubernetes,
++            method=method,
++            target=target,
++            credential_header=(
++                "Authorization",
++                f"Bearer {self._kubernetes_token}",
++            ),
++            body=body,
++            content_type=content_type,
++        )
++
++    @staticmethod
++    def _object(body: bytes, operation: str) -> dict[str, Any]:
++        try:
++            value = json.loads(body.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            raise ProtocolError(
++                f"{operation} returned malformed JSON"
++            ) from None
++        if not isinstance(value, dict):
++            raise ProtocolError(f"{operation} did not return an object")
++        return value
++
++    @staticmethod
++    def _namespace_ledger(namespace: str) -> dict[str, object]:
++        return {
++            "operationId": "Vcenter.Namespaces.Instances_update",
++            "namespace": namespace,
++            "status": "Succeeded",
++            "changed": True,
++        }
++
++    @staticmethod
++    def _cluster_ledger(
++        namespace: str,
++        cluster_name: str,
++        *,
++        status: str,
++        changed: bool,
++        http_status: int | None,
++    ) -> dict[str, object]:
++        return {
++            "operationKey": (
++                "cluster.x-k8s.io/v1beta2:"
++                "namespaced-clusters:patch"
++            ),
++            "namespace": namespace,
++            "name": cluster_name,
++            "status": status,
++            "changed": changed,
++            "httpStatus": http_status,
++        }
+ 
+     def coordinate_change(
+         self,
+@@ -39,5 +254,125 @@
+         namespace_description: str,
+         target_version: str,
+     ) -> dict[str, object]:
+-        """Apply both changes and return a partial-success-aware ledger."""
+-        raise NotImplementedError("complete coordinate_change")
++        """Run both preflights and preserve the partial-success boundary."""
++        supervisor = _required_string(supervisor, "supervisor")
++        namespace = _required_string(namespace, "namespace")
++        cluster_name = _required_string(cluster_name, "cluster_name")
++        cluster_class = _required_string(cluster_class, "cluster_class")
++        namespace_description = _required_string(
++            namespace_description,
++            "namespace_description",
++        )
++        target_version = _required_string(target_version, "target_version")
++
++        encoded_namespace = _segment(namespace)
++        namespace_get_target = (
++            "/api/vcenter/namespaces/instances/v2/"
++            f"{encoded_namespace}"
++        )
++        namespace_patch_target = (
++            "/api/vcenter/namespaces/instances/"
++            f"{encoded_namespace}"
++        )
++        cluster_target = (
++            "/apis/cluster.x-k8s.io/v1beta2/namespaces/"
++            f"{encoded_namespace}/clusters/{_segment(cluster_name)}"
++        )
++
++        status, body = self._vcenter_request(
++            method="GET",
++            target=namespace_get_target,
++        )
++        if status != 200:
++            raise ApiError(
++                f"namespace preflight failed with HTTP {status}"
++            )
++        namespace_info = self._object(body, "namespace preflight")
++        if (
++            namespace_info.get("supervisor") != supervisor
++            or namespace_info.get("config_status") != "RUNNING"
++        ):
++            raise PreflightError("Supervisor namespace is not ready")
++
++        status, body = self._kubernetes_request(
++            method="GET",
++            target=cluster_target,
++        )
++        if status != 200:
++            raise ApiError(f"Cluster preflight failed with HTTP {status}")
++        cluster = self._object(body, "Cluster preflight")
++        metadata = cluster.get("metadata")
++        spec = cluster.get("spec")
++        topology = spec.get("topology") if isinstance(spec, dict) else None
++        if (
++            not isinstance(metadata, dict)
++            or metadata.get("namespace") != namespace
++            or metadata.get("name") != cluster_name
++            or not isinstance(topology, dict)
++            or topology.get("class") != cluster_class
++            or not isinstance(topology.get("version"), str)
++            or not topology["version"].strip()
++        ):
++            raise PreflightError("VKS Cluster preflight did not match")
++
++        namespace_body = _json_bytes(
++            {"description": namespace_description}
++        )
++        status, _ = self._vcenter_request(
++            method="PATCH",
++            target=namespace_patch_target,
++            body=namespace_body,
++            content_type="application/json",
++        )
++        if status != 204:
++            raise ApiError(
++                f"namespace update failed with HTTP {status}"
++            )
++
++        namespace_change = self._namespace_ledger(namespace)
++        cluster_body = _json_bytes(
++            {"spec": {"topology": {"version": target_version}}}
++        )
++        try:
++            status, _ = self._kubernetes_request(
++                method="PATCH",
++                target=cluster_target,
++                body=cluster_body,
++                content_type="application/merge-patch+json",
++            )
++        except ApiError:
++            return {
++                "overallStatus": "Failed",
++                "namespaceChange": namespace_change,
++                "clusterChange": self._cluster_ledger(
++                    namespace,
++                    cluster_name,
++                    status="Unknown",
++                    changed=False,
++                    http_status=None,
++                ),
++            }
++
++        if status == 200:
++            return {
++                "overallStatus": "Succeeded",
++                "namespaceChange": namespace_change,
++                "clusterChange": self._cluster_ledger(
++                    namespace,
++                    cluster_name,
++                    status="Succeeded",
++                    changed=True,
++                    http_status=200,
++                ),
++            }
++        return {
++            "overallStatus": "Failed",
++            "namespaceChange": namespace_change,
++            "clusterChange": self._cluster_ledger(
++                namespace,
++                cluster_name,
++                status="Failed",
++                changed=False,
++                http_status=status,
++            ),
++        }

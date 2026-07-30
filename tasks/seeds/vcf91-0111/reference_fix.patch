@@ -1,0 +1,350 @@
+--- a/client.go
++++ b/client.go
+@@ -2,12 +2,23 @@
+ package vcentercategories
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
++	"sort"
++	"strconv"
++	"strings"
+ )
+ 
+-const listCategoriesOperationID = "Vcenter.Tagging.Categories_list"
++const (
++	listCategoriesOperationID = "Vcenter.Tagging.Categories_list"
++	maxResponseBytes          = 8 << 20
++)
+ 
+ // Config configures a vCenter Automation API client.
+ type Config struct {
+@@ -51,7 +62,9 @@
+ 	Messages    []LocalizableMessage
+ }
+ 
+-func (e *APIError) Error() string { return "vCenter API request failed" }
++func (e *APIError) Error() string {
++	return fmt.Sprintf("%s failed with HTTP status %d", e.OperationID, e.StatusCode)
++}
+ 
+ // ProtocolError represents a malformed or inconsistent successful response.
+ type ProtocolError struct {
+@@ -60,15 +73,53 @@
+ }
+ 
+ func (e *ProtocolError) Error() string {
+-	return "vCenter response violated the focused contract"
++	return e.OperationID + " response violated the focused contract"
+ }
+ 
+ // Client is a focused vCenter tag-category client.
+-type Client struct{}
++type Client struct {
++	baseURL    string
++	sessionID  string
++	httpClient *http.Client
++}
+ 
+ // NewClient validates config without performing network I/O.
+ func NewClient(config Config) (*Client, error) {
+-	return nil, errors.New("not implemented")
++	parsed, err := url.Parse(config.BaseURL)
++	if err != nil {
++		return nil, errors.New("BaseURL must be an HTTP(S) origin")
++	}
++	scheme := strings.ToLower(parsed.Scheme)
++	if (scheme != "http" && scheme != "https") ||
++		parsed.Host == "" ||
++		parsed.Hostname() == "" ||
++		parsed.User != nil ||
++		parsed.Opaque != "" ||
++		(parsed.Path != "" && parsed.Path != "/") ||
++		(parsed.EscapedPath() != "" && parsed.EscapedPath() != "/") ||
++		parsed.RawQuery != "" ||
++		parsed.ForceQuery ||
++		parsed.Fragment != "" {
++		return nil, errors.New("BaseURL must be an HTTP(S) origin")
++	}
++	if strings.TrimSpace(config.SessionID) == "" ||
++		!validHeaderValue(config.SessionID) {
++		return nil, errors.New("SessionID must be a nonblank safe header value")
++	}
++
++	httpClient := config.HTTPClient
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++	clientCopy := *httpClient
++	clientCopy.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
++		return http.ErrUseLastResponse
++	}
++	return &Client{
++		baseURL:    scheme + "://" + parsed.Host,
++		sessionID:  config.SessionID,
++		httpClient: &clientCopy,
++	}, nil
+ }
+ 
+ // ListAllCategories retrieves every page and returns a contract-sorted collection.
+@@ -76,5 +127,253 @@
+ 	ctx context.Context,
+ 	options ListOptions,
+ ) ([]Category, error) {
+-	return nil, errors.New("not implemented")
++	if ctx == nil {
++		return nil, errors.New("context is required")
++	}
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++	if err := validateOptions(options); err != nil {
++		return nil, err
++	}
++
++	categories := make([]Category, 0)
++	seenMarkers := make(map[string]struct{})
++	marker := ""
++	for {
++		query := make(url.Values)
++		if marker == "" && options.Names != nil {
++			query["names"] = append([]string(nil), options.Names...)
++		}
++		if marker != "" {
++			query.Set("marker", marker)
++		}
++		if options.PageSize != nil {
++			query.Set("page_size", strconv.FormatInt(*options.PageSize, 10))
++		}
++
++		page, nextMarker, hasNext, err := c.getPage(ctx, query)
++		if err != nil {
++			return nil, err
++		}
++		categories = append(categories, page...)
++		if !hasNext {
++			sortCategories(categories)
++			return categories, nil
++		}
++		if _, exists := seenMarkers[nextMarker]; exists {
++			return nil, protocolError("response repeated a pagination marker")
++		}
++		seenMarkers[nextMarker] = struct{}{}
++		marker = nextMarker
++	}
++}
++
++func (c *Client) getPage(
++	ctx context.Context,
++	query url.Values,
++) ([]Category, string, bool, error) {
++	target := c.baseURL + "/api/vcenter/tagging/categories"
++	if encoded := query.Encode(); encoded != "" {
++		target += "?" + encoded
++	}
++	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
++	if err != nil {
++		if ctx.Err() != nil {
++			return nil, "", false, ctx.Err()
++		}
++		return nil, "", false, errors.New(listCategoriesOperationID + " request could not be created")
++	}
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set("vmware-api-session-id", c.sessionID)
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		if ctx.Err() != nil {
++			return nil, "", false, ctx.Err()
++		}
++		return nil, "", false, errors.New(listCategoriesOperationID + " transport request failed")
++	}
++	defer response.Body.Close()
++
++	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
++	if err != nil {
++		return nil, "", false, errors.New(listCategoriesOperationID + " response could not be read")
++	}
++	if len(body) > maxResponseBytes {
++		return nil, "", false, protocolError("response body is too large")
++	}
++	if response.StatusCode != http.StatusOK {
++		var envelope struct {
++			ErrorType string               `json:"error_type"`
++			Messages  []LocalizableMessage `json:"messages"`
++		}
++		_ = json.Unmarshal(body, &envelope)
++		return nil, "", false, &APIError{
++			OperationID: listCategoriesOperationID,
++			StatusCode:  response.StatusCode,
++			ErrorType:   envelope.ErrorType,
++			Messages:    envelope.Messages,
++		}
++	}
++	page, marker, hasNext, err := decodePage(body)
++	if err != nil {
++		return nil, "", false, err
++	}
++	return page, marker, hasNext, nil
++}
++
++func decodePage(body []byte) ([]Category, string, bool, error) {
++	var result map[string]json.RawMessage
++	if err := json.Unmarshal(body, &result); err != nil || result == nil {
++		return nil, "", false, protocolError("response is not a JSON object")
++	}
++	itemsJSON, exists := result["items"]
++	if !exists || isNull(itemsJSON) {
++		return nil, "", false, protocolError("items is missing or null")
++	}
++	var rawItems []json.RawMessage
++	if err := json.Unmarshal(itemsJSON, &rawItems); err != nil || rawItems == nil {
++		return nil, "", false, protocolError("items is not an array")
++	}
++
++	items := make([]Category, len(rawItems))
++	for index, rawItem := range rawItems {
++		item, err := decodeCategory(rawItem)
++		if err != nil {
++			return nil, "", false, err
++		}
++		items[index] = item
++	}
++
++	markerJSON, exists := result["marker"]
++	if !exists || isNull(markerJSON) {
++		return items, "", false, nil
++	}
++	var marker string
++	if err := json.Unmarshal(markerJSON, &marker); err != nil {
++		return nil, "", false, protocolError("marker is not a string")
++	}
++	if marker == "" {
++		return nil, "", false, protocolError("marker is empty")
++	}
++	return items, marker, true, nil
++}
++
++func decodeCategory(raw json.RawMessage) (Category, error) {
++	var item map[string]json.RawMessage
++	if err := json.Unmarshal(raw, &item); err != nil || item == nil {
++		return Category{}, protocolError("category item is not an object")
++	}
++	categoryID, ok := requiredString(item, "category_id")
++	if !ok {
++		return Category{}, protocolError("category_id is missing or invalid")
++	}
++	infoJSON, exists := item["info"]
++	if !exists || isNull(infoJSON) {
++		return Category{}, protocolError("info is missing or null")
++	}
++	var info map[string]json.RawMessage
++	if err := json.Unmarshal(infoJSON, &info); err != nil || info == nil {
++		return Category{}, protocolError("info is not an object")
++	}
++	name, nameOK := requiredString(info, "name")
++	description, descriptionOK := requiredString(info, "description")
++	cardinality, cardinalityOK := requiredString(info, "cardinality")
++	associableTypes, associableOK := requiredStringArray(info, "associable_types")
++	usedBy, usedByOK := requiredStringArray(info, "used_by")
++	if !nameOK || !descriptionOK || !cardinalityOK || !associableOK || !usedByOK {
++		return Category{}, protocolError("category info has missing or invalid required fields")
++	}
++	return Category{
++		CategoryID: categoryID,
++		Info: CategoryInfo{
++			Name:            name,
++			Description:     description,
++			Cardinality:     cardinality,
++			AssociableTypes: associableTypes,
++			UsedBy:          usedBy,
++		},
++	}, nil
++}
++
++func requiredString(
++	object map[string]json.RawMessage,
++	name string,
++) (string, bool) {
++	raw, exists := object[name]
++	if !exists || isNull(raw) {
++		return "", false
++	}
++	var value string
++	if err := json.Unmarshal(raw, &value); err != nil {
++		return "", false
++	}
++	return value, true
++}
++
++func requiredStringArray(
++	object map[string]json.RawMessage,
++	name string,
++) ([]string, bool) {
++	raw, exists := object[name]
++	if !exists || isNull(raw) {
++		return nil, false
++	}
++	var value []string
++	if err := json.Unmarshal(raw, &value); err != nil || value == nil {
++		return nil, false
++	}
++	return value, true
++}
++
++func validateOptions(options ListOptions) error {
++	if options.Names != nil {
++		if len(options.Names) == 0 {
++			return errors.New("Names must be nil or a nonempty unique list")
++		}
++		seen := make(map[string]struct{}, len(options.Names))
++		for _, name := range options.Names {
++			if strings.TrimSpace(name) == "" {
++				return errors.New("Names contains a blank value")
++			}
++			if _, exists := seen[name]; exists {
++				return errors.New("Names contains a duplicate value")
++			}
++			seen[name] = struct{}{}
++		}
++	}
++	if options.PageSize != nil && *options.PageSize < 1 {
++		return errors.New("PageSize must be positive when set")
++	}
++	return nil
++}
++
++func sortCategories(categories []Category) {
++	sort.Slice(categories, func(left, right int) bool {
++		if categories[left].Info.Name != categories[right].Info.Name {
++			return categories[left].Info.Name < categories[right].Info.Name
++		}
++		return categories[left].CategoryID < categories[right].CategoryID
++	})
++}
++
++func validHeaderValue(value string) bool {
++	for index := 0; index < len(value); index++ {
++		if value[index] < 0x20 || value[index] == 0x7f {
++			return false
++		}
++	}
++	return true
++}
++
++func isNull(raw json.RawMessage) bool {
++	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
++}
++
++func protocolError(reason string) *ProtocolError {
++	return &ProtocolError{
++		OperationID: listCategoriesOperationID,
++		Reason:      reason,
++	}
+ }

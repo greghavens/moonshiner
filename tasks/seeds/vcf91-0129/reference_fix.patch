@@ -1,0 +1,283 @@
+diff --git a/src/VksSupervisor.psm1 b/src/VksSupervisor.psm1
+index fad0b1f..0975166 100644
+--- a/src/VksSupervisor.psm1
++++ b/src/VksSupervisor.psm1
+@@ -1,5 +1,59 @@
+ Set-StrictMode -Version Latest
+ 
++function Join-VksUri {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [uri] $BaseUri,
++
++        [Parameter(Mandatory)]
++        [string] $Path
++    )
++
++    return '{0}/{1}' -f $BaseUri.AbsoluteUri.TrimEnd('/'), $Path.TrimStart('/')
++}
++
++function ConvertTo-VksPathSegment {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [string] $Value
++    )
++
++    return [uri]::EscapeDataString($Value)
++}
++
++function Invoke-VksJsonRequest {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [ValidateSet('GET', 'POST')]
++        [string] $Method,
++
++        [Parameter(Mandatory)]
++        [uri] $Uri,
++
++        [Parameter(Mandatory)]
++        [hashtable] $Headers,
++
++        [object] $Body,
++
++        [switch] $HasBody
++    )
++
++    $request = @{
++        Method = $Method
++        Uri = $Uri
++        Headers = $Headers
++        ErrorAction = 'Stop'
++    }
++    if ($HasBody) {
++        $request.ContentType = 'application/json'
++        $request.Body = $Body | ConvertTo-Json -Depth 32 -Compress
++    }
++    return Invoke-RestMethod @request
++}
++
+ function Invoke-VksClusterDeployment {
+     [CmdletBinding()]
+     param(
+@@ -62,7 +116,217 @@ function Invoke-VksClusterDeployment {
+         [int] $TimeoutSeconds = 300
+     )
+ 
+-    throw 'Invoke-VksClusterDeployment has not been implemented.'
++    $descriptionWasSet = $PSBoundParameters.ContainsKey('NamespaceDescription')
++    $storageLimitWasSet = $PSBoundParameters.ContainsKey('NamespaceStorageLimitMiB')
++    $serviceCidrWasSet = $PSBoundParameters.ContainsKey('ServiceCidr')
++    $podCidrWasSet = $PSBoundParameters.ContainsKey('PodCidr')
++
++    if ($serviceCidrWasSet -xor $podCidrWasSet) {
++        throw [System.ArgumentException]::new(
++            'ServiceCidr and PodCidr must either both be supplied or both be omitted.'
++        )
++    }
++
++    $requiredValues = [ordered] @{
++        VCenterSessionId = $VCenterSessionId
++        KubernetesBearerToken = $KubernetesBearerToken
++        Supervisor = $Supervisor
++        Namespace = $Namespace
++        StoragePolicy = $StoragePolicy
++        ClusterName = $ClusterName
++        KubernetesVersion = $KubernetesVersion
++        ClusterClass = $ClusterClass
++        VmClass = $VmClass
++        WorkerClass = $WorkerClass
++        WorkerName = $WorkerName
++    }
++    foreach ($entry in $requiredValues.GetEnumerator()) {
++        if ([string]::IsNullOrWhiteSpace([string] $entry.Value)) {
++            throw [System.ArgumentException]::new("$($entry.Key) cannot be empty.")
++        }
++    }
++
++    $vCenterHeaders = @{
++        Accept = 'application/json'
++        'vmware-api-session-id' = $VCenterSessionId
++    }
++    $kubernetesHeaders = @{
++        Accept = 'application/json'
++        Authorization = "Bearer $KubernetesBearerToken"
++    }
++
++    $storageSpec = [ordered] @{
++        policy = $StoragePolicy
++    }
++    if ($storageLimitWasSet) {
++        if ($NamespaceStorageLimitMiB -lt 0) {
++            throw [System.ArgumentOutOfRangeException]::new(
++                'NamespaceStorageLimitMiB',
++                'NamespaceStorageLimitMiB cannot be negative.'
++            )
++        }
++        $storageSpec.limit = [long] $NamespaceStorageLimitMiB
++    }
++
++    $namespaceBody = [ordered] @{
++        supervisor = $Supervisor
++        namespace = $Namespace
++        storage_specs = @($storageSpec)
++    }
++    if ($descriptionWasSet) {
++        $namespaceBody.description = $NamespaceDescription
++    }
++
++    $namespaceCollectionUri = Join-VksUri `
++        -BaseUri $VCenterBaseUri `
++        -Path 'vcenter/namespaces/instances/v2'
++    Invoke-VksJsonRequest `
++        -Method POST `
++        -Uri $namespaceCollectionUri `
++        -Headers $vCenterHeaders `
++        -Body $namespaceBody `
++        -HasBody | Out-Null
++
++    $escapedNamespace = ConvertTo-VksPathSegment -Value $Namespace
++    $namespaceItemUri = Join-VksUri `
++        -BaseUri $VCenterBaseUri `
++        -Path "vcenter/namespaces/instances/v2/$escapedNamespace"
++    $namespaceDeadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
++    $namespacePollCount = 0
++    $namespaceStatus = $null
++    while ($true) {
++        $namespacePollCount++
++        $namespaceResponse = Invoke-VksJsonRequest `
++            -Method GET `
++            -Uri $namespaceItemUri `
++            -Headers $vCenterHeaders
++        $namespaceStatus = [string] $namespaceResponse.config_status
++        switch ($namespaceStatus.ToUpperInvariant()) {
++            'RUNNING' {
++                break
++            }
++            'ERROR' {
++                throw "Supervisor namespace '$Namespace' reached terminal status ERROR."
++            }
++            'REMOVING' {
++                throw "Supervisor namespace '$Namespace' reached terminal status REMOVING."
++            }
++        }
++        if ($namespaceStatus -eq 'RUNNING') {
++            break
++        }
++        if ([DateTime]::UtcNow -ge $namespaceDeadline) {
++            throw [TimeoutException]::new(
++                "Timed out waiting for Supervisor namespace '$Namespace' to reach RUNNING."
++            )
++        }
++        if ($PollIntervalMilliseconds -gt 0) {
++            Start-Sleep -Milliseconds $PollIntervalMilliseconds
++        }
++    }
++
++    $topology = [ordered] @{
++        class = $ClusterClass
++        version = $KubernetesVersion
++        controlPlane = [ordered] @{
++            replicas = $ControlPlaneReplicas
++        }
++        workers = [ordered] @{
++            machineDeployments = @(
++                [ordered] @{
++                    class = $WorkerClass
++                    name = $WorkerName
++                    replicas = $WorkerReplicas
++                }
++            )
++        }
++        variables = @(
++            [ordered] @{ name = 'vmClass'; value = $VmClass },
++            [ordered] @{ name = 'storageClass'; value = $StoragePolicy }
++        )
++    }
++    $clusterSpec = [ordered] @{
++        topology = $topology
++    }
++    if ($serviceCidrWasSet -and $podCidrWasSet) {
++        $clusterSpec.clusterNetwork = [ordered] @{
++            services = [ordered] @{ cidrBlocks = @($ServiceCidr) }
++            pods = [ordered] @{ cidrBlocks = @($PodCidr) }
++            serviceDomain = 'cluster.local'
++        }
++    }
++    $clusterBody = [ordered] @{
++        apiVersion = 'cluster.x-k8s.io/v1beta1'
++        kind = 'Cluster'
++        metadata = [ordered] @{
++            name = $ClusterName
++            namespace = $Namespace
++        }
++        spec = $clusterSpec
++    }
++
++    $clusterCollectionUri = Join-VksUri `
++        -BaseUri $KubernetesBaseUri `
++        -Path "apis/cluster.x-k8s.io/v1beta1/namespaces/$escapedNamespace/clusters"
++    Invoke-VksJsonRequest `
++        -Method POST `
++        -Uri $clusterCollectionUri `
++        -Headers $kubernetesHeaders `
++        -Body $clusterBody `
++        -HasBody | Out-Null
++
++    $escapedCluster = ConvertTo-VksPathSegment -Value $ClusterName
++    $clusterItemUri = Join-VksUri `
++        -BaseUri $KubernetesBaseUri `
++        -Path "apis/cluster.x-k8s.io/v1beta1/namespaces/$escapedNamespace/clusters/$escapedCluster"
++    $clusterDeadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
++    $clusterPollCount = 0
++    while ($true) {
++        $clusterPollCount++
++        $clusterResponse = Invoke-VksJsonRequest `
++            -Method GET `
++            -Uri $clusterItemUri `
++            -Headers $kubernetesHeaders
++        $clusterPhase = [string] $clusterResponse.status.phase
++        if ($clusterPhase -in @('Failed', 'Deleting')) {
++            $readyFailure = @($clusterResponse.status.conditions) |
++                Where-Object type -eq 'Ready' |
++                Select-Object -First 1
++            $detail = if ($null -ne $readyFailure -and
++                $readyFailure.PSObject.Properties.Name -contains 'message') {
++                ": $($readyFailure.message)"
++            }
++            else {
++                '.'
++            }
++            throw "VKS cluster '$ClusterName' reached terminal phase $clusterPhase$detail"
++        }
++
++        $readyCondition = @($clusterResponse.status.conditions) |
++            Where-Object type -eq 'Ready' |
++            Select-Object -First 1
++        $isReady = $null -ne $readyCondition -and
++            [string] $readyCondition.status -eq 'True'
++        if ($isReady) {
++            return [pscustomobject] [ordered] @{
++                Namespace = $Namespace
++                NamespaceStatus = $namespaceStatus
++                Cluster = $ClusterName
++                ClusterPhase = $clusterPhase
++                Ready = $true
++                NamespacePollCount = $namespacePollCount
++                ClusterPollCount = $clusterPollCount
++            }
++        }
++        if ([DateTime]::UtcNow -ge $clusterDeadline) {
++            throw [TimeoutException]::new(
++                "Timed out waiting for VKS cluster '$ClusterName' to become Ready."
++            )
++        }
++        if ($PollIntervalMilliseconds -gt 0) {
++            Start-Sleep -Milliseconds $PollIntervalMilliseconds
++        }
++    }
+ }
+ 
+ Export-ModuleMember -Function Invoke-VksClusterDeployment

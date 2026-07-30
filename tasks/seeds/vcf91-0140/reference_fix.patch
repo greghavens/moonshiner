@@ -1,0 +1,508 @@
+diff --git a/vcf_vks_inventory/client.py b/vcf_vks_inventory/client.py
+index 9c4e084..1b4be1b 100644
+--- a/vcf_vks_inventory/client.py
++++ b/vcf_vks_inventory/client.py
+@@ -2,13 +2,24 @@
+ 
+ from __future__ import annotations
+ 
++import http.client
++import ipaddress
++import json
++import math
++import re
+ from typing import Any
++from urllib.parse import quote, urlsplit
+ 
+ 
+ VCENTER_OPERATION_ID = "Vcenter.Namespaces.User.Instances_list"
++DISCOVERY_PATH = "/api/vcenter/namespaces-user/namespaces"
+ KUBERNETES_OPERATION = (
+     "cluster.x-k8s.io/v1beta2:namespaced-clusters:list"
+ )
++_INT64_MAX = 2**63 - 1
++_DNS_LABEL = re.compile(
++    r"(?=.{1,63}\Z)[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
++)
+ 
+ 
+ class VksInventoryError(RuntimeError):
+@@ -51,7 +62,35 @@ class VksClusterInventoryClient:
+         timeout: float = 10.0,
+         kubernetes_scheme: str = "https",
+     ) -> None:
+-        raise NotImplementedError
++        (
++            self._vcenter_scheme,
++            self._vcenter_host,
++            self._vcenter_port,
++        ) = self._parse_origin(vcenter_url)
++        self._validate_credential(
++            vcenter_session_id,
++            "vcenter_session_id",
++        )
++        self._validate_credential(
++            kubernetes_token,
++            "kubernetes_token",
++        )
++        if (
++            isinstance(timeout, bool)
++            or not isinstance(timeout, (int, float))
++            or not math.isfinite(float(timeout))
++            or timeout <= 0
++        ):
++            raise ValueError("timeout must be a positive finite number")
++        if kubernetes_scheme not in {"http", "https"}:
++            raise ValueError(
++                "kubernetes_scheme must be 'http' or 'https'"
++            )
++
++        self._vcenter_session_id = vcenter_session_id
++        self._kubernetes_token = kubernetes_token
++        self._timeout = float(timeout)
++        self._kubernetes_scheme = kubernetes_scheme
+ 
+     def list_clusters(
+         self,
+@@ -61,4 +100,440 @@ class VksClusterInventoryClient:
+     ) -> list[dict[str, Any]]:
+         """Return the complete Cluster collection in stable order."""
+ 
+-        raise NotImplementedError
++        if not isinstance(namespace, str) or not namespace.strip():
++            raise ValueError("namespace must be a non-blank string")
++        if (
++            isinstance(page_size, bool)
++            or not isinstance(page_size, int)
++            or not 1 <= page_size <= _INT64_MAX
++        ):
++            raise ValueError(
++                "page_size must be a positive signed-int64 integer"
++            )
++
++        summaries = self._request_json(
++            self._vcenter_scheme,
++            self._vcenter_host,
++            self._vcenter_port,
++            DISCOVERY_PATH,
++            "vmware-api-session-id",
++            self._vcenter_session_id,
++            VCENTER_OPERATION_ID,
++        )
++        master_host = self._select_master_host(
++            summaries,
++            namespace,
++        )
++        kubernetes_host, kubernetes_port = (
++            self._parse_master_host(master_host)
++        )
++        path = (
++            "/apis/cluster.x-k8s.io/v1beta2/namespaces/"
++            + quote(namespace, safe="")
++            + "/clusters"
++        )
++
++        clusters: list[dict[str, Any]] = []
++        cluster_names: set[str] = set()
++        seen_continuations: set[str] = set()
++        continuation: str | None = None
++
++        while True:
++            target = path + "?limit=" + str(page_size)
++            if continuation is not None:
++                target += "&continue=" + quote(
++                    continuation,
++                    safe="",
++                )
++            page = self._request_json(
++                self._kubernetes_scheme,
++                kubernetes_host,
++                kubernetes_port,
++                target,
++                "Authorization",
++                "Bearer " + self._kubernetes_token,
++                KUBERNETES_OPERATION,
++            )
++            page_items, next_continuation = self._validate_page(
++                page,
++                namespace,
++                cluster_names,
++                seen_continuations,
++            )
++            clusters.extend(page_items)
++            cluster_names.update(
++                item["metadata"]["name"] for item in page_items
++            )
++            if next_continuation is None:
++                break
++            seen_continuations.add(next_continuation)
++            continuation = next_continuation
++
++        return sorted(clusters, key=self._cluster_sort_key)
++
++    @staticmethod
++    def _parse_origin(
++        value: str,
++    ) -> tuple[str, str, int | None]:
++        if not isinstance(value, str) or not value:
++            raise ValueError("vcenter_url must be an HTTP(S) origin")
++        if any(character.isspace() for character in value):
++            raise ValueError("vcenter_url must be an HTTP(S) origin")
++        try:
++            parsed = urlsplit(value)
++            port = parsed.port
++        except ValueError as exc:
++            raise ValueError(
++                "vcenter_url must be an HTTP(S) origin"
++            ) from exc
++        if (
++            parsed.scheme not in {"http", "https"}
++            or parsed.hostname is None
++            or parsed.username is not None
++            or parsed.password is not None
++            or parsed.path not in {"", "/"}
++            or parsed.query
++            or parsed.fragment
++            or (
++                parsed.netloc.endswith(":")
++                and port is None
++            )
++            or (
++                port is not None
++                and not 1 <= port <= 65535
++            )
++        ):
++            raise ValueError("vcenter_url must be an HTTP(S) origin")
++        VksClusterInventoryClient._validate_host(parsed.hostname)
++        return parsed.scheme, parsed.hostname, port
++
++    @staticmethod
++    def _parse_master_host(
++        value: Any,
++    ) -> tuple[str, int | None]:
++        if (
++            not isinstance(value, str)
++            or not value
++            or "://" in value
++            or any(character.isspace() for character in value)
++        ):
++            raise ProtocolError(
++                VCENTER_OPERATION_ID,
++                "namespace master_host is not a bare authority",
++            )
++        try:
++            parsed = urlsplit("//" + value)
++            port = parsed.port
++        except ValueError as exc:
++            raise ProtocolError(
++                VCENTER_OPERATION_ID,
++                "namespace master_host is malformed",
++            ) from exc
++        if (
++            parsed.hostname is None
++            or parsed.username is not None
++            or parsed.password is not None
++            or parsed.path
++            or parsed.query
++            or parsed.fragment
++            or (
++                parsed.netloc.endswith(":")
++                and port is None
++            )
++            or (
++                port is not None
++                and not 1 <= port <= 65535
++            )
++        ):
++            raise ProtocolError(
++                VCENTER_OPERATION_ID,
++                "namespace master_host is not a bare authority",
++            )
++        try:
++            VksClusterInventoryClient._validate_host(
++                parsed.hostname
++            )
++        except ValueError as exc:
++            raise ProtocolError(
++                VCENTER_OPERATION_ID,
++                "namespace master_host is malformed",
++            ) from exc
++        return parsed.hostname, port
++
++    @staticmethod
++    def _validate_host(host: str) -> None:
++        try:
++            ipaddress.ip_address(host)
++            return
++        except ValueError:
++            pass
++        candidate = host[:-1] if host.endswith(".") else host
++        if (
++            not candidate
++            or len(candidate) > 253
++            or any(
++                _DNS_LABEL.fullmatch(label) is None
++                for label in candidate.split(".")
++            )
++        ):
++            raise ValueError("host must be an IP address or DNS name")
++
++    @staticmethod
++    def _validate_credential(value: str, name: str) -> None:
++        if (
++            not isinstance(value, str)
++            or not value.strip()
++            or any(
++                ord(character) < 32 or ord(character) == 127
++                for character in value
++            )
++        ):
++            raise ValueError(
++                f"{name} must be a non-blank header-safe string"
++            )
++
++    @staticmethod
++    def _connection(
++        scheme: str,
++        host: str,
++        port: int | None,
++        timeout: float,
++    ) -> http.client.HTTPConnection:
++        connection_type: type[http.client.HTTPConnection]
++        if scheme == "https":
++            connection_type = http.client.HTTPSConnection
++        else:
++            connection_type = http.client.HTTPConnection
++        return connection_type(host, port=port, timeout=timeout)
++
++    def _request_json(
++        self,
++        scheme: str,
++        host: str,
++        port: int | None,
++        target: str,
++        authentication_name: str,
++        authentication_value: str,
++        operation_id: str,
++    ) -> Any:
++        connection = self._connection(
++            scheme,
++            host,
++            port,
++            self._timeout,
++        )
++        try:
++            connection.putrequest(
++                "GET",
++                target,
++                skip_accept_encoding=True,
++            )
++            connection.putheader("Accept", "application/json")
++            connection.putheader(
++                authentication_name,
++                authentication_value,
++            )
++            connection.endheaders()
++            response = connection.getresponse()
++            status = response.status
++            raw = response.read()
++        except (
++            OSError,
++            ValueError,
++            http.client.HTTPException,
++        ):
++            raise VksInventoryError(
++                operation_id,
++                None,
++                None,
++            ) from None
++        finally:
++            connection.close()
++
++        if status != 200:
++            raise VksInventoryError(
++                operation_id,
++                status,
++                self._decode_error_payload(raw),
++            )
++        try:
++            text = raw.decode("utf-8")
++            return json.loads(
++                text,
++                parse_constant=self._reject_json_constant,
++            )
++        except (
++            UnicodeDecodeError,
++            json.JSONDecodeError,
++            ValueError,
++        ):
++            raise ProtocolError(
++                operation_id,
++                "success response is not strict UTF-8 JSON",
++            ) from None
++
++    @staticmethod
++    def _decode_error_payload(raw: bytes) -> Any:
++        try:
++            return json.loads(
++                raw.decode("utf-8"),
++                parse_constant=(
++                    VksClusterInventoryClient._reject_json_constant
++                ),
++            )
++        except (
++            UnicodeDecodeError,
++            json.JSONDecodeError,
++            ValueError,
++        ):
++            return None
++
++    @staticmethod
++    def _reject_json_constant(value: str) -> Any:
++        raise ValueError(f"non-finite JSON constant: {value}")
++
++    @staticmethod
++    def _select_master_host(
++        value: Any,
++        namespace: str,
++    ) -> str:
++        if not isinstance(value, list):
++            raise ProtocolError(
++                VCENTER_OPERATION_ID,
++                "success response must be a JSON array",
++            )
++        seen_names: set[str] = set()
++        selected: list[str] = []
++        for summary in value:
++            if not isinstance(summary, dict):
++                raise ProtocolError(
++                    VCENTER_OPERATION_ID,
++                    "namespace summaries must be objects",
++                )
++            name = summary.get("namespace")
++            master_host = summary.get("master_host")
++            if (
++                not isinstance(name, str)
++                or not name.strip()
++                or not isinstance(master_host, str)
++                or not master_host.strip()
++            ):
++                raise ProtocolError(
++                    VCENTER_OPERATION_ID,
++                    "namespace summary has invalid required fields",
++                )
++            if name in seen_names:
++                raise ProtocolError(
++                    VCENTER_OPERATION_ID,
++                    "namespace response contains duplicate names",
++                )
++            seen_names.add(name)
++            if name == namespace:
++                selected.append(master_host)
++        if len(selected) != 1:
++            raise ProtocolError(
++                VCENTER_OPERATION_ID,
++                "requested namespace must match exactly one summary",
++            )
++        return selected[0]
++
++    @staticmethod
++    def _validate_page(
++        value: Any,
++        namespace: str,
++        existing_names: set[str],
++        seen_continuations: set[str],
++    ) -> tuple[list[dict[str, Any]], str | None]:
++        if not isinstance(value, dict):
++            raise ProtocolError(
++                KUBERNETES_OPERATION,
++                "ClusterList response must be an object",
++            )
++        if (
++            value.get("apiVersion") != "cluster.x-k8s.io/v1beta2"
++            or value.get("kind") != "ClusterList"
++            or not isinstance(value.get("metadata"), dict)
++            or not isinstance(value.get("items"), list)
++        ):
++            raise ProtocolError(
++                KUBERNETES_OPERATION,
++                "success response is not a valid ClusterList",
++            )
++
++        items = value["items"]
++        page_names: set[str] = set()
++        for item in items:
++            if (
++                not isinstance(item, dict)
++                or item.get("apiVersion")
++                != "cluster.x-k8s.io/v1beta2"
++                or item.get("kind") != "Cluster"
++                or not isinstance(item.get("metadata"), dict)
++            ):
++                raise ProtocolError(
++                    KUBERNETES_OPERATION,
++                    "ClusterList contains an invalid Cluster item",
++                )
++            metadata = item["metadata"]
++            name = metadata.get("name")
++            item_namespace = metadata.get("namespace")
++            uid = metadata.get("uid")
++            if (
++                not isinstance(name, str)
++                or not name.strip()
++                or not isinstance(item_namespace, str)
++                or not item_namespace.strip()
++                or not isinstance(uid, str)
++                or not uid.strip()
++                or item_namespace != namespace
++            ):
++                raise ProtocolError(
++                    KUBERNETES_OPERATION,
++                    "Cluster metadata is invalid",
++                )
++            if name in existing_names or name in page_names:
++                raise ProtocolError(
++                    KUBERNETES_OPERATION,
++                    "Cluster collection contains duplicate names",
++                )
++            page_names.add(name)
++
++        metadata = value["metadata"]
++        if "continue" not in metadata:
++            continuation = None
++        else:
++            raw_continuation = metadata["continue"]
++            if not isinstance(raw_continuation, str):
++                raise ProtocolError(
++                    KUBERNETES_OPERATION,
++                    "continuation must be a string",
++                )
++            continuation = raw_continuation or None
++        if continuation is not None:
++            if not items:
++                raise ProtocolError(
++                    KUBERNETES_OPERATION,
++                    "empty page cannot have a continuation",
++                )
++            if continuation in seen_continuations:
++                raise ProtocolError(
++                    KUBERNETES_OPERATION,
++                    "continuation repeated",
++                )
++        return items, continuation
++
++    @staticmethod
++    def _cluster_sort_key(
++        item: dict[str, Any],
++    ) -> tuple[str, str, str]:
++        metadata = item["metadata"]
++        return (
++            metadata["name"],
++            metadata["uid"],
++            json.dumps(
++                item,
++                ensure_ascii=False,
++                sort_keys=True,
++                separators=(",", ":"),
++            ),
++        )

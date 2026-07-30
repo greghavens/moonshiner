@@ -1,0 +1,518 @@
+--- a/VcenterVmClient.java
++++ b/VcenterVmClient.java
+@@ -1,15 +1,30 @@
+ import java.io.IOException;
+ import java.net.URI;
+ import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
+ import java.time.Duration;
++import java.util.ArrayList;
++import java.util.Base64;
++import java.util.HashSet;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Map;
+ import java.util.Objects;
++import java.util.Set;
+ 
+ /**
+  * Minimal Java 17 client for the two vCenter operations selected in
+  * docs/contract.json.
+  */
+ public final class VcenterVmClient {
++    private static final char[] HEX = "0123456789ABCDEF".toCharArray();
++    private static final Set<String> SUMMARY_FIELDS = Set.of(
++            "vm", "name", "power_state", "cpu_count", "memory_size_mib");
++    private static final Set<String> POWER_STATES = Set.of(
++            "POWERED_OFF", "POWERED_ON", "SUSPENDED");
++
+     private final URI baseUri;
+     private final Duration requestTimeout;
+     private final HttpClient http;
+@@ -23,10 +38,16 @@
+     }
+ 
+     public VcenterVmClient(URI baseUri, Duration requestTimeout) {
+-        this.baseUri = Objects.requireNonNull(baseUri, "baseUri");
+-        this.requestTimeout = Objects.requireNonNull(requestTimeout, "requestTimeout");
++        this.baseUri = requireOrigin(baseUri);
++        if (requestTimeout == null
++                || requestTimeout.isZero()
++                || requestTimeout.isNegative()) {
++            throw new IllegalArgumentException("requestTimeout must be positive");
++        }
++        this.requestTimeout = requestTimeout;
+         this.http = HttpClient.newBuilder()
+                 .connectTimeout(requestTimeout)
++                .followRedirects(HttpClient.Redirect.NEVER)
+                 .build();
+     }
+ 
+@@ -38,7 +59,463 @@
+             String username,
+             String password,
+             List<String> datacenterIds) throws IOException, InterruptedException {
+-        // TODO: implement the spec-derived session/list/resume workflow.
+-        throw new UnsupportedOperationException("Not implemented");
++        validateInputs(username, password, datacenterIds);
++
++        String sessionToken = createSession(username, password);
++        boolean replaced = false;
++        List<VmSummary> collected = new ArrayList<>();
++
++        for (String datacenterId : datacenterIds) {
++            ListAttempt attempt = listForDatacenter(datacenterId, sessionToken);
++            if (attempt.statusCode() == 401) {
++                if (replaced) {
++                    throw new IOException(
++                            "Vcenter.VM_list returned HTTP 401 after session replacement");
++                }
++                sessionToken = createSession(username, password);
++                replaced = true;
++                attempt = listForDatacenter(datacenterId, sessionToken);
++                if (attempt.statusCode() == 401) {
++                    throw new IOException(
++                            "Vcenter.VM_list returned HTTP 401 after session replacement");
++                }
++            }
++            if (attempt.statusCode() != 200) {
++                throw new IOException(
++                        "Vcenter.VM_list returned HTTP " + attempt.statusCode());
++            }
++            collected.addAll(parseSummaries(attempt.body()));
++        }
++        return List.copyOf(collected);
++    }
++
++    private record ListAttempt(int statusCode, String body) {
++    }
++
++    private static URI requireOrigin(URI value) {
++        if (value == null) {
++            throw new IllegalArgumentException("baseUri is required");
++        }
++        String scheme = value.getScheme();
++        String path = value.getRawPath();
++        if (scheme == null
++                || (!scheme.equalsIgnoreCase("http")
++                        && !scheme.equalsIgnoreCase("https"))
++                || value.getHost() == null
++                || value.getRawUserInfo() != null
++                || value.getRawQuery() != null
++                || value.getRawFragment() != null
++                || !(path == null || path.isEmpty() || path.equals("/"))) {
++            throw new IllegalArgumentException("baseUri must be an HTTP(S) origin");
++        }
++        return value;
++    }
++
++    private static void validateInputs(
++            String username, String password, List<String> datacenterIds) {
++        if (username == null || username.isBlank() || username.indexOf(':') >= 0) {
++            throw new IllegalArgumentException(
++                    "username must be nonblank and must not contain ':'");
++        }
++        if (password == null || password.isBlank()) {
++            throw new IllegalArgumentException("password must be nonblank");
++        }
++        if (datacenterIds == null || datacenterIds.isEmpty()) {
++            throw new IllegalArgumentException("datacenterIds must not be empty");
++        }
++        Set<String> seen = new HashSet<>();
++        for (String datacenterId : datacenterIds) {
++            if (datacenterId == null || datacenterId.isBlank()) {
++                throw new IllegalArgumentException(
++                        "datacenterIds must contain only nonblank values");
++            }
++            if (!seen.add(datacenterId)) {
++                throw new IllegalArgumentException(
++                        "datacenterIds must not contain duplicates");
++            }
++        }
++    }
++
++    private String createSession(String username, String password)
++            throws IOException, InterruptedException {
++        String credentials = Base64.getEncoder().encodeToString(
++                (username + ":" + password).getBytes(StandardCharsets.UTF_8));
++        HttpRequest request = request("/api/session")
++                .header("Authorization", "Basic " + credentials)
++                .POST(HttpRequest.BodyPublishers.noBody())
++                .build();
++        HttpResponse<String> response = send(request, "Cis.Session_create");
++        if (response.statusCode() != 201) {
++            throw new IOException(
++                    "Cis.Session_create returned HTTP " + response.statusCode());
++        }
++        Object document = Json.parse(response.body());
++        if (!(document instanceof String token)
++                || token.isBlank()
++                || !isHeaderSafe(token)) {
++            throw new IOException("Cis.Session_create returned a malformed session token");
++        }
++        return token;
++    }
++
++    private ListAttempt listForDatacenter(String datacenterId, String sessionToken)
++            throws IOException, InterruptedException {
++        String path = "/api/vcenter/vm?datacenters="
++                + encodeQueryComponent(datacenterId);
++        HttpRequest request = request(path)
++                .header("vmware-api-session-id", sessionToken)
++                .GET()
++                .build();
++        HttpResponse<String> response = send(request, "Vcenter.VM_list");
++        return new ListAttempt(response.statusCode(), response.body());
++    }
++
++    private HttpRequest.Builder request(String pathAndQuery) {
++        return HttpRequest.newBuilder(baseUri.resolve(pathAndQuery))
++                .timeout(requestTimeout)
++                .header("Accept", "application/json");
++    }
++
++    private HttpResponse<String> send(HttpRequest request, String operationId)
++            throws IOException, InterruptedException {
++        try {
++            return http.send(
++                    request,
++                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++        } catch (IOException error) {
++            throw new IOException(operationId + " transport failure");
++        }
++    }
++
++    private static boolean isHeaderSafe(String value) {
++        for (int index = 0; index < value.length(); index++) {
++            char character = value.charAt(index);
++            if (character < 0x21 || character > 0x7e) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++    private static String encodeQueryComponent(String value) {
++        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
++        StringBuilder encoded = new StringBuilder(bytes.length);
++        for (byte item : bytes) {
++            int unsigned = item & 0xff;
++            if ((unsigned >= 'a' && unsigned <= 'z')
++                    || (unsigned >= 'A' && unsigned <= 'Z')
++                    || (unsigned >= '0' && unsigned <= '9')
++                    || unsigned == '-'
++                    || unsigned == '.'
++                    || unsigned == '_'
++                    || unsigned == '~') {
++                encoded.append((char) unsigned);
++            } else {
++                encoded.append('%')
++                        .append(HEX[unsigned >>> 4])
++                        .append(HEX[unsigned & 0x0f]);
++            }
++        }
++        return encoded.toString();
++    }
++
++    private static List<VmSummary> parseSummaries(String json) throws IOException {
++        Object document = Json.parse(json);
++        if (!(document instanceof List<?> items)) {
++            throw new IOException("Vcenter.VM_list response must be a JSON array");
++        }
++        List<VmSummary> summaries = new ArrayList<>(items.size());
++        for (Object item : items) {
++            if (!(item instanceof Map<?, ?> raw)) {
++                throw new IOException("Vcenter.VM_list item must be an object");
++            }
++            Map<String, Object> object = stringKeyed(raw);
++            if (!SUMMARY_FIELDS.containsAll(object.keySet())) {
++                throw new IOException("Vcenter.VM_list item has an unknown member");
++            }
++            String vm = requiredString(object, "vm");
++            String name = requiredString(object, "name");
++            String powerState = requiredString(object, "power_state");
++            if (!POWER_STATES.contains(powerState)) {
++                throw new IOException("Vcenter.VM_list item has an invalid power_state");
++            }
++            summaries.add(new VmSummary(
++                    vm,
++                    name,
++                    powerState,
++                    optionalInteger(object, "cpu_count"),
++                    optionalInteger(object, "memory_size_mib")));
++        }
++        return summaries;
++    }
++
++    private static Map<String, Object> stringKeyed(Map<?, ?> raw) throws IOException {
++        Map<String, Object> result = new LinkedHashMap<>();
++        for (Map.Entry<?, ?> entry : raw.entrySet()) {
++            if (!(entry.getKey() instanceof String key)) {
++                throw new IOException("JSON object member name is not a string");
++            }
++            result.put(key, entry.getValue());
++        }
++        return result;
++    }
++
++    private static String requiredString(Map<String, Object> object, String field)
++            throws IOException {
++        Object value = object.get(field);
++        if (!(value instanceof String text) || text.isBlank()) {
++            throw new IOException(
++                    "Vcenter.VM_list item has an invalid required field " + field);
++        }
++        return text;
++    }
++
++    private static Long optionalInteger(Map<String, Object> object, String field)
++            throws IOException {
++        if (!object.containsKey(field) || object.get(field) == null) {
++            return null;
++        }
++        Object value = object.get(field);
++        if (!(value instanceof Long integer)) {
++            throw new IOException(
++                    "Vcenter.VM_list item has a non-integer field " + field);
++        }
++        return integer;
++    }
++
++    /**
++     * Small strict JSON parser sufficient for the spec-projected response
++     * documents. It rejects duplicate members and trailing data.
++     */
++    private static final class Json {
++        private final String source;
++        private int position;
++
++        private Json(String source) {
++            this.source = Objects.requireNonNull(source, "source");
++        }
++
++        static Object parse(String source) throws IOException {
++            Json parser = new Json(source);
++            Object value = parser.value();
++            parser.whitespace();
++            if (parser.position != parser.source.length()) {
++                throw malformed();
++            }
++            return value;
++        }
++
++        private Object value() throws IOException {
++            whitespace();
++            if (position >= source.length()) {
++                throw malformed();
++            }
++            return switch (source.charAt(position)) {
++                case '"' -> string();
++                case '{' -> object();
++                case '[' -> array();
++                case 't' -> literal("true", Boolean.TRUE);
++                case 'f' -> literal("false", Boolean.FALSE);
++                case 'n' -> literal("null", null);
++                default -> number();
++            };
++        }
++
++        private Map<String, Object> object() throws IOException {
++            position++;
++            Map<String, Object> result = new LinkedHashMap<>();
++            whitespace();
++            if (take('}')) {
++                return result;
++            }
++            while (true) {
++                whitespace();
++                if (position >= source.length() || source.charAt(position) != '"') {
++                    throw malformed();
++                }
++                String key = string();
++                whitespace();
++                if (!take(':')) {
++                    throw malformed();
++                }
++                Object value = value();
++                if (result.containsKey(key)) {
++                    throw malformed();
++                }
++                result.put(key, value);
++                whitespace();
++                if (take('}')) {
++                    return result;
++                }
++                if (!take(',')) {
++                    throw malformed();
++                }
++            }
++        }
++
++        private List<Object> array() throws IOException {
++            position++;
++            List<Object> result = new ArrayList<>();
++            whitespace();
++            if (take(']')) {
++                return result;
++            }
++            while (true) {
++                result.add(value());
++                whitespace();
++                if (take(']')) {
++                    return result;
++                }
++                if (!take(',')) {
++                    throw malformed();
++                }
++            }
++        }
++
++        private String string() throws IOException {
++            if (!take('"')) {
++                throw malformed();
++            }
++            StringBuilder result = new StringBuilder();
++            while (position < source.length()) {
++                char character = source.charAt(position++);
++                if (character == '"') {
++                    return result.toString();
++                }
++                if (character < 0x20) {
++                    throw malformed();
++                }
++                if (character != '\\') {
++                    result.append(character);
++                    continue;
++                }
++                if (position >= source.length()) {
++                    throw malformed();
++                }
++                char escape = source.charAt(position++);
++                switch (escape) {
++                    case '"' -> result.append('"');
++                    case '\\' -> result.append('\\');
++                    case '/' -> result.append('/');
++                    case 'b' -> result.append('\b');
++                    case 'f' -> result.append('\f');
++                    case 'n' -> result.append('\n');
++                    case 'r' -> result.append('\r');
++                    case 't' -> result.append('\t');
++                    case 'u' -> result.append(unicodeEscape());
++                    default -> throw malformed();
++                }
++            }
++            throw malformed();
++        }
++
++        private char unicodeEscape() throws IOException {
++            if (position + 4 > source.length()) {
++                throw malformed();
++            }
++            int value = 0;
++            for (int count = 0; count < 4; count++) {
++                int digit = Character.digit(source.charAt(position++), 16);
++                if (digit < 0) {
++                    throw malformed();
++                }
++                value = (value << 4) | digit;
++            }
++            return (char) value;
++        }
++
++        private Object number() throws IOException {
++            int start = position;
++            if (take('-') && position >= source.length()) {
++                throw malformed();
++            }
++            if (take('0')) {
++                if (position < source.length()
++                        && Character.isDigit(source.charAt(position))) {
++                    throw malformed();
++                }
++            } else {
++                if (position >= source.length()
++                        || source.charAt(position) < '1'
++                        || source.charAt(position) > '9') {
++                    throw malformed();
++                }
++                while (position < source.length()
++                        && Character.isDigit(source.charAt(position))) {
++                    position++;
++                }
++            }
++            boolean integer = true;
++            if (take('.')) {
++                integer = false;
++                int fraction = position;
++                while (position < source.length()
++                        && Character.isDigit(source.charAt(position))) {
++                    position++;
++                }
++                if (fraction == position) {
++                    throw malformed();
++                }
++            }
++            if (position < source.length()
++                    && (source.charAt(position) == 'e'
++                            || source.charAt(position) == 'E')) {
++                integer = false;
++                position++;
++                if (position < source.length()
++                        && (source.charAt(position) == '+'
++                                || source.charAt(position) == '-')) {
++                    position++;
++                }
++                int exponent = position;
++                while (position < source.length()
++                        && Character.isDigit(source.charAt(position))) {
++                    position++;
++                }
++                if (exponent == position) {
++                    throw malformed();
++                }
++            }
++            String text = source.substring(start, position);
++            try {
++                return integer ? (Object) Long.valueOf(text) : Double.valueOf(text);
++            } catch (NumberFormatException error) {
++                throw malformed();
++            }
++        }
++
++        private Object literal(String expected, Object value) throws IOException {
++            if (!source.startsWith(expected, position)) {
++                throw malformed();
++            }
++            position += expected.length();
++            return value;
++        }
++
++        private boolean take(char expected) {
++            if (position < source.length() && source.charAt(position) == expected) {
++                position++;
++                return true;
++            }
++            return false;
++        }
++
++        private void whitespace() {
++            while (position < source.length()) {
++                char character = source.charAt(position);
++                if (character == ' '
++                        || character == '\n'
++                        || character == '\r'
++                        || character == '\t') {
++                    position++;
++                } else {
++                    return;
++                }
++            }
++        }
++
++        private static IOException malformed() {
++            return new IOException("malformed JSON response");
++        }
+     }
+ }

@@ -1,0 +1,262 @@
+--- a/vcenter/client.go
++++ b/vcenter/client.go
+@@ -1,12 +1,61 @@
+ package vcenter
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
++	"errors"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
+ )
+ 
++const automationBasePath = "/api"
++
+ // NewClient validates cfg and returns an independent client.
+ func NewClient(cfg Config) (*Client, error) {
+-	return nil, &ValidationError{Field: "configuration: TODO"}
++	if cfg.BaseURL == "" ||
++		cfg.BaseURL != strings.TrimSpace(cfg.BaseURL) ||
++		hasControl(cfg.BaseURL) {
++		return nil, &ValidationError{Field: "BaseURL"}
++	}
++	base, err := url.Parse(cfg.BaseURL)
++	if err != nil ||
++		(base.Scheme != "http" && base.Scheme != "https") ||
++		base.Host == "" ||
++		base.Hostname() == "" ||
++		base.User != nil ||
++		(base.Path != "" && base.Path != "/") ||
++		base.RawPath != "" ||
++		base.RawQuery != "" ||
++		base.ForceQuery ||
++		base.Fragment != "" ||
++		base.Opaque != "" {
++		return nil, &ValidationError{Field: "BaseURL"}
++	}
++	if strings.TrimSpace(cfg.SessionToken) == "" ||
++		hasControl(cfg.SessionToken) {
++		return nil, &ValidationError{Field: "SessionToken"}
++	}
++
++	source := cfg.HTTPClient
++	if source == nil {
++		source = http.DefaultClient
++	}
++	httpClient := *source
++	httpClient.CheckRedirect = func(
++		_ *http.Request,
++		_ []*http.Request,
++	) error {
++		return http.ErrUseLastResponse
++	}
++
++	return &Client{
++		baseURL:      strings.TrimSuffix(base.String(), "/") + automationBasePath,
++		sessionToken: cfg.SessionToken,
++		httpClient:   &httpClient,
++	}, nil
+ }
+ 
+ // CreateLocalLibrary creates one local Content Library with retry-safe semantics.
+@@ -15,5 +64,195 @@
+ 	clientToken string,
+ 	spec LocalLibrarySpec,
+ ) (CreateResult, error) {
+-	return CreateResult{}, &ValidationError{Field: "request: TODO"}
++	if c == nil || c.httpClient == nil || c.baseURL == "" {
++		return CreateResult{}, &ValidationError{Field: "client"}
++	}
++	if ctx == nil {
++		return CreateResult{}, &ValidationError{Field: "context"}
++	}
++	if !isUUID(clientToken) {
++		return CreateResult{}, &ValidationError{Field: "ClientToken"}
++	}
++	if strings.TrimSpace(spec.Name) == "" || hasControl(spec.Name) {
++		return CreateResult{}, &ValidationError{Field: "Name"}
++	}
++	if len(spec.StorageBackings) != 1 {
++		return CreateResult{}, &ValidationError{Field: "StorageBackings"}
++	}
++	if err := validateBacking(spec.StorageBackings[0]); err != nil {
++		return CreateResult{}, err
++	}
++
++	body, err := json.Marshal(spec)
++	if err != nil {
++		return CreateResult{}, &ValidationError{Field: "LocalLibrarySpec"}
++	}
++	endpoint := c.baseURL + "/content/local-library"
++
++	for attempt := 1; attempt <= 2; attempt++ {
++		if ctxErr := ctx.Err(); ctxErr != nil {
++			return CreateResult{}, &TransportError{
++				OperationID: operationID,
++				Attempts:    attempt - 1,
++				Err:         ctxErr,
++			}
++		}
++		request, err := http.NewRequestWithContext(
++			ctx,
++			http.MethodPost,
++			endpoint,
++			bytes.NewReader(body),
++		)
++		if err != nil {
++			return CreateResult{}, &TransportError{
++				OperationID: operationID,
++				Attempts:    attempt - 1,
++				Err:         err,
++			}
++		}
++		request.Header.Set("Accept", "application/json")
++		request.Header.Set("Content-Type", "application/json")
++		request.Header.Set("vmware-api-session-id", c.sessionToken)
++		request.Header.Set("Client-Token", clientToken)
++
++		response, err := c.httpClient.Do(request)
++		if err != nil {
++			if response != nil && response.Body != nil {
++				_ = response.Body.Close()
++			}
++			if ctxErr := ctx.Err(); ctxErr != nil {
++				return CreateResult{}, &TransportError{
++					OperationID: operationID,
++					Attempts:    attempt,
++					Err:         ctxErr,
++				}
++			}
++			if errors.Is(err, context.Canceled) ||
++				errors.Is(err, context.DeadlineExceeded) {
++				return CreateResult{}, &TransportError{
++					OperationID: operationID,
++					Attempts:    attempt,
++					Err:         err,
++				}
++			}
++			if attempt == 1 {
++				continue
++			}
++			return CreateResult{}, &TransportError{
++				OperationID: operationID,
++				Attempts:    attempt,
++				Err:         err,
++			}
++		}
++
++		if response.StatusCode != http.StatusCreated {
++			_, _ = io.Copy(io.Discard, response.Body)
++			_ = response.Body.Close()
++			return CreateResult{}, &APIError{
++				OperationID: operationID,
++				StatusCode:  response.StatusCode,
++				Attempts:    attempt,
++			}
++		}
++
++		responseBody, readErr := io.ReadAll(response.Body)
++		_ = response.Body.Close()
++		if readErr != nil {
++			if ctxErr := ctx.Err(); ctxErr != nil {
++				return CreateResult{}, &TransportError{
++					OperationID: operationID,
++					Attempts:    attempt,
++					Err:         ctxErr,
++				}
++			}
++			if attempt == 1 {
++				continue
++			}
++			return CreateResult{}, &TransportError{
++				OperationID: operationID,
++				Attempts:    attempt,
++				Err:         readErr,
++			}
++		}
++
++		var libraryID string
++		if err := json.Unmarshal(responseBody, &libraryID); err != nil ||
++			strings.TrimSpace(libraryID) == "" {
++			return CreateResult{}, &ProtocolError{
++				OperationID: operationID,
++				Attempts:    attempt,
++			}
++		}
++		return CreateResult{
++			OperationID: operationID,
++			LibraryID:   libraryID,
++			ClientToken: clientToken,
++			Attempts:    attempt,
++		}, nil
++	}
++
++	panic("unreachable")
++}
++
++func validateBacking(backing StorageBacking) *ValidationError {
++	switch backing.Type {
++	case StorageBackingDatastore:
++		if backing.DatastoreID == nil ||
++			strings.TrimSpace(*backing.DatastoreID) == "" ||
++			hasControl(*backing.DatastoreID) ||
++			backing.StorageURI != nil {
++			return &ValidationError{Field: "StorageBackings"}
++		}
++	case StorageBackingOther:
++		if backing.StorageURI == nil ||
++			strings.TrimSpace(*backing.StorageURI) == "" ||
++			hasControl(*backing.StorageURI) ||
++			backing.DatastoreID != nil {
++			return &ValidationError{Field: "StorageBackings"}
++		}
++		location, err := url.Parse(*backing.StorageURI)
++		if err != nil ||
++			!location.IsAbs() ||
++			location.Scheme == "" ||
++			(location.Host == "" && location.Path == "" && location.Opaque == "") {
++			return &ValidationError{Field: "StorageBackings"}
++		}
++	default:
++		return &ValidationError{Field: "StorageBackings"}
++	}
++	return nil
++}
++
++func hasControl(value string) bool {
++	for _, character := range value {
++		if character < 32 || character == 127 {
++			return true
++		}
++	}
++	return false
++}
++
++func isUUID(value string) bool {
++	if len(value) != 36 {
++		return false
++	}
++	for index := 0; index < len(value); index++ {
++		switch index {
++		case 8, 13, 18, 23:
++			if value[index] != '-' {
++				return false
++			}
++		default:
++			if !isHex(value[index]) {
++				return false
++			}
++		}
++	}
++	return true
++}
++
++func isHex(value byte) bool {
++	return value >= '0' && value <= '9' ||
++		value >= 'a' && value <= 'f' ||
++		value >= 'A' && value <= 'F'
+ }

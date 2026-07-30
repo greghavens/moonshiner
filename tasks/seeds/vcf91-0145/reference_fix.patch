@@ -1,0 +1,569 @@
+--- a/vks_diag/client.py
++++ b/vks_diag/client.py
+@@ -2,31 +2,274 @@
+ 
+ from __future__ import annotations
+ 
++import json
+ from typing import Any
++from urllib.error import HTTPError, URLError
++from urllib.parse import quote, urlencode, urlsplit
++from urllib.request import Request, urlopen
+ 
+ 
+ class DiagnosticError(RuntimeError):
+     """Raised when evidence cannot be retrieved or trusted."""
+ 
++    def __init__(
++        self,
++        message: str,
++        *,
++        status: int | None = None,
++        response_body: str | None = None,
++    ):
++        super().__init__(message)
++        self.status = status
++        self.response_body = response_body
++
++
++def _validate_base_url(
++    base_url: str,
++    *,
++    required_suffix: str | None = None,
++) -> str:
++    if not isinstance(base_url, str):
++        raise ValueError("base_url must be a string")
++    candidate = base_url.rstrip("/")
++    parsed = urlsplit(candidate)
++    if (
++        parsed.scheme not in {"http", "https"}
++        or not parsed.hostname
++        or parsed.username is not None
++        or parsed.password is not None
++        or parsed.query
++        or parsed.fragment
++    ):
++        raise ValueError("base_url must be an http(s) API URL")
++    if required_suffix is not None and not parsed.path.rstrip("/").endswith(
++        required_suffix
++    ):
++        raise ValueError(f"base_url must end with {required_suffix}")
++    return candidate
++
++
++def _segment(value: str, name: str) -> str:
++    if not isinstance(value, str) or not value:
++        raise ValueError(f"{name} must be a non-empty string")
++    return quote(value, safe="")
++
++
++class _HTTPClient:
++    def __init__(
++        self,
++        base_url: str,
++        timeout: float,
++        headers: dict[str, str],
++        *,
++        required_suffix: str | None = None,
++    ):
++        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
++            raise ValueError("timeout must be a number")
++        if timeout <= 0:
++            raise ValueError("timeout must be positive")
++        self._base_url = _validate_base_url(
++            base_url,
++            required_suffix=required_suffix,
++        )
++        self._timeout = float(timeout)
++        self._headers = headers
++
++    def _request(
++        self,
++        path: str,
++        *,
++        query: list[tuple[str, str]] | None = None,
++        accept: str,
++        expected_status: int = 200,
++        expect_json: bool,
++    ) -> Any:
++        if not path.startswith("/") or "://" in path:
++            raise ValueError("request path must be relative to the API base")
++        url = self._base_url + path
++        if query:
++            url += "?" + urlencode(query)
++        headers = {**self._headers, "Accept": accept}
++        request = Request(url, headers=headers, method="GET")
++        try:
++            with urlopen(request, timeout=self._timeout) as response:
++                status = getattr(response, "status", None)
++                if status is None:
++                    status = response.getcode()
++                payload = response.read()
++        except HTTPError as exc:
++            payload = exc.read()
++            text = payload.decode("utf-8", errors="replace")
++            raise DiagnosticError(
++                f"API returned HTTP {exc.code} for GET {path}",
++                status=exc.code,
++                response_body=text,
++            ) from exc
++        except (URLError, TimeoutError, OSError) as exc:
++            reason = getattr(exc, "reason", exc)
++            raise DiagnosticError(
++                f"API request failed for GET {path}: {reason}"
++            ) from exc
++        if status != expected_status:
++            text = payload.decode("utf-8", errors="replace")
++            raise DiagnosticError(
++                f"API returned HTTP {status} for GET {path}",
++                status=status,
++                response_body=text,
++            )
++        try:
++            text = payload.decode("utf-8")
++        except UnicodeDecodeError as exc:
++            raise DiagnosticError(
++                f"API returned non-UTF-8 data for GET {path}"
++            ) from exc
++        if not expect_json:
++            return text
++        try:
++            return json.loads(text)
++        except json.JSONDecodeError as exc:
++            raise DiagnosticError(
++                f"API returned invalid JSON for GET {path}"
++            ) from exc
+ 
+-class VCenterClient:
++
++class VCenterClient(_HTTPClient):
+     """Client for the vCenter operations recorded in ``docs/contract.json``."""
+ 
+     def __init__(self, base_url: str, session_id: str, timeout: float = 10.0):
+-        raise NotImplementedError("implement VCenterClient")
++        if not isinstance(session_id, str) or not session_id:
++            raise ValueError("session_id must be a non-empty string")
++        super().__init__(
++            base_url,
++            timeout,
++            {"vmware-api-session-id": session_id},
++            required_suffix="/api",
++        )
+ 
+     def get_namespace(self, namespace: str) -> dict[str, Any]:
+-        raise NotImplementedError
++        namespace_segment = _segment(namespace, "namespace")
++        result = self._request(
++            f"/vcenter/namespaces/instances/v2/{namespace_segment}",
++            accept="application/json",
++            expect_json=True,
++        )
++        if not isinstance(result, dict):
++            raise DiagnosticError(
++                "vCenter namespace response must be a JSON object"
++            )
++        required = {
++            "supervisor": str,
++            "config_status": str,
++            "messages": list,
++            "stats": dict,
++            "description": str,
++            "access_list": list,
++            "storage_specs": list,
++        }
++        _require_fields(result, required, "vCenter namespace")
++        return result
+ 
+     def get_supervisor_summary(self, supervisor: str) -> dict[str, Any]:
+-        raise NotImplementedError
++        supervisor_segment = _segment(supervisor, "supervisor")
++        result = self._request(
++            (
++                "/vcenter/namespace-management/supervisors/"
++                f"{supervisor_segment}/summary"
++            ),
++            accept="application/json",
++            expect_json=True,
++        )
++        if not isinstance(result, dict):
++            raise DiagnosticError(
++                "vCenter Supervisor summary must be a JSON object"
++            )
++        required = {
++            "name": str,
++            "config_status": str,
++            "kubernetes_status": str,
++            "stats": dict,
++        }
++        _require_fields(result, required, "vCenter Supervisor summary")
++        return result
++
++
++def _require_fields(
++    value: dict[str, Any],
++    expected: dict[str, type],
++    context: str,
++) -> None:
++    for name, expected_type in expected.items():
++        if not isinstance(value.get(name), expected_type):
++            raise DiagnosticError(
++                f"{context} has invalid or missing {name!r}"
++            )
+ 
+ 
+-class KubernetesClient:
++class KubernetesClient(_HTTPClient):
+     """Small client for the core V1 Kubernetes evidence endpoints."""
+ 
+     def __init__(self, base_url: str, token: str, timeout: float = 10.0):
+-        raise NotImplementedError("implement KubernetesClient")
++        if not isinstance(token, str) or not token:
++            raise ValueError("token must be a non-empty string")
++        super().__init__(
++            base_url,
++            timeout,
++            {"Authorization": f"Bearer {token}"},
++        )
++
++    @staticmethod
++    def _list_query(
++        *,
++        label_selector: str | None,
++        field_selector: str | None,
++        limit: int | None,
++    ) -> list[tuple[str, str]]:
++        query: list[tuple[str, str]] = []
++        if label_selector is not None:
++            if not isinstance(label_selector, str):
++                raise ValueError("label_selector must be a string or None")
++            query.append(("labelSelector", label_selector))
++        if field_selector is not None:
++            if not isinstance(field_selector, str):
++                raise ValueError("field_selector must be a string or None")
++            query.append(("fieldSelector", field_selector))
++        if limit is not None:
++            if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
++                raise ValueError("limit must be a non-negative integer or None")
++            query.append(("limit", str(limit)))
++        return query
++
++    def _list_resource(
++        self,
++        resource: str,
++        namespace: str,
++        *,
++        label_selector: str | None,
++        field_selector: str | None,
++        limit: int | None,
++    ) -> dict[str, Any]:
++        namespace_segment = _segment(namespace, "namespace")
++        result = self._request(
++            f"/api/v1/namespaces/{namespace_segment}/{resource}",
++            query=self._list_query(
++                label_selector=label_selector,
++                field_selector=field_selector,
++                limit=limit,
++            ),
++            accept="application/json",
++            expect_json=True,
++        )
++        if not isinstance(result, dict) or not isinstance(
++            result.get("items"), list
++        ):
++            raise DiagnosticError(
++                f"Kubernetes {resource} response must contain an items array"
++            )
++        if not all(isinstance(item, dict) for item in result["items"]):
++            raise DiagnosticError(
++                f"Kubernetes {resource} response contains a non-object item"
++            )
++        return result
+ 
+     def list_pods(
+         self,
+@@ -36,7 +279,13 @@
+         field_selector: str | None = None,
+         limit: int | None = None,
+     ) -> dict[str, Any]:
+-        raise NotImplementedError
++        return self._list_resource(
++            "pods",
++            namespace,
++            label_selector=label_selector,
++            field_selector=field_selector,
++            limit=limit,
++        )
+ 
+     def list_events(
+         self,
+@@ -46,7 +295,13 @@
+         field_selector: str | None = None,
+         limit: int | None = None,
+     ) -> dict[str, Any]:
+-        raise NotImplementedError
++        return self._list_resource(
++            "events",
++            namespace,
++            label_selector=label_selector,
++            field_selector=field_selector,
++            limit=limit,
++        )
+ 
+     def get_pod_log(
+         self,
+@@ -58,4 +313,40 @@
+         previous: bool | None = None,
+         timestamps: bool | None = None,
+     ) -> str:
+-        raise NotImplementedError
++        namespace_segment = _segment(namespace, "namespace")
++        pod_segment = _segment(pod, "pod")
++        query: list[tuple[str, str]] = []
++        if container is not None:
++            if not isinstance(container, str):
++                raise ValueError("container must be a string or None")
++            query.append(("container", container))
++        if tail_lines is not None:
++            if (
++                not isinstance(tail_lines, int)
++                or isinstance(tail_lines, bool)
++                or tail_lines < 0
++            ):
++                raise ValueError(
++                    "tail_lines must be a non-negative integer or None"
++                )
++            query.append(("tailLines", str(tail_lines)))
++        if previous is not None:
++            if not isinstance(previous, bool):
++                raise ValueError("previous must be a boolean or None")
++            query.append(("previous", "true" if previous else "false"))
++        if timestamps is not None:
++            if not isinstance(timestamps, bool):
++                raise ValueError("timestamps must be a boolean or None")
++            query.append(("timestamps", "true" if timestamps else "false"))
++        result = self._request(
++            (
++                f"/api/v1/namespaces/{namespace_segment}/pods/"
++                f"{pod_segment}/log"
++            ),
++            query=query,
++            accept="text/plain",
++            expect_json=False,
++        )
++        if not isinstance(result, str):
++            raise DiagnosticError("Kubernetes pod log must be text")
++        return result
+--- a/vks_diag/diagnosis.py
++++ b/vks_diag/diagnosis.py
+@@ -18,4 +18,148 @@
+ ) -> dict[str, Any]:
+     """Collect namespace, pod, Event, and log evidence."""
+ 
+-    raise NotImplementedError
++    if not isinstance(namespace, str) or not namespace:
++        raise ValueError("namespace must be a non-empty string")
++    if not isinstance(label_selector, str) or not label_selector:
++        raise ValueError("label_selector must be a non-empty string")
++    if (
++        not isinstance(tail_lines, int)
++        or isinstance(tail_lines, bool)
++        or tail_lines < 0
++    ):
++        raise ValueError("tail_lines must be a non-negative integer")
++
++    namespace_info = vcenter.get_namespace(namespace)
++    supervisor = namespace_info.get("supervisor")
++    if not isinstance(supervisor, str) or not supervisor:
++        raise DiagnosticError(
++            "namespace response lacks a usable Supervisor identifier"
++        )
++    supervisor_summary = vcenter.get_supervisor_summary(supervisor)
++
++    pod_list = kubernetes.list_pods(
++        namespace,
++        label_selector=label_selector,
++    )
++    unhealthy: list[dict[str, Any]] = []
++    for pod in pod_list["items"]:
++        statuses = _container_statuses(pod)
++        if any(status.get("ready") is False for status in statuses):
++            unhealthy.append(pod)
++    if not unhealthy:
++        raise DiagnosticError("no unhealthy pod matched the selector")
++    if len(unhealthy) != 1:
++        raise DiagnosticError(
++            f"expected one unhealthy pod, received {len(unhealthy)}"
++        )
++    selected_pod = unhealthy[0]
++    metadata = selected_pod.get("metadata")
++    if not isinstance(metadata, dict):
++        raise DiagnosticError("selected pod has invalid metadata")
++    pod_name = metadata.get("name")
++    pod_uid = metadata.get("uid")
++    if not isinstance(pod_name, str) or not pod_name:
++        raise DiagnosticError("selected pod has no usable name")
++    if not isinstance(pod_uid, str) or not pod_uid:
++        raise DiagnosticError("selected pod has no usable UID")
++
++    statuses = _container_statuses(selected_pod)
++    non_ready = [
++        status
++        for status in statuses
++        if status.get("ready") is False
++        and isinstance(status.get("name"), str)
++        and status["name"]
++    ]
++    if container is None:
++        if not non_ready:
++            raise DiagnosticError("selected pod has no non-ready container")
++        if len(non_ready) != 1:
++            raise DiagnosticError(
++                f"expected one non-ready container, received {len(non_ready)}"
++            )
++        selected_container = non_ready[0]["name"]
++    else:
++        if not isinstance(container, str) or not container:
++            raise ValueError("container must be a non-empty string or None")
++        matches = [
++            status
++            for status in statuses
++            if status.get("name") == container
++            and status.get("ready") is False
++        ]
++        if len(matches) != 1:
++            raise DiagnosticError(
++                "explicit container is not a unique non-ready container"
++            )
++        selected_container = container
++
++    event_list = kubernetes.list_events(
++        namespace,
++        field_selector=f"involvedObject.uid={pod_uid}",
++    )
++    events = event_list["items"]
++    container_log = kubernetes.get_pod_log(
++        namespace,
++        pod_name,
++        container=selected_container,
++        tail_lines=tail_lines,
++    )
++
++    warning_reasons = sorted(
++        {
++            event["reason"]
++            for event in events
++            if event.get("type") == "Warning"
++            and isinstance(event.get("reason"), str)
++            and event["reason"]
++        }
++    )
++    lower_log = container_log.lower()
++    correlated_expiry = (
++        "BackOff" in warning_reasons
++        and "x509" in lower_log
++        and "certificate has expired" in lower_log
++    )
++    if correlated_expiry:
++        code = "UPSTREAM_TLS_CERTIFICATE_EXPIRED"
++        summary = (
++            "A Warning BackOff Event coincides with an x509 certificate-expiry "
++            "message in the selected container log."
++        )
++    else:
++        code = "UNRESOLVED_REVIEW_EVENTS_AND_LOGS"
++        summary = (
++            "The collected Events and container log do not jointly establish "
++            "the configured TLS-certificate failure signature."
++        )
++    return {
++        "namespace": namespace,
++        "namespace_info": namespace_info,
++        "supervisor_summary": supervisor_summary,
++        "pod": selected_pod,
++        "events": events,
++        "container_log": container_log,
++        "diagnosis": {
++            "code": code,
++            "summary": summary,
++            "evidence": {
++                "container": selected_container,
++                "warning_reasons": warning_reasons,
++            },
++        },
++    }
++
++
++def _container_statuses(pod: dict[str, Any]) -> list[dict[str, Any]]:
++    status = pod.get("status")
++    if not isinstance(status, dict):
++        raise DiagnosticError("pod has invalid or missing status")
++    statuses = status.get("containerStatuses")
++    if not isinstance(statuses, list) or not all(
++        isinstance(item, dict) for item in statuses
++    ):
++        raise DiagnosticError(
++            "pod has invalid or missing containerStatuses"
++        )
++    return statuses
+--- a/vks_diag/__main__.py
++++ b/vks_diag/__main__.py
+@@ -2,9 +2,57 @@
+ 
+ from __future__ import annotations
+ 
++import argparse
++import json
++import sys
+ 
+-def main() -> int:
+-    raise NotImplementedError("implement the vks_diag CLI")
++from .client import DiagnosticError, KubernetesClient, VCenterClient
++from .diagnosis import diagnose_workload
++
++
++def _parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(
++        prog="python -m vks_diag",
++        description="Collect VCF namespace and VKS workload failure evidence.",
++    )
++    parser.add_argument("--vcenter-url", required=True)
++    parser.add_argument("--session-id", required=True)
++    parser.add_argument("--kube-url", required=True)
++    parser.add_argument("--kube-token", required=True)
++    parser.add_argument("--namespace", required=True)
++    parser.add_argument("--selector", required=True)
++    parser.add_argument("--container")
++    parser.add_argument("--tail-lines", type=int, default=200)
++    parser.add_argument("--timeout", type=float, default=10.0)
++    return parser
++
++
++def main(argv: list[str] | None = None) -> int:
++    arguments = _parser().parse_args(argv)
++    try:
++        vcenter = VCenterClient(
++            arguments.vcenter_url,
++            arguments.session_id,
++            timeout=arguments.timeout,
++        )
++        kubernetes = KubernetesClient(
++            arguments.kube_url,
++            arguments.kube_token,
++            timeout=arguments.timeout,
++        )
++        report = diagnose_workload(
++            vcenter,
++            kubernetes,
++            arguments.namespace,
++            arguments.selector,
++            container=arguments.container,
++            tail_lines=arguments.tail_lines,
++        )
++    except (DiagnosticError, ValueError) as exc:
++        print(f"vks-diag: {exc}", file=sys.stderr)
++        return 1
++    print(json.dumps(report, sort_keys=True, separators=(",", ":")))
++    return 0
+ 
+ 
+ if __name__ == "__main__":

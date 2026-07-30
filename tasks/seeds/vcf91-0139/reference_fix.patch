@@ -1,0 +1,486 @@
+diff --git a/vcf_vks_sync/client.py b/vcf_vks_sync/client.py
+new file mode 100644
+index 0000000..d08e914
+--- /dev/null
++++ b/vcf_vks_sync/client.py
+@@ -0,0 +1,480 @@
++"""Standard-library vSphere Supervisor and VKS Cluster REST client."""
++
++from __future__ import annotations
++
++import http.client
++import json
++import math
++import urllib.parse
++from collections.abc import Iterable
++from dataclasses import dataclass
++from typing import Any
++
++
++_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:token-exchange"
++_API_VERSION = "cluster.x-k8s.io/v1beta2"
++
++
++class VcfVksError(RuntimeError):
++    """Raised when a vCenter or Kubernetes contract operation fails."""
++
++
++@dataclass(frozen=True)
++class _Origin:
++    scheme: str
++    host: str
++    port: int | None
++
++
++def _required_string(value: object, name: str) -> str:
++    if not isinstance(value, str) or not value.strip():
++        raise ValueError(f"{name} must be a nonblank string")
++    try:
++        value.encode("utf-8")
++    except UnicodeEncodeError:
++        raise ValueError(f"{name} must contain valid UTF-8") from None
++    return value
++
++
++def _header_value(value: object, name: str) -> str:
++    result = _required_string(value, name)
++    if "\r" in result or "\n" in result:
++        raise ValueError(f"{name} contains a header-unsafe character")
++    return result
++
++
++def _parse_origin(value: object, name: str) -> _Origin:
++    text = _required_string(value, name)
++    if any(ord(character) <= 0x20 for character in text):
++        raise ValueError(f"{name} must be an absolute HTTP(S) origin")
++    try:
++        parsed = urllib.parse.urlsplit(text)
++        port = parsed.port
++    except ValueError as exc:
++        raise ValueError(f"{name} is not a valid HTTP(S) origin") from exc
++    if (
++        parsed.scheme not in ("http", "https")
++        or not parsed.netloc
++        or not parsed.hostname
++        or parsed.username is not None
++        or parsed.password is not None
++        or parsed.path not in ("", "/")
++        or "?" in text
++        or "#" in text
++        or parsed.query
++        or parsed.fragment
++    ):
++        raise ValueError(f"{name} must be an absolute HTTP(S) origin")
++    return _Origin(parsed.scheme, parsed.hostname, port)
++
++
++def _parse_master_host(value: object, scheme: str) -> _Origin:
++    try:
++        authority = _required_string(value, "master_host")
++    except ValueError:
++        raise VcfVksError(
++            "namespace discovery returned an invalid master_host"
++        ) from None
++    if any(
++        character in authority
++        for character in "/?#@"
++    ) or any(ord(character) <= 0x20 for character in authority):
++        raise VcfVksError("namespace discovery returned an invalid master_host")
++    try:
++        parsed = urllib.parse.urlsplit(f"{scheme}://{authority}")
++        port = parsed.port
++    except ValueError as exc:
++        raise VcfVksError(
++            "namespace discovery returned an invalid master_host"
++        ) from exc
++    if (
++        not parsed.hostname
++        or parsed.username is not None
++        or parsed.password is not None
++        or parsed.path
++        or parsed.query
++        or parsed.fragment
++    ):
++        raise VcfVksError("namespace discovery returned an invalid master_host")
++    return _Origin(scheme, parsed.hostname, port)
++
++
++def _send(
++    origin: _Origin,
++    method: str,
++    target: str,
++    headers: dict[str, str],
++    body: bytes | None,
++    timeout: float,
++    operation: str,
++) -> tuple[int, bytes]:
++    connection_type = (
++        http.client.HTTPSConnection
++        if origin.scheme == "https"
++        else http.client.HTTPConnection
++    )
++    connection = connection_type(origin.host, origin.port, timeout=timeout)
++    try:
++        connection.request(
++            method,
++            target,
++            body=body,
++            headers=headers,
++        )
++        response = connection.getresponse()
++        response_body = response.read()
++        return response.status, response_body
++    except Exception:
++        raise VcfVksError(f"{operation} request failed") from None
++    finally:
++        connection.close()
++
++
++def _json_value(body: bytes, operation: str) -> Any:
++    try:
++        return json.loads(body.decode("utf-8"))
++    except (UnicodeDecodeError, json.JSONDecodeError):
++        raise VcfVksError(f"{operation} returned malformed JSON") from None
++
++
++def _expect_json(
++    status: int,
++    body: bytes,
++    expected_status: int,
++    operation: str,
++) -> Any:
++    if status != expected_status:
++        raise VcfVksError(f"{operation} failed with HTTP {status}")
++    return _json_value(body, operation)
++
++
++class _TokenManager:
++    def __init__(
++        self,
++        origin: _Origin,
++        subject_token: str,
++        subject_token_type: str,
++        timeout: float,
++    ) -> None:
++        self._origin = origin
++        self._subject_token = subject_token
++        self._subject_token_type = subject_token_type
++        self._timeout = timeout
++        self.access_token = self._exchange()
++        self.refresh_count = 0
++
++    def _exchange(self) -> str:
++        body = urllib.parse.urlencode(
++            [
++                ("grant_type", _GRANT_TYPE),
++                ("subject_token", self._subject_token),
++                ("subject_token_type", self._subject_token_type),
++            ]
++        ).encode("ascii")
++        status, response_body = _send(
++            self._origin,
++            "POST",
++            "/api/vcenter/authentication/token",
++            {
++                "Accept": "application/json",
++                "Authorization": f"Bearer {self._subject_token}",
++                "Content-Type": "application/x-www-form-urlencoded",
++            },
++            body,
++            self._timeout,
++            "Vcenter.Authentication.Token_issue",
++        )
++        value = _expect_json(
++            status,
++            response_body,
++            200,
++            "Vcenter.Authentication.Token_issue",
++        )
++        if not isinstance(value, dict):
++            raise VcfVksError(
++                "Vcenter.Authentication.Token_issue returned an invalid token"
++            )
++        token = value.get("access_token")
++        token_type = value.get("token_type")
++        try:
++            access_token = _header_value(token, "access_token")
++        except ValueError:
++            raise VcfVksError(
++                "Vcenter.Authentication.Token_issue returned an invalid token"
++            ) from None
++        if not isinstance(token_type, str) or token_type.casefold() != "bearer":
++            raise VcfVksError(
++                "Vcenter.Authentication.Token_issue returned an invalid token"
++            )
++        return access_token
++
++    def refresh(self) -> None:
++        if self.refresh_count != 0:
++            raise VcfVksError("access token refresh limit exceeded")
++        replacement = self._exchange()
++        self.access_token = replacement
++        self.refresh_count = 1
++
++
++def _get_with_refresh(
++    origin: _Origin,
++    target: str,
++    manager: _TokenManager,
++    timeout: float,
++    operation: str,
++    authentication: str,
++) -> Any:
++    def send_once() -> tuple[int, bytes]:
++        if authentication == "vcenter":
++            headers = {
++                "Accept": "application/json",
++                "vmware-api-session-id": manager.access_token,
++            }
++        else:
++            headers = {
++                "Accept": "application/json",
++                "Authorization": f"Bearer {manager.access_token}",
++            }
++        return _send(
++            origin,
++            "GET",
++            target,
++            headers,
++            None,
++            timeout,
++            operation,
++        )
++
++    status, body = send_once()
++    if status == 401 and manager.refresh_count == 0:
++        manager.refresh()
++        status, body = send_once()
++    return _expect_json(status, body, 200, operation)
++
++
++def _discover_master_host(
++    origin: _Origin,
++    manager: _TokenManager,
++    namespace: str,
++    kubernetes_scheme: str,
++    timeout: float,
++) -> _Origin:
++    value = _get_with_refresh(
++        origin,
++        "/api/vcenter/namespaces-user/namespaces",
++        manager,
++        timeout,
++        "Vcenter.Namespaces.User.Instances_list",
++        "vcenter",
++    )
++    if not isinstance(value, list):
++        raise VcfVksError(
++            "Vcenter.Namespaces.User.Instances_list returned an invalid summary"
++        )
++    seen: set[str] = set()
++    matches: list[str] = []
++    for item in value:
++        if not isinstance(item, dict):
++            raise VcfVksError(
++                "Vcenter.Namespaces.User.Instances_list returned an invalid summary"
++            )
++        try:
++            item_namespace = _required_string(
++                item.get("namespace"), "summary namespace"
++            )
++            master_host = _required_string(
++                item.get("master_host"), "summary master_host"
++            )
++        except ValueError:
++            raise VcfVksError(
++                "Vcenter.Namespaces.User.Instances_list returned an invalid summary"
++            ) from None
++        if item_namespace in seen:
++            raise VcfVksError(
++                "Vcenter.Namespaces.User.Instances_list returned duplicate summaries"
++            )
++        seen.add(item_namespace)
++        if item_namespace == namespace:
++            matches.append(master_host)
++    if len(matches) != 1:
++        raise VcfVksError(
++            "Vcenter.Namespaces.User.Instances_list did not return one exact match"
++        )
++    return _parse_master_host(matches[0], kubernetes_scheme)
++
++
++def _cluster_target(namespace: str, cluster: str) -> str:
++    return (
++        "/apis/cluster.x-k8s.io/v1beta2/namespaces/"
++        + urllib.parse.quote(namespace, safe="")
++        + "/clusters/"
++        + urllib.parse.quote(cluster, safe="")
++    )
++
++
++def _validate_cluster(
++    value: Any,
++    namespace: str,
++    cluster: str,
++    operation: str,
++    require_resource_version: bool,
++) -> str | None:
++    if (
++        not isinstance(value, dict)
++        or value.get("apiVersion") != _API_VERSION
++        or value.get("kind") != "Cluster"
++        or not isinstance(value.get("metadata"), dict)
++    ):
++        raise VcfVksError(f"{operation} returned an invalid Cluster")
++    metadata = value["metadata"]
++    if (
++        metadata.get("name") != cluster
++        or metadata.get("namespace") != namespace
++    ):
++        raise VcfVksError(f"{operation} returned an inconsistent Cluster")
++    resource_version = metadata.get("resourceVersion")
++    if require_resource_version:
++        if (
++            not isinstance(resource_version, str)
++            or not resource_version.strip()
++        ):
++            raise VcfVksError(
++                f"{operation} returned an invalid resourceVersion"
++            )
++        return resource_version
++    return None
++
++
++def reconcile_cluster_annotations(
++    vcenter_url: str,
++    subject_token: str,
++    subject_token_type: str,
++    namespace: str,
++    cluster_names: Iterable[str],
++    managed_by: str,
++    *,
++    change_ticket: str | None = None,
++    kubernetes_scheme: str = "https",
++    timeout: float = 10.0,
++) -> dict[str, object]:
++    """Reconcile focused annotations across named VKS Cluster resources."""
++
++    vcenter_origin = _parse_origin(vcenter_url, "vcenter_url")
++    subject = _header_value(subject_token, "subject_token")
++    subject_type = _header_value(subject_token_type, "subject_token_type")
++    namespace_value = _required_string(namespace, "namespace")
++    managed_by_value = _required_string(managed_by, "managed_by")
++    if change_ticket is not None:
++        change_ticket_value = _required_string(change_ticket, "change_ticket")
++    else:
++        change_ticket_value = None
++    if kubernetes_scheme not in ("http", "https"):
++        raise ValueError("kubernetes_scheme must be http or https")
++    if (
++        isinstance(timeout, bool)
++        or not isinstance(timeout, (int, float))
++        or not math.isfinite(float(timeout))
++        or float(timeout) <= 0
++    ):
++        raise ValueError("timeout must be finite and positive")
++    timeout_value = float(timeout)
++    if isinstance(cluster_names, (str, bytes)):
++        raise TypeError("cluster_names must be an iterable of strings")
++    try:
++        clusters = list(cluster_names)
++    except TypeError:
++        raise TypeError("cluster_names must be an iterable of strings") from None
++    if not clusters:
++        raise ValueError("cluster_names must not be empty")
++    normalized_clusters: list[str] = []
++    seen_clusters: set[str] = set()
++    for cluster in clusters:
++        cluster_value = _required_string(cluster, "cluster name")
++        if cluster_value in seen_clusters:
++            raise ValueError("cluster_names must be unique")
++        seen_clusters.add(cluster_value)
++        normalized_clusters.append(cluster_value)
++
++    manager = _TokenManager(
++        vcenter_origin,
++        subject,
++        subject_type,
++        timeout_value,
++    )
++    kubernetes_origin = _discover_master_host(
++        vcenter_origin,
++        manager,
++        namespace_value,
++        kubernetes_scheme,
++        timeout_value,
++    )
++
++    updated: list[dict[str, str]] = []
++    for cluster in normalized_clusters:
++        target = _cluster_target(namespace_value, cluster)
++        current = _get_with_refresh(
++            kubernetes_origin,
++            target,
++            manager,
++            timeout_value,
++            "kubernetes.cluster.get",
++            "kubernetes",
++        )
++        _validate_cluster(
++            current,
++            namespace_value,
++            cluster,
++            "kubernetes.cluster.get",
++            False,
++        )
++
++        annotations = {
++            "platform.vcf.vmware.com/managed-by": managed_by_value
++        }
++        if change_ticket_value is not None:
++            annotations[
++                "platform.vcf.vmware.com/change-ticket"
++            ] = change_ticket_value
++        patch_body = json.dumps(
++            {"metadata": {"annotations": annotations}},
++            separators=(",", ":"),
++            ensure_ascii=False,
++        ).encode("utf-8")
++        status, response_body = _send(
++            kubernetes_origin,
++            "PATCH",
++            target,
++            {
++                "Accept": "application/json",
++                "Authorization": f"Bearer {manager.access_token}",
++                "Content-Type": "application/merge-patch+json",
++            },
++            patch_body,
++            timeout_value,
++            "kubernetes.cluster.patch",
++        )
++        patched = _expect_json(
++            status,
++            response_body,
++            200,
++            "kubernetes.cluster.patch",
++        )
++        resource_version = _validate_cluster(
++            patched,
++            namespace_value,
++            cluster,
++            "kubernetes.cluster.patch",
++            True,
++        )
++        updated.append(
++            {
++                "name": cluster,
++                "resource_version": resource_version,
++            }
++        )
++
++    return {
++        "namespace": namespace_value,
++        "updated": updated,
++        "access_token_refreshes": manager.refresh_count,
++    }
