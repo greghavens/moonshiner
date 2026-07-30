@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3142 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3143 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 38 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 69 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 70 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -3659,6 +3659,7 @@
 - **vcf91-0050** (`powershell`) `#vcf-9-1` `#nsx-policy` `#powershell` `#rest-contract` `#spec-derived` — Our VCF 9.1 application rollout creates an NSX group and then a distributed-firewall security policy. The current automation loses its place when its access token expires between those two writes:…
 - **vcf91-0051** (`powershell`) `#vcf-9-1` `#nsx-policy` `#powershell` `#rest-contract` `#spec-derived` — Platform engineering needs a deterministic NSX Policy group inventory for a Git-tracked VCF report. Finish the `VcfNsxGroupInventory` PowerShell module so it retrieves the complete cursor-paginated…
 - **vcf91-0052** (`powershell`) `#vcf-9-1` `#nsx-policy` `#powershell` `#rest-contract` `#spec-derived` — A network-allocation bootstrap job creates or updates a named NSX IP address block, but the caller sometimes loses the HTTP response after NSX has already applied the change. Finish the `VcfNsxIpBl…
+- **vcf91-0053** (`powershell`) `#vcf-9-1` `#nsx-policy` `#powershell` `#rest-contract` `#spec-derived` — Platform engineering applies a two-step NSX Policy firewall change from PowerShell. The source group PATCH can commit before the later security-policy PATCH fails, so the workflow must preserve and…
 - **vcf91-0054** (`powershell`) `#vcf-9-1` `#nsx-policy` `#powershell` `#rest-contract` `#spec-derived` — Platform engineering needs a guarded NSX Policy group rename for VMware Cloud Foundation 9.1. Finish the `VcfNsxGroupGuard` PowerShell module so the current group is read and checked before the upd…
 - **vcf91-0055** (`powershell`) `#vcf-9-1` `#nsx-policy` `#powershell` `#rest-contract` `#spec-derived` — Platform engineering rotates the Basic credential used by an NSX Policy client while inventory requests may still be in flight. Finish the `VcfNsxCredentialGate` PowerShell module so a cutover queu…
 - **vcf91-0056** (`powershell`) `#vcf-9-1` `#nsx-policy` `#powershell` `#rest-contract` `#spec-derived` — Platform engineering has an NSX Policy intent whose consolidated realization status is only the generic `ERROR`. Finish the `VcfNsxFailureEvidence` PowerShell module so the incident report is based…
