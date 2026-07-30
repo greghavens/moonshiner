@@ -1,0 +1,376 @@
+--- a/vcf_session_rotation/client.py
++++ b/vcf_session_rotation/client.py
+@@ -1,20 +1,171 @@
+ """Stdlib-only client for the focused vCenter session-rotation contract."""
+ 
++import base64
++from dataclasses import dataclass
++from http.client import HTTPException
++import json
++import math
++from numbers import Real
++import threading
+ from typing import Any, Sequence
++from urllib.error import HTTPError, URLError
++from urllib.parse import quote, urlsplit
++from urllib.request import (
++    HTTPRedirectHandler,
++    ProxyHandler,
++    Request,
++    build_opener,
++)
+ 
+ 
+ CREATE_SESSION_OPERATION = "Cis.Session_create"
+ LIST_VMS_OPERATION = "Vcenter.VM_list"
+ DELETE_SESSION_OPERATION = "Cis.Session_delete"
++_FILTER_NAMES = (
++    "vms",
++    "names",
++    "folders",
++    "datacenters",
++    "hosts",
++    "clusters",
++    "resource_pools",
++    "power_states",
++)
++_POWER_STATES = {"POWERED_OFF", "POWERED_ON", "SUSPENDED"}
+ 
+ 
+ class VcenterError(RuntimeError):
+     """An HTTP or transport failure."""
+ 
++    def __init__(
++        self,
++        operation_id: str,
++        status_code: int | None,
++        payload: Any,
++    ) -> None:
++        self.operation_id = operation_id
++        self.status_code = status_code
++        self.payload = payload
++        if status_code is None:
++            message = f"{operation_id} transport failed"
++        else:
++            message = f"{operation_id} returned HTTP {status_code}"
++        super().__init__(message)
++
+ 
+ class ProtocolError(RuntimeError):
+     """A malformed successful response."""
+ 
++    def __init__(self, operation_id: str, reason: str) -> None:
++        self.operation_id = operation_id
++        super().__init__(f"{operation_id} returned malformed data: {reason}")
++
++
++class _NoRedirect(HTTPRedirectHandler):
++    def redirect_request(
++        self,
++        req: Request,
++        fp: Any,
++        code: int,
++        msg: str,
++        headers: Any,
++        newurl: str,
++    ) -> None:
++        return None
++
++
++@dataclass
++class _Generation:
++    token: str
++    in_flight: int = 0
++
++
++def _origin(value: str) -> str:
++    if (
++        not isinstance(value, str)
++        or any(character.isspace() or ord(character) < 32 for character in value)
++    ):
++        raise ValueError("base_url must be an HTTP(S) origin")
++    try:
++        parsed = urlsplit(value)
++        parsed_port = parsed.port
++    except ValueError as exc:
++        raise ValueError("base_url must be an HTTP(S) origin") from exc
++    if (
++        parsed.scheme not in {"http", "https"}
++        or not parsed.netloc
++        or parsed.hostname is None
++        or parsed.username is not None
++        or parsed.password is not None
++        or parsed.path not in {"", "/"}
++        or parsed.query
++        or parsed.fragment
++    ):
++        raise ValueError("base_url must be an HTTP(S) origin")
++    if parsed_port is not None and not 0 < parsed_port < 65536:
++        raise ValueError("base_url must be an HTTP(S) origin")
++    return f"{parsed.scheme}://{parsed.netloc}"
++
++
++def _credential(value: str, name: str, *, username: bool = False) -> str:
++    if (
++        not isinstance(value, str)
++        or not value.strip()
++        or any(ord(character) < 32 or ord(character) == 127 for character in value)
++        or (username and ":" in value)
++    ):
++        raise ValueError(f"{name} is not a valid Basic credential")
++    return value
++
++
++def _positive_timeout(value: float) -> float:
++    if isinstance(value, bool) or not isinstance(value, Real):
++        raise ValueError("timeout must be a positive finite number")
++    converted = float(value)
++    if not math.isfinite(converted) or converted <= 0:
++        raise ValueError("timeout must be a positive finite number")
++    return converted
++
++
++def _error_payload(raw: bytes) -> Any:
++    if not raw:
++        return None
++    try:
++        return json.loads(raw.decode("utf-8"))
++    except (UnicodeDecodeError, json.JSONDecodeError):
++        return None
++
++
++def _success_json(raw: bytes, operation_id: str) -> Any:
++    try:
++        return json.loads(raw.decode("utf-8"))
++    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++        raise ProtocolError(operation_id, "response is not UTF-8 JSON") from exc
++
++
++def _filter_values(
++    value: Sequence[str] | None,
++    name: str,
++) -> tuple[str, ...] | None:
++    if value is None:
++        return None
++    if (
++        isinstance(value, (str, bytes, bytearray))
++        or not isinstance(value, Sequence)
++        or not value
++    ):
++        raise ValueError(f"{name} must be a nonempty sequence")
++    result = tuple(value)
++    if any(not isinstance(item, str) or not item.strip() for item in result):
++        raise ValueError(f"{name} must contain nonblank strings")
++    if len(set(result)) != len(result):
++        raise ValueError(f"{name} must contain unique values")
++    if name == "power_states" and any(
++        item not in _POWER_STATES for item in result
++    ):
++        raise ValueError("power_states contains an unsupported value")
++    return result
++
+ 
+ class RotatingVcenterClient:
+     """Use generation-pinned sessions and drain old work during rotation."""
+@@ -27,7 +178,94 @@
+         *,
+         timeout: float = 10.0,
+     ) -> None:
+-        raise NotImplementedError("Implement the contract-backed client.")
++        self._base_url = _origin(base_url)
++        self._username = _credential(username, "username", username=True)
++        initial_password = _credential(password, "password")
++        self._timeout = _positive_timeout(timeout)
++        self._opener = build_opener(ProxyHandler({}), _NoRedirect())
++        self._condition = threading.Condition()
++        self._rotation_lock = threading.Lock()
++        self._closed = False
++        token = self._create_session(initial_password)
++        self._generation = _Generation(token)
++
++    def _request(
++        self,
++        operation_id: str,
++        method: str,
++        target: str,
++        headers: dict[str, str],
++        expected_status: int,
++    ) -> bytes:
++        request = Request(
++            self._base_url + target,
++            headers=headers,
++            method=method,
++        )
++        try:
++            with self._opener.open(request, timeout=self._timeout) as response:
++                status = response.getcode()
++                raw = response.read()
++        except HTTPError as error:
++            try:
++                raw = error.read()
++            except Exception:
++                raw = b""
++            raise VcenterError(
++                operation_id,
++                int(error.code),
++                _error_payload(raw),
++            ) from None
++        except (URLError, OSError, HTTPException):
++            raise VcenterError(operation_id, None, None) from None
++        if status != expected_status:
++            raise VcenterError(operation_id, int(status), _error_payload(raw))
++        return raw
++
++    def _create_session(self, password: str) -> str:
++        raw_credential = f"{self._username}:{password}".encode("utf-8")
++        authorization = (
++            "Basic " + base64.b64encode(raw_credential).decode("ascii")
++        )
++        raw = self._request(
++            CREATE_SESSION_OPERATION,
++            "POST",
++            "/api/session",
++            {
++                "Accept": "application/json",
++                "Authorization": authorization,
++            },
++            201,
++        )
++        value = _success_json(raw, CREATE_SESSION_OPERATION)
++        if not isinstance(value, str) or not value.strip():
++            raise ProtocolError(
++                CREATE_SESSION_OPERATION,
++                "session token is not a nonblank string",
++            )
++        if any(ord(character) < 32 or ord(character) == 127 for character in value):
++            raise ProtocolError(
++                CREATE_SESSION_OPERATION,
++                "session token is not header-safe",
++            )
++        return value
++
++    def _delete_session(self, token: str) -> None:
++        raw = self._request(
++            DELETE_SESSION_OPERATION,
++            "DELETE",
++            "/api/session",
++            {
++                "Accept": "application/json",
++                "vmware-api-session-id": token,
++            },
++            204,
++        )
++        if raw:
++            raise ProtocolError(
++                DELETE_SESSION_OPERATION,
++                "HTTP 204 response was not empty",
++            )
+ 
+     def list_vms(
+         self,
+@@ -41,13 +279,102 @@
+         resource_pools: Sequence[str] | None = None,
+         power_states: Sequence[str] | None = None,
+     ) -> list[dict[str, Any]]:
+-        raise NotImplementedError("List VMs through the captured session.")
++        provided = {
++            "vms": vms,
++            "names": names,
++            "folders": folders,
++            "datacenters": datacenters,
++            "hosts": hosts,
++            "clusters": clusters,
++            "resource_pools": resource_pools,
++            "power_states": power_states,
++        }
++        filters = {
++            name: _filter_values(provided[name], name)
++            for name in _FILTER_NAMES
++        }
++        pairs: list[str] = []
++        for name in _FILTER_NAMES:
++            values = filters[name]
++            if values is not None:
++                for value in values:
++                    pairs.append(
++                        f"{quote(name, safe='-._~')}="
++                        f"{quote(value, safe='-._~')}"
++                    )
++        target = "/api/vcenter/vm"
++        if pairs:
++            target += "?" + "&".join(pairs)
++
++        with self._condition:
++            if self._closed:
++                raise RuntimeError("vCenter client is closed")
++            generation = self._generation
++            generation.in_flight += 1
++        try:
++            raw = self._request(
++                LIST_VMS_OPERATION,
++                "GET",
++                target,
++                {
++                    "Accept": "application/json",
++                    "vmware-api-session-id": generation.token,
++                },
++                200,
++            )
++            value = _success_json(raw, LIST_VMS_OPERATION)
++            if not isinstance(value, list):
++                raise ProtocolError(
++                    LIST_VMS_OPERATION,
++                    "response is not an array",
++                )
++            result: list[dict[str, Any]] = []
++            for item in value:
++                if (
++                    not isinstance(item, dict)
++                    or any(
++                        not isinstance(item.get(field), str)
++                        or not item[field].strip()
++                        for field in ("vm", "name", "power_state")
++                    )
++                    or item["power_state"] not in _POWER_STATES
++                ):
++                    raise ProtocolError(
++                        LIST_VMS_OPERATION,
++                        "response contains an invalid VM summary",
++                    )
++                result.append(dict(item))
++            return result
++        finally:
++            with self._condition:
++                generation.in_flight -= 1
++                self._condition.notify_all()
+ 
+     def rotate_password(self, new_password: str) -> None:
+-        raise NotImplementedError("Publish, drain, and retire a session generation.")
++        replacement_password = _credential(new_password, "new_password")
++        with self._rotation_lock:
++            with self._condition:
++                if self._closed:
++                    raise RuntimeError("vCenter client is closed")
++            replacement_token = self._create_session(replacement_password)
++            replacement = _Generation(replacement_token)
++            with self._condition:
++                old = self._generation
++                self._generation = replacement
++                while old.in_flight:
++                    self._condition.wait()
++            self._delete_session(old.token)
+ 
+     def close(self) -> None:
+-        raise NotImplementedError("Drain and close the active session.")
++        with self._rotation_lock:
++            with self._condition:
++                if self._closed:
++                    return
++                self._closed = True
++                generation = self._generation
++                while generation.in_flight:
++                    self._condition.wait()
++            self._delete_session(generation.token)
+ 
+     def __enter__(self) -> "RotatingVcenterClient":
+         return self
