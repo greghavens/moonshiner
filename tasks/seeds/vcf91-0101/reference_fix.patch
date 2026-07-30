@@ -1,0 +1,266 @@
+diff --git a/vcf_vcenter_roles/client.py b/vcf_vcenter_roles/client.py
+--- a/vcf_vcenter_roles/client.py
++++ b/vcf_vcenter_roles/client.py
+@@ -2,10 +2,34 @@
+ 
+ from __future__ import annotations
+ 
++import json
++import math
+ from typing import Any
++from urllib.error import HTTPError, URLError
++from urllib.parse import quote, urlsplit
++from urllib.request import (
++    HTTPRedirectHandler,
++    ProxyHandler,
++    Request,
++    build_opener,
++)
+ 
+ 
+ OPERATION_ID = "Vcenter.Authorization.Roles_list"
++_INT64_MAX = 2**63 - 1
++
++
++class _NoRedirects(HTTPRedirectHandler):
++    def redirect_request(
++        self,
++        req: Any,
++        fp: Any,
++        code: int,
++        msg: str,
++        headers: Any,
++        newurl: str,
++    ) -> None:
++        return None
+ 
+ 
+ class VcenterError(RuntimeError):
+@@ -46,7 +70,44 @@
+         *,
+         timeout: float = 10.0,
+     ) -> None:
+-        raise NotImplementedError
++        if not isinstance(base_url, str) or not base_url:
++            raise ValueError("base_url must be an HTTP(S) origin")
++        try:
++            parsed = urlsplit(base_url)
++            parsed_port = parsed.port
++        except ValueError as exc:
++            raise ValueError("base_url must be an HTTP(S) origin") from exc
++        if (
++            parsed.scheme not in {"http", "https"}
++            or parsed.hostname is None
++            or parsed.username is not None
++            or parsed.password is not None
++            or parsed.path not in {"", "/"}
++            or parsed.query
++            or parsed.fragment
++        ):
++            raise ValueError("base_url must be an HTTP(S) origin")
++        if parsed_port is not None and not 1 <= parsed_port <= 65535:
++            raise ValueError("base_url port is invalid")
++        if (
++            not isinstance(session_token, str)
++            or not session_token.strip()
++            or "\r" in session_token
++            or "\n" in session_token
++        ):
++            raise ValueError("session_token must be a non-blank string")
++        if (
++            isinstance(timeout, bool)
++            or not isinstance(timeout, (int, float))
++            or not math.isfinite(float(timeout))
++            or timeout <= 0
++        ):
++            raise ValueError("timeout must be a positive finite number")
++
++        self._base_url = f"{parsed.scheme}://{parsed.netloc}"
++        self._session_token = session_token
++        self._timeout = float(timeout)
++        self._opener = build_opener(ProxyHandler({}), _NoRedirects())
+ 
+     def list_roles(
+         self,
+@@ -55,4 +116,180 @@
+     ) -> list[dict[str, Any]]:
+         """Return every authorization role in deterministic order."""
+ 
+-        raise NotImplementedError
++        if (
++            isinstance(page_size, bool)
++            or not isinstance(page_size, int)
++            or not 1 <= page_size <= _INT64_MAX
++        ):
++            raise ValueError("page_size must be a positive int64 integer")
++
++        roles: list[dict[str, Any]] = []
++        seen_markers: set[str] = set()
++        marker: str | None = None
++
++        while True:
++            page = self._request_page(
++                page_size=page_size,
++                marker=marker,
++            )
++            if not isinstance(page, dict):
++                self._protocol_error(
++                    "success response must be a JSON object"
++                )
++            if "items" not in page or not isinstance(page["items"], list):
++                self._protocol_error("success response has invalid items")
++
++            page_items = page["items"]
++            for item in page_items:
++                self._validate_item(item)
++
++            has_marker = "marker" in page
++            next_marker = page.get("marker")
++            if has_marker:
++                if not isinstance(next_marker, str) or next_marker == "":
++                    self._protocol_error(
++                        "response marker must be a non-empty string"
++                    )
++                if not page_items:
++                    self._protocol_error(
++                        "an empty page cannot carry a continuation marker"
++                    )
++                if next_marker in seen_markers:
++                    self._protocol_error("response repeated a marker")
++
++            roles.extend(page_items)
++            if not has_marker:
++                break
++            seen_markers.add(next_marker)
++            marker = next_marker
++
++        return sorted(roles, key=self._role_sort_key)
++
++    def _request_page(
++        self,
++        *,
++        page_size: int,
++        marker: str | None,
++    ) -> Any:
++        query = "page_size=" + str(page_size)
++        if marker is not None:
++            query += "&marker=" + quote(marker, safe="")
++        request = Request(
++            self._base_url
++            + "/api/vcenter/authorization/roles?"
++            + query,
++            method="GET",
++            headers={
++                "Accept": "application/json",
++                "vmware-api-session-id": self._session_token,
++            },
++        )
++        try:
++            with self._opener.open(
++                request,
++                timeout=self._timeout,
++            ) as response:
++                status = response.getcode()
++                raw = response.read()
++        except HTTPError as exc:
++            try:
++                raw = exc.read()
++            except OSError:
++                raw = b""
++            finally:
++                exc.close()
++            raise VcenterError(
++                OPERATION_ID,
++                exc.code,
++                self._decode_error_payload(raw),
++            ) from None
++        except (URLError, OSError, ValueError):
++            raise VcenterError(OPERATION_ID, None, None) from None
++
++        if status != 200:
++            raise VcenterError(
++                OPERATION_ID,
++                status,
++                self._decode_error_payload(raw),
++            )
++        try:
++            text = raw.decode("utf-8")
++            return json.loads(
++                text,
++                parse_constant=self._reject_json_constant,
++            )
++        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
++            self._protocol_error(
++                "success response is not strict UTF-8 JSON"
++            )
++
++    @staticmethod
++    def _validate_item(item: Any) -> None:
++        if not isinstance(item, dict):
++            VcenterRoleClient._protocol_error(
++                "role items must be JSON objects"
++            )
++        role = item.get("role")
++        info = item.get("info")
++        if not isinstance(role, str) or not role.strip():
++            VcenterRoleClient._protocol_error(
++                "role item has an invalid role identifier"
++            )
++        if not isinstance(info, dict):
++            VcenterRoleClient._protocol_error(
++                "role item has invalid info"
++            )
++        name = info.get("name")
++        description = info.get("description")
++        privileges = info.get("privileges")
++        system = info.get("system")
++        if not isinstance(name, str) or not name.strip():
++            VcenterRoleClient._protocol_error(
++                "role info has an invalid name"
++            )
++        if not isinstance(description, str):
++            VcenterRoleClient._protocol_error(
++                "role info has an invalid description"
++            )
++        if (
++            not isinstance(privileges, list)
++            or any(not isinstance(value, str) for value in privileges)
++            or len(set(privileges)) != len(privileges)
++        ):
++            VcenterRoleClient._protocol_error(
++                "role info has invalid privileges"
++            )
++        if not isinstance(system, bool):
++            VcenterRoleClient._protocol_error(
++                "role info has an invalid system flag"
++            )
++
++    @staticmethod
++    def _role_sort_key(
++        item: dict[str, Any],
++    ) -> tuple[str, str, str]:
++        return (
++            item["info"]["name"],
++            item["role"],
++            json.dumps(
++                item,
++                ensure_ascii=False,
++                sort_keys=True,
++                separators=(",", ":"),
++            ),
++        )
++
++    @staticmethod
++    def _decode_error_payload(raw: bytes) -> Any:
++        try:
++            return json.loads(raw.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            return None
++
++    @staticmethod
++    def _reject_json_constant(value: str) -> None:
++        raise ValueError(f"invalid JSON constant: {value}")
++
++    @staticmethod
++    def _protocol_error(message: str) -> None:
++        raise ProtocolError(OPERATION_ID, message)

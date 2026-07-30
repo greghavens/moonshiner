@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3144 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3146 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 38 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 71 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 73 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -3700,6 +3700,8 @@
 - **vcf91-0094** (`powershell`) `#vcf-9-1` `#vcenter-automation` `#powershell` `#rest-contract` `#spec-derived` — VMware platform engineering needs a safe Enhanced vMotion Compatibility (EVC) rollout primitive for VCF 9.1. Implement the PowerShell module in VcfEvcSafety.psm1. It must expose Set-VcfClusterEvcMo…
 - **vcf91-0095** (`powershell`) `#vcf-9-1` `#vcenter-automation` `#powershell` `#rest-contract` `#spec-derived` — Platform engineering replaces vCenter API session credentials while inventory requests are still running. A cutover must not strand an admitted request on the retired secret, and work arriving duri…
 - **vcf91-0096** (`powershell`) `#vcf-9-1` `#vcenter-automation` `#powershell` `#rest-contract` `#spec-derived` — A vCenter alarm says that an ESXi host failed TPM attestation. The current automation guesses that the TPM is disabled without reading the evidence. Complete `VcfVcenterTpmEvidence/VcfVcenterTpmEvi…
+- **vcf91-0099** (`python`) `#vcf-9-1` `#vcenter-automation` `#python` `#rest-contract` `#spec-derived` — Implement `vcf_supervisor_backup/client.py` as a standard-library-only Python package for the vSphere Automation API exposed by vCenter in VMware Cloud Foundation 9.1. Read the protected `docs/cont…
+- **vcf91-0101** (`python`) `#vcf-9-1` `#vcenter-automation` `#python` `#rest-contract` `#spec-derived` — Implement `vcf_vcenter_roles/client.py` as a standard-library-only Python package for the vSphere Automation API exposed by vCenter in VMware Cloud Foundation 9.1. Read the protected `docs/contract…
 
 ## project-io
 

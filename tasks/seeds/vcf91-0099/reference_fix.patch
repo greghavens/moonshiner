@@ -1,0 +1,328 @@
+--- a/vcf_supervisor_backup/client.py
++++ b/vcf_supervisor_backup/client.py
+@@ -1,7 +1,19 @@
+ """Stdlib-only client for the focused vCenter Supervisor backup contract."""
+ 
+ from dataclasses import dataclass
++import json
++import math
++from numbers import Real
++import time
+ from typing import Any
++from urllib.error import HTTPError, URLError
++from urllib.parse import quote, urlsplit
++from urllib.request import (
++    HTTPRedirectHandler,
++    ProxyHandler,
++    Request,
++    build_opener,
++)
+ 
+ 
+ CREATE_BACKUP_OPERATION = (
+@@ -13,18 +25,49 @@
+ class VcenterError(RuntimeError):
+     """An HTTP or transport failure."""
+ 
++    def __init__(
++        self,
++        operation_id: str,
++        status_code: int | None,
++        payload: Any,
++    ) -> None:
++        self.operation_id = operation_id
++        self.status_code = status_code
++        self.payload = payload
++        if status_code is None:
++            message = f"{operation_id} transport failed"
++        else:
++            message = f"{operation_id} returned HTTP {status_code}"
++        super().__init__(message)
++
+ 
+ class ProtocolError(RuntimeError):
+     """A malformed successful response."""
+ 
++    def __init__(self, operation_id: str, reason: str) -> None:
++        self.operation_id = operation_id
++        super().__init__(f"{operation_id} returned malformed data: {reason}")
++
+ 
+ class TaskFailedError(RuntimeError):
+     """A task that reached FAILED."""
+ 
++    def __init__(self, task_id: str, task_info: dict[str, Any]) -> None:
++        self.task_id = task_id
++        self.task_info = task_info
++        super().__init__(f"vCenter task {task_id!r} failed")
++
+ 
+ class PollTimeoutError(RuntimeError):
+     """A task that did not terminate within the configured poll limit."""
+ 
++    def __init__(self, task_id: str, max_polls: int) -> None:
++        self.task_id = task_id
++        self.max_polls = max_polls
++        super().__init__(
++            f"vCenter task {task_id!r} did not finish after {max_polls} polls"
++        )
++
+ 
+ @dataclass(frozen=True)
+ class BackupResult:
+@@ -34,6 +77,109 @@
+     poll_count: int
+ 
+ 
++class _NoRedirect(HTTPRedirectHandler):
++    def redirect_request(
++        self,
++        req: Request,
++        fp: Any,
++        code: int,
++        msg: str,
++        headers: Any,
++        newurl: str,
++    ) -> None:
++        return None
++
++
++def _number(value: Any, *, name: str, positive: bool) -> float:
++    if isinstance(value, bool) or not isinstance(value, Real):
++        raise ValueError(f"{name} must be a finite number")
++    converted = float(value)
++    if not math.isfinite(converted):
++        raise ValueError(f"{name} must be finite")
++    if positive and converted <= 0:
++        raise ValueError(f"{name} must be positive")
++    if not positive and converted < 0:
++        raise ValueError(f"{name} must not be negative")
++    return converted
++
++
++def _origin(value: str) -> str:
++    if (
++        not isinstance(value, str)
++        or any(character.isspace() or ord(character) < 32 for character in value)
++    ):
++        raise ValueError("base_url must be an HTTP(S) origin")
++    try:
++        parsed = urlsplit(value)
++        parsed_port = parsed.port
++    except ValueError as exc:
++        raise ValueError("base_url must be an HTTP(S) origin") from exc
++    if (
++        parsed.scheme not in {"http", "https"}
++        or not parsed.netloc
++        or parsed.hostname is None
++        or parsed.username is not None
++        or parsed.password is not None
++        or parsed.path not in {"", "/"}
++        or parsed.query
++        or parsed.fragment
++    ):
++        raise ValueError("base_url must be an HTTP(S) origin")
++    if parsed_port is not None and not 0 < parsed_port < 65536:
++        raise ValueError("base_url must be an HTTP(S) origin")
++    return f"{parsed.scheme}://{parsed.netloc}"
++
++
++def _decode_json(raw: bytes, operation_id: str) -> Any:
++    try:
++        return json.loads(raw.decode("utf-8"))
++    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++        raise ProtocolError(operation_id, "response is not valid UTF-8 JSON") from exc
++
++
++def _error_payload(raw: bytes) -> Any:
++    if not raw:
++        return None
++    try:
++        return json.loads(raw.decode("utf-8"))
++    except (UnicodeDecodeError, json.JSONDecodeError):
++        return None
++
++
++def _validate_task_info(value: Any) -> dict[str, Any]:
++    if not isinstance(value, dict):
++        raise ProtocolError(GET_TASK_OPERATION, "task information is not an object")
++    required = {"description", "service", "operation", "status", "cancelable"}
++    if not required.issubset(value):
++        raise ProtocolError(GET_TASK_OPERATION, "task information is incomplete")
++
++    description = value["description"]
++    if not isinstance(description, dict):
++        raise ProtocolError(GET_TASK_OPERATION, "description is not an object")
++    if not {"id", "default_message", "args"}.issubset(description):
++        raise ProtocolError(GET_TASK_OPERATION, "description is incomplete")
++    if (
++        not isinstance(description["id"], str)
++        or not isinstance(description["default_message"], str)
++        or not isinstance(description["args"], list)
++        or any(not isinstance(item, str) for item in description["args"])
++    ):
++        raise ProtocolError(GET_TASK_OPERATION, "description has invalid members")
++
++    for name in ("service", "operation"):
++        if not isinstance(value[name], str) or not value[name].strip():
++            raise ProtocolError(GET_TASK_OPERATION, f"{name} is invalid")
++    if not isinstance(value["cancelable"], bool):
++        raise ProtocolError(GET_TASK_OPERATION, "cancelable is not boolean")
++    statuses = {"PENDING", "RUNNING", "BLOCKED", "SUCCEEDED", "FAILED"}
++    if (
++        not isinstance(value["status"], str)
++        or value["status"] not in statuses
++    ):
++        raise ProtocolError(GET_TASK_OPERATION, "status is unknown")
++    return value
++
++
+ class SupervisorBackupClient:
+     """Submit a Supervisor backup and poll its CIS task."""
+ 
+@@ -46,7 +192,26 @@
+         poll_interval: float = 0.0,
+         max_polls: int = 8,
+     ) -> None:
+-        raise NotImplementedError("Implement the contract-backed client.")
++        self._base_url = _origin(base_url)
++        if (
++            not isinstance(session_token, str)
++            or not session_token.strip()
++            or "\r" in session_token
++            or "\n" in session_token
++        ):
++            raise ValueError("session_token must be a nonblank safe header value")
++        if isinstance(max_polls, bool) or not isinstance(max_polls, int):
++            raise ValueError("max_polls must be a positive integer")
++        if max_polls <= 0:
++            raise ValueError("max_polls must be a positive integer")
++
++        self._session_token = session_token
++        self._timeout = _number(timeout, name="timeout", positive=True)
++        self._poll_interval = _number(
++            poll_interval, name="poll_interval", positive=False
++        )
++        self._max_polls = max_polls
++        self._opener = build_opener(ProxyHandler({}), _NoRedirect())
+ 
+     def create_backup(
+         self,
+@@ -55,4 +220,115 @@
+         comment: str | None = None,
+         ignore_health_check_failure: bool | None = None,
+     ) -> BackupResult:
+-        raise NotImplementedError("Submit and poll the Supervisor backup task.")
++        if not isinstance(supervisor, str) or not supervisor.strip():
++            raise ValueError("supervisor must be a nonblank string")
++        if comment is not None and not isinstance(comment, str):
++            raise ValueError("comment must be a string or None")
++        if (
++            ignore_health_check_failure is not None
++            and not isinstance(ignore_health_check_failure, bool)
++        ):
++            raise ValueError(
++                "ignore_health_check_failure must be a boolean or None"
++            )
++
++        body: dict[str, Any] = {}
++        if comment is not None:
++            body["comment"] = comment
++        if ignore_health_check_failure is not None:
++            body["ignore_health_check_failure"] = ignore_health_check_failure
++
++        supervisor_segment = quote(supervisor, safe="")
++        target = (
++            "/api/vcenter/namespace-management/supervisors/"
++            f"{supervisor_segment}/recovery/backup/jobs"
++        )
++        raw = self._request(
++            method="POST",
++            target=target,
++            operation_id=CREATE_BACKUP_OPERATION,
++            expected_status=200,
++            body=body,
++        )
++        task_id = _decode_json(raw, CREATE_BACKUP_OPERATION)
++        if not isinstance(task_id, str) or not task_id.strip():
++            raise ProtocolError(
++                CREATE_BACKUP_OPERATION,
++                "task identifier is not a nonblank string",
++            )
++
++        task_target = "/api/cis/tasks/" + quote(task_id, safe="")
++        for poll_count in range(1, self._max_polls + 1):
++            task_raw = self._request(
++                method="GET",
++                target=task_target,
++                operation_id=GET_TASK_OPERATION,
++                expected_status=200,
++                body=None,
++            )
++            task_info = _validate_task_info(
++                _decode_json(task_raw, GET_TASK_OPERATION)
++            )
++            status = task_info["status"]
++            if status == "SUCCEEDED":
++                return BackupResult(
++                    task_id=task_id,
++                    status=status,
++                    result=task_info.get("result"),
++                    poll_count=poll_count,
++                )
++            if status == "FAILED":
++                raise TaskFailedError(task_id, task_info)
++            if poll_count < self._max_polls and self._poll_interval:
++                time.sleep(self._poll_interval)
++
++        raise PollTimeoutError(task_id, self._max_polls)
++
++    def _request(
++        self,
++        *,
++        method: str,
++        target: str,
++        operation_id: str,
++        expected_status: int,
++        body: dict[str, Any] | None,
++    ) -> bytes:
++        data: bytes | None = None
++        headers = {
++            "Accept": "application/json",
++            "vmware-api-session-id": self._session_token,
++        }
++        if body is not None:
++            data = json.dumps(
++                body,
++                separators=(",", ":"),
++                ensure_ascii=False,
++            ).encode("utf-8")
++            headers["Content-Type"] = "application/json; charset=utf-8"
++        request = Request(
++            self._base_url + target,
++            data=data,
++            headers=headers,
++            method=method,
++        )
++        try:
++            response = self._opener.open(request, timeout=self._timeout)
++        except HTTPError as exc:
++            try:
++                raw_error = exc.read()
++            finally:
++                exc.close()
++            raise VcenterError(
++                operation_id,
++                int(exc.code),
++                _error_payload(raw_error),
++            ) from None
++        except (URLError, OSError, TimeoutError):
++            raise VcenterError(operation_id, None, None) from None
++
++        with response:
++            status = int(response.getcode())
++            raw = response.read()
++        if status != expected_status:
++            raise VcenterError(operation_id, status, _error_payload(raw))
++        return raw
+
