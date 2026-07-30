@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3143 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3144 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 38 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 70 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 71 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -3699,6 +3699,7 @@
 - **vcf91-0093** (`powershell`) `#vcf-9-1` `#vcenter-automation` `#powershell` `#rest-contract` `#spec-derived` — Platform engineering resizes a powered-off VM and then starts it. A power-on failure must not erase the evidence that the CPU and memory changes already succeeded. Complete `VcfVcenterResizeReport/…
 - **vcf91-0094** (`powershell`) `#vcf-9-1` `#vcenter-automation` `#powershell` `#rest-contract` `#spec-derived` — VMware platform engineering needs a safe Enhanced vMotion Compatibility (EVC) rollout primitive for VCF 9.1. Implement the PowerShell module in VcfEvcSafety.psm1. It must expose Set-VcfClusterEvcMo…
 - **vcf91-0095** (`powershell`) `#vcf-9-1` `#vcenter-automation` `#powershell` `#rest-contract` `#spec-derived` — Platform engineering replaces vCenter API session credentials while inventory requests are still running. A cutover must not strand an admitted request on the retired secret, and work arriving duri…
+- **vcf91-0096** (`powershell`) `#vcf-9-1` `#vcenter-automation` `#powershell` `#rest-contract` `#spec-derived` — A vCenter alarm says that an ESXi host failed TPM attestation. The current automation guesses that the TPM is disabled without reading the evidence. Complete `VcfVcenterTpmEvidence/VcfVcenterTpmEvi…
 
 ## project-io
 
