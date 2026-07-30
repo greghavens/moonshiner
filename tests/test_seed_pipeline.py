@@ -53,5 +53,29 @@ class TheJudgeCorrectsAndTheSeedMovesOn(unittest.TestCase):
         self.assertIn("final_report = validate_report(seed)", source,
                       "the report is still produced, it just does not veto")
 
+
+class ASeedIsNeverDiscarded(unittest.TestCase):
+    """Authoring is paid for. Judging is paid for. Discarding buys both again.
+
+    The pipeline returned 1 and left the candidate in a scratch directory
+    whenever the judge had not cleared it, so every unresolved seed was
+    re-authored from nothing on the next pass and charged twice.
+    """
+
+    def test_the_candidate_is_promoted_whatever_the_verdict(self):
+        source = (ROOT / "src" / "seed_pipeline.py").read_text()
+        body = source[source.index("if not accepted:"):]
+        body = body[:body.index("shutil.copytree(candidate, destination)")]
+        self.assertNotIn("return 1", body,
+                         "an unresolved seed must not abandon the paid work")
+
+    def test_the_promotion_is_unconditional(self):
+        source = (ROOT / "src" / "seed_pipeline.py").read_text()
+        promote = source.index("shutil.copytree(candidate, destination)")
+        guard_before = source[:promote].rstrip().splitlines()[-1]
+        self.assertNotIn("if ", guard_before,
+                         "promotion must not sit behind an acceptance test")
+
+
 if __name__ == "__main__":
     unittest.main()

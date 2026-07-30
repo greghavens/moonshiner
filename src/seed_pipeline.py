@@ -187,10 +187,15 @@ def main(argv: list[str] | None = None) -> int:
                            review=verdict, error=error)
             print(f"[{status}] {args.id}{': ' + error if error else ''}")
             if accepted: break
+        # A seed is never discarded. Authoring it was paid for, the judge was
+        # paid to correct it, and throwing the result away spends both again on
+        # the next pass. Every candidate is promoted; a judge that could not
+        # clear it says so in the record, and the seed is fixed in place rather
+        # than deleted and re-bought.
         if not accepted:
             set_run_status(db, run_id, "complete_with_rejections")
-            print(f"candidate retained at {candidate}")
-            return 1
+            print(f"[promoted unresolved] {args.id}: judge did not clear it; "
+                  "promoted anyway so the work is kept")
         shutil.copytree(candidate, destination)
         if legacy_path is not None:
             archive = STORAGE_ROOT / "tasks" / "replaced-synthetic-seeds"
