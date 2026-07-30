@@ -1,0 +1,379 @@
+--- a/vcf_inventory/client.py
++++ b/vcf_inventory/client.py
+@@ -1,2 +1,375 @@
+-"""Implement the contract-pinned vCenter inventory client here."""
++"""Standard-library client for the focused vCenter inventory contract."""
+ 
++from __future__ import annotations
++
++import base64
++import json
++import math
++import numbers
++import threading
++from collections.abc import Sequence
++from urllib import error, parse, request
++
++
++_POWER_STATES = {"POWERED_OFF", "POWERED_ON", "SUSPENDED"}
++_DATACENTER_FILTERS = ("datacenters", "names", "folders")
++_VM_FILTERS = (
++    "vms",
++    "names",
++    "folders",
++    "datacenters",
++    "hosts",
++    "clusters",
++    "resource_pools",
++    "power_states",
++)
++
++
++class VcenterError(RuntimeError):
++    """An HTTP or transport failure from a focused vCenter operation."""
++
++    def __init__(
++        self,
++        operation_id: str,
++        status_code: int | None,
++        payload: object,
++    ) -> None:
++        self.operation_id = operation_id
++        self.status_code = status_code
++        self.payload = payload
++        detail = (
++            "transport failure"
++            if status_code is None
++            else f"HTTP {status_code}"
++        )
++        super().__init__(f"{operation_id} failed: {detail}")
++
++
++class ProtocolError(RuntimeError):
++    """A successful response that violates the focused contract."""
++
++    def __init__(self, operation_id: str) -> None:
++        self.operation_id = operation_id
++        super().__init__(f"{operation_id} returned an invalid response")
++
++
++class _NoRedirect(request.HTTPRedirectHandler):
++    def redirect_request(
++        self,
++        req: request.Request,
++        fp: object,
++        code: int,
++        msg: str,
++        headers: object,
++        newurl: str,
++    ) -> None:
++        return None
++
++
++def _has_control(value: str) -> bool:
++    return any(ord(character) < 32 or ord(character) == 127 for character in value)
++
++
++def _credential(value: object, name: str) -> str:
++    if (
++        not isinstance(value, str)
++        or not value.strip()
++        or _has_control(value)
++    ):
++        raise ValueError(f"{name} must be a nonblank string without controls")
++    return value
++
++
++def _origin(value: object) -> str:
++    if not isinstance(value, str) or not value or _has_control(value):
++        raise ValueError("base_url must be an HTTP(S) origin")
++    try:
++        split = parse.urlsplit(value)
++        _ = split.port
++    except (TypeError, ValueError) as exc:
++        raise ValueError("base_url must be an HTTP(S) origin") from exc
++    if (
++        split.scheme not in {"http", "https"}
++        or not split.netloc
++        or split.hostname is None
++        or split.username is not None
++        or split.password is not None
++        or split.path not in {"", "/"}
++        or split.query
++        or split.fragment
++    ):
++        raise ValueError("base_url must be an HTTP(S) origin")
++    return f"{split.scheme}://{split.netloc}"
++
++
++def _positive_timeout(value: object) -> float:
++    if (
++        isinstance(value, bool)
++        or not isinstance(value, numbers.Real)
++        or not math.isfinite(float(value))
++        or float(value) <= 0
++    ):
++        raise ValueError("timeout must be a positive finite number")
++    return float(value)
++
++
++def _filter_values(value: object, name: str) -> tuple[str, ...] | None:
++    if value is None:
++        return None
++    if (
++        isinstance(value, (str, bytes, bytearray))
++        or not isinstance(value, Sequence)
++        or not value
++    ):
++        raise ValueError(f"{name} must be a nonempty string sequence")
++    result: list[str] = []
++    for item in value:
++        if not isinstance(item, str) or not item.strip():
++            raise ValueError(f"{name} must contain nonblank strings")
++        result.append(item)
++    if len(set(result)) != len(result):
++        raise ValueError(f"{name} must contain unique strings")
++    return tuple(result)
++
++
++def _target(path: str, order: tuple[str, ...], values: dict[str, object]) -> str:
++    pairs: list[str] = []
++    for name in order:
++        selected = _filter_values(values[name], name)
++        if selected is None:
++            continue
++        if name == "power_states" and any(
++            item not in _POWER_STATES for item in selected
++        ):
++            raise ValueError("power_states contains an unsupported value")
++        for item in selected:
++            pairs.append(
++                f"{parse.quote(name, safe='-._~')}="
++                f"{parse.quote(item, safe='-._~', encoding='utf-8', errors='strict')}"
++            )
++    return path + ("?" + "&".join(pairs) if pairs else "")
++
++
++class VcenterInventoryClient:
++    """Small vCenter inventory client with one-time expiry recovery."""
++
++    def __init__(
++        self,
++        base_url: str,
++        username: str,
++        password: str,
++        *,
++        timeout: float = 10.0,
++    ) -> None:
++        self._base_url = _origin(base_url)
++        self._username = _credential(username, "username")
++        if ":" in self._username:
++            raise ValueError("username must not contain ':'")
++        self._password = _credential(password, "password")
++        self._timeout = _positive_timeout(timeout)
++        self._opener = request.build_opener(
++            request.ProxyHandler({}),
++            _NoRedirect(),
++        )
++        self._token_lock = threading.Lock()
++        self._refresh_lock = threading.Lock()
++        self._token = self._create_session()
++
++    def _exchange(
++        self,
++        operation_id: str,
++        method: str,
++        target: str,
++        headers: dict[str, str],
++    ) -> tuple[int, bytes, object]:
++        req = request.Request(
++            self._base_url + target,
++            headers=headers,
++            method=method,
++        )
++        try:
++            with self._opener.open(req, timeout=self._timeout) as response:
++                status = response.status
++                body = response.read()
++        except error.HTTPError as exc:
++            status = exc.code
++            try:
++                body = exc.read()
++            except Exception:
++                body = b""
++        except (OSError, error.URLError):
++            raise VcenterError(operation_id, None, None) from None
++        payload: object = None
++        if body:
++            try:
++                payload = json.loads(body.decode("utf-8"))
++            except (UnicodeDecodeError, json.JSONDecodeError):
++                payload = None
++        return status, body, payload
++
++    def _create_session(self) -> str:
++        operation_id = "Cis.Session_create"
++        raw = f"{self._username}:{self._password}".encode("utf-8")
++        authorization = "Basic " + base64.b64encode(raw).decode("ascii")
++        status, body, payload = self._exchange(
++            operation_id,
++            "POST",
++            "/api/session",
++            {
++                "Accept": "application/json",
++                "Authorization": authorization,
++            },
++        )
++        if status != 201:
++            raise VcenterError(operation_id, status, payload)
++        if not body:
++            raise ProtocolError(operation_id)
++        try:
++            token = json.loads(body.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            raise ProtocolError(operation_id) from None
++        if not isinstance(token, str) or not token.strip():
++            raise ProtocolError(operation_id)
++        return token
++
++    def _get_collection(
++        self,
++        operation_id: str,
++        target: str,
++    ) -> object:
++        with self._token_lock:
++            captured = self._token
++        status, body, payload = self._exchange(
++            operation_id,
++            "GET",
++            target,
++            {
++                "Accept": "application/json",
++                "vmware-api-session-id": captured,
++            },
++        )
++        if status == 401:
++            with self._refresh_lock:
++                with self._token_lock:
++                    current = self._token
++                if current == captured:
++                    replacement = self._create_session()
++                    with self._token_lock:
++                        self._token = replacement
++                        current = replacement
++            status, body, payload = self._exchange(
++                operation_id,
++                "GET",
++                target,
++                {
++                    "Accept": "application/json",
++                    "vmware-api-session-id": current,
++                },
++            )
++        if status != 200:
++            raise VcenterError(operation_id, status, payload)
++        if not body:
++            raise ProtocolError(operation_id)
++        try:
++            return json.loads(body.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            raise ProtocolError(operation_id) from None
++
++    def list_datacenters(
++        self,
++        *,
++        datacenters: Sequence[str] | None = None,
++        names: Sequence[str] | None = None,
++        folders: Sequence[str] | None = None,
++    ) -> list[dict]:
++        operation_id = "Vcenter.Datacenter_list"
++        target = _target(
++            "/api/vcenter/datacenter",
++            _DATACENTER_FILTERS,
++            {
++                "datacenters": datacenters,
++                "names": names,
++                "folders": folders,
++            },
++        )
++        value = self._get_collection(operation_id, target)
++        if not isinstance(value, list):
++            raise ProtocolError(operation_id)
++        result: list[dict] = []
++        for item in value:
++            if (
++                not isinstance(item, dict)
++                or not isinstance(item.get("datacenter"), str)
++                or not item["datacenter"].strip()
++                or not isinstance(item.get("name"), str)
++                or not item["name"].strip()
++            ):
++                raise ProtocolError(operation_id)
++            result.append(dict(item))
++        result.sort(key=lambda item: (item["name"], item["datacenter"]))
++        return result
++
++    def list_vms(
++        self,
++        *,
++        vms: Sequence[str] | None = None,
++        names: Sequence[str] | None = None,
++        folders: Sequence[str] | None = None,
++        datacenters: Sequence[str] | None = None,
++        hosts: Sequence[str] | None = None,
++        clusters: Sequence[str] | None = None,
++        resource_pools: Sequence[str] | None = None,
++        power_states: Sequence[str] | None = None,
++    ) -> list[dict]:
++        operation_id = "Vcenter.VM_list"
++        target = _target(
++            "/api/vcenter/vm",
++            _VM_FILTERS,
++            {
++                "vms": vms,
++                "names": names,
++                "folders": folders,
++                "datacenters": datacenters,
++                "hosts": hosts,
++                "clusters": clusters,
++                "resource_pools": resource_pools,
++                "power_states": power_states,
++            },
++        )
++        value = self._get_collection(operation_id, target)
++        if not isinstance(value, list):
++            raise ProtocolError(operation_id)
++        result: list[dict] = []
++        for item in value:
++            if (
++                not isinstance(item, dict)
++                or not isinstance(item.get("vm"), str)
++                or not item["vm"].strip()
++                or not isinstance(item.get("name"), str)
++                or not item["name"].strip()
++                or not isinstance(item.get("power_state"), str)
++                or item["power_state"] not in _POWER_STATES
++            ):
++                raise ProtocolError(operation_id)
++            for field in ("cpu_count", "memory_size_mib"):
++                optional = item.get(field)
++                if (
++                    field in item
++                    and optional is not None
++                    and (
++                        isinstance(optional, bool)
++                        or not isinstance(optional, int)
++                    )
++                ):
++                    raise ProtocolError(operation_id)
++            result.append(dict(item))
++        result.sort(key=lambda item: (item["name"], item["vm"]))
++        return result
++
++    def collect_inventory(self) -> dict:
++        datacenters = self.list_datacenters()
++        vms = self.list_vms()
++        return {
++            "datacenters": datacenters,
++            "vms": vms,
++        }

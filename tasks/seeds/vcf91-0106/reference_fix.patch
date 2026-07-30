@@ -1,0 +1,345 @@
+--- a/vcf_diag/client.py
++++ b/vcf_diag/client.py
+@@ -2,18 +2,120 @@
+ 
+ from __future__ import annotations
+ 
+-from typing import Any, Iterable
++import json
++from collections.abc import Iterable, Mapping
++from typing import Any
++from urllib.error import HTTPError, URLError
++from urllib.parse import quote, urlencode, urlsplit
++from urllib.request import Request, urlopen
+ 
+ 
+ class VCenterAPIError(RuntimeError):
+     """Raised when a vCenter API request or response is unusable."""
+ 
++    def __init__(
++        self,
++        message: str,
++        *,
++        status: int | None = None,
++        response_body: str | None = None,
++    ):
++        super().__init__(message)
++        self.status = status
++        self.response_body = response_body
++
+ 
+ class VCenterClient:
+     """Client for the operations recorded in ``docs/contract.json``."""
+ 
+     def __init__(self, base_url: str, session_id: str, timeout: float = 10.0):
+-        raise NotImplementedError("implement VCenterClient")
++        candidate = base_url.rstrip("/")
++        parsed = urlsplit(candidate)
++        if (
++            parsed.scheme not in {"http", "https"}
++            or not parsed.hostname
++            or parsed.username is not None
++            or parsed.password is not None
++            or parsed.query
++            or parsed.fragment
++            or not parsed.path.rstrip("/").endswith("/api")
++        ):
++            raise ValueError("base_url must be an http(s) vCenter API-root URL")
++        if not session_id:
++            raise ValueError("session_id must not be empty")
++        if timeout <= 0:
++            raise ValueError("timeout must be positive")
++        self._base_url = candidate
++        self._session_id = session_id
++        self._timeout = float(timeout)
++
++    @staticmethod
++    def _segment(value: str, name: str) -> str:
++        if not isinstance(value, str) or not value:
++            raise ValueError(f"{name} must be a non-empty string")
++        return quote(value, safe="")
++
++    def _request(
++        self,
++        method: str,
++        path: str,
++        *,
++        query: list[tuple[str, str]] | None = None,
++        body: dict[str, Any] | None = None,
++        expected_status: int,
++    ) -> Any:
++        if not path.startswith("/") or "://" in path:
++            raise ValueError("request path must be relative to the API root")
++        url = self._base_url + path
++        if query:
++            url += "?" + urlencode(query)
++        headers = {
++            "Accept": "application/json",
++            "vmware-api-session-id": self._session_id,
++        }
++        encoded_body: bytes | None = None
++        if body is not None:
++            encoded_body = json.dumps(
++                body, ensure_ascii=True, separators=(",", ":")
++            ).encode("utf-8")
++            headers["Content-Type"] = "application/json"
++        request = Request(
++            url,
++            data=encoded_body,
++            headers=headers,
++            method=method,
++        )
++        try:
++            with urlopen(request, timeout=self._timeout) as response:
++                status = response.status
++                payload = response.read()
++        except HTTPError as exc:
++            payload = exc.read()
++            text = payload.decode("utf-8", errors="replace")
++            raise VCenterAPIError(
++                f"vCenter returned HTTP {exc.code} for {method} {path}",
++                status=exc.code,
++                response_body=text,
++            ) from exc
++        except (URLError, TimeoutError, OSError) as exc:
++            reason = getattr(exc, "reason", exc)
++            raise VCenterAPIError(
++                f"vCenter request failed for {method} {path}: {reason}"
++            ) from exc
++        if status != expected_status:
++            text = payload.decode("utf-8", errors="replace")
++            raise VCenterAPIError(
++                f"vCenter returned HTTP {status} for {method} {path}",
++                status=status,
++                response_body=text,
++            )
++        try:
++            text = payload.decode("utf-8")
++            return json.loads(text)
++        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++            raise VCenterAPIError(
++                f"vCenter returned invalid JSON for {method} {path}"
++            ) from exc
+ 
+     def list_tpms(
+         self,
+@@ -22,10 +124,80 @@
+         active: bool | None = None,
+         major_versions: Iterable[int] | None = None,
+     ) -> list[dict[str, Any]]:
+-        raise NotImplementedError
++        host_segment = self._segment(host, "host")
++        query: list[tuple[str, str]] = []
++        if active is not None:
++            if not isinstance(active, bool):
++                raise ValueError("active must be a boolean or None")
++            query.append(("active", "true" if active else "false"))
++        if major_versions is not None:
++            for version in major_versions:
++                if not isinstance(version, int) or isinstance(version, bool):
++                    raise ValueError("major_versions must contain integers")
++                query.append(("major_versions", str(version)))
++        result = self._request(
++            "GET",
++            f"/vcenter/trusted-infrastructure/hosts/{host_segment}/hardware/tpm",
++            query=query,
++            expected_status=200,
++        )
++        if not isinstance(result, list):
++            raise VCenterAPIError("TPM list response must be a JSON array")
++        for summary in result:
++            if not isinstance(summary, dict):
++                raise VCenterAPIError("TPM list contains a non-object item")
++            required_types = {
++                "tpm": str,
++                "major_version": int,
++                "minor_version": int,
++                "active": bool,
++            }
++            for name, expected_type in required_types.items():
++                value = summary.get(name)
++                if not isinstance(value, expected_type) or (
++                    expected_type is int and isinstance(value, bool)
++                ):
++                    raise VCenterAPIError(
++                        f"TPM summary has invalid or missing {name!r}"
++                    )
++        return result
+ 
+     def get_tpm_event_log(self, host: str, tpm: str) -> dict[str, Any]:
+-        raise NotImplementedError
++        host_segment = self._segment(host, "host")
++        tpm_segment = self._segment(tpm, "tpm")
++        result = self._request(
++            "GET",
++            (
++                "/vcenter/trusted-infrastructure/hosts/"
++                f"{host_segment}/hardware/tpm/{tpm_segment}/event-log"
++            ),
++            expected_status=200,
++        )
++        if not isinstance(result, dict):
++            raise VCenterAPIError("TPM event-log response must be a JSON object")
++        if not isinstance(result.get("type"), str):
++            raise VCenterAPIError("TPM event log has invalid or missing 'type'")
++        if not isinstance(result.get("truncated"), bool):
++            raise VCenterAPIError(
++                "TPM event log has invalid or missing 'truncated'"
++            )
++        if "data" in result and not isinstance(result["data"], str):
++            raise VCenterAPIError("TPM event log has invalid 'data'")
++        banks = result.get("banks")
++        if not isinstance(banks, list):
++            raise VCenterAPIError("TPM event log has invalid or missing 'banks'")
++        for bank in banks:
++            if (
++                not isinstance(bank, dict)
++                or not isinstance(bank.get("algorithm"), str)
++                or not isinstance(bank.get("pcrs"), dict)
++                or not all(
++                    isinstance(key, str) and isinstance(value, str)
++                    for key, value in bank["pcrs"].items()
++                )
++            ):
++                raise VCenterAPIError("TPM event log contains an invalid PCR bank")
++        return result
+ 
+     def create_log_bundle(
+         self,
+@@ -34,7 +206,37 @@
+         components: dict[str, list[str]] | None = None,
+         partition: str | None = None,
+     ) -> str:
+-        raise NotImplementedError
++        if not isinstance(description, str) or not description:
++            raise ValueError("description must be a non-empty string")
++        payload: dict[str, Any] = {"description": description}
++        if components is not None:
++            if not isinstance(components, Mapping) or not all(
++                isinstance(group, str)
++                and isinstance(items, list)
++                and all(isinstance(item, str) for item in items)
++                for group, items in components.items()
++            ):
++                raise ValueError(
++                    "components must map string group names to lists of strings"
++                )
++            payload["components"] = dict(components)
++        payload["content_type"] = "LOGS"
++        if partition is not None:
++            if not isinstance(partition, str):
++                raise ValueError("partition must be a string or None")
++            payload["partition"] = partition
++        result = self._request(
++            "POST",
++            "/appliance/support-bundle",
++            query=[("vmw-task", "true")],
++            body=payload,
++            expected_status=202,
++        )
++        if not isinstance(result, str) or not result:
++            raise VCenterAPIError(
++                "support-bundle response must be a non-empty task identifier"
++            )
++        return result
+ 
+ 
+ def collect_diagnosis(
+@@ -42,4 +244,43 @@
+ ) -> dict[str, Any]:
+     """Collect TPM and support-bundle evidence and return a diagnosis report."""
+ 
+-    raise NotImplementedError
++    tpms = client.list_tpms(host)
++    if not tpms:
++        raise VCenterAPIError("no TPM was returned for the host")
++    if len(tpms) != 1:
++        raise VCenterAPIError(
++            f"expected one TPM for unambiguous diagnosis, received {len(tpms)}"
++        )
++    tpm = tpms[0]
++    event_log = client.get_tpm_event_log(host, tpm["tpm"])
++    support_bundle_task = client.create_log_bundle(description)
++
++    if not tpm["active"]:
++        code = "TPM_INACTIVE"
++        summary = (
++            "The API reports that the selected TPM is inactive; inactive TPMs "
++            "cannot be used for attestation."
++        )
++    elif event_log["truncated"]:
++        code = "TPM_EVENT_LOG_TRUNCATED"
++        summary = (
++            "The API reports an active TPM, but its event log is truncated; "
++            "review the requested log bundle instead of assuming the TPM is disabled."
++        )
++    else:
++        code = "UNRESOLVED_REVIEW_EVENT_LOG"
++        summary = (
++            "The TPM is active and the event log is not truncated; the returned "
++            "evidence does not establish a root cause, so review the event log "
++            "and requested support bundle."
++        )
++    return {
++        "host": host,
++        "tpm": tpm,
++        "event_log": event_log,
++        "support_bundle_task": support_bundle_task,
++        "diagnosis": {
++            "code": code,
++            "summary": summary,
++        },
++    }
+--- a/vcf_diag/__main__.py
++++ b/vcf_diag/__main__.py
+@@ -2,9 +2,48 @@
+ 
+ from __future__ import annotations
+ 
++import argparse
++import json
++import sys
+ 
+-def main() -> int:
+-    raise NotImplementedError("implement the vcf_diag CLI")
++from .client import VCenterAPIError, VCenterClient, collect_diagnosis
++
++
++def _parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(
++        prog="python -m vcf_diag",
++        description="Collect vCenter TPM event-log and support-bundle evidence.",
++    )
++    parser.add_argument("--base-url", required=True, help="vCenter API root")
++    parser.add_argument("--session-id", required=True, help="vCenter API session ID")
++    parser.add_argument("--host", required=True, help="ESXi host identifier")
++    parser.add_argument(
++        "--description",
++        required=True,
++        help="support-bundle collection description",
++    )
++    parser.add_argument("--timeout", type=float, default=10.0)
++    return parser
++
++
++def main(argv: list[str] | None = None) -> int:
++    arguments = _parser().parse_args(argv)
++    try:
++        client = VCenterClient(
++            arguments.base_url,
++            arguments.session_id,
++            timeout=arguments.timeout,
++        )
++        report = collect_diagnosis(
++            client,
++            arguments.host,
++            arguments.description,
++        )
++    except (VCenterAPIError, ValueError) as exc:
++        print(f"vcf-diag: {exc}", file=sys.stderr)
++        return 1
++    print(json.dumps(report, sort_keys=True, separators=(",", ":")))
++    return 0
+ 
+ 
+ if __name__ == "__main__":
