@@ -1,0 +1,695 @@
+--- a/VcfOpsLogCredential/VcfOpsLogCredential.psm1
++++ b/VcfOpsLogCredential/VcfOpsLogCredential.psm1
+@@ -1,5 +1,449 @@
+ Set-StrictMode -Version Latest
+ 
++class VcfOpsLogCredentialLease : System.IDisposable {
++    [string] $SecretName
++    [string] $Secret
++    [string] $AccessToken
++
++    hidden [object] $Gate
++    hidden [long] $Generation
++    hidden [object] $DisposeRoot
++    hidden [bool] $Disposed
++
++    VcfOpsLogCredentialLease(
++        [object] $Gate,
++        [long] $Generation,
++        [string] $SecretName,
++        [string] $Secret,
++        [string] $AccessToken
++    ) {
++        $this.Gate = $Gate
++        $this.Generation = $Generation
++        $this.SecretName = $SecretName
++        $this.Secret = $Secret
++        $this.AccessToken = $AccessToken
++        $this.DisposeRoot = [object]::new()
++        $this.Disposed = $false
++    }
++
++    [void] Dispose() {
++        $Release = $false
++        [Threading.Monitor]::Enter($this.DisposeRoot)
++        try {
++            if (-not $this.Disposed) {
++                $this.Disposed = $true
++                $Release = $true
++            }
++        }
++        finally {
++            [Threading.Monitor]::Exit($this.DisposeRoot)
++        }
++
++        if ($Release) {
++            $this.Gate.Release($this.Generation)
++        }
++    }
++}
++
++class VcfOpsLogCredentialGate {
++    hidden [object] $SyncRoot
++    hidden [Collections.Generic.Dictionary[long, int]] $LeaseCounts
++    hidden [long] $Generation
++    hidden [string] $CurrentName
++    hidden [string] $CurrentSecret
++    hidden [string] $CurrentAccessToken
++    hidden [bool] $RotationOwned
++
++    VcfOpsLogCredentialGate(
++        [string] $SecretName,
++        [string] $Secret,
++        [string] $AccessToken
++    ) {
++        $this.SyncRoot = [object]::new()
++        $this.LeaseCounts = (
++            [Collections.Generic.Dictionary[long, int]]::new()
++        )
++        $this.Generation = 0
++        $this.CurrentName = $SecretName
++        $this.CurrentSecret = $Secret
++        $this.CurrentAccessToken = $AccessToken
++        $this.RotationOwned = $false
++    }
++
++    [object] Acquire() {
++        $Lease = $null
++        [Threading.Monitor]::Enter($this.SyncRoot)
++        try {
++            $CurrentCount = 0
++            $null = $this.LeaseCounts.TryGetValue(
++                $this.Generation,
++                [ref] $CurrentCount
++            )
++            $this.LeaseCounts[$this.Generation] = $CurrentCount + 1
++            $Lease = [VcfOpsLogCredentialLease]::new(
++                $this,
++                $this.Generation,
++                $this.CurrentName,
++                $this.CurrentSecret,
++                $this.CurrentAccessToken
++            )
++        }
++        finally {
++            [Threading.Monitor]::Exit($this.SyncRoot)
++        }
++        return $Lease
++    }
++
++    hidden [void] Release([long] $ReleasedGeneration) {
++        [Threading.Monitor]::Enter($this.SyncRoot)
++        try {
++            $CurrentCount = 0
++            if (
++                -not $this.LeaseCounts.TryGetValue(
++                    $ReleasedGeneration,
++                    [ref] $CurrentCount
++                ) -or
++                $CurrentCount -lt 1
++            ) {
++                throw [InvalidOperationException]::new(
++                    'Credential lease accounting is inconsistent.'
++                )
++            }
++            if ($CurrentCount -eq 1) {
++                $null = $this.LeaseCounts.Remove($ReleasedGeneration)
++            }
++            else {
++                $this.LeaseCounts[$ReleasedGeneration] = $CurrentCount - 1
++            }
++        }
++        finally {
++            [Threading.Monitor]::Exit($this.SyncRoot)
++        }
++    }
++
++    [hashtable] BeginRotation() {
++        $Snapshot = $null
++        [Threading.Monitor]::Enter($this.SyncRoot)
++        try {
++            if ($this.RotationOwned) {
++                throw [InvalidOperationException]::new(
++                    'A credential rotation already owns this gate.'
++                )
++            }
++            $this.RotationOwned = $true
++            $Snapshot = @{
++                Generation = $this.Generation
++                Name = $this.CurrentName
++            }
++        }
++        finally {
++            [Threading.Monitor]::Exit($this.SyncRoot)
++        }
++        return $Snapshot
++    }
++
++    [long] Publish(
++        [string] $SecretName,
++        [string] $Secret,
++        [string] $AccessToken
++    ) {
++        $OldGeneration = 0
++        [Threading.Monitor]::Enter($this.SyncRoot)
++        try {
++            if (-not $this.RotationOwned) {
++                throw [InvalidOperationException]::new(
++                    'The gate is not owned for credential rotation.'
++                )
++            }
++            $OldGeneration = $this.Generation
++            $this.Generation++
++            $this.CurrentName = $SecretName
++            $this.CurrentSecret = $Secret
++            $this.CurrentAccessToken = $AccessToken
++        }
++        finally {
++            [Threading.Monitor]::Exit($this.SyncRoot)
++        }
++        return $OldGeneration
++    }
++
++    [int] GetActiveCount([long] $RequestedGeneration) {
++        $Count = 0
++        [Threading.Monitor]::Enter($this.SyncRoot)
++        try {
++            $null = $this.LeaseCounts.TryGetValue(
++                $RequestedGeneration,
++                [ref] $Count
++            )
++        }
++        finally {
++            [Threading.Monitor]::Exit($this.SyncRoot)
++        }
++        return $Count
++    }
++
++    [void] EndRotation() {
++        [Threading.Monitor]::Enter($this.SyncRoot)
++        try {
++            $this.RotationOwned = $false
++        }
++        finally {
++            [Threading.Monitor]::Exit($this.SyncRoot)
++        }
++    }
++}
++
++class VcfOpsLogDrainTimeoutException : System.TimeoutException {
++    [string] $OldName
++    [string] $NewName
++    [int] $DrainCheckCount
++
++    VcfOpsLogDrainTimeoutException(
++        [string] $OldName,
++        [string] $NewName,
++        [int] $DrainCheckCount
++    ) : base('Credential rotation timed out while draining the old generation.') {
++        $this.OldName = $OldName
++        $this.NewName = $NewName
++        $this.DrainCheckCount = $DrainCheckCount
++    }
++}
++
++function Assert-VcfOpsLogNonBlank {
++    param(
++        [Parameter(Mandatory)]
++        [AllowEmptyString()]
++        [string] $Value,
++
++        [Parameter(Mandatory)]
++        [string] $Name
++    )
++
++    if ([string]::IsNullOrWhiteSpace($Value)) {
++        throw [ArgumentException]::new("$Name must be nonblank.")
++    }
++}
++
++function Assert-VcfOpsLogName {
++    param(
++        [Parameter(Mandatory)]
++        [AllowEmptyString()]
++        [string] $Value,
++
++        [Parameter(Mandatory)]
++        [string] $Name
++    )
++
++    Assert-VcfOpsLogNonBlank -Value $Value -Name $Name
++    if (-not [StringComparer]::Ordinal.Equals($Value, $Value.Trim())) {
++        throw [ArgumentException]::new(
++            "$Name must not have surrounding whitespace."
++        )
++    }
++}
++
++function Assert-VcfOpsLogToken {
++    param(
++        [Parameter(Mandatory)]
++        [AllowEmptyString()]
++        [string] $Value
++    )
++
++    Assert-VcfOpsLogNonBlank -Value $Value -Name 'LogToken'
++    if ($Value.Contains("`r") -or $Value.Contains("`n")) {
++        throw [ArgumentException]::new(
++            'LogToken contains a header-unsafe character.'
++        )
++    }
++}
++
++function Resolve-VcfOpsLogOrigin {
++    param(
++        [Parameter(Mandatory)]
++        [uri] $BaseUri
++    )
++
++    if (
++        -not $BaseUri.IsAbsoluteUri -or
++        ($BaseUri.Scheme -cne 'http' -and $BaseUri.Scheme -cne 'https') -or
++        $BaseUri.UserInfo.Length -ne 0 -or
++        $BaseUri.AbsolutePath -cne '/' -or
++        $BaseUri.Query.Length -ne 0 -or
++        $BaseUri.Fragment.Length -ne 0
++    ) {
++        throw [ArgumentException]::new(
++            'BaseUri must be an absolute HTTP(S) origin.'
++        )
++    }
++    return [uri] $BaseUri.GetLeftPart([UriPartial]::Authority)
++}
++
++function Get-VcfOpsLogGate {
++    param(
++        [Parameter(Mandatory)]
++        [object] $Gate
++    )
++
++    if ($Gate -isnot [VcfOpsLogCredentialGate]) {
++        throw [ArgumentException]::new(
++            'Gate must be created by New-VcfOpsLogCredentialGate.'
++        )
++    }
++    return [VcfOpsLogCredentialGate] $Gate
++}
++
++function ConvertFrom-VcfOpsLogJson {
++    param(
++        [Parameter(Mandatory)]
++        [AllowEmptyString()]
++        [string] $Text,
++
++        [Parameter(Mandatory)]
++        [string] $Context
++    )
++
++    try {
++        return $Text | ConvertFrom-Json -Depth 30
++    }
++    catch {
++        throw [System.IO.InvalidDataException]::new(
++            "$Context returned malformed JSON."
++        )
++    }
++}
++
++function Get-VcfOpsLogRequiredString {
++    param(
++        [Parameter(Mandatory)]
++        [object] $InputObject,
++
++        [Parameter(Mandatory)]
++        [string] $Name,
++
++        [Parameter(Mandatory)]
++        [string] $Context
++    )
++
++    $Property = $InputObject.PSObject.Properties[$Name]
++    if (
++        $null -eq $Property -or
++        $Property.Value -isnot [string] -or
++        [string]::IsNullOrWhiteSpace([string] $Property.Value)
++    ) {
++        throw [System.IO.InvalidDataException]::new(
++            "$Context is missing a required string."
++        )
++    }
++    return [string] $Property.Value
++}
++
++function Get-VcfOpsLogRequiredInteger {
++    param(
++        [Parameter(Mandatory)]
++        [object] $InputObject,
++
++        [Parameter(Mandatory)]
++        [string] $Name,
++
++        [Parameter(Mandatory)]
++        [string] $Context
++    )
++
++    $Property = $InputObject.PSObject.Properties[$Name]
++    if (
++        $null -eq $Property -or
++        $Property.Value -isnot [sbyte] -and
++        $Property.Value -isnot [byte] -and
++        $Property.Value -isnot [int16] -and
++        $Property.Value -isnot [uint16] -and
++        $Property.Value -isnot [int32] -and
++        $Property.Value -isnot [uint32] -and
++        $Property.Value -isnot [int64]
++    ) {
++        throw [System.IO.InvalidDataException]::new(
++            "$Context is missing a required integer."
++        )
++    }
++    return [long] $Property.Value
++}
++
++function Invoke-VcfOpsLogRequest {
++    param(
++        [Parameter(Mandatory)]
++        [Net.Http.HttpClient] $Client,
++
++        [Parameter(Mandatory)]
++        [Net.Http.HttpMethod] $Method,
++
++        [Parameter(Mandatory)]
++        [uri] $Uri,
++
++        [Parameter(Mandatory)]
++        [string] $LogToken,
++
++        [Parameter(Mandatory)]
++        [int] $ExpectedStatus,
++
++        [AllowNull()]
++        [object] $JsonBody,
++
++        [Parameter(Mandatory)]
++        [string] $Context
++    )
++
++    $Request = [Net.Http.HttpRequestMessage]::new($Method, $Uri)
++    $Response = $null
++    try {
++        $Request.Headers.Accept.Add(
++            [Net.Http.Headers.MediaTypeWithQualityHeaderValue]::new(
++                'application/json'
++            )
++        )
++        if (
++            -not $Request.Headers.TryAddWithoutValidation(
++                'X-JWT-Token',
++                $LogToken
++            )
++        ) {
++            throw [InvalidOperationException]::new(
++                'Could not configure log authentication.'
++            )
++        }
++        if ($null -ne $JsonBody) {
++            $Bytes = [Text.Encoding]::UTF8.GetBytes([string] $JsonBody)
++            $Request.Content = [Net.Http.ByteArrayContent]::new($Bytes)
++            $Request.Content.Headers.ContentType = (
++                [Net.Http.Headers.MediaTypeHeaderValue]::new(
++                    'application/json'
++                )
++            )
++        }
++
++        try {
++            $Response = $Client.Send($Request)
++            if ([int] $Response.StatusCode -ne $ExpectedStatus) {
++                throw [System.IO.IOException]::new(
++                    'Unexpected response status.'
++                )
++            }
++            return (
++                $Response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
++            )
++        }
++        catch {
++            throw [System.IO.IOException]::new(
++                "The $Context log-management request failed."
++            )
++        }
++    }
++    finally {
++        if ($null -ne $Response) {
++            $Response.Dispose()
++        }
++        $Request.Dispose()
++    }
++}
++
+ function New-VcfOpsLogCredentialGate {
+     [CmdletBinding()]
+     param(
+@@ -13,8 +457,13 @@
+         [string] $AccessToken
+     )
+ 
+-    throw [NotImplementedException]::new(
+-        'TODO: construct the credential gate.'
++    Assert-VcfOpsLogName -Value $SecretName -Name 'SecretName'
++    Assert-VcfOpsLogNonBlank -Value $Secret -Name 'Secret'
++    Assert-VcfOpsLogNonBlank -Value $AccessToken -Name 'AccessToken'
++    return [VcfOpsLogCredentialGate]::new(
++        $SecretName,
++        $Secret,
++        $AccessToken
+     )
+ }
+ 
+@@ -25,9 +474,8 @@
+         [object] $Gate
+     )
+ 
+-    throw [NotImplementedException]::new(
+-        'TODO: lease the current credential generation.'
+-    )
++    $CredentialGate = Get-VcfOpsLogGate -Gate $Gate
++    return $CredentialGate.Acquire()
+ }
+ 
+ function Invoke-VcfOpsLogCredentialRotation {
+@@ -60,9 +508,211 @@
+         [Net.Http.HttpClient] $HttpClient
+     )
+ 
+-    throw [NotImplementedException]::new(
+-        'TODO: create, validate, cut over, drain, and revoke.'
+-    )
++    $CredentialGate = Get-VcfOpsLogGate -Gate $Gate
++    Assert-VcfOpsLogName -Value $NewName -Name 'NewName'
++    Assert-VcfOpsLogToken -Value $LogToken
++    $Origin = Resolve-VcfOpsLogOrigin -BaseUri $BaseUri
++    $TtlWasBound = $PSBoundParameters.ContainsKey('SessionTtlMilliseconds')
++
++    $OwnedHandler = $null
++    $OwnedClient = $null
++    $Client = $HttpClient
++    $RotationStarted = $false
++    try {
++        $Old = $CredentialGate.BeginRotation()
++        $RotationStarted = $true
++        $OldName = [string] $Old.Name
++        if ([StringComparer]::Ordinal.Equals($OldName, $NewName)) {
++            throw [ArgumentException]::new(
++                'NewName must differ from the current credential name.'
++            )
++        }
++
++        if ($null -eq $Client) {
++            $OwnedHandler = [Net.Http.HttpClientHandler]::new()
++            $OwnedHandler.AllowAutoRedirect = $false
++            $OwnedClient = [Net.Http.HttpClient]::new($OwnedHandler, $false)
++            $Client = $OwnedClient
++        }
++
++        $CreateUri = [uri]::new($Origin, '/api/v2/agent/secrets')
++        $CreateBody = [ordered] @{
++            name = $NewName
++        } | ConvertTo-Json -Compress
++        $CreateText = Invoke-VcfOpsLogRequest `
++            -Client $Client `
++            -Method ([Net.Http.HttpMethod]::Post) `
++            -Uri $CreateUri `
++            -LogToken $LogToken `
++            -ExpectedStatus 201 `
++            -JsonBody $CreateBody `
++            -Context 'create'
++        $Created = ConvertFrom-VcfOpsLogJson `
++            -Text $CreateText `
++            -Context 'The create operation'
++        $CreatedId = Get-VcfOpsLogRequiredString `
++            -InputObject $Created `
++            -Name 'id' `
++            -Context 'The create response'
++        $CreatedName = Get-VcfOpsLogRequiredString `
++            -InputObject $Created `
++            -Name 'name' `
++            -Context 'The create response'
++        $CreateSecret = Get-VcfOpsLogRequiredString `
++            -InputObject $Created `
++            -Name 'secret' `
++            -Context 'The create response'
++        $null = Get-VcfOpsLogRequiredString `
++            -InputObject $Created `
++            -Name 'status' `
++            -Context 'The create response'
++        if (-not [StringComparer]::Ordinal.Equals($CreatedName, $NewName)) {
++            throw [System.IO.InvalidDataException]::new(
++                'The create response identity is inconsistent.'
++            )
++        }
++
++        $ExchangeBodyValue = [ordered] @{
++            secret = $CreateSecret
++        }
++        if ($TtlWasBound) {
++            $ExchangeBodyValue.ttl = $SessionTtlMilliseconds
++        }
++        $ExchangeBody = $ExchangeBodyValue | ConvertTo-Json -Compress
++        $ExchangeUri = [uri]::new(
++            $Origin,
++            '/api/v2/agent/secrets/exchange'
++        )
++        $ExchangeText = Invoke-VcfOpsLogRequest `
++            -Client $Client `
++            -Method ([Net.Http.HttpMethod]::Post) `
++            -Uri $ExchangeUri `
++            -LogToken $LogToken `
++            -ExpectedStatus 200 `
++            -JsonBody $ExchangeBody `
++            -Context 'exchange'
++        $Exchanged = ConvertFrom-VcfOpsLogJson `
++            -Text $ExchangeText `
++            -Context 'The exchange operation'
++        $NewAccessToken = Get-VcfOpsLogRequiredString `
++            -InputObject $Exchanged `
++            -Name 'access_token' `
++            -Context 'The exchange response'
++        $ExchangeName = Get-VcfOpsLogRequiredString `
++            -InputObject $Exchanged `
++            -Name 'name' `
++            -Context 'The exchange response'
++        $NewSecret = Get-VcfOpsLogRequiredString `
++            -InputObject $Exchanged `
++            -Name 'new_secret' `
++            -Context 'The exchange response'
++        $null = Get-VcfOpsLogRequiredInteger `
++            -InputObject $Exchanged `
++            -Name 'ttl' `
++            -Context 'The exchange response'
++        if (-not [StringComparer]::Ordinal.Equals($ExchangeName, $NewName)) {
++            throw [System.IO.InvalidDataException]::new(
++                'The exchange response identity is inconsistent.'
++            )
++        }
++
++        $OldGeneration = $CredentialGate.Publish(
++            $NewName,
++            $NewSecret,
++            $NewAccessToken
++        )
++
++        $WaitedForDrain = $false
++        $Drained = $false
++        $DrainCheckCount = 0
++        for ($Check = 1; $Check -le $MaxDrainChecks; $Check++) {
++            $DrainCheckCount = $Check
++            $ActiveCount = $CredentialGate.GetActiveCount($OldGeneration)
++            if ($ActiveCount -eq 0) {
++                $Drained = $true
++                break
++            }
++
++            $WaitedForDrain = $true
++            if ($Check -lt $MaxDrainChecks) {
++                if ($null -ne $SleepAction) {
++                    try {
++                        $null = & $SleepAction $DrainPollIntervalMilliseconds
++                    }
++                    catch {
++                        throw [InvalidOperationException]::new(
++                            'The drain wait action failed.'
++                        )
++                    }
++                }
++                else {
++                    Start-Sleep `
++                        -Milliseconds $DrainPollIntervalMilliseconds
++                }
++            }
++        }
++        if (-not $Drained) {
++            throw [VcfOpsLogDrainTimeoutException]::new(
++                $OldName,
++                $NewName,
++                $DrainCheckCount
++            )
++        }
++
++        $EncodedOldName = [uri]::EscapeDataString($OldName)
++        $RevokeUri = [uri]::new(
++            $Origin,
++            "/api/v2/agent/secrets/$EncodedOldName/revoke"
++        )
++        $RevokeText = Invoke-VcfOpsLogRequest `
++            -Client $Client `
++            -Method ([Net.Http.HttpMethod]::Post) `
++            -Uri $RevokeUri `
++            -LogToken $LogToken `
++            -ExpectedStatus 200 `
++            -JsonBody $null `
++            -Context 'revoke'
++        $Revoked = ConvertFrom-VcfOpsLogJson `
++            -Text $RevokeText `
++            -Context 'The revoke operation'
++        $null = Get-VcfOpsLogRequiredString `
++            -InputObject $Revoked `
++            -Name 'id' `
++            -Context 'The revoke response'
++        $RevokedName = Get-VcfOpsLogRequiredString `
++            -InputObject $Revoked `
++            -Name 'name' `
++            -Context 'The revoke response'
++        $null = Get-VcfOpsLogRequiredString `
++            -InputObject $Revoked `
++            -Name 'status' `
++            -Context 'The revoke response'
++        if (-not [StringComparer]::Ordinal.Equals($RevokedName, $OldName)) {
++            throw [System.IO.InvalidDataException]::new(
++                'The revoke response identity is inconsistent.'
++            )
++        }
++
++        return [pscustomobject] [ordered] @{
++            Status = 'Rotated'
++            OldName = $OldName
++            NewName = $NewName
++            CreatedId = $CreatedId
++            DrainCheckCount = $DrainCheckCount
++            WaitedForDrain = $WaitedForDrain
++        }
++    }
++    finally {
++        if ($RotationStarted) {
++            $CredentialGate.EndRotation()
++        }
++        if ($null -ne $OwnedClient) {
++            $OwnedClient.Dispose()
++        }
++        if ($null -ne $OwnedHandler) {
++            $OwnedHandler.Dispose()
++        }
++    }
+ }
+ 
+ Export-ModuleMember -Function @(
