@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3212 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3213 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 40 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 137 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 138 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -1815,6 +1815,7 @@
 - **ts-salesforce-composite-tree** (`ts`) — CRM integrations pod. Our provisioning service already creates Salesforce record hierarchies through the sObject Tree endpoint (tree_client.ts — it works, leave its behavior alone), but sales ops k…
 - **ts-sap-cloud-integration-monitor** (`ts`) — Integration-ops ticket. Our SAP Cloud Integration tenant runs ~40 productive iflows and the on-call rotation still checks the Monitor UI by hand; last Saturday a FAILED spike on Replicate_Cost_Cent…
 - **vcf91-0165** (`powershell`) `#vcf-9-1` `#vcf-operations-logs` `#powershell` `#rest-contract` `#spec-derived` — Complete `VcfOpsLogSecret/VcfOpsLogSecret.psm1` as a PowerShell 7.4 module that creates an ingestion-agent secret in VCF Operations for Logs and waits until that asynchronous secret activation reac…
+- **vcf91-0168** (`powershell`) `#vcf-9-1` `#vcf-operations-logs` `#powershell` `#rest-contract` `#spec-derived` — Complete `VcfOpsLogForwarder/VcfOpsLogForwarder.psm1` as a PowerShell 7.4 module that idempotently ensures one named VCF Operations for Logs forwarder exists. A retry with the same desired configur…
 
 ## feature-io
 
