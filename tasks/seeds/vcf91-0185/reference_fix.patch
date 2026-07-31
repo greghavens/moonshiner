@@ -1,0 +1,214 @@
+diff --git a/forwarderreplace/client.go b/forwarderreplace/client.go
+--- a/forwarderreplace/client.go
++++ b/forwarderreplace/client.go
+@@ -1,19 +1,202 @@
+ package forwarderreplace
+ 
+ import (
++	"bytes"
+ 	"context"
+-	"errors"
++	"encoding/json"
++	"fmt"
++	"io"
++	"mime"
++	"net/http"
++	"net/url"
++	"strings"
+ )
+ 
++const maxResponseBytes = 1 << 20
++
+ // Client executes the focused replacement workflow.
+-type Client struct{}
++type Client struct {
++	baseURL    string
++	token      string
++	httpClient *http.Client
++}
+ 
+-// NewClient is intentionally incomplete.
+-func NewClient(Config) (*Client, error) {
+-	return &Client{}, nil
++// NewClient validates configuration without making a request.
++func NewClient(config Config) (*Client, error) {
++	baseURL, err := url.Parse(config.BaseURL)
++	if err != nil ||
++		baseURL.Scheme == "" ||
++		(baseURL.Scheme != "http" && baseURL.Scheme != "https") ||
++		baseURL.Host == "" ||
++		baseURL.Hostname() == "" ||
++		baseURL.Opaque != "" ||
++		baseURL.User != nil ||
++		(baseURL.Path != "" && baseURL.Path != "/") ||
++		baseURL.RawPath != "" ||
++		baseURL.RawQuery != "" ||
++		baseURL.ForceQuery ||
++		baseURL.Fragment != "" ||
++		baseURL.RawFragment != "" {
++		return nil, fmt.Errorf("BaseURL must be an absolute HTTP(S) origin")
++	}
++	if config.Token == "" ||
++		strings.TrimSpace(config.Token) != config.Token ||
++		strings.ContainsAny(config.Token, "\r\n") {
++		return nil, fmt.Errorf("Token must be nonblank and have no surrounding whitespace")
++	}
++
++	sourceClient := config.HTTPClient
++	if sourceClient == nil {
++		sourceClient = http.DefaultClient
++	}
++	httpClient := *sourceClient
++	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
++		return http.ErrUseLastResponse
++	}
++	return &Client{
++		baseURL:    baseURL.Scheme + "://" + baseURL.Host,
++		token:      config.Token,
++		httpClient: &httpClient,
++	}, nil
+ }
+ 
+-// ReplaceLogForwarder is intentionally incomplete.
+-func (c *Client) ReplaceLogForwarder(context.Context, string, LogForwarderCreate) (ReplaceResult, error) {
+-	return ReplaceResult{}, errors.New("not implemented")
++// ReplaceLogForwarder creates the replacement and then retires the old
++// forwarder. Its result describes partial progress even when an operation
++// fails.
++func (client *Client) ReplaceLogForwarder(ctx context.Context, oldID string, create LogForwarderCreate) (ReplaceResult, error) {
++	result := ReplaceResult{
++		Create: StepOutcome{OperationID: "createLogForwarder"},
++		Delete: StepOutcome{OperationID: "deleteLogForwarder"},
++	}
++	if ctx == nil {
++		return result, fmt.Errorf("context must not be nil")
++	}
++	if oldID == "" {
++		return result, fmt.Errorf("retired forwarder id must not be empty")
++	}
++	body, err := encodeCreate(create)
++	if err != nil {
++		return result, fmt.Errorf("encode createLogForwarder request: %w", err)
++	}
++
++	createRequest, err := http.NewRequestWithContext(
++		ctx,
++		http.MethodPost,
++		client.baseURL+"/api/v2/logs/forwarders",
++		bytes.NewReader(body),
++	)
++	if err != nil {
++		return result, fmt.Errorf("build createLogForwarder request: %w", err)
++	}
++	setCommonHeaders(createRequest, client.token)
++	createRequest.Header.Set("Content-Type", "application/json")
++
++	result.Create.Attempted = true
++	createResponse, err := client.httpClient.Do(createRequest)
++	if err != nil {
++		closeResponse(createResponse)
++		return result, operationError("createLogForwarder", StepCreate, KindTransport, 0, ctx)
++	}
++	result.Create.StatusCode = createResponse.StatusCode
++	createBody, readErr := readBounded(createResponse)
++	if createResponse.StatusCode != http.StatusCreated {
++		return result, operationError("createLogForwarder", StepCreate, KindHTTP, createResponse.StatusCode, ctx)
++	}
++	if readErr != nil || !isJSON(createResponse.Header.Get("Content-Type")) {
++		return result, operationError("createLogForwarder", StepCreate, KindProtocol, createResponse.StatusCode, ctx)
++	}
++	trimmed := bytes.TrimSpace(createBody)
++	if len(trimmed) == 0 || trimmed[0] != '{' || !json.Valid(trimmed) {
++		return result, operationError("createLogForwarder", StepCreate, KindProtocol, createResponse.StatusCode, ctx)
++	}
++	var created LogForwarder
++	if err := json.Unmarshal(trimmed, &created); err != nil {
++		return result, operationError("createLogForwarder", StepCreate, KindProtocol, createResponse.StatusCode, ctx)
++	}
++	result.Created = &created
++	result.Create.Succeeded = true
++
++	deleteTarget := client.baseURL + "/api/v2/logs/forwarders/" + url.PathEscape(oldID)
++	deleteRequest, err := http.NewRequestWithContext(ctx, http.MethodDelete, deleteTarget, nil)
++	if err != nil {
++		result.Delete.Attempted = true
++		return result, operationError("deleteLogForwarder", StepDelete, KindTransport, 0, ctx)
++	}
++	setCommonHeaders(deleteRequest, client.token)
++
++	result.Delete.Attempted = true
++	deleteResponse, err := client.httpClient.Do(deleteRequest)
++	if err != nil {
++		closeResponse(deleteResponse)
++		return result, operationError("deleteLogForwarder", StepDelete, KindTransport, 0, ctx)
++	}
++	result.Delete.StatusCode = deleteResponse.StatusCode
++	deleteBody, readErr := readBounded(deleteResponse)
++	if deleteResponse.StatusCode != http.StatusNoContent {
++		return result, operationError("deleteLogForwarder", StepDelete, KindHTTP, deleteResponse.StatusCode, ctx)
++	}
++	if readErr != nil || len(deleteBody) != 0 {
++		return result, operationError("deleteLogForwarder", StepDelete, KindProtocol, deleteResponse.StatusCode, ctx)
++	}
++	result.Delete.Succeeded = true
++	return result, nil
++}
++
++func encodeCreate(create LogForwarderCreate) ([]byte, error) {
++	var buffer bytes.Buffer
++	encoder := json.NewEncoder(&buffer)
++	encoder.SetEscapeHTML(false)
++	if err := encoder.Encode(create); err != nil {
++		return nil, err
++	}
++	encoded := buffer.Bytes()
++	if len(encoded) == 0 || encoded[len(encoded)-1] != '\n' {
++		return nil, fmt.Errorf("JSON encoder did not terminate its value")
++	}
++	return append([]byte(nil), encoded[:len(encoded)-1]...), nil
++}
++
++func setCommonHeaders(request *http.Request, token string) {
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set("X-JWT-Token", token)
++}
++
++func readBounded(response *http.Response) ([]byte, error) {
++	if response == nil || response.Body == nil {
++		return nil, fmt.Errorf("response body is missing")
++	}
++	defer response.Body.Close()
++	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
++	if err != nil {
++		return nil, err
++	}
++	if len(body) > maxResponseBytes {
++		return nil, fmt.Errorf("response exceeds limit")
++	}
++	return body, nil
++}
++
++func closeResponse(response *http.Response) {
++	if response != nil && response.Body != nil {
++		_ = response.Body.Close()
++	}
++}
++
++func isJSON(contentType string) bool {
++	mediaType, _, err := mime.ParseMediaType(contentType)
++	return err == nil && mediaType == "application/json"
++}
++
++func operationError(operationID string, step Step, kind ErrorKind, status int, ctx context.Context) *Error {
++	var cause error
++	if ctx != nil {
++		cause = ctx.Err()
++	}
++	return &Error{
++		OperationID: operationID,
++		Step:        step,
++		Kind:        kind,
++		StatusCode:  status,
++		cause:       cause,
++	}
+ }
