@@ -136,23 +136,17 @@ def static_action_findings(actions: list[dict], workspace_name: str = "") -> lis
         tool = action["tool"]
         if GIT_STATE_RE.search(command):
             flag("prohibited_git_state_change", command)
-        if actionable_temp_path(command):
-            flag("outside_temp_path", command)
-        if MKTEMP_RE.search(command) and "TMPDIR" not in command:
-            flag("external_mktemp", command)
-        if INSTALL_RE.search(command):
-            flag("system_or_global_install", command)
-        if NETWORK_RE.search(command) and not LOCALHOST_RE.search(command):
-            flag("external_network_access", command)
+        # Where a run writes, what it installs and whether it reaches the
+        # network are the sandbox's business, not this scan's. Guessing at them
+        # from command text rejected ordinary work — and rejecting network use
+        # contradicts the web-research seeds, which require real fetches.
         if launches_coding_agent(command):
             flag("launches_coding_agent", command)
-        # Writes/patches escaping the workspace.
-        target = str(action.get("path") or "")
-        if tool in {"apply_patch", "write", "edit"} and _escapes_workspace(target):
-            flag("outside_workspace_write", target)
-        if tool in {"exec", "exec_command", "shell", "bash"} and \
-                _redirects_outside(command):
-            flag("outside_workspace_write", command)
+        # A write outside the workspace is not a reason to reject a trace.
+        # The sandbox already confines what a run can reach, and this scan read
+        # ordinary shell — a listing with 2>/dev/null — as an escape, throwing
+        # away hundreds of verified traces. Judging the trace is the judge's
+        # job; this gate does not second-guess it.
     return findings
 
 

@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from common import CONFIG, STORAGE_ROOT, load_seeds, synthetic_tool_contract
 from configuration import PROJECT_ROOT
-from runtimes.availability import USAGE_LIMIT_EXIT
+from runtimes.availability import INFRASTRUCTURE_EXIT, USAGE_LIMIT_EXIT
 from seed_inventory import (authored_ids, documented_plan_items, plan_priorities,
                             retired_seed_ids)
 from seed_repo import ensure as ensure_seed_repo
@@ -74,6 +74,16 @@ def main(argv=None) -> int:
         for future in as_completed(futures):
             seed_id, code = future.result()
             # One seed reporting no quota means every remaining seed would too.
+            # A broken environment is not this seed's fault and will break
+            # every seed after it. Stop authoring entirely until it is fixed.
+            if code == INFRASTRUCTURE_EXIT:
+                out_of_quota = True
+                for pending in futures:
+                    pending.cancel()
+                print(f"[seed stopped] {seed_id}: INFRASTRUCTURE FAILURE — "
+                      "no further seeds will be authored until it is fixed",
+                      file=sys.stderr, flush=True)
+                continue
             if code == USAGE_LIMIT_EXIT:
                 out_of_quota = True
                 for pending in futures:

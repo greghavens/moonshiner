@@ -561,7 +561,7 @@ def _start_default_queues() -> int:
     from common import CONFIG
     _ensure_configured_pi()
     from configuration import PROJECT_ROOT
-    from runtimes.availability import USAGE_LIMIT_EXIT, purge_legacy_markers
+    from runtimes.availability import INFRASTRUCTURE_EXIT, USAGE_LIMIT_EXIT, purge_legacy_markers
     # Starting the product is the point at which quota is re-tested for real.
     purge_legacy_markers()
     project_key = hashlib.sha256(str(PROJECT_ROOT).encode()).hexdigest()[:12]
@@ -593,7 +593,7 @@ def _start_default_queues() -> int:
                        f"--unit={unit}",
                        f"--property=WorkingDirectory={PROJECT_ROOT}",
                        "--property=Restart=always", "--property=RestartSec=10s",
-                       f"--property=RestartPreventExitStatus={USAGE_LIMIT_EXIT}",
+                       f"--property=RestartPreventExitStatus={USAGE_LIMIT_EXIT} {INFRASTRUCTURE_EXIT}",
                        f"--property=StandardOutput=append:{log_dir / 'run.log'}",
                        f"--property=StandardError=append:{log_dir / 'run.log'}",
                        *_memory_ceiling(), f"--setenv=PATH={os.environ.get('PATH', '')}",
@@ -613,7 +613,7 @@ def _start_default_queues() -> int:
             subprocess.run(["systemd-run", "--user", "--collect", f"--unit={unit}",
                             f"--property=WorkingDirectory={PROJECT_ROOT}",
                             "--property=Restart=always", "--property=RestartSec=10s",
-                            f"--property=RestartPreventExitStatus={USAGE_LIMIT_EXIT}",
+                            f"--property=RestartPreventExitStatus={USAGE_LIMIT_EXIT} {INFRASTRUCTURE_EXIT}",
                             f"--property=StandardOutput=append:{log_dir / 'run.log'}",
                             f"--property=StandardError=append:{log_dir / 'run.log'}",
                             *_memory_ceiling(), f"--setenv=PATH={os.environ.get('PATH', '')}",
@@ -747,14 +747,14 @@ def _service(argv: list[str]) -> int:
         subprocess.run(["systemctl", "--user", "reset-failed", f"{name}.service"])
         from common import RUNS
         from configuration import PROJECT_ROOT
-        from runtimes.availability import USAGE_LIMIT_EXIT
+        from runtimes.availability import INFRASTRUCTURE_EXIT, USAGE_LIMIT_EXIT
         log_dir = RUNS / "trace-continuous"
         log_dir.mkdir(parents=True, exist_ok=True)
         executable = Path(sys.executable).parent / "moonshiner"
         command = ["systemd-run", "--user", "--collect", f"--unit={name}",
                    f"--property=WorkingDirectory={PROJECT_ROOT}",
                    "--property=Restart=always", "--property=RestartSec=10s",
-                   f"--property=RestartPreventExitStatus={USAGE_LIMIT_EXIT}",
+                   f"--property=RestartPreventExitStatus={USAGE_LIMIT_EXIT} {INFRASTRUCTURE_EXIT}",
                    f"--property=StandardOutput=append:{log_dir / 'run.log'}",
                    f"--property=StandardError=append:{log_dir / 'run.log'}",
                    *_memory_ceiling(), f"--setenv=PATH={os.environ.get('PATH', '')}",

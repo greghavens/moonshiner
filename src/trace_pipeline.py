@@ -22,7 +22,8 @@ from run_state import (connect, create_run, finish_attempt, set_job,
                        set_run_status, start_attempt, run_row, job_rows,
                        abandon_claim, claim_job, renew_lease, record_model_call)
 from runtimes import get_judge, get_teacher
-from runtimes.availability import USAGE_LIMIT_EXIT, ModelUnavailable
+from runtimes.availability import (INFRASTRUCTURE_EXIT, USAGE_LIMIT_EXIT,
+                                   ModelUnavailable)
 from screen_traces import feedback_from_review, screen
 from reasoning_stepdown import (native_effort, next_reasoning_stage,
                                 reasoning_schedule, runtime_for_stage)
@@ -70,9 +71,15 @@ def remove_completed_workspace(record: dict) -> None:
     remove_workspace(Path(str(value)), workspaces=WORKSPACES)
 
 
+class InfrastructureFailure(RuntimeError):
+    """The environment is broken. Not this seed's fault, and not survivable."""
+
+
 def alert_infrastructure_failure(seed_id: str, reason: str) -> None:
-    print(f"[ALERT infrastructure failure] {seed_id}: {reason}",
-          file=sys.stderr, flush=True)
+    banner = "=" * 72
+    print(f"\n{banner}\n[INFRASTRUCTURE FAILURE] {seed_id}\n{reason}\n"
+          f"the queue is stopping; nothing else will be traced until this is "
+          f"fixed\n{banner}", file=sys.stderr, flush=True)
 
 
 def finish_infrastructure_failure(db, run_id, seed_id, number, review, usage=None, artifact=None):
@@ -80,6 +87,9 @@ def finish_infrastructure_failure(db, run_id, seed_id, number, review, usage=Non
     finish_attempt(db, run_id, seed_id, number, "infrastructure_error", usage, review, reason, artifact)
     set_job(db, run_id, seed_id, "infrastructure_blocked", number, reason)
     alert_infrastructure_failure(seed_id, reason)
+    # Marking one seed blocked and carrying on hid a broken environment for a
+    # day while every seed it touched was quietly skipped.
+    raise InfrastructureFailure(f"{seed_id}: {reason}")
 
 
 def _selected(args) -> list[dict]:
@@ -507,6 +517,12 @@ def main(argv: list[str] | None = None) -> int:
         for thread in threads.values(): thread.join()
         set_run_status(db, run_id, "interrupted", "keyboard interrupt")
         return 130
+    except InfrastructureFailure as broken:
+        stop_claiming.set()
+        for thread in threads.values(): thread.join()
+        set_run_status(db, run_id, "stopped", str(broken))
+        print(f"stopping: infrastructure failure: {broken}", file=sys.stderr)
+        return INFRASTRUCTURE_EXIT
     except ModelUnavailable as blocked:
         # Out of quota is a live condition, not a failure to retry against: stop
         # the run and let the next start find out whether quota has returned.

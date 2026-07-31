@@ -107,15 +107,21 @@ class TraceConcurrency(unittest.TestCase):
         output = io.StringIO()
         with mock.patch.object(trace_pipeline.sys, "stderr", output):
             trace_pipeline.alert_infrastructure_failure("task-a", "disk full")
-        self.assertEqual(output.getvalue(),
-                         "[ALERT infrastructure failure] task-a: disk full\n")
+        written = output.getvalue()
+        self.assertIn("[INFRASTRUCTURE FAILURE] task-a", written)
+        self.assertIn("disk full", written)
+        self.assertIn("the queue is stopping", written)
+        self.assertIn("=" * 72, written)
 
     def test_setup_failure_finishes_once_and_blocks_retry(self):
         db = connect(self.path)
         claim = claim_job(db, self.run_id, "worker")
         start_attempt(db, self.run_id, claim["seed_id"], 1)
         output = io.StringIO()
-        with mock.patch.object(trace_pipeline.sys, "stderr", output):
+        # A broken environment stops the run; it never blocks one seed and
+        # carries on, which hid a broken sandbox for a day.
+        with mock.patch.object(trace_pipeline.sys, "stderr", output), \
+             self.assertRaises(trace_pipeline.InfrastructureFailure):
             trace_pipeline.finish_infrastructure_failure(
                 db, self.run_id, claim["seed_id"], 1,
                 {"deterministic": {
@@ -126,9 +132,9 @@ class TraceConcurrency(unittest.TestCase):
         self.assertEqual(tuple(job), ("infrastructure_blocked", 1))
         self.assertNotEqual(claim_job(db, self.run_id, "replacement")["seed_id"],
                             claim["seed_id"])
-        self.assertEqual(output.getvalue(),
-                         f"[ALERT infrastructure failure] {claim['seed_id']}: "
-                         "- setup failed: DNS unavailable\n")
+        written = output.getvalue()
+        self.assertIn(f"[INFRASTRUCTURE FAILURE] {claim['seed_id']}", written)
+        self.assertIn("setup failed: DNS unavailable", written)
         db.close()
 
     def test_parallel_claims_are_unique(self):

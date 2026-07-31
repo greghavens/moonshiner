@@ -32,6 +32,13 @@ LIMIT_PHRASES = (
 # restart a queue that has nothing to spend.
 USAGE_LIMIT_EXIT = 75
 
+# Exit status used when a queue stops because its infrastructure is broken —
+# a missing prerequisite, an unusable environment. Listed alongside the usage
+# limit in RestartPreventExitStatus so the supervisor does not restart a queue
+# into the same wall. An infrastructure failure is never a seed's fault and is
+# never worked around silently: the run stops and says so.
+INFRASTRUCTURE_EXIT = 78
+
 
 class ModelUnavailable(RuntimeError):
     """Raised when a metered runtime reports it is out of quota."""
