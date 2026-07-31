@@ -1,0 +1,260 @@
+--- a/logforwarder/client.go
++++ b/logforwarder/client.go
+@@ -1,23 +1,250 @@
+ package logforwarder
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"io"
++	"mime"
++	"net/http"
++	"net/url"
++	"strings"
+ )
+ 
+-// ErrNotImplemented marks the implementation point for this exercise.
+-var ErrNotImplemented = errors.New("logforwarder client is not implemented")
++const maxResponseBody = 1 << 20
+ 
+ // Client executes the focused Log Management workflow.
+-type Client struct{}
++type Client struct {
++	baseURL    *url.URL
++	token      string
++	httpClient *http.Client
++}
+ 
+ // NewClient validates and constructs a client.
+-func NewClient(Config) (*Client, error) {
+-	return nil, ErrNotImplemented
++func NewClient(config Config) (*Client, error) {
++	if config.BaseURL == "" || config.BaseURL != strings.TrimSpace(config.BaseURL) {
++		return nil, errors.New("invalid base URL")
++	}
++	baseURL, err := url.Parse(config.BaseURL)
++	if err != nil ||
++		(baseURL.Scheme != "http" && baseURL.Scheme != "https") ||
++		baseURL.Host == "" ||
++		baseURL.Hostname() == "" ||
++		baseURL.User != nil ||
++		baseURL.Opaque != "" ||
++		(baseURL.Path != "" && baseURL.Path != "/") ||
++		baseURL.RawPath != "" ||
++		baseURL.RawQuery != "" ||
++		baseURL.ForceQuery ||
++		baseURL.Fragment != "" {
++		return nil, errors.New("invalid base URL")
++	}
++	if config.Token == "" ||
++		config.Token != strings.TrimSpace(config.Token) ||
++		strings.ContainsAny(config.Token, "\r\n") {
++		return nil, errors.New("invalid token")
++	}
++
++	selectedClient := config.HTTPClient
++	if selectedClient == nil {
++		selectedClient = http.DefaultClient
++	}
++	httpClient := *selectedClient
++	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
++		return http.ErrUseLastResponse
++	}
++
++	normalizedBaseURL := *baseURL
++	normalizedBaseURL.Path = ""
++	normalizedBaseURL.RawPath = ""
++	return &Client{
++		baseURL:    &normalizedBaseURL,
++		token:      config.Token,
++		httpClient: &httpClient,
++	}, nil
+ }
+ 
+ // PrecheckAndCreate tests the proposed forwarder connection and creates the
+ // forwarder only when that precheck succeeds.
+-func (c *Client) PrecheckAndCreate(context.Context, LogForwarderInput) (LogForwarder, error) {
+-	return LogForwarder{}, ErrNotImplemented
++func (c *Client) PrecheckAndCreate(ctx context.Context, input LogForwarderInput) (LogForwarder, error) {
++	if ctx == nil {
++		return LogForwarder{}, errors.New("nil context")
++	}
++	body, err := encodeInput(input)
++	if err != nil {
++		return LogForwarder{}, &OperationError{
++			OperationID: OperationTestLogForwarderConnection,
++			Kind:        KindProtocol,
++			cause:       err,
++		}
++	}
++
++	precheckResponse, err := c.post(
++		ctx,
++		OperationTestLogForwarderConnection,
++		"/api/v2/logs/forwarders/test",
++		body,
++	)
++	if err != nil {
++		return LogForwarder{}, err
++	}
++	if err := validatePrecheckResponse(precheckResponse); err != nil {
++		return LogForwarder{}, err
++	}
++
++	createResponse, err := c.post(
++		ctx,
++		OperationCreateLogForwarder,
++		"/api/v2/logs/forwarders",
++		body,
++	)
++	if err != nil {
++		return LogForwarder{}, err
++	}
++	return decodeCreateResponse(createResponse)
++}
++
++func encodeInput(input LogForwarderInput) ([]byte, error) {
++	var buffer bytes.Buffer
++	encoder := json.NewEncoder(&buffer)
++	encoder.SetEscapeHTML(false)
++	if err := encoder.Encode(input); err != nil {
++		return nil, err
++	}
++	encoded := buffer.Bytes()
++	if len(encoded) == 0 || encoded[len(encoded)-1] != '\n' {
++		return nil, errors.New("JSON encoder did not terminate its value")
++	}
++	return append([]byte(nil), encoded[:len(encoded)-1]...), nil
++}
++
++func (c *Client) post(ctx context.Context, operationID, path string, body []byte) (*http.Response, error) {
++	endpoint := *c.baseURL
++	endpoint.Path = path
++	endpoint.RawPath = ""
++	endpoint.RawQuery = ""
++	endpoint.ForceQuery = false
++	endpoint.Fragment = ""
++
++	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(body))
++	if err != nil {
++		return nil, &OperationError{
++			OperationID: operationID,
++			Kind:        KindProtocol,
++			cause:       err,
++		}
++	}
++	request.Header = make(http.Header)
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set("Content-Type", "application/json")
++	request.Header.Set("X-JWT-Token", c.token)
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		if response != nil && response.Body != nil {
++			_ = response.Body.Close()
++		}
++		return nil, &OperationError{
++			OperationID: operationID,
++			Kind:        KindTransport,
++			cause:       err,
++		}
++	}
++	return response, nil
++}
++
++func validatePrecheckResponse(response *http.Response) error {
++	defer response.Body.Close()
++	body, tooLarge, readErr := readResponse(response.Body)
++	if response.StatusCode != http.StatusOK {
++		return &OperationError{
++			OperationID: OperationTestLogForwarderConnection,
++			Kind:        KindHTTP,
++			StatusCode:  response.StatusCode,
++		}
++	}
++	if readErr != nil || tooLarge || len(body) != 0 {
++		return &OperationError{
++			OperationID: OperationTestLogForwarderConnection,
++			Kind:        KindProtocol,
++			cause:       readErr,
++		}
++	}
++	return nil
++}
++
++func decodeCreateResponse(response *http.Response) (LogForwarder, error) {
++	defer response.Body.Close()
++	body, tooLarge, readErr := readResponse(response.Body)
++	if response.StatusCode != http.StatusCreated {
++		return LogForwarder{}, &OperationError{
++			OperationID: OperationCreateLogForwarder,
++			Kind:        KindHTTP,
++			StatusCode:  response.StatusCode,
++		}
++	}
++	if readErr != nil || tooLarge {
++		return LogForwarder{}, &OperationError{
++			OperationID: OperationCreateLogForwarder,
++			Kind:        KindProtocol,
++			cause:       readErr,
++		}
++	}
++	mediaType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
++	if err != nil || mediaType != "application/json" {
++		return LogForwarder{}, &OperationError{
++			OperationID: OperationCreateLogForwarder,
++			Kind:        KindProtocol,
++			cause:       err,
++		}
++	}
++	trimmed := bytes.TrimSpace(body)
++	if len(trimmed) == 0 || trimmed[0] != '{' {
++		return LogForwarder{}, &OperationError{
++			OperationID: OperationCreateLogForwarder,
++			Kind:        KindProtocol,
++		}
++	}
++
++	var result LogForwarder
++	decoder := json.NewDecoder(bytes.NewReader(body))
++	decoder.DisallowUnknownFields()
++	if err := decoder.Decode(&result); err != nil {
++		return LogForwarder{}, &OperationError{
++			OperationID: OperationCreateLogForwarder,
++			Kind:        KindProtocol,
++			cause:       err,
++		}
++	}
++	if err := requireEOF(decoder); err != nil {
++		return LogForwarder{}, &OperationError{
++			OperationID: OperationCreateLogForwarder,
++			Kind:        KindProtocol,
++			cause:       err,
++		}
++	}
++	return result, nil
++}
++
++func readResponse(reader io.Reader) ([]byte, bool, error) {
++	body, err := io.ReadAll(io.LimitReader(reader, maxResponseBody+1))
++	if err != nil {
++		return nil, false, err
++	}
++	if len(body) > maxResponseBody {
++		return body[:maxResponseBody], true, nil
++	}
++	return body, false, nil
++}
++
++func requireEOF(decoder *json.Decoder) error {
++	var extra json.RawMessage
++	err := decoder.Decode(&extra)
++	if errors.Is(err, io.EOF) {
++		return nil
++	}
++	if err == nil {
++		return errors.New("response contains trailing JSON")
++	}
++	return err
+ }

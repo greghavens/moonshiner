@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3231 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3232 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 41 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 155 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 156 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -1834,6 +1834,7 @@
 - **vcf91-0183** (`go`) `#vcf-9-1` `#vcf-operations-logs` `#go` `#rest-contract` `#spec-derived` — Build a Go package named `vcfopslogs` at the module root for the VMware Cloud Foundation Operations 9.1 Log Management API. The protected `docs/contract.json` is a pruned, semantically equivalent O…
 - **vcf91-0184** (`go`) `#vcf-9-1` `#vcf-operations-logs` `#go` `#rest-contract` `#spec-derived` — Implement `logupdate/client.go` as a standard-library-only Go 1.22+ client for one retry-safe VMware Cloud Foundation 9.1 VCF Operations Log Management mutation. Read the protected `docs/contract.j…
 - **vcf91-0185** (`go`) `#vcf-9-1` `#vcf-operations-logs` `#go` `#rest-contract` `#spec-derived` — Implement `forwarderreplace/client.go` as a standard-library-only Go 1.22+ client for a two-step VMware Cloud Foundation 9.1 VCF Operations Log Management change. Read the protected `docs/contract.…
+- **vcf91-0186** (`go`) `#vcf-9-1` `#vcf-operations-logs` `#go` `#rest-contract` `#spec-derived` — Implement `logforwarder/client.go` as a standard-library-only Go 1.22+ client for one VMware Cloud Foundation 9.1 VCF Operations Log Management workflow: test a proposed log-forwarder connection, t…
 
 ## feature-io
 
