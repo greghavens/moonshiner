@@ -1,0 +1,302 @@
+diff --git a/vcf_log_forwarders/client.py b/vcf_log_forwarders/client.py
+--- a/vcf_log_forwarders/client.py
++++ b/vcf_log_forwarders/client.py
+@@ -2,8 +2,18 @@
+ 
+ from __future__ import annotations
+ 
+-from collections.abc import Iterable, Mapping
++import json
++import math
++from collections.abc import Collection, Iterable, Mapping
++from copy import deepcopy
+ from typing import Any, Callable
++from urllib.error import HTTPError
++from urllib.parse import urlsplit
++from urllib.request import (
++    HTTPRedirectHandler,
++    Request,
++    build_opener,
++)
+ 
+ 
+ class ApiError(RuntimeError):
+@@ -33,6 +43,19 @@ class TokenProviderError(ValueError):
+     """The access-token provider returned an unusable value."""
+ 
+ 
++class _NoRedirectHandler(HTTPRedirectHandler):
++    def redirect_request(
++        self,
++        req: Request,
++        fp: Any,
++        code: int,
++        msg: str,
++        headers: Any,
++        newurl: str,
++    ) -> None:
++        return None
++
++
+ class LogManagementClient:
+     """Client for the focused log-forwarder reconciliation contract."""
+ 
+@@ -60,20 +83,254 @@ class LogManagementClient:
+         *,
+         timeout: float = 10.0,
+     ) -> None:
+-        raise NotImplementedError
++        if not isinstance(base_url, str):
++            raise ValueError("base_url must be an HTTP(S) origin")
++        try:
++            parsed = urlsplit(base_url)
++            parsed_port = parsed.port
++        except ValueError as error:
++            raise ValueError("base_url must be an HTTP(S) origin") from error
++        if (
++            parsed.scheme.lower() not in {"http", "https"}
++            or not parsed.hostname
++            or parsed.username is not None
++            or parsed.password is not None
++            or parsed.path not in {"", "/"}
++            or parsed.query
++            or parsed.fragment
++            or "?" in base_url
++            or "#" in base_url
++            or (
++                parsed_port is None
++                and ":" in parsed.netloc.rsplit("]", 1)[-1]
++            )
++        ):
++            raise ValueError("base_url must be an HTTP(S) origin")
++        if not callable(access_token_provider):
++            raise TypeError("access_token_provider must be callable")
++        if (
++            isinstance(timeout, bool)
++            or not isinstance(timeout, (int, float))
++            or timeout <= 0
++            or not math.isfinite(timeout)
++        ):
++            raise ValueError("timeout must be a positive number")
++
++        self.base_url = f"{parsed.scheme.lower()}://{parsed.netloc}"
++        self.access_token_provider = access_token_provider
++        self.timeout = float(timeout)
++        self._access_token: str | None = None
++        self._opener = build_opener(_NoRedirectHandler())
+ 
+     def list_forwarders(self) -> list[dict[str, Any]]:
+         """Return the complete current log-forwarder collection."""
+-        raise NotImplementedError
++        payload = self._request("GET", expected_status=200)
++        if not isinstance(payload, list) or any(
++            not isinstance(item, dict) for item in payload
++        ):
++            raise ApiError(
++                200,
++                message="getAllLogForwarders returned malformed JSON",
++                payload=payload,
++            )
++        return payload
+ 
+     def create_forwarder(
+         self, forwarder: Mapping[str, Any]
+     ) -> dict[str, Any]:
+         """Create one schema-projected log forwarder."""
+-        raise NotImplementedError
++        projected = self._project_forwarder(forwarder)
++        payload = self._request("POST", projected, expected_status=201)
++        if (
++            not isinstance(payload, dict)
++            or payload.get("name") != projected["name"]
++        ):
++            raise ApiError(
++                201,
++                message="createLogForwarder returned malformed JSON",
++                payload=payload,
++            )
++        return payload
+ 
+     def reconcile_forwarders(
+         self, desired_forwarders: Iterable[Mapping[str, Any]]
+     ) -> list[dict[str, Any]]:
+         """Preserve existing forwarders and create missing names in input order."""
+-        raise NotImplementedError
++        desired = self._prepare_desired(desired_forwarders)
++        existing = self.list_forwarders()
++        reconciled = list(existing)
++        known_names = {
++            item["name"]
++            for item in existing
++            if isinstance(item.get("name"), str) and item["name"].strip()
++        }
++
++        for candidate in desired:
++            name = candidate["name"]
++            if name in known_names:
++                continue
++            created = self._create_projected(candidate)
++            reconciled.append(created)
++            known_names.add(name)
++        return reconciled
++
++    def _prepare_desired(
++        self, desired_forwarders: Iterable[Mapping[str, Any]]
++    ) -> list[dict[str, Any]]:
++        if isinstance(desired_forwarders, (Mapping, str, bytes, bytearray)):
++            raise TypeError("desired_forwarders must be an iterable of mappings")
++        try:
++            iterator = iter(desired_forwarders)
++        except TypeError as error:
++            raise TypeError(
++                "desired_forwarders must be an iterable of mappings"
++            ) from error
++
++        prepared: list[dict[str, Any]] = []
++        for item in iterator:
++            projected = self._project_forwarder(item)
++            self._encode_json(projected)
++            prepared.append(projected)
++        return prepared
++
++    def _project_forwarder(
++        self, forwarder: Mapping[str, Any]
++    ) -> dict[str, Any]:
++        if not isinstance(forwarder, Mapping):
++            raise TypeError("each desired forwarder must be a mapping")
++        name = forwarder.get("name")
++        if (
++            not isinstance(name, str)
++            or not name.strip()
++            or name != name.strip()
++        ):
++            raise ValueError(
++                "each desired forwarder needs a nonblank, unpadded name"
++            )
++
++        projected: dict[str, Any] = {}
++        for property_name in self.LOG_FORWARDER_PROPERTIES:
++            if property_name == "id" or property_name not in forwarder:
++                continue
++            value = forwarder[property_name]
++            if value is None or value == "":
++                continue
++            if (
++                isinstance(value, Collection)
++                and not isinstance(value, (str, bytes, bytearray))
++                and len(value) == 0
++            ):
++                continue
++            projected[property_name] = deepcopy(value)
++        return projected
++
++    def _create_projected(
++        self, projected: Mapping[str, Any]
++    ) -> dict[str, Any]:
++        payload = self._request("POST", projected, expected_status=201)
++        if (
++            not isinstance(payload, dict)
++            or payload.get("name") != projected["name"]
++        ):
++            raise ApiError(
++                201,
++                message="createLogForwarder returned malformed JSON",
++                payload=payload,
++            )
++        return payload
++
++    def _request(
++        self,
++        method: str,
++        payload: Mapping[str, Any] | None = None,
++        *,
++        expected_status: int,
++    ) -> Any:
++        body = None if payload is None else self._encode_json(payload)
++        for attempt in range(2):
++            token = self._current_token()
++            headers = {
++                "Accept": "application/json",
++                "X-JWT-Token": token,
++            }
++            if body is not None:
++                headers["Content-Type"] = "application/json"
++            request = Request(
++                f"{self.base_url}/api/v2/logs/forwarders",
++                data=body,
++                headers=headers,
++                method=method,
++            )
++            status, response_body = self._send(request)
++            if status in {401, 403} and attempt == 0:
++                self._access_token = self._provide_token(force_refresh=True)
++                continue
++            if status != expected_status:
++                raise self._api_error(status, response_body)
++            try:
++                return json.loads(response_body.decode("utf-8"))
++            except (UnicodeDecodeError, json.JSONDecodeError) as error:
++                raise ApiError(
++                    status,
++                    message="response body is not valid JSON",
++                    payload=None,
++                ) from error
++        raise AssertionError("unreachable authentication retry state")
++
++    def _send(self, request: Request) -> tuple[int, bytes]:
++        try:
++            with self._opener.open(request, timeout=self.timeout) as response:
++                return response.status, response.read()
++        except HTTPError as error:
++            with error:
++                return error.code, error.read()
++
++    def _current_token(self) -> str:
++        if self._access_token is None:
++            self._access_token = self._provide_token(force_refresh=False)
++        return self._access_token
++
++    def _provide_token(self, *, force_refresh: bool) -> str:
++        token = self.access_token_provider(force_refresh)
++        if (
++            not isinstance(token, str)
++            or not token.strip()
++            or "\r" in token
++            or "\n" in token
++        ):
++            raise TokenProviderError(
++                "access-token provider returned an invalid token"
++            )
++        return token
++
++    @staticmethod
++    def _encode_json(payload: Mapping[str, Any]) -> bytes:
++        try:
++            return json.dumps(
++                payload,
++                ensure_ascii=False,
++                separators=(",", ":"),
++            ).encode("utf-8")
++        except (TypeError, ValueError) as error:
++            raise ValueError("desired forwarder is not JSON serializable") from error
++
++    @staticmethod
++    def _api_error(status: int, raw_body: bytes) -> ApiError:
++        payload: Any = None
++        try:
++            payload = json.loads(raw_body.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            pass
++        error_code = None
++        message = None
++        if isinstance(payload, dict):
++            if isinstance(payload.get("errorCode"), str):
++                error_code = payload["errorCode"]
++            if isinstance(payload.get("errorMessage"), str):
++                message = payload["errorMessage"]
++        return ApiError(
++            status,
++            error_code=error_code,
++            message=message,
++            payload=payload,
++        )

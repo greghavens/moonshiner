@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3219 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3220 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 40 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 144 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 145 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -1822,6 +1822,7 @@
 - **vcf91-0171** (`powershell`) `#vcf-9-1` `#vcf-operations-logs` `#powershell` `#rest-contract` `#spec-derived` — Complete `VcfOpsLogCredential/VcfOpsLogCredential.psm1` as a PowerShell 7.4 module that rotates a VCF Operations for Logs ingestion credential without revoking the old secret while work that alread…
 - **vcf91-0172** (`powershell`) `#vcf-9-1` `#vcf-operations-logs` `#powershell` `#rest-contract` `#spec-derived` — Complete `VcfOpsLogDiagnosis/VcfOpsLogDiagnosis.psm1` as a PowerShell 7.4 module that diagnoses a failed VCF deployment operation from VCF Operations for Logs evidence. The failure request alone do…
 - **vcf91-0173** (`python`) `#vcf-9-1` `#vcf-operations-logs` `#python` `#rest-contract` `#spec-derived` — Implement the production code in `vcf_logs/` as a stdlib-only Python package for the pinned VCF Operations 9.1 Log Management contract in `docs/contract.json`. The source projection is from `specif…
+- **vcf91-0174** (`python`) `#vcf-9-1` `#vcf-operations-logs` `#python` `#rest-contract` `#spec-derived` — Complete `vcf_log_forwarders/client.py` as a standard-library-only Python package for VMware Cloud Foundation 9.1 VCF Operations Log Management. Read the protected `docs/contract.json` and `docs/of…
 
 ## feature-io
 
