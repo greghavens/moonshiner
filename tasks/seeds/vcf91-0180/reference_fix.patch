@@ -1,0 +1,372 @@
+diff --git a/vcf_ops_diagnosis/client.py b/vcf_ops_diagnosis/client.py
+--- a/vcf_ops_diagnosis/client.py
++++ b/vcf_ops_diagnosis/client.py
+@@ -1,4 +1,364 @@
+-"""Implementation target for the VCF Operations Log Management task."""
+-
+-# Complete this file.  The protected package __init__.py defines the public
+-# names that must remain importable.
++"""VCF Operations Log Management client and evidence-based diagnosis flow."""
++
++from __future__ import annotations
++
++import json
++import math
++import urllib.error
++import urllib.request
++from dataclasses import dataclass
++from urllib.parse import urlsplit
++
++
++class LogManagementError(RuntimeError):
++    """A safe client, transport, response, or evidence-contract failure."""
++
++
++@dataclass(frozen=True)
++class Evidence:
++    """One structured log record used in a diagnosis."""
++
++    event_type: str
++    timestamp: int
++    message: str
++
++
++@dataclass(frozen=True)
++class Diagnosis:
++    """Evidence-backed deployment failure diagnosis."""
++
++    status: str
++    request_id: str
++    correlation_id: str
++    cause: str
++    component: str
++    evidence: tuple[Evidence, ...]
++
++
++class _NoRedirect(urllib.request.HTTPRedirectHandler):
++    def redirect_request(self, req, fp, code, msg, headers, newurl):
++        return None
++
++
++class LogManagementClient:
++    """Client for the VCF Operations 9.1 Log Management search operation."""
++
++    def __init__(self, base_url, token, *, timeout=5.0):
++        if not isinstance(base_url, str):
++            raise TypeError("base_url must be a string")
++        parsed = urlsplit(base_url)
++        try:
++            port = parsed.port
++        except ValueError as exc:
++            raise ValueError("base_url must be a valid HTTP(S) origin") from exc
++        if (
++            parsed.scheme not in {"http", "https"}
++            or not parsed.netloc
++            or parsed.hostname is None
++            or parsed.username is not None
++            or parsed.password is not None
++            or parsed.path not in {"", "/"}
++            or parsed.query
++            or parsed.fragment
++            or any(character.isspace() for character in parsed.netloc)
++        ):
++            raise ValueError("base_url must be an absolute HTTP(S) origin")
++        if port is not None and not 0 < port < 65536:
++            raise ValueError("base_url port is out of range")
++        if (
++            not isinstance(token, str)
++            or not token
++            or token.strip() != token
++            or "\r" in token
++            or "\n" in token
++        ):
++            raise ValueError("token must be a nonblank header-safe string")
++        if (
++            isinstance(timeout, bool)
++            or not isinstance(timeout, (int, float))
++            or not math.isfinite(timeout)
++            or timeout <= 0
++        ):
++            raise ValueError("timeout must be a finite positive number")
++
++        self._base_url = base_url.rstrip("/")
++        self._token = token
++        self._timeout = float(timeout)
++        self._opener = urllib.request.build_opener(_NoRedirect())
++
++    def search(
++        self,
++        query,
++        *,
++        aggregations=None,
++        from_=None,
++        indices=None,
++        scroll=None,
++        scroll_size=None,
++        size=None,
++        sort=None,
++        track_total_hits=None,
++    ):
++        """Execute ``executeLogSearchQuery_1`` with spec-order omission."""
++        if not isinstance(query, dict):
++            raise TypeError("query must be a mapping")
++
++        values = (
++            ("aggregations", aggregations),
++            ("from", from_),
++            ("indices", indices),
++            ("query", query),
++            ("scroll", scroll),
++            ("scrollSize", scroll_size),
++            ("size", size),
++            ("sort", sort),
++            ("trackTotalHits", track_total_hits),
++        )
++        body = {name: value for name, value in values if value is not None}
++        try:
++            data = json.dumps(
++                body, ensure_ascii=False, separators=(",", ":")
++            ).encode("utf-8")
++        except (TypeError, ValueError) as exc:
++            raise LogManagementError(
++                "log search request is not JSON serializable"
++            ) from exc
++
++        request = urllib.request.Request(
++            self._base_url + "/api/v2/logs/search",
++            data=data,
++            headers={
++                "Accept": "application/json",
++                "Content-Type": "application/json",
++                "X-JWT-Token": self._token,
++            },
++            method="POST",
++        )
++        try:
++            with self._opener.open(request, timeout=self._timeout) as response:
++                status = response.status
++                raw = response.read()
++        except urllib.error.HTTPError as exc:
++            raw = exc.read()
++            status = exc.code
++            try:
++                payload = json.loads(raw.decode("utf-8"))
++            except (UnicodeDecodeError, json.JSONDecodeError):
++                payload = None
++            code = payload.get("errorCode") if isinstance(payload, dict) else None
++            message = (
++                payload.get("errorMessage") if isinstance(payload, dict) else None
++            )
++            parts = [f"log search failed with HTTP {status}"]
++            if isinstance(code, str) and code:
++                parts.append(f"({code})")
++            if isinstance(message, str) and message:
++                parts.append(": " + message.replace(self._token, "[redacted]"))
++            raise LogManagementError(" ".join(parts)) from None
++        except (urllib.error.URLError, OSError) as exc:
++            raise LogManagementError(
++                f"log search transport failure: {type(exc).__name__}"
++            ) from None
++
++        if status != 200:
++            raise LogManagementError(
++                f"log search returned unexpected HTTP status {status}"
++            )
++        try:
++            payload = json.loads(raw.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            raise LogManagementError(
++                "log search returned invalid JSON"
++            ) from None
++        if not isinstance(payload, dict):
++            raise LogManagementError(
++                "log search success must be a JSON object"
++            )
++        if payload.get("timedOut") is True:
++            raise LogManagementError("log search timed out")
++        if payload.get("failureReason"):
++            reason = payload["failureReason"]
++            if not isinstance(reason, str):
++                reason = "unknown"
++            raise LogManagementError(f"log search reported failure: {reason}")
++        return payload
++
++    def diagnose_deployment_failure(
++        self, request_id, start_time_ms, end_time_ms
++    ):
++        """Correlate a deployment failure log with its platform event."""
++        self._validate_diagnosis_input(
++            request_id, start_time_ms, end_time_ms
++        )
++        failure_query = self._evidence_query(
++            "request_id",
++            request_id,
++            "DEPLOYMENT_FAILED",
++            start_time_ms,
++            end_time_ms,
++        )
++        failure_response = self.search(
++            failure_query,
++            size=25,
++            sort=[{"timestamp": {"order": "asc"}}],
++            track_total_hits=False,
++        )
++        failure_hit, failure_fields = self._one_matching_hit(
++            failure_response,
++            {
++                "request_id": request_id,
++                "event_type": "DEPLOYMENT_FAILED",
++            },
++        )
++        correlation_id = failure_fields.get("correlation_id")
++        if (
++            not isinstance(correlation_id, str)
++            or not correlation_id.strip()
++        ):
++            raise LogManagementError(
++                "failure log has no structured correlation_id"
++            )
++
++        event_query = self._evidence_query(
++            "correlation_id",
++            correlation_id,
++            "CERTIFICATE_VALIDATION_FAILED",
++            start_time_ms,
++            end_time_ms,
++        )
++        event_response = self.search(
++            event_query,
++            size=25,
++            sort=[{"timestamp": {"order": "asc"}}],
++            track_total_hits=False,
++        )
++        event_hit, event_fields = self._one_matching_hit(
++            event_response,
++            {
++                "correlation_id": correlation_id,
++                "event_type": "CERTIFICATE_VALIDATION_FAILED",
++                "certificate_status": "EXPIRED",
++            },
++        )
++        component = event_fields.get("component")
++        if not isinstance(component, str) or not component.strip():
++            raise LogManagementError(
++                "correlated event has no structured component"
++            )
++
++        return Diagnosis(
++            status="diagnosed",
++            request_id=request_id,
++            correlation_id=correlation_id,
++            cause="certificate_expired",
++            component=component,
++            evidence=(
++                self._to_evidence(failure_hit, failure_fields),
++                self._to_evidence(event_hit, event_fields),
++            ),
++        )
++
++    @staticmethod
++    def _validate_diagnosis_input(request_id, start_time_ms, end_time_ms):
++        if (
++            not isinstance(request_id, str)
++            or not request_id
++            or request_id.strip() != request_id
++        ):
++            raise ValueError(
++                "request_id must be a nonblank string without outer whitespace"
++            )
++        if (
++            isinstance(start_time_ms, bool)
++            or not isinstance(start_time_ms, int)
++            or start_time_ms < 0
++        ):
++            raise ValueError("start_time_ms must be a nonnegative integer")
++        if (
++            isinstance(end_time_ms, bool)
++            or not isinstance(end_time_ms, int)
++            or end_time_ms <= start_time_ms
++        ):
++            raise ValueError(
++                "end_time_ms must be an integer greater than start_time_ms"
++            )
++
++    @staticmethod
++    def _evidence_query(identity_name, identity_value, event_type, start, end):
++        return {
++            "bool": {
++                "filter": [
++                    {"match_phrase": {identity_name: identity_value}},
++                    {"match_phrase": {"event_type": event_type}},
++                    {
++                        "range": {
++                            "timestamp": {
++                                "gte": str(start),
++                                "lte": str(end),
++                            }
++                        }
++                    },
++                ]
++            }
++        }
++
++    @classmethod
++    def _one_matching_hit(cls, response, expected):
++        events = response.get("events")
++        if not isinstance(events, dict) or not isinstance(events.get("hits"), list):
++            raise LogManagementError(
++                "log search response has no events.hits array"
++            )
++        matches = []
++        for candidate in events["hits"]:
++            fields = cls._structured_fields(candidate)
++            if all(fields.get(name) == value for name, value in expected.items()):
++                matches.append((candidate, fields))
++        if len(matches) != 1:
++            raise LogManagementError(
++                "log search did not return exactly one matching structured record"
++            )
++        return matches[0]
++
++    @staticmethod
++    def _structured_fields(hit):
++        if not isinstance(hit, dict):
++            raise LogManagementError("log hit must be an object")
++        content = hit.get("msgContent")
++        if not isinstance(content, dict):
++            raise LogManagementError("log hit has no msgContent object")
++        source_fields = content.get("fields")
++        if not isinstance(source_fields, list):
++            raise LogManagementError("log hit has no structured fields array")
++        fields = {}
++        for item in source_fields:
++            if not isinstance(item, dict):
++                raise LogManagementError("structured field must be an object")
++            name = item.get("internalName")
++            if not isinstance(name, str) or not name:
++                raise LogManagementError(
++                    "structured field has no internalName"
++                )
++            if name in fields:
++                raise LogManagementError(
++                    f"structured field {name!r} is ambiguous"
++                )
++            fields[name] = item.get("value")
++        return fields
++
++    @staticmethod
++    def _to_evidence(hit, fields):
++        content = hit["msgContent"]
++        timestamp = content.get("logTimestamp")
++        message = content.get("originalText")
++        event_type = fields.get("event_type")
++        if (
++            isinstance(timestamp, bool)
++            or not isinstance(timestamp, int)
++            or not isinstance(message, str)
++            or not isinstance(event_type, str)
++        ):
++            raise LogManagementError(
++                "matching log record has malformed evidence fields"
++            )
++        return Evidence(event_type, timestamp, message)

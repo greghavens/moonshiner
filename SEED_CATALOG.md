@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3224 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3226 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 40 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 149 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 151 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -1827,6 +1827,8 @@
 - **vcf91-0176** (`python`) `#vcf-9-1` `#vcf-operations-logs` `#python` `#rest-contract` `#spec-derived` — Implement the missing code in the stdlib-only `vcf_operations` package. Read the protected `docs/contract.json` and `docs/official_sources.json` first. The focused contract was derived directly fro…
 - **vcf91-0177** (`python`) `#vcf-9-1` `#vcf-operations-logs` `#python` `#rest-contract` `#spec-derived` — Implement the missing stdlib-only Python package in `vcf_log_forwarder/`. The package integrates with the VMware Cloud Foundation Operations 9.1 Log Management API contract pinned in `docs/contract…
 - **vcf91-0178** (`python`) `#vcf-9-1` `#vcf-operations-logs` `#python` `#rest-contract` `#spec-derived` — Complete `vcf_log_forwarder/client.py` as a Python 3.11+ standard-library-only package for one safe VMware Cloud Foundation Operations Log Management workflow: test a proposed log forwarder, then c…
+- **vcf91-0179** (`python`) `#vcf-9-1` `#vcf-operations-logs` `#python` `#rest-contract` `#spec-derived` — Implement `vcf_log_rotation/client.py` as a standard-library-only Python package for rotating VMware Cloud Foundation 9.1 Log Management agent secrets without invalidating an exchange that already…
+- **vcf91-0180** (`python`) `#vcf-9-1` `#vcf-operations-logs` `#python` `#rest-contract` `#spec-derived` — Complete `vcf_ops_diagnosis/client.py` as a standard-library-only Python package for VMware Cloud Foundation 9.1 VCF Operations Log Management. A VCF deployment request failed, but the request itse…
 
 ## feature-io
 
