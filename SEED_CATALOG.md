@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3210 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3211 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 40 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 135 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 136 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -1814,6 +1814,7 @@
 - **ts-okta-group-rules** (`ts`) — IT automation ticket. We keep group-rule definitions for the org in a reviewed desired-state file, but applying them is still a human clicking around the Admin Console, and last month someone fat-f…
 - **ts-salesforce-composite-tree** (`ts`) — CRM integrations pod. Our provisioning service already creates Salesforce record hierarchies through the sObject Tree endpoint (tree_client.ts — it works, leave its behavior alone), but sales ops k…
 - **ts-sap-cloud-integration-monitor** (`ts`) — Integration-ops ticket. Our SAP Cloud Integration tenant runs ~40 productive iflows and the on-call rotation still checks the Monitor UI by hand; last Saturday a FAILED spike on Replicate_Cost_Cent…
+- **vcf91-0165** (`powershell`) `#vcf-9-1` `#vcf-operations-logs` `#powershell` `#rest-contract` `#spec-derived` — Complete `VcfOpsLogSecret/VcfOpsLogSecret.psm1` as a PowerShell 7.4 module that creates an ingestion-agent secret in VCF Operations for Logs and waits until that asynchronous secret activation reac…
 
 ## feature-io
 
