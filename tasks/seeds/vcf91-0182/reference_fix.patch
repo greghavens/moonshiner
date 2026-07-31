@@ -1,0 +1,424 @@
+diff --git a/logforwarder/client.go b/logforwarder/client.go
+--- a/logforwarder/client.go
++++ b/logforwarder/client.go
+@@ -1,17 +1,413 @@
+ package logforwarder
+ 
+ import (
++	"bytes"
+ 	"context"
+-	"errors"
++	"encoding/json"
++	"fmt"
++	"io"
++	"mime"
++	"net/http"
++	"net/url"
++	"strings"
++	"sync"
+ )
+ 
+-// Client is implemented by the exercise.
+-type Client struct{}
++const maxResponseBytes = 64 << 10
+ 
+-func NewClient(Config) (*Client, error) {
+-	return nil, errors.New("not implemented")
++type Client struct {
++	baseURL       string
++	tokenProvider TokenProvider
++	httpClient    *http.Client
++
++	tokenMu          sync.Mutex
++	tokenInitialized bool
++	token            string
++}
++
++func NewClient(config Config) (*Client, error) {
++	baseURL, err := validateBaseURL(config.BaseURL)
++	if err != nil {
++		return nil, err
++	}
++	if config.TokenProvider == nil {
++		return nil, fmt.Errorf("TokenProvider is required")
++	}
++
++	selected := config.HTTPClient
++	if selected == nil {
++		selected = http.DefaultClient
++	}
++	httpClient := *selected
++	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
++		return http.ErrUseLastResponse
++	}
++	httpClient.Jar = nil
++
++	return &Client{
++		baseURL:       baseURL,
++		tokenProvider: config.TokenProvider,
++		httpClient:    &httpClient,
++	}, nil
++}
++
++func (c *Client) Reconcile(ctx context.Context, desired []DesiredForwarder) ([]Forwarder, error) {
++	if ctx == nil {
++		return nil, fmt.Errorf("context is required")
++	}
++
++	prepared := make([]preparedForwarder, len(desired))
++	for i := range desired {
++		body, err := prepareDesired(desired[i])
++		if err != nil {
++			return nil, fmt.Errorf("desired forwarder %d: %w", i, err)
++		}
++		prepared[i] = preparedForwarder{desired: desired[i], body: body}
++	}
++
++	response, err := c.invoke(
++		ctx,
++		GetAllLogForwardersOperation,
++		http.MethodGet,
++		nil,
++		http.StatusOK,
++	)
++	if err != nil {
++		return nil, err
++	}
++	existing, err := decodeForwarderList(response)
++	if err != nil {
++		return nil, err
++	}
++
++	result := append([]Forwarder(nil), existing...)
++	names := make(map[string]struct{}, len(existing)+len(prepared))
++	for _, forwarder := range existing {
++		if strings.TrimSpace(forwarder.Name) == "" {
++			return nil, &ProtocolError{
++				OperationID: GetAllLogForwardersOperation,
++				Problem:     "a forwarder name is blank",
++			}
++		}
++		if _, duplicate := names[forwarder.Name]; duplicate {
++			return nil, &ProtocolError{
++				OperationID: GetAllLogForwardersOperation,
++				Problem:     "forwarder names are not unique",
++			}
++		}
++		names[forwarder.Name] = struct{}{}
++	}
++
++	for _, item := range prepared {
++		if _, exists := names[item.desired.Name]; exists {
++			continue
++		}
++		response, err := c.invoke(
++			ctx,
++			CreateLogForwarderOperation,
++			http.MethodPost,
++			item.body,
++			http.StatusCreated,
++		)
++		if err != nil {
++			return nil, err
++		}
++		created, err := decodeCreatedForwarder(response, item.desired)
++		if err != nil {
++			return nil, err
++		}
++		result = append(result, created)
++		names[item.desired.Name] = struct{}{}
++	}
++	return result, nil
++}
++
++type preparedForwarder struct {
++	desired DesiredForwarder
++	body    []byte
++}
++
++type wireForwarder struct {
++	Certificate                *string           `json:"certificate,omitempty"`
++	ConnectionRefreshInterval  *int32            `json:"connectionRefreshInterval,omitempty"`
++	Constraints                map[string]any    `json:"constraints,omitempty"`
++	Enabled                    *bool             `json:"enabled,omitempty"`
++	ForwardComplementaryFields *bool             `json:"forwardComplementaryFields,omitempty"`
++	Host                       string            `json:"host"`
++	Name                       string            `json:"name"`
++	Port                       int32             `json:"port"`
++	Protocol                   string            `json:"protocol"`
++	SSLEnabled                 *bool             `json:"sslEnabled,omitempty"`
++	Tags                       map[string]string `json:"tags,omitempty"`
++	TransportProtocol          string            `json:"transportProtocol"`
++	WorkerCount                *int32            `json:"workerCount,omitempty"`
++}
++
++func prepareDesired(desired DesiredForwarder) ([]byte, error) {
++	if desired.Name == "" || strings.TrimSpace(desired.Name) != desired.Name {
++		return nil, fmt.Errorf("name must be nonblank without surrounding whitespace")
++	}
++	if desired.Host == "" || strings.TrimSpace(desired.Host) != desired.Host {
++		return nil, fmt.Errorf("host must be nonblank without surrounding whitespace")
++	}
++	if desired.Port < 1 || desired.Port > 65535 {
++		return nil, fmt.Errorf("port must be between 1 and 65535")
++	}
++	switch desired.Protocol {
++	case "SYSLOG", "RAW", "RAWPLUS":
++	default:
++		return nil, fmt.Errorf("protocol is not in the contract enum")
++	}
++	switch desired.TransportProtocol {
++	case "TCP", "UDP":
++	default:
++		return nil, fmt.Errorf("transport protocol is not in the contract enum")
++	}
++	for key, value := range desired.Tags {
++		if key == "" || value == "" {
++			return nil, fmt.Errorf("tag keys and values must be nonempty")
++		}
++	}
++
++	var certificate *string
++	if desired.Certificate != nil && *desired.Certificate != "" {
++		value := *desired.Certificate
++		certificate = &value
++	}
++	var constraints map[string]any
++	if len(desired.Constraints) != 0 {
++		constraints = desired.Constraints
++	}
++	var tags map[string]string
++	if len(desired.Tags) != 0 {
++		tags = desired.Tags
++	}
++
++	wire := wireForwarder{
++		Certificate:                certificate,
++		ConnectionRefreshInterval:  desired.ConnectionRefreshInterval,
++		Constraints:                constraints,
++		Enabled:                    desired.Enabled,
++		ForwardComplementaryFields: desired.ForwardComplementaryFields,
++		Host:                       desired.Host,
++		Name:                       desired.Name,
++		Port:                       desired.Port,
++		Protocol:                   desired.Protocol,
++		SSLEnabled:                 desired.SSLEnabled,
++		Tags:                       tags,
++		TransportProtocol:          desired.TransportProtocol,
++		WorkerCount:                desired.WorkerCount,
++	}
++	var buffer bytes.Buffer
++	encoder := json.NewEncoder(&buffer)
++	encoder.SetEscapeHTML(false)
++	if err := encoder.Encode(wire); err != nil {
++		return nil, fmt.Errorf("encode request")
++	}
++	body := buffer.Bytes()
++	if len(body) == 0 || body[len(body)-1] != '\n' {
++		return nil, fmt.Errorf("encode request")
++	}
++	return append([]byte(nil), body[:len(body)-1]...), nil
++}
++
++func validateBaseURL(raw string) (string, error) {
++	parsed, err := url.Parse(raw)
++	if err != nil {
++		return "", fmt.Errorf("BaseURL must be an HTTP(S) origin")
++	}
++	if parsed.Scheme != "http" && parsed.Scheme != "https" ||
++		parsed.Host == "" ||
++		parsed.User != nil ||
++		parsed.Opaque != "" ||
++		(parsed.Path != "" && parsed.Path != "/") ||
++		parsed.RawPath != "" ||
++		parsed.RawQuery != "" ||
++		parsed.ForceQuery ||
++		parsed.Fragment != "" {
++		return "", fmt.Errorf("BaseURL must be an HTTP(S) origin")
++	}
++	return parsed.Scheme + "://" + parsed.Host, nil
++}
++
++func validToken(token string) bool {
++	return token != "" &&
++		strings.TrimSpace(token) == token &&
++		!strings.ContainsAny(token, "\r\n")
++}
++
++func (c *Client) currentToken(ctx context.Context) (string, error) {
++	c.tokenMu.Lock()
++	defer c.tokenMu.Unlock()
++	if c.tokenInitialized {
++		return c.token, nil
++	}
++	token, err := c.tokenProvider(ctx, false)
++	if err != nil {
++		return "", &TokenProviderError{cause: err}
++	}
++	if !validToken(token) {
++		return "", &TokenProviderError{}
++	}
++	c.token = token
++	c.tokenInitialized = true
++	return token, nil
++}
++
++func (c *Client) refreshToken(ctx context.Context, failedToken string) (string, error) {
++	c.tokenMu.Lock()
++	defer c.tokenMu.Unlock()
++	if c.tokenInitialized && c.token != failedToken {
++		return c.token, nil
++	}
++	token, err := c.tokenProvider(ctx, true)
++	if err != nil {
++		return "", &TokenProviderError{cause: err}
++	}
++	if !validToken(token) {
++		return "", &TokenProviderError{}
++	}
++	c.token = token
++	c.tokenInitialized = true
++	return token, nil
++}
++
++type wireResponse struct {
++	status      int
++	contentType string
++	body        []byte
++	tooLarge    bool
++}
++
++func (c *Client) invoke(
++	ctx context.Context,
++	operationID string,
++	method string,
++	body []byte,
++	successStatus int,
++) ([]byte, error) {
++	token, err := c.currentToken(ctx)
++	if err != nil {
++		return nil, err
++	}
++	response, err := c.send(ctx, operationID, method, body, token)
++	if err != nil {
++		return nil, err
++	}
++	if response.status == http.StatusForbidden {
++		token, err = c.refreshToken(ctx, token)
++		if err != nil {
++			return nil, err
++		}
++		response, err = c.send(ctx, operationID, method, body, token)
++		if err != nil {
++			return nil, err
++		}
++	}
++	if response.status != successStatus {
++		return nil, &APIError{OperationID: operationID, StatusCode: response.status}
++	}
++	if response.tooLarge {
++		return nil, &ProtocolError{OperationID: operationID, Problem: "response exceeds 64 KiB"}
++	}
++	mediaType, _, err := mime.ParseMediaType(response.contentType)
++	if err != nil || strings.ToLower(mediaType) != "application/json" {
++		return nil, &ProtocolError{OperationID: operationID, Problem: "response is not JSON"}
++	}
++	return response.body, nil
++}
++
++func (c *Client) send(
++	ctx context.Context,
++	operationID string,
++	method string,
++	body []byte,
++	token string,
++) (wireResponse, error) {
++	var reader io.Reader
++	if body != nil {
++		reader = bytes.NewReader(body)
++	}
++	request, err := http.NewRequestWithContext(
++		ctx,
++		method,
++		c.baseURL+"/api/v2/logs/forwarders",
++		reader,
++	)
++	if err != nil {
++		return wireResponse{}, &APIError{OperationID: operationID}
++	}
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set("X-JWT-Token", token)
++	if body != nil {
++		request.Header.Set("Content-Type", "application/json")
++	}
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return wireResponse{}, &APIError{OperationID: operationID, cause: err}
++	}
++	defer response.Body.Close()
++
++	responseBody, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
++	if err != nil {
++		return wireResponse{}, &APIError{OperationID: operationID, cause: err}
++	}
++	tooLarge := len(responseBody) > maxResponseBytes
++	if tooLarge {
++		responseBody = responseBody[:maxResponseBytes]
++	}
++	return wireResponse{
++		status:      response.StatusCode,
++		contentType: response.Header.Get("Content-Type"),
++		body:        responseBody,
++		tooLarge:    tooLarge,
++	}, nil
++}
++
++func decodeForwarderList(body []byte) ([]Forwarder, error) {
++	trimmed := bytes.TrimSpace(body)
++	if len(trimmed) == 0 || trimmed[0] != '[' {
++		return nil, &ProtocolError{
++			OperationID: GetAllLogForwardersOperation,
++			Problem:     "success body is not an array",
++		}
++	}
++	var forwarders []Forwarder
++	if err := json.Unmarshal(trimmed, &forwarders); err != nil {
++		return nil, &ProtocolError{
++			OperationID: GetAllLogForwardersOperation,
++			Problem:     "success body is malformed JSON",
++		}
++	}
++	return forwarders, nil
+ }
+ 
+-func (c *Client) Reconcile(context.Context, []DesiredForwarder) ([]Forwarder, error) {
+-	return nil, errors.New("not implemented")
++func decodeCreatedForwarder(body []byte, desired DesiredForwarder) (Forwarder, error) {
++	trimmed := bytes.TrimSpace(body)
++	if len(trimmed) == 0 || trimmed[0] != '{' {
++		return Forwarder{}, &ProtocolError{
++			OperationID: CreateLogForwarderOperation,
++			Problem:     "success body is not an object",
++		}
++	}
++	var created Forwarder
++	if err := json.Unmarshal(trimmed, &created); err != nil {
++		return Forwarder{}, &ProtocolError{
++			OperationID: CreateLogForwarderOperation,
++			Problem:     "success body is malformed JSON",
++		}
++	}
++	if strings.TrimSpace(created.ID) == "" ||
++		created.Name != desired.Name ||
++		created.Host != desired.Host ||
++		created.Port != desired.Port ||
++		created.Protocol != desired.Protocol ||
++		created.TransportProtocol != desired.TransportProtocol {
++		return Forwarder{}, &ProtocolError{
++			OperationID: CreateLogForwarderOperation,
++			Problem:     "created forwarder does not match the request",
++		}
++	}
++	return created, nil
+ }

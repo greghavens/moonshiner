@@ -1,0 +1,471 @@
+diff --git a/logtask/client.go b/logtask/client.go
+--- a/logtask/client.go
++++ b/logtask/client.go
+@@ -1,4 +1,466 @@
+ // Package logtask polls VCF Operations Log Management state events.
+ package logtask
+ 
+-// TODO: implement NewClient and (*Client).WaitForOperation.
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"io"
++	"mime"
++	"net/http"
++	"net/url"
++	"strconv"
++	"strings"
++	"time"
++)
++
++const (
++	searchPath      = "/api/v2/logs/search"
++	maxResponseSize = 64 << 10
++)
++
++// Client is safe for concurrent use.
++type Client struct {
++	baseURL      string
++	token        string
++	httpClient   *http.Client
++	pollInterval time.Duration
++	maxPolls     int
++}
++
++// NewClient validates config without performing network traffic.
++func NewClient(config Config) (*Client, error) {
++	baseURL, err := validateOrigin(config.BaseURL)
++	if err != nil {
++		return nil, err
++	}
++	if config.Token == "" ||
++		strings.TrimSpace(config.Token) != config.Token ||
++		strings.ContainsAny(config.Token, "\r\n") {
++		return nil, errors.New("token must be a nonblank header-safe string")
++	}
++	if config.PollInterval < 0 {
++		return nil, errors.New("poll interval must be nonnegative")
++	}
++	if config.MaxPolls <= 0 {
++		return nil, errors.New("max polls must be positive")
++	}
++
++	var copied http.Client
++	if config.HTTPClient == nil {
++		copied = *http.DefaultClient
++	} else {
++		copied = *config.HTTPClient
++	}
++	copied.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
++		return http.ErrUseLastResponse
++	}
++
++	return &Client{
++		baseURL:      baseURL,
++		token:        config.Token,
++		httpClient:   &copied,
++		pollInterval: config.PollInterval,
++		maxPolls:     config.MaxPolls,
++	}, nil
++}
++
++// WaitForOperation polls structured state events until the operation reaches
++// SUCCEEDED, FAILED, or CANCELLED.
++func (client *Client) WaitForOperation(ctx context.Context, request WaitRequest) (Result, error) {
++	if ctx == nil {
++		return Result{}, errors.New("context must not be nil")
++	}
++	endTime, err := validateWaitRequest(request)
++	if err != nil {
++		return Result{}, err
++	}
++	if err := ctx.Err(); err != nil {
++		return Result{}, err
++	}
++
++	body, err := makeSearchBody(request.OperationID, request.StartTimeMS, endTime)
++	if err != nil {
++		return Result{}, &ProtocolError{
++			Operation: SearchOperationID,
++			Problem:   "cannot encode query request",
++		}
++	}
++
++	for poll := 1; poll <= client.maxPolls; poll++ {
++		event, found, err := client.searchOnce(ctx, body, request.OperationID)
++		if err != nil {
++			return Result{}, err
++		}
++		if found {
++			switch event.state {
++			case StateSucceeded:
++				return Result{
++					OperationID: request.OperationID,
++					State:       event.state,
++					Polls:       poll,
++					ObservedAt:  event.timestamp,
++					Message:     event.message,
++				}, nil
++			case StateFailed, StateCancelled:
++				return Result{}, &OperationFailedError{
++					OperationID: request.OperationID,
++					State:       event.state,
++					Polls:       poll,
++				}
++			case StateQueued, StateRunning, StateBlocked:
++				// A successful query is not proof that the operation completed.
++			default:
++				return Result{}, &ProtocolError{
++					Operation: SearchOperationID,
++					Problem:   "unknown operation_state",
++				}
++			}
++		}
++
++		if poll == client.maxPolls {
++			return Result{}, &PollTimeoutError{
++				OperationID: request.OperationID,
++				Polls:       poll,
++			}
++		}
++		if err := waitForNextPoll(ctx, client.pollInterval); err != nil {
++			return Result{}, err
++		}
++	}
++
++	panic("unreachable")
++}
++
++func validateOrigin(value string) (string, error) {
++	if value == "" || strings.TrimSpace(value) != value {
++		return "", errors.New("base URL must be an absolute HTTP(S) origin")
++	}
++	parsed, err := url.Parse(value)
++	if err != nil ||
++		(parsed.Scheme != "http" && parsed.Scheme != "https") ||
++		parsed.Host == "" ||
++		parsed.Hostname() == "" ||
++		parsed.User != nil ||
++		(parsed.Path != "" && parsed.Path != "/") ||
++		parsed.RawPath != "" ||
++		parsed.RawQuery != "" ||
++		parsed.ForceQuery ||
++		parsed.Fragment != "" ||
++		strings.ContainsAny(parsed.Host, " \t\r\n") {
++		return "", errors.New("base URL must be an absolute HTTP(S) origin")
++	}
++	if port := parsed.Port(); port != "" {
++		number, convertErr := strconv.Atoi(port)
++		if convertErr != nil || number < 1 || number > 65535 {
++			return "", errors.New("base URL must contain a valid port")
++		}
++	}
++	return strings.TrimSuffix(value, "/"), nil
++}
++
++func validateWaitRequest(request WaitRequest) (*int64, error) {
++	if request.OperationID == "" ||
++		strings.TrimSpace(request.OperationID) != request.OperationID ||
++		strings.ContainsAny(request.OperationID, "\r\n") {
++		return nil, errors.New("operation ID must be a nonblank string without surrounding whitespace")
++	}
++	if request.StartTimeMS < 0 {
++		return nil, errors.New("start time must be nonnegative")
++	}
++	if request.EndTimeMS == nil {
++		return nil, nil
++	}
++	end := *request.EndTimeMS
++	if end <= request.StartTimeMS {
++		return nil, errors.New("end time must be greater than start time")
++	}
++	return &end, nil
++}
++
++type queryRequest struct {
++	Aggregations   any           `json:"aggregations,omitempty"`
++	From           *int32        `json:"from,omitempty"`
++	Indices        []string      `json:"indices,omitempty"`
++	Query          queryClause   `json:"query"`
++	Scroll         *string       `json:"scroll,omitempty"`
++	ScrollSize     *int32        `json:"scrollSize,omitempty"`
++	Size           int32         `json:"size"`
++	Sort           []sortOptions `json:"sort"`
++	TrackTotalHits bool          `json:"trackTotalHits"`
++}
++
++type queryClause struct {
++	Bool        *boolQuery                 `json:"bool,omitempty"`
++	MatchPhrase map[string]string          `json:"match_phrase,omitempty"`
++	Range       map[string]rangeQueryValue `json:"range,omitempty"`
++}
++
++type boolQuery struct {
++	Filter []queryClause `json:"filter"`
++}
++
++type rangeQueryValue struct {
++	GT  *string `json:"gt,omitempty"`
++	GTE string  `json:"gte"`
++	LT  *string `json:"lt,omitempty"`
++	LTE *string `json:"lte,omitempty"`
++}
++
++type sortOptions struct {
++	Timestamp sortOrder `json:"timestamp"`
++}
++
++type sortOrder struct {
++	Order string `json:"order"`
++}
++
++func makeSearchBody(operationID string, startTime int64, endTime *int64) ([]byte, error) {
++	var lte *string
++	if endTime != nil {
++		value := strconv.FormatInt(*endTime, 10)
++		lte = &value
++	}
++	wire := queryRequest{
++		Query: queryClause{
++			Bool: &boolQuery{
++				Filter: []queryClause{
++					{MatchPhrase: map[string]string{"operation_id": operationID}},
++					{MatchPhrase: map[string]string{"event_type": StateEventType}},
++					{Range: map[string]rangeQueryValue{
++						"timestamp": {
++							GTE: strconv.FormatInt(startTime, 10),
++							LTE: lte,
++						},
++					}},
++				},
++			},
++		},
++		Size: 1,
++		Sort: []sortOptions{
++			{Timestamp: sortOrder{Order: "desc"}},
++		},
++		TrackTotalHits: false,
++	}
++	return marshalCompact(wire)
++}
++
++func marshalCompact(value any) ([]byte, error) {
++	var buffer bytes.Buffer
++	encoder := json.NewEncoder(&buffer)
++	encoder.SetEscapeHTML(false)
++	if err := encoder.Encode(value); err != nil {
++		return nil, err
++	}
++	data := buffer.Bytes()
++	if len(data) > 0 && data[len(data)-1] == '\n' {
++		data = data[:len(data)-1]
++	}
++	return append([]byte(nil), data...), nil
++}
++
++type queryResponse struct {
++	Events        *eventsResult `json:"events"`
++	FailureReason *string       `json:"failureReason"`
++	TimedOut      *bool         `json:"timedOut"`
++}
++
++type eventsResult struct {
++	Hits []logMessage `json:"hits"`
++}
++
++type logMessage struct {
++	Content *messageContent `json:"msgContent"`
++}
++
++type messageContent struct {
++	Fields       []fieldValue `json:"fields"`
++	LogTimestamp *int64       `json:"logTimestamp"`
++	OriginalText *string      `json:"originalText"`
++}
++
++type fieldValue struct {
++	InternalName string          `json:"internalName"`
++	Value        json.RawMessage `json:"value"`
++}
++
++type stateEvent struct {
++	state     OperationState
++	timestamp int64
++	message   string
++}
++
++func (client *Client) searchOnce(
++	ctx context.Context,
++	body []byte,
++	expectedOperationID string,
++) (stateEvent, bool, error) {
++	request, err := http.NewRequestWithContext(
++		ctx,
++		http.MethodPost,
++		client.baseURL+searchPath,
++		bytes.NewReader(body),
++	)
++	if err != nil {
++		return stateEvent{}, false, &APIError{Operation: SearchOperationID}
++	}
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set("Content-Type", "application/json")
++	request.Header.Set("X-JWT-Token", client.token)
++
++	response, err := client.httpClient.Do(request)
++	if err != nil {
++		if contextErr := ctx.Err(); contextErr != nil {
++			return stateEvent{}, false, contextErr
++		}
++		return stateEvent{}, false, &APIError{Operation: SearchOperationID}
++	}
++	defer response.Body.Close()
++
++	raw, readErr := io.ReadAll(io.LimitReader(response.Body, maxResponseSize+1))
++	if readErr != nil {
++		return stateEvent{}, false, &APIError{Operation: SearchOperationID}
++	}
++	if len(raw) > maxResponseSize {
++		return stateEvent{}, false, &ProtocolError{
++			Operation: SearchOperationID,
++			Problem:   "response exceeds 64 KiB",
++		}
++	}
++	if response.StatusCode != http.StatusOK {
++		return stateEvent{}, false, &APIError{
++			Operation:  SearchOperationID,
++			StatusCode: response.StatusCode,
++		}
++	}
++	mediaType, _, parseErr := mime.ParseMediaType(response.Header.Get("Content-Type"))
++	if parseErr != nil || mediaType != "application/json" {
++		return stateEvent{}, false, &ProtocolError{
++			Operation: SearchOperationID,
++			Problem:   "success response is not application/json",
++		}
++	}
++
++	var decoded queryResponse
++	if err := decodeJSONObject(raw, &decoded); err != nil {
++		return stateEvent{}, false, &ProtocolError{
++			Operation: SearchOperationID,
++			Problem:   "success response is not one JSON object",
++		}
++	}
++	if decoded.TimedOut != nil && *decoded.TimedOut {
++		return stateEvent{}, false, &ProtocolError{
++			Operation: SearchOperationID,
++			Problem:   "query reported timedOut",
++		}
++	}
++	if decoded.FailureReason != nil && *decoded.FailureReason != "" {
++		return stateEvent{}, false, &ProtocolError{
++			Operation: SearchOperationID,
++			Problem:   "query reported failureReason",
++		}
++	}
++	if decoded.Events == nil {
++		return stateEvent{}, false, &ProtocolError{
++			Operation: SearchOperationID,
++			Problem:   "events is missing",
++		}
++	}
++	if len(decoded.Events.Hits) == 0 {
++		return stateEvent{}, false, nil
++	}
++	if len(decoded.Events.Hits) != 1 {
++		return stateEvent{}, false, &ProtocolError{
++			Operation: SearchOperationID,
++			Problem:   "expected at most one event hit",
++		}
++	}
++	event, err := parseStateEvent(decoded.Events.Hits[0], expectedOperationID)
++	if err != nil {
++		return stateEvent{}, false, err
++	}
++	return event, true, nil
++}
++
++func decodeJSONObject(raw []byte, destination any) error {
++	trimmed := bytes.TrimSpace(raw)
++	if len(trimmed) == 0 || trimmed[0] != '{' {
++		return errors.New("not an object")
++	}
++	decoder := json.NewDecoder(bytes.NewReader(trimmed))
++	if err := decoder.Decode(destination); err != nil {
++		return err
++	}
++	var extra any
++	if err := decoder.Decode(&extra); err != io.EOF {
++		return errors.New("trailing JSON value")
++	}
++	return nil
++}
++
++func parseStateEvent(hit logMessage, expectedOperationID string) (stateEvent, error) {
++	if hit.Content == nil ||
++		hit.Content.LogTimestamp == nil ||
++		hit.Content.OriginalText == nil {
++		return stateEvent{}, &ProtocolError{
++			Operation: SearchOperationID,
++			Problem:   "event content is incomplete",
++		}
++	}
++
++	required := map[string]string{}
++	seen := map[string]bool{}
++	for _, field := range hit.Content.Fields {
++		switch field.InternalName {
++		case "operation_id", "event_type", "operation_state":
++			if seen[field.InternalName] {
++				return stateEvent{}, &ProtocolError{
++					Operation: SearchOperationID,
++					Problem:   "event contains a duplicate required field",
++				}
++			}
++			seen[field.InternalName] = true
++			var value string
++			if len(field.Value) == 0 || json.Unmarshal(field.Value, &value) != nil {
++				return stateEvent{}, &ProtocolError{
++					Operation: SearchOperationID,
++					Problem:   "required event field is not a string",
++				}
++			}
++			required[field.InternalName] = value
++		}
++	}
++	if required["operation_id"] != expectedOperationID ||
++		required["event_type"] != StateEventType ||
++		required["operation_state"] == "" {
++		return stateEvent{}, &ProtocolError{
++			Operation: SearchOperationID,
++			Problem:   "event fields do not match the requested operation",
++		}
++	}
++	return stateEvent{
++		state:     OperationState(required["operation_state"]),
++		timestamp: *hit.Content.LogTimestamp,
++		message:   *hit.Content.OriginalText,
++	}, nil
++}
++
++func waitForNextPoll(ctx context.Context, interval time.Duration) error {
++	if interval == 0 {
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		default:
++			return nil
++		}
++	}
++	timer := time.NewTimer(interval)
++	defer timer.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-timer.C:
++		return nil
++	}
++}
