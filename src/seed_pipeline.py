@@ -68,6 +68,35 @@ def _init_workspace(seed_id: str) -> Path:
     return workspace
 
 
+def _normalise_task(directory: Path) -> None:
+    """Translate a task written to the alternate schema, in place.
+
+    Authors occasionally emit ``instruction`` and a ``verification`` object
+    instead of ``prompt`` and ``verify_cmd``. Both describe the same seed, so
+    the difference is translated rather than treated as a defect: discarding
+    the candidate is never an option, and promoting it unrepaired puts a seed
+    in the corpus that the audit reports as partial.
+    """
+    task = directory / "task.json"
+    if not task.exists():
+        return
+    try:
+        data = json.loads(task.read_text())
+    except json.JSONDecodeError:
+        return
+    if "prompt" in data or "instruction" not in data:
+        return
+    verification = data.pop("verification", None) or {}
+    data["prompt"] = data.pop("instruction")
+    data.setdefault("verify_cmd", verification.get("command", ""))
+    if verification.get("timeout_seconds"):
+        data.setdefault("verify_timeout", int(verification["timeout_seconds"]))
+    protected = list(verification.get("protected_paths") or [])
+    if protected and not data.get("test_files"):
+        data["test_files"] = protected
+    task.write_text(json.dumps(data, indent=2) + "\n")
+
+
 def _load_candidate(directory: Path, expected_id: str) -> dict:
     task = directory / "task.json"
     if not task.exists(): raise ValueError("author did not create task.json")
@@ -150,6 +179,7 @@ def main(argv: list[str] | None = None) -> int:
                                or "seed author failed to complete")
         candidate.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(workspace, candidate, ignore=shutil.ignore_patterns(".git"))
+        _normalise_task(candidate)
         seed = _load_candidate(candidate, args.id)
         accepted = False
         for number in range(1, args.max_attempts + 1):

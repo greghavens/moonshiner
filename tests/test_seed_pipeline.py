@@ -77,5 +77,44 @@ class ASeedIsNeverDiscarded(unittest.TestCase):
                          "promotion must not sit behind an acceptance test")
 
 
+
+class AnAlternateTaskSchemaIsTranslated(unittest.TestCase):
+    """A seed must never reach the corpus in a shape the audit calls partial.
+
+    vcf91-0109 was authored with `instruction` and a `verification` object
+    rather than `prompt` and `verify_cmd`. Discarding it is not an option, so
+    the difference is translated before the judge ever sees the candidate.
+    """
+
+    def test_instruction_and_verification_become_prompt_and_verify_cmd(self):
+        import json, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = pathlib.Path(tmp)
+            (directory / "task.json").write_text(json.dumps({
+                "id": "vcf91-0109", "category": "project-integration",
+                "instruction": "Implement the vcenter package.",
+                "verification": {"command": "bash .moonshiner/verify/verify.sh",
+                                 "timeout_seconds": 120,
+                                 "protected_paths": [".moonshiner/verify"]}}))
+            seed_pipeline._normalise_task(directory)
+            data = json.loads((directory / "task.json").read_text())
+        self.assertEqual("Implement the vcenter package.", data["prompt"])
+        self.assertEqual("bash .moonshiner/verify/verify.sh", data["verify_cmd"])
+        self.assertEqual(120, data["verify_timeout"])
+        self.assertEqual([".moonshiner/verify"], data["test_files"])
+        self.assertNotIn("instruction", data)
+
+    def test_a_task_already_in_the_expected_shape_is_untouched(self):
+        import json, tempfile
+        original = {"id": "vcf91-0009", "prompt": "Do the thing",
+                    "verify_cmd": "pwsh -File t.ps1"}
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = pathlib.Path(tmp)
+            (directory / "task.json").write_text(json.dumps(original))
+            seed_pipeline._normalise_task(directory)
+            self.assertEqual(original,
+                             json.loads((directory / "task.json").read_text()))
+
+
 if __name__ == "__main__":
     unittest.main()
