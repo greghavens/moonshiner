@@ -1,0 +1,218 @@
+diff --git a/vcf_log_forwarder/client.py b/vcf_log_forwarder/client.py
+index e4a6d0d..55ce7dc 100644
+--- a/vcf_log_forwarder/client.py
++++ b/vcf_log_forwarder/client.py
+@@ -6,8 +6,43 @@ contract in docs/contract.json.
+ 
+ from __future__ import annotations
+ 
++import json
+ from dataclasses import dataclass
+ from typing import Any, Mapping
++from urllib.error import HTTPError
++from urllib.parse import quote
++from urllib.request import Request, urlopen
++
++
++_WIRE_FIELDS = (
++    ("name", "name"),
++    ("host", "host"),
++    ("port", "port"),
++    ("protocol", "protocol"),
++    ("transport_protocol", "transportProtocol"),
++    ("enabled", "enabled"),
++    ("ssl_enabled", "sslEnabled"),
++    ("certificate", "certificate"),
++    ("connection_refresh_interval", "connectionRefreshInterval"),
++    ("constraints", "constraints"),
++    ("forward_complementary_fields", "forwardComplementaryFields"),
++    ("tags", "tags"),
++    ("worker_count", "workerCount"),
++)
++_WRITABLE_WIRE_FIELDS = {wire_name for _, wire_name in _WIRE_FIELDS}
++_STRING_WIRE_FIELDS = {
++    "certificate",
++    "host",
++    "name",
++    "protocol",
++    "transportProtocol",
++}
++
++
++def _validate_nonempty_strings(payload: Mapping[str, Any]) -> None:
++    for name in _STRING_WIRE_FIELDS:
++        if name in payload and payload[name] == "":
++            raise ValueError(f"{name} must not be empty when supplied")
+ 
+ 
+ @dataclass(frozen=True)
+@@ -31,7 +66,13 @@ class ForwarderSpec:
+     def to_payload(self) -> dict[str, Any]:
+         """Return writable values under their contract-defined wire names."""
+ 
+-        raise NotImplementedError
++        payload = {
++            wire_name: value
++            for attribute, wire_name in _WIRE_FIELDS
++            if (value := getattr(self, attribute)) is not None
++        }
++        _validate_nonempty_strings(payload)
++        return payload
+ 
+ 
+ @dataclass(frozen=True)
+@@ -49,12 +90,81 @@ class VcfLogClient:
+     """Minimal client for the two operations selected in docs/contract.json."""
+ 
+     def __init__(self, base_url: str, token: str, timeout: float = 10.0):
+-        raise NotImplementedError
++        if not token:
++            raise ValueError("token must not be empty")
++        self._base_url = base_url.rstrip("/")
++        self._token = token
++        self._timeout = timeout
+ 
+     def create_log_forwarder(self, spec: ForwarderSpec) -> ApiResponse:
+-        raise NotImplementedError
++        return self._request(
++            "createLogForwarder",
++            "POST",
++            "/api/v2/logs/forwarders",
++            spec.to_payload(),
++        )
+ 
+     def patch_log_forwarder(
+         self, forwarder_id: str, changes: Mapping[str, Any]
+     ) -> ApiResponse:
+-        raise NotImplementedError
++        if not forwarder_id:
++            raise ValueError("forwarder_id must not be empty")
++        unknown = set(changes).difference(_WRITABLE_WIRE_FIELDS)
++        if unknown:
++            raise ValueError(f"unknown LogForwarder fields: {sorted(unknown)}")
++        payload = {name: value for name, value in changes.items() if value is not None}
++        if not payload:
++            raise ValueError("patch must contain at least one supplied field")
++        resource_id = quote(forwarder_id, safe="")
++        return self._request(
++            "patchLogForwarder",
++            "PATCH",
++            f"/api/v2/logs/forwarders/{resource_id}",
++            payload,
++        )
++
++    def _request(
++        self,
++        operation_id: str,
++        method: str,
++        path: str,
++        payload: Mapping[str, Any],
++    ) -> ApiResponse:
++        data = json.dumps(
++            payload, ensure_ascii=False, separators=(",", ":")
++        ).encode("utf-8")
++        request = Request(
++            self._base_url + path,
++            data=data,
++            method=method,
++            headers={
++                "Accept": "application/json",
++                "Content-Type": "application/json",
++                "X-JWT-Token": self._token,
++            },
++        )
++        try:
++            response = urlopen(request, timeout=self._timeout)
++        except HTTPError as error:
++            raw_body = error.read()
++            return ApiResponse(
++                operation_id=operation_id,
++                status=error.code,
++                body=self._decode_body(raw_body),
++            )
++        with response:
++            raw_body = response.read()
++            return ApiResponse(
++                operation_id=operation_id,
++                status=response.status,
++                body=self._decode_body(raw_body),
++            )
++
++    @staticmethod
++    def _decode_body(raw_body: bytes) -> Any:
++        if not raw_body:
++            return None
++        try:
++            return json.loads(raw_body.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            return raw_body.decode("utf-8", errors="replace")
+diff --git a/vcf_log_forwarder/rollout.py b/vcf_log_forwarder/rollout.py
+index caed61a..4ef8276 100644
+--- a/vcf_log_forwarder/rollout.py
++++ b/vcf_log_forwarder/rollout.py
+@@ -32,4 +32,64 @@ def rollout_forwarder_pair(
+ ) -> dict[str, Any]:
+     """Create and enable primary, then create and enable secondary."""
+ 
+-    raise NotImplementedError
++    steps: list[dict[str, Any]] = []
++
++    def target_name(spec: ForwarderSpec) -> str | None:
++        return spec.name
++
++    def record(
++        response: ApiResponse,
++        target: str | None,
++    ) -> bool:
++        step: dict[str, Any] = {
++            "operationId": response.operation_id,
++            "target": target,
++            "status": "succeeded" if response.ok else "failed",
++            "httpStatus": response.status,
++        }
++        if response.ok:
++            if isinstance(response.body, dict):
++                resource_id = response.body.get("id")
++                if isinstance(resource_id, str):
++                    step["resourceId"] = resource_id
++        else:
++            step["error"] = response.body
++        steps.append(step)
++        return response.ok
++
++    def failure_report() -> dict[str, Any]:
++        successes = sum(step["status"] == "succeeded" for step in steps)
++        return {
++            "outcome": "partial_failure" if successes else "failed",
++            "steps": steps,
++        }
++
++    primary_create = client.create_log_forwarder(primary)
++    if not record(primary_create, target_name(primary)):
++        return failure_report()
++    primary_id = _response_id(primary_create)
++
++    primary_enable = client.patch_log_forwarder(primary_id, {"enabled": True})
++    if not record(primary_enable, target_name(primary)):
++        return failure_report()
++
++    secondary_create = client.create_log_forwarder(secondary)
++    if not record(secondary_create, target_name(secondary)):
++        return failure_report()
++    secondary_id = _response_id(secondary_create)
++
++    secondary_enable = client.patch_log_forwarder(secondary_id, {"enabled": True})
++    if not record(secondary_enable, target_name(secondary)):
++        return failure_report()
++
++    return {"outcome": "succeeded", "steps": steps}
++
++
++def _response_id(response: ApiResponse) -> str:
++    if isinstance(response.body, dict):
++        resource_id = response.body.get("id")
++        if isinstance(resource_id, str) and resource_id:
++            return resource_id
++    raise ValueError(
++        f"{response.operation_id} succeeded without a non-empty resource id"
++    )

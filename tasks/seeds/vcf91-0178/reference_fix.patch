@@ -1,0 +1,201 @@
+--- a/vcf_log_forwarder/client.py
++++ b/vcf_log_forwarder/client.py
+@@ -2,7 +2,12 @@
+ 
+ from __future__ import annotations
+ 
++import http.client
++import json
++import math
++import numbers
+ from dataclasses import dataclass
++from urllib.parse import urlsplit
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -49,6 +54,8 @@
+ class LogManagementClient:
+     """Create a log forwarder only after its connection precheck passes."""
+ 
++    _MAX_RESPONSE_BYTES = 1024 * 1024
++
+     def __init__(
+         self,
+         base_url: str,
+@@ -56,10 +63,174 @@
+         *,
+         timeout: float = 10.0,
+     ) -> None:
+-        raise NotImplementedError("TODO: validate and initialize the client")
++        if (
++            not isinstance(base_url, str)
++            or not base_url
++            or any(character.isspace() for character in base_url)
++        ):
++            raise ValueError("base_url must be an HTTP(S) origin")
++        try:
++            origin = urlsplit(base_url)
++            port = origin.port
++        except ValueError as error:
++            raise ValueError("base_url must be an HTTP(S) origin") from error
++        if (
++            origin.scheme not in {"http", "https"}
++            or not origin.netloc
++            or origin.hostname is None
++            or origin.username is not None
++            or origin.password is not None
++            or origin.path not in {"", "/"}
++            or origin.query
++            or origin.fragment
++        ):
++            raise ValueError("base_url must be an HTTP(S) origin")
++        if (
++            not isinstance(log_token, str)
++            or not log_token.strip()
++            or "\r" in log_token
++            or "\n" in log_token
++        ):
++            raise ValueError("log_token must be nonblank and header-safe")
++        if (
++            isinstance(timeout, bool)
++            or not isinstance(timeout, numbers.Real)
++            or not math.isfinite(float(timeout))
++            or timeout <= 0
++        ):
++            raise ValueError("timeout must be a finite positive real number")
++
++        self._origin = origin
++        self._host = origin.hostname
++        self._port = port
++        self._log_token = log_token
++        self._timeout = float(timeout)
+ 
+     def create_after_precheck(
+         self,
+         forwarder: ForwarderConfig,
+     ) -> CreateResult:
+-        raise NotImplementedError("TODO: implement the gated workflow")
++        self._validate_forwarder(forwarder)
++        document = {
++            "enabled": forwarder.enabled,
++            "host": forwarder.host,
++            "name": forwarder.name,
++            "port": forwarder.port,
++            "protocol": forwarder.protocol,
++            "sslEnabled": forwarder.ssl_enabled,
++            "transportProtocol": forwarder.transport_protocol,
++        }
++        body = json.dumps(
++            document,
++            ensure_ascii=False,
++            separators=(",", ":"),
++        ).encode("utf-8")
++
++        status, _headers, _response_body = self._request(
++            "/api/v2/logs/forwarders/test",
++            body,
++        )
++        if status != 200:
++            raise PrecheckFailed("testLogForwarderConnection", status)
++
++        status, headers, response_body = self._request(
++            "/api/v2/logs/forwarders",
++            body,
++        )
++        if status != 201:
++            raise ApiError("createLogForwarder", status)
++        media_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()
++        if media_type != "application/json":
++            raise ProtocolError("createLogForwarder returned an unexpected media type")
++        try:
++            response = json.loads(response_body.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            raise ProtocolError("createLogForwarder returned malformed JSON") from None
++        if not isinstance(response, dict):
++            raise ProtocolError("createLogForwarder returned a non-object response")
++        identifier = response.get("id")
++        if (
++            not isinstance(identifier, str)
++            or not identifier
++            or identifier != identifier.strip()
++        ):
++            raise ProtocolError("createLogForwarder returned an invalid id")
++        for name, value in document.items():
++            if type(response.get(name)) is not type(value) or response.get(name) != value:
++                raise ProtocolError("createLogForwarder returned inconsistent data")
++        return CreateResult(
++            created=True,
++            operation_id="createLogForwarder",
++            id=identifier,
++        )
++
++    @staticmethod
++    def _validate_forwarder(forwarder: ForwarderConfig) -> None:
++        if not isinstance(forwarder, ForwarderConfig):
++            raise TypeError("forwarder must be a ForwarderConfig")
++        for name, value in (
++            ("name", forwarder.name),
++            ("host", forwarder.host),
++        ):
++            if (
++                not isinstance(value, str)
++                or not value
++                or value != value.strip()
++            ):
++                raise ValueError(f"{name} must be nonblank without surrounding whitespace")
++        if (
++            isinstance(forwarder.port, bool)
++            or not isinstance(forwarder.port, int)
++            or not 1 <= forwarder.port <= 65535
++        ):
++            raise ValueError("port must be an integer in 1..65535")
++        if forwarder.protocol not in {"SYSLOG", "RAW", "RAWPLUS"}:
++            raise ValueError("protocol is not supported")
++        if forwarder.transport_protocol not in {"TCP", "UDP"}:
++            raise ValueError("transport_protocol is not supported")
++        if not isinstance(forwarder.ssl_enabled, bool):
++            raise TypeError("ssl_enabled must be bool")
++        if not isinstance(forwarder.enabled, bool):
++            raise TypeError("enabled must be bool")
++
++    def _request(
++        self,
++        path: str,
++        body: bytes,
++    ) -> tuple[int, dict[str, str], bytes]:
++        connection_type: type[http.client.HTTPConnection]
++        if self._origin.scheme == "https":
++            connection_type = http.client.HTTPSConnection
++        else:
++            connection_type = http.client.HTTPConnection
++        connection = connection_type(
++            self._host,
++            self._port,
++            timeout=self._timeout,
++        )
++        try:
++            connection.request(
++                "POST",
++                path,
++                body=body,
++                headers={
++                    "Accept": "application/json",
++                    "Content-Type": "application/json",
++                    "X-JWT-Token": self._log_token,
++                },
++            )
++            response = connection.getresponse()
++            response_body = response.read(self._MAX_RESPONSE_BYTES + 1)
++            if len(response_body) > self._MAX_RESPONSE_BYTES:
++                raise ProtocolError("operation returned an oversized response")
++            headers = {
++                name.lower(): value
++                for name, value in response.getheaders()
++            }
++            return response.status, headers, response_body
++        except LogManagementError:
++            raise
++        except (OSError, http.client.HTTPException):
++            raise LogManagementError("Log Management request failed") from None
++        finally:
++            connection.close()
