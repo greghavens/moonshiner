@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3221 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3222 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 40 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 146 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 147 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -1824,6 +1824,7 @@
 - **vcf91-0173** (`python`) `#vcf-9-1` `#vcf-operations-logs` `#python` `#rest-contract` `#spec-derived` — Implement the production code in `vcf_logs/` as a stdlib-only Python package for the pinned VCF Operations 9.1 Log Management contract in `docs/contract.json`. The source projection is from `specif…
 - **vcf91-0174** (`python`) `#vcf-9-1` `#vcf-operations-logs` `#python` `#rest-contract` `#spec-derived` — Complete `vcf_log_forwarders/client.py` as a standard-library-only Python package for VMware Cloud Foundation 9.1 VCF Operations Log Management. Read the protected `docs/contract.json` and `docs/of…
 - **vcf91-0175** (`python`) `#vcf-9-1` `#vcf-operations-logs` `#python` `#rest-contract` `#spec-derived` — Complete `vcf_ops_logs/client.py` as a standard-library-only Python package for VMware Cloud Foundation 9.1 VCF Operations Log Management. Read the protected `docs/contract.json` and `docs/official…
+- **vcf91-0176** (`python`) `#vcf-9-1` `#vcf-operations-logs` `#python` `#rest-contract` `#spec-derived` — Implement the missing code in the stdlib-only `vcf_operations` package. Read the protected `docs/contract.json` and `docs/official_sources.json` first. The focused contract was derived directly fro…
 
 ## feature-io
 
