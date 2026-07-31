@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3216 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3217 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 40 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 141 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 142 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -1819,6 +1819,7 @@
 - **vcf91-0168** (`powershell`) `#vcf-9-1` `#vcf-operations-logs` `#powershell` `#rest-contract` `#spec-derived` — Complete `VcfOpsLogForwarder/VcfOpsLogForwarder.psm1` as a PowerShell 7.4 module that idempotently ensures one named VCF Operations for Logs forwarder exists. A retry with the same desired configur…
 - **vcf91-0169** (`powershell`) `#vcf-9-1` `#vcf-operations-logs` `#powershell` `#rest-contract` `#spec-derived` — Complete `VcfOpsLogRouting/VcfOpsLogRouting.psm1` as a PowerShell 7.4 module for a non-transactional VCF Operations for Logs routing change. The workflow patches an agent group, patches a log forwa…
 - **vcf91-0170** (`powershell`) `#vcf-9-1` `#vcf-operations-logs` `#powershell` `#rest-contract` `#spec-derived` — Complete `VcfOpsLogForwarder/VcfOpsLogForwarder.psm1` as a PowerShell 7.4 module that safely creates a VCF Operations Log Management forwarder only when its name is absent. Read the protected `docs…
+- **vcf91-0172** (`powershell`) `#vcf-9-1` `#vcf-operations-logs` `#powershell` `#rest-contract` `#spec-derived` — Complete `VcfOpsLogDiagnosis/VcfOpsLogDiagnosis.psm1` as a PowerShell 7.4 module that diagnoses a failed VCF deployment operation from VCF Operations for Logs evidence. The failure request alone do…
 
 ## feature-io
 
