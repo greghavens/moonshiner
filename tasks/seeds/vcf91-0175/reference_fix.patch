@@ -1,0 +1,313 @@
+diff --git a/vcf_ops_logs/client.py b/vcf_ops_logs/client.py
+--- a/vcf_ops_logs/client.py
++++ b/vcf_ops_logs/client.py
+@@ -2,7 +2,14 @@
+ 
+ from __future__ import annotations
+ 
++import json
++import math
++from collections.abc import Mapping
+ from dataclasses import dataclass
++from typing import Any
++from urllib.error import HTTPError, URLError
++from urllib.parse import urlsplit
++from urllib.request import HTTPRedirectHandler, Request, build_opener
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -18,11 +25,30 @@
+ class ApiError(RuntimeError):
+     """An HTTP or transport failure from the focused Log Management API."""
+ 
++    def __init__(self, status_code: int, message: str) -> None:
++        self.status_code = status_code
++        super().__init__(
++            f"VCF Log Management request failed ({status_code}): {message}"
++        )
++
+ 
+ class ResponseContractError(RuntimeError):
+     """A successful response did not match the focused contract."""
+ 
+ 
++class _NoRedirectHandler(HTTPRedirectHandler):
++    def redirect_request(
++        self,
++        req: Request,
++        fp: Any,
++        code: int,
++        msg: str,
++        headers: Any,
++        newurl: str,
++    ) -> None:
++        return None
++
++
+ class LogManagementClient:
+     """Client for ``getAllAgentGroupConfig``."""
+ 
+@@ -33,9 +59,45 @@
+         *,
+         timeout: float = 5.0,
+     ) -> None:
+-        self.base_url = base_url
++        if not isinstance(base_url, str):
++            raise TypeError("base_url must be an HTTP(S) origin")
++        try:
++            parsed = urlsplit(base_url)
++            parsed_port = parsed.port
++        except ValueError as error:
++            raise ValueError("base_url must be an HTTP(S) origin") from error
++        if (
++            parsed.scheme.lower() not in {"http", "https"}
++            or not parsed.hostname
++            or parsed.username is not None
++            or parsed.password is not None
++            or parsed.path not in {"", "/"}
++            or parsed.query
++            or parsed.fragment
++            or "\r" in base_url
++            or "\n" in base_url
++            or (
++                parsed_port is None
++                and ":" in parsed.netloc.rsplit("]", 1)[-1]
++            )
++        ):
++            raise ValueError("base_url must be an HTTP(S) origin")
++        if not isinstance(token, str):
++            raise TypeError("token must be a string")
++        if not token.strip() or "\r" in token or "\n" in token:
++            raise ValueError("token must be nonblank and CR/LF-free")
++        if (
++            isinstance(timeout, bool)
++            or not isinstance(timeout, (int, float))
++            or not math.isfinite(timeout)
++            or timeout <= 0
++        ):
++            raise ValueError("timeout must be a finite positive number")
++
++        self.base_url = f"{parsed.scheme.lower()}://{parsed.netloc}"
+         self.token = token
+-        self.timeout = timeout
++        self.timeout = float(timeout)
++        self._opener = build_opener(_NoRedirectHandler())
+ 
+     def list_all_agent_groups(
+         self,
+@@ -43,4 +105,214 @@
+         page_size: int = 100,
+     ) -> list[AgentGroup]:
+         """Return the complete agent-group collection in stable order."""
+-        raise NotImplementedError
++        if (
++            isinstance(page_size, bool)
++            or not isinstance(page_size, int)
++            or not 1 <= page_size <= 1000
++        ):
++            raise ValueError("page_size must be an integer from 1 through 1000")
++
++        groups: list[AgentGroup] = []
++        seen_ids: set[str] = set()
++        expected_total_elements: int | None = None
++        expected_total_pages: int | None = None
++        page_number = 0
++
++        while True:
++            payload = self._get_page(page_number, page_size)
++            page = self._page_object(payload)
++            content = page.get("content")
++            if not isinstance(content, list):
++                raise ResponseContractError("Page.content must be an array")
++
++            actual_number = self._integer(page, "number", minimum=0)
++            actual_size = self._integer(page, "size", minimum=1)
++            number_of_elements = self._integer(
++                page, "numberOfElements", minimum=0
++            )
++            total_elements = self._integer(
++                page, "totalElements", minimum=0
++            )
++            total_pages = self._integer(page, "totalPages", minimum=0)
++            first = self._boolean(page, "first")
++            last = self._boolean(page, "last")
++            empty = self._boolean(page, "empty")
++
++            if actual_number != page_number:
++                raise ResponseContractError(
++                    "Page.number does not match the requested page"
++                )
++            if actual_size != page_size:
++                raise ResponseContractError(
++                    "Page.size does not match the requested size"
++                )
++            if number_of_elements != len(content):
++                raise ResponseContractError(
++                    "Page.numberOfElements does not match content"
++                )
++            if empty is not (len(content) == 0):
++                raise ResponseContractError(
++                    "Page.empty contradicts Page.content"
++                )
++            if first is not (page_number == 0):
++                raise ResponseContractError(
++                    "Page.first contradicts Page.number"
++                )
++            if total_elements == 0:
++                if total_pages not in {0, 1}:
++                    raise ResponseContractError(
++                        "empty collection has invalid Page.totalPages"
++                    )
++                expected_last = True
++            else:
++                if total_pages < 1 or page_number >= total_pages:
++                    raise ResponseContractError(
++                        "Page.totalPages contradicts Page.number"
++                    )
++                expected_last = page_number == total_pages - 1
++            if last is not expected_last:
++                raise ResponseContractError(
++                    "Page.last contradicts Page.totalPages"
++                )
++
++            if expected_total_elements is None:
++                expected_total_elements = total_elements
++                expected_total_pages = total_pages
++            elif (
++                total_elements != expected_total_elements
++                or total_pages != expected_total_pages
++            ):
++                raise ResponseContractError(
++                    "pagination totals changed between pages"
++                )
++
++            for raw_item in content:
++                item = self._agent_group(raw_item)
++                if item.id in seen_ids:
++                    raise ResponseContractError(
++                        "duplicate agent-group id across pages"
++                    )
++                seen_ids.add(item.id)
++                groups.append(item)
++
++            if len(groups) > total_elements:
++                raise ResponseContractError(
++                    "received more items than Page.totalElements"
++                )
++            if last:
++                if len(groups) != total_elements:
++                    raise ResponseContractError(
++                        "final item count differs from Page.totalElements"
++                    )
++                return sorted(groups, key=lambda item: (item.name, item.id))
++
++            if len(groups) == total_elements:
++                raise ResponseContractError(
++                    "Page.last is false after all declared items arrived"
++                )
++            page_number += 1
++
++    def _get_page(self, page: int, size: int) -> Any:
++        url = f"{self.base_url}/api/v2/agent/groups?page={page}&size={size}"
++        request = Request(
++            url,
++            headers={
++                "Accept": "application/json",
++                "X-JWT-Token": self.token,
++            },
++            method="GET",
++        )
++        try:
++            with self._opener.open(request, timeout=self.timeout) as response:
++                status = response.status
++                raw = response.read()
++        except HTTPError as error:
++            with error:
++                status = error.code
++            raise ApiError(status, "unexpected HTTP response") from error
++        except (URLError, OSError) as error:
++            raise ApiError(0, "transport failure") from error
++
++        if status != 200:
++            raise ApiError(status, "unexpected HTTP response")
++        try:
++            return json.loads(raw.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError) as error:
++            raise ResponseContractError(
++                "HTTP 200 response body is not valid JSON"
++            ) from error
++
++    @staticmethod
++    def _page_object(payload: Any) -> Mapping[str, Any]:
++        if (
++            not isinstance(payload, list)
++            or len(payload) != 1
++            or not isinstance(payload[0], Mapping)
++        ):
++            raise ResponseContractError(
++                "response must contain exactly one Page object"
++            )
++        return payload[0]
++
++    @staticmethod
++    def _integer(
++        page: Mapping[str, Any],
++        name: str,
++        *,
++        minimum: int,
++    ) -> int:
++        value = page.get(name)
++        if (
++            isinstance(value, bool)
++            or not isinstance(value, int)
++            or value < minimum
++        ):
++            raise ResponseContractError(f"Page.{name} is invalid")
++        return value
++
++    @staticmethod
++    def _boolean(page: Mapping[str, Any], name: str) -> bool:
++        value = page.get(name)
++        if not isinstance(value, bool):
++            raise ResponseContractError(f"Page.{name} must be Boolean")
++        return value
++
++    @staticmethod
++    def _agent_group(raw_item: Any) -> AgentGroup:
++        if not isinstance(raw_item, Mapping):
++            raise ResponseContractError(
++                "Page.content items must be objects"
++            )
++        if any(
++            name not in raw_item
++            for name in ("id", "name", "autoUpdate", "info")
++        ):
++            raise ResponseContractError(
++                "agent-group item is missing a focused property"
++            )
++        group_id = raw_item["id"]
++        name = raw_item["name"]
++        auto_update = raw_item["autoUpdate"]
++        info = raw_item["info"]
++        if not isinstance(group_id, str) or not group_id.strip():
++            raise ResponseContractError(
++                "agent-group id must be a nonblank string"
++            )
++        if not isinstance(name, str) or not name.strip():
++            raise ResponseContractError(
++                "agent-group name must be a nonblank string"
++            )
++        if not isinstance(auto_update, bool):
++            raise ResponseContractError(
++                "agent-group autoUpdate must be Boolean"
++            )
++        if not isinstance(info, str):
++            raise ResponseContractError(
++                "agent-group info must be a string"
++            )
++        return AgentGroup(
++            id=group_id,
++            name=name,
++            auto_update=auto_update,
++            info=info,
++        )
