@@ -1,0 +1,182 @@
+diff --git a/logupdate/client.go b/logupdate/client.go
+--- a/logupdate/client.go
++++ b/logupdate/client.go
+@@ -1,20 +1,175 @@
+ package logupdate
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"io"
++	"mime"
++	"net/http"
++	"net/url"
++	"strings"
+ )
+ 
++const (
++	updateOperationID = "updateLogForwarder"
++	maxResponseBody   = 1 << 20
++)
++
+ // Client invokes the focused updateLogForwarder contract.
+-type Client struct{}
++type Client struct {
++	baseURL     string
++	token       string
++	httpClient  *http.Client
++	maxAttempts int
++}
+ 
+ // NewClient validates configuration without performing network traffic.
+ func NewClient(cfg Config) (*Client, error) {
+-	return nil, errors.New("not implemented")
++	parsed, err := url.Parse(cfg.BaseURL)
++	if err != nil ||
++		(parsed.Scheme != "http" && parsed.Scheme != "https") ||
++		parsed.Host == "" ||
++		parsed.Opaque != "" ||
++		parsed.User != nil ||
++		(parsed.Path != "" && parsed.Path != "/") ||
++		parsed.RawQuery != "" ||
++		parsed.ForceQuery ||
++		parsed.Fragment != "" {
++		return nil, errors.New("BaseURL must be an absolute HTTP(S) origin")
++	}
++	if strings.TrimSpace(cfg.Token) == "" ||
++		strings.TrimSpace(cfg.Token) != cfg.Token ||
++		strings.ContainsAny(cfg.Token, "\r\n") {
++		return nil, errors.New("Token must be nonblank without surrounding whitespace or line breaks")
++	}
++	if cfg.MaxAttempts <= 0 {
++		return nil, errors.New("MaxAttempts must be positive")
++	}
++
++	selected := cfg.HTTPClient
++	if selected == nil {
++		selected = http.DefaultClient
++	}
++	clientCopy := *selected
++	clientCopy.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
++		return http.ErrUseLastResponse
++	}
++
++	parsed.Path = ""
++	parsed.RawPath = ""
++	return &Client{
++		baseURL:     strings.TrimSuffix(parsed.String(), "/"),
++		token:       cfg.Token,
++		httpClient:  &clientCopy,
++		maxAttempts: cfg.MaxAttempts,
++	}, nil
+ }
+ 
+ // UpdateLogForwarder replaces a log forwarder using the contract's idempotent
+ // PUT operation.
+ func (c *Client) UpdateLogForwarder(ctx context.Context, id string, update LogForwarderUpdate) (LogForwarder, error) {
+-	return LogForwarder{}, errors.New("not implemented")
++	if ctx == nil {
++		return LogForwarder{}, errors.New("context is required")
++	}
++	if id == "" {
++		return LogForwarder{}, errors.New("forwarder id is required")
++	}
++	if err := ctx.Err(); err != nil {
++		return LogForwarder{}, &Error{
++			OperationID: updateOperationID,
++			Kind:        KindTransport,
++			cause:       err,
++		}
++	}
++
++	var encoded bytes.Buffer
++	encoder := json.NewEncoder(&encoded)
++	encoder.SetEscapeHTML(false)
++	if err := encoder.Encode(update); err != nil {
++		return LogForwarder{}, protocolError(0)
++	}
++	body := bytes.TrimSuffix(encoded.Bytes(), []byte{'\n'})
++	body = append([]byte(nil), body...)
++	target := c.baseURL +
++		"/api/v2/logs/forwarders/" +
++		url.PathEscape(id)
++
++	for attempt := 1; attempt <= c.maxAttempts; attempt++ {
++		if err := ctx.Err(); err != nil {
++			return LogForwarder{}, &Error{
++				OperationID: updateOperationID,
++				Kind:        KindTransport,
++				Attempts:    attempt - 1,
++				cause:       err,
++			}
++		}
++		request, err := http.NewRequestWithContext(
++			ctx,
++			http.MethodPut,
++			target,
++			bytes.NewReader(body),
++		)
++		if err != nil {
++			return LogForwarder{}, protocolError(attempt - 1)
++		}
++		request.Header.Set("Accept", "application/json")
++		request.Header.Set("Content-Type", "application/json")
++		request.Header.Set("X-JWT-Token", c.token)
++
++		response, err := c.httpClient.Do(request)
++		if err != nil {
++			cause := err
++			if ctxErr := ctx.Err(); ctxErr != nil {
++				cause = ctxErr
++			}
++			if attempt == c.maxAttempts || ctx.Err() != nil {
++				return LogForwarder{}, &Error{
++					OperationID: updateOperationID,
++					Kind:        KindTransport,
++					Attempts:    attempt,
++					cause:       cause,
++				}
++			}
++			continue
++		}
++
++		if response.StatusCode != http.StatusOK {
++			_ = response.Body.Close()
++			return LogForwarder{}, &Error{
++				OperationID: updateOperationID,
++				Kind:        KindHTTP,
++				StatusCode:  response.StatusCode,
++				Attempts:    attempt,
++			}
++		}
++
++		mediaType, _, mediaErr := mime.ParseMediaType(response.Header.Get("Content-Type"))
++		if mediaErr != nil || mediaType != "application/json" {
++			_ = response.Body.Close()
++			return LogForwarder{}, protocolError(attempt)
++		}
++		raw, readErr := io.ReadAll(io.LimitReader(response.Body, maxResponseBody+1))
++		closeErr := response.Body.Close()
++		if readErr != nil || closeErr != nil || len(raw) > maxResponseBody {
++			return LogForwarder{}, protocolError(attempt)
++		}
++
++		var result *LogForwarder
++		if err := json.Unmarshal(raw, &result); err != nil || result == nil {
++			return LogForwarder{}, protocolError(attempt)
++		}
++		return *result, nil
++	}
++
++	panic("unreachable")
+ }
++
++func protocolError(attempts int) *Error {
++	return &Error{
++		OperationID: updateOperationID,
++		Kind:        KindProtocol,
++		Attempts:    attempts,
++	}
++}

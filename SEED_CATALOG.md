@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3228 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3230 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -17,8 +17,8 @@
 | **Refactoring & performance** | 29 | Restructure safely and improve measured performance without behavior drift. |
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
-| **Uncategorized** | 40 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 153 | Catalog program awaiting description. |
+| **Uncategorized** | 41 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 154 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -1831,6 +1831,8 @@
 - **vcf91-0180** (`python`) `#vcf-9-1` `#vcf-operations-logs` `#python` `#rest-contract` `#spec-derived` — Complete `vcf_ops_diagnosis/client.py` as a standard-library-only Python package for VMware Cloud Foundation 9.1 VCF Operations Log Management. A VCF deployment request failed, but the request itse…
 - **vcf91-0181** (`go`) `#vcf-9-1` `#vcf-operations-logs` `#go` `#rest-contract` `#spec-derived` — Implement `logtask/client.go` as a standard-library-only Go 1.22+ package that observes an already-started asynchronous VMware Cloud Foundation operation through structured VCF Operations Log Manag…
 - **vcf91-0182** (`go`) `#vcf-9-1` `#vcf-operations-logs` `#go` `#rest-contract` `#spec-derived` — Implement `logforwarder/client.go` as a standard-library-only Go 1.22+ client for reconciling VMware Cloud Foundation 9.1 VCF Operations Log Management forwarders while its access token can expire…
+- **vcf91-0183** (`go`) `#vcf-9-1` `#vcf-operations-logs` `#go` `#rest-contract` `#spec-derived` — Build a Go package named `vcfopslogs` at the module root for the VMware Cloud Foundation Operations 9.1 Log Management API. The protected `docs/contract.json` is a pruned, semantically equivalent O…
+- **vcf91-0184** (`go`) `#vcf-9-1` `#vcf-operations-logs` `#go` `#rest-contract` `#spec-derived` — Implement `logupdate/client.go` as a standard-library-only Go 1.22+ client for one retry-safe VMware Cloud Foundation 9.1 VCF Operations Log Management mutation. Read the protected `docs/contract.j…
 
 ## feature-io
 
