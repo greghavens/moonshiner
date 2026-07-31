@@ -1,0 +1,588 @@
+--- a/VcfOpsLogForwarder/VcfOpsLogForwarder.psm1
++++ b/VcfOpsLogForwarder/VcfOpsLogForwarder.psm1
+@@ -1,5 +1,584 @@
+ Set-StrictMode -Version Latest
+ 
+-# Implement New-VcfOpsLogForwarderIfAbsent here.
++function Assert-VcfOpsLogForwarderText {
++    param(
++        [Parameter(Mandatory)]
++        [AllowEmptyString()]
++        [string] $Value,
++
++        [Parameter(Mandatory)]
++        [string] $Name
++    )
++
++    if (
++        [string]::IsNullOrWhiteSpace($Value) -or
++        -not [StringComparer]::Ordinal.Equals($Value, $Value.Trim())
++    ) {
++        throw [ArgumentException]::new(
++            "$Name must be nonblank and have no surrounding whitespace."
++        )
++    }
++}
++
++function Assert-VcfOpsLogForwarderToken {
++    param(
++        [Parameter(Mandatory)]
++        [AllowEmptyString()]
++        [string] $Value
++    )
++
++    if ([string]::IsNullOrWhiteSpace($Value)) {
++        throw [ArgumentException]::new('LogToken must be nonblank.')
++    }
++    if ($Value.Contains("`r") -or $Value.Contains("`n")) {
++        throw [ArgumentException]::new(
++            'LogToken contains a header-unsafe character.'
++        )
++    }
++}
++
++function Assert-VcfOpsLogForwarderEnum {
++    param(
++        [Parameter(Mandatory)]
++        [string] $Value,
++
++        [Parameter(Mandatory)]
++        [string[]] $Allowed,
++
++        [Parameter(Mandatory)]
++        [string] $Name
++    )
++
++    foreach ($Candidate in $Allowed) {
++        if ([StringComparer]::Ordinal.Equals($Value, $Candidate)) {
++            return
++        }
++    }
++    throw [ArgumentException]::new("$Name has an unsupported value.")
++}
++
++function Resolve-VcfOpsLogForwarderOrigin {
++    param(
++        [Parameter(Mandatory)]
++        [uri] $BaseUri
++    )
++
++    $Http = [StringComparer]::OrdinalIgnoreCase.Equals(
++        $BaseUri.Scheme,
++        'http'
++    )
++    $Https = [StringComparer]::OrdinalIgnoreCase.Equals(
++        $BaseUri.Scheme,
++        'https'
++    )
++    if (
++        -not $BaseUri.IsAbsoluteUri -or
++        (-not $Http -and -not $Https) -or
++        $BaseUri.UserInfo.Length -ne 0 -or
++        $BaseUri.AbsolutePath -cne '/' -or
++        $BaseUri.Query.Length -ne 0 -or
++        $BaseUri.Fragment.Length -ne 0
++    ) {
++        throw [ArgumentException]::new(
++            'BaseUri must be an absolute HTTP(S) origin.'
++        )
++    }
++
++    return [uri] $BaseUri.GetLeftPart([UriPartial]::Authority)
++}
++
++function New-VcfOpsLogForwarderJson {
++    param(
++        [Parameter(Mandatory)]
++        [bool] $Enabled,
++
++        [Parameter(Mandatory)]
++        [string] $HostName,
++
++        [Parameter(Mandatory)]
++        [string] $ForwarderName,
++
++        [Parameter(Mandatory)]
++        [int] $Port,
++
++        [Parameter(Mandatory)]
++        [string] $Protocol,
++
++        [Parameter(Mandatory)]
++        [bool] $SslEnabled,
++
++        [Parameter(Mandatory)]
++        [string] $TransportProtocol
++    )
++
++    $Stream = [IO.MemoryStream]::new()
++    $Writer = [Text.Json.Utf8JsonWriter]::new($Stream)
++    try {
++        $Writer.WriteStartObject()
++        $Writer.WriteBoolean('enabled', $Enabled)
++        $Writer.WriteString('host', $HostName)
++        $Writer.WriteString('name', $ForwarderName)
++        $Writer.WriteNumber('port', $Port)
++        $Writer.WriteString('protocol', $Protocol)
++        $Writer.WriteBoolean('sslEnabled', $SslEnabled)
++        $Writer.WriteString('transportProtocol', $TransportProtocol)
++        $Writer.WriteEndObject()
++        $Writer.Flush()
++        return [Text.Encoding]::UTF8.GetString($Stream.ToArray())
++    }
++    finally {
++        $Writer.Dispose()
++        $Stream.Dispose()
++    }
++}
++
++function Invoke-VcfOpsLogForwarderRequest {
++    param(
++        [Parameter(Mandatory)]
++        [Net.Http.HttpClient] $Client,
++
++        [Parameter(Mandatory)]
++        [Net.Http.HttpMethod] $Method,
++
++        [Parameter(Mandatory)]
++        [uri] $Uri,
++
++        [Parameter(Mandatory)]
++        [string] $LogToken,
++
++        [Parameter(Mandatory)]
++        [string] $OperationId,
++
++        [Parameter()]
++        [AllowNull()]
++        [string] $JsonBody
++    )
++
++    $Request = [Net.Http.HttpRequestMessage]::new($Method, $Uri)
++    $Response = $null
++    try {
++        $Request.Headers.Accept.Add(
++            [Net.Http.Headers.MediaTypeWithQualityHeaderValue]::new(
++                'application/json'
++            )
++        )
++        if (
++            -not $Request.Headers.TryAddWithoutValidation(
++                'X-JWT-Token',
++                $LogToken
++            )
++        ) {
++            throw [InvalidOperationException]::new(
++                'Could not configure log authentication.'
++            )
++        }
++
++        if ($PSBoundParameters.ContainsKey('JsonBody')) {
++            $Bytes = [Text.Encoding]::UTF8.GetBytes($JsonBody)
++            $Request.Content = [Net.Http.ByteArrayContent]::new($Bytes)
++            $Request.Content.Headers.ContentType = (
++                [Net.Http.Headers.MediaTypeHeaderValue]::new(
++                    'application/json'
++                )
++            )
++        }
++
++        try {
++            $Response = $Client.Send($Request)
++            $Text = (
++                $Response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
++            )
++        }
++        catch {
++            throw [IO.IOException]::new(
++                "The $OperationId log-management request failed."
++            )
++        }
++
++        return [pscustomobject] @{
++            StatusCode = [int] $Response.StatusCode
++            Text = $Text
++        }
++    }
++    finally {
++        if ($null -ne $Response) {
++            $Response.Dispose()
++        }
++        $Request.Dispose()
++    }
++}
++
++function ConvertTo-VcfOpsLogForwarderDocument {
++    param(
++        [Parameter(Mandatory)]
++        [AllowEmptyString()]
++        [string] $Text,
++
++        [Parameter(Mandatory)]
++        [string] $OperationId
++    )
++
++    try {
++        return [Text.Json.JsonDocument]::Parse($Text)
++    }
++    catch {
++        throw [IO.InvalidDataException]::new(
++            "The $OperationId response was not valid JSON."
++        )
++    }
++}
++
++function Get-VcfOpsLogForwarderProperty {
++    param(
++        [Parameter(Mandatory)]
++        [Text.Json.JsonElement] $Object,
++
++        [Parameter(Mandatory)]
++        [string] $Name,
++
++        [Parameter(Mandatory)]
++        [Text.Json.JsonValueKind] $Kind,
++
++        [Parameter(Mandatory)]
++        [string] $OperationId
++    )
++
++    $Property = [Text.Json.JsonElement]::new()
++    if (
++        -not $Object.TryGetProperty($Name, [ref] $Property) -or
++        $Property.ValueKind -ne $Kind
++    ) {
++        throw [IO.InvalidDataException]::new(
++            "The $OperationId response has an invalid $Name property."
++        )
++    }
++    return $Property
++}
++
++function Assert-VcfOpsLogForwarderPrecheck {
++    param(
++        [Parameter(Mandatory)]
++        [string] $Text,
++
++        [Parameter(Mandatory)]
++        [string] $Name
++    )
++
++    $OperationId = 'getAllLogForwarders'
++    $Document = ConvertTo-VcfOpsLogForwarderDocument `
++        -Text $Text `
++        -OperationId $OperationId
++    try {
++        if ($Document.RootElement.ValueKind -ne [Text.Json.JsonValueKind]::Array) {
++            throw [IO.InvalidDataException]::new(
++                "The $OperationId response must be an array."
++            )
++        }
++
++        foreach ($Item in $Document.RootElement.EnumerateArray()) {
++            if ($Item.ValueKind -ne [Text.Json.JsonValueKind]::Object) {
++                throw [IO.InvalidDataException]::new(
++                    "The $OperationId response contains a non-object item."
++                )
++            }
++
++            $ExistingName = [Text.Json.JsonElement]::new()
++            if ($Item.TryGetProperty('name', [ref] $ExistingName)) {
++                if (
++                    $ExistingName.ValueKind -ne
++                    [Text.Json.JsonValueKind]::String
++                ) {
++                    throw [IO.InvalidDataException]::new(
++                        "The $OperationId response has an invalid name."
++                    )
++                }
++                if (
++                    [StringComparer]::Ordinal.Equals(
++                        $ExistingName.GetString(),
++                        $Name
++                    )
++                ) {
++                    throw [InvalidOperationException]::new(
++                        "A log forwarder named '$Name' already exists."
++                    )
++                }
++            }
++        }
++    }
++    finally {
++        $Document.Dispose()
++    }
++}
++
++function Get-VcfOpsLogForwarderCreatedId {
++    param(
++        [Parameter(Mandatory)]
++        [string] $Text,
++
++        [Parameter(Mandatory)]
++        [bool] $Enabled,
++
++        [Parameter(Mandatory)]
++        [string] $HostName,
++
++        [Parameter(Mandatory)]
++        [string] $ForwarderName,
++
++        [Parameter(Mandatory)]
++        [int] $Port,
++
++        [Parameter(Mandatory)]
++        [string] $Protocol,
++
++        [Parameter(Mandatory)]
++        [bool] $SslEnabled,
++
++        [Parameter(Mandatory)]
++        [string] $TransportProtocol
++    )
++
++    $OperationId = 'createLogForwarder'
++    $Document = ConvertTo-VcfOpsLogForwarderDocument `
++        -Text $Text `
++        -OperationId $OperationId
++    try {
++        $Root = $Document.RootElement
++        if ($Root.ValueKind -ne [Text.Json.JsonValueKind]::Object) {
++            throw [IO.InvalidDataException]::new(
++                "The $OperationId response must be an object."
++            )
++        }
++
++        $IdElement = Get-VcfOpsLogForwarderProperty `
++            -Object $Root `
++            -Name 'id' `
++            -Kind ([Text.Json.JsonValueKind]::String) `
++            -OperationId $OperationId
++        $Id = $IdElement.GetString()
++        if ([string]::IsNullOrWhiteSpace($Id)) {
++            throw [IO.InvalidDataException]::new(
++                "The $OperationId response has a blank id."
++            )
++        }
++
++        $ExpectedEnabledKind = if ($Enabled) {
++            [Text.Json.JsonValueKind]::True
++        }
++        else {
++            [Text.Json.JsonValueKind]::False
++        }
++        $ActualEnabled = (
++            Get-VcfOpsLogForwarderProperty `
++                -Object $Root `
++                -Name 'enabled' `
++                -Kind $ExpectedEnabledKind `
++                -OperationId $OperationId
++        ).GetBoolean()
++        $ActualHost = (
++            Get-VcfOpsLogForwarderProperty `
++                -Object $Root `
++                -Name 'host' `
++                -Kind ([Text.Json.JsonValueKind]::String) `
++                -OperationId $OperationId
++        ).GetString()
++        $ActualName = (
++            Get-VcfOpsLogForwarderProperty `
++                -Object $Root `
++                -Name 'name' `
++                -Kind ([Text.Json.JsonValueKind]::String) `
++                -OperationId $OperationId
++        ).GetString()
++        $ActualPort = (
++            Get-VcfOpsLogForwarderProperty `
++                -Object $Root `
++                -Name 'port' `
++                -Kind ([Text.Json.JsonValueKind]::Number) `
++                -OperationId $OperationId
++        ).GetInt32()
++        $ActualProtocol = (
++            Get-VcfOpsLogForwarderProperty `
++                -Object $Root `
++                -Name 'protocol' `
++                -Kind ([Text.Json.JsonValueKind]::String) `
++                -OperationId $OperationId
++        ).GetString()
++        $ExpectedSslKind = if ($SslEnabled) {
++            [Text.Json.JsonValueKind]::True
++        }
++        else {
++            [Text.Json.JsonValueKind]::False
++        }
++        $ActualSslEnabled = (
++            Get-VcfOpsLogForwarderProperty `
++                -Object $Root `
++                -Name 'sslEnabled' `
++                -Kind $ExpectedSslKind `
++                -OperationId $OperationId
++        ).GetBoolean()
++        $ActualTransport = (
++            Get-VcfOpsLogForwarderProperty `
++                -Object $Root `
++                -Name 'transportProtocol' `
++                -Kind ([Text.Json.JsonValueKind]::String) `
++                -OperationId $OperationId
++        ).GetString()
++
++        if (
++            $ActualEnabled -ne $Enabled -or
++            -not [StringComparer]::Ordinal.Equals($ActualHost, $HostName) -or
++            -not [StringComparer]::Ordinal.Equals(
++                $ActualName,
++                $ForwarderName
++            ) -or
++            $ActualPort -ne $Port -or
++            -not [StringComparer]::Ordinal.Equals(
++                $ActualProtocol,
++                $Protocol
++            ) -or
++            $ActualSslEnabled -ne $SslEnabled -or
++            -not [StringComparer]::Ordinal.Equals(
++                $ActualTransport,
++                $TransportProtocol
++            )
++        ) {
++            throw [IO.InvalidDataException]::new(
++                "The $OperationId response does not match the request."
++            )
++        }
++
++        return $Id
++    }
++    finally {
++        $Document.Dispose()
++    }
++}
++
++function New-VcfOpsLogForwarderIfAbsent {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [uri] $BaseUri,
++
++        [Parameter(Mandatory)]
++        [AllowEmptyString()]
++        [string] $LogToken,
++
++        [Parameter(Mandatory)]
++        [AllowEmptyString()]
++        [string] $Name,
++
++        [Parameter(Mandatory)]
++        [AllowEmptyString()]
++        [string] $Host,
++
++        [Parameter(Mandatory)]
++        [int] $Port,
++
++        [Parameter(Mandatory)]
++        [string] $Protocol,
++
++        [Parameter(Mandatory)]
++        [bool] $SslEnabled,
++
++        [Parameter(Mandatory)]
++        [string] $TransportProtocol,
++
++        [Parameter(Mandatory)]
++        [bool] $Enabled,
++
++        [Parameter()]
++        [Net.Http.HttpClient] $HttpClient
++    )
++
++    $Origin = Resolve-VcfOpsLogForwarderOrigin -BaseUri $BaseUri
++    Assert-VcfOpsLogForwarderToken -Value $LogToken
++    Assert-VcfOpsLogForwarderText -Value $Name -Name 'Name'
++    Assert-VcfOpsLogForwarderText -Value $Host -Name 'Host'
++    if ($Port -lt 1 -or $Port -gt 65535) {
++        throw [ArgumentOutOfRangeException]::new(
++            'Port',
++            'Port must be between 1 and 65535.'
++        )
++    }
++    Assert-VcfOpsLogForwarderEnum `
++        -Value $Protocol `
++        -Allowed @('SYSLOG', 'RAW', 'RAWPLUS') `
++        -Name 'Protocol'
++    Assert-VcfOpsLogForwarderEnum `
++        -Value $TransportProtocol `
++        -Allowed @('TCP', 'UDP') `
++        -Name 'TransportProtocol'
++
++    $JsonBody = New-VcfOpsLogForwarderJson `
++        -Enabled $Enabled `
++        -HostName $Host `
++        -ForwarderName $Name `
++        -Port $Port `
++        -Protocol $Protocol `
++        -SslEnabled $SslEnabled `
++        -TransportProtocol $TransportProtocol
++
++    $OwnedClient = $null
++    if ($null -eq $HttpClient) {
++        $Handler = [Net.Http.HttpClientHandler]::new()
++        $Handler.AllowAutoRedirect = $false
++        $OwnedClient = [Net.Http.HttpClient]::new($Handler, $true)
++        $HttpClient = $OwnedClient
++    }
++
++    try {
++        $Endpoint = [uri]::new($Origin, '/api/v2/logs/forwarders')
++        $Precheck = Invoke-VcfOpsLogForwarderRequest `
++            -Client $HttpClient `
++            -Method ([Net.Http.HttpMethod]::Get) `
++            -Uri $Endpoint `
++            -LogToken $LogToken `
++            -OperationId 'getAllLogForwarders'
++        if ($Precheck.StatusCode -ne 200) {
++            throw [InvalidOperationException]::new(
++                "getAllLogForwarders failed with HTTP status " +
++                "$($Precheck.StatusCode)."
++            )
++        }
++        Assert-VcfOpsLogForwarderPrecheck `
++            -Text $Precheck.Text `
++            -Name $Name
++
++        $Created = Invoke-VcfOpsLogForwarderRequest `
++            -Client $HttpClient `
++            -Method ([Net.Http.HttpMethod]::Post) `
++            -Uri $Endpoint `
++            -LogToken $LogToken `
++            -OperationId 'createLogForwarder' `
++            -JsonBody $JsonBody
++        if ($Created.StatusCode -ne 201) {
++            throw [InvalidOperationException]::new(
++                "createLogForwarder failed with HTTP status " +
++                "$($Created.StatusCode)."
++            )
++        }
++
++        $Id = Get-VcfOpsLogForwarderCreatedId `
++            -Text $Created.Text `
++            -Enabled $Enabled `
++            -HostName $Host `
++            -ForwarderName $Name `
++            -Port $Port `
++            -Protocol $Protocol `
++            -SslEnabled $SslEnabled `
++            -TransportProtocol $TransportProtocol
++
++        return [pscustomobject] [ordered] @{
++            Created = $true
++            OperationId = 'createLogForwarder'
++            Id = $Id
++        }
++    }
++    finally {
++        if ($null -ne $OwnedClient) {
++            $OwnedClient.Dispose()
++        }
++    }
++}
+ 
+ Export-ModuleMember -Function New-VcfOpsLogForwarderIfAbsent
