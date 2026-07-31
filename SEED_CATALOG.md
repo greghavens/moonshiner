@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3208 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3210 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 40 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 133 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 135 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -3764,6 +3764,8 @@
 - **vcf91-0159** (`java`) `#vcf-9-1` `#vks-supervisor` `#java` `#rest-contract` `#spec-derived` — Complete `VksClusterApplyClient.java` as a dependency-free, single-file Java 17 client for one VMware Cloud Foundation 9.1 integration workflow: validate a vSphere Supervisor namespace through vCen…
 - **vcf91-0160** (`java`) `#vcf-9-1` `#vks-supervisor` `#java` `#rest-contract` `#spec-derived` — Implement `src/VcfVksChangeClient.java` as a dependency-free, single-file Java 17 client for one coordinated VCF 9.1 change. Preserve every public type and signature already declared in that file.…
 - **vcf91-0161** (`java`) `#vcf-9-1` `#vks-supervisor` `#java` `#rest-contract` `#spec-derived` — Implement `src/VksClusterProvisionClient.java` as a dependency-free, single-file Java 17 client for a guarded VKS cluster create workflow in VMware Cloud Foundation 9.1. Read the protected `docs/co…
+- **vcf91-0162** (`java`) `#vcf-9-1` `#vks-supervisor` `#java` `#rest-contract` `#spec-derived` — Implement `src/VcfVksSessionRotationClient.java` as a dependency-free, single-file Java 17 client that rotates a vCenter API session without abandoning or silently moving a VKS lookup already using…
+- **vcf91-0163** (`java`) `#vcf-9-1` `#vks-supervisor` `#java` `#rest-contract` `#spec-derived` — Implement the TODOs in `src/VksFailureEvidenceClient.java` as a dependency-free, single-file Java 17 client. The client diagnoses a repeatedly restarting pod only after it proves that the caller ca…
 
 ## project-io
 
