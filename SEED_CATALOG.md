@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3214 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
+3215 seeds grouped into 425 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 40 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 139 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 140 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
 
@@ -1817,6 +1817,7 @@
 - **vcf91-0165** (`powershell`) `#vcf-9-1` `#vcf-operations-logs` `#powershell` `#rest-contract` `#spec-derived` — Complete `VcfOpsLogSecret/VcfOpsLogSecret.psm1` as a PowerShell 7.4 module that creates an ingestion-agent secret in VCF Operations for Logs and waits until that asynchronous secret activation reac…
 - **vcf91-0167** (`powershell`) `#vcf-9-1` `#vcf-operations-logs` `#powershell` `#rest-contract` `#spec-derived` — Complete `VcfOpsLogAgentGroups/VcfOpsLogAgentGroups.psm1` as a PowerShell 7.4 module that retrieves the complete VCF Operations for Logs agent-group collection and emits it in deterministic order.…
 - **vcf91-0168** (`powershell`) `#vcf-9-1` `#vcf-operations-logs` `#powershell` `#rest-contract` `#spec-derived` — Complete `VcfOpsLogForwarder/VcfOpsLogForwarder.psm1` as a PowerShell 7.4 module that idempotently ensures one named VCF Operations for Logs forwarder exists. A retry with the same desired configur…
+- **vcf91-0169** (`powershell`) `#vcf-9-1` `#vcf-operations-logs` `#powershell` `#rest-contract` `#spec-derived` — Complete `VcfOpsLogRouting/VcfOpsLogRouting.psm1` as a PowerShell 7.4 module for a non-transactional VCF Operations for Logs routing change. The workflow patches an agent group, patches a log forwa…
 
 ## feature-io
 
