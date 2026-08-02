@@ -9,11 +9,13 @@ import sys
 import uuid
 from pathlib import Path
 
-from common import CONFIG, ROOT, SEEDS_DIR, STORAGE_ROOT, TRACES, WORKSPACES
+from common import (CONFIG, ROOT, SEEDS_DIR, STORAGE_ROOT, TRACES, WORKSPACES,
+                    preflight_seed_environment)
 from run_state import (connect, create_run, finish_attempt, set_run_status,
                        start_attempt)
 from runtimes import get_seed_author, get_seed_judge
-from runtimes.availability import USAGE_LIMIT_EXIT, ModelUnavailable
+from runtimes.availability import (INFRASTRUCTURE_EXIT, USAGE_LIMIT_EXIT,
+                                   ModelUnavailable)
 from validate_seeds import validate_report
 from audit_seeds import check as audit_seed
 from seed_inventory import bundled_plan_record
@@ -181,6 +183,12 @@ def main(argv: list[str] | None = None) -> int:
         shutil.copytree(workspace, candidate, ignore=shutil.ignore_patterns(".git"))
         _normalise_task(candidate)
         seed = _load_candidate(candidate, args.id)
+        environment_ok, environment_detail = preflight_seed_environment(seed)
+        if not environment_ok:
+            set_run_status(db, run_id, "stopped", environment_detail)
+            print(f"[seed stopped] {args.id}: infrastructure failure — "
+                  f"{environment_detail}", file=sys.stderr)
+            return INFRASTRUCTURE_EXIT
         accepted = False
         for number in range(1, args.max_attempts + 1):
             start_attempt(db, run_id, args.id, number)

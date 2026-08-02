@@ -1,7 +1,10 @@
 """Authoring one seed is a single piece of paid work; it must not be wasted."""
 import pathlib
 import sys
+import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -75,6 +78,57 @@ class ASeedIsNeverDiscarded(unittest.TestCase):
         guard_before = source[:promote].rstrip().splitlines()[-1]
         self.assertNotIn("if ", guard_before,
                          "promotion must not sit behind an acceptance test")
+
+
+class InfrastructureStopsBeforeTheJudge(unittest.TestCase):
+    def test_candidate_is_preserved_without_judging_or_promotion(self):
+        author = mock.Mock(name="author")
+        author.name = "codex"
+        author.role = {"model": "gpt-5.6-sol", "reasoning": "xhigh"}
+        judge = mock.Mock(name="judge")
+        judge.name = "codex"
+        judge.role = {"model": "gpt-5.6-sol", "reasoning": "xhigh"}
+
+        def author_seed(_dummy, workspace, **_kwargs):
+            (workspace / "task.json").write_text(
+                '{"id":"vcf91-0004","prompt":"fix it"}\n')
+            return SimpleNamespace(unavailable=None, timed_out=False,
+                                   safeguard_refusal=False, return_code=0,
+                                   error=None)
+
+        author.run_trace.side_effect = author_seed
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            workspaces = root / "workspaces"; workspaces.mkdir()
+            candidates = root / "candidates"
+            seeds = root / "seeds"; seeds.mkdir()
+            traces = root / "traces"
+            with mock.patch.object(seed_pipeline, "WORKSPACES", workspaces), \
+                 mock.patch.object(seed_pipeline, "CANDIDATES", candidates), \
+                 mock.patch.object(seed_pipeline, "SEEDS_DIR", seeds), \
+                 mock.patch.object(seed_pipeline, "TRACES", traces), \
+                 mock.patch.object(seed_pipeline, "get_seed_author",
+                                   return_value=author), \
+                 mock.patch.object(seed_pipeline, "get_seed_judge",
+                                   return_value=judge), \
+                 mock.patch.object(seed_pipeline, "connect",
+                                   return_value=mock.Mock()), \
+                 mock.patch.object(seed_pipeline, "create_run",
+                                   return_value="seed-run"), \
+                 mock.patch.object(seed_pipeline, "set_run_status") as status, \
+                 mock.patch.object(seed_pipeline, "start_attempt") as attempt, \
+                 mock.patch.object(seed_pipeline, "preflight_seed_environment",
+                                   return_value=(False, "pwsh unavailable")):
+                result = seed_pipeline.main([
+                    "--id", "vcf91-0004", "--brief", "VCF seed", "--yes"])
+            candidate = candidates / "seed-run" / "vcf91-0004" / "task.json"
+            self.assertEqual(result, seed_pipeline.INFRASTRUCTURE_EXIT)
+            self.assertTrue(candidate.is_file())
+            self.assertFalse((seeds / "vcf91-0004").exists())
+        judge.run_review.assert_not_called()
+        attempt.assert_not_called()
+        status.assert_called_with(mock.ANY, "seed-run", "stopped",
+                                  "pwsh unavailable")
 
 
 
