@@ -1,6 +1,7 @@
 """Core helpers: secret/path scrubbing, seed fingerprinting, corpus loading."""
 import pathlib
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -204,3 +205,40 @@ class TheSandboxHomeIsNeverSeedContent(unittest.TestCase):
         for name in (".sandbox-home", ".toolchain"):
             self.assertIn(f"**/{name}/**", DIFF_EXCLUDE_PATTERNS)
             self.assertIn(name, RUNTIME_CACHE_DIR_NAMES)
+
+
+class PowerShellSandboxMounts(unittest.TestCase):
+    def test_home_local_runtime_and_modules_use_neutral_read_only_mounts(self):
+        import toolchains
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            workspace = root / "workspace"; workspace.mkdir()
+            runtime = root / "home" / "powershell"; runtime.mkdir(parents=True)
+            executable = runtime / "pwsh"; executable.write_text("")
+            modules = root / "state" / "Modules"; modules.mkdir(parents=True)
+            completed = subprocess.CompletedProcess([], 0, "", "")
+            with mock.patch.object(common.shutil, "which", return_value="/usr/bin/bwrap"), \
+                 mock.patch.object(toolchains, "powershell_runtime",
+                                   return_value=executable), \
+                 mock.patch.object(toolchains, "powershell_module_root",
+                                   return_value=modules), \
+                 mock.patch.object(toolchains, "effective_path",
+                                   return_value="/usr/bin:/bin"), \
+                 mock.patch.object(common.subprocess, "run",
+                                   return_value=completed) as run:
+                common._sandboxed_command(["pwsh", "-Version"], workspace, 10)
+        command = run.call_args.args[0]
+        self.assertIn(["--ro-bind", str(runtime),
+                       toolchains.POWERSHELL_RUNTIME_MOUNT],
+                      [command[index:index + 3]
+                       for index in range(len(command) - 2)])
+        self.assertIn(["--ro-bind", str(modules),
+                       toolchains.POWERSHELL_MODULES_MOUNT],
+                      [command[index:index + 3]
+                       for index in range(len(command) - 2)])
+        path_index = command.index("PATH")
+        self.assertTrue(command[path_index + 1].startswith(
+            toolchains.POWERSHELL_RUNTIME_MOUNT + ":"))
+        module_index = command.index("PSModulePath")
+        self.assertTrue(command[module_index + 1].startswith(
+            toolchains.POWERSHELL_MODULES_MOUNT + ":"))

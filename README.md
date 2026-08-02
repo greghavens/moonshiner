@@ -138,6 +138,14 @@ moonshiner seed run --id calendar-reschedule --brief "Reschedule independent app
 
 Completed seeds enter the trace queue automatically. Categories and tags organize the catalog and can optionally select training data; they do not create separate trace pipelines.
 
+Seed verifiers may declare executable and PowerShell-module prerequisites in
+`task.json`. Moonshiner resolves a host PowerShell 7 installation—including a
+user-local `pwsh` on Linux—or installs Homebrew's `powershell` formula when it
+is absent. Declared PowerShell modules are downloaded with their exact declared
+versions and dependencies into project-managed storage, then mounted read-only
+inside the offline verifier sandbox. A provisioning failure stops seed
+authoring before the seed judge is called and preserves the authored candidate.
+
 ## Traces
 
 Running `moonshiner` is the normal way to keep tracing continuously. To request a deliberate bounded run:

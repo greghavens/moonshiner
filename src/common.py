@@ -472,7 +472,9 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int):
     """Run seed-controlled commands offline with no home or inherited secrets."""
     if shutil.which("bwrap") is None:
         raise RuntimeError("bubblewrap is required to execute seed commands safely")
-    from toolchains import effective_path
+    from toolchains import (POWERSHELL_MODULES_MOUNT, POWERSHELL_RUNTIME_MOUNT,
+                            effective_path, powershell_module_root,
+                            powershell_runtime)
     sandbox_path = effective_path()
     cmd = ["bwrap", "--die-with-parent", "--unshare-net", "--unshare-pid",
            "--ro-bind", "/", "/"]
@@ -487,12 +489,23 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int):
         # home tmpfs preserves access to the host sources without exposing home.
         cmd += ["--ro-bind", str(cargo_bin), "/mnt",
                 "--ro-bind", str(rustup_home), "/media"]
-    cmd += ["--tmpfs", str(Path.home()),
-            "--tmpfs", "/tmp", "--dev-bind", "/dev", "/dev",
+    cmd += ["--tmpfs", str(Path.home()), "--tmpfs", "/tmp"]
+    pwsh = powershell_runtime()
+    if pwsh is not None:
+        cmd += ["--ro-bind", str(pwsh.parent), POWERSHELL_RUNTIME_MOUNT]
+        sandbox_path = POWERSHELL_RUNTIME_MOUNT + ":" + sandbox_path
+    module_root = powershell_module_root()
+    if module_root.is_dir():
+        cmd += ["--ro-bind", str(module_root), POWERSHELL_MODULES_MOUNT]
+    cmd += ["--dev-bind", "/dev", "/dev",
             "--proc", "/proc", "--bind", str(workspace), str(workspace),
             "--clearenv", "--setenv", "PATH", sandbox_path,
             "--setenv", "HOME", str(workspace / ".sandbox-home"),
             "--chdir", str(workspace)]
+    if module_root.is_dir():
+        builtin_modules = POWERSHELL_RUNTIME_MOUNT + "/Modules"
+        cmd += ["--setenv", "PSModulePath",
+                POWERSHELL_MODULES_MOUNT + os.pathsep + builtin_modules]
     if cargo_bin.is_dir() and rustup_home.is_dir():
         cmd += [
                 "--setenv", "PATH", "/mnt:" + sandbox_path,
@@ -510,8 +523,17 @@ def preflight_seed_environment(seed: dict) -> tuple[bool, str]:
     legitimately invoke a file created by ``reference_fix.patch`` and must
     never run against the intentionally broken baseline used for tracing.
     """
+    from toolchains import (declared_commands, declared_powershell_modules,
+                            missing_executables, provision,
+                            provision_powershell_modules)
+    deployed, deployment_detail = provision(declared_commands(seed))
+    if not deployed:
+        return False, deployment_detail
+    modules_deployed, modules_detail = provision_powershell_modules(
+        declared_powershell_modules(seed))
+    if not modules_deployed:
+        return False, modules_detail
     workspace = materialize(seed, name=f"environment-{seed['id']}")
-    from toolchains import missing_executables, provision
     # Preflight sandboxes are scratch: one per claim, yielding a verdict rather
     # than an artifact. Unremoved they outweigh the traces. A failed one is kept
     # because it is the evidence an infrastructure failure is diagnosed from.
