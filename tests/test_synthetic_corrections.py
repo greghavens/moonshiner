@@ -12,6 +12,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import synthetic_corrections as corrections  # noqa: E402
+import common  # noqa: E402
 import publish_queue  # noqa: E402
 import hf_sync  # noqa: E402
 from run_state import connect, create_run, finish_attempt, start_attempt  # noqa: E402
@@ -155,7 +156,8 @@ class SyntheticCorrectionContracts(unittest.TestCase):
         with mock.patch.object(corrections, "load_seeds",
                                return_value=[{"id": n, "prompt": "p"} for n in names]), \
              mock.patch.object(corrections, "correction_paths", return_value=paths), \
-             mock.patch.object(corrections, "_correction_runtime", return_value=runtime):
+             mock.patch.object(corrections, "_correction_runtime", return_value=runtime), \
+             mock.patch.object(common, "WORKSPACES", self.root / "model-workspaces"):
             return runtime, corrections.run(config=config, db_path=self.db_path,
                                             runtime=runtime, judge=mock.Mock())
 
@@ -167,6 +169,13 @@ class SyntheticCorrectionContracts(unittest.TestCase):
                          corrections.MAX_CONSECUTIVE_REVIEWER_FAILURES - 1)
         self.assertEqual(report["reviewer_failures"],
                          corrections.MAX_CONSECUTIVE_REVIEWER_FAILURES - 1)
+
+    def test_eligibility_reviewer_receives_only_a_staged_model_workspace(self):
+        runtime, _ = self._reviewer_failure_run(1)
+        workspace = runtime.run_review.call_args.args[1]
+        self.assertIn((self.root / "model-workspaces").resolve(),
+                      pathlib.Path(workspace).resolve().parents)
+        self.assertFalse(pathlib.Path(workspace).exists())
 
     def test_a_broken_reviewer_stops_before_spending_on_every_candidate(self):
         """Consecutive failures mean the reviewer itself is broken."""

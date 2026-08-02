@@ -78,8 +78,17 @@ class Runtime(abc.ABC):
 
     @staticmethod
     def require_persistent_workspace(workspace: Path) -> Path:
-        """Refuse to launch any model inside an ephemeral temp directory."""
+        """Refuse model contexts that are ephemeral or inherit AGENTS.md."""
         resolved = Path(workspace).resolve()
+        from configuration import PROJECT_ROOT
+        project = PROJECT_ROOT.resolve()
+        if resolved == project or project in resolved.parents:
+            raise RuntimeError(
+                f"model workspace must be outside the project repository: {resolved}")
+        for directory in (resolved, *resolved.parents):
+            if (directory / "AGENTS.md").is_file():
+                raise RuntimeError(
+                    f"model workspace ancestry contains AGENTS.md: {directory}")
         for temporary_root in (Path("/tmp"), Path("/var/tmp")):
             root = temporary_root.resolve()
             if resolved == root or root in resolved.parents:

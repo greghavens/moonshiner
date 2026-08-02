@@ -21,7 +21,7 @@ from audit_seeds import check as audit_seed
 from seed_inventory import bundled_plan_record
 
 SCHEMA = json.loads((ROOT / "schemas" / "author_review_verdict.schema.json").read_text())
-CANDIDATES = STORAGE_ROOT / "tasks" / "candidates"
+CANDIDATES = WORKSPACES / "seed-candidates"
 
 AUTHOR_SYSTEM = """You author one Moonshiner seed for the selected unmodified agent harness. Work only in the current workspace. Create exactly task.json, files/, and reference_fix.patch at the workspace root. The task may provide a safely simulated environment through fixtures, local services, or reversible state, but the harness's tools and their results must never be simulated, intercepted, embedded, or replaced. Never embed tool calls, tool results, expected call arguments, answer-key response maps, fictional tool schemas, initial service state, or .invalid URLs. A web-research task must require genuine network research against real reachable sources using the harness. Provide deterministic protected verification and a reference patch proving the requested deliverable can be produced. Do not run another coding agent."""
 
@@ -111,7 +111,7 @@ def _load_candidate(directory: Path, expected_id: str) -> dict:
 
 def _review_prompt(seed: dict, report: dict) -> str:
     return f"""Review and, when possible, FIX this authored Moonshiner seed in place.
-You may edit task.json, files/, tests, and reference_fix.patch. Preserve the core objective; repair prompt/test mismatches, weak tests, unrelated baseline bugs, broken patches, and nondeterminism. After edits, return only the required JSON verdict. Use verdict=accept only if the resulting on-disk seed is ready. Use needs_human if fixing it would redefine the objective.
+You are the final seed judge and are authorized to make every necessary in-scope repair without asking for human approval. You may edit task.json, files/, tests, and reference_fix.patch. Preserve the core objective; repair prompt/test mismatches, weak tests, unrelated baseline bugs, broken patches, and nondeterminism. Do not reject or defer a seed merely because it requires edits you can make. After edits, return only the required JSON verdict. Use verdict=accept only if the resulting on-disk seed is ready. Use needs_human only when the objective is genuinely ambiguous or fixing it would redefine the objective.
 
 SEED ID: {seed['id']}
 DETERMINISTIC VALIDATION BEFORE YOUR REVIEW:
