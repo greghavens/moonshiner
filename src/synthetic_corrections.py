@@ -13,8 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from common import (jsonl_lines, CONFIG, RUNS, STORAGE_ROOT, clear_runtime_caches, git_diff,
-                    load_seeds, materialize, protected_hashes, run_setup,
-                    run_verify, scrub_text)
+                    load_seeds, materialize, protected_hashes, remove_workspace,
+                    run_setup, run_verify, scrub_text, stage_workspace)
 from run_state import (connect, create_run, finish_attempt, set_run_status,
                        start_attempt)
 from runtimes import get_judge, get_runtime
@@ -578,9 +578,14 @@ def run(*, dry_run: bool = False, config: dict | None = None,
                                     "\n\n".join(item["trace"] for item in failure_sections))
         eligibility_dir = correction_paths().root / "eligibility" / seed["id"]
         eligibility_dir.mkdir(parents=True, exist_ok=True)
-        eligibility = runtime.run_review(prompt, latest_artifact,
-            out_dir=eligibility_dir,
-            schema=None, read_only=True)
+        eligibility_workspace = stage_workspace(
+            latest_artifact, f"correction-eligibility-{seed['id']}")
+        try:
+            eligibility = runtime.run_review(prompt, eligibility_workspace,
+                out_dir=eligibility_dir,
+                schema=None, read_only=True)
+        finally:
+            remove_workspace(eligibility_workspace)
         report["model_calls"] += 1
         if (eligibility.return_code != 0 or eligibility.timed_out
                 or not eligibility.model_attested or eligibility.error):

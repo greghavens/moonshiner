@@ -19,7 +19,8 @@ echo "== unit tests =="
 if [ -d tests ] && ls tests/test_*.py >/dev/null 2>&1; then
   test_home=$(mktemp -d -t moonshiner-check-XXXXXX)
   trap 'rm -rf "$test_home"' EXIT
-  MOONSHINER_HOME="$test_home" python3 -m unittest discover -s tests -v
+  MOONSHINER_HOME="$test_home" XDG_DATA_HOME="$test_home/model-data" \
+    python3 -m unittest discover -s tests -v
 else
   echo "(no tests yet)"
 fi

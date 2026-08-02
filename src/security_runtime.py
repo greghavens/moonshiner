@@ -9,8 +9,8 @@ before any model-generated command can run. Codex keeps the already-loaded
 session credential in its parent process, while the command sandbox has no
 credential file to steal.
 
-The isolated ``CODEX_HOME`` and teacher workspace live under the project's
-``.moonshiner/runs`` tree and are retained for audit. They are relocatable with
+The isolated ``CODEX_HOME`` and teacher workspace are retained for audit, but
+the model sees them only at neutral sandbox paths. They are relocatable with
 ``MOONSHINER_SECURITY_RUNTIME_ROOT`` / ``MOONSHINER_SECURITY_WORK_ROOT``.
 """
 from __future__ import annotations
@@ -30,6 +30,8 @@ from common import RUNS, jsonl_lines
 ROOT = Path(__file__).resolve().parent.parent
 SECURITY = ROOT / "security"
 RUNTIME = SECURITY / "runtime"
+SANDBOX_WORKSPACE = Path("/mnt/moonshiner-workspace")
+SANDBOX_CODEX_HOME = Path("/mnt/moonshiner-codex-home")
 
 
 def _real_codex_home() -> Path:
@@ -74,31 +76,42 @@ def _outer_sandbox(inner: list[str], cwd: Path, codex_home: Path) -> list[str]:
     # / is read-only for normal binaries/libraries. Private homes and the user runtime
     # are replaced with empty tmpfs mounts. Only the disposable repo and ephemeral
     # CODEX_HOME are writable/readable host binds.
-    hidden_mounts = [str(Path.home())]
+    from configuration import PROJECT_ROOT
+    hidden_mounts = {str(Path.home()), str(Path.home().resolve()),
+                     str(PROJECT_ROOT), str(PROJECT_ROOT.resolve())}
     if Path("/root").exists() and Path.home() != Path("/root"):
-        hidden_mounts.append("/root")
+        hidden_mounts.add("/root")
     user_runtime = Path(f"/run/user/{os.getuid()}")
     if user_runtime.exists():
-        hidden_mounts.append(str(user_runtime))
+        hidden_mounts.add(str(user_runtime))
     argv = [
         bwrap,
         "--die-with-parent",
         "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try",
         "--ro-bind", "/", "/",
     ]
-    for mount in hidden_mounts:
+    for mount in sorted(hidden_mounts, key=lambda value: (value.count("/"), value)):
+        # Once an ancestor is hidden, mounting a second tmpfs below it is both
+        # unnecessary and can fail because the empty ancestor has no target.
+        path = Path(mount)
+        if any(Path(parent) != path and Path(parent) in path.parents
+               for parent in hidden_mounts):
+            continue
         argv += ["--tmpfs", mount]
     argv += [
         "--tmpfs", "/tmp",
+        "--tmpfs", "/mnt",
         "--dev-bind", "/dev", "/dev",
         "--proc", "/proc",
-        "--bind", str(cwd), str(cwd),
-        "--bind", str(codex_home), str(codex_home),
-        "--setenv", "HOME", str(codex_home),
-        "--setenv", "CODEX_HOME", str(codex_home),
+        "--dir", str(SANDBOX_WORKSPACE),
+        "--dir", str(SANDBOX_CODEX_HOME),
+        "--bind", str(cwd), str(SANDBOX_WORKSPACE),
+        "--bind", str(codex_home), str(SANDBOX_CODEX_HOME),
+        "--setenv", "HOME", str(SANDBOX_CODEX_HOME),
+        "--setenv", "CODEX_HOME", str(SANDBOX_CODEX_HOME),
         "--setenv", "USER", "codex",
         "--setenv", "LOGNAME", "codex",
-        "--chdir", str(cwd),
+        "--chdir", str(SANDBOX_WORKSPACE),
         "--",
         *inner,
     ]
@@ -161,12 +174,12 @@ def run_codex(
         "--ignore-user-config", "--ignore-rules",
         "--sandbox", sandbox,
         "--skip-git-repo-check",
-        "-C", str(cwd),
+        "-C", str(SANDBOX_WORKSPACE),
     ]
     if output_schema is not None:
         schema_path = codex_home / "output.schema.json"
         schema_path.write_text(json.dumps(output_schema))
-        cmd += ["--output-schema", str(schema_path)]
+        cmd += ["--output-schema", str(SANDBOX_CODEX_HOME / schema_path.name)]
     cmd.append("-")
     cmd = _outer_sandbox(cmd, cwd, codex_home)
 

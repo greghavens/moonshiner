@@ -56,6 +56,20 @@ class TheJudgeCorrectsAndTheSeedMovesOn(unittest.TestCase):
         self.assertIn("final_report = validate_report(seed)", source,
                       "the report is still produced, it just does not veto")
 
+    def test_judge_is_authorized_to_repair_without_approval(self):
+        prompt = seed_pipeline._review_prompt(
+            {"id": "vcf91-0004"}, {"passed": False})
+        self.assertIn("authorized to make every necessary in-scope repair", prompt)
+        self.assertIn("without asking for human approval", prompt)
+        self.assertIn("Do not reject or defer a seed merely because it requires edits", prompt)
+        self.assertIn("Use needs_human only", prompt)
+
+    def test_seed_judge_is_edit_enabled(self):
+        source = (ROOT / "src" / "seed_pipeline.py").read_text()
+        call = source[source.index("review = judge.run_review("):]
+        call = call[:call.index("# Reload judge edits")]
+        self.assertIn("read_only=False", call)
+
 
 class ASeedIsNeverDiscarded(unittest.TestCase):
     """Authoring is paid for. Judging is paid for. Discarding buys both again.

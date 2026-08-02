@@ -30,6 +30,28 @@ def _storage_root() -> Path:
 STORAGE_ROOT = _storage_root()
 
 
+def model_workspace_root(*, project_root: Path | None = None,
+                         data_home: Path | None = None) -> Path:
+    """Return the project-scoped model workspace root outside the project.
+
+    Model CLIs discover instruction files by walking upward from their current
+    working directory.  Project state commonly lives at ``.moonshiner`` below
+    the checkout, so it must never also be used as a model workspace root.
+    """
+    if project_root is None:
+        from configuration import PROJECT_ROOT
+        project_root = PROJECT_ROOT
+    project = Path(project_root).resolve()
+    base = Path(data_home or os.environ.get(
+        "XDG_DATA_HOME", Path.home() / ".local" / "share")).expanduser().resolve()
+    project_key = hashlib.sha256(str(project).encode()).hexdigest()[:12]
+    root = (base / "moonshiner" / "projects" / project_key / "workspaces").resolve()
+    if root == project or project in root.parents:
+        raise RuntimeError(
+            f"model workspace root must be outside the project repository: {root}")
+    return root
+
+
 def _load_config() -> dict:
     """Load built-in, user, then repository-local configuration layers."""
     from configuration import load_config
@@ -77,7 +99,7 @@ SEEDS_DIR = _authoring_seeds_dir() or _corpus_seeds
 BEHAVIOR_WORLDS = (SEEDS_DIR.parent / "behavior-worlds.json"
                    if (SEEDS_DIR.parent / "behavior-worlds.json").is_file()
                    else ROOT / "tasks" / "behavior-worlds.json")
-WORKSPACES = STORAGE_ROOT / "workspaces"
+WORKSPACES = model_workspace_root()
 TRACES = STORAGE_ROOT / "traces"
 DATA = STORAGE_ROOT / "data"
 RUNS = STORAGE_ROOT / "runs"
@@ -393,6 +415,20 @@ def remove_workspace(path: Path, *, workspaces: Path | None = None) -> None:
         function(failed)
 
     shutil.rmtree(resolved, onexc=force_writable)
+
+
+def stage_workspace(source: Path, name: str) -> Path:
+    """Copy an archived review input into an isolated model workspace."""
+    source = Path(source).resolve()
+    workspace = WORKSPACES / f"{name}-{uuid.uuid4().hex[:10]}"
+    if workspace.resolve().parent != WORKSPACES.resolve():
+        raise ValueError(f"unsafe staged workspace name: {name!r}")
+    links = [path for path in source.rglob("*") if path.is_symlink()]
+    if links:
+        raise ValueError(f"review input contains prohibited symlink: {links[0]}")
+    workspace.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, workspace)
+    return workspace
 
 
 def materialize(seed: dict, name: str | None = None) -> Path:
