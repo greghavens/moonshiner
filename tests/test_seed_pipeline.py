@@ -35,6 +35,16 @@ class AuthorIsToldTheId(unittest.TestCase):
                       system)
         self.assertIn("never be simulated", system)
 
+    def test_author_and_reauthor_receive_self_containment_and_prompt_purity(self):
+        for replace_synthetic in (False, True):
+            with self.subTest(replace_synthetic=replace_synthetic):
+                system = seed_pipeline._author_system(
+                    "security-r1-0001", replace_synthetic=replace_synthetic)
+                self.assertIn("self-contained", system)
+                self.assertIn("sibling repositories", system)
+                self.assertIn("prompt must contain only the end-user task", system)
+                self.assertIn("authoring instructions", system)
+
 
 class TheJudgeCorrectsAndTheSeedMovesOn(unittest.TestCase):
     """Authoring is: author, judge, judge fixes, move on.
@@ -63,6 +73,16 @@ class TheJudgeCorrectsAndTheSeedMovesOn(unittest.TestCase):
         self.assertIn("without asking for human approval", prompt)
         self.assertIn("Do not reject or defer a seed merely because it requires edits", prompt)
         self.assertIn("Use needs_human only", prompt)
+
+    def test_judge_independently_enforces_seed_artifact_integrity(self):
+        prompt = seed_pipeline._review_prompt(
+            {"id": "security-r1-0001"}, {"passed": False})
+        self.assertIn("Independently enforce the final artifact contract", prompt)
+        self.assertIn("must be self-contained", prompt)
+        self.assertIn("prompt must contain only the end-user task", prompt)
+        self.assertIn("unmodified harness must execute every tool call", prompt)
+        self.assertIn("Web research must use real reachable sources", prompt)
+        self.assertIn("grade the resulting environment or artifacts", prompt)
 
     def test_seed_judge_is_edit_enabled(self):
         source = (ROOT / "src" / "seed_pipeline.py").read_text()

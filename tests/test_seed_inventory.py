@@ -1,4 +1,5 @@
 """Seed inventory counts distinguish presence from execution readiness."""
+import json
 import pathlib
 import sys
 import unittest
@@ -77,6 +78,35 @@ class SeedInventoryCounts(unittest.TestCase):
             self.assertIn(f'Category: {record["category"]}.', record["brief"])
             self.assertIn("Training tags: " + ", ".join(record["training_tags"]),
                           record["brief"])
+
+    def test_security_round_is_3000_unique_scenarios_behind_behavioral_work(self):
+        records = seed_inventory.bundled_plan_records()
+        security = [record for record in records
+                    if record.get("plan") == "security-round-1"]
+        self.assertEqual(len(security), 3000)
+        self.assertEqual(len({record["id"] for record in security}), 3000)
+        self.assertEqual(len({record["brief"] for record in security}), 3000)
+        self.assertEqual(security[0]["id"], "security-r1-0001")
+        self.assertEqual(security[-1]["id"], "security-r1-3000")
+        self.assertEqual(len({record["scenario"] for record in security}), 30)
+        self.assertEqual({record["artifact_contract"] for record in security},
+                         {"genuine_harness_task"})
+        self.assertTrue(all("security-round:1" in record["training_tags"]
+                            for record in security))
+
+        plan = json.loads((_ROOT / "plans" / "security-round-1.json").read_text())
+        for values in plan["dimensions"].values():
+            self.assertTrue(all(any(value in record["brief"] for record in security)
+                                for value in values))
+
+        priorities = seed_inventory.plan_priorities()
+        behavior_priority = priorities["instruction-following-r3-0001"]
+        security_priority = priorities.get("security-r1-0001", 0)
+        with mock.patch.object(seed_inventory, "select_seeds", return_value=[
+                {"id": "legacy", "tool_results": {"fake": "result"}}]):
+            replacement_priority = seed_inventory.plan_priorities()["legacy"]
+        self.assertGreater(behavior_priority, security_priority)
+        self.assertGreater(security_priority, replacement_priority)
 
     def test_bundled_plan_extends_documented_inventory_without_cataloguing_unwritten_seeds(self):
         records = [{"id": "planned-new", "brief": "A new scenario",
