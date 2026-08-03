@@ -28,6 +28,7 @@ MISSING_EXECUTABLES = (
     re.compile(r"(?:^|\n)[^\n:]*:\s*([^\s:]+):\s*(?:command )?not found(?:\n|$)",
                re.IGNORECASE),
 )
+ENVIRONMENT_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", re.DOTALL)
 
 
 @lru_cache(maxsize=1)
@@ -69,8 +70,15 @@ def declared_commands(seed: dict) -> list[str]:
     prerequisites = seed.get("prerequisites")
     commands: list[str] = []
     if isinstance(prerequisites, dict):
-        commands.extend(value for value in prerequisites.get("commands", [])
-                        if isinstance(value, str) and value)
+        for value in prerequisites.get("commands", []):
+            if not isinstance(value, str) or not value.strip():
+                continue
+            command = value.strip()
+            # Environment assignments configure a command; they are not
+            # executables and therefore have nothing to provision.
+            if ENVIRONMENT_ASSIGNMENT.fullmatch(command):
+                continue
+            commands.append(command)
     if declared_powershell_modules(seed) and "pwsh" not in commands:
         commands.append("pwsh")
     return list(dict.fromkeys(commands))
