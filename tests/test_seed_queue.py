@@ -1,7 +1,9 @@
 """The single seed queue honors authored and retired terminal states."""
 import json
+import fcntl
 import pathlib
 import sys
+import tempfile
 import unittest
 import threading
 from unittest import mock
@@ -13,6 +15,29 @@ import seed_queue  # noqa: E402
 
 
 class SeedQueueSelection(unittest.TestCase):
+    def test_active_claims_include_only_locks_held_by_workers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            claims = pathlib.Path(directory)
+            held_path = claims / "seed-active.lock"
+            idle_path = claims / "seed-idle.lock"
+            held = held_path.open("a+")
+            idle_path.touch()
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                self.assertEqual(seed_queue.active_claim_ids(claims),
+                                 {"seed-active"})
+            finally:
+                fcntl.flock(held, fcntl.LOCK_UN)
+                held.close()
+            reader = idle_path.open("r")
+            fcntl.flock(reader, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            try:
+                self.assertEqual(seed_queue.active_claim_ids(claims), set(),
+                                 "concurrent status readers are not workers")
+            finally:
+                fcntl.flock(reader, fcntl.LOCK_UN)
+                reader.close()
+
     def test_retired_and_authored_seeds_are_not_requeued(self):
         with mock.patch.object(seed_queue, "documented_plan_items", return_value={
                 "authored": "done", "retired": "retired", "waiting": "new"}), \

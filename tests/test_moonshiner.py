@@ -255,6 +255,7 @@ class FrontDoor(unittest.TestCase):
                  "waiting": set(), "exhausted": set(),
                  "needs_reauthoring": set()}), \
              mock.patch("run_state.live_trace_run_ids", return_value=set()), \
+             mock.patch("seed_queue.active_claim_ids", return_value=set()), \
              mock.patch("publish_queue.accepted_tasks", return_value=[]), \
              mock.patch("synthetic_corrections.eligible_exhausted_attempts",
                         return_value=[]), \

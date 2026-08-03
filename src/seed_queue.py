@@ -19,6 +19,30 @@ from seed_repo import ensure as ensure_seed_repo
 CLAIMS = STORAGE_ROOT / "locks" / "seed-authoring"
 
 
+def active_claim_ids(claims: Path = CLAIMS) -> set[str]:
+    """Return seed IDs whose queue claims are currently held by a worker."""
+    active: set[str] = set()
+    if not claims.is_dir():
+        return active
+    for path in claims.glob("*.lock"):
+        try:
+            claim = path.open("r")
+        except OSError:
+            continue
+        try:
+            # Status readers take shared locks so concurrent status commands do
+            # not mistake one another for author workers. Workers hold exclusive
+            # locks for the full subprocess lifetime.
+            fcntl.flock(claim, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            active.add(path.stem)
+        else:
+            fcntl.flock(claim, fcntl.LOCK_UN)
+        finally:
+            claim.close()
+    return active
+
+
 def _moonshiner() -> str:
     executable = shutil.which("moonshiner")
     if not executable:
