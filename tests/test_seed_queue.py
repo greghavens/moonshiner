@@ -111,6 +111,40 @@ class PlanPriority(unittest.TestCase):
             self.assertEqual(["zzz-0001", "zzz-0002", "aaa-0001", "aaa-0002"],
                              ordered)
 
+    def test_replacement_work_has_lower_priority_than_first_authorship(self):
+        import seed_inventory
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = pathlib.Path(tmp)
+            self._plan(directory, "replacement", "legacy-", priority=100)
+            replacement = {"id": "legacy-0001"}
+            with mock.patch.object(seed_inventory, "PLANS", directory), \
+                 mock.patch.object(seed_inventory, "select_seeds",
+                                   return_value=[replacement]), \
+                 mock.patch.object(seed_inventory, "synthetic_tool_contract",
+                                   return_value="legacy synthetic contract"):
+                priorities = seed_inventory.plan_priorities()
+            self.assertEqual(priorities["legacy-0001"], -1)
+
+
+class ReplacementIntake(unittest.TestCase):
+    def test_replacements_are_queued_without_an_imports_directory(self):
+        import seed_inventory
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            plans = root / "plans"
+            plans.mkdir()
+            replacement = {"id": "legacy-seed", "training_tags": ["legacy"],
+                           "prompt": "Preserve this objective."}
+            with mock.patch.object(seed_inventory, "PLANS", plans), \
+                 mock.patch.object(seed_inventory, "STORAGE_ROOT", root / "state"), \
+                 mock.patch.object(seed_inventory, "select_seeds",
+                                   return_value=[replacement]), \
+                 mock.patch.object(seed_inventory, "synthetic_tool_contract",
+                                   return_value="legacy synthetic contract"):
+                items = seed_inventory.documented_plan_items()
+            self.assertIn("legacy-seed", items)
+            self.assertIn("Reauthor this existing objective", items["legacy-seed"])
+
 
 class TracePriorityIsSeparate(unittest.TestCase):
     """Authoring order and tracing order are different questions.

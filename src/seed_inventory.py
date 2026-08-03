@@ -109,7 +109,11 @@ def plan_priorities(directory: Path | None = None) -> dict[str, int]:
     A plan carrying a competence the model needs now would otherwise wait
     behind every alphabetically earlier ID in a corpus of thousands.
     """
-    return _plan_priorities("priority", directory)
+    priorities = _plan_priorities("priority", directory)
+    if directory is None:
+        priorities.update({seed["id"]: -1 for seed in select_seeds()
+                           if synthetic_tool_contract(seed)})
+    return priorities
 
 
 def _plan_priorities(field: str, directory: Path | None = None) -> dict[str, int]:
@@ -146,21 +150,20 @@ def documented_plan_items() -> dict[str, str]:
     items.update((record["id"], record["brief"])
                  for record in bundled_plan_records())
     imports = STORAGE_ROOT / "imports"
-    if not imports.is_dir():
-        return items
-    for path in sorted(imports.glob("**/WAVE*_USECASES.md")):
-        try:
-            wave = int(path.name.removeprefix("WAVE").split("_", 1)[0])
-            if wave not in {10, 11, 14, 17, 18}:
+    if imports.is_dir():
+        for path in sorted(imports.glob("**/WAVE*_USECASES.md")):
+            try:
+                wave = int(path.name.removeprefix("WAVE").split("_", 1)[0])
+                if wave not in {10, 11, 14, 17, 18}:
+                    continue
+                if wave in {17, 18}:
+                    for seed_id, chunk, objective in matrix_items(path, wave):
+                        items.setdefault(seed_id, f"Wave {wave}, chunk {chunk}. {objective}")
+                else:
+                    for seed_id, chunk, text in catalog_items(path):
+                        items.setdefault(seed_id, f"Wave {wave}, chunk {chunk}. {text}")
+            except (OSError, ValueError):
                 continue
-            if wave in {17, 18}:
-                for seed_id, chunk, objective in matrix_items(path, wave):
-                    items.setdefault(seed_id, f"Wave {wave}, chunk {chunk}. {objective}")
-            else:
-                for seed_id, chunk, text in catalog_items(path):
-                    items.setdefault(seed_id, f"Wave {wave}, chunk {chunk}. {text}")
-        except (OSError, ValueError):
-            continue
     for seed in select_seeds():
         if synthetic_tool_contract(seed):
             tags = ", ".join(seed.get("training_tags") or [])
