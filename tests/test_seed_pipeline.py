@@ -45,6 +45,17 @@ class AuthorIsToldTheId(unittest.TestCase):
                 self.assertIn("prompt must contain only the end-user task", system)
                 self.assertIn("authoring instructions", system)
 
+    def test_author_and_reauthor_cannot_invent_product_requirements(self):
+        for replace_synthetic in (False, True):
+            with self.subTest(replace_synthetic=replace_synthetic):
+                system = seed_pipeline._author_system(
+                    "security-r1-0001", replace_synthetic=replace_synthetic)
+                self.assertIn("requested seed objective and constraints", system)
+                self.assertIn("Do not broaden them", system)
+                self.assertIn("approval or eligibility gate", system)
+                self.assertIn("unless the", system)
+                self.assertIn("explicitly requests it", system)
+
 
 class TheJudgeCorrectsAndTheSeedMovesOn(unittest.TestCase):
     """Authoring is: author, judge, judge fixes, move on.
@@ -83,6 +94,14 @@ class TheJudgeCorrectsAndTheSeedMovesOn(unittest.TestCase):
         self.assertIn("unmodified harness must execute every tool call", prompt)
         self.assertIn("Web research must use real reachable sources", prompt)
         self.assertIn("grade the resulting environment or artifacts", prompt)
+
+    def test_judge_cannot_invent_product_requirements_while_repairing(self):
+        prompt = seed_pipeline._review_prompt(
+            {"id": "security-r1-0001"}, {"passed": False})
+        self.assertIn("Judge and repair only against the requested", prompt)
+        self.assertIn("Do not broaden them", prompt)
+        self.assertIn("approval or eligibility gate", prompt)
+        self.assertIn("unless the seed explicitly requests it", prompt)
 
     def test_seed_judge_is_edit_enabled(self):
         source = (ROOT / "src" / "seed_pipeline.py").read_text()
