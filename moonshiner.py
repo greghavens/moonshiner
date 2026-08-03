@@ -519,10 +519,20 @@ def _setup(argv: list[str] | None = None) -> int:
 
 
 def _configured() -> bool:
-    from configuration import LOCAL_PATH, load_config
+    from configuration import LOCAL_PATH
     if not LOCAL_PATH.exists():
         return False
-    return bool(load_config().get("onboarding", {}).get("complete"))
+    try:
+        local = json.loads(LOCAL_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    onboarding = local.get("onboarding")
+    if isinstance(onboarding, dict) and "complete" in onboarding:
+        return bool(onboarding["complete"])
+    # Projects configured before the onboarding marker existed already have
+    # an explicit queue selection. A newly confirmed project has only its
+    # workspace and storage metadata, so it still enters setup.
+    return bool(((local.get("pipeline") or {}).get("queues") or {}))
 
 
 def _ensure_configured_pi() -> None:
