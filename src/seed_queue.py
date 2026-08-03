@@ -7,10 +7,10 @@ import subprocess
 import sys
 import shutil
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from common import CONFIG, STORAGE_ROOT, load_seeds, synthetic_tool_contract
-from configuration import PROJECT_ROOT
+from configuration import PROJECT_ROOT, load_config
 from runtimes.availability import INFRASTRUCTURE_EXIT, USAGE_LIMIT_EXIT
 from seed_inventory import (authored_ids, documented_plan_items, plan_priorities,
                             retired_seed_ids)
@@ -69,30 +69,49 @@ def main(argv=None) -> int:
         parser.error("metered seed authoring requires --yes")
     failed = 0
     out_of_quota = False
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="seed-worker") as pool:
-        futures = {pool.submit(author_one, seed_id, plans) for seed_id in missing}
-        for future in as_completed(futures):
-            seed_id, code = future.result()
-            # One seed reporting no quota means every remaining seed would too.
-            # A broken environment is not this seed's fault and will break
-            # every seed after it. Stop authoring entirely until it is fixed.
-            if code == INFRASTRUCTURE_EXIT:
-                out_of_quota = True
-                for pending in futures:
-                    pending.cancel()
-                print(f"[seed stopped] {seed_id}: INFRASTRUCTURE FAILURE — "
-                      "no further seeds will be authored until it is fixed",
-                      file=sys.stderr, flush=True)
-                continue
-            if code == USAGE_LIMIT_EXIT:
-                out_of_quota = True
-                for pending in futures:
-                    pending.cancel()
-                print(f"[seed stopped] {seed_id}: runtime out of quota",
-                      file=sys.stderr, flush=True)
-                continue
-            failed += bool(code)
-            print(f"[seed {'failed' if code else 'authored'}] {seed_id}", flush=True)
+    pending = list(missing)
+    def configured_workers() -> int:
+        if args.workers:
+            return args.workers
+        value = int(((load_config().get("pipeline") or {}).get("seed") or {})
+                    .get("workers", workers))
+        if not 1 <= value <= 64:
+            raise ValueError("pipeline.seed.workers must be from 1 through 64")
+        return value
+    with ThreadPoolExecutor(max_workers=64, thread_name_prefix="seed-worker") as pool:
+        futures: set = set()
+        while pending or futures:
+            target = configured_workers()
+            while pending and len(futures) < target and not out_of_quota:
+                futures.add(pool.submit(author_one, pending.pop(0), plans))
+            if not futures:
+                break
+            done, _ = wait(futures, timeout=2, return_when=FIRST_COMPLETED)
+            for future in done:
+                futures.remove(future)
+                seed_id, code = future.result()
+                # One seed reporting no quota means every remaining seed would too.
+                # A broken environment is not this seed's fault and will break
+                # every seed after it. Stop authoring entirely until it is fixed.
+                if code == INFRASTRUCTURE_EXIT:
+                    out_of_quota = True
+                    pending.clear()
+                    for queued in futures:
+                        queued.cancel()
+                    print(f"[seed stopped] {seed_id}: INFRASTRUCTURE FAILURE — "
+                          "no further seeds will be authored until it is fixed",
+                          file=sys.stderr, flush=True)
+                    continue
+                if code == USAGE_LIMIT_EXIT:
+                    out_of_quota = True
+                    pending.clear()
+                    for queued in futures:
+                        queued.cancel()
+                    print(f"[seed stopped] {seed_id}: runtime out of quota",
+                          file=sys.stderr, flush=True)
+                    continue
+                failed += bool(code)
+                print(f"[seed {'failed' if code else 'authored'}] {seed_id}", flush=True)
     if out_of_quota:
         return USAGE_LIMIT_EXIT
     return 1 if failed else 0
