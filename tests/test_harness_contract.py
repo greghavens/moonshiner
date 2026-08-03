@@ -21,18 +21,40 @@ from runtimes import (REGISTRY, get_judge, get_seed_author, get_teacher,
 class HarnessContract(unittest.TestCase):
     def test_current_supported_trace_harnesses_are_explicit(self):
         self.assertEqual(set(runtime_names()), {"claude-code", "codex", "pi"})
-        self.assertEqual(set(source_runtime_names()), {"codex", "pi"})
+        self.assertEqual(set(source_runtime_names()), set(runtime_names()))
 
-    def test_claude_code_is_judge_only(self):
+    def test_claude_code_can_fill_every_runtime_role(self):
         config = {"teacher": {"runtime": "claude-code", "model": "claude"},
                   "judge": {"runtime": "claude-code", "model": "claude"},
                   "seed_author": {"runtime": "claude-code", "model": "claude"},
                   "runtimes": {"claude-code": {}}}
-        with self.assertRaisesRegex(SystemExit, "judge-only"):
-            get_teacher(config)
-        with self.assertRaisesRegex(SystemExit, "judge-only"):
-            get_seed_author(config)
+        self.assertEqual(get_teacher(config).name, "claude-code")
+        self.assertEqual(get_seed_author(config).name, "claude-code")
         self.assertEqual(get_judge(config).name, "claude-code")
+
+    def test_claude_code_seed_author_reaches_the_runtime(self):
+        config = {
+            "seed_author": {"runtime": "claude-code", "model": "claude-opus-5"},
+            "runtimes": {"claude-code": {"cli": "claude"}},
+        }
+        runtime = get_seed_author(config)
+        completed = SimpleNamespace(
+            returncode=0, stderr="", stdout=(
+                '{"type":"system","subtype":"init","model":"claude-opus-5"}\n'
+                '{"type":"result","subtype":"success","usage":{}}\n'))
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = pathlib.Path(directory) / "workspace"
+            output = pathlib.Path(directory) / "output"
+            workspace.mkdir(); output.mkdir()
+            with mock.patch.object(runtime, "require_persistent_workspace",
+                                   return_value=workspace), \
+                 mock.patch("runtimes.claude_code.subprocess.run",
+                            return_value=completed) as launch:
+                result = runtime.run_trace(
+                    {"id": "seed"}, workspace, out_dir=output,
+                    system_prompt="author", prompt="build the seed")
+        self.assertEqual(result.return_code, 0)
+        self.assertIn("claude-opus-5", launch.call_args.args[0])
 
     def test_pipeline_calls_the_selected_runtime_adapter(self):
         source = inspect.getsource(generate_traces.trace_task)

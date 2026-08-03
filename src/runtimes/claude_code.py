@@ -56,8 +56,6 @@ class ClaudeCodeRuntime(Runtime):
                   security: bool = False,
                   tools: list[str] | None = None) -> TraceResult:
         workspace = self.require_persistent_workspace(workspace)
-        if not self.runtime_config.get("unsafe_host_access", False):
-            raise RuntimeError("claude-code teacher disabled until a contained runtime is configured")
         cmd = self._base_cmd()
         cmd += ["--append-system-prompt", system_prompt]
 
