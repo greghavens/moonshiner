@@ -516,3 +516,22 @@ class ARunawayJobMustNotKillItsQueue(unittest.TestCase):
     def test_every_queue_unit_gets_it(self):
         source = (pathlib.Path(m.__file__).resolve()).read_text()
         self.assertGreaterEqual(source.count("*_memory_ceiling()"), 4)
+
+    def test_seed_queue_restarts_after_oom_but_not_usage_or_infrastructure_exit(self):
+        from runtimes.availability import INFRASTRUCTURE_EXIT, USAGE_LIMIT_EXIT
+        config = {"pipeline": {"queues": {"seed_authoring": True,
+                                                "tracing": False}}}
+        with mock.patch("common.CONFIG", config), \
+             mock.patch.object(m, "_ensure_configured_pi"), \
+             mock.patch("runtimes.availability.purge_legacy_markers"), \
+             mock.patch("seed_repo.ensure"), \
+             mock.patch.object(m.subprocess, "run", side_effect=[
+                 mock.Mock(returncode=3), mock.Mock(returncode=0),
+             ]) as run:
+            self.assertEqual(m._start_default_queues(), 0)
+        command = run.call_args_list[1].args[0]
+        self.assertIn("--property=Restart=on-failure", command)
+        self.assertIn("--property=RestartSec=10s", command)
+        self.assertIn(
+            f"--property=RestartPreventExitStatus={USAGE_LIMIT_EXIT} {INFRASTRUCTURE_EXIT}",
+            command)

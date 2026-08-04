@@ -588,6 +588,8 @@ def _start_default_queues() -> int:
             executable = Path(sys.executable).parent / "moonshiner"
             subprocess.run(["systemd-run", "--user", "--collect", f"--unit={unit}",
                             f"--property=WorkingDirectory={PROJECT_ROOT}",
+                            "--property=Restart=on-failure", "--property=RestartSec=10s",
+                            f"--property=RestartPreventExitStatus={USAGE_LIMIT_EXIT} {INFRASTRUCTURE_EXIT}",
                             *_memory_ceiling(), f"--setenv=PATH={os.environ.get('PATH', '')}",
                             str(executable), "seed", "queue", "--yes"], check=True)
     if queues.get("tracing", True):
