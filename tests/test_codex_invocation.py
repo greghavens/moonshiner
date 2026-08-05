@@ -1,12 +1,17 @@
 """Codex command construction: reviews must work outside a git checkout."""
+import json
 import pathlib
 import sys
+import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from runtimes.codex import CodexRuntime  # noqa: E402
+from runtimes.availability import ModelUnavailable  # noqa: E402
 
 
 def _runtime(runtime_config=None):
@@ -31,6 +36,24 @@ class BaseCommand(unittest.TestCase):
     def test_model_flag_keeps_its_value_adjacent(self):
         cmd = _runtime()._base_cmd(sandbox="read-only")
         self.assertEqual(cmd[cmd.index("--model") + 1], "test-model")
+
+
+class ReviewAvailability(unittest.TestCase):
+    def test_usage_limit_reported_in_event_stream_stops_the_review(self):
+        message = ("You've hit your usage limit. Visit https://example.invalid/usage "
+                   "to purchase more credits or try again later.")
+        stdout = (json.dumps({"type": "error", "message": message}) + "\n"
+                  + json.dumps({"type": "turn.failed",
+                                "error": {"message": message}}) + "\n")
+        with tempfile.TemporaryDirectory() as name:
+            workspace = pathlib.Path(name) / "workspace"; workspace.mkdir()
+            out_dir = pathlib.Path(name) / "out"; out_dir.mkdir()
+            completed = SimpleNamespace(returncode=1, stdout=stdout, stderr="")
+            with mock.patch.object(CodexRuntime, "require_persistent_workspace",
+                                   return_value=workspace), \
+                 mock.patch("runtimes.codex.subprocess.run", return_value=completed):
+                with self.assertRaisesRegex(ModelUnavailable, "usage limit"):
+                    _runtime().run_review("review", workspace, out_dir=out_dir)
 
 
 if __name__ == "__main__":

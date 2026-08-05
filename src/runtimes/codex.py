@@ -207,7 +207,7 @@ class CodexRuntime(Runtime):
 
         (out_dir / "judge.events.jsonl").write_text(stdout)
         (out_dir / "judge.stderr").write_text(stderr)
-        limit = availability.find_usage_limit(stderr)
+        limit = availability.find_usage_limit(stderr, stdout)
         if limit:
             raise availability.ModelUnavailable(f"{self.name}: {limit}")
 
