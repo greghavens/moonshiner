@@ -133,8 +133,8 @@ class ASeedIsNeverDiscarded(unittest.TestCase):
                          "promotion must not sit behind an acceptance test")
 
 
-class InfrastructureStopsBeforeTheJudge(unittest.TestCase):
-    def test_candidate_is_preserved_without_judging_or_promotion(self):
+class InfrastructureFailuresReachTheJudge(unittest.TestCase):
+    def test_judge_repairs_a_preserved_candidate_before_preflight_retries(self):
         author = mock.Mock(name="author")
         author.name = "codex"
         author.role = {"model": "gpt-5.6-sol", "reasoning": "xhigh"}
@@ -142,20 +142,22 @@ class InfrastructureStopsBeforeTheJudge(unittest.TestCase):
         judge.name = "codex"
         judge.role = {"model": "gpt-5.6-sol", "reasoning": "xhigh"}
 
-        def author_seed(_dummy, workspace, **_kwargs):
-            (workspace / "task.json").write_text(
-                '{"id":"vcf91-0004","prompt":"fix it"}\n')
-            return SimpleNamespace(unavailable=None, timed_out=False,
-                                   safeguard_refusal=False, return_code=0,
-                                   error=None)
-
-        author.run_trace.side_effect = author_seed
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             workspaces = root / "workspaces"; workspaces.mkdir()
             candidates = root / "candidates"
+            preserved = candidates / "old-run" / "vcf91-0004"
+            preserved.mkdir(parents=True)
+            (preserved / "task.json").write_text(
+                '{"id":"vcf91-0004","prompt":"fix it"}\n')
             seeds = root / "seeds"; seeds.mkdir()
             traces = root / "traces"
+            judge.run_review.side_effect = lambda *_args, **_kwargs: (
+                SimpleNamespace(verdict={
+                    "verdict": "accept",
+                    "seed_reviews": [{"seed_id": "vcf91-0004",
+                                      "status": "accept"}],
+                }))
             with mock.patch.object(seed_pipeline, "WORKSPACES", workspaces), \
                  mock.patch.object(seed_pipeline, "CANDIDATES", candidates), \
                  mock.patch.object(seed_pipeline, "SEEDS_DIR", seeds), \
@@ -171,17 +173,79 @@ class InfrastructureStopsBeforeTheJudge(unittest.TestCase):
                  mock.patch.object(seed_pipeline, "set_run_status") as status, \
                  mock.patch.object(seed_pipeline, "start_attempt") as attempt, \
                  mock.patch.object(seed_pipeline, "preflight_seed_environment",
-                                   return_value=(False, "pwsh unavailable")):
+                                   side_effect=[
+                                       (False, "bad module version"),
+                                       (True, "module available")]), \
+                 mock.patch.object(seed_pipeline, "validate_report",
+                                   return_value={"passed": True,
+                                                 "failures": []}), \
+                 mock.patch.object(seed_pipeline, "audit_seed",
+                                   return_value=None), \
+                 mock.patch("corpus.write_catalog"):
                 result = seed_pipeline.main([
                     "--id", "vcf91-0004", "--brief", "VCF seed", "--yes"])
-            candidate = candidates / "seed-run" / "vcf91-0004" / "task.json"
+            self.assertEqual(result, 0)
+            self.assertTrue((seeds / "vcf91-0004" / "task.json").is_file())
+        author.run_trace.assert_not_called()
+        judge.run_review.assert_called_once()
+        report = judge.run_review.call_args.args[0]
+        self.assertIn("environment preflight: bad module version", report)
+        attempt.assert_called_once()
+        status.assert_called_with(mock.ANY, "seed-run", "complete")
+
+    def test_unrepaired_preflight_failure_stops_without_promotion(self):
+        author = mock.Mock(name="author")
+        author.name = "claude-code"
+        author.role = {"model": "claude-opus-5", "reasoning": "xhigh"}
+        judge = mock.Mock(name="judge")
+        judge.name = "codex"
+        judge.role = {"model": "gpt-5.6-sol", "reasoning": "xhigh"}
+        judge.run_review.return_value = SimpleNamespace(verdict={
+            "verdict": "accept",
+            "seed_reviews": [{"seed_id": "vcf91-0004",
+                              "status": "accept"}],
+        })
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            workspaces = root / "workspaces"; workspaces.mkdir()
+            candidates = root / "candidates"
+            preserved = candidates / "old-run" / "vcf91-0004"
+            preserved.mkdir(parents=True)
+            (preserved / "task.json").write_text(
+                '{"id":"vcf91-0004","prompt":"fix it"}\n')
+            seeds = root / "seeds"; seeds.mkdir()
+            traces = root / "traces"
+            with mock.patch.object(seed_pipeline, "WORKSPACES", workspaces), \
+                 mock.patch.object(seed_pipeline, "CANDIDATES", candidates), \
+                 mock.patch.object(seed_pipeline, "SEEDS_DIR", seeds), \
+                 mock.patch.object(seed_pipeline, "TRACES", traces), \
+                 mock.patch.object(seed_pipeline, "get_seed_author",
+                                   return_value=author), \
+                 mock.patch.object(seed_pipeline, "get_seed_judge",
+                                   return_value=judge), \
+                 mock.patch.object(seed_pipeline, "connect",
+                                   return_value=mock.Mock()), \
+                 mock.patch.object(seed_pipeline, "create_run",
+                                   return_value="seed-run"), \
+                 mock.patch.object(seed_pipeline, "set_run_status") as status, \
+                 mock.patch.object(seed_pipeline, "preflight_seed_environment",
+                                   side_effect=[
+                                       (False, "bad module version"),
+                                       (False, "bad module version")]), \
+                 mock.patch.object(seed_pipeline, "audit_seed",
+                                   return_value=None):
+                result = seed_pipeline.main([
+                    "--id", "vcf91-0004", "--brief", "VCF seed",
+                    "--max-attempts", "1", "--yes"])
             self.assertEqual(result, seed_pipeline.INFRASTRUCTURE_EXIT)
-            self.assertTrue(candidate.is_file())
             self.assertFalse((seeds / "vcf91-0004").exists())
-        judge.run_review.assert_not_called()
-        attempt.assert_not_called()
+            self.assertTrue((candidates / "seed-run" / "vcf91-0004" /
+                             "task.json").is_file())
+        author.run_trace.assert_not_called()
+        judge.run_review.assert_called_once()
         status.assert_called_with(mock.ANY, "seed-run", "stopped",
-                                  "pwsh unavailable")
+                                  "bad module version")
 
 
 

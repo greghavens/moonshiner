@@ -118,6 +118,22 @@ def _load_candidate(directory: Path, expected_id: str) -> dict:
     return seed
 
 
+def _latest_preserved_candidate(seed_id: str) -> Path | None:
+    """Return the newest valid prior candidate so paid authorship is reusable."""
+    candidates: list[tuple[int, Path]] = []
+    if not CANDIDATES.is_dir():
+        return None
+    for task in CANDIDATES.glob(f"*/{seed_id}/task.json"):
+        try:
+            data = json.loads(task.read_text())
+            modified = task.stat().st_mtime_ns
+        except (OSError, json.JSONDecodeError):
+            continue
+        if data.get("id") == seed_id:
+            candidates.append((modified, task.parent))
+    return max(candidates, default=(0, None))[1]
+
+
 def _review_prompt(seed: dict, report: dict) -> str:
     return f"""Review and, when possible, FIX this authored Moonshiner seed in place.
 You are the final seed judge and are authorized to make every necessary in-scope repair without asking for human approval. You may edit task.json, files/, tests, and reference_fix.patch. Preserve the core objective; repair prompt/test mismatches, weak tests, unrelated baseline bugs, broken patches, and nondeterminism. Do not reject or defer a seed merely because it requires edits you can make. After edits, return only the required JSON verdict. Use verdict=accept only if the resulting on-disk seed is ready. Use needs_human only when the objective is genuinely ambiguous or fixing it would redefine the objective.
@@ -170,48 +186,62 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run: return 0
     if not args.yes:
         print("refusing metered seed authoring without --yes", file=sys.stderr); return 2
-    author.preflight(require_auth=True); judge.preflight(require_auth=True)
+    preserved = _latest_preserved_candidate(args.id)
+    if preserved is None:
+        author.preflight(require_auth=True)
+    judge.preflight(require_auth=True)
     db = connect(); run_id = create_run(db, "seed", {
         "author": {"runtime": author.name, **author.role},
         "judge": {"runtime": judge.name, **judge.role}},
         {"max_attempts": args.max_attempts}, [args.id])
-    workspace = _init_workspace(args.id)
     candidate = CANDIDATES / run_id / args.id
     try:
-        # The author call creates the initial candidate. Later calls belong to the
-        # judge, which is explicitly allowed to repair the candidate in place.
-        dummy = {"id": f"seed-author-{args.id}"}
         (TRACES / "raw").mkdir(parents=True, exist_ok=True)
         (TRACES / "reviews").mkdir(parents=True, exist_ok=True)
-        author_system = _author_system(args.id, args.replace_synthetic)
-        authored = author.run_trace(dummy, workspace, out_dir=TRACES / "raw",
-                                    system_prompt=author_system, prompt=args.brief)
-        if authored.unavailable:
-            raise ModelUnavailable(f"{author.name}: {authored.unavailable}")
-        if (authored.timed_out or authored.safeguard_refusal
-                or authored.return_code not in (0, None)):
-            raise RuntimeError(authored.error
-                               or "seed author failed to complete")
         candidate.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(workspace, candidate, ignore=shutil.ignore_patterns(".git"))
+        if preserved is not None:
+            print(f"resuming preserved candidate: {preserved}")
+            shutil.copytree(preserved, candidate)
+        else:
+            # The author call creates the initial candidate. Later calls belong
+            # to the judge, which repairs the candidate in place.
+            workspace = _init_workspace(args.id)
+            dummy = {"id": f"seed-author-{args.id}"}
+            author_system = _author_system(args.id, args.replace_synthetic)
+            authored = author.run_trace(
+                dummy, workspace, out_dir=TRACES / "raw",
+                system_prompt=author_system, prompt=args.brief)
+            if authored.unavailable:
+                raise ModelUnavailable(f"{author.name}: {authored.unavailable}")
+            if (authored.timed_out or authored.safeguard_refusal
+                    or authored.return_code not in (0, None)):
+                raise RuntimeError(authored.error
+                                   or "seed author failed to complete")
+            shutil.copytree(workspace, candidate,
+                            ignore=shutil.ignore_patterns(".git"))
         _normalise_task(candidate)
         seed = _load_candidate(candidate, args.id)
         environment_ok, environment_detail = preflight_seed_environment(seed)
-        if not environment_ok:
-            set_run_status(db, run_id, "stopped", environment_detail)
-            print(f"[seed stopped] {args.id}: infrastructure failure — "
-                  f"{environment_detail}", file=sys.stderr)
-            return INFRASTRUCTURE_EXIT
         accepted = False
         for number in range(1, args.max_attempts + 1):
             start_attempt(db, run_id, args.id, number)
-            report = validate_report(seed)
+            report = (validate_report(seed) if environment_ok else {
+                "passed": False,
+                "failures": ["environment preflight: " + environment_detail],
+            })
             review = judge.run_review(_review_prompt(seed, report), candidate,
                                       out_dir=TRACES / "reviews", schema=SCHEMA,
                                       read_only=False)
             # Reload judge edits and prove the final on-disk form independently.
             seed = _load_candidate(candidate, args.id)
-            final_report = validate_report(seed)
+            environment_ok, environment_detail = preflight_seed_environment(seed)
+            if environment_ok:
+                final_report = validate_report(seed)
+            else:
+                final_report = {
+                    "passed": False,
+                    "failures": ["environment preflight: " + environment_detail],
+                }
             structural_error = audit_seed(candidate)
             if structural_error:
                 final_report["passed"] = False
@@ -226,6 +256,18 @@ def main(argv: list[str] | None = None) -> int:
                              and any(item.get("seed_id") == args.id
                                      and item.get("status") == "accept"
                                      for item in verdict.get("seed_reviews", [])))
+            if not environment_ok:
+                error = "; ".join(final_report["failures"])
+                status = "retry" if number < args.max_attempts else "stopped"
+                finish_attempt(db, run_id, args.id, number, status,
+                               review=verdict, error=error)
+                print(f"[{status}] {args.id}: {error}")
+                if number < args.max_attempts:
+                    continue
+                set_run_status(db, run_id, "stopped", environment_detail)
+                print(f"[seed stopped] {args.id}: infrastructure failure — "
+                      f"{environment_detail}", file=sys.stderr)
+                return INFRASTRUCTURE_EXIT
             # The judge corrects; it does not reject. It edits the candidate
             # and re-verifies its own work, so its verdict is the decision.
             # Re-running validation here and vetoing on the result discarded
