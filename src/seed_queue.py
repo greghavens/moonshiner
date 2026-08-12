@@ -91,8 +91,7 @@ def main(argv=None) -> int:
         return 0
     if not args.yes:
         parser.error("metered seed authoring requires --yes")
-    failed = 0
-    out_of_quota = False
+    stop_exit = None
     pending = list(missing)
     def configured_workers() -> int:
         if args.workers:
@@ -103,39 +102,41 @@ def main(argv=None) -> int:
             raise ValueError("pipeline.seed.workers must be from 1 through 64")
         return value
     with ThreadPoolExecutor(max_workers=64, thread_name_prefix="seed-worker") as pool:
-        futures: set = set()
+        futures: dict = {}
         while pending or futures:
             target = configured_workers()
-            while pending and len(futures) < target and not out_of_quota:
-                futures.add(pool.submit(author_one, pending.pop(0), plans))
+            while pending and len(futures) < target and stop_exit is None:
+                seed_id = pending.pop(0)
+                futures[pool.submit(author_one, seed_id, plans)] = seed_id
             if not futures:
                 break
             done, _ = wait(futures, timeout=2, return_when=FIRST_COMPLETED)
             for future in done:
-                futures.remove(future)
-                seed_id, code = future.result()
-                # One seed reporting no quota means every remaining seed would too.
-                # A broken environment is not this seed's fault and will break
-                # every seed after it. Stop authoring entirely until it is fixed.
-                if code == INFRASTRUCTURE_EXIT:
-                    out_of_quota = True
+                seed_id = futures.pop(future)
+                try:
+                    _, code = future.result()
+                    detail = f"worker exited {code}"
+                except Exception as error:
+                    code = INFRASTRUCTURE_EXIT
+                    detail = f"{type(error).__name__}: {error}"
+                if code:
+                    # This is the provider-independent, fail-closed boundary.
+                    # Only success may claim another seed: an adapter cannot
+                    # turn a new or unrecognised provider outage into a sweep.
+                    failure_exit = (USAGE_LIMIT_EXIT if code == USAGE_LIMIT_EXIT
+                                    else INFRASTRUCTURE_EXIT)
+                    if stop_exit is None or failure_exit == INFRASTRUCTURE_EXIT:
+                        stop_exit = failure_exit
                     pending.clear()
                     for queued in futures:
                         queued.cancel()
-                    print(f"[seed stopped] {seed_id}: INFRASTRUCTURE FAILURE — "
-                          "no further seeds will be authored until it is fixed",
-                          file=sys.stderr, flush=True)
+                    if failure_exit == USAGE_LIMIT_EXIT:
+                        print(f"[seed stopped] {seed_id}: runtime out of quota",
+                              file=sys.stderr, flush=True)
+                    else:
+                        print(f"[seed stopped] {seed_id}: INFRASTRUCTURE FAILURE — "
+                              f"{detail}; no further seeds will be authored until "
+                              "it is fixed", file=sys.stderr, flush=True)
                     continue
-                if code == USAGE_LIMIT_EXIT:
-                    out_of_quota = True
-                    pending.clear()
-                    for queued in futures:
-                        queued.cancel()
-                    print(f"[seed stopped] {seed_id}: runtime out of quota",
-                          file=sys.stderr, flush=True)
-                    continue
-                failed += bool(code)
-                print(f"[seed {'failed' if code else 'authored'}] {seed_id}", flush=True)
-    if out_of_quota:
-        return USAGE_LIMIT_EXIT
-    return 1 if failed else 0
+                print(f"[seed authored] {seed_id}", flush=True)
+    return stop_exit or 0

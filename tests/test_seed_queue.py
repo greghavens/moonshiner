@@ -75,6 +75,75 @@ class SeedQueueSelection(unittest.TestCase):
         self.assertEqual(peak, 2)
 
 
+class QueueFailureInvariant(unittest.TestCase):
+    """Every worker failure stops the provider-independent queue boundary."""
+
+    def _run(self, worker, *, workers=1, plans=None):
+        plans = plans or {"seed-a": "first", "seed-b": "second"}
+        with mock.patch.object(seed_queue, "documented_plan_items",
+                               return_value=plans), \
+             mock.patch.object(seed_queue, "authored_ids", return_value=set()), \
+             mock.patch.object(seed_queue, "retired_seed_ids", return_value=set()), \
+             mock.patch.object(seed_queue, "plan_priorities", return_value={}), \
+             mock.patch.object(seed_queue, "ensure_seed_repo"), \
+             mock.patch.object(seed_queue, "author_one", side_effect=worker) as author:
+            result = seed_queue.main(["--yes", "--workers", str(workers)])
+        return result, [call.args[0] for call in author.call_args_list]
+
+    def test_unknown_provider_failure_stops_before_the_next_seed(self):
+        def worker(seed_id, _plans):
+            return seed_id, 1
+
+        result, claimed = self._run(worker)
+
+        self.assertEqual(seed_queue.INFRASTRUCTURE_EXIT, result)
+        self.assertEqual(["seed-a"], claimed)
+
+    def test_worker_exception_stops_before_the_next_seed(self):
+        def worker(_seed_id, _plans):
+            raise OSError("provider executable failed")
+
+        result, claimed = self._run(worker)
+
+        self.assertEqual(seed_queue.INFRASTRUCTURE_EXIT, result)
+        self.assertEqual(["seed-a"], claimed)
+
+    def test_explicit_infrastructure_failure_is_reported_as_infrastructure(self):
+        def worker(seed_id, _plans):
+            return seed_id, seed_queue.INFRASTRUCTURE_EXIT
+
+        result, claimed = self._run(worker)
+
+        self.assertEqual(seed_queue.INFRASTRUCTURE_EXIT, result)
+        self.assertEqual(["seed-a"], claimed)
+
+    def test_explicit_usage_limit_remains_a_usage_limit(self):
+        def worker(seed_id, _plans):
+            return seed_id, seed_queue.USAGE_LIMIT_EXIT
+
+        result, claimed = self._run(worker)
+
+        self.assertEqual(seed_queue.USAGE_LIMIT_EXIT, result)
+        self.assertEqual(["seed-a"], claimed)
+
+    def test_failure_never_backfills_another_worker(self):
+        both_started = threading.Barrier(2)
+
+        def worker(seed_id, _plans):
+            both_started.wait(timeout=1)
+            if seed_id == "seed-a":
+                return seed_id, 1
+            threading.Event().wait(0.05)
+            return seed_id, 0
+
+        result, claimed = self._run(
+            worker, workers=2,
+            plans={"seed-a": "first", "seed-b": "second", "seed-c": "third"})
+
+        self.assertEqual(seed_queue.INFRASTRUCTURE_EXIT, result)
+        self.assertEqual({"seed-a", "seed-b"}, set(claimed))
+
+
 if __name__ == "__main__":
     unittest.main()
 
