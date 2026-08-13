@@ -18,7 +18,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import signal
 import subprocess
 import tempfile
 import threading
@@ -26,6 +25,7 @@ import time
 from pathlib import Path
 
 from common import RUNS, jsonl_lines
+from runtimes.base import wait_with_inactivity_timeout
 
 ROOT = Path(__file__).resolve().parent.parent
 SECURITY = ROOT / "security"
@@ -237,18 +237,12 @@ def run_codex(
         except BrokenPipeError:
             pass
         try:
-            returncode = proc.wait(timeout=timeout_s)
+            returncode = wait_with_inactivity_timeout(
+                proc, timeout_s,
+                activity_probe=lambda: (
+                    events_path.stat().st_size, stderr_path.stat().st_size))
         except subprocess.TimeoutExpired:
             timed_out = True
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-                proc.wait(timeout=10)
-            except (ProcessLookupError, subprocess.TimeoutExpired):
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                proc.wait()
             returncode = proc.returncode
         reader.join(timeout=10)
 

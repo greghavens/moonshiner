@@ -18,7 +18,8 @@ from pathlib import Path
 
 from common import SECRET_RE, scrub_text
 from runtimes import availability
-from runtimes.base import ReviewResult, Runtime, TraceResult
+from runtimes.base import (ReviewResult, Runtime, TraceResult,
+                           run_with_inactivity_timeout)
 
 CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
 
@@ -89,9 +90,9 @@ class CodexRuntime(Runtime):
         started = time.monotonic()
         timed_out = False
         try:
-            proc = subprocess.run(
+            proc = run_with_inactivity_timeout(
                 cmd, cwd=workspace, input=full_prompt, capture_output=True,
-                text=True, timeout=timeout,
+                text=True, inactivity_timeout=timeout,
                 env=self.teacher_environment(workspace))
             return_code = proc.returncode
             stdout, stderr = proc.stdout, proc.stderr
@@ -192,9 +193,9 @@ class CodexRuntime(Runtime):
         started = time.monotonic()
         timed_out = False
         try:
-            proc = subprocess.run(
+            proc = run_with_inactivity_timeout(
                 cmd, cwd=workspace, input=instruction, capture_output=True,
-                text=True, timeout=int(self.role.get("timeout_s", 1800)),
+                text=True, inactivity_timeout=int(self.role.get("timeout_s", 1800)),
                 env={k: os.environ[k]
                      for k in ("PATH", "HOME", "LANG", "LC_ALL", "TERM")
                      if k in os.environ})

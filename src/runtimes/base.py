@@ -10,8 +10,179 @@ from __future__ import annotations
 
 import abc
 import os
+import signal
+import subprocess
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+
+def _process_tree_snapshot(root_pid: int) -> tuple[tuple[int, ...], int, int]:
+    """Return process membership, CPU ticks, and I/O for one child tree."""
+    processes: dict[int, tuple[int, int, int]] = {}
+    proc = Path("/proc")
+    try:
+        entries = list(proc.iterdir())
+    except OSError:
+        return (), 0, 0
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+            fields = stat[stat.rfind(")") + 2:].split()
+            pid = int(entry.name)
+            ppid = int(fields[1])
+            cpu = int(fields[11]) + int(fields[12])
+            io_total = 0
+            try:
+                for line in (entry / "io").read_text().splitlines():
+                    key, value = line.split(":", 1)
+                    if key in {"rchar", "wchar", "read_bytes", "write_bytes"}:
+                        io_total += int(value)
+            except (OSError, ValueError):
+                pass
+            processes[pid] = (ppid, cpu, io_total)
+        except (OSError, ValueError, IndexError):
+            continue
+
+    descendants = {root_pid}
+    changed = True
+    while changed:
+        changed = False
+        for pid, (ppid, _, _) in processes.items():
+            if ppid in descendants and pid not in descendants:
+                descendants.add(pid)
+                changed = True
+    live = tuple(sorted(pid for pid in descendants if pid in processes))
+    return (live,
+            sum(processes[pid][1] for pid in live),
+            sum(processes[pid][2] for pid in live))
+
+
+def _kill_process_tree(process: subprocess.Popen) -> None:
+    """Kill the process session plus descendants that escaped its group."""
+    descendants = _process_tree_snapshot(process.pid)[0]
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    for pid in reversed(descendants):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def wait_with_inactivity_timeout(
+        process: subprocess.Popen, inactivity_timeout: float, *,
+        activity_probe=None) -> int:
+    """Wait for an existing process, killing only a continuously idle tree."""
+    if inactivity_timeout <= 0:
+        raise ValueError("inactivity_timeout must be positive")
+    interval = max(0.01, min(1.0, inactivity_timeout / 4))
+    last_activity = time.monotonic()
+    snapshot = _process_tree_snapshot(process.pid)
+    external = activity_probe() if activity_probe else None
+    while True:
+        try:
+            return process.wait(timeout=interval)
+        except subprocess.TimeoutExpired:
+            current = _process_tree_snapshot(process.pid)
+            current_external = activity_probe() if activity_probe else None
+            if current != snapshot or current_external != external:
+                snapshot, external = current, current_external
+                last_activity = time.monotonic()
+                continue
+            if time.monotonic() - last_activity < inactivity_timeout:
+                continue
+
+            # Re-sample immediately before the destructive action. Activity
+            # racing the timeout cancels the kill and resets the clock.
+            final = _process_tree_snapshot(process.pid)
+            final_external = activity_probe() if activity_probe else None
+            if final != snapshot or final_external != external:
+                snapshot, external = final, final_external
+                last_activity = time.monotonic()
+                continue
+            _kill_process_tree(process)
+            process.wait()
+            raise subprocess.TimeoutExpired(process.args, inactivity_timeout)
+
+
+def run_with_inactivity_timeout(
+        command: list[str], *, inactivity_timeout: float,
+        cwd: str | Path | None = None, input: str | bytes | None = None,
+        capture_output: bool = False, text: bool = False,
+        stdin=None, stdout=None, stderr=None, env: dict[str, str] | None = None,
+        activity_probe=None,
+        **popen_options) -> subprocess.CompletedProcess:
+    """Run until completion or sustained whole-process-tree inactivity.
+
+    There is deliberately no total-runtime deadline. Output, CPU, disk I/O,
+    or child-process changes reset the inactivity clock. Only a tree whose
+    complete observable state remains unchanged for ``inactivity_timeout`` is
+    killed.
+    """
+    if inactivity_timeout <= 0:
+        raise ValueError("inactivity_timeout must be positive")
+    if capture_output and (stdout is not None or stderr is not None):
+        raise ValueError("stdout/stderr may not be used with capture_output")
+    process = subprocess.Popen(
+        command, cwd=cwd,
+        stdin=subprocess.PIPE if input is not None else stdin,
+        stdout=subprocess.PIPE if capture_output else stdout,
+        stderr=subprocess.PIPE if capture_output else stderr,
+        text=text, env=env, start_new_session=True, **popen_options)
+    interval = max(0.01, min(1.0, inactivity_timeout / 4))
+    last_activity = time.monotonic()
+    snapshot = _process_tree_snapshot(process.pid)
+    external = activity_probe() if activity_probe else None
+    completed = threading.Event()
+    communication: dict[str, object] = {}
+
+    def communicate() -> None:
+        try:
+            communication["result"] = process.communicate(input=input)
+        except BaseException as error:
+            communication["error"] = error
+        finally:
+            completed.set()
+
+    reader = threading.Thread(target=communicate, daemon=True)
+    reader.start()
+    timed_out = False
+    while not completed.wait(interval):
+        current = _process_tree_snapshot(process.pid)
+        current_external = activity_probe() if activity_probe else None
+        if current != snapshot or current_external != external:
+            snapshot, external = current, current_external
+            last_activity = time.monotonic()
+            continue
+        if time.monotonic() - last_activity < inactivity_timeout:
+            continue
+
+        # Re-sample immediately before the destructive action. Activity
+        # racing the timeout cancels the kill and resets the clock.
+        final = _process_tree_snapshot(process.pid)
+        final_external = activity_probe() if activity_probe else None
+        if final != snapshot or final_external != external:
+            snapshot, external = final, final_external
+            last_activity = time.monotonic()
+            continue
+        timed_out = True
+        _kill_process_tree(process)
+        break
+
+    reader.join()
+    if "error" in communication:
+        raise communication["error"]
+    output, errors = communication.get("result", (None, None))
+    if timed_out:
+        raise subprocess.TimeoutExpired(
+            command, inactivity_timeout, output=output, stderr=errors)
+    return subprocess.CompletedProcess(command, process.returncode, output, errors)
 
 
 @dataclass

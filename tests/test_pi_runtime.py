@@ -230,7 +230,8 @@ class StreamedProcess(unittest.TestCase):
                 kwargs["stderr"].write("diagnostic\n")
                 return subprocess.CompletedProcess([], 0)
 
-            with mock.patch("runtimes.pi.subprocess.run", side_effect=fake_run):
+            with mock.patch("runtimes.pi.run_with_inactivity_timeout",
+                            side_effect=fake_run):
                 result = run_streamed(["pi"], workspace=root, turn="prompt",
                                       stdout_path=stdout_path,
                                       stderr_path=stderr_path, timeout=30,

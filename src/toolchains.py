@@ -9,6 +9,8 @@ import fcntl
 from functools import lru_cache
 from pathlib import Path
 
+from runtimes.base import run_with_inactivity_timeout
+
 
 FORMULAS = {
     "go": "go",
@@ -179,10 +181,10 @@ if ($null -eq $module) { exit 1 }
         "PSModulePath": str(root) + os.pathsep + env.get("PSModulePath", ""),
     })
     try:
-        result = subprocess.run(
+        result = run_with_inactivity_timeout(
             [str(executable), "-NoLogo", "-NoProfile", "-NonInteractive",
              "-Command", script], stdin=subprocess.DEVNULL, text=True,
-            capture_output=True, env=env, timeout=30)
+            capture_output=True, env=env, inactivity_timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         return False
     return result.returncode == 0
@@ -221,10 +223,10 @@ Save-Module -Name $env:MOONSHINER_MODULE_NAME `
                 "MOONSHINER_MODULE_PATH": str(root),
             })
             try:
-                result = subprocess.run(
+                result = run_with_inactivity_timeout(
                     [str(executable), "-NoLogo", "-NoProfile", "-NonInteractive",
                      "-Command", script], stdin=subprocess.DEVNULL, text=True,
-                    capture_output=True, env=env, timeout=900)
+                    capture_output=True, env=env, inactivity_timeout=900)
             except subprocess.TimeoutExpired:
                 return False, ("PowerShell module deployment timed out: "
                                f"{name} {version}")

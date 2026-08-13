@@ -67,7 +67,7 @@ class PowerShellModuleDeployment(unittest.TestCase):
                                pathlib.Path(tmp)), \
              mock.patch.object(toolchains, "powershell_runtime",
                                return_value=pathlib.Path("/opt/pwsh/pwsh")), \
-             mock.patch.object(toolchains.subprocess, "run",
+             mock.patch.object(toolchains, "run_with_inactivity_timeout",
                                side_effect=[missing, saved, available]) as run:
             ready, detail = toolchains.provision_powershell_modules([
                 ("VMware.Sdk.Vcf.SddcManager", "13.5.0.25380678")])

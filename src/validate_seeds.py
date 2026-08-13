@@ -31,6 +31,7 @@ from pathlib import Path
 
 from common import (TRACES, clear_runtime_caches, load_seeds, materialize,
                     run_setup, run_verify, test_file_hashes)
+from runtimes.base import run_with_inactivity_timeout
 
 
 def run_runtime_build(seed: dict, workspace: Path) -> str | None:
@@ -39,10 +40,10 @@ def run_runtime_build(seed: dict, workspace: Path) -> str | None:
     if runtime.get("required") is not True:
         return None
     try:
-        result = subprocess.run(
+        result = run_with_inactivity_timeout(
             shlex.split(runtime["build_cmd"]), cwd=workspace,
             capture_output=True, text=True,
-            timeout=min(int(seed.get("verify_timeout", 300)), 300),
+            inactivity_timeout=min(int(seed.get("verify_timeout", 300)), 300),
         )
     except (KeyError, ValueError, subprocess.TimeoutExpired) as error:
         return f"runtime build command failed to run: {error}"

@@ -51,7 +51,8 @@ class ReviewAvailability(unittest.TestCase):
             completed = SimpleNamespace(returncode=1, stdout=stdout, stderr="")
             with mock.patch.object(CodexRuntime, "require_persistent_workspace",
                                    return_value=workspace), \
-                 mock.patch("runtimes.codex.subprocess.run", return_value=completed):
+                 mock.patch("runtimes.codex.run_with_inactivity_timeout",
+                            return_value=completed):
                 with self.assertRaisesRegex(ModelUnavailable, "usage limit"):
                     _runtime().run_review("review", workspace, out_dir=out_dir)
 

@@ -19,7 +19,8 @@ from pathlib import Path
 
 from common import scrub_text
 from runtimes import availability
-from runtimes.base import ReviewResult, Runtime, TraceResult
+from runtimes.base import (ReviewResult, Runtime, TraceResult,
+                           run_with_inactivity_timeout)
 
 REFUSAL_MARKERS = ("model_refusal_no_fallback", "model_refusal")
 READ_ONLY_DISALLOW = "Edit Write NotebookEdit Bash MultiEdit"
@@ -75,8 +76,10 @@ class ClaudeCodeRuntime(Runtime):
         started = time.monotonic()
         timed_out = False
         try:
-            proc = subprocess.run(cmd, cwd=workspace, input=stdin_text,
-                                  capture_output=True, text=True, timeout=timeout,
+            proc = run_with_inactivity_timeout(
+                                  cmd, cwd=workspace, input=stdin_text,
+                                  capture_output=True, text=True,
+                                  inactivity_timeout=timeout,
                                   env=self.teacher_environment(workspace))
             return_code, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
         except subprocess.TimeoutExpired as exc:
@@ -169,9 +172,9 @@ class ClaudeCodeRuntime(Runtime):
         started = time.monotonic()
         timed_out = False
         try:
-            proc = subprocess.run(cmd, cwd=workspace, input=prompt,
+            proc = run_with_inactivity_timeout(cmd, cwd=workspace, input=prompt,
                                   capture_output=True, text=True,
-                                  timeout=int(self.role.get("timeout_s", 1800)),
+                                  inactivity_timeout=int(self.role.get("timeout_s", 1800)),
                                   env={k: os.environ[k]
                                        for k in ("PATH", "HOME", "LANG",
                                                  "LC_ALL", "TERM")

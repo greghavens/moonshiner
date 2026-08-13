@@ -22,7 +22,8 @@ from pathlib import Path
 from common import ROOT, scrub_text
 from runtimes import availability
 from runtimes.auth import load_provider_key
-from runtimes.base import ReviewResult, Runtime, TraceResult
+from runtimes.base import (ReviewResult, Runtime, TraceResult,
+                           run_with_inactivity_timeout)
 from runtimes.credential_proxy import DUMMY_TOKEN, ProxySession
 
 DEFAULT_TIMEOUT_SECONDS = 300
@@ -40,9 +41,13 @@ def run_streamed(command: list[str], *, workspace: Path, turn: str,
     """Run Pi with bounded parent memory by streaming both output channels."""
     with stdout_path.open("a", encoding="utf-8") as output, \
          stderr_path.open("a", encoding="utf-8") as errors:
-        return subprocess.run(command, cwd=workspace, input=turn,
+        return run_with_inactivity_timeout(
+                              command, cwd=workspace, input=turn,
                               stdout=output, stderr=errors, text=True,
-                              timeout=timeout, env=environment)
+                              inactivity_timeout=timeout, env=environment,
+                              activity_probe=lambda: (
+                                  stdout_path.stat().st_size,
+                                  stderr_path.stat().st_size))
 
 def _hidden_mounts() -> list[str]:
     hidden = [str(Path.home())]
@@ -104,8 +109,9 @@ class PiRuntime(Runtime):
 
     def _runtime_version(self, cli: Path) -> str | None:
         try:
-            out = subprocess.run([str(cli), "--version"], capture_output=True,
-                                 text=True, timeout=30)
+            out = run_with_inactivity_timeout(
+                [str(cli), "--version"], capture_output=True, text=True,
+                inactivity_timeout=30)
             return out.stdout.strip() or None
         except (subprocess.SubprocessError, FileNotFoundError):
             return None

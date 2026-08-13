@@ -224,8 +224,8 @@ class PowerShellSandboxMounts(unittest.TestCase):
                                    return_value=modules), \
                  mock.patch.object(toolchains, "effective_path",
                                    return_value="/usr/bin:/bin"), \
-                 mock.patch.object(common.subprocess, "run",
-                                   return_value=completed) as run:
+                 mock.patch("runtimes.base.run_with_inactivity_timeout",
+                            return_value=completed) as run:
                 common._sandboxed_command(["pwsh", "-Version"], workspace, 10)
         command = run.call_args.args[0]
         self.assertIn(["--ro-bind", str(runtime),

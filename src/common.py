@@ -548,8 +548,10 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int):
                 "--setenv", "RUSTUP_HOME", "/media",
                 "--setenv", "CARGO_HOME", str(workspace / ".sandbox-home" / ".cargo")]
     cmd += ["--", *command]
-    return subprocess.run(cmd, cwd=workspace, capture_output=True, text=True,
-                          timeout=timeout)
+    from runtimes.base import run_with_inactivity_timeout
+    return run_with_inactivity_timeout(
+        cmd, cwd=workspace, capture_output=True, text=True,
+        inactivity_timeout=timeout)
 
 
 def preflight_seed_environment(seed: dict) -> tuple[bool, str]:

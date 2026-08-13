@@ -48,7 +48,7 @@ class HarnessContract(unittest.TestCase):
             workspace.mkdir(); output.mkdir()
             with mock.patch.object(runtime, "require_persistent_workspace",
                                    return_value=workspace), \
-                 mock.patch("runtimes.claude_code.subprocess.run",
+                 mock.patch("runtimes.claude_code.run_with_inactivity_timeout",
                             return_value=completed) as launch:
                 result = runtime.run_trace(
                     {"id": "seed"}, workspace, out_dir=output,
