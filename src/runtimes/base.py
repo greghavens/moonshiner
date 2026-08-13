@@ -22,7 +22,8 @@ from pathlib import Path
 def workspace_only_command(
         command: list[str], workspace: Path, *,
         read_only_binds: tuple[tuple[Path, Path], ...] = (),
-        unshare_network: bool = False) -> list[str]:
+        unshare_network: bool = False,
+        workspace_writable: bool = True) -> list[str]:
     """Wrap a command so its only persistent writable storage is *workspace*.
 
     The root filesystem remains visible but read-only.  Both conventional
@@ -36,9 +37,10 @@ def workspace_only_command(
         raise RuntimeError(
             "bubblewrap is required to enforce workspace-only writes")
     workspace = Path(workspace).resolve()
-    scratch = workspace / ".sandbox-home" / "tmp"
-    shared_memory = workspace / ".sandbox-home" / "shm"
-    masks = workspace / ".sandbox-home" / "masks"
+    sandbox_home = workspace / ".sandbox-home"
+    scratch = sandbox_home / "tmp"
+    shared_memory = sandbox_home / "shm"
+    masks = sandbox_home / "masks"
     empty_directory = masks / "empty-directory"
     empty_file = masks / "empty-file"
     scratch.mkdir(parents=True, exist_ok=True)
@@ -56,7 +58,11 @@ def workspace_only_command(
         "--ro-bind", "/", "/",
         "--dev-bind", "/dev", "/dev",
         "--proc", "/proc",
-        "--bind", str(workspace), str(workspace),
+        "--bind" if workspace_writable else "--ro-bind",
+        str(workspace), str(workspace),
+        # A read-only review still needs isolated CLI/session/cache state. This
+        # is runtime-owned and excluded from every candidate diff.
+        "--bind", str(sandbox_home), str(sandbox_home),
         "--bind", str(scratch), "/tmp",
         "--bind", str(scratch), "/var/tmp",
         "--bind", str(shared_memory), "/dev/shm",

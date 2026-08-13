@@ -121,9 +121,14 @@ def _load_candidate(directory: Path, expected_id: str) -> dict:
 def _latest_preserved_candidate(seed_id: str) -> Path | None:
     """Return the newest valid prior candidate so paid authorship is reusable."""
     candidates: list[tuple[int, Path]] = []
-    if not CANDIDATES.is_dir():
-        return None
-    for task in CANDIDATES.glob(f"*/{seed_id}/task.json"):
+    tasks = list(CANDIDATES.glob(f"*/{seed_id}/task.json"))
+    # An interrupted queue can leave fully authored work in its retained model
+    # workspace before the pipeline has copied it into seed-candidates.
+    tasks += [task for task in WORKSPACES.glob(
+        f"author-{seed_id}-*/task.json")
+        if (task.parent / "files").is_dir()
+        and (task.parent / "reference_fix.patch").is_file()]
+    for task in tasks:
         try:
             data = json.loads(task.read_text())
             modified = task.stat().st_mtime_ns
@@ -201,7 +206,9 @@ def main(argv: list[str] | None = None) -> int:
         candidate.parent.mkdir(parents=True, exist_ok=True)
         if preserved is not None:
             print(f"resuming preserved candidate: {preserved}")
-            shutil.copytree(preserved, candidate)
+            shutil.copytree(
+                preserved, candidate,
+                ignore=shutil.ignore_patterns(".git", ".sandbox-home"))
         else:
             # The author call creates the initial candidate. Later calls belong
             # to the judge, which repairs the candidate in place.

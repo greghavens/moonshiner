@@ -1,8 +1,10 @@
 """Authoring one seed is a single piece of paid work; it must not be wasted."""
+import json
 import pathlib
 import sys
 import tempfile
 import unittest
+import uuid
 from types import SimpleNamespace
 from unittest import mock
 
@@ -10,6 +12,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import seed_pipeline  # noqa: E402
+import common  # noqa: E402
 
 
 class AuthorIsToldTheId(unittest.TestCase):
@@ -131,6 +134,23 @@ class ASeedIsNeverDiscarded(unittest.TestCase):
         guard_before = source[:promote].rstrip().splitlines()[-1]
         self.assertNotIn("if ", guard_before,
                          "promotion must not sit behind an acceptance test")
+
+    def test_a_completed_retained_author_workspace_is_reused(self):
+        seed_id = f"unit-retained-{uuid.uuid4().hex}"
+        retained = seed_pipeline.WORKSPACES / f"author-{seed_id}-complete"
+        incomplete = seed_pipeline.WORKSPACES / f"author-{seed_id}-newer"
+        try:
+            retained.mkdir(parents=True)
+            (retained / "task.json").write_text(
+                json.dumps({"id": seed_id, "prompt": "implement"}) + "\n")
+            (retained / "reference_fix.patch").write_text("patch\n")
+            (retained / "files").mkdir()
+            incomplete.mkdir()
+            selected = seed_pipeline._latest_preserved_candidate(seed_id)
+        finally:
+            common.remove_workspace(retained)
+            common.remove_workspace(incomplete)
+        self.assertEqual(retained, selected)
 
 
 class InfrastructureFailuresReachTheJudge(unittest.TestCase):

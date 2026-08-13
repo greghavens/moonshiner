@@ -67,12 +67,13 @@ class CodexRuntime(Runtime):
                   system_prompt: str, prompt: str,
                   interaction: list[str] | None = None,
                   security: bool = False,
-                  tools: list[str] | None = None) -> TraceResult:
+        tools: list[str] | None = None) -> TraceResult:
         workspace = self.require_persistent_workspace(workspace)
-        sandbox = self.runtime_config.get("sandbox", "workspace-write")
-        if security:
-            sandbox = "workspace-write"
-        cmd = self._base_cmd(sandbox=sandbox)
+        # Moonshiner's outer Bubblewrap namespace is the sole filesystem
+        # boundary. Nesting Codex's workspace sandbox makes its /tmp handling
+        # remount the workspace-backed temp tree and reject every file write.
+        sandbox = "outer-workspace-write"
+        cmd = self._base_cmd(sandbox="danger-full-access")
         if self.runtime_config.get("web_search") == "live" and not security:
             # Append configuration as a complete option/value pair. Inserting
             # at index 4 splits ``--model <name>`` and makes Codex report that
@@ -199,13 +200,14 @@ class CodexRuntime(Runtime):
             schema_path = workspace / ".sandbox-home" / "review.schema.json"
             schema_path.parent.mkdir(parents=True, exist_ok=True)
             schema_path.write_text(json.dumps(schema))
-        sandbox = "read-only" if read_only else "workspace-write"
-        cmd = self._base_cmd(sandbox=sandbox, schema_path=schema_path)
+        cmd = self._base_cmd(sandbox="danger-full-access",
+                             schema_path=schema_path)
         cmd += ["-C", str(workspace), "-"]
         environment = self.teacher_environment(workspace)
         cmd = workspace_only_command(
             cmd, workspace,
-            read_only_binds=self._auth_bindings(environment))
+            read_only_binds=self._auth_bindings(environment),
+            workspace_writable=not read_only)
 
         started = time.monotonic()
         timed_out = False

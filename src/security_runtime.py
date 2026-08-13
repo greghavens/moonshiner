@@ -178,7 +178,10 @@ def run_codex(
         "codex", "exec", "--json", "--model", model,
         "-c", f'model_reasoning_effort="{effort}"',
         "--ignore-user-config", "--ignore-rules",
-        "--sandbox", sandbox,
+        # The outer Bubblewrap namespace below is the filesystem boundary.
+        # A second Codex sandbox cannot safely remount its workspace-backed
+        # temporary directories.
+        "--dangerously-bypass-approvals-and-sandbox",
         "--skip-git-repo-check",
         "-C", str(SANDBOX_WORKSPACE),
     ]

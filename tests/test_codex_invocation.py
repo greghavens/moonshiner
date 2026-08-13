@@ -1,5 +1,6 @@
 """Codex command construction: reviews must work outside a git checkout."""
 import json
+import inspect
 import pathlib
 import sys
 import tempfile
@@ -12,6 +13,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from runtimes.codex import CodexRuntime  # noqa: E402
 from runtimes.availability import ModelUnavailable  # noqa: E402
+from runtimes.base import workspace_only_command  # noqa: E402
 
 
 def _runtime(runtime_config=None):
@@ -36,6 +38,24 @@ class BaseCommand(unittest.TestCase):
     def test_model_flag_keeps_its_value_adjacent(self):
         cmd = _runtime()._base_cmd(sandbox="read-only")
         self.assertEqual(cmd[cmd.index("--model") + 1], "test-model")
+
+    def test_outer_boundary_is_the_only_codex_filesystem_sandbox(self):
+        for operation in (CodexRuntime.run_trace, CodexRuntime.run_review):
+            with self.subTest(operation=operation.__name__):
+                source = inspect.getsource(operation)
+                self.assertIn('_base_cmd(sandbox="danger-full-access"', source)
+
+    def test_outer_boundary_enforces_read_only_reviews(self):
+        with tempfile.TemporaryDirectory() as name:
+            workspace = pathlib.Path(name) / "workspace"
+            workspace.mkdir()
+            command = workspace_only_command(
+                ["true"], workspace, workspace_writable=False)
+        workspace_mount = ["--ro-bind", str(workspace.resolve()),
+                           str(workspace.resolve())]
+        self.assertIn(workspace_mount,
+                      [command[index:index + 3]
+                       for index in range(len(command) - 2)])
 
 
 class ReviewAvailability(unittest.TestCase):

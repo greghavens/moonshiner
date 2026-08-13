@@ -11,6 +11,7 @@ surfaced as ``safeguard_refusal`` for the caller to defer. Multi-turn seeds use
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -69,6 +70,7 @@ class ClaudeCodeRuntime(Runtime):
         if streaming:
             cmd += ["--input-format", "stream-json", "--replay-user-messages"]
         environment = self.teacher_environment(workspace)
+        self._add_host_auth(environment)
         cmd = workspace_only_command(
             cmd, workspace,
             read_only_binds=self._auth_bindings(environment))
@@ -95,7 +97,7 @@ class ClaudeCodeRuntime(Runtime):
         events_path.write_text(stdout)
         stderr_path.write_text(stderr)
         meta = self._result_meta(stdout, stderr)
-        limit = availability.find_usage_limit(stderr)
+        limit = availability.find_usage_limit(stderr, meta["error"])
 
         model_fallback = bool(meta["observed_model"]
                               and not self.model_matches(meta["observed_model"]))
@@ -139,6 +141,12 @@ class ClaudeCodeRuntime(Runtime):
         destination = Path(environment["CLAUDE_CONFIG_DIR"]) / ".credentials.json"
         return ((source, destination),)
 
+    @staticmethod
+    def _add_host_auth(environment: dict[str, str]) -> None:
+        token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+        if token:
+            environment["CLAUDE_CODE_OAUTH_TOKEN"] = token
+
     def _result_meta(self, stdout: str, stderr: str) -> dict:
         observed_model = None
         session_id = None
@@ -158,8 +166,14 @@ class ClaudeCodeRuntime(Runtime):
                 session_id = event.get("session_id") or session_id
                 init_tools = event.get("tools") or init_tools
             elif event.get("type") == "assistant":
-                observed_model = (event.get("message") or {}).get(
-                    "model") or observed_model
+                message = event.get("message") or {}
+                observed_model = message.get("model") or observed_model
+                if event.get("is_api_error_message") or event.get("error"):
+                    content = message.get("content") or []
+                    text = " ".join(
+                        str(item.get("text") or "") for item in content
+                        if isinstance(item, dict)).strip()
+                    error = text or str(event.get("error") or "API error")
             elif event.get("type") == "result":
                 usage = event.get("usage") or usage
                 subtype = event.get("subtype", "")
@@ -167,7 +181,8 @@ class ClaudeCodeRuntime(Runtime):
                 if "refusal" in subtype:
                     safeguard = True
                 if event.get("is_error") or "error" in subtype:
-                    error = subtype or "result error"
+                    error = str(event.get("result") or error or subtype
+                                or "result error")
         return {"observed_model": observed_model, "session_id": session_id,
                 "init_tools": init_tools, "usage": usage, "error": error,
                 "success": success, "safeguard_refusal": safeguard}
@@ -183,6 +198,7 @@ class ClaudeCodeRuntime(Runtime):
             prompt += ("\n\nReturn ONLY a single JSON object matching this schema, "
                        "with no prose:\n" + json.dumps(schema))
         environment = self.teacher_environment(workspace)
+        self._add_host_auth(environment)
         cmd = workspace_only_command(
             cmd, workspace,
             read_only_binds=self._auth_bindings(environment))
@@ -204,10 +220,10 @@ class ClaudeCodeRuntime(Runtime):
         # needed to adjudicate this one.
         (out_dir / f"{workspace.name}.judge.jsonl").write_text(stdout)
         (out_dir / f"{workspace.name}.judge.stderr").write_text(stderr)
-        limit = availability.find_usage_limit(stderr)
+        meta = self._result_meta(stdout, stderr)
+        limit = availability.find_usage_limit(stderr, meta["error"])
         if limit:
             raise availability.ModelUnavailable(f"{self.name}: {limit}")
-        meta = self._result_meta(stdout, stderr)
         last = self._final_text(stdout)
         return ReviewResult(
             raw_text=last,
