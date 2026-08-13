@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3507 seeds grouped into 426 categories. This file is generated; edit each seed's source, then regenerate it.
+3508 seeds grouped into 426 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -19,7 +19,7 @@
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 63 | Catalog program awaiting description. |
 | **VMware Cloud Foundation 9.1** | 313 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.0** | 93 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.0** | 94 | Catalog program awaiting description. |
 | **instruction-following** | 1 | Catalog program awaiting description. |
 
 ## Detailed recipe categories
@@ -1867,6 +1867,7 @@
 - **vcf90-0106** (`python`) `#vcf-9-0` `#python` `#rest-client` `#token-refresh` `#stdlib-only` — Implement the unfinished `vcf_installer` package in `src/vcf_installer` as a Python 3.11+ standard-library-only client for the VCF Installer 9.0 contract in `docs/contract.json`. Complete `VCFInsta…
 - **vcf90-0107** (`python`) `#vcf-9-0` `#vcf-installer` `#python` `#rest-contract` `#spec-derived` — Implement the standard-library-only Python integration for the pinned VMware Cloud Foundation Installer 9.0 task collection in this repository. Use `docs/contract.json` as the REST contract and `do…
 - **vcf90-0108** (`python`) `#vcf-9-0` `#vcf-installer` `#python` `#rest-contract` `#spec-derived` — Implement `src/vcf_installer/client.py` as a Python 3.11+ standard-library-only client for the focused VMware Cloud Foundation Installer 9.0 depot contract. Do not add dependencies or edit any othe…
+- **vcf90-0109** (`go`) `#vcf-9-0` `#vcf-installer` `#go` `#rest-contract` `#spec-derived` — Implement the VCF Installer client in `client.go` against the supplied, protected VCF 9.0 contract. The integration uses the exact OpenAPI operations `startBundleDownloadByID` and `getTask`: start…
 - **vcf91-0165** (`powershell`) `#vcf-9-1` `#vcf-operations-logs` `#powershell` `#rest-contract` `#spec-derived` — Complete `VcfOpsLogSecret/VcfOpsLogSecret.psm1` as a PowerShell 7.4 module that creates an ingestion-agent secret in VCF Operations for Logs and waits until that asynchronous secret activation reac…
 - **vcf91-0166** (`powershell`) `#vcf-9-1` `#vcf-operations-logs` `#powershell` `#rest-contract` `#spec-derived` — Complete `VcfOpsLogForwarder/VcfOpsLogForwarder.psm1` as a PowerShell 7.4 module that reconciles desired VCF Operations Log Management forwarders even when its access token expires part way through…
 - **vcf91-0167** (`powershell`) `#vcf-9-1` `#vcf-operations-logs` `#powershell` `#rest-contract` `#spec-derived` — Complete `VcfOpsLogAgentGroups/VcfOpsLogAgentGroups.psm1` as a PowerShell 7.4 module that retrieves the complete VCF Operations for Logs agent-group collection and emits it in deterministic order.…
