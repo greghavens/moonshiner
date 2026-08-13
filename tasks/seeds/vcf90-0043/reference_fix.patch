@@ -1,0 +1,160 @@
+diff --git a/vcenter_content/client.py b/vcenter_content/client.py
+index e29aaf6..27fadca 100644
+--- a/vcenter_content/client.py
++++ b/vcenter_content/client.py
+@@ -1,10 +1,28 @@
+ """Client for the three vSphere Automation operations in docs/contract.json.
+ 
+-Implement the bodies below. Only the Python standard library may be used.
++Standard library only. Creating a library item is the one mutating call here,
++and it is made idempotent with the Client-Token header the spec documents on
++Content.Library.Item_create, so a retry after a lost response cannot leave a
++second item behind.
+ """
+ 
+ from __future__ import annotations
+ 
++import base64
++import json
++import time
++import uuid
++from urllib import request as urlrequest
++from urllib.error import HTTPError
++from urllib.parse import quote
++
++# A 503 is the task's server-side, retryable condition. Every other documented
++# status is a terminal client error.
++RETRYABLE_STATUS = frozenset({503})
++
++SESSION_HEADER = "vmware-api-session-id"
++IDEMPOTENCY_HEADER = "Client-Token"
++
+ 
+ class VCenterApiError(Exception):
+     """An error response from the vCenter Automation API.
+@@ -41,8 +59,85 @@ class ContentLibraryClient:
+         backoff=0.0,
+         timeout=10.0,
+     ):
+-        raise NotImplementedError
++        self._base_url = base_url.rstrip("/")
++        self._username = username
++        self._password = password
++        self._max_attempts = max(1, int(max_attempts))
++        self._backoff = backoff
++        self._timeout = timeout
++        self._session_id = None
++
++    # -- transport --------------------------------------------------------
++    def _send(self, method, path, body=None, headers=None, retry=False):
++        """Issue one operation, optionally retrying transient server failures.
++
++        The request is rebuilt identically on every attempt, so a retry is a
++        byte-for-byte replay of the original -- which is what makes the
++        Client-Token on a create attempt meaningful.
++        """
++        url = self._base_url + path
++        data = None
++        request_headers = dict(headers or {})
++        if body is not None:
++            data = json.dumps(body).encode("utf-8")
++            request_headers["Content-Type"] = "application/json"
++        request_headers.setdefault("Accept", "application/json")
+ 
++        attempts = self._max_attempts if retry else 1
++        last_error = None
++        for attempt in range(1, attempts + 1):
++            request = urlrequest.Request(url, data=data, method=method)
++            for key, value in request_headers.items():
++                request.add_header(key, value)
++            try:
++                with urlrequest.urlopen(request, timeout=self._timeout) as response:
++                    payload = response.read()
++                    return json.loads(payload) if payload else None
++            except HTTPError as exc:
++                last_error = self._to_api_error(exc)
++                if (
++                    last_error.status not in RETRYABLE_STATUS
++                    or attempt == attempts
++                ):
++                    raise last_error
++            if self._backoff:
++                time.sleep(self._backoff)
++        raise last_error
++
++    @staticmethod
++    def _to_api_error(exc):
++        try:
++            payload = json.loads(exc.read() or b"null")
++        except (ValueError, OSError):
++            payload = None
++        if not isinstance(payload, dict):
++            payload = {}
++        messages = payload.get("messages") or []
++        detail = messages[0].get("default_message") if messages else None
++        return VCenterApiError(
++            exc.code, payload.get("error_type"), messages, detail=detail
++        )
++
++    def _session(self):
++        """Cis.Session_create, once per client; the token is then reused."""
++        if self._session_id is None:
++            credentials = base64.b64encode(
++                ("%s:%s" % (self._username, self._password)).encode("utf-8")
++            ).decode("ascii")
++            self._session_id = self._send(
++                "POST",
++                "/session",
++                headers={"Authorization": "Basic " + credentials},
++                retry=True,
++            )
++        return self._session_id
++
++    def _authenticated_headers(self, extra=None):
++        headers = {SESSION_HEADER: self._session()}
++        headers.update(extra or {})
++        return headers
++
++    # -- operations -------------------------------------------------------
+     def ensure_library_item(
+         self,
+         library_id,
+@@ -55,8 +150,36 @@ class ContentLibraryClient:
+ 
+         Returns the identifier of the library item as a string.
+         """
+-        raise NotImplementedError
++        # Content.Library.ItemModel carries no JSON-Schema `required` list; its
++        # create-time contract is per-property. library_id and name must be
++        # provided, description and type are optional, and everything else is
++        # "not used for the create operation". An optional property the caller
++        # did not set is left out of the body entirely -- sending null or ""
++        # would assert a value rather than decline to set one.
++        spec = {"library_id": library_id, "name": name}
++        if description is not None:
++            spec["description"] = description
++        if item_type is not None:
++            spec["type"] = item_type
++
++        # Generated once, outside the retry loop. A retry that minted a fresh
++        # token would read as a second creation request and could leave a
++        # duplicate item behind when the first attempt committed but its
++        # response was lost.
++        token = client_token if client_token is not None else str(uuid.uuid4())
++
++        return self._send(
++            "POST",
++            "/content/library/item",
++            body=spec,
++            headers=self._authenticated_headers({IDEMPOTENCY_HEADER: token}),
++            retry=True,
++        )
+ 
+     def get_library_item(self, item_id):
+         """Return the Content.Library.ItemModel for ``item_id`` as a dict."""
+-        raise NotImplementedError
++        return self._send(
++            "GET",
++            "/content/library/item/" + quote(str(item_id), safe=""),
++            headers=self._authenticated_headers(),
++        )

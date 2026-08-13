@@ -1,0 +1,314 @@
+diff --git a/vcfops_alerts/__init__.py b/vcfops_alerts/__init__.py
+new file mode 100644
+index 0000000..2b123fe
+--- /dev/null
++++ b/vcfops_alerts/__init__.py
+@@ -0,0 +1,32 @@
++"""Stdlib-only reader for the VMware Cloud Foundation 9.0 Operations alert collection.
++
++Pinned to docs/contract.json, a projection of
++specifications/vcf-operations/vcf-operations-openapi.json at tag 9.0.0.0 of
++vmware/vcf-api-specs.
++"""
++
++from .client import (
++    DEFAULT_MAX_PAGES,
++    DEFAULT_PAGE_SIZE,
++    GET_ALERTS_PATH,
++    ACQUIRE_TOKEN_PATH,
++    SERVER_BASE_PATH,
++    VcfOperationsClient,
++)
++from .errors import (
++    VcfOperationsAuthError,
++    VcfOperationsError,
++    VcfOperationsProtocolError,
++)
++
++__all__ = [
++    "ACQUIRE_TOKEN_PATH",
++    "DEFAULT_MAX_PAGES",
++    "DEFAULT_PAGE_SIZE",
++    "GET_ALERTS_PATH",
++    "SERVER_BASE_PATH",
++    "VcfOperationsAuthError",
++    "VcfOperationsClient",
++    "VcfOperationsError",
++    "VcfOperationsProtocolError",
++]
+diff --git a/vcfops_alerts/client.py b/vcfops_alerts/client.py
+new file mode 100644
+index 0000000..736724b
+--- /dev/null
++++ b/vcfops_alerts/client.py
+@@ -0,0 +1,238 @@
++"""A stdlib-only client for the VCF Operations paged alert collection.
++
++The wire shape follows docs/contract.json, which is projected from
++specifications/vcf-operations/vcf-operations-openapi.json at tag 9.0.0.0 of
++vmware/vcf-api-specs. Two operations are in scope:
++
++    acquireToken  POST /suite-api/api/auth/token/acquire
++    getAlerts     GET  /suite-api/api/alerts
++"""
++
++from __future__ import annotations
++
++import json
++import urllib.error
++import urllib.parse
++import urllib.request
++from typing import Any, Iterable
++
++from .errors import VcfOperationsAuthError, VcfOperationsProtocolError
++
++# From the contract's servers[0].url and the two operation paths.
++SERVER_BASE_PATH = "/suite-api"
++ACQUIRE_TOKEN_PATH = "/api/auth/token/acquire"
++GET_ALERTS_PATH = "/api/alerts"
++
++# From the parameter defaults the pinned spec declares for getAlerts.
++DEFAULT_PAGE_SIZE = 1000
++# Not from the spec: a local ceiling so an appliance whose page-info never
++# settles cannot page forever.
++DEFAULT_MAX_PAGES = 1000
++
++JSON_MEDIA_TYPE = "application/json"
++
++
++def _require_text(value: Any, name: str) -> str:
++    if not isinstance(value, str) or not value.strip():
++        raise ValueError(f"{name} must be a non-empty string")
++    return value
++
++
++def _require_positive_int(value: Any, name: str, minimum: int) -> int:
++    if isinstance(value, bool) or not isinstance(value, int):
++        raise ValueError(f"{name} must be an integer")
++    if value < minimum:
++        raise ValueError(f"{name} must be at least {minimum}")
++    return value
++
++
++def _alert_sort_key(alert: dict[str, Any]) -> tuple[int, str]:
++    """Newest first, ties broken by alertId ascending.
++
++    Both members are optional in the pinned alert schema, so a row that omits
++    one still sorts deterministically instead of raising.
++    """
++    start = alert.get("startTimeUTC")
++    start = int(start) if isinstance(start, int) and not isinstance(start, bool) else 0
++    alert_id = alert.get("alertId")
++    return (-start, alert_id if isinstance(alert_id, str) else "")
++
++
++class VcfOperationsClient:
++    """Reads the VCF Operations alert collection completely and in a stable order."""
++
++    def __init__(
++        self,
++        base_url: str,
++        username: str,
++        password: str,
++        auth_source: str | None = None,
++        page_size: int = DEFAULT_PAGE_SIZE,
++        max_pages: int = DEFAULT_MAX_PAGES,
++        timeout: float = 30.0,
++    ) -> None:
++        self.base_url = _require_text(base_url, "base_url").rstrip("/")
++        self.username = _require_text(username, "username")
++        self._password = _require_text(password, "password")
++        if auth_source is not None:
++            auth_source = _require_text(auth_source, "auth_source")
++        self.auth_source = auth_source
++        self.page_size = _require_positive_int(page_size, "page_size", 1)
++        self.max_pages = _require_positive_int(max_pages, "max_pages", 1)
++        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
++            raise ValueError("timeout must be a positive number")
++        self.timeout = float(timeout)
++        self._token: str | None = None
++
++    # -- authentication ---------------------------------------------------
++
++    @property
++    def token(self) -> str:
++        """The auth-token, acquired on first use and reused afterwards."""
++        if self._token is None:
++            self._token = self.acquire_token()
++        return self._token
++
++    def acquire_token(self) -> str:
++        """POST username-password to acquireToken and return auth-token.token.
++
++        authSource is the one optional member of username-password. When no
++        auth source is configured the member is left out of the body entirely
++        rather than sent as null or an empty string. acquireToken declares an
++        empty security array, so no Authorization header goes with it.
++        """
++        body: dict[str, str] = {"username": self.username, "password": self._password}
++        if self.auth_source is not None:
++            body["authSource"] = self.auth_source
++
++        try:
++            payload = self._request(
++                "POST", ACQUIRE_TOKEN_PATH, body=body, authorize=False
++            )
++        except urllib.error.HTTPError as exc:
++            if exc.code == 401:
++                raise VcfOperationsAuthError(
++                    "VCF Operations rejected the supplied credentials",
++                    username=self.username,
++                ) from None
++            raise VcfOperationsProtocolError(
++                f"acquireToken answered HTTP {exc.code}", status=exc.code
++            ) from None
++
++        if not isinstance(payload, dict):
++            raise VcfOperationsProtocolError("acquireToken did not return an auth-token object")
++        token = payload.get("token")
++        if not isinstance(token, str) or not token:
++            raise VcfOperationsProtocolError("acquireToken returned no usable token")
++        return token
++
++    # -- the paged collection ---------------------------------------------
++
++    def collect_alerts(
++        self,
++        alert_ids: Iterable[str] | None = None,
++        resource_ids: Iterable[str] | None = None,
++    ) -> list[dict[str, Any]]:
++        """Retrieve the whole alert collection and return it in emission order.
++
++        Paging runs from page 0 upwards with an explicit pageSize on every
++        request. It stops as soon as page-info says the collection is complete
++        or a page comes back empty, so a collection that fills its final page
++        exactly costs no trailing request.
++        """
++        alert_ids = [_require_text(v, "alert id") for v in (alert_ids or [])]
++        resource_ids = [_require_text(v, "resource id") for v in (resource_ids or [])]
++
++        collected: list[dict[str, Any]] = []
++        page = 0
++        while True:
++            if page >= self.max_pages:
++                raise VcfOperationsProtocolError(
++                    f"getAlerts still had not delivered the whole collection after "
++                    f"{self.max_pages} page(s); refusing to page further"
++                )
++            envelope = self._read_page(page, alert_ids, resource_ids)
++            window = envelope["alerts"]
++            collected.extend(window)
++            if not window or len(collected) >= envelope["totalCount"]:
++                break
++            page += 1
++
++        return sorted(collected, key=_alert_sort_key)
++
++    def _read_page(
++        self, page: int, alert_ids: list[str], resource_ids: list[str]
++    ) -> dict[str, Any]:
++        # id and resourceId are form/explode query arrays, so each value gets
++        # its own repeated key. Both are omitted entirely when unset.
++        query: list[tuple[str, str]] = []
++        query.extend(("id", value) for value in alert_ids)
++        query.extend(("resourceId", value) for value in resource_ids)
++        query.append(("page", str(page)))
++        query.append(("pageSize", str(self.page_size)))
++
++        try:
++            payload = self._request("GET", GET_ALERTS_PATH, query=query)
++        except urllib.error.HTTPError as exc:
++            raise VcfOperationsProtocolError(
++                f"getAlerts page {page} answered HTTP {exc.code}", status=exc.code
++            ) from None
++
++        if not isinstance(payload, dict):
++            raise VcfOperationsProtocolError(f"getAlerts page {page} did not return an object")
++        alerts = payload.get("alerts")
++        if alerts is None:
++            alerts = []
++        if not isinstance(alerts, list):
++            raise VcfOperationsProtocolError(f"getAlerts page {page} returned a malformed alerts")
++        page_info = payload.get("pageInfo")
++        if not isinstance(page_info, dict):
++            raise VcfOperationsProtocolError(f"getAlerts page {page} returned no page-info")
++        total = page_info.get("totalCount")
++        if not isinstance(total, int) or isinstance(total, bool) or total < 0:
++            raise VcfOperationsProtocolError(
++                f"getAlerts page {page} returned no usable page-info totalCount"
++            )
++        return {"alerts": alerts, "totalCount": total}
++
++    # -- transport --------------------------------------------------------
++
++    def _request(
++        self,
++        method: str,
++        path: str,
++        query: list[tuple[str, str]] | None = None,
++        body: dict[str, Any] | None = None,
++        authorize: bool = True,
++    ) -> Any:
++        url = self.base_url + SERVER_BASE_PATH + path
++        if query:
++            url = f"{url}?{urllib.parse.urlencode(query)}"
++
++        data = None
++        headers = {"Accept": JSON_MEDIA_TYPE}
++        if body is not None:
++            data = json.dumps(body).encode("utf-8")
++            headers["Content-Type"] = JSON_MEDIA_TYPE
++        if authorize:
++            # Token-based-authorization is an apiKey in the Authorization
++            # header; the pinned spec defines no value prefix.
++            headers["Authorization"] = self.token
++
++        request = urllib.request.Request(url, data=data, headers=headers, method=method)
++        try:
++            with urllib.request.urlopen(request, timeout=self.timeout) as response:
++                raw = response.read()
++        except urllib.error.HTTPError:
++            raise
++        except urllib.error.URLError as exc:
++            raise VcfOperationsProtocolError(
++                f"{method} {path} could not reach VCF Operations: {exc.reason}"
++            ) from None
++
++        if not raw:
++            return None
++        try:
++            return json.loads(raw.decode("utf-8"))
++        except ValueError:
++            raise VcfOperationsProtocolError(f"{method} {path} did not return JSON") from None
+diff --git a/vcfops_alerts/errors.py b/vcfops_alerts/errors.py
+new file mode 100644
+index 0000000..87d7af3
+--- /dev/null
++++ b/vcfops_alerts/errors.py
+@@ -0,0 +1,26 @@
++"""Exceptions raised by the VCF Operations alert collector."""
++
++from __future__ import annotations
++
++
++class VcfOperationsError(Exception):
++    """Base class for every failure this package raises."""
++
++
++class VcfOperationsAuthError(VcfOperationsError):
++    """acquireToken refused the supplied credentials.
++
++    The message never repeats the password or the auth token.
++    """
++
++    def __init__(self, message: str, *, username: str | None = None) -> None:
++        super().__init__(message)
++        self.username = username
++
++
++class VcfOperationsProtocolError(VcfOperationsError):
++    """The appliance answered in a way the pinned contract does not allow."""
++
++    def __init__(self, message: str, *, status: int | None = None) -> None:
++        super().__init__(message)
++        self.status = status

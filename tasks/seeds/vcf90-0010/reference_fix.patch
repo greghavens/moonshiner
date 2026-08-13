@@ -1,0 +1,313 @@
+diff --git a/vcf_credrotate/__init__.py b/vcf_credrotate/__init__.py
+index 590c35c..74e93fe 100644
+--- a/vcf_credrotate/__init__.py
++++ b/vcf_credrotate/__init__.py
+@@ -1,18 +1,10 @@
+ """Scheduled ESXi credential rotation against VCF 9.0 SDDC Manager.
+ 
+ Standard library only. See docs/contract.json for the wire contract this
+-package must speak, and README.md for the behaviour required of
+-:func:`rotate_credentials`.
++package speaks, and README.md for the behaviour of :func:`rotate_credentials`.
+ """
+ 
+-__all__ = ["rotate_credentials"]
++from .client import SddcManagerClient, SddcManagerError
++from .rotation import rotate_credentials
+ 
+-
+-def rotate_credentials(base_url, username, password, resource_type="ESXI",
+-                       page_size=100, poll_interval=5.0):
+-    """Rotate every managed credential of ``resource_type`` and return a summary.
+-
+-    Returns a dict with the keys ``rotated_credential_ids`` (sorted list of
+-    credential ids), ``task_id``, ``task_status`` and ``token_refreshes``.
+-    """
+-    raise NotImplementedError("rotate_credentials is not implemented yet")
++__all__ = ["rotate_credentials", "SddcManagerClient", "SddcManagerError"]
+diff --git a/vcf_credrotate/client.py b/vcf_credrotate/client.py
+new file mode 100644
+index 0000000..74f222a
+--- /dev/null
++++ b/vcf_credrotate/client.py
+@@ -0,0 +1,199 @@
++"""HTTP client for the SDDC Manager operations named in docs/contract.json.
++
++Two things this module is careful about, both from the 9.0.0.0 specification:
++
++* ``refreshAccessToken`` is ``PATCH``, and its request and response bodies are
++  bare JSON strings - the refresh token id going out, the new access token
++  coming back. Neither side is an object.
++* A field with no value is omitted from the request entirely. :func:`compact`
++  drops unset keys instead of serialising ``null`` or ``""``, and the query
++  builder does the same for unset filters.
++"""
++
++import json
++import time
++import urllib.error
++import urllib.parse
++import urllib.request
++
++#: Task states that mean the task is still running.
++PENDING_STATES = frozenset({"PENDING", "IN_PROGRESS"})
++
++
++class SddcManagerError(RuntimeError):
++    """An SDDC Manager call failed."""
++
++    def __init__(self, operation_id, status, payload):
++        self.operation_id = operation_id
++        self.status = status
++        self.payload = payload
++        detail = ""
++        if isinstance(payload, dict):
++            detail = payload.get("message") or payload.get("errorCode") or ""
++        super().__init__(
++            "%s failed with HTTP %s%s" % (operation_id, status,
++                                          ": " + detail if detail else "")
++        )
++
++
++def compact(mapping):
++    """Drop keys whose value is unset, so they are omitted from the wire."""
++    return {k: v for k, v in mapping.items() if v is not None and v != ""}
++
++
++class SddcManagerClient:
++    """Speaks the five operations the contract names, and nothing else."""
++
++    def __init__(self, base_url, timeout=60.0):
++        self.base_url = base_url.rstrip("/")
++        self.timeout = timeout
++        self.access_token = None
++        self.refresh_token_id = None
++        self.token_refreshes = 0
++
++    # -- tokens ---------------------------------------------------------
++    def create_token(self, username=None, password=None, api_key=None,
++                     id_token=None):
++        """createToken - POST /v1/tokens."""
++        spec = compact({
++            "username": username,
++            "password": password,
++            "apiKey": api_key,
++            "idToken": id_token,
++        })
++        pair = self._call(
++            "createToken", "POST", "/v1/tokens",
++            body=spec, authorized=False, expect=(201,),
++        )
++        self.access_token = pair["accessToken"]
++        # TokenPair.refreshToken is a RefreshToken object, not a bare string.
++        self.refresh_token_id = (pair.get("refreshToken") or {}).get("id")
++        return pair
++
++    def refresh_access_token(self):
++        """refreshAccessToken - PATCH /v1/tokens/access-token/refresh."""
++        if not self.refresh_token_id:
++            raise SddcManagerError("refreshAccessToken", None, {
++                "message": "no refresh token id from createToken"})
++        # The body is the id itself as a bare JSON string.
++        token = self._call(
++            "refreshAccessToken", "PATCH", "/v1/tokens/access-token/refresh",
++            body=self.refresh_token_id, authorized=False, expect=(200,),
++        )
++        if not isinstance(token, str):
++            raise SddcManagerError("refreshAccessToken", 200, {
++                "message": "expected a bare JSON string access token"})
++        self.access_token = token
++        self.token_refreshes += 1
++        return token
++
++    # -- credentials -----------------------------------------------------
++    def get_credentials(self, resource_name=None, resource_ip=None,
++                        resource_type=None, domain_name=None,
++                        account_type=None, page_number=0, page_size=100):
++        """getCredentials - GET /v1/credentials, one page."""
++        query = compact({
++            "resourceName": resource_name,
++            "resourceIp": resource_ip,
++            "resourceType": resource_type,
++            "domainName": domain_name,
++            "accountType": account_type,
++            "pageNumber": str(page_number),
++            "pageSize": str(page_size),
++        })
++        return self._call(
++            "getCredentials", "GET", "/v1/credentials", query=query, expect=(200,)
++        )
++
++    def iter_all_credentials(self, page_size=100, **filters):
++        """Every page of getCredentials, resuming where a 401 interrupted us.
++
++        The page number only advances once a page has actually been received,
++        so an access token expiring mid-inventory costs one replayed request
++        and no re-read pages.
++        """
++        collected, page_number = [], 0
++        while True:
++            page = self.get_credentials(
++                page_number=page_number, page_size=page_size, **filters
++            )
++            collected.extend(page.get("elements") or [])
++            metadata = page.get("pageMetadata") or {}
++            total_pages = metadata.get("totalPages")
++            page_number += 1
++            if not total_pages or page_number >= total_pages:
++                return collected
++
++    def update_or_rotate_passwords(self, spec):
++        """updateOrRotatePasswords - PATCH /v1/credentials."""
++        return self._call(
++            "updateOrRotatePasswords", "PATCH", "/v1/credentials",
++            body=spec, expect=(202,),
++        )
++
++    def get_credentials_task(self, task_id):
++        """getCredentialsTask - GET /v1/credentials/tasks/{id}."""
++        path = "/v1/credentials/tasks/" + urllib.parse.quote(str(task_id), safe="")
++        return self._call("getCredentialsTask", "GET", path, expect=(200,))
++
++    def await_credentials_task(self, task_id, poll_interval=5.0, timeout=1800.0):
++        """Poll one task to a terminal state and return it."""
++        deadline = time.monotonic() + timeout
++        while True:
++            task = self.get_credentials_task(task_id)
++            if task.get("status") not in PENDING_STATES:
++                return task
++            if time.monotonic() >= deadline:
++                raise SddcManagerError("getCredentialsTask", None, {
++                    "message": "task %s still running after %ss" % (task_id, timeout)})
++            if poll_interval:
++                time.sleep(poll_interval)
++
++    # -- transport --------------------------------------------------------
++    def _call(self, operation_id, method, path, body=None, query=None,
++              authorized=True, expect=(200,)):
++        """Send a request, refreshing and replaying it once on expiry.
++
++        The payload and URL are built once and reused for the replay, so the
++        retried request is the same request - only the bearer token changes.
++        """
++        url = self.base_url + path
++        if query:
++            url += "?" + urllib.parse.urlencode(query)
++        payload = None if body is None else json.dumps(body).encode("utf-8")
++
++        status, data = self._attempt(method, url, payload, authorized)
++        if status == 401 and authorized:
++            self.refresh_access_token()
++            status, data = self._attempt(method, url, payload, authorized)
++        if status not in expect:
++            raise SddcManagerError(operation_id, status, data)
++        return data
++
++    def _attempt(self, method, url, payload, authorized):
++        headers = {"Accept": "application/json"}
++        if payload is not None:
++            headers["Content-Type"] = "application/json"
++        if authorized:
++            if not self.access_token:
++                raise SddcManagerError("authorize", None, {
++                    "message": "no access token; call create_token first"})
++            headers["Authorization"] = "Bearer " + self.access_token
++
++        request = urllib.request.Request(
++            url, data=payload, method=method, headers=headers
++        )
++        try:
++            with urllib.request.urlopen(request, timeout=self.timeout) as response:
++                return response.status, _decode(response.read())
++        except urllib.error.HTTPError as exc:
++            return exc.code, _decode(exc.read())
++
++
++def _decode(raw):
++    if not raw:
++        return None
++    try:
++        return json.loads(raw.decode("utf-8"))
++    except ValueError:
++        return raw.decode("utf-8", errors="replace")
+diff --git a/vcf_credrotate/rotation.py b/vcf_credrotate/rotation.py
+new file mode 100644
+index 0000000..daa9296
+--- /dev/null
++++ b/vcf_credrotate/rotation.py
+@@ -0,0 +1,75 @@
++"""The rotation run itself: inventory, one rotation spec, one task, poll it."""
++
++from .client import SddcManagerClient, SddcManagerError, compact
++
++
++def build_rotation_spec(credentials):
++    """Group listed credentials into a CredentialsUpdateSpec for ROTATE.
++
++    One ``elements`` entry per resource carrying all of that resource's
++    credentials - a resource's credentials can land on different inventory
++    pages, so grouping happens over the whole inventory, not per page.
++
++    ``password`` is omitted from every entry: SDDC Manager generates the new
++    password for a ROTATE. ``autoRotatePolicy`` is omitted because this run
++    does not change the policy.
++    """
++    elements = {}
++    for credential in credentials:
++        resource = credential.get("resource") or {}
++        key = resource.get("resourceId") or resource.get("resourceName")
++        element = elements.get(key)
++        if element is None:
++            element = compact({
++                "resourceId": resource.get("resourceId"),
++                "resourceName": resource.get("resourceName"),
++                "resourceType": resource.get("resourceType"),
++            })
++            element["credentials"] = []
++            elements[key] = element
++        element["credentials"].append(compact({
++            "credentialType": credential.get("credentialType"),
++            "accountType": credential.get("accountType"),
++            "username": credential.get("username"),
++        }))
++    return {"operationType": "ROTATE", "elements": list(elements.values())}
++
++
++def rotate_credentials(base_url, username, password, resource_type="ESXI",
++                       page_size=100, poll_interval=5.0):
++    """Rotate every managed credential of ``resource_type`` and return a summary.
++
++    The access token can expire at any point; the client refreshes and replays
++    the interrupted request, so the inventory is not re-read from page zero and
++    the rotation is never submitted twice.
++    """
++    client = SddcManagerClient(base_url)
++    client.create_token(username=username, password=password)
++
++    credentials = client.iter_all_credentials(
++        page_size=page_size, resource_type=resource_type
++    )
++    credential_ids = sorted(c["id"] for c in credentials)
++    if not credentials:
++        return {
++            "rotated_credential_ids": [],
++            "task_id": None,
++            "task_status": None,
++            "token_refreshes": client.token_refreshes,
++        }
++
++    submitted = client.update_or_rotate_passwords(build_rotation_spec(credentials))
++    task_id = submitted["id"]
++
++    task = client.await_credentials_task(task_id, poll_interval=poll_interval)
++    status = task.get("status")
++    if status != "SUCCESSFUL":
++        raise SddcManagerError("getCredentialsTask", None, {
++            "message": "rotation task %s finished %s" % (task_id, status)})
++
++    return {
++        "rotated_credential_ids": credential_ids,
++        "task_id": task_id,
++        "task_status": status,
++        "token_refreshes": client.token_refreshes,
++    }

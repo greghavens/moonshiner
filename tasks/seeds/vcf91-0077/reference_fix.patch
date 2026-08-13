@@ -1,0 +1,371 @@
+diff --git a/nsxpolicy/client.go b/nsxpolicy/client.go
+new file mode 100644
+--- /dev/null
++++ b/nsxpolicy/client.go
+@@ -0,0 +1,366 @@
++package nsxpolicy
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"io"
++	"mime"
++	"net/http"
++	"net/url"
++	"sort"
++	"strings"
++	"time"
++	"unicode/utf8"
++)
++
++const (
++	policyBasePath   = "/policy/api/v1"
++	bulkTagPath      = policyBasePath + "/infra/tags/tag-operations/"
++	maxResponseBytes = 1 << 20
++)
++
++// Client calls the two operations in the focused NSX Policy contract.
++type Client struct {
++	origin       string
++	username     string
++	password     string
++	httpClient   *http.Client
++	pollInterval time.Duration
++	maxPolls     int
++}
++
++// NewClient validates configuration without making a request.
++func NewClient(config Config) (*Client, error) {
++	origin, err := validateOrigin(config.BaseURL)
++	if err != nil {
++		return nil, err
++	}
++	if strings.TrimSpace(config.Username) == "" || strings.Contains(config.Username, ":") ||
++		strings.ContainsAny(config.Username, "\r\n") {
++		return nil, errors.New("nsxpolicy: Username must be a nonblank header-safe Basic username")
++	}
++	if strings.TrimSpace(config.Password) == "" || strings.ContainsAny(config.Password, "\r\n") {
++		return nil, errors.New("nsxpolicy: Password must be nonblank and header-safe")
++	}
++	if config.PollInterval < 0 {
++		return nil, errors.New("nsxpolicy: PollInterval must be nonnegative")
++	}
++	if config.MaxPolls <= 0 {
++		return nil, errors.New("nsxpolicy: MaxPolls must be positive")
++	}
++
++	configuredHTTP := config.HTTPClient
++	if configuredHTTP == nil {
++		configuredHTTP = http.DefaultClient
++	}
++	httpCopy := *configuredHTTP
++	httpCopy.CheckRedirect = func(*http.Request, []*http.Request) error {
++		return http.ErrUseLastResponse
++	}
++	return &Client{
++		origin:       origin,
++		username:     config.Username,
++		password:     config.Password,
++		httpClient:   &httpCopy,
++		pollInterval: config.PollInterval,
++		maxPolls:     config.MaxPolls,
++	}, nil
++}
++
++func validateOrigin(raw string) (string, error) {
++	if raw == "" || raw != strings.TrimSpace(raw) {
++		return "", errors.New("nsxpolicy: BaseURL must be an HTTP(S) origin")
++	}
++	parsed, err := url.Parse(raw)
++	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") ||
++		parsed.Host == "" || parsed.Opaque != "" || parsed.User != nil ||
++		(parsed.Path != "" && parsed.Path != "/") || parsed.RawPath != "" ||
++		parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" ||
++		strings.Contains(raw, "#") {
++		return "", errors.New("nsxpolicy: BaseURL must be an HTTP(S) origin")
++	}
++	return parsed.Scheme + "://" + parsed.Host, nil
++}
++
++// ApplyTagAndWait invokes TagBulkUpdate once and polls
++// GetTagBulkOperationStatus until it observes a terminal status.
++func (c *Client) ApplyTagAndWait(ctx context.Context, operationID string, request BulkTagRequest) (Result, error) {
++	if err := validateCall(ctx, operationID, request); err != nil {
++		return Result{}, err
++	}
++	body, err := json.Marshal(request)
++	if err != nil {
++		return Result{}, &ProtocolError{OperationID: OperationTagBulkUpdate, Reason: "request could not be encoded"}
++	}
++	target := c.origin + bulkTagPath + url.PathEscape(operationID)
++	var accepted map[string]any
++	if err := c.doJSON(ctx, OperationTagBulkUpdate, http.MethodPut, target, body, &accepted); err != nil {
++		return Result{}, err
++	}
++	if accepted == nil {
++		return Result{}, &ProtocolError{OperationID: OperationTagBulkUpdate, Reason: "success was not one JSON object"}
++	}
++
++	statusTarget := target + "/status"
++	var last TagBulkOperationStatus
++	for poll := 1; poll <= c.maxPolls; poll++ {
++		var status TagBulkOperationStatus
++		if err := c.doJSON(ctx, OperationGetTagBulkOperationStatus, http.MethodGet, statusTarget, nil, &status); err != nil {
++			return Result{}, err
++		}
++		if err := validateStatus(status); err != nil {
++			return Result{}, err
++		}
++		last = status
++		switch status.Status {
++		case StatusSuccess:
++			outcomes, err := flattenOutcomes(status)
++			if err != nil {
++				return Result{}, err
++			}
++			return Result{
++				OperationID: operationID,
++				Path:        status.Path,
++				Polls:       poll,
++				Outcomes:    outcomes,
++			}, nil
++		case StatusError:
++			outcomes, err := flattenOutcomes(status)
++			if err != nil {
++				return Result{}, err
++			}
++			return Result{}, &OperationFailedError{
++				OperationID: operationID,
++				Polls:       poll,
++				Final:       status,
++				Outcomes:    outcomes,
++			}
++		case StatusPending, StatusRunning:
++			if poll == c.maxPolls {
++				return Result{}, &PollTimeoutError{
++					OperationID: operationID,
++					MaxPolls:    c.maxPolls,
++					Last:        last,
++				}
++			}
++			if err := waitForPoll(ctx, c.pollInterval); err != nil {
++				return Result{}, err
++			}
++		default:
++			return Result{}, &ProtocolError{
++				OperationID: OperationGetTagBulkOperationStatus,
++				Reason:      "status has an unknown value",
++			}
++		}
++	}
++	panic("unreachable")
++}
++
++func validateCall(ctx context.Context, operationID string, request BulkTagRequest) error {
++	if ctx == nil {
++		return errors.New("nsxpolicy: context is required")
++	}
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	if operationID == "" || operationID != strings.TrimSpace(operationID) || !utf8.ValidString(operationID) {
++		return errors.New("nsxpolicy: operation ID must be a trimmed nonblank UTF-8 string")
++	}
++	if strings.TrimSpace(request.Tag.Tag) == "" || !utf8.ValidString(request.Tag.Tag) ||
++		utf8.RuneCountInString(request.Tag.Tag) > 256 {
++		return errors.New("nsxpolicy: tag must be nonblank and at most 256 characters")
++	}
++	if request.Tag.Scope != nil &&
++		(strings.TrimSpace(*request.Tag.Scope) == "" || !utf8.ValidString(*request.Tag.Scope) ||
++			utf8.RuneCountInString(*request.Tag.Scope) > 128) {
++		return errors.New("nsxpolicy: scope must be nonblank and at most 128 characters when set")
++	}
++	if request.ApplyTo == nil && request.RemoveFrom == nil {
++		return errors.New("nsxpolicy: at least one tag action is required")
++	}
++	if request.ApplyTo != nil && len(request.ApplyTo) == 0 {
++		return errors.New("nsxpolicy: apply_to cannot be explicitly empty")
++	}
++	if request.RemoveFrom != nil && len(request.RemoveFrom) == 0 {
++		return errors.New("nsxpolicy: remove_from cannot be explicitly empty")
++	}
++	for _, groups := range [][]ResourceInfo{request.ApplyTo, request.RemoveFrom} {
++		for _, group := range groups {
++			if group.ResourceType != "VirtualMachine" {
++				return errors.New("nsxpolicy: resource_type must be VirtualMachine")
++			}
++			if len(group.ResourceIDs) == 0 {
++				return errors.New("nsxpolicy: every resource group requires resource_ids")
++			}
++			for _, id := range group.ResourceIDs {
++				if strings.TrimSpace(id) == "" || !utf8.ValidString(id) {
++					return errors.New("nsxpolicy: resource IDs must be nonblank UTF-8 strings")
++				}
++			}
++		}
++	}
++	return nil
++}
++
++func validateStatus(status TagBulkOperationStatus) error {
++	if strings.TrimSpace(status.Path) == "" || strings.TrimSpace(status.Tag.Tag) == "" {
++		return &ProtocolError{
++			OperationID: OperationGetTagBulkOperationStatus,
++			Reason:      "required path or tag data is missing",
++		}
++	}
++	return nil
++}
++
++func flattenOutcomes(status TagBulkOperationStatus) ([]Outcome, error) {
++	var outcomes []Outcome
++	appendGroups := func(action string, groups []ResourceTypeTagStatus) error {
++		for _, group := range groups {
++			if strings.TrimSpace(group.ResourceType) == "" {
++				return &ProtocolError{OperationID: OperationGetTagBulkOperationStatus, Reason: "outcome resource_type is blank"}
++			}
++			for _, item := range group.ResourceTagStatus {
++				if strings.TrimSpace(item.ResourceID) == "" || strings.TrimSpace(item.TagStatus) == "" {
++					return &ProtocolError{OperationID: OperationGetTagBulkOperationStatus, Reason: "outcome resource ID or status is blank"}
++				}
++				outcomes = append(outcomes, Outcome{
++					Action:       action,
++					ResourceType: group.ResourceType,
++					ResourceID:   item.ResourceID,
++					TagStatus:    item.TagStatus,
++					Details:      item.Details,
++				})
++			}
++		}
++		return nil
++	}
++	if err := appendGroups(ActionApply, status.ApplyTo); err != nil {
++		return nil, err
++	}
++	if err := appendGroups(ActionRemove, status.RemoveFrom); err != nil {
++		return nil, err
++	}
++	sort.Slice(outcomes, func(i, j int) bool {
++		left, right := outcomes[i], outcomes[j]
++		if left.ResourceType != right.ResourceType {
++			return left.ResourceType < right.ResourceType
++		}
++		if left.ResourceID != right.ResourceID {
++			return left.ResourceID < right.ResourceID
++		}
++		if left.Action != right.Action {
++			return left.Action < right.Action
++		}
++		if left.TagStatus != right.TagStatus {
++			return left.TagStatus < right.TagStatus
++		}
++		return left.Details < right.Details
++	})
++	return outcomes, nil
++}
++
++func waitForPoll(ctx context.Context, interval time.Duration) error {
++	if interval == 0 {
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		default:
++			return nil
++		}
++	}
++	timer := time.NewTimer(interval)
++	defer timer.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-timer.C:
++		return nil
++	}
++}
++
++func (c *Client) doJSON(ctx context.Context, operationID, method, target string, body []byte, result any) error {
++	var reader io.Reader
++	if body != nil {
++		reader = bytes.NewReader(body)
++	}
++	request, err := http.NewRequestWithContext(ctx, method, target, reader)
++	if err != nil {
++		return &ProtocolError{OperationID: operationID, Reason: "request could not be constructed"}
++	}
++	request.Header.Set("Accept", "application/json")
++	request.SetBasicAuth(c.username, c.password)
++	if body != nil {
++		request.Header.Set("Content-Type", "application/json")
++	}
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		cause := err
++		if ctx.Err() != nil {
++			cause = ctx.Err()
++		}
++		return &TransportError{OperationID: operationID, Cause: cause}
++	}
++	defer response.Body.Close()
++	payload, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
++	if err != nil {
++		cause := err
++		if ctx.Err() != nil {
++			cause = ctx.Err()
++		}
++		return &TransportError{OperationID: operationID, Cause: cause}
++	}
++	if len(payload) > maxResponseBytes {
++		return &ProtocolError{OperationID: operationID, Reason: "response exceeded the size limit"}
++	}
++	if response.StatusCode != http.StatusOK {
++		return decodeAPIError(operationID, response.StatusCode, payload)
++	}
++	mediaType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
++	if err != nil || (mediaType != "application/json" && !strings.HasSuffix(mediaType, "+json")) {
++		return &ProtocolError{OperationID: operationID, Reason: "success did not use a JSON media type"}
++	}
++	if err := decodeOneObject(payload, result); err != nil {
++		return &ProtocolError{OperationID: operationID, Reason: "success was not exactly one JSON object"}
++	}
++	return nil
++}
++
++func decodeAPIError(operationID string, statusCode int, payload []byte) error {
++	var envelope map[string]any
++	if err := decodeOneObject(payload, &envelope); err != nil || envelope == nil {
++		return &ProtocolError{OperationID: operationID, Reason: "error response was not exactly one JSON object"}
++	}
++	var projected struct {
++		ErrorCode    *int64 `json:"error_code"`
++		ErrorMessage string `json:"error_message"`
++		ModuleName   string `json:"module_name"`
++		Details      string `json:"details"`
++	}
++	_ = json.Unmarshal(payload, &projected)
++	return &APIError{
++		OperationID:  operationID,
++		StatusCode:   statusCode,
++		Envelope:     envelope,
++		ErrorCode:    projected.ErrorCode,
++		ErrorMessage: projected.ErrorMessage,
++		ModuleName:   projected.ModuleName,
++		Details:      projected.Details,
++	}
++}
++
++func decodeOneObject(payload []byte, result any) error {
++	decoder := json.NewDecoder(bytes.NewReader(payload))
++	if err := decoder.Decode(result); err != nil {
++		return err
++	}
++	var extra any
++	if err := decoder.Decode(&extra); err != io.EOF {
++		if err == nil {
++			return errors.New("trailing JSON value")
++		}
++		return err
++	}
++	return nil
++}

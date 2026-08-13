@@ -1,0 +1,132 @@
+diff --git a/src/VcenterSecretRotation/VcenterSecretRotation.psm1 b/src/VcenterSecretRotation/VcenterSecretRotation.psm1
+--- a/src/VcenterSecretRotation/VcenterSecretRotation.psm1
++++ b/src/VcenterSecretRotation/VcenterSecretRotation.psm1
+@@ -13,14 +13,47 @@
+     return $script:Contract
+ }
+ 
++function Remove-UnsetProperty {
++    <#
++    .SYNOPSIS
++        Drops every property that stands in for "the caller did not set this".
++    .DESCRIPTION
++        Schema-shaped objects can carry placeholders for unset optional properties. The contract
++        treats null, "", [] and {} as values in their own right, so they have to be removed
++        rather than forwarded.
++    #>
++    param($Value)
++
++    if ($Value -is [System.Collections.IDictionary]) {
++        $kept = [ordered]@{}
++        foreach ($key in @($Value.Keys)) {
++            $inner = $Value[$key]
++            if ($null -eq $inner) { continue }
++            $inner = Remove-UnsetProperty -Value $inner
++            if ($null -eq $inner) { continue }
++            if ($inner -is [string] -and $inner.Length -eq 0) { continue }
++            if (($inner -is [System.Collections.IDictionary] -or $inner -is [array]) -and $inner.Count -eq 0) { continue }
++            $kept[$key] = $inner
++        }
++        return $kept
++    }
++    if ($Value -is [array]) {
++        # The comma keeps a single-element array an array instead of letting the pipeline
++        # unroll it into a bare scalar.
++        $items = @(foreach ($item in $Value) { Remove-UnsetProperty -Value $item })
++        return , $items
++    }
++    return $Value
++}
++
+ function ConvertTo-ContractPayload {
+     <#
+     .SYNOPSIS
+-        Turns a schema-shaped object into the JSON property bag that goes on the wire.
++        Turns a schema-shaped object into the cleaned property bag that goes on the wire.
+     #>
+     param([Parameter(Mandatory)] $Model)
+ 
+-    return $Model | ConvertTo-Json -Depth 20 -Compress | ConvertFrom-Json
++    return Remove-UnsetProperty -Value ($Model | ConvertTo-Json -Depth 20 -Compress | ConvertFrom-Json -AsHashtable -Depth 20)
+ }
+ 
+ function Invoke-VcenterApi {
+@@ -142,8 +175,11 @@
+         -Body $payload `
+         -SkipCertificateCheck:$SkipCertificateCheck
+ 
+-    if ($null -eq $response) { return @() }
+-    return @($response.PSObject.Properties.Name)
++    # Cis.Tasks_list answers with a map of task identifier to Cis.Task.Info, so the keys are
++    # the identifiers. An empty map and a single-entry map both have to stay arrays here.
++    if ($null -eq $response) { return , @() }
++    $identifiers = @($response.PSObject.Properties | ForEach-Object { $_.Name })
++    return , $identifiers
+ }
+ 
+ function Get-VcenterTask {
+@@ -162,9 +198,16 @@
+         return_all     = $null
+         exclude_result = $true
+     }
++    # style: form, explode: true - each property that was set becomes its own query parameter,
++    # and the ones that were not set contribute nothing at all.
+     $query = @{}
+-    foreach ($property in (ConvertTo-ContractPayload -Model $getSpec).PSObject.Properties) {
+-        $query[$property.Name] = ([string]$property.Value).ToLowerInvariant()
++    foreach ($entry in (ConvertTo-ContractPayload -Model $getSpec).GetEnumerator()) {
++        $query[$entry.Key] = if ($entry.Value -is [bool]) {
++            $entry.Value.ToString().ToLowerInvariant()
++        }
++        else {
++            [string]$entry.Value
++        }
+     }
+ 
+     return Invoke-VcenterApi -BaseUri $BaseUri -Method 'GET' -Path "/cis/tasks/$TaskId" `
+@@ -178,8 +221,10 @@
+     .SYNOPSIS
+         Rotates the automation service account onto a new secret.
+     .DESCRIPTION
+-        Opens a session on the new secret, then retires the session that was minted from the
+-        old secret.
++        Opens a session on the new secret and confirms it belongs to the account being rotated,
++        then holds the retiring session open until the requests still bound to it have settled,
++        and only then deletes it. If the drain does not finish, the retiring session is left
++        alive: an operator can retry, whereas work abandoned mid-flight cannot be recovered.
+     #>
+     [CmdletBinding()]
+     param(
+@@ -198,9 +243,9 @@
+     $newSessionId = New-VcenterSession -BaseUri $baseUri -Credential $Credential -SkipCertificateCheck:$SkipCertificateCheck
+ 
+     $info = Get-VcenterSessionInfo -BaseUri $baseUri -SessionId $newSessionId -SkipCertificateCheck:$SkipCertificateCheck
+-    Write-Verbose ("new session belongs to {0}" -f $info.user)
+-
+-    Remove-VcenterSession -BaseUri $baseUri -SessionId $RetiringSessionId -SkipCertificateCheck:$SkipCertificateCheck
++    if ($info.user -ne $Credential.UserName) {
++        throw ("The session opened on the new secret belongs to '{0}', not '{1}'. Nothing was retired." -f $info.user, $Credential.UserName)
++    }
+ 
+     $pending = Get-InFlightTask -BaseUri $baseUri -SessionId $RetiringSessionId -Account $Credential.UserName `
+         -Service $DrainService -SkipCertificateCheck:$SkipCertificateCheck
+@@ -209,7 +254,7 @@
+     $deadline = [datetime]::UtcNow.AddSeconds($DrainTimeoutSeconds)
+     while ($pending.Count -gt 0) {
+         if ([datetime]::UtcNow -ge $deadline) {
+-            throw "Timed out draining in-flight tasks: $($pending -join ', ')"
++            throw ("Gave up after {0}s waiting for requests still bound to the retiring session: {1}. The retiring session was left alive so none of them are stranded." -f $DrainTimeoutSeconds, ($pending -join ', '))
+         }
+         $stillPending = [System.Collections.Generic.List[string]]::new()
+         foreach ($taskId in $pending) {
+@@ -227,6 +272,9 @@
+         }
+     }
+ 
++    # Everything the retiring session owned has settled, so its identity can be handed over.
++    Remove-VcenterSession -BaseUri $baseUri -SessionId $RetiringSessionId -SkipCertificateCheck:$SkipCertificateCheck
++
+     return [pscustomobject]@{
+         Account                = $Credential.UserName
+         NewSessionId           = $newSessionId
+

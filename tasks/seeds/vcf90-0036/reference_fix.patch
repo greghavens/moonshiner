@@ -1,0 +1,244 @@
+diff --git a/VcfLibraryItemRegistration.psm1 b/VcfLibraryItemRegistration.psm1
+index 124654e..9106685 100644
+--- a/VcfLibraryItemRegistration.psm1
++++ b/VcfLibraryItemRegistration.psm1
+@@ -2,11 +2,197 @@
+     VcfLibraryItemRegistration - register content library items on a
+     VMware Cloud Foundation 9.0 vCenter.
+ 
+-    Nothing here is implemented yet. The exported surface below is the shape
+-    the acceptance harness drives; fill it in against docs/contract.json.
++    Request bodies are built from the genuine VMware.Sdk.vSphere.ContentLibrary
++    model initializers. Those models keep every member the caller never set and
++    render them as null, so the null members are stripped before the body goes
++    on the wire: the vSphere Automation API treats an absent optional member and
++    a null one differently, and the contract asks for absent.
++
++    Creating a library item is the one mutating call here. Each item gets a
++    single Client-Token UUID minted before its first attempt and replayed
++    unchanged on every retry, so a create whose response is lost resolves to the
++    item the first attempt already committed instead of a second copy of it.
+ #>
+ Set-StrictMode -Version Latest
+ 
++Import-Module VMware.Sdk.vSphere.ContentLibrary -ErrorAction Stop -WarningAction SilentlyContinue
++
++function Get-VcfField {
++    param($InputObject, [string]$Name)
++    if ($null -eq $InputObject) { return $null }
++    if ($InputObject -is [System.Collections.IDictionary]) {
++        if ($InputObject.Contains($Name)) { return $InputObject[$Name] }
++        return $null
++    }
++    $property = $InputObject.PSObject.Properties[$Name]
++    if ($null -eq $property) { return $null }
++    return $property.Value
++}
++
++# The SDK models render unset members as null. The contract wants them absent,
++# so the decoded body is pruned before it is re-encoded.
++function Remove-VcfEmptyMember {
++    param($Node)
++
++    if ($null -eq $Node) { return $null }
++    if ($Node -is [string]) {
++        if ($Node.Length -eq 0) { return $null }
++        return $Node
++    }
++    if ($Node -is [System.ValueType]) { return $Node }
++    if ($Node -is [System.Collections.IEnumerable]) {
++        $kept = @()
++        foreach ($element in $Node) {
++            $pruned = Remove-VcfEmptyMember -Node $element
++            if ($null -ne $pruned) { $kept += , $pruned }
++        }
++        if ($kept.Count -eq 0) { return $null }
++        return , $kept
++    }
++
++    $members = [ordered]@{}
++    foreach ($property in $Node.PSObject.Properties) {
++        $pruned = Remove-VcfEmptyMember -Node $property.Value
++        if ($null -ne $pruned) { $members[$property.Name] = $pruned }
++    }
++    if ($members.Count -eq 0) { return $null }
++    return [pscustomobject]$members
++}
++
++function ConvertTo-VcfRequestBody {
++    param([Parameter(Mandatory)]$Model)
++
++    $decoded = $Model.ToJson() | ConvertFrom-Json
++    $pruned = Remove-VcfEmptyMember -Node $decoded
++    if ($null -eq $pruned) { throw 'Refusing to send an empty request body.' }
++    return ($pruned | ConvertTo-Json -Depth 12 -Compress)
++}
++
++function Invoke-VcfApi {
++    param(
++        [Parameter(Mandatory)][string]$Method,
++        [Parameter(Mandatory)][string]$Uri,
++        [hashtable]$Headers = @{},
++        [string]$Body
++    )
++
++    $arguments = @{
++        Method             = $Method
++        Uri                = $Uri
++        Headers            = $Headers
++        SkipHttpErrorCheck = $true
++        MaximumRedirection = 0
++        ErrorAction        = 'Stop'
++    }
++    if ($PSBoundParameters.ContainsKey('Body')) {
++        $arguments['Body'] = $Body
++        $arguments['ContentType'] = 'application/json'
++    }
++    return Invoke-WebRequest @arguments
++}
++
++function Get-VcfErrorText {
++    param($Response)
++    $content = $Response.Content
++    if ([string]::IsNullOrWhiteSpace($content)) { return "HTTP $($Response.StatusCode)" }
++    return "HTTP $($Response.StatusCode): $content"
++}
++
++function New-VcfSession {
++    param([string]$BaseUri, [pscredential]$Credential)
++
++    $pair = '{0}:{1}' -f $Credential.UserName, $Credential.GetNetworkCredential().Password
++    $basic = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($pair))
++
++    # Cis.Session_create declares no request body; the credentials ride in the
++    # Authorization header and the token comes back as a bare JSON string.
++    $response = Invoke-VcfApi -Method 'POST' -Uri "$BaseUri/session" -Headers @{ Authorization = $basic }
++    if ($response.StatusCode -ne 201) {
++        throw "Cis.Session_create failed. $(Get-VcfErrorText $response)"
++    }
++    return ($response.Content | ConvertFrom-Json)
++}
++
++function Resolve-VcfLibraryId {
++    param([string]$BaseUri, [hashtable]$Headers, [string]$LibraryName)
++
++    $spec = Initialize-ContentLibraryFindSpec -Name $LibraryName -Type 'LOCAL'
++    $response = Invoke-VcfApi -Method 'POST' -Uri "$BaseUri/content/library?action=find" `
++        -Headers $Headers -Body (ConvertTo-VcfRequestBody -Model $spec)
++    if ($response.StatusCode -ne 200) {
++        throw "Content.Library_find failed. $(Get-VcfErrorText $response)"
++    }
++
++    $found = @($response.Content | ConvertFrom-Json)
++    if ($found.Count -eq 0) { throw "No local content library named '$LibraryName' exists on this vCenter." }
++    if ($found.Count -gt 1) { throw "'$LibraryName' matches $($found.Count) local content libraries; refusing to guess." }
++    return $found[0]
++}
++
++function Find-VcfLibraryItemId {
++    param([string]$BaseUri, [hashtable]$Headers, [string]$LibraryId, [string]$Name)
++
++    $spec = Initialize-ContentLibraryItemFindSpec -LibraryId $LibraryId -Name $Name
++    $response = Invoke-VcfApi -Method 'POST' -Uri "$BaseUri/content/library/item?action=find" `
++        -Headers $Headers -Body (ConvertTo-VcfRequestBody -Model $spec)
++    if ($response.StatusCode -ne 200) {
++        throw "Content.Library.Item_find failed for '$Name'. $(Get-VcfErrorText $response)"
++    }
++
++    $found = @($response.Content | ConvertFrom-Json)
++    if ($found.Count -eq 0) { return $null }
++    if ($found.Count -gt 1) { throw "'$Name' matches $($found.Count) items in $LibraryId; refusing to guess." }
++    return $found[0]
++}
++
++function New-VcfLibraryItem {
++    param(
++        [string]$BaseUri,
++        [hashtable]$Headers,
++        [string]$LibraryId,
++        [string]$Name,
++        [string]$Type,
++        [int]$MaxAttempts,
++        [scriptblock]$SleepAction
++    )
++
++    $modelArguments = @{ LibraryId = $LibraryId; Name = $Name }
++    if (-not [string]::IsNullOrEmpty($Type)) { $modelArguments['Type'] = $Type }
++    $body = ConvertTo-VcfRequestBody -Model (Initialize-ContentLibraryItemModel @modelArguments)
++
++    # One token for this item, minted once. Every retry below replays it, which
++    # is what lets vCenter answer a repeated create with the item it already
++    # made rather than making another one.
++    $clientToken = [guid]::NewGuid().ToString()
++    $requestHeaders = $Headers.Clone()
++    $requestHeaders['Client-Token'] = $clientToken
++
++    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
++        $response = Invoke-VcfApi -Method 'POST' -Uri "$BaseUri/content/library/item" `
++            -Headers $requestHeaders -Body $body
++        if ($response.StatusCode -eq 201) {
++            return ($response.Content | ConvertFrom-Json)
++        }
++        if ([int]$response.StatusCode -lt 500 -or $attempt -eq $MaxAttempts) {
++            throw "Content.Library.Item_create failed for '$Name'. $(Get-VcfErrorText $response)"
++        }
++        $delay = [math]::Min(30, [math]::Pow(2, $attempt - 1))
++        if ($SleepAction) { & $SleepAction $delay } else { Start-Sleep -Seconds $delay }
++    }
++    throw "Content.Library.Item_create for '$Name' exhausted $MaxAttempts attempts."
++}
++
++function Get-VcfLibraryItem {
++    param([string]$BaseUri, [hashtable]$Headers, [string]$ItemId)
++
++    $escaped = [uri]::EscapeDataString($ItemId)
++    $response = Invoke-VcfApi -Method 'GET' -Uri "$BaseUri/content/library/item/$escaped" -Headers $Headers
++    if ($response.StatusCode -ne 200) {
++        throw "Content.Library.Item_get failed for '$ItemId'. $(Get-VcfErrorText $response)"
++    }
++    return ($response.Content | ConvertFrom-Json)
++}
++
+ function Invoke-VcfLibraryItemRegistration {
+     [CmdletBinding()]
+     param(
+@@ -18,7 +204,38 @@ function Invoke-VcfLibraryItemRegistration {
+         [scriptblock]$SleepAction
+     )
+ 
+-    throw [System.NotImplementedException]::new('Invoke-VcfLibraryItemRegistration is not implemented.')
++    $baseUri = $Server.TrimEnd('/') + '/api'
++
++    $sessionId = New-VcfSession -BaseUri $baseUri -Credential $Credential
++    $headers = @{ 'vmware-api-session-id' = $sessionId }
++
++    $libraryId = Resolve-VcfLibraryId -BaseUri $baseUri -Headers $headers -LibraryName $LibraryName
++
++    $registered = foreach ($entry in $Item) {
++        $name = Get-VcfField -InputObject $entry -Name 'Name'
++        if ([string]::IsNullOrWhiteSpace($name)) { throw 'Every requested item needs a Name.' }
++        $type = Get-VcfField -InputObject $entry -Name 'Type'
++
++        $itemId = Find-VcfLibraryItemId -BaseUri $baseUri -Headers $headers -LibraryId $libraryId -Name $name
++        $created = $false
++        if ($null -eq $itemId) {
++            $itemId = New-VcfLibraryItem -BaseUri $baseUri -Headers $headers -LibraryId $libraryId `
++                -Name $name -Type $type -MaxAttempts $MaxAttempts -SleepAction $SleepAction
++            $created = $true
++        }
++
++        $model = Get-VcfLibraryItem -BaseUri $baseUri -Headers $headers -ItemId $itemId
++        [pscustomobject]@{
++            Name    = $model.name
++            ItemId  = $itemId
++            Created = $created
++        }
++    }
++
++    return [pscustomobject]@{
++        LibraryId = $libraryId
++        Items     = @($registered)
++    }
+ }
+ 
+ Export-ModuleMember -Function Invoke-VcfLibraryItemRegistration

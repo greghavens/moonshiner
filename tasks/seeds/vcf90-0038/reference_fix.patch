@@ -1,0 +1,518 @@
+diff --git a/VcfEvcGuard/VcfEvcGuard.psd1 b/VcfEvcGuard/VcfEvcGuard.psd1
+new file mode 100644
+index 0000000..881137c
+--- /dev/null
++++ b/VcfEvcGuard/VcfEvcGuard.psd1
+@@ -0,0 +1,31 @@
++@{
++    RootModule        = 'VcfEvcGuard.psm1'
++    ModuleVersion     = '1.0.0'
++    GUID              = 'b6f1c2d4-8a35-4f70-9e21-3c58a0d7b914'
++    Author            = 'VCF Platform Engineering'
++    CompanyName       = 'Unknown'
++    Copyright         = '(c) VCF Platform Engineering. All rights reserved.'
++    Description       = 'Precheck-gated EVC mode changes for VCF 9.0 vSphere clusters, over the vSphere Automation API.'
++    PowerShellVersion = '7.2'
++
++    # The VMware.Sdk.Vcf PowerCLI modules are an environment prerequisite. They
++    # are declared here rather than vendored, so importing VcfEvcGuard loads the
++    # SDK (and with it VMware.Binding.OpenApi.Client.ClientUtils) alongside it.
++    RequiredModules   = @(
++        @{
++            ModuleName      = 'VMware.Sdk.Vcf.SddcManager'
++            RequiredVersion = '13.5.0.25380678'
++        }
++    )
++
++    FunctionsToExport = @('Connect-VcfEvcGuardServer', 'Invoke-VcfEvcModeGuardedSet')
++    CmdletsToExport   = @()
++    VariablesToExport = @()
++    AliasesToExport   = @()
++
++    PrivateData       = @{
++        PSData = @{
++            Tags = @('VCF', 'vSphere', 'EVC', 'PowerCLI')
++        }
++    }
++}
+diff --git a/VcfEvcGuard/VcfEvcGuard.psm1 b/VcfEvcGuard/VcfEvcGuard.psm1
+index 75ee9a2..6fb9338 100644
+--- a/VcfEvcGuard/VcfEvcGuard.psm1
++++ b/VcfEvcGuard/VcfEvcGuard.psm1
+@@ -1,6 +1,171 @@
+ Set-StrictMode -Version Latest
+ $ErrorActionPreference = 'Stop'
+ 
++# Base path from the servers block of the vCenter automation specification:
++#   https://{host}/api
++$script:ApiBasePath = '/api'
++
++$script:TerminalTaskStatus = @('SUCCEEDED', 'FAILED')
++
++function ConvertTo-VcfEvcGuardRequestBody {
++    <#
++        Serialises a SetSpec. Properties whose value is $null are dropped, at
++        every level, so an optional property the caller never set is absent from
++        the wire rather than present and empty. Vcenter.Cluster.EvcMode.SetSpec
++        has exactly one optional property, so a spec that clears EVC serialises
++        to {}.
++    #>
++    param([hashtable] $Spec)
++
++    $clean = Remove-VcfEvcGuardNullValue -Value $Spec
++    if ($null -eq $clean) { return '{}' }
++    return (ConvertTo-Json -InputObject $clean -Depth 24 -Compress)
++}
++
++function Remove-VcfEvcGuardNullValue {
++    param($Value)
++
++    if ($null -eq $Value) { return $null }
++
++    if ($Value -is [System.Collections.IDictionary]) {
++        $result = [ordered]@{}
++        foreach ($key in $Value.Keys) {
++            $child = Remove-VcfEvcGuardNullValue -Value $Value[$key]
++            if ($null -ne $child) { $result[$key] = $child }
++        }
++        return $result
++    }
++
++    if ($Value -isnot [string] -and $Value -is [System.Collections.IEnumerable]) {
++        $items = @(foreach ($item in $Value) { Remove-VcfEvcGuardNullValue -Value $item })
++        return ,$items
++    }
++
++    return $Value
++}
++
++function Invoke-VcfEvcGuardRequest {
++    <#
++        One HTTP exchange against the connected vCenter. Query parameters are
++        supplied as an ordered dictionary and only the entries present are sent,
++        so an unset Cis.Tasks.GetSpec property never reaches the wire.
++    #>
++    param(
++        [Parameter(Mandatory)] [psobject] $Connection,
++        [Parameter(Mandatory)] [ValidateSet('GET', 'POST', 'PUT')] [string] $Method,
++        [Parameter(Mandatory)] [string] $Path,
++        [System.Collections.IDictionary] $Query,
++        [string] $Body,
++        [switch] $UseBasicAuthentication
++    )
++
++    $uri = $Connection.ServiceUri + $Path
++    if ($Query -and $Query.Count -gt 0) {
++        $pairs = foreach ($key in $Query.Keys) {
++            '{0}={1}' -f [VMware.Binding.OpenApi.Client.ClientUtils]::UrlEncode($key),
++                          [VMware.Binding.OpenApi.Client.ClientUtils]::UrlEncode([string]$Query[$key])
++        }
++        $uri = '{0}?{1}' -f $uri, ($pairs -join '&')
++    }
++
++    $headers = @{}
++    if ($UseBasicAuthentication) {
++        $plain = '{0}:{1}' -f $Connection.User, $Connection.Password
++        $headers['Authorization'] = 'Basic ' +
++            [VMware.Binding.OpenApi.Client.ClientUtils]::Base64Encode($plain)
++    }
++    else {
++        # api_key_auth: apiKey carried in the vmware-api-session-id header.
++        $headers['vmware-api-session-id'] = $Connection.SessionSecret
++    }
++
++    $arguments = @{
++        Uri     = $uri
++        Method  = $Method
++        Headers = $headers
++    }
++    if ($PSBoundParameters.ContainsKey('Body')) {
++        $arguments['Body'] = $Body
++        $arguments['ContentType'] = 'application/json'
++    }
++    if ($Connection.SkipCertificateCheck) {
++        $arguments['SkipCertificateCheck'] = $true
++    }
++
++    return Invoke-RestMethod @arguments
++}
++
++function Get-VcfEvcGuardClusterPath {
++    param([Parameter(Mandatory)] [string] $Cluster)
++    return '/vcenter/cluster/{0}/evc-mode' -f
++        [VMware.Binding.OpenApi.Client.ClientUtils]::UrlEncode($Cluster)
++}
++
++function Wait-VcfEvcGuardTask {
++    <#
++        Polls Cis.Tasks_get until the task reaches a terminal status.
++
++        $IncludeResult controls the Cis.Tasks.GetSpec that travels with the
++        request. The spec serialises it style=form explode=true, so its
++        properties are top-level query parameters; return_all is never set here
++        and therefore never appears.
++    #>
++    param(
++        [Parameter(Mandatory)] [psobject] $Connection,
++        [Parameter(Mandatory)] [string] $Task,
++        [Parameter(Mandatory)] [bool] $IncludeResult,
++        [Parameter(Mandatory)] [double] $PollIntervalSeconds,
++        [Parameter(Mandatory)] [double] $TimeoutSeconds
++    )
++
++    $query = [ordered]@{}
++    if (-not $IncludeResult) { $query['exclude_result'] = 'true' }
++
++    $path = '/cis/tasks/{0}' -f [VMware.Binding.OpenApi.Client.ClientUtils]::UrlEncode($Task)
++    $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSeconds)
++
++    while ($true) {
++        $info = Invoke-VcfEvcGuardRequest -Connection $Connection -Method 'GET' `
++            -Path $path -Query $query
++
++        if ($script:TerminalTaskStatus -contains $info.status) { return $info }
++
++        if ([datetime]::UtcNow -ge $deadline) {
++            throw ("Task {0} was still {1} after {2} seconds." -f
++                $Task, $info.status, $TimeoutSeconds)
++        }
++        Start-Sleep -Seconds $PollIntervalSeconds
++    }
++}
++
++function Get-VcfEvcGuardTaskResultList {
++    <#
++        Cis.Task.Info.result is absent when the operation returned nothing. The
++        check-set task returns a list of Vcenter.Cluster.EvcMode.CheckResult,
++        and "no errors" is signalled by the property being missing.
++    #>
++    param([Parameter(Mandatory)] [psobject] $TaskInfo)
++
++    $property = $TaskInfo.PSObject.Properties['result']
++    if ($null -eq $property -or $null -eq $property.Value) { return @() }
++    return @($property.Value)
++}
++
++function Get-VcfEvcGuardEvcMode {
++    param(
++        [Parameter(Mandatory)] [psobject] $Connection,
++        [Parameter(Mandatory)] [string] $Cluster
++    )
++
++    $info = Invoke-VcfEvcGuardRequest -Connection $Connection -Method 'GET' `
++        -Path (Get-VcfEvcGuardClusterPath -Cluster $Cluster)
++
++    if ($null -eq $info) { return $null }
++    $property = $info.PSObject.Properties['evc_mode']
++    if ($null -eq $property) { return $null }
++    return $property.Value
++}
++
+ <#
+ .SYNOPSIS
+     Opens a session against the vSphere Automation API of a VCF 9.0 vCenter.
+@@ -32,7 +197,33 @@ function Connect-VcfEvcGuardServer {
+         [switch] $IgnoreInvalidCertificate
+     )
+ 
+-    throw [System.NotImplementedException]::new('Connect-VcfEvcGuardServer is not implemented yet.')
++    $serviceUri = '{0}://{1}:{2}{3}' -f $Protocol, $Server, $Port, $script:ApiBasePath
++
++    # Carries the password only long enough to run Cis.Session_create; the
++    # session token authenticates everything afterwards.
++    $pending = [pscustomobject]@{
++        ServiceUri           = $serviceUri
++        User                 = $Credential.UserName
++        Password             = $Credential.GetNetworkCredential().Password
++        SessionSecret        = $null
++        SkipCertificateCheck = [bool] $IgnoreInvalidCertificate
++    }
++
++    # Cis.Session_create: POST /api/session, basic_auth, no request body.
++    $token = Invoke-VcfEvcGuardRequest -Connection $pending -Method 'POST' `
++        -Path '/session' -UseBasicAuthentication
++
++    if ([string]::IsNullOrWhiteSpace($token)) {
++        throw "Cis.Session_create returned no session token from $serviceUri."
++    }
++
++    return [pscustomobject]@{
++        ServiceUri           = $serviceUri
++        User                 = $Credential.UserName
++        SessionSecret        = [string] $token
++        IsConnected          = $true
++        SkipCertificateCheck = [bool] $IgnoreInvalidCertificate
++    }
+ }
+ 
+ <#
+@@ -64,7 +255,76 @@ function Invoke-VcfEvcModeGuardedSet {
+         [double] $TimeoutSeconds = 300
+     )
+ 
+-    throw [System.NotImplementedException]::new('Invoke-VcfEvcModeGuardedSet is not implemented yet.')
++    $clusterPath = Get-VcfEvcGuardClusterPath -Cluster $Cluster
++
++    # Vcenter.Cluster.EvcMode.SetSpec. evc_mode is the sole, optional property:
++    # leaving it out is what asks vCenter to clear the cluster's EVC mode.
++    $setSpec = @{}
++    if ($PSBoundParameters.ContainsKey('EvcMode') -and $null -ne $EvcMode) {
++        $setSpec['evc_mode'] = $EvcMode
++    }
++    $body = ConvertTo-VcfEvcGuardRequestBody -Spec $setSpec
++
++    $outcome = [ordered]@{
++        Cluster       = $Cluster
++        Applied       = $false
++        CheckTask     = $null
++        CheckStatus   = $null
++        CheckResults  = @()
++        SetTask       = $null
++        SetStatus     = $null
++        EvcModeBefore = $null
++        EvcModeAfter  = $null
++        BlockedReason = $null
++    }
++
++    # 1. Vcenter.Cluster.EvcMode_get
++    $outcome['EvcModeBefore'] = Get-VcfEvcGuardEvcMode -Connection $Connection -Cluster $Cluster
++
++    # 2. Vcenter.Cluster.EvcMode_checkSet$Task
++    $checkTask = Invoke-VcfEvcGuardRequest -Connection $Connection -Method 'POST' `
++        -Path $clusterPath `
++        -Query ([ordered]@{ 'action' = 'check-set'; 'vmw-task' = 'true' }) `
++        -Body $body
++    $outcome['CheckTask'] = [string] $checkTask
++
++    # 3. Poll it. The gate reads this task's result, so no GetSpec is sent.
++    $checkInfo = Wait-VcfEvcGuardTask -Connection $Connection -Task $outcome['CheckTask'] `
++        -IncludeResult $true -PollIntervalSeconds $PollIntervalSeconds `
++        -TimeoutSeconds $TimeoutSeconds
++    $outcome['CheckStatus'] = [string] $checkInfo.status
++
++    # 4. The gate.
++    if ($outcome['CheckStatus'] -ne 'SUCCEEDED') {
++        $outcome['BlockedReason'] = 'PRECHECK_TASK_FAILED'
++        return [pscustomobject] $outcome
++    }
++
++    $findings = @(Get-VcfEvcGuardTaskResultList -TaskInfo $checkInfo)
++    if ($findings.Count -gt 0) {
++        $outcome['CheckResults'] = $findings
++        $outcome['BlockedReason'] = 'PRECHECK_ERRORS'
++        return [pscustomobject] $outcome
++    }
++
++    # 5. Vcenter.Cluster.EvcMode_set$Task, with the spec that was checked.
++    $setTask = Invoke-VcfEvcGuardRequest -Connection $Connection -Method 'PUT' `
++        -Path $clusterPath `
++        -Query ([ordered]@{ 'vmw-task' = 'true' }) `
++        -Body $body
++    $outcome['SetTask'] = [string] $setTask
++
++    # 6. Poll it. Nothing reads this result, so ask for it to be excluded.
++    $setInfo = Wait-VcfEvcGuardTask -Connection $Connection -Task $outcome['SetTask'] `
++        -IncludeResult $false -PollIntervalSeconds $PollIntervalSeconds `
++        -TimeoutSeconds $TimeoutSeconds
++    $outcome['SetStatus'] = [string] $setInfo.status
++    $outcome['Applied'] = ($outcome['SetStatus'] -eq 'SUCCEEDED')
++
++    # 7. Read the cluster back.
++    $outcome['EvcModeAfter'] = Get-VcfEvcGuardEvcMode -Connection $Connection -Cluster $Cluster
++
++    return [pscustomobject] $outcome
+ }
+ 
+ Export-ModuleMember -Function Connect-VcfEvcGuardServer, Invoke-VcfEvcModeGuardedSet
+diff --git a/docs/contract.json b/docs/contract.json
+new file mode 100644
+index 0000000..4872966
+--- /dev/null
++++ b/docs/contract.json
+@@ -0,0 +1,143 @@
++{
++  "source": {
++    "repository": "vmware/vcf-api-specs",
++    "path": "specifications/vsphere/openapi/automation/vcenter.yaml",
++    "tag": "9.0.0.0",
++    "commit": "85151f6b1bb58f13b6ac0304bfec53904bea085f",
++    "license": "Apache-2.0",
++    "openapi": "3.0.3",
++    "info_version": "9.0.0.0",
++    "server_url": "https://{host}/api",
++    "note": "Derived from the OpenAPI document itself, not from a rendered documentation page. The Vcenter.Cluster.EvcMode resource was added in vSphere API 9.0.0.0; the same file at tag 9.1.0.0 is a later revision and is not the contract this client is pinned to."
++  },
++
++  "security_schemes": {
++    "basic_auth": {
++      "type": "http",
++      "scheme": "basic"
++    },
++    "api_key_auth": {
++      "type": "apiKey",
++      "name": "vmware-api-session-id",
++      "in": "header"
++    }
++  },
++
++  "operations": {
++    "createSession": {
++      "operationId": "Cis.Session_create",
++      "method": "POST",
++      "path": "/session",
++      "path_parameters": [],
++      "query": {},
++      "optional_query_schema": null,
++      "security": ["basic_auth"],
++      "request_body": null,
++      "request_body_required": false,
++      "success_status": 201,
++      "response_schema": "string",
++      "error_statuses": [401, 503]
++    },
++
++    "getEvcMode": {
++      "operationId": "Vcenter.Cluster.EvcMode_get",
++      "method": "GET",
++      "path": "/vcenter/cluster/{cluster}/evc-mode",
++      "path_parameters": ["cluster"],
++      "query": {},
++      "optional_query_schema": null,
++      "security": ["api_key_auth"],
++      "request_body": null,
++      "request_body_required": false,
++      "success_status": 200,
++      "response_schema": "Vcenter.Cluster.EvcMode.Info",
++      "error_statuses": [401, 403, 404, 500]
++    },
++
++    "checkSetEvcMode": {
++      "operationId": "Vcenter.Cluster.EvcMode_checkSet$Task",
++      "method": "POST",
++      "path": "/vcenter/cluster/{cluster}/evc-mode",
++      "path_parameters": ["cluster"],
++      "query": {
++        "action": "check-set",
++        "vmw-task": "true"
++      },
++      "optional_query_schema": null,
++      "security": ["api_key_auth"],
++      "request_body": "Vcenter.Cluster.EvcMode.SetSpec",
++      "request_body_required": true,
++      "success_status": 202,
++      "response_schema": "string",
++      "error_statuses": [400, 401, 403, 404, 500]
++    },
++
++    "setEvcMode": {
++      "operationId": "Vcenter.Cluster.EvcMode_set$Task",
++      "method": "PUT",
++      "path": "/vcenter/cluster/{cluster}/evc-mode",
++      "path_parameters": ["cluster"],
++      "query": {
++        "vmw-task": "true"
++      },
++      "optional_query_schema": null,
++      "security": ["api_key_auth"],
++      "request_body": "Vcenter.Cluster.EvcMode.SetSpec",
++      "request_body_required": true,
++      "success_status": 202,
++      "response_schema": "string",
++      "error_statuses": [400, 401, 403, 404, 500]
++    },
++
++    "getTask": {
++      "operationId": "Cis.Tasks_get",
++      "method": "GET",
++      "path": "/cis/tasks/{task}",
++      "path_parameters": ["task"],
++      "query": {},
++      "optional_query_schema": "Cis.Tasks.GetSpec",
++      "security": ["api_key_auth"],
++      "request_body": null,
++      "request_body_required": false,
++      "success_status": 200,
++      "response_schema": "Cis.Task.Info",
++      "error_statuses": [401, 403, 404, 500, 503]
++    }
++  },
++
++  "schemas": {
++    "Vcenter.Cluster.EvcMode.SetSpec": {
++      "required": [],
++      "optional": ["evc_mode"],
++      "note": "evc_mode is a Vcenter.EvcMode.EvcMode. When it is missing or null the cluster's EVC mode is reset, so an omitted property is meaningful and must not be sent as null."
++    },
++    "Vcenter.EvcMode.EvcMode": {
++      "required": ["key", "masks"],
++      "optional": [],
++      "note": "masks is an array of Vcenter.EvcMode.FeatureMask."
++    },
++    "Vcenter.EvcMode.FeatureMask": {
++      "required": ["key", "name", "value"],
++      "optional": []
++    },
++    "Vcenter.Cluster.EvcMode.CheckResult": {
++      "required": ["error"],
++      "optional": ["host_system"],
++      "note": "error is a Vapi.Std.Errors.Error; host_system is a HostSystem identifier and is absent when the error is not tied to a host."
++    },
++    "Cis.Tasks.GetSpec": {
++      "required": [],
++      "optional": ["exclude_result", "return_all"]
++    },
++    "Vcenter.Cluster.EvcMode.Info": {
++      "required": [],
++      "optional": ["evc_mode"]
++    },
++    "Cis.Task.Info": {
++      "required": ["cancelable", "description", "operation", "service", "status"],
++      "optional": ["end_time", "error", "parent", "progress", "result", "start_time", "target", "user"]
++    }
++  },
++
++  "task_status_values": ["PENDING", "RUNNING", "BLOCKED", "SUCCEEDED", "FAILED"]
++}
+diff --git a/docs/official_sources.json b/docs/official_sources.json
+new file mode 100644
+index 0000000..cf5b9b3
+--- /dev/null
++++ b/docs/official_sources.json
+@@ -0,0 +1,37 @@
++{
++  "sources": [
++    {
++      "repository": "vmware/vcf-api-specs",
++      "path": "specifications/vsphere/openapi/automation/vcenter.yaml",
++      "tag": "9.0.0.0",
++      "commit": "85151f6b1bb58f13b6ac0304bfec53904bea085f",
++      "url": "https://github.com/vmware/vcf-api-specs/blob/85151f6b1bb58f13b6ac0304bfec53904bea085f/specifications/vsphere/openapi/automation/vcenter.yaml",
++      "title": "vSphere Automation API 9.0.0.0 - vcenter.yaml (OpenAPI 3.0.3)",
++      "license": "Apache-2.0",
++      "operation_ids": [
++        "Cis.Session_create",
++        "Vcenter.Cluster.EvcMode_get",
++        "Vcenter.Cluster.EvcMode_checkSet$Task",
++        "Vcenter.Cluster.EvcMode_set$Task",
++        "Cis.Tasks_get"
++      ],
++      "retrieved": "2026-08-12",
++      "note": "Every path, method, query parameter, security scheme, request/response schema and status code in docs/contract.json was read out of this file. Tag 9.0.0.0 resolves to commit 85151f6b1bb58f13b6ac0304bfec53904bea085f; the 9.1.0.0 tag revises the same path and was deliberately not used."
++    },
++    {
++      "repository": "vmware/vcf-api-specs",
++      "path": "specifications/vsphere/openapi/automation/vcenter.yaml",
++      "tag": "9.0.0.0",
++      "commit": "85151f6b1bb58f13b6ac0304bfec53904bea085f",
++      "url": "https://raw.githubusercontent.com/vmware/vcf-api-specs/85151f6b1bb58f13b6ac0304bfec53904bea085f/specifications/vsphere/openapi/automation/vcenter.yaml",
++      "title": "vSphere Automation API 9.0.0.0 - vcenter.yaml (raw)",
++      "license": "Apache-2.0",
++      "operation_ids": [
++        "Vcenter.Cluster.EvcMode_checkSet$Task",
++        "Vcenter.Cluster.EvcMode_set$Task"
++      ],
++      "retrieved": "2026-08-12",
++      "note": "Raw form of the same blob, used to read the components.schemas entries for Vcenter.Cluster.EvcMode.SetSpec, Vcenter.EvcMode.EvcMode, Vcenter.EvcMode.FeatureMask, Vcenter.Cluster.EvcMode.CheckResult and Cis.Tasks.GetSpec."
++    }
++  ]
++}

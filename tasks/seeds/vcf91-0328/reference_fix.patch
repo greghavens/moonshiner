@@ -1,0 +1,1484 @@
+diff --git a/client.go b/client.go
+index 43accef..d18e312 100644
+--- a/client.go
++++ b/client.go
+@@ -8,10 +8,23 @@
+ package vcfauto
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
++	"strings"
++	"time"
++)
++
++// Operation ids from docs/contract.json. They tag the errors this package
++// returns so a caller can tell the precheck read apart from the mutating call.
++const (
++	opGetDeploymentActions          = "getDeploymentActions"
++	opSubmitDeploymentActionRequest = "submitDeploymentActionRequest"
+ )
+ 
+ // Config configures a Client.
+@@ -61,6 +74,17 @@ type Request struct {
+ 	Status       string `json:"status"`
+ }
+ 
++// resourceActionRequest is the ResourceActionRequest body of
++// submitDeploymentActionRequest.
++//
++// The omitempty tags are the contract's omitWhenUnset flags: an optional field
++// the caller left alone has to be absent from the body, not sent as "" or {}.
++type resourceActionRequest struct {
++	ActionID string         `json:"actionId"`
++	Inputs   map[string]any `json:"inputs,omitempty"`
++	Reason   string         `json:"reason,omitempty"`
++}
++
+ // Errors reported by SubmitAction before or instead of the mutating call.
+ var (
+ 	// ErrInvalidRequest reports an ActionRequest that is malformed, so no HTTP
+@@ -88,7 +112,7 @@ func (e *APIError) Error() string {
+ 	return fmt.Sprintf("vcfauto: %s: unexpected status %d: %s", e.Op, e.StatusCode, e.Body)
+ }
+ 
+-// Client talks to one VCF Automation endpoint.
++// Client talks to one VCF Automation endpoint. It is safe for concurrent use.
+ type Client struct {
+ 	baseURL string
+ 	token   string
+@@ -97,17 +121,153 @@ type Client struct {
+ 
+ // New returns a Client for cfg.
+ func New(cfg Config) (*Client, error) {
+-	return nil, errors.New("vcfauto: New not implemented")
++	base := strings.TrimRight(cfg.BaseURL, "/")
++	if base == "" {
++		return nil, fmt.Errorf("%w: BaseURL is required", ErrInvalidRequest)
++	}
++	u, err := url.Parse(base)
++	if err != nil || u.Scheme == "" || u.Host == "" {
++		return nil, fmt.Errorf("%w: BaseURL %q is not an absolute URL", ErrInvalidRequest, cfg.BaseURL)
++	}
++	if cfg.Token == "" {
++		return nil, fmt.Errorf("%w: Token is required", ErrInvalidRequest)
++	}
++
++	hc := cfg.HTTPClient
++	if hc == nil {
++		hc = &http.Client{Timeout: 30 * time.Second}
++	}
++	return &Client{baseURL: base, token: cfg.Token, hc: hc}, nil
+ }
+ 
+ // ListActions runs the precheck read and returns the actions currently
+ // available on the deployment.
+ func (c *Client) ListActions(ctx context.Context, deploymentID string) ([]Action, error) {
+-	return nil, errors.New("vcfauto: ListActions not implemented")
++	if err := checkDeploymentID(deploymentID); err != nil {
++		return nil, err
++	}
++
++	req, err := c.newRequest(ctx, http.MethodGet,
++		"/deployment/api/deployments/"+deploymentID+"/actions", nil)
++	if err != nil {
++		return nil, fmt.Errorf("vcfauto: %s: %w", opGetDeploymentActions, err)
++	}
++
++	var actions []Action
++	if err := c.do(req, opGetDeploymentActions, &actions); err != nil {
++		return nil, err
++	}
++	return actions, nil
+ }
+ 
+ // SubmitAction runs the precheck and, only if it passes, submits the day-2
+ // action request. When the precheck fails the mutating call is not made.
+ func (c *Client) SubmitAction(ctx context.Context, req ActionRequest) (*Request, error) {
+-	return nil, errors.New("vcfauto: SubmitAction not implemented")
++	if err := checkDeploymentID(req.DeploymentID); err != nil {
++		return nil, err
++	}
++	if req.ActionID == "" {
++		return nil, fmt.Errorf("%w: ActionID is required", ErrInvalidRequest)
++	}
++
++	// The gate. Nothing below this point runs unless the precheck approves.
++	actions, err := c.ListActions(ctx, req.DeploymentID)
++	if err != nil {
++		return nil, err
++	}
++	found := false
++	valid := false
++	for _, action := range actions {
++		if action.ID != req.ActionID {
++			continue
++		}
++		found = true
++		if action.Valid {
++			valid = true
++			break
++		}
++	}
++	switch {
++	case !found:
++		return nil, fmt.Errorf("%w: %q on deployment %q",
++			ErrActionNotFound, req.ActionID, req.DeploymentID)
++	case !valid:
++		return nil, fmt.Errorf("%w: %q on deployment %q",
++			ErrActionNotValid, req.ActionID, req.DeploymentID)
++	}
++
++	body, err := json.Marshal(resourceActionRequest{
++		ActionID: req.ActionID,
++		Inputs:   req.Inputs,
++		Reason:   req.Reason,
++	})
++	if err != nil {
++		return nil, fmt.Errorf("vcfauto: %s: encode body: %w", opSubmitDeploymentActionRequest, err)
++	}
++
++	httpReq, err := c.newRequest(ctx, http.MethodPost,
++		"/deployment/api/deployments/"+req.DeploymentID+"/requests", body)
++	if err != nil {
++		return nil, fmt.Errorf("vcfauto: %s: %w", opSubmitDeploymentActionRequest, err)
++	}
++
++	var out Request
++	if err := c.do(httpReq, opSubmitDeploymentActionRequest, &out); err != nil {
++		return nil, err
++	}
++	return &out, nil
++}
++
++// checkDeploymentID rejects ids that would change the request path rather than
++// fill the deploymentId slot in it.
++func checkDeploymentID(id string) error {
++	if id == "" {
++		return fmt.Errorf("%w: DeploymentID is required", ErrInvalidRequest)
++	}
++	if strings.ContainsAny(id, "/?#") {
++		return fmt.Errorf("%w: DeploymentID %q contains a path separator", ErrInvalidRequest, id)
++	}
++	return nil
++}
++
++// newRequest builds a request against a contract path. Content-Type is set only
++// when there is a body to describe.
++func (c *Client) newRequest(ctx context.Context, method, path string, body []byte) (*http.Request, error) {
++	var rdr io.Reader
++	if body != nil {
++		rdr = bytes.NewReader(body)
++	}
++	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, rdr)
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("Authorization", "Bearer "+c.token)
++	req.Header.Set("Accept", "application/json")
++	if body != nil {
++		req.Header.Set("Content-Type", "application/json")
++	}
++	return req, nil
++}
++
++func (c *Client) do(req *http.Request, op string, out any) error {
++	resp, err := c.hc.Do(req)
++	if err != nil {
++		return fmt.Errorf("vcfauto: %s: %w", op, err)
++	}
++	defer resp.Body.Close()
++
++	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
++	if err != nil {
++		return fmt.Errorf("vcfauto: %s: read response: %w", op, err)
++	}
++	if resp.StatusCode < 200 || resp.StatusCode > 299 {
++		return &APIError{Op: op, StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(body))}
++	}
++	if out == nil {
++		return nil
++	}
++	if err := json.Unmarshal(body, out); err != nil {
++		return fmt.Errorf("vcfauto: %s: decode response: %w", op, err)
++	}
++	return nil
+ }
+diff --git a/client_test.go b/client_test.go
+new file mode 100644
+index 0000000..6e36b66
+--- /dev/null
++++ b/client_test.go
+@@ -0,0 +1,403 @@
++package vcfauto_test
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"net/http"
++	"reflect"
++	"testing"
++
++	"example.com/vcfauto"
++	"example.com/vcfauto/mockapi"
++)
++
++const (
++	contractPath = "docs/contract.json"
++	token        = "unit-test-token"
++	deployment   = "b71c0d3e-2a44-4f0b-9c88-7d5e1a2f6c30"
++
++	actionSnapshot = "Deployment.CreateSnapshot"
++	actionPowerOn  = "Deployment.PowerOn"
++)
++
++func act(id string, valid bool) mockapi.Action {
++	return mockapi.Action{
++		ID:          id,
++		Name:        id,
++		DisplayName: id,
++		ActionType:  "RESOURCE_ACTION",
++		Valid:       valid,
++	}
++}
++
++func serve(t *testing.T, opts mockapi.Options) (*mockapi.Server, *vcfauto.Client) {
++	t.Helper()
++	if opts.ContractPath == "" {
++		opts.ContractPath = contractPath
++	}
++	if opts.Token == "" {
++		opts.Token = token
++	}
++	srv, err := mockapi.Start(opts)
++	if err != nil {
++		t.Fatalf("mockapi.Start: %v", err)
++	}
++	t.Cleanup(srv.Close)
++
++	c, err := vcfauto.New(vcfauto.Config{BaseURL: srv.URL(), Token: token})
++	if err != nil {
++		t.Fatalf("vcfauto.New: %v", err)
++	}
++	return srv, c
++}
++
++func withActions(actions ...mockapi.Action) mockapi.Options {
++	return mockapi.Options{
++		Deployments: map[string]mockapi.Deployment{deployment: {Actions: actions}},
++	}
++}
++
++func TestNew(t *testing.T) {
++	tests := []struct {
++		name    string
++		cfg     vcfauto.Config
++		wantErr bool
++	}{
++		{"ok", vcfauto.Config{BaseURL: "https://vcf.example.test", Token: "t"}, false},
++		{"trailing slash is trimmed", vcfauto.Config{BaseURL: "https://vcf.example.test/", Token: "t"}, false},
++		{"missing base url", vcfauto.Config{Token: "t"}, true},
++		{"relative base url", vcfauto.Config{BaseURL: "vcf.example.test", Token: "t"}, true},
++		{"missing token", vcfauto.Config{BaseURL: "https://vcf.example.test"}, true},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			c, err := vcfauto.New(tc.cfg)
++			if tc.wantErr {
++				if err == nil {
++					t.Fatal("New returned a nil error")
++				}
++				if !errors.Is(err, vcfauto.ErrInvalidRequest) {
++					t.Errorf("error = %v, want errors.Is(err, ErrInvalidRequest)", err)
++				}
++				return
++			}
++			if err != nil {
++				t.Fatalf("New: %v", err)
++			}
++			if c == nil {
++				t.Fatal("New returned a nil Client")
++			}
++		})
++	}
++}
++
++func TestListActions(t *testing.T) {
++	tests := []struct {
++		name    string
++		opts    mockapi.Options
++		depID   string
++		want    []vcfauto.Action
++		wantErr func(t *testing.T, err error)
++	}{
++		{
++			name:  "two actions",
++			opts:  withActions(act(actionSnapshot, true), act(actionPowerOn, false)),
++			depID: deployment,
++			want: []vcfauto.Action{
++				{ID: actionSnapshot, Name: actionSnapshot, DisplayName: actionSnapshot, ActionType: "RESOURCE_ACTION", Valid: true},
++				{ID: actionPowerOn, Name: actionPowerOn, DisplayName: actionPowerOn, ActionType: "RESOURCE_ACTION", Valid: false},
++			},
++		},
++		{
++			name:  "no actions",
++			opts:  withActions(),
++			depID: deployment,
++			want:  []vcfauto.Action{},
++		},
++		{
++			name:  "unknown deployment",
++			opts:  withActions(act(actionSnapshot, true)),
++			depID: "does-not-exist",
++			wantErr: func(t *testing.T, err error) {
++				var apiErr *vcfauto.APIError
++				if !errors.As(err, &apiErr) {
++					t.Fatalf("error = %v, want *APIError", err)
++				}
++				if apiErr.StatusCode != http.StatusNotFound {
++					t.Errorf("status = %d, want 404", apiErr.StatusCode)
++				}
++			},
++		},
++		{
++			name:  "empty deployment id",
++			opts:  withActions(act(actionSnapshot, true)),
++			depID: "",
++			wantErr: func(t *testing.T, err error) {
++				if !errors.Is(err, vcfauto.ErrInvalidRequest) {
++					t.Fatalf("error = %v, want ErrInvalidRequest", err)
++				}
++			},
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			_, c := serve(t, tc.opts)
++
++			got, err := c.ListActions(context.Background(), tc.depID)
++			if tc.wantErr != nil {
++				tc.wantErr(t, err)
++				return
++			}
++			if err != nil {
++				t.Fatalf("ListActions: %v", err)
++			}
++			if !reflect.DeepEqual(got, tc.want) {
++				t.Errorf("ListActions = %+v, want %+v", got, tc.want)
++			}
++		})
++	}
++}
++
++// TestSubmitActionGate walks the precheck outcomes and, for each, checks whether
++// the mutating call was allowed through.
++func TestSubmitActionGate(t *testing.T) {
++	tests := []struct {
++		name         string
++		actions      []mockapi.Action
++		wantErr      error
++		wantRequests int
++	}{
++		{
++			name:         "valid action passes the gate",
++			actions:      []mockapi.Action{act(actionSnapshot, true)},
++			wantRequests: 2,
++		},
++		{
++			name:         "action missing from the list",
++			actions:      []mockapi.Action{act(actionPowerOn, true)},
++			wantErr:      vcfauto.ErrActionNotFound,
++			wantRequests: 1,
++		},
++		{
++			name:         "action invalid for the current state",
++			actions:      []mockapi.Action{act(actionSnapshot, false)},
++			wantErr:      vcfauto.ErrActionNotValid,
++			wantRequests: 1,
++		},
++		{
++			name:         "empty action list",
++			actions:      nil,
++			wantErr:      vcfauto.ErrActionNotFound,
++			wantRequests: 1,
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			srv, c := serve(t, withActions(tc.actions...))
++
++			got, err := c.SubmitAction(context.Background(), vcfauto.ActionRequest{
++				DeploymentID: deployment,
++				ActionID:     actionSnapshot,
++			})
++
++			if tc.wantErr != nil {
++				if !errors.Is(err, tc.wantErr) {
++					t.Fatalf("error = %v, want errors.Is(err, %v)", err, tc.wantErr)
++				}
++			} else {
++				if err != nil {
++					t.Fatalf("SubmitAction: %v", err)
++				}
++				if got.Status != "PENDING" {
++					t.Errorf("Status = %q, want PENDING", got.Status)
++				}
++			}
++
++			recs := srv.Requests()
++			if len(recs) != tc.wantRequests {
++				t.Fatalf("recorded %d requests, want %d", len(recs), tc.wantRequests)
++			}
++			if tc.wantErr != nil {
++				for _, r := range recs {
++					if r.Method == http.MethodPost {
++						t.Errorf("a mutating %s %s was sent despite the failed precheck", r.Method, r.Path)
++					}
++				}
++			}
++		})
++	}
++}
++
++// TestSubmitActionBodyOmitsUnsetFields reads the mock's request log and checks
++// the body key by key.
++func TestSubmitActionBodyOmitsUnsetFields(t *testing.T) {
++	tests := []struct {
++		name string
++		req  vcfauto.ActionRequest
++		want map[string]any
++	}{
++		{
++			name: "nothing optional",
++			req:  vcfauto.ActionRequest{DeploymentID: deployment, ActionID: actionSnapshot},
++			want: map[string]any{"actionId": actionSnapshot},
++		},
++		{
++			name: "nil inputs and empty reason stay off the wire",
++			req:  vcfauto.ActionRequest{DeploymentID: deployment, ActionID: actionSnapshot, Inputs: nil, Reason: ""},
++			want: map[string]any{"actionId": actionSnapshot},
++		},
++		{
++			name: "an empty inputs map is not an input",
++			req:  vcfauto.ActionRequest{DeploymentID: deployment, ActionID: actionSnapshot, Inputs: map[string]any{}},
++			want: map[string]any{"actionId": actionSnapshot},
++		},
++		{
++			name: "reason travels when set",
++			req:  vcfauto.ActionRequest{DeploymentID: deployment, ActionID: actionSnapshot, Reason: "pre-upgrade snapshot"},
++			want: map[string]any{"actionId": actionSnapshot, "reason": "pre-upgrade snapshot"},
++		},
++		{
++			name: "inputs travel when set",
++			req: vcfauto.ActionRequest{
++				DeploymentID: deployment,
++				ActionID:     actionSnapshot,
++				Inputs:       map[string]any{"name": "pre-upgrade", "memory": false},
++			},
++			want: map[string]any{
++				"actionId": actionSnapshot,
++				"inputs":   map[string]any{"name": "pre-upgrade", "memory": false},
++			},
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			srv, c := serve(t, withActions(act(actionSnapshot, true)))
++
++			if _, err := c.SubmitAction(context.Background(), tc.req); err != nil {
++				t.Fatalf("SubmitAction: %v", err)
++			}
++
++			recs := srv.Requests()
++			if len(recs) != 2 {
++				t.Fatalf("recorded %d requests, want 2", len(recs))
++			}
++			post := recs[1]
++
++			var got map[string]any
++			if err := json.Unmarshal(post.Body, &got); err != nil {
++				t.Fatalf("decode body %q: %v", post.Body, err)
++			}
++			if !reflect.DeepEqual(got, tc.want) {
++				t.Errorf("body = %#v, want %#v", got, tc.want)
++			}
++		})
++	}
++}
++
++func TestSubmitActionRejectsBadArgumentsBeforeAnyCall(t *testing.T) {
++	tests := []struct {
++		name string
++		req  vcfauto.ActionRequest
++	}{
++		{"no deployment id", vcfauto.ActionRequest{ActionID: actionSnapshot}},
++		{"no action id", vcfauto.ActionRequest{DeploymentID: deployment}},
++		{"deployment id with a slash", vcfauto.ActionRequest{DeploymentID: "a/b", ActionID: actionSnapshot}},
++		{"deployment id with a query marker", vcfauto.ActionRequest{DeploymentID: "a?b", ActionID: actionSnapshot}},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			srv, c := serve(t, withActions(act(actionSnapshot, true)))
++
++			if _, err := c.SubmitAction(context.Background(), tc.req); !errors.Is(err, vcfauto.ErrInvalidRequest) {
++				t.Fatalf("error = %v, want ErrInvalidRequest", err)
++			}
++			if n := len(srv.Requests()); n != 0 {
++				t.Errorf("recorded %d requests, want none", n)
++			}
++		})
++	}
++}
++
++func TestAPIErrorsCarryTheOperationId(t *testing.T) {
++	tests := []struct {
++		name       string
++		opts       mockapi.Options
++		wantOp     string
++		wantStatus int
++	}{
++		{
++			name: "precheck fails",
++			opts: mockapi.Options{
++				Deployments:   map[string]mockapi.Deployment{deployment: {Actions: []mockapi.Action{act(actionSnapshot, true)}}},
++				ActionsStatus: http.StatusServiceUnavailable,
++			},
++			wantOp:     "getDeploymentActions",
++			wantStatus: http.StatusServiceUnavailable,
++		},
++		{
++			name: "mutating call fails",
++			opts: mockapi.Options{
++				Deployments:   map[string]mockapi.Deployment{deployment: {Actions: []mockapi.Action{act(actionSnapshot, true)}}},
++				RequestStatus: http.StatusConflict,
++			},
++			wantOp:     "submitDeploymentActionRequest",
++			wantStatus: http.StatusConflict,
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			_, c := serve(t, tc.opts)
++
++			_, err := c.SubmitAction(context.Background(), vcfauto.ActionRequest{
++				DeploymentID: deployment,
++				ActionID:     actionSnapshot,
++			})
++
++			var apiErr *vcfauto.APIError
++			if !errors.As(err, &apiErr) {
++				t.Fatalf("error = %v, want *APIError", err)
++			}
++			if apiErr.Op != tc.wantOp {
++				t.Errorf("Op = %q, want %q", apiErr.Op, tc.wantOp)
++			}
++			if apiErr.StatusCode != tc.wantStatus {
++				t.Errorf("StatusCode = %d, want %d", apiErr.StatusCode, tc.wantStatus)
++			}
++			if apiErr.Error() == "" {
++				t.Error("Error() is empty")
++			}
++		})
++	}
++}
++
++func TestPrecheckHeaders(t *testing.T) {
++	srv, c := serve(t, withActions(act(actionSnapshot, true)))
++
++	if _, err := c.ListActions(context.Background(), deployment); err != nil {
++		t.Fatalf("ListActions: %v", err)
++	}
++	rec := srv.Requests()[0]
++
++	tests := []struct {
++		header string
++		want   string
++	}{
++		{"Authorization", "Bearer " + token},
++		{"Accept", "application/json"},
++		{"Content-Type", ""}, // a GET carries no body, so it describes none
++	}
++	for _, tc := range tests {
++		t.Run(tc.header, func(t *testing.T) {
++			if got := rec.Header.Get(tc.header); got != tc.want {
++				t.Errorf("%s = %q, want %q", tc.header, got, tc.want)
++			}
++		})
++	}
++}
+diff --git a/docs/contract.json b/docs/contract.json
+new file mode 100644
+index 0000000..0b109b1
+--- /dev/null
++++ b/docs/contract.json
+@@ -0,0 +1,202 @@
++{
++  "api": {
++    "name": "VCF Automation API",
++    "product": "VMware Cloud Foundation 9.1",
++    "version": "9.1",
++    "reference": "VM Apps Org - Deployment (xAPIs)",
++    "baseURLTemplate": "https://{api_host}",
++    "sourceType": "reference-documentation",
++    "specificationAvailable": false,
++    "sourceNote": "VCF Automation ships no machine-readable specification in the vmware/vcf-api-specs repository. This contract was derived by hand from the VCF Automation xAPIs reference documentation published at developer.broadcom.com, so it is a reading of reference documentation rather than a transcription of a published specification. Every page it was read from, the operation that page documents and the date it was fetched are recorded in docs/official_sources.json."
++  },
++  "auth": {
++    "scheme": "bearer",
++    "header": "Authorization",
++    "valuePrefix": "Bearer "
++  },
++  "gate": {
++    "precheck": "getDeploymentActions",
++    "mutating": "submitDeploymentActionRequest",
++    "rule": "submitDeploymentActionRequest may only be called after getDeploymentActions has returned an action whose id equals the requested action id and whose valid flag is true. When the action is absent from the list, or is listed with valid false, the request is not submitted and the deployment is left unchanged."
++  },
++  "operations": [
++    {
++      "id": "getDeploymentActions",
++      "role": "precheck",
++      "method": "GET",
++      "path": "/deployment/api/deployments/{deploymentId}/actions",
++      "summary": "Fetch deployment available actions. Returns the complete list of available actions that can be performed on a given deployment.",
++      "source": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/9.1/deployment/api/deployments/deploymentId/actions/get/",
++      "pathParams": [
++        {
++          "name": "deploymentId",
++          "type": "string",
++          "required": true,
++          "description": "Deployment ID"
++        }
++      ],
++      "queryParams": [],
++      "requestBody": null,
++      "responses": [
++        {
++          "status": 200,
++          "contentType": "application/json",
++          "schema": "DeploymentAction[]"
++        },
++        { "status": 401, "contentType": "application/json", "schema": "Error" },
++        { "status": 403, "contentType": "application/json", "schema": "Error" },
++        { "status": 404, "contentType": "application/json", "schema": "Error" }
++      ]
++    },
++    {
++      "id": "submitDeploymentActionRequest",
++      "role": "mutating",
++      "method": "POST",
++      "path": "/deployment/api/deployments/{deploymentId}/requests",
++      "summary": "Submit Deployment Action Request.",
++      "source": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/9.1/deployment/api/deployments/deploymentId/requests/post/",
++      "pathParams": [
++        {
++          "name": "deploymentId",
++          "type": "string",
++          "required": true,
++          "description": "Deployment ID"
++        }
++      ],
++      "queryParams": [],
++      "requestBody": {
++        "contentType": "application/json",
++        "schema": "ResourceActionRequest",
++        "fields": [
++          {
++            "name": "actionId",
++            "type": "string",
++            "required": false,
++            "omitWhenUnset": false,
++            "description": "The id of the action to perform. The reference documents this field as optional; this client always sends it, because it carries the action the precheck approved."
++          },
++          {
++            "name": "inputs",
++            "type": "object",
++            "required": false,
++            "omitWhenUnset": true,
++            "description": "Inputs for the day-2 action. Omitted from the body when the caller sets none."
++          },
++          {
++            "name": "reason",
++            "type": "string",
++            "required": false,
++            "omitWhenUnset": true,
++            "description": "Reason for requesting a day2 operation. Omitted from the body when the caller sets none."
++          }
++        ]
++      },
++      "responses": [
++        {
++          "status": 200,
++          "contentType": "application/json",
++          "schema": "Request"
++        },
++        { "status": 401, "contentType": "application/json", "schema": "Error" },
++        { "status": 403, "contentType": "application/json", "schema": "Error" },
++        { "status": 404, "contentType": "application/json", "schema": "Error" },
++        { "status": 409, "contentType": "application/json", "schema": "Error" }
++      ]
++    }
++  ],
++  "schemas": {
++    "DeploymentAction": {
++      "description": "One entry of the array returned by getDeploymentActions.",
++      "fields": [
++        { "name": "id", "type": "string", "description": "Resource action id" },
++        {
++          "name": "name",
++          "type": "string",
++          "description": "Resource action name"
++        },
++        {
++          "name": "displayName",
++          "type": "string",
++          "description": "Resource action display name"
++        },
++        {
++          "name": "actionType",
++          "type": "string",
++          "description": "Resource action type"
++        },
++        {
++          "name": "description",
++          "type": "string",
++          "description": "Resource action description"
++        },
++        {
++          "name": "dependents",
++          "type": "array",
++          "description": "Dependent resources"
++        },
++        {
++          "name": "valid",
++          "type": "boolean",
++          "description": "Resource action is valid for current state"
++        },
++        {
++          "name": "orgId",
++          "type": "string",
++          "description": "Organization id"
++        },
++        {
++          "name": "projectId",
++          "type": "string",
++          "description": "Project id"
++        },
++        {
++          "name": "formDefinition",
++          "type": "object",
++          "description": "Custom form definition, with formURI and trackProgressInModal"
++        },
++        {
++          "name": "schema",
++          "type": "object",
++          "description": "JSON schema of the action inputs"
++        }
++      ]
++    },
++    "ResourceActionRequest": {
++      "description": "Body accepted by submitDeploymentActionRequest.",
++      "fields": [
++        { "name": "actionId", "type": "string" },
++        { "name": "inputs", "type": "object" },
++        { "name": "reason", "type": "string" }
++      ]
++    },
++    "Request": {
++      "description": "Day-2 request returned by submitDeploymentActionRequest. Only the fields this client reads are listed as consumed.",
++      "consumed": ["id", "actionId", "deploymentId", "status"],
++      "fields": [
++        { "name": "id", "type": "string" },
++        { "name": "actionId", "type": "string" },
++        { "name": "deploymentId", "type": "string" },
++        { "name": "status", "type": "string" },
++        { "name": "blueprintId", "type": "string" },
++        { "name": "catalogItemId", "type": "string" },
++        { "name": "cancelable", "type": "boolean" },
++        { "name": "dismissed", "type": "boolean" },
++        { "name": "name", "type": "string" },
++        { "name": "details", "type": "string" },
++        { "name": "requestedBy", "type": "string" },
++        { "name": "inputs", "type": "object" },
++        { "name": "outputs", "type": "object" },
++        { "name": "resourceIds", "type": "array" },
++        { "name": "resources", "type": "array" },
++        { "name": "completedTasks", "type": "integer" },
++        { "name": "totalTasks", "type": "integer" },
++        { "name": "createdAt", "type": "string" },
++        { "name": "updatedAt", "type": "string" },
++        { "name": "initializedAt", "type": "string" },
++        { "name": "approvedAt", "type": "string" },
++        { "name": "completedAt", "type": "string" },
++        { "name": "estimatedCompletionTime", "type": "string" }
++      ]
++    }
++  }
++}
+diff --git a/docs/official_sources.json b/docs/official_sources.json
+new file mode 100644
+index 0000000..8b1d803
+--- /dev/null
++++ b/docs/official_sources.json
+@@ -0,0 +1,47 @@
++{
++  "note": "Every page of the VCF Automation xAPIs reference that docs/contract.json was derived from. VCF Automation is absent from vmware/vcf-api-specs, so these reference pages are the authority for the contract.",
++  "sources": [
++    {
++      "url": "https://developer.broadcom.com/xapis/org-management-vm-apps-org/latest/",
++      "title": "Org Management - VM Apps Org",
++      "operation": "api-index",
++      "documents": "Index of the VM Apps Org API references; located VM Apps Org - Deployment as the reference covering deployment day-2 actions.",
++      "fetchedOn": "2026-08-11"
++    },
++    {
++      "url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/9.1/",
++      "title": "VCF Automation API | VM Apps Org - Deployment",
++      "operation": "api-overview",
++      "documents": "API title, description and version 9.1; the Deployment Actions and Requests operation groups.",
++      "fetchedOn": "2026-08-11"
++    },
++    {
++      "url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/9.1/operation-index/",
++      "title": "Operation index | VM Apps Org - Deployment",
++      "operation": "operation-index",
++      "documents": "Full operation list; confirms which deployment-action and request operations exist, and therefore which ones this contract deliberately leaves out.",
++      "fetchedOn": "2026-08-11"
++    },
++    {
++      "url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/9.1/deployment/api/deployments/deploymentId/actions/get/",
++      "title": "Get Deployment Actions | VM Apps Org - Deployment",
++      "operation": "getDeploymentActions",
++      "documents": "GET /deployment/api/deployments/{deploymentId}/actions: summary, the deploymentId path parameter, the absence of query parameters, bearer auth, and the DeploymentAction response fields.",
++      "fetchedOn": "2026-08-11"
++    },
++    {
++      "url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/9.1/deployment/api/deployments/deploymentId/actions/actionId/get/",
++      "title": "Get Deployment Action | VM Apps Org - Deployment",
++      "operation": "getDeploymentAction-schema-reference",
++      "documents": "Field-level descriptions for the DeploymentAction schema, including valid: \"Resource action is valid for current state\", which is the flag the precheck gates on.",
++      "fetchedOn": "2026-08-11"
++    },
++    {
++      "url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/9.1/deployment/api/deployments/deploymentId/requests/post/",
++      "title": "Submit Deployment Action Request | VM Apps Org - Deployment",
++      "operation": "submitDeploymentActionRequest",
++      "documents": "POST /deployment/api/deployments/{deploymentId}/requests: summary, the deploymentId path parameter, the absence of query parameters, the ResourceActionRequest body with its optional actionId, inputs and reason fields, and the Request response plus its 401/403/404/409 codes.",
++      "fetchedOn": "2026-08-11"
++    }
++  ]
++}
+diff --git a/mockapi/mockapi.go b/mockapi/mockapi.go
+index 8269b73..00c3ac7 100644
+--- a/mockapi/mockapi.go
++++ b/mockapi/mockapi.go
+@@ -7,10 +7,19 @@
+ package mockapi
+ 
+ import (
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
++	"net"
+ 	"net/http"
++	"os"
++	"strings"
++	"sync"
+ )
+ 
++const maxBody = 4 << 20
++
+ // Action is one entry of the action list served by the precheck operation.
+ type Action struct {
+ 	ID          string `json:"id"`
+@@ -55,22 +64,286 @@ type Recorded struct {
+ 	Body     []byte
+ }
+ 
++// handler serves one contract operation.
++type handler func(w http.ResponseWriter, r *http.Request, params map[string]string, body []byte)
++
++type route struct {
++	id      string
++	method  string
++	segs    []string
++	handler handler
++}
++
+ // Server is a running loopback API.
+ type Server struct {
+-	url string
++	url    string
++	routes []route
++	token  string
++
++	deployments   map[string]Deployment
++	actionsStatus int
++	requestStatus int
++
++	httpSrv  *http.Server
++	listener net.Listener
++
++	mu         sync.Mutex
++	log        []Recorded
++	requestSeq int
++}
++
++// contractDoc is the slice of docs/contract.json the mock is pinned to.
++type contractDoc struct {
++	Operations []struct {
++		ID     string `json:"id"`
++		Method string `json:"method"`
++		Path   string `json:"path"`
++	} `json:"operations"`
+ }
+ 
+ // Start reads the contract, registers a route for each operation it names and
+ // starts listening on loopback.
+ func Start(opts Options) (*Server, error) {
+-	return nil, errors.New("mockapi: Start not implemented")
++	if opts.ContractPath == "" {
++		return nil, errors.New("mockapi: ContractPath is required")
++	}
++	if opts.Token == "" {
++		return nil, errors.New("mockapi: Token is required")
++	}
++
++	raw, err := os.ReadFile(opts.ContractPath)
++	if err != nil {
++		return nil, fmt.Errorf("mockapi: read contract: %w", err)
++	}
++	var doc contractDoc
++	if err := json.Unmarshal(raw, &doc); err != nil {
++		return nil, fmt.Errorf("mockapi: parse contract: %w", err)
++	}
++	if len(doc.Operations) == 0 {
++		return nil, errors.New("mockapi: contract names no operations")
++	}
++
++	s := &Server{
++		token:         opts.Token,
++		deployments:   make(map[string]Deployment, len(opts.Deployments)),
++		actionsStatus: opts.ActionsStatus,
++		requestStatus: opts.RequestStatus,
++	}
++	for id, dep := range opts.Deployments {
++		s.deployments[id] = dep
++	}
++
++	// Only the operations the contract names get a route. Anything else the
++	// real API offers stays unserved.
++	for _, op := range doc.Operations {
++		var h handler
++		switch op.ID {
++		case "getDeploymentActions":
++			h = s.handleGetDeploymentActions
++		case "submitDeploymentActionRequest":
++			h = s.handleSubmitDeploymentActionRequest
++		default:
++			return nil, fmt.Errorf("mockapi: contract names operation %q, which this mock does not serve", op.ID)
++		}
++		if op.Method == "" || op.Path == "" {
++			return nil, fmt.Errorf("mockapi: operation %q has no method or path", op.ID)
++		}
++		s.routes = append(s.routes, route{
++			id:      op.ID,
++			method:  op.Method,
++			segs:    splitPath(op.Path),
++			handler: h,
++		})
++	}
++
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		return nil, fmt.Errorf("mockapi: listen: %w", err)
++	}
++	s.listener = ln
++	s.url = "http://" + ln.Addr().String()
++	s.httpSrv = &http.Server{Handler: http.HandlerFunc(s.serveHTTP)}
++	go func() { _ = s.httpSrv.Serve(ln) }()
++
++	return s, nil
+ }
+ 
+ // URL is the scheme://host:port root the server is listening on.
+ func (s *Server) URL() string { return s.url }
+ 
+ // Close shuts the server down.
+-func (s *Server) Close() {}
++func (s *Server) Close() {
++	if s.httpSrv != nil {
++		_ = s.httpSrv.Close()
++	}
++}
+ 
+ // Requests returns a copy of the request log, oldest first.
+-func (s *Server) Requests() []Recorded { return nil }
++func (s *Server) Requests() []Recorded {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	out := make([]Recorded, len(s.log))
++	for i, rec := range s.log {
++		cp := rec
++		cp.Header = rec.Header.Clone()
++		cp.Body = append([]byte(nil), rec.Body...)
++		out[i] = cp
++	}
++	return out
++}
++
++func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
++	recordIndex := s.record(r)
++	body, _ := io.ReadAll(io.LimitReader(r.Body, maxBody))
++	s.recordBody(recordIndex, body)
++
++	got := splitPath(r.URL.Path)
++	pathKnown := false
++	for _, rt := range s.routes {
++		params, ok := matchPath(rt.segs, got)
++		if !ok {
++			continue
++		}
++		pathKnown = true
++		if rt.method != r.Method {
++			continue
++		}
++		if r.Header.Get("Authorization") != "Bearer "+s.token {
++			writeError(w, http.StatusUnauthorized, "invalid or missing bearer token")
++			return
++		}
++		rt.handler(w, r, params, body)
++		return
++	}
++
++	if pathKnown {
++		writeError(w, http.StatusMethodNotAllowed, "method not allowed for this operation")
++		return
++	}
++	writeError(w, http.StatusNotFound, "path is not an operation named by the pinned contract")
++}
++
++func (s *Server) record(r *http.Request) int {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	s.log = append(s.log, Recorded{
++		Method:   r.Method,
++		Path:     r.URL.Path,
++		RawQuery: r.URL.RawQuery,
++		Header:   r.Header.Clone(),
++	})
++	return len(s.log) - 1
++}
++
++func (s *Server) recordBody(index int, body []byte) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	s.log[index].Body = append([]byte(nil), body...)
++}
++
++func (s *Server) handleGetDeploymentActions(w http.ResponseWriter, _ *http.Request, params map[string]string, _ []byte) {
++	if s.actionsStatus != 0 {
++		writeError(w, s.actionsStatus, "injected precheck failure")
++		return
++	}
++	dep, ok := s.deployments[params["deploymentId"]]
++	if !ok {
++		writeError(w, http.StatusNotFound, "deployment not found")
++		return
++	}
++	actions := dep.Actions
++	if actions == nil {
++		actions = []Action{}
++	}
++	writeJSON(w, http.StatusOK, actions)
++}
++
++// handleSubmitDeploymentActionRequest deliberately does not re-check whether the
++// action is available or valid. The gate lives in the client, and the mock has
++// to stay willing so a test can tell a client that skipped the gate apart from
++// one that honoured it.
++func (s *Server) handleSubmitDeploymentActionRequest(w http.ResponseWriter, r *http.Request, params map[string]string, body []byte) {
++	if s.requestStatus != 0 {
++		writeError(w, s.requestStatus, "injected failure")
++		return
++	}
++	depID := params["deploymentId"]
++	if _, ok := s.deployments[depID]; !ok {
++		writeError(w, http.StatusNotFound, "deployment not found")
++		return
++	}
++	if ct := r.Header.Get("Content-Type"); ct != "application/json" {
++		writeError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json, got "+ct)
++		return
++	}
++
++	var in struct {
++		ActionID string         `json:"actionId"`
++		Inputs   map[string]any `json:"inputs"`
++		Reason   string         `json:"reason"`
++	}
++	if err := json.Unmarshal(body, &in); err != nil {
++		writeError(w, http.StatusBadRequest, "body is not a ResourceActionRequest")
++		return
++	}
++	if in.ActionID == "" {
++		writeError(w, http.StatusBadRequest, "actionId is required")
++		return
++	}
++
++	s.mu.Lock()
++	s.requestSeq++
++	seq := s.requestSeq
++	s.mu.Unlock()
++
++	writeJSON(w, http.StatusOK, map[string]any{
++		"id":           fmt.Sprintf("req-%d", seq),
++		"actionId":     in.ActionID,
++		"deploymentId": depID,
++		"status":       "PENDING",
++		"inputs":       in.Inputs,
++		"details":      in.Reason,
++	})
++}
++
++// splitPath turns "/deployment/api/deployments/{deploymentId}/actions" into its
++// segments.
++func splitPath(p string) []string {
++	return strings.Split(strings.Trim(p, "/"), "/")
++}
++
++// matchPath matches a request's segments against a route template and returns
++// the path parameters it filled.
++func matchPath(tmpl, got []string) (map[string]string, bool) {
++	if len(tmpl) != len(got) {
++		return nil, false
++	}
++	params := map[string]string{}
++	for i, seg := range tmpl {
++		if strings.HasPrefix(seg, "{") && strings.HasSuffix(seg, "}") {
++			if got[i] == "" {
++				return nil, false
++			}
++			params[seg[1:len(seg)-1]] = got[i]
++			continue
++		}
++		if seg != got[i] {
++			return nil, false
++		}
++	}
++	return params, true
++}
++
++func writeJSON(w http.ResponseWriter, status int, v any) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(status)
++	_ = json.NewEncoder(w).Encode(v)
++}
++
++func writeError(w http.ResponseWriter, status int, message string) {
++	writeJSON(w, status, map[string]any{
++		"status":  status,
++		"message": message,
++	})
++}
+diff --git a/mockapi/mockapi_test.go b/mockapi/mockapi_test.go
+new file mode 100644
+index 0000000..b9b9b9c
+--- /dev/null
++++ b/mockapi/mockapi_test.go
+@@ -0,0 +1,281 @@
++package mockapi_test
++
++import (
++	"encoding/json"
++	"net/http"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"example.com/vcfauto/mockapi"
++)
++
++const (
++	contractPath = "../docs/contract.json"
++	token        = "mock-test-token"
++	deployment   = "3f9a1c77-55b2-4e0a-9d61-8ab4c2e07f13"
++)
++
++func start(t *testing.T, opts mockapi.Options) *mockapi.Server {
++	t.Helper()
++	if opts.ContractPath == "" {
++		opts.ContractPath = contractPath
++	}
++	if opts.Token == "" {
++		opts.Token = token
++	}
++	if opts.Deployments == nil {
++		opts.Deployments = map[string]mockapi.Deployment{
++			deployment: {Actions: []mockapi.Action{{ID: "Deployment.PowerOff", Valid: true}}},
++		}
++	}
++	srv, err := mockapi.Start(opts)
++	if err != nil {
++		t.Fatalf("Start: %v", err)
++	}
++	t.Cleanup(srv.Close)
++	return srv
++}
++
++func do(t *testing.T, srv *mockapi.Server, method, path, body, authToken string) *http.Response {
++	t.Helper()
++	var rdr *strings.Reader
++	if body != "" {
++		rdr = strings.NewReader(body)
++	}
++	var req *http.Request
++	var err error
++	if rdr == nil {
++		req, err = http.NewRequest(method, srv.URL()+path, nil)
++	} else {
++		req, err = http.NewRequest(method, srv.URL()+path, rdr)
++		req.Header.Set("Content-Type", "application/json")
++	}
++	if err != nil {
++		t.Fatalf("new request: %v", err)
++	}
++	if authToken != "" {
++		req.Header.Set("Authorization", "Bearer "+authToken)
++	}
++	resp, err := http.DefaultClient.Do(req)
++	if err != nil {
++		t.Fatalf("do: %v", err)
++	}
++	t.Cleanup(func() { resp.Body.Close() })
++	return resp
++}
++
++func TestStartValidatesOptions(t *testing.T) {
++	tests := []struct {
++		name string
++		opts mockapi.Options
++	}{
++		{"no contract path", mockapi.Options{Token: token}},
++		{"no token", mockapi.Options{ContractPath: contractPath}},
++		{"contract does not exist", mockapi.Options{ContractPath: "does/not/exist.json", Token: token}},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			srv, err := mockapi.Start(tc.opts)
++			if err == nil {
++				srv.Close()
++				t.Fatal("Start returned a nil error")
++			}
++		})
++	}
++}
++
++func TestStartRejectsAnUnknownOperation(t *testing.T) {
++	dir := t.TempDir()
++	path := filepath.Join(dir, "contract.json")
++	doc := `{"operations":[{"id":"deleteDeployment","method":"DELETE","path":"/deployment/api/deployments/{deploymentId}"}]}`
++	if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
++		t.Fatalf("write: %v", err)
++	}
++
++	srv, err := mockapi.Start(mockapi.Options{ContractPath: path, Token: token})
++	if err == nil {
++		srv.Close()
++		t.Fatal("Start served an operation the mock does not implement")
++	}
++	if !strings.Contains(err.Error(), "deleteDeployment") {
++		t.Errorf("error = %v, want it to name the unserved operation", err)
++	}
++}
++
++func TestRouting(t *testing.T) {
++	tests := []struct {
++		name       string
++		method     string
++		path       string
++		body       string
++		token      string
++		wantStatus int
++	}{
++		{"precheck", http.MethodGet, "/deployment/api/deployments/" + deployment + "/actions", "", token, http.StatusOK},
++		{"precheck unknown deployment", http.MethodGet, "/deployment/api/deployments/nope/actions", "", token, http.StatusNotFound},
++		{"precheck without a token", http.MethodGet, "/deployment/api/deployments/" + deployment + "/actions", "", "", http.StatusUnauthorized},
++		{"precheck with the wrong token", http.MethodGet, "/deployment/api/deployments/" + deployment + "/actions", "", "nope", http.StatusUnauthorized},
++		{"submit", http.MethodPost, "/deployment/api/deployments/" + deployment + "/requests", `{"actionId":"Deployment.PowerOff"}`, token, http.StatusOK},
++		{"submit without an actionId", http.MethodPost, "/deployment/api/deployments/" + deployment + "/requests", `{}`, token, http.StatusBadRequest},
++		{"submit with a malformed body", http.MethodPost, "/deployment/api/deployments/" + deployment + "/requests", `not json`, token, http.StatusBadRequest},
++		{"wrong method on a contract path", http.MethodDelete, "/deployment/api/deployments/" + deployment + "/actions", "", token, http.StatusMethodNotAllowed},
++		{"operation outside the contract", http.MethodGet, "/deployment/api/requests/req-1", "", token, http.StatusNotFound},
++		{"unrelated path", http.MethodGet, "/", "", token, http.StatusNotFound},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			srv := start(t, mockapi.Options{})
++			resp := do(t, srv, tc.method, tc.path, tc.body, tc.token)
++			if resp.StatusCode != tc.wantStatus {
++				t.Errorf("%s %s = %d, want %d", tc.method, tc.path, resp.StatusCode, tc.wantStatus)
++			}
++		})
++	}
++}
++
++func TestInjectedStatuses(t *testing.T) {
++	tests := []struct {
++		name       string
++		opts       mockapi.Options
++		method     string
++		path       string
++		body       string
++		wantStatus int
++	}{
++		{
++			name:       "precheck failure",
++			opts:       mockapi.Options{ActionsStatus: http.StatusInternalServerError},
++			method:     http.MethodGet,
++			path:       "/deployment/api/deployments/" + deployment + "/actions",
++			wantStatus: http.StatusInternalServerError,
++		},
++		{
++			name:       "mutating failure",
++			opts:       mockapi.Options{RequestStatus: http.StatusConflict},
++			method:     http.MethodPost,
++			path:       "/deployment/api/deployments/" + deployment + "/requests",
++			body:       `{"actionId":"Deployment.PowerOff"}`,
++			wantStatus: http.StatusConflict,
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			srv := start(t, tc.opts)
++			resp := do(t, srv, tc.method, tc.path, tc.body, token)
++			if resp.StatusCode != tc.wantStatus {
++				t.Errorf("status = %d, want %d", resp.StatusCode, tc.wantStatus)
++			}
++		})
++	}
++}
++
++func TestSubmitRequiresJSONContentType(t *testing.T) {
++	srv := start(t, mockapi.Options{})
++
++	req, err := http.NewRequest(http.MethodPost,
++		srv.URL()+"/deployment/api/deployments/"+deployment+"/requests",
++		strings.NewReader(`{"actionId":"Deployment.PowerOff"}`))
++	if err != nil {
++		t.Fatalf("new request: %v", err)
++	}
++	req.Header.Set("Authorization", "Bearer "+token)
++	req.Header.Set("Content-Type", "text/plain")
++
++	resp, err := http.DefaultClient.Do(req)
++	if err != nil {
++		t.Fatalf("do: %v", err)
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusUnsupportedMediaType {
++		t.Errorf("status = %d, want 415", resp.StatusCode)
++	}
++}
++
++func TestRequestLog(t *testing.T) {
++	srv := start(t, mockapi.Options{})
++
++	do(t, srv, http.MethodGet, "/deployment/api/deployments/"+deployment+"/actions?ignored=1", "", token)
++	do(t, srv, http.MethodPost, "/deployment/api/deployments/"+deployment+"/requests", `{"actionId":"Deployment.PowerOff"}`, token)
++
++	recs := srv.Requests()
++	if len(recs) != 2 {
++		t.Fatalf("recorded %d requests, want 2", len(recs))
++	}
++
++	tests := []struct {
++		name     string
++		rec      mockapi.Recorded
++		method   string
++		path     string
++		rawQuery string
++		body     string
++	}{
++		{"precheck", recs[0], http.MethodGet, "/deployment/api/deployments/" + deployment + "/actions", "ignored=1", ""},
++		{"submit", recs[1], http.MethodPost, "/deployment/api/deployments/" + deployment + "/requests", "", `{"actionId":"Deployment.PowerOff"}`},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			if tc.rec.Method != tc.method {
++				t.Errorf("Method = %q, want %q", tc.rec.Method, tc.method)
++			}
++			if tc.rec.Path != tc.path {
++				t.Errorf("Path = %q, want %q", tc.rec.Path, tc.path)
++			}
++			if tc.rec.RawQuery != tc.rawQuery {
++				t.Errorf("RawQuery = %q, want %q", tc.rec.RawQuery, tc.rawQuery)
++			}
++			if string(tc.rec.Body) != tc.body {
++				t.Errorf("Body = %q, want %q", tc.rec.Body, tc.body)
++			}
++			if tc.rec.Header.Get("Authorization") != "Bearer "+token {
++				t.Errorf("Authorization was not recorded")
++			}
++		})
++	}
++}
++
++func TestUnauthorizedRequestsAreStillLogged(t *testing.T) {
++	srv := start(t, mockapi.Options{})
++
++	do(t, srv, http.MethodGet, "/deployment/api/deployments/"+deployment+"/actions", "", "")
++
++	if n := len(srv.Requests()); n != 1 {
++		t.Errorf("recorded %d requests, want the rejected one to be logged too", n)
++	}
++}
++
++func TestPrecheckResponseShape(t *testing.T) {
++	srv := start(t, mockapi.Options{
++		Deployments: map[string]mockapi.Deployment{
++			deployment: {Actions: []mockapi.Action{
++				{ID: "Deployment.PowerOff", Name: "PowerOff", DisplayName: "Power Off", ActionType: "RESOURCE_ACTION", Valid: true},
++			}},
++		},
++	})
++
++	resp := do(t, srv, http.MethodGet, "/deployment/api/deployments/"+deployment+"/actions", "", token)
++	if resp.StatusCode != http.StatusOK {
++		t.Fatalf("status = %d", resp.StatusCode)
++	}
++
++	var got []map[string]any
++	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
++		t.Fatalf("decode: %v", err)
++	}
++	if len(got) != 1 {
++		t.Fatalf("got %d actions, want 1", len(got))
++	}
++	for _, key := range []string{"id", "name", "displayName", "actionType", "valid"} {
++		if _, ok := got[0][key]; !ok {
++			t.Errorf("action is missing %q", key)
++		}
++	}
++	if got[0]["valid"] != true {
++		t.Errorf("valid = %v, want true", got[0]["valid"])
++	}
++}

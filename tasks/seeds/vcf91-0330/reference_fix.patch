@@ -1,0 +1,1746 @@
+diff --git a/client.go b/client.go
+index 6a097d5..820a0e7 100644
+--- a/client.go
++++ b/client.go
+@@ -10,9 +10,15 @@ package vcfdiag
+ 
+ import (
+ 	"context"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
++	"strconv"
++	"strings"
++	"time"
+ )
+ 
+ // Config configures a Client.
+@@ -103,6 +109,21 @@ func (e *APIError) Error() string {
+ 	return fmt.Sprintf("vcfdiag: %s: unexpected status %d: %s", e.Op, e.StatusCode, e.Body)
+ }
+ 
++// Contract operation ids, as named in docs/contract.json.
++const (
++	opDeploymentRequests = "getDeploymentRequests"
++	opRequest            = "getRequest"
++	opRequestEvents      = "getRequestEvents"
++	opEventLogs          = "getEventLogs"
++)
++
++// failedStatus is the request status the diagnosis looks for.
++const failedStatus = "FAILED"
++
++// errorPrefix marks a log line that reports an error. The first such line, in
++// event order then row order, is the root cause; anything after it is fallout.
++const errorPrefix = "ERROR "
++
+ // Client talks to one VCF Automation endpoint.
+ type Client struct {
+ 	baseURL string
+@@ -112,11 +133,287 @@ type Client struct {
+ 
+ // New returns a Client for cfg.
+ func New(cfg Config) (*Client, error) {
+-	return nil, errors.New("vcfdiag: New not implemented")
++	base := strings.TrimRight(cfg.BaseURL, "/")
++	if base == "" {
++		return nil, fmt.Errorf("%w: BaseURL is required", ErrInvalidRequest)
++	}
++	u, err := url.Parse(base)
++	if err != nil {
++		return nil, fmt.Errorf("%w: BaseURL %q: %v", ErrInvalidRequest, cfg.BaseURL, err)
++	}
++	if !u.IsAbs() || u.Host == "" {
++		return nil, fmt.Errorf("%w: BaseURL %q must be absolute", ErrInvalidRequest, cfg.BaseURL)
++	}
++	if cfg.Token == "" {
++		return nil, fmt.Errorf("%w: Token is required", ErrInvalidRequest)
++	}
++
++	hc := cfg.HTTPClient
++	if hc == nil {
++		hc = &http.Client{Timeout: 30 * time.Second}
++	}
++	return &Client{baseURL: base, token: cfg.Token, hc: hc}, nil
++}
++
++// ---------------------------------------------------------------------------
++// wire types
++// ---------------------------------------------------------------------------
++
++type pageOfRequests struct {
++	Content []apiRequest `json:"content"`
++}
++
++type apiRequest struct {
++	ID      string `json:"id"`
++	Name    string `json:"name"`
++	Status  string `json:"status"`
++	Details string `json:"details"`
++}
++
++type pageOfEvents struct {
++	Content []apiEvent `json:"content"`
+ }
+ 
++type apiEvent struct {
++	ID           string `json:"id"`
++	Name         string `json:"name"`
++	Details      string `json:"details"`
++	Timestamp    string `json:"timestamp"`
++	ResourceName string `json:"resourceName"`
++	ResourceType string `json:"resourceType"`
++	HasLogs      bool   `json:"hasLogs"`
++	UserEvent    bool   `json:"userEvent"`
++}
++
++type sliceOfLogs struct {
++	Content          []apiLogLine `json:"content"`
++	Last             bool         `json:"last"`
++	NumberOfElements int          `json:"numberOfElements"`
++}
++
++type apiLogLine struct {
++	ID        string `json:"id"`
++	Message   string `json:"message"`
++	Rownum    int    `json:"rownum"`
++	Timestamp string `json:"timestamp"`
++	EOF       bool   `json:"eof"`
++}
++
++// ---------------------------------------------------------------------------
++// Diagnose
++// ---------------------------------------------------------------------------
++
+ // Diagnose walks the deployment's most recent failed request down to the log
+ // line that explains it.
+ func (c *Client) Diagnose(ctx context.Context, req DiagnoseRequest) (*Diagnosis, error) {
+-	return nil, errors.New("vcfdiag: Diagnose not implemented")
++	if err := validate(req); err != nil {
++		return nil, err
++	}
++
++	// 1. The deployment's requests, newest first.
++	failed, err := c.latestFailedRequest(ctx, req)
++	if err != nil {
++		return nil, err
++	}
++
++	// 2. The failed request itself, for its details.
++	full, err := c.request(ctx, failed.ID)
++	if err != nil {
++		return nil, err
++	}
++
++	// 3. Its events, oldest first.
++	events, err := c.events(ctx, failed.ID, req.PageSize)
++	if err != nil {
++		return nil, err
++	}
++
++	// 4. Every log line of every event that has logs, in event order.
++	d := &Diagnosis{
++		DeploymentID:   req.DeploymentID,
++		RequestID:      full.ID,
++		RequestName:    full.Name,
++		RequestStatus:  full.Status,
++		RequestDetails: full.Details,
++	}
++	type sourced struct {
++		event apiEvent
++		line  LogLine
++	}
++	var all []sourced
++
++	for _, ev := range events {
++		if !ev.HasLogs {
++			continue
++		}
++		lines, err := c.eventLogs(ctx, failed.ID, ev.ID)
++		if err != nil {
++			return nil, err
++		}
++		for _, l := range lines {
++			line := LogLine{
++				EventID:   ev.ID,
++				Rownum:    l.Rownum,
++				Message:   l.Message,
++				Timestamp: l.Timestamp,
++			}
++			d.LogLines = append(d.LogLines, line)
++			all = append(all, sourced{event: ev, line: line})
++		}
++	}
++
++	// 5. The first error line is the cause; later ones are its consequences.
++	for _, s := range all {
++		if !strings.HasPrefix(s.line.Message, errorPrefix) {
++			continue
++		}
++		d.EventID = s.event.ID
++		d.EventName = s.event.Name
++		d.ResourceName = s.event.ResourceName
++		d.RootCause = s.line.Message
++		return d, nil
++	}
++
++	return nil, fmt.Errorf("%w: request %s emitted %d log lines, none of them an error",
++		ErrNoRootCause, failed.ID, len(d.LogLines))
++}
++
++func validate(req DiagnoseRequest) error {
++	if req.DeploymentID == "" {
++		return fmt.Errorf("%w: DeploymentID is required", ErrInvalidRequest)
++	}
++	if strings.ContainsAny(req.DeploymentID, "/?#") {
++		return fmt.Errorf("%w: DeploymentID %q may not contain '/', '?' or '#'",
++			ErrInvalidRequest, req.DeploymentID)
++	}
++	if req.PageSize < 0 {
++		return fmt.Errorf("%w: PageSize %d must not be negative", ErrInvalidRequest, req.PageSize)
++	}
++	return nil
++}
++
++func (c *Client) latestFailedRequest(ctx context.Context, req DiagnoseRequest) (apiRequest, error) {
++	q := url.Values{}
++	// The listing has to come back newest first for "most recent failure" to
++	// mean anything, so sort is always sent.
++	q.Set("sort", "createdAt,DESC")
++	if req.PageSize > 0 {
++		q.Set("size", strconv.Itoa(req.PageSize))
++	}
++	if req.Search != "" {
++		q.Set("search", req.Search)
++	}
++
++	var page pageOfRequests
++	path := "/deployment/api/deployments/" + url.PathEscape(req.DeploymentID) + "/requests"
++	if err := c.get(ctx, opDeploymentRequests, path, q, &page); err != nil {
++		return apiRequest{}, err
++	}
++	for _, r := range page.Content {
++		if r.Status == failedStatus {
++			return r, nil
++		}
++	}
++	return apiRequest{}, fmt.Errorf("%w: deployment %s", ErrNoFailedRequest, req.DeploymentID)
++}
++
++func (c *Client) request(ctx context.Context, requestID string) (apiRequest, error) {
++	var out apiRequest
++	// The reference documents no query parameters here, so none are sent.
++	path := "/deployment/api/requests/" + url.PathEscape(requestID)
++	if err := c.get(ctx, opRequest, path, nil, &out); err != nil {
++		return apiRequest{}, err
++	}
++	return out, nil
++}
++
++func (c *Client) events(ctx context.Context, requestID string, pageSize int) ([]apiEvent, error) {
++	q := url.Values{}
++	// Oldest first: the root cause is the first error in time order.
++	q.Set("sort", "timestamp,ASC")
++	if pageSize > 0 {
++		q.Set("size", strconv.Itoa(pageSize))
++	}
++
++	var page pageOfEvents
++	path := "/deployment/api/requests/" + url.PathEscape(requestID) + "/events"
++	if err := c.get(ctx, opRequestEvents, path, q, &page); err != nil {
++		return nil, err
++	}
++	return page.Content, nil
++}
++
++// eventLogs follows the slice to the end of the log. The first call omits
++// sinceRow entirely; each later call asks for the row after the last one read.
++func (c *Client) eventLogs(ctx context.Context, requestID, eventID string) ([]apiLogLine, error) {
++	path := "/deployment/api/requests/" + url.PathEscape(requestID) +
++		"/events/" + url.PathEscape(eventID) + "/logs"
++
++	var out []apiLogLine
++	sinceRow := 0
++
++	for {
++		var q url.Values
++		if sinceRow > 0 {
++			q = url.Values{"sinceRow": []string{strconv.Itoa(sinceRow)}}
++		}
++
++		var slice sliceOfLogs
++		if err := c.get(ctx, opEventLogs, path, q, &slice); err != nil {
++			return nil, err
++		}
++		if len(slice.Content) == 0 {
++			return out, nil
++		}
++		out = append(out, slice.Content...)
++
++		last := slice.Content[len(slice.Content)-1]
++		if slice.Last || last.EOF {
++			return out, nil
++		}
++		next := last.Rownum + 1
++		if next <= sinceRow {
++			// The server is not advancing; stop rather than loop forever.
++			return out, nil
++		}
++		sinceRow = next
++	}
++}
++
++// ---------------------------------------------------------------------------
++// transport
++// ---------------------------------------------------------------------------
++
++// get issues one GET and decodes a 2xx JSON body into out. A query with no
++// values produces no query string at all.
++func (c *Client) get(ctx context.Context, op, path string, q url.Values, out any) error {
++	target := c.baseURL + path
++	if encoded := q.Encode(); encoded != "" {
++		target += "?" + encoded
++	}
++
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
++	if err != nil {
++		return fmt.Errorf("vcfdiag: %s: %w", op, err)
++	}
++	req.Header.Set("Authorization", "Bearer "+c.token)
++	req.Header.Set("Accept", "application/json")
++
++	resp, err := c.hc.Do(req)
++	if err != nil {
++		return fmt.Errorf("vcfdiag: %s: %w", op, err)
++	}
++	defer resp.Body.Close()
++
++	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
++	if err != nil {
++		return fmt.Errorf("vcfdiag: %s: reading response: %w", op, err)
++	}
++	if resp.StatusCode < 200 || resp.StatusCode > 299 {
++		return &APIError{Op: op, StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(body))}
++	}
++	if err := json.Unmarshal(body, out); err != nil {
++		return fmt.Errorf("vcfdiag: %s: decoding response: %w", op, err)
++	}
++	return nil
+ }
+diff --git a/client_test.go b/client_test.go
+new file mode 100644
+index 0000000..40a761e
+--- /dev/null
++++ b/client_test.go
+@@ -0,0 +1,307 @@
++package vcfdiag_test
++
++import (
++	"context"
++	"errors"
++	"net/http"
++	"net/url"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"example.com/vcfdiag"
++	"example.com/vcfdiag/mockapi"
++)
++
++const testToken = "tkn-client-test"
++
++func contractPath(t *testing.T) string {
++	t.Helper()
++	return filepath.Join("docs", "contract.json")
++}
++
++func seed() map[string]mockapi.Deployment {
++	return map[string]mockapi.Deployment{
++		"dep-1": {Requests: []mockapi.Request{
++			{ID: "r-new", Name: "Power Off", Status: "SUCCESSFUL", CreatedAt: "2026-02-02T10:00:00Z"},
++			{
++				ID: "r-bad", Name: "Reconfigure", Status: "FAILED", Details: "Request failed.",
++				CreatedAt: "2026-02-01T10:00:00Z",
++				Events: []mockapi.Event{
++					{
++						ID: "e-1", Name: "Resize disk", Timestamp: "2026-02-01T10:00:10Z",
++						ResourceName: "db-01", ResourceType: "Cloud.vSphere.Disk", HasLogs: true,
++						Logs: []string{
++							"INFO Resizing disk db-01 to 400 GB",
++							"INFO Datastore ds-gold selected",
++							"ERROR Resize refused: datastore ds-gold has 12 GB free, 150 GB needed",
++							"INFO Task marked failed",
++						},
++					},
++					{ID: "e-2", Name: "Notified owner", Timestamp: "2026-02-01T10:00:30Z", UserEvent: true},
++					{
++						ID: "e-3", Name: "Rollback", Timestamp: "2026-02-01T10:01:00Z",
++						ResourceName: "db-01", HasLogs: true,
++						Logs: []string{"ERROR Rollback left db-01 in ERROR state"},
++					},
++				},
++			},
++		}},
++	}
++}
++
++func start(t *testing.T, opts mockapi.Options) *mockapi.Server {
++	t.Helper()
++	if opts.ContractPath == "" {
++		opts.ContractPath = contractPath(t)
++	}
++	if opts.Token == "" {
++		opts.Token = testToken
++	}
++	srv, err := mockapi.Start(opts)
++	if err != nil {
++		t.Fatalf("mockapi.Start: %v", err)
++	}
++	t.Cleanup(srv.Close)
++	return srv
++}
++
++func TestNew(t *testing.T) {
++	cases := []struct {
++		name    string
++		cfg     vcfdiag.Config
++		wantErr bool
++	}{
++		{"ok", vcfdiag.Config{BaseURL: "https://vcfa.example.test", Token: "t"}, false},
++		{"ok with trailing slash", vcfdiag.Config{BaseURL: "https://vcfa.example.test/", Token: "t"}, false},
++		{"ok with custom http client", vcfdiag.Config{BaseURL: "https://vcfa.example.test", Token: "t", HTTPClient: &http.Client{}}, false},
++		{"no base url", vcfdiag.Config{Token: "t"}, true},
++		{"relative base url", vcfdiag.Config{BaseURL: "vcfa.example.test", Token: "t"}, true},
++		{"scheme only", vcfdiag.Config{BaseURL: "https://", Token: "t"}, true},
++		{"no token", vcfdiag.Config{BaseURL: "https://vcfa.example.test"}, true},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			c, err := vcfdiag.New(tc.cfg)
++			switch {
++			case tc.wantErr && err == nil:
++				t.Fatal("want an error, got none")
++			case tc.wantErr && !errors.Is(err, vcfdiag.ErrInvalidRequest):
++				t.Fatalf("err = %v, want ErrInvalidRequest", err)
++			case !tc.wantErr && err != nil:
++				t.Fatalf("unexpected error: %v", err)
++			case !tc.wantErr && c == nil:
++				t.Fatal("no client returned")
++			}
++		})
++	}
++}
++
++func TestDiagnoseRootCause(t *testing.T) {
++	cases := []struct {
++		name        string
++		logPageSize int
++		wantCause   string
++		wantEvent   string
++		wantLines   int
++		wantCalls   int
++	}{
++		{"one row per page", 1, "ERROR Resize refused: datastore ds-gold has 12 GB free, 150 GB needed", "e-1", 5, 3 + 4 + 1},
++		{"two rows per page", 2, "ERROR Resize refused: datastore ds-gold has 12 GB free, 150 GB needed", "e-1", 5, 3 + 2 + 1},
++		{"whole log in one page", 0, "ERROR Resize refused: datastore ds-gold has 12 GB free, 150 GB needed", "e-1", 5, 3 + 1 + 1},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			srv := start(t, mockapi.Options{Deployments: seed(), LogPageSize: tc.logPageSize})
++			c, err := vcfdiag.New(vcfdiag.Config{BaseURL: srv.URL(), Token: testToken})
++			if err != nil {
++				t.Fatalf("New: %v", err)
++			}
++
++			got, err := c.Diagnose(context.Background(), vcfdiag.DiagnoseRequest{DeploymentID: "dep-1"})
++			if err != nil {
++				t.Fatalf("Diagnose: %v", err)
++			}
++			if got.RootCause != tc.wantCause {
++				t.Errorf("RootCause = %q, want %q", got.RootCause, tc.wantCause)
++			}
++			if got.EventID != tc.wantEvent {
++				t.Errorf("EventID = %q, want %q", got.EventID, tc.wantEvent)
++			}
++			if got.RequestID != "r-bad" {
++				t.Errorf("RequestID = %q, want r-bad", got.RequestID)
++			}
++			if len(got.LogLines) != tc.wantLines {
++				t.Errorf("retrieved %d log lines, want %d", len(got.LogLines), tc.wantLines)
++			}
++			if n := len(srv.Requests()); n != tc.wantCalls {
++				t.Errorf("made %d calls, want %d", n, tc.wantCalls)
++			}
++			for _, l := range got.LogLines {
++				if l.EventID == "e-2" {
++					t.Error("pulled logs for e-2, which has none")
++				}
++			}
++		})
++	}
++}
++
++func TestDiagnoseQueryShape(t *testing.T) {
++	cases := []struct {
++		name      string
++		req       vcfdiag.DiagnoseRequest
++		wantFirst map[string]string
++	}{
++		{"defaults", vcfdiag.DiagnoseRequest{DeploymentID: "dep-1"},
++			map[string]string{"sort": "createdAt,DESC"}},
++		{"with size", vcfdiag.DiagnoseRequest{DeploymentID: "dep-1", PageSize: 5},
++			map[string]string{"sort": "createdAt,DESC", "size": "5"}},
++		{"with search", vcfdiag.DiagnoseRequest{DeploymentID: "dep-1", Search: "db"},
++			map[string]string{"sort": "createdAt,DESC", "search": "db"}},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			srv := start(t, mockapi.Options{Deployments: seed(), LogPageSize: 2})
++			c, err := vcfdiag.New(vcfdiag.Config{BaseURL: srv.URL(), Token: testToken})
++			if err != nil {
++				t.Fatalf("New: %v", err)
++			}
++			if _, err := c.Diagnose(context.Background(), tc.req); err != nil {
++				t.Fatalf("Diagnose: %v", err)
++			}
++
++			recs := srv.Requests()
++			q, err := url.ParseQuery(recs[0].RawQuery)
++			if err != nil {
++				t.Fatalf("parse query: %v", err)
++			}
++			if len(q) != len(tc.wantFirst) {
++				t.Errorf("query = %v, want exactly %v", q, tc.wantFirst)
++			}
++			for k, want := range tc.wantFirst {
++				if got := q.Get(k); got != want {
++					t.Errorf("query %s = %q, want %q", k, got, want)
++				}
++			}
++			// The single-request read never carries a query string.
++			if recs[1].RawQuery != "" {
++				t.Errorf("getRequest query = %q, want empty", recs[1].RawQuery)
++			}
++			// The first log page omits sinceRow.
++			for _, rec := range recs {
++				if strings.HasSuffix(rec.Path, "/logs") && strings.Contains(rec.RawQuery, "sinceRow=0") {
++					t.Error("sent sinceRow=0; an unset sinceRow is omitted")
++				}
++			}
++		})
++	}
++}
++
++func TestDiagnoseErrors(t *testing.T) {
++	cases := []struct {
++		name    string
++		opts    mockapi.Options
++		deps    map[string]mockapi.Deployment
++		req     vcfdiag.DiagnoseRequest
++		wantErr error
++	}{
++		{
++			name:    "empty deployment id",
++			deps:    seed(),
++			req:     vcfdiag.DiagnoseRequest{},
++			wantErr: vcfdiag.ErrInvalidRequest,
++		},
++		{
++			name:    "path traversal in deployment id",
++			deps:    seed(),
++			req:     vcfdiag.DiagnoseRequest{DeploymentID: "a/b"},
++			wantErr: vcfdiag.ErrInvalidRequest,
++		},
++		{
++			name:    "negative page size",
++			deps:    seed(),
++			req:     vcfdiag.DiagnoseRequest{DeploymentID: "dep-1", PageSize: -3},
++			wantErr: vcfdiag.ErrInvalidRequest,
++		},
++		{
++			name: "no failed request",
++			deps: map[string]mockapi.Deployment{"dep-1": {Requests: []mockapi.Request{
++				{ID: "r-ok", Status: "SUCCESSFUL"},
++			}}},
++			req:     vcfdiag.DiagnoseRequest{DeploymentID: "dep-1"},
++			wantErr: vcfdiag.ErrNoFailedRequest,
++		},
++		{
++			name: "failed request with no error line",
++			deps: map[string]mockapi.Deployment{"dep-1": {Requests: []mockapi.Request{
++				{ID: "r-bad", Status: "FAILED", Events: []mockapi.Event{
++					{ID: "e-1", Timestamp: "t", HasLogs: true, Logs: []string{"INFO fine", "WARN odd"}},
++				}},
++			}}},
++			req:     vcfdiag.DiagnoseRequest{DeploymentID: "dep-1"},
++			wantErr: vcfdiag.ErrNoRootCause,
++		},
++		{
++			name: "failed request with no events at all",
++			deps: map[string]mockapi.Deployment{"dep-1": {Requests: []mockapi.Request{
++				{ID: "r-bad", Status: "FAILED"},
++			}}},
++			req:     vcfdiag.DiagnoseRequest{DeploymentID: "dep-1"},
++			wantErr: vcfdiag.ErrNoRootCause,
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			opts := tc.opts
++			opts.Deployments = tc.deps
++			opts.LogPageSize = 2
++			srv := start(t, opts)
++			c, err := vcfdiag.New(vcfdiag.Config{BaseURL: srv.URL(), Token: testToken})
++			if err != nil {
++				t.Fatalf("New: %v", err)
++			}
++			_, err = c.Diagnose(context.Background(), tc.req)
++			if !errors.Is(err, tc.wantErr) {
++				t.Fatalf("err = %v, want %v", err, tc.wantErr)
++			}
++		})
++	}
++}
++
++func TestDiagnoseAPIErrors(t *testing.T) {
++	cases := []struct {
++		name   string
++		opts   mockapi.Options
++		wantOp string
++	}{
++		{"listing", mockapi.Options{RequestsStatus: http.StatusInternalServerError}, "getDeploymentRequests"},
++		{"request", mockapi.Options{RequestStatus: http.StatusNotFound}, "getRequest"},
++		{"events", mockapi.Options{EventsStatus: http.StatusForbidden}, "getRequestEvents"},
++		{"logs", mockapi.Options{LogsStatus: http.StatusBadGateway}, "getEventLogs"},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			opts := tc.opts
++			opts.Deployments = seed()
++			opts.LogPageSize = 2
++			srv := start(t, opts)
++			c, err := vcfdiag.New(vcfdiag.Config{BaseURL: srv.URL(), Token: testToken})
++			if err != nil {
++				t.Fatalf("New: %v", err)
++			}
++			_, err = c.Diagnose(context.Background(), vcfdiag.DiagnoseRequest{DeploymentID: "dep-1"})
++
++			var apiErr *vcfdiag.APIError
++			if !errors.As(err, &apiErr) {
++				t.Fatalf("err = %v, want *APIError", err)
++			}
++			if apiErr.Op != tc.wantOp {
++				t.Errorf("Op = %q, want %q", apiErr.Op, tc.wantOp)
++			}
++			if !strings.Contains(apiErr.Error(), tc.wantOp) {
++				t.Errorf("Error() = %q, want it to name %q", apiErr.Error(), tc.wantOp)
++			}
++		})
++	}
++}
+diff --git a/docs/contract.json b/docs/contract.json
+new file mode 100644
+index 0000000..48608f3
+--- /dev/null
++++ b/docs/contract.json
+@@ -0,0 +1,318 @@
++{
++  "api": {
++    "name": "VCF Automation API - VM Apps Org, Deployment service",
++    "product": "VMware Cloud Foundation Automation",
++    "version": "9.1",
++    "basePath": "/deployment/api",
++    "sourceType": "reference-documentation",
++    "specificationAvailable": false,
++    "sourceNote": "VCF Automation, the successor to vRealize Automation and Aria Automation, has no machine-readable specification in the vmware/vcf-api-specs repository. This contract is therefore derived by hand from the authoritative xAPIs reference documentation Broadcom publishes at developer.broadcom.com for VCF Automation 9.1 - it is reference documentation, not a published specification, and every operation below records the page it was read from in the source field."
++  },
++  "auth": {
++    "scheme": "bearer",
++    "header": "Authorization",
++    "valuePrefix": "Bearer ",
++    "note": "An access token is obtained from the tenant token endpoint and sent as a bearer token on every request."
++  },
++  "diagnosis": {
++    "chain": [
++      "getDeploymentRequests",
++      "getRequest",
++      "getRequestEvents",
++      "getEventLogs"
++    ],
++    "rule": "A failed deployment is diagnosed by listing the deployment's requests newest first, taking the most recent one whose status is FAILED, reading that request, listing its events oldest first, and retrieving the logs of every event whose hasLogs flag is true. The root cause is the first log line, in event order then row order, whose message begins with 'ERROR '. The request's own details field is not a diagnosis and is not treated as one."
++  },
++  "operations": [
++    {
++      "id": "getDeploymentRequests",
++      "method": "GET",
++      "path": "/deployment/api/deployments/{deploymentId}/requests",
++      "summary": "Get Deployment Requests - returns a page of the requests made against one deployment.",
++      "source": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/deployment/api/deployments/deploymentId/requests/get/",
++      "pathParams": [
++        {
++          "name": "deploymentId",
++          "type": "string",
++          "required": true,
++          "description": "Deployment ID"
++        }
++      ],
++      "queryParams": [
++        {
++          "name": "size",
++          "type": "integer",
++          "required": false,
++          "omitWhenUnset": true,
++          "description": "Page size. The reference documents a default of 20 and a minimum of 1, so an unset size is left out rather than sent as 0."
++        },
++        {
++          "name": "sort",
++          "type": "string",
++          "required": false,
++          "omitWhenUnset": false,
++          "description": "Sorting in property,(asc|desc) form. The client always sends createdAt,DESC because it depends on newest-first ordering to pick the most recent failure."
++        },
++        {
++          "name": "search",
++          "type": "string",
++          "required": false,
++          "omitWhenUnset": true,
++          "description": "Free-text search across the request's searchable fields."
++        },
++        {
++          "name": "page",
++          "type": "integer",
++          "required": false,
++          "omitWhenUnset": true,
++          "description": "Zero-based page index. Not used by this client, which reads only the first page."
++        },
++        {
++          "name": "deleted",
++          "type": "boolean",
++          "required": false,
++          "omitWhenUnset": true,
++          "description": "Include soft-deleted requests. Not used by this client."
++        },
++        {
++          "name": "inprogressRequests",
++          "type": "boolean",
++          "required": false,
++          "omitWhenUnset": true,
++          "description": "Restrict to in-progress requests. Not used by this client, which is looking for finished failures."
++        },
++        {
++          "name": "$top",
++          "type": "integer",
++          "required": false,
++          "omitWhenUnset": true,
++          "description": "OData-style maximum number of records. Not used by this client."
++        },
++        {
++          "name": "$skip",
++          "type": "integer",
++          "required": false,
++          "omitWhenUnset": true,
++          "description": "OData-style number of records to skip. Not used by this client."
++        },
++        {
++          "name": "$orderby",
++          "type": "string",
++          "required": false,
++          "omitWhenUnset": true,
++          "description": "OData-style sorting criteria. Not used by this client."
++        }
++      ],
++      "requestBody": null,
++      "responseSchema": {
++        "name": "PageRequest",
++        "contentField": "content",
++        "itemFields": [
++          "actionId",
++          "approvedAt",
++          "blueprintId",
++          "cancelable",
++          "catalogItemId",
++          "completedAt",
++          "completedTasks",
++          "createdAt",
++          "deploymentId",
++          "details",
++          "dismissed",
++          "estimatedCompletionTime",
++          "id",
++          "initializedAt",
++          "inputs",
++          "name",
++          "outputs",
++          "requestedBy",
++          "resourceIds",
++          "resources",
++          "status",
++          "totalTasks",
++          "updatedAt"
++        ],
++        "pageFields": [
++          "content",
++          "empty",
++          "first",
++          "last",
++          "number",
++          "numberOfElements",
++          "pageable",
++          "size",
++          "sort",
++          "totalElements",
++          "totalPages"
++        ]
++      }
++    },
++    {
++      "id": "getRequest",
++      "method": "GET",
++      "path": "/deployment/api/requests/{requestId}",
++      "summary": "Get Request - returns one deployment request by id.",
++      "source": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/deployment/api/requests/requestId/get/",
++      "pathParams": [
++        {
++          "name": "requestId",
++          "type": "string",
++          "required": true,
++          "description": "Request ID"
++        }
++      ],
++      "queryParams": [],
++      "requestBody": null,
++      "responseSchema": {
++        "name": "Request",
++        "fields": [
++          "actionId",
++          "approvedAt",
++          "blueprintId",
++          "cancelable",
++          "catalogItemId",
++          "completedAt",
++          "completedTasks",
++          "createdAt",
++          "deploymentId",
++          "details",
++          "dismissed",
++          "estimatedCompletionTime",
++          "id",
++          "initializedAt",
++          "inputs",
++          "name",
++          "outputs",
++          "requestedBy",
++          "resourceIds",
++          "resources",
++          "status",
++          "totalTasks",
++          "updatedAt"
++        ]
++      },
++      "note": "The reference documents no query parameters for this operation, so the client sends none and the request carries no query string at all."
++    },
++    {
++      "id": "getRequestEvents",
++      "method": "GET",
++      "path": "/deployment/api/requests/{requestId}/events",
++      "summary": "Get Request Events - returns a page of the events a request emitted.",
++      "source": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/deployment/api/requests/requestId/events/get/",
++      "pathParams": [
++        {
++          "name": "requestId",
++          "type": "string",
++          "required": true,
++          "description": "Request ID"
++        }
++      ],
++      "queryParams": [
++        {
++          "name": "size",
++          "type": "integer",
++          "required": false,
++          "omitWhenUnset": true,
++          "description": "Page size. Left out entirely when the caller sets none."
++        },
++        {
++          "name": "sort",
++          "type": "string",
++          "required": false,
++          "omitWhenUnset": false,
++          "description": "Sorting in property,(asc|desc) form. The client always sends timestamp,ASC so events arrive in the order they happened, which is the order the root cause is selected in."
++        },
++        {
++          "name": "page",
++          "type": "integer",
++          "required": false,
++          "omitWhenUnset": true,
++          "description": "Zero-based page index. Not used by this client."
++        }
++      ],
++      "requestBody": null,
++      "responseSchema": {
++        "name": "PageEvent",
++        "contentField": "content",
++        "itemFields": [
++          "id",
++          "name",
++          "details",
++          "timestamp",
++          "resourceName",
++          "resourceType",
++          "hasLogs",
++          "userEvent"
++        ],
++        "pageFields": [
++          "content",
++          "empty",
++          "first",
++          "last",
++          "number",
++          "numberOfElements",
++          "pageable",
++          "size",
++          "sort",
++          "totalElements",
++          "totalPages"
++        ],
++        "note": "hasLogs tells the client which events have logs to retrieve; an event without logs has no log resource to ask for."
++      }
++    },
++    {
++      "id": "getEventLogs",
++      "method": "GET",
++      "path": "/deployment/api/requests/{requestId}/events/{eventId}/logs",
++      "summary": "Get Event Logs - returns a slice of one event's log lines, from a given row onwards.",
++      "source": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/deployment/api/requests/requestId/events/eventId/logs/get/",
++      "pathParams": [
++        {
++          "name": "requestId",
++          "type": "string",
++          "required": true,
++          "description": "Request ID"
++        },
++        {
++          "name": "eventId",
++          "type": "string",
++          "required": true,
++          "description": "Event ID"
++        }
++      ],
++      "queryParams": [
++        {
++          "name": "sinceRow",
++          "type": "integer",
++          "required": false,
++          "omitWhenUnset": true,
++          "description": "A positive row number from which to show logs. The reference calls it positive, so the first page omits it entirely rather than sending sinceRow=0; later pages send the row after the last one already read."
++        }
++      ],
++      "requestBody": null,
++      "responseSchema": {
++        "name": "SliceEventLog",
++        "contentField": "content",
++        "itemFields": [
++          "id",
++          "message",
++          "rownum",
++          "timestamp",
++          "eof"
++        ],
++        "sliceFields": [
++          "content",
++          "empty",
++          "first",
++          "last",
++          "number",
++          "numberOfElements",
++          "pageable",
++          "size",
++          "sort"
++        ],
++        "note": "This operation is a slice rather than a page: it carries no total count, so the client follows last and rownum to reach the end of the log."
++      }
++    }
++  ]
++}
+diff --git a/docs/official_sources.json b/docs/official_sources.json
+new file mode 100644
+index 0000000..ff2b632
+--- /dev/null
++++ b/docs/official_sources.json
+@@ -0,0 +1,53 @@
++{
++  "note": "Every developer.broadcom.com page read while deriving docs/contract.json. VCF Automation has no specification in vmware/vcf-api-specs, so these reference pages are the authoritative source for the contract.",
++  "sources": [
++    {
++      "url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/",
++      "title": "VM Apps Org - Deployment (VCF Automation API 9.1) - overview",
++      "operation": "api-overview",
++      "fetchedOn": "2026-08-11"
++    },
++    {
++      "url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/operation-index/",
++      "title": "VM Apps Org - Deployment - operations index",
++      "operation": "api-overview",
++      "fetchedOn": "2026-08-11"
++    },
++    {
++      "url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/requests/",
++      "title": "Requests APIs - resource group covering the request, event and log operations",
++      "operation": "api-overview",
++      "fetchedOn": "2026-08-11"
++    },
++    {
++      "url": "https://developer.broadcom.com/xapis/org-management-vm-apps-org/latest/",
++      "title": "Org Management - VM Apps Org - access token and API version conventions",
++      "operation": "auth",
++      "fetchedOn": "2026-08-11"
++    },
++    {
++      "url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/deployment/api/deployments/deploymentId/requests/get/",
++      "title": "Get Deployment Requests",
++      "operation": "getDeploymentRequests",
++      "fetchedOn": "2026-08-11"
++    },
++    {
++      "url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/deployment/api/requests/requestId/get/",
++      "title": "Get Request",
++      "operation": "getRequest",
++      "fetchedOn": "2026-08-11"
++    },
++    {
++      "url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/deployment/api/requests/requestId/events/get/",
++      "title": "Get Request Events",
++      "operation": "getRequestEvents",
++      "fetchedOn": "2026-08-11"
++    },
++    {
++      "url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/deployment/api/requests/requestId/events/eventId/logs/get/",
++      "title": "Get Event Logs",
++      "operation": "getEventLogs",
++      "fetchedOn": "2026-08-11"
++    }
++  ]
++}
+diff --git a/mockapi/mockapi.go b/mockapi/mockapi.go
+index 74ef131..ba1b472 100644
+--- a/mockapi/mockapi.go
++++ b/mockapi/mockapi.go
+@@ -7,8 +7,15 @@
+ package mockapi
+ 
+ import (
+-	"errors"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net"
+ 	"net/http"
++	"os"
++	"strconv"
++	"strings"
++	"sync"
+ )
+ 
+ // Event is one event emitted by a deployment request.
+@@ -84,20 +91,358 @@ type Recorded struct {
+ 
+ // Server is a running loopback API.
+ type Server struct {
+-	url string
++	url  string
++	http *http.Server
++	opts Options
++
++	mu  sync.Mutex
++	log []Recorded
++}
++
++// contract is the subset of docs/contract.json the mock pins itself to.
++type contract struct {
++	Operations []struct {
++		ID     string `json:"id"`
++		Method string `json:"method"`
++		Path   string `json:"path"`
++	} `json:"operations"`
++}
++
++// The operations this mock knows how to serve, and the paths it expects for
++// them. A contract naming anything else is refused.
++var served = map[string]string{
++	"getDeploymentRequests": "/deployment/api/deployments/{deploymentId}/requests",
++	"getRequest":            "/deployment/api/requests/{requestId}",
++	"getRequestEvents":      "/deployment/api/requests/{requestId}/events",
++	"getEventLogs":          "/deployment/api/requests/{requestId}/events/{eventId}/logs",
+ }
+ 
+ // Start reads the contract, registers a route for each operation it names and
+ // starts listening on loopback.
+ func Start(opts Options) (*Server, error) {
+-	return nil, errors.New("mockapi: Start not implemented")
++	if opts.ContractPath == "" {
++		return nil, fmt.Errorf("mockapi: ContractPath is required")
++	}
++	if opts.Token == "" {
++		return nil, fmt.Errorf("mockapi: Token is required")
++	}
++
++	raw, err := os.ReadFile(opts.ContractPath)
++	if err != nil {
++		return nil, fmt.Errorf("mockapi: reading contract: %w", err)
++	}
++	var c contract
++	if err := json.Unmarshal(raw, &c); err != nil {
++		return nil, fmt.Errorf("mockapi: parsing contract %s: %w", opts.ContractPath, err)
++	}
++	if len(c.Operations) == 0 {
++		return nil, fmt.Errorf("mockapi: contract %s names no operations", opts.ContractPath)
++	}
++
++	s := &Server{opts: opts}
++	mux := http.NewServeMux()
++
++	for _, op := range c.Operations {
++		want, ok := served[op.ID]
++		if !ok {
++			return nil, fmt.Errorf("mockapi: contract names operation %q, which this mock does not serve", op.ID)
++		}
++		if op.Path != want {
++			return nil, fmt.Errorf("mockapi: operation %q has path %q, want %q", op.ID, op.Path, want)
++		}
++		method := op.Method
++		if method == "" {
++			method = http.MethodGet
++		}
++
++		var h http.HandlerFunc
++		switch op.ID {
++		case "getDeploymentRequests":
++			h = s.handleDeploymentRequests
++		case "getRequest":
++			h = s.handleRequest
++		case "getRequestEvents":
++			h = s.handleRequestEvents
++		case "getEventLogs":
++			h = s.handleEventLogs
++		}
++		// Go's ServeMux takes the contract's template verbatim: {deploymentId}
++		// and friends are wildcards, and a routed path reached with another
++		// method answers 405 on its own.
++		mux.HandleFunc(method+" "+op.Path, s.authed(h))
++	}
++
++	listener, err := net.Listen("tcp4", "127.0.0.1:0")
++	if err != nil {
++		return nil, fmt.Errorf("mockapi: listen on loopback: %w", err)
++	}
++	s.http = &http.Server{Handler: s.record(mux)}
++	s.url = "http://" + listener.Addr().String()
++	go func() { _ = s.http.Serve(listener) }()
++	return s, nil
+ }
+ 
+ // URL is the scheme://host:port root the server is listening on.
+ func (s *Server) URL() string { return s.url }
+ 
+ // Close shuts the server down.
+-func (s *Server) Close() {}
++func (s *Server) Close() {
++	if s.http != nil {
++		s.http.Close()
++	}
++}
+ 
+ // Requests returns a copy of the request log, oldest first.
+-func (s *Server) Requests() []Recorded { return nil }
++func (s *Server) Requests() []Recorded {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	out := make([]Recorded, len(s.log))
++	for i, rec := range s.log {
++		cp := rec
++		cp.Header = rec.Header.Clone()
++		if rec.Body != nil {
++			cp.Body = append([]byte(nil), rec.Body...)
++		}
++		out[i] = cp
++	}
++	return out
++}
++
++// record logs every request, routed or not, before handing it on.
++func (s *Server) record(next http.Handler) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
++		r.Body.Close()
++
++		s.mu.Lock()
++		s.log = append(s.log, Recorded{
++			Method:   r.Method,
++			Path:     r.URL.Path,
++			RawQuery: r.URL.RawQuery,
++			Header:   r.Header.Clone(),
++			Body:     body,
++		})
++		s.mu.Unlock()
++
++		r.Body = io.NopCloser(strings.NewReader(string(body)))
++		next.ServeHTTP(w, r)
++	})
++}
++
++// authed rejects a missing or wrong bearer token. The request is recorded
++// either way, because record wraps the whole mux.
++func (s *Server) authed(next http.HandlerFunc) http.HandlerFunc {
++	return func(w http.ResponseWriter, r *http.Request) {
++		if r.Header.Get("Authorization") != "Bearer "+s.opts.Token {
++			writeJSON(w, http.StatusUnauthorized, map[string]any{
++				"message": "unauthorized",
++			})
++			return
++		}
++		next(w, r)
++	}
++}
++
++// ---------------------------------------------------------------------------
++// handlers
++// ---------------------------------------------------------------------------
++
++func (s *Server) handleDeploymentRequests(w http.ResponseWriter, r *http.Request) {
++	if s.opts.RequestsStatus != 0 {
++		writeStatus(w, s.opts.RequestsStatus)
++		return
++	}
++	dep, ok := s.opts.Deployments[r.PathValue("deploymentId")]
++	if !ok {
++		writeJSON(w, http.StatusNotFound, map[string]any{"message": "deployment not found"})
++		return
++	}
++
++	// Served in seeded order; the mock records sort and size but does not apply
++	// them, so a test can see exactly what the client asked for.
++	content := make([]map[string]any, 0, len(dep.Requests))
++	for _, req := range dep.Requests {
++		content = append(content, requestJSON(req))
++	}
++	writeJSON(w, http.StatusOK, pageJSON(content))
++}
++
++func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
++	if s.opts.RequestStatus != 0 {
++		writeStatus(w, s.opts.RequestStatus)
++		return
++	}
++	req, ok := s.findRequest(r.PathValue("requestId"))
++	if !ok {
++		writeJSON(w, http.StatusNotFound, map[string]any{"message": "request not found"})
++		return
++	}
++	writeJSON(w, http.StatusOK, requestJSON(req))
++}
++
++func (s *Server) handleRequestEvents(w http.ResponseWriter, r *http.Request) {
++	if s.opts.EventsStatus != 0 {
++		writeStatus(w, s.opts.EventsStatus)
++		return
++	}
++	req, ok := s.findRequest(r.PathValue("requestId"))
++	if !ok {
++		writeJSON(w, http.StatusNotFound, map[string]any{"message": "request not found"})
++		return
++	}
++
++	content := make([]map[string]any, 0, len(req.Events))
++	for _, ev := range req.Events {
++		content = append(content, map[string]any{
++			"id":           ev.ID,
++			"name":         ev.Name,
++			"details":      ev.Details,
++			"timestamp":    ev.Timestamp,
++			"resourceName": ev.ResourceName,
++			"resourceType": ev.ResourceType,
++			"hasLogs":      ev.HasLogs,
++			"userEvent":    ev.UserEvent,
++		})
++	}
++	writeJSON(w, http.StatusOK, pageJSON(content))
++}
++
++func (s *Server) handleEventLogs(w http.ResponseWriter, r *http.Request) {
++	if s.opts.LogsStatus != 0 {
++		writeStatus(w, s.opts.LogsStatus)
++		return
++	}
++	req, ok := s.findRequest(r.PathValue("requestId"))
++	if !ok {
++		writeJSON(w, http.StatusNotFound, map[string]any{"message": "request not found"})
++		return
++	}
++	var ev Event
++	var found bool
++	for _, e := range req.Events {
++		if e.ID == r.PathValue("eventId") {
++			ev, found = e, true
++			break
++		}
++	}
++	// An event with no logs has no log resource at all.
++	if !found || !ev.HasLogs {
++		writeJSON(w, http.StatusNotFound, map[string]any{"message": "event logs not found"})
++		return
++	}
++
++	// sinceRow is a positive row number, inclusive. Absent means from the top.
++	from := 1
++	if raw := r.URL.Query().Get("sinceRow"); raw != "" {
++		n, err := strconv.Atoi(raw)
++		if err != nil {
++			writeJSON(w, http.StatusBadRequest, map[string]any{"message": "sinceRow must be an integer"})
++			return
++		}
++		if n > 1 {
++			from = n
++		}
++	}
++
++	total := len(ev.Logs)
++	start := from - 1
++	if start > total {
++		start = total
++	}
++	end := total
++	if s.opts.LogPageSize > 0 && start+s.opts.LogPageSize < end {
++		end = start + s.opts.LogPageSize
++	}
++
++	content := make([]map[string]any, 0, end-start)
++	for i := start; i < end; i++ {
++		rownum := i + 1
++		content = append(content, map[string]any{
++			// Deterministic: derived from the event and the row, never random.
++			"id":        fmt.Sprintf("%s-log-%d", ev.ID, rownum),
++			"message":   ev.Logs[i],
++			"rownum":    rownum,
++			"timestamp": ev.Timestamp,
++			"eof":       rownum == total,
++		})
++	}
++
++	writeJSON(w, http.StatusOK, map[string]any{
++		"content":          content,
++		"empty":            len(content) == 0,
++		"first":            start == 0,
++		"last":             end >= total,
++		"number":           0,
++		"numberOfElements": len(content),
++		"size":             len(content),
++	})
++}
++
++// ---------------------------------------------------------------------------
++// helpers
++// ---------------------------------------------------------------------------
++
++func (s *Server) findRequest(id string) (Request, bool) {
++	for _, key := range slicesSortedKeys(s.opts.Deployments) {
++		for _, req := range s.opts.Deployments[key].Requests {
++			if req.ID == id {
++				return req, true
++			}
++		}
++	}
++	return Request{}, false
++}
++
++// slicesSortedKeys keeps the lookup order stable so the server behaves the same
++// way on every run.
++func slicesSortedKeys(m map[string]Deployment) []string {
++	keys := make([]string, 0, len(m))
++	for k := range m {
++		keys = append(keys, k)
++	}
++	// Small maps; an insertion sort keeps this dependency-free.
++	for i := 1; i < len(keys); i++ {
++		for j := i; j > 0 && keys[j] < keys[j-1]; j-- {
++			keys[j], keys[j-1] = keys[j-1], keys[j]
++		}
++	}
++	return keys
++}
++
++func requestJSON(req Request) map[string]any {
++	return map[string]any{
++		"id":        req.ID,
++		"name":      req.Name,
++		"status":    req.Status,
++		"details":   req.Details,
++		"createdAt": req.CreatedAt,
++		"updatedAt": req.UpdatedAt,
++	}
++}
++
++func pageJSON(content []map[string]any) map[string]any {
++	return map[string]any{
++		"content":          content,
++		"empty":            len(content) == 0,
++		"first":            true,
++		"last":             true,
++		"number":           0,
++		"numberOfElements": len(content),
++		"size":             len(content),
++		"totalElements":    len(content),
++		"totalPages":       1,
++	}
++}
++
++func writeJSON(w http.ResponseWriter, status int, body any) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(status)
++	_ = json.NewEncoder(w).Encode(body)
++}
++
++func writeStatus(w http.ResponseWriter, status int) {
++	writeJSON(w, status, map[string]any{
++		"message": http.StatusText(status),
++	})
++}
+diff --git a/mockapi/mockapi_test.go b/mockapi/mockapi_test.go
+new file mode 100644
+index 0000000..9dc5183
+--- /dev/null
++++ b/mockapi/mockapi_test.go
+@@ -0,0 +1,328 @@
++package mockapi_test
++
++import (
++	"encoding/json"
++	"net/http"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"testing"
++
++	"example.com/vcfdiag/mockapi"
++)
++
++const testToken = "tkn-mock-test"
++
++func contractPath() string { return filepath.Join("..", "docs", "contract.json") }
++
++func seed() map[string]mockapi.Deployment {
++	return map[string]mockapi.Deployment{
++		"dep-1": {Requests: []mockapi.Request{
++			{ID: "r-1", Name: "Update", Status: "FAILED", Details: "Request failed.", Events: []mockapi.Event{
++				{ID: "e-1", Name: "Allocate", Timestamp: "2026-01-01T00:00:00Z", HasLogs: true,
++					Logs: []string{"one", "two", "three", "four", "five"}},
++				{ID: "e-2", Name: "Notify", Timestamp: "2026-01-01T00:01:00Z", UserEvent: true},
++			}},
++		}},
++	}
++}
++
++func start(t *testing.T, opts mockapi.Options) *mockapi.Server {
++	t.Helper()
++	if opts.ContractPath == "" {
++		opts.ContractPath = contractPath()
++	}
++	if opts.Token == "" {
++		opts.Token = testToken
++	}
++	srv, err := mockapi.Start(opts)
++	if err != nil {
++		t.Fatalf("Start: %v", err)
++	}
++	t.Cleanup(srv.Close)
++	return srv
++}
++
++func get(t *testing.T, target, auth string) (*http.Response, []byte) {
++	t.Helper()
++	req, err := http.NewRequest("GET", target, nil)
++	if err != nil {
++		t.Fatalf("new request: %v", err)
++	}
++	if auth != "" {
++		req.Header.Set("Authorization", auth)
++	}
++	resp, err := http.DefaultClient.Do(req)
++	if err != nil {
++		t.Fatalf("do: %v", err)
++	}
++	defer resp.Body.Close()
++	body := make([]byte, 0)
++	buf := make([]byte, 4096)
++	for {
++		n, err := resp.Body.Read(buf)
++		body = append(body, buf[:n]...)
++		if err != nil {
++			break
++		}
++	}
++	return resp, body
++}
++
++func TestStartValidation(t *testing.T) {
++	badJSON := filepath.Join(t.TempDir(), "bad.json")
++	if err := os.WriteFile(badJSON, []byte("nope"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	empty := writeContract(t, []map[string]any{})
++	unknown := writeContract(t, []map[string]any{
++		{"id": "getCatalogItems", "method": "GET", "path": "/catalog/api/items"},
++	})
++	wrongPath := writeContract(t, []map[string]any{
++		{"id": "getRequest", "method": "GET", "path": "/deployment/api/request/{requestId}"},
++	})
++
++	cases := []struct {
++		name     string
++		opts     mockapi.Options
++		wantErr  bool
++		contains string
++	}{
++		{"ok", mockapi.Options{ContractPath: contractPath(), Token: testToken}, false, ""},
++		{"no contract path", mockapi.Options{Token: testToken}, true, "ContractPath"},
++		{"no token", mockapi.Options{ContractPath: contractPath()}, true, "Token"},
++		{"missing file", mockapi.Options{ContractPath: "no/such.json", Token: testToken}, true, ""},
++		{"not json", mockapi.Options{ContractPath: badJSON, Token: testToken}, true, ""},
++		{"no operations", mockapi.Options{ContractPath: empty, Token: testToken}, true, "no operations"},
++		{"unserved operation", mockapi.Options{ContractPath: unknown, Token: testToken}, true, "getCatalogItems"},
++		{"wrong path for operation", mockapi.Options{ContractPath: wrongPath, Token: testToken}, true, "getRequest"},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			srv, err := mockapi.Start(tc.opts)
++			if srv != nil {
++				defer srv.Close()
++			}
++			if tc.wantErr {
++				if err == nil {
++					t.Fatal("want an error, got none")
++				}
++				if tc.contains != "" && !strings.Contains(err.Error(), tc.contains) {
++					t.Errorf("error %q does not contain %q", err, tc.contains)
++				}
++				return
++			}
++			if err != nil {
++				t.Fatalf("unexpected error: %v", err)
++			}
++			if !strings.HasPrefix(srv.URL(), "http://127.0.0.1:") {
++				t.Errorf("URL = %q, want a loopback address", srv.URL())
++			}
++		})
++	}
++}
++
++func TestRouting(t *testing.T) {
++	srv := start(t, mockapi.Options{Deployments: seed(), LogPageSize: 2})
++	auth := "Bearer " + testToken
++
++	cases := []struct {
++		name   string
++		target string
++		auth   string
++		want   int
++	}{
++		{"deployment requests", "/deployment/api/deployments/dep-1/requests", auth, 200},
++		{"request", "/deployment/api/requests/r-1", auth, 200},
++		{"events", "/deployment/api/requests/r-1/events", auth, 200},
++		{"logs", "/deployment/api/requests/r-1/events/e-1/logs", auth, 200},
++		{"unknown deployment", "/deployment/api/deployments/nope/requests", auth, 404},
++		{"unknown request", "/deployment/api/requests/nope", auth, 404},
++		{"unknown event", "/deployment/api/requests/r-1/events/nope/logs", auth, 404},
++		{"event without logs", "/deployment/api/requests/r-1/events/e-2/logs", auth, 404},
++		{"unrouted", "/deployment/api/resources", auth, 404},
++		{"no auth", "/deployment/api/requests/r-1", "", 401},
++		{"bad auth", "/deployment/api/requests/r-1", "Bearer wrong", 401},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			resp, _ := get(t, srv.URL()+tc.target, tc.auth)
++			if resp.StatusCode != tc.want {
++				t.Errorf("GET %s = %d, want %d", tc.target, resp.StatusCode, tc.want)
++			}
++		})
++	}
++
++	t.Run("wrong method on a routed path", func(t *testing.T) {
++		req, err := http.NewRequest("DELETE", srv.URL()+"/deployment/api/requests/r-1", nil)
++		if err != nil {
++			t.Fatal(err)
++		}
++		req.Header.Set("Authorization", auth)
++		resp, err := http.DefaultClient.Do(req)
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer resp.Body.Close()
++		if resp.StatusCode != http.StatusMethodNotAllowed {
++			t.Errorf("status = %d, want 405", resp.StatusCode)
++		}
++	})
++}
++
++func TestLogSlicing(t *testing.T) {
++	cases := []struct {
++		name        string
++		pageSize    int
++		sinceRow    string
++		wantRows    []int
++		wantLast    bool
++		wantEOFLast bool
++	}{
++		{"first page of two", 2, "", []int{1, 2}, false, false},
++		{"second page of two", 2, "3", []int{3, 4}, false, false},
++		{"final partial page", 2, "5", []int{5}, true, true},
++		{"whole log at once", 0, "", []int{1, 2, 3, 4, 5}, true, true},
++		{"sinceRow past the end", 2, "9", nil, true, false},
++		{"sinceRow of one is the top", 2, "1", []int{1, 2}, false, false},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			srv := start(t, mockapi.Options{Deployments: seed(), LogPageSize: tc.pageSize})
++			target := srv.URL() + "/deployment/api/requests/r-1/events/e-1/logs"
++			if tc.sinceRow != "" {
++				target += "?sinceRow=" + tc.sinceRow
++			}
++			resp, body := get(t, target, "Bearer "+testToken)
++			if resp.StatusCode != 200 {
++				t.Fatalf("status = %d, want 200", resp.StatusCode)
++			}
++
++			var slice struct {
++				Content []struct {
++					Rownum int    `json:"rownum"`
++					EOF    bool   `json:"eof"`
++					ID     string `json:"id"`
++				} `json:"content"`
++				Last bool `json:"last"`
++			}
++			if err := json.Unmarshal(body, &slice); err != nil {
++				t.Fatalf("decode: %v (%s)", err, body)
++			}
++
++			var gotRows []int
++			for _, l := range slice.Content {
++				gotRows = append(gotRows, l.Rownum)
++			}
++			if len(gotRows) != len(tc.wantRows) {
++				t.Fatalf("rows = %v, want %v", gotRows, tc.wantRows)
++			}
++			for i, want := range tc.wantRows {
++				if gotRows[i] != want {
++					t.Errorf("rows = %v, want %v", gotRows, tc.wantRows)
++					break
++				}
++			}
++			if slice.Last != tc.wantLast {
++				t.Errorf("last = %v, want %v", slice.Last, tc.wantLast)
++			}
++			if tc.wantEOFLast && len(slice.Content) > 0 {
++				if !slice.Content[len(slice.Content)-1].EOF {
++					t.Error("final row is not marked eof")
++				}
++			}
++			// Ids are derived from the event and row, never generated.
++			for _, l := range slice.Content {
++				if !strings.HasPrefix(l.ID, "e-1-log-") {
++					t.Errorf("log id %q is not derived from the event and row", l.ID)
++				}
++			}
++		})
++	}
++}
++
++func TestStatusOverrides(t *testing.T) {
++	cases := []struct {
++		name   string
++		opts   mockapi.Options
++		target string
++		want   int
++	}{
++		{"requests", mockapi.Options{RequestsStatus: 503}, "/deployment/api/deployments/dep-1/requests", 503},
++		{"request", mockapi.Options{RequestStatus: 500}, "/deployment/api/requests/r-1", 500},
++		{"events", mockapi.Options{EventsStatus: 502}, "/deployment/api/requests/r-1/events", 502},
++		{"logs", mockapi.Options{LogsStatus: 418}, "/deployment/api/requests/r-1/events/e-1/logs", 418},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			opts := tc.opts
++			opts.Deployments = seed()
++			srv := start(t, opts)
++			resp, _ := get(t, srv.URL()+tc.target, "Bearer "+testToken)
++			if resp.StatusCode != tc.want {
++				t.Errorf("status = %d, want %d", resp.StatusCode, tc.want)
++			}
++		})
++	}
++}
++
++func TestRequestLog(t *testing.T) {
++	srv := start(t, mockapi.Options{Deployments: seed(), LogPageSize: 2})
++
++	get(t, srv.URL()+"/deployment/api/requests/r-1", "Bearer "+testToken)
++	get(t, srv.URL()+"/deployment/api/requests/r-1/events?size=7&sort=timestamp,ASC", "Bearer "+testToken)
++	get(t, srv.URL()+"/unrouted", "")
++
++	recs := srv.Requests()
++	if len(recs) != 3 {
++		t.Fatalf("recorded %d requests, want 3 (unrouted and unauthorised requests are recorded too)", len(recs))
++	}
++	if recs[1].RawQuery != "size=7&sort=timestamp,ASC" {
++		t.Errorf("RawQuery = %q, want the query verbatim", recs[1].RawQuery)
++	}
++	if recs[2].Path != "/unrouted" {
++		t.Errorf("Path = %q, want /unrouted", recs[2].Path)
++	}
++
++	t.Run("the log is a copy", func(t *testing.T) {
++		a := srv.Requests()
++		a[0].Path = "/tampered"
++		a[0].Header.Set("Authorization", "tampered")
++		b := srv.Requests()
++		if b[0].Path == "/tampered" {
++			t.Error("Requests() shares its slice with the server")
++		}
++		if b[0].Header.Get("Authorization") == "tampered" {
++			t.Error("Requests() shares its header map with the server")
++		}
++	})
++
++	t.Run("concurrent reads and writes", func(t *testing.T) {
++		var wg sync.WaitGroup
++		for range 6 {
++			wg.Add(2)
++			go func() { defer wg.Done(); get(t, srv.URL()+"/deployment/api/requests/r-1", "Bearer "+testToken) }()
++			go func() { defer wg.Done(); srv.Requests() }()
++		}
++		wg.Wait()
++	})
++}
++
++func writeContract(t *testing.T, ops []map[string]any) string {
++	t.Helper()
++	raw, err := json.Marshal(map[string]any{
++		"api":        map[string]any{"version": "9.1"},
++		"operations": ops,
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	p := filepath.Join(t.TempDir(), "contract.json")
++	if err := os.WriteFile(p, raw, 0o644); err != nil {
++		t.Fatal(err)
++	}
++	return p
++}

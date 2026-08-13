@@ -1,0 +1,210 @@
+diff --git a/src/vcfa_storage/client.py b/src/vcfa_storage/client.py
+index dadc863..8d1942e 100644
+--- a/src/vcfa_storage/client.py
++++ b/src/vcfa_storage/client.py
+@@ -9,6 +9,15 @@ Standard library only. The only host this client may contact is the
+ ``base_url`` it was constructed with.
+ """
+ 
++import json
++import urllib.error
++import urllib.parse
++import urllib.request
++
++class _RejectRedirects(urllib.request.HTTPRedirectHandler):
++    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
++        return None
++
+ from .errors import (  # noqa: F401
+     ApiError,
+     DatastoreNotFoundError,
+@@ -61,6 +70,59 @@ class StorageProfileClient:
+         self.api_version = api_version
+         self.timeout = timeout
++        self._opener = urllib.request.build_opener(_RejectRedirects)
+ 
++    # -- transport -----------------------------------------------------------
++
++    def _url(self, path, *segments):
++        """Join a contract path with URL-encoded path parameters."""
++        for segment in segments:
++            path += "/" + urllib.parse.quote(str(segment), safe="")
++        # apiVersion is optional on all three operations. Unset means the
++        # parameter is absent, not present-and-empty.
++        if self.api_version is not None:
++            path += "?" + urllib.parse.urlencode({"apiVersion": self.api_version})
++        return self.base_url + path
++
++    def _send(self, method, url, body=None):
++        """Return ``(status, decoded_body)``. Never raises for a non-2xx."""
++        headers = {
++            "Authorization": "Bearer " + self.access_token,
++            "Accept": "application/json",
++        }
++        data = None
++        if body is not None:
++            data = json.dumps(body).encode("utf-8")
++            # Content-Type belongs only on a request that carries a body.
++            headers["Content-Type"] = "application/json"
++
++        request = urllib.request.Request(url, data=data, headers=headers, method=method)
++        try:
++            with self._opener.open(request, timeout=self.timeout) as response:
++                return response.status, self._decode(response.read())
++        except urllib.error.HTTPError as error:
++            return error.code, self._decode(error.read())
++
++    @staticmethod
++    def _decode(raw):
++        if not raw:
++            return None
++        text = raw.decode("utf-8", "replace")
++        try:
++            return json.loads(text)
++        except ValueError:
++            return text
++
++    @staticmethod
++    def _message(payload, fallback):
++        """Pull a human-readable line out of a ServiceErrorResponse."""
++        if isinstance(payload, dict):
++            for key in ("message", "messageId"):
++                if payload.get(key):
++                    return payload[key]
++        elif isinstance(payload, str) and payload.strip():
++            return payload.strip()
++        return fallback
++
+     # -- reads ---------------------------------------------------------------
+ 
+     def get_region(self, region_id):
+@@ -69,7 +131,17 @@ class StorageProfileClient:
+         Returns ``None`` when the appliance answers 404. Raises
+         :class:`ApiError` on any other non-2xx status.
+         """
+-        raise NotImplementedError("get_region is not implemented yet")
++        status, payload = self._send("GET", self._url(REGIONS_PATH, region_id))
++        if status == 404:
++            return None
++        if not 200 <= status < 300:
++            raise ApiError(
++                "getRegion %r failed with HTTP %d: %s"
++                % (region_id, status, self._message(payload, "no error body")),
++                status=status,
++                body=payload,
++            )
++        return payload
+ 
+     def get_datastore(self, datastore_id):
+         """Call ``getFabricVsphereDatastore`` and return the decoded datastore.
+@@ -77,10 +149,64 @@ class StorageProfileClient:
+         Returns ``None`` when the appliance answers 404. Raises
+         :class:`ApiError` on any other non-2xx status.
+         """
+-        raise NotImplementedError("get_datastore is not implemented yet")
++        status, payload = self._send("GET", self._url(DATASTORES_PATH, datastore_id))
++        if status == 404:
++            return None
++        if not 200 <= status < 300:
++            raise ApiError(
++                "getFabricVsphereDatastore %r failed with HTTP %d: %s"
++                % (datastore_id, status, self._message(payload, "no error body")),
++                status=status,
++                body=payload,
++            )
++        return payload
+ 
+     # -- gated mutation ------------------------------------------------------
+ 
++    def _precheck(self, region_id, datastore_id):
++        """Run the contract's placement precheck.
++
++        Raises a :class:`PrecheckFailed` subclass rather than returning a
++        verdict, so there is no way to fall through to the mutation holding a
++        failed precheck.
++        """
++        region = self.get_region(region_id)
++        if region is None:
++            raise RegionNotFoundError(
++                "region %r does not exist on this appliance, so no storage class was created"
++                % (region_id,)
++            )
++
++        if datastore_id is None:
++            # Nothing to cross-check, and no id to look a datastore up with.
++            return
++
++        datastore = self.get_datastore(datastore_id)
++        if datastore is None:
++            raise DatastoreNotFoundError(
++                "datastore %r does not exist on this appliance, so no storage class was created"
++                % (datastore_id,)
++            )
++
++        region_datacenter = region.get("externalRegionId")
++        datastore_datacenter = datastore.get("externalRegionId")
++        if datastore_datacenter != region_datacenter:
++            raise PlacementMismatchError(
++                "datastore %r sits in datacenter %r but region %r points at %r, so no storage "
++                "class was created"
++                % (datastore_id, datastore_datacenter, region_id, region_datacenter)
++            )
++
++        cloud_account_id = region.get("cloudAccountId")
++        if cloud_account_id:
++            reachable = datastore.get("cloudAccountIds") or []
++            if cloud_account_id not in reachable:
++                raise PlacementMismatchError(
++                    "region %r belongs to cloud account %r but datastore %r is only reachable "
++                    "from %r, so no storage class was created"
++                    % (region_id, cloud_account_id, datastore_id, list(reachable))
++                )
++
+     def create_vsphere_storage_profile(
+         self,
+         name,
+@@ -113,4 +239,43 @@ class StorageProfileClient:
+         in which case no mutating request has been sent. Raises
+         :class:`ApiError` when the create itself fails.
+         """
+-        raise NotImplementedError("create_vsphere_storage_profile is not implemented yet")
++        # The gate. Nothing below this line runs unless the precheck passed,
++        # and the precheck itself only ever reads.
++        self._precheck(region_id, datastore_id)
++
++        supplied = {
++            "description": description,
++            "supports_encryption": supports_encryption,
++            "tags": tags,
++            "datastore_id": datastore_id,
++            "storage_policy_id": storage_policy_id,
++            "provisioning_type": provisioning_type,
++            "limit_iops": limit_iops,
++            "disk_mode": disk_mode,
++            "disk_type": disk_type,
++            "priority": priority,
++            "storage_filter_type": storage_filter_type,
++            "tags_to_match": tags_to_match,
++            "compute_host_id": compute_host_id,
++        }
++
++        body = {"name": name, "regionId": region_id, "defaultItem": default_item}
++        for argument, field in OPTIONAL_BODY_FIELDS:
++            value = supplied[argument]
++            # Presence turns on whether the caller supplied a value, never on
++            # whether it is truthy: priority=0 and supportsEncryption=False are
++            # real instructions, while None means "leave it at the default".
++            if value is not None:
++                body[field] = value
++
++        status, payload = self._send(
++            "POST", self._url(STORAGE_PROFILES_VSPHERE_PATH), body=body
++        )
++        if not 200 <= status < 300:
++            raise ApiError(
++                "createVsphereStorageProfile %r failed with HTTP %d: %s"
++                % (name, status, self._message(payload, "no error body")),
++                status=status,
++                body=payload,
++            )
++        return payload

@@ -1,0 +1,464 @@
+--- a/src/com/broadcom/vcf/sddclcm/SddcLcmClient.java
++++ b/src/com/broadcom/vcf/sddclcm/SddcLcmClient.java
+@@ -1,7 +1,20 @@
+ package com.broadcom.vcf.sddclcm;
+ 
+ import java.io.IOException;
++import java.net.URI;
++import java.net.URLEncoder;
+ import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.time.Duration;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.Set;
++import java.util.function.Function;
++import java.util.regex.Pattern;
+ 
+ /**
+  * Focused VMware Cloud Foundation 9.1 SDDC LCM client.
+@@ -143,14 +156,31 @@
+         }
+     }
+ 
+-    /** Signals that the exercise stub has not been implemented yet. */
+-    static final class NotImplemented extends UnsupportedOperationException {
+-        private static final long serialVersionUID = 1L;
+-
+-        NotImplemented() {
+-            super("the SDDC LCM fleet component upgrade workflow is not implemented");
+-        }
+-    }
++    private static final String OPERATION_GET_HEALTH = "getHealth";
++    private static final String OPERATION_GET_COMPONENTS = "getComponents";
++    private static final String OPERATION_RESOLVE_DEPOT_COMPONENTS = "resolveDepotComponents";
++    private static final String OPERATION_PERFORM_COMPONENT_ACTION = "performComponentAction";
++    private static final String OPERATION_GET_TASK = "getTask";
++
++    private static final String PATH_HEALTH = "/v1/health";
++    private static final String PATH_COMPONENTS = "/v1/components";
++    private static final String PATH_DEPOT_COMPONENTS = "/v1/depot/components";
++    private static final String PATH_COMPONENT = "/v1/components/";
++    private static final String PATH_TASK = "/v1/tasks/";
++
++    private static final String FLEET_SCOPE = "FLEET";
++    private static final String ACTION_PRECHECK = "precheck";
++    private static final String ACTION_APPLY = "apply";
++
++    private static final Set<String> TERMINAL_STATUSES = Set.of("SUCCEEDED", "FAILED", "CANCELED");
++    private static final Set<String> TASK_STATUSES =
++            Set.of("PENDING", "SCHEDULED", "RUNNING", "SUCCEEDED", "FAILED", "CANCELED");
++
++    private static final Pattern UUID_PATTERN =
++            Pattern.compile("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$");
++
++    private static final Duration POLL_INTERVAL = Duration.ofMillis(25);
++    private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(30);
+ 
+     private final String serviceRootUrl;
+     private final AccessTokenSource tokens;
+@@ -169,7 +200,33 @@
+      * @throws IllegalArgumentException when an argument is unusable
+      */
+     public static SddcLcmClient create(String serviceRootUrl, AccessTokenSource tokens, HttpClient httpClient) {
+-        return new SddcLcmClient(serviceRootUrl, tokens, httpClient);
++        if (serviceRootUrl == null || serviceRootUrl.isBlank()) {
++            throw new IllegalArgumentException("the SDDC LCM service root must not be blank");
++        }
++        if (tokens == null) {
++            throw new IllegalArgumentException("an access token source is required");
++        }
++        URI root;
++        try {
++            root = URI.create(serviceRootUrl.strip());
++        } catch (IllegalArgumentException failure) {
++            throw new IllegalArgumentException("the SDDC LCM service root is not a valid URI", failure);
++        }
++        String scheme = root.getScheme() == null ? "" : root.getScheme().toLowerCase(Locale.ROOT);
++        if (!scheme.equals("http") && !scheme.equals("https")) {
++            throw new IllegalArgumentException("the SDDC LCM service root must use http or https, saw '" + scheme + "'");
++        }
++        if (root.getHost() == null || root.getHost().isBlank()) {
++            throw new IllegalArgumentException("the SDDC LCM service root must name a host");
++        }
++        if (root.getQuery() != null || root.getFragment() != null) {
++            throw new IllegalArgumentException("the SDDC LCM service root must carry no query or fragment");
++        }
++        String normalized = root.toString();
++        while (normalized.endsWith("/")) {
++            normalized = normalized.substring(0, normalized.length() - 1);
++        }
++        return new SddcLcmClient(normalized, tokens, httpClient == null ? HttpClient.newHttpClient() : httpClient);
+     }
+ 
+     /**
+@@ -179,6 +236,364 @@
+      */
+     public UpgradeOutcome upgradeFleetComponent(UpgradeRequest request)
+             throws SddcLcmException, IOException, InterruptedException {
+-        throw new NotImplemented();
++        validate(request);
++        Session session = new Session(requireUsableToken(tokens.currentAccessToken()));
++
++        probeHealth(session);
++        Component component = findFleetComponent(session, request.componentType());
++        String binaryUrl = resolveBinaryUrl(session, request);
++
++        String precheckBody = Json.write(componentUpgradeSpec(request, binaryUrl, false));
++        String precheckTaskId = submitComponentAction(session, component.id(), ACTION_PRECHECK, precheckBody, null);
++        String precheckStatus = awaitTask(session, precheckTaskId, ACTION_PRECHECK);
++
++        String applyBody = Json.write(componentUpgradeSpec(request, binaryUrl, true));
++        String applyTaskId = submitComponentAction(session, component.id(), ACTION_APPLY, applyBody,
++                request.correlationId());
++        String applyStatus = awaitTask(session, applyTaskId, ACTION_APPLY);
++
++        return new UpgradeOutcome(
++                component.id(),
++                component.componentType(),
++                component.version(),
++                request.targetVersion(),
++                binaryUrl,
++                precheckTaskId,
++                precheckStatus,
++                applyTaskId,
++                applyStatus,
++                session.refreshes());
++    }
++
++    // ------------------------------------------------------------- workflow
++
++    private void probeHealth(Session session) throws SddcLcmException, IOException, InterruptedException {
++        String body = exchange(OPERATION_GET_HEALTH, session, 200, token -> HttpRequest.newBuilder()
++                .uri(URI.create(serviceRootUrl + PATH_HEALTH))
++                .timeout(REQUEST_TIMEOUT)
++                .header("Accept", "application/json")
++                .GET()
++                .build());
++        Map<String, Object> health = requireObject(OPERATION_GET_HEALTH, body);
++        if (!Boolean.TRUE.equals(health.get("up"))) {
++            throw new ProtocolException(OPERATION_GET_HEALTH, "the SDDC LCM service does not report itself as up");
++        }
++    }
++
++    private record Component(String id, String componentType, String version) {
++    }
++
++    private Component findFleetComponent(Session session, String componentType)
++            throws SddcLcmException, IOException, InterruptedException {
++        String target = serviceRootUrl + PATH_COMPONENTS + "?scope=" + encode(FLEET_SCOPE);
++        String body = exchange(OPERATION_GET_COMPONENTS, session, 200, token -> HttpRequest.newBuilder()
++                .uri(URI.create(target))
++                .timeout(REQUEST_TIMEOUT)
++                .header("Accept", "application/json")
++                .header("Authorization", "Bearer " + token)
++                .GET()
++                .build());
++
++        Map<String, Object> document = requireObject(OPERATION_GET_COMPONENTS, body);
++        if (!(document.get("components") instanceof List<?> components)) {
++            throw new ProtocolException(OPERATION_GET_COMPONENTS, "the response carries no 'components' array");
++        }
++        List<Component> matches = new ArrayList<>();
++        for (Object entry : components) {
++            if (!(entry instanceof Map<?, ?> component)) {
++                throw new ProtocolException(OPERATION_GET_COMPONENTS, "the 'components' array holds a non-object entry");
++            }
++            if (!FLEET_SCOPE.equals(component.get("scope"))) {
++                throw new ProtocolException(OPERATION_GET_COMPONENTS,
++                        "a fleet-scoped listing returned a component scoped '" + component.get("scope") + "'");
++            }
++            if (!componentType.equals(component.get("componentType"))) {
++                continue;
++            }
++            String id = text(component.get("id"));
++            String version = text(component.get("version"));
++            if (id == null || version == null) {
++                throw new ProtocolException(OPERATION_GET_COMPONENTS,
++                        "the listed '" + componentType + "' component carries no identifier or version");
++            }
++            matches.add(new Component(id, componentType, version));
++        }
++        if (matches.isEmpty()) {
++            throw new ProtocolException(OPERATION_GET_COMPONENTS,
++                    "no fleet-scoped component of type '" + componentType + "' is registered with SDDC LCM");
++        }
++        if (matches.size() > 1) {
++            throw new ProtocolException(OPERATION_GET_COMPONENTS,
++                    matches.size() + " fleet-scoped components of type '" + componentType + "' are registered");
++        }
++        return matches.get(0);
++    }
++
++    private String resolveBinaryUrl(Session session, UpgradeRequest request)
++            throws SddcLcmException, IOException, InterruptedException {
++        String payload = Json.write(depotComponentsSpec(request));
++        String body = exchange(OPERATION_RESOLVE_DEPOT_COMPONENTS, session, 200, token -> HttpRequest.newBuilder()
++                .uri(URI.create(serviceRootUrl + PATH_DEPOT_COMPONENTS))
++                .timeout(REQUEST_TIMEOUT)
++                .header("Accept", "application/json")
++                .header("Content-Type", "application/json")
++                .header("Authorization", "Bearer " + token)
++                .POST(HttpRequest.BodyPublishers.ofString(payload, StandardCharsets.UTF_8))
++                .build());
++
++        Map<String, Object> document = requireObject(OPERATION_RESOLVE_DEPOT_COMPONENTS, body);
++        if (!(document.get("componentVersions") instanceof List<?> resolutions)) {
++            throw new ProtocolException(OPERATION_RESOLVE_DEPOT_COMPONENTS,
++                    "the response carries no 'componentVersions' array");
++        }
++        for (Object entry : resolutions) {
++            if (!(entry instanceof Map<?, ?> resolution)) {
++                throw new ProtocolException(OPERATION_RESOLVE_DEPOT_COMPONENTS,
++                        "the 'componentVersions' array holds a non-object entry");
++            }
++            if (!request.componentType().equals(resolution.get("component"))
++                    || !request.targetVersion().equals(resolution.get("version"))) {
++                continue;
++            }
++            String binaryUrl = text(resolution.get("binaryUrl"));
++            if (binaryUrl == null) {
++                throw new ProtocolException(OPERATION_RESOLVE_DEPOT_COMPONENTS,
++                        "the depot resolved no binary url for " + request.componentType() + " "
++                                + request.targetVersion());
++            }
++            return binaryUrl;
++        }
++        throw new ProtocolException(OPERATION_RESOLVE_DEPOT_COMPONENTS,
++                "the depot did not resolve " + request.componentType() + " " + request.targetVersion());
++    }
++
++    private String submitComponentAction(Session session, String componentId, String action, String payload,
++                                         String correlationId)
++            throws SddcLcmException, IOException, InterruptedException {
++        String target = serviceRootUrl + PATH_COMPONENT + componentId + "?action=" + encode(action);
++        String body = exchange(OPERATION_PERFORM_COMPONENT_ACTION, session, 202, token -> {
++            HttpRequest.Builder builder = HttpRequest.newBuilder()
++                    .uri(URI.create(target))
++                    .timeout(REQUEST_TIMEOUT)
++                    .header("Accept", "application/json")
++                    .header("Content-Type", "application/json")
++                    .header("Authorization", "Bearer " + token);
++            if (correlationId != null) {
++                builder.header("X-Correlation-Id", correlationId);
++            }
++            return builder.POST(HttpRequest.BodyPublishers.ofString(payload, StandardCharsets.UTF_8)).build();
++        });
++
++        Map<String, Object> task = requireObject(OPERATION_PERFORM_COMPONENT_ACTION, body);
++        String taskId = text(task.get("id"));
++        if (taskId == null) {
++            throw new ProtocolException(OPERATION_PERFORM_COMPONENT_ACTION,
++                    "the accepted '" + action + "' action returned a task without an identifier");
++        }
++        return taskId;
++    }
++
++    private String awaitTask(Session session, String taskId, String taskType)
++            throws SddcLcmException, IOException, InterruptedException {
++        String target = serviceRootUrl + PATH_TASK + taskId;
++        boolean firstPoll = true;
++        while (true) {
++            if (!firstPoll) {
++                Thread.sleep(POLL_INTERVAL.toMillis());
++            }
++            firstPoll = false;
++            String body = exchange(OPERATION_GET_TASK, session, 200, token -> HttpRequest.newBuilder()
++                    .uri(URI.create(target))
++                    .timeout(REQUEST_TIMEOUT)
++                    .header("Accept", "application/json")
++                    .header("Authorization", "Bearer " + token)
++                    .GET()
++                    .build());
++
++            Map<String, Object> task = requireObject(OPERATION_GET_TASK, body);
++            if (!taskId.equals(task.get("id"))) {
++                throw new ProtocolException(OPERATION_GET_TASK,
++                        "polling task " + taskId + " returned task " + task.get("id"));
++            }
++            String status = text(task.get("status"));
++            if (status == null || !TASK_STATUSES.contains(status)) {
++                throw new ProtocolException(OPERATION_GET_TASK,
++                        "task " + taskId + " reported the unknown status '" + task.get("status") + "'");
++            }
++            if (!TERMINAL_STATUSES.contains(status)) {
++                continue;
++            }
++            if (!"SUCCEEDED".equals(status)) {
++                throw new TaskFailureException(taskId, taskType, status);
++            }
++            return status;
++        }
++    }
++
++    // ------------------------------------------------------------- encoding
++
++    private static Map<String, Object> depotComponentsSpec(UpgradeRequest request) {
++        Map<String, Object> fleetDepotSpec = Json.object();
++        fleetDepotSpec.put("fqdn", request.fleetDepotFqdn());
++        fleetDepotSpec.put("certificate", request.fleetDepotCertificate());
++
++        Map<String, Object> componentVersion = Json.object();
++        componentVersion.put("component", request.componentType());
++        componentVersion.put("version", request.targetVersion());
++
++        List<Object> componentVersions = Json.array();
++        componentVersions.add(componentVersion);
++
++        // DepotComponentsSpec.version is optional and unset here, so it is omitted.
++        Map<String, Object> spec = Json.object();
++        spec.put("fleetDepotSpec", fleetDepotSpec);
++        spec.put("componentVersions", componentVersions);
++        return spec;
++    }
++
++    private static Map<String, Object> componentUpgradeSpec(UpgradeRequest request, String binaryUrl, boolean apply) {
++        Map<String, Object> software = Json.object();
++        software.put("version", request.targetVersion());
++
++        Map<String, Object> depot = Json.object();
++        depot.put("url", binaryUrl);
++        if (apply) {
++            // DepotSpec.certificate is optional: the precheck omits it entirely.
++            List<Object> certificates = Json.array();
++            certificates.add(request.fleetDepotCertificate());
++            depot.put("certificate", certificates);
++        }
++
++        // ComponentDesiredSpec.policy, userInput and additionalInput stay unset, so they are omitted.
++        Map<String, Object> componentSpec = Json.object();
++        componentSpec.put("software", software);
++        componentSpec.put("depot", depot);
++
++        Map<String, Object> spec = Json.object();
++        spec.put("componentSpec", componentSpec);
++        if (apply) {
++            Map<String, Object> lcmPlatformSpec = Json.object();
++            lcmPlatformSpec.put("performBackup", request.performBackup());
++            spec.put("lcmPlatformSpec", lcmPlatformSpec);
++            spec.put("correlationId", request.correlationId());
++        }
++        return spec;
++    }
++
++    // ------------------------------------------------------------- transport
++
++    private static final class Session {
++        private String accessToken;
++        private int refreshes;
++
++        Session(String accessToken) {
++            this.accessToken = accessToken;
++        }
++
++        String accessToken() {
++            return accessToken;
++        }
++
++        int refreshes() {
++            return refreshes;
++        }
++
++        boolean renewed() {
++            return refreshes > 0;
++        }
++
++        void adopt(String replacement) {
++            accessToken = replacement;
++            refreshes++;
++        }
++    }
++
++    private String exchange(String operationId, Session session, int expectedStatus,
++                            Function<String, HttpRequest> factory)
++            throws SddcLcmException, IOException, InterruptedException {
++        HttpResponse<String> response = httpClient.send(factory.apply(session.accessToken()),
++                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++
++        if (response.statusCode() == 401 && !session.renewed()) {
++            // The session outlived the access token. Renew once and resume the
++            // identical interrupted request rather than replaying finished work.
++            session.adopt(requireUsableToken(tokens.refreshAccessToken()));
++            response = httpClient.send(factory.apply(session.accessToken()),
++                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++        }
++
++        if (response.statusCode() != expectedStatus) {
++            throw new ApiException(operationId, response.statusCode(), errorCodeOf(response.body()));
++        }
++        return response.body();
++    }
++
++    private static String errorCodeOf(String body) {
++        if (body == null || body.isBlank()) {
++            return null;
++        }
++        try {
++            return text(Json.parseObject(body).get("code"));
++        } catch (RuntimeException ignored) {
++            return null;
++        }
++    }
++
++    private static Map<String, Object> requireObject(String operationId, String body) throws ProtocolException {
++        try {
++            return Json.parseObject(body);
++        } catch (RuntimeException failure) {
++            throw new ProtocolException(operationId, "the response body is not a JSON object");
++        }
++    }
++
++    // ------------------------------------------------------------ validation
++
++    private static void validate(UpgradeRequest request) {
++        if (request == null) {
++            throw new IllegalArgumentException("an upgrade request is required");
++        }
++        requireText(request.componentType(), "componentType");
++        requireText(request.targetVersion(), "targetVersion");
++        requireText(request.fleetDepotFqdn(), "fleetDepotFqdn");
++        requireText(request.fleetDepotCertificate(), "fleetDepotCertificate");
++        requireText(request.correlationId(), "correlationId");
++        if (!UUID_PATTERN.matcher(request.correlationId().strip()).matches()) {
++            throw new IllegalArgumentException("correlationId must be a uuid as the specification declares");
++        }
++        if (!request.correlationId().equals(request.correlationId().strip())) {
++            throw new IllegalArgumentException("correlationId must not carry surrounding whitespace");
++        }
++    }
++
++    private static void requireText(String value, String name) {
++        if (value == null || value.isBlank()) {
++            throw new IllegalArgumentException(name + " must not be blank");
++        }
++    }
++
++    private static String requireUsableToken(String token) {
++        if (token == null || token.isBlank()) {
++            throw new IllegalArgumentException("the access token source supplied a blank access token");
++        }
++        for (int index = 0; index < token.length(); index++) {
++            char character = token.charAt(index);
++            if (character < 0x21 || character > 0x7e) {
++                throw new IllegalArgumentException(
++                        "the access token source supplied a token that is not safe to send in a header");
++            }
++        }
++        return token;
++    }
++
++    private static String encode(String value) {
++        return URLEncoder.encode(value, StandardCharsets.UTF_8);
++    }
++
++    private static String text(Object value) {
++        if (value instanceof String string && !string.isBlank()) {
++            return string;
++        }
++        return null;
+     }
+ }

@@ -1,0 +1,225 @@
+--- a/src/VcfOpsNetworks.DataSource/VcfOpsNetworks.DataSource.psm1
++++ b/src/VcfOpsNetworks.DataSource/VcfOpsNetworks.DataSource.psm1
+@@ -1,5 +1,81 @@
+ Set-StrictMode -Version Latest
+ 
++# Projection of docs/contract.json. The contract is derived from
++# specifications/vcf-operations/vcf-operations-for-networks-openapi.yaml at
++# commit c3f3b52c845dd967cabbc21680e893292077d5ba of vmware/vcf-api-specs.
++$script:BasePath = '/api/ni'
++$script:Operations = @{
++    create               = @{ Method = 'POST';   Path = '/auth/token' }
++    listExpandedNodes    = @{ Method = 'GET';    Path = '/infra/expanded-nodes' }
++    validateVCenter      = @{ Method = 'POST';   Path = '/data-sources/vcenters/validate' }
++    addVcenterDatasource = @{ Method = 'POST';   Path = '/data-sources/vcenters' }
++    delete               = @{ Method = 'DELETE'; Path = '/auth/token' }
++}
++
++function Get-VcfNetworksProperty {
++    param($InputObject, [string] $Name)
++
++    if ($null -eq $InputObject) { return $null }
++    $property = $InputObject.PSObject.Properties[$Name]
++    if ($null -eq $property) { return $null }
++    return $property.Value
++}
++
++function Invoke-VcfNetworksOperation {
++    param(
++        [Parameter(Mandatory)][string] $BaseUri,
++        [Parameter(Mandatory)][string] $OperationId,
++        [string] $Token,
++        $Body
++    )
++
++    $operation = $script:Operations[$OperationId]
++    if ($null -eq $operation) {
++        throw [System.InvalidOperationException]::new(
++            "Operation '$OperationId' is not named by the contract."
++        )
++    }
++
++    $headers = @{ 'Accept' = 'application/json' }
++    if (-not [string]::IsNullOrEmpty($Token)) {
++        $headers['Authorization'] = "NetworkInsight $Token"
++    }
++
++    $arguments = @{
++        Uri                = $BaseUri + $operation.Path
++        Method             = $operation.Method
++        Headers            = $headers
++        SkipHttpErrorCheck = $true
++        MaximumRedirection = 0
++        ErrorAction        = 'Stop'
++    }
++
++    # An unset optional field is absent from the request body, never present
++    # with an empty or null value, so only bind a body when there is one.
++    if ($null -ne $Body) {
++        $arguments['Body'] = ($Body | ConvertTo-Json -Depth 8 -Compress)
++        $arguments['ContentType'] = 'application/json'
++    }
++
++    $response = Invoke-WebRequest @arguments
++
++    $payload = $null
++    if (-not [string]::IsNullOrWhiteSpace([string]$response.Content)) {
++        try {
++            $payload = $response.Content | ConvertFrom-Json
++        }
++        catch {
++            $payload = $null
++        }
++    }
++
++    return [pscustomobject]@{
++        OperationId = $OperationId
++        StatusCode  = [int]$response.StatusCode
++        Payload     = $payload
++    }
++}
++
+ <#
+ .SYNOPSIS
+     Onboards a vCenter data source into VCF Operations for Networks behind a
+@@ -66,7 +142,139 @@
+         [switch] $Disabled
+     )
+ 
+-    throw [System.NotImplementedException]::new('Add-VcfNetworksVcenterDataSource is not implemented yet.')
++    $hasFqdn = -not [string]::IsNullOrWhiteSpace($VcenterFqdn)
++    $hasIp = -not [string]::IsNullOrWhiteSpace($VcenterIp)
++    if ($hasFqdn -eq $hasIp) {
++        throw [System.ArgumentException]::new(
++            'Supply exactly one of -VcenterFqdn or -VcenterIp; the specification requires either IP or FQDN, not both.'
++        )
++    }
++
++    $baseUri = $Server.TrimEnd('/') + $script:BasePath
++
++    $authBody = [ordered]@{
++        username = $Credential.UserName
++        password = $Credential.GetNetworkCredential().Password
++    }
++    if (-not [string]::IsNullOrWhiteSpace($AuthDomain)) {
++        $authBody['domain'] = [ordered]@{
++            domain_type = 'LDAP'
++            value       = $AuthDomain
++        }
++    }
++
++    $authResult = Invoke-VcfNetworksOperation -BaseUri $baseUri -OperationId 'create' -Body $authBody
++    $token = [string](Get-VcfNetworksProperty -InputObject $authResult.Payload -Name 'token')
++    if ($authResult.StatusCode -ne 200 -or [string]::IsNullOrWhiteSpace($token)) {
++        throw [System.InvalidOperationException]::new(
++            "Authentication against '$Server' failed with status $($authResult.StatusCode)."
++        )
++    }
++
++    try {
++        $nodesResult = Invoke-VcfNetworksOperation -BaseUri $baseUri -OperationId 'listExpandedNodes' -Token $token
++        if ($nodesResult.StatusCode -ne 200) {
++            throw [System.InvalidOperationException]::new(
++                "listExpandedNodes failed with status $($nodesResult.StatusCode)."
++            )
++        }
++
++        $nodes = @(Get-VcfNetworksProperty -InputObject $nodesResult.Payload -Name 'results')
++        $wanted = $CollectorName.Trim()
++        $collectors = @($nodes | Where-Object {
++            $nodeType = [string](Get-VcfNetworksProperty -InputObject $_ -Name 'node_type')
++            $nodeName = [string](Get-VcfNetworksProperty -InputObject $_ -Name 'name')
++            $nodeType -ceq 'PROXY_VM' -and $nodeName.Trim() -ieq $wanted
++        })
++
++        if ($collectors.Count -ne 1) {
++            throw [System.InvalidOperationException]::new(
++                "Expected exactly one PROXY_VM collector named '$CollectorName', found $($collectors.Count)."
++            )
++        }
++
++        $collector = $collectors[0]
++        $health = Get-VcfNetworksProperty -InputObject $collector -Name 'health'
++        $healthStatus = [string](Get-VcfNetworksProperty -InputObject $health -Name 'health_status')
++        if ($healthStatus -cne 'HEALTHY') {
++            throw [System.InvalidOperationException]::new(
++                "Collector '$CollectorName' reports health status '$healthStatus'; refusing to register a data source against it."
++            )
++        }
++
++        $proxyId = [string](Get-VcfNetworksProperty -InputObject $collector -Name 'id')
++        if ([string]::IsNullOrWhiteSpace($proxyId)) {
++            throw [System.InvalidOperationException]::new(
++                "Collector '$CollectorName' does not expose an entity id."
++            )
++        }
++
++        $vcenterCredentials = [ordered]@{
++            username = $VcenterCredential.UserName
++            password = $VcenterCredential.GetNetworkCredential().Password
++        }
++
++        $validationBody = [ordered]@{}
++        if ($hasFqdn) {
++            $validationBody['fqdn'] = $VcenterFqdn
++        }
++        else {
++            $validationBody['ip'] = $VcenterIp
++        }
++        $validationBody['proxy_id'] = $proxyId
++        $validationBody['credentials'] = $vcenterCredentials
++
++        $validation = Invoke-VcfNetworksOperation -BaseUri $baseUri -OperationId 'validateVCenter' -Token $token -Body $validationBody
++
++        # Fail closed: the precheck passes only on HTTP 200 carrying a
++        # BaseDataSourceValidationResponse whose code is 200.
++        $validationCode = Get-VcfNetworksProperty -InputObject $validation.Payload -Name 'code'
++        $validationMessage = [string](Get-VcfNetworksProperty -InputObject $validation.Payload -Name 'message')
++        if ($validation.StatusCode -ne 200 -or $null -eq $validationCode -or [int]$validationCode -ne 200) {
++            $reportedCode = if ($null -eq $validationCode) { '<absent>' } else { [string]$validationCode }
++            $reportedMessage = if ([string]::IsNullOrWhiteSpace($validationMessage)) { '<no message>' } else { $validationMessage }
++            throw [System.InvalidOperationException]::new(
++                "validateVCenter did not succeed (HTTP $($validation.StatusCode), code $reportedCode): $reportedMessage. " +
++                'The mutating addVcenterDatasource operation was not attempted.'
++            )
++        }
++
++        $addBody = [ordered]@{}
++        if ($hasFqdn) {
++            $addBody['fqdn'] = $VcenterFqdn
++        }
++        else {
++            $addBody['ip'] = $VcenterIp
++        }
++        $addBody['proxy_id'] = $proxyId
++        $addBody['nickname'] = $Nickname
++        if ($Disabled.IsPresent) {
++            $addBody['enabled'] = $false
++        }
++        if (-not [string]::IsNullOrWhiteSpace($Notes)) {
++            $addBody['notes'] = $Notes
++        }
++        $addBody['credentials'] = $vcenterCredentials
++
++        $added = Invoke-VcfNetworksOperation -BaseUri $baseUri -OperationId 'addVcenterDatasource' -Token $token -Body $addBody
++        if ($added.StatusCode -ne 201 -or $null -eq $added.Payload) {
++            throw [System.InvalidOperationException]::new(
++                "addVcenterDatasource failed with status $($added.StatusCode)."
++            )
++        }
++
++        return $added.Payload
++    }
++    finally {
++        # The specification advises deleting auth tokens after use; do so on
++        # every path, including the gated ones.
++        try {
++            $null = Invoke-VcfNetworksOperation -BaseUri $baseUri -OperationId 'delete' -Token $token
++        }
++        catch {
++            Write-Verbose "Failed to delete the auth token: $($_.Exception.Message)"
++        }
++    }
+ }
+ 
+ Export-ModuleMember -Function 'Add-VcfNetworksVcenterDataSource'

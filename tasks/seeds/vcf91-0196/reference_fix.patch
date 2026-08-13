@@ -1,0 +1,489 @@
+diff --git a/VcfOperationsLogClient.java b/VcfOperationsLogClient.java
+new file mode 100644
+index 0000000..2f98a9d
+--- /dev/null
++++ b/VcfOperationsLogClient.java
+@@ -0,0 +1,483 @@
++import java.io.IOException;
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * Minimal VCF Operations 9.1 Log Management client for failure diagnosis.
++ * The wire subset is pinned in docs/contract.json.
++ */
++public final class VcfOperationsLogClient {
++    private static final String SEARCH_PATH = "/api/v2/logs/search";
++    private static final String FAILED_EVENT = "LCM_UPGRADE_FAILED";
++
++    private final HttpClient http;
++    private final String baseUrl;
++    private final String jwtToken;
++
++    public record Diagnosis(
++            String correlationId,
++            String workloadDomainId,
++            String workflowId,
++            String component,
++            String failureCode,
++            String eventText,
++            String rootCauseText) {
++    }
++
++    public static final class VcfApiException extends RuntimeException {
++        private final int statusCode;
++        private final String errorCode;
++
++        private VcfApiException(int statusCode, String errorCode, String detail, String credential) {
++            super(safeMessage(statusCode, errorCode, detail, credential));
++            this.statusCode = statusCode;
++            this.errorCode = errorCode;
++        }
++
++        private static String safeMessage(int statusCode, String errorCode, String detail, String credential) {
++            String message = "VCF Log Management API " + statusCode
++                    + (errorCode == null ? "" : " " + errorCode)
++                    + (detail == null ? "" : ": " + detail);
++            return message.replace(credential, "[REDACTED]");
++        }
++
++        public int statusCode() {
++            return statusCode;
++        }
++
++        public String errorCode() {
++            return errorCode;
++        }
++    }
++
++    private record Hit(String text, Map<String, Object> fields) {
++    }
++
++    public VcfOperationsLogClient(String baseUrl, String jwtToken) {
++        this.baseUrl = requireText(baseUrl, "baseUrl").replaceAll("/+$", "");
++        this.jwtToken = requireText(jwtToken, "jwtToken");
++        URI parsed = URI.create(this.baseUrl);
++        if (parsed.getScheme() == null || parsed.getHost() == null) {
++            throw new IllegalArgumentException("baseUrl must be an absolute HTTP URL");
++        }
++        this.http = HttpClient.newBuilder()
++                .followRedirects(HttpClient.Redirect.NEVER)
++                .build();
++    }
++
++    public Diagnosis diagnoseUpgradeFailure(
++            String workloadDomainId,
++            String correlationId,
++            String fromInclusive,
++            String toInclusive) {
++        workloadDomainId = requireText(workloadDomainId, "workloadDomainId");
++        correlationId = requireText(correlationId, "correlationId");
++        fromInclusive = requireText(fromInclusive, "fromInclusive");
++        toInclusive = requireText(toInclusive, "toInclusive");
++
++        List<Hit> eventHits = search(eventBody(
++                workloadDomainId, correlationId, fromInclusive, toInclusive));
++        Hit event = null;
++        for (Hit hit : eventHits) {
++            if (FAILED_EVENT.equals(stringField(hit, "event_type"))
++                    && workloadDomainId.equals(stringField(hit, "workload_domain_id"))
++                    && correlationId.equals(stringField(hit, "correlation_id"))) {
++                event = hit;
++                break;
++            }
++        }
++        if (event == null) {
++            throw new IllegalStateException("failed lifecycle event evidence is missing");
++        }
++
++        String workflowId = requiredStringField(event, "workflow_id", "event");
++        String component = requiredStringField(event, "component", "event");
++        List<Hit> logHits = search(logBody(
++                correlationId, workflowId, component, fromInclusive, toInclusive));
++
++        Hit rootCause = null;
++        for (Hit hit : logHits) {
++            if (Boolean.TRUE.equals(hit.fields().get("root_cause"))
++                    && workflowId.equals(stringField(hit, "workflow_id"))
++                    && component.equals(stringField(hit, "component"))) {
++                rootCause = hit;
++                break;
++            }
++        }
++        if (rootCause == null) {
++            throw new IllegalStateException("root-cause log evidence is missing");
++        }
++
++        String failureCode = requiredStringField(rootCause, "error_code", "root-cause log");
++        return new Diagnosis(
++                correlationId,
++                workloadDomainId,
++                workflowId,
++                component,
++                failureCode,
++                event.text(),
++                rootCause.text());
++    }
++
++    private List<Hit> search(String body) {
++        HttpRequest request = HttpRequest.newBuilder(URI.create(baseUrl + SEARCH_PATH))
++                .header("X-JWT-Token", jwtToken)
++                .header("Accept", "application/json")
++                .header("Content-Type", "application/json")
++                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
++                .build();
++
++        HttpResponse<String> response;
++        try {
++            response = http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++        } catch (InterruptedException ex) {
++            Thread.currentThread().interrupt();
++            throw new IllegalStateException("interrupted while querying VCF Log Management", ex);
++        } catch (IOException ex) {
++            throw new IllegalStateException("I/O failure while querying VCF Log Management", ex);
++        }
++
++        if (response.statusCode() != 200) {
++            throw apiError(response.statusCode(), response.body(), jwtToken);
++        }
++        return decodeSearchResponse(response.body());
++    }
++
++    private static VcfApiException apiError(int status, String body, String credential) {
++        String errorCode = null;
++        String message = null;
++        try {
++            Map<String, Object> error = object(MiniJson.parse(body), "ErrorBody");
++            errorCode = optionalString(error.get("errorCode"));
++            message = optionalString(error.get("errorMessage"));
++        } catch (RuntimeException ignored) {
++            message = "malformed error response";
++        }
++        return new VcfApiException(status, errorCode, message, credential);
++    }
++
++    private static List<Hit> decodeSearchResponse(String body) {
++        try {
++            Map<String, Object> root = object(MiniJson.parse(body), "QueryResponse");
++            if (Boolean.TRUE.equals(root.get("timedOut"))) {
++                String reason = optionalString(root.get("failureReason"));
++                String message = optionalString(root.get("failureMessage"));
++                throw new IllegalStateException("log search timed out"
++                        + (reason == null ? "" : " (" + reason + ")")
++                        + (message == null ? "" : ": " + message));
++            }
++            Map<String, Object> events = object(root.get("events"), "QueryResponse.events");
++            List<Object> rawHits = array(events.get("hits"), "EventsResult.hits");
++            List<Hit> hits = new ArrayList<>();
++            for (Object rawHit : rawHits) {
++                Map<String, Object> hit = object(rawHit, "LogMessage");
++                Map<String, Object> content = object(hit.get("msgContent"), "LogMessage.msgContent");
++                String text = requiredString(content.get("originalText"), "MessageContent.originalText");
++                List<Object> rawFields = array(content.get("fields"), "MessageContent.fields");
++                Map<String, Object> fields = new LinkedHashMap<>();
++                for (Object rawField : rawFields) {
++                    Map<String, Object> field = object(rawField, "Field");
++                    String name = requiredString(field.get("internalName"), "Field.internalName");
++                    if (!field.containsKey("value")) {
++                        throw new IllegalStateException("Field.value is missing for " + name);
++                    }
++                    fields.put(name, field.get("value"));
++                }
++                hits.add(new Hit(text, Map.copyOf(fields)));
++            }
++            return List.copyOf(hits);
++        } catch (IllegalStateException ex) {
++            throw ex;
++        } catch (RuntimeException ex) {
++            throw new IllegalStateException("malformed QueryResponse", ex);
++        }
++    }
++
++    private static String eventBody(String domain, String correlation, String from, String to) {
++        return "{\"indices\":[\"vcf-events\"],\"query\":{\"bool\":{\"filter\":["
++                + match("workload_domain_id", domain) + ","
++                + match("correlation_id", correlation) + ","
++                + match("event_type", FAILED_EVENT) + ","
++                + range(from, to)
++                + "]}}},\"size\":100,\"sort\":[{\"@timestamp\":{\"order\":\"asc\"}}],\"trackTotalHits\":true}";
++    }
++
++    private static String logBody(
++            String correlation, String workflowId, String component, String from, String to) {
++        return "{\"indices\":[\"vcf-logs\"],\"query\":{\"bool\":{\"filter\":["
++                + match("correlation_id", correlation) + ","
++                + match("workflow_id", workflowId) + ","
++                + match("component", component) + ","
++                + range(from, to)
++                + "]}}},\"size\":200,\"sort\":[{\"@timestamp\":{\"order\":\"asc\"}}],\"trackTotalHits\":true}";
++    }
++
++    private static String match(String field, String value) {
++        return "{\"match_phrase\":{\"" + field + "\":" + quote(value) + "}}";
++    }
++
++    private static String range(String from, String to) {
++        return "{\"range\":{\"@timestamp\":{\"gte\":" + quote(from)
++                + ",\"lte\":" + quote(to) + "}}}";
++    }
++
++    private static String quote(String value) {
++        StringBuilder out = new StringBuilder(value.length() + 2).append('"');
++        for (int i = 0; i < value.length(); i++) {
++            char ch = value.charAt(i);
++            switch (ch) {
++                case '"' -> out.append("\\\"");
++                case '\\' -> out.append("\\\\");
++                case '\b' -> out.append("\\b");
++                case '\f' -> out.append("\\f");
++                case '\n' -> out.append("\\n");
++                case '\r' -> out.append("\\r");
++                case '\t' -> out.append("\\t");
++                default -> {
++                    if (ch < 0x20) {
++                        out.append("\\u");
++                        String hex = Integer.toHexString(ch);
++                        out.append("0".repeat(4 - hex.length())).append(hex);
++                    } else {
++                        out.append(ch);
++                    }
++                }
++            }
++        }
++        return out.append('"').toString();
++    }
++
++    private static String stringField(Hit hit, String name) {
++        return optionalString(hit.fields().get(name));
++    }
++
++    private static String requiredStringField(Hit hit, String name, String owner) {
++        String value = stringField(hit, name);
++        if (value == null || value.isBlank()) {
++            throw new IllegalStateException(owner + " field " + name + " is missing");
++        }
++        return value;
++    }
++
++    private static String requireText(String value, String name) {
++        if (value == null || value.isBlank()) {
++            throw new IllegalArgumentException(name + " must not be blank");
++        }
++        return value;
++    }
++
++    private static String requiredString(Object value, String name) {
++        if (value instanceof String text) {
++            return text;
++        }
++        throw new IllegalStateException(name + " must be a string");
++    }
++
++    private static String optionalString(Object value) {
++        return value instanceof String text ? text : null;
++    }
++
++    @SuppressWarnings("unchecked")
++    private static Map<String, Object> object(Object value, String name) {
++        if (value instanceof Map<?, ?> map) {
++            return (Map<String, Object>) map;
++        }
++        throw new IllegalStateException(name + " must be an object");
++    }
++
++    @SuppressWarnings("unchecked")
++    private static List<Object> array(Object value, String name) {
++        if (value instanceof List<?> list) {
++            return (List<Object>) list;
++        }
++        throw new IllegalStateException(name + " must be an array");
++    }
++
++    /** Small strict JSON reader, kept private so the client remains one source file. */
++    private static final class MiniJson {
++        private final String source;
++        private int index;
++
++        private MiniJson(String source) {
++            this.source = source;
++        }
++
++        static Object parse(String source) {
++            MiniJson parser = new MiniJson(source);
++            Object value = parser.value();
++            parser.space();
++            if (parser.index != source.length()) {
++                throw new IllegalArgumentException("trailing JSON data");
++            }
++            return value;
++        }
++
++        private Object value() {
++            space();
++            if (index >= source.length()) {
++                throw new IllegalArgumentException("unexpected end of JSON");
++            }
++            return switch (source.charAt(index)) {
++                case '{' -> object();
++                case '[' -> array();
++                case '"' -> string();
++                case 't' -> literal("true", Boolean.TRUE);
++                case 'f' -> literal("false", Boolean.FALSE);
++                case 'n' -> literal("null", null);
++                default -> number();
++            };
++        }
++
++        private Map<String, Object> object() {
++            index++;
++            Map<String, Object> result = new LinkedHashMap<>();
++            space();
++            if (take('}')) {
++                return result;
++            }
++            while (true) {
++                space();
++                if (index >= source.length() || source.charAt(index) != '"') {
++                    throw new IllegalArgumentException("object key must be a string");
++                }
++                String key = string();
++                space();
++                expect(':');
++                result.put(key, value());
++                space();
++                if (take('}')) {
++                    return result;
++                }
++                expect(',');
++            }
++        }
++
++        private List<Object> array() {
++            index++;
++            List<Object> result = new ArrayList<>();
++            space();
++            if (take(']')) {
++                return result;
++            }
++            while (true) {
++                result.add(value());
++                space();
++                if (take(']')) {
++                    return result;
++                }
++                expect(',');
++            }
++        }
++
++        private String string() {
++            expect('"');
++            StringBuilder result = new StringBuilder();
++            while (index < source.length()) {
++                char ch = source.charAt(index++);
++                if (ch == '"') {
++                    return result.toString();
++                }
++                if (ch != '\\') {
++                    if (ch < 0x20) {
++                        throw new IllegalArgumentException("control character in JSON string");
++                    }
++                    result.append(ch);
++                    continue;
++                }
++                if (index >= source.length()) {
++                    throw new IllegalArgumentException("incomplete JSON escape");
++                }
++                char escaped = source.charAt(index++);
++                switch (escaped) {
++                    case '"', '\\', '/' -> result.append(escaped);
++                    case 'b' -> result.append('\b');
++                    case 'f' -> result.append('\f');
++                    case 'n' -> result.append('\n');
++                    case 'r' -> result.append('\r');
++                    case 't' -> result.append('\t');
++                    case 'u' -> {
++                        if (index + 4 > source.length()) {
++                            throw new IllegalArgumentException("incomplete unicode escape");
++                        }
++                        result.append((char) Integer.parseInt(source.substring(index, index + 4), 16));
++                        index += 4;
++                    }
++                    default -> throw new IllegalArgumentException("invalid JSON escape");
++                }
++            }
++            throw new IllegalArgumentException("unterminated JSON string");
++        }
++
++        private Object number() {
++            int start = index;
++            if (take('-')) {
++                // sign consumed
++            }
++            digits();
++            boolean decimal = false;
++            if (take('.')) {
++                decimal = true;
++                digits();
++            }
++            if (index < source.length() && (source.charAt(index) == 'e' || source.charAt(index) == 'E')) {
++                decimal = true;
++                index++;
++                if (index < source.length() && (source.charAt(index) == '+' || source.charAt(index) == '-')) {
++                    index++;
++                }
++                digits();
++            }
++            String token = source.substring(start, index);
++            try {
++                return decimal ? Double.valueOf(token) : Long.valueOf(token);
++            } catch (NumberFormatException ex) {
++                throw new IllegalArgumentException("invalid JSON number", ex);
++            }
++        }
++
++        private void digits() {
++            int start = index;
++            while (index < source.length() && Character.isDigit(source.charAt(index))) {
++                index++;
++            }
++            if (index == start) {
++                throw new IllegalArgumentException("invalid JSON number");
++            }
++        }
++
++        private Object literal(String token, Object value) {
++            if (!source.startsWith(token, index)) {
++                throw new IllegalArgumentException("invalid JSON literal");
++            }
++            index += token.length();
++            return value;
++        }
++
++        private void space() {
++            while (index < source.length() && Character.isWhitespace(source.charAt(index))) {
++                index++;
++            }
++        }
++
++        private boolean take(char expected) {
++            if (index < source.length() && source.charAt(index) == expected) {
++                index++;
++                return true;
++            }
++            return false;
++        }
++
++        private void expect(char expected) {
++            if (!take(expected)) {
++                throw new IllegalArgumentException("expected '" + expected + "'");
++            }
++        }
++    }
++}

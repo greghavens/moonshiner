@@ -1,0 +1,304 @@
+diff --git a/vcfsupport/client.py b/vcfsupport/client.py
+index 3a11607..a8ff0d9 100644
+--- a/vcfsupport/client.py
++++ b/vcfsupport/client.py
+@@ -6,6 +6,11 @@ package: the whole client is built on the Python standard library.
+ 
+ from __future__ import annotations
+ 
++import json
++import urllib.error
++import urllib.parse
++import urllib.request
++
+ 
+ class SddcManagerError(Exception):
+     """Raised when SDDC Manager returns an error response."""
+@@ -27,34 +32,90 @@ class SddcManagerClient:
+         self.base_url = base_url.rstrip("/")
+         self.access_token: str | None = None
+ 
++    # -- transport --------------------------------------------------------
++    def _request(
++        self,
++        method: str,
++        path: str,
++        *,
++        query: dict | None = None,
++        body: dict | None = None,
++        authenticated: bool = True,
++    ):
++        url = self.base_url + path
++        # Only parameters that were actually given reach the wire; an optional
++        # parameter without a value is left out of the URL entirely.
++        if query:
++            url += "?" + urllib.parse.urlencode(query)
++
++        data = None
++        headers = {"Accept": "application/json"}
++        if body is not None:
++            data = json.dumps(body).encode("utf-8")
++            headers["Content-Type"] = "application/json"
++        if authenticated:
++            if not self.access_token:
++                raise SddcManagerError(401, "no access token; call create_token first")
++            headers["Authorization"] = f"Bearer {self.access_token}"
++
++        request = urllib.request.Request(url, data=data, headers=headers, method=method)
++        try:
++            with urllib.request.urlopen(request) as response:
++                payload = response.read().decode("utf-8")
++        except urllib.error.HTTPError as error:
++            raw = error.read().decode("utf-8")
++            try:
++                raw = json.loads(raw)
++            except json.JSONDecodeError:
++                pass
++            raise SddcManagerError(error.code, raw) from error
++        return json.loads(payload) if payload.strip() else None
++
+     # -- Tokens -----------------------------------------------------------
+     def create_token(self, username: str, password: str) -> dict:
+         """createToken: POST /v1/tokens. Stores and returns the token pair."""
+-        raise NotImplementedError
++        # apiKey and idToken are unset for password authentication, so they are
++        # omitted from TokenCreationSpec rather than sent as null or "".
++        pair = self._request(
++            "POST",
++            "/v1/tokens",
++            body={"username": username, "password": password},
++            authenticated=False,
++        )
++        self.access_token = pair["accessToken"]
++        return pair
+ 
+     # -- Tasks ------------------------------------------------------------
+     def get_tasks(self, **filters) -> dict:
+         """getTasks: GET /v1/tasks. Only the filters passed here are sent."""
+-        raise NotImplementedError
++        query = {name: value for name, value in filters.items() if value is not None}
++        return self._request("GET", "/v1/tasks", query=query)
+ 
+     def get_task(self, task_id: str) -> dict:
+         """getTask: GET /v1/tasks/{id}."""
+-        raise NotImplementedError
++        return self._request(
++            "GET", f"/v1/tasks/{urllib.parse.quote(task_id, safe='')}"
++        )
+ 
+     def retry_task(self, task_id: str) -> None:
+-        """retryTask: PATCH /v1/tasks/{id}."""
+-        raise NotImplementedError
++        """retryTask: PATCH /v1/tasks/{id}. The operation takes no body."""
++        self._request(
++            "PATCH", f"/v1/tasks/{urllib.parse.quote(task_id, safe='')}"
++        )
+ 
+     # -- Notifications ----------------------------------------------------
+     def get_notifications(self) -> list:
+         """getNotifications: GET /v1/notifications."""
+-        raise NotImplementedError
++        return self._request("GET", "/v1/notifications")
+ 
+     # -- SOS --------------------------------------------------------------
+     def start_support_bundle(self, spec: dict) -> dict:
+         """startSupportBundle: POST /v1/system/support-bundles."""
+-        raise NotImplementedError
++        return self._request("POST", "/v1/system/support-bundles", body=spec)
+ 
+     def get_support_bundle_status(self, bundle_id: str) -> dict:
+         """getSupportBundleStatus: GET /v1/system/support-bundles/{id}."""
+-        raise NotImplementedError
++        return self._request(
++            "GET",
++            f"/v1/system/support-bundles/{urllib.parse.quote(bundle_id, safe='')}",
++        )
+diff --git a/vcfsupport/diagnose.py b/vcfsupport/diagnose.py
+index da53d1b..fd5ace8 100644
+--- a/vcfsupport/diagnose.py
++++ b/vcfsupport/diagnose.py
+@@ -2,6 +2,11 @@
+ 
+ from __future__ import annotations
+ 
++import time
++from datetime import datetime, timezone
++
++from .client import SddcManagerClient
++
+ # Resource type -> the Logs flag that collects that component's logs.
+ LOG_FLAG_BY_COMPONENT_TYPE = {
+     "ESXI": "esxLogs",
+@@ -10,10 +15,171 @@ LOG_FLAG_BY_COMPONENT_TYPE = {
+     "SDDC_MANAGER": "sddcManagerLogs",
+ }
+ 
++CORRELATING_SEVERITIES = {"ERROR", "CRITICAL"}
++TERMINAL_BUNDLE_STATUSES = {"COMPLETED_WITH_SUCCESS", "COMPLETED_WITH_FAILURE"}
++POLL_INTERVAL_SECONDS = 1.0
++POLL_TIMEOUT_SECONDS = 120.0
++
++
++def _parse_timestamp(value: str | None) -> datetime | None:
++    if not value:
++        return None
++    try:
++        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
++    except ValueError:
++        return None
++    if parsed.tzinfo is None:
++        parsed = parsed.replace(tzinfo=timezone.utc)
++    return parsed
++
++
++def _latest_failed_task(tasks: list) -> dict:
++    completed = [task for task in tasks if _parse_timestamp(task.get("completionTimestamp"))]
++    if not completed:
++        raise LookupError("no completed failed task was returned by getTasks")
++    return max(completed, key=lambda task: _parse_timestamp(task["completionTimestamp"]))
++
++
++def _walk_sub_tasks(sub_tasks, depth=1):
++    for sub_task in sub_tasks or []:
++        yield depth, sub_task
++        yield from _walk_sub_tasks(sub_task.get("subTasks"), depth + 1)
++
++
++def _root_cause(task: dict) -> dict:
++    """The error on the deepest FAILED stage of the sub-task tree."""
++    deepest = None
++    for depth, sub_task in _walk_sub_tasks(task.get("subTasks")):
++        if sub_task.get("status") != "FAILED":
++            continue
++        for stage in sub_task.get("stages") or []:
++            if stage.get("status") != "FAILED":
++                continue
++            for error in stage.get("errors") or []:
++                if deepest is None or depth > deepest[0]:
++                    deepest = (depth, error)
++    if deepest is None:
++        raise LookupError(f"task {task.get('id')} has no failed stage carrying an error")
++    return deepest[1]
++
++
++def _failed_component_types(task: dict) -> set:
++    types = set()
++    for _depth, sub_task in _walk_sub_tasks(task.get("subTasks")):
++        if sub_task.get("status") != "FAILED":
++            continue
++        for resource in sub_task.get("resources") or []:
++            types.add(resource.get("type"))
++    return types & set(LOG_FLAG_BY_COMPONENT_TYPE)
++
++
++def _resource_of_type(task: dict, resource_type: str) -> list:
++    return [
++        resource
++        for resource in task.get("resources") or []
++        if resource.get("type") == resource_type
++    ]
++
++
++def _correlated_notifications(notifications: list, domain_id: str) -> list:
++    now = datetime.now(timezone.utc)
++    correlated = []
++    for notification in notifications or []:
++        if notification.get("severity") not in CORRELATING_SEVERITIES:
++            continue
++        if (notification.get("domain") or {}).get("id") != domain_id:
++            continue
++        expires = _parse_timestamp(notification.get("expirationTimestamp"))
++        if expires is not None and expires <= now:
++            continue
++        correlated.append(notification)
++    return correlated
++
++
++def _support_bundle_spec(domain: dict, clusters: list, component_types: set) -> dict:
++    """Build a SupportBundleSpec that carries only the fields that have a value.
++
++    ``options`` is never set here, so it is omitted rather than sent as an empty
++    object, and only the selected log flags appear under ``logs``.
++    """
++    scope_entry = {"domainName": domain["name"]}
++    cluster_names = [cluster["name"] for cluster in clusters]
++    if cluster_names:
++        scope_entry["clusterNames"] = cluster_names
++    return {
++        "scope": {"domains": [scope_entry]},
++        "logs": {
++            LOG_FLAG_BY_COMPONENT_TYPE[component]: True
++            for component in sorted(
++                component_types, key=lambda item: LOG_FLAG_BY_COMPONENT_TYPE[item]
++            )
++        },
++    }
++
++
++def _await_support_bundle(client: SddcManagerClient, bundle_id: str) -> dict:
++    deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
++    while True:
++        status = client.get_support_bundle_status(bundle_id)
++        if status.get("status") in TERMINAL_BUNDLE_STATUSES:
++            return status
++        if time.monotonic() >= deadline:
++            raise TimeoutError(
++                f"support bundle {bundle_id} did not finish within "
++                f"{POLL_TIMEOUT_SECONDS:.0f} seconds"
++            )
++        time.sleep(POLL_INTERVAL_SECONDS)
++
+ 
+ def diagnose_failure(base_url: str, username: str, password: str) -> dict:
+     """Diagnose the most recent failed task and return the diagnosis report.
+ 
+     See README.md for the required report keys and the derivation rules.
+     """
+-    raise NotImplementedError
++    client = SddcManagerClient(base_url)
++    client.create_token(username, password)
++
++    # taskStatus is the only filter that has a value; the other eleven optional
++    # query parameters of getTasks stay off the URL.
++    listing = client.get_tasks(taskStatus="Failed")
++    summary = _latest_failed_task(listing.get("elements") or [])
++
++    # The list view carries no sub-task tree, so the detail has to be fetched.
++    task = client.get_task(summary["id"])
++
++    error = _root_cause(task)
++    domains = _resource_of_type(task, "DOMAIN")
++    if not domains:
++        raise LookupError(f"task {task['id']} has no DOMAIN resource")
++    domain = domains[0]
++
++    notifications = client.get_notifications()
++    correlated = _correlated_notifications(notifications, domain["resourceId"])
++
++    component_types = _failed_component_types(task)
++    for notification in correlated:
++        for resource in notification.get("resources") or []:
++            if resource.get("type") in LOG_FLAG_BY_COMPONENT_TYPE:
++                component_types.add(resource["type"])
++
++    spec = _support_bundle_spec(domain, _resource_of_type(task, "CLUSTER"), component_types)
++    started = client.start_support_bundle(spec)
++    finished = _await_support_bundle(client, started["id"])
++
++    client.retry_task(task["id"])
++
++    return {
++        "failedTaskId": task["id"],
++        "failedTaskName": task["name"],
++        "rootCauseErrorCode": error.get("errorCode"),
++        "rootCauseReferenceToken": error.get("referenceToken"),
++        "affectedComponentTypes": sorted(component_types),
++        "correlatedNotificationTypes": sorted(
++            notification["type"] for notification in correlated
++        ),
++        "logsRequested": sorted(spec["logs"]),
++        "supportBundleId": started["id"],
++        "supportBundleName": finished.get("bundleName"),
++        "supportBundleStatus": finished["status"],
++        "retried": True,
++    }

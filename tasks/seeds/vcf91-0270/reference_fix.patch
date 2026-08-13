@@ -1,0 +1,709 @@
+diff --git a/customgroup/customgroup.go b/customgroup/customgroup.go
+index f27ab3b..0f1cc40 100644
+--- a/customgroup/customgroup.go
++++ b/customgroup/customgroup.go
+@@ -7,68 +7,94 @@
+ package customgroup
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
++	"strings"
+ )
+ 
+ // BasePath is the server base path the contract declares for the suite-api.
+ // Operation paths from the contract are appended to it.
+ const BasePath = "/suite-api"
+ 
+-// ErrNotImplemented is returned by the unfinished parts of this package.
+-var ErrNotImplemented = errors.New("customgroup: not implemented")
++// groupsPath is the path both contract operations share.
++const groupsPath = "/api/resources/groups"
++
++// authHeader is the header named by the contract's security scheme.
++const authHeader = "Authorization"
+ 
+ // ResourceKey is the composite key that uniquely identifies a resource. The
+ // appliance treats the triple of name, adapter kind and resource kind as the
+ // identity of a custom group: two groups cannot share it.
+ //
+-// TODO: give these fields the JSON encoding the contract's resource-key schema
+-// requires.
++// The three properties are marked required by the contract's resource-key
++// schema, so they are always serialised.
+ type ResourceKey struct {
+ 	// Name is the display name of the custom group.
+-	Name string
++	Name string `json:"name"`
+ 	// AdapterKindKey is the adapter kind the group belongs to.
+-	AdapterKindKey string
++	AdapterKindKey string `json:"adapterKindKey"`
+ 	// ResourceKindKey is the resource kind the group belongs to.
+-	ResourceKindKey string
++	ResourceKindKey string `json:"resourceKindKey"`
+ }
+ 
+ // MembershipDefinition describes which resources belong to a custom group.
+ //
+ // The contract marks this property required on custom-group, so it is always
+-// part of a create request even when no members are named.
+-//
+-// TODO: give these fields the JSON encoding the contract's
+-// custom-group-membership schema requires.
++// part of a create request even when no members are named. Both collections are
++// optional and are left out of the request when empty rather than sent as an
++// empty array.
+ type MembershipDefinition struct {
+ 	// IncludedResources holds resource identifiers to place in the group.
+-	IncludedResources []string
++	IncludedResources []string `json:"includedResources,omitempty"`
+ 	// ExcludedResources holds resource identifiers to keep out of the group.
+-	ExcludedResources []string
++	ExcludedResources []string `json:"excludedResources,omitempty"`
+ }
+ 
+ // CustomGroup mirrors the contract's custom-group schema. The same type is used
+ // for create requests and for decoding responses, so properties the server
+ // assigns must not appear in an outbound request.
+-//
+-// TODO: give these fields the JSON encoding the contract's custom-group schema
+-// requires.
+ type CustomGroup struct {
+ 	// ID is assigned by the appliance. It is empty on a create request.
+-	ID string
++	ID string `json:"id,omitempty"`
+ 	// ResourceKey identifies the group. Required.
+-	ResourceKey ResourceKey
++	ResourceKey ResourceKey `json:"resourceKey"`
+ 	// AutoResolveMembership controls whether membership is recomputed
+ 	// automatically. It is tri-state: nil leaves the property out of the
+ 	// request so the appliance default applies, while a non-nil pointer sends
+ 	// the value explicitly, including false.
+-	AutoResolveMembership *bool
+-	// MembershipDefinition is required by the contract.
+-	MembershipDefinition MembershipDefinition
++	//
++	// The pointer is what makes the distinction expressible: a plain bool with
++	// omitempty could not tell "leave it to the appliance" apart from "set it
++	// to false".
++	AutoResolveMembership *bool `json:"autoResolveMembership,omitempty"`
++	// MembershipDefinition is required by the contract, so it carries no
++	// omitempty and serialises as {} when nothing is named.
++	MembershipDefinition MembershipDefinition `json:"membershipDefinition"`
+ 	// Policy is the identifier of the policy applied to the group. It is
+ 	// returned by the appliance and is empty on a create request.
+-	Policy string
++	Policy string `json:"policy,omitempty"`
++}
++
++// forCreate returns a copy stripped of the properties the appliance assigns.
++// They are meaningful when decoding a response but must never travel outbound,
++// so a group read back from the appliance can be handed straight to
++// CreateCustomGroup without leaking a stale identifier.
++func (g CustomGroup) forCreate() CustomGroup {
++	g.ID = ""
++	g.Policy = ""
++	return g
++}
++
++// customGroupList mirrors the contract's cgroups schema, the response envelope
++// of getCustomGroups.
++type customGroupList struct {
++	Groups []CustomGroup `json:"groups"`
+ }
+ 
+ // ListOptions holds the optional query parameters of getCustomGroups. A zero
+@@ -81,6 +107,21 @@ type ListOptions struct {
+ 	IncludePolicy bool
+ }
+ 
++// query renders the options as query parameters, leaving out everything the
++// caller did not ask for. The contract annotates neither parameter with a
++// serialisation style, so the OpenAPI default of form/explode applies and the
++// array repeats the parameter.
++func (o ListOptions) query() url.Values {
++	q := url.Values{}
++	for _, id := range o.GroupIDs {
++		q.Add("groupId", id)
++	}
++	if o.IncludePolicy {
++		q.Set("includePolicy", "true")
++	}
++	return q
++}
++
+ // APIError reports a non-success HTTP response from the appliance.
+ type APIError struct {
+ 	// OperationID is the contract operation that was called.
+@@ -98,7 +139,16 @@ func (e *APIError) Error() string {
+ 		http.StatusText(e.StatusCode) + ": " + e.Message
+ }
+ 
++// isConflict reports whether err is the appliance refusing to hold a second
++// group under a resource key it already has.
++func isConflict(err error) bool {
++	var apiErr *APIError
++	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusConflict
++}
++
+ // Client calls the custom group operations of a VCF Operations appliance.
++//
++// A Client holds no mutable state and is safe for concurrent use.
+ type Client struct {
+ 	baseURL string
+ 	auth    string
+@@ -110,19 +160,120 @@ type Client struct {
+ // the value of the header named by the contract's security scheme. A nil
+ // httpClient selects http.DefaultClient.
+ func NewClient(baseURL, authorization string, httpClient *http.Client) (*Client, error) {
+-	return nil, ErrNotImplemented
++	if baseURL == "" {
++		return nil, errors.New("customgroup: baseURL is required")
++	}
++	u, err := url.Parse(baseURL)
++	if err != nil {
++		return nil, fmt.Errorf("customgroup: parse baseURL: %w", err)
++	}
++	if u.Scheme == "" || u.Host == "" {
++		return nil, fmt.Errorf("customgroup: baseURL %q needs a scheme and a host", baseURL)
++	}
++	if authorization == "" {
++		return nil, errors.New("customgroup: authorization is required")
++	}
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++	return &Client{
++		baseURL: strings.TrimRight(baseURL, "/"),
++		auth:    authorization,
++		http:    httpClient,
++	}, nil
++}
++
++// do performs one contract operation. A nil body sends no payload and no
++// Content-Type; a nil out discards the response body.
++func (c *Client) do(ctx context.Context, operationID, method, path string,
++	query url.Values, body any, wantStatus int, out any) error {
++
++	target := c.baseURL + BasePath + path
++	if encoded := query.Encode(); encoded != "" {
++		target += "?" + encoded
++	}
++
++	var payload io.Reader
++	if body != nil {
++		raw, err := json.Marshal(body)
++		if err != nil {
++			return fmt.Errorf("customgroup: %s: encode request: %w", operationID, err)
++		}
++		payload = bytes.NewReader(raw)
++	}
++
++	req, err := http.NewRequestWithContext(ctx, method, target, payload)
++	if err != nil {
++		return fmt.Errorf("customgroup: %s: build request: %w", operationID, err)
++	}
++	req.Header.Set(authHeader, c.auth)
++	req.Header.Set("Accept", "application/json")
++	if body != nil {
++		req.Header.Set("Content-Type", "application/json")
++	}
++
++	resp, err := c.http.Do(req)
++	if err != nil {
++		return fmt.Errorf("customgroup: %s: %w", operationID, err)
++	}
++	defer resp.Body.Close()
++
++	raw, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return fmt.Errorf("customgroup: %s: read response: %w", operationID, err)
++	}
++
++	if resp.StatusCode != wantStatus {
++		return &APIError{
++			OperationID: operationID,
++			StatusCode:  resp.StatusCode,
++			Message:     messageOf(raw),
++			Body:        raw,
++		}
++	}
++
++	if out != nil {
++		if err := json.Unmarshal(raw, out); err != nil {
++			return fmt.Errorf("customgroup: %s: decode response: %w", operationID, err)
++		}
++	}
++	return nil
++}
++
++// messageOf pulls the human readable detail out of an error body, falling back
++// to the raw text when the body is not the appliance's error envelope.
++func messageOf(raw []byte) string {
++	var envelope struct {
++		Message string `json:"message"`
++	}
++	if err := json.Unmarshal(raw, &envelope); err == nil && envelope.Message != "" {
++		return envelope.Message
++	}
++	return strings.TrimSpace(string(raw))
+ }
+ 
+ // ListCustomGroups calls getCustomGroups and returns the custom groups the
+ // appliance holds.
+ func (c *Client) ListCustomGroups(ctx context.Context, opts ListOptions) ([]CustomGroup, error) {
+-	return nil, ErrNotImplemented
++	var list customGroupList
++	err := c.do(ctx, "getCustomGroups", http.MethodGet, groupsPath,
++		opts.query(), nil, http.StatusOK, &list)
++	if err != nil {
++		return nil, err
++	}
++	return list.Groups, nil
+ }
+ 
+ // CreateCustomGroup calls createCustomGroup and returns the created group as
+ // the appliance recorded it.
+ func (c *Client) CreateCustomGroup(ctx context.Context, group CustomGroup) (CustomGroup, error) {
+-	return CustomGroup{}, ErrNotImplemented
++	var created CustomGroup
++	err := c.do(ctx, "createCustomGroup", http.MethodPost, groupsPath,
++		nil, group.forCreate(), http.StatusCreated, &created)
++	if err != nil {
++		return CustomGroup{}, err
++	}
++	return created, nil
+ }
+ 
+ // EnsureResult reports the outcome of EnsureCustomGroup.
+@@ -136,6 +287,59 @@ type EnsureResult struct {
+ // EnsureCustomGroup makes the desired custom group exist on the appliance and
+ // is safe to call repeatedly: however many times it runs, at most one group
+ // with the desired resource key exists afterwards.
++//
++// createCustomGroup is a plain POST with no server-side idempotency key, so
++// retry safety is built here out of the two operations the contract names. A
++// group's resource key is its identity on the appliance, which makes it a
++// natural idempotency key:
++//
++//  1. Look the resource key up. If a group already holds it, adopt that group
++//     and create nothing. This is what makes an ordinary repeat call, and a
++//     retry after a response was lost in transit, harmless.
++//  2. Otherwise create it. A create that succeeds is the one call that created
++//     the group.
++//  3. If the create is refused because the key is already taken, another writer
++//     won the race between the lookup and the create. Look it up once more and
++//     adopt the winner's group rather than reporting a conflict upwards.
+ func (c *Client) EnsureCustomGroup(ctx context.Context, desired CustomGroup) (EnsureResult, error) {
+-	return EnsureResult{}, ErrNotImplemented
++	existing, found, err := c.findByResourceKey(ctx, desired.ResourceKey)
++	if err != nil {
++		return EnsureResult{}, err
++	}
++	if found {
++		return EnsureResult{Group: existing, Created: false}, nil
++	}
++
++	created, err := c.CreateCustomGroup(ctx, desired)
++	if err == nil {
++		return EnsureResult{Group: created, Created: true}, nil
++	}
++	if !isConflict(err) {
++		return EnsureResult{}, err
++	}
++
++	// The key was taken between the lookup and the create.
++	existing, found, lookupErr := c.findByResourceKey(ctx, desired.ResourceKey)
++	if lookupErr != nil {
++		return EnsureResult{}, lookupErr
++	}
++	if !found {
++		// The conflict was not about this resource key after all.
++		return EnsureResult{}, err
++	}
++	return EnsureResult{Group: existing, Created: false}, nil
++}
++
++// findByResourceKey returns the group holding key, if the appliance has one.
++func (c *Client) findByResourceKey(ctx context.Context, key ResourceKey) (CustomGroup, bool, error) {
++	groups, err := c.ListCustomGroups(ctx, ListOptions{})
++	if err != nil {
++		return CustomGroup{}, false, err
++	}
++	for _, g := range groups {
++		if g.ResourceKey == key {
++			return g, true, nil
++		}
++	}
++	return CustomGroup{}, false, nil
+ }
+diff --git a/customgroup/customgroup_test.go b/customgroup/customgroup_test.go
+new file mode 100644
+index 0000000..717457f
+--- /dev/null
++++ b/customgroup/customgroup_test.go
+@@ -0,0 +1,358 @@
++package customgroup
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"net/http"
++	"testing"
++
++	"vcfops/internal/mock"
++)
++
++const (
++	testName    = "Overcommitted Clusters"
++	testAdapter = "Container"
++	testKind    = "Environment"
++)
++
++func ptr(b bool) *bool { return &b }
++
++func testGroup() CustomGroup {
++	return CustomGroup{
++		ResourceKey: ResourceKey{
++			Name:            testName,
++			AdapterKindKey:  testAdapter,
++			ResourceKindKey: testKind,
++		},
++	}
++}
++
++func dial(t *testing.T) (*Client, *mock.Server) {
++	t.Helper()
++	srv := mock.New(t)
++	c, err := NewClient(srv.URL(), srv.Authorization(), srv.Client())
++	if err != nil {
++		t.Fatalf("NewClient: %v", err)
++	}
++	return c, srv
++}
++
++// TestCreateBodyEncoding pins the exact JSON a create request carries. The
++// contract marks resourceKey and membershipDefinition required and everything
++// else optional, so optional properties the caller left alone must not appear.
++func TestCreateBodyEncoding(t *testing.T) {
++	cases := []struct {
++		name string
++		in   CustomGroup
++		want string
++	}{
++		{
++			name: "required properties only",
++			in:   testGroup(),
++			want: `{"resourceKey":{"name":"Overcommitted Clusters","adapterKindKey":"Container","resourceKindKey":"Environment"},"membershipDefinition":{}}`,
++		},
++		{
++			name: "explicit false is not the same as unset",
++			in: func() CustomGroup {
++				g := testGroup()
++				g.AutoResolveMembership = ptr(false)
++				return g
++			}(),
++			want: `{"resourceKey":{"name":"Overcommitted Clusters","adapterKindKey":"Container","resourceKindKey":"Environment"},"autoResolveMembership":false,"membershipDefinition":{}}`,
++		},
++		{
++			name: "explicit true",
++			in: func() CustomGroup {
++				g := testGroup()
++				g.AutoResolveMembership = ptr(true)
++				return g
++			}(),
++			want: `{"resourceKey":{"name":"Overcommitted Clusters","adapterKindKey":"Container","resourceKindKey":"Environment"},"autoResolveMembership":true,"membershipDefinition":{}}`,
++		},
++		{
++			name: "an empty member list is omitted, a populated one is sent",
++			in: func() CustomGroup {
++				g := testGroup()
++				g.MembershipDefinition.ExcludedResources = []string{"a", "b"}
++				return g
++			}(),
++			want: `{"resourceKey":{"name":"Overcommitted Clusters","adapterKindKey":"Container","resourceKindKey":"Environment"},"membershipDefinition":{"excludedResources":["a","b"]}}`,
++		},
++		{
++			name: "appliance assigned properties are stripped",
++			in: func() CustomGroup {
++				g := testGroup()
++				g.ID = "9f1b2c3d-0000-4000-8000-000000000001"
++				g.Policy = "9f1b2c3d-0000-4000-8000-000000000002"
++				return g
++			}(),
++			want: `{"resourceKey":{"name":"Overcommitted Clusters","adapterKindKey":"Container","resourceKindKey":"Environment"},"membershipDefinition":{}}`,
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			raw, err := json.Marshal(tc.in.forCreate())
++			if err != nil {
++				t.Fatalf("marshal: %v", err)
++			}
++			if got := string(raw); got != tc.want {
++				t.Errorf("create body\n got: %s\nwant: %s", got, tc.want)
++			}
++		})
++	}
++}
++
++// TestListOptionsQuery checks that optional query parameters only appear when
++// the caller asked for them.
++func TestListOptionsQuery(t *testing.T) {
++	cases := []struct {
++		name string
++		opts ListOptions
++		want string
++	}{
++		{"zero value sends nothing", ListOptions{}, ""},
++		{"policy requested", ListOptions{IncludePolicy: true}, "includePolicy=true"},
++		{"policy not requested is omitted, not false", ListOptions{IncludePolicy: false}, ""},
++		{"one id", ListOptions{GroupIDs: []string{"a"}}, "groupId=a"},
++		{"ids repeat the parameter", ListOptions{GroupIDs: []string{"a", "b"}}, "groupId=a&groupId=b"},
++		{
++			"ids and policy",
++			ListOptions{GroupIDs: []string{"a"}, IncludePolicy: true},
++			"groupId=a&includePolicy=true",
++		},
++		{"empty id slice sends nothing", ListOptions{GroupIDs: []string{}}, ""},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := tc.opts.query().Encode(); got != tc.want {
++				t.Errorf("query = %q, want %q", got, tc.want)
++			}
++		})
++	}
++}
++
++// TestNewClientValidation covers the constructor's argument checking.
++func TestNewClientValidation(t *testing.T) {
++	cases := []struct {
++		name    string
++		baseURL string
++		auth    string
++		wantErr bool
++	}{
++		{"good", "https://vcfops.internal", "token", false},
++		{"trailing slash is tolerated", "https://vcfops.internal/", "token", false},
++		{"no base url", "", "token", true},
++		{"no scheme or host", "vcfops.internal", "token", true},
++		{"no credential", "https://vcfops.internal", "", true},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			c, err := NewClient(tc.baseURL, tc.auth, nil)
++			if tc.wantErr {
++				if err == nil {
++					t.Fatal("expected an error, got none")
++				}
++				return
++			}
++			if err != nil {
++				t.Fatalf("unexpected error: %v", err)
++			}
++			if c.http != http.DefaultClient {
++				t.Error("a nil httpClient should select http.DefaultClient")
++			}
++		})
++	}
++}
++
++// TestEnsureCustomGroupIsIdempotent drives the ways a create can be attempted
++// more than once and checks that only one group ever results.
++func TestEnsureCustomGroupIsIdempotent(t *testing.T) {
++	cases := []struct {
++		name string
++		// arrange primes the appliance before the calls are made.
++		arrange func(srv *mock.Server)
++		// calls is how many times EnsureCustomGroup runs.
++		calls int
++		// wantErrAt is the 1-based call that must fail, or 0 for none.
++		wantErrAt int
++		// wantCreated counts calls reporting Created=true.
++		wantCreated int
++		// wantCreateCalls is the number of createCustomGroup requests.
++		wantCreateCalls int
++	}{
++		{
++			name:            "single call creates the group",
++			calls:           1,
++			wantCreated:     1,
++			wantCreateCalls: 1,
++		},
++		{
++			name:            "repeat calls adopt the existing group",
++			calls:           3,
++			wantCreated:     1,
++			wantCreateCalls: 1,
++		},
++		{
++			name:            "a lost response is not replayed as a second create",
++			arrange:         func(srv *mock.Server) { srv.FailNextCreateAfterStore() },
++			calls:           2,
++			wantErrAt:       1,
++			wantCreated:     0,
++			wantCreateCalls: 1,
++		},
++		{
++			name: "another writer winning the race is adopted",
++			arrange: func(srv *mock.Server) {
++				srv.InsertBeforeNextCreate(testName, testAdapter, testKind)
++			},
++			calls:           1,
++			wantCreated:     0,
++			wantCreateCalls: 1,
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			c, srv := dial(t)
++			if tc.arrange != nil {
++				tc.arrange(srv)
++			}
++
++			created := 0
++			for i := 1; i <= tc.calls; i++ {
++				res, err := c.EnsureCustomGroup(context.Background(), testGroup())
++				switch {
++				case i == tc.wantErrAt && err == nil:
++					t.Fatalf("call %d: expected an error, got none", i)
++				case i == tc.wantErrAt:
++					continue
++				case err != nil:
++					t.Fatalf("call %d: %v", i, err)
++				}
++				if res.Group.ID == "" {
++					t.Errorf("call %d returned a group with no ID", i)
++				}
++				if res.Created {
++					created++
++				}
++			}
++
++			if created != tc.wantCreated {
++				t.Errorf("Created=true on %d calls, want %d", created, tc.wantCreated)
++			}
++			if got := srv.CountFor("createCustomGroup"); got != tc.wantCreateCalls {
++				t.Errorf("createCustomGroup called %d times, want %d", got, tc.wantCreateCalls)
++			}
++			if names := srv.GroupNames(); len(names) != 1 || names[0] != testName {
++				t.Errorf("appliance holds %v, want one group named %q", names, testName)
++			}
++		})
++	}
++}
++
++// TestAPIErrorReportsStatus checks that a refused request surfaces as an
++// *APIError carrying the operation and status.
++func TestAPIErrorReportsStatus(t *testing.T) {
++	cases := []struct {
++		name       string
++		arrange    func(srv *mock.Server)
++		call       func(c *Client) error
++		wantOpID   string
++		wantStatus int
++	}{
++		{
++			name:    "a lost create surfaces the status",
++			arrange: func(srv *mock.Server) { srv.FailNextCreateAfterStore() },
++			call: func(c *Client) error {
++				_, err := c.CreateCustomGroup(context.Background(), testGroup())
++				return err
++			},
++			wantOpID:   "createCustomGroup",
++			wantStatus: http.StatusServiceUnavailable,
++		},
++		{
++			name: "a duplicate resource key is a conflict",
++			arrange: func(srv *mock.Server) {
++				srv.InsertBeforeNextCreate(testName, testAdapter, testKind)
++			},
++			call: func(c *Client) error {
++				_, err := c.CreateCustomGroup(context.Background(), testGroup())
++				return err
++			},
++			wantOpID:   "createCustomGroup",
++			wantStatus: http.StatusConflict,
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			c, srv := dial(t)
++			tc.arrange(srv)
++
++			err := tc.call(c)
++			if err == nil {
++				t.Fatal("expected an error, got none")
++			}
++			var apiErr *APIError
++			if !errors.As(err, &apiErr) {
++				t.Fatalf("error %v is not an *APIError", err)
++			}
++			if apiErr.OperationID != tc.wantOpID {
++				t.Errorf("OperationID = %q, want %q", apiErr.OperationID, tc.wantOpID)
++			}
++			if apiErr.StatusCode != tc.wantStatus {
++				t.Errorf("StatusCode = %d, want %d", apiErr.StatusCode, tc.wantStatus)
++			}
++			if apiErr.Message == "" {
++				t.Error("Message is empty, want the detail from the response body")
++			}
++			if isConflict(err) != (tc.wantStatus == http.StatusConflict) {
++				t.Errorf("isConflict = %v for status %d", isConflict(err), tc.wantStatus)
++			}
++		})
++	}
++}
++
++// TestListDecodesResponseEnvelope checks the cgroups envelope is unwrapped and
++// that appliance assigned properties survive the round trip.
++func TestListDecodesResponseEnvelope(t *testing.T) {
++	c, _ := dial(t)
++	ctx := context.Background()
++
++	if groups, err := c.ListCustomGroups(ctx, ListOptions{}); err != nil {
++		t.Fatalf("list on an empty appliance: %v", err)
++	} else if len(groups) != 0 {
++		t.Fatalf("empty appliance returned %d groups", len(groups))
++	}
++
++	want := testGroup()
++	want.AutoResolveMembership = ptr(true)
++	created, err := c.CreateCustomGroup(ctx, want)
++	if err != nil {
++		t.Fatalf("create: %v", err)
++	}
++	if created.ID == "" {
++		t.Error("created group has no ID")
++	}
++
++	groups, err := c.ListCustomGroups(ctx, ListOptions{})
++	if err != nil {
++		t.Fatalf("list: %v", err)
++	}
++	if len(groups) != 1 {
++		t.Fatalf("list returned %d groups, want 1", len(groups))
++	}
++	if groups[0].ResourceKey != want.ResourceKey {
++		t.Errorf("resource key = %+v, want %+v", groups[0].ResourceKey, want.ResourceKey)
++	}
++	if groups[0].AutoResolveMembership == nil || !*groups[0].AutoResolveMembership {
++		t.Error("autoResolveMembership did not survive the round trip")
++	}
++	if groups[0].ID != created.ID {
++		t.Errorf("listed ID %q != created ID %q", groups[0].ID, created.ID)
++	}
++}

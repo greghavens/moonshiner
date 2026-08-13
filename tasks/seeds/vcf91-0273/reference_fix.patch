@@ -1,0 +1,154 @@
+--- a/vcfops/client.go
++++ b/vcfops/client.go
+@@ -73,11 +73,12 @@
+ 	RoleNames []string `json:"roleNames,omitempty"`
+ }
+ 
+-// usernamePassword encodes the spec "username-password" schema.
++// usernamePassword encodes the spec "username-password" schema. authSource is
++// optional, so it is omitted rather than encoded as an empty string.
+ type usernamePassword struct {
+ 	Username   string `json:"username"`
+ 	Password   string `json:"password"`
+-	AuthSource string `json:"authSource"`
++	AuthSource string `json:"authSource,omitempty"`
+ }
+ 
+ // authToken decodes the spec "auth-token" schema.
+@@ -90,8 +91,15 @@
+ 
+ // session is one credential generation: the token acquired for a given set of
+ // credentials, used by every request issued while it is the active generation.
++//
++// inFlight counts the requests that captured this generation and have not
++// finished yet. Once the generation is retired it accepts no new requests, and
++// drained is closed when the last one finishes.
+ type session struct {
+-	token string
++	token    string
++	inFlight int
++	retired  bool
++	drained  chan struct{}
+ }
+ 
+ // Client is safe for concurrent use.
+@@ -145,18 +153,24 @@
+ }
+ 
+ // CurrentUser calls getCurrentUser with whichever token is active when the call
+-// starts.
++// starts. That generation stays alive for the duration of the call, so a
++// rotation running concurrently cannot pull the token out from under it.
+ func (c *Client) CurrentUser(ctx context.Context) (*User, error) {
+-	s, err := c.currentSession()
++	s, err := c.capture()
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	defer c.finish(s)
+ 	return c.getCurrentUser(ctx, s.token)
+ }
+ 
+ // Rotate moves the client onto creds: it acquires a token for the new
+-// credentials, makes that token the one new callers use, and releases the token
+-// it replaced.
++// credentials, makes that token the one new callers use, waits for the requests
++// still running on the token it replaced, and only then releases it.
++//
++// New callers are never blocked by the wait. If ctx ends before the retired
++// generation has drained, Rotate returns ctx.Err() and leaves the retired token
++// alive rather than stranding the requests still using it.
+ func (c *Client) Rotate(ctx context.Context, creds Credentials) error {
+ 	tok, err := c.acquireToken(ctx, creds)
+ 	if err != nil {
+@@ -171,15 +185,25 @@
+ 	}
+ 	retired := c.active
+ 	c.active = &session{token: tok.Token}
++	var drained chan struct{}
++	if retired != nil {
++		drained = c.retire(retired)
++	}
+ 	c.mu.Unlock()
+ 
+ 	if retired == nil {
+ 		return nil
+ 	}
++	select {
++	case <-drained:
++	case <-ctx.Done():
++		return ctx.Err()
++	}
+ 	return c.releaseToken(ctx, retired.token)
+ }
+ 
+-// Close releases the active token, if any. Close is idempotent.
++// Close stops the client taking new requests and releases the active token once
++// the requests still using it have finished. Close is idempotent.
+ func (c *Client) Close(ctx context.Context) error {
+ 	c.mu.Lock()
+ 	if c.closed {
+@@ -189,15 +213,26 @@
+ 	c.closed = true
+ 	active := c.active
+ 	c.active = nil
++	var drained chan struct{}
++	if active != nil {
++		drained = c.retire(active)
++	}
+ 	c.mu.Unlock()
+ 
+ 	if active == nil {
+ 		return nil
+ 	}
++	select {
++	case <-drained:
++	case <-ctx.Done():
++		return ctx.Err()
++	}
+ 	return c.releaseToken(ctx, active.token)
+ }
+ 
+-func (c *Client) currentSession() (*session, error) {
++// capture pins the active generation for one request and counts the request
++// against it. Every successful capture must be paired with finish.
++func (c *Client) capture() (*session, error) {
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+ 	switch {
+@@ -206,9 +241,35 @@
+ 	case c.active == nil:
+ 		return nil, ErrNotAuthenticated
+ 	}
++	c.active.inFlight++
+ 	return c.active, nil
+ }
+ 
++// finish accounts for a request leaving s, and completes the drain when s is
++// retired and its last request has gone.
++func (c *Client) finish(s *session) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	s.inFlight--
++	if s.retired && s.inFlight == 0 && s.drained != nil {
++		close(s.drained)
++		s.drained = nil
++	}
++}
++
++// retire takes s out of service for new requests and returns a channel that is
++// closed once the requests still using it have finished. c.mu must be held.
++func (c *Client) retire(s *session) chan struct{} {
++	drained := make(chan struct{})
++	s.retired = true
++	if s.inFlight == 0 {
++		close(drained)
++		return drained
++	}
++	s.drained = drained
++	return drained
++}
++
+ // acquireToken implements operationId acquireToken. It sends no Authorization
+ // header: the specification gives this operation an empty security list.
+ func (c *Client) acquireToken(ctx context.Context, creds Credentials) (*authToken, error) {

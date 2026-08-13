@@ -1,0 +1,336 @@
+diff --git a/commission/commission.go b/commission/commission.go
+index 8c72ad0..b6ad0c1 100644
+--- a/commission/commission.go
++++ b/commission/commission.go
+@@ -2,17 +2,25 @@
+ // submit a precheck, wait for it to finish, and commission the hosts only if
+ // the precheck succeeded.
+ //
+-// The wire contract this package must satisfy is docs/contract.json, derived
+-// from the VMware Cloud Foundation 9.0 SDDC Manager OpenAPI specification.
+-//
+-// TODO: this package is a stub. Implement Client.CommissionHosts.
++// The wire contract this package satisfies is docs/contract.json, derived from
++// the VMware Cloud Foundation 9.0 SDDC Manager OpenAPI specification. The three
++// operations used are postHostsPrechecks_1, getHostsPrechecksResponse and
++// commissionHosts; paths, methods and body shapes are read from the contract
++// rather than hard-coded here.
+ package commission
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
+ 	"net/http"
++	"strings"
+ 	"time"
++
++	hostcommission "vcf90.local/hostcommission"
+ )
+ 
+ // ErrPrecheckFailed reports that the precheck completed with a non-SUCCEEDED
+@@ -23,6 +31,19 @@ var ErrPrecheckFailed = errors.New("commission: host prechecks failed")
+ // not accept. It is returned before any request is issued.
+ var ErrUnsupportedStorageType = errors.New("commission: unsupported storage type")
+ 
++// operationIds this client uses, as named by the 9.0 specification.
++const (
++	opPrecheckSubmit = "postHostsPrechecks_1"
++	opPrecheckStatus = "getHostsPrechecksResponse"
++	opCommission     = "commissionHosts"
++)
++
++// Precheck lifecycle values, per the contract's enumerations.
++const (
++	statusCompleted = "COMPLETED"
++	resultSucceeded = "SUCCEEDED"
++)
++
+ // HostSpec is one host to commission. It mirrors the HostCommissionSpec schema.
+ //
+ // FQDN, Username, Password, StorageType and NetworkPoolID are required. The
+@@ -41,6 +62,69 @@ type HostSpec struct {
+ 	SSLThumbprint           string
+ }
+ 
++// wireHostSpec is the JSON projection of HostSpec. The optional properties
++// carry omitempty so that an unset one is absent from the payload rather than
++// serialized as "".
++type wireHostSpec struct {
++	FQDN          string `json:"fqdn"`
++	Username      string `json:"username"`
++	Password      string `json:"password"`
++	StorageType   string `json:"storageType"`
++	NetworkPoolID string `json:"networkPoolId"`
++
++	VvolStorageProtocolType string `json:"vvolStorageProtocolType,omitempty"`
++	NetworkPoolName         string `json:"networkPoolName,omitempty"`
++	SSHThumbprint           string `json:"sshThumbprint,omitempty"`
++	SSLThumbprint           string `json:"sslThumbprint,omitempty"`
++}
++
++func (h HostSpec) wire() wireHostSpec {
++	return wireHostSpec{
++		FQDN:                    h.FQDN,
++		Username:                h.Username,
++		Password:                h.Password,
++		StorageType:             h.StorageType,
++		NetworkPoolID:           h.NetworkPoolID,
++		VvolStorageProtocolType: h.VvolStorageProtocolType,
++		NetworkPoolName:         h.NetworkPoolName,
++		SSHThumbprint:           h.SSHThumbprint,
++		SSLThumbprint:           h.SSLThumbprint,
++	}
++}
++
++// prechecksRequest is the HostsPrechecksRequest envelope: an object wrapping
++// the host list. The commissioning call sends a bare array instead.
++type prechecksRequest struct {
++	Hosts []wireHostSpec `json:"hosts"`
++}
++
++// prechecksResponse is the HostsPrechecksResponse schema.
++type prechecksResponse struct {
++	ID              string `json:"id"`
++	ExecutionStatus string `json:"executionStatus"`
++	Result          string `json:"result"`
++	HostPrechecks   []struct {
++		HostPrecheckDetails struct {
++			FQDN string `json:"fqdn"`
++		} `json:"hostPrecheckDetails"`
++		Result string `json:"result"`
++		Error  string `json:"error"`
++	} `json:"hostPrechecks"`
++}
++
++// task is the Task schema returned by the commissioning call.
++type task struct {
++	ID     string `json:"id"`
++	Name   string `json:"name"`
++	Status string `json:"status"`
++}
++
++// apiError is the Error schema SDDC Manager returns on failure.
++type apiError struct {
++	ErrorCode string `json:"errorCode"`
++	Message   string `json:"message"`
++}
++
+ // HostPrecheckError is a per-host precheck failure reported by SDDC Manager.
+ type HostPrecheckError struct {
+ 	FQDN   string
+@@ -95,6 +179,20 @@ func NewClient(baseURL string, httpc *http.Client) *Client {
+ 	return &Client{baseURL: baseURL, httpc: httpc}
+ }
+ 
++func (c *Client) pollInterval() time.Duration {
++	if c.PollInterval > 0 {
++		return c.PollInterval
++	}
++	return DefaultPollInterval
++}
++
++func (c *Client) maxPolls() int {
++	if c.MaxPolls > 0 {
++		return c.MaxPolls
++	}
++	return DefaultMaxPolls
++}
++
+ // CommissionHosts runs the precheck-gated commissioning workflow:
+ //
+ //  1. submit the hosts for prechecking,
+@@ -104,5 +202,189 @@ func NewClient(baseURL string, httpc *http.Client) *Client {
+ // When the precheck fails it returns a Result with Committed false and an error
+ // wrapping ErrPrecheckFailed, having issued no commissioning request.
+ func (c *Client) CommissionHosts(ctx context.Context, specs []HostSpec) (*Result, error) {
+-	return nil, errors.New("commission: not implemented")
++	contract := hostcommission.MustLoad()
++
++	if len(specs) == 0 {
++		return nil, errors.New("commission: no hosts given")
++	}
++	// Validate before anything leaves the process, so a batch this release
++	// cannot accept never reaches the API.
++	for i, s := range specs {
++		if err := validate(contract, s); err != nil {
++			return nil, fmt.Errorf("commission: hosts[%d] (%s): %w", i, s.FQDN, err)
++		}
++	}
++
++	wire := make([]wireHostSpec, len(specs))
++	for i, s := range specs {
++		wire[i] = s.wire()
++	}
++
++	res := &Result{}
++
++	// 1. Submit the precheck.
++	var submitted prechecksResponse
++	if err := c.do(ctx, contract.MustOp(opPrecheckSubmit), nil,
++		prechecksRequest{Hosts: wire}, &submitted); err != nil {
++		return res, fmt.Errorf("commission: submitting prechecks: %w", err)
++	}
++	if submitted.ID == "" {
++		return res, errors.New("commission: precheck submission returned no id")
++	}
++	res.PrecheckID = submitted.ID
++
++	// 2. Poll until the precheck completes.
++	final, err := c.awaitPrecheck(ctx, contract, res)
++	if err != nil {
++		return res, err
++	}
++	res.PrecheckResult = final.Result
++	for _, hp := range final.HostPrechecks {
++		if hp.Result == resultSucceeded {
++			continue
++		}
++		res.HostErrors = append(res.HostErrors, HostPrecheckError{
++			FQDN:   hp.HostPrecheckDetails.FQDN,
++			Result: hp.Result,
++			Error:  hp.Error,
++		})
++	}
++
++	// 3. The gate. Anything other than SUCCEEDED stops here, before the
++	// mutating call, so nothing is changed.
++	if final.Result != resultSucceeded {
++		return res, fmt.Errorf("commission: precheck %s completed with result %q: %w%s",
++			res.PrecheckID, final.Result, ErrPrecheckFailed, summarize(res.HostErrors))
++	}
++
++	var t task
++	if err := c.do(ctx, contract.MustOp(opCommission), nil, wire, &t); err != nil {
++		return res, fmt.Errorf("commission: commissioning hosts: %w", err)
++	}
++	res.Committed = true
++	res.TaskID = t.ID
++	return res, nil
++}
++
++// awaitPrecheck reads the precheck status until it reports completion,
++// recording the number of reads on res.
++func (c *Client) awaitPrecheck(ctx context.Context, contract *hostcommission.Contract, res *Result) (*prechecksResponse, error) {
++	op := contract.MustOp(opPrecheckStatus)
++	maxReads := c.maxPolls()
++
++	for i := 0; i < maxReads; i++ {
++		if i > 0 {
++			select {
++			case <-ctx.Done():
++				return nil, fmt.Errorf("commission: waiting for precheck %s: %w", res.PrecheckID, ctx.Err())
++			case <-time.After(c.pollInterval()):
++			}
++		}
++
++		var status prechecksResponse
++		if err := c.do(ctx, op, map[string]string{"id": res.PrecheckID}, nil, &status); err != nil {
++			return nil, fmt.Errorf("commission: reading precheck %s: %w", res.PrecheckID, err)
++		}
++		res.Polls++
++
++		if status.ExecutionStatus == statusCompleted {
++			return &status, nil
++		}
++	}
++	return nil, fmt.Errorf("commission: precheck %s did not complete within %d status reads",
++		res.PrecheckID, maxReads)
++}
++
++// validate enforces the HostCommissionSpec rules the contract states: every
++// required property present, and a storage type this release accepts.
++func validate(contract *hostcommission.Contract, s HostSpec) error {
++	values := map[string]string{
++		"fqdn":          s.FQDN,
++		"username":      s.Username,
++		"password":      s.Password,
++		"storageType":   s.StorageType,
++		"networkPoolId": s.NetworkPoolID,
++	}
++	for _, name := range contract.Schemas["HostCommissionSpec"].Required {
++		// storageType gets the more specific message below.
++		if name != "storageType" && strings.TrimSpace(values[name]) == "" {
++			return fmt.Errorf("required property %q is empty", name)
++		}
++	}
++	if !contract.StorageTypeAllowed(s.StorageType) {
++		return fmt.Errorf("%w %q; VMware Cloud Foundation 9.0 accepts: %s",
++			ErrUnsupportedStorageType, s.StorageType,
++			strings.Join(contract.AllowedStorageTypes(), ", "))
++	}
++	return nil
++}
++
++// do issues one contract operation. body is encoded as JSON when non-nil; out
++// receives the decoded success response when non-nil.
++func (c *Client) do(ctx context.Context, op hostcommission.Operation, pathParams map[string]string, body, out any) error {
++	path := op.Path
++	for k, v := range pathParams {
++		path = strings.ReplaceAll(path, "{"+k+"}", v)
++	}
++
++	var payload io.Reader
++	if body != nil {
++		buf, err := json.Marshal(body)
++		if err != nil {
++			return fmt.Errorf("encoding request: %w", err)
++		}
++		payload = bytes.NewReader(buf)
++	}
++
++	req, err := http.NewRequestWithContext(ctx, op.Method, strings.TrimSuffix(c.baseURL, "/")+path, payload)
++	if err != nil {
++		return err
++	}
++	if body != nil {
++		ct := op.RequestContentType
++		if ct == "" {
++			ct = "application/json"
++		}
++		req.Header.Set("Content-Type", ct)
++	}
++	req.Header.Set("Accept", "application/json")
++
++	resp, err := c.httpc.Do(req)
++	if err != nil {
++		return err
++	}
++	defer resp.Body.Close()
++
++	raw, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return fmt.Errorf("reading response: %w", err)
++	}
++	if resp.StatusCode != op.SuccessStatus {
++		var e apiError
++		_ = json.Unmarshal(raw, &e)
++		msg := e.Message
++		if msg == "" {
++			msg = strings.TrimSpace(string(raw))
++		}
++		return fmt.Errorf("%s %s: unexpected status %d (want %d): %s",
++			op.Method, path, resp.StatusCode, op.SuccessStatus, msg)
++	}
++	if out == nil {
++		return nil
++	}
++	if err := json.Unmarshal(raw, out); err != nil {
++		return fmt.Errorf("decoding %s response: %w", op.ResponseSchema, err)
++	}
++	return nil
++}
++
++func summarize(errs []HostPrecheckError) string {
++	if len(errs) == 0 {
++		return ""
++	}
++	parts := make([]string, 0, len(errs))
++	for _, e := range errs {
++		parts = append(parts, fmt.Sprintf("%s: %s", e.FQDN, e.Error))
++	}
++	return " (" + strings.Join(parts, "; ") + ")"
+ }

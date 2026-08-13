@@ -1,0 +1,573 @@
+--- a/VcfInstallerClient.java
++++ b/VcfInstallerClient.java
+@@ -1,4 +1,17 @@
++import java.io.IOException;
++import java.math.BigDecimal;
++import java.net.URI;
++import java.net.URISyntaxException;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++import java.util.Objects;
+ 
+ /** Single-file, dependency-free client for the focused VCF Installer contract. */
+ public final class VcfInstallerClient {
+@@ -154,13 +167,550 @@
+         }
+     }
+ 
++    private static final List<String> OPERATION_IDS = List.of(
++            "updateProxyConfiguration", "updateDepotSettings", "syncDepotMetadata");
++    private static final List<String> METHODS = List.of("PATCH", "PUT", "PATCH");
++    private static final List<String> PATHS = List.of(
++            "/v1/system/proxy-configuration",
++            "/v1/system/settings/depot",
++            "/v1/system/settings/depot/depot-sync-info");
++
++    private final URI serviceRoot;
++    private final String accessToken;
++    private final HttpClient httpClient;
++
+     public VcfInstallerClient(String baseUrl, String accessToken) {
+-        // TODO: implement validation and client construction.
++        this.serviceRoot = validateServiceRoot(baseUrl);
++        this.accessToken = validateAccessToken(accessToken);
++        this.httpClient = HttpClient.newBuilder()
++                .followRedirects(HttpClient.Redirect.NEVER)
++                .build();
+     }
+ 
+     /** Applies proxy, depot settings, and metadata sync in contract order. */
+     public ChangeReport configureDepotAccess(ProxyConfiguration proxy, DepotSettings depot)
+             throws ChangeException {
+-        throw new UnsupportedOperationException("not implemented");
++        Objects.requireNonNull(proxy, "proxy");
++        Objects.requireNonNull(depot, "depot");
++
++        byte[][] bodies = {
++                encodeProxy(proxy).getBytes(StandardCharsets.UTF_8),
++                encodeDepot(depot).getBytes(StandardCharsets.UTF_8),
++                null
++        };
++        List<StepResult> steps = initialSteps();
++
++        for (int index = 0; index < OPERATION_IDS.size(); index++) {
++            String operationId = OPERATION_IDS.get(index);
++            HttpResponse<byte[]> response;
++            try {
++                response = send(METHODS.get(index), PATHS.get(index), bodies[index]);
++            } catch (InterruptedException interrupted) {
++                Thread.currentThread().interrupt();
++                ChangeReport report = failedReport(steps, index, 0, null, null);
++                throw new TransportException(operationId, report, interrupted);
++            } catch (IOException | RuntimeException transportFailure) {
++                ChangeReport report = failedReport(steps, index, 0, null, null);
++                throw new TransportException(operationId, report, transportFailure);
++            }
++
++            if (response.statusCode() != 202) {
++                ErrorFields error = decodeError(response.body());
++                ChangeReport report = failedReport(
++                        steps, index, response.statusCode(), error.errorCode(), error.message());
++                throw new VcfApiException(
++                        operationId,
++                        response.statusCode(),
++                        error.errorCode(),
++                        error.errorType(),
++                        error.message(),
++                        error.remediationMessage(),
++                        error.referenceToken(),
++                        report);
++            }
++
++            String taskId;
++            try {
++                taskId = validateAcceptedResponse(index, response);
++            } catch (RuntimeException malformed) {
++                ChangeReport report = failedReport(steps, index, 202, null, null);
++                throw new ProtocolException(operationId, report, malformed);
++            }
++            steps.set(index, new StepResult(
++                    operationId, StepStatus.ACCEPTED, 202, taskId, null, null));
++        }
++
++        return new ChangeReport(Outcome.ACCEPTED, steps);
++    }
++
++    private HttpResponse<byte[]> send(String method, String path, byte[] body)
++            throws IOException, InterruptedException {
++        HttpRequest.Builder builder = HttpRequest.newBuilder(serviceRoot.resolve(path))
++                .header("Authorization", "Bearer " + accessToken)
++                .header("Accept", "application/json");
++        if (body == null) {
++            builder.method(method, HttpRequest.BodyPublishers.noBody());
++        } else {
++            builder.header("Content-Type", "application/json")
++                    .method(method, HttpRequest.BodyPublishers.ofByteArray(body));
++        }
++        return httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray());
++    }
++
++    private static String validateAcceptedResponse(int index, HttpResponse<byte[]> response) {
++        if (!isJsonMediaType(response.headers().firstValue("Content-Type").orElse(null))) {
++            throw new IllegalArgumentException("accepted response is not JSON");
++        }
++        Object parsed = Json.parse(new String(response.body(), StandardCharsets.UTF_8));
++        if (!(parsed instanceof Map<?, ?> object)) {
++            throw new IllegalArgumentException("accepted response is not an object");
++        }
++        if (index == 0) {
++            String id = requiredString(object, "id");
++            requiredString(object, "name");
++            requiredString(object, "status");
++            requiredString(object, "creationTimestamp");
++            return id;
++        }
++        if (index == 2) {
++            requiredString(object, "syncStatus");
++        }
++        return null;
++    }
++
++    private static String requiredString(Map<?, ?> object, String name) {
++        Object value = object.get(name);
++        if (!(value instanceof String stringValue) || stringValue.isBlank()) {
++            throw new IllegalArgumentException("missing required string");
++        }
++        return stringValue;
++    }
++
++    private static boolean isJsonMediaType(String value) {
++        if (value == null) {
++            return false;
++        }
++        int semicolon = value.indexOf(';');
++        String mediaType = (semicolon < 0 ? value : value.substring(0, semicolon))
++                .trim()
++                .toLowerCase(Locale.ROOT);
++        return mediaType.equals("application/json")
++                || (mediaType.startsWith("application/") && mediaType.endsWith("+json"));
++    }
++
++    private static List<StepResult> initialSteps() {
++        List<StepResult> steps = new ArrayList<>();
++        for (String operationId : OPERATION_IDS) {
++            steps.add(new StepResult(
++                    operationId, StepStatus.NOT_RUN, 0, null, null, null));
++        }
++        return steps;
++    }
++
++    private static ChangeReport failedReport(
++            List<StepResult> steps,
++            int failedIndex,
++            int httpStatus,
++            String errorCode,
++            String errorMessage) {
++        steps.set(failedIndex, new StepResult(
++                OPERATION_IDS.get(failedIndex),
++                StepStatus.FAILED,
++                httpStatus,
++                null,
++                errorCode,
++                errorMessage));
++        return new ChangeReport(
++                failedIndex == 0 ? Outcome.FAILED : Outcome.PARTIAL_FAILURE,
++                steps);
++    }
++
++    private record ErrorFields(
++            String errorCode,
++            String errorType,
++            String message,
++            String remediationMessage,
++            String referenceToken) {
++    }
++
++    private static ErrorFields decodeError(byte[] body) {
++        try {
++            Object parsed = Json.parse(new String(body, StandardCharsets.UTF_8));
++            if (parsed instanceof Map<?, ?> object) {
++                return new ErrorFields(
++                        optionalString(object, "errorCode"),
++                        optionalString(object, "errorType"),
++                        optionalString(object, "message"),
++                        optionalString(object, "remediationMessage"),
++                        optionalString(object, "referenceToken"));
++            }
++        } catch (RuntimeException ignored) {
++            // Error bodies are best-effort; HTTP status and operationId remain authoritative.
++        }
++        return new ErrorFields(null, null, null, null, null);
++    }
++
++    private static String optionalString(Map<?, ?> object, String name) {
++        Object value = object.get(name);
++        return value instanceof String stringValue ? stringValue : null;
++    }
++
++    private static URI validateServiceRoot(String baseUrl) {
++        if (baseUrl == null || baseUrl.isBlank()) {
++            throw new IllegalArgumentException("baseUrl must be an absolute HTTP(S) service root");
++        }
++        final URI uri;
++        try {
++            uri = new URI(baseUrl);
++        } catch (URISyntaxException malformed) {
++            throw new IllegalArgumentException(
++                    "baseUrl must be an absolute HTTP(S) service root", malformed);
++        }
++        String scheme = uri.getScheme();
++        if (scheme == null
++                || !(scheme.equalsIgnoreCase("http") || scheme.equalsIgnoreCase("https"))
++                || uri.getHost() == null
++                || uri.getHost().isBlank()
++                || uri.getRawAuthority() == null) {
++            throw new IllegalArgumentException("baseUrl must be an absolute HTTP(S) service root");
++        }
++        String path = uri.getRawPath();
++        if (uri.getRawUserInfo() != null
++                || (path != null && !path.isEmpty() && !path.equals("/"))
++                || uri.getRawQuery() != null
++                || uri.getRawFragment() != null) {
++            throw new IllegalArgumentException(
++                    "baseUrl must not contain userinfo, a path, query, or fragment");
++        }
++        return URI.create(scheme.toLowerCase(Locale.ROOT) + "://" + uri.getRawAuthority() + "/");
++    }
++
++    private static String validateAccessToken(String accessToken) {
++        if (accessToken == null || accessToken.isBlank()) {
++            throw new IllegalArgumentException("accessToken must be nonblank and header-safe");
++        }
++        for (int index = 0; index < accessToken.length(); index++) {
++            char character = accessToken.charAt(index);
++            if (character <= 0x20 || character == 0x7f) {
++                throw new IllegalArgumentException("accessToken must be nonblank and header-safe");
++            }
++        }
++        return accessToken;
++    }
++
++    private static String encodeProxy(ProxyConfiguration proxy) {
++        JsonObject object = new JsonObject();
++        object.add("isEnabled", proxy.isEnabled());
++        object.add("host", proxy.host());
++        object.add("port", proxy.port());
++        object.add("transferProtocol", proxy.transferProtocol());
++        object.add("username", proxy.username());
++        object.add("password", proxy.password());
++        object.add("isAuthenticated", proxy.isAuthenticated());
++        return object.finish();
++    }
++
++    private static String encodeDepot(DepotSettings depot) {
++        JsonObject object = new JsonObject();
++        if (depot.vmwareAccount() != null) {
++            object.addEncoded("vmwareAccount", encodeAccount(depot.vmwareAccount()));
++        }
++        if (depot.offlineAccount() != null) {
++            object.addEncoded("offlineAccount", encodeAccount(depot.offlineAccount()));
++        }
++        if (depot.depotConfiguration() != null) {
++            object.addEncoded(
++                    "depotConfiguration", encodeDepotConfiguration(depot.depotConfiguration()));
++        }
++        return object.finish();
++    }
++
++    private static String encodeAccount(DepotAccount account) {
++        JsonObject object = new JsonObject();
++        object.add("username", account.username());
++        object.add("password", account.password());
++        object.add("downloadToken", account.downloadToken());
++        object.add("downloadActivationCode", account.downloadActivationCode());
++        return object.finish();
++    }
++
++    private static String encodeDepotConfiguration(DepotConfiguration configuration) {
++        JsonObject object = new JsonObject();
++        object.add("isOfflineDepot", configuration.isOfflineDepot());
++        object.add("hostname", configuration.hostname());
++        object.add("port", configuration.port());
++        object.add("url", configuration.url());
++        return object.finish();
++    }
++
++    private static final class JsonObject {
++        private final StringBuilder value = new StringBuilder("{");
++        private boolean first = true;
++
++        void add(String name, String stringValue) {
++            if (stringValue != null) {
++                addEncoded(name, Json.quote(stringValue));
++            }
++        }
++
++        void add(String name, Integer numberValue) {
++            if (numberValue != null) {
++                addEncoded(name, numberValue.toString());
++            }
++        }
++
++        void add(String name, Boolean booleanValue) {
++            if (booleanValue != null) {
++                addEncoded(name, booleanValue.toString());
++            }
++        }
++
++        void add(String name, boolean booleanValue) {
++            addEncoded(name, Boolean.toString(booleanValue));
++        }
++
++        void addEncoded(String name, String encodedValue) {
++            if (!first) {
++                value.append(',');
++            }
++            first = false;
++            value.append(Json.quote(name)).append(':').append(encodedValue);
++        }
++
++        String finish() {
++            return value.append('}').toString();
++        }
++    }
++
++    /** Minimal strict JSON implementation for the focused response fields. */
++    private static final class Json {
++        private final String input;
++        private int index;
++
++        private Json(String input) {
++            this.input = input;
++        }
++
++        static Object parse(String input) {
++            Json parser = new Json(Objects.requireNonNull(input));
++            Object value = parser.readValue();
++            parser.skipWhitespace();
++            if (parser.index != input.length()) {
++                throw new IllegalArgumentException("trailing JSON content");
++            }
++            return value;
++        }
++
++        static String quote(String value) {
++            StringBuilder encoded = new StringBuilder(value.length() + 2).append('"');
++            for (int i = 0; i < value.length(); i++) {
++                char character = value.charAt(i);
++                switch (character) {
++                    case '"' -> encoded.append("\\\"");
++                    case '\\' -> encoded.append("\\\\");
++                    case '\b' -> encoded.append("\\b");
++                    case '\f' -> encoded.append("\\f");
++                    case '\n' -> encoded.append("\\n");
++                    case '\r' -> encoded.append("\\r");
++                    case '\t' -> encoded.append("\\t");
++                    default -> {
++                        if (character < 0x20) {
++                            encoded.append(String.format(Locale.ROOT, "\\u%04x", (int) character));
++                        } else {
++                            encoded.append(character);
++                        }
++                    }
++                }
++            }
++            return encoded.append('"').toString();
++        }
++
++        private Object readValue() {
++            skipWhitespace();
++            if (index >= input.length()) {
++                throw new IllegalArgumentException("missing JSON value");
++            }
++            return switch (input.charAt(index)) {
++                case '{' -> readObject();
++                case '[' -> readArray();
++                case '"' -> readString();
++                case 't' -> readLiteral("true", Boolean.TRUE);
++                case 'f' -> readLiteral("false", Boolean.FALSE);
++                case 'n' -> readLiteral("null", null);
++                default -> readNumber();
++            };
++        }
++
++        private Map<String, Object> readObject() {
++            expect('{');
++            LinkedHashMap<String, Object> object = new LinkedHashMap<>();
++            skipWhitespace();
++            if (consume('}')) {
++                return object;
++            }
++            while (true) {
++                skipWhitespace();
++                String name = readString();
++                skipWhitespace();
++                expect(':');
++                Object value = readValue();
++                if (object.containsKey(name)) {
++                    throw new IllegalArgumentException("duplicate JSON member");
++                }
++                object.put(name, value);
++                skipWhitespace();
++                if (consume('}')) {
++                    return object;
++                }
++                expect(',');
++            }
++        }
++
++        private List<Object> readArray() {
++            expect('[');
++            List<Object> values = new ArrayList<>();
++            skipWhitespace();
++            if (consume(']')) {
++                return values;
++            }
++            while (true) {
++                values.add(readValue());
++                skipWhitespace();
++                if (consume(']')) {
++                    return values;
++                }
++                expect(',');
++            }
++        }
++
++        private String readString() {
++            expect('"');
++            StringBuilder value = new StringBuilder();
++            while (index < input.length()) {
++                char character = input.charAt(index++);
++                if (character == '"') {
++                    return value.toString();
++                }
++                if (character == '\\') {
++                    if (index >= input.length()) {
++                        throw new IllegalArgumentException("incomplete JSON escape");
++                    }
++                    char escaped = input.charAt(index++);
++                    switch (escaped) {
++                        case '"', '\\', '/' -> value.append(escaped);
++                        case 'b' -> value.append('\b');
++                        case 'f' -> value.append('\f');
++                        case 'n' -> value.append('\n');
++                        case 'r' -> value.append('\r');
++                        case 't' -> value.append('\t');
++                        case 'u' -> value.append(readUnicodeEscape());
++                        default -> throw new IllegalArgumentException("invalid JSON escape");
++                    }
++                } else {
++                    if (character < 0x20) {
++                        throw new IllegalArgumentException("control character in JSON string");
++                    }
++                    value.append(character);
++                }
++            }
++            throw new IllegalArgumentException("unterminated JSON string");
++        }
++
++        private char readUnicodeEscape() {
++            if (index + 4 > input.length()) {
++                throw new IllegalArgumentException("incomplete unicode escape");
++            }
++            int value = 0;
++            for (int count = 0; count < 4; count++) {
++                int digit = Character.digit(input.charAt(index++), 16);
++                if (digit < 0) {
++                    throw new IllegalArgumentException("invalid unicode escape");
++                }
++                value = (value << 4) | digit;
++            }
++            return (char) value;
++        }
++
++        private Object readLiteral(String spelling, Object value) {
++            if (!input.startsWith(spelling, index)) {
++                throw new IllegalArgumentException("invalid JSON literal");
++            }
++            index += spelling.length();
++            return value;
++        }
++
++        private BigDecimal readNumber() {
++            int start = index;
++            if (consume('-')) {
++                // optional sign
++            }
++            if (consume('0')) {
++                // zero cannot be followed by another integer digit
++            } else {
++                requireDigitOneToNine();
++                while (index < input.length() && Character.isDigit(input.charAt(index))) {
++                    index++;
++                }
++            }
++            if (consume('.')) {
++                requireDigit();
++                while (index < input.length() && Character.isDigit(input.charAt(index))) {
++                    index++;
++                }
++            }
++            if (consume('e') || consume('E')) {
++                if (!consume('+')) {
++                    consume('-');
++                }
++                requireDigit();
++                while (index < input.length() && Character.isDigit(input.charAt(index))) {
++                    index++;
++                }
++            }
++            try {
++                return new BigDecimal(input.substring(start, index));
++            } catch (NumberFormatException malformed) {
++                throw new IllegalArgumentException("invalid JSON number", malformed);
++            }
++        }
++
++        private void requireDigitOneToNine() {
++            if (index >= input.length() || input.charAt(index) < '1' || input.charAt(index) > '9') {
++                throw new IllegalArgumentException("invalid JSON number");
++            }
++            index++;
++        }
++
++        private void requireDigit() {
++            if (index >= input.length() || !Character.isDigit(input.charAt(index))) {
++                throw new IllegalArgumentException("invalid JSON number");
++            }
++            index++;
++        }
++
++        private void skipWhitespace() {
++            while (index < input.length()) {
++                char character = input.charAt(index);
++                if (character != ' ' && character != '\n'
++                        && character != '\r' && character != '\t') {
++                    return;
++                }
++                index++;
++            }
++        }
++
++        private boolean consume(char expected) {
++            if (index < input.length() && input.charAt(index) == expected) {
++                index++;
++                return true;
++            }
++            return false;
++        }
++
++        private void expect(char expected) {
++            if (!consume(expected)) {
++                throw new IllegalArgumentException("unexpected JSON token");
++            }
++        }
+     }
+ }

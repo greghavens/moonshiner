@@ -1,0 +1,371 @@
+diff --git a/vcfsizer/__init__.py b/vcfsizer/__init__.py
+new file mode 100644
+index 0000000..1d32562
+--- /dev/null
++++ b/vcfsizer/__init__.py
+@@ -0,0 +1,5 @@
++"""Right-sizing automation for VMware Cloud Foundation 9.0 vCenter fleets."""
++
++__all__ = ["__version__"]
++
++__version__ = "1.0.0"
+diff --git a/vcfsizer/__main__.py b/vcfsizer/__main__.py
+new file mode 100644
+index 0000000..078cd02
+--- /dev/null
++++ b/vcfsizer/__main__.py
+@@ -0,0 +1,6 @@
++"""Entry point for ``python3 -m vcfsizer``."""
++
++from .cli import main
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/vcfsizer/cli.py b/vcfsizer/cli.py
+new file mode 100644
+index 0000000..2aa0665
+--- /dev/null
++++ b/vcfsizer/cli.py
+@@ -0,0 +1,114 @@
++"""Command line entry point: apply a right-sizing plan to a vCenter fleet."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import sys
++
++from .client import ApiError, VCenterClient
++from .plan import PlanError, cpu_spec, load, memory_spec
++
++PASSWORD_ENV = "VCENTER_PASSWORD"
++
++
++def build_parser():
++    parser = argparse.ArgumentParser(
++        prog="vcfsizer",
++        description="Apply a right-sizing plan to virtual machines in vCenter.",
++    )
++    parser.add_argument(
++        "--base-url", required=True,
++        help="Appliance root, for example https://vcenter.example.com",
++    )
++    parser.add_argument("--username", required=True, help="vCenter Single Sign-On user")
++    parser.add_argument("--plan", required=True, help="Path to the right-sizing plan")
++    parser.add_argument("--report", required=True, help="Path of the JSON report to write")
++    return parser
++
++
++def resolve_targets(client, plan):
++    """Map every plan target to its virtual machine identifier with one listing."""
++    names = []
++    for target in plan["targets"]:
++        if target["vm_name"] not in names:
++            names.append(target["vm_name"])
++    inventory = {summary["name"]: summary["vm"] for summary in client.list_vms(names)}
++    missing = [name for name in names if name not in inventory]
++    if missing:
++        raise PlanError(
++            "no virtual machine named %s exists in this vCenter"
++            % ", ".join(sorted(missing))
++        )
++    return inventory
++
++
++def apply_plan(client, plan):
++    inventory = resolve_targets(client, plan)
++    results = []
++    for target in plan["targets"]:
++        name = target["vm_name"]
++        vm = inventory[name]
++        applied = []
++        cpu = cpu_spec(target)
++        if cpu:
++            client.update_cpu(vm, cpu)
++            applied.append("cpu")
++        memory = memory_spec(target)
++        if memory:
++            client.update_memory(vm, memory)
++            applied.append("memory")
++        results.append({"vm_name": name, "vm": vm, "applied": applied})
++    return results
++
++
++def write_report(path, plan, results, session_creations):
++    report = {
++        "plan_id": plan["plan_id"],
++        "session_creations": session_creations,
++        "results": results,
++    }
++    directory = os.path.dirname(os.path.abspath(path))
++    if directory:
++        os.makedirs(directory, exist_ok=True)
++    with open(path, "w", encoding="utf-8") as handle:
++        json.dump(report, handle, indent=2)
++        handle.write("\n")
++    return report
++
++
++def main(argv=None):
++    args = build_parser().parse_args(argv)
++    password = os.environ.get(PASSWORD_ENV)
++    if not password:
++        sys.stderr.write("%s is not set\n" % PASSWORD_ENV)
++        return 2
++
++    try:
++        plan = load(args.plan)
++    except (OSError, ValueError, PlanError) as error:
++        sys.stderr.write("%s\n" % error)
++        return 2
++
++    client = VCenterClient(args.base_url, args.username, password)
++    try:
++        try:
++            results = apply_plan(client, plan)
++        finally:
++            client.delete_session()
++    except (ApiError, PlanError) as error:
++        sys.stderr.write("%s\n" % error)
++        return 1
++
++    write_report(args.report, plan, results, client.session_creations)
++    applied = sum(len(result["applied"]) for result in results)
++    sys.stdout.write(
++        "applied %d change(s) across %d virtual machine(s) using %d session(s)\n"
++        % (applied, len(results), client.session_creations)
++    )
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/vcfsizer/client.py b/vcfsizer/client.py
+new file mode 100644
+index 0000000..257ee63
+--- /dev/null
++++ b/vcfsizer/client.py
+@@ -0,0 +1,161 @@
++"""A small client for the pinned subset of the vSphere Automation API.
++
++Paths, parameter serialization, property names and status codes all follow
++``docs/contract.json``, which is transcribed from the VCF 9.0 vCenter OpenAPI
++specification.
++"""
++
++from __future__ import annotations
++
++import base64
++import json
++import urllib.error
++import urllib.parse
++import urllib.request
++
++BASE_PATH = "/api"
++SESSION_HEADER = "vmware-api-session-id"
++JSON_MEDIA_TYPE = "application/json"
++DEFAULT_TIMEOUT = 30
++
++
++class ApiError(Exception):
++    """A ``Vapi.Std.Errors.Error`` reported by the appliance."""
++
++    def __init__(self, status, payload):
++        self.status = status
++        self.payload = payload if isinstance(payload, dict) else {}
++        self.error_type = self.payload.get("error_type")
++        messages = self.payload.get("messages") or []
++        self.detail = messages[0].get("default_message", "") if messages else ""
++        super().__init__(
++            "HTTP %s %s: %s" % (status, self.error_type or "error", self.detail)
++        )
++
++
++class Unauthenticated(ApiError):
++    """The session token is missing, unknown or expired."""
++
++
++def _raise(status, payload):
++    if status == 401:
++        raise Unauthenticated(status, payload)
++    raise ApiError(status, payload)
++
++
++class VCenterClient:
++    """Talks to one vCenter appliance, refreshing its session when it expires."""
++
++    def __init__(self, base_url, username, password, timeout=DEFAULT_TIMEOUT):
++        self.base_url = base_url.rstrip("/") + BASE_PATH
++        self.username = username
++        self.password = password
++        self.timeout = timeout
++        self.token = None
++        self.session_creations = 0
++
++    # -- transport --------------------------------------------------------
++
++    def _send(self, method, path, query=None, body=None, headers=None):
++        url = self.base_url + path
++        if query:
++            url += "?" + urllib.parse.urlencode(query)
++        payload = None
++        request_headers = dict(headers or {})
++        if body is not None:
++            payload = json.dumps(body).encode("utf-8")
++            request_headers["Content-Type"] = JSON_MEDIA_TYPE
++        request = urllib.request.Request(
++            url, data=payload, headers=request_headers, method=method
++        )
++        try:
++            with urllib.request.urlopen(request, timeout=self.timeout) as response:
++                return response.status, _decode(response.read())
++        except urllib.error.HTTPError as error:
++            return error.code, _decode(error.read())
++
++    def _authenticated(self, method, path, query=None, body=None):
++        """Send a session-authenticated request, refreshing an expired token once.
++
++        The request is replayed verbatim after a refresh, so no already-applied
++        change is repeated and no pending change is dropped.
++        """
++        if self.token is None:
++            self.create_session()
++        status, payload = self._send(
++            method, path, query, body, {SESSION_HEADER: self.token}
++        )
++        if status == 401:
++            self.create_session()
++            status, payload = self._send(
++                method, path, query, body, {SESSION_HEADER: self.token}
++            )
++        return status, payload
++
++    # -- Cis.Session ------------------------------------------------------
++
++    def create_session(self):
++        """``Cis.Session_create`` - exchange HTTP Basic credentials for a token."""
++        credentials = base64.b64encode(
++            ("%s:%s" % (self.username, self.password)).encode("utf-8")
++        ).decode("ascii")
++        status, payload = self._send(
++            "POST", "/session", headers={"Authorization": "Basic " + credentials}
++        )
++        if status != 201:
++            _raise(status, payload)
++        self.token = payload
++        self.session_creations += 1
++        return self.token
++
++    def delete_session(self):
++        """``Cis.Session_delete`` - log the current token out."""
++        if self.token is None:
++            return
++        status, payload = self._authenticated("DELETE", "/session")
++        if status != 204:
++            _raise(status, payload)
++        self.token = None
++
++    # -- Vcenter.VM -------------------------------------------------------
++
++    def list_vms(self, names=None):
++        """``Vcenter.VM_list`` - list virtual machines matching the filter.
++
++        ``names`` is serialized as ``style: form, explode: true``: one
++        repetition of the parameter per value.  Filters that are not being
++        applied are left off the query string entirely.
++        """
++        query = [("names", name) for name in names or []]
++        status, payload = self._authenticated("GET", "/vcenter/vm", query=query)
++        if status != 200:
++            _raise(status, payload)
++        return payload
++
++    # -- Vcenter.Vm.Hardware ----------------------------------------------
++
++    def update_cpu(self, vm, spec):
++        """``Vcenter.Vm.Hardware.Cpu_update``."""
++        self._update("/vcenter/vm/%s/hardware/cpu" % _quote(vm), spec)
++
++    def update_memory(self, vm, spec):
++        """``Vcenter.Vm.Hardware.Memory_update``."""
++        self._update("/vcenter/vm/%s/hardware/memory" % _quote(vm), spec)
++
++    def _update(self, path, spec):
++        status, payload = self._authenticated("PATCH", path, body=spec)
++        if status != 204:
++            _raise(status, payload)
++
++
++def _quote(value):
++    return urllib.parse.quote(str(value), safe="")
++
++
++def _decode(raw):
++    if not raw:
++        return None
++    try:
++        return json.loads(raw.decode("utf-8"))
++    except ValueError:
++        return None
+diff --git a/vcfsizer/plan.py b/vcfsizer/plan.py
+new file mode 100644
+index 0000000..20d5468
+--- /dev/null
++++ b/vcfsizer/plan.py
+@@ -0,0 +1,55 @@
++"""Translation of a right-sizing plan into vSphere Automation update specs."""
++
++from __future__ import annotations
++
++import json
++
++# plan key -> Vcenter.Vm.Hardware.Cpu.UpdateSpec property
++CPU_FIELDS = (
++    ("vcpus", "count"),
++    ("cores_per_socket", "cores_per_socket"),
++)
++
++# plan key -> Vcenter.Vm.Hardware.Memory.UpdateSpec property
++MEMORY_FIELDS = (
++    ("memory_mib", "size_mib"),
++    ("allow_memory_hot_add", "hot_add_enabled"),
++)
++
++
++class PlanError(Exception):
++    """The plan cannot be turned into a sequence of updates."""
++
++
++def load(path):
++    with open(path, encoding="utf-8") as handle:
++        plan = json.load(handle)
++    if not plan.get("plan_id"):
++        raise PlanError("%s has no plan_id" % path)
++    targets = plan.get("targets") or []
++    for target in targets:
++        if not target.get("vm_name"):
++            raise PlanError("%s has a target without a vm_name" % path)
++    return plan
++
++
++def _spec(target, fields):
++    """Build an update spec holding only the properties the plan changes.
++
++    Every property of both update specs is optional and means "unchanged" when
++    absent, so a property the plan is silent about is left out of the request
++    body rather than sent as null.
++    """
++    return {
++        property_name: target[plan_key]
++        for plan_key, property_name in fields
++        if plan_key in target
++    }
++
++
++def cpu_spec(target):
++    return _spec(target, CPU_FIELDS)
++
++
++def memory_spec(target):
++    return _spec(target, MEMORY_FIELDS)

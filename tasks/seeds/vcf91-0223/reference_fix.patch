@@ -1,0 +1,220 @@
+diff --git a/VcfSddcLcm/VcfSddcLcm.psm1 b/VcfSddcLcm/VcfSddcLcm.psm1
+index 2be74ae..22eef8e 100644
+--- a/VcfSddcLcm/VcfSddcLcm.psm1
++++ b/VcfSddcLcm/VcfSddcLcm.psm1
+@@ -1,6 +1,151 @@
+ Set-StrictMode -Version Latest
+ $ErrorActionPreference = 'Stop'
+ 
++# Query parameters are emitted in the order the contract declares for the
++# operation. An unset optional parameter is skipped outright.
++$script:QueryParameterOrder = @{
++    getComponents     = @('scope')
++    getComponentNodes = @('pageNumber', 'pageSize', 'nodeTypes')
++}
++
++function Get-VcfSddcLcmBaseUri {
++    param([uri] $ServiceUri)
++
++    if (-not $ServiceUri.IsAbsoluteUri) {
++        throw [System.ArgumentException]::new(
++            "ServiceUri must be an absolute URI, got '$ServiceUri'.", 'ServiceUri')
++    }
++    return $ServiceUri.AbsoluteUri.TrimEnd('/')
++}
++
++function Get-VcfSddcLcmSessionToken {
++    param([object] $Server)
++
++    $property = $Server.PSObject.Properties['SessionSecret']
++    if ($null -eq $property -or [string]::IsNullOrEmpty([string]$property.Value)) {
++        throw [System.ArgumentException]::new(
++            'Server does not carry a session secret. Connect first with Connect-VcfInstallerServer.',
++            'Server')
++    }
++    return [string]$property.Value
++}
++
++function New-VcfSddcLcmQueryString {
++    param(
++        [string] $OperationId,
++        [hashtable] $Values
++    )
++
++    $parts = [System.Collections.Generic.List[string]]::new()
++    foreach ($name in $script:QueryParameterOrder[$OperationId]) {
++        if (-not $Values.ContainsKey($name)) { continue }
++
++        $value = $Values[$name]
++        # An unset optional parameter is omitted, never sent as an empty value.
++        if ($null -eq $value) { continue }
++        $rendered = [string]$value
++        if ($rendered.Length -eq 0) { continue }
++
++        $parts.Add(('{0}={1}' -f $name, $rendered)) | Out-Null
++    }
++
++    if ($parts.Count -eq 0) { return '' }
++    return '?' + ($parts -join '&')
++}
++
++function Invoke-VcfSddcLcmGet {
++    param(
++        [string] $BaseUri,
++        [string] $OperationId,
++        [string] $Path,
++        [string] $Token,
++        [hashtable] $Query
++    )
++
++    $uri = $BaseUri + $Path + (New-VcfSddcLcmQueryString -OperationId $OperationId -Values $Query)
++    $headers = @{
++        'Accept'        = 'application/json'
++        'Authorization' = "Bearer $Token"
++    }
++
++    try {
++        return Invoke-RestMethod -Method Get -Uri $uri -Headers $headers `
++            -MaximumRedirection 0 -ErrorAction Stop
++    } catch {
++        $status = $null
++        $response = $_.Exception.PSObject.Properties['Response']
++        if ($null -ne $response -and $null -ne $response.Value) {
++            $status = [int] $response.Value.StatusCode
++        }
++        $detail = if ($null -ne $status) { "HTTP $status" } else { $_.Exception.Message }
++        throw [System.InvalidOperationException]::new(
++            "SDDC LCM operation '$OperationId' failed for $uri : $detail", $_.Exception)
++    }
++}
++
++function Get-VcfSddcLcmPageMetadata {
++    param(
++        [object] $Response,
++        [int] $RequestedPageNumber
++    )
++
++    if ($null -eq $Response -or $Response.PSObject.Properties['pageMetadata'] -eq $null) {
++        throw [System.InvalidOperationException]::new(
++            "getComponentNodes returned no pageMetadata for page $RequestedPageNumber.")
++    }
++    $metadata = $Response.pageMetadata
++    foreach ($field in @('pageNumber', 'totalPages')) {
++        if ($null -eq $metadata -or $metadata.PSObject.Properties[$field] -eq $null -or
++            $null -eq $metadata.$field) {
++            throw [System.InvalidOperationException]::new(
++                "getComponentNodes returned pageMetadata without '$field' for page $RequestedPageNumber.")
++        }
++    }
++    if ([int] $metadata.pageNumber -ne $RequestedPageNumber) {
++        throw [System.InvalidOperationException]::new(
++            ("getComponentNodes returned page {0} when page {1} was requested." -f `
++                    [int] $metadata.pageNumber, $RequestedPageNumber))
++    }
++    return $metadata
++}
++
++function Resolve-VcfSddcLcmComponentId {
++    param(
++        [string] $BaseUri,
++        [string] $Token,
++        [string] $ComponentType,
++        [string] $Scope
++    )
++
++    $query = @{}
++    if (-not [string]::IsNullOrEmpty($Scope)) { $query['scope'] = $Scope }
++
++    $response = Invoke-VcfSddcLcmGet -BaseUri $BaseUri -OperationId 'getComponents' `
++        -Path '/v1/components' -Token $Token -Query $query
++
++    $components = @()
++    if ($null -ne $response -and $null -ne $response.PSObject.Properties['components']) {
++        $components = @($response.components)
++    }
++
++    $matched = @($components | Where-Object {
++            $null -ne $_ -and $null -ne $_.PSObject.Properties['componentType'] -and
++            [string]::Equals([string]$_.componentType, $ComponentType, [System.StringComparison]::Ordinal)
++        })
++
++    if ($matched.Count -eq 0) {
++        throw [System.InvalidOperationException]::new(
++            "No SDDC LCM component of type '$ComponentType' was found.")
++    }
++    if ($matched.Count -gt 1) {
++        $ids = ($matched | ForEach-Object { [string]$_.id } | Sort-Object) -join ', '
++        throw [System.InvalidOperationException]::new(
++            "Component type '$ComponentType' matched $($matched.Count) components ($ids). Narrow the selection with -Scope or -ComponentId.")
++    }
++
++    return [string] $matched[0].id
++}
++
+ <#
+ .SYNOPSIS
+     Retrieve every node of a VCF 9.1 SDDC LCM component in a stable order.
+@@ -79,8 +224,61 @@ function Get-VcfSddcLcmComponentNode {
+         [int] $PageSize
+     )
+ 
+-    throw [System.NotImplementedException]::new(
+-        'TODO: implement getComponents resolution and getComponentNodes pagination')
++    $baseUri = Get-VcfSddcLcmBaseUri -ServiceUri $ServiceUri
++    $token = Get-VcfSddcLcmSessionToken -Server $Server
++
++    $targetId = $ComponentId
++    if ($PSCmdlet.ParameterSetName -eq 'ByType') {
++        $resolveArgs = @{
++            BaseUri       = $baseUri
++            Token         = $token
++            ComponentType = $ComponentType
++        }
++        if ($PSBoundParameters.ContainsKey('Scope')) { $resolveArgs['Scope'] = $Scope }
++        $targetId = Resolve-VcfSddcLcmComponentId @resolveArgs
++    }
++
++    # The comma between node types is a raw delimiter, so each element is escaped
++    # on its own and the delimiter is left literal.
++    $nodeTypesValue = $null
++    if ($PSBoundParameters.ContainsKey('NodeType')) {
++        $nodeTypesValue = (@($NodeType | ForEach-Object { [uri]::EscapeDataString($_) })) -join ','
++    }
++
++    $path = '/v1/components/{0}/nodes' -f [uri]::EscapeDataString($targetId)
++
++    $collected = [System.Collections.Generic.List[object]]::new()
++    $pageNumber = 0
++    while ($true) {
++        $query = [ordered]@{}
++        $query['pageNumber'] = $pageNumber
++        if ($PSBoundParameters.ContainsKey('PageSize')) { $query['pageSize'] = $PageSize }
++        if ($null -ne $nodeTypesValue) { $query['nodeTypes'] = $nodeTypesValue }
++
++        $response = Invoke-VcfSddcLcmGet -BaseUri $baseUri -OperationId 'getComponentNodes' `
++            -Path $path -Token $token -Query ([hashtable]$query)
++
++        $metadata = Get-VcfSddcLcmPageMetadata -Response $response -RequestedPageNumber $pageNumber
++
++        if ($null -ne $response.PSObject.Properties['nodes'] -and $null -ne $response.nodes) {
++            foreach ($node in @($response.nodes)) { $collected.Add($node) | Out-Null }
++        }
++
++        $totalPages = [int] $metadata.totalPages
++        if ($totalPages -le ($pageNumber + 1)) { break }
++        $pageNumber++
++    }
++
++    # Stable total order that does not depend on how the service split the pages:
++    # name ascending, then id ascending, both ordinal.
++    $collected.Sort([System.Comparison[object]] {
++            param($left, $right)
++            $byName = [string]::CompareOrdinal([string]$left.name, [string]$right.name)
++            if ($byName -ne 0) { return $byName }
++            return [string]::CompareOrdinal([string]$left.id, [string]$right.id)
++        })
++
++    foreach ($node in $collected) { $node }
+ }
+ 
+ Export-ModuleMember -Function 'Get-VcfSddcLcmComponentNode'

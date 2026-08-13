@@ -1,0 +1,459 @@
+diff --git a/src/VcfNetworkPoolClient.java b/src/VcfNetworkPoolClient.java
+index 33916e9..8ec9729 100644
+--- a/src/VcfNetworkPoolClient.java
++++ b/src/VcfNetworkPoolClient.java
+@@ -1,4 +1,13 @@
++import java.io.IOException;
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.time.Duration;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Map;
+ 
+ /**
+  * Client for the VMware Cloud Foundation 9.0 SDDC Manager network pool operations.
+@@ -47,9 +56,20 @@ public final class VcfNetworkPoolClient {
+         }
+     }
+ 
++    private static final String TOKENS_PATH = "/v1/tokens";
++    private static final String NETWORK_POOLS_PATH = "/v1/network-pools";
++    private static final String JSON = "application/json";
++
++    /** createNetworkPool has no idempotency key, so recovery is bounded and always re-reads state. */
++    private static final int MAX_ATTEMPTS = 3;
++    private static final long RETRY_DELAY_MILLIS = 100L;
++
+     private final String baseUrl;
+     private final String username;
+     private final String password;
++    private final HttpClient http;
++
++    private String accessToken;
+ 
+     /**
+      * @param baseUrl scheme, host and port of the SDDC Manager appliance, with no trailing slash,
+@@ -59,6 +79,10 @@ public final class VcfNetworkPoolClient {
+         this.baseUrl = baseUrl;
+         this.username = username;
+         this.password = password;
++        this.http = HttpClient.newBuilder()
++                .connectTimeout(Duration.ofSeconds(10))
++                .followRedirects(HttpClient.Redirect.NEVER)
++                .build();
+     }
+ 
+     /**
+@@ -71,6 +95,407 @@ public final class VcfNetworkPoolClient {
+      * @return the id of the network pool that exists on the appliance
+      */
+     public String ensureNetworkPool(String poolName, List<NetworkSpec> networks) throws Exception {
+-        throw new UnsupportedOperationException("ensureNetworkPool is not implemented yet");
++        TransientFailure lastFailure = null;
++        for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
++            if (attempt > 1) {
++                Thread.sleep(RETRY_DELAY_MILLIS);
++            }
++            try {
++                // The pool name is the natural key, so the current state of the appliance decides
++                // whether a create is still needed. Reading it before every attempt - including
++                // every retry - is what keeps the create from being applied twice: an attempt whose
++                // response was lost has already registered the pool, and the next read finds it.
++                String existingId = findNetworkPoolIdByName(poolName);
++                if (existingId != null) {
++                    return existingId;
++                }
++                return createNetworkPool(poolName, networks);
++            } catch (TransientFailure failure) {
++                lastFailure = failure;
++            }
++        }
++        throw new IOException("Could not reconcile network pool '" + poolName + "' after "
++                + MAX_ATTEMPTS + " attempts: " + lastFailure.getMessage(), lastFailure);
++    }
++
++    // ------------------------------------------------------------- operations
++
++    /** getNetworkPool: returns the id of the pool with this name, or null when there is none. */
++    private String findNetworkPoolIdByName(String poolName) throws Exception {
++        Response response = send("GET", NETWORK_POOLS_PATH, null);
++        if (response.status == 404) {
++            return null; // the appliance holds no network pool at all
++        }
++        if (response.status != 200) {
++            throw failureFor("getNetworkPool", response);
++        }
++        Object elements = asObject(Json.parse(response.body)).get("elements");
++        if (!(elements instanceof List<?> list)) {
++            return null;
++        }
++        for (Object element : list) {
++            Map<String, Object> pool = asObject(element);
++            if (poolName.equals(pool.get("name")) && pool.get("id") instanceof String id) {
++                return id;
++            }
++        }
++        return null;
++    }
++
++    /** createNetworkPool: returns the id of the newly created pool. */
++    private String createNetworkPool(String poolName, List<NetworkSpec> networks) throws Exception {
++        Response response = send("POST", NETWORK_POOLS_PATH, networkPoolJson(poolName, networks));
++        if (response.status != 201) {
++            throw failureFor("createNetworkPool", response);
++        }
++        Object id = asObject(Json.parse(response.body)).get("id");
++        if (!(id instanceof String created) || created.isEmpty()) {
++            throw new IOException("createNetworkPool answered 201 without a network pool id: "
++                    + response.body);
++        }
++        return created;
++    }
++
++    /** createToken: exchanges the credentials for the bearer access token. */
++    private String authenticate() throws Exception {
++        StringBuilder body = new StringBuilder("{");
++        appendString(body, "username").append(':');
++        appendString(body, username).append(',');
++        appendString(body, "password").append(':');
++        appendString(body, password);
++        body.append('}');
++
++        Response response = send("POST", TOKENS_PATH, body.toString());
++        if (response.status != 201) {
++            throw failureFor("createToken", response);
++        }
++        Object token = asObject(Json.parse(response.body)).get("accessToken");
++        if (!(token instanceof String value) || value.isEmpty()) {
++            throw new IOException("createToken answered 201 without an access token: "
++                    + response.body);
++        }
++        accessToken = value;
++        return value;
++    }
++
++    // ------------------------------------------------------------ serializing
++
++    /**
++     * Serializes a NetworkPool request body. Only the writable properties of the 9.0.0.0 schemas are
++     * emitted, and a property with nothing to say is left out rather than written as an empty value:
++     * a network without IP ranges carries no {@code ipPools} key at all.
++     */
++    private static String networkPoolJson(String poolName, List<NetworkSpec> networks) {
++        StringBuilder sb = new StringBuilder("{");
++        appendString(sb, "name").append(':');
++        appendString(sb, poolName).append(',');
++        appendString(sb, "networks").append(":[");
++        for (int i = 0; i < networks.size(); i++) {
++            if (i > 0) {
++                sb.append(',');
++            }
++            appendNetwork(sb, networks.get(i));
++        }
++        return sb.append("]}").toString();
++    }
++
++    private static void appendNetwork(StringBuilder sb, NetworkSpec network) {
++        sb.append('{');
++        appendString(sb, "type").append(':');
++        appendString(sb, network.type).append(',');
++        appendString(sb, "vlanId").append(':').append(network.vlanId).append(',');
++        appendString(sb, "mtu").append(':').append(network.mtu).append(',');
++        appendString(sb, "subnet").append(':');
++        appendString(sb, network.subnet).append(',');
++        appendString(sb, "mask").append(':');
++        appendString(sb, network.mask).append(',');
++        appendString(sb, "gateway").append(':');
++        appendString(sb, network.gateway);
++        if (!network.ipPools.isEmpty()) {
++            sb.append(',');
++            appendString(sb, "ipPools").append(":[");
++            for (int i = 0; i < network.ipPools.size(); i++) {
++                IpRange range = network.ipPools.get(i);
++                if (i > 0) {
++                    sb.append(',');
++                }
++                sb.append('{');
++                appendString(sb, "start").append(':');
++                appendString(sb, range.start).append(',');
++                appendString(sb, "end").append(':');
++                appendString(sb, range.end);
++                sb.append('}');
++            }
++            sb.append(']');
++        }
++        sb.append('}');
++    }
++
++    private static StringBuilder appendString(StringBuilder sb, String value) {
++        sb.append('"');
++        for (int i = 0; i < value.length(); i++) {
++            char c = value.charAt(i);
++            switch (c) {
++                case '"' -> sb.append("\\\"");
++                case '\\' -> sb.append("\\\\");
++                case '\n' -> sb.append("\\n");
++                case '\r' -> sb.append("\\r");
++                case '\t' -> sb.append("\\t");
++                case '\b' -> sb.append("\\b");
++                case '\f' -> sb.append("\\f");
++                default -> {
++                    if (c < 0x20) {
++                        sb.append(String.format("\\u%04x", (int) c));
++                    } else {
++                        sb.append(c);
++                    }
++                }
++            }
++        }
++        return sb.append('"');
++    }
++
++    // ------------------------------------------------------------------- HTTP
++
++    private record Response(int status, String body) {
++    }
++
++    /** A failure worth another attempt; the retry re-reads appliance state before mutating again. */
++    private static final class TransientFailure extends Exception {
++        TransientFailure(String message) {
++            super(message);
++        }
++    }
++
++    private Response send(String method, String path, String body) throws Exception {
++        boolean authenticated = !TOKENS_PATH.equals(path);
++        if (authenticated && accessToken == null) {
++            authenticate();
++        }
++        Response response = exchange(method, path, body);
++        if (authenticated && response.status == 401) {
++            // The access token expired or was rejected; get a fresh one and replay the request once.
++            accessToken = null;
++            authenticate();
++            response = exchange(method, path, body);
++        }
++        return response;
++    }
++
++    private Response exchange(String method, String path, String body) throws Exception {
++        HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(baseUrl + path))
++                .timeout(Duration.ofSeconds(30))
++                .header("Accept", JSON);
++        if (accessToken != null && !TOKENS_PATH.equals(path)) {
++            request.header("Authorization", "Bearer " + accessToken);
++        }
++        if (body == null) {
++            request.method(method, HttpRequest.BodyPublishers.noBody());
++        } else {
++            request.header("Content-Type", JSON)
++                    .method(method, HttpRequest.BodyPublishers.ofString(body));
++        }
++        try {
++            HttpResponse<String> response =
++                    http.send(request.build(), HttpResponse.BodyHandlers.ofString());
++            return new Response(response.statusCode(), response.body());
++        } catch (IOException e) {
++            // The request may or may not have been applied, so this is exactly the case that makes
++            // re-reading state before a retry mandatory.
++            throw new TransientFailure(method + " " + path + " failed in transport: " + e);
++        }
++    }
++
++    private TransientFailure failureFor(String operationId, Response response) throws IOException {
++        String detail = describeError(response.body);
++        if (response.status >= 500 || response.status == 408 || response.status == 429) {
++            return new TransientFailure(operationId + " answered " + response.status + detail);
++        }
++        throw new IOException(operationId + " answered " + response.status + detail);
++    }
++
++    private static String describeError(String body) {
++        if (body == null || body.isBlank()) {
++            return "";
++        }
++        try {
++            Map<String, Object> error = asObject(Json.parse(body));
++            Object code = error.get("errorCode");
++            Object message = error.get("message");
++            if (code != null || message != null) {
++                return " (" + code + ": " + message + ")";
++            }
++        } catch (RuntimeException ignored) {
++            // Fall through to the raw body.
++        }
++        return " (" + body + ")";
++    }
++
++    @SuppressWarnings("unchecked")
++    private static Map<String, Object> asObject(Object value) {
++        return value instanceof Map ? (Map<String, Object>) value : Map.of();
++    }
++
++    // ------------------------------------------------------------------- JSON
++
++    /** Just enough JSON reading to pull fields out of the appliance responses. */
++    private static final class Json {
++        private final String text;
++        private int pos;
++
++        private Json(String text) {
++            this.text = text;
++        }
++
++        static Object parse(String text) {
++            Json json = new Json(text == null ? "" : text);
++            json.skipWhitespace();
++            Object value = json.readValue();
++            json.skipWhitespace();
++            return value;
++        }
++
++        private void skipWhitespace() {
++            while (pos < text.length() && Character.isWhitespace(text.charAt(pos))) {
++                pos++;
++            }
++        }
++
++        private Object readValue() {
++            if (pos >= text.length()) {
++                throw new IllegalArgumentException("unexpected end of JSON input");
++            }
++            char c = text.charAt(pos);
++            if (c == '{') {
++                return readObject();
++            }
++            if (c == '[') {
++                return readArray();
++            }
++            if (c == '"') {
++                return readString();
++            }
++            if (text.startsWith("true", pos)) {
++                pos += 4;
++                return Boolean.TRUE;
++            }
++            if (text.startsWith("false", pos)) {
++                pos += 5;
++                return Boolean.FALSE;
++            }
++            if (text.startsWith("null", pos)) {
++                pos += 4;
++                return null;
++            }
++            return readNumber();
++        }
++
++        private Map<String, Object> readObject() {
++            Map<String, Object> map = new LinkedHashMap<>();
++            pos++;
++            skipWhitespace();
++            if (pos < text.length() && text.charAt(pos) == '}') {
++                pos++;
++                return map;
++            }
++            while (true) {
++                skipWhitespace();
++                String key = readString();
++                skipWhitespace();
++                expect(':');
++                skipWhitespace();
++                map.put(key, readValue());
++                skipWhitespace();
++                char c = next();
++                if (c == '}') {
++                    return map;
++                }
++                if (c != ',') {
++                    throw new IllegalArgumentException("expected ',' or '}' at offset " + (pos - 1));
++                }
++            }
++        }
++
++        private List<Object> readArray() {
++            List<Object> list = new ArrayList<>();
++            pos++;
++            skipWhitespace();
++            if (pos < text.length() && text.charAt(pos) == ']') {
++                pos++;
++                return list;
++            }
++            while (true) {
++                skipWhitespace();
++                list.add(readValue());
++                skipWhitespace();
++                char c = next();
++                if (c == ']') {
++                    return list;
++                }
++                if (c != ',') {
++                    throw new IllegalArgumentException("expected ',' or ']' at offset " + (pos - 1));
++                }
++            }
++        }
++
++        private String readString() {
++            expect('"');
++            StringBuilder sb = new StringBuilder();
++            while (true) {
++                char c = next();
++                if (c == '"') {
++                    return sb.toString();
++                }
++                if (c != '\\') {
++                    sb.append(c);
++                    continue;
++                }
++                char escape = next();
++                switch (escape) {
++                    case '"' -> sb.append('"');
++                    case '\\' -> sb.append('\\');
++                    case '/' -> sb.append('/');
++                    case 'b' -> sb.append('\b');
++                    case 'f' -> sb.append('\f');
++                    case 'n' -> sb.append('\n');
++                    case 'r' -> sb.append('\r');
++                    case 't' -> sb.append('\t');
++                    case 'u' -> {
++                        sb.append((char) Integer.parseInt(text.substring(pos, pos + 4), 16));
++                        pos += 4;
++                    }
++                    default -> throw new IllegalArgumentException("bad escape \\" + escape);
++                }
++            }
++        }
++
++        private Object readNumber() {
++            int start = pos;
++            while (pos < text.length() && "+-0123456789.eE".indexOf(text.charAt(pos)) >= 0) {
++                pos++;
++            }
++            String raw = text.substring(start, pos);
++            if (raw.isEmpty()) {
++                throw new IllegalArgumentException("expected a JSON value at offset " + start);
++            }
++            if (raw.indexOf('.') < 0 && raw.indexOf('e') < 0 && raw.indexOf('E') < 0) {
++                return Long.valueOf(raw);
++            }
++            return Double.valueOf(raw);
++        }
++
++        private void expect(char expected) {
++            if (next() != expected) {
++                throw new IllegalArgumentException("expected '" + expected + "' at offset "
++                        + (pos - 1));
++            }
++        }
++
++        private char next() {
++            if (pos >= text.length()) {
++                throw new IllegalArgumentException("unexpected end of JSON input");
++            }
++            return text.charAt(pos++);
++        }
+     }
+ }

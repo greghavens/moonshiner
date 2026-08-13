@@ -1,0 +1,379 @@
+diff --git a/vcfops_customgroups/__init__.py b/vcfops_customgroups/__init__.py
+new file mode 100644
+index 0000000..21e774f
+--- /dev/null
++++ b/vcfops_customgroups/__init__.py
+@@ -0,0 +1,18 @@
++"""Idempotent custom-group management for the VCF Operations suite-api.
++
++The wire behaviour of this package is fixed by ``docs/contract.json``, which is
++derived from the VCF Operations OpenAPI specification (see
++``docs/official_sources.json``). Only the standard library is used.
++"""
++
++from .client import OperationsApiError, OperationsClient
++from .contract import Contract
++from .groups import EnsureResult, ensure_custom_group
++
++__all__ = [
++    "Contract",
++    "EnsureResult",
++    "OperationsApiError",
++    "OperationsClient",
++    "ensure_custom_group",
++]
+diff --git a/vcfops_customgroups/client.py b/vcfops_customgroups/client.py
+new file mode 100644
+index 0000000..3b44ccd
+--- /dev/null
++++ b/vcfops_customgroups/client.py
+@@ -0,0 +1,144 @@
++"""HTTP client for the four suite-api operations the contract names."""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++from typing import Any, Iterable, Sequence
++from urllib.error import HTTPError
++from urllib.parse import urlencode
++from urllib.request import Request, urlopen
++
++from .contract import Contract
++
++
++class OperationsApiError(RuntimeError):
++    """A suite-api call came back with a status the contract does not allow."""
++
++    def __init__(self, operation_id: str, status: int, body: str, url: str) -> None:
++        super().__init__(f"{operation_id} -> HTTP {status}: {body}")
++        self.operation_id = operation_id
++        self.status = status
++        self.body = body
++        self.url = url
++
++    @property
++    def message(self) -> str:
++        try:
++            return json.loads(self.body).get("message", self.body)
++        except ValueError:
++            return self.body
++
++
++class OperationsClient:
++    """Talks to one VCF Operations appliance.
++
++    ``base_url`` is the appliance origin (``https://ops.example.com``); the
++    ``/suite-api`` base path comes from the contract.
++    """
++
++    def __init__(
++        self,
++        base_url: str,
++        *,
++        timeout: float = 30.0,
++        contract_path: Path | str | None = None,
++    ) -> None:
++        self.base_url = base_url.rstrip("/")
++        self.timeout = timeout
++        self.contract = Contract(contract_path)
++        self.token: str | None = None
++
++    # -- operations -------------------------------------------------------
++    def acquire_token(self, username: str, password: str, auth_source: str | None = None) -> str:
++        """``acquireToken``. ``authSource`` is omitted unless the caller sets it."""
++        body: dict[str, Any] = {"username": username, "password": password}
++        if auth_source is not None:
++            body["authSource"] = auth_source
++        payload = self._call("acquireToken", body=body)
++        self.token = payload["token"]
++        return self.token
++
++    def get_custom_groups(
++        self,
++        group_ids: Iterable[str] | None = None,
++        include_policy: bool | None = None,
++    ) -> list[dict]:
++        """``getCustomGroups``. Unset parameters produce no query string at all."""
++        query: list[tuple[str, str]] = [("groupId", gid) for gid in (group_ids or ())]
++        if include_policy is not None:
++            query.append(("includePolicy", "true" if include_policy else "false"))
++        payload = self._call("getCustomGroups", query=query)
++        return list(payload.get("groups") or [])
++
++    def create_custom_group(self, group: dict) -> dict:
++        """``createCustomGroup``. ``group`` must not carry a server-assigned ``id``."""
++        return self._call("createCustomGroup", body=self._group_body(group, create=True))
++
++    def modify_custom_group(self, group: dict) -> dict:
++        """``modifyCustomGroup``. ``group`` must carry the existing ``id``."""
++        return self._call("modifyCustomGroup", body=self._group_body(group, create=False))
++
++    @staticmethod
++    def _group_body(group: dict, *, create: bool) -> dict:
++        """Return a detached group serialized according to the wire conventions."""
++        payload = json.loads(json.dumps(group))
++
++        # Links are response metadata at both schema locations where they can
++        # occur; a client never echoes them into a create or modify request.
++        payload.pop("links", None)
++        resource_key = payload.get("resourceKey")
++        if isinstance(resource_key, dict):
++            resource_key.pop("links", None)
++
++        membership = payload.get("membershipDefinition")
++        if isinstance(membership, dict):
++            for field in ("includedResources", "excludedResources"):
++                if field in membership:
++                    membership[field] = sorted(set(membership[field]))
++
++        if create:
++            payload.pop("id", None)
++        elif not payload.get("id"):
++            raise ValueError("modifyCustomGroup requires the existing custom group 'id'")
++        return payload
++
++    # -- transport --------------------------------------------------------
++    def _call(
++        self,
++        operation_id: str,
++        *,
++        body: dict | None = None,
++        query: Sequence[tuple[str, str]] = (),
++    ) -> dict:
++        operation = self.contract.operation(operation_id)
++        url = self.base_url + operation["full_path"]
++        if query:
++            url = f"{url}?{urlencode(list(query))}"
++
++        headers = {"Accept": self.contract.accept}
++        data = None
++        if body is not None:
++            data = json.dumps(body).encode("utf-8")
++            headers["Content-Type"] = self.contract.content_type
++        if operation["secured"]:
++            if not self.token:
++                raise RuntimeError(
++                    f"{operation_id} is a secured operation; call acquire_token() first"
++                )
++            headers[self.contract.auth_header_name] = self.contract.auth_header_value(self.token)
++
++        request = Request(url, data=data, headers=headers, method=operation["method"])
++        try:
++            with urlopen(request, timeout=self.timeout) as response:
++                status = response.status
++                raw = response.read()
++        except HTTPError as exc:
++            detail = exc.read().decode("utf-8", "replace")
++            raise OperationsApiError(operation_id, exc.code, detail, url) from None
++
++        if status != operation["success_status"]:
++            raise OperationsApiError(
++                operation_id, status, raw.decode("utf-8", "replace"), url
++            )
++        return json.loads(raw) if raw else {}
+diff --git a/vcfops_customgroups/contract.py b/vcfops_customgroups/contract.py
+new file mode 100644
+index 0000000..24a93f0
+--- /dev/null
++++ b/vcfops_customgroups/contract.py
+@@ -0,0 +1,58 @@
++"""Loader for the wire contract in ``docs/contract.json``.
++
++Paths, methods, success statuses, the auth header and the serialization rules
++are read from the contract rather than hard-coded, so regenerating the contract
++from a newer revision of the specification is the only edit a bump needs.
++"""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++DEFAULT_CONTRACT_PATH = Path(__file__).resolve().parent.parent / "docs" / "contract.json"
++
++
++class Contract:
++    def __init__(self, path: Path | str | None = None) -> None:
++        self.path = Path(path) if path else DEFAULT_CONTRACT_PATH
++        self._data = json.loads(self.path.read_text(encoding="utf-8"))
++
++    @property
++    def base_path(self) -> str:
++        return self._data["api"]["base_path"]
++
++    @property
++    def accept(self) -> str:
++        return self._data["wire_conventions"]["accept_header"]
++
++    @property
++    def content_type(self) -> str:
++        conventions = self._data["wire_conventions"]
++        return f"{conventions['request_content_type']}; charset={conventions['request_charset']}"
++
++    @property
++    def auth_header_name(self) -> str:
++        return self._data["auth"]["header_name"]
++
++    def auth_header_value(self, token: str) -> str:
++        return self._data["auth"]["value_template"].format(token=token)
++
++    @property
++    def identity_fields(self) -> list[str]:
++        return list(self._data["identity"]["custom_group"]["fields"])
++
++    def operation(self, operation_id: str) -> dict:
++        try:
++            operation = self._data["operations"][operation_id]
++        except KeyError:
++            raise KeyError(
++                f"operation {operation_id!r} is not named by {self.path}"
++            ) from None
++        return {
++            "operation_id": operation_id,
++            "method": operation["method"],
++            "full_path": operation.get("full_path") or self.base_path + operation["path"],
++            "secured": operation["secured"],
++            "success_status": operation["success_status"],
++        }
+diff --git a/vcfops_customgroups/groups.py b/vcfops_customgroups/groups.py
+new file mode 100644
+index 0000000..05ddfbd
+--- /dev/null
++++ b/vcfops_customgroups/groups.py
+@@ -0,0 +1,135 @@
++"""Retry-safe reconciliation of a VCF Operations custom group.
++
++``createCustomGroup`` is not idempotent on its own: the appliance rejects a
++second create for the same ``resourceKey`` with 409. So the desired state is
++resolved against ``getCustomGroups`` first, and the mutating call is chosen from
++what is actually there:
++
++* absent           -> ``createCustomGroup``
++* present, drifted -> ``modifyCustomGroup`` carrying the existing ``id``
++* present, matching -> no mutating call at all
++
++Running the same request twice therefore leaves exactly one custom group.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any, Iterable
++
++from .client import OperationsClient
++
++
++@dataclass(frozen=True)
++class EnsureResult:
++    group_id: str
++    action: str  # "created" | "updated" | "unchanged"
++    group: dict
++
++
++def _identity(group: dict) -> tuple[str, str, str]:
++    key = group.get("resourceKey") or {}
++    return (
++        key.get("adapterKindKey", ""),
++        key.get("resourceKindKey", ""),
++        key.get("name", ""),
++    )
++
++
++def _build_desired(
++    *,
++    name: str,
++    adapter_kind_key: str,
++    resource_kind_key: str,
++    included_resources: Iterable[str],
++    policy: str | None,
++    auto_resolve_membership: bool | None,
++) -> dict:
++    """Serialize the desired custom group, omitting every field left unset.
++
++    Required fields (``resourceKey``, ``membershipDefinition``) are always
++    present. Optional fields appear only when the caller supplied a value —
++    never as ``null``, ``""``, ``[]`` or ``{}``. ``uniqueItems`` arrays are
++    sorted so the body is byte-stable across runs.
++    """
++    membership: dict[str, Any] = {}
++    resources = sorted(set(included_resources or ()))
++    if resources:
++        membership["includedResources"] = resources
++
++    desired: dict[str, Any] = {
++        "resourceKey": {
++            "adapterKindKey": adapter_kind_key,
++            "name": name,
++            "resourceKindKey": resource_kind_key,
++        },
++        "membershipDefinition": membership,
++    }
++    if policy is not None:
++        desired["policy"] = policy
++    if auto_resolve_membership is not None:
++        desired["autoResolveMembership"] = auto_resolve_membership
++    return desired
++
++
++def _is_satisfied_by(existing: dict, desired: dict) -> bool:
++    """Whether ``existing`` already carries every field the caller asked for.
++
++    Only managed fields are compared: a field the caller left unset is not drift
++    just because the appliance has a value for it.
++    """
++    existing_membership = existing.get("membershipDefinition") or {}
++    desired_membership = desired["membershipDefinition"]
++    for field in ("includedResources", "excludedResources"):
++        if field in desired_membership:
++            if sorted(existing_membership.get(field) or ()) != desired_membership[field]:
++                return False
++
++    for field in ("policy", "autoResolveMembership"):
++        if field in desired and existing.get(field) != desired[field]:
++            return False
++    return True
++
++
++def ensure_custom_group(
++    client: OperationsClient,
++    *,
++    name: str,
++    adapter_kind_key: str,
++    resource_kind_key: str,
++    included_resources: Iterable[str] = (),
++    policy: str | None = None,
++    auto_resolve_membership: bool | None = None,
++) -> EnsureResult:
++    """Make the named custom group exist with the given membership.
++
++    Safe to call repeatedly: the effect is not duplicated on a retry.
++    """
++    desired = _build_desired(
++        name=name,
++        adapter_kind_key=adapter_kind_key,
++        resource_kind_key=resource_kind_key,
++        included_resources=included_resources,
++        policy=policy,
++        auto_resolve_membership=auto_resolve_membership,
++    )
++    identity = _identity(desired)
++
++    # The policy field is only returned when it is asked for, so ask for it
++    # exactly when the caller manages it — otherwise send no query at all.
++    existing_groups = client.get_custom_groups(
++        include_policy=True if policy is not None else None
++    )
++    existing = next((g for g in existing_groups if _identity(g) == identity), None)
++
++    if existing is None:
++        created = client.create_custom_group(desired)
++        return EnsureResult(created["id"], "created", created)
++
++    if _is_satisfied_by(existing, desired):
++        return EnsureResult(existing["id"], "unchanged", existing)
++
++    payload = dict(desired)
++    payload["id"] = existing["id"]
++    updated = client.modify_custom_group(payload)
++    return EnsureResult(updated["id"], "updated", updated)

@@ -1,0 +1,245 @@
+diff --git a/src/VcfAutomationCatalog/VcfAutomationCatalog.psd1 b/src/VcfAutomationCatalog/VcfAutomationCatalog.psd1
+new file mode 100644
+index 0000000..8840eb2
+--- /dev/null
++++ b/src/VcfAutomationCatalog/VcfAutomationCatalog.psd1
+@@ -0,0 +1,26 @@
++@{
++    RootModule        = 'VcfAutomationCatalog.psm1'
++    ModuleVersion     = '1.0.0'
++    GUID              = '3d9a1c07-5f42-4b8e-9a16-c8e70b25d341'
++    Author            = 'Platform Engineering'
++    CompanyName       = 'Platform Engineering'
++    Description       = 'Retry-safe catalog provisioning against the VMware Cloud Foundation Automation 9.1 API.'
++    PowerShellVersion = '7.2'
++
++    # The VCF PowerCLI SDK is a prerequisite installed from the PowerShell
++    # Gallery by scripts/setup.sh. No copy of it lives in this repository.
++    # There is no generated binding for VCF Automation, which is why the
++    # requests below are built by hand against docs/contract.json.
++    RequiredModules   = @('VMware.Sdk.Vcf.SddcManager')
++
++    FunctionsToExport = @('New-VcfAutomationCatalogDeployment')
++    CmdletsToExport   = @()
++    VariablesToExport = @()
++    AliasesToExport   = @()
++
++    PrivateData = @{
++        PSData = @{
++            Tags = @('VCF', 'VCFAutomation', 'Catalog')
++        }
++    }
++}
+diff --git a/src/VcfAutomationCatalog/VcfAutomationCatalog.psm1 b/src/VcfAutomationCatalog/VcfAutomationCatalog.psm1
+new file mode 100644
+index 0000000..bcfc47e
+--- /dev/null
++++ b/src/VcfAutomationCatalog/VcfAutomationCatalog.psm1
+@@ -0,0 +1,207 @@
++Set-StrictMode -Version 3.0
++
++# Deep enough for any inputs payload a blueprint takes; the default of 2 would
++# flatten nested objects into their ToString().
++$script:JsonDepth = 32
++
++function Get-VcfaAccessToken {
++    <#
++        retrieveAuthToken - POST /iaas/api/login
++
++        This is the call that mints the bearer token, so it goes out without an
++        Authorization header of its own. The contract records that the reference
++        page annotates it with the Authorization scheme anyway.
++    #>
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] [string] $ApiUri,
++        [Parameter(Mandatory)] [string] $RefreshToken
++    )
++
++    $body = @{ refreshToken = $RefreshToken } | ConvertTo-Json -Compress -Depth 3
++    $response = Invoke-RestMethod -Method Post -Uri ('{0}/iaas/api/login' -f $ApiUri) `
++        -Body $body -ContentType 'application/json' -ErrorAction Stop
++
++    if (-not $response.token) {
++        throw 'The VCF Automation appliance returned no access token.'
++    }
++    return '{0} {1}' -f $response.tokenType, $response.token
++}
++
++function Find-VcfaDeployment {
++    <#
++        getDeployments - GET /deployment/api/deployments
++
++        Only the two filters that identify the deployment are sent. 'name'
++        matches exactly and 'projects' scopes it, which together are the natural
++        key the caller supplied.
++    #>
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] [string] $ApiUri,
++        [Parameter(Mandatory)] [string] $Authorization,
++        [Parameter(Mandatory)] [string] $DeploymentName,
++        [Parameter(Mandatory)] [string] $ProjectId
++    )
++
++    $query = 'name={0}&projects={1}' -f `
++        [uri]::EscapeDataString($DeploymentName), [uri]::EscapeDataString($ProjectId)
++    $uri = '{0}/deployment/api/deployments?{1}' -f $ApiUri, $query
++
++    $page = Invoke-RestMethod -Method Get -Uri $uri `
++        -Headers @{ Authorization = $Authorization } -ErrorAction Stop
++
++    $content = @()
++    if ($page -and $page.PSObject.Properties['content'] -and $page.content) {
++        $content = @($page.content)
++    }
++    if ($content.Count -eq 0) { return $null }
++    return $content[0]
++}
++
++function Submit-VcfaCatalogRequest {
++    <# requestCatalogItemInstances - POST /catalog/api/items/{id}/request #>
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] [string] $ApiUri,
++        [Parameter(Mandatory)] [string] $Authorization,
++        [Parameter(Mandatory)] [string] $CatalogItemId,
++        [Parameter(Mandatory)] [string] $Json
++    )
++
++    $uri = '{0}/catalog/api/items/{1}/request' -f $ApiUri, [uri]::EscapeDataString($CatalogItemId)
++    return Invoke-RestMethod -Method Post -Uri $uri `
++        -Headers @{ Authorization = $Authorization } `
++        -Body $Json -ContentType 'application/json' -ErrorAction Stop
++}
++
++function Test-VcfaEffectMayHaveLanded {
++    <#
++        True when the failure leaves it genuinely unknown whether the appliance
++        acted: a 5xx, or an error that came back with no response at all. A 4xx
++        is the appliance saying it did nothing, and is not retried.
++    #>
++    [CmdletBinding()]
++    param([Parameter(Mandatory)] $ErrorRecord)
++
++    $exception = $ErrorRecord.Exception
++    if (-not $exception.PSObject.Properties['Response']) { return $true }
++
++    $response = $exception.Response
++    if ($null -eq $response) { return $true }
++    return ([int]$response.StatusCode) -ge 500
++}
++
++function New-VcfAutomationCatalogDeployment {
++    <#
++        .SYNOPSIS
++        Requests a catalog item from VCF Automation 9.1, at most once.
++
++        .DESCRIPTION
++        requestCatalogItemInstances allocates a new deployment on every accepted
++        call: the contract documents no idempotency key, no precondition header
++        and no de-duplication window. Retry safety therefore has to come from
++        the deployment name, which is unique within a project.
++
++        The deployment is looked up before anything is submitted. If it is
++        already there, this returns it and sends no request at all. If the
++        request is submitted and then fails in a way that leaves its outcome
++        unknown, the lookup runs again: a deployment that has appeared is the
++        request having landed after all, and is adopted rather than requested a
++        second time. Only a failure that provably created nothing is resent, and
++        only once.
++    #>
++    [CmdletBinding()]
++    [OutputType([pscustomobject])]
++    param(
++        [Parameter(Mandatory)] [ValidateNotNullOrEmpty()] [string] $ApiUri,
++        [Parameter(Mandatory)] [ValidateNotNullOrEmpty()] [string] $RefreshToken,
++        [Parameter(Mandatory)] [ValidateNotNullOrEmpty()] [string] $CatalogItemId,
++        [Parameter(Mandatory)] [ValidateNotNullOrEmpty()] [string] $DeploymentName,
++        [Parameter(Mandatory)] [ValidateNotNullOrEmpty()] [string] $ProjectId,
++        [hashtable] $Inputs,
++        [string] $Reason,
++        [string] $CatalogItemVersion
++    )
++
++    $ApiUri = $ApiUri.TrimEnd('/')
++    $authorization = Get-VcfaAccessToken -ApiUri $ApiUri -RefreshToken $RefreshToken
++
++    $lookup = @{
++        ApiUri         = $ApiUri
++        Authorization  = $authorization
++        DeploymentName = $DeploymentName
++        ProjectId      = $ProjectId
++    }
++
++    $lookupCount = 1
++    $existing = Find-VcfaDeployment @lookup
++    if ($existing) {
++        return [pscustomobject]@{
++            DeploymentId   = [string]$existing.id
++            DeploymentName = [string]$existing.name
++            Created        = $false
++            LookupCount    = $lookupCount
++        }
++    }
++
++    # Optional fields are only present when they carry a value. The appliance
++    # reads a property that is there as an instruction, so a null, an empty
++    # string or an empty object is not the same thing as leaving it out.
++    $body = [ordered]@{
++        deploymentName = $DeploymentName
++        projectId      = $ProjectId
++    }
++    if ($PSBoundParameters.ContainsKey('Inputs') -and $Inputs -and $Inputs.Count -gt 0) {
++        $body['inputs'] = $Inputs
++    }
++    if (-not [string]::IsNullOrEmpty($Reason)) {
++        $body['reason'] = $Reason
++    }
++    if (-not [string]::IsNullOrEmpty($CatalogItemVersion)) {
++        $body['version'] = $CatalogItemVersion
++    }
++    $json = $body | ConvertTo-Json -Depth $script:JsonDepth -Compress
++
++    $attempt = 0
++    while ($true) {
++        $attempt++
++        try {
++            $requested = @(Submit-VcfaCatalogRequest -ApiUri $ApiUri `
++                -Authorization $authorization -CatalogItemId $CatalogItemId -Json $json)
++            if ($requested.Count -eq 0) {
++                throw 'The catalog request was accepted but returned no deployment.'
++            }
++            return [pscustomobject]@{
++                DeploymentId   = [string]$requested[0].deploymentId
++                DeploymentName = [string]$requested[0].deploymentName
++                Created        = $true
++                LookupCount    = $lookupCount
++            }
++        } catch {
++            $failure = $_
++            if (-not (Test-VcfaEffectMayHaveLanded -ErrorRecord $failure)) { throw }
++            if ($attempt -ge 2) {
++                throw [System.Exception]::new(
++                    ("The catalog request for '{0}' failed, and its single resend " +
++                     'failed too: {1}') -f $DeploymentName, $failure.Exception.Message,
++                    $failure.Exception)
++            }
++
++            # The request may have been carried out even though the answer never
++            # arrived. Ask the appliance what it actually holds before deciding.
++            $landed = Find-VcfaDeployment @lookup
++            $lookupCount++
++            if ($landed) {
++                return [pscustomobject]@{
++                    DeploymentId   = [string]$landed.id
++                    DeploymentName = [string]$landed.name
++                    Created        = $true
++                    LookupCount    = $lookupCount
++                }
++            }
++        }
++    }
++}
++
++Export-ModuleMember -Function New-VcfAutomationCatalogDeployment

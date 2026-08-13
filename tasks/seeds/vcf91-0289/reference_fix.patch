@@ -1,0 +1,209 @@
+--- a/vcfonw_certrotate/client.py
++++ b/vcfonw_certrotate/client.py
+@@ -7,12 +7,46 @@
+ Standard library only.
+ """
+ 
+-from typing import Optional
++import json
++import time
++import urllib.error
++import urllib.parse
++import urllib.request
++from typing import Any, Dict, Optional, Tuple
+ 
+ from .model import ApiError, PollTimeoutError, RotationOutcome
+ 
+ __all__ = ["CertificateRotationClient"]
+ 
++# docs/contract.json -> source.server_base_path
++BASE_PATH = "/api/ni"
++# docs/contract.json -> security.header_value_format
++AUTH_HEADER = "Authorization"
++AUTH_PREFIX = "NetworkInsight"
++# docs/contract.json -> status_model
++TERMINAL_STATES = frozenset({"SUCCESS", "FAILED"})
++
++
++class _RejectRedirects(urllib.request.HTTPRedirectHandler):
++    """Keep every response on the one contract operation that was requested."""
++
++    def redirect_request(self, request, file_pointer, code, message, headers,
++                         new_url):
++        return None
++
++
++def _domain_payload(domain_type: Optional[str],
++                    domain_value: Optional[str]) -> Optional[Dict[str, str]]:
++    """Build the optional ``Domain`` object, dropping whatever was not supplied."""
++    if domain_type is None and domain_value is None:
++        return None
++    domain: Dict[str, str] = {}
++    if domain_type is not None:
++        domain["domain_type"] = domain_type
++    if domain_value is not None:
++        domain["value"] = domain_value
++    return domain
++
+ 
+ class CertificateRotationClient:
+     """Replaces an appliance certificate and follows the update to a terminal state.
+@@ -26,6 +60,83 @@
+         self.base_url = base_url.rstrip("/")
+         self.timeout = timeout
++        self._opener = urllib.request.build_opener(_RejectRedirects())
+ 
++    # -- transport ---------------------------------------------------------
++    def _request(self, method: str, path: str, *, body: Any = None,
++                 token: Optional[str] = None) -> Tuple[int, Any]:
++        url = self.base_url + BASE_PATH + path
++        headers = {"Accept": "application/json"}
++        data = None
++        if body is not None:
++            data = json.dumps(body).encode("utf-8")
++            headers["Content-Type"] = "application/json"
++        if token is not None:
++            headers[AUTH_HEADER] = "%s %s" % (AUTH_PREFIX, token)
++
++        request = urllib.request.Request(url, data=data, headers=headers, method=method)
++        try:
++            with self._opener.open(request, timeout=self.timeout) as response:
++                status = response.status
++                raw = response.read()
++        except urllib.error.HTTPError as error:
++            raw = error.read()
++            raise ApiError(
++                "%s %s answered %d" % (method, path, error.code),
++                status=error.code,
++                url=url,
++                body=_decode(raw),
++            ) from None
++        except urllib.error.URLError as error:
++            raise ApiError(
++                "%s %s could not be reached: %s" % (method, path, error.reason),
++                url=url,
++            ) from None
++        return status, _decode(raw)
++
++    # -- contract operations ------------------------------------------------
++    def _authenticate(self, username: str, password: str,
++                      domain: Optional[Dict[str, str]]) -> str:
++        """operationId: create -- POST /auth/token, sent without an auth header."""
++        credentials: Dict[str, Any] = {"username": username, "password": password}
++        if domain is not None:
++            credentials["domain"] = domain
++        status, payload = self._request("POST", "/auth/token", body=credentials)
++        token = payload.get("token") if isinstance(payload, dict) else None
++        if not token:
++            raise ApiError("token missing from the authentication response", status=status)
++        return token
++
++    def _submit_update(self, token: str, certificate_id: str, certificate_pem: str,
++                       private_key_pem: str, chain_pem: Optional[str]) -> Dict[str, Any]:
++        """operationId: updateCertificate -- PUT /settings/certificates/{id}."""
++        update: Dict[str, Any] = {
++            "certificate": certificate_pem,
++            "private_key": private_key_pem,
++        }
++        if chain_pem is not None:
++            update["chain"] = chain_pem
++        path = "/settings/certificates/%s" % urllib.parse.quote(certificate_id, safe="")
++        status, payload = self._request("PUT", path, body=update, token=token)
++        if not isinstance(payload, dict) or not payload.get("id"):
++            raise ApiError("accepted update did not carry an update id", status=status)
++        return payload
++
++    def _read_status(self, token: str, update_id: str) -> Dict[str, Any]:
++        """operationId: fetchCertificateUpdateStatusForUpdateId.
++
++        Keyed by the update id from the 202, not by the certificate id.
++        """
++        path = "/settings/certificates/status/%s" % urllib.parse.quote(update_id, safe="")
++        status, payload = self._request("GET", path, token=token)
++        if not isinstance(payload, dict):
++            raise ApiError("status response was not an object", status=status)
++        return payload
++
++    def _revoke(self, token: str) -> None:
++        """operationId: delete -- DELETE /auth/token."""
++        self._request("DELETE", "/auth/token", token=token)
++
++    # -- flow ---------------------------------------------------------------
+     def rotate(
+         self,
+         *,
+@@ -47,4 +158,73 @@
+         :class:`PollTimeoutError` if no terminal state is observed within
+         ``poll_timeout`` seconds.
+         """
+-        raise NotImplementedError("rotate() is not implemented yet")
++        domain = _domain_payload(domain_type, domain_value)
++        token = self._authenticate(username, password, domain)
++
++        try:
++            outcome = self._follow_update(
++                token=token,
++                certificate_id=certificate_id,
++                certificate_pem=certificate_pem,
++                private_key_pem=private_key_pem,
++                chain_pem=chain_pem,
++                poll_interval=poll_interval,
++                poll_timeout=poll_timeout,
++            )
++        except BaseException:
++            # The appliance caps valid tokens per user, so give this one back even
++            # when the update failed or never settled.
++            self._revoke_quietly(token)
++            raise
++
++        self._revoke(token)
++        return outcome
++
++    def _follow_update(self, *, token: str, certificate_id: str, certificate_pem: str,
++                       private_key_pem: str, chain_pem: Optional[str],
++                       poll_interval: float, poll_timeout: float) -> RotationOutcome:
++        accepted = self._submit_update(token, certificate_id, certificate_pem,
++                                       private_key_pem, chain_pem)
++        update_id = accepted["id"]
++        # The status on the 202 is an acknowledgement (SUBMITTED), never a result.
++        last_status = accepted.get("status")
++
++        deadline = time.monotonic() + poll_timeout
++        polls = 0
++        while True:
++            snapshot = self._read_status(token, update_id)
++            polls += 1
++            last_status = snapshot.get("status")
++            if last_status in TERMINAL_STATES:
++                return RotationOutcome(
++                    update_id=update_id,
++                    status=last_status,
++                    poll_count=polls,
++                    error_message=snapshot.get("error_message"),
++                    updated_nodes=list(snapshot.get("updated_nodes") or []),
++                    failed_nodes=list(snapshot.get("failed_nodes") or []),
++                )
++            if time.monotonic() + poll_interval > deadline:
++                raise PollTimeoutError(
++                    "certificate update %s was still %s after %.3fs"
++                    % (update_id, last_status, poll_timeout),
++                    update_id=update_id,
++                    last_status=last_status,
++                    poll_count=polls,
++                )
++            time.sleep(poll_interval)
++
++    def _revoke_quietly(self, token: str) -> None:
++        try:
++            self._revoke(token)
++        except ApiError:
++            pass
++
++
++def _decode(raw: bytes) -> Any:
++    if not raw:
++        return None
++    try:
++        return json.loads(raw.decode("utf-8"))
++    except (UnicodeDecodeError, ValueError):
++        return raw.decode("utf-8", "replace")

@@ -1,0 +1,345 @@
+diff --git a/VcfInstaller.Resilient/VcfInstaller.Resilient.psm1 b/VcfInstaller.Resilient/VcfInstaller.Resilient.psm1
+new file mode 100644
+index 0000000..891b7d1
+--- /dev/null
++++ b/VcfInstaller.Resilient/VcfInstaller.Resilient.psm1
+@@ -0,0 +1,339 @@
++Set-StrictMode -Version Latest
++
++$script:VcfInstallerSdkOperations = [ordered]@{
++    createToken        = 'Invoke-VcfInstallerCreateToken'
++    validateSddcSpec   = 'Invoke-VcfInstallerValidateSddcSpec'
++    deploySddc         = 'Invoke-VcfInstallerDeploySddc'
++    getTask            = 'Invoke-VcfInstallerGetTask'
++    refreshAccessToken = 'Invoke-VcfInstallerRefreshAccessToken'
++}
++
++function Assert-VcfInstallerSdkContract {
++    [CmdletBinding()]
++    param()
++
++    foreach ($entry in $script:VcfInstallerSdkOperations.GetEnumerator()) {
++        $command = Get-Command `
++            -Name $entry.Value `
++            -Module 'VMware.Sdk.Vcf.Installer' `
++            -ErrorAction SilentlyContinue
++        if ($null -eq $command) {
++            throw "VMware.Sdk.Vcf.Installer does not provide $($entry.Value) for operationId $($entry.Key)."
++        }
++    }
++}
++
++function ConvertFrom-SecureCredentialPassword {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [securestring] $SecureString
++    )
++
++    $pointer = [IntPtr]::Zero
++    try {
++        $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureString)
++        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer)
++    }
++    finally {
++        if ($pointer -ne [IntPtr]::Zero) {
++            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
++        }
++    }
++}
++
++function Get-SdkModelProperty {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [object] $InputObject,
++
++        [Parameter(Mandatory)]
++        [string] $Name
++    )
++
++    $property = $InputObject.PSObject.Properties |
++        Where-Object Name -IEQ $Name |
++        Select-Object -First 1
++    if ($null -eq $property) {
++        throw "The VMware SDK TokenCreationSpec model is missing property '$Name'."
++    }
++    return $property.Value
++}
++
++function ConvertTo-ContractJson {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [AllowNull()]
++        [object] $InputObject
++    )
++
++    return ($InputObject | ConvertTo-Json -Depth 100 -Compress)
++}
++
++function ConvertFrom-ContractJson {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [AllowEmptyString()]
++        [string] $Json
++    )
++
++    if ([string]::IsNullOrWhiteSpace($Json)) {
++        return $null
++    }
++    return ($Json | ConvertFrom-Json)
++}
++
++function New-ContractUri {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [uri] $ServerUri,
++
++        [Parameter(Mandatory)]
++        [string] $RelativeTarget
++    )
++
++    if (-not $ServerUri.IsAbsoluteUri) {
++        throw 'ServerUri must be an absolute URI.'
++    }
++    $base = $ServerUri.AbsoluteUri.TrimEnd('/')
++    return [uri]::new("$base$RelativeTarget")
++}
++
++function Invoke-ContractRequest {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [Net.Http.HttpClient] $Client,
++
++        [Parameter(Mandatory)]
++        [ValidateSet('GET', 'POST', 'PATCH')]
++        [string] $Method,
++
++        [Parameter(Mandatory)]
++        [uri] $Uri,
++
++        [Parameter()]
++        [AllowEmptyString()]
++        [string] $BodyJson,
++
++        [Parameter()]
++        [AllowEmptyString()]
++        [string] $AccessToken
++    )
++
++    $request = [Net.Http.HttpRequestMessage]::new(
++        [Net.Http.HttpMethod]::new($Method),
++        $Uri
++    )
++    $response = $null
++    try {
++        if ($PSBoundParameters.ContainsKey('AccessToken') -and
++            -not [string]::IsNullOrEmpty($AccessToken)) {
++            $request.Headers.Authorization =
++                [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $AccessToken)
++        }
++        if ($PSBoundParameters.ContainsKey('BodyJson')) {
++            $request.Content = [Net.Http.StringContent]::new(
++                $BodyJson,
++                [Text.Encoding]::UTF8,
++                'application/json'
++            )
++        }
++
++        $response = $Client.SendAsync($request).GetAwaiter().GetResult()
++        $responseBody = if ($null -eq $response.Content) {
++            ''
++        }
++        else {
++            $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
++        }
++        return [pscustomobject]@{
++            StatusCode = [int] $response.StatusCode
++            Body = $responseBody
++        }
++    }
++    finally {
++        if ($null -ne $response) {
++            $response.Dispose()
++        }
++        $request.Dispose()
++    }
++}
++
++function Assert-ContractStatus {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [object] $Response,
++
++        [Parameter(Mandatory)]
++        [int[]] $Expected,
++
++        [Parameter(Mandatory)]
++        [string] $OperationId
++    )
++
++    if ($Response.StatusCode -notin $Expected) {
++        throw "VCF Installer operationId $OperationId returned HTTP $($Response.StatusCode): $($Response.Body)"
++    }
++}
++
++function Invoke-VcfInstallerResilientDeployment {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [uri] $ServerUri,
++
++        [Parameter(Mandatory)]
++        [pscredential] $Credential,
++
++        [Parameter(Mandatory)]
++        [object] $SddcSpec,
++
++        [Parameter()]
++        [Nullable[bool]] $SkipValidations,
++
++        [Parameter()]
++        [ValidateRange(0, 3600)]
++        [int] $PollIntervalSeconds = 5,
++
++        [Parameter()]
++        [ValidateRange(1, 10000)]
++        [int] $MaxPollCount = 120
++    )
++
++    Assert-VcfInstallerSdkContract
++
++    $plainPassword = ConvertFrom-SecureCredentialPassword $Credential.Password
++    try {
++        $tokenModel =
++            VMware.Sdk.Vcf.Installer\Initialize-VcfInstallerTokenCreationSpec `
++                -Username $Credential.UserName `
++                -Password $plainPassword
++        # Explicit projection is intentional: optional apiKey and idToken are not
++        # part of this credential mode and therefore must not appear on the wire.
++        $tokenRequest = [ordered]@{
++            username = Get-SdkModelProperty $tokenModel 'username'
++            password = Get-SdkModelProperty $tokenModel 'password'
++        }
++        $tokenJson = ConvertTo-ContractJson $tokenRequest
++    }
++    finally {
++        $plainPassword = $null
++    }
++
++    $client = [Net.Http.HttpClient]::new()
++    try {
++        $tokenResponse = Invoke-ContractRequest `
++            -Client $client `
++            -Method POST `
++            -Uri (New-ContractUri $ServerUri '/v1/tokens') `
++            -BodyJson $tokenJson
++        $tokenJson = $null
++        Assert-ContractStatus $tokenResponse @(201) 'createToken'
++        $tokenPair = ConvertFrom-ContractJson $tokenResponse.Body
++        $accessToken = [string] $tokenPair.accessToken
++        $refreshTokenId = [string] $tokenPair.refreshToken.id
++        if ([string]::IsNullOrEmpty($accessToken) -or
++            [string]::IsNullOrEmpty($refreshTokenId)) {
++            throw 'createToken did not return both an access token and refresh-token id.'
++        }
++
++        $sddcJson = ConvertTo-ContractJson $SddcSpec
++        $validationResponse = Invoke-ContractRequest `
++            -Client $client `
++            -Method POST `
++            -Uri (New-ContractUri $ServerUri '/v1/sddcs/validations') `
++            -BodyJson $sddcJson `
++            -AccessToken $accessToken
++        Assert-ContractStatus $validationResponse @(200, 202) 'validateSddcSpec'
++
++        $deployTarget = '/v1/sddcs'
++        if ($PSBoundParameters.ContainsKey('SkipValidations')) {
++            $skipValue = if ($SkipValidations.Value) { 'true' } else { 'false' }
++            $deployTarget = "$deployTarget`?skipValidations=$skipValue"
++        }
++        $deployResponse = Invoke-ContractRequest `
++            -Client $client `
++            -Method POST `
++            -Uri (New-ContractUri $ServerUri $deployTarget) `
++            -BodyJson $sddcJson `
++            -AccessToken $accessToken
++        $sddcJson = $null
++        Assert-ContractStatus $deployResponse @(202) 'deploySddc'
++        $deploymentTask = ConvertFrom-ContractJson $deployResponse.Body
++        $taskId = [string] $deploymentTask.id
++        if ([string]::IsNullOrEmpty($taskId)) {
++            throw 'deploySddc did not return a task id.'
++        }
++
++        $escapedTaskId = [uri]::EscapeDataString($taskId)
++        $taskUri = New-ContractUri $ServerUri "/v1/tasks/$escapedTaskId"
++        $successfulStates = @('SUCCESSFUL', 'COMPLETED_WITH_SUCCESS')
++        $failedStates = @(
++            'FAILED',
++            'COMPLETED_WITH_FAILURE',
++            'COMPLETED_WITH_WARNING',
++            'CANCELLED',
++            'SKIPPED',
++            'TIMED_OUT',
++            'TIMED OUT',
++            'ROLLBACK_SUCCESS'
++        )
++
++        for ($poll = 0; $poll -lt $MaxPollCount; $poll++) {
++            $taskResponse = Invoke-ContractRequest `
++                -Client $client `
++                -Method GET `
++                -Uri $taskUri `
++                -AccessToken $accessToken
++
++            if ($taskResponse.StatusCode -eq 401) {
++                $refreshJson = ConvertTo-ContractJson $refreshTokenId
++                $refreshResponse = Invoke-ContractRequest `
++                    -Client $client `
++                    -Method PATCH `
++                    -Uri (New-ContractUri $ServerUri '/v1/tokens/access-token/refresh') `
++                    -BodyJson $refreshJson
++                $refreshJson = $null
++                Assert-ContractStatus $refreshResponse @(200) 'refreshAccessToken'
++                $accessToken = [string] (ConvertFrom-ContractJson $refreshResponse.Body)
++                if ([string]::IsNullOrEmpty($accessToken)) {
++                    throw 'refreshAccessToken returned an empty access token.'
++                }
++
++                # Only the failed, idempotent poll is retried. Earlier workflow
++                # steps, especially deploySddc, are never submitted again.
++                $taskResponse = Invoke-ContractRequest `
++                    -Client $client `
++                    -Method GET `
++                    -Uri $taskUri `
++                    -AccessToken $accessToken
++            }
++
++            Assert-ContractStatus $taskResponse @(200) 'getTask'
++            $task = ConvertFrom-ContractJson $taskResponse.Body
++            $status = [string] $task.status
++            if ($status -in $successfulStates) {
++                return $task
++            }
++            if ($status -in $failedStates) {
++                throw "VCF Installer task $taskId reached terminal state $status."
++            }
++            if ($PollIntervalSeconds -gt 0 -and $poll + 1 -lt $MaxPollCount) {
++                Start-Sleep -Seconds $PollIntervalSeconds
++            }
++        }
++
++        throw "VCF Installer task $taskId did not complete after $MaxPollCount polls."
++    }
++    finally {
++        $client.Dispose()
++    }
++}
++
++Export-ModuleMember -Function 'Invoke-VcfInstallerResilientDeployment'

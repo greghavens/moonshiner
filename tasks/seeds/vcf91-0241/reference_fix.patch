@@ -1,0 +1,283 @@
+--- a/module/VcfVsanDataProtection/VcfVsanDataProtection.psm1
++++ b/module/VcfVsanDataProtection/VcfVsanDataProtection.psm1
+@@ -12,22 +12,112 @@
+       Snapservice.Tasks_get
+ 
+     Requests are issued with the OpenAPI client runtime that ships with the
+-    VMware.Sdk.Vcf PowerCLI modules, for example:
++    VMware.Sdk.Vcf PowerCLI modules. That runtime returns non-success statuses
++    on the response object rather than throwing, so every call site inspects
++    StatusCode itself.
++#>
+ 
+-      $http   = [System.Net.Http.HttpClient]::new()
+-      $client = [VMware.Binding.OpenApi.Client.ApiClient]::new($http, $basePath, $handler)
+-      $config = [VMware.Binding.OpenApi.Client.Configuration]::new()
+-      $config.BasePath = $basePath
+-      $options = [VMware.Binding.OpenApi.Client.RequestOptions]::new()
+-      $options.PathParameters.Add('cluster', $Cluster)
+-      $options.QueryParameters.Add('vmw-task', 'true')
+-      $options.HeaderParameters.Add('vmware-api-session-id', $token)
+-      $options.Data = @{ name = $Name }
+-      $response = $client.Post[string]('/snapservice/clusters/{cluster}/...', $options, $config)
++$script:BasePathSuffix = '/api'
++$script:SessionHeader = 'vmware-api-session-id'
++$script:TerminalStatuses = @('SUCCEEDED', 'FAILED')
+ 
+-    $response exposes StatusCode, Data and ErrorText. Non-success statuses are
+-    returned rather than thrown, so callers must inspect StatusCode themselves.
+-#>
++function Resolve-VsanDpBasePath {
++    <#
++        Accepts either a bare host name (HTTPS is assumed) or an absolute
++        http/https URL, and returns the service base path.
++    #>
++    [CmdletBinding()]
++    param([Parameter(Mandatory)][string] $Server)
++
++    $trimmed = $Server.Trim()
++    if ([string]::IsNullOrWhiteSpace($trimmed)) {
++        throw [System.ArgumentException]::new('Server must not be blank.', 'Server')
++    }
++
++    $hasExplicitScheme = $trimmed -match '^[A-Za-z][A-Za-z0-9+.-]*://'
++    if (-not $hasExplicitScheme) {
++        $hostKind = [System.Uri]::CheckHostName($trimmed)
++        if ($hostKind -eq [System.UriHostNameType]::Unknown) {
++            throw [System.ArgumentException]::new("Server '$Server' must be a bare host name or an absolute http/https URL.", 'Server')
++        }
++        if ($hostKind -eq [System.UriHostNameType]::IPv6) { $trimmed = "[$trimmed]" }
++        $trimmed = 'https://' + $trimmed
++    }
++
++    $uri = $null
++    if (-not [System.Uri]::TryCreate($trimmed, [System.UriKind]::Absolute, [ref] $uri)) {
++        throw [System.ArgumentException]::new("Server '$Server' is not a valid address.", 'Server')
++    }
++    if ($uri.Scheme -notin @('http', 'https')) {
++        throw [System.ArgumentException]::new("Server '$Server' must use http or https.", 'Server')
++    }
++
++    return ($uri.GetLeftPart([System.UriPartial]::Authority).TrimEnd('/') + $script:BasePathSuffix)
++}
++
++function New-VsanDpApiClient {
++    [CmdletBinding()]
++    param([Parameter(Mandatory)][string] $BasePath, [switch] $SkipCertificateCheck)
++
++    $handler = [System.Net.Http.HttpClientHandler]::new()
++    if ($SkipCertificateCheck) {
++        $handler.ServerCertificateCustomValidationCallback =
++            [System.Net.Http.HttpClientHandler]::DangerousAcceptAnyServerCertificateValidator
++    }
++    $http = [System.Net.Http.HttpClient]::new($handler, $false)
++    return [VMware.Binding.OpenApi.Client.ApiClient]::new($http, $BasePath, $handler)
++}
++
++function Get-VsanDpInfoValue {
++    <#
++        Reads a property from a decoded response body, which the OpenAPI
++        runtime materialises as an ExpandoObject. Absent optional properties
++        yield $null rather than an error.
++    #>
++    [CmdletBinding()]
++    param($Body, [Parameter(Mandatory)][string] $Name)
++
++    if ($null -eq $Body) { return $null }
++    $dictionary = $Body -as [System.Collections.Generic.IDictionary[string, object]]
++    if ($null -ne $dictionary) {
++        if ($dictionary.ContainsKey($Name)) { return $dictionary[$Name] }
++        return $null
++    }
++    $property = $Body.PSObject.Properties[$Name]
++    if ($null -eq $property) { return $null }
++    return $property.Value
++}
++
++function Get-VsanDpFailureText {
++    [CmdletBinding()]
++    param($Info)
++
++    $messages = [System.Collections.Generic.List[string]]::new()
++    foreach ($name in @('error', 'description')) {
++        $node = Get-VsanDpInfoValue -Body $Info -Name $name
++        if ($null -eq $node) { continue }
++        $list = Get-VsanDpInfoValue -Body $node -Name 'messages'
++        if ($null -eq $list) { $list = @($node) }
++        foreach ($item in $list) {
++            $text = Get-VsanDpInfoValue -Body $item -Name 'default_message'
++            if (-not [string]::IsNullOrWhiteSpace([string]$text)) { $messages.Add([string]$text) }
++        }
++    }
++    if ($messages.Count -eq 0) { return 'no further detail was reported' }
++    return ($messages -join ' ')
++}
++
++function Assert-VsanDpConnection {
++    [CmdletBinding()]
++    param($Connection)
++
++    foreach ($name in @('BasePath', 'SessionId', 'ApiClient', 'Configuration')) {
++        if ($null -eq (Get-VsanDpInfoValue -Body $Connection -Name $name)) {
++            throw [System.ArgumentException]::new(
++                'Connection is not a vSAN Data Protection connection. Use Connect-VsanDpAppliance first.', 'Connection')
++        }
++    }
++}
+ 
+ function Connect-VsanDpAppliance {
+     <#
+@@ -52,7 +142,35 @@
+         [switch] $SkipCertificateCheck
+     )
+ 
+-    throw [System.NotImplementedException]::new('Connect-VsanDpAppliance is not implemented.')
++    $basePath = Resolve-VsanDpBasePath -Server $Server
++    $client = New-VsanDpApiClient -BasePath $basePath -SkipCertificateCheck:$SkipCertificateCheck
++    $configuration = [VMware.Binding.OpenApi.Client.Configuration]::new()
++    $configuration.BasePath = $basePath
++
++    $pair = '{0}:{1}' -f $Credential.UserName, $Credential.GetNetworkCredential().Password
++    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($pair))
++
++    $options = [VMware.Binding.OpenApi.Client.RequestOptions]::new()
++    $options.HeaderParameters.Add('Authorization', "Basic $encoded")
++
++    $response = $client.Post[string]('/snapservice/sessions', $options, $configuration)
++    if ([int]$response.StatusCode -ne 201) {
++        throw "Snapservice.Sessions_create failed with HTTP $([int]$response.StatusCode): $($response.ErrorText)"
++    }
++
++    $token = [string]$response.Data
++    if ([string]::IsNullOrWhiteSpace($token)) {
++        throw 'Snapservice.Sessions_create returned an empty session token.'
++    }
++
++    return [pscustomobject]@{
++        PSTypeName    = 'VcfVsanDataProtection.Connection'
++        Server        = $Server
++        BasePath      = $basePath
++        SessionId     = $token
++        ApiClient     = $client
++        Configuration = $configuration
++    }
+ }
+ 
+ function New-VsanDpProtectionGroupSnapshot {
+@@ -63,7 +181,7 @@
+     .DESCRIPTION
+         Calls Snapservice.Clusters.ProtectionGroups.Snapshots_create$Task and
+         then polls Snapservice.Tasks_get until the task reaches a terminal
+-        status.
++        status. PENDING, RUNNING and BLOCKED are not terminal.
+     #>
+     [CmdletBinding()]
+     [OutputType([psobject])]
+@@ -100,7 +218,106 @@
+         [int] $TimeoutSeconds = 120
+     )
+ 
+-    throw [System.NotImplementedException]::new('New-VsanDpProtectionGroupSnapshot is not implemented.')
++    Assert-VsanDpConnection -Connection $Connection
++
++    $hasDuration = $PSBoundParameters.ContainsKey('RetentionDuration')
++    $hasUnit = $PSBoundParameters.ContainsKey('RetentionUnit')
++    if ($hasDuration -ne $hasUnit) {
++        throw [System.ArgumentException]::new(
++            'A retention period requires both RetentionDuration and RetentionUnit; supply both or neither.')
++    }
++    if ($hasDuration -and $RetentionDuration -le 0) {
++        throw [System.ArgumentException]::new(
++            'RetentionDuration must be greater than zero.', 'RetentionDuration')
++    }
++
++    $client = $Connection.ApiClient
++    $configuration = $Connection.Configuration
++
++    # Snapservice.Clusters.ProtectionGroups.Snapshots.CreateSpec requires only
++    # name. retention is added only when the caller asked for one, so an unset
++    # optional property is absent from the request rather than null or empty.
++    $spec = [ordered]@{ name = $Name }
++    if ($hasDuration) {
++        $spec['retention'] = [ordered]@{
++            duration = [long]$RetentionDuration
++            unit     = $RetentionUnit
++        }
++    }
++
++    $options = [VMware.Binding.OpenApi.Client.RequestOptions]::new()
++    $options.PathParameters.Add('cluster', $Cluster)
++    $options.PathParameters.Add('pg', $ProtectionGroup)
++    $options.QueryParameters.Add('vmw-task', 'true')
++    $options.HeaderParameters.Add($script:SessionHeader, $Connection.SessionId)
++    $options.Data = $spec
++
++    $response = $client.Post[string](
++        '/snapservice/clusters/{cluster}/protection-groups/{pg}/snapshots', $options, $configuration)
++    if ([int]$response.StatusCode -ne 202) {
++        throw ("Snapservice.Clusters.ProtectionGroups.Snapshots_create`$Task failed with HTTP " +
++               "$([int]$response.StatusCode): $($response.ErrorText)")
++    }
++
++    $taskId = [string]$response.Data
++    if ([string]::IsNullOrWhiteSpace($taskId)) {
++        throw 'The snapshot request was accepted but no task identifier was returned.'
++    }
++
++    # HTTP 202 means the work was accepted, not that it finished. Follow the
++    # task until it reports a terminal status.
++    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
++    $pollCount = 0
++    while ($true) {
++        if ($pollCount -gt 0 -and $stopwatch.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
++            throw ("Protection group snapshot task '$taskId' did not reach a terminal status " +
++                   "within $TimeoutSeconds seconds.")
++        }
++
++        $pollOptions = [VMware.Binding.OpenApi.Client.RequestOptions]::new()
++        $pollOptions.PathParameters.Add('task', $taskId)
++        $pollOptions.HeaderParameters.Add($script:SessionHeader, $Connection.SessionId)
++
++        $pollResponse = $client.Get[System.Object]('/snapservice/tasks/{task}', $pollOptions, $configuration)
++        $pollCount++
++        if ([int]$pollResponse.StatusCode -ne 200) {
++            throw "Snapservice.Tasks_get failed for task '$taskId' with HTTP $([int]$pollResponse.StatusCode): $($pollResponse.ErrorText)"
++        }
++
++        $info = $pollResponse.Data
++        $status = [string](Get-VsanDpInfoValue -Body $info -Name 'status')
++        Write-Verbose "Task '$taskId' reported status '$status' on poll $pollCount."
++
++        if ($stopwatch.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
++            throw ("Protection group snapshot task '$taskId' did not reach a terminal status " +
++                   "within $TimeoutSeconds seconds; last reported status was '$status'.")
++        }
++
++        if ($status -in $script:TerminalStatuses) {
++            if ($status -eq 'FAILED') {
++                throw ("Protection group snapshot task '$taskId' failed: " +
++                       (Get-VsanDpFailureText -Info $info))
++            }
++
++            return [pscustomobject]@{
++                PSTypeName = 'VcfVsanDataProtection.SnapshotTaskResult'
++                TaskId     = $taskId
++                Status     = $status
++                Result     = Get-VsanDpInfoValue -Body $info -Name 'result'
++            }
++        }
++
++        if ($PollIntervalSeconds -gt 0) {
++            $remainingSeconds = $TimeoutSeconds - $stopwatch.Elapsed.TotalSeconds
++            if ($PollIntervalSeconds -ge $remainingSeconds) {
++                Start-Sleep -Milliseconds ([int][Math]::Ceiling($remainingSeconds * 1000))
++                throw ("Protection group snapshot task '$taskId' did not reach a terminal status " +
++                       "within $TimeoutSeconds seconds; last reported status was '$status'.")
++            }
++
++            Start-Sleep -Seconds $PollIntervalSeconds
++        }
++    }
+ }
+ 
+ Export-ModuleMember -Function 'Connect-VsanDpAppliance', 'New-VsanDpProtectionGroupSnapshot'

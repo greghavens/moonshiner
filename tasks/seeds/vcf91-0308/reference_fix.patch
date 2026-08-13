@@ -1,0 +1,262 @@
+--- a/src/VcfAutomation/VcfAutomation.psm1
++++ b/src/VcfAutomation/VcfAutomation.psm1
+@@ -1,25 +1,139 @@
+ Set-StrictMode -Version Latest
+ 
+-<#
+-.SYNOPSIS
+-    Submits one day-2 action request against every VCF Automation deployment in the tenant.
+-
+-.DESCRIPTION
+-    Pages through the VCF Automation deployments of the calling tenant, then submits one
+-    deployment action request per deployment, in ascending deployment-name order.
+-
+-    The bearer access token supplied to this function expires part way through the sweep.
+-    When that happens the function must exchange the API (refresh) token for a replacement
+-    access token and resume the interrupted request, without replaying deployments whose
+-    action request has already been accepted.
+-
+-    See docs/contract.json for the wire contract these calls must honor.
+-
+-.OUTPUTS
+-    One object per deployment, with exactly the properties DeploymentId, DeploymentName,
+-    RequestId and Status, ordered by DeploymentName ascending.
+-#>
++$script:ContractPageOperation = '/deployment/api/deployments'
++$script:ContractActionOperation = '/deployment/api/deployments/{0}/requests'
++$script:ContractTokenOperation = '/tm/oauth/tenant/{0}/token'
++
++function Get-VcfaResponse {
++    <#
++        Single HTTP exchange. Returns the raw web response so the caller can act on the
++        status code itself; 401 is a control-flow signal here, not an error.
++    #>
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] [string] $Method,
++        [Parameter(Mandatory)] [string] $Uri,
++        [Parameter(Mandatory)] [hashtable] $Headers,
++        [Parameter()] [AllowNull()] [string] $Body,
++        [Parameter()] [AllowNull()] [string] $ContentType,
++        [Parameter(Mandatory)] [int] $TimeoutSec
++    )
++
++    $call = @{
++        Method             = $Method
++        Uri                = $Uri
++        Headers            = $Headers
++        TimeoutSec         = $TimeoutSec
++        SkipHttpErrorCheck = $true
++        ErrorAction        = 'Stop'
++    }
++    if (-not [string]::IsNullOrEmpty($ContentType)) {
++        # Only a request that actually carries a body may declare a media type.
++        $call['Body'] = $Body
++        $call['ContentType'] = $ContentType
++    }
++
++    try {
++        return Invoke-WebRequest @call
++    }
++    catch {
++        # Do not relay transport-library text: it can include request details and this
++        # function promises that neither credential is ever exposed in an error.
++        throw "VCF Automation transport failure during $Method."
++    }
++}
++
++function ConvertFrom-VcfaPayload {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] [AllowNull()] $Response,
++        [Parameter(Mandatory)] [string] $Operation
++    )
++
++    $content = $Response.Content
++    if ($content -is [byte[]]) {
++        $content = [System.Text.Encoding]::UTF8.GetString($content)
++    }
++    if ([string]::IsNullOrWhiteSpace($content)) {
++        throw "VCF Automation returned an empty body for $Operation."
++    }
++    try {
++        return $content | ConvertFrom-Json -ErrorAction Stop
++    }
++    catch {
++        throw "VCF Automation returned a body that is not JSON for $Operation."
++    }
++}
++
++function Get-VcfaRequiredString {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] [AllowNull()] $Object,
++        [Parameter(Mandatory)] [string] $Property,
++        [Parameter(Mandatory)] [string] $Operation
++    )
++
++    if ($null -eq $Object) {
++        throw "VCF Automation returned a malformed response for $Operation."
++    }
++    $member = $Object.PSObject.Properties[$Property]
++    if ($null -eq $member -or $member.Value -isnot [string] -or
++        [string]::IsNullOrWhiteSpace([string]$member.Value)) {
++        throw "VCF Automation returned a malformed response for $Operation."
++    }
++    return [string]$member.Value
++}
++
++function Get-VcfaAccessToken {
++    <#
++        Exchanges the API (refresh) token for a replacement bearer access token.
++
++        The reference contract sends this operation as a form post with no Authorization
++        header: the API token is the credential and travels in the body, percent-encoded.
++    #>
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] [string] $BaseUri,
++        [Parameter(Mandatory)] [string] $Tenant,
++        [Parameter(Mandatory)] [string] $ApiToken,
++        [Parameter(Mandatory)] [int] $TimeoutSec
++    )
++
++    $uri = $BaseUri + ($script:ContractTokenOperation -f [uri]::EscapeDataString($Tenant))
++    $form = 'grant_type=refresh_token&refresh_token=' + [uri]::EscapeDataString($ApiToken)
++
++    $response = Get-VcfaResponse -Method 'POST' -Uri $uri `
++        -Headers @{ 'Accept' = 'application/json' } `
++        -Body $form -ContentType 'application/x-www-form-urlencoded' -TimeoutSec $TimeoutSec
++
++    if ([int]$response.StatusCode -ne 200) {
++        throw "VCF Automation refused to issue an access token (HTTP $([int]$response.StatusCode))."
++    }
++
++    $payload = ConvertFrom-VcfaPayload -Response $response -Operation 'getAccessToken'
++    return Get-VcfaRequiredString -Object $payload -Property 'access_token' -Operation 'getAccessToken'
++}
++
+ function Invoke-VcfaDeploymentActionSweep {
++    <#
++    .SYNOPSIS
++        Submits one day-2 action request against every VCF Automation deployment in the tenant.
++
++    .DESCRIPTION
++        Pages through the VCF Automation deployments of the calling tenant, then submits one
++        deployment action request per deployment, in ascending deployment-name order.
++
++        The bearer access token supplied to this function expires part way through the sweep.
++        When that happens the function exchanges the API (refresh) token for a replacement
++        access token and resumes the interrupted request, without replaying deployments whose
++        action request has already been accepted.
++
++        See docs/contract.json for the wire contract these calls honor.
++
++    .OUTPUTS
++        One object per deployment, with exactly the properties DeploymentId, DeploymentName,
++        RequestId and Status, ordered by DeploymentName ascending.
++    #>
+     [CmdletBinding()]
+     [OutputType([psobject[]])]
+     param(
+@@ -67,7 +181,99 @@
+         [int] $TimeoutSec = 30
+     )
+ 
+-    throw [System.NotImplementedException]::new('Invoke-VcfaDeploymentActionSweep is not implemented yet.')
++    $baseUri = $ApiEndpoint.TrimEnd('/')
++    # Held in a hashtable so the sender below mutates one shared object rather than a copy
++    # in its own child scope.
++    $state = @{ AccessToken = $AccessToken; Refreshed = $false }
++
++    # ResourceActionRequest members, in contract order. Anything the caller left unset is
++    # never added, so it is absent from the wire rather than sent null or empty.
++    $payload = [ordered]@{ actionId = $ActionId }
++    if ($PSBoundParameters.ContainsKey('Inputs') -and $null -ne $Inputs) {
++        $payload['inputs'] = $Inputs
++    }
++    if ($PSBoundParameters.ContainsKey('Reason') -and -not [string]::IsNullOrEmpty($Reason)) {
++        $payload['reason'] = $Reason
++    }
++    $actionBody = ConvertTo-Json -InputObject $payload -Depth 12 -Compress
++
++    # One attempt; on the first 401 only, refresh once and replay exactly the interrupted
++    # request. Requests that already succeeded are never re-sent.
++    $send = {
++        param(
++            [string] $Method,
++            [string] $Uri,
++            [AllowNull()] [string] $Body,
++            [AllowNull()] [string] $ContentType,
++            [string] $Operation
++        )
++
++        for ($attempt = 0; $attempt -lt 2; $attempt++) {
++            $headers = @{ 'Authorization' = 'Bearer ' + $state['AccessToken'] }
++            $response = Get-VcfaResponse -Method $Method -Uri $Uri -Headers $headers `
++                -Body $Body -ContentType $ContentType -TimeoutSec $TimeoutSec
++
++            $status = [int]$response.StatusCode
++            if ($status -eq 200) {
++                return $response
++            }
++            if ($status -eq 401 -and $Operation -eq 'submitDeploymentActionRequest' -and
++                -not $state['Refreshed']) {
++                $state['AccessToken'] = Get-VcfaAccessToken -BaseUri $baseUri -Tenant $Tenant `
++                    -ApiToken $ApiToken -TimeoutSec $TimeoutSec
++                $state['Refreshed'] = $true
++                continue
++            }
++            throw "VCF Automation rejected $Operation with HTTP $status."
++        }
++        throw "VCF Automation rejected $Operation after the access token was refreshed."
++    }
++
++    # --- collect every deployment page before acting on any of them.
++    $deployments = [System.Collections.Generic.List[object]]::new()
++    $page = 0
++    while ($true) {
++        $uri = '{0}{1}?page={2}&size={3}' -f $baseUri, $script:ContractPageOperation, $page, $PageSize
++        $response = & $send 'GET' $uri $null $null 'getDeployments'
++        $envelope = ConvertFrom-VcfaPayload -Response $response -Operation 'getDeployments'
++
++        $contentMember = $envelope.PSObject.Properties['content']
++        $lastMember = $envelope.PSObject.Properties['last']
++        if ($null -eq $contentMember -or $contentMember.Value -isnot [array] -or
++            $null -eq $lastMember -or $lastMember.Value -isnot [bool]) {
++            throw 'VCF Automation returned a malformed response for getDeployments.'
++        }
++        foreach ($item in $contentMember.Value) {
++            $id = Get-VcfaRequiredString -Object $item -Property 'id' -Operation 'getDeployments'
++            $name = Get-VcfaRequiredString -Object $item -Property 'name' -Operation 'getDeployments'
++            $deployments.Add([pscustomobject]@{ id = $id; name = $name })
++        }
++        if ($lastMember.Value) { break }
++        $page++
++        if ($page -gt 1000) {
++            throw 'VCF Automation deployment paging did not terminate.'
++        }
++    }
++
++    # --- one action request per deployment, in ascending name order.
++    $results = [System.Collections.Generic.List[psobject]]::new()
++    $ordered = $deployments | Sort-Object -Property @{ Expression = { [string]$_.name } }
++    foreach ($deployment in @($ordered)) {
++        $uri = $baseUri + ($script:ContractActionOperation -f [uri]::EscapeDataString([string]$deployment.id))
++        $response = & $send 'POST' $uri $actionBody 'application/json' 'submitDeploymentActionRequest'
++        $request = ConvertFrom-VcfaPayload -Response $response -Operation 'submitDeploymentActionRequest'
++        $requestId = Get-VcfaRequiredString -Object $request -Property 'id' -Operation 'submitDeploymentActionRequest'
++        $requestStatus = Get-VcfaRequiredString -Object $request -Property 'status' -Operation 'submitDeploymentActionRequest'
++
++        $results.Add([pscustomobject][ordered]@{
++                DeploymentId   = [string]$deployment.id
++                DeploymentName = [string]$deployment.name
++                RequestId      = $requestId
++                Status         = $requestStatus
++            })
++    }
++
++    return $results.ToArray()
+ }
+ 
+ Export-ModuleMember -Function 'Invoke-VcfaDeploymentActionSweep'

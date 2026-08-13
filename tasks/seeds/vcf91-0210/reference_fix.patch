@@ -1,0 +1,395 @@
+--- a/vcfinstaller/client.go
++++ b/vcfinstaller/client.go
+@@ -2,13 +2,20 @@
+ package vcfinstaller
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"io"
++	"mime"
+ 	"net/http"
++	"net/url"
++	"sort"
++	"strings"
+ 	"sync"
+ )
+ 
+ // Task is the result projection returned by ListTasks. Type is nil when the
+ // optional response member was absent.
+ type Task struct {
+@@ -48,17 +55,32 @@
+ 	workflowMu     sync.Mutex
+ }
+ 
+-// ErrNotImplemented is returned by the exercise stub.
+-var ErrNotImplemented = errors.New("VCF Installer task workflow is not implemented")
+-
+ // NewClient constructs a focused VCF Installer client. A nil HTTP client uses
+ // http.DefaultClient.
+ func NewClient(baseURL, accessToken, refreshTokenID string, httpClient *http.Client) (*Client, error) {
++	parsed, err := url.Parse(baseURL)
++	if err != nil || (!strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https")) || parsed.Host == "" || parsed.Hostname() == "" {
++		return nil, fmt.Errorf("baseURL must be an absolute HTTP(S) service root")
++	}
++	if parsed.User != nil || parsed.Opaque != "" || (parsed.Path != "" && parsed.Path != "/") || parsed.RawPath != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
++		return nil, fmt.Errorf("baseURL must not contain credentials, a path, query, or fragment")
++	}
++	if !nonblank(accessToken) {
++		return nil, fmt.Errorf("accessToken must be nonblank")
++	}
++	if !headerSafe(accessToken) {
++		return nil, fmt.Errorf("accessToken contains an invalid header character")
++	}
++	if !nonblank(refreshTokenID) {
++		return nil, fmt.Errorf("refreshTokenID must be nonblank")
++	}
++	parsed.Scheme = strings.ToLower(parsed.Scheme)
+ 	if httpClient == nil {
+ 		httpClient = http.DefaultClient
+ 	}
++	parsed.Path = ""
+ 	return &Client{
+-		baseURL:        baseURL,
++		baseURL:        strings.TrimSuffix(parsed.String(), "/"),
+ 		accessToken:    accessToken,
+ 		refreshTokenID: refreshTokenID,
+ 		httpClient:     httpClient,
+@@ -69,5 +91,333 @@
+ // collection. It refreshes the access token once when getTasks first returns
+ // HTTP 401 and resumes at the interrupted page.
+ func (c *Client) ListTasks(ctx context.Context, pageSize int) ([]Task, error) {
+-	return nil, ErrNotImplemented
++	if ctx == nil {
++		return nil, fmt.Errorf("ctx must not be nil")
++	}
++	if pageSize < 1 || pageSize > 100 {
++		return nil, fmt.Errorf("pageSize must be from 1 through 100")
++	}
++
++	c.workflowMu.Lock()
++	defer c.workflowMu.Unlock()
++
++	accessToken := c.accessToken
++	requestedPage := 0
++	firstPage := true
++	refreshed := false
++	haveTotals := false
++	expectedTotal := 0
++	expectedPages := 0
++	seenPages := make(map[int]struct{})
++	seenTaskIDs := make(map[string]struct{})
++	tasks := make([]Task, 0)
++
++	for {
++		target := fmt.Sprintf("/v1/tasks?pageSize=%d", pageSize)
++		if !firstPage {
++			target = fmt.Sprintf("/v1/tasks?pageNumber=%d&pageSize=%d", requestedPage, pageSize)
++		}
++
++		page, err := c.getTasksPage(ctx, target, accessToken)
++		if err != nil {
++			var apiError *APIError
++			if errors.As(err, &apiError) && apiError.OperationID == "getTasks" && apiError.StatusCode == http.StatusUnauthorized && !refreshed {
++				replacement, refreshErr := c.refreshAccessToken(ctx, accessToken)
++				if refreshErr != nil {
++					return nil, refreshErr
++				}
++				accessToken = replacement
++				c.accessToken = replacement
++				refreshed = true
++				continue
++			}
++			return nil, err
++		}
++
++		metadata := page.Metadata
++		if metadata.PageNumber < 0 || metadata.PageSize <= 0 || metadata.TotalElements < 0 || metadata.TotalPages < 0 {
++			return nil, protocol("getTasks", "pageMetadata contains an out-of-range value")
++		}
++		if metadata.PageSize != pageSize {
++			return nil, protocol("getTasks", "pageMetadata.pageSize changed")
++		}
++		if metadata.PageNumber != requestedPage {
++			return nil, protocol("getTasks", "returned an unrequested page")
++		}
++		if _, duplicate := seenPages[metadata.PageNumber]; duplicate {
++			return nil, protocol("getTasks", "repeated a page")
++		}
++		seenPages[metadata.PageNumber] = struct{}{}
++
++		calculatedPages := 0
++		if metadata.TotalElements > 0 {
++			calculatedPages = metadata.TotalElements / pageSize
++			if metadata.TotalElements%pageSize != 0 {
++				calculatedPages++
++			}
++		}
++		if metadata.TotalPages != calculatedPages {
++			return nil, protocol("getTasks", "pagination totals are incoherent")
++		}
++		if metadata.TotalElements > 0 && metadata.PageNumber >= metadata.TotalPages {
++			return nil, protocol("getTasks", "page number is outside totalPages")
++		}
++		if !haveTotals {
++			expectedTotal = metadata.TotalElements
++			expectedPages = metadata.TotalPages
++			haveTotals = true
++		} else if metadata.TotalElements != expectedTotal || metadata.TotalPages != expectedPages {
++			return nil, protocol("getTasks", "pagination totals changed")
++		}
++		if len(page.Elements) > pageSize {
++			return nil, protocol("getTasks", "returned an overfull page")
++		}
++		if len(page.Elements) == 0 && len(tasks) < expectedTotal {
++			return nil, protocol("getTasks", "returned an empty nonterminal page")
++		}
++
++		for _, task := range page.Elements {
++			if _, duplicate := seenTaskIDs[task.ID]; duplicate {
++				return nil, protocol("getTasks", "returned a duplicate task id")
++			}
++			seenTaskIDs[task.ID] = struct{}{}
++			tasks = append(tasks, task)
++		}
++		if len(tasks) > expectedTotal {
++			return nil, protocol("getTasks", "returned more tasks than declared")
++		}
++		if len(tasks) == expectedTotal {
++			if expectedTotal > 0 && (metadata.PageNumber != expectedPages-1 || len(seenPages) != expectedPages) {
++				return nil, protocol("getTasks", "ended before all declared pages completed")
++			}
++			break
++		}
++
++		nextPage := metadata.PageNumber + 1
++		if nextPage >= expectedPages {
++			return nil, protocol("getTasks", "pagination cannot make progress")
++		}
++		requestedPage = nextPage
++		firstPage = false
++	}
++
++	sort.Slice(tasks, func(left, right int) bool {
++		if tasks[left].CreationTimestamp == tasks[right].CreationTimestamp {
++			return tasks[left].ID < tasks[right].ID
++		}
++		return tasks[left].CreationTimestamp < tasks[right].CreationTimestamp
++	})
++	return tasks, nil
++}
++
++type taskPage struct {
++	Elements []Task
++	Metadata pageMetadata
++}
++
++type pageMetadata struct {
++	PageNumber    int
++	PageSize      int
++	TotalElements int
++	TotalPages    int
++}
++
++func (c *Client) getTasksPage(ctx context.Context, target, accessToken string) (taskPage, error) {
++	payload, err := c.requestJSON(ctx, "getTasks", http.MethodGet, target, nil, accessToken, http.StatusOK)
++	if err != nil {
++		return taskPage{}, err
++	}
++	var envelope struct {
++		Elements     json.RawMessage `json:"elements"`
++		PageMetadata json.RawMessage `json:"pageMetadata"`
++	}
++	if err := json.Unmarshal(payload, &envelope); err != nil {
++		return taskPage{}, protocol("getTasks", "response is not a JSON object")
++	}
++	if missingOrNull(envelope.Elements) || missingOrNull(envelope.PageMetadata) {
++		return taskPage{}, protocol("getTasks", "response omits elements or pageMetadata")
++	}
++	var rawTasks []json.RawMessage
++	if err := json.Unmarshal(envelope.Elements, &rawTasks); err != nil {
++		return taskPage{}, protocol("getTasks", "elements is not an array")
++	}
++	elements := make([]Task, len(rawTasks))
++	for index, rawTask := range rawTasks {
++		task, err := decodeTask(rawTask)
++		if err != nil {
++			return taskPage{}, err
++		}
++		elements[index] = task
++	}
++	metadata, err := decodeMetadata(envelope.PageMetadata)
++	if err != nil {
++		return taskPage{}, err
++	}
++	return taskPage{Elements: elements, Metadata: metadata}, nil
++}
++
++func (c *Client) refreshAccessToken(ctx context.Context, accessToken string) (string, error) {
++	body, err := json.Marshal(c.refreshTokenID)
++	if err != nil {
++		return "", protocol("refreshAccessToken", "could not encode refresh-token id")
++	}
++	payload, err := c.requestJSON(
++		ctx,
++		"refreshAccessToken",
++		http.MethodPatch,
++		"/v1/tokens/access-token/refresh",
++		body,
++		accessToken,
++		http.StatusOK,
++	)
++	if err != nil {
++		return "", err
++	}
++	var replacement string
++	if err := json.Unmarshal(payload, &replacement); err != nil || !nonblank(replacement) || !headerSafe(replacement) {
++		return "", protocol("refreshAccessToken", "response is not a usable JSON access-token string")
++	}
++	return replacement, nil
++}
++
++func (c *Client) requestJSON(
++	ctx context.Context,
++	operationID, method, target string,
++	body []byte,
++	accessToken string,
++	wantStatus int,
++) ([]byte, error) {
++	var requestBody io.Reader
++	if body != nil {
++		requestBody = bytes.NewReader(body)
++	}
++	request, err := http.NewRequestWithContext(ctx, method, c.baseURL+target, requestBody)
++	if err != nil {
++		return nil, fmt.Errorf("build %s request: %w", operationID, err)
++	}
++	request.Header.Set("Authorization", "Bearer "+accessToken)
++	request.Header.Set("Accept", "application/json")
++	if body != nil {
++		request.Header.Set("Content-Type", "application/json")
++	}
++
++	requestClient := &http.Client{
++		Transport: c.httpClient.Transport,
++		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
++			return http.ErrUseLastResponse
++		},
++		Jar:     c.httpClient.Jar,
++		Timeout: c.httpClient.Timeout,
++	}
++	response, err := requestClient.Do(request)
++	if err != nil {
++		if response != nil && response.Body != nil {
++			_ = response.Body.Close()
++		}
++		if contextError := ctx.Err(); contextError != nil {
++			return nil, fmt.Errorf("%s transport failed: %w", operationID, contextError)
++		}
++		return nil, fmt.Errorf("%s transport failed", operationID)
++	}
++	defer response.Body.Close()
++	if response.StatusCode != wantStatus {
++		return nil, &APIError{OperationID: operationID, StatusCode: response.StatusCode}
++	}
++	payload, readErr := io.ReadAll(response.Body)
++	if readErr != nil {
++		return nil, fmt.Errorf("read %s response failed", operationID)
++	}
++	mediaType, _, mediaErr := mime.ParseMediaType(response.Header.Get("Content-Type"))
++	if mediaErr != nil || mediaType != "application/json" {
++		return nil, protocol(operationID, "successful response is not application/json")
++	}
++	return payload, nil
++}
++
++func decodeTask(raw json.RawMessage) (Task, error) {
++	var object map[string]json.RawMessage
++	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
++		return Task{}, protocol("getTasks", "elements contains a non-object task")
++	}
++	id, err := requiredText(object, "id")
++	if err != nil {
++		return Task{}, err
++	}
++	name, err := requiredText(object, "name")
++	if err != nil {
++		return Task{}, err
++	}
++	status, err := requiredText(object, "status")
++	if err != nil {
++		return Task{}, err
++	}
++	created, err := requiredText(object, "creationTimestamp")
++	if err != nil {
++		return Task{}, err
++	}
++	var taskType *string
++	if rawType, present := object["type"]; present {
++		if missingOrNull(rawType) {
++			return Task{}, protocol("getTasks", "Task.type is not a string")
++		}
++		var value string
++		if err := json.Unmarshal(rawType, &value); err != nil {
++			return Task{}, protocol("getTasks", "Task.type is not a string")
++		}
++		taskType = &value
++	}
++	return Task{ID: id, Name: name, Type: taskType, Status: status, CreationTimestamp: created}, nil
++}
++
++func decodeMetadata(raw json.RawMessage) (pageMetadata, error) {
++	var object struct {
++		PageNumber    *int `json:"pageNumber"`
++		PageSize      *int `json:"pageSize"`
++		TotalElements *int `json:"totalElements"`
++		TotalPages    *int `json:"totalPages"`
++	}
++	if err := json.Unmarshal(raw, &object); err != nil {
++		return pageMetadata{}, protocol("getTasks", "pageMetadata is not an object with integer members")
++	}
++	if object.PageNumber == nil || object.PageSize == nil || object.TotalElements == nil || object.TotalPages == nil {
++		return pageMetadata{}, protocol("getTasks", "pageMetadata omits a required workflow member")
++	}
++	return pageMetadata{
++		PageNumber:    *object.PageNumber,
++		PageSize:      *object.PageSize,
++		TotalElements: *object.TotalElements,
++		TotalPages:    *object.TotalPages,
++	}, nil
++}
++
++func requiredText(object map[string]json.RawMessage, name string) (string, error) {
++	raw, present := object[name]
++	if !present || missingOrNull(raw) {
++		return "", protocol("getTasks", "Task."+name+" must be a nonblank string")
++	}
++	var value string
++	if err := json.Unmarshal(raw, &value); err != nil || !nonblank(value) {
++		return "", protocol("getTasks", "Task."+name+" must be a nonblank string")
++	}
++	return value, nil
++}
++
++func missingOrNull(raw json.RawMessage) bool {
++	return len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
++}
++
++func nonblank(value string) bool { return strings.TrimSpace(value) != "" }
++
++func headerSafe(value string) bool {
++	for index := 0; index < len(value); index++ {
++		character := value[index]
++		if (character < ' ' && character != '\t') || character == 0x7f {
++			return false
++		}
++	}
++	return true
++}
++
++func protocol(operationID, problem string) *ProtocolError {
++	return &ProtocolError{OperationID: operationID, Problem: problem}
+ }

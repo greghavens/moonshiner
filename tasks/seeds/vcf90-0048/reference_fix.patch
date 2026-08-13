@@ -1,0 +1,488 @@
+--- a/client.go
++++ b/client.go
+@@ -9,9 +9,12 @@
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"mime"
+ 	"net/http"
+ 	"net/url"
++	"strconv"
+ 	"strings"
++	"unicode"
+ )
+ 
+ const maxResponseBytes = 1 << 20
+@@ -30,9 +33,6 @@
+ // sessionHeader is the api_key_auth header named by the contract.
+ const sessionHeader = "vmware-api-session-id"
+ 
+-// ErrNotImplemented is returned by the incomplete workflow.
+-var ErrNotImplemented = errors.New("cpu sweep workflow is not implemented")
+-
+ // ReauthFunc is invoked immediately before each session refresh. It is never
+ // invoked for the initial login.
+ type ReauthFunc func(
+@@ -221,6 +221,7 @@
+ 		parsed.User != nil ||
+ 		parsed.RawQuery != "" ||
+ 		parsed.ForceQuery ||
++		strings.Contains(config.BaseURL, "#") ||
+ 		parsed.Fragment != "" ||
+ 		(parsed.Path != "" && parsed.Path != "/") {
+ 		return nil, errors.New("BaseURL must be an HTTP(S) origin")
+@@ -270,15 +271,114 @@
+ 	ctx context.Context,
+ 	request SweepRequest,
+ ) (SweepResult, error) {
+-	return SweepResult{}, ErrNotImplemented
++	var result SweepResult
++	if c == nil || c.httpClient == nil || c.onReauth == nil {
++		return result, errors.New("client is not initialized")
++	}
++	if ctx == nil {
++		return result, errors.New("context must not be nil")
++	}
++	if err := ctx.Err(); err != nil {
++		return result, err
++	}
++	if err := validateSweepRequest(request); err != nil {
++		return result, err
++	}
++
++	state := &session{}
++	if err := c.login(ctx, state); err != nil {
++		return result, err
++	}
++	targets, err := c.listTargets(ctx, state, request)
++	if err != nil {
++		result.Reauths = state.reauths
++		return result, err
++	}
++
++	for _, target := range targets {
++		info, err := c.getCPU(ctx, state, target.VM)
++		if err != nil {
++			result.Reauths = state.reauths
++			return result, err
++		}
++		changed, body, deferred := planUpdate(info, target.PowerState, request.Desired)
++		outcome := Outcome{
++			VM:         target.VM,
++			Name:       target.Name,
++			PowerState: target.PowerState,
++			Before:     info,
++			Changed:    changed,
++			Deferred:   deferred,
++		}
++		if len(changed) != 0 {
++			if err := c.updateCPU(ctx, state, target.VM, body); err != nil {
++				result.Reauths = state.reauths
++				return result, err
++			}
++			outcome.Updated = true
++		}
++		result.Outcomes = append(result.Outcomes, outcome)
++	}
++	result.Reauths = state.reauths
++	return result, nil
+ }
+ 
+ func validateSweepRequest(request SweepRequest) error {
+-	return ErrNotImplemented
++	desired := request.Desired
++	if desired.Count == nil &&
++		desired.CoresPerSocket == nil &&
++		desired.HotAddEnabled == nil &&
++		desired.HotRemoveEnabled == nil {
++		return errors.New("Desired must manage at least one UpdateSpec member")
++	}
++	if desired.Count != nil && *desired.Count < 1 {
++		return errors.New("Desired.Count must be positive")
++	}
++	if desired.CoresPerSocket != nil && *desired.CoresPerSocket < 1 {
++		return errors.New("Desired.CoresPerSocket must be positive")
++	}
++	if desired.Count != nil && desired.CoresPerSocket != nil &&
++		*desired.Count%*desired.CoresPerSocket != 0 {
++		return errors.New("Desired.Count must be a multiple of Desired.CoresPerSocket")
++	}
++	if err := validateFilter("Names", request.Names, nil); err != nil {
++		return err
++	}
++	return validateFilter(
++		"PowerStates",
++		request.PowerStates,
++		[]string{"POWERED_OFF", "POWERED_ON", "SUSPENDED"},
++	)
+ }
+ 
+ func validateFilter(field string, values []string, allowed []string) error {
+-	return ErrNotImplemented
++	seen := make(map[string]struct{}, len(values))
++	for _, value := range values {
++		if value == "" || strings.TrimSpace(value) != value {
++			return fmt.Errorf(
++				"%s entries must be nonblank and free of surrounding whitespace",
++				field,
++			)
++		}
++		if _, exists := seen[value]; exists {
++			return fmt.Errorf("%s entries must be unique", field)
++		}
++		seen[value] = struct{}{}
++		if allowed == nil {
++			continue
++		}
++		permitted := false
++		for _, candidate := range allowed {
++			if value == candidate {
++				permitted = true
++				break
++			}
++		}
++		if !permitted {
++			return fmt.Errorf("%s contains an unsupported value", field)
++		}
++	}
++	return nil
+ }
+ 
+ // planUpdate returns the UpdateSpec members that must be sent, the exact
+@@ -289,11 +389,71 @@
+ 	powerState string,
+ 	desired Desired,
+ ) ([]string, []byte, []string) {
+-	return nil, nil, nil
++	poweredOff := powerState == "POWERED_OFF"
++	var changed []string
++	var deferred []string
++	var members []string
++
++	if desired.Count != nil && *desired.Count != info.Count {
++		changed = append(changed, "count")
++		members = append(members, `"count":`+strconv.FormatInt(*desired.Count, 10))
++	}
++	if desired.CoresPerSocket != nil && *desired.CoresPerSocket != info.CoresPerSocket {
++		changed = append(changed, "cores_per_socket")
++		members = append(
++			members,
++			`"cores_per_socket":`+strconv.FormatInt(*desired.CoresPerSocket, 10),
++		)
++	}
++	if desired.HotAddEnabled != nil && *desired.HotAddEnabled != info.HotAddEnabled {
++		if poweredOff {
++			changed = append(changed, "hot_add_enabled")
++			members = append(
++				members,
++				`"hot_add_enabled":`+strconv.FormatBool(*desired.HotAddEnabled),
++			)
++		} else {
++			deferred = append(deferred, "hot_add_enabled")
++		}
++	}
++	if desired.HotRemoveEnabled != nil &&
++		*desired.HotRemoveEnabled != info.HotRemoveEnabled {
++		if poweredOff {
++			changed = append(changed, "hot_remove_enabled")
++			members = append(
++				members,
++				`"hot_remove_enabled":`+strconv.FormatBool(*desired.HotRemoveEnabled),
++			)
++		} else {
++			deferred = append(deferred, "hot_remove_enabled")
++		}
++	}
++	if len(changed) == 0 {
++		return nil, nil, deferred
++	}
++	return changed, []byte("{" + strings.Join(members, ",") + "}"), deferred
+ }
+ 
+ func (c *Client) login(ctx context.Context, state *session) error {
+-	return ErrNotImplemented
++	var token string
++	err := c.exchange(ctx, apiRequest{
++		operationID:   OpSessionCreate,
++		method:        http.MethodPost,
++		path:          basePath + "/session",
++		successStatus: http.StatusCreated,
++		basicAuth:     true,
++	}, "", &token)
++	if err != nil {
++		return err
++	}
++	if token == "" || strings.IndexFunc(token, unicode.IsSpace) >= 0 {
++		return &ProtocolError{
++			OperationID: OpSessionCreate,
++			Reason:      "the session token was blank or contained whitespace",
++		}
++	}
++	state.token = token
++	return nil
+ }
+ 
+ func (c *Client) listTargets(
+@@ -301,7 +461,36 @@
+ 	state *session,
+ 	request SweepRequest,
+ ) ([]VMSummary, error) {
+-	return nil, ErrNotImplemented
++	values := url.Values{}
++	for _, name := range request.Names {
++		values.Add("names", name)
++	}
++	for _, powerState := range request.PowerStates {
++		values.Add("power_states", powerState)
++	}
++
++	var summaries []VMSummary
++	err := c.call(ctx, state, apiRequest{
++		operationID:   OpVMList,
++		method:        http.MethodGet,
++		path:          basePath + "/vcenter/vm",
++		rawQuery:      values.Encode(),
++		successStatus: http.StatusOK,
++	}, &summaries)
++	if err != nil {
++		return nil, err
++	}
++	for _, summary := range summaries {
++		if strings.TrimSpace(summary.VM) == "" ||
++			strings.TrimSpace(summary.Name) == "" ||
++			strings.TrimSpace(summary.PowerState) == "" {
++			return nil, &ProtocolError{
++				OperationID: OpVMList,
++				Reason:      "a summary omitted a required member",
++			}
++		}
++	}
++	return summaries, nil
+ }
+ 
+ func (c *Client) getCPU(
+@@ -309,7 +498,34 @@
+ 	state *session,
+ 	vm string,
+ ) (CPUInfo, error) {
+-	return CPUInfo{}, ErrNotImplemented
++	var wire struct {
++		Count            *int64 `json:"count"`
++		CoresPerSocket   *int64 `json:"cores_per_socket"`
++		HotAddEnabled    *bool  `json:"hot_add_enabled"`
++		HotRemoveEnabled *bool  `json:"hot_remove_enabled"`
++	}
++	err := c.call(ctx, state, apiRequest{
++		operationID:   OpCPUGet,
++		method:        http.MethodGet,
++		path:          cpuPath(vm),
++		successStatus: http.StatusOK,
++	}, &wire)
++	if err != nil {
++		return CPUInfo{}, err
++	}
++	if wire.Count == nil || wire.CoresPerSocket == nil ||
++		wire.HotAddEnabled == nil || wire.HotRemoveEnabled == nil {
++		return CPUInfo{}, &ProtocolError{
++			OperationID: OpCPUGet,
++			Reason:      "the Cpu.Info response omitted a required member",
++		}
++	}
++	return CPUInfo{
++		Count:            *wire.Count,
++		CoresPerSocket:   *wire.CoresPerSocket,
++		HotAddEnabled:    *wire.HotAddEnabled,
++		HotRemoveEnabled: *wire.HotRemoveEnabled,
++	}, nil
+ }
+ 
+ func (c *Client) updateCPU(
+@@ -318,11 +534,17 @@
+ 	vm string,
+ 	body []byte,
+ ) error {
+-	return ErrNotImplemented
++	return c.call(ctx, state, apiRequest{
++		operationID:   OpCPUUpdate,
++		method:        http.MethodPatch,
++		path:          cpuPath(vm),
++		body:          body,
++		successStatus: http.StatusNoContent,
++	}, nil)
+ }
+ 
+ func cpuPath(vm string) string {
+-	return ""
++	return basePath + "/vcenter/vm/" + url.PathEscape(vm) + "/hardware/cpu"
+ }
+ 
+ // call performs a session-authenticated request, refreshing the session and
+@@ -333,7 +555,21 @@
+ 	request apiRequest,
+ 	out any,
+ ) error {
+-	return ErrNotImplemented
++	status, mediaType, payload, err := c.roundTrip(ctx, request, state.token)
++	if err != nil {
++		return err
++	}
++	if status != http.StatusUnauthorized {
++		return c.interpret(request, status, mediaType, payload, out)
++	}
++	if err := c.refresh(ctx, state, request.operationID); err != nil {
++		return err
++	}
++	status, mediaType, payload, err = c.roundTrip(ctx, request, state.token)
++	if err != nil {
++		return err
++	}
++	return c.interpret(request, status, mediaType, payload, out)
+ }
+ 
+ // refresh runs Cis.Session_create again within the configured budget.
+@@ -342,7 +578,24 @@
+ 	state *session,
+ 	operationID string,
+ ) error {
+-	return ErrNotImplemented
++	if state.reauths >= c.maxReauth {
++		return &ReauthLimitError{
++			OperationID: operationID,
++			Limit:       c.maxReauth,
++		}
++	}
++	attempt := state.reauths + 1
++	if err := c.onReauth(ctx, OpSessionCreate, attempt); err != nil {
++		return err
++	}
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	if err := c.login(ctx, state); err != nil {
++		return err
++	}
++	state.reauths = attempt
++	return nil
+ }
+ 
+ // exchange performs one request without any refresh handling.
+@@ -352,7 +605,11 @@
+ 	token string,
+ 	out any,
+ ) error {
+-	return ErrNotImplemented
++	status, mediaType, payload, err := c.roundTrip(ctx, request, token)
++	if err != nil {
++		return err
++	}
++	return c.interpret(request, status, mediaType, payload, out)
+ }
+ 
+ func (c *Client) roundTrip(
+@@ -360,7 +617,69 @@
+ 	request apiRequest,
+ 	token string,
+ ) (int, string, []byte, error) {
+-	return 0, "", nil, ErrNotImplemented
++	target := c.baseURL + request.path
++	if request.rawQuery != "" {
++		target += "?" + request.rawQuery
++	}
++
++	var reader io.Reader
++	if request.body != nil {
++		reader = bytes.NewReader(request.body)
++	}
++	httpRequest, err := http.NewRequestWithContext(
++		ctx,
++		request.method,
++		target,
++		reader,
++	)
++	if err != nil {
++		return 0, "", nil, &TransportError{
++			OperationID: request.operationID,
++			Err:         err,
++		}
++	}
++	httpRequest.Header.Set("Accept", "application/json")
++	if request.body != nil {
++		httpRequest.Header.Set("Content-Type", "application/json")
++	}
++	if request.basicAuth {
++		httpRequest.SetBasicAuth(c.username, c.password)
++	} else {
++		httpRequest.Header.Set(sessionHeader, token)
++	}
++
++	response, err := c.httpClient.Do(httpRequest)
++	if err != nil {
++		return 0, "", nil, &TransportError{
++			OperationID: request.operationID,
++			Err:         err,
++		}
++	}
++	defer func() {
++		_, _ = io.Copy(io.Discard, response.Body)
++		_ = response.Body.Close()
++	}()
++
++	payload, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
++	if err != nil {
++		return 0, "", nil, &TransportError{
++			OperationID: request.operationID,
++			Err:         err,
++		}
++	}
++	if len(payload) > maxResponseBytes {
++		return 0, "", nil, &ProtocolError{
++			OperationID: request.operationID,
++			Reason:      "the response body exceeded the accepted size",
++		}
++	}
++	mediaType := ""
++	if raw := response.Header.Get("Content-Type"); raw != "" {
++		if parsed, _, parseErr := mime.ParseMediaType(raw); parseErr == nil {
++			mediaType = parsed
++		}
++	}
++	return response.StatusCode, mediaType, payload, nil
+ }
+ 
+ func (c *Client) interpret(
+@@ -370,7 +689,34 @@
+ 	payload []byte,
+ 	out any,
+ ) error {
+-	return ErrNotImplemented
++	if status != request.successStatus {
++		return newAPIError(request.operationID, status, payload)
++	}
++	if request.successStatus == http.StatusNoContent {
++		if len(payload) != 0 {
++			return &ProtocolError{
++				OperationID: request.operationID,
++				Reason:      "the 204 response carried a body",
++			}
++		}
++		return nil
++	}
++	if mediaType != "application/json" {
++		return &ProtocolError{
++			OperationID: request.operationID,
++			Reason:      "the success response was not application/json",
++		}
++	}
++	if out == nil {
++		return nil
++	}
++	if err := decodeOneJSON(payload, out); err != nil {
++		return &ProtocolError{
++			OperationID: request.operationID,
++			Reason:      "the success response body was not a single JSON value",
++		}
++	}
++	return nil
+ }
+ 
+ func newAPIError(operationID string, status int, payload []byte) *APIError {

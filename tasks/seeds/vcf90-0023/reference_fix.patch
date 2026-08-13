@@ -1,0 +1,645 @@
+diff --git a/credrotate/rotate.go b/credrotate/rotate.go
+index 7978c97..13bf296 100644
+--- a/credrotate/rotate.go
++++ b/credrotate/rotate.go
+@@ -19,10 +19,17 @@
+ package credrotate
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
+ 	"strconv"
++	"strings"
++	"sync"
+ 	"time"
+ )
+ 
+@@ -34,6 +41,8 @@ type Key struct {
+ 	Username     string
+ }
+ 
++func (k Key) String() string { return k.ResourceName + "/" + k.Username }
++
+ // Secret is the credential a caller borrows to reach a VCF resource.
+ // Generation starts at 1 for every secret handed to NewStore and increases by
+ // one each time the appliance confirms a new password for that credential.
+@@ -47,14 +56,54 @@ type Secret struct {
+ // Its zero value is not usable; build one with NewStore. All methods are safe
+ // for concurrent use.
+ type Store struct {
+-	// Replaced by the implementation.
+-	unimplemented struct{}
++	mu      sync.Mutex
++	entries map[Key]*entry
++}
++
++type entry struct {
++	secret Secret
++	leases int
++	seal   *seal
++}
++
++// seal is one rotation's hold on a set of credentials. Acquire blocks on done
++// while the seal stands; drained closes once every borrower that held one of
++// the sealed secrets has handed it back.
++type seal struct {
++	keys     []Key
++	pending  int
++	drained  chan struct{}
++	done     chan struct{}
++	released bool
+ }
+ 
+ // NewStore builds a store over the supplied secrets. Every secret is stamped
+ // with generation 1. The supplied map is not retained.
+ func NewStore(secrets map[Key]Secret) (*Store, error) {
+-	return nil, errors.New("credrotate: NewStore is not implemented")
++	if len(secrets) == 0 {
++		return nil, errors.New("credrotate: NewStore needs at least one secret")
++	}
++	s := &Store{entries: make(map[Key]*entry, len(secrets))}
++	for k, v := range secrets {
++		if k.ResourceName == "" {
++			return nil, errors.New("credrotate: a store key needs a resource name")
++		}
++		if k.Username == "" {
++			return nil, fmt.Errorf("credrotate: the store key for %q needs a username", k.ResourceName)
++		}
++		if v.Username == "" {
++			v.Username = k.Username
++		}
++		if v.Username != k.Username {
++			return nil, fmt.Errorf("credrotate: the secret filed under %s carries a different username", k)
++		}
++		if v.Password == "" {
++			return nil, fmt.Errorf("credrotate: the secret for %s has no password", k)
++		}
++		v.Generation = 1
++		s.entries[k] = &entry{secret: v}
++	}
++	return s, nil
+ }
+ 
+ // Acquire borrows the current secret for key and returns a release function the
+@@ -63,12 +112,143 @@ func NewStore(secrets map[Key]Secret) (*Store, error) {
+ // secret is live afterwards. It returns ctx.Err() if ctx ends first, and an
+ // error if the store does not hold key.
+ func (s *Store) Acquire(ctx context.Context, key Key) (Secret, func(), error) {
+-	return Secret{}, nil, errors.New("credrotate: Acquire is not implemented")
++	if s == nil {
++		return Secret{}, nil, errors.New("credrotate: nil store")
++	}
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	for {
++		if err := ctx.Err(); err != nil {
++			return Secret{}, nil, err
++		}
++
++		s.mu.Lock()
++		e, ok := s.entries[key]
++		if !ok {
++			s.mu.Unlock()
++			return Secret{}, nil, fmt.Errorf("credrotate: the store holds no secret for %s", key)
++		}
++		if e.seal == nil {
++			e.leases++
++			secret := e.secret
++			s.mu.Unlock()
++
++			var once sync.Once
++			return secret, func() { once.Do(func() { s.handBack(key) }) }, nil
++		}
++		wait := e.seal.done
++		s.mu.Unlock()
++
++		select {
++		case <-wait:
++		case <-ctx.Done():
++			return Secret{}, nil, ctx.Err()
++		}
++	}
++}
++
++func (s *Store) handBack(key Key) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	e, ok := s.entries[key]
++	if !ok || e.leases == 0 {
++		return
++	}
++	e.leases--
++	if e.leases > 0 || e.seal == nil {
++		return
++	}
++	e.seal.pending--
++	if e.seal.pending == 0 {
++		close(e.seal.drained)
++	}
+ }
+ 
+ // Snapshot returns a copy of every secret the store currently holds.
+ func (s *Store) Snapshot() map[Key]Secret {
+-	return nil
++	if s == nil {
++		return nil
++	}
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	out := make(map[Key]Secret, len(s.entries))
++	for k, e := range s.entries {
++		out[k] = e.secret
++	}
++	return out
++}
++
++// takeSeal stops new borrowing of keys and counts how many of them are still
++// out on loan.
++func (s *Store) takeSeal(keys []Key) (*seal, error) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	for _, k := range keys {
++		e, ok := s.entries[k]
++		if !ok {
++			return nil, fmt.Errorf("credrotate: the store holds no secret for %s", k)
++		}
++		if e.seal != nil {
++			return nil, fmt.Errorf("credrotate: %s is already being rotated", k)
++		}
++	}
++
++	sl := &seal{
++		keys:    append([]Key(nil), keys...),
++		drained: make(chan struct{}),
++		done:    make(chan struct{}),
++	}
++	for _, k := range keys {
++		e := s.entries[k]
++		e.seal = sl
++		if e.leases > 0 {
++			sl.pending++
++		}
++	}
++	if sl.pending == 0 {
++		close(sl.drained)
++	}
++	return sl, nil
++}
++
++// drain waits until every borrower holding one of the sealed secrets has handed
++// it back, so the appliance can retire those secrets without stranding anyone.
++func (s *Store) drain(ctx context.Context, sl *seal) error {
++	select {
++	case <-sl.drained:
++		return nil
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++}
++
++// lift publishes the confirmed new passwords and releases the seal. A key with
++// no entry in confirmed keeps the secret it had. Calling it twice is harmless;
++// the second call does nothing.
++func (s *Store) lift(sl *seal, confirmed map[Key]string) {
++	if sl == nil {
++		return
++	}
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if sl.released {
++		return
++	}
++	sl.released = true
++	for _, k := range sl.keys {
++		e, ok := s.entries[k]
++		if !ok {
++			continue
++		}
++		if pw, changed := confirmed[k]; changed && pw != "" {
++			e.secret.Password = pw
++			e.secret.Generation++
++		}
++		e.seal = nil
++	}
++	close(sl.done)
+ }
+ 
+ // CredentialSpec is one credential of a resource to change. A blank optional
+@@ -197,14 +377,406 @@ type Client struct {
+ // NewClient builds a client for the SDDC Manager service root. A nil
+ // httpClient means http.DefaultClient.
+ func NewClient(baseURL, accessToken string, httpClient *http.Client) (*Client, error) {
+-	return nil, errors.New("credrotate: NewClient is not implemented")
++	if strings.TrimSpace(baseURL) == "" {
++		return nil, errors.New("credrotate: the SDDC Manager service root is empty")
++	}
++	u, err := url.Parse(baseURL)
++	if err != nil {
++		return nil, fmt.Errorf("credrotate: the SDDC Manager service root is not a URL: %w", err)
++	}
++	if u.Scheme != "http" && u.Scheme != "https" {
++		return nil, fmt.Errorf("credrotate: the SDDC Manager service root must be http or https, got %q", u.Scheme)
++	}
++	if u.Host == "" {
++		return nil, errors.New("credrotate: the SDDC Manager service root has no host")
++	}
++	if accessToken == "" {
++		return nil, errors.New("credrotate: the access token is empty")
++	}
++	for _, r := range accessToken {
++		if r < 0x21 || r > 0x7e {
++			return nil, errors.New("credrotate: the access token is not safe to put in a header")
++		}
++	}
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++
++	root := &url.URL{Scheme: u.Scheme, Host: u.Host, Path: strings.TrimRight(u.Path, "/")}
++	return &Client{baseURL: root.String(), accessToken: accessToken, httpClient: httpClient}, nil
++}
++
++// Vocabularies the pinned 9.0.0.0 document enumerates. The 9.1.0.0 revision
++// widens resourceType with HCX_MANAGER and VSP; a client pinned to 9.0.0.0
++// refuses those.
++var (
++	operationTypes = map[string]bool{
++		"UPDATE": true, "ROTATE": true, "REMEDIATE": true, "UPDATE_AUTO_ROTATE_POLICY": true,
++	}
++	resourceTypes = map[string]bool{
++		"ESXI": true, "VCENTER": true, "PSC": true, "NSXT_MANAGER": true,
++		"NSXT_EDGE": true, "NSX_ALB": true, "BACKUP": true,
++	}
++	nonTerminalStatuses = map[string]bool{"PENDING": true, "IN_PROGRESS": true}
++	terminalStatuses    = map[string]bool{
++		"SUCCESSFUL": true, "FAILED": true, "USER_CANCELLED": true, "INCONSISTENT": true,
++	}
++	cancellableStatuses = map[string]bool{"FAILED": true, "INCONSISTENT": true}
++)
++
++// Request bodies. Every optional member carries omitempty so an unset one is
++// absent from the encoding rather than sent as a placeholder; a required member
++// does not, so a zero value the appliance requires still travels.
++type wireCredential struct {
++	CredentialType string `json:"credentialType,omitempty"`
++	AccountType    string `json:"accountType,omitempty"`
++	Username       string `json:"username"`
++	Password       string `json:"password,omitempty"`
++}
++
++type wireResource struct {
++	ResourceName string           `json:"resourceName,omitempty"`
++	ResourceID   string           `json:"resourceId,omitempty"`
++	ResourceType string           `json:"resourceType"`
++	Credentials  []wireCredential `json:"credentials"`
++}
++
++type wireAutoRotate struct {
++	FrequencyInDays int32 `json:"frequencyInDays,omitempty"`
++	// enableAutoRotatePolicy is required, so false travels rather than being
++	// omitted.
++	EnableAutoRotatePolicy bool `json:"enableAutoRotatePolicy"`
++}
++
++type wireUpdateSpec struct {
++	OperationType    string          `json:"operationType"`
++	Elements         []wireResource  `json:"elements"`
++	AutoRotatePolicy *wireAutoRotate `json:"autoRotatePolicy,omitempty"`
++}
++
++// Response bodies.
++type wireError struct {
++	ErrorCode string `json:"errorCode"`
++	Message   string `json:"message"`
++}
++
++type wireTask struct {
++	ID                string      `json:"id"`
++	Name              string      `json:"name"`
++	Status            string      `json:"status"`
++	CreationTimestamp string      `json:"creationTimestamp"`
++	Errors            []wireError `json:"errors"`
++}
++
++type wireSubTask struct {
++	ResourceName string      `json:"resourceName"`
++	Username     string      `json:"username"`
++	Status       string      `json:"status"`
++	NewPassword  string      `json:"newPassword"`
++	Errors       []wireError `json:"errors"`
++}
++
++type wireCredentialsTask struct {
++	ID                string        `json:"id"`
++	Name              string        `json:"name"`
++	Type              string        `json:"type"`
++	Status            string        `json:"status"`
++	CreationTimestamp string        `json:"creationTimestamp"`
++	SubTasks          []wireSubTask `json:"subTasks"`
++	Errors            []wireError   `json:"errors"`
+ }
+ 
+ // Rotate applies req and waits for the resulting credentials task to settle,
+ // updating store from the settled subtasks before any sealed credential can be
+ // borrowed again.
+ func (c *Client) Rotate(ctx context.Context, store *Store, req RotateRequest, pollInterval time.Duration) (Result, error) {
+-	return Result{}, errors.New("credrotate: Rotate is not implemented")
++	if c == nil {
++		return Result{}, errors.New("credrotate: nil client")
++	}
++	if store == nil {
++		return Result{}, errors.New("credrotate: Rotate needs a store")
++	}
++	if pollInterval <= 0 {
++		return Result{}, errors.New("credrotate: the poll interval must be positive")
++	}
++	if ctx == nil {
++		ctx = context.Background()
++	}
++
++	keys, body, err := buildSpec(req, store)
++	if err != nil {
++		return Result{}, err
++	}
++
++	result := Result{Retained: append([]Key(nil), keys...)}
++
++	sl, err := store.takeSeal(keys)
++	if err != nil {
++		return result, err
++	}
++	// confirmed is filled from the settled subtasks; lift runs on every exit
++	// path, so an abandoned rotation never leaves a credential sealed.
++	confirmed := map[Key]string{}
++	defer store.lift(sl, confirmed)
++
++	// Nobody may still hold a secret the appliance is about to retire.
++	if err := store.drain(ctx, sl); err != nil {
++		return result, fmt.Errorf("credrotate: waiting for in-flight borrowers to hand back their secrets: %w", err)
++	}
++
++	var accepted wireTask
++	if err := c.call(ctx, "updateOrRotatePasswords", http.MethodPatch, "/v1/credentials", body, http.StatusAccepted, &accepted); err != nil {
++		return result, err
++	}
++	result.TaskID = accepted.ID
++	// The accepted representation is a Task, whose vocabulary carries mixed-case
++	// spellings, so normalize it before recording it.
++	result.TaskStatus = normalizeStatus(accepted.Status)
++	if strings.TrimSpace(accepted.ID) == "" || strings.TrimSpace(accepted.Name) == "" || strings.TrimSpace(accepted.Status) == "" || strings.TrimSpace(accepted.CreationTimestamp) == "" {
++		return result, errors.New("credrotate: updateOrRotatePasswords accepted the change with a Task missing a required member")
++	}
++
++	taskPath := "/v1/credentials/tasks/" + url.PathEscape(accepted.ID)
++
++	sealed := make(map[Key]bool, len(keys))
++	for _, k := range keys {
++		sealed[k] = true
++	}
++
++	// The accepted Task carries no subtasks, so getCredentialsTask runs at least
++	// once even when the accepted status already looks terminal.
++	for {
++		var task wireCredentialsTask
++		if err := c.call(ctx, "getCredentialsTask", http.MethodGet, taskPath, nil, http.StatusOK, &task); err != nil {
++			return result, err
++		}
++		status := normalizeStatus(task.Status)
++		result.TaskStatus = status
++		if task.ID != accepted.ID {
++			return result, fmt.Errorf("credrotate: getCredentialsTask returned task %q, want %q", task.ID, accepted.ID)
++		}
++
++		switch {
++		case nonTerminalStatuses[status]:
++			select {
++			case <-ctx.Done():
++				return result, fmt.Errorf("credrotate: waiting for credentials task %s: %w", accepted.ID, ctx.Err())
++			case <-time.After(pollInterval):
++			}
++			continue
++		case !terminalStatuses[status]:
++			return result, fmt.Errorf("credrotate: credentials task %s reported status %q, which the pinned 9.0.0.0 specification does not enumerate", accepted.ID, task.Status)
++		}
++
++		result.Outcomes = correlate(task.SubTasks, sealed, confirmed)
++		result.Rotated, result.Retained = partition(keys, confirmed)
++
++		if status == "SUCCESSFUL" {
++			result.Succeeded = true
++			return result, nil
++		}
++
++		// A failed credentials task stays on the appliance and blocks the next
++		// one, so retire it before reporting.
++		if cancellableStatuses[status] {
++			result.Cancelled = true
++			var cancelled wireTask
++			if err := c.call(ctx, "cancelCredentialsTask", http.MethodDelete, taskPath, nil, http.StatusAccepted, &cancelled); err != nil {
++				return result, err
++			}
++		}
++
++		code, message := firstError(task.Errors)
++		return result, &RotationFailedError{
++			TaskID:     accepted.ID,
++			TaskStatus: status,
++			ErrorCode:  code,
++			Message:    message,
++			Outcomes:   result.Outcomes,
++		}
++	}
++}
++
++// buildSpec validates req against the pinned vocabularies and against the
++// store, then encodes the CredentialsUpdateSpec body. It returns the affected
++// keys in request order.
++func buildSpec(req RotateRequest, store *Store) ([]Key, []byte, error) {
++	if !operationTypes[req.OperationType] {
++		return nil, nil, fmt.Errorf("credrotate: operationType %q is not one of UPDATE, ROTATE, REMEDIATE or UPDATE_AUTO_ROTATE_POLICY in the pinned 9.0.0.0 specification", req.OperationType)
++	}
++	if len(req.Resources) == 0 {
++		return nil, nil, errors.New("credrotate: a change needs at least one resource")
++	}
++
++	held := store.Snapshot()
++	spec := wireUpdateSpec{OperationType: req.OperationType}
++	var keys []Key
++	seen := map[Key]bool{}
++
++	for i, r := range req.Resources {
++		if r.ResourceName == "" {
++			return nil, nil, fmt.Errorf("credrotate: resource %d has no resource name, so its subtasks could not be correlated", i)
++		}
++		if !resourceTypes[r.ResourceType] {
++			return nil, nil, fmt.Errorf("credrotate: resource %q has resourceType %q, which the pinned 9.0.0.0 specification does not enumerate", r.ResourceName, r.ResourceType)
++		}
++		if len(r.Credentials) == 0 {
++			return nil, nil, fmt.Errorf("credrotate: resource %q lists no credentials", r.ResourceName)
++		}
++
++		element := wireResource{
++			ResourceName: r.ResourceName,
++			ResourceID:   r.ResourceID,
++			ResourceType: r.ResourceType,
++		}
++		for j, cred := range r.Credentials {
++			if cred.Username == "" {
++				return nil, nil, fmt.Errorf("credrotate: credential %d of resource %q has no username", j, r.ResourceName)
++			}
++			if req.OperationType == "UPDATE" {
++				if cred.Password == "" {
++					return nil, nil, fmt.Errorf("credrotate: an UPDATE must supply a password for %s on %s", cred.Username, r.ResourceName)
++				}
++			} else if cred.Password != "" {
++				return nil, nil, fmt.Errorf("credrotate: a %s must not supply a password for %s on %s; the appliance generates the replacement", req.OperationType, cred.Username, r.ResourceName)
++			}
++
++			k := Key{ResourceName: r.ResourceName, Username: cred.Username}
++			if seen[k] {
++				return nil, nil, fmt.Errorf("credrotate: %s appears twice in the same change", k)
++			}
++			if _, ok := held[k]; !ok {
++				return nil, nil, fmt.Errorf("credrotate: the store holds no secret for %s", k)
++			}
++			seen[k] = true
++			keys = append(keys, k)
++
++			element.Credentials = append(element.Credentials, wireCredential{
++				CredentialType: cred.CredentialType,
++				AccountType:    cred.AccountType,
++				Username:       cred.Username,
++				Password:       cred.Password,
++			})
++		}
++		spec.Elements = append(spec.Elements, element)
++	}
++
++	if req.AutoRotate != nil {
++		spec.AutoRotatePolicy = &wireAutoRotate{
++			FrequencyInDays:        req.AutoRotate.FrequencyInDays,
++			EnableAutoRotatePolicy: req.AutoRotate.Enable,
++		}
++	}
++
++	body, err := json.Marshal(spec)
++	if err != nil {
++		return nil, nil, fmt.Errorf("credrotate: encoding the change: %w", err)
++	}
++	return keys, body, nil
++}
++
++// correlate turns the settled subtasks into outcomes. A subtask naming neither
++// a resource nor a username is orchestration, not a credential, and a subtask
++// for a credential this change did not touch is not ours; both are skipped. A
++// confirmed new password goes into confirmed rather than into the outcome, so
++// no secret can reach a caller through Result.
++func correlate(subTasks []wireSubTask, sealed map[Key]bool, confirmed map[Key]string) []Outcome {
++	var out []Outcome
++	for _, st := range subTasks {
++		if st.ResourceName == "" || st.Username == "" {
++			continue
++		}
++		k := Key{ResourceName: st.ResourceName, Username: st.Username}
++		if !sealed[k] {
++			continue
++		}
++
++		status := normalizeStatus(st.Status)
++		o := Outcome{Key: k, Status: status}
++		if status == "SUCCESSFUL" && strings.TrimSpace(st.NewPassword) != "" {
++			o.SecretChanged = true
++			confirmed[k] = st.NewPassword
++		} else {
++			o.ErrorCode, o.Message = firstError(st.Errors)
++		}
++		out = append(out, o)
++	}
++	return out
+ }
+ 
+-var _ = time.Second
++func partition(keys []Key, confirmed map[Key]string) (rotated, retained []Key) {
++	for _, k := range keys {
++		if _, ok := confirmed[k]; ok {
++			rotated = append(rotated, k)
++			continue
++		}
++		retained = append(retained, k)
++	}
++	return rotated, retained
++}
++
++func firstError(errs []wireError) (code, message string) {
++	if len(errs) == 0 {
++		return "", ""
++	}
++	return errs[0].ErrorCode, errs[0].Message
++}
++
++// normalizeStatus trims a status, uppercases it, then collapses each run of
++// whitespace into a single underscore, so the Task vocabulary's "In Progress"
++// and the CredentialsTask vocabulary's "IN_PROGRESS" compare equal.
++func normalizeStatus(status string) string {
++	return strings.Join(strings.Fields(strings.ToUpper(strings.TrimSpace(status))), "_")
++}
++
++// call issues one contract operation. A nil body means the request carries no
++// body and therefore no Content-Type.
++func (c *Client) call(ctx context.Context, operationID, method, path string, body []byte, wantStatus int, out any) error {
++	var reader io.Reader
++	if body != nil {
++		reader = bytes.NewReader(body)
++	}
++
++	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
++	if err != nil {
++		return fmt.Errorf("credrotate: %s: building the request: %w", operationID, err)
++	}
++	req.Header.Set("Accept", "application/json")
++	req.Header.Set("Authorization", "Bearer "+c.accessToken)
++	if body != nil {
++		req.Header.Set("Content-Type", "application/json")
++	}
++
++	resp, err := c.httpClient.Do(req)
++	if err != nil {
++		return fmt.Errorf("credrotate: %s: %w", operationID, err)
++	}
++	defer func() {
++		_, _ = io.Copy(io.Discard, resp.Body)
++		_ = resp.Body.Close()
++	}()
++
++	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
++	if err != nil {
++		return fmt.Errorf("credrotate: %s: reading the response: %w", operationID, err)
++	}
++
++	if resp.StatusCode != wantStatus {
++		var e wireError
++		_ = json.Unmarshal(raw, &e)
++		return &APIError{
++			OperationID: operationID,
++			StatusCode:  resp.StatusCode,
++			ErrorCode:   e.ErrorCode,
++			Message:     e.Message,
++		}
++	}
++
++	if out == nil {
++		return nil
++	}
++	if err := json.Unmarshal(raw, out); err != nil {
++		return fmt.Errorf("credrotate: %s: decoding the response: %w", operationID, err)
++	}
++	return nil
++}

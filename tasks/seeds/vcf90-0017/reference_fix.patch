@@ -1,0 +1,1109 @@
+diff --git a/hostcommission/client.go b/hostcommission/client.go
+new file mode 100644
+index 0000000..933751c
+--- /dev/null
++++ b/hostcommission/client.go
+@@ -0,0 +1,534 @@
++package hostcommission
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
++	"time"
++)
++
++// Operation identifiers from docs/contract.json. Errors name the operation they
++// came from, so these are the strings that reach the caller.
++const (
++	opCreateToken   = "createToken"
++	opValidateHosts = "validateHostCommissionSpec"
++	opGetValidation = "getHostCommissionValidationByID"
++	opCommission    = "commissionHosts"
++	opGetTask       = "getTask"
++)
++
++// Paths from docs/contract.json. The 9.0.0.0 specification declares no base
++// path, so these hang directly off the appliance root.
++const (
++	pathTokens          = "/v1/tokens"
++	pathHosts           = "/v1/hosts"
++	pathHostValidations = "/v1/hosts/validations"
++	pathTasks           = "/v1/tasks"
++)
++
++// Defaults for the optional Config fields.
++const (
++	DefaultPollInterval    = 5 * time.Second
++	DefaultMaxPollAttempts = 60
++)
++
++// Sentinel errors, all matchable with errors.Is.
++var (
++	// ErrInvalidRequest reports a config or HostSpec problem found locally,
++	// before any HTTP request was made.
++	ErrInvalidRequest = errors.New("invalid request")
++	// ErrValidationFailed reports a host commission validation that reached a
++	// terminal state the flow cannot continue from.
++	ErrValidationFailed = errors.New("host commission validation failed")
++	// ErrTaskFailed reports a commissioning task that reached a terminal
++	// failure state.
++	ErrTaskFailed = errors.New("host commission task failed")
++	// ErrPollTimeout reports a status that was still non-terminal after
++	// MaxPollAttempts polls.
++	ErrPollTimeout = errors.New("polling timed out")
++	// ErrAPI reports a non-2xx answer from SDDC Manager.
++	ErrAPI = errors.New("sddc manager api error")
++)
++
++// Terminal and outcome vocabularies, canonicalized per
++// contract.statusVocabularies. A value outside these sets is non-terminal:
++// polling continues rather than guessing at an unrecognized status.
++var (
++	terminalTaskStatuses = map[string]bool{
++		"SUCCESSFUL": true, "COMPLETED_WITH_WARNING": true,
++		"FAILED": true, "CANCELLED": true, "SKIPPED": true,
++	}
++	successfulTaskStatuses = map[string]bool{
++		"SUCCESSFUL": true, "COMPLETED_WITH_WARNING": true,
++	}
++	terminalValidationStatuses = map[string]bool{
++		"COMPLETED": true, "FAILED": true, "UNKNOWN": true,
++		"SKIPPED": true, "CANCELLED": true,
++	}
++	acceptableValidationResults = map[string]bool{
++		"SUCCEEDED": true, "WARNING": true,
++	}
++)
++
++// canonical applies the normalization docs/contract.json documents for both
++// status vocabularies: uppercase, spaces to underscores. It is what lets
++// "In Progress" and "IN_PROGRESS" compare equal.
++func canonical(status string) string {
++	return strings.ReplaceAll(strings.ToUpper(strings.TrimSpace(status)), " ", "_")
++}
++
++// Config configures a Client.
++type Config struct {
++	// BaseURL is the SDDC Manager appliance root, without a path.
++	BaseURL string
++	// Username and Password authenticate createToken.
++	Username string
++	Password string
++	// HTTPClient is optional; http.DefaultClient is used when nil.
++	HTTPClient *http.Client
++	// PollInterval is the wait between polls. Zero selects
++	// DefaultPollInterval.
++	PollInterval time.Duration
++	// MaxPollAttempts bounds each polling loop independently. Zero selects
++	// DefaultMaxPollAttempts.
++	MaxPollAttempts int
++}
++
++// HostSpec is one HostCommissionSpec. The first five fields are required; the
++// rest are optional and are omitted from the request when left unset.
++type HostSpec struct {
++	FQDN          string
++	Username      string
++	Password      string
++	StorageType   string
++	NetworkPoolID string
++
++	NetworkPoolName         string
++	VVolStorageProtocolType string
++	SSHThumbprint           string
++	SSLThumbprint           string
++}
++
++// ValidationCheck is one entry of Validation.validationChecks.
++type ValidationCheck struct {
++	Description  string
++	Severity     string
++	ResultStatus string
++}
++
++// Validation is a host commission validation as of its terminal poll.
++type Validation struct {
++	ID              string
++	Description     string
++	ExecutionStatus string
++	ResultStatus    string
++	Checks          []ValidationCheck
++}
++
++// Task is a commissioning task as of its terminal poll.
++type Task struct {
++	ID                  string
++	Name                string
++	Type                string
++	Status              string
++	CreationTimestamp   string
++	CompletionTimestamp string
++	Errors              []string
++}
++
++// Result is the outcome of a completed commissioning flow.
++type Result struct {
++	Validation Validation
++	Task       Task
++	// ValidationPolls and TaskPolls count the getHostCommissionValidationByID
++	// and getTask calls the flow made.
++	ValidationPolls int
++	TaskPolls       int
++}
++
++// Client commissions hosts against one SDDC Manager appliance.
++type Client struct {
++	baseURL         string
++	username        string
++	password        string
++	httpClient      *http.Client
++	pollInterval    time.Duration
++	maxPollAttempts int
++}
++
++// New validates cfg and returns a Client. It performs no I/O.
++func New(cfg Config) (*Client, error) {
++	if strings.TrimSpace(cfg.BaseURL) == "" {
++		return nil, fmt.Errorf("%w: BaseURL is required", ErrInvalidRequest)
++	}
++	parsed, err := url.Parse(strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/"))
++	if err != nil {
++		return nil, fmt.Errorf("%w: BaseURL %q: %v", ErrInvalidRequest, cfg.BaseURL, err)
++	}
++	if parsed.Scheme == "" || parsed.Host == "" {
++		return nil, fmt.Errorf("%w: BaseURL %q needs a scheme and a host", ErrInvalidRequest, cfg.BaseURL)
++	}
++	if !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
++		return nil, fmt.Errorf("%w: BaseURL %q must use http or https", ErrInvalidRequest, cfg.BaseURL)
++	}
++	if parsed.User != nil {
++		return nil, fmt.Errorf("%w: BaseURL %q must not contain user info", ErrInvalidRequest, cfg.BaseURL)
++	}
++	if parsed.Path != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
++		return nil, fmt.Errorf("%w: BaseURL %q must be the appliance root without a path, query, or fragment",
++			ErrInvalidRequest, cfg.BaseURL)
++	}
++	if cfg.Username == "" {
++		return nil, fmt.Errorf("%w: Username is required", ErrInvalidRequest)
++	}
++	if cfg.Password == "" {
++		return nil, fmt.Errorf("%w: Password is required", ErrInvalidRequest)
++	}
++	if cfg.PollInterval < 0 {
++		return nil, fmt.Errorf("%w: PollInterval must not be negative", ErrInvalidRequest)
++	}
++	if cfg.MaxPollAttempts < 0 {
++		return nil, fmt.Errorf("%w: MaxPollAttempts must not be negative", ErrInvalidRequest)
++	}
++
++	c := &Client{
++		baseURL:         strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/"),
++		username:        cfg.Username,
++		password:        cfg.Password,
++		httpClient:      cfg.HTTPClient,
++		pollInterval:    cfg.PollInterval,
++		maxPollAttempts: cfg.MaxPollAttempts,
++	}
++	if c.httpClient == nil {
++		c.httpClient = http.DefaultClient
++	}
++	if c.pollInterval == 0 {
++		c.pollInterval = DefaultPollInterval
++	}
++	if c.maxPollAttempts == 0 {
++		c.maxPollAttempts = DefaultMaxPollAttempts
++	}
++	return c, nil
++}
++
++// CommissionHosts runs the whole flow: acquire a token, validate the host
++// specifications, poll the validation to a terminal state, commission the
++// hosts, then poll the resulting task to a terminal state.
++//
++// It returns a nil Result on any error.
++func (c *Client) CommissionHosts(ctx context.Context, hosts []HostSpec) (*Result, error) {
++	if err := validateHostSpecs(hosts); err != nil {
++		return nil, err
++	}
++	body := hostSpecsWire(hosts)
++
++	token, err := c.createToken(ctx)
++	if err != nil {
++		return nil, err
++	}
++
++	accepted, err := c.startValidation(ctx, token, body)
++	if err != nil {
++		return nil, err
++	}
++	validation, validationPolls, err := c.pollValidation(ctx, token, accepted.ID)
++	if err != nil {
++		return nil, err
++	}
++	if canonical(validation.ExecutionStatus) != "COMPLETED" ||
++		!acceptableValidationResults[canonical(validation.ResultStatus)] {
++		return nil, fmt.Errorf("%w: executionStatus %q, resultStatus %q%s",
++			ErrValidationFailed, validation.ExecutionStatus, validation.ResultStatus,
++			failedChecks(validation))
++	}
++
++	task, err := c.startCommission(ctx, token, body)
++	if err != nil {
++		return nil, err
++	}
++	task, taskPolls, err := c.pollTask(ctx, token, task.ID)
++	if err != nil {
++		return nil, err
++	}
++	if !successfulTaskStatuses[canonical(task.Status)] {
++		detail := ""
++		if len(task.Errors) > 0 {
++			detail = ": " + strings.Join(task.Errors, "; ")
++		}
++		return nil, fmt.Errorf("%w: task %s reached status %q%s",
++			ErrTaskFailed, task.ID, task.Status, detail)
++	}
++
++	return &Result{
++		Validation:      validation,
++		Task:            task,
++		ValidationPolls: validationPolls,
++		TaskPolls:       taskPolls,
++	}, nil
++}
++
++func validateHostSpecs(hosts []HostSpec) error {
++	if len(hosts) == 0 {
++		return fmt.Errorf("%w: at least one HostSpec is required", ErrInvalidRequest)
++	}
++	seen := map[string]int{}
++	for i, h := range hosts {
++		missing := []string{}
++		if h.FQDN == "" {
++			missing = append(missing, "FQDN")
++		}
++		if h.Username == "" {
++			missing = append(missing, "Username")
++		}
++		if h.Password == "" {
++			missing = append(missing, "Password")
++		}
++		if h.StorageType == "" {
++			missing = append(missing, "StorageType")
++		}
++		if h.NetworkPoolID == "" {
++			missing = append(missing, "NetworkPoolID")
++		}
++		if len(missing) > 0 {
++			return fmt.Errorf("%w: hosts[%d]: %s must be set",
++				ErrInvalidRequest, i, strings.Join(missing, ", "))
++		}
++		isVVol := canonical(h.StorageType) == "VVOL"
++		switch {
++		case isVVol && h.VVolStorageProtocolType == "":
++			return fmt.Errorf("%w: hosts[%d]: StorageType VVOL requires VVolStorageProtocolType",
++				ErrInvalidRequest, i)
++		case !isVVol && h.VVolStorageProtocolType != "":
++			return fmt.Errorf("%w: hosts[%d]: VVolStorageProtocolType applies only to StorageType VVOL, not %q",
++				ErrInvalidRequest, i, h.StorageType)
++		}
++		key := strings.ToLower(h.FQDN)
++		if first, dup := seen[key]; dup {
++			return fmt.Errorf("%w: hosts[%d] repeats the FQDN of hosts[%d]: %s",
++				ErrInvalidRequest, i, first, h.FQDN)
++		}
++		seen[key] = i
++	}
++	return nil
++}
++
++func failedChecks(v Validation) string {
++	var out []string
++	for _, c := range v.Checks {
++		if canonical(c.ResultStatus) == "SUCCEEDED" {
++			continue
++		}
++		out = append(out, fmt.Sprintf("%s: %s", c.ResultStatus, c.Description))
++	}
++	if len(out) == 0 {
++		return ""
++	}
++	return ": " + strings.Join(out, "; ")
++}
++
++func (c *Client) createToken(ctx context.Context) (string, error) {
++	var pair tokenPairWire
++	err := c.do(ctx, request{
++		operationID: opCreateToken,
++		method:      http.MethodPost,
++		path:        pathTokens,
++		body:        tokenCreationSpecWire{Username: c.username, Password: c.password},
++	}, &pair)
++	if err != nil {
++		return "", err
++	}
++	if pair.AccessToken == "" {
++		return "", fmt.Errorf("%s: %w: response carried no accessToken", opCreateToken, ErrAPI)
++	}
++	return pair.AccessToken, nil
++}
++
++func (c *Client) startValidation(ctx context.Context, token string, body []hostCommissionSpecWire) (Validation, error) {
++	var wire validationWire
++	err := c.do(ctx, request{
++		operationID: opValidateHosts,
++		method:      http.MethodPost,
++		path:        pathHostValidations,
++		body:        body,
++		token:       token,
++	}, &wire)
++	if err != nil {
++		return Validation{}, err
++	}
++	if wire.ID == "" {
++		return Validation{}, fmt.Errorf("%s: %w: response carried no validation id", opValidateHosts, ErrAPI)
++	}
++	return wire.public(), nil
++}
++
++func (c *Client) pollValidation(ctx context.Context, token, id string) (Validation, int, error) {
++	for attempt := 1; attempt <= c.maxPollAttempts; attempt++ {
++		var wire validationWire
++		err := c.do(ctx, request{
++			operationID: opGetValidation,
++			method:      http.MethodGet,
++			path:        pathHostValidations + "/" + url.PathEscape(id),
++			token:       token,
++		}, &wire)
++		if err != nil {
++			return Validation{}, attempt, err
++		}
++		if terminalValidationStatuses[canonical(wire.ExecutionStatus)] {
++			return wire.public(), attempt, nil
++		}
++		if attempt == c.maxPollAttempts {
++			break
++		}
++		if err := wait(ctx, c.pollInterval); err != nil {
++			return Validation{}, attempt, err
++		}
++	}
++	return Validation{}, c.maxPollAttempts, fmt.Errorf(
++		"%s: %w: validation %s was still not terminal after %d polls",
++		opGetValidation, ErrPollTimeout, id, c.maxPollAttempts)
++}
++
++func (c *Client) startCommission(ctx context.Context, token string, body []hostCommissionSpecWire) (Task, error) {
++	var wire taskWire
++	err := c.do(ctx, request{
++		operationID: opCommission,
++		method:      http.MethodPost,
++		path:        pathHosts,
++		body:        body,
++		token:       token,
++	}, &wire)
++	if err != nil {
++		return Task{}, err
++	}
++	if wire.ID == "" {
++		return Task{}, fmt.Errorf("%s: %w: response carried no task id", opCommission, ErrAPI)
++	}
++	return wire.public(), nil
++}
++
++func (c *Client) pollTask(ctx context.Context, token, id string) (Task, int, error) {
++	for attempt := 1; attempt <= c.maxPollAttempts; attempt++ {
++		var wire taskWire
++		err := c.do(ctx, request{
++			operationID: opGetTask,
++			method:      http.MethodGet,
++			path:        pathTasks + "/" + url.PathEscape(id),
++			token:       token,
++		}, &wire)
++		if err != nil {
++			return Task{}, attempt, err
++		}
++		if terminalTaskStatuses[canonical(wire.Status)] {
++			return wire.public(), attempt, nil
++		}
++		if attempt == c.maxPollAttempts {
++			break
++		}
++		if err := wait(ctx, c.pollInterval); err != nil {
++			return Task{}, attempt, err
++		}
++	}
++	return Task{}, c.maxPollAttempts, fmt.Errorf(
++		"%s: %w: task %s was still not terminal after %d polls",
++		opGetTask, ErrPollTimeout, id, c.maxPollAttempts)
++}
++
++// wait sleeps for d, or returns early if ctx is cancelled first.
++func wait(ctx context.Context, d time.Duration) error {
++	if d <= 0 {
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		default:
++			return nil
++		}
++	}
++	timer := time.NewTimer(d)
++	defer timer.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-timer.C:
++		return nil
++	}
++}
++
++type request struct {
++	operationID string
++	method      string
++	path        string
++	body        any // nil for GET
++	token       string
++}
++
++func (c *Client) do(ctx context.Context, req request, out any) error {
++	var payload io.Reader
++	if req.body != nil {
++		encoded, err := json.Marshal(req.body)
++		if err != nil {
++			return fmt.Errorf("%s: %w: encode request: %v", req.operationID, ErrInvalidRequest, err)
++		}
++		payload = bytes.NewReader(encoded)
++	}
++
++	httpReq, err := http.NewRequestWithContext(ctx, req.method, c.baseURL+req.path, payload)
++	if err != nil {
++		return fmt.Errorf("%s: %w", req.operationID, err)
++	}
++	httpReq.Header.Set("Accept", "application/json")
++	if req.body != nil {
++		httpReq.Header.Set("Content-Type", "application/json")
++	}
++	if req.token != "" {
++		httpReq.Header.Set("Authorization", "Bearer "+req.token)
++	}
++
++	resp, err := c.httpClient.Do(httpReq)
++	if err != nil {
++		return fmt.Errorf("%s: %w", req.operationID, err)
++	}
++	defer func() {
++		_, _ = io.Copy(io.Discard, resp.Body)
++		_ = resp.Body.Close()
++	}()
++
++	responseBody, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return fmt.Errorf("%s: %w", req.operationID, err)
++	}
++	if resp.StatusCode < 200 || resp.StatusCode > 299 {
++		return fmt.Errorf("%s: %w: HTTP %d%s",
++			req.operationID, ErrAPI, resp.StatusCode, describeError(responseBody))
++	}
++	if out == nil {
++		return nil
++	}
++	if err := json.Unmarshal(responseBody, out); err != nil {
++		return fmt.Errorf("%s: %w: decode response: %v", req.operationID, ErrAPI, err)
++	}
++	return nil
++}
++
++// describeError pulls errorCode and message out of an SDDC Manager Error body
++// when the appliance sent one.
++func describeError(body []byte) string {
++	var e errorWire
++	if err := json.Unmarshal(body, &e); err != nil {
++		return ""
++	}
++	switch {
++	case e.ErrorCode != "" && e.Message != "":
++		return fmt.Sprintf(": %s: %s", e.ErrorCode, e.Message)
++	case e.Message != "":
++		return ": " + e.Message
++	case e.ErrorCode != "":
++		return ": " + e.ErrorCode
++	}
++	return ""
++}
+diff --git a/hostcommission/client_test.go b/hostcommission/client_test.go
+new file mode 100644
+index 0000000..0998404
+--- /dev/null
++++ b/hostcommission/client_test.go
+@@ -0,0 +1,422 @@
++package hostcommission_test
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"net/http"
++	"reflect"
++	"strings"
++	"testing"
++	"time"
++
++	"vcf.local/sddchosts/hostcommission"
++	"vcf.local/sddchosts/internal/contract"
++	"vcf.local/sddchosts/internal/smmock"
++)
++
++const (
++	adminUser     = "administrator@vsphere.local"
++	adminPassword = "VMw@re1!VMw@re1!"
++	poolID        = "3f8a1b26-9c04-4d7e-8b53-1a6e2d90c4f7"
++)
++
++func host() hostcommission.HostSpec {
++	return hostcommission.HostSpec{
++		FQDN:          "esxi-11.vrack.vsphere.local",
++		Username:      "root",
++		Password:      "EsxiP@ssw0rd!",
++		StorageType:   "VSAN",
++		NetworkPoolID: poolID,
++	}
++}
++
++func requiredOnlyJSON() map[string]any {
++	return map[string]any{
++		"fqdn":          "esxi-11.vrack.vsphere.local",
++		"username":      "root",
++		"password":      "EsxiP@ssw0rd!",
++		"storageType":   "VSAN",
++		"networkPoolId": poolID,
++	}
++}
++
++type fixture struct {
++	mock   *smmock.Server
++	client *hostcommission.Client
++}
++
++func newFixture(t *testing.T, opts smmock.Options, tune func(*hostcommission.Config)) *fixture {
++	t.Helper()
++	c, err := contract.LoadDefault()
++	if err != nil {
++		t.Fatalf("load contract: %v", err)
++	}
++	mock, err := smmock.New(c, opts)
++	if err != nil {
++		t.Fatalf("start mock: %v", err)
++	}
++	t.Cleanup(mock.Close)
++
++	cfg := hostcommission.Config{
++		BaseURL:         mock.URL(),
++		Username:        adminUser,
++		Password:        adminPassword,
++		PollInterval:    time.Millisecond,
++		MaxPollAttempts: 8,
++	}
++	if tune != nil {
++		tune(&cfg)
++	}
++	client, err := hostcommission.New(cfg)
++	if err != nil {
++		t.Fatalf("New: %v", err)
++	}
++	return &fixture{mock: mock, client: client}
++}
++
++func (f *fixture) run(hosts ...hostcommission.HostSpec) (*hostcommission.Result, error) {
++	return f.client.CommissionHosts(context.Background(), hosts)
++}
++
++func (f *fixture) calls(operationID string) int {
++	return len(f.mock.RequestsFor(operationID))
++}
++
++func decodeArray(t *testing.T, reqs []smmock.Request) []map[string]any {
++	t.Helper()
++	if len(reqs) != 1 {
++		t.Fatalf("recorded %d requests, want 1", len(reqs))
++	}
++	items, err := reqs[0].DecodeArray()
++	if err != nil {
++		t.Fatalf("%v", err)
++	}
++	return items
++}
++
++// TestRequestWireShape is the table over how a HostSpec serializes. An optional
++// field the caller left unset must be absent, not present and empty.
++func TestRequestWireShape(t *testing.T) {
++	withNetworkPoolName := host()
++	withNetworkPoolName.NetworkPoolName = "np-mgmt-01"
++	namedJSON := requiredOnlyJSON()
++	namedJSON["networkPoolName"] = "np-mgmt-01"
++
++	vvol := host()
++	vvol.StorageType = "VVOL"
++	vvol.VVolStorageProtocolType = "FC"
++	vvol.SSHThumbprint = "SHA256:abc"
++	vvol.SSLThumbprint = "AA:BB:CC"
++	vvolJSON := requiredOnlyJSON()
++	vvolJSON["storageType"] = "VVOL"
++	vvolJSON["vvolStorageProtocolType"] = "FC"
++	vvolJSON["sshThumbprint"] = "SHA256:abc"
++	vvolJSON["sslThumbprint"] = "AA:BB:CC"
++
++	cases := []struct {
++		name string
++		in   []hostcommission.HostSpec
++		want []map[string]any
++	}{
++		{"required only", []hostcommission.HostSpec{host()}, []map[string]any{requiredOnlyJSON()}},
++		{"one optional set", []hostcommission.HostSpec{withNetworkPoolName}, []map[string]any{namedJSON}},
++		{"fully populated", []hostcommission.HostSpec{vvol}, []map[string]any{vvolJSON}},
++		{"two hosts keep order", []hostcommission.HostSpec{host(), withNetworkPoolName},
++			[]map[string]any{requiredOnlyJSON(), namedJSON}},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			// The two hosts in the last case would otherwise share an FQDN.
++			in := append([]hostcommission.HostSpec(nil), tc.in...)
++			want := make([]map[string]any, len(tc.want))
++			for i := range tc.want {
++				want[i] = map[string]any{}
++				for k, v := range tc.want[i] {
++					want[i][k] = v
++				}
++			}
++			if len(in) > 1 {
++				in[1].FQDN = "esxi-12.vrack.vsphere.local"
++				want[1]["fqdn"] = "esxi-12.vrack.vsphere.local"
++			}
++
++			f := newFixture(t, smmock.Options{}, nil)
++			if _, err := f.run(in...); err != nil {
++				t.Fatalf("CommissionHosts: %v", err)
++			}
++			for _, op := range []string{"validateHostCommissionSpec", "commissionHosts"} {
++				got := decodeArray(t, f.mock.RequestsFor(op))
++				if !reflect.DeepEqual(got, want) {
++					gotJSON, _ := json.Marshal(got)
++					wantJSON, _ := json.Marshal(want)
++					t.Errorf("%s body\n got %s\nwant %s", op, gotJSON, wantJSON)
++				}
++			}
++		})
++	}
++}
++
++func TestTokenRequestCarriesOnlyCredentials(t *testing.T) {
++	f := newFixture(t, smmock.Options{}, nil)
++	if _, err := f.run(host()); err != nil {
++		t.Fatalf("CommissionHosts: %v", err)
++	}
++	reqs := f.mock.RequestsFor("createToken")
++	if len(reqs) != 1 {
++		t.Fatalf("createToken called %d times, want 1", len(reqs))
++	}
++	got, err := reqs[0].DecodeObject()
++	if err != nil {
++		t.Fatalf("%v", err)
++	}
++	want := map[string]any{"username": adminUser, "password": adminPassword}
++	if !reflect.DeepEqual(got, want) {
++		t.Errorf("createToken body %v, want %v", got, want)
++	}
++	if h := reqs[0].Header.Get("Authorization"); h != "" {
++		t.Errorf("createToken carried Authorization %q, want none", h)
++	}
++}
++
++// TestPollingToTerminalState is the table over both asynchronous halves.
++func TestPollingToTerminalState(t *testing.T) {
++	cases := []struct {
++		name            string
++		validations     []smmock.ValidationState
++		tasks           []smmock.TaskState
++		wantValidations int
++		wantTasks       int
++		wantStatus      string
++	}{
++		{
++			name:            "settles on the first poll",
++			validations:     []smmock.ValidationState{{ExecutionStatus: "COMPLETED", ResultStatus: "SUCCEEDED"}},
++			tasks:           []smmock.TaskState{{Status: "SUCCESSFUL"}},
++			wantValidations: 1, wantTasks: 1, wantStatus: "SUCCESSFUL",
++		},
++		{
++			name: "runs through the intermediate states",
++			validations: []smmock.ValidationState{
++				{ExecutionStatus: "IN_PROGRESS", ResultStatus: "UNKNOWN"},
++				{ExecutionStatus: "IN_PROGRESS", ResultStatus: "UNKNOWN"},
++				{ExecutionStatus: "COMPLETED", ResultStatus: "SUCCEEDED"},
++			},
++			tasks: []smmock.TaskState{
++				{Status: "PENDING"}, {Status: "IN_PROGRESS"}, {Status: "SUCCESSFUL"},
++			},
++			wantValidations: 3, wantTasks: 3, wantStatus: "SUCCESSFUL",
++		},
++		{
++			name:        "accepts the display forms of the statuses",
++			validations: []smmock.ValidationState{{ExecutionStatus: "COMPLETED", ResultStatus: "SUCCEEDED"}},
++			tasks: []smmock.TaskState{
++				{Status: "Pending"}, {Status: "In Progress"}, {Status: "Successful"},
++			},
++			wantValidations: 1, wantTasks: 3, wantStatus: "Successful",
++		},
++		{
++			name: "keeps polling through statuses it does not recognize",
++			validations: []smmock.ValidationState{
++				{ExecutionStatus: "CANCELLATION_IN_PROGRESS", ResultStatus: "CANCELLATION_IN_PROGRESS"},
++				{ExecutionStatus: "COMPLETED", ResultStatus: "WARNING"},
++			},
++			tasks: []smmock.TaskState{
++				{Status: "QUEUED"}, {Status: "COMPLETED_WITH_WARNING"},
++			},
++			wantValidations: 2, wantTasks: 2, wantStatus: "COMPLETED_WITH_WARNING",
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			f := newFixture(t, smmock.Options{Validations: tc.validations, Tasks: tc.tasks}, nil)
++			result, err := f.run(host())
++			if err != nil {
++				t.Fatalf("CommissionHosts: %v", err)
++			}
++			if result.ValidationPolls != tc.wantValidations {
++				t.Errorf("ValidationPolls %d, want %d", result.ValidationPolls, tc.wantValidations)
++			}
++			if result.TaskPolls != tc.wantTasks {
++				t.Errorf("TaskPolls %d, want %d", result.TaskPolls, tc.wantTasks)
++			}
++			if result.Task.Status != tc.wantStatus {
++				t.Errorf("Task.Status %q, want %q", result.Task.Status, tc.wantStatus)
++			}
++			if got := f.calls("getHostCommissionValidationByID"); got != tc.wantValidations {
++				t.Errorf("getHostCommissionValidationByID called %d times, want %d", got, tc.wantValidations)
++			}
++			if got := f.calls("getTask"); got != tc.wantTasks {
++				t.Errorf("getTask called %d times, want %d", got, tc.wantTasks)
++			}
++		})
++	}
++}
++
++// TestTerminalOutcomes maps terminal states onto the sentinel errors.
++func TestTerminalOutcomes(t *testing.T) {
++	cases := []struct {
++		name        string
++		validations []smmock.ValidationState
++		tasks       []smmock.TaskState
++		maxPolls    int
++		wantErr     error
++		wantCommits int
++	}{
++		{
++			name:        "validation result rules out commissioning",
++			validations: []smmock.ValidationState{{ExecutionStatus: "COMPLETED", ResultStatus: "FAILED"}},
++			wantErr:     hostcommission.ErrValidationFailed,
++		},
++		{
++			name:        "validation execution failed",
++			validations: []smmock.ValidationState{{ExecutionStatus: "FAILED", ResultStatus: "FAILED"}},
++			wantErr:     hostcommission.ErrValidationFailed,
++		},
++		{
++			name:        "validation never settles",
++			validations: []smmock.ValidationState{{ExecutionStatus: "IN_PROGRESS", ResultStatus: "UNKNOWN"}},
++			maxPolls:    3,
++			wantErr:     hostcommission.ErrPollTimeout,
++		},
++		{
++			name:        "task failed",
++			tasks:       []smmock.TaskState{{Status: "FAILED", ErrorMessages: []string{"disk claim failed"}}},
++			wantErr:     hostcommission.ErrTaskFailed,
++			wantCommits: 1,
++		},
++		{
++			name:        "task cancelled",
++			tasks:       []smmock.TaskState{{Status: "Cancelled"}},
++			wantErr:     hostcommission.ErrTaskFailed,
++			wantCommits: 1,
++		},
++		{
++			name:        "task never settles",
++			tasks:       []smmock.TaskState{{Status: "IN_PROGRESS"}},
++			maxPolls:    2,
++			wantErr:     hostcommission.ErrPollTimeout,
++			wantCommits: 1,
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			f := newFixture(t, smmock.Options{Validations: tc.validations, Tasks: tc.tasks},
++				func(cfg *hostcommission.Config) {
++					if tc.maxPolls > 0 {
++						cfg.MaxPollAttempts = tc.maxPolls
++					}
++				})
++			result, err := f.run(host())
++			if !errors.Is(err, tc.wantErr) {
++				t.Fatalf("error %v, want one matching %v", err, tc.wantErr)
++			}
++			if result != nil {
++				t.Errorf("Result %+v, want nil alongside an error", result)
++			}
++			if got := f.calls("commissionHosts"); got != tc.wantCommits {
++				t.Errorf("commissionHosts called %d times, want %d", got, tc.wantCommits)
++			}
++		})
++	}
++}
++
++// TestLocalValidation checks the input rules that must be enforced before any
++// request reaches the appliance.
++func TestLocalValidation(t *testing.T) {
++	mutate := func(f func(*hostcommission.HostSpec)) []hostcommission.HostSpec {
++		h := host()
++		f(&h)
++		return []hostcommission.HostSpec{h}
++	}
++	duplicates := []hostcommission.HostSpec{host(), host()}
++
++	cases := []struct {
++		name  string
++		hosts []hostcommission.HostSpec
++	}{
++		{"no hosts", nil},
++		{"blank fqdn", mutate(func(h *hostcommission.HostSpec) { h.FQDN = "" })},
++		{"blank username", mutate(func(h *hostcommission.HostSpec) { h.Username = "" })},
++		{"blank password", mutate(func(h *hostcommission.HostSpec) { h.Password = "" })},
++		{"blank storage type", mutate(func(h *hostcommission.HostSpec) { h.StorageType = "" })},
++		{"blank network pool id", mutate(func(h *hostcommission.HostSpec) { h.NetworkPoolID = "" })},
++		{"vvol storage without a protocol type", mutate(func(h *hostcommission.HostSpec) {
++			h.StorageType = "VVOL"
++		})},
++		{"protocol type on non-vvol storage", mutate(func(h *hostcommission.HostSpec) {
++			h.VVolStorageProtocolType = "NFS"
++		})},
++		{"repeated fqdn", duplicates},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			f := newFixture(t, smmock.Options{}, nil)
++			if _, err := f.run(tc.hosts...); !errors.Is(err, hostcommission.ErrInvalidRequest) {
++				t.Fatalf("error %v, want one matching ErrInvalidRequest", err)
++			}
++			if got := len(f.mock.Requests()); got != 0 {
++				t.Errorf("%d request(s) reached the appliance", got)
++			}
++		})
++	}
++}
++
++func TestConfigValidation(t *testing.T) {
++	valid := hostcommission.Config{
++		BaseURL:  "https://sddc-manager.vrack.vsphere.local",
++		Username: adminUser,
++		Password: adminPassword,
++	}
++	cases := []struct {
++		name string
++		cfg  hostcommission.Config
++	}{
++		{"no base url", hostcommission.Config{Username: adminUser, Password: adminPassword}},
++		{"relative base url", hostcommission.Config{
++			BaseURL: "/v1", Username: adminUser, Password: adminPassword}},
++		{"no username", hostcommission.Config{BaseURL: valid.BaseURL, Password: adminPassword}},
++		{"no password", hostcommission.Config{BaseURL: valid.BaseURL, Username: adminUser}},
++		{"negative poll interval", hostcommission.Config{
++			BaseURL: valid.BaseURL, Username: adminUser, Password: adminPassword,
++			PollInterval: -time.Second}},
++		{"negative max poll attempts", hostcommission.Config{
++			BaseURL: valid.BaseURL, Username: adminUser, Password: adminPassword,
++			MaxPollAttempts: -2}},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			if _, err := hostcommission.New(tc.cfg); !errors.Is(err, hostcommission.ErrInvalidRequest) {
++				t.Fatalf("New error %v, want one matching ErrInvalidRequest", err)
++			}
++		})
++	}
++	if _, err := hostcommission.New(valid); err != nil {
++		t.Errorf("New rejected a valid config: %v", err)
++	}
++}
++
++func TestApplianceErrorsNameTheirOperation(t *testing.T) {
++	for _, op := range []string{"createToken", "validateHostCommissionSpec", "commissionHosts", "getTask"} {
++		t.Run(op, func(t *testing.T) {
++			f := newFixture(t, smmock.Options{
++				Failures: map[string]smmock.Failure{op: {
++					StatusCode: http.StatusInternalServerError,
++					ErrorCode:  "INTERNAL_SERVER_ERROR",
++					Message:    "the appliance is unwell",
++				}},
++			}, nil)
++			_, err := f.run(host())
++			if !errors.Is(err, hostcommission.ErrAPI) {
++				t.Fatalf("error %v, want one matching ErrAPI", err)
++			}
++			if got := err.Error(); !strings.Contains(got, op) || !strings.Contains(got, "the appliance is unwell") {
++				t.Errorf("error %q should name %s and carry the appliance message", got, op)
++			}
++		})
++	}
++}
+diff --git a/hostcommission/doc.go b/hostcommission/doc.go
+index bbe56f7..f191adb 100644
+--- a/hostcommission/doc.go
++++ b/hostcommission/doc.go
+@@ -14,9 +14,4 @@
+ // status vocabularies. The rule that catches most implementations is
+ // contract.omitEmptyRule: an optional property the caller did not set must be
+ // absent from the serialized request, not present and empty.
+-//
+-// This package is a stub. Implement Config, Client, New, HostSpec, Validation,
+-// ValidationCheck, Task, Result, CommissionHosts and the ErrInvalidRequest,
+-// ErrValidationFailed, ErrTaskFailed, ErrPollTimeout and ErrAPI sentinels, and
+-// add table-driven tests alongside them.
+ package hostcommission
+diff --git a/hostcommission/wire.go b/hostcommission/wire.go
+new file mode 100644
+index 0000000..4263794
+--- /dev/null
++++ b/hostcommission/wire.go
+@@ -0,0 +1,121 @@
++package hostcommission
++
++// The types in this file are the exact JSON shapes docs/contract.json declares.
++//
++// Only the five properties HostCommissionSpec marks required are unconditional;
++// every optional property carries omitempty so that a property the caller left
++// unset is absent from the request rather than present and empty. The same
++// applies to TokenCreationSpec, whose apiKey and idToken this flow never sends
++// and therefore does not model at all.
++
++type tokenCreationSpecWire struct {
++	Username string `json:"username"`
++	Password string `json:"password"`
++}
++
++type refreshTokenWire struct {
++	ID string `json:"id"`
++}
++
++type tokenPairWire struct {
++	AccessToken  string           `json:"accessToken"`
++	RefreshToken refreshTokenWire `json:"refreshToken"`
++}
++
++type hostCommissionSpecWire struct {
++	FQDN                    string `json:"fqdn"`
++	Username                string `json:"username"`
++	Password                string `json:"password"`
++	StorageType             string `json:"storageType"`
++	NetworkPoolID           string `json:"networkPoolId"`
++	VVolStorageProtocolType string `json:"vvolStorageProtocolType,omitempty"`
++	NetworkPoolName         string `json:"networkPoolName,omitempty"`
++	SSHThumbprint           string `json:"sshThumbprint,omitempty"`
++	SSLThumbprint           string `json:"sslThumbprint,omitempty"`
++}
++
++func (h HostSpec) wire() hostCommissionSpecWire {
++	return hostCommissionSpecWire{
++		FQDN:                    h.FQDN,
++		Username:                h.Username,
++		Password:                h.Password,
++		StorageType:             h.StorageType,
++		NetworkPoolID:           h.NetworkPoolID,
++		VVolStorageProtocolType: h.VVolStorageProtocolType,
++		NetworkPoolName:         h.NetworkPoolName,
++		SSHThumbprint:           h.SSHThumbprint,
++		SSLThumbprint:           h.SSLThumbprint,
++	}
++}
++
++func hostSpecsWire(hosts []HostSpec) []hostCommissionSpecWire {
++	out := make([]hostCommissionSpecWire, 0, len(hosts))
++	for _, h := range hosts {
++		out = append(out, h.wire())
++	}
++	return out
++}
++
++type validationCheckWire struct {
++	Description  string `json:"description"`
++	Severity     string `json:"severity"`
++	ResultStatus string `json:"resultStatus"`
++}
++
++type validationWire struct {
++	ID               string                `json:"id"`
++	Description      string                `json:"description"`
++	ExecutionStatus  string                `json:"executionStatus"`
++	ResultStatus     string                `json:"resultStatus"`
++	ValidationChecks []validationCheckWire `json:"validationChecks"`
++}
++
++func (v validationWire) public() Validation {
++	out := Validation{
++		ID:              v.ID,
++		Description:     v.Description,
++		ExecutionStatus: v.ExecutionStatus,
++		ResultStatus:    v.ResultStatus,
++	}
++	for _, c := range v.ValidationChecks {
++		out.Checks = append(out.Checks, ValidationCheck{
++			Description:  c.Description,
++			Severity:     c.Severity,
++			ResultStatus: c.ResultStatus,
++		})
++	}
++	return out
++}
++
++type errorWire struct {
++	ErrorCode string `json:"errorCode"`
++	ErrorType string `json:"errorType"`
++	Message   string `json:"message"`
++}
++
++type taskWire struct {
++	ID                  string      `json:"id"`
++	Name                string      `json:"name"`
++	Type                string      `json:"type"`
++	Status              string      `json:"status"`
++	CreationTimestamp   string      `json:"creationTimestamp"`
++	CompletionTimestamp string      `json:"completionTimestamp"`
++	Errors              []errorWire `json:"errors"`
++}
++
++func (t taskWire) public() Task {
++	out := Task{
++		ID:                  t.ID,
++		Name:                t.Name,
++		Type:                t.Type,
++		Status:              t.Status,
++		CreationTimestamp:   t.CreationTimestamp,
++		CompletionTimestamp: t.CompletionTimestamp,
++	}
++	for _, e := range t.Errors {
++		if e.Message != "" {
++			out.Errors = append(out.Errors, e.Message)
++		}
++	}
++	return out
++}

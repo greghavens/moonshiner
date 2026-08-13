@@ -1,0 +1,1 @@
+Final correction: increase the maximum width from 13 inches to 14.5 inches and exclude any model whose controls are touch-only. Everything else we already decided still stands, including which price field to use, the other product filters, ranking and tiebreak rules, exact table structure, and both closing sections. Deliver the finished comparison as `comparison.md`.

@@ -1,0 +1,448 @@
+diff -ruN a/src/VcfVsanDp/VcfVsanDp.psd1 b/src/VcfVsanDp/VcfVsanDp.psd1
+--- a/src/VcfVsanDp/VcfVsanDp.psd1	2026-08-03 21:11:48.195568034 -0500
++++ b/src/VcfVsanDp/VcfVsanDp.psd1	2026-08-03 21:08:57.179228338 -0500
+@@ -7,10 +7,17 @@
+     Description       = 'PowerShell bindings for the VCF 9.1 vSAN Data Protection (snapservice) API.'
+     PowerShellVersion = '7.2'
+ 
+-    # TODO: the VMware.Sdk.Vcf modules are installed in this environment and must
+-    # not be vendored into this repository.
++    # Installed in this environment as a prerequisite, never vendored here.
++    RequiredModules = @(
++        @{ ModuleName = 'VMware.Sdk.Vcf.SddcManager'; ModuleVersion = '13.5.0.25380678' }
++    )
+ 
+-    FunctionsToExport = @()
++    FunctionsToExport = @(
++        'Connect-VcfVsanDpServer'
++        'Disconnect-VcfVsanDpServer'
++        'Get-VcfVsanDpProtectionGroup'
++        'Get-VcfVsanDpProtectionGroupSnapshotReport'
++    )
+     CmdletsToExport   = @()
+     VariablesToExport = @()
+     AliasesToExport   = @()
+diff -ruN a/src/VcfVsanDp/VcfVsanDp.psm1 b/src/VcfVsanDp/VcfVsanDp.psm1
+--- a/src/VcfVsanDp/VcfVsanDp.psm1	2026-08-03 21:11:48.195112629 -0500
++++ b/src/VcfVsanDp/VcfVsanDp.psm1	2026-08-03 21:11:16.584326206 -0500
+@@ -3,9 +3,416 @@
+ Set-StrictMode -Version Latest
+ 
+ # The vSAN Data Protection (snapservice) API has no binding in the VMware.Sdk.Vcf
+-# family, so this module provides one. The wire contract it must honour is
++# family, so this module provides one. The wire contract it honours is
+ # docs/contract.json, derived from the published OpenAPI specification.
+-#
+-# Nothing is implemented yet.
+ 
+-throw 'VcfVsanDp is not implemented yet.'
++$script:SessionHeaderName = 'vmware-api-session-id'
++
++#region json
++
++function ConvertFrom-VcfVsanDpJsonElement {
++    [CmdletBinding()]
++    param([Parameter(Mandatory = $true)] [System.Text.Json.JsonElement] $Element)
++
++    switch ($Element.ValueKind) {
++        'Object' {
++            $map = [ordered] @{}
++            foreach ($property in $Element.EnumerateObject()) {
++                $map[$property.Name] = ConvertFrom-VcfVsanDpJsonElement -Element $property.Value
++            }
++            return [pscustomobject] $map
++        }
++        'Array' {
++            $items = [System.Collections.Generic.List[object]]::new()
++            foreach ($item in $Element.EnumerateArray()) {
++                $items.Add((ConvertFrom-VcfVsanDpJsonElement -Element $item))
++            }
++            # Comma operator so a nested array is not unrolled onto the pipeline.
++            return , $items.ToArray()
++        }
++        'String' { return $Element.GetString() }
++        'Number' {
++            $whole = [int64] 0
++            if ($Element.TryGetInt64([ref] $whole)) { return $whole }
++            return $Element.GetDouble()
++        }
++        'True'  { return $true }
++        'False' { return $false }
++        default { return $null }
++    }
++}
++
++function ConvertFrom-VcfVsanDpJson {
++    <#
++    .SYNOPSIS
++        Parses a response body without rewriting any of its scalars.
++
++    .DESCRIPTION
++        ConvertFrom-Json and Invoke-RestMethod both coerce anything that looks
++        like an ISO 8601 timestamp into a [datetime], which loses the exact text
++        the appliance sent and reformats it according to the host's culture.
++        Timestamps in this API are contract data, so they are kept as the strings
++        they arrived as.
++    #>
++    [CmdletBinding()]
++    param([AllowEmptyString()] [AllowNull()] [string] $Json)
++
++    if ([string]::IsNullOrWhiteSpace($Json)) { return $null }
++
++    $document = [System.Text.Json.JsonDocument]::Parse($Json)
++    try {
++        return ConvertFrom-VcfVsanDpJsonElement -Element $document.RootElement
++    }
++    finally {
++        $document.Dispose()
++    }
++}
++
++#endregion
++
++#region wire helpers
++
++function ConvertTo-VcfVsanDpQueryString {
++    <#
++    .SYNOPSIS
++        Serializes query parameters the way the specification declares them.
++
++    .DESCRIPTION
++        Every query parameter in this API is style=form, explode=true.
++
++          * An object-typed parameter (filter, iterate) contributes one key per
++            property, named after the property. The parameter's own name never
++            reaches the wire.
++          * An array-typed parameter (pgs, names, ...) contributes one repeated
++            key per element, named after the parameter.
++
++        A value that was never set is omitted outright. It is never emitted as a
++        bare key, an empty value, or a literal 'null'.
++
++        $Parameters is an ordered dictionary of wire key -> value, where a value
++        may be a scalar or an array.
++    #>
++    [CmdletBinding()]
++    [OutputType([string])]
++    param(
++        [Parameter(Mandatory = $true)] [System.Collections.IDictionary] $Parameters
++    )
++
++    $pairs = [System.Collections.Generic.List[string]]::new()
++
++    foreach ($key in $Parameters.Keys) {
++        $value = $Parameters[$key]
++
++        if ($null -eq $value) { continue }
++
++        if ($value -is [string] -and $value.Length -eq 0) { continue }
++
++        if ($value -is [System.Array] -or
++            ($value -is [System.Collections.IEnumerable] -and $value -isnot [string])) {
++
++            foreach ($element in $value) {
++                if ($null -eq $element) { continue }
++                $text = [string] $element
++                if ($text.Length -eq 0) { continue }
++                $pairs.Add(('{0}={1}' -f `
++                    [uri]::EscapeDataString([string] $key),
++                    [uri]::EscapeDataString($text)))
++            }
++            continue
++        }
++
++        if ($value -is [bool]) {
++            $text = if ($value) { 'true' } else { 'false' }
++        }
++        else {
++            $text = [string] $value
++        }
++        if ($text.Length -eq 0) { continue }
++
++        $pairs.Add(('{0}={1}' -f `
++            [uri]::EscapeDataString([string] $key),
++            [uri]::EscapeDataString($text)))
++    }
++
++    return ($pairs -join '&')
++}
++
++function Invoke-VcfVsanDpRequest {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory = $true)] [psobject] $Session,
++        [Parameter(Mandatory = $true)] [string]   $Method,
++        [Parameter(Mandatory = $true)] [string]   $Path,
++        [System.Collections.IDictionary]          $Query
++    )
++
++    $uri = '{0}{1}' -f $Session.BaseUri, $Path
++    if ($Query -and $Query.Count -gt 0) {
++        $qs = ConvertTo-VcfVsanDpQueryString -Parameters $Query
++        if ($qs) { $uri = '{0}?{1}' -f $uri, $qs }
++    }
++
++    $arguments = @{
++        Method      = $Method
++        Uri         = $uri
++        Headers     = @{ $script:SessionHeaderName = $Session.SessionId }
++        ErrorAction = 'Stop'
++    }
++    if ($Session.SkipCertificateCheck) { $arguments.SkipCertificateCheck = $true }
++
++    $response = Invoke-WebRequest @arguments
++    return ConvertFrom-VcfVsanDpJson -Json ([string] $response.Content)
++}
++
++#endregion
++
++#region session lifecycle
++
++function Connect-VcfVsanDpServer {
++    <#
++    .SYNOPSIS
++        Opens a session with a vSAN Data Protection snapshot appliance.
++
++    .DESCRIPTION
++        Implements Snapservice.Sessions_create. Exchanges HTTP Basic credentials
++        for a session token and returns a session object to pass to the other
++        cmdlets in this module.
++    #>
++    [CmdletBinding()]
++    [OutputType([psobject])]
++    param(
++        [Parameter(Mandatory = $true)] [string] $Server,
++        [Parameter(Mandatory = $true)] [ValidateRange(1, 65535)] [int] $Port,
++        [Parameter(Mandatory = $true)]
++        [ValidateSet('http', 'https')] [string] $Protocol,
++        [Parameter(Mandatory = $true)]
++        [System.Management.Automation.PSCredential] $Credential,
++        [switch] $SkipCertificateCheck
++    )
++
++    $baseUri = '{0}://{1}:{2}/api' -f $Protocol, $Server, $Port
++
++    # The credentials must be presented up front. Invoke-RestMethod -Credential
++    # waits for a 401 challenge, so the header is built by hand.
++    $plain = '{0}:{1}' -f $Credential.UserName, $Credential.GetNetworkCredential().Password
++    $basic = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($plain))
++
++    $arguments = @{
++        Method      = 'POST'
++        Uri         = '{0}/snapservice/sessions' -f $baseUri
++        Headers     = @{ Authorization = "Basic $basic" }
++        ErrorAction = 'Stop'
++    }
++    if ($SkipCertificateCheck) { $arguments.SkipCertificateCheck = $true }
++
++    $response = Invoke-WebRequest @arguments
++    $token = ConvertFrom-VcfVsanDpJson -Json ([string] $response.Content)
++
++    if ([string]::IsNullOrEmpty($token)) {
++        throw "Snapservice.Sessions_create returned no session token from $Server."
++    }
++
++    return [pscustomobject] @{
++        PSTypeName           = 'VcfVsanDp.Session'
++        Server               = $Server
++        Port                 = $Port
++        Protocol             = $Protocol
++        BaseUri              = $baseUri
++        SessionId            = [string] $token
++        SkipCertificateCheck = [bool] $SkipCertificateCheck
++    }
++}
++
++function Disconnect-VcfVsanDpServer {
++    <#
++    .SYNOPSIS
++        Closes a snapshot appliance session.
++
++    .DESCRIPTION
++        Implements Snapservice.Sessions_delete. The token is invalid afterwards.
++    #>
++    [CmdletBinding()]
++    [OutputType([void])]
++    param(
++        [Parameter(Mandatory = $true, ValueFromPipeline = $true)] [psobject] $Session
++    )
++
++    process {
++        $null = Invoke-VcfVsanDpRequest -Session $Session `
++            -Method 'DELETE' -Path '/snapservice/sessions'
++    }
++}
++
++#endregion
++
++#region operations
++
++function Get-VcfVsanDpProtectionGroup {
++    <#
++    .SYNOPSIS
++        Lists the protection groups on a cluster.
++
++    .DESCRIPTION
++        Implements Snapservice.Clusters.ProtectionGroups_list. Filters that the
++        caller does not supply are omitted from the request entirely.
++    #>
++    [CmdletBinding()]
++    [OutputType([psobject])]
++    param(
++        [Parameter(Mandatory = $true)] [psobject] $Session,
++        [Parameter(Mandatory = $true)] [string]   $Cluster,
++        [string[]] $ProtectionGroupId,
++        [string[]] $Name,
++        [string[]] $State,
++        [string[]] $Vm,
++        [string[]] $ClusterPair
++    )
++
++    $query = [ordered] @{}
++    if ($PSBoundParameters.ContainsKey('ProtectionGroupId') -and $ProtectionGroupId) {
++        $query['pgs'] = $ProtectionGroupId
++    }
++    if ($PSBoundParameters.ContainsKey('Name') -and $Name) {
++        $query['names'] = $Name
++    }
++    if ($PSBoundParameters.ContainsKey('State') -and $State) {
++        $query['states'] = $State
++    }
++    if ($PSBoundParameters.ContainsKey('Vm') -and $Vm) {
++        $query['vms'] = $Vm
++    }
++    if ($PSBoundParameters.ContainsKey('ClusterPair') -and $ClusterPair) {
++        $query['cluster_pairs'] = $ClusterPair
++    }
++
++    $path = '/snapservice/clusters/{0}/protection-groups' -f [uri]::EscapeDataString($Cluster)
++    $response = Invoke-VcfVsanDpRequest -Session $Session -Method 'GET' -Path $path -Query $query
++
++    if ($null -eq $response -or -not $response.PSObject.Properties['items']) { return }
++
++    foreach ($item in @($response.items)) {
++        [pscustomobject] @{
++            PSTypeName          = 'VcfVsanDp.ProtectionGroup'
++            ProtectionGroupId   = [string] $item.pg
++            ProtectionGroupName = [string] $item.info.name
++        }
++    }
++}
++
++function Get-VcfVsanDpProtectionGroupSnapshotReport {
++    <#
++    .SYNOPSIS
++        Retrieves the complete protection group snapshot report for a cluster.
++
++    .DESCRIPTION
++        Implements Snapservice.Reports.Clusters.ProtectionGroups.Snapshots_list.
++
++        The operation is paginated by offset. This cmdlet walks every page and
++        returns the whole collection, ordered by creation time ascending with
++        ties broken by protection group id then snapshot id, so that repeated
++        runs against unchanged data emit records in the same sequence.
++
++        The 'filter' and 'iterate' parameters are style=form, explode=true
++        objects, so their properties (start_time, end_time, page_size, offset)
++        travel as top-level query keys.
++    #>
++    [CmdletBinding()]
++    [OutputType([psobject])]
++    param(
++        [Parameter(Mandatory = $true)] [psobject] $Session,
++        [Parameter(Mandatory = $true)] [string]   $Cluster,
++        [Parameter(Mandatory = $true)]
++        [ValidateRange(1, [int]::MaxValue)] [int] $PageSize,
++        [string]   $StartTime,
++        [string]   $EndTime,
++        [string[]] $ProtectionGroupId
++    )
++
++    $path = '/snapservice/reports/clusters/{0}/protection-groups/snapshots' -f `
++        [uri]::EscapeDataString($Cluster)
++
++    $collected = [System.Collections.Generic.List[object]]::new()
++    $offset = 0
++
++    while ($true) {
++        $query = [ordered] @{}
++
++        # filter: form/explode=true, so its properties are the wire keys.
++        if (-not [string]::IsNullOrEmpty($StartTime)) { $query['start_time'] = $StartTime }
++        if (-not [string]::IsNullOrEmpty($EndTime))   { $query['end_time']   = $EndTime }
++
++        if ($PSBoundParameters.ContainsKey('ProtectionGroupId') -and $ProtectionGroupId) {
++            $query['pgs'] = $ProtectionGroupId
++        }
++
++        # iterate: likewise exploded into page_size and offset.
++        $query['page_size'] = $PageSize
++        $query['offset']    = $offset
++
++        $response = Invoke-VcfVsanDpRequest -Session $Session `
++            -Method 'GET' -Path $path -Query $query
++
++        if ($null -eq $response) { break }
++
++        $page = @()
++        if ($response.PSObject.Properties['snapshots'] -and $null -ne $response.snapshots) {
++            $page = @($response.snapshots)
++        }
++        foreach ($record in $page) { $collected.Add($record) }
++
++        $total = $null
++        if ($response.PSObject.Properties['total_count']) {
++            $total = [int] $response.total_count
++        }
++
++        # Stop as soon as the collection is complete, so no request is made for a
++        # page that cannot exist.
++        if ($null -ne $total -and $collected.Count -ge $total) { break }
++        if ($page.Count -eq 0) { break }
++
++        $offset += $PageSize
++    }
++
++    $shaped = [System.Collections.Generic.List[object]]::new()
++    foreach ($record in $collected) {
++        $shaped.Add([pscustomobject] @{
++            PSTypeName        = 'VcfVsanDp.ProtectionGroupSnapshot'
++            ProtectionGroupId = [string] $record.pg
++            SnapshotId        = if ($record.PSObject.Properties['snapshot']) {
++                                    [string] $record.snapshot } else { '' }
++            SnapshotName      = [string] $record.name
++            Status            = [string] $record.status
++            SnapshotType      = if ($record.PSObject.Properties['snapshot_type']) {
++                                    [string] $record.snapshot_type } else { '' }
++            CreationTime      = [string] $record.creation_time
++            ExpirationTime    = if ($record.PSObject.Properties['expiration_time']) {
++                                    [string] $record.expiration_time } else { '' }
++            Deleted           = [bool] $record.deleted
++        })
++    }
++
++    # Ordinal comparison so the order does not shift with the host's culture.
++    $comparison = [Comparison[object]] {
++        param($left, $right)
++
++        $result = [string]::CompareOrdinal($left.CreationTime, $right.CreationTime)
++        if ($result -ne 0) { return $result }
++
++        $result = [string]::CompareOrdinal($left.ProtectionGroupId, $right.ProtectionGroupId)
++        if ($result -ne 0) { return $result }
++
++        return [string]::CompareOrdinal($left.SnapshotId, $right.SnapshotId)
++    }
++    $shaped.Sort($comparison)
++
++    return $shaped.ToArray()
++}
++
++#endregion
++
++Export-ModuleMember -Function @(
++    'Connect-VcfVsanDpServer'
++    'Disconnect-VcfVsanDpServer'
++    'Get-VcfVsanDpProtectionGroup'
++    'Get-VcfVsanDpProtectionGroupSnapshotReport'
++)

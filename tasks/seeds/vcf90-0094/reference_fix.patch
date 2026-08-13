@@ -1,0 +1,434 @@
+diff --git a/client.go b/client.go
+index f366423..5733bcb 100644
+--- a/client.go
++++ b/client.go
+@@ -1,9 +1,15 @@
+ package vcflogs
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
++	"strings"
+ )
+ 
+ // ForwarderUpdate is the request body for PUT_log-forwarder-id.
+@@ -50,10 +56,51 @@ type Client struct {
+ }
+ 
+ func NewClient(baseURL, bearerToken string, httpClient *http.Client) *Client {
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
+ 	return &Client{baseURL: baseURL, bearerToken: bearerToken, httpClient: httpClient}
+ }
+ 
+ // UpdateForwarder updates a log-forwarding destination.
+ func (c *Client) UpdateForwarder(ctx context.Context, id string, update ForwarderUpdate) (Forwarder, error) {
+-	return Forwarder{}, errors.New("UpdateForwarder is not implemented")
++	if c == nil {
++		return Forwarder{}, errors.New("nil client")
++	}
++
++	body, err := json.Marshal(update)
++	if err != nil {
++		return Forwarder{}, fmt.Errorf("encode log forwarder update: %w", err)
++	}
++	endpoint := strings.TrimRight(c.baseURL, "/") + "/api/v2/log-forwarder/" + url.PathEscape(id)
++
++	request, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(body))
++	if err != nil {
++		return Forwarder{}, fmt.Errorf("build log forwarder update request: %w", err)
++	}
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set("Content-Type", "application/json")
++	request.Header.Set("Authorization", "Bearer "+c.bearerToken)
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return Forwarder{}, fmt.Errorf("update log forwarder: %w", err)
++	}
++	responseBody, readErr := io.ReadAll(response.Body)
++	closeErr := response.Body.Close()
++	if readErr != nil {
++		return Forwarder{}, fmt.Errorf("read log forwarder response: %w", readErr)
++	}
++	if closeErr != nil {
++		return Forwarder{}, fmt.Errorf("close log forwarder response: %w", closeErr)
++	}
++	if response.StatusCode != http.StatusOK {
++		return Forwarder{}, fmt.Errorf("update log forwarder: HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(responseBody)))
++	}
++
++	var forwarder Forwarder
++	if err := json.Unmarshal(responseBody, &forwarder); err != nil {
++		return Forwarder{}, fmt.Errorf("decode log forwarder response: %w", err)
++	}
++	return forwarder, nil
+ }
+diff --git a/client_test.go b/client_test.go
+new file mode 100644
+index 0000000..c41bd57
+--- /dev/null
++++ b/client_test.go
+@@ -0,0 +1,57 @@
++package vcflogs_test
++
++import (
++	"context"
++	"testing"
++
++	vcflogs "example.com/vcflogs"
++	"example.com/vcflogs/mock"
++)
++
++func TestUpdateForwarder(t *testing.T) {
++	zero := 0
++	empty := ""
++	falseValue := false
++
++	testCases := []struct {
++		name   string
++		update vcflogs.ForwarderUpdate
++	}{
++		{
++			name: "required fields",
++			update: vcflogs.ForwarderUpdate{
++				Host: "logs-backup.example.test", Port: 9543, Protocol: "CFAPI", SSLEnabled: false,
++			},
++		},
++		{
++			name: "explicit optional zero values",
++			update: vcflogs.ForwarderUpdate{
++				Host: "logs-backup.example.test", Port: 9543, Protocol: "CFAPI", SSLEnabled: false,
++				Name: &empty, WorkerCount: &zero, Filter: &empty, TestConnection: &falseValue,
++			},
++		},
++	}
++
++	for _, testCase := range testCases {
++		t.Run(testCase.name, func(t *testing.T) {
++			server, err := mock.New()
++			if err != nil {
++				t.Fatal(err)
++			}
++			t.Cleanup(server.Close)
++
++			client := vcflogs.NewClient(server.URL(), "session-token", server.HTTPClient())
++			_, err = client.UpdateForwarder(context.Background(), "forwarder-1", testCase.update)
++			if err == nil {
++				t.Fatal("first update unexpectedly succeeded")
++			}
++			result, err := client.UpdateForwarder(context.Background(), "forwarder-1", testCase.update)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if result.ID != "forwarder-1" || len(server.Requests()) != 2 || server.EffectCount() != 1 {
++				t.Fatalf("result=%#v requests=%d effects=%d", result, len(server.Requests()), server.EffectCount())
++			}
++		})
++	}
++}
+diff --git a/contract.go b/contract.go
+new file mode 100644
+index 0000000..8db4941
+--- /dev/null
++++ b/contract.go
+@@ -0,0 +1,9 @@
++package vcflogs
++
++import _ "embed"
++
++// ContractJSON is the normalized VCF Operations for Logs 9.0 contract used by
++// the loopback mock.
++//
++//go:embed docs/contract.json
++var ContractJSON []byte
+diff --git a/mock/server.go b/mock/server.go
+index 9f8d957..64ab63d 100644
+--- a/mock/server.go
++++ b/mock/server.go
+@@ -2,8 +2,19 @@
+ package mock
+ 
+ import (
++	"bytes"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
+ 	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"reflect"
++	"strings"
++	"sync"
++
++	vcflogs "example.com/vcflogs"
+ )
+ 
+ // RequestRecord is one request as observed on the wire by the loopback mock.
+@@ -17,18 +28,251 @@ type RequestRecord struct {
+ }
+ 
+ // Server is a contract-pinned loopback server.
+-type Server struct{}
++type Server struct {
++	method   string
++	prefix   string
++	required []string
++	client   *http.Client
++
++	mu          sync.Mutex
++	requests    []RequestRecord
++	state       map[string]vcflogs.ForwarderUpdate
++	effectCount int
++	failedFirst bool
++}
++
++type contractDocument struct {
++	ServerBasePath string `json:"server_base_path"`
++	Operations     []struct {
++		OperationID string `json:"operationId"`
++		Method      string `json:"method"`
++		Path        string `json:"path"`
++		RequestBody struct {
++			ContentType string `json:"content_type"`
++			Schema      struct {
++				Required   []string                   `json:"required"`
++				Properties map[string]json.RawMessage `json:"properties"`
++			} `json:"schema"`
++		} `json:"request_body"`
++	} `json:"operations"`
++}
+ 
+ func New() (*Server, error) {
+-	return nil, errors.New("mock server is not implemented")
++	var contract contractDocument
++	if err := json.Unmarshal(vcflogs.ContractJSON, &contract); err != nil {
++		return nil, fmt.Errorf("decode VCF Operations for Logs contract: %w", err)
++	}
++	if len(contract.Operations) != 1 {
++		return nil, fmt.Errorf("contract names %d operations, want 1", len(contract.Operations))
++	}
++	operation := contract.Operations[0]
++	if operation.OperationID != "PUT_log-forwarder-id" || operation.Method != http.MethodPut || operation.Path != "/log-forwarder/{id}" {
++		return nil, errors.New("contract does not contain the expected PUT_log-forwarder-id operation")
++	}
++	if operation.RequestBody.ContentType != "application/json" {
++		return nil, errors.New("contract request content type is not application/json")
++	}
++	if contract.ServerBasePath != "/api/v2" {
++		return nil, errors.New("contract server base path is not /api/v2")
++	}
++	wantRequired := []string{"host", "port", "protocol", "sslEnabled"}
++	if !reflect.DeepEqual(operation.RequestBody.Schema.Required, wantRequired) {
++		return nil, errors.New("contract has unexpected required request fields")
++	}
++	wantProperties := []string{
++		"acceptCert", "name", "host", "port", "protocol", "sslEnabled",
++		"workerCount", "diskCacheSize", "tags", "filter", "transportProtocol",
++		"forwardComplementaryFields", "testConnection",
++	}
++	if len(operation.RequestBody.Schema.Properties) != len(wantProperties) {
++		return nil, errors.New("contract has unexpected request properties")
++	}
++	for _, name := range wantProperties {
++		if _, present := operation.RequestBody.Schema.Properties[name]; !present {
++			return nil, fmt.Errorf("contract is missing request property %q", name)
++		}
++	}
++
++	prefix := contract.ServerBasePath + strings.TrimSuffix(operation.Path, "{id}")
++	result := &Server{
++		method:   operation.Method,
++		prefix:   prefix,
++		required: append([]string(nil), operation.RequestBody.Schema.Required...),
++		state:    make(map[string]vcflogs.ForwarderUpdate),
++	}
++	result.client = &http.Client{Transport: roundTripper(result.roundTrip)}
++	return result, nil
++}
++
++func (s *Server) URL() string { return "http://127.0.0.1" }
++
++func (s *Server) HTTPClient() *http.Client { return s.client }
++
++func (s *Server) Close() { s.client.CloseIdleConnections() }
++
++func (s *Server) Requests() []RequestRecord {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	result := make([]RequestRecord, len(s.requests))
++	for index, record := range s.requests {
++		result[index] = record
++		result[index].Body = bytes.Clone(record.Body)
++	}
++	return result
++}
++
++func (s *Server) EffectCount() int {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return s.effectCount
++}
++
++type roundTripper func(*http.Request) (*http.Response, error)
++
++func (function roundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
++	return function(request)
+ }
+ 
+-func (s *Server) URL() string { return "" }
++func (s *Server) roundTrip(request *http.Request) (*http.Response, error) {
++	request = request.Clone(request.Context())
++	request.RequestURI = request.URL.RequestURI()
++	if request.Body == nil {
++		request.Body = http.NoBody
++	}
++	recorder := httptest.NewRecorder()
++	s.serveHTTP(recorder, request)
++	return recorder.Result(), nil
++}
++
++func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
++	body, err := io.ReadAll(request.Body)
++	s.record(request, body)
++	if err != nil {
++		http.Error(writer, "read request body", http.StatusBadRequest)
++		return
++	}
++
++	escapedPath := request.URL.EscapedPath()
++	suffix := strings.TrimPrefix(escapedPath, s.prefix)
++	if request.Method != s.method || suffix == escapedPath || suffix == "" || strings.Contains(suffix, "/") || request.URL.RawQuery != "" {
++		http.NotFound(writer, request)
++		return
++	}
++	id, err := url.PathUnescape(suffix)
++	if err != nil || id == "" {
++		http.NotFound(writer, request)
++		return
++	}
++	if request.Header.Get("Content-Type") != "application/json" {
++		http.Error(writer, "content type must be application/json", http.StatusBadRequest)
++		return
++	}
+ 
+-func (s *Server) HTTPClient() *http.Client { return nil }
++	var raw map[string]json.RawMessage
++	if err := json.Unmarshal(body, &raw); err != nil {
++		http.Error(writer, "invalid JSON", http.StatusBadRequest)
++		return
++	}
++	for _, required := range s.required {
++		if _, present := raw[required]; !present {
++			http.Error(writer, "missing required field", http.StatusBadRequest)
++			return
++		}
++	}
+ 
+-func (s *Server) Close() {}
++	decoder := json.NewDecoder(bytes.NewReader(body))
++	decoder.DisallowUnknownFields()
++	var update vcflogs.ForwarderUpdate
++	if err := decoder.Decode(&update); err != nil {
++		http.Error(writer, "request does not match contract", http.StatusBadRequest)
++		return
++	}
++	if err := decoder.Decode(&struct{}{}); err != io.EOF {
++		http.Error(writer, "request contains trailing JSON", http.StatusBadRequest)
++		return
++	}
+ 
+-func (s *Server) Requests() []RequestRecord { return nil }
++	s.mu.Lock()
++	if previous, present := s.state[id]; !present || !reflect.DeepEqual(previous, update) {
++		s.state[id] = update
++		s.effectCount++
++	}
++	fail := !s.failedFirst
++	if fail {
++		s.failedFirst = true
++	}
++	s.mu.Unlock()
+ 
+-func (s *Server) EffectCount() int { return 0 }
++	if fail {
++		writer.Header().Set("Content-Type", "application/json")
++		writer.WriteHeader(http.StatusInternalServerError)
++		_, _ = writer.Write([]byte(`{"errorMessage":"The operation failed due to an internal error."}`))
++		return
++	}
++
++	response := forwarderResponse(id, update)
++	writer.Header().Set("Content-Type", "application/json")
++	if err := json.NewEncoder(writer).Encode(response); err != nil {
++		panic(err)
++	}
++}
++
++func (s *Server) record(request *http.Request, body []byte) {
++	record := RequestRecord{
++		Method:        request.Method,
++		RequestURI:    request.RequestURI,
++		ContentType:   request.Header.Get("Content-Type"),
++		Accept:        request.Header.Get("Accept"),
++		Authorization: request.Header.Get("Authorization"),
++		Body:          bytes.Clone(body),
++	}
++	s.mu.Lock()
++	s.requests = append(s.requests, record)
++	s.mu.Unlock()
++}
++
++func forwarderResponse(id string, update vcflogs.ForwarderUpdate) vcflogs.Forwarder {
++	name := "forwarder-" + id
++	if update.Name != nil {
++		name = *update.Name
++	}
++	workerCount := 4
++	if update.WorkerCount != nil {
++		workerCount = *update.WorkerCount
++	}
++	diskCacheSize := 1000000000
++	if update.DiskCacheSize != nil {
++		diskCacheSize = *update.DiskCacheSize
++	}
++	filter := ""
++	if update.Filter != nil {
++		filter = *update.Filter
++	}
++	forwardComplementaryFields := false
++	if update.ForwardComplementaryFields != nil {
++		forwardComplementaryFields = *update.ForwardComplementaryFields
++	}
++	transportProtocol := ""
++	if update.TransportProtocol != nil {
++		transportProtocol = *update.TransportProtocol
++	}
++	tags := update.Tags
++	if tags == nil {
++		tags = map[string]string{}
++	}
++	return vcflogs.Forwarder{
++		Name:                       name,
++		Host:                       update.Host,
++		Port:                       update.Port,
++		Protocol:                   update.Protocol,
++		SSLEnabled:                 update.SSLEnabled,
++		WorkerCount:                workerCount,
++		DiskCacheSize:              diskCacheSize,
++		Tags:                       tags,
++		Filter:                     filter,
++		TransportProtocol:          transportProtocol,
++		ForwardComplementaryFields: forwardComplementaryFields,
++		ID:                         id,
++	}
++}

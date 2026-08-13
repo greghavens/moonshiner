@@ -1,0 +1,313 @@
+diff --git a/src/VcfAutomation.CredentialRotation/VcfAutomation.CredentialRotation.psm1 b/src/VcfAutomation.CredentialRotation/VcfAutomation.CredentialRotation.psm1
+index fabfb4c..a900d78 100644
+--- a/src/VcfAutomation.CredentialRotation/VcfAutomation.CredentialRotation.psm1
++++ b/src/VcfAutomation.CredentialRotation/VcfAutomation.CredentialRotation.psm1
+@@ -6,12 +6,35 @@ $ErrorActionPreference = 'Stop'
+     VcfAutomation.CredentialRotation
+ 
+     Drives the VCF Automation IaaS API described by docs/contract.json.
+-
+-    Both public functions below are unimplemented. Implement them so that the
+-    wire traffic matches the contract exactly; see README.md for the required
+-    behaviour and docs/contract.json for the authority on every field.
+ #>
+ 
++# Pinned by docs/contract.json. Every operation carries it.
++$script:ApiVersion   = '2021-07-15'
++$script:BasePath     = '/iaas/api'
++$script:TerminalStatuses = @('FINISHED', 'FAILED')
++
++# --------------------------------------------------------------------------
++# Specification model
++# --------------------------------------------------------------------------
++
++class VcfaUpdateCloudAccountSpecification {
++    # Ordered so the serialised body reads required-first.
++    [System.Collections.Specialized.OrderedDictionary] $Fields
++
++    VcfaUpdateCloudAccountSpecification() {
++        $this.Fields = [ordered]@{}
++    }
++
++    [void] Set([string] $name, [object] $value) {
++        $this.Fields[$name] = $value
++    }
++
++    [string] ToJson() {
++        # Depth covers cloudAccountProperties/customProperties nesting and tags.
++        return ($this.Fields | ConvertTo-Json -Depth 12 -Compress)
++    }
++}
++
+ function New-VcfaUpdateCloudAccountSpecification {
+     <#
+     .SYNOPSIS
+@@ -22,6 +45,11 @@ function New-VcfaUpdateCloudAccountSpecification {
+         the way the VMware.Sdk.Vcf model builders do: an optional property the
+         caller did not supply does not appear in the output at all.
+ 
++        Presence is decided by PSBoundParameters, so an optional the caller
++        explicitly set to $false or to '' is still transmitted. Clearing a field
++        is a distinct intent from not mentioning it, and on a PATCH the API
++        treats them differently.
++
+     .OUTPUTS
+         An object with a ToJson() method returning a JSON string.
+     #>
+@@ -53,10 +81,130 @@ function New-VcfaUpdateCloudAccountSpecification {
+         [Parameter()] [hashtable]  $CertificateInfo
+     )
+ 
+-    throw [System.NotImplementedException]::new(
+-        'New-VcfaUpdateCloudAccountSpecification is not implemented.')
++    $spec = [VcfaUpdateCloudAccountSpecification]::new()
++
++    $spec.Set('name', $Name)
++    $spec.Set('cloudAccountProperties', $CloudAccountProperties)
++    $spec.Set('regions', @(
++            foreach ($region in $Regions) {
++                # RegionSpecification is exactly these two fields. The Region type
++                # that comes back from Get Cloud Account carries id, cloudAccountId,
++                # _links and friends; none of them belong in a request body.
++                [ordered]@{
++                    externalRegionId = [string] $region.externalRegionId
++                    name             = [string] $region.name
++                }
++            }
++        ))
++
++    # Parameter name -> wire field name, for every optional in the contract.
++    $optionalFields = [ordered]@{
++        Description                       = 'description'
++        PrivateKeyId                      = 'privateKeyId'
++        PrivateKey                        = 'privateKey'
++        CustomProperties                  = 'customProperties'
++        AssociatedCloudAccountIds         = 'associatedCloudAccountIds'
++        AssociatedMobilityCloudAccountIds = 'associatedMobilityCloudAccountIds'
++        CreateDefaultZones                = 'createDefaultZones'
++        Tags                              = 'tags'
++        CertificateInfo                   = 'certificateInfo'
++    }
++
++    foreach ($parameterName in $optionalFields.Keys) {
++        if ($PSBoundParameters.ContainsKey($parameterName)) {
++            $spec.Set($optionalFields[$parameterName], $PSBoundParameters[$parameterName])
++        }
++    }
++
++    return $spec
+ }
+ 
++# --------------------------------------------------------------------------
++# Transport
++# --------------------------------------------------------------------------
++
++function Invoke-VcfaIaasRequest {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] [string] $Server,
++        [Parameter(Mandatory)] [string] $AccessToken,
++        [Parameter(Mandatory)] [ValidateSet('GET', 'POST', 'PATCH')] [string] $Method,
++        [Parameter(Mandatory)] [string] $Path,
++        [Parameter()] [hashtable] $Query,
++        [Parameter()] [string] $JsonBody
++    )
++
++    # apiVersion is pinned for every operation so a rotation cannot straddle
++    # two server-selected API versions part way through.
++    $parameters = [ordered]@{ apiVersion = $script:ApiVersion }
++    if ($Query) {
++        foreach ($key in $Query.Keys) { $parameters[$key] = $Query[$key] }
++    }
++
++    $queryString = ($parameters.GetEnumerator() | ForEach-Object {
++            '{0}={1}' -f [uri]::EscapeDataString($_.Key), [uri]::EscapeDataString([string] $_.Value)
++        }) -join '&'
++
++    $uri = '{0}{1}?{2}' -f $Server.TrimEnd('/'), $Path, $queryString
++
++    $arguments = @{
++        Uri     = $uri
++        Method  = $Method
++        Headers = @{ Authorization = "Bearer $AccessToken"; Accept = 'application/json' }
++    }
++    if ($PSBoundParameters.ContainsKey('JsonBody')) {
++        $arguments.Body        = $JsonBody
++        $arguments.ContentType = 'application/json'
++    }
++
++    return Invoke-RestMethod @arguments
++}
++
++function Get-VcfaRequestTracker {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] [string] $Server,
++        [Parameter(Mandatory)] [string] $AccessToken,
++        [Parameter(Mandatory)] [string] $RequestId
++    )
++    return Invoke-VcfaIaasRequest -Server $Server -AccessToken $AccessToken `
++        -Method GET -Path "$script:BasePath/request-tracker/$RequestId"
++}
++
++function Wait-VcfaRequestTracker {
++    <#
++        Follows one tracker to a terminal status and returns it.
++    #>
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] [string] $Server,
++        [Parameter(Mandatory)] [string] $AccessToken,
++        [Parameter(Mandatory)] [string] $RequestId,
++        [Parameter(Mandatory)] [int] $TimeoutSeconds,
++        [Parameter(Mandatory)] [int] $PollIntervalMilliseconds
++    )
++
++    $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSeconds)
++    while ($true) {
++        $tracker = Get-VcfaRequestTracker -Server $Server -AccessToken $AccessToken -RequestId $RequestId
++        $status = if ($tracker.PSObject.Properties.Name -contains 'status') { $tracker.status } else { $null }
++
++        if ($status -in $script:TerminalStatuses) {
++            return $tracker
++        }
++
++        if ([datetime]::UtcNow -ge $deadline) {
++            throw "Request $RequestId did not reach a terminal status within $TimeoutSeconds seconds (last status: $status)."
++        }
++
++        Start-Sleep -Milliseconds $PollIntervalMilliseconds
++    }
++}
++
++# --------------------------------------------------------------------------
++# Rotation
++# --------------------------------------------------------------------------
++
+ function Invoke-VcfaCloudAccountCredentialRotation {
+     <#
+     .SYNOPSIS
+@@ -99,8 +247,121 @@ function Invoke-VcfaCloudAccountCredentialRotation {
+         [int] $PollIntervalMilliseconds = 50
+     )
+ 
+-    throw [System.NotImplementedException]::new(
+-        'Invoke-VcfaCloudAccountCredentialRotation is not implemented.')
++    $common = @{ Server = $Server; AccessToken = $AccessToken }
++
++    # -- 1. Read the account before writing to it -------------------------
++    #
++    # name, cloudAccountProperties and regions are all required on the update.
++    # Rotating a secret must not be an excuse to drop the endpoint's hostname
++    # or its enabled regions, so they are carried forward from the current state.
++
++    Write-Verbose "Reading cloud account $CloudAccountId."
++    $account = Invoke-VcfaIaasRequest @common -Method GET -Path "$script:BasePath/cloud-accounts/$CloudAccountId"
++
++    $enabledRegions = @()
++    if ($account.PSObject.Properties.Name -contains 'enabledRegions' -and $account.enabledRegions) {
++        $enabledRegions = @($account.enabledRegions)
++    }
++
++    # -- 2. Drain anything already in flight -------------------------------
++    #
++    # A request that is already running was admitted under the old secret and
++    # will go on authenticating to the provider with it. Rotating underneath it
++    # strands it: it holds a credential the platform has replaced, and it fails
++    # part way through with nothing to roll back to. Wait it out first.
++
++    Write-Verbose 'Listing request trackers to find in-flight work.'
++    $trackers = Invoke-VcfaIaasRequest @common -Method GET -Path "$script:BasePath/request-tracker"
++
++    $inFlight = @()
++    if ($trackers.PSObject.Properties.Name -contains 'content' -and $trackers.content) {
++        $inFlight = @($trackers.content | Where-Object { $_.status -eq 'INPROGRESS' } | ForEach-Object { $_.id })
++    }
++
++    $drained = [System.Collections.Generic.List[string]]::new()
++    foreach ($requestId in $inFlight) {
++        Write-Verbose "Waiting for in-flight request $requestId to settle before rotating."
++        $settled = Wait-VcfaRequestTracker @common -RequestId $requestId `
++            -TimeoutSeconds $DrainTimeoutSeconds -PollIntervalMilliseconds $PollIntervalMilliseconds
++        $drained.Add($settled.id)
++    }
++
++    # -- 3. Rotate ---------------------------------------------------------
++    #
++    # Only privateKeyId and privateKey are being changed, so every other
++    # optional field is left unbound and will not appear on the wire at all.
++    # Sending description:'' or tags:[] here would clear operator-set metadata,
++    # because PATCH replaces exactly the fields it is given.
++
++    $specification = New-VcfaUpdateCloudAccountSpecification `
++        -Name $account.name `
++        -CloudAccountProperties (ConvertTo-VcfaHashtable $account.cloudAccountProperties) `
++        -Regions $enabledRegions `
++        -PrivateKeyId $NewPrivateKeyId `
++        -PrivateKey $NewPrivateKey
++
++    Write-Verbose "Submitting credential rotation for $CloudAccountId."
++    $accepted = Invoke-VcfaIaasRequest @common -Method PATCH `
++        -Path "$script:BasePath/cloud-accounts/$CloudAccountId" `
++        -JsonBody $specification.ToJson()
++
++    # 202 Accepted only says the update was queued.
++    $rotation = Wait-VcfaRequestTracker @common -RequestId $accepted.id `
++        -TimeoutSeconds $DrainTimeoutSeconds -PollIntervalMilliseconds $PollIntervalMilliseconds
++
++    if ($rotation.status -ne 'FINISHED') {
++        Write-Warning "Credential rotation request $($rotation.id) ended $($rotation.status): $($rotation.message)"
++    }
++
++    # -- 4. Prove the new secret works --------------------------------------
++
++    $healthStatus = $null
++    $healthId     = $null
++    if ($rotation.status -eq 'FINISHED') {
++        Write-Verbose 'Running endpoint health check against the rotated credentials.'
++        # periodicHealthCheckId is left off: this is a manual check, and an
++        # unset optional query parameter is omitted rather than sent empty.
++        $healthAccepted = Invoke-VcfaIaasRequest @common -Method POST `
++            -Path "$script:BasePath/cloud-accounts/$CloudAccountId/health-check"
++
++        $health = Wait-VcfaRequestTracker @common -RequestId $healthAccepted.id `
++            -TimeoutSeconds $DrainTimeoutSeconds -PollIntervalMilliseconds $PollIntervalMilliseconds
++
++        $healthId     = $health.id
++        $healthStatus = $health.status
++        if ($healthStatus -ne 'FINISHED') {
++            Write-Warning "Endpoint health check $healthId ended ${healthStatus}: $($health.message)"
++        }
++    }
++
++    return [pscustomobject]@{
++        DrainedRequestIds    = $drained.ToArray()
++        RotationRequestId    = $rotation.id
++        RotationStatus       = $rotation.status
++        HealthCheckRequestId = $healthId
++        HealthCheckStatus    = $healthStatus
++        Succeeded            = ($rotation.status -eq 'FINISHED' -and $healthStatus -eq 'FINISHED')
++    }
++}
++
++function ConvertTo-VcfaHashtable {
++    <#
++        Invoke-RestMethod hands back PSCustomObject; the specification builder
++        takes a hashtable. Converts one level deep, which is all
++        cloudAccountProperties needs (it is a name/value bag).
++    #>
++    [CmdletBinding()]
++    [OutputType([hashtable])]
++    param([Parameter(Mandatory)] [AllowNull()] [object] $InputObject)
++
++    $result = @{}
++    if ($null -eq $InputObject) { return $result }
++    if ($InputObject -is [hashtable]) { return $InputObject }
++
++    foreach ($property in $InputObject.PSObject.Properties) {
++        $result[$property.Name] = $property.Value
++    }
++    return $result
+ }
+ 
+ Export-ModuleMember -Function @(

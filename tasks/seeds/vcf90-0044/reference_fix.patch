@@ -1,0 +1,471 @@
+diff --git a/vcfvm/__init__.py b/vcfvm/__init__.py
+new file mode 100644
+index 0000000..f477c1a
+--- /dev/null
++++ b/vcfvm/__init__.py
+@@ -0,0 +1,24 @@
++"""Contract-pinned client for the VCF 9.0 vSphere Automation API for vCenter.
++
++The package applies a multi-step virtual machine change and reports, step by
++step, exactly which parts of that change landed on the endpoint.  Every request
++is resolved from ``docs/contract.json``, a projection of
++``specifications/vsphere/openapi/automation/vcenter.yaml`` in
++``vmware/vcf-api-specs`` at tag ``9.0.0.0``.
++
++Standard library only.
++"""
++
++from .contract import Contract, ContractError
++from .client import VcenterApiError, VcenterClient
++from .reconfigure import STEP_NAMES, ChangePlan, reconfigure
++
++__all__ = [
++    "ChangePlan",
++    "Contract",
++    "ContractError",
++    "STEP_NAMES",
++    "VcenterApiError",
++    "VcenterClient",
++    "reconfigure",
++]
+diff --git a/vcfvm/__main__.py b/vcfvm/__main__.py
+new file mode 100644
+index 0000000..dbdd066
+--- /dev/null
++++ b/vcfvm/__main__.py
+@@ -0,0 +1,6 @@
++import sys
++
++from .cli import main
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/vcfvm/cli.py b/vcfvm/cli.py
+new file mode 100644
+index 0000000..29a92ea
+--- /dev/null
++++ b/vcfvm/cli.py
+@@ -0,0 +1,98 @@
++"""`python3 -m vcfvm` - apply the change and write the step report."""
++
++import argparse
++import json
++import sys
++
++from .client import VcenterApiError, VcenterClient
++from .contract import Contract, ContractError, DEFAULT_CONTRACT
++from .reconfigure import ChangePlan, reconfigure
++
++
++def build_parser():
++    parser = argparse.ArgumentParser(
++        prog="vcfvm",
++        description="Resize memory, attach a disk and a NIC, then power on a vCenter VM.")
++    parser.add_argument("--base-url", required=True,
++                        help="vCenter server root, for example https://vcenter.example.com")
++    parser.add_argument("--username", required=True)
++    parser.add_argument("--password", required=True)
++    parser.add_argument("--vm", required=True, help="VirtualMachine identifier, e.g. vm-3041")
++    parser.add_argument("--report", required=True, help="path of the JSON report to write")
++    parser.add_argument("--contract", default=DEFAULT_CONTRACT,
++                        help="API contract to resolve operations against")
++    parser.add_argument("--memory-mib", type=int, required=True)
++    parser.add_argument("--hot-add-enabled", action="store_true")
++
++    parser.add_argument("--disk-capacity-gib", type=int, required=True)
++    parser.add_argument("--disk-name")
++    parser.add_argument("--disk-scsi-bus", type=int)
++    parser.add_argument("--disk-scsi-unit", type=int)
++
++    parser.add_argument("--nic-network", required=True)
++    parser.add_argument("--nic-type")
++    parser.add_argument("--nic-start-connected", action="store_true")
++    return parser
++
++
++def main(argv=None):
++    args = build_parser().parse_args(argv)
++    if args.memory_mib <= 0:
++        build_parser().error("--memory-mib must be positive")
++    if args.disk_capacity_gib <= 0:
++        build_parser().error("--disk-capacity-gib must be positive")
++
++    try:
++        contract = Contract.load(args.contract)
++    except ContractError as err:
++        print("error: %s" % err, file=sys.stderr)
++        return 2
++
++    plan = ChangePlan(
++        vm=args.vm,
++        memory_mib=args.memory_mib,
++        disk_capacity_gib=args.disk_capacity_gib,
++        nic_network=args.nic_network,
++        hot_add_enabled=args.hot_add_enabled,
++        disk_name=args.disk_name,
++        disk_scsi_bus=args.disk_scsi_bus,
++        disk_scsi_unit=args.disk_scsi_unit,
++        nic_type=args.nic_type,
++        nic_start_connected=args.nic_start_connected,
++    )
++
++    client = VcenterClient(args.base_url, contract)
++    try:
++        client.open_session(args.username, args.password)
++    except VcenterApiError as err:
++        print("error: could not authenticate to %s: %s (%s)"
++              % (args.base_url, err.message, err.error_type), file=sys.stderr)
++        return 2
++    try:
++        report = reconfigure(client, plan)
++    finally:
++        try:
++            client.close_session()
++        except VcenterApiError as err:
++            print("warning: could not release the vCenter session: %s" % err.message,
++                  file=sys.stderr)
++
++    with open(args.report, "w", encoding="utf-8") as handle:
++        json.dump(report, handle, indent=2)
++        handle.write("\n")
++
++    _summarise(report)
++    return 0 if report["outcome"] == "succeeded" else 1
++
++
++def _summarise(report):
++    print("virtual machine %s: %s" % (report["vm"], report["outcome"]))
++    for step in report["steps"]:
++        line = "  %-12s %-13s %s" % (step["name"], step["status"], step["operation_id"])
++        if "error" in step:
++            line += "\n      HTTP %s %s: %s" % (step["error"]["http_status"],
++                                                step["error"]["error_type"],
++                                                step["error"]["message"])
++        elif "result" in step:
++            line += "  ->  %s" % json.dumps(step["result"], sort_keys=True)
++        print(line, file=sys.stderr if "error" in step else sys.stdout)
+diff --git a/vcfvm/client.py b/vcfvm/client.py
+new file mode 100644
+index 0000000..97abd7b
+--- /dev/null
++++ b/vcfvm/client.py
+@@ -0,0 +1,118 @@
++"""Minimal urllib transport for the contract-pinned vCenter operations."""
++
++import base64
++import json
++import urllib.error
++import urllib.request
++
++SESSION_CREATE = "Cis.Session_create"
++SESSION_DELETE = "Cis.Session_delete"
++SESSION_HEADER = "vmware-api-session-id"
++
++
++class VcenterApiError(Exception):
++    """A vAPI error response (Vapi.Std.Errors.*) returned by the endpoint."""
++
++    def __init__(self, operation_id, status, error_type, message, messages=None):
++        super().__init__("%s failed with HTTP %s (%s): %s"
++                         % (operation_id, status, error_type, message))
++        self.operation_id = operation_id
++        self.status = status
++        self.error_type = error_type
++        self.message = message
++        self.messages = messages or []
++
++    def as_report(self):
++        return {"http_status": self.status, "error_type": self.error_type,
++                "message": self.message}
++
++
++class VcenterClient:
++    """Calls the operations named in the contract and nothing else."""
++
++    def __init__(self, base_url, contract, timeout=30.0):
++        self.base_url = base_url.rstrip("/")
++        self.contract = contract
++        self.timeout = timeout
++        self._session_id = None
++    # -- session ---------------------------------------------------------
++
++    @property
++    def session_id(self):
++        return self._session_id
++
++    def open_session(self, username, password):
++        blob = base64.b64encode(("%s:%s" % (username, password)).encode("utf-8")).decode("ascii")
++        token = self.call(SESSION_CREATE, headers={"Authorization": "Basic " + blob})
++        if not isinstance(token, str) or not token:
++            raise VcenterApiError(SESSION_CREATE, 201, "ERROR",
++                                  "the endpoint did not return a session identifier")
++        self._session_id = token
++        return token
++
++    def close_session(self):
++        if self._session_id is None:
++            return
++        try:
++            self.call(SESSION_DELETE)
++        finally:
++            self._session_id = None
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *_):
++        self.close_session()
++        return False
++
++    # -- transport -------------------------------------------------------
++
++    def call(self, operation_id, path_params=None, body=None, headers=None):
++        method, target = self.contract.target(operation_id, path_params)
++        request_headers = dict(headers or {})
++        if self.contract.security(operation_id) != "basic_auth":
++            if not self._session_id:
++                raise VcenterApiError(operation_id, 401, "UNAUTHENTICATED",
++                                      "no session has been established")
++            request_headers[SESSION_HEADER] = self._session_id
++        payload = None
++        if body is not None:
++            payload = json.dumps(body).encode("utf-8")
++            request_headers["Content-Type"] = "application/json"
++        request_headers["Accept"] = "application/json"
++        request = urllib.request.Request(self.base_url + target, data=payload,
++                                         headers=request_headers, method=method)
++        try:
++            with urllib.request.urlopen(request, timeout=self.timeout) as response:
++                return _decode(response.status, response.read())
++        except urllib.error.HTTPError as err:
++            raise _api_error(operation_id, err)
++        except urllib.error.URLError as err:
++            raise VcenterApiError(operation_id, 0, "SERVICE_UNAVAILABLE",
++                                  "cannot reach %s: %s" % (self.base_url, err.reason))
++
++
++def _decode(status, raw):
++    if status == 204 or not raw:
++        return None
++    try:
++        return json.loads(raw.decode("utf-8"))
++    except (ValueError, UnicodeDecodeError):
++        return None
++
++
++def _api_error(operation_id, err):
++    try:
++        payload = json.loads(err.read().decode("utf-8"))
++    except (ValueError, UnicodeDecodeError, OSError):
++        payload = {}
++    if not isinstance(payload, dict):
++        payload = {}
++    messages = payload.get("messages") or []
++    default = ""
++    if messages and isinstance(messages[0], dict):
++        default = messages[0].get("default_message") or ""
++    return VcenterApiError(operation_id, err.code,
++                           payload.get("error_type") or "ERROR",
++                           default or err.reason or "the endpoint reported an error",
++                           messages)
+diff --git a/vcfvm/contract.py b/vcfvm/contract.py
+new file mode 100644
+index 0000000..55e6c24
+--- /dev/null
++++ b/vcfvm/contract.py
+@@ -0,0 +1,67 @@
++"""Reads docs/contract.json and turns an operationId into a concrete request."""
++
++import json
++import os
++from urllib.parse import quote, urlencode
++
++DEFAULT_CONTRACT = os.path.join(
++    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "contract.json")
++
++
++class ContractError(Exception):
++    """The contract does not describe the operation the caller asked for."""
++
++
++class Contract:
++    """The subset of the vCenter OpenAPI document this client is pinned to."""
++
++    def __init__(self, document):
++        self.document = document
++        self.base_path = document["basePath"].rstrip("/")
++        self.operations = {op["operationId"]: op for op in document["operations"]}
++
++    @classmethod
++    def load(cls, path=None):
++        path = path or DEFAULT_CONTRACT
++        try:
++            with open(path, "r", encoding="utf-8") as handle:
++                return cls(json.load(handle))
++        except OSError as err:
++            raise ContractError("cannot read the API contract at %s: %s" % (path, err))
++        except ValueError as err:
++            raise ContractError("the API contract at %s is not valid JSON: %s" % (path, err))
++
++    def operation(self, operation_id):
++        try:
++            return self.operations[operation_id]
++        except KeyError:
++            raise ContractError("the contract does not describe %r" % operation_id)
++
++    def target(self, operation_id, path_params=None):
++        """Return (method, target) for an operation, relative to the server root."""
++        operation = self.operation(operation_id)
++        supplied = dict(path_params or {})
++        target = self.base_path
++        for segment in operation["path"].split("/"):
++            if not segment:
++                continue
++            if segment.startswith("{") and segment.endswith("}"):
++                name = segment[1:-1]
++                if name not in supplied:
++                    raise ContractError(
++                        "%s needs a %r path parameter" % (operation_id, name))
++                segment = quote(str(supplied.pop(name)), safe="")
++            target += "/" + segment
++        if supplied:
++            raise ContractError("%s does not take %s"
++                                % (operation_id, ", ".join(sorted(supplied))))
++        query = operation.get("query") or {}
++        if query:
++            target += "?" + urlencode(sorted(query.items()))
++        return operation["method"], target
++
++    def security(self, operation_id):
++        return self.operation(operation_id)["security"]
++
++    def success_status(self, operation_id):
++        return self.operation(operation_id)["successStatus"]
+diff --git a/vcfvm/reconfigure.py b/vcfvm/reconfigure.py
+new file mode 100644
+index 0000000..2e28636
+--- /dev/null
++++ b/vcfvm/reconfigure.py
+@@ -0,0 +1,122 @@
++"""The multi-step VM change, and the step-by-step report of what actually landed.
++
++Steps run in order and stop at the first failure.  A step that never ran is
++reported as ``not_attempted`` rather than silently dropped, so a caller can tell
++the difference between "did not happen" and "happened and failed".
++"""
++
++from .client import VcenterApiError
++
++GIB = 1024 ** 3
++
++STEP_NAMES = ["power_state", "memory", "disk", "nic", "power_on"]
++STEP_OPERATIONS = {
++    "power_state": "Vcenter.Vm.Power_get",
++    "memory": "Vcenter.Vm.Hardware.Memory_update",
++    "disk": "Vcenter.Vm.Hardware.Disk_create",
++    "nic": "Vcenter.Vm.Hardware.Ethernet_create",
++    "power_on": "Vcenter.Vm.Power_start",
++}
++
++
++class ChangePlan:
++    """The change a caller asked for.  ``None`` means "the caller said nothing"."""
++
++    def __init__(self, vm, memory_mib, disk_capacity_gib, nic_network,
++                 hot_add_enabled=False, disk_name=None, disk_scsi_bus=None,
++                 disk_scsi_unit=None, nic_type=None, nic_start_connected=False):
++        self.vm = vm
++        self.memory_mib = memory_mib
++        self.disk_capacity_gib = disk_capacity_gib
++        self.nic_network = nic_network
++        self.hot_add_enabled = hot_add_enabled
++        self.disk_name = disk_name
++        self.disk_scsi_bus = disk_scsi_bus
++        self.disk_scsi_unit = disk_scsi_unit
++        self.nic_type = nic_type
++        self.nic_start_connected = nic_start_connected
++
++    # -- request bodies ---------------------------------------------------
++    #
++    # Every optional property is omitted when the caller did not ask for it.
++    # None of them is ever sent as null, false or an empty object.
++
++    def memory_spec(self):
++        spec = {"size_mib": self.memory_mib}
++        if self.hot_add_enabled:
++            spec["hot_add_enabled"] = True
++        return spec
++
++    def disk_spec(self):
++        vmdk = {}
++        if self.disk_name is not None:
++            vmdk["name"] = self.disk_name
++        vmdk["capacity"] = self.disk_capacity_gib * GIB
++        spec = {"new_vmdk": vmdk}
++        if self.disk_scsi_bus is not None:
++            scsi = {"bus": self.disk_scsi_bus}
++            if self.disk_scsi_unit is not None:
++                scsi["unit"] = self.disk_scsi_unit
++            spec["type"] = "SCSI"
++            spec["scsi"] = scsi
++        return spec
++
++    def nic_spec(self):
++        spec = {"backing": {"type": "STANDARD_PORTGROUP", "network": self.nic_network}}
++        if self.nic_type is not None:
++            spec["type"] = self.nic_type
++        if self.nic_start_connected:
++            spec["start_connected"] = True
++        return spec
++
++
++def _blank_report(vm):
++    return {
++        "vm": vm,
++        "outcome": "succeeded",
++        "steps": [{"name": name, "operation_id": STEP_OPERATIONS[name],
++                   "status": "not_attempted"} for name in STEP_NAMES],
++    }
++
++
++def reconfigure(client, plan):
++    """Apply the plan and return the report.  Never raises for an API failure."""
++    report = _blank_report(plan.vm)
++    steps = {step["name"]: step for step in report["steps"]}
++    where = {"vm": plan.vm}
++
++    def run(name, call):
++        step = steps[name]
++        try:
++            step["result"] = call()
++        except VcenterApiError as err:
++            step["status"] = "failed"
++            step["error"] = err.as_report()
++            report["outcome"] = "failed"
++            return False
++        step["status"] = "succeeded"
++        return True
++
++    def read_power():
++        info = client.call("Vcenter.Vm.Power_get", where) or {}
++        return {"state": info.get("state")}
++
++    def update_memory():
++        client.call("Vcenter.Vm.Hardware.Memory_update", where, plan.memory_spec())
++        return {"memory_mib": plan.memory_mib}
++
++    def create_disk():
++        return {"disk": client.call("Vcenter.Vm.Hardware.Disk_create", where, plan.disk_spec())}
++
++    def create_nic():
++        return {"nic": client.call("Vcenter.Vm.Hardware.Ethernet_create", where, plan.nic_spec())}
++
++    def power_on():
++        client.call("Vcenter.Vm.Power_start", where)
++        return {"state": "POWERED_ON"}
++
++    for name, call in (("power_state", read_power), ("memory", update_memory),
++                       ("disk", create_disk), ("nic", create_nic), ("power_on", power_on)):
++        if not run(name, call):
++            break
++    return report

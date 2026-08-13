@@ -1,0 +1,415 @@
+diff --git a/vsandp/client.go b/vsandp/client.go
+--- a/vsandp/client.go
++++ b/vsandp/client.go
+@@ -10,15 +10,22 @@
+ package vsandp
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
++	"strings"
++	"sync"
+ 	"time"
+ )
+ 
+ // ErrNotImplemented is returned by the unfinished parts of this package.
+ var ErrNotImplemented = errors.New("vsandp: not implemented")
+ 
+ // TimeUnit values accepted by RetentionPeriod.Unit, per the Snapservice.TimeUnit
+ // enumeration in the pinned contract.
+ const (
+@@ -39,6 +46,9 @@
+ 	StatusFailed    = "FAILED"
+ )
+ 
++// headerSessionID is the api_key_auth security scheme from the contract.
++const headerSessionID = "vmware-api-session-id"
++
+ // RetentionPeriod mirrors the Snapservice.RetentionPeriod schema. Both
+ // properties are required by the schema, so a RetentionPeriod is either sent in
+ // full or not sent at all.
+@@ -108,19 +118,48 @@
+ // Client talks to one snapshot appliance. A Client is safe for concurrent use
+ // by multiple goroutines and shares one working session token across them.
+ type Client struct {
+-	cfg Config
++	cfg  Config
++	http *http.Client
++
++	// mu guards the working session token. It is held across the
++	// Snapservice.Sessions_create round trip so that concurrent batches that
++	// notice the same expiry mint one replacement between them rather than one
++	// each.
++	mu      sync.Mutex
++	token   string
++	gen     uint64
++	creates int
+ }
+ 
+ // New validates cfg and returns a ready Client. It performs no I/O.
+ func New(cfg Config) (*Client, error) {
+-	return nil, ErrNotImplemented
++	if strings.TrimSpace(cfg.BaseURL) == "" {
++		return nil, errors.New("vsandp: BaseURL is required")
++	}
++	if cfg.BootstrapToken == "" {
++		return nil, errors.New("vsandp: BootstrapToken is required")
++	}
++	if cfg.PollInterval < 0 {
++		return nil, errors.New("vsandp: PollInterval must not be negative")
++	}
++	cfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/")
++	if _, err := url.Parse(cfg.BaseURL); err != nil {
++		return nil, fmt.Errorf("vsandp: BaseURL is not a URL: %w", err)
++	}
++	httpClient := cfg.HTTPClient
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++	return &Client{cfg: cfg, http: httpClient}, nil
+ }
+ 
+ // SessionCreates reports how many working session tokens this Client has minted
+ // over its lifetime, including the first one. It is safe to call concurrently
+ // with SnapshotProtectionGroups.
+ func (c *Client) SessionCreates() int {
+-	return 0
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return c.creates
+ }
+ 
+ // SnapshotProtectionGroups lists the protection groups selected by req, starts a
+@@ -131,5 +170,325 @@
+ // is not an error. Any transport failure, malformed response, or non-2xx status
+ // other than 401 aborts the batch and is returned as an error.
+ func (c *Client) SnapshotProtectionGroups(ctx context.Context, req BatchRequest) (*BatchReport, error) {
+-	return nil, ErrNotImplemented
++	if err := req.validate(); err != nil {
++		return nil, err
++	}
++
++	groups, err := c.listProtectionGroups(ctx, req)
++	if err != nil {
++		return nil, err
++	}
++
++	report := &BatchReport{Results: make([]Result, 0, len(groups))}
++	for _, g := range groups {
++		// Each protection group is started and drained before the next one, so
++		// a token that expires here leaves the already-finished entries of
++		// report.Results untouched and never restarts a snapshot that the
++		// appliance has already accepted.
++		task, err := c.createSnapshot(ctx, req, g.PG)
++		if err != nil {
++			return nil, err
++		}
++		status, err := c.awaitTask(ctx, task)
++		if err != nil {
++			return nil, err
++		}
++		report.Results = append(report.Results, Result{
++			PG:     g.PG,
++			Name:   g.Name,
++			Task:   task,
++			Status: status,
++		})
++	}
++	return report, nil
++}
++
++func (r BatchRequest) validate() error {
++	if r.Cluster == "" {
++		return errors.New("vsandp: BatchRequest.Cluster is required")
++	}
++	if r.SnapshotName == "" {
++		return errors.New("vsandp: BatchRequest.SnapshotName is required")
++	}
++	seen := make(map[string]bool, len(r.Names))
++	for i, name := range r.Names {
++		if name == "" {
++			return fmt.Errorf("vsandp: BatchRequest.Names[%d] is empty", i)
++		}
++		if seen[name] {
++			return fmt.Errorf("vsandp: BatchRequest.Names[%d] repeats %q; the "+
++				"names filter has unique items", i, name)
++		}
++		seen[name] = true
++	}
++	if r.Retention != nil {
++		if r.Retention.Unit == "" {
++			return errors.New("vsandp: RetentionPeriod.Unit is required when Retention is set")
++		}
++		if r.Retention.Duration <= 0 {
++			return errors.New("vsandp: RetentionPeriod.Duration must be positive when Retention is set")
++		}
++	}
++	return nil
++}
++
++// protectionGroup is one entry of a Snapservice.Clusters.ProtectionGroups_list
++// response.
++type protectionGroup struct {
++	PG   string
++	Name string
++}
++
++// listProtectionGroups invokes Snapservice.Clusters.ProtectionGroups_list.
++func (c *Client) listProtectionGroups(ctx context.Context, req BatchRequest) ([]protectionGroup, error) {
++	query := url.Values{}
++	// pgs, states, vms and cluster_pairs stay unset, and an unset optional
++	// query parameter is absent from the request rather than sent empty.
++	if len(req.Names) > 0 {
++		query["names"] = req.Names
++	}
++
++	path := "/snapservice/clusters/" + url.PathEscape(req.Cluster) + "/protection-groups"
++	body, err := c.do(ctx, http.MethodGet, path, query, nil, http.StatusOK)
++	if err != nil {
++		return nil, err
++	}
++
++	var payload struct {
++		Items *[]struct {
++			PG   string `json:"pg"`
++			Info struct {
++				Name string `json:"name"`
++			} `json:"info"`
++		} `json:"items"`
++	}
++	if err := json.Unmarshal(body, &payload); err != nil {
++		return nil, fmt.Errorf("vsandp: Snapservice.Clusters.ProtectionGroups_list: "+
++			"undecodable response: %w", err)
++	}
++	if payload.Items == nil {
++		return nil, errors.New("vsandp: Snapservice.Clusters.ProtectionGroups_list: missing items")
++	}
++	groups := make([]protectionGroup, 0, len(*payload.Items))
++	for i, item := range *payload.Items {
++		if item.PG == "" || item.Info.Name == "" {
++			return nil, fmt.Errorf("vsandp: Snapservice.Clusters.ProtectionGroups_list: "+
++				"item %d is missing a required property", i)
++		}
++		groups = append(groups, protectionGroup{PG: item.PG, Name: item.Info.Name})
++	}
++	return groups, nil
++}
++
++// createSpec mirrors Snapservice.Clusters.ProtectionGroups.Snapshots.CreateSpec,
++// with the property order the contract declares. retention is optional and is
++// omitted rather than serialized as null or as a zero-valued object.
++type createSpec struct {
++	Name      string         `json:"name"`
++	Retention *retentionSpec `json:"retention,omitempty"`
++}
++
++// retentionSpec mirrors Snapservice.RetentionPeriod. Both properties are
++// required, so neither carries omitempty.
++type retentionSpec struct {
++	Unit     string `json:"unit"`
++	Duration int64  `json:"duration"`
++}
++
++// createSnapshot invokes Snapservice.Clusters.ProtectionGroups.Snapshots_create$Task
++// and returns the task identifier.
++func (c *Client) createSnapshot(ctx context.Context, req BatchRequest, pg string) (string, error) {
++	spec := createSpec{Name: req.SnapshotName}
++	if req.Retention != nil {
++		spec.Retention = &retentionSpec{
++			Unit:     req.Retention.Unit,
++			Duration: req.Retention.Duration,
++		}
++	}
++	payload, err := json.Marshal(spec)
++	if err != nil {
++		return "", fmt.Errorf("vsandp: encoding CreateSpec: %w", err)
++	}
++
++	path := "/snapservice/clusters/" + url.PathEscape(req.Cluster) +
++		"/protection-groups/" + url.PathEscape(pg) + "/snapshots"
++	// The operation is only exposed as a task, so vmw-task=true is part of the
++	// contract's path rather than an optional parameter.
++	query := url.Values{"vmw-task": []string{"true"}}
++
++	body, err := c.do(ctx, http.MethodPost, path, query, payload, http.StatusAccepted)
++	if err != nil {
++		return "", err
++	}
++	var task string
++	if err := json.Unmarshal(body, &task); err != nil || task == "" {
++		return "", fmt.Errorf("vsandp: Snapservice.Clusters.ProtectionGroups.Snapshots_create$Task: "+
++			"expected a task identifier, got %q", body)
++	}
++	return task, nil
++}
++
++// awaitTask polls Snapservice.Tasks_get until the task reports a terminal
++// status, and returns that status.
++func (c *Client) awaitTask(ctx context.Context, task string) (string, error) {
++	path := "/snapservice/tasks/" + url.PathEscape(task)
++	for {
++		body, err := c.do(ctx, http.MethodGet, path, nil, nil, http.StatusOK)
++		if err != nil {
++			return "", err
++		}
++		var info struct {
++			Status string `json:"status"`
++		}
++		if err := json.Unmarshal(body, &info); err != nil {
++			return "", fmt.Errorf("vsandp: Snapservice.Tasks_get: undecodable response: %w", err)
++		}
++		switch info.Status {
++		case StatusSucceeded, StatusFailed:
++			return info.Status, nil
++		case StatusPending, StatusRunning, StatusBlocked:
++		default:
++			return "", fmt.Errorf("vsandp: Snapservice.Tasks_get: task %s reported "+
++				"unknown status %q", task, info.Status)
++		}
++		if err := c.wait(ctx); err != nil {
++			return "", err
++		}
++	}
++}
++
++func (c *Client) wait(ctx context.Context) error {
++	if c.cfg.PollInterval <= 0 {
++		return ctx.Err()
++	}
++	timer := time.NewTimer(c.cfg.PollInterval)
++	defer timer.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-timer.C:
++		return nil
++	}
++}
++
++// do sends one contract operation, refreshing the session token and replaying
++// the request once if the appliance rejects it with 401.
++func (c *Client) do(ctx context.Context, method, path string, query url.Values, payload []byte, want int) ([]byte, error) {
++	token, gen, err := c.session(ctx)
++	if err != nil {
++		return nil, err
++	}
++
++	status, body, err := c.send(ctx, method, path, query, payload, token)
++	if err != nil {
++		return nil, err
++	}
++	if status == http.StatusUnauthorized {
++		// The token expired mid-flight. Nothing was done on the appliance, so
++		// replaying this one request byte for byte resumes exactly where the
++		// batch left off.
++		if token, _, err = c.refresh(ctx, gen); err != nil {
++			return nil, err
++		}
++		if status, body, err = c.send(ctx, method, path, query, payload, token); err != nil {
++			return nil, err
++		}
++	}
++	if status != want {
++		return nil, apiError(method, path, status, body)
++	}
++	return body, nil
++}
++
++func (c *Client) send(ctx context.Context, method, path string, query url.Values, payload []byte, token string) (int, []byte, error) {
++	target := c.cfg.BaseURL + path
++	if len(query) > 0 {
++		target += "?" + query.Encode()
++	}
++	var reader io.Reader
++	if payload != nil {
++		reader = bytes.NewReader(payload)
++	}
++	req, err := http.NewRequestWithContext(ctx, method, target, reader)
++	if err != nil {
++		return 0, nil, fmt.Errorf("vsandp: building %s %s: %w", method, path, err)
++	}
++	req.Header.Set("Accept", "application/json")
++	req.Header.Set(headerSessionID, token)
++	if payload != nil {
++		req.Header.Set("Content-Type", "application/json")
++	}
++
++	resp, err := c.http.Do(req)
++	if err != nil {
++		return 0, nil, fmt.Errorf("vsandp: %s %s: %w", method, path, err)
++	}
++	defer resp.Body.Close()
++	body, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return 0, nil, fmt.Errorf("vsandp: reading %s %s response: %w", method, path, err)
++	}
++	return resp.StatusCode, body, nil
++}
++
++// session returns the current working token, minting the first one on demand,
++// along with the generation it belongs to.
++func (c *Client) session(ctx context.Context) (string, uint64, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.token != "" {
++		return c.token, c.gen, nil
++	}
++	return c.mintLocked(ctx)
++}
++
++// refresh replaces the token that generation stale was using. If another
++// goroutine has already replaced it, the current token is returned untouched so
++// that one expiry costs one Snapservice.Sessions_create no matter how many
++// requests it rejected.
++func (c *Client) refresh(ctx context.Context, stale uint64) (string, uint64, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.gen != stale && c.token != "" {
++		return c.token, c.gen, nil
++	}
++	return c.mintLocked(ctx)
++}
++
++// mintLocked invokes Snapservice.Sessions_create. c.mu must be held.
++func (c *Client) mintLocked(ctx context.Context) (string, uint64, error) {
++	status, body, err := c.send(ctx, http.MethodPost, "/snapservice/sessions",
++		nil, nil, c.cfg.BootstrapToken)
++	if err != nil {
++		return "", 0, err
++	}
++	if status != http.StatusCreated {
++		return "", 0, apiError(http.MethodPost, "/snapservice/sessions", status, body)
++	}
++	var token string
++	if err := json.Unmarshal(body, &token); err != nil || token == "" {
++		return "", 0, fmt.Errorf("vsandp: Snapservice.Sessions_create: expected a "+
++			"session token, got %q", body)
++	}
++	c.token = token
++	c.gen++
++	c.creates++
++	return c.token, c.gen, nil
++}
++
++// apiError renders a Vapi.Std.Errors.Error response, falling back to the raw
++// body when it does not follow the schema.
++func apiError(method, path string, status int, body []byte) error {
++	var payload struct {
++		ErrorType string `json:"error_type"`
++		Messages  []struct {
++			DefaultMessage string `json:"default_message"`
++		} `json:"messages"`
++	}
++	if err := json.Unmarshal(body, &payload); err == nil && len(payload.Messages) > 0 {
++		return fmt.Errorf("vsandp: %s %s: %d %s: %s", method, path, status,
++			payload.ErrorType, payload.Messages[0].DefaultMessage)
++	}
++	return fmt.Errorf("vsandp: %s %s: unexpected status %d: %s", method, path, status,
++		strings.TrimSpace(string(body)))
+ }

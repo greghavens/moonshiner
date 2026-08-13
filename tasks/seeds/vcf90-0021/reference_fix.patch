@@ -1,0 +1,528 @@
+diff --git a/sddcmanager/onboarding.go b/sddcmanager/onboarding.go
+index 4ae3e25..46ab999 100644
+--- a/sddcmanager/onboarding.go
++++ b/sddcmanager/onboarding.go
+@@ -12,9 +12,15 @@
+ package sddcmanager
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
++	"strings"
+ 	"time"
+ )
+ 
+@@ -142,14 +148,504 @@ type Client struct {
+ // NewClient builds a client for the SDDC Manager service root. A nil
+ // httpClient means http.DefaultClient.
+ func NewClient(baseURL, accessToken string, httpClient *http.Client) (*Client, error) {
+-	return nil, errors.New("sddcmanager: NewClient is not implemented")
++	root := strings.TrimSpace(baseURL)
++	if root == "" {
++		return nil, errors.New("sddcmanager: base URL is empty")
++	}
++	parsed, err := url.Parse(root)
++	if err != nil {
++		return nil, fmt.Errorf("sddcmanager: base URL is not a URL: %w", err)
++	}
++	parsed.Scheme = strings.ToLower(parsed.Scheme)
++	if parsed.Scheme != "http" && parsed.Scheme != "https" {
++		return nil, errors.New("sddcmanager: base URL scheme is not http or https")
++	}
++	if parsed.Host == "" {
++		return nil, errors.New("sddcmanager: base URL has no host")
++	}
++	if strings.TrimSpace(accessToken) == "" {
++		return nil, errors.New("sddcmanager: access token is blank")
++	}
++	if !headerSafe(accessToken) {
++		// Reported without the value, so the token never lands in a log.
++		return nil, errors.New("sddcmanager: access token contains characters that cannot go in a header")
++	}
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++	return &Client{
++		baseURL:     strings.TrimRight(parsed.String(), "/"),
++		accessToken: accessToken,
++		httpClient:  httpClient,
++	}, nil
+ }
+ 
++func headerSafe(v string) bool {
++	for _, r := range v {
++		if r < 0x20 || r == 0x7f {
++			return false
++		}
++	}
++	return true
++}
++
++// ---- wire types -----------------------------------------------------------
++//
++// Only writable members appear in the request types. Every optional member is a
++// pointer or a slice tagged omitempty, so an unset value is absent from the
++// encoded object rather than sent as null, "" or 0.
++
++type ipPoolWire struct {
++	Start string `json:"start"`
++	End   string `json:"end"`
++}
++
++type networkWire struct {
++	Type    string       `json:"type"`
++	VlanID  int32        `json:"vlanId"`
++	MTU     int32        `json:"mtu"`
++	Subnet  string       `json:"subnet"`
++	Mask    string       `json:"mask"`
++	Gateway string       `json:"gateway"`
++	IPPools []ipPoolWire `json:"ipPools,omitempty"`
++}
++
++type networkPoolWire struct {
++	Name     string        `json:"name"`
++	Networks []networkWire `json:"networks"`
++}
++
++type hostCommissionWire struct {
++	FQDN                    string  `json:"fqdn"`
++	Username                string  `json:"username"`
++	Password                string  `json:"password"`
++	StorageType             string  `json:"storageType"`
++	VvolStorageProtocolType *string `json:"vvolStorageProtocolType,omitempty"`
++	NetworkPoolID           string  `json:"networkPoolId"`
++	NetworkPoolName         *string `json:"networkPoolName,omitempty"`
++	SSHThumbprint           *string `json:"sshThumbprint,omitempty"`
++	SSLThumbprint           *string `json:"sslThumbprint,omitempty"`
++}
++
++type networkPoolResponse struct {
++	ID       string `json:"id"`
++	Name     string `json:"name"`
++	Networks []struct {
++		ID   string `json:"id"`
++		Type string `json:"type"`
++	} `json:"networks"`
++}
++
++type errorResponse struct {
++	ErrorCode string `json:"errorCode"`
++	Message   string `json:"message"`
++}
++
++type resourceResponse struct {
++	ResourceID string `json:"resourceId"`
++	Type       string `json:"type"`
++	Name       string `json:"name"`
++	FQDN       string `json:"fqdn"`
++}
++
++type subTaskResponse struct {
++	Name      string             `json:"name"`
++	Status    string             `json:"status"`
++	Errors    []errorResponse    `json:"errors"`
++	Resources []resourceResponse `json:"resources"`
++}
++
++type taskResponse struct {
++	ID                string            `json:"id"`
++	Name              string            `json:"name"`
++	Type              string            `json:"type"`
++	Status            string            `json:"status"`
++	CreationTimestamp string            `json:"creationTimestamp"`
++	SubTasks          []subTaskResponse `json:"subTasks"`
++	Errors            []errorResponse   `json:"errors"`
++}
++
++// ---- task status ----------------------------------------------------------
++
++var (
++	nonTerminalStatuses = map[string]bool{"PENDING": true, "IN_PROGRESS": true, "QUEUED": true}
++	failedStatuses      = map[string]bool{
++		"FAILED": true, "CANCELLED": true, "COMPLETED_WITH_WARNING": true,
++		"SKIPPED": true, "TIMED_OUT": true,
++	}
++)
++
++// normalizeStatus trims, uppercases, and collapses each run of whitespace to a
++// single underscore.
++func normalizeStatus(s string) string {
++	return strings.Join(strings.Fields(strings.ToUpper(strings.TrimSpace(s))), "_")
++}
++
++// ---- onboarding -----------------------------------------------------------
++
+ // Onboard applies plan and waits for the commission task to settle. The
+ // returned Report describes every step that ran, and is populated even when the
+ // error is non-nil.
+ func (c *Client) Onboard(ctx context.Context, plan Plan, pollInterval time.Duration) (Report, error) {
+-	return Report{}, errors.New("sddcmanager: Onboard is not implemented")
++	report := Report{
++		Steps: []StepReport{
++			{OperationID: "createNetworkPool", Status: StepSkipped},
++			{OperationID: "addIpPoolToNetworkOfNetworkPool", Status: StepSkipped},
++			{OperationID: "commissionHosts", Status: StepSkipped},
++			{OperationID: "getTask", Status: StepSkipped},
++		},
++	}
++
++	if c == nil {
++		return report, errors.New("sddcmanager: nil client")
++	}
++	if ctx == nil {
++		return report, errors.New("sddcmanager: nil context")
++	}
++	if pollInterval < 0 {
++		return report, errors.New("sddcmanager: poll interval is negative")
++	}
++	if err := validatePlan(plan); err != nil {
++		return report, err
++	}
++	secrets := []string{c.accessToken}
++	for _, host := range plan.Hosts {
++		if host.Password != "" {
++			secrets = append(secrets, host.Password)
++		}
++	}
++	ctx = context.WithValue(ctx, secretContextKey{}, secrets)
++
++	// Step 1: create the network pool.
++	poolBody := networkPoolWire{Name: plan.NetworkPoolName}
++	for _, n := range plan.Networks {
++		poolBody.Networks = append(poolBody.Networks, networkWire{
++			Type: n.Type, VlanID: n.VlanID, MTU: n.MTU,
++			Subnet: n.Subnet, Mask: n.Mask, Gateway: n.Gateway,
++		})
++	}
++
++	var pool networkPoolResponse
++	if err := c.call(ctx, "createNetworkPool", http.MethodPost, "/v1/network-pools",
++		poolBody, http.StatusCreated, &pool); err != nil {
++		report.fail(0, err)
++		return report, err
++	}
++	if strings.TrimSpace(pool.ID) == "" {
++		err := errors.New("sddcmanager: createNetworkPool returned no network pool id")
++		report.fail(0, err)
++		return report, err
++	}
++
++	report.Steps[0] = StepReport{
++		OperationID: "createNetworkPool",
++		Status:      StepSucceeded,
++		Detail:      "created network pool " + pool.ID,
++	}
++	report.NetworkPoolCreated = true
++	report.NetworkPoolID = pool.ID
++	report.PersistedResources = append(report.PersistedResources, "network-pool:"+pool.ID)
++
++	// The IP range goes to the network of the requested type, identified by the
++	// id the appliance just assigned rather than by position in the plan.
++	networkID := ""
++	for _, n := range pool.Networks {
++		if n.Type == plan.IPRangeNetworkType {
++			networkID = n.ID
++			break
++		}
++	}
++	if networkID == "" {
++		err := fmt.Errorf("sddcmanager: network pool %s has no %s network", pool.ID, plan.IPRangeNetworkType)
++		report.fail(1, err)
++		return report, err
++	}
++	report.NetworkID = networkID
++
++	// Step 2: widen that network with the IP range.
++	ipPoolPath := "/v1/network-pools/" + url.PathEscape(pool.ID) +
++		"/networks/" + url.PathEscape(networkID) + "/ip-pools"
++	rangeBody := ipPoolWire{Start: plan.IPRange.Start, End: plan.IPRange.End}
++
++	if err := c.call(ctx, "addIpPoolToNetworkOfNetworkPool", http.MethodPost, ipPoolPath,
++		rangeBody, http.StatusOK, nil); err != nil {
++		report.fail(1, err)
++		return report, err
++	}
++	report.Steps[1] = StepReport{
++		OperationID: "addIpPoolToNetworkOfNetworkPool",
++		Status:      StepSucceeded,
++		Detail:      fmt.Sprintf("added %s-%s to network %s", plan.IPRange.Start, plan.IPRange.End, networkID),
++	}
++	report.IPRangeAdded = true
++	report.PersistedResources = append(report.PersistedResources,
++		fmt.Sprintf("ip-pool:%s:%s-%s", networkID, plan.IPRange.Start, plan.IPRange.End))
++
++	// Step 3: submit the commission. The 9.0.0.0 body is a bare array.
++	specs := make([]hostCommissionWire, 0, len(plan.Hosts))
++	for _, h := range plan.Hosts {
++		specs = append(specs, hostCommissionWire{
++			FQDN:                    h.FQDN,
++			Username:                h.Username,
++			Password:                h.Password,
++			StorageType:             h.StorageType,
++			VvolStorageProtocolType: h.VvolStorageProtocolType,
++			NetworkPoolID:           pool.ID,
++			SSHThumbprint:           h.SSHThumbprint,
++			SSLThumbprint:           h.SSLThumbprint,
++		})
++	}
++
++	var accepted taskResponse
++	if err := c.call(ctx, "commissionHosts", http.MethodPost, "/v1/hosts",
++		specs, http.StatusAccepted, &accepted); err != nil {
++		report.fail(2, err)
++		return report, err
++	}
++	report.TaskID = accepted.ID
++	report.TaskStatus = normalizeStatus(accepted.Status)
++	if err := validateTask(accepted); err != nil {
++		report.fail(2, err)
++		return report, err
++	}
++	report.Steps[2] = StepReport{
++		OperationID: "commissionHosts",
++		Status:      StepSucceeded,
++		Detail:      "accepted as task " + accepted.ID,
++	}
++
++	// Step 4: HTTP 202 only accepted the work, so the outcome comes from the
++	// task itself. Poll at least once even if the accepted body looks terminal.
++	settled, err := c.waitForTask(ctx, accepted.ID, pollInterval, func(task taskResponse) {
++		report.TaskStatus = normalizeStatus(task.Status)
++	})
++	if err != nil {
++		report.fail(3, err)
++		return report, err
++	}
++
++	status := normalizeStatus(settled.Status)
++	report.TaskStatus = status
++	report.Hosts = hostOutcomes(settled, secrets)
++	for _, h := range report.Hosts {
++		if h.Status == "SUCCESSFUL" {
++			report.PersistedResources = append(report.PersistedResources, "host:"+h.FQDN)
++		}
++	}
++
++	if status == "SUCCESSFUL" {
++		report.Steps[3] = StepReport{
++			OperationID: "getTask",
++			Status:      StepSucceeded,
++			Detail:      "task " + settled.ID + " ended SUCCESSFUL",
++		}
++		report.Succeeded = true
++		return report, nil
++	}
++
++	code, message := firstError(settled.Errors)
++	code = redact(code, secrets...)
++	message = redact(message, secrets...)
++	report.Steps[3] = StepReport{
++		OperationID: "getTask",
++		Status:      StepFailed,
++		Detail:      fmt.Sprintf("task %s ended %s: %s: %s", settled.ID, status, code, message),
++	}
++	return report, &CommissionFailedError{
++		TaskID:     settled.ID,
++		TaskStatus: status,
++		ErrorCode:  code,
++		Message:    message,
++		Hosts:      report.Hosts,
++	}
++}
++
++// fail marks step i failed and leaves every later step SKIPPED.
++func (r *Report) fail(i int, err error) {
++	detail := err.Error()
++	var apiErr *APIError
++	if errors.As(err, &apiErr) {
++		detail = fmt.Sprintf("HTTP %d: %s: %s", apiErr.StatusCode, apiErr.ErrorCode, apiErr.Message)
++	}
++	r.Steps[i] = StepReport{
++		OperationID: r.Steps[i].OperationID,
++		Status:      StepFailed,
++		Detail:      detail,
++	}
++}
++
++func validatePlan(plan Plan) error {
++	switch {
++	case strings.TrimSpace(plan.NetworkPoolName) == "":
++		return errors.New("sddcmanager: plan has no network pool name")
++	case len(plan.Networks) == 0:
++		return errors.New("sddcmanager: plan has no networks")
++	case strings.TrimSpace(plan.IPRangeNetworkType) == "":
++		return errors.New("sddcmanager: plan does not say which network takes the IP range")
++	case strings.TrimSpace(plan.IPRange.Start) == "", strings.TrimSpace(plan.IPRange.End) == "":
++		return errors.New("sddcmanager: plan has an incomplete IP range")
++	case len(plan.Hosts) == 0:
++		return errors.New("sddcmanager: plan has no hosts to commission")
++	}
++	return nil
++}
++
++func validateTask(t taskResponse) error {
++	switch {
++	case strings.TrimSpace(t.ID) == "":
++		return errors.New("sddcmanager: task response has no id")
++	case strings.TrimSpace(t.Name) == "":
++		return errors.New("sddcmanager: task response has no name")
++	case strings.TrimSpace(t.Status) == "":
++		return errors.New("sddcmanager: task response has no status")
++	case strings.TrimSpace(t.CreationTimestamp) == "":
++		return errors.New("sddcmanager: task response has no creationTimestamp")
++	}
++	return nil
++}
++
++func (c *Client) waitForTask(ctx context.Context, taskID string, pollInterval time.Duration, observed func(taskResponse)) (taskResponse, error) {
++	path := "/v1/tasks/" + url.PathEscape(taskID)
++	for {
++		var task taskResponse
++		if err := c.call(ctx, "getTask", http.MethodGet, path, nil, http.StatusOK, &task); err != nil {
++			return taskResponse{}, err
++		}
++		if err := validateTask(task); err != nil {
++			return taskResponse{}, err
++		}
++		if task.ID != taskID {
++			return taskResponse{}, fmt.Errorf("sddcmanager: getTask returned task %q, want %q", task.ID, taskID)
++		}
++		observed(task)
++
++		status := normalizeStatus(task.Status)
++		if !nonTerminalStatuses[status] {
++			if status != "SUCCESSFUL" && !failedStatuses[status] {
++				return taskResponse{}, fmt.Errorf("sddcmanager: task %s has unknown status %q", taskID, task.Status)
++			}
++			return task, nil
++		}
++
++		timer := time.NewTimer(pollInterval)
++		select {
++		case <-ctx.Done():
++			timer.Stop()
++			return taskResponse{}, ctx.Err()
++		case <-timer.C:
++		}
++	}
++}
++
++// hostOutcomes reads the per-host result out of the task's subtasks, keyed by
++// the ESXi resource each subtask carries.
++func hostOutcomes(task taskResponse, secrets []string) []HostOutcome {
++	var out []HostOutcome
++	for _, sub := range task.SubTasks {
++		fqdn := ""
++		for _, res := range sub.Resources {
++			if strings.EqualFold(strings.TrimSpace(res.Type), "ESXI") && strings.TrimSpace(res.FQDN) != "" {
++				fqdn = res.FQDN
++				break
++			}
++		}
++		if fqdn == "" {
++			continue
++		}
++		outcome := HostOutcome{FQDN: fqdn, Status: normalizeStatus(sub.Status)}
++		if outcome.Status != "SUCCESSFUL" {
++			outcome.ErrorCode, outcome.Message = firstError(sub.Errors)
++			outcome.ErrorCode = redact(outcome.ErrorCode, secrets...)
++			outcome.Message = redact(outcome.Message, secrets...)
++		}
++		out = append(out, outcome)
++	}
++	return out
++}
++
++func firstError(errs []errorResponse) (code, message string) {
++	if len(errs) == 0 {
++		return "", ""
++	}
++	return errs[0].ErrorCode, errs[0].Message
++}
++
++// ---- transport ------------------------------------------------------------
++
++// call performs one contract operation. A nil body means a bodyless request,
++// which carries no Content-Type. A nil out discards the response body.
++func (c *Client) call(ctx context.Context, operationID, method, path string, body any, wantStatus int, out any) error {
++	var reader io.Reader
++	var encoded []byte
++	if body != nil {
++		var err error
++		encoded, err = json.Marshal(body)
++		if err != nil {
++			return fmt.Errorf("sddcmanager: %s: encode request: %w", operationID, err)
++		}
++		reader = bytes.NewReader(encoded)
++	}
++
++	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
++	if err != nil {
++		return fmt.Errorf("sddcmanager: %s: build request: %w", operationID, err)
++	}
++	req.Header.Set("Accept", "application/json")
++	req.Header.Set("Authorization", "Bearer "+c.accessToken)
++	if body != nil {
++		req.Header.Set("Content-Type", "application/json")
++		req.ContentLength = int64(len(encoded))
++	}
++
++	resp, err := c.httpClient.Do(req)
++	if err != nil {
++		return fmt.Errorf("sddcmanager: %s: %w", operationID, err)
++	}
++	defer func() {
++		_, _ = io.Copy(io.Discard, resp.Body)
++		_ = resp.Body.Close()
++	}()
++
++	raw, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return fmt.Errorf("sddcmanager: %s: read response: %w", operationID, err)
++	}
++
++	if resp.StatusCode != wantStatus {
++		apiErr := &APIError{OperationID: operationID, StatusCode: resp.StatusCode}
++		var body errorResponse
++		if json.Unmarshal(raw, &body) == nil {
++			apiErr.ErrorCode = body.ErrorCode
++			apiErr.Message = body.Message
++		}
++		if apiErr.Message == "" {
++			apiErr.Message = fmt.Sprintf("unexpected status %d, want %d", resp.StatusCode, wantStatus)
++		}
++		secrets, _ := ctx.Value(secretContextKey{}).([]string)
++		apiErr.ErrorCode = redact(apiErr.ErrorCode, secrets...)
++		apiErr.Message = redact(apiErr.Message, secrets...)
++		return apiErr
++	}
++
++	if out == nil {
++		return nil
++	}
++	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
++		return fmt.Errorf("sddcmanager: %s: response media type is %q, want application/json", operationID, ct)
++	}
++	if err := json.Unmarshal(raw, out); err != nil {
++		return fmt.Errorf("sddcmanager: %s: decode response: %w", operationID, err)
++	}
++	return nil
++}
++
++func redact(value string, secrets ...string) string {
++	for _, secret := range secrets {
++		if secret != "" {
++			value = strings.ReplaceAll(value, secret, "[REDACTED]")
++		}
++	}
++	return value
+ }
+ 
+-var _ = time.Second
++type secretContextKey struct{}

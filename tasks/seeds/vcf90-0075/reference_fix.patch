@@ -1,0 +1,206 @@
+--- a/client.go
++++ b/client.go
+@@ -3,10 +3,17 @@
+ package maintenancechange
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"io"
++	"mime"
+ 	"net/http"
++	"net/url"
++	"strings"
++	"unicode/utf8"
+ )
+ 
+ // ErrNotImplemented marks the incomplete integration.
+@@ -105,16 +112,182 @@
+ }
+ 
+ // Client is a focused createMaintenanceSchedules client.
+-type Client struct{}
++type Client struct {
++	baseURL     string
++	accessToken string
++	httpClient  *http.Client
++}
+ 
+ // NewClient validates configuration without making a request.
+ func NewClient(config Config) (*Client, error) {
+-	return nil, ErrNotImplemented
++	parsed, err := url.Parse(config.BaseURL)
++	if err != nil {
++		return nil, fmt.Errorf("invalid base URL: %w", err)
++	}
++	if (!strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https")) || parsed.Hostname() == "" {
++		return nil, errors.New("base URL must be an HTTP(S) origin")
++	}
++	if parsed.User != nil || (parsed.Path != "" && parsed.Path != "/") || parsed.RawPath != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || strings.Contains(config.BaseURL, "#") {
++		return nil, errors.New("base URL must not contain credentials, a path, query, or fragment")
++	}
++	if strings.TrimSpace(config.AccessToken) == "" || containsASCIIWhitespace(config.AccessToken) {
++		return nil, errors.New("access token must be nonblank and contain no ASCII whitespace")
++	}
++	httpClient := config.HTTPClient
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++	parsed.Scheme = strings.ToLower(parsed.Scheme)
++	return &Client{
++		baseURL:     strings.TrimSuffix(parsed.String(), "/"),
++		accessToken: config.AccessToken,
++		httpClient:  httpClient,
++	}, nil
+ }
+ 
+ // Apply creates schedules in input order, stopping at the first failed step.
+ // Its report contains every attempted step, including successful steps before
+ // the returned error.
+ func (c *Client) Apply(ctx context.Context, changes []MaintenanceScheduleSpec) (ApplyReport, error) {
+-	return ApplyReport{}, ErrNotImplemented
++	report := ApplyReport{Results: make([]StepResult, 0, len(changes))}
++	if c == nil || c.baseURL == "" || c.httpClient == nil {
++		return report, errors.New("client is nil or uninitialized")
++	}
++	if len(changes) == 0 {
++		return report, nil
++	}
++	if ctx == nil {
++		return report, errors.New("context must not be nil")
++	}
++	if err := ctx.Err(); err != nil {
++		return report, err
++	}
++
++	for index, change := range changes {
++		result := StepResult{Index: index, Key: change.Key, Status: StepFailed}
++		if err := validateSpec(change); err != nil {
++			report.Results = append(report.Results, result)
++			return report, fmt.Errorf("change %d: %w", index, err)
++		}
++		body, err := json.Marshal(change)
++		if err != nil {
++			report.Results = append(report.Results, result)
++			return report, fmt.Errorf("change %d: encode request: %w", index, err)
++		}
++		created, err := c.createMaintenanceSchedule(ctx, body)
++		if err != nil {
++			report.Results = append(report.Results, result)
++			return report, err
++		}
++		result.Status = StepSucceeded
++		result.Created = &created
++		report.Results = append(report.Results, result)
++	}
++	return report, nil
++}
++
++type scheduleResponseWire struct {
++	Hour            *int32   `json:"hour"`
++	MinuteOfTheHour *int32   `json:"minuteOfTheHour"`
++	Duration        *int32   `json:"duration"`
++	ScheduleType    *string  `json:"scheduleType"`
++	Recurrence      *int32   `json:"recurrence,omitempty"`
++	DayOfTheMonth   *int32   `json:"dayOfTheMonth,omitempty"`
++	DaysOfTheMonth  []string `json:"daysOfTheMonth,omitempty"`
++	WeeksOfTheMonth []string `json:"weeksOfTheMonth,omitempty"`
++	DaysOfTheWeek   []string `json:"daysOfTheWeek,omitempty"`
++	Month           *int32   `json:"month,omitempty"`
++	Months          []int32  `json:"months,omitempty"`
++	StartDate       *string  `json:"startDate,omitempty"`
++	ExpirationDate  *string  `json:"expirationDate,omitempty"`
++	TimeZone        *string  `json:"timeZone,omitempty"`
++	ExpireRuns      *int32   `json:"expireRuns,omitempty"`
++}
++
++type maintenanceScheduleResponseWire struct {
++	ID       string                `json:"id,omitempty"`
++	Key      *string               `json:"key"`
++	Schedule *scheduleResponseWire `json:"schedule"`
++}
++
++func (c *Client) createMaintenanceSchedule(ctx context.Context, body []byte) (MaintenanceSchedule, error) {
++	const operation = "createMaintenanceSchedules"
++	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/suite-api/api/maintenanceschedules", bytes.NewReader(body))
++	if err != nil {
++		return MaintenanceSchedule{}, fmt.Errorf("%s request: %w", operation, err)
++	}
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set("Authorization", c.accessToken)
++	request.Header.Set("Content-Type", "application/json")
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return MaintenanceSchedule{}, fmt.Errorf("%s request failed: %w", operation, err)
++	}
++	defer response.Body.Close()
++	if response.StatusCode != http.StatusCreated {
++		_, _ = io.Copy(io.Discard, response.Body)
++		return MaintenanceSchedule{}, &APIError{OperationID: operation, StatusCode: response.StatusCode}
++	}
++	mediaType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
++	if err != nil || mediaType != "application/json" {
++		return MaintenanceSchedule{}, &ProtocolError{OperationID: operation, Reason: "HTTP 201 response is not application/json"}
++	}
++	decoder := json.NewDecoder(response.Body)
++	var wire maintenanceScheduleResponseWire
++	if err := decoder.Decode(&wire); err != nil {
++		return MaintenanceSchedule{}, &ProtocolError{OperationID: operation, Reason: "response body is not one JSON object"}
++	}
++	var trailing any
++	if err := decoder.Decode(&trailing); err != io.EOF {
++		return MaintenanceSchedule{}, &ProtocolError{OperationID: operation, Reason: "response body contains trailing data"}
++	}
++	if wire.Key == nil || wire.Schedule == nil || wire.Schedule.Hour == nil || wire.Schedule.MinuteOfTheHour == nil || wire.Schedule.Duration == nil || wire.Schedule.ScheduleType == nil {
++		return MaintenanceSchedule{}, &ProtocolError{OperationID: operation, Reason: "response omits required maintenance-schedule fields"}
++	}
++	return MaintenanceSchedule{
++		ID:  wire.ID,
++		Key: *wire.Key,
++		Schedule: Schedule{
++			Hour:            *wire.Schedule.Hour,
++			MinuteOfTheHour: *wire.Schedule.MinuteOfTheHour,
++			Duration:        *wire.Schedule.Duration,
++			ScheduleType:    *wire.Schedule.ScheduleType,
++			Recurrence:      wire.Schedule.Recurrence,
++			DayOfTheMonth:   wire.Schedule.DayOfTheMonth,
++			DaysOfTheMonth:  wire.Schedule.DaysOfTheMonth,
++			WeeksOfTheMonth: wire.Schedule.WeeksOfTheMonth,
++			DaysOfTheWeek:   wire.Schedule.DaysOfTheWeek,
++			Month:           wire.Schedule.Month,
++			Months:          wire.Schedule.Months,
++			StartDate:       wire.Schedule.StartDate,
++			ExpirationDate:  wire.Schedule.ExpirationDate,
++			TimeZone:        wire.Schedule.TimeZone,
++			ExpireRuns:      wire.Schedule.ExpireRuns,
++		},
++	}, nil
++}
++
++func validateSpec(spec MaintenanceScheduleSpec) error {
++	keyLength := utf8.RuneCountInString(spec.Key)
++	if keyLength < 1 || keyLength > 200 {
++		return errors.New("key length must be from 1 through 200 characters")
++	}
++	if spec.Schedule.Duration < 1 {
++		return errors.New("duration must be at least 1")
++	}
++	switch spec.Schedule.ScheduleType {
++	case "UNKNOWN", "ONCE", "DAILY", "WEEKLY", "MONTHLY", "YEARLY":
++	default:
++		return errors.New("scheduleType is not in the contract enum")
++	}
++	if spec.Schedule.Recurrence != nil && *spec.Schedule.Recurrence < 1 {
++		return errors.New("recurrence must be at least 1 when present")
++	}
++	return nil
++}
++
++func containsASCIIWhitespace(value string) bool {
++	return strings.IndexFunc(value, func(character rune) bool {
++		return character == ' ' || character == '\t' || character == '\n' || character == '\r' || character == '\v' || character == '\f'
++	}) >= 0
+ }

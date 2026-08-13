@@ -1,0 +1,1 @@
+I need to correct an earlier decision. Rank the eligible finalists primarily by lowest noise instead of lowest regular price, using lower regular price only as the tiebreaker. Do not change any other requirement.

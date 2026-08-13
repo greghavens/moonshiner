@@ -1,0 +1,193 @@
+--- a/client.go
++++ b/client.go
+@@ -2,15 +2,25 @@
+ package vcfopslogs
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
++	"strings"
+ )
+ 
+-var ErrNotImplemented = errors.New("vcfopslogs: not implemented")
+-
+ // Client is a client for the focused Log Management agent-secret contract.
+-type Client struct{}
++type Client struct {
++	baseURL           *url.URL
++	adminToken        string
++	httpClient        *http.Client
++	sessionTurn       chan struct{}
++	activeAgentSecret string
++}
+ 
+ // CreateAgentSecretRequest is the request for createAgentSecret. Name is
+ // optional in the pinned OpenAPI schema; nil must be omitted from JSON.
+@@ -49,21 +59,157 @@
+ }
+ 
+ func (e *APIError) Error() string {
+-	return "vcfopslogs: API request failed"
++	message := strings.TrimSpace(e.ErrorMessage)
++	if message == "" {
++		message = http.StatusText(e.StatusCode)
++	}
++	if e.ErrorCode != "" {
++		return fmt.Sprintf("vcfopslogs: API request failed: status %d, code %s: %s", e.StatusCode, e.ErrorCode, message)
++	}
++	return fmt.Sprintf("vcfopslogs: API request failed: status %d: %s", e.StatusCode, message)
+ }
+ 
+ // NewClient constructs a client. A nil httpClient uses http.DefaultClient.
+ func NewClient(baseURL, adminToken, initialAgentSecret string, httpClient *http.Client) (*Client, error) {
+-	return nil, ErrNotImplemented
++	parsed, err := url.Parse(baseURL)
++	if err != nil {
++		return nil, fmt.Errorf("vcfopslogs: parse base URL: %w", err)
++	}
++	if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
++		return nil, errors.New("vcfopslogs: base URL must be an absolute HTTP(S) URL")
++	}
++	if parsed.User != nil {
++		return nil, errors.New("vcfopslogs: base URL must not contain user information")
++	}
++	if parsed.RawQuery != "" || parsed.Fragment != "" {
++		return nil, errors.New("vcfopslogs: base URL must not contain a query or fragment")
++	}
++	if parsed.Path != "" && parsed.Path != "/" {
++		return nil, errors.New("vcfopslogs: base URL must not contain a path prefix")
++	}
++	if adminToken == "" {
++		return nil, errors.New("vcfopslogs: administrator token is required")
++	}
++	if initialAgentSecret == "" {
++		return nil, errors.New("vcfopslogs: initial agent secret is required")
++	}
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++	parsed.Path = ""
++	parsed.RawPath = ""
++	turn := make(chan struct{}, 1)
++	turn <- struct{}{}
++	return &Client{
++		baseURL:           parsed,
++		adminToken:        adminToken,
++		httpClient:        httpClient,
++		sessionTurn:       turn,
++		activeAgentSecret: initialAgentSecret,
++	}, nil
+ }
+ 
+ // CreateAgentSecret calls operationId createAgentSecret.
+ func (c *Client) CreateAgentSecret(ctx context.Context, request CreateAgentSecretRequest) (AgentSecret, error) {
+-	return AgentSecret{}, ErrNotImplemented
++	var response AgentSecret
++	if err := c.doJSON(ctx, http.MethodPost, "/api/v2/agent/secrets", request, &response); err != nil {
++		return AgentSecret{}, err
++	}
++	return response, nil
+ }
+ 
+ // CreateAgentSession calls operationId createAgentSession and commits the
+ // returned new_secret before allowing the next exchange to start.
+ func (c *Client) CreateAgentSession(ctx context.Context, options CreateAgentSessionOptions) (AgentSession, error) {
+-	return AgentSession{}, ErrNotImplemented
++	if ctx == nil {
++		return AgentSession{}, errors.New("vcfopslogs: nil context")
++	}
++	if c == nil || c.sessionTurn == nil {
++		return AgentSession{}, errors.New("vcfopslogs: invalid client")
++	}
++	select {
++	case <-ctx.Done():
++		return AgentSession{}, ctx.Err()
++	case <-c.sessionTurn:
++	}
++	defer func() { c.sessionTurn <- struct{}{} }()
++
++	request := struct {
++		Secret string `json:"secret"`
++		TTL    *int64 `json:"ttl,omitempty"`
++	}{
++		Secret: c.activeAgentSecret,
++		TTL:    options.TTL,
++	}
++	var response struct {
++		AccessToken *string `json:"access_token"`
++		Name        *string `json:"name"`
++		NewSecret   *string `json:"new_secret"`
++		TTL         *int64  `json:"ttl"`
++	}
++	if err := c.doJSON(ctx, http.MethodPost, "/api/v2/agent/secrets/exchange", request, &response); err != nil {
++		return AgentSession{}, err
++	}
++	if response.AccessToken == nil || response.Name == nil || response.NewSecret == nil || response.TTL == nil || *response.NewSecret == "" {
++		return AgentSession{}, errors.New("vcfopslogs: createAgentSession response omitted a required field")
++	}
++	session := AgentSession{
++		AccessToken: *response.AccessToken,
++		Name:        *response.Name,
++		NewSecret:   *response.NewSecret,
++		TTL:         *response.TTL,
++	}
++	c.activeAgentSecret = session.NewSecret
++	return session, nil
++}
++
++func (c *Client) doJSON(ctx context.Context, method, path string, input, output any) error {
++	if ctx == nil {
++		return errors.New("vcfopslogs: nil context")
++	}
++	if c == nil || c.baseURL == nil || c.httpClient == nil {
++		return errors.New("vcfopslogs: invalid client")
++	}
++	payload, err := json.Marshal(input)
++	if err != nil {
++		return fmt.Errorf("vcfopslogs: encode request: %w", err)
++	}
++	endpoint := *c.baseURL
++	endpoint.Path = path
++	request, err := http.NewRequestWithContext(ctx, method, endpoint.String(), bytes.NewReader(payload))
++	if err != nil {
++		return fmt.Errorf("vcfopslogs: build request: %w", err)
++	}
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set("Content-Type", "application/json")
++	request.Header.Set("X-JWT-Token", c.adminToken)
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return fmt.Errorf("vcfopslogs: send request: %w", err)
++	}
++	defer response.Body.Close()
++
++	const maximumResponseBytes = 4 << 20
++	body, err := io.ReadAll(io.LimitReader(response.Body, maximumResponseBytes+1))
++	if err != nil {
++		return fmt.Errorf("vcfopslogs: read response: %w", err)
++	}
++	if len(body) > maximumResponseBytes {
++		return errors.New("vcfopslogs: response exceeds 4 MiB")
++	}
++	if response.StatusCode < 200 || response.StatusCode >= 300 {
++		apiError := &APIError{StatusCode: response.StatusCode}
++		if err := json.Unmarshal(body, apiError); err != nil && len(strings.TrimSpace(string(body))) != 0 {
++			apiError.ErrorMessage = strings.TrimSpace(string(body))
++		}
++		return apiError
++	}
++	if len(strings.TrimSpace(string(body))) == 0 {
++		return errors.New("vcfopslogs: successful response has an empty body")
++	}
++	if err := json.Unmarshal(body, output); err != nil {
++		return fmt.Errorf("vcfopslogs: decode response: %w", err)
++	}
++	return nil
+ }

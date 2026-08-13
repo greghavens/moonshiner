@@ -1,0 +1,349 @@
+diff --git a/client.go b/client.go
+index 138e534..0d10a4b 100644
+--- a/client.go
++++ b/client.go
+@@ -7,9 +7,15 @@
+ package vcfapolicy
+ 
+ import (
++	"bytes"
+ 	"context"
++	"crypto/rand"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
+ 	"net/http"
++	"strings"
+ 	"time"
+ )
+ 
+@@ -108,7 +114,10 @@ type APIError struct {
+ }
+ 
+ func (e *APIError) Error() string {
+-	return "vcfapolicy: not implemented"
++	// Body remains available through APIError.Body, but is not copied into
++	// the message because a server can echo request credentials.
++	return fmt.Sprintf("vcfapolicy: %s %s %s: unexpected status %d",
++		e.Operation, e.Method, e.Path, e.StatusCode)
+ }
+ 
+ // Client talks to the VCF Automation policy endpoints.
+@@ -121,14 +130,313 @@ type Client struct {
+ 	newPolicyID func() string
+ }
+ 
+-var errNotImplemented = errors.New("vcfapolicy: not implemented")
++const (
++	// Operation ids and paths come from docs/contract.json.
++	upsertOperation = "upsertPolicy"
++	readOperation   = "getPolicy"
++	policiesPath    = "/policy/api/policies"
++
++	defaultMaxAttempts = 4
++)
++
++// retryableStatuses are the responses worth delivering the upsert again for.
++// The upsert carries a client-chosen id, so redelivery converges on one policy
++// rather than making another.
++var retryableStatuses = map[int]bool{
++	http.StatusTooManyRequests:     true,
++	http.StatusInternalServerError: true,
++	http.StatusBadGateway:          true,
++	http.StatusServiceUnavailable:  true,
++	http.StatusGatewayTimeout:      true,
++}
+ 
+ // New validates cfg and returns a Client.
+ func New(cfg Config) (*Client, error) {
+-	return nil, errNotImplemented
++	baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
++	if baseURL == "" {
++		return nil, errors.New("vcfapolicy: Config.BaseURL is required")
++	}
++	if strings.TrimSpace(cfg.Token) == "" {
++		return nil, errors.New("vcfapolicy: Config.Token is required")
++	}
++
++	client := &Client{
++		baseURL:     baseURL,
++		token:       cfg.Token,
++		httpClient:  cfg.HTTPClient,
++		maxAttempts: cfg.MaxAttempts,
++		retryDelay:  cfg.RetryDelay,
++		newPolicyID: cfg.NewPolicyID,
++	}
++	if client.httpClient == nil {
++		client.httpClient = &http.Client{}
++	}
++	if client.maxAttempts <= 0 {
++		client.maxAttempts = defaultMaxAttempts
++	}
++	if client.retryDelay == nil {
++		client.retryDelay = defaultRetryDelay
++	}
++	if client.newPolicyID == nil {
++		client.newPolicyID = newUUIDv4
++	}
++	return client, nil
+ }
+ 
+ // EnsurePolicy puts spec in place and reports how it got there.
++//
++// The policy id is chosen once, before the first delivery, and every delivery
++// carries the same bytes. That is what makes the upsert safe to repeat: the
++// API creates the policy or updates it, and either way there is one policy at
++// that id however many times the request arrives.
++//
++// A response with a status is an observed outcome. A transport failure is not:
++// the request may have landed and the acknowledgement gone missing. Before the
++// upsert is delivered again the policy is read back, so a delivery that landed
++// is recognised rather than repeated.
+ func (c *Client) EnsurePolicy(ctx context.Context, spec PolicySpec) (Result, error) {
+-	return Result{}, errNotImplemented
++	if err := ctx.Err(); err != nil {
++		return Result{}, fmt.Errorf("vcfapolicy: ensure policy: %w", err)
++	}
++	if strings.TrimSpace(spec.TypeID) == "" {
++		return Result{}, errors.New("vcfapolicy: PolicySpec.TypeID is required")
++	}
++
++	policyID := spec.ID
++	if policyID == "" {
++		policyID = c.newPolicyID()
++	}
++	if policyID == "" {
++		return Result{}, errors.New("vcfapolicy: Config.NewPolicyID returned an empty policy id")
++	}
++	result := Result{PolicyID: policyID}
++
++	body, err := json.Marshal(newPolicyDocument(spec, policyID))
++	if err != nil {
++		return result, fmt.Errorf("vcfapolicy: encode policy: %w", err)
++	}
++
++	var lastErr error
++	unresolved := false
++	for attempt := 1; attempt <= c.maxAttempts; attempt++ {
++		if unresolved {
++			policy, found, err := c.readPolicy(ctx, policyID)
++			if err != nil {
++				if !isNotFound(err) {
++					return result, err
++				}
++			} else if found {
++				result.Outcome = OutcomeRecovered
++				result.Policy = policy
++				return result, nil
++			}
++			unresolved = false
++		}
++
++		result.Attempts = attempt
++		status, responseBody, err := c.deliver(ctx, body)
++		switch {
++		case err != nil:
++			if ctxErr := ctx.Err(); ctxErr != nil {
++				return result, fmt.Errorf("vcfapolicy: %s: %w", upsertOperation, ctxErr)
++			}
++			// No status was observed, so whether the write landed is unknown.
++			unresolved = true
++			lastErr = fmt.Errorf("vcfapolicy: %s %s %s: %w",
++				upsertOperation, http.MethodPost, policiesPath, err)
++
++		case status == http.StatusOK || status == http.StatusCreated:
++			outcome := OutcomeUpdated
++			if status == http.StatusCreated {
++				outcome = OutcomeCreated
++			}
++			// The upsert returns no data structure at any status, so the
++			// stored policy has to be read back.
++			policy, _, err := c.readPolicy(ctx, policyID)
++			if err != nil {
++				return result, err
++			}
++			result.Outcome = outcome
++			result.Policy = policy
++			return result, nil
++
++		case retryableStatuses[status]:
++			lastErr = c.upsertError(status, responseBody)
++
++		default:
++			// Everything else the reference documents - 202, 400, 401, 403 -
++			// is terminal. A 202 names no request resource under /policy/api
++			// that could be polled, so it cannot be resolved either.
++			return result, c.upsertError(status, responseBody)
++		}
++
++		if attempt == c.maxAttempts {
++			break
++		}
++		if err := c.wait(ctx, attempt); err != nil {
++			return result, fmt.Errorf("vcfapolicy: %s: %w", upsertOperation, err)
++		}
++	}
++
++	// The last delivery was never acknowledged; it may still have landed.
++	if unresolved {
++		policy, found, err := c.readPolicy(ctx, policyID)
++		if err == nil && found {
++			result.Outcome = OutcomeRecovered
++			result.Policy = policy
++			return result, nil
++		}
++		if err != nil && !isNotFound(err) {
++			return result, err
++		}
++	}
++	return result, lastErr
++}
++
++func isNotFound(err error) bool {
++	var apiErr *APIError
++	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound
++}
++
++func (c *Client) upsertError(status int, body string) *APIError {
++	return &APIError{
++		Operation:  upsertOperation,
++		Method:     http.MethodPost,
++		Path:       policiesPath,
++		StatusCode: status,
++		Body:       body,
++	}
++}
++
++// deliver sends one upsert and reports the status it observed. A transport
++// failure is returned as an error with no status.
++func (c *Client) deliver(ctx context.Context, body []byte) (int, string, error) {
++	request, err := http.NewRequestWithContext(ctx, http.MethodPost,
++		c.baseURL+policiesPath, bytes.NewReader(body))
++	if err != nil {
++		return 0, "", err
++	}
++	request.Header.Set("Authorization", "Bearer "+c.token)
++	request.Header.Set("Content-Type", "application/json")
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return 0, "", err
++	}
++	defer response.Body.Close()
++	captured, _ := io.ReadAll(response.Body)
++	return response.StatusCode, string(captured), nil
++}
++
++// readPolicy reads one policy back. A 404 remains an APIError so its body is
++// preserved; reconciliation callers recognize that status as "not there".
++func (c *Client) readPolicy(ctx context.Context, policyID string) (Policy, bool, error) {
++	path := policiesPath + "/" + policyID
++	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
++	if err != nil {
++		return Policy{}, false, err
++	}
++	request.Header.Set("Authorization", "Bearer "+c.token)
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return Policy{}, false, fmt.Errorf("vcfapolicy: %s %s %s: %w",
++			readOperation, http.MethodGet, path, err)
++	}
++	defer response.Body.Close()
++	captured, readErr := io.ReadAll(response.Body)
++	if readErr != nil {
++		return Policy{}, false, fmt.Errorf("vcfapolicy: %s: read policy response: %w",
++			readOperation, readErr)
++	}
++
++	switch response.StatusCode {
++	case http.StatusOK:
++		var policy Policy
++		if err := json.Unmarshal(captured, &policy); err != nil {
++			return Policy{}, false, fmt.Errorf("vcfapolicy: %s: decode policy: %w",
++				readOperation, err)
++		}
++		return policy, true, nil
++	default:
++		return Policy{}, false, &APIError{
++			Operation:  readOperation,
++			Method:     http.MethodGet,
++			Path:       path,
++			StatusCode: response.StatusCode,
++			Body:       string(captured),
++		}
++	}
++}
++
++func (c *Client) wait(ctx context.Context, attempt int) error {
++	delay := c.retryDelay(attempt)
++	if delay <= 0 {
++		return ctx.Err()
++	}
++	timer := time.NewTimer(delay)
++	defer timer.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-timer.C:
++		return nil
++	}
++}
++
++func defaultRetryDelay(attempt int) time.Duration {
++	if attempt < 1 {
++		attempt = 1
++	}
++	if attempt > 5 {
++		attempt = 5
++	}
++	return time.Duration(1<<uint(attempt-1)) * 250 * time.Millisecond
++}
++
++// policyDocument is the request body. Every optional property is omitted when
++// the caller left it unset; nothing is sent as "", null or {}. The properties
++// the server owns - createdAt, createdBy, creator, lastUpdatedAt,
++// lastUpdatedBy, lastUpdater, definitionLegend, statistics - are not here at
++// all, because a client does not report them.
++type policyDocument struct {
++	TypeID          string         `json:"typeId"`
++	ID              string         `json:"id,omitempty"`
++	Name            string         `json:"name,omitempty"`
++	Description     string         `json:"description,omitempty"`
++	EnforcementType string         `json:"enforcementType,omitempty"`
++	OrgID           string         `json:"orgId,omitempty"`
++	ProjectID       string         `json:"projectId,omitempty"`
++	OPARegoCriteria string         `json:"opaRegoCriteria,omitempty"`
++	Criteria        map[string]any `json:"criteria,omitempty"`
++	ScopeCriteria   map[string]any `json:"scopeCriteria,omitempty"`
++	Definition      map[string]any `json:"definition,omitempty"`
++}
++
++func newPolicyDocument(spec PolicySpec, policyID string) policyDocument {
++	return policyDocument{
++		TypeID:          spec.TypeID,
++		ID:              policyID,
++		Name:            spec.Name,
++		Description:     spec.Description,
++		EnforcementType: spec.EnforcementType,
++		OrgID:           spec.OrgID,
++		ProjectID:       spec.ProjectID,
++		OPARegoCriteria: spec.OPARegoCriteria,
++		Criteria:        spec.Criteria,
++		ScopeCriteria:   spec.ScopeCriteria,
++		Definition:      spec.Definition,
++	}
++}
++
++// newUUIDv4 mints the policy id the contract types as a uuid.
++func newUUIDv4() string {
++	var buffer [16]byte
++	if _, err := rand.Read(buffer[:]); err != nil {
++		panic("vcfapolicy: no randomness available for a policy id: " + err.Error())
++	}
++	buffer[6] = (buffer[6] & 0x0f) | 0x40
++	buffer[8] = (buffer[8] & 0x3f) | 0x80
++	return fmt.Sprintf("%x-%x-%x-%x-%x",
++		buffer[0:4], buffer[4:6], buffer[6:8], buffer[8:10], buffer[10:16])
+ }

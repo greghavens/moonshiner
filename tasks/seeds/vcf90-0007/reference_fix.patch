@@ -1,0 +1,330 @@
+diff --git a/VcfCredentialRotation/VcfCredentialRotation.psm1 b/VcfCredentialRotation/VcfCredentialRotation.psm1
+index 896ff6b..0f1fca8 100644
+--- a/VcfCredentialRotation/VcfCredentialRotation.psm1
++++ b/VcfCredentialRotation/VcfCredentialRotation.psm1
+@@ -1,5 +1,108 @@
+ Set-StrictMode -Version Latest
+ 
++class VcfCredentialDrainTimeoutException : System.Exception {
++    [string] $ResourceName
++    [int] $DrainAttempts
++    [int] $InFlightCount
++
++    VcfCredentialDrainTimeoutException(
++        [string] $message,
++        [string] $resourceName,
++        [int] $drainAttempts,
++        [int] $inFlightCount
++    ) : base($message) {
++        $this.ResourceName = $resourceName
++        $this.DrainAttempts = $drainAttempts
++        $this.InFlightCount = $inFlightCount
++    }
++}
++
++class VcfCredentialRotationFailedException : System.Exception {
++    [string] $TaskId
++    [string] $TaskStatus
++    [string] $ErrorCode
++    [bool] $RetryAttempted
++
++    VcfCredentialRotationFailedException(
++        [string] $message,
++        [string] $taskId,
++        [string] $taskStatus,
++        [string] $errorCode,
++        [bool] $retryAttempted
++    ) : base($message) {
++        $this.TaskId = $taskId
++        $this.TaskStatus = $taskStatus
++        $this.ErrorCode = $errorCode
++        $this.RetryAttempted = $retryAttempted
++    }
++}
++
++class VcfCredentialRotationTimeoutException : System.Exception {
++    [string] $TaskId
++    [int] $PollCount
++    [bool] $Cancelled
++    [string] $CancelStatus
++
++    VcfCredentialRotationTimeoutException(
++        [string] $message,
++        [string] $taskId,
++        [int] $pollCount,
++        [bool] $cancelled,
++        [string] $cancelStatus
++    ) : base($message) {
++        $this.TaskId = $taskId
++        $this.PollCount = $pollCount
++        $this.Cancelled = $cancelled
++        $this.CancelStatus = $cancelStatus
++    }
++}
++
++$script:NonTerminalStatus = @('PENDING', 'IN_PROGRESS')
++$script:SuccessfulStatus = @('SUCCESSFUL')
++$script:FailedStatus = @('FAILED', 'USER_CANCELLED', 'INCONSISTENT')
++
++function ConvertTo-VcfRotationStatus {
++    param([AllowNull()] [string] $Status)
++
++    if ([string]::IsNullOrWhiteSpace($Status)) { return '' }
++    return $Status.Trim().ToUpperInvariant().Replace(' ', '_')
++}
++
++function Invoke-VcfRotationWait {
++    param(
++        [int] $Seconds,
++        [AllowNull()] [scriptblock] $SleepAction
++    )
++
++    if ($null -ne $SleepAction) {
++        & $SleepAction $Seconds | Out-Null
++        return
++    }
++    if ($Seconds -gt 0) { Start-Sleep -Seconds $Seconds }
++}
++
++function Get-VcfRotationTaskError {
++    param([Parameter(Mandatory)] $Task)
++
++    $result = [pscustomobject]@{
++        ErrorCode = ''
++        Message   = ''
++    }
++    if ($Task.PSObject.Properties.Name -notcontains 'errors') { return $result }
++    $errors = @($Task.errors)
++    if ($errors.Count -eq 0 -or $null -eq $errors[0]) { return $result }
++    $first = $errors[0]
++    if ($first.PSObject.Properties.Name -contains 'errorCode' -and
++        -not [string]::IsNullOrWhiteSpace([string] $first.errorCode)) {
++        $result.ErrorCode = [string] $first.errorCode
++    }
++    if ($first.PSObject.Properties.Name -contains 'message' -and
++        -not [string]::IsNullOrWhiteSpace([string] $first.message)) {
++        $result.Message = [string] $first.message
++    }
++    return $result
++}
++
+ function Invoke-VcfCredentialRotation {
+     [CmdletBinding()]
+     param(
+@@ -50,9 +153,214 @@ function Invoke-VcfCredentialRotation {
+         [scriptblock] $SleepAction
+     )
+ 
+-    throw [NotImplementedException]::new(
+-        'TODO: drain the old secret, rotate the credential, and publish only a confirmed replacement.'
++    foreach ($pair in @(
++        @('ResourceType', $ResourceType),
++        @('ResourceName', $ResourceName),
++        @('Username', $Username),
++        @('CredentialType', $CredentialType)
++    )) {
++        if ([string]::IsNullOrWhiteSpace($pair[1])) {
++            throw [System.ArgumentException]::new(
++                "$($pair[0]) must be a non-empty value.", $pair[0])
++        }
++    }
++    $accountTypeBound = $PSBoundParameters.ContainsKey('AccountType')
++    if ($accountTypeBound -and [string]::IsNullOrWhiteSpace($AccountType)) {
++        throw [System.ArgumentException]::new(
++            'AccountType must be a non-empty value when it is supplied.',
++            'AccountType')
++    }
++    if ($DrainLimit -lt 1) {
++        throw [System.ArgumentOutOfRangeException]::new(
++            'DrainLimit', 'DrainLimit must be at least 1.')
++    }
++    if ($PollLimit -lt 1) {
++        throw [System.ArgumentOutOfRangeException]::new(
++            'PollLimit', 'PollLimit must be at least 1.')
++    }
++    if ($DrainIntervalSeconds -lt 0) {
++        throw [System.ArgumentOutOfRangeException]::new(
++            'DrainIntervalSeconds', 'DrainIntervalSeconds must not be negative.')
++    }
++    if ($PollIntervalSeconds -lt 0) {
++        throw [System.ArgumentOutOfRangeException]::new(
++            'PollIntervalSeconds', 'PollIntervalSeconds must not be negative.')
++    }
++
++    # 1. Identify the credential that is about to be rotated. Only the bound
++    #    filters travel on the wire; every other query field stays omitted.
++    $lookup = @{
++        Server       = $Server
++        ResourceName = $ResourceName
++        ResourceType = $ResourceType
++    }
++    if ($accountTypeBound) { $lookup['AccountType'] = $AccountType }
++    $page = Invoke-VcfGetCredentials @lookup
++
++    $elements = @()
++    if ($null -ne $page -and
++        $page.PSObject.Properties.Name -contains 'elements' -and
++        $null -ne $page.elements) {
++        $elements = @($page.elements)
++    }
++    $candidates = @(
++        $elements | Where-Object {
++            $null -ne $_ -and
++            [string] $_.username -ceq $Username -and
++            [string] $_.credentialType -ceq $CredentialType
++        }
+     )
++    if ($candidates.Count -ne 1) {
++        throw [System.InvalidOperationException]::new(
++            ("Expected exactly one {0} credential for {1} on {2} but found {3}." -f
++                $CredentialType, $Username, $ResourceName, $candidates.Count))
++    }
++    $credentialId = [string] $candidates[0].id
++    if ([string]::IsNullOrWhiteSpace($credentialId)) {
++        throw [System.InvalidOperationException]::new(
++            "SDDC Manager returned a credential without an id for $ResourceName.")
++    }
++
++    # 2. Close the gate on the retired secret before anything is mutated: no
++    #    rotation is submitted while a caller can still be using it.
++    $drainAttempts = 0
++    $inFlight = -1
++    while ($drainAttempts -lt $DrainLimit) {
++        $drainAttempts++
++        $reported = @(& $DrainAction $drainAttempts)
++        $inFlight = 0
++        if ($reported.Count -gt 0 -and $null -ne $reported[-1]) {
++            $inFlight = [int] $reported[-1]
++        }
++        if ($inFlight -eq 0) { break }
++        if ($drainAttempts -lt $DrainLimit) {
++            Invoke-VcfRotationWait -Seconds $DrainIntervalSeconds -SleepAction $SleepAction
++        }
++    }
++    if ($inFlight -ne 0) {
++        throw [VcfCredentialDrainTimeoutException]::new(
++            ("{0} request(s) were still using the current {1} secret on {2} after {3} drain attempt(s); no rotation was submitted." -f
++                $inFlight, $CredentialType, $ResourceName, $drainAttempts),
++            $ResourceName, $drainAttempts, $inFlight)
++    }
++
++    # 3. Build the CredentialsUpdateSpec with the genuine SDK initializers.
++    #    ROTATE lets SDDC Manager generate the secret, so no password is sent,
++    #    and every unbound optional stays off the wire.
++    $credentialArguments = @{
++        Username       = $Username
++        CredentialType = $CredentialType
++    }
++    if ($accountTypeBound) { $credentialArguments['AccountType'] = $AccountType }
++    $baseCredential = Initialize-VcfBaseCredential @credentialArguments
++    $resourceCredentials = Initialize-VcfResourceCredentials `
++        -ResourceType $ResourceType `
++        -ResourceName $ResourceName `
++        -Credentials @($baseCredential)
++    $updateSpec = Initialize-VcfCredentialsUpdateSpec `
++        -OperationType 'ROTATE' `
++        -Elements @($resourceCredentials)
++
++    $submission = Invoke-VcfUpdateOrRotatePasswords `
++        -CredentialsUpdateSpec $updateSpec `
++        -Server $Server
++    $taskId = ''
++    if ($null -ne $submission -and
++        $submission.PSObject.Properties.Name -contains 'id') {
++        $taskId = [string] $submission.id
++    }
++    if ([string]::IsNullOrWhiteSpace($taskId)) {
++        throw [System.InvalidOperationException]::new(
++            "SDDC Manager accepted the rotation without returning a task id for $ResourceName.")
++    }
++
++    # 4. Acceptance is not completion: poll the credentials task itself.
++    $pollCount = 0
++    $retryAttempted = $false
++    $status = ''
++    $normalized = ''
++    $task = $null
++    while ($pollCount -lt $PollLimit) {
++        $task = Invoke-VcfGetCredentialsTask -Id $taskId -Server $Server
++        $pollCount++
++        $status = ''
++        if ($null -ne $task -and
++            $task.PSObject.Properties.Name -contains 'status') {
++            $status = [string] $task.status
++        }
++        $normalized = ConvertTo-VcfRotationStatus -Status $status
++
++        if ($script:SuccessfulStatus -contains $normalized) { break }
++
++        if ($script:FailedStatus -contains $normalized) {
++            $detail = Get-VcfRotationTaskError -Task $task
++            if ($normalized -eq 'FAILED' -and -not $retryAttempted) {
++                # One retry resubmits the original specification unchanged.
++                $retryAttempted = $true
++                Invoke-VcfRetryCredentialsTask `
++                    -Id $taskId `
++                    -CredentialsUpdateSpec $updateSpec `
++                    -Server $Server | Out-Null
++                continue
++            }
++            $message = $detail.Message
++            if ([string]::IsNullOrWhiteSpace($message)) {
++                $message = "The credential rotation task ended as $status."
++            }
++            throw [VcfCredentialRotationFailedException]::new(
++                $message, $taskId, $status, $detail.ErrorCode, $retryAttempted)
++        }
++
++        if ($pollCount -lt $PollLimit) {
++            Invoke-VcfRotationWait -Seconds $PollIntervalSeconds -SleepAction $SleepAction
++        }
++    }
++
++    if ($script:SuccessfulStatus -notcontains $normalized) {
++        # Never leave a half-applied rotation running behind a closed gate.
++        $cancelStatus = ''
++        $cancelled = $false
++        $cancelResult = Invoke-VcfCancelCredentialsTask -Id $taskId -Server $Server
++        $cancelled = $true
++        if ($null -ne $cancelResult -and
++            $cancelResult.PSObject.Properties.Name -contains 'status') {
++            $cancelStatus = [string] $cancelResult.status
++        }
++        throw [VcfCredentialRotationTimeoutException]::new(
++            ("The credential rotation task {0} was still {1} after {2} read(s) and was cancelled." -f
++                $taskId, $status, $pollCount),
++            $taskId, $pollCount, $cancelled, $cancelStatus)
++    }
++
++    # 5. Only a confirmed rotation may replace the secret consumers hold.
++    $credential = Invoke-VcfGetCredential -Id $credentialId -Server $Server
++    if ($null -eq $credential) {
++        throw [System.InvalidOperationException]::new(
++            "The rotated credential $credentialId could not be read back.")
++    }
++    if ([string] $credential.username -cne $Username) {
++        throw [System.InvalidOperationException]::new(
++            "The rotated credential $credentialId belongs to another account.")
++    }
++    $newSecret = [string] $credential.password
++    if ([string]::IsNullOrWhiteSpace($newSecret)) {
++        throw [System.InvalidOperationException]::new(
++            "The rotated credential $credentialId carries no replacement secret.")
++    }
++    & $PublishAction $newSecret | Out-Null
++
++    return [pscustomobject][ordered]@{
++        ResourceName   = $ResourceName
++        ResourceType   = $ResourceType
++        Username       = $Username
++        CredentialId   = $credentialId
++        TaskId         = $taskId
++        Status         = $status
++        PollCount      = $pollCount
++        DrainAttempts  = $drainAttempts
++        RetryAttempted = $retryAttempted
++        RotatedAt      = [string] $credential.modificationTimestamp
++    }
+ }
+ 
+ Export-ModuleMember -Function 'Invoke-VcfCredentialRotation'

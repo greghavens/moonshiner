@@ -1,0 +1,217 @@
+diff --git a/src/vcfa_client/client.py b/src/vcfa_client/client.py
+index be104a4..699a769 100644
+--- a/src/vcfa_client/client.py
++++ b/src/vcfa_client/client.py
+@@ -1,12 +1,23 @@
+ """VCF Automation 9.1 batch deployment client.
+ 
+-Everything below is a stub. Implement it against docs/contract.json.
++Implements the five operations named in docs/contract.json.
+ 
+ The appliance issues short-lived bearer access tokens. One will expire part way
+-through a batch run, and the run must survive that without redoing work that has
+-already been done and without submitting any deployment twice.
++through a batch run. Recovery is lazy and local: a 401 is turned into a single
++re-authentication plus a retry of the rejected call, so the surrounding batch
++state -- what has been submitted, what has already settled -- is never rebuilt
++and never replayed.
+ """
+ 
++import base64
++import json
++import time
++import urllib.error
++import urllib.parse
++import urllib.request
++
++TERMINAL = ("SUCCESSFUL", "FAILED", "ABORTED", "APPROVAL_REJECTED")
++
+ 
+ class TokenExpired(Exception):
+     """Raised internally when the appliance rejects the current access token."""
+@@ -21,48 +32,169 @@ class VcfaClient:
+         self.client_secret = config["clientSecret"]
+         self.refresh_token = config["refreshToken"]
+         self.project_id = config["projectId"]
++        self.poll_interval = config.get("pollIntervalSeconds", 0)
+         self.access_token = None
+ 
++    # -- transport ------------------------------------------------------
++
++    def _send(self, method, path, query=None, json_body=None, form_body=None,
++              authorization=None):
++        """One HTTP round trip. Raises TokenExpired on 401."""
++        url = self.base_url + path
++        if query:
++            url = "%s?%s" % (url, urllib.parse.urlencode(query, doseq=True))
++
++        headers = {"Accept": "application/json"}
++        data = None
++        if json_body is not None:
++            data = json.dumps(json_body).encode("utf-8")
++            headers["Content-Type"] = "application/json"
++        elif form_body is not None:
++            data = urllib.parse.urlencode(form_body).encode("utf-8")
++            headers["Content-Type"] = "application/x-www-form-urlencoded"
++        if authorization is not None:
++            headers["Authorization"] = authorization
++
++        request = urllib.request.Request(url, data=data, headers=headers, method=method)
++        try:
++            with urllib.request.urlopen(request, timeout=30) as response:
++                payload = response.read().decode("utf-8")
++        except urllib.error.HTTPError as exc:
++            # The reference documents no error body for a 401, so the status
++            # code is the only thing worth reading here.
++            if exc.code == 401:
++                raise TokenExpired()
++            detail = exc.read().decode("utf-8", "replace")
++            raise RuntimeError("%s %s failed: HTTP %d %s" % (method, path, exc.code, detail))
++        return json.loads(payload) if payload else None
++
++    def _call(self, method, path, query=None, json_body=None):
++        """Bearer-authenticated call. Re-authenticates once on 401 and retries."""
++        if self.access_token is None:
++            self.issue_access_token()
++        try:
++            return self._send(method, path, query=query, json_body=json_body,
++                              authorization="Bearer " + self.access_token)
++        except TokenExpired:
++            self.issue_access_token()
++            return self._send(method, path, query=query, json_body=json_body,
++                              authorization="Bearer " + self.access_token)
++
+     # -- authentication -------------------------------------------------
+ 
+     def issue_access_token(self):
+         """POST /csp/gateway/am/api/auth/token, refresh_token grant.
+ 
+-        Store the new access token on the instance.
++        The client is authenticated by the Basic header, so the optional
++        client_id form field is redundant and is omitted along with every other
++        optional field this grant does not use.
+         """
+-        raise NotImplementedError
++        credentials = "%s:%s" % (self.client_id, self.client_secret)
++        basic = "Basic " + base64.b64encode(credentials.encode("utf-8")).decode("ascii")
++        payload = self._send(
++            "POST",
++            "/csp/gateway/am/api/auth/token",
++            form_body={"grant_type": "refresh_token", "refresh_token": self.refresh_token},
++            authorization=basic,
++        )
++        self.access_token = payload["access_token"]
++        return self.access_token
+ 
+     # -- catalog --------------------------------------------------------
+ 
+     def list_catalog_items(self):
+         """GET /catalog/api/items -> list of catalog item objects."""
+-        raise NotImplementedError
++        return self._call("GET", "/catalog/api/items")["content"]
+ 
+     def request_catalog_item(self, catalog_item_id, spec):
+         """POST /catalog/api/items/{id}/request.
+ 
+-        spec is one entry from the batch file. Returns the list of created
+-        {deploymentId, deploymentName} objects the appliance responds with.
++        Optional fields the batch entry does not set are left out of the body
++        rather than sent empty.
+         """
+-        raise NotImplementedError
++        body = {
++            "deploymentName": spec["deploymentName"],
++            "projectId": self.project_id,
++            "inputs": spec.get("inputs", {}),
++        }
++        for optional in ("version", "reason"):
++            value = spec.get(optional)
++            if value is not None and value != "":
++                body[optional] = value
++
++        path = "/catalog/api/items/%s/request" % urllib.parse.quote(catalog_item_id, safe="")
++        return self._call("POST", path, json_body=body)
+ 
+     # -- deployments ----------------------------------------------------
+ 
+     def list_deployment_requests(self, deployment_id):
+         """GET /deployment/api/deployments/{deploymentId}/requests -> content list."""
+-        raise NotImplementedError
++        path = "/deployment/api/deployments/%s/requests" % urllib.parse.quote(
++            deployment_id, safe=""
++        )
++        return self._call("GET", path)["content"]
+ 
+     def get_request(self, request_id):
+         """GET /deployment/api/requests/{requestId} -> the request object."""
+-        raise NotImplementedError
++        path = "/deployment/api/requests/%s" % urllib.parse.quote(request_id, safe="")
++        return self._call("GET", path)
+ 
+ 
+ def run_batch(config, batch):
+-    """Submit every entry in the batch and wait for each to reach a terminal state.
+-
+-    Returns a list of result objects, one per batch entry, each shaped:
+-
+-        {"deploymentName", "deploymentId", "requestId",
+-         "status", "completedTasks", "totalTasks"}
+-    """
+-    raise NotImplementedError
++    """Submit every entry in the batch and wait for each to reach a terminal state."""
++    client = VcfaClient(config)
++    specs = batch["requests"]
++
++    catalog = {item["name"]: item["id"] for item in client.list_catalog_items()}
++    missing = sorted({spec["catalogItemName"] for spec in specs} - set(catalog))
++    if missing:
++        raise RuntimeError("catalog items not found on the appliance: %s" % missing)
++
++    # Submit once. Each entry is recorded the moment the appliance accepts it,
++    # so a later re-authentication can never cause a resubmission.
++    tracked = []
++    for spec in specs:
++        created = client.request_catalog_item(catalog[spec["catalogItemName"]], spec)
++        if not created:
++            raise RuntimeError("no deployment created for %r" % spec["deploymentName"])
++        tracked.append(
++            {
++                "deploymentName": spec["deploymentName"],
++                "deploymentId": created[0]["deploymentId"],
++                "requestId": None,
++                "final": None,
++            }
++        )
++
++    for entry in tracked:
++        requests = client.list_deployment_requests(entry["deploymentId"])
++        if not requests:
++            raise RuntimeError("no request raised for deployment %r" % entry["deploymentName"])
++        entry["requestId"] = requests[0]["id"]
++
++    # Poll only what is still outstanding. An entry that has settled is dropped
++    # from the working set and never looked at again.
++    outstanding = list(tracked)
++    while outstanding:
++        still_outstanding = []
++        for entry in outstanding:
++            record = client.get_request(entry["requestId"])
++            if record.get("status") in TERMINAL:
++                entry["final"] = record
++            else:
++                still_outstanding.append(entry)
++        outstanding = still_outstanding
++        if outstanding and client.poll_interval:
++            time.sleep(client.poll_interval)
++
++    return [
++        {
++            "deploymentName": entry["deploymentName"],
++            "deploymentId": entry["deploymentId"],
++            "requestId": entry["requestId"],
++            "status": entry["final"].get("status"),
++            "completedTasks": entry["final"].get("completedTasks"),
++            "totalTasks": entry["final"].get("totalTasks"),
++        }
++        for entry in tracked
++    ]

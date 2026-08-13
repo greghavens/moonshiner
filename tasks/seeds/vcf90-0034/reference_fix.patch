@@ -1,0 +1,369 @@
+diff --git a/VcfTagSync.psm1 b/VcfTagSync.psm1
+new file mode 100644
+index 0000000..8caf14f
+--- /dev/null
++++ b/VcfTagSync.psm1
+@@ -0,0 +1,363 @@
++Set-StrictMode -Version Latest
++$ErrorActionPreference = 'Stop'
++
++Import-Module -Name 'VMware.Sdk.vSphere' `
++    -MinimumVersion '13.5.0.25380678' `
++    -ErrorAction Stop
++Import-Module -Name 'VMware.Sdk.vSphereRuntime' `
++    -MinimumVersion '8.0.2099.24145081' `
++    -ErrorAction Stop
++
++class VcfTagSyncException : System.Exception {
++    VcfTagSyncException([string] $message) : base($message) { }
++}
++
++function New-SyncContext {
++    param(
++        [string] $Server,
++        [pscredential] $Credential,
++        [bool] $SkipCertificateCheck
++    )
++    [pscustomobject] @{
++        Server               = $Server
++        Credential           = $Credential
++        SkipCertificateCheck = $SkipCertificateCheck
++        Configuration        = $null
++        RefreshCount         = -1
++    }
++}
++
++<#
++Obtains a session token with Cis.Session_create and pins it as the
++vmware-api-session-id credential for every later operation.  UseDeprecatedApis
++is fixed so the runtime never probes the pre-7.0.2 /rest surface, which the
++9.0.0.0 contract does not cover.
++#>
++function Update-SyncSession {
++    param([Parameter(Mandatory)] [object] $Context)
++
++    $login = New-vSphereServerConfiguration `
++        -Server $Context.Server `
++        -Username $Context.Credential.UserName `
++        -Password $Context.Credential.Password `
++        -SkipCertificateCheck:$Context.SkipCertificateCheck `
++        -UseDeprecatedApis:$false `
++        -NotDefault
++
++    $created = Invoke-vSphereApiClient `
++        -Uri '/api/session' `
++        -Accepts @('application/json') `
++        -ContentTypes @('application/json') `
++        -HeaderParameters @{} `
++        -FormParameters @{} `
++        -QueryParameters @{} `
++        -CookieParameters @{} `
++        -Body '' `
++        -Method 'POST' `
++        -ReturnType 'string' `
++        -IsBodyNullable $false `
++        -InvocationInfo @{ OperationId = 'Cis.Session_create'; Parameters = @{} } `
++        -Server $login
++
++    $token = [string] $created.Response
++    if ([string]::IsNullOrWhiteSpace($token)) {
++        throw [VcfTagSyncException]::new('vCenter returned an empty session token')
++    }
++
++    $Context.Configuration = New-vSphereServerConfiguration `
++        -Server $Context.Server `
++        -ApiKey $token `
++        -SkipCertificateCheck:$Context.SkipCertificateCheck `
++        -UseDeprecatedApis:$false `
++        -NotDefault
++    $Context.RefreshCount++
++}
++
++function Test-SessionExpired {
++    param([Parameter(Mandatory)] [System.Management.Automation.ErrorRecord] $ErrorRecord)
++
++    $exception = $ErrorRecord.Exception
++    while ($null -ne $exception) {
++        $direct = $exception.PSObject.Properties['StatusCode']
++        if ($null -ne $direct -and $null -ne $direct.Value) {
++            try {
++                if ([int] $direct.Value -eq 401) { return $true }
++            }
++            catch { }
++        }
++
++        $response = $exception.PSObject.Properties['Response']
++        if ($null -ne $response -and $null -ne $response.Value) {
++            $status = $response.Value.PSObject.Properties['StatusCode']
++            if ($null -ne $status -and $null -ne $status.Value) {
++                try {
++                    if ([int] $status.Value -eq 401) { return $true }
++                }
++                catch { }
++            }
++        }
++
++        if ($null -ne $exception.Data -and $exception.Data.Contains('StatusCode')) {
++            try {
++                if ([int] $exception.Data['StatusCode'] -eq 401) { return $true }
++            }
++            catch { }
++        }
++        $exception = $exception.InnerException
++    }
++    return $false
++}
++
++<#
++Invokes one contract operation.  A token that expired mid-run surfaces as a
++401; that is answered by creating exactly one replacement session and replaying
++the same request, so no already-completed operation is repeated.
++#>
++function Invoke-ContractOperation {
++    param(
++        [Parameter(Mandatory)] [object] $Context,
++        [Parameter(Mandatory)] [string] $OperationId,
++        [Parameter(Mandatory)] [string] $Method,
++        [Parameter(Mandatory)] [string] $Uri,
++        [hashtable] $Query = @{},
++        [string] $Body = ''
++    )
++
++    $refreshed = $false
++    while ($true) {
++        try {
++            return Invoke-vSphereApiClient `
++                -Uri $Uri `
++                -Accepts @('application/json') `
++                -ContentTypes @('application/json') `
++                -HeaderParameters @{} `
++                -FormParameters @{} `
++                -QueryParameters $Query `
++                -CookieParameters @{} `
++                -Body $Body `
++                -Method $Method `
++                -ReturnType 'string' `
++                -IsBodyNullable $false `
++                -InvocationInfo @{ OperationId = $OperationId; Parameters = @{} } `
++                -Server $Context.Configuration
++        }
++        catch {
++            if ($refreshed -or -not (Test-SessionExpired $_)) { throw }
++            $refreshed = $true
++            Update-SyncSession -Context $Context
++        }
++    }
++}
++
++function ConvertTo-PathSegment {
++    param([Parameter(Mandatory)] [string] $Value)
++    [uri]::EscapeDataString($Value)
++}
++
++function Resolve-PlanVm {
++    param([Parameter(Mandatory)] [object] $Context, [string[]] $Name)
++
++    $response = Invoke-ContractOperation `
++        -Context $Context `
++        -OperationId 'Vcenter.VM_list' `
++        -Method 'GET' `
++        -Uri '/api/vcenter/vm' `
++        -Query @{ names = [string[]] $Name }
++
++    $byName = @{}
++    foreach ($summary in @($response.Response)) {
++        $byName[[string] $summary.name] = [string] $summary.vm
++    }
++    $missing = @($Name | Where-Object { -not $byName.ContainsKey($_) } | Sort-Object)
++    if ($missing.Count -gt 0) {
++        throw [VcfTagSyncException]::new(
++            "the plan names virtual machines that vCenter does not list: $($missing -join ', ')")
++    }
++    $byName
++}
++
++function Resolve-PlanCategory {
++    param([Parameter(Mandatory)] [object] $Context, [string] $Name)
++
++    $listed = Invoke-ContractOperation `
++        -Context $Context `
++        -OperationId 'Cis.Tagging.Category_list' `
++        -Method 'GET' `
++        -Uri '/api/cis/tagging/category'
++
++    foreach ($categoryId in @($listed.Response)) {
++        $category = Invoke-ContractOperation `
++            -Context $Context `
++            -OperationId 'Cis.Tagging.Category_get' `
++            -Method 'GET' `
++            -Uri "/api/cis/tagging/category/$(ConvertTo-PathSegment $categoryId)"
++        if ([string] $category.Response.name -ceq $Name) {
++            return [string] $category.Response.id
++        }
++    }
++    throw [VcfTagSyncException]::new(
++        "the plan category '$Name' does not exist in vCenter")
++}
++
++function Resolve-CategoryTag {
++    param([Parameter(Mandatory)] [object] $Context, [string] $CategoryId)
++
++    $request = @{ category_id = $CategoryId } | ConvertTo-Json -Compress
++    $listed = Invoke-ContractOperation `
++        -Context $Context `
++        -OperationId 'Cis.Tagging.Tag_listTagsForCategory' `
++        -Method 'POST' `
++        -Uri '/api/cis/tagging/tag' `
++        -Query @{ action = 'list-tags-for-category' } `
++        -Body $request
++
++    $byName = @{}
++    foreach ($tagId in @($listed.Response)) {
++        $tag = Invoke-ContractOperation `
++            -Context $Context `
++            -OperationId 'Cis.Tagging.Tag_get' `
++            -Method 'GET' `
++            -Uri "/api/cis/tagging/tag/$(ConvertTo-PathSegment $tagId)"
++        $byName[[string] $tag.Response.name] = [string] $tag.Response.id
++    }
++    $byName
++}
++
++function New-CategoryTag {
++    param(
++        [Parameter(Mandatory)] [object] $Context,
++        [string] $CategoryId,
++        [string] $Name,
++        [string] $Description
++    )
++
++    # Construct the genuine SDK model first. Its ToJson representation contains
++    # optional members as null; the SDK runtime strips those members before it
++    # puts the body on the wire because SerializeNulls is left disabled.
++    $spec = Initialize-CisTaggingTagCreateSpec `
++        -Name $Name `
++        -Description $Description `
++        -CategoryId $CategoryId
++
++    $created = Invoke-ContractOperation `
++        -Context $Context `
++        -OperationId 'Cis.Tagging.Tag_create' `
++        -Method 'POST' `
++        -Uri '/api/cis/tagging/tag' `
++        -Body $spec.ToJson()
++
++    [string] $created.Response
++}
++
++function Add-TagToVm {
++    param(
++        [Parameter(Mandatory)] [object] $Context,
++        [string] $TagId,
++        [string[]] $VmId
++    )
++
++    $objectIds = @(
++        foreach ($id in $VmId) {
++            (Initialize-VapiStdDynamicID -Type 'VirtualMachine' -Id $id).ToJson()
++        }
++    )
++    $body = '{"object_ids":[' + ($objectIds -join ',') + ']}'
++
++    $result = Invoke-ContractOperation `
++        -Context $Context `
++        -OperationId 'Cis.Tagging.TagAssociation_attachTagToMultipleObjects' `
++        -Method 'POST' `
++        -Uri "/api/cis/tagging/tag-association/$(ConvertTo-PathSegment $TagId)" `
++        -Query @{ action = 'attach-tag-to-multiple-objects' } `
++        -Body $body
++
++    if (-not $result.Response.success) {
++        $detail = @($result.Response.error_messages | ForEach-Object { $_.default_message })
++        throw [VcfTagSyncException]::new(
++            "attaching tag $TagId failed: $($detail -join '; ')")
++    }
++}
++
++function Close-SyncSession {
++    param([Parameter(Mandatory)] [object] $Context)
++    $null = Invoke-ContractOperation `
++        -Context $Context `
++        -OperationId 'Cis.Session_delete' `
++        -Method 'DELETE' `
++        -Uri '/api/session'
++    $Context.Configuration = $null
++}
++
++function Invoke-VcfTagSync {
++    <#
++    .SYNOPSIS
++    Applies a desired-state tag plan to virtual machines in a VCF 9.0 vCenter.
++    #>
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] [ValidateNotNullOrEmpty()] [string] $Server,
++        [Parameter(Mandatory)] [ValidateNotNull()] [pscredential] $Credential,
++        [Parameter(Mandatory)] [ValidateNotNullOrEmpty()] [string] $PlanPath,
++        [switch] $SkipCertificateCheck
++    )
++
++    if (-not (Test-Path -LiteralPath $PlanPath -PathType Leaf)) {
++        throw [VcfTagSyncException]::new("tag plan not found: $PlanPath")
++    }
++    $plan = Get-Content -LiteralPath $PlanPath -Raw | ConvertFrom-Json
++    $assignments = @($plan.assignments)
++    if ($assignments.Count -eq 0) {
++        throw [VcfTagSyncException]::new('the tag plan contains no assignments')
++    }
++
++    $context = New-SyncContext `
++        -Server $Server `
++        -Credential $Credential `
++        -SkipCertificateCheck ([bool] $SkipCertificateCheck)
++
++    Update-SyncSession -Context $context
++
++    $vmNames = @(
++        $assignments | ForEach-Object { $_.vms } |
++            Select-Object -Unique | Sort-Object
++    )
++    $vmIdByName = Resolve-PlanVm -Context $context -Name $vmNames
++    $categoryId = Resolve-PlanCategory -Context $context -Name $plan.category.name
++    $tagIdByName = Resolve-CategoryTag -Context $context -CategoryId $categoryId
++
++    $created = [System.Collections.Generic.List[string]]::new()
++    foreach ($assignment in $assignments) {
++        $tagName = [string] $assignment.tag
++        if (-not $tagIdByName.ContainsKey($tagName)) {
++            $tagIdByName[$tagName] = New-CategoryTag `
++                -Context $context `
++                -CategoryId $categoryId `
++                -Name $tagName `
++                -Description ([string] $assignment.description)
++            $created.Add($tagName)
++        }
++    }
++
++    $attached = 0
++    foreach ($assignment in $assignments) {
++        $vmIds = @($assignment.vms | ForEach-Object { $vmIdByName[[string] $_] })
++        Add-TagToVm `
++            -Context $context `
++            -TagId $tagIdByName[[string] $assignment.tag] `
++            -VmId $vmIds
++        $attached++
++    }
++
++    Close-SyncSession -Context $context
++
++    [pscustomobject] [ordered] @{
++        Server              = $Server
++        CategoryId          = $categoryId
++        TagsCreated         = [string[]] @($created | Sort-Object)
++        VmsResolved         = $vmNames.Count
++        AttachedCount       = $attached
++        SessionRefreshCount = $context.RefreshCount
++    }
++}
++
++Export-ModuleMember -Function 'Invoke-VcfTagSync'

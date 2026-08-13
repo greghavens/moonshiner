@@ -1,0 +1,1260 @@
+diff --git a/vmreconfig/client.go b/vmreconfig/client.go
+new file mode 100644
+index 0000000..ab3f571
+--- /dev/null
++++ b/vmreconfig/client.go
+@@ -0,0 +1,637 @@
++package vmreconfig
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
++)
++
++// Operation identifiers, exactly as the vSphere Automation API specification
++// spells them. These are the only operations this package calls.
++const (
++	OpPowerGet      = "Vcenter.Vm.Power_get"
++	OpPowerStop     = "Vcenter.Vm.Power_stop"
++	OpMemoryUpdate  = "Vcenter.Vm.Hardware.Memory_update"
++	OpCPUUpdate     = "Vcenter.Vm.Hardware.Cpu_update"
++	OpDiskCreate    = "Vcenter.Vm.Hardware.Disk_create"
++	OpPowerStart    = "Vcenter.Vm.Power_start"
++	sessionHeader   = "vmware-api-session-id"
++	basePath        = "/api"
++	jsonContentType = "application/json"
++)
++
++// Power states from the specification's Vcenter.Vm.Power.State vocabulary.
++const (
++	PoweredOff = "POWERED_OFF"
++	PoweredOn  = "POWERED_ON"
++	Suspended  = "SUSPENDED"
++)
++
++// Sentinels, matchable with errors.Is.
++var (
++	// ErrInvalidRequest reports a change set or configuration this package
++	// rejected locally, before any request was sent.
++	ErrInvalidRequest = errors.New("vmreconfig: invalid request")
++	// ErrAPI reports a non-success answer from the appliance.
++	ErrAPI = errors.New("vmreconfig: api error")
++)
++
++// Config configures a Client.
++type Config struct {
++	// BaseURL is the vCenter appliance root with no path, such as
++	// https://vcenter.example.com. The /api base path is appended by this
++	// package.
++	BaseURL string
++	// SessionID is the value sent in the vmware-api-session-id header.
++	SessionID string
++	// HTTPClient is optional; nil means http.DefaultClient.
++	HTTPClient *http.Client
++}
++
++// Client applies change sets to a virtual machine.
++type Client struct {
++	baseURL   string
++	sessionID string
++	http      *http.Client
++}
++
++// New validates cfg and returns a Client. It performs no I/O.
++func New(cfg Config) (*Client, error) {
++	raw := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
++	if raw == "" {
++		return nil, fmt.Errorf("%w: BaseURL is empty", ErrInvalidRequest)
++	}
++	u, err := url.Parse(raw)
++	if err != nil {
++		return nil, fmt.Errorf("%w: BaseURL %q is not a URL: %v", ErrInvalidRequest, cfg.BaseURL, err)
++	}
++	if u.Scheme != "http" && u.Scheme != "https" {
++		return nil, fmt.Errorf("%w: BaseURL scheme %q is not http or https", ErrInvalidRequest, u.Scheme)
++	}
++	if u.Host == "" {
++		return nil, fmt.Errorf("%w: BaseURL %q has no host", ErrInvalidRequest, cfg.BaseURL)
++	}
++	if strings.TrimSpace(cfg.SessionID) == "" {
++		return nil, fmt.Errorf("%w: SessionID is empty", ErrInvalidRequest)
++	}
++	if !headerSafe(cfg.SessionID) {
++		return nil, fmt.Errorf("%w: SessionID contains a byte that is unsafe in an HTTP header", ErrInvalidRequest)
++	}
++	hc := cfg.HTTPClient
++	if hc == nil {
++		hc = http.DefaultClient
++	}
++	return &Client{baseURL: raw, sessionID: cfg.SessionID, http: hc}, nil
++}
++
++func headerSafe(value string) bool {
++	for i := 0; i < len(value); i++ {
++		if value[i] == 0x7f || (value[i] < 0x20 && value[i] != '\t') {
++			return false
++		}
++	}
++	return true
++}
++
++// MemoryChange is a requested change to Vcenter.Vm.Hardware.Memory.UpdateSpec.
++// A nil field is not sent.
++type MemoryChange struct {
++	SizeMiB       *int64
++	HotAddEnabled *bool
++}
++
++func (m *MemoryChange) empty() bool { return m.SizeMiB == nil && m.HotAddEnabled == nil }
++
++// CPUChange is a requested change to Vcenter.Vm.Hardware.Cpu.UpdateSpec. A nil
++// field is not sent.
++type CPUChange struct {
++	Count            *int64
++	CoresPerSocket   *int64
++	HotAddEnabled    *bool
++	HotRemoveEnabled *bool
++}
++
++func (c *CPUChange) empty() bool {
++	return c.Count == nil && c.CoresPerSocket == nil && c.HotAddEnabled == nil && c.HotRemoveEnabled == nil
++}
++
++// SCSIAddress is a Vcenter.Vm.Hardware.ScsiAddressSpec. Bus is required by the
++// specification and is always sent, including when it is zero. Unit is optional.
++type SCSIAddress struct {
++	Bus  int64
++	Unit *int64
++}
++
++// NewVMDK is a Vcenter.Vm.Hardware.Disk.VmdkCreateSpec. Every field is optional.
++type NewVMDK struct {
++	Name          string
++	CapacityBytes *int64
++}
++
++// DiskChange is a Vcenter.Vm.Hardware.Disk.CreateSpec. Every field is optional
++// on the wire, but this package requires NewVMDK because it only creates new
++// backings.
++type DiskChange struct {
++	Type    string
++	SCSI    *SCSIAddress
++	NewVMDK *NewVMDK
++}
++
++// ChangeSet is one reconfiguration applied as an ordered sequence.
++type ChangeSet struct {
++	VM                string
++	Memory            *MemoryChange
++	CPU               *CPUChange
++	Disks             []DiskChange
++	RestorePowerState bool
++}
++
++// StepStatus is the outcome of one step.
++type StepStatus string
++
++const (
++	// StepApplied means the request was sent and the appliance accepted it.
++	StepApplied StepStatus = "APPLIED"
++	// StepSkipped means the step was deliberately not needed. No change is
++	// outstanding because of it.
++	StepSkipped StepStatus = "SKIPPED"
++	// StepFailed means the request was sent and the appliance refused it.
++	StepFailed StepStatus = "FAILED"
++	// StepNotAttempted means an earlier step failed and this one never ran.
++	StepNotAttempted StepStatus = "NOT_ATTEMPTED"
++)
++
++// StepReport is the outcome of one step of a change set.
++type StepReport struct {
++	// Operation is the specification operationId for this step.
++	Operation string
++	Status    StepStatus
++	// Detail explains the outcome in prose.
++	Detail string
++	// Err is non-nil only when Status is StepFailed.
++	Err error
++}
++
++// Report describes everything a change set did, including a change set that
++// stopped part way through.
++type Report struct {
++	VM                string
++	InitialPowerState string
++	FinalPowerState   string
++	Steps             []StepReport
++	CreatedDiskIDs    []string
++}
++
++// Applied lists the operationIds of the steps that landed, in order.
++func (r Report) Applied() []string {
++	out := []string{}
++	for _, s := range r.Steps {
++		if s.Status == StepApplied {
++			out = append(out, s.Operation)
++		}
++	}
++	return out
++}
++
++// Failed returns the first failed step.
++func (r Report) Failed() (StepReport, bool) {
++	for _, s := range r.Steps {
++		if s.Status == StepFailed {
++			return s, true
++		}
++	}
++	return StepReport{}, false
++}
++
++// APIError is a non-success answer from the appliance.
++type APIError struct {
++	// Operation is the specification operationId that failed.
++	Operation string
++	Status    int
++	// ErrorType is the vAPI error_type discriminator.
++	ErrorType string
++	// Message is messages[0].default_message.
++	Message string
++}
++
++func (e *APIError) Error() string {
++	return fmt.Sprintf("vmreconfig: %s: %s (HTTP %d): %s", e.Operation, e.ErrorType, e.Status, e.Message)
++}
++
++// Unwrap makes errors.Is(err, ErrAPI) true.
++func (e *APIError) Unwrap() error { return ErrAPI }
++
++// ---------------------------------------------------------------------------
++// wire types
++// ---------------------------------------------------------------------------
++
++type memoryUpdateSpec struct {
++	SizeMiB       *int64 `json:"size_mib,omitempty"`
++	HotAddEnabled *bool  `json:"hot_add_enabled,omitempty"`
++}
++
++type cpuUpdateSpec struct {
++	Count            *int64 `json:"count,omitempty"`
++	CoresPerSocket   *int64 `json:"cores_per_socket,omitempty"`
++	HotAddEnabled    *bool  `json:"hot_add_enabled,omitempty"`
++	HotRemoveEnabled *bool  `json:"hot_remove_enabled,omitempty"`
++}
++
++// scsiAddressSpec sends bus unconditionally: the specification marks it
++// required, so omitempty would silently drop a legitimate bus 0.
++type scsiAddressSpec struct {
++	Bus  int64  `json:"bus"`
++	Unit *int64 `json:"unit,omitempty"`
++}
++
++type vmdkCreateSpec struct {
++	Name     string `json:"name,omitempty"`
++	Capacity *int64 `json:"capacity,omitempty"`
++}
++
++type diskCreateSpec struct {
++	Type    string           `json:"type,omitempty"`
++	SCSI    *scsiAddressSpec `json:"scsi,omitempty"`
++	NewVMDK *vmdkCreateSpec  `json:"new_vmdk,omitempty"`
++}
++
++type powerInfo struct {
++	State string `json:"state"`
++}
++
++type vapiError struct {
++	ErrorType string `json:"error_type"`
++	Messages  []struct {
++		DefaultMessage string `json:"default_message"`
++	} `json:"messages"`
++}
++
++// ---------------------------------------------------------------------------
++// Apply
++// ---------------------------------------------------------------------------
++
++// Apply runs the change set as an ordered sequence and reports every step.
++//
++// The returned Report is always populated, including when Apply returns an
++// error: a change set that fails part way through has still changed the
++// machine, and the caller needs to know which steps landed. A step behind a
++// failed step is reported StepNotAttempted, never StepSkipped.
++func (c *Client) Apply(ctx context.Context, cs ChangeSet) (Report, error) {
++	if err := validate(cs); err != nil {
++		return Report{VM: cs.VM}, err
++	}
++
++	report := Report{VM: cs.VM, CreatedDiskIDs: []string{}}
++	report.Steps = plan(cs)
++
++	// Preflight: the initial power state decides whether a stop is needed and
++	// whether the machine should be powered back on at the end.
++	initial, err := c.powerState(ctx, cs.VM)
++	if err != nil {
++		markNotAttempted(&report, 0)
++		return report, err
++	}
++	report.InitialPowerState = initial
++	report.FinalPowerState = initial
++
++	failedAt := -1
++
++	for i := range report.Steps {
++		if failedAt >= 0 {
++			report.Steps[i].Status = StepNotAttempted
++			report.Steps[i].Detail = fmt.Sprintf("not attempted: %s failed earlier in this change set",
++				report.Steps[failedAt].Operation)
++			continue
++		}
++		step := &report.Steps[i]
++		switch step.Operation {
++		case OpPowerStop:
++			c.applyStop(ctx, cs, report.InitialPowerState, step)
++		case OpMemoryUpdate:
++			c.applyMemory(ctx, cs, step)
++		case OpCPUUpdate:
++			c.applyCPU(ctx, cs, step)
++		case OpDiskCreate:
++			c.applyDisk(ctx, cs, i, step, &report)
++		case OpPowerStart:
++			c.applyStart(ctx, cs, report.InitialPowerState, step)
++		}
++		if step.Status == StepFailed {
++			failedAt = i
++		}
++	}
++
++	// Report the power state the machine was actually left in, read back from
++	// the appliance rather than assumed, even when a step failed.
++	final, finalErr := c.powerState(ctx, cs.VM)
++	if finalErr == nil {
++		report.FinalPowerState = final
++	} else {
++		report.FinalPowerState = ""
++	}
++
++	if failedAt >= 0 {
++		return report, report.Steps[failedAt].Err
++	}
++	if finalErr != nil {
++		return report, finalErr
++	}
++	return report, nil
++}
++
++// plan builds the ordered step list for a change set. Its shape depends only on
++// the change set, so the caller sees every step that was considered, including
++// the ones that turn out to be skipped.
++func plan(cs ChangeSet) []StepReport {
++	steps := []StepReport{{Operation: OpPowerStop}, {Operation: OpMemoryUpdate}, {Operation: OpCPUUpdate}}
++	for range cs.Disks {
++		steps = append(steps, StepReport{Operation: OpDiskCreate})
++	}
++	steps = append(steps, StepReport{Operation: OpPowerStart})
++	return steps
++}
++
++func markNotAttempted(r *Report, from int) {
++	for i := from; i < len(r.Steps); i++ {
++		r.Steps[i].Status = StepNotAttempted
++		r.Steps[i].Detail = "not attempted: the initial power state could not be read"
++	}
++}
++
++func (c *Client) applyStop(ctx context.Context, cs ChangeSet, initial string, step *StepReport) {
++	if initial == PoweredOff {
++		step.Status = StepSkipped
++		step.Detail = "the virtual machine was already POWERED_OFF"
++		return
++	}
++	_, err := c.do(ctx, OpPowerStop, http.MethodPost,
++		"/vcenter/vm/{vm}/power", cs.VM, url.Values{"action": []string{"stop"}}, nil, http.StatusNoContent)
++	if err != nil {
++		// A machine that reached the desired state on its own has nothing
++		// outstanding. That is a skip, not a failure.
++		var apiErr *APIError
++		if errors.As(err, &apiErr) && apiErr.Status == http.StatusBadRequest && apiErr.ErrorType == "ALREADY_IN_DESIRED_STATE" {
++			step.Status = StepSkipped
++			step.Detail = "the appliance reported the virtual machine was already powered off"
++			return
++		}
++		step.Status = StepFailed
++		step.Detail = "could not power the virtual machine down: " + err.Error()
++		step.Err = err
++		return
++	}
++	step.Status = StepApplied
++	step.Detail = "powered the virtual machine down"
++}
++
++func (c *Client) applyMemory(ctx context.Context, cs ChangeSet, step *StepReport) {
++	if cs.Memory == nil {
++		step.Status = StepSkipped
++		step.Detail = "no memory change was requested"
++		return
++	}
++	body := memoryUpdateSpec{SizeMiB: cs.Memory.SizeMiB, HotAddEnabled: cs.Memory.HotAddEnabled}
++	if _, err := c.do(ctx, OpMemoryUpdate, http.MethodPatch,
++		"/vcenter/vm/{vm}/hardware/memory", cs.VM, nil, body, http.StatusNoContent); err != nil {
++		step.Status = StepFailed
++		step.Detail = "could not update memory: " + err.Error()
++		step.Err = err
++		return
++	}
++	step.Status = StepApplied
++	step.Detail = "updated the memory settings"
++}
++
++func (c *Client) applyCPU(ctx context.Context, cs ChangeSet, step *StepReport) {
++	if cs.CPU == nil {
++		step.Status = StepSkipped
++		step.Detail = "no CPU change was requested"
++		return
++	}
++	body := cpuUpdateSpec{
++		Count:            cs.CPU.Count,
++		CoresPerSocket:   cs.CPU.CoresPerSocket,
++		HotAddEnabled:    cs.CPU.HotAddEnabled,
++		HotRemoveEnabled: cs.CPU.HotRemoveEnabled,
++	}
++	if _, err := c.do(ctx, OpCPUUpdate, http.MethodPatch,
++		"/vcenter/vm/{vm}/hardware/cpu", cs.VM, nil, body, http.StatusNoContent); err != nil {
++		step.Status = StepFailed
++		step.Detail = "could not update CPU: " + err.Error()
++		step.Err = err
++		return
++	}
++	step.Status = StepApplied
++	step.Detail = "updated the CPU settings"
++}
++
++// diskIndex maps a step position onto the change set's disk slice. The disk
++// steps are contiguous and start after the stop, memory and CPU steps.
++const firstDiskStep = 3
++
++func (c *Client) applyDisk(ctx context.Context, cs ChangeSet, stepIndex int, step *StepReport, report *Report) {
++	d := cs.Disks[stepIndex-firstDiskStep]
++	body := diskCreateSpec{Type: d.Type}
++	if d.SCSI != nil {
++		body.SCSI = &scsiAddressSpec{Bus: d.SCSI.Bus, Unit: d.SCSI.Unit}
++	}
++	if d.NewVMDK != nil {
++		body.NewVMDK = &vmdkCreateSpec{Name: d.NewVMDK.Name, Capacity: d.NewVMDK.CapacityBytes}
++	}
++	raw, err := c.do(ctx, OpDiskCreate, http.MethodPost,
++		"/vcenter/vm/{vm}/hardware/disk", cs.VM, nil, body, http.StatusCreated)
++	if err != nil {
++		step.Status = StepFailed
++		step.Detail = fmt.Sprintf("could not add disk %d: %s", stepIndex-firstDiskStep+1, err.Error())
++		step.Err = err
++		return
++	}
++	// The specification declares the 201 body as a bare JSON string holding the
++	// identifier of the disk that was created.
++	var id string
++	if uerr := json.Unmarshal(raw, &id); uerr != nil {
++		step.Status = StepFailed
++		step.Detail = fmt.Sprintf("could not add disk %d: unreadable identifier", stepIndex-firstDiskStep+1)
++		step.Err = &APIError{
++			Operation: OpDiskCreate,
++			Status:    http.StatusCreated,
++			ErrorType: "UNEXPECTED_INPUT",
++			Message:   fmt.Sprintf("response body %q is not a JSON string", string(raw)),
++		}
++		return
++	}
++	report.CreatedDiskIDs = append(report.CreatedDiskIDs, id)
++	step.Status = StepApplied
++	step.Detail = fmt.Sprintf("added disk %d as %s", stepIndex-firstDiskStep+1, id)
++}
++
++func (c *Client) applyStart(ctx context.Context, cs ChangeSet, initial string, step *StepReport) {
++	if !cs.RestorePowerState {
++		step.Status = StepSkipped
++		step.Detail = "the change set did not ask for the power state to be restored"
++		return
++	}
++	if initial != PoweredOn {
++		step.Status = StepSkipped
++		step.Detail = fmt.Sprintf("the virtual machine was %s before the change set, so it is not powered on", initial)
++		return
++	}
++	if _, err := c.do(ctx, OpPowerStart, http.MethodPost,
++		"/vcenter/vm/{vm}/power", cs.VM, url.Values{"action": []string{"start"}}, nil, http.StatusNoContent); err != nil {
++		step.Status = StepFailed
++		step.Detail = "could not power the virtual machine back on: " + err.Error()
++		step.Err = err
++		return
++	}
++	step.Status = StepApplied
++	step.Detail = "powered the virtual machine back on"
++}
++
++func (c *Client) powerState(ctx context.Context, vm string) (string, error) {
++	raw, err := c.do(ctx, OpPowerGet, http.MethodGet, "/vcenter/vm/{vm}/power", vm, nil, nil, http.StatusOK)
++	if err != nil {
++		return "", err
++	}
++	var info powerInfo
++	if uerr := json.Unmarshal(raw, &info); uerr != nil {
++		return "", &APIError{
++			Operation: OpPowerGet,
++			Status:    http.StatusOK,
++			ErrorType: "UNEXPECTED_INPUT",
++			Message:   "response is not a Vcenter.Vm.Power.Info object",
++		}
++	}
++	if info.State == "" {
++		return "", &APIError{
++			Operation: OpPowerGet,
++			Status:    http.StatusOK,
++			ErrorType: "UNEXPECTED_INPUT",
++			Message:   "Vcenter.Vm.Power.Info.state is required and was absent",
++		}
++	}
++	return info.State, nil
++}
++
++// do issues one operation and returns the response body on success.
++func (c *Client) do(ctx context.Context, operation, method, template, vm string, query url.Values, body any, wantStatus int) ([]byte, error) {
++	endpoint := c.baseURL + basePath + strings.Replace(template, "{vm}", url.PathEscape(vm), 1)
++	if len(query) > 0 {
++		endpoint += "?" + query.Encode()
++	}
++
++	var reader io.Reader
++	var encoded []byte
++	if body != nil {
++		var err error
++		encoded, err = json.Marshal(body)
++		if err != nil {
++			return nil, fmt.Errorf("%w: %s: encoding the request: %v", ErrInvalidRequest, operation, err)
++		}
++		reader = bytes.NewReader(encoded)
++	}
++
++	req, err := http.NewRequestWithContext(ctx, method, endpoint, reader)
++	if err != nil {
++		return nil, fmt.Errorf("%w: %s: %v", ErrInvalidRequest, operation, err)
++	}
++	req.Header.Set(sessionHeader, c.sessionID)
++	req.Header.Set("Accept", jsonContentType)
++	if body != nil {
++		req.Header.Set("Content-Type", jsonContentType)
++	}
++
++	resp, err := c.http.Do(req)
++	if err != nil {
++		return nil, fmt.Errorf("%s %s: %w", operation, method, err)
++	}
++	defer resp.Body.Close()
++	raw, _ := io.ReadAll(resp.Body)
++
++	if resp.StatusCode != wantStatus {
++		return nil, newAPIError(operation, resp.StatusCode, raw)
++	}
++	return raw, nil
++}
++
++func newAPIError(operation string, status int, raw []byte) *APIError {
++	e := &APIError{Operation: operation, Status: status, ErrorType: "ERROR"}
++	var parsed vapiError
++	if err := json.Unmarshal(raw, &parsed); err == nil {
++		if parsed.ErrorType != "" {
++			e.ErrorType = parsed.ErrorType
++		}
++		if len(parsed.Messages) > 0 {
++			e.Message = parsed.Messages[0].DefaultMessage
++		}
++	}
++	if e.Message == "" {
++		e.Message = fmt.Sprintf("the appliance answered HTTP %d", status)
++	}
++	return e
++}
++
++// ---------------------------------------------------------------------------
++// local validation
++// ---------------------------------------------------------------------------
++
++// hostBusAdapterTypes is the specification's
++// Vcenter.Vm.Hardware.Disk.HostBusAdapterType vocabulary.
++var hostBusAdapterTypes = map[string]bool{"IDE": true, "SCSI": true, "SATA": true, "NVME": true}
++
++func validate(cs ChangeSet) error {
++	if strings.TrimSpace(cs.VM) == "" {
++		return fmt.Errorf("%w: ChangeSet.VM is empty", ErrInvalidRequest)
++	}
++	if cs.Memory == nil && cs.CPU == nil && len(cs.Disks) == 0 {
++		return fmt.Errorf("%w: the change set requests no changes", ErrInvalidRequest)
++	}
++	if cs.Memory != nil && cs.Memory.empty() {
++		return fmt.Errorf("%w: MemoryChange sets no property", ErrInvalidRequest)
++	}
++	if cs.Memory != nil && cs.Memory.SizeMiB != nil && *cs.Memory.SizeMiB <= 0 {
++		return fmt.Errorf("%w: MemoryChange.SizeMiB must be positive", ErrInvalidRequest)
++	}
++	if cs.CPU != nil && cs.CPU.empty() {
++		return fmt.Errorf("%w: CPUChange sets no property", ErrInvalidRequest)
++	}
++	if cs.CPU != nil && cs.CPU.Count != nil && *cs.CPU.Count <= 0 {
++		return fmt.Errorf("%w: CPUChange.Count must be positive", ErrInvalidRequest)
++	}
++	if cs.CPU != nil && cs.CPU.CoresPerSocket != nil && *cs.CPU.CoresPerSocket <= 0 {
++		return fmt.Errorf("%w: CPUChange.CoresPerSocket must be positive", ErrInvalidRequest)
++	}
++	if cs.CPU != nil && cs.CPU.Count != nil && cs.CPU.CoresPerSocket != nil {
++		if *cs.CPU.Count%*cs.CPU.CoresPerSocket != 0 {
++			return fmt.Errorf("%w: CPUChange.Count %d is not a multiple of CoresPerSocket %d",
++				ErrInvalidRequest, *cs.CPU.Count, *cs.CPU.CoresPerSocket)
++		}
++	}
++	for i, d := range cs.Disks {
++		if d.Type != "" && !hostBusAdapterTypes[d.Type] {
++			return fmt.Errorf("%w: Disks[%d].Type %q is not an IDE, SCSI, SATA or NVME adapter",
++				ErrInvalidRequest, i, d.Type)
++		}
++		if d.NewVMDK == nil {
++			return fmt.Errorf("%w: Disks[%d] has no NewVMDK; this package only creates new backings",
++				ErrInvalidRequest, i)
++		}
++		if d.NewVMDK.CapacityBytes != nil && *d.NewVMDK.CapacityBytes <= 0 {
++			return fmt.Errorf("%w: Disks[%d].NewVMDK.CapacityBytes must be positive", ErrInvalidRequest, i)
++		}
++		if strings.HasSuffix(strings.ToLower(d.NewVMDK.Name), ".vmdk") {
++			return fmt.Errorf("%w: Disks[%d].NewVMDK.Name must not carry the .vmdk extension",
++				ErrInvalidRequest, i)
++		}
++		if d.SCSI != nil && d.Type != "" && d.Type != "SCSI" {
++			return fmt.Errorf("%w: Disks[%d] gives an SCSI address but asks for a %s adapter",
++				ErrInvalidRequest, i, d.Type)
++		}
++	}
++	return nil
++}
+diff --git a/vmreconfig/client_test.go b/vmreconfig/client_test.go
+new file mode 100644
+index 0000000..5cb300f
+--- /dev/null
++++ b/vmreconfig/client_test.go
+@@ -0,0 +1,598 @@
++package vmreconfig_test
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"net/http"
++	"reflect"
++	"strings"
++	"testing"
++
++	"vcf.local/vcenterchange/internal/vcmock"
++	"vcf.local/vcenterchange/vmreconfig"
++)
++
++func i64(v int64) *int64 { return &v }
++func b(v bool) *bool     { return &v }
++
++func newClient(t *testing.T, s *vcmock.Server) *vmreconfig.Client {
++	t.Helper()
++	c, err := vmreconfig.New(vmreconfig.Config{BaseURL: s.URL, SessionID: s.SessionID})
++	if err != nil {
++		t.Fatalf("New: %v", err)
++	}
++	return c
++}
++
++// statuses flattens a report into the per-step outcomes.
++func statuses(r vmreconfig.Report) []vmreconfig.StepStatus {
++	out := make([]vmreconfig.StepStatus, 0, len(r.Steps))
++	for _, s := range r.Steps {
++		out = append(out, s.Status)
++	}
++	return out
++}
++
++// bodyOf decodes the single request a given operation received.
++func bodyOf(t *testing.T, s *vcmock.Server, operation string) map[string]any {
++	t.Helper()
++	reqs := s.RequestsFor(operation)
++	if len(reqs) != 1 {
++		t.Fatalf("%s was called %d times, want once", operation, len(reqs))
++	}
++	obj, err := reqs[0].JSONBody()
++	if err != nil {
++		t.Fatalf("%s: %v", operation, err)
++	}
++	return obj
++}
++
++func TestNew(t *testing.T) {
++	tests := []struct {
++		name    string
++		cfg     vmreconfig.Config
++		wantErr bool
++	}{
++		{"ok", vmreconfig.Config{BaseURL: "https://vc.example.com", SessionID: "sid"}, false},
++		{"ok with trailing slash", vmreconfig.Config{BaseURL: "https://vc.example.com/", SessionID: "sid"}, false},
++		{"ok with explicit client", vmreconfig.Config{BaseURL: "http://vc.example.com", SessionID: "sid", HTTPClient: &http.Client{}}, false},
++		{"empty base url", vmreconfig.Config{SessionID: "sid"}, true},
++		{"blank base url", vmreconfig.Config{BaseURL: "   ", SessionID: "sid"}, true},
++		{"bad scheme", vmreconfig.Config{BaseURL: "ftp://vc.example.com", SessionID: "sid"}, true},
++		{"no host", vmreconfig.Config{BaseURL: "https://", SessionID: "sid"}, true},
++		{"empty session id", vmreconfig.Config{BaseURL: "https://vc.example.com"}, true},
++		{"blank session id", vmreconfig.Config{BaseURL: "https://vc.example.com", SessionID: "  "}, true},
++		{"session id with a line break", vmreconfig.Config{BaseURL: "https://vc.example.com", SessionID: "a\nb"}, true},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			got, err := vmreconfig.New(tc.cfg)
++			if tc.wantErr {
++				if err == nil {
++					t.Fatal("New: got nil error, want ErrInvalidRequest")
++				}
++				if !errors.Is(err, vmreconfig.ErrInvalidRequest) {
++					t.Errorf("New error %v does not match ErrInvalidRequest", err)
++				}
++				return
++			}
++			if err != nil {
++				t.Fatalf("New: unexpected error: %v", err)
++			}
++			if got == nil {
++				t.Fatal("New returned a nil client and a nil error")
++			}
++		})
++	}
++}
++
++func TestValidationRejectsBeforeSending(t *testing.T) {
++	tests := []struct {
++		name   string
++		change vmreconfig.ChangeSet
++	}{
++		{"no vm", vmreconfig.ChangeSet{CPU: &vmreconfig.CPUChange{Count: i64(2)}}},
++		{"blank vm", vmreconfig.ChangeSet{VM: "  ", CPU: &vmreconfig.CPUChange{Count: i64(2)}}},
++		{"nothing to change", vmreconfig.ChangeSet{VM: "vm-1"}},
++		{"memory change with no properties", vmreconfig.ChangeSet{VM: "vm-1", Memory: &vmreconfig.MemoryChange{}}},
++		{"cpu change with no properties", vmreconfig.ChangeSet{VM: "vm-1", CPU: &vmreconfig.CPUChange{}}},
++		{"non positive memory", vmreconfig.ChangeSet{VM: "vm-1", Memory: &vmreconfig.MemoryChange{SizeMiB: i64(0)}}},
++		{"non positive cpu count", vmreconfig.ChangeSet{VM: "vm-1", CPU: &vmreconfig.CPUChange{Count: i64(0)}}},
++		{"non positive cores per socket", vmreconfig.ChangeSet{VM: "vm-1", CPU: &vmreconfig.CPUChange{CoresPerSocket: i64(-1)}}},
++		{"count not a multiple of cores per socket", vmreconfig.ChangeSet{
++			VM:  "vm-1",
++			CPU: &vmreconfig.CPUChange{Count: i64(6), CoresPerSocket: i64(4)},
++		}},
++		{"adapter type outside the vocabulary", vmreconfig.ChangeSet{
++			VM:    "vm-1",
++			Disks: []vmreconfig.DiskChange{{Type: "USB", NewVMDK: &vmreconfig.NewVMDK{}}},
++		}},
++		{"disk without a new backing", vmreconfig.ChangeSet{
++			VM:    "vm-1",
++			Disks: []vmreconfig.DiskChange{{Type: "SCSI"}},
++		}},
++		{"non positive capacity", vmreconfig.ChangeSet{
++			VM:    "vm-1",
++			Disks: []vmreconfig.DiskChange{{NewVMDK: &vmreconfig.NewVMDK{CapacityBytes: i64(0)}}},
++		}},
++		{"vmdk name carrying the extension", vmreconfig.ChangeSet{
++			VM:    "vm-1",
++			Disks: []vmreconfig.DiskChange{{NewVMDK: &vmreconfig.NewVMDK{Name: "data-01.vmdk"}}},
++		}},
++		{"scsi address on a non scsi adapter", vmreconfig.ChangeSet{
++			VM: "vm-1",
++			Disks: []vmreconfig.DiskChange{{
++				Type:    "SATA",
++				SCSI:    &vmreconfig.SCSIAddress{Bus: 0},
++				NewVMDK: &vmreconfig.NewVMDK{},
++			}},
++		}},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			s := vcmock.New(t, vcmock.Config{})
++			client := newClient(t, s)
++			report, err := client.Apply(context.Background(), tc.change)
++			if err == nil {
++				t.Fatal("Apply: got nil error, want ErrInvalidRequest")
++			}
++			if !errors.Is(err, vmreconfig.ErrInvalidRequest) {
++				t.Errorf("Apply error %v does not match ErrInvalidRequest", err)
++			}
++			if len(s.Requests()) != 0 {
++				t.Errorf("an invalid change set reached the wire with %d requests", len(s.Requests()))
++			}
++			if len(report.Steps) != 0 {
++				t.Errorf("a rejected change set reported %d steps, want none", len(report.Steps))
++			}
++		})
++	}
++}
++
++func TestRequestBodiesOmitUnsetOptionalProperties(t *testing.T) {
++	tests := []struct {
++		name      string
++		change    vmreconfig.ChangeSet
++		operation string
++		want      map[string]any
++	}{
++		{
++			name:      "memory size alone",
++			change:    vmreconfig.ChangeSet{VM: "vm-1", Memory: &vmreconfig.MemoryChange{SizeMiB: i64(8192)}},
++			operation: "Vcenter.Vm.Hardware.Memory_update",
++			want:      map[string]any{"size_mib": float64(8192)},
++		},
++		{
++			name: "memory hot add alone",
++			change: vmreconfig.ChangeSet{
++				VM:     "vm-1",
++				Memory: &vmreconfig.MemoryChange{HotAddEnabled: b(true)},
++			},
++			operation: "Vcenter.Vm.Hardware.Memory_update",
++			want:      map[string]any{"hot_add_enabled": true},
++		},
++		{
++			name: "memory hot add explicitly false",
++			change: vmreconfig.ChangeSet{
++				VM:     "vm-1",
++				Memory: &vmreconfig.MemoryChange{HotAddEnabled: b(false)},
++			},
++			operation: "Vcenter.Vm.Hardware.Memory_update",
++			want:      map[string]any{"hot_add_enabled": false},
++		},
++		{
++			name:      "cpu count alone",
++			change:    vmreconfig.ChangeSet{VM: "vm-1", CPU: &vmreconfig.CPUChange{Count: i64(8)}},
++			operation: "Vcenter.Vm.Hardware.Cpu_update",
++			want:      map[string]any{"count": float64(8)},
++		},
++		{
++			name: "every cpu property",
++			change: vmreconfig.ChangeSet{VM: "vm-1", CPU: &vmreconfig.CPUChange{
++				Count:            i64(8),
++				CoresPerSocket:   i64(2),
++				HotAddEnabled:    b(true),
++				HotRemoveEnabled: b(false),
++			}},
++			operation: "Vcenter.Vm.Hardware.Cpu_update",
++			want: map[string]any{
++				"count": float64(8), "cores_per_socket": float64(2),
++				"hot_add_enabled": true, "hot_remove_enabled": false,
++			},
++		},
++		{
++			name: "disk with only a capacity",
++			change: vmreconfig.ChangeSet{VM: "vm-1", Disks: []vmreconfig.DiskChange{{
++				NewVMDK: &vmreconfig.NewVMDK{CapacityBytes: i64(1073741824)},
++			}}},
++			operation: "Vcenter.Vm.Hardware.Disk_create",
++			want:      map[string]any{"new_vmdk": map[string]any{"capacity": float64(1073741824)}},
++		},
++		{
++			name: "disk on scsi bus zero",
++			change: vmreconfig.ChangeSet{VM: "vm-1", Disks: []vmreconfig.DiskChange{{
++				Type:    "SCSI",
++				SCSI:    &vmreconfig.SCSIAddress{Bus: 0},
++				NewVMDK: &vmreconfig.NewVMDK{Name: "data-01"},
++			}}},
++			operation: "Vcenter.Vm.Hardware.Disk_create",
++			want: map[string]any{
++				"type":     "SCSI",
++				"scsi":     map[string]any{"bus": float64(0)},
++				"new_vmdk": map[string]any{"name": "data-01"},
++			},
++		},
++		{
++			name: "disk on scsi bus one unit three",
++			change: vmreconfig.ChangeSet{VM: "vm-1", Disks: []vmreconfig.DiskChange{{
++				Type:    "SCSI",
++				SCSI:    &vmreconfig.SCSIAddress{Bus: 1, Unit: i64(3)},
++				NewVMDK: &vmreconfig.NewVMDK{Name: "data-02", CapacityBytes: i64(2147483648)},
++			}}},
++			operation: "Vcenter.Vm.Hardware.Disk_create",
++			want: map[string]any{
++				"type":     "SCSI",
++				"scsi":     map[string]any{"bus": float64(1), "unit": float64(3)},
++				"new_vmdk": map[string]any{"name": "data-02", "capacity": float64(2147483648)},
++			},
++		},
++		{
++			name: "nvme disk carries no scsi address",
++			change: vmreconfig.ChangeSet{VM: "vm-1", Disks: []vmreconfig.DiskChange{{
++				Type:    "NVME",
++				NewVMDK: &vmreconfig.NewVMDK{CapacityBytes: i64(1073741824)},
++			}}},
++			operation: "Vcenter.Vm.Hardware.Disk_create",
++			want: map[string]any{
++				"type":     "NVME",
++				"new_vmdk": map[string]any{"capacity": float64(1073741824)},
++			},
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			s := vcmock.New(t, vcmock.Config{})
++			client := newClient(t, s)
++			if _, err := client.Apply(context.Background(), tc.change); err != nil {
++				t.Fatalf("Apply: unexpected error: %v", err)
++			}
++			if got := bodyOf(t, s, tc.operation); !reflect.DeepEqual(got, tc.want) {
++				gotJSON, _ := json.Marshal(got)
++				wantJSON, _ := json.Marshal(tc.want)
++				t.Errorf("%s body:\n got: %s\nwant: %s", tc.operation, gotJSON, wantJSON)
++			}
++		})
++	}
++}
++
++func TestHeadersAndRouting(t *testing.T) {
++	s := vcmock.New(t, vcmock.Config{})
++	client := newClient(t, s)
++	if _, err := client.Apply(context.Background(), vmreconfig.ChangeSet{
++		VM:                "vm-42",
++		Memory:            &vmreconfig.MemoryChange{SizeMiB: i64(4096)},
++		RestorePowerState: true,
++	}); err != nil {
++		t.Fatalf("Apply: unexpected error: %v", err)
++	}
++
++	for _, r := range s.Requests() {
++		if r.OperationID == "" {
++			t.Errorf("request %d (%s %s) matched no contract operation", r.Seq, r.Method, r.Path)
++		}
++		if got := r.Header.Get("vmware-api-session-id"); got != s.SessionID {
++			t.Errorf("request %d: session header = %q, want %q", r.Seq, got, s.SessionID)
++		}
++		if got := r.Header.Get("Accept"); !strings.Contains(got, "application/json") {
++			t.Errorf("request %d: Accept = %q", r.Seq, got)
++		}
++		if !strings.HasPrefix(r.Path, "/api/vcenter/vm/vm-42/") {
++			t.Errorf("request %d: path = %q, want it under /api/vcenter/vm/vm-42/", r.Seq, r.Path)
++		}
++		hasBody := len(r.Body) > 0
++		ct := r.Header.Get("Content-Type")
++		if hasBody && !strings.HasPrefix(ct, "application/json") {
++			t.Errorf("request %d carries a body with Content-Type %q", r.Seq, ct)
++		}
++		if !hasBody && ct != "" {
++			t.Errorf("request %d carries no body but sends Content-Type %q", r.Seq, ct)
++		}
++	}
++}
++
++func TestPowerSequencing(t *testing.T) {
++	tests := []struct {
++		name             string
++		initial          string
++		restore          bool
++		change           vmreconfig.ChangeSet
++		wantStatuses     []vmreconfig.StepStatus
++		wantStops        int
++		wantStarts       int
++		wantFinalPowered string
++	}{
++		{
++			name:    "powered on, restore requested",
++			initial: vcmock.PoweredOn,
++			restore: true,
++			change:  vmreconfig.ChangeSet{VM: "vm-1", CPU: &vmreconfig.CPUChange{Count: i64(2)}},
++			wantStatuses: []vmreconfig.StepStatus{
++				vmreconfig.StepApplied, vmreconfig.StepSkipped, vmreconfig.StepApplied, vmreconfig.StepApplied,
++			},
++			wantStops: 1, wantStarts: 1, wantFinalPowered: vcmock.PoweredOn,
++		},
++		{
++			name:    "powered on, restore not requested",
++			initial: vcmock.PoweredOn,
++			change:  vmreconfig.ChangeSet{VM: "vm-1", CPU: &vmreconfig.CPUChange{Count: i64(2)}},
++			wantStatuses: []vmreconfig.StepStatus{
++				vmreconfig.StepApplied, vmreconfig.StepSkipped, vmreconfig.StepApplied, vmreconfig.StepSkipped,
++			},
++			wantStops: 1, wantStarts: 0, wantFinalPowered: vcmock.PoweredOff,
++		},
++		{
++			name:    "already powered off",
++			initial: vcmock.PoweredOff,
++			restore: true,
++			change:  vmreconfig.ChangeSet{VM: "vm-1", CPU: &vmreconfig.CPUChange{Count: i64(2)}},
++			wantStatuses: []vmreconfig.StepStatus{
++				vmreconfig.StepSkipped, vmreconfig.StepSkipped, vmreconfig.StepApplied, vmreconfig.StepSkipped,
++			},
++			wantStops: 0, wantStarts: 0, wantFinalPowered: vcmock.PoweredOff,
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			s := vcmock.New(t, vcmock.Config{InitialPowerState: tc.initial})
++			client := newClient(t, s)
++			cs := tc.change
++			cs.RestorePowerState = tc.restore
++			report, err := client.Apply(context.Background(), cs)
++			if err != nil {
++				t.Fatalf("Apply: unexpected error: %v", err)
++			}
++			if got := statuses(report); !reflect.DeepEqual(got, tc.wantStatuses) {
++				t.Errorf("step statuses = %v, want %v", got, tc.wantStatuses)
++			}
++			if got := len(s.RequestsFor("Vcenter.Vm.Power_stop")); got != tc.wantStops {
++				t.Errorf("Power_stop calls = %d, want %d", got, tc.wantStops)
++			}
++			if got := len(s.RequestsFor("Vcenter.Vm.Power_start")); got != tc.wantStarts {
++				t.Errorf("Power_start calls = %d, want %d", got, tc.wantStarts)
++			}
++			if report.FinalPowerState != tc.wantFinalPowered {
++				t.Errorf("FinalPowerState = %q, want %q", report.FinalPowerState, tc.wantFinalPowered)
++			}
++			if report.InitialPowerState != tc.initial {
++				t.Errorf("InitialPowerState = %q, want %q", report.InitialPowerState, tc.initial)
++			}
++		})
++	}
++}
++
++func TestAlreadyInDesiredStateIsASkip(t *testing.T) {
++	s := vcmock.New(t, vcmock.Config{PowerStopAlreadyOff: true})
++	client := newClient(t, s)
++
++	report, err := client.Apply(context.Background(), vmreconfig.ChangeSet{
++		VM:     "vm-1",
++		Memory: &vmreconfig.MemoryChange{SizeMiB: i64(4096)},
++	})
++	if err != nil {
++		t.Fatalf("Apply: unexpected error: %v", err)
++	}
++	if got, want := statuses(report), []vmreconfig.StepStatus{
++		vmreconfig.StepSkipped, vmreconfig.StepApplied, vmreconfig.StepSkipped, vmreconfig.StepSkipped,
++	}; !reflect.DeepEqual(got, want) {
++		t.Errorf("step statuses = %v, want %v", got, want)
++	}
++	if report.Steps[0].Err != nil {
++		t.Errorf("a skipped stop carries Err %v, want nil", report.Steps[0].Err)
++	}
++}
++
++func TestPartialApplicationIsReported(t *testing.T) {
++	tests := []struct {
++		name         string
++		failure      vcmock.Failure
++		change       vmreconfig.ChangeSet
++		wantStatuses []vmreconfig.StepStatus
++		wantApplied  []string
++		wantDiskIDs  []string
++		wantFinal    string
++	}{
++		{
++			name: "memory fails, cpu and disk never run",
++			failure: vcmock.Failure{
++				Operation: "Vcenter.Vm.Hardware.Memory_update",
++				Status:    http.StatusBadRequest,
++				ErrorType: "NOT_ALLOWED_IN_CURRENT_STATE",
++				Message:   "Memory may only be resized while the virtual machine is powered off.",
++			},
++			change: vmreconfig.ChangeSet{
++				VM:                "vm-1",
++				Memory:            &vmreconfig.MemoryChange{SizeMiB: i64(8192)},
++				CPU:               &vmreconfig.CPUChange{Count: i64(4)},
++				Disks:             []vmreconfig.DiskChange{{NewVMDK: &vmreconfig.NewVMDK{CapacityBytes: i64(1024)}}},
++				RestorePowerState: true,
++			},
++			wantStatuses: []vmreconfig.StepStatus{
++				vmreconfig.StepApplied, vmreconfig.StepFailed,
++				vmreconfig.StepNotAttempted, vmreconfig.StepNotAttempted, vmreconfig.StepNotAttempted,
++			},
++			wantApplied: []string{"Vcenter.Vm.Power_stop"},
++			wantDiskIDs: []string{},
++			wantFinal:   vcmock.PoweredOff,
++		},
++		{
++			name: "the second disk fails",
++			failure: vcmock.Failure{
++				Operation:  "Vcenter.Vm.Hardware.Disk_create",
++				Occurrence: 2,
++				Status:     http.StatusBadRequest,
++				ErrorType:  "UNABLE_TO_ALLOCATE_RESOURCE",
++				Message:    "Datastore ds-01 is full.",
++			},
++			change: vmreconfig.ChangeSet{
++				VM:     "vm-1",
++				Memory: &vmreconfig.MemoryChange{SizeMiB: i64(8192)},
++				Disks: []vmreconfig.DiskChange{
++					{NewVMDK: &vmreconfig.NewVMDK{CapacityBytes: i64(1024)}},
++					{NewVMDK: &vmreconfig.NewVMDK{CapacityBytes: i64(2048)}},
++				},
++				RestorePowerState: true,
++			},
++			wantStatuses: []vmreconfig.StepStatus{
++				vmreconfig.StepApplied, vmreconfig.StepApplied, vmreconfig.StepSkipped,
++				vmreconfig.StepApplied, vmreconfig.StepFailed, vmreconfig.StepNotAttempted,
++			},
++			wantApplied: []string{
++				"Vcenter.Vm.Power_stop",
++				"Vcenter.Vm.Hardware.Memory_update",
++				"Vcenter.Vm.Hardware.Disk_create",
++			},
++			wantDiskIDs: []string{"2000"},
++			wantFinal:   vcmock.PoweredOff,
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			s := vcmock.New(t, vcmock.Config{Failures: []vcmock.Failure{tc.failure}})
++			client := newClient(t, s)
++
++			report, err := client.Apply(context.Background(), tc.change)
++			if err == nil {
++				t.Fatal("Apply: got nil error, want the injected failure")
++			}
++			if !errors.Is(err, vmreconfig.ErrAPI) {
++				t.Errorf("Apply error %v does not match ErrAPI", err)
++			}
++			var apiErr *vmreconfig.APIError
++			if !errors.As(err, &apiErr) {
++				t.Fatalf("Apply error %v is not an *APIError", err)
++			}
++			if apiErr.Operation != tc.failure.Operation {
++				t.Errorf("APIError.Operation = %q, want %q", apiErr.Operation, tc.failure.Operation)
++			}
++			if apiErr.ErrorType != tc.failure.ErrorType {
++				t.Errorf("APIError.ErrorType = %q, want %q", apiErr.ErrorType, tc.failure.ErrorType)
++			}
++			if apiErr.Message != tc.failure.Message {
++				t.Errorf("APIError.Message = %q, want the appliance message %q", apiErr.Message, tc.failure.Message)
++			}
++
++			if got := statuses(report); !reflect.DeepEqual(got, tc.wantStatuses) {
++				t.Errorf("step statuses = %v, want %v", got, tc.wantStatuses)
++			}
++			if got := report.Applied(); !reflect.DeepEqual(got, tc.wantApplied) {
++				t.Errorf("Applied() = %v, want %v", got, tc.wantApplied)
++			}
++			if got := report.CreatedDiskIDs; !reflect.DeepEqual(got, tc.wantDiskIDs) {
++				t.Errorf("CreatedDiskIDs = %v, want %v", got, tc.wantDiskIDs)
++			}
++			if report.FinalPowerState != tc.wantFinal {
++				t.Errorf("FinalPowerState = %q, want %q", report.FinalPowerState, tc.wantFinal)
++			}
++			if len(s.RequestsFor("Vcenter.Vm.Power_start")) != 0 {
++				t.Error("Power_start reached the wire behind a failed step")
++			}
++			failed, ok := report.Failed()
++			if !ok {
++				t.Fatal("Report.Failed() found no failed step")
++			}
++			if failed.Operation != tc.failure.Operation {
++				t.Errorf("failed step = %q, want %q", failed.Operation, tc.failure.Operation)
++			}
++			for i, step := range report.Steps {
++				if step.Detail == "" {
++					t.Errorf("step %d (%s) has no Detail", i, step.Operation)
++				}
++				if step.Status != vmreconfig.StepFailed && step.Err != nil {
++					t.Errorf("step %d (%s) is %s but carries Err", i, step.Operation, step.Status)
++				}
++			}
++		})
++	}
++}
++
++func TestDiskIdentifiersAreCollectedInOrder(t *testing.T) {
++	s := vcmock.New(t, vcmock.Config{DiskIDs: []string{"2000", "2001", "2002"}})
++	client := newClient(t, s)
++
++	report, err := client.Apply(context.Background(), vmreconfig.ChangeSet{
++		VM: "vm-1",
++		Disks: []vmreconfig.DiskChange{
++			{NewVMDK: &vmreconfig.NewVMDK{Name: "a", CapacityBytes: i64(1024)}},
++			{NewVMDK: &vmreconfig.NewVMDK{Name: "b", CapacityBytes: i64(2048)}},
++			{NewVMDK: &vmreconfig.NewVMDK{Name: "c", CapacityBytes: i64(4096)}},
++		},
++	})
++	if err != nil {
++		t.Fatalf("Apply: unexpected error: %v", err)
++	}
++	if got, want := report.CreatedDiskIDs, []string{"2000", "2001", "2002"}; !reflect.DeepEqual(got, want) {
++		t.Errorf("CreatedDiskIDs = %v, want %v", got, want)
++	}
++	// Each disk was sent as its own request, in the order the change set gave.
++	reqs := s.RequestsFor("Vcenter.Vm.Hardware.Disk_create")
++	if len(reqs) != 3 {
++		t.Fatalf("Disk_create calls = %d, want 3", len(reqs))
++	}
++	for i, wantName := range []string{"a", "b", "c"} {
++		obj, err := reqs[i].JSONBody()
++		if err != nil {
++			t.Fatalf("disk %d: %v", i, err)
++		}
++		vmdk, _ := obj["new_vmdk"].(map[string]any)
++		if vmdk["name"] != wantName {
++			t.Errorf("disk %d name = %v, want %q", i, vmdk["name"], wantName)
++		}
++	}
++}
++
++func TestUnauthorizedSessionIsReportedAsAnAPIError(t *testing.T) {
++	s := vcmock.New(t, vcmock.Config{})
++	client, err := vmreconfig.New(vmreconfig.Config{BaseURL: s.URL, SessionID: "not-the-session"})
++	if err != nil {
++		t.Fatalf("New: %v", err)
++	}
++	_, err = client.Apply(context.Background(), vmreconfig.ChangeSet{
++		VM:  "vm-1",
++		CPU: &vmreconfig.CPUChange{Count: i64(2)},
++	})
++	if err == nil {
++		t.Fatal("Apply: got nil error, want an authentication failure")
++	}
++	var apiErr *vmreconfig.APIError
++	if !errors.As(err, &apiErr) {
++		t.Fatalf("Apply error %v is not an *APIError", err)
++	}
++	if apiErr.Status != http.StatusUnauthorized {
++		t.Errorf("APIError.Status = %d, want 401", apiErr.Status)
++	}
++	if apiErr.Operation != "Vcenter.Vm.Power_get" {
++		t.Errorf("APIError.Operation = %q, want the preflight Vcenter.Vm.Power_get", apiErr.Operation)
++	}
++}
++
++func TestCancelledContextStopsBeforeTheFirstRequest(t *testing.T) {
++	s := vcmock.New(t, vcmock.Config{})
++	client := newClient(t, s)
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++
++	if _, err := client.Apply(ctx, vmreconfig.ChangeSet{
++		VM:  "vm-1",
++		CPU: &vmreconfig.CPUChange{Count: i64(2)},
++	}); err == nil {
++		t.Fatal("Apply: got nil error on a cancelled context")
++	}
++	if got := len(s.Requests()); got != 0 {
++		t.Errorf("a cancelled context still sent %d requests", got)
++	}
++}
+diff --git a/vmreconfig/doc.go b/vmreconfig/doc.go
+index 9de6cd3..62dc884 100644
+--- a/vmreconfig/doc.go
++++ b/vmreconfig/doc.go
+@@ -21,8 +21,4 @@
+ // most implementations is contract.omitEmptyRule: a property the caller did not
+ // set must be absent from the serialized request, not present and empty, all
+ // the way down through nested objects.
+-//
+-// This package is a stub. Implement Config, Client, New, the change types, the
+-// report types, APIError, Apply and the error sentinels, and add table-driven
+-// tests alongside them.
+ package vmreconfig

@@ -1,0 +1,477 @@
+diff --git a/vcf_onboard/__main__.py b/vcf_onboard/__main__.py
+index 1110ca3..753f1ef 100644
+--- a/vcf_onboard/__main__.py
++++ b/vcf_onboard/__main__.py
+@@ -1,13 +1,88 @@
+-"""Command line entry point: python3 -m vcf_onboard ...
++"""Command line entry point: python3 -m vcf_onboard ..."""
+ 
+-Not implemented yet. See README.md.
+-"""
++from __future__ import annotations
+ 
++import argparse
++import json
++import os
+ import sys
+ 
++from .client import SddcManagerClient
++from .workflow import Onboarding
++
++EXIT_OK = 0
++EXIT_USAGE = 1
++EXIT_CHANGE_FAILED = 2
++
++
++class ExitOneArgumentParser(argparse.ArgumentParser):
++    """Use the command's documented status for invalid command-line usage."""
++
++    def error(self, message):
++        self.print_usage(sys.stderr)
++        self.exit(EXIT_USAGE, "%s: error: %s\n" % (self.prog, message))
++
++
++def parse_args(argv):
++    parser = ExitOneArgumentParser(
++        prog="vcf_onboard",
++        description="Create a network pool and commission hosts on VCF 9.0 SDDC Manager")
++    parser.add_argument("--base-url", required=True,
++                        help="SDDC Manager base URL, for example https://sddc.rainpole.io")
++    parser.add_argument("--plan", required=True, help="Path to the onboarding plan JSON")
++    parser.add_argument("--report", required=True, help="Path to write the run report to")
++    parser.add_argument("--poll-interval", type=float, default=10.0,
++                        help="Seconds between getTask polls (default: 10)")
++    parser.add_argument("--poll-timeout", type=float, default=3600.0,
++                        help="Seconds to wait for the task to settle (default: 3600)")
++    return parser.parse_args(argv)
++
+ 
+ def main(argv=None):
+-    raise NotImplementedError("vcf_onboard is not implemented yet")
++    args = parse_args(sys.argv[1:] if argv is None else argv)
++
++    username = os.environ.get("VCF_SDDC_USERNAME")
++    password = os.environ.get("VCF_SDDC_PASSWORD")
++    if not username or not password:
++        print("VCF_SDDC_USERNAME and VCF_SDDC_PASSWORD must be set", file=sys.stderr)
++        return EXIT_USAGE
++    if args.poll_interval <= 0 or args.poll_timeout <= 0:
++        print("--poll-interval and --poll-timeout must be positive", file=sys.stderr)
++        return EXIT_USAGE
++    try:
++        with open(args.plan, encoding="utf-8") as fh:
++            plan = json.load(fh)
++    except (OSError, ValueError) as exc:
++        print("Cannot read the plan %s: %s" % (args.plan, exc), file=sys.stderr)
++        return EXIT_USAGE
++
++    client = SddcManagerClient(args.base_url)
++    onboarding = Onboarding(client, plan, args.base_url,
++                            poll_interval=args.poll_interval,
++                            poll_timeout=args.poll_timeout)
++    report = onboarding.run(username, password)
++
++    report_dir = os.path.dirname(os.path.abspath(args.report))
++    if report_dir:
++        os.makedirs(report_dir, exist_ok=True)
++    with open(args.report, "w", encoding="utf-8") as fh:
++        json.dump(report, fh, indent=2)
++        fh.write("\n")
++
++    if report["overallStatus"] == "SUCCEEDED":
++        print("Onboarding completed: %d change(s) applied"
++              % len(report["completedChanges"]))
++        return EXIT_OK
++
++    failure = report["failure"]
++    print("Onboarding stopped at %s: %s" % (failure["step"], failure["message"]),
++          file=sys.stderr)
++    for change in report["completedChanges"]:
++        print("  already applied: %s" % json.dumps(change, sort_keys=True), file=sys.stderr)
++    for host in report["hosts"]:
++        print("  host %s: %s" % (host["fqdn"], host["status"]), file=sys.stderr)
++    print("Report written to %s" % args.report, file=sys.stderr)
++    return EXIT_CHANGE_FAILED
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/vcf_onboard/client.py b/vcf_onboard/client.py
+new file mode 100644
+index 0000000..7b36155
+--- /dev/null
++++ b/vcf_onboard/client.py
+@@ -0,0 +1,101 @@
++"""Minimal SDDC Manager REST client for the operations named in docs/contract.json."""
++
++from __future__ import annotations
++
++import json
++import urllib.error
++import urllib.request
++
++JSON_MEDIA_TYPE = "application/json"
++
++
++class ApiError(Exception):
++    """An SDDC Manager error response, or a transport failure, for one operation."""
++
++    def __init__(self, operation_id, message, http_status=None, error_code=None):
++        super().__init__(message)
++        self.operation_id = operation_id
++        self.message = message
++        self.http_status = http_status
++        self.error_code = error_code
++
++
++class SddcManagerClient:
++    def __init__(self, base_url, timeout=60.0):
++        self.base_url = base_url.rstrip("/")
++        self.timeout = timeout
++        self._access_token = None
++
++    # -- transport ---------------------------------------------------------
++    def _call(self, operation_id, method, path, body=None, authenticated=True):
++        data = None
++        headers = {"Accept": JSON_MEDIA_TYPE, "Content-Type": JSON_MEDIA_TYPE}
++        if body is not None:
++            data = json.dumps(body).encode("utf-8")
++        if authenticated:
++            if not self._access_token:
++                raise ApiError(operation_id, "No access token has been obtained yet")
++            headers["Authorization"] = "Bearer " + self._access_token
++        request = urllib.request.Request(self.base_url + path, data=data, headers=headers,
++                                         method=method)
++        try:
++            with urllib.request.urlopen(request, timeout=self.timeout) as response:
++                raw = response.read()
++                return response.status, (json.loads(raw.decode("utf-8")) if raw else None)
++        except urllib.error.HTTPError as exc:
++            raw = exc.read()
++            payload = {}
++            try:
++                payload = json.loads(raw.decode("utf-8")) if raw else {}
++            except ValueError:
++                payload = {}
++            message = payload.get("message") or ("HTTP %d from %s" % (exc.code, path))
++            raise ApiError(operation_id, message, http_status=exc.code,
++                           error_code=payload.get("errorCode")) from None
++        except urllib.error.URLError as exc:
++            raise ApiError(operation_id,
++                           "Cannot reach %s: %s" % (self.base_url, exc.reason)) from None
++
++    # -- operations --------------------------------------------------------
++    def create_token(self, username, password):
++        """createToken -- POST /v1/tokens.
++
++        Only the credential fields in use are sent; apiKey and idToken stay off the wire.
++        """
++        _status, payload = self._call("createToken", "POST", "/v1/tokens",
++                                      body={"username": username, "password": password},
++                                      authenticated=False)
++        token = (payload or {}).get("accessToken")
++        if not token:
++            raise ApiError("createToken", "The token pair carries no accessToken")
++        self._access_token = token
++        return payload
++
++    def create_network_pool(self, network_pool):
++        """createNetworkPool -- POST /v1/network-pools."""
++        _status, payload = self._call("createNetworkPool", "POST", "/v1/network-pools",
++                                      body=network_pool)
++        return payload
++
++    def add_ip_pool(self, network_pool_id, network_id, start, end):
++        """addIpPoolToNetworkOfNetworkPool -- POST .../networks/{networkId}/ip-pools."""
++        path = "/v1/network-pools/%s/networks/%s/ip-pools" % (network_pool_id, network_id)
++        _status, payload = self._call("addIpPoolToNetworkOfNetworkPool", "POST", path,
++                                      body={"start": start, "end": end})
++        return payload
++
++    def validate_host_commission_specs(self, specs):
++        """validateHostCommissionSpec -- POST /v1/hosts/validations."""
++        _status, payload = self._call("validateHostCommissionSpec", "POST",
++                                      "/v1/hosts/validations", body=specs)
++        return payload
++
++    def commission_hosts(self, specs):
++        """commissionHosts -- POST /v1/hosts."""
++        _status, payload = self._call("commissionHosts", "POST", "/v1/hosts", body=specs)
++        return payload
++
++    def get_task(self, task_id):
++        """getTask -- GET /v1/tasks/{id}."""
++        _status, payload = self._call("getTask", "GET", "/v1/tasks/%s" % task_id)
++        return payload
+diff --git a/vcf_onboard/workflow.py b/vcf_onboard/workflow.py
+new file mode 100644
+index 0000000..b1172a6
+--- /dev/null
++++ b/vcf_onboard/workflow.py
+@@ -0,0 +1,267 @@
++"""The onboarding change itself, and the report that records what it actually did."""
++
++from __future__ import annotations
++
++import time
++
++from .client import ApiError
++
++SCHEMA_VERSION = "vcf-onboard/report/1"
++
++STEPS = [
++    ("authenticate", "createToken"),
++    ("create_network_pool", "createNetworkPool"),
++    ("add_ip_pool", "addIpPoolToNetworkOfNetworkPool"),
++    ("validate_hosts", "validateHostCommissionSpec"),
++    ("commission_hosts", "commissionHosts"),
++]
++
++# HostCommissionSpec: required first, then the optional fields, which are only ever
++# written when the plan supplies them.
++HOST_REQUIRED = ("fqdn", "username", "password", "storageType")
++HOST_OPTIONAL = ("vvolStorageProtocolType", "networkPoolName", "sshThumbprint",
++                 "sslThumbprint")
++
++# Network properties SDDC Manager assigns; a create request must not echo them back.
++NETWORK_SERVER_ASSIGNED = ("id", "freeIps", "usedIps")
++NETWORK_POOL_SERVER_ASSIGNED = ("id", "hostsCount")
++
++TERMINAL_TASK_STATUSES = {"SUCCESSFUL", "FAILED", "CANCELLED"}
++FAILED_TASK_STATUSES = {"FAILED", "CANCELLED"}
++
++
++class StepFailure(Exception):
++    """A step did not land. Everything before it stays as it is."""
++
++    def __init__(self, message, error_code=None, http_status=None, task_id=None):
++        super().__init__(message)
++        self.message = message
++        self.error_code = error_code
++        self.http_status = http_status
++        self.task_id = task_id
++
++
++def _without(mapping, forbidden):
++    return {k: v for k, v in mapping.items() if k not in forbidden}
++
++
++def build_network_pool_body(plan_pool):
++    """The NetworkPool create body: the plan's shape minus server assigned fields."""
++    networks = []
++    for network in plan_pool["networks"]:
++        entry = _without(network, NETWORK_SERVER_ASSIGNED)
++        # An empty ipPools list means "no IP pools", which is expressed by leaving the
++        # optional property out entirely.
++        if not entry.get("ipPools"):
++            entry.pop("ipPools", None)
++        networks.append(entry)
++    body = _without(plan_pool, NETWORK_POOL_SERVER_ASSIGNED)
++    body["networks"] = networks
++    return body
++
++
++def build_host_specs(plan_hosts, network_pool_id):
++    """HostCommissionSpec items. An optional field with no value is left out."""
++    specs = []
++    for host in plan_hosts:
++        spec = {field: host[field] for field in HOST_REQUIRED}
++        spec["networkPoolId"] = network_pool_id
++        for field in HOST_OPTIONAL:
++            value = host.get(field)
++            if value:
++                spec[field] = value
++        specs.append(spec)
++    return specs
++
++
++class Onboarding:
++    def __init__(self, client, plan, base_url, poll_interval=10.0, poll_timeout=3600.0,
++                 sleep=time.sleep, monotonic=time.monotonic):
++        self.client = client
++        self.plan = plan
++        self.base_url = base_url
++        self.poll_interval = poll_interval
++        self.poll_timeout = poll_timeout
++        self._sleep = sleep
++        self._monotonic = monotonic
++        self.steps = [{"name": name, "operationId": operation_id,
++                       "status": "NOT_ATTEMPTED", "details": {}}
++                      for name, operation_id in STEPS]
++        self.hosts = []
++        self.completed_changes = []
++        self.failure = None
++
++    # -- helpers -----------------------------------------------------------
++    def _step(self, name):
++        return next(step for step in self.steps if step["name"] == name)
++
++    def _record_failure(self, name, exc):
++        step = self._step(name)
++        step["status"] = "FAILED"
++        failure = {"step": name, "operationId": step["operationId"],
++                   "message": exc.message}
++        if getattr(exc, "error_code", None):
++            failure["errorCode"] = exc.error_code
++        if getattr(exc, "http_status", None):
++            failure["httpStatus"] = exc.http_status
++        if getattr(exc, "task_id", None):
++            failure["taskId"] = exc.task_id
++        self.failure = failure
++
++    # -- steps -------------------------------------------------------------
++    def _authenticate(self, username, password):
++        self.client.create_token(username, password)
++        self._step("authenticate")["status"] = "SUCCEEDED"
++
++    def _create_network_pool(self):
++        plan_pool = self.plan["networkPool"]
++        pool = self.client.create_network_pool(build_network_pool_body(plan_pool))
++        pool_id = (pool or {}).get("id")
++        if not pool_id:
++            raise StepFailure("createNetworkPool returned no network pool id")
++        network_ids = {}
++        for network in pool.get("networks") or []:
++            if network.get("type") and network.get("id"):
++                network_ids[network["type"]] = network["id"]
++        step = self._step("create_network_pool")
++        step["status"] = "SUCCEEDED"
++        step["details"] = {"networkPoolId": pool_id,
++                           "networkPoolName": pool.get("name"),
++                           "networkIds": network_ids}
++        self.completed_changes.append({"kind": "NETWORK_POOL", "id": pool_id,
++                                       "name": pool.get("name")})
++        return pool_id, network_ids
++
++    def _add_ip_pool(self, pool_id, network_ids):
++        wanted = self.plan["additionalIpPool"]
++        network_id = network_ids.get(wanted["networkType"])
++        if not network_id:
++            raise StepFailure("The created pool has no %s network to attach an IP pool to"
++                              % wanted["networkType"])
++        self.client.add_ip_pool(pool_id, network_id, wanted["start"], wanted["end"])
++        step = self._step("add_ip_pool")
++        step["status"] = "SUCCEEDED"
++        step["details"] = {"networkPoolId": pool_id, "networkId": network_id,
++                           "start": wanted["start"], "end": wanted["end"]}
++        self.completed_changes.append({"kind": "IP_POOL", "networkPoolId": pool_id,
++                                       "networkId": network_id, "start": wanted["start"],
++                                       "end": wanted["end"]})
++
++    def _validate_hosts(self, specs):
++        validation = self.client.validate_host_commission_specs(specs) or {}
++        checks = validation.get("validationChecks") or []
++        warnings = [check.get("description") for check in checks
++                    if check.get("severity") == "WARNING"]
++        step = self._step("validate_hosts")
++        step["details"] = {"validationId": validation.get("id"),
++                           "executionStatus": validation.get("executionStatus"),
++                           "resultStatus": validation.get("resultStatus"),
++                           "warnings": warnings}
++        if validation.get("resultStatus") == "FAILED":
++            step["status"] = "FAILED"
++            raise StepFailure("Host commission validation failed: %s"
++                              % (validation.get("description") or validation.get("id")))
++        step["status"] = "SUCCEEDED"
++
++    def _await_task(self, task_id):
++        deadline = self._monotonic() + self.poll_timeout
++        while True:
++            task = self.client.get_task(task_id) or {}
++            if task.get("status") in TERMINAL_TASK_STATUSES:
++                return task
++            if self._monotonic() >= deadline:
++                raise StepFailure(
++                    "Task %s was still %s after %.0f seconds"
++                    % (task_id, task.get("status"), self.poll_timeout), task_id=task_id)
++            self._sleep(self.poll_interval)
++
++    def _commission_hosts(self, specs):
++        accepted = self.client.commission_hosts(specs) or {}
++        task_id = accepted.get("id")
++        if not task_id:
++            raise StepFailure("commissionHosts returned no task")
++        step = self._step("commission_hosts")
++        step["details"] = {"taskId": task_id, "taskStatus": accepted.get("status")}
++        task = self._await_task(task_id)
++        step["details"]["taskStatus"] = task.get("status")
++        self._record_host_outcomes(specs, task)
++        if task.get("status") in FAILED_TASK_STATUSES:
++            error = (task.get("errors") or [{}])[0]
++            step["status"] = "FAILED"
++            raise StepFailure(
++                error.get("message") or "Task %s ended %s" % (task_id, task.get("status")),
++                error_code=error.get("errorCode"), task_id=task_id)
++        step["status"] = "SUCCEEDED"
++
++    def _record_host_outcomes(self, specs, task):
++        """Per host truth, taken from the sub-tasks rather than from the task status."""
++        by_fqdn = {}
++        for sub_task in task.get("subTasks") or []:
++            resources = sub_task.get("resources") or []
++            fqdn = resources[0].get("fqdn") if resources else None
++            if fqdn:
++                by_fqdn[fqdn] = sub_task
++        for spec in specs:
++            fqdn = spec["fqdn"]
++            sub_task = by_fqdn.get(fqdn)
++            if sub_task is None:
++                self.hosts.append({"fqdn": fqdn, "status": "UNKNOWN"})
++                continue
++            status = sub_task.get("status")
++            outcome = {"fqdn": fqdn, "status": status}
++            resource = (sub_task.get("resources") or [{}])[0]
++            if status == "SUCCESSFUL":
++                resource_id = resource.get("resourceId")
++                outcome["resourceId"] = resource_id
++                self.completed_changes.append({"kind": "HOST", "fqdn": fqdn,
++                                               "resourceId": resource_id})
++            else:
++                error = (sub_task.get("errors") or [{}])[0]
++                if error.get("errorCode"):
++                    outcome["errorCode"] = error["errorCode"]
++                if error.get("message"):
++                    outcome["message"] = error["message"]
++            self.hosts.append(outcome)
++
++    # -- driver ------------------------------------------------------------
++    def run(self, username, password):
++        try:
++            self._authenticate(username, password)
++            pool_id, network_ids = self._create_network_pool()
++            self._add_ip_pool(pool_id, network_ids)
++            specs = build_host_specs(self.plan["hosts"], pool_id)
++            self._validate_hosts(specs)
++            self._commission_hosts(specs)
++        except ApiError as exc:
++            self._record_failure(self._current_step(exc.operation_id), exc)
++        except StepFailure as exc:
++            self._record_failure(self._first_unfinished_step(), exc)
++        return self.report()
++
++    def _current_step(self, operation_id):
++        for step in self.steps:
++            if step["operationId"] == operation_id:
++                return step["name"]
++        # getTask failures belong to the step that is waiting on the task.
++        return "commission_hosts"
++
++    def _first_unfinished_step(self):
++        for step in self.steps:
++            if step["status"] in ("NOT_ATTEMPTED", "FAILED"):
++                return step["name"]
++        return self.steps[-1]["name"]
++
++    def report(self):
++        failed = self.failure is not None
++        report = {
++            "schemaVersion": SCHEMA_VERSION,
++            "planName": self.plan.get("planName"),
++            "sddcManager": self.base_url,
++            "overallStatus": "FAILED" if failed else "SUCCEEDED",
++            "steps": self.steps,
++            "hosts": self.hosts,
++            "completedChanges": self.completed_changes,
++        }
++        if failed:
++            report["failure"] = self.failure
++        return report

@@ -1,0 +1,358 @@
+diff --git a/VcfHostOnboarding/VcfHostOnboarding.psm1 b/VcfHostOnboarding/VcfHostOnboarding.psm1
+new file mode 100644
+index 0000000..4991328
+--- /dev/null
++++ b/VcfHostOnboarding/VcfHostOnboarding.psm1
+@@ -0,0 +1,352 @@
++Set-StrictMode -Version Latest
++$ErrorActionPreference = 'Stop'
++
++Import-Module -Name 'VMware.Sdk.Vcf.SddcManager' `
++    -RequiredVersion '13.5.0.25380678' `
++    -ErrorAction Stop
++
++$script:NonTerminalTaskStatuses = @('PENDING', 'IN_PROGRESS')
++
++function Get-VcfOnboardingCommand {
++    <#
++        .SYNOPSIS
++        Resolves one contract operationId to the single generated binding
++        that implements it.
++    #>
++    param([Parameter(Mandatory)] [string] $OperationId)
++
++    $operations = @(Get-VcfSddcManagerOperation -Name $OperationId -ErrorAction Stop)
++    if ($operations.Count -ne 1) {
++        throw [InvalidOperationException]::new(
++            "Operation '$OperationId' resolved to $($operations.Count) generated commands.")
++    }
++    $command = $operations[0].CommandInfo
++    if ($null -eq $command) {
++        throw [InvalidOperationException]::new(
++            "Operation '$OperationId' has no generated command.")
++    }
++    return $command
++}
++
++function ConvertTo-VcfNormalizedStatus {
++    param([string] $Status)
++
++    if ([string]::IsNullOrWhiteSpace($Status)) { return '' }
++    return ($Status.Trim() -replace '\s+', '_').ToUpperInvariant()
++}
++
++function Test-VcfPlanMember {
++    param(
++        [Parameter(Mandatory)] [psobject] $Source,
++        [Parameter(Mandatory)] [string] $Name
++    )
++
++    if ($null -eq $Source) { return $false }
++    $property = $Source.PSObject.Properties[$Name]
++    if ($null -eq $property) { return $false }
++    $value = $property.Value
++    if ($null -eq $value) { return $false }
++    if ($value -is [string] -and [string]::IsNullOrEmpty($value)) { return $false }
++    return $true
++}
++
++function Get-VcfRequiredPlanValue {
++    param(
++        [Parameter(Mandatory)] [psobject] $Source,
++        [Parameter(Mandatory)] [string] $Name,
++        [Parameter(Mandatory)] [string] $Context
++    )
++
++    if (-not (Test-VcfPlanMember -Source $Source -Name $Name)) {
++        throw [ArgumentException]::new("$Context is missing the required member '$Name'.")
++    }
++    return $Source.PSObject.Properties[$Name].Value
++}
++
++function New-VcfOnboardingStep {
++    param(
++        [Parameter(Mandatory)] [string] $OperationId,
++        [Parameter(Mandatory)] [string] $Status,
++        [string] $Detail = ''
++    )
++
++    return [pscustomobject] [ordered] @{
++        operationId = $OperationId
++        status      = $Status
++        detail      = $Detail
++    }
++}
++
++function New-VcfNetworkPoolSpec {
++    param([Parameter(Mandatory)] [psobject] $PlanPool)
++
++    $name = Get-VcfRequiredPlanValue -Source $PlanPool -Name 'name' `
++        -Context 'The onboarding plan network pool'
++    $planNetworks = @(Get-VcfRequiredPlanValue -Source $PlanPool -Name 'networks' `
++            -Context 'The onboarding plan network pool')
++    if ($planNetworks.Count -eq 0) {
++        throw [ArgumentException]::new('The onboarding plan network pool declares no networks.')
++    }
++
++    $networks = foreach ($planNetwork in $planNetworks) {
++        $context = 'The onboarding plan network'
++        $arguments = @{
++            Type    = [string] (Get-VcfRequiredPlanValue -Source $planNetwork -Name 'type' -Context $context)
++            VlanId  = [int] (Get-VcfRequiredPlanValue -Source $planNetwork -Name 'vlanId' -Context $context)
++            Mtu     = [int] (Get-VcfRequiredPlanValue -Source $planNetwork -Name 'mtu' -Context $context)
++            Subnet  = [string] (Get-VcfRequiredPlanValue -Source $planNetwork -Name 'subnet' -Context $context)
++            Mask    = [string] (Get-VcfRequiredPlanValue -Source $planNetwork -Name 'mask' -Context $context)
++            Gateway = [string] (Get-VcfRequiredPlanValue -Source $planNetwork -Name 'gateway' -Context $context)
++        }
++        # ipPools is optional on this contract: bind it only when the plan
++        # supplies ranges so that an unset pool list is absent from the body.
++        if (Test-VcfPlanMember -Source $planNetwork -Name 'ipPools') {
++            $ranges = @(
++                foreach ($range in @($planNetwork.ipPools)) {
++                    Initialize-VcfIpPool `
++                        -Start ([string] (Get-VcfRequiredPlanValue -Source $range -Name 'start' -Context 'The onboarding plan IP pool')) `
++                        -VarEnd ([string] (Get-VcfRequiredPlanValue -Source $range -Name 'end' -Context 'The onboarding plan IP pool'))
++                }
++            )
++            if ($ranges.Count -gt 0) {
++                $arguments['IpPools'] = $ranges
++            }
++        }
++        Initialize-VcfNetwork @arguments
++    }
++
++    return Initialize-VcfNetworkPool -Name ([string] $name) -Networks @($networks)
++}
++
++function New-VcfHostCommissionSpecList {
++    param(
++        [Parameter(Mandatory)] [psobject[]] $PlanHosts,
++        [Parameter(Mandatory)] [string] $NetworkPoolId
++    )
++
++    $specs = foreach ($planHost in $PlanHosts) {
++        $context = 'The onboarding plan host'
++        $arguments = @{
++            Fqdn          = [string] (Get-VcfRequiredPlanValue -Source $planHost -Name 'fqdn' -Context $context)
++            Username      = [string] (Get-VcfRequiredPlanValue -Source $planHost -Name 'username' -Context $context)
++            Password      = [string] (Get-VcfRequiredPlanValue -Source $planHost -Name 'password' -Context $context)
++            StorageType   = [string] (Get-VcfRequiredPlanValue -Source $planHost -Name 'storageType' -Context $context)
++            NetworkPoolId = $NetworkPoolId
++        }
++        # The pool is addressed by the identifier the create step returned;
++        # every optional member the plan omits stays off the wire.
++        foreach ($optional in @(
++                @{ Plan = 'vvolStorageProtocolType'; Parameter = 'VvolStorageProtocolType' },
++                @{ Plan = 'sshThumbprint'; Parameter = 'SshThumbprint' },
++                @{ Plan = 'sslThumbprint'; Parameter = 'SslThumbprint' })) {
++            if (Test-VcfPlanMember -Source $planHost -Name $optional.Plan) {
++                $arguments[$optional.Parameter] =
++                    [string] $planHost.PSObject.Properties[$optional.Plan].Value
++            }
++        }
++        Initialize-VcfHostCommissionSpec @arguments
++    }
++
++    return @($specs)
++}
++
++function Get-VcfSubTaskFqdnStatus {
++    param(
++        [Parameter(Mandatory)] [AllowNull()] [psobject] $Task,
++        [Parameter(Mandatory)] [string] $Fqdn
++    )
++
++    if ($null -eq $Task) { return '' }
++    $subTasks = $Task.PSObject.Properties['SubTasks']
++    if ($null -eq $subTasks -or $null -eq $subTasks.Value) { return '' }
++    foreach ($subTask in @($subTasks.Value)) {
++        if ($null -eq $subTask) { continue }
++        $resources = $subTask.PSObject.Properties['Resources']
++        if ($null -eq $resources -or $null -eq $resources.Value) { continue }
++        foreach ($resource in @($resources.Value)) {
++            if ($null -eq $resource) { continue }
++            $resourceFqdn = $resource.PSObject.Properties['Fqdn']
++            if ($null -ne $resourceFqdn -and
++                [string] $resourceFqdn.Value -ceq $Fqdn) {
++                return ConvertTo-VcfNormalizedStatus ([string] $subTask.Status)
++            }
++        }
++    }
++    return ''
++}
++
++function Get-VcfFirstTaskError {
++    param([Parameter(Mandatory)] [AllowNull()] [psobject] $Task)
++
++    if ($null -eq $Task) { return $null }
++    $errors = $Task.PSObject.Properties['Errors']
++    if ($null -eq $errors -or $null -eq $errors.Value) { return $null }
++    foreach ($taskError in @($errors.Value)) {
++        if ($null -ne $taskError) { return $taskError }
++    }
++    return $null
++}
++
++function Get-VcfErrorMember {
++    param(
++        [Parameter(Mandatory)] [AllowNull()] [psobject] $TaskError,
++        [Parameter(Mandatory)] [string] $Name
++    )
++
++    if ($null -eq $TaskError) { return '' }
++    $property = $TaskError.PSObject.Properties[$Name]
++    if ($null -eq $property -or $null -eq $property.Value) { return '' }
++    return [string] $property.Value
++}
++
++function Invoke-VcfHostOnboarding {
++    <#
++        .SYNOPSIS
++        Creates the network pool of an onboarding plan, validates and
++        commissions its hosts, and reports what each step of the change did.
++    #>
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] [AllowNull()] [object] $Server,
++        [Parameter(Mandatory)] [AllowEmptyString()] [string] $PlanPath,
++        [ValidateRange(0, 60)] [int] $PollIntervalSeconds = 5,
++        [ValidateRange(1, 900)] [int] $TimeoutSeconds = 300
++    )
++
++    if ($null -eq $Server) {
++        throw [ArgumentNullException]::new('Server')
++    }
++    if ([string]::IsNullOrWhiteSpace($PlanPath)) {
++        throw [ArgumentException]::new('PlanPath must name an onboarding plan.', 'PlanPath')
++    }
++    if (-not (Test-Path -LiteralPath $PlanPath -PathType Leaf)) {
++        throw [IO.FileNotFoundException]::new("The onboarding plan '$PlanPath' does not exist.", $PlanPath)
++    }
++
++    $plan = Get-Content -LiteralPath $PlanPath -Raw | ConvertFrom-Json
++    $planPool = Get-VcfRequiredPlanValue -Source $plan -Name 'networkPool' -Context 'The onboarding plan'
++    $planHosts = @(Get-VcfRequiredPlanValue -Source $plan -Name 'hosts' -Context 'The onboarding plan')
++    if ($planHosts.Count -eq 0) {
++        throw [ArgumentException]::new('The onboarding plan declares no hosts.')
++    }
++
++    $createNetworkPool = Get-VcfOnboardingCommand -OperationId 'createNetworkPool'
++    $validateHostCommissionSpec = Get-VcfOnboardingCommand -OperationId 'validateHostCommissionSpec'
++    $commissionHosts = Get-VcfOnboardingCommand -OperationId 'commissionHosts'
++    $getTask = Get-VcfOnboardingCommand -OperationId 'getTask'
++
++    $steps = [Collections.Generic.List[psobject]]::new()
++
++    # Step 1 - create the network pool the hosts will join.
++    $poolSpec = New-VcfNetworkPoolSpec -PlanPool $planPool
++    $createdPool = & $createNetworkPool -Server $Server -NetworkPool $poolSpec -ErrorAction Stop
++    $networkPoolId = [string] $createdPool.Id
++    $networkPoolName = [string] $createdPool.Name
++    if ([string]::IsNullOrWhiteSpace($networkPoolId)) {
++        throw [InvalidOperationException]::new('createNetworkPool returned no network pool identifier.')
++    }
++    $steps.Add((New-VcfOnboardingStep -OperationId 'createNetworkPool' -Status 'SUCCEEDED' -Detail $networkPoolId))
++
++    $specs = New-VcfHostCommissionSpecList -PlanHosts $planHosts -NetworkPoolId $networkPoolId
++
++    # Step 2 - validate the commission specification of every host.
++    $validation = & $validateHostCommissionSpec -Server $Server -HostCommissionSpec $specs -ErrorAction Stop
++    $validationId = [string] $validation.Id
++    $validationStatus = ConvertTo-VcfNormalizedStatus ([string] $validation.ResultStatus)
++    $executionStatus = ConvertTo-VcfNormalizedStatus ([string] $validation.ExecutionStatus)
++    if ($validationStatus -ne 'SUCCEEDED' -or $executionStatus -ne 'COMPLETED') {
++        $steps.Add((New-VcfOnboardingStep -OperationId 'validateHostCommissionSpec' -Status 'FAILED' -Detail $validationId))
++        $steps.Add((New-VcfOnboardingStep -OperationId 'commissionHosts' -Status 'NOT_ATTEMPTED'))
++        $steps.Add((New-VcfOnboardingStep -OperationId 'getTask' -Status 'NOT_ATTEMPTED'))
++        return [pscustomobject] [ordered] @{
++            status                = 'FAILED'
++            networkPoolId         = $networkPoolId
++            networkPoolName       = $networkPoolName
++            validationId          = $validationId
++            validationStatus      = $validationStatus
++            taskId                = ''
++            taskStatus            = ''
++            commissionedHostFqdns = @()
++            failedHostFqdns       = @()
++            errorCode             = ''
++            errorMessage          = ''
++            referenceToken        = ''
++            steps                 = $steps.ToArray()
++        }
++    }
++    $steps.Add((New-VcfOnboardingStep -OperationId 'validateHostCommissionSpec' -Status 'SUCCEEDED' -Detail $validationId))
++
++    # Step 3 - submit the commission of the validated specification list.
++    $submitted = & $commissionHosts -Server $Server -HostCommissionSpec $specs -ErrorAction Stop
++    $taskId = [string] $submitted.Id
++    if ([string]::IsNullOrWhiteSpace($taskId)) {
++        throw [InvalidOperationException]::new('commissionHosts returned no task identifier.')
++    }
++    $steps.Add((New-VcfOnboardingStep -OperationId 'commissionHosts' -Status 'SUCCEEDED' -Detail $taskId))
++
++    # Step 4 - the acceptance of the task is not its outcome; poll for it.
++    $timer = [Diagnostics.Stopwatch]::StartNew()
++    $task = $null
++    $taskStatus = ''
++    while ($true) {
++        if ($timer.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
++            throw [TimeoutException]::new(
++                "Commission task '$taskId' did not finish within $TimeoutSeconds seconds.")
++        }
++        $task = & $getTask -Server $Server -Id $taskId -ErrorAction Stop
++        $taskStatus = ConvertTo-VcfNormalizedStatus ([string] $task.Status)
++        if ($taskStatus -notin $script:NonTerminalTaskStatuses) { break }
++        $remainingSeconds = $TimeoutSeconds - $timer.Elapsed.TotalSeconds
++        if ($remainingSeconds -le 0) {
++            throw [TimeoutException]::new(
++                "Commission task '$taskId' was still $taskStatus after $TimeoutSeconds seconds.")
++        }
++        if ($PollIntervalSeconds -gt 0) {
++            $delaySeconds = [Math]::Min($PollIntervalSeconds, $remainingSeconds)
++            $delayMilliseconds = [int] [Math]::Ceiling($delaySeconds * 1000)
++            Start-Sleep -Milliseconds $delayMilliseconds
++            if ($PollIntervalSeconds -ge $remainingSeconds) {
++                throw [TimeoutException]::new(
++                    "Commission task '$taskId' was still $taskStatus after $TimeoutSeconds seconds.")
++            }
++        }
++    }
++    if ($taskStatus -notin @('SUCCESSFUL', 'FAILED')) {
++        throw [InvalidOperationException]::new(
++            "Commission task '$taskId' reached the unexpected status '$taskStatus'.")
++    }
++
++    $commissioned = [Collections.Generic.List[string]]::new()
++    $failed = [Collections.Generic.List[string]]::new()
++    foreach ($planHost in $planHosts) {
++        $fqdn = [string] $planHost.fqdn
++        switch (Get-VcfSubTaskFqdnStatus -Task $task -Fqdn $fqdn) {
++            'SUCCESSFUL' { $commissioned.Add($fqdn) }
++            'FAILED' { $failed.Add($fqdn) }
++            default { }
++        }
++    }
++
++    $taskError = Get-VcfFirstTaskError -Task $task
++    $steps.Add((New-VcfOnboardingStep -OperationId 'getTask' `
++                -Status $(if ($taskStatus -eq 'SUCCESSFUL') { 'SUCCEEDED' } else { 'FAILED' }) `
++                -Detail $taskStatus))
++
++    return [pscustomobject] [ordered] @{
++        status                = $(if ($taskStatus -eq 'SUCCESSFUL') { 'SUCCEEDED' } else { 'FAILED' })
++        networkPoolId         = $networkPoolId
++        networkPoolName       = $networkPoolName
++        validationId          = $validationId
++        validationStatus      = $validationStatus
++        taskId                = $taskId
++        taskStatus            = $taskStatus
++        commissionedHostFqdns = $commissioned.ToArray()
++        failedHostFqdns       = $failed.ToArray()
++        errorCode             = Get-VcfErrorMember -TaskError $taskError -Name 'ErrorCode'
++        errorMessage          = Get-VcfErrorMember -TaskError $taskError -Name 'Message'
++        referenceToken        = Get-VcfErrorMember -TaskError $taskError -Name 'ReferenceToken'
++        steps                 = $steps.ToArray()
++    }
++}
++
++Export-ModuleMember -Function 'Invoke-VcfHostOnboarding'

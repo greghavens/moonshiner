@@ -1,0 +1,344 @@
+diff --git a/src/vcf_host_commission/commission.py b/src/vcf_host_commission/commission.py
+index cae3794..c189a64 100644
+--- a/src/vcf_host_commission/commission.py
++++ b/src/vcf_host_commission/commission.py
+@@ -1,13 +1,63 @@
+ """Precheck-gated host commissioning against the SDDC Manager REST API.
+ 
+-Fill in the implementation described in the task. The contract for the three
+-operations in scope is projected in ``docs/contract.json``.
++The three operations in scope are projected in ``docs/contract.json``:
++``validateHostCommissionSpec``, ``getHostCommissionValidationByID`` and
++``commissionHosts``. The precheck gates the mutating call, so a host is only
++commissioned once its validation has actually completed with a passing result.
+ """
+ 
+ from __future__ import annotations
+ 
+-from dataclasses import dataclass
+-from typing import Any
++import json
++import time
++import urllib.error
++import urllib.request
++from dataclasses import dataclass, fields
++from typing import Any, Callable, Sequence
++
++__all__ = [
++    "CommissionOutcome",
++    "HostCommissionSpec",
++    "PrecheckFailedError",
++    "PrecheckTimeoutError",
++    "SddcManagerClient",
++    "SddcManagerError",
++]
++
++#: HostCommissionSpec members in the order the pinned specification declares them.
++WIRE_MEMBERS: tuple[tuple[str, str], ...] = (
++    ("fqdn", "fqdn"),
++    ("username", "username"),
++    ("password", "password"),
++    ("storageType", "storage_type"),
++    ("vvolStorageProtocolType", "vvol_storage_protocol_type"),
++    ("networkPoolId", "network_pool_id"),
++    ("networkPoolName", "network_pool_name"),
++    ("sshThumbprint", "ssh_thumbprint"),
++    ("sslThumbprint", "ssl_thumbprint"),
++)
++REQUIRED_MEMBERS = frozenset(
++    {"fqdn", "username", "password", "storageType", "networkPoolId"}
++)
++
++#: Validation.executionStatus values that mean the precheck has stopped running.
++TERMINAL_EXECUTION_STATUSES = frozenset(
++    {"COMPLETED", "FAILED", "CANCELLED", "SKIPPED", "UNKNOWN"}
++)
++PASSING_EXECUTION_STATUS = "COMPLETED"
++PASSING_RESULT_STATUS = "SUCCEEDED"
++
++VALIDATIONS_PATH = "/v1/hosts/validations"
++HOSTS_PATH = "/v1/hosts"
++
++_REDACTED = "***"
++
++
++def _normalize(status: Any) -> str:
++    """Fold a status into the uppercase, underscored form the contract names."""
++    if not isinstance(status, str):
++        return ""
++    return status.strip().upper().replace(" ", "_")
+ 
+ 
+ class SddcManagerError(Exception):
+@@ -17,19 +67,79 @@ class SddcManagerError(Exception):
+ class PrecheckFailedError(SddcManagerError):
+     """The host commission precheck reached a terminal state that is not a pass."""
+ 
++    def __init__(
++        self,
++        message: str,
++        *,
++        validation_id: str,
++        execution_status: str,
++        result_status: str | None,
++        failed_checks: list[dict[str, Any]],
++    ) -> None:
++        super().__init__(message)
++        self.validation_id = validation_id
++        self.execution_status = execution_status
++        self.result_status = result_status
++        self.failed_checks = failed_checks
++
+ 
+ class PrecheckTimeoutError(SddcManagerError):
+     """The host commission precheck never reached a terminal state."""
+ 
++    def __init__(
++        self,
++        message: str,
++        *,
++        validation_id: str,
++        execution_status: str,
++        poll_count: int,
++    ) -> None:
++        super().__init__(message)
++        self.validation_id = validation_id
++        self.execution_status = execution_status
++        self.poll_count = poll_count
+ 
+-@dataclass(frozen=True)
++
++@dataclass(frozen=True, repr=False)
+ class HostCommissionSpec:
+-    """One host to commission, mirroring the HostCommissionSpec schema."""
++    """One host to commission, mirroring the HostCommissionSpec schema.
++
++    The five members the specification marks required come first; the four
++    optional ones default to ``None`` and are then left off the wire entirely
++    rather than sent as null or as an empty string.
++    """
+ 
+     fqdn: str
++    username: str
++    password: str
++    storage_type: str
++    network_pool_id: str
++    vvol_storage_protocol_type: str | None = None
++    network_pool_name: str | None = None
++    ssh_thumbprint: str | None = None
++    ssl_thumbprint: str | None = None
+ 
+     def to_wire(self) -> dict[str, str]:
+-        raise NotImplementedError("HostCommissionSpec.to_wire is not implemented yet")
++        """Render the specification-ordered JSON object for this host."""
++        payload: dict[str, str] = {}
++        for wire_name, attribute in WIRE_MEMBERS:
++            value = getattr(self, attribute)
++            if value is None:
++                if wire_name in REQUIRED_MEMBERS:
++                    raise ValueError(f"{attribute} is required and cannot be None")
++                continue
++            if not isinstance(value, str) or not value.strip():
++                raise ValueError(f"{attribute} must be a non-empty string")
++            payload[wire_name] = value
++        return payload
++
++    def __repr__(self) -> str:
++        rendered = ", ".join(
++            f"{item.name}="
++            + (_REDACTED if item.name == "password" else repr(getattr(self, item.name)))
++            for item in fields(self)
++        )
++        return f"{type(self).__name__}({rendered})"
+ 
+ 
+ @dataclass(frozen=True)
+@@ -37,10 +147,186 @@ class CommissionOutcome:
+     """What a gated commissioning attempt observed and did."""
+ 
+     validation_id: str
++    execution_status: str
++    result_status: str | None
++    poll_count: int
++    task_id: str | None
++    commissioned: bool
+ 
+ 
+ class SddcManagerClient:
+     """Thin client over the three contracted host commissioning operations."""
+ 
+-    def __init__(self, base_url: str, token: str, **options: Any) -> None:
+-        raise NotImplementedError("SddcManagerClient is not implemented yet")
++    def __init__(
++        self,
++        base_url: str,
++        token: str,
++        *,
++        timeout: float = 30.0,
++        poll_interval: float = 5.0,
++        max_polls: int = 60,
++        sleep: Callable[[float], None] | None = None,
++    ) -> None:
++        if not isinstance(base_url, str) or not base_url.strip():
++            raise ValueError("base_url must be a non-empty string")
++        if not isinstance(token, str) or not token.strip():
++            raise ValueError("token must be a non-empty string")
++        if max_polls < 1:
++            raise ValueError("max_polls must be at least 1")
++        if poll_interval < 0:
++            raise ValueError("poll_interval must not be negative")
++        self.base_url = base_url.rstrip("/")
++        self._token = token
++        self.timeout = timeout
++        self.poll_interval = poll_interval
++        self.max_polls = max_polls
++        self._sleep = sleep if sleep is not None else time.sleep
++
++    # -- contracted operations -------------------------------------------- #
++
++    def validate_host_commission_spec(
++        self, specs: Sequence[HostCommissionSpec]
++    ) -> dict[str, Any]:
++        """POST /v1/hosts/validations — submit the precheck."""
++        return self._request("POST", VALIDATIONS_PATH, body=_wire_array(specs))
++
++    def get_host_commission_validation_by_id(self, validation_id: str) -> dict[str, Any]:
++        """GET /v1/hosts/validations/{id} — read the precheck's current state."""
++        if not isinstance(validation_id, str) or not validation_id.strip():
++            raise ValueError("validation_id must be a non-empty string")
++        return self._request("GET", f"{VALIDATIONS_PATH}/{validation_id}")
++
++    def commission_hosts(self, specs: Sequence[HostCommissionSpec]) -> dict[str, Any]:
++        """POST /v1/hosts — commission the hosts. Mutating; gate it."""
++        return self._request("POST", HOSTS_PATH, body=_wire_array(specs))
++
++    # -- the gate ---------------------------------------------------------- #
++
++    def commission_after_precheck(
++        self, specs: Sequence[HostCommissionSpec]
++    ) -> CommissionOutcome:
++        """Precheck the hosts and commission them only if the precheck passed."""
++        specs = list(specs)
++        if not specs:
++            raise ValueError("at least one HostCommissionSpec is required")
++
++        accepted = self.validate_host_commission_spec(specs)
++        validation_id = accepted.get("id")
++        if not isinstance(validation_id, str) or not validation_id.strip():
++            raise SddcManagerError("the validation submission returned no validation id")
++
++        # The 202 answers before the checks have run, so the statuses it echoes
++        # mean nothing yet. Only a polled state decides whether hosts are touched.
++        validation: dict[str, Any] = {}
++        execution_status = ""
++        poll_count = 0
++        while poll_count < self.max_polls:
++            validation = self.get_host_commission_validation_by_id(validation_id)
++            poll_count += 1
++            execution_status = _normalize(validation.get("executionStatus"))
++            if execution_status in TERMINAL_EXECUTION_STATUSES:
++                break
++            if poll_count < self.max_polls:
++                self._sleep(self.poll_interval)
++        else:
++            raise PrecheckTimeoutError(
++                "host commission validation did not reach a terminal status "
++                f"after {poll_count} polls",
++                validation_id=validation_id,
++                execution_status=execution_status,
++                poll_count=poll_count,
++            )
++
++        raw_result = validation.get("resultStatus")
++        result_status = _normalize(raw_result) if raw_result is not None else None
++        if (
++            execution_status != PASSING_EXECUTION_STATUS
++            or result_status != PASSING_RESULT_STATUS
++        ):
++            failed_checks = [
++                check
++                for check in validation.get("validationChecks") or []
++                if isinstance(check, dict)
++                and _normalize(check.get("resultStatus")) == "FAILED"
++            ]
++            raise PrecheckFailedError(
++                "host commission validation did not pass; "
++                "the precheck gate remained shut and "
++                "no host was commissioned",
++                validation_id=validation_id,
++                execution_status=execution_status,
++                result_status=result_status,
++                failed_checks=failed_checks,
++            )
++
++        task = self.commission_hosts(specs)
++        task_id = task.get("id")
++        return CommissionOutcome(
++            validation_id=validation_id,
++            execution_status=execution_status,
++            result_status=result_status,
++            poll_count=poll_count,
++            task_id=task_id if isinstance(task_id, str) else None,
++            commissioned=True,
++        )
++
++    # -- transport --------------------------------------------------------- #
++
++    def _request(
++        self, method: str, path: str, *, body: list[dict[str, str]] | None = None
++    ) -> dict[str, Any]:
++        data = None
++        headers = {
++            "Accept": "application/json",
++            "Authorization": f"Bearer {self._token}",
++        }
++        if body is not None:
++            data = json.dumps(body, separators=(",", ":")).encode("utf-8")
++            headers["Content-Type"] = "application/json"
++
++        try:
++            request = urllib.request.Request(
++                f"{self.base_url}{path}", data=data, headers=headers, method=method
++            )
++            with urllib.request.urlopen(request, timeout=self.timeout) as response:
++                payload = response.read()
++                status = response.status
++        except urllib.error.HTTPError as error:
++            raise _http_error(method, path, error) from None
++        except urllib.error.URLError as error:
++            raise SddcManagerError(
++                "the SDDC Manager request could not reach the service"
++            ) from None
++        except ValueError:
++            raise SddcManagerError("the SDDC Manager request was invalid") from None
++
++        if not payload:
++            return {}
++        try:
++            decoded = json.loads(payload.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            raise SddcManagerError(
++                "SDDC Manager answered with a body that is not JSON"
++            ) from None
++        if not isinstance(decoded, dict):
++            raise SddcManagerError(
++                "SDDC Manager answered with JSON whose top level is "
++                f"{type(decoded).__name__}, not an object"
++            )
++        return decoded
++
++
++def _wire_array(specs: Sequence[HostCommissionSpec]) -> list[dict[str, str]]:
++    rendered = []
++    for spec in specs:
++        if not isinstance(spec, HostCommissionSpec):
++            raise TypeError("every element must be a HostCommissionSpec")
++        rendered.append(spec.to_wire())
++    if not rendered:
++        raise ValueError("at least one HostCommissionSpec is required")
++    return rendered
++
++
++def _http_error(method: str, path: str, error: urllib.error.HTTPError) -> SddcManagerError:
++    """Turn an HTTP failure into an SddcManagerError, never echoing credentials."""
++    return SddcManagerError(f"SDDC Manager request failed with HTTP {error.code}")

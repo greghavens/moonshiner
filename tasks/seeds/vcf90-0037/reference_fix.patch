@@ -1,0 +1,305 @@
+diff --git a/VcfResourcePoolRollout.psm1 b/VcfResourcePoolRollout.psm1
+new file mode 100644
+index 0000000..ddb4043
+--- /dev/null
++++ b/VcfResourcePoolRollout.psm1
+@@ -0,0 +1,299 @@
++# Applies a resource pool plan to one vCenter over the vSphere Automation API.
++#
++# The four operations in scope are the ones docs/contract.json names, projected
++# from specifications/vsphere/openapi/automation/vcenter.yaml at tag 9.0.0.0 of
++# vmware/vcf-api-specs: Cis.Session_create, Cis.Session_delete,
++# Vcenter.ResourcePool_list and Vcenter.ResourcePool_create.
++
++Set-StrictMode -Version Latest
++
++$script:SessionPath = '/api/session'
++$script:ResourcePoolPath = '/api/vcenter/resource-pool'
++
++function Get-PlanMember {
++    <#
++        .SYNOPSIS
++        Reads one property off a parsed JSON node, or $null when it is absent.
++    #>
++    param(
++        [Parameter(Mandatory)] [AllowNull()] [object] $Node,
++        [Parameter(Mandatory)] [string] $Name
++    )
++
++    if ($null -eq $Node) { return $null }
++    $property = $Node.PSObject.Properties[$Name]
++    if ($null -eq $property) { return $null }
++    $property.Value
++}
++
++function New-SharesSpec {
++    <#
++        .SYNOPSIS
++        Builds a Vcenter.ResourcePool.SharesInfo, or $null when the plan set none.
++    #>
++    param([Parameter(Mandatory)] [AllowNull()] [object] $Node)
++
++    if ($null -eq $Node) { return $null }
++
++    $level = Get-PlanMember -Node $Node -Name 'level'
++    if ([string]::IsNullOrWhiteSpace($level)) {
++        throw 'A shares block in the plan does not set the required level.'
++    }
++
++    # shares is only meaningful for CUSTOM, and an unset shares count has to stay
++    # off the wire rather than travel as a zero.
++    $count = Get-PlanMember -Node $Node -Name 'shares'
++    if ($null -eq $count) {
++        return Initialize-VcenterResourcePoolSharesInfo -Level ([string] $level)
++    }
++    Initialize-VcenterResourcePoolSharesInfo -Level ([string] $level) -Shares ([long] $count)
++}
++
++function New-AllocationSpec {
++    <#
++        .SYNOPSIS
++        Builds a Vcenter.ResourcePool.ResourceAllocationCreateSpec from a plan
++        node, or $null when the plan tunes nothing.
++
++        An allocation with no members at all is not a valid request: the
++        specification treats a missing allocation and an empty one differently,
++        so nothing is built unless at least one member was actually set.
++    #>
++    param([Parameter(Mandatory)] [AllowNull()] [object] $Node)
++
++    if ($null -eq $Node) { return $null }
++
++    $reservation = Get-PlanMember -Node $Node -Name 'reservation'
++    $limit = Get-PlanMember -Node $Node -Name 'limit'
++    $expandable = Get-PlanMember -Node $Node -Name 'expandableReservation'
++    $shares = New-SharesSpec -Node (Get-PlanMember -Node $Node -Name 'shares')
++
++    $arguments = @{}
++    if ($null -ne $reservation) { $arguments['Reservation'] = [long] $reservation }
++    if ($null -ne $limit) { $arguments['Limit'] = [long] $limit }
++    if ($null -ne $expandable) { $arguments['ExpandableReservation'] = [bool] $expandable }
++    if ($null -ne $shares) { $arguments['Shares'] = $shares }
++
++    if ($arguments.Count -eq 0) { return $null }
++    Initialize-VcenterResourcePoolResourceAllocationCreateSpec @arguments
++}
++
++function Read-RolloutPlan {
++    <#
++        .SYNOPSIS
++        Reads and validates the plan file, keeping the pools in file order.
++    #>
++    param([Parameter(Mandatory)] [string] $Path)
++
++    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
++        throw "The rollout plan '$Path' does not exist."
++    }
++
++    try {
++        $plan = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
++    } catch {
++        throw "The rollout plan '$Path' is not valid JSON: $($_.Exception.Message)"
++    }
++
++    $parent = Get-PlanMember -Node $plan -Name 'parentPool'
++    if ([string]::IsNullOrWhiteSpace($parent)) {
++        throw "The rollout plan '$Path' does not name a parentPool."
++    }
++
++    $pools = @(Get-PlanMember -Node $plan -Name 'pools')
++    if ($pools.Count -eq 0) {
++        throw "The rollout plan '$Path' does not list any pools."
++    }
++
++    $steps = foreach ($pool in $pools) {
++        $name = Get-PlanMember -Node $pool -Name 'name'
++        if ([string]::IsNullOrWhiteSpace($name)) {
++            throw "The rollout plan '$Path' has a pool without a name."
++        }
++        [pscustomobject] @{
++            Name             = [string] $name
++            CpuAllocation    = New-AllocationSpec -Node (Get-PlanMember -Node $pool -Name 'cpuAllocation')
++            MemoryAllocation = New-AllocationSpec -Node (Get-PlanMember -Node $pool -Name 'memoryAllocation')
++        }
++    }
++
++    [pscustomobject] @{
++        ParentPool = [string] $parent
++        Pools      = @($steps)
++    }
++}
++
++function Resolve-VapiFailure {
++    <#
++        .SYNOPSIS
++        Pulls the HTTP status and the Vapi.Std.Errors.Error body out of a failed
++        SDK invocation, so a step failure can be reported rather than guessed at.
++    #>
++    param([Parameter(Mandatory)] [System.Management.Automation.ErrorRecord] $ErrorRecord)
++
++    $status = 0
++    $errorType = ''
++    $message = $ErrorRecord.Exception.Message
++
++    $exception = $ErrorRecord.Exception
++    try {
++        $response = $exception.InnerException.Response
++        if ($null -ne $response) { $status = [int] $response.StatusCode }
++    } catch {
++        $status = 0
++    }
++
++    try {
++        $serverError = $exception.ServerError
++        if ($null -ne $serverError) {
++            $type = $serverError.error_type
++            if (-not [string]::IsNullOrWhiteSpace($type)) { $errorType = [string] $type }
++            $messages = @($serverError.messages)
++            if ($messages.Count -gt 0 -and $null -ne $messages[0]) {
++                $default = $messages[0].default_message
++                if (-not [string]::IsNullOrWhiteSpace($default)) { $message = [string] $default }
++            }
++        }
++    } catch {
++        # Leave the transport message in place when the body is not a vAPI error.
++    }
++
++    [pscustomobject] @{
++        Status    = $status
++        ErrorType = $errorType
++        Message   = ([string] $message).Trim()
++    }
++}
++
++function Invoke-VcfResourcePoolRollout {
++    <#
++        .SYNOPSIS
++        Applies a resource pool plan to one vCenter, one pool at a time, and
++        reports exactly how far it got.
++
++        .DESCRIPTION
++        The pools are created in plan order.  The first failure stops the
++        rollout: the pools already created stay created, and the report names
++        them, the pool that failed, and the pools that were never attempted.
++        A failing step is reported, not thrown, because the change is by then
++        partially applied and the operator needs the record.  Only a failure
++        that leaves vCenter untouched - a refused session or a parent pool that
++        cannot be resolved - is thrown.
++    #>
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] [ValidateNotNullOrEmpty()] [string] $Server,
++        [Parameter(Mandatory)] [ValidateNotNull()] [pscredential] $Credential,
++        [Parameter(Mandatory)] [ValidateNotNullOrEmpty()] [string] $PlanPath,
++        [switch] $SkipCertificateCheck
++    )
++
++    $plan = Read-RolloutPlan -Path $PlanPath
++
++    # UseDeprecatedApis is pinned so the runtime never probes the pre-7.0.2
++    # /rest endpoint, which is not part of the contract.  SerializeNulls is left
++    # off so an unset optional property is omitted instead of sent as null.
++    $configuration = New-vSphereServerConfiguration -Server $Server -Credential $Credential `
++        -SkipCertificateCheck:$SkipCertificateCheck.IsPresent -UseDeprecatedApis:$false -NotDefault
++
++    $request = @{
++        Accepts          = @('application/json')
++        ContentTypes     = @('application/json')
++        HeaderParameters = @{}
++        FormParameters   = @{}
++        QueryParameters  = @{}
++        CookieParameters = @{}
++        Body             = ''
++        IsBodyNullable   = $false
++        InvocationInfo   = @{}
++        Server           = $configuration
++    }
++
++    $created = [System.Collections.Generic.List[object]]::new()
++    $failed = $null
++    $notAttempted = [System.Collections.Generic.List[string]]::new()
++    $parentId = $null
++    $sessionOpen = $false
++
++    try {
++        # Cis.Session_create: basic auth, and the 201 body is the token.
++        $session = Invoke-vSphereApiClient @request -Uri $script:SessionPath -Method 'POST' `
++            -ReturnType 'String'
++        $token = $session.Response
++        if ([string]::IsNullOrWhiteSpace($token)) {
++            throw "vCenter $Server did not return a session token."
++        }
++        $sessionOpen = $true
++        Set-vSphereServerConfiguration -ServerConfiguration $configuration -ApiKey $token | Out-Null
++
++        # Vcenter.ResourcePool_list: names is the only filter this rollout sets,
++        # so it is the only query key that may reach the wire.
++        $listed = Invoke-vSphereApiClient @request -Uri $script:ResourcePoolPath -Method 'GET' `
++            -ReturnType 'VcenterResourcePoolSummary[]' `
++            -QueryParameters @{ names = @($plan.ParentPool) }
++        $matches = @(@($listed.Response) | Where-Object { $null -ne $_ -and $_.name -ceq $plan.ParentPool })
++        if ($matches.Count -eq 0) {
++            throw "vCenter $Server has no resource pool named '$($plan.ParentPool)'."
++        }
++        if ($matches.Count -gt 1) {
++            throw "vCenter $Server has $($matches.Count) resource pools named '$($plan.ParentPool)'."
++        }
++        $parentId = [string] $matches[0].resource_pool
++
++        for ($index = 0; $index -lt $plan.Pools.Count; $index++) {
++            $step = $plan.Pools[$index]
++
++            if ($null -ne $failed) {
++                $notAttempted.Add($step.Name)
++                continue
++            }
++
++            $specArguments = @{ Name = $step.Name; Parent = $parentId }
++            if ($null -ne $step.CpuAllocation) { $specArguments['CpuAllocation'] = $step.CpuAllocation }
++            if ($null -ne $step.MemoryAllocation) { $specArguments['MemoryAllocation'] = $step.MemoryAllocation }
++            $spec = Initialize-VcenterResourcePoolCreateSpec @specArguments
++
++            try {
++                $result = Invoke-vSphereApiClient @request -Uri $script:ResourcePoolPath `
++                    -Method 'POST' -ReturnType 'String' -Body ($spec.ToJson())
++                $created.Add([pscustomobject] @{
++                    Name           = $step.Name
++                    ResourcePoolId = [string] $result.Response
++                })
++            } catch {
++                $failure = Resolve-VapiFailure -ErrorRecord $_
++                $failed = [pscustomobject] @{
++                    Name      = $step.Name
++                    Status    = $failure.Status
++                    ErrorType = $failure.ErrorType
++                    Message   = $failure.Message
++                }
++            }
++        }
++    } finally {
++        if ($sessionOpen) {
++            # Cis.Session_delete runs whether the rollout finished or stopped
++            # on a failed step, and a refused teardown never masks the report.
++            try {
++                $null = Invoke-vSphereApiClient @request -Uri $script:SessionPath `
++                    -Method 'DELETE' -ReturnType ''
++            } catch {
++                Write-Verbose "Closing the vCenter session failed: $($_.Exception.Message)"
++            }
++        }
++    }
++
++    [pscustomobject] [ordered] @{
++        Server         = $Server
++        ParentPoolName = $plan.ParentPool
++        ParentPoolId   = $parentId
++        PlannedCount   = $plan.Pools.Count
++        CreatedCount   = $created.Count
++        Created        = @($created)
++        Failed         = $failed
++        NotAttempted   = @($notAttempted)
++        Succeeded      = ($null -eq $failed)
++    }
++}
++
++Export-ModuleMember -Function Invoke-VcfResourcePoolRollout

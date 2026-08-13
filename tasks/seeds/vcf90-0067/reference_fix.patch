@@ -1,0 +1,460 @@
+diff --git a/src/vcfops_triage/__main__.py b/src/vcfops_triage/__main__.py
+index 0d974e2..7928565 100644
+--- a/src/vcfops_triage/__main__.py
++++ b/src/vcfops_triage/__main__.py
+@@ -1,18 +1,139 @@
+ """Command line entry point: ``python -m vcfops_triage``.
+ 
+-See README.md for the argument list, the exit codes and the behaviour expected of
+-the triage run, including how a token that expires mid-batch has to be handled.
+-Nothing here is implemented yet.
++Annotates VMware Cloud Foundation Operations alerts with a triage note and writes
++a report to disk. See README.md for the arguments and the exit codes.
+ """
+ 
++import argparse
++import json
+ import sys
+ 
++from .client import ApiError, AuthError, OperationsClient, TransportError
++from .contract import (
++    ContractViolation,
++    load_contract,
++    validate_criticality,
++    validate_page_size,
++)
++from .triage import run_triage
++
++EXIT_OK = 0
++EXIT_ERROR = 1
++EXIT_BAD_REQUEST = 2
++EXIT_AUTH = 5
++
++
++def build_parser():
++    parser = argparse.ArgumentParser(
++        prog="python -m vcfops_triage",
++        description="Annotate VCF Operations alerts with a triage note.",
++    )
++    parser.add_argument("--base-url", required=True, help="scheme, host and port only")
++    parser.add_argument("--username", required=True)
++    parser.add_argument("--password", required=True)
++    parser.add_argument("--auth-source", default=None)
++    parser.add_argument(
++        "--criticality", required=True, help="comma-separated alert criticalities"
++    )
++    parser.add_argument("--alert-name", default=None, help="'contains' filter on name")
++    parser.add_argument("--note", required=True, help="the note to add to each alert")
++    parser.add_argument("--output", required=True, help="where to write the report")
++    parser.add_argument("--page-size", type=int, default=None)
++    parser.add_argument("--max-refreshes", type=int, default=3)
++    return parser
++
+ 
+ def main(argv=None):
+-    raise NotImplementedError(
+-        "vcfops_triage is not implemented yet: see README.md and docs/contract.json"
++    args = build_parser().parse_args(argv)
++
++    # Everything the contract can rule out is ruled out before a socket is opened.
++    try:
++        contract = load_contract()
++        criticality = validate_criticality(
++            contract,
++            [item.strip() for item in args.criticality.split(",") if item.strip()],
++        )
++        page_size = validate_page_size(contract, args.page_size)
++        if not args.note:
++            raise ContractViolation("--note must not be empty: content is required")
++        if args.max_refreshes < 0:
++            raise ContractViolation("--max-refreshes must not be negative")
++    except ContractViolation as exc:
++        print("invalid request: %s" % exc, file=sys.stderr)
++        return EXIT_BAD_REQUEST
++    except OSError as exc:
++        print("could not read the pinned contract: %s" % exc, file=sys.stderr)
++        return EXIT_ERROR
++
++    client = OperationsClient(
++        args.base_url,
++        contract,
++        args.username,
++        args.password,
++        auth_source=args.auth_source,
++        max_refreshes=args.max_refreshes,
+     )
+ 
++    try:
++        client.login()
++    except AuthError as exc:
++        print("authentication failed: %s" % exc, file=sys.stderr)
++        return EXIT_AUTH
++    except (ApiError, TransportError) as exc:
++        print("could not acquire a token: %s" % exc, file=sys.stderr)
++        return EXIT_ERROR
++
++    try:
++        report = run_triage(
++            client,
++            contract,
++            criticality,
++            args.note,
++            page_size=page_size,
++            alert_name=args.alert_name,
++        )
++    except AuthError as exc:
++        # The refresh budget is gone and the token is still rejected, so there is
++        # nothing live to release.
++        print("session could not be renewed: %s" % exc, file=sys.stderr)
++        return EXIT_AUTH
++    except (ApiError, TransportError) as exc:
++        print("triage failed: %s" % exc, file=sys.stderr)
++        _release_quietly(client)
++        return EXIT_ERROR
++
++    try:
++        client.logout()
++    except AuthError as exc:
++        print("session could not be renewed for release: %s" % exc, file=sys.stderr)
++        return EXIT_AUTH
++    except (ApiError, TransportError) as exc:
++        print("could not release the token: %s" % exc, file=sys.stderr)
++        return EXIT_ERROR
++    # Releasing is authenticated too, so it may have spent a refresh of its own.
++    report["tokenRefreshes"] = client.refreshes
++
++    try:
++        with open(args.output, "w", encoding="utf-8") as handle:
++            json.dump(report, handle, indent=2, sort_keys=True)
++            handle.write("\n")
++    except OSError as exc:
++        print("could not write %s: %s" % (args.output, exc), file=sys.stderr)
++        return EXIT_ERROR
++
++    print(
++        "annotated %d alert(s) over %d page(s) with %d token refresh(es)"
++        % (len(report["annotated"]), report["pagesFetched"], report["tokenRefreshes"])
++    )
++    return EXIT_OK
++
++
++def _release_quietly(client):
++    try:
++        client.logout()
++    except (ApiError, AuthError, TransportError) as exc:
++        print("warning: could not release the token: %s" % exc, file=sys.stderr)
++
+ 
+ if __name__ == "__main__":
+     sys.exit(main())
+diff --git a/src/vcfops_triage/client.py b/src/vcfops_triage/client.py
+new file mode 100644
+index 0000000..3bf3a73
+--- /dev/null
++++ b/src/vcfops_triage/client.py
+@@ -0,0 +1,164 @@
++"""HTTP transport for the four operations the pinned contract names.
++
++The one interesting thing here is :meth:`OperationsClient._call`. Every
++authenticated operation goes through it, and a ``401`` there is treated as "the
++token is finished", not "this request is bad": the client re-acquires and replays
++*that request alone*. Callers see a plain method call and never learn that a
++refresh happened, so no caller has to be written to cope with restarting.
++"""
++
++import json
++import urllib.error
++import urllib.parse
++import urllib.request
++
++from .contract import operation
++
++
++class TransportError(Exception):
++    """The request never produced an HTTP response."""
++
++
++class ApiError(Exception):
++    """The server answered, but not the way the contract says it should."""
++
++    def __init__(self, status, payload, message=None):
++        super().__init__(message or "unexpected HTTP %s: %s" % (status, payload))
++        self.status = status
++        self.payload = payload
++
++
++class AuthError(Exception):
++    """The credentials were rejected, or the refresh budget ran out."""
++
++
++def _decode(raw):
++    if not raw:
++        return None
++    try:
++        return json.loads(raw.decode("utf-8"))
++    except (UnicodeDecodeError, ValueError):
++        return raw.decode("utf-8", "replace")
++
++
++class OperationsClient:
++    """A session against one VCF Operations appliance."""
++
++    def __init__(self, base_url, contract, username, password, auth_source=None,
++                 max_refreshes=3, timeout=30):
++        self.base_url = base_url.rstrip("/")
++        self.contract = contract
++        self.username = username
++        self.password = password
++        self.auth_source = auth_source
++        self.max_refreshes = max_refreshes
++        self.timeout = timeout
++
++        self.token = None
++        self.refreshes = 0
++
++        security = contract["security"]
++        self.auth_header = security["headerName"]
++        self.auth_template = security["headerValueTemplate"]
++
++    # -- plumbing ---------------------------------------------------------
++
++    def _url(self, path, query=None):
++        url = self.base_url + path
++        if query:
++            url += "?" + urllib.parse.urlencode(query)
++        return url
++
++    def _send(self, method, url, body=None, authenticated=True):
++        headers = {"Accept": "application/json"}
++        data = None
++        if body is not None:
++            data = json.dumps(body).encode("utf-8")
++            headers["Content-Type"] = "application/json"
++        if authenticated:
++            headers[self.auth_header] = self.auth_template.format(token=self.token)
++        request = urllib.request.Request(url, data=data, headers=headers, method=method)
++        try:
++            with urllib.request.urlopen(request, timeout=self.timeout) as response:
++                return response.status, _decode(response.read())
++        except urllib.error.HTTPError as exc:
++            return exc.code, _decode(exc.read())
++        except urllib.error.URLError as exc:
++            raise TransportError("%s %s: %s" % (method, url, exc.reason)) from exc
++
++    def _call(self, operation_id, path=None, query=None, body=None, expect=200):
++        """Send an authenticated operation, refreshing and replaying on a 401."""
++        spec = operation(self.contract, operation_id)
++        url = self._url(path or spec["path"], query)
++        while True:
++            status, payload = self._send(spec["method"], url, body)
++            if status == expect:
++                return payload
++            if status != 401:
++                raise ApiError(status, payload)
++            # The token is finished. Spend a refresh and re-send this one request;
++            # everything the server already accepted stays accepted.
++            if self.refreshes >= self.max_refreshes:
++                raise AuthError(
++                    "token still rejected after %d refresh(es); giving up on %s"
++                    % (self.refreshes, operation_id)
++                )
++            self.refreshes += 1
++            self.token = None
++            self._acquire()
++
++    # -- operations -------------------------------------------------------
++
++    def _acquire(self):
++        spec = operation(self.contract, "acquireToken")
++        body = {"username": self.username, "password": self.password}
++        # authSource is optional: when we were not given one, it must not appear in
++        # the body at all -- not as null, not as "".
++        if self.auth_source:
++            body["authSource"] = self.auth_source
++        status, payload = self._send(
++            spec["method"], self._url(spec["path"]), body, authenticated=False
++        )
++        if status == 401:
++            raise AuthError("authentication failed for user %r" % self.username)
++        if status != 200:
++            raise ApiError(status, payload)
++        if not isinstance(payload, dict) or not payload.get("token"):
++            raise ApiError(status, payload, "acquireToken returned no token")
++        self.token = payload["token"]
++        return payload
++
++    def login(self):
++        return self._acquire()
++
++    def query_alerts(self, page, page_size, criticality, alert_name=None):
++        query = {"page": page}
++        # pageSize is optional and documented with a default: omit it entirely
++        # rather than sending the default back, and never send it empty.
++        if page_size is not None:
++            query["pageSize"] = page_size
++        body = {"activeOnly": True, "alertCriticality": list(criticality)}
++        if alert_name:
++            body["alertName"] = alert_name
++        payload = self._call("queryAlert", query=query, body=body)
++        if not isinstance(payload, dict):
++            raise ApiError(200, payload, "queryAlert returned a non-object body")
++        return payload
++
++    def add_alert_note(self, alert_id, content):
++        spec = operation(self.contract, "addAlertNote")
++        path = spec["path"].replace("{id}", urllib.parse.quote(alert_id, safe=""))
++        payload = self._call("addAlertNote", path=path, body={"content": content},
++                             expect=201)
++        if not isinstance(payload, dict) or "id" not in payload:
++            raise ApiError(201, payload, "addAlertNote returned no alert-note id")
++        return payload
++
++    def logout(self):
++        # releaseToken is authenticated, so the contract's 401 rule applies here
++        # just as it does to queryAlert and addAlertNote.
++        if self.token is None:
++            return
++        payload = self._call("releaseToken")
++        self.token = None
++        return payload
+diff --git a/src/vcfops_triage/contract.py b/src/vcfops_triage/contract.py
+new file mode 100644
+index 0000000..59ed964
+--- /dev/null
++++ b/src/vcfops_triage/contract.py
+@@ -0,0 +1,76 @@
++"""Loading of, and validation against, the pinned REST contract.
++
++``docs/contract.json`` is the authority for paths, query parameters, required and
++optional body fields and the enum vocabularies. Nothing in this package hardcodes
++a path or an enum member that the contract does not carry.
++"""
++
++import json
++import os
++
++REPO_ROOT = os.path.dirname(
++    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++)
++DEFAULT_CONTRACT_PATH = os.path.join(REPO_ROOT, "docs", "contract.json")
++
++CRITICALITY_ENUM_KEY = "alert-query.alertCriticality[]"
++
++
++class ContractViolation(Exception):
++    """A request we were asked to make that the pinned contract forbids."""
++
++
++def load_contract(path=None):
++    with open(path or DEFAULT_CONTRACT_PATH, "r", encoding="utf-8") as handle:
++        return json.load(handle)
++
++
++def operation(contract, operation_id):
++    try:
++        return contract["operations"][operation_id]
++    except KeyError:
++        raise ContractViolation(
++            "the pinned contract does not name an operation %r" % operation_id
++        ) from None
++
++
++def query_parameter_default(contract, operation_id, name):
++    for item in operation(contract, operation_id).get("queryParameters", []):
++        if item["name"] == name:
++            return item["default"]
++    raise ContractViolation(
++        "%s has no query parameter %r in the pinned contract" % (operation_id, name)
++    )
++
++
++def validate_criticality(contract, values):
++    """Check every requested criticality against the 9.0.0.0 enum."""
++    allowed = contract["enums"][CRITICALITY_ENUM_KEY]
++    unknown = [value for value in values if value not in allowed]
++    if unknown:
++        raise ContractViolation(
++            "unknown alert criticality %s; the pinned contract allows %s"
++            % (", ".join(repr(value) for value in unknown), ", ".join(allowed))
++        )
++    if not values:
++        raise ContractViolation("at least one alert criticality is required")
++    return list(values)
++
++
++def validate_page_size(contract, page_size):
++    """``None`` means 'leave pageSize off the URL and take the server default'."""
++    if page_size is None:
++        return None
++    minimum = contract["paging"]["minimumPageSize"]
++    if page_size < minimum:
++        raise ContractViolation(
++            "pageSize must be at least %d, got %d" % (minimum, page_size)
++        )
++    return page_size
++
++
++def effective_page_size(contract, page_size):
++    """The page size the server will actually apply, used by the stop rule."""
++    if page_size is not None:
++        return page_size
++    return query_parameter_default(contract, "queryAlert", "pageSize")
+diff --git a/src/vcfops_triage/triage.py b/src/vcfops_triage/triage.py
+new file mode 100644
+index 0000000..81febac
+--- /dev/null
++++ b/src/vcfops_triage/triage.py
+@@ -0,0 +1,53 @@
++"""The triage run itself: walk the alert pages, note each alert once.
++
++The loop is written as if the session never lapsed. That is the point --
++:class:`~vcfops_triage.client.OperationsClient` absorbs the refresh, so the state
++that matters here (which page we are on, which alerts on it are still un-noted)
++is never unwound. An alert is appended to ``annotated`` only after the server has
++answered ``201``, so a replayed request cannot double-count and a lost one cannot
++be silently skipped.
++"""
++
++from .contract import effective_page_size
++
++
++def run_triage(client, contract, criticality, note, page_size=None, alert_name=None):
++    paging = contract["paging"]
++    result_field = paging["resultField"]
++    page_info_field = paging["pageInfoField"]
++    window = effective_page_size(contract, page_size)
++
++    annotated = []
++    seen = set()
++    page = paging["firstPage"]
++    pages_fetched = 0
++    total_count = None
++
++    while True:
++        payload = client.query_alerts(page, page_size, criticality, alert_name)
++        pages_fetched += 1
++        alerts = payload.get(result_field) or []
++        info = payload.get(page_info_field) or {}
++        if total_count is None:
++            total_count = info.get("totalCount")
++
++        for alert in alerts:
++            alert_id = alert.get("alertId")
++            if not alert_id or alert_id in seen:
++                continue
++            created = client.add_alert_note(alert_id, note)
++            seen.add(alert_id)
++            annotated.append({"alertId": alert_id, "noteId": created["id"]})
++
++        # A page shorter than the page size in effect is the last one; asking for
++        # the page after it would be a request we already know is empty.
++        if len(alerts) < window:
++            break
++        page += 1
++
++    return {
++        "alertsMatched": total_count if total_count is not None else len(annotated),
++        "pagesFetched": pages_fetched,
++        "tokenRefreshes": client.refreshes,
++        "annotated": annotated,
++    }

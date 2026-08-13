@@ -1,0 +1,315 @@
+diff --git a/SddcCredentialClient.java b/SddcCredentialClient.java
+index 4722d42..4e4f0cb 100644
+--- a/SddcCredentialClient.java
++++ b/SddcCredentialClient.java
+@@ -1,4 +1,18 @@
++import java.net.URI;
++import java.net.URLEncoder;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.time.Duration;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
+ 
+ /**
+  * Rotates the ESXi SSH passwords held by an SDDC Manager appliance.
+@@ -6,13 +20,30 @@ import java.util.List;
+  * <p>The five operations this client is allowed to use are described in {@code docs/contract.json},
+  * which is transcribed from the VMware Cloud Foundation 9.0 SDDC Manager OpenAPI document.
+  *
+- * <p>Not implemented yet.
++ * <p>The appliance hands out a short-lived access token, and it can expire while several requests
++ * are already in flight. Each of those comes back 401, and each of them is worth rescuing: they wait
++ * on one shared refresh rather than starting their own, then replay themselves on the new token.
++ * Nothing is ever sent on a token that has already been replaced.
+  */
+ public final class SddcCredentialClient implements AutoCloseable {
+ 
++    private static final Set<String> TERMINAL_STATUSES =
++            Set.of("SUCCESSFUL", "FAILED", "USER_CANCELLED", "INCONSISTENT");
++    private static final long POLL_INTERVAL_MILLIS = 120;
++
+     private final String baseUrl;
+     private final String username;
+     private final String password;
++    private final HttpClient http;
++    private final ExecutorService lookups;
++
++    /** Guards every field below it. */
++    private final Object tokenLock = new Object();
++    private String accessToken;
++    private String refreshTokenId;
++    private long tokenGeneration;
++    private boolean refreshInFlight;
++    private int refreshCount;
+ 
+     /**
+      * @param baseUrl  scheme, host and port of the appliance, with no trailing slash
+@@ -20,9 +51,15 @@ public final class SddcCredentialClient implements AutoCloseable {
+      * @param password the password for {@code username}
+      */
+     public SddcCredentialClient(String baseUrl, String username, String password) {
+-        this.baseUrl = baseUrl;
++        this.baseUrl = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
+         this.username = username;
+         this.password = password;
++        this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
++        this.lookups = Executors.newCachedThreadPool(runnable -> {
++            Thread thread = new Thread(runnable, "sddc-credential-lookup");
++            thread.setDaemon(true);
++            return thread;
++        });
+     }
+ 
+     /**
+@@ -34,11 +71,240 @@ public final class SddcCredentialClient implements AutoCloseable {
+      * @return what the run produced
+      */
+     public RotationResult rotateSshPasswords(List<String> resourceNames) throws Exception {
+-        throw new UnsupportedOperationException("SddcCredentialClient.rotateSshPasswords is not implemented");
++        createToken();
++
++        // Every lookup goes out at once, so the token can expire with all of them in flight.
++        List<Future<StoredCredential>> pending = new ArrayList<>();
++        for (String resourceName : resourceNames) {
++            pending.add(lookups.submit(() -> lookUpUserCredential(resourceName)));
++        }
++        List<StoredCredential> credentials = new ArrayList<>();
++        for (Future<StoredCredential> future : pending) {
++            credentials.add(future.get());
++        }
++
++        String taskId = submitRotation(credentials);
++        String status = pollUntilTerminal(taskId);
++
++        List<String> credentialIds = new ArrayList<>();
++        for (StoredCredential credential : credentials) {
++            credentialIds.add(credential.credentialId());
++        }
++        credentialIds.sort(String::compareTo);
++        synchronized (tokenLock) {
++            return new RotationResult(taskId, status, credentialIds, refreshCount);
++        }
+     }
+ 
+     @Override
+     public void close() {
+-        // Release anything the implementation allocated.
++        lookups.shutdownNow();
++        http.close();
++    }
++
++    // ----------------------------------------------------------- operations
++
++    /** createToken: mints the first access token and the refresh token that outlives it. */
++    private void createToken() throws Exception {
++        Map<String, Object> spec = new LinkedHashMap<>();
++        spec.put("username", username);
++        spec.put("password", password);
++        // apiKey and idToken are optional and unset here, so they stay out of the body entirely.
++
++        HttpRequest request = json(HttpRequest.newBuilder(URI.create(baseUrl + "/v1/tokens")))
++                .POST(HttpRequest.BodyPublishers.ofString(Json.write(spec), StandardCharsets.UTF_8))
++                .build();
++        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
++        if (response.statusCode() != 201) {
++            throw failure("createToken", response);
++        }
++        Object pair = Json.parse(response.body());
++        synchronized (tokenLock) {
++            accessToken = Json.asString(Json.get(pair, "accessToken"));
++            refreshTokenId = Json.asString(Json.get(Json.get(pair, "refreshToken"), "id"));
++            tokenGeneration = 1;
++        }
++    }
++
++    /** getCredentials: resolves one host to the root SSH credential of its USER account. */
++    private StoredCredential lookUpUserCredential(String resourceName) throws Exception {
++        String query = "resourceName=" + URLEncoder.encode(resourceName, StandardCharsets.UTF_8)
++                + "&accountType=USER";
++        HttpResponse<String> response = sendAuthenticated(() ->
++                HttpRequest.newBuilder(URI.create(baseUrl + "/v1/credentials?" + query)).GET());
++        if (response.statusCode() != 200) {
++            throw failure("getCredentials", response);
++        }
++        for (Object element : Json.asArray(Json.get(Json.parse(response.body()), "elements"))) {
++            if (!"SSH".equals(Json.getString(element, "credentialType"))
++                    || !"USER".equals(Json.getString(element, "accountType"))
++                    || !"root".equals(Json.getString(element, "username"))) {
++                continue;
++            }
++            Object resource = Json.get(element, "resource");
++            return new StoredCredential(
++                    Json.asString(Json.get(element, "id")),
++                    Json.asString(Json.get(resource, "resourceId")),
++                    Json.asString(Json.get(resource, "resourceType")),
++                    Json.asString(Json.get(element, "credentialType")),
++                    Json.asString(Json.get(element, "accountType")),
++                    Json.asString(Json.get(element, "username")));
++        }
++        throw new IllegalStateException("no SSH credential for the root USER account on " + resourceName);
++    }
++
++    /** updateOrRotatePasswords: asks the appliance to generate new secrets for these accounts. */
++    private String submitRotation(List<StoredCredential> credentials) throws Exception {
++        List<Object> elements = new ArrayList<>();
++        for (StoredCredential credential : credentials) {
++            Map<String, Object> account = new LinkedHashMap<>();
++            account.put("credentialType", credential.credentialType());
++            account.put("accountType", credential.accountType());
++            account.put("username", credential.username());
++            // No password member: on a ROTATE the appliance generates the new secret.
++
++            Map<String, Object> element = new LinkedHashMap<>();
++            element.put("resourceId", credential.resourceId());
++            element.put("resourceType", credential.resourceType());
++            element.put("credentials", List.of(account));
++            elements.add(element);
++        }
++        Map<String, Object> spec = new LinkedHashMap<>();
++        spec.put("operationType", "ROTATE");
++        spec.put("elements", elements);
++        // autoRotatePolicy is optional and unset here, so it stays out of the body entirely.
++
++        String body = Json.write(spec);
++        HttpResponse<String> response = sendAuthenticated(() ->
++                json(HttpRequest.newBuilder(URI.create(baseUrl + "/v1/credentials")))
++                        .method("PATCH", HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8)));
++        if (response.statusCode() != 202) {
++            throw failure("updateOrRotatePasswords", response);
++        }
++        return Json.asString(Json.get(Json.parse(response.body()), "id"));
++    }
++
++    /** getCredentialsTask: follows the task until it settles, then stops. */
++    private String pollUntilTerminal(String taskId) throws Exception {
++        String path = baseUrl + "/v1/credentials/tasks/"
++                + URLEncoder.encode(taskId, StandardCharsets.UTF_8);
++        while (true) {
++            HttpResponse<String> response = sendAuthenticated(() ->
++                    HttpRequest.newBuilder(URI.create(path)).GET());
++            if (response.statusCode() != 200) {
++                throw failure("getCredentialsTask", response);
++            }
++            String status = Json.getString(Json.parse(response.body()), "status");
++            if (status != null && TERMINAL_STATUSES.contains(status)) {
++                return status;
++            }
++            Thread.sleep(POLL_INTERVAL_MILLIS);
++        }
++    }
++
++    // -------------------------------------------------------- token plumbing
++
++    @FunctionalInterface
++    private interface RequestFactory {
++        HttpRequest.Builder build();
++    }
++
++    /**
++     * Sends a request on the current access token. A 401 means the token was replaced underneath
++     * this request, so the request is not lost: it waits for the refresh and then goes out again on
++     * the new token.
++     */
++    private HttpResponse<String> sendAuthenticated(RequestFactory factory) throws Exception {
++        for (int attempt = 0; attempt < 2; attempt++) {
++            String token;
++            long generation;
++            synchronized (tokenLock) {
++                token = accessToken;
++                generation = tokenGeneration;
++            }
++            HttpRequest request = factory.build()
++                    .header("Authorization", "Bearer " + token)
++                    .build();
++            HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
++            if (response.statusCode() != 401) {
++                return response;
++            }
++            refreshPast(generation);
++        }
++        throw new IllegalStateException("the appliance rejected the access token twice in a row");
++    }
++
++    /**
++     * Makes sure an access token newer than {@code staleGeneration} exists. Only one caller performs
++     * the exchange; the rest wait for it and reuse the result, so a batch of requests stranded on the
++     * same expired token costs exactly one refreshAccessToken call.
++     */
++    private void refreshPast(long staleGeneration) throws Exception {
++        synchronized (tokenLock) {
++            while (true) {
++                if (tokenGeneration > staleGeneration) {
++                    return; // Somebody else already replaced it.
++                }
++                if (!refreshInFlight) {
++                    refreshInFlight = true;
++                    break; // This caller owns the exchange.
++                }
++                tokenLock.wait();
++            }
++        }
++        try {
++            String fresh = exchangeRefreshToken();
++            synchronized (tokenLock) {
++                accessToken = fresh;
++                tokenGeneration++;
++                refreshCount++;
++            }
++        } finally {
++            synchronized (tokenLock) {
++                refreshInFlight = false;
++                tokenLock.notifyAll();
++            }
++        }
++    }
++
++    /** refreshAccessToken: the body is a bare JSON string holding the refresh token id. */
++    private String exchangeRefreshToken() throws Exception {
++        String id;
++        synchronized (tokenLock) {
++            id = refreshTokenId;
++        }
++        HttpRequest request = json(HttpRequest.newBuilder(
++                URI.create(baseUrl + "/v1/tokens/access-token/refresh")))
++                .method("PATCH", HttpRequest.BodyPublishers.ofString(Json.write(id), StandardCharsets.UTF_8))
++                .build();
++        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
++        if (response.statusCode() != 200) {
++            throw failure("refreshAccessToken", response);
++        }
++        return Json.asString(Json.parse(response.body()));
++    }
++
++    // --------------------------------------------------------------- shared
++
++    private static HttpRequest.Builder json(HttpRequest.Builder builder) {
++        return builder.header("Content-Type", "application/json").header("Accept", "application/json");
++    }
++
++    private static IllegalStateException failure(String operationId, HttpResponse<String> response) {
++        String message;
++        try {
++            message = Json.getString(Json.parse(response.body()), "message");
++        } catch (RuntimeException unreadable) {
++            message = response.body();
++        }
++        return new IllegalStateException(operationId + " answered " + response.statusCode() + ": " + message);
++    }
++
++    private record StoredCredential(String credentialId,
++                                    String resourceId,
++                                    String resourceType,
++                                    String credentialType,
++                                    String accountType,
++                                    String username) {
+     }
+ }

@@ -1,0 +1,340 @@
+--- a/vcfinstaller/client.go
++++ b/vcfinstaller/client.go
+@@ -1,9 +1,17 @@
+ package vcfinstaller
+ 
+ import (
++	"bytes"
+ 	"context"
+-	"errors"
++	"encoding/json"
++	"fmt"
++	"io"
++	"mime"
+ 	"net/http"
++	"net/url"
++	"sort"
++	"strconv"
++	"strings"
+ )
+ 
+ // Task is the focused getTasks representation used by this package.
+@@ -45,14 +53,314 @@
+ func (e *ProtocolError) Error() string { return "VCF Installer protocol error: " + e.Reason }
+ 
+ // Client calls the VCF Installer API.
+-type Client struct{}
++type Client struct {
++	baseURL     string
++	accessToken string
++	httpClient  *http.Client
++}
+ 
+-// NewClient constructs a client. It is intentionally incomplete.
++// NewClient constructs a client.
+ func NewClient(baseURL, accessToken string, httpClient *http.Client) (*Client, error) {
+-	return nil, errors.New("TODO: implement NewClient")
++	parsed, err := url.Parse(baseURL)
++	if err != nil || parsed == nil {
++		return nil, fmt.Errorf("base URL must be an HTTP(S) service root")
++	}
++	parsed.Scheme = strings.ToLower(parsed.Scheme)
++	if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.Hostname() == "" ||
++		parsed.User != nil || parsed.Opaque != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" ||
++		(parsed.Path != "" && parsed.Path != "/") {
++		return nil, fmt.Errorf("base URL must be an HTTP(S) service root")
++	}
++	if !safeToken(accessToken) {
++		return nil, fmt.Errorf("access token must be nonblank and safe for an HTTP header")
++	}
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++	parsed.Path = ""
++	parsed.RawPath = ""
++	return &Client{
++		baseURL:     strings.TrimSuffix(parsed.String(), "/"),
++		accessToken: accessToken,
++		httpClient:  httpClient,
++	}, nil
+ }
+ 
+ // ListAllTasks retrieves and orders the complete task collection.
+ func (c *Client) ListAllTasks(ctx context.Context, options ListTasksOptions) ([]Task, error) {
+-	return nil, errors.New("TODO: implement ListAllTasks")
++	if ctx == nil {
++		return nil, fmt.Errorf("context must not be nil")
++	}
++	if options.PageSize < 1 || options.PageSize > 100 {
++		return nil, fmt.Errorf("page size must be between 1 and 100")
++	}
++	if c == nil || c.httpClient == nil {
++		return nil, fmt.Errorf("client is not initialized")
++	}
++
++	var tasks []Task
++	seenIDs := make(map[string]struct{})
++	expectedPage := 0
++	expectedTotalElements := -1
++	expectedTotalPages := -1
++
++	for {
++		query := options.query(expectedPage)
++		requestURL := c.baseURL + "/v1/tasks?" + query.Encode()
++		request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
++		if err != nil {
++			return nil, fmt.Errorf("build getTasks request: %w", err)
++		}
++		request.Header.Set("Authorization", "Bearer "+c.accessToken)
++		request.Header.Set("Accept", "application/json")
++
++		response, err := c.httpClient.Do(request)
++		if err != nil {
++			return nil, fmt.Errorf("getTasks request failed: %w", err)
++		}
++		body, readErr := io.ReadAll(response.Body)
++		closeErr := response.Body.Close()
++		if readErr != nil {
++			return nil, fmt.Errorf("read getTasks response: %w", readErr)
++		}
++		if closeErr != nil {
++			return nil, fmt.Errorf("close getTasks response: %w", closeErr)
++		}
++		if response.StatusCode != http.StatusOK {
++			return nil, decodeAPIError(response.StatusCode, body)
++		}
++		if !isJSONMediaType(response.Header.Get("Content-Type")) {
++			return nil, protocolError("successful getTasks response is not application/json")
++		}
++
++		current, err := decodePage(body)
++		if err != nil {
++			return nil, err
++		}
++		meta := current.metadata
++		if meta.pageNumber < 0 || meta.pageSize < 0 || meta.totalElements < 0 || meta.totalPages < 0 {
++			return nil, protocolError("page metadata contains a negative value")
++		}
++		if meta.pageNumber != expectedPage {
++			return nil, protocolError(fmt.Sprintf("returned page %d, requested page %d", meta.pageNumber, expectedPage))
++		}
++		if meta.pageSize != len(current.elements) {
++			return nil, protocolError("pageMetadata.pageSize does not equal the current element count")
++		}
++		if meta.pageSize > options.PageSize {
++			return nil, protocolError("page is larger than the requested page size")
++		}
++
++		calculatedPages := meta.totalElements / options.PageSize
++		if meta.totalElements%options.PageSize != 0 {
++			calculatedPages++
++		}
++		if meta.totalPages != calculatedPages {
++			return nil, protocolError("totalPages is incoherent with totalElements and the requested page size")
++		}
++		if expectedTotalElements == -1 {
++			expectedTotalElements = meta.totalElements
++			expectedTotalPages = meta.totalPages
++		} else if meta.totalElements != expectedTotalElements || meta.totalPages != expectedTotalPages {
++			return nil, protocolError("page totals changed while collecting the task collection")
++		}
++
++		if meta.totalPages == 0 {
++			if meta.pageNumber != 0 || meta.totalElements != 0 || len(current.elements) != 0 {
++				return nil, protocolError("empty collection metadata is incoherent")
++			}
++			break
++		}
++		if meta.pageNumber >= meta.totalPages {
++			return nil, protocolError("page number is outside totalPages")
++		}
++		isFinalPage := meta.pageNumber == meta.totalPages-1
++		if !isFinalPage && len(current.elements) != options.PageSize {
++			return nil, protocolError("non-final page is empty or not full")
++		}
++		if len(tasks)+len(current.elements) > meta.totalElements {
++			return nil, protocolError("page elements overshoot totalElements")
++		}
++
++		for _, task := range current.elements {
++			if strings.TrimSpace(task.ID) == "" || strings.TrimSpace(task.Name) == "" ||
++				strings.TrimSpace(task.Status) == "" || strings.TrimSpace(task.CreationTimestamp) == "" {
++				return nil, protocolError("task is missing a required nonblank field")
++			}
++			if _, exists := seenIDs[task.ID]; exists {
++				return nil, protocolError("duplicate task ID")
++			}
++			seenIDs[task.ID] = struct{}{}
++			tasks = append(tasks, task)
++		}
++
++		if isFinalPage {
++			if len(tasks) != meta.totalElements {
++				return nil, protocolError("final accumulated task count does not equal totalElements")
++			}
++			break
++		}
++		expectedPage = meta.pageNumber + 1
++	}
++
++	sort.Slice(tasks, func(i, j int) bool {
++		if tasks[i].CreationTimestamp == tasks[j].CreationTimestamp {
++			return tasks[i].ID < tasks[j].ID
++		}
++		return tasks[i].CreationTimestamp < tasks[j].CreationTimestamp
++	})
++	if tasks == nil {
++		return []Task{}, nil
++	}
++	return tasks, nil
++}
++
++func safeToken(value string) bool {
++	if strings.TrimSpace(value) == "" || value != strings.TrimSpace(value) {
++		return false
++	}
++	for i := 0; i < len(value); i++ {
++		if value[i] < 0x20 || value[i] == 0x7f {
++			return false
++		}
++	}
++	return true
++}
++
++func (options ListTasksOptions) query(pageNumber int) url.Values {
++	query := make(url.Values)
++	query.Set("pageSize", strconv.Itoa(options.PageSize))
++	if pageNumber > 0 {
++		query.Set("pageNumber", strconv.Itoa(pageNumber))
++	}
++	if options.Limit != nil {
++		query.Set("limit", strconv.Itoa(*options.Limit))
++	}
++	if options.TaskStatus != nil {
++		query.Set("taskStatus", *options.TaskStatus)
++	}
++	if options.TaskType != nil {
++		query.Set("taskType", *options.TaskType)
++	}
++	if options.ResourceID != nil {
++		query.Set("resourceId", *options.ResourceID)
++	}
++	if options.ResourceType != nil {
++		query.Set("resourceType", *options.ResourceType)
++	}
++	if options.CompletedAfter != nil {
++		query.Set("completedAfter", strconv.FormatInt(*options.CompletedAfter, 10))
++	}
++	if options.OrderDirection != nil {
++		query.Set("orderDirection", *options.OrderDirection)
++	}
++	if options.OrderBy != nil {
++		query.Set("orderBy", *options.OrderBy)
++	}
++	if options.TaskName != nil {
++		query.Set("taskName", *options.TaskName)
++	}
++	if options.DoLiveRefresh != nil {
++		query.Set("doLiveRefresh", strconv.FormatBool(*options.DoLiveRefresh))
++	}
++	return query
+ }
++
++type decodedMetadata struct {
++	pageNumber    int
++	pageSize      int
++	totalElements int
++	totalPages    int
++}
++
++type decodedPage struct {
++	elements []Task
++	metadata decodedMetadata
++}
++
++func decodePage(body []byte) (decodedPage, error) {
++	var envelope struct {
++		Elements     json.RawMessage `json:"elements"`
++		PageMetadata json.RawMessage `json:"pageMetadata"`
++	}
++	decoder := json.NewDecoder(bytes.NewReader(body))
++	if err := decoder.Decode(&envelope); err != nil {
++		return decodedPage{}, protocolError("malformed getTasks JSON: " + err.Error())
++	}
++	var trailing any
++	if err := decoder.Decode(&trailing); err != io.EOF {
++		return decodedPage{}, protocolError("getTasks response contains trailing JSON")
++	}
++	if missingOrNull(envelope.Elements) {
++		return decodedPage{}, protocolError("elements must be a non-null array")
++	}
++	if missingOrNull(envelope.PageMetadata) {
++		return decodedPage{}, protocolError("pageMetadata must be an object")
++	}
++
++	var rawElements []json.RawMessage
++	if err := json.Unmarshal(envelope.Elements, &rawElements); err != nil || rawElements == nil {
++		return decodedPage{}, protocolError("elements must be a non-null task array")
++	}
++	elements := make([]Task, len(rawElements))
++	for index, rawElement := range rawElements {
++		if missingOrNull(rawElement) {
++			return decodedPage{}, protocolError("elements must not contain null tasks")
++		}
++		var memberPresence struct {
++			Type json.RawMessage `json:"type"`
++		}
++		if err := json.Unmarshal(rawElement, &memberPresence); err != nil {
++			return decodedPage{}, protocolError("each element must be a task object")
++		}
++		if len(memberPresence.Type) != 0 && missingOrNull(memberPresence.Type) {
++			return decodedPage{}, protocolError("task type must be a string when present")
++		}
++		if err := json.Unmarshal(rawElement, &elements[index]); err != nil {
++			return decodedPage{}, protocolError("task fields must have their specified JSON types")
++		}
++	}
++	var rawMetadata struct {
++		PageNumber    *int `json:"pageNumber"`
++		PageSize      *int `json:"pageSize"`
++		TotalElements *int `json:"totalElements"`
++		TotalPages    *int `json:"totalPages"`
++	}
++	if err := json.Unmarshal(envelope.PageMetadata, &rawMetadata); err != nil {
++		return decodedPage{}, protocolError("pageMetadata must contain integer members")
++	}
++	if rawMetadata.PageNumber == nil || rawMetadata.PageSize == nil ||
++		rawMetadata.TotalElements == nil || rawMetadata.TotalPages == nil {
++		return decodedPage{}, protocolError("pageMetadata is missing a required member")
++	}
++	return decodedPage{
++		elements: elements,
++		metadata: decodedMetadata{
++			pageNumber:    *rawMetadata.PageNumber,
++			pageSize:      *rawMetadata.PageSize,
++			totalElements: *rawMetadata.TotalElements,
++			totalPages:    *rawMetadata.TotalPages,
++		},
++	}, nil
++}
++
++func missingOrNull(raw json.RawMessage) bool {
++	trimmed := bytes.TrimSpace(raw)
++	return len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null"))
++}
++
++func isJSONMediaType(value string) bool {
++	mediaType, _, err := mime.ParseMediaType(value)
++	return err == nil && strings.EqualFold(mediaType, "application/json")
++}
++
++func decodeAPIError(statusCode int, body []byte) error {
++	var document struct {
++		ErrorCode string `json:"errorCode"`
++		Message   string `json:"message"`
++	}
++	_ = json.Unmarshal(body, &document)
++	return &APIError{StatusCode: statusCode, ErrorCode: document.ErrorCode, Message: document.Message}
++}
++
++func protocolError(reason string) error { return &ProtocolError{Reason: reason} }

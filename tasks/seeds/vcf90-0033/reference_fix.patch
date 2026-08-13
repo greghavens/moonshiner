@@ -1,0 +1,323 @@
+--- a/module/VcfVcenterVmClone/VcfVcenterVmClone.psm1
++++ b/module/VcfVcenterVmClone/VcfVcenterVmClone.psm1
+@@ -12,22 +12,129 @@
+       Cis.Tasks_get
+ 
+     Requests are issued with the OpenAPI client runtime that ships with the
+-    VMware.Sdk.Vcf PowerCLI modules, for example:
++    VMware.Sdk.Vcf PowerCLI modules. That runtime returns non-success statuses
++    on the response object rather than throwing, so every call site inspects
++    StatusCode itself.
++#>
+ 
+-      $http   = [System.Net.Http.HttpClient]::new()
+-      $client = [VMware.Binding.OpenApi.Client.ApiClient]::new($http, $basePath, $handler)
+-      $config = [VMware.Binding.OpenApi.Client.Configuration]::new()
+-      $config.BasePath = $basePath
+-      $options = [VMware.Binding.OpenApi.Client.RequestOptions]::new()
+-      $options.PathParameters.Add('task', $taskId)
+-      $options.QueryParameters.Add('vmw-task', 'true')
+-      $options.HeaderParameters.Add('vmware-api-session-id', $token)
+-      $options.Data = @{ name = $Name; source = $SourceVm }
+-      $response = $client.Post[string]('/vcenter/vm', $options, $config)
++$script:BasePathSuffix = '/api'
++$script:SessionHeader = 'vmware-api-session-id'
++$script:TerminalStatuses = @('SUCCEEDED', 'FAILED')
+ 
+-    $response exposes StatusCode, Data and ErrorText. Non-success statuses are
+-    returned rather than thrown, so callers must inspect StatusCode themselves.
+-#>
++function Resolve-VcfVcenterBasePath {
++    <#
++        Accepts either a bare host name (HTTPS is assumed) or an absolute
++        http/https URL, and returns the service base path.
++    #>
++    [CmdletBinding()]
++    param([Parameter(Mandatory)][string] $Server)
++
++    $trimmed = $Server.Trim()
++    if ([string]::IsNullOrWhiteSpace($trimmed)) {
++        throw [System.ArgumentException]::new('Server must not be blank.', 'Server')
++    }
++
++    if ($trimmed -notmatch '^[A-Za-z][A-Za-z0-9+.-]*://') {
++        $trimmed = 'https://' + $trimmed
++    }
++
++    $uri = $null
++    if (-not [System.Uri]::TryCreate($trimmed, [System.UriKind]::Absolute, [ref] $uri)) {
++        throw [System.ArgumentException]::new("Server '$Server' is not a valid address.", 'Server')
++    }
++    if ($uri.Scheme -notin @('http', 'https')) {
++        throw [System.ArgumentException]::new("Server '$Server' must use http or https.", 'Server')
++    }
++
++    return ($uri.GetLeftPart([System.UriPartial]::Authority).TrimEnd('/') + $script:BasePathSuffix)
++}
++
++function New-VcfVcenterApiClient {
++    [CmdletBinding()]
++    param([Parameter(Mandatory)][string] $BasePath, [switch] $SkipCertificateCheck)
++
++    $handler = [System.Net.Http.HttpClientHandler]::new()
++    if ($SkipCertificateCheck) {
++        $handler.ServerCertificateCustomValidationCallback =
++            [System.Net.Http.HttpClientHandler]::DangerousAcceptAnyServerCertificateValidator
++    }
++    $http = [System.Net.Http.HttpClient]::new($handler, $false)
++    return [VMware.Binding.OpenApi.Client.ApiClient]::new($http, $BasePath, $handler)
++}
++
++function Get-VcfVcenterInfoValue {
++    <#
++        Reads a property from a decoded response body, which the OpenAPI
++        runtime materialises as an ExpandoObject. Absent optional properties
++        yield $null rather than an error.
++    #>
++    [CmdletBinding()]
++    param($Body, [Parameter(Mandatory)][string] $Name)
++
++    if ($null -eq $Body) { return $null }
++    $dictionary = $Body -as [System.Collections.Generic.IDictionary[string, object]]
++    if ($null -ne $dictionary) {
++        if ($dictionary.ContainsKey($Name)) { return $dictionary[$Name] }
++        return $null
++    }
++    $property = $Body.PSObject.Properties[$Name]
++    if ($null -eq $property) { return $null }
++    return $property.Value
++}
++
++function Get-VcfVcenterFailureText {
++    [CmdletBinding()]
++    param($Info)
++
++    $messages = [System.Collections.Generic.List[string]]::new()
++    foreach ($name in @('error', 'description')) {
++        $node = Get-VcfVcenterInfoValue -Body $Info -Name $name
++        if ($null -eq $node) { continue }
++        $list = Get-VcfVcenterInfoValue -Body $node -Name 'messages'
++        if ($null -eq $list) { $list = @($node) }
++        foreach ($item in $list) {
++            $text = Get-VcfVcenterInfoValue -Body $item -Name 'default_message'
++            if (-not [string]::IsNullOrWhiteSpace([string]$text)) { $messages.Add([string]$text) }
++        }
++    }
++    if ($messages.Count -eq 0) { return 'no further detail was reported' }
++    return ($messages -join ' ')
++}
++
++function Protect-VcfVcenterErrorText {
++    <#
++        Service error bodies are untrusted and can echo request headers or
++        credentials. Remove secrets before incorporating any such text into a
++        terminating error.
++    #>
++    [CmdletBinding()]
++    param([AllowNull()][string] $Text, [object[]] $Secrets = @())
++
++    if ([string]::IsNullOrWhiteSpace($Text)) {
++        return 'no further detail was reported'
++    }
++    $safeText = $Text
++    foreach ($secret in $Secrets) {
++        $value = [string]$secret
++        if (-not [string]::IsNullOrEmpty($value)) {
++            $safeText = $safeText.Replace(
++                $value, '[REDACTED]', [System.StringComparison]::Ordinal)
++        }
++    }
++    return $safeText
++}
++
++function Assert-VcfVcenterConnection {
++    [CmdletBinding()]
++    param($Connection)
++
++    foreach ($name in @('BasePath', 'SessionId', 'ApiClient', 'Configuration')) {
++        if ($null -eq (Get-VcfVcenterInfoValue -Body $Connection -Name $name)) {
++            throw [System.ArgumentException]::new(
++                'Connection is not a vCenter API connection. Use Connect-VcfVcenterApi first.', 'Connection')
++        }
++    }
++}
+ 
+ function Connect-VcfVcenterApi {
+     <#
+@@ -52,7 +159,37 @@
+         [switch] $SkipCertificateCheck
+     )
+ 
+-    throw [System.NotImplementedException]::new('Connect-VcfVcenterApi is not implemented.')
++    $basePath = Resolve-VcfVcenterBasePath -Server $Server
++    $client = New-VcfVcenterApiClient -BasePath $basePath -SkipCertificateCheck:$SkipCertificateCheck
++    $configuration = [VMware.Binding.OpenApi.Client.Configuration]::new()
++    $configuration.BasePath = $basePath
++
++    $password = $Credential.GetNetworkCredential().Password
++    $pair = '{0}:{1}' -f $Credential.UserName, $password
++    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($pair))
++
++    $options = [VMware.Binding.OpenApi.Client.RequestOptions]::new()
++    $options.HeaderParameters.Add('Authorization', "Basic $encoded")
++
++    $response = $client.Post[string]('/session', $options, $configuration)
++    if ([int]$response.StatusCode -ne 201) {
++        $safeError = Protect-VcfVcenterErrorText -Text $response.ErrorText -Secrets @($password, $encoded)
++        throw "Cis.Session_create failed with HTTP $([int]$response.StatusCode): $safeError"
++    }
++
++    $token = [string]$response.Data
++    if ([string]::IsNullOrWhiteSpace($token)) {
++        throw 'Cis.Session_create returned an empty session token.'
++    }
++
++    return [pscustomobject]@{
++        PSTypeName    = 'VcfVcenterVmClone.Connection'
++        Server        = $Server
++        BasePath      = $basePath
++        SessionId     = $token
++        ApiClient     = $client
++        Configuration = $configuration
++    }
+ }
+ 
+ function New-VcfVcenterVmClone {
+@@ -62,7 +199,8 @@
+         state.
+     .DESCRIPTION
+         Calls Vcenter.VM_clone$Task and then polls Cis.Tasks_get until the task
+-        reaches a terminal status.
++        reaches a terminal status. PENDING, RUNNING and BLOCKED are not
++        terminal.
+     #>
+     [CmdletBinding()]
+     [OutputType([psobject])]
+@@ -119,7 +257,126 @@
+         [int] $TimeoutSeconds = 120
+     )
+ 
+-    throw [System.NotImplementedException]::new('New-VcfVcenterVmClone is not implemented.')
++    Assert-VcfVcenterConnection -Connection $Connection
++
++    $client = $Connection.ApiClient
++    $configuration = $Connection.Configuration
++
++    # Vcenter.VM.CloneSpec requires only name and source. Every optional member
++    # is added only when the caller supplied it, so an unset optional is absent
++    # from the request rather than null, empty or false.
++    $spec = [ordered]@{
++        name   = $Name
++        source = $SourceVm
++    }
++
++    # Vcenter.VM.ClonePlacementSpec has no required members, so it is sent only
++    # when at least one member was supplied, carrying just those members.
++    $placementMap = [ordered]@{
++        folder        = 'Folder'
++        resource_pool = 'ResourcePool'
++        host          = 'HostSystem'
++        cluster       = 'Cluster'
++        datastore     = 'Datastore'
++    }
++    $placement = [ordered]@{}
++    foreach ($member in $placementMap.Keys) {
++        $parameter = $placementMap[$member]
++        if ($PSBoundParameters.ContainsKey($parameter)) {
++            $placement[$member] = [string]$PSBoundParameters[$parameter]
++        }
++    }
++    if ($placement.Count -gt 0) {
++        $spec['placement'] = $placement
++    }
++
++    if ($PSBoundParameters.ContainsKey('DisksToRemove')) {
++        $spec['disks_to_remove'] = [string[]]$DisksToRemove
++    }
++
++    # A bound switch is an explicit value, so -PowerOn:$false is preserved as
++    # JSON false; an unbound switch omits power_on entirely.
++    if ($PSBoundParameters.ContainsKey('PowerOn')) {
++        $spec['power_on'] = [bool]$PowerOn
++    }
++
++    if ($PSBoundParameters.ContainsKey('GuestCustomizationName')) {
++        $spec['guest_customization_spec'] = [ordered]@{ name = $GuestCustomizationName }
++    }
++
++    $options = [VMware.Binding.OpenApi.Client.RequestOptions]::new()
++    $options.QueryParameters.Add('action', 'clone')
++    $options.QueryParameters.Add('vmw-task', 'true')
++    $options.HeaderParameters.Add($script:SessionHeader, $Connection.SessionId)
++    $options.Data = $spec
++
++    $response = $client.Post[string]('/vcenter/vm', $options, $configuration)
++    if ([int]$response.StatusCode -ne 202) {
++        $safeError = Protect-VcfVcenterErrorText -Text $response.ErrorText -Secrets @($Connection.SessionId)
++        throw ("Vcenter.VM_clone`$Task failed with HTTP " +
++               "$([int]$response.StatusCode): $safeError")
++    }
++
++    $taskId = [string]$response.Data
++    if ([string]::IsNullOrWhiteSpace($taskId)) {
++        throw 'The clone request was accepted but no task identifier was returned.'
++    }
++
++    # HTTP 202 means the work was accepted, not that it finished. Follow the
++    # task until it reports a terminal status.
++    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
++    $pollCount = 0
++    $lastStatus = ''
++    while ($true) {
++        if ($pollCount -gt 0 -and $stopwatch.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
++            throw ("Virtual machine clone task '$taskId' did not reach a terminal status " +
++                   "within $TimeoutSeconds seconds; last reported status was '$lastStatus'.")
++        }
++
++        $pollOptions = [VMware.Binding.OpenApi.Client.RequestOptions]::new()
++        $pollOptions.PathParameters.Add('task', $taskId)
++        $pollOptions.HeaderParameters.Add($script:SessionHeader, $Connection.SessionId)
++
++        $pollResponse = $client.Get[System.Object]('/cis/tasks/{task}', $pollOptions, $configuration)
++        $pollCount++
++        if ([int]$pollResponse.StatusCode -ne 200) {
++            $safeError = Protect-VcfVcenterErrorText -Text $pollResponse.ErrorText -Secrets @($Connection.SessionId)
++            throw "Cis.Tasks_get failed for task '$taskId' with HTTP $([int]$pollResponse.StatusCode): $safeError"
++        }
++
++        $info = $pollResponse.Data
++        $status = [string](Get-VcfVcenterInfoValue -Body $info -Name 'status')
++        $lastStatus = $status
++        Write-Verbose "Task '$taskId' reported status '$status' on poll $pollCount."
++
++        if ($status -in $script:TerminalStatuses) {
++            if ($status -eq 'FAILED') {
++                $failureText = Get-VcfVcenterFailureText -Info $info
++                $failureText = Protect-VcfVcenterErrorText -Text $failureText -Secrets @($Connection.SessionId)
++                throw ("Virtual machine clone task '$taskId' failed: " +
++                       $failureText)
++            }
++
++            return [pscustomobject]@{
++                PSTypeName = 'VcfVcenterVmClone.CloneTaskResult'
++                TaskId     = $taskId
++                Status     = $status
++                Result     = Get-VcfVcenterInfoValue -Body $info -Name 'result'
++                SourceVm   = $SourceVm
++                Name       = $Name
++                PollCount  = $pollCount
++            }
++        }
++
++        if ($stopwatch.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
++            throw ("Virtual machine clone task '$taskId' did not reach a terminal status " +
++                   "within $TimeoutSeconds seconds; last reported status was '$status'.")
++        }
++
++        if ($PollIntervalSeconds -gt 0) {
++            Start-Sleep -Seconds $PollIntervalSeconds
++        }
++    }
+ }
+ 
+ Export-ModuleMember -Function 'Connect-VcfVcenterApi', 'New-VcfVcenterVmClone'

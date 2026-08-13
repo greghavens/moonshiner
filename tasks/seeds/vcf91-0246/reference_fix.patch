@@ -1,0 +1,312 @@
+diff --git a/vsan_snapshot_inventory/client.py b/vsan_snapshot_inventory/client.py
+--- a/vsan_snapshot_inventory/client.py
++++ b/vsan_snapshot_inventory/client.py
+@@ -2,14 +2,233 @@
+ 
+ from __future__ import annotations
+ 
++import base64
++import json
++import os
++import tempfile
+ from os import PathLike
++from pathlib import Path
+ from typing import Any
++from urllib.error import HTTPError, URLError
++from urllib.parse import urlencode, urlsplit
++from urllib.request import HTTPRedirectHandler, Request, build_opener
++
++
++BASE_PATH = "/api"
++SESSIONS_PATH = "/snapservice/sessions"
++SNAPSHOTS_PATH = "/snapservice/virtual-machines/snapshots"
++SESSION_HEADER = "vmware-api-session-id"
++JSON_MEDIA_TYPE = "application/json"
++
++REQUIRED_ITEM_FIELDS = ("creation_time", "name", "snapshot", "snapshot_type", "vm")
++SNAPSHOT_TYPES = {"SCHEDULED", "ONE_TIME", "SYSTEM_CREATED", "STAGED"}
++
++
++class _NoRedirectHandler(HTTPRedirectHandler):
++    """Expose redirects as non-success responses instead of following them."""
++
++    def redirect_request(
++        self,
++        req: Any,
++        fp: Any,
++        code: int,
++        msg: str,
++        headers: Any,
++        newurl: str,
++    ) -> None:
++        del req, fp, code, msg, headers, newurl
++        return None
++
++
++_HTTP_OPENER = build_opener(_NoRedirectHandler)
+ 
+ 
+ class SnapserviceError(RuntimeError):
+     """Raised when the Snapshot Appliance rejects or breaks a request."""
+ 
+ 
++def _require_text(value: Any, label: str) -> str:
++    if not isinstance(value, str) or not value:
++        raise ValueError(f"{label} must be a non-empty string")
++    return value
++
++
++def _optional_text(value: Any, label: str) -> str | None:
++    """Normalise an optional field; None and empty text both mean unset."""
++
++    if value is None:
++        return None
++    if not isinstance(value, str):
++        raise ValueError(f"{label} must be a string when supplied")
++    return value or None
++
++
++def _normalise_service_root(service_root: Any) -> str:
++    _require_text(service_root, "service_root")
++    if any(character.isspace() or ord(character) < 32 for character in service_root):
++        raise ValueError("service_root must not contain whitespace or controls")
++    try:
++        split = urlsplit(service_root)
++        hostname = split.hostname
++        # Accessing port performs urllib's range and syntax validation.
++        split.port
++    except ValueError:
++        raise ValueError("service_root is not a well-formed origin") from None
++    if split.scheme not in ("http", "https"):
++        raise ValueError("service_root must use http or https")
++    if not hostname:
++        raise ValueError("service_root must name a host")
++    if split.username is not None or split.password is not None:
++        raise ValueError("service_root must not embed credentials")
++    if split.query or split.fragment:
++        raise ValueError("service_root must not carry a query or fragment")
++    if split.path not in ("", "/"):
++        raise ValueError("service_root must be an origin without a path")
++    return f"{split.scheme}://{split.netloc}"
++
++
++def _send(
++    url: str, *, method: str, headers: dict[str, str], operation: str, timeout: float
++) -> tuple[int, bytes]:
++    request = Request(url, method=method)
++    for name, value in headers.items():
++        request.add_header(name, value)
++    try:
++        with _HTTP_OPENER.open(request, timeout=timeout) as response:
++            return response.status, response.read()
++    except HTTPError as error:
++        # Deliberately drop the body and the transport text: both can echo
++        # credentials or session tokens back into a log.
++        raise SnapserviceError(
++            f"{operation} failed with HTTP status {error.code}"
++        ) from None
++    except (URLError, TimeoutError, OSError):
++        raise SnapserviceError(f"{operation} could not reach the appliance") from None
++
++
++def _decode_json(payload: bytes, operation: str) -> Any:
++    try:
++        return json.loads(payload.decode("utf-8"))
++    except (UnicodeDecodeError, json.JSONDecodeError):
++        raise SnapserviceError(f"{operation} returned a malformed JSON body") from None
++
++
++def _create_session(
++    origin: str, username: str, password: str, *, timeout: float
++) -> str:
++    """Snapservice.Sessions_create: Basic credentials in, session token out."""
++
++    operation = "Snapservice.Sessions_create"
++    raw = f"{username}:{password}".encode("utf-8")
++    credentials = base64.b64encode(raw).decode("ascii")
++    status, payload = _send(
++        origin + BASE_PATH + SESSIONS_PATH,
++        method="POST",
++        headers={
++            "Accept": JSON_MEDIA_TYPE,
++            "Authorization": f"Basic {credentials}",
++        },
++        operation=operation,
++        timeout=timeout,
++    )
++    if status != 201:
++        raise SnapserviceError(f"{operation} returned unexpected status {status}")
++    token = _decode_json(payload, operation)
++    if not isinstance(token, str) or not token:
++        raise SnapserviceError(f"{operation} did not return a session token")
++    return token
++
++
++def _list_page(
++    origin: str,
++    token: str,
++    *,
++    cluster: str,
++    page_size: int,
++    offset: int,
++    created_after: str | None,
++    created_before: str | None,
++    timeout: float,
++) -> tuple[list[dict[str, Any]], int]:
++    """One page of Snapservice.VirtualMachines.Snapshots_list."""
++
++    operation = "Snapservice.VirtualMachines.Snapshots_list"
++    fields: list[tuple[str, str]] = [("clusters", cluster)]
++    # Unset optional filter fields are omitted; offset is always sent, even
++    # when it is zero.
++    if created_after is not None:
++        fields.append(("created_after", created_after))
++    if created_before is not None:
++        fields.append(("created_before", created_before))
++    fields.append(("page_size", str(page_size)))
++    fields.append(("offset", str(offset)))
++
++    url = f"{origin}{BASE_PATH}{SNAPSHOTS_PATH}?{urlencode(fields)}"
++    status, payload = _send(
++        url,
++        method="GET",
++        headers={"Accept": JSON_MEDIA_TYPE, SESSION_HEADER: token},
++        operation=operation,
++        timeout=timeout,
++    )
++    if status != 200:
++        raise SnapserviceError(f"{operation} returned unexpected status {status}")
++
++    result = _decode_json(payload, operation)
++    if not isinstance(result, dict):
++        raise SnapserviceError(f"{operation} did not return a ListResult object")
++    snapshots = result.get("snapshots")
++    total_count = result.get("total_count")
++    if not isinstance(snapshots, list):
++        raise SnapserviceError(f"{operation} returned no snapshots array")
++    if (
++        isinstance(total_count, bool)
++        or not isinstance(total_count, int)
++        or total_count < 0
++    ):
++        raise SnapserviceError(f"{operation} returned an invalid total_count")
++    if len(snapshots) > total_count:
++        raise SnapserviceError(f"{operation} returned inconsistent page counts")
++    for item in snapshots:
++        if not isinstance(item, dict):
++            raise SnapserviceError(f"{operation} returned a malformed list item")
++        for field in REQUIRED_ITEM_FIELDS:
++            if field not in item or not isinstance(item[field], str):
++                raise SnapserviceError(
++                    f"{operation} returned an item without a string {field}"
++                )
++        if item["snapshot_type"] not in SNAPSHOT_TYPES:
++            raise SnapserviceError(
++                f"{operation} returned an item with an invalid snapshot_type"
++            )
++        if "expiration_time" in item and not isinstance(
++            item["expiration_time"], str
++        ):
++            raise SnapserviceError(
++                f"{operation} returned an item with an invalid expiration_time"
++            )
++    return snapshots, total_count
++
++
++def _write_report(report_path: str | PathLike[str], report: dict[str, Any]) -> None:
++    target = Path(os.fspath(report_path))
++    target.parent.mkdir(parents=True, exist_ok=True)
++    text = json.dumps(report, indent=2, ensure_ascii=False) + "\n"
++    handle_fd, staged = tempfile.mkstemp(
++        dir=str(target.parent), prefix=".inventory-", suffix=".tmp"
++    )
++    try:
++        with os.fdopen(handle_fd, "w", encoding="utf-8", newline="\n") as handle:
++            handle.write(text)
++        os.replace(staged, target)
++    except BaseException:
++        try:
++            os.unlink(staged)
++        except OSError:
++            pass
++        raise
++
++
+ def collect_vm_snapshot_inventory(
+     service_root: str,
+     username: str,
+@@ -24,4 +243,72 @@
+ ) -> dict[str, Any]:
+     """Collect every snapshot page and return the stable inventory report."""
+ 
+-    raise NotImplementedError("implement the contract-pinned inventory collection")
++    origin = _normalise_service_root(service_root)
++    _require_text(username, "username")
++    _require_text(password, "password")
++    _require_text(cluster, "cluster")
++    if isinstance(page_size, bool) or not isinstance(page_size, int):
++        raise ValueError("page_size must be an integer")
++    if page_size < 1:
++        raise ValueError("page_size must be at least 1")
++    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
++        raise ValueError("timeout must be a number")
++    if timeout <= 0:
++        raise ValueError("timeout must be positive")
++    after = _optional_text(created_after, "created_after")
++    before = _optional_text(created_before, "created_before")
++    if report_path is None:
++        raise ValueError("report_path is required")
++
++    token = _create_session(origin, username, password, timeout=timeout)
++
++    collected: list[dict[str, Any]] = []
++    total_count = 0
++    offset = 0
++    while True:
++        page, total_count = _list_page(
++            origin,
++            token,
++            cluster=cluster,
++            page_size=page_size,
++            offset=offset,
++            created_after=after,
++            created_before=before,
++            timeout=timeout,
++        )
++        if len(collected) > total_count or len(collected) + len(page) > total_count:
++            raise SnapserviceError(
++                "Snapservice.VirtualMachines.Snapshots_list returned "
++                "inconsistent pagination counts"
++            )
++        collected.extend(page)
++        if len(collected) == total_count:
++            break
++        if not page:
++            raise SnapserviceError(
++                "Snapservice.VirtualMachines.Snapshots_list stopped returning "
++                f"items after {len(collected)} of {total_count}"
++            )
++        # The appliance may serve fewer items than requested, so the next page
++        # starts after what actually arrived.
++        offset = len(collected)
++
++    collected.sort(key=lambda item: (item["creation_time"], item["snapshot"]))
++    report = {
++        "cluster": cluster,
++        "total_count": total_count,
++        "returned_count": len(collected),
++        "snapshots": [
++            {
++                "snapshot": item["snapshot"],
++                "vm": item["vm"],
++                "name": item["name"],
++                "creation_time": item["creation_time"],
++                "snapshot_type": item["snapshot_type"],
++                "expiration_time": item.get("expiration_time"),
++            }
++            for item in collected
++        ],
++    }
++    _write_report(report_path, report)
++    return report
+

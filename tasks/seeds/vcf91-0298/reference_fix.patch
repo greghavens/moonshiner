@@ -1,0 +1,392 @@
+--- a/vcfnetworks/client.go
++++ b/vcfnetworks/client.go
+@@ -1,11 +1,29 @@
++// Package vcfnetworks onboards vCenter data sources into VCF Operations for
++// Networks 9.1 in a way that is safe to repeat: the mutating
++// addVcenterDatasource call is issued only after the target has been shown to be
++// absent, so a retried onboarding converges instead of duplicating.
+ package vcfnetworks
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
++	"mime"
+ 	"net/http"
++	"net/url"
++	"strings"
++	"sync"
+ )
+ 
++// serviceRoot is the specification's declared server URL.
++const serviceRoot = "/api/ni"
++
++// vcenterDataSourceType is the DataSourceType discriminator for a vCenter.
++const vcenterDataSourceType = "VCenterDataSource"
++
+ // PasswordCredentials mirrors the specification PasswordCredentials object
+ // carried by a VCenterDataSourceRequest.
+ type PasswordCredentials struct {
+@@ -66,16 +84,354 @@
+ 
+ // Client calls the VCF Operations for Networks API. It is safe for concurrent
+ // use by multiple goroutines.
+-type Client struct{}
++type Client struct {
++	root       string
++	username   string
++	password   string
++	httpClient *http.Client
++
++	mu    sync.Mutex
++	token string
++}
+ 
+-// NewClient constructs a client for the service root baseURL. It is
+-// intentionally incomplete.
++// NewClient constructs a client for the service root baseURL.
+ func NewClient(baseURL, username, password string, httpClient *http.Client) (*Client, error) {
+-	return nil, errors.New("TODO: implement NewClient")
++	trimmed := strings.TrimSpace(baseURL)
++	if trimmed == "" {
++		return nil, errors.New("vcfnetworks: service root URL is empty")
++	}
++	parsed, err := url.Parse(trimmed)
++	if err != nil {
++		return nil, fmt.Errorf("vcfnetworks: service root URL is not parseable: %w", err)
++	}
++	if parsed.Scheme != "http" && parsed.Scheme != "https" {
++		return nil, fmt.Errorf("vcfnetworks: service root scheme %q is not http or https", parsed.Scheme)
++	}
++	if parsed.Host == "" {
++		return nil, errors.New("vcfnetworks: service root URL has no host")
++	}
++	if parsed.Path != "" && parsed.Path != "/" {
++		return nil, fmt.Errorf("vcfnetworks: service root URL carries path %q", parsed.Path)
++	}
++	if parsed.RawQuery != "" || parsed.ForceQuery {
++		return nil, errors.New("vcfnetworks: service root URL carries a query string")
++	}
++	if parsed.Fragment != "" || strings.Contains(trimmed, "#") {
++		return nil, errors.New("vcfnetworks: service root URL carries a fragment")
++	}
++	if parsed.User != nil {
++		return nil, errors.New("vcfnetworks: service root URL carries userinfo")
++	}
++	if strings.TrimSpace(username) == "" {
++		return nil, errors.New("vcfnetworks: username is empty")
++	}
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++	root := parsed.Scheme + "://" + parsed.Host + serviceRoot
++	return &Client{root: root, username: username, password: password, httpClient: httpClient}, nil
+ }
+ 
+ // EnsureVcenterDataSource registers the vCenter data source described by spec if
+ // and only if no data source for the same target already exists.
+ func (c *Client) EnsureVcenterDataSource(ctx context.Context, spec VcenterSpec) (EnsureResult, error) {
+-	return EnsureResult{}, errors.New("TODO: implement EnsureVcenterDataSource")
++	if ctx == nil {
++		return EnsureResult{}, errors.New("vcfnetworks: nil context")
++	}
++	if err := validateSpec(spec); err != nil {
++		return EnsureResult{}, err
++	}
++
++	token, err := c.authToken(ctx)
++	if err != nil {
++		return EnsureResult{}, err
++	}
++
++	existing, found, err := c.resolveExisting(ctx, token, spec)
++	if err != nil {
++		return EnsureResult{}, err
++	}
++	if found {
++		return EnsureResult{DataSource: existing, Created: false}, nil
++	}
++
++	created, err := c.addVcenterDatasource(ctx, token, spec)
++	if err != nil {
++		return EnsureResult{}, err
++	}
++	return EnsureResult{DataSource: created, Created: true}, nil
++}
++
++func validateSpec(spec VcenterSpec) error {
++	if strings.TrimSpace(spec.Nickname) == "" {
++		return errors.New("vcfnetworks: nickname is required")
++	}
++	if strings.TrimSpace(spec.ProxyID) == "" {
++		return errors.New("vcfnetworks: proxy_id is required")
++	}
++	if strings.TrimSpace(spec.Username) == "" {
++		return errors.New("vcfnetworks: credentials username is required")
++	}
++	hasIP, hasFQDN := spec.IP != "", spec.FQDN != ""
++	if hasIP == hasFQDN {
++		return errors.New("vcfnetworks: exactly one of IP or FQDN identifies the data source")
++	}
++	return nil
++}
++
++// authToken returns the cached ApiKeyAuth token, obtaining one exactly once per
++// client. The lock is held across the exchange so concurrent callers share a
++// single create call rather than racing to issue several.
++func (c *Client) authToken(ctx context.Context) (string, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.token != "" {
++		return c.token, nil
++	}
++
++	// UserCredential: domain is optional and is omitted for the LOCAL domain.
++	body, err := json.Marshal(struct {
++		Username string `json:"username"`
++		Password string `json:"password"`
++	}{Username: c.username, Password: c.password})
++	if err != nil {
++		return "", fmt.Errorf("vcfnetworks: encode credentials: %w", err)
++	}
++
++	response, err := c.do(ctx, http.MethodPost, "/auth/token", "", body)
++	if err != nil {
++		return "", err
++	}
++	payload, err := decodeSuccess(response, http.StatusOK)
++	if err != nil {
++		return "", err
++	}
++	var token struct {
++		Token  string `json:"token"`
++		Expiry int64  `json:"expiry"`
++	}
++	if err := json.Unmarshal(payload, &token); err != nil {
++		return "", &ProtocolError{Reason: "token response is not a Token object"}
++	}
++	if strings.TrimSpace(token.Token) == "" {
++		return "", &ProtocolError{Reason: "token response carries no token"}
++	}
++	c.token = token.Token
++	return c.token, nil
++}
++
++// resolveExisting walks listVcenters and fetches candidates in order, stopping
++// at the first data source that already describes the requested target.
++func (c *Client) resolveExisting(ctx context.Context, token string, spec VcenterSpec) (VcenterDataSource, bool, error) {
++	response, err := c.do(ctx, http.MethodGet, "/data-sources/vcenters", token, nil)
++	if err != nil {
++		return VcenterDataSource{}, false, err
++	}
++	payload, err := decodeSuccess(response, http.StatusOK)
++	if err != nil {
++		return VcenterDataSource{}, false, err
++	}
++	var list struct {
++		Results []struct {
++			EntityID   string `json:"entity_id"`
++			EntityType string `json:"entity_type"`
++		} `json:"results"`
++		TotalCount int `json:"total_count"`
++	}
++	if err := json.Unmarshal(payload, &list); err != nil {
++		return VcenterDataSource{}, false, &ProtocolError{
++			Reason: "listVcenters response is not a DataSourceListResponse",
++		}
++	}
++
++	for _, entry := range list.Results {
++		if strings.TrimSpace(entry.EntityID) == "" || entry.EntityType != vcenterDataSourceType {
++			continue
++		}
++		candidate, present, err := c.getVcenter(ctx, token, entry.EntityID)
++		if err != nil {
++			return VcenterDataSource{}, false, err
++		}
++		if !present {
++			// The data source disappeared between the list and the fetch.
++			continue
++		}
++		if targetMatches(candidate, spec) {
++			return candidate, true, nil
++		}
++	}
++	return VcenterDataSource{}, false, nil
++}
++
++func (c *Client) getVcenter(ctx context.Context, token, entityID string) (VcenterDataSource, bool, error) {
++	path := "/data-sources/vcenters/" + url.PathEscape(entityID)
++	response, err := c.do(ctx, http.MethodGet, path, token, nil)
++	if err != nil {
++		return VcenterDataSource{}, false, err
++	}
++	if response.status == http.StatusNotFound {
++		return VcenterDataSource{}, false, nil
++	}
++	payload, err := decodeSuccess(response, http.StatusOK)
++	if err != nil {
++		return VcenterDataSource{}, false, err
++	}
++	var source VcenterDataSource
++	if err := json.Unmarshal(payload, &source); err != nil {
++		return VcenterDataSource{}, false, &ProtocolError{
++			Reason: "getVcenter response is not a VCenterDataSource",
++		}
++	}
++	return source, true, nil
++}
++
++func (c *Client) addVcenterDatasource(ctx context.Context, token string, spec VcenterSpec) (VcenterDataSource, error) {
++	// VCenterDataSourceRequest. Every member the caller did not supply is
++	// omitted rather than serialized as an empty or defaulted value; the
++	// pointer members preserve an explicit false or empty string.
++	request := struct {
++		IP          string              `json:"ip,omitempty"`
++		FQDN        string              `json:"fqdn,omitempty"`
++		ProxyID     string              `json:"proxy_id"`
++		Nickname    string              `json:"nickname"`
++		Enabled     *bool               `json:"enabled,omitempty"`
++		Notes       *string             `json:"notes,omitempty"`
++		Credentials PasswordCredentials `json:"credentials"`
++	}{
++		IP:       spec.IP,
++		FQDN:     spec.FQDN,
++		ProxyID:  spec.ProxyID,
++		Nickname: spec.Nickname,
++		Enabled:  spec.Enabled,
++		Notes:    spec.Notes,
++		Credentials: PasswordCredentials{
++			Username: spec.Username,
++			Password: spec.Password,
++		},
++	}
++	body, err := json.Marshal(request)
++	if err != nil {
++		return VcenterDataSource{}, fmt.Errorf("vcfnetworks: encode data source request: %w", err)
++	}
++
++	response, err := c.do(ctx, http.MethodPost, "/data-sources/vcenters", token, body)
++	if err != nil {
++		return VcenterDataSource{}, err
++	}
++	payload, err := decodeSuccess(response, http.StatusCreated)
++	if err != nil {
++		return VcenterDataSource{}, err
++	}
++	var created VcenterDataSource
++	if err := json.Unmarshal(payload, &created); err != nil {
++		return VcenterDataSource{}, &ProtocolError{
++			Reason: "addVcenterDatasource response is not a VCenterDataSource",
++		}
++	}
++	if strings.TrimSpace(created.EntityID) == "" {
++		return VcenterDataSource{}, &ProtocolError{
++			Reason: "addVcenterDatasource response carries no entity_id",
++		}
++	}
++	return created, nil
++}
++
++// targetMatches reports whether an existing data source already addresses the
++// host the spec identifies. Addresses compare exactly; hostnames compare
++// case-insensitively.
++func targetMatches(source VcenterDataSource, spec VcenterSpec) bool {
++	if spec.IP != "" {
++		return source.IP == spec.IP
++	}
++	return source.FQDN != "" && strings.EqualFold(source.FQDN, spec.FQDN)
++}
++
++type apiResponse struct {
++	status      int
++	contentType string
++	body        []byte
++}
++
++// do issues one request beneath the service root. A body is sent only when one
++// is supplied, and the ApiKeyAuth header is attached only when a token is held,
++// keeping the token exchange itself unauthenticated.
++func (c *Client) do(ctx context.Context, method, path, token string, body []byte) (apiResponse, error) {
++	var reader io.Reader
++	if body != nil {
++		reader = bytes.NewReader(body)
++	}
++	request, err := http.NewRequestWithContext(ctx, method, c.root+path, reader)
++	if err != nil {
++		return apiResponse{}, fmt.Errorf("vcfnetworks: build %s request: %w", method, err)
++	}
++	request.Header.Set("Accept", "application/json")
++	if body != nil {
++		request.Header.Set("Content-Type", "application/json")
++		request.ContentLength = int64(len(body))
++	}
++	if token != "" {
++		request.Header.Set("Authorization", "NetworkInsight "+token)
++	}
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		// A RoundTripper is supplied by the caller and may include request
++		// headers or bodies in its error text. Do not propagate that text: it
++		// can contain the login password or the issued token.
++		return apiResponse{}, fmt.Errorf("vcfnetworks: %s request failed", method)
++	}
++	defer response.Body.Close()
++	payload, err := io.ReadAll(response.Body)
++	if err != nil {
++		return apiResponse{}, errors.New("vcfnetworks: read response failed")
++	}
++	return apiResponse{
++		status:      response.StatusCode,
++		contentType: response.Header.Get("Content-Type"),
++		body:        payload,
++	}, nil
++}
++
++// decodeSuccess returns the response body when the status is exactly want and
++// the media type is JSON, and otherwise classifies the failure.
++func decodeSuccess(response apiResponse, want int) ([]byte, error) {
++	if response.status == want {
++		if !isJSON(response.contentType) {
++			return nil, &ProtocolError{
++				Reason: "response media type is not JSON",
++			}
++		}
++		if trimmed := bytes.TrimSpace(response.body); len(trimmed) == 0 || trimmed[0] != '{' {
++			return nil, &ProtocolError{Reason: "response body is not a JSON object"}
++		}
++		return response.body, nil
++	}
++	if response.status >= 200 && response.status < 300 {
++		return nil, &ProtocolError{
++			Reason: fmt.Sprintf("status %d is not the contracted %d", response.status, want),
++		}
++	}
++	apiError := &APIError{StatusCode: response.status}
++	if isJSON(response.contentType) {
++		var decoded struct {
++			Code    int    `json:"code"`
++			Message string `json:"message"`
++		}
++		if err := json.Unmarshal(response.body, &decoded); err == nil {
++			apiError.Code = decoded.Code
++			apiError.Message = decoded.Message
++		}
++	}
++	return nil, apiError
++}
++
++func isJSON(contentType string) bool {
++	if contentType == "" {
++		return false
++	}
++	mediaType, _, err := mime.ParseMediaType(contentType)
++	if err != nil {
++		return false
++	}
++	return mediaType == "application/json" || strings.HasSuffix(mediaType, "+json")
+ }

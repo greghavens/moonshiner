@@ -1,0 +1,496 @@
+diff --git a/vcfops_onboarding/__init__.py b/vcfops_onboarding/__init__.py
+new file mode 100644
+index 0000000..b5bde1c
+--- /dev/null
++++ b/vcfops_onboarding/__init__.py
+@@ -0,0 +1,490 @@
++"""Precheck-gated VCF Operations adapter instance onboarding (VCF 9.1).
++
++Onboarding an adapter instance is a gate.  ``enumerateAdapterInstances`` proves
++the requested name is free and ``testConnection`` proves the data source is
++reachable; only when both pass is the mutating ``createAdapterInstance`` sent,
++so a refused precheck leaves the VCF Operations inventory untouched.
++
++The wire contract is the focused projection in ``docs/contract.json``, derived
++from ``specifications/vcf-operations/vcf-operations-openapi.json`` in VMware's
++Apache-2.0 ``vmware/vcf-api-specs`` repository.  Bound members are serialized in
++the order that projection declares them and unset optional members are omitted
++outright rather than sent as ``null``, ``""`` or ``{}``.
++"""
++
++from __future__ import annotations
++
++import json
++import urllib.error
++import urllib.parse
++import urllib.request
++from dataclasses import dataclass
++from typing import Any, Sequence
++
++__all__ = [
++    "OnboardingResult",
++    "OperationsApiError",
++    "PrecheckFailedError",
++    "onboard_adapter_instance",
++]
++
++JSON_MEDIA_TYPE = "application/json"
++TOKEN_PREFIX = "vRealizeOpsToken"
++
++ACQUIRE_TOKEN = ("acquireToken", "POST", "/api/auth/token/acquire")
++ENUMERATE_ADAPTER_INSTANCES = ("enumerateAdapterInstances", "GET", "/api/adapters")
++TEST_CONNECTION = ("testConnection", "POST", "/api/adapters/testConnection")
++CREATE_ADAPTER_INSTANCE = ("createAdapterInstance", "POST", "/api/adapters")
++
++DUPLICATE_NAME_STAGE = "duplicate-name"
++TEST_CONNECTION_STAGE = "test-connection"
++
++
++# ---------------------------------------------------------------------------
++# errors
++# ---------------------------------------------------------------------------
++
++
++class OperationsApiError(RuntimeError):
++    """A VCF Operations operation answered with an unusable response.
++
++    ``operation_id`` is the contract operationId that was invoked, so callers
++    can tell an authentication problem from an inventory or creation problem.
++    """
++
++    def __init__(self, operation_id: str, status_code: int, message: str) -> None:
++        super().__init__(f"{operation_id} failed with HTTP {status_code}: {message}")
++        self.operation_id = operation_id
++        self.status_code = status_code
++        self.message = message
++
++
++class PrecheckFailedError(RuntimeError):
++    """A precheck refused the onboarding before anything was created.
++
++    ``stage`` is ``"duplicate-name"`` when ``enumerateAdapterInstances`` already
++    lists the requested adapter instance name, and ``"test-connection"`` when
++    ``testConnection`` rejected the connection.  Either way the mutating
++    ``createAdapterInstance`` call is never sent.
++    """
++
++    def __init__(
++        self,
++        stage: str,
++        reason: str,
++        status_code: int | None = None,
++        conflicting_instance_ids: tuple[str, ...] = (),
++    ) -> None:
++        super().__init__(f"{stage} precheck refused the onboarding: {reason}")
++        self.stage = stage
++        self.reason = reason
++        self.status_code = status_code
++        self.conflicting_instance_ids = tuple(conflicting_instance_ids)
++
++
++class OperationsTransportError(RuntimeError):
++    """VCF Operations could not be reached at all for ``operation_id``."""
++
++    def __init__(self, operation_id: str, reason: str) -> None:
++        super().__init__(f"{operation_id} could not reach VCF Operations: {reason}")
++        self.operation_id = operation_id
++        self.reason = reason
++
++
++# ---------------------------------------------------------------------------
++# wire encoding
++# ---------------------------------------------------------------------------
++
++
++@dataclass(frozen=True)
++class _Response:
++    """A decoded VCF Operations response; an HTTP status is never fatal here."""
++
++    status: int
++    payload: Any
++
++
++def _encode_body(payload: dict[str, Any]) -> bytes:
++    """Compact UTF-8 JSON with the member order exactly as it was built."""
++    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
++
++
++def _encode_query(members: Sequence[tuple[str, str]]) -> str:
++    return "&".join(
++        f"{urllib.parse.quote(name, safe='')}={urllib.parse.quote(value, safe='')}"
++        for name, value in members
++    )
++
++
++def _name_values(pairs: Sequence[tuple[str, str]]) -> list[dict[str, str]]:
++    """The ``name-value`` schema, whose declared order is name then value."""
++    return [{"name": name, "value": value} for name, value in pairs]
++
++
++def _username_password_body(
++    username: str, password: str, auth_source: str | None
++) -> bytes:
++    """``username-password`` in declared order: authSource, password, username."""
++    payload: dict[str, Any] = {}
++    if auth_source is not None:
++        payload["authSource"] = auth_source
++    payload["password"] = password
++    payload["username"] = username
++    return _encode_body(payload)
++
++
++def _create_adapter_instance_body(
++    *,
++    name: str,
++    adapter_kind_key: str,
++    credential_name: str,
++    credential_kind_key: str,
++    credential_fields: Sequence[tuple[str, str]],
++    resource_identifiers: Sequence[tuple[str, str]],
++    description: str | None,
++) -> bytes:
++    """``create-adapter-instance`` in declared order, unset members omitted.
++
++    ``collectorGroupId``, ``collectorId``, ``monitoringInterval``,
++    ``monitoringIntervalSeconds`` and ``physicalDatacenterId`` are left to the
++    service, so they never reach the wire.  The nested ``credential`` omits its
++    unset ``editable`` and ``id`` members; ``id`` must be absent on a creation
++    request.
++    """
++    credential = {
++        "adapterKindKey": adapter_kind_key,
++        "credentialKindKey": credential_kind_key,
++        "fields": _name_values(credential_fields),
++        "name": credential_name,
++    }
++    payload: dict[str, Any] = {
++        "adapterKindKey": adapter_kind_key,
++        "credential": credential,
++    }
++    if description is not None:
++        payload["description"] = description
++    payload["name"] = name
++    payload["resourceIdentifiers"] = _name_values(resource_identifiers)
++    return _encode_body(payload)
++
++
++def _decode(raw: bytes) -> Any:
++    if not raw:
++        return None
++    try:
++        return json.loads(raw.decode("utf-8"))
++    except (UnicodeDecodeError, json.JSONDecodeError):
++        return None
++
++
++def _error_message(payload: Any, fallback: str) -> str:
++    """Read ``message`` out of the contract's ``error`` envelope."""
++    if isinstance(payload, dict):
++        message = payload.get("message")
++        if isinstance(message, str):
++            return message
++    return fallback
++
++
++class _Transport:
++    """Sends the four contracted operations to the caller-supplied base URL."""
++
++    def __init__(self, base_url: str, timeout: float) -> None:
++        self._base_url = base_url.rstrip("/")
++        self._timeout = timeout
++        self._opener = urllib.request.build_opener()
++
++    def send(
++        self,
++        operation_id: str,
++        method: str,
++        path: str,
++        *,
++        query: Sequence[tuple[str, str]] = (),
++        body: bytes | None = None,
++        token: str | None = None,
++    ) -> _Response:
++        url = self._base_url + path
++        encoded_query = _encode_query(query)
++        if encoded_query:
++            url += "?" + encoded_query
++        headers = {"Accept": JSON_MEDIA_TYPE}
++        if token is not None:
++            headers["Authorization"] = f"{TOKEN_PREFIX} {token}"
++        if body is not None:
++            headers["Content-Type"] = JSON_MEDIA_TYPE
++        request = urllib.request.Request(
++            url, data=body, headers=headers, method=method
++        )
++        try:
++            with self._opener.open(request, timeout=self._timeout) as response:
++                return _Response(response.status, _decode(response.read()))
++        except urllib.error.HTTPError as error:
++            with error:
++                return _Response(error.code, _decode(error.read()))
++        except urllib.error.URLError as error:
++            raise OperationsTransportError(operation_id, str(error.reason)) from error
++
++
++# ---------------------------------------------------------------------------
++# onboarding flow
++# ---------------------------------------------------------------------------
++
++
++@dataclass(frozen=True)
++class OnboardingResult:
++    """What VCF Operations reported about a completed onboarding."""
++
++    name: str
++    adapter_kind_key: str
++    adapter_instance_id: str
++    resource_kind_key: str
++    collector_id: int | None
++    credential_instance_id: str | None
++    description: str | None
++    existing_instance_count: int
++    precheck_message: str
++
++
++def onboard_adapter_instance(
++    base_url: str,
++    *,
++    username: str,
++    password: str,
++    auth_source: str | None = None,
++    name: str,
++    adapter_kind_key: str,
++    credential_name: str,
++    credential_kind_key: str,
++    credential_fields: Sequence[tuple[str, str]],
++    resource_identifiers: Sequence[tuple[str, str]] = (),
++    description: str | None = None,
++    timeout: float = 30.0,
++) -> OnboardingResult:
++    """Onboard one adapter instance, refusing before any mutation on failure."""
++    _require_text(base_url, "base_url")
++    for value, label in (
++        (username, "username"),
++        (password, "password"),
++        (name, "name"),
++        (adapter_kind_key, "adapter_kind_key"),
++        (credential_name, "credential_name"),
++        (credential_kind_key, "credential_kind_key"),
++    ):
++        _require_text(value, label)
++    _require_optional_text(auth_source, "auth_source")
++    _require_optional_text(description, "description")
++    fields = _require_pairs(credential_fields, "credential_fields", allow_empty=False)
++    identifiers = _require_pairs(
++        resource_identifiers, "resource_identifiers", allow_empty=True
++    )
++    if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
++        raise ValueError("timeout must be a positive number of seconds")
++    if not timeout > 0:
++        raise ValueError("timeout must be a positive number of seconds")
++
++    transport = _Transport(base_url, float(timeout))
++    token = _acquire_token(transport, username, password, auth_source)
++
++    instances = _enumerate_adapter_instances(transport, token, adapter_kind_key)
++    conflicts = _conflicting_instances(instances, name)
++    if conflicts:
++        raise PrecheckFailedError(
++            DUPLICATE_NAME_STAGE,
++            f"an adapter instance named {name!r} already exists",
++            None,
++            conflicts,
++        )
++
++    # One body, sent twice: the create must be byte-identical to what passed.
++    body = _create_adapter_instance_body(
++        name=name,
++        adapter_kind_key=adapter_kind_key,
++        credential_name=credential_name,
++        credential_kind_key=credential_kind_key,
++        credential_fields=fields,
++        resource_identifiers=identifiers,
++        description=description,
++    )
++
++    tested = transport.send(*TEST_CONNECTION, body=body, token=token)
++    if tested.status == 400:
++        raise PrecheckFailedError(
++            TEST_CONNECTION_STAGE,
++            _error_message(tested.payload, "the connection test was rejected"),
++            tested.status,
++            (),
++        )
++    _require_status(tested, TEST_CONNECTION[0], 201)
++    precheck_message = _text_member(tested.payload, "messageFromAdapterInstance") or ""
++
++    created = transport.send(
++        *CREATE_ADAPTER_INSTANCE,
++        query=(("force", "false"),),
++        body=body,
++        token=token,
++    )
++    _require_status(created, CREATE_ADAPTER_INSTANCE[0], 201)
++    return _result(created.payload, len(instances), precheck_message)
++
++
++def _acquire_token(
++    transport: _Transport, username: str, password: str, auth_source: str | None
++) -> str:
++    response = transport.send(
++        *ACQUIRE_TOKEN, body=_username_password_body(username, password, auth_source)
++    )
++    _require_status(response, ACQUIRE_TOKEN[0], 200)
++    token = _text_member(response.payload, "token")
++    if token is None:
++        raise OperationsApiError(
++            ACQUIRE_TOKEN[0], response.status, "the response carried no token"
++        )
++    return token
++
++
++def _enumerate_adapter_instances(
++    transport: _Transport, token: str, adapter_kind_key: str
++) -> list[dict[str, Any]]:
++    response = transport.send(
++        *ENUMERATE_ADAPTER_INSTANCES,
++        query=(("adapterKindKey", adapter_kind_key),),
++        token=token,
++    )
++    _require_status(response, ENUMERATE_ADAPTER_INSTANCES[0], 200)
++    payload = response.payload
++    if not isinstance(payload, dict):
++        raise OperationsApiError(
++            ENUMERATE_ADAPTER_INSTANCES[0],
++            response.status,
++            "the adapter instance listing was not an object",
++        )
++    instances = payload.get("adapterInstancesInfoDto")
++    if instances is None:
++        return []
++    if not isinstance(instances, list):
++        raise OperationsApiError(
++            ENUMERATE_ADAPTER_INSTANCES[0],
++            response.status,
++            "adapterInstancesInfoDto was not a collection",
++        )
++    return [item for item in instances if isinstance(item, dict)]
++
++
++def _conflicting_instances(
++    instances: Sequence[dict[str, Any]], name: str
++) -> tuple[str, ...]:
++    """Ids of listed instances whose resource key name matches ``name`` exactly.
++
++    The comparison is ordinal, so a differently cased or padded neighbour is
++    not a collision.
++    """
++    conflicts = []
++    for instance in instances:
++        resource_key = instance.get("resourceKey")
++        if not isinstance(resource_key, dict):
++            continue
++        if resource_key.get("name") != name:
++            continue
++        instance_id = _text_member(instance, "id")
++        if instance_id is not None:
++            conflicts.append(instance_id)
++    return tuple(conflicts)
++
++
++def _result(
++    payload: Any, existing_instance_count: int, precheck_message: str
++) -> OnboardingResult:
++    operation_id = CREATE_ADAPTER_INSTANCE[0]
++    if not isinstance(payload, dict):
++        raise OperationsApiError(
++            operation_id, 201, "the created adapter instance was not an object"
++        )
++    resource_key = payload.get("resourceKey")
++    if not isinstance(resource_key, dict):
++        raise OperationsApiError(
++            operation_id, 201, "the created adapter instance carried no resource key"
++        )
++    instance_id = _text_member(payload, "id")
++    created_name = _text_member(resource_key, "name")
++    adapter_kind_key = _text_member(resource_key, "adapterKindKey")
++    resource_kind_key = _text_member(resource_key, "resourceKindKey")
++    for value, label in (
++        (instance_id, "id"),
++        (created_name, "resourceKey.name"),
++        (adapter_kind_key, "resourceKey.adapterKindKey"),
++        (resource_kind_key, "resourceKey.resourceKindKey"),
++    ):
++        if value is None:
++            raise OperationsApiError(
++                operation_id, 201, f"the created adapter instance omitted {label}"
++            )
++    collector_id = payload.get("collectorId")
++    return OnboardingResult(
++        name=created_name,
++        adapter_kind_key=adapter_kind_key,
++        adapter_instance_id=instance_id,
++        resource_kind_key=resource_kind_key,
++        collector_id=collector_id if isinstance(collector_id, int) else None,
++        credential_instance_id=_string_member(payload, "credentialInstanceId"),
++        description=_string_member(payload, "description"),
++        existing_instance_count=existing_instance_count,
++        precheck_message=precheck_message,
++    )
++
++
++def _require_status(response: _Response, operation_id: str, expected: int) -> None:
++    if response.status != expected:
++        raise OperationsApiError(
++            operation_id,
++            response.status,
++            _error_message(response.payload, "the service returned no explanation"),
++        )
++
++
++def _text_member(payload: Any, member: str) -> str | None:
++    if not isinstance(payload, dict):
++        return None
++    value = payload.get(member)
++    if isinstance(value, str) and value.strip():
++        return value
++    return None
++
++
++def _string_member(payload: Any, member: str) -> str | None:
++    if not isinstance(payload, dict):
++        return None
++    value = payload.get(member)
++    return value if isinstance(value, str) else None
++
++
++def _require_text(value: Any, label: str) -> None:
++    if not isinstance(value, str) or not value.strip():
++        raise ValueError(f"{label} must be a nonblank string")
++
++
++def _require_optional_text(value: Any, label: str) -> None:
++    if value is None:
++        return
++    if not isinstance(value, str) or not value.strip():
++        raise ValueError(f"{label} must be omitted or a nonblank string")
++
++
++def _require_pairs(
++    value: Any, label: str, *, allow_empty: bool
++) -> tuple[tuple[str, str], ...]:
++    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
++        raise ValueError(f"{label} must be a sequence of (name, value) pairs")
++    pairs = []
++    for item in value:
++        if isinstance(item, (str, bytes)) or not isinstance(item, Sequence):
++            raise ValueError(f"{label} must be a sequence of (name, value) pairs")
++        entries = tuple(item)
++        if len(entries) != 2:
++            raise ValueError(f"{label} must be a sequence of (name, value) pairs")
++        if not isinstance(entries[0], str) or not isinstance(entries[1], str):
++            raise ValueError(f"{label} members must both be strings")
++        pairs.append((entries[0], entries[1]))
++    if not pairs and not allow_empty:
++        raise ValueError(f"{label} must not be empty")
++    return tuple(pairs)

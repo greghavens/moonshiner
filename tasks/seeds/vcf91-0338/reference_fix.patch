@@ -1,0 +1,328 @@
+diff --git a/src/VcfaTriage.java b/src/VcfaTriage.java
+index b059340..ccea052 100644
+--- a/src/VcfaTriage.java
++++ b/src/VcfaTriage.java
+@@ -1,41 +1,306 @@
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.time.Duration;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
+ /**
+  * VCF Automation 9.1 deployment triage client.
+  *
+- * Implement this class. It is the only file you need to change.
+- *
+- * The contract you are coding against is docs/contract.json; its provenance is
+- * docs/official_sources.json. Do not add source files, libraries or build
+- * tooling - the harness compiles exactly this file together with
+- * harness/TestMain.java and harness/Json.java on the stock JDK.
++ * Walks deployment -> failed request -> events -> event logs to find the real
++ * cause of an UPDATE_FAILED deployment, then files the remediating day-2 action
++ * against the resource the logs implicate.
+  *
+- * Json (from the harness) is available for reading responses:
+- *   Object doc = Json.parse(body);
+- *   String name = Json.str(doc, "name");
+- *   for (Object item : Json.asArray(Json.get(doc, "content"))) { ... }
+- * and Json.quote(s) escapes a string for a JSON document you build yourself.
++ * Every request follows docs/contract.json, including its rule that an optional
++ * parameter with no value is left off the wire entirely.
+  */
+ public final class VcfaTriage {
+ 
++    /** First ERROR row wins; INFO and WARN rows are context. */
++    private static final String ERROR_MARKER = " ERROR ";
++
++    private static final Pattern SNAPSHOT_NAME = Pattern.compile("snapshot '([^']+)'");
++
+     private final String baseUrl;
+     private final String bearerToken;
++    private final HttpClient http;
+ 
+     /**
+-     * @param baseUrl     origin of the VCF Automation API, no trailing slash,
+-     *                    for example "https://automation.vcf.example.com"
++     * @param baseUrl     origin of the VCF Automation API, no trailing slash
+      * @param bearerToken the token to present as "Authorization: Bearer &lt;token&gt;"
+      */
+     public VcfaTriage(String baseUrl, String bearerToken) {
+-        this.baseUrl = baseUrl;
++        this.baseUrl = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
+         this.bearerToken = bearerToken;
++        this.http = HttpClient.newBuilder()
++                .connectTimeout(Duration.ofSeconds(10))
++                .followRedirects(HttpClient.Redirect.NEVER)
++                .build();
+     }
+ 
+     /**
+      * Diagnose the failed deployment and submit the remediating day-2 action.
+      *
+-     * @param deploymentId the deployment to triage
+-     * @return the report, in the exact format described in README.md
++     * @return the nine-line report described in README.md
+      */
+     public String triage(String deploymentId) throws Exception {
+-        throw new UnsupportedOperationException("VcfaTriage.triage is not implemented yet");
++        Object deployment = getJson(path("/deployment/api/deployments/%s", deploymentId), Map.of());
++        String deploymentName = Json.str(deployment, "name");
++        String deploymentStatus = Json.str(deployment, "status");
++
++        Object failedRequest = newestOpenFailure(deploymentId);
++        String requestId = Json.str(failedRequest, "id");
++
++        Object failingEvent = lastEventWithLogs(requestId);
++        String eventId = Json.str(failingEvent, "id");
++        String resourceName = Json.str(failingEvent, "resourceName");
++
++        Object rootCause = firstErrorRow(readAllLogs(requestId, eventId));
++        String rootCauseMessage = Json.str(rootCause, "message");
++
++        String resourceId = resourceIdByName(deploymentId, resourceName);
++        Object action = chooseAction(resourceId, rootCauseMessage);
++        String actionId = Json.str(action, "id");
++
++        Object submitted = submit(resourceId, actionId, reasonFor(rootCauseMessage));
++
++        return String.join("\n",
++                "deployment=" + deploymentName + " status=" + deploymentStatus,
++                "failedRequest=" + requestId,
++                "failedEvent=" + eventId,
++                "failedResource=" + resourceName,
++                "rootCauseRow=" + Json.intOf(rootCause, "rownum"),
++                "rootCause=" + rootCauseMessage,
++                "remediationResource=" + resourceId,
++                "remediationAction=" + actionId,
++                "submittedRequest=" + Json.str(submitted, "id")
++                        + " status=" + Json.str(submitted, "status"));
++    }
++
++    // --- diagnosis -----------------------------------------------------------
++
++    /**
++     * The newest FAILED request that has not been dismissed. A dismissed failure
++     * has already been triaged and closed, even when it is the deployment's
++     * lastRequest.
++     */
++    private Object newestOpenFailure(String deploymentId) throws Exception {
++        Object best = null;
++        String bestCreatedAt = null;
++        for (Object request : allPages(
++                path("/deployment/api/deployments/%s/requests", deploymentId))) {
++            if (!"FAILED".equals(Json.str(request, "status")) || Json.bool(request, "dismissed")) {
++                continue;
++            }
++            String createdAt = Json.str(request, "createdAt");
++            if (bestCreatedAt == null || createdAt.compareTo(bestCreatedAt) > 0) {
++                best = request;
++                bestCreatedAt = createdAt;
++            }
++        }
++        if (best == null) {
++            throw new IllegalStateException(
++                    "deployment " + deploymentId + " has no open FAILED request");
++        }
++        return best;
++    }
++
++    /** The last event carrying logs, across every page of the request's events. */
++    private Object lastEventWithLogs(String requestId) throws Exception {
++        Object found = null;
++        for (Object event : allPages(path("/deployment/api/requests/%s/events", requestId))) {
++            if (Json.bool(event, "hasLogs")) {
++                found = event;
++            }
++        }
++        if (found == null) {
++            throw new IllegalStateException("request " + requestId + " has no event with logs");
++        }
++        return found;
++    }
++
++    /**
++     * Read the event log slice by slice, resuming from the row after the last
++     * one received. sinceRow is left off the first call: there is no row number
++     * to resume from yet.
++     */
++    private List<Object> readAllLogs(String requestId, String eventId) throws Exception {
++        String url = path("/deployment/api/requests/%s/events/%s/logs", requestId, eventId);
++        List<Object> rows = new ArrayList<>();
++        Integer sinceRow = null;
++
++        while (true) {
++            Map<String, String> query = sinceRow == null
++                    ? Map.of()
++                    : Map.of("sinceRow", String.valueOf(sinceRow));
++            Object slice = getJson(url, query);
++            List<Object> content = Json.asArray(Json.get(slice, "content"));
++            if (content.isEmpty()) {
++                return rows;
++            }
++            rows.addAll(content);
++            Object last = content.get(content.size() - 1);
++            if (Json.bool(last, "eof")) {
++                return rows;
++            }
++            sinceRow = Json.intOf(last, "rownum") + 1;
++        }
++    }
++
++    private Object firstErrorRow(List<Object> rows) {
++        for (Object row : rows) {
++            String message = Json.str(row, "message");
++            if (message != null && message.contains(ERROR_MARKER)) {
++                return row;
++            }
++        }
++        throw new IllegalStateException("event logs contain no ERROR row");
++    }
++
++    private String resourceIdByName(String deploymentId, String resourceName) throws Exception {
++        for (Object resource : allPages(
++                path("/deployment/api/deployments/%s/resources", deploymentId))) {
++            if (resourceName.equals(Json.str(resource, "name"))) {
++                return Json.str(resource, "id");
++            }
++        }
++        throw new IllegalStateException("deployment " + deploymentId
++                + " has no resource named " + resourceName);
++    }
++
++    // --- remediation ---------------------------------------------------------
++
++    /** Runbook: map the root cause to the action name that clears it. */
++    private static String runbookActionName(String rootCause) {
++        String cause = rootCause.toLowerCase();
++        if (cause.contains("snapshot")) {
++            return "Delete Snapshot";
++        }
++        if (cause.contains("storage policy")) {
++            return "Resize";
++        }
++        if (cause.contains("customization") || cause.contains("dns")
++                || cause.contains("unreachable")) {
++            return "Reboot";
++        }
++        throw new IllegalStateException("no runbook entry matches: " + rootCause);
++    }
++
++    private Object chooseAction(String resourceId, String rootCause) throws Exception {
++        String wanted = runbookActionName(rootCause);
++        Object body = getJson(path("/deployment/api/resources/%s/actions", resourceId), Map.of());
++        for (Object action : Json.asArray(body)) {
++            if (wanted.equals(Json.str(action, "name")) && Json.bool(action, "valid")) {
++                return action;
++            }
++        }
++        throw new IllegalStateException(
++                "resource " + resourceId + " offers no valid '" + wanted + "' action");
++    }
++
++    /** Ground the audit trail in the log evidence by naming the offending object. */
++    private static String reasonFor(String rootCause) {
++        Matcher m = SNAPSHOT_NAME.matcher(rootCause);
++        if (m.find()) {
++            return "Deleting snapshot '" + m.group(1) + "', which blocked disk reconfiguration "
++                    + "and failed the deployment update.";
++        }
++        return "Automated remediation for: " + rootCause;
++    }
++
++    private Object submit(String resourceId, String actionId, String reason) throws Exception {
++        // ResourceActionRequest documents actionId, inputs and reason, all optional.
++        // This action's schema declares no properties, so inputs is omitted rather
++        // than sent as an empty object.
++        String body = "{"
++                + "\"actionId\":" + Json.quote(actionId) + ","
++                + "\"reason\":" + Json.quote(reason)
++                + "}";
++        return postJson(path("/deployment/api/resources/%s/requests", resourceId), body);
++    }
++
++    // --- pagination ----------------------------------------------------------
++
++    /**
++     * Walk a page envelope to exhaustion. The first call chooses no page or size,
++     * so the server applies its documented defaults; later calls carry only the
++     * page index.
++     */
++    private List<Object> allPages(String url) throws Exception {
++        List<Object> items = new ArrayList<>();
++        Map<String, String> query = Map.of();
++        while (true) {
++            Object page = getJson(url, query);
++            items.addAll(Json.asArray(Json.get(page, "content")));
++            if (Json.bool(page, "last")) {
++                return items;
++            }
++            query = Map.of("page", String.valueOf(Json.intOf(page, "number") + 1));
++        }
++    }
++
++    // --- transport -----------------------------------------------------------
++
++    private String path(String template, String... segments) {
++        Object[] encoded = new Object[segments.length];
++        for (int i = 0; i < segments.length; i++) {
++            encoded[i] = encode(segments[i]);
++        }
++        return String.format(template, encoded);
++    }
++
++    private Object getJson(String path, Map<String, String> query) throws Exception {
++        return send(HttpRequest.newBuilder(URI.create(baseUrl + path + queryString(query)))
++                .GET(), path);
++    }
++
++    private Object postJson(String path, String body) throws Exception {
++        return send(HttpRequest.newBuilder(URI.create(baseUrl + path))
++                .header("Content-Type", "application/json")
++                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8)), path);
++    }
++
++    private Object send(HttpRequest.Builder builder, String path) throws Exception {
++        HttpRequest request = builder
++                .header("Authorization", "Bearer " + bearerToken)
++                .header("Accept", "application/json")
++                .timeout(Duration.ofSeconds(30))
++                .build();
++        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
++        if (response.statusCode() < 200 || response.statusCode() >= 300) {
++            throw new IllegalStateException(
++                    request.method() + " " + path + " returned " + response.statusCode()
++                            + ": " + response.body());
++        }
++        return Json.parse(response.body());
++    }
++
++    /** Only parameters the caller actually chose reach the wire. */
++    private static String queryString(Map<String, String> query) {
++        if (query.isEmpty()) {
++            return "";
++        }
++        StringBuilder out = new StringBuilder("?");
++        for (Map.Entry<String, String> entry : new LinkedHashMap<>(query).entrySet()) {
++            if (entry.getValue() == null || entry.getValue().isEmpty()) {
++                continue;
++            }
++            if (out.length() > 1) {
++                out.append('&');
++            }
++            out.append(encode(entry.getKey())).append('=').append(encode(entry.getValue()));
++        }
++        return out.length() == 1 ? "" : out.toString();
++    }
++
++    private static String encode(String raw) {
++        return java.net.URLEncoder.encode(raw, StandardCharsets.UTF_8).replace("+", "%20");
+     }
+ }

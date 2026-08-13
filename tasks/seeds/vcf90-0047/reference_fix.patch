@@ -1,0 +1,430 @@
+diff --git a/esxsoftware/remediate.go b/esxsoftware/remediate.go
+index bb0089c..c4d63a3 100644
+--- a/esxsoftware/remediate.go
++++ b/esxsoftware/remediate.go
+@@ -15,10 +15,16 @@
+ package esxsoftware
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
++	"strconv"
++	"strings"
+ 	"time"
+ )
+ 
+@@ -38,6 +44,20 @@ const (
+ // DefaultPollInterval is used when PollOptions.Interval is not positive.
+ const DefaultPollInterval = 5 * time.Second
+ 
++// The operationIds of the two operations this package calls, exactly as the
++// 9.0.0.0 vcenter.yaml specification names them.
++const (
++	opApply = "Esx.Settings.Clusters.Software_apply$Task"
++	opGet   = "Cis.Tasks_get"
++)
++
++// serverPathPrefix is the path component of the specification's server
++// template, https://{host}/api.
++const serverPathPrefix = "/api"
++
++// sessionHeader is the api_key_auth security scheme.
++const sessionHeader = "vmware-api-session-id"
++
+ // ApplySpec is the Esx.Settings.Clusters.Software.ApplySpec request body. Every
+ // member is optional, and an unset member must not reach the wire in any form.
+ type ApplySpec struct {
+@@ -119,7 +139,14 @@ type APIError struct {
+ }
+ 
+ func (e *APIError) Error() string {
+-	return "esxsoftware: api error"
++	detail := e.ErrorType
++	if detail == "" {
++		detail = "no error_type"
++	}
++	if len(e.Messages) > 0 && e.Messages[0].DefaultMessage != "" {
++		detail += ": " + e.Messages[0].DefaultMessage
++	}
++	return fmt.Sprintf("esxsoftware: %s returned HTTP %d (%s)", e.OperationID, e.StatusCode, detail)
+ }
+ 
+ // TaskFailedError reports a task that settled in an unsuccessful terminal
+@@ -133,7 +160,17 @@ type TaskFailedError struct {
+ }
+ 
+ func (e *TaskFailedError) Error() string {
+-	return "esxsoftware: task failed"
++	detail := e.ErrorType
++	if len(e.Messages) > 0 && e.Messages[0].DefaultMessage != "" {
++		if detail != "" {
++			detail += ": "
++		}
++		detail += e.Messages[0].DefaultMessage
++	}
++	if detail == "" {
++		return fmt.Sprintf("esxsoftware: task %s settled %s", e.TaskID, e.Status)
++	}
++	return fmt.Sprintf("esxsoftware: task %s settled %s (%s)", e.TaskID, e.Status, detail)
+ }
+ 
+ // ProtocolError reports a response that was accepted at the HTTP layer but does
+@@ -144,7 +181,7 @@ type ProtocolError struct {
+ }
+ 
+ func (e *ProtocolError) Error() string {
+-	return "esxsoftware: protocol error"
++	return fmt.Sprintf("esxsoftware: %s returned a response the contract does not describe: %s", e.OperationID, e.Detail)
+ }
+ 
+ // PollOptions tunes how ApplyAndAwait polls the accepted task.
+@@ -165,22 +202,339 @@ type Client struct {
+ // NewClient builds a client for a vCenter Server service root such as
+ // "https://vc-a01.vcf.local". A nil httpClient means http.DefaultClient.
+ func NewClient(baseURL, sessionID string, httpClient *http.Client) (*Client, error) {
+-	return nil, errors.New("esxsoftware: NewClient is not implemented")
++	root := strings.TrimSpace(baseURL)
++	if root == "" {
++		return nil, errors.New("esxsoftware: the vCenter Server service root is empty")
++	}
++	parsed, err := url.Parse(root)
++	if err != nil {
++		return nil, fmt.Errorf("esxsoftware: the vCenter Server service root is not a URL: %w", err)
++	}
++	if parsed.Scheme != "http" && parsed.Scheme != "https" {
++		return nil, fmt.Errorf("esxsoftware: the vCenter Server service root must be http or https, got %q", parsed.Scheme)
++	}
++	if parsed.Host == "" {
++		return nil, errors.New("esxsoftware: the vCenter Server service root has no host")
++	}
++
++	session := strings.TrimSpace(sessionID)
++	if session == "" {
++		return nil, errors.New("esxsoftware: the session identifier is empty")
++	}
++	// Never let a session identifier smuggle extra headers into a request, and
++	// never repeat it back in the message.
++	if strings.ContainsAny(session, "\r\n\x00") {
++		return nil, errors.New("esxsoftware: the session identifier is not safe to send as a header value")
++	}
++	for _, r := range session {
++		if r < 0x20 || r > 0x7e {
++			return nil, errors.New("esxsoftware: the session identifier is not safe to send as a header value")
++		}
++	}
++
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++	return &Client{
++		baseURL:    strings.TrimRight(root, "/"),
++		sessionID:  session,
++		httpClient: httpClient,
++	}, nil
++}
++
++// applySpecWire is the JSON projection of ApplySpec. Every member carries
++// omitempty, so an unset member is absent from the encoded object instead of
++// being encoded as null, "" or false. AcceptEULA is a pointer precisely so that
++// an explicit false survives.
++type applySpecWire struct {
++	Commit     string   `json:"commit,omitempty"`
++	Hosts      []string `json:"hosts,omitempty"`
++	AcceptEULA *bool    `json:"accept_eula,omitempty"`
+ }
+ 
+ // ApplySoftware invokes Esx.Settings.Clusters.Software_apply$Task and returns
+ // the identifier of the accepted task. It does not wait for the task.
+ func (c *Client) ApplySoftware(ctx context.Context, cluster string, spec ApplySpec) (string, error) {
+-	return "", errors.New("esxsoftware: ApplySoftware is not implemented")
++	if c == nil {
++		return "", errors.New("esxsoftware: nil client")
++	}
++	if strings.TrimSpace(cluster) == "" {
++		return "", errors.New("esxsoftware: the cluster identifier is empty")
++	}
++
++	body, err := json.Marshal(applySpecWire{
++		Commit:     spec.Commit,
++		Hosts:      spec.Hosts,
++		AcceptEULA: spec.AcceptEULA,
++	})
++	if err != nil {
++		return "", fmt.Errorf("esxsoftware: encoding the apply specification: %w", err)
++	}
++
++	// The specification keys this operation on both query parameters. Dropping
++	// vmw-task=true asks for a different, synchronous operation.
++	query := url.Values{
++		"action":   []string{"apply"},
++		"vmw-task": []string{"true"},
++	}
++	target := c.baseURL + serverPathPrefix + "/esx/settings/clusters/" +
++		url.PathEscape(cluster) + "/software?" + query.Encode()
++
++	raw, err := c.do(ctx, opApply, http.MethodPost, target, body, http.StatusAccepted)
++	if err != nil {
++		return "", err
++	}
++
++	// The 202 body is a bare JSON string holding the task identifier.
++	var taskID string
++	if err := json.Unmarshal(raw, &taskID); err != nil {
++		return "", &ProtocolError{
++			OperationID: opApply,
++			Detail:      fmt.Sprintf("the 202 body is not a JSON string holding a com.vmware.cis.task identifier: %q", string(raw)),
++		}
++	}
++	if strings.TrimSpace(taskID) == "" {
++		return "", &ProtocolError{
++			OperationID: opApply,
++			Detail:      "the apply was accepted without a com.vmware.cis.task identifier, so the remediation cannot be followed",
++		}
++	}
++	return taskID, nil
+ }
+ 
+ // GetTask invokes Cis.Tasks_get once for the given task identifier.
+ func (c *Client) GetTask(ctx context.Context, taskID string, spec GetSpec) (*TaskInfo, error) {
+-	return nil, errors.New("esxsoftware: GetTask is not implemented")
++	if c == nil {
++		return nil, errors.New("esxsoftware: nil client")
++	}
++	if strings.TrimSpace(taskID) == "" {
++		return nil, errors.New("esxsoftware: the task identifier is empty")
++	}
++
++	target := c.baseURL + serverPathPrefix + "/cis/tasks/" + url.PathEscape(taskID)
++	// The spec parameter is style=form with explode=true: it is never sent under
++	// the name "spec". Each set member becomes its own parameter, and an unset
++	// member contributes nothing at all.
++	query := url.Values{}
++	if spec.ReturnAll != nil {
++		query.Set("return_all", strconv.FormatBool(*spec.ReturnAll))
++	}
++	if spec.ExcludeResult != nil {
++		query.Set("exclude_result", strconv.FormatBool(*spec.ExcludeResult))
++	}
++	if encoded := query.Encode(); encoded != "" {
++		target += "?" + encoded
++	}
++
++	raw, err := c.do(ctx, opGet, http.MethodGet, target, nil, http.StatusOK)
++	if err != nil {
++		return nil, err
++	}
++
++	var wire taskInfoWire
++	if err := json.Unmarshal(raw, &wire); err != nil {
++		return nil, &ProtocolError{
++			OperationID: opGet,
++			Detail:      fmt.Sprintf("the 200 body is not a Cis.Task.Info: %v", err),
++		}
++	}
++	return wire.toTaskInfo(), nil
+ }
+ 
+ // ApplyAndAwait applies the desired software document to the cluster and polls
+ // the accepted task until it reaches a terminal state.
+ func (c *Client) ApplyAndAwait(ctx context.Context, cluster string, spec ApplySpec, opts PollOptions) (Report, error) {
+-	return Report{}, errors.New("esxsoftware: ApplyAndAwait is not implemented")
++	var report Report
++	if c == nil {
++		return report, errors.New("esxsoftware: nil client")
++	}
++
++	taskID, err := c.ApplySoftware(ctx, cluster, spec)
++	if err != nil {
++		return report, err
++	}
++	report.TaskID = taskID
++
++	interval := opts.Interval
++	if interval <= 0 {
++		interval = DefaultPollInterval
++	}
++
++	for {
++		info, err := c.GetTask(ctx, taskID, opts.GetSpec)
++		if err != nil {
++			return report, err
++		}
++
++		report.Polls++
++		report.Status = info.Status
++		report.StatusSequence = append(report.StatusSequence, info.Status)
++		report.Info = info
++
++		switch info.Status {
++		case StatusSucceeded:
++			report.Succeeded = true
++			return report, nil
++		case StatusFailed:
++			errType, messages := decodeVapiError(info.Error)
++			return report, &TaskFailedError{
++				TaskID:    taskID,
++				Status:    info.Status,
++				ErrorType: errType,
++				Messages:  messages,
++				Info:      info,
++			}
++		case StatusPending, StatusRunning, StatusBlocked:
++			// The appliance is still working. BLOCKED in particular is not an
++			// outcome: it means the task is waiting on something.
++		default:
++			return report, &ProtocolError{
++				OperationID: opGet,
++				Detail: fmt.Sprintf("task %s reported status %q, which Cis.Task.Status does not define",
++					taskID, string(info.Status)),
++			}
++		}
++
++		if err := sleep(ctx, interval); err != nil {
++			return report, err
++		}
++	}
++}
++
++// sleep waits for d or until the context is done, whichever comes first.
++func sleep(ctx context.Context, d time.Duration) error {
++	timer := time.NewTimer(d)
++	defer timer.Stop()
++	select {
++	case <-ctx.Done():
++		return fmt.Errorf("esxsoftware: stopped polling: %w", ctx.Err())
++	case <-timer.C:
++		return nil
++	}
++}
++
++// do issues one request and returns the body of a response whose status is the
++// one the contract lists as success.
++func (c *Client) do(ctx context.Context, operationID, method, target string, body []byte, wantStatus int) ([]byte, error) {
++	if ctx == nil {
++		return nil, errors.New("esxsoftware: nil context")
++	}
++	if err := ctx.Err(); err != nil {
++		return nil, fmt.Errorf("esxsoftware: %s not sent: %w", operationID, err)
++	}
++
++	var reader io.Reader
++	if body != nil {
++		reader = bytes.NewReader(body)
++	}
++	req, err := http.NewRequestWithContext(ctx, method, target, reader)
++	if err != nil {
++		return nil, fmt.Errorf("esxsoftware: building the %s request: %w", operationID, err)
++	}
++	req.Header.Set("Accept", "application/json")
++	req.Header.Set(sessionHeader, c.sessionID)
++	if body != nil {
++		req.Header.Set("Content-Type", "application/json")
++	}
++
++	resp, err := c.httpClient.Do(req)
++	if err != nil {
++		return nil, fmt.Errorf("esxsoftware: %s: %w", operationID, err)
++	}
++	defer func() {
++		_, _ = io.Copy(io.Discard, resp.Body)
++		_ = resp.Body.Close()
++	}()
++
++	raw, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return nil, fmt.Errorf("esxsoftware: reading the %s response: %w", operationID, err)
++	}
++	if resp.StatusCode != wantStatus {
++		errType, messages := decodeVapiError(raw)
++		return nil, &APIError{
++			OperationID: operationID,
++			StatusCode:  resp.StatusCode,
++			ErrorType:   errType,
++			Messages:    messages,
++		}
++	}
++	return raw, nil
++}
++
++// messageWire is a Vapi.Std.LocalizableMessage as it arrives.
++type messageWire struct {
++	ID             string   `json:"id"`
++	DefaultMessage string   `json:"default_message"`
++	Args           []string `json:"args"`
++}
++
++func (m messageWire) toMessage() Message {
++	return Message{ID: m.ID, DefaultMessage: m.DefaultMessage, Args: m.Args}
++}
++
++type taskInfoWire struct {
++	Status      Status      `json:"status"`
++	Cancelable  bool        `json:"cancelable"`
++	Service     string      `json:"service"`
++	Operation   string      `json:"operation"`
++	Description messageWire `json:"description"`
++	Parent      string      `json:"parent"`
++	User        string      `json:"user"`
++	StartTime   string      `json:"start_time"`
++	EndTime     string      `json:"end_time"`
++	Progress    *struct {
++		Total     int64       `json:"total"`
++		Completed int64       `json:"completed"`
++		Message   messageWire `json:"message"`
++	} `json:"progress"`
++	Result json.RawMessage `json:"result"`
++	Error  json.RawMessage `json:"error"`
++}
++
++func (w taskInfoWire) toTaskInfo() *TaskInfo {
++	info := &TaskInfo{
++		Status:      w.Status,
++		Cancelable:  w.Cancelable,
++		Service:     w.Service,
++		Operation:   w.Operation,
++		Description: w.Description.toMessage(),
++		Parent:      w.Parent,
++		User:        w.User,
++		StartTime:   w.StartTime,
++		EndTime:     w.EndTime,
++		Result:      w.Result,
++		Error:       w.Error,
++	}
++	if w.Progress != nil {
++		info.Progress = &Progress{
++			Total:     w.Progress.Total,
++			Completed: w.Progress.Completed,
++			Message:   w.Progress.Message.toMessage(),
++		}
++	}
++	return info
++}
++
++// decodeVapiError pulls error_type and messages out of a Vapi.Std.Errors.Error.
++// A body that is not one yields no fields rather than an error of its own.
++func decodeVapiError(raw []byte) (string, []Message) {
++	if len(raw) == 0 {
++		return "", nil
++	}
++	var wire struct {
++		ErrorType string        `json:"error_type"`
++		Messages  []messageWire `json:"messages"`
++	}
++	if err := json.Unmarshal(raw, &wire); err != nil {
++		return "", nil
++	}
++	messages := make([]Message, 0, len(wire.Messages))
++	for _, m := range wire.Messages {
++		messages = append(messages, m.toMessage())
++	}
++	if len(messages) == 0 {
++		messages = nil
++	}
++	return wire.ErrorType, messages
+ }

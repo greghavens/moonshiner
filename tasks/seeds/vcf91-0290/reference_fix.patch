@@ -1,0 +1,499 @@
+diff --git a/vcfon_tiers/rollout.py b/vcfon_tiers/rollout.py
+new file mode 100644
+index 0000000..51283fa
+--- /dev/null
++++ b/vcfon_tiers/rollout.py
+@@ -0,0 +1,493 @@
++"""Tier rollout against the VCF Operations for Networks 9.1 REST API.
++
++Wire shapes follow the focused contract projected in ``docs/contract.json``
++from ``specifications/vcf-operations/vcf-operations-for-networks-openapi.yaml``
++at commit ``c3f3b52c845dd967cabbc21680e893292077d5ba`` of
++``https://github.com/vmware/vcf-api-specs``.
++
++Only the standard library is used.
++"""
++
++from __future__ import annotations
++
++import json
++import urllib.error
++import urllib.request
++from typing import Any, Mapping, Sequence
++from urllib.parse import quote, urlencode, urlsplit
++
++# From the specification's single server entry.
++BASE_PATH = "/api/ni"
++# From the ApiKeyAuth security scheme: "API Key - NetworkInsight {token}".
++AUTH_SCHEME = "NetworkInsight"
++
++# Declaration order of each request-side schema's properties in the pinned
++# specification. Members absent from a caller's input are omitted on the wire.
++USER_CREDENTIAL_ORDER = ("username", "password", "domain")
++DOMAIN_ORDER = ("domain_type", "value")
++TIER_REQUEST_ORDER = (
++    "name",
++    "entity_id",
++    "group_membership_criteria",
++    "member_list",
++    "source_group_entity_id",
++)
++GROUP_MEMBERSHIP_CRITERIA_ORDER = (
++    "membership_type",
++    "ip_address_membership_criteria",
++    "search_membership_criteria",
++)
++IP_ADDRESS_MEMBERSHIP_CRITERIA_ORDER = ("ip_addresses",)
++SEARCH_MEMBERSHIP_CRITERIA_ORDER = ("entity_type", "filter")
++MEMBER_LIST_ORDER = ("vms", "physical_ips", "kubernetes_services")
++MEMBER_ORDER = ("key", "name")
++REFERENCE_ORDER = ("entity_id", "entity_type", "entity_name")
++
++
++class VcfOnError(Exception):
++    """Base class for every failure this package raises."""
++
++
++class ApiError(VcfOnError):
++    """The appliance answered with a status the rollout cannot continue past."""
++
++    def __init__(
++        self,
++        status: int,
++        code: Any = None,
++        message: str = "",
++        operation_id: str = "",
++    ) -> None:
++        super().__init__(
++            f"{operation_id or 'request'} failed with HTTP {status}"
++            + (f": {message}" if message else "")
++        )
++        self.status = status
++        self.code = code
++        self.message = message
++        self.operation_id = operation_id
++
++
++class TokenRefreshError(VcfOnError):
++    """A freshly minted token was rejected, so the rollout cannot proceed."""
++
++
++# --------------------------------------------------------------------------
++# Request body projection
++# --------------------------------------------------------------------------
++
++
++def _project(
++    value: Mapping[str, Any],
++    order: Sequence[str],
++    nested: Mapping[str, Any] | None = None,
++    *,
++    label: str,
++) -> dict[str, Any]:
++    """Order a mapping by the schema's property order, dropping unset members."""
++    if not isinstance(value, Mapping):
++        raise VcfOnError(f"{label} must be a mapping")
++    unknown = [key for key in value if key not in order]
++    if unknown:
++        rendered = sorted(repr(key) for key in unknown)
++        raise VcfOnError(f"{label} has members outside the contract: {rendered}")
++    projected: dict[str, Any] = {}
++    for key in order:
++        if key not in value:
++            continue
++        member = value[key]
++        if member is None:
++            continue
++        projector = (nested or {}).get(key)
++        projected[key] = projector(member) if projector is not None else member
++    return projected
++
++
++def _project_reference(value: Mapping[str, Any]) -> dict[str, Any]:
++    return _project(value, REFERENCE_ORDER, label="Reference")
++
++
++def _project_member(value: Mapping[str, Any]) -> dict[str, Any]:
++    return _project(value, MEMBER_ORDER, {"key": _project_reference}, label="Member")
++
++
++def _project_member_sequence(value: Sequence[Any]) -> list[dict[str, Any]]:
++    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
++        raise VcfOnError("Member sequence must be an array")
++    return [_project_member(item) for item in value]
++
++
++def _project_member_list(value: Mapping[str, Any]) -> dict[str, Any]:
++    return _project(
++        value,
++        MEMBER_LIST_ORDER,
++        {name: _project_member_sequence for name in MEMBER_LIST_ORDER},
++        label="MemberList",
++    )
++
++
++def _project_criterion(value: Mapping[str, Any]) -> dict[str, Any]:
++    return _project(
++        value,
++        GROUP_MEMBERSHIP_CRITERIA_ORDER,
++        {
++            "ip_address_membership_criteria": lambda item: _project(
++                item,
++                IP_ADDRESS_MEMBERSHIP_CRITERIA_ORDER,
++                label="IpAddressMembershipCriteria",
++            ),
++            "search_membership_criteria": lambda item: _project(
++                item,
++                SEARCH_MEMBERSHIP_CRITERIA_ORDER,
++                label="SearchMembershipCriteria",
++            ),
++        },
++        label="GroupMembershipCriteria",
++    )
++
++
++def _project_criterion_sequence(value: Sequence[Any]) -> list[dict[str, Any]]:
++    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
++        raise VcfOnError("GroupMembershipCriteria sequence must be an array")
++    return [_project_criterion(item) for item in value]
++
++
++def _project_tier_request(value: Mapping[str, Any]) -> dict[str, Any]:
++    projected = _project(
++        value,
++        TIER_REQUEST_ORDER,
++        {
++            "group_membership_criteria": _project_criterion_sequence,
++            "member_list": _project_member_list,
++        },
++        label="TierRequest",
++    )
++    if not isinstance(projected.get("name"), str) or not projected["name"]:
++        raise VcfOnError("TierRequest.name must be a non-empty string")
++    return projected
++
++
++def _project_user_credential(
++    username: str, password: str, domain: Mapping[str, Any] | None
++) -> dict[str, Any]:
++    credential: dict[str, Any] = {"username": username, "password": password}
++    if domain is not None:
++        credential["domain"] = domain
++    return _project(
++        credential,
++        USER_CREDENTIAL_ORDER,
++        {"domain": lambda item: _project(item, DOMAIN_ORDER, label="Domain")},
++        label="UserCredential",
++    )
++
++
++def _encode_body(value: Any) -> bytes:
++    try:
++        return json.dumps(
++            value,
++            separators=(",", ":"),
++            ensure_ascii=False,
++            allow_nan=False,
++        ).encode("utf-8")
++    except (TypeError, ValueError) as error:
++        raise VcfOnError("request body is not JSON-serializable") from error
++
++
++def _normalize_base_url(base_url: str) -> str:
++    if (
++        not isinstance(base_url, str)
++        or not base_url
++        or base_url != base_url.strip()
++    ):
++        raise VcfOnError("base_url must be an HTTP(S) appliance root URL")
++    try:
++        parsed = urlsplit(base_url)
++        # Accessing these properties also validates bracketed hosts and ports.
++        hostname = parsed.hostname
++        _port = parsed.port
++    except ValueError as error:
++        raise VcfOnError("base_url must be an HTTP(S) appliance root URL") from error
++    if (
++        parsed.scheme not in {"http", "https"}
++        or hostname is None
++        or parsed.username is not None
++        or parsed.password is not None
++        or parsed.path not in {"", "/"}
++        or parsed.query
++        or parsed.fragment
++    ):
++        raise VcfOnError("base_url must be an HTTP(S) appliance root URL")
++    return base_url.rstrip("/")
++
++
++# --------------------------------------------------------------------------
++# HTTP client
++# --------------------------------------------------------------------------
++
++
++class _Unauthorized(Exception):
++    """Internal signal: the appliance rejected the presented token."""
++
++
++class _Client:
++    """Minimal client for the five contracted operations."""
++
++    def __init__(self, base_url: str, timeout_seconds: float) -> None:
++        self.base_url = base_url.rstrip("/")
++        self.timeout_seconds = timeout_seconds
++        self.token: str | None = None
++        self.token_expiry: int | None = None
++        self.refreshes = 0
++
++    def _url(self, path: str, query: Sequence[tuple[str, str]] = ()) -> str:
++        url = f"{self.base_url}{BASE_PATH}{path}"
++        if query:
++            url += "?" + urlencode(list(query))
++        return url
++
++    def _send(
++        self,
++        method: str,
++        path: str,
++        *,
++        operation_id: str,
++        query: Sequence[tuple[str, str]] = (),
++        body: bytes | None = None,
++        authenticated: bool = True,
++    ) -> tuple[int, Any]:
++        request = urllib.request.Request(self._url(path, query), method=method)
++        request.add_header("Accept", "application/json")
++        if body is not None:
++            request.add_header("Content-Type", "application/json")
++            request.data = body
++        if authenticated:
++            if self.token is None:
++                raise VcfOnError("no auth token has been acquired")
++            request.add_header("Authorization", f"{AUTH_SCHEME} {self.token}")
++
++        try:
++            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as reply:
++                raw = reply.read()
++                status = reply.status
++        except urllib.error.HTTPError as error:
++            raw = error.read()
++            status = error.code
++            if status == 401 and authenticated:
++                raise _Unauthorized() from error
++            code, message = _read_api_error(raw)
++            raise ApiError(status, code, message, operation_id) from error
++        except urllib.error.URLError as error:
++            raise VcfOnError(f"{operation_id} could not reach the appliance: {error}") from error
++
++        if status == 204 or not raw:
++            return status, None
++        try:
++            return status, json.loads(raw.decode("utf-8"))
++        except (UnicodeDecodeError, ValueError) as error:
++            raise VcfOnError(f"{operation_id} returned a body that is not JSON") from error
++
++    # -- token lifecycle -------------------------------------------------
++
++    def acquire_token(self, credential_body: bytes) -> None:
++        """`create` — POST /auth/token. The specification gives this operation
++        an empty security list, so no Authorization header is sent."""
++        status, payload = self._send(
++            "POST",
++            "/auth/token",
++            operation_id="create",
++            body=credential_body,
++            authenticated=False,
++        )
++        if status != 200 or not isinstance(payload, dict):
++            raise ApiError(status, None, "unexpected token response", "create")
++        token = payload.get("token")
++        if not isinstance(token, str) or not token:
++            raise ApiError(status, None, "token response carried no token", "create")
++        self.token = token
++        expiry = payload.get("expiry")
++        self.token_expiry = expiry if isinstance(expiry, int) else None
++
++    def call(
++        self,
++        method: str,
++        path: str,
++        *,
++        operation_id: str,
++        credential_body: bytes,
++        query: Sequence[tuple[str, str]] = (),
++        body: bytes | None = None,
++    ) -> tuple[int, Any]:
++        """Send one authenticated request, refreshing at most once on a 401.
++
++        A 401 is the authoritative expiry signal. The failed request — and only
++        that request — is replayed with the new token, so completed work is
++        never repeated.
++        """
++        try:
++            return self._send(
++                method, path, operation_id=operation_id, query=query, body=body
++            )
++        except _Unauthorized:
++            pass
++        self.refreshes += 1
++        self.acquire_token(credential_body)
++        try:
++            return self._send(
++                method, path, operation_id=operation_id, query=query, body=body
++            )
++        except _Unauthorized as error:
++            raise TokenRefreshError(
++                f"{operation_id} was rejected again with a freshly issued token"
++            ) from error
++
++
++def _read_api_error(raw: bytes) -> tuple[Any, str]:
++    try:
++        payload = json.loads(raw.decode("utf-8"))
++    except (UnicodeDecodeError, ValueError):
++        return None, ""
++    if not isinstance(payload, dict):
++        return None, ""
++    message = payload.get("message")
++    return payload.get("code"), message if isinstance(message, str) else ""
++
++
++# --------------------------------------------------------------------------
++# Rollout
++# --------------------------------------------------------------------------
++
++
++def run_tier_rollout(
++    base_url: str,
++    username: str,
++    password: str,
++    plan: Mapping[str, Any],
++    *,
++    domain: Mapping[str, Any] | None = None,
++    page_size: int = 10,
++    timeout_seconds: float = 30.0,
++) -> dict[str, Any]:
++    """Create one planned tier in each saved application whose name the plan names.
++
++    ``plan`` maps an application name to a TierRequest body. The appliance is
++    listed in full first, every listed application is resolved to its name, and
++    only then are tiers created — one per matched application, in list order.
++    """
++    normalized_base_url = _normalize_base_url(base_url)
++    if not isinstance(username, str) or not username:
++        raise VcfOnError("username is required")
++    if not isinstance(password, str) or not password:
++        raise VcfOnError("password is required")
++    if not isinstance(plan, Mapping):
++        raise VcfOnError("plan must be a mapping of application name to tier request")
++    if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size < 1:
++        raise VcfOnError("page_size must be a positive integer")
++    for name in plan:
++        if not isinstance(name, str) or not name:
++            raise VcfOnError("every plan key must be a non-empty application name")
++
++    credential_body = _encode_body(
++        _project_user_credential(username, password, domain)
++    )
++    # Reject an unusable plan before touching the appliance.
++    projected_plan = {
++        name: _project_tier_request(entry) for name, entry in plan.items()
++    }
++
++    client = _Client(normalized_base_url, timeout_seconds)
++    client.acquire_token(credential_body)
++
++    # 1. Page through every saved application.
++    entity_ids: list[str] = []
++    cursor: str | None = None
++    pages_fetched = 0
++    while True:
++        query: list[tuple[str, str]] = [("size", str(page_size))]
++        if cursor is not None:
++            query.append(("cursor", cursor))
++        _status, payload = client.call(
++            "GET",
++            "/groups/applications",
++            operation_id="listApplications",
++            credential_body=credential_body,
++            query=query,
++        )
++        pages_fetched += 1
++        if not isinstance(payload, dict):
++            raise VcfOnError("listApplications returned an unexpected body")
++        for item in payload.get("results") or []:
++            entity_id = (item or {}).get("entity_id")
++            if not isinstance(entity_id, str) or not entity_id:
++                raise VcfOnError("listApplications returned an entry without an entity_id")
++            entity_ids.append(entity_id)
++        following = payload.get("cursor")
++        if not isinstance(following, str) or not following:
++            break
++        cursor = following
++
++    # 2. Resolve every listed application to its name.
++    names: list[str] = []
++    for entity_id in entity_ids:
++        _status, payload = client.call(
++            "GET",
++            f"/groups/applications/{quote(entity_id, safe='')}",
++            operation_id="getApplicationById",
++            credential_body=credential_body,
++        )
++        if not isinstance(payload, dict):
++            raise VcfOnError("getApplicationById returned an unexpected body")
++        name = payload.get("name")
++        if not isinstance(name, str) or not name:
++            raise VcfOnError(f"application {entity_id} has no name")
++        names.append(name)
++
++    # 3. Create one tier per matched application, in list order, exactly once.
++    tiers_created: list[dict[str, Any]] = []
++    applications_without_plan: list[str] = []
++    matched_names: set[str] = set()
++    for entity_id, name in zip(entity_ids, names):
++        tier_request = projected_plan.get(name)
++        if tier_request is None:
++            applications_without_plan.append(name)
++            continue
++        matched_names.add(name)
++        status, payload = client.call(
++            "POST",
++            f"/groups/applications/{quote(entity_id, safe='')}/tiers",
++            operation_id="addTier",
++            credential_body=credential_body,
++            body=_encode_body(tier_request),
++        )
++        if status != 201 or not isinstance(payload, dict):
++            raise ApiError(status, None, "unexpected tier response", "addTier")
++        tier_id = payload.get("entity_id")
++        if not isinstance(tier_id, str) or not tier_id:
++            raise ApiError(status, None, "tier response carried no entity_id", "addTier")
++        tiers_created.append(
++            {
++                "application_entity_id": entity_id,
++                "application_name": name,
++                "tier_entity_id": tier_id,
++                "tier_name": tier_request["name"],
++            }
++        )
++
++    # 4. Release the token the run finished with.
++    client.call(
++        "DELETE",
++        "/auth/token",
++        operation_id="delete",
++        credential_body=credential_body,
++    )
++
++    return {
++        "base_url": client.base_url,
++        "pages_fetched": pages_fetched,
++        "applications_listed": len(entity_ids),
++        "tiers_created": tiers_created,
++        "applications_without_plan": applications_without_plan,
++        "plan_entries_without_application": sorted(
++            name for name in projected_plan if name not in matched_names
++        ),
++        "token_refreshes": client.refreshes,
++    }

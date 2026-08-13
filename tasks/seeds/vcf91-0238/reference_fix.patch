@@ -1,0 +1,261 @@
+diff --git a/src/FleetTaskInventory.java b/src/FleetTaskInventory.java
+new file mode 100644
+index 0000000..712355c
+--- /dev/null
++++ b/src/FleetTaskInventory.java
+@@ -0,0 +1,255 @@
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.time.OffsetDateTime;
++import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * Retrieves the complete SDDC LCM task collection for a VCF 9.1 fleet and reports it in a stable
++ * order, enriching every failed task with the stage that failed.
++ *
++ * Wire behaviour is pinned to docs/contract.json, a focused projection of
++ * specifications/sddc-lcm/sddc-lcm-openapi.yaml from vmware/vcf-api-specs. Only the operations
++ * getTasks and getTask are used.
++ */
++public final class FleetTaskInventory {
++
++    /** "Page Size. Maximum allowed is 50." -- pageSizeQueryParam in the pinned specification. */
++    private static final int PAGE_SIZE = 50;
++
++    /** getTasks query parameters, in the order the contract declares them. */
++    private static final List<String> FILTER_ORDER = List.of(
++            "status", "type", "createdBy", "name", "description",
++            "startTimeGt", "startTimeLt", "updateTimeGt", "updateTimeLt",
++            "endTimeGt", "endTimeLt", "resourceId", "resourceType",
++            "includeSystemTasks");
++
++    private static final String UNRESERVED =
++            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
++
++    private final String baseUrl;
++    private final String bearerToken;
++    private final HttpClient http;
++
++    public FleetTaskInventory(String baseUrl, String bearerToken) {
++        if (baseUrl == null || baseUrl.isBlank()) {
++            throw new IllegalArgumentException("baseUrl must not be blank");
++        }
++        if (bearerToken == null || bearerToken.isBlank()) {
++            throw new IllegalArgumentException("bearerToken must not be blank");
++        }
++        this.baseUrl = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
++        this.bearerToken = bearerToken;
++        this.http = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NEVER).build();
++    }
++
++    // --------------------------------------------------------------- public API
++
++    public String collect(Map<String, String> filters) throws Exception {
++        String filterQuery = renderFilters(filters);
++
++        List<Map<String, Object>> summaries = new ArrayList<>();
++        long totalElements = 0;
++        int pagesRetrieved = 0;
++        int pageNumber = 0;
++        int totalPages = 1;
++
++        while (pageNumber < totalPages) {
++            Map<String, Object> page = Json.obj(getJson(listTarget(filterQuery, pageNumber)));
++            pagesRetrieved++;
++
++            List<Object> elements = Json.arr(page.get("elements"));
++            if (elements != null) {
++                for (Object e : elements) {
++                    summaries.add(Json.obj(e));
++                }
++            }
++
++            Map<String, Object> meta = Json.obj(page.get("pageMetadata"));
++            if (meta == null) {
++                throw new IllegalStateException("getTasks response carried no pageMetadata");
++            }
++            Long metaTotalPages = Json.num(meta.get("totalPages"));
++            Long metaTotalElements = Json.num(meta.get("totalElements"));
++            totalPages = metaTotalPages == null ? pageNumber + 1 : metaTotalPages.intValue();
++            totalElements = metaTotalElements == null ? summaries.size() : metaTotalElements;
++            pageNumber++;
++        }
++
++        if (summaries.size() != totalElements) {
++            throw new IllegalStateException("retrieved " + summaries.size()
++                    + " task(s) but the service reported " + totalElements);
++        }
++
++        summaries.sort(ORDER);
++
++        List<Object> tasks = new ArrayList<>();
++        List<Object> failures = new ArrayList<>();
++        for (Map<String, Object> t : summaries) {
++            String id = requireId(t);
++            String status = Json.str(t.get("status"));
++            String startTime = normalizeTime(t.get("startTime"));
++
++            Map<String, Object> row = new LinkedHashMap<>();
++            row.put("id", id);
++            row.put("name", Json.str(t.get("name")));
++            row.put("status", status);
++            row.put("startTime", startTime);
++            tasks.add(row);
++
++            if ("FAILED".equals(status)) {
++                failures.add(describeFailure(id, t, startTime));
++            }
++        }
++
++        Map<String, Object> report = new LinkedHashMap<>();
++        report.put("pagesRetrieved", (long) pagesRetrieved);
++        report.put("totalElements", totalElements);
++        report.put("taskCount", (long) tasks.size());
++        report.put("failedCount", (long) failures.size());
++        report.put("tasks", tasks);
++        report.put("failures", failures);
++        return Json.write(report);
++    }
++
++    // -------------------------------------------------------------- enrichment
++
++    /** getTask for one failed task; the failing stage comes from its own stages, never subTasks. */
++    private Map<String, Object> describeFailure(String id, Map<String, Object> summary,
++                                                String startTime) throws Exception {
++        Map<String, Object> detail = Json.obj(getJson("/v1/tasks/" + encode(id)));
++        if (detail == null || !id.equals(Json.str(detail.get("id")))) {
++            throw new IllegalStateException("getTask returned a different task than " + id);
++        }
++
++        List<Object> stages = Json.arr(detail.get("stages"));
++        if (stages == null) {
++            stages = List.of();
++        }
++        Map<String, Object> failedStage = null;
++        for (Object s : stages) {
++            Map<String, Object> stage = Json.obj(s);
++            if ("FAILED".equals(Json.str(stage.get("status")))) {
++                if (failedStage != null) {
++                    throw new IllegalStateException("task " + id + " has more than one failed stage");
++                }
++                failedStage = stage;
++            }
++        }
++        if (failedStage == null) {
++            throw new IllegalStateException("task " + id + " has no failed stage");
++        }
++        Map<String, Object> description = Json.obj(failedStage.get("description"));
++
++        Map<String, Object> row = new LinkedHashMap<>();
++        row.put("id", id);
++        row.put("name", Json.str(summary.get("name")));
++        row.put("startTime", startTime);
++        row.put("stageCount", (long) stages.size());
++        row.put("failedStage", Json.str(failedStage.get("name")));
++        row.put("failureMessageId", description == null ? null : Json.str(description.get("id")));
++        return row;
++    }
++
++    // ------------------------------------------------------------------ order
++
++    /**
++     * Newest first by start instant, then by id ascending. Tasks that never started sort last.
++     * The service renders the same instant in several legal ISO-8601 forms, so the comparison must
++     * be on the parsed instant rather than on the raw string.
++     */
++    private static final Comparator<Map<String, Object>> ORDER = (a, b) -> {
++        OffsetDateTime ta = parseInstant(a.get("startTime"));
++        OffsetDateTime tb = parseInstant(b.get("startTime"));
++        if (ta != null && tb != null) {
++            int c = tb.toInstant().compareTo(ta.toInstant());
++            if (c != 0) {
++                return c;
++            }
++        } else if (ta != null) {
++            return -1;
++        } else if (tb != null) {
++            return 1;
++        }
++        return requireId(a).compareTo(requireId(b));
++    };
++
++    private static OffsetDateTime parseInstant(Object raw) {
++        String text = normalizeTime(raw);
++        return text == null ? null : OffsetDateTime.parse(text);
++    }
++
++    private static String normalizeTime(Object raw) {
++        String text = Json.str(raw);
++        return (text == null || text.isBlank()) ? null : text;
++    }
++
++    private static String requireId(Map<String, Object> task) {
++        String id = Json.str(task.get("id"));
++        if (id == null || id.isBlank()) {
++            throw new IllegalStateException("task summary carried no id");
++        }
++        return id;
++    }
++
++    // ------------------------------------------------------------------- wire
++
++    private String listTarget(String filterQuery, int pageNumber) {
++        StringBuilder q = new StringBuilder("/v1/tasks?");
++        q.append(filterQuery);
++        q.append("pageNumber=").append(pageNumber);
++        q.append("&pageSize=").append(PAGE_SIZE);
++        return q.toString();
++    }
++
++    /** Only filters the caller actually set are emitted, in the contract's parameter order. */
++    private String renderFilters(Map<String, String> filters) {
++        StringBuilder q = new StringBuilder();
++        if (filters == null) {
++            return "";
++        }
++        for (String name : FILTER_ORDER) {
++            String value = filters.get(name);
++            if (value == null || value.isBlank()) {
++                continue;
++            }
++            q.append(name).append('=').append(encode(value)).append('&');
++        }
++        return q.toString();
++    }
++
++    private static String encode(String value) {
++        StringBuilder out = new StringBuilder();
++        for (byte b : value.getBytes(StandardCharsets.UTF_8)) {
++            char c = (char) (b & 0xFF);
++            if (UNRESERVED.indexOf(c) >= 0) {
++                out.append(c);
++            } else {
++                out.append('%').append(String.format("%02X", b & 0xFF));
++            }
++        }
++        return out.toString();
++    }
++
++    private Object getJson(String target) throws Exception {
++        HttpRequest request = HttpRequest.newBuilder()
++                .uri(URI.create(baseUrl + target))
++                .header("Authorization", "Bearer " + bearerToken)
++                .header("Accept", "application/json")
++                .GET()
++                .build();
++        HttpResponse<String> response =
++                http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++        if (response.statusCode() != 200) {
++            throw new IllegalStateException(
++                    "GET " + target + " returned " + response.statusCode() + ": " + response.body());
++        }
++        return Json.parse(response.body());
++    }
++}

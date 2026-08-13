@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "id": "vcf90-0051",
+  "title": "Report a partially applied vCenter virtual-machine reconfiguration",
+  "program": "VMware Cloud Foundation 9.0",
+  "category": "project-integration",
+  "lang": "go",
+  "language": "go",
+  "training_tags": [
+    "vcf-9-0",
+    "vcenter-automation",
+    "go",
+    "rest-contract",
+    "spec-derived"
+  ],
+  "prompt": "The `vmreconfig` package in this Go module is a stub. Implement it, with tests.\n\nIt applies a reconfiguration change set to one virtual machine through the VMware Cloud Foundation 9.0 vSphere Automation API for vCenter. The steps are not independent: memory and CPU are only resizable while the machine is powered off, so the change set powers the machine down, resizes it, adds disks, and powers it back up. A step that fails stops the ones behind it - but the steps in front of it have already changed the machine, and the caller has to be told exactly what happened.\n\n`docs/contract.json` is the wire contract for this work, derived from the vSphere Automation API specification recorded in `docs/official_sources.json`. Read it - it is the authority on paths, the action query parameter, the session header, success status codes and the required versus optional property sets. `internal/vcmock` is a loopback stand-in for the appliance that builds its routing table from that same contract, serves only the six operations the contract names, and records every request it receives.\n\n## The flow\n\nThe specification's server URL is `https://{host}/api`, so every path below hangs off the `/api` base path.\n\n1. `Vcenter.Vm.Power_get` - `GET /vcenter/vm/{vm}/power`, 200, reads the power state before anything is changed.\n2. `Vcenter.Vm.Power_stop` - `POST /vcenter/vm/{vm}/power?action=stop`, 204.\n3. `Vcenter.Vm.Hardware.Memory_update` - `PATCH /vcenter/vm/{vm}/hardware/memory`, 204.\n4. `Vcenter.Vm.Hardware.Cpu_update` - `PATCH /vcenter/vm/{vm}/hardware/cpu`, 204.\n5. `Vcenter.Vm.Hardware.Disk_create` - `POST /vcenter/vm/{vm}/hardware/disk`, 201, once per requested disk, in order. The 201 body is a bare JSON string holding the identifier of the disk that was created, not an object.\n6. `Vcenter.Vm.Power_start` - `POST /vcenter/vm/{vm}/power?action=start`, 204.\n\nCall no other route. `Vcenter.Vm.Power_get`, `Vcenter.Vm.Power_stop` and `Vcenter.Vm.Power_start` share one path and are told apart only by the `action` query parameter, which the specification encodes in the path key.\n\n## The API to implement\n\n```go\ntype Config struct {\n    BaseURL    string       // appliance root, no path; /api is appended by this package\n    SessionID  string       // sent in the vmware-api-session-id header\n    HTTPClient *http.Client // optional\n}\n\ntype MemoryChange struct{ SizeMiB *int64; HotAddEnabled *bool }\ntype CPUChange struct{ Count, CoresPerSocket *int64; HotAddEnabled, HotRemoveEnabled *bool }\ntype SCSIAddress struct{ Bus int64; Unit *int64 }\ntype NewVMDK struct{ Name string; CapacityBytes *int64 }\ntype DiskChange struct{ Type string; SCSI *SCSIAddress; NewVMDK *NewVMDK }\n\ntype ChangeSet struct {\n    VM                string\n    Memory            *MemoryChange\n    CPU               *CPUChange\n    Disks             []DiskChange\n    RestorePowerState bool\n}\n\ntype StepStatus string\nconst (\n    StepApplied      StepStatus = \"APPLIED\"\n    StepSkipped      StepStatus = \"SKIPPED\"\n    StepFailed       StepStatus = \"FAILED\"\n    StepNotAttempted StepStatus = \"NOT_ATTEMPTED\"\n)\n\ntype StepReport struct {\n    Operation string     // the specification operationId for this step\n    Status    StepStatus\n    Detail    string     // never empty\n    Err       error      // non-nil only when Status is StepFailed\n}\n\ntype Report struct {\n    VM                string\n    InitialPowerState string\n    FinalPowerState   string\n    Steps             []StepReport\n    CreatedDiskIDs    []string\n}\n\nfunc (r Report) Applied() []string           // operationIds of the steps that landed, in order\nfunc (r Report) Failed() (StepReport, bool)  // the first failed step\n\ntype APIError struct {\n    Operation string // the operationId that failed\n    Status    int\n    ErrorType string // the vAPI error_type discriminator\n    Message   string // messages[0].default_message\n}\nfunc (e *APIError) Error() string\n\nvar ErrInvalidRequest, ErrAPI error // matchable with errors.Is\n\nfunc New(cfg Config) (*Client, error)\nfunc (c *Client) Apply(ctx context.Context, cs ChangeSet) (Report, error)\n```\n\n## Reporting a change set that stopped part way\n\n`Report.Steps` holds one entry per step of the plan, in execution order: the power stop, the memory update, the CPU update, one entry per element of `Disks`, then the power start. Its shape depends only on the change set, so every step that was considered appears, including the ones that turn out not to be needed.\n\n- `Apply` returns a fully populated `Report` alongside its error. A change set that fails part way through has still changed the machine; discarding the report loses the only record of that.\n- A step that ran and was accepted is `APPLIED`. A step that ran and was refused is `FAILED` and carries the appliance's error in `Err`.\n- A step that was genuinely unnecessary is `SKIPPED`: no memory change was requested, the machine was already powered off, the caller did not ask for the power state to be restored.\n- A step behind a failed step is `NOT_ATTEMPTED`, never `SKIPPED`. The difference matters to whoever has to clean up: skipped work is not outstanding, unattempted work is.\n- `CreatedDiskIDs` holds the identifiers of the disks that were actually created, in order.\n- `FinalPowerState` is read back from the appliance rather than assumed, on the failure path as well as the success path, so the report says where the machine was really left.\n\n## Behaviour\n\n- Power the machine down only when `Vcenter.Vm.Power_get` reported it was not already off.\n- The specification declares 400 on `Vcenter.Vm.Power_stop` as `Vapi.Std.Errors.AlreadyInDesiredState`. A machine that reached the desired state on its own leaves nothing outstanding, so that answer is a skip and the change set carries on. Any other refusal of the stop is a failure.\n- Power the machine back on only when the caller asked for it, the machine was powered on to begin with, and no step failed.\n- A non-2xx answer becomes an `*APIError` naming the operation that failed and carrying the appliance's `error_type` and `messages[0].default_message`. It wraps `ErrAPI` and is not retried.\n- Validate the change set before any request is made, returning `ErrInvalidRequest` having sent nothing: a missing virtual machine; a change set that requests no changes; a `MemoryChange` or `CPUChange` that sets no property; a non-positive size, count or capacity; a `Count` that is not a multiple of `CoresPerSocket`; a `Type` outside the specification's `IDE`, `SCSI`, `SATA` and `NVME` vocabulary; a disk with no `NewVMDK`; an SCSI address on a non-SCSI adapter; a `NewVMDK.Name` carrying the `.vmdk` extension.\n- `New` validates its config and performs no I/O; a bad config returns an error wrapping `ErrInvalidRequest`. A nil `HTTPClient` means `http.DefaultClient`. Reject an empty or non-HTTP(S) `BaseURL` and a blank or header-unsafe `SessionID`.\n- Abort on context cancellation rather than running the sequence to the end.\n\n## What the wire has to look like\n\n- **An optional property the caller did not set must be absent from the request, not present and empty.** A change that sets only a memory size must serialize to exactly one key, `size_mib`; no `\"hot_add_enabled\":null`, no zero-valued keys. This holds through nested objects too: a disk with no address must not send `\"scsi\":{}`, and a VMDK with no name must not send `\"name\":\"\"`.\n- **A property the caller did set must be sent even when its value is the zero value of its type.** An explicitly requested `HotAddEnabled` of false is a change, and is not the same thing as an unset flag. A `NewVMDK` that sets neither a name nor a capacity is still a request for a new backing with server-chosen values, so it is sent as an empty `new_vmdk` object rather than dropped - dropping it would ask for a disk with no backing at all.\n- `Vcenter.Vm.Hardware.ScsiAddressSpec` marks `bus` required, so an SCSI address always sends its bus, including bus 0.\n- `vmware-api-session-id` on every operation; this API does not use a Bearer scheme.\n- `Accept: application/json` on all six operations. `Content-Type: application/json` only on the requests that carry a body - the power operations carry none.\n- `Vcenter.Vm.Power_get` sends no body and no query string. A `BaseURL` with a trailing slash must not double the separator.\n\n## Tests\n\nAdd table-driven tests for the package in `vmreconfig`, driving the client against `internal/vcmock` and asserting against the recorded request log. Cover the required-only and fully-populated request shapes, the power sequencing, a change set whose later step fails, the already-in-desired-state skip, and local validation.\n\n`./verify.sh` must pass: `gofmt`, `go vet`, and `go test -race ./...`.\n\nDo not modify `docs/`, `internal/`, `verify/` or `verify.sh`.",
+  "verify_cmd": "./verify.sh",
+  "verify_timeout": 300,
+  "test_files": [
+    "docs/contract.json",
+    "docs/official_sources.json",
+    "internal/contract/contract.go",
+    "internal/vcmock/vcmock.go",
+    "internal/vcmock/vcmock_test.go",
+    "verify/wire_test.go",
+    "verify.sh",
+    "go.mod"
+  ],
+  "protected_paths": [
+    "docs/contract.json",
+    "docs/official_sources.json",
+    "internal/contract/contract.go",
+    "internal/vcmock/vcmock.go",
+    "internal/vcmock/vcmock_test.go",
+    "verify/wire_test.go",
+    "verify.sh",
+    "go.mod"
+  ],
+  "offline": true,
+  "prerequisites": {
+    "commands": [
+      "go",
+      "gofmt",
+      "bash"
+    ],
+    "go_version": "1.24",
+    "vendored": false,
+    "modules": []
+  },
+  "source_basis": {
+    "repository": "https://github.com/vmware/vcf-api-specs",
+    "repository_tag": "9.0.0.0",
+    "repository_commit_sha": "85151f6b1bb58f13b6ac0304bfec53904bea085f",
+    "spec_path": "specifications/vsphere/openapi/automation/vcenter.yaml",
+    "license": "Apache-2.0",
+    "operation_ids": [
+      "Vcenter.Vm.Power_get",
+      "Vcenter.Vm.Power_stop",
+      "Vcenter.Vm.Hardware.Memory_update",
+      "Vcenter.Vm.Hardware.Cpu_update",
+      "Vcenter.Vm.Hardware.Disk_create",
+      "Vcenter.Vm.Power_start"
+    ]
+  }
+}

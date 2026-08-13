@@ -1,0 +1,455 @@
+diff --git a/VcfFailureTriage/VcfFailureTriage.psm1 b/VcfFailureTriage/VcfFailureTriage.psm1
+new file mode 100644
+index 0000000..f5ca5cb
+--- /dev/null
++++ b/VcfFailureTriage/VcfFailureTriage.psm1
+@@ -0,0 +1,449 @@
++Set-StrictMode -Version Latest
++$ErrorActionPreference = 'Stop'
++
++Import-Module -Name 'VMware.Sdk.Vcf.SddcManager' `
++    -RequiredVersion '13.5.0.25380678' `
++    -ErrorAction Stop
++
++# Everything below follows docs/contract.json, the focused projection of
++# specifications/sddc-manager/sddc-manager-openapi.json at tag 9.0.0.0.
++$script:NonTerminalTaskStatuses = @('PENDING', 'IN_PROGRESS')
++$script:NonTerminalBundleStatuses = @('PENDING', 'IN_PROGRESS')
++$script:TerminalBundleStatuses = @('COMPLETED_WITH_SUCCESS',
++    'COMPLETED_WITH_FAILURE')
++$script:AlwaysCollectedLogMembers = @('sddcManagerLogs', 'apiLogs')
++$script:ResourceTypeLogMembers =
++    [Collections.Generic.Dictionary[string, string]]::new(
++        [StringComparer]::Ordinal)
++$script:ResourceTypeLogMembers.Add('ESXI', 'esxLogs')
++$script:ResourceTypeLogMembers.Add('VCENTER', 'vcLogs')
++$script:ResourceTypeLogMembers.Add('NSXT_MANAGER', 'nsxLogs')
++# The member order of the Logs schema in this API version.
++$script:LogMemberOrder = @(
++    'vcLogs', 'nsxLogs', 'esxLogs', 'wcpLogs', 'sddcManagerLogs', 'apiLogs',
++    'systemDebugLogs', 'vmScreenshots', 'vraLogs', 'vropsLogs', 'vrliLogs',
++    'vrslcmLogs', 'automationLogs', 'operationsLogs', 'operationsForLogs',
++    'lifecycleLogs'
++)
++# Contract member name -> generated binding parameter name.
++$script:LogMemberParameters = @{
++    'vcLogs'          = 'VcLogs'
++    'nsxLogs'         = 'NsxLogs'
++    'esxLogs'         = 'EsxLogs'
++    'sddcManagerLogs' = 'SddcManagerLogs'
++    'apiLogs'         = 'ApiLogs'
++}
++
++function Get-VcfTriageCommand {
++    <#
++        .SYNOPSIS
++        Resolves one contract operationId to the single generated binding
++        that implements it.
++    #>
++    param([Parameter(Mandatory)] [string] $OperationId)
++
++    $operations = @(Get-VcfSddcManagerOperation -Name $OperationId `
++            -ErrorAction Stop)
++    if ($operations.Count -ne 1) {
++        throw [InvalidOperationException]::new(
++            "Operation '$OperationId' resolved to $($operations.Count) generated commands.")
++    }
++    $command = $operations[0].CommandInfo
++    if ($null -eq $command) {
++        throw [InvalidOperationException]::new(
++            "Operation '$OperationId' has no generated command.")
++    }
++    return $command
++}
++
++function ConvertTo-VcfNormalizedStatus {
++    param([string] $Status)
++
++    if ([string]::IsNullOrWhiteSpace($Status)) { return '' }
++    return ($Status.Trim() -replace '\s+', '_').ToUpperInvariant()
++}
++
++function ConvertTo-VcfTimestamp {
++    param([string] $Value)
++
++    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
++    $parsed = [DateTimeOffset]::MinValue
++    $parsedOk = [DateTimeOffset]::TryParse(
++        $Value,
++        [Globalization.CultureInfo]::InvariantCulture,
++        [Globalization.DateTimeStyles]::RoundtripKind,
++        [ref] $parsed)
++    if ($parsedOk) { return $parsed }
++    return $null
++}
++
++function Get-VcfText {
++    param($Value)
++
++    if ($null -eq $Value) { return '' }
++    return [string] $Value
++}
++
++function Get-VcfList {
++    param($Value)
++
++    if ($null -eq $Value) { return @() }
++    return @($Value)
++}
++
++function Get-VcfFailedSubTask {
++    <#
++        .SYNOPSIS
++        Walks the sub-task tree depth first, in response order, and emits
++        every sub-task whose own status is FAILED.
++    #>
++    param($SubTasks)
++
++    foreach ($subTask in (Get-VcfList $SubTasks)) {
++        if ($null -eq $subTask) { continue }
++        if ((ConvertTo-VcfNormalizedStatus (Get-VcfText $subTask.Status)) -ceq 'FAILED') {
++            $subTask
++        }
++        Get-VcfFailedSubTask -SubTasks $subTask.SubTasks
++    }
++}
++
++function New-VcfTriageStep {
++    param(
++        [Parameter(Mandatory)] [string] $OperationId,
++        [Parameter(Mandatory)] [string] $Status,
++        [string] $Detail = ''
++    )
++
++    return [pscustomobject] [ordered] @{
++        operationId = $OperationId
++        status      = $Status
++        detail      = $Detail
++    }
++}
++
++function Invoke-VcfFailureTriage {
++    <#
++        .SYNOPSIS
++        Diagnoses a failed SDDC Manager task from the task itself, the
++        events that name the resources it failed on, and a support bundle
++        scoped to exactly those resources.
++
++        .DESCRIPTION
++        Four operations of the 9.0.0.0 SDDC Manager contract are used, in
++        this order: getTask, getNotifications, startSupportBundle and
++        getSupportBundleStatus.  Nothing about the failure is guessed: the
++        failing sub-tasks decide which logs are collected, and the events
++        that name their resources decide which domain and clusters the
++        collection is scoped to.
++    #>
++    [CmdletBinding()]
++    [OutputType([pscustomobject])]
++    param(
++        [Parameter(Mandatory)]
++        [ValidateNotNull()]
++        [VMware.Sdk.Vcf.SddcManager.Types.VcfSddcManagerServer] $Server,
++
++        [Parameter(Mandatory)]
++        [ValidateNotNullOrEmpty()]
++        [string] $TaskId,
++
++        [switch] $IncludeHealthCheck,
++
++        [switch] $ForceCollection,
++
++        [ValidateRange(0, 60)]
++        [int] $PollIntervalSeconds = 5,
++
++        [ValidateRange(1, 900)]
++        [int] $TimeoutSeconds = 300
++    )
++
++    if ($null -eq $Server) {
++        throw [ArgumentNullException]::new('Server')
++    }
++    if ([string]::IsNullOrWhiteSpace($TaskId)) {
++        throw [ArgumentException]::new('TaskId must be a non-blank task id.',
++            'TaskId')
++    }
++
++    # -- getTask ----------------------------------------------------------
++    $getTask = Get-VcfTriageCommand -OperationId 'getTask'
++    $task = & $getTask -Server $Server -Id $TaskId
++    if ($null -eq $task) {
++        throw [InvalidOperationException]::new(
++            "Task '$TaskId' returned no task document.")
++    }
++    $taskStatus = ConvertTo-VcfNormalizedStatus (Get-VcfText $task.Status)
++    if ($script:NonTerminalTaskStatuses -ccontains $taskStatus) {
++        throw [InvalidOperationException]::new(
++            "Task '$TaskId' is $taskStatus and has not ended; there is nothing to diagnose yet.")
++    }
++    if ($taskStatus -cne 'FAILED') {
++        throw [InvalidOperationException]::new(
++            "Task '$TaskId' ended $taskStatus; only a FAILED task is triaged.")
++    }
++
++    $windowStart = ConvertTo-VcfTimestamp (Get-VcfText $task.CreationTimestamp)
++    if ($null -eq $windowStart) {
++        throw [InvalidOperationException]::new(
++            "Task '$TaskId' carries no readable creation timestamp.")
++    }
++    $windowEnd = ConvertTo-VcfTimestamp (Get-VcfText $task.CompletionTimestamp)
++    if ($null -eq $windowEnd) {
++        throw [InvalidOperationException]::new(
++            "Task '$TaskId' carries no readable completion timestamp.")
++    }
++
++    $failedSubTasks = @(Get-VcfFailedSubTask -SubTasks $task.SubTasks)
++    if ($failedSubTasks.Count -eq 0) {
++        throw [InvalidOperationException]::new(
++            "Task '$TaskId' ended FAILED but names no failed sub-task.")
++    }
++    $failedSubTaskNames = [string[]] @(
++        $failedSubTasks | ForEach-Object { Get-VcfText $_.Name })
++
++    $affectedIds = [Collections.Generic.List[string]]::new()
++    $affectedTypes =
++        [Collections.Generic.Dictionary[string, string]]::new(
++            [StringComparer]::Ordinal)
++    foreach ($subTask in $failedSubTasks) {
++        foreach ($resource in (Get-VcfList $subTask.Resources)) {
++            if ($null -eq $resource) { continue }
++            $resourceId = Get-VcfText $resource.ResourceId
++            if ([string]::IsNullOrWhiteSpace($resourceId)) { continue }
++            if (-not $affectedIds.Contains($resourceId)) {
++                $affectedIds.Add($resourceId)
++                $affectedTypes[$resourceId] = Get-VcfText $resource.Type
++            }
++        }
++    }
++    if ($affectedIds.Count -eq 0) {
++        throw [InvalidOperationException]::new(
++            "Task '$TaskId' names no resource on any failed sub-task.")
++    }
++
++    $errorCode = ''
++    $errorMessage = ''
++    $referenceToken = ''
++    $taskErrors = @(Get-VcfList $task.Errors)
++    if ($taskErrors.Count -gt 0 -and $null -ne $taskErrors[0]) {
++        $errorCode = Get-VcfText $taskErrors[0].ErrorCode
++        $errorMessage = Get-VcfText $taskErrors[0].Message
++        $referenceToken = Get-VcfText $taskErrors[0].ReferenceToken
++    }
++    $steps = [Collections.Generic.List[object]]::new()
++    $steps.Add((New-VcfTriageStep -OperationId 'getTask' `
++                -Status 'SUCCEEDED' -Detail $taskStatus))
++
++    # -- getNotifications -------------------------------------------------
++    $getNotifications = Get-VcfTriageCommand -OperationId 'getNotifications'
++    $notifications = @(Get-VcfList (& $getNotifications -Server $Server))
++
++    $correlated = [Collections.Generic.List[object]]::new()
++    $namedByEvents = [Collections.Generic.HashSet[string]]::new(
++        [StringComparer]::Ordinal)
++    foreach ($notification in $notifications) {
++        if ($null -eq $notification) { continue }
++        $raised = ConvertTo-VcfTimestamp (Get-VcfText $notification.CreationTimestamp)
++        if ($null -eq $raised) { continue }
++        if ($raised -lt $windowStart -or $raised -gt $windowEnd) { continue }
++        $touches = $false
++        foreach ($resource in (Get-VcfList $notification.Resources)) {
++            if ($null -eq $resource) { continue }
++            if ($affectedIds.Contains((Get-VcfText $resource.Id))) {
++                $touches = $true
++                break
++            }
++        }
++        if (-not $touches) { continue }
++        $correlated.Add($notification)
++        foreach ($resource in (Get-VcfList $notification.Resources)) {
++            if ($null -eq $resource) { continue }
++            $null = $namedByEvents.Add((Get-VcfText $resource.Id))
++        }
++    }
++    if ($correlated.Count -eq 0) {
++        throw [InvalidOperationException]::new(
++            "No event names a resource of the failed sub-tasks of task '$TaskId' while it ran; the collection cannot be scoped.")
++    }
++
++    $domainId = ''
++    $domainName = ''
++    foreach ($notification in $correlated) {
++        $domain = $notification.Domain
++        if ($null -eq $domain) { continue }
++        $candidateId = Get-VcfText $domain.Id
++        if ([string]::IsNullOrWhiteSpace($candidateId)) { continue }
++        if ($domainId -eq '') {
++            $domainId = $candidateId
++            $domainName = Get-VcfText $domain.Name
++        } elseif ($domainId -cne $candidateId) {
++            throw [InvalidOperationException]::new(
++                "The events of task '$TaskId' name more than one domain; the collection cannot be scoped.")
++        }
++    }
++    if ([string]::IsNullOrWhiteSpace($domainName)) {
++        throw [InvalidOperationException]::new(
++            "The events of task '$TaskId' name no domain; the collection cannot be scoped.")
++    }
++
++    $clusterNames = [Collections.Generic.List[string]]::new()
++    $seenClusters = [Collections.Generic.HashSet[string]]::new(
++        [StringComparer]::Ordinal)
++    $eventMessageIds = [Collections.Generic.List[string]]::new()
++    foreach ($notification in $correlated) {
++        foreach ($resource in (Get-VcfList $notification.Resources)) {
++            if ($null -eq $resource) { continue }
++            if ((Get-VcfText $resource.Type) -cne 'CLUSTER') { continue }
++            $clusterName = Get-VcfText $resource.Name
++            if ([string]::IsNullOrWhiteSpace($clusterName)) { continue }
++            if ($seenClusters.Add($clusterName)) {
++                $clusterNames.Add($clusterName)
++            }
++        }
++        $messageId = ''
++        if ($null -ne $notification.Message) {
++            $messageId = Get-VcfText $notification.Message.Id
++        }
++        $eventMessageIds.Add($messageId)
++    }
++    $steps.Add((New-VcfTriageStep -OperationId 'getNotifications' `
++                -Status 'SUCCEEDED' `
++                -Detail $correlated.Count.ToString(
++                    [Globalization.CultureInfo]::InvariantCulture)))
++
++    # -- startSupportBundle -----------------------------------------------
++    $wanted = [Collections.Generic.HashSet[string]]::new(
++        [StringComparer]::Ordinal)
++    foreach ($member in $script:AlwaysCollectedLogMembers) {
++        $null = $wanted.Add($member)
++    }
++    $includeFreeHosts = $false
++    foreach ($resourceId in $affectedIds) {
++        $type = $affectedTypes[$resourceId]
++        if ($script:ResourceTypeLogMembers.ContainsKey($type)) {
++            $null = $wanted.Add($script:ResourceTypeLogMembers[$type])
++        }
++        if ($type -ceq 'ESXI' -and -not $namedByEvents.Contains($resourceId)) {
++            $includeFreeHosts = $true
++        }
++    }
++    $requestedLogs = [string[]] @(
++        $script:LogMemberOrder | Where-Object { $wanted.Contains($_) })
++
++    $logParameters = @{}
++    foreach ($member in $requestedLogs) {
++        $logParameters[$script:LogMemberParameters[$member]] = $true
++    }
++    $logs = Initialize-VcfLogs @logParameters
++
++    $domainParameters = @{ DomainName = $domainName }
++    if ($clusterNames.Count -gt 0) {
++        $domainParameters['ClusterNames'] = [string[]] $clusterNames
++    }
++    $domainEntry = Initialize-VcfDomains @domainParameters
++
++    $scopeParameters = @{ Domains = @($domainEntry) }
++    if ($includeFreeHosts) { $scopeParameters['IncludeFreeHosts'] = $true }
++    $scope = Initialize-VcfSupportBundleScope @scopeParameters
++
++    $specParameters = @{ Scope = $scope; Logs = $logs }
++    $optionParameters = @{}
++    if ($ForceCollection.IsPresent) {
++        $optionParameters['Config'] = Initialize-VcfSupportBundleConfig `
++            -Force $true
++    }
++    if ($IncludeHealthCheck.IsPresent) {
++        $optionParameters['Include'] = `
++            Initialize-VcfSupportBundleIncludeItems -HealthCheck $true
++    }
++    if ($optionParameters.Count -gt 0) {
++        $specParameters['Options'] = `
++            Initialize-VcfSupportBundleOption @optionParameters
++    }
++    $spec = Initialize-VcfSupportBundleSpec @specParameters
++
++    $startSupportBundle = Get-VcfTriageCommand -OperationId 'startSupportBundle'
++    $started = & $startSupportBundle -Server $Server -SupportBundleSpec $spec
++    $bundleId = ''
++    if ($null -ne $started) { $bundleId = Get-VcfText $started.Id }
++    if ([string]::IsNullOrWhiteSpace($bundleId)) {
++        throw [InvalidOperationException]::new(
++            'The accepted support bundle collection carries no identifier.')
++    }
++    $steps.Add((New-VcfTriageStep -OperationId 'startSupportBundle' `
++                -Status 'SUCCEEDED' -Detail $bundleId))
++
++    # -- getSupportBundleStatus -------------------------------------------
++    $getStatus = Get-VcfTriageCommand -OperationId 'getSupportBundleStatus'
++    # The timeout starts with the first poll, and each wait is capped at the
++    # remaining time so a long poll interval cannot overrun the deadline.
++    $pollTimer = [Diagnostics.Stopwatch]::StartNew()
++    $firstPoll = $true
++    $bundleStatus = ''
++    $bundleName = ''
++    while ($true) {
++        if (-not $firstPoll -and
++            $pollTimer.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
++            throw [TimeoutException]::new(
++                "Support bundle '$bundleId' did not finish within $TimeoutSeconds seconds.")
++        }
++        $firstPoll = $false
++        $bundle = & $getStatus -Server $Server -Id $bundleId
++        if ($null -eq $bundle) {
++            throw [InvalidOperationException]::new(
++                "Support bundle '$bundleId' returned no status document.")
++        }
++        $bundleStatus = ConvertTo-VcfNormalizedStatus (Get-VcfText $bundle.Status)
++        if ($script:TerminalBundleStatuses -ccontains $bundleStatus) {
++            $bundleName = Get-VcfText $bundle.BundleName
++            break
++        }
++        if ($script:NonTerminalBundleStatuses -cnotcontains $bundleStatus) {
++            throw [InvalidOperationException]::new(
++                "Support bundle '$bundleId' reported the unexpected status '$bundleStatus'.")
++        }
++        if ($pollTimer.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
++            throw [TimeoutException]::new(
++                "Support bundle '$bundleId' was still $bundleStatus after $TimeoutSeconds seconds.")
++        }
++        if ($PollIntervalSeconds -gt 0) {
++            $remainingMilliseconds =
++                ($TimeoutSeconds * 1000.0) - $pollTimer.Elapsed.TotalMilliseconds
++            $waitMilliseconds = [Math]::Min(
++                $PollIntervalSeconds * 1000.0,
++                [Math]::Max(0.0, $remainingMilliseconds))
++            if ($waitMilliseconds -gt 0) {
++                Start-Sleep -Milliseconds ([Math]::Ceiling($waitMilliseconds))
++            }
++        }
++    }
++    $bundleSucceeded = $bundleStatus -ceq 'COMPLETED_WITH_SUCCESS'
++    $steps.Add((New-VcfTriageStep -OperationId 'getSupportBundleStatus' `
++                -Status $(if ($bundleSucceeded) { 'SUCCEEDED' } else { 'FAILED' }) `
++                -Detail $bundleStatus))
++
++    return [pscustomobject] [ordered] @{
++        status                    = $(if ($bundleSucceeded) { 'SUCCEEDED' } else { 'FAILED' })
++        taskId                    = Get-VcfText $task.Id
++        taskStatus                = $taskStatus
++        failedSubTaskNames        = $failedSubTaskNames
++        affectedResourceIds       = [string[]] $affectedIds
++        domainName                = $domainName
++        clusterNames              = [string[]] $clusterNames
++        includeFreeHosts          = $includeFreeHosts
++        correlatedEventCount      = $correlated.Count
++        correlatedEventMessageIds = [string[]] $eventMessageIds
++        requestedLogs             = $requestedLogs
++        supportBundleId           = $bundleId
++        supportBundleStatus       = $bundleStatus
++        bundleName                = $bundleName
++        errorCode                 = $errorCode
++        errorMessage              = $errorMessage
++        referenceToken            = $referenceToken
++        steps                     = $steps.ToArray()
++    }
++}
++
++Export-ModuleMember -Function 'Invoke-VcfFailureTriage'

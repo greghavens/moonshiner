@@ -1,0 +1,557 @@
+diff --git a/SddcLcmClient.java b/SddcLcmClient.java
+index 12f87ac..012cf10 100644
+--- a/SddcLcmClient.java
++++ b/SddcLcmClient.java
+@@ -1,35 +1,65 @@
++import java.io.IOException;
++import java.net.URI;
++import java.net.URLEncoder;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.time.Duration;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
+ /**
+- * Client for the VMware Cloud Foundation 9.1 SDDC LCM Service.
++ * Single-file client for the VMware Cloud Foundation 9.1 SDDC LCM Service.
+  *
+- * Requests a support bundle for a FLEET-scoped component in a way that is safe to
+- * re-run: resubmitting with the same correlation key must adopt the task already in
+- * flight instead of starting a second bundle generation.
++ * Submits a support-bundle generation for a FLEET-scoped component in a way that is
++ * safe to re-run: the caller's correlation key is carried outbound on X-Correlation-Id
++ * and read back from TaskSummary.correlationId, so a resubmission after a timeout or a
++ * pipeline restart adopts the task that is already in flight instead of starting a
++ * second bundle.
+  *
+- * The wire contract is docs/contract.json; its provenance is docs/official_sources.json.
+- * The whole client belongs in this one compilation unit.
++ * Wire contract: docs/contract.json, derived from specifications/sddc-lcm/sddc-lcm-openapi.yaml
++ * at vmware/vcf-api-specs commit 3949fc33339fc5ea1b77eadb258f1cf49aa88e26 (Apache-2.0).
++ * Operations used: getComponents, getTasks, generateComponentSupportBundle.
+  */
+ public final class SddcLcmClient {
+ 
++    /** SDDC LCM 9.1 TaskStatus values whose effect stands, so resubmitting would duplicate. */
++    private static final Set<String> ADOPTABLE =
++            Set.of("PENDING", "SCHEDULED", "RUNNING", "SUCCEEDED");
++
++    /** SDDC LCM 9.1 TaskStatus values that leave nothing standing, so resubmitting is a retry. */
++    private static final Set<String> TERMINAL_UNSUCCESSFUL = Set.of("FAILED", "CANCELED");
++
++    private final String baseUrl;
++    private final String bearerToken;
++    private final HttpClient http;
++
+     public SddcLcmClient(String baseUrl, String bearerToken) {
+-        throw new UnsupportedOperationException(
+-                "Implement the contract-pinned SDDC LCM support-bundle client.");
++        if (baseUrl == null || baseUrl.isBlank()) {
++            throw new IllegalArgumentException("baseUrl is required");
++        }
++        if (bearerToken == null || bearerToken.isBlank()) {
++            throw new IllegalArgumentException("bearerToken is required");
++        }
++        // The operation paths already start with '/', so a trailing slash on the base
++        // would produce an empty path segment.
++        String trimmed = baseUrl;
++        while (trimmed.endsWith("/")) {
++            trimmed = trimmed.substring(0, trimmed.length() - 1);
++        }
++        this.baseUrl = trimmed;
++        this.bearerToken = bearerToken;
++        this.http = HttpClient.newBuilder()
++                .connectTimeout(Duration.ofSeconds(10))
++                .followRedirects(HttpClient.Redirect.NEVER)
++                .build();
+     }
+ 
+-    /**
+-     * Requests a support bundle for the fleet component with the given FQDN, exactly
+-     * once per correlation key.
+-     *
+-     * @param componentFqdn  FQDN of a FLEET-scoped component
+-     * @param correlationId  the caller's idempotency key
+-     * @param lookBackWindow optional look-back window; null leaves it off the wire
+-     */
+-    public SupportBundleRequestResult requestSupportBundle(String componentFqdn,
+-                                                           String correlationId,
+-                                                           Integer lookBackWindow)
+-            throws SddcLcmException {
+-        throw new UnsupportedOperationException(
+-                "Implement the contract-pinned SDDC LCM support-bundle client.");
+-    }
++    // ------------------------------------------------------------------- results
+ 
+     /** Outcome of a support-bundle request: either a fresh submission or an adopted task. */
+     public static final class SupportBundleRequestResult {
+@@ -46,6 +76,12 @@ public final class SddcLcmClient {
+             this.taskStatus = taskStatus;
+             this.adopted = adopted;
+         }
++
++        @Override
++        public String toString() {
++            return (adopted ? "adopted " : "submitted ") + taskId + " (" + taskStatus + ")"
++                    + " for component " + componentId;
++        }
+     }
+ 
+     /** Any failure talking to SDDC LCM. httpStatus is 0 for purely client-side failures. */
+@@ -62,5 +98,450 @@ public final class SddcLcmClient {
+             this.errorCode = errorCode;
+             this.referenceId = referenceId;
+         }
++
++        SddcLcmException(String message) {
++            this(0, null, null, message);
++        }
++    }
++
++    // ---------------------------------------------------------------- public API
++
++    /**
++     * Requests a support bundle for the fleet component with the given FQDN, exactly once
++     * per correlation key.
++     *
++     * @param componentFqdn  FQDN of a FLEET-scoped component, matched exactly
++     * @param correlationId  the caller's idempotency key
++     * @param lookBackWindow optional look-back window; null leaves the property off the wire
++     */
++    public SupportBundleRequestResult requestSupportBundle(String componentFqdn,
++                                                           String correlationId,
++                                                           Integer lookBackWindow)
++            throws SddcLcmException {
++        if (componentFqdn == null || componentFqdn.isBlank()) {
++            throw new SddcLcmException("componentFqdn is required");
++        }
++        if (correlationId == null || correlationId.isBlank()) {
++            throw new SddcLcmException("correlationId is required: it is the only handle "
++                    + "SDDC LCM gives us for de-duplicating a resubmitted support-bundle request");
++        }
++
++        String componentId = resolveFleetComponentId(componentFqdn);
++
++        // Pre-flight. If this fails we stop: submitting after a failed duplicate check is
++        // exactly the duplication this method exists to prevent.
++        TaskRef existing = findAdoptableTask(componentId, correlationId);
++        if (existing != null) {
++            return new SupportBundleRequestResult(componentId, existing.id, existing.status, true);
++        }
++
++        TaskRef created = submitSupportBundle(componentId, correlationId, lookBackWindow);
++        return new SupportBundleRequestResult(componentId, created.id, created.status, false);
++    }
++
++    // ------------------------------------------------------------ getComponents
++
++    private String resolveFleetComponentId(String componentFqdn) throws SddcLcmException {
++        HttpRequest request = get("/v1/components?scope=FLEET");
++        HttpResponse<String> response = send(request);
++        if (response.statusCode() != 200) {
++            throw error(response, "getComponents");
++        }
++        Object parsed = decode(response.body(), "getComponents");
++        Object components = asMap(parsed, "getComponents").get("components");
++        if (!(components instanceof List<?> list)) {
++            throw new SddcLcmException("getComponents returned no components array");
++        }
++        for (Object element : list) {
++            if (element instanceof Map<?, ?> component
++                    && componentFqdn.equals(component.get("fqdn"))) {
++                Object id = component.get("id");
++                if (!(id instanceof String s) || s.isBlank()) {
++                    throw new SddcLcmException(
++                            "component " + componentFqdn + " has no id in the inventory response");
++                }
++                return s;
++            }
++        }
++        throw new SddcLcmException("no FLEET-scoped component with fqdn " + componentFqdn
++                + " is registered with SDDC LCM");
++    }
++
++    // ----------------------------------------------------------------- getTasks
++
++    private record TaskRef(String id, String status) { }
++
++    /**
++     * Pages through the tasks recorded against this component and returns the first task
++     * whose correlationId equals the key and whose status still stands. Paging stops as
++     * soon as such a task is found.
++     */
++    private TaskRef findAdoptableTask(String componentId, String correlationId)
++            throws SddcLcmException {
++        String filters = "resourceId=" + enc(componentId) + "&resourceType=COMPONENT";
++        Integer requestedPage = null;
++        while (true) {
++            String query = requestedPage == null
++                    ? filters
++                    : filters + "&pageNumber=" + requestedPage;
++            HttpResponse<String> response = send(get("/v1/tasks?" + query));
++            if (response.statusCode() != 200) {
++                throw error(response, "getTasks");
++            }
++            Map<String, Object> body = asMap(decode(response.body(), "getTasks"), "getTasks");
++
++            Object elements = body.get("elements");
++            if (elements instanceof List<?> list) {
++                for (Object element : list) {
++                    if (!(element instanceof Map<?, ?> task)) {
++                        continue;
++                    }
++                    // Exact field equality. Task descriptions quote correlation ids in prose,
++                    // so anything looser than this matches the wrong task.
++                    if (!correlationId.equals(task.get("correlationId"))) {
++                        continue;
++                    }
++                    String status = task.get("status") instanceof String s ? s : null;
++                    if (status == null) {
++                        throw new SddcLcmException("task " + task.get("id")
++                                + " carries correlation id " + correlationId + " but no status");
++                    }
++                    if (ADOPTABLE.contains(status)) {
++                        Object id = task.get("id");
++                        if (!(id instanceof String taskId) || taskId.isBlank()) {
++                            throw new SddcLcmException(
++                                    "task with correlation id " + correlationId + " has no id");
++                        }
++                        return new TaskRef(taskId, status);
++                    }
++                    if (!TERMINAL_UNSUCCESSFUL.contains(status)) {
++                        throw new SddcLcmException("task " + task.get("id") + " reports status "
++                                + status + ", which is not an SDDC LCM 9.1 TaskStatus ("
++                                + "PENDING, SCHEDULED, RUNNING, SUCCEEDED, FAILED, CANCELED); "
++                                + "refusing to guess whether its effect stands");
++                    }
++                    // FAILED or CANCELED: nothing stands, keep looking for a live attempt.
++                }
++            }
++
++            Map<String, Object> metadata = asMap(body.get("pageMetadata"),
++                    "getTasks pageMetadata");
++            int returnedPage = pageInteger(metadata.get("pageNumber"),
++                    "pageMetadata.pageNumber");
++            int totalPages = pageInteger(metadata.get("totalPages"),
++                    "pageMetadata.totalPages");
++            if (requestedPage == null ? returnedPage != 0 : returnedPage != requestedPage) {
++                throw new SddcLcmException("getTasks returned pageMetadata.pageNumber "
++                        + returnedPage + " for "
++                        + (requestedPage == null ? "the initial zero-based page"
++                                : "requested page " + requestedPage));
++            }
++            long next = (long) returnedPage + 1;
++            if (next >= totalPages) {
++                return null;
++            }
++            requestedPage = (int) next;
++        }
++    }
++
++    // ------------------------------------------ generateComponentSupportBundle
++
++    private TaskRef submitSupportBundle(String componentId, String correlationId,
++                                        Integer lookBackWindow) throws SddcLcmException {
++        // ComponentSupportBundleSpec: lookBackWindow is optional with no default, so an
++        // unset window is an absent property -- not null and not zero.
++        String payload = lookBackWindow == null
++                ? "{}"
++                : "{\"lookBackWindow\":" + lookBackWindow + "}";
++
++        HttpRequest request = HttpRequest.newBuilder()
++                .uri(URI.create(baseUrl + "/v1/components/" + enc(componentId)
++                        + "/support-bundles"))
++                .header("Authorization", "Bearer " + bearerToken)
++                .header("Accept", "application/json")
++                .header("Content-Type", "application/json")
++                .header("X-Correlation-Id", correlationId)
++                .timeout(Duration.ofSeconds(30))
++                .POST(HttpRequest.BodyPublishers.ofString(payload, StandardCharsets.UTF_8))
++                .build();
++
++        HttpResponse<String> response = send(request);
++        if (response.statusCode() != 202) {
++            if (response.statusCode() / 100 == 2) {
++                throw new SddcLcmException(response.statusCode(), null, null,
++                        "generateComponentSupportBundle answered " + response.statusCode()
++                                + "; 202 Accepted is its only documented success response, so the "
++                                + "body cannot be trusted to describe a started task");
++            }
++            throw error(response, "generateComponentSupportBundle");
++        }
++
++        Map<String, Object> task = asMap(decode(response.body(), "generateComponentSupportBundle"),
++                "generateComponentSupportBundle");
++        Object id = task.get("id");
++        if (!(id instanceof String taskId) || taskId.isBlank()) {
++            throw new SddcLcmException("the 202 Task from generateComponentSupportBundle has no id");
++        }
++        String status = task.get("status") instanceof String s ? s : null;
++        return new TaskRef(taskId, status);
++    }
++
++    // ---------------------------------------------------------------- transport
++
++    private HttpRequest get(String pathAndQuery) {
++        return HttpRequest.newBuilder()
++                .uri(URI.create(baseUrl + pathAndQuery))
++                .header("Authorization", "Bearer " + bearerToken)
++                .header("Accept", "application/json")
++                .timeout(Duration.ofSeconds(30))
++                .GET()
++                .build();
++    }
++
++    private HttpResponse<String> send(HttpRequest request) throws SddcLcmException {
++        try {
++            return http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++        } catch (IOException e) {
++            throw new SddcLcmException("transport failure calling " + request.uri() + ": "
++                    + e.getMessage());
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++            throw new SddcLcmException("interrupted calling " + request.uri());
++        }
++    }
++
++    /** Turns a non-success response into an exception, decoding the ErrorResponse envelope. */
++    private SddcLcmException error(HttpResponse<String> response, String operation) {
++        int status = response.statusCode();
++        String code = null;
++        String referenceId = null;
++        String message = null;
++        try {
++            Map<String, Object> body = asMap(Json.parse(response.body()), operation);
++            if (body.get("code") instanceof String s) {
++                code = s;
++            }
++            if (body.get("referenceId") instanceof String s) {
++                referenceId = s;
++            }
++            Object msg = body.get("message");
++            if (msg instanceof Map<?, ?> localizable
++                    && localizable.get("defaultMessage") instanceof String s) {
++                message = s;
++            }
++        } catch (RuntimeException | SddcLcmException ignored) {
++            // Not an ErrorResponse envelope; fall back to the raw status below.
++        }
++        if (message == null) {
++            message = operation + " failed with HTTP " + status;
++        }
++        return new SddcLcmException(status, code, referenceId, message);
++    }
++
++    private Object decode(String body, String operation) throws SddcLcmException {
++        try {
++            return Json.parse(body);
++        } catch (RuntimeException e) {
++            throw new SddcLcmException(operation + " returned a body that is not JSON: "
++                    + e.getMessage());
++        }
++    }
++
++    @SuppressWarnings("unchecked")
++    private static Map<String, Object> asMap(Object value, String operation)
++            throws SddcLcmException {
++        if (!(value instanceof Map)) {
++            throw new SddcLcmException(operation + " returned " + describe(value)
++                    + " where a JSON object was expected");
++        }
++        return (Map<String, Object>) value;
++    }
++
++    private static int pageInteger(Object value, String field) throws SddcLcmException {
++        if (!(value instanceof Number number)) {
++            throw new SddcLcmException(field + " is missing or is not an integer");
++        }
++        double d = number.doubleValue();
++        if (!Double.isFinite(d) || d != Math.rint(d) || d < 0 || d > Integer.MAX_VALUE) {
++            throw new SddcLcmException(field + " is not a usable non-negative integer: " + value);
++        }
++        return (int) d;
++    }
++
++    private static String describe(Object value) {
++        return value == null ? "null" : value.getClass().getSimpleName();
++    }
++
++    private static String enc(String segment) {
++        return URLEncoder.encode(segment, StandardCharsets.UTF_8).replace("+", "%20");
++    }
++
++    // -------------------------------------------------------------- JSON reader
++
++    /** Minimal JSON reader: Map, List, String, Double, Boolean, null. */
++    private static final class Json {
++        private final String s;
++        private int i;
++
++        private Json(String s) {
++            this.s = s;
++        }
++
++        static Object parse(String text) {
++            if (text == null) {
++                throw new IllegalArgumentException("empty body");
++            }
++            Json p = new Json(text);
++            p.ws();
++            Object v = p.value();
++            p.ws();
++            if (p.i != text.length()) {
++                throw new IllegalArgumentException("trailing content at offset " + p.i);
++            }
++            return v;
++        }
++
++        private void ws() {
++            while (i < s.length() && Character.isWhitespace(s.charAt(i))) {
++                i++;
++            }
++        }
++
++        private Object value() {
++            if (i >= s.length()) {
++                throw new IllegalArgumentException("unexpected end of input");
++            }
++            switch (s.charAt(i)) {
++                case '{':
++                    return obj();
++                case '[':
++                    return arr();
++                case '"':
++                    return string();
++                case 't':
++                    expect("true");
++                    return Boolean.TRUE;
++                case 'f':
++                    expect("false");
++                    return Boolean.FALSE;
++                case 'n':
++                    expect("null");
++                    return null;
++                default:
++                    return number();
++            }
++        }
++
++        private void expect(String lit) {
++            if (!s.startsWith(lit, i)) {
++                throw new IllegalArgumentException("expected " + lit + " at offset " + i);
++            }
++            i += lit.length();
++        }
++
++        private Map<String, Object> obj() {
++            Map<String, Object> m = new LinkedHashMap<>();
++            i++;
++            ws();
++            if (i < s.length() && s.charAt(i) == '}') {
++                i++;
++                return m;
++            }
++            while (true) {
++                ws();
++                String k = string();
++                ws();
++                if (i >= s.length() || s.charAt(i) != ':') {
++                    throw new IllegalArgumentException("expected ':' at offset " + i);
++                }
++                i++;
++                ws();
++                m.put(k, value());
++                ws();
++                if (i >= s.length()) {
++                    throw new IllegalArgumentException("unterminated object");
++                }
++                char c = s.charAt(i++);
++                if (c == '}') {
++                    return m;
++                }
++                if (c != ',') {
++                    throw new IllegalArgumentException("expected ',' or '}' at offset " + (i - 1));
++                }
++            }
++        }
++
++        private List<Object> arr() {
++            List<Object> l = new ArrayList<>();
++            i++;
++            ws();
++            if (i < s.length() && s.charAt(i) == ']') {
++                i++;
++                return l;
++            }
++            while (true) {
++                ws();
++                l.add(value());
++                ws();
++                if (i >= s.length()) {
++                    throw new IllegalArgumentException("unterminated array");
++                }
++                char c = s.charAt(i++);
++                if (c == ']') {
++                    return l;
++                }
++                if (c != ',') {
++                    throw new IllegalArgumentException("expected ',' or ']' at offset " + (i - 1));
++                }
++            }
++        }
++
++        private String string() {
++            if (i >= s.length() || s.charAt(i) != '"') {
++                throw new IllegalArgumentException("expected a string at offset " + i);
++            }
++            i++;
++            StringBuilder sb = new StringBuilder();
++            while (true) {
++                if (i >= s.length()) {
++                    throw new IllegalArgumentException("unterminated string");
++                }
++                char c = s.charAt(i++);
++                if (c == '"') {
++                    return sb.toString();
++                }
++                if (c != '\\') {
++                    sb.append(c);
++                    continue;
++                }
++                char e = s.charAt(i++);
++                switch (e) {
++                    case '"' -> sb.append('"');
++                    case '\\' -> sb.append('\\');
++                    case '/' -> sb.append('/');
++                    case 'b' -> sb.append('\b');
++                    case 'f' -> sb.append('\f');
++                    case 'n' -> sb.append('\n');
++                    case 'r' -> sb.append('\r');
++                    case 't' -> sb.append('\t');
++                    case 'u' -> {
++                        sb.append((char) Integer.parseInt(s.substring(i, i + 4), 16));
++                        i += 4;
++                    }
++                    default -> throw new IllegalArgumentException("bad escape \\" + e);
++                }
++            }
++        }
++
++        private Double number() {
++            int start = i;
++            while (i < s.length() && "+-.eE0123456789".indexOf(s.charAt(i)) >= 0) {
++                i++;
++            }
++            if (start == i) {
++                throw new IllegalArgumentException("expected a value at offset " + i);
++            }
++            return Double.valueOf(s.substring(start, i));
++        }
+     }
+ }

@@ -1,0 +1,744 @@
+diff --git a/onboarding/onboarding.go b/onboarding/onboarding.go
+index c315c96..7704e65 100644
+--- a/onboarding/onboarding.go
++++ b/onboarding/onboarding.go
+@@ -1,9 +1,28 @@
+ // Package onboarding registers a vCenter as a data source in VCF Operations
+ // for Networks (VCF 9.1).
+ //
+-// Status: first draft. This was written against a rendered API reference page
+-// rather than against the OpenAPI document, and it does not yet match
+-// docs/contract.json.
++// Onboarding is two calls, in order:
++//
++//	validateVCenter       POST /api/ni/data-sources/vcenters/validate
++//	addVcenterDatasource  POST /api/ni/data-sources/vcenters
++//
++// The first is a precheck and the second is the mutating call. The precheck
++// gates the mutation: if validation does not come back with a 200 verdict, the
++// data source is never created and OnboardVCenter returns a *PrecheckError.
++//
++// The two operations do not share a request schema, so they do not share a wire
++// struct here either. VCenterDataSourceValidationRequest has no nickname, notes
++// or enabled member; VCenterDataSourceRequest has no ipfix_enabled member.
++// Sending a member the operation's schema does not declare is a contract
++// violation even when the server tolerates it.
++//
++// Optional members are omitted when the caller did not set them, never sent as
++// an empty string or a false. That matters for enabled in particular, whose
++// spec default is true: serializing an unset Enabled as "enabled": false would
++// quietly disable data collection.
++//
++// See docs/contract.json for the operations, schemas and wire rules, and
++// docs/official_sources.json for the specification they were derived from.
+ package onboarding
+ 
+ import (
+@@ -17,9 +36,27 @@ import (
+ 	"strings"
+ )
+ 
++// API base path from the spec's `servers` entry, and the two operation paths.
++const (
++	apiBasePath = "/api/ni"
++
++	pathValidateVCenter      = apiBasePath + "/data-sources/vcenters/validate"
++	pathAddVcenterDatasource = apiBasePath + "/data-sources/vcenters"
++)
++
++// authPrefix is the ApiKeyAuth value format from the spec: "NetworkInsight
++// {token}". It is deliberately not "Bearer "; that prefix belongs to the
++// separate OpsTokenAuth scheme this client does not use.
++const authPrefix = "NetworkInsight "
++
++// validationSuccessCode is the body-level verdict that means the precheck
++// passed. The precheck reports its verdict in the body, so an HTTP 200 alone
++// does not mean the vCenter is acceptable.
++const validationSuccessCode = 200
++
+ // ErrInvalidRequest is returned when a VCenterOnboardRequest cannot be turned
+ // into a legal request body. Errors of this kind are raised before any HTTP
+-// call is made.
++// call is made, so a rejected request never touches the appliance.
+ var ErrInvalidRequest = errors.New("onboarding: invalid request")
+ 
+ // Credentials are the vCenter credentials Operations for Networks will use to
+@@ -45,16 +82,37 @@ type VCenterOnboardRequest struct {
+ 	Notes string
+ 
+ 	// Enabled is a tri-state. nil means "say nothing and let the server apply
+-	// its own default".
++	// its own default", which for this schema is true.
+ 	Enabled *bool
+ 
+ 	// IPFIXEnabled asks the precheck to also verify IPFIX configuration. It is
+-	// a precheck-side concern only.
++	// a precheck-side concern only and is not part of the create schema.
+ 	IPFIXEnabled bool
+ 
+ 	Credentials Credentials
+ }
+ 
++// validate enforces the parts of the schema that can be checked locally: the
++// required members, and the mutual exclusion of ip and fqdn.
++func (r VCenterOnboardRequest) validate() error {
++	switch {
++	case r.IP != "" && r.FQDN != "":
++		return fmt.Errorf("%w: set either IP or FQDN, not both", ErrInvalidRequest)
++	case r.IP == "" && r.FQDN == "":
++		return fmt.Errorf("%w: one of IP or FQDN is required", ErrInvalidRequest)
++	}
++	if r.ProxyID == "" {
++		return fmt.Errorf("%w: ProxyID is required", ErrInvalidRequest)
++	}
++	if r.Nickname == "" {
++		return fmt.Errorf("%w: Nickname is required", ErrInvalidRequest)
++	}
++	if r.Credentials.Username == "" && r.Credentials.Password != "" {
++		return fmt.Errorf("%w: Credentials.Username is required", ErrInvalidRequest)
++	}
++	return nil
++}
++
+ // ValidationOutcome is the verdict the precheck returned.
+ type ValidationOutcome struct {
+ 	Code    int
+@@ -103,64 +161,130 @@ func New(baseURL, token string, hc *http.Client) (*Client, error) {
+ 	}, nil
+ }
+ 
+-// dataSourceBody is the JSON body sent to the API.
+-//
+-// TODO: the two operations do not actually share a request schema. Sharing one
+-// struct is what makes this draft send nickname/notes/enabled to the precheck
+-// and drop ipfix_enabled entirely.
+-type dataSourceBody struct {
+-	IP          string          `json:"ip"`
+-	FQDN        string          `json:"fqdn"`
++// credentialsBody is PasswordCredentials. username is required; password is
++// not, so an unset password is omitted.
++type credentialsBody struct {
++	Username string `json:"username"`
++	Password string `json:"password,omitempty"`
++}
++
++// validateBody is VCenterDataSourceValidationRequest. It carries no nickname,
++// notes or enabled member, because the schema does not declare them.
++type validateBody struct {
++	IP           string           `json:"ip,omitempty"`
++	FQDN         string           `json:"fqdn,omitempty"`
++	ProxyID      string           `json:"proxy_id"`
++	Credentials  *credentialsBody `json:"credentials,omitempty"`
++	IPFIXEnabled bool             `json:"ipfix_enabled,omitempty"`
++}
++
++// addBody is VCenterDataSourceRequest. It carries no ipfix_enabled member,
++// because the schema does not declare one. Enabled is a *bool so that an unset
++// value is omitted and the server's default of true applies.
++type addBody struct {
++	IP          string           `json:"ip,omitempty"`
++	FQDN        string           `json:"fqdn,omitempty"`
+-	ProxyID     string          `json:"proxy_id"`
++	ProxyID     string           `json:"proxy_id"`
+-	Nickname    string          `json:"nickname"`
++	Nickname    string           `json:"nickname"`
+-	Notes       string          `json:"notes"`
+-	Enabled     bool            `json:"enabled"`
++	Enabled     *bool            `json:"enabled,omitempty"`
++	Notes       string           `json:"notes,omitempty"`
+-	Credentials credentialsBody `json:"credentials"`
++	Credentials *credentialsBody `json:"credentials,omitempty"`
+ }
+ 
+-type credentialsBody struct {
+-	Username string `json:"username"`
+-	Password string `json:"password"`
++func (r VCenterOnboardRequest) credentials() *credentialsBody {
++	if r.Credentials.Username == "" && r.Credentials.Password == "" {
++		return nil
++	}
++	return &credentialsBody{
++		Username: r.Credentials.Username,
++		Password: r.Credentials.Password,
++	}
+ }
+ 
+-func (r VCenterOnboardRequest) body() dataSourceBody {
+-	b := dataSourceBody{
+-		IP:       r.IP,
+-		FQDN:     r.FQDN,
+-		ProxyID:  r.ProxyID,
+-		Nickname: r.Nickname,
+-		Notes:    r.Notes,
+-		Credentials: credentialsBody{
+-			Username: r.Credentials.Username,
+-			Password: r.Credentials.Password,
+-		},
++func (r VCenterOnboardRequest) validateBody() validateBody {
++	return validateBody{
++		IP:           r.IP,
++		FQDN:         r.FQDN,
++		ProxyID:      r.ProxyID,
++		Credentials:  r.credentials(),
++		IPFIXEnabled: r.IPFIXEnabled,
+ 	}
+-	if r.Enabled != nil {
+-		b.Enabled = *r.Enabled
++}
++
++func (r VCenterOnboardRequest) addBody() addBody {
++	return addBody{
++		IP:          r.IP,
++		FQDN:        r.FQDN,
++		ProxyID:     r.ProxyID,
++		Nickname:    r.Nickname,
++		Enabled:     r.Enabled,
++		Notes:       r.Notes,
++		Credentials: r.credentials(),
+ 	}
+-	return b
+ }
+ 
+-// OnboardVCenter registers the vCenter as a data source.
++// OnboardVCenter prechecks the vCenter and, only if the precheck passes,
++// creates the data source.
+ //
+-// TODO: the precheck result is fetched but not acted on, so a vCenter that
+-// fails validation is still created.
++// It returns a *PrecheckError when the precheck refuses the vCenter. In that
++// case the mutating call is not made and the appliance is left unchanged.
+ func (c *Client) OnboardVCenter(ctx context.Context, req VCenterOnboardRequest) (*OnboardResult, error) {
+-	body := req.body()
++	if err := req.validate(); err != nil {
++		return nil, err
++	}
++
++	outcome, err := c.precheck(ctx, req)
++	if err != nil {
++		return nil, err
++	}
+ 
+-	status, raw, err := c.post(ctx, "/api/ni/data-sources/vcenters/validate", body)
++	created, err := c.create(ctx, req)
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	created.Validation = outcome
++	return created, nil
++}
+ 
+-	var outcome ValidationOutcome
+-	if status == http.StatusOK {
+-		if err := json.Unmarshal(raw, &outcome); err != nil {
+-			return nil, fmt.Errorf("onboarding: decode precheck response: %w", err)
++// precheck runs validateVCenter. It returns a *PrecheckError for any verdict
++// other than a 200 body code on an HTTP 200 response.
++func (c *Client) precheck(ctx context.Context, req VCenterOnboardRequest) (ValidationOutcome, error) {
++	status, raw, err := c.post(ctx, pathValidateVCenter, req.validateBody())
++	if err != nil {
++		return ValidationOutcome{}, err
++	}
++
++	// Both BaseDataSourceValidationResponse and ApiError carry code and
++	// message, so one shape decodes either reply.
++	var verdict struct {
++		Code    int    `json:"code"`
++		Message string `json:"message"`
++	}
++	if err := json.Unmarshal(raw, &verdict); err != nil {
++		return ValidationOutcome{}, fmt.Errorf(
++			"onboarding: decode precheck response (HTTP %d): %w", status, err)
++	}
++
++	if status != http.StatusOK {
++		code := verdict.Code
++		if code == 0 {
++			code = status
+ 		}
++		return ValidationOutcome{}, &PrecheckError{Code: code, Message: verdict.Message}
+ 	}
+ 
+-	status, raw, err = c.post(ctx, "/api/ni/data-sources/vcenters", body)
++	// HTTP 200 is not the verdict. The body-level code is.
++	if verdict.Code != validationSuccessCode {
++		return ValidationOutcome{}, &PrecheckError{Code: verdict.Code, Message: verdict.Message}
++	}
++
++	return ValidationOutcome{Code: verdict.Code, Message: verdict.Message}, nil
++}
++
++// create runs addVcenterDatasource. It is only reached once the precheck has
++// passed.
++func (c *Client) create(ctx context.Context, req VCenterOnboardRequest) (*OnboardResult, error) {
++	status, raw, err := c.post(ctx, pathAddVcenterDatasource, req.addBody())
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -176,11 +300,7 @@ func (c *Client) OnboardVCenter(ctx context.Context, req VCenterOnboardRequest)
+ 		return nil, fmt.Errorf("onboarding: decode create response: %w", err)
+ 	}
+ 
+-	return &OnboardResult{
+-		EntityID:   created.EntityID,
+-		EntityType: created.EntityType,
+-		Validation: outcome,
+-	}, nil
++	return &OnboardResult{EntityID: created.EntityID, EntityType: created.EntityType}, nil
+ }
+ 
+ func (c *Client) post(ctx context.Context, path string, body any) (int, []byte, error) {
+@@ -195,7 +315,7 @@ func (c *Client) post(ctx context.Context, path string, body any) (int, []byte,
+ 	}
+ 	httpReq.Header.Set("Content-Type", "application/json")
+ 	httpReq.Header.Set("Accept", "application/json")
+-	httpReq.Header.Set("Authorization", "Bearer "+c.token)
++	httpReq.Header.Set("Authorization", authPrefix+c.token)
+ 
+ 	resp, err := c.http.Do(httpReq)
+ 	if err != nil {
+diff --git a/onboarding/onboarding_test.go b/onboarding/onboarding_test.go
+new file mode 100644
+index 0000000..4df973d
+--- /dev/null
++++ b/onboarding/onboarding_test.go
+@@ -0,0 +1,440 @@
++package onboarding_test
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"net/http"
++	"strings"
++	"testing"
++
++	"vcf9.local/opsnet/internal/mockni"
++	"vcf9.local/opsnet/onboarding"
++)
++
++const token = "test-token"
++
++func ptr(b bool) *bool { return &b }
++
++func goodRequest() onboarding.VCenterOnboardRequest {
++	return onboarding.VCenterOnboardRequest{
++		IP:          "10.197.17.68",
++		ProxyID:     "18230:901:1585583463",
++		Nickname:    "vc1",
++		Credentials: onboarding.Credentials{Username: "readonly", Password: "VMware1!"},
++	}
++}
++
++func client(t *testing.T, srv *mockni.Server) *onboarding.Client {
++	t.Helper()
++	c, err := onboarding.New(srv.URL(), token, nil)
++	if err != nil {
++		t.Fatalf("New: %v", err)
++	}
++	return c
++}
++
++func members(t *testing.T, r mockni.LoggedRequest) map[string]json.RawMessage {
++	t.Helper()
++	obj, err := r.JSONBody()
++	if err != nil {
++		t.Fatalf("decode body: %v", err)
++	}
++	return obj
++}
++
++func TestNew(t *testing.T) {
++	t.Parallel()
++
++	tests := []struct {
++		name    string
++		baseURL string
++		wantErr error
++	}{
++		{name: "plain URL", baseURL: "https://opsnet.example.com"},
++		{name: "trailing slash is trimmed", baseURL: "https://opsnet.example.com/"},
++		{name: "empty URL is rejected", baseURL: "", wantErr: onboarding.ErrInvalidRequest},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			c, err := onboarding.New(tc.baseURL, token, nil)
++			if tc.wantErr != nil {
++				if !errors.Is(err, tc.wantErr) {
++					t.Fatalf("err = %v, want %v", err, tc.wantErr)
++				}
++				return
++			}
++			if err != nil {
++				t.Fatalf("unexpected error: %v", err)
++			}
++			if c == nil {
++				t.Fatal("New returned a nil client and a nil error")
++			}
++		})
++	}
++}
++
++// TestLocalValidation covers the checks that happen before any HTTP call.
++func TestLocalValidation(t *testing.T) {
++	t.Parallel()
++
++	tests := []struct {
++		name   string
++		mutate func(*onboarding.VCenterOnboardRequest)
++		wantOK bool
++	}{
++		{name: "IP target", mutate: func(*onboarding.VCenterOnboardRequest) {}, wantOK: true},
++		{name: "FQDN target", mutate: func(r *onboarding.VCenterOnboardRequest) {
++			r.IP, r.FQDN = "", "vc01.corp.example.com"
++		}, wantOK: true},
++		{name: "both IP and FQDN", mutate: func(r *onboarding.VCenterOnboardRequest) {
++			r.FQDN = "vc01.corp.example.com"
++		}},
++		{name: "neither IP nor FQDN", mutate: func(r *onboarding.VCenterOnboardRequest) { r.IP = "" }},
++		{name: "no ProxyID", mutate: func(r *onboarding.VCenterOnboardRequest) { r.ProxyID = "" }},
++		{name: "no Nickname", mutate: func(r *onboarding.VCenterOnboardRequest) { r.Nickname = "" }},
++		{name: "no username", mutate: func(r *onboarding.VCenterOnboardRequest) {
++			r.Credentials.Username = ""
++		}},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			srv := mockni.Start(t, mockni.Options{Token: token})
++			req := goodRequest()
++			tc.mutate(&req)
++
++			_, err := client(t, srv).OnboardVCenter(context.Background(), req)
++			if tc.wantOK {
++				if err != nil {
++					t.Fatalf("unexpected error: %v", err)
++				}
++				return
++			}
++			if !errors.Is(err, onboarding.ErrInvalidRequest) {
++				t.Fatalf("err = %v, want ErrInvalidRequest", err)
++			}
++			if n := len(srv.Requests()); n != 0 {
++				t.Errorf("%d request(s) were sent, want 0", n)
++			}
++		})
++	}
++}
++
++// TestPrecheckGate is the behaviour that gives the precheck its point.
++func TestPrecheckGate(t *testing.T) {
++	t.Parallel()
++
++	tests := []struct {
++		name        string
++		outcome     mockni.ValidateOutcome
++		wantCreated int
++		wantCode    int
++	}{
++		{name: "pass", outcome: mockni.ValidationSucceeds(), wantCreated: 1},
++		{name: "body verdict 500", outcome: mockni.ValidationFailsInBody(500, "unreachable"), wantCode: 500},
++		{name: "body verdict 400", outcome: mockni.ValidationFailsInBody(400, "bad credentials"), wantCode: 400},
++		{name: "HTTP 400", outcome: mockni.ValidationFailsWithStatus(400, "bad request"), wantCode: 400},
++		{name: "HTTP 403", outcome: mockni.ValidationFailsWithStatus(403, "forbidden"), wantCode: 403},
++		{name: "HTTP 500", outcome: mockni.ValidationFailsWithStatus(500, "internal"), wantCode: 500},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			srv := mockni.Start(t, mockni.Options{Token: token, Validate: tc.outcome})
++			res, err := client(t, srv).OnboardVCenter(context.Background(), goodRequest())
++
++			if tc.wantCreated > 0 {
++				if err != nil {
++					t.Fatalf("unexpected error: %v", err)
++				}
++				if res.EntityID == "" {
++					t.Error("EntityID is empty")
++				}
++				if res.Validation.Code != 200 {
++					t.Errorf("Validation.Code = %d, want 200", res.Validation.Code)
++				}
++			} else {
++				var pe *onboarding.PrecheckError
++				if !errors.As(err, &pe) {
++					t.Fatalf("err = %v (%T), want *PrecheckError", err, err)
++				}
++				if pe.Code != tc.wantCode {
++					t.Errorf("PrecheckError.Code = %d, want %d", pe.Code, tc.wantCode)
++				}
++				if !strings.Contains(pe.Error(), "precheck failed") {
++					t.Errorf("Error() = %q, want it to mention the precheck", pe.Error())
++				}
++				if res != nil {
++					t.Errorf("result = %+v, want nil", res)
++				}
++			}
++
++			if got := len(srv.Created()); got != tc.wantCreated {
++				t.Errorf("created = %d, want %d", got, tc.wantCreated)
++			}
++			if got := len(srv.RequestsFor(mockni.OpValidateVCenter)); got != 1 {
++				t.Errorf("validateVCenter calls = %d, want 1", got)
++			}
++			if got := len(srv.RequestsFor(mockni.OpAddVcenterDatasource)); got != tc.wantCreated {
++				t.Errorf("addVcenterDatasource calls = %d, want %d", got, tc.wantCreated)
++			}
++		})
++	}
++}
++
++// TestRequestBodies checks that each operation serializes only the members its
++// own schema declares, and omits the optional ones the caller left unset.
++func TestRequestBodies(t *testing.T) {
++	t.Parallel()
++
++	tests := []struct {
++		name             string
++		mutate           func(*onboarding.VCenterOnboardRequest)
++		wantValidateKeys []string
++		wantAddKeys      []string
++	}{
++		{
++			name:             "minimal",
++			mutate:           func(*onboarding.VCenterOnboardRequest) {},
++			wantValidateKeys: []string{"credentials", "ip", "proxy_id"},
++			wantAddKeys:      []string{"credentials", "ip", "nickname", "proxy_id"},
++		},
++		{
++			name: "credentials omitted when unset",
++			mutate: func(r *onboarding.VCenterOnboardRequest) {
++				r.Credentials = onboarding.Credentials{}
++			},
++			wantValidateKeys: []string{"ip", "proxy_id"},
++			wantAddKeys:      []string{"ip", "nickname", "proxy_id"},
++		},
++		{
++			name: "fqdn instead of ip",
++			mutate: func(r *onboarding.VCenterOnboardRequest) {
++				r.IP, r.FQDN = "", "vc01.corp.example.com"
++			},
++			wantValidateKeys: []string{"credentials", "fqdn", "proxy_id"},
++			wantAddKeys:      []string{"credentials", "fqdn", "nickname", "proxy_id"},
++		},
++		{
++			name:             "ipfix is precheck-only",
++			mutate:           func(r *onboarding.VCenterOnboardRequest) { r.IPFIXEnabled = true },
++			wantValidateKeys: []string{"credentials", "ip", "ipfix_enabled", "proxy_id"},
++			wantAddKeys:      []string{"credentials", "ip", "nickname", "proxy_id"},
++		},
++		{
++			name:             "notes and enabled are add-only",
++			mutate:           func(r *onboarding.VCenterOnboardRequest) { r.Notes, r.Enabled = "DC1", ptr(false) },
++			wantValidateKeys: []string{"credentials", "ip", "proxy_id"},
++			wantAddKeys:      []string{"credentials", "enabled", "ip", "nickname", "notes", "proxy_id"},
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			srv := mockni.Start(t, mockni.Options{Token: token})
++			req := goodRequest()
++			tc.mutate(&req)
++
++			if _, err := client(t, srv).OnboardVCenter(context.Background(), req); err != nil {
++				t.Fatalf("OnboardVCenter: %v", err)
++			}
++
++			for _, c := range []struct {
++				op   string
++				want []string
++			}{
++				{mockni.OpValidateVCenter, tc.wantValidateKeys},
++				{mockni.OpAddVcenterDatasource, tc.wantAddKeys},
++			} {
++				reqs := srv.RequestsFor(c.op)
++				if len(reqs) != 1 {
++					t.Fatalf("%s: %d requests, want 1", c.op, len(reqs))
++				}
++				obj := members(t, reqs[0])
++				if len(obj) != len(c.want) {
++					t.Errorf("%s: members = %v, want %v", c.op, keys(obj), c.want)
++					continue
++				}
++				for _, k := range c.want {
++					if _, ok := obj[k]; !ok {
++						t.Errorf("%s: member %q is missing (have %v)", c.op, k, keys(obj))
++					}
++				}
++			}
++		})
++	}
++}
++
++func keys(obj map[string]json.RawMessage) []string {
++	out := make([]string, 0, len(obj))
++	for k := range obj {
++		out = append(out, k)
++	}
++	return out
++}
++
++// TestEnabledTriState pins the reason Enabled is a pointer.
++func TestEnabledTriState(t *testing.T) {
++	t.Parallel()
++
++	tests := []struct {
++		name    string
++		enabled *bool
++		wantRaw string // "" means the member must be absent
++	}{
++		{name: "unset is omitted so the server default of true applies", enabled: nil},
++		{name: "explicit false is sent", enabled: ptr(false), wantRaw: "false"},
++		{name: "explicit true is sent", enabled: ptr(true), wantRaw: "true"},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			srv := mockni.Start(t, mockni.Options{Token: token})
++			req := goodRequest()
++			req.Enabled = tc.enabled
++
++			if _, err := client(t, srv).OnboardVCenter(context.Background(), req); err != nil {
++				t.Fatalf("OnboardVCenter: %v", err)
++			}
++
++			obj := members(t, srv.RequestsFor(mockni.OpAddVcenterDatasource)[0])
++			raw, present := obj["enabled"]
++			if tc.wantRaw == "" {
++				if present {
++					t.Errorf("enabled = %s, want the member to be absent", raw)
++				}
++				return
++			}
++			if !present {
++				t.Fatalf("enabled is absent, want %s", tc.wantRaw)
++			}
++			if string(raw) != tc.wantRaw {
++				t.Errorf("enabled = %s, want %s", raw, tc.wantRaw)
++			}
++		})
++	}
++}
++
++func TestPasswordOmittedWhenUnset(t *testing.T) {
++	t.Parallel()
++
++	tests := []struct {
++		name        string
++		password    string
++		wantPresent bool
++	}{
++		{name: "set", password: "VMware1!", wantPresent: true},
++		{name: "unset", password: ""},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			srv := mockni.Start(t, mockni.Options{Token: token})
++			req := goodRequest()
++			req.Credentials.Password = tc.password
++
++			if _, err := client(t, srv).OnboardVCenter(context.Background(), req); err != nil {
++				t.Fatalf("OnboardVCenter: %v", err)
++			}
++
++			for _, op := range []string{mockni.OpValidateVCenter, mockni.OpAddVcenterDatasource} {
++				obj := members(t, srv.RequestsFor(op)[0])
++				var nested map[string]json.RawMessage
++				if err := json.Unmarshal(obj["credentials"], &nested); err != nil {
++					t.Fatalf("%s: credentials: %v", op, err)
++				}
++				if _, ok := nested["password"]; ok != tc.wantPresent {
++					t.Errorf("%s: password present = %v, want %v", op, ok, tc.wantPresent)
++				}
++				if _, ok := nested["username"]; !ok {
++					t.Errorf("%s: username is missing", op)
++				}
++			}
++		})
++	}
++}
++
++func TestAuthorizationHeaderAndPaths(t *testing.T) {
++	t.Parallel()
++
++	srv := mockni.Start(t, mockni.Options{Token: token})
++	if _, err := client(t, srv).OnboardVCenter(context.Background(), goodRequest()); err != nil {
++		t.Fatalf("OnboardVCenter: %v", err)
++	}
++
++	reqs := srv.Requests()
++	if len(reqs) != 2 {
++		t.Fatalf("%d requests, want 2", len(reqs))
++	}
++	wantPaths := []string{mockni.PathValidateVCenter, mockni.PathAddVcenterDatasource}
++	for i, r := range reqs {
++		if r.Method != http.MethodPost {
++			t.Errorf("request %d: method = %s, want POST", i, r.Method)
++		}
++		if r.Path != wantPaths[i] {
++			t.Errorf("request %d: path = %s, want %s", i, r.Path, wantPaths[i])
++		}
++		if got, want := r.Header.Get("Authorization"), mockni.AuthPrefix+token; got != want {
++			t.Errorf("request %d: Authorization = %q, want %q", i, got, want)
++		}
++	}
++}
++
++// TestTransportErrorsSurface checks unreachable and cancelled requests, plus
++// an authorization failure returned as a precheck error.
++func TestTransportErrorsSurface(t *testing.T) {
++	t.Parallel()
++
++	t.Run("unreachable appliance", func(t *testing.T) {
++		t.Parallel()
++		// Port 0 on loopback never accepts a connection.
++		c, err := onboarding.New("http://127.0.0.1:0", token, nil)
++		if err != nil {
++			t.Fatalf("New: %v", err)
++		}
++		if _, err := c.OnboardVCenter(context.Background(), goodRequest()); err == nil {
++			t.Fatal("want an error when the appliance is unreachable")
++		}
++	})
++
++	t.Run("cancelled context", func(t *testing.T) {
++		t.Parallel()
++		srv := mockni.Start(t, mockni.Options{Token: token})
++		ctx, cancel := context.WithCancel(context.Background())
++		cancel()
++		if _, err := client(t, srv).OnboardVCenter(ctx, goodRequest()); err == nil {
++			t.Fatal("want an error when the context is already cancelled")
++		}
++		if n := len(srv.Created()); n != 0 {
++			t.Errorf("created = %d, want 0", n)
++		}
++	})
++
++	t.Run("wrong token is rejected by the appliance", func(t *testing.T) {
++		t.Parallel()
++		srv := mockni.Start(t, mockni.Options{Token: "the-real-token"})
++		c, err := onboarding.New(srv.URL(), "a-stale-token", nil)
++		if err != nil {
++			t.Fatalf("New: %v", err)
++		}
++		_, err = c.OnboardVCenter(context.Background(), goodRequest())
++		var pe *onboarding.PrecheckError
++		if !errors.As(err, &pe) {
++			t.Fatalf("err = %v (%T), want *PrecheckError", err, err)
++		}
++		if pe.Code != http.StatusUnauthorized {
++			t.Errorf("PrecheckError.Code = %d, want 401", pe.Code)
++		}
++		if n := len(srv.Created()); n != 0 {
++			t.Errorf("created = %d, want 0: an unauthorized precheck must still gate the mutation", n)
++		}
++	})
++}

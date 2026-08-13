@@ -1,0 +1,311 @@
+diff --git a/snapservice/client.go b/snapservice/client.go
+index c9f283c..985a21e 100644
+--- a/snapservice/client.go
++++ b/snapservice/client.go
+@@ -1,10 +1,43 @@
+ package snapservice
+ 
+ import (
++	"bytes"
+ 	"context"
+-	"errors"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
++	"time"
+ )
+ 
++// Operation identifiers taken from docs/contract.json.
++const (
++	createSnapshotOp = "Snapservice.Clusters.ProtectionGroups.Snapshots_create$Task"
++	getTaskOp        = "Snapservice.Tasks_get"
++)
++
++// Wire details taken from docs/contract.json.
++const (
++	basePath          = "/api"
++	sessionHeader     = "vmware-api-session-id"
++	createPath        = "/snapservice/clusters/%s/protection-groups/%s/snapshots"
++	createQueryField  = "vmw-task"
++	createQueryValue  = "true"
++	createSuccess     = http.StatusAccepted
++	getTaskPath       = "/snapservice/tasks/%s"
++	getTaskSuccess    = http.StatusOK
++	statusSucceeded   = "SUCCEEDED"
++	statusFailed      = "FAILED"
++	maxErrorBodyBytes = 1 << 20
++)
++
++// retentionUnits is the Snapservice.TimeUnit enumeration.
++var retentionUnits = map[TimeUnit]bool{
++	Minute: true, Hour: true, Day: true, Week: true, Month: true, Year: true,
++}
++
+ // NewClient builds a Client for one Snapshot Appliance service root and session
+ // token, applying DefaultPollInterval, DefaultMaxPolls and an HTTP client whose
+ // timeout is DefaultTimeout.
+@@ -12,12 +45,259 @@ import (
+ // A service root that is not a usable HTTP(S) origin, or an empty session
+ // token, is reported as an error wrapping ErrInvalidRequest.
+ func NewClient(serviceRoot, sessionID string) (*Client, error) {
+-	return nil, errors.New("snapservice: NewClient is not implemented")
++	root := strings.TrimSpace(serviceRoot)
++	if root == "" {
++		return nil, fmt.Errorf("%w: service root is empty", ErrInvalidRequest)
++	}
++	u, err := url.Parse(root)
++	if err != nil {
++		return nil, fmt.Errorf("%w: service root is not a URL", ErrInvalidRequest)
++	}
++	switch u.Scheme {
++	case "http", "https":
++	default:
++		return nil, fmt.Errorf("%w: service root scheme %q is not http or https", ErrInvalidRequest, u.Scheme)
++	}
++	if u.Host == "" {
++		return nil, fmt.Errorf("%w: service root has no host", ErrInvalidRequest)
++	}
++	if u.User != nil {
++		return nil, fmt.Errorf("%w: service root must not embed credentials", ErrInvalidRequest)
++	}
++	if u.RawQuery != "" || u.ForceQuery {
++		return nil, fmt.Errorf("%w: service root must not carry a query", ErrInvalidRequest)
++	}
++	if u.Fragment != "" || strings.Contains(root, "#") {
++		return nil, fmt.Errorf("%w: service root must not carry a fragment", ErrInvalidRequest)
++	}
++	if u.Path != "" && u.Path != "/" {
++		return nil, fmt.Errorf("%w: service root must be an origin, not the path %q", ErrInvalidRequest, u.Path)
++	}
++	if strings.TrimSpace(sessionID) == "" {
++		return nil, fmt.Errorf("%w: session token is empty", ErrInvalidRequest)
++	}
++
++	return &Client{
++		ServiceRoot:  u.Scheme + "://" + u.Host,
++		SessionID:    sessionID,
++		HTTPClient:   &http.Client{Timeout: DefaultTimeout},
++		PollInterval: DefaultPollInterval,
++		MaxPolls:     DefaultMaxPolls,
++	}, nil
+ }
+ 
+ // CreateProtectionGroupSnapshot starts a protection group snapshot with
+ // Snapservice.Clusters.ProtectionGroups.Snapshots_create$Task and then polls
+ // Snapservice.Tasks_get until the task reaches a terminal status.
+ func (c *Client) CreateProtectionGroupSnapshot(ctx context.Context, req SnapshotRequest) (*TaskResult, error) {
+-	return nil, errors.New("snapservice: CreateProtectionGroupSnapshot is not implemented")
++	if err := validate(req); err != nil {
++		return nil, err
++	}
++	if ctx == nil {
++		ctx = context.Background()
++	}
++
++	taskID, err := c.startSnapshot(ctx, req)
++	if err != nil {
++		return nil, err
++	}
++	return c.pollTask(ctx, taskID)
++}
++
++func validate(req SnapshotRequest) error {
++	if strings.TrimSpace(req.Cluster) == "" {
++		return fmt.Errorf("%w: cluster identifier is empty", ErrInvalidRequest)
++	}
++	if strings.TrimSpace(req.ProtectionGroup) == "" {
++		return fmt.Errorf("%w: protection group identifier is empty", ErrInvalidRequest)
++	}
++	if strings.TrimSpace(req.Name) == "" {
++		return fmt.Errorf("%w: snapshot name is empty", ErrInvalidRequest)
++	}
++	if req.Retention != nil {
++		if !retentionUnits[req.Retention.Unit] {
++			return fmt.Errorf("%w: retention unit %q is not a Snapservice.TimeUnit value", ErrInvalidRequest, req.Retention.Unit)
++		}
++		if req.Retention.Duration <= 0 {
++			return fmt.Errorf("%w: retention duration must be positive", ErrInvalidRequest)
++		}
++	}
++	return nil
++}
++
++// startSnapshot performs the asynchronous create and returns the task
++// identifier the appliance answers with.
++func (c *Client) startSnapshot(ctx context.Context, req SnapshotRequest) (string, error) {
++	// Only the properties the caller actually set travel on the wire: an unset
++	// optional property is omitted, never sent as null or as an empty object.
++	spec := map[string]any{"name": req.Name}
++	if req.Retention != nil {
++		spec["retention"] = map[string]any{
++			"unit":     string(req.Retention.Unit),
++			"duration": req.Retention.Duration,
++		}
++	}
++	body, err := json.Marshal(spec)
++	if err != nil {
++		return "", &Error{Op: createSnapshotOp, Msg: "could not encode the snapshot specification"}
++	}
++
++	target := c.ServiceRoot + basePath + fmt.Sprintf(createPath,
++		url.PathEscape(req.Cluster), url.PathEscape(req.ProtectionGroup))
++	target += "?" + url.Values{createQueryField: []string{createQueryValue}}.Encode()
++
++	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
++	if err != nil {
++		return "", ctxOr(ctx, err, &Error{Op: createSnapshotOp, Msg: "could not build the create request"})
++	}
++	httpReq.Header.Set(sessionHeader, c.SessionID)
++	httpReq.Header.Set("Content-Type", "application/json")
++	httpReq.Header.Set("Accept", "application/json")
++
++	raw, err := c.do(ctx, httpReq, createSnapshotOp, createSuccess)
++	if err != nil {
++		return "", err
++	}
++
++	// The 202 body is a JSON string, so it has to be decoded before the
++	// identifier can be used as a path segment.
++	var taskID string
++	if err := json.Unmarshal(raw, &taskID); err != nil {
++		return "", &Error{Op: createSnapshotOp, Status: createSuccess, Msg: "the response body is not a JSON task identifier"}
++	}
++	if strings.TrimSpace(taskID) == "" {
++		return "", &Error{Op: createSnapshotOp, Status: createSuccess, Msg: "the response carried an empty task identifier"}
++	}
++	return taskID, nil
++}
++
++// taskInfo is the subset of Snapservice.Tasks.Info this client reads.
++type taskInfo struct {
++	Status    string `json:"status"`
++	Result    any    `json:"result"`
++	StartTime string `json:"start_time"`
++	EndTime   string `json:"end_time"`
++}
++
++// pollTask polls Snapservice.Tasks_get until the task reaches a terminal
++// status. A 202 means the appliance accepted the work, not that the snapshot
++// exists, so the terminal status is the only completion signal.
++func (c *Client) pollTask(ctx context.Context, taskID string) (*TaskResult, error) {
++	maxPolls := c.MaxPolls
++	if maxPolls <= 0 {
++		maxPolls = DefaultMaxPolls
++	}
++	target := c.ServiceRoot + basePath + fmt.Sprintf(getTaskPath, url.PathEscape(taskID))
++
++	for poll := 1; poll <= maxPolls; poll++ {
++		if poll > 1 {
++			if err := wait(ctx, c.PollInterval); err != nil {
++				return nil, err
++			}
++		}
++
++		httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
++		if err != nil {
++			return nil, ctxOr(ctx, err, &Error{Op: getTaskOp, Msg: "could not build the task request"})
++		}
++		httpReq.Header.Set(sessionHeader, c.SessionID)
++		httpReq.Header.Set("Accept", "application/json")
++
++		raw, err := c.do(ctx, httpReq, getTaskOp, getTaskSuccess)
++		if err != nil {
++			return nil, err
++		}
++		var info taskInfo
++		if err := json.Unmarshal(raw, &info); err != nil {
++			return nil, &Error{Op: getTaskOp, Status: getTaskSuccess, Msg: "the response body is not a task info object"}
++		}
++		if info.Status == "" {
++			return nil, &Error{Op: getTaskOp, Status: getTaskSuccess, Msg: "the task info carried no status"}
++		}
++		switch info.Status {
++		case "PENDING", "RUNNING", "BLOCKED":
++			continue
++		case statusSucceeded, statusFailed:
++		default:
++			return nil, &Error{Op: getTaskOp, Status: getTaskSuccess, Msg: "the task info carried an unrecognized status"}
++		}
++
++		if info.Status == statusFailed {
++			return nil, &Error{
++				Op:  getTaskOp,
++				Msg: fmt.Sprintf("task %s reached terminal status FAILED", taskID),
++			}
++		}
++		return &TaskResult{
++			TaskID:    taskID,
++			Status:    info.Status,
++			Polls:     poll,
++			Result:    info.Result,
++			StartTime: info.StartTime,
++			EndTime:   info.EndTime,
++		}, nil
++	}
++
++	return nil, &Error{
++		Op:  getTaskOp,
++		Msg: fmt.Sprintf("task %s did not reach a terminal status within %d polls", taskID, maxPolls),
++	}
++}
++
++// do sends one request and returns the body of a successful response. Response
++// bodies are never carried into an error message.
++func (c *Client) do(ctx context.Context, req *http.Request, op string, wantStatus int) ([]byte, error) {
++	httpClient := c.HTTPClient
++	if httpClient == nil {
++		httpClient = &http.Client{Timeout: DefaultTimeout}
++	}
++	resp, err := httpClient.Do(req)
++	if err != nil {
++		return nil, ctxOr(ctx, err, &Error{Op: op, Msg: "the appliance could not be reached"})
++	}
++	defer func() {
++		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorBodyBytes))
++		_ = resp.Body.Close()
++	}()
++
++	body, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
++	if err != nil {
++		return nil, ctxOr(ctx, err, &Error{Op: op, Status: resp.StatusCode, Msg: "the response body could not be read"})
++	}
++	if resp.StatusCode != wantStatus {
++		return nil, &Error{
++			Op:     op,
++			Status: resp.StatusCode,
++			Msg:    fmt.Sprintf("the appliance did not answer %d", wantStatus),
++		}
++	}
++	return body, nil
++}
++
++// wait sleeps for d, or returns as soon as ctx is done.
++func wait(ctx context.Context, d time.Duration) error {
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	if d <= 0 {
++		return nil
++	}
++	timer := time.NewTimer(d)
++	defer timer.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-timer.C:
++		return nil
++	}
++}
++
++// ctxOr prefers the context's own error, so that a cancelled or expired call
++// unwraps to context.Canceled or context.DeadlineExceeded.
++func ctxOr(ctx context.Context, cause error, fallback error) error {
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	_ = cause
++	return fallback
+ }

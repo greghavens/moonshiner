@@ -1,0 +1,288 @@
+diff --git a/opsrollout/rollout.go b/opsrollout/rollout.go
+index 439cfb7..49e7d5f 100644
+--- a/opsrollout/rollout.go
++++ b/opsrollout/rollout.go
+@@ -113,8 +113,8 @@ type StepReport struct {
+ 	OperationID string
+ 	// Status is the outcome.
+ 	Status StepStatus
+-	// HTTPStatus is the status the appliance answered with, or 0 when the step
+-	// was not attempted.
++	// HTTPStatus is the status the appliance answered with, or 0 when no HTTP
++	// response was received.
+ 	HTTPStatus int
+ 	// Detail carries what the appliance returned for a succeeded step: the
+ 	// identifier it assigned or the value it echoed back. It is empty for a
+@@ -148,6 +148,17 @@ func (e *APIError) Error() string {
+ 	return fmt.Sprintf("%s: appliance answered %d: %s", e.OperationID, e.Status, e.Message)
+ }
+ 
++// responseError is a failure discovered after an HTTP response arrived. It
++// retains that response's status for the step report while preserving the
++// underlying error text and chain.
++type responseError struct {
++	status int
++	err    error
++}
++
++func (e *responseError) Error() string { return e.err.Error() }
++func (e *responseError) Unwrap() error { return e.err }
++
+ // Client applies changes to one appliance.
+ type Client struct {
+ 	baseURL string
+@@ -155,9 +166,6 @@ type Client struct {
+ 
+ 	mu    sync.RWMutex
+ 	token string
+-
+-	// steps accumulates the report of the change being applied.
+-	steps []StepReport
+ }
+ 
+ // New returns a client for the appliance rooted at baseURL, which must include
+@@ -177,7 +185,7 @@ func New(baseURL string, hc *http.Client) *Client {
+ type credentialsPayload struct {
+ 	Username   string `json:"username"`
+ 	Password   string `json:"password"`
+-	AuthSource string `json:"authSource"`
++	AuthSource string `json:"authSource,omitempty"`
+ }
+ 
+ type authToken struct {
+@@ -192,9 +200,11 @@ type resourceKeyPayload struct {
+ 	ResourceKindKey string `json:"resourceKindKey"`
+ }
+ 
++// membershipPayload is custom-group-membership. Every property it declares is
++// optional, so an unconfigured membership encodes as the empty object.
+ type membershipPayload struct {
+-	IncludedResources []string `json:"includedResources"`
+-	ExcludedResources []string `json:"excludedResources"`
++	IncludedResources []string `json:"includedResources,omitempty"`
++	ExcludedResources []string `json:"excludedResources,omitempty"`
+ }
+ 
+ type customGroupPayload struct {
+@@ -207,14 +217,16 @@ type customGroup struct {
+ 	ID string `json:"id"`
+ }
+ 
++// resourceAssignmentPayload is resource-assignment, which declares both of its
++// properties required: an assignment at depth 0 still sends depth.
+ type resourceAssignmentPayload struct {
+ 	ResourceID string `json:"resourceId"`
+-	Depth      int    `json:"depth,omitempty"`
++	Depth      int    `json:"depth"`
+ }
+ 
+ type policyAssignmentPayload struct {
+-	GroupIDs            []string                    `json:"groupIds"`
+-	ResourceAssignments []resourceAssignmentPayload `json:"resourceAssignments"`
++	GroupIDs            []string                    `json:"groupIds,omitempty"`
++	ResourceAssignments []resourceAssignmentPayload `json:"resourceAssignments,omitempty"`
+ }
+ 
+ type policyAssociations struct {
+@@ -233,9 +245,9 @@ type notificationRulePayload struct {
+ 	PluginID                 string     `json:"pluginId"`
+ 	Enabled                  bool       `json:"enabled"`
+ 	RuleType                 string     `json:"ruleType"`
+-	TemplateID               string     `json:"templateId"`
+-	Criticalities            []string   `json:"criticalities"`
+-	AlertDefinitionIDFilters *strValues `json:"alertDefinitionIdFilters"`
++	TemplateID               string     `json:"templateId,omitempty"`
++	Criticalities            []string   `json:"criticalities,omitempty"`
++	AlertDefinitionIDFilters *strValues `json:"alertDefinitionIdFilters,omitempty"`
+ }
+ 
+ type notificationRule struct {
+@@ -247,44 +259,67 @@ type notificationRule struct {
+ // ---------------------------------------------------------------------------
+ 
+ // Apply runs the change against the appliance and returns a report of it.
++//
++// The appliance has no transaction spanning the four operations, so Apply stops
++// at the first failure and does not undo the steps it already applied. The
++// report names every step of the change either way: the steps that were
++// applied, with the identifiers the appliance assigned; the step that failed,
++// with the status and message the appliance answered; and the steps that were
++// never attempted. It is returned together with the error, never discarded.
+ func (c *Client) Apply(ctx context.Context, ch Change) (*Report, error) {
+-	c.steps = c.steps[:0]
++	// Report storage belongs to this call, so concurrent changes on one client
++	// neither race nor overwrite each other's outcome.
++	rep := &Report{Steps: []StepReport{
++		{Name: StepAcquireToken, OperationID: OpAcquireToken, Status: StatusSkipped},
++		{Name: StepCreateGroup, OperationID: OpCreateGroup, Status: StatusSkipped},
++		{Name: StepAssignPolicy, OperationID: OpAssignPolicy, Status: StatusSkipped},
++		{Name: StepCreateRule, OperationID: OpCreateRule, Status: StatusSkipped},
++	}}
+ 
+ 	expiresAt, err := c.acquireToken(ctx, ch.Credentials)
+ 	if err != nil {
+-		return nil, err
++		return rep.failed(0, err)
+ 	}
+-	c.succeeded(StepAcquireToken, OpAcquireToken, http.StatusOK, expiresAt)
++	rep.succeeded(0, http.StatusOK, expiresAt)
+ 
+-	if _, err := c.createCustomGroup(ctx, ch.Group); err != nil {
+-		return nil, err
++	group, err := c.createCustomGroup(ctx, ch.Group)
++	if err != nil {
++		return rep.failed(1, err)
+ 	}
+-	c.succeeded(StepCreateGroup, OpCreateGroup, http.StatusCreated, ch.Group.Name)
++	// From here on the group is addressed by the identifier the appliance
++	// assigned, not by the name the change asked for.
++	rep.succeeded(1, http.StatusCreated, group.ID)
+ 
+-	assoc, err := c.assignPolicy(ctx, ch.PolicyID, ch.Group.Name, ch.ResourceAssignments)
++	assoc, err := c.assignPolicy(ctx, ch.PolicyID, group.ID, ch.ResourceAssignments)
+ 	if err != nil {
+-		return nil, err
++		return rep.failed(2, err)
+ 	}
+-	c.succeeded(StepAssignPolicy, OpAssignPolicy, http.StatusOK, strings.Join(assoc.AssignedGroupIDs, ","))
++	rep.succeeded(2, http.StatusOK, strings.Join(assoc.AssignedGroupIDs, ","))
+ 
+ 	rule, err := c.createNotificationRule(ctx, ch.Rule)
+ 	if err != nil {
+-		return nil, err
++		return rep.failed(3, err)
+ 	}
+-	c.succeeded(StepCreateRule, OpCreateRule, http.StatusCreated, rule.ID)
++	rep.succeeded(3, http.StatusCreated, rule.ID)
++
++	return rep, nil
++}
+ 
+-	return &Report{Steps: c.steps}, nil
++// succeeded records step i as applied, carrying what the appliance returned.
++func (r *Report) succeeded(i, status int, detail string) {
++	r.Steps[i].Status = StatusSucceeded
++	r.Steps[i].HTTPStatus = status
++	r.Steps[i].Detail = detail
+ }
+ 
+-// succeeded records a step that the appliance accepted.
+-func (c *Client) succeeded(name, operationID string, status int, detail string) {
+-	c.steps = append(c.steps, StepReport{
+-		Name:        name,
+-		OperationID: operationID,
+-		Status:      StatusSucceeded,
+-		HTTPStatus:  status,
+-		Detail:      detail,
+-	})
++// failed records step i as the one that failed and ends the change. The steps
++// before it keep the outcome they were given; the steps after it stay skipped.
++func (r *Report) failed(i int, err error) (*Report, error) {
++	r.Steps[i].Status = StatusFailed
++	r.Steps[i].HTTPStatus = statusOf(err)
++	r.Steps[i].Err = err.Error()
++	r.Failed = true
++	return r, err
+ }
+ 
+ // acquireToken performs step 1 and caches the token for the later steps.
+@@ -301,7 +336,10 @@ func (c *Client) acquireToken(ctx context.Context, creds Credentials) (string, e
+ 		return "", err
+ 	}
+ 	if out.Token == "" {
+-		return "", fmt.Errorf("%s: appliance returned an empty token", OpAcquireToken)
++		return "", &responseError{
++			status: http.StatusOK,
++			err:    fmt.Errorf("%s: appliance returned an empty token", OpAcquireToken),
++		}
+ 	}
+ 	c.mu.Lock()
+ 	c.token = out.Token
+@@ -317,9 +355,12 @@ func (c *Client) createCustomGroup(ctx context.Context, g GroupSpec) (*customGro
+ 			AdapterKindKey:  g.AdapterKindKey,
+ 			ResourceKindKey: g.ResourceKindKey,
+ 		},
++		// includedResources and excludedResources are optional: when the caller
++		// configured neither, membershipDefinition is sent as the empty object
++		// rather than as a membership with empty lists.
+ 		MembershipDefinition: membershipPayload{
+-			IncludedResources: append([]string{}, g.IncludedResourceIDs...),
+-			ExcludedResources: append([]string{}, g.ExcludedResourceIDs...),
++			IncludedResources: g.IncludedResourceIDs,
++			ExcludedResources: g.ExcludedResourceIDs,
+ 		},
+ 		AutoResolveMembership: g.AutoResolveMembership,
+ 	}
+@@ -333,10 +374,9 @@ func (c *Client) createCustomGroup(ctx context.Context, g GroupSpec) (*customGro
+ 
+ // assignPolicy performs step 3.
+ func (c *Client) assignPolicy(ctx context.Context, policyID, groupID string, assignments []ResourceAssignment) (*policyAssociations, error) {
+-	payload := policyAssignmentPayload{
+-		GroupIDs:            []string{groupID},
+-		ResourceAssignments: make([]resourceAssignmentPayload, 0, len(assignments)),
+-	}
++	// resourceAssignments is optional: it is omitted when the caller assigned no
++	// resources, rather than sent as an empty list.
++	payload := policyAssignmentPayload{GroupIDs: []string{groupID}}
+ 	for _, a := range assignments {
+ 		payload.ResourceAssignments = append(payload.ResourceAssignments, resourceAssignmentPayload{
+ 			ResourceID: a.ResourceID,
+@@ -355,13 +395,17 @@ func (c *Client) assignPolicy(ctx context.Context, policyID, groupID string, ass
+ // createNotificationRule performs step 4.
+ func (c *Client) createNotificationRule(ctx context.Context, r RuleSpec) (*notificationRule, error) {
+ 	body := notificationRulePayload{
+-		Name:                     r.Name,
+-		PluginID:                 r.PluginID,
+-		Enabled:                  r.Enabled,
+-		RuleType:                 ruleTypeAlert,
+-		TemplateID:               r.TemplateID,
+-		Criticalities:            append([]string{}, r.Criticalities...),
+-		AlertDefinitionIDFilters: &strValues{Values: append([]string{}, r.AlertDefinitionIDs...)},
++		Name:          r.Name,
++		PluginID:      r.PluginID,
++		Enabled:       r.Enabled,
++		RuleType:      ruleTypeAlert,
++		TemplateID:    r.TemplateID,
++		Criticalities: r.Criticalities,
++	}
++	// alertDefinitionIdFilters is optional: the filter is sent only when the
++	// caller named alert definitions to filter on, never as an empty filter.
++	if len(r.AlertDefinitionIDs) > 0 {
++		body.AlertDefinitionIDFilters = &strValues{Values: r.AlertDefinitionIDs}
+ 	}
+ 	var out notificationRule
+ 	if err := c.do(ctx, http.MethodPost, "/api/notifications/rules", OpCreateRule,
+@@ -404,7 +448,10 @@ func (c *Client) do(ctx context.Context, method, path, operationID string, wantS
+ 
+ 	payload, err := io.ReadAll(resp.Body)
+ 	if err != nil {
+-		return fmt.Errorf("%s: read response: %w", operationID, err)
++		return &responseError{
++			status: resp.StatusCode,
++			err:    fmt.Errorf("%s: read response: %w", operationID, err),
++		}
+ 	}
+ 	if resp.StatusCode != wantStatus {
+ 		return &APIError{
+@@ -417,7 +464,10 @@ func (c *Client) do(ctx context.Context, method, path, operationID string, wantS
+ 		return nil
+ 	}
+ 	if err := json.Unmarshal(payload, out); err != nil {
+-		return fmt.Errorf("%s: decode response: %w", operationID, err)
++		return &responseError{
++			status: resp.StatusCode,
++			err:    fmt.Errorf("%s: decode response: %w", operationID, err),
++		}
+ 	}
+ 	return nil
+ }
+@@ -447,5 +497,9 @@ func statusOf(err error) int {
+ 	if errors.As(err, &apiErr) {
+ 		return apiErr.Status
+ 	}
++	var responseErr *responseError
++	if errors.As(err, &responseErr) {
++		return responseErr.status
++	}
+ 	return 0
+ }

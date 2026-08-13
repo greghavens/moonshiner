@@ -1,0 +1,278 @@
+--- a/src/vcf_sddc_lcm/client.py
++++ b/src/vcf_sddc_lcm/client.py
+@@ -2,11 +2,48 @@
+ 
+ from __future__ import annotations
+ 
++import json
++from http.client import HTTPException
++from typing import Any
++from urllib.error import HTTPError, URLError
++from urllib.parse import quote, urlencode
++from urllib.request import Request, urlopen
++
++
++TASK_TYPE = "SUPPORT_BUNDLE"
++RESOURCE_TYPE = "COMPONENT"
++CORRELATION_HEADER = "X-Correlation-Id"
++MAX_PAGE_SIZE = 50
++TASK_STATUSES = frozenset(
++    {"PENDING", "SCHEDULED", "RUNNING", "SUCCEEDED", "FAILED", "CANCELED"}
++)
++BUNDLE_KEYS = ("id", "createdTimestamp", "size", "name", "url")
++
+ 
+ class SddcLcmError(RuntimeError):
+     """Raised when an SDDC LCM request or response is invalid."""
+ 
+ 
++def _text(value: object, label: str) -> str:
++    if not isinstance(value, str) or not value.strip():
++        raise SddcLcmError(f"{label} must be a nonblank string")
++    return value
++
++
++def _count(value: object, label: str, *, minimum: int, maximum: int | None = None) -> int:
++    if isinstance(value, bool) or not isinstance(value, int):
++        raise SddcLcmError(f"{label} must be an integer")
++    if value < minimum or (maximum is not None and value > maximum):
++        raise SddcLcmError(f"{label} is out of range")
++    return value
++
++
++def _whole(value: object, label: str) -> int:
++    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
++        raise SddcLcmError(f"{label} must be a nonnegative integer")
++    return value
++
++
+ class SddcLcmClient:
+     """Small focused client for the protected SDDC LCM contract."""
+ 
+@@ -17,9 +54,188 @@
+         *,
+         timeout: float = 10.0,
+     ) -> None:
+-        self._base_url = base_url
+-        self._access_token = access_token
+-        self._timeout = timeout
++        self._base_url = _text(base_url, "base_url").rstrip("/")
++        self._access_token = _text(access_token, "access_token")
++        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
++            raise SddcLcmError("timeout must be a number")
++        if timeout <= 0:
++            raise SddcLcmError("timeout must be positive")
++        self._timeout = float(timeout)
++
++    # -- transport ---------------------------------------------------------
++
++    def _send(
++        self,
++        method: str,
++        path: str,
++        *,
++        expected_status: int,
++        query: list[tuple[str, str]] | None = None,
++        payload: dict[str, Any] | None = None,
++        correlation_id: str | None = None,
++    ) -> Any:
++        url = self._base_url + path
++        if query:
++            url = f"{url}?{urlencode(query)}"
++        headers = {
++            "Authorization": f"Bearer {self._access_token}",
++            "Accept": "application/json",
++        }
++        body: bytes | None = None
++        if payload is not None:
++            body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
++            headers["Content-Type"] = "application/json"
++        if correlation_id is not None:
++            headers[CORRELATION_HEADER] = correlation_id
++
++        try:
++            request = Request(url, data=body, headers=headers, method=method)
++            with urlopen(request, timeout=self._timeout) as response:
++                status = response.status
++                raw = response.read()
++        except HTTPError as error:
++            raise SddcLcmError(
++                f"{method} {path} failed with HTTP {error.code}"
++            ) from None
++        except (HTTPException, URLError, OSError, ValueError) as error:
++            raise SddcLcmError(f"{method} {path} transport failure: {error}") from None
++        if status != expected_status:
++            raise SddcLcmError(f"{method} {path} returned unexpected HTTP {status}")
++        try:
++            return json.loads(raw.decode("utf-8"))
++        except (UnicodeDecodeError, ValueError):
++            raise SddcLcmError(f"{method} {path} returned malformed JSON") from None
++
++    # -- operations --------------------------------------------------------
++
++    def _get_tasks_page(
++        self, component_id: str, page_number: int, page_size: int
++    ) -> dict[str, Any]:
++        """getTasks: members follow specification order; unset members are omitted."""
++        query: list[tuple[str, str]] = [
++            ("type", TASK_TYPE),
++            ("resourceId", component_id),
++            ("resourceType", RESOURCE_TYPE),
++        ]
++        if page_number:
++            query.append(("pageNumber", str(page_number)))
++        query.append(("pageSize", str(page_size)))
++
++        page = self._send("GET", "/v1/tasks", expected_status=200, query=query)
++        if not isinstance(page, dict):
++            raise SddcLcmError("getTasks did not return an object")
++        elements = page.get("elements")
++        metadata = page.get("pageMetadata")
++        if not isinstance(elements, list) or not isinstance(metadata, dict):
++            raise SddcLcmError("getTasks page is missing elements or pageMetadata")
++        for key in ("pageNumber", "pageSize", "totalElements", "totalPages"):
++            _whole(metadata.get(key), f"pageMetadata.{key}")
++        if metadata["pageNumber"] != page_number:
++            raise SddcLcmError("getTasks returned a different page than requested")
++        if metadata["pageSize"] != page_size:
++            raise SddcLcmError("getTasks changed the requested page size")
++        if len(elements) > page_size:
++            raise SddcLcmError("getTasks returned an overfull page")
++        if metadata["totalPages"] < 1:
++            raise SddcLcmError("getTasks returned no pages for an existing page")
++        if page_number >= metadata["totalPages"]:
++            raise SddcLcmError("getTasks returned a page beyond its last page")
++        return page
++
++    def _find_existing_task(
++        self, component_id: str, correlation_id: str, page_size: int
++    ) -> str | None:
++        """Reconcile before mutating: a prior attempt is found by its correlation ID."""
++        page_number = 0
++        totals: tuple[int, int] | None = None
++        while True:
++            page = self._get_tasks_page(component_id, page_number, page_size)
++            elements = page["elements"]
++            metadata = page["pageMetadata"]
++            current_totals = (metadata["totalElements"], metadata["totalPages"])
++            if totals is None:
++                totals = current_totals
++            elif current_totals != totals:
++                raise SddcLcmError("getTasks paging totals changed between pages")
++            for element in elements:
++                if not isinstance(element, dict):
++                    raise SddcLcmError("getTasks returned a non-object task summary")
++                identifier = element.get("id")
++                if not isinstance(identifier, str) or not identifier.strip():
++                    raise SddcLcmError("a task summary is missing its required id")
++                if element.get("correlationId") == correlation_id:
++                    return identifier
++            if page_number + 1 >= metadata["totalPages"]:
++                return None
++            if not elements:
++                raise SddcLcmError("getTasks paging stalled on an empty page")
++            next_page = metadata["pageNumber"] + 1
++            if next_page <= page_number:
++                raise SddcLcmError("getTasks paging did not progress")
++            page_number = next_page
++
++    def _generate(
++        self, component_id: str, correlation_id: str, look_back_window: int | None
++    ) -> str:
++        """generateComponentSupportBundle: unset optional members are omitted."""
++        payload: dict[str, Any] = {}
++        if look_back_window is not None:
++            payload["lookBackWindow"] = look_back_window
++        task = self._send(
++            "POST",
++            f"/v1/components/{quote(component_id, safe='')}/support-bundles",
++            expected_status=202,
++            payload=payload,
++            correlation_id=correlation_id,
++        )
++        if not isinstance(task, dict):
++            raise SddcLcmError("generateComponentSupportBundle did not return a task")
++        identifier = task.get("id")
++        if not isinstance(identifier, str) or not identifier.strip():
++            raise SddcLcmError("the accepted task is missing its required id")
++        if task.get("correlationId") not in (None, correlation_id):
++            raise SddcLcmError("the accepted task carries a foreign correlation ID")
++        return identifier
++
++    def _get_task(self, task_id: str, correlation_id: str) -> dict[str, Any]:
++        task = self._send(
++            "GET", f"/v1/tasks/{quote(task_id, safe='')}", expected_status=200
++        )
++        if not isinstance(task, dict):
++            raise SddcLcmError("getTask did not return an object")
++        if task.get("id") != task_id:
++            raise SddcLcmError("getTask returned a different task")
++        status = task.get("status")
++        if status not in TASK_STATUSES:
++            raise SddcLcmError("getTask returned an unknown task status")
++        if task.get("correlationId") != correlation_id:
++            raise SddcLcmError("the resolved task carries a foreign correlation ID")
++        if status != "SUCCEEDED":
++            raise SddcLcmError(f"support bundle task finished as {status}")
++        return task
++
++    def _get_bundle(self, component_id: str, bundle_id: str) -> dict[str, Any]:
++        listing = self._send(
++            "GET",
++            f"/v1/components/{quote(component_id, safe='')}/support-bundles",
++            expected_status=200,
++        )
++        if not isinstance(listing, list):
++            raise SddcLcmError("getComponentSupportBundles did not return an array")
++        if any(not isinstance(item, dict) for item in listing):
++            raise SddcLcmError("getComponentSupportBundles returned a malformed entry")
++        matches = [
++            item
++            for item in listing
++            if item.get("id") == bundle_id
++        ]
++        if len(matches) != 1:
++            raise SddcLcmError(
++                "the component does not expose exactly one bundle for this task"
++            )
++        return {key: matches[0].get(key) for key in BUNDLE_KEYS}
++
++    # -- public surface ----------------------------------------------------
+ 
+     def ensure_support_bundle(
+         self,
+@@ -30,4 +246,33 @@
+         page_size: int = 50,
+     ) -> dict[str, object]:
+         """Generate a component support bundle at most once per correlation ID."""
+-        raise NotImplementedError("implement the retry-safe support-bundle workflow")
++        component_id = _text(component_id, "component_id")
++        correlation_id = _text(correlation_id, "correlation_id")
++        page_size = _count(page_size, "page_size", minimum=1, maximum=MAX_PAGE_SIZE)
++        if look_back_window is not None:
++            look_back_window = _count(look_back_window, "look_back_window", minimum=1)
++
++        existing = self._find_existing_task(component_id, correlation_id, page_size)
++        created = existing is None
++        task_id = (
++            self._generate(component_id, correlation_id, look_back_window)
++            if created
++            else existing
++        )
++        assert task_id is not None
++
++        task = self._get_task(task_id, correlation_id)
++        details = task.get("additionalDetails")
++        if not isinstance(details, dict):
++            raise SddcLcmError("the resolved task is missing additionalDetails")
++        bundle_id = details.get("supportBundleId")
++        if not isinstance(bundle_id, str) or not bundle_id.strip():
++            raise SddcLcmError("the resolved task does not name a support bundle")
++
++        return {
++            "taskId": task_id,
++            "correlationId": correlation_id,
++            "status": task["status"],
++            "created": created,
++            "supportBundle": self._get_bundle(component_id, bundle_id),
++        }

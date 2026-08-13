@@ -1,0 +1,236 @@
+diff --git a/scripts/Invoke-ForwarderRollout.ps1 b/scripts/Invoke-ForwarderRollout.ps1
+index f78c2b2..0bd564b 100644
+--- a/scripts/Invoke-ForwarderRollout.ps1
++++ b/scripts/Invoke-ForwarderRollout.ps1
+@@ -12,4 +12,30 @@ param(
+ 
+ $ErrorActionPreference = 'Stop'
+ 
+-throw 'TODO: load the scenario, run the rollout, and write the report as JSON.'
++$report = [pscustomobject]@{
++    OverallStatus = 'Failed'
++    Steps         = @()
++}
++
++try {
++    $scenario = Get-Content -LiteralPath $ScenarioPath -Raw | ConvertFrom-Json -Depth 20
++    $securePassword = ConvertTo-SecureString $scenario.credentials.password -AsPlainText -Force
++    $credential = [pscredential]::new($scenario.credentials.username, $securePassword)
++
++    $modulePath = Join-Path $PSScriptRoot '..' 'src' 'VcfOpsLogs.psd1'
++    Import-Module $modulePath -Force
++    $report = Invoke-VcfOpsLogsForwarderRollout `
++        -ServerUri $ServerUri `
++        -Credential $credential `
++        -Provider $scenario.credentials.provider `
++        -Updates @($scenario.updates)
++}
++finally {
++    $parent = Split-Path -Parent $OutputPath
++    if (-not [string]::IsNullOrWhiteSpace($parent) -and -not (Test-Path -LiteralPath $parent)) {
++        $null = New-Item -ItemType Directory -Path $parent -Force
++    }
++    $report | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $OutputPath -Encoding utf8
++}
++
++$report
+diff --git a/src/VcfOpsLogs.psm1 b/src/VcfOpsLogs.psm1
+index 2dbb2af..d72fe75 100644
+--- a/src/VcfOpsLogs.psm1
++++ b/src/VcfOpsLogs.psm1
+@@ -1,5 +1,92 @@
+ Set-StrictMode -Version Latest
+ 
++function Test-InputProperty {
++    param(
++        [Parameter(Mandatory)]
++        [object] $InputObject,
++
++        [Parameter(Mandatory)]
++        [string] $Name
++    )
++
++    if ($InputObject -is [System.Collections.IDictionary]) {
++        return $InputObject.Contains($Name)
++    }
++
++    return $null -ne $InputObject.PSObject.Properties[$Name]
++}
++
++function Get-InputProperty {
++    param(
++        [Parameter(Mandatory)]
++        [object] $InputObject,
++
++        [Parameter(Mandatory)]
++        [string] $Name
++    )
++
++    if ($InputObject -is [System.Collections.IDictionary]) {
++        return $InputObject[$Name]
++    }
++
++    return $InputObject.PSObject.Properties[$Name].Value
++}
++
++function Get-HttpFailure {
++    param(
++        [Parameter(Mandatory)]
++        [System.Management.Automation.ErrorRecord] $ErrorRecord
++    )
++
++    $response = $null
++    $responseProperty = $ErrorRecord.Exception.PSObject.Properties['Response']
++    if ($null -ne $responseProperty) {
++        $response = $responseProperty.Value
++    }
++
++    $statusCode = $null
++    if ($null -ne $response) {
++        $statusCode = [int] $response.StatusCode
++    }
++
++    $errorBody = $null
++    $rawError = $null
++    if ($null -ne $ErrorRecord.ErrorDetails) {
++        $rawError = $ErrorRecord.ErrorDetails.Message
++    }
++    if ([string]::IsNullOrWhiteSpace($rawError) -and
++        $null -ne $response -and
++        $null -ne $response.Content) {
++        $rawError = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
++    }
++
++    if (-not [string]::IsNullOrWhiteSpace($rawError)) {
++        try {
++            $errorBody = $rawError | ConvertFrom-Json -ErrorAction Stop
++        }
++        catch {
++            $errorBody = $null
++        }
++    }
++
++    $errorCode = $null
++    $message = $ErrorRecord.Exception.Message
++    if ($null -ne $errorBody) {
++        if ($null -ne $errorBody.PSObject.Properties['errorCode']) {
++            $errorCode = $errorBody.errorCode
++        }
++        if ($null -ne $errorBody.PSObject.Properties['errorMessage']) {
++            $message = $errorBody.errorMessage
++        }
++    }
++
++    return [pscustomobject]@{
++        HttpStatus = $statusCode
++        ErrorCode  = $errorCode
++        Message    = $message
++    }
++}
++
+ function Invoke-VcfOpsLogsForwarderRollout {
+     [CmdletBinding()]
+     param(
+@@ -17,7 +104,101 @@ function Invoke-VcfOpsLogsForwarderRollout {
+         [object[]] $Updates
+     )
+ 
+-    throw 'TODO: implement the contract-pinned forwarder rollout.'
++    $serviceRoot = $ServerUri.AbsoluteUri.TrimEnd('/') + '/api/v2'
++    $sessionBody = [ordered]@{
++        username = $Credential.UserName
++        password = $Credential.GetNetworkCredential().Password
++        provider = $Provider
++    }
++
++    $sessionResponse = Invoke-WebRequest `
++        -Uri "$serviceRoot/sessions" `
++        -Method Post `
++        -ContentType 'application/json' `
++        -Body ($sessionBody | ConvertTo-Json -Compress) `
++        -ErrorAction Stop
++    $session = $sessionResponse.Content | ConvertFrom-Json -ErrorAction Stop
++    if ([string]::IsNullOrWhiteSpace($session.sessionId)) {
++        throw 'POST_sessions returned no sessionId.'
++    }
++
++    $headers = @{ Authorization = "Bearer $($session.sessionId)" }
++    $requiredFields = @('host', 'port', 'protocol', 'sslEnabled')
++    $optionalFields = @(
++        'acceptCert',
++        'name',
++        'workerCount',
++        'diskCacheSize',
++        'tags',
++        'filter',
++        'transportProtocol',
++        'forwardComplementaryFields',
++        'testConnection'
++    )
++    $steps = [System.Collections.Generic.List[object]]::new()
++
++    foreach ($update in $Updates) {
++        if (-not (Test-InputProperty -InputObject $update -Name 'id')) {
++            throw 'Each update must supply id.'
++        }
++
++        $targetId = [string] (Get-InputProperty -InputObject $update -Name 'id')
++        $body = [ordered]@{}
++        foreach ($field in $requiredFields) {
++            if (-not (Test-InputProperty -InputObject $update -Name $field)) {
++                throw "Update '$targetId' must supply required field '$field'."
++            }
++            $body[$field] = Get-InputProperty -InputObject $update -Name $field
++        }
++        foreach ($field in $optionalFields) {
++            if (Test-InputProperty -InputObject $update -Name $field) {
++                $body[$field] = Get-InputProperty -InputObject $update -Name $field
++            }
++        }
++
++        $encodedId = [uri]::EscapeDataString($targetId)
++        try {
++            $response = Invoke-WebRequest `
++                -Uri "$serviceRoot/log-forwarder/$encodedId" `
++                -Method Put `
++                -Headers $headers `
++                -ContentType 'application/json' `
++                -Body ($body | ConvertTo-Json -Compress -Depth 20) `
++                -ErrorAction Stop
++            $steps.Add([pscustomobject]@{
++                    OperationId = 'PUT_log-forwarder-id'
++                    TargetId    = $targetId
++                    Status      = 'Succeeded'
++                    HttpStatus  = [int] $response.StatusCode
++                    ErrorCode   = $null
++                    Message     = 'Log forwarder updated.'
++                })
++        }
++        catch {
++            $failure = Get-HttpFailure -ErrorRecord $_
++            $steps.Add([pscustomobject]@{
++                    OperationId = 'PUT_log-forwarder-id'
++                    TargetId    = $targetId
++                    Status      = 'Failed'
++                    HttpStatus  = $failure.HttpStatus
++                    ErrorCode   = $failure.ErrorCode
++                    Message     = $failure.Message
++                })
++            break
++        }
++    }
++
++    $overallStatus = if ($steps.Where({ $_.Status -eq 'Failed' }).Count -gt 0) {
++        'Failed'
++    }
++    else {
++        'Succeeded'
++    }
++
++    return [pscustomobject]@{
++        OverallStatus = $overallStatus
++        Steps         = $steps.ToArray()
++    }
+ }
+ 
+ Export-ModuleMember -Function Invoke-VcfOpsLogsForwarderRollout

@@ -1,0 +1,697 @@
+diff -Nru a/opsdiag/opsdiag.go b/opsdiag/opsdiag.go
+--- a/opsdiag/opsdiag.go	2026-08-04 14:10:10.000000000 -0500
++++ b/opsdiag/opsdiag.go	2026-08-04 14:12:52.138219531 -0500
+@@ -4,9 +4,17 @@
+ package opsdiag
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
++	"os"
++	"sort"
++	"strings"
+ )
+ 
+ // Root cause classifications returned in Diagnosis.RootCause.
+@@ -22,12 +30,195 @@
+ // does not name every operation this package needs.
+ var ErrIncompleteContract = errors.New("opsdiag: contract does not name every required operation")
+ 
++// Operation identifiers this package issues, in the order Diagnose calls them.
++const (
++	opQueryAlert          = "queryAlert"
++	opContributingSymptom = "getAlertContributingSymptoms"
++	opAlertNotes          = "getAlertNotes"
++	opQuerySymptoms       = "querySymptoms"
++	opSystemAudit         = "getSystemAudit"
++)
++
++var requiredOperations = []string{
++	opQueryAlert, opContributingSymptom, opAlertNotes, opQuerySymptoms, opSystemAudit,
++}
++
++// symptomDefinitionCauses maps a root symptom definition to a classification.
++var symptomDefinitionCauses = map[string]string{
++	"SystemAdapterInstanceCredentialFailure": RootCauseCredentialRejected,
++	"SystemCollectorDown":                    RootCauseCollectorOffline,
++	"SystemAdapterInstanceMonitoringStopped": RootCauseMonitoringStopped,
++}
++
++// criticalityRank orders the criticality enum of the specification, most
++// severe first. Anything unrecognised, including AUTO, ranks lowest.
++var criticalityRank = map[string]int{
++	"CRITICAL":    5,
++	"IMMEDIATE":   4,
++	"WARNING":     3,
++	"INFORMATION": 2,
++	"NONE":        1,
++	"UNKNOWN":     0,
++}
++
++// contractOperation is one operation of the contract projection.
++type contractOperation struct {
++	Method string `json:"method"`
++	Path   string `json:"path"`
++}
++
+ // Contract is the loaded projection of the VCF Operations OpenAPI
+ // specification that pins every request this package issues.
+ type Contract struct {
+-	// TODO: model the fields of docs/contract.json that the client needs.
++	BasePath      string `json:"basePath"`
++	Authorization struct {
++		Header string `json:"header"`
++		Scheme string `json:"scheme"`
++	} `json:"authorization"`
++	Operations map[string]contractOperation `json:"operations"`
++}
++
++// LoadContract reads and validates the contract projection at path.
++func LoadContract(path string) (*Contract, error) {
++	raw, err := os.ReadFile(path)
++	if err != nil {
++		return nil, fmt.Errorf("opsdiag: read contract: %w", err)
++	}
++	var c Contract
++	if err := json.Unmarshal(raw, &c); err != nil {
++		return nil, fmt.Errorf("opsdiag: parse contract: %w", err)
++	}
++	if c.BasePath == "" {
++		return nil, errors.New("opsdiag: contract declares no basePath")
++	}
++	if c.Authorization.Header == "" || c.Authorization.Scheme == "" {
++		return nil, errors.New("opsdiag: contract declares no authorization header or scheme")
++	}
++	if len(c.Operations) == 0 {
++		return nil, errors.New("opsdiag: contract names no operations")
++	}
++	return &c, nil
++}
++
++// Client issues contract-pinned requests against a VCF Operations endpoint.
++// A Client is safe for concurrent use by multiple goroutines: every field is
++// read-only after construction.
++type Client struct {
++	baseURL  string
++	contract *Contract
++	authHdr  string
++	authVal  string
++	hc       *http.Client
++}
++
++// NewClient builds a client for the endpoint at baseURL, presenting token with
++// the authorization scheme the contract names. A nil hc selects
++// http.DefaultClient. NewClient returns ErrIncompleteContract if the contract
++// omits any operation this package issues.
++func NewClient(baseURL, token string, contract *Contract, hc *http.Client) (*Client, error) {
++	if contract == nil {
++		return nil, ErrIncompleteContract
++	}
++	var missing []string
++	for _, id := range requiredOperations {
++		op, ok := contract.Operations[id]
++		if !ok || op.Method == "" || op.Path == "" {
++			missing = append(missing, id)
++		}
++	}
++	if len(missing) > 0 {
++		sort.Strings(missing)
++		return nil, fmt.Errorf("%w: %s", ErrIncompleteContract, strings.Join(missing, ", "))
++	}
++	if hc == nil {
++		hc = http.DefaultClient
++	}
++	return &Client{
++		baseURL:  strings.TrimSuffix(baseURL, "/"),
++		contract: contract,
++		authHdr:  contract.Authorization.Header,
++		authVal:  contract.Authorization.Scheme + " " + token,
++		hc:       hc,
++	}, nil
++}
++
++// ---------------------------------------------------------------- wire types
++
++// resourceQuery mirrors the resource-query schema. Only the criteria that are
++// actually set are marshalled; everything else stays off the wire.
++type resourceQuery struct {
++	ResourceID []string `json:"resourceId,omitempty"`
++}
++
++// alertQuery mirrors the alert-query schema. activeOnly is a pointer because
++// the field is optional but meaningful when explicitly false, so it must not
++// be conflated with "unset".
++type alertQuery struct {
++	ResourceQuery     *resourceQuery `json:"resource-query,omitempty"`
++	ActiveOnly        *bool          `json:"activeOnly,omitempty"`
++	AlertCriticality  []string       `json:"alertCriticality,omitempty"`
++	CompositeOperator string         `json:"compositeOperator,omitempty"`
++}
++
++// symptomQuery mirrors the symptom-query schema.
++type symptomQuery struct {
++	ResourceQuery     *resourceQuery `json:"resource-query,omitempty"`
++	ActiveOnly        *bool          `json:"activeOnly,omitempty"`
++	IncludeAlarmInfo  *bool          `json:"includeAlarmInfo,omitempty"`
++	CompositeOperator string         `json:"compositeOperator,omitempty"`
++}
++
++type alert struct {
++	AlertID      string `json:"alertId"`
++	ResourceID   string `json:"resourceId"`
++	AlertLevel   string `json:"alertLevel"`
++	StartTimeUTC int64  `json:"startTimeUTC"`
++}
++
++type alertsPage struct {
++	Alerts []alert `json:"alerts"`
++}
++
++type contributingSymptom struct {
++	SymptomID             string   `json:"symptomId"`
++	SymptomDefinitionsIDs []string `json:"symptomDefinitionsIds"`
++}
++
++type contributingSymptoms struct {
++	ContributingSymptoms []contributingSymptom `json:"contributingSymptoms"`
++}
++
++type symptom struct {
++	ID                  string `json:"id"`
++	SymptomDefinitionID string `json:"symptomDefinitionId"`
++	SymptomCriticality  string `json:"symptomCriticality"`
++	StartTimeUTC        int64  `json:"startTimeUTC"`
++}
++
++type symptomsPage struct {
++	Symptoms []symptom `json:"symptom"`
++}
++
++type alertNote struct {
++	Note string `json:"note"`
+ }
+ 
++type alertNotesPage struct {
++	AlertNotes []alertNote `json:"alertNotes"`
++}
++
++type auditObject struct {
++	Name   string        `json:"name"`
++	Count  int           `json:"count"`
++	Audits []auditObject `json:"audits"`
++}
++
++type systemAuditReports struct {
++	AuditReports []auditObject `json:"auditReports"`
++}
++
++// ---------------------------------------------------------------- result
++
+ // Diagnosis is the result of correlating the records retrieved for one resource.
+ type Diagnosis struct {
+ 	// ResourceID is the resource that was diagnosed.
+@@ -49,26 +240,257 @@
+ 	Notes []string
+ }
+ 
+-// Client issues contract-pinned requests against a VCF Operations endpoint.
+-// A Client is safe for concurrent use by multiple goroutines.
+-type Client struct {
+-	// TODO
++// Diagnose retrieves the records for resourceID and correlates them.
++func (c *Client) Diagnose(ctx context.Context, resourceID string) (*Diagnosis, error) {
++	d := &Diagnosis{ResourceID: resourceID}
++
++	alerts, err := c.queryAlerts(ctx, resourceID)
++	if err != nil {
++		return nil, err
++	}
++
++	var contributing []contributingSymptom
++	if len(alerts) > 0 {
++		selected := selectAlert(alerts)
++		d.AlertID = selected.AlertID
++
++		ids := make([]string, 0, len(alerts))
++		for _, a := range alerts {
++			ids = append(ids, a.AlertID)
++		}
++		if contributing, err = c.contributingSymptoms(ctx, ids); err != nil {
++			return nil, err
++		}
++		if d.Notes, err = c.alertNotes(ctx, selected.AlertID); err != nil {
++			return nil, err
++		}
++	}
++
++	symptoms, err := c.querySymptoms(ctx, resourceID)
++	if err != nil {
++		return nil, err
++	}
++	configured, collecting, err := c.systemAudit(ctx)
++	if err != nil {
++		return nil, err
++	}
++	d.ObjectsConfigured = configured
++	d.ObjectsCollecting = collecting
++	d.ObjectsNotCollecting = configured - collecting
++
++	if len(alerts) == 0 {
++		d.RootCause = RootCauseNoActiveAlerts
++		return d, nil
++	}
++
++	root, ok := selectRootSymptom(contributing, symptoms)
++	if !ok {
++		d.RootCause = RootCauseUnclassified
++		return d, nil
++	}
++	d.RootSymptomID = root.ID
++	d.RootSymptomDefinitionID = root.SymptomDefinitionID
++	if cause, known := symptomDefinitionCauses[root.SymptomDefinitionID]; known {
++		d.RootCause = cause
++	} else {
++		d.RootCause = RootCauseUnclassified
++	}
++	return d, nil
+ }
+ 
+-// LoadContract reads and validates the contract projection at path.
+-func LoadContract(path string) (*Contract, error) {
+-	return nil, errors.New("opsdiag: LoadContract not implemented")
++// selectAlert picks the most severe alert, breaking ties on the earliest start
++// time and then on the alert id, so the choice never depends on map or slice
++// ordering the platform did not promise.
++func selectAlert(alerts []alert) alert {
++	best := alerts[0]
++	for _, a := range alerts[1:] {
++		switch {
++		case criticalityRank[a.AlertLevel] != criticalityRank[best.AlertLevel]:
++			if criticalityRank[a.AlertLevel] > criticalityRank[best.AlertLevel] {
++				best = a
++			}
++		case a.StartTimeUTC != best.StartTimeUTC:
++			if a.StartTimeUTC < best.StartTimeUTC {
++				best = a
++			}
++		case a.AlertID < best.AlertID:
++			best = a
++		}
++	}
++	return best
+ }
+ 
+-// NewClient builds a client for the endpoint at baseURL, presenting token with
+-// the authorization scheme the contract names. A nil hc selects
+-// http.DefaultClient. NewClient returns ErrIncompleteContract if the contract
+-// omits any operation this package issues.
+-func NewClient(baseURL, token string, contract *Contract, hc *http.Client) (*Client, error) {
+-	return nil, errors.New("opsdiag: NewClient not implemented")
++// selectRootSymptom returns the contributing symptom that started first. A
++// contributing symptom with no matching record cannot be timed, so it is not a
++// candidate; the loudest symptom is deliberately not preferred.
++func selectRootSymptom(contributing []contributingSymptom, symptoms []symptom) (symptom, bool) {
++	byID := make(map[string]symptom, len(symptoms))
++	for _, s := range symptoms {
++		byID[s.ID] = s
++	}
++
++	var best symptom
++	found := false
++	for _, cs := range contributing {
++		s, ok := byID[cs.SymptomID]
++		if !ok {
++			continue
++		}
++		if !found {
++			best, found = s, true
++			continue
++		}
++		switch {
++		case s.StartTimeUTC != best.StartTimeUTC:
++			if s.StartTimeUTC < best.StartTimeUTC {
++				best = s
++			}
++		case criticalityRank[s.SymptomCriticality] != criticalityRank[best.SymptomCriticality]:
++			if criticalityRank[s.SymptomCriticality] > criticalityRank[best.SymptomCriticality] {
++				best = s
++			}
++		case s.ID < best.ID:
++			best = s
++		}
++	}
++	return best, found
+ }
+ 
+-// Diagnose retrieves the records for resourceID and correlates them.
+-func (c *Client) Diagnose(ctx context.Context, resourceID string) (*Diagnosis, error) {
+-	return nil, errors.New("opsdiag: Diagnose not implemented")
++// ---------------------------------------------------------------- operations
++
++const queryPageSize = "100"
++
++func (c *Client) queryAlerts(ctx context.Context, resourceID string) ([]alert, error) {
++	body := alertQuery{
++		ResourceQuery:     &resourceQuery{ResourceID: []string{resourceID}},
++		ActiveOnly:        boolPtr(true),
++		AlertCriticality:  []string{"CRITICAL", "IMMEDIATE"},
++		CompositeOperator: "AND",
++	}
++	var out alertsPage
++	err := c.do(ctx, opQueryAlert, nil, url.Values{
++		"page":     {"0"},
++		"pageSize": {queryPageSize},
++	}, body, &out)
++	return out.Alerts, err
++}
++
++func (c *Client) contributingSymptoms(ctx context.Context, alertIDs []string) ([]contributingSymptom, error) {
++	// style=form, explode=true: one repeated id key per alert, never a joined
++	// value.
++	var out contributingSymptoms
++	err := c.do(ctx, opContributingSymptom, nil, url.Values{"id": alertIDs}, nil, &out)
++	return out.ContributingSymptoms, err
++}
++
++func (c *Client) alertNotes(ctx context.Context, alertID string) ([]string, error) {
++	// page and pageSize are optional and unset here, so neither is sent.
++	var out alertNotesPage
++	if err := c.do(ctx, opAlertNotes, map[string]string{"id": alertID}, nil, nil, &out); err != nil {
++		return nil, err
++	}
++	notes := make([]string, 0, len(out.AlertNotes))
++	for _, n := range out.AlertNotes {
++		notes = append(notes, n.Note)
++	}
++	return notes, nil
++}
++
++func (c *Client) querySymptoms(ctx context.Context, resourceID string) ([]symptom, error) {
++	// activeOnly is explicitly false: cancelled symptoms are needed to time the
++	// contributing conditions, so the field must reach the wire as false rather
++	// than fall back to the active-only default by being omitted.
++	body := symptomQuery{
++		ResourceQuery:     &resourceQuery{ResourceID: []string{resourceID}},
++		ActiveOnly:        boolPtr(false),
++		IncludeAlarmInfo:  boolPtr(true),
++		CompositeOperator: "AND",
++	}
++	var out symptomsPage
++	err := c.do(ctx, opQuerySymptoms, nil, url.Values{
++		"page":     {"0"},
++		"pageSize": {queryPageSize},
++	}, body, &out)
++	return out.Symptoms, err
+ }
++
++func (c *Client) systemAudit(ctx context.Context) (configured, collecting int, err error) {
++	var out systemAuditReports
++	if err = c.do(ctx, opSystemAudit, nil, nil, nil, &out); err != nil {
++		return 0, 0, err
++	}
++	for _, report := range out.AuditReports {
++		if report.Name != "Object" {
++			continue
++		}
++		for _, a := range report.Audits {
++			switch a.Name {
++			case "Objects Configured":
++				configured = a.Count
++			case "Objects Collecting":
++				collecting = a.Count
++			}
++		}
++		return configured, collecting, nil
++	}
++	return 0, 0, errors.New("opsdiag: system audit report has no Object section")
++}
++
++// ---------------------------------------------------------------- transport
++
++func (c *Client) do(ctx context.Context, operationID string, pathParams map[string]string, query url.Values, body, out any) error {
++	op, ok := c.contract.Operations[operationID]
++	if !ok {
++		return fmt.Errorf("%w: %s", ErrIncompleteContract, operationID)
++	}
++
++	path := op.Path
++	for name, value := range pathParams {
++		path = strings.ReplaceAll(path, "{"+name+"}", url.PathEscape(value))
++	}
++	target := c.baseURL + c.contract.BasePath + path
++	if len(query) > 0 {
++		target += "?" + query.Encode()
++	}
++
++	var reader io.Reader
++	var encoded []byte
++	if body != nil {
++		var err error
++		if encoded, err = json.Marshal(body); err != nil {
++			return fmt.Errorf("opsdiag: encode %s request: %w", operationID, err)
++		}
++		reader = bytes.NewReader(encoded)
++	}
++
++	req, err := http.NewRequestWithContext(ctx, op.Method, target, reader)
++	if err != nil {
++		return fmt.Errorf("opsdiag: build %s request: %w", operationID, err)
++	}
++	req.Header.Set(c.authHdr, c.authVal)
++	req.Header.Set("Accept", "application/json")
++	if encoded != nil {
++		req.Header.Set("Content-Type", "application/json")
++	}
++
++	resp, err := c.hc.Do(req)
++	if err != nil {
++		return fmt.Errorf("opsdiag: %s: %w", operationID, err)
++	}
++	defer resp.Body.Close()
++
++	payload, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return fmt.Errorf("opsdiag: read %s response: %w", operationID, err)
++	}
++	if resp.StatusCode != http.StatusOK {
++		return fmt.Errorf("opsdiag: %s returned %s: %s",
++			operationID, resp.Status, strings.TrimSpace(string(payload)))
++	}
++	if err := json.Unmarshal(payload, out); err != nil {
++		return fmt.Errorf("opsdiag: decode %s response: %w", operationID, err)
++	}
++	return nil
++}
++
++func boolPtr(v bool) *bool { return &v }
+diff -Nru a/opsdiag/opsdiag_test.go b/opsdiag/opsdiag_test.go
+--- a/opsdiag/opsdiag_test.go	1969-12-31 18:00:00.000000000 -0600
++++ b/opsdiag/opsdiag_test.go	2026-08-04 14:12:37.640857113 -0500
+@@ -0,0 +1,201 @@
++package opsdiag_test
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"reflect"
++	"testing"
++
++	"vcfops/internal/opsmock"
++	"vcfops/opsdiag"
++)
++
++const resourceID = "9d3a1f52-77b0-4c1e-9a44-0f9b2c7e51ad"
++
++func dial(t *testing.T, fixtureSet string) (*opsdiag.Client, *opsmock.Server) {
++	t.Helper()
++	srv, err := opsmock.New(opsmock.ContractPath(), fixtureSet)
++	if err != nil {
++		t.Fatalf("opsmock.New(%q): %v", fixtureSet, err)
++	}
++	t.Cleanup(srv.Close)
++
++	contract, err := opsdiag.LoadContract(opsmock.ContractPath())
++	if err != nil {
++		t.Fatalf("LoadContract: %v", err)
++	}
++	client, err := opsdiag.NewClient(srv.URL(), opsmock.Token, contract, nil)
++	if err != nil {
++		t.Fatalf("NewClient: %v", err)
++	}
++	return client, srv
++}
++
++func TestDiagnoseRootCause(t *testing.T) {
++	t.Parallel()
++
++	cases := []struct {
++		name        string
++		fixture     string
++		wantCause   string
++		wantAlert   string
++		wantSymptom string
++		wantStalled int
++	}{
++		{
++			name:        "credential rejected",
++			fixture:     "adapter-credential-rejected",
++			wantCause:   opsdiag.RootCauseCredentialRejected,
++			wantAlert:   "3c9e0a41-2b77-4a83-9c14-6d0f5b21e7aa",
++			wantSymptom: "SystemAdapterInstanceCredentialFailure",
++			wantStalled: 202,
++		},
++		{
++			name:        "collector offline",
++			fixture:     "collector-offline",
++			wantCause:   opsdiag.RootCauseCollectorOffline,
++			wantAlert:   "b8e14f27-9c03-4d6a-a1f5-2e70bd394c88",
++			wantSymptom: "SystemCollectorDown",
++			wantStalled: 1204,
++		},
++		{
++			name:        "monitoring stopped",
++			fixture:     "monitoring-stopped",
++			wantCause:   opsdiag.RootCauseMonitoringStopped,
++			wantAlert:   "5f8b2c14-90d7-4a63-b1e8-0c6749a3f582",
++			wantSymptom: "SystemAdapterInstanceMonitoringStopped",
++			wantStalled: 200,
++		},
++		{
++			name:        "unclassified root symptom",
++			fixture:     "unclassified-root-symptom",
++			wantCause:   opsdiag.RootCauseUnclassified,
++			wantAlert:   "7c3d9b60-1e48-4fa2-85d3-b9026ce41f7a",
++			wantSymptom: "SystemHostCpuContention",
++			wantStalled: 6,
++		},
++		{
++			name:        "no active alerts",
++			fixture:     "no-active-alerts",
++			wantCause:   opsdiag.RootCauseNoActiveAlerts,
++			wantStalled: 0,
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			client, _ := dial(t, tc.fixture)
++
++			got, err := client.Diagnose(context.Background(), resourceID)
++			if err != nil {
++				t.Fatalf("Diagnose: %v", err)
++			}
++			if got.RootCause != tc.wantCause {
++				t.Errorf("RootCause = %q, want %q", got.RootCause, tc.wantCause)
++			}
++			if got.AlertID != tc.wantAlert {
++				t.Errorf("AlertID = %q, want %q", got.AlertID, tc.wantAlert)
++			}
++			if got.RootSymptomDefinitionID != tc.wantSymptom {
++				t.Errorf("RootSymptomDefinitionID = %q, want %q",
++					got.RootSymptomDefinitionID, tc.wantSymptom)
++			}
++			if got.ObjectsNotCollecting != tc.wantStalled {
++				t.Errorf("ObjectsNotCollecting = %d, want %d",
++					got.ObjectsNotCollecting, tc.wantStalled)
++			}
++		})
++	}
++}
++
++func TestQueryBodiesOmitUnsetFields(t *testing.T) {
++	t.Parallel()
++
++	cases := []struct {
++		name        string
++		operationID string
++		want        map[string]any
++	}{
++		{
++			name:        "alert query",
++			operationID: "queryAlert",
++			want: map[string]any{
++				"resource-query":    map[string]any{"resourceId": []any{resourceID}},
++				"activeOnly":        true,
++				"alertCriticality":  []any{"CRITICAL", "IMMEDIATE"},
++				"compositeOperator": "AND",
++			},
++		},
++		{
++			// activeOnly is false and must still be transmitted, otherwise the
++			// query quietly reverts to its active-only default.
++			name:        "symptom query",
++			operationID: "querySymptoms",
++			want: map[string]any{
++				"resource-query":    map[string]any{"resourceId": []any{resourceID}},
++				"activeOnly":        false,
++				"includeAlarmInfo":  true,
++				"compositeOperator": "AND",
++			},
++		},
++	}
++
++	client, srv := dial(t, "adapter-credential-rejected")
++	if _, err := client.Diagnose(context.Background(), resourceID); err != nil {
++		t.Fatalf("Diagnose: %v", err)
++	}
++	recorded := map[string]opsmock.Request{}
++	for _, r := range srv.Requests() {
++		recorded[r.OperationID] = r
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			r, ok := recorded[tc.operationID]
++			if !ok {
++				t.Fatalf("%s was never called", tc.operationID)
++			}
++			if got := r.Header.Get("Content-Type"); got != "application/json" {
++				t.Errorf("Content-Type = %q, want application/json", got)
++			}
++			var got map[string]any
++			if err := json.Unmarshal(r.Body, &got); err != nil {
++				t.Fatalf("body is not a JSON object: %v (%s)", err, r.Body)
++			}
++			if !reflect.DeepEqual(got, tc.want) {
++				t.Errorf("body mismatch\n got: %v\nwant: %v", got, tc.want)
++			}
++		})
++	}
++}
++
++func TestOnlyContractOperationsAreCalled(t *testing.T) {
++	t.Parallel()
++
++	for _, set := range opsmock.FixtureSets() {
++		t.Run(set, func(t *testing.T) {
++			t.Parallel()
++			client, srv := dial(t, set)
++			if _, err := client.Diagnose(context.Background(), resourceID); err != nil {
++				t.Fatalf("Diagnose: %v", err)
++			}
++			reqs := srv.Requests()
++			if len(reqs) == 0 {
++				t.Fatal("Diagnose issued no requests")
++			}
++			for _, r := range reqs {
++				if r.OperationID == "" {
++					t.Errorf("%s %s matches no contract operation", r.Method, r.Path)
++				}
++				if r.Status != http.StatusOK {
++					t.Errorf("%s answered %d, want 200", r.OperationID, r.Status)
++				}
++				if r.Method == http.MethodGet && len(r.Body) != 0 {
++					t.Errorf("%s sent a body on a GET: %s", r.OperationID, r.Body)
++				}
++			}
++		})
++	}
++}

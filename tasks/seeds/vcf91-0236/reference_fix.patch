@@ -1,0 +1,614 @@
+--- a/SddcLcmSupportBundleClient.java
++++ b/SddcLcmSupportBundleClient.java
+@@ -1,6 +1,18 @@
++import java.io.IOException;
++import java.net.URI;
++import java.net.URISyntaxException;
+ import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
+ import java.time.Duration;
++import java.time.Instant;
++import java.time.format.DateTimeParseException;
++import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Map;
+ 
+ /**
+  * Single-file, dependency-free client for the focused VCF 9.1 SDDC LCM support-bundle contract.
+@@ -223,17 +235,114 @@
+         }
+     }
+ 
++    private final String origin;
++    private final String token;
++    private final String correlationId;
++    private final Duration pollInterval;
++    private final Duration pollTimeout;
++    private final HttpClient httpClient;
++
+     /**
+      * Validates the configuration and builds a client. Nothing is sent from this call.
+      *
+      * @throws IllegalArgumentException if the configuration is unusable
+      */
+     public static SddcLcmSupportBundleClient create(Config config) {
+-        throw new UnsupportedOperationException("not implemented");
++        if (config == null) {
++            throw new IllegalArgumentException("config is required");
++        }
++        String origin = originOf(config.baseUrl());
++
++        String token = config.token();
++        if (token == null || token.isBlank()) {
++            throw new IllegalArgumentException("token is required");
++        }
++        rejectControlCharacters("token", token);
++
++        String correlationId = config.correlationId();
++        if (correlationId != null && correlationId.isEmpty()) {
++            correlationId = null;
++        }
++        if (correlationId != null) {
++            rejectControlCharacters("correlationId", correlationId);
++        }
++
++        Duration pollInterval = positive("pollInterval", config.pollInterval(), DEFAULT_POLL_INTERVAL);
++        Duration pollTimeout = positive("pollTimeout", config.pollTimeout(), DEFAULT_POLL_TIMEOUT);
++
++        HttpClient httpClient = config.httpClient();
++        if (httpClient == null) {
++            httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build();
++        }
++        return new SddcLcmSupportBundleClient(
++                origin, token, correlationId, pollInterval, pollTimeout, httpClient);
+     }
+ 
+-    private SddcLcmSupportBundleClient() {
+-        // TODO: retain the validated configuration.
++    private SddcLcmSupportBundleClient(
++            String origin,
++            String token,
++            String correlationId,
++            Duration pollInterval,
++            Duration pollTimeout,
++            HttpClient httpClient) {
++        this.origin = origin;
++        this.token = token;
++        this.correlationId = correlationId;
++        this.pollInterval = pollInterval;
++        this.pollTimeout = pollTimeout;
++        this.httpClient = httpClient;
++    }
++
++    private static String originOf(String baseUrl) {
++        if (baseUrl == null || baseUrl.isBlank()) {
++            throw new IllegalArgumentException("baseUrl is required");
++        }
++        URI uri;
++        try {
++            uri = new URI(baseUrl.trim());
++        } catch (URISyntaxException e) {
++            throw new IllegalArgumentException("baseUrl is not a valid URL", e);
++        }
++        String scheme = uri.getScheme();
++        if (scheme == null || !(scheme.equalsIgnoreCase("http") || scheme.equalsIgnoreCase("https"))) {
++            throw new IllegalArgumentException("baseUrl must be an absolute http or https URL");
++        }
++        if (uri.getHost() == null || uri.getHost().isEmpty()) {
++            throw new IllegalArgumentException("baseUrl must carry a host");
++        }
++        if (uri.getRawUserInfo() != null) {
++            throw new IllegalArgumentException("baseUrl must not carry userinfo");
++        }
++        if (uri.getRawQuery() != null) {
++            throw new IllegalArgumentException("baseUrl must not carry a query string");
++        }
++        if (uri.getRawFragment() != null) {
++            throw new IllegalArgumentException("baseUrl must not carry a fragment");
++        }
++        String path = uri.getRawPath();
++        if (path != null && !path.isEmpty() && !path.equals("/")) {
++            throw new IllegalArgumentException("baseUrl must not carry a path");
++        }
++        return scheme.toLowerCase(java.util.Locale.ROOT) + "://" + uri.getRawAuthority();
++    }
++
++    private static void rejectControlCharacters(String what, String value) {
++        for (int i = 0; i < value.length(); i++) {
++            char c = value.charAt(i);
++            if (c < 0x20 || c == 0x7f) {
++                throw new IllegalArgumentException(what + " must not contain control characters");
++            }
++        }
++    }
++
++    private static Duration positive(String what, Duration value, Duration fallback) {
++        if (value == null) {
++            return fallback;
++        }
++        if (value.isZero() || value.isNegative()) {
++            throw new IllegalArgumentException(what + " must be positive");
++        }
++        return value;
+     }
+ 
+     /**
+@@ -241,6 +350,473 @@
+      * a terminal status before reading its result.
+      */
+     public CollectionReport collect(CollectionPlan plan) throws CollectionException {
+-        throw new UnsupportedOperationException("not implemented");
++        if (plan == null) {
++            throw new IllegalArgumentException("plan is required");
++        }
++        List<ComponentOutcome> outcomes = new ArrayList<>();
++        for (ComponentRequest request : plan.components()) {
++            outcomes.add(collectOne(request, plan.retainNewestPerComponent(), outcomes));
++        }
++        return new CollectionReport(outcomes);
++    }
++
++    private ComponentOutcome collectOne(
++            ComponentRequest request, int retain, List<ComponentOutcome> completed)
++            throws CollectionException {
++
++        String componentId = request.componentId();
++        String bundlesPath = "/v1/components/" + segment(componentId) + "/support-bundles";
++
++        HttpRequest generate =
++                authorized(bundlesPath, true)
++                        .header("Content-Type", "application/json")
++                        .POST(HttpRequest.BodyPublishers.ofString(
++                                supportBundleSpec(request.lookBackWindow()), StandardCharsets.UTF_8))
++                        .build();
++        Object accepted =
++                exchange(
++                        generate, OP_GENERATE_COMPONENT_SUPPORT_BUNDLE, componentId, 202, completed);
++
++        String taskId = J.string(J.get(accepted, "id"));
++        if (taskId == null || taskId.isEmpty()) {
++            throw new SddcLcmProtocolException(
++                    OP_GENERATE_COMPONENT_SUPPORT_BUNDLE, componentId, "no task id", report(completed));
++        }
++
++        Object terminal = driveToTerminal(componentId, taskId, completed);
++        String status = J.string(J.get(terminal, "status"));
++
++        if (!STATUS_SUCCEEDED.equals(status)) {
++            String[] failure = describeFailure(terminal);
++            return new ComponentOutcome(
++                    componentId, taskId, status, null, failure[0], failure[1], List.of());
++        }
++
++        Object listing =
++                exchange(
++                        authorized(bundlesPath, false).GET().build(),
++                        OP_GET_COMPONENT_SUPPORT_BUNDLES,
++                        componentId,
++                        200,
++                        completed);
++
++        List<BundleRef> ordered = newestFirst(listing);
++        if (ordered.isEmpty()) {
++            throw new SddcLcmProtocolException(
++                    OP_GET_COMPONENT_SUPPORT_BUNDLES,
++                    componentId,
++                    "no bundle after a SUCCEEDED generation task",
++                    report(completed));
++        }
++
++        List<String> pruned = new ArrayList<>();
++        if (retain > 0 && ordered.size() > retain) {
++            for (int i = ordered.size() - 1; i >= retain; i--) {
++                String bundleId = ordered.get(i).id();
++                String deletePath = bundlesPath + "/" + segment(bundleId);
++                HttpRequest delete =
++                        authorized(deletePath, true)
++                                .method("DELETE", HttpRequest.BodyPublishers.noBody())
++                                .build();
++                Object deleteTask =
++                        exchange(
++                                delete, OP_DELETE_COMPONENT_SUPPORT_BUNDLE, componentId, 202, completed);
++                String deleteTaskId = J.string(J.get(deleteTask, "id"));
++                if (deleteTaskId == null || deleteTaskId.isEmpty()) {
++                    throw new SddcLcmProtocolException(
++                            OP_DELETE_COMPONENT_SUPPORT_BUNDLE, componentId, "no task id", report(completed));
++                }
++                driveToTerminal(componentId, deleteTaskId, completed);
++                pruned.add(bundleId);
++            }
++        }
++
++        return new ComponentOutcome(
++                componentId, taskId, status, ordered.get(0), null, null, pruned);
++    }
++
++    /**
++     * Polls {@code getTask} until the task reports a terminal status, waiting {@link #pollInterval}
++     * between polls and giving up once {@link #pollTimeout} has passed.
++     */
++    private Object driveToTerminal(String componentId, String taskId, List<ComponentOutcome> completed)
++            throws CollectionException {
++
++        String taskPath = "/v1/tasks/" + segment(taskId);
++        long deadline = System.nanoTime() + pollTimeout.toNanos();
++        while (true) {
++            Object task =
++                    exchange(
++                            authorized(taskPath, false).GET().build(),
++                            OP_GET_TASK,
++                            componentId,
++                            200,
++                            completed);
++            String status = J.string(J.get(task, "status"));
++            if (status == null || status.isEmpty()) {
++                throw new SddcLcmProtocolException(
++                        OP_GET_TASK, componentId, "task carries no status", report(completed));
++            }
++            if (isTerminal(status)) {
++                return task;
++            }
++            if (!isContinuing(status)) {
++                throw new SddcLcmProtocolException(
++                        OP_GET_TASK, componentId, "unknown task status", report(completed));
++            }
++            long remaining = deadline - System.nanoTime();
++            if (remaining <= 0) {
++                throw new TaskPollTimeoutException(
++                        componentId, taskId, status, pollTimeout, report(completed));
++            }
++            long sleepNanos = Math.min(pollInterval.toNanos(), remaining);
++            sleep(sleepNanos);
++            if (sleepNanos == remaining) {
++                throw new TaskPollTimeoutException(
++                        componentId, taskId, status, pollTimeout, report(completed));
++            }
++        }
++    }
++
++    private static boolean isTerminal(String status) {
++        return STATUS_SUCCEEDED.equals(status)
++                || STATUS_FAILED.equals(status)
++                || STATUS_CANCELED.equals(status);
++    }
++
++    private static boolean isContinuing(String status) {
++        return STATUS_PENDING.equals(status)
++                || STATUS_SCHEDULED.equals(status)
++                || STATUS_RUNNING.equals(status);
++    }
++
++    private static void sleep(long nanos) {
++        try {
++            Thread.sleep(Duration.ofNanos(nanos));
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++            throw new IllegalStateException("interrupted while polling", e);
++        }
++    }
++
++    /** Reads the failing stage name and its first ERROR-level message from a terminal task. */
++    private static String[] describeFailure(Object task) {
++        for (Object stage : J.array(J.get(task, "stages"))) {
++            if (!STATUS_FAILED.equals(J.string(J.get(stage, "status")))) {
++                continue;
++            }
++            String name = J.string(J.get(stage, "name"));
++            for (Object message : J.array(J.get(stage, "messages"))) {
++                if ("ERROR".equals(J.string(J.get(message, "level")))) {
++                    return new String[] {name, J.string(J.get(message, "message", "defaultMessage"))};
++                }
++            }
++            return new String[] {name, null};
++        }
++        return new String[] {null, null};
++    }
++
++    /** Orders a SupportBundle listing newest first, keeping reply order among equal timestamps. */
++    private static List<BundleRef> newestFirst(Object listing) {
++        List<BundleRef> bundles = new ArrayList<>();
++        for (Object entry : J.array(listing)) {
++            bundles.add(
++                    new BundleRef(
++                            J.string(J.get(entry, "id")),
++                            J.string(J.get(entry, "name")),
++                            J.longValue(J.get(entry, "size")),
++                            J.string(J.get(entry, "createdTimestamp")),
++                            J.string(J.get(entry, "url"))));
++        }
++        bundles.sort(Comparator.comparing(SddcLcmSupportBundleClient::instantOf).reversed());
++        return bundles;
++    }
++
++    private static Instant instantOf(BundleRef bundle) {
++        String raw = bundle.createdTimestamp();
++        if (raw == null || raw.isEmpty()) {
++            return Instant.EPOCH;
++        }
++        try {
++            return Instant.parse(raw);
++        } catch (DateTimeParseException e) {
++            return Instant.EPOCH;
++        }
++    }
++
++    /** ComponentSupportBundleSpec: an unset lookBackWindow is absent, an explicit zero survives. */
++    private static String supportBundleSpec(Integer lookBackWindow) {
++        return lookBackWindow == null ? "{}" : "{\"lookBackWindow\":" + lookBackWindow + "}";
++    }
++
++    /**
++     * Starts a request that carries the bearer scheme the specification declares. {@code correlated}
++     * marks the two operations on which the specification declares the optional {@code
++     * X-Correlation-Id} header; it is sent only when a correlation id was configured.
++     */
++    private HttpRequest.Builder authorized(String path, boolean correlated) {
++        HttpRequest.Builder builder =
++                HttpRequest.newBuilder(URI.create(origin + SERVICE_BASE_PATH + path))
++                        .header("Authorization", "Bearer " + token)
++                        .header("Accept", "application/json");
++        if (correlated && correlationId != null) {
++            builder.header("X-Correlation-Id", correlationId);
++        }
++        return builder;
++    }
++
++    /** Sends a request, enforcing the single status the contract documents as success. */
++    private Object exchange(
++            HttpRequest request,
++            String operationId,
++            String componentId,
++            int successStatus,
++            List<ComponentOutcome> completed)
++            throws CollectionException {
++
++        HttpResponse<String> response;
++        try {
++            response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++        } catch (IOException e) {
++            throw new SddcLcmTransportException(operationId, componentId, report(completed), e);
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++            throw new SddcLcmTransportException(operationId, componentId, report(completed), e);
++        }
++
++        if (response.statusCode() != successStatus) {
++            Object error = parseQuietly(response.body());
++            throw new SddcLcmApiException(
++                    operationId,
++                    componentId,
++                    response.statusCode(),
++                    J.string(J.get(error, "code")),
++                    J.string(J.get(error, "message", "defaultMessage")),
++                    J.string(J.get(error, "referenceId")),
++                    report(completed));
++        }
++        try {
++            return J.parse(response.body());
++        } catch (RuntimeException e) {
++            throw new SddcLcmProtocolException(
++                    operationId, componentId, "reply is not JSON", report(completed));
++        }
++    }
++
++    private static Object parseQuietly(String body) {
++        try {
++            return J.parse(body);
++        } catch (RuntimeException e) {
++            return null;
++        }
++    }
++
++    private static CollectionReport report(List<ComponentOutcome> completed) {
++        return new CollectionReport(completed);
++    }
++
++    /** Percent-encodes anything outside the unreserved set so a value cannot escape its segment. */
++    private static String segment(String raw) {
++        StringBuilder out = new StringBuilder(raw.length());
++        for (byte b : raw.getBytes(StandardCharsets.UTF_8)) {
++            int c = b & 0xff;
++            boolean unreserved =
++                    (c >= 'A' && c <= 'Z')
++                            || (c >= 'a' && c <= 'z')
++                            || (c >= '0' && c <= '9')
++                            || c == '-'
++                            || c == '.'
++                            || c == '_'
++                            || c == '~';
++            if (unreserved) {
++                out.append((char) c);
++            } else {
++                out.append('%').append(String.format("%02X", c));
++            }
++        }
++        return out.toString();
++    }
++
++    // ------------------------------------------------------------------ minimal JSON reader
++
++    private static final class J {
++
++        private final String text;
++        private int at;
++
++        private J(String text) {
++            this.text = text;
++        }
++
++        static Object parse(String text) {
++            J json = new J(text);
++            json.ws();
++            Object value = json.value();
++            json.ws();
++            if (json.at != text.length()) {
++                throw new IllegalArgumentException("trailing content");
++            }
++            return value;
++        }
++
++        static Object get(Object node, String... path) {
++            Object current = node;
++            for (String key : path) {
++                if (!(current instanceof Map<?, ?> map)) {
++                    return null;
++                }
++                current = map.get(key);
++            }
++            return current;
++        }
++
++        static String string(Object node) {
++            return node instanceof String s ? s : null;
++        }
++
++        static long longValue(Object node) {
++            if (node instanceof Long l) {
++                return l;
++            }
++            if (node instanceof Double d) {
++                return d.longValue();
++            }
++            return 0L;
++        }
++
++        static List<?> array(Object node) {
++            return node instanceof List<?> list ? list : List.of();
++        }
++
++        private void ws() {
++            while (at < text.length() && Character.isWhitespace(text.charAt(at))) {
++                at++;
++            }
++        }
++
++        private Object value() {
++            if (at >= text.length()) {
++                throw new IllegalArgumentException("unexpected end of input");
++            }
++            return switch (text.charAt(at)) {
++                case '{' -> object();
++                case '[' -> array();
++                case '"' -> string();
++                case 't' -> literal("true", Boolean.TRUE);
++                case 'f' -> literal("false", Boolean.FALSE);
++                case 'n' -> literal("null", null);
++                default -> number();
++            };
++        }
++
++        private Object literal(String token, Object result) {
++            if (!text.startsWith(token, at)) {
++                throw new IllegalArgumentException("bad literal");
++            }
++            at += token.length();
++            return result;
++        }
++
++        private Map<String, Object> object() {
++            Map<String, Object> out = new LinkedHashMap<>();
++            at++;
++            ws();
++            if (at < text.length() && text.charAt(at) == '}') {
++                at++;
++                return out;
++            }
++            while (true) {
++                ws();
++                String key = string();
++                ws();
++                expect(':');
++                ws();
++                out.put(key, value());
++                ws();
++                if (at < text.length() && text.charAt(at) == ',') {
++                    at++;
++                    continue;
++                }
++                expect('}');
++                return out;
++            }
++        }
++
++        private List<Object> array() {
++            List<Object> out = new ArrayList<>();
++            at++;
++            ws();
++            if (at < text.length() && text.charAt(at) == ']') {
++                at++;
++                return out;
++            }
++            while (true) {
++                ws();
++                out.add(value());
++                ws();
++                if (at < text.length() && text.charAt(at) == ',') {
++                    at++;
++                    continue;
++                }
++                expect(']');
++                return out;
++            }
++        }
++
++        private String string() {
++            expect('"');
++            StringBuilder out = new StringBuilder();
++            while (true) {
++                if (at >= text.length()) {
++                    throw new IllegalArgumentException("unterminated string");
++                }
++                char c = text.charAt(at++);
++                if (c == '"') {
++                    return out.toString();
++                }
++                if (c != '\\') {
++                    out.append(c);
++                    continue;
++                }
++                char esc = text.charAt(at++);
++                switch (esc) {
++                    case '"' -> out.append('"');
++                    case '\\' -> out.append('\\');
++                    case '/' -> out.append('/');
++                    case 'b' -> out.append('\b');
++                    case 'f' -> out.append('\f');
++                    case 'n' -> out.append('\n');
++                    case 'r' -> out.append('\r');
++                    case 't' -> out.append('\t');
++                    case 'u' -> {
++                        out.append((char) Integer.parseInt(text.substring(at, at + 4), 16));
++                        at += 4;
++                    }
++                    default -> throw new IllegalArgumentException("bad escape");
++                }
++            }
++        }
++
++        private Object number() {
++            int start = at;
++            while (at < text.length() && "+-.eE0123456789".indexOf(text.charAt(at)) >= 0) {
++                at++;
++            }
++            String token = text.substring(start, at);
++            if (token.isEmpty()) {
++                throw new IllegalArgumentException("bad value");
++            }
++            if (token.contains(".") || token.contains("e") || token.contains("E")) {
++                return Double.parseDouble(token);
++            }
++            return Long.parseLong(token);
++        }
++
++        private void expect(char c) {
++            if (at >= text.length() || text.charAt(at) != c) {
++                throw new IllegalArgumentException("expected '" + c + "'");
++            }
++            at++;
++        }
+     }
+ }

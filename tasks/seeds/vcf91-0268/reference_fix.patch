@@ -1,0 +1,850 @@
+diff --git a/docs/contract.json b/docs/contract.json
+new file mode 100644
+index 0000000..1d86d86
+--- /dev/null
++++ b/docs/contract.json
+@@ -0,0 +1,79 @@
++{
++  "spec": {
++    "repository": "https://github.com/vmware/vcf-api-specs",
++    "path": "specifications/vcf-operations/vcf-operations-openapi.json",
++    "commit": "c3f3b52c845dd967cabbc21680e893292077d5ba",
++    "title": "VMware Cloud Foundation Operations API",
++    "version": "9.1.0.0"
++  },
++  "basePath": "/suite-api",
++  "securityScheme": {
++    "name": "Authorization",
++    "in": "header",
++    "type": "apiKey"
++  },
++  "operations": [
++    {
++      "operationId": "acquireToken",
++      "method": "POST",
++      "path": "/api/auth/token/acquire",
++      "authenticated": false,
++      "successStatus": 200,
++      "requestSchema": "username-password",
++      "responseSchema": "auth-token"
++    },
++    {
++      "operationId": "getResources",
++      "method": "GET",
++      "path": "/api/resources",
++      "authenticated": true,
++      "successStatus": 200,
++      "responseSchema": "resources",
++      "queryParams": [
++        "adapterKind",
++        "name",
++        "page",
++        "pageSize",
++        "resourceKind"
++      ]
++    },
++    {
++      "operationId": "addResourcesProperties",
++      "method": "POST",
++      "path": "/api/resources/properties",
++      "authenticated": true,
++      "successStatus": 200,
++      "requestSchema": "resources-property-contents"
++    }
++  ],
++  "schemas": {
++    "username-password": {
++      "required": ["password", "username"],
++      "optional": ["authSource"]
++    },
++    "auth-token": {
++      "required": ["token", "validity"],
++      "optional": ["expiresAt", "roles"]
++    },
++    "resources": {
++      "required": [],
++      "optional": ["links", "pageInfo", "resourceList"]
++    },
++    "resources-property-contents": {
++      "required": [],
++      "optional": ["values"]
++    },
++    "resource-property-contents": {
++      "required": ["property-contents", "resourceId"],
++      "optional": []
++    },
++    "property-contents": {
++      "required": ["property-content"],
++      "optional": []
++    },
++    "property-content": {
++      "required": ["statKey", "timestamps"],
++      "optional": ["data", "values"]
++    }
++  }
++}
+diff --git a/docs/official_sources.json b/docs/official_sources.json
+new file mode 100644
+index 0000000..24ac38e
+--- /dev/null
++++ b/docs/official_sources.json
+@@ -0,0 +1,17 @@
++{
++  "sources": [
++    {
++      "repository": "https://github.com/vmware/vcf-api-specs",
++      "license": "Apache-2.0",
++      "path": "specifications/vcf-operations/vcf-operations-openapi.json",
++      "commit": "c3f3b52c845dd967cabbc21680e893292077d5ba",
++      "url": "https://github.com/vmware/vcf-api-specs/blob/c3f3b52c845dd967cabbc21680e893292077d5ba/specifications/vcf-operations/vcf-operations-openapi.json",
++      "specVersion": "9.1.0.0",
++      "operationIds": [
++        "acquireToken",
++        "getResources",
++        "addResourcesProperties"
++      ]
++    }
++  ]
++}
+diff --git a/vcfops/vcfops.go b/vcfops/vcfops.go
+index 83ec6fe..1c046da 100644
+--- a/vcfops/vcfops.go
++++ b/vcfops/vcfops.go
+@@ -1,39 +1,412 @@
+ // Package vcfops is a client for the VMware Cloud Foundation Operations API.
++//
++// The routes, schemas and required/optional property sets it puts on the wire
++// are the ones recorded in docs/contract.json, which is derived from the
++// VMware Cloud Foundation Operations OpenAPI document.
+ package vcfops
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strconv"
++	"strings"
++	"sync"
+ 
+ 	"vcfops.local/opssync/opsapi"
+ )
+ 
+-var errNotImplemented = errors.New("vcfops: not implemented")
++// Routes contracted in docs/contract.json.
++const (
++	basePath = "/suite-api"
++
++	pathAcquireToken       = basePath + "/api/auth/token/acquire"
++	pathResources          = basePath + "/api/resources"
++	pathResourceProperties = basePath + "/api/resources/properties"
++
++	// authScheme is the credential scheme carried in the Authorization header
++	// the specification's apiKey security scheme names.
++	authScheme = "OpsToken"
++)
+ 
+ // Client talks to one VCF Operations appliance. It is safe for concurrent use
+ // by multiple goroutines.
+ type Client struct {
+-	cfg opsapi.Config
++	baseURL    string
++	username   string
++	password   string
++	authSource string
++	httpClient *http.Client
++
++	// tokenMu guards the cached credential. It is held across an acquisition so
++	// that concurrent callers reacting to the same expiry refresh once rather
++	// than once each.
++	tokenMu    sync.Mutex
++	token      string
++	generation uint64
++
++	statsMu sync.Mutex
++	stats   opsapi.Stats
+ }
+ 
+ // New builds a client from cfg. It performs no network I/O.
+ func New(cfg opsapi.Config) (*Client, error) {
+-	return nil, errNotImplemented
++	base := strings.TrimSuffix(strings.TrimSpace(cfg.BaseURL), "/")
++	if base == "" {
++		return nil, errors.New("vcfops: Config.BaseURL is empty")
++	}
++	parsed, err := url.Parse(base)
++	if err != nil {
++		return nil, fmt.Errorf("vcfops: parse Config.BaseURL: %w", err)
++	}
++	if parsed.Scheme == "" || parsed.Host == "" {
++		return nil, fmt.Errorf("vcfops: Config.BaseURL %q needs a scheme and a host", cfg.BaseURL)
++	}
++	if cfg.Username == "" {
++		return nil, errors.New("vcfops: Config.Username is empty")
++	}
++	if cfg.Password == "" {
++		return nil, errors.New("vcfops: Config.Password is empty")
++	}
++
++	httpClient := cfg.HTTPClient
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++
++	return &Client{
++		baseURL:    base,
++		username:   cfg.Username,
++		password:   cfg.Password,
++		authSource: cfg.AuthSource,
++		httpClient: httpClient,
++	}, nil
++}
++
++// Stats reports what this client has done so far.
++func (c *Client) Stats() opsapi.Stats {
++	c.statsMu.Lock()
++	defer c.statsMu.Unlock()
++	return c.stats
++}
++
++func (c *Client) record(update func(*opsapi.Stats)) {
++	c.statsMu.Lock()
++	defer c.statsMu.Unlock()
++	update(&c.stats)
++}
++
++// credentials is the username-password schema. authSource is optional, so it
++// carries omitempty: an unset auth source must not reach the wire at all.
++type credentials struct {
++	Username   string `json:"username"`
++	Password   string `json:"password"`
++	AuthSource string `json:"authSource,omitempty"`
++}
++
++// authToken is the auth-token schema.
++type authToken struct {
++	Token     string   `json:"token"`
++	Validity  int64    `json:"validity"`
++	ExpiresAt string   `json:"expiresAt"`
++	Roles     []string `json:"roles"`
++}
++
++// resourcesPage is the resources schema.
++type resourcesPage struct {
++	Links []struct {
++		Href string `json:"href"`
++		Rel  string `json:"rel"`
++	} `json:"links"`
++	PageInfo struct {
++		Page       int `json:"page"`
++		PageSize   int `json:"pageSize"`
++		TotalCount int `json:"totalCount"`
++	} `json:"pageInfo"`
++	ResourceList []struct {
++		Identifier  string `json:"identifier"`
++		ResourceKey struct {
++			Name            string `json:"name"`
++			AdapterKindKey  string `json:"adapterKindKey"`
++			ResourceKindKey string `json:"resourceKindKey"`
++		} `json:"resourceKey"`
++	} `json:"resourceList"`
++}
++
++func (p resourcesPage) hasNext() bool {
++	for _, link := range p.Links {
++		if link.Rel == "NEXT" {
++			return true
++		}
++	}
++	return false
++}
++
++// propertyContent is the property-content schema. data and values are the two
++// optional properties and are mutually exclusive, so both carry omitempty.
++type propertyContent struct {
++	StatKey    string    `json:"statKey"`
++	Timestamps []int64   `json:"timestamps"`
++	Values     []string  `json:"values,omitempty"`
++	Data       []float64 `json:"data,omitempty"`
++}
++
++type propertyContents struct {
++	PropertyContent []propertyContent `json:"property-content"`
++}
++
++type resourcePropertyContents struct {
++	ResourceID       string           `json:"resourceId"`
++	PropertyContents propertyContents `json:"property-contents"`
++}
++
++type resourcesPropertyContents struct {
++	Values []resourcePropertyContents `json:"values,omitempty"`
+ }
+ 
+ // ListAllResources walks every page of the resource listing operation and
+ // returns the resources it collected, in server order.
+ func (c *Client) ListAllResources(ctx context.Context, filter opsapi.ResourceFilter) ([]opsapi.Resource, error) {
+-	return nil, errNotImplemented
++	var collected []opsapi.Resource
++
++	for page := 0; ; page++ {
++		query := url.Values{}
++		query.Set("page", strconv.Itoa(page))
++		if filter.PageSize != 0 {
++			query.Set("pageSize", strconv.Itoa(filter.PageSize))
++		}
++		for _, v := range filter.Name {
++			query.Add("name", v)
++		}
++		for _, v := range filter.AdapterKind {
++			query.Add("adapterKind", v)
++		}
++		for _, v := range filter.ResourceKind {
++			query.Add("resourceKind", v)
++		}
++
++		var decoded resourcesPage
++		if err := c.do(ctx, http.MethodGet, pathResources, query, nil, &decoded); err != nil {
++			return nil, err
++		}
++		c.record(func(s *opsapi.Stats) { s.ResourcePagesFetched++ })
++
++		for _, item := range decoded.ResourceList {
++			collected = append(collected, opsapi.Resource{
++				Identifier:      item.Identifier,
++				Name:            item.ResourceKey.Name,
++				AdapterKindKey:  item.ResourceKey.AdapterKindKey,
++				ResourceKindKey: item.ResourceKey.ResourceKindKey,
++			})
++		}
++
++		if !decoded.hasNext() {
++			return collected, nil
++		}
++	}
+ }
+ 
+ // PushProperties groups samples by resource, splits them into batches of at
+ // most batchSize resources, and posts each batch to the property operation.
+ func (c *Client) PushProperties(ctx context.Context, samples []opsapi.PropertySample, batchSize int) error {
+-	return errNotImplemented
++	if batchSize < 1 {
++		return fmt.Errorf("vcfops: batchSize %d must be at least 1", batchSize)
++	}
++	if len(samples) == 0 {
++		return nil
++	}
++
++	order := make([]string, 0, len(samples))
++	grouped := make(map[string][]propertyContent, len(samples))
++	for i, sample := range samples {
++		switch {
++		case sample.ResourceID == "":
++			return fmt.Errorf("vcfops: samples[%d] has no ResourceID", i)
++		case sample.StatKey == "":
++			return fmt.Errorf("vcfops: samples[%d] has no StatKey", i)
++		case len(sample.Timestamps) == 0:
++			return fmt.Errorf("vcfops: samples[%d] (%s) has no Timestamps", i, sample.StatKey)
++		case len(sample.Values) > 0 && len(sample.Data) > 0:
++			return fmt.Errorf("vcfops: samples[%d] (%s) sets both Values and Data", i, sample.StatKey)
++		case len(sample.Values) == 0 && len(sample.Data) == 0:
++			return fmt.Errorf("vcfops: samples[%d] (%s) sets neither Values nor Data", i, sample.StatKey)
++		}
++
++		if _, seen := grouped[sample.ResourceID]; !seen {
++			order = append(order, sample.ResourceID)
++		}
++		grouped[sample.ResourceID] = append(grouped[sample.ResourceID], propertyContent{
++			StatKey:    sample.StatKey,
++			Timestamps: append([]int64(nil), sample.Timestamps...),
++			Values:     append([]string(nil), sample.Values...),
++			Data:       append([]float64(nil), sample.Data...),
++		})
++	}
++
++	for start := 0; start < len(order); start += batchSize {
++		end := start + batchSize
++		if end > len(order) {
++			end = len(order)
++		}
++
++		payload := resourcesPropertyContents{Values: make([]resourcePropertyContents, 0, end-start)}
++		for _, id := range order[start:end] {
++			payload.Values = append(payload.Values, resourcePropertyContents{
++				ResourceID:       id,
++				PropertyContents: propertyContents{PropertyContent: grouped[id]},
++			})
++		}
++
++		body, err := json.Marshal(payload)
++		if err != nil {
++			return fmt.Errorf("vcfops: encode property batch: %w", err)
++		}
++		if err := c.do(ctx, http.MethodPost, pathResourceProperties, nil, body, nil); err != nil {
++			return err
++		}
++		c.record(func(s *opsapi.Stats) { s.PropertyBatchesSent++ })
++	}
++
++	return nil
+ }
+ 
+-// Stats reports what this client has done so far.
+-func (c *Client) Stats() opsapi.Stats {
+-	return opsapi.Stats{}
++// do performs one authenticated exchange. A rejected credential costs one
++// refresh and one replay of the same request; the caller's work is never
++// rebuilt or repeated.
++func (c *Client) do(ctx context.Context, method, path string, query url.Values, body []byte, out any) error {
++	token, generation, err := c.currentToken(ctx)
++	if err != nil {
++		return err
++	}
++
++	status, payload, err := c.send(ctx, method, path, query, body, token)
++	if err != nil {
++		return err
++	}
++
++	if status == http.StatusUnauthorized {
++		token, _, err = c.refreshToken(ctx, generation)
++		if err != nil {
++			return err
++		}
++		status, payload, err = c.send(ctx, method, path, query, body, token)
++		if err != nil {
++			return err
++		}
++	}
++
++	if status != http.StatusOK {
++		return fmt.Errorf("vcfops: %s %s: unexpected status %d", method, path, status)
++	}
++	if out == nil {
++		return nil
++	}
++	if err := json.Unmarshal(payload, out); err != nil {
++		return fmt.Errorf("vcfops: %s %s: decode response: %w", method, path, err)
++	}
++	return nil
++}
++
++// currentToken returns the cached credential, acquiring one on first use.
++func (c *Client) currentToken(ctx context.Context) (string, uint64, error) {
++	c.tokenMu.Lock()
++	defer c.tokenMu.Unlock()
++	if c.token == "" {
++		if err := c.acquireLocked(ctx); err != nil {
++			return "", 0, err
++		}
++	}
++	return c.token, c.generation, nil
++}
++
++// refreshToken replaces the credential that was current at stale. If another
++// goroutine already replaced it, that newer credential is returned instead of
++// acquiring a redundant one.
++func (c *Client) refreshToken(ctx context.Context, stale uint64) (string, uint64, error) {
++	c.tokenMu.Lock()
++	defer c.tokenMu.Unlock()
++	if c.generation != stale {
++		return c.token, c.generation, nil
++	}
++	if err := c.acquireLocked(ctx); err != nil {
++		return "", 0, err
++	}
++	return c.token, c.generation, nil
++}
++
++// acquireLocked runs the token acquisition operation. The caller holds tokenMu.
++func (c *Client) acquireLocked(ctx context.Context) error {
++	body, err := json.Marshal(credentials{
++		Username:   c.username,
++		Password:   c.password,
++		AuthSource: c.authSource,
++	})
++	if err != nil {
++		return fmt.Errorf("vcfops: encode credentials: %w", err)
++	}
++
++	// Token acquisition is unauthenticated, so it carries no credential.
++	status, payload, err := c.send(ctx, http.MethodPost, pathAcquireToken, nil, body, "")
++	if err != nil {
++		return err
++	}
++	if status != http.StatusOK {
++		return fmt.Errorf("vcfops: acquire token: unexpected status %d", status)
++	}
++
++	var decoded authToken
++	if err := json.Unmarshal(payload, &decoded); err != nil {
++		return fmt.Errorf("vcfops: acquire token: decode response: %w", err)
++	}
++	if decoded.Token == "" {
++		return errors.New("vcfops: acquire token: response carried no token")
++	}
++
++	c.token = decoded.Token
++	c.generation++
++	c.record(func(s *opsapi.Stats) { s.TokensAcquired++ })
++	return nil
++}
++
++// send issues one HTTP request and reads the whole response.
++func (c *Client) send(ctx context.Context, method, path string, query url.Values, body []byte, token string) (int, []byte, error) {
++	target := c.baseURL + path
++	if len(query) > 0 {
++		target += "?" + query.Encode()
++	}
++
++	var reader io.Reader
++	if body != nil {
++		reader = bytes.NewReader(body)
++	}
++	req, err := http.NewRequestWithContext(ctx, method, target, reader)
++	if err != nil {
++		return 0, nil, fmt.Errorf("vcfops: build %s %s: %w", method, path, err)
++	}
++
++	// The API serves XML unless JSON is negotiated explicitly.
++	req.Header.Set("Accept", "application/json")
++	if body != nil {
++		req.Header.Set("Content-Type", "application/json")
++	}
++	if token != "" {
++		req.Header.Set("Authorization", authScheme+" "+token)
++	}
++
++	resp, err := c.httpClient.Do(req)
++	if err != nil {
++		return 0, nil, fmt.Errorf("vcfops: %s %s: %w", method, path, err)
++	}
++	defer resp.Body.Close()
++
++	payload, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return 0, nil, fmt.Errorf("vcfops: %s %s: read response: %w", method, path, err)
++	}
++	return resp.StatusCode, payload, nil
+ }
+diff --git a/vcfops/vcfops_test.go b/vcfops/vcfops_test.go
+new file mode 100644
+index 0000000..cfc207b
+--- /dev/null
++++ b/vcfops/vcfops_test.go
+@@ -0,0 +1,311 @@
++package vcfops_test
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"reflect"
++	"strings"
++	"testing"
++
++	"vcfops.local/opssync/mock"
++	"vcfops.local/opssync/opsapi"
++	"vcfops.local/opssync/vcfops"
++)
++
++const contractPath = "../docs/contract.json"
++
++var fixture = []opsapi.Resource{
++	{Identifier: "11111111-1111-4111-8111-111111111111", Name: "esx-a", AdapterKindKey: "VMWARE", ResourceKindKey: "HostSystem"},
++	{Identifier: "22222222-2222-4222-8222-222222222222", Name: "esx-b", AdapterKindKey: "VMWARE", ResourceKindKey: "HostSystem"},
++	{Identifier: "33333333-3333-4333-8333-333333333333", Name: "vm-c", AdapterKindKey: "VMWARE", ResourceKindKey: "VirtualMachine"},
++	{Identifier: "44444444-4444-4444-8444-444444444444", Name: "vm-d", AdapterKindKey: "VMWARE", ResourceKindKey: "VirtualMachine"},
++	{Identifier: "55555555-5555-4555-8555-555555555555", Name: "edge-e", AdapterKindKey: "NSXTAdapter", ResourceKindKey: "EdgeNode"},
++}
++
++func client(t *testing.T, srv *mock.Server, authSource string) *vcfops.Client {
++	t.Helper()
++	c, err := vcfops.New(opsapi.Config{
++		BaseURL:    srv.URL(),
++		Username:   "admin",
++		Password:   "secret",
++		AuthSource: authSource,
++	})
++	if err != nil {
++		t.Fatalf("New: %v", err)
++	}
++	return c
++}
++
++func TestNewRejectsIncompleteConfig(t *testing.T) {
++	cases := []struct {
++		name string
++		cfg  opsapi.Config
++		want string
++	}{
++		{"no base url", opsapi.Config{Username: "u", Password: "p"}, "BaseURL"},
++		{"base url without scheme", opsapi.Config{BaseURL: "ops.lab", Username: "u", Password: "p"}, "scheme"},
++		{"no username", opsapi.Config{BaseURL: "https://ops.lab", Password: "p"}, "Username"},
++		{"no password", opsapi.Config{BaseURL: "https://ops.lab", Username: "u"}, "Password"},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			got, err := vcfops.New(tc.cfg)
++			if err == nil {
++				t.Fatalf("New(%+v) succeeded, want an error", tc.cfg)
++			}
++			if got != nil {
++				t.Errorf("New returned a client alongside the error")
++			}
++			if !strings.Contains(err.Error(), tc.want) {
++				t.Errorf("error %q does not mention %q", err, tc.want)
++			}
++		})
++	}
++}
++
++func TestListAllResourcesPagination(t *testing.T) {
++	cases := []struct {
++		name      string
++		filter    opsapi.ResourceFilter
++		wantPages int
++		wantNames []string
++	}{
++		{"single page by default", opsapi.ResourceFilter{}, 1, []string{"esx-a", "esx-b", "vm-c", "vm-d", "edge-e"}},
++		{"exact multiple", opsapi.ResourceFilter{PageSize: 5}, 1, []string{"esx-a", "esx-b", "vm-c", "vm-d", "edge-e"}},
++		{"uneven last page", opsapi.ResourceFilter{PageSize: 2}, 3, []string{"esx-a", "esx-b", "vm-c", "vm-d", "edge-e"}},
++		{"one per page", opsapi.ResourceFilter{PageSize: 1}, 5, []string{"esx-a", "esx-b", "vm-c", "vm-d", "edge-e"}},
++		{"filtered", opsapi.ResourceFilter{ResourceKind: []string{"HostSystem"}, PageSize: 1}, 2, []string{"esx-a", "esx-b"}},
++		{"no matches", opsapi.ResourceFilter{Name: []string{"absent"}}, 1, nil},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			srv := mock.Start(t, contractPath, mock.Script{Resources: fixture})
++			c := client(t, srv, "")
++
++			got, err := c.ListAllResources(context.Background(), tc.filter)
++			if err != nil {
++				t.Fatalf("ListAllResources: %v", err)
++			}
++			var names []string
++			for _, r := range got {
++				names = append(names, r.Name)
++			}
++			if !reflect.DeepEqual(names, tc.wantNames) {
++				t.Errorf("names = %v, want %v", names, tc.wantNames)
++			}
++			if n := len(srv.RequestsFor("getResources")); n != tc.wantPages {
++				t.Errorf("fetched %d pages, want %d", n, tc.wantPages)
++			}
++			if got := c.Stats().ResourcePagesFetched; got != tc.wantPages {
++				t.Errorf("Stats().ResourcePagesFetched = %d, want %d", got, tc.wantPages)
++			}
++		})
++	}
++}
++
++func TestOmittedOptionalFields(t *testing.T) {
++	cases := []struct {
++		name       string
++		authSource string
++		filter     opsapi.ResourceFilter
++		wantAuth   []string
++		wantQuery  []string
++	}{
++		{
++			name:      "nothing optional set",
++			filter:    opsapi.ResourceFilter{},
++			wantAuth:  []string{"password", "username"},
++			wantQuery: []string{"page"},
++		},
++		{
++			name:       "everything optional set",
++			authSource: "LOCAL",
++			filter:     opsapi.ResourceFilter{Name: []string{"esx-a"}, AdapterKind: []string{"VMWARE"}, ResourceKind: []string{"HostSystem"}, PageSize: 4},
++			wantAuth:   []string{"authSource", "password", "username"},
++			wantQuery:  []string{"adapterKind", "name", "page", "pageSize", "resourceKind"},
++		},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			srv := mock.Start(t, contractPath, mock.Script{Resources: fixture})
++			c := client(t, srv, tc.authSource)
++			if _, err := c.ListAllResources(context.Background(), tc.filter); err != nil {
++				t.Fatalf("ListAllResources: %v", err)
++			}
++
++			acquire := srv.RequestsFor("acquireToken")[0]
++			body, err := acquire.DecodeBody()
++			if err != nil {
++				t.Fatalf("%v", err)
++			}
++			if got := keysOf(body); !reflect.DeepEqual(got, tc.wantAuth) {
++				t.Errorf("acquireToken body keys = %v, want %v", got, tc.wantAuth)
++			}
++
++			list := srv.RequestsFor("getResources")[0]
++			var params []string
++			for name := range list.Query {
++				params = append(params, name)
++			}
++			if got := sorted(params); !reflect.DeepEqual(got, tc.wantQuery) {
++				t.Errorf("getResources query params = %v, want %v", got, tc.wantQuery)
++			}
++		})
++	}
++}
++
++func TestPushPropertiesRejectsMalformedSamples(t *testing.T) {
++	valid := opsapi.PropertySample{
++		ResourceID: fixture[0].Identifier,
++		StatKey:    "summary|state",
++		Timestamps: []int64{mock.ClockMillis},
++		Values:     []string{"UP"},
++	}
++	cases := []struct {
++		name      string
++		samples   []opsapi.PropertySample
++		batchSize int
++		want      string
++	}{
++		{"zero batch size", []opsapi.PropertySample{valid}, 0, "batchSize"},
++		{"missing resource id", []opsapi.PropertySample{{StatKey: "k", Timestamps: []int64{1}, Values: []string{"v"}}}, 1, "ResourceID"},
++		{"missing stat key", []opsapi.PropertySample{{ResourceID: "r", Timestamps: []int64{1}, Values: []string{"v"}}}, 1, "StatKey"},
++		{"missing timestamps", []opsapi.PropertySample{{ResourceID: "r", StatKey: "k", Values: []string{"v"}}}, 1, "Timestamps"},
++		{"both payloads", []opsapi.PropertySample{{ResourceID: "r", StatKey: "k", Timestamps: []int64{1}, Values: []string{"v"}, Data: []float64{1}}}, 1, "both"},
++		{"neither payload", []opsapi.PropertySample{{ResourceID: "r", StatKey: "k", Timestamps: []int64{1}}}, 1, "neither"},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			srv := mock.Start(t, contractPath, mock.Script{Resources: fixture})
++			c := client(t, srv, "")
++			err := c.PushProperties(context.Background(), tc.samples, tc.batchSize)
++			if err == nil {
++				t.Fatal("PushProperties succeeded, want an error")
++			}
++			if !strings.Contains(err.Error(), tc.want) {
++				t.Errorf("error %q does not mention %q", err, tc.want)
++			}
++			if n := len(srv.RequestsFor("addResourcesProperties")); n != 0 {
++				t.Errorf("sent %d requests for a malformed batch, want 0", n)
++			}
++		})
++	}
++}
++
++func TestPropertyPayloadShape(t *testing.T) {
++	cases := []struct {
++		name    string
++		sample  opsapi.PropertySample
++		omitted string
++		kept    string
++	}{
++		{
++			name:    "string payload",
++			sample:  opsapi.PropertySample{ResourceID: fixture[0].Identifier, StatKey: "summary|state", Timestamps: []int64{7}, Values: []string{"UP"}},
++			omitted: "data",
++			kept:    "values",
++		},
++		{
++			name:    "numeric payload",
++			sample:  opsapi.PropertySample{ResourceID: fixture[0].Identifier, StatKey: "config|count", Timestamps: []int64{7}, Data: []float64{93}},
++			omitted: "values",
++			kept:    "data",
++		},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			srv := mock.Start(t, contractPath, mock.Script{Resources: fixture})
++			c := client(t, srv, "")
++			if err := c.PushProperties(context.Background(), []opsapi.PropertySample{tc.sample}, 1); err != nil {
++				t.Fatalf("PushProperties: %v", err)
++			}
++
++			raw := srv.RequestsFor("addResourcesProperties")[0].Body
++			var decoded struct {
++				Values []struct {
++					PropertyContents struct {
++						PropertyContent []map[string]json.RawMessage `json:"property-content"`
++					} `json:"property-contents"`
++				} `json:"values"`
++			}
++			if err := json.Unmarshal(raw, &decoded); err != nil {
++				t.Fatalf("decode body: %v", err)
++			}
++			content := decoded.Values[0].PropertyContents.PropertyContent[0]
++			if _, present := content[tc.omitted]; present {
++				t.Errorf("body carries %q for an unset field: %s", tc.omitted, raw)
++			}
++			if _, present := content[tc.kept]; !present {
++				t.Errorf("body is missing %q: %s", tc.kept, raw)
++			}
++		})
++	}
++}
++
++func TestExpiredTokenIsRefreshedAndTheRequestReplayed(t *testing.T) {
++	cases := []struct {
++		name         string
++		expiresAfter []int
++		pageSize     int
++		wantTokens   int
++		wantRejected int
++	}{
++		{"no expiry", nil, 2, 1, 0},
++		{"expires on the second page", []int{1}, 2, 2, 1},
++		{"expires twice", []int{1, 1}, 1, 3, 2},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			srv := mock.Start(t, contractPath, mock.Script{Resources: fixture, ExpiresAfter: tc.expiresAfter})
++			c := client(t, srv, "")
++
++			got, err := c.ListAllResources(context.Background(), opsapi.ResourceFilter{PageSize: tc.pageSize})
++			if err != nil {
++				t.Fatalf("ListAllResources: %v", err)
++			}
++			if !reflect.DeepEqual(got, fixture) {
++				t.Fatalf("resources = %+v, want the full fixture", got)
++			}
++			if n := c.Stats().TokensAcquired; n != tc.wantTokens {
++				t.Errorf("Stats().TokensAcquired = %d, want %d", n, tc.wantTokens)
++			}
++
++			rejected := 0
++			seen := map[string]int{}
++			for _, r := range srv.RequestsFor("getResources") {
++				if r.Status == http.StatusUnauthorized {
++					rejected++
++					continue
++				}
++				seen[r.Query.Get("page")]++
++			}
++			if rejected != tc.wantRejected {
++				t.Errorf("saw %d rejected pages, want %d", rejected, tc.wantRejected)
++			}
++			for page, count := range seen {
++				if count != 1 {
++					t.Errorf("page %s was served %d times, want exactly 1", page, count)
++				}
++			}
++		})
++	}
++}
++
++func keysOf(m map[string]any) []string {
++	var out []string
++	for k := range m {
++		out = append(out, k)
++	}
++	return sorted(out)
++}
++
++func sorted(in []string) []string {
++	out := append([]string(nil), in...)
++	for i := 1; i < len(out); i++ {
++		for j := i; j > 0 && out[j] < out[j-1]; j-- {
++			out[j], out[j-1] = out[j-1], out[j]
++		}
++	}
++	return out
++}

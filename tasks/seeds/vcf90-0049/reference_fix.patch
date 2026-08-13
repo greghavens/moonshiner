@@ -1,0 +1,741 @@
+diff --git a/vctag/client.go b/vctag/client.go
+new file mode 100644
+index 0000000..9232d06
+--- /dev/null
++++ b/vctag/client.go
+@@ -0,0 +1,286 @@
++// Package vctag talks to the vCenter Automation API operations named by
++// docs/contract.json and builds a complete, stably ordered tag inventory.
++package vctag
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strconv"
++	"strings"
++	"sync"
++)
++
++// Paths of the four contract operations, relative to the vCenter base URL.
++const (
++	sessionPath    = "/api/session"
++	categoriesPath = "/api/vcenter/tagging/categories"
++	tagsPath       = "/api/vcenter/tagging/tags"
++
++	opSessionCreate  = "Cis.Session_create"
++	opSessionDelete  = "Cis.Session_delete"
++	opCategoriesList = "Vcenter.Tagging.Categories_list"
++	opTagsList       = "Vcenter.Tagging.Tags_list"
++)
++
++// ErrNoSession is returned when an api_key_auth operation is attempted before
++// Login, or after Logout.
++var ErrNoSession = errors.New("vctag: no vCenter session; call Login first")
++
++// ErrRepeatedMarker is returned when a page hands back a marker that has
++// already been used, which would otherwise iterate forever.
++var ErrRepeatedMarker = errors.New("vctag: server replayed a pagination marker")
++
++// APIError carries a Vapi.Std.Errors.Error response.
++type APIError struct {
++	Op         string // operationId that failed
++	StatusCode int
++	ErrorType  string
++	Message    string // default_message of the first localizable message
++}
++
++func (e *APIError) Error() string {
++	msg := e.Message
++	if msg == "" {
++		msg = http.StatusText(e.StatusCode)
++	}
++	errType := e.ErrorType
++	if errType == "" {
++		errType = "ERROR"
++	}
++	return fmt.Sprintf("vctag: %s failed: HTTP %d %s: %s", e.Op, e.StatusCode, errType, msg)
++}
++
++// Config configures a Client.
++type Config struct {
++	// BaseURL is the vCenter Server base URL without the /api prefix,
++	// for example https://vc01.example.com.
++	BaseURL string
++	// Username and Password are exchanged for a session token by Login.
++	Username string
++	Password string
++	// PageSize is sent as the iteration spec's page_size. Zero leaves
++	// page_size off the wire entirely so the server default applies.
++	PageSize int
++	// HTTPClient is optional; http.DefaultClient is used when it is nil.
++	HTTPClient *http.Client
++}
++
++// Client is a vCenter Automation API client scoped to the tagging contract.
++type Client struct {
++	baseURL  string
++	username string
++	password string
++	pageSize int
++	http     *http.Client
++
++	mu      sync.RWMutex
++	session string
++}
++
++// New validates cfg and returns a Client. It performs no I/O.
++func New(cfg Config) (*Client, error) {
++	if strings.TrimSpace(cfg.BaseURL) == "" {
++		return nil, errors.New("vctag: BaseURL is required")
++	}
++	u, err := url.Parse(strings.TrimRight(cfg.BaseURL, "/"))
++	if err != nil {
++		return nil, fmt.Errorf("vctag: BaseURL is not a URL: %w", err)
++	}
++	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
++		return nil, fmt.Errorf("vctag: BaseURL %q must be an absolute http or https URL", cfg.BaseURL)
++	}
++	if u.ForceQuery || u.RawQuery != "" || u.Fragment != "" {
++		return nil, fmt.Errorf("vctag: BaseURL %q must not carry a query or fragment", cfg.BaseURL)
++	}
++	if cfg.Username == "" {
++		return nil, errors.New("vctag: Username is required")
++	}
++	if cfg.PageSize < 0 {
++		return nil, fmt.Errorf("vctag: PageSize %d must not be negative", cfg.PageSize)
++	}
++	httpClient := cfg.HTTPClient
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++	return &Client{
++		baseURL:  strings.TrimRight(u.String(), "/"),
++		username: cfg.Username,
++		password: cfg.Password,
++		pageSize: cfg.PageSize,
++		http:     httpClient,
++	}, nil
++}
++
++// SessionID is the token held by the client, or "" when there is none.
++func (c *Client) SessionID() string {
++	c.mu.RLock()
++	defer c.mu.RUnlock()
++	return c.session
++}
++
++func (c *Client) setSession(id string) {
++	c.mu.Lock()
++	c.session = id
++	c.mu.Unlock()
++}
++
++// Login runs Cis.Session_create and keeps the returned token.
++func (c *Client) Login(ctx context.Context) error {
++	c.setSession("")
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+sessionPath, nil)
++	if err != nil {
++		return fmt.Errorf("vctag: %s: %w", opSessionCreate, err)
++	}
++	req.Header.Set("Accept", "application/json")
++	req.SetBasicAuth(c.username, c.password)
++
++	resp, err := c.http.Do(req)
++	if err != nil {
++		return fmt.Errorf("vctag: %s: %w", opSessionCreate, err)
++	}
++	defer drain(resp)
++
++	if resp.StatusCode != http.StatusCreated {
++		return faultFrom(opSessionCreate, resp)
++	}
++	var token string
++	if err := json.NewDecoder(resp.Body).Decode(&token); err != nil {
++		return fmt.Errorf("vctag: %s: decoding the session token: %w", opSessionCreate, err)
++	}
++	if token == "" {
++		return fmt.Errorf("vctag: %s: the server returned an empty session token", opSessionCreate)
++	}
++	c.setSession(token)
++	return nil
++}
++
++// Logout runs Cis.Session_delete and drops the token.
++func (c *Client) Logout(ctx context.Context) error {
++	session := c.SessionID()
++	if session == "" {
++		return fmt.Errorf("vctag: %s: %w", opSessionDelete, ErrNoSession)
++	}
++	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+sessionPath, nil)
++	if err != nil {
++		return fmt.Errorf("vctag: %s: %w", opSessionDelete, err)
++	}
++	req.Header.Set("Accept", "application/json")
++	req.Header.Set("vmware-api-session-id", session)
++
++	resp, err := c.http.Do(req)
++	if err != nil {
++		return fmt.Errorf("vctag: %s: %w", opSessionDelete, err)
++	}
++	defer drain(resp)
++
++	if resp.StatusCode != http.StatusNoContent {
++		return faultFrom(opSessionDelete, resp)
++	}
++	c.setSession("")
++	return nil
++}
++
++// get performs one api_key_auth GET and decodes a 200 body into out.
++func (c *Client) get(ctx context.Context, op, path string, query url.Values, out any) error {
++	session := c.SessionID()
++	if session == "" {
++		return fmt.Errorf("vctag: %s: %w", op, ErrNoSession)
++	}
++	target := c.baseURL + path
++	if len(query) > 0 {
++		target += "?" + query.Encode()
++	}
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
++	if err != nil {
++		return fmt.Errorf("vctag: %s: %w", op, err)
++	}
++	req.Header.Set("Accept", "application/json")
++	req.Header.Set("vmware-api-session-id", session)
++
++	resp, err := c.http.Do(req)
++	if err != nil {
++		return fmt.Errorf("vctag: %s: %w", op, err)
++	}
++	defer drain(resp)
++
++	if resp.StatusCode != http.StatusOK {
++		return faultFrom(op, resp)
++	}
++	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
++		return fmt.Errorf("vctag: %s: decoding the response: %w", op, err)
++	}
++	return nil
++}
++
++func drain(resp *http.Response) {
++	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
++	_ = resp.Body.Close()
++}
++
++func faultFrom(op string, resp *http.Response) error {
++	apiErr := &APIError{Op: op, StatusCode: resp.StatusCode}
++	var body struct {
++		ErrorType string `json:"error_type"`
++		Messages  []struct {
++			DefaultMessage string `json:"default_message"`
++		} `json:"messages"`
++	}
++	if err := json.NewDecoder(resp.Body).Decode(&body); err == nil {
++		apiErr.ErrorType = body.ErrorType
++		if len(body.Messages) > 0 {
++			apiErr.Message = body.Messages[0].DefaultMessage
++		}
++	}
++	return apiErr
++}
++
++// listPage is the response shape shared by both list operations.
++type listPage[T any] struct {
++	Items  []T    `json:"items"`
++	Marker string `json:"marker"`
++}
++
++// listAll walks a marker paginated collection to its end and returns every
++// item in the order the server produced them.
++func listAll[T any](ctx context.Context, c *Client, op, path string) ([]T, error) {
++	if c.SessionID() == "" {
++		return nil, fmt.Errorf("vctag: %s: %w", op, ErrNoSession)
++	}
++
++	var (
++		items     []T
++		marker    string
++		requested = map[string]bool{}
++	)
++	for {
++		// Optional fields that are not set are left out of the query
++		// string entirely; they are never sent as empty values.
++		query := url.Values{}
++		if marker != "" {
++			query.Set("marker", marker)
++		}
++		if c.pageSize > 0 {
++			query.Set("page_size", strconv.Itoa(c.pageSize))
++		}
++
++		var page listPage[T]
++		if err := c.get(ctx, op, path, query, &page); err != nil {
++			return nil, err
++		}
++		items = append(items, page.Items...)
++
++		if page.Marker == "" {
++			return items, nil
++		}
++		if requested[page.Marker] {
++			return nil, fmt.Errorf("vctag: %s: %w", op, ErrRepeatedMarker)
++		}
++		requested[page.Marker] = true
++		marker = page.Marker
++	}
++}
+diff --git a/vctag/client_test.go b/vctag/client_test.go
+new file mode 100644
+index 0000000..e094fc5
+--- /dev/null
++++ b/vctag/client_test.go
+@@ -0,0 +1,279 @@
++package vctag_test
++
++import (
++	"context"
++	"errors"
++	"net/url"
++	"strconv"
++	"strings"
++	"testing"
++
++	"example.com/vcf90/vsphere/internal/mockvc"
++	"example.com/vcf90/vsphere/vctag"
++)
++
++func newLoggedInClient(t *testing.T, srv *mockvc.Server, pageSize int) *vctag.Client {
++	t.Helper()
++	c, err := vctag.New(vctag.Config{
++		BaseURL:  srv.URL(),
++		Username: mockvc.DefaultUsername,
++		Password: mockvc.DefaultPassword,
++		PageSize: pageSize,
++	})
++	if err != nil {
++		t.Fatalf("New: %v", err)
++	}
++	if err := c.Login(context.Background()); err != nil {
++		t.Fatalf("Login: %v", err)
++	}
++	return c
++}
++
++func TestNewValidatesConfig(t *testing.T) {
++	tests := []struct {
++		name    string
++		cfg     vctag.Config
++		wantErr bool
++	}{
++		{"good", vctag.Config{BaseURL: "https://vc01.example.com", Username: "u", Password: "p"}, false},
++		{"good with trailing slash", vctag.Config{BaseURL: "https://vc01.example.com/", Username: "u", Password: "p"}, false},
++		{"good with empty password", vctag.Config{BaseURL: "http://127.0.0.1:8443", Username: "u"}, false},
++		{"missing base url", vctag.Config{Username: "u", Password: "p"}, true},
++		{"blank base url", vctag.Config{BaseURL: "   ", Username: "u", Password: "p"}, true},
++		{"scheme-less base url", vctag.Config{BaseURL: "vc01.example.com", Username: "u", Password: "p"}, true},
++		{"unsupported scheme", vctag.Config{BaseURL: "ftp://vc01.example.com", Username: "u", Password: "p"}, true},
++		{"base url with empty query", vctag.Config{BaseURL: "https://vc01.example.com?", Username: "u", Password: "p"}, true},
++		{"base url with query", vctag.Config{BaseURL: "https://vc01.example.com/?a=b", Username: "u", Password: "p"}, true},
++		{"missing username", vctag.Config{BaseURL: "https://vc01.example.com", Password: "p"}, true},
++		{"negative page size", vctag.Config{BaseURL: "https://vc01.example.com", Username: "u", PageSize: -1}, true},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			_, err := vctag.New(tc.cfg)
++			if tc.wantErr && err == nil {
++				t.Fatalf("New(%+v) = nil error, want an error", tc.cfg)
++			}
++			if !tc.wantErr && err != nil {
++				t.Fatalf("New(%+v) = %v, want no error", tc.cfg, err)
++			}
++		})
++	}
++}
++
++func TestPaginationCoversEveryPage(t *testing.T) {
++	inv := mockvc.Inventory()
++	tests := []struct {
++		name           string
++		pageSize       int
++		serverDefault  int
++		wantCategories int
++		wantTags       int
++		wantPageSizeQ  string
++	}{
++		{"server default of four", 0, 4, 2, 3, ""},
++		{"server default of one", 0, 1, 5, 9, ""},
++		{"client page size of one", 1, 20, 5, 9, "1"},
++		{"client page size of two", 2, 20, 3, 5, "2"},
++		{"client page size beyond the collection", 100, 20, 1, 1, "100"},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			srv := mockvc.Start(mockvc.Options{DefaultPageSize: tc.serverDefault})
++			defer srv.Close()
++
++			c := newLoggedInClient(t, srv, tc.pageSize)
++			cats, err := c.ListCategories(context.Background())
++			if err != nil {
++				t.Fatalf("ListCategories: %v", err)
++			}
++			tags, err := c.ListTags(context.Background())
++			if err != nil {
++				t.Fatalf("ListTags: %v", err)
++			}
++			if len(cats) != len(inv.Categories) {
++				t.Errorf("got %d categories, want %d", len(cats), len(inv.Categories))
++			}
++			if len(tags) != len(inv.Tags) {
++				t.Errorf("got %d tags, want %d", len(tags), len(inv.Tags))
++			}
++
++			var catPages, tagPages int
++			for _, r := range srv.Requests() {
++				switch r.Path {
++				case "/api/vcenter/tagging/categories":
++					catPages++
++					assertIterationQuery(t, r, catPages == 1, tc.wantPageSizeQ)
++				case "/api/vcenter/tagging/tags":
++					tagPages++
++					assertIterationQuery(t, r, tagPages == 1, tc.wantPageSizeQ)
++				}
++			}
++			if catPages != tc.wantCategories {
++				t.Errorf("categories were fetched in %d page(s), want %d", catPages, tc.wantCategories)
++			}
++			if tagPages != tc.wantTags {
++				t.Errorf("tags were fetched in %d page(s), want %d", tagPages, tc.wantTags)
++			}
++		})
++	}
++}
++
++func assertIterationQuery(t *testing.T, r mockvc.Request, first bool, wantPageSize string) {
++	t.Helper()
++	q, err := url.ParseQuery(r.RawQuery)
++	if err != nil {
++		t.Fatalf("unparsable query %q: %v", r.RawQuery, err)
++	}
++	if _, ok := q["marker"]; ok == first {
++		t.Errorf("query %q: marker presence = %v on first page = %v", r.RawQuery, ok, first)
++	}
++	if got, ok := q["page_size"]; ok {
++		if wantPageSize == "" {
++			t.Errorf("query %q: page_size must be omitted when it is unset", r.RawQuery)
++		} else if got[0] != wantPageSize {
++			t.Errorf("query %q: page_size = %q, want %q", r.RawQuery, got[0], wantPageSize)
++		}
++	} else if wantPageSize != "" {
++		t.Errorf("query %q: page_size is missing, want %q", r.RawQuery, wantPageSize)
++	}
++	for _, pair := range strings.Split(r.RawQuery, "&") {
++		if pair != "" && strings.HasSuffix(pair, "=") {
++			t.Errorf("query %q: %q is an empty value; unset fields must be omitted", r.RawQuery, pair)
++		}
++	}
++}
++
++func TestInventoryOrdering(t *testing.T) {
++	cat := func(id, name, cardinality string) mockvc.CategoryRecord {
++		return mockvc.CategoryRecord{
++			CategoryID: id,
++			Info:       mockvc.CategoryInfo{Name: name, Cardinality: cardinality},
++		}
++	}
++	tag := func(id, name, category string) mockvc.TagRecord {
++		return mockvc.TagRecord{Tag: id, Info: mockvc.TagInfo{Name: name, Category: category}}
++	}
++
++	tests := []struct {
++		name string
++		data mockvc.Dataset
++		want []string
++	}{
++		{
++			name: "empty inventory",
++			data: mockvc.Dataset{},
++			want: nil,
++		},
++		{
++			name: "uppercase sorts before lowercase",
++			data: mockvc.Dataset{
++				Categories: []mockvc.CategoryRecord{cat("c1", "zone", "MULTIPLE"), cat("c2", "Backup", "SINGLE")},
++				Tags:       []mockvc.TagRecord{tag("t1", "a", "c1"), tag("t2", "b", "c2")},
++			},
++			want: []string{"Backup\tSINGLE\tb\tt2", "zone\tMULTIPLE\ta\tt1"},
++		},
++		{
++			name: "tags of one category sort by tag name",
++			data: mockvc.Dataset{
++				Categories: []mockvc.CategoryRecord{cat("c1", "zone", "MULTIPLE")},
++				Tags: []mockvc.TagRecord{
++					tag("t3", "eu-west", "c1"), tag("t1", "ap-south", "c1"), tag("t2", "Us-East", "c1"),
++				},
++			},
++			want: []string{
++				"zone\tMULTIPLE\tUs-East\tt2",
++				"zone\tMULTIPLE\tap-south\tt1",
++				"zone\tMULTIPLE\teu-west\tt3",
++			},
++		},
++		{
++			name: "orphaned tags keep an empty category and break ties on tag id",
++			data: mockvc.Dataset{
++				Categories: []mockvc.CategoryRecord{cat("c1", "zone", "MULTIPLE")},
++				Tags: []mockvc.TagRecord{
++					tag("t9", "orphan", "gone"), tag("t1", "orphan", "also-gone"), tag("t5", "eu-west", "c1"),
++				},
++			},
++			want: []string{
++				"\t\torphan\tt1",
++				"\t\torphan\tt9",
++				"zone\tMULTIPLE\teu-west\tt5",
++			},
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			data := tc.data
++			srv := mockvc.Start(mockvc.Options{Dataset: &data, DefaultPageSize: 1})
++			defer srv.Close()
++
++			c := newLoggedInClient(t, srv, 1)
++			rows, err := c.Inventory(context.Background())
++			if err != nil {
++				t.Fatalf("Inventory: %v", err)
++			}
++			if len(rows) != len(tc.want) {
++				t.Fatalf("got %d row(s), want %d: %+v", len(rows), len(tc.want), rows)
++			}
++			want := ""
++			for _, line := range tc.want {
++				want += line + "\n"
++			}
++			if got := vctag.Render(rows); got != want {
++				t.Errorf("Render() =\n%q\nwant\n%q", got, want)
++			}
++		})
++	}
++}
++
++func TestFailureModes(t *testing.T) {
++	tests := []struct {
++		name    string
++		opts    mockvc.Options
++		login   bool
++		wantIs  error
++		wantAPI int
++	}{
++		{name: "no session", opts: mockvc.Options{}, login: false, wantIs: vctag.ErrNoSession},
++		{name: "replayed marker", opts: mockvc.Options{RepeatMarker: true}, login: true, wantIs: vctag.ErrRepeatedMarker},
++		{name: "tagging service down", opts: mockvc.Options{TagsUnavailable: true}, login: true, wantAPI: 503},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			srv := mockvc.Start(tc.opts)
++			defer srv.Close()
++
++			var c *vctag.Client
++			if tc.login {
++				c = newLoggedInClient(t, srv, 2)
++			} else {
++				var err error
++				c, err = vctag.New(vctag.Config{BaseURL: srv.URL(), Username: "u", PageSize: 2})
++				if err != nil {
++					t.Fatalf("New: %v", err)
++				}
++			}
++
++			_, err := c.ListTags(context.Background())
++			if err == nil {
++				t.Fatal("ListTags = nil error, want a failure")
++			}
++			if tc.wantIs != nil && !errors.Is(err, tc.wantIs) {
++				t.Fatalf("ListTags = %v, want %v", err, tc.wantIs)
++			}
++			if tc.wantAPI != 0 {
++				var apiErr *vctag.APIError
++				if !errors.As(err, &apiErr) {
++					t.Fatalf("ListTags = %v, want an *vctag.APIError", err)
++				}
++				if apiErr.StatusCode != tc.wantAPI {
++					t.Errorf("StatusCode = %d, want %d", apiErr.StatusCode, tc.wantAPI)
++				}
++				if !strings.Contains(apiErr.Error(), strconv.Itoa(tc.wantAPI)) {
++					t.Errorf("Error() = %q, want it to mention the status", apiErr.Error())
++				}
++			}
++		})
++	}
++}
+diff --git a/vctag/inventory.go b/vctag/inventory.go
+new file mode 100644
+index 0000000..f30e2d0
+--- /dev/null
++++ b/vctag/inventory.go
+@@ -0,0 +1,158 @@
++package vctag
++
++import (
++	"context"
++	"sort"
++	"strings"
++)
++
++// Category is one Vcenter.Tagging.Categories.ListItem.
++type Category struct {
++	ID              string
++	Name            string
++	Description     string
++	Cardinality     string
++	AssociableTypes []string
++	UsedBy          []string
++}
++
++// Tag is one Vcenter.Tagging.Tags.ListItem.
++type Tag struct {
++	ID          string
++	Name        string
++	CategoryID  string
++	Description string
++	UsedBy      []string
++}
++
++// Row is a tag joined to the category it belongs to. CategoryName and
++// Cardinality stay empty when the category is no longer present.
++type Row struct {
++	CategoryName string
++	CategoryID   string
++	Cardinality  string
++	TagName      string
++	TagID        string
++}
++
++type wireCategory struct {
++	CategoryID string `json:"category_id"`
++	Info       struct {
++		Name            string   `json:"name"`
++		Description     string   `json:"description"`
++		Cardinality     string   `json:"cardinality"`
++		AssociableTypes []string `json:"associable_types"`
++		UsedBy          []string `json:"used_by"`
++	} `json:"info"`
++}
++
++type wireTag struct {
++	Tag  string `json:"tag"`
++	Info struct {
++		Name        string   `json:"name"`
++		Category    string   `json:"category"`
++		Description string   `json:"description"`
++		UsedBy      []string `json:"used_by"`
++	} `json:"info"`
++}
++
++// ListCategories walks Vcenter.Tagging.Categories_list to its last page.
++func (c *Client) ListCategories(ctx context.Context) ([]Category, error) {
++	raw, err := listAll[wireCategory](ctx, c, opCategoriesList, categoriesPath)
++	if err != nil {
++		return nil, err
++	}
++	out := make([]Category, 0, len(raw))
++	for _, item := range raw {
++		out = append(out, Category{
++			ID:              item.CategoryID,
++			Name:            item.Info.Name,
++			Description:     item.Info.Description,
++			Cardinality:     item.Info.Cardinality,
++			AssociableTypes: item.Info.AssociableTypes,
++			UsedBy:          item.Info.UsedBy,
++		})
++	}
++	return out, nil
++}
++
++// ListTags walks Vcenter.Tagging.Tags_list to its last page.
++func (c *Client) ListTags(ctx context.Context) ([]Tag, error) {
++	raw, err := listAll[wireTag](ctx, c, opTagsList, tagsPath)
++	if err != nil {
++		return nil, err
++	}
++	out := make([]Tag, 0, len(raw))
++	for _, item := range raw {
++		out = append(out, Tag{
++			ID:          item.Tag,
++			Name:        item.Info.Name,
++			CategoryID:  item.Info.Category,
++			Description: item.Info.Description,
++			UsedBy:      item.Info.UsedBy,
++		})
++	}
++	return out, nil
++}
++
++// Inventory lists every category, then every tag, joins them and returns the
++// rows in a stable order: category name, then tag name, then tag id, each
++// compared byte by byte.
++func (c *Client) Inventory(ctx context.Context) ([]Row, error) {
++	categories, err := c.ListCategories(ctx)
++	if err != nil {
++		return nil, err
++	}
++	tags, err := c.ListTags(ctx)
++	if err != nil {
++		return nil, err
++	}
++
++	byID := make(map[string]Category, len(categories))
++	for _, cat := range categories {
++		byID[cat.ID] = cat
++	}
++
++	rows := make([]Row, 0, len(tags))
++	for _, tag := range tags {
++		row := Row{
++			CategoryID: tag.CategoryID,
++			TagName:    tag.Name,
++			TagID:      tag.ID,
++		}
++		if cat, ok := byID[tag.CategoryID]; ok {
++			row.CategoryName = cat.Name
++			row.Cardinality = cat.Cardinality
++		}
++		rows = append(rows, row)
++	}
++
++	sort.Slice(rows, func(i, j int) bool {
++		a, b := rows[i], rows[j]
++		if a.CategoryName != b.CategoryName {
++			return a.CategoryName < b.CategoryName
++		}
++		if a.TagName != b.TagName {
++			return a.TagName < b.TagName
++		}
++		return a.TagID < b.TagID
++	})
++	return rows, nil
++}
++
++// Render writes one line per row: category name, cardinality, tag name and tag
++// id separated by single tabs, each line terminated by a newline.
++func Render(rows []Row) string {
++	var sb strings.Builder
++	for _, r := range rows {
++		sb.WriteString(r.CategoryName)
++		sb.WriteByte('\t')
++		sb.WriteString(r.Cardinality)
++		sb.WriteByte('\t')
++		sb.WriteString(r.TagName)
++		sb.WriteByte('\t')
++		sb.WriteString(r.TagID)
++		sb.WriteByte('\n')
++	}
++	return sb.String()
++}

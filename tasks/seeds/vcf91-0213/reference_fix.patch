@@ -1,0 +1,250 @@
+--- a/vcfinstaller/client.go
++++ b/vcfinstaller/client.go
+@@ -2,10 +2,16 @@
+ package vcfinstaller
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"io"
++	"mime"
+ 	"net/http"
++	"net/url"
++	"strings"
+ )
+ 
+ // ProxyConfiguration contains only writable ProxyConfiguration members.
+@@ -123,19 +129,227 @@
+ 	httpClient  *http.Client
+ }
+ 
+-// ErrNotImplemented is returned by the exercise stub.
++// ErrNotImplemented is retained for source compatibility with the exercise
++// stub. The implemented client does not return it.
+ var ErrNotImplemented = errors.New("vcfinstaller bootstrap client is not implemented")
+ 
+ // NewClient constructs a client for a VCF Installer service root.
+ func NewClient(baseURL, accessToken string, httpClient *http.Client) (*Client, error) {
++	parsed, err := url.Parse(baseURL)
++	if err != nil || (!strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https")) || parsed.Host == "" || parsed.Hostname() == "" {
++		return nil, fmt.Errorf("baseURL must be an absolute HTTP(S) service root")
++	}
++	if parsed.User != nil || parsed.Opaque != "" || (parsed.Path != "" && parsed.Path != "/") || parsed.RawPath != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
++		return nil, fmt.Errorf("baseURL must not contain credentials, a path, query, or fragment")
++	}
++	if strings.TrimSpace(accessToken) == "" {
++		return nil, fmt.Errorf("accessToken must be nonblank")
++	}
++	if !validHeaderValue(accessToken) {
++		return nil, fmt.Errorf("accessToken contains an invalid header character")
++	}
+ 	if httpClient == nil {
+ 		httpClient = http.DefaultClient
+ 	}
+-	return &Client{baseURL: baseURL, accessToken: accessToken, httpClient: httpClient}, nil
++	contractClient := &http.Client{
++		Transport: httpClient.Transport,
++		Jar:       httpClient.Jar,
++		Timeout:   httpClient.Timeout,
++		CheckRedirect: func(*http.Request, []*http.Request) error {
++			return http.ErrUseLastResponse
++		},
++	}
++	parsed.Scheme = strings.ToLower(parsed.Scheme)
++	parsed.Path = ""
++	return &Client{
++		baseURL:     strings.TrimSuffix(parsed.String(), "/"),
++		accessToken: accessToken,
++		httpClient:  contractClient,
++	}, nil
+ }
+ 
+ // ConfigureDepotAccess applies the three contract operations in order and
+ // returns an exact partial-progress report on failure.
+ func (c *Client) ConfigureDepotAccess(ctx context.Context, proxy ProxyConfiguration, depot DepotSettings) (ChangeReport, error) {
+-	return ChangeReport{}, ErrNotImplemented
++	report := newReport()
++	if ctx == nil {
++		return report, fmt.Errorf("ctx must not be nil")
++	}
++
++	proxyBody, err := json.Marshal(proxy)
++	if err != nil {
++		return report, &ProtocolError{OperationID: "updateProxyConfiguration", Message: "encode request"}
++	}
++	depotBody, err := json.Marshal(depot)
++	if err != nil {
++		return report, &ProtocolError{OperationID: "updateDepotSettings", Message: "encode request"}
++	}
++	calls := []struct {
++		operationID string
++		method      string
++		path        string
++		body        []byte
++	}{
++		{"updateProxyConfiguration", http.MethodPatch, "/v1/system/proxy-configuration", proxyBody},
++		{"updateDepotSettings", http.MethodPut, "/v1/system/settings/depot", depotBody},
++		{"syncDepotMetadata", http.MethodPatch, "/v1/system/settings/depot/depot-sync-info", nil},
++	}
++
++	for index, call := range calls {
++		if contextErr := ctx.Err(); contextErr != nil {
++			markFailure(&report, index, 0, "", "")
++			return report, contextErr
++		}
++		result, requestErr := c.call(ctx, call.operationID, call.method, call.path, call.body)
++		if requestErr != nil {
++			markFailure(&report, index, result.statusCode, "", "")
++			return report, requestErr
++		}
++		if result.statusCode != http.StatusAccepted {
++			apiError := decodeAPIError(call.operationID, result.statusCode, result.body)
++			markFailure(&report, index, result.statusCode, apiError.ErrorCode, apiError.Message)
++			return report, apiError
++		}
++		if index == 0 {
++			taskID, protocolErr := decodeProxyTask(result.contentType, result.body)
++			if protocolErr != nil {
++				markFailure(&report, index, result.statusCode, "", "")
++				return report, protocolErr
++			}
++			report.Steps[index].TaskID = taskID
++		}
++		report.Steps[index].Status = StepAccepted
++		report.Steps[index].HTTPStatus = result.statusCode
++	}
++	report.Outcome = OutcomeAccepted
++	return report, nil
++}
++
++type callResult struct {
++	statusCode  int
++	contentType string
++	body        []byte
++}
++
++func (c *Client) call(ctx context.Context, operationID, method, path string, body []byte) (callResult, error) {
++	var reader io.Reader
++	if body != nil {
++		reader = bytes.NewReader(body)
++	}
++	request, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
++	if err != nil {
++		return callResult{}, &ProtocolError{OperationID: operationID, Message: "build request"}
++	}
++	request.Header.Set("Authorization", "Bearer "+c.accessToken)
++	request.Header.Set("Accept", "application/json")
++	if body != nil {
++		request.Header.Set("Content-Type", "application/json")
++	}
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		closeResponse(response)
++		if contextErr := ctx.Err(); contextErr != nil {
++			return callResult{}, contextErr
++		}
++		if errors.Is(err, context.Canceled) {
++			return callResult{}, context.Canceled
++		}
++		if errors.Is(err, context.DeadlineExceeded) {
++			return callResult{}, context.DeadlineExceeded
++		}
++		return callResult{}, &TransportError{OperationID: operationID}
++	}
++	defer response.Body.Close()
++	responseBody, err := io.ReadAll(response.Body)
++	if err != nil {
++		return callResult{statusCode: response.StatusCode, contentType: response.Header.Get("Content-Type")}, &ProtocolError{OperationID: operationID, Message: "read response body"}
++	}
++	return callResult{
++		statusCode:  response.StatusCode,
++		contentType: response.Header.Get("Content-Type"),
++		body:        responseBody,
++	}, nil
++}
++
++func newReport() ChangeReport {
++	return ChangeReport{
++		Outcome: OutcomeFailed,
++		Steps: []StepResult{
++			{OperationID: "updateProxyConfiguration", Status: StepNotRun},
++			{OperationID: "updateDepotSettings", Status: StepNotRun},
++			{OperationID: "syncDepotMetadata", Status: StepNotRun},
++		},
++	}
++}
++
++func markFailure(report *ChangeReport, index, statusCode int, errorCode, errorMessage string) {
++	report.Steps[index].Status = StepFailed
++	report.Steps[index].HTTPStatus = statusCode
++	report.Steps[index].ErrorCode = errorCode
++	report.Steps[index].ErrorMessage = errorMessage
++	if index == 0 {
++		report.Outcome = OutcomeFailed
++	} else {
++		report.Outcome = OutcomePartialFailure
++	}
++}
++
++func decodeAPIError(operationID string, statusCode int, body []byte) *APIError {
++	document := struct {
++		ErrorCode          string `json:"errorCode"`
++		ErrorType          string `json:"errorType"`
++		Message            string `json:"message"`
++		RemediationMessage string `json:"remediationMessage"`
++		ReferenceToken     string `json:"referenceToken"`
++	}{}
++	_ = json.Unmarshal(body, &document)
++	return &APIError{
++		OperationID:        operationID,
++		StatusCode:         statusCode,
++		ErrorCode:          document.ErrorCode,
++		ErrorType:          document.ErrorType,
++		Message:            document.Message,
++		RemediationMessage: document.RemediationMessage,
++		ReferenceToken:     document.ReferenceToken,
++	}
++}
++
++func decodeProxyTask(contentType string, body []byte) (string, *ProtocolError) {
++	const operationID = "updateProxyConfiguration"
++	mediaType, _, err := mime.ParseMediaType(contentType)
++	if err != nil || (mediaType != "application/json" && !strings.HasSuffix(strings.ToLower(mediaType), "+json")) {
++		return "", &ProtocolError{OperationID: operationID, Message: "response is not JSON"}
++	}
++	task := struct {
++		ID                string `json:"id"`
++		Name              string `json:"name"`
++		Status            string `json:"status"`
++		CreationTimestamp string `json:"creationTimestamp"`
++	}{}
++	if err := json.Unmarshal(body, &task); err != nil {
++		return "", &ProtocolError{OperationID: operationID, Message: "malformed JSON task"}
++	}
++	if strings.TrimSpace(task.ID) == "" || strings.TrimSpace(task.Name) == "" || strings.TrimSpace(task.Status) == "" || strings.TrimSpace(task.CreationTimestamp) == "" {
++		return "", &ProtocolError{OperationID: operationID, Message: "task is missing a required member"}
++	}
++	return task.ID, nil
++}
++
++func closeResponse(response *http.Response) {
++	if response == nil || response.Body == nil {
++		return
++	}
++	_, _ = io.Copy(io.Discard, response.Body)
++	_ = response.Body.Close()
++}
++
++func validHeaderValue(value string) bool {
++	for index := 0; index < len(value); index++ {
++		character := value[index]
++		if (character < ' ' && character != '\t') || character == 0x7f {
++			return false
++		}
++	}
++	return true
+ }

@@ -1,0 +1,355 @@
+diff --git a/src/VcfLcmClient.java b/src/VcfLcmClient.java
+index 1a94ea0..6446c5a 100644
+--- a/src/VcfLcmClient.java
++++ b/src/VcfLcmClient.java
+@@ -1,14 +1,41 @@
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.time.Duration;
++import java.util.Arrays;
++import java.util.List;
++import java.util.Map;
++import java.util.UUID;
++
+ /**
+  * Client for the VCF 9.1 SDDC LCM service.
+  *
+- * Drives a fleet component upgrade against the operations named in docs/contract.json and
+- * returns a rollout report in the format described in docs/client_api.md.
++ * Drives a fleet component upgrade from an operator change request: discover the
++ * component, register the fleet depot, resolve the target versions against it, precheck
++ * the component, then apply. Each operation that returns a task is followed to a terminal
++ * status before the next one starts, so the rollout report says what actually happened
++ * rather than what was requested.
+  *
+- * Not implemented yet.
++ * Only the operations in docs/contract.json are called, and only the properties those
++ * schemas define are sent -- anything the change request leaves unset is omitted from the
++ * JSON rather than sent as null or "".
+  */
+ public final class VcfLcmClient {
+ 
+-    private VcfLcmClient() {
++    private static final List<String> TERMINAL = Arrays.asList("SUCCEEDED", "FAILED", "CANCELED");
++    private static final Duration TIMEOUT = Duration.ofSeconds(30);
++
++    private final HttpClient http;
++    private final String baseUrl;
++    private final String bearerToken;
++    private final String correlationId;
++
++    private VcfLcmClient(String baseUrl, String bearerToken, String correlationId) {
++        this.http = HttpClient.newBuilder().connectTimeout(TIMEOUT).build();
++        this.baseUrl = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
++        this.bearerToken = bearerToken;
++        this.correlationId = correlationId;
+     }
+ 
+     /**
+@@ -16,6 +43,303 @@ public final class VcfLcmClient {
+      * {@code baseUrl} and returns the rollout report as a JSON document.
+      */
+     public static String run(String baseUrl, String bearerToken, String requestJson) throws Exception {
+-        throw new UnsupportedOperationException("VcfLcmClient.run is not implemented");
++        Map<String, Object> request = Json.map(Json.parse(requestJson));
++        VcfLcmClient client = new VcfLcmClient(baseUrl, bearerToken, UUID.randomUUID().toString());
++        return Json.writeIndented(client.rollout(request));
++    }
++
++    // ---------------------------------------------------------------- rollout
++
++    private Map<String, Object> rollout(Map<String, Object> request) throws Exception {
++        String componentType = Json.str(request, "componentType");
++        String targetVersion = Json.str(request, "targetVersion");
++        Map<String, Object> depot = Json.map(request.get("depot"));
++
++        Map<String, Object> report = Json.obj();
++        report.put("changeRequest", request.get("changeRequest"));
++        report.put("componentType", componentType);
++        report.put("targetVersion", targetVersion);
++        report.put("correlationId", correlationId);
++        List<Object> steps = Json.arr();
++        report.put("steps", steps);
++
++        // 1. Discover the fleet component the change request names.
++        Map<String, Object> component = findFleetComponent(componentType);
++        report.put("componentId", Json.str(component, "id"));
++        report.put("currentVersion", Json.str(component, "version"));
++        steps.add(step("getComponents", null, "SUCCEEDED", null));
++
++        // 2. Register the fleet depot and follow its task.
++        Map<String, Object> depotSpec = Json.obj();
++        depotSpec.put("fqdn", Json.str(depot, "fqdn"));
++        depotSpec.put("certificate", Json.str(depot, "certificate"));
++        Map<String, Object> depotTask = Json.map(
++                post("/v1/depot", depotSpec, true, 202).body);
++        String depotTaskId = Json.str(depotTask, "id");
++        Map<String, Object> depotDone = pollToTerminal(depotTaskId);
++        if (!finish(report, steps, "setDepot", null, depotTaskId, depotDone)) {
++            return report;
++        }
++
++        // 3. Resolve the target versions against that depot.
++        Map<String, Object> resolved = Json.map(
++                post("/v1/depot/components",
++                        resolveSpec(request, depotSpec, componentType, targetVersion),
++                        false, 200).body);
++        List<Object> resolvedVersions = Json.list(resolved.get("componentVersions"));
++        report.put("resolvedComponentVersions", resolvedVersions);
++        steps.add(step("resolveDepotComponents", null, "SUCCEEDED", null));
++
++        // 4 and 5. Precheck the component, then apply, against the resolved bundle.
++        Map<String, Object> componentSpec = componentSpec(
++                targetVersion, binaryUrlOf(resolvedVersions, componentType), Json.str(depot, "certificate"));
++        String componentId = Json.str(component, "id");
++
++        Map<String, Object> precheckBody = Json.obj();
++        precheckBody.put("componentSpec", componentSpec);
++        precheckBody.put("correlationId", correlationId);
++        Map<String, Object> precheckTask = Json.map(
++                post(componentAction(componentId, "precheck"), precheckBody, true, 202).body);
++        String precheckTaskId = Json.str(precheckTask, "id");
++        Map<String, Object> precheckDone = pollToTerminal(precheckTaskId);
++        if (!finish(report, steps, "performComponentAction", "precheck", precheckTaskId, precheckDone)) {
++            return report;
++        }
++
++        Map<String, Object> applyBody = Json.obj();
++        applyBody.put("componentSpec", componentSpec);
++        if (request.containsKey("performBackup")) {
++            Map<String, Object> platform = Json.obj();
++            platform.put("performBackup", request.get("performBackup"));
++            applyBody.put("lcmPlatformSpec", platform);
++        }
++        applyBody.put("correlationId", correlationId);
++        Map<String, Object> applyTask = Json.map(
++                post(componentAction(componentId, "apply"), applyBody, true, 202).body);
++        String applyTaskId = Json.str(applyTask, "id");
++        Map<String, Object> applyDone = pollToTerminal(applyTaskId);
++        if (!finish(report, steps, "performComponentAction", "apply", applyTaskId, applyDone)) {
++            return report;
++        }
++
++        report.put("outcome", "SUCCEEDED");
++        return report;
++    }
++
++    // ------------------------------------------------------------- step wiring
++
++    private Map<String, Object> step(String operationId, String action, String status, String taskId) {
++        Map<String, Object> s = Json.obj();
++        s.put("operationId", operationId);
++        if (action != null) {
++            s.put("action", action);
++        }
++        s.put("status", status);
++        if (taskId != null) {
++            s.put("taskId", taskId);
++        }
++        return s;
++    }
++
++    /**
++     * Records a task-backed step and, when its task did not succeed, closes the report out
++     * with the failure. Returns false when the rollout must stop here.
++     */
++    private boolean finish(Map<String, Object> report, List<Object> steps, String operationId,
++                           String action, String taskId, Map<String, Object> task) {
++        String status = Json.str(task, "status");
++        boolean ok = "SUCCEEDED".equals(status);
++        steps.add(step(operationId, action, ok ? "SUCCEEDED" : "FAILED", taskId));
++        if (ok) {
++            return true;
++        }
++        Map<String, Object> failure = Json.obj();
++        failure.put("stepIndex", steps.size() - 1);
++        failure.put("operationId", operationId);
++        if (action != null) {
++            failure.put("action", action);
++        }
++        failure.put("taskId", taskId);
++        failure.put("taskStatus", status);
++        Map<String, Object> stage = failedStage(task);
++        if (stage != null) {
++            failure.put("failedStageId", Json.str(stage, "id"));
++            String message = firstErrorMessage(stage);
++            if (message != null) {
++                failure.put("message", message);
++            }
++        }
++        report.put("outcome", "FAILED");
++        report.put("failure", failure);
++        return false;
++    }
++
++    private Map<String, Object> failedStage(Map<String, Object> task) {
++        Object stages = task.get("stages");
++        if (!(stages instanceof List)) {
++            return null;
++        }
++        for (Object entry : Json.list(stages)) {
++            Map<String, Object> stage = Json.map(entry);
++            if ("FAILED".equals(Json.str(stage, "status"))) {
++                return stage;
++            }
++        }
++        return null;
++    }
++
++    private String firstErrorMessage(Map<String, Object> stage) {
++        Object messages = stage.get("messages");
++        if (!(messages instanceof List)) {
++            return null;
++        }
++        for (Object entry : Json.list(messages)) {
++            Map<String, Object> m = Json.map(entry);
++            if ("ERROR".equals(Json.str(m, "level"))) {
++                return Json.str(m, "message", "defaultMessage");
++            }
++        }
++        return null;
++    }
++
++    // ---------------------------------------------------------------- payloads
++
++    private Map<String, Object> resolveSpec(Map<String, Object> request, Map<String, Object> depotSpec,
++                                            String componentType, String targetVersion) {
++        Map<String, Object> spec = Json.obj();
++        spec.put("fleetDepotSpec", depotSpec);
++        List<Object> versions = Json.arr();
++        versions.add(componentVersion(componentType, targetVersion));
++        Object additional = request.get("additionalComponents");
++        if (additional instanceof List) {
++            for (Object entry : Json.list(additional)) {
++                Map<String, Object> extra = Json.map(entry);
++                versions.add(componentVersion(Json.str(extra, "component"),
++                        extra.containsKey("version") ? Json.str(extra, "version") : null));
++            }
++        }
++        spec.put("componentVersions", versions);
++        return spec;
++    }
++
++    private Map<String, Object> componentVersion(String component, String version) {
++        Map<String, Object> cv = Json.obj();
++        cv.put("component", component);
++        // version is optional: an unpinned component resolves to what the depot publishes.
++        if (version != null) {
++            cv.put("version", version);
++        }
++        return cv;
++    }
++
++    private Map<String, Object> componentSpec(String targetVersion, String binaryUrl, String certificate) {
++        Map<String, Object> software = Json.obj();
++        software.put("version", targetVersion);
++        Map<String, Object> depot = Json.obj();
++        depot.put("url", binaryUrl);
++        if (certificate != null) {
++            List<Object> chain = Json.arr();
++            chain.add(certificate);
++            depot.put("certificate", chain);
++        }
++        Map<String, Object> spec = Json.obj();
++        spec.put("software", software);
++        spec.put("depot", depot);
++        return spec;
++    }
++
++    private String binaryUrlOf(List<Object> resolvedVersions, String componentType) {
++        for (Object entry : resolvedVersions) {
++            Map<String, Object> cv = Json.map(entry);
++            if (componentType.equals(Json.str(cv, "component"))) {
++                return Json.str(cv, "binaryUrl");
++            }
++        }
++        throw new IllegalStateException("the depot resolved no bundle for " + componentType);
++    }
++
++    private Map<String, Object> findFleetComponent(String componentType) throws Exception {
++        Map<String, Object> body = Json.map(get("/v1/components?scope=FLEET", 200).body);
++        Object components = body.get("components");
++        if (components instanceof List) {
++            for (Object entry : Json.list(components)) {
++                Map<String, Object> component = Json.map(entry);
++                if (componentType.equals(Json.str(component, "componentType"))) {
++                    return component;
++                }
++            }
++        }
++        throw new IllegalStateException("no fleet component of type " + componentType);
++    }
++
++    private String componentAction(String componentId, String action) {
++        return "/v1/components/" + encode(componentId) + "?action=" + encode(action);
++    }
++
++    private static String encode(String segment) {
++        return java.net.URLEncoder.encode(segment, java.nio.charset.StandardCharsets.UTF_8)
++                .replace("+", "%20");
++    }
++
++    // -------------------------------------------------------------- transport
++
++    private Map<String, Object> pollToTerminal(String taskId) throws Exception {
++        while (true) {
++            Map<String, Object> task = Json.map(get("/v1/tasks/" + encode(taskId), 200).body);
++            if (TERMINAL.contains(Json.str(task, "status"))) {
++                return task;
++            }
++        }
++    }
++
++    private Reply get(String pathAndQuery, int expected) throws Exception {
++        return send("GET", pathAndQuery, null, false, expected);
++    }
++
++    private Reply post(String pathAndQuery, Object body, boolean correlate, int expected) throws Exception {
++        return send("POST", pathAndQuery, body, correlate, expected);
++    }
++
++    private Reply send(String method, String pathAndQuery, Object body, boolean correlate,
++                       int expected) throws Exception {
++        HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(baseUrl + pathAndQuery))
++                .header("Authorization", "Bearer " + bearerToken)
++                .header("Accept", "application/json")
++                .timeout(TIMEOUT);
++        // X-Correlation-Id is only defined for the operations that accept it.
++        if (correlate) {
++            builder.header("X-Correlation-Id", correlationId);
++        }
++        if (body == null) {
++            builder.method(method, HttpRequest.BodyPublishers.noBody());
++        } else {
++            builder.header("Content-Type", "application/json")
++                    .method(method, HttpRequest.BodyPublishers.ofString(Json.write(body)));
++        }
++
++        HttpResponse<String> response = http.send(builder.build(), HttpResponse.BodyHandlers.ofString());
++        Object parsed;
++        try {
++            parsed = Json.parse(response.body());
++        } catch (RuntimeException e) {
++            throw new IllegalStateException(method + " " + pathAndQuery + " returned HTTP "
++                    + response.statusCode() + " with a body that is not JSON", e);
++        }
++        if (response.statusCode() != expected) {
++            throw new IllegalStateException(method + " " + pathAndQuery + " returned HTTP "
++                    + response.statusCode() + " (expected " + expected + "): "
++                    + Json.str(parsed, "code") + " - " + Json.str(parsed, "message", "defaultMessage"));
++        }
++        return new Reply(response.statusCode(), parsed);
++    }
++
++    private static final class Reply {
++        final int status;
++        final Object body;
++
++        Reply(int status, Object body) {
++            this.status = status;
++            this.body = body;
++        }
+     }
+ }

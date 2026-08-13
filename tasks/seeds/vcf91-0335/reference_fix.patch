@@ -1,0 +1,356 @@
+--- a/src/VcfaChangeClient.java
++++ b/src/VcfaChangeClient.java
+@@ -10,6 +10,7 @@
+ import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Set;
+ 
+ /**
+  * Dependency-free, single-file client for the VCF Automation 9.1 REST surface.
+@@ -38,6 +39,12 @@
+     private static final Duration POLL_INTERVAL = Duration.ofMillis(200);
+     private static final int MAX_POLL_ATTEMPTS = 25;
+ 
++    private static final Set<String> DEPLOYMENT_TERMINAL_STATUSES = Set.of(
++            "CREATE_SUCCESSFUL", "CREATE_FAILED", "UPDATE_SUCCESSFUL", "UPDATE_FAILED",
++            "DELETE_SUCCESSFUL", "DELETE_FAILED");
++    private static final Set<String> REQUEST_TERMINAL_STATUSES = Set.of(
++            "SUCCESSFUL", "FAILED", "ABORTED", "APPROVAL_REJECTED");
++
+     /** One element of ProjectSpecification.zoneAssignmentConfigurations; null limits are unset. */
+     public record ZoneAssignment(String zoneId, Integer priority, Integer maxNumberInstances,
+                                  Integer memoryLimitMB, Integer cpuLimit, Integer storageLimitGB) {
+@@ -122,7 +129,61 @@
+      */
+     public ChangeReport runChange(ProjectSpec project, CatalogRequestSpec catalogRequest,
+                                   ActionSpec action) throws IOException, InterruptedException {
+-        throw new UnsupportedOperationException("runChange is not implemented");
++        List<StepOutcome> steps = new ArrayList<>();
++        List<PersistedChange> persisted = new ArrayList<>();
++        String step = STEP_AUTHENTICATE;
++        try {
++            String accessToken = authenticate();
++            steps.add(new StepOutcome(step, SUCCEEDED, "access token issued for tenant " + tenant));
++
++            step = STEP_CREATE_PROJECT;
++            String projectId = createProject(accessToken, project);
++            persisted.add(new PersistedChange("project", projectId, "CREATED"));
++            steps.add(new StepOutcome(step, SUCCEEDED, "project " + projectId + " created"));
++
++            step = STEP_REQUEST_CATALOG_ITEM;
++            String deploymentId = requestCatalogItem(accessToken, catalogRequest, projectId);
++            persisted.add(new PersistedChange("deployment", deploymentId, "CREATE_INPROGRESS"));
++            steps.add(new StepOutcome(step, SUCCEEDED,
++                    "deployment " + deploymentId + " requested from catalog item "
++                            + catalogRequest.catalogItemId()));
++
++            step = STEP_AWAIT_DEPLOYMENT;
++            String deploymentStatus = awaitDeployment(accessToken, deploymentId);
++            persisted.set(1, new PersistedChange("deployment", deploymentId, deploymentStatus));
++            if (!"CREATE_SUCCESSFUL".equals(deploymentStatus)) {
++                steps.add(new StepOutcome(step, FAILED,
++                        "deployment " + deploymentId + " reached " + deploymentStatus));
++                return new ChangeReport(FAILED, step, steps, persisted, null, null);
++            }
++            steps.add(new StepOutcome(step, SUCCEEDED,
++                    "deployment " + deploymentId + " reached " + deploymentStatus));
++
++            step = STEP_SUBMIT_RESOURCE_ACTION;
++            Map<String, Object> submitted = submitResourceAction(accessToken, deploymentId, action);
++            String requestId = Json.string(submitted, "id");
++            if (requestId == null || requestId.isEmpty()) {
++                throw new IOException("submitDeploymentActionRequest returned no request id");
++            }
++            steps.add(new StepOutcome(step, SUCCEEDED, "day-2 request " + requestId
++                    + " accepted with status " + Json.string(submitted, "status")));
++
++            step = STEP_AWAIT_RESOURCE_ACTION;
++            Map<String, Object> settled = awaitResourceAction(accessToken, requestId);
++            String requestStatus = Json.string(settled, "status");
++            String details = Json.string(settled, "details");
++            if ("SUCCESSFUL".equals(requestStatus)) {
++                steps.add(new StepOutcome(step, SUCCEEDED,
++                        "day-2 request " + requestId + " ended " + requestStatus));
++                return new ChangeReport(SUCCEEDED, null, steps, persisted, null, null);
++            }
++            steps.add(new StepOutcome(step, FAILED, "day-2 request " + requestId + " ended "
++                    + requestStatus + ": " + (details == null ? "no detail reported" : details)));
++            return new ChangeReport(FAILED, step, steps, persisted, requestId, details);
++        } catch (ApiFailure failure) {
++            steps.add(new StepOutcome(step, FAILED, failure.getMessage()));
++            return new ChangeReport(FAILED, step, steps, persisted, null, null);
++        }
+     }
+ 
+     /**
+@@ -130,13 +191,70 @@
+      * grant_type/refresh_token payload. Returns the access_token.
+      */
+     private String authenticate() throws IOException, InterruptedException {
+-        throw new UnsupportedOperationException("authenticate is not implemented");
++        String form = "grant_type=refresh_token&refresh_token="
++                + URLEncoder.encode(refreshToken, StandardCharsets.UTF_8);
++        HttpResponse<String> response = send(
++                requestTo("/tm/oauth/tenant/" + encodeSegment(tenant) + "/token")
++                        .header("Content-Type", "application/x-www-form-urlencoded")
++                        .header("Accept", "application/json")
++                        .POST(HttpRequest.BodyPublishers.ofString(form, StandardCharsets.UTF_8))
++                        .build());
++        requireStatus(response, 200, "exchangeRefreshToken");
++        String accessToken = Json.string(Json.parse(response.body()), "access_token");
++        if (accessToken == null || accessToken.isEmpty()) {
++            throw new IOException("exchangeRefreshToken returned no access_token");
++        }
++        return accessToken;
+     }
+ 
+     /** createProject: POST /iaas/api/projects. Returns the created project id. */
+     private String createProject(String accessToken, ProjectSpec spec)
+             throws IOException, InterruptedException {
+-        throw new UnsupportedOperationException("createProject is not implemented");
++        String zones = null;
++        if (spec.zoneAssignmentConfigurations() != null
++                && !spec.zoneAssignmentConfigurations().isEmpty()) {
++            StringBuilder array = new StringBuilder("[");
++            for (ZoneAssignment zone : spec.zoneAssignmentConfigurations()) {
++                if (array.length() > 1) {
++                    array.append(',');
++                }
++                array.append(new JsonObject()
++                        .put("zoneId", zone.zoneId())
++                        .put("priority", zone.priority())
++                        .put("maxNumberInstances", zone.maxNumberInstances())
++                        .put("memoryLimitMB", zone.memoryLimitMB())
++                        .put("cpuLimit", zone.cpuLimit())
++                        .put("storageLimitGB", zone.storageLimitGB())
++                        .build());
++            }
++            zones = array.append(']').toString();
++        }
++        String body = new JsonObject()
++                .put("name", spec.name())
++                .put("description", spec.description())
++                .putRaw("zoneAssignmentConfigurations", zones)
++                .put("operationTimeout", spec.operationTimeout())
++                .put("machineNamingTemplate", spec.machineNamingTemplate())
++                .put("sharedResources", spec.sharedResources())
++                .put("placementPolicy", spec.placementPolicy())
++                .putMap("customProperties", spec.customProperties())
++                .build();
++
++        Query query = new Query()
++                .add("apiVersion", spec.apiVersion())
++                .add("validatePrincipals", spec.validatePrincipals());
++        HttpResponse<String> response = send(
++                requestTo("/iaas/api/projects" + query.build())
++                        .header("Authorization", "Bearer " + accessToken)
++                        .header("Content-Type", "application/json")
++                        .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
++                        .build());
++        requireStatus(response, 201, "createProject");
++        String projectId = Json.string(Json.parse(response.body()), "id");
++        if (projectId == null || projectId.isEmpty()) {
++            throw new IOException("createProject returned no project id");
++        }
++        return projectId;
+     }
+ 
+     /**
+@@ -145,13 +263,48 @@
+      */
+     private String requestCatalogItem(String accessToken, CatalogRequestSpec spec, String projectId)
+             throws IOException, InterruptedException {
+-        throw new UnsupportedOperationException("requestCatalogItem is not implemented");
++        String body = new JsonObject()
++                .put("bulkRequestCount", spec.bulkRequestCount())
++                .put("deploymentName", spec.deploymentName())
++                .putMap("inputs", spec.inputs())
++                .put("projectId", projectId)
++                .put("reason", spec.reason())
++                .put("version", spec.version())
++                .build();
++        HttpResponse<String> response = send(
++                requestTo("/catalog/api/items/" + encodeSegment(spec.catalogItemId()) + "/request")
++                        .header("Authorization", "Bearer " + accessToken)
++                        .header("Content-Type", "application/json")
++                        .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
++                        .build());
++        requireStatus(response, 200, "requestCatalogItemInstances");
++        Object parsed = Json.parse(response.body());
++        if (!(parsed instanceof List<?> instances) || instances.isEmpty()) {
++            throw new IOException("requestCatalogItemInstances returned no instance");
++        }
++        String deploymentId = Json.string(instances.get(0), "deploymentId");
++        if (deploymentId == null || deploymentId.isEmpty()) {
++            throw new IOException("requestCatalogItemInstances returned no deploymentId");
++        }
++        return deploymentId;
+     }
+ 
+     /** getDeploymentById: polls until the deployment reports a terminal status, which it returns. */
+     private String awaitDeployment(String accessToken, String deploymentId)
+             throws IOException, InterruptedException {
+-        throw new UnsupportedOperationException("awaitDeployment is not implemented");
++        String path = "/deployment/api/deployments/" + encodeSegment(deploymentId);
++        for (int attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt++) {
++            if (attempt > 0) {
++                awaitNextPoll();
++            }
++            Map<String, Object> deployment = getJsonObject(accessToken, path, "getDeploymentById");
++            String status = Json.string(deployment, "status");
++            if (status != null && DEPLOYMENT_TERMINAL_STATUSES.contains(status)) {
++                return status;
++            }
++        }
++        throw new IOException("deployment " + deploymentId
++                + " did not reach a terminal status within " + MAX_POLL_ATTEMPTS + " polls");
+     }
+ 
+     /**
+@@ -161,13 +314,143 @@
+     private Map<String, Object> submitResourceAction(String accessToken, String deploymentId,
+                                                      ActionSpec spec)
+             throws IOException, InterruptedException {
+-        throw new UnsupportedOperationException("submitResourceAction is not implemented");
++        String body = new JsonObject()
++                .put("actionId", spec.actionId())
++                .putMap("inputs", spec.inputs())
++                .put("reason", spec.reason())
++                .build();
++        HttpResponse<String> response = send(
++                requestTo("/deployment/api/deployments/" + encodeSegment(deploymentId) + "/requests")
++                        .header("Authorization", "Bearer " + accessToken)
++                        .header("Content-Type", "application/json")
++                        .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
++                        .build());
++        requireStatus(response, 200, "submitDeploymentActionRequest");
++        return asObject(response.body(), "submitDeploymentActionRequest");
+     }
+ 
+     /** getRequest: polls until the request reports a terminal status, and returns it parsed. */
+     private Map<String, Object> awaitResourceAction(String accessToken, String requestId)
+             throws IOException, InterruptedException {
+-        throw new UnsupportedOperationException("awaitResourceAction is not implemented");
++        String path = "/deployment/api/requests/" + encodeSegment(requestId);
++        for (int attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt++) {
++            if (attempt > 0) {
++                awaitNextPoll();
++            }
++            Map<String, Object> request = getJsonObject(accessToken, path, "getRequest");
++            String status = Json.string(request, "status");
++            if (status != null && REQUEST_TERMINAL_STATUSES.contains(status)) {
++                return request;
++            }
++        }
++        throw new IOException("day-2 request " + requestId
++                + " did not reach a terminal status within " + MAX_POLL_ATTEMPTS + " polls");
++    }
++
++    /** Issues a bodyless GET and returns the JSON object it answered with. */
++    private Map<String, Object> getJsonObject(String accessToken, String path, String operationId)
++            throws IOException, InterruptedException {
++        HttpResponse<String> response = send(requestTo(path)
++                .header("Authorization", "Bearer " + accessToken)
++                .GET()
++                .build());
++        requireStatus(response, 200, operationId);
++        return asObject(response.body(), operationId);
++    }
++
++    @SuppressWarnings("unchecked")
++    private static Map<String, Object> asObject(String body, String operationId) throws IOException {
++        Object parsed = Json.parse(body);
++        if (!(parsed instanceof Map)) {
++            throw new IOException(operationId + " did not return a JSON object");
++        }
++        return (Map<String, Object>) parsed;
++    }
++
++    private static void requireStatus(HttpResponse<String> response, int expected, String operationId)
++            throws ApiFailure {
++        if (response.statusCode() != expected) {
++            throw new ApiFailure(operationId + " was rejected with HTTP " + response.statusCode()
++                    + ": " + response.body());
++        }
++    }
++
++    /** A step the appliance refused. It ends the run without pretending anything else happened. */
++    private static final class ApiFailure extends IOException {
++        private static final long serialVersionUID = 1L;
++
++        ApiFailure(String message) {
++            super(message);
++        }
++    }
++
++    /** Builds a JSON object body, dropping every field whose value the caller left unset. */
++    private static final class JsonObject {
++        private final StringBuilder text = new StringBuilder("{");
++
++        JsonObject put(String name, String value) {
++            return value == null || value.isEmpty()
++                    ? this : raw(name, "\"" + Json.escape(value) + "\"");
++        }
++
++        JsonObject put(String name, Number value) {
++            return value == null ? this : raw(name, String.valueOf(value));
++        }
++
++        JsonObject put(String name, Boolean value) {
++            return value == null ? this : raw(name, String.valueOf(value));
++        }
++
++        JsonObject putMap(String name, Map<String, String> value) {
++            if (value == null || value.isEmpty()) {
++                return this;
++            }
++            JsonObject nested = new JsonObject();
++            value.forEach((key, item) -> nested.put(key, item));
++            return raw(name, nested.build());
++        }
++
++        JsonObject putRaw(String name, String json) {
++            return json == null ? this : raw(name, json);
++        }
++
++        private JsonObject raw(String name, String json) {
++            if (text.length() > 1) {
++                text.append(',');
++            }
++            text.append('"').append(Json.escape(name)).append("\":").append(json);
++            return this;
++        }
++
++        String build() {
++            return text + "}";
++        }
++    }
++
++    /** Builds a query string, dropping every optional parameter the caller left unset. */
++    private static final class Query {
++        private final StringBuilder text = new StringBuilder();
++
++        Query add(String name, String value) {
++            if (value == null || value.isEmpty()) {
++                return this;
++            }
++            if (text.length() > 0) {
++                text.append('&');
++            }
++            text.append(URLEncoder.encode(name, StandardCharsets.UTF_8))
++                    .append('=')
++                    .append(URLEncoder.encode(value, StandardCharsets.UTF_8));
++            return this;
++        }
++
++        Query add(String name, Boolean value) {
++            return value == null ? this : add(name, String.valueOf(value));
++        }
++
++        String build() {
++            return text.length() == 0 ? "" : "?" + text;
++        }
+     }
+ 
+     // ---------------------------------------------------------------------------------------

@@ -1,0 +1,524 @@
+diff --git a/src/VcfDiagnostics.java b/src/VcfDiagnostics.java
+--- a/src/VcfDiagnostics.java
++++ b/src/VcfDiagnostics.java
+@@ -1,4 +1,19 @@
++import java.net.URI;
++import java.net.URLEncoder;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
+ import java.nio.file.Path;
++import java.time.Duration;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.TreeSet;
+ 
+ /**
+  * Diagnostic client for SDDC-51782.
+@@ -7,11 +22,16 @@
+  * seven SDDC Manager operations that are available, their query parameters and
+  * their request-body properties.
+  *
+- * Keep everything in this one file and use only the JDK standard library
+- * (java.net.http.HttpClient is available).
++ * Request bodies and query strings are built by putting in only the fields that
++ * are actually being set, so anything left unset is absent from the wire rather
++ * than sent as null, "" or false.
+  */
+ public final class VcfDiagnostics {
+ 
++    private static final int MAX_BUNDLE_POLLS = 30;
++    private static final Duration POLL_INTERVAL = Duration.ofSeconds(1);
++    private static final String SUCCESSFUL = "SUCCESSFUL";
++
+     /**
+      * Investigates the failed credential rotation and writes {@code outDir/diagnosis.json}.
+      *
+@@ -23,8 +43,479 @@
+      */
+     public static Path diagnose(String baseUrl, String username, String password, Path outDir)
+             throws Exception {
+-        throw new UnsupportedOperationException(
+-                "VcfDiagnostics.diagnose is not implemented yet - see docs/incident.md");
++        Api api = new Api(baseUrl);
++
++        // 1. Authenticate. Only username and password are being set, so apiKey and
++        //    idToken never reach the wire.
++        Map<String, Object> tokenSpec = new LinkedHashMap<>();
++        tokenSpec.put("username", username);
++        tokenSpec.put("password", password);
++        Map<String, Object> tokenPair = api.postObject("/v1/tokens", tokenSpec, 201);
++        api.authenticate(str(tokenPair.get("accessToken")));
++
++        // 2. Find the failed rotation, narrowed server-side to the three filters we need.
++        Map<String, String> taskFilter = new LinkedHashMap<>();
++        taskFilter.put("taskStatus", "Failed");
++        taskFilter.put("taskType", "CREDENTIALS_ROTATE");
++        taskFilter.put("limit", "50");
++        Map<String, Object> page = api.getObject("/v1/tasks", taskFilter);
++        List<Object> tasks = list(page.get("elements"));
++        if (tasks.isEmpty()) {
++            throw new IllegalStateException("no failed CREDENTIALS_ROTATE task to diagnose");
++        }
++        Map<String, Object> task = object(tasks.get(0));
++        String taskId = str(task.get("id"));
++        String taskType = str(task.get("type"));
++        System.out.println("[diag] failed rotation task " + taskId + " (" + taskType + ")");
++
++        // 3. The rotation roster. The top-level errors here are generic, so the cause
++        //    has to come from the subtasks and the notifications.
++        Map<String, Object> credentialsTask =
++                api.getObject("/v1/credentials/tasks/" + taskId, Map.of());
++        String credentialsTaskStatus = str(credentialsTask.get("status"));
++
++        List<String> failedSubtaskIds = new ArrayList<>();
++        Set<String> affectedHosts = new TreeSet<>();
++        for (Object entry : list(credentialsTask.get("subTasks"))) {
++            Map<String, Object> sub = object(entry);
++            if (!SUCCESSFUL.equals(str(sub.get("status")))) {
++                failedSubtaskIds.add(str(sub.get("id")));
++                affectedHosts.add(str(sub.get("resourceName")));
++            }
++        }
++        failedSubtaskIds.sort(String::compareTo);
++        System.out.println("[diag] " + failedSubtaskIds.size() + " subtask(s) did not succeed on "
++                + affectedHosts);
++
++        // 4. Detail for the subtasks that failed, and only those.
++        for (String subtaskId : failedSubtaskIds) {
++            Map<String, Object> detail = api.getObject(
++                    "/v1/credentials/tasks/" + taskId + "/subtasks/" + subtaskId, Map.of());
++            for (Object entry : list(detail.get("subTasks"))) {
++                for (Object err : list(object(entry).get("errors"))) {
++                    System.out.println("[diag]   subtask " + subtaskId + ": "
++                            + str(object(err).get("message")));
++                }
++            }
++        }
++
++        // 5. Notifications, correlated against the hosts whose subtasks failed. A
++        //    notification only counts as evidence if it concerns one of those hosts,
++        //    which rules out same-type warnings raised for other domains.
++        List<Object> notifications = api.getArray("/v1/notifications");
++        Map<String, Set<String>> hostsByType = new LinkedHashMap<>();
++        Map<String, Set<String>> domainsByType = new LinkedHashMap<>();
++        for (Object entry : notifications) {
++            Map<String, Object> note = object(entry);
++            Set<String> hit = new LinkedHashSet<>();
++            for (Object resource : list(note.get("resources"))) {
++                String name = str(object(resource).get("name"));
++                if (affectedHosts.contains(name)) {
++                    hit.add(name);
++                }
++            }
++            if (hit.isEmpty()) {
++                continue;
++            }
++            String type = str(note.get("type"));
++            hostsByType.computeIfAbsent(type, k -> new LinkedHashSet<>()).addAll(hit);
++            Map<String, Object> domain = object(note.get("domain"));
++            if (domain != null && domain.get("name") != null) {
++                domainsByType.computeIfAbsent(type, k -> new LinkedHashSet<>())
++                        .add(str(domain.get("name")));
++            }
++        }
++
++        String rootCauseType = null;
++        for (Map.Entry<String, Set<String>> e : hostsByType.entrySet()) {
++            if (e.getValue().containsAll(affectedHosts)) {
++                rootCauseType = e.getKey();
++                break;
++            }
++        }
++        if (rootCauseType == null) {
++            throw new IllegalStateException(
++                    "no notification covers every affected host; candidates were " + hostsByType);
++        }
++        Set<String> domains = domainsByType.getOrDefault(rootCauseType, Set.of());
++        if (domains.size() != 1) {
++            throw new IllegalStateException(
++                    "expected the affected hosts to sit in one domain, found " + domains);
++        }
++        String domainName = domains.iterator().next();
++        System.out.println("[diag] root cause " + rootCauseType + " in domain " + domainName);
++
++        // 6. Support bundle for the ticket: ESXi and SDDC Manager logs only, scoped to
++        //    the affected domain. Every other flag is simply not put into the map.
++        Map<String, Object> logs = new LinkedHashMap<>();
++        logs.put("esxLogs", Boolean.TRUE);
++        logs.put("sddcManagerLogs", Boolean.TRUE);
++
++        Map<String, Object> domainEntry = new LinkedHashMap<>();
++        domainEntry.put("domainName", domainName);
++        Map<String, Object> scope = new LinkedHashMap<>();
++        scope.put("domains", List.of(domainEntry));
++
++        Map<String, Object> bundleSpec = new LinkedHashMap<>();
++        bundleSpec.put("logs", logs);
++        bundleSpec.put("scope", scope);
++
++        Map<String, Object> bundle =
++                api.postObject("/v1/system/support-bundles", bundleSpec, 202);
++        String bundleId = str(bundle.get("id"));
++
++        // 7. Poll until the bundle reaches a terminal status.
++        String bundleStatus = str(bundle.get("status"));
++        for (int attempt = 0; attempt < MAX_BUNDLE_POLLS; attempt++) {
++            Map<String, Object> status =
++                    api.getObject("/v1/system/support-bundles/" + bundleId, Map.of());
++            bundleStatus = str(status.get("status"));
++            if (!"IN_PROGRESS".equals(bundleStatus)) {
++                break;
++            }
++            Thread.sleep(POLL_INTERVAL.toMillis());
++        }
++        if ("IN_PROGRESS".equals(bundleStatus)) {
++            throw new IllegalStateException(
++                    "support bundle " + bundleId + " was still running after "
++                            + MAX_BUNDLE_POLLS + " polls");
++        }
++        System.out.println("[diag] support bundle " + bundleId + " " + bundleStatus);
++
++        String summary = "The rotation did not fail for the network reason the subtask errors"
++                + " report: SDDC Manager raised " + rootCauseType + " for "
++                + String.join(" and ", affectedHosts) + " in domain " + domainName
++                + ", so the root account was already locked out after repeated failed"
++                + " authentication attempts and the hosts refused the password change.";
++
++        Map<String, Object> diagnosis = new LinkedHashMap<>();
++        diagnosis.put("taskId", taskId);
++        diagnosis.put("taskType", taskType);
++        diagnosis.put("credentialsTaskStatus", credentialsTaskStatus);
++        diagnosis.put("failedSubtaskIds", failedSubtaskIds);
++        diagnosis.put("affectedHosts", new ArrayList<>(affectedHosts));
++        diagnosis.put("domainName", domainName);
++        diagnosis.put("rootCauseNotificationType", rootCauseType);
++        diagnosis.put("rootCauseSummary", summary);
++        diagnosis.put("supportBundleId", bundleId);
++        diagnosis.put("supportBundleStatus", bundleStatus);
++
++        Files.createDirectories(outDir);
++        Path target = outDir.resolve("diagnosis.json");
++        Files.writeString(target, Json.write(diagnosis) + "\n");
++        return target;
++    }
++
++    // ------------------------------------------------------------------ http --
++
++    /** Thin SDDC Manager client. Sends a header or a parameter only when it has one. */
++    private static final class Api {
++        private final HttpClient http = HttpClient.newBuilder()
++                .connectTimeout(Duration.ofSeconds(10))
++                .build();
++        private final String baseUrl;
++        private String accessToken;
++
++        Api(String baseUrl) {
++            this.baseUrl = baseUrl.endsWith("/")
++                    ? baseUrl.substring(0, baseUrl.length() - 1)
++                    : baseUrl;
++        }
++
++        void authenticate(String accessToken) {
++            this.accessToken = accessToken;
++        }
++
++        private HttpRequest.Builder request(String path, Map<String, String> query) {
++            StringBuilder url = new StringBuilder(baseUrl).append(path);
++            if (query != null && !query.isEmpty()) {
++                char sep = '?';
++                for (Map.Entry<String, String> e : query.entrySet()) {
++                    url.append(sep)
++                            .append(URLEncoder.encode(e.getKey(), StandardCharsets.UTF_8))
++                            .append('=')
++                            .append(URLEncoder.encode(e.getValue(), StandardCharsets.UTF_8));
++                    sep = '&';
++                }
++            }
++            HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(url.toString()))
++                    .timeout(Duration.ofSeconds(30));
++            if (accessToken != null) {
++                builder.header("Authorization", "Bearer " + accessToken);
++            }
++            return builder;
++        }
++
++        private String send(HttpRequest req, int expected) throws Exception {
++            HttpResponse<String> res = http.send(req, HttpResponse.BodyHandlers.ofString());
++            if (res.statusCode() != expected) {
++                throw new IllegalStateException(req.method() + " " + req.uri().getPath()
++                        + " expected HTTP " + expected + " but got " + res.statusCode()
++                        + ": " + res.body());
++            }
++            return res.body();
++        }
++
++        Map<String, Object> getObject(String path, Map<String, String> query) throws Exception {
++            return object(Json.parse(send(request(path, query).GET().build(), 200)));
++        }
++
++        List<Object> getArray(String path) throws Exception {
++            return list(Json.parse(send(request(path, Map.of()).GET().build(), 200)));
++        }
++
++        Map<String, Object> postObject(String path, Map<String, Object> body, int expected)
++                throws Exception {
++            HttpRequest req = request(path, Map.of())
++                    .header("Content-Type", "application/json")
++                    .POST(HttpRequest.BodyPublishers.ofString(Json.write(body),
++                            StandardCharsets.UTF_8))
++                    .build();
++            return object(Json.parse(send(req, expected)));
++        }
++    }
++
++    // ------------------------------------------------------------------ json --
++
++    @SuppressWarnings("unchecked")
++    private static Map<String, Object> object(Object value) {
++        return (Map<String, Object>) value;
++    }
++
++    @SuppressWarnings("unchecked")
++    private static List<Object> list(Object value) {
++        return value == null ? List.of() : (List<Object>) value;
++    }
++
++    private static String str(Object value) {
++        return value == null ? null : String.valueOf(value);
++    }
++
++    /** Minimal JSON reader/writer - the JDK has no JSON support and we take no dependencies. */
++    private static final class Json {
++
++        private final String src;
++        private int pos;
++
++        private Json(String src) {
++            this.src = src;
++        }
++
++        static Object parse(String text) {
++            Json p = new Json(text);
++            p.skipWhitespace();
++            Object value = p.readValue();
++            p.skipWhitespace();
++            if (p.pos != p.src.length()) {
++                throw new IllegalArgumentException("trailing content at offset " + p.pos);
++            }
++            return value;
++        }
++
++        private void skipWhitespace() {
++            while (pos < src.length() && Character.isWhitespace(src.charAt(pos))) {
++                pos++;
++            }
++        }
++
++        private char peek() {
++            if (pos >= src.length()) {
++                throw new IllegalArgumentException("unexpected end of JSON input");
++            }
++            return src.charAt(pos);
++        }
++
++        private void expect(char c) {
++            if (peek() != c) {
++                throw new IllegalArgumentException(
++                        "expected '" + c + "' at offset " + pos + " but found '" + peek() + "'");
++            }
++            pos++;
++        }
++
++        private Object readValue() {
++            char c = peek();
++            switch (c) {
++                case '{':
++                    return readObject();
++                case '[':
++                    return readArray();
++                case '"':
++                    return readString();
++                case 't':
++                    return readLiteral("true", Boolean.TRUE);
++                case 'f':
++                    return readLiteral("false", Boolean.FALSE);
++                case 'n':
++                    return readLiteral("null", null);
++                default:
++                    return readNumber();
++            }
++        }
++
++        private Object readLiteral(String literal, Object value) {
++            if (!src.startsWith(literal, pos)) {
++                throw new IllegalArgumentException("bad literal at offset " + pos);
++            }
++            pos += literal.length();
++            return value;
++        }
++
++        private Map<String, Object> readObject() {
++            Map<String, Object> map = new LinkedHashMap<>();
++            expect('{');
++            skipWhitespace();
++            if (peek() == '}') {
++                pos++;
++                return map;
++            }
++            while (true) {
++                skipWhitespace();
++                String key = readString();
++                skipWhitespace();
++                expect(':');
++                skipWhitespace();
++                map.put(key, readValue());
++                skipWhitespace();
++                if (peek() == ',') {
++                    pos++;
++                    continue;
++                }
++                expect('}');
++                return map;
++            }
++        }
++
++        private List<Object> readArray() {
++            List<Object> items = new ArrayList<>();
++            expect('[');
++            skipWhitespace();
++            if (peek() == ']') {
++                pos++;
++                return items;
++            }
++            while (true) {
++                skipWhitespace();
++                items.add(readValue());
++                skipWhitespace();
++                if (peek() == ',') {
++                    pos++;
++                    continue;
++                }
++                expect(']');
++                return items;
++            }
++        }
++
++        private String readString() {
++            expect('"');
++            StringBuilder sb = new StringBuilder();
++            while (true) {
++                char c = src.charAt(pos++);
++                if (c == '"') {
++                    return sb.toString();
++                }
++                if (c != '\\') {
++                    sb.append(c);
++                    continue;
++                }
++                char esc = src.charAt(pos++);
++                switch (esc) {
++                    case '"': sb.append('"'); break;
++                    case '\\': sb.append('\\'); break;
++                    case '/': sb.append('/'); break;
++                    case 'b': sb.append('\b'); break;
++                    case 'f': sb.append('\f'); break;
++                    case 'n': sb.append('\n'); break;
++                    case 'r': sb.append('\r'); break;
++                    case 't': sb.append('\t'); break;
++                    case 'u':
++                        sb.append((char) Integer.parseInt(src.substring(pos, pos + 4), 16));
++                        pos += 4;
++                        break;
++                    default:
++                        throw new IllegalArgumentException("bad escape \\" + esc);
++                }
++            }
++        }
++
++        private Object readNumber() {
++            int start = pos;
++            while (pos < src.length() && "+-.eE0123456789".indexOf(src.charAt(pos)) >= 0) {
++                pos++;
++            }
++            String text = src.substring(start, pos);
++            if (text.isEmpty()) {
++                throw new IllegalArgumentException("expected a value at offset " + start);
++            }
++            if (text.indexOf('.') < 0 && text.indexOf('e') < 0 && text.indexOf('E') < 0) {
++                return Long.parseLong(text);
++            }
++            return Double.parseDouble(text);
++        }
++
++        static String write(Object value) {
++            StringBuilder sb = new StringBuilder();
++            writeValue(value, sb);
++            return sb.toString();
++        }
++
++        private static void writeValue(Object value, StringBuilder sb) {
++            if (value == null) {
++                sb.append("null");
++            } else if (value instanceof Map<?, ?> map) {
++                sb.append('{');
++                boolean first = true;
++                for (Map.Entry<?, ?> e : map.entrySet()) {
++                    if (!first) {
++                        sb.append(',');
++                    }
++                    first = false;
++                    writeString(String.valueOf(e.getKey()), sb);
++                    sb.append(':');
++                    writeValue(e.getValue(), sb);
++                }
++                sb.append('}');
++            } else if (value instanceof Iterable<?> items) {
++                sb.append('[');
++                boolean first = true;
++                for (Object item : items) {
++                    if (!first) {
++                        sb.append(',');
++                    }
++                    first = false;
++                    writeValue(item, sb);
++                }
++                sb.append(']');
++            } else if (value instanceof Boolean || value instanceof Number) {
++                sb.append(value);
++            } else {
++                writeString(String.valueOf(value), sb);
++            }
++        }
++
++        private static void writeString(String text, StringBuilder sb) {
++            sb.append('"');
++            for (int i = 0; i < text.length(); i++) {
++                char c = text.charAt(i);
++                switch (c) {
++                    case '"': sb.append("\\\""); break;
++                    case '\\': sb.append("\\\\"); break;
++                    case '\b': sb.append("\\b"); break;
++                    case '\f': sb.append("\\f"); break;
++                    case '\n': sb.append("\\n"); break;
++                    case '\r': sb.append("\\r"); break;
++                    case '\t': sb.append("\\t"); break;
++                    default:
++                        if (c < 0x20) {
++                            sb.append(String.format("\\u%04x", (int) c));
++                        } else {
++                            sb.append(c);
++                        }
++                }
++            }
++            sb.append('"');
++        }
+     }
+ 
+     public static void main(String[] args) throws Exception {

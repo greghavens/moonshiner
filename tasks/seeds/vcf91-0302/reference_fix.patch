@@ -1,0 +1,215 @@
+diff --git a/files/src/com/vmware/vcfops/networks/NetworkInsightInventoryClient.java b/files/src/com/vmware/vcfops/networks/NetworkInsightInventoryClient.java
+index 86a8b32..e26585c 100644
+--- a/files/src/com/vmware/vcfops/networks/NetworkInsightInventoryClient.java
++++ b/files/src/com/vmware/vcfops/networks/NetworkInsightInventoryClient.java
+@@ -11,6 +11,7 @@ import java.util.ArrayList;
+ import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.function.Supplier;
+ 
+ /**
+  * Client for the VCF Operations for Networks application inventory sweep.
+@@ -19,14 +20,11 @@ import java.util.Map;
+  * {@code specifications/vcf-operations/vcf-operations-for-networks-openapi.yaml} in
+  * vmware/vcf-api-specs.
+  *
+- * <p>Status: first draft. It logs in and reads the first page of applications, which is enough
+- * against a small lab appliance, but it has not been finished for a real inventory:
+- *
+- * <ul>
+- *   <li>it stops after one page instead of following the {@code cursor};
+- *   <li>it has no answer for a token that expires part way through a sweep;
+- *   <li>it never releases the token it acquired.
+- * </ul>
++ * <p>The appliance issues short-lived auth tokens and answers 401 once one expires, which on a
++ * large inventory happens part way through a sweep. Refreshing is handled underneath the sweep:
++ * {@link #sendAuthenticated} re-authenticates and replays the rejected request verbatim, so the
++ * pagination cursor and the summaries gathered so far survive the expiry untouched. The sweep
++ * itself never sees a 401 and never restarts.
+  */
+ public class NetworkInsightInventoryClient {
+ 
+@@ -36,6 +34,8 @@ public class NetworkInsightInventoryClient {
+     /** Page size to request from listApplications. */
+     private static final int PAGE_SIZE = 5;
+ 
++    private static final String AUTH_SCHEME = "NetworkInsight ";
++
+     private final String baseUrl;
+     private final String username;
+     private final String password;
+@@ -58,28 +58,44 @@ public class NetworkInsightInventoryClient {
+      */
+     public List<ApplicationSummary> collectApplicationInventory() throws Exception {
+         authenticate();
+-
+-        List<String> entityIds = new ArrayList<>();
+-        Map<String, Object> page = getJson(applicationsUri(null));
+-        List<Object> results = Json.listAt(page, "results");
+-        if (results != null) {
+-            for (Object entry : results) {
+-                @SuppressWarnings("unchecked")
+-                Map<String, Object> entity = (Map<String, Object>) entry;
+-                entityIds.add(Json.stringAt(entity, "entity_id"));
++        try {
++            List<String> entityIds = listAllApplicationIds();
++
++            List<ApplicationSummary> summaries = new ArrayList<>(entityIds.size());
++            for (String entityId : entityIds) {
++                Map<String, Object> app = getJson(applicationUri(entityId));
++                summaries.add(new ApplicationSummary(
++                        Json.stringAt(app, "entity_id"),
++                        Json.stringAt(app, "name"),
++                        Json.intAt(app, "tier_count", 0),
++                        Json.intAt(app, "member_count", 0)));
+             }
++            return summaries;
++        } finally {
++            // The specification caps valid tokens per user and advises deleting them after use.
++            // Only the token still in hand is deleted; expired ones would answer 401.
++            releaseToken();
+         }
++    }
+ 
+-        List<ApplicationSummary> summaries = new ArrayList<>();
+-        for (String entityId : entityIds) {
+-            Map<String, Object> app = getJson(applicationUri(entityId));
+-            summaries.add(new ApplicationSummary(
+-                    Json.stringAt(app, "entity_id"),
+-                    Json.stringAt(app, "name"),
+-                    Json.intAt(app, "tier_count", 0),
+-                    Json.intAt(app, "member_count", 0)));
+-        }
+-        return summaries;
++    /** Walks every page of listApplications, following the cursor until the appliance stops. */
++    private List<String> listAllApplicationIds() throws Exception {
++        List<String> entityIds = new ArrayList<>();
++        String cursor = null;
++        do {
++            Map<String, Object> page = getJson(applicationsUri(cursor));
++            List<Object> results = Json.listAt(page, "results");
++            if (results != null) {
++                for (Object entry : results) {
++                    @SuppressWarnings("unchecked")
++                    Map<String, Object> entity = (Map<String, Object>) entry;
++                    entityIds.add(Json.stringAt(entity, "entity_id"));
++                }
++            }
++            // Absent or null on the final page.
++            cursor = Json.stringAt(page, "cursor");
++        } while (cursor != null && !cursor.isEmpty());
++        return entityIds;
+     }
+ 
+     // -------------------------------------------------------- operationId: create
+@@ -88,7 +104,8 @@ public class NetworkInsightInventoryClient {
+     private void authenticate() throws Exception {
+         Map<String, Object> domain = new LinkedHashMap<>();
+         domain.put("domain_type", "LOCAL");
+-        domain.put("value", "");
++        // Domain.value is "not required for LOCAL domain": leave the key out rather than
++        // sending it empty.
+ 
+         Map<String, Object> credential = new LinkedHashMap<>();
+         credential.put("username", username);
+@@ -107,6 +124,29 @@ public class NetworkInsightInventoryClient {
+                     "Authentication failed: HTTP " + response.statusCode() + " " + response.body());
+         }
+         this.token = Json.stringAt(Json.parseObject(response.body()), "token");
++        if (token == null || token.isEmpty()) {
++            throw new IllegalStateException("Token response carried no token: " + response.body());
++        }
++    }
++
++    // -------------------------------------------------------- operationId: delete
++
++    /** DELETE /api/ni/auth/token */
++    private void releaseToken() throws Exception {
++        if (token == null) {
++            return;
++        }
++        HttpRequest request = authenticated(
++                HttpRequest.newBuilder(URI.create(baseUrl + "/api/ni/auth/token")))
++                .DELETE()
++                .build();
++        HttpResponse<String> response =
++                http.send(request, HttpResponse.BodyHandlers.ofString());
++        token = null;
++        if (response.statusCode() != 204 && response.statusCode() != 401) {
++            throw new IllegalStateException("Deleting the auth token failed: HTTP "
++                    + response.statusCode() + " " + response.body());
++        }
+     }
+ 
+     // ------------------------------------------------- operationId: listApplications
+@@ -115,8 +155,10 @@ public class NetworkInsightInventoryClient {
+     private URI applicationsUri(String cursor) {
+         Map<String, String> query = new LinkedHashMap<>();
+         query.put("size", String.valueOf(PAGE_SIZE));
+-        query.put("cursor", cursor == null ? "" : cursor);
+-        query.put("modifiedAfter", "");
++        if (cursor != null && !cursor.isEmpty()) {
++            query.put("cursor", cursor);
++        }
++        // modifiedAfter is unused by this sweep, so it is not sent at all.
+         return URI.create(baseUrl + "/api/ni/groups/applications" + queryString(query));
+     }
+ 
+@@ -126,7 +168,7 @@ public class NetworkInsightInventoryClient {
+     private URI applicationUri(String entityId) {
+         Map<String, String> query = new LinkedHashMap<>();
+         query.put("fetch_member_counts", "true");
+-        query.put("fetch_update_status", "");
++        // fetch_update_status is unused by this sweep, so it is not sent at all.
+         return URI.create(baseUrl + "/api/ni/groups/applications/"
+                 + encode(entityId) + queryString(query));
+     }
+@@ -134,13 +176,8 @@ public class NetworkInsightInventoryClient {
+     // ------------------------------------------------------------------ plumbing
+ 
+     private Map<String, Object> getJson(URI uri) throws Exception {
+-        HttpRequest request = HttpRequest.newBuilder(uri)
+-                .header("Authorization", "NetworkInsight " + token)
+-                .header("Accept", "application/json")
+-                .GET()
+-                .build();
+-
+-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
++        HttpResponse<String> response = sendAuthenticated(
++                () -> authenticated(HttpRequest.newBuilder(uri)).GET().build());
+         if (response.statusCode() != 200) {
+             throw new IllegalStateException(
+                     "GET " + uri.getPath() + " failed: HTTP " + response.statusCode()
+@@ -149,6 +186,31 @@ public class NetworkInsightInventoryClient {
+         return Json.parseObject(response.body());
+     }
+ 
++    /**
++     * Sends a request, and if the appliance reports the token expired, acquires a fresh one and
++     * replays the identical request.
++     *
++     * <p>The request is rebuilt from {@code factory} on each attempt so it picks up the new token
++     * while method, path and query stay byte-for-byte the same. Callers keep whatever progress
++     * they had: no page is re-listed and no application is re-fetched.
++     */
++    private HttpResponse<String> sendAuthenticated(Supplier<HttpRequest> factory) throws Exception {
++        while (true) {
++            HttpResponse<String> response =
++                    http.send(factory.get(), HttpResponse.BodyHandlers.ofString());
++            if (response.statusCode() != 401) {
++                return response;
++            }
++            authenticate();
++        }
++    }
++
++    private HttpRequest.Builder authenticated(HttpRequest.Builder builder) {
++        return builder
++                .header("Authorization", AUTH_SCHEME + token)
++                .header("Accept", "application/json");
++    }
++
+     private static String queryString(Map<String, String> query) {
+         StringBuilder sb = new StringBuilder();
+         for (Map.Entry<String, String> e : query.entrySet()) {

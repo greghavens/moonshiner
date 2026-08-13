@@ -1,0 +1,452 @@
+--- a/vcenter/client.go
++++ b/vcenter/client.go
+@@ -4,12 +4,26 @@
+ 
+ import (
+ 	"context"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"io"
++	"mime"
+ 	"net/http"
++	"net/url"
++	"strings"
+ 	"sync"
+ )
+ 
++const (
++	basePath      = "/api"
++	sessionHeader = "vmware-api-session-id"
++
++	operationCreate = "Cis.Session_create"
++	operationDelete = "Cis.Session_delete"
++	operationList   = "Vcenter.VM_list"
++)
++
+ // Credential is a vCenter secret exchanged for a session token by
+ // Cis.Session_create.
+ type Credential struct {
+@@ -67,9 +81,6 @@
+ // ErrSessionActive is returned by Login when a session is already held.
+ var ErrSessionActive = errors.New("vcenter: a session is already active")
+ 
+-// ErrNotImplemented is returned by the exercise stub.
+-var ErrNotImplemented = errors.New("vcenter session rotation is not implemented")
+-
+ // Client calls the three operations in the focused vCenter contract and owns
+ // the lifetime of the session token they share.
+ type Client struct {
+@@ -93,11 +104,27 @@
+ // NewClient constructs a focused vCenter client for a service root such as
+ // "https://vcenter.example.com". A nil HTTP client uses http.DefaultClient.
+ func NewClient(serviceRoot string, credential Credential, httpClient *http.Client) (*Client, error) {
++	parsed, err := url.Parse(serviceRoot)
++	if err != nil {
++		return nil, fmt.Errorf("vcenter: service root is not a URL: %w", err)
++	}
++	if parsed.Scheme != "http" && parsed.Scheme != "https" {
++		return nil, errors.New("vcenter: service root must use http or https")
++	}
++	if parsed.Host == "" {
++		return nil, errors.New("vcenter: service root must be absolute")
++	}
++	if parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.User != nil {
++		return nil, errors.New("vcenter: service root must carry no path, query, fragment, or userinfo")
++	}
++	if err := validateCredential(credential); err != nil {
++		return nil, err
++	}
+ 	if httpClient == nil {
+ 		httpClient = http.DefaultClient
+ 	}
+ 	return &Client{
+-		serviceRoot: serviceRoot,
++		serviceRoot: strings.TrimSuffix(parsed.String(), "/"),
+ 		httpClient:  httpClient,
+ 		credential:  credential,
+ 	}, nil
+@@ -105,22 +132,379 @@
+ 
+ // Login exchanges the current credential for a session token.
+ func (c *Client) Login(ctx context.Context) error {
+-	return ErrNotImplemented
++	if ctx == nil {
++		return errors.New("vcenter: context is nil")
++	}
++	c.mu.Lock()
++	if c.session != nil && !c.session.retired {
++		c.mu.Unlock()
++		return ErrSessionActive
++	}
++	credential := c.credential
++	c.mu.Unlock()
++
++	token, err := c.createSession(ctx, credential)
++	if err != nil {
++		return err
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.session != nil && !c.session.retired {
++		return ErrSessionActive
++	}
++	c.session = newSession(token)
++	return nil
+ }
+ 
+ // ListVMs returns the virtual machines matching filter, using whichever session
+ // token is current when the request starts.
+ func (c *Client) ListVMs(ctx context.Context, filter Filter) ([]VM, error) {
+-	return nil, ErrNotImplemented
++	if ctx == nil {
++		return nil, errors.New("vcenter: context is nil")
++	}
++	query, err := encodeFilter(filter)
++	if err != nil {
++		return nil, err
++	}
++	current, err := c.acquire()
++	if err != nil {
++		return nil, err
++	}
++	defer c.release(current)
++
++	target := c.serviceRoot + basePath + "/vcenter/vm"
++	if query != "" {
++		target += "?" + query
++	}
++	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
++	if err != nil {
++		return nil, fmt.Errorf("vcenter: build %s request: %w", operationList, err)
++	}
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set(sessionHeader, current.token)
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return nil, fmt.Errorf("vcenter: %s transport failure", operationList)
++	}
++	defer closeBody(response)
++	if response.StatusCode != http.StatusOK {
++		return nil, &APIError{OperationID: operationList, StatusCode: response.StatusCode}
++	}
++	if err := requireJSON(operationList, response); err != nil {
++		return nil, err
++	}
++	body, err := io.ReadAll(response.Body)
++	if err != nil {
++		return nil, &ProtocolError{OperationID: operationList, Problem: "response body could not be read"}
++	}
++	return decodeSummaries(body)
+ }
+ 
+ // Rotate establishes a session for next, makes it current, and retires the
+ // previous session only after every request that started on it has finished.
+ func (c *Client) Rotate(ctx context.Context, next Credential) error {
+-	return ErrNotImplemented
++	if ctx == nil {
++		return errors.New("vcenter: context is nil")
++	}
++	if err := validateCredential(next); err != nil {
++		return err
++	}
++	c.mu.Lock()
++	if c.session == nil || c.session.retired {
++		c.mu.Unlock()
++		return ErrNoSession
++	}
++	c.mu.Unlock()
++
++	// The replacement session is established first so no window exists in which
++	// the client holds no usable token.
++	token, err := c.createSession(ctx, next)
++	if err != nil {
++		return err
++	}
++
++	c.mu.Lock()
++	previous := c.session
++	c.credential = next
++	c.session = newSession(token)
++	drained := retireLocked(previous)
++	c.mu.Unlock()
++
++	select {
++	case <-drained:
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++	if previous == nil {
++		return nil
++	}
++	return c.deleteSession(ctx, previous.token)
+ }
+ 
+ // Logout retires the current session once its in-flight requests have finished.
+ func (c *Client) Logout(ctx context.Context) error {
+-	return ErrNotImplemented
++	if ctx == nil {
++		return errors.New("vcenter: context is nil")
++	}
++	c.mu.Lock()
++	previous := c.session
++	if previous == nil || previous.retired {
++		c.mu.Unlock()
++		return ErrNoSession
++	}
++	drained := retireLocked(previous)
++	c.session = nil
++	c.mu.Unlock()
++
++	select {
++	case <-drained:
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++	return c.deleteSession(ctx, previous.token)
++}
++
++func newSession(token string) *session {
++	return &session{token: token, drained: make(chan struct{})}
++}
++
++// acquire pins the current session for the lifetime of one request.
++func (c *Client) acquire() (*session, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.session == nil || c.session.retired {
++		return nil, ErrNoSession
++	}
++	c.session.inFlight++
++	return c.session, nil
++}
++
++func (c *Client) release(current *session) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	current.inFlight--
++	if current.retired && current.inFlight == 0 {
++		current.closeOne.Do(func() { close(current.drained) })
++	}
++}
++
++// retireLocked stops new requests from picking up a session and returns the
++// channel closed once its outstanding requests have finished.
++func retireLocked(current *session) <-chan struct{} {
++	closed := make(chan struct{})
++	if current == nil {
++		close(closed)
++		return closed
++	}
++	current.retired = true
++	if current.inFlight == 0 {
++		current.closeOne.Do(func() { close(current.drained) })
++	}
++	return current.drained
++}
++
++func (c *Client) createSession(ctx context.Context, credential Credential) (string, error) {
++	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.serviceRoot+basePath+"/session", nil)
++	if err != nil {
++		return "", fmt.Errorf("vcenter: build %s request: %w", operationCreate, err)
++	}
++	request.Header.Set("Accept", "application/json")
++	request.SetBasicAuth(credential.Username, credential.Password)
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return "", fmt.Errorf("vcenter: %s transport failure", operationCreate)
++	}
++	defer closeBody(response)
++	if response.StatusCode != http.StatusCreated {
++		return "", &APIError{OperationID: operationCreate, StatusCode: response.StatusCode}
++	}
++	if err := requireJSON(operationCreate, response); err != nil {
++		return "", err
++	}
++	body, err := io.ReadAll(response.Body)
++	if err != nil {
++		return "", &ProtocolError{OperationID: operationCreate, Problem: "response body could not be read"}
++	}
++	var decoded any
++	if err := json.Unmarshal(body, &decoded); err != nil {
++		return "", &ProtocolError{OperationID: operationCreate, Problem: "response body is not JSON"}
++	}
++	token, ok := decoded.(string)
++	if !ok {
++		return "", &ProtocolError{OperationID: operationCreate, Problem: "response body is not a bare JSON string session token"}
++	}
++	if strings.TrimSpace(token) == "" {
++		return "", &ProtocolError{OperationID: operationCreate, Problem: "session token is blank"}
++	}
++	if !headerSafe(token) {
++		return "", &ProtocolError{OperationID: operationCreate, Problem: "session token is not header safe"}
++	}
++	return token, nil
++}
++
++// headerSafe mirrors the standard library transport's field-value check. A
++// horizontal tab is permitted by HTTP; other controls and DEL are not.
++func headerSafe(value string) bool {
++	for index := 0; index < len(value); index++ {
++		character := value[index]
++		if (character < ' ' && character != '\t') || character == 0x7f {
++			return false
++		}
++	}
++	return true
++}
++
++func (c *Client) deleteSession(ctx context.Context, token string) error {
++	request, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.serviceRoot+basePath+"/session", nil)
++	if err != nil {
++		return fmt.Errorf("vcenter: build %s request: %w", operationDelete, err)
++	}
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set(sessionHeader, token)
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return fmt.Errorf("vcenter: %s transport failure", operationDelete)
++	}
++	defer closeBody(response)
++	if response.StatusCode != http.StatusNoContent {
++		return &APIError{OperationID: operationDelete, StatusCode: response.StatusCode}
++	}
++	return nil
++}
++
++// encodeFilter serialises the set members in the order the specification
++// declares them. Unset members are omitted outright rather than sent empty.
++func encodeFilter(filter Filter) (string, error) {
++	members := []struct {
++		name   string
++		values []string
++	}{
++		{"vms", filter.VMs},
++		{"names", filter.Names},
++		{"folders", filter.Folders},
++		{"datacenters", filter.Datacenters},
++		{"hosts", filter.Hosts},
++		{"clusters", filter.Clusters},
++		{"resource_pools", filter.ResourcePools},
++		{"power_states", filter.PowerStates},
++	}
++	var encoded strings.Builder
++	for _, member := range members {
++		if len(member.values) == 0 {
++			continue
++		}
++		seen := make(map[string]bool, len(member.values))
++		for _, value := range member.values {
++			if strings.TrimSpace(value) == "" {
++				return "", fmt.Errorf("vcenter: filter member %q has a blank value", member.name)
++			}
++			if seen[value] {
++				return "", fmt.Errorf("vcenter: filter member %q repeats a value but is declared uniqueItems", member.name)
++			}
++			seen[value] = true
++			if encoded.Len() > 0 {
++				encoded.WriteByte('&')
++			}
++			encoded.WriteString(member.name)
++			encoded.WriteByte('=')
++			encoded.WriteString(url.QueryEscape(value))
++		}
++	}
++	return encoded.String(), nil
++}
++
++func decodeSummaries(body []byte) ([]VM, error) {
++	var elements []json.RawMessage
++	if err := json.Unmarshal(body, &elements); err != nil {
++		return nil, &ProtocolError{OperationID: operationList, Problem: "response body is not a JSON array"}
++	}
++	if elements == nil {
++		return nil, &ProtocolError{OperationID: operationList, Problem: "response array is null"}
++	}
++	result := make([]VM, 0, len(elements))
++	seen := make(map[string]bool, len(elements))
++	for _, element := range elements {
++		var properties map[string]json.RawMessage
++		if err := json.Unmarshal(element, &properties); err != nil || properties == nil {
++			return nil, &ProtocolError{OperationID: operationList, Problem: "summary element is not an object"}
++		}
++		summary := VM{}
++		for _, required := range []struct {
++			name   string
++			target *string
++		}{
++			{"vm", &summary.VM},
++			{"name", &summary.Name},
++			{"power_state", &summary.PowerState},
++		} {
++			raw, present := properties[required.name]
++			if !present {
++				return nil, &ProtocolError{OperationID: operationList, Problem: "summary is missing a required property"}
++			}
++			var value string
++			if err := json.Unmarshal(raw, &value); err != nil || strings.TrimSpace(value) == "" {
++				return nil, &ProtocolError{OperationID: operationList, Problem: "required summary property is not a nonblank string"}
++			}
++			*required.target = value
++		}
++		if seen[summary.VM] {
++			return nil, &ProtocolError{OperationID: operationList, Problem: "summary repeats a virtual machine identifier"}
++		}
++		seen[summary.VM] = true
++
++		count, err := optionalInt64(properties, "cpu_count")
++		if err != nil {
++			return nil, err
++		}
++		memory, err := optionalInt64(properties, "memory_size_mib")
++		if err != nil {
++			return nil, err
++		}
++		summary.CPUCount = count
++		summary.MemorySizeMiB = memory
++		result = append(result, summary)
++	}
++	return result, nil
++}
++
++func optionalInt64(properties map[string]json.RawMessage, name string) (*int64, error) {
++	raw, present := properties[name]
++	if !present || string(raw) == "null" {
++		return nil, nil
++	}
++	text := strings.TrimSpace(string(raw))
++	if text == "true" || text == "false" || strings.ContainsAny(text, `".eE`) {
++		return nil, &ProtocolError{OperationID: operationList, Problem: "optional summary property is not an integer"}
++	}
++	var value int64
++	if err := json.Unmarshal(raw, &value); err != nil {
++		return nil, &ProtocolError{OperationID: operationList, Problem: "optional summary property is not an integer"}
++	}
++	return &value, nil
++}
++
++func requireJSON(operationID string, response *http.Response) error {
++	mediaType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
++	if err != nil || mediaType != "application/json" {
++		return &ProtocolError{OperationID: operationID, Problem: "response media type is not application/json"}
++	}
++	return nil
++}
++
++func closeBody(response *http.Response) {
++	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1<<20))
++	_ = response.Body.Close()
++}
++
++func validateCredential(credential Credential) error {
++	if strings.TrimSpace(credential.Username) == "" {
++		return errors.New("vcenter: credential username is blank")
++	}
++	if strings.TrimSpace(credential.Password) == "" {
++		return errors.New("vcenter: credential password is blank")
++	}
++	return nil
+ }

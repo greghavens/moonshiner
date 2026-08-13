@@ -1,0 +1,1444 @@
+diff --git a/client.go b/client.go
+new file mode 100644
+index 0000000..89de3a7
+--- /dev/null
++++ b/client.go
+@@ -0,0 +1,194 @@
++package vcfauto
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"strings"
++	"time"
++)
++
++// ClientConfig configures a Client.
++type ClientConfig struct {
++	// BaseURL is the scheme and host of the VCF Automation appliance.
++	BaseURL string
++	// Token is the bearer token sent as the Authorization header.
++	Token string
++	// Contract pins the operations the client may send.
++	Contract *Contract
++
++	HTTPClient   *http.Client
++	PollInterval time.Duration
++	MaxPolls     int
++}
++
++// Client speaks the subset of the VCF Automation deployment API that the
++// contract names.
++type Client struct {
++	base     string
++	token    string
++	contract *Contract
++	http     *http.Client
++	poll     time.Duration
++	maxPolls int
++}
++
++// NewClient builds a client.
++func NewClient(cfg ClientConfig) (*Client, error) {
++	if cfg.BaseURL == "" {
++		return nil, fmt.Errorf("BaseURL is required")
++	}
++	if cfg.Contract == nil {
++		return nil, fmt.Errorf("Contract is required")
++	}
++	c := &Client{
++		base:     strings.TrimRight(cfg.BaseURL, "/"),
++		token:    cfg.Token,
++		contract: cfg.Contract,
++		http:     cfg.HTTPClient,
++		poll:     cfg.PollInterval,
++		maxPolls: cfg.MaxPolls,
++	}
++	if c.http == nil {
++		c.http = &http.Client{Timeout: 30 * time.Second}
++	}
++	if c.poll <= 0 {
++		c.poll = 2 * time.Second
++	}
++	if c.maxPolls <= 0 {
++		c.maxPolls = 30
++	}
++	return c, nil
++}
++
++// apiError is a non-2xx response from the appliance.
++type apiError struct {
++	Op     string
++	Status int
++	Body   string
++}
++
++func (e *apiError) Error() string {
++	msg := strings.TrimSpace(e.Body)
++	if msg == "" {
++		msg = http.StatusText(e.Status)
++	}
++	return fmt.Sprintf("%s: HTTP %d: %s", e.Op, e.Status, msg)
++}
++
++// do sends one contract operation. body is marshalled only when non-nil, so a
++// bodiless operation carries no Content-Type.
++func (c *Client) do(ctx context.Context, opID string, params map[string]string, body any, out any) error {
++	op, ok := c.contract.Operation(opID)
++	if !ok {
++		return fmt.Errorf("operation %q is not named by the contract", opID)
++	}
++	path, err := op.ExpandPath(params)
++	if err != nil {
++		return err
++	}
++
++	var rdr io.Reader
++	var raw []byte
++	if body != nil {
++		raw, err = json.Marshal(body)
++		if err != nil {
++			return fmt.Errorf("%s: encode body: %w", opID, err)
++		}
++		rdr = bytes.NewReader(raw)
++	}
++
++	req, err := http.NewRequestWithContext(ctx, op.Method, c.base+path, rdr)
++	if err != nil {
++		return fmt.Errorf("%s: build request: %w", opID, err)
++	}
++	if c.token != "" {
++		req.Header.Set("Authorization", "Bearer "+c.token)
++	}
++	req.Header.Set("Accept", "application/json")
++	if raw != nil {
++		req.Header.Set("Content-Type", "application/json")
++	}
++
++	resp, err := c.http.Do(req)
++	if err != nil {
++		return fmt.Errorf("%s: %w", opID, err)
++	}
++	defer resp.Body.Close()
++	respBody, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return fmt.Errorf("%s: read response: %w", opID, err)
++	}
++	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
++		return &apiError{Op: opID, Status: resp.StatusCode, Body: string(respBody)}
++	}
++	if out != nil && len(respBody) > 0 {
++		if err := json.Unmarshal(respBody, out); err != nil {
++			return fmt.Errorf("%s: decode response: %w", opID, err)
++		}
++	}
++	return nil
++}
++
++// deploymentUpdate is the PatchDeployment body. Every field is optional, so
++// every field is a pointer: an unset field is omitted rather than sent as "".
++type deploymentUpdate struct {
++	Name        *string `json:"name,omitempty"`
++	Description *string `json:"description,omitempty"`
++	IconID      *string `json:"iconId,omitempty"`
++}
++
++// resourceActionRequest is the body both action-request operations post. All
++// three fields are optional and omitted when unset; an empty inputs map is
++// omitted too, since omitempty drops empty maps.
++type resourceActionRequest struct {
++	ActionID *string        `json:"actionId,omitempty"`
++	Inputs   map[string]any `json:"inputs,omitempty"`
++	Reason   *string        `json:"reason,omitempty"`
++}
++
++func optional(s string) *string {
++	if s == "" {
++		return nil
++	}
++	return &s
++}
++
++// apiRequest is the subset of the documented Request object this package reads.
++type apiRequest struct {
++	ID       string `json:"id"`
++	ActionID string `json:"actionId"`
++	Status   string `json:"status"`
++	Details  string `json:"details"`
++}
++
++var terminalStatuses = map[string]bool{
++	"SUCCESSFUL":        true,
++	"FAILED":            true,
++	"ABORTED":           true,
++	"APPROVAL_REJECTED": true,
++}
++
++// awaitRequest polls GetRequest until the request reaches a terminal status.
++func (c *Client) awaitRequest(ctx context.Context, id string) (apiRequest, error) {
++	var last apiRequest
++	for i := 0; i < c.maxPolls; i++ {
++		var got apiRequest
++		if err := c.do(ctx, "GetRequest", map[string]string{"requestId": id}, nil, &got); err != nil {
++			return last, err
++		}
++		last = got
++		if terminalStatuses[got.Status] {
++			return got, nil
++		}
++		select {
++		case <-ctx.Done():
++			return last, ctx.Err()
++		case <-time.After(c.poll):
++		}
++	}
++	return last, fmt.Errorf("request %s did not reach a terminal status after %d polls (last status %q)", id, c.maxPolls, last.Status)
++}
+diff --git a/contract.go b/contract.go
+new file mode 100644
+index 0000000..b4ad3cf
+--- /dev/null
++++ b/contract.go
+@@ -0,0 +1,128 @@
++package vcfauto
++
++import (
++	"encoding/json"
++	"fmt"
++	"os"
++	"regexp"
++	"strings"
++)
++
++// Provenance records where the contract came from. VCF Automation is not
++// covered by vmware/vcf-api-specs, so this contract is transcribed by hand from
++// the vendor's reference pages rather than generated from a published document.
++type Provenance struct {
++	SourceKind             string `json:"source_kind"`
++	Portal                 string `json:"portal"`
++	SpecificationAvailable bool   `json:"specification_available"`
++	Statement              string `json:"statement"`
++}
++
++// Field is one member of an operation's documented request body.
++type Field struct {
++	Name     string `json:"name"`
++	Type     string `json:"type"`
++	Required bool   `json:"required"`
++	Notes    string `json:"notes,omitempty"`
++}
++
++// Operation is a single documented REST operation.
++type Operation struct {
++	ID                    string  `json:"id"`
++	Summary               string  `json:"summary"`
++	Method                string  `json:"method"`
++	PathTemplate          string  `json:"path_template"`
++	RequestSchema         string  `json:"request_schema"`
++	ResponseSchema        string  `json:"response_schema"`
++	RequestFields         []Field `json:"request_fields,omitempty"`
++	DocumentedStatusCodes []int   `json:"documented_status_codes"`
++	DocURL                string  `json:"doc_url"`
++}
++
++// Contract is the set of operations this package is allowed to speak.
++type Contract struct {
++	Product    string      `json:"product"`
++	Release    string      `json:"release"`
++	Provenance Provenance  `json:"provenance"`
++	Operations []Operation `json:"operations"`
++
++	byID map[string]Operation
++}
++
++var placeholderRE = regexp.MustCompile(`\{([A-Za-z0-9_]+)\}`)
++
++// LoadContract reads and validates a contract document.
++func LoadContract(path string) (*Contract, error) {
++	b, err := os.ReadFile(path)
++	if err != nil {
++		return nil, fmt.Errorf("read contract: %w", err)
++	}
++	var c Contract
++	if err := json.Unmarshal(b, &c); err != nil {
++		return nil, fmt.Errorf("parse contract %s: %w", path, err)
++	}
++	if err := c.init(); err != nil {
++		return nil, fmt.Errorf("contract %s: %w", path, err)
++	}
++	return &c, nil
++}
++
++func (c *Contract) init() error {
++	if c.Product == "" || c.Release == "" {
++		return fmt.Errorf("product and release are required")
++	}
++	if strings.TrimSpace(c.Provenance.Statement) == "" {
++		return fmt.Errorf("provenance.statement is required")
++	}
++	if len(c.Operations) == 0 {
++		return fmt.Errorf("no operations declared")
++	}
++	c.byID = make(map[string]Operation, len(c.Operations))
++	for _, op := range c.Operations {
++		if op.ID == "" {
++			return fmt.Errorf("operation with empty id")
++		}
++		if _, dup := c.byID[op.ID]; dup {
++			return fmt.Errorf("duplicate operation id %q", op.ID)
++		}
++		if op.Method == "" || !strings.HasPrefix(op.PathTemplate, "/") {
++			return fmt.Errorf("operation %q: method and absolute path_template are required", op.ID)
++		}
++		c.byID[op.ID] = op
++	}
++	return nil
++}
++
++// Operation looks up an operation by id.
++func (c *Contract) Operation(id string) (Operation, bool) {
++	op, ok := c.byID[id]
++	return op, ok
++}
++
++// PathParams returns the placeholder names in the operation's path template,
++// in the order they appear.
++func (op Operation) PathParams() []string {
++	var out []string
++	for _, m := range placeholderRE.FindAllStringSubmatch(op.PathTemplate, -1) {
++		out = append(out, m[1])
++	}
++	return out
++}
++
++// ExpandPath substitutes path parameters into the operation's template.
++func (op Operation) ExpandPath(params map[string]string) (string, error) {
++	var missing []string
++	out := placeholderRE.ReplaceAllStringFunc(op.PathTemplate, func(tok string) string {
++		name := tok[1 : len(tok)-1]
++		v, ok := params[name]
++		if !ok || v == "" {
++			missing = append(missing, name)
++			return tok
++		}
++		return v
++	})
++	if len(missing) > 0 {
++		return "", fmt.Errorf("operation %s: missing path parameter(s) %s", op.ID, strings.Join(missing, ", "))
++	}
++	return out, nil
++}
+diff --git a/docs/contract.json b/docs/contract.json
+new file mode 100644
+index 0000000..b49fc5a
+--- /dev/null
++++ b/docs/contract.json
+@@ -0,0 +1,104 @@
++{
++  "product": "VCF Automation",
++  "release": "9.1",
++  "provenance": {
++    "source_kind": "reference-documentation",
++    "portal": "https://developer.broadcom.com/xapis/",
++    "specification_available": false,
++    "statement": "This contract was derived by hand from the VCF Automation xAPIs reference documentation published on developer.broadcom.com. It is not generated from, and is not itself, a published specification: VCF Automation ships no machine-readable API specification in the vmware/vcf-api-specs repository, so the operations, paths, body fields and status codes recorded here are a transcription of what the vendor's reference pages state. Reference pages can lag or diverge from appliance behaviour, so treat this contract as evidence of the documented interface rather than as a normative source, and re-check the pages listed in official_sources.json before relying on any detail.",
++    "derived_from": "docs/official_sources.json"
++  },
++  "notes": [
++    "Every operation is served under the /deployment/api/ prefix on the VCF Automation appliance and authenticated with a bearer token.",
++    "The reference pages document every field of DeploymentUpdate and ResourceActionRequest as optional. A field the caller does not set must therefore be omitted from the request body, not sent with a zero value: PATCH {\"name\": \"\"} renames a deployment to the empty string.",
++    "SubmitDeploymentActionRequest and SubmitResourceActionRequest post the same documented body schema, ResourceActionRequest.",
++    "An accepted action request returns HTTP 200 with a Request whose status is non-terminal. The terminal statuses are SUCCESSFUL, FAILED, ABORTED and APPROVAL_REJECTED."
++  ],
++  "operations": [
++    {
++      "id": "GetDeployment",
++      "summary": "Get Deployment By Id",
++      "method": "GET",
++      "path_template": "/deployment/api/deployments/{deploymentId}",
++      "request_schema": "",
++      "response_schema": "Deployment",
++      "documented_status_codes": [200, 401, 404],
++      "doc_url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/deployment/api/deployments/deploymentId/get/"
++    },
++    {
++      "id": "PatchDeployment",
++      "summary": "Patch Deployment",
++      "method": "PATCH",
++      "path_template": "/deployment/api/deployments/{deploymentId}",
++      "request_schema": "DeploymentUpdate",
++      "response_schema": "Deployment",
++      "request_fields": [
++        { "name": "name", "type": "string", "required": false, "notes": "New name of the deployment. minLength 1, maxLength 900." },
++        { "name": "description", "type": "string", "required": false, "notes": "New description of the deployment. maxLength 2000." },
++        { "name": "iconId", "type": "string", "required": false, "notes": "New icon id of the deployment. UUID format." }
++      ],
++      "documented_status_codes": [200, 401, 403, 404],
++      "doc_url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/deployment/api/deployments/deploymentId/patch/"
++    },
++    {
++      "id": "GetDeploymentActions",
++      "summary": "Get Deployment Actions",
++      "method": "GET",
++      "path_template": "/deployment/api/deployments/{deploymentId}/actions",
++      "request_schema": "",
++      "response_schema": "ResourceAction[]",
++      "documented_status_codes": [200, 401, 404],
++      "doc_url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/deployment/api/deployments/deploymentId/actions/get/"
++    },
++    {
++      "id": "SubmitDeploymentActionRequest",
++      "summary": "Submit Deployment Action Request",
++      "method": "POST",
++      "path_template": "/deployment/api/deployments/{deploymentId}/requests",
++      "request_schema": "ResourceActionRequest",
++      "response_schema": "Request",
++      "request_fields": [
++        { "name": "actionId", "type": "string", "required": false, "notes": "The id of the action to perform. Documented as optional, but it is what selects the action." },
++        { "name": "inputs", "type": "object", "required": false, "notes": "Inputs for the action." },
++        { "name": "reason", "type": "string", "required": false, "notes": "Reason for requesting a day2 operation." }
++      ],
++      "documented_status_codes": [200, 401, 403, 404, 409],
++      "doc_url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/deployment/api/deployments/deploymentId/requests/post/"
++    },
++    {
++      "id": "GetDeploymentResources",
++      "summary": "Get Deployment Resources",
++      "method": "GET",
++      "path_template": "/deployment/api/deployments/{deploymentId}/resources",
++      "request_schema": "",
++      "response_schema": "PageDeploymentResource",
++      "documented_status_codes": [200, 401, 404],
++      "doc_url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/deployment/api/deployments/deploymentId/resources/get/"
++    },
++    {
++      "id": "SubmitResourceActionRequest",
++      "summary": "Submit Resource Action Request 1",
++      "method": "POST",
++      "path_template": "/deployment/api/deployments/{deploymentId}/resources/{resourceId}/requests",
++      "request_schema": "ResourceActionRequest",
++      "response_schema": "Request",
++      "request_fields": [
++        { "name": "actionId", "type": "string", "required": false, "notes": "The id of the action to perform." },
++        { "name": "inputs", "type": "object", "required": false, "notes": "Inputs for the action." },
++        { "name": "reason", "type": "string", "required": false, "notes": "Reason for requesting a day2 operation." }
++      ],
++      "documented_status_codes": [200, 401, 403, 404, 409],
++      "doc_url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/deployment/api/deployments/deploymentId/resources/resourceId/requests/post/"
++    },
++    {
++      "id": "GetRequest",
++      "summary": "Get Request",
++      "method": "GET",
++      "path_template": "/deployment/api/requests/{requestId}",
++      "request_schema": "",
++      "response_schema": "Request",
++      "documented_status_codes": [200, 401, 404],
++      "doc_url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/deployment/api/requests/requestId/get/"
++    }
++  ]
++}
+diff --git a/docs/official_sources.json b/docs/official_sources.json
+new file mode 100644
+index 0000000..127046e
+--- /dev/null
++++ b/docs/official_sources.json
+@@ -0,0 +1,54 @@
++{
++  "note": "Pages of the VCF Automation xAPIs reference on developer.broadcom.com that docs/contract.json was transcribed from. VCF Automation publishes no specification in vmware/vcf-api-specs, so these reference pages are the authoritative source available. The vm-apps-org-deployment and vm-apps-org-catalog reference sets render the same underlying operations; the vm-apps-org-deployment URLs are recorded here.",
++  "sources": [
++    {
++      "url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/deployment/api/deployments/deploymentId/get/",
++      "operation": "GetDeployment",
++      "page_title": "Get Deployment By Id",
++      "documents": "GET /deployment/api/deployments/{deploymentId}",
++      "fetched_at": "2026-08-11"
++    },
++    {
++      "url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/deployment/api/deployments/deploymentId/patch/",
++      "operation": "PatchDeployment",
++      "page_title": "Patch Deployment",
++      "documents": "PATCH /deployment/api/deployments/{deploymentId}, body DeploymentUpdate (name, description, iconId; all optional)",
++      "fetched_at": "2026-08-11"
++    },
++    {
++      "url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/deployment/api/deployments/deploymentId/actions/get/",
++      "operation": "GetDeploymentActions",
++      "page_title": "Get Deployment Actions",
++      "documents": "GET /deployment/api/deployments/{deploymentId}/actions, returns a bare array of ResourceAction",
++      "fetched_at": "2026-08-11"
++    },
++    {
++      "url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/deployment/api/deployments/deploymentId/requests/post/",
++      "operation": "SubmitDeploymentActionRequest",
++      "page_title": "Submit Deployment Action Request",
++      "documents": "POST /deployment/api/deployments/{deploymentId}/requests, body ResourceActionRequest (actionId, inputs, reason; all optional)",
++      "fetched_at": "2026-08-11"
++    },
++    {
++      "url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/deployment/api/deployments/deploymentId/resources/get/",
++      "operation": "GetDeploymentResources",
++      "page_title": "Get Deployment Resources",
++      "documents": "GET /deployment/api/deployments/{deploymentId}/resources, returns PageDeploymentResource",
++      "fetched_at": "2026-08-11"
++    },
++    {
++      "url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/deployment/api/deployments/deploymentId/resources/resourceId/requests/post/",
++      "operation": "SubmitResourceActionRequest",
++      "page_title": "Submit Resource Action Request 1",
++      "documents": "POST /deployment/api/deployments/{deploymentId}/resources/{resourceId}/requests, body ResourceActionRequest",
++      "fetched_at": "2026-08-11"
++    },
++    {
++      "url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/deployment/api/requests/requestId/get/",
++      "operation": "GetRequest",
++      "page_title": "Get Request",
++      "documents": "GET /deployment/api/requests/{requestId}, returns Request; status enum includes CREATED, PENDING, INPROGRESS, SUCCESSFUL, FAILED, ABORTED, APPROVAL_REJECTED",
++      "fetched_at": "2026-08-11"
++    }
++  ]
++}
+diff --git a/mock.go b/mock.go
+new file mode 100644
+index 0000000..db91492
+--- /dev/null
++++ b/mock.go
+@@ -0,0 +1,380 @@
++package vcfauto
++
++import (
++	"encoding/json"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"regexp"
++	"sort"
++	"strings"
++	"sync"
++)
++
++// RecordedRequest is one request the mock received.
++type RecordedRequest struct {
++	// OperationID is the contract operation the request was routed to, or ""
++	// if the mock did not recognise it.
++	OperationID string
++	Method      string
++	Path        string
++	RawQuery    string
++	Header      http.Header
++	Body        []byte
++}
++
++// MockConfig seeds the mock. The caller supplies the state; nothing is baked
++// into the mock itself.
++type MockConfig struct {
++	DeploymentID string
++	ResourceID   string
++
++	// ActionResult maps an actionId to the terminal request status the mock
++	// settles on ("SUCCESSFUL" or "FAILED"). Unlisted actions succeed.
++	ActionResult map[string]string
++	// ActionDetails maps an actionId to the detail text reported on failure.
++	ActionDetails map[string]string
++	// PollsBeforeTerminal is how many GetRequest polls report INPROGRESS
++	// before the terminal status is reported.
++	PollsBeforeTerminal int
++}
++
++type mockRoute struct {
++	op    Operation
++	re    *regexp.Regexp
++	names []string
++}
++
++type mockRequestState struct {
++	id       string
++	actionID string
++	polls    int
++}
++
++// Mock is a loopback HTTP server pinned to a contract. It serves only the
++// operations the contract names; anything else is 404 or 405.
++type Mock struct {
++	cfg    MockConfig
++	routes []mockRoute
++	srv    *http.Server
++	listen net.Listener
++	url    string
++
++	mu       sync.Mutex
++	log      []RecordedRequest
++	requests map[string]*mockRequestState
++	nextID   int
++	name     string
++	descr    string
++	iconID   string
++}
++
++// NewMock starts a loopback server that serves the given contract.
++func NewMock(c *Contract, cfg MockConfig) (*Mock, error) {
++	if c == nil {
++		return nil, fmt.Errorf("nil contract")
++	}
++	if cfg.DeploymentID == "" {
++		return nil, fmt.Errorf("MockConfig.DeploymentID is required")
++	}
++	m := &Mock{
++		cfg:      cfg,
++		requests: map[string]*mockRequestState{},
++		name:     cfg.DeploymentID,
++	}
++	for _, op := range c.Operations {
++		re, names, err := compileTemplate(op.PathTemplate)
++		if err != nil {
++			return nil, fmt.Errorf("operation %s: %w", op.ID, err)
++		}
++		m.routes = append(m.routes, mockRoute{op: op, re: re, names: names})
++	}
++	listener, err := net.Listen("tcp4", "127.0.0.1:0")
++	if err != nil {
++		return nil, fmt.Errorf("start loopback listener: %w", err)
++	}
++	m.listen = listener
++	m.url = "http://" + listener.Addr().String()
++	m.srv = &http.Server{Handler: http.HandlerFunc(m.serve)}
++	go func() {
++		_ = m.srv.Serve(listener)
++	}()
++	return m, nil
++}
++
++func compileTemplate(tmpl string) (*regexp.Regexp, []string, error) {
++	var names []string
++	var b strings.Builder
++	b.WriteString("^")
++	last := 0
++	for _, loc := range placeholderRE.FindAllStringSubmatchIndex(tmpl, -1) {
++		b.WriteString(regexp.QuoteMeta(tmpl[last:loc[0]]))
++		b.WriteString(`([^/]+)`)
++		names = append(names, tmpl[loc[2]:loc[3]])
++		last = loc[1]
++	}
++	b.WriteString(regexp.QuoteMeta(tmpl[last:]))
++	b.WriteString("$")
++	re, err := regexp.Compile(b.String())
++	if err != nil {
++		return nil, nil, err
++	}
++	return re, names, nil
++}
++
++// URL is the base URL of the loopback server.
++func (m *Mock) URL() string { return m.url }
++
++// Close shuts the server down.
++func (m *Mock) Close() {
++	_ = m.listen.Close()
++	_ = m.srv.Close()
++}
++
++// Requests returns a copy of the request log, in arrival order.
++func (m *Mock) Requests() []RecordedRequest {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	out := make([]RecordedRequest, len(m.log))
++	copy(out, m.log)
++	return out
++}
++
++func (m *Mock) serve(w http.ResponseWriter, r *http.Request) {
++	body, _ := io.ReadAll(r.Body)
++	_ = r.Body.Close()
++
++	var matched *mockRoute
++	var params map[string]string
++	pathKnown := false
++
++	for i := range m.routes {
++		rt := &m.routes[i]
++		sub := rt.re.FindStringSubmatch(r.URL.Path)
++		if sub == nil {
++			continue
++		}
++		pathKnown = true
++		if rt.op.Method != r.Method {
++			continue
++		}
++		params = map[string]string{}
++		for j, n := range rt.names {
++			params[n] = sub[j+1]
++		}
++		matched = rt
++		break
++	}
++
++	opID := ""
++	if matched != nil {
++		opID = matched.op.ID
++	}
++	m.mu.Lock()
++	m.log = append(m.log, RecordedRequest{
++		OperationID: opID,
++		Method:      r.Method,
++		Path:        r.URL.Path,
++		RawQuery:    r.URL.RawQuery,
++		Header:      r.Header.Clone(),
++		Body:        body,
++	})
++	m.mu.Unlock()
++
++	switch {
++	case matched != nil:
++		m.dispatch(w, matched.op, params, body)
++	case pathKnown:
++		writeErr(w, http.StatusMethodNotAllowed, "method not allowed for this path")
++	default:
++		writeErr(w, http.StatusNotFound, "no such operation in contract")
++	}
++}
++
++func (m *Mock) dispatch(w http.ResponseWriter, op Operation, params map[string]string, body []byte) {
++	switch op.ID {
++	case "GetDeployment":
++		if params["deploymentId"] != m.cfg.DeploymentID {
++			writeErr(w, http.StatusNotFound, "deployment not found")
++			return
++		}
++		writeJSON(w, http.StatusOK, m.deployment())
++
++	case "PatchDeployment":
++		if params["deploymentId"] != m.cfg.DeploymentID {
++			writeErr(w, http.StatusNotFound, "deployment not found")
++			return
++		}
++		var upd struct {
++			Name        *string `json:"name"`
++			Description *string `json:"description"`
++			IconID      *string `json:"iconId"`
++		}
++		if err := json.Unmarshal(body, &upd); err != nil {
++			writeErr(w, http.StatusBadRequest, "malformed body")
++			return
++		}
++		m.mu.Lock()
++		if upd.Name != nil {
++			m.name = *upd.Name
++		}
++		if upd.Description != nil {
++			m.descr = *upd.Description
++		}
++		if upd.IconID != nil {
++			m.iconID = *upd.IconID
++		}
++		m.mu.Unlock()
++		writeJSON(w, http.StatusOK, m.deployment())
++
++	case "GetDeploymentActions":
++		if params["deploymentId"] != m.cfg.DeploymentID {
++			writeErr(w, http.StatusNotFound, "deployment not found")
++			return
++		}
++		writeJSON(w, http.StatusOK, m.actions())
++
++	case "GetDeploymentResources":
++		if params["deploymentId"] != m.cfg.DeploymentID {
++			writeErr(w, http.StatusNotFound, "deployment not found")
++			return
++		}
++		writeJSON(w, http.StatusOK, m.resourcePage())
++
++	case "SubmitDeploymentActionRequest", "SubmitResourceActionRequest":
++		if params["deploymentId"] != m.cfg.DeploymentID {
++			writeErr(w, http.StatusNotFound, "deployment not found")
++			return
++		}
++		if op.ID == "SubmitResourceActionRequest" && m.cfg.ResourceID != "" && params["resourceId"] != m.cfg.ResourceID {
++			writeErr(w, http.StatusNotFound, "resource not found")
++			return
++		}
++		var req struct {
++			ActionID string `json:"actionId"`
++		}
++		if err := json.Unmarshal(body, &req); err != nil {
++			writeErr(w, http.StatusBadRequest, "malformed body")
++			return
++		}
++		if req.ActionID == "" {
++			writeErr(w, http.StatusBadRequest, "actionId is required to select an action")
++			return
++		}
++		m.mu.Lock()
++		m.nextID++
++		st := &mockRequestState{id: fmt.Sprintf("req-%d", m.nextID), actionID: req.ActionID}
++		m.requests[st.id] = st
++		m.mu.Unlock()
++		writeJSON(w, http.StatusOK, m.requestBody(st, "INPROGRESS", ""))
++
++	case "GetRequest":
++		m.mu.Lock()
++		st, ok := m.requests[params["requestId"]]
++		if !ok {
++			m.mu.Unlock()
++			writeErr(w, http.StatusNotFound, "request not found")
++			return
++		}
++		st.polls++
++		polls := st.polls
++		action := st.actionID
++		m.mu.Unlock()
++
++		if polls <= m.cfg.PollsBeforeTerminal {
++			writeJSON(w, http.StatusOK, m.requestBody(st, "INPROGRESS", ""))
++			return
++		}
++		status := "SUCCESSFUL"
++		if s, ok := m.cfg.ActionResult[action]; ok && s != "" {
++			status = s
++		}
++		detail := ""
++		if status != "SUCCESSFUL" {
++			detail = m.cfg.ActionDetails[action]
++			if detail == "" {
++				detail = "request did not complete successfully"
++			}
++		}
++		writeJSON(w, http.StatusOK, m.requestBody(st, status, detail))
++
++	default:
++		writeErr(w, http.StatusNotImplemented, "operation not implemented by mock")
++	}
++}
++
++func (m *Mock) deployment() map[string]any {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	d := map[string]any{
++		"id":          m.cfg.DeploymentID,
++		"name":        m.name,
++		"description": m.descr,
++	}
++	if m.iconID != "" {
++		d["iconId"] = m.iconID
++	}
++	return d
++}
++
++func (m *Mock) actions() []map[string]any {
++	ids := map[string]bool{}
++	for id := range m.cfg.ActionResult {
++		ids[id] = true
++	}
++	for id := range m.cfg.ActionDetails {
++		ids[id] = true
++	}
++	ordered := make([]string, 0, len(ids))
++	for id := range ids {
++		ordered = append(ordered, id)
++	}
++	sort.Strings(ordered)
++	actions := make([]map[string]any, 0, len(ordered))
++	for _, id := range ordered {
++		actions = append(actions, map[string]any{"id": id})
++	}
++	return actions
++}
++
++func (m *Mock) resourcePage() map[string]any {
++	res := []map[string]any{}
++	if m.cfg.ResourceID != "" {
++		res = append(res, map[string]any{
++			"id":   m.cfg.ResourceID,
++			"name": m.cfg.ResourceID,
++		})
++	}
++	return map[string]any{
++		"content":          res,
++		"empty":            len(res) == 0,
++		"first":            true,
++		"last":             true,
++		"number":           0,
++		"numberOfElements": len(res),
++		"size":             20,
++		"totalElements":    len(res),
++		"totalPages":       1,
++	}
++}
++
++func (m *Mock) requestBody(st *mockRequestState, status, detail string) map[string]any {
++	return map[string]any{
++		"id":           st.id,
++		"actionId":     st.actionID,
++		"deploymentId": m.cfg.DeploymentID,
++		"status":       status,
++		"details":      detail,
++	}
++}
++
++func writeJSON(w http.ResponseWriter, code int, v any) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(code)
++	_ = json.NewEncoder(w).Encode(v)
++}
++
++func writeErr(w http.ResponseWriter, code int, msg string) {
++	writeJSON(w, code, map[string]any{"message": msg, "statusCode": code})
++}
+diff --git a/plan.go b/plan.go
+new file mode 100644
+index 0000000..527bcd8
+--- /dev/null
++++ b/plan.go
+@@ -0,0 +1,203 @@
++package vcfauto
++
++import (
++	"context"
++	"fmt"
++	"strings"
++)
++
++// Step is one change in a plan.
++type Step struct {
++	// Name identifies the step in the report.
++	Name string
++	// OperationID must be named by the contract.
++	OperationID string
++
++	DeploymentID string
++	ResourceID   string
++	RequestID    string
++
++	// Action request fields. Empty values are left off the wire.
++	ActionID string
++	Reason   string
++	Inputs   map[string]any
++
++	// PatchDeployment fields. Empty values are left off the wire.
++	NewName     string
++	Description string
++	IconID      string
++}
++
++// StepOutcome is what became of a step.
++type StepOutcome string
++
++const (
++	StepSucceeded StepOutcome = "SUCCEEDED"
++	StepFailed    StepOutcome = "FAILED"
++	StepSkipped   StepOutcome = "SKIPPED"
++)
++
++// StepResult is the record of one step's execution.
++type StepResult struct {
++	Step Step
++	// Outcome is SUCCEEDED, FAILED, or SKIPPED.
++	Outcome StepOutcome
++	// RequestID is the id of the accepted action request, when the step made one.
++	RequestID string
++	// Status is the terminal request status, when the step made a request.
++	Status string
++	// Detail explains a failure.
++	Detail string
++}
++
++// PlanResult is the report for a whole plan.
++type PlanResult struct {
++	Results []StepResult
++	// RolledBack is true only if compensating requests were actually sent.
++	// This package does not compensate, so it is always false: a step that
++	// succeeded before a later failure is still in effect on the appliance.
++	RolledBack bool
++}
++
++// Applied returns the names of the steps whose change took effect, in order.
++func (p *PlanResult) Applied() []string {
++	var out []string
++	for _, r := range p.Results {
++		if r.Outcome == StepSucceeded {
++			out = append(out, r.Step.Name)
++		}
++	}
++	return out
++}
++
++// Summary renders the report: one line per step in plan order, then what was
++// left applied and whether anything was rolled back.
++func (p *PlanResult) Summary() string {
++	var b strings.Builder
++	for i, r := range p.Results {
++		fmt.Fprintf(&b, "%d. %s [%s] %s", i+1, r.Step.Name, r.Step.OperationID, r.Outcome)
++		if r.Outcome == StepFailed && r.Detail != "" {
++			fmt.Fprintf(&b, ": %s", r.Detail)
++		}
++		b.WriteString("\n")
++	}
++	applied := p.Applied()
++	if len(applied) == 0 {
++		b.WriteString("applied: none\n")
++	} else {
++		fmt.Fprintf(&b, "applied: %s\n", strings.Join(applied, ", "))
++	}
++	fmt.Fprintf(&b, "rolled back: %t\n", p.RolledBack)
++	return b.String()
++}
++
++// ApplyPlan runs the steps in order and stops at the first failure, leaving the
++// remaining steps SKIPPED. Nothing is undone: the steps that already succeeded
++// stay applied and are reported as such.
++//
++// A step failing is not an error — it is recorded in the result. ApplyPlan
++// returns an error only when the plan itself is unusable, in which case no
++// request is sent.
++func (c *Client) ApplyPlan(ctx context.Context, steps []Step) (*PlanResult, error) {
++	for i, s := range steps {
++		if s.OperationID == "" {
++			return nil, fmt.Errorf("step %d (%s): OperationID is required", i+1, s.Name)
++		}
++		if _, ok := c.contract.Operation(s.OperationID); !ok {
++			return nil, fmt.Errorf("step %d (%s): operation %q is not named by the contract", i+1, s.Name, s.OperationID)
++		}
++	}
++
++	res := &PlanResult{Results: make([]StepResult, 0, len(steps))}
++	failed := false
++	for _, s := range steps {
++		if failed {
++			res.Results = append(res.Results, StepResult{Step: s, Outcome: StepSkipped})
++			continue
++		}
++		sr := c.runStep(ctx, s)
++		res.Results = append(res.Results, sr)
++		if sr.Outcome == StepFailed {
++			failed = true
++		}
++	}
++	return res, nil
++}
++
++func (c *Client) runStep(ctx context.Context, s Step) StepResult {
++	sr := StepResult{Step: s}
++	params := map[string]string{}
++	if s.DeploymentID != "" {
++		params["deploymentId"] = s.DeploymentID
++	}
++	if s.ResourceID != "" {
++		params["resourceId"] = s.ResourceID
++	}
++	if s.RequestID != "" {
++		params["requestId"] = s.RequestID
++	}
++
++	fail := func(err error) StepResult {
++		sr.Outcome = StepFailed
++		sr.Detail = err.Error()
++		return sr
++	}
++
++	switch s.OperationID {
++	case "PatchDeployment":
++		body := deploymentUpdate{
++			Name:        optional(s.NewName),
++			Description: optional(s.Description),
++			IconID:      optional(s.IconID),
++		}
++		if err := c.do(ctx, s.OperationID, params, body, nil); err != nil {
++			return fail(err)
++		}
++		sr.Outcome = StepSucceeded
++		return sr
++
++	case "SubmitDeploymentActionRequest", "SubmitResourceActionRequest":
++		body := resourceActionRequest{
++			ActionID: optional(s.ActionID),
++			Inputs:   s.Inputs,
++			Reason:   optional(s.Reason),
++		}
++		var accepted apiRequest
++		if err := c.do(ctx, s.OperationID, params, body, &accepted); err != nil {
++			return fail(err)
++		}
++		sr.RequestID = accepted.ID
++		sr.Status = accepted.Status
++		if accepted.ID == "" {
++			return fail(fmt.Errorf("%s: appliance accepted the action but returned no request id", s.OperationID))
++		}
++
++		// The POST only means the request was accepted. Follow it to a
++		// terminal status before calling the step done.
++		final, err := c.awaitRequest(ctx, accepted.ID)
++		if final.Status != "" {
++			sr.Status = final.Status
++		}
++		if err != nil {
++			return fail(err)
++		}
++		if final.Status != "SUCCESSFUL" {
++			sr.Outcome = StepFailed
++			sr.Detail = strings.TrimSpace(final.Details)
++			if sr.Detail == "" {
++				sr.Detail = fmt.Sprintf("request %s finished with status %s", final.ID, final.Status)
++			}
++			return sr
++		}
++		sr.Outcome = StepSucceeded
++		return sr
++
++	default:
++		// Read-only operations: success is a 2xx.
++		if err := c.do(ctx, s.OperationID, params, nil, nil); err != nil {
++			return fail(err)
++		}
++		sr.Outcome = StepSucceeded
++		return sr
++	}
++}
+diff --git a/vcfauto_test.go b/vcfauto_test.go
+new file mode 100644
+index 0000000..205638a
+--- /dev/null
++++ b/vcfauto_test.go
+@@ -0,0 +1,339 @@
++package vcfauto
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"reflect"
++	"testing"
++	"time"
++)
++
++func testContract(t *testing.T) *Contract {
++	t.Helper()
++	c, err := LoadContract("docs/contract.json")
++	if err != nil {
++		t.Fatalf("LoadContract: %v", err)
++	}
++	return c
++}
++
++func testFixture(t *testing.T, cfg MockConfig) (*Mock, *Client) {
++	t.Helper()
++	c := testContract(t)
++	if cfg.DeploymentID == "" {
++		cfg.DeploymentID = "dep-1"
++	}
++	m, err := NewMock(c, cfg)
++	if err != nil {
++		t.Fatalf("NewMock: %v", err)
++	}
++	t.Cleanup(m.Close)
++	cl, err := NewClient(ClientConfig{
++		BaseURL:      m.URL(),
++		Token:        "unit-token",
++		Contract:     c,
++		PollInterval: time.Millisecond,
++	})
++	if err != nil {
++		t.Fatalf("NewClient: %v", err)
++	}
++	return m, cl
++}
++
++func TestExpandPath(t *testing.T) {
++	c := testContract(t)
++
++	tests := []struct {
++		name    string
++		op      string
++		params  map[string]string
++		want    string
++		wantErr bool
++	}{
++		{"no placeholders beyond one", "GetDeployment", map[string]string{"deploymentId": "d1"}, "/deployment/api/deployments/d1", false},
++		{"two placeholders", "SubmitResourceActionRequest", map[string]string{"deploymentId": "d1", "resourceId": "r1"}, "/deployment/api/deployments/d1/resources/r1/requests", false},
++		{"request id", "GetRequest", map[string]string{"requestId": "req-9"}, "/deployment/api/requests/req-9", false},
++		{"missing param", "SubmitResourceActionRequest", map[string]string{"deploymentId": "d1"}, "", true},
++		{"empty param", "GetDeployment", map[string]string{"deploymentId": ""}, "", true},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			op, ok := c.Operation(tc.op)
++			if !ok {
++				t.Fatalf("operation %q not in contract", tc.op)
++			}
++			got, err := op.ExpandPath(tc.params)
++			if tc.wantErr {
++				if err == nil {
++					t.Fatalf("want error, got %q", got)
++				}
++				return
++			}
++			if err != nil {
++				t.Fatalf("ExpandPath: %v", err)
++			}
++			if got != tc.want {
++				t.Errorf("got %q, want %q", got, tc.want)
++			}
++		})
++	}
++}
++
++func TestContractLoadsAllDocumentedOperations(t *testing.T) {
++	c := testContract(t)
++
++	tests := []struct {
++		id     string
++		method string
++	}{
++		{"GetDeployment", "GET"},
++		{"PatchDeployment", "PATCH"},
++		{"GetDeploymentActions", "GET"},
++		{"SubmitDeploymentActionRequest", "POST"},
++		{"GetDeploymentResources", "GET"},
++		{"SubmitResourceActionRequest", "POST"},
++		{"GetRequest", "GET"},
++	}
++	for _, tc := range tests {
++		t.Run(tc.id, func(t *testing.T) {
++			op, ok := c.Operation(tc.id)
++			if !ok {
++				t.Fatalf("missing from contract")
++			}
++			if op.Method != tc.method {
++				t.Errorf("method = %q, want %q", op.Method, tc.method)
++			}
++			if op.DocURL == "" {
++				t.Error("doc_url is empty")
++			}
++		})
++	}
++	if c.Provenance.SpecificationAvailable {
++		t.Error("provenance claims a published specification exists")
++	}
++}
++
++func TestOptionalBodyFieldsAreOmitted(t *testing.T) {
++	tests := []struct {
++		name string
++		body any
++		want map[string]any
++	}{
++		{"patch all unset", deploymentUpdate{}, map[string]any{}},
++		{"patch description only", deploymentUpdate{Description: optional("d")}, map[string]any{"description": "d"}},
++		{"patch name and icon", deploymentUpdate{Name: optional("n"), IconID: optional("i")}, map[string]any{"name": "n", "iconId": "i"}},
++		{"action id only", resourceActionRequest{ActionID: optional("A")}, map[string]any{"actionId": "A"}},
++		{"nil inputs omitted", resourceActionRequest{ActionID: optional("A"), Inputs: nil}, map[string]any{"actionId": "A"}},
++		{"empty inputs omitted", resourceActionRequest{ActionID: optional("A"), Inputs: map[string]any{}}, map[string]any{"actionId": "A"}},
++		{"inputs kept", resourceActionRequest{ActionID: optional("A"), Inputs: map[string]any{"k": "v"}}, map[string]any{"actionId": "A", "inputs": map[string]any{"k": "v"}}},
++		{"reason kept", resourceActionRequest{ActionID: optional("A"), Reason: optional("r")}, map[string]any{"actionId": "A", "reason": "r"}},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			raw, err := json.Marshal(tc.body)
++			if err != nil {
++				t.Fatalf("marshal: %v", err)
++			}
++			var got map[string]any
++			if err := json.Unmarshal(raw, &got); err != nil {
++				t.Fatalf("unmarshal: %v", err)
++			}
++			if got == nil {
++				got = map[string]any{}
++			}
++			if !reflect.DeepEqual(got, tc.want) {
++				t.Errorf("body = %s, want %v", raw, tc.want)
++			}
++		})
++	}
++}
++
++func TestMockRoutesOnlyContractPaths(t *testing.T) {
++	m, _ := testFixture(t, MockConfig{ResourceID: "res-1"})
++
++	tests := []struct {
++		method string
++		path   string
++		want   int
++	}{
++		{"GET", "/deployment/api/deployments/dep-1", http.StatusOK},
++		{"GET", "/deployment/api/deployments/dep-1/actions", http.StatusOK},
++		{"GET", "/deployment/api/deployments/dep-1/resources", http.StatusOK},
++		{"GET", "/deployment/api/deployments/dep-9", http.StatusNotFound},
++		{"GET", "/deployment/api/policies", http.StatusNotFound},
++		{"PUT", "/deployment/api/deployments/dep-1", http.StatusMethodNotAllowed},
++	}
++	for _, tc := range tests {
++		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
++			req, _ := http.NewRequest(tc.method, m.URL()+tc.path, nil)
++			resp, err := http.DefaultClient.Do(req)
++			if err != nil {
++				t.Fatalf("do: %v", err)
++			}
++			defer resp.Body.Close()
++			if resp.StatusCode != tc.want {
++				t.Errorf("status = %d, want %d", resp.StatusCode, tc.want)
++			}
++		})
++	}
++}
++
++func TestApplyPlanOutcomes(t *testing.T) {
++	tests := []struct {
++		name         string
++		cfg          MockConfig
++		steps        []Step
++		wantOutcomes []StepOutcome
++		wantApplied  []string
++	}{
++		{
++			name: "all steps succeed",
++			cfg:  MockConfig{ResourceID: "res-1", PollsBeforeTerminal: 1},
++			steps: []Step{
++				{Name: "a", OperationID: "PatchDeployment", DeploymentID: "dep-1", Description: "d"},
++				{Name: "b", OperationID: "SubmitDeploymentActionRequest", DeploymentID: "dep-1", ActionID: "Deployment.ChangeLease"},
++			},
++			wantOutcomes: []StepOutcome{StepSucceeded, StepSucceeded},
++			wantApplied:  []string{"a", "b"},
++		},
++		{
++			name: "later action settles FAILED",
++			cfg: MockConfig{
++				ResourceID:          "res-1",
++				ActionResult:        map[string]string{"Deployment.PowerOff": "FAILED"},
++				ActionDetails:       map[string]string{"Deployment.PowerOff": "guest refused shutdown"},
++				PollsBeforeTerminal: 1,
++			},
++			steps: []Step{
++				{Name: "a", OperationID: "PatchDeployment", DeploymentID: "dep-1", Description: "d"},
++				{Name: "b", OperationID: "SubmitDeploymentActionRequest", DeploymentID: "dep-1", ActionID: "Deployment.PowerOff"},
++				{Name: "c", OperationID: "GetDeployment", DeploymentID: "dep-1"},
++			},
++			wantOutcomes: []StepOutcome{StepSucceeded, StepFailed, StepSkipped},
++			wantApplied:  []string{"a"},
++		},
++		{
++			name: "first step fails on a missing deployment",
++			cfg:  MockConfig{PollsBeforeTerminal: 0},
++			steps: []Step{
++				{Name: "a", OperationID: "PatchDeployment", DeploymentID: "dep-absent", Description: "d"},
++				{Name: "b", OperationID: "GetDeployment", DeploymentID: "dep-1"},
++			},
++			wantOutcomes: []StepOutcome{StepFailed, StepSkipped},
++			wantApplied:  nil,
++		},
++		{
++			name: "action rejected as a resource action on an unknown resource",
++			cfg:  MockConfig{ResourceID: "res-1", PollsBeforeTerminal: 0},
++			steps: []Step{
++				{Name: "a", OperationID: "SubmitResourceActionRequest", DeploymentID: "dep-1", ResourceID: "res-absent", ActionID: "Deployment.PowerOff"},
++			},
++			wantOutcomes: []StepOutcome{StepFailed},
++			wantApplied:  nil,
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			_, cl := testFixture(t, tc.cfg)
++			res, err := cl.ApplyPlan(context.Background(), tc.steps)
++			if err != nil {
++				t.Fatalf("ApplyPlan: %v", err)
++			}
++			got := make([]StepOutcome, len(res.Results))
++			for i, r := range res.Results {
++				got[i] = r.Outcome
++			}
++			if !reflect.DeepEqual(got, tc.wantOutcomes) {
++				t.Errorf("outcomes = %v, want %v\n%s", got, tc.wantOutcomes, res.Summary())
++			}
++			if !reflect.DeepEqual(res.Applied(), tc.wantApplied) {
++				t.Errorf("Applied() = %v, want %v", res.Applied(), tc.wantApplied)
++			}
++			if res.RolledBack {
++				t.Error("RolledBack = true, but no compensating request is ever sent")
++			}
++		})
++	}
++}
++
++func TestApplyPlanValidatesBeforeSending(t *testing.T) {
++	m, cl := testFixture(t, MockConfig{})
++
++	tests := []struct {
++		name  string
++		steps []Step
++	}{
++		{"unknown operation", []Step{{Name: "x", OperationID: "DeleteDeployment", DeploymentID: "dep-1"}}},
++		{"empty operation", []Step{{Name: "x"}}},
++		{"unknown operation after a valid one", []Step{
++			{Name: "ok", OperationID: "GetDeployment", DeploymentID: "dep-1"},
++			{Name: "x", OperationID: "PurgeDeployment", DeploymentID: "dep-1"},
++		}},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			if _, err := cl.ApplyPlan(context.Background(), tc.steps); err == nil {
++				t.Fatal("want an error")
++			}
++		})
++	}
++	if n := len(m.Requests()); n != 0 {
++		t.Errorf("mock received %d requests; an invalid plan must send nothing", n)
++	}
++}
++
++func TestSummaryReportsPartialApplication(t *testing.T) {
++	_, cl := testFixture(t, MockConfig{
++		ResourceID:          "res-1",
++		ActionResult:        map[string]string{"Deployment.PowerOff": "FAILED"},
++		ActionDetails:       map[string]string{"Deployment.PowerOff": "guest refused shutdown"},
++		PollsBeforeTerminal: 1,
++	})
++
++	res, err := cl.ApplyPlan(context.Background(), []Step{
++		{Name: "rename", OperationID: "PatchDeployment", DeploymentID: "dep-1", NewName: "n"},
++		{Name: "poweroff", OperationID: "SubmitDeploymentActionRequest", DeploymentID: "dep-1", ActionID: "Deployment.PowerOff"},
++	})
++	if err != nil {
++		t.Fatalf("ApplyPlan: %v", err)
++	}
++
++	want := "1. rename [PatchDeployment] SUCCEEDED\n" +
++		"2. poweroff [SubmitDeploymentActionRequest] FAILED: guest refused shutdown\n" +
++		"applied: rename\n" +
++		"rolled back: false\n"
++	if got := res.Summary(); got != want {
++		t.Errorf("Summary() =\n%s\nwant\n%s", got, want)
++	}
++}
++
++func TestAwaitRequestPollsUntilTerminal(t *testing.T) {
++	m, cl := testFixture(t, MockConfig{PollsBeforeTerminal: 3})
++
++	res, err := cl.ApplyPlan(context.Background(), []Step{
++		{Name: "lease", OperationID: "SubmitDeploymentActionRequest", DeploymentID: "dep-1", ActionID: "Deployment.ChangeLease"},
++	})
++	if err != nil {
++		t.Fatalf("ApplyPlan: %v", err)
++	}
++	if res.Results[0].Outcome != StepSucceeded {
++		t.Fatalf("outcome = %q: %s", res.Results[0].Outcome, res.Results[0].Detail)
++	}
++	if res.Results[0].Status != "SUCCESSFUL" {
++		t.Errorf("Status = %q, want SUCCESSFUL", res.Results[0].Status)
++	}
++
++	var polls int
++	for _, r := range m.Requests() {
++		if r.OperationID == "GetRequest" {
++			polls++
++		}
++	}
++	if polls != 4 {
++		t.Errorf("GetRequest polls = %d, want 4 (3 in-progress then the terminal one)", polls)
++	}
++}

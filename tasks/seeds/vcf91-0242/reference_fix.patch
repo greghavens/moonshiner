@@ -1,0 +1,434 @@
+diff --git a/VsanDpProtect/VsanDpProtect.psm1 b/VsanDpProtect/VsanDpProtect.psm1
+new file mode 100644
+index 0000000..a63bc2a
+--- /dev/null
++++ b/VsanDpProtect/VsanDpProtect.psm1
+@@ -0,0 +1,428 @@
++Set-StrictMode -Version Latest
++$ErrorActionPreference = 'Stop'
++
++Import-Module -Name 'VMware.Sdk.Vcf.SddcManager' `
++    -RequiredVersion '13.5.0.25380678' `
++    -ErrorAction Stop
++
++$script:JsonMediaType = 'application/json'
++
++function New-VsanDpRequestOptions {
++    [OutputType([VMware.Binding.OpenApi.Client.RequestOptions])]
++    param(
++        [hashtable] $PathParameter,
++        [System.Collections.Specialized.OrderedDictionary] $QueryParameter
++    )
++
++    $options = [VMware.Binding.OpenApi.Client.RequestOptions]::new()
++    if ($PathParameter) {
++        foreach ($name in $PathParameter.Keys) {
++            $options.PathParameters[[string] $name] = [string] $PathParameter[$name]
++        }
++    }
++    if ($QueryParameter) {
++        foreach ($name in $QueryParameter.Keys) {
++            foreach ($value in @($QueryParameter[$name])) {
++                $options.QueryParameters.Add([string] $name, [string] $value)
++            }
++        }
++    }
++    $options.HeaderParameters.Add('Accept', $script:JsonMediaType)
++    return $options
++}
++
++function Read-VsanDpPayload {
++    param([Parameter(Mandatory)] $Response)
++
++    $raw = [string] $Response.RawContent
++    if ([string]::IsNullOrWhiteSpace($raw)) {
++        return $null
++    }
++    return ConvertFrom-Json -InputObject $raw
++}
++
++function Get-VsanDpFailureText {
++    param([Parameter(Mandatory)] $Response, [Parameter(Mandatory)] [string] $What)
++
++    $detail = [string] $Response.RawContent
++    return "$What failed with HTTP $([int] $Response.StatusCode). $detail".Trim()
++}
++
++function New-VsanDpSessionToken {
++    param([Parameter(Mandatory)] [hashtable] $State)
++
++    $plain = '{0}:{1}' -f `
++        $State.Credential.UserName, `
++        $State.Credential.GetNetworkCredential().Password
++    $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($plain))
++
++    $options = [VMware.Binding.OpenApi.Client.RequestOptions]::new()
++    $options.HeaderParameters.Add('Authorization', "Basic $encoded")
++    $options.HeaderParameters.Add('Accept', $script:JsonMediaType)
++
++    $response = $State.ApiClient.Post[object](
++        '/snapservice/sessions',
++        $options,
++        $State.Configuration
++    )
++    if ([int] $response.StatusCode -ne 201) {
++        throw [InvalidOperationException]::new(
++            (Get-VsanDpFailureText -Response $response -What 'Snapservice.Sessions_create'))
++    }
++    $token = Read-VsanDpPayload -Response $response
++    if ([string]::IsNullOrWhiteSpace([string] $token)) {
++        throw [InvalidOperationException]::new(
++            'Snapservice.Sessions_create returned an empty session token.')
++    }
++    $State.SessionCreateCount = $State.SessionCreateCount + 1
++    $State.Token = [string] $token
++    return $State.Token
++}
++
++function Invoke-VsanDpOperation {
++    param(
++        [Parameter(Mandatory)] [hashtable] $State,
++        [Parameter(Mandatory)] [ValidateSet('GET', 'POST')] [string] $Method,
++        [Parameter(Mandatory)] [string] $Path,
++        [Parameter(Mandatory)] [string] $OperationId,
++        [hashtable] $PathParameter,
++        [System.Collections.Specialized.OrderedDictionary] $QueryParameter,
++        $Body
++    )
++
++    for ($attempt = 0; $attempt -lt 2; $attempt++) {
++        $options = New-VsanDpRequestOptions `
++            -PathParameter $PathParameter `
++            -QueryParameter $QueryParameter
++        $options.HeaderParameters.Add('vmware-api-session-id', $State.Token)
++        if ($null -ne $Body) {
++            $options.HeaderParameters.Add('Content-Type', $script:JsonMediaType)
++            $options.Data = $Body
++        }
++
++        if ($Method -eq 'GET') {
++            $response = $State.ApiClient.Get[object]($Path, $options, $State.Configuration)
++        } else {
++            $response = $State.ApiClient.Post[object]($Path, $options, $State.Configuration)
++        }
++
++        if ([int] $response.StatusCode -ne 401) {
++            return $response
++        }
++        if ($attempt -ne 0) {
++            throw [InvalidOperationException]::new(
++                "$OperationId was still unauthenticated after refreshing the session token.")
++        }
++
++        # The token expired mid-run. Exchange the credentials for a new one and
++        # replay only this request; everything already completed stands.
++        $null = New-VsanDpSessionToken -State $State
++        $State.TokenRefreshCount = $State.TokenRefreshCount + 1
++    }
++}
++
++function Wait-VsanDpTask {
++    param(
++        [Parameter(Mandatory)] [hashtable] $State,
++        [Parameter(Mandatory)] [string] $TaskId,
++        [Parameter(Mandatory)] [string] $What
++    )
++
++    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
++    while ($true) {
++        $response = Invoke-VsanDpOperation `
++            -State $State `
++            -Method 'GET' `
++            -Path '/snapservice/tasks/{task}' `
++            -OperationId 'Snapservice.Tasks_get' `
++            -PathParameter @{ task = $TaskId }
++        if ([int] $response.StatusCode -ne 200) {
++            throw [InvalidOperationException]::new(
++                (Get-VsanDpFailureText -Response $response -What "Snapservice.Tasks_get for $TaskId"))
++        }
++        $info = Read-VsanDpPayload -Response $response
++        $status = [string] $info.status
++
++        switch -CaseSensitive ($status) {
++            'SUCCEEDED' {
++                $result = $null
++                $property = $info.PSObject.Properties['result']
++                if ($null -ne $property) {
++                    $result = [string] $property.Value
++                }
++                if ([string]::IsNullOrWhiteSpace($result)) {
++                    throw [InvalidOperationException]::new(
++                        "$What completed without returning an identifier.")
++                }
++                return $result
++            }
++            'FAILED' {
++                throw [InvalidOperationException]::new("$What failed on the appliance.")
++            }
++            { $_ -in @('PENDING', 'RUNNING', 'BLOCKED') } { }
++            default {
++                throw [InvalidOperationException]::new(
++                    "$What reported the unknown task status '$status'.")
++            }
++        }
++
++        if ($stopwatch.Elapsed.TotalSeconds -ge $State.TimeoutSeconds) {
++            throw [TimeoutException]::new(
++                "$What did not finish within $($State.TimeoutSeconds) seconds.")
++        }
++        if ($State.PollIntervalSeconds -gt 0) {
++            Start-Sleep -Seconds $State.PollIntervalSeconds
++        }
++    }
++}
++
++function New-VsanDpProtectedSnapshot {
++    <#
++    .SYNOPSIS
++        Creates a vSAN Data Protection protection group and takes one manual
++        protection group snapshot, refreshing an expired session token in place.
++    #>
++    [CmdletBinding()]
++    [OutputType([psobject])]
++    param(
++        [Parameter(Mandatory)]
++        [VMware.Binding.OpenApi.Client.ApiClient] $ApiClient,
++
++        [Parameter(Mandatory)]
++        [ValidateNotNullOrEmpty()]
++        [string] $BasePath,
++
++        [Parameter(Mandatory)]
++        [ValidateNotNull()]
++        [pscredential] $Credential,
++
++        [Parameter(Mandatory)]
++        [ValidateNotNullOrEmpty()]
++        [string] $ClusterId,
++
++        [Parameter(Mandatory)]
++        [ValidateNotNullOrEmpty()]
++        [string] $ProtectionGroupName,
++
++        [Parameter(Mandatory)]
++        [ValidateNotNullOrEmpty()]
++        [string] $SnapshotName,
++
++        [string[]] $VmNamePattern,
++
++        [string[]] $VmId,
++
++        [switch] $Locked,
++
++        [string] $PolicyName,
++
++        [string] $PolicyIntervalUnit,
++
++        [long] $PolicyInterval,
++
++        [string] $PolicyRetentionUnit,
++
++        [long] $PolicyRetentionDuration,
++
++        [string] $SnapshotRetentionUnit,
++
++        [long] $SnapshotRetentionDuration,
++
++        [ValidateRange(0, 60)]
++        [int] $PollIntervalSeconds = 2,
++
++        [ValidateRange(1, 900)]
++        [int] $TimeoutSeconds = 300
++    )
++
++    if ($null -eq $ApiClient) {
++        throw [ArgumentNullException]::new('ApiClient')
++    }
++    if ($null -eq $Credential) {
++        throw [ArgumentNullException]::new('Credential')
++    }
++
++    foreach ($requiredString in @(
++        @{ Name = 'BasePath'; Value = $BasePath },
++        @{ Name = 'ClusterId'; Value = $ClusterId },
++        @{ Name = 'ProtectionGroupName'; Value = $ProtectionGroupName },
++        @{ Name = 'SnapshotName'; Value = $SnapshotName }
++    )) {
++        if ([string]::IsNullOrWhiteSpace([string] $requiredString.Value)) {
++            throw [ArgumentException]::new(
++                "$($requiredString.Name) must not be blank.",
++                [string] $requiredString.Name)
++        }
++    }
++
++    $patterns = @($VmNamePattern | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
++    $vms = @($VmId | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
++    if ($patterns.Count -eq 0 -and $vms.Count -eq 0) {
++        throw [ArgumentException]::new(
++            'Supply VmNamePattern, VmId, or both so the protection group has target entities.')
++    }
++
++    $policyFields = @(
++        $PSBoundParameters.ContainsKey('PolicyName'),
++        $PSBoundParameters.ContainsKey('PolicyIntervalUnit'),
++        $PSBoundParameters.ContainsKey('PolicyInterval'),
++        $PSBoundParameters.ContainsKey('PolicyRetentionUnit'),
++        $PSBoundParameters.ContainsKey('PolicyRetentionDuration')
++    )
++    $policyGiven = @($policyFields | Where-Object { $_ }).Count
++    if ($policyGiven -notin @(0, $policyFields.Count)) {
++        throw [ArgumentException]::new(
++            'A snapshot policy needs PolicyName, PolicyIntervalUnit, PolicyInterval, PolicyRetentionUnit and PolicyRetentionDuration together.')
++    }
++
++    $snapshotRetentionFields = @(
++        $PSBoundParameters.ContainsKey('SnapshotRetentionUnit'),
++        $PSBoundParameters.ContainsKey('SnapshotRetentionDuration')
++    )
++    $snapshotRetentionGiven = @($snapshotRetentionFields | Where-Object { $_ }).Count
++    if ($snapshotRetentionGiven -notin @(0, $snapshotRetentionFields.Count)) {
++        throw [ArgumentException]::new(
++            'Snapshot retention needs SnapshotRetentionUnit and SnapshotRetentionDuration together.')
++    }
++
++    $configuration = [VMware.Binding.OpenApi.Client.Configuration]::new()
++    $configuration.BasePath = $BasePath
++
++    $state = @{
++        ApiClient           = $ApiClient
++        Configuration       = $configuration
++        Credential          = $Credential
++        Token               = $null
++        SessionCreateCount  = 0
++        TokenRefreshCount   = 0
++        PollIntervalSeconds = $PollIntervalSeconds
++        TimeoutSeconds      = $TimeoutSeconds
++    }
++
++    $null = New-VsanDpSessionToken -State $state
++
++    # Snapservice.ProtectionGroupSpec, properties in specification order and
++    # with every unset optional property left off the wire entirely.
++    $targetEntities = [ordered] @{}
++    if ($patterns.Count -gt 0) {
++        $targetEntities['vm_name_patterns'] = [string[]] $patterns
++    }
++    if ($vms.Count -gt 0) {
++        $targetEntities['vms'] = [string[]] $vms
++    }
++
++    $protectionGroupSpec = [ordered] @{}
++    $protectionGroupSpec['name'] = $ProtectionGroupName
++    $protectionGroupSpec['target_entities'] = $targetEntities
++    if ($policyGiven -eq $policyFields.Count) {
++        $schedule = [ordered] @{}
++        $schedule['unit'] = $PolicyIntervalUnit
++        $schedule['interval'] = $PolicyInterval
++        $retention = [ordered] @{}
++        $retention['unit'] = $PolicyRetentionUnit
++        $retention['duration'] = $PolicyRetentionDuration
++        $policy = [ordered] @{}
++        $policy['name'] = $PolicyName
++        $policy['schedule'] = $schedule
++        $policy['retention'] = $retention
++        $protectionGroupSpec['snapshot_policies'] = @($policy)
++    }
++    if ($Locked.IsPresent) {
++        $protectionGroupSpec['locked'] = $true
++    }
++
++    $createQuery = [ordered] @{ 'vmw-task' = 'true' }
++    $createResponse = Invoke-VsanDpOperation `
++        -State $state `
++        -Method 'POST' `
++        -Path '/snapservice/clusters/{cluster}/protection-groups' `
++        -OperationId 'Snapservice.Clusters.ProtectionGroups_create$Task' `
++        -PathParameter @{ cluster = $ClusterId } `
++        -QueryParameter $createQuery `
++        -Body $protectionGroupSpec
++    if ([int] $createResponse.StatusCode -ne 202) {
++        throw [InvalidOperationException]::new((Get-VsanDpFailureText `
++            -Response $createResponse `
++            -What 'Snapservice.Clusters.ProtectionGroups_create$Task'))
++    }
++    $createTaskId = [string] (Read-VsanDpPayload -Response $createResponse)
++    if ([string]::IsNullOrWhiteSpace($createTaskId)) {
++        throw [InvalidOperationException]::new(
++            'The protection group create operation returned no task identifier.')
++    }
++
++    $protectionGroupId = Wait-VsanDpTask `
++        -State $state `
++        -TaskId $createTaskId `
++        -What "Creating protection group '$ProtectionGroupName'"
++
++    # Snapservice.Clusters.ProtectionGroups.Snapshots.CreateSpec
++    $snapshotSpec = [ordered] @{}
++    $snapshotSpec['name'] = $SnapshotName
++    if ($snapshotRetentionGiven -eq $snapshotRetentionFields.Count) {
++        $snapshotRetention = [ordered] @{}
++        $snapshotRetention['unit'] = $SnapshotRetentionUnit
++        $snapshotRetention['duration'] = $SnapshotRetentionDuration
++        $snapshotSpec['retention'] = $snapshotRetention
++    }
++
++    $snapshotQuery = [ordered] @{ 'vmw-task' = 'true' }
++    $snapshotResponse = Invoke-VsanDpOperation `
++        -State $state `
++        -Method 'POST' `
++        -Path '/snapservice/clusters/{cluster}/protection-groups/{pg}/snapshots' `
++        -OperationId 'Snapservice.Clusters.ProtectionGroups.Snapshots_create$Task' `
++        -PathParameter @{ cluster = $ClusterId; pg = $protectionGroupId } `
++        -QueryParameter $snapshotQuery `
++        -Body $snapshotSpec
++    if ([int] $snapshotResponse.StatusCode -ne 202) {
++        throw [InvalidOperationException]::new((Get-VsanDpFailureText `
++            -Response $snapshotResponse `
++            -What 'Snapservice.Clusters.ProtectionGroups.Snapshots_create$Task'))
++    }
++    $snapshotTaskId = [string] (Read-VsanDpPayload -Response $snapshotResponse)
++    if ([string]::IsNullOrWhiteSpace($snapshotTaskId)) {
++        throw [InvalidOperationException]::new(
++            'The snapshot operation returned no task identifier.')
++    }
++
++    $snapshotId = Wait-VsanDpTask `
++        -State $state `
++        -TaskId $snapshotTaskId `
++        -What "Taking snapshot '$SnapshotName'"
++
++    $listQuery = [ordered] @{ pgs = $protectionGroupId }
++    $listResponse = Invoke-VsanDpOperation `
++        -State $state `
++        -Method 'GET' `
++        -Path '/snapservice/clusters/{cluster}/protection-groups' `
++        -OperationId 'Snapservice.Clusters.ProtectionGroups_list' `
++        -PathParameter @{ cluster = $ClusterId } `
++        -QueryParameter $listQuery
++    if ([int] $listResponse.StatusCode -ne 200) {
++        throw [InvalidOperationException]::new((Get-VsanDpFailureText `
++            -Response $listResponse `
++            -What 'Snapservice.Clusters.ProtectionGroups_list'))
++    }
++    $listResult = Read-VsanDpPayload -Response $listResponse
++    $matches = @($listResult.items | Where-Object { [string] $_.pg -ceq $protectionGroupId })
++    if ($matches.Count -ne 1) {
++        throw [InvalidOperationException]::new(
++            "Expected exactly one protection group with identifier '$protectionGroupId', saw $($matches.Count).")
++    }
++
++    return [pscustomobject] ([ordered] @{
++        clusterId             = $ClusterId
++        protectionGroupId     = $protectionGroupId
++        protectionGroupName   = [string] $matches[0].info.name
++        protectionGroupStatus = [string] $matches[0].info.status
++        createTaskId          = $createTaskId
++        snapshotTaskId        = $snapshotTaskId
++        snapshotId            = $snapshotId
++        snapshotName          = $SnapshotName
++        sessionCreateCount    = [int] $state.SessionCreateCount
++        tokenRefreshCount     = [int] $state.TokenRefreshCount
++    })
++}
++
++Export-ModuleMember -Function 'New-VsanDpProtectedSnapshot'

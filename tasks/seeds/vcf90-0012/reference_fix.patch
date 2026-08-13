@@ -1,0 +1,306 @@
+diff --git a/src/vcf_sddc_credentials/client.py b/src/vcf_sddc_credentials/client.py
+index 1a94a10..372f369 100644
+--- a/src/vcf_sddc_credentials/client.py
++++ b/src/vcf_sddc_credentials/client.py
+@@ -2,6 +2,36 @@
+ 
+ from __future__ import annotations
+ 
++import json
++import math
++from http.client import HTTPException
++from typing import Any
++from urllib.error import HTTPError, URLError
++from urllib.parse import quote, urlencode, urlsplit, urlunsplit
++from urllib.request import Request, urlopen
++
++#: ResourceCredentials.resourceType values enumerated by the 9.0.0.0 specification.
++_RESOURCE_TYPES = (
++    "ESXI",
++    "VCENTER",
++    "PSC",
++    "NSXT_MANAGER",
++    "NSXT_EDGE",
++    "NSX_ALB",
++    "BACKUP",
++)
++
++#: CredentialsTask.status values that describe a rotation already under way.
++_ADOPTABLE = {
++    "PENDING": "in-flight",
++    "IN_PROGRESS": "in-flight",
++    "SUCCESSFUL": "already-complete",
++}
++
++_CREDENTIAL_TYPE = "SSH"
++_ACCOUNT_TYPE = "USER"
++_JSON = "application/json"
++
+ 
+ class SddcManagerError(RuntimeError):
+     """Raised when an SDDC Manager request, response, or task state is unusable."""
+@@ -18,11 +48,20 @@ class SddcManagerClient:
+         *,
+         timeout: float = 10.0,
+     ) -> None:
+-        self._base_url = base_url
+-        self._username = username
+-        self._password = password
+-        self._timeout = timeout
+-        raise NotImplementedError("SddcManagerClient is not implemented yet")
++        self._base_url = _require_base_url(base_url)
++        self._username = _require_text(username, "username")
++        self._password = _require_text(password, "password")
++        if (
++            isinstance(timeout, bool)
++            or not isinstance(timeout, (int, float))
++            or not math.isfinite(float(timeout))
++            or timeout <= 0
++        ):
++            raise SddcManagerError("timeout must be a positive finite number")
++        self._timeout = float(timeout)
++        self._access_token: str | None = None
++
++    # -- public API --------------------------------------------------------- #
+ 
+     def rotate_ssh_password(
+         self,
+@@ -33,4 +72,237 @@ class SddcManagerClient:
+         task_lookup_limit: int | None = 10,
+     ) -> dict[str, object]:
+         """Rotate one SSH account password without duplicating an existing rotation."""
+-        raise NotImplementedError("rotate_ssh_password is not implemented yet")
++        resource_type = _require_text(resource_type, "resource_type")
++        if resource_type not in _RESOURCE_TYPES:
++            raise SddcManagerError(f"resource_type must be one of {list(_RESOURCE_TYPES)}")
++        resource_name = _require_text(resource_name, "resource_name")
++        account_username = _require_text(account_username, "account_username")
++        if task_lookup_limit is not None and (
++            isinstance(task_lookup_limit, bool)
++            or not isinstance(task_lookup_limit, int)
++            or not 1 <= task_lookup_limit <= 1000
++        ):
++            raise SddcManagerError(
++                "task_lookup_limit must be None or an integer from 1 to 1000"
++            )
++
++        # One representation, serialized once, used by whichever route is chosen.
++        payload = _update_spec(resource_type, resource_name, account_username)
++
++        existing = self._find_task(
++            resource_type, resource_name, account_username, task_lookup_limit
++        )
++        if existing is None:
++            return self._submit(payload)
++
++        status = existing.get("status")
++        action = _ADOPTABLE.get(status) if isinstance(status, str) else None
++        if action is not None:
++            return _result(action, existing)
++        if status == "FAILED":
++            return self._resume(existing, payload)
++        if status == "USER_CANCELLED":
++            return self._submit(payload)
++        raise SddcManagerError(
++            "matching credentials task is in an unresolved state; "
++            "rotation was not attempted"
++        )
++
++    # -- rotation reconciliation -------------------------------------------- #
++
++    def _find_task(
++        self,
++        resource_type: str,
++        resource_name: str,
++        account_username: str,
++        limit: int | None,
++    ) -> dict[str, Any] | None:
++        """Return the first ROTATE task that already covers this exact account."""
++        query = None if limit is None else {"limit": str(limit)}
++        page = self._call("GET", "/v1/credentials/tasks", 200, query=query)
++        if "elements" not in page:
++            return None
++        elements = page["elements"]
++        if not isinstance(elements, list):
++            raise SddcManagerError("PageOfCredentialsTask elements must be an array")
++        for task in elements:
++            _validate_credentials_task(task)
++            sub_tasks = task.get("subTasks", [])
++            if not isinstance(sub_tasks, list):
++                raise SddcManagerError("CredentialsTask subTasks must be an array")
++            for sub in sub_tasks:
++                _validate_credentials_subtask(sub)
++            if task["type"] != "ROTATE":
++                continue
++            for sub in sub_tasks:
++                if (
++                    sub.get("entityType") == resource_type
++                    and sub.get("resourceName") == resource_name
++                    and sub.get("username") == account_username
++                    and sub.get("credentialType") == _CREDENTIAL_TYPE
++                ):
++                    return task
++        return None
++
++    def _submit(self, payload: bytes) -> dict[str, object]:
++        task = self._call("PATCH", "/v1/credentials", 202, payload=payload)
++        return _result("submitted", task)
++
++    def _resume(self, existing: dict[str, Any], payload: bytes) -> dict[str, object]:
++        path = "/v1/credentials/tasks/" + quote(existing["id"], safe="")
++        task = self._call("PATCH", path, 202, payload=payload)
++        return _result("resumed", task)
++
++    # -- transport ---------------------------------------------------------- #
++
++    def _token(self) -> str:
++        if self._access_token is None:
++            payload = _encode({"username": self._username, "password": self._password})
++            pair = self._call(
++                "POST", "/v1/tokens", 201, payload=payload, authenticated=False
++            )
++            token = pair.get("accessToken")
++            if (
++                not isinstance(token, str)
++                or not token.strip()
++                or "\r" in token
++                or "\n" in token
++            ):
++                raise SddcManagerError("createToken response carried no access token")
++            self._access_token = token
++        return self._access_token
++
++    def _call(
++        self,
++        method: str,
++        path: str,
++        expected: int,
++        *,
++        query: dict[str, str] | None = None,
++        payload: bytes | None = None,
++        authenticated: bool = True,
++    ) -> dict[str, Any]:
++        scheme, netloc = self._base_url
++        target = urlunsplit((scheme, netloc, path, urlencode(query) if query else "", ""))
++        request = Request(target, data=payload, method=method)
++        request.add_header("Accept", _JSON)
++        if authenticated:
++            request.add_header("Authorization", f"Bearer {self._token()}")
++        if payload is not None:
++            request.add_header("Content-Type", _JSON)
++            request.add_header("Content-Length", str(len(payload)))
++
++        try:
++            with urlopen(request, timeout=self._timeout) as response:
++                status = response.status
++                body = response.read()
++        except HTTPError as error:
++            raise SddcManagerError(
++                f"SDDC Manager request failed with HTTP {error.code}"
++            ) from None
++        except (URLError, HTTPException, TimeoutError, OSError, ValueError) as error:
++            raise SddcManagerError(
++                f"SDDC Manager request could not be completed: {type(error).__name__}"
++            ) from None
++
++        if status != expected:
++            raise SddcManagerError(
++                f"SDDC Manager request returned HTTP {status}, expected {expected}"
++            )
++        try:
++            decoded = json.loads(body.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            raise SddcManagerError("SDDC Manager returned a malformed JSON body") from None
++        if not isinstance(decoded, dict):
++            raise SddcManagerError("SDDC Manager returned a non-object JSON body")
++        return decoded
++
++
++# --------------------------------------------------------------------------- #
++# helpers
++# --------------------------------------------------------------------------- #
++
++
++def _update_spec(resource_type: str, resource_name: str, account_username: str) -> bytes:
++    """Build a CredentialsUpdateSpec that omits every unset optional member."""
++    return _encode(
++        {
++            "operationType": "ROTATE",
++            "elements": [
++                {
++                    "resourceType": resource_type,
++                    "resourceName": resource_name,
++                    "credentials": [
++                        {
++                            "credentialType": _CREDENTIAL_TYPE,
++                            "accountType": _ACCOUNT_TYPE,
++                            "username": account_username,
++                        }
++                    ],
++                }
++            ],
++        }
++    )
++
++
++def _encode(value: dict[str, Any]) -> bytes:
++    try:
++        return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode(
++            "utf-8"
++        )
++    except (TypeError, ValueError, UnicodeEncodeError):
++        raise SddcManagerError("request values cannot be encoded as UTF-8 JSON") from None
++
++
++def _result(action: str, task: dict[str, Any]) -> dict[str, object]:
++    for name in ("id", "name", "status", "creationTimestamp"):
++        if not isinstance(task.get(name), str):
++            raise SddcManagerError("credentials task response is malformed")
++    task_id = task.get("id")
++    if not isinstance(task_id, str) or not task_id.strip():
++        raise SddcManagerError("credentials task carried no usable id")
++    return {"action": action, "taskId": task_id, "task": task}
++
++
++def _require_text(value: object, name: str) -> str:
++    if not isinstance(value, str) or not value.strip():
++        raise SddcManagerError(f"{name} must be a nonblank string")
++    return value
++
++
++def _require_base_url(base_url: object) -> tuple[str, str]:
++    if not isinstance(base_url, str) or not base_url.strip():
++        raise SddcManagerError("base_url must be a nonblank string")
++    try:
++        parsed = urlsplit(base_url)
++        parsed.port
++    except ValueError:
++        raise SddcManagerError("base_url is not a valid URL") from None
++    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
++        raise SddcManagerError("base_url must be an absolute http or https URL")
++    if parsed.query or parsed.fragment:
++        raise SddcManagerError("base_url must not carry a query or fragment")
++    return parsed.scheme, parsed.netloc
++
++
++def _validate_credentials_task(value: object) -> None:
++    if not isinstance(value, dict):
++        raise SddcManagerError("CredentialsTask elements must be objects")
++    for name in ("id", "name", "type", "status", "creationTimestamp"):
++        if not isinstance(value.get(name), str):
++            raise SddcManagerError("CredentialsTask response is malformed")
++    if not value["id"].strip():
++        raise SddcManagerError("CredentialsTask carried no usable id")
++    if "subTasks" in value and not isinstance(value["subTasks"], list):
++        raise SddcManagerError("CredentialsTask subTasks must be an array")
++
++
++def _validate_credentials_subtask(value: object) -> None:
++    if not isinstance(value, dict):
++        raise SddcManagerError("CredentialsSubTask elements must be objects")
++    for name in ("creationTimestamp", "description", "name", "status"):
++        if not isinstance(value.get(name), str):
++            raise SddcManagerError("CredentialsSubTask response is malformed")
++    for name in ("entityType", "resourceName", "username", "credentialType"):
++        if name in value and not isinstance(value[name], str):
++            raise SddcManagerError("CredentialsSubTask response is malformed")

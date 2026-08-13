@@ -1,0 +1,355 @@
+diff --git a/vcfa_change/change.py b/vcfa_change/change.py
+new file mode 100644
+index 0000000..7bb1de6
+--- /dev/null
++++ b/vcfa_change/change.py
+@@ -0,0 +1,349 @@
++"""Apply a catalog-driven change against the VCF Automation API in VCF 9.1.
++
++The four operations used here are transcribed in ``docs/contract.json`` from the
++rendered VCF Automation xAPIs reference for the VM Apps Org - Catalog API:
++
++  GET  /catalog/api/items                                   Get Catalog Items
++  POST /catalog/api/items/{id}/request                      Request Catalog Item Instances
++  GET  /deployment/api/deployments/{deploymentId}           Get Deployment By Id
++  POST /deployment/api/deployments/{deploymentId}/requests  Submit Deployment Action Request
++
++Every member of both request bodies and every query parameter is documented
++optional, so an unsupplied member is left off the wire entirely rather than sent
++as null, an empty string, an empty object, zero or false.
++"""
++
++from __future__ import annotations
++
++import json
++import urllib.error
++import urllib.parse
++import urllib.request
++from collections.abc import Mapping
++from typing import Any
++
++
++CATALOG_ITEMS_PATH = "/catalog/api/items"
++DEPLOYMENTS_PATH = "/deployment/api/deployments"
++
++# Documented member order of CatalogItemRequest and ResourceActionRequest.
++CATALOG_ITEM_REQUEST_ORDER = (
++    "bulkRequestCount",
++    "deploymentName",
++    "inputs",
++    "projectId",
++    "reason",
++    "version",
++)
++ACTION_REQUEST_ORDER = ("actionId", "inputs", "reason")
++
++STEP_RESOLVE = "resolve-catalog-item"
++STEP_REQUEST = "request-catalog-item"
++STEP_READ = "read-deployment"
++STEP_ACTION = "submit-deployment-action"
++
++
++class VcfaResponseError(RuntimeError):
++    """A step before the day-2 action did not return a usable response."""
++
++
++def apply_catalog_change(
++    *,
++    base_url: str,
++    access_token: str,
++    project_id: str,
++    catalog_item_name: str,
++    deployment_name: str,
++    action_id: str,
++    inputs: Mapping[str, Any] | None = None,
++    reason: str | None = None,
++    action_reason: str | None = None,
++    page_size: int = 50,
++    timeout: float = 30.0,
++) -> dict[str, Any]:
++    """Resolve a catalog item, deploy it, read it back, then run a day-2 action.
++
++    The returned report names every step and the outcome the service actually
++    gave it. A failure in the day-2 action never restates an earlier step as
++    failed and never rolls one back.
++    """
++    root = _require_text(base_url, "base_url").rstrip("/")
++    token = _require_text(access_token, "access_token")
++    project = _require_text(project_id, "project_id")
++    item_name = _require_text(catalog_item_name, "catalog_item_name")
++    wanted_name = _require_text(deployment_name, "deployment_name")
++    action = _require_text(action_id, "action_id")
++    if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size < 1:
++        raise ValueError("page_size must be a positive integer")
++    if inputs is not None and not isinstance(inputs, Mapping):
++        raise ValueError("inputs must be a mapping when it is supplied")
++    if reason is not None and not isinstance(reason, str):
++        raise ValueError("reason must be a string when it is supplied")
++    if action_reason is not None and not isinstance(action_reason, str):
++        raise ValueError("action_reason must be a string when it is supplied")
++
++    steps: list[dict[str, Any]] = []
++
++    item_id = _resolve_catalog_item(
++        root, token, timeout, project, item_name, page_size
++    )
++    steps.append(_step(STEP_RESOLVE, "getCatalogItems", "succeeded", item_id))
++
++    deployment_id, created_name = _request_catalog_item(
++        root, token, timeout, item_id, project, wanted_name, inputs, reason
++    )
++    steps.append(
++        _step(STEP_REQUEST, "requestCatalogItemInstances", "succeeded", deployment_id)
++    )
++
++    status = _read_deployment(root, token, timeout, deployment_id)
++    steps.append(_step(STEP_READ, "getDeploymentById", "succeeded", status))
++
++    # The service owns the decision on whether the action is permitted; a local
++    # guess about the deployment status would report something the service never
++    # said.
++    http_status, payload = _post(
++        root,
++        f"{DEPLOYMENTS_PATH}/{urllib.parse.quote(deployment_id, safe='')}/requests",
++        token,
++        timeout,
++        _ordered_body(
++            ACTION_REQUEST_ORDER,
++            {"actionId": action, "reason": action_reason},
++        ),
++    )
++    if http_status == 200:
++        request_id = _text_member(payload, "id", STEP_ACTION)
++        steps.append(
++            _step(STEP_ACTION, "submitDeploymentActionRequest", "succeeded", request_id)
++        )
++        failure: dict[str, Any] | None = None
++        outcome = "applied"
++    else:
++        error_code, message = _error_fields(http_status, payload)
++        request_id = None
++        steps.append(
++            _step(STEP_ACTION, "submitDeploymentActionRequest", "failed", error_code)
++        )
++        failure = {
++            "step": STEP_ACTION,
++            "operation": "submitDeploymentActionRequest",
++            "httpStatus": http_status,
++            "errorCode": error_code,
++            "message": message,
++        }
++        outcome = "partially_applied"
++
++    return {
++        "outcome": outcome,
++        "catalogItemId": item_id,
++        "catalogItemName": item_name,
++        "projectId": project,
++        "deploymentId": deployment_id,
++        "deploymentName": created_name,
++        "deploymentStatus": status,
++        "actionId": action,
++        "actionRequestId": request_id,
++        "steps": steps,
++        "failure": failure,
++    }
++
++
++# --------------------------------------------------------------------------- #
++# Steps
++# --------------------------------------------------------------------------- #
++
++
++def _resolve_catalog_item(
++    root: str,
++    token: str,
++    timeout: float,
++    project_id: str,
++    catalog_item_name: str,
++    page_size: int,
++) -> str:
++    query = urllib.parse.urlencode(
++        [
++            ("search", catalog_item_name),
++            ("projects", project_id),
++            ("size", str(page_size)),
++        ]
++    )
++    status, payload = _get(root, f"{CATALOG_ITEMS_PATH}?{query}", token, timeout)
++    _require_ok(status, payload, STEP_RESOLVE)
++    if not isinstance(payload, Mapping):
++        raise VcfaResponseError("the catalog item page was not an object")
++    content = payload.get("content")
++    if not isinstance(content, list):
++        raise VcfaResponseError("the catalog item page carried no content array")
++
++    # search is a substring match across a page whose order is not significant,
++    # so the item is selected by exact name, project membership and requestability.
++    matches = [
++        item
++        for item in content
++        if isinstance(item, Mapping)
++        and item.get("name") == catalog_item_name
++        and project_id in _string_list(item.get("projectIds"))
++        and item.get("isRequestable") is True
++    ]
++    if len(matches) != 1:
++        raise LookupError(
++            f"expected exactly one requestable catalog item named "
++            f"{catalog_item_name!r} in project {project_id}, found {len(matches)}"
++        )
++    return _text_member(matches[0], "id", STEP_RESOLVE)
++
++
++def _request_catalog_item(
++    root: str,
++    token: str,
++    timeout: float,
++    item_id: str,
++    project_id: str,
++    deployment_name: str,
++    inputs: Mapping[str, Any] | None,
++    reason: str | None,
++) -> tuple[str, str]:
++    body = _ordered_body(
++        CATALOG_ITEM_REQUEST_ORDER,
++        {
++            "deploymentName": deployment_name,
++            "inputs": dict(inputs) if inputs is not None else None,
++            "projectId": project_id,
++            "reason": reason,
++        },
++    )
++    status, payload = _post(
++        root,
++        f"{CATALOG_ITEMS_PATH}/{urllib.parse.quote(item_id, safe='')}/request",
++        token,
++        timeout,
++        body,
++    )
++    _require_ok(status, payload, STEP_REQUEST)
++    if not isinstance(payload, list) or len(payload) != 1:
++        raise VcfaResponseError(
++            "the catalog item request did not return exactly one deployment"
++        )
++    entry = payload[0]
++    deployment_id = _text_member(entry, "deploymentId", STEP_REQUEST)
++    created_name = _text_member(entry, "deploymentName", STEP_REQUEST)
++    return deployment_id, created_name
++
++
++def _read_deployment(root: str, token: str, timeout: float, deployment_id: str) -> str:
++    # expandResources, expandLastRequest and expandProject are deprecated; the
++    # supported expand member carries the same intent.
++    query = urllib.parse.urlencode([("expand", "resources")])
++    status, payload = _get(
++        root,
++        f"{DEPLOYMENTS_PATH}/{urllib.parse.quote(deployment_id, safe='')}?{query}",
++        token,
++        timeout,
++    )
++    _require_ok(status, payload, STEP_READ)
++    if _text_member(payload, "id", STEP_READ) != deployment_id:
++        raise VcfaResponseError("the service returned a different deployment")
++    return _text_member(payload, "status", STEP_READ)
++
++
++# --------------------------------------------------------------------------- #
++# Wire helpers
++# --------------------------------------------------------------------------- #
++
++
++def _ordered_body(
++    member_order: tuple[str, ...], values: Mapping[str, Any]
++) -> dict[str, Any]:
++    """Keep only the members the caller supplied, in the documented order."""
++    return {
++        name: values[name]
++        for name in member_order
++        if values.get(name) is not None
++    }
++
++
++def _get(root: str, target: str, token: str, timeout: float) -> tuple[int, Any]:
++    return _send("GET", root + target, token, timeout, None)
++
++
++def _post(
++    root: str, target: str, token: str, timeout: float, body: Mapping[str, Any]
++) -> tuple[int, Any]:
++    return _send("POST", root + target, token, timeout, body)
++
++
++def _send(
++    method: str,
++    url: str,
++    token: str,
++    timeout: float,
++    body: Mapping[str, Any] | None,
++) -> tuple[int, Any]:
++    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
++    data: bytes | None = None
++    if body is not None:
++        data = json.dumps(body, separators=(",", ":")).encode("utf-8")
++        headers["Content-Type"] = "application/json"
++    request = urllib.request.Request(url, data=data, headers=headers, method=method)
++    try:
++        with urllib.request.urlopen(request, timeout=timeout) as response:
++            return response.status, _decode(response.read())
++    except urllib.error.HTTPError as error:
++        return error.code, _decode(error.read())
++
++
++def _decode(raw: bytes) -> Any:
++    if not raw:
++        return None
++    try:
++        return json.loads(raw.decode("utf-8"))
++    except (UnicodeDecodeError, json.JSONDecodeError):
++        return None
++
++
++def _require_ok(status: int, payload: Any, step: str) -> None:
++    if status != 200:
++        code, message = _error_fields(status, payload)
++        raise VcfaResponseError(f"{step} failed with {status} {code}: {message}")
++
++
++def _error_fields(status: int, payload: Any) -> tuple[str, str]:
++    code = ""
++    message = ""
++    if isinstance(payload, Mapping):
++        raw_code = payload.get("errorCode")
++        raw_message = payload.get("message")
++        code = raw_code if isinstance(raw_code, str) else ""
++        message = raw_message if isinstance(raw_message, str) else ""
++    if not code:
++        code = f"HTTP_{status}"
++    if not message:
++        message = f"the service answered {status} without a message"
++    return code, message
++
++
++def _string_list(value: Any) -> list[str]:
++    if not isinstance(value, list):
++        return []
++    return [item for item in value if isinstance(item, str)]
++
++
++def _text_member(payload: Any, name: str, step: str) -> str:
++    if not isinstance(payload, Mapping):
++        raise VcfaResponseError(f"{step} received a response that was not an object")
++    value = payload.get(name)
++    if not isinstance(value, str) or not value.strip():
++        raise VcfaResponseError(f"{step} received a blank or missing {name}")
++    return value
++
++
++def _step(name: str, operation: str, status: str, detail: str) -> dict[str, Any]:
++    return {"name": name, "operation": operation, "status": status, "detail": detail}
++
++
++def _require_text(value: Any, name: str) -> str:
++    if not isinstance(value, str) or not value.strip():
++        raise ValueError(f"{name} must be a nonblank string")
++    return value

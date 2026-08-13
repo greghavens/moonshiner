@@ -1,0 +1,398 @@
+--- a/vcfautomation/client.go
++++ b/vcfautomation/client.go
+@@ -1,9 +1,21 @@
++// Package vcfautomation is a standard-library-only client for the three
++// VMware Cloud Foundation Automation 9.1 deployment operations projected in
++// docs/contract.json: listing the actions available on a deployment,
++// submitting a day-2 action request, and polling that asynchronous request
++// until it reaches a terminal status.
+ package vcfautomation
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
++	"mime"
+ 	"net/http"
++	"net/url"
++	"strings"
+ 	"time"
+ )
+ 
+@@ -11,6 +23,11 @@
+ // status before the poll deadline elapsed.
+ var ErrPollTimeout = errors.New("vcf automation: deployment request did not reach a terminal status before the poll timeout")
+ 
++const (
++	defaultPollInterval = 5 * time.Second
++	defaultPollTimeout  = 30 * time.Minute
++)
++
+ // Action is a deployment action reported by getDeploymentActions.
+ type Action struct {
+ 	ID          string `json:"id"`
+@@ -79,6 +96,24 @@
+ 	return "VCF Automation deployment request ended in status " + e.Status
+ }
+ 
++// statusLifecycle mirrors components.x-status-lifecycle in docs/contract.json.
++// A status outside this table is not part of the contract enum and must not be
++// guessed at by the poller.
++var statusLifecycle = map[string]struct{ terminal, successful bool }{
++	"CREATED":                  {false, false},
++	"PENDING":                  {false, false},
++	"INITIALIZATION":           {false, false},
++	"CHECKING_APPROVAL":        {false, false},
++	"APPROVAL_PENDING":         {false, false},
++	"USER_INTERACTION_PENDING": {false, false},
++	"INPROGRESS":               {false, false},
++	"COMPLETION":               {false, false},
++	"APPROVAL_REJECTED":        {true, false},
++	"ABORTED":                  {true, false},
++	"SUCCESSFUL":               {true, true},
++	"FAILED":                   {true, false},
++}
++
+ // Client calls the VCF Automation VM Apps Org deployment API.
+ type Client struct {
+ 	// PollInterval is the delay between getRequest polls. Zero selects the
+@@ -87,15 +122,333 @@
+ 	// PollTimeout bounds the total time spent polling one request. Zero
+ 	// selects the package default.
+ 	PollTimeout time.Duration
++
++	baseURL     string
++	accessToken string
++	httpClient  *http.Client
+ }
+ 
+-// NewClient constructs a client. It is intentionally incomplete.
++// NewClient constructs a client for the service root baseURL, authenticating
++// with accessToken. A nil httpClient selects http.DefaultClient.
+ func NewClient(baseURL, accessToken string, httpClient *http.Client) (*Client, error) {
+-	return nil, errors.New("TODO: implement NewClient")
++	trimmed := strings.TrimSpace(baseURL)
++	if trimmed == "" {
++		return nil, errors.New("vcf automation: service root URL is empty")
++	}
++	parsed, err := url.Parse(trimmed)
++	if err != nil {
++		return nil, errors.New("vcf automation: service root URL is not a URL")
++	}
++	switch parsed.Scheme {
++	case "http", "https":
++	default:
++		return nil, errors.New("vcf automation: service root URL scheme is not http or https")
++	}
++	if parsed.Host == "" {
++		return nil, errors.New("vcf automation: service root URL has no host")
++	}
++	// Contract operations define no query parameters, and URL fragments are
++	// never part of an HTTP request target. Treat either as outside the service
++	// root rather than carrying it into an endpoint request.
++	parsed.RawQuery = ""
++	parsed.ForceQuery = false
++	parsed.Fragment = ""
++
++	// The token is never echoed into an error message.
++	if strings.TrimSpace(accessToken) == "" {
++		return nil, errors.New("vcf automation: access token is blank")
++	}
++	for _, r := range accessToken {
++		if r < 0x20 || r > 0x7e {
++			return nil, errors.New("vcf automation: access token is not safe for an HTTP header")
++		}
++	}
++
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++	return &Client{
++		baseURL:     strings.TrimRight(parsed.String(), "/"),
++		accessToken: accessToken,
++		httpClient:  httpClient,
++	}, nil
++}
++
++func (c *Client) pollInterval() time.Duration {
++	if c.PollInterval > 0 {
++		return c.PollInterval
++	}
++	return defaultPollInterval
++}
++
++func (c *Client) pollTimeout() time.Duration {
++	if c.PollTimeout > 0 {
++		return c.PollTimeout
++	}
++	return defaultPollTimeout
++}
++
++func (c *Client) redact(text string) string {
++	if c.accessToken == "" {
++		return text
++	}
++	return strings.ReplaceAll(text, c.accessToken, "[REDACTED]")
++}
++
++func (c *Client) protocolError(reason string) error {
++	return &ProtocolError{Reason: c.redact(reason)}
+ }
+ 
+ // RunDeploymentAction resolves the named action on the deployment, submits it,
+ // and polls the resulting request until it reaches a terminal status.
++//
++// A request that settles in SUCCESSFUL is returned with a nil error. A request
++// that settles in FAILED, ABORTED or APPROVAL_REJECTED is returned alongside a
++// *RequestFailedError so the caller can still inspect the terminal request.
+ func (c *Client) RunDeploymentAction(ctx context.Context, deploymentID string, action ActionRequest) (*Request, error) {
+-	return nil, errors.New("TODO: implement RunDeploymentAction")
++	if ctx == nil {
++		return nil, errors.New("vcf automation: nil context")
++	}
++	if strings.TrimSpace(deploymentID) == "" {
++		return nil, errors.New("vcf automation: deployment id is blank")
++	}
++	if strings.TrimSpace(action.ActionName) == "" {
++		return nil, errors.New("vcf automation: action name is blank")
++	}
++
++	actionID, err := c.resolveActionID(ctx, deploymentID, action.ActionName)
++	if err != nil {
++		return nil, err
++	}
++
++	submitted, err := c.submitActionRequest(ctx, deploymentID, actionID, action)
++	if err != nil {
++		return nil, err
++	}
++
++	return c.awaitTerminal(ctx, submitted.ID)
++}
++
++// resolveActionID reads the deployment's available actions and returns the id
++// of the one named actionName.
++func (c *Client) resolveActionID(ctx context.Context, deploymentID, actionName string) (string, error) {
++	path := "/deployment/api/deployments/" + url.PathEscape(deploymentID) + "/actions"
++
++	var actions []Action
++	if err := c.do(ctx, http.MethodGet, path, nil, &actions); err != nil {
++		return "", err
++	}
++	for _, candidate := range actions {
++		if candidate.Name != actionName {
++			continue
++		}
++		if !candidate.Valid {
++			return "", c.protocolError(fmt.Sprintf("deployment action %q is not currently valid for deployment %s", actionName, deploymentID))
++		}
++		if strings.TrimSpace(candidate.ID) == "" {
++			return "", c.protocolError(fmt.Sprintf("deployment action %q carries no id", actionName))
++		}
++		return candidate.ID, nil
++	}
++	return "", c.protocolError(fmt.Sprintf("deployment %s exposes no action named %q", deploymentID, actionName))
++}
++
++// resourceActionRequest is the contract's ResourceActionRequest body. Every
++// member is optional; a nil pointer is omitted from the encoding entirely
++// rather than serialised as an empty or null placeholder.
++type resourceActionRequest struct {
++	ActionID string          `json:"actionId"`
++	Inputs   *map[string]any `json:"inputs,omitempty"`
++	Reason   *string         `json:"reason,omitempty"`
++}
++
++func (c *Client) submitActionRequest(ctx context.Context, deploymentID, actionID string, action ActionRequest) (*Request, error) {
++	payload := resourceActionRequest{ActionID: actionID, Reason: action.Reason}
++	if action.Inputs != nil {
++		inputs := action.Inputs
++		payload.Inputs = &inputs
++	}
++
++	body, err := json.Marshal(payload)
++	if err != nil {
++		return nil, c.protocolError("action request body cannot be encoded: " + err.Error())
++	}
++
++	path := "/deployment/api/deployments/" + url.PathEscape(deploymentID) + "/requests"
++
++	var submitted Request
++	if err := c.do(ctx, http.MethodPost, path, body, &submitted); err != nil {
++		return nil, err
++	}
++	if strings.TrimSpace(submitted.ID) == "" {
++		return nil, c.protocolError("the accepted deployment request carries no id, so it cannot be polled")
++	}
++	return &submitted, nil
++}
++
++// awaitTerminal polls getRequest until the request reaches a terminal status,
++// the poll timeout elapses, or the context is done.
++func (c *Client) awaitTerminal(ctx context.Context, requestID string) (*Request, error) {
++	interval := c.pollInterval()
++	pollCtx, cancel := context.WithTimeout(ctx, c.pollTimeout())
++	defer cancel()
++
++	for {
++		current, err := c.getRequest(pollCtx, requestID)
++		if err != nil {
++			if ctxErr := ctx.Err(); ctxErr != nil {
++				return nil, fmt.Errorf("vcf automation: polling context ended: %w", ctxErr)
++			}
++			if pollErr := pollCtx.Err(); pollErr != nil && errors.Is(err, pollErr) {
++				return nil, fmt.Errorf("vcf automation: polling deadline elapsed: %w", ErrPollTimeout)
++			}
++			return nil, err
++		}
++		if pollCtx.Err() != nil {
++			return nil, c.pollingDoneError(ctx)
++		}
++
++		lifecycle, known := statusLifecycle[current.Status]
++		if !known {
++			return nil, c.protocolError(fmt.Sprintf("request %s reported status %q, which is not one of the twelve contract status values", requestID, current.Status))
++		}
++		if lifecycle.terminal {
++			if lifecycle.successful {
++				return current, nil
++			}
++			return current, &RequestFailedError{
++				RequestID: requestID,
++				Status:    current.Status,
++				Details:   current.Details,
++			}
++		}
++
++		timer := time.NewTimer(interval)
++		select {
++		case <-pollCtx.Done():
++			timer.Stop()
++			return nil, c.pollingDoneError(ctx)
++		case <-timer.C:
++		}
++	}
++}
++
++func (c *Client) pollingDoneError(ctx context.Context) error {
++	if ctxErr := ctx.Err(); ctxErr != nil {
++		return fmt.Errorf("vcf automation: polling context ended: %w", ctxErr)
++	}
++	return fmt.Errorf("vcf automation: polling deadline elapsed: %w", ErrPollTimeout)
++}
++
++func (c *Client) getRequest(ctx context.Context, requestID string) (*Request, error) {
++	path := "/deployment/api/requests/" + url.PathEscape(requestID)
++
++	var current Request
++	if err := c.do(ctx, http.MethodGet, path, nil, &current); err != nil {
++		return nil, err
++	}
++	return &current, nil
++}
++
++// do issues one contract request. A nil body produces a strictly bodyless
++// request: no Content-Type, no content length and no transfer encoding.
++func (c *Client) do(ctx context.Context, method, path string, body []byte, out any) error {
++	var reader io.Reader
++	if body != nil {
++		reader = bytes.NewReader(body)
++	}
++
++	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
++	if err != nil {
++		return errors.New("vcf automation: could not build the HTTP request")
++	}
++	req.Header.Set("Authorization", "Bearer "+c.accessToken)
++	req.Header.Set("Accept", "application/json")
++	if body != nil {
++		req.Header.Set("Content-Type", "application/json")
++		req.ContentLength = int64(len(body))
++	}
++
++	resp, err := c.httpClient.Do(req)
++	if err != nil {
++		if ctxErr := ctx.Err(); ctxErr != nil {
++			return fmt.Errorf("vcf automation: HTTP request context ended: %w", ctxErr)
++		}
++		return errors.New("vcf automation: HTTP request failed")
++	}
++	defer func() {
++		_, _ = io.Copy(io.Discard, resp.Body)
++		_ = resp.Body.Close()
++	}()
++
++	payload, err := io.ReadAll(resp.Body)
++	if err != nil {
++		if ctxErr := ctx.Err(); ctxErr != nil {
++			return fmt.Errorf("vcf automation: response read context ended: %w", ctxErr)
++		}
++		return errors.New("vcf automation: could not read the HTTP response")
++	}
++
++	if resp.StatusCode != http.StatusOK {
++		return decodeAPIError(resp.StatusCode, payload)
++	}
++
++	if media := mediaType(resp.Header.Get("Content-Type")); media != "" && media != "application/json" {
++		return c.protocolError(fmt.Sprintf("%s %s returned media type %q, want application/json", method, path, media))
++	}
++	if err := json.Unmarshal(payload, out); err != nil {
++		return c.protocolError(fmt.Sprintf("%s %s returned a body that is not the documented JSON shape: %v", method, path, err))
++	}
++	if err := validateSuccessBody(payload, out); err != nil {
++		return c.protocolError(fmt.Sprintf("%s %s returned a contract-violating body: %v", method, path, err))
++	}
++	return nil
++}
++
++func validateSuccessBody(payload []byte, out any) error {
++	switch out.(type) {
++	case *[]Action:
++		if bytes.Equal(bytes.TrimSpace(payload), []byte("null")) {
++			return errors.New("the action collection is null rather than an array")
++		}
++	case *Request:
++		var members map[string]json.RawMessage
++		if err := json.Unmarshal(payload, &members); err != nil || members == nil {
++			return errors.New("the request is not a JSON object")
++		}
++		for _, name := range []string{"completedTasks", "createdAt", "name", "requestedBy", "totalTasks"} {
++			value, ok := members[name]
++			if !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
++				return fmt.Errorf("required member %q is absent or null", name)
++			}
++		}
++	}
++	return nil
++}
++
++func decodeAPIError(status int, payload []byte) error {
++	apiErr := &APIError{StatusCode: status}
++	var decoded struct {
++		ErrorCode string `json:"errorCode"`
++		Message   string `json:"message"`
++	}
++	if err := json.Unmarshal(payload, &decoded); err == nil {
++		apiErr.ErrorCode = decoded.ErrorCode
++		apiErr.Message = decoded.Message
++	}
++	if apiErr.Message == "" {
++		apiErr.Message = http.StatusText(status)
++	}
++	return apiErr
++}
++
++func mediaType(header string) string {
++	if header == "" {
++		return ""
++	}
++	media, _, err := mime.ParseMediaType(header)
++	if err != nil {
++		return header
++	}
++	return media
+ }

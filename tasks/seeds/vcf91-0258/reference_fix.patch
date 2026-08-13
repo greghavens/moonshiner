@@ -1,0 +1,293 @@
+diff --git a/VcfOpsCollectionTriage/VcfOpsCollectionTriage.psm1 b/VcfOpsCollectionTriage/VcfOpsCollectionTriage.psm1
+index 64eac5e..0ada483 100644
+--- a/VcfOpsCollectionTriage/VcfOpsCollectionTriage.psm1
++++ b/VcfOpsCollectionTriage/VcfOpsCollectionTriage.psm1
+@@ -5,6 +5,47 @@ Import-Module -Name 'VMware.Sdk.Vcf.Ops' `
+     -MinimumVersion '13.5.0.25380678' `
+     -ErrorAction Stop
+ 
++class VcfOpsCollectionEvidenceException : System.Exception {
++    [string] $ObjectName
++    [string] $Reason
++
++    VcfOpsCollectionEvidenceException(
++        [string] $message,
++        [string] $objectName,
++        [string] $reason
++    ) : base($message) {
++        $this.ObjectName = $objectName
++        $this.Reason = $reason
++    }
++}
++
++# The generated SDK enums drop the underscores the specification uses, so
++# NO_DATA_RECEIVING deserializes as the member name NODATARECEIVING. Compare on
++# the normalized token and report the specification value.
++$script:StalledResourceStatus = [ordered] @{
++    'NODATARECEIVING'  = 'NO_DATA_RECEIVING'
++    'OLDDATARECEIVING' = 'OLD_DATA_RECEIVING'
++    'COLLECTORDOWN'    = 'COLLECTOR_DOWN'
++}
++$script:CollectionAgeStatKey = 'System Attributes|last_collection_time_diff'
++
++function ConvertTo-VcfOpsToken {
++    param([AllowNull()] [object] $Value)
++
++    if ($null -eq $Value) { return '' }
++    return [regex]::Replace([string] $Value, '[^A-Za-z0-9]', '').ToUpperInvariant()
++}
++
++function New-VcfOpsEvidenceError {
++    param(
++        [string] $ObjectName,
++        [string] $Reason,
++        [string] $Message
++    )
++
++    return [VcfOpsCollectionEvidenceException]::new($Message, $ObjectName, $Reason)
++}
++
+ function Get-VcfOpsCollectionDiagnosis {
+     [CmdletBinding()]
+     [OutputType([pscustomobject])]
+@@ -40,9 +81,237 @@ function Get-VcfOpsCollectionDiagnosis {
+         [int] $PageSize = 1000
+     )
+ 
+-    throw [System.NotImplementedException]::new(
+-        'Get-VcfOpsCollectionDiagnosis is not implemented yet.'
+-    )
++    foreach ($pair in @(
++            @{ Name = 'Server'; Value = $Server }
++            @{ Name = 'ObjectName'; Value = $ObjectName }
++            @{ Name = 'ResourceKind'; Value = $ResourceKind }
++            @{ Name = 'AdapterKind'; Value = $AdapterKind }
++            @{ Name = 'AuthSource'; Value = $AuthSource }
++        )) {
++        $value = [string] $pair.Value
++        if ([string]::IsNullOrWhiteSpace($value) -or $value -ne $value.Trim()) {
++            throw [System.ArgumentException]::new(
++                "$($pair.Name) must be non-blank and free of surrounding whitespace.",
++                $pair.Name
++            )
++        }
++    }
++
++    $ops = Connect-VcfOpsServer `
++        -Server $Server `
++        -Protocol $Protocol `
++        -Port $Port `
++        -Credential $Credential `
++        -AuthSource $AuthSource `
++        -NotDefault `
++        -ErrorAction Stop
++
++    try {
++        $resourceQuery = Initialize-VcfOpsresourcequery `
++            -Name @($ObjectName) `
++            -ResourceKind @($ResourceKind) `
++            -AdapterKind @($AdapterKind)
++
++        $resources = Invoke-VcfOpsGetMatchingResources `
++            -Server $ops `
++            -ResourceQuery $resourceQuery `
++            -PageSize $PageSize
++
++        $matched = @($resources.ResourceList)
++        if ($matched.Count -ne 1) {
++            throw (New-VcfOpsEvidenceError -ObjectName $ObjectName `
++                    -Reason 'AmbiguousObject' `
++                    -Message "Expected exactly one matching object, found $($matched.Count).")
++        }
++
++        $resource = $matched[0]
++        $resourceId = [string] $resource.Identifier
++        if ([string]::IsNullOrWhiteSpace($resourceId)) {
++            throw (New-VcfOpsEvidenceError -ObjectName $ObjectName `
++                    -Reason 'MissingResourceIdentifier' `
++                    -Message 'The matched object carries no identifier.')
++        }
++
++        $stalled = @(
++            @($resource.ResourceStatusStates) | Where-Object {
++                $script:StalledResourceStatus.Contains(
++                    (ConvertTo-VcfOpsToken $_.ResourceStatus)
++                )
++            }
++        )
++        if ($stalled.Count -ne 1) {
++            throw (New-VcfOpsEvidenceError -ObjectName $ObjectName `
++                    -Reason 'AmbiguousResourceStatus' `
++                    -Message "Expected exactly one stalled collection state, found $($stalled.Count).")
++        }
++
++        $state = $stalled[0]
++        $resourceStatus = $script:StalledResourceStatus[
++            (ConvertTo-VcfOpsToken $state.ResourceStatus)
++        ]
++        $adapterInstanceId = [string] $state.AdapterInstanceId
++        $statusMessage = [string] $state.StatusMessage
++        if ([string]::IsNullOrWhiteSpace($adapterInstanceId)) {
++            throw (New-VcfOpsEvidenceError -ObjectName $ObjectName `
++                    -Reason 'MissingAdapterInstance' `
++                    -Message 'The stalled collection state names no adapter instance.')
++        }
++        if ([string]::IsNullOrWhiteSpace($statusMessage)) {
++            throw (New-VcfOpsEvidenceError -ObjectName $ObjectName `
++                    -Reason 'MissingStatusMessage' `
++                    -Message 'The stalled collection state carries no status message.')
++        }
++
++        $alertQuery = Initialize-VcfOpsalertquery `
++            -ActiveOnly $true `
++            -ResourceQuery (Initialize-VcfOpsresourcequery -ResourceId @($adapterInstanceId))
++
++        $alerts = Invoke-VcfOpsQueryAlert `
++            -Server $ops `
++            -AlertQuery $alertQuery `
++            -PageSize $PageSize
++
++        $openAlerts = @(
++            @($alerts.'_Alerts') | Where-Object {
++                ([string] $_.ResourceId) -eq $adapterInstanceId -and
++                (ConvertTo-VcfOpsToken $_.Status) -eq 'ACTIVE'
++            }
++        )
++        if ($openAlerts.Count -lt 1) {
++            throw (New-VcfOpsEvidenceError -ObjectName $ObjectName `
++                    -Reason 'NoActiveAlert' `
++                    -Message 'The stalled adapter instance carries no active alert.')
++        }
++
++        $alertIds = @($openAlerts | ForEach-Object { [string] $_.AlertId })
++        if (@($alertIds | Where-Object { [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
++            throw (New-VcfOpsEvidenceError -ObjectName $ObjectName `
++                    -Reason 'MissingAlertIdentifier' `
++                    -Message 'An active alert carries no identifier.')
++        }
++
++        $contributing = Invoke-VcfOpsGetAlertContributingSymptoms -Server $ops -Id $alertIds
++
++        $symptomIds = [System.Collections.Generic.List[string]]::new()
++        $symptomOwners = @{}
++        $alertSymptomIds = @{}
++        foreach ($entry in @($contributing.ContributingSymptoms)) {
++            $alertId = [string] $entry.AlertId
++            if (-not $alertSymptomIds.ContainsKey($alertId)) {
++                $alertSymptomIds[$alertId] = [System.Collections.Generic.List[string]]::new()
++            }
++            foreach ($item in @($entry.ContributingSymptoms.'_ContributingSymptoms')) {
++                $symptomId = [string] $item.SymptomId
++                if ([string]::IsNullOrWhiteSpace($symptomId)) { continue }
++                if (-not $alertSymptomIds[$alertId].Contains($symptomId)) {
++                    $alertSymptomIds[$alertId].Add($symptomId)
++                }
++                if (-not $symptomOwners.ContainsKey($symptomId)) {
++                    $symptomOwners[$symptomId] = [System.Collections.Generic.List[string]]::new()
++                    $symptomIds.Add($symptomId)
++                }
++                if (-not $symptomOwners[$symptomId].Contains($alertId)) {
++                    $symptomOwners[$symptomId].Add($alertId)
++                }
++            }
++        }
++        if ($symptomIds.Count -lt 1) {
++            throw (New-VcfOpsEvidenceError -ObjectName $ObjectName `
++                    -Reason 'NoContributingSymptom' `
++                    -Message 'No active alert reports a contributing symptom.')
++        }
++
++        $symptomQuery = Initialize-VcfOpssymptomquery `
++            -SymptomId $symptomIds `
++            -IncludeAlarmInfo $true
++
++        $symptoms = Invoke-VcfOpsQuerySymptoms `
++            -Server $ops `
++            -SymptomQuery $symptomQuery `
++            -PageSize $PageSize
++
++        $returnedSymptoms = @($symptoms.Symptom)
++        $detail = [ordered] @{}
++        foreach ($item in $returnedSymptoms) {
++            $id = [string] $item.Id
++            if ([string]::IsNullOrWhiteSpace($id)) { continue }
++            if ($detail.Contains($id)) {
++                throw (New-VcfOpsEvidenceError -ObjectName $ObjectName `
++                        -Reason 'DuplicateSymptomDetail' `
++                        -Message 'The symptom query returned duplicate detail records.')
++            }
++            $detail[$id] = $item
++        }
++
++        $proof = @(
++            $returnedSymptoms | Where-Object {
++                ([string] $_.StatKey) -ceq $script:CollectionAgeStatKey -and
++                (ConvertTo-VcfOpsToken $_.SymptomCriticality) -eq 'CRITICAL'
++            }
++        )
++        if ($proof.Count -ne 1) {
++            throw (New-VcfOpsEvidenceError -ObjectName $ObjectName `
++                    -Reason 'InconclusiveSymptomEvidence' `
++                    -Message "Expected exactly one critical collection-age symptom, found $($proof.Count).")
++        }
++
++        $proofSymptomId = [string] $proof[0].Id
++        if ([string]::IsNullOrWhiteSpace($proofSymptomId) -or
++            -not $symptomOwners.ContainsKey($proofSymptomId)) {
++            throw (New-VcfOpsEvidenceError -ObjectName $ObjectName `
++                    -Reason 'UncorrelatedSymptomEvidence' `
++                    -Message 'The critical collection-age symptom was not contributed by an active alert.')
++        }
++
++        $proofOwners = @($symptomOwners[$proofSymptomId])
++        if ($proofOwners.Count -ne 1) {
++            throw (New-VcfOpsEvidenceError -ObjectName $ObjectName `
++                    -Reason 'AmbiguousSymptomContribution' `
++                    -Message 'The critical collection-age symptom is contributed by several active alerts.')
++        }
++        $triggeringAlertId = $proofOwners[0]
++        $triggeringAlerts = @(
++            $openAlerts | Where-Object { ([string] $_.AlertId) -eq $triggeringAlertId }
++        )
++        if ($triggeringAlerts.Count -ne 1) {
++            throw (New-VcfOpsEvidenceError -ObjectName $ObjectName `
++                    -Reason 'AmbiguousTriggeringAlert' `
++                    -Message 'The symptom evidence does not identify exactly one active alert.')
++        }
++        $triggeringAlert = $triggeringAlerts[0]
++
++        $evidence = foreach ($symptomId in $alertSymptomIds[$triggeringAlertId]) {
++            if (-not $detail.Contains($symptomId)) {
++                throw (New-VcfOpsEvidenceError -ObjectName $ObjectName `
++                        -Reason 'MissingSymptomDetail' `
++                        -Message 'A contributing symptom returned no detail record.')
++            }
++            $record = $detail[$symptomId]
++            [pscustomobject] [ordered] @{
++                SymptomId    = [string] $record.Id
++                StatKey      = [string] $record.StatKey
++                Criticality  = [string] $record.SymptomCriticality
++                Message      = [string] $record.Message
++                StartTimeUTC = [long] $record.StartTimeUTC
++            }
++        }
++
++        return [pscustomobject] [ordered] @{
++            Status              = 'Diagnosed'
++            ObjectName          = $ObjectName
++            ResourceId          = $resourceId
++            AdapterInstanceId   = $adapterInstanceId
++            ResourceStatus      = $resourceStatus
++            StatusMessage       = $statusMessage
++            Cause               = 'AdapterInstanceNotCollecting'
++            AlertId             = $triggeringAlertId
++            AlertDefinitionName = [string] $triggeringAlert.AlertDefinitionName
++            Evidence            = @($evidence)
++        }
++    }
++    finally {
++        $null = Disconnect-VcfOpsServer -Server $ops -Force -ErrorAction SilentlyContinue
++    }
+ }
+ 
+ Export-ModuleMember -Function 'Get-VcfOpsCollectionDiagnosis'

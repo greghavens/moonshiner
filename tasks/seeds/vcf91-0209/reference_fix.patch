@@ -1,0 +1,214 @@
+--- a/vcfinstaller/client.go
++++ b/vcfinstaller/client.go
+@@ -2,10 +2,16 @@
+ package vcfinstaller
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"io"
++	"mime"
+ 	"net/http"
++	"net/url"
++	"strings"
+ 	"time"
+ )
+ 
+@@ -65,15 +71,31 @@
+ 	httpClient  *http.Client
+ }
+ 
+-// ErrNotImplemented is returned by the exercise stub.
++// ErrNotImplemented is retained for source compatibility with the exercise stub.
++// The implemented client does not return it.
+ var ErrNotImplemented = errors.New("vcfinstaller client is not implemented")
+ 
+ // NewClient constructs a client for a VCF Installer service root.
+ func NewClient(baseURL, accessToken string, httpClient *http.Client) (*Client, error) {
++	parsed, err := url.Parse(baseURL)
++	if err != nil || (!strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https")) || parsed.Host == "" || parsed.Hostname() == "" {
++		return nil, fmt.Errorf("baseURL must be an absolute HTTP(S) service root")
++	}
++	if parsed.User != nil || parsed.Opaque != "" || (parsed.Path != "" && parsed.Path != "/") || parsed.RawPath != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
++		return nil, fmt.Errorf("baseURL must not contain credentials, a path, query, or fragment")
++	}
++	if strings.TrimSpace(accessToken) == "" {
++		return nil, fmt.Errorf("accessToken must be nonblank")
++	}
++	if !validHeaderValue(accessToken) {
++		return nil, fmt.Errorf("accessToken contains an invalid header character")
++	}
+ 	if httpClient == nil {
+ 		httpClient = http.DefaultClient
+ 	}
+-	return &Client{baseURL: baseURL, accessToken: accessToken, httpClient: httpClient}, nil
++	parsed.Scheme = strings.ToLower(parsed.Scheme)
++	parsed.Path = ""
++	return &Client{baseURL: strings.TrimSuffix(parsed.String(), "/"), accessToken: accessToken, httpClient: httpClient}, nil
+ }
+ 
+ // UpdateProxyAndWait submits the update and polls its task to a terminal state.
+@@ -82,5 +104,159 @@
+ 	config ProxyConfiguration,
+ 	pollInterval time.Duration,
+ ) (Task, error) {
+-	return Task{}, ErrNotImplemented
++	if ctx == nil {
++		return Task{}, fmt.Errorf("ctx must not be nil")
++	}
++	if pollInterval < 0 {
++		return Task{}, fmt.Errorf("pollInterval must not be negative")
++	}
++
++	body, err := json.Marshal(config)
++	if err != nil {
++		return Task{}, fmt.Errorf("encode proxy configuration: %w", err)
++	}
++	accepted, err := c.requestTask(
++		ctx,
++		"updateProxyConfiguration",
++		http.MethodPatch,
++		"/v1/system/proxy-configuration",
++		body,
++		http.StatusAccepted,
++	)
++	if err != nil {
++		return Task{}, err
++	}
++	if err := validateTask("updateProxyConfiguration", accepted); err != nil {
++		return Task{}, err
++	}
++
++	target := "/v1/tasks/" + url.PathEscape(accepted.ID)
++	for {
++		polled, err := c.requestTask(ctx, "getTask", http.MethodGet, target, nil, http.StatusOK)
++		if err != nil {
++			return Task{}, err
++		}
++		if err := validateTask("getTask", polled); err != nil {
++			return Task{}, err
++		}
++		if polled.ID != accepted.ID {
++			return polled, &ProtocolError{OperationID: "getTask", Problem: "task id changed while polling"}
++		}
++
++		switch normalizeStatus(polled.Status) {
++		case "SUCCESSFUL":
++			return polled, nil
++		case "FAILED", "CANCELLED", "COMPLETED_WITH_WARNING", "SKIPPED", "TIMED_OUT":
++			return polled, &TaskFailedError{Task: polled}
++		case "PENDING", "IN_PROGRESS", "QUEUED":
++			if err := waitForPoll(ctx, pollInterval); err != nil {
++				return Task{}, err
++			}
++		default:
++			return polled, &ProtocolError{OperationID: "getTask", Problem: fmt.Sprintf("unexpected task status %q", polled.Status)}
++		}
++	}
++}
++
++func (c *Client) requestTask(
++	ctx context.Context,
++	operationID, method, target string,
++	body []byte,
++	wantStatus int,
++) (Task, error) {
++	var requestBody io.Reader
++	if body != nil {
++		requestBody = bytes.NewReader(body)
++	}
++	request, err := http.NewRequestWithContext(ctx, method, c.baseURL+target, requestBody)
++	if err != nil {
++		return Task{}, fmt.Errorf("build %s request: %w", operationID, err)
++	}
++	request.Header.Set("Authorization", "Bearer "+c.accessToken)
++	request.Header.Set("Accept", "application/json")
++	if body != nil {
++		request.Header.Set("Content-Type", "application/json")
++	}
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		if response != nil && response.Body != nil {
++			_ = response.Body.Close()
++		}
++		if contextErr := ctx.Err(); contextErr != nil {
++			return Task{}, contextErr
++		}
++		return Task{}, fmt.Errorf("%s transport failed", operationID)
++	}
++	defer response.Body.Close()
++	if response.StatusCode != wantStatus {
++		return Task{}, &APIError{OperationID: operationID, StatusCode: response.StatusCode}
++	}
++	mediaType, _, mediaErr := mime.ParseMediaType(response.Header.Get("Content-Type"))
++	if mediaErr != nil || mediaType != "application/json" {
++		return Task{}, &ProtocolError{OperationID: operationID, Problem: "successful response is not application/json"}
++	}
++	payload, readErr := io.ReadAll(response.Body)
++	if readErr != nil {
++		if contextErr := ctx.Err(); contextErr != nil {
++			return Task{}, contextErr
++		}
++		return Task{}, fmt.Errorf("read %s response failed", operationID)
++	}
++	var task Task
++	if err := json.Unmarshal(payload, &task); err != nil {
++		return Task{}, &ProtocolError{OperationID: operationID, Problem: "successful response is not a JSON Task object"}
++	}
++	return task, nil
++}
++
++func validateTask(operationID string, task Task) error {
++	required := []struct {
++		name  string
++		value string
++	}{
++		{"id", task.ID},
++		{"name", task.Name},
++		{"status", task.Status},
++		{"creationTimestamp", task.CreationTimestamp},
++	}
++	for _, field := range required {
++		if strings.TrimSpace(field.value) == "" {
++			return &ProtocolError{OperationID: operationID, Problem: "Task." + field.name + " must be a nonblank string"}
++		}
++	}
++	return nil
++}
++
++func normalizeStatus(status string) string {
++	return strings.Join(strings.Fields(strings.ToUpper(status)), "_")
++}
++
++func validHeaderValue(value string) bool {
++	for index := 0; index < len(value); index++ {
++		character := value[index]
++		if (character < ' ' && character != '\t') || character == 0x7f {
++			return false
++		}
++	}
++	return true
++}
++
++func waitForPoll(ctx context.Context, interval time.Duration) error {
++	if interval == 0 {
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		default:
++			return nil
++		}
++	}
++	timer := time.NewTimer(interval)
++	defer timer.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-timer.C:
++		return nil
++	}
+ }

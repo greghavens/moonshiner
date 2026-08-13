@@ -1,0 +1,440 @@
+diff --git a/vcfrotate/__init__.py b/vcfrotate/__init__.py
+new file mode 100644
+index 0000000..8d564eb
+--- /dev/null
++++ b/vcfrotate/__init__.py
+@@ -0,0 +1,15 @@
++"""Rotate the vCenter automation secret without stranding in-flight requests."""
++
++from .contract import Contract, ContractError
++from .client import ApiError, VCenterClient
++from .rotation import Rotation, load_work, rotate
++
++__all__ = [
++    "ApiError",
++    "Contract",
++    "ContractError",
++    "Rotation",
++    "VCenterClient",
++    "load_work",
++    "rotate",
++]
+diff --git a/vcfrotate/__main__.py b/vcfrotate/__main__.py
+new file mode 100644
+index 0000000..6ab1587
+--- /dev/null
++++ b/vcfrotate/__main__.py
+@@ -0,0 +1,55 @@
++"""Command line entry point: python3 -m vcfrotate."""
++
++import argparse
++import json
++import os
++import sys
++
++from .contract import Contract
++from .rotation import load_work, rotate
++
++DEFAULT_CONTRACT = os.path.join("docs", "contract.json")
++
++
++def build_parser():
++    parser = argparse.ArgumentParser(
++        prog="vcfrotate",
++        description="Rotate the vCenter automation secret without stranding "
++                    "requests that are still bound to the retiring session.")
++    parser.add_argument("--base-url", required=True)
++    parser.add_argument("--username", required=True)
++    parser.add_argument("--old-password", required=True)
++    parser.add_argument("--new-password", required=True)
++    parser.add_argument("--work", required=True)
++    parser.add_argument("--report", required=True)
++    parser.add_argument("--contract", default=DEFAULT_CONTRACT)
++    parser.add_argument("--workers", type=int, default=4)
++    return parser
++
++
++def main(argv=None):
++    args = build_parser().parse_args(argv)
++    contract = Contract.load(args.contract)
++    in_flight, after = load_work(args.work)
++
++    rotation = rotate(args.base_url, contract, args.username, args.old_password,
++                      args.new_password, in_flight, after, args.workers)
++    report = rotation.report(in_flight, after)
++
++    with open(args.report, "w", encoding="utf-8") as handle:
++        json.dump(report, handle, indent=2, sort_keys=True)
++        handle.write("\n")
++
++    failed = [row for row in report["requests"] if row["status"] == "failed"]
++    if report["outcome"] == "rotated" and not failed:
++        return 0
++    if report["outcome"] != "rotated":
++        sys.stderr.write("rotation aborted: %s\n" % report["aborted_reason"])
++    for row in failed:
++        sys.stderr.write("request %s failed: %s\n"
++                         % (row["id"], json.dumps(row.get("error"))))
++    return 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/vcfrotate/client.py b/vcfrotate/client.py
+new file mode 100644
+index 0000000..61e0765
+--- /dev/null
++++ b/vcfrotate/client.py
+@@ -0,0 +1,139 @@
++"""A stdlib-only client for the four vCenter operations in docs/contract.json."""
++
++import base64
++import json
++import urllib.error
++import urllib.request
++from urllib.parse import urlencode
++
++SESSION_CREATE = "Cis.Session_create"
++SESSION_GET = "Cis.Session_get"
++SESSION_DELETE = "Cis.Session_delete"
++TOKEN_ISSUE = "Vcenter.Authentication.Token_issue"
++
++# The optional properties of Vcenter.Authentication.Token.IssueSpec that a work
++# item may set.  An item that leaves one unset does not send it at all.
++OPTIONAL_ISSUE_PROPERTIES = (
++    "resource",
++    "audience",
++    "scope",
++    "requested_token_type",
++    "actor_token",
++    "actor_token_type",
++)
++
++
++class ApiError(Exception):
++    """A non-2xx answer from the endpoint, normalised for the report."""
++
++    def __init__(self, http_status, error, error_description):
++        super().__init__(error_description or error or str(http_status))
++        self.http_status = http_status
++        self.error = error
++        self.error_description = error_description
++
++    def as_report(self):
++        return {
++            "http_status": self.http_status,
++            "error": self.error,
++            "error_description": self.error_description,
++        }
++
++    @classmethod
++    def from_http_error(cls, err):
++        raw = err.read()
++        body = None
++        if raw:
++            try:
++                body = json.loads(raw.decode("utf-8"))
++            except (UnicodeDecodeError, json.JSONDecodeError):
++                body = None
++        if isinstance(body, dict) and "error" in body:
++            return cls(err.code, body.get("error"), body.get("error_description"))
++        if isinstance(body, dict) and "error_type" in body:
++            messages = body.get("messages") or []
++            description = None
++            if messages and isinstance(messages[0], dict):
++                description = messages[0].get("default_message")
++            return cls(err.code, body.get("error_type"), description)
++        return cls(err.code, None, None)
++
++
++class VCenterClient:
++    """Every request is resolved from the contract, never from a hard-coded URL."""
++
++    def __init__(self, base_url, contract):
++        self.base_url = base_url
++        self.contract = contract
++        self.opener = urllib.request.build_opener()
++
++    # -- transport ---------------------------------------------------------
++
++    def _send(self, operation_id, headers, body=None):
++        url = self.contract.target(self.base_url, operation_id)
++        method = self.contract.operation(operation_id)["method"]
++        request = urllib.request.Request(url, data=body, method=method)
++        for name, value in headers.items():
++            request.add_header(name, value)
++        if body is not None:
++            request.add_header("Content-Type", self.contract.media_type(operation_id))
++        try:
++            with self.opener.open(request, timeout=120) as response:
++                payload = response.read()
++                status = response.status
++        except urllib.error.HTTPError as err:
++            raise ApiError.from_http_error(err) from None
++        if not payload:
++            return status, None
++        return status, json.loads(payload.decode("utf-8"))
++
++    def _session_headers(self, session):
++        return {self.contract.session_header: session}
++
++    # -- operations --------------------------------------------------------
++
++    def create_session(self, username, password):
++        """Cis.Session_create.  Basic credentials, no body, no session header."""
++        credentials = base64.b64encode(
++            ("%s:%s" % (username, password)).encode("utf-8")).decode("ascii")
++        _status, token = self._send(
++            SESSION_CREATE, {"Authorization": "Basic " + credentials})
++        if not isinstance(token, str):
++            raise ApiError(201, None,
++                           "Cis.Session_create did not answer with a session identifier")
++        return token
++
++    def get_session(self, session):
++        """Cis.Session_get.  Returns the Cis.Session.Info of the given session."""
++        _status, info = self._send(SESSION_GET, self._session_headers(session))
++        return info
++
++    def delete_session(self, session):
++        """Cis.Session_delete."""
++        self._send(SESSION_DELETE, self._session_headers(session))
++
++    def issue_token(self, session, item):
++        """Vcenter.Authentication.Token_issue for one unit of work.
++
++        The subject of the exchange is the session the request is bound to, and
++        the specification says subject_token is base64-encoded.  Any optional
++        property the work item left unset is absent from the body rather than
++        present with an empty value.
++        """
++        form = {
++            "grant_type": self.contract.grant_type(),
++            "subject_token": base64.b64encode(session.encode("utf-8")).decode("ascii"),
++            "subject_token_type": item["subject_token_type"],
++        }
++        for name in OPTIONAL_ISSUE_PROPERTIES:
++            value = item.get(name)
++            if value is not None and value != "":
++                form[name] = value
++
++        order = self.contract.issue_spec_properties()
++        ordered = [(name, form[name]) for name in order if name in form]
++        body = urlencode(ordered).encode("ascii")
++
++        headers = self._session_headers(session)
++        _status, info = self._send(TOKEN_ISSUE, headers, body)
++        return info or {}
+diff --git a/vcfrotate/contract.py b/vcfrotate/contract.py
+new file mode 100644
+index 0000000..0aecb0f
+--- /dev/null
++++ b/vcfrotate/contract.py
+@@ -0,0 +1,51 @@
++"""Read docs/contract.json and turn it into request targets."""
++
++import json
++
++
++class ContractError(Exception):
++    pass
++
++
++class Contract:
++    """The pinned projection of the vSphere Automation API for vCenter."""
++
++    def __init__(self, document):
++        self.document = document
++        self.base_path = document["basePath"].rstrip("/")
++        self.operations = {op["operationId"]: op for op in document["operations"]}
++        schemes = document["securitySchemes"]
++        self.session_header = schemes["api_key_auth"]["name"]
++        self.issue_spec = document["schemas"]["Vcenter.Authentication.Token.IssueSpec"]
++
++    @classmethod
++    def load(cls, path):
++        with open(path, "r", encoding="utf-8") as handle:
++            return cls(json.load(handle))
++
++    def operation(self, operation_id):
++        try:
++            return self.operations[operation_id]
++        except KeyError:
++            raise ContractError(
++                "the contract does not name %r" % operation_id) from None
++
++    def target(self, base_url, operation_id):
++        """The absolute URL of an operation, resolved through the contract."""
++        operation = self.operation(operation_id)
++        url = base_url.rstrip("/") + self.base_path + operation["path"]
++        query = operation.get("query") or {}
++        if query:
++            from urllib.parse import urlencode
++            url += "?" + urlencode(sorted(query.items()))
++        return url
++
++    def media_type(self, operation_id):
++        body = self.operation(operation_id).get("requestBody")
++        return None if body is None else body["mediaType"]
++
++    def issue_spec_properties(self):
++        return list(self.issue_spec["properties"])
++
++    def grant_type(self):
++        return self.issue_spec["properties"]["grant_type"]["enum"][0]
+diff --git a/vcfrotate/rotation.py b/vcfrotate/rotation.py
+new file mode 100644
+index 0000000..4a4874f
+--- /dev/null
++++ b/vcfrotate/rotation.py
+@@ -0,0 +1,150 @@
++"""The rotation itself: open the incoming session, drain, then retire."""
++
++import threading
++
++from .client import ApiError, VCenterClient
++
++IN_FLIGHT = "in_flight"
++POST_ROTATION = "post_rotation"
++
++
++class WorkItem:
++    def __init__(self, spec, phase):
++        self.id = spec["id"]
++        self.phase = phase
++        self.spec = spec
++        self.status = "not_attempted"
++        self.issued_token_type = None
++        self.error = None
++
++    def as_report(self):
++        row = {"id": self.id, "phase": self.phase, "status": self.status}
++        if self.status == "succeeded":
++            row["issued_token_type"] = self.issued_token_type
++        elif self.status == "failed":
++            row["error"] = self.error
++        return row
++
++
++def load_work(path):
++    import json
++    with open(path, "r", encoding="utf-8") as handle:
++        document = json.load(handle)
++    in_flight = [WorkItem(spec, IN_FLIGHT) for spec in document.get(IN_FLIGHT, [])]
++    after = [WorkItem(spec, POST_ROTATION) for spec in document.get(POST_ROTATION, [])]
++    return in_flight, after
++
++
++class Dispatcher:
++    """Runs work items concurrently, at most `workers` of them at a time."""
++
++    def __init__(self, client, workers):
++        self.client = client
++        self.workers = max(1, workers)
++        self.threads = []
++
++    def start(self, items, session):
++        gate = threading.Semaphore(self.workers)
++
++        def run(item):
++            with gate:
++                try:
++                    info = self.client.issue_token(session, item.spec)
++                except ApiError as err:
++                    item.status = "failed"
++                    item.error = err.as_report()
++                else:
++                    item.status = "succeeded"
++                    item.issued_token_type = info.get("issued_token_type")
++
++        for item in items:
++            thread = threading.Thread(target=run, args=(item,), daemon=True)
++            thread.start()
++            self.threads.append(thread)
++
++    def drain(self):
++        for thread in self.threads:
++            thread.join()
++        self.threads = []
++
++    def run(self, items, session):
++        self.start(items, session)
++        self.drain()
++
++
++class Rotation:
++    def __init__(self, client, username, old_password, new_password, workers):
++        self.client = client
++        self.username = username
++        self.old_password = old_password
++        self.new_password = new_password
++        self.dispatcher = Dispatcher(client, workers)
++        self.user = None
++        self.outcome = "aborted"
++        self.aborted_reason = None
++        self.retired_session_deleted = False
++
++    def run(self, in_flight, after):
++        try:
++            retiring = self.client.create_session(self.username, self.old_password)
++        except ApiError:
++            self.aborted_reason = "login_failed"
++            return
++
++        # The work that is already open stays on the retiring session, and the
++        # rotation runs alongside it rather than waiting for it.
++        self.dispatcher.start(in_flight, retiring)
++
++        incoming = None
++        try:
++            incoming = self.client.create_session(self.username, self.new_password)
++            info = self.client.get_session(incoming)
++        except ApiError:
++            self.aborted_reason = ("new_session_rejected" if incoming is None
++                                   else "session_inspection_failed")
++            self.dispatcher.drain()
++            if incoming is not None:
++                self._release(incoming)
++            return
++
++        self.user = (info or {}).get("user")
++        if self.user != self.username:
++            # The incoming session is not the account being rotated.  Nothing is
++            # retired, so a corrected rotation can be retried.
++            self.aborted_reason = "user_mismatch"
++            self.dispatcher.drain()
++            self._release(incoming)
++            return
++
++        # Everything still bound to the retiring session has to settle before
++        # that session may be terminated.
++        self.dispatcher.drain()
++        self.client.delete_session(retiring)
++        self.retired_session_deleted = True
++        self.outcome = "rotated"
++
++        self.dispatcher.run(after, incoming)
++        self._release(incoming)
++
++    def _release(self, session):
++        try:
++            self.client.delete_session(session)
++        except ApiError:
++            pass
++
++    def report(self, in_flight, after):
++        return {
++            "user": self.user,
++            "outcome": self.outcome,
++            "aborted_reason": self.aborted_reason,
++            "retired_session_deleted": self.retired_session_deleted,
++            "requests": [item.as_report() for item in list(in_flight) + list(after)],
++        }
++
++
++def rotate(base_url, contract, username, old_password, new_password,
++           in_flight, after, workers):
++    client = VCenterClient(base_url, contract)
++    rotation = Rotation(client, username, old_password, new_password, workers)
++    rotation.run(in_flight, after)
++    return rotation

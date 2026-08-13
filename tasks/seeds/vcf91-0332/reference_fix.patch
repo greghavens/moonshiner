@@ -1,0 +1,200 @@
+diff --git a/src/com/broadcom/vcfa/VcfAutomationClient.java b/src/com/broadcom/vcfa/VcfAutomationClient.java
+index ec3d598..36f409d 100644
+--- a/src/com/broadcom/vcfa/VcfAutomationClient.java
++++ b/src/com/broadcom/vcfa/VcfAutomationClient.java
+@@ -1,23 +1,37 @@
+ package com.broadcom.vcfa;
+ 
+ import java.io.IOException;
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.time.Duration;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Map;
++import java.util.UUID;
++import java.util.function.Supplier;
+ 
+ /**
+  * A client for the three VCF Automation 9.1 operations named in {@code docs/contract.json}.
+  *
+- * <p>This is the only file you need to change. Everything the wire format has to satisfy is written
+- * down in {@code docs/contract.json}, which was transcribed from the xAPIs reference pages listed in
+- * {@code docs/official_sources.json}.
+- *
+- * <p>The appliance issues a short-lived access token. It will expire partway through a run, and the
+- * Deployment API will answer 401 for the request that hits the expiry. Recover from that without
+- * discarding the pages already fetched.
++ * <p>The appliance issues a short-lived access token. It expires partway through a run, and the
++ * Deployment API answers 401 for the request that hits the expiry. That single request is replayed
++ * against a fresh token; pages already fetched are kept and never requested again.
+  */
+ public final class VcfAutomationClient {
+ 
++    private static final String TOKEN_PATH = "/csp/gateway/am/api/login/oauth";
++    private static final String DEPLOYMENTS_PATH = "/deployment/api/deployments";
++    private static final String JSON = "application/json";
++
+     private final String baseUrl;
+     private final String refreshToken;
++    private final HttpClient http;
++
++    private String accessToken;
+ 
+     /**
+      * @param baseUrl      origin of the appliance, e.g. {@code http://127.0.0.1:8443}, no trailing slash
+@@ -26,6 +40,7 @@ public final class VcfAutomationClient {
+     public VcfAutomationClient(String baseUrl, String refreshToken) {
+         this.baseUrl = baseUrl;
+         this.refreshToken = refreshToken;
++        this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
+     }
+ 
+     /** Origin of the appliance this client talks to. */
+@@ -46,13 +61,36 @@ public final class VcfAutomationClient {
+      *     dropped
+      */
+     public List<Deployment> listAllDeployments(int pageSize) throws IOException, InterruptedException {
+-        throw new UnsupportedOperationException("listAllDeployments is not implemented yet");
++        List<Deployment> collected = new ArrayList<>();
++        int page = 0;
++        while (true) {
++            final int index = page;
++            URI uri = URI.create(baseUrl + DEPLOYMENTS_PATH + "?page=" + index + "&size=" + pageSize);
++            HttpResponse<String> response = sendAuthorized(() -> HttpRequest.newBuilder(uri).GET());
++            if (response.statusCode() != 200) {
++                throw new IOException("listDeployments page " + index + " failed with "
++                        + response.statusCode() + ": " + response.body());
++            }
++            Map<String, Object> envelope = Json.asObject(Json.parse(response.body()));
++            for (Object item : Json.asArray(envelope.get("content"))) {
++                collected.add(toDeployment(Json.asObject(item)));
++            }
++            if (Boolean.TRUE.equals(envelope.get("last"))) {
++                return collected;
++            }
++            int totalPages = Json.optInt(envelope, "totalPages", index + 1);
++            if (index + 1 >= totalPages) {
++                return collected;
++            }
++            page = index + 1;
++        }
+     }
+ 
+     /**
+      * Updates one deployment through {@code patchDeployment}.
+      *
+-     * <p>A null argument means the caller is not changing that field.
++     * <p>A null argument means the caller is not changing that field, so the field is left out of
++     * the request body entirely rather than sent as an empty value.
+      *
+      * @param deploymentId the deployment to update
+      * @param name         new name, or null to leave it alone
+@@ -62,7 +100,102 @@ public final class VcfAutomationClient {
+      */
+     public Deployment updateDeployment(String deploymentId, String name, String description, String iconId)
+             throws IOException, InterruptedException {
+-        throw new UnsupportedOperationException("updateDeployment is not implemented yet");
++        Map<String, Object> update = new LinkedHashMap<>();
++        if (name != null) {
++            update.put("name", name);
++        }
++        if (description != null) {
++            update.put("description", description);
++        }
++        if (iconId != null) {
++            update.put("iconId", iconId);
++        }
++        if (update.isEmpty()) {
++            throw new IllegalArgumentException(
++                    "patchDeployment needs at least one of name, description, iconId");
++        }
++
++        URI uri = URI.create(baseUrl + DEPLOYMENTS_PATH + "/" + deploymentId);
++        String payload = Json.write(update);
++        HttpResponse<String> response = sendAuthorized(() -> HttpRequest.newBuilder(uri)
++                .header("Content-Type", JSON)
++                .method("PATCH", HttpRequest.BodyPublishers.ofString(payload, StandardCharsets.UTF_8)));
++        if (response.statusCode() != 200) {
++            throw new IOException("patchDeployment " + deploymentId + " failed with "
++                    + response.statusCode() + ": " + response.body());
++        }
++        return toDeployment(Json.asObject(Json.parse(response.body())));
++    }
++
++    // ------------------------------------------------------------------ internals
++
++    /**
++     * Sends a request under the current access token, obtaining one first if there is none.
++     *
++     * <p>A 401 means the token expired: it is exchanged once and this one request is replayed. The
++     * caller's work up to that point is untouched, so pagination carries on from the page that was
++     * rejected. The builder is a supplier because the request has to be rebuilt with the new
++     * Authorization header.
++     */
++    private HttpResponse<String> sendAuthorized(Supplier<HttpRequest.Builder> builder)
++            throws IOException, InterruptedException {
++        if (accessToken == null) {
++            exchangeRefreshToken();
++        }
++        HttpResponse<String> response = send(builder);
++        if (response.statusCode() == 401) {
++            exchangeRefreshToken();
++            response = send(builder);
++        }
++        return response;
++    }
++
++    private HttpResponse<String> send(Supplier<HttpRequest.Builder> builder)
++            throws IOException, InterruptedException {
++        HttpRequest request = builder.get()
++                .header("Authorization", "Bearer " + accessToken)
++                .build();
++        return http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++    }
++
++    /**
++     * Trades the refresh token for a new access token.
++     *
++     * <p>The body carries only the three fields this grant uses. The other optional fields the
++     * reference lists for this operation — client_id, client_secret, code, redirect_uri, scope,
++     * orgId — have no value here, so they are omitted rather than sent empty.
++     */
++    private void exchangeRefreshToken() throws IOException, InterruptedException {
++        Map<String, Object> body = new LinkedHashMap<>();
++        body.put("grant_type", "refresh_token");
++        body.put("state", UUID.randomUUID().toString());
++        body.put("refresh_token", refreshToken);
++
++        HttpRequest request = HttpRequest.newBuilder(URI.create(baseUrl + TOKEN_PATH))
++                .header("Content-Type", JSON)
++                .header("Accept", JSON)
++                .POST(HttpRequest.BodyPublishers.ofString(Json.write(body), StandardCharsets.UTF_8))
++                .build();
++        HttpResponse<String> response =
++                http.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++        if (response.statusCode() != 200) {
++            throw new IOException("token exchange failed with " + response.statusCode()
++                    + ": " + response.body());
++        }
++        Map<String, Object> token = Json.asObject(Json.parse(response.body()));
++        String issued = Json.optString(token, "access_token");
++        if (issued == null || issued.isEmpty()) {
++            throw new IOException("token exchange returned no access_token: " + response.body());
++        }
++        accessToken = issued;
++    }
++
++    private static Deployment toDeployment(Map<String, Object> json) {
++        return new Deployment(
++                Json.optString(json, "id"),
++                Json.optString(json, "name"),
++                Json.optString(json, "description"),
++                Json.optString(json, "status"));
+     }
+ 
+     /** The subset of the Deployment object this project cares about. */

@@ -1,0 +1,751 @@
+--- a/VcfAutomationMachineClient.java
++++ b/VcfAutomationMachineClient.java
+@@ -1,6 +1,15 @@
++import java.io.IOException;
++import java.net.URI;
++import java.net.URISyntaxException;
+ import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
+ import java.time.Duration;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Locale;
+ import java.util.Map;
+ 
+ /**
+@@ -237,17 +246,44 @@
+         }
+     }
+ 
++    private static final String MACHINES_PATH = SERVICE_BASE_PATH + "/machines";
++
++    private final String origin;
++    private final String refreshToken;
++    private final String machineSelect;
++    private final Duration pollInterval;
++    private final Duration pollTimeout;
++    private final long pollIntervalNanos;
++    private final long pollTimeoutNanos;
++    private final HttpClient http;
++
++    private volatile String bearerToken;
++    private volatile String apiVersion;
++
+     /**
+      * Validates the configuration and builds a client. Nothing is sent from this call.
+      *
+      * @throws IllegalArgumentException if the configuration is unusable
+      */
+     public static VcfAutomationMachineClient create(Config config) {
+-        throw new UnsupportedOperationException("not implemented");
++        if (config == null) {
++            throw new IllegalArgumentException("configuration is required");
++        }
++        return new VcfAutomationMachineClient(config);
+     }
+ 
+-    private VcfAutomationMachineClient() {
+-        // TODO: retain the validated configuration.
++    private VcfAutomationMachineClient(Config config) {
++        this.origin = origin(config.baseUrl());
++        this.refreshToken = credential(config.refreshToken());
++        this.machineSelect = selector(config.machineSelect());
++        this.pollInterval = positive(config.pollInterval(), DEFAULT_POLL_INTERVAL, "pollInterval");
++        this.pollTimeout = positive(config.pollTimeout(), DEFAULT_POLL_TIMEOUT, "pollTimeout");
++        this.pollIntervalNanos = saturatedNanos(pollInterval);
++        this.pollTimeoutNanos = saturatedNanos(pollTimeout);
++        this.http =
++                config.httpClient() != null
++                        ? config.httpClient()
++                        : HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build();
+     }
+ 
+     /**
+@@ -255,7 +291,7 @@
+      * read the about page.
+      */
+     public String apiVersion() {
+-        throw new UnsupportedOperationException("not implemented");
++        return apiVersion;
+     }
+ 
+     /**
+@@ -263,6 +299,674 @@
+      * reads back the machine the terminal tracker points at.
+      */
+     public ProvisionResult provision(MachineRequest request) throws ProvisioningException {
+-        throw new UnsupportedOperationException("not implemented");
++        if (request == null) {
++            throw new IllegalArgumentException("machine request is required");
++        }
++        authenticate();
++        String version = discoverApiVersion();
++
++        Map<String, Object> accepted =
++                json(
++                        OP_CREATE_MACHINE,
++                        null,
++                        send(
++                                OP_CREATE_MACHINE,
++                                null,
++                                "POST",
++                                MACHINES_PATH,
++                                versionQuery(version),
++                                specification(request)),
++                        202);
++        String requestId = requiredText(OP_CREATE_MACHINE, null, accepted, "id");
++
++        Map<String, Object> tracker;
++        int reads = 0;
++        int trackerProgress = 0;
++        String status = null;
++        long started = System.nanoTime();
++        while (true) {
++            if (reads > 0) {
++                long remaining = pollTimeoutNanos - (System.nanoTime() - started);
++                if (remaining <= 0) {
++                    throw new RequestPollTimeoutException(
++                            requestId, status, trackerProgress, pollTimeout);
++                }
++                sleep(OP_GET_REQUEST_TRACKER, requestId, Math.min(pollIntervalNanos, remaining));
++                if (System.nanoTime() - started >= pollTimeoutNanos) {
++                    throw new RequestPollTimeoutException(
++                            requestId, status, trackerProgress, pollTimeout);
++                }
++            }
++            tracker =
++                    json(
++                            OP_GET_REQUEST_TRACKER,
++                            requestId,
++                            send(
++                                    OP_GET_REQUEST_TRACKER,
++                                    requestId,
++                                    "GET",
++                                    SERVICE_BASE_PATH + "/request-tracker/" + requestId,
++                                    versionQuery(version),
++                                    null),
++                            200);
++            reads++;
++            String trackerId = requiredText(OP_GET_REQUEST_TRACKER, requestId, tracker, "id");
++            if (!requestId.equals(trackerId)) {
++                throw new VcfAutomationProtocolException(
++                        OP_GET_REQUEST_TRACKER, requestId, "the tracker id changed");
++            }
++            requiredText(OP_GET_REQUEST_TRACKER, requestId, tracker, "selfLink");
++            status = requiredText(OP_GET_REQUEST_TRACKER, requestId, tracker, "status");
++            trackerProgress = requiredProgress(requestId, tracker);
++            if (!STATUS_INPROGRESS.equals(status)) {
++                break;
++            }
++        }
++
++        if (!STATUS_FINISHED.equals(status)) {
++            throw new RequestFailedException(
++                    requestId, status, text(tracker.get("message")), trackerProgress);
++        }
++
++        String machineId = provisionedMachineId(requestId, tracker);
++        Map<String, Object> machine =
++                json(
++                        OP_GET_MACHINE,
++                        requestId,
++                        send(
++                                OP_GET_MACHINE,
++                                requestId,
++                                "GET",
++                                MACHINES_PATH + "/" + machineId,
++                                machineQuery(version),
++                                null),
++                        200);
++
++        return new ProvisionResult(
++                requestId,
++                requiredText(OP_GET_REQUEST_TRACKER, requestId, tracker, "selfLink"),
++                status,
++                trackerProgress,
++                version,
++                reads,
++                new MachineRef(
++                        requiredText(OP_GET_MACHINE, requestId, machine, "id"),
++                        text(machine.get("name")),
++                        text(machine.get("powerState")),
++                        text(machine.get("address")),
++                        text(machine.get("externalId")),
++                        text(machine.get("projectId"))));
++    }
++
++    // ------------------------------------------------------------ operations
++
++    private void authenticate() throws ProvisioningException {
++        if (bearerToken != null) {
++            return;
++        }
++        Map<String, Object> reply =
++                json(
++                        OP_RETRIEVE_AUTH_TOKEN,
++                        null,
++                        send(
++                                OP_RETRIEVE_AUTH_TOKEN,
++                                null,
++                                "POST",
++                                SERVICE_BASE_PATH + "/login",
++                                null,
++                                "{\"refreshToken\":" + quoted(refreshToken) + "}"),
++                        200);
++        bearerToken = requiredText(OP_RETRIEVE_AUTH_TOKEN, null, reply, "token");
++    }
++
++    private String discoverApiVersion() throws ProvisioningException {
++        String known = apiVersion;
++        if (known != null) {
++            return known;
++        }
++        Map<String, Object> reply =
++                json(
++                        OP_GET_ABOUT_PAGE,
++                        null,
++                        send(OP_GET_ABOUT_PAGE, null, "GET", SERVICE_BASE_PATH + "/about", null, null),
++                        200);
++        String discovered = requiredText(OP_GET_ABOUT_PAGE, null, reply, "latestApiVersion");
++        apiVersion = discovered;
++        return discovered;
++    }
++
++    private String provisionedMachineId(String requestId, Map<String, Object> tracker)
++            throws ProvisioningException {
++        Object resources = tracker.get("resources");
++        if (!(resources instanceof List<?> entries) || entries.size() != 1) {
++            throw new VcfAutomationProtocolException(
++                    OP_GET_REQUEST_TRACKER,
++                    requestId,
++                    "a finished machine request must carry exactly one resource, found "
++                            + (resources instanceof List<?> list ? list.size() : "none"));
++        }
++        String resource = text(entries.get(0));
++        String prefix = MACHINES_PATH + "/";
++        if (resource == null || !resource.startsWith(prefix)) {
++            throw new VcfAutomationProtocolException(
++                    OP_GET_REQUEST_TRACKER,
++                    requestId,
++                    "resource <" + resource + "> is not a machine of this service");
++        }
++        String id = resource.substring(prefix.length());
++        if (id.isEmpty() || id.indexOf('/') >= 0) {
++            throw new VcfAutomationProtocolException(
++                    OP_GET_REQUEST_TRACKER, requestId, "resource <" + resource + "> carries no machine id");
++        }
++        return id;
++    }
++
++    /** Serialises MachineSpecification, omitting every optional member that carries no value. */
++    private static String specification(MachineRequest request) {
++        StringBuilder out = new StringBuilder("{");
++        member(out, "name", quoted(request.name()));
++        member(out, "projectId", quoted(request.projectId()));
++        member(out, "image", quoted(request.image()));
++        member(out, "flavor", quoted(request.flavor()));
++        if (present(request.description())) {
++            member(out, "description", quoted(request.description()));
++        }
++        if (!request.tags().isEmpty()) {
++            StringBuilder tags = new StringBuilder("[");
++            for (int i = 0; i < request.tags().size(); i++) {
++                Tag tag = request.tags().get(i);
++                if (i > 0) {
++                    tags.append(',');
++                }
++                tags.append("{\"key\":")
++                        .append(quoted(tag.key()))
++                        .append(",\"value\":")
++                        .append(quoted(tag.value()))
++                        .append('}');
++            }
++            member(out, "tags", tags.append(']').toString());
++        }
++        if (!request.customProperties().isEmpty()) {
++            StringBuilder properties = new StringBuilder("{");
++            boolean first = true;
++            for (Map.Entry<String, String> entry : request.customProperties().entrySet()) {
++                if (!first) {
++                    properties.append(',');
++                }
++                first = false;
++                properties.append(quoted(entry.getKey())).append(':').append(quoted(entry.getValue()));
++            }
++            member(out, "customProperties", properties.append('}').toString());
++        }
++        if (present(request.deploymentId())) {
++            member(out, "deploymentId", quoted(request.deploymentId()));
++        }
++        return out.append('}').toString();
++    }
++
++    private static void member(StringBuilder out, String name, String value) {
++        if (out.length() > 1) {
++            out.append(',');
++        }
++        out.append(quoted(name)).append(':').append(value);
++    }
++
++    private static boolean present(String value) {
++        return value != null && !value.isEmpty();
++    }
++
++    // ----------------------------------------------------------------- wire
++
++    private String versionQuery(String version) {
++        return "apiVersion=" + version;
++    }
++
++    private String machineQuery(String version) {
++        return machineSelect == null
++                ? versionQuery(version)
++                : versionQuery(version) + "&$select=" + machineSelect;
++    }
++
++    private HttpResponse<String> send(
++            String operationId, String requestId, String method, String path, String query, String entity)
++            throws ProvisioningException {
++        HttpRequest.Builder builder;
++        try {
++            builder = HttpRequest.newBuilder(new URI(origin + path + (query == null ? "" : "?" + query)));
++        } catch (URISyntaxException malformed) {
++            throw new VcfAutomationProtocolException(
++                    operationId, requestId, "the request target could not be built");
++        }
++        builder.header("Accept", "application/json");
++        if (!OP_RETRIEVE_AUTH_TOKEN.equals(operationId)) {
++            builder.header("Authorization", "Bearer " + bearerToken);
++        }
++        if (entity == null) {
++            builder.method(method, HttpRequest.BodyPublishers.noBody());
++        } else {
++            builder.header("Content-Type", "application/json")
++                    .method(method, HttpRequest.BodyPublishers.ofString(entity, StandardCharsets.UTF_8));
++        }
++        try {
++            return http.send(builder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++        } catch (IOException failure) {
++            throw new VcfAutomationTransportException(operationId, requestId, failure);
++        } catch (InterruptedException interrupted) {
++            Thread.currentThread().interrupt();
++            throw new VcfAutomationTransportException(operationId, requestId, interrupted);
++        }
++    }
++
++    private Map<String, Object> json(
++            String operationId, String requestId, HttpResponse<String> response, int success)
++            throws ProvisioningException {
++        if (response.statusCode() != success) {
++            throw apiFailure(operationId, requestId, response);
++        }
++        try {
++            return Json.obj(Json.parse(response.body()));
++        } catch (RuntimeException malformed) {
++            throw new VcfAutomationProtocolException(
++                    operationId, requestId, "the reply is not a JSON object");
++        }
++    }
++
++    private static VcfAutomationApiException apiFailure(
++            String operationId, String requestId, HttpResponse<String> response) {
++        String message = null;
++        Integer errorCode = null;
++        String serverErrorId = null;
++        try {
++            Map<String, Object> error = Json.obj(Json.parse(response.body()));
++            message = text(error.get("message"));
++            Object code = error.get("errorCode");
++            if (code instanceof Number number) {
++                errorCode = number.intValue();
++            }
++            serverErrorId = text(error.get("serverErrorId"));
++        } catch (RuntimeException unreadable) {
++            // A reply that is not a ServiceErrorResponse still fails with its documented status.
++        }
++        return new VcfAutomationApiException(
++                operationId, requestId, response.statusCode(), message, errorCode, serverErrorId);
++    }
++
++    private void sleep(String operationId, String requestId, long nanos)
++            throws ProvisioningException {
++        try {
++            Thread.sleep(Duration.ofNanos(nanos));
++        } catch (InterruptedException interrupted) {
++            Thread.currentThread().interrupt();
++            throw new VcfAutomationTransportException(operationId, requestId, interrupted);
++        }
++    }
++
++    private static String requiredText(
++            String operationId, String requestId, Map<String, Object> document, String member)
++            throws ProvisioningException {
++        String value = text(document.get(member));
++        if (value == null || value.isEmpty()) {
++            throw new VcfAutomationProtocolException(
++                    operationId, requestId, "the reply carries no '" + member + "'");
++        }
++        return value;
++    }
++
++    private static int requiredProgress(String requestId, Map<String, Object> tracker)
++            throws ProvisioningException {
++        Object value = tracker.get("progress");
++        if (!(value instanceof Long number)
++                || number < Integer.MIN_VALUE
++                || number > Integer.MAX_VALUE) {
++            throw new VcfAutomationProtocolException(
++                    OP_GET_REQUEST_TRACKER,
++                    requestId,
++                    "the reply carries no usable integer 'progress'");
++        }
++        return number.intValue();
++    }
++
++    private static String text(Object value) {
++        return value instanceof String string ? string : null;
++    }
++
++    // --------------------------------------------------------- configuration
++
++    private static String origin(String baseUrl) {
++        if (baseUrl == null || baseUrl.isBlank()) {
++            throw new IllegalArgumentException("baseUrl is required");
++        }
++        URI uri;
++        try {
++            uri = new URI(baseUrl);
++        } catch (URISyntaxException malformed) {
++            throw new IllegalArgumentException("baseUrl is not a valid URL");
++        }
++        String scheme = uri.getScheme() == null ? "" : uri.getScheme().toLowerCase(Locale.ROOT);
++        if (!scheme.equals("http") && !scheme.equals("https")) {
++            throw new IllegalArgumentException("baseUrl must be an http or https URL");
++        }
++        if (uri.getHost() == null || uri.getHost().isEmpty()) {
++            throw new IllegalArgumentException("baseUrl must carry a host");
++        }
++        if (uri.getPort() > 65535) {
++            throw new IllegalArgumentException("baseUrl carries an invalid port");
++        }
++        if (uri.getUserInfo() != null) {
++            throw new IllegalArgumentException("baseUrl must not carry user information");
++        }
++        if (uri.getQuery() != null || uri.getFragment() != null) {
++            throw new IllegalArgumentException("baseUrl must not carry a query or fragment");
++        }
++        String path = uri.getPath();
++        if (path != null && !path.isEmpty() && !path.equals("/")) {
++            throw new IllegalArgumentException("baseUrl must not carry a path");
++        }
++        return scheme + "://" + uri.getHost() + (uri.getPort() < 0 ? "" : ":" + uri.getPort());
++    }
++
++    private static String credential(String refreshToken) {
++        if (refreshToken == null || refreshToken.isBlank()) {
++            throw new IllegalArgumentException("refreshToken is required");
++        }
++        if (hasControlCharacter(refreshToken)) {
++            throw new IllegalArgumentException("refreshToken carries a control character");
++        }
++        return refreshToken;
++    }
++
++    private static String selector(String machineSelect) {
++        if (machineSelect == null || machineSelect.isBlank()) {
++            return null;
++        }
++        if (hasControlCharacter(machineSelect)) {
++            throw new IllegalArgumentException("machineSelect carries a control character");
++        }
++        for (int i = 0; i < machineSelect.length(); i++) {
++            if (!queryValueCharacter(machineSelect.charAt(i))) {
++                throw new IllegalArgumentException(
++                        "machineSelect carries a character that must be escaped");
++            }
++        }
++        return machineSelect;
++    }
++
++    private static boolean queryValueCharacter(char c) {
++        return c >= 'a' && c <= 'z'
++                || c >= 'A' && c <= 'Z'
++                || c >= '0' && c <= '9'
++                || "-._~!$'()*+,;:@/?".indexOf(c) >= 0;
++    }
++
++    private static Duration positive(Duration value, Duration fallback, String what) {
++        if (value == null) {
++            return fallback;
++        }
++        if (value.isZero() || value.isNegative()) {
++            throw new IllegalArgumentException(what + " must be positive");
++        }
++        return value;
++    }
++
++    private static long saturatedNanos(Duration value) {
++        try {
++            return value.toNanos();
++        } catch (ArithmeticException tooLarge) {
++            return Long.MAX_VALUE;
++        }
++    }
++
++    private static boolean hasControlCharacter(String value) {
++        for (int i = 0; i < value.length(); i++) {
++            char c = value.charAt(i);
++            if (c < 0x20 || c == 0x7f) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    private static String quoted(String value) {
++        StringBuilder out = new StringBuilder("\"");
++        for (int i = 0; i < value.length(); i++) {
++            char c = value.charAt(i);
++            switch (c) {
++                case '"' -> out.append("\\\"");
++                case '\\' -> out.append("\\\\");
++                case '\n' -> out.append("\\n");
++                case '\r' -> out.append("\\r");
++                case '\t' -> out.append("\\t");
++                default -> {
++                    if (c < 0x20) {
++                        out.append(String.format("\\u%04x", (int) c));
++                    } else {
++                        out.append(c);
++                    }
++                }
++            }
++        }
++        return out.append('"').toString();
++    }
++
++    // ------------------------------------------------------------------ json
++
++    /** Minimal JSON reader, sufficient for the documents this contract projects. */
++    private static final class Json {
++
++        private final String text;
++        private int at;
++
++        private Json(String text) {
++            this.text = text;
++        }
++
++        static Object parse(String text) {
++            Json parser = new Json(text);
++            parser.skip();
++            Object value = parser.value();
++            parser.skip();
++            if (parser.at != text.length()) {
++                throw new IllegalArgumentException("trailing content");
++            }
++            return value;
++        }
++
++        @SuppressWarnings("unchecked")
++        static Map<String, Object> obj(Object value) {
++            if (!(value instanceof Map)) {
++                throw new IllegalArgumentException("not a JSON object");
++            }
++            return (Map<String, Object>) value;
++        }
++
++        private Object value() {
++            char c = peek();
++            return switch (c) {
++                case '{' -> object();
++                case '[' -> array();
++                case '"' -> string();
++                case 't', 'f' -> bool();
++                case 'n' -> nul();
++                default -> number();
++            };
++        }
++
++        private Map<String, Object> object() {
++            Map<String, Object> members = new LinkedHashMap<>();
++            expect('{');
++            skip();
++            if (peek() == '}') {
++                at++;
++                return members;
++            }
++            while (true) {
++                skip();
++                String key = string();
++                skip();
++                expect(':');
++                skip();
++                members.put(key, value());
++                skip();
++                char c = next();
++                if (c == '}') {
++                    return members;
++                }
++                if (c != ',') {
++                    throw new IllegalArgumentException("malformed object");
++                }
++            }
++        }
++
++        private List<Object> array() {
++            List<Object> items = new ArrayList<>();
++            expect('[');
++            skip();
++            if (peek() == ']') {
++                at++;
++                return items;
++            }
++            while (true) {
++                skip();
++                items.add(value());
++                skip();
++                char c = next();
++                if (c == ']') {
++                    return items;
++                }
++                if (c != ',') {
++                    throw new IllegalArgumentException("malformed array");
++                }
++            }
++        }
++
++        private String string() {
++            expect('"');
++            StringBuilder out = new StringBuilder();
++            while (true) {
++                char c = next();
++                if (c == '"') {
++                    return out.toString();
++                }
++                if (c < 0x20) {
++                    throw new IllegalArgumentException("unescaped control character");
++                }
++                if (c != '\\') {
++                    out.append(c);
++                    continue;
++                }
++                char escape = next();
++                switch (escape) {
++                    case '"' -> out.append('"');
++                    case '\\' -> out.append('\\');
++                    case '/' -> out.append('/');
++                    case 'b' -> out.append('\b');
++                    case 'f' -> out.append('\f');
++                    case 'n' -> out.append('\n');
++                    case 'r' -> out.append('\r');
++                    case 't' -> out.append('\t');
++                    case 'u' -> {
++                        out.append((char) Integer.parseInt(text.substring(at, at + 4), 16));
++                        at += 4;
++                    }
++                    default -> throw new IllegalArgumentException("bad escape");
++                }
++            }
++        }
++
++        private Object bool() {
++            if (text.startsWith("true", at)) {
++                at += 4;
++                return Boolean.TRUE;
++            }
++            if (text.startsWith("false", at)) {
++                at += 5;
++                return Boolean.FALSE;
++            }
++            throw new IllegalArgumentException("bad literal");
++        }
++
++        private Object nul() {
++            if (!text.startsWith("null", at)) {
++                throw new IllegalArgumentException("bad literal");
++            }
++            at += 4;
++            return null;
++        }
++
++        private Object number() {
++            int start = at;
++            if (at < text.length() && text.charAt(at) == '-') {
++                at++;
++            }
++            if (at >= text.length()) {
++                throw new IllegalArgumentException("bad number");
++            }
++            if (text.charAt(at) == '0') {
++                at++;
++            } else if (text.charAt(at) >= '1' && text.charAt(at) <= '9') {
++                digits();
++            } else {
++                throw new IllegalArgumentException("bad number");
++            }
++            if (at < text.length() && text.charAt(at) == '.') {
++                at++;
++                int fraction = at;
++                digits();
++                if (at == fraction) {
++                    throw new IllegalArgumentException("bad number");
++                }
++            }
++            if (at < text.length() && (text.charAt(at) == 'e' || text.charAt(at) == 'E')) {
++                at++;
++                if (at < text.length() && (text.charAt(at) == '+' || text.charAt(at) == '-')) {
++                    at++;
++                }
++                int exponent = at;
++                digits();
++                if (at == exponent) {
++                    throw new IllegalArgumentException("bad number");
++                }
++            }
++            String literal = text.substring(start, at);
++            if (literal.indexOf('.') < 0 && literal.indexOf('e') < 0 && literal.indexOf('E') < 0) {
++                return Long.parseLong(literal);
++            }
++            return Double.parseDouble(literal);
++        }
++
++        private void digits() {
++            while (at < text.length() && text.charAt(at) >= '0' && text.charAt(at) <= '9') {
++                at++;
++            }
++        }
++
++        private void skip() {
++            while (at < text.length()
++                    && (text.charAt(at) == ' '
++                            || text.charAt(at) == '\t'
++                            || text.charAt(at) == '\r'
++                            || text.charAt(at) == '\n')) {
++                at++;
++            }
++        }
++
++        private char peek() {
++            if (at >= text.length()) {
++                throw new IllegalArgumentException("unexpected end");
++            }
++            return text.charAt(at);
++        }
++
++        private char next() {
++            char c = peek();
++            at++;
++            return c;
++        }
++
++        private void expect(char expected) {
++            if (next() != expected) {
++                throw new IllegalArgumentException("expected '" + expected + "'");
++            }
++        }
+     }
+ }

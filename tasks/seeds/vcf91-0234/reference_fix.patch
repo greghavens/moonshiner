@@ -1,0 +1,740 @@
+diff --git a/sddclcm/sddclcm.go b/sddclcm/sddclcm.go
+index c5a02fc..6851177 100644
+--- a/sddclcm/sddclcm.go
++++ b/sddclcm/sddclcm.go
+@@ -9,9 +9,15 @@
+ package sddclcm
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
++	"strings"
+ 	"time"
+ )
+ 
+@@ -34,7 +40,12 @@ type APIError struct {
+ 	Body        []byte
+ }
+ 
+-func (e *APIError) Error() string { return "" }
++func (e *APIError) Error() string {
++	if e.Code == "" {
++		return fmt.Sprintf("sddclcm: http %d", e.StatusCode)
++	}
++	return fmt.Sprintf("sddclcm: http %d: %s: %s", e.StatusCode, e.Code, e.Message)
++}
+ 
+ // ProtocolError reports a malformed success response or one that the pinned
+ // contract does not allow.
+@@ -42,14 +53,19 @@ type ProtocolError struct {
+ 	Reason string
+ }
+ 
+-func (e *ProtocolError) Error() string { return "" }
++func (e *ProtocolError) Error() string { return "sddclcm: " + e.Reason }
+ 
+ // TaskFailedError reports a task that reached a terminal non-success status.
+ type TaskFailedError struct {
+ 	Task *Task
+ }
+ 
+-func (e *TaskFailedError) Error() string { return "" }
++func (e *TaskFailedError) Error() string {
++	if e.Task == nil {
++		return "sddclcm: task failed"
++	}
++	return fmt.Sprintf("sddclcm: task %s ended %s", e.Task.ID, e.Task.Status)
++}
+ 
+ // SoftwareSpec is the desired post-upgrade software state.
+ type SoftwareSpec struct {
+@@ -86,6 +102,60 @@ type UpgradeSpec struct {
+ 	CorrelationID string
+ }
+ 
++// The wire types below exist so that the encoder, and only the encoder, decides
++// the JSON shape: member order follows the "order" values in
++// docs/contract.json and every optional member carries omitempty.
++// performBackup deliberately does not, because the contract makes it required
++// whenever lcmPlatformSpec is present, and false is a value rather than an
++// omission.
++
++type wireSoftwareSpec struct {
++	Version string `json:"version"`
++}
++
++type wireDepotSpec struct {
++	URL         string   `json:"url"`
++	Certificate []string `json:"certificate,omitempty"`
++}
++
++type wireComponentDesiredSpec struct {
++	Software        wireSoftwareSpec `json:"software"`
++	Policy          map[string]any   `json:"policy,omitempty"`
++	Depot           wireDepotSpec    `json:"depot"`
++	UserInput       map[string]any   `json:"userInput,omitempty"`
++	AdditionalInput map[string]any   `json:"additionalInput,omitempty"`
++}
++
++type wireLcmPlatformSpec struct {
++	PerformBackup bool `json:"performBackup"`
++}
++
++type wireUpgradeSpec struct {
++	ComponentSpec   wireComponentDesiredSpec `json:"componentSpec"`
++	LcmPlatformSpec *wireLcmPlatformSpec     `json:"lcmPlatformSpec,omitempty"`
++	CorrelationID   string                   `json:"correlationId,omitempty"`
++}
++
++func (s UpgradeSpec) toWire() wireUpgradeSpec {
++	out := wireUpgradeSpec{
++		ComponentSpec: wireComponentDesiredSpec{
++			Software: wireSoftwareSpec{Version: s.ComponentSpec.Software.Version},
++			Policy:   s.ComponentSpec.Policy,
++			Depot: wireDepotSpec{
++				URL:         s.ComponentSpec.Depot.URL,
++				Certificate: s.ComponentSpec.Depot.Certificate,
++			},
++			UserInput:       s.ComponentSpec.UserInput,
++			AdditionalInput: s.ComponentSpec.AdditionalInput,
++		},
++		CorrelationID: s.CorrelationID,
++	}
++	if s.LcmPlatform != nil {
++		out.LcmPlatformSpec = &wireLcmPlatformSpec{PerformBackup: s.LcmPlatform.PerformBackup}
++	}
++	return out
++}
++
+ // LocalizableMessage mirrors the spec schema of the same name.
+ type LocalizableMessage struct {
+ 	ID               string            `json:"id,omitempty"`
+@@ -115,58 +185,327 @@ type Task struct {
+ 	Cancellable   bool                `json:"cancellable,omitempty"`
+ }
+ 
++// The pinned TaskStatus enum.
++const (
++	StatusPending   = "PENDING"
++	StatusScheduled = "SCHEDULED"
++	StatusRunning   = "RUNNING"
++	StatusSucceeded = "SUCCEEDED"
++	StatusFailed    = "FAILED"
++	StatusCanceled  = "CANCELED"
++)
++
++type statusClass int
++
++const (
++	statusUnknown statusClass = iota
++	statusNonTerminal
++	statusSuccess
++	statusFailure
++)
++
++func classify(status string) statusClass {
++	switch status {
++	case StatusPending, StatusScheduled, StatusRunning:
++		return statusNonTerminal
++	case StatusSucceeded:
++		return statusSuccess
++	case StatusFailed, StatusCanceled:
++		return statusFailure
++	default:
++		return statusUnknown
++	}
++}
++
+ // Option customises a Client.
+ type Option func(*Client)
+ 
+ // WithHTTPClient overrides the transport used for every request.
+ func WithHTTPClient(h *http.Client) Option {
+-	return func(c *Client) { _ = h }
++	return func(c *Client) {
++		if h != nil {
++			c.httpClient = h
++		}
++	}
+ }
+ 
+ // WithMaxAttempts caps how many times a single submission is sent, including
+ // the first attempt. The default is 4.
+ func WithMaxAttempts(n int) Option {
+-	return func(c *Client) { _ = n }
++	return func(c *Client) {
++		if n > 0 {
++			c.maxAttempts = n
++		}
++	}
+ }
+ 
+ // WithRetryBackoff sets the pause before attempt n (1-based, so backoff(1) runs
+ // before the second attempt). The default is 250ms per attempt.
+ func WithRetryBackoff(f func(attempt int) time.Duration) Option {
+-	return func(c *Client) { _ = f }
++	return func(c *Client) {
++		if f != nil {
++			c.backoff = f
++		}
++	}
+ }
+ 
+ // WithPollInterval sets the pause between getTask polls. The default is 2s.
+ func WithPollInterval(d time.Duration) Option {
+-	return func(c *Client) { _ = d }
++	return func(c *Client) { c.pollInterval = d }
+ }
+ 
+ // Client talks to one SDDC LCM service endpoint. It is safe for concurrent use
+-// by multiple goroutines.
++// by multiple goroutines: every field is set once by NewClient and never
++// mutated afterwards, and all per-call state lives on the stack.
+ type Client struct {
+-	baseURL string
+-	token   string
++	baseURL      string
++	token        string
++	httpClient   *http.Client
++	maxAttempts  int
++	backoff      func(attempt int) time.Duration
++	pollInterval time.Duration
+ }
+ 
+ // NewClient builds a client for baseURL authenticating with the given bearer
+ // token. It rejects an empty baseURL or token.
+ func NewClient(baseURL, bearerToken string, opts ...Option) (*Client, error) {
+-	return nil, errors.New("sddclcm: NewClient is not implemented")
++	trimmed := strings.TrimRight(strings.TrimSpace(baseURL), "/")
++	if trimmed == "" {
++		return nil, errors.New("sddclcm: baseURL is required")
++	}
++	if _, err := url.Parse(trimmed); err != nil {
++		return nil, fmt.Errorf("sddclcm: invalid baseURL: %w", err)
++	}
++	if strings.TrimSpace(bearerToken) == "" {
++		return nil, errors.New("sddclcm: bearerToken is required")
++	}
++	c := &Client{
++		baseURL:      trimmed,
++		token:        bearerToken,
++		httpClient:   &http.Client{Timeout: 30 * time.Second},
++		maxAttempts:  4,
++		backoff:      func(int) time.Duration { return 250 * time.Millisecond },
++		pollInterval: 2 * time.Second,
++	}
++	for _, opt := range opts {
++		if opt != nil {
++			opt(c)
++		}
++	}
++	return c, nil
+ }
+ 
+ // ApplyComponentUpgrade submits performComponentAction with action=apply and
+ // returns the accepted Task. Retries re-send byte-identical bytes under the
+ // same correlation id so the service can collapse them into one upgrade.
+ func (c *Client) ApplyComponentUpgrade(ctx context.Context, componentID string, spec UpgradeSpec) (*Task, error) {
+-	return nil, errors.New("sddclcm: ApplyComponentUpgrade is not implemented")
++	if strings.TrimSpace(componentID) == "" {
++		return nil, errors.New("sddclcm: componentID is required")
++	}
++	if strings.TrimSpace(spec.CorrelationID) == "" {
++		return nil, ErrMissingCorrelationID
++	}
++
++	// Encoded once, outside the retry loop: every attempt has to be the same
++	// bytes under the same correlation id, or the service cannot recognise a
++	// resubmission as a replay of work it may already have started.
++	body, err := json.Marshal(spec.toWire())
++	if err != nil {
++		return nil, fmt.Errorf("sddclcm: encode ComponentUpgradeSpec: %w", err)
++	}
++
++	endpoint := c.baseURL + "/v1/components/" + url.PathEscape(componentID) +
++		"?" + url.Values{"action": {"apply"}}.Encode()
++
++	var lastErr error
++	for attempt := 1; attempt <= c.maxAttempts; attempt++ {
++		if attempt > 1 {
++			if err := sleep(ctx, c.backoff(attempt-1)); err != nil {
++				return nil, err
++			}
++		}
++		task, err := c.submitApply(ctx, endpoint, body, spec.CorrelationID)
++		if err == nil {
++			return task, nil
++		}
++		lastErr = err
++		if !retryable(err) {
++			return nil, err
++		}
++	}
++	return nil, lastErr
++}
++
++func (c *Client) submitApply(ctx context.Context, endpoint string, body []byte, correlationID string) (*Task, error) {
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
++	if err != nil {
++		return nil, fmt.Errorf("sddclcm: build apply request: %w", err)
++	}
++	req.Header.Set("Accept", "application/json")
++	req.Header.Set("Content-Type", "application/json")
++	req.Header.Set("Authorization", "Bearer "+c.token)
++	req.Header.Set("X-Correlation-Id", correlationID)
++
++	return c.roundTripTask(req, http.StatusAccepted)
+ }
+ 
+ // GetTask reads one task by id.
+ func (c *Client) GetTask(ctx context.Context, taskID string) (*Task, error) {
+-	return nil, errors.New("sddclcm: GetTask is not implemented")
++	if strings.TrimSpace(taskID) == "" {
++		return nil, errors.New("sddclcm: taskID is required")
++	}
++	endpoint := c.baseURL + "/v1/tasks/" + url.PathEscape(taskID)
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
++	if err != nil {
++		return nil, fmt.Errorf("sddclcm: build getTask request: %w", err)
++	}
++	// A body-less GET carries no Content-Type.
++	req.Header.Set("Accept", "application/json")
++	req.Header.Set("Authorization", "Bearer "+c.token)
++
++	return c.roundTripTask(req, http.StatusOK)
++}
++
++func (c *Client) roundTripTask(req *http.Request, wantStatus int) (*Task, error) {
++	resp, err := c.httpClient.Do(req)
++	if err != nil {
++		return nil, err
++	}
++	defer func() { _ = resp.Body.Close() }()
++
++	raw, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return nil, fmt.Errorf("sddclcm: read response: %w", err)
++	}
++	if resp.StatusCode != wantStatus {
++		return nil, apiError(resp.StatusCode, raw)
++	}
++
++	task := &Task{}
++	if err := json.Unmarshal(raw, task); err != nil {
++		return nil, &ProtocolError{Reason: fmt.Sprintf("response is not a Task object: %v", err)}
++	}
++	if task.ID == "" {
++		return nil, &ProtocolError{Reason: "Task.id is required by the contract but was empty"}
++	}
++	return task, nil
++}
++
++func apiError(status int, raw []byte) *APIError {
++	out := &APIError{StatusCode: status, Body: raw}
++	var payload struct {
++		Code        string              `json:"code"`
++		ReferenceID string              `json:"referenceId"`
++		Message     *LocalizableMessage `json:"message"`
++	}
++	if err := json.Unmarshal(raw, &payload); err == nil {
++		out.Code = payload.Code
++		out.ReferenceID = payload.ReferenceID
++		if payload.Message != nil {
++			out.Message = payload.Message.DefaultMessage
++			if out.Message == "" {
++				out.Message = payload.Message.LocalizedMessage
++			}
++		}
++	}
++	return out
++}
++
++// retryable reports whether re-sending the identical submission is worth it.
++// Only transport failures and the named transient statuses qualify: any
++// other 4xx means the service understood the request and rejected it, so replaying
++// it would only repeat the rejection.
++func retryable(err error) bool {
++	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
++		return false
++	}
++	var protocolErr *ProtocolError
++	if errors.As(err, &protocolErr) {
++		return false
++	}
++	var apiErr *APIError
++	if errors.As(err, &apiErr) {
++		switch apiErr.StatusCode {
++		case http.StatusTooManyRequests,
++			http.StatusInternalServerError,
++			http.StatusBadGateway,
++			http.StatusServiceUnavailable,
++			http.StatusGatewayTimeout:
++			return true
++		default:
++			return false
++		}
++	}
++	return true
+ }
+ 
+ // ApplyUpgradeAndWait submits the upgrade and polls until the task reaches a
+ // terminal status or timeout elapses.
+ func (c *Client) ApplyUpgradeAndWait(ctx context.Context, componentID string, spec UpgradeSpec, timeout time.Duration) (*Task, error) {
+-	return nil, errors.New("sddclcm: ApplyUpgradeAndWait is not implemented")
++	task, err := c.ApplyComponentUpgrade(ctx, componentID, spec)
++	if err != nil {
++		return nil, err
++	}
++
++	pollCtx, cancel := context.WithTimeout(ctx, timeout)
++	defer cancel()
++	current := task
++	for {
++		switch classify(current.Status) {
++		case statusSuccess:
++			return current, nil
++		case statusFailure:
++			return current, &TaskFailedError{Task: current}
++		case statusUnknown:
++			return nil, &ProtocolError{
++				Reason: fmt.Sprintf("task %s reported status %q, which is outside the TaskStatus enum",
++					current.ID, current.Status),
++			}
++		}
++
++		if err := pollWaitError(ctx, pollCtx, current); err != nil {
++			return nil, err
++		}
++		if err := sleep(pollCtx, c.pollInterval); err != nil {
++			if waitErr := pollWaitError(ctx, pollCtx, current); waitErr != nil {
++				return nil, waitErr
++			}
++			return nil, err
++		}
++		next, err := c.GetTask(pollCtx, task.ID)
++		if err != nil {
++			if waitErr := pollWaitError(ctx, pollCtx, current); waitErr != nil {
++				return nil, waitErr
++			}
++			return nil, err
++		}
++		current = next
++	}
++}
++
++func pollWaitError(parent, poll context.Context, task *Task) error {
++	if err := parent.Err(); err != nil {
++		return err
++	}
++	if errors.Is(poll.Err(), context.DeadlineExceeded) {
++		return fmt.Errorf("sddclcm: task %s is still %s: %w", task.ID, task.Status, ErrPollTimeout)
++	}
++	return poll.Err()
++}
++
++func sleep(ctx context.Context, d time.Duration) error {
++	if err := ctx.Err(); err != nil {
++		return err
++	}
++	if d <= 0 {
++		return nil
++	}
++	timer := time.NewTimer(d)
++	defer timer.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-timer.C:
++		return nil
++	}
+ }
+diff --git a/sddclcm/sddclcm_test.go b/sddclcm/sddclcm_test.go
+new file mode 100644
+index 0000000..3a48f96
+--- /dev/null
++++ b/sddclcm/sddclcm_test.go
+@@ -0,0 +1,278 @@
++package sddclcm
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"net/http"
++	"testing"
++	"time"
++
++	"vcf/lcm/internal/contractmock"
++)
++
++const (
++	testComponentID   = "af6ef462-e192-4fe1-9522-67a50a2b3392"
++	testCorrelationID = "39ab89c8-a945-4290-9327-13c5bd3f595c"
++	testToken         = "eyJhbGciOiJIUzI1NiJ9.unit.signature"
++	testVersion       = "9.1.0.0000.1234567"
++	testDepotURL      = "https://fds.vsphere.com/component-x/v9.1.0/upgrade-manifest"
++)
++
++func testSpec() UpgradeSpec {
++	return UpgradeSpec{
++		ComponentSpec: ComponentDesiredSpec{
++			Software: SoftwareSpec{Version: testVersion},
++			Depot:    DepotSpec{URL: testDepotURL},
++		},
++		CorrelationID: testCorrelationID,
++	}
++}
++
++func TestUpgradeSpecToWireJSON(t *testing.T) {
++	withPlatform := func(backup bool) UpgradeSpec {
++		spec := testSpec()
++		spec.LcmPlatform = &LcmPlatformSpec{PerformBackup: backup}
++		return spec
++	}
++	full := withPlatform(true)
++	full.ComponentSpec.Policy = map[string]any{"haltOnPrecheckWarning": true}
++	full.ComponentSpec.Depot.Certificate = []string{"LS0tLS1CRUdJTiBDRVJUSUZJQ0FURQ=="}
++	full.ComponentSpec.UserInput = map[string]any{"acceptEula": true}
++	full.ComponentSpec.AdditionalInput = map[string]any{"maintenanceWindow": "PT4H"}
++
++	emptyContainers := testSpec()
++	emptyContainers.ComponentSpec.Policy = map[string]any{}
++	emptyContainers.ComponentSpec.UserInput = map[string]any{}
++	emptyContainers.ComponentSpec.Depot.Certificate = []string{}
++
++	base := `{"componentSpec":{"software":{"version":"9.1.0.0000.1234567"},` +
++		`"depot":{"url":"https://fds.vsphere.com/component-x/v9.1.0/upgrade-manifest"}},`
++
++	for _, tc := range []struct {
++		name string
++		spec UpgradeSpec
++		want string
++	}{
++		{
++			name: "optional members are omitted when unset",
++			spec: testSpec(),
++			want: base + `"correlationId":"39ab89c8-a945-4290-9327-13c5bd3f595c"}`,
++		},
++		{
++			name: "optional containers left empty are still omitted",
++			spec: emptyContainers,
++			want: base + `"correlationId":"39ab89c8-a945-4290-9327-13c5bd3f595c"}`,
++		},
++		{
++			name: "performBackup false is transmitted, not dropped",
++			spec: withPlatform(false),
++			want: base + `"lcmPlatformSpec":{"performBackup":false},` +
++				`"correlationId":"39ab89c8-a945-4290-9327-13c5bd3f595c"}`,
++		},
++		{
++			name: "every member follows the contract order",
++			spec: full,
++			want: `{"componentSpec":{"software":{"version":"9.1.0.0000.1234567"},` +
++				`"policy":{"haltOnPrecheckWarning":true},` +
++				`"depot":{"url":"https://fds.vsphere.com/component-x/v9.1.0/upgrade-manifest",` +
++				`"certificate":["LS0tLS1CRUdJTiBDRVJUSUZJQ0FURQ=="]},` +
++				`"userInput":{"acceptEula":true},` +
++				`"additionalInput":{"maintenanceWindow":"PT4H"}},` +
++				`"lcmPlatformSpec":{"performBackup":true},` +
++				`"correlationId":"39ab89c8-a945-4290-9327-13c5bd3f595c"}`,
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			raw, err := json.Marshal(tc.spec.toWire())
++			if err != nil {
++				t.Fatalf("marshal: %v", err)
++			}
++			if string(raw) != tc.want {
++				t.Errorf("payload mismatch\n got: %s\nwant: %s", raw, tc.want)
++			}
++		})
++	}
++}
++
++func TestClassifyStatus(t *testing.T) {
++	for _, tc := range []struct {
++		name   string
++		status string
++		want   statusClass
++	}{
++		{"pending is not terminal", StatusPending, statusNonTerminal},
++		{"scheduled is not terminal", StatusScheduled, statusNonTerminal},
++		{"running is not terminal", StatusRunning, statusNonTerminal},
++		{"succeeded is success", StatusSucceeded, statusSuccess},
++		{"failed is failure", StatusFailed, statusFailure},
++		{"canceled is failure", StatusCanceled, statusFailure},
++		{"lowercase is not in the enum", "succeeded", statusUnknown},
++		{"empty is not in the enum", "", statusUnknown},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := classify(tc.status); got != tc.want {
++				t.Errorf("classify(%q) = %v, want %v", tc.status, got, tc.want)
++			}
++		})
++	}
++}
++
++func TestRetryable(t *testing.T) {
++	for _, tc := range []struct {
++		name string
++		err  error
++		want bool
++	}{
++		{"transient server error", &APIError{StatusCode: http.StatusInternalServerError}, true},
++		{"gateway timeout", &APIError{StatusCode: http.StatusGatewayTimeout}, true},
++		{"throttled", &APIError{StatusCode: http.StatusTooManyRequests}, true},
++		{"bad request is final", &APIError{StatusCode: http.StatusBadRequest}, false},
++		{"not found is final", &APIError{StatusCode: http.StatusNotFound}, false},
++		{"protocol error is final", &ProtocolError{Reason: "bad body"}, false},
++		{"cancelled context is final", context.Canceled, false},
++		{"transport failure is worth another attempt", errors.New("connection reset by peer"), true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := retryable(tc.err); got != tc.want {
++				t.Errorf("retryable(%v) = %v, want %v", tc.err, got, tc.want)
++			}
++		})
++	}
++}
++
++func newTestClient(t *testing.T, mock *contractmock.Mock) *Client {
++	t.Helper()
++	client, err := NewClient(mock.BaseURL(), testToken,
++		WithHTTPClient(mock.HTTPClient()),
++		WithMaxAttempts(4),
++		WithRetryBackoff(func(int) time.Duration { return 0 }),
++		WithPollInterval(0),
++	)
++	if err != nil {
++		t.Fatalf("NewClient: %v", err)
++	}
++	return client
++}
++
++func TestApplyUpgradeAndWaitAgainstTheFixture(t *testing.T) {
++	for _, tc := range []struct {
++		name        string
++		opts        contractmock.Options
++		wantApplies int
++		wantTasks   int
++		check       func(t *testing.T, task *Task, err error)
++	}{
++		{
++			name:        "a clean submission runs to SUCCEEDED",
++			opts:        contractmock.Options{TaskStatuses: []string{"RUNNING", "SUCCEEDED"}},
++			wantApplies: 1,
++			wantTasks:   1,
++			check: func(t *testing.T, task *Task, err error) {
++				if err != nil {
++					t.Fatalf("err = %v, want nil", err)
++				}
++				if task.Status != StatusSucceeded {
++					t.Errorf("status = %q, want %q", task.Status, StatusSucceeded)
++				}
++				if task.CorrelationID != testCorrelationID {
++					t.Errorf("correlationId = %q, want %q", task.CorrelationID, testCorrelationID)
++				}
++			},
++		},
++		{
++			name: "two lost responses still yield a single upgrade",
++			opts: contractmock.Options{
++				LostAcceptResponses: 2,
++				TaskStatuses:        []string{"SUCCEEDED"},
++			},
++			wantApplies: 3,
++			wantTasks:   1,
++			check: func(t *testing.T, task *Task, err error) {
++				if err != nil {
++					t.Fatalf("err = %v, want nil", err)
++				}
++				if task.Status != StatusSucceeded {
++					t.Errorf("status = %q, want %q", task.Status, StatusSucceeded)
++				}
++			},
++		},
++		{
++			name:        "a failed task is reported as TaskFailedError",
++			opts:        contractmock.Options{TaskStatuses: []string{"FAILED"}},
++			wantApplies: 1,
++			wantTasks:   1,
++			check: func(t *testing.T, _ *Task, err error) {
++				var failed *TaskFailedError
++				if !errors.As(err, &failed) {
++					t.Fatalf("err = %v, want *TaskFailedError", err)
++				}
++			},
++		},
++		{
++			name:        "an unknown status is a protocol error",
++			opts:        contractmock.Options{TaskStatuses: []string{"HALF_DONE"}},
++			wantApplies: 1,
++			wantTasks:   1,
++			check: func(t *testing.T, _ *Task, err error) {
++				var protocolErr *ProtocolError
++				if !errors.As(err, &protocolErr) {
++					t.Fatalf("err = %v, want *ProtocolError", err)
++				}
++			},
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			mock := contractmock.Start(t, tc.opts)
++			client := newTestClient(t, mock)
++
++			task, err := client.ApplyUpgradeAndWait(context.Background(), testComponentID, testSpec(), time.Hour)
++			tc.check(t, task, err)
++
++			applies := 0
++			for _, rec := range mock.Requests() {
++				if rec.Method == http.MethodPost {
++					applies++
++				}
++			}
++			if applies != tc.wantApplies {
++				t.Errorf("apply attempts = %d, want %d", applies, tc.wantApplies)
++			}
++			if got := len(mock.CreatedTaskIDs()); got != tc.wantTasks {
++				t.Errorf("upgrades started = %d, want %d", got, tc.wantTasks)
++			}
++		})
++	}
++}
++
++func TestNewClientValidatesItsInputs(t *testing.T) {
++	for _, tc := range []struct {
++		name    string
++		baseURL string
++		token   string
++	}{
++		{"empty base url", "", testToken},
++		{"blank base url", "   ", testToken},
++		{"empty token", "http://127.0.0.1:1", ""},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			if _, err := NewClient(tc.baseURL, tc.token); err == nil {
++				t.Fatal("err = nil, want a validation error")
++			}
++		})
++	}
++}
++
++func TestApplyRefusesAnUnreplayableSubmission(t *testing.T) {
++	mock := contractmock.Start(t, contractmock.Options{})
++	client := newTestClient(t, mock)
++
++	spec := testSpec()
++	spec.CorrelationID = ""
++	if _, err := client.ApplyComponentUpgrade(context.Background(), testComponentID, spec); !errors.Is(err, ErrMissingCorrelationID) {
++		t.Fatalf("err = %v, want ErrMissingCorrelationID", err)
++	}
++	if got := len(mock.Requests()); got != 0 {
++		t.Fatalf("requests = %d, want 0", got)
++	}
++}

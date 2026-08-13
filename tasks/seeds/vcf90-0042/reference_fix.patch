@@ -1,0 +1,332 @@
+diff --git a/vcperm/__init__.py b/vcperm/__init__.py
+new file mode 100644
+index 0000000..e380474
+--- /dev/null
++++ b/vcperm/__init__.py
+@@ -0,0 +1,15 @@
++"""Collect the vCenter authorization permissions collection from a VCF 9.0
++vSphere Automation endpoint, paged to completion and emitted in a stable order.
++
++Standard library only.
++"""
++
++from .errors import VcenterApiError, VcenterAuthError, VcenterError
++from .permissions import collect_permissions
++
++__all__ = [
++    "collect_permissions",
++    "VcenterError",
++    "VcenterAuthError",
++    "VcenterApiError",
++]
+diff --git a/vcperm/client.py b/vcperm/client.py
+new file mode 100644
+index 0000000..e7ecf83
+--- /dev/null
++++ b/vcperm/client.py
+@@ -0,0 +1,156 @@
++"""Minimal stdlib transport for the three vSphere Automation operations in scope.
++
++Operations, per docs/contract.json:
++
++  Cis.Session_create                      POST   /session                (basic_auth)
++  Cis.Session_delete                      DELETE /session                (api_key_auth)
++  Vcenter.Authorization.Permissions_list  POST   /vcenter/authorization/permissions?action=list
++                                                                         (api_key_auth)
++"""
++
++from __future__ import annotations
++
++import base64
++import json
++import urllib.error
++import urllib.request
++
++from .errors import VcenterApiError, VcenterAuthError, VcenterError
++
++SESSION_HEADER = "vmware-api-session-id"
++SESSION_PATH = "/session"
++PERMISSIONS_LIST_TARGET = "/vcenter/authorization/permissions?action=list"
++
++DEFAULT_TIMEOUT = 30.0
++
++
++def _describe(payload, fallback):
++    """Pull a human string out of a Vapi.Std.Errors.Error body."""
++    if isinstance(payload, dict):
++        messages = payload.get("messages")
++        if isinstance(messages, list) and messages:
++            first = messages[0]
++            if isinstance(first, dict) and first.get("default_message"):
++                return str(first["default_message"])
++        if payload.get("error_type"):
++            return str(payload["error_type"])
++    return fallback
++
++
++def _error_type(payload):
++    if isinstance(payload, dict) and isinstance(payload.get("error_type"), str):
++        return payload["error_type"]
++    return None
++
++
++def _redact(message, secrets):
++    """Remove caller credentials and issued tokens from remote diagnostics."""
++    text = str(message)
++    for secret in secrets:
++        if secret:
++            text = text.replace(str(secret), "[REDACTED]")
++    return text
++
++
++class VcenterSession:
++    """Holds one Cis.Session token and issues the calls that depend on it."""
++
++    def __init__(self, base_url, timeout=DEFAULT_TIMEOUT):
++        self.base_url = base_url.rstrip("/")
++        self.timeout = timeout
++        self._token = None
++
++    # -- transport --------------------------------------------------------
++    def _send(self, method, target, operation_id, headers, body=None, secrets=()):
++        url = self.base_url + target
++        secrets = tuple(str(secret) for secret in secrets if secret)
++        if self._token:
++            secrets += (self._token,)
++        data = None
++        if body is not None:
++            data = json.dumps(body).encode("utf-8")
++            headers = dict(headers, **{"Content-Type": "application/json"})
++        request = urllib.request.Request(url, data=data, headers=headers, method=method)
++        try:
++            with urllib.request.urlopen(request, timeout=self.timeout) as response:
++                raw = response.read()
++                status = response.status
++        except urllib.error.HTTPError as exc:
++            raw = exc.read()
++            try:
++                payload = json.loads(raw.decode("utf-8")) if raw else None
++            except (ValueError, UnicodeDecodeError):
++                payload = None
++            if exc.code == 401 and operation_id == "Cis.Session_create":
++                detail = _redact(
++                    _describe(payload, "vCenter rejected the supplied credentials."), secrets)
++                raise VcenterAuthError(detail, _error_type(payload)) from None
++            detail = _redact(
++                _describe(payload, exc.reason or "no detail supplied"), secrets)
++            raise VcenterApiError(exc.code, operation_id, detail,
++                                  _error_type(payload)) from None
++        except urllib.error.URLError as exc:
++            detail = _redact("transport failure: %s" % (exc.reason,), secrets)
++            raise VcenterApiError(None, operation_id, detail) from None
++        except Exception as exc:
++            detail = _redact("transport failure: %s" % (exc,), secrets)
++            raise VcenterApiError(None, operation_id, detail) from None
++
++        if not raw:
++            return status, None
++        try:
++            return status, json.loads(raw.decode("utf-8"))
++        except (ValueError, UnicodeDecodeError):
++            raise VcenterApiError(status, operation_id,
++                                  "response body was not valid JSON") from None
++
++    def _authenticated_headers(self):
++        if self._token is None:
++            raise VcenterApiError(None, "Cis.Session", "no session token has been created")
++        return {SESSION_HEADER: self._token}
++
++    # -- operations -------------------------------------------------------
++    def open(self, username, password):
++        """Cis.Session_create. Exchanges basic credentials for a session token."""
++        password = str(password)
++        credentials = base64.b64encode(
++            ("%s:%s" % (username, password)).encode("utf-8")).decode("ascii")
++        # The specification declares no request body for this operation, so none
++        # is sent.
++        _status, token = self._send(
++            "POST", SESSION_PATH, "Cis.Session_create",
++            {"Authorization": "Basic " + credentials}, secrets=(password,))
++        if not isinstance(token, str) or not token:
++            raise VcenterApiError(_status, "Cis.Session_create",
++                                  "the 201 body was not a session token string")
++        self._token = token
++        return token
++
++    def close(self):
++        """Cis.Session_delete. Best effort: a failed logout never masks a result."""
++        if self._token is None:
++            return
++        try:
++            self._send("DELETE", SESSION_PATH, "Cis.Session_delete",
++                       self._authenticated_headers())
++        except Exception:
++            pass
++        finally:
++            self._token = None
++
++    def list_permissions(self, body):
++        """Vcenter.Authorization.Permissions_list. Returns one ListResult page."""
++        _status, page = self._send(
++            "POST", PERMISSIONS_LIST_TARGET, "Vcenter.Authorization.Permissions_list",
++            self._authenticated_headers(), body=body)
++        if not isinstance(page, dict) or not isinstance(page.get("items"), list):
++            raise VcenterApiError(_status, "Vcenter.Authorization.Permissions_list",
++                                  "the 200 body was not a ListResult")
++        return page
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *exc_info):
++        self.close()
++        return False
+diff --git a/vcperm/errors.py b/vcperm/errors.py
+new file mode 100644
+index 0000000..7c771b2
+--- /dev/null
++++ b/vcperm/errors.py
+@@ -0,0 +1,28 @@
++"""Errors raised by vcperm.
++
++Nothing in this module ever carries a password or a session token in its
++message; the vCenter fixture and a real vCenter both treat those as secrets.
++"""
++
++
++class VcenterError(Exception):
++    """Base class for every vcperm failure."""
++
++
++class VcenterAuthError(VcenterError):
++    """Cis.Session_create was rejected with 401 Unauthenticated."""
++
++    def __init__(self, message="vCenter rejected the supplied credentials.",
++                 error_type=None):
++        super().__init__(message)
++        self.error_type = error_type
++
++
++class VcenterApiError(VcenterError):
++    """The endpoint answered an operation with a non-success status."""
++
++    def __init__(self, status, operation_id, message, error_type=None):
++        super().__init__("%s failed with HTTP %s: %s" % (operation_id, status, message))
++        self.status = status
++        self.operation_id = operation_id
++        self.error_type = error_type
+diff --git a/vcperm/permissions.py b/vcperm/permissions.py
+new file mode 100644
+index 0000000..b2e3f6d
+--- /dev/null
++++ b/vcperm/permissions.py
+@@ -0,0 +1,109 @@
++"""Page Vcenter.Authorization.Permissions_list to completion, in a stable order.
++
++Wire rules taken from the pinned contract:
++
++* Both request-body members, ``filter`` and ``iterate``, are optional and every
++  property inside them is optional. Anything the caller did not ask for is left
++  out of the JSON entirely, never sent as ``null`` or as an empty object.
++* The operation's documented 400 is "if both filter and marker are passed", so
++  the FilterSpec travels on the first call only. Afterwards the server-issued
++  marker already carries it.
++* ``ListResult.marker`` missing or null means every currently available
++  permission has been returned.
++* ``Principal.domain`` missing or null means the ``localos`` domain.
++"""
++
++from __future__ import annotations
++
++from .client import VcenterSession
++
++# The domain the specification says to assume when Principal.domain is absent.
++DEFAULT_PRINCIPAL_DOMAIN = "localos"
++
++
++def _build_filter_spec(roles, is_propagating):
++    """Vcenter.Authorization.Permissions.FilterSpec, omitting anything unset."""
++    spec = {}
++    if roles is not None:
++        # uniqueItems in the schema; sorted so the body is byte-stable.
++        spec["roles"] = sorted(set(roles))
++    if is_propagating is not None:
++        # False is a value the caller asked for, not an absent property.
++        spec["is_propagating"] = bool(is_propagating)
++    return spec
++
++
++def _build_body(filter_spec, page_size, marker):
++    """One Permissions_list request body."""
++    body = {}
++    # A FilterSpec and a marker may never travel together.
++    if marker is None and filter_spec:
++        body["filter"] = dict(filter_spec)
++    iterate = {}
++    if page_size is not None:
++        iterate["page_size"] = page_size
++    if marker is not None:
++        iterate["marker"] = marker
++    if iterate:
++        body["iterate"] = iterate
++    return body
++
++
++def _normalise(item):
++    """One Vcenter.Authorization.Permissions.ListItem as a flat record."""
++    info = item["info"]
++    obj = info["object"]
++    principal = info["principal"]
++    domain = principal.get("domain")
++    return {
++        "permission": item["permission"],
++        "object_type": obj["type"],
++        "object_id": obj["id"],
++        "principal_type": principal["type"],
++        "principal_name": principal["name"],
++        "principal_domain": domain if domain else DEFAULT_PRINCIPAL_DOMAIN,
++        "role": info["role"],
++        "propagating": bool(info["propagating"]),
++    }
++
++
++def _sort_key(record):
++    return (
++        record["object_type"],
++        record["object_id"],
++        record["principal_domain"],
++        record["principal_name"],
++        record["principal_type"],
++        record["role"],
++        record["permission"],
++    )
++
++
++def collect_permissions(base_url, username, password, *, roles=None,
++                        is_propagating=None, page_size=None, timeout=30.0):
++    """Retrieve every authorization permission and emit it in a stable order.
++
++    Returns ``{"permissions": [...], "count": int, "pages": int}``.
++    """
++    if page_size is not None:
++        page_size = int(page_size)
++        if page_size < 1:
++            raise ValueError("page_size must be a positive integer")
++
++    filter_spec = _build_filter_spec(roles, is_propagating)
++
++    records = []
++    pages = 0
++    marker = None
++    with VcenterSession(base_url, timeout=timeout) as session:
++        session.open(username, password)
++        while True:
++            page = session.list_permissions(_build_body(filter_spec, page_size, marker))
++            pages += 1
++            records.extend(_normalise(item) for item in page["items"])
++            marker = page.get("marker")
++            if marker is None:
++                break
++
++    records.sort(key=_sort_key)
++    return {"permissions": records, "count": len(records), "pages": pages}

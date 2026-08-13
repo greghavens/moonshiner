@@ -1,0 +1,326 @@
+--- a/vofn_appgroups/reconcile.py
++++ b/vofn_appgroups/reconcile.py
+@@ -18,6 +18,12 @@ readable ``201``.
+ This module is standard-library only.
+ """
+ 
++import http.client
++import json
++import math
++import urllib.error
++import urllib.parse
++import urllib.request
+ from dataclasses import dataclass
+ 
+ BASE_PATH = "/api/ni"
+@@ -43,6 +49,12 @@ MAX_ATTEMPTS = 5
+ #: Statuses that mean the appliance may or may not have applied the mutation.
+ RETRYABLE_STATUSES = frozenset({500, 502, 503, 504})
+ 
++#: Domain types the specification enumerates for the credential body.
++_DOMAIN_TYPES = ("LDAP", "LOCAL")
++
++#: Transport-level failures that never yielded an HTTP response.
++_TRANSPORT_FAILURES = (urllib.error.URLError, http.client.HTTPException, OSError)
++
+ 
+ class AppGroupError(Exception):
+     """Base class for every error raised by this module."""
+@@ -98,6 +110,68 @@ class EnsureOutcome:
+     pages_read: int
+ 
+ 
++def _require_text(value, label):
++    if not isinstance(value, str) or not value.strip():
++        raise ValueError("%s must be a non-blank string" % (label,))
++    return value
++
++
++def _require_base_url(value):
++    _require_text(value, "base_url")
++    parts = urllib.parse.urlsplit(value.strip())
++    if parts.scheme.lower() not in ("http", "https"):
++        raise ValueError("base_url must be an absolute http or https URL")
++    try:
++        hostname = parts.hostname
++        port = parts.port
++    except ValueError:
++        raise ValueError("base_url must carry a valid host and port") from None
++    if not hostname:
++        raise ValueError("base_url must name a host")
++    if parts.username is not None or parts.password is not None:
++        raise ValueError("base_url must not carry userinfo")
++    if parts.path not in ("", "/"):
++        raise ValueError("base_url must be the appliance root")
++    if parts.query or parts.fragment:
++        raise ValueError("base_url must not carry a query or a fragment")
++    return "%s://%s" % (parts.scheme.lower(), parts.netloc)
++
++
++def _require_domain(domain_type, domain_value):
++    if domain_type is None:
++        if domain_value is not None:
++            raise ValueError("domain_value requires a domain_type")
++        return None, None
++    if not isinstance(domain_type, str) or domain_type not in _DOMAIN_TYPES:
++        raise ValueError("domain_type must be one of %s" % (", ".join(_DOMAIN_TYPES),))
++    if domain_type == "LOCAL":
++        if domain_value is not None:
++            raise ValueError("a LOCAL domain carries no value")
++        return domain_type, None
++    _require_text(domain_value, "domain_value")
++    return domain_type, domain_value
++
++
++def _require_timeout(value):
++    if isinstance(value, bool) or not isinstance(value, (int, float)):
++        raise ValueError("timeout must be a number")
++    try:
++        converted = float(value)
++    except (OverflowError, ValueError):
++        raise ValueError("timeout must be a finite positive number") from None
++    if not math.isfinite(converted) or converted <= 0:
++        raise ValueError("timeout must be a finite positive number")
++    return converted
++
++
++def _require_bounded_int(value, label, low, high):
++    if isinstance(value, bool) or not isinstance(value, int):
++        raise ValueError("%s must be an integer" % (label,))
++    if value < low or value > high:
++        raise ValueError("%s must be between %d and %d" % (label, low, high))
++    return value
++
++
+ class ApplicationGroupClient:
+     """Reconciles application groups on one appliance.
+ 
+@@ -116,23 +190,222 @@ class ApplicationGroupClient:
+         domain_value=None,
+         timeout=30.0,
+     ):
+-        raise NotImplementedError
++        self._base_url = _require_base_url(base_url)
++        self._username = _require_text(username, "username")
++        self._password = _require_text(password, "password")
++        self._domain_type, self._domain_value = _require_domain(domain_type, domain_value)
++        self._timeout = _require_timeout(timeout)
++        self._token = None
++
++    def __repr__(self):
++        return "<ApplicationGroupClient %s user=%r>" % (self._base_url, self._username)
+ 
+     def __enter__(self):
+-        raise NotImplementedError
++        return self
+ 
+     def __exit__(self, exc_type, exc, tb):
+-        raise NotImplementedError
++        self.close()
++        return False
++
++    # -- workflow --------------------------------------------------------
+ 
+     def ensure_application(self, name, *, page_size=100, max_attempts=3) -> EnsureOutcome:
+         """Make sure exactly one saved application is named ``name``."""
+-        raise NotImplementedError
++        _require_text(name, "name")
++        page_size = _require_bounded_int(page_size, "page_size", 1, MAX_PAGE_SIZE)
++        max_attempts = _require_bounded_int(max_attempts, "max_attempts", 1, MAX_ATTEMPTS)
++
++        self._authenticate()
++        counters = {"pages": 0, "creates": 0}
++        last_error = None
++
++        for _ in range(max_attempts):
++            existing = self._find(name, page_size, counters)
++            if existing is not None:
++                return self._outcome(existing, name, False, counters)
++            try:
++                created = self._create(name, counters)
++            except TransportError as exc:
++                # The appliance may or may not have applied the mutation, so the
++                # next attempt re-reads the collection before creating again.
++                last_error = exc
++                continue
++            except APIError as exc:
++                if exc.status_code == 400:
++                    # Names are unique, so a rejection may mean the group is
++                    # already there; confirm by reading, never by re-creating.
++                    confirmed = self._find(name, page_size, counters)
++                    if confirmed is not None:
++                        return self._outcome(confirmed, name, False, counters)
++                    raise
++                if exc.status_code in RETRYABLE_STATUSES:
++                    last_error = exc
++                    continue
++                raise
++            return self._outcome(created, name, True, counters)
++
++        raise last_error
+ 
+     def close(self) -> None:
+         """Release the auth token this client obtained, at most once."""
+-        raise NotImplementedError
++        if self._token is None:
++            return
++        try:
++            self._call(DELETE_TOKEN_OPERATION_ID, "DELETE", TOKEN_PATH)
++        except AppGroupError:
++            pass
++        finally:
++            self._token = None
++
++    # -- operations ------------------------------------------------------
++
++    def _authenticate(self):
++        if self._token is not None:
++            return
++        payload = {"username": self._username, "password": self._password}
++        if self._domain_type is not None:
++            domain = {"domain_type": self._domain_type}
++            if self._domain_value is not None:
++                domain["value"] = self._domain_value
++            payload["domain"] = domain
++        status, body = self._call(
++            CREATE_TOKEN_OPERATION_ID, "POST", TOKEN_PATH, payload=payload, authorize=False
++        )
++        if status != 200:
++            raise self._api_error(CREATE_TOKEN_OPERATION_ID, status, body)
++        document = self._document(CREATE_TOKEN_OPERATION_ID, body)
++        token = document.get("token")
++        if not isinstance(token, str) or not token:
++            raise ProtocolError(CREATE_TOKEN_OPERATION_ID, "the response carried no token")
++        self._token = token
++
++    def _find(self, name, page_size, counters):
++        """Read every page of summaries and return the single exact match."""
++        operation = LIST_SUMMARIES_OPERATION_ID
++        cursor = None
++        seen = set()
++        matches = []
++        while True:
++            query = [("size", str(page_size))]
++            if cursor is not None:
++                query.append(("cursor", cursor))
++            counters["pages"] += 1
++            status, body = self._call(operation, "GET", LIST_SUMMARIES_PATH, query=query)
++            if status != 200:
++                raise self._api_error(operation, status, body)
++            document = self._document(operation, body)
++            results = document.get("results")
++            if results is None:
++                results = []
++            if not isinstance(results, list):
++                raise ProtocolError(operation, "results was not an array")
++            for item in results:
++                if not isinstance(item, dict):
++                    raise ProtocolError(operation, "a summary was not an object")
++                if item.get("name") != name:
++                    continue
++                entity_id = item.get("entity_id")
++                if not isinstance(entity_id, str) or not entity_id:
++                    raise ProtocolError(operation, "a matching summary carried no entity_id")
++                matches.append(item)
++            cursor = document.get("cursor")
++            if "cursor" in document and not isinstance(cursor, str):
++                raise ProtocolError(operation, "cursor was not a string")
++            if not cursor or not results:
++                break
++            if cursor in seen:
++                raise ProtocolError(operation, "the appliance repeated a cursor")
++            seen.add(cursor)
++        if len(matches) > 1:
++            raise ProtocolError(
++                operation, "%d saved applications share the name" % (len(matches),)
++            )
++        return matches[0] if matches else None
++
++    def _create(self, name, counters):
++        operation = ADD_APPLICATION_OPERATION_ID
++        counters["creates"] += 1
++        status, body = self._call(
++            operation, "POST", ADD_APPLICATION_PATH, payload={"name": name}
++        )
++        if status != 201:
++            raise self._api_error(operation, status, body)
++        document = self._document(operation, body)
++        entity_id = document.get("entity_id")
++        if not isinstance(entity_id, str) or not entity_id:
++            raise ProtocolError(operation, "the created application carried no entity_id")
++        if document.get("name") != name:
++            raise ProtocolError(operation, "the created application carried another name")
++        return document
++
++    def _outcome(self, record, name, created, counters):
++        return EnsureOutcome(
++            entity_id=record["entity_id"],
++            name=name,
++            created=created,
++            create_attempts=counters["creates"],
++            pages_read=counters["pages"],
++        )
++
++    # -- transport -------------------------------------------------------
++
++    def _call(self, operation_id, method, path, query=None, payload=None, authorize=True):
++        url = self._base_url + path
++        if query:
++            url += "?" + urllib.parse.urlencode(query)
++        headers = {"Accept": "application/json"}
++        data = None
++        if payload is not None:
++            data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
++            headers["Content-Type"] = "application/json"
++        if authorize:
++            headers["Authorization"] = "NetworkInsight " + self._token
++        request = urllib.request.Request(url, data=data, headers=headers, method=method)
++        try:
++            with urllib.request.urlopen(request, timeout=self._timeout) as response:
++                return response.status, response.read()
++        except urllib.error.HTTPError as exc:
++            try:
++                body = exc.read()
++            except Exception:  # noqa: BLE001 - an unreadable body is simply empty
++                body = b""
++            finally:
++                exc.close()
++            return exc.code, body
++        except _TRANSPORT_FAILURES:
++            raise TransportError(operation_id) from None
++
++    def _document(self, operation_id, body):
++        try:
++            document = json.loads(body.decode("utf-8"))
++        except (UnicodeDecodeError, ValueError):
++            raise ProtocolError(operation_id, "the response was not JSON") from None
++        if not isinstance(document, dict):
++            raise ProtocolError(operation_id, "the response was not a JSON object")
++        return document
++
++    def _api_error(self, operation_id, status, body):
++        code = None
++        message = None
++        try:
++            document = json.loads(body.decode("utf-8"))
++        except (UnicodeDecodeError, ValueError):
++            document = None
++        if isinstance(document, dict):
++            if isinstance(document.get("code"), int):
++                code = document["code"]
++            if isinstance(document.get("message"), str):
++                message = document["message"]
++        return APIError(operation_id, status, code=code, message=message)
+ 
+ 
+ def render_outcome(outcome: EnsureOutcome) -> str:
+     """Render ``outcome`` as the canonical reconciliation document."""
+-    raise NotImplementedError
++    document = {
++        "entity_id": outcome.entity_id,
++        "name": outcome.name,
++        "created": outcome.created,
++        "create_attempts": outcome.create_attempts,
++        "pages_read": outcome.pages_read,
++    }
++    return json.dumps(document, indent=2, ensure_ascii=False) + "\n"

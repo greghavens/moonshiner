@@ -1,0 +1,1446 @@
+diff --git a/docs/contract.json b/docs/contract.json
+new file mode 100644
+index 0000000..545088c
+--- /dev/null
++++ b/docs/contract.json
+@@ -0,0 +1,67 @@
++{
++  "spec": {
++    "repository": "vmware/vcf-api-specs",
++    "path": "specifications/sddc-manager/sddc-manager-openapi.json",
++    "tag": "9.0.0.0",
++    "commit": "85151f6b1bb58f13b6ac0304bfec53904bea085f",
++    "openapi": "3.0.1",
++    "title": "VMware Cloud Foundation API Reference Guide",
++    "version": "9.0.0.0"
++  },
++  "operations": [
++    {
++      "operationId": "createToken",
++      "method": "POST",
++      "path": "/v1/tokens",
++      "successStatus": 201,
++      "responseSchema": "TokenPair",
++      "requestBody": {
++        "required": true,
++        "contentType": "application/json",
++        "schema": "TokenCreationSpec",
++        "properties": ["username", "password", "apiKey", "idToken"]
++      }
++    },
++    {
++      "operationId": "refreshAccessToken",
++      "method": "PATCH",
++      "path": "/v1/tokens/access-token/refresh",
++      "successStatus": 200,
++      "responseSchema": "string",
++      "requestBody": {
++        "required": true,
++        "contentType": "application/json",
++        "schema": "string",
++        "properties": []
++      }
++    },
++    {
++      "operationId": "getCredentials",
++      "method": "GET",
++      "path": "/v1/credentials",
++      "successStatus": 200,
++      "responseSchema": "PageOfCredential",
++      "queryParameters": [
++        { "name": "resourceName", "required": false },
++        { "name": "resourceIp", "required": false, "deprecated": true },
++        {
++          "name": "resourceType",
++          "required": false,
++          "allowedValues": [
++            "ESXI",
++            "VCENTER",
++            "PSC",
++            "NSXT_MANAGER",
++            "NSXT_EDGE",
++            "NSX_ALB",
++            "BACKUP"
++          ]
++        },
++        { "name": "domainName", "required": false },
++        { "name": "pageNumber", "required": false, "default": "0" },
++        { "name": "pageSize", "required": false, "default": "0" },
++        { "name": "accountType", "required": false }
++      ]
++    }
++  ]
++}
+diff --git a/docs/official_sources.json b/docs/official_sources.json
+new file mode 100644
+index 0000000..93e2d3f
+--- /dev/null
++++ b/docs/official_sources.json
+@@ -0,0 +1,14 @@
++{
++  "sources": [
++    {
++      "title": "VMware Cloud Foundation API Reference Guide 9.0.0.0 - SDDC Manager OpenAPI document",
++      "url": "https://github.com/vmware/vcf-api-specs/blob/85151f6b1bb58f13b6ac0304bfec53904bea085f/specifications/sddc-manager/sddc-manager-openapi.json",
++      "repository": "vmware/vcf-api-specs",
++      "license": "Apache-2.0",
++      "path": "specifications/sddc-manager/sddc-manager-openapi.json",
++      "tag": "9.0.0.0",
++      "commit": "85151f6b1bb58f13b6ac0304bfec53904bea085f",
++      "operationIds": ["createToken", "refreshAccessToken", "getCredentials"]
++    }
++  ]
++}
+diff --git a/pkg/client/client.go b/pkg/client/client.go
+new file mode 100644
+index 0000000..8110d85
+--- /dev/null
++++ b/pkg/client/client.go
+@@ -0,0 +1,329 @@
++// Package client talks to the SDDC Manager REST API of VMware Cloud
++// Foundation 9.0.
++//
++// It signs in with createToken, pages through getCredentials, and when the
++// access token expires part way through a listing it swaps in a fresh one with
++// refreshAccessToken and resumes at the page that failed, so no page already
++// collected is fetched twice and no page is skipped.
++package client
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++)
++
++// Config configures a Client.
++type Config struct {
++	// BaseURL is the SDDC Manager base URL, without a trailing slash.
++	BaseURL string
++	// Username and Password are used by createToken.
++	Username string
++	Password string
++	// HTTPClient is optional; a client with a 30s timeout is used when nil.
++	HTTPClient *http.Client
++}
++
++// Filter narrows a credential listing. Every field is optional: a field left
++// at its zero value is omitted from the request rather than sent empty.
++type Filter struct {
++	ResourceName string
++	ResourceType string
++	DomainName   string
++	AccountType  string
++	// PageSize is the requested page size. Zero omits the parameter, which
++	// leaves the server on its own default.
++	PageSize int
++}
++
++// Resource is the resource a credential belongs to.
++type Resource struct {
++	ResourceID   string   `json:"resourceId"`
++	ResourceName string   `json:"resourceName"`
++	ResourceType string   `json:"resourceType"`
++	DomainNames  []string `json:"domainNames"`
++}
++
++// Credential is one entry of a PageOfCredential response.
++type Credential struct {
++	ID             string   `json:"id"`
++	CredentialType string   `json:"credentialType"`
++	AccountType    string   `json:"accountType"`
++	Username       string   `json:"username"`
++	Resource       Resource `json:"resource"`
++}
++
++// Client is a SDDC Manager API client.
++type Client struct {
++	cfg  Config
++	http *http.Client
++
++	mu             sync.Mutex
++	accessToken    string
++	refreshTokenID string
++}
++
++// New builds a Client.
++func New(cfg Config) (*Client, error) {
++	if strings.TrimSpace(cfg.BaseURL) == "" {
++		return nil, errors.New("client: BaseURL is required")
++	}
++	if _, err := url.Parse(cfg.BaseURL); err != nil {
++		return nil, fmt.Errorf("client: BaseURL: %w", err)
++	}
++	if cfg.Username == "" || cfg.Password == "" {
++		return nil, errors.New("client: Username and Password are required")
++	}
++	httpClient := cfg.HTTPClient
++	if httpClient == nil {
++		httpClient = &http.Client{Timeout: 30 * time.Second}
++	}
++	cfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/")
++	return &Client{cfg: cfg, http: httpClient}, nil
++}
++
++// APIError is a non-success response from the API.
++type APIError struct {
++	Status      int
++	OperationID string
++	ErrorCode   string
++	Message     string
++}
++
++func (e *APIError) Error() string {
++	msg := e.Message
++	if msg == "" {
++		msg = http.StatusText(e.Status)
++	}
++	if e.ErrorCode != "" {
++		return fmt.Sprintf("%s: %d %s: %s", e.OperationID, e.Status, e.ErrorCode, msg)
++	}
++	return fmt.Sprintf("%s: %d: %s", e.OperationID, e.Status, msg)
++}
++
++// tokenCreationSpec is the TokenCreationSpec of the specification. Every field
++// is optional, so unset fields are dropped rather than sent as "".
++type tokenCreationSpec struct {
++	Username string `json:"username,omitempty"`
++	Password string `json:"password,omitempty"`
++	APIKey   string `json:"apiKey,omitempty"`
++	IDToken  string `json:"idToken,omitempty"`
++}
++
++type tokenPair struct {
++	AccessToken  string `json:"accessToken"`
++	RefreshToken struct {
++		ID string `json:"id"`
++	} `json:"refreshToken"`
++}
++
++type pageOfCredential struct {
++	Elements     []Credential `json:"elements"`
++	PageMetadata struct {
++		PageNumber    int `json:"pageNumber"`
++		PageSize      int `json:"pageSize"`
++		TotalElements int `json:"totalElements"`
++		TotalPages    int `json:"totalPages"`
++	} `json:"pageMetadata"`
++}
++
++// ListCredentials pages through getCredentials and returns every credential
++// matching the filter, in the order the API returned them.
++func (c *Client) ListCredentials(ctx context.Context, f Filter) ([]Credential, error) {
++	if err := c.ensureToken(ctx); err != nil {
++		return nil, err
++	}
++
++	var out []Credential
++	for page := 0; ; page++ {
++		gotPage, totalPages, err := c.credentialsPage(ctx, f, page)
++		if err != nil {
++			return nil, err
++		}
++		out = append(out, gotPage...)
++		if page+1 >= totalPages {
++			return out, nil
++		}
++	}
++}
++
++// credentialsPage fetches one page, refreshing the access token once if the
++// page is refused because the token expired. The refreshed attempt repeats the
++// same page, so the pages already collected are kept.
++func (c *Client) credentialsPage(ctx context.Context, f Filter, page int) ([]Credential, int, error) {
++	for attempt := 0; ; attempt++ {
++		req, err := c.newRequest(ctx, http.MethodGet, "/v1/credentials", pageQuery(f, page), nil)
++		if err != nil {
++			return nil, 0, err
++		}
++		req.Header.Set("Authorization", "Bearer "+c.token())
++
++		var body pageOfCredential
++		err = c.do(req, "getCredentials", &body)
++		if err == nil {
++			return body.Elements, body.PageMetadata.TotalPages, nil
++		}
++
++		var apiErr *APIError
++		if attempt == 0 && errors.As(err, &apiErr) && apiErr.Status == http.StatusUnauthorized {
++			if refreshErr := c.refresh(ctx); refreshErr != nil {
++				return nil, 0, fmt.Errorf("page %d: %w", page, refreshErr)
++			}
++			continue
++		}
++		return nil, 0, fmt.Errorf("page %d: %w", page, err)
++	}
++}
++
++// pageQuery builds the query string for one page. Optional parameters that are
++// unset are left out entirely.
++func pageQuery(f Filter, page int) url.Values {
++	q := url.Values{}
++	q.Set("pageNumber", strconv.Itoa(page))
++	if f.PageSize > 0 {
++		q.Set("pageSize", strconv.Itoa(f.PageSize))
++	}
++	if f.ResourceName != "" {
++		q.Set("resourceName", f.ResourceName)
++	}
++	if f.ResourceType != "" {
++		q.Set("resourceType", f.ResourceType)
++	}
++	if f.DomainName != "" {
++		q.Set("domainName", f.DomainName)
++	}
++	if f.AccountType != "" {
++		q.Set("accountType", f.AccountType)
++	}
++	return q
++}
++
++func (c *Client) ensureToken(ctx context.Context) error {
++	if c.token() != "" {
++		return nil
++	}
++	spec := tokenCreationSpec{Username: c.cfg.Username, Password: c.cfg.Password}
++	body, err := json.Marshal(spec)
++	if err != nil {
++		return fmt.Errorf("createToken: %w", err)
++	}
++	req, err := c.newRequest(ctx, http.MethodPost, "/v1/tokens", nil, body)
++	if err != nil {
++		return err
++	}
++
++	var pair tokenPair
++	if err := c.do(req, "createToken", &pair); err != nil {
++		return err
++	}
++	if pair.AccessToken == "" {
++		return errors.New("createToken: response carried no access token")
++	}
++
++	c.mu.Lock()
++	c.accessToken = pair.AccessToken
++	c.refreshTokenID = pair.RefreshToken.ID
++	c.mu.Unlock()
++	return nil
++}
++
++// refresh swaps the expired access token for a new one. The refresh token id
++// is sent as a bare JSON string, which is what the operation's request body is
++// defined as.
++func (c *Client) refresh(ctx context.Context) error {
++	c.mu.Lock()
++	id := c.refreshTokenID
++	c.mu.Unlock()
++	if id == "" {
++		return errors.New("refreshAccessToken: no refresh token id was issued")
++	}
++
++	body, err := json.Marshal(id)
++	if err != nil {
++		return fmt.Errorf("refreshAccessToken: %w", err)
++	}
++	req, err := c.newRequest(ctx, http.MethodPatch, "/v1/tokens/access-token/refresh", nil, body)
++	if err != nil {
++		return err
++	}
++
++	var token string
++	if err := c.do(req, "refreshAccessToken", &token); err != nil {
++		return err
++	}
++	if token == "" {
++		return errors.New("refreshAccessToken: response carried no access token")
++	}
++
++	c.mu.Lock()
++	c.accessToken = token
++	c.mu.Unlock()
++	return nil
++}
++
++func (c *Client) token() string {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return c.accessToken
++}
++
++func (c *Client) newRequest(ctx context.Context, method, path string, query url.Values, body []byte) (*http.Request, error) {
++	target := c.cfg.BaseURL + path
++	if encoded := query.Encode(); encoded != "" {
++		target += "?" + encoded
++	}
++	var reader io.Reader
++	if body != nil {
++		reader = bytes.NewReader(body)
++	}
++	req, err := http.NewRequestWithContext(ctx, method, target, reader)
++	if err != nil {
++		return nil, fmt.Errorf("client: build %s %s: %w", method, path, err)
++	}
++	req.Header.Set("Accept", "application/json")
++	if body != nil {
++		req.Header.Set("Content-Type", "application/json")
++	}
++	return req, nil
++}
++
++func (c *Client) do(req *http.Request, operationID string, out any) error {
++	resp, err := c.http.Do(req)
++	if err != nil {
++		return fmt.Errorf("%s: %w", operationID, err)
++	}
++	defer resp.Body.Close()
++
++	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<22))
++	if err != nil {
++		return fmt.Errorf("%s: read response: %w", operationID, err)
++	}
++	if resp.StatusCode < 200 || resp.StatusCode > 299 {
++		apiErr := &APIError{Status: resp.StatusCode, OperationID: operationID}
++		var payload struct {
++			ErrorCode string `json:"errorCode"`
++			Message   string `json:"message"`
++		}
++		if json.Unmarshal(raw, &payload) == nil {
++			apiErr.ErrorCode = payload.ErrorCode
++			apiErr.Message = payload.Message
++		}
++		return apiErr
++	}
++	if out == nil {
++		return nil
++	}
++	if err := json.Unmarshal(raw, out); err != nil {
++		return fmt.Errorf("%s: decode response: %w", operationID, err)
++	}
++	return nil
++}
+diff --git a/pkg/client/client_test.go b/pkg/client/client_test.go
+new file mode 100644
+index 0000000..2436dfe
+--- /dev/null
++++ b/pkg/client/client_test.go
+@@ -0,0 +1,234 @@
++package client
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strconv"
++	"strings"
++	"sync/atomic"
++	"testing"
++)
++
++func TestPageQueryOmitsUnsetOptionalParameters(t *testing.T) {
++	tests := []struct {
++		name   string
++		filter Filter
++		page   int
++		want   string
++	}{
++		{
++			name: "nothing set",
++			want: "pageNumber=0",
++		},
++		{
++			name:   "page size only",
++			filter: Filter{PageSize: 25},
++			page:   3,
++			want:   "pageNumber=3&pageSize=25",
++		},
++		{
++			name:   "resource type only",
++			filter: Filter{ResourceType: "ESXI"},
++			want:   "pageNumber=0&resourceType=ESXI",
++		},
++		{
++			name:   "domain name only",
++			filter: Filter{DomainName: "wld-01"},
++			want:   "domainName=wld-01&pageNumber=0",
++		},
++		{
++			name: "every field set",
++			filter: Filter{
++				ResourceName: "esxi-01.vrack.vsphere.local",
++				ResourceType: "ESXI",
++				DomainName:   "mgmt-domain",
++				AccountType:  "USER",
++				PageSize:     2,
++			},
++			want: "accountType=USER&domainName=mgmt-domain&pageNumber=0&pageSize=2&resourceName=esxi-01.vrack.vsphere.local&resourceType=ESXI",
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got := pageQuery(tt.filter, tt.page).Encode()
++			if got != tt.want {
++				t.Fatalf("query = %q, want %q", got, tt.want)
++			}
++			if strings.Contains(got, "=&") || strings.HasSuffix(got, "=") {
++				t.Errorf("query %q carries an empty parameter value", got)
++			}
++		})
++	}
++}
++
++func TestCreateTokenBodyDropsUnusedCredentialKinds(t *testing.T) {
++	tests := []struct {
++		name string
++		spec tokenCreationSpec
++		want string
++	}{
++		{
++			name: "password grant",
++			spec: tokenCreationSpec{Username: "administrator@vsphere.local", Password: "secret"},
++			want: `{"username":"administrator@vsphere.local","password":"secret"}`,
++		},
++		{
++			name: "api key grant",
++			spec: tokenCreationSpec{APIKey: "key"},
++			want: `{"apiKey":"key"}`,
++		},
++		{
++			name: "empty spec",
++			spec: tokenCreationSpec{},
++			want: `{}`,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			got, err := json.Marshal(tt.spec)
++			if err != nil {
++				t.Fatalf("marshal: %v", err)
++			}
++			if string(got) != tt.want {
++				t.Fatalf("body = %s, want %s", got, tt.want)
++			}
++		})
++	}
++}
++
++func TestNewRejectsIncompleteConfig(t *testing.T) {
++	tests := []struct {
++		name string
++		cfg  Config
++	}{
++		{"no base url", Config{Username: "u", Password: "p"}},
++		{"blank base url", Config{BaseURL: "   ", Username: "u", Password: "p"}},
++		{"no username", Config{BaseURL: "http://127.0.0.1:8080", Password: "p"}},
++		{"no password", Config{BaseURL: "http://127.0.0.1:8080", Username: "u"}},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if _, err := New(tt.cfg); err == nil {
++				t.Fatal("expected an error")
++			}
++		})
++	}
++}
++
++// stub is a minimal hand-rolled endpoint used to drive the client through
++// paths the pinned mock does not produce.
++type stub struct {
++	pages    int
++	fail     int // page number answered 401 while the first token is presented
++	refreshN atomic.Int64
++}
++
++func (s *stub) handler() http.HandlerFunc {
++	return func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		switch {
++		case r.Method == http.MethodPost && r.URL.Path == "/v1/tokens":
++			w.WriteHeader(http.StatusCreated)
++			_ = json.NewEncoder(w).Encode(map[string]any{
++				"accessToken":  "first",
++				"refreshToken": map[string]string{"id": "rt"},
++			})
++		case r.Method == http.MethodPatch && r.URL.Path == "/v1/tokens/access-token/refresh":
++			s.refreshN.Add(1)
++			_ = json.NewEncoder(w).Encode("second")
++		case r.Method == http.MethodGet && r.URL.Path == "/v1/credentials":
++			page := r.URL.Query().Get("pageNumber")
++			if page == s.pageString(s.fail) && r.Header.Get("Authorization") == "Bearer first" {
++				w.WriteHeader(http.StatusUnauthorized)
++				_ = json.NewEncoder(w).Encode(map[string]string{"errorCode": "TOKEN_EXPIRED"})
++				return
++			}
++			_ = json.NewEncoder(w).Encode(map[string]any{
++				"elements": []map[string]any{{"id": "cred-" + page}},
++				"pageMetadata": map[string]int{
++					"pageNumber": 0, "pageSize": 1, "totalElements": s.pages, "totalPages": s.pages,
++				},
++			})
++		default:
++			w.WriteHeader(http.StatusNotFound)
++			_ = json.NewEncoder(w).Encode(map[string]string{"errorCode": "NOT_FOUND"})
++		}
++	}
++}
++
++func (s *stub) pageString(n int) string {
++	return strconv.Itoa(n)
++}
++
++func TestListCredentialsResumesAfterRefresh(t *testing.T) {
++	tests := []struct {
++		name    string
++		pages   int
++		failOn  int
++		wantIDs []string
++	}{
++		{"expires on the first page", 3, 0, []string{"cred-0", "cred-1", "cred-2"}},
++		{"expires mid listing", 4, 2, []string{"cred-0", "cred-1", "cred-2", "cred-3"}},
++		{"expires on the last page", 3, 2, []string{"cred-0", "cred-1", "cred-2"}},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			s := &stub{pages: tt.pages, fail: tt.failOn}
++			srv := httptest.NewServer(s.handler())
++			defer srv.Close()
++
++			c, err := New(Config{BaseURL: srv.URL, Username: "u", Password: "p"})
++			if err != nil {
++				t.Fatalf("new client: %v", err)
++			}
++			got, err := c.ListCredentials(context.Background(), Filter{PageSize: 1})
++			if err != nil {
++				t.Fatalf("ListCredentials: %v", err)
++			}
++			if len(got) != len(tt.wantIDs) {
++				t.Fatalf("collected %d credentials, want %d", len(got), len(tt.wantIDs))
++			}
++			for i, want := range tt.wantIDs {
++				if got[i].ID != want {
++					t.Fatalf("credential ids = %v, want %v", got, tt.wantIDs)
++				}
++			}
++			if got := s.refreshN.Load(); got != 1 {
++				t.Errorf("refreshed %d times, want 1", got)
++			}
++		})
++	}
++}
++
++func TestListCredentialsFailsWhenRefreshDoesNotHelp(t *testing.T) {
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		switch r.URL.Path {
++		case "/v1/tokens":
++			w.WriteHeader(http.StatusCreated)
++			_ = json.NewEncoder(w).Encode(map[string]any{
++				"accessToken": "first", "refreshToken": map[string]string{"id": "rt"},
++			})
++		case "/v1/tokens/access-token/refresh":
++			_ = json.NewEncoder(w).Encode("second")
++		default:
++			w.WriteHeader(http.StatusUnauthorized)
++			_ = json.NewEncoder(w).Encode(map[string]string{"errorCode": "TOKEN_EXPIRED"})
++		}
++	}))
++	defer srv.Close()
++
++	c, err := New(Config{BaseURL: srv.URL, Username: "u", Password: "p"})
++	if err != nil {
++		t.Fatalf("new client: %v", err)
++	}
++	if _, err := c.ListCredentials(context.Background(), Filter{PageSize: 1}); err == nil {
++		t.Fatal("expected an error when the refreshed token is refused too")
++	}
++}
+diff --git a/pkg/mock/mock.go b/pkg/mock/mock.go
+new file mode 100644
+index 0000000..5682345
+--- /dev/null
++++ b/pkg/mock/mock.go
+@@ -0,0 +1,500 @@
++// Package mock serves a loopback stand-in for the SDDC Manager REST API.
++//
++// The server is pinned to docs/contract.json: it routes only the operations
++// the contract names, accepts only the query parameters the contract lists,
++// and rejects anything else. Every request it sees is appended to a log the
++// caller can read back.
++package mock
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/url"
++	"os"
++	"strconv"
++	"strings"
++	"sync"
++)
++
++// Config configures a mock server.
++type Config struct {
++	// ContractPath is the docs/contract.json the server is pinned to.
++	ContractPath string
++	// FixturePath is the JSON array of credentials the server pages over.
++	FixturePath string
++	// Username and Password are the only credentials createToken accepts.
++	Username string
++	Password string
++	// AccessToken is the access token createToken hands out.
++	AccessToken string
++	// RefreshedToken is the access token refreshAccessToken hands out.
++	RefreshedToken string
++	// RefreshTokenID is the refresh token id createToken hands out and
++	// refreshAccessToken expects back.
++	RefreshTokenID string
++	// ExpireAfter is how many getCredentials requests are answered 200 while
++	// bearing AccessToken. Every later request bearing AccessToken is answered
++	// 401.
++	ExpireAfter int
++}
++
++// Request is one logged request.
++type Request struct {
++	// Index is the position of this request in the log.
++	Index int
++	// OperationID is the contract operation the request matched, or "" when it
++	// matched none.
++	OperationID string
++	Method      string
++	Path        string
++	RawQuery    string
++	Header      http.Header
++	Body        []byte
++	// Status is the status code the server answered with.
++	Status int
++}
++
++func (r Request) clone() Request {
++	out := r
++	out.Header = r.Header.Clone()
++	out.Body = append([]byte(nil), r.Body...)
++	return out
++}
++
++// Server is a running mock.
++type Server struct {
++	cfg      Config
++	routes   map[string]string // "METHOD PATH" -> operationId
++	allowed  map[string]map[string]bool
++	fixture  []credential
++	listener net.Listener
++	srv      *http.Server
++	url      string
++
++	mu       sync.Mutex
++	log      []Request
++	served   int  // getCredentials requests answered 200 with the initial token
++	refresh  bool // a refresh has happened
++	closed   bool
++	closeErr error
++}
++
++type credential struct {
++	ID                    string   `json:"id"`
++	CredentialType        string   `json:"credentialType"`
++	AccountType           string   `json:"accountType"`
++	Username              string   `json:"username"`
++	CreationTimestamp     string   `json:"creationTimestamp"`
++	ModificationTimestamp string   `json:"modificationTimestamp"`
++	Resource              resource `json:"resource"`
++}
++
++type resource struct {
++	ResourceID   string   `json:"resourceId"`
++	ResourceName string   `json:"resourceName"`
++	ResourceType string   `json:"resourceType"`
++	DomainNames  []string `json:"domainNames"`
++}
++
++type contractDoc struct {
++	Operations []struct {
++		OperationID     string `json:"operationId"`
++		Method          string `json:"method"`
++		Path            string `json:"path"`
++		QueryParameters []struct {
++			Name string `json:"name"`
++		} `json:"queryParameters"`
++	} `json:"operations"`
++}
++
++// New starts a mock server on the loopback interface.
++func New(cfg Config) (*Server, error) {
++	if cfg.ContractPath == "" {
++		return nil, errors.New("mock: ContractPath is required")
++	}
++	if cfg.FixturePath == "" {
++		return nil, errors.New("mock: FixturePath is required")
++	}
++	if cfg.AccessToken == "" || cfg.RefreshedToken == "" || cfg.RefreshTokenID == "" {
++		return nil, errors.New("mock: AccessToken, RefreshedToken and RefreshTokenID are required")
++	}
++
++	routes, allowed, err := loadContract(cfg.ContractPath)
++	if err != nil {
++		return nil, err
++	}
++	fixture, err := loadFixture(cfg.FixturePath)
++	if err != nil {
++		return nil, err
++	}
++
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		return nil, fmt.Errorf("mock: listen: %w", err)
++	}
++
++	s := &Server{
++		cfg:      cfg,
++		routes:   routes,
++		allowed:  allowed,
++		fixture:  fixture,
++		listener: ln,
++		url:      "http://" + ln.Addr().String(),
++	}
++	s.srv = &http.Server{Handler: http.HandlerFunc(s.serve)}
++	go func() { _ = s.srv.Serve(ln) }()
++	return s, nil
++}
++
++func loadContract(path string) (map[string]string, map[string]map[string]bool, error) {
++	raw, err := os.ReadFile(path)
++	if err != nil {
++		return nil, nil, fmt.Errorf("mock: read contract: %w", err)
++	}
++	var doc contractDoc
++	if err := json.Unmarshal(raw, &doc); err != nil {
++		return nil, nil, fmt.Errorf("mock: parse contract: %w", err)
++	}
++	if len(doc.Operations) == 0 {
++		return nil, nil, errors.New("mock: contract names no operations")
++	}
++	routes := make(map[string]string, len(doc.Operations))
++	allowed := make(map[string]map[string]bool, len(doc.Operations))
++	for _, op := range doc.Operations {
++		if op.OperationID == "" || op.Method == "" || op.Path == "" {
++			return nil, nil, errors.New("mock: contract operation is missing operationId, method or path")
++		}
++		routes[strings.ToUpper(op.Method)+" "+op.Path] = op.OperationID
++		names := make(map[string]bool, len(op.QueryParameters))
++		for _, p := range op.QueryParameters {
++			names[p.Name] = true
++		}
++		allowed[op.OperationID] = names
++	}
++	return routes, allowed, nil
++}
++
++func loadFixture(path string) ([]credential, error) {
++	raw, err := os.ReadFile(path)
++	if err != nil {
++		return nil, fmt.Errorf("mock: read fixture: %w", err)
++	}
++	var creds []credential
++	if err := json.Unmarshal(raw, &creds); err != nil {
++		return nil, fmt.Errorf("mock: parse fixture: %w", err)
++	}
++	return creds, nil
++}
++
++// URL is the base URL the server listens on.
++func (s *Server) URL() string { return s.url }
++
++// Requests returns a snapshot of the request log, in the order the requests
++// arrived. Mutating the result does not affect the server.
++func (s *Server) Requests() []Request {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	out := make([]Request, len(s.log))
++	for i, r := range s.log {
++		out[i] = r.clone()
++	}
++	return out
++}
++
++// Close shuts the server down.
++func (s *Server) Close() {
++	s.mu.Lock()
++	if s.closed {
++		s.mu.Unlock()
++		return
++	}
++	s.closed = true
++	s.mu.Unlock()
++	_ = s.srv.Close()
++}
++
++// apiError is the Error schema of the specification, reduced to the fields the
++// mock fills in.
++type apiError struct {
++	ErrorCode string `json:"errorCode"`
++	ErrorType string `json:"errorType"`
++	Message   string `json:"message"`
++}
++
++type pageMetadata struct {
++	PageNumber    int `json:"pageNumber"`
++	PageSize      int `json:"pageSize"`
++	TotalElements int `json:"totalElements"`
++	TotalPages    int `json:"totalPages"`
++}
++
++type pageOfCredential struct {
++	Elements     []credential `json:"elements"`
++	PageMetadata pageMetadata `json:"pageMetadata"`
++}
++
++type tokenPair struct {
++	AccessToken  string       `json:"accessToken"`
++	RefreshToken refreshToken `json:"refreshToken"`
++}
++
++type refreshToken struct {
++	ID string `json:"id"`
++}
++
++// reply is what a handler decided to send back.
++type reply struct {
++	status int
++	body   any
++}
++
++func errorReply(status int, code, message string) reply {
++	return reply{status: status, body: apiError{
++		ErrorCode: code,
++		ErrorType: http.StatusText(status),
++		Message:   message,
++	}}
++}
++
++func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
++	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
++	if err != nil {
++		body = nil
++	}
++	_ = r.Body.Close()
++
++	operationID := s.routes[r.Method+" "+r.URL.Path]
++
++	var res reply
++	switch operationID {
++	case "":
++		res = errorReply(http.StatusNotFound, "NOT_FOUND",
++			fmt.Sprintf("%s %s is not part of the pinned contract", r.Method, r.URL.Path))
++	case "createToken":
++		res = s.createToken(body, r)
++	case "refreshAccessToken":
++		res = s.refreshAccessToken(body, r)
++	case "getCredentials":
++		res = s.getCredentials(r)
++	default:
++		res = errorReply(http.StatusNotImplemented, "NOT_IMPLEMENTED",
++			fmt.Sprintf("operation %s is named by the contract but not served", operationID))
++	}
++
++	s.mu.Lock()
++	s.log = append(s.log, Request{
++		Index:       len(s.log),
++		OperationID: operationID,
++		Method:      r.Method,
++		Path:        r.URL.Path,
++		RawQuery:    r.URL.RawQuery,
++		Header:      r.Header.Clone(),
++		Body:        append([]byte(nil), body...),
++		Status:      res.status,
++	})
++	s.mu.Unlock()
++
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(res.status)
++	if res.body != nil {
++		_ = json.NewEncoder(w).Encode(res.body)
++	}
++}
++
++func requireJSON(r *http.Request) *reply {
++	if ct := r.Header.Get("Content-Type"); ct != "application/json" {
++		res := errorReply(http.StatusBadRequest, "BAD_REQUEST",
++			fmt.Sprintf("Content-Type %q, want application/json", ct))
++		return &res
++	}
++	return nil
++}
++
++func (s *Server) createToken(body []byte, r *http.Request) reply {
++	if bad := requireJSON(r); bad != nil {
++		return *bad
++	}
++	var fields map[string]json.RawMessage
++	if err := json.Unmarshal(body, &fields); err != nil {
++		return errorReply(http.StatusBadRequest, "BAD_REQUEST", "body is not a TokenCreationSpec")
++	}
++	for name := range fields {
++		switch name {
++		case "username", "password", "apiKey", "idToken":
++		default:
++			return errorReply(http.StatusBadRequest, "BAD_REQUEST",
++				fmt.Sprintf("TokenCreationSpec has no field %q", name))
++		}
++	}
++	var spec struct {
++		Username string `json:"username"`
++		Password string `json:"password"`
++	}
++	if err := json.Unmarshal(body, &spec); err != nil {
++		return errorReply(http.StatusBadRequest, "BAD_REQUEST", "body is not a TokenCreationSpec")
++	}
++	if spec.Username != s.cfg.Username || spec.Password != s.cfg.Password {
++		return errorReply(http.StatusBadRequest, "BAD_CREDENTIALS", "username or password is incorrect")
++	}
++	return reply{status: http.StatusCreated, body: tokenPair{
++		AccessToken:  s.cfg.AccessToken,
++		RefreshToken: refreshToken{ID: s.cfg.RefreshTokenID},
++	}}
++}
++
++func (s *Server) refreshAccessToken(body []byte, r *http.Request) reply {
++	if bad := requireJSON(r); bad != nil {
++		return *bad
++	}
++	var id string
++	if err := json.Unmarshal(body, &id); err != nil {
++		return errorReply(http.StatusBadRequest, "BAD_REQUEST",
++			"body must be a JSON string holding the refresh token id")
++	}
++	if id != s.cfg.RefreshTokenID {
++		return errorReply(http.StatusNotFound, "REFRESH_TOKEN_NOT_FOUND", "refresh token id is not known")
++	}
++	s.mu.Lock()
++	s.refresh = true
++	s.mu.Unlock()
++	return reply{status: http.StatusOK, body: s.cfg.RefreshedToken}
++}
++
++func (s *Server) getCredentials(r *http.Request) reply {
++	if bad := s.authorize(r); bad != nil {
++		return *bad
++	}
++	values, err := url.ParseQuery(r.URL.RawQuery)
++	if err != nil {
++		return errorReply(http.StatusBadRequest, "BAD_REQUEST", "query string is malformed")
++	}
++	allowed := s.allowed["getCredentials"]
++	for name, vals := range values {
++		if !allowed[name] {
++			return errorReply(http.StatusBadRequest, "BAD_REQUEST",
++				fmt.Sprintf("getCredentials has no query parameter %q", name))
++		}
++		if len(vals) > 1 {
++			return errorReply(http.StatusBadRequest, "BAD_REQUEST",
++				fmt.Sprintf("query parameter %q is repeated", name))
++		}
++		if vals[0] == "" {
++			return errorReply(http.StatusBadRequest, "BAD_REQUEST",
++				fmt.Sprintf("query parameter %q was sent empty; omit it instead", name))
++		}
++	}
++
++	pageNumber, bad := positiveInt(values, "pageNumber")
++	if bad != nil {
++		return *bad
++	}
++	pageSize, bad := positiveInt(values, "pageSize")
++	if bad != nil {
++		return *bad
++	}
++
++	matched := make([]credential, 0, len(s.fixture))
++	for _, c := range s.fixture {
++		if v := values.Get("resourceType"); v != "" && c.Resource.ResourceType != v {
++			continue
++		}
++		if v := values.Get("resourceName"); v != "" && c.Resource.ResourceName != v {
++			continue
++		}
++		if v := values.Get("accountType"); v != "" && c.AccountType != v {
++			continue
++		}
++		if v := values.Get("domainName"); v != "" && !contains(c.Resource.DomainNames, v) {
++			continue
++		}
++		matched = append(matched, c)
++	}
++
++	total := len(matched)
++	totalPages := 1
++	if pageSize > 0 {
++		totalPages = (total + pageSize - 1) / pageSize
++	}
++	if total == 0 {
++		totalPages = 0
++	}
++
++	elements := matched
++	if pageSize > 0 {
++		start := pageNumber * pageSize
++		if start > total {
++			start = total
++		}
++		end := start + pageSize
++		if end > total {
++			end = total
++		}
++		elements = matched[start:end]
++	} else if pageNumber > 0 {
++		elements = nil
++	}
++
++	return reply{status: http.StatusOK, body: pageOfCredential{
++		Elements: elements,
++		PageMetadata: pageMetadata{
++			PageNumber:    pageNumber,
++			PageSize:      len(elements),
++			TotalElements: total,
++			TotalPages:    totalPages,
++		},
++	}}
++}
++
++func (s *Server) authorize(r *http.Request) *reply {
++	header := r.Header.Get("Authorization")
++	token, ok := strings.CutPrefix(header, "Bearer ")
++	if !ok || token == "" {
++		res := errorReply(http.StatusUnauthorized, "UNAUTHENTICATED",
++			"a Bearer access token is required")
++		return &res
++	}
++
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	switch token {
++	case s.cfg.RefreshedToken:
++		return nil
++	case s.cfg.AccessToken:
++		if s.served >= s.cfg.ExpireAfter {
++			res := errorReply(http.StatusUnauthorized, "TOKEN_EXPIRED", "the access token has expired")
++			return &res
++		}
++		s.served++
++		return nil
++	default:
++		res := errorReply(http.StatusUnauthorized, "UNAUTHENTICATED", "the access token is not recognised")
++		return &res
++	}
++}
++
++func positiveInt(values url.Values, name string) (int, *reply) {
++	raw := values.Get(name)
++	if raw == "" {
++		return 0, nil
++	}
++	n, err := strconv.Atoi(raw)
++	if err != nil || n < 0 {
++		res := errorReply(http.StatusBadRequest, "BAD_REQUEST",
++			fmt.Sprintf("query parameter %q must be a non-negative number, got %q", name, raw))
++		return 0, &res
++	}
++	return n, nil
++}
++
++func contains(haystack []string, needle string) bool {
++	for _, s := range haystack {
++		if s == needle {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/pkg/mock/mock_test.go b/pkg/mock/mock_test.go
+new file mode 100644
+index 0000000..5b4961a
+--- /dev/null
++++ b/pkg/mock/mock_test.go
+@@ -0,0 +1,266 @@
++package mock
++
++import (
++	"encoding/json"
++	"io"
++	"net/http"
++	"strings"
++	"testing"
++)
++
++const (
++	testUser       = "administrator@vsphere.local"
++	testPass       = "VMw@re1!VMw@re1!"
++	testAccess     = "access-1"
++	testRefreshed  = "access-2"
++	testRefreshID  = "refresh-1"
++	contractPath   = "../../docs/contract.json"
++	fixturePath    = "../../testdata/credentials.json"
++	authorization  = "Authorization"
++	jsonContent    = "application/json"
++	contentTypeHdr = "Content-Type"
++)
++
++func newTestServer(t *testing.T, expireAfter int) *Server {
++	t.Helper()
++	s, err := New(Config{
++		ContractPath:   contractPath,
++		FixturePath:    fixturePath,
++		Username:       testUser,
++		Password:       testPass,
++		AccessToken:    testAccess,
++		RefreshedToken: testRefreshed,
++		RefreshTokenID: testRefreshID,
++		ExpireAfter:    expireAfter,
++	})
++	if err != nil {
++		t.Fatalf("new server: %v", err)
++	}
++	t.Cleanup(s.Close)
++	return s
++}
++
++func send(t *testing.T, s *Server, method, target, body string, header map[string]string) *http.Response {
++	t.Helper()
++	var reader io.Reader
++	if body != "" {
++		reader = strings.NewReader(body)
++	}
++	req, err := http.NewRequest(method, s.URL()+target, reader)
++	if err != nil {
++		t.Fatalf("build request: %v", err)
++	}
++	for k, v := range header {
++		req.Header.Set(k, v)
++	}
++	resp, err := http.DefaultClient.Do(req)
++	if err != nil {
++		t.Fatalf("%s %s: %v", method, target, err)
++	}
++	t.Cleanup(func() { resp.Body.Close() })
++	return resp
++}
++
++func TestNewRejectsIncompleteConfig(t *testing.T) {
++	tests := []struct {
++		name string
++		cfg  Config
++	}{
++		{"no contract", Config{FixturePath: fixturePath, AccessToken: "a", RefreshedToken: "b", RefreshTokenID: "c"}},
++		{"no fixture", Config{ContractPath: contractPath, AccessToken: "a", RefreshedToken: "b", RefreshTokenID: "c"}},
++		{"no tokens", Config{ContractPath: contractPath, FixturePath: fixturePath}},
++		{"contract missing", Config{ContractPath: "does-not-exist.json", FixturePath: fixturePath, AccessToken: "a", RefreshedToken: "b", RefreshTokenID: "c"}},
++		{"fixture missing", Config{ContractPath: contractPath, FixturePath: "does-not-exist.json", AccessToken: "a", RefreshedToken: "b", RefreshTokenID: "c"}},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			s, err := New(tt.cfg)
++			if err == nil {
++				s.Close()
++				t.Fatal("expected an error")
++			}
++		})
++	}
++}
++
++func TestRoutingIsPinnedToTheContract(t *testing.T) {
++	bearer := map[string]string{authorization: "Bearer " + testAccess}
++	jsonBody := map[string]string{contentTypeHdr: jsonContent}
++
++	tests := []struct {
++		name       string
++		method     string
++		target     string
++		body       string
++		header     map[string]string
++		wantStatus int
++		wantOpID   string
++	}{
++		{"createToken", http.MethodPost, "/v1/tokens", `{"username":"` + testUser + `","password":"` + testPass + `"}`, jsonBody, http.StatusCreated, "createToken"},
++		{"createToken with a bad password", http.MethodPost, "/v1/tokens", `{"username":"` + testUser + `","password":"nope"}`, jsonBody, http.StatusBadRequest, "createToken"},
++		{"createToken with an unknown field", http.MethodPost, "/v1/tokens", `{"username":"u","password":"p","tenant":"t"}`, jsonBody, http.StatusBadRequest, "createToken"},
++		{"createToken without a json content type", http.MethodPost, "/v1/tokens", `{}`, nil, http.StatusBadRequest, "createToken"},
++		{"refreshAccessToken", http.MethodPatch, "/v1/tokens/access-token/refresh", `"` + testRefreshID + `"`, jsonBody, http.StatusOK, "refreshAccessToken"},
++		{"refreshAccessToken with an unknown id", http.MethodPatch, "/v1/tokens/access-token/refresh", `"other"`, jsonBody, http.StatusNotFound, "refreshAccessToken"},
++		{"refreshAccessToken with an object body", http.MethodPatch, "/v1/tokens/access-token/refresh", `{"id":"` + testRefreshID + `"}`, jsonBody, http.StatusBadRequest, "refreshAccessToken"},
++		{"getCredentials", http.MethodGet, "/v1/credentials?pageNumber=0", "", bearer, http.StatusOK, "getCredentials"},
++		{"getCredentials without a token", http.MethodGet, "/v1/credentials?pageNumber=0", "", nil, http.StatusUnauthorized, "getCredentials"},
++		{"getCredentials with an unknown token", http.MethodGet, "/v1/credentials?pageNumber=0", "", map[string]string{authorization: "Bearer nope"}, http.StatusUnauthorized, "getCredentials"},
++		{"getCredentials with a basic auth header", http.MethodGet, "/v1/credentials?pageNumber=0", "", map[string]string{authorization: "Basic abc"}, http.StatusUnauthorized, "getCredentials"},
++		{"getCredentials with an unknown parameter", http.MethodGet, "/v1/credentials?tenant=a", "", bearer, http.StatusBadRequest, "getCredentials"},
++		{"getCredentials with an empty parameter", http.MethodGet, "/v1/credentials?resourceType=", "", bearer, http.StatusBadRequest, "getCredentials"},
++		{"getCredentials with a repeated parameter", http.MethodGet, "/v1/credentials?pageNumber=0&pageNumber=1", "", bearer, http.StatusBadRequest, "getCredentials"},
++		{"getCredentials with a negative page", http.MethodGet, "/v1/credentials?pageNumber=-1", "", bearer, http.StatusBadRequest, "getCredentials"},
++		{"an operation the contract does not name", http.MethodGet, "/v1/domains", "", bearer, http.StatusNotFound, ""},
++		{"a method the contract does not name", http.MethodPatch, "/v1/credentials", `{}`, jsonBody, http.StatusNotFound, ""},
++		{"the root", http.MethodGet, "/", "", nil, http.StatusNotFound, ""},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			s := newTestServer(t, 1000)
++			resp := send(t, s, tt.method, tt.target, tt.body, tt.header)
++			if resp.StatusCode != tt.wantStatus {
++				t.Errorf("status = %d, want %d", resp.StatusCode, tt.wantStatus)
++			}
++			log := s.Requests()
++			if len(log) != 1 {
++				t.Fatalf("request log has %d entries, want 1", len(log))
++			}
++			if log[0].OperationID != tt.wantOpID {
++				t.Errorf("operationId = %q, want %q", log[0].OperationID, tt.wantOpID)
++			}
++			if log[0].Status != tt.wantStatus {
++				t.Errorf("logged status = %d, want %d", log[0].Status, tt.wantStatus)
++			}
++			if log[0].Index != 0 {
++				t.Errorf("index = %d, want 0", log[0].Index)
++			}
++		})
++	}
++}
++
++func TestPagingAndFiltering(t *testing.T) {
++	tests := []struct {
++		name          string
++		query         string
++		wantIDSuffix  []string
++		wantTotal     int
++		wantTotalPage int
++	}{
++		{"everything on one page", "pageNumber=0", nil, 12, 1},
++		{"first page of two", "pageNumber=0&pageSize=6", nil, 12, 2},
++		{"second page of two", "pageNumber=1&pageSize=6", nil, 12, 2},
++		{"filtered by resource type", "pageNumber=0&resourceType=ESXI", nil, 8, 1},
++		{"filtered by account type", "pageNumber=0&accountType=SYSTEM", nil, 2, 1},
++		{"filtered by domain", "pageNumber=0&domainName=wld-02", nil, 2, 1},
++		{"filtered by resource name", "pageNumber=0&resourceName=esxi-01.vrack.vsphere.local", nil, 1, 1},
++		{"filter matching nothing", "pageNumber=0&resourceType=NSX_ALB", nil, 0, 0},
++		{"page past the end", "pageNumber=9&pageSize=6", nil, 12, 2},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			s := newTestServer(t, 1000)
++			resp := send(t, s, http.MethodGet, "/v1/credentials?"+tt.query, "",
++				map[string]string{authorization: "Bearer " + testAccess})
++			if resp.StatusCode != http.StatusOK {
++				t.Fatalf("status = %d, want 200", resp.StatusCode)
++			}
++			var page struct {
++				Elements     []credential `json:"elements"`
++				PageMetadata pageMetadata `json:"pageMetadata"`
++			}
++			if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
++				t.Fatalf("decode: %v", err)
++			}
++			if page.PageMetadata.TotalElements != tt.wantTotal {
++				t.Errorf("totalElements = %d, want %d", page.PageMetadata.TotalElements, tt.wantTotal)
++			}
++			if page.PageMetadata.TotalPages != tt.wantTotalPage {
++				t.Errorf("totalPages = %d, want %d", page.PageMetadata.TotalPages, tt.wantTotalPage)
++			}
++			if page.PageMetadata.PageSize != len(page.Elements) {
++				t.Errorf("pageSize = %d, but the page carried %d elements", page.PageMetadata.PageSize, len(page.Elements))
++			}
++		})
++	}
++}
++
++func TestAccessTokenExpiresAfterTheConfiguredNumberOfRequests(t *testing.T) {
++	tests := []struct {
++		name        string
++		expireAfter int
++		wantStatus  []int
++	}{
++		{"never used before expiry", 0, []int{http.StatusUnauthorized}},
++		{"one good request", 1, []int{http.StatusOK, http.StatusUnauthorized}},
++		{"three good requests", 3, []int{http.StatusOK, http.StatusOK, http.StatusOK, http.StatusUnauthorized}},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			s := newTestServer(t, tt.expireAfter)
++			for i, want := range tt.wantStatus {
++				resp := send(t, s, http.MethodGet, "/v1/credentials?pageNumber=0", "",
++					map[string]string{authorization: "Bearer " + testAccess})
++				if resp.StatusCode != want {
++					t.Fatalf("request %d: status = %d, want %d", i, resp.StatusCode, want)
++				}
++			}
++			// The refreshed token is always accepted.
++			resp := send(t, s, http.MethodGet, "/v1/credentials?pageNumber=0", "",
++				map[string]string{authorization: "Bearer " + testRefreshed})
++			if resp.StatusCode != http.StatusOK {
++				t.Fatalf("refreshed token: status = %d, want 200", resp.StatusCode)
++			}
++		})
++	}
++}
++
++func TestRefreshReturnsABareJSONString(t *testing.T) {
++	s := newTestServer(t, 0)
++	resp := send(t, s, http.MethodPatch, "/v1/tokens/access-token/refresh", `"`+testRefreshID+`"`,
++		map[string]string{contentTypeHdr: jsonContent})
++	if resp.StatusCode != http.StatusOK {
++		t.Fatalf("status = %d, want 200", resp.StatusCode)
++	}
++	raw, err := io.ReadAll(resp.Body)
++	if err != nil {
++		t.Fatalf("read: %v", err)
++	}
++	var token string
++	if err := json.Unmarshal([]byte(strings.TrimSpace(string(raw))), &token); err != nil {
++		t.Fatalf("response %q is not a bare JSON string: %v", raw, err)
++	}
++	if token != testRefreshed {
++		t.Errorf("token = %q, want %q", token, testRefreshed)
++	}
++}
++
++func TestRequestsReturnsAnIndependentSnapshot(t *testing.T) {
++	s := newTestServer(t, 1000)
++	send(t, s, http.MethodPost, "/v1/tokens", `{"username":"`+testUser+`","password":"`+testPass+`"}`,
++		map[string]string{contentTypeHdr: jsonContent})
++
++	first := s.Requests()
++	if len(first) != 1 {
++		t.Fatalf("request log has %d entries, want 1", len(first))
++	}
++	body := string(first[0].Body)
++	first[0].Body[0] = '#'
++	first[0].Header.Set(contentTypeHdr, "text/plain")
++	first[0].OperationID = "tampered"
++
++	second := s.Requests()
++	if string(second[0].Body) != body {
++		t.Error("the logged body can be mutated through the returned snapshot")
++	}
++	if second[0].Header.Get(contentTypeHdr) != jsonContent {
++		t.Error("the logged headers can be mutated through the returned snapshot")
++	}
++	if second[0].OperationID != "createToken" {
++		t.Error("the logged operationId can be mutated through the returned snapshot")
++	}
++}

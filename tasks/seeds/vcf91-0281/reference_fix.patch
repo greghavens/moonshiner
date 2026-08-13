@@ -1,0 +1,666 @@
+diff --git a/src/VcfOpsCredentialRotator.java b/src/VcfOpsCredentialRotator.java
+index a131a89..bafe1a4 100644
+--- a/src/VcfOpsCredentialRotator.java
++++ b/src/VcfOpsCredentialRotator.java
+@@ -1,3 +1,14 @@
++import java.io.IOException;
++import java.math.BigDecimal;
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.time.Duration;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
+ 
+@@ -20,10 +31,24 @@ import java.util.Map;
+  */
+ public final class VcfOpsCredentialRotator {
+ 
++    /** servers[0].url in the specification. */
++    private static final String BASE_PATH = "/suite-api";
++
++    /** Value prefix for the Token-based-authorization security scheme. */
++    private static final String AUTH_PREFIX = "OpsToken ";
++
++    private static final String JSON = "application/json";
++
++    /** Pause between drain polls, so a wedged rotation does not spin. */
++    private static final Duration DRAIN_INTERVAL = Duration.ofMillis(100);
++
+     private final String baseUrl;
+     private final String username;
+     private final String password;
+     private final String authSource;
++    private final HttpClient http;
++
++    private String token;
+ 
+     /**
+      * @param baseUrl    origin of the VCF Operations node, e.g.
+@@ -36,16 +61,26 @@ public final class VcfOpsCredentialRotator {
+      */
+     public VcfOpsCredentialRotator(String baseUrl, String username,
+                                    String password, String authSource) {
+-        this.baseUrl = baseUrl;
++        this.baseUrl = stripTrailingSlash(baseUrl);
+         this.username = username;
+         this.password = password;
+         this.authSource = authSource;
++        this.http = HttpClient.newBuilder()
++                .version(HttpClient.Version.HTTP_1_1)
++                .connectTimeout(Duration.ofSeconds(20))
++                .build();
+     }
+ 
+     /**
+      * Rotate {@code oldCredentialId} onto a fresh credential instance without
+      * stranding in-flight work on the outgoing secret.
+      *
++     * <p>The order matters. The replacement is created first so both secrets
++     * are briefly valid; every adapter instance is repointed while the old
++     * credential is still live; and the old credential is deleted only once a
++     * poll confirms nothing is using it any more. Deleting earlier would pull
++     * the secret out from under collections that are already running on it.
++     *
+      * @param oldCredentialId   identifier of the credential instance to retire
+      * @param newCredentialName name for the replacement credential instance
+      * @param newFields         credential field name to value, in order
+@@ -55,9 +90,293 @@ public final class VcfOpsCredentialRotator {
+     public RotationResult rotate(String oldCredentialId, String newCredentialName,
+                                  Map<String, String> newFields, int maxDrainPolls)
+             throws Exception {
+-        throw new UnsupportedOperationException("rotate() is not implemented");
++        if (oldCredentialId == null || oldCredentialId.isEmpty()) {
++            throw new IllegalArgumentException("oldCredentialId is required");
++        }
++        if (newCredentialName == null || newCredentialName.isEmpty()) {
++            throw new IllegalArgumentException("newCredentialName is required");
++        }
++        if (newFields == null || newFields.isEmpty()) {
++            throw new IllegalArgumentException("newFields is required");
++        }
++        if (maxDrainPolls < 1) {
++            throw new IllegalArgumentException("maxDrainPolls must be positive");
++        }
++
++        // acquireToken is unauthenticated. Clear any token left by an earlier
++        // rotation on this client before making the new session request.
++        this.token = null;
++        this.token = acquireToken();
++
++        Map<String, Object> outgoing = getCredential(oldCredentialId);
++        String newCredentialId = createCredential(
++                newCredentialName,
++                str(outgoing.get("adapterKindKey")),
++                str(outgoing.get("credentialKindKey")),
++                newFields);
++
++        List<Object> bound = getAdapterInstancesUsingCredential(oldCredentialId);
++        List<String> repointed = new ArrayList<>();
++        for (Object entry : bound) {
++            Map<String, Object> adapter = asObject(entry, "adapter instance");
++            String adapterId = str(adapter.get("id"));
++            if (newCredentialId.equals(adapter.get("credentialInstanceId"))) {
++                continue; // already on the replacement
++            }
++            patchAdapterInstance(adapterId, adapter.get("resourceKey"),
++                    newCredentialId);
++            repointed.add(adapterId);
++        }
++
++        int drainPolls = 0;
++        boolean drained = false;
++        while (drainPolls < maxDrainPolls) {
++            if (drainPolls > 0) {
++                Thread.sleep(DRAIN_INTERVAL.toMillis());
++            }
++            List<Object> still = getAdapterInstancesUsingCredential(oldCredentialId);
++            drainPolls++;
++            if (still.isEmpty()) {
++                drained = true;
++                break;
++            }
++        }
++        if (!drained) {
++            throw new IllegalStateException(
++                    "credential " + oldCredentialId + " still had adapter instances"
++                            + " bound to it after " + drainPolls + " drain poll(s);"
++                            + " refusing to delete a secret that is still in use");
++        }
++
++        deleteCredential(oldCredentialId);
++        return new RotationResult(newCredentialId,
++                Collections.unmodifiableList(repointed), drainPolls, true);
++    }
++
++    // -----------------------------------------------------------------------
++    // Contracted operations
++    // -----------------------------------------------------------------------
++
++    /** acquireToken: POST /suite-api/api/auth/token/acquire */
++    private String acquireToken() throws IOException, InterruptedException {
++        Map<String, Object> body = new LinkedHashMap<>();
++        body.put("username", username);
++        body.put("password", password);
++        // authSource is optional. With no auth source configured the property
++        // is left out entirely rather than sent as null or "".
++        if (authSource != null && !authSource.isEmpty()) {
++            body.put("authSource", authSource);
++        }
++        Map<String, Object> response = asObject(
++                send("POST", "/api/auth/token/acquire", body, 200), "auth-token");
++        String acquired = str(response.get("token"));
++        if (acquired == null || acquired.isEmpty()) {
++            throw new IOException("acquireToken returned no token");
++        }
++        return acquired;
++    }
++
++    /** getCredential: GET /suite-api/api/credentials/{id} */
++    private Map<String, Object> getCredential(String credentialId)
++            throws IOException, InterruptedException {
++        return asObject(
++                send("GET", "/api/credentials/" + segment(credentialId), null, 200),
++                "credential");
++    }
++
++    /** createCredential: POST /suite-api/api/credentials */
++    private String createCredential(String name, String adapterKindKey,
++                                    String credentialKindKey,
++                                    Map<String, String> fields)
++            throws IOException, InterruptedException {
++        if (adapterKindKey == null || credentialKindKey == null) {
++            throw new IOException(
++                    "the outgoing credential did not report its adapter or "
++                            + "credential kind");
++        }
++        // credential.id must be null on a creation request, which for a client
++        // that never emits nulls means the property is simply not there.
++        Map<String, Object> body = new LinkedHashMap<>();
++        body.put("name", name);
++        body.put("adapterKindKey", adapterKindKey);
++        body.put("credentialKindKey", credentialKindKey);
++        List<Object> pairs = new ArrayList<>();
++        for (Map.Entry<String, String> field : fields.entrySet()) {
++            if (field.getValue() == null) {
++                throw new IllegalArgumentException(
++                        "credential field " + field.getKey() + " has no value");
++            }
++            Map<String, Object> pair = new LinkedHashMap<>();
++            pair.put("name", field.getKey());
++            pair.put("value", field.getValue());
++            pairs.add(pair);
++        }
++        body.put("fields", pairs);
++
++        Map<String, Object> created = asObject(
++                send("POST", "/api/credentials", body, 201), "credential");
++        String id = str(created.get("id"));
++        if (id == null || id.isEmpty()) {
++            throw new IOException("createCredential returned no credential id");
++        }
++        return id;
++    }
++
++    /**
++     * getAdapterInstancesUsingCredential:
++     * GET /suite-api/api/credentials/{id}/adapters
++     */
++    private List<Object> getAdapterInstancesUsingCredential(String credentialId)
++            throws IOException, InterruptedException {
++        Map<String, Object> response = asObject(
++                send("GET", "/api/credentials/" + segment(credentialId) + "/adapters",
++                        null, 200),
++                "adapter-instances");
++        Object list = response.get("adapterInstancesInfoDto");
++        if (list == null) {
++            return Collections.emptyList();
++        }
++        if (!(list instanceof List)) {
++            throw new IOException("adapterInstancesInfoDto was not an array");
++        }
++        @SuppressWarnings("unchecked")
++        List<Object> adapters = (List<Object>) list;
++        return adapters;
++    }
++
++    /** patchAdapterInstance: PATCH /suite-api/api/adapters */
++    private void patchAdapterInstance(String adapterId, Object resourceKey,
++                                      String newCredentialId)
++            throws IOException, InterruptedException {
++        if (adapterId == null || adapterId.isEmpty()) {
++            throw new IOException("an adapter instance was listed without an id");
++        }
++        if (resourceKey == null) {
++            throw new IOException(
++                    "adapter instance " + adapterId + " was listed without the "
++                            + "resourceKey the partial update requires");
++        }
++        // A partial update carries the identity of the instance, the required
++        // resourceKey echoed back untouched, and nothing but the one property
++        // being changed. Everything else the read returned stays out.
++        Map<String, Object> body = new LinkedHashMap<>();
++        body.put("id", adapterId);
++        body.put("resourceKey", resourceKey);
++        body.put("credentialInstanceId", newCredentialId);
++        send("PATCH", "/api/adapters", body, 200);
++    }
++
++    /** deleteCredential: DELETE /suite-api/api/credentials/{id} */
++    private void deleteCredential(String credentialId)
++            throws IOException, InterruptedException {
++        send("DELETE", "/api/credentials/" + segment(credentialId), null, 204);
++    }
++
++    // -----------------------------------------------------------------------
++    // Transport
++    // -----------------------------------------------------------------------
++
++    private Object send(String method, String path, Object body, int expectedStatus)
++            throws IOException, InterruptedException {
++        HttpRequest.BodyPublisher publisher;
++        String rendered = null;
++        if (body == null) {
++            publisher = HttpRequest.BodyPublishers.noBody();
++        } else {
++            rendered = Json.write(body);
++            publisher = HttpRequest.BodyPublishers.ofString(rendered,
++                    StandardCharsets.UTF_8);
++        }
++
++        HttpRequest.Builder builder = HttpRequest.newBuilder()
++                .uri(URI.create(baseUrl + BASE_PATH + path))
++                .timeout(Duration.ofSeconds(30))
++                .header("Accept", JSON)
++                .method(method, publisher);
++        if (rendered != null) {
++            builder.header("Content-Type", JSON);
++        }
++        if (token != null) {
++            builder.header("Authorization", AUTH_PREFIX + token);
++        }
++
++        HttpResponse<String> response = http.send(builder.build(),
++                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++        String payload = response.body();
++        if (response.statusCode() != expectedStatus) {
++            throw new IOException(method + " " + path + " returned "
++                    + response.statusCode() + " (expected " + expectedStatus
++                    + "): " + describe(payload));
++        }
++        if (payload == null || payload.isEmpty()) {
++            return null;
++        }
++        return Json.parse(payload);
++    }
++
++    private static String describe(String payload) {
++        if (payload == null || payload.isEmpty()) {
++            return "<empty body>";
++        }
++        try {
++            Object parsed = Json.parse(payload);
++            if (parsed instanceof Map) {
++                Object message = ((Map<?, ?>) parsed).get("message");
++                if (message != null) {
++                    return String.valueOf(message);
++                }
++            }
++        } catch (RuntimeException ignored) {
++            // fall through to the raw payload
++        }
++        return payload.length() > 400 ? payload.substring(0, 400) + "..." : payload;
++    }
++
++    private static String segment(String value) {
++        StringBuilder sb = new StringBuilder();
++        for (byte b : value.getBytes(StandardCharsets.UTF_8)) {
++            int c = b & 0xFF;
++            boolean unreserved = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
++                    || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_'
++                    || c == '~';
++            if (unreserved) {
++                sb.append((char) c);
++            } else {
++                sb.append('%').append(String.format("%02X", c));
++            }
++        }
++        return sb.toString();
++    }
++
++    private static String stripTrailingSlash(String value) {
++        if (value == null) {
++            throw new IllegalArgumentException("baseUrl is required");
++        }
++        String trimmed = value.trim();
++        while (trimmed.endsWith("/")) {
++            trimmed = trimmed.substring(0, trimmed.length() - 1);
++        }
++        return trimmed;
+     }
+ 
++    private static String str(Object value) {
++        return value == null ? null : String.valueOf(value);
++    }
++
++    @SuppressWarnings("unchecked")
++    private static Map<String, Object> asObject(Object value, String what)
++            throws IOException {
++        if (!(value instanceof Map)) {
++            throw new IOException("expected a " + what + " object, got "
++                    + (value == null ? "nothing" : value.getClass().getSimpleName()));
++        }
++        return (Map<String, Object>) value;
++    }
++
++    // -----------------------------------------------------------------------
++    // Outcome
++    // -----------------------------------------------------------------------
++
+     /** Outcome of a rotation. */
+     public static final class RotationResult {
+ 
+@@ -88,4 +407,298 @@ public final class VcfOpsCredentialRotator {
+             this.oldCredentialDeleted = oldCredentialDeleted;
+         }
+     }
++
++    // -----------------------------------------------------------------------
++    // Minimal JSON, because the client carries no dependencies
++    // -----------------------------------------------------------------------
++
++    /**
++     * Just enough JSON for this API. Values parse to {@link Map},
++     * {@link List}, {@link String}, {@link BigDecimal}, {@link Boolean} or
++     * {@code null}; numbers keep their literal form so a value read from the
++     * server can be written back unchanged.
++     */
++    static final class Json {
++
++        private final String text;
++        private int pos;
++
++        private Json(String text) {
++            this.text = text;
++        }
++
++        static Object parse(String text) {
++            Json parser = new Json(text);
++            parser.skipWhitespace();
++            Object value = parser.readValue();
++            parser.skipWhitespace();
++            if (parser.pos != text.length()) {
++                throw new IllegalArgumentException(
++                        "trailing content at offset " + parser.pos);
++            }
++            return value;
++        }
++
++        private Object readValue() {
++            if (pos >= text.length()) {
++                throw new IllegalArgumentException("unexpected end of input");
++            }
++            char c = text.charAt(pos);
++            switch (c) {
++                case '{':
++                    return readObject();
++                case '[':
++                    return readArray();
++                case '"':
++                    return readString();
++                case 't':
++                    expect("true");
++                    return Boolean.TRUE;
++                case 'f':
++                    expect("false");
++                    return Boolean.FALSE;
++                case 'n':
++                    expect("null");
++                    return null;
++                default:
++                    return readNumber();
++            }
++        }
++
++        private Map<String, Object> readObject() {
++            Map<String, Object> out = new LinkedHashMap<>();
++            pos++; // {
++            skipWhitespace();
++            if (peek() == '}') {
++                pos++;
++                return out;
++            }
++            while (true) {
++                skipWhitespace();
++                String key = readString();
++                skipWhitespace();
++                if (peek() != ':') {
++                    throw new IllegalArgumentException(
++                            "expected ':' at offset " + pos);
++                }
++                pos++;
++                skipWhitespace();
++                out.put(key, readValue());
++                skipWhitespace();
++                char c = peek();
++                pos++;
++                if (c == '}') {
++                    return out;
++                }
++                if (c != ',') {
++                    throw new IllegalArgumentException(
++                            "expected ',' or '}' at offset " + (pos - 1));
++                }
++            }
++        }
++
++        private List<Object> readArray() {
++            List<Object> out = new ArrayList<>();
++            pos++; // [
++            skipWhitespace();
++            if (peek() == ']') {
++                pos++;
++                return out;
++            }
++            while (true) {
++                skipWhitespace();
++                out.add(readValue());
++                skipWhitespace();
++                char c = peek();
++                pos++;
++                if (c == ']') {
++                    return out;
++                }
++                if (c != ',') {
++                    throw new IllegalArgumentException(
++                            "expected ',' or ']' at offset " + (pos - 1));
++                }
++            }
++        }
++
++        private String readString() {
++            if (peek() != '"') {
++                throw new IllegalArgumentException(
++                        "expected a string at offset " + pos);
++            }
++            pos++;
++            StringBuilder sb = new StringBuilder();
++            while (true) {
++                if (pos >= text.length()) {
++                    throw new IllegalArgumentException("unterminated string");
++                }
++                char c = text.charAt(pos++);
++                if (c == '"') {
++                    return sb.toString();
++                }
++                if (c != '\\') {
++                    sb.append(c);
++                    continue;
++                }
++                char esc = text.charAt(pos++);
++                switch (esc) {
++                    case '"':
++                        sb.append('"');
++                        break;
++                    case '\\':
++                        sb.append('\\');
++                        break;
++                    case '/':
++                        sb.append('/');
++                        break;
++                    case 'b':
++                        sb.append('\b');
++                        break;
++                    case 'f':
++                        sb.append('\f');
++                        break;
++                    case 'n':
++                        sb.append('\n');
++                        break;
++                    case 'r':
++                        sb.append('\r');
++                        break;
++                    case 't':
++                        sb.append('\t');
++                        break;
++                    case 'u':
++                        sb.append((char) Integer.parseInt(
++                                text.substring(pos, pos + 4), 16));
++                        pos += 4;
++                        break;
++                    default:
++                        throw new IllegalArgumentException(
++                                "bad escape \\" + esc + " at offset " + (pos - 1));
++                }
++            }
++        }
++
++        private BigDecimal readNumber() {
++            int start = pos;
++            while (pos < text.length() && "+-.eE0123456789".indexOf(
++                    text.charAt(pos)) >= 0) {
++                pos++;
++            }
++            if (start == pos) {
++                throw new IllegalArgumentException(
++                        "unexpected character '" + text.charAt(pos) + "' at offset "
++                                + pos);
++            }
++            return new BigDecimal(text.substring(start, pos));
++        }
++
++        private void expect(String literal) {
++            if (!text.startsWith(literal, pos)) {
++                throw new IllegalArgumentException(
++                        "expected " + literal + " at offset " + pos);
++            }
++            pos += literal.length();
++        }
++
++        private char peek() {
++            if (pos >= text.length()) {
++                throw new IllegalArgumentException("unexpected end of input");
++            }
++            return text.charAt(pos);
++        }
++
++        private void skipWhitespace() {
++            while (pos < text.length()
++                    && Character.isWhitespace(text.charAt(pos))) {
++                pos++;
++            }
++        }
++
++        static String write(Object value) {
++            StringBuilder sb = new StringBuilder();
++            writeValue(value, sb);
++            return sb.toString();
++        }
++
++        private static void writeValue(Object value, StringBuilder sb) {
++            if (value == null) {
++                // Nothing in this API is expressed as an explicit null: a
++                // property with no value is left out of the request instead.
++                throw new IllegalArgumentException(
++                        "refusing to serialize a null; omit the property instead");
++            }
++            if (value instanceof Map) {
++                sb.append('{');
++                boolean first = true;
++                for (Map.Entry<?, ?> entry : ((Map<?, ?>) value).entrySet()) {
++                    if (entry.getValue() == null) {
++                        continue; // an absent value is an absent property
++                    }
++                    if (!first) {
++                        sb.append(',');
++                    }
++                    first = false;
++                    writeString(String.valueOf(entry.getKey()), sb);
++                    sb.append(':');
++                    writeValue(entry.getValue(), sb);
++                }
++                sb.append('}');
++            } else if (value instanceof List) {
++                sb.append('[');
++                boolean first = true;
++                for (Object element : (List<?>) value) {
++                    if (!first) {
++                        sb.append(',');
++                    }
++                    first = false;
++                    writeValue(element, sb);
++                }
++                sb.append(']');
++            } else if (value instanceof String) {
++                writeString((String) value, sb);
++            } else if (value instanceof Boolean || value instanceof BigDecimal
++                    || value instanceof Number) {
++                sb.append(value);
++            } else {
++                writeString(String.valueOf(value), sb);
++            }
++        }
++
++        private static void writeString(String value, StringBuilder sb) {
++            sb.append('"');
++            for (int i = 0; i < value.length(); i++) {
++                char c = value.charAt(i);
++                switch (c) {
++                    case '"':
++                        sb.append("\\\"");
++                        break;
++                    case '\\':
++                        sb.append("\\\\");
++                        break;
++                    case '\b':
++                        sb.append("\\b");
++                        break;
++                    case '\f':
++                        sb.append("\\f");
++                        break;
++                    case '\n':
++                        sb.append("\\n");
++                        break;
++                    case '\r':
++                        sb.append("\\r");
++                        break;
++                    case '\t':
++                        sb.append("\\t");
++                        break;
++                    default:
++                        if (c < 0x20) {
++                            sb.append(String.format("\\u%04x", (int) c));
++                        } else {
++                            sb.append(c);
++                        }
++                }
++            }
++            sb.append('"');
++        }
++    }
+ }

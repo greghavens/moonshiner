@@ -1,0 +1,195 @@
+--- a/src/VcfOpsNetworks/VcfOpsNetworks.psm1
++++ b/src/VcfOpsNetworks/VcfOpsNetworks.psm1
+@@ -145,6 +145,53 @@
+     return $null
+ }
+ 
++<#
++    Materialises an ApiError wire body as the VMware.Sdk.Vcf.Ops model type.
++    The prerequisite SDK owns the ApiError / ApiErrorDetail shapes that the
++    Operations for Networks specification also declares.
++#>
++function New-NiApiErrorRecord {
++    param(
++        [Parameter(Mandatory)] [object] $Response,
++        [Parameter(Mandatory)] [string] $OperationId
++    )
++
++    $status = [int]$Response.StatusCode
++    $payload = $null
++    $raw = [string]$Response.RawContent
++    if (-not [string]::IsNullOrWhiteSpace($raw)) {
++        try { $payload = $raw | ConvertFrom-Json } catch { $payload = $null }
++    }
++
++    $details = [System.Collections.Generic.List[VMware.Bindings.Vcf.Ops.Model.ApiErrorDetail]]::new()
++    foreach ($detail in @(Get-NiField -InputObject $payload -Name 'details')) {
++        if ($null -eq $detail) { continue }
++        $targets = [System.Collections.Generic.List[string]]::new()
++        foreach ($target in @(Get-NiField -InputObject $detail -Name 'target')) {
++            if ($null -ne $target) { $targets.Add([string]$target) }
++        }
++        $details.Add((Initialize-VcfOpsApiErrorDetail `
++                    -Code ([int](Get-NiField -InputObject $detail -Name 'code')) `
++                    -Message ([string](Get-NiField -InputObject $detail -Name 'message')) `
++                    -Target $targets))
++    }
++
++    $code = Get-NiField -InputObject $payload -Name 'code'
++    if ($null -eq $code) { $code = $status }
++    $message = [string](Get-NiField -InputObject $payload -Name 'message')
++    if ([string]::IsNullOrEmpty($message)) { $message = "HTTP $status" }
++
++    $apiError = Initialize-VcfOpsApiError -Code ([int]$code) -Message $message -Details $details
++
++    $exception = [System.InvalidOperationException]::new(
++        "VCF Operations for Networks operation '$OperationId' failed with HTTP ${status}: $message")
++    return [System.Management.Automation.ErrorRecord]::new(
++        $exception,
++        'VcfOnApiError',
++        [System.Management.Automation.ErrorCategory]::InvalidResult,
++        $apiError)
++}
++
+ # ---------------------------------------------------------------------------
+ # Public surface.
+ # ---------------------------------------------------------------------------
+@@ -186,7 +233,40 @@
+         [switch] $SkipCertificateCheck
+     )
+ 
+-    throw [System.NotImplementedException]::new('Connect-VcfOnServer is not implemented.')
++    $connection = New-NiApiConnection -Server $Server -SkipCertificateCheck:$SkipCertificateCheck
++
++    # UserCredential. Only bound optional fields reach the wire: a key that is
++    # never added is a key the binding layer never serializes.
++    $userCredential = [ordered]@{
++        username = $Credential.UserName
++        password = $Credential.GetNetworkCredential().Password
++    }
++    if ($PSBoundParameters.ContainsKey('DomainType')) {
++        $domain = [ordered]@{ domain_type = $DomainType }
++        if ($PSBoundParameters.ContainsKey('DomainValue')) {
++            $domain['value'] = $DomainValue
++        }
++        $userCredential['domain'] = $domain
++    }
++
++    # The create operation has empty security: no Authorization header.
++    $options = New-NiRequestOptions
++    $options.Data = $userCredential
++
++    $response = Invoke-NiRequest -Connection $connection -Method 'POST' -Path '/auth/token' -Options $options
++    $status = [int]$response.StatusCode
++    if ($status -lt 200 -or $status -ge 300) {
++        $PSCmdlet.ThrowTerminatingError((New-NiApiErrorRecord -Response $response -OperationId 'create'))
++    }
++
++    return [pscustomobject]@{
++        PSTypeName = 'VcfOpsNetworks.Session'
++        Connection = $connection
++        BaseUri    = $connection.BasePath
++        Server     = $Server
++        Token      = [string](Get-NiField -InputObject $response.Data -Name 'token')
++        Expiry     = Get-NiField -InputObject $response.Data -Name 'expiry'
++    }
+ }
+ 
+ <#
+@@ -214,7 +294,95 @@
+         [long] $ModifiedAfter
+     )
+ 
+-    throw [System.NotImplementedException]::new('Get-VcfOnApplication is not implemented.')
++    $connection = Get-NiField -InputObject $Session -Name 'Connection'
++    $token = [string](Get-NiField -InputObject $Session -Name 'Token')
++    if ($null -eq $connection -or [string]::IsNullOrEmpty($token)) {
++        throw [System.ArgumentException]::new(
++            'Session must carry Connection and Token; use Connect-VcfOnServer.', 'Session')
++    }
++    $authorization = "NetworkInsight $token"
++
++    # --- sweep the paginated collection to completion ----------------------
++    $entities = [System.Collections.Generic.List[object]]::new()
++    $seenCursors = [System.Collections.Generic.HashSet[string]]::new()
++    $cursor = $null
++    $totalCount = $null
++
++    while ($true) {
++        $options = New-NiRequestOptions
++        $options.HeaderParameters.Add('Authorization', $authorization)
++        $options.QueryParameters.Add('size', [string]$PageSize)
++        # An unset optional parameter is never added, so it never reaches the wire.
++        if ($null -ne $cursor) {
++            $options.QueryParameters.Add('cursor', $cursor)
++        }
++        if ($PSBoundParameters.ContainsKey('ModifiedAfter')) {
++            $options.QueryParameters.Add('modifiedAfter', [string]$ModifiedAfter)
++        }
++
++        $response = Invoke-NiRequest -Connection $connection -Method 'GET' `
++            -Path '/groups/applications' -Options $options
++        $status = [int]$response.StatusCode
++        if ($status -lt 200 -or $status -ge 300) {
++            $PSCmdlet.ThrowTerminatingError(
++                (New-NiApiErrorRecord -Response $response -OperationId 'listApplications'))
++        }
++
++        foreach ($entity in @(Get-NiField -InputObject $response.Data -Name 'results')) {
++            if ($null -ne $entity) { $entities.Add($entity) }
++        }
++
++        $reported = Get-NiField -InputObject $response.Data -Name 'total_count'
++        if ($null -ne $reported) { $totalCount = [int]$reported }
++
++        # The cursor field is absent on the final page.
++        $next = [string](Get-NiField -InputObject $response.Data -Name 'cursor')
++        if ([string]::IsNullOrEmpty($next)) { break }
++        if (-not $seenCursors.Add($next)) {
++            throw [System.InvalidOperationException]::new(
++                "listApplications returned a repeated cursor '$next'; refusing to loop.")
++        }
++        $cursor = $next
++    }
++
++    if ($null -ne $totalCount -and $entities.Count -ne $totalCount) {
++        throw [System.InvalidOperationException]::new(
++            "listApplications reported total_count $totalCount but the sweep collected $($entities.Count).")
++    }
++
++    # --- resolve each entity exactly once ----------------------------------
++    $applications = [System.Collections.Generic.List[object]]::new()
++    foreach ($entity in $entities) {
++        $entityId = [string](Get-NiField -InputObject $entity -Name 'entity_id')
++
++        $options = New-NiRequestOptions
++        $options.HeaderParameters.Add('Authorization', $authorization)
++        $options.PathParameters.Add('id', $entityId)
++
++        $response = Invoke-NiRequest -Connection $connection -Method 'GET' `
++            -Path '/groups/applications/{id}' -Options $options
++        $status = [int]$response.StatusCode
++        if ($status -lt 200 -or $status -ge 300) {
++            $PSCmdlet.ThrowTerminatingError(
++                (New-NiApiErrorRecord -Response $response -OperationId 'getApplicationById'))
++        }
++        $applications.Add($response.Data)
++    }
++
++    # --- stable emission order ---------------------------------------------
++    $comparison = [System.Comparison[object]] {
++        param($left, $right)
++        $result = [string]::CompareOrdinal(
++            [string](Get-NiField -InputObject $left -Name 'name'),
++            [string](Get-NiField -InputObject $right -Name 'name'))
++        if ($result -ne 0) { return $result }
++        return [string]::CompareOrdinal(
++            [string](Get-NiField -InputObject $left -Name 'entity_id'),
++            [string](Get-NiField -InputObject $right -Name 'entity_id'))
++    }
++    $applications.Sort($comparison)
++
++    return $applications.ToArray()
+ }
+ 
+ Export-ModuleMember -Function Connect-VcfOnServer, Get-VcfOnApplication

@@ -1,0 +1,396 @@
+Reference solution for task vcf91-0287.
+
+Implements the three public functions of the VCFOpsNetworks module against the
+wire contract in docs/contract.json using PowerShell's built-in HTTP and JSON
+facilities.
+
+Apply from the repository root (the directory holding docs/, src/, tests/):
+
+    git apply reference_fix.patch
+
+diff --git a/src/VCFOpsNetworks/VCFOpsNetworks.psm1 b/src/VCFOpsNetworks/VCFOpsNetworks.psm1
+index 8e6a76a..330b3cd 100644
+--- a/src/VCFOpsNetworks/VCFOpsNetworks.psm1
++++ b/src/VCFOpsNetworks/VCFOpsNetworks.psm1
+@@ -6,10 +6,184 @@ Set-StrictMode -Version Latest
+     The wire contract these functions must honour is docs/contract.json, which is
+     derived from the product OpenAPI specification (see docs/official_sources.json).
+ 
+-    Nothing here is implemented yet.
++    The governing rule for request bodies: a field the caller did not set is
++    absent from the JSON, never present-but-empty. Every body here is assembled
++    key by key so that an unset field simply never gets added.
+ #>
+ 
++$script:BasePath = '/api/ni'
++
++# ---------------------------------------------------------------------------
++# Private helpers
++# ---------------------------------------------------------------------------
++
++function ConvertTo-NiJson {
++    <#
++        Serialises a body that was assembled key by key. -Depth is generous
++        because tier membership criteria nest three levels deep.
++    #>
++    param([Parameter(Mandatory)] $Body)
++
++    return ConvertTo-Json -InputObject $Body -Depth 12 -Compress
++}
++
++function Invoke-NiRequest {
++    <#
++        One HTTP round trip against the appliance. Returns the status code and
++        the decoded payload without throwing on 4xx/5xx: whether a non-success
++        response is fatal is the caller's decision, not the transport's.
++    #>
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] $Connection,
++        [Parameter(Mandatory)] [string] $Method,
++        [Parameter(Mandatory)] [string] $Path,
++        $Body,
++        [switch] $Anonymous
++    )
++
++    $params = @{
++        Uri                  = $Connection.BaseUri + $Path
++        Method               = $Method
++        SkipHttpErrorCheck   = $true
++        MaximumRedirection   = 0
++        ErrorAction          = 'Stop'
++    }
++
++    if (-not $Anonymous) {
++        $params['Headers'] = @{ 'Authorization' = $Connection.Authorization }
++    }
++
++    if ($Connection.SkipCertificateCheck) {
++        $params['SkipCertificateCheck'] = $true
++    }
++
++    if ($null -ne $Body) {
++        $params['ContentType'] = 'application/json'
++        $params['Body'] = [System.Text.Encoding]::UTF8.GetBytes((ConvertTo-NiJson -Body $Body))
++    }
++
++    $response = Invoke-WebRequest @params
++
++    $payload = $null
++    $text = [string]$response.Content
++    if (-not [string]::IsNullOrWhiteSpace($text)) {
++        try { $payload = $text | ConvertFrom-Json -ErrorAction Stop } catch { $payload = $null }
++    }
++
++    return [pscustomobject]@{
++        StatusCode = [int] $response.StatusCode
++        Payload    = $payload
++        RawBody    = $text
++    }
++}
++
++function Get-NiErrorMessage {
++    <#
++        Pull the appliance's own wording out of an ApiError body so the operator
++        sees what the appliance said, not something we invented for it.
++    #>
++    param([Parameter(Mandatory)] $Response)
++
++    if ($null -ne $Response.Payload -and
++        ($Response.Payload.PSObject.Properties.Name -contains 'message')) {
++        return [string] $Response.Payload.message
++    }
++
++    if (-not [string]::IsNullOrWhiteSpace($Response.RawBody)) {
++        return $Response.RawBody.Trim()
++    }
++
++    return "HTTP $($Response.StatusCode)"
++}
++
++function New-NiTierBody {
++    <#
++        TierRequest for one -Tier hashtable. Optional keys are added only when
++        the caller supplied a non-empty value; member_list and entity_id are
++        never sent by this client.
++    #>
++    param([Parameter(Mandatory)] [hashtable] $Definition)
++
++    if (-not $Definition.ContainsKey('Name') -or [string]::IsNullOrWhiteSpace([string]$Definition['Name'])) {
++        throw [System.ArgumentException]::new('Each -Tier entry requires a non-empty Name.')
++    }
++
++    $body = [ordered]@{ name = [string] $Definition['Name'] }
++
++    $criteria = @()
++
++    if ($Definition.ContainsKey('SearchFilter') -and -not [string]::IsNullOrWhiteSpace([string]$Definition['SearchFilter'])) {
++        $criteria += [ordered]@{
++            membership_type            = 'SearchMembershipCriteria'
++            search_membership_criteria = [ordered]@{
++                entity_type = 'VirtualMachine'
++                filter      = [string] $Definition['SearchFilter']
++            }
++        }
++    }
++
++    if ($Definition.ContainsKey('IpAddresses')) {
++        $addresses = @($Definition['IpAddresses'] | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
++        if ($addresses.Count -gt 0) {
++            $criteria += [ordered]@{
++                membership_type                = 'IPAddressMembershipCriteria'
++                ip_address_membership_criteria = [ordered]@{
++                    ip_addresses = @([string[]] $addresses)
++                }
++            }
++        }
++    }
++
++    if ($criteria.Count -gt 0) {
++        $body['group_membership_criteria'] = @($criteria)
++    }
++
++    if ($Definition.ContainsKey('SourceGroupEntityId')) {
++        $sources = @($Definition['SourceGroupEntityId'] | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
++        if ($sources.Count -gt 0) {
++            $body['source_group_entity_id'] = @([string[]] $sources)
++        }
++    }
++
++    return $body
++}
++
++function New-NiStep {
++    param(
++        [Parameter(Mandatory)] [int] $Index,
++        [Parameter(Mandatory)] [string] $Operation,
++        [Parameter(Mandatory)] [string] $Target,
++        [Parameter(Mandatory)] [string] $Status,
++        [string] $EntityId
++    )
++
++    return [pscustomobject]@{
++        Index     = $Index
++        Operation = $Operation
++        Target    = $Target
++        Status    = $Status
++        EntityId  = if ([string]::IsNullOrEmpty($EntityId)) { $null } else { $EntityId }
++    }
++}
++
++# ---------------------------------------------------------------------------
++# Public surface
++# ---------------------------------------------------------------------------
++
+ function Connect-VCFOpsNetworksServer {
++    <#
++        .SYNOPSIS
++        Opens a connection to a VCF Operations for Networks appliance.
++
++        .DESCRIPTION
++        With -Credential, operationId 'create' opens a native session and the
++        returned token is presented under the ApiKeyAuth scheme.
++
++        With -OpsAccessToken, a VCF Operations JWT obtained elsewhere -- for
++        instance from a Connect-VcfOpsServer session -- is presented under the
++        OpsTokenAuth scheme. No native session is opened in that mode.
++    #>
+     [CmdletBinding(DefaultParameterSetName = 'Credential')]
+     param(
+         [Parameter(Mandatory)]
+@@ -36,10 +210,73 @@ function Connect-VCFOpsNetworksServer {
+         [switch] $SkipCertificateCheck
+     )
+ 
+-    throw [System.NotImplementedException]::new('Connect-VCFOpsNetworksServer is not implemented.')
++    $connection = [pscustomobject]@{
++        Server               = $Server
++        Port                 = $Port
++        Protocol             = $Protocol
++        BaseUri              = '{0}://{1}:{2}{3}' -f $Protocol, $Server, $Port, $script:BasePath
++        AuthMode             = $null
++        Authorization        = $null
++        SkipCertificateCheck = [bool] $SkipCertificateCheck
++        TokenExpiry          = $null
++    }
++
++    if ($PSCmdlet.ParameterSetName -eq 'OpsToken') {
++        $connection.AuthMode = 'OpsTokenAuth'
++        $connection.Authorization = "Bearer $OpsAccessToken"
++        return $connection
++    }
++
++    $body = [ordered]@{
++        username = $Credential.UserName
++        password = $Credential.GetNetworkCredential().Password
++    }
++
++    # domain, and each of its own fields, appears only when supplied.
++    $domain = [ordered]@{}
++    if ($PSBoundParameters.ContainsKey('DomainType') -and -not [string]::IsNullOrWhiteSpace($DomainType)) {
++        $domain['domain_type'] = $DomainType
++    }
++    if ($PSBoundParameters.ContainsKey('DomainValue') -and -not [string]::IsNullOrWhiteSpace($DomainValue)) {
++        $domain['value'] = $DomainValue
++    }
++    if ($domain.Count -gt 0) {
++        $body['domain'] = $domain
++    }
++
++    $response = Invoke-NiRequest -Connection $connection -Method 'POST' -Path '/auth/token' -Body $body -Anonymous
++
++    if ($response.StatusCode -ne 200) {
++        throw [System.InvalidOperationException]::new(
++            "Authentication against $($connection.BaseUri) failed with HTTP $($response.StatusCode): $(Get-NiErrorMessage -Response $response)")
++    }
++
++    if ($null -eq $response.Payload -or [string]::IsNullOrWhiteSpace([string]$response.Payload.token)) {
++        throw [System.InvalidOperationException]::new(
++            "Authentication against $($connection.BaseUri) returned no session token.")
++    }
++
++    $connection.AuthMode = 'ApiKeyAuth'
++    $connection.Authorization = "NetworkInsight $($response.Payload.token)"
++    if ($response.Payload.PSObject.Properties.Name -contains 'expiry') {
++        $connection.TokenExpiry = $response.Payload.expiry
++    }
++
++    return $connection
+ }
+ 
+ function New-VCFOpsNetworksApplication {
++    <#
++        .SYNOPSIS
++        Creates an application and its tiers, reporting exactly what landed.
++
++        .DESCRIPTION
++        A tier rejected by the appliance stops the rollout: the remaining tiers
++        are not attempted and nothing already created is removed. The rejection
++        is reported in the returned object rather than thrown, and the tiers
++        listed in CreatedTiers come from a closing listApplicationTiers call --
++        what the appliance says exists, not what this function believes it made.
++    #>
+     [CmdletBinding()]
+     param(
+         [Parameter(Mandatory)]
+@@ -52,17 +289,118 @@ function New-VCFOpsNetworksApplication {
+         [hashtable[]] $Tier
+     )
+ 
+-    throw [System.NotImplementedException]::new('New-VCFOpsNetworksApplication is not implemented.')
++    $steps = [System.Collections.Generic.List[object]]::new()
++    $index = 0
++    $failed = $null
++    $applicationId = $null
++
++    $index++
++    $response = Invoke-NiRequest -Connection $Connection -Method 'POST' -Path '/groups/applications' `
++        -Body ([ordered]@{ name = $Name })
++
++    if ($response.StatusCode -ne 201) {
++        $steps.Add((New-NiStep -Index $index -Operation 'addApplication' -Target $Name -Status 'Failed'))
++        $failed = [pscustomobject]@{
++            Operation  = 'addApplication'
++            Target     = $Name
++            StatusCode = $response.StatusCode
++            Message    = Get-NiErrorMessage -Response $response
++        }
++
++        # Without an application there is nothing to confirm and nothing to clean up.
++        return [pscustomobject]@{
++            ApplicationName     = $Name
++            ApplicationEntityId = $null
++            Status              = 'Failed'
++            Steps               = @($steps.ToArray())
++            CreatedTiers        = @()
++            FailedStep          = $failed
++        }
++    }
++
++    $applicationId = [string] $response.Payload.entity_id
++    $steps.Add((New-NiStep -Index $index -Operation 'addApplication' -Target $Name -Status 'Succeeded' -EntityId $applicationId))
++
++    foreach ($definition in $Tier) {
++        $body = New-NiTierBody -Definition $definition
++        $tierName = [string] $body['name']
++
++        $index++
++        $response = Invoke-NiRequest -Connection $Connection -Method 'POST' `
++            -Path "/groups/applications/$applicationId/tiers" -Body $body
++
++        if ($response.StatusCode -ne 201) {
++            $steps.Add((New-NiStep -Index $index -Operation 'addTier' -Target $tierName -Status 'Failed'))
++            $failed = [pscustomobject]@{
++                Operation  = 'addTier'
++                Target     = $tierName
++                StatusCode = $response.StatusCode
++                Message    = Get-NiErrorMessage -Response $response
++            }
++            break
++        }
++
++        $steps.Add((New-NiStep -Index $index -Operation 'addTier' -Target $tierName -Status 'Succeeded' `
++                    -EntityId ([string] $response.Payload.entity_id)))
++    }
++
++    # Confirm server-side state whether or not the rollout completed, so the
++    # operator learns what a partially applied change actually left behind.
++    $created = @()
++    $listing = Invoke-NiRequest -Connection $Connection -Method 'GET' `
++        -Path "/groups/applications/$applicationId/tiers"
++
++    if ($listing.StatusCode -eq 200 -and $null -ne $listing.Payload -and
++        ($listing.Payload.PSObject.Properties.Name -contains 'results')) {
++        $created = @(
++            foreach ($entry in @($listing.Payload.results)) {
++                [pscustomobject]@{
++                    Name     = [string] $entry.name
++                    EntityId = [string] $entry.entity_id
++                }
++            }
++        )
++    }
++
++    return [pscustomobject]@{
++        ApplicationName     = $Name
++        ApplicationEntityId = $applicationId
++        Status              = if ($null -eq $failed) { 'Succeeded' } else { 'Failed' }
++        Steps               = @($steps.ToArray())
++        CreatedTiers        = @($created)
++        FailedStep          = $failed
++    }
+ }
+ 
+ function Disconnect-VCFOpsNetworksServer {
++    <#
++        .SYNOPSIS
++        Revokes a native session.
++
++        .DESCRIPTION
++        A connection built from a VCF Operations JWT owns no session of its own,
++        so nothing is sent -- revoking that token is the business of whoever
++        issued it.
++    #>
+     [CmdletBinding()]
+     param(
+         [Parameter(Mandatory)]
+         [object] $Connection
+     )
+ 
+-    throw [System.NotImplementedException]::new('Disconnect-VCFOpsNetworksServer is not implemented.')
++    if ($Connection.AuthMode -ne 'ApiKeyAuth') {
++        return
++    }
++
++    $response = Invoke-NiRequest -Connection $Connection -Method 'DELETE' -Path '/auth/token'
++
++    if ($response.StatusCode -ne 204) {
++        throw [System.InvalidOperationException]::new(
++            "Revoking the session on $($Connection.BaseUri) failed with HTTP $($response.StatusCode): $(Get-NiErrorMessage -Response $response)")
++    }
++
++    $Connection.Authorization = $null
++    $Connection.AuthMode = 'Disconnected'
+ }
+ 
+ Export-ModuleMember -Function Connect-VCFOpsNetworksServer, New-VCFOpsNetworksApplication, Disconnect-VCFOpsNetworksServer

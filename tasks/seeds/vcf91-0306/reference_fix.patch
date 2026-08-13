@@ -1,0 +1,456 @@
+diff --git a/src/main/java/com/broadcom/vcfops/networks/VcfOpsNetworksClient.java b/src/main/java/com/broadcom/vcfops/networks/VcfOpsNetworksClient.java
+index ee84e50..20326e2 100644
+--- a/src/main/java/com/broadcom/vcfops/networks/VcfOpsNetworksClient.java
++++ b/src/main/java/com/broadcom/vcfops/networks/VcfOpsNetworksClient.java
+@@ -1,5 +1,17 @@
+ package com.broadcom.vcfops.networks;
+ 
++import java.io.IOException;
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.time.Duration;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++
+ /**
+  * Client for the vCenter data source onboarding flow of VCF Operations for Networks 9.1.
+  *
+@@ -25,7 +37,16 @@ public final class VcfOpsNetworksClient {
+     /** The appliance answered with an unexpected HTTP status. */
+     public static final String FAILURE_HTTP_ERROR = "HTTP_ERROR";
+ 
++    /** `servers` entry of the OpenAPI document. */
++    private static final String BASE_PATH = "/api/ni";
++    /** ApiKeyAuth value template from the document's security schemes. */
++    private static final String AUTH_PREFIX = "NetworkInsight ";
++    private static final String JSON = "application/json";
++    /** Only a PROXY_VM node can register a data source. */
++    private static final String COLLECTOR_NODE_TYPE = "PROXY_VM";
++
+     private final String baseUrl;
++    private final HttpClient http;
+ 
+     /**
+      * @param baseUrl scheme, host and port of the appliance, with no trailing slash and no API
+@@ -34,6 +55,10 @@ public final class VcfOpsNetworksClient {
+      */
+     public VcfOpsNetworksClient(String baseUrl) {
+         this.baseUrl = baseUrl;
++        this.http = HttpClient.newBuilder()
++                .followRedirects(HttpClient.Redirect.NEVER)
++                .connectTimeout(Duration.ofSeconds(20))
++                .build();
+     }
+ 
+     /** Base URL this client was constructed with. */
+@@ -62,7 +87,404 @@ public final class VcfOpsNetworksClient {
+     public OnboardOutcome onboardVcenter(Credentials apiCredentials,
+                                          Domain apiDomain,
+                                          VcenterOnboardRequest request) {
+-        throw new UnsupportedOperationException("onboardVcenter is not implemented yet");
++        checkRequest(apiCredentials, request);
++
++        // --- authenticate -------------------------------------------------
++        Reply auth = send("POST", "/auth/token", null, credentialBody(apiCredentials, apiDomain));
++        if (auth.status != 200) {
++            return failure(STAGE_AUTHENTICATE, FAILURE_HTTP_ERROR, describe(auth), null, null, null);
++        }
++        String token = string(map(auth.body).get("token"));
++        if (token == null || token.isEmpty()) {
++            return failure(STAGE_AUTHENTICATE, FAILURE_HTTP_ERROR,
++                    "The appliance returned no auth token.", null, null, null);
++        }
++
++        // --- resolve the collector node ------------------------------------
++        Reply nodes = send("GET", "/infra/expanded-nodes", token, null);
++        if (nodes.status != 200) {
++            return failure(STAGE_RESOLVE_COLLECTOR, FAILURE_HTTP_ERROR, describe(nodes),
++                    null, null, null);
++        }
++        String proxyId = findCollector(nodes.body, request.collectorNodeName);
++        if (proxyId == null) {
++            return failure(STAGE_RESOLVE_COLLECTOR, FAILURE_COLLECTOR_NOT_FOUND,
++                    "No " + COLLECTOR_NODE_TYPE + " node is named '" + request.collectorNodeName
++                            + "'.", null, null, null);
++        }
++
++        // --- precheck -------------------------------------------------------
++        Reply precheck = send("POST", "/data-sources/vcenters/validate", token,
++                validationBody(request, proxyId));
++        if (precheck.status != 200) {
++            return failure(STAGE_PRECHECK, FAILURE_HTTP_ERROR, describe(precheck),
++                    proxyId, null, null);
++        }
++        Map<String, Object> verdict = map(precheck.body);
++        Integer code = integer(verdict.get("code"));
++        String message = string(verdict.get("message"));
++        // The precheck reports its verdict in the body, not in the HTTP status: 200 here only
++        // means the appliance ran the check. Anything other than code 200 stops the flow before
++        // the mutating call, so a rejected vCenter leaves the appliance untouched.
++        if (code == null || code != 200) {
++            return failure(STAGE_PRECHECK, FAILURE_PRECHECK_REJECTED,
++                    message == null ? "The precheck refused the data source." : message,
++                    proxyId, code, message);
++        }
++
++        // --- create ---------------------------------------------------------
++        Reply created = send("POST", "/data-sources/vcenters", token,
++                dataSourceBody(request, proxyId));
++        if (created.status != 201) {
++            return failure(STAGE_CREATE, FAILURE_HTTP_ERROR, describe(created),
++                    proxyId, code, message);
++        }
++        String entityId = string(map(created.body).get("entity_id"));
++        return new OnboardOutcome(true, STAGE_CREATE, null, null, proxyId, code, message, entityId);
++    }
++
++    // ------------------------------------------------------------- request bodies
++
++    private static void checkRequest(Credentials apiCredentials, VcenterOnboardRequest request) {
++        if (apiCredentials == null || isBlank(apiCredentials.username)) {
++            throw new IllegalArgumentException("appliance credentials are required");
++        }
++        if (request == null) {
++            throw new IllegalArgumentException("a vCenter onboarding request is required");
++        }
++        boolean hasIp = !isBlank(request.ip);
++        boolean hasFqdn = !isBlank(request.fqdn);
++        if (hasIp == hasFqdn) {
++            throw new IllegalArgumentException(
++                    "exactly one of ip or fqdn must be set, got ip=" + request.ip
++                            + " fqdn=" + request.fqdn);
++        }
++        if (isBlank(request.collectorNodeName)) {
++            throw new IllegalArgumentException("collectorNodeName is required");
++        }
++        if (isBlank(request.nickname)) {
++            throw new IllegalArgumentException("nickname is required");
++        }
++        if (request.vcenterCredentials == null || isBlank(request.vcenterCredentials.username)) {
++            throw new IllegalArgumentException("vCenter credentials are required");
++        }
++    }
++
++    private static Map<String, Object> credentialBody(Credentials credentials, Domain domain) {
++        Map<String, Object> body = obj();
++        put(body, "username", credentials.username);
++        put(body, "password", credentials.password);
++        if (domain != null && !isBlank(domain.domainType)) {
++            Map<String, Object> d = obj();
++            put(d, "domain_type", domain.domainType);
++            // The specification notes that a domain value is not required for the LOCAL type.
++            if (!"LOCAL".equals(domain.domainType)) {
++                put(d, "value", domain.value);
++            }
++            body.put("domain", d);
++        }
++        return body;
++    }
++
++    private static Map<String, Object> validationBody(VcenterOnboardRequest r, String proxyId) {
++        Map<String, Object> body = obj();
++        put(body, "ip", r.ip);
++        put(body, "fqdn", r.fqdn);
++        put(body, "proxy_id", proxyId);
++        Map<String, Object> credentials = credentialsOf(r);
++        if (credentials != null) body.put("credentials", credentials);
++        put(body, "ipfix_enabled", r.ipfixEnabled);
++        return body;
++    }
++
++    private static Map<String, Object> dataSourceBody(VcenterOnboardRequest r, String proxyId) {
++        Map<String, Object> body = obj();
++        put(body, "ip", r.ip);
++        put(body, "fqdn", r.fqdn);
++        put(body, "proxy_id", proxyId);
++        put(body, "nickname", r.nickname);
++        Map<String, Object> credentials = credentialsOf(r);
++        if (credentials != null) body.put("credentials", credentials);
++        put(body, "notes", r.notes);
++        put(body, "enabled", r.enabled);
++        if (r.ipfixEnabled != null) {
++            Map<String, Object> ipfix = obj();
++            put(ipfix, "enable_all", r.ipfixEnabled);
++            body.put("ipfix_request", ipfix);
++        }
++        put(body, "is_vmc", r.isVmc);
++        return body;
++    }
++
++    private static Map<String, Object> credentialsOf(VcenterOnboardRequest r) {
++        if (r.vcenterCredentials == null) return null;
++        Map<String, Object> credentials = obj();
++        put(credentials, "username", r.vcenterCredentials.username);
++        put(credentials, "password", r.vcenterCredentials.password);
++        return credentials.isEmpty() ? null : credentials;
++    }
++
++    private static String findCollector(Object nodesBody, String name) {
++        List<Object> results = list(map(nodesBody).get("results"));
++        for (Object o : results) {
++            Map<String, Object> node = map(o);
++            if (COLLECTOR_NODE_TYPE.equals(node.get("node_type")) && name.equals(node.get("name"))) {
++                return string(node.get("id"));
++            }
++        }
++        return null;
++    }
++
++    // ------------------------------------------------------------- transport
++
++    private record Reply(int status, Object body, String raw) {}
++
++    private Reply send(String method, String path, String token, Map<String, Object> body) {
++        HttpRequest.Builder builder = HttpRequest.newBuilder()
++                .uri(URI.create(baseUrl + BASE_PATH + path))
++                .timeout(Duration.ofSeconds(60));
++        if (token != null) builder.header("Authorization", AUTH_PREFIX + token);
++        if (body == null) {
++            builder.method(method, HttpRequest.BodyPublishers.noBody());
++        } else {
++            builder.header("Content-Type", JSON);
++            builder.method(method, HttpRequest.BodyPublishers.ofString(
++                    writeJson(body), StandardCharsets.UTF_8));
++        }
++        HttpResponse<String> response;
++        try {
++            response = http.send(builder.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++        } catch (IOException e) {
++            throw new IllegalStateException(method + " " + path + " failed: " + e, e);
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++            throw new IllegalStateException(method + " " + path + " was interrupted", e);
++        }
++        String raw = response.body() == null ? "" : response.body();
++        Object parsed;
++        try {
++            parsed = raw.isEmpty() ? null : readJson(raw);
++        } catch (RuntimeException e) {
++            parsed = null;
++        }
++        return new Reply(response.statusCode(), parsed, raw);
++    }
++
++    private static String describe(Reply reply) {
++        Map<String, Object> body = map(reply.body);
++        String message = string(body.get("message"));
++        return "HTTP " + reply.status + (message == null ? ": " + reply.raw : ": " + message);
++    }
++
++    private static OnboardOutcome failure(String stage, String code, String message,
++                                          String proxyId, Integer precheckCode,
++                                          String precheckMessage) {
++        return new OnboardOutcome(false, stage, code, message, proxyId, precheckCode,
++                precheckMessage, null);
++    }
++
++    // ------------------------------------------------------------- json output
++
++    private static Map<String, Object> obj() {
++        return new LinkedHashMap<>();
++    }
++
++    /** Puts a value only when the caller actually set it, so unset optionals never hit the wire. */
++    private static void put(Map<String, Object> target, String key, Object value) {
++        if (value == null) return;
++        if (value instanceof String s && s.isEmpty()) return;
++        target.put(key, value);
++    }
++
++    private static String writeJson(Object value) {
++        StringBuilder sb = new StringBuilder();
++        writeJson(sb, value);
++        return sb.toString();
++    }
++
++    private static void writeJson(StringBuilder sb, Object value) {
++        if (value == null) {
++            sb.append("null");
++        } else if (value instanceof Map<?, ?> m) {
++            sb.append('{');
++            boolean first = true;
++            for (Map.Entry<?, ?> e : m.entrySet()) {
++                if (!first) sb.append(',');
++                first = false;
++                writeJsonString(sb, String.valueOf(e.getKey()));
++                sb.append(':');
++                writeJson(sb, e.getValue());
++            }
++            sb.append('}');
++        } else if (value instanceof List<?> l) {
++            sb.append('[');
++            for (int i = 0; i < l.size(); i++) {
++                if (i > 0) sb.append(',');
++                writeJson(sb, l.get(i));
++            }
++            sb.append(']');
++        } else if (value instanceof String s) {
++            writeJsonString(sb, s);
++        } else if (value instanceof Boolean || value instanceof Number) {
++            sb.append(value);
++        } else {
++            writeJsonString(sb, String.valueOf(value));
++        }
++    }
++
++    private static void writeJsonString(StringBuilder sb, String s) {
++        sb.append('"');
++        for (int i = 0; i < s.length(); i++) {
++            char c = s.charAt(i);
++            switch (c) {
++                case '"' -> sb.append("\\\"");
++                case '\\' -> sb.append("\\\\");
++                case '\b' -> sb.append("\\b");
++                case '\f' -> sb.append("\\f");
++                case '\n' -> sb.append("\\n");
++                case '\r' -> sb.append("\\r");
++                case '\t' -> sb.append("\\t");
++                default -> {
++                    if (c < 0x20) sb.append(String.format("\\u%04x", (int) c));
++                    else sb.append(c);
++                }
++            }
++        }
++        sb.append('"');
++    }
++
++    // ------------------------------------------------------------- json input
++
++    private static Object readJson(String text) {
++        Cursor c = new Cursor(text);
++        Object v = c.value();
++        c.ws();
++        if (c.pos != text.length()) throw new IllegalArgumentException("trailing JSON content");
++        return v;
++    }
++
++    private static final class Cursor {
++        private final String s;
++        private int pos;
++
++        Cursor(String s) {
++            this.s = s;
++        }
++
++        Object value() {
++            ws();
++            char c = s.charAt(pos);
++            return switch (c) {
++                case '{' -> object();
++                case '[' -> array();
++                case '"' -> string();
++                case 't' -> literal("true", Boolean.TRUE);
++                case 'f' -> literal("false", Boolean.FALSE);
++                case 'n' -> literal("null", null);
++                default -> number();
++            };
++        }
++
++        Map<String, Object> object() {
++            Map<String, Object> out = new LinkedHashMap<>();
++            pos++;
++            ws();
++            if (s.charAt(pos) == '}') { pos++; return out; }
++            while (true) {
++                ws();
++                String key = string();
++                ws();
++                pos++; // ':'
++                out.put(key, value());
++                ws();
++                char c = s.charAt(pos++);
++                if (c == '}') return out;
++                if (c != ',') throw new IllegalArgumentException("expected ',' or '}'");
++            }
++        }
++
++        List<Object> array() {
++            List<Object> out = new ArrayList<>();
++            pos++;
++            ws();
++            if (s.charAt(pos) == ']') { pos++; return out; }
++            while (true) {
++                out.add(value());
++                ws();
++                char c = s.charAt(pos++);
++                if (c == ']') return out;
++                if (c != ',') throw new IllegalArgumentException("expected ',' or ']'");
++            }
++        }
++
++        String string() {
++            if (s.charAt(pos) != '"') throw new IllegalArgumentException("expected a string");
++            pos++;
++            StringBuilder sb = new StringBuilder();
++            while (true) {
++                char c = s.charAt(pos++);
++                if (c == '"') return sb.toString();
++                if (c != '\\') { sb.append(c); continue; }
++                char e = s.charAt(pos++);
++                switch (e) {
++                    case '"' -> sb.append('"');
++                    case '\\' -> sb.append('\\');
++                    case '/' -> sb.append('/');
++                    case 'b' -> sb.append('\b');
++                    case 'f' -> sb.append('\f');
++                    case 'n' -> sb.append('\n');
++                    case 'r' -> sb.append('\r');
++                    case 't' -> sb.append('\t');
++                    case 'u' -> {
++                        sb.append((char) Integer.parseInt(s.substring(pos, pos + 4), 16));
++                        pos += 4;
++                    }
++                    default -> throw new IllegalArgumentException("bad escape \\" + e);
++                }
++            }
++        }
++
++        Object number() {
++            int start = pos;
++            while (pos < s.length() && "+-0123456789.eE".indexOf(s.charAt(pos)) >= 0) pos++;
++            String text = s.substring(start, pos);
++            if (text.isEmpty()) throw new IllegalArgumentException("expected a JSON value");
++            boolean fractional = text.indexOf('.') >= 0 || text.indexOf('e') >= 0
++                    || text.indexOf('E') >= 0;
++            return fractional ? (Object) Double.valueOf(text) : (Object) Long.valueOf(text);
++        }
++
++        Object literal(String text, Object value) {
++            if (!s.startsWith(text, pos)) throw new IllegalArgumentException("expected " + text);
++            pos += text.length();
++            return value;
++        }
++
++        void ws() {
++            while (pos < s.length() && Character.isWhitespace(s.charAt(pos))) pos++;
++        }
++    }
++
++    @SuppressWarnings("unchecked")
++    private static Map<String, Object> map(Object v) {
++        return v instanceof Map ? (Map<String, Object>) v : Map.of();
++    }
++
++    @SuppressWarnings("unchecked")
++    private static List<Object> list(Object v) {
++        return v instanceof List ? (List<Object>) v : List.of();
++    }
++
++    private static String string(Object v) {
++        return v instanceof String s ? s : null;
++    }
++
++    private static Integer integer(Object v) {
++        return v instanceof Number n ? Integer.valueOf(n.intValue()) : null;
++    }
++
++    private static boolean isBlank(String s) {
++        return s == null || s.trim().isEmpty();
+     }
+ 
+     // ------------------------------------------------------------------ types

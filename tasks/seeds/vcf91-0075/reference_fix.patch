@@ -1,0 +1,189 @@
+--- a/nsxpolicy/client.go
++++ b/nsxpolicy/client.go
+@@ -2,10 +2,17 @@
+ package nsxpolicy
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
+ 	"net/http"
+ 	"net/url"
++	"strconv"
++	"strings"
++	"sync/atomic"
+ )
+ 
+ // Credentials are the HTTP Basic credentials used for an NSX request.
+@@ -72,13 +79,24 @@
+ 	Body       string
+ }
+ 
+-func (e *HTTPError) Error() string { return http.StatusText(e.StatusCode) }
++func (e *HTTPError) Error() string {
++	detail := strings.TrimSpace(e.Body)
++	if detail == "" {
++		return fmt.Sprintf("nsx policy: HTTP %d %s", e.StatusCode, http.StatusText(e.StatusCode))
++	}
++	return fmt.Sprintf("nsx policy: HTTP %d %s: %s", e.StatusCode, http.StatusText(e.StatusCode), detail)
++}
++
++type credentialSnapshot struct {
++	Credentials
++	generation uint64
++}
+ 
+ // Client is safe for concurrent use after construction.
+ type Client struct {
+ 	baseURL     *url.URL
+ 	httpClient  *http.Client
+-	credentials Credentials
++	credentials atomic.Pointer[credentialSnapshot]
+ }
+ 
+ // NewClient constructs a client using initial credentials.
+@@ -102,7 +120,9 @@
+ 	if httpClient == nil {
+ 		httpClient = http.DefaultClient
+ 	}
+-	return &Client{baseURL: parsed, httpClient: httpClient, credentials: initial}, nil
++	client := &Client{baseURL: parsed, httpClient: httpClient}
++	client.credentials.Store(&credentialSnapshot{Credentials: initial, generation: 1})
++	return client, nil
+ }
+ 
+ // RotateCredentials replaces credentials used by future attempts.
+@@ -110,16 +130,124 @@
+ 	if next.Username == "" || next.Password == "" {
+ 		return errors.New("username and password are required")
+ 	}
+-	c.credentials = next
+-	return nil
++	for {
++		current := c.credentials.Load()
++		updated := &credentialSnapshot{Credentials: next, generation: current.generation + 1}
++		if c.credentials.CompareAndSwap(current, updated) {
++			return nil
++		}
++	}
+ }
+ 
+ // ListGroups invokes ListGroupForDomain.
+-func (c *Client) ListGroups(context.Context, string, ListOptions) (GroupListResult, error) {
+-	return GroupListResult{}, errors.New("ListGroups not implemented")
++func (c *Client) ListGroups(ctx context.Context, domainID string, options ListOptions) (GroupListResult, error) {
++	if domainID == "" {
++		return GroupListResult{}, errors.New("domain ID is required")
++	}
++	query := make(url.Values)
++	if options.Cursor != nil {
++		query.Set("cursor", *options.Cursor)
++	}
++	if options.IncludeMarkForDeleteObjects != nil {
++		query.Set("include_mark_for_delete_objects", strconv.FormatBool(*options.IncludeMarkForDeleteObjects))
++	}
++	if options.IncludedFields != nil {
++		query.Set("included_fields", *options.IncludedFields)
++	}
++	if options.MemberTypes != nil {
++		query.Set("member_types", *options.MemberTypes)
++	}
++	if options.PageSize != nil {
++		query.Set("page_size", strconv.Itoa(*options.PageSize))
++	}
++	if options.SortAscending != nil {
++		query.Set("sort_ascending", strconv.FormatBool(*options.SortAscending))
++	}
++	if options.SortBy != nil {
++		query.Set("sort_by", *options.SortBy)
++	}
++
++	path := "/policy/api/v1/infra/domains/" + url.PathEscape(domainID) + "/groups"
++	body, err := c.do(ctx, http.MethodGet, path, query, nil)
++	if err != nil {
++		return GroupListResult{}, err
++	}
++	var result GroupListResult
++	if err := json.Unmarshal(body, &result); err != nil {
++		return GroupListResult{}, fmt.Errorf("decode ListGroupForDomain response: %w", err)
++	}
++	return result, nil
+ }
+ 
+ // UpdateGroup invokes UpdateGroupForDomain.
+-func (c *Client) UpdateGroup(context.Context, string, string, Group) (Group, error) {
+-	return Group{}, errors.New("UpdateGroup not implemented")
++func (c *Client) UpdateGroup(ctx context.Context, domainID, groupID string, group Group) (Group, error) {
++	if domainID == "" || groupID == "" {
++		return Group{}, errors.New("domain ID and group ID are required")
++	}
++	payload, err := json.Marshal(group)
++	if err != nil {
++		return Group{}, fmt.Errorf("encode UpdateGroupForDomain request: %w", err)
++	}
++	path := "/policy/api/v1/infra/domains/" + url.PathEscape(domainID) + "/groups/" + url.PathEscape(groupID)
++	body, err := c.do(ctx, http.MethodPut, path, nil, payload)
++	if err != nil {
++		return Group{}, err
++	}
++	var result Group
++	if err := json.Unmarshal(body, &result); err != nil {
++		return Group{}, fmt.Errorf("decode UpdateGroupForDomain response: %w", err)
++	}
++	return result, nil
++}
++
++func (c *Client) do(ctx context.Context, method, path string, query url.Values, body []byte) ([]byte, error) {
++	endpoint := strings.TrimRight(c.baseURL.String(), "/") + path
++	if len(query) != 0 {
++		endpoint += "?" + query.Encode()
++	}
++
++	for attempt := 0; attempt < 2; attempt++ {
++		var reader io.Reader
++		if body != nil {
++			reader = bytes.NewReader(body)
++		}
++		request, err := http.NewRequestWithContext(ctx, method, endpoint, reader)
++		if err != nil {
++			return nil, fmt.Errorf("build NSX Policy request: %w", err)
++		}
++		request.Header.Set("Accept", "application/json")
++		if body != nil {
++			request.Header.Set("Content-Type", "application/json")
++		}
++
++		// Take the immutable snapshot as the last request mutation before Do.
++		// A response can therefore determine whether this exact generation was
++		// superseded while it was in flight.
++		used := c.credentials.Load()
++		request.SetBasicAuth(used.Username, used.Password)
++		response, err := c.httpClient.Do(request)
++		if err != nil {
++			return nil, fmt.Errorf("perform NSX Policy request: %w", err)
++		}
++		responseBody, readErr := io.ReadAll(response.Body)
++		closeErr := response.Body.Close()
++		if readErr != nil {
++			return nil, fmt.Errorf("read NSX Policy response: %w", readErr)
++		}
++		if closeErr != nil {
++			return nil, fmt.Errorf("close NSX Policy response: %w", closeErr)
++		}
++
++		if response.StatusCode == http.StatusUnauthorized && attempt == 0 {
++			current := c.credentials.Load()
++			if current.generation != used.generation {
++				continue
++			}
++		}
++		if response.StatusCode < 200 || response.StatusCode >= 300 {
++			return nil, &HTTPError{StatusCode: response.StatusCode, Body: string(responseBody)}
++		}
++		return responseBody, nil
++	}
++	panic("unreachable")
+ }

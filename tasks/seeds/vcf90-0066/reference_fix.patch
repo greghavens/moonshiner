@@ -1,0 +1,387 @@
+diff --git a/src/vcfops_export/__main__.py b/src/vcfops_export/__main__.py
+index 5aef6de..fb561fb 100644
+--- a/src/vcfops_export/__main__.py
++++ b/src/vcfops_export/__main__.py
+@@ -1,16 +1,118 @@
+ """Command line entry point: ``python -m vcfops_export``.
+ 
+-See README.md for the argument list, the exit codes and the behaviour expected of
+-the export flow. Nothing here is implemented yet.
++Exports content from VMware Cloud Foundation Operations and writes the archive to
++disk. See README.md for the arguments and the exit codes.
+ """
+ 
++import argparse
+ import sys
+ 
++from .client import ApiError, AuthError, OperationsClient, TransportError
++from .contract import ContractViolation, load_contract
+ 
+-def main(argv=None):
+-    raise NotImplementedError(
+-        "vcfops_export is not implemented yet: see README.md and docs/contract.json"
++EXIT_OK = 0
++EXIT_ERROR = 1
++EXIT_BAD_REQUEST = 2
++EXIT_EXPORT_FAILED = 3
++EXIT_POLL_EXHAUSTED = 4
++EXIT_AUTH = 5
++
++
++def build_parser():
++    parser = argparse.ArgumentParser(
++        prog="python -m vcfops_export",
++        description="Export content from VMware Cloud Foundation Operations.",
++    )
++    parser.add_argument("--base-url", required=True, help="scheme://host:port of the appliance")
++    parser.add_argument("--username", required=True)
++    parser.add_argument("--password", required=True)
++    parser.add_argument("--auth-source", default=None, help="optional auth source name")
++    parser.add_argument("--scope", required=True, help="ALL or CUSTOM")
++    parser.add_argument(
++        "--content-types", required=True, help="comma-separated content types to export"
++    )
++    parser.add_argument(
++        "--encryption-password",
++        default=None,
++        help="optional key for encrypting sensitive information",
+     )
++    parser.add_argument("--output", required=True, help="where to write the archive")
++    parser.add_argument("--poll-interval", type=float, default=2.0)
++    parser.add_argument("--max-polls", type=int, default=60)
++    return parser
++
++
++def main(argv=None):
++    args = build_parser().parse_args(argv)
++    contract = load_contract()
++
++    # Validate before opening a connection, so a request that the pinned 9.0.0.0
++    # contract forbids is never put on the wire.
++    try:
++        scope = contract.validate_scope(args.scope)
++        content_types = contract.validate_content_types(
++            [item.strip() for item in args.content_types.split(",")]
++        )
++    except ContractViolation as exc:
++        print("error: %s" % exc, file=sys.stderr)
++        return EXIT_BAD_REQUEST
++
++    client = OperationsClient(args.base_url, contract)
++
++    try:
++        client.acquire_token(args.username, args.password, args.auth_source)
++    except AuthError as exc:
++        print("error: authentication failed: %s" % exc, file=sys.stderr)
++        return EXIT_AUTH
++    except (ApiError, TransportError) as exc:
++        print("error: %s" % exc, file=sys.stderr)
++        return EXIT_ERROR
++
++    try:
++        client.export_content(scope, content_types, args.encryption_password)
++
++        def note(attempt, state):
++            print("poll %d: state=%s" % (attempt, state))
++
++        details = client.poll_until_terminal(
++            max_polls=args.max_polls, interval=args.poll_interval, on_poll=note
++        )
++
++        state = details.get(contract.status_field) if details else None
++        if details is None or state not in contract.terminal_states:
++            print(
++                "error: export did not reach a terminal state within %d polls; last state=%r"
++                % (args.max_polls, state),
++                file=sys.stderr,
++            )
++            return EXIT_POLL_EXHAUSTED
++
++        if state in contract.failure_states:
++            print("error: content export finished in state %s" % state, file=sys.stderr)
++            for message in details.get("errorMessages") or []:
++                print("error: %s" % message, file=sys.stderr)
++            if details.get("errorCode"):
++                print("error: errorCode=%s" % details["errorCode"], file=sys.stderr)
++            return EXIT_EXPORT_FAILED
++
++        if state not in contract.success_states:
++            print("error: unexpected terminal state %r" % state, file=sys.stderr)
++            return EXIT_ERROR
++
++        archive = client.download()
++        with open(args.output, "wb") as handle:
++            handle.write(archive)
++        print("wrote %d bytes to %s" % (len(archive), args.output))
++        return EXIT_OK
++
++    except (ApiError, TransportError) as exc:
++        print("error: %s" % exc, file=sys.stderr)
++        return EXIT_ERROR
++    finally:
++        try:
++            client.release_token()
++        except Exception as exc:  # releasing the token is best effort
++            print("warning: could not release token: %s" % exc, file=sys.stderr)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/src/vcfops_export/client.py b/src/vcfops_export/client.py
+new file mode 100644
+index 0000000..80a0c85
+--- /dev/null
++++ b/src/vcfops_export/client.py
+@@ -0,0 +1,156 @@
++"""HTTP client for the five VCF Operations operations named in the contract.
++
++Standard library only. Optional inputs that the caller did not supply are never
++placed in the request: the key is left out of the JSON object and the optional
++header is not sent, rather than being sent as null, "" or [].
++"""
++
++import json
++import time
++import urllib.error
++import urllib.request
++
++
++class TransportError(Exception):
++    """The server could not be reached, or answered something unusable."""
++
++
++class AuthError(Exception):
++    """acquireToken was rejected."""
++
++
++class ApiError(Exception):
++    def __init__(self, operation_id, status, payload):
++        self.operation_id = operation_id
++        self.status = status
++        self.payload = payload
++        detail = ""
++        if isinstance(payload, dict):
++            detail = " ".join(
++                str(payload[key]) for key in ("message", "detail") if payload.get(key)
++            )
++        super().__init__(
++            "%s failed with HTTP %s%s" % (operation_id, status, ": " + detail if detail else "")
++        )
++
++
++class OperationsClient:
++    def __init__(self, base_url, contract, timeout=30.0):
++        self.base_url = base_url.rstrip("/")
++        self.contract = contract
++        self.timeout = timeout
++        self.token = None
++
++    # -- plumbing -----------------------------------------------------------
++
++    def _call(self, operation_id, body=None, extra_headers=None, expect=(200,)):
++        operation = self.contract.operation(operation_id)
++        url = self.base_url + self.contract.request_path(operation_id)
++        headers = {}
++        data = None
++
++        if body is not None:
++            data = json.dumps(body).encode("utf-8")
++            headers["Content-Type"] = operation.get("requestContentType", "application/json")
++        if self.contract.is_authenticated(operation_id):
++            if not self.token:
++                raise TransportError("%s requires a token but none was acquired" % operation_id)
++            headers[self.contract.auth_header_name] = self.contract.auth_header_value(self.token)
++        # Optional headers arrive already filtered: a key is present only when the
++        # caller supplied a value for it.
++        headers.update(extra_headers or {})
++
++        request = urllib.request.Request(
++            url, data=data, headers=headers, method=self.contract.method(operation_id)
++        )
++        try:
++            with urllib.request.urlopen(request, timeout=self.timeout) as response:
++                status = response.status
++                payload = response.read()
++        except urllib.error.HTTPError as exc:
++            raw = exc.read()
++            try:
++                parsed = json.loads(raw) if raw else None
++            except ValueError:
++                parsed = {"message": raw.decode("utf-8", "replace")}
++            raise ApiError(operation_id, exc.code, parsed) from None
++        except urllib.error.URLError as exc:
++            raise TransportError("%s: %s" % (operation_id, exc.reason)) from None
++
++        if status not in expect:
++            raise ApiError(operation_id, status, None)
++        return status, payload
++
++    @staticmethod
++    def _json(payload):
++        if not payload:
++            return None
++        return json.loads(payload.decode("utf-8"))
++
++    # -- operations ---------------------------------------------------------
++
++    def acquire_token(self, username, password, auth_source=None):
++        body = {"username": username, "password": password}
++        if auth_source:
++            body["authSource"] = auth_source
++        try:
++            _, payload = self._call("acquireToken", body=body, expect=(200,))
++        except ApiError as exc:
++            if exc.status == 401:
++                raise AuthError(str(exc)) from None
++            raise
++        document = self._json(payload) or {}
++        self.token = document.get("token")
++        if not self.token:
++            raise AuthError("acquireToken returned no token")
++        return self.token
++
++    def release_token(self):
++        if not self.token:
++            return
++        try:
++            self._call("releaseToken", expect=(200,))
++        finally:
++            self.token = None
++
++    def export_content(self, scope, content_types, encryption_password=None):
++        body = {"scope": scope, "contentTypes": list(content_types)}
++        headers = {}
++        if encryption_password:
++            headers["EncryptionPassword"] = encryption_password
++        _, payload = self._call(
++            "exportContent", body=body, extra_headers=headers, expect=(202,)
++        )
++        return self._json(payload)
++
++    def last_export_operation(self):
++        _, payload = self._call("getLastExportOperation", expect=(200,))
++        return self._json(payload) or {}
++
++    def download(self):
++        _, payload = self._call("download", expect=(200,))
++        return payload
++
++    # -- the async part -----------------------------------------------------
++
++    def poll_until_terminal(self, max_polls=60, interval=2.0, on_poll=None):
++        """Poll getLastExportOperation until the operation state is terminal.
++
++        Returns the terminal operation-details document, or the last document
++        observed if ``max_polls`` was exhausted. The 202 from
++        exportContent says only that the export was queued, so this loop — not
++        that response — decides whether an archive exists.
++        """
++        terminal = set(self.contract.terminal_states)
++        field = self.contract.status_field
++        details = None
++        for attempt in range(max_polls):
++            details = self.last_export_operation()
++            state = details.get(field)
++            if on_poll:
++                on_poll(attempt + 1, state)
++            if state in terminal:
++                return details
++            if attempt + 1 < max_polls:
++                time.sleep(interval)
++        return details
+diff --git a/src/vcfops_export/contract.py b/src/vcfops_export/contract.py
+new file mode 100644
+index 0000000..6751e93
+--- /dev/null
++++ b/src/vcfops_export/contract.py
+@@ -0,0 +1,91 @@
++"""Access to the pinned VCF Operations 9.0.0.0 contract.
++
++Paths, enum vocabularies, authentication metadata and polling states come from
++docs/contract.json, which was derived from the OpenAPI specification.
++"""
++
++import json
++import os
++
++_HERE = os.path.dirname(os.path.abspath(__file__))
++REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
++DEFAULT_CONTRACT_PATH = os.path.join(REPO_ROOT, "docs", "contract.json")
++
++
++class ContractViolation(ValueError):
++    """A value the caller supplied is not permitted by the pinned contract."""
++
++
++class Contract:
++    def __init__(self, document):
++        self._doc = document
++
++    @property
++    def base_path(self):
++        return self._doc["basePath"]
++
++    def operation(self, operation_id):
++        return self._doc["operations"][operation_id]
++
++    def enum(self, name):
++        return list(self._doc["enums"][name])
++
++    @property
++    def auth_header_name(self):
++        return self._doc["security"]["headerName"]
++
++    def auth_header_value(self, token):
++        return self._doc["security"]["headerValueTemplate"].format(token=token)
++
++    @property
++    def status_field(self):
++        return self._doc["polling"]["statusField"]
++
++    @property
++    def terminal_states(self):
++        return list(self._doc["polling"]["terminal"])
++
++    @property
++    def success_states(self):
++        return list(self._doc["polling"]["success"])
++
++    @property
++    def failure_states(self):
++        return list(self._doc["polling"]["failure"])
++
++    def is_authenticated(self, operation_id):
++        return bool(self.operation(operation_id).get("authenticated"))
++
++    def request_path(self, operation_id):
++        return self.operation(operation_id)["path"]
++
++    def method(self, operation_id):
++        return self.operation(operation_id)["method"]
++
++    # -- validation ---------------------------------------------------------
++
++    def validate_scope(self, scope):
++        allowed = self.operation("exportContent")["requestBody"]["properties"]["scope"]["enum"]
++        if scope not in allowed:
++            raise ContractViolation(
++                "scope %r is not defined at %s; allowed values are %s"
++                % (scope, self._doc["source"]["tag"], ", ".join(allowed))
++            )
++        return scope
++
++    def validate_content_types(self, content_types):
++        allowed = set(self.enum("content-export.contentTypes[]"))
++        if not content_types:
++            raise ContractViolation("contentTypes is required and must not be empty")
++        for value in content_types:
++            if value not in allowed:
++                raise ContractViolation(
++                    "content type %r is not defined at %s"
++                    % (value, self._doc["source"]["tag"])
++                )
++        return list(content_types)
++
++
++def load_contract():
++    with open(DEFAULT_CONTRACT_PATH, "r", encoding="utf-8") as handle:
++        return Contract(json.load(handle))

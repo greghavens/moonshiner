@@ -1,0 +1,213 @@
+diff --git a/VcfBundleDownload.psm1 b/VcfBundleDownload.psm1
+new file mode 100644
+index 0000000..b2f397f
+--- /dev/null
++++ b/VcfBundleDownload.psm1
+@@ -0,0 +1,207 @@
++Set-StrictMode -Version Latest
++$ErrorActionPreference = 'Stop'
++
++Import-Module -Name 'VMware.Sdk.Vcf.SddcManager' `
++    -MinimumVersion '13.5.0.25380678' `
++    -ErrorAction Stop
++
++class VcfBundleDownloadFailedException : System.Exception {
++    [string] $BundleId
++    [string] $TaskId
++    [string] $TaskStatus
++    [string] $ErrorCode
++    [string] $ReferenceToken
++
++    VcfBundleDownloadFailedException(
++        [string] $message,
++        [string] $bundleId,
++        [string] $taskId,
++        [string] $taskStatus,
++        [string] $errorCode,
++        [string] $referenceToken
++    ) : base($message) {
++        $this.BundleId = $bundleId
++        $this.TaskId = $taskId
++        $this.TaskStatus = $taskStatus
++        $this.ErrorCode = $errorCode
++        $this.ReferenceToken = $referenceToken
++    }
++}
++
++class VcfBundleDownloadTimeoutException : System.Exception {
++    [string] $BundleId
++    [string] $TaskId
++    [int] $PollCount
++
++    VcfBundleDownloadTimeoutException(
++        [string] $message,
++        [string] $bundleId,
++        [string] $taskId,
++        [int] $pollCount
++    ) : base($message) {
++        $this.BundleId = $bundleId
++        $this.TaskId = $taskId
++        $this.PollCount = $pollCount
++    }
++}
++
++$script:NonTerminalStatuses = @('PENDING', 'IN_PROGRESS')
++$script:SuccessfulTerminalStatuses = @('SUCCESSFUL', 'COMPLETED_WITH_WARNING', 'SKIPPED')
++$script:FailedTerminalStatuses = @('FAILED', 'CANCELLED')
++
++function ConvertTo-NormalizedTaskStatus {
++    param([object] $Status)
++
++    if ($null -eq $Status) { return '' }
++    return ([string] $Status).Trim().ToUpperInvariant() -replace ' ', '_'
++}
++
++function Get-MemberValue {
++    param([object] $InputObject, [string] $Name)
++
++    if ($null -eq $InputObject) { return $null }
++    $member = $InputObject.PSObject.Properties[$Name]
++    if ($null -eq $member) { return $null }
++    return $member.Value
++}
++
++function Start-VcfBundleDownloadAndWait {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory = $true)]
++        [ValidateNotNull()]
++        [object] $Server,
++
++        [Parameter(Mandatory = $true)]
++        [string] $BundleId,
++
++        [Parameter(Mandatory = $false)]
++        [string] $ScheduledTimestamp,
++
++        [Parameter(Mandatory = $false)]
++        [int] $PollLimit = 120,
++
++        [Parameter(Mandatory = $false)]
++        [int] $PollIntervalSeconds = 5,
++
++        [Parameter(Mandatory = $false)]
++        [scriptblock] $SleepAction
++    )
++
++    if ([string]::IsNullOrWhiteSpace($BundleId)) {
++        throw 'BundleId must be a non-empty string.'
++    }
++    if ($PollLimit -lt 1) {
++        throw 'PollLimit must be at least 1.'
++    }
++    if ($PollIntervalSeconds -lt 0) {
++        throw 'PollIntervalSeconds must be zero or greater.'
++    }
++
++    $scheduled = $PSBoundParameters.ContainsKey('ScheduledTimestamp')
++    if ($scheduled -and [string]::IsNullOrWhiteSpace($ScheduledTimestamp)) {
++        throw 'ScheduledTimestamp must be a non-empty string when supplied.'
++    }
++
++    # Pre-flight read so a bad bundle id fails before any download is triggered.
++    $bundle = Invoke-VcfGetBundle -Id $BundleId -Server $Server
++    $bundleVersion = [string] (Get-MemberValue -InputObject $bundle -Name 'Version')
++
++    # Send exactly the member the caller asked for. Anything the caller did not
++    # ask for stays absent from the wire, rather than being sent as null/empty.
++    if ($scheduled) {
++        $downloadSpec = Initialize-VcfBundleDownloadSpec -ScheduledTimestamp $ScheduledTimestamp
++    }
++    else {
++        $downloadSpec = Initialize-VcfBundleDownloadSpec -DownloadNow $true
++    }
++
++    $updateSpec = Initialize-VcfBundleUpdateSpec -BundleDownloadSpec $downloadSpec
++
++    $submission = Invoke-VcfStartBundleDownloadByID `
++        -Id $BundleId `
++        -BundleUpdateSpec $updateSpec `
++        -Server $Server
++
++    $taskId = [string] (Get-MemberValue -InputObject $submission -Name 'Id')
++    if ([string]::IsNullOrWhiteSpace($taskId)) {
++        throw "The bundle download submission for $BundleId did not return a task id."
++    }
++
++    # A 202 only names the work to watch. The terminal state is discovered by
++    # polling getTask, never assumed from the submission response.
++    $pollCount = 0
++    $status = ''
++    $task = $null
++    $isTerminal = $false
++
++    while ($pollCount -lt $PollLimit) {
++        $task = Invoke-VcfGetTask -Id $taskId -Server $Server
++        $pollCount++
++
++        $status = ConvertTo-NormalizedTaskStatus (Get-MemberValue -InputObject $task -Name 'Status')
++        if ($script:SuccessfulTerminalStatuses -ccontains $status -or
++            $script:FailedTerminalStatuses -ccontains $status) {
++            $isTerminal = $true
++            break
++        }
++
++        # Wait only between non-terminal polls: never after a terminal response
++        # and never after the final permitted poll.
++        if ($pollCount -lt $PollLimit) {
++            if ($PSBoundParameters.ContainsKey('SleepAction')) {
++                & $SleepAction $PollIntervalSeconds
++            }
++            else {
++                Start-Sleep -Seconds $PollIntervalSeconds
++            }
++        }
++    }
++
++    if (-not $isTerminal) {
++        throw [VcfBundleDownloadTimeoutException]::new(
++            "Bundle download task $taskId did not reach a terminal state within $pollCount poll(s).",
++            $BundleId,
++            $taskId,
++            $pollCount
++        )
++    }
++
++    if ($script:FailedTerminalStatuses -ccontains $status) {
++        $errorCode = ''
++        $referenceToken = ''
++        $message = "Bundle download task $taskId ended in status $status."
++
++        $taskErrors = Get-MemberValue -InputObject $task -Name 'Errors'
++        if ($null -ne $taskErrors) {
++            $firstError = @($taskErrors) | Select-Object -First 1
++            if ($null -ne $firstError) {
++                $errorCode = [string] (Get-MemberValue -InputObject $firstError -Name 'ErrorCode')
++                $referenceToken = [string] (Get-MemberValue -InputObject $firstError -Name 'ReferenceToken')
++                $errorMessage = [string] (Get-MemberValue -InputObject $firstError -Name 'Message')
++                if (-not [string]::IsNullOrWhiteSpace($errorMessage)) {
++                    $message = $errorMessage
++                }
++            }
++        }
++
++        throw [VcfBundleDownloadFailedException]::new(
++            $message,
++            $BundleId,
++            $taskId,
++            $status,
++            $errorCode,
++            $referenceToken
++        )
++    }
++
++    return [pscustomobject] ([ordered] @{
++        BundleId      = $BundleId
++        BundleVersion = $bundleVersion
++        TaskId        = $taskId
++        Status        = $status
++        PollCount     = $pollCount
++    })
++}
++
++Export-ModuleMember -Function 'Start-VcfBundleDownloadAndWait'

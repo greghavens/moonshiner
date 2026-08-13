@@ -1,0 +1,344 @@
+diff --git a/src/VcfOpsReporting/VcfOpsReporting.psm1 b/src/VcfOpsReporting/VcfOpsReporting.psm1
+index 2111f0f..ef46edf 100644
+--- a/src/VcfOpsReporting/VcfOpsReporting.psm1
++++ b/src/VcfOpsReporting/VcfOpsReporting.psm1
+@@ -4,24 +4,152 @@ Set-StrictMode -Version Latest
+ <#
+     VcfOpsReporting -- on-demand report generation against the VCF Operations API.
+ 
+-    The wire contract these functions must honour is docs/contract.json, which is derived from
+-    the VCF 9.1 vcf-operations OpenAPI document. Read it before changing anything here.
++    The wire contract these functions honour is docs/contract.json, derived from the VCF 9.1
++    vcf-operations OpenAPI document. All HTTP work is built on the VMware.Sdk.Vcf.Ops PowerCLI
++    module (installed by the environment). Nothing here vendors or re-implements that SDK.
+ 
+-    All HTTP work is built on the VMware.Sdk.Vcf.Ops PowerCLI module (installed by the
+-    environment). Nothing in this repository vendors or re-implements that SDK.
++    The SDK is used for three things:
++      1. Connect-VcfOpsServer  -- authentication and session state (acquireToken).
++      2. Get-VcfOpsOperation   -- resolving an operationId to its HTTP method and path template,
++                                  so routes come from the SDK's own contract rather than from
++                                  strings pasted into this file.
++      3. Initialize-VcfOps*    -- building request models. The SDK's serializer is what guarantees
++         + -AsInvokeRestMethodRequest    that properties the caller never set are absent from the
++                                         JSON body rather than emitted as null/""/[].
+ 
+-    NOT IMPLEMENTED. Every public function below throws.
++    Requests are dispatched by this module rather than by the Invoke-VcfOps* wrappers because the
++    SDK's path-parameter serializer does not render [guid] path segments correctly on current .NET
++    (System.Guid gained public instance properties, which that serializer reflects over instead of
++    calling ToString(); the segment comes out as "Variant,4,Version,3"). Building the path from the
++    template returned by Get-VcfOpsOperation keeps the wire shape correct on every runtime.
+ #>
+ 
+ $script:BasePath = '/suite-api'
+ 
++# docs/contract.json -> taskDefined.reportStatus. report.status is a free-form string in the
++# specification; this partition is the task's, not the spec's.
++$script:NonTerminalStatus   = @('QUEUED', 'SCHEDULED', 'RUNNING')
++$script:TerminalSuccess     = @('COMPLETED')
++$script:TerminalFailure     = @('FAILED', 'ABORTED')
++
++# ------------------------------------------------------------------ internals --
++
++function Resolve-VcfOpsRoute {
++    <# Resolve an operationId to its method and path template using the SDK's own operation table. #>
++    [CmdletBinding()]
++    param([Parameter(Mandatory)] [string] $OperationId)
++
++    $op = Get-VcfOpsOperation -Name $OperationId
++    if (-not $op) { throw "The VMware.Sdk.Vcf.Ops operation table has no operation '$OperationId'." }
++    # .Method is a System.Net.Http.HttpMethod; Invoke-RestMethod wants the verb as a string.
++    [pscustomobject]@{
++        OperationId  = $OperationId
++        Method       = [string]$op.Method
++        PathTemplate = [string]$op.Path
++    }
++}
++
++function Build-VcfOpsUri {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] $Session,
++        [Parameter(Mandatory)] [string] $PathTemplate,
++        [hashtable] $PathParameters = @{},
++        [hashtable] $QueryParameters = @{}
++    )
++
++    $path = $PathTemplate
++    foreach ($name in $PathParameters.Keys) {
++        $value = [string]$PathParameters[$name]
++        if ([string]::IsNullOrWhiteSpace($value)) { throw "Path parameter '$name' has no value." }
++        $path = $path -replace ('\{' + [regex]::Escape($name) + '\}'), [uri]::EscapeDataString($value)
++    }
++    if ($path -match '\{|\}') { throw "Unsubstituted path parameter in '$path'." }
++
++    $uri = $Session.ServiceUri.TrimEnd('/') + $script:BasePath + $path
++
++    # Only parameters the caller actually supplied reach the query string; an omitted optional
++    # parameter must not appear at all, not even as an empty value.
++    if ($QueryParameters.Count -gt 0) {
++        $pairs = foreach ($name in ($QueryParameters.Keys | Sort-Object)) {
++            '{0}={1}' -f [uri]::EscapeDataString($name), [uri]::EscapeDataString([string]$QueryParameters[$name])
++        }
++        $uri += '?' + ($pairs -join '&')
++    }
++    $uri
++}
++
++function Invoke-VcfOpsContractRequest {
++    <# Single dispatch point for every operation this module performs. #>
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] $Session,
++        [Parameter(Mandatory)] [string] $OperationId,
++        [hashtable] $PathParameters = @{},
++        [hashtable] $QueryParameters = @{},
++        [string] $JsonBody,
++        [string] $OutFile
++    )
++
++    $route = Resolve-VcfOpsRoute -OperationId $OperationId
++    $uri = Build-VcfOpsUri -Session $Session -PathTemplate $route.PathTemplate `
++        -PathParameters $PathParameters -QueryParameters $QueryParameters
++
++    $params = @{
++        Uri     = $uri
++        Method  = $route.Method
++        Headers = @{ Authorization = 'OpsToken ' + $Session.Token }
++    }
++    if ($PSBoundParameters.ContainsKey('JsonBody')) {
++        $params.ContentType = 'application/json'
++        $params.Body        = $JsonBody
++    }
++    if ($Session.SkipCertificateCheck) { $params.SkipCertificateCheck = $true }
++
++    if ($PSBoundParameters.ContainsKey('OutFile') -and $OutFile) {
++        $params.Headers['Accept'] = '*/*'
++        $params.OutFile = $OutFile
++        Invoke-WebRequest @params | Out-Null
++        return
++    }
++
++    $params.Headers['Accept'] = 'application/json'
++    Invoke-RestMethod @params
++}
++
++function Get-VcfOpsSerializedBody {
++    <#
++        Hand a model to the SDK and take back the exact JSON it would put on the wire. This is what
++        keeps unset optional properties out of the body -- the omission rule is the SDK serializer's,
++        not a hand-rolled hashtable's.
++    #>
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] $Session,
++        [Parameter(Mandatory)] [string] $OperationId,
++        [Parameter(Mandatory)] $Model
++    )
++
++    $emitted = switch ($OperationId) {
++        'createReport' { Invoke-VcfOpsCreateReport -Server $Session.Server -Report $Model -AsInvokeRestMethodRequest }
++        default        { throw "No serializer wired up for operation '$OperationId'." }
++    }
++
++    # -AsInvokeRestMethodRequest emits a collection whose first element is null; pick the request.
++    $request = @($emitted) |
++        Where-Object { $null -ne $_ -and $_.PSObject.Properties.Name -contains 'Body' } |
++        Select-Object -First 1
++    if (-not $request) { throw "The SDK did not return a serialized request for '$OperationId'." }
++
++    [string]$request.Body
++}
++
++# -------------------------------------------------------------------- public --
++
+ function Connect-VcfOpsReportingSession {
+     <#
+     .SYNOPSIS
+         Establish an authenticated session against a VCF Operations instance.
+-    .DESCRIPTION
+-        Wraps Connect-VcfOpsServer. The session object returned by this function is what every
+-        other function in this module takes as -Session.
+     #>
+     [CmdletBinding()]
+     param(
+@@ -32,18 +160,38 @@ function Connect-VcfOpsReportingSession {
+         [string] $AuthSource,
+         [switch] $SkipCertificateCheck
+     )
+-    throw [System.NotImplementedException]::new('Connect-VcfOpsReportingSession is not implemented.')
++
++    $connect = @{
++        Server   = $Server
++        Protocol = $Protocol
++        User     = $Credential.UserName
++        Password = $Credential.Password
++    }
++    if ($PSBoundParameters.ContainsKey('Port')) { $connect.Port = $Port }
++    if ($PSBoundParameters.ContainsKey('AuthSource')) { $connect.AuthSource = $AuthSource }
++    if ($SkipCertificateCheck) { $connect.IgnoreInvalidCertificate = $true }
++
++    $srv = Connect-VcfOpsServer @connect
++
++    if (-not $srv -or -not $srv.SessionSecret) {
++        throw "Failed to establish a VCF Operations session against $Server."
++    }
++
++    [pscustomobject]@{
++        PSTypeName           = 'VcfOpsReporting.Session'
++        Server               = $srv
++        ServiceUri           = [string]$srv.ServiceUri
++        Token                = [string]$srv.SessionSecret
++        User                 = [string]$srv.User
++        ProductVersion       = [string]$srv.ProductVersion
++        SkipCertificateCheck = [bool]$SkipCertificateCheck
++    }
+ }
+ 
+ function Start-VcfOpsReportGeneration {
+     <#
+     .SYNOPSIS
+         Request generation of a report. Returns as soon as the request is accepted.
+-    .DESCRIPTION
+-        Report generation is asynchronous: this returns a report whose status is not yet terminal.
+-        Feed the returned Id to Wait-VcfOpsReportGeneration.
+-
+-        Only the parameters the caller actually supplies may appear in the request body.
+     #>
+     [CmdletBinding()]
+     param(
+@@ -56,17 +204,31 @@ function Start-VcfOpsReportGeneration {
+         [string] $TraversalSpecName,
+         [switch] $Publish
+     )
+-    throw [System.NotImplementedException]::new('Start-VcfOpsReportGeneration is not implemented.')
++
++    # Only bind what the caller supplied. Anything left unbound never reaches the model, so the
++    # SDK serializer leaves it out of the body entirely.
++    $model = @{
++        ReportDefinitionId = $ReportDefinitionId
++        ResourceId         = $ResourceId
++    }
++    if ($PSBoundParameters.ContainsKey('Name'))        { $model.Name = $Name }
++    if ($PSBoundParameters.ContainsKey('Description')) { $model.Description = $Description }
++    if ($PSBoundParameters.ContainsKey('Subject'))     { $model.Subject = [System.Collections.Generic.List[string]]$Subject }
++    if ($PSBoundParameters.ContainsKey('TraversalSpecName')) {
++        $model.TraversalSpec = Initialize-VcfOpstraversalspec -Name $TraversalSpecName
++    }
++    if ($Publish.IsPresent) { $model.Publish = $true }
++
++    $report = Initialize-VcfOpsreport @model
++    $body   = Get-VcfOpsSerializedBody -Session $Session -OperationId 'createReport' -Model $report
++
++    Invoke-VcfOpsContractRequest -Session $Session -OperationId 'createReport' -JsonBody $body
+ }
+ 
+ function Wait-VcfOpsReportGeneration {
+     <#
+     .SYNOPSIS
+         Poll a report until its status reaches a terminal state.
+-    .DESCRIPTION
+-        Returns the final report on terminal success. Throws on terminal failure and on timeout.
+-        The terminal/non-terminal partition is recorded in docs/contract.json under
+-        taskDefined.reportStatus.
+     #>
+     [CmdletBinding()]
+     param(
+@@ -75,16 +237,34 @@ function Wait-VcfOpsReportGeneration {
+         [double] $PollIntervalSeconds = 5,
+         [double] $TimeoutSeconds = 900
+     )
+-    throw [System.NotImplementedException]::new('Wait-VcfOpsReportGeneration is not implemented.')
++
++    $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSeconds)
++    $last = $null
++
++    while ($true) {
++        $report = Invoke-VcfOpsContractRequest -Session $Session -OperationId 'getReport' `
++            -PathParameters @{ id = $ReportId }
++
++        $last = if ($report.PSObject.Properties.Name -contains 'status') { [string]$report.status } else { '' }
++
++        if ($script:TerminalSuccess -contains $last) { return $report }
++        if ($script:TerminalFailure -contains $last) {
++            throw "Report $ReportId finished in terminal state '$last'."
++        }
++        if ($script:NonTerminalStatus -notcontains $last) {
++            Write-Verbose "Report $ReportId reported unrecognised status '$last'; continuing to poll."
++        }
++        if ([datetime]::UtcNow -ge $deadline) {
++            throw "Timed out after $TimeoutSeconds s waiting for report $ReportId to reach a terminal state (last status '$last')."
++        }
++        Start-Sleep -Seconds $PollIntervalSeconds
++    }
+ }
+ 
+ function Save-VcfOpsReport {
+     <#
+     .SYNOPSIS
+         Download a generated report to disk.
+-    .DESCRIPTION
+-        -Format is optional. When the caller omits it the request must not carry a format query
+-        parameter at all.
+     #>
+     [CmdletBinding()]
+     param(
+@@ -93,16 +273,21 @@ function Save-VcfOpsReport {
+         [Parameter(Mandatory)] [string] $Path,
+         [ValidateSet('CSV', 'PDF')] [string] $Format
+     )
+-    throw [System.NotImplementedException]::new('Save-VcfOpsReport is not implemented.')
++
++    # 'format' is optional in the contract: when the caller omits it, no query parameter is sent.
++    $query = @{}
++    if ($PSBoundParameters.ContainsKey('Format')) { $query.format = $Format }
++
++    Invoke-VcfOpsContractRequest -Session $Session -OperationId 'downloadReport' `
++        -PathParameters @{ id = $ReportId } -QueryParameters $query -OutFile $Path
++
++    Get-Item -LiteralPath $Path
+ }
+ 
+ function Invoke-VcfOpsReportRun {
+     <#
+     .SYNOPSIS
+         Generate a report, wait for it to finish, and download it.
+-    .DESCRIPTION
+-        The end-to-end asynchronous flow: start, poll to a terminal state, then download.
+-        Nothing is downloaded if generation does not reach terminal success.
+     #>
+     [CmdletBinding()]
+     param(
+@@ -119,7 +304,30 @@ function Invoke-VcfOpsReportRun {
+         [double] $PollIntervalSeconds = 5,
+         [double] $TimeoutSeconds = 900
+     )
+-    throw [System.NotImplementedException]::new('Invoke-VcfOpsReportRun is not implemented.')
++
++    $start = @{ Session = $Session; ReportDefinitionId = $ReportDefinitionId; ResourceId = $ResourceId }
++    foreach ($p in 'Name', 'Description', 'Subject', 'TraversalSpecName') {
++        if ($PSBoundParameters.ContainsKey($p)) { $start[$p] = $PSBoundParameters[$p] }
++    }
++    if ($Publish.IsPresent) { $start.Publish = $true }
++
++    $created = Start-VcfOpsReportGeneration @start
++    if (-not $created -or -not $created.id) {
++        throw 'createReport did not return a report identifier.'
++    }
++
++    $final = Wait-VcfOpsReportGeneration -Session $Session -ReportId $created.id `
++        -PollIntervalSeconds $PollIntervalSeconds -TimeoutSeconds $TimeoutSeconds
++
++    $save = @{ Session = $Session; ReportId = $created.id; Path = $Path }
++    if ($PSBoundParameters.ContainsKey('Format')) { $save.Format = $Format }
++    $file = Save-VcfOpsReport @save
++
++    [pscustomobject]@{
++        ReportId = [string]$created.id
++        Status   = [string]$final.status
++        Path     = $file.FullName
++    }
+ }
+ 
+ Export-ModuleMember -Function @(

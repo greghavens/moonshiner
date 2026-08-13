@@ -1,0 +1,155 @@
+--- a/src/vcflcm/client.py
++++ b/src/vcflcm/client.py
+@@ -9,7 +9,7 @@ import urllib.parse
+ import urllib.request
+ 
+ from .contract import Contract, Operation, load_contract
+-from .errors import ApiError
++from .errors import ApiError, InvalidApplySpec
+ 
+ GET_INIT_SPEC = "Vcenter.Lcm.Deployment.MigrationUpgrade_get"
+ APPLY = "Vcenter.Lcm.Deployment.MigrationUpgrade_apply"
+@@ -18,7 +18,12 @@ CANCEL = "Vcenter.Lcm.Deployment.MigrationUpgrade_cancel"
+ 
+ 
+ class MigrationUpgradeClient:
+-    """Issues the contract operations against one vCenter appliance."""
++    """Issues the contract operations against one vCenter appliance.
++
++    Every request carries the ``Accept`` header and the session header named by
++    the contract security scheme. A request that has no body is sent without a
++    body and without a ``Content-Type`` header.
++    """
+ 
+     def __init__(
+         self,
+@@ -49,10 +54,12 @@ class MigrationUpgradeClient:
+         operation = self.contract.operation(operation_id)
+         headers = {
+             "Accept": self.contract.accept,
+-            "Content-Type": self.contract.request_content_type,
+             self.contract.session_header: self.session_id,
+         }
+-        data = json.dumps(body, separators=(",", ":"), sort_keys=True).encode("utf-8")
++        data = None
++        if body is not None:
++            data = json.dumps(body, separators=(",", ":"), sort_keys=True).encode("utf-8")
++            headers["Content-Type"] = self.contract.request_content_type
+ 
+         request = urllib.request.Request(
+             self._url(operation), data=data, headers=headers, method=operation.method
+@@ -74,13 +81,30 @@ class MigrationUpgradeClient:
+     def apply(
+         self, *, pause: str | None = None, start_switchover: str | None = None
+     ) -> None:
+-        """``Vcenter.Lcm.Deployment.MigrationUpgrade_apply``."""
+-
+-        spec: dict[str, Any] = {
+-            "pause": pause,
+-            "start_switchover": start_switchover,
+-        }
+-        self._request(APPLY, body=spec)
++        """``Vcenter.Lcm.Deployment.MigrationUpgrade_apply``.
++
++        Both ApplySpec properties are optional; an unset property is omitted
++        from the body. When neither is set the ApplySpec itself is unset and no
++        body is sent, because the contract marks the request body optional.
++        """
++
++        schema = self.contract.operation(APPLY).request_schema
++        properties = schema.get("properties", {})
++        if pause is not None and start_switchover is not None:
++            raise InvalidApplySpec(
++                "pause and start_switchover cannot be set together; the "
++                "specification reports Vapi.Std.Errors.InvalidArgument"
++            )
++        allowed = properties.get("pause", {}).get("enum", [])
++        if pause is not None and pause not in allowed:
++            raise InvalidApplySpec(f"pause must be one of {sorted(allowed)}, got {pause!r}")
++
++        spec: dict[str, Any] = {}
++        if pause is not None:
++            spec["pause"] = pause
++        if start_switchover is not None:
++            spec["start_switchover"] = start_switchover
++        self._request(APPLY, body=spec or None)
+ 
+     def get_status(self) -> Mapping[str, Any]:
+         """``Vcenter.Lcm.Deployment.MigrationUpgrade.Status_get``."""
+--- a/src/vcflcm/upgrade.py
++++ b/src/vcflcm/upgrade.py
+@@ -7,6 +7,7 @@ import time
+ from typing import Any, Callable, Mapping
+ 
+ from .client import MigrationUpgradeClient
++from .errors import ApiError, UpgradeNotConfigured, UpgradePollTimeout
+ 
+ #: ``Vcenter.Lcm.Deployment.Common.Status`` values that end a run.
+ TERMINAL_STATUSES = frozenset({"SUCCEEDED", "FAILED", "CANCELED"})
+@@ -27,7 +28,13 @@ class UpgradeOutcome:
+ 
+ 
+ class MigrationUpgradeDriver:
+-    """Applies the configured upgrade and reports the resulting status."""
++    """Applies the configured upgrade and polls it to a terminal status.
++
++    ``apply`` answers 204 with no body, so completion is never inferred from
++    the apply response: the run is only complete once
++    ``Vcenter.Lcm.Deployment.MigrationUpgrade.Status_get`` reports a status in
++    :data:`TERMINAL_STATUSES` for a sample that describes a running upgrade.
++    """
+ 
+     def __init__(
+         self,
+@@ -57,12 +64,47 @@ class MigrationUpgradeDriver:
+         cancel_on_failure: bool = False,
+     ) -> UpgradeOutcome:
+         self._polls = 0
+-        self.client.get_init_spec()
++        try:
++            self.client.get_init_spec()
++        except ApiError as exc:
++            if exc.status == 404:
++                raise UpgradeNotConfigured(
++                    "no migration upgrade is configured on the appliance"
++                ) from exc
++            raise
++
+         self.client.apply(pause=pause, start_switchover=start_switchover)
+ 
+-        sample = self.client.get_status()
+-        self._polls += 1
+-        return self._outcome(sample, False)
++        sample = self._poll_until()
++        canceled = False
++        if sample.get("status") == "FAILED" and cancel_on_failure:
++            self.client.cancel()
++            canceled = True
++            sample = self._poll_until(target="CANCELED")
++        return self._outcome(sample, canceled)
++
++    # -- polling -----------------------------------------------------------
++
++    def _poll_until(self, target: str | None = None) -> Mapping[str, Any]:
++        last_status: str | None = None
++        while self._polls < self.max_polls:
++            self._sleep(self.poll_interval)
++            self._polls += 1
++            sample = self.client.get_status()
++            if not isinstance(sample, Mapping):
++                continue
++            # A sample without current_state reports that no upgrade is running,
++            # so it cannot be the outcome of the apply that was just issued.
++            if not sample.get("current_state"):
++                continue
++            last_status = sample.get("status")
++            if target is not None:
++                if last_status == target:
++                    return sample
++                continue
++            if last_status in TERMINAL_STATUSES:
++                return sample
++        raise UpgradePollTimeout(self._polls, last_status)
+ 
+     def _outcome(self, sample: Mapping[str, Any], canceled: bool) -> UpgradeOutcome:
+         upgrade_info = sample.get("upgrade_info") or {}

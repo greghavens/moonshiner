@@ -1,0 +1,284 @@
+diff --git a/src/VcfOpsAlertTriage/VcfOpsAlertTriage.psm1 b/src/VcfOpsAlertTriage/VcfOpsAlertTriage.psm1
+index 88fff28..63445fc 100644
+--- a/src/VcfOpsAlertTriage/VcfOpsAlertTriage.psm1
++++ b/src/VcfOpsAlertTriage/VcfOpsAlertTriage.psm1
+@@ -1,13 +1,224 @@
+ Set-StrictMode -Version Latest
+ 
++# The SDK surfaces a rejected access token as this exception, wrapped in a
++# PowerCLI VimException.
++$script:NotAuthenticatedType = 'VMware.Binding.OpenApi.Client.Exceptions.NotAuthenticatedApiException'
++
++function Test-TriageProperty {
++    param(
++        [AllowNull()]$InputObject,
++        [Parameter(Mandatory = $true)][string]$Name
++    )
++
++    if ($null -eq $InputObject) { return $false }
++    return ($InputObject.PSObject.Properties.Name -contains $Name)
++}
++
++function Read-TriageConfig {
++    param([Parameter(Mandatory = $true)][string]$Path)
++
++    if (-not (Test-Path -LiteralPath $Path)) {
++        throw "Run configuration '$Path' was not found."
++    }
++
++    $config = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
++    foreach ($name in @('server', 'protocol', 'port', 'user', 'password', 'pageSize', 'batchSize', 'query', 'assignOwnership', 'suspend')) {
++        if (-not (Test-TriageProperty -InputObject $config -Name $name)) {
++            throw "Run configuration '$Path' is missing the '$name' setting."
++        }
++    }
++    if ([int]$config.batchSize -lt 1) { throw 'batchSize must be at least 1.' }
++    if ([int]$config.pageSize -lt 1) { throw 'pageSize must be at least 1.' }
++
++    return $config
++}
++
++function Connect-TriageServer {
++    param([Parameter(Mandatory = $true)]$Config)
++
++    $parameters = @{
++        Server      = [string]$Config.server
++        User        = [string]$Config.user
++        Password    = (ConvertTo-SecureString -String ([string]$Config.password) -AsPlainText -Force)
++        Protocol    = [string]$Config.protocol
++        Port        = [int]$Config.port
++        NotDefault  = $true
++        ErrorAction = 'Stop'
++    }
++    if (Test-TriageProperty -InputObject $Config -Name 'authSource') {
++        $parameters['AuthSource'] = [string]$Config.authSource
++    }
++    if ((Test-TriageProperty -InputObject $Config -Name 'ignoreInvalidCertificate') -and $Config.ignoreInvalidCertificate) {
++        $parameters['IgnoreInvalidCertificate'] = $true
++    }
++
++    return Connect-VcfOpsServer @parameters
++}
++
++function Reset-TriageAccessToken {
++    <#
++        Re-authenticates in place. The connection object keeps its identity, so
++        every subsequent SDK call carries the new access token without the
++        session being torn down and rebuilt.
++    #>
++    param([Parameter(Mandatory = $true)][hashtable]$Session)
++
++    $client = $Session.Server.GetClient()
++    $null = $client.Connect()
++}
++
++function Test-TriageTokenRejected {
++    param([Parameter(Mandatory = $true)][System.Management.Automation.ErrorRecord]$ErrorRecord)
++
++    $exception = $ErrorRecord.Exception
++    while ($null -ne $exception) {
++        if ($exception.GetType().FullName -eq $script:NotAuthenticatedType) { return $true }
++        if ($exception.Message -match '(^|\D)401(\D|$)') { return $true }
++        $exception = $exception.InnerException
++    }
++    return $false
++}
++
++function Invoke-TriageCall {
++    <#
++        Runs one SDK call. If the deployment rejects the access token, a
++        replacement is acquired and the refused call is replayed once, so the
++        in-flight unit of work finishes instead of being dropped. Only the
++        refused call is replayed, so work that already succeeded is never re-sent.
++    #>
++    param(
++        [Parameter(Mandatory = $true)][hashtable]$Session,
++        [Parameter(Mandatory = $true)][scriptblock]$Call
++    )
++
++    try {
++        return & $Call $Session.Server
++    } catch {
++        if (-not (Test-TriageTokenRejected -ErrorRecord $_)) { throw }
++
++        Write-Verbose 'The access token was rejected; acquiring a replacement and replaying the pending call.'
++        # Connect-VcfOpsServer would hand back the cached connection for this
++        # user@host:port instead of re-authenticating, so refresh the token on
++        # the live connection. The dead token is not released: the sweep still
++        # owns the session and releases it once, at the end.
++        Reset-TriageAccessToken -Session $Session
++        $Session.TokenAcquisitions++
++        $Session.Replays++
++        return & $Call $Session.Server
++    }
++}
++
++function New-TriageAlertQuery {
++    <#
++        Builds the alert-query body from the run configuration. A filter the
++        configuration does not set is left off the object entirely, so the SDK
++        omits it from the wire instead of sending null or an empty list.
++    #>
++    param([Parameter(Mandatory = $true)]$Query)
++
++    $parameters = @{}
++    if (Test-TriageProperty -InputObject $Query -Name 'activeOnly') {
++        $parameters['ActiveOnly'] = [bool]$Query.activeOnly
++    }
++    if (Test-TriageProperty -InputObject $Query -Name 'alertName') {
++        $parameters['AlertName'] = [string]$Query.alertName
++    }
++    $listFilters = [ordered]@{
++        alertCriticality  = 'AlertCriticality'
++        alertStatus       = 'AlertStatus'
++        alertControlState = 'AlertControlState'
++    }
++    foreach ($jsonName in $listFilters.Keys) {
++        if (-not (Test-TriageProperty -InputObject $Query -Name $jsonName)) { continue }
++        $values = @($Query.$jsonName)
++        if ($values.Count -eq 0) { continue }
++        $parameters[$listFilters[$jsonName]] = $values
++    }
++
++    return Initialize-VcfOpsalertquery @parameters
++}
++
++function Get-TriageAlerts {
++    param([Parameter(Mandatory = $true)][hashtable]$Session)
++
++    $config = $Session.Config
++    $query = New-TriageAlertQuery -Query $config.query
++    $pageSize = [int]$config.pageSize
++
++    $collected = [System.Collections.Generic.List[object]]::new()
++    $page = 0
++    $total = 0
++    do {
++        $pageNumber = $page
++        $result = Invoke-TriageCall -Session $Session -Call {
++            param($server)
++            Invoke-VcfOpsQueryAlert -AlertQuery $query -Server $server -Page $pageNumber -PageSize $pageSize -ErrorAction Stop
++        }
++        $Session.Pages++
++
++        $total = 0
++        if ($null -ne $result.PageInfo -and $null -ne $result.PageInfo.TotalCount) {
++            $total = [int]$result.PageInfo.TotalCount
++        }
++
++        # The generated model exposes the alert collection as _Alerts, because
++        # 'Alerts' would collide with the name of the model itself.
++        $batch = @()
++        if ($null -ne $result._Alerts) { $batch = @($result._Alerts) }
++        foreach ($alert in $batch) { $collected.Add($alert) }
++
++        $page++
++    } while ($collected.Count -lt $total -and $batch.Count -gt 0)
++
++    return , $collected.ToArray()
++}
++
++function Submit-TriageAction {
++    param(
++        [Parameter(Mandatory = $true)][hashtable]$Session,
++        [Parameter(Mandatory = $true)][string]$Action,
++        [Parameter(Mandatory = $true)][object[]]$Alerts,
++        [Parameter(Mandatory = $true)][hashtable]$ActionParameter
++    )
++
++    $applied = [System.Collections.Generic.List[string]]::new()
++    $batchSize = [int]$Session.Config.batchSize
++
++    for ($offset = 0; $offset -lt $Alerts.Count; $offset += $batchSize) {
++        $last = [Math]::Min($offset + $batchSize, $Alerts.Count) - 1
++        $slice = @($Alerts[$offset..$last])
++        $ids = [guid[]]@($slice | ForEach-Object { [guid]::Parse([string]$_.AlertId) })
++
++        $parameters = @{
++            Action      = $Action
++            UuidValues  = (Initialize-VcfOpsuuidvalues -Uuids $ids)
++            ErrorAction = 'Stop'
++        }
++        foreach ($key in $ActionParameter.Keys) { $parameters[$key] = $ActionParameter[$key] }
++
++        $null = Invoke-TriageCall -Session $Session -Call {
++            param($server)
++            Invoke-VcfOpsModifyAlerts @parameters -Server $server
++        }
++
++        $Session.Batches++
++        foreach ($id in $ids) { $applied.Add($id.ToString()) }
++    }
++
++    return , $applied.ToArray()
++}
++
+ <#
+ .SYNOPSIS
+     Runs one alert triage sweep against a VMware Cloud Foundation Operations 9.0
+     deployment.
+ 
+ .DESCRIPTION
+-    Not implemented yet. See README.md for the run configuration schema, the
+-    triage policy and the summary object this function has to return.
++    Pages through the alerts that match the configured filter, assigns ownership
++    of the alerts at the configured criticality, suspends the rest, and releases
++    the access token. If the deployment rejects the access token part way through
++    the sweep, a replacement is acquired and the refused call is replayed, so no
++    completed work is repeated and no alert is skipped.
+ 
+ .PARAMETER ConfigPath
+     Path to the JSON run configuration.
+@@ -19,7 +230,51 @@ function Invoke-VcfOpsAlertTriage {
+         [string]$ConfigPath
+     )
+ 
+-    throw [System.NotImplementedException]::new('Invoke-VcfOpsAlertTriage has not been implemented yet.')
++    $config = Read-TriageConfig -Path $ConfigPath
++
++    $session = @{
++        Config            = $config
++        Server            = $null
++        TokenAcquisitions = 0
++        Replays           = 0
++        Pages             = 0
++        Batches           = 0
++    }
++
++    $session.Server = Connect-TriageServer -Config $config
++    $session.TokenAcquisitions++
++
++    $alerts = Get-TriageAlerts -Session $session
++
++    $ownershipLevel = [string]$config.assignOwnership.alertCriticality
++    $toAssign = @($alerts | Where-Object { [string]$_.AlertLevel -eq $ownershipLevel })
++    $toSuspend = @($alerts | Where-Object { [string]$_.AlertLevel -ne $ownershipLevel })
++
++    $assigned = @()
++    if ($toAssign.Count -gt 0) {
++        $assigned = Submit-TriageAction -Session $session -Action 'assignownership' -Alerts $toAssign -ActionParameter @{
++            UserAccountID = [string]$config.assignOwnership.userAccountId
++        }
++    }
++
++    $suspended = @()
++    if ($toSuspend.Count -gt 0) {
++        $suspended = Submit-TriageAction -Session $session -Action 'suspend' -Alerts $toSuspend -ActionParameter @{
++            Minutes = [int]$config.suspend.minutes
++        }
++    }
++
++    Invoke-VcfOpsReleaseToken -Server $session.Server -ErrorAction Stop | Out-Null
++
++    return [pscustomobject]@{
++        tokenAcquisitions = $session.TokenAcquisitions
++        pagesRead         = $session.Pages
++        alertsSeen        = $alerts.Count
++        batchesSubmitted  = $session.Batches
++        batchesRetried    = $session.Replays
++        assignedAlertIds  = [string[]]$assigned
++        suspendedAlertIds = [string[]]$suspended
++    }
+ }
+ 
+ Export-ModuleMember -Function 'Invoke-VcfOpsAlertTriage'

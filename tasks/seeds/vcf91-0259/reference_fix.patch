@@ -1,0 +1,457 @@
+diff --git a/src/vcfops_report/cli.py b/src/vcfops_report/cli.py
+index 57d7f4d..51b9453 100644
+--- a/src/vcfops_report/cli.py
++++ b/src/vcfops_report/cli.py
+@@ -1,56 +1,100 @@
+ """Command line entry point: ``python3 -m vcfops_report``.
+ 
+-Stub. Implement ``build_parser`` and ``main`` so that the command below runs the
+-full workflow and writes the report to disk::
+-
+-    python3 -m vcfops_report \\
+-        --base-url http://127.0.0.1:8080/suite-api \\
+-        --username report-runner --password '...' \\
+-        --report-definition-id <uuid> --resource-id <uuid> \\
+-        --format CSV --output report.csv
+-
+-Required options: --base-url, --username, --password, --report-definition-id,
+---resource-id, --output.
+-Optional: --auth-source, --format (one of the contract's formatValues; omitted
+-means the caller did not choose one), --name, --description, --subject
+-(repeatable), --publish/--no-publish, --poll-interval, --poll-timeout,
+---request-timeout.
+-
+-On success: write the report bytes to --output, print exactly one JSON object
+-to stdout and exit 0::
+-
+-    {"reportId": "...", "status": "COMPLETED", "polls": 3,
+-     "outputPath": "report.csv", "bytes": 61}
+-
+-On failure: write nothing to --output, print exactly one JSON object to stderr
+-and exit 1::
+-
+-    {"error": "ReportGenerationFailed", "message": "..."}
+-
+-where "error" is the exception's class name.
+-
+-The token must be released before the process exits, on the success path and on
+-the failure path alike.
++Runs the full report workflow against a VCF Operations endpoint and writes the
++generated report to disk.
+ """
+ 
+ from __future__ import annotations
+ 
+-import argparse  # noqa: F401
+-import json  # noqa: F401
+-import sys  # noqa: F401
++import argparse
++import json
++import sys
+ 
+-from .client import VcfOperationsClient  # noqa: F401
+-from .errors import VcfOperationsError  # noqa: F401
++from .client import ACCEPT_BY_FORMAT, VcfOperationsClient
++from .errors import VcfOperationsError
+ 
+ 
+ def build_parser():
+     """Return the argparse.ArgumentParser for the command described above."""
+-    raise NotImplementedError
++    parser = argparse.ArgumentParser(
++        prog="vcfops_report",
++        description="Generate a VCF Operations report and download it once it completes.",
++    )
++    parser.add_argument("--base-url", required=True, help="API root including /suite-api")
++    parser.add_argument("--username", required=True)
++    parser.add_argument("--password", required=True)
++    parser.add_argument("--auth-source", default=None, help="authentication source name")
++    parser.add_argument("--report-definition-id", required=True)
++    parser.add_argument("--resource-id", required=True)
++    parser.add_argument("--output", required=True, help="where to write the report")
++    parser.add_argument(
++        "--format",
++        dest="report_format",
++        choices=sorted(ACCEPT_BY_FORMAT),
++        default=None,
++        help="report format; omit to accept the server default",
++    )
++    parser.add_argument("--name", default=None, help="name for the generated report")
++    parser.add_argument("--description", default=None)
++    parser.add_argument(
++        "--subject", action="append", default=None, help="report subject; repeatable"
++    )
++    publish = parser.add_mutually_exclusive_group()
++    publish.add_argument("--publish", dest="publish", action="store_true", default=None)
++    publish.add_argument("--no-publish", dest="publish", action="store_false")
++    parser.add_argument("--poll-interval", type=float, default=5.0)
++    parser.add_argument("--poll-timeout", type=float, default=600.0)
++    parser.add_argument("--request-timeout", type=float, default=30.0)
++    return parser
+ 
+ 
+ def main(argv=None):
+     """Run the CLI. Returns the process exit status."""
+-    raise NotImplementedError
++    args = build_parser().parse_args(argv)
++
++    client = VcfOperationsClient(
++        args.base_url,
++        args.username,
++        args.password,
++        auth_source=args.auth_source,
++        poll_interval=args.poll_interval,
++        poll_timeout=args.poll_timeout,
++        request_timeout=args.request_timeout,
++    )
++    try:
++        # The context manager releases the token on both paths out of here.
++        with client as session:
++            result = session.generate_report(
++                args.report_definition_id,
++                args.resource_id,
++                report_format=args.report_format,
++                name=args.name,
++                description=args.description,
++                subject=args.subject,
++                publish=args.publish,
++            )
++    except VcfOperationsError as exc:
++        sys.stderr.write(
++            json.dumps({"error": type(exc).__name__, "message": str(exc)}) + "\n"
++        )
++        return 1
++
++    with open(args.output, "wb") as handle:
++        handle.write(result.content)
++
++    sys.stdout.write(
++        json.dumps(
++            {
++                "reportId": result.report_id,
++                "status": result.status,
++                "polls": result.polls,
++                "outputPath": args.output,
++                "bytes": len(result.content),
++            }
++        )
++        + "\n"
++    )
++    return 0
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/src/vcfops_report/client.py b/src/vcfops_report/client.py
+index 7e1edb3..cd36a96 100644
+--- a/src/vcfops_report/client.py
++++ b/src/vcfops_report/client.py
+@@ -1,12 +1,18 @@
+ """VCF Operations report client.
+ 
+-Every method below is a stub. Implement them against docs/contract.json using
+-only the Python standard library.
++Implements the five operations named by docs/contract.json using nothing but
++the Python standard library.
+ """
+ 
+ from __future__ import annotations
+ 
+-from .errors import (  # noqa: F401  (imported for implementors to raise)
++import json
++import time
++from urllib.error import HTTPError, URLError
++from urllib.parse import quote, urlencode
++from urllib.request import ProxyHandler, Request, build_opener
++
++from .errors import (
+     ApiError,
+     AuthenticationError,
+     ReportGenerationFailed,
+@@ -15,6 +21,30 @@ from .errors import (  # noqa: F401  (imported for implementors to raise)
+ )
+ from .models import ReportResult
+ 
++# -- constants taken from docs/contract.json --------------------------------
++
++AUTHORIZATION_HEADER_FORMAT = "OpsToken {token}"
++JSON_CONTENT_TYPE = "application/json"
++JSON_ACCEPT = "application/json"
++
++PATH_ACQUIRE_TOKEN = "/api/auth/token/acquire"
++PATH_RELEASE_TOKEN = "/api/auth/token/release"
++PATH_REPORTS = "/api/reports"
++PATH_REPORT = "/api/reports/{id}"
++PATH_REPORT_DOWNLOAD = "/api/reports/{id}/download"
++
++# contract.asyncPolling
++STATUS_FIELD = "status"
++TERMINAL_STATUSES = frozenset({"COMPLETED", "FAILED"})
++SUCCESS_STATUS = "COMPLETED"
++
++# contract.operations.downloadReport
++DEFAULT_FORMAT = "PDF"
++ACCEPT_BY_FORMAT = {"PDF": "application/pdf", "CSV": "text/csv"}
++
++# contract.operations.createReport.requestBody.callerSettableOptionalProperties
++_CREATE_REPORT_OPTIONAL = ("name", "description", "subject", "publish")
++
+ 
+ class VcfOperationsClient:
+     """Drives the createReport / getReport / downloadReport workflow.
+@@ -50,7 +80,75 @@ class VcfOperationsClient:
+             poll_timeout: seconds to keep polling before giving up on a report.
+             request_timeout: per-request socket timeout in seconds.
+         """
+-        raise NotImplementedError
++        self._base_url = base_url.rstrip("/")
++        self._username = username
++        self._password = password
++        self._auth_source = auth_source
++        self._poll_interval = float(poll_interval)
++        self._poll_timeout = float(poll_timeout)
++        self._request_timeout = float(request_timeout)
++        self._token = None
++        self._last_poll_count = 0
++        # An explicit empty ProxyHandler keeps requests on the host they are
++        # addressed to instead of following ambient proxy configuration.
++        self._opener = build_opener(ProxyHandler({}))
++
++    # -- transport --------------------------------------------------------
++
++    def _call(
++        self,
++        operation_id,
++        method,
++        path,
++        query=None,
++        body=None,
++        accept=JSON_ACCEPT,
++        authenticated=True,
++    ):
++        """Issue one request and return its body as bytes.
++
++        ``query`` entries and ``body`` properties are only ever the ones the
++        caller actually set, so an unset optional never reaches the wire.
++        """
++        url = self._base_url + path
++        if query:
++            url += "?" + urlencode(query)
++
++        headers = {"Accept": accept}
++        data = None
++        if body is not None:
++            data = json.dumps(body).encode("utf-8")
++            headers["Content-Type"] = JSON_CONTENT_TYPE
++        if authenticated:
++            if self._token is None:
++                raise VcfOperationsError(
++                    "%s requires a token; call acquire_token first" % operation_id
++                )
++            headers["Authorization"] = AUTHORIZATION_HEADER_FORMAT.format(token=self._token)
++
++        request = Request(url, data=data, headers=headers, method=method)
++        try:
++            with self._opener.open(request, timeout=self._request_timeout) as response:
++                return response.read()
++        except HTTPError as exc:
++            raise self._api_error(operation_id, exc.code, exc.read()) from None
++        except URLError as exc:
++            raise VcfOperationsError(
++                "%s could not reach %s: %s" % (operation_id, url, exc.reason)
++            ) from None
++
++    @staticmethod
++    def _api_error(operation_id, status, raw):
++        text = raw.decode("utf-8", "replace")
++        message = ""
++        try:
++            parsed = json.loads(text)
++        except ValueError:
++            parsed = None
++        if isinstance(parsed, dict):
++            message = parsed.get("message", "")
++        error_type = AuthenticationError if status == 401 else ApiError
++        return error_type(status, operation_id, message, text)
+ 
+     # -- session ----------------------------------------------------------
+ 
+@@ -60,7 +158,7 @@ class VcfOperationsClient:
+ 
+         Set by acquire_token; cleared by release_token.
+         """
+-        raise NotImplementedError
++        return self._token
+ 
+     def acquire_token(self):
+         """Invoke acquireToken and retain the token for later calls.
+@@ -72,7 +170,19 @@ class VcfOperationsClient:
+             AuthenticationError: the credentials were rejected (HTTP 401).
+             ApiError: any other non-success status.
+         """
+-        raise NotImplementedError
++        body = {"username": self._username, "password": self._password}
++        if self._auth_source is not None:
++            body["authSource"] = self._auth_source
++
++        raw = self._call(
++            "acquireToken",
++            "POST",
++            PATH_ACQUIRE_TOKEN,
++            body=body,
++            authenticated=False,
++        )
++        self._token = json.loads(raw.decode("utf-8"))["token"]
++        return self._token
+ 
+     def release_token(self):
+         """Invoke releaseToken for the token currently held, then drop it.
+@@ -80,7 +190,14 @@ class VcfOperationsClient:
+         Does nothing when no token is held. After this returns, ``token`` is
+         None.
+         """
+-        raise NotImplementedError
++        if self._token is None:
++            return
++        try:
++            # The operation defines no request body, so none is sent: leaving
++            # body at None omits both the payload and the Content-Type header.
++            self._call("releaseToken", "POST", PATH_RELEASE_TOKEN)
++        finally:
++            self._token = None
+ 
+     # -- report operations ------------------------------------------------
+ 
+@@ -108,7 +225,23 @@ class VcfOperationsClient:
+         Raises:
+             ApiError: on any non-success status.
+         """
+-        raise NotImplementedError
++        body = {"reportDefinitionId": report_definition_id, "resourceId": resource_id}
++        supplied = {
++            "name": name,
++            "description": description,
++            "subject": subject,
++            "publish": publish,
++        }
++        for key in _CREATE_REPORT_OPTIONAL:
++            value = supplied[key]
++            # `is not None` rather than truthiness: publish=False is a value the
++            # caller chose and belongs on the wire, while an unset optional must
++            # be left out of the body entirely.
++            if value is not None:
++                body[key] = value
++
++        raw = self._call("createReport", "POST", PATH_REPORTS, body=body)
++        return json.loads(raw.decode("utf-8"))
+ 
+     def get_report(self, report_id):
+         """Invoke getReport once and return the report object as a dict.
+@@ -116,7 +249,9 @@ class VcfOperationsClient:
+         Raises:
+             ApiError: on any non-success status.
+         """
+-        raise NotImplementedError
++        path = PATH_REPORT.format(id=quote(str(report_id), safe=""))
++        raw = self._call("getReport", "GET", path)
++        return json.loads(raw.decode("utf-8"))
+ 
+     def wait_for_report(self, report_id):
+         """Poll getReport until the report reaches a terminal status.
+@@ -135,7 +270,23 @@ class VcfOperationsClient:
+                 exception carries the last status seen and the poll count.
+             ApiError: on any non-success HTTP status.
+         """
+-        raise NotImplementedError
++        started = time.monotonic()
++        polls = 0
++        while True:
++            report = self.get_report(report_id)
++            polls += 1
++            self._last_poll_count = polls
++            last_status = report.get(STATUS_FIELD)
++
++            if last_status in TERMINAL_STATUSES:
++                if last_status == SUCCESS_STATUS:
++                    return report
++                raise ReportGenerationFailed(report_id, report)
++
++            elapsed = time.monotonic() - started
++            if elapsed >= self._poll_timeout:
++                raise ReportTimeout(report_id, last_status, polls, elapsed)
++            time.sleep(min(self._poll_interval, self._poll_timeout - elapsed))
+ 
+     def download_report(self, report_id, report_format=None):
+         """Invoke downloadReport and return the report bytes.
+@@ -152,7 +303,26 @@ class VcfOperationsClient:
+             ApiError: on any non-success status, including an attempt to
+                 download a report that is not yet complete.
+         """
+-        raise NotImplementedError
++        query = None
++        if report_format is not None:
++            if report_format not in ACCEPT_BY_FORMAT:
++                raise ValueError(
++                    "unsupported report format %r; supported: %s"
++                    % (report_format, sorted(ACCEPT_BY_FORMAT))
++                )
++            query = {"format": report_format}
++
++        # The Accept header must correspond to the effective format, which is
++        # the server default when the caller did not choose one.
++        effective = report_format if report_format is not None else DEFAULT_FORMAT
++        path = PATH_REPORT_DOWNLOAD.format(id=quote(str(report_id), safe=""))
++        return self._call(
++            "downloadReport",
++            "GET",
++            path,
++            query=query,
++            accept=ACCEPT_BY_FORMAT[effective],
++        )
+ 
+     # -- end-to-end -------------------------------------------------------
+ 
+@@ -180,17 +350,40 @@ class VcfOperationsClient:
+             ReportTimeout: generation never reached a terminal status.
+             ApiError: on any non-success HTTP status.
+         """
+-        raise NotImplementedError
++        if self._token is None:
++            self.acquire_token()
++
++        report = self.create_report(
++            report_definition_id,
++            resource_id,
++            name=name,
++            description=description,
++            subject=subject,
++            publish=publish,
++        )
++        report_id = report["id"]
++
++        # createReport only accepted the work. The report is not finished until
++        # getReport says so, and a failure must not fall through to a download.
++        final = self.wait_for_report(report_id)
++        content = self.download_report(report_id, report_format=report_format)
++        return ReportResult(
++            report_id=report_id,
++            status=final[STATUS_FIELD],
++            polls=self._last_poll_count,
++            content=content,
++        )
+ 
+     # -- lifecycle --------------------------------------------------------
+ 
+     def close(self):
+         """Release the token if one is held. Safe to call more than once."""
+-        raise NotImplementedError
++        self.release_token()
+ 
+     def __enter__(self):
+-        raise NotImplementedError
++        return self
+ 
+     def __exit__(self, exc_type, exc, tb):
+         """Close the client, including when the body raised."""
+-        raise NotImplementedError
++        self.close()
++        return False

@@ -1,0 +1,106 @@
+--- a/netpool/client.go
++++ b/netpool/client.go
+@@ -9,6 +9,7 @@
+ 	"bytes"
+ 	"context"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+@@ -158,14 +159,33 @@
+ 	return created, nil
+ }
+ 
++// createNetworkPoolRequest is the write model for createNetworkPool. It is kept
++// apart from the read model on purpose: it carries only the writable properties
++// of the NetworkPool schema, so the readOnly ones can never reach the wire.
++type createNetworkPoolRequest struct {
++	Name     string               `json:"name"`
++	Networks []createNetworkEntry `json:"networks"`
++}
++
++// createNetworkEntry is the write model for one Network. All six properties the
++// 9.0.0.0 schema marks required are always sent; ipPools is the schema's only
++// optional writable property, and omitempty keeps it off the wire entirely when
++// the caller left it unset rather than sending it as null or as [].
++type createNetworkEntry struct {
++	Type    string    `json:"type"`
++	VLANID  int32     `json:"vlanId"`
++	MTU     int32     `json:"mtu"`
++	Subnet  string    `json:"subnet"`
++	Mask    string    `json:"mask"`
++	Gateway string    `json:"gateway"`
++	IPPools []IPRange `json:"ipPools,omitempty"`
++}
++
+ // createBody builds the createNetworkPool request body.
+-//
+-// The read model already mirrors the NetworkPool schema, so create reuses it and
+-// keeps a single set of JSON tags for both directions.
+-func createBody(spec NetworkPoolSpec) NetworkPool {
+-	body := NetworkPool{Name: spec.Name}
++func createBody(spec NetworkPoolSpec) createNetworkPoolRequest {
++	body := createNetworkPoolRequest{Name: spec.Name}
+ 	for _, n := range spec.Networks {
+-		body.Networks = append(body.Networks, Network{
++		body.Networks = append(body.Networks, createNetworkEntry{
+ 			Type:    n.Type,
+ 			VLANID:  n.VLANID,
+ 			MTU:     n.MTU,
+@@ -184,11 +204,53 @@
+ // Callers drive this from provisioning runs that are re-executed after partial
+ // failures, so the call is expected to be safe to repeat and safe to retry.
+ func (c *Client) EnsureNetworkPool(ctx context.Context, spec NetworkPoolSpec) (EnsureResult, error) {
+-	pool, err := c.CreateNetworkPool(ctx, spec)
++	// Read before mutating. A pool that is already there is adopted, and no
++	// create goes out at all.
++	before, err := c.ListNetworkPools(ctx)
+ 	if err != nil {
+ 		return EnsureResult{}, err
+ 	}
+-	return EnsureResult{Pool: pool, Created: true}, nil
++	if pool, ok := findByName(before, spec.Name); ok {
++		return EnsureResult{Pool: pool, Created: false}, nil
++	}
++
++	pool, createErr := c.CreateNetworkPool(ctx, spec)
++	if createErr == nil {
++		return EnsureResult{Pool: pool, Created: true}, nil
++	}
++
++	// A create that did not report success has not necessarily failed. A lost
++	// response, a dropped connection or a 5xx leaves the outcome unknown, and a
++	// duplicate-name rejection says the pool exists whoever made it. In all of
++	// those cases the appliance is the authority on what happened, so ask it
++	// instead of sending a second create.
++	if !mayHaveLanded(createErr) {
++		return EnsureResult{}, createErr
++	}
++	after, listErr := c.ListNetworkPools(ctx)
++	if listErr != nil {
++		return EnsureResult{}, fmt.Errorf("%w (reconciling the outcome also failed: %v)", createErr, listErr)
++	}
++	if pool, ok := findByName(after, spec.Name); ok {
++		return EnsureResult{Pool: pool, Created: false}, nil
++	}
++
++	// The create really did not land. Report it and let the caller retry; doing
++	// so is safe, because the next call starts from the read again.
++	return EnsureResult{}, createErr
++}
++
++// mayHaveLanded reports whether a failed createNetworkPool could still have
++// changed appliance state, or whether the pool may exist for some other reason.
++// Either way the appliance has to be consulted before drawing a conclusion.
++func mayHaveLanded(err error) bool {
++	var apiErr *APIError
++	if errors.As(err, &apiErr) {
++		return apiErr.IsDuplicateName() || apiErr.Status >= http.StatusInternalServerError
++	}
++	// A transport failure is no evidence either way: the request may have been
++	// applied and only its answer lost.
++	return true
+ }
+ 
+ // findByName returns the pool carrying the given name, if the slice holds one.

@@ -1,0 +1,304 @@
+--- a/vofn_inventory/client.py
++++ b/vofn_inventory/client.py
+@@ -10,6 +10,10 @@
+ This module is standard-library only.
+ """
+ 
++import json
++import urllib.error
++import urllib.parse
++import urllib.request
+ from dataclasses import dataclass
+ from typing import List, Optional, Sequence
+ 
+@@ -25,6 +29,13 @@
+ #: Largest page this client is willing to request from ``listKubernetesPods``.
+ MAX_PAGE_SIZE = 1000
+ 
++#: Query parameters in the order ``listKubernetesPods`` declares them.
++_LIST_QUERY_ORDER = ("size", "cursor", "start_time", "end_time")
++
++_UNSAFE_HEADER_BYTES = frozenset(
++    [chr(code) for code in range(0x20) if code != 0x09] + ["\x7f"]
++)
++
+ 
+ class InventoryError(Exception):
+     """Base class for every error raised by this module."""
+@@ -98,20 +109,273 @@
+         }
+ 
+ 
++def _is_int(value) -> bool:
++    return isinstance(value, int) and not isinstance(value, bool)
++
++
++def _check_bound(name, value):
++    if value is None:
++        return
++    if not _is_int(value):
++        raise ValueError("%s must be an integer number of epoch seconds" % name)
++    if value < 0:
++        raise ValueError("%s must not be negative" % name)
++
++
++def _check_count(name, value, maximum):
++    if not _is_int(value):
++        raise ValueError("%s must be an integer" % name)
++    if value < 1 or value > maximum:
++        raise ValueError("%s must be between 1 and %d" % (name, maximum))
++
++
+ class NetworksClient:
+     """Minimal client for the two contract operations."""
+ 
+     def __init__(self, base_url: str, api_token: str, timeout: float = 30.0):
+         """Validate and store the appliance root, API token and socket timeout."""
+-        raise NotImplementedError("NetworksClient.__init__ is not implemented yet")
++        self._base_url = self._validate_base_url(base_url)
++        self._api_token = self._validate_token(api_token)
++        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
++            raise ValueError("timeout must be a positive number of seconds")
++        if timeout <= 0:
++            raise ValueError("timeout must be a positive number of seconds")
++        self._timeout = float(timeout)
++
++    # -- validation --------------------------------------------------------
++    @staticmethod
++    def _validate_base_url(base_url):
++        if not isinstance(base_url, str) or not base_url.strip():
++            raise ValueError("base_url must be a non-empty string")
++        split = urllib.parse.urlsplit(base_url.strip())
++        if split.scheme.lower() not in ("http", "https"):
++            raise ValueError("base_url must use the http or https scheme")
++        if not split.hostname:
++            raise ValueError("base_url must contain a host")
++        if split.username is not None or split.password is not None:
++            raise ValueError("base_url must not carry userinfo")
++        if split.path not in ("", "/"):
++            raise ValueError("base_url must be the appliance root, not a sub-path")
++        if split.query or split.fragment:
++            raise ValueError("base_url must not carry a query or fragment")
++        return "%s://%s" % (split.scheme.lower(), split.netloc)
++
++    @staticmethod
++    def _validate_token(api_token):
++        if not isinstance(api_token, str) or not api_token.strip():
++            raise ValueError("api_token must be a non-empty string")
++        if any(char in _UNSAFE_HEADER_BYTES for char in api_token):
++            raise ValueError("api_token contains characters that are unsafe in a header")
++        return api_token
++
++    @staticmethod
++    def _validate_options(options):
++        _check_count("page_size", options.page_size, MAX_PAGE_SIZE)
++        _check_count("name_batch_size", options.name_batch_size, MAX_NAME_BATCH)
++        _check_bound("start_time", options.start_time)
++        _check_bound("end_time", options.end_time)
++        if (
++            options.start_time is not None
++            and options.end_time is not None
++            and options.start_time > options.end_time
++        ):
++            raise ValueError("start_time must not be after end_time")
+ 
++    # -- public workflow ---------------------------------------------------
+     def collect_pod_inventory(
+         self, options: Optional[InventoryOptions] = None
+     ) -> List[PodRecord]:
+         """Collect every Kubernetes pod and return it in the stable order."""
+-        raise NotImplementedError("collect_pod_inventory is not implemented yet")
++        if options is None:
++            options = InventoryOptions()
++        if not isinstance(options, InventoryOptions):
++            raise ValueError("options must be an InventoryOptions instance")
++        self._validate_options(options)
++
++        collected = self._collect_pages(options)
++        names = self._resolve_names(collected, options.name_batch_size)
++
++        named = []
++        unnamed = []
++        for record in collected:
++            name = names.get(record.entity_id)
++            resolved = PodRecord(
++                entity_id=record.entity_id,
++                entity_type=record.entity_type,
++                time=record.time,
++                name=name,
++            )
++            (named if name is not None else unnamed).append(resolved)
++
++        named.sort(key=lambda record: (record.name, record.entity_id))
++        unnamed.sort(key=lambda record: record.entity_id)
++        return named + unnamed
++
++    # -- listKubernetesPods ------------------------------------------------
++    def _collect_pages(self, options):
++        records = []
++        seen_ids = set()
++        seen_cursors = set()
++        cursor = None
++
++        while True:
++            payload = self._request(
++                LIST_OPERATION_ID,
++                "GET",
++                LIST_PATH,
++                query=self._list_query(options, cursor),
++            )
++            results = payload.get("results")
++            if results is None:
++                results = []
++            if not isinstance(results, list):
++                raise ProtocolError(LIST_OPERATION_ID, "results is not a list")
++
++            for item in results:
++                record = self._to_record(item)
++                if record.entity_id in seen_ids:
++                    continue
++                seen_ids.add(record.entity_id)
++                records.append(record)
++
++            next_cursor = payload.get("cursor")
++            if next_cursor is None or next_cursor == "":
++                break
++            if not isinstance(next_cursor, str):
++                raise ProtocolError(LIST_OPERATION_ID, "cursor is not a string")
++            if not results:
++                break
++            if next_cursor in seen_cursors:
++                raise ProtocolError(LIST_OPERATION_ID, "cursor repeated a previous page")
++            seen_cursors.add(next_cursor)
++            cursor = next_cursor
++
++        return records
++
++    @staticmethod
++    def _list_query(options, cursor):
++        values = {
++            "size": options.page_size,
++            "cursor": cursor,
++            "start_time": options.start_time,
++            "end_time": options.end_time,
++        }
++        return [
++            (name, str(values[name]))
++            for name in _LIST_QUERY_ORDER
++            if values[name] is not None
++        ]
++
++    @staticmethod
++    def _to_record(item):
++        if not isinstance(item, dict):
++            raise ProtocolError(LIST_OPERATION_ID, "result entry is not an object")
++        entity_id = item.get("entity_id")
++        if not isinstance(entity_id, str) or not entity_id:
++            raise ProtocolError(LIST_OPERATION_ID, "result entry has no entity_id")
++        entity_type = item.get("entity_type")
++        if entity_type is not None and not isinstance(entity_type, str):
++            raise ProtocolError(LIST_OPERATION_ID, "entity_type is not a string")
++        stamp = item.get("time")
++        if stamp is not None and not _is_int(stamp):
++            raise ProtocolError(LIST_OPERATION_ID, "time is not an integer")
++        return PodRecord(entity_id=entity_id, entity_type=entity_type, time=stamp)
++
++    # -- getNames ----------------------------------------------------------
++    def _resolve_names(self, records, batch_size):
++        names = {}
++        for start in range(0, len(records), batch_size):
++            batch = records[start : start + batch_size]
++            entities = []
++            for record in batch:
++                entity = {"entity_id": record.entity_id}
++                if record.time is not None:
++                    entity["time"] = record.time
++                entities.append(entity)
++
++            payload = self._request(
++                NAMES_OPERATION_ID,
++                "POST",
++                NAMES_PATH,
++                body={"entities": entities},
++            )
++            resolved = payload.get("entities")
++            if resolved is None:
++                resolved = []
++            if not isinstance(resolved, list):
++                raise ProtocolError(NAMES_OPERATION_ID, "entities is not a list")
++            for item in resolved:
++                if not isinstance(item, dict):
++                    raise ProtocolError(NAMES_OPERATION_ID, "entity is not an object")
++                entity_id = item.get("entity_id")
++                name = item.get("name")
++                if isinstance(entity_id, str) and isinstance(name, str) and name:
++                    names[entity_id] = name
++        return names
++
++    # -- transport ---------------------------------------------------------
++    def _request(self, operation_id, method, path, query=None, body=None):
++        url = self._base_url + path
++        if query:
++            url += "?" + urllib.parse.urlencode(query)
++
++        data = None
++        headers = {
++            "Authorization": "NetworkInsight " + self._api_token,
++            "Accept": "application/json",
++        }
++        if body is not None:
++            data = json.dumps(body, separators=(",", ":")).encode("utf-8")
++            headers["Content-Type"] = "application/json"
++
++        request = urllib.request.Request(url, data=data, headers=headers, method=method)
++        try:
++            with urllib.request.urlopen(request, timeout=self._timeout) as response:
++                status = response.getcode()
++                raw = response.read()
++        except urllib.error.HTTPError as error:
++            try:
++                raw = error.read()
++            finally:
++                error.close()
++            raise self._api_error(operation_id, error.code, raw) from None
++        except (urllib.error.URLError, OSError):
++            raise TransportError(operation_id) from None
++
++        if status != 200:
++            raise self._api_error(operation_id, status, raw)
++        payload = self._decode(operation_id, raw)
++        if not isinstance(payload, dict):
++            raise ProtocolError(operation_id, "response body is not a JSON object")
++        return payload
++
++    @staticmethod
++    def _api_error(operation_id, status, raw):
++        code = None
++        message = None
++        try:
++            body = json.loads(raw.decode("utf-8"))
++        except (ValueError, UnicodeDecodeError):
++            body = None
++        if isinstance(body, dict):
++            if _is_int(body.get("code")):
++                code = body["code"]
++            if isinstance(body.get("message"), str):
++                message = body["message"]
++        return APIError(operation_id, status, code=code, message=message)
++
++    @staticmethod
++    def _decode(operation_id, raw):
++        try:
++            return json.loads(raw.decode("utf-8"))
++        except (ValueError, UnicodeDecodeError):
++            raise ProtocolError(operation_id, "response body is not valid JSON") from None
+ 
+ 
+ def render_inventory(records: Sequence[PodRecord]) -> str:
+     """Render collected records as the canonical inventory document."""
+-    raise NotImplementedError("render_inventory is not implemented yet")
++    payload = {
++        "total_count": len(records),
++        "pods": [record.as_dict() for record in records],
++    }
++    return json.dumps(payload, indent=2, ensure_ascii=False) + "\n"

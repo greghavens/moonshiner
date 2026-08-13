@@ -1,0 +1,465 @@
+diff --git a/client.go b/client.go
+index 96a238a..80af6f8 100644
+--- a/client.go
++++ b/client.go
+@@ -1,9 +1,14 @@
+ package vcfops
+ 
+ import (
++	"bytes"
+ 	"context"
+-	"errors"
++	"encoding/json"
++	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
++	"strings"
+ )
+ 
+ // CollectorGroupInput is the desired, user-settable portion of a collector
+@@ -31,20 +36,125 @@ type CollectorGroup struct {
+ 	VirtualIP     *string `json:"virtualIP,omitempty"`
+ }
+ 
+-// ErrNotImplemented marks the starter implementation.
+-var ErrNotImplemented = errors.New("vcfops: not implemented")
+-
+ // Client calls VCF Operations.
+-type Client struct{}
++type Client struct {
++	baseURL    *url.URL
++	token      string
++	httpClient *http.Client
++}
+ 
+ // NewClient constructs a client. baseURL is the appliance origin; API paths
+ // are rooted beneath the /suite-api server path from the official contract.
+ func NewClient(baseURL, token string, httpClient *http.Client) (*Client, error) {
+-	return &Client{}, nil
++	parsed, err := url.Parse(baseURL)
++	if err != nil {
++		return nil, fmt.Errorf("parse VCF Operations base URL: %w", err)
++	}
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++	return &Client{baseURL: parsed, token: token, httpClient: httpClient}, nil
+ }
+ 
+ // EnsureCollectorGroup returns the group with desired.Name, creating it only
+ // when it is absent. created reports whether this invocation created it.
+ func (c *Client) EnsureCollectorGroup(ctx context.Context, desired CollectorGroupInput) (group CollectorGroup, created bool, err error) {
+-	return CollectorGroup{}, false, ErrNotImplemented
++	groups, err := c.getCollectorGroups(ctx)
++	if err != nil {
++		return CollectorGroup{}, false, err
++	}
++	for _, group := range groups {
++		if group.Name == desired.Name {
++			return group, false, nil
++		}
++	}
++	group, err = c.createCollectorGroup(ctx, desired)
++	if err != nil {
++		return CollectorGroup{}, false, err
++	}
++	return group, true, nil
++}
++
++const collectorGroupsPath = "/suite-api/api/collectorgroups"
++
++func (c *Client) endpoint(rawQuery string) *url.URL {
++	endpoint := *c.baseURL
++	endpoint.Path = strings.TrimRight(c.baseURL.Path, "/") + collectorGroupsPath
++	endpoint.RawPath = ""
++	endpoint.RawQuery = rawQuery
++	endpoint.Fragment = ""
++	return &endpoint
++}
++
++func (c *Client) newRequest(ctx context.Context, method, rawQuery string, body io.Reader) (*http.Request, error) {
++	req, err := http.NewRequestWithContext(ctx, method, c.endpoint(rawQuery).String(), body)
++	if err != nil {
++		return nil, fmt.Errorf("build %s collector groups request: %w", method, err)
++	}
++	req.Header.Set("Accept", "application/json")
++	req.Header.Set("Authorization", c.token)
++	return req, nil
++}
++
++func (c *Client) getCollectorGroups(ctx context.Context) ([]CollectorGroup, error) {
++	req, err := c.newRequest(ctx, http.MethodGet, "", nil)
++	if err != nil {
++		return nil, err
++	}
++	resp, err := c.httpClient.Do(req)
++	if err != nil {
++		return nil, fmt.Errorf("list collector groups: %w", err)
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		return nil, responseError("list collector groups", resp)
++	}
++	var payload struct {
++		CollectorGroups []CollectorGroup `json:"collectorGroups"`
++	}
++	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
++		return nil, fmt.Errorf("decode collector groups response: %w", err)
++	}
++	return payload.CollectorGroups, nil
++}
++
++func (c *Client) createCollectorGroup(ctx context.Context, desired CollectorGroupInput) (CollectorGroup, error) {
++	var body bytes.Buffer
++	if err := json.NewEncoder(&body).Encode(desired); err != nil {
++		return CollectorGroup{}, fmt.Errorf("encode collector group: %w", err)
++	}
++	query := url.Values{}
++	if desired.CheckCollectorMembers != nil {
++		query.Set("checkCollectorMembers", fmt.Sprintf("%t", *desired.CheckCollectorMembers))
++	}
++	req, err := c.newRequest(ctx, http.MethodPost, query.Encode(), &body)
++	if err != nil {
++		return CollectorGroup{}, err
++	}
++	req.Header.Set("Content-Type", "application/json")
++	resp, err := c.httpClient.Do(req)
++	if err != nil {
++		return CollectorGroup{}, fmt.Errorf("create collector group: %w", err)
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusCreated {
++		return CollectorGroup{}, responseError("create collector group", resp)
++	}
++	var group CollectorGroup
++	if err := json.NewDecoder(resp.Body).Decode(&group); err != nil {
++		return CollectorGroup{}, fmt.Errorf("decode create collector group response: %w", err)
++	}
++	return group, nil
++}
++
++func responseError(action string, resp *http.Response) error {
++	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
++	if err != nil {
++		return fmt.Errorf("%s: unexpected HTTP status %s (read response: %v)", action, resp.Status, err)
++	}
++	detail := strings.TrimSpace(string(body))
++	if detail == "" {
++		return fmt.Errorf("%s: unexpected HTTP status %s", action, resp.Status)
++	}
++	return fmt.Errorf("%s: unexpected HTTP status %s: %s", action, resp.Status, detail)
+ }
+diff --git a/client_test.go b/client_test.go
+new file mode 100644
+index 0000000..e5ef02d
+--- /dev/null
++++ b/client_test.go
+@@ -0,0 +1,101 @@
++package vcfops_test
++
++import (
++	"context"
++	"encoding/json"
++	"path/filepath"
++	"reflect"
++	"testing"
++
++	vcfops "example.com/vcfops"
++	"example.com/vcfops/internal/contracttest"
++)
++
++func TestEnsureCollectorGroupIsSafeToRetry(t *testing.T) {
++	boolean := func(v bool) *bool { return &v }
++	text := func(v string) *string { return &v }
++	tests := []struct {
++		name         string
++		desired      vcfops.CollectorGroupInput
++		dropResponse bool
++		wantQuery    string
++		wantBody     map[string]any
++	}{
++		{
++			name:     "minimal request and ordinary retry",
++			desired:  vcfops.CollectorGroupInput{Name: "edge-proxies"},
++			wantBody: map[string]any{"name": "edge-proxies"},
++		},
++		{
++			name: "all writable fields",
++			desired: vcfops.CollectorGroupInput{
++				Name: "ha-proxies", Description: text("zone-a"), CollectorIDs: []int32{7, 9},
++				HAEnabled: boolean(false), LBEnabled: boolean(true), VirtualIP: text("192.0.2.10"),
++				CheckCollectorMembers: boolean(false),
++			},
++			wantQuery: "checkCollectorMembers=false",
++			wantBody: map[string]any{
++				"name": "ha-proxies", "description": "zone-a",
++				"collectorId": []any{float64(7), float64(9)},
++				"haEnabled":   false, "lbEnabled": true, "virtualIP": "192.0.2.10",
++			},
++		},
++		{
++			name:         "response lost after create effect",
++			desired:      vcfops.CollectorGroupInput{Name: "lossy-create"},
++			dropResponse: true,
++			wantBody:     map[string]any{"name": "lossy-create"},
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			mock := contracttest.NewMock(t, filepath.Join("docs", "contract.json"))
++			client, err := vcfops.NewClient(mock.URL(), "test-token", mock.HTTPClient())
++			if err != nil {
++				t.Fatal(err)
++			}
++			if tt.dropResponse {
++				mock.DropNextCreateResponse()
++				if _, _, err := client.EnsureCollectorGroup(context.Background(), tt.desired); err == nil {
++					t.Fatal("expected the deliberately lost response to surface as an error")
++				}
++			} else {
++				group, created, err := client.EnsureCollectorGroup(context.Background(), tt.desired)
++				if err != nil {
++					t.Fatal(err)
++				}
++				if !created || group.Name != tt.desired.Name {
++					t.Fatalf("first ensure = (%+v, %v)", group, created)
++				}
++			}
++			group, created, err := client.EnsureCollectorGroup(context.Background(), tt.desired)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if created || group.Name != tt.desired.Name || mock.GroupCount() != 1 {
++				t.Fatalf("retry = (%+v, %v), effects=%d", group, created, mock.GroupCount())
++			}
++
++			logs := mock.Logs()
++			if len(logs) != 3 {
++				t.Fatalf("request count = %d, want 3", len(logs))
++			}
++			for i, method := range []string{"GET", "POST", "GET"} {
++				if logs[i].Method != method || logs[i].Path != "/suite-api/api/collectorgroups" {
++					t.Errorf("request %d = %s %s", i, logs[i].Method, logs[i].Path)
++				}
++			}
++			post := logs[1]
++			if post.RawQuery != tt.wantQuery {
++				t.Errorf("POST query = %q, want %q", post.RawQuery, tt.wantQuery)
++			}
++			var body map[string]any
++			if err := json.Unmarshal(post.Body, &body); err != nil {
++				t.Fatal(err)
++			}
++			if !reflect.DeepEqual(body, tt.wantBody) {
++				t.Errorf("POST body = %#v, want %#v", body, tt.wantBody)
++			}
++		})
++	}
++}
+diff --git a/docs/contract.json b/docs/contract.json
+new file mode 100644
+index 0000000..78de6f2
+--- /dev/null
++++ b/docs/contract.json
+@@ -0,0 +1,175 @@
++{
++  "openapi": "3.0.1",
++  "info": {
++    "title": "VCF Operations collector group retry contract",
++    "version": "9.0.0.0"
++  },
++  "servers": [
++    {
++      "url": "/suite-api"
++    }
++  ],
++  "security": [
++    {
++      "Token-based-authorization": []
++    }
++  ],
++  "paths": {
++    "/api/collectorgroups": {
++      "get": {
++        "operationId": "getCollectorGroups",
++        "responses": {
++          "200": {
++            "description": "The defined Collector Groups",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/collector-groups"
++                }
++              }
++            }
++          },
++          "500": {
++            "description": "Error processing the API response"
++          }
++        }
++      },
++      "post": {
++        "operationId": "createCollectorGroup",
++        "parameters": [
++          {
++            "name": "checkCollectorMembers",
++            "in": "query",
++            "required": false,
++            "schema": {
++              "type": "boolean",
++              "default": false
++            }
++          }
++        ],
++        "requestBody": {
++          "required": true,
++          "content": {
++            "application/json": {
++              "schema": {
++                "$ref": "#/components/schemas/collector-group-create"
++              }
++            }
++          }
++        },
++        "responses": {
++          "201": {
++            "description": "The Collector Group object that was created along with its identifier",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/collector-group"
++                }
++              }
++            }
++          },
++          "500": {
++            "description": "Error creating the Collector Group"
++          }
++        }
++      }
++    }
++  },
++  "components": {
++    "schemas": {
++      "collector-group-create": {
++        "type": "object",
++        "required": [
++          "name"
++        ],
++        "properties": {
++          "name": {
++            "type": "string"
++          },
++          "description": {
++            "type": "string"
++          },
++          "collectorId": {
++            "type": "array",
++            "items": {
++              "type": "integer",
++              "format": "int32"
++            }
++          },
++          "haEnabled": {
++            "type": "boolean"
++          },
++          "lbEnabled": {
++            "type": "boolean"
++          },
++          "virtualIP": {
++            "type": "string"
++          }
++        }
++      },
++      "collector-group": {
++        "type": "object",
++        "required": [
++          "id",
++          "name"
++        ],
++        "properties": {
++          "id": {
++            "type": "string",
++            "format": "uuid"
++          },
++          "name": {
++            "type": "string"
++          },
++          "description": {
++            "type": "string"
++          },
++          "collectorId": {
++            "type": "array",
++            "items": {
++              "type": "integer",
++              "format": "int32"
++            }
++          },
++          "systemDefined": {
++            "type": "boolean"
++          },
++          "haEnabled": {
++            "type": "boolean"
++          },
++          "lbEnabled": {
++            "type": "boolean"
++          },
++          "virtualIP": {
++            "type": "string"
++          }
++        }
++      },
++      "collector-groups": {
++        "type": "object",
++        "properties": {
++          "collectorGroups": {
++            "type": "array",
++            "items": {
++              "$ref": "#/components/schemas/collector-group"
++            }
++          }
++        }
++      }
++    },
++    "securitySchemes": {
++      "Token-based-authorization": {
++        "type": "apiKey",
++        "description": "Token based authorization",
++        "name": "Authorization",
++        "in": "header"
++      }
++    }
++  },
++  "x-official-source": {
++    "repository": "https://github.com/vmware/vcf-api-specs",
++    "tag": "9.0.0.0",
++    "commit": "85151f6b1bb58f13b6ac0304bfec53904bea085f",
++    "path": "specifications/vcf-operations/vcf-operations-openapi.json"
++  }
++}
+diff --git a/docs/official_sources.json b/docs/official_sources.json
+new file mode 100644
+index 0000000..ed2fc84
+--- /dev/null
++++ b/docs/official_sources.json
+@@ -0,0 +1,19 @@
++{
++  "repository": "https://github.com/vmware/vcf-api-specs",
++  "license": "Apache-2.0",
++  "tag": "9.0.0.0",
++  "commit": "85151f6b1bb58f13b6ac0304bfec53904bea085f",
++  "spec_path": "specifications/vcf-operations/vcf-operations-openapi.json",
++  "operations": [
++    {
++      "operationId": "getCollectorGroups",
++      "method": "GET",
++      "path": "/api/collectorgroups"
++    },
++    {
++      "operationId": "createCollectorGroup",
++      "method": "POST",
++      "path": "/api/collectorgroups"
++    }
++  ]
++}

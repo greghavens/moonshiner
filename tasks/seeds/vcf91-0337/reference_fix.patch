@@ -1,0 +1,239 @@
+--- a/src/CredentialRotator.java
++++ b/src/CredentialRotator.java
+@@ -1,3 +1,11 @@
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.time.Duration;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.List;
+ import java.util.Map;
+ 
+ /**
+@@ -8,6 +16,16 @@
+  */
+ public final class CredentialRotator {
+ 
++    /** Fields of the read model that UpdateCloudAccountVsphereSpecification also declares. */
++    private static final List<String> CARRIED_FORWARD = List.of(
++            "name", "description", "hostName", "dcid", "username", "environment",
++            "tags", "associatedMobilityCloudAccountIds");
++
++    private static final int MAX_DRAIN_POLLS = 40;
++    private static final int MAX_ROTATION_POLLS = 60;
++    private static final Duration POLL_INTERVAL = Duration.ofMillis(150);
++    private static final Duration TIMEOUT = Duration.ofSeconds(30);
++
+     /**
+      * Rotates the password of a vSphere cloud account without stranding requests that are already
+      * in flight against it.
+@@ -22,7 +40,206 @@
+      */
+     public static Map<String, Object> rotate(String baseUrl, String bearerToken, String cloudAccountId,
+                                              String newPassword) throws Exception {
+-        throw new UnsupportedOperationException("CredentialRotator.rotate is not implemented yet");
++        HttpClient http = HttpClient.newBuilder()
++                .connectTimeout(TIMEOUT)
++                .followRedirects(HttpClient.Redirect.NEVER)
++                .build();
++        Session session = new Session(http, trimTrailingSlash(baseUrl), bearerToken);
++
++        // The set of acceptable apiVersion values is deployment specific, so ask before calling
++        // anything else: omitting the parameter would silently pin the oldest supported version.
++        String apiVersion = Json.str(session.get("/iaas/api/about", null), "latestApiVersion");
++        if (apiVersion == null || apiVersion.isBlank()) {
++            throw new IllegalStateException("/iaas/api/about did not report a latestApiVersion");
++        }
++        session.apiVersion = apiVersion;
++
++        // A cloud account update re-authenticates every request that is still being worked on, so
++        // wait for the ones already in flight to settle before the old secret stops being valid.
++        List<String> drained = drainInFlightRequests(session);
++
++        Map<String, Object> account = session.get(
++                "/iaas/api/cloud-accounts-vsphere/" + cloudAccountId, session.apiVersion);
++        Map<String, Object> update = buildUpdate(account, newPassword);
++
++        Map<String, Object> accepted = session.patch(
++                "/iaas/api/cloud-accounts-vsphere/" + cloudAccountId, update);
++        String requestId = Json.str(accepted, "id");
++        if (requestId == null) {
++            throw new IllegalStateException("the update did not return a request tracker id");
++        }
++
++        String status = awaitCompletion(session, requestId);
++
++        Map<String, Object> summary = new LinkedHashMap<>();
++        summary.put("apiVersion", apiVersion);
++        summary.put("drainedRequestIds", drained);
++        summary.put("requestId", requestId);
++        summary.put("status", status);
++        return summary;
++    }
++
++    /* ---------------------------------------------------------------- steps */
++
++    /** Polls the request collection until nothing is in progress, returning what was waited on. */
++    private static List<String> drainInFlightRequests(Session session) throws Exception {
++        List<String> waitedOn = new ArrayList<>();
++        for (int attempt = 0; attempt < MAX_DRAIN_POLLS; attempt++) {
++            Map<String, Object> page = session.get("/iaas/api/request-tracker", session.apiVersion);
++            List<String> stillRunning = new ArrayList<>();
++            for (Object entry : Json.arr(page, "content")) {
++                Map<String, Object> tracker = Json.object(entry);
++                if ("INPROGRESS".equals(Json.str(tracker, "status"))) {
++                    String id = Json.str(tracker, "id");
++                    stillRunning.add(id);
++                    if (id != null && !waitedOn.contains(id)) {
++                        waitedOn.add(id);
++                    }
++                }
++            }
++            if (stillRunning.isEmpty()) {
++                return waitedOn;
++            }
++            Thread.sleep(POLL_INTERVAL.toMillis());
++        }
++        throw new IllegalStateException("requests were still in flight after " + MAX_DRAIN_POLLS
++                + " polls; refusing to rotate the secret and strand them");
++    }
++
++    /**
++     * Builds the update body: every field the read returned that the update schema also declares,
++     * the regions provisioning stays enabled on, and the new secret. A field the account does not
++     * carry is left out of the body rather than sent as null, "" or [].
++     */
++    private static Map<String, Object> buildUpdate(Map<String, Object> account, String newPassword) {
++        Map<String, Object> update = new LinkedHashMap<>();
++        for (String field : CARRIED_FORWARD) {
++            Object value = account.get(field);
++            if (hasValue(value)) {
++                update.put(field, value);
++            }
++        }
++        for (String required : List.of("name", "hostName")) {
++            if (!update.containsKey(required)) {
++                throw new IllegalStateException(
++                        "the cloud account did not report '" + required + "', which the update requires");
++            }
++        }
++
++        List<Object> regions = new ArrayList<>();
++        for (Object entry : Json.arr(account, "enabledRegions")) {
++            Map<String, Object> region = Json.object(entry);
++            Map<String, Object> specification = new LinkedHashMap<>();
++            specification.put("name", Json.str(region, "name"));
++            specification.put("externalRegionId", Json.str(region, "externalRegionId"));
++            if (!hasValue(specification.get("name")) || !hasValue(specification.get("externalRegionId"))) {
++                throw new IllegalStateException("enabled region " + region.get("id")
++                        + " is missing a name or an externalRegionId");
++            }
++            regions.add(specification);
++        }
++        if (regions.isEmpty()) {
++            throw new IllegalStateException("the cloud account reports no enabled regions; sending an "
++                    + "empty set would disable provisioning");
++        }
++        update.put("regions", regions);
++        update.put("password", newPassword);
++        return update;
++    }
++
++    /** Polls one request tracker until it leaves INPROGRESS. */
++    private static String awaitCompletion(Session session, String requestId) throws Exception {
++        for (int attempt = 0; attempt < MAX_ROTATION_POLLS; attempt++) {
++            Map<String, Object> tracker = session.get(
++                    "/iaas/api/request-tracker/" + requestId, session.apiVersion);
++            String status = Json.str(tracker, "status");
++            if ("FINISHED".equals(status)) {
++                return status;
++            }
++            if ("FAILED".equals(status)) {
++                throw new IllegalStateException("the credential rotation failed: "
++                        + Json.str(tracker, "message"));
++            }
++            Thread.sleep(POLL_INTERVAL.toMillis());
++        }
++        throw new IllegalStateException("request " + requestId + " did not settle after "
++                + MAX_ROTATION_POLLS + " polls");
++    }
++
++    /* ---------------------------------------------------------------- transport */
++
++    private static final class Session {
++        private final HttpClient http;
++        private final String baseUrl;
++        private final String bearerToken;
++        private String apiVersion;
++
++        Session(HttpClient http, String baseUrl, String bearerToken) {
++            this.http = http;
++            this.baseUrl = baseUrl;
++            this.bearerToken = bearerToken;
++        }
++
++        Map<String, Object> get(String path, String version) throws Exception {
++            HttpRequest request = common(path, version).GET().build();
++            return send(request, 200);
++        }
++
++        Map<String, Object> patch(String path, Map<String, Object> body) throws Exception {
++            HttpRequest request = common(path, apiVersion)
++                    .header("Content-Type", "application/json")
++                    .method("PATCH", HttpRequest.BodyPublishers.ofString(Json.write(body)))
++                    .build();
++            return send(request, 202);
++        }
++
++        private HttpRequest.Builder common(String path, String version) {
++            String query = version == null ? "" : "?apiVersion=" + version;
++            return HttpRequest.newBuilder(URI.create(baseUrl + path + query))
++                    .timeout(TIMEOUT)
++                    .header("Authorization", "Bearer " + bearerToken)
++                    .header("Accept", "application/json");
++        }
++
++        private Map<String, Object> send(HttpRequest request, int expectedStatus) throws Exception {
++            HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
++            if (response.statusCode() != expectedStatus) {
++                throw new IllegalStateException(request.method() + " " + request.uri().getPath()
++                        + " answered " + response.statusCode() + ": " + describe(response.body()));
++            }
++            return Json.object(Json.parse(response.body()));
++        }
++
++        private String describe(String body) {
++            try {
++                String message = Json.str(Json.object(Json.parse(body)), "message");
++                return message == null ? body : message;
++            } catch (RuntimeException notJson) {
++                return body;
++            }
++        }
++    }
++
++    /* ---------------------------------------------------------------- helpers */
++
++    private static boolean hasValue(Object value) {
++        if (value == null) {
++            return false;
++        }
++        if (value instanceof String s) {
++            return !s.isEmpty();
++        }
++        if (value instanceof Map<?, ?> map) {
++            return !map.isEmpty();
++        }
++        if (value instanceof List<?> list) {
++            return !list.isEmpty();
++        }
++        return true;
++    }
++
++    private static String trimTrailingSlash(String baseUrl) {
++        return baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
+     }
+ 
+     private CredentialRotator() {

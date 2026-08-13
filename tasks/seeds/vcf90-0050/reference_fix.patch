@@ -1,0 +1,467 @@
+diff --git a/deploy.go b/deploy.go
+new file mode 100644
+index 0000000..5be0442
+--- /dev/null
++++ b/deploy.go
+@@ -0,0 +1,461 @@
++package vcfovf
++
++import (
++	"bytes"
++	"context"
++	"crypto/rand"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"regexp"
++	"strings"
++	"time"
++)
++
++// The pinned surface of the vSphere Automation API for vCenter, 9.0.0.0.
++// docs/contract.json is the authority; these constants mirror it.
++const (
++	// BasePath is the single server path prefix declared by the spec.
++	BasePath = "/api"
++	// SessionHeader carries the api_key_auth session identifier.
++	SessionHeader = "vmware-api-session-id"
++	// ClientTokenHeader carries the idempotency token that makes a deploy
++	// safe to re-send.
++	ClientTokenHeader = "Client-Token"
++	// DeployOperationID is the mutating operation this package drives.
++	DeployOperationID = "Vcenter.Ovf.LibraryItem_deploy"
++	// ListVMsOperationID is the read-back used to confirm the result.
++	ListVMsOperationID = "Vcenter.VM_list"
++)
++
++const (
++	deployPathPrefix = BasePath + "/vcenter/ovf/library-item/"
++	deployAction     = "action=deploy"
++	listVMsPath      = BasePath + "/vcenter/vm"
++
++	defaultMaxAttempts = 4
++	defaultBaseBackoff = 100 * time.Millisecond
++	defaultMaxBackoff  = 2 * time.Second
++)
++
++var uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
++
++// DeploymentTarget is Vcenter.Ovf.LibraryItem.DeploymentTarget.
++//
++// Only resource_pool_id is required. The optional identifiers are omitted when
++// unset — the spec's "If missing or null, the server will ..." means absent,
++// not empty.
++type DeploymentTarget struct {
++	ResourcePoolID string `json:"resource_pool_id"`
++	HostID         string `json:"host_id,omitempty"`
++	FolderID       string `json:"folder_id,omitempty"`
++}
++
++// DeploymentSpec is the subset of
++// Vcenter.Ovf.LibraryItem.ResourcePoolDeploymentSpec this package sends.
++//
++// accept_all_eula is the schema's only required property, so it goes on the
++// wire even when false. Everything else is omitted when unset.
++type DeploymentSpec struct {
++	Name                string            `json:"name,omitempty"`
++	Annotation          string            `json:"annotation,omitempty"`
++	AcceptAllEULA       bool              `json:"accept_all_eula"`
++	NetworkMappings     map[string]string `json:"network_mappings,omitempty"`
++	StorageProvisioning string            `json:"storage_provisioning,omitempty"`
++	StorageProfileID    string            `json:"storage_profile_id,omitempty"`
++	DefaultDatastoreID  string            `json:"default_datastore_id,omitempty"`
++}
++
++// DeployableIdentity is Vcenter.Ovf.LibraryItem.DeployableIdentity.
++type DeployableIdentity struct {
++	Type string `json:"type"`
++	ID   string `json:"id"`
++}
++
++// DeployResult is a successful Vcenter.Ovf.LibraryItem.DeploymentResult plus
++// the bookkeeping of how it was obtained.
++type DeployResult struct {
++	Succeeded bool
++	Resource  DeployableIdentity
++	// ClientToken is the token every attempt of this deploy carried.
++	ClientToken string
++	// Attempts counts the requests it took, including the one that answered.
++	Attempts int
++}
++
++// VMSummary is Vcenter.VM.Summary.
++type VMSummary struct {
++	VM            string
++	Name          string
++	PowerState    string
++	CPUCount      int64
++	MemorySizeMiB int64
++}
++
++// OvfError is one entry of Vcenter.Ovf.LibraryItem.ResultInfo.errors.
++type OvfError struct {
++	Category string
++	Message  string
++}
++
++// APIError is a vAPI error envelope, Vapi.Std.Errors.Error, with the HTTP
++// status it arrived under.
++type APIError struct {
++	OperationID string
++	StatusCode  int
++	ErrorType   string
++	Message     string
++}
++
++func (e *APIError) Error() string {
++	return fmt.Sprintf("vcfovf: %s returned HTTP %d %s: %s",
++		e.OperationID, e.StatusCode, e.ErrorType, e.Message)
++}
++
++// DeployFailedError reports a deploy that ran to completion and failed —
++// HTTP 200 with succeeded=false. It is a final answer, so it is never retried.
++type DeployFailedError struct {
++	LibraryItemID string
++	ClientToken   string
++	Errors        []OvfError
++}
++
++func (e *DeployFailedError) Error() string {
++	reasons := make([]string, 0, len(e.Errors))
++	for _, r := range e.Errors {
++		reasons = append(reasons, r.Category+": "+r.Message)
++	}
++	if len(reasons) == 0 {
++		reasons = append(reasons, "no reason reported")
++	}
++	return fmt.Sprintf("vcfovf: deploy of library item %s (token %s) failed: %s",
++		e.LibraryItemID, e.ClientToken, strings.Join(reasons, "; "))
++}
++
++// RetriesExhaustedError reports that the retry budget ran out while the
++// outcome was still unknown or the service was still unavailable. It unwraps
++// to the last failure seen.
++type RetriesExhaustedError struct {
++	Attempts    int
++	ClientToken string
++	Err         error
++}
++
++func (e *RetriesExhaustedError) Error() string {
++	return fmt.Sprintf("vcfovf: gave up after %d attempts with token %s: %v",
++		e.Attempts, e.ClientToken, e.Err)
++}
++
++func (e *RetriesExhaustedError) Unwrap() error { return e.Err }
++
++// Options tunes a Client. The zero value is the pinned default policy:
++// four attempts, 100ms base backoff doubling to a 2s cap, no jitter.
++type Options struct {
++	MaxAttempts int
++	BaseBackoff time.Duration
++	MaxBackoff  time.Duration
++	// Sleep waits out a backoff interval. Tests inject their own so nothing
++	// waits on a real clock; nil means time.Sleep.
++	Sleep func(time.Duration)
++	// HTTPClient is the transport; nil means a fresh http.Client.
++	HTTPClient *http.Client
++}
++
++// Client speaks the two pinned operations against one vCenter.
++type Client struct {
++	baseURL     string
++	sessionID   string
++	http        *http.Client
++	maxAttempts int
++	baseBackoff time.Duration
++	maxBackoff  time.Duration
++	sleep       func(time.Duration)
++}
++
++// NewClient builds a client for the vCenter reachable at baseURL, which is the
++// scheme and host only — the /api prefix comes from the contract.
++func NewClient(baseURL, sessionID string, opts Options) (*Client, error) {
++	if sessionID == "" {
++		return nil, errors.New("vcfovf: a vmware-api-session-id value is required")
++	}
++	u, err := url.Parse(baseURL)
++	if err != nil {
++		return nil, fmt.Errorf("vcfovf: base URL %q: %w", baseURL, err)
++	}
++	if u.Scheme == "" || u.Host == "" {
++		return nil, fmt.Errorf("vcfovf: base URL %q needs a scheme and a host", baseURL)
++	}
++	if u.User != nil || (u.EscapedPath() != "" && u.EscapedPath() != "/") ||
++		u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
++		return nil, fmt.Errorf("vcfovf: base URL %q must contain only a scheme and host", baseURL)
++	}
++
++	c := &Client{
++		baseURL:     u.Scheme + "://" + u.Host,
++		sessionID:   sessionID,
++		http:        opts.HTTPClient,
++		maxAttempts: opts.MaxAttempts,
++		baseBackoff: opts.BaseBackoff,
++		maxBackoff:  opts.MaxBackoff,
++		sleep:       opts.Sleep,
++	}
++	if c.http == nil {
++		c.http = &http.Client{}
++	}
++	if c.maxAttempts <= 0 {
++		c.maxAttempts = defaultMaxAttempts
++	}
++	if c.baseBackoff <= 0 {
++		c.baseBackoff = defaultBaseBackoff
++	}
++	if c.maxBackoff <= 0 {
++		c.maxBackoff = defaultMaxBackoff
++	}
++	if c.sleep == nil {
++		c.sleep = time.Sleep
++	}
++	return c, nil
++}
++
++func newClientToken() (string, error) {
++	var b [16]byte
++	if _, err := rand.Read(b[:]); err != nil {
++		return "", fmt.Errorf("vcfovf: generating a client token: %w", err)
++	}
++	b[6] = (b[6] & 0x0f) | 0x40
++	b[8] = (b[8] & 0x3f) | 0x80
++	h := hex.EncodeToString(b[:])
++	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32], nil
++}
++
++type deployBody struct {
++	Target         DeploymentTarget `json:"target"`
++	DeploymentSpec DeploymentSpec   `json:"deployment_spec"`
++}
++
++// DeployLibraryItem deploys an OVF library item, retrying safely.
++//
++// clientToken is the idempotency token. Pass "" to have one minted. Whatever
++// it is, every attempt of this call carries that one token, so a deploy the
++// client failed to get an answer to is replayed by vCenter rather than run a
++// second time.
++func (c *Client) DeployLibraryItem(ctx context.Context, libraryItemID, clientToken string, target DeploymentTarget, spec DeploymentSpec) (DeployResult, error) {
++	if libraryItemID == "" {
++		return DeployResult{}, errors.New("vcfovf: a content library item identifier is required")
++	}
++	if clientToken == "" {
++		var err error
++		if clientToken, err = newClientToken(); err != nil {
++			return DeployResult{}, err
++		}
++	} else if !uuidPattern.MatchString(clientToken) {
++		return DeployResult{}, fmt.Errorf(
++			"vcfovf: client token %q does not conform to the UUID format", clientToken)
++	}
++
++	body, err := json.Marshal(deployBody{Target: target, DeploymentSpec: spec})
++	if err != nil {
++		return DeployResult{}, fmt.Errorf("vcfovf: encoding the deploy body: %w", err)
++	}
++	endpoint := c.baseURL + deployPathPrefix + url.PathEscape(libraryItemID) + "?" + deployAction
++
++	var last error
++	for attempt := 1; ; attempt++ {
++		if err := ctx.Err(); err != nil {
++			return DeployResult{}, fmt.Errorf("vcfovf: deploy of %s abandoned: %w", libraryItemID, err)
++		}
++
++		status, payload, err := c.do(ctx, http.MethodPost, endpoint, clientToken, body)
++		switch {
++		case err != nil:
++			// No complete response came back. Whether the deploy took
++			// effect is unknown, which is precisely the case the
++			// Client-Token exists for: re-send it.
++			if ctxErr := contextCause(ctx, err); ctxErr != nil {
++				return DeployResult{}, fmt.Errorf("vcfovf: deploy of %s abandoned: %w", libraryItemID, ctxErr)
++			}
++			last = err
++		case status == http.StatusOK:
++			return decodeDeployResult(libraryItemID, clientToken, attempt, payload)
++		case status == http.StatusServiceUnavailable:
++			last = apiErrorFrom(DeployOperationID, status, payload)
++		default:
++			// Every documented status other than 503 is a final outcome;
++			// re-sending it would only ask the same question twice.
++			return DeployResult{}, apiErrorFrom(DeployOperationID, status, payload)
++		}
++
++		if attempt >= c.maxAttempts {
++			return DeployResult{}, &RetriesExhaustedError{
++				Attempts:    attempt,
++				ClientToken: clientToken,
++				Err:         last,
++			}
++		}
++		if err := ctx.Err(); err != nil {
++			return DeployResult{}, fmt.Errorf("vcfovf: deploy of %s abandoned: %w", libraryItemID, err)
++		}
++		c.sleep(c.backoff(attempt))
++	}
++}
++
++// ListVMs returns the virtual machines visible to the session, optionally
++// filtered by name. Several names travel as repeated names= pairs; an empty
++// filter sends no query parameter at all.
++func (c *Client) ListVMs(ctx context.Context, names []string) ([]VMSummary, error) {
++	endpoint := c.baseURL + listVMsPath
++	if len(names) > 0 {
++		q := url.Values{}
++		for _, n := range names {
++			q.Add("names", n)
++		}
++		endpoint += "?" + q.Encode()
++	}
++
++	status, payload, err := c.do(ctx, http.MethodGet, endpoint, "", nil)
++	if err != nil {
++		return nil, fmt.Errorf("vcfovf: %s: %w", ListVMsOperationID, err)
++	}
++	if status != http.StatusOK {
++		return nil, apiErrorFrom(ListVMsOperationID, status, payload)
++	}
++
++	var raw []struct {
++		VM            string `json:"vm"`
++		Name          string `json:"name"`
++		PowerState    string `json:"power_state"`
++		CPUCount      int64  `json:"cpu_count"`
++		MemorySizeMiB int64  `json:"memory_size_mib"`
++	}
++	if err := json.Unmarshal(payload, &raw); err != nil {
++		return nil, fmt.Errorf("vcfovf: decoding the %s response: %w", ListVMsOperationID, err)
++	}
++	out := make([]VMSummary, 0, len(raw))
++	for _, r := range raw {
++		out = append(out, VMSummary{
++			VM:            r.VM,
++			Name:          r.Name,
++			PowerState:    r.PowerState,
++			CPUCount:      r.CPUCount,
++			MemorySizeMiB: r.MemorySizeMiB,
++		})
++	}
++	return out, nil
++}
++
++// do performs one request. A non-nil error means no complete response.
++func (c *Client) do(ctx context.Context, method, endpoint, clientToken string, body []byte) (int, []byte, error) {
++	var reader io.Reader
++	if body != nil {
++		reader = bytes.NewReader(body)
++	}
++	req, err := http.NewRequestWithContext(ctx, method, endpoint, reader)
++	if err != nil {
++		return 0, nil, err
++	}
++	req.Header.Set(SessionHeader, c.sessionID)
++	if body != nil {
++		req.Header.Set("Content-Type", "application/json")
++	}
++	if clientToken != "" {
++		req.Header.Set(ClientTokenHeader, clientToken)
++	}
++
++	resp, err := c.http.Do(req)
++	if err != nil {
++		return 0, nil, err
++	}
++	defer resp.Body.Close()
++
++	payload, err := io.ReadAll(resp.Body)
++	if err != nil {
++		// A truncated response is no response at all.
++		return 0, nil, err
++	}
++	return resp.StatusCode, payload, nil
++}
++
++func (c *Client) backoff(attempt int) time.Duration {
++	d := c.baseBackoff
++	for i := 1; i < attempt; i++ {
++		d *= 2
++		if d >= c.maxBackoff {
++			return c.maxBackoff
++		}
++	}
++	if d > c.maxBackoff {
++		return c.maxBackoff
++	}
++	return d
++}
++
++func decodeDeployResult(libraryItemID, clientToken string, attempt int, payload []byte) (DeployResult, error) {
++	var raw struct {
++		Succeeded  bool                `json:"succeeded"`
++		ResourceID *DeployableIdentity `json:"resource_id"`
++		Error      *struct {
++			Errors []struct {
++				Category string `json:"category"`
++				Message  *struct {
++					DefaultMessage string `json:"default_message"`
++				} `json:"message"`
++			} `json:"errors"`
++		} `json:"error"`
++	}
++	if err := json.Unmarshal(payload, &raw); err != nil {
++		return DeployResult{}, fmt.Errorf("vcfovf: decoding the %s response: %w", DeployOperationID, err)
++	}
++
++	if !raw.Succeeded {
++		failed := &DeployFailedError{LibraryItemID: libraryItemID, ClientToken: clientToken}
++		if raw.Error != nil {
++			for _, e := range raw.Error.Errors {
++				msg := ""
++				if e.Message != nil {
++					msg = e.Message.DefaultMessage
++				}
++				failed.Errors = append(failed.Errors, OvfError{Category: e.Category, Message: msg})
++			}
++		}
++		return DeployResult{ClientToken: clientToken, Attempts: attempt}, failed
++	}
++
++	res := DeployResult{Succeeded: true, ClientToken: clientToken, Attempts: attempt}
++	if raw.ResourceID != nil {
++		res.Resource = *raw.ResourceID
++	}
++	return res, nil
++}
++
++func apiErrorFrom(operationID string, status int, payload []byte) *APIError {
++	e := &APIError{OperationID: operationID, StatusCode: status}
++	var env struct {
++		ErrorType string `json:"error_type"`
++		Messages  []struct {
++			DefaultMessage string `json:"default_message"`
++		} `json:"messages"`
++	}
++	if err := json.Unmarshal(payload, &env); err == nil {
++		e.ErrorType = env.ErrorType
++		if len(env.Messages) > 0 {
++			e.Message = env.Messages[0].DefaultMessage
++		}
++	}
++	if e.Message == "" {
++		e.Message = strings.TrimSpace(string(payload))
++	}
++	return e
++}
++
++// contextCause reports the context error behind a transport failure, so a
++// cancellation is never mistaken for a transient network problem.
++func contextCause(ctx context.Context, err error) error {
++	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
++		return err
++	}
++	return ctx.Err()
++}

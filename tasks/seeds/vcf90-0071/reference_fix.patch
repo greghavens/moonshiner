@@ -1,0 +1,175 @@
+--- a/client.go
++++ b/client.go
+@@ -1,12 +1,17 @@
+ package vcfops
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"mime/multipart"
+ 	"net/http"
+ 	"net/url"
++	"strconv"
++	"strings"
+ 	"time"
+ )
+ 
+@@ -83,7 +88,11 @@
+ }
+ 
+ func (e *OperationError) Error() string {
+-	return fmt.Sprintf("content import reached terminal state %s (error code %s)", e.Operation.State, e.Operation.ErrorCode)
++	detail := strings.Join(e.Operation.ErrorMessages, "; ")
++	if detail == "" {
++		return fmt.Sprintf("content import reached terminal state %s (error code %s)", e.Operation.State, e.Operation.ErrorCode)
++	}
++	return fmt.Sprintf("content import reached terminal state %s (error code %s): %s", e.Operation.State, e.Operation.ErrorCode, detail)
+ }
+ 
+ // Client calls the two VCF Operations endpoints in docs/contract.json.
+@@ -116,5 +125,140 @@
+ 
+ // ImportAndWait submits a content import and waits for its terminal state.
+ func (c *Client) ImportAndWait(ctx context.Context, filename string, content io.Reader, opts ImportOptions) (ImportResult, error) {
+-	return ImportResult{}, errors.New("ImportAndWait is not implemented")
++	accepted, err := c.importContent(ctx, filename, content, opts)
++	if err != nil {
++		return ImportResult{}, err
++	}
++
++	for {
++		operation, err := c.getLastImportOperation(ctx)
++		if err != nil {
++			return ImportResult{}, err
++		}
++		switch operation.State {
++		case StateFinished:
++			return ImportResult{Accepted: accepted, Operation: operation}, nil
++		case StateFailed, StateUnknown:
++			return ImportResult{}, &OperationError{Operation: operation}
++		case StateNotInitialized, StateInitialized, StateRunning:
++			if err := waitForPoll(ctx, c.pollInterval); err != nil {
++				return ImportResult{}, fmt.Errorf("wait to poll getLastImportOperation: %w", err)
++			}
++		default:
++			return ImportResult{}, fmt.Errorf("getLastImportOperation returned unsupported state %q", operation.State)
++		}
++	}
++}
++
++const contentImportPath = "/suite-api/api/content/operations/import"
++
++func (c *Client) importContent(ctx context.Context, filename string, content io.Reader, opts ImportOptions) (ContentImport, error) {
++	var body bytes.Buffer
++	writer := multipart.NewWriter(&body)
++	part, err := writer.CreateFormFile("contentFile", filename)
++	if err != nil {
++		return ContentImport{}, fmt.Errorf("build importContent multipart field: %w", err)
++	}
++	if _, err := io.Copy(part, content); err != nil {
++		return ContentImport{}, fmt.Errorf("read importContent content: %w", err)
++	}
++	if err := writer.Close(); err != nil {
++		return ContentImport{}, fmt.Errorf("finish importContent multipart body: %w", err)
++	}
++
++	endpoint := c.endpoint()
++	if opts.Force != nil {
++		query := endpoint.Query()
++		query.Set("force", strconv.FormatBool(*opts.Force))
++		endpoint.RawQuery = query.Encode()
++	}
++	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), &body)
++	if err != nil {
++		return ContentImport{}, fmt.Errorf("build importContent request: %w", err)
++	}
++	c.setCommonHeaders(request)
++	request.Header.Set("Content-Type", writer.FormDataContentType())
++	if opts.EncryptionPassword != "" {
++		request.Header.Set("EncryptionPassword", opts.EncryptionPassword)
++	}
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return ContentImport{}, fmt.Errorf("send importContent request: %w", err)
++	}
++	defer response.Body.Close()
++	if response.StatusCode != http.StatusAccepted {
++		return ContentImport{}, unexpectedStatus("importContent", response)
++	}
++	var accepted ContentImport
++	if err := json.NewDecoder(response.Body).Decode(&accepted); err != nil {
++		return ContentImport{}, fmt.Errorf("decode importContent response: %w", err)
++	}
++	return accepted, nil
++}
++
++func (c *Client) getLastImportOperation(ctx context.Context) (OperationDetails, error) {
++	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint().String(), nil)
++	if err != nil {
++		return OperationDetails{}, fmt.Errorf("build getLastImportOperation request: %w", err)
++	}
++	c.setCommonHeaders(request)
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return OperationDetails{}, fmt.Errorf("send getLastImportOperation request: %w", err)
++	}
++	defer response.Body.Close()
++	if response.StatusCode != http.StatusOK {
++		return OperationDetails{}, unexpectedStatus("getLastImportOperation", response)
++	}
++	var operation OperationDetails
++	if err := json.NewDecoder(response.Body).Decode(&operation); err != nil {
++		return OperationDetails{}, fmt.Errorf("decode getLastImportOperation response: %w", err)
++	}
++	return operation, nil
++}
++
++func (c *Client) endpoint() *url.URL {
++	endpoint := *c.baseURL
++	endpoint.Path = contentImportPath
++	endpoint.RawPath = ""
++	endpoint.RawQuery = ""
++	endpoint.Fragment = ""
++	return &endpoint
++}
++
++func (c *Client) setCommonHeaders(request *http.Request) {
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set("Authorization", c.authorization)
++}
++
++func unexpectedStatus(operation string, response *http.Response) error {
++	body, err := io.ReadAll(response.Body)
++	if err != nil {
++		return fmt.Errorf("%s returned HTTP %s and its error body could not be read: %w", operation, response.Status, err)
++	}
++	detail := strings.TrimSpace(string(body))
++	if detail == "" {
++		return fmt.Errorf("%s returned unexpected HTTP status %s", operation, response.Status)
++	}
++	return fmt.Errorf("%s returned unexpected HTTP status %s: %s", operation, response.Status, detail)
++}
++
++func waitForPoll(ctx context.Context, interval time.Duration) error {
++	if interval <= 0 {
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		default:
++			return nil
++		}
++	}
++	timer := time.NewTimer(interval)
++	defer timer.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-timer.C:
++		return nil
++	}
+ }

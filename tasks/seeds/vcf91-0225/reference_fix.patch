@@ -1,0 +1,479 @@
+diff --git a/VcfSddcLcmUpgrade/VcfSddcLcmUpgrade.psm1 b/VcfSddcLcmUpgrade/VcfSddcLcmUpgrade.psm1
+new file mode 100644
+index 0000000..7713384
+--- /dev/null
++++ b/VcfSddcLcmUpgrade/VcfSddcLcmUpgrade.psm1
+@@ -0,0 +1,473 @@
++#Requires -Version 7.4
++
++Set-StrictMode -Version Latest
++
++# The environment installs PowerCLI; this module never vendors it. The SDK owns
++# the session type and the session's bearer token. PowerCLI 13.5.0.25380678
++# ships no VMware.Sdk.Vcf.SddcLcm bindings, so the SDDC LCM requests themselves
++# are built here against docs/contract.json.
++Import-Module -Name 'VMware.Sdk.Vcf.Installer' `
++    -RequiredVersion '13.5.0.25380678' `
++    -ErrorAction Stop
++
++$script:BasePath = '/sddc-lcm'
++$script:TerminalStatus = @('SUCCEEDED', 'FAILED', 'CANCELED')
++
++function ConvertTo-NormalizedStatus {
++    param([Parameter()] $Value)
++
++    if ($null -eq $Value) { return '' }
++    $text = ([string] $Value).Trim()
++    if ([string]::IsNullOrEmpty($text)) { return '' }
++    return ([regex]::Replace($text, '\s+', '_')).ToUpperInvariant()
++}
++
++function Test-Blank {
++    param([Parameter()] $Value)
++
++    return [string]::IsNullOrWhiteSpace([string] $Value)
++}
++
++function Get-MemberValue {
++    <#
++        Reads a member from a PSCustomObject or dictionary without tripping
++        StrictMode when the member is absent.
++    #>
++    param(
++        [Parameter()] $InputObject,
++        [Parameter(Mandatory)] [string] $Name
++    )
++
++    if ($null -eq $InputObject) { return $null }
++    if ($InputObject -is [System.Collections.IDictionary]) {
++        if ($InputObject.Contains($Name)) { return $InputObject[$Name] }
++        return $null
++    }
++    $property = $InputObject.PSObject.Properties[$Name]
++    if ($null -eq $property) { return $null }
++    return $property.Value
++}
++
++function Invoke-SddcLcmRequest {
++    <#
++        Issues one contracted SDDC LCM request over the caller-owned PowerCLI
++        session. PowerCLI 13.5.0.25380678 ships no VMware.Sdk.Vcf.SddcLcm
++        bindings, so the request is built here and authorised with the session's
++        own bearer token.
++    #>
++    param(
++        [Parameter(Mandatory)] $Server,
++        [Parameter(Mandatory)] [ValidateSet('GET', 'POST')] [string] $Method,
++        [Parameter(Mandatory)] [string] $Path,
++        [Parameter()] [hashtable] $Query,
++        [Parameter()] $Body,
++        [Parameter()] [string] $CorrelationId,
++        [Parameter(Mandatory)] [string] $OperationId
++    )
++
++    $builder = [UriBuilder]::new([uri] $Server.ServiceUri)
++    $builder.Path = $script:BasePath + $Path
++    if ($Query -and $Query.Count -gt 0) {
++        $pairs = foreach ($name in $Query.Keys) {
++            '{0}={1}' -f [uri]::EscapeDataString([string] $name),
++                         [uri]::EscapeDataString([string] $Query[$name])
++        }
++        $builder.Query = ($pairs -join '&')
++    }
++
++    $headers = @{
++        'Authorization' = 'Bearer ' + [string] $Server.SessionSecret
++        'Accept'        = 'application/json'
++    }
++    # Optional header: present only when the caller supplied a correlation id.
++    if (-not (Test-Blank $CorrelationId)) {
++        $headers['X-Correlation-Id'] = $CorrelationId
++    }
++
++    $arguments = @{
++        Uri                = $builder.Uri.AbsoluteUri
++        Method             = $Method
++        Headers            = $headers
++        MaximumRedirection = 0
++        SkipHttpErrorCheck = $true
++        ErrorAction        = 'Stop'
++    }
++    if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
++        $arguments['Body'] = ConvertTo-Json -InputObject $Body -Depth 12 -Compress
++        $arguments['ContentType'] = 'application/json'
++    }
++
++    $response = Invoke-WebRequest @arguments
++    $status = [int] $response.StatusCode
++    $text = [string] $response.Content
++
++    $payload = $null
++    if (-not (Test-Blank $text)) {
++        try {
++            $payload = ConvertFrom-Json -InputObject $text -Depth 32
++        } catch {
++            throw "Operation '$OperationId' returned a body that is not JSON: $text"
++        }
++    }
++
++    if ($status -ge 400) {
++        $detail = $status
++        $message = Get-MemberValue -InputObject $payload -Name 'message'
++        $default = Get-MemberValue -InputObject $message -Name 'defaultMessage'
++        $code = Get-MemberValue -InputObject $payload -Name 'code'
++        if (-not (Test-Blank $default)) { $detail = "$status $code - $default" }
++        throw "Operation '$OperationId' failed: $detail"
++    }
++
++    return [pscustomobject] @{
++        StatusCode = $status
++        Payload    = $payload
++    }
++}
++
++function Wait-SddcLcmTask {
++    <#
++        Polls getTask for one accepted task until its status is terminal. The
++        status carried by the 202 response is never treated as terminal.
++    #>
++    param(
++        [Parameter(Mandatory)] $Server,
++        [Parameter(Mandatory)] [string] $TaskId,
++        [Parameter(Mandatory)] [int] $PollIntervalSeconds,
++        [Parameter(Mandatory)] [datetime] $Deadline,
++        [Parameter()] [string] $CorrelationId
++    )
++
++    while ($true) {
++        $result = Invoke-SddcLcmRequest `
++            -Server $Server `
++            -Method 'GET' `
++            -Path ('/v1/tasks/{0}' -f [uri]::EscapeDataString($TaskId)) `
++            -CorrelationId $CorrelationId `
++            -OperationId 'getTask'
++
++        $task = $result.Payload
++        if ($null -eq $task) {
++            throw "Operation 'getTask' returned no task for id '$TaskId'."
++        }
++        $returnedId = [string] (Get-MemberValue -InputObject $task -Name 'id')
++        if ($returnedId -cne $TaskId) {
++            throw "Operation 'getTask' returned task '$returnedId' for id '$TaskId'."
++        }
++
++        $status = ConvertTo-NormalizedStatus (Get-MemberValue -InputObject $task -Name 'status')
++        if ($script:TerminalStatus -ccontains $status) {
++            return [pscustomobject] @{ Task = $task; Status = $status }
++        }
++
++        if ([datetime]::UtcNow -ge $Deadline) {
++            throw [TimeoutException]::new(
++                "Task '$TaskId' was still '$status' when the timeout expired.")
++        }
++        if ($PollIntervalSeconds -gt 0) {
++            Start-Sleep -Seconds $PollIntervalSeconds
++        }
++    }
++}
++
++function Get-FailedStageDetail {
++    param([Parameter()] $Task)
++
++    $stageName = ''
++    $message = ''
++
++    $stages = Get-MemberValue -InputObject $Task -Name 'stages'
++    if ($null -ne $stages) {
++        foreach ($stage in @($stages)) {
++            $stageStatus = ConvertTo-NormalizedStatus (Get-MemberValue -InputObject $stage -Name 'status')
++            if ($stageStatus -cne 'FAILED') { continue }
++            $stageName = [string] (Get-MemberValue -InputObject $stage -Name 'name')
++            $stageMessages = Get-MemberValue -InputObject $stage -Name 'messages'
++            foreach ($entry in @($stageMessages)) {
++                $level = ConvertTo-NormalizedStatus (Get-MemberValue -InputObject $entry -Name 'level')
++                if ($level -cne 'ERROR') { continue }
++                $localizable = Get-MemberValue -InputObject $entry -Name 'message'
++                $text = [string] (Get-MemberValue -InputObject $localizable -Name 'defaultMessage')
++                if (-not (Test-Blank $text)) { $message = $text; break }
++            }
++            break
++        }
++    }
++
++    if (Test-Blank $message) {
++        foreach ($entry in @(Get-MemberValue -InputObject $Task -Name 'messages')) {
++            $level = ConvertTo-NormalizedStatus (Get-MemberValue -InputObject $entry -Name 'level')
++            if ($level -cne 'ERROR') { continue }
++            $localizable = Get-MemberValue -InputObject $entry -Name 'message'
++            $text = [string] (Get-MemberValue -InputObject $localizable -Name 'defaultMessage')
++            if (-not (Test-Blank $text)) { $message = $text; break }
++        }
++    }
++
++    return [pscustomobject] @{ StageName = $stageName; Message = $message }
++}
++
++function Invoke-VcfSddcLcmComponentUpgrade {
++    <#
++        .SYNOPSIS
++        Runs an ordered VCF 9.1 SDDC LCM upgrade over a caller-owned PowerCLI
++        session and reports the outcome of every step that was executed.
++
++        .DESCRIPTION
++        Registers the fleet depot, resolves the requested component versions to
++        binary urls, then prechecks and applies each component in the supplied
++        order. The run stops at the first failure. Steps that already succeeded
++        keep their reported status and components that were never reached are
++        listed in notAttempted.
++    #>
++    [CmdletBinding()]
++    param(
++        # Only a genuine PowerCLI session is accepted; a look-alike object with
++        # the right property names is rejected by the parameter binder.
++        [Parameter(Mandatory)]
++        [VMware.Sdk.Vcf.Installer.Types.VcfInstallerServer] $Server,
++        [Parameter(Mandatory)] [object[]] $Component,
++        [Parameter(Mandatory)] [string] $DepotFqdn,
++        [Parameter(Mandatory)] [string] $DepotCertificate,
++        [Parameter()] [string] $BundleVersion,
++        [Parameter()] [string[]] $DepotManifestCertificate,
++        [Parameter()] [bool] $PerformBackup,
++        [Parameter()] [string] $CorrelationId,
++        [Parameter()] [ValidateRange(0, 60)] [int] $PollIntervalSeconds = 2,
++        [Parameter()] [ValidateRange(1, 900)] [int] $TimeoutSeconds = 300
++    )
++
++    # ---- input validation, before any request ----
++    if ($null -eq $Server) {
++        throw [ArgumentNullException]::new('Server')
++    }
++    foreach ($name in @('ServiceUri', 'SessionSecret')) {
++        if (Test-Blank (Get-MemberValue -InputObject $Server -Name $name)) {
++            throw [ArgumentException]::new(
++                "The supplied server has no '$name'; pass a connected VcfInstallerServer.",
++                'Server')
++        }
++    }
++    if (Test-Blank $DepotFqdn) {
++        throw [ArgumentException]::new('DepotFqdn must not be blank.', 'DepotFqdn')
++    }
++    if (Test-Blank $DepotCertificate) {
++        throw [ArgumentException]::new('DepotCertificate must not be blank.', 'DepotCertificate')
++    }
++    if ($Component.Count -eq 0) {
++        throw [ArgumentException]::new('At least one component is required.', 'Component')
++    }
++
++    $plan = foreach ($entry in $Component) {
++        $name = [string] (Get-MemberValue -InputObject $entry -Name 'Name')
++        $id = [string] (Get-MemberValue -InputObject $entry -Name 'Id')
++        $version = [string] (Get-MemberValue -InputObject $entry -Name 'TargetVersion')
++        foreach ($pair in @(@('Name', $name), @('Id', $id), @('TargetVersion', $version))) {
++            if (Test-Blank $pair[1]) {
++                throw [ArgumentException]::new(
++                    "Every component requires a non-blank '$($pair[0])'.", 'Component')
++            }
++        }
++        [pscustomobject] @{ Name = $name; Id = $id; TargetVersion = $version }
++    }
++    $plan = @($plan)
++    if (@($plan.Name | Sort-Object -Unique).Count -ne $plan.Count) {
++        throw [ArgumentException]::new('Component names must be unique.', 'Component')
++    }
++    if (@($plan.Id | Sort-Object -Unique).Count -ne $plan.Count) {
++        throw [ArgumentException]::new('Component ids must be unique.', 'Component')
++    }
++
++    $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSeconds)
++    $steps = [System.Collections.Generic.List[object]]::new()
++    $stepNumber = 0
++
++    $failure = [pscustomobject] @{
++        Step = 0; OperationId = ''; Action = ''; Component = ''
++        TaskId = ''; Stage = ''; Message = ''
++    }
++
++    $addStep = {
++        param([string] $OperationId, [string] $Action, [string] $ComponentName,
++              [string] $TaskId, [string] $Status)
++        $script:stepCounter = $script:stepCounter + 1
++        $steps.Add([pscustomobject] [ordered] @{
++            stepNumber  = $script:stepCounter
++            operationId = $OperationId
++            action      = $Action
++            component   = $ComponentName
++            taskId      = $TaskId
++            status      = $Status
++        })
++    }
++    $script:stepCounter = 0
++
++    # The fleet depot spec is reused by setDepot and resolveDepotComponents.
++    $fleetDepotSpec = [ordered] @{
++        fqdn        = $DepotFqdn
++        certificate = $DepotCertificate
++    }
++
++    # ---- step 1: setDepot ----
++    $accepted = Invoke-SddcLcmRequest `
++        -Server $Server -Method 'POST' -Path '/v1/depot' `
++        -Body $fleetDepotSpec -CorrelationId $CorrelationId -OperationId 'setDepot'
++    $depotTaskId = [string] (Get-MemberValue -InputObject $accepted.Payload -Name 'id')
++    if (Test-Blank $depotTaskId) {
++        throw "Operation 'setDepot' returned no task id."
++    }
++    $depotOutcome = Wait-SddcLcmTask -Server $Server -TaskId $depotTaskId `
++        -PollIntervalSeconds $PollIntervalSeconds -Deadline $deadline `
++        -CorrelationId $CorrelationId
++    & $addStep 'setDepot' '' '' $depotTaskId $depotOutcome.Status
++
++    $resolvedComponents = @()
++    $notAttempted = [System.Collections.Generic.List[string]]::new()
++
++    if ($depotOutcome.Status -cne 'SUCCEEDED') {
++        $detail = Get-FailedStageDetail -Task $depotOutcome.Task
++        $failure = [pscustomobject] @{
++            Step = $script:stepCounter; OperationId = 'setDepot'; Action = ''
++            Component = ''; TaskId = $depotTaskId
++            Stage = $detail.StageName; Message = $detail.Message
++        }
++        foreach ($item in $plan) { $notAttempted.Add($item.Name) }
++    } else {
++        # ---- step 2: resolveDepotComponents ----
++        $depotComponentsSpec = [ordered] @{
++            fleetDepotSpec    = $fleetDepotSpec
++            componentVersions = @(
++                foreach ($item in $plan) {
++                    [ordered] @{ component = $item.Name; version = $item.TargetVersion }
++                }
++            )
++        }
++        # Optional member: present only when the caller supplied it.
++        if ($PSBoundParameters.ContainsKey('BundleVersion') -and -not (Test-Blank $BundleVersion)) {
++            $depotComponentsSpec['version'] = $BundleVersion
++        }
++
++        $resolveResult = Invoke-SddcLcmRequest `
++            -Server $Server -Method 'POST' -Path '/v1/depot/components' `
++            -Body $depotComponentsSpec -CorrelationId $CorrelationId `
++            -OperationId 'resolveDepotComponents'
++        & $addStep 'resolveDepotComponents' '' '' '' 'SUCCEEDED'
++
++        $returned = @(Get-MemberValue -InputObject $resolveResult.Payload -Name 'componentVersions')
++        $resolvedComponents = @(
++            foreach ($item in $plan) {
++                # Match on component AND version; the depot answers out of order
++                # and may carry entries for other components or versions.
++                $found = @(
++                    foreach ($candidate in $returned) {
++                        if ($null -eq $candidate) { continue }
++                        $candidateName = [string] (Get-MemberValue -InputObject $candidate -Name 'component')
++                        $candidateVersion = [string] (Get-MemberValue -InputObject $candidate -Name 'version')
++                        if ($candidateName -ceq $item.Name -and $candidateVersion -ceq $item.TargetVersion) {
++                            $candidate
++                        }
++                    }
++                )
++                if ($found.Count -ne 1) {
++                    throw ("Expected exactly one resolved version for component " +
++                           "'$($item.Name)' at '$($item.TargetVersion)'; got $($found.Count).")
++                }
++                $binaryUrl = [string] (Get-MemberValue -InputObject $found[0] -Name 'binaryUrl')
++                if (Test-Blank $binaryUrl) {
++                    throw "Component '$($item.Name)' resolved to a blank binaryUrl."
++                }
++                [pscustomobject] [ordered] @{
++                    component = $item.Name
++                    version   = $item.TargetVersion
++                    binaryUrl = $binaryUrl
++                }
++            }
++        )
++
++        # ---- steps 3..n: precheck then apply, component by component ----
++        $stopped = $false
++        for ($index = 0; $index -lt $plan.Count; $index++) {
++            $item = $plan[$index]
++            if ($stopped) { $notAttempted.Add($item.Name); continue }
++
++            $binaryUrl = $resolvedComponents[$index].binaryUrl
++
++            $depotSpec = [ordered] @{ url = $binaryUrl }
++            if ($PSBoundParameters.ContainsKey('DepotManifestCertificate') -and
++                $null -ne $DepotManifestCertificate -and
++                $DepotManifestCertificate.Count -gt 0) {
++                $depotSpec['certificate'] = @($DepotManifestCertificate)
++            }
++
++            # policy, userInput and additionalInput stay absent: this run
++            # supplies none of them.
++            $componentSpec = [ordered] @{
++                software = [ordered] @{ version = $item.TargetVersion }
++                depot    = $depotSpec
++            }
++
++            $upgradeSpec = [ordered] @{ componentSpec = $componentSpec }
++            # A supplied $false is a supplied value and must reach the wire.
++            if ($PSBoundParameters.ContainsKey('PerformBackup')) {
++                $upgradeSpec['lcmPlatformSpec'] = [ordered] @{ performBackup = $PerformBackup }
++            }
++            if (-not (Test-Blank $CorrelationId)) {
++                $upgradeSpec['correlationId'] = $CorrelationId
++            }
++
++            foreach ($action in @('precheck', 'apply')) {
++                $acceptedAction = Invoke-SddcLcmRequest `
++                    -Server $Server -Method 'POST' `
++                    -Path ('/v1/components/{0}' -f [uri]::EscapeDataString($item.Id)) `
++                    -Query @{ action = $action } `
++                    -Body $upgradeSpec -CorrelationId $CorrelationId `
++                    -OperationId 'performComponentAction'
++
++                $taskId = [string] (Get-MemberValue -InputObject $acceptedAction.Payload -Name 'id')
++                if (Test-Blank $taskId) {
++                    throw ("Operation 'performComponentAction' returned no task id for " +
++                           "'$action' on '$($item.Name)'.")
++                }
++                $outcome = Wait-SddcLcmTask -Server $Server -TaskId $taskId `
++                    -PollIntervalSeconds $PollIntervalSeconds -Deadline $deadline `
++                    -CorrelationId $CorrelationId
++                & $addStep 'performComponentAction' $action $item.Name $taskId $outcome.Status
++
++                if ($outcome.Status -cne 'SUCCEEDED') {
++                    $detail = Get-FailedStageDetail -Task $outcome.Task
++                    $failure = [pscustomobject] @{
++                        Step = $script:stepCounter
++                        OperationId = 'performComponentAction'
++                        Action = $action
++                        Component = $item.Name
++                        TaskId = $taskId
++                        Stage = $detail.StageName
++                        Message = $detail.Message
++                    }
++                    $stopped = $true
++                    break
++                }
++            }
++        }
++    }
++
++    $overall = if ($failure.Step -gt 0) { 'FAILED' } else { 'SUCCEEDED' }
++
++    return [pscustomobject] [ordered] @{
++        overallStatus      = $overall
++        depotFqdn          = $DepotFqdn
++        depotTaskId        = $depotTaskId
++        resolvedComponents = @($resolvedComponents)
++        steps              = @($steps)
++        failedStep         = [int] $failure.Step
++        failedOperationId  = [string] $failure.OperationId
++        failedAction       = [string] $failure.Action
++        failedComponent    = [string] $failure.Component
++        failedTaskId       = [string] $failure.TaskId
++        failedStage        = [string] $failure.Stage
++        errorMessage       = [string] $failure.Message
++        notAttempted       = @($notAttempted)
++    }
++}
++
++Export-ModuleMember -Function 'Invoke-VcfSddcLcmComponentUpgrade'

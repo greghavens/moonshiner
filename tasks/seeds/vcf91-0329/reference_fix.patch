@@ -1,0 +1,509 @@
+--- a/credrotate/client.go
++++ b/credrotate/client.go
+@@ -1,31 +1,498 @@
+ package credrotate
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
++	"sync"
++	"time"
+ )
+ 
++const maxResponseBody = 1 << 20
++
+ // ErrNotImplemented marks the implementation point for this exercise.
+ var ErrNotImplemented = errors.New("credrotate client is not implemented")
+ 
+ // Client executes the focused VCF Automation credential-rotation workflow and
+-// must be safe for concurrent use by multiple goroutines.
+-type Client struct{}
++// is safe for concurrent use by multiple goroutines.
++//
++// The bearer token is held behind mu together with a generation counter.
++// A caller that meets a 401 knows the generation its request was signed with,
++// so it can tell "nobody has refreshed yet, I must" from "somebody already
++// refreshed, I only have to retry". authMu then serializes the refresh itself,
++// which collapses a fleet of concurrent 401s into a single retrieveAuthToken
++// exchange instead of a stampede.
++type Client struct {
++	baseURL         *url.URL
++	refreshToken    string
++	apiVersion      string
++	httpClient      *http.Client
++	pollInterval    time.Duration
++	maxPollAttempts int
++
++	authMu sync.Mutex
++
++	mu         sync.RWMutex
++	token      string
++	generation uint64
++}
+ 
+ // NewClient validates the configuration and constructs a client. It performs
+ // no I/O: the bearer token is acquired lazily on first use.
+-func NewClient(Config) (*Client, error) {
+-	return nil, ErrNotImplemented
++func NewClient(config Config) (*Client, error) {
++	if strings.TrimSpace(config.BaseURL) == "" {
++		return nil, fmt.Errorf("%w: BaseURL is required", ErrInvalidInput)
++	}
++	base, err := url.Parse(config.BaseURL)
++	if err != nil || base.Scheme == "" || base.Host == "" {
++		return nil, fmt.Errorf("%w: BaseURL %q is not an absolute URL", ErrInvalidInput, config.BaseURL)
++	}
++	if config.RefreshToken == "" {
++		return nil, fmt.Errorf("%w: RefreshToken is required", ErrInvalidInput)
++	}
++	if config.APIVersion == "" {
++		return nil, fmt.Errorf("%w: APIVersion is required", ErrInvalidInput)
++	}
++	if config.HTTPClient == nil {
++		return nil, fmt.Errorf("%w: HTTPClient is required", ErrInvalidInput)
++	}
++	client := &Client{
++		baseURL:         base,
++		refreshToken:    config.RefreshToken,
++		apiVersion:      config.APIVersion,
++		httpClient:      config.HTTPClient,
++		pollInterval:    config.PollInterval,
++		maxPollAttempts: config.MaxPollAttempts,
++	}
++	if client.pollInterval <= 0 {
++		client.pollInterval = time.Second
++	}
++	if client.maxPollAttempts <= 0 {
++		client.maxPollAttempts = 60
++	}
++	return client, nil
+ }
+ 
+ // RotateCredentials replaces the cloud account's stored privateKeyId and
+ // privateKey, waits for the asynchronous request to reach a terminal state,
+ // and reads the account back.
+-func (c *Client) RotateCredentials(context.Context, string, UpdateCloudAccountInput) (RotationResult, error) {
+-	return RotationResult{}, ErrNotImplemented
++func (c *Client) RotateCredentials(ctx context.Context, cloudAccountID string, input UpdateCloudAccountInput) (RotationResult, error) {
++	if err := validate(cloudAccountID, input); err != nil {
++		return RotationResult{}, err
++	}
++	body, err := json.Marshal(updateBody(input))
++	if err != nil {
++		return RotationResult{}, fmt.Errorf("%w: input is not serializable: %v", ErrInvalidInput, err)
++	}
++
++	result := RotationResult{}
++	var accepted RequestTracker
++	err = c.do(ctx, request{
++		operationID:    OperationUpdateCloudAccountAsync,
++		method:         http.MethodPatch,
++		path:           "/iaas/api/cloud-accounts/" + url.PathEscape(cloudAccountID),
++		body:           body,
++		expectedStatus: http.StatusAccepted,
++		out:            &accepted,
++	}, &result.Reauthentications)
++	if err != nil {
++		return RotationResult{}, err
++	}
++
++	terminal, err := c.awaitRequest(ctx, accepted, &result.Reauthentications)
++	if err != nil {
++		return RotationResult{}, err
++	}
++	result.Tracker = terminal
++
++	var account CloudAccount
++	if err := c.do(ctx, request{
++		operationID:    OperationGetCloudAccount,
++		method:         http.MethodGet,
++		path:           "/iaas/api/cloud-accounts/" + url.PathEscape(cloudAccountID),
++		expectedStatus: http.StatusOK,
++		out:            &account,
++	}, &result.Reauthentications); err != nil {
++		return RotationResult{}, err
++	}
++	result.Account = account
++	return result, nil
+ }
+ 
+ // GetCloudAccount reads one cloud account.
+-func (c *Client) GetCloudAccount(context.Context, string) (CloudAccount, error) {
+-	return CloudAccount{}, ErrNotImplemented
++func (c *Client) GetCloudAccount(ctx context.Context, cloudAccountID string) (CloudAccount, error) {
++	if cloudAccountID == "" {
++		return CloudAccount{}, fmt.Errorf("%w: cloud account id is required", ErrInvalidInput)
++	}
++	var account CloudAccount
++	if err := c.do(ctx, request{
++		operationID:    OperationGetCloudAccount,
++		method:         http.MethodGet,
++		path:           "/iaas/api/cloud-accounts/" + url.PathEscape(cloudAccountID),
++		expectedStatus: http.StatusOK,
++		out:            &account,
++	}, nil); err != nil {
++		return CloudAccount{}, err
++	}
++	return account, nil
++}
++
++// awaitRequest polls getRequestTracker until the request leaves INPROGRESS or
++// the poll budget runs out. The accepted tracker counts as the first observed
++// state but not as a poll.
++func (c *Client) awaitRequest(ctx context.Context, accepted RequestTracker, reauth *int) (RequestTracker, error) {
++	if accepted.ID == "" {
++		return RequestTracker{}, &OperationError{
++			OperationID: OperationUpdateCloudAccountAsync,
++			Kind:        KindProtocol,
++			Cause:       errors.New("the 202 RequestTracker carried no id"),
++		}
++	}
++	latest := accepted
++	for attempt := 0; attempt < c.maxPollAttempts; attempt++ {
++		if err := sleep(ctx, c.pollInterval); err != nil {
++			return RequestTracker{}, err
++		}
++		var tracker RequestTracker
++		if err := c.do(ctx, request{
++			operationID:    OperationGetRequestTracker,
++			method:         http.MethodGet,
++			path:           "/iaas/api/request-tracker/" + url.PathEscape(accepted.ID),
++			expectedStatus: http.StatusOK,
++			out:            &tracker,
++		}, reauth); err != nil {
++			return RequestTracker{}, err
++		}
++		latest = tracker
++		switch tracker.Status {
++		case StatusFinished:
++			return tracker, nil
++		case StatusFailed:
++			return RequestTracker{}, &TrackerError{
++				RequestID: accepted.ID,
++				Status:    tracker.Status,
++				Message:   tracker.Message,
++			}
++		case StatusInProgress:
++		default:
++			return RequestTracker{}, &OperationError{
++				OperationID: OperationGetRequestTracker,
++				Kind:        KindProtocol,
++				Cause:       fmt.Errorf("unknown status %q", tracker.Status),
++			}
++		}
++	}
++	return RequestTracker{}, &TrackerError{
++		RequestID: accepted.ID,
++		Status:    latest.Status,
++		Message:   latest.Message,
++	}
++}
++
++type request struct {
++	operationID    string
++	method         string
++	path           string
++	body           []byte
++	expectedStatus int
++	out            any
++}
++
++// do issues one authorized operation. A 401 means the bearer token was revoked
++// or expired underneath an already-started call: the token is refreshed once
++// and the identical request is replayed, so the caller is never stranded on
++// the old secret. The 401 itself proves the service applied nothing, which is
++// what makes replaying the mutation safe.
++func (c *Client) do(ctx context.Context, spec request, reauth *int) error {
++	token, generation, err := c.authorize(ctx)
++	if err != nil {
++		return err
++	}
++
++	response, err := c.send(ctx, spec, token)
++	if err != nil {
++		return err
++	}
++	if response.status == http.StatusUnauthorized {
++		token, refreshed, err := c.refresh(ctx, generation)
++		if err != nil {
++			return err
++		}
++		if refreshed && reauth != nil {
++			*reauth++
++		}
++		if response, err = c.send(ctx, spec, token); err != nil {
++			return err
++		}
++	}
++
++	if response.status != spec.expectedStatus {
++		return &OperationError{
++			OperationID: spec.operationID,
++			Kind:        KindHTTP,
++			StatusCode:  response.status,
++			Cause:       errors.New(serviceMessage(response.body)),
++		}
++	}
++	if spec.out == nil {
++		return nil
++	}
++	if err := json.Unmarshal(response.body, spec.out); err != nil {
++		return &OperationError{OperationID: spec.operationID, Kind: KindProtocol, Cause: err}
++	}
++	return nil
++}
++
++type rawResponse struct {
++	status int
++	body   []byte
++}
++
++func (c *Client) send(ctx context.Context, spec request, token string) (rawResponse, error) {
++	target := *c.baseURL
++	// spec.path is already escaped one segment at a time. Populate both Path
++	// and RawPath so reserved bytes in an account or tracker id are not escaped
++	// a second time by url.URL.String.
++	escapedPath := strings.TrimSuffix(c.baseURL.EscapedPath(), "/") + spec.path
++	decodedPath, err := url.PathUnescape(escapedPath)
++	if err != nil {
++		return rawResponse{}, &OperationError{OperationID: spec.operationID, Kind: KindTransport, Cause: err}
++	}
++	target.Path = decodedPath
++	target.RawPath = escapedPath
++	query := url.Values{}
++	query.Set("apiVersion", c.apiVersion)
++	target.RawQuery = query.Encode()
++
++	var payload io.Reader
++	if spec.body != nil {
++		payload = bytes.NewReader(spec.body)
++	}
++	httpRequest, err := http.NewRequestWithContext(ctx, spec.method, target.String(), payload)
++	if err != nil {
++		return rawResponse{}, &OperationError{OperationID: spec.operationID, Kind: KindTransport, Cause: err}
++	}
++	httpRequest.Header.Set("Accept", "application/json")
++	if spec.body != nil {
++		httpRequest.Header.Set("Content-Type", "application/json")
++		httpRequest.ContentLength = int64(len(spec.body))
++	}
++	if token != "" {
++		httpRequest.Header.Set("Authorization", "Bearer "+token)
++	}
++
++	httpResponse, err := c.httpClient.Do(httpRequest)
++	if err != nil {
++		return rawResponse{}, &OperationError{OperationID: spec.operationID, Kind: KindTransport, Cause: err}
++	}
++	defer func() {
++		_, _ = io.Copy(io.Discard, io.LimitReader(httpResponse.Body, maxResponseBody))
++		_ = httpResponse.Body.Close()
++	}()
++	body, err := io.ReadAll(io.LimitReader(httpResponse.Body, maxResponseBody))
++	if err != nil {
++		return rawResponse{}, &OperationError{OperationID: spec.operationID, Kind: KindTransport, Cause: err}
++	}
++	return rawResponse{status: httpResponse.StatusCode, body: body}, nil
++}
++
++// authorize returns the live token, acquiring one lazily on first use.
++func (c *Client) authorize(ctx context.Context) (string, uint64, error) {
++	token, generation := c.snapshot()
++	if token != "" {
++		return token, generation, nil
++	}
++	if _, _, err := c.refresh(ctx, generation); err != nil {
++		return "", 0, err
++	}
++	// Take the token and generation from one locked snapshot. Another caller
++	// may refresh immediately after the lazy acquisition, and pairing that
++	// newer generation with the older token would defeat stale-token detection.
++	token, generation = c.snapshot()
++	return token, generation, nil
++}
++
++func (c *Client) snapshot() (string, uint64) {
++	c.mu.RLock()
++	defer c.mu.RUnlock()
++	return c.token, c.generation
++}
++
++// refresh exchanges the refresh token for a new bearer token, but only if no
++// other goroutine has already replaced the generation the caller was using.
++// The bool reports whether this call is the one that performed the exchange.
++func (c *Client) refresh(ctx context.Context, stale uint64) (string, bool, error) {
++	c.authMu.Lock()
++	defer c.authMu.Unlock()
++
++	if token, generation := c.snapshot(); generation != stale && token != "" {
++		return token, false, nil
++	}
++	token, err := c.login(ctx)
++	if err != nil {
++		return "", false, err
++	}
++	c.mu.Lock()
++	c.token = token
++	c.generation++
++	c.mu.Unlock()
++	return token, true, nil
++}
++
++func (c *Client) login(ctx context.Context) (string, error) {
++	body, err := json.Marshal(map[string]string{"refreshToken": c.refreshToken})
++	if err != nil {
++		return "", &OperationError{OperationID: OperationRetrieveAuthToken, Kind: KindProtocol, Cause: err}
++	}
++	response, err := c.send(ctx, request{
++		operationID: OperationRetrieveAuthToken,
++		method:      http.MethodPost,
++		path:        "/iaas/api/login",
++		body:        body,
++	}, "")
++	if err != nil {
++		return "", err
++	}
++	if response.status != http.StatusOK {
++		return "", &OperationError{
++			OperationID: OperationRetrieveAuthToken,
++			Kind:        KindHTTP,
++			StatusCode:  response.status,
++			Cause:       errors.New(serviceMessage(response.body)),
++		}
++	}
++	var auth struct {
++		TokenType string `json:"tokenType"`
++		Token     string `json:"token"`
++	}
++	if err := json.Unmarshal(response.body, &auth); err != nil {
++		return "", &OperationError{OperationID: OperationRetrieveAuthToken, Kind: KindProtocol, Cause: err}
++	}
++	if auth.Token == "" {
++		return "", &OperationError{
++			OperationID: OperationRetrieveAuthToken,
++			Kind:        KindProtocol,
++			Cause:       errors.New("AuthResponse carried no token"),
++		}
++	}
++	return auth.Token, nil
++}
++
++// updateBody projects the input onto UpdateCloudAccountSpecification. A nil
++// optional member contributes no key at all; a member set to a zero value
++// contributes that zero value.
++func updateBody(input UpdateCloudAccountInput) map[string]any {
++	regions := make([]map[string]string, 0, len(input.Regions))
++	for _, region := range input.Regions {
++		regions = append(regions, map[string]string{
++			"name":             region.Name,
++			"externalRegionId": region.ExternalRegionID,
++		})
++	}
++	body := map[string]any{
++		"name":                   input.Name,
++		"cloudAccountProperties": input.CloudAccountProperties,
++		"regions":                regions,
++	}
++	if input.Description != nil {
++		body["description"] = *input.Description
++	}
++	if input.PrivateKeyID != nil {
++		body["privateKeyId"] = *input.PrivateKeyID
++	}
++	if input.PrivateKey != nil {
++		body["privateKey"] = *input.PrivateKey
++	}
++	if input.AssociatedCloudAccountIDs != nil {
++		ids := *input.AssociatedCloudAccountIDs
++		if ids == nil {
++			ids = []string{}
++		}
++		body["associatedCloudAccountIds"] = ids
++	}
++	if input.AssociatedMobilityCloudAccountIDs != nil {
++		mobility := *input.AssociatedMobilityCloudAccountIDs
++		if mobility == nil {
++			mobility = map[string]string{}
++		}
++		body["associatedMobilityCloudAccountIds"] = mobility
++	}
++	if input.CustomProperties != nil {
++		custom := *input.CustomProperties
++		if custom == nil {
++			custom = map[string]string{}
++		}
++		body["customProperties"] = custom
++	}
++	if input.CreateDefaultZones != nil {
++		body["createDefaultZones"] = *input.CreateDefaultZones
++	}
++	if input.Tags != nil {
++		tags := make([]map[string]string, 0, len(*input.Tags))
++		for _, tag := range *input.Tags {
++			wire := map[string]string{"key": tag.Key, "value": tag.Value}
++			if tag.ID != nil {
++				wire["id"] = *tag.ID
++			}
++			tags = append(tags, wire)
++		}
++		body["tags"] = tags
++	}
++	if input.CertificateInfo != nil {
++		body["certificateInfo"] = map[string]string{"certificate": input.CertificateInfo.Certificate}
++	}
++	return body
++}
++
++func validate(cloudAccountID string, input UpdateCloudAccountInput) error {
++	if cloudAccountID == "" {
++		return fmt.Errorf("%w: cloud account id is required", ErrInvalidInput)
++	}
++	if input.Name == "" {
++		return fmt.Errorf("%w: Name is required", ErrInvalidInput)
++	}
++	if input.CloudAccountProperties == nil {
++		return fmt.Errorf("%w: CloudAccountProperties is required", ErrInvalidInput)
++	}
++	if len(input.Regions) == 0 {
++		return fmt.Errorf("%w: at least one region is required", ErrInvalidInput)
++	}
++	for i, region := range input.Regions {
++		if region.Name == "" || region.ExternalRegionID == "" {
++			return fmt.Errorf("%w: region %d needs both Name and ExternalRegionID", ErrInvalidInput, i)
++		}
++	}
++	if input.Tags != nil {
++		for i, tag := range *input.Tags {
++			if tag.Key == "" {
++				return fmt.Errorf("%w: tag %d needs a Key", ErrInvalidInput, i)
++			}
++		}
++	}
++	return nil
++}
++
++func sleep(ctx context.Context, d time.Duration) error {
++	timer := time.NewTimer(d)
++	defer timer.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-timer.C:
++		return nil
++	}
++}
++
++func serviceMessage(body []byte) string {
++	var failure ServiceErrorResponse
++	if err := json.Unmarshal(body, &failure); err != nil || failure.Message == "" {
++		return "the service returned no message"
++	}
++	return failure.Message
+ }

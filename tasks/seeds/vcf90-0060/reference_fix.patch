@@ -1,0 +1,260 @@
+--- a/src/main/java/com/vmware/vcf/lab/VcenterSessionClient.java
++++ b/src/main/java/com/vmware/vcf/lab/VcenterSessionClient.java
+@@ -3,7 +3,13 @@
+ import java.io.IOException;
+ import java.net.URI;
+ import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
+ import java.time.Duration;
++import java.util.Base64;
++import java.util.HashMap;
++import java.util.Map;
+ 
+ /**
+  * Minimal vSphere Automation API client for VMware Cloud Foundation 9.0 vCenter.
+@@ -17,11 +23,30 @@
+  */
+ public final class VcenterSessionClient implements AutoCloseable {
+ 
++    private static final String SESSION_PATH = "/session";
++    private static final String TOKEN_HEADER = "vmware-api-session-id";
++    private static final String JSON = "application/json";
++
++    private static final String CREATE_OPERATION = "Cis.Session_create";
++    private static final String GET_OPERATION = "Cis.Session_get";
++    private static final String DELETE_OPERATION = "Cis.Session_delete";
++    private static final String CPU_UPDATE_OPERATION = "Vcenter.Vm.Hardware.Cpu_update";
++
+     /** Base URI of the API endpoint, including the {@code /api} base path, with no trailing slash. */
+     private final URI baseUri;
+ 
+     private final HttpClient httpClient;
+ 
++    /** Guards {@link #sessionToken}, {@link #inFlight} and {@link #closed}. */
++    private final Object sessionLock = new Object();
++
++    /** Number of requests currently on the wire, per session token. */
++    private final Map<String, Integer> inFlight = new HashMap<>();
++
++    private String sessionToken;
++
++    private boolean closed;
++
+     public VcenterSessionClient(URI baseUri) {
+         String normalized = baseUri.toString();
+         while (normalized.endsWith("/")) {
+@@ -49,12 +74,18 @@
+      * session token that subsequent calls authenticate with.
+      */
+     public String connect(String username, String password) throws IOException, InterruptedException {
+-        throw new UnsupportedOperationException("connect has not been implemented.");
++        String token = createSession(username, password);
++        synchronized (sessionLock) {
++            sessionToken = token;
++        }
++        return token;
+     }
+ 
+     /** The session token that new requests currently authenticate with, or {@code null} if not connected. */
+     public String currentSessionToken() {
+-        throw new UnsupportedOperationException("currentSessionToken has not been implemented.");
++        synchronized (sessionLock) {
++            return sessionToken;
++        }
+     }
+ 
+     /**
+@@ -65,7 +96,25 @@
+      */
+     public void updateVirtualMachineCpu(String vmId, CpuUpdateSpec spec)
+             throws IOException, InterruptedException {
+-        throw new UnsupportedOperationException("updateVirtualMachineCpu has not been implemented.");
++        // The token is pinned for the whole lifetime of the call, and the call is registered
++        // against it, so a concurrent rotation can see that this request is still on the wire.
++        String token = beginRequest();
++        try {
++            URI target = URI.create(baseUri + "/vcenter/vm/" + vmId + "/hardware/cpu");
++            HttpRequest request = HttpRequest.newBuilder(target)
++                    .header(TOKEN_HEADER, token)
++                    .header("Accept", JSON)
++                    .header("Content-Type", JSON)
++                    .method("PATCH", HttpRequest.BodyPublishers.ofString(
++                            serializeCpuUpdateSpec(spec), StandardCharsets.UTF_8))
++                    .build();
++            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
++            if (response.statusCode() != 204) {
++                throw new VcenterApiException(CPU_UPDATE_OPERATION, response.statusCode(), response.body());
++            }
++        } finally {
++            endRequest(token);
++        }
+     }
+ 
+     /**
+@@ -75,20 +124,161 @@
+      */
+     public void rotateCredential(String username, String password)
+             throws IOException, InterruptedException {
+-        throw new UnsupportedOperationException("rotateCredential has not been implemented.");
++        String replacement = createSession(username, password);
++        try {
++            validateSession(replacement);
++        } catch (VcenterApiException validationFailure) {
++            // The replacement is unusable, so drop it rather than leak a session, and leave the
++            // client running on the credential it already had.
++            discardSession(replacement);
++            throw validationFailure;
++        }
++
++        String retiring;
++        synchronized (sessionLock) {
++            retiring = sessionToken;
++            sessionToken = replacement;
++        }
++        if (retiring == null || retiring.equals(replacement)) {
++            return;
++        }
++
++        // New work is already on the replacement session; the retired one only has to outlive
++        // the requests that were issued under it.
++        awaitDrained(retiring);
++        deleteSession(retiring);
+     }
+ 
+     /** Terminates the current session, if any. Calling this more than once is a no-op after the first call. */
+     @Override
+     public void close() {
+-        throw new UnsupportedOperationException("close has not been implemented.");
++        String token;
++        synchronized (sessionLock) {
++            if (closed) {
++                return;
++            }
++            closed = true;
++            token = sessionToken;
++            sessionToken = null;
++        }
++        if (token == null) {
++            return;
++        }
++        try {
++            awaitDrained(token);
++            deleteSession(token);
++        } catch (InterruptedException interruption) {
++            Thread.currentThread().interrupt();
++        } catch (IOException | VcenterApiException ignored) {
++            // Logging out is best effort; the session expires on its own.
++        }
++    }
++
++    // ------------------------------------------------------------------ session lifecycle
++
++    private String createSession(String username, String password) throws IOException, InterruptedException {
++        HttpRequest request = HttpRequest.newBuilder(URI.create(baseUri + SESSION_PATH))
++                .header("Authorization", basicAuthorization(username, password))
++                .header("Accept", JSON)
++                .POST(HttpRequest.BodyPublishers.noBody())
++                .build();
++        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
++        if (response.statusCode() != 201) {
++            throw new VcenterApiException(CREATE_OPERATION, response.statusCode(), response.body());
++        }
++        return decodeJsonString(response.body());
++    }
++
++    private void validateSession(String token) throws IOException, InterruptedException {
++        HttpRequest request = HttpRequest.newBuilder(URI.create(baseUri + SESSION_PATH))
++                .header(TOKEN_HEADER, token)
++                .header("Accept", JSON)
++                .GET()
++                .build();
++        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
++        if (response.statusCode() != 200) {
++            throw new VcenterApiException(GET_OPERATION, response.statusCode(), response.body());
++        }
++    }
++
++    private void deleteSession(String token) throws IOException, InterruptedException {
++        HttpRequest request = HttpRequest.newBuilder(URI.create(baseUri + SESSION_PATH))
++                .header(TOKEN_HEADER, token)
++                .header("Accept", JSON)
++                .DELETE()
++                .build();
++        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
++        if (response.statusCode() != 204) {
++            throw new VcenterApiException(DELETE_OPERATION, response.statusCode(), response.body());
++        }
++    }
++
++    private void discardSession(String token) {
++        try {
++            deleteSession(token);
++        } catch (InterruptedException interruption) {
++            Thread.currentThread().interrupt();
++        } catch (IOException | VcenterApiException ignored) {
++            // Best effort cleanup; the rotation failure is the interesting one.
++        }
++    }
++
++    // ------------------------------------------------------------------ in-flight bookkeeping
++
++    private String beginRequest() {
++        synchronized (sessionLock) {
++            if (sessionToken == null) {
++                throw new IllegalStateException("client is not connected to vCenter");
++            }
++            String token = sessionToken;
++            inFlight.merge(token, 1, Integer::sum);
++            return token;
++        }
++    }
++
++    private void endRequest(String token) {
++        synchronized (sessionLock) {
++            inFlight.computeIfPresent(token, (key, count) -> count <= 1 ? null : count - 1);
++            sessionLock.notifyAll();
++        }
++    }
++
++    private void awaitDrained(String token) throws InterruptedException {
++        synchronized (sessionLock) {
++            while (inFlight.getOrDefault(token, 0) > 0) {
++                sessionLock.wait();
++            }
++        }
++    }
++
++    // ------------------------------------------------------------------ encoding helpers
++
++    private static String basicAuthorization(String username, String password) {
++        byte[] raw = (username + ":" + password).getBytes(StandardCharsets.UTF_8);
++        return "Basic " + Base64.getEncoder().encodeToString(raw);
+     }
+ 
+     /**
+      * Serialises {@code spec} into a {@code Vcenter.Vm.Hardware.Cpu.UpdateSpec} request body.
+      */
+     private static String serializeCpuUpdateSpec(CpuUpdateSpec spec) {
+-        throw new UnsupportedOperationException("serializeCpuUpdateSpec has not been implemented.");
++        StringBuilder json = new StringBuilder("{");
++        appendIfSet(json, "count", spec.count());
++        appendIfSet(json, "cores_per_socket", spec.coresPerSocket());
++        appendIfSet(json, "hot_add_enabled", spec.hotAddEnabled());
++        appendIfSet(json, "hot_remove_enabled", spec.hotRemoveEnabled());
++        return json.append('}').toString();
++    }
++
++    /** Appends {@code property} only when it was set; an unset property stays off the wire entirely. */
++    private static void appendIfSet(StringBuilder json, String property, Object value) {
++        if (value == null) {
++            return;
++        }
++        if (json.length() > 1) {
++            json.append(',');
++        }
++        json.append('"').append(property).append("\":").append(value);
+     }
+ 
+     /**

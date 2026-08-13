@@ -1,0 +1,267 @@
+--- a/module/VcfOpsNotificationOnboarding/VcfOpsNotificationOnboarding.psm1	2026-08-04 04:03:40.314086367 -0500
++++ b/module/VcfOpsNotificationOnboarding/VcfOpsNotificationOnboarding.psm1	2026-08-04 04:03:40.314564291 -0500
+@@ -32,6 +32,66 @@
+     ErrorCode (the HTTP status) and an ErrorContent (the raw response body).
+ #>
+ 
++$script:StepOrder = @(
++    @{ Name = 'VerifyPluginType'; OperationId = 'getAlertPluginTypes' }
++    @{ Name = 'CreatePlugin';     OperationId = 'createAlertPlugin' }
++    @{ Name = 'ResolveTemplate';  OperationId = 'getNotificationTemplates' }
++    @{ Name = 'CreateRule';       OperationId = 'createNotificationPluginRule' }
++)
++
++function New-StepLedger {
++    # Every step starts as NotAttempted. A step only leaves that state when the
++    # run actually reaches it, so an abandoned step is never reported as done.
++    $ledger = [ordered] @{}
++    foreach ($step in $script:StepOrder) {
++        $ledger[$step.Name] = [pscustomobject] @{
++            Name        = $step.Name
++            OperationId = $step.OperationId
++            Outcome     = 'NotAttempted'
++        }
++    }
++    return $ledger
++}
++
++function Resolve-ApiFailure {
++    <#
++        Extracts the HTTP status and the server-supplied message from a
++        terminating error raised by an Invoke-VcfOps* cmdlet. Returns $null
++        when the error did not come from the API layer, so a genuine transport
++        or programming fault is never misreported as a service rejection.
++    #>
++    param([Parameter(Mandatory)] $ErrorRecord)
++
++    $api = $null
++    $exception = $ErrorRecord.Exception
++    while ($null -ne $exception) {
++        if ($exception -is [VMware.Binding.OpenApi.Client.ApiException]) {
++            $api = $exception
++            break
++        }
++        $exception = $exception.InnerException
++    }
++    if ($null -eq $api) { return $null }
++
++    $message = $api.ErrorContent
++    if (-not [string]::IsNullOrWhiteSpace($api.ErrorContent)) {
++        try {
++            $parsed = $api.ErrorContent | ConvertFrom-Json -ErrorAction Stop
++            if ($parsed.PSObject.Properties.Name -contains 'message' -and
++                -not [string]::IsNullOrWhiteSpace($parsed.message)) {
++                $message = [string] $parsed.message
++            }
++        } catch {
++            # Body is not JSON; the raw content is the best available message.
++        }
++    }
++
++    return [pscustomobject] @{
++        StatusCode = [int] $api.ErrorCode
++        Message    = $message
++    }
++}
++
+ function Connect-VcfOpsNotificationSession {
+     <#
+     .SYNOPSIS
+@@ -67,7 +127,23 @@
+         [switch] $SkipCertificateCheck
+     )
+ 
+-    throw [System.NotImplementedException]::new('Connect-VcfOpsNotificationSession is not implemented.')
++    $parameters = @{
++        Server     = $Server
++        Port       = $Port
++        Protocol   = $Protocol
++        User       = $Credential.UserName
++        Password   = $Credential.Password
++        NotDefault = $true
++    }
++    # authSource is optional in username-password; only send it when supplied.
++    if ($PSBoundParameters.ContainsKey('AuthSource')) {
++        $parameters['AuthSource'] = $AuthSource
++    }
++    if ($SkipCertificateCheck) {
++        $parameters['IgnoreInvalidCertificate'] = $true
++    }
++
++    return Connect-VcfOpsServer @parameters
+ }
+ 
+ function New-VcfOpsNotificationBinding {
+@@ -120,7 +196,171 @@
+         [string[]] $Criticality
+     )
+ 
+-    throw [System.NotImplementedException]::new('New-VcfOpsNotificationBinding is not implemented.')
++    $steps = New-StepLedger
++
++    $report = [pscustomobject] @{
++        Succeeded           = $false
++        PluginTypeSupported = $false
++        PluginId            = $null
++        TemplateId          = $null
++        RuleId              = $null
++        OrphanedPluginId    = $null
++        FailedOperationId   = $null
++        FailureStatusCode   = $null
++        FailureMessage      = $null
++        Steps               = @()
++    }
++
++    # Emitted on every exit path so the caller always learns what was applied.
++    $publish = {
++        $report.Steps = @($steps.Values)
++        return $report
++    }
++
++    # -- Step 1: VerifyPluginType -------------------------------------------
++    # Nothing is created until the server confirms it supports the type, so a
++    # rejected type leaves the appliance untouched.
++    try {
++        $types = Invoke-VcfOpsGetAlertPluginTypes -Server $Connection
++    } catch {
++        $failure = Resolve-ApiFailure -ErrorRecord $_
++        if ($null -eq $failure) { throw }
++        $steps['VerifyPluginType'].Outcome = 'Failed'
++        $report.FailedOperationId = 'getAlertPluginTypes'
++        $report.FailureStatusCode = $failure.StatusCode
++        $report.FailureMessage = $failure.Message
++        return & $publish
++    }
++
++    $supported = @()
++    if ($null -ne $types -and $null -ne $types.NotificationPluginType) {
++        $supported = @($types.NotificationPluginType)
++    }
++    $report.PluginTypeSupported = $supported -contains $PluginTypeId
++
++    if (-not $report.PluginTypeSupported) {
++        # The call itself succeeded; there is no HTTP status to report.
++        $steps['VerifyPluginType'].Outcome = 'Failed'
++        $report.FailedOperationId = 'getAlertPluginTypes'
++        $report.FailureMessage = "Plugin type '$PluginTypeId' is not supported by this server. Supported types: $($supported -join ', ')."
++        return & $publish
++    }
++    $steps['VerifyPluginType'].Outcome = 'Succeeded'
++
++    # -- Step 2: CreatePlugin ------------------------------------------------
++    $configValues = @()
++    foreach ($key in $ConfigValue.Keys) {
++        $configValues += Initialize-VcfOpsnamevalue -Name ([string] $key) -Value ([string] $ConfigValue[$key])
++    }
++
++    # Only name and pluginTypeId are required. description is bound solely when
++    # the caller supplied one; pluginId is an update-only field and enabled is
++    # documented read-only, so neither is ever sent on create.
++    $pluginParameters = @{
++        Name         = $PluginName
++        PluginTypeId = $PluginTypeId
++    }
++    if ($configValues.Count -gt 0) {
++        $pluginParameters['ConfigValues'] = $configValues
++    }
++    if ($PSBoundParameters.ContainsKey('PluginDescription')) {
++        $pluginParameters['Description'] = $PluginDescription
++    }
++    $pluginModel = Initialize-VcfOpsnotificationplugin @pluginParameters
++
++    try {
++        $createdPlugin = Invoke-VcfOpsCreateAlertPlugin -Server $Connection -NotificationPlugin $pluginModel
++    } catch {
++        $failure = Resolve-ApiFailure -ErrorRecord $_
++        if ($null -eq $failure) { throw }
++        $steps['CreatePlugin'].Outcome = 'Failed'
++        $report.FailedOperationId = 'createAlertPlugin'
++        $report.FailureStatusCode = $failure.StatusCode
++        $report.FailureMessage = $failure.Message
++        return & $publish
++    }
++
++    $steps['CreatePlugin'].Outcome = 'Succeeded'
++    $report.PluginId = [string] $createdPlugin.PluginId
++    # From here on the appliance has been changed. Any later failure leaves this
++    # plugin instance behind: the contract names no delete operation, so the
++    # report surfaces it rather than pretending the change was undone.
++    $report.OrphanedPluginId = $report.PluginId
++
++    # -- Step 3: ResolveTemplate --------------------------------------------
++    # Skipped, not failed, when no template was requested: the specification
++    # says the server applies a default template when templateId is absent.
++    if ($PSBoundParameters.ContainsKey('TemplateName')) {
++        try {
++            $templates = Invoke-VcfOpsGetNotificationTemplates -Server $Connection -Name $TemplateName
++        } catch {
++            $failure = Resolve-ApiFailure -ErrorRecord $_
++            if ($null -eq $failure) { throw }
++            $steps['ResolveTemplate'].Outcome = 'Failed'
++            $report.FailedOperationId = 'getNotificationTemplates'
++            $report.FailureStatusCode = $failure.StatusCode
++            $report.FailureMessage = $failure.Message
++            return & $publish
++        }
++
++        # The collection property is exposed as _NotificationTemplates because
++        # the generated model type is itself named NotificationTemplates.
++        $found = @()
++        if ($null -ne $templates -and $null -ne $templates._NotificationTemplates) {
++            $found = @($templates._NotificationTemplates | Where-Object { $_.Name -eq $TemplateName })
++        }
++
++        if ($found.Count -ne 1) {
++            $steps['ResolveTemplate'].Outcome = 'Failed'
++            $report.FailedOperationId = 'getNotificationTemplates'
++            $report.FailureMessage = "Expected exactly one notification template named '$TemplateName'; the server returned $($found.Count)."
++            return & $publish
++        }
++
++        $report.TemplateId = [string] $found[0].TemplateId
++        $steps['ResolveTemplate'].Outcome = 'Succeeded'
++    } else {
++        $steps['ResolveTemplate'].Outcome = 'Skipped'
++    }
++
++    # -- Step 4: CreateRule --------------------------------------------------
++    # name and pluginId are the only required properties. templateId,
++    # collectorGroupId and criticalities are bound only when the caller asked
++    # for them; enabled and sendHeartbeat carry server-side defaults and id is
++    # assigned on create, so none of the three is transmitted.
++    $ruleParameters = @{
++        Name     = $RuleName
++        PluginId = $report.PluginId
++    }
++    if ($null -ne $report.TemplateId) {
++        $ruleParameters['TemplateId'] = $report.TemplateId
++    }
++    if ($PSBoundParameters.ContainsKey('CollectorGroupId')) {
++        $ruleParameters['CollectorGroupId'] = $CollectorGroupId
++    }
++    if ($PSBoundParameters.ContainsKey('Criticality') -and $Criticality.Count -gt 0) {
++        $ruleParameters['Criticalities'] = $Criticality
++    }
++    $ruleModel = Initialize-VcfOpsnotificationrule @ruleParameters
++
++    try {
++        $createdRule = Invoke-VcfOpsCreateNotificationPluginRule -Server $Connection -NotificationRule $ruleModel
++    } catch {
++        $failure = Resolve-ApiFailure -ErrorRecord $_
++        if ($null -eq $failure) { throw }
++        $steps['CreateRule'].Outcome = 'Failed'
++        $report.FailedOperationId = 'createNotificationPluginRule'
++        $report.FailureStatusCode = $failure.StatusCode
++        $report.FailureMessage = $failure.Message
++        return & $publish
++    }
++
++    $steps['CreateRule'].Outcome = 'Succeeded'
++    $report.RuleId = [string] $createdRule.Id
++    # The change completed, so nothing is left dangling.
++    $report.OrphanedPluginId = $null
++    $report.Succeeded = $true
++    return & $publish
+ }
+ 
+ Export-ModuleMember -Function 'Connect-VcfOpsNotificationSession', 'New-VcfOpsNotificationBinding'

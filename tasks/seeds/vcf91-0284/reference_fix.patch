@@ -1,0 +1,410 @@
+diff --git a/src/VcfOpsNetworksOnboarding/VcfOpsNetworksOnboarding.psd1 b/src/VcfOpsNetworksOnboarding/VcfOpsNetworksOnboarding.psd1
+new file mode 100644
+index 0000000000000000000000000000000000000000..bfb469b246d1c73085b2493973a699868e82a473
+--- /dev/null
++++ b/src/VcfOpsNetworksOnboarding/VcfOpsNetworksOnboarding.psd1
+@@ -0,0 +1,25 @@
++@{
++    RootModule        = 'VcfOpsNetworksOnboarding.psm1'
++    ModuleVersion     = '1.0.0'
++    GUID              = '6f2b0f5a-6e4a-4f7e-9c4a-2d5f8a1b3c77'
++    Author            = 'Platform Automation'
++    CompanyName       = 'Unknown'
++    Copyright         = '(c) Platform Automation. All rights reserved.'
++    Description       = 'Onboards application definitions into VCF Operations for Networks 9.1, surviving a mid-run API token expiry.'
++    PowerShellVersion = '7.0'
++
++    # Supplied by the environment alongside the rest of the VCF 9.1 PowerCLI
++    # surface; this module never ships a copy of it.
++    RequiredModules   = @('VMware.Sdk.Vcf.Ops')
++
++    FunctionsToExport = @('Invoke-VcfOpsNetworksApplicationOnboarding')
++    CmdletsToExport   = @()
++    VariablesToExport = @()
++    AliasesToExport   = @()
++
++    PrivateData       = @{
++        PSData = @{
++            Tags = @('VCF', 'VCF-Operations-for-Networks', 'PowerCLI')
++        }
++    }
++}
+diff --git a/src/VcfOpsNetworksOnboarding/VcfOpsNetworksOnboarding.psm1 b/src/VcfOpsNetworksOnboarding/VcfOpsNetworksOnboarding.psm1
+new file mode 100644
+index 0000000000000000000000000000000000000000..9cedd39fc9fd5d16a1ce1b5562fd2234ec26d9f7
+--- /dev/null
++++ b/src/VcfOpsNetworksOnboarding/VcfOpsNetworksOnboarding.psm1
+@@ -0,0 +1,373 @@
++#Requires -Version 7.0
++
++Set-StrictMode -Version Latest
++
++$script:ApiBasePath = '/api/ni'
++$script:AuthHeaderName = 'Authorization'
++$script:AuthHeaderPrefix = 'NetworkInsight '
++
++<#
++    Every request body below is assembled key by key rather than by projecting a
++    whole object graph. Only slots that actually carry a value are added, so an
++    optional field the source data has no value for never reaches the appliance
++    as null, "" or []. Per the contract, the appliance treats a present-but-empty
++    field as an instruction, not as an absence.
++#>
++
++function New-NiSession {
++    param(
++        [Parameter(Mandatory)][string] $Server,
++        [Parameter(Mandatory)][pscredential] $Credential,
++        [Parameter(Mandatory)][string] $DomainType,
++        [AllowNull()][AllowEmptyString()][string] $DomainValue
++    )
++
++    [pscustomobject]@{
++        BaseUri      = $Server.TrimEnd('/') + $script:ApiBasePath
++        Credential   = $Credential
++        DomainType   = $DomainType
++        DomainValue  = $DomainValue
++        Token        = $null
++        Expiry       = $null
++        RefreshCount = -1   # the first acquisition is not a refresh
++    }
++}
++
++function New-NiUri {
++    param(
++        [Parameter(Mandatory)][string] $BaseUri,
++        [Parameter(Mandatory)][string] $Path,
++        [System.Collections.IDictionary] $Query
++    )
++
++    $uri = $BaseUri + $Path
++    if ($Query -and $Query.Count -gt 0) {
++        $pairs = foreach ($key in $Query.Keys) {
++            '{0}={1}' -f [uri]::EscapeDataString($key), [uri]::EscapeDataString([string]$Query[$key])
++        }
++        $uri += '?' + ($pairs -join '&')
++    }
++    $uri
++}
++
++function Read-NiResponseBody {
++    param($Response)
++
++    if (-not $Response.Content) { return $null }
++    $text = $Response.Content
++    if ($text -is [byte[]]) { $text = [System.Text.Encoding]::UTF8.GetString($text) }
++    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
++    try { $text | ConvertFrom-Json -Depth 32 } catch { $null }
++}
++
++function Get-NiErrorMessage {
++    param($Response)
++
++    $parsed = Read-NiResponseBody -Response $Response
++    if ($parsed -and $parsed.PSObject.Properties['message']) { return [string]$parsed.message }
++    "HTTP $($Response.StatusCode)"
++}
++
++function Connect-NiSession {
++    <#
++        Acquires an API token via the 'create' operation. The token request is
++        itself unauthenticated, so it never carries an Authorization header.
++    #>
++    [CmdletBinding()]
++    param([Parameter(Mandatory)] $Session)
++
++    $body = [ordered]@{
++        username = $Session.Credential.UserName
++        password = $Session.Credential.GetNetworkCredential().Password
++    }
++
++    $domain = [ordered]@{ domain_type = $Session.DomainType }
++    # 'value' is not required for a LOCAL domain; omit it unless one was given.
++    if (-not [string]::IsNullOrWhiteSpace($Session.DomainValue)) {
++        $domain['value'] = $Session.DomainValue
++    }
++    $body['domain'] = $domain
++
++    $response = Invoke-WebRequest `
++        -Uri (New-NiUri -BaseUri $Session.BaseUri -Path '/auth/token') `
++        -Method 'POST' `
++        -Body ($body | ConvertTo-Json -Depth 8 -Compress) `
++        -ContentType 'application/json' `
++        -SkipHttpErrorCheck `
++        -MaximumRedirection 0 `
++        -ErrorAction Stop
++
++    if ([int]$response.StatusCode -ne 200) {
++        throw "Could not acquire an API token: $(Get-NiErrorMessage -Response $response)"
++    }
++
++    $token = Read-NiResponseBody -Response $response
++    if (-not $token -or [string]::IsNullOrWhiteSpace($token.token)) {
++        throw 'The appliance returned a token response with no token.'
++    }
++
++    $Session.Token = [string]$token.token
++    $Session.Expiry = $token.expiry
++    $Session.RefreshCount = $Session.RefreshCount + 1
++    Write-Verbose "Acquired API token (refresh count $($Session.RefreshCount))."
++}
++
++function Disconnect-NiSession {
++    [CmdletBinding()]
++    param([Parameter(Mandatory)] $Session)
++
++    if (-not $Session.Token) { return }
++    $null = Invoke-NiRequest -Session $Session -Method 'DELETE' -Path '/auth/token'
++    $Session.Token = $null
++}
++
++function Invoke-NiRequest {
++    <#
++        Performs one authenticated call. A 401 means the appliance has ended the
++        session -- it can do that before the advertised expiry -- so a fresh
++        token is acquired and the very same request is replayed once. Work that
++        already succeeded is untouched; only the request that was rejected runs
++        again.
++    #>
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] $Session,
++        [Parameter(Mandatory)][string] $Method,
++        [Parameter(Mandatory)][string] $Path,
++        [System.Collections.IDictionary] $Query,
++        [string] $Body
++    )
++
++    if (-not $Session.Token) { Connect-NiSession -Session $Session }
++
++    $uri = New-NiUri -BaseUri $Session.BaseUri -Path $Path -Query $Query
++    $reauthorized = $false
++
++    while ($true) {
++        $arguments = @{
++            Uri                = $uri
++            Method             = $Method
++            Headers            = @{ $script:AuthHeaderName = $script:AuthHeaderPrefix + $Session.Token }
++            SkipHttpErrorCheck = $true
++            MaximumRedirection = 0
++            ErrorAction        = 'Stop'
++        }
++        if ($PSBoundParameters.ContainsKey('Body') -and $null -ne $Body) {
++            $arguments['Body'] = $Body
++            $arguments['ContentType'] = 'application/json'
++        }
++
++        $response = Invoke-WebRequest @arguments
++        $status = [int]$response.StatusCode
++
++        if ($status -eq 401 -and -not $reauthorized) {
++            Write-Verbose "$Method $Path was refused with 401; re-authenticating and replaying it."
++            $reauthorized = $true
++            Connect-NiSession -Session $Session
++            continue
++        }
++
++        if ($status -ge 400) {
++            throw "$Method $Path failed with HTTP $status`: $(Get-NiErrorMessage -Response $response)"
++        }
++
++        return [pscustomobject]@{
++            StatusCode = $status
++            Body       = Read-NiResponseBody -Response $response
++        }
++    }
++}
++
++function Get-NiApplicationName {
++    <#
++        Walks every page of the 'listApplications' operation and returns the name
++        of each application the appliance already holds. The first page carries
++        no cursor; later pages carry the cursor the previous page returned.
++    #>
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] $Session,
++        [Parameter(Mandatory)][int] $PageSize
++    )
++
++    $names = [System.Collections.Generic.List[string]]::new()
++    $cursor = $null
++
++    do {
++        $query = [ordered]@{ size = $PageSize }
++        if ($cursor) { $query['cursor'] = $cursor }
++
++        $page = (Invoke-NiRequest -Session $Session -Method 'GET' -Path '/groups/applications' -Query $query).Body
++
++        $cursor = $null
++        if ($page) {
++            if ($page.PSObject.Properties['results'] -and $page.results) {
++                foreach ($item in $page.results) {
++                    if ($item.PSObject.Properties['entity_name'] -and $item.entity_name) {
++                        $names.Add([string]$item.entity_name)
++                    }
++                }
++            }
++            if ($page.PSObject.Properties['cursor'] -and -not [string]::IsNullOrWhiteSpace($page.cursor)) {
++                $cursor = [string]$page.cursor
++            }
++        }
++    } while ($cursor)
++
++    , $names.ToArray()
++}
++
++function ConvertTo-NiMember {
++    param([Parameter(Mandatory)] $Source)
++
++    # Reference carries an optional entity_name too; the source data has no such
++    # slot, so it is not sent.
++    [ordered]@{
++        key  = [ordered]@{
++            entity_id   = [string]$Source['entity_id']
++            entity_type = [string]$Source['entity_type']
++        }
++        name = [string]$Source['name']
++    }
++}
++
++function ConvertTo-NiTierRequest {
++    param([Parameter(Mandatory)][hashtable] $Tier)
++
++    $request = [ordered]@{ name = [string]$Tier['name'] }
++    # entity_id is allocated by the appliance on create, so it is never sent.
++
++    $criteria = [System.Collections.Generic.List[object]]::new()
++    if ($Tier['search_membership']) {
++        $search = $Tier['search_membership']
++        $criteria.Add([ordered]@{
++            membership_type           = 'SearchMembershipCriteria'
++            search_membership_criteria = [ordered]@{
++                entity_type = [string]$search['entity_type']
++                filter      = [string]$search['filter']
++            }
++        })
++    }
++    if ($Tier['ip_membership'] -and $Tier['ip_membership']['ip_addresses']) {
++        $criteria.Add([ordered]@{
++            membership_type               = 'IPAddressMembershipCriteria'
++            ip_address_membership_criteria = [ordered]@{
++                ip_addresses = @([string[]]$Tier['ip_membership']['ip_addresses'])
++            }
++        })
++    }
++    if ($criteria.Count -gt 0) { $request['group_membership_criteria'] = $criteria.ToArray() }
++
++    $memberList = [ordered]@{}
++    foreach ($mapping in @(
++            @{ Source = 'member_vms';                 Target = 'vms' },
++            @{ Source = 'member_physical_ips';        Target = 'physical_ips' },
++            @{ Source = 'member_kubernetes_services'; Target = 'kubernetes_services' })) {
++        $items = $Tier[$mapping.Source]
++        if ($items -and @($items).Count -gt 0) {
++            $memberList[$mapping.Target] = @(foreach ($item in $items) { ConvertTo-NiMember -Source $item })
++        }
++    }
++    # An application tier can be defined purely by criteria; in that case there
++    # is no member list at all rather than an empty one.
++    if ($memberList.Count -gt 0) { $request['member_list'] = $memberList }
++
++    $request
++}
++
++function ConvertTo-NiAppWithTiersRequest {
++    param([Parameter(Mandatory)][hashtable] $Application)
++
++    $request = [ordered]@{ name = [string]$Application['name'] }
++    # entity_id is allocated by the appliance on create, so it is never sent.
++
++    $sourceGroups = $Application['source_group_entity_id']
++    if ($sourceGroups -and @($sourceGroups).Count -gt 0) {
++        $request['source_group_entity_id'] = @([string[]]$sourceGroups)
++    }
++
++    # A null enable_intent means "leave it at the appliance default", which is
++    # expressed by omitting the field, not by sending a guess at the default.
++    if ($null -ne $Application['enable_intent']) {
++        $request['enable_intent'] = [bool]$Application['enable_intent']
++    }
++
++    $request['tiers'] = @(foreach ($tier in $Application['tiers']) { ConvertTo-NiTierRequest -Tier $tier })
++    $request
++}
++
++function Invoke-VcfOpsNetworksApplicationOnboarding {
++    <#
++    .SYNOPSIS
++        Onboards a batch of application definitions into VCF Operations for Networks.
++
++    .DESCRIPTION
++        Reads a CMDB export, skips the applications the appliance already holds and
++        creates the rest, one 'addApplicationWithTiers' call per application. If the
++        appliance ends the session mid-batch the module acquires a new token and
++        replays only the rejected request, so no application is created twice and
++        the batch runs to completion.
++
++    .OUTPUTS
++        An object with Created, Skipped and TokenRefreshCount.
++    #>
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)][string] $Server,
++        [Parameter(Mandatory)][pscredential] $Credential,
++        [Parameter(Mandatory)][string] $DefinitionPath,
++        [ValidateSet('LOCAL', 'LDAP')][string] $DomainType = 'LOCAL',
++        [string] $DomainValue,
++        [ValidateRange(1, 1000)][int] $PageSize = 100
++    )
++
++    $definition = Get-Content -LiteralPath $DefinitionPath -Raw -Encoding utf8 |
++        ConvertFrom-Json -Depth 32 -AsHashtable
++    if (-not $definition.ContainsKey('applications')) {
++        throw "'$DefinitionPath' does not contain an 'applications' array."
++    }
++
++    $session = New-NiSession -Server $Server -Credential $Credential -DomainType $DomainType -DomainValue $DomainValue
++    $created = [System.Collections.Generic.List[string]]::new()
++    $skipped = [System.Collections.Generic.List[string]]::new()
++
++    try {
++        Connect-NiSession -Session $session
++
++        $existing = [System.Collections.Generic.HashSet[string]]::new(
++            [string[]](Get-NiApplicationName -Session $session -PageSize $PageSize),
++            [System.StringComparer]::Ordinal)
++
++        foreach ($application in $definition['applications']) {
++            $name = [string]$application['name']
++            if ($existing.Contains($name)) {
++                Write-Verbose "Skipping '$name'; the appliance already holds it."
++                $skipped.Add($name)
++                continue
++            }
++
++            $body = ConvertTo-NiAppWithTiersRequest -Application $application | ConvertTo-Json -Depth 32 -Compress
++            # If-Match applies to modifying an existing definition; this is a
++            # create, so the header is not sent.
++            $null = Invoke-NiRequest -Session $session -Method 'POST' -Path '/groups/applications/full/' -Body $body
++
++            Write-Verbose "Created '$name'."
++            $created.Add($name)
++            $null = $existing.Add($name)
++        }
++    }
++    finally {
++        if ($session.Token) {
++            try { Disconnect-NiSession -Session $session }
++            catch { Write-Warning "Could not release the API token: $($_.Exception.Message)" }
++        }
++    }
++
++    [pscustomobject]@{
++        Created           = $created.ToArray()
++        Skipped           = $skipped.ToArray()
++        TokenRefreshCount = [int]$session.RefreshCount
++    }
++}
++
++Export-ModuleMember -Function 'Invoke-VcfOpsNetworksApplicationOnboarding'

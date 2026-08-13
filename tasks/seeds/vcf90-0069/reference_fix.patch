@@ -1,0 +1,394 @@
+diff --git a/opsgroups/__init__.py b/opsgroups/__init__.py
+new file mode 100644
+index 0000000..f439b63
+--- /dev/null
++++ b/opsgroups/__init__.py
+@@ -0,0 +1,17 @@
++"""Idempotent custom-group reconciliation for a VCF 9.0 Operations appliance.
++
++Standard library only.
++"""
++
++from .client import OperationsClient
++from .errors import OpsApiError, OpsAuthError, OpsConflictError, OpsError
++from .groups import ensure_custom_group
++
++__all__ = [
++    "ensure_custom_group",
++    "OperationsClient",
++    "OpsError",
++    "OpsAuthError",
++    "OpsApiError",
++    "OpsConflictError",
++]
+diff --git a/opsgroups/client.py b/opsgroups/client.py
+new file mode 100644
+index 0000000..017278a
+--- /dev/null
++++ b/opsgroups/client.py
+@@ -0,0 +1,132 @@
++"""Standard-library transport for the four VCF Operations operations in scope.
++
++Per docs/contract.json, a projection of
++specifications/vcf-operations/vcf-operations-openapi.json at tag 9.0.0.0 of
++vmware/vcf-api-specs:
++
++    acquireToken        POST /suite-api/api/auth/token/acquire
++    getCustomGroups     GET  /suite-api/api/resources/groups
++    createCustomGroup   POST /suite-api/api/resources/groups
++    modifyCustomGroup   PUT  /suite-api/api/resources/groups
++
++Every operation offers application/json and application/xml, so this client asks
++for JSON explicitly rather than taking whatever the appliance prefers.
++"""
++
++from __future__ import annotations
++
++import json
++import urllib.error
++import urllib.parse
++import urllib.request
++
++from .errors import OpsApiError, OpsAuthError
++
++#: Path of each operation below the base URL, which already ends in /suite-api.
++TOKEN_ACQUIRE_PATH = "/api/auth/token/acquire"
++CUSTOM_GROUPS_PATH = "/api/resources/groups"
++
++#: The specification declares the Token-based-authorization apiKey header but not
++#: its value; VCF Operations expects the acquired token behind this prefix.
++TOKEN_PREFIX = "vRealizeOpsToken "
++
++JSON_MEDIA_TYPE = "application/json"
++
++
++class OperationsClient:
++    """One authenticated conversation with a VCF Operations appliance."""
++
++    def __init__(self, base_url, timeout=30.0):
++        self.base_url = base_url.rstrip("/")
++        self.timeout = timeout
++        self._token = None
++        #: createCustomGroup plus modifyCustomGroup calls actually put on the wire.
++        self.writes = 0
++
++    # -- plumbing ---------------------------------------------------------
++    def _url(self, path, query=None):
++        url = self.base_url + path
++        if query:
++            url += "?" + urllib.parse.urlencode(query, doseq=True)
++        return url
++
++    def _request(self, method, path, operation_id, body=None, query=None,
++                 authenticated=True):
++        data = None
++        headers = {"Accept": JSON_MEDIA_TYPE}
++        if body is not None:
++            data = json.dumps(body).encode("utf-8")
++            headers["Content-Type"] = JSON_MEDIA_TYPE
++        if authenticated:
++            headers["Authorization"] = TOKEN_PREFIX + self._token
++
++        request = urllib.request.Request(
++            self._url(path, query), data=data, headers=headers, method=method)
++        try:
++            with urllib.request.urlopen(request, timeout=self.timeout) as response:
++                return response.status, _decode(response.read())
++        except urllib.error.HTTPError as exc:
++            payload = _decode(exc.read())
++            raise _translate(operation_id, exc.code, payload) from None
++        except urllib.error.URLError as exc:
++            raise OpsApiError("%s could not reach the appliance: %s"
++                              % (operation_id, exc.reason),
++                              operation_id=operation_id) from None
++
++    # -- operations -------------------------------------------------------
++    def acquire_token(self, username, password, auth_source=None):
++        """acquireToken. `authSource` is optional and is omitted when unset."""
++        body = {"username": username, "password": password}
++        if auth_source:
++            body["authSource"] = auth_source
++
++        _status, payload = self._request(
++            "POST", TOKEN_ACQUIRE_PATH, "acquireToken", body=body, authenticated=False)
++        if not isinstance(payload, dict) or not payload.get("token"):
++            raise OpsApiError("acquireToken returned no token.",
++                              operation_id="acquireToken")
++        self._token = payload["token"]
++        return self._token
++
++    def get_custom_groups(self):
++        """getCustomGroups. Both query parameters are optional and unset here, so
++        the request carries no query string at all."""
++        _status, payload = self._request(
++            "GET", CUSTOM_GROUPS_PATH, "getCustomGroups")
++        if not isinstance(payload, dict):
++            raise OpsApiError("getCustomGroups returned no cgroups object.",
++                              operation_id="getCustomGroups")
++        return list(payload.get("groups") or [])
++
++    def create_custom_group(self, custom_group):
++        """createCustomGroup. The appliance assigns the id, so none is sent."""
++        self.writes += 1
++        _status, payload = self._request(
++            "POST", CUSTOM_GROUPS_PATH, "createCustomGroup", body=custom_group)
++        return payload
++
++    def modify_custom_group(self, custom_group):
++        """modifyCustomGroup. Addressed by custom-group.id, not by a path segment."""
++        self.writes += 1
++        _status, payload = self._request(
++            "PUT", CUSTOM_GROUPS_PATH, "modifyCustomGroup", body=custom_group)
++        return payload
++
++
++def _decode(raw):
++    if not raw:
++        return None
++    try:
++        return json.loads(raw.decode("utf-8"))
++    except (ValueError, UnicodeDecodeError):
++        return None
++
++
++def _translate(operation_id, status, _payload):
++    if status == 401 and operation_id == "acquireToken":
++        return OpsAuthError("acquireToken was rejected by the appliance")
++    return OpsApiError("%s answered HTTP %d" % (operation_id, status),
++                       status=status, operation_id=operation_id)
++
++
++__all__ = ["OperationsClient", "TOKEN_PREFIX"]
+diff --git a/opsgroups/errors.py b/opsgroups/errors.py
+new file mode 100644
+index 0000000..3252aa7
+--- /dev/null
++++ b/opsgroups/errors.py
+@@ -0,0 +1,40 @@
++"""Failures raised by :mod:`opsgroups`.
++
++Nothing here ever carries the appliance password or the acquired token: an
++exception message may be logged, and a Suite API token is a bearer credential.
++"""
++
++from __future__ import annotations
++
++
++class OpsError(Exception):
++    """Base class for every failure this package raises."""
++
++
++class OpsAuthError(OpsError):
++    """acquireToken was rejected by the appliance."""
++
++
++class OpsApiError(OpsError):
++    """The appliance answered an operation with a non-success status."""
++
++    def __init__(self, message, status=None, operation_id=None):
++        super().__init__(message)
++        self.status = status
++        self.operation_id = operation_id
++
++
++class OpsConflictError(OpsError):
++    """More than one custom group already carries the desired resource key.
++
++    Repeating an unguarded createCustomGroup is exactly how an appliance ends up
++    in this state, so the reconciliation refuses to guess which duplicate is the
++    real one instead of writing to an arbitrary group.
++    """
++
++    def __init__(self, message, group_ids=()):
++        super().__init__(message)
++        self.group_ids = list(group_ids)
++
++
++__all__ = ["OpsError", "OpsAuthError", "OpsApiError", "OpsConflictError"]
+diff --git a/opsgroups/groups.py b/opsgroups/groups.py
+new file mode 100644
+index 0000000..cda05b9
+--- /dev/null
++++ b/opsgroups/groups.py
+@@ -0,0 +1,181 @@
++"""Reconcile one VCF Operations custom group towards a desired definition.
++
++createCustomGroup has no idempotency key in the 9.0.0.0 specification, no
++conditional-request header and no 409 for a duplicate name, so calling it twice
++files two groups. The effect is made repeatable here instead: read the existing
++groups first, and only create when the resource key is genuinely absent.
++"""
++
++from __future__ import annotations
++
++from .client import OperationsClient
++from .errors import OpsConflictError
++
++#: Members of custom-group-membership this package fills in, keyed by the
++#: keyword argument that supplies each one.
++_COLLECTION_MEMBERS = (
++    ("rules", "rules"),
++    ("included_resources", "includedResources"),
++    ("excluded_resources", "excludedResources"),
++)
++
++
++def ensure_custom_group(base_url, username, password, *, name, adapter_kind_key,
++                        resource_kind_key, rules=None, included_resources=None,
++                        excluded_resources=None, auto_resolve_membership=None,
++                        auth_source=None, timeout=30.0):
++    """Make the named custom group exist with the desired definition.
++
++    Returns a dict whose keys are, in order, ``action`` (``created``, ``updated``
++    or ``unchanged``), ``groupId``, ``group`` as the appliance last reported it,
++    and ``writes``, the number of mutating calls actually made.
++    """
++    resource_key = {
++        "name": name,
++        "adapterKindKey": adapter_kind_key,
++        "resourceKindKey": resource_kind_key,
++    }
++    membership = _membership_definition(rules, included_resources, excluded_resources)
++
++    client = OperationsClient(base_url, timeout=timeout)
++    client.acquire_token(username, password, auth_source=auth_source)
++
++    existing = _match(client.get_custom_groups(), resource_key)
++
++    if existing is None:
++        body = _custom_group(resource_key, membership, auto_resolve_membership)
++        created = client.create_custom_group(body)
++        return _result("created", created, client.writes)
++
++    if _is_current(existing, membership, auto_resolve_membership):
++        return _result("unchanged", existing, client.writes)
++
++    body = _custom_group(resource_key, membership, auto_resolve_membership)
++    body["id"] = existing["id"]
++    updated = client.modify_custom_group(body)
++    return _result("updated", updated, client.writes)
++
++
++# -- desired state ---------------------------------------------------------
++def _membership_definition(rules, included_resources, excluded_resources):
++    """custom-group-membership carrying only what the caller actually asked for.
++
++    The member itself is required by the specification, so it is always present,
++    even when everything inside it was left unset.
++    """
++    supplied = {
++        "rules": list(rules) if rules else None,
++        "included_resources": _unique(included_resources),
++        "excluded_resources": _unique(excluded_resources),
++    }
++    membership = {}
++    for argument, member in _COLLECTION_MEMBERS:
++        value = supplied[argument]
++        if value:
++            membership[member] = value
++    return membership
++
++
++def _unique(values):
++    """resourceIdentifiers-style uuid collections are declared uniqueItems, and a
++    stable order keeps the request body byte-for-byte repeatable."""
++    if not values:
++        return None
++    return sorted(set(values))
++
++
++def _custom_group(resource_key, membership, auto_resolve_membership):
++    """A custom-group body carrying no member the caller left unset.
++
++    id, policy and links belong to the appliance, and resourceIdentifiers,
++    extension and links inside resource-key were never asked for, so none of them
++    goes on the wire.
++    """
++    body = {"resourceKey": dict(resource_key)}
++    if isinstance(auto_resolve_membership, bool):
++        body["autoResolveMembership"] = auto_resolve_membership
++    body["membershipDefinition"] = membership
++    return body
++
++
++# -- reconciliation --------------------------------------------------------
++def _match(groups, resource_key):
++    """The group carrying the desired resource key, or None.
++
++    Names alone do not identify a group: the same name under another adapter or
++    resource kind is a different group, and updating it would be a write to the
++    wrong object.
++    """
++    matches = []
++    for group in groups:
++        key = group.get("resourceKey") or {}
++        if all(key.get(member) == value for member, value in resource_key.items()):
++            matches.append(group)
++    if len(matches) > 1:
++        ids = [group.get("id") for group in matches]
++        raise OpsConflictError(
++            "%d custom groups already carry the resource key %s/%s/%s; refusing to "
++            "guess which one to reconcile." % (
++                len(matches), resource_key["adapterKindKey"],
++                resource_key["resourceKindKey"], resource_key["name"]),
++            ids)
++    return matches[0] if matches else None
++
++
++def _is_current(existing, membership, auto_resolve_membership):
++    """Whether the appliance's group already says what the desired one says.
++
++    The appliance echoes every custom-group-membership member back, empty
++    collections included, and decorates resource-key with identifiers and links
++    nobody sent. None of that is drift, so both sides are compared with empty and
++    null members dropped.
++    """
++    desired_auto = auto_resolve_membership if isinstance(auto_resolve_membership, bool) \
++        else bool(existing.get("autoResolveMembership", False))
++    if bool(existing.get("autoResolveMembership", False)) != desired_auto:
++        return False
++    return (_membership_for_comparison(existing.get("membershipDefinition")) ==
++            _membership_for_comparison(membership))
++
++
++def _membership_for_comparison(node):
++    """Normalise only the two resource-id sets; rule ordering is meaningful.
++
++    ``uniqueItems`` makes the order of includedResources and excludedResources
++    insignificant, and an appliance may report either set in any order.
++    """
++    membership = _prune(node)
++    if not isinstance(membership, dict):
++        return membership
++    for member in ("includedResources", "excludedResources"):
++        values = membership.get(member)
++        if isinstance(values, list):
++            membership[member] = sorted(values)
++    return membership
++
++
++def _prune(node):
++    """Drop nulls and empty collections so a normalised echo compares equal."""
++    if isinstance(node, dict):
++        pruned = {}
++        for key, value in node.items():
++            value = _prune(value)
++            if value is None or value == [] or value == {}:
++                continue
++            pruned[key] = value
++        return pruned
++    if isinstance(node, list):
++        return [_prune(value) for value in node]
++    return node
++
++
++def _result(action, group, writes):
++    return {
++        "action": action,
++        "groupId": (group or {}).get("id"),
++        "group": group,
++        "writes": writes,
++    }
++
++
++__all__ = ["ensure_custom_group"]

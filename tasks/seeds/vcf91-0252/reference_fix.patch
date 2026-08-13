@@ -1,0 +1,226 @@
+diff --git a/src/VcfOpsAlertTriage/VcfOpsAlertTriage.psm1 b/src/VcfOpsAlertTriage/VcfOpsAlertTriage.psm1
+index 58f68b6..d7d9c60 100644
+--- a/src/VcfOpsAlertTriage/VcfOpsAlertTriage.psm1
++++ b/src/VcfOpsAlertTriage/VcfOpsAlertTriage.psm1
+@@ -1,12 +1,138 @@
+ Set-StrictMode -Version Latest
+ 
++# The SDK builds every request for us -- URL, query string, body serialization --
++# but it signs each one with the token its connection was opened with, and that
++# token is read-only. So we take the request the SDK builds, put our own token on
++# it, and send it ourselves. That is the whole reason for -AsInvokeRestMethodRequest:
++# it gives us the SDK's serialization with our own transport, which is what lets us
++# see a 401 and recover from it instead of having the call throw from inside the SDK.
++
++function New-TriageSession {
++    param($Server, [pscredential]$Credential, [string]$AuthSource)
++
++    $session = [pscustomobject]@{
++        Server         = $Server
++        Credential     = $Credential
++        AuthSource     = $AuthSource
++        Token          = $null
++        TokensAcquired = 0
++    }
++    Update-TriageToken -Session $session
++    return $session
++}
++
++function Update-TriageToken {
++    param([Parameter(Mandatory)] $Session)
++
++    # Build the body through the SDK's model so unset optional properties are left
++    # out of the JSON entirely. Passing -AuthSource $null here would still omit it,
++    # but only because the SDK drops nulls -- being explicit keeps that from being
++    # an accident. Connect-VcfOpsServer is deliberately not used to re-authenticate:
++    # it serializes authSource as null, and it cannot retarget an existing handle.
++    $bodyArgs = @{
++        Username = $Session.Credential.UserName
++        Password = $Session.Credential.GetNetworkCredential().Password
++    }
++    if ($Session.AuthSource) {
++        $bodyArgs.AuthSource = $Session.AuthSource
++    }
++    $usernamePassword = Initialize-VcfOpsusernamepassword @bodyArgs
++
++    $auth = Invoke-VcfOpsAcquireToken -Server $Session.Server -UsernamePassword $usernamePassword
++    $Session.Token = $auth.Token
++    $Session.TokensAcquired++
++}
++
++function Invoke-TriageRequest {
++    <#
++        Sends a request the SDK built, under the session's current token.
++
++        On 401 the token is refreshed and the identical request is replayed once.
++        The request object is rebuilt by the caller, never mutated here, so the
++        replay is byte-for-byte the request that was rejected -- an action that
++        was in flight when the token died is applied, and is applied once.
++    #>
++    param(
++        [Parameter(Mandatory)] $Session,
++        [Parameter(Mandatory)] $Request
++    )
++
++    # -AsInvokeRestMethodRequest emits a two-element pipeline whose first element is
++    # null; the request is the last thing on it.
++    $built = @($Request) | Where-Object { $null -ne $_ } | Select-Object -Last 1
++    if (-not $built) { throw 'the SDK produced no request object' }
++
++    for ($attempt = 0; $attempt -lt 2; $attempt++) {
++        $headers = @{}
++        foreach ($key in $built.Headers.Keys) { $headers[$key] = $built.Headers[$key] }
++        $headers['Authorization'] = 'OpsToken ' + $Session.Token
++
++        $params = @{
++            Uri                = $built.Uri
++            Method             = $built.Method
++            Headers            = $headers
++            SkipHttpErrorCheck = $true
++            StatusCodeVariable = 'status'
++        }
++        if ($built.Body) {
++            $params.Body = $built.Body
++            $params.ContentType = $built.ContentType
++        }
++
++        $response = Invoke-RestMethod @params
++
++        if ($status -eq 401 -and $attempt -eq 0) {
++            Write-Verbose "token rejected on $($built.Method) $($built.Uri); refreshing and replaying"
++            Update-TriageToken -Session $Session
++            continue
++        }
++        if ($status -ge 400) {
++            throw "VCF Operations returned $status for $($built.Method) $($built.Uri)"
++        }
++        return $response
++    }
++}
++
+ <#
+ .SYNOPSIS
+     Runs the nightly alert triage pass against VCF Operations.
+ 
+ .DESCRIPTION
+-    Not implemented yet. See README.md for the behaviour this has to have and
+-    docs/contract.json for the operations it is allowed to call.
++    Pages through the alerts matching the supplied filters and applies one triage
++    action to each. The run authenticates with its own token rather than the one the
++    caller's connection holds, and refreshes that token if the server revokes it
++    mid-run, replaying whatever request was rejected.
++
++.PARAMETER Server
++    A connection handle from Connect-VcfOpsServer. Used to build requests; its
++    token is not spent.
++
++.PARAMETER Credential
++    The credentials this run authenticates with.
++
++.PARAMETER Action
++    The modifyAlerts action to apply to each alert.
++
++.PARAMETER AuthSource
++    Auth source to authenticate against. Omitted from the request when not supplied.
++
++.PARAMETER SuspendMinutes
++    How long to suspend for. Omitted from the request when not supplied.
++
++.PARAMETER OwnerAccountId
++    Account to assign ownership to. Omitted from the request when not supplied.
++
++.PARAMETER PageSize
++    Alerts per page.
++
++.PARAMETER ActiveOnly
++    Restrict the query to active alerts.
++
++.PARAMETER AlertCriticality
++    Restrict the query to these criticality levels.
++
++.PARAMETER ResourceKind
++    Restrict the query to this resource kind.
+ #>
+ function Invoke-VcfOpsAlertTriage {
+     [CmdletBinding()]
+@@ -23,7 +149,79 @@ function Invoke-VcfOpsAlertTriage {
+         [string]   $ResourceKind
+     )
+ 
+-    throw [System.NotImplementedException]::new('Invoke-VcfOpsAlertTriage is not implemented.')
++    $session = New-TriageSession -Server $Server -Credential $Credential -AuthSource $AuthSource
++
++    try {
++        # Only the filters the caller actually set are handed to the SDK's model
++        # builder, so the rest never reach the wire -- not as null, not as [].
++        $queryArgs = @{}
++        if ($ActiveOnly)       { $queryArgs.ActiveOnly = $true }
++        if ($AlertCriticality) { $queryArgs.AlertCriticality = $AlertCriticality }
++        if ($ResourceKind)     { $queryArgs.ResourceKind = $ResourceKind }
++        $alertQuery = Initialize-VcfOpsalertquery @queryArgs
++
++        $alertIds = [System.Collections.Generic.List[string]]::new()
++        $seen = [System.Collections.Generic.HashSet[string]]::new()
++        $page = 0
++        $total = $null
++
++        do {
++            $request = Invoke-VcfOpsQueryAlert -Server $Server -AlertQuery $alertQuery `
++                -Page $page -PageSize $PageSize -AsInvokeRestMethodRequest
++            $result = Invoke-TriageRequest -Session $session -Request $request
++
++            $batch = @()
++            if ($result.PSObject.Properties.Name -contains 'alerts' -and $result.alerts) {
++                $batch = @($result.alerts)
++            }
++            if ($null -eq $total -and
++                $result.PSObject.Properties.Name -contains 'pageInfo' -and $result.pageInfo) {
++                $total = [int]$result.pageInfo.totalCount
++            }
++
++            foreach ($alert in $batch) {
++                # A page boundary can repeat an alert if the server's ordering
++                # shifts between requests; the action must still go out once.
++                if ($seen.Add([string]$alert.alertId)) {
++                    $alertIds.Add([string]$alert.alertId)
++                }
++            }
++
++            $page++
++        } while ($batch.Count -gt 0 -and ($null -eq $total -or $alertIds.Count -lt $total))
++
++        # One alert per request. The API takes a list, but batching would mean a
++        # single 401 puts a whole batch in doubt; per-alert calls keep "what has
++        # already been actioned" exact, which is what makes the replay after a
++        # refresh safe to do.
++        $actioned = [System.Collections.Generic.List[string]]::new()
++        foreach ($alertId in $alertIds) {
++            $actionArgs = @{
++                Server     = $Server
++                Action     = $Action
++                UuidValues = Initialize-VcfOpsuuidvalues -Uuids @($alertId)
++            }
++            if ($PSBoundParameters.ContainsKey('SuspendMinutes')) { $actionArgs.Minutes = $SuspendMinutes }
++            if ($OwnerAccountId) { $actionArgs.UserAccountID = $OwnerAccountId }
++
++            $request = Invoke-VcfOpsModifyAlerts @actionArgs -AsInvokeRestMethodRequest
++            Invoke-TriageRequest -Session $session -Request $request | Out-Null
++            $actioned.Add($alertId)
++        }
++
++        return [pscustomobject]@{
++            TokensAcquired   = $session.TokensAcquired
++            AlertsFound      = $alertIds.Count
++            AlertsActioned   = $actioned.Count
++            ActionedAlertIds = $actioned.ToArray()
++        }
++    }
++    finally {
++        if ($session.Token) {
++            $request = Invoke-VcfOpsReleaseToken -Server $Server -AsInvokeRestMethodRequest
++            Invoke-TriageRequest -Session $session -Request $request | Out-Null
++        }
++    }
+ }
+ 
+ Export-ModuleMember -Function 'Invoke-VcfOpsAlertTriage'

@@ -1,0 +1,165 @@
+diff --git a/VcfNetworkPoolProvisioning.psm1 b/VcfNetworkPoolProvisioning.psm1
+index 417be43..2288f64 100644
+--- a/VcfNetworkPoolProvisioning.psm1
++++ b/VcfNetworkPoolProvisioning.psm1
+@@ -34,6 +34,11 @@ function Get-VcfProvisionStatusCode {
+ }
+ 
+ function ConvertTo-VcfProvisionNetworkModel {
++    <#
++        Turn one caller network definition into the SDK Network model. IpPools
++        is only passed when the caller actually supplied ranges, so the unset
++        case is omitted from the request rather than sent as null or [].
++    #>
+     param([Parameter(Mandatory)][hashtable]$Definition)
+ 
+     $arguments = @{
+@@ -59,13 +64,70 @@ function ConvertTo-VcfProvisionNetworkModel {
+     return Initialize-VcfNetwork @arguments
+ }
+ 
++function Test-VcfProvisionPoolMatchesDefinition {
++    <#
++        An existing pool satisfies the request when it carries exactly the
++        requested network types and every one of them agrees on the six fields
++        the 9.0.0.0 Network schema requires. Allocated ipPools are server state
++        and are deliberately not compared.
++    #>
++    param(
++        [Parameter(Mandatory)][object]$Pool,
++        [Parameter(Mandatory)][hashtable[]]$Definition
++    )
++
++    $existing = @($Pool.Networks)
++    if ($existing.Count -ne $Definition.Count) {
++        return $false
++    }
++
++    $wanted = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
++    foreach ($item in $Definition) {
++        $type = [string]$item.Type
++        if ($wanted.ContainsKey($type)) {
++            return $false
++        }
++        $wanted.Add($type, $item)
++    }
++
++    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
++    foreach ($network in $existing) {
++        $type = [string]$network.Type
++        if (-not $wanted.ContainsKey($type) -or -not $seen.Add($type)) {
++            return $false
++        }
++        $want = $wanted[$type]
++        if ([int]$network.VlanId -ne [int]$want.VlanId) { return $false }
++        if ([int]$network.Mtu -ne [int]$want.Mtu) { return $false }
++        if ([string]$network.Subnet -cne [string]$want.Subnet) { return $false }
++        if ([string]$network.Mask -cne [string]$want.Mask) { return $false }
++        if ([string]$network.Gateway -cne [string]$want.Gateway) { return $false }
++    }
++
++    return $true
++}
++
++function Find-VcfProvisionPoolByName {
++    param(
++        [Parameter(Mandatory)][object]$Server,
++        [Parameter(Mandatory)][string]$Name
++    )
++
++    $page = Invoke-VcfGetNetworkPool -Server $Server
++    $elements = if ($null -eq $page -or $null -eq $page.Elements) { @() } else { @($page.Elements) }
++    return @($elements | Where-Object { [string]$_.Name -ceq $Name })
++}
++
+ <#
+ .SYNOPSIS
+-    Provision an SDDC Manager network pool.
++    Provision an SDDC Manager network pool exactly once.
+ 
+ .DESCRIPTION
+-    Looks the pool up once up front, then creates it and retries the create if
+-    the call fails.
++    Creating a network pool is not idempotent: SDDC Manager will happily accept
++    the same specification twice and leave two pools behind. Every attempt here
++    therefore begins by reading the pools that already exist, so a retry after a
++    lost response adopts the pool the previous attempt created instead of
++    creating a second one.
+ #>
+ function Invoke-VcfNetworkPoolProvision {
+     [CmdletBinding()]
+@@ -96,20 +158,30 @@ function Invoke-VcfNetworkPoolProvision {
+     }
+     $spec = Initialize-VcfNetworkPool -Name $Name -Networks $networks
+ 
+-    $page = Invoke-VcfGetNetworkPool -Server $Server
+-    $elements = if ($null -eq $page -or $null -eq $page.Elements) { @() } else { @($page.Elements) }
+-    $existing = @($elements | Where-Object { [string]$_.Name -ceq $Name })
+-    if ($existing.Count -ge 1) {
+-        return [pscustomobject]@{
+-            Name     = $Name
+-            PoolId   = [string]$existing[0].Id
+-            Outcome  = 'AlreadyExists'
+-            Attempts = 1
+-            Pool     = $existing[0]
+-        }
+-    }
++    $lastError = $null
+ 
+     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
++        # Read before write, on every attempt. This is what makes the create
++        # safe to repeat: an earlier attempt whose response was lost is visible
++        # here and is adopted instead of being duplicated.
++        $candidates = @(Find-VcfProvisionPoolByName -Server $Server -Name $Name)
++        if ($candidates.Count -ge 1) {
++            $conflicting = @($candidates | Where-Object {
++                    -not (Test-VcfProvisionPoolMatchesDefinition -Pool $_ -Definition $Network)
++                })
++            if ($conflicting.Count -gt 0) {
++                throw "Network pool '$Name' already exists with a different network definition; refusing to provision."
++            }
++            $existing = $candidates[0]
++            return [pscustomobject]@{
++                Name     = $Name
++                PoolId   = [string]$existing.Id
++                Outcome  = if ($attempt -eq 1) { 'AlreadyExists' } else { 'RecoveredAfterRetry' }
++                Attempts = $attempt
++                Pool     = $existing
++            }
++        }
++
+         try {
+             $created = Invoke-VcfCreateNetworkPool -Server $Server -NetworkPool $spec
+             return [pscustomobject]@{
+@@ -121,10 +193,14 @@ function Invoke-VcfNetworkPoolProvision {
+             }
+         }
+         catch {
++            $lastError = $_
+             $status = Get-VcfProvisionStatusCode -ErrorRecord $_
+-            if ($script:RetryableStatusCodes -notcontains $status -or $attempt -ge $MaxAttempts) {
++            if ($script:RetryableStatusCodes -notcontains $status) {
+                 throw
+             }
++            if ($attempt -ge $MaxAttempts) {
++                break
++            }
+             if ($PSBoundParameters.ContainsKey('SleepAction') -and $null -ne $SleepAction) {
+                 & $SleepAction $RetryDelaySeconds
+             }
+@@ -131,3 +207,3 @@ function Invoke-VcfNetworkPoolProvision {
+-            elseif ($RetryDelaySeconds -gt 0) {
++            else {
+                 Start-Sleep -Seconds $RetryDelaySeconds
+             }
+@@ -134,6 +210,10 @@ function Invoke-VcfNetworkPoolProvision {
+         }
+     }
+ 
++    if ($null -ne $lastError) {
++        throw $lastError
++    }
++
+     throw "Network pool '$Name' could not be provisioned within $MaxAttempts attempts."
+ }
+ 

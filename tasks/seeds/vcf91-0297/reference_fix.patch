@@ -1,0 +1,408 @@
+--- a/vcfnetworks/client.go
++++ b/vcfnetworks/client.go
+@@ -1,11 +1,39 @@
+ package vcfnetworks
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
++	"mime"
+ 	"net/http"
++	"net/url"
++	"sort"
++	"strconv"
++	"strings"
+ )
+ 
++// basePath is the service root declared by the specification's server entry.
++const basePath = "/api/ni"
++
++// listPath and detailPath are the specification routes for the two operations
++// this package calls: listProblemEvents and getProblemEvent.
++const (
++	listPath   = basePath + "/entities/problems"
++	detailPath = basePath + "/entities/problems/"
++)
++
++// authPrefix is the ApiKeyAuth value prefix required by the specification.
++const authPrefix = "NetworkInsight "
++
++// maxPageSize bounds the accepted listProblemEvents page size.
++const maxPageSize = 1000
++
++// entityType is the only entity_type this collection may contain.
++const entityType = "ProblemEvent"
++
+ // ProblemEvent is the focused getProblemEvent representation used by this
+ // package. It projects the specification's ProblemEvent schema.
+ type ProblemEvent struct {
+@@ -62,15 +90,358 @@
+ }
+ 
+ // Client calls the VCF Operations for Networks API.
+-type Client struct{}
++type Client struct {
++	baseURL    *url.URL
++	authHeader string
++	httpClient *http.Client
++}
+ 
+-// NewClient constructs a client. It is intentionally incomplete.
++// NewClient constructs a client for the service root baseURL. A nil httpClient
++// means http.DefaultClient. No returned error discloses the API token.
+ func NewClient(baseURL, apiToken string, httpClient *http.Client) (*Client, error) {
+-	return nil, errors.New("TODO: implement NewClient")
++	trimmedBaseURL := strings.TrimSpace(baseURL)
++	parsed, err := url.Parse(trimmedBaseURL)
++	if err != nil {
++		return nil, errors.New("service root URL is not a valid URL")
++	}
++	if !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
++		return nil, errors.New("service root URL must use http or https")
++	}
++	if parsed.Host == "" {
++		return nil, errors.New("service root URL must include a host")
++	}
++	if parsed.RawQuery != "" || parsed.ForceQuery || strings.Contains(trimmedBaseURL, "#") {
++		return nil, errors.New("service root URL must not carry a query or fragment")
++	}
++	if !headerSafe(apiToken) {
++		return nil, errors.New("API token is blank or not safe for a header value")
++	}
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++	root := *parsed
++	root.Scheme = strings.ToLower(root.Scheme)
++	root.Path = strings.TrimSuffix(root.Path, "/")
++	return &Client{
++		baseURL:    &root,
++		authHeader: authPrefix + apiToken,
++		httpClient: httpClient,
++	}, nil
++}
++
++func headerSafe(value string) bool {
++	if strings.TrimSpace(value) == "" {
++		return false
++	}
++	for _, r := range value {
++		if r < 0x20 || r == 0x7f {
++			return false
++		}
++	}
++	return true
++}
++
++// pagedListResponse projects PagedListResponseWithTime.
++type pagedListResponse struct {
++	Results    *[]entityIDWithTime `json:"results"`
++	Cursor     json.RawMessage     `json:"cursor"`
++	TotalCount *int                `json:"total_count"`
++}
++
++// entityIDWithTime projects EntityIdWithTime.
++type entityIDWithTime struct {
++	EntityID   string `json:"entity_id"`
++	EntityType string `json:"entity_type"`
++	Time       int64  `json:"time"`
+ }
+ 
+-// CollectProblemEvents retrieves the complete problem event collection and
+-// returns it in a deterministic order.
++// CollectProblemEvents retrieves every page of listProblemEvents, resolves each
++// distinct entity through getProblemEvent, and returns the result ordered by
++// Name then EntityID. Any failure returns a nil slice rather than a partial
++// collection.
+ func (c *Client) CollectProblemEvents(ctx context.Context, options CollectOptions) ([]ProblemEvent, error) {
+-	return nil, errors.New("TODO: implement CollectProblemEvents")
++	if ctx == nil {
++		return nil, errors.New("context must not be nil")
++	}
++	filters, err := options.listQuery()
++	if err != nil {
++		return nil, err
++	}
++	if options.DetailTime != nil && *options.DetailTime < 0 {
++		return nil, errors.New("DetailTime must not be negative")
++	}
++
++	ids, err := c.collectIdentifiers(ctx, options, filters)
++	if err != nil {
++		return nil, err
++	}
++
++	events := make([]ProblemEvent, 0, len(ids))
++	for _, id := range ids {
++		event, err := c.getProblemEvent(ctx, id, options.DetailTime)
++		if err != nil {
++			return nil, err
++		}
++		events = append(events, event)
++	}
++	sort.SliceStable(events, func(i, j int) bool {
++		if events[i].Name != events[j].Name {
++			return events[i].Name < events[j].Name
++		}
++		return events[i].EntityID < events[j].EntityID
++	})
++	return events, nil
++}
++
++// listQuery renders the listProblemEvents filters. Every unset option is
++// omitted; an explicitly supplied zero value is preserved.
++func (o CollectOptions) listQuery() (url.Values, error) {
++	if o.Size < 1 || o.Size > maxPageSize {
++		return nil, fmt.Errorf("Size must be between 1 and %d", maxPageSize)
++	}
++	values := url.Values{}
++	values.Set("size", strconv.Itoa(o.Size))
++
++	setEpoch := func(name string, value *int64) error {
++		if value == nil {
++			return nil
++		}
++		if *value < 0 {
++			return fmt.Errorf("%s must not be negative", name)
++		}
++		values.Set(name, strconv.FormatInt(*value, 10))
++		return nil
++	}
++	for _, field := range []struct {
++		name  string
++		value *int64
++	}{
++		{"start_time", o.StartTime},
++		{"end_time", o.EndTime},
++		{"update_time_from", o.UpdateTimeFrom},
++		{"update_time_to", o.UpdateTimeTo},
++	} {
++		if err := setEpoch(field.name, field.value); err != nil {
++			return nil, err
++		}
++	}
++
++	if o.EventType != nil {
++		if *o.EventType == "" {
++			return nil, errors.New("EventType must not be empty when supplied")
++		}
++		values.Set("event_type", *o.EventType)
++	}
++	if o.EventStatus != nil {
++		switch *o.EventStatus {
++		case "open", "closed", "all":
++			values.Set("event_status", *o.EventStatus)
++		default:
++			return nil, fmt.Errorf("EventStatus %q is not open, closed or all", *o.EventStatus)
++		}
++	}
++
++	// style=form, explode=true: each element becomes its own repeated key.
++	addRepeated := func(name string, items []string, allowed map[string]bool) error {
++		for _, item := range items {
++			if item == "" {
++				return fmt.Errorf("%s must not contain an empty value", name)
++			}
++			if allowed != nil && !allowed[item] {
++				return fmt.Errorf("%s value %q is not permitted by the specification", name, item)
++			}
++			values.Add(name, item)
++		}
++		return nil
++	}
++	severities := map[string]bool{"Critical": true, "Warning": true, "Moderate": true, "Info": true}
++	if err := addRepeated("event_tags", o.EventTags, nil); err != nil {
++		return nil, err
++	}
++	if err := addRepeated("event_severity", o.EventSeverity, severities); err != nil {
++		return nil, err
++	}
++	if err := addRepeated("managers", o.Managers, nil); err != nil {
++		return nil, err
++	}
++	return values, nil
++}
++
++// collectIdentifiers drains the cursor pagination and returns each distinct
++// entity ID in first-appearance order.
++func (c *Client) collectIdentifiers(ctx context.Context, options CollectOptions, filters url.Values) ([]string, error) {
++	var (
++		ids      []string
++		seen     = map[string]bool{}
++		cursors  = map[string]bool{}
++		cursor   string
++		total    = -1
++		pageSize = options.Size
++	)
++	for {
++		query := url.Values{}
++		for name, list := range filters {
++			query[name] = append([]string(nil), list...)
++		}
++		if cursor != "" {
++			query.Set("cursor", cursor)
++		}
++
++		var page pagedListResponse
++		if err := c.get(ctx, listPath, query, &page); err != nil {
++			return nil, err
++		}
++		if page.Results == nil {
++			return nil, &ProtocolError{Reason: "page omitted the results array"}
++		}
++		if page.TotalCount == nil || *page.TotalCount < 0 {
++			return nil, &ProtocolError{Reason: "page omitted a non-negative total_count"}
++		}
++		if total == -1 {
++			total = *page.TotalCount
++		} else if *page.TotalCount != total {
++			return nil, &ProtocolError{Reason: "total_count changed between pages"}
++		}
++		hasNextCursor := len(page.Cursor) != 0
++		nextCursor := ""
++		if hasNextCursor {
++			if err := json.Unmarshal(page.Cursor, &nextCursor); err != nil || nextCursor == "" {
++				return nil, &ProtocolError{Reason: "page carried an invalid pagination cursor"}
++			}
++		}
++		results := *page.Results
++		if len(results) > pageSize {
++			return nil, &ProtocolError{Reason: "page returned more results than the requested size"}
++		}
++		if hasNextCursor && len(results) < pageSize {
++			return nil, &ProtocolError{Reason: "a non-final page was not full"}
++		}
++		for _, entry := range results {
++			if strings.TrimSpace(entry.EntityID) == "" {
++				return nil, &ProtocolError{Reason: "a result omitted entity_id"}
++			}
++			if entry.EntityType != entityType {
++				return nil, &ProtocolError{
++					Reason: fmt.Sprintf("result %s has entity_type %q", entry.EntityID, entry.EntityType),
++				}
++			}
++			// Cursor windows may overlap; keep the first sighting only.
++			if seen[entry.EntityID] {
++				continue
++			}
++			seen[entry.EntityID] = true
++			ids = append(ids, entry.EntityID)
++		}
++		if len(ids) > total {
++			return nil, &ProtocolError{Reason: "collection overshot total_count"}
++		}
++		if !hasNextCursor {
++			break
++		}
++		if cursors[nextCursor] {
++			return nil, &ProtocolError{Reason: "server repeated a pagination cursor"}
++		}
++		cursors[nextCursor] = true
++		cursor = nextCursor
++	}
++	if len(ids) != total {
++		return nil, &ProtocolError{
++			Reason: fmt.Sprintf("collected %d distinct events but total_count is %d", len(ids), total),
++		}
++	}
++	return ids, nil
++}
++
++func (c *Client) getProblemEvent(ctx context.Context, id string, detailTime *int64) (ProblemEvent, error) {
++	query := url.Values{}
++	if detailTime != nil {
++		query.Set("time", strconv.FormatInt(*detailTime, 10))
++	}
++	var event ProblemEvent
++	if err := c.get(ctx, detailPath+id, query, &event); err != nil {
++		return ProblemEvent{}, err
++	}
++	if event.EntityID != id {
++		return ProblemEvent{}, &ProtocolError{
++			Reason: fmt.Sprintf("requested %s but the detail body reported %q", id, event.EntityID),
++		}
++	}
++	if strings.TrimSpace(event.Name) == "" {
++		return ProblemEvent{}, &ProtocolError{Reason: "detail body omitted name for " + id}
++	}
++	if event.EntityType != entityType {
++		return ProblemEvent{}, &ProtocolError{
++			Reason: fmt.Sprintf("detail body for %s has entity_type %q", id, event.EntityType),
++		}
++	}
++	return event, nil
++}
++
++// get performs one bodyless GET and decodes a strict JSON success response.
++func (c *Client) get(ctx context.Context, path string, query url.Values, out any) error {
++	target := *c.baseURL
++	target.Path = c.baseURL.Path + path
++	// Omit the delimiter entirely when there is nothing to encode.
++	target.RawQuery = query.Encode()
++
++	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
++	if err != nil {
++		return errors.New("could not build the API request")
++	}
++	request.Header.Set("Authorization", c.authHeader)
++	request.Header.Set("Accept", "application/json")
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return errors.New("API request failed before a response was received")
++	}
++	defer func() {
++		_, _ = io.Copy(io.Discard, response.Body)
++		_ = response.Body.Close()
++	}()
++
++	body, err := io.ReadAll(response.Body)
++	if err != nil {
++		return &ProtocolError{Reason: "could not read the response body"}
++	}
++	if response.StatusCode != http.StatusOK {
++		return decodeAPIError(response.StatusCode, body)
++	}
++	if !isJSON(response.Header.Get("Content-Type")) {
++		return &ProtocolError{
++			Reason: fmt.Sprintf("expected a JSON media type, got %q", response.Header.Get("Content-Type")),
++		}
++	}
++	decoder := json.NewDecoder(bytes.NewReader(body))
++	if err := decoder.Decode(out); err != nil {
++		return &ProtocolError{Reason: "response body is not valid JSON"}
++	}
++	var trailing any
++	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
++		return &ProtocolError{Reason: "response body contains trailing non-whitespace data"}
++	}
++	return nil
++}
++
++func isJSON(contentType string) bool {
++	mediaType, _, err := mime.ParseMediaType(contentType)
++	if err != nil {
++		return false
++	}
++	return mediaType == "application/json" || strings.HasSuffix(mediaType, "+json")
++}
++
++func decodeAPIError(status int, body []byte) error {
++	apiError := &APIError{StatusCode: status}
++	var payload struct {
++		Code    *int   `json:"code"`
++		Message string `json:"message"`
++	}
++	if err := json.Unmarshal(body, &payload); err == nil {
++		if payload.Code != nil {
++			apiError.Code = *payload.Code
++		}
++		apiError.Message = payload.Message
++	}
++	return apiError
+ }
+

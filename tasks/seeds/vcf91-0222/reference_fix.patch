@@ -1,0 +1,204 @@
+--- a/src/VcfSddcLcm.DepotSync/VcfSddcLcm.DepotSync.psm1
++++ b/src/VcfSddcLcm.DepotSync/VcfSddcLcm.DepotSync.psm1
+@@ -45,7 +45,200 @@
+         [string] $CorrelationId
+     )
+ 
+-    throw 'Invoke-VcfSddcLcmDepotSync has not been implemented.'
++    # Session bootstrap: mint the token pair through the genuine SDK binding for
++    # operationId createToken. Initialize-VcfTokenCreationSpec leaves the unset
++    # optional apiKey and idToken members off the wire instead of sending them empty.
++    $tokenSpec = Initialize-VcfTokenCreationSpec `
++        -Username $Credential.UserName `
++        -Password $Credential.GetNetworkCredential().Password
++    $tokenPair = Invoke-VcfCreateToken -TokenCreationSpec $tokenSpec -Server $Server
++    if ($null -eq $tokenPair -or [string]::IsNullOrEmpty($tokenPair.accessToken)) {
++        throw [System.InvalidOperationException]::new(
++            'createToken returned no access token.'
++        )
++    }
++
++    $session = @{
++        Server         = $Server
++        AccessToken    = [string] $tokenPair.accessToken
++        RefreshTokenId = [string] $tokenPair.refreshToken.id
++        RefreshCount   = 0
++    }
++    if ([string]::IsNullOrEmpty($session.RefreshTokenId)) {
++        throw [System.InvalidOperationException]::new(
++            'createToken returned no refresh token id.'
++        )
++    }
++
++    $baseUrl = $LcmBaseUrl.TrimEnd('/')
++
++    # FleetDepotSpec: both members are required by the contract.
++    $fleetDepotSpec = [ordered] @{
++        fqdn        = $DepotFqdn
++        certificate = $DepotCertificate
++    }
++
++    # setDepot is the only contract operation that defines X-Correlation-Id. An unset
++    # correlation id means the header is absent, not present and empty.
++    $setDepotHeaders = @{}
++    if (-not [string]::IsNullOrEmpty($CorrelationId)) {
++        $setDepotHeaders['X-Correlation-Id'] = $CorrelationId
++    }
++
++    $depotResponse = Invoke-VcfSddcLcmContractRequest `
++        -Session $session `
++        -Method 'POST' `
++        -Uri "$baseUrl/v1/depot" `
++        -JsonBody ($fleetDepotSpec | ConvertTo-Json -Depth 6 -Compress) `
++        -ExtraHeader $setDepotHeaders `
++        -OperationId 'setDepot'
++    if ($depotResponse.StatusCode -ne 202) {
++        throw [System.InvalidOperationException]::new(
++            "setDepot returned HTTP $($depotResponse.StatusCode)."
++        )
++    }
++    $depotTask = $depotResponse.Content | ConvertFrom-Json
++    $taskId = [string] $depotTask.id
++    if ([string]::IsNullOrEmpty($taskId)) {
++        throw [System.InvalidOperationException]::new(
++            'setDepot returned a Task without an id.'
++        )
++    }
++
++    # getTask carries no request body and no query string.
++    $taskResponse = Invoke-VcfSddcLcmContractRequest `
++        -Session $session `
++        -Method 'GET' `
++        -Uri "$baseUrl/v1/tasks/$taskId" `
++        -OperationId 'getTask'
++    if ($taskResponse.StatusCode -ne 200) {
++        throw [System.InvalidOperationException]::new(
++            "getTask returned HTTP $($taskResponse.StatusCode)."
++        )
++    }
++    $task = $taskResponse.Content | ConvertFrom-Json
++    $taskStatus = [string] $task.status
++    if ($taskStatus -cne 'SUCCEEDED') {
++        throw [System.InvalidOperationException]::new(
++            "Fleet depot registration ended in status '$taskStatus'."
++        )
++    }
++
++    # DepotComponentsSpec: fleetDepotSpec and componentVersions are required; the
++    # top-level version member and each entry's version member are optional and stay
++    # off the wire when the caller did not supply them.
++    $componentVersions = @(
++        foreach ($entry in $ComponentVersion) {
++            $component = [string] $entry['component']
++            if ([string]::IsNullOrEmpty($component)) {
++                throw [System.ArgumentException]::new(
++                    'each ComponentVersion entry requires a component name.'
++                )
++            }
++            $item = [ordered] @{ component = $component }
++            if ($entry.ContainsKey('version')) {
++                $version = [string] $entry['version']
++                if (-not [string]::IsNullOrEmpty($version)) {
++                    $item['version'] = $version
++                }
++            }
++            $item
++        }
++    )
++
++    $componentsSpec = [ordered] @{ fleetDepotSpec = $fleetDepotSpec }
++    if (-not [string]::IsNullOrEmpty($TargetVersion)) {
++        $componentsSpec['version'] = $TargetVersion
++    }
++    $componentsSpec['componentVersions'] = $componentVersions
++
++    $resolveResponse = Invoke-VcfSddcLcmContractRequest `
++        -Session $session `
++        -Method 'POST' `
++        -Uri "$baseUrl/v1/depot/components" `
++        -JsonBody ($componentsSpec | ConvertTo-Json -Depth 6 -Compress) `
++        -OperationId 'resolveDepotComponents'
++    if ($resolveResponse.StatusCode -ne 200) {
++        throw [System.InvalidOperationException]::new(
++            "resolveDepotComponents returned HTTP $($resolveResponse.StatusCode)."
++        )
++    }
++    $resolved = $resolveResponse.Content | ConvertFrom-Json
++
++    return [pscustomobject] @{
++        TaskId                  = $taskId
++        TaskStatus              = $taskStatus
++        ResolvedComponents      = @($resolved.componentVersions)
++        AccessTokenRefreshCount = $session.RefreshCount
++    }
++}
++
++function Invoke-VcfSddcLcmContractRequest {
++    <#
++        Issues one SDDC LCM request. On 401 the access token is refreshed exactly once
++        through the genuine SDK binding for operationId refreshAccessToken and only the
++        unauthorized request is replayed, byte for byte. Work already accepted by the
++        service is never reissued.
++    #>
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)] [hashtable] $Session,
++        [Parameter(Mandatory)] [string] $Method,
++        [Parameter(Mandatory)] [string] $Uri,
++        [Parameter()] [AllowNull()] [string] $JsonBody,
++        [Parameter()] [hashtable] $ExtraHeader = @{},
++        [Parameter(Mandatory)] [string] $OperationId
++    )
++
++    for ($attempt = 0; $attempt -lt 2; $attempt++) {
++        $headers = @{
++            Authorization = "Bearer $($Session.AccessToken)"
++            Accept        = 'application/json'
++        }
++        foreach ($name in $ExtraHeader.Keys) {
++            $headers[$name] = $ExtraHeader[$name]
++        }
++
++        $request = @{
++            Method             = $Method
++            Uri                = $Uri
++            Headers            = $headers
++            SkipHttpErrorCheck = $true
++            MaximumRedirection = 0
++            ErrorAction        = 'Stop'
++        }
++        if (-not [string]::IsNullOrEmpty($JsonBody)) {
++            $request['Body'] = $JsonBody
++            $request['ContentType'] = 'application/json'
++        }
++
++        $response = Invoke-WebRequest @request
++        if ($response.StatusCode -ne 401) {
++            return $response
++        }
++        if ($attempt -ne 0) {
++            throw [System.UnauthorizedAccessException]::new(
++                "$OperationId remained unauthorized after refreshing the access token."
++            )
++        }
++
++        if ($Session.RefreshCount -ne 0) {
++            throw [System.UnauthorizedAccessException]::new(
++                "$OperationId was unauthorized after the run had already refreshed once."
++            )
++        }
++
++        $refreshed = Invoke-VcfRefreshAccessToken `
++            -Body $Session.RefreshTokenId `
++            -Server $Session.Server
++        if ([string]::IsNullOrEmpty([string] $refreshed)) {
++            throw [System.UnauthorizedAccessException]::new(
++                'refreshAccessToken returned no access token.'
++            )
++        }
++        $Session.AccessToken = [string] $refreshed
++        $Session.RefreshCount = $Session.RefreshCount + 1
++    }
+ }
+ 
+ Export-ModuleMember -Function Invoke-VcfSddcLcmDepotSync

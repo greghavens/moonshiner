@@ -1,0 +1,448 @@
+diff --git a/docs/diagnosis.md b/docs/diagnosis.md
+new file mode 100644
+index 0000000..6019594
+--- /dev/null
++++ b/docs/diagnosis.md
+@@ -0,0 +1,81 @@
++# wld01 capacity incident — root cause
++
++**Incident window:** 2026-03-10T23:52:14Z through 2026-03-11T06:00:00Z
++**Affected object:** `wld01-vsan-ds01` (VMWARE / Datastore)
++**Evidence:** pulled with `src/VcfOpsClient.java` against the VCF Operations 9.1 suite-api.
++Every figure below is quoted from a response, not from recollection.
++
++## Summary
++
++Two independent things went wrong, and only one of them is a storage problem.
++
++1. `wld01-vsan-ds01` genuinely ran out of allocatable capacity, and VCF Operations
++   detected it on time and raised a CRITICAL alert at 2026-03-10T23:52:14Z.
++2. Nobody was paged, because the outbound notification task that should have delivered
++   that alert failed with an SMTP connect timeout and silently dropped the notifications.
++
++The popular theory before the evidence was pulled — "Operations stopped collecting from
++the vCenter adapter, so we were flying blind" — is wrong and is contradicted below.
++
++## How the evidence was gathered
++
++| Step | operationId | What it answered |
++| --- | --- | --- |
++| 1 | `acquireToken` | Opened a suite-api session (no `authSource` supplied, so the field was not sent). |
++| 2 | `getMatchingResources` | Resolved the name `wld01-vsan-ds01` to its resource UUID and, incidentally, its collection status. |
++| 3 | `queryAlert` | Listed the active CRITICAL/IMMEDIATE alerts scoped to that resource UUID. |
++| 4 | `getAlertContributingSymptoms` | Named the symptoms that actually triggered the alert. |
++| 5 | `getSymptoms` | Supplied the human-readable message, `statKey` and timestamps for those symptoms. |
++| 6 | `getTasksStatus` | Listed the tasks in `ERROR`, which is where the notification failure surfaced. |
++| 7 | `releaseToken` | Closed the session. |
++
++Step 4 is required because `contributing-symptom` carries only `symptomId` and
++`symptomDefinitionsIds`; the message and the statKey live on the `symptom` objects that
++step 5 returns. Neither step alone identifies what breached.
++
++## What actually broke
++
++`queryAlert` returned exactly one active alert on the datastore:
++
++- alert definition **"Datastore is running out of disk space"**
++  (`AlertDefinition-VMWARE-Datastore-capacity-remaining`)
++- `alertLevel` CRITICAL, `status` ACTIVE, `controlState` OPEN
++- `startTimeUTC` 1773186734000 = 2026-03-10T23:52:14Z, last updated 2026-03-11T03:10:22Z
++
++`getAlertContributingSymptoms` attributed it to two symptoms in `capacity-symptom-set`,
++and `getSymptoms` filled them in:
++
++| statKey | Criticality | Started | Message |
++| --- | --- | --- | --- |
++| `diskspace|used_pct` | CRITICAL | 2026-03-10T23:52:14Z | Datastore space used is 97.4% of 40.00 TiB usable (critical threshold 90%, warning threshold 80%) |
++| `diskspace|freespace` | IMMEDIATE | 2026-03-11T02:32:41Z | Allocatable free space on wld01-vsan-ds01 is 118 GB once the vSAN resync slack reserve is held back; new VM provisioning is being refused |
++
++So the capacity breach crossed the critical threshold at 23:52Z, and the second-order
++effect — provisioning refusals, with only 118 GB allocatable — landed 2h40m later at
++02:32:41Z. That is the failure users felt.
++
++## Why nobody was paged
++
++`getTasksStatus` filtered to `taskState=ERROR` returned two failed tasks. One is
++unrelated noise ("Management pack content synchronisation", content repository
++`packs.example.com` returning HTTP 503). The other is the cause of the silence:
++
++> **Outbound notification delivery for alert plugin 'ops-smtp-relay'** — ERROR,
++> "Delivery aborted after 5 retries", last updated 2026-03-11T03:10:22Z
++>
++> - `ops-smtp-relay: connect timed out to smtp.wld01.example.com:587 after 30000 ms`
++> - `ops-smtp-relay: 3 notification(s) dropped after 5 retries, alertId=<the capacity alert above>`
++> - `ops-smtp-relay: outbound plugin marked unhealthy at 2026-03-11T03:10:22Z`
++
++The second error message carries the alert UUID of the capacity alert, so the dropped
++notifications are the ones for this incident. The alert existed in the platform the whole
++time; it just never left it.
++
++## What the evidence rules out
++
++Monitoring was never interrupted. `getMatchingResources` returned, for the datastore's
++only adapter instance, `resourceState` **STARTED** and `resourceStatus`
++**DATA_RECEIVING**, with `statusMessage` "Collecting; last collection completed
++2026-03-11T06:00:00Z". The object was also at `resourceHealth` RED with
++`resourceHealthValue` 8.0, i.e. the platform was scoring it correctly. There is no
++collection gap to explain, and no adapter to restart.
+diff --git a/src/VcfOpsClient.java b/src/VcfOpsClient.java
+index 82124b8..5fa4f6b 100644
+--- a/src/VcfOpsClient.java
++++ b/src/VcfOpsClient.java
+@@ -1,4 +1,15 @@
++import java.io.IOException;
++import java.net.URI;
++import java.net.URLEncoder;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.time.Duration;
++import java.util.ArrayList;
+ import java.util.List;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
+ 
+ /**
+  * Single-file REST client for the VMware Cloud Foundation Operations 9.1 suite-api.
+@@ -7,84 +18,295 @@ import java.util.List;
+  * {@code docs/contract.json}, which was derived from the vmware/vcf-api-specs OpenAPI document
+  * recorded in {@code docs/official_sources.json}.
+  *
+- * <p>Implement every method below. Keep it to this one file and to the JDK standard library
+- * (java.net.http is available); no third-party dependencies and no extra source files.
+- *
+- * <p>Method signatures are fixed - {@code harness/TestMain.java} compiles against them.
++ * <p>The rule that shapes most of the code below: an optional body field or query parameter the
++ * caller did not supply is absent from the wire. It is never sent as null, "", [], {} or as the
++ * schema's documented default. A field the caller did supply is always sent, including a boolean
++ * {@code false}.
+  */
+ public class VcfOpsClient implements AutoCloseable {
+ 
++    private static final String AUTH_HEADER = "Authorization";
++    private static final String AUTH_SCHEME = "vRealizeOpsToken";
++    private static final String JSON = "application/json";
++    private static final Pattern TOKEN = Pattern.compile("\"token\"\\s*:\\s*\"([^\"]+)\"");
++
++    private final String baseUrl;
++    private final HttpClient http;
++    private String token;
++
+     /**
+      * @param baseUrl absolute base URL including the suite-api base path,
+      *                e.g. {@code http://127.0.0.1:8443/suite-api}
+      */
+     public VcfOpsClient(String baseUrl) {
+-        throw new UnsupportedOperationException("VcfOpsClient is not implemented yet");
++        if (baseUrl == null || baseUrl.isBlank()) {
++            throw new IllegalArgumentException("baseUrl is required");
++        }
++        String trimmed = baseUrl.trim();
++        while (trimmed.endsWith("/")) {
++            trimmed = trimmed.substring(0, trimmed.length() - 1);
++        }
++        this.baseUrl = trimmed;
++        this.http = HttpClient.newBuilder()
++                .version(HttpClient.Version.HTTP_1_1)
++                .followRedirects(HttpClient.Redirect.NEVER)
++                .proxy(HttpClient.Builder.NO_PROXY)
++                .connectTimeout(Duration.ofSeconds(20))
++                .build();
+     }
+ 
+-    /**
+-     * operationId {@code acquireToken}. Stores the returned token for subsequent calls.
+-     *
+-     * @param authSource null when the caller did not supply one
+-     */
++    // ---- operations -------------------------------------------------------
++
++    /** operationId {@code acquireToken}. Stores the returned token for subsequent calls. */
+     public void acquireToken(String username, String password, String authSource) {
+-        throw new UnsupportedOperationException("acquireToken is not implemented yet");
++        if (username == null || password == null) {
++            throw new IllegalArgumentException("username and password are required");
++        }
++        String body = new JsonObject()
++                .string("username", username)
++                .string("password", password)
++                .string("authSource", authSource)
++                .render();
++        // The one operation whose spec entry overrides the global security requirement.
++        String response = send(request("/api/auth/token/acquire", List.of())
++                .header("Accept", JSON)
++                .header("Content-Type", JSON)
++                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
++                .build());
++        Matcher m = TOKEN.matcher(response);
++        if (!m.find()) {
++            throw new VcfOpsException("acquireToken returned no token: " + response);
++        }
++        this.token = m.group(1);
+     }
+ 
+-    /**
+-     * operationId {@code getMatchingResources}. Returns the raw JSON response body.
+-     *
+-     * @param names         null or empty when the caller did not supply the filter
+-     * @param resourceKinds null or empty when the caller did not supply the filter
+-     */
++    /** operationId {@code getMatchingResources}. */
+     public String getMatchingResources(List<String> names, List<String> resourceKinds) {
+-        throw new UnsupportedOperationException("getMatchingResources is not implemented yet");
++        String body = new JsonObject()
++                .strings("name", names)
++                .strings("resourceKind", resourceKinds)
++                .render();
++        return send(authorized("/api/resources/query", List.of())
++                .header("Content-Type", JSON)
++                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
++                .build());
+     }
+ 
+-    /**
+-     * operationId {@code queryAlert}. Returns the raw JSON response body.
+-     *
+-     * @param resourceIds   null or empty when the caller did not supply the filter
+-     * @param activeOnly    always supplied, including when false
+-     * @param criticalities null or empty when the caller did not supply the filter
+-     */
++    /** operationId {@code queryAlert}. */
+     public String queryAlert(List<String> resourceIds, boolean activeOnly, List<String> criticalities) {
+-        throw new UnsupportedOperationException("queryAlert is not implemented yet");
++        JsonObject spec = new JsonObject()
++                .bool("activeOnly", activeOnly)
++                .strings("alertCriticality", criticalities);
++        if (notEmpty(resourceIds)) {
++            // alert-query has no top-level resourceId: the filter is a nested resource-query,
++            // and that JSON property name really is hyphenated.
++            spec.object("resource-query", new JsonObject().strings("resourceId", resourceIds));
++        }
++        String body = spec.render();
++        return send(authorized("/api/alerts/query", List.of())
++                .header("Content-Type", JSON)
++                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
++                .build());
+     }
+ 
+-    /** operationId {@code getAlertContributingSymptoms}. Returns the raw JSON response body. */
++    /** operationId {@code getAlertContributingSymptoms}. */
+     public String getAlertContributingSymptoms(List<String> alertIds) {
+-        throw new UnsupportedOperationException("getAlertContributingSymptoms is not implemented yet");
++        if (!notEmpty(alertIds)) {
++            throw new IllegalArgumentException("at least one alert id is required");
++        }
++        List<String[]> query = new ArrayList<>();
++        repeat(query, "id", alertIds);
++        return send(authorized("/api/alerts/contributingsymptoms", query).GET().build());
+     }
+ 
+-    /**
+-     * operationId {@code getSymptoms}. Returns the raw JSON response body.
+-     *
+-     * @param resourceIds      null or empty when the caller did not supply the filter
+-     * @param activeOnly       null when the caller did not supply it
+-     * @param includeAlarmInfo null when the caller did not supply it
+-     */
++    /** operationId {@code getSymptoms}. */
+     public String getSymptoms(List<String> resourceIds, Boolean activeOnly, Boolean includeAlarmInfo) {
+-        throw new UnsupportedOperationException("getSymptoms is not implemented yet");
++        List<String[]> query = new ArrayList<>();
++        repeat(query, "resourceId", resourceIds);
++        // Boxed: null means the caller said nothing, so the parameter is left off entirely even
++        // though the specification documents a default for it.
++        if (activeOnly != null) {
++            query.add(new String[] {"activeOnly", activeOnly.toString()});
++        }
++        if (includeAlarmInfo != null) {
++            query.add(new String[] {"includeAlarmInfo", includeAlarmInfo.toString()});
++        }
++        return send(authorized("/api/symptoms", query).GET().build());
+     }
+ 
+-    /**
+-     * operationId {@code getTasksStatus}. Returns the raw JSON response body.
+-     *
+-     * @param taskStates null or empty when the caller did not supply the filter
+-     * @param taskIds    null or empty when the caller did not supply the filter
+-     */
++    /** operationId {@code getTasksStatus}. */
+     public String getTasksStatus(List<String> taskStates, List<String> taskIds) {
+-        throw new UnsupportedOperationException("getTasksStatus is not implemented yet");
++        List<String[]> query = new ArrayList<>();
++        repeat(query, "taskState", taskStates);
++        repeat(query, "taskId", taskIds);
++        return send(authorized("/api/tasks", query).GET().build());
+     }
+ 
+     /** operationId {@code releaseToken}. Terminates the session held by this client. */
+     public void releaseToken() {
+-        throw new UnsupportedOperationException("releaseToken is not implemented yet");
++        if (token == null) {
++            return;
++        }
++        // The spec declares no requestBody, so nothing is sent and no Content-Type is set.
++        send(authorized("/api/auth/token/release", List.of())
++                .POST(HttpRequest.BodyPublishers.noBody())
++                .build());
++        token = null;
+     }
+ 
+     @Override
+     public void close() {
+-        // Release any resources held by the client. Must be safe to call more than once.
++        releaseToken();
++    }
++
++    /** Raised for non-2xx responses from the suite-api. */
++    public static class VcfOpsException extends RuntimeException {
++        private static final long serialVersionUID = 1L;
++
++        public VcfOpsException(String message) {
++            super(message);
++        }
++
++        public VcfOpsException(String message, Throwable cause) {
++            super(message, cause);
++        }
++    }
++
++    // ---- transport --------------------------------------------------------
++
++    private HttpRequest.Builder request(String path, List<String[]> query) {
++        return HttpRequest.newBuilder(URI.create(baseUrl + path + queryString(query)))
++                .timeout(Duration.ofSeconds(60));
++    }
++
++    private HttpRequest.Builder authorized(String path, List<String[]> query) {
++        if (token == null) {
++            throw new IllegalStateException("no session: call acquireToken first");
++        }
++        return request(path, query)
++                .header("Accept", JSON)
++                .header(AUTH_HEADER, AUTH_SCHEME + " " + token);
++    }
++
++    private String send(HttpRequest req) {
++        HttpResponse<String> res;
++        try {
++            res = http.send(req, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++        } catch (IOException e) {
++            throw new VcfOpsException(req.method() + " " + req.uri() + " failed", e);
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++            throw new VcfOpsException(req.method() + " " + req.uri() + " interrupted", e);
++        }
++        if (res.statusCode() / 100 != 2) {
++            throw new VcfOpsException(
++                    req.method() + " " + req.uri() + " -> HTTP " + res.statusCode() + ": " + res.body());
++        }
++        return res.body();
++    }
++
++    private static String queryString(List<String[]> params) {
++        if (params == null || params.isEmpty()) {
++            return "";
++        }
++        StringBuilder sb = new StringBuilder("?");
++        for (int i = 0; i < params.size(); i++) {
++            if (i > 0) {
++                sb.append('&');
++            }
++            // style=form, explode=true: one repeated key per array element.
++            sb.append(enc(params.get(i)[0])).append('=').append(enc(params.get(i)[1]));
++        }
++        return sb.toString();
++    }
++
++    private static void repeat(List<String[]> query, String key, List<String> values) {
++        if (!notEmpty(values)) {
++            return;
++        }
++        for (String v : values) {
++            if (v != null) {
++                query.add(new String[] {key, v});
++            }
++        }
++    }
++
++    private static boolean notEmpty(List<String> values) {
++        return values != null && !values.isEmpty();
++    }
++
++    private static String enc(String s) {
++        return URLEncoder.encode(s, StandardCharsets.UTF_8);
++    }
++
++    // ---- minimal JSON writer ---------------------------------------------
++
++    /** Emits only the members that were actually supplied. */
++    private static final class JsonObject {
++        private final StringBuilder sb = new StringBuilder("{");
++        private boolean empty = true;
++
++        JsonObject string(String key, String value) {
++            return value == null ? this : member(key, quote(value));
++        }
++
++        JsonObject bool(String key, Boolean value) {
++            return value == null ? this : member(key, value ? "true" : "false");
++        }
++
++        JsonObject strings(String key, List<String> values) {
++            if (!notEmpty(values)) {
++                return this;
++            }
++            StringBuilder arr = new StringBuilder("[");
++            for (int i = 0; i < values.size(); i++) {
++                if (i > 0) {
++                    arr.append(',');
++                }
++                arr.append(quote(values.get(i)));
++            }
++            return member(key, arr.append(']').toString());
++        }
++
++        JsonObject object(String key, JsonObject value) {
++            return value == null || value.empty ? this : member(key, value.render());
++        }
++
++        private JsonObject member(String key, String rendered) {
++            if (!empty) {
++                sb.append(',');
++            }
++            sb.append(quote(key)).append(':').append(rendered);
++            empty = false;
++            return this;
++        }
++
++        String render() {
++            return sb + "}";
++        }
++
++        private static String quote(String s) {
++            StringBuilder out = new StringBuilder(s.length() + 16).append('"');
++            for (int i = 0; i < s.length(); i++) {
++                char c = s.charAt(i);
++                switch (c) {
++                    case '"' -> out.append("\\\"");
++                    case '\\' -> out.append("\\\\");
++                    case '\b' -> out.append("\\b");
++                    case '\f' -> out.append("\\f");
++                    case '\n' -> out.append("\\n");
++                    case '\r' -> out.append("\\r");
++                    case '\t' -> out.append("\\t");
++                    default -> {
++                        if (c < 0x20) {
++                            out.append(String.format("\\u%04x", (int) c));
++                        } else {
++                            out.append(c);
++                        }
++                    }
++                }
++            }
++            return out.append('"').toString();
++        }
+     }
+ }

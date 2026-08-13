@@ -1,0 +1,313 @@
+--- a/rollout/rollout.go
++++ b/rollout/rollout.go
+@@ -7,8 +7,13 @@
+ package rollout
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
++	"fmt"
++	"io"
+ 	"net/http"
++	"strings"
+ )
+ 
+ // Membership criteria discriminator values, per the spec's
+@@ -121,5 +126,295 @@
+ // application and keeps a tier marked applied only if the server lists it. A
+ // rollout in which every step succeeds makes no such confirmation call.
+ func (c *Client) Apply(ctx context.Context, p Plan) (*Report, error) {
+-	panic("rollout: Apply is not implemented")
++	rep := &Report{Steps: plannedSteps(p)}
++
++	app, apiErr, err := c.addApplication(ctx, p.ApplicationName)
++	switch {
++	case err != nil:
++		rep.Steps[0].Status = StatusFailed
++		rep.Failed = true
++		return rep, fmt.Errorf("addApplication %q: %w", p.ApplicationName, err)
++	case apiErr != nil:
++		rep.Steps[0].Status = StatusFailed
++		rep.Steps[0].StatusCode = apiErr.status
++		rep.Steps[0].Message = apiErr.Message
++		rep.Failed = true
++		return rep, fmt.Errorf("addApplication %q: %w", p.ApplicationName, apiErr)
++	}
++
++	rep.ApplicationID = app.EntityID
++	rep.Steps[0].Status = StatusApplied
++	rep.Steps[0].EntityID = app.EntityID
++	rep.Steps[0].StatusCode = http.StatusCreated
++
++	var failure error
++	for i, tier := range p.Tiers {
++		step := &rep.Steps[i+1]
++
++		created, apiErr, err := c.addTier(ctx, app.EntityID, tier)
++		switch {
++		case err != nil:
++			step.Status = StatusFailed
++			failure = fmt.Errorf("addTier %q: %w", tier.Name, err)
++		case apiErr != nil:
++			step.Status = StatusFailed
++			step.StatusCode = apiErr.status
++			step.Message = apiErr.Message
++			failure = fmt.Errorf("addTier %q: %w", tier.Name, apiErr)
++		default:
++			step.Status = StatusApplied
++			step.EntityID = created.EntityID
++			step.StatusCode = http.StatusCreated
++			continue
++		}
++		break // stop at the first failure; later steps stay not_attempted
++	}
++
++	if failure == nil {
++		return rep, nil
++	}
++
++	rep.Failed = true
++	// The rollout is partly applied. Confirm what the server actually holds
++	// rather than trusting the per-call bookkeeping above.
++	c.confirmAppliedTiers(ctx, rep)
++	return rep, failure
++}
++
++// plannedSteps lays out every step of the plan up front, so a step that is
++// never reached is still present in the report as not_attempted.
++func plannedSteps(p Plan) []Step {
++	steps := make([]Step, 0, len(p.Tiers)+1)
++	steps = append(steps, Step{
++		OperationID: "addApplication",
++		Target:      p.ApplicationName,
++		Status:      StatusNotAttempted,
++	})
++	for _, t := range p.Tiers {
++		steps = append(steps, Step{
++			OperationID: "addTier",
++			Target:      t.Name,
++			Status:      StatusNotAttempted,
++		})
++	}
++	return steps
++}
++
++// confirmAppliedTiers downgrades any addTier step the server does not list.
++// A confirmation that cannot be completed leaves the report unchanged.
++func (c *Client) confirmAppliedTiers(ctx context.Context, rep *Report) {
++	if rep.ApplicationID == "" {
++		return
++	}
++	tiers, err := c.listApplicationTiers(ctx, rep.ApplicationID)
++	if err != nil {
++		return
++	}
++	present := make(map[string]string, len(tiers))
++	for _, t := range tiers {
++		present[t.EntityID] = t.EntityID
++	}
++	for i := range rep.Steps {
++		s := &rep.Steps[i]
++		if s.OperationID != "addTier" || s.Status != StatusApplied {
++			continue
++		}
++		id, ok := present[s.EntityID]
++		if !ok {
++			s.Status = StatusFailed
++			s.EntityID = ""
++			continue
++		}
++		s.EntityID = id
++	}
++}
++
++// ---------------------------------------------------------------------------
++// wire types
++//
++// TierRequest's properties are all optional in the specification. Every
++// optional field is a pointer or slice tagged omitempty so that a field the
++// plan does not set is absent from the JSON object rather than present with a
++// zero value.
++// ---------------------------------------------------------------------------
++
++type applicationRequest struct {
++	Name string `json:"name"`
++}
++
++type searchMembershipCriteria struct {
++	EntityType string `json:"entity_type,omitempty"`
++	Filter     string `json:"filter,omitempty"`
++}
++
++type ipAddressMembershipCriteria struct {
++	IPAddresses []string `json:"ip_addresses,omitempty"`
++}
++
++type groupMembershipCriteria struct {
++	MembershipType string                       `json:"membership_type"`
++	IPAddress      *ipAddressMembershipCriteria `json:"ip_address_membership_criteria,omitempty"`
++	Search         *searchMembershipCriteria    `json:"search_membership_criteria,omitempty"`
++}
++
++type memberList struct {
++	VMs                []entityRef `json:"vms,omitempty"`
++	PhysicalIPs        []entityRef `json:"physical_ips,omitempty"`
++	KubernetesServices []entityRef `json:"kubernetes_services,omitempty"`
++}
++
++type entityRef struct {
++	Key  map[string]string `json:"key,omitempty"`
++	Name string            `json:"name,omitempty"`
++}
++
++type tierRequest struct {
++	Name                    string                    `json:"name,omitempty"`
++	EntityID                string                    `json:"entity_id,omitempty"`
++	GroupMembershipCriteria []groupMembershipCriteria `json:"group_membership_criteria,omitempty"`
++	MemberList              *memberList               `json:"member_list,omitempty"`
++	SourceGroupEntityID     []string                  `json:"source_group_entity_id,omitempty"`
++}
++
++type baseEntity struct {
++	EntityID   string `json:"entity_id"`
++	Name       string `json:"name"`
++	EntityType string `json:"entity_type"`
++}
++
++type tierListResponse struct {
++	Results []baseEntity `json:"results"`
++}
++
++func tierRequestFor(t TierPlan) tierRequest {
++	req := tierRequest{Name: t.Name}
++	for _, cr := range t.Criteria {
++		switch cr.Type {
++		case SearchMembership:
++			req.GroupMembershipCriteria = append(req.GroupMembershipCriteria, groupMembershipCriteria{
++				MembershipType: SearchMembership,
++				Search: &searchMembershipCriteria{
++					EntityType: cr.SearchEntityType,
++					Filter:     cr.SearchFilter,
++				},
++			})
++		case IPAddressMembership:
++			req.GroupMembershipCriteria = append(req.GroupMembershipCriteria, groupMembershipCriteria{
++				MembershipType: IPAddressMembership,
++				IPAddress: &ipAddressMembershipCriteria{
++					IPAddresses: cr.IPAddresses,
++				},
++			})
++		}
++	}
++	return req
++}
++
++// ---------------------------------------------------------------------------
++// operations
++// ---------------------------------------------------------------------------
++
++// basePath is the specification's servers[0].url.
++const basePath = "/api/ni"
++
++func (c *Client) addApplication(ctx context.Context, name string) (*baseEntity, *apiError, error) {
++	var out baseEntity
++	apiErr, err := c.do(ctx, http.MethodPost, basePath+"/groups/applications",
++		applicationRequest{Name: name}, http.StatusCreated, &out)
++	if err != nil || apiErr != nil {
++		return nil, apiErr, err
++	}
++	return &out, nil, nil
++}
++
++func (c *Client) addTier(ctx context.Context, appID string, t TierPlan) (*baseEntity, *apiError, error) {
++	var out baseEntity
++	apiErr, err := c.do(ctx, http.MethodPost, basePath+"/groups/applications/"+appID+"/tiers",
++		tierRequestFor(t), http.StatusCreated, &out)
++	if err != nil || apiErr != nil {
++		return nil, apiErr, err
++	}
++	return &out, nil, nil
++}
++
++func (c *Client) listApplicationTiers(ctx context.Context, appID string) ([]baseEntity, error) {
++	var out tierListResponse
++	apiErr, err := c.do(ctx, http.MethodGet, basePath+"/groups/applications/"+appID+"/tiers",
++		nil, http.StatusOK, &out)
++	if err != nil {
++		return nil, err
++	}
++	if apiErr != nil {
++		return nil, apiErr
++	}
++	return out.Results, nil
++}
++
++// ---------------------------------------------------------------------------
++// transport
++// ---------------------------------------------------------------------------
++
++// apiError is the specification's ApiError payload plus the HTTP status that
++// carried it.
++type apiError struct {
++	Code    int    `json:"code"`
++	Message string `json:"message"`
++
++	status int
++}
++
++func (e *apiError) Error() string {
++	if e.Message != "" {
++		return fmt.Sprintf("HTTP %d: %s", e.status, e.Message)
++	}
++	return fmt.Sprintf("HTTP %d", e.status)
++}
++
++// do performs one contract operation. It returns a non-nil *apiError when the
++// server answered with something other than wantStatus, and a non-nil error
++// only when no usable response was obtained.
++func (c *Client) do(ctx context.Context, method, path string, body any, wantStatus int, out any) (*apiError, error) {
++	var rdr io.Reader
++	if body != nil {
++		buf, err := json.Marshal(body)
++		if err != nil {
++			return nil, fmt.Errorf("encode request: %w", err)
++		}
++		rdr = bytes.NewReader(buf)
++	}
++
++	req, err := http.NewRequestWithContext(ctx, method, strings.TrimSuffix(c.baseURL, "/")+path, rdr)
++	if err != nil {
++		return nil, fmt.Errorf("build request: %w", err)
++	}
++	// ApiKeyAuth: "API Key - NetworkInsight {token}" in the Authorization header.
++	req.Header.Set("Authorization", "NetworkInsight "+c.token)
++	req.Header.Set("Accept", "application/json")
++	if body != nil {
++		req.Header.Set("Content-Type", "application/json")
++	}
++
++	resp, err := c.httpc.Do(req)
++	if err != nil {
++		return nil, fmt.Errorf("%s %s: %w", method, path, err)
++	}
++	defer resp.Body.Close()
++
++	raw, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return nil, fmt.Errorf("%s %s: read response: %w", method, path, err)
++	}
++
++	if resp.StatusCode != wantStatus {
++		ae := &apiError{status: resp.StatusCode}
++		_ = json.Unmarshal(raw, ae) // a body-less or non-JSON error is still an error
++		return ae, nil
++	}
++
++	if out != nil {
++		if err := json.Unmarshal(raw, out); err != nil {
++			return nil, fmt.Errorf("%s %s: decode response: %w", method, path, err)
++		}
++	}
++	return nil, nil
+ }

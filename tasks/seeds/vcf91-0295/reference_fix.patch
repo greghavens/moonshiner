@@ -1,0 +1,352 @@
+diff --git a/netinsight/client.go b/netinsight/client.go
+index 9d8cfb7..ef0d95d 100644
+--- a/netinsight/client.go
++++ b/netinsight/client.go
+@@ -4,12 +4,24 @@
+ package netinsight
+ 
+ import (
++	"bytes"
+ 	"context"
+-	"errors"
++	"encoding/json"
++	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
++	"strings"
++	"sync"
+ 	"time"
+ )
+ 
++// basePath is the server base path the specification declares for this API.
++const basePath = "/api/ni"
++
++// authPrefix builds the Authorization header value, "NetworkInsight {token}".
++const authPrefix = "NetworkInsight "
++
+ // Domain selects the authentication domain for a credential. A zero Domain is
+ // not the same as no domain at all: callers signal "no domain" by leaving
+ // Credentials.Domain nil.
+@@ -72,7 +84,11 @@ type APIError struct {
+ }
+ 
+ func (e *APIError) Error() string {
+-	return "netinsight: " + e.Operation + ": unimplemented"
++	msg := e.Message
++	if msg == "" {
++		msg = http.StatusText(e.StatusCode)
++	}
++	return fmt.Sprintf("netinsight: %s: %s (HTTP %d)", e.Operation, msg, e.StatusCode)
+ }
+ 
+ // TaskFailedError is returned when a task reaches a terminal failure state.
+@@ -84,47 +100,299 @@ func (e *TaskFailedError) Error() string {
+ 	return "netinsight: task " + e.Progress.RequestID + " ended in " + e.Progress.Status
+ }
+ 
+-// errNotImplemented is returned by every stub below.
+-var errNotImplemented = errors.New("netinsight: not implemented")
++// terminalSuccess and terminalFailure are the task states after which polling
++// stops. Anything else means the task is still running.
++var (
++	terminalSuccess = map[string]bool{"FINISHED": true}
++	terminalFailure = map[string]bool{"FAILED": true, "CANCELLED": true}
++)
+ 
+ // Client talks to one VCF Operations for Networks appliance.
+ type Client struct {
+ 	baseURL string
+ 	http    *http.Client
+-	token   string
++
++	mu    sync.RWMutex
++	token string
+ }
+ 
+ // NewClient returns a client for the appliance root baseURL, for example
+ // "https://vcfon.example.com". The contract base path is appended by the
+ // client, so baseURL must not already carry it. A nil hc means http.DefaultClient.
+ func NewClient(baseURL string, hc *http.Client) (*Client, error) {
+-	return nil, errNotImplemented
++	trimmed := strings.TrimRight(strings.TrimSpace(baseURL), "/")
++	if trimmed == "" {
++		return nil, fmt.Errorf("netinsight: base URL is empty")
++	}
++	u, err := url.Parse(trimmed)
++	if err != nil {
++		return nil, fmt.Errorf("netinsight: parse base URL %q: %w", baseURL, err)
++	}
++	if u.Scheme != "http" && u.Scheme != "https" {
++		return nil, fmt.Errorf("netinsight: base URL %q needs an http or https scheme", baseURL)
++	}
++	if u.Host == "" {
++		return nil, fmt.Errorf("netinsight: base URL %q has no host", baseURL)
++	}
++	if strings.HasSuffix(u.Path, basePath) {
++		return nil, fmt.Errorf("netinsight: base URL %q already carries the API base path %s", baseURL, basePath)
++	}
++	if hc == nil {
++		hc = http.DefaultClient
++	}
++	return &Client{baseURL: trimmed + basePath, http: hc}, nil
++}
++
++// --- request bodies ---------------------------------------------------------
++//
++// Every optional field below is a pointer or carries omitempty so that leaving
++// it unset drops the key from the encoded body instead of sending a zero value.
++// enable_intent is the one that cannot be a plain bool: the specification
++// defaults it to true, so an explicit false has to survive encoding.
++
++type domainWire struct {
++	DomainType string `json:"domain_type,omitempty"`
++	Value      string `json:"value,omitempty"`
++}
++
++type credentialWire struct {
++	Username string      `json:"username"`
++	Password string      `json:"password"`
++	Domain   *domainWire `json:"domain,omitempty"`
++}
++
++type discoveredAppWire struct {
++	SourceEntityID string `json:"source_entity_id"`
+ }
+ 
++type saveWire struct {
++	DiscoveredApps []discoveredAppWire `json:"discovered_apps"`
++	DiscoveryType  string              `json:"discovery_type,omitempty"`
++	EnableIntent   *bool               `json:"enable_intent,omitempty"`
++}
++
++// --- response bodies --------------------------------------------------------
++//
++// The component schemas use snake_case throughout. Several inline examples in
++// the specification disagree (requestId, callbackAPI, entityId, responseCode,
++// errorMessage); the schemas are authoritative.
++
++type tokenWire struct {
++	Token  string `json:"token"`
++	Expiry int64  `json:"expiry"`
++}
++
++type saveResponseWire struct {
++	RequestID   string `json:"request_id"`
++	CallbackAPI string `json:"callback_API"`
++}
++
++type appProgressWire struct {
++	EntityID     string `json:"entity_id"`
++	Name         string `json:"name"`
++	ResponseCode string `json:"response_code"`
++	ErrorMessage string `json:"error_message"`
++}
++
++type progressWire struct {
++	RequestID       string            `json:"request_id"`
++	TaskName        string            `json:"task_name"`
++	Status          string            `json:"status"`
++	Progress        float64           `json:"progress"`
++	StartTime       int64             `json:"start_time"`
++	AppSaveResponse []appProgressWire `json:"app_save_response"`
++}
++
++type apiErrorWire struct {
++	Code    int    `json:"code"`
++	Message string `json:"message"`
++}
++
++// --- operations -------------------------------------------------------------
++
+ // CreateToken authenticates and stores the issued token on the client for use
+ // by every subsequent authenticated call.
+ func (c *Client) CreateToken(ctx context.Context, cred Credentials) (Token, error) {
+-	return Token{}, errNotImplemented
++	body := credentialWire{Username: cred.Username, Password: cred.Password}
++	if cred.Domain != nil {
++		body.Domain = &domainWire{DomainType: cred.Domain.Type, Value: cred.Domain.Value}
++	}
++
++	var out tokenWire
++	// The specification gives this operation an empty security list, so it is
++	// sent without an Authorization header.
++	if err := c.do(ctx, "create", http.MethodPost, "/auth/token", body, false, &out); err != nil {
++		return Token{}, err
++	}
++
++	c.mu.Lock()
++	c.token = out.Token
++	c.mu.Unlock()
++
++	return Token{Value: out.Token, Expiry: out.Expiry}, nil
+ }
+ 
+ // DeleteToken deletes the token currently held by the client and forgets it.
+ func (c *Client) DeleteToken(ctx context.Context) error {
+-	return errNotImplemented
++	if err := c.do(ctx, "delete", http.MethodDelete, "/auth/token", nil, true, nil); err != nil {
++		return err
++	}
++	c.mu.Lock()
++	c.token = ""
++	c.mu.Unlock()
++	return nil
+ }
+ 
+ // SaveDiscoveredApplications submits the batch and returns the request id of
+ // the task the appliance created. The batch is not saved when this returns.
+ func (c *Client) SaveDiscoveredApplications(ctx context.Context, req SaveRequest) (string, error) {
+-	return "", errNotImplemented
++	apps := make([]discoveredAppWire, 0, len(req.SourceEntityIDs))
++	for _, id := range req.SourceEntityIDs {
++		apps = append(apps, discoveredAppWire{SourceEntityID: id})
++	}
++	body := saveWire{
++		DiscoveredApps: apps,
++		DiscoveryType:  req.DiscoveryType,
++		EnableIntent:   req.EnableIntent,
++	}
++
++	var out saveResponseWire
++	if err := c.do(ctx, "saveDiscoveredApplications", http.MethodPost, "/groups/discovered-applications/save", body, true, &out); err != nil {
++		return "", err
++	}
++	if out.RequestID == "" {
++		return "", fmt.Errorf("netinsight: saveDiscoveredApplications: appliance returned no request_id")
++	}
++	return out.RequestID, nil
+ }
+ 
+ // GetTaskProgress fetches one progress report for a request id.
+ func (c *Client) GetTaskProgress(ctx context.Context, requestID string) (TaskProgress, error) {
+-	return TaskProgress{}, errNotImplemented
++	if requestID == "" {
++		return TaskProgress{}, fmt.Errorf("netinsight: getBulkApplicationTaskProgress: request id is empty")
++	}
++	var out progressWire
++	path := "/groups/task/progress/" + url.PathEscape(requestID)
++	if err := c.do(ctx, "getBulkApplicationTaskProgress", http.MethodGet, path, nil, true, &out); err != nil {
++		return TaskProgress{}, err
++	}
++
++	p := TaskProgress{
++		RequestID: out.RequestID,
++		TaskName:  out.TaskName,
++		Status:    out.Status,
++		Progress:  out.Progress,
++		StartTime: out.StartTime,
++	}
++	for _, a := range out.AppSaveResponse {
++		p.AppResults = append(p.AppResults, AppSaveResult{
++			EntityID:     a.EntityID,
++			Name:         a.Name,
++			ResponseCode: a.ResponseCode,
++			ErrorMessage: a.ErrorMessage,
++		})
++	}
++	return p, nil
+ }
+ 
+ // SaveAndWait submits the batch and polls its task until the task reaches a
+ // terminal state, returning the terminal report.
++//
++// The 200 on the submission only acknowledges that a task was created, so the
++// outcome of the batch is whatever the terminal progress report says.
+ func (c *Client) SaveAndWait(ctx context.Context, req SaveRequest, pollInterval time.Duration) (TaskProgress, error) {
+-	return TaskProgress{}, errNotImplemented
++	if pollInterval <= 0 {
++		pollInterval = 5 * time.Second
++	}
++	requestID, err := c.SaveDiscoveredApplications(ctx, req)
++	if err != nil {
++		return TaskProgress{}, err
++	}
++
++	// Fires immediately for the first poll, then every pollInterval.
++	timer := time.NewTimer(0)
++	defer timer.Stop()
++
++	for {
++		select {
++		case <-ctx.Done():
++			return TaskProgress{}, fmt.Errorf("netinsight: waiting for task %s: %w", requestID, ctx.Err())
++		case <-timer.C:
++		}
++
++		progress, err := c.GetTaskProgress(ctx, requestID)
++		if err != nil {
++			return TaskProgress{}, err
++		}
++		switch status := strings.ToUpper(strings.TrimSpace(progress.Status)); {
++		case terminalSuccess[status]:
++			return progress, nil
++		case terminalFailure[status]:
++			return progress, &TaskFailedError{Progress: progress}
++		}
++
++		timer.Reset(pollInterval)
++	}
++}
++
++// --- transport --------------------------------------------------------------
++
++func (c *Client) do(ctx context.Context, operation, method, path string, body any, authenticated bool, out any) error {
++	var reader io.Reader
++	var encoded []byte
++	if body != nil {
++		var err error
++		encoded, err = json.Marshal(body)
++		if err != nil {
++			return fmt.Errorf("netinsight: %s: encode request: %w", operation, err)
++		}
++		reader = bytes.NewReader(encoded)
++	}
++
++	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
++	if err != nil {
++		return fmt.Errorf("netinsight: %s: build request: %w", operation, err)
++	}
++	req.Header.Set("Accept", "application/json")
++	if encoded != nil {
++		req.Header.Set("Content-Type", "application/json")
++	}
++	if authenticated {
++		c.mu.RLock()
++		token := c.token
++		c.mu.RUnlock()
++		req.Header.Set("Authorization", authPrefix+token)
++	}
++
++	resp, err := c.http.Do(req)
++	if err != nil {
++		return fmt.Errorf("netinsight: %s: %w", operation, err)
++	}
++	defer resp.Body.Close()
++
++	payload, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return fmt.Errorf("netinsight: %s: read response: %w", operation, err)
++	}
++
++	if resp.StatusCode < 200 || resp.StatusCode > 299 {
++		apiErr := &APIError{Operation: operation, StatusCode: resp.StatusCode}
++		var wire apiErrorWire
++		if json.Unmarshal(payload, &wire) == nil {
++			apiErr.Code = wire.Code
++			apiErr.Message = wire.Message
++		}
++		if apiErr.Message == "" {
++			apiErr.Message = strings.TrimSpace(string(payload))
++		}
++		return apiErr
++	}
++
++	if out == nil || len(bytes.TrimSpace(payload)) == 0 {
++		return nil
++	}
++	if err := json.Unmarshal(payload, out); err != nil {
++		return fmt.Errorf("netinsight: %s: decode response: %w", operation, err)
++	}
++	return nil
+ }

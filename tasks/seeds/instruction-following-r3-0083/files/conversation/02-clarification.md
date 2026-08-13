@@ -1,0 +1,1 @@
+One clarification: by “price,” I mean the catalog's regular price, not the promotional price. A finalist must also have a dishwasher-safe basket. For any tie in the primary ranking criterion, use lower noise as the tiebreaker. Keep the requested number of finalists, limits, table fields, and closing sections.

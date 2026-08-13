@@ -1,0 +1,3247 @@
+diff --git a/automation/client.go b/automation/client.go
+index 6c98732..538f8b1 100644
+--- a/automation/client.go
++++ b/automation/client.go
+@@ -2,12 +2,9 @@
+ // described by docs/contract.json.
+ //
+ // The service issues short-lived access tokens. A long run will outlive its
+-// token, so the client must notice the expiry, exchange its long-lived API
+-// token for a fresh access token, and carry on from where it was — without
++// token, so the client notices the expiry, exchanges its long-lived API token
++// for a fresh access token, and carries on from where it was — without
+ // dropping results it already has and without redoing work it already did.
+-//
+-// Every exported symbol in this file is part of the package's contract with
+-// its callers; the signatures are fixed. The bodies are yours to write.
+ package automation
+ 
+ import (
+@@ -15,14 +12,17 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
+ 
+ 	"vcfauto/contract"
+ )
+ 
+-// errNotImplemented is returned by the unimplemented stubs below.
+-var errNotImplemented = errors.New("automation: not implemented")
+-
+ // Config configures a Client.
+ type Config struct {
+ 	// BaseURL is the scheme and host of the VCF Automation appliance, with
+@@ -54,18 +54,58 @@ type Config struct {
+ // Client talks to one VCF Automation appliance.
+ //
+ // A Client is safe for concurrent use. When several goroutines discover at the
+-// same moment that the access token has expired, they must between them cause
+-// exactly one token exchange, not one each.
++// same moment that the access token has expired, they cause exactly one token
++// exchange between them, not one each — see refresh.
+ type Client struct {
+-	cfg Config
+-	// Add whatever state you need. Keep it race-free: the test suite runs
+-	// under -race with concurrent callers.
++	cfg  Config
++	http *http.Client
++
++	// mu guards token. It is also held across the token exchange itself,
++	// which is what collapses a burst of concurrent refreshes into one: the
++	// goroutines that queue behind the exchange find a token that is no
++	// longer the one they saw rejected, and take it instead of asking again.
++	mu    sync.Mutex
++	token string
+ }
+ 
+ // New validates cfg and returns a Client. It does not perform any I/O; the
+ // first access token is fetched lazily, when it is first needed.
+ func New(cfg Config) (*Client, error) {
+-	return nil, errNotImplemented
++	switch {
++	case strings.TrimSpace(cfg.BaseURL) == "":
++		return nil, errors.New("automation: BaseURL is required")
++	case strings.TrimSpace(cfg.Tenant) == "":
++		return nil, errors.New("automation: Tenant is required")
++	case strings.TrimSpace(cfg.APIToken) == "":
++		return nil, errors.New("automation: APIToken is required")
++	case cfg.Contract == nil:
++		return nil, errors.New("automation: Contract is required")
++	}
++	u, err := url.Parse(cfg.BaseURL)
++	if err != nil {
++		return nil, fmt.Errorf("automation: BaseURL: %w", err)
++	}
++	if u.Scheme == "" || u.Host == "" {
++		return nil, fmt.Errorf("automation: BaseURL %q must be absolute", cfg.BaseURL)
++	}
++	cfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/")
++
++	// Fail here rather than at the first call if the contract is missing
++	// something this package needs.
++	for _, id := range contract.RequiredOperations {
++		if _, err := cfg.Contract.Operation(id); err != nil {
++			return nil, fmt.Errorf("automation: %w", err)
++		}
++	}
++
++	httpClient := cfg.HTTPClient
++	if httpClient == nil {
++		httpClient = &http.Client{Timeout: 30 * time.Second}
++	}
++	if cfg.Concurrency <= 0 {
++		cfg.Concurrency = 4
++	}
++	return &Client{cfg: cfg, http: httpClient}, nil
+ }
+ 
+ // APIError is a non-2xx response from the service.
+@@ -178,24 +218,559 @@ type CatalogItemRequest struct {
+ 	Inputs           Opt[map[string]any]
+ }
+ 
++// --- wire names -------------------------------------------------------------
++
++// Wire names are checked against the contract before use rather than trusted
++// as literals, so that a contract that disagrees with this package is an error
++// here instead of a puzzling 400 from the service.
++
++const (
++	qPage     = "page"
++	qSize     = "size"
++	qSort     = "sort"
++	qSearch   = "search"
++	qName     = "name"
++	qProjects = "projects"
++	qStatus   = "status"
++	qExpand   = "expand"
++	qDeleted  = "deleted"
++	qTypes    = "types"
++
++	fGrantType        = "grant_type"
++	fRefreshToken     = "refresh_token"
++	fDeploymentName   = "deploymentName"
++	fProjectID        = "projectId"
++	fVersion          = "version"
++	fReason           = "reason"
++	fBulkRequestCount = "bulkRequestCount"
++	fInputs           = "inputs"
++)
++
++// params accumulates query parameters, dropping every option that was never
++// set. An option that *was* set is written even when its value is the zero
++// value, because "size=0" is a different request from saying nothing.
++type params struct {
++	op  *contract.Operation
++	val url.Values
++	err error
++}
++
++func newParams(op *contract.Operation) *params {
++	return &params{op: op, val: url.Values{}}
++}
++
++func (p *params) set(name, value string) {
++	if p.err != nil {
++		return
++	}
++	if _, ok := p.op.QueryField(name); !ok {
++		p.err = fmt.Errorf("operation %s: contract declares no query parameter %q", p.op.ID, name)
++		return
++	}
++	p.val.Set(name, value)
++}
++
++func (p *params) str(name string, o Opt[string]) {
++	if v, ok := o.Get(); ok {
++		p.set(name, v)
++	}
++}
++
++func (p *params) num(name string, o Opt[int]) {
++	if v, ok := o.Get(); ok {
++		p.set(name, strconv.Itoa(v))
++	}
++}
++
++func (p *params) flag(name string, o Opt[bool]) {
++	if v, ok := o.Get(); ok {
++		p.set(name, strconv.FormatBool(v))
++	}
++}
++
++// list writes a string slice as the comma-separated list the reference
++// describes. A slice that is empty but *set* is written as an empty value,
++// which is still distinct from omitting the parameter.
++func (p *params) list(name string, o Opt[[]string]) {
++	if v, ok := o.Get(); ok {
++		p.set(name, strings.Join(v, ","))
++	}
++}
++
++func (p *params) values() (url.Values, error) {
++	if p.err != nil {
++		return nil, p.err
++	}
++	return p.val, nil
++}
++
++// body accumulates JSON body fields, dropping every option that was never set.
++type body struct {
++	op  *contract.Operation
++	val map[string]any
++	err error
++}
++
++func newBody(op *contract.Operation) *body {
++	return &body{op: op, val: map[string]any{}}
++}
++
++func (b *body) set(name string, value any) {
++	if b.err != nil {
++		return
++	}
++	if _, ok := b.op.BodyField(name); !ok {
++		b.err = fmt.Errorf("operation %s: contract declares no body field %q", b.op.ID, name)
++		return
++	}
++	b.val[name] = value
++}
++
++func (b *body) str(name string, o Opt[string]) {
++	if v, ok := o.Get(); ok {
++		b.set(name, v)
++	}
++}
++
++func (b *body) num(name string, o Opt[int]) {
++	if v, ok := o.Get(); ok {
++		b.set(name, v)
++	}
++}
++
++func (b *body) object(name string, o Opt[map[string]any]) {
++	if v, ok := o.Get(); ok {
++		b.set(name, v)
++	}
++}
++
++// encode marshals the accumulated fields. A body with nothing set encodes as
++// {} — an empty object, not a set of keys holding empty values.
++func (b *body) encode() ([]byte, error) {
++	if b.err != nil {
++		return nil, b.err
++	}
++	return json.Marshal(b.val)
++}
++
++// --- token handling ---------------------------------------------------------
++
++// accessToken returns the current access token, obtaining one if the client
++// does not hold one yet.
++func (c *Client) accessToken(ctx context.Context) (string, error) {
++	c.mu.Lock()
++	tok := c.token
++	c.mu.Unlock()
++	if tok != "" {
++		return tok, nil
++	}
++	return c.refresh(ctx, "")
++}
++
++// refresh exchanges the API token for a new access token, unless another
++// goroutine has already replaced stale — in which case its result is reused.
++//
++// stale is the token the caller saw rejected, or "" when the caller simply has
++// no token yet. Comparing against it is what makes a burst of concurrent 401s
++// cost one exchange rather than one per goroutine.
++func (c *Client) refresh(ctx context.Context, stale string) (string, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.token != "" && c.token != stale {
++		return c.token, nil
++	}
++	tok, err := c.exchange(ctx)
++	if err != nil {
++		return "", err
++	}
++	c.token = tok
++	return tok, nil
++}
++
++// tokenResponse is the documented shape of the token operation's reply.
++type tokenResponse struct {
++	AccessToken string `json:"access_token"`
++	TokenType   string `json:"token_type"`
++	ExpiresIn   int    `json:"expires_in"`
++}
++
++// exchange performs the token operation. It is called with c.mu held.
++func (c *Client) exchange(ctx context.Context) (string, error) {
++	op, err := c.cfg.Contract.Operation(contract.OpAuthToken)
++	if err != nil {
++		return "", err
++	}
++	if op.RequestBody == nil {
++		return "", fmt.Errorf("automation: operation %s declares no request body", op.ID)
++	}
++	for _, name := range []string{fGrantType, fRefreshToken} {
++		if _, ok := op.BodyField(name); !ok {
++			return "", fmt.Errorf("automation: operation %s declares no body field %q", op.ID, name)
++		}
++	}
++
++	path, err := expandSingle(op, c.cfg.Tenant)
++	if err != nil {
++		return "", err
++	}
++
++	grant := "refresh_token"
++	if f, ok := op.BodyField(fGrantType); ok && f.Default != "" {
++		grant = f.Default
++	}
++	form := url.Values{}
++	form.Set(fGrantType, grant)
++	form.Set(fRefreshToken, c.cfg.APIToken)
++
++	req, err := http.NewRequestWithContext(ctx, op.Method, c.cfg.BaseURL+path,
++		strings.NewReader(form.Encode()))
++	if err != nil {
++		return "", err
++	}
++	req.Header.Set("Content-Type", op.RequestBody.ContentType)
++	req.Header.Set("Accept", op.Response.ContentType)
++
++	resp, err := c.http.Do(req)
++	if err != nil {
++		return "", fmt.Errorf("automation: %s: %w", op.ID, err)
++	}
++	defer resp.Body.Close()
++	raw, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return "", fmt.Errorf("automation: %s: %w", op.ID, err)
++	}
++	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
++		return "", &APIError{Operation: op.ID, Method: op.Method, Path: path,
++			StatusCode: resp.StatusCode, Body: string(raw)}
++	}
++	var tr tokenResponse
++	if err := json.Unmarshal(raw, &tr); err != nil {
++		return "", fmt.Errorf("automation: %s: decode: %w", op.ID, err)
++	}
++	if tr.AccessToken == "" {
++		return "", fmt.Errorf("automation: %s: response carried no access token", op.ID)
++	}
++	return tr.AccessToken, nil
++}
++
++// expandSingle fills the one path parameter of a single-parameter operation.
++func expandSingle(op *contract.Operation, value string) (string, error) {
++	names, err := contract.PathParamNames(op.Path)
++	if err != nil {
++		return "", err
++	}
++	if len(names) != 1 {
++		return "", fmt.Errorf("automation: operation %s takes %d path parameters, want 1", op.ID, len(names))
++	}
++	return op.ExpandPath(map[string]string{names[0]: value})
++}
++
++// --- request plumbing -------------------------------------------------------
++
++type request struct {
++	op         *contract.Operation
++	pathParams map[string]string
++	query      url.Values
++	body       []byte
++}
++
++// maxAuthAttempts bounds how many times one request will refresh and try
++// again. More than one is necessary, not belt-and-braces: under concurrency a
++// token obtained by refreshing can be spent by other goroutines in the moment
++// between obtaining it and using it, so a request can legitimately meet a
++// second expiry on its first retry. The bound stops a genuinely unusable
++// credential from looping forever.
++const maxAuthAttempts = 4
++
++// do sends req with the current access token. If the service rejects the token,
++// it refreshes and sends the same request again; the caller neither sees the
++// rejection nor has to rebuild anything.
++func (c *Client) do(ctx context.Context, req request) ([]byte, error) {
++	tok, err := c.accessToken(ctx)
++	if err != nil {
++		return nil, err
++	}
++	for attempt := 1; ; attempt++ {
++		raw, status, err := c.send(ctx, req, tok)
++		if err != nil {
++			return nil, err
++		}
++		if status == http.StatusUnauthorized && attempt < maxAuthAttempts {
++			// Hand refresh the token that was just rejected, so that
++			// a goroutine which has already replaced it can be
++			// deferred to rather than duplicated.
++			tok, err = c.refresh(ctx, tok)
++			if err != nil {
++				return nil, err
++			}
++			continue
++		}
++		if status < 200 || status >= 300 {
++			path, _ := req.op.ExpandPath(req.pathParams)
++			return nil, &APIError{Operation: req.op.ID, Method: req.op.Method, Path: path,
++				StatusCode: status, Body: string(raw)}
++		}
++		return raw, nil
++	}
++}
++
++func (c *Client) send(ctx context.Context, req request, token string) ([]byte, int, error) {
++	path, err := req.op.ExpandPath(req.pathParams)
++	if err != nil {
++		return nil, 0, err
++	}
++	u := c.cfg.BaseURL + path
++	if len(req.query) > 0 {
++		u += "?" + req.query.Encode()
++	}
++
++	var rdr io.Reader
++	if req.body != nil {
++		rdr = strings.NewReader(string(req.body))
++	}
++	hr, err := http.NewRequestWithContext(ctx, req.op.Method, u, rdr)
++	if err != nil {
++		return nil, 0, err
++	}
++	hr.Header.Set("Authorization", "Bearer "+token)
++	hr.Header.Set("Accept", req.op.Response.ContentType)
++	if req.body != nil && req.op.RequestBody != nil {
++		hr.Header.Set("Content-Type", req.op.RequestBody.ContentType)
++	}
++
++	resp, err := c.http.Do(hr)
++	if err != nil {
++		return nil, 0, fmt.Errorf("automation: %s: %w", req.op.ID, err)
++	}
++	defer resp.Body.Close()
++	raw, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return nil, 0, fmt.Errorf("automation: %s: %w", req.op.ID, err)
++	}
++	return raw, resp.StatusCode, nil
++}
++
++// --- decoding ---------------------------------------------------------------
++
++type pageEnvelope struct {
++	Content          []json.RawMessage `json:"content"`
++	Number           int               `json:"number"`
++	Size             int               `json:"size"`
++	NumberOfElements int               `json:"numberOfElements"`
++	TotalElements    int               `json:"totalElements"`
++	TotalPages       int               `json:"totalPages"`
++	First            bool              `json:"first"`
++	Last             bool              `json:"last"`
++	Empty            bool              `json:"empty"`
++}
++
++type deploymentJSON struct {
++	ID        string `json:"id"`
++	Name      string `json:"name"`
++	Status    string `json:"status"`
++	ProjectID string `json:"projectId"`
++	CreatedAt string `json:"createdAt"`
++}
++
++func decodeDeployment(raw json.RawMessage) (Deployment, error) {
++	var d deploymentJSON
++	if err := json.Unmarshal(raw, &d); err != nil {
++		return Deployment{}, err
++	}
++	return Deployment{
++		ID: d.ID, Name: d.Name, Status: d.Status,
++		ProjectID: d.ProjectID, CreatedAt: d.CreatedAt,
++		Raw: append(json.RawMessage(nil), raw...),
++	}, nil
++}
++
++type catalogItemJSON struct {
++	ID          string `json:"id"`
++	Name        string `json:"name"`
++	Description string `json:"description"`
++}
++
++// --- operations -------------------------------------------------------------
++
+ // ListDeployments fetches one page of deployments.
+ func (c *Client) ListDeployments(ctx context.Context, opts ListDeploymentsOptions) (*DeploymentPage, error) {
+-	return nil, errNotImplemented
++	op, err := c.cfg.Contract.Operation(contract.OpDeploymentsList)
++	if err != nil {
++		return nil, err
++	}
++	p := newParams(op)
++	p.num(qPage, opts.Page)
++	p.num(qSize, opts.Size)
++	p.str(qSort, opts.Sort)
++	p.str(qSearch, opts.Search)
++	p.str(qName, opts.Name)
++	p.list(qProjects, opts.Projects)
++	p.list(qStatus, opts.Status)
++	p.list(qExpand, opts.Expand)
++	p.flag(qDeleted, opts.Deleted)
++	q, err := p.values()
++	if err != nil {
++		return nil, err
++	}
++
++	raw, err := c.do(ctx, request{op: op, query: q})
++	if err != nil {
++		return nil, err
++	}
++	var env pageEnvelope
++	if err := json.Unmarshal(raw, &env); err != nil {
++		return nil, fmt.Errorf("automation: %s: decode: %w", op.ID, err)
++	}
++	page := &DeploymentPage{
++		Number: env.Number, Size: env.Size, NumberOfElements: env.NumberOfElements,
++		TotalElements: env.TotalElements, TotalPages: env.TotalPages,
++		First: env.First, Last: env.Last, Empty: env.Empty,
++	}
++	for _, item := range env.Content {
++		d, err := decodeDeployment(item)
++		if err != nil {
++			return nil, fmt.Errorf("automation: %s: decode: %w", op.ID, err)
++		}
++		page.Content = append(page.Content, d)
++	}
++	return page, nil
+ }
+ 
+ // GetDeployment fetches one deployment by ID.
+ func (c *Client) GetDeployment(ctx context.Context, deploymentID string, opts GetDeploymentOptions) (*Deployment, error) {
+-	return nil, errNotImplemented
++	op, err := c.cfg.Contract.Operation(contract.OpDeploymentsGet)
++	if err != nil {
++		return nil, err
++	}
++	if strings.TrimSpace(deploymentID) == "" {
++		return nil, errors.New("automation: deployment ID is required")
++	}
++	names, err := contract.PathParamNames(op.Path)
++	if err != nil {
++		return nil, err
++	}
++	if len(names) != 1 {
++		return nil, fmt.Errorf("automation: operation %s takes %d path parameters, want 1", op.ID, len(names))
++	}
++
++	p := newParams(op)
++	p.list(qExpand, opts.Expand)
++	p.flag(qDeleted, opts.Deleted)
++	q, err := p.values()
++	if err != nil {
++		return nil, err
++	}
++
++	raw, err := c.do(ctx, request{
++		op:         op,
++		pathParams: map[string]string{names[0]: deploymentID},
++		query:      q,
++	})
++	if err != nil {
++		return nil, err
++	}
++	d, err := decodeDeployment(raw)
++	if err != nil {
++		return nil, fmt.Errorf("automation: %s: decode: %w", op.ID, err)
++	}
++	return &d, nil
+ }
+ 
+ // ListCatalogItems fetches one page of catalog items.
+ func (c *Client) ListCatalogItems(ctx context.Context, opts ListCatalogItemsOptions) (*CatalogItemPage, error) {
+-	return nil, errNotImplemented
++	op, err := c.cfg.Contract.Operation(contract.OpCatalogItemsList)
++	if err != nil {
++		return nil, err
++	}
++	p := newParams(op)
++	p.num(qPage, opts.Page)
++	p.num(qSize, opts.Size)
++	p.str(qSearch, opts.Search)
++	p.list(qProjects, opts.Projects)
++	p.list(qTypes, opts.Types)
++	q, err := p.values()
++	if err != nil {
++		return nil, err
++	}
++
++	raw, err := c.do(ctx, request{op: op, query: q})
++	if err != nil {
++		return nil, err
++	}
++	var env pageEnvelope
++	if err := json.Unmarshal(raw, &env); err != nil {
++		return nil, fmt.Errorf("automation: %s: decode: %w", op.ID, err)
++	}
++	page := &CatalogItemPage{
++		Number: env.Number, Size: env.Size, NumberOfElements: env.NumberOfElements,
++		TotalElements: env.TotalElements, TotalPages: env.TotalPages,
++		First: env.First, Last: env.Last, Empty: env.Empty,
++	}
++	for _, item := range env.Content {
++		var ci catalogItemJSON
++		if err := json.Unmarshal(item, &ci); err != nil {
++			return nil, fmt.Errorf("automation: %s: decode: %w", op.ID, err)
++		}
++		page.Content = append(page.Content, CatalogItem{
++			ID: ci.ID, Name: ci.Name, Description: ci.Description,
++			Raw: append(json.RawMessage(nil), item...),
++		})
++	}
++	return page, nil
+ }
+ 
+ // RequestCatalogItem requests a new deployment from a catalog item.
+ func (c *Client) RequestCatalogItem(ctx context.Context, catalogItemID string, req CatalogItemRequest) ([]CatalogItemRequestResult, error) {
+-	return nil, errNotImplemented
++	op, err := c.cfg.Contract.Operation(contract.OpCatalogItemsRequest)
++	if err != nil {
++		return nil, err
++	}
++	if strings.TrimSpace(catalogItemID) == "" {
++		return nil, errors.New("automation: catalog item ID is required")
++	}
++	names, err := contract.PathParamNames(op.Path)
++	if err != nil {
++		return nil, err
++	}
++	if len(names) != 1 {
++		return nil, fmt.Errorf("automation: operation %s takes %d path parameters, want 1", op.ID, len(names))
++	}
++
++	b := newBody(op)
++	b.str(fDeploymentName, req.DeploymentName)
++	b.str(fProjectID, req.ProjectID)
++	b.str(fVersion, req.Version)
++	b.str(fReason, req.Reason)
++	b.num(fBulkRequestCount, req.BulkRequestCount)
++	b.object(fInputs, req.Inputs)
++	payload, err := b.encode()
++	if err != nil {
++		return nil, err
++	}
++
++	raw, err := c.do(ctx, request{
++		op:         op,
++		pathParams: map[string]string{names[0]: catalogItemID},
++		body:       payload,
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	var results []struct {
++		DeploymentID   string `json:"deploymentId"`
++		DeploymentName string `json:"deploymentName"`
++	}
++	if err := json.Unmarshal(raw, &results); err != nil {
++		return nil, fmt.Errorf("automation: %s: decode: %w", op.ID, err)
++	}
++	out := make([]CatalogItemRequestResult, 0, len(results))
++	for _, r := range results {
++		out = append(out, CatalogItemRequestResult{
++			DeploymentID: r.DeploymentID, DeploymentName: r.DeploymentName,
++		})
++	}
++	return out, nil
+ }
+ 
+ // CollectDeployments walks every page of deployments and returns them in page
+@@ -203,11 +778,40 @@ func (c *Client) RequestCatalogItem(ctx context.Context, catalogItemID string, r
+ //
+ // opts supplies the starting page and page size; the walk continues until the
+ // service reports the last page. If the access token expires part way through
+-// the walk, the walk must resume at the page it was on: a page that has
+-// already been read successfully must not be read a second time, and the
+-// deployments already collected must not be discarded.
++// the walk, the walk resumes at the page it was on: a page already read is not
++// read again, and the deployments already collected are not discarded.
+ func (c *Client) CollectDeployments(ctx context.Context, opts ListDeploymentsOptions) ([]Deployment, error) {
+-	return nil, errNotImplemented
++	page := 0
++	if v, ok := opts.Page.Get(); ok {
++		page = v
++	}
++
++	var out []Deployment
++	for {
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
++		cur := opts
++		cur.Page = Set(page)
++
++		// A token expiry inside ListDeployments is handled there, by
++		// refreshing and re-sending this same page. It never surfaces
++		// here, so the pages already appended to out stay put and the
++		// walk does not restart.
++		p, err := c.ListDeployments(ctx, cur)
++		if err != nil {
++			return nil, err
++		}
++		out = append(out, p.Content...)
++
++		if p.Last || len(p.Content) == 0 {
++			return out, nil
++		}
++		if p.TotalPages > 0 && page >= p.TotalPages-1 {
++			return out, nil
++		}
++		page++
++	}
+ }
+ 
+ // CollectDeploymentDetails fetches each of the given deployments by ID, with
+@@ -215,8 +819,48 @@ func (c *Client) CollectDeployments(ctx context.Context, opts ListDeploymentsOpt
+ // order as ids.
+ //
+ // If the access token expires while these requests are in flight, every one of
+-// them must still succeed, and the concurrent callers must between them cause
+-// exactly one token exchange.
++// them still succeeds, and the concurrent callers cause exactly one token
++// exchange between them.
+ func (c *Client) CollectDeploymentDetails(ctx context.Context, ids []string, opts GetDeploymentOptions) ([]Deployment, error) {
+-	return nil, errNotImplemented
++	if len(ids) == 0 {
++		return nil, nil
++	}
++
++	out := make([]Deployment, len(ids))
++	errs := make([]error, len(ids))
++
++	ctx, cancel := context.WithCancel(ctx)
++	defer cancel()
++
++	sem := make(chan struct{}, c.cfg.Concurrency)
++	var wg sync.WaitGroup
++	for i, id := range ids {
++		wg.Add(1)
++		go func(i int, id string) {
++			defer wg.Done()
++			select {
++			case sem <- struct{}{}:
++			case <-ctx.Done():
++				errs[i] = ctx.Err()
++				return
++			}
++			defer func() { <-sem }()
++
++			d, err := c.GetDeployment(ctx, id, opts)
++			if err != nil {
++				errs[i] = err
++				cancel()
++				return
++			}
++			// Each goroutine owns its own index, so the slice needs
++			// no lock.
++			out[i] = *d
++		}(i, id)
++	}
++	wg.Wait()
++
++	if err := errors.Join(errs...); err != nil {
++		return nil, err
++	}
++	return out, nil
+ }
+diff --git a/automation/client_test.go b/automation/client_test.go
+new file mode 100644
+index 0000000..173788c
+--- /dev/null
++++ b/automation/client_test.go
+@@ -0,0 +1,426 @@
++package automation_test
++
++import (
++	"context"
++	"net/url"
++	"strings"
++	"sync"
++	"testing"
++
++	"vcfauto/automation"
++	"vcfauto/contract"
++	"vcfauto/mock"
++	"vcfauto/wire"
++)
++
++const (
++	testTenant   = "acme-org"
++	testAPIToken = "vcfa-api-token-fixture-0123456789"
++)
++
++func setup(t *testing.T, expireAfter int) (*automation.Client, *mock.Server, *contract.Contract) {
++	t.Helper()
++	c, err := contract.Load("../docs/contract.json")
++	if err != nil {
++		t.Fatalf("load contract: %v", err)
++	}
++	srv, err := mock.Start(mock.Options{
++		Contract:               c,
++		Tenant:                 testTenant,
++		APIToken:               testAPIToken,
++		Deployments:            mock.Deployments(12),
++		CatalogItems:           mock.CatalogItems(5),
++		ExpireAccessTokenAfter: expireAfter,
++	})
++	if err != nil {
++		t.Fatalf("start mock: %v", err)
++	}
++	t.Cleanup(srv.Close)
++
++	cl, err := automation.New(automation.Config{
++		BaseURL: srv.URL(), Tenant: testTenant, APIToken: testAPIToken,
++		Contract: c, Concurrency: 4,
++	})
++	if err != nil {
++		t.Fatalf("new client: %v", err)
++	}
++	return cl, srv, c
++}
++
++func TestNewRejectsIncompleteConfig(t *testing.T) {
++	c, err := contract.Load("../docs/contract.json")
++	if err != nil {
++		t.Fatalf("load contract: %v", err)
++	}
++	full := automation.Config{
++		BaseURL: "https://automation.example.com", Tenant: testTenant,
++		APIToken: testAPIToken, Contract: c,
++	}
++
++	tests := []struct {
++		name    string
++		mutate  func(automation.Config) automation.Config
++		wantErr bool
++	}{
++		{name: "complete", mutate: func(c automation.Config) automation.Config { return c }},
++		{name: "no base URL", wantErr: true,
++			mutate: func(c automation.Config) automation.Config { c.BaseURL = ""; return c }},
++		{name: "relative base URL", wantErr: true,
++			mutate: func(c automation.Config) automation.Config { c.BaseURL = "/api"; return c }},
++		{name: "no tenant", wantErr: true,
++			mutate: func(c automation.Config) automation.Config { c.Tenant = ""; return c }},
++		{name: "no API token", wantErr: true,
++			mutate: func(c automation.Config) automation.Config { c.APIToken = ""; return c }},
++		{name: "no contract", wantErr: true,
++			mutate: func(c automation.Config) automation.Config { c.Contract = nil; return c }},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			_, err := automation.New(tc.mutate(full))
++			if tc.wantErr != (err != nil) {
++				t.Fatalf("New() error = %v, wantErr %v", err, tc.wantErr)
++			}
++		})
++	}
++}
++
++// TestListDeploymentsQueryShape checks that options reach the wire as the
++// reference describes them, and that unset options do not reach it at all.
++func TestListDeploymentsQueryShape(t *testing.T) {
++	tests := []struct {
++		name string
++		opts automation.ListDeploymentsOptions
++		want url.Values
++	}{
++		{
++			name: "nothing set sends nothing",
++			opts: automation.ListDeploymentsOptions{},
++			want: nil,
++		},
++		{
++			name: "page and size",
++			opts: automation.ListDeploymentsOptions{
++				Page: automation.Set(2), Size: automation.Set(5)},
++			want: url.Values{"page": {"2"}, "size": {"5"}},
++		},
++		{
++			name: "a zero that was set is still sent",
++			opts: automation.ListDeploymentsOptions{Page: automation.Set(0)},
++			want: url.Values{"page": {"0"}},
++		},
++		{
++			name: "an empty string that was set is still sent",
++			opts: automation.ListDeploymentsOptions{Search: automation.Set("")},
++			want: url.Values{"search": {""}},
++		},
++		{
++			name: "a false that was set is still sent",
++			opts: automation.ListDeploymentsOptions{Deleted: automation.Set(false)},
++			want: url.Values{"deleted": {"false"}},
++		},
++		{
++			name: "slices become comma-separated lists",
++			opts: automation.ListDeploymentsOptions{
++				Projects: automation.Set([]string{"proj-0", "proj-1"}),
++				Expand:   automation.Set([]string{"resources"}),
++			},
++			want: url.Values{"projects": {"proj-0,proj-1"}, "expand": {"resources"}},
++		},
++		{
++			name: "everything at once",
++			opts: automation.ListDeploymentsOptions{
++				Page: automation.Set(1), Size: automation.Set(3),
++				Sort: automation.Set("createdAt,DESC"), Search: automation.Set("web"),
++				Name: automation.Set("deployment-01"), Deleted: automation.Set(true),
++				Status: automation.Set([]string{"CREATE_SUCCESSFUL"}),
++			},
++			want: url.Values{
++				"page": {"1"}, "size": {"3"}, "sort": {"createdAt,DESC"},
++				"search": {"web"}, "name": {"deployment-01"}, "deleted": {"true"},
++				"status": {"CREATE_SUCCESSFUL"},
++			},
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			cl, srv, c := setup(t, 0)
++			if _, err := cl.ListDeployments(context.Background(), tc.opts); err != nil {
++				t.Fatalf("ListDeployments: %v", err)
++			}
++			got := srv.RequestsFor(contract.OpDeploymentsList)
++			if len(got) != 1 {
++				t.Fatalf("recorded %d list requests, want 1", len(got))
++			}
++			if err := wire.Check(got[0], wire.Expectation{
++				Operation: contract.OpDeploymentsList,
++				Method:    "GET",
++				Path:      c.MustOperation(contract.OpDeploymentsList).Path,
++				Query:     tc.want,
++				NoBody:    true,
++				Status:    200,
++			}); err != nil {
++				t.Error(err)
++			}
++		})
++	}
++}
++
++// TestCatalogRequestBodyShape checks the JSON body, where the reference marks
++// every field optional and so an unset field must simply not be there.
++func TestCatalogRequestBodyShape(t *testing.T) {
++	tests := []struct {
++		name string
++		req  automation.CatalogItemRequest
++		want string
++	}{
++		{
++			name: "nothing set is a bare object",
++			req:  automation.CatalogItemRequest{},
++			want: `{}`,
++		},
++		{
++			name: "one field",
++			req:  automation.CatalogItemRequest{DeploymentName: automation.Set("web")},
++			want: `{"deploymentName":"web"}`,
++		},
++		{
++			name: "a zero that was set is still sent",
++			req:  automation.CatalogItemRequest{BulkRequestCount: automation.Set(0)},
++			want: `{"bulkRequestCount":0}`,
++		},
++		{
++			name: "an empty string that was set is still sent",
++			req:  automation.CatalogItemRequest{Reason: automation.Set("")},
++			want: `{"reason":""}`,
++		},
++		{
++			name: "nested inputs",
++			req: automation.CatalogItemRequest{
++				ProjectID: automation.Set("proj-0"),
++				Inputs:    automation.Set(map[string]any{"cpu": float64(2)}),
++			},
++			want: `{"projectId":"proj-0","inputs":{"cpu":2}}`,
++		},
++		{
++			name: "everything at once",
++			req: automation.CatalogItemRequest{
++				DeploymentName: automation.Set("web"), ProjectID: automation.Set("proj-0"),
++				Version: automation.Set("v2.0"), Reason: automation.Set("because"),
++				BulkRequestCount: automation.Set(2),
++			},
++			want: `{"deploymentName":"web","projectId":"proj-0","version":"v2.0",` +
++				`"reason":"because","bulkRequestCount":2}`,
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			cl, srv, _ := setup(t, 0)
++			if _, err := cl.RequestCatalogItem(context.Background(), mock.CatalogItemID(0), tc.req); err != nil {
++				t.Fatalf("RequestCatalogItem: %v", err)
++			}
++			got := srv.RequestsFor(contract.OpCatalogItemsRequest)
++			if len(got) != 1 {
++				t.Fatalf("recorded %d requests, want 1", len(got))
++			}
++			if err := wire.Check(got[0], wire.Expectation{
++				Operation: contract.OpCatalogItemsRequest,
++				Method:    "POST",
++				JSONBody:  tc.want,
++				Status:    200,
++			}); err != nil {
++				t.Error(err)
++			}
++		})
++	}
++}
++
++func TestTokenExchangeWireShape(t *testing.T) {
++	cl, srv, _ := setup(t, 0)
++	if _, err := cl.ListDeployments(context.Background(), automation.ListDeploymentsOptions{}); err != nil {
++		t.Fatalf("ListDeployments: %v", err)
++	}
++	got := srv.RequestsFor(contract.OpAuthToken)
++	if len(got) != 1 {
++		t.Fatalf("recorded %d token exchanges, want 1", len(got))
++	}
++	if err := wire.Check(got[0], wire.Expectation{
++		Operation:     contract.OpAuthToken,
++		Method:        "POST",
++		AbsentHeaders: []string{"Authorization"},
++		FormBody: url.Values{
++			"grant_type":    {"refresh_token"},
++			"refresh_token": {testAPIToken},
++		},
++		Status: 200,
++	}); err != nil {
++		t.Error(err)
++	}
++	if ct := got[0].Header.Get("Content-Type"); !strings.HasPrefix(ct, contract.ContentTypeForm) {
++		t.Errorf("Content-Type = %q, want %q", ct, contract.ContentTypeForm)
++	}
++}
++
++func TestTokenIsFetchedOnceAndReused(t *testing.T) {
++	cl, srv, _ := setup(t, 0)
++	ctx := context.Background()
++	for i := 0; i < 3; i++ {
++		if _, err := cl.ListDeployments(ctx, automation.ListDeploymentsOptions{}); err != nil {
++			t.Fatalf("ListDeployments: %v", err)
++		}
++	}
++	if n := len(srv.RequestsFor(contract.OpAuthToken)); n != 1 {
++		t.Errorf("token exchanges = %d, want 1: a token that still works must be reused", n)
++	}
++}
++
++func TestExpiryHandling(t *testing.T) {
++	tests := []struct {
++		name          string
++		expireAfter   int
++		calls         int
++		wantExchanges int
++	}{
++		{name: "no expiry", expireAfter: 0, calls: 4, wantExchanges: 1},
++		{name: "expires every other call", expireAfter: 2, calls: 4, wantExchanges: 2},
++		{name: "expires every call", expireAfter: 1, calls: 4, wantExchanges: 4},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			cl, srv, _ := setup(t, tc.expireAfter)
++			ctx := context.Background()
++			for i := 0; i < tc.calls; i++ {
++				if _, err := cl.ListDeployments(ctx, automation.ListDeploymentsOptions{}); err != nil {
++					t.Fatalf("call %d: %v", i, err)
++				}
++			}
++			if n := len(srv.RequestsFor(contract.OpAuthToken)); n != tc.wantExchanges {
++				t.Errorf("token exchanges = %d, want %d", n, tc.wantExchanges)
++			}
++		})
++	}
++}
++
++func TestCollectDeployments(t *testing.T) {
++	tests := []struct {
++		name        string
++		expireAfter int
++		size        int
++	}{
++		{name: "no expiry", expireAfter: 0, size: 4},
++		{name: "expiry mid-walk", expireAfter: 2, size: 4},
++		{name: "expiry every page", expireAfter: 1, size: 3},
++		{name: "single page", expireAfter: 0, size: 20},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			cl, _, _ := setup(t, tc.expireAfter)
++			got, err := cl.CollectDeployments(context.Background(),
++				automation.ListDeploymentsOptions{Page: automation.Set(0), Size: automation.Set(tc.size)})
++			if err != nil {
++				t.Fatalf("CollectDeployments: %v", err)
++			}
++			if len(got) != 12 {
++				t.Fatalf("collected %d, want 12", len(got))
++			}
++			for i, d := range got {
++				if d.ID != mock.DeploymentID(i) {
++					t.Fatalf("index %d = %q, want %q", i, d.ID, mock.DeploymentID(i))
++				}
++			}
++		})
++	}
++}
++
++func TestCollectDeploymentDetailsIsOrderedAndRaceFree(t *testing.T) {
++	cl, _, _ := setup(t, 3)
++	ids := make([]string, 9)
++	for i := range ids {
++		ids[i] = mock.DeploymentID(i)
++	}
++	got, err := cl.CollectDeploymentDetails(context.Background(), ids, automation.GetDeploymentOptions{})
++	if err != nil {
++		t.Fatalf("CollectDeploymentDetails: %v", err)
++	}
++	for i, d := range got {
++		if d.ID != ids[i] {
++			t.Errorf("index %d = %q, want %q", i, d.ID, ids[i])
++		}
++	}
++}
++
++// TestConcurrentCallsShareOneToken drives the client from several goroutines
++// at once, which is where a token cache without a lock shows up under -race.
++func TestConcurrentCallsShareOneToken(t *testing.T) {
++	cl, srv, _ := setup(t, 0)
++	ctx := context.Background()
++
++	var wg sync.WaitGroup
++	for i := 0; i < 8; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			if _, err := cl.ListDeployments(ctx, automation.ListDeploymentsOptions{}); err != nil {
++				t.Errorf("ListDeployments: %v", err)
++			}
++		}()
++	}
++	wg.Wait()
++
++	if n := len(srv.RequestsFor(contract.OpAuthToken)); n != 1 {
++		t.Errorf("token exchanges = %d, want 1", n)
++	}
++}
++
++func TestGetDeploymentNotFound(t *testing.T) {
++	cl, _, _ := setup(t, 0)
++	_, err := cl.GetDeployment(context.Background(), "no-such-id", automation.GetDeploymentOptions{})
++	if err == nil {
++		t.Fatal("GetDeployment() = nil error, want a not-found error")
++	}
++	var apiErr *automation.APIError
++	if !asAPIError(err, &apiErr) {
++		t.Fatalf("error is %T, want *automation.APIError", err)
++	}
++	if apiErr.StatusCode != 404 {
++		t.Errorf("StatusCode = %d, want 404", apiErr.StatusCode)
++	}
++}
++
++func asAPIError(err error, target **automation.APIError) bool {
++	for err != nil {
++		if e, ok := err.(*automation.APIError); ok {
++			*target = e
++			return true
++		}
++		u, ok := err.(interface{ Unwrap() error })
++		if !ok {
++			return false
++		}
++		err = u.Unwrap()
++	}
++	return false
++}
++
++func TestListCatalogItems(t *testing.T) {
++	cl, _, _ := setup(t, 0)
++	page, err := cl.ListCatalogItems(context.Background(), automation.ListCatalogItemsOptions{
++		Page: automation.Set(0), Size: automation.Set(2),
++	})
++	if err != nil {
++		t.Fatalf("ListCatalogItems: %v", err)
++	}
++	if len(page.Content) != 2 {
++		t.Fatalf("content = %d, want 2", len(page.Content))
++	}
++	if page.Content[0].ID != mock.CatalogItemID(0) {
++		t.Errorf("first item = %q, want %q", page.Content[0].ID, mock.CatalogItemID(0))
++	}
++	if page.TotalElements != 5 {
++		t.Errorf("TotalElements = %d, want 5", page.TotalElements)
++	}
++}
+diff --git a/docs/contract.json b/docs/contract.json
+new file mode 100644
+index 0000000..ca171a8
+--- /dev/null
++++ b/docs/contract.json
+@@ -0,0 +1,675 @@
++{
++  "schema_version": "1",
++  "product": "VCF Automation",
++  "release": "9.1",
++  "source": {
++    "kind": "reference-documentation",
++    "specification_available": false,
++    "portal": "https://developer.broadcom.com/xapis",
++    "statement": "This contract was transcribed by hand from the VCF Automation xAPIs reference documentation published at developer.broadcom.com. VCF Automation is absent from the vmware/vcf-api-specs repository and publishes no machine-readable specification, so there is no OpenAPI document behind these names: every method, path, parameter and field below was read off a human-facing reference page rather than generated from or validated against a published specification. Each operation's provenance, including the page URL and the date it was read, is recorded in docs/official_sources.json."
++  },
++  "operations": [
++    {
++      "id": "auth.token",
++      "summary": "Exchange a long-lived organization-scoped API token for a short-lived access token.",
++      "method": "POST",
++      "path": "/tm/oauth/tenant/{tenant}/token",
++      "path_params": [
++        {
++          "name": "tenant",
++          "type": "string",
++          "required": true,
++          "description": "Organization the token is scoped to."
++        }
++      ],
++      "request_body": {
++        "content_type": "application/x-www-form-urlencoded",
++        "fields": [
++          {
++            "name": "grant_type",
++            "type": "string",
++            "required": true,
++            "default": "refresh_token",
++            "description": "OAuth 2.0 grant type."
++          },
++          {
++            "name": "refresh_token",
++            "type": "string",
++            "required": true,
++            "description": "The API token generated in the VCF Automation UI."
++          }
++        ]
++      },
++      "response": {
++        "content_type": "application/json",
++        "kind": "object",
++        "fields": [
++          {
++            "name": "access_token",
++            "type": "string",
++            "required": true,
++            "description": "Bearer token for subsequent calls."
++          },
++          {
++            "name": "token_type",
++            "type": "string",
++            "required": true,
++            "description": "Always Bearer."
++          },
++          {
++            "name": "expires_in",
++            "type": "integer",
++            "required": true,
++            "description": "Lifetime in seconds; documented as 3600."
++          }
++        ]
++      }
++    },
++    {
++      "id": "deployments.list",
++      "summary": "Fetch all deployments, a page at a time.",
++      "method": "GET",
++      "path": "/deployment/api/deployments",
++      "query": [
++        {
++          "name": "page",
++          "type": "integer",
++          "required": false,
++          "default": "0",
++          "description": "Zero-based page index (0..N)."
++        },
++        {
++          "name": "size",
++          "type": "integer",
++          "required": false,
++          "default": "20",
++          "description": "The size of the page to be returned."
++        },
++        {
++          "name": "sort",
++          "type": "string[]",
++          "required": false,
++          "default": "createdAt,DESC",
++          "description": "Sorting criteria in the format: property,(asc|desc)."
++        },
++        {
++          "name": "ids",
++          "type": "string[]",
++          "required": false,
++          "description": "A comma-separated list. Only deployments with these IDs will be included."
++        },
++        {
++          "name": "search",
++          "type": "string",
++          "required": false,
++          "description": "Matches a searchable field of a deployment or of one of its resources."
++        },
++        {
++          "name": "name",
++          "type": "string",
++          "required": false,
++          "description": "Results must have exactly this name."
++        },
++        {
++          "name": "status",
++          "type": "string[]",
++          "required": false,
++          "description": "A comma-separated list. Results must be associated with one of these statuses."
++        },
++        {
++          "name": "projects",
++          "type": "string[]",
++          "required": false,
++          "description": "A comma-separated list. Results must be associated with one of these project IDs."
++        },
++        {
++          "name": "resourceTypes",
++          "type": "string[]",
++          "required": false,
++          "description": "A comma-separated list of resourceType names."
++        },
++        {
++          "name": "cloudAccounts",
++          "type": "string[]",
++          "required": false,
++          "description": "A comma-separated list of cloud accounts."
++        },
++        {
++          "name": "cloudTypes",
++          "type": "string[]",
++          "required": false,
++          "description": "A comma-separated list of endpoint types."
++        },
++        {
++          "name": "requestedBy",
++          "type": "string[]",
++          "required": false,
++          "description": "A comma-separated list of requesters."
++        },
++        {
++          "name": "ownedBy",
++          "type": "string[]",
++          "required": false,
++          "description": "A comma-separated list of owners."
++        },
++        {
++          "name": "tags",
++          "type": "string[]",
++          "required": false,
++          "description": "A comma-separated list of tags."
++        },
++        {
++          "name": "createdAt",
++          "type": "string",
++          "required": false,
++          "description": "Comma-separated start and end dates."
++        },
++        {
++          "name": "expiresAt",
++          "type": "string",
++          "required": false,
++          "description": "Comma-separated start and end dates; either bound is optional."
++        },
++        {
++          "name": "lastUpdatedAt",
++          "type": "string",
++          "required": false,
++          "description": "Comma-separated start and end dates; either bound is optional."
++        },
++        {
++          "name": "expand",
++          "type": "string[]",
++          "required": false,
++          "description": "The expanded details of the requested comma-separated objects."
++        },
++        {
++          "name": "lastRequestStatus",
++          "type": "string[]",
++          "required": false,
++          "description": "ABORTED, APPROVAL_PENDING, APPROVAL_REJECTED, FAILED, INPROGRESS, PENDING, SUCCESSFUL."
++        },
++        {
++          "name": "deleted",
++          "type": "boolean",
++          "required": false,
++          "description": "Retrieves only soft-deleted deployments not yet completely deleted."
++        },
++        {
++          "name": "expandResources",
++          "type": "boolean",
++          "required": false,
++          "deprecated": true,
++          "description": "Deprecated; use expand."
++        },
++        {
++          "name": "expandLastRequest",
++          "type": "boolean",
++          "required": false,
++          "deprecated": true,
++          "description": "Deprecated; use expand."
++        },
++        {
++          "name": "expandProject",
++          "type": "boolean",
++          "required": false,
++          "deprecated": true,
++          "description": "Deprecated; use expand."
++        },
++        {
++          "name": "$top",
++          "type": "integer",
++          "required": false,
++          "description": "Number of records you want."
++        },
++        {
++          "name": "$skip",
++          "type": "integer",
++          "required": false,
++          "description": "Number of records you want to skip."
++        },
++        {
++          "name": "$orderby",
++          "type": "string",
++          "required": false,
++          "description": "Sorting criteria in the format: property (asc|desc)."
++        },
++        {
++          "name": "$filter",
++          "type": "string",
++          "required": false,
++          "description": "A subset of records satisfying the given predicate expression."
++        }
++      ],
++      "response": {
++        "content_type": "application/json",
++        "kind": "object",
++        "fields": [
++          {
++            "name": "content",
++            "type": "object[]",
++            "required": true,
++            "description": "The deployments on this page."
++          },
++          {
++            "name": "empty",
++            "type": "boolean",
++            "required": false
++          },
++          {
++            "name": "first",
++            "type": "boolean",
++            "required": false
++          },
++          {
++            "name": "last",
++            "type": "boolean",
++            "required": false
++          },
++          {
++            "name": "number",
++            "type": "integer",
++            "required": false,
++            "description": "Zero-based index of this page."
++          },
++          {
++            "name": "numberOfElements",
++            "type": "integer",
++            "required": false
++          },
++          {
++            "name": "pageable",
++            "type": "object",
++            "required": false
++          },
++          {
++            "name": "size",
++            "type": "integer",
++            "required": false
++          },
++          {
++            "name": "sort",
++            "type": "object",
++            "required": false
++          },
++          {
++            "name": "totalElements",
++            "type": "integer",
++            "required": false
++          },
++          {
++            "name": "totalPages",
++            "type": "integer",
++            "required": false
++          }
++        ]
++      }
++    },
++    {
++      "id": "deployments.get",
++      "summary": "Fetch a specific deployment.",
++      "method": "GET",
++      "path": "/deployment/api/deployments/{deploymentId}",
++      "path_params": [
++        {
++          "name": "deploymentId",
++          "type": "string",
++          "required": true,
++          "description": "Deployment ID."
++        }
++      ],
++      "query": [
++        {
++          "name": "expand",
++          "type": "string[]",
++          "required": false,
++          "description": "Comma-separated expansion options, e.g. resources or blueprint."
++        },
++        {
++          "name": "deleted",
++          "type": "boolean",
++          "required": false,
++          "description": "Include soft-deleted deployments."
++        },
++        {
++          "name": "expandResources",
++          "type": "boolean",
++          "required": false,
++          "deprecated": true,
++          "description": "Deprecated; use expand."
++        },
++        {
++          "name": "expandLastRequest",
++          "type": "boolean",
++          "required": false,
++          "deprecated": true,
++          "description": "Deprecated; use expand."
++        },
++        {
++          "name": "expandProject",
++          "type": "boolean",
++          "required": false,
++          "deprecated": true,
++          "description": "Deprecated; use expand."
++        }
++      ],
++      "response": {
++        "content_type": "application/json",
++        "kind": "object",
++        "fields": [
++          {
++            "name": "id",
++            "type": "string",
++            "required": false
++          },
++          {
++            "name": "name",
++            "type": "string",
++            "required": true
++          },
++          {
++            "name": "description",
++            "type": "string",
++            "required": false
++          },
++          {
++            "name": "orgId",
++            "type": "string",
++            "required": false
++          },
++          {
++            "name": "projectId",
++            "type": "string",
++            "required": false
++          },
++          {
++            "name": "status",
++            "type": "string",
++            "required": false
++          },
++          {
++            "name": "createdAt",
++            "type": "string",
++            "required": false
++          },
++          {
++            "name": "createdBy",
++            "type": "string",
++            "required": false
++          },
++          {
++            "name": "lastUpdatedAt",
++            "type": "string",
++            "required": false
++          },
++          {
++            "name": "lastUpdatedBy",
++            "type": "string",
++            "required": false
++          },
++          {
++            "name": "ownedBy",
++            "type": "string",
++            "required": false
++          },
++          {
++            "name": "inputs",
++            "type": "object",
++            "required": false
++          },
++          {
++            "name": "outputs",
++            "type": "object",
++            "required": false
++          },
++          {
++            "name": "resources",
++            "type": "object[]",
++            "required": false
++          },
++          {
++            "name": "lastRequest",
++            "type": "object",
++            "required": false
++          },
++          {
++            "name": "catalogItemId",
++            "type": "string",
++            "required": false
++          },
++          {
++            "name": "blueprintId",
++            "type": "string",
++            "required": false
++          },
++          {
++            "name": "expense",
++            "type": "object",
++            "required": false
++          },
++          {
++            "name": "leaseExpireAt",
++            "type": "string",
++            "required": false
++          },
++          {
++            "name": "deleted",
++            "type": "boolean",
++            "required": false
++          }
++        ]
++      }
++    },
++    {
++      "id": "catalog.items.list",
++      "summary": "Fetch all catalog items the user can see, a page at a time.",
++      "method": "GET",
++      "path": "/catalog/api/items",
++      "query": [
++        {
++          "name": "page",
++          "type": "integer",
++          "required": false,
++          "default": "0",
++          "description": "Zero-based page index (0..N)."
++        },
++        {
++          "name": "size",
++          "type": "integer",
++          "required": false,
++          "default": "20",
++          "description": "The size of the page to be returned."
++        },
++        {
++          "name": "sort",
++          "type": "string[]",
++          "required": false,
++          "description": "Sorting criteria in the format: property,(asc|desc)."
++        },
++        {
++          "name": "search",
++          "type": "string",
++          "required": false,
++          "description": "Matches somewhere in the item's name or description."
++        },
++        {
++          "name": "projects",
++          "type": "string[]",
++          "required": false,
++          "description": "A comma-separated list of project IDs."
++        },
++        {
++          "name": "types",
++          "type": "string[]",
++          "required": false,
++          "description": "A comma-separated list of catalog item type IDs."
++        },
++        {
++          "name": "expandProjects",
++          "type": "boolean",
++          "required": false,
++          "description": "Expand the projects of the catalog item."
++        },
++        {
++          "name": "expand",
++          "type": "string",
++          "required": false,
++          "description": "Expanded details of the requested object."
++        },
++        {
++          "name": "$top",
++          "type": "integer",
++          "required": false,
++          "description": "Number of records you want."
++        },
++        {
++          "name": "$skip",
++          "type": "integer",
++          "required": false,
++          "description": "Number of records you want to skip."
++        },
++        {
++          "name": "$orderby",
++          "type": "string",
++          "required": false,
++          "description": "Sorting criteria in the format: property (asc|desc)."
++        }
++      ],
++      "response": {
++        "content_type": "application/json",
++        "kind": "object",
++        "fields": [
++          {
++            "name": "content",
++            "type": "object[]",
++            "required": true,
++            "description": "The catalog items on this page."
++          },
++          {
++            "name": "empty",
++            "type": "boolean",
++            "required": false
++          },
++          {
++            "name": "first",
++            "type": "boolean",
++            "required": false
++          },
++          {
++            "name": "last",
++            "type": "boolean",
++            "required": false
++          },
++          {
++            "name": "number",
++            "type": "integer",
++            "required": false
++          },
++          {
++            "name": "numberOfElements",
++            "type": "integer",
++            "required": false
++          },
++          {
++            "name": "pageable",
++            "type": "object",
++            "required": false
++          },
++          {
++            "name": "size",
++            "type": "integer",
++            "required": false
++          },
++          {
++            "name": "sort",
++            "type": "object",
++            "required": false
++          },
++          {
++            "name": "totalElements",
++            "type": "integer",
++            "required": false
++          },
++          {
++            "name": "totalPages",
++            "type": "integer",
++            "required": false
++          }
++        ]
++      }
++    },
++    {
++      "id": "catalog.items.request",
++      "summary": "Request one or more deployment instances from a catalog item.",
++      "method": "POST",
++      "path": "/catalog/api/items/{id}/request",
++      "path_params": [
++        {
++          "name": "id",
++          "type": "string",
++          "required": true,
++          "description": "Catalog item ID."
++        }
++      ],
++      "request_body": {
++        "content_type": "application/json",
++        "fields": [
++          {
++            "name": "bulkRequestCount",
++            "type": "integer",
++            "required": false,
++            "default": "1",
++            "description": "Deployment request count; defaults to 1 if not specified."
++          },
++          {
++            "name": "deploymentName",
++            "type": "string",
++            "required": false,
++            "description": "Name of the requested deployment; maxLength 900."
++          },
++          {
++            "name": "inputs",
++            "type": "object",
++            "required": false,
++            "description": "Inputs for the catalog item's request form."
++          },
++          {
++            "name": "projectId",
++            "type": "string",
++            "required": false,
++            "description": "Project to be used for the request."
++          },
++          {
++            "name": "reason",
++            "type": "string",
++            "required": false,
++            "description": "Reason for request; maxLength 10240."
++          },
++          {
++            "name": "version",
++            "type": "string",
++            "required": false,
++            "description": "Version of the catalog item, e.g. v2.0."
++          }
++        ]
++      },
++      "response": {
++        "content_type": "application/json",
++        "kind": "array",
++        "fields": [
++          {
++            "name": "deploymentId",
++            "type": "string",
++            "required": false,
++            "description": "Identifier of the created deployment."
++          },
++          {
++            "name": "deploymentName",
++            "type": "string",
++            "required": false,
++            "description": "Name of the created deployment."
++          }
++        ]
++      }
++    }
++  ]
++}
+diff --git a/docs/official_sources.json b/docs/official_sources.json
+new file mode 100644
+index 0000000..6da401d
+--- /dev/null
++++ b/docs/official_sources.json
+@@ -0,0 +1,48 @@
++{
++  "portal": "https://developer.broadcom.com/xapis",
++  "note": "VCF Automation has no machine-readable specification in vmware/vcf-api-specs. Every operation in docs/contract.json was transcribed from the reference pages listed here, on the dates given. The xAPIs portal encodes an operation's path and method into its own URL, so a page URL below reads as a restatement of the route it documents. Where a page carries a version selector it showed 9.1 (Latest) at the time of reading.",
++  "records": [
++    {
++      "operation": "auth.token",
++      "url": "https://developer.broadcom.com/xapis/org-management-vm-apps-org/latest/",
++      "title": "Org Management - VM Apps Org",
++      "fetched_at": "2026-08-11"
++    },
++    {
++      "operation": "auth.token",
++      "url": "https://developer.broadcom.com/xapis/org-management-all-apps-org/latest/",
++      "title": "Org Management - All Apps Org",
++      "fetched_at": "2026-08-11"
++    },
++    {
++      "operation": "deployments.list",
++      "url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/deployment/api/deployments/get/",
++      "title": "Get Deployments",
++      "fetched_at": "2026-08-11"
++    },
++    {
++      "operation": "deployments.list",
++      "url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/deployments/",
++      "title": "Deployments APIs",
++      "fetched_at": "2026-08-11"
++    },
++    {
++      "operation": "deployments.get",
++      "url": "https://developer.broadcom.com/xapis/vm-apps-org-deployment/latest/deployment/api/deployments/deploymentId/get/",
++      "title": "Get Deployment By Id",
++      "fetched_at": "2026-08-11"
++    },
++    {
++      "operation": "catalog.items.list",
++      "url": "https://developer.broadcom.com/xapis/vm-apps-org-catalog/latest/catalog/api/items/get/",
++      "title": "Get Catalog Items",
++      "fetched_at": "2026-08-11"
++    },
++    {
++      "operation": "catalog.items.request",
++      "url": "https://developer.broadcom.com/xapis/vm-apps-org-catalog/latest/catalog/api/items/id/request/post/",
++      "title": "Request Catalog Item Instances",
++      "fetched_at": "2026-08-11"
++    }
++  ]
++}
+diff --git a/mock/server.go b/mock/server.go
+index 006cbce..c5eaf9b 100644
+--- a/mock/server.go
++++ b/mock/server.go
+@@ -31,21 +31,23 @@
+ //
+ // Validating before authenticating is deliberate: it lets a test confirm that
+ // the contract is being enforced without first having to hold a token.
+-//
+-// Every exported symbol here has a fixed signature. The bodies are yours.
+ package mock
+ 
+ import (
+ 	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
++	"net"
+ 	"net/http"
+ 	"net/url"
++	"strconv"
++	"strings"
++	"sync"
+ 
+ 	"vcfauto/contract"
+ )
+ 
+-var errNotImplemented = errors.New("mock: not implemented")
+-
+ // Options configures a Server.
+ type Options struct {
+ 	// Contract is the loaded docs/contract.json. The server refuses to
+@@ -80,10 +82,33 @@ type Options struct {
+ 	AccessTokenTTLSeconds int
+ }
+ 
++// route is one contract operation, pre-split for matching.
++type route struct {
++	op   *contract.Operation
++	segs []string // path segments; a placeholder is stored as ""
++	name []string // placeholder names, in the order they appear
++}
++
+ // Server is a running loopback mock.
+ type Server struct {
+-	// Unexported state is yours. Requests() is called concurrently with
+-	// requests being served, so guard the log.
++	opts   Options
++	routes []route
++	http   *http.Server
++	listen net.Listener
++	url    string
++
++	mu     sync.Mutex
++	log    []*loggedRequest
++	tokens map[string]int // access token -> requests it has authorized
++	issued int
++}
++
++// loggedRequest reserves a request's position in the log as soon as its
++// handler starts. Requests waits for done before copying record, so callers
++// never observe a partially populated entry.
++type loggedRequest struct {
++	record RecordedRequest
++	done   chan struct{}
+ }
+ 
+ // Start validates opts and starts a server listening on 127.0.0.1 on an
+@@ -104,14 +129,68 @@ type Server struct {
+ //   - The catalog request operation replies with one entry per requested
+ //     instance, echoing the requested deployment name.
+ func Start(opts Options) (*Server, error) {
+-	return nil, errNotImplemented
++	if opts.Contract == nil {
++		return nil, errors.New("mock: Contract is required")
++	}
++	if strings.TrimSpace(opts.Tenant) == "" {
++		return nil, errors.New("mock: Tenant is required")
++	}
++	if strings.TrimSpace(opts.APIToken) == "" {
++		return nil, errors.New("mock: APIToken is required")
++	}
++	if opts.AccessTokenTTLSeconds == 0 {
++		opts.AccessTokenTTLSeconds = 3600
++	}
++	for _, id := range contract.RequiredOperations {
++		if _, err := opts.Contract.Operation(id); err != nil {
++			return nil, fmt.Errorf("mock: %w", err)
++		}
++	}
++
++	s := &Server{opts: opts, tokens: map[string]int{}}
++	for i := range opts.Contract.Operations {
++		op := &opts.Contract.Operations[i]
++		r := route{op: op}
++		for _, seg := range strings.Split(strings.TrimPrefix(op.Path, "/"), "/") {
++			if strings.HasPrefix(seg, "{") && strings.HasSuffix(seg, "}") {
++				r.segs = append(r.segs, "")
++				r.name = append(r.name, strings.Trim(seg, "{}"))
++				continue
++			}
++			r.segs = append(r.segs, seg)
++		}
++		s.routes = append(s.routes, r)
++	}
++	listener, err := net.Listen("tcp4", "127.0.0.1:0")
++	if err != nil {
++		return nil, fmt.Errorf("mock: listen on loopback: %w", err)
++	}
++	s.listen = listener
++	s.url = "http://" + listener.Addr().String()
++	s.http = &http.Server{Handler: http.HandlerFunc(s.serve)}
++	go func() {
++		_ = s.http.Serve(listener)
++	}()
++	return s, nil
+ }
+ 
+ // URL is the server's base URL, with no trailing slash.
+-func (s *Server) URL() string { return "" }
++func (s *Server) URL() string {
++	if s == nil || s.http == nil {
++		return ""
++	}
++	return strings.TrimRight(s.url, "/")
++}
+ 
+ // Close shuts the server down.
+-func (s *Server) Close() {}
++func (s *Server) Close() {
++	if s != nil && s.http != nil {
++		_ = s.http.Close()
++	}
++	if s != nil && s.listen != nil {
++		_ = s.listen.Close()
++	}
++}
+ 
+ // RecordedRequest is one request as the server received it.
+ type RecordedRequest struct {
+@@ -159,7 +238,18 @@ func (r RecordedRequest) FormBody() (url.Values, error) {
+ 
+ // Requests returns a copy of the request log, in the order received. It is
+ // safe to call while the server is serving.
+-func (s *Server) Requests() []RecordedRequest { return nil }
++func (s *Server) Requests() []RecordedRequest {
++	s.mu.Lock()
++	entries := append([]*loggedRequest(nil), s.log...)
++	s.mu.Unlock()
++
++	out := make([]RecordedRequest, len(entries))
++	for i, entry := range entries {
++		<-entry.done
++		out[i] = entry.record
++	}
++	return out
++}
+ 
+ // RequestsFor returns the logged requests that matched the given operation ID.
+ func (s *Server) RequestsFor(operation string) []RecordedRequest {
+@@ -171,3 +261,320 @@ func (s *Server) RequestsFor(operation string) []RecordedRequest {
+ 	}
+ 	return out
+ }
++
++// --- serving ----------------------------------------------------------------
++
++// reply is what a handler decided to send.
++type reply struct {
++	status int
++	body   any
++}
++
++func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
++	entry := &loggedRequest{done: make(chan struct{})}
++	s.mu.Lock()
++	seq := len(s.log)
++	s.log = append(s.log, entry)
++	s.mu.Unlock()
++	defer close(entry.done)
++
++	raw, _ := io.ReadAll(r.Body)
++	r.Body.Close()
++
++	rec := RecordedRequest{
++		Seq:       seq,
++		Operation: "",
++		Method:    r.Method,
++		Path:      r.URL.Path,
++		Query:     r.URL.Query(),
++		Header:    r.Header.Clone(),
++		Body:      raw,
++	}
++
++	op, pathParams, ok := s.match(r.Method, r.URL.Path)
++	if ok {
++		rec.Operation = op.ID
++	}
++	res := s.handle(op, ok, pathParams, r, raw)
++	rec.Status = res.status
++	entry.record = rec
++
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(res.status)
++	if res.body != nil {
++		_ = json.NewEncoder(w).Encode(res.body)
++	}
++}
++
++func errBody(msg string) map[string]any {
++	return map[string]any{"message": msg}
++}
++
++// match finds the operation a method and path address.
++func (s *Server) match(method, path string) (*contract.Operation, map[string]string, bool) {
++	got := strings.Split(strings.TrimPrefix(path, "/"), "/")
++	for _, r := range s.routes {
++		if r.op.Method != method || len(r.segs) != len(got) {
++			continue
++		}
++		params := map[string]string{}
++		n := 0
++		matched := true
++		for i, want := range r.segs {
++			if want == "" {
++				if got[i] == "" {
++					matched = false
++					break
++				}
++				params[r.name[n]] = got[i]
++				n++
++				continue
++			}
++			if want != got[i] {
++				matched = false
++				break
++			}
++		}
++		if !matched {
++			continue
++		}
++		// The token operation is scoped to one organization; a request
++		// for any other one addresses a tenant this appliance does not
++		// serve.
++		if r.op.ID == contract.OpAuthToken {
++			if len(r.name) != 1 || params[r.name[0]] != s.opts.Tenant {
++				continue
++			}
++		}
++		return r.op, params, true
++	}
++	return nil, nil, false
++}
++
++func (s *Server) handle(op *contract.Operation, routed bool, pathParams map[string]string, r *http.Request, raw []byte) reply {
++	if !routed {
++		return reply{http.StatusNotFound, errBody("no such operation")}
++	}
++
++	// 2. Validate against the contract.
++	for name := range r.URL.Query() {
++		if _, ok := op.QueryField(name); !ok {
++			return reply{http.StatusBadRequest,
++				errBody(fmt.Sprintf("operation %s declares no query parameter %q", op.ID, name))}
++		}
++	}
++	var jsonBody map[string]any
++	var formBody url.Values
++	if op.RequestBody != nil {
++		switch op.RequestBody.ContentType {
++		case contract.ContentTypeJSON:
++			if len(raw) > 0 {
++				if err := json.Unmarshal(raw, &jsonBody); err != nil {
++					return reply{http.StatusBadRequest, errBody("body is not a JSON object")}
++				}
++				if jsonBody == nil {
++					return reply{http.StatusBadRequest, errBody("body is not a JSON object")}
++				}
++			}
++			for name := range jsonBody {
++				if _, ok := op.BodyField(name); !ok {
++					return reply{http.StatusBadRequest,
++						errBody(fmt.Sprintf("operation %s declares no body field %q", op.ID, name))}
++				}
++			}
++		case contract.ContentTypeForm:
++			var err error
++			formBody, err = url.ParseQuery(string(raw))
++			if err != nil {
++				return reply{http.StatusBadRequest, errBody("body is not form-encoded")}
++			}
++			for name := range formBody {
++				if _, ok := op.BodyField(name); !ok {
++					return reply{http.StatusBadRequest,
++						errBody(fmt.Sprintf("operation %s declares no body field %q", op.ID, name))}
++				}
++			}
++		}
++	}
++
++	// 3. Authenticate, except for the operation that hands out tokens.
++	if op.ID != contract.OpAuthToken {
++		if res, ok := s.authorize(r); !ok {
++			return res
++		}
++	}
++
++	// 4. Serve.
++	switch op.ID {
++	case contract.OpAuthToken:
++		return s.serveToken(op, formBody)
++	case contract.OpDeploymentsList:
++		return s.servePage(op, r.URL.Query(), s.opts.Deployments)
++	case contract.OpCatalogItemsList:
++		return s.servePage(op, r.URL.Query(), s.opts.CatalogItems)
++	case contract.OpDeploymentsGet:
++		return s.serveDeployment(pathParams)
++	case contract.OpCatalogItemsRequest:
++		return s.serveCatalogRequest(pathParams, jsonBody)
++	}
++	return reply{http.StatusNotImplemented, errBody("operation not served by this mock")}
++}
++
++// authorize checks the bearer token and, on success, spends one of its
++// remaining authorizations.
++func (s *Server) authorize(r *http.Request) (reply, bool) {
++	auth := r.Header.Get("Authorization")
++	if !strings.HasPrefix(auth, "Bearer ") {
++		return reply{http.StatusUnauthorized, errBody("missing bearer token")}, false
++	}
++	tok := strings.TrimPrefix(auth, "Bearer ")
++
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	used, known := s.tokens[tok]
++	if !known {
++		return reply{http.StatusUnauthorized, errBody("unknown access token")}, false
++	}
++	if s.opts.ExpireAccessTokenAfter > 0 && used >= s.opts.ExpireAccessTokenAfter {
++		return reply{http.StatusUnauthorized, errBody("access token has expired")}, false
++	}
++	s.tokens[tok] = used + 1
++	return reply{}, true
++}
++
++func (s *Server) serveToken(op *contract.Operation, form url.Values) reply {
++	grant := "refresh_token"
++	if f, ok := op.BodyField("grant_type"); ok && f.Default != "" {
++		grant = f.Default
++	}
++	if form.Get("grant_type") != grant {
++		return reply{http.StatusBadRequest, errBody("unsupported grant_type")}
++	}
++	if form.Get("refresh_token") != s.opts.APIToken {
++		return reply{http.StatusBadRequest, errBody("invalid API token")}
++	}
++
++	s.mu.Lock()
++	s.issued++
++	tok := fmt.Sprintf("access-token-%d", s.issued)
++	s.tokens[tok] = 0
++	s.mu.Unlock()
++
++	return reply{http.StatusOK, map[string]any{
++		"access_token": tok,
++		"token_type":   "Bearer",
++		"expires_in":   s.opts.AccessTokenTTLSeconds,
++	}}
++}
++
++// intParam reads an integer query parameter, falling back to the default the
++// contract records for it.
++func intParam(op *contract.Operation, q url.Values, name string) (int, error) {
++	values, present := q[name]
++	raw := ""
++	if present && len(values) > 0 {
++		raw = values[0]
++	}
++	if !present {
++		if f, ok := op.QueryField(name); ok && f.Default != "" {
++			raw = f.Default
++		}
++	}
++	if raw == "" {
++		if present {
++			return 0, fmt.Errorf("%s must not be empty", name)
++		}
++		return 0, nil
++	}
++	return strconv.Atoi(raw)
++}
++
++func (s *Server) servePage(op *contract.Operation, q url.Values, corpus []map[string]any) reply {
++	page, err := intParam(op, q, "page")
++	if err != nil || page < 0 {
++		return reply{http.StatusBadRequest, errBody("page must be a non-negative integer")}
++	}
++	size, err := intParam(op, q, "size")
++	if err != nil || size <= 0 {
++		return reply{http.StatusBadRequest, errBody("size must be a positive integer")}
++	}
++
++	total := len(corpus)
++	totalPages := (total + size - 1) / size
++	start := page * size
++	if start > total {
++		start = total
++	}
++	end := start + size
++	if end > total {
++		end = total
++	}
++	content := corpus[start:end]
++
++	return reply{http.StatusOK, map[string]any{
++		"content":          content,
++		"number":           page,
++		"size":             size,
++		"numberOfElements": len(content),
++		"totalElements":    total,
++		"totalPages":       totalPages,
++		"first":            page == 0,
++		"last":             page >= totalPages-1,
++		"empty":            len(content) == 0,
++	}}
++}
++
++func (s *Server) serveDeployment(pathParams map[string]string) reply {
++	id := singleParam(pathParams)
++	for _, d := range s.opts.Deployments {
++		if d["id"] == id {
++			return reply{http.StatusOK, d}
++		}
++	}
++	return reply{http.StatusNotFound, errBody("no such deployment")}
++}
++
++func (s *Server) serveCatalogRequest(pathParams map[string]string, body map[string]any) reply {
++	id := singleParam(pathParams)
++	var item map[string]any
++	for _, ci := range s.opts.CatalogItems {
++		if ci["id"] == id {
++			item = ci
++			break
++		}
++	}
++	if item == nil {
++		return reply{http.StatusNotFound, errBody("no such catalog item")}
++	}
++
++	count := 1
++	if v, ok := body["bulkRequestCount"]; ok {
++		if n, ok := v.(float64); ok && int(n) > 0 {
++			count = int(n)
++		}
++	}
++	name, _ := body["deploymentName"].(string)
++	if name == "" {
++		name, _ = item["name"].(string)
++	}
++
++	out := make([]map[string]any, 0, count)
++	for i := 0; i < count; i++ {
++		suffix := ""
++		if count > 1 {
++			suffix = fmt.Sprintf("-%d", i)
++		}
++		out = append(out, map[string]any{
++			"deploymentId":   fmt.Sprintf("%s-req-%d", id, i),
++			"deploymentName": name + suffix,
++		})
++	}
++	return reply{http.StatusOK, out}
++}
++
++func singleParam(params map[string]string) string {
++	for _, v := range params {
++		return v
++	}
++	return ""
++}
+diff --git a/mock/server_test.go b/mock/server_test.go
+new file mode 100644
+index 0000000..ce5347a
+--- /dev/null
++++ b/mock/server_test.go
+@@ -0,0 +1,346 @@
++package mock
++
++import (
++	"encoding/json"
++	"io"
++	"net/http"
++	"strings"
++	"testing"
++
++	"vcfauto/contract"
++)
++
++const (
++	testTenant   = "acme-org"
++	testAPIToken = "vcfa-api-token-fixture-0123456789"
++)
++
++func testContract(t *testing.T) *contract.Contract {
++	t.Helper()
++	c, err := contract.Load("../docs/contract.json")
++	if err != nil {
++		t.Fatalf("load contract: %v", err)
++	}
++	return c
++}
++
++func start(t *testing.T, expireAfter int) (*Server, *contract.Contract) {
++	t.Helper()
++	c := testContract(t)
++	s, err := Start(Options{
++		Contract:               c,
++		Tenant:                 testTenant,
++		APIToken:               testAPIToken,
++		Deployments:            Deployments(12),
++		CatalogItems:           CatalogItems(5),
++		ExpireAccessTokenAfter: expireAfter,
++	})
++	if err != nil {
++		t.Fatalf("start: %v", err)
++	}
++	t.Cleanup(s.Close)
++	return s, c
++}
++
++// token exchanges the API token and returns the access token.
++func token(t *testing.T, s *Server, c *contract.Contract) string {
++	t.Helper()
++	op := c.MustOperation(contract.OpAuthToken)
++	path, err := op.ExpandPath(map[string]string{"tenant": testTenant})
++	if err != nil {
++		t.Fatalf("expand: %v", err)
++	}
++	resp, err := http.Post(s.URL()+path, contract.ContentTypeForm,
++		strings.NewReader("grant_type=refresh_token&refresh_token="+testAPIToken))
++	if err != nil {
++		t.Fatalf("token: %v", err)
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		body, _ := io.ReadAll(resp.Body)
++		t.Fatalf("token: status %d: %s", resp.StatusCode, body)
++	}
++	var out struct {
++		AccessToken string `json:"access_token"`
++		TokenType   string `json:"token_type"`
++		ExpiresIn   int    `json:"expires_in"`
++	}
++	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
++		t.Fatalf("decode token: %v", err)
++	}
++	if out.TokenType != "Bearer" || out.ExpiresIn != 3600 {
++		t.Errorf("token_type = %q, expires_in = %d", out.TokenType, out.ExpiresIn)
++	}
++	return out.AccessToken
++}
++
++func TestStartRejectsIncompleteOptions(t *testing.T) {
++	c := testContract(t)
++	tests := []struct {
++		name string
++		opts Options
++	}{
++		{"no contract", Options{Tenant: testTenant, APIToken: testAPIToken}},
++		{"no tenant", Options{Contract: c, APIToken: testAPIToken}},
++		{"no API token", Options{Contract: c, Tenant: testTenant}},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			s, err := Start(tc.opts)
++			if err == nil {
++				s.Close()
++				t.Fatal("Start() = nil error, want a rejection")
++			}
++		})
++	}
++}
++
++func TestRoutingAndValidation(t *testing.T) {
++	s, c := start(t, 0)
++	tok := token(t, s, c)
++
++	listPath := c.MustOperation(contract.OpDeploymentsList).Path
++	getPath := listPath + "/" + DeploymentID(0)
++	reqPath, err := c.MustOperation(contract.OpCatalogItemsRequest).
++		ExpandPath(map[string]string{"id": CatalogItemID(0)})
++	if err != nil {
++		t.Fatalf("expand: %v", err)
++	}
++
++	tests := []struct {
++		name    string
++		method  string
++		path    string
++		query   string
++		body    string
++		ctype   string
++		bearer  string
++		want    int
++		wantOp  string
++		wantLog bool
++	}{
++		{name: "unknown path", method: http.MethodGet, path: "/nope", bearer: tok,
++			want: http.StatusNotFound, wantOp: ""},
++		{name: "undocumented method", method: http.MethodPut, path: listPath, bearer: tok,
++			want: http.StatusNotFound},
++		{name: "other tenant", method: http.MethodPost, path: "/tm/oauth/tenant/other/token",
++			want: http.StatusNotFound},
++		{name: "undeclared query parameter", method: http.MethodGet, path: listPath,
++			query: "nope=1", bearer: tok, want: http.StatusBadRequest, wantOp: contract.OpDeploymentsList},
++		{name: "declared query parameter", method: http.MethodGet, path: listPath,
++			query: "page=0&size=4", bearer: tok, want: http.StatusOK, wantOp: contract.OpDeploymentsList},
++		{name: "undeclared body field", method: http.MethodPost, path: reqPath,
++			body: `{"nope":1}`, ctype: contract.ContentTypeJSON, bearer: tok,
++			want: http.StatusBadRequest, wantOp: contract.OpCatalogItemsRequest},
++		{name: "declared body field", method: http.MethodPost, path: reqPath,
++			body: `{"deploymentName":"d"}`, ctype: contract.ContentTypeJSON, bearer: tok,
++			want: http.StatusOK, wantOp: contract.OpCatalogItemsRequest},
++		{name: "no bearer token", method: http.MethodGet, path: listPath,
++			want: http.StatusUnauthorized, wantOp: contract.OpDeploymentsList},
++		{name: "unknown bearer token", method: http.MethodGet, path: listPath, bearer: "made-up",
++			want: http.StatusUnauthorized, wantOp: contract.OpDeploymentsList},
++		{name: "get by id", method: http.MethodGet, path: getPath, bearer: tok,
++			want: http.StatusOK, wantOp: contract.OpDeploymentsGet},
++		{name: "get by unknown id", method: http.MethodGet, path: listPath + "/missing", bearer: tok,
++			want: http.StatusNotFound, wantOp: contract.OpDeploymentsGet},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			before := len(s.Requests())
++
++			u := s.URL() + tc.path
++			if tc.query != "" {
++				u += "?" + tc.query
++			}
++			var rdr io.Reader
++			if tc.body != "" {
++				rdr = strings.NewReader(tc.body)
++			}
++			req, err := http.NewRequest(tc.method, u, rdr)
++			if err != nil {
++				t.Fatalf("build: %v", err)
++			}
++			if tc.ctype != "" {
++				req.Header.Set("Content-Type", tc.ctype)
++			}
++			if tc.bearer != "" {
++				req.Header.Set("Authorization", "Bearer "+tc.bearer)
++			}
++			resp, err := http.DefaultClient.Do(req)
++			if err != nil {
++				t.Fatalf("do: %v", err)
++			}
++			defer resp.Body.Close()
++			body, _ := io.ReadAll(resp.Body)
++			if resp.StatusCode != tc.want {
++				t.Fatalf("status = %d, want %d: %s", resp.StatusCode, tc.want, body)
++			}
++
++			log := s.Requests()
++			if len(log) != before+1 {
++				t.Fatalf("log grew by %d, want 1", len(log)-before)
++			}
++			last := log[len(log)-1]
++			if last.Operation != tc.wantOp {
++				t.Errorf("logged operation = %q, want %q", last.Operation, tc.wantOp)
++			}
++			if last.Status != tc.want {
++				t.Errorf("logged status = %d, want %d", last.Status, tc.want)
++			}
++			if last.Seq != len(log)-1 {
++				t.Errorf("Seq = %d, want %d", last.Seq, len(log)-1)
++			}
++		})
++	}
++}
++
++func TestTokenExchange(t *testing.T) {
++	s, c := start(t, 0)
++	op := c.MustOperation(contract.OpAuthToken)
++	path, err := op.ExpandPath(map[string]string{"tenant": testTenant})
++	if err != nil {
++		t.Fatalf("expand: %v", err)
++	}
++
++	tests := []struct {
++		name string
++		form string
++		want int
++	}{
++		{"valid", "grant_type=refresh_token&refresh_token=" + testAPIToken, http.StatusOK},
++		{"wrong grant", "grant_type=password&refresh_token=" + testAPIToken, http.StatusBadRequest},
++		{"wrong API token", "grant_type=refresh_token&refresh_token=nope", http.StatusBadRequest},
++		{"empty body", "", http.StatusBadRequest},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			resp, err := http.Post(s.URL()+path, contract.ContentTypeForm, strings.NewReader(tc.form))
++			if err != nil {
++				t.Fatalf("post: %v", err)
++			}
++			defer resp.Body.Close()
++			io.Copy(io.Discard, resp.Body)
++			if resp.StatusCode != tc.want {
++				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.want)
++			}
++		})
++	}
++}
++
++func TestAccessTokenExpiresAfterAFixedNumberOfRequests(t *testing.T) {
++	const expireAfter = 2
++	s, c := start(t, expireAfter)
++	tok := token(t, s, c)
++	listPath := c.MustOperation(contract.OpDeploymentsList).Path
++
++	tests := []struct {
++		name string
++		want int
++	}{
++		{"first authorized request", http.StatusOK},
++		{"second authorized request", http.StatusOK},
++		{"third request meets the expiry", http.StatusUnauthorized},
++		{"and stays expired", http.StatusUnauthorized},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			req, err := http.NewRequest(http.MethodGet, s.URL()+listPath, nil)
++			if err != nil {
++				t.Fatalf("build: %v", err)
++			}
++			req.Header.Set("Authorization", "Bearer "+tok)
++			resp, err := http.DefaultClient.Do(req)
++			if err != nil {
++				t.Fatalf("do: %v", err)
++			}
++			defer resp.Body.Close()
++			io.Copy(io.Discard, resp.Body)
++			if resp.StatusCode != tc.want {
++				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.want)
++			}
++		})
++	}
++
++	// A fresh exchange restores service.
++	tok2 := token(t, s, c)
++	if tok2 == tok {
++		t.Fatal("a second exchange returned the same access token")
++	}
++}
++
++func TestPaging(t *testing.T) {
++	s, c := start(t, 0)
++	tok := token(t, s, c)
++	listPath := c.MustOperation(contract.OpDeploymentsList).Path
++
++	tests := []struct {
++		name       string
++		query      string
++		wantCount  int
++		wantFirst  bool
++		wantLast   bool
++		wantTotal  int
++		wantPages  int
++		wantNumber int
++	}{
++		{name: "first page", query: "page=0&size=5", wantCount: 5, wantFirst: true,
++			wantTotal: 12, wantPages: 3, wantNumber: 0},
++		{name: "middle page", query: "page=1&size=5", wantCount: 5,
++			wantTotal: 12, wantPages: 3, wantNumber: 1},
++		{name: "short last page", query: "page=2&size=5", wantCount: 2, wantLast: true,
++			wantTotal: 12, wantPages: 3, wantNumber: 2},
++		{name: "past the end", query: "page=9&size=5", wantCount: 0, wantLast: true,
++			wantTotal: 12, wantPages: 3, wantNumber: 9},
++		{name: "contract defaults when omitted", query: "", wantCount: 12, wantFirst: true,
++			wantLast: true, wantTotal: 12, wantPages: 1, wantNumber: 0},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			u := s.URL() + listPath
++			if tc.query != "" {
++				u += "?" + tc.query
++			}
++			req, _ := http.NewRequest(http.MethodGet, u, nil)
++			req.Header.Set("Authorization", "Bearer "+tok)
++			resp, err := http.DefaultClient.Do(req)
++			if err != nil {
++				t.Fatalf("do: %v", err)
++			}
++			defer resp.Body.Close()
++
++			var page struct {
++				Content       []map[string]any `json:"content"`
++				Number        int              `json:"number"`
++				First         bool             `json:"first"`
++				Last          bool             `json:"last"`
++				TotalElements int              `json:"totalElements"`
++				TotalPages    int              `json:"totalPages"`
++			}
++			if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
++				t.Fatalf("decode: %v", err)
++			}
++			if len(page.Content) != tc.wantCount {
++				t.Errorf("content = %d items, want %d", len(page.Content), tc.wantCount)
++			}
++			if page.Number != tc.wantNumber {
++				t.Errorf("number = %d, want %d", page.Number, tc.wantNumber)
++			}
++			if page.First != tc.wantFirst {
++				t.Errorf("first = %v, want %v", page.First, tc.wantFirst)
++			}
++			if page.Last != tc.wantLast {
++				t.Errorf("last = %v, want %v", page.Last, tc.wantLast)
++			}
++			if page.TotalElements != tc.wantTotal {
++				t.Errorf("totalElements = %d, want %d", page.TotalElements, tc.wantTotal)
++			}
++			if page.TotalPages != tc.wantPages {
++				t.Errorf("totalPages = %d, want %d", page.TotalPages, tc.wantPages)
++			}
++		})
++	}
++}
+diff --git a/wire/wire.go b/wire/wire.go
+index d9bcd78..cf57fca 100644
+--- a/wire/wire.go
++++ b/wire/wire.go
+@@ -7,19 +7,21 @@
+ // does not list must be absent from the object. This is the whole point of the
+ // package: the interesting bugs in a client of an API whose fields are almost
+ // all optional are the fields it sends when it should have stayed quiet.
+-//
+-// Every exported symbol here has a fixed signature. The bodies are yours.
+ package wire
+ 
+ import (
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"net/http"
+ 	"net/url"
++	"reflect"
++	"sort"
++	"strings"
+ 
+ 	"vcfauto/mock"
+ )
+ 
+-var errNotImplemented = errors.New("wire: not implemented")
+-
+ // Expectation is the exact shape a request must have had.
+ type Expectation struct {
+ 	// Operation is the contract operation ID the request must have matched.
+@@ -60,17 +62,194 @@ type Expectation struct {
+ 	Status int
+ }
+ 
++// problems accumulates every discrepancy so that one call reports all of them.
++type problems []string
++
++func (p *problems) addf(format string, args ...any) {
++	*p = append(*p, fmt.Sprintf(format, args...))
++}
++
++func (p problems) err() error {
++	if len(p) == 0 {
++		return nil
++	}
++	if len(p) == 1 {
++		return errors.New("wire: " + p[0])
++	}
++	return fmt.Errorf("wire: %d discrepancies:\n  - %s", len(p), strings.Join(p, "\n  - "))
++}
++
+ // Check reports how got departs from want, or nil if it matches exactly.
+ //
+-// The error must name every discrepancy it found, not just the first, and must
+-// distinguish "parameter absent" from "parameter present but empty" in its
+-// wording — those are the two cases this package exists to tell apart.
++// The error names every discrepancy it found, not just the first, and
++// distinguishes "parameter absent" from "parameter present but empty" — those
++// are the two cases this package exists to tell apart.
+ func Check(got mock.RecordedRequest, want Expectation) error {
+-	return errNotImplemented
++	var p problems
++
++	if want.Operation != "" && got.Operation != want.Operation {
++		p.addf("operation: got %q, want %q", got.Operation, want.Operation)
++	}
++	if want.Method != "" && got.Method != want.Method {
++		p.addf("method: got %q, want %q", got.Method, want.Method)
++	}
++	if want.Path != "" && got.Path != want.Path {
++		p.addf("path: got %q, want %q", got.Path, want.Path)
++	}
++	if want.Status != 0 && got.Status != want.Status {
++		p.addf("status: got %d, want %d", got.Status, want.Status)
++	}
++
++	checkValues(&p, "query parameter", got.Query, want.Query)
++
++	for name, wantVal := range want.Header {
++		gotVal := got.Header.Get(name)
++		if _, present := got.Header[canonical(name)]; !present {
++			p.addf("header %q is absent; want %q", name, wantVal)
++			continue
++		}
++		if gotVal != wantVal {
++			p.addf("header %q: got %q, want %q", name, gotVal, wantVal)
++		}
++	}
++	for _, name := range want.AbsentHeaders {
++		if _, present := got.Header[canonical(name)]; present {
++			p.addf("header %q was sent as %q; it must not be sent at all", name, got.Header.Get(name))
++		}
++	}
++
++	if want.NoBody && len(got.Body) != 0 {
++		p.addf("body: got %q, want no body at all", string(got.Body))
++	}
++
++	if want.JSONBody != "" {
++		checkJSON(&p, got.Body, want.JSONBody)
++	}
++	if want.FormBody != nil {
++		gotForm, err := url.ParseQuery(string(got.Body))
++		if err != nil {
++			p.addf("body %q is not form-encoded: %v", string(got.Body), err)
++		} else {
++			checkValues(&p, "form field", gotForm, want.FormBody)
++		}
++	}
++
++	return p.err()
++}
++
++func canonical(name string) string {
++	return http.CanonicalHeaderKey(name)
++}
++
++// checkValues compares two url.Values exactly, reporting absent and
++// present-but-unwanted separately.
++func checkValues(p *problems, what string, got, want url.Values) {
++	for _, name := range sortedKeys(want) {
++		gotVals, present := got[name]
++		if !present {
++			p.addf("%s %q is absent; want %q. An absent %s is not the same as one sent empty",
++				what, name, strings.Join(want[name], ","), what)
++			continue
++		}
++		if !reflect.DeepEqual(gotVals, want[name]) {
++			p.addf("%s %q: got %q, want %q", what, name, gotVals, want[name])
++		}
++	}
++	for _, name := range sortedKeys(got) {
++		if _, expected := want[name]; expected {
++			continue
++		}
++		vals := got[name]
++		if len(vals) == 1 && vals[0] == "" {
++			p.addf("%s %q was sent empty; it must be omitted entirely rather than sent with an empty value", what, name)
++			continue
++		}
++		p.addf("%s %q was sent as %q; it must not be sent at all", what, name, vals)
++	}
++}
++
++func sortedKeys(v url.Values) []string {
++	out := make([]string, 0, len(v))
++	for k := range v {
++		out = append(out, k)
++	}
++	sort.Strings(out)
++	return out
++}
++
++// checkJSON compares two JSON objects by decoded value, reporting each key
++// that is missing, unwanted or different.
++func checkJSON(p *problems, gotRaw []byte, wantRaw string) {
++	var gotObj, wantObj map[string]any
++	if err := json.Unmarshal([]byte(wantRaw), &wantObj); err != nil {
++		p.addf("expected body %q is not a JSON object: %v", wantRaw, err)
++		return
++	}
++	if wantObj == nil {
++		p.addf("expected body %q is not a JSON object", wantRaw)
++		return
++	}
++	if len(gotRaw) == 0 {
++		p.addf("body is empty; want the JSON object %s", wantRaw)
++		return
++	}
++	if err := json.Unmarshal(gotRaw, &gotObj); err != nil {
++		p.addf("body %q is not a JSON object: %v", string(gotRaw), err)
++		return
++	}
++	if gotObj == nil {
++		p.addf("body %q is not a JSON object", string(gotRaw))
++		return
++	}
++
++	for _, key := range sortedObjKeys(wantObj) {
++		gotVal, present := gotObj[key]
++		if !present {
++			p.addf("body key %q is absent; want %v", key, wantObj[key])
++			continue
++		}
++		if !reflect.DeepEqual(gotVal, wantObj[key]) {
++			p.addf("body key %q: got %v, want %v", key, gotVal, wantObj[key])
++		}
++	}
++	for _, key := range sortedObjKeys(gotObj) {
++		if _, expected := wantObj[key]; expected {
++			continue
++		}
++		switch v := gotObj[key].(type) {
++		case nil:
++			p.addf("body key %q was sent as null; an unset optional field must be omitted from the object, not sent null", key)
++		case string:
++			if v == "" {
++				p.addf("body key %q was sent as an empty string; an unset optional field must be omitted from the object, not sent empty", key)
++				continue
++			}
++			p.addf("body key %q was sent as %q; it must not be sent at all", key, v)
++		default:
++			p.addf("body key %q was sent as %v; it must not be sent at all", key, v)
++		}
++	}
++}
++
++func sortedObjKeys(m map[string]any) []string {
++	out := make([]string, 0, len(m))
++	for k := range m {
++		out = append(out, k)
++	}
++	sort.Strings(out)
++	return out
+ }
+ 
+ // CheckAll matches a recorded sequence against an expected sequence, in order,
+ // reporting a length mismatch or the first index that differs.
+ func CheckAll(got []mock.RecordedRequest, want []Expectation) error {
+-	return errNotImplemented
++	if len(got) != len(want) {
++		return fmt.Errorf("wire: recorded %d requests, want %d", len(got), len(want))
++	}
++	for i := range want {
++		if err := Check(got[i], want[i]); err != nil {
++			return fmt.Errorf("wire: request %d: %w", i, err)
++		}
++	}
++	return nil
+ }
+diff --git a/wire/wire_test.go b/wire/wire_test.go
+new file mode 100644
+index 0000000..021e335
+--- /dev/null
++++ b/wire/wire_test.go
+@@ -0,0 +1,245 @@
++package wire
++
++import (
++	"net/http"
++	"net/url"
++	"strings"
++	"testing"
++
++	"vcfauto/mock"
++)
++
++func rec() mock.RecordedRequest {
++	return mock.RecordedRequest{
++		Operation: "deployments.list",
++		Method:    http.MethodGet,
++		Path:      "/deployment/api/deployments",
++		Status:    http.StatusOK,
++		Header:    http.Header{"Authorization": {"Bearer abc"}},
++	}
++}
++
++func TestCheck(t *testing.T) {
++	tests := []struct {
++		name string
++		got  func(mock.RecordedRequest) mock.RecordedRequest
++		want Expectation
++		// wantSubstr, when non-empty, must appear in the error. An empty
++		// wantSubstr means the check must pass.
++		wantSubstr string
++	}{
++		{
++			name: "identical request passes",
++			got:  func(r mock.RecordedRequest) mock.RecordedRequest { return r },
++			want: Expectation{Operation: "deployments.list", Method: http.MethodGet,
++				Path: "/deployment/api/deployments", Status: http.StatusOK},
++		},
++		{
++			name: "wrong path",
++			got:  func(r mock.RecordedRequest) mock.RecordedRequest { return r },
++			want: Expectation{Path: "/deployment/api/deployment"},
++
++			wantSubstr: "path:",
++		},
++		{
++			name: "wrong operation",
++			got:  func(r mock.RecordedRequest) mock.RecordedRequest { return r },
++			want: Expectation{Operation: "catalog.items.list"},
++
++			wantSubstr: "operation:",
++		},
++		{
++			name: "parameter sent empty when none expected",
++			got: func(r mock.RecordedRequest) mock.RecordedRequest {
++				r.Query = url.Values{"search": {""}}
++				return r
++			},
++			want:       Expectation{},
++			wantSubstr: "must be omitted entirely rather than sent with an empty value",
++		},
++		{
++			name: "parameter sent with a value when none expected",
++			got: func(r mock.RecordedRequest) mock.RecordedRequest {
++				r.Query = url.Values{"search": {"web"}}
++				return r
++			},
++			want:       Expectation{},
++			wantSubstr: "must not be sent at all",
++		},
++		{
++			name: "parameter absent when one expected",
++			got:  func(r mock.RecordedRequest) mock.RecordedRequest { return r },
++			want: Expectation{Query: url.Values{"page": {"0"}}},
++
++			wantSubstr: "is absent",
++		},
++		{
++			name: "matching query passes",
++			got: func(r mock.RecordedRequest) mock.RecordedRequest {
++				r.Query = url.Values{"page": {"1"}, "size": {"4"}}
++				return r
++			},
++			want: Expectation{Query: url.Values{"page": {"1"}, "size": {"4"}}},
++		},
++		{
++			name: "body key sent empty when object should be bare",
++			got: func(r mock.RecordedRequest) mock.RecordedRequest {
++				r.Body = []byte(`{"reason":""}`)
++				return r
++			},
++			want:       Expectation{JSONBody: `{}`},
++			wantSubstr: "must be omitted from the object, not sent empty",
++		},
++		{
++			name: "body key sent null when object should be bare",
++			got: func(r mock.RecordedRequest) mock.RecordedRequest {
++				r.Body = []byte(`{"reason":null}`)
++				return r
++			},
++			want:       Expectation{JSONBody: `{}`},
++			wantSubstr: "not sent null",
++		},
++		{
++			name: "bare object matches bare object",
++			got: func(r mock.RecordedRequest) mock.RecordedRequest {
++				r.Body = []byte(`{}`)
++				return r
++			},
++			want: Expectation{JSONBody: `{}`},
++		},
++		{
++			name: "body compares by value not by byte order",
++			got: func(r mock.RecordedRequest) mock.RecordedRequest {
++				r.Body = []byte(`{"projectId":"p","deploymentName":"d"}`)
++				return r
++			},
++			want: Expectation{JSONBody: `{"deploymentName":"d","projectId":"p"}`},
++		},
++		{
++			name: "zero value that was deliberately set is kept",
++			got: func(r mock.RecordedRequest) mock.RecordedRequest {
++				r.Body = []byte(`{"bulkRequestCount":0}`)
++				return r
++			},
++			want: Expectation{JSONBody: `{"bulkRequestCount":0}`},
++		},
++		{
++			name: "expected header absent",
++			got: func(r mock.RecordedRequest) mock.RecordedRequest {
++				r.Header = http.Header{}
++				return r
++			},
++			want:       Expectation{Header: map[string]string{"Authorization": "Bearer abc"}},
++			wantSubstr: "is absent",
++		},
++		{
++			name: "header must not be present",
++			got:  func(r mock.RecordedRequest) mock.RecordedRequest { return r },
++			want: Expectation{AbsentHeaders: []string{"Authorization"}},
++
++			wantSubstr: "must not be sent at all",
++		},
++		{
++			name: "no body expected but one sent",
++			got: func(r mock.RecordedRequest) mock.RecordedRequest {
++				r.Body = []byte(`{}`)
++				return r
++			},
++			want:       Expectation{NoBody: true},
++			wantSubstr: "want no body at all",
++		},
++		{
++			name: "form body compared exactly",
++			got: func(r mock.RecordedRequest) mock.RecordedRequest {
++				r.Body = []byte("grant_type=refresh_token&refresh_token=t")
++				return r
++			},
++			want: Expectation{FormBody: url.Values{
++				"grant_type": {"refresh_token"}, "refresh_token": {"t"}}},
++		},
++		{
++			name: "form body with an extra field",
++			got: func(r mock.RecordedRequest) mock.RecordedRequest {
++				r.Body = []byte("grant_type=refresh_token&scope=")
++				return r
++			},
++			want:       Expectation{FormBody: url.Values{"grant_type": {"refresh_token"}}},
++			wantSubstr: "must be omitted entirely",
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			err := Check(tc.got(rec()), tc.want)
++			if tc.wantSubstr == "" {
++				if err != nil {
++					t.Fatalf("Check() = %v, want nil", err)
++				}
++				return
++			}
++			if err == nil {
++				t.Fatalf("Check() = nil, want an error mentioning %q", tc.wantSubstr)
++			}
++			if !strings.Contains(err.Error(), tc.wantSubstr) {
++				t.Fatalf("Check() = %v, want it to mention %q", err, tc.wantSubstr)
++			}
++		})
++	}
++}
++
++func TestCheckReportsEveryDiscrepancy(t *testing.T) {
++	r := rec()
++	r.Query = url.Values{"search": {""}, "name": {"x"}}
++	err := Check(r, Expectation{Operation: "catalog.items.list", Method: http.MethodPost})
++	if err == nil {
++		t.Fatal("Check() = nil, want an error")
++	}
++	for _, want := range []string{"operation:", "method:", "search", "name"} {
++		if !strings.Contains(err.Error(), want) {
++			t.Errorf("error does not mention %q: %v", want, err)
++		}
++	}
++}
++
++func TestCheckAll(t *testing.T) {
++	tests := []struct {
++		name    string
++		got     []mock.RecordedRequest
++		want    []Expectation
++		wantErr bool
++	}{
++		{name: "empty matches empty"},
++		{
++			name: "length mismatch",
++			got:  []mock.RecordedRequest{rec()},
++
++			wantErr: true,
++		},
++		{
++			name: "in order",
++			got:  []mock.RecordedRequest{rec(), rec()},
++			want: []Expectation{
++				{Operation: "deployments.list"},
++				{Operation: "deployments.list"},
++			},
++		},
++		{
++			name: "reports the index that differs",
++			got:  []mock.RecordedRequest{rec(), rec()},
++			want: []Expectation{
++				{Operation: "deployments.list"},
++				{Operation: "deployments.get"},
++			},
++			wantErr: true,
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			err := CheckAll(tc.got, tc.want)
++			if tc.wantErr != (err != nil) {
++				t.Fatalf("CheckAll() = %v, wantErr %v", err, tc.wantErr)
++			}
++		})
++	}
++}

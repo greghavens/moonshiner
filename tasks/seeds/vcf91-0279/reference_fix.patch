@@ -1,0 +1,483 @@
+diff --git a/VcfOpsChangeClient.java b/VcfOpsChangeClient.java
+new file mode 100644
+index 0000000..a863e85
+--- /dev/null
++++ b/VcfOpsChangeClient.java
+@@ -0,0 +1,477 @@
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.time.Duration;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * Drives the datastore-latency alerting rollout against a VCF Operations 9.1 node.
++ *
++ * Four operations from docs/contract.json, in order: acquireToken, createSymptomDefinition,
++ * createAlertDefinition, createNotificationPluginRule. The run stops at the first operation the
++ * appliance rejects, and applyChange still returns a report describing every attempt plus the
++ * objects that are left behind on the node.
++ */
++public final class VcfOpsChangeClient {
++
++    private static final String BASE_PATH = "/suite-api";
++    private static final String P_ACQUIRE_TOKEN = BASE_PATH + "/api/auth/token/acquire";
++    private static final String P_SYMPTOM_DEFINITIONS = BASE_PATH + "/api/symptomdefinitions";
++    private static final String P_ALERT_DEFINITIONS = BASE_PATH + "/api/alertdefinitions";
++    private static final String P_NOTIFICATION_RULES = BASE_PATH + "/api/notifications/rules";
++
++    private final String baseUrl;
++    private final HttpClient http;
++
++    public VcfOpsChangeClient(String baseUrl) {
++        if (baseUrl == null || baseUrl.isEmpty()) {
++            throw new IllegalArgumentException("baseUrl is required");
++        }
++        this.baseUrl = baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
++        this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
++    }
++
++    /**
++     * Applies the change described by {@code changeRequestJson} and returns the report as JSON.
++     * A rejection by the appliance is a reported outcome, not an exception.
++     */
++    public String applyChange(String changeRequestJson) {
++        Map<String, Object> request = Json.object(Json.parse(changeRequestJson));
++        Run run = new Run();
++
++        Map<String, Object> credentials = Json.object(request.get("credentials"));
++        Map<String, Object> tokenBody = new LinkedHashMap<>();
++        tokenBody.put("username", credentials.get("username"));
++        tokenBody.put("password", credentials.get("password"));
++        // authSource is optional in the spec; carry it only when the change request sets one.
++        putIfPresent(tokenBody, credentials, "authSource");
++
++        Call auth = post("acquireToken", P_ACQUIRE_TOKEN, null, tokenBody, 200);
++        run.record(auth, null);
++        if (!auth.ok) {
++            return run.finish();
++        }
++        String token = str(Json.object(auth.body).get("token"));
++        String authorization = "OpsToken " + token;
++
++        // The symptom definition travels exactly as the change request states it: no id (the node
++        // assigns one) and no placeholder values for waitCycles/cancelCycles style optionals.
++        Map<String, Object> symptomBody = Json.object(request.get("symptomDefinition"));
++        Call symptom = post("createSymptomDefinition", P_SYMPTOM_DEFINITIONS, authorization, symptomBody, 201);
++        String symptomId = symptom.ok ? str(Json.object(symptom.body).get("id")) : null;
++        run.record(symptom, symptomId);
++        if (!symptom.ok) {
++            return run.finish();
++        }
++
++        // The alert definition fires on the symptom that was just created, so its id has to be
++        // threaded into the base symptom set.
++        Map<String, Object> alertBody = Json.object(request.get("alertDefinition"));
++        List<Object> states = Json.array(alertBody.get("states"));
++        Map<String, Object> baseSymptomSet = Json.object(Json.object(states.get(0)).get("base-symptom-set"));
++        baseSymptomSet.put("symptomDefinitionIds", List.of(symptomId));
++
++        Call alert = post("createAlertDefinition", P_ALERT_DEFINITIONS, authorization, alertBody, 201);
++        String alertId = alert.ok ? str(Json.object(alert.body).get("id")) : null;
++        run.record(alert, alertId);
++        if (!alert.ok) {
++            return run.finish();
++        }
++
++        // The rule filters on the alert definition created a moment ago.
++        Map<String, Object> ruleBody = Json.object(request.get("notificationRule"));
++        Map<String, Object> alertFilter = new LinkedHashMap<>();
++        alertFilter.put("values", List.of(alertId));
++        ruleBody.put("alertDefinitionIdFilters", alertFilter);
++
++        Call rule = post("createNotificationPluginRule", P_NOTIFICATION_RULES, authorization, ruleBody, 201);
++        run.record(rule, rule.ok ? str(Json.object(rule.body).get("id")) : null);
++        return run.finish();
++    }
++
++    // ------------------------------------------------------------------ transport
++
++    private Call post(String operationId, String path, String authorization,
++                      Map<String, Object> body, int successStatus) {
++        String payload = Json.write(body);
++        HttpRequest.Builder b = HttpRequest.newBuilder()
++                .uri(URI.create(baseUrl + path))
++                .timeout(Duration.ofSeconds(30))
++                .header("Content-Type", "application/json")
++                .header("Accept", "application/json")
++                .POST(HttpRequest.BodyPublishers.ofString(payload, StandardCharsets.UTF_8));
++        if (authorization != null) {
++            b.header("Authorization", authorization);
++        }
++
++        HttpResponse<String> response;
++        try {
++            response = http.send(b.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
++        } catch (java.io.IOException e) {
++            throw new IllegalStateException(operationId + " could not reach " + baseUrl + path, e);
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++            throw new IllegalStateException(operationId + " was interrupted", e);
++        }
++
++        Call call = new Call(operationId, response.statusCode(), response.statusCode() == successStatus);
++        Object parsed = null;
++        if (!response.body().isEmpty()) {
++            try {
++                parsed = Json.parse(response.body());
++            } catch (RuntimeException ignored) {
++                // Leave the body unparsed; the fallback message below still describes the failure.
++            }
++        }
++        call.body = parsed;
++        if (!call.ok) {
++            call.errorMessage = errorMessage(parsed, response.statusCode());
++        }
++        return call;
++    }
++
++    private static String errorMessage(Object body, int status) {
++        if (body instanceof Map) {
++            Object message = ((Map<?, ?>) body).get("message");
++            if (message instanceof String && !((String) message).isEmpty()) {
++                return (String) message;
++            }
++        }
++        return "HTTP " + status + " with no error message";
++    }
++
++    // ------------------------------------------------------------------ reporting
++
++    private static final class Call {
++        final String operationId;
++        final int status;
++        final boolean ok;
++        Object body;
++        String errorMessage;
++
++        Call(String operationId, int status, boolean ok) {
++            this.operationId = operationId;
++            this.status = status;
++            this.ok = ok;
++        }
++    }
++
++    /** Accumulates what actually happened, so a late failure cannot erase the earlier successes. */
++    private static final class Run {
++        final List<Object> steps = new ArrayList<>();
++        final List<Object> created = new ArrayList<>();
++        boolean anyFailure;
++
++        void record(Call call, String resourceId) {
++            Map<String, Object> step = new LinkedHashMap<>();
++            step.put("operationId", call.operationId);
++            step.put("status", call.ok ? "SUCCEEDED" : "FAILED");
++            step.put("httpStatus", call.status);
++            if (call.ok && resourceId != null) {
++                step.put("resourceId", resourceId);
++                Map<String, Object> resource = new LinkedHashMap<>();
++                resource.put("operationId", call.operationId);
++                resource.put("id", resourceId);
++                created.add(resource);
++            }
++            if (!call.ok) {
++                anyFailure = true;
++                step.put("errorMessage", call.errorMessage);
++            }
++            steps.add(step);
++        }
++
++        String finish() {
++            Map<String, Object> report = new LinkedHashMap<>();
++            report.put("outcome", anyFailure ? (created.isEmpty() ? "FAILED" : "PARTIAL_FAILURE") : "SUCCEEDED");
++            report.put("steps", steps);
++            report.put("createdResources", created);
++            return Json.write(report);
++        }
++    }
++
++    // ------------------------------------------------------------------ helpers
++
++    private static void putIfPresent(Map<String, Object> target, Map<String, Object> source, String key) {
++        Object value = source.get(key);
++        if (value != null && value != Json.NULL) {
++            target.put(key, value);
++        }
++    }
++
++    private static String str(Object value) {
++        return value instanceof String ? (String) value : null;
++    }
++
++    // ------------------------------------------------------------------ minimal JSON
++
++    /** Just enough JSON for this client: no dependencies, and a null that stays distinguishable. */
++    static final class Json {
++
++        static final Object NULL = new Object() {
++            @Override public String toString() { return "null"; }
++        };
++
++        @SuppressWarnings("unchecked")
++        static Map<String, Object> object(Object value) {
++            if (!(value instanceof Map)) {
++                throw new IllegalArgumentException("expected a JSON object, got " + value);
++            }
++            return (Map<String, Object>) value;
++        }
++
++        @SuppressWarnings("unchecked")
++        static List<Object> array(Object value) {
++            if (!(value instanceof List)) {
++                throw new IllegalArgumentException("expected a JSON array, got " + value);
++            }
++            return (List<Object>) value;
++        }
++
++        static Object parse(String text) {
++            P p = new P(text);
++            Object v = p.value();
++            p.ws();
++            if (p.i != text.length()) {
++                throw new IllegalArgumentException("trailing content at offset " + p.i);
++            }
++            return v;
++        }
++
++        static String write(Object value) {
++            StringBuilder sb = new StringBuilder();
++            emit(value, sb);
++            return sb.toString();
++        }
++
++        private static void emit(Object v, StringBuilder sb) {
++            if (v == null || v == NULL) {
++                sb.append("null");
++            } else if (v instanceof String) {
++                quote((String) v, sb);
++            } else if (v instanceof Boolean || v instanceof Long || v instanceof Integer) {
++                sb.append(v);
++            } else if (v instanceof Double) {
++                double d = (Double) v;
++                if (d == Math.rint(d) && !Double.isInfinite(d)) {
++                    sb.append((long) d).append(".0");
++                } else {
++                    sb.append(d);
++                }
++            } else if (v instanceof Map) {
++                sb.append('{');
++                boolean first = true;
++                for (Map.Entry<?, ?> e : ((Map<?, ?>) v).entrySet()) {
++                    if (!first) {
++                        sb.append(',');
++                    }
++                    first = false;
++                    quote(String.valueOf(e.getKey()), sb);
++                    sb.append(':');
++                    emit(e.getValue(), sb);
++                }
++                sb.append('}');
++            } else if (v instanceof List) {
++                sb.append('[');
++                boolean first = true;
++                for (Object e : (List<?>) v) {
++                    if (!first) {
++                        sb.append(',');
++                    }
++                    first = false;
++                    emit(e, sb);
++                }
++                sb.append(']');
++            } else {
++                quote(String.valueOf(v), sb);
++            }
++        }
++
++        private static void quote(String s, StringBuilder sb) {
++            sb.append('"');
++            for (int i = 0; i < s.length(); i++) {
++                char c = s.charAt(i);
++                switch (c) {
++                    case '"': sb.append("\\\""); break;
++                    case '\\': sb.append("\\\\"); break;
++                    case '\n': sb.append("\\n"); break;
++                    case '\r': sb.append("\\r"); break;
++                    case '\t': sb.append("\\t"); break;
++                    case '\b': sb.append("\\b"); break;
++                    case '\f': sb.append("\\f"); break;
++                    default:
++                        if (c < 0x20) {
++                            sb.append(String.format("\\u%04x", (int) c));
++                        } else {
++                            sb.append(c);
++                        }
++                }
++            }
++            sb.append('"');
++        }
++
++        private static final class P {
++            final String s;
++            int i;
++
++            P(String s) { this.s = s; }
++
++            void ws() {
++                while (i < s.length() && Character.isWhitespace(s.charAt(i))) {
++                    i++;
++                }
++            }
++
++            Object value() {
++                ws();
++                if (i >= s.length()) {
++                    throw new IllegalArgumentException("unexpected end of input");
++                }
++                switch (s.charAt(i)) {
++                    case '{': return obj();
++                    case '[': return arr();
++                    case '"': return string();
++                    case 't': lit("true"); return Boolean.TRUE;
++                    case 'f': lit("false"); return Boolean.FALSE;
++                    case 'n': lit("null"); return NULL;
++                    default: return number();
++                }
++            }
++
++            void lit(String l) {
++                if (!s.startsWith(l, i)) {
++                    throw new IllegalArgumentException("bad literal at offset " + i);
++                }
++                i += l.length();
++            }
++
++            Map<String, Object> obj() {
++                Map<String, Object> m = new LinkedHashMap<>();
++                i++;
++                ws();
++                if (i < s.length() && s.charAt(i) == '}') {
++                    i++;
++                    return m;
++                }
++                while (true) {
++                    ws();
++                    String k = string();
++                    ws();
++                    if (i >= s.length() || s.charAt(i) != ':') {
++                        throw new IllegalArgumentException("expected ':' at offset " + i);
++                    }
++                    i++;
++                    m.put(k, value());
++                    ws();
++                    if (i >= s.length()) {
++                        throw new IllegalArgumentException("unterminated object");
++                    }
++                    char c = s.charAt(i++);
++                    if (c == '}') {
++                        return m;
++                    }
++                    if (c != ',') {
++                        throw new IllegalArgumentException("expected ',' or '}' at offset " + (i - 1));
++                    }
++                }
++            }
++
++            List<Object> arr() {
++                List<Object> l = new ArrayList<>();
++                i++;
++                ws();
++                if (i < s.length() && s.charAt(i) == ']') {
++                    i++;
++                    return l;
++                }
++                while (true) {
++                    l.add(value());
++                    ws();
++                    if (i >= s.length()) {
++                        throw new IllegalArgumentException("unterminated array");
++                    }
++                    char c = s.charAt(i++);
++                    if (c == ']') {
++                        return l;
++                    }
++                    if (c != ',') {
++                        throw new IllegalArgumentException("expected ',' or ']' at offset " + (i - 1));
++                    }
++                }
++            }
++
++            String string() {
++                if (i >= s.length() || s.charAt(i) != '"') {
++                    throw new IllegalArgumentException("expected a string at offset " + i);
++                }
++                i++;
++                StringBuilder sb = new StringBuilder();
++                while (true) {
++                    if (i >= s.length()) {
++                        throw new IllegalArgumentException("unterminated string");
++                    }
++                    char c = s.charAt(i++);
++                    if (c == '"') {
++                        return sb.toString();
++                    }
++                    if (c != '\\') {
++                        sb.append(c);
++                        continue;
++                    }
++                    char e = s.charAt(i++);
++                    switch (e) {
++                        case '"': sb.append('"'); break;
++                        case '\\': sb.append('\\'); break;
++                        case '/': sb.append('/'); break;
++                        case 'b': sb.append('\b'); break;
++                        case 'f': sb.append('\f'); break;
++                        case 'n': sb.append('\n'); break;
++                        case 'r': sb.append('\r'); break;
++                        case 't': sb.append('\t'); break;
++                        case 'u':
++                            sb.append((char) Integer.parseInt(s.substring(i, i + 4), 16));
++                            i += 4;
++                            break;
++                        default: throw new IllegalArgumentException("bad escape \\" + e);
++                    }
++                }
++            }
++
++            Object number() {
++                int start = i;
++                if (i < s.length() && (s.charAt(i) == '-' || s.charAt(i) == '+')) {
++                    i++;
++                }
++                boolean fractional = false;
++                while (i < s.length()) {
++                    char c = s.charAt(i);
++                    if (c >= '0' && c <= '9') {
++                        i++;
++                    } else if (c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-') {
++                        fractional = true;
++                        i++;
++                    } else {
++                        break;
++                    }
++                }
++                String raw = s.substring(start, i);
++                if (raw.isEmpty()) {
++                    throw new IllegalArgumentException("expected a number at offset " + start);
++                }
++                if (!fractional) {
++                    try {
++                        return Long.parseLong(raw);
++                    } catch (NumberFormatException ignored) {
++                        // fall through
++                    }
++                }
++                return Double.parseDouble(raw);
++            }
++        }
++    }
++}

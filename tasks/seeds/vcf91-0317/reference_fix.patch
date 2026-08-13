@@ -1,0 +1,315 @@
+diff --git a/vcfa_catalog/__init__.py b/vcfa_catalog/__init__.py
+new file mode 100644
+index 0000000..f26e8e8
+--- /dev/null
++++ b/vcfa_catalog/__init__.py
+@@ -0,0 +1,13 @@
++"""Client for the VMware Cloud Foundation Automation 9.1 catalog API.
++
++The API surface this package speaks is defined by ``docs/contract.json``, which
++was derived from the Broadcom xAPIs reference rather than from a published
++specification. Standard library only.
++"""
++
++from .client import CatalogClient, VcfaApiError
++
++__all__ = [
++    "CatalogClient",
++    "VcfaApiError",
++]
+diff --git a/vcfa_catalog/__main__.py b/vcfa_catalog/__main__.py
+new file mode 100644
+index 0000000..b040bce
+--- /dev/null
++++ b/vcfa_catalog/__main__.py
+@@ -0,0 +1,77 @@
++"""Command line front end for the VCF Automation catalog client.
++
++    python -m vcfa_catalog list-items --base-url URL --token TOKEN
++    python -m vcfa_catalog get-item   --base-url URL --token TOKEN --id ID
++
++``list-items`` writes one tab-separated ``<id>\\t<name>`` line per catalog item,
++in the order the contract requires, so the output is diffable between runs.
++"""
++
++import argparse
++import json
++import sys
++
++from .client import DEFAULT_PAGE_SIZE, CatalogClient, VcfaApiError
++
++
++def build_parser():
++    parser = argparse.ArgumentParser(prog="vcfa_catalog", description=__doc__)
++    sub = parser.add_subparsers(dest="command", required=True)
++
++    def common(sp):
++        sp.add_argument("--base-url", required=True, help="VCF Automation base URL")
++        sp.add_argument("--token", required=True, help="bearer access token")
++
++    listing = sub.add_parser("list-items", help="list every catalog item")
++    common(listing)
++    listing.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE)
++    listing.add_argument("--search", default=None)
++    listing.add_argument(
++        "--project",
++        dest="projects",
++        action="append",
++        default=None,
++        help="repeatable; sent as one comma-joined 'projects' parameter",
++    )
++    listing.add_argument(
++        "--type", dest="types", action="append", default=None, help="repeatable"
++    )
++    listing.add_argument("--expand-projects", action="store_true", default=None)
++
++    one = sub.add_parser("get-item", help="fetch a single catalog item")
++    common(one)
++    one.add_argument("--id", required=True, dest="item_id")
++
++    return parser
++
++
++def main(argv=None):
++    args = build_parser().parse_args(argv)
++    client = CatalogClient(
++        args.base_url,
++        args.token,
++        page_size=getattr(args, "page_size", DEFAULT_PAGE_SIZE),
++    )
++
++    try:
++        if args.command == "list-items":
++            items = client.list_catalog_items(
++                search=args.search,
++                projects=args.projects,
++                types=args.types,
++                expand_projects=args.expand_projects,
++            )
++            for item in items:
++                sys.stdout.write("%s\t%s\n" % (item["id"], item["name"]))
++        else:
++            item = client.get_catalog_item(args.item_id)
++            json.dump(item, sys.stdout, indent=2)
++            sys.stdout.write("\n")
++    except VcfaApiError as exc:
++        sys.stderr.write("%s\n" % exc)
++        return 1
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/vcfa_catalog/client.py b/vcfa_catalog/client.py
+new file mode 100644
+index 0000000..85c1228
+--- /dev/null
++++ b/vcfa_catalog/client.py
+@@ -0,0 +1,207 @@
++"""HTTP client for the two catalog operations named in ``docs/contract.json``.
++
++Every wire-shape decision here cites the contract clause it implements, because
++the contract is derived from reference documentation rather than from a
++specification: several of its clauses are choices the contract pinned where the
++Broadcom xAPIs reference is ambiguous, and a reader needs to know which is which.
++"""
++
++import json
++import urllib.error
++import urllib.parse
++import urllib.request
++
++DEFAULT_API_VERSION = "9.1.0"
++DEFAULT_PAGE_SIZE = 20
++DEFAULT_TIMEOUT = 30.0
++
++CATALOG_ITEMS_PATH = "/catalog/api/items"
++
++
++class VcfaApiError(RuntimeError):
++    """A VCF Automation endpoint answered with an error status.
++
++    The body follows the contract's ``Error`` schema, so ``error_code`` and
++    ``server_message`` are lifted out of it when present.
++    """
++
++    def __init__(self, status_code, server_message=None, error_code=None, url=None):
++        self.status_code = status_code
++        self.server_message = server_message
++        self.error_code = error_code
++        self.url = url
++        detail = server_message or "no message"
++        if error_code:
++            detail = "%s: %s" % (error_code, detail)
++        super().__init__("HTTP %s from %s (%s)" % (status_code, url, detail))
++
++
++def _as_csv(value):
++    """Serialise a multi-valued query parameter.
++
++    Contract conventions.array_parameter_serialization: one occurrence, members
++    joined by a bare comma. Contract conventions.omission_of_unset_parameters:
++    an empty collection is unset, so it becomes ``None`` and is dropped later.
++    """
++    if value is None:
++        return None
++    if isinstance(value, str):
++        members = [value]
++    else:
++        members = [str(member) for member in value]
++    if not members:
++        return None
++    return ",".join(members)
++
++
++def _as_bool(value):
++    """Contract conventions.boolean_parameter_serialization: lowercase literals.
++
++    ``None`` means the caller did not set the flag and the parameter is omitted;
++    ``False`` is a value the caller chose and is sent as ``false``.
++    """
++    if value is None:
++        return None
++    return "true" if value else "false"
++
++
++def _as_text(value):
++    if value is None:
++        return None
++    text = str(value)
++    return text if text.strip() != "" else None
++
++
++def _sort_key(item):
++    """Contract pagination.result_ordering: name then id, raw code points.
++
++    Python compares ``str`` by code point already, so no folding or normalisation
++    is applied here on purpose.
++    """
++    return (item["name"], item["id"])
++
++
++class CatalogClient:
++    """Reads the VCF Automation catalog over HTTP.
++
++    ``base_url`` is the scheme, host and port of the VCF Automation appliance;
++    the contract's paths are appended to it.
++    """
++
++    def __init__(
++        self,
++        base_url,
++        token,
++        api_version=DEFAULT_API_VERSION,
++        page_size=DEFAULT_PAGE_SIZE,
++        timeout=DEFAULT_TIMEOUT,
++    ):
++        if page_size < 1 or page_size > 2000:
++            raise ValueError("page_size must be between 1 and 2000")
++        self.base_url = base_url.rstrip("/")
++        self.token = token
++        self.api_version = api_version
++        self.page_size = page_size
++        self.timeout = timeout
++
++    # -- transport ---------------------------------------------------------
++
++    def _headers(self):
++        return {
++            # Contract auth: bearerAuth.
++            "Authorization": "Bearer %s" % self.token,
++            # Contract conventions.accept_header: the API version lives here,
++            # not in the URL.
++            "Accept": "application/json;version=%s" % self.api_version,
++        }
++
++    def _build_url(self, path, params):
++        # Dropping None here is what implements
++        # conventions.omission_of_unset_parameters: an unset parameter never
++        # reaches the query string, rather than reaching it empty.
++        present = [(name, value) for name, value in params if value is not None]
++        url = self.base_url + path
++        if present:
++            # safe="," keeps the array separator literal, as the contract's
++            # percent_encoding clause requires.
++            url += "?" + urllib.parse.urlencode(present, safe=",")
++        return url
++
++    def _get(self, path, params=()):
++        url = self._build_url(path, params)
++        request = urllib.request.Request(url, method="GET", headers=self._headers())
++        try:
++            with urllib.request.urlopen(request, timeout=self.timeout) as response:
++                payload = response.read()
++        except urllib.error.HTTPError as exc:
++            raise _http_error(exc, url) from None
++        return json.loads(payload.decode("utf-8"))
++
++    # -- operations --------------------------------------------------------
++
++    def list_catalog_items(
++        self,
++        search=None,
++        projects=None,
++        types=None,
++        sort=None,
++        expand=None,
++        expand_projects=None,
++    ):
++        """Return the whole catalog item collection, de-duplicated and ordered.
++
++        Walks every page of ``GET /catalog/api/items`` and returns the distinct
++        items ascending by name, ties broken by id.
++        """
++        filters = [
++            ("sort", _as_csv(sort)),
++            ("search", _as_text(search)),
++            ("projects", _as_csv(projects)),
++            ("types", _as_csv(types)),
++            ("expandProjects", _as_bool(expand_projects)),
++            ("expand", _as_text(expand)),
++        ]
++
++        # Contract pagination.id_stability: the collection may be re-sorted
++        # between requests, so an id can arrive twice. Keep the first sighting.
++        collected = {}
++        page = 0
++        while True:
++            params = [("page", str(page)), ("size", str(self.page_size))] + filters
++            body = self._get(CATALOG_ITEMS_PATH, params)
++            for item in body.get("content") or []:
++                collected.setdefault(item["id"], item)
++            # Contract pagination.termination: stop on last, never on a count.
++            # totalElements is advisory and the per-page sums can exceed it.
++            if body.get("last"):
++                break
++            page += 1
++
++        return sorted(collected.values(), key=_sort_key)
++
++    def get_catalog_item(self, item_id, expand=None, expand_projects=None):
++        """Return one catalog item by id."""
++        path = "%s/%s" % (
++            CATALOG_ITEMS_PATH,
++            urllib.parse.quote(str(item_id), safe=""),
++        )
++        params = [
++            ("expandProjects", _as_bool(expand_projects)),
++            ("expand", _as_text(expand)),
++        ]
++        return self._get(path, params)
++
++
++def _http_error(exc, url):
++    server_message = None
++    error_code = None
++    try:
++        body = json.loads(exc.read().decode("utf-8"))
++    except Exception:
++        body = None
++    if isinstance(body, dict):
++        server_message = body.get("serverMessage")
++        error_code = body.get("errorCode")
++    return VcfaApiError(
++        exc.code, server_message=server_message, error_code=error_code, url=url
++    )

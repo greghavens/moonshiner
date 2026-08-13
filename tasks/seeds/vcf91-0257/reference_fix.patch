@@ -1,0 +1,152 @@
+--- a/src/VcfOpsCredentialRotation/VcfOpsCredentialRotation.psm1
++++ b/src/VcfOpsCredentialRotation/VcfOpsCredentialRotation.psm1
+@@ -2,16 +2,23 @@
+ 
+ Set-StrictMode -Version Latest
+ 
++Import-Module VMware.Sdk.Vcf.Ops -ErrorAction Stop
++
+ <#
+ .SYNOPSIS
+     Rotate the secret behind a VCF Operations credential without stranding
+     adapter instances that are still collecting on the old one.
+ 
+ .DESCRIPTION
+-    NOT IMPLEMENTED.
+-
+-    See README.md for the required behaviour and docs/contract.json for the
+-    operations this module is allowed to use.
++    Rewriting a credential in place cuts over every adapter instance at once,
++    so any collection cycle already in flight fails against the old secret.
++    This rotation stages a replacement credential first, moves each adapter
++    instance onto it, proves that nothing still references the original, and
++    only then marks the original retired.
++
++    All API traffic goes through the VMware.Sdk.Vcf.Ops cmdlets, which
++    serialise the request models for us -- notably, properties that were
++    never set are left out of the JSON rather than sent as null.
+ 
+ .OUTPUTS
+     [pscustomobject] with the properties:
+@@ -38,8 +45,119 @@
+         [int] $MaxAttempts = 3
+     )
+ 
+-    throw [System.NotImplementedException]::new(
+-        'Invoke-VcfOpsCredentialRotation is not implemented yet.')
++    $session = Connect-VcfOpsServer -Server $Server -Port $Port -Protocol $Protocol `
++        -User $User -Password $Password -NotDefault -ErrorAction Stop
++
++    try {
++        # --- locate the credential being rotated -------------------------
++        $existing = Invoke-VcfOpsGetCredentials -Server $session -AdapterKind @($AdapterKind) -ErrorAction Stop
++        $old = @($existing._CredentialInstances | Where-Object { $_.Name -eq $CredentialName })
++
++        if ($old.Count -ne 1) {
++            throw "expected exactly one '$AdapterKind' credential named '$CredentialName', found $($old.Count)"
++        }
++        $old = $old[0]
++
++        # --- stage the replacement ---------------------------------------
++        # Id is deliberately not set: the spec requires it to be absent when
++        # creating, and the SDK omits properties that were never assigned.
++        $secretField = Initialize-VcfOpsnamevalue -Name $SecretFieldName -Value $NewSecret
++        $staged = Initialize-VcfOpscredential `
++            -Name $NewCredentialName `
++            -AdapterKindKey $old.AdapterKindKey `
++            -CredentialKindKey $old.CredentialKindKey `
++            -Fields @($secretField)
++
++        $new = Invoke-VcfOpsCreateCredential -Server $session -Credential $staged -ErrorAction Stop
++        Write-Verbose "staged replacement credential $($new.Id)"
++
++        # --- move every adapter instance onto the replacement ------------
++        $bound = @(Get-BoundAdapter -Session $session -AdapterKind $AdapterKind -CredentialId $old.Id)
++        $repointed = [System.Collections.Generic.List[string]]::new()
++
++        foreach ($adapter in $bound) {
++            Set-AdapterCredential -Session $session -Adapter $adapter `
++                -CredentialId $new.Id -MaxAttempts $MaxAttempts
++            $repointed.Add([string]$adapter.Id)
++        }
++
++        # --- prove the old credential is unused before touching it -------
++        $still = @(Get-BoundAdapter -Session $session -AdapterKind $AdapterKind -CredentialId $old.Id)
++        $drained = ($still.Count -eq 0)
++
++        $retired = $false
++        $retiredName = $null
++        if ($drained) {
++            $retiredName = "$CredentialName (retired)"
++            # Only name changes. Rewriting `fields` here would push a new
++            # secret onto a credential something might still be using.
++            $marker = Initialize-VcfOpscredential `
++                -Id $old.Id `
++                -Name $retiredName `
++                -AdapterKindKey $old.AdapterKindKey `
++                -CredentialKindKey $old.CredentialKindKey
++
++            $null = Invoke-VcfOpsPartialUpdateCredential -Server $session -Credential $marker -ErrorAction Stop
++            $retired = $true
++        }
++        else {
++            Write-Warning ("$($still.Count) adapter instance(s) still reference $($old.Id); " +
++                           'leaving the original credential in place')
++        }
++
++        return [pscustomobject]@{
++            OldCredentialId       = [string]$old.Id
++            NewCredentialId       = [string]$new.Id
++            RepointedAdapterIds   = @($repointed | Sort-Object)
++            Drained               = $drained
++            Retired               = $retired
++            RetiredCredentialName = $retiredName
++        }
++    }
++    finally {
++        Disconnect-VcfOpsServer -Server $session -ErrorAction SilentlyContinue
++    }
++}
++
++function Get-BoundAdapter {
++    [CmdletBinding()]
++    param($Session, [string]$AdapterKind, $CredentialId)
++
++    $all = Invoke-VcfOpsEnumerateAdapterInstances -Server $Session -AdapterKindKey $AdapterKind -ErrorAction Stop
++    return @($all.AdapterInstancesInfoDto | Where-Object { $_.CredentialInstanceId -eq $CredentialId })
++}
++
++function Set-AdapterCredential {
++    [CmdletBinding()]
++    param($Session, $Adapter, $CredentialId, [int]$MaxAttempts)
++
++    # resourceKey is the only required property of adapter-instance; sending
++    # the rest of the instance back would echo nulls the server never asked for.
++    $resourceKey = Initialize-VcfOpsresourcekey `
++        -Name $Adapter.ResourceKey.Name `
++        -AdapterKindKey $Adapter.ResourceKey.AdapterKindKey `
++        -ResourceKindKey $Adapter.ResourceKey.ResourceKindKey
++
++    $patch = Initialize-VcfOpsadapterinstance `
++        -Id $Adapter.Id `
++        -ResourceKey $resourceKey `
++        -CredentialInstanceId $CredentialId
++
++    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
++        try {
++            $null = Invoke-VcfOpsPatchAdapterInstance -Server $Session -AdapterInstance $patch -ErrorAction Stop
++            return
++        }
++        catch {
++            if ($attempt -ge $MaxAttempts) {
++                throw "could not repoint adapter instance $($Adapter.Id) after $MaxAttempts attempt(s): $_"
++            }
++            # A collector mid-cycle rejects the repoint; leaving it on the old
++            # credential is exactly the stranding we are trying to avoid.
++            Write-Verbose "adapter $($Adapter.Id) attempt $attempt failed, retrying: $_"
++            Start-Sleep -Milliseconds 200
++        }
++    }
+ }
+ 
+ Export-ModuleMember -Function Invoke-VcfOpsCredentialRotation

@@ -1,0 +1,1007 @@
+diff --git a/reportclient/client.go b/reportclient/client.go
+new file mode 100644
+index 0000000..1caaab6
+--- /dev/null
++++ b/reportclient/client.go
+@@ -0,0 +1,391 @@
++package reportclient
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strings"
++	"time"
++)
++
++// Paths and statuses below mirror docs/contract.json, which was derived from the
++// VCF Operations OpenAPI specification recorded in docs/official_sources.json.
++const (
++	basePath = "/suite-api"
++
++	pathAcquireToken = basePath + "/api/auth/token/acquire"
++	pathReports      = basePath + "/api/reports"
++
++	authHeader        = "Authorization"
++	authValuePrefix   = "vRealizeOpsToken "
++	mediaTypeJSON     = "application/json"
++	mediaTypeDownload = "application/pdf, text/csv"
++
++	statusCompleted = "COMPLETED"
++	statusFailed    = "FAILED"
++
++	defaultPollInterval    = 5 * time.Second
++	defaultMaxPollAttempts = 60
++)
++
++// Sentinel errors, matchable with errors.Is.
++var (
++	// ErrInvalidRequest means the request was rejected locally, before any HTTP
++	// request was made.
++	ErrInvalidRequest = errors.New("reportclient: invalid request")
++	// ErrReportFailed means the report reached the FAILED terminal status.
++	ErrReportFailed = errors.New("reportclient: report generation failed")
++	// ErrPollTimeout means the report never reached a terminal status within the
++	// configured number of poll attempts.
++	ErrPollTimeout = errors.New("reportclient: report did not reach a terminal state")
++)
++
++// Config configures a Client.
++type Config struct {
++	// BaseURL is the appliance root, without the /suite-api base path.
++	BaseURL string
++	// Username and Password authenticate against acquireToken.
++	Username string
++	Password string
++	// AuthSource is optional. When empty it is omitted from the request body.
++	AuthSource string
++	// HTTPClient defaults to a client with a 30 second timeout.
++	HTTPClient *http.Client
++	// PollInterval is the wait between getReport polls. Defaults to 5s.
++	PollInterval time.Duration
++	// MaxPollAttempts bounds the number of getReport calls. Defaults to 60.
++	MaxPollAttempts int
++}
++
++// Client drives the report-generation flow against one appliance.
++type Client struct {
++	base            *url.URL
++	username        string
++	password        string
++	authSource      string
++	httpClient      *http.Client
++	pollInterval    time.Duration
++	maxPollAttempts int
++}
++
++// TraversalSpec selects the resource hierarchy a report is generated over.
++// Only Name is required; the remaining fields are omitted from the request when
++// left at their zero value.
++type TraversalSpec struct {
++	Name                       string
++	Description                string
++	RootAdapterKindKey         string
++	RootResourceKindKey        string
++	AdapterInstanceAssociation *bool
++}
++
++// ReportRequest describes a report to generate. ReportDefinitionID and
++// ResourceID are required; every other field is omitted from the request body
++// when unset. Publish is a pointer so that an explicit false is sent rather
++// than treated as unset.
++type ReportRequest struct {
++	ReportDefinitionID string
++	ResourceID         string
++	Name               string
++	Description        string
++	Subject            []string
++	Publish            *bool
++	TraversalSpec      *TraversalSpec
++}
++
++// Report is the appliance's view of a report.
++type Report struct {
++	ID                 string
++	Status             string
++	ReportDefinitionID string
++	ResourceID         string
++	Name               string
++	Owner              string
++	CompletionTime     string
++}
++
++// Result is a completed generation: the terminal report plus its downloaded
++// content.
++type Result struct {
++	Report      Report
++	Content     []byte
++	ContentType string
++	// PollCount is the number of getReport calls made.
++	PollCount int
++}
++
++// New builds a Client. It validates configuration but performs no I/O.
++func New(cfg Config) (*Client, error) {
++	if strings.TrimSpace(cfg.BaseURL) == "" {
++		return nil, fmt.Errorf("%w: BaseURL is required", ErrInvalidRequest)
++	}
++	base, err := url.Parse(strings.TrimRight(cfg.BaseURL, "/"))
++	if err != nil {
++		return nil, fmt.Errorf("%w: BaseURL %q: %v", ErrInvalidRequest, cfg.BaseURL, err)
++	}
++	if base.Scheme == "" || base.Host == "" {
++		return nil, fmt.Errorf("%w: BaseURL %q needs a scheme and host", ErrInvalidRequest, cfg.BaseURL)
++	}
++	if cfg.Username == "" || cfg.Password == "" {
++		return nil, fmt.Errorf("%w: Username and Password are required", ErrInvalidRequest)
++	}
++
++	c := &Client{
++		base:            base,
++		username:        cfg.Username,
++		password:        cfg.Password,
++		authSource:      cfg.AuthSource,
++		httpClient:      cfg.HTTPClient,
++		pollInterval:    cfg.PollInterval,
++		maxPollAttempts: cfg.MaxPollAttempts,
++	}
++	if c.httpClient == nil {
++		c.httpClient = &http.Client{Timeout: 30 * time.Second}
++	}
++	if c.pollInterval <= 0 {
++		c.pollInterval = defaultPollInterval
++	}
++	if c.maxPollAttempts <= 0 {
++		c.maxPollAttempts = defaultMaxPollAttempts
++	}
++	return c, nil
++}
++
++// GenerateReport runs the whole asynchronous flow: acquire a token, create the
++// report, poll it to a terminal status, and download it when it succeeded.
++//
++// format selects the download encoding ("csv" or "pdf"). When empty the format
++// query parameter is omitted and the appliance picks its default.
++//
++// A report that reaches FAILED returns ErrReportFailed and is never downloaded.
++// A report still non-terminal after MaxPollAttempts returns ErrPollTimeout.
++func (c *Client) GenerateReport(ctx context.Context, req ReportRequest, format string) (*Result, error) {
++	if err := req.validate(); err != nil {
++		return nil, err
++	}
++
++	token, err := c.acquireToken(ctx)
++	if err != nil {
++		return nil, err
++	}
++
++	created, err := c.createReport(ctx, token, req)
++	if err != nil {
++		return nil, err
++	}
++	if created.ID == "" {
++		return nil, fmt.Errorf("reportclient: createReport returned no report identifier")
++	}
++
++	// createReport only queues the work, so its status is never the outcome.
++	// Poll until the appliance reports a terminal status.
++	report, polls, err := c.pollToTerminal(ctx, token, created.ID)
++	if err != nil {
++		return nil, err
++	}
++
++	if report.Status == statusFailed {
++		return nil, fmt.Errorf("%w: report %s", ErrReportFailed, report.ID)
++	}
++
++	content, contentType, err := c.downloadReport(ctx, token, report.ID, format)
++	if err != nil {
++		return nil, err
++	}
++
++	return &Result{
++		Report:      report,
++		Content:     content,
++		ContentType: contentType,
++		PollCount:   polls,
++	}, nil
++}
++
++func (r ReportRequest) validate() error {
++	if r.ReportDefinitionID == "" {
++		return fmt.Errorf("%w: ReportDefinitionID is required", ErrInvalidRequest)
++	}
++	if r.ResourceID == "" {
++		return fmt.Errorf("%w: ResourceID is required", ErrInvalidRequest)
++	}
++	if r.TraversalSpec != nil && r.TraversalSpec.Name == "" {
++		return fmt.Errorf("%w: TraversalSpec.Name is required", ErrInvalidRequest)
++	}
++	return nil
++}
++
++func (c *Client) acquireToken(ctx context.Context) (string, error) {
++	body := credentialsWire{
++		AuthSource: c.authSource,
++		Password:   c.password,
++		Username:   c.username,
++	}
++	var out authTokenWire
++	if err := c.doJSON(ctx, http.MethodPost, c.url(pathAcquireToken, nil), "", body, &out); err != nil {
++		return "", fmt.Errorf("acquireToken: %w", err)
++	}
++	if out.Token == "" {
++		return "", fmt.Errorf("acquireToken: appliance returned an empty token")
++	}
++	return out.Token, nil
++}
++
++func (c *Client) createReport(ctx context.Context, token string, req ReportRequest) (Report, error) {
++	var out reportWire
++	if err := c.doJSON(ctx, http.MethodPost, c.url(pathReports, nil), token, req.wire(), &out); err != nil {
++		return Report{}, fmt.Errorf("createReport: %w", err)
++	}
++	return out.report(), nil
++}
++
++func (c *Client) pollToTerminal(ctx context.Context, token, reportID string) (Report, int, error) {
++	pollPath := pathReports + "/" + url.PathEscape(reportID)
++
++	var last Report
++	for attempt := 1; attempt <= c.maxPollAttempts; attempt++ {
++		if attempt > 1 {
++			if err := sleep(ctx, c.pollInterval); err != nil {
++				return Report{}, attempt - 1, err
++			}
++		}
++
++		var out reportWire
++		if err := c.doJSON(ctx, http.MethodGet, c.url(pollPath, nil), token, nil, &out); err != nil {
++			return Report{}, attempt, fmt.Errorf("getReport: %w", err)
++		}
++		last = out.report()
++
++		if isTerminal(last.Status) {
++			return last, attempt, nil
++		}
++	}
++
++	return last, c.maxPollAttempts, fmt.Errorf("%w: report %s was still %q after %d polls",
++		ErrPollTimeout, reportID, last.Status, c.maxPollAttempts)
++}
++
++func (c *Client) downloadReport(ctx context.Context, token, reportID, format string) ([]byte, string, error) {
++	// An unset format must not appear in the URL at all, so the query is only
++	// built when there is something to put in it.
++	var query url.Values
++	if format != "" {
++		query = url.Values{"format": []string{format}}
++	}
++	target := c.url(pathReports+"/"+url.PathEscape(reportID)+"/download", query)
++
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
++	if err != nil {
++		return nil, "", fmt.Errorf("downloadReport: %w", err)
++	}
++	req.Header.Set(authHeader, authValuePrefix+token)
++	req.Header.Set("Accept", mediaTypeDownload)
++
++	resp, err := c.httpClient.Do(req)
++	if err != nil {
++		return nil, "", fmt.Errorf("downloadReport: %w", err)
++	}
++	defer resp.Body.Close()
++
++	payload, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return nil, "", fmt.Errorf("downloadReport: read body: %w", err)
++	}
++	if resp.StatusCode < 200 || resp.StatusCode > 299 {
++		return nil, "", fmt.Errorf("downloadReport: %s", statusError(resp.StatusCode, payload))
++	}
++	return payload, resp.Header.Get("Content-Type"), nil
++}
++
++// url joins a contract path onto the base URL. query is omitted entirely when
++// empty, so the request carries no "?" at all.
++func (c *Client) url(path string, query url.Values) string {
++	u := *c.base
++	u.Path = strings.TrimRight(u.Path, "/") + path
++	if len(query) > 0 {
++		u.RawQuery = query.Encode()
++	}
++	return u.String()
++}
++
++// doJSON sends an optional JSON body and decodes an optional JSON response.
++// token is empty for operations the contract exempts from authorization.
++func (c *Client) doJSON(ctx context.Context, method, target, token string, in, out any) error {
++	var reader io.Reader
++	if in != nil {
++		encoded, err := json.Marshal(in)
++		if err != nil {
++			return fmt.Errorf("encode body: %w", err)
++		}
++		reader = bytes.NewReader(encoded)
++	}
++
++	req, err := http.NewRequestWithContext(ctx, method, target, reader)
++	if err != nil {
++		return err
++	}
++	req.Header.Set("Accept", mediaTypeJSON)
++	if in != nil {
++		req.Header.Set("Content-Type", mediaTypeJSON)
++	}
++	if token != "" {
++		req.Header.Set(authHeader, authValuePrefix+token)
++	}
++
++	resp, err := c.httpClient.Do(req)
++	if err != nil {
++		return err
++	}
++	defer resp.Body.Close()
++
++	payload, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return fmt.Errorf("read body: %w", err)
++	}
++	if resp.StatusCode < 200 || resp.StatusCode > 299 {
++		return statusError(resp.StatusCode, payload)
++	}
++	if out == nil {
++		return nil
++	}
++	if err := json.Unmarshal(payload, out); err != nil {
++		return fmt.Errorf("decode response: %w", err)
++	}
++	return nil
++}
++
++func isTerminal(status string) bool {
++	return status == statusCompleted || status == statusFailed
++}
++
++func sleep(ctx context.Context, d time.Duration) error {
++	timer := time.NewTimer(d)
++	defer timer.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-timer.C:
++		return nil
++	}
++}
++
++func statusError(code int, payload []byte) error {
++	var apiErr struct {
++		Message string `json:"message"`
++	}
++	if err := json.Unmarshal(payload, &apiErr); err == nil && apiErr.Message != "" {
++		return fmt.Errorf("appliance returned %d: %s", code, apiErr.Message)
++	}
++	snippet := strings.TrimSpace(string(payload))
++	if len(snippet) > 200 {
++		snippet = snippet[:200] + "..."
++	}
++	if snippet == "" {
++		return fmt.Errorf("appliance returned %d", code)
++	}
++	return fmt.Errorf("appliance returned %d: %s", code, snippet)
++}
+diff --git a/reportclient/client_test.go b/reportclient/client_test.go
+new file mode 100644
+index 0000000..571bef1
+--- /dev/null
++++ b/reportclient/client_test.go
+@@ -0,0 +1,477 @@
++package reportclient_test
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"reflect"
++	"sort"
++	"strings"
++	"testing"
++	"time"
++
++	"vcfops.local/opsreport/internal/mockops"
++	"vcfops.local/opsreport/reportclient"
++)
++
++const (
++	testDefinitionID = "8b1c3a12-4f6d-4a1e-9c33-7d5e2b0a91f4"
++	testResourceID   = "2a7d5e90-1c4b-4e33-8f21-6b9a0d3c5e18"
++)
++
++func ptr[T any](v T) *T { return &v }
++
++// newClient boots a mock and returns a client wired to it.
++func newClient(t *testing.T, sc mockops.Scenario) (*reportclient.Client, *mockops.Server) {
++	t.Helper()
++	srv := mockops.Start(t, sc)
++	got := srv.Scenario()
++	client, err := reportclient.New(reportclient.Config{
++		BaseURL:         srv.URL(),
++		HTTPClient:      srv.Client(),
++		Username:        got.Username,
++		Password:        got.Password,
++		AuthSource:      got.AuthSource,
++		PollInterval:    time.Millisecond,
++		MaxPollAttempts: 10,
++	})
++	if err != nil {
++		t.Fatalf("New: %v", err)
++	}
++	return client, srv
++}
++
++func TestNewValidatesConfig(t *testing.T) {
++	t.Parallel()
++
++	tests := []struct {
++		name    string
++		cfg     reportclient.Config
++		wantErr bool
++	}{
++		{
++			name:    "complete config",
++			cfg:     reportclient.Config{BaseURL: "https://127.0.0.1:8443", Username: "u", Password: "p"},
++			wantErr: false,
++		},
++		{"no base url", reportclient.Config{Username: "u", Password: "p"}, true},
++		{"base url without scheme", reportclient.Config{BaseURL: "127.0.0.1:8443", Username: "u", Password: "p"}, true},
++		{"no username", reportclient.Config{BaseURL: "https://127.0.0.1:8443", Password: "p"}, true},
++		{"no password", reportclient.Config{BaseURL: "https://127.0.0.1:8443", Username: "u"}, true},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			client, err := reportclient.New(tc.cfg)
++			if tc.wantErr {
++				if err == nil {
++					t.Fatal("New succeeded, want an error")
++				}
++				if !errors.Is(err, reportclient.ErrInvalidRequest) {
++					t.Errorf("New error = %v, want errors.Is(err, ErrInvalidRequest)", err)
++				}
++				return
++			}
++			if err != nil {
++				t.Fatalf("New: %v", err)
++			}
++			if client == nil {
++				t.Fatal("New returned a nil client and no error")
++			}
++		})
++	}
++}
++
++func TestGenerateReportSerializesOnlyTheFieldsThatWereSet(t *testing.T) {
++	t.Parallel()
++
++	tests := []struct {
++		name     string
++		req      reportclient.ReportRequest
++		wantKeys []string
++	}{
++		{
++			name:     "required fields only",
++			req:      reportclient.ReportRequest{ReportDefinitionID: testDefinitionID, ResourceID: testResourceID},
++			wantKeys: []string{"reportDefinitionId", "resourceId"},
++		},
++		{
++			name: "name only",
++			req: reportclient.ReportRequest{
++				ReportDefinitionID: testDefinitionID,
++				ResourceID:         testResourceID,
++				Name:               "Weekly capacity",
++			},
++			wantKeys: []string{"name", "reportDefinitionId", "resourceId"},
++		},
++		{
++			name: "publish false is still sent",
++			req: reportclient.ReportRequest{
++				ReportDefinitionID: testDefinitionID,
++				ResourceID:         testResourceID,
++				Publish:            ptr(false),
++			},
++			wantKeys: []string{"publish", "reportDefinitionId", "resourceId"},
++		},
++		{
++			name: "empty subject slice is omitted",
++			req: reportclient.ReportRequest{
++				ReportDefinitionID: testDefinitionID,
++				ResourceID:         testResourceID,
++				Subject:            []string{},
++			},
++			wantKeys: []string{"reportDefinitionId", "resourceId"},
++		},
++		{
++			name: "everything set",
++			req: reportclient.ReportRequest{
++				ReportDefinitionID: testDefinitionID,
++				ResourceID:         testResourceID,
++				Name:               "Weekly capacity",
++				Description:        "rollup",
++				Subject:            []string{"HostSystem"},
++				Publish:            ptr(true),
++				TraversalSpec:      &reportclient.TraversalSpec{Name: "vSphere Hosts and Clusters"},
++			},
++			wantKeys: []string{"description", "name", "publish", "reportDefinitionId", "resourceId", "subject", "traversalSpec"},
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			client, srv := newClient(t, mockops.Scenario{PollStatuses: []string{"RUNNING", "COMPLETED"}})
++
++			if _, err := client.GenerateReport(context.Background(), tc.req, ""); err != nil {
++				t.Fatalf("GenerateReport: %v", err)
++			}
++
++			create := srv.RequestsFor("createReport")
++			if len(create) != 1 {
++				t.Fatalf("createReport called %d times, want 1", len(create))
++			}
++			got, err := create[0].BodyKeys()
++			if err != nil {
++				t.Fatalf("body keys: %v", err)
++			}
++			if !reflect.DeepEqual(got, tc.wantKeys) {
++				t.Errorf("createReport body keys = %v, want %v", got, tc.wantKeys)
++			}
++		})
++	}
++}
++
++func TestGenerateReportAuthSourceIsOptional(t *testing.T) {
++	t.Parallel()
++
++	tests := []struct {
++		name       string
++		authSource string
++		wantKeys   []string
++	}{
++		{"unset", "", []string{"password", "username"}},
++		{"set", "vIDMAuthSource", []string{"authSource", "password", "username"}},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			client, srv := newClient(t, mockops.Scenario{
++				AuthSource:   tc.authSource,
++				PollStatuses: []string{"COMPLETED"},
++			})
++
++			if _, err := client.GenerateReport(context.Background(), reportclient.ReportRequest{
++				ReportDefinitionID: testDefinitionID,
++				ResourceID:         testResourceID,
++			}, ""); err != nil {
++				t.Fatalf("GenerateReport: %v", err)
++			}
++
++			acquire := srv.RequestsFor("acquireToken")
++			if len(acquire) != 1 {
++				t.Fatalf("acquireToken called %d times, want 1", len(acquire))
++			}
++			got, err := acquire[0].BodyKeys()
++			if err != nil {
++				t.Fatalf("body keys: %v", err)
++			}
++			if !reflect.DeepEqual(got, tc.wantKeys) {
++				t.Errorf("acquireToken body keys = %v, want %v", got, tc.wantKeys)
++			}
++		})
++	}
++}
++
++func TestGenerateReportDownloadFormat(t *testing.T) {
++	t.Parallel()
++
++	tests := []struct {
++		name            string
++		format          string
++		wantQuery       string
++		wantContentType string
++	}{
++		{"unset omits the query entirely", "", "", "text/csv"},
++		{"csv", "csv", "format=csv", "text/csv"},
++		{"pdf", "pdf", "format=pdf", "application/pdf"},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			client, srv := newClient(t, mockops.Scenario{PollStatuses: []string{"COMPLETED"}})
++
++			res, err := client.GenerateReport(context.Background(), reportclient.ReportRequest{
++				ReportDefinitionID: testDefinitionID,
++				ResourceID:         testResourceID,
++			}, tc.format)
++			if err != nil {
++				t.Fatalf("GenerateReport: %v", err)
++			}
++
++			dl := srv.RequestsFor("downloadReport")
++			if len(dl) != 1 {
++				t.Fatalf("downloadReport called %d times, want 1", len(dl))
++			}
++			if dl[0].RawQuery != tc.wantQuery {
++				t.Errorf("downloadReport query = %q, want %q", dl[0].RawQuery, tc.wantQuery)
++			}
++			if !strings.HasPrefix(res.ContentType, tc.wantContentType) {
++				t.Errorf("Result.ContentType = %q, want prefix %q", res.ContentType, tc.wantContentType)
++			}
++			if len(res.Content) == 0 {
++				t.Error("Result.Content is empty")
++			}
++		})
++	}
++}
++
++func TestGenerateReportPollsToTerminalStatus(t *testing.T) {
++	t.Parallel()
++
++	tests := []struct {
++		name         string
++		pollStatuses []string
++		maxAttempts  int
++		wantErr      error
++		wantPolls    int
++		wantDownload int
++	}{
++		{"completed immediately", []string{"COMPLETED"}, 10, nil, 1, 1},
++		{"queued then running then completed", []string{"QUEUED", "RUNNING", "COMPLETED"}, 10, nil, 3, 1},
++		{"failed is terminal and skips download", []string{"QUEUED", "FAILED"}, 10, reportclient.ErrReportFailed, 2, 0},
++		{"never terminal", []string{"RUNNING"}, 3, reportclient.ErrPollTimeout, 3, 0},
++		{"unknown status keeps polling", []string{"SCHEDULED", "COMPLETED"}, 10, nil, 2, 1},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			srv := mockops.Start(t, mockops.Scenario{PollStatuses: tc.pollStatuses})
++			sc := srv.Scenario()
++			client, err := reportclient.New(reportclient.Config{
++				BaseURL:         srv.URL(),
++				HTTPClient:      srv.Client(),
++				Username:        sc.Username,
++				Password:        sc.Password,
++				PollInterval:    time.Millisecond,
++				MaxPollAttempts: tc.maxAttempts,
++			})
++			if err != nil {
++				t.Fatalf("New: %v", err)
++			}
++
++			res, err := client.GenerateReport(context.Background(), reportclient.ReportRequest{
++				ReportDefinitionID: testDefinitionID,
++				ResourceID:         testResourceID,
++			}, "")
++
++			if tc.wantErr != nil {
++				if !errors.Is(err, tc.wantErr) {
++					t.Fatalf("GenerateReport error = %v, want errors.Is(err, %v)", err, tc.wantErr)
++				}
++			} else {
++				if err != nil {
++					t.Fatalf("GenerateReport: %v", err)
++				}
++				if res.PollCount != tc.wantPolls {
++					t.Errorf("Result.PollCount = %d, want %d", res.PollCount, tc.wantPolls)
++				}
++				if res.Report.Status != "COMPLETED" {
++					t.Errorf("Result.Report.Status = %q, want COMPLETED", res.Report.Status)
++				}
++			}
++
++			if got := len(srv.RequestsFor("getReport")); got != tc.wantPolls {
++				t.Errorf("getReport called %d times, want %d", got, tc.wantPolls)
++			}
++			if got := len(srv.RequestsFor("downloadReport")); got != tc.wantDownload {
++				t.Errorf("downloadReport called %d times, want %d", got, tc.wantDownload)
++			}
++		})
++	}
++}
++
++func TestGenerateReportRejectsInvalidRequestsBeforeAnyCall(t *testing.T) {
++	t.Parallel()
++
++	tests := []struct {
++		name string
++		req  reportclient.ReportRequest
++	}{
++		{"missing definition", reportclient.ReportRequest{ResourceID: testResourceID}},
++		{"missing resource", reportclient.ReportRequest{ReportDefinitionID: testDefinitionID}},
++		{
++			name: "traversal spec without a name",
++			req: reportclient.ReportRequest{
++				ReportDefinitionID: testDefinitionID,
++				ResourceID:         testResourceID,
++				TraversalSpec:      &reportclient.TraversalSpec{RootAdapterKindKey: "VMWARE"},
++			},
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			client, srv := newClient(t, mockops.Scenario{})
++
++			_, err := client.GenerateReport(context.Background(), tc.req, "")
++			if !errors.Is(err, reportclient.ErrInvalidRequest) {
++				t.Fatalf("GenerateReport error = %v, want errors.Is(err, ErrInvalidRequest)", err)
++			}
++			if got := srv.Requests(); len(got) != 0 {
++				t.Errorf("client made %d requests, want none", len(got))
++			}
++		})
++	}
++}
++
++func TestGenerateReportStaysInsideTheContract(t *testing.T) {
++	t.Parallel()
++	client, srv := newClient(t, mockops.Scenario{PollStatuses: []string{"QUEUED", "COMPLETED"}})
++
++	if _, err := client.GenerateReport(context.Background(), reportclient.ReportRequest{
++		ReportDefinitionID: testDefinitionID,
++		ResourceID:         testResourceID,
++		Name:               "Weekly capacity",
++	}, "csv"); err != nil {
++		t.Fatalf("GenerateReport: %v", err)
++	}
++
++	seen := map[string]int{}
++	for _, r := range srv.Requests() {
++		if r.OperationID == "" {
++			t.Errorf("request %d %s %s matched no contract operation", r.Index, r.Method, r.Path)
++			continue
++		}
++		seen[r.OperationID]++
++	}
++
++	ids := make([]string, 0, len(seen))
++	for id := range seen {
++		ids = append(ids, id)
++	}
++	sort.Strings(ids)
++	want := []string{"acquireToken", "createReport", "downloadReport", "getReport"}
++	if !reflect.DeepEqual(ids, want) {
++		t.Errorf("operations used = %v, want %v", ids, want)
++	}
++}
++
++func TestGenerateReportHonoursContextCancellation(t *testing.T) {
++	t.Parallel()
++	srv := mockops.Start(t, mockops.Scenario{PollStatuses: []string{"RUNNING"}})
++	sc := srv.Scenario()
++	client, err := reportclient.New(reportclient.Config{
++		BaseURL:         srv.URL(),
++		HTTPClient:      srv.Client(),
++		Username:        sc.Username,
++		Password:        sc.Password,
++		PollInterval:    time.Hour, // the poll wait is what the cancellation must interrupt
++		MaxPollAttempts: 5,
++	})
++	if err != nil {
++		t.Fatalf("New: %v", err)
++	}
++
++	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
++	defer cancel()
++
++	start := time.Now()
++	if _, err := client.GenerateReport(ctx, reportclient.ReportRequest{
++		ReportDefinitionID: testDefinitionID,
++		ResourceID:         testResourceID,
++	}, ""); !errors.Is(err, context.DeadlineExceeded) {
++		t.Fatalf("GenerateReport error = %v, want context.DeadlineExceeded", err)
++	}
++	if elapsed := time.Since(start); elapsed > 30*time.Second {
++		t.Errorf("GenerateReport blocked for %v, want it to abort on the context", elapsed)
++	}
++	if got := len(srv.RequestsFor("downloadReport")); got != 0 {
++		t.Errorf("downloadReport called %d times after cancellation, want 0", got)
++	}
++}
++
++func TestGenerateReportSurfacesApplianceErrors(t *testing.T) {
++	t.Parallel()
++	srv := mockops.Start(t, mockops.Scenario{})
++	sc := srv.Scenario()
++	client, err := reportclient.New(reportclient.Config{
++		BaseURL:         srv.URL(),
++		HTTPClient:      srv.Client(),
++		Username:        sc.Username,
++		Password:        "not-the-password",
++		PollInterval:    time.Millisecond,
++		MaxPollAttempts: 5,
++	})
++	if err != nil {
++		t.Fatalf("New: %v", err)
++	}
++
++	_, err = client.GenerateReport(context.Background(), reportclient.ReportRequest{
++		ReportDefinitionID: testDefinitionID,
++		ResourceID:         testResourceID,
++	}, "")
++	if err == nil {
++		t.Fatal("GenerateReport succeeded with bad credentials, want an error")
++	}
++	if !strings.Contains(err.Error(), "acquireToken") {
++		t.Errorf("error = %v, want it to name the failing operation", err)
++	}
++	if got := len(srv.Requests()); got != 1 {
++		t.Errorf("client made %d requests, want 1; the flow must stop when the token cannot be acquired", got)
++	}
++}
++
++// TestCreateReportBodyIsExactJSON pins the encoded bytes for the minimal
++// request, so a regression in field tagging shows up as a byte diff.
++func TestCreateReportBodyIsExactJSON(t *testing.T) {
++	t.Parallel()
++	client, srv := newClient(t, mockops.Scenario{PollStatuses: []string{"COMPLETED"}})
++
++	if _, err := client.GenerateReport(context.Background(), reportclient.ReportRequest{
++		ReportDefinitionID: testDefinitionID,
++		ResourceID:         testResourceID,
++	}, ""); err != nil {
++		t.Fatalf("GenerateReport: %v", err)
++	}
++
++	create := srv.RequestsFor("createReport")
++	if len(create) != 1 {
++		t.Fatalf("createReport called %d times, want 1", len(create))
++	}
++
++	var got, want any
++	if err := json.Unmarshal(create[0].Body, &got); err != nil {
++		t.Fatalf("decode sent body: %v", err)
++	}
++	if err := json.Unmarshal([]byte(`{"reportDefinitionId":"`+testDefinitionID+`","resourceId":"`+testResourceID+`"}`), &want); err != nil {
++		t.Fatalf("decode expected body: %v", err)
++	}
++	if !reflect.DeepEqual(got, want) {
++		t.Errorf("createReport body = %s, want %v", create[0].Body, want)
++	}
++}
+diff --git a/reportclient/doc.go b/reportclient/doc.go
+index 4bc11b8..92a6dbf 100644
+--- a/reportclient/doc.go
++++ b/reportclient/doc.go
+@@ -12,8 +12,8 @@
+ // contract.omitEmptyRule: an optional field the caller did not set must be
+ // absent from the serialized request, not present and empty.
+ //
+-// This package is a stub. Implement Config, Client, New, ReportRequest,
+-// TraversalSpec, Report, Result, GenerateReport and the ErrInvalidRequest,
+-// ErrReportFailed and ErrPollTimeout sentinels, and add table-driven tests
+-// alongside them.
++// Start with New to build a Client, then GenerateReport to run the flow. It
++// returns ErrInvalidRequest for a request rejected before any HTTP call,
++// ErrReportFailed for a report that reached the FAILED terminal status, and
++// ErrPollTimeout for one that never became terminal.
+ package reportclient
+diff --git a/reportclient/wire.go b/reportclient/wire.go
+new file mode 100644
+index 0000000..49dcc32
+--- /dev/null
++++ b/reportclient/wire.go
+@@ -0,0 +1,104 @@
++package reportclient
++
++// The types in this file are the on-the-wire shapes from docs/contract.json.
++// They are deliberately separate from the exported API types: request types
++// carry only the properties the contract lists under allowedProperties, and
++// every optional property is tagged omitempty so that an unset field is absent
++// from the encoded request rather than present and empty.
++//
++// Publish and AdapterInstanceAssociation are pointers because they are optional
++// booleans: with a plain bool, omitempty could not tell "not set" from "set to
++// false", and an explicit false would silently vanish from the request.
++
++// credentialsWire is the username-password schema.
++type credentialsWire struct {
++	AuthSource string `json:"authSource,omitempty"`
++	Password   string `json:"password"`
++	Username   string `json:"username"`
++}
++
++// authTokenWire is the auth-token schema.
++type authTokenWire struct {
++	ExpiresAt string   `json:"expiresAt"`
++	Roles     []string `json:"roles"`
++	Token     string   `json:"token"`
++	Validity  int64    `json:"validity"`
++}
++
++// traversalSpecWire is the traversal-spec schema. Only name is required.
++type traversalSpecWire struct {
++	AdapterInstanceAssociation *bool  `json:"adapterInstanceAssociation,omitempty"`
++	Description                string `json:"description,omitempty"`
++	Name                       string `json:"name"`
++	RootAdapterKindKey         string `json:"rootAdapterKindKey,omitempty"`
++	RootResourceKindKey        string `json:"rootResourceKindKey,omitempty"`
++}
++
++// createReportWire is the request body for createReport. It holds exactly the
++// contract's allowedProperties for that operation: the remaining properties of
++// the report schema are server-populated and must never be sent.
++type createReportWire struct {
++	Description        string             `json:"description,omitempty"`
++	Name               string             `json:"name,omitempty"`
++	Publish            *bool              `json:"publish,omitempty"`
++	ReportDefinitionID string             `json:"reportDefinitionId"`
++	ResourceID         string             `json:"resourceId"`
++	Subject            []string           `json:"subject,omitempty"`
++	TraversalSpec      *traversalSpecWire `json:"traversalSpec,omitempty"`
++}
++
++// reportWire decodes a report response.
++type reportWire struct {
++	CompletionTime     string `json:"completionTime"`
++	Description        string `json:"description"`
++	ID                 string `json:"id"`
++	Name               string `json:"name"`
++	Owner              string `json:"owner"`
++	ReportDefinitionID string `json:"reportDefinitionId"`
++	ResourceID         string `json:"resourceId"`
++	Status             string `json:"status"`
++}
++
++func (r reportWire) report() Report {
++	return Report{
++		ID:                 r.ID,
++		Status:             r.Status,
++		ReportDefinitionID: r.ReportDefinitionID,
++		ResourceID:         r.ResourceID,
++		Name:               r.Name,
++		Owner:              r.Owner,
++		CompletionTime:     r.CompletionTime,
++	}
++}
++
++// wire converts a caller's ReportRequest into the createReport body.
++func (r ReportRequest) wire() createReportWire {
++	out := createReportWire{
++		Description:        r.Description,
++		Name:               r.Name,
++		Publish:            r.Publish,
++		ReportDefinitionID: r.ReportDefinitionID,
++		ResourceID:         r.ResourceID,
++		TraversalSpec:      r.TraversalSpec.wire(),
++	}
++	// A caller-supplied but empty slice is still "not set" on the wire, and
++	// omitempty already drops it; copying keeps the client from aliasing the
++	// caller's backing array.
++	if len(r.Subject) > 0 {
++		out.Subject = append([]string(nil), r.Subject...)
++	}
++	return out
++}
++
++func (t *TraversalSpec) wire() *traversalSpecWire {
++	if t == nil {
++		return nil
++	}
++	return &traversalSpecWire{
++		AdapterInstanceAssociation: t.AdapterInstanceAssociation,
++		Description:                t.Description,
++		Name:                       t.Name,
++		RootAdapterKindKey:         t.RootAdapterKindKey,
++		RootResourceKindKey:        t.RootResourceKindKey,
++	}
++}

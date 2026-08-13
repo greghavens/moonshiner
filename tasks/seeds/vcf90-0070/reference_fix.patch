@@ -1,0 +1,229 @@
+diff --git a/vcf_ops_maintenance/client.py b/vcf_ops_maintenance/client.py
+--- a/vcf_ops_maintenance/client.py
++++ b/vcf_ops_maintenance/client.py
+@@ -6,7 +6,11 @@
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
++import http.client
++import json
++import math
+ from typing import Sequence
++from urllib.parse import urlencode, urlsplit
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -74,7 +78,38 @@ class ChangeFailed(ApiError):
+ 
+ class VcfOperationsClient:
+     def __init__(self, base_url: str, token: str, *, timeout: float = 5.0) -> None:
+-        raise NotImplementedError
++        if not isinstance(base_url, str):
++            raise TypeError("base_url must be a string")
++        parsed = urlsplit(base_url)
++        if (
++            parsed.scheme not in {"http", "https"}
++            or parsed.hostname is None
++            or parsed.username is not None
++            or parsed.password is not None
++            or parsed.path not in {"", "/"}
++            or parsed.query
++            or parsed.fragment
++        ):
++            raise ValueError("base_url must be an absolute HTTP(S) origin")
++        try:
++            port = parsed.port
++        except ValueError as error:
++            raise ValueError("base_url has an invalid port") from error
++        if not isinstance(token, str) or not token.strip() or "\r" in token or "\n" in token:
++            raise ValueError("token must be a nonblank single-line string")
++        if (
++            isinstance(timeout, bool)
++            or not isinstance(timeout, (int, float))
++            or not math.isfinite(float(timeout))
++            or float(timeout) <= 0
++        ):
++            raise ValueError("timeout must be finite and positive")
++
++        self._scheme = parsed.scheme
++        self._host = parsed.hostname
++        self._port = port
++        self._token = token
++        self._timeout = float(timeout)
+ 
+     def apply_change(
+         self,
+@@ -82,4 +117,172 @@ class VcfOperationsClient:
+         update: MaintenanceSchedule,
+         retire_ids: Sequence[str],
+     ) -> ChangeReport:
+-        raise NotImplementedError
++        if not isinstance(create, MaintenanceSchedule) or not isinstance(update, MaintenanceSchedule):
++            raise TypeError("create and update must be MaintenanceSchedule values")
++        if not isinstance(update.id, str) or not update.id.strip():
++            raise ValueError("the update schedule requires a nonblank id")
++        retired = tuple(retire_ids)
++        if not retired or any(not isinstance(value, str) or not value.strip() for value in retired):
++            raise ValueError("retire_ids must contain nonblank strings")
++
++        completed: list[StepResult] = []
++
++        create_body = self._json_body(self._maintenance_value(create))
++        status, response_body = self._workflow_request(
++            "createMaintenanceSchedules",
++            completed,
++            "POST",
++            "/suite-api/api/maintenanceschedules",
++            create_body,
++        )
++        if status != 201:
++            self._raise_http_failure("createMaintenanceSchedules", status, completed)
++        try:
++            response_value = json.loads(response_body.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError) as error:
++            raise ResponseContractError(
++                "createMaintenanceSchedules returned malformed JSON"
++            ) from error
++        if (
++            not isinstance(response_value, dict)
++            or not isinstance(response_value.get("id"), str)
++            or not response_value["id"].strip()
++        ):
++            raise ResponseContractError(
++                "createMaintenanceSchedules returned a schedule without a valid id"
++            )
++        completed.append(
++            StepResult("createMaintenanceSchedules", 201, response_value["id"])
++        )
++
++        update_body = self._json_body(self._maintenance_value(update))
++        status, _ = self._workflow_request(
++            "updateMaintenanceSchedules",
++            completed,
++            "PUT",
++            "/suite-api/api/maintenanceschedules",
++            update_body,
++        )
++        if status != 200:
++            self._raise_http_failure("updateMaintenanceSchedules", status, completed)
++        completed.append(StepResult("updateMaintenanceSchedules", 200, update.id))
++
++        query = urlencode([("id", value) for value in retired])
++        status, _ = self._workflow_request(
++            "deleteMaintenanceSchedules",
++            completed,
++            "DELETE",
++            f"/suite-api/api/maintenanceschedules?{query}",
++            None,
++        )
++        if status != 204:
++            self._raise_http_failure("deleteMaintenanceSchedules", status, completed)
++        completed.append(StepResult("deleteMaintenanceSchedules", 204, None))
++        return ChangeReport(tuple(completed))
++
++    @staticmethod
++    def _schedule_value(schedule: ScheduleSpec) -> dict[str, object]:
++        value: dict[str, object] = {
++            "hour": schedule.hour,
++            "minuteOfTheHour": schedule.minute_of_the_hour,
++            "duration": schedule.duration,
++            "scheduleType": schedule.schedule_type,
++        }
++        optional_fields = (
++            ("recurrence", schedule.recurrence),
++            ("dayOfTheMonth", schedule.day_of_the_month),
++            ("daysOfTheMonth", schedule.days_of_the_month),
++            ("weeksOfTheMonth", schedule.weeks_of_the_month),
++            ("daysOfTheWeek", schedule.days_of_the_week),
++            ("month", schedule.month),
++            ("months", schedule.months),
++            ("startDate", schedule.start_date),
++            ("expirationDate", schedule.expiration_date),
++            ("timeZone", schedule.time_zone),
++            ("expireRuns", schedule.expire_runs),
++        )
++        for wire_name, field_value in optional_fields:
++            if field_value is not None:
++                value[wire_name] = (
++                    list(field_value) if isinstance(field_value, tuple) else field_value
++                )
++        return value
++
++    @classmethod
++    def _maintenance_value(cls, maintenance: MaintenanceSchedule) -> dict[str, object]:
++        value: dict[str, object] = {}
++        if maintenance.id is not None:
++            value["id"] = maintenance.id
++        value["key"] = maintenance.key
++        value["schedule"] = cls._schedule_value(maintenance.schedule)
++        return value
++
++    @staticmethod
++    def _json_body(value: object) -> bytes:
++        return json.dumps(
++            value,
++            ensure_ascii=False,
++            separators=(",", ":"),
++        ).encode("utf-8")
++
++    def _workflow_request(
++        self,
++        operation_id: str,
++        completed: list[StepResult],
++        method: str,
++        target: str,
++        body: bytes | None,
++    ) -> tuple[int, bytes]:
++        try:
++            return self._request(method, target, body)
++        except ApiError as error:
++            raise ChangeFailed(
++                f"{operation_id} transport failure",
++                failed_operation_id=operation_id,
++                status_code=None,
++                report=ChangeReport(tuple(completed)),
++            ) from error
++
++    @staticmethod
++    def _raise_http_failure(
++        operation_id: str,
++        status: int,
++        completed: list[StepResult],
++    ) -> None:
++        raise ChangeFailed(
++            f"{operation_id} failed with HTTP {status}",
++            failed_operation_id=operation_id,
++            status_code=status,
++            report=ChangeReport(tuple(completed)),
++        )
++
++    def _request(
++        self,
++        method: str,
++        target: str,
++        body: bytes | None,
++    ) -> tuple[int, bytes]:
++        connection_class = (
++            http.client.HTTPSConnection
++            if self._scheme == "https"
++            else http.client.HTTPConnection
++        )
++        connection = connection_class(
++            self._host,
++            self._port,
++            timeout=self._timeout,
++        )
++        try:
++            connection.putrequest(method, target, skip_accept_encoding=True)
++            connection.putheader("Accept", "application/json")
++            connection.putheader("Authorization", self._token)
++            if body is not None:
++                connection.putheader("Content-Type", "application/json")
++                connection.putheader("Content-Length", str(len(body)))
++            connection.endheaders(body)
++            response = connection.getresponse()
++            return response.status, response.read()
++        except (OSError, http.client.HTTPException) as error:
++            raise ApiError("VCF Operations transport failure") from error
++        finally:
++            connection.close()

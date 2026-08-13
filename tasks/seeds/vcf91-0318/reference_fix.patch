@@ -1,0 +1,165 @@
+diff --git a/src/vcfa_policy/client.py b/src/vcfa_policy/client.py
+index f4489ce..ddc3cd2 100644
+--- a/src/vcfa_policy/client.py
++++ b/src/vcfa_policy/client.py
+@@ -9,10 +9,37 @@ Speaks the three operations named in docs/contract.json:
+ Standard library only.
+ """
+ 
++import json
++import time
++import urllib.error
++import urllib.parse
++import urllib.request
++
+ from .errors import ApiError, PolicyTypeNotFoundError, VcfAutomationError  # noqa: F401
+ 
+ DEFAULT_MAX_ATTEMPTS = 4
+ 
++#: Statuses the contract marks retryable for these operations.
++RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
++
++POLICIES_PATH = "/policy/api/policies"
++POLICY_TYPES_PATH = "/policy/api/policyTypes"
++
++#: ensure_policy keyword -> Policy body field. Order fixed so the body a retry
++#: sends is byte-identical to the body of the attempt it is repeating.
++_OPTIONAL_FIELDS = (
++    ("description", "description"),
++    ("enforcement_type", "enforcementType"),
++    ("project_id", "projectId"),
++    ("org_id", "orgId"),
++)
++
++class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
++    """Keep credentials and requests on the configured appliance origin."""
++
++    def redirect_request(self, req, fp, code, msg, headers, newurl):
++        return None
++
+ 
+ def default_backoff(attempt):
+     """Seconds to wait after a failed attempt (1-based)."""
+@@ -41,13 +68,28 @@ class PolicyClient:
+         self.max_attempts = max_attempts
+         self.backoff = backoff or default_backoff
++        self._opener = urllib.request.build_opener(
++            urllib.request.ProxyHandler({}), _NoRedirectHandler()
++        )
+ 
++    # -- operations --------------------------------------------------------
++
+     def get_policy_type(self, type_id):
+         """GET /policy/api/policyTypes/{id}.
+ 
+         Returns the PolicyType object. Raises PolicyTypeNotFoundError on 404
+         and ApiError on any other non-2xx status.
+         """
+-        raise NotImplementedError
++        path = "%s/%s" % (POLICY_TYPES_PATH, urllib.parse.quote(type_id, safe=""))
++        try:
++            status, body = self._request("GET", path)
++        except ApiError as exc:
++            if exc.status == 404:
++                raise PolicyTypeNotFoundError(
++                    type_id, exc.method, exc.path, exc.status, exc.body
++                ) from None
++            raise
++        del status
++        return json.loads(body)
+ 
+     def get_policy(self, policy_id):
+         """GET /policy/api/policies/{id}.
+@@ -55,12 +97,90 @@ class PolicyClient:
+         Returns the Policy object, or None if the appliance answers 404.
+         Raises ApiError on any other non-2xx status.
+         """
+-        raise NotImplementedError
++        path = "%s/%s" % (POLICIES_PATH, urllib.parse.quote(policy_id, safe=""))
++        try:
++            status, body = self._request("GET", path)
++        except ApiError as exc:
++            if exc.status == 404:
++                return None
++            raise
++        del status
++        return json.loads(body)
+ 
+     def ensure_policy(self, *, policy_id, type_id, name, definition, description=None,
+                       enforcement_type=None, project_id=None, org_id=None):
+         """Converge one policy to the requested state, safely retryable.
+ 
+         Returns the stored Policy object read back from the appliance.
++
++        The mutation is a create-or-update keyed on the caller's ``policy_id``,
++        which travels in the request body's ``id`` field on every attempt. That
++        is what makes a retry after a lost response converge on the same policy
++        instead of leaving a second one behind. Fields the caller left unset are
++        omitted from the body entirely.
++        """
++        self.get_policy_type(type_id)
++
++        body = {
++            "id": policy_id,
++            "typeId": type_id,
++            "name": name,
++            "definition": definition,
++        }
++        supplied = {
++            "description": description,
++            "enforcement_type": enforcement_type,
++            "project_id": project_id,
++            "org_id": org_id,
++        }
++        for keyword, field in _OPTIONAL_FIELDS:
++            if supplied[keyword] is not None:
++                body[field] = supplied[keyword]
++
++        self._request("POST", POLICIES_PATH, body=body)
++        return self.get_policy(policy_id)
++
++    # -- transport ---------------------------------------------------------
++
++    def _request(self, method, path, body=None):
++        """Issue one request, retrying the statuses the contract marks retryable.
++
++        The encoded body is built once and resent unchanged on every attempt.
+         """
+-        raise NotImplementedError
++        payload = None
++        headers = {
++            "Authorization": "Bearer %s" % self.token,
++            "Accept": "application/json",
++        }
++        if body is not None:
++            payload = json.dumps(body).encode("utf-8")
++            headers["Content-Type"] = "application/json"
++
++        last_error = None
++        for attempt in range(1, self.max_attempts + 1):
++            request = urllib.request.Request(
++                self.base_url + path, data=payload, headers=headers, method=method
++            )
++            try:
++                with self._opener.open(request, timeout=self.timeout) as response:
++                    return response.status, response.read().decode("utf-8")
++            except urllib.error.HTTPError as exc:
++                detail = exc.read().decode("utf-8", "replace")
++                last_error = ApiError(method, path, exc.code, detail)
++                if exc.code not in RETRYABLE_STATUSES:
++                    raise last_error from None
++            except urllib.error.URLError as exc:
++                last_error = VcfAutomationError(
++                    "%s %s failed to reach the appliance: %s" % (method, path, exc.reason)
++                )
++            except OSError as exc:
++                last_error = VcfAutomationError(
++                    "%s %s failed to reach the appliance: %s" % (method, path, exc)
++                )
++
++            if attempt < self.max_attempts:
++                delay = self.backoff(attempt)
++                if delay:
++                    time.sleep(delay)
++
++        raise last_error

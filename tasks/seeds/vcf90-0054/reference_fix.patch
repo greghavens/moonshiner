@@ -1,0 +1,482 @@
+diff --git a/src/com/example/vcf/VcenterRemediationClient.java b/src/com/example/vcf/VcenterRemediationClient.java
+index e2386da108b9..e76a72edcae3 100644
+--- a/src/com/example/vcf/VcenterRemediationClient.java
++++ b/src/com/example/vcf/VcenterRemediationClient.java
+@@ -1,6 +1,18 @@
+ package com.example.vcf;
+ 
++import java.io.IOException;
++import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
++import java.time.Duration;
++import java.util.ArrayList;
++import java.util.Base64;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Map;
++import java.util.Set;
+ 
+ /**
+  * Client for the cluster software remediation flow of the vSphere Automation API on a
+@@ -72,9 +84,23 @@ public final class VcenterRemediationClient {
+         public String errorMessage;
+     }
+ 
++    /** The server URL template in the specification is {@code https://{host}/api}. */
++    private static final String BASE_PATH = "/api";
++
++    private static final String SESSION_HEADER = "vmware-api-session-id";
++
++    /** {@code Cis.Task.Status} values a task can still move out of. */
++    private static final Set<String> NON_TERMINAL = Set.of("PENDING", "RUNNING", "BLOCKED");
++
++    /** The only {@code Cis.Task.Status} values that represent a settled task. */
++    private static final Set<String> TERMINAL = Set.of("SUCCEEDED", "FAILED");
++
+     private final String baseUrl;
+     private final long pollIntervalMillis;
+     private final int maxPolls;
++    private final HttpClient http;
++
++    private String sessionToken;
+ 
+     /**
+      * @param baseUrl            scheme and authority of the appliance, with no trailing slash and
+@@ -88,6 +114,10 @@ public final class VcenterRemediationClient {
+         this.baseUrl = baseUrl;
+         this.pollIntervalMillis = pollIntervalMillis;
+         this.maxPolls = maxPolls;
++        this.http = HttpClient.newBuilder()
++                .connectTimeout(Duration.ofSeconds(20))
++                .followRedirects(HttpClient.Redirect.NEVER)
++                .build();
+     }
+ 
+     public String baseUrl() {
+@@ -109,7 +139,24 @@ public final class VcenterRemediationClient {
+      * @throws Exception if the appliance does not answer with the status the contract declares
+      */
+     public String login(String username, String password) throws Exception {
+-        throw new UnsupportedOperationException("TODO: implement Cis.Session_create");
++        String credentials = Base64.getEncoder().encodeToString(
++                (username + ":" + password).getBytes(StandardCharsets.UTF_8));
++
++        HttpRequest request = HttpRequest.newBuilder(URI.create(baseUrl + BASE_PATH + "/session"))
++                .header("Authorization", "Basic " + credentials)
++                .header("Accept", "application/json")
++                .POST(HttpRequest.BodyPublishers.noBody())
++                .build();
++
++        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
++        requireStatus(response, 201, "Cis.Session_create");
++
++        Object token = Json.parse(response.body());
++        if (!(token instanceof String s) || s.isEmpty()) {
++            throw new IOException("Cis.Session_create did not return a session token: " + response.body());
++        }
++        this.sessionToken = s;
++        return s;
+     }
+ 
+     /**
+@@ -131,7 +178,395 @@ public final class VcenterRemediationClient {
+      */
+     public Outcome remediateCluster(String clusterId, ApplyOptions applyOptions, PollOptions pollOptions)
+             throws Exception {
+-        throw new UnsupportedOperationException(
+-                "TODO: implement Esx.Settings.Clusters.Software_apply$Task followed by Cis.Tasks_get polling");
++        if (sessionToken == null) {
++            throw new IllegalStateException("login(...) must create a session before remediating a cluster");
++        }
++
++        String taskId = startApply(clusterId, applyOptions);
++
++        Outcome outcome = new Outcome();
++        outcome.taskId = taskId;
++
++        String query = pollQuery(pollOptions);
++        URI taskUri = URI.create(baseUrl + BASE_PATH + "/cis/tasks/" + encodePathSegment(taskId) + query);
++
++        for (int attempt = 0; attempt < maxPolls; attempt++) {
++            if (attempt > 0 && pollIntervalMillis > 0) {
++                Thread.sleep(pollIntervalMillis);
++            }
++
++            HttpRequest request = HttpRequest.newBuilder(taskUri)
++                    .header(SESSION_HEADER, sessionToken)
++                    .header("Accept", "application/json")
++                    .GET()
++                    .build();
++
++            HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
++            requireStatus(response, 200, "Cis.Tasks_get");
++            outcome.pollCount++;
++
++            Map<String, Object> info = Json.asObject(Json.parse(response.body()));
++            Object status = info == null ? null : info.get("status");
++            if (!(status instanceof String state)) {
++                throw new IOException("Cis.Task.Info carried no status: " + response.body());
++            }
++            if (NON_TERMINAL.contains(state)) {
++                continue;
++            }
++            if (!TERMINAL.contains(state)) {
++                throw new IOException("Cis.Task.Info carried an unknown status '" + state
++                        + "': " + response.body());
++            }
++
++            outcome.status = state;
++            outcome.errorMessage = firstErrorMessage(info);
++            return outcome;
++        }
++
++        throw new IOException("task " + taskId + " had not reached a terminal status after "
++                + maxPolls + " polls");
++    }
++
++    // ------------------------------------------------------------------ apply
++
++    private String startApply(String clusterId, ApplyOptions options) throws Exception {
++        URI uri = URI.create(baseUrl + BASE_PATH + "/esx/settings/clusters/"
++                + encodePathSegment(clusterId) + "/software?action=apply&vmw-task=true");
++
++        String body = applySpec(options);
++
++        HttpRequest request = HttpRequest.newBuilder(uri)
++                .header(SESSION_HEADER, sessionToken)
++                .header("Content-Type", "application/json")
++                .header("Accept", "application/json")
++                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
++                .build();
++
++        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
++        requireStatus(response, 202, "Esx.Settings.Clusters.Software_apply$Task");
++
++        Object taskId = Json.parse(response.body());
++        if (!(taskId instanceof String s) || s.isEmpty()) {
++            throw new IOException("the apply operation did not return a task identifier: " + response.body());
++        }
++        return s;
++    }
++
++    /**
++     * Serialises {@code Esx.Settings.Clusters.Software.ApplySpec}. Only properties the caller
++     * actually supplied appear; an unset property is left out rather than sent as null or empty.
++     */
++    private static String applySpec(ApplyOptions options) {
++        Map<String, Object> spec = new LinkedHashMap<>();
++        if (options != null) {
++            if (options.commit != null && !options.commit.isBlank()) {
++                spec.put("commit", options.commit);
++            }
++            if (options.hosts != null && !options.hosts.isEmpty()) {
++                spec.put("hosts", new ArrayList<Object>(options.hosts));
++            }
++            if (options.acceptEula != null) {
++                spec.put("accept_eula", options.acceptEula);
++            }
++        }
++        return Json.write(spec);
++    }
++
++    /**
++     * Serialises {@code Cis.Tasks.GetSpec} as the {@code spec} query parameter, which the
++     * specification declares {@code style=form, explode=true}: every supplied property becomes a
++     * top level parameter of its own, and an unsupplied property contributes nothing. When the
++     * caller supplied neither property the request carries no query string at all.
++     */
++    private static String pollQuery(PollOptions options) {
++        List<String> parts = new ArrayList<>();
++        if (options != null) {
++            if (options.returnAll != null) {
++                parts.add("return_all=" + options.returnAll);
++            }
++            if (options.excludeResult != null) {
++                parts.add("exclude_result=" + options.excludeResult);
++            }
++        }
++        return parts.isEmpty() ? "" : "?" + String.join("&", parts);
++    }
++
++    // ------------------------------------------------------------------ misc
++
++    private static String firstErrorMessage(Map<String, Object> info) {
++        Map<String, Object> error = Json.asObject(info.get("error"));
++        if (error == null) {
++            return null;
++        }
++        List<Object> messages = Json.asArray(error.get("messages"));
++        if (messages == null || messages.isEmpty()) {
++            return null;
++        }
++        Map<String, Object> first = Json.asObject(messages.get(0));
++        Object message = first == null ? null : first.get("default_message");
++        return message instanceof String s ? s : null;
++    }
++
++    private static void requireStatus(HttpResponse<String> response, int expected, String operationId)
++            throws IOException {
++        if (response.statusCode() != expected) {
++            throw new IOException(operationId + " answered " + response.statusCode()
++                    + " (the contract declares " + expected + "): " + response.body());
++        }
++    }
++
++    /** Percent-encodes everything a path segment may not carry literally. */
++    private static String encodePathSegment(String segment) {
++        StringBuilder sb = new StringBuilder(segment.length());
++        for (byte b : segment.getBytes(StandardCharsets.UTF_8)) {
++            int c = b & 0xff;
++            boolean safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
++                    || c == '-' || c == '.' || c == '_' || c == '~' || c == ':' || c == '@';
++            if (safe) {
++                sb.append((char) c);
++            } else {
++                sb.append('%').append(String.format("%02X", c));
++            }
++        }
++        return sb.toString();
++    }
++
++    // ------------------------------------------------------------------ JSON
++
++    /** Just enough JSON for the three payloads this client exchanges. */
++    private static final class Json {
++
++        static Object parse(String text) {
++            Cursor cursor = new Cursor(text);
++            cursor.skipWhitespace();
++            Object value = cursor.value();
++            cursor.skipWhitespace();
++            if (!cursor.done()) {
++                throw new IllegalArgumentException("trailing JSON content: " + text);
++            }
++            return value;
++        }
++
++        @SuppressWarnings("unchecked")
++        static Map<String, Object> asObject(Object value) {
++            return value instanceof Map ? (Map<String, Object>) value : null;
++        }
++
++        @SuppressWarnings("unchecked")
++        static List<Object> asArray(Object value) {
++            return value instanceof List ? (List<Object>) value : null;
++        }
++
++        static String write(Object value) {
++            StringBuilder sb = new StringBuilder();
++            writeValue(value, sb);
++            return sb.toString();
++        }
++
++        private static void writeValue(Object value, StringBuilder sb) {
++            if (value == null) {
++                sb.append("null");
++            } else if (value instanceof Map<?, ?> map) {
++                sb.append('{');
++                boolean first = true;
++                for (Map.Entry<?, ?> e : map.entrySet()) {
++                    if (!first) {
++                        sb.append(',');
++                    }
++                    first = false;
++                    writeString(String.valueOf(e.getKey()), sb);
++                    sb.append(':');
++                    writeValue(e.getValue(), sb);
++                }
++                sb.append('}');
++            } else if (value instanceof List<?> list) {
++                sb.append('[');
++                boolean first = true;
++                for (Object item : list) {
++                    if (!first) {
++                        sb.append(',');
++                    }
++                    first = false;
++                    writeValue(item, sb);
++                }
++                sb.append(']');
++            } else if (value instanceof Boolean || value instanceof Number) {
++                sb.append(value);
++            } else {
++                writeString(String.valueOf(value), sb);
++            }
++        }
++
++        private static void writeString(String s, StringBuilder sb) {
++            sb.append('"');
++            for (int i = 0; i < s.length(); i++) {
++                char c = s.charAt(i);
++                switch (c) {
++                    case '"' -> sb.append("\\\"");
++                    case '\\' -> sb.append("\\\\");
++                    case '\n' -> sb.append("\\n");
++                    case '\r' -> sb.append("\\r");
++                    case '\t' -> sb.append("\\t");
++                    default -> {
++                        if (c < 0x20) {
++                            sb.append(String.format("\\u%04x", (int) c));
++                        } else {
++                            sb.append(c);
++                        }
++                    }
++                }
++            }
++            sb.append('"');
++        }
++
++        private static final class Cursor {
++            private final String src;
++            private int pos;
++
++            Cursor(String src) {
++                this.src = src;
++            }
++
++            boolean done() {
++                return pos >= src.length();
++            }
++
++            void skipWhitespace() {
++                while (pos < src.length() && Character.isWhitespace(src.charAt(pos))) {
++                    pos++;
++                }
++            }
++
++            Object value() {
++                skipWhitespace();
++                if (done()) {
++                    throw new IllegalArgumentException("unexpected end of JSON input");
++                }
++                char c = src.charAt(pos);
++                return switch (c) {
++                    case '{' -> object();
++                    case '[' -> array();
++                    case '"' -> string();
++                    case 't' -> literal("true", Boolean.TRUE);
++                    case 'f' -> literal("false", Boolean.FALSE);
++                    case 'n' -> literal("null", null);
++                    default -> number();
++                };
++            }
++
++            private Object literal(String text, Object value) {
++                if (!src.startsWith(text, pos)) {
++                    throw new IllegalArgumentException("bad JSON literal at offset " + pos);
++                }
++                pos += text.length();
++                return value;
++            }
++
++            private Map<String, Object> object() {
++                Map<String, Object> out = new LinkedHashMap<>();
++                pos++;
++                skipWhitespace();
++                if (!done() && src.charAt(pos) == '}') {
++                    pos++;
++                    return out;
++                }
++                while (true) {
++                    skipWhitespace();
++                    String key = string();
++                    skipWhitespace();
++                    if (done() || src.charAt(pos++) != ':') {
++                        throw new IllegalArgumentException("expected ':' at offset " + (pos - 1));
++                    }
++                    out.put(key, value());
++                    skipWhitespace();
++                    if (done()) {
++                        throw new IllegalArgumentException("unterminated JSON object");
++                    }
++                    char c = src.charAt(pos++);
++                    if (c == '}') {
++                        return out;
++                    }
++                    if (c != ',') {
++                        throw new IllegalArgumentException("expected ',' or '}' at offset " + (pos - 1));
++                    }
++                }
++            }
++
++            private List<Object> array() {
++                List<Object> out = new ArrayList<>();
++                pos++;
++                skipWhitespace();
++                if (!done() && src.charAt(pos) == ']') {
++                    pos++;
++                    return out;
++                }
++                while (true) {
++                    out.add(value());
++                    skipWhitespace();
++                    if (done()) {
++                        throw new IllegalArgumentException("unterminated JSON array");
++                    }
++                    char c = src.charAt(pos++);
++                    if (c == ']') {
++                        return out;
++                    }
++                    if (c != ',') {
++                        throw new IllegalArgumentException("expected ',' or ']' at offset " + (pos - 1));
++                    }
++                }
++            }
++
++            private String string() {
++                if (done() || src.charAt(pos) != '"') {
++                    throw new IllegalArgumentException("expected a JSON string at offset " + pos);
++                }
++                pos++;
++                StringBuilder sb = new StringBuilder();
++                while (true) {
++                    if (done()) {
++                        throw new IllegalArgumentException("unterminated JSON string");
++                    }
++                    char c = src.charAt(pos++);
++                    if (c == '"') {
++                        return sb.toString();
++                    }
++                    if (c != '\\') {
++                        sb.append(c);
++                        continue;
++                    }
++                    char esc = src.charAt(pos++);
++                    switch (esc) {
++                        case '"' -> sb.append('"');
++                        case '\\' -> sb.append('\\');
++                        case '/' -> sb.append('/');
++                        case 'b' -> sb.append('\b');
++                        case 'f' -> sb.append('\f');
++                        case 'n' -> sb.append('\n');
++                        case 'r' -> sb.append('\r');
++                        case 't' -> sb.append('\t');
++                        case 'u' -> {
++                            sb.append((char) Integer.parseInt(src.substring(pos, pos + 4), 16));
++                            pos += 4;
++                        }
++                        default -> throw new IllegalArgumentException("bad JSON escape at offset " + (pos - 1));
++                    }
++                }
++            }
++
++            private Object number() {
++                int start = pos;
++                while (pos < src.length() && "+-0123456789.eE".indexOf(src.charAt(pos)) >= 0) {
++                    pos++;
++                }
++                String literal = src.substring(start, pos);
++                if (literal.isEmpty()) {
++                    throw new IllegalArgumentException("unexpected character at offset " + pos);
++                }
++                if (literal.indexOf('.') < 0 && literal.indexOf('e') < 0 && literal.indexOf('E') < 0) {
++                    return Long.parseLong(literal);
++                }
++                return Double.parseDouble(literal);
++            }
++        }
+     }
+ }

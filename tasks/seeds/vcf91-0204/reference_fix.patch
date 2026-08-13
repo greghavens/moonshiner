@@ -1,0 +1,279 @@
+--- a/src/vcf_installer/client.py
++++ b/src/vcf_installer/client.py
+@@ -2,11 +2,30 @@
+ 
+ from __future__ import annotations
+ 
++import json
++import math
++from http.client import HTTPException
++from typing import Any
++from urllib.error import HTTPError, URLError
++from urllib.parse import urlencode, urlsplit, urlunsplit
++from urllib.request import HTTPRedirectHandler, Request, build_opener
++
+ 
+ class VcfInstallerError(RuntimeError):
+     """Raised when a VCF Installer request or response is invalid."""
+ 
+ 
++class _HTTPFailure(Exception):
++    def __init__(self, status: int) -> None:
++        super().__init__()
++        self.status = status
++
++
++class _NoRedirectHandler(HTTPRedirectHandler):
++    def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
++        return None
++
++
+ class VcfInstallerClient:
+     """Small focused client for the protected VCF Installer contract."""
+ 
+@@ -18,11 +37,242 @@
+         *,
+         timeout: float = 10.0,
+     ) -> None:
+-        self._base_url = base_url
++        if not self._is_nonblank(base_url):
++            raise VcfInstallerError("base_url must be a nonblank string")
++        if not self._is_nonblank(access_token):
++            raise VcfInstallerError("access_token must be a nonblank string")
++        if not self._is_nonblank(refresh_token_id):
++            raise VcfInstallerError("refresh_token_id must be a nonblank string")
++        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
++            raise VcfInstallerError("timeout must be a positive finite number")
++        try:
++            normalized_timeout = float(timeout)
++        except (OverflowError, ValueError):
++            raise VcfInstallerError("timeout must be a positive finite number") from None
++        if not math.isfinite(normalized_timeout) or normalized_timeout <= 0:
++            raise VcfInstallerError("timeout must be a positive finite number")
++
++        try:
++            parsed = urlsplit(base_url)
++            hostname = parsed.hostname
++            parsed.port
++        except ValueError:
++            raise VcfInstallerError("base_url must be an HTTP service root") from None
++        if (
++            parsed.scheme not in {"http", "https"}
++            or not parsed.netloc
++            or hostname is None
++            or parsed.username is not None
++            or parsed.password is not None
++            or parsed.query
++            or parsed.fragment
++            or any(character.isspace() for character in base_url)
++        ):
++            raise VcfInstallerError("base_url must be an HTTP service root")
++        self._base_url = urlunsplit(
++            (parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", "")
++        )
+         self._access_token = access_token
+         self._refresh_token_id = refresh_token_id
+-        self._timeout = timeout
++        self._timeout = normalized_timeout
+ 
+     def list_tasks(self, *, page_size: int = 100) -> list[dict[str, object]]:
+         """Return all Installer tasks from the focused contract."""
+-        raise NotImplementedError("implement the VCF Installer task workflow")
++        if (
++            isinstance(page_size, bool)
++            or not isinstance(page_size, int)
++            or not 1 <= page_size <= 2_147_483_647
++        ):
++            raise VcfInstallerError("page_size must be a positive int32")
++
++        tasks: list[Any] = []
++        seen_pages: set[int] = set()
++        requested_page: int | None = None
++        expected_total: int | None = None
++        expected_total_pages: int | None = None
++        refreshed = False
++
++        while True:
++            parameters: list[tuple[str, str]] = []
++            if requested_page is not None:
++                parameters.append(("pageNumber", str(requested_page)))
++            parameters.append(("pageSize", str(page_size)))
++            target = "/v1/tasks?" + urlencode(parameters)
++
++            try:
++                page = self._request_json("GET", target)
++            except _HTTPFailure as error:
++                if error.status == 401 and not refreshed:
++                    self._refresh_access_token()
++                    refreshed = True
++                    continue
++                raise VcfInstallerError(
++                    f"getTasks failed with HTTP status {error.status}"
++                ) from None
++
++            if not isinstance(page, dict):
++                raise VcfInstallerError("getTasks returned a non-object page")
++            elements = page.get("elements")
++            metadata = page.get("pageMetadata")
++            if not isinstance(elements, list):
++                raise VcfInstallerError("getTasks returned invalid elements")
++            if not isinstance(metadata, dict):
++                raise VcfInstallerError("getTasks returned invalid pageMetadata")
++
++            page_number = self._metadata_integer(metadata, "pageNumber")
++            metadata_page_size = self._metadata_integer(metadata, "pageSize")
++            total_elements = self._metadata_integer(metadata, "totalElements")
++            total_pages = self._metadata_integer(metadata, "totalPages")
++            if (
++                page_number < 0
++                or metadata_page_size <= 0
++                or total_elements < 0
++                or total_pages < 0
++            ):
++                raise VcfInstallerError("getTasks returned negative pagination metadata")
++            if metadata_page_size != page_size:
++                raise VcfInstallerError("getTasks changed the requested page size")
++            wanted_page = 0 if requested_page is None else requested_page
++            if page_number != wanted_page:
++                raise VcfInstallerError("getTasks returned an unrequested page")
++            if page_number in seen_pages:
++                raise VcfInstallerError("getTasks repeated a page")
++            seen_pages.add(page_number)
++
++            calculated_pages = (
++                0
++                if total_elements == 0
++                else (total_elements + metadata_page_size - 1) // metadata_page_size
++            )
++            if total_pages != calculated_pages:
++                raise VcfInstallerError("getTasks returned incoherent pagination totals")
++            if expected_total is None:
++                expected_total = total_elements
++                expected_total_pages = total_pages
++            elif (
++                total_elements != expected_total
++                or total_pages != expected_total_pages
++            ):
++                raise VcfInstallerError("getTasks changed pagination totals")
++
++            if total_elements > 0 and page_number >= total_pages:
++                raise VcfInstallerError("getTasks returned a page outside totalPages")
++            if len(elements) > page_size:
++                raise VcfInstallerError("getTasks returned an overfull page")
++            if not elements and len(tasks) < total_elements:
++                raise VcfInstallerError("getTasks returned an empty nonterminal page")
++            tasks.extend(elements)
++            if len(tasks) > total_elements:
++                raise VcfInstallerError("getTasks returned more tasks than declared")
++
++            if len(tasks) == total_elements:
++                completed_page_count = total_pages if total_elements else 1
++                if len(seen_pages) != completed_page_count:
++                    raise VcfInstallerError("getTasks ended before all pages completed")
++                break
++            next_page = page_number + 1
++            if next_page >= total_pages:
++                raise VcfInstallerError("getTasks pagination cannot make progress")
++            requested_page = next_page
++
++        rows: list[dict[str, object]] = []
++        seen_ids: set[str] = set()
++        for task in tasks:
++            if not isinstance(task, dict):
++                raise VcfInstallerError("getTasks returned a non-object task")
++            task_id = self._required_task_text(task, "id")
++            name = self._required_task_text(task, "name")
++            status = self._required_task_text(task, "status")
++            created = self._required_task_text(task, "creationTimestamp")
++            if task_id in seen_ids:
++                raise VcfInstallerError("getTasks returned a duplicate task ID")
++            seen_ids.add(task_id)
++            if "type" in task:
++                task_type = task["type"]
++                if not isinstance(task_type, str):
++                    raise VcfInstallerError("getTasks returned an invalid task type")
++            else:
++                task_type = None
++            rows.append(
++                {
++                    "id": task_id,
++                    "name": name,
++                    "type": task_type,
++                    "status": status,
++                    "creationTimestamp": created,
++                }
++            )
++
++        rows.sort(key=lambda row: (str(row["creationTimestamp"]), str(row["id"])))
++        return rows
++
++    def _refresh_access_token(self) -> None:
++        body = json.dumps(self._refresh_token_id, ensure_ascii=False).encode("utf-8")
++        try:
++            replacement = self._request_json(
++                "PATCH",
++                "/v1/tokens/access-token/refresh",
++                body=body,
++            )
++        except _HTTPFailure as error:
++            raise VcfInstallerError(
++                f"refreshAccessToken failed with HTTP status {error.status}"
++            ) from None
++        if not self._is_nonblank(replacement):
++            raise VcfInstallerError(
++                "refreshAccessToken returned an invalid access-token response"
++            )
++        self._access_token = replacement
++
++    def _request_json(
++        self, method: str, target: str, *, body: bytes | None = None
++    ) -> Any:
++        headers = {
++            "Accept": "application/json",
++            "Authorization": f"Bearer {self._access_token}",
++        }
++        if body is not None:
++            headers["Content-Type"] = "application/json"
++        try:
++            request = Request(
++                self._base_url + target,
++                data=body,
++                headers=headers,
++                method=method,
++            )
++            response = build_opener(_NoRedirectHandler()).open(
++                request, timeout=self._timeout
++            )
++            with response:
++                status = int(response.status)
++                payload = response.read()
++        except HTTPError as error:
++            status = int(error.code)
++            error.close()
++            raise _HTTPFailure(status) from None
++        except (HTTPException, URLError, OSError, UnicodeError, ValueError):
++            raise VcfInstallerError("VCF Installer transport failed") from None
++        if not 200 <= status < 300:
++            raise _HTTPFailure(status)
++        try:
++            return json.loads(payload.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError):
++            raise VcfInstallerError("VCF Installer returned invalid JSON") from None
++
++    @staticmethod
++    def _is_nonblank(value: object) -> bool:
++        return isinstance(value, str) and bool(value.strip())
++
++    @staticmethod
++    def _metadata_integer(metadata: dict[str, Any], name: str) -> int:
++        value = metadata.get(name)
++        if isinstance(value, bool) or not isinstance(value, int):
++            raise VcfInstallerError(f"pageMetadata.{name} must be an integer")
++        return value
++
++    @classmethod
++    def _required_task_text(cls, task: dict[str, Any], name: str) -> str:
++        value = task.get(name)
++        if not cls._is_nonblank(value):
++            raise VcfInstallerError(f"task {name} must be a nonblank string")
++        return value

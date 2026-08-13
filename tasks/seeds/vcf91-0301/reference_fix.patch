@@ -1,0 +1,283 @@
+diff --git a/src/main/java/com/vmware/vcf/opsnet/VcfOpsNetworksClient.java b/src/main/java/com/vmware/vcf/opsnet/VcfOpsNetworksClient.java
+index 1908836..e427b4c 100644
+--- a/src/main/java/com/vmware/vcf/opsnet/VcfOpsNetworksClient.java
++++ b/src/main/java/com/vmware/vcf/opsnet/VcfOpsNetworksClient.java
+@@ -2,9 +2,11 @@ package com.vmware.vcf.opsnet;
+ 
+ import java.io.IOException;
+ import java.net.URI;
++import java.net.URLEncoder;
+ import java.net.http.HttpClient;
+ import java.net.http.HttpRequest;
+ import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
+ import java.time.Duration;
+ import java.util.ArrayList;
+ import java.util.LinkedHashMap;
+@@ -140,8 +142,34 @@ public final class VcfOpsNetworksClient {
+      * @return the token string returned by the platform
+      */
+     public String authenticate(String username, String password, String domainType, String domainValue) {
+-        // TODO: implement operationId `create` per docs/contract.json.
+-        throw new UnsupportedOperationException("authenticate is not implemented");
++        // `domain` is a whole optional object: it is emitted only when at least one of
++        // its own properties is set, and each of those is itself omitted when unset.
++        String domain = null;
++        if (domainType != null || domainValue != null) {
++            domain = new JsonObject()
++                    .put("domain_type", domainType)
++                    .put("value", domainValue)
++                    .end();
++        }
++        String body = new JsonObject()
++                .put("username", username)
++                .put("password", password)
++                .putJson("domain", domain)
++                .end();
++
++        // `create` declares `security: []` - no Authorization header on this request.
++        HttpResponse<String> response = send(HttpRequest.newBuilder(uri("/auth/token"))
++                .header("Content-Type", "application/json")
++                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
++                .build());
++        requireStatus(response, 200, "create");
++
++        String issued = Json.str(Json.parseObject(response.body()), "token");
++        if (issued == null || issued.isBlank()) {
++            throw new VcfOpsNetworksException("auth token response carried no token");
++        }
++        this.token = issued;
++        return issued;
+     }
+ 
+     /**
+@@ -153,8 +181,57 @@ public final class VcfOpsNetworksClient {
+      * @return the {@code request_id} to poll with {@link #awaitBulkOperation}
+      */
+     public String submitBulkOperation(String actionType, List<DataSourceEntity> dataSources) {
+-        // TODO: implement operationId `bulkDataSourceOperation` per docs/contract.json.
+-        throw new UnsupportedOperationException("submitBulkOperation is not implemented");
++        if (dataSources == null || dataSources.isEmpty()) {
++            throw new IllegalArgumentException("dataSources is required");
++        }
++
++        StringBuilder entities = new StringBuilder("[");
++        for (int i = 0; i < dataSources.size(); i++) {
++            DataSourceEntity entity = dataSources.get(i);
++            StringBuilder fields = new StringBuilder("[");
++            List<FieldUpdate> updates = entity.fields() == null ? List.of() : entity.fields();
++            for (int j = 0; j < updates.size(); j++) {
++                FieldUpdate field = updates.get(j);
++                if (j > 0) {
++                    fields.append(',');
++                }
++                // actionOnField is null when the caller left it unset, and JsonObject
++                // drops null-valued properties rather than emitting them empty.
++                fields.append(new JsonObject()
++                        .put("key", field.key())
++                        .put("value", field.value())
++                        .put("action_on_field", field.actionOnField())
++                        .end());
++            }
++            fields.append(']');
++
++            if (i > 0) {
++                entities.append(',');
++            }
++            entities.append(new JsonObject()
++                    .put("entity_id", entity.entityId())
++                    .putJson("fields", fields.toString())
++                    .end());
++        }
++        entities.append(']');
++
++        String body = new JsonObject()
++                .put("action_type", actionType)
++                .putJson("data_sources", entities.toString())
++                .end();
++
++        HttpResponse<String> response = send(authenticated(HttpRequest.newBuilder(uri("/data-sources/bulk")))
++                .header("Content-Type", "application/json")
++                .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
++                .build());
++        // 202 Submitted. The operation is accepted, not finished.
++        requireStatus(response, 202, "bulkDataSourceOperation");
++
++        String requestId = Json.str(Json.parseObject(response.body()), "request_id");
++        if (requestId == null || requestId.isBlank()) {
++            throw new VcfOpsNetworksException("bulk operation response carried no request_id");
++        }
++        return requestId;
+     }
+ 
+     /**
+@@ -168,9 +245,73 @@ public final class VcfOpsNetworksClient {
+      *                                 within the configured poll timeout
+      */
+     public BulkOperationReport awaitBulkOperation(String requestId) {
+-        // TODO: implement operationId `getBulkOperationDetails` and the polling loop
+-        //       per docs/contract.json -> async_workflow.
+-        throw new UnsupportedOperationException("awaitBulkOperation is not implemented");
++        if (requestId == null || requestId.isBlank()) {
++            throw new IllegalArgumentException("requestId is required");
++        }
++        long deadline = System.nanoTime() + Duration.ofMillis(pollTimeoutMillis).toNanos();
++
++        BulkOperationReport report = getBulkOperationDetails(requestId, deadline);
++        while (!isTerminal(report)) {
++            if (System.nanoTime() >= deadline) {
++                throw new VcfOpsNetworksException(
++                        "bulk operation " + requestId + " did not reach a terminal state within "
++                                + pollTimeoutMillis + " ms; last report was " + report.successCount()
++                                + " succeeded and " + report.failedCount() + " failed of "
++                                + report.totalCount());
++            }
++            sleep(Math.min(pollIntervalMillis, Math.max(1L,
++                    Duration.ofNanos(deadline - System.nanoTime()).toMillis())));
++            report = getBulkOperationDetails(requestId, deadline);
++        }
++        return report;
++    }
++
++    private BulkOperationReport getBulkOperationDetails(String requestId, long deadline) {
++        String path = "/data-sources/bulk/view-details/" + encodeSegment(requestId);
++        HttpResponse<String> response = send(authenticated(HttpRequest.newBuilder(uri(path)))
++                .timeout(Duration.ofNanos(Math.max(1L, deadline - System.nanoTime())))
++                .GET()
++                .build());
++        requireStatus(response, 200, "getBulkOperationDetails");
++
++        Map<String, Object> body = Json.parseObject(response.body());
++
++        List<String> successful = new ArrayList<>();
++        for (Object entry : Json.list(body, "successful_data_sources")) {
++            successful.add(String.valueOf(entry));
++        }
++        List<FailedDataSource> failed = new ArrayList<>();
++        for (Object entry : Json.list(body, "failed_data_sources")) {
++            Map<String, Object> details = Json.asObject(entry);
++            failed.add(new FailedDataSource(Json.str(details, "entity_id"), Json.str(details, "reason")));
++        }
++        return new BulkOperationReport(
++                Json.intAt(body, "total_count"),
++                Json.intAt(body, "success_count"),
++                Json.intAt(body, "failed_count"),
++                List.copyOf(successful),
++                List.copyOf(failed));
++    }
++
++    /**
++     * The report is terminal only once every data source has been accounted for. Any
++     * earlier snapshot is partial progress, not a result.
++     */
++    private static boolean isTerminal(BulkOperationReport report) {
++        return report.totalCount() > 0
++                && report.successCount() + report.failedCount() == report.totalCount();
++    }
++
++    private static void sleep(long millis) {
++        if (millis <= 0) {
++            return;
++        }
++        try {
++            Thread.sleep(millis);
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++            throw new VcfOpsNetworksException("interrupted while polling", e);
++        }
+     }
+ 
+     // ---------------------------------------------------------------------
+@@ -192,6 +333,92 @@ public final class VcfOpsNetworksClient {
+         }
+     }
+ 
++    /** Absolute URI for a specification path item, under the {@code /api/ni} server base path. */
++    private URI uri(String pathItem) {
++        return URI.create(baseUrl + BASE_PATH + pathItem);
++    }
++
++    /** Adds the ApiKeyAuth header: {@code Authorization: NetworkInsight {token}}. */
++    private HttpRequest.Builder authenticated(HttpRequest.Builder builder) {
++        if (token == null) {
++            throw new VcfOpsNetworksException("not authenticated - call authenticate() first");
++        }
++        return builder.header("Authorization", "NetworkInsight " + token);
++    }
++
++    private static void requireStatus(HttpResponse<String> response, int expected, String operationId) {
++        if (response.statusCode() != expected) {
++            throw new VcfOpsNetworksException(
++                    operationId + " expected HTTP " + expected + " but got " + response.statusCode()
++                            + ": " + response.body(),
++                    response.statusCode());
++        }
++    }
++
++    private static String encodeSegment(String value) {
++        return URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20");
++    }
++
++    // ---------------------------------------------------------------------
++    // Minimal JSON writer.
++    //
++    // The one rule that matters: a property whose value is null was never set by the
++    // caller, so it is dropped rather than written as null, "" or {}. A property that
++    // was set is always written, including when it was set to the empty string.
++    // ---------------------------------------------------------------------
++
++    private static final class JsonObject {
++        private final StringBuilder sb = new StringBuilder("{");
++        private boolean empty = true;
++
++        /** Writes a string property, or nothing at all when the value is unset. */
++        JsonObject put(String name, String value) {
++            return value == null ? this : append(name, quote(value));
++        }
++
++        /** Writes an already-serialized JSON value, or nothing at all when it is unset. */
++        JsonObject putJson(String name, String json) {
++            return json == null ? this : append(name, json);
++        }
++
++        private JsonObject append(String name, String rendered) {
++            if (!empty) {
++                sb.append(',');
++            }
++            sb.append(quote(name)).append(':').append(rendered);
++            empty = false;
++            return this;
++        }
++
++        String end() {
++            return sb.append('}').toString();
++        }
++
++        private static String quote(String value) {
++            StringBuilder out = new StringBuilder(value.length() + 2).append('"');
++            for (int i = 0; i < value.length(); i++) {
++                char c = value.charAt(i);
++                switch (c) {
++                    case '"' -> out.append("\\\"");
++                    case '\\' -> out.append("\\\\");
++                    case '\b' -> out.append("\\b");
++                    case '\f' -> out.append("\\f");
++                    case '\n' -> out.append("\\n");
++                    case '\r' -> out.append("\\r");
++                    case '\t' -> out.append("\\t");
++                    default -> {
++                        if (c < 0x20) {
++                            out.append(String.format("\\u%04x", (int) c));
++                        } else {
++                            out.append(c);
++                        }
++                    }
++                }
++            }
++            return out.append('"').toString();
++        }
++    }
++
+     // ---------------------------------------------------------------------
+     // Minimal JSON reader - provided, no need to change.
+     //

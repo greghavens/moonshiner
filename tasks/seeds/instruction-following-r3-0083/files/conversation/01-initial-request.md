@@ -1,0 +1,3 @@
+I need a decision-ready comparison of countertop air fryers from the supplied catalog. Choose exactly three finalists that are no wider than 13 inches, hold at least 5 quarts, and include at least a one-year warranty.
+
+Rank them primarily by lowest price. Give me a Markdown table with these columns in this order: Rank, Model, Regular price, Width (in), Capacity (qt), Warranty, Controls, Noise (dBA), and Why it fits. After the table, include separate Recommendation and Runner-up sections, each with two or three complete sentences that name the chosen model and explain a meaningful advantage and tradeoff.

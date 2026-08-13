@@ -1,0 +1,256 @@
+--- a/sddclcm/client.go
++++ b/sddclcm/client.go
+@@ -11,8 +11,10 @@ import (
+ 	"io"
+ 	"net/http"
+ 	"net/url"
++	"sort"
+ 	"strconv"
+ 	"strings"
++	"sync"
+ 	"time"
+ )
+ 
+@@ -163,25 +165,148 @@ func NewClient(baseURL, bearerToken string, httpClient *http.Client) (*Client, e
+ }
+ 
+ // ListAllTasks retrieves the whole getTasks collection and returns it in the
+-// package's stable order.
+-//
+-// TODO(lcm): this walks only the first page, returns the elements in whatever
+-// order the service happened to emit them, and sends every filter parameter
+-// whether or not the caller set it.
++// package's stable order: ascending createTime instant, tasks whose createTime
++// is absent or unparseable last, ties broken by ascending id. Where the same
++// task id appears more than once, the occurrence on the lowest page wins.
+ func (c *Client) ListAllTasks(ctx context.Context, opts ListTasksOptions) ([]TaskSummary, error) {
+ 	pageSize := opts.PageSize
+ 	if pageSize == 0 {
+ 		pageSize = DefaultPageSize
+ 	}
++	if pageSize < 1 {
++		pageSize = 1
++	}
++	if pageSize > MaxPageSize {
++		pageSize = MaxPageSize
++	}
++	concurrency := opts.Concurrency
++	if concurrency == 0 {
++		concurrency = DefaultConcurrency
++	}
++	if concurrency < MinConcurrency {
++		concurrency = MinConcurrency
++	}
+ 
+-	page, err := c.getTasksPage(ctx, opts.Filter, 0, pageSize)
++	first, err := c.getTasksPage(ctx, opts.Filter, 0, pageSize)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	out := make([]TaskSummary, 0, len(page.Elements))
+-	out = append(out, page.Elements...)
+-	return out, nil
++	totalPages := first.PageMetadata.TotalPages
++	if totalPages < 1 {
++		totalPages = 1
++	}
++	pages := make([][]TaskSummary, totalPages)
++	pages[0] = first.Elements
++
++	if totalPages > 1 {
++		if err := c.fetchFollowerPages(ctx, opts.Filter, pageSize, concurrency, pages); err != nil {
++			return nil, err
++		}
++	}
++	return stableOrder(pages), nil
++}
++
++// fetchFollowerPages retrieves pages 1..len(pages)-1 with at most concurrency
++// requests in flight, writing each page into its own slot so that the
++// collection order never depends on completion order.
++func (c *Client) fetchFollowerPages(ctx context.Context, filter TaskFilter, pageSize, concurrency int, pages [][]TaskSummary) error {
++	ctx, cancel := context.WithCancel(ctx)
++	defer cancel()
++
++	errs := make([]error, len(pages))
++	slots := make(chan struct{}, concurrency)
++	var wg sync.WaitGroup
++
++	for pageNumber := 1; pageNumber < len(pages); pageNumber++ {
++		wg.Add(1)
++		go func(pageNumber int) {
++			defer wg.Done()
++			select {
++			case slots <- struct{}{}:
++				defer func() { <-slots }()
++			case <-ctx.Done():
++				errs[pageNumber] = ctx.Err()
++				return
++			}
++			if ctx.Err() != nil {
++				errs[pageNumber] = ctx.Err()
++				return
++			}
++			page, err := c.getTasksPage(ctx, filter, pageNumber, pageSize)
++			if err != nil {
++				errs[pageNumber] = err
++				cancel() // stop the remaining pages; the call has already failed
++				return
++			}
++			pages[pageNumber] = page.Elements
++		}(pageNumber)
++	}
++	wg.Wait()
++
++	// Report the lowest-numbered genuine failure in preference to the
++	// cancellations it caused, so the error is the same on every run.
++	for _, err := range errs {
++		if err != nil && !errors.Is(err, context.Canceled) {
++			return err
++		}
++	}
++	for _, err := range errs {
++		if err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// stableOrder de-duplicates by task id, keeping the occurrence with the lowest
++// (page number, index within page), and returns the result in the package's
++// stable order.
++func stableOrder(pages [][]TaskSummary) []TaskSummary {
++	type placed struct {
++		pageNumber int
++		index      int
++		task       TaskSummary
++	}
++	best := make(map[string]placed)
++	for pageNumber, elements := range pages {
++		for index, task := range elements {
++			current, seen := best[task.ID]
++			if seen && (current.pageNumber < pageNumber ||
++				(current.pageNumber == pageNumber && current.index <= index)) {
++				continue
++			}
++			best[task.ID] = placed{pageNumber: pageNumber, index: index, task: task}
++		}
++	}
++
++	out := make([]TaskSummary, 0, len(best))
++	for _, entry := range best {
++		out = append(out, entry.task)
++	}
++	sort.Slice(out, func(i, j int) bool {
++		left, leftOK := parseTimestamp(out[i].CreateTime)
++		right, rightOK := parseTimestamp(out[j].CreateTime)
++		if leftOK != rightOK {
++			return leftOK // tasks without a usable createTime sort last
++		}
++		if leftOK && !left.Equal(right) {
++			return left.Before(right)
++		}
++		return out[i].ID < out[j].ID
++	})
++	return out
++}
++
++func parseTimestamp(value string) (time.Time, bool) {
++	if value == "" {
++		return time.Time{}, false
++	}
++	parsed, err := time.Parse(time.RFC3339, value)
++	if err != nil {
++		return time.Time{}, false
++	}
++	return parsed.UTC(), true
+ }
+ 
+ // getTasksPage performs one getTasks request.
+@@ -189,20 +314,20 @@ func (c *Client) getTasksPage(ctx context.Context, filter TaskFilter, pageNumber
+ 	query := url.Values{}
+ 	query.Set("pageNumber", strconv.Itoa(pageNumber))
+ 	query.Set("pageSize", strconv.Itoa(pageSize))
+-	query.Set("status", filter.Status)
+-	query.Set("type", filter.Type)
+-	query.Set("createdBy", filter.CreatedBy)
+-	query.Set("name", filter.Name)
+-	query.Set("description", filter.Description)
+-	query.Set("resourceId", filter.ResourceID)
+-	query.Set("resourceType", filter.ResourceType)
+-	query.Set("startTimeGt", formatTime(filter.StartTimeGt))
+-	query.Set("startTimeLt", formatTime(filter.StartTimeLt))
+-	query.Set("updateTimeGt", formatTime(filter.UpdateTimeGt))
+-	query.Set("updateTimeLt", formatTime(filter.UpdateTimeLt))
+-	query.Set("endTimeGt", formatTime(filter.EndTimeGt))
+-	query.Set("endTimeLt", formatTime(filter.EndTimeLt))
+-	query.Set("includeSystemTasks", formatBool(filter.IncludeSystemTasks))
++	setString(query, "status", filter.Status)
++	setString(query, "type", filter.Type)
++	setString(query, "createdBy", filter.CreatedBy)
++	setString(query, "name", filter.Name)
++	setString(query, "description", filter.Description)
++	setString(query, "resourceId", filter.ResourceID)
++	setString(query, "resourceType", filter.ResourceType)
++	setTime(query, "startTimeGt", filter.StartTimeGt)
++	setTime(query, "startTimeLt", filter.StartTimeLt)
++	setTime(query, "updateTimeGt", filter.UpdateTimeGt)
++	setTime(query, "updateTimeLt", filter.UpdateTimeLt)
++	setTime(query, "endTimeGt", filter.EndTimeGt)
++	setTime(query, "endTimeLt", filter.EndTimeLt)
++	setBool(query, "includeSystemTasks", filter.IncludeSystemTasks)
+ 
+ 	var page PageOfTaskSummary
+ 	if err := c.do(ctx, "getTasks", "/v1/tasks", query, &page); err != nil {
+@@ -212,12 +337,10 @@ func (c *Client) getTasksPage(ctx context.Context, filter TaskFilter, pageNumber
+ }
+ 
+ // ListComponents retrieves the SDDC and Fleet components. An empty scope means
+-// the caller did not filter by scope.
+-//
+-// TODO(lcm): scope is sent even when the caller left it unset.
++// the caller did not filter by scope, so the parameter is left off entirely.
+ func (c *Client) ListComponents(ctx context.Context, scope string) ([]Component, error) {
+ 	query := url.Values{}
+-	query.Set("scope", scope)
++	setString(query, "scope", scope)
+ 
+ 	var body Components
+ 	if err := c.do(ctx, "getComponents", "/v1/components", query, &body); err != nil {
+@@ -260,16 +383,26 @@ func (c *Client) do(ctx context.Context, operationID, path string, query url.Val
+ 	return nil
+ }
+ 
+-func formatTime(t *time.Time) string {
+-	if t == nil {
+-		return ""
++// setString, setTime and setBool add an optional query parameter only when the
++// caller set it. An unset parameter is omitted from the request rather than
++// sent with an empty value.
++func setString(query url.Values, name, value string) {
++	if value == "" {
++		return
++	}
++	query.Set(name, value)
++}
++
++func setTime(query url.Values, name string, value *time.Time) {
++	if value == nil {
++		return
+ 	}
+-	return t.UTC().Format(time.RFC3339)
++	query.Set(name, value.UTC().Format(time.RFC3339))
+ }
+ 
+-func formatBool(b *bool) string {
+-	if b == nil {
+-		return ""
++func setBool(query url.Values, name string, value *bool) {
++	if value == nil {
++		return
+ 	}
+-	return strconv.FormatBool(*b)
++	query.Set(name, strconv.FormatBool(*value))
+ }

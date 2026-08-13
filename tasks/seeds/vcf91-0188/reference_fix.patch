@@ -1,0 +1,286 @@
+--- a/diagnostics/client.go
++++ b/diagnostics/client.go
+@@ -3,9 +3,15 @@
+ package diagnostics
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
++	"strings"
+ 	"time"
+ )
+ 
+@@ -55,10 +61,265 @@
+ 
+ // NewClient constructs a Log Management client.
+ func NewClient(cfg Config) (*Client, error) {
+-	return nil, errors.New("TODO: implement VCF Operations Log Management client")
++	baseURL := strings.TrimSpace(cfg.BaseURL)
++	token := strings.TrimSpace(cfg.Token)
++	if baseURL == "" {
++		return nil, errors.New("base URL is required")
++	}
++	parsed, err := url.Parse(baseURL)
++	if err != nil {
++		return nil, fmt.Errorf("parse base URL: %w", err)
++	}
++	if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
++		return nil, errors.New("base URL must be an absolute HTTP or HTTPS URL")
++	}
++	if parsed.RawQuery != "" || parsed.Fragment != "" {
++		return nil, errors.New("base URL must not contain a query or fragment")
++	}
++	if token == "" {
++		return nil, errors.New("X-JWT-Token is required")
++	}
++	httpClient := cfg.HTTPClient
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++	return &Client{
++		baseURL:    strings.TrimRight(baseURL, "/"),
++		token:      token,
++		httpClient: httpClient,
++	}, nil
+ }
+ 
+ // DiagnoseFailure pulls and correlates the relevant logs and events.
+ func (c *Client) DiagnoseFailure(ctx context.Context, incident Incident) (Diagnosis, error) {
+-	return Diagnosis{}, errors.New("TODO: diagnose from correlated logs and events")
++	if c == nil || c.httpClient == nil {
++		return Diagnosis{}, errors.New("client is not initialized")
++	}
++	if ctx == nil {
++		return Diagnosis{}, errors.New("context is required")
++	}
++	if err := ctx.Err(); err != nil {
++		return Diagnosis{}, err
++	}
++	deploymentID := strings.TrimSpace(incident.DeploymentID)
++	if deploymentID == "" {
++		return Diagnosis{}, errors.New("deployment ID is required")
++	}
++	if incident.StartedAt.IsZero() || incident.EndedAt.IsZero() {
++		return Diagnosis{}, errors.New("incident start and end are required")
++	}
++	if incident.EndedAt.Before(incident.StartedAt) {
++		return Diagnosis{}, errors.New("incident end precedes start")
++	}
++
++	logs, err := c.search(ctx, "logs", "deployment_id", deploymentID, incident)
++	if err != nil {
++		return Diagnosis{}, fmt.Errorf("search deployment logs: %w", err)
++	}
++	failureLog, fields, ok := qualifyingFailureLog(logs.Events.Hits, deploymentID)
++	if !ok {
++		return Diagnosis{}, fmt.Errorf("%w: no ERROR/TLS_HANDSHAKE log for deployment", ErrInsufficientEvidence)
++	}
++	correlationID := fields["correlation_id"]
++	endpoint := fields["endpoint"]
++	if correlationID == "" || endpoint == "" {
++		return Diagnosis{}, fmt.Errorf("%w: failure log lacks correlation fields", ErrInsufficientEvidence)
++	}
++
++	events, err := c.search(ctx, "events", "correlation_id", correlationID, incident)
++	if err != nil {
++		return Diagnosis{}, fmt.Errorf("search correlated events: %w", err)
++	}
++	rotationEvent, ok := matchingRotationEvent(events.Events.Hits, correlationID, endpoint)
++	if !ok {
++		return Diagnosis{}, fmt.Errorf("%w: no matching certificate replacement event", ErrInsufficientEvidence)
++	}
++
++	return Diagnosis{
++		RootCause:     CertificateRotationRootCause,
++		CorrelationID: correlationID,
++		Endpoint:      endpoint,
++		Evidence: []Evidence{
++			{
++				Kind:      "log",
++				Timestamp: failureLog.MsgContent.LogTimestamp,
++				Text:      failureLog.MsgContent.OriginalText,
++			},
++			{
++				Kind:      "event",
++				Timestamp: rotationEvent.MsgContent.LogTimestamp,
++				Text:      rotationEvent.MsgContent.OriginalText,
++			},
++		},
++	}, nil
++}
++
++const searchPath = "/api/v2/logs/search"
++
++type queryRequest struct {
++	Aggregations  map[string]any `json:"aggregations,omitempty"`
++	From          *int           `json:"from,omitempty"`
++	Indices       []string       `json:"indices,omitempty"`
++	Query         query          `json:"query"`
++	Scroll        string         `json:"scroll,omitempty"`
++	ScrollSize    *int           `json:"scrollSize,omitempty"`
++	Size          int            `json:"size,omitempty"`
++	Sort          []sortOption   `json:"sort,omitempty"`
++	TrackTotalHit *bool          `json:"trackTotalHits,omitempty"`
++}
++
++type query struct {
++	Bool        *boolQuery              `json:"bool,omitempty"`
++	MatchPhrase map[string]string       `json:"match_phrase,omitempty"`
++	Range       map[string]rangeOptions `json:"range,omitempty"`
++}
++
++type boolQuery struct {
++	Filter  []query `json:"filter,omitempty"`
++	Must    []query `json:"must,omitempty"`
++	MustNot []query `json:"must_not,omitempty"`
++	Should  []query `json:"should,omitempty"`
++}
++
++type rangeOptions struct {
++	GT  string `json:"gt,omitempty"`
++	GTE string `json:"gte,omitempty"`
++	LT  string `json:"lt,omitempty"`
++	LTE string `json:"lte,omitempty"`
++}
++
++type sortOption map[string]sortOrder
++
++type sortOrder struct {
++	Order string `json:"order,omitempty"`
++}
++
++type queryResponse struct {
++	Events         eventsResult `json:"events"`
++	FailureMessage string       `json:"failureMessage"`
++	FailureReason  string       `json:"failureReason"`
++	TimeTaken      int64        `json:"timeTakenMillis"`
++	TimedOut       bool         `json:"timedOut"`
++}
++
++type eventsResult struct {
++	Hits  []logMessage `json:"hits"`
++	Total int64        `json:"total"`
++}
++
++type logMessage struct {
++	MsgContent messageContent `json:"msgContent"`
++}
++
++type messageContent struct {
++	Fields          []field `json:"fields"`
++	IncomingAddress string  `json:"incomingAddress"`
++	IngestTimestamp int64   `json:"ingestTimestamp"`
++	LogTimestamp    int64   `json:"logTimestamp"`
++	OriginalText    string  `json:"originalText"`
++}
++
++type field struct {
++	InternalName string `json:"internalName"`
++	Value        any    `json:"value"`
++}
++
++func (c *Client) search(
++	ctx context.Context,
++	index string,
++	matchField string,
++	matchValue string,
++	incident Incident,
++) (queryResponse, error) {
++	trackTotalHits := true
++	payload := queryRequest{
++		Indices: []string{index},
++		Query: query{Bool: &boolQuery{Filter: []query{
++			{MatchPhrase: map[string]string{matchField: matchValue}},
++			{Range: map[string]rangeOptions{
++				"timestamp": {
++					GTE: incident.StartedAt.UTC().Format(time.RFC3339Nano),
++					LTE: incident.EndedAt.UTC().Format(time.RFC3339Nano),
++				},
++			}},
++		}}},
++		Size:          100,
++		Sort:          []sortOption{{"timestamp": {Order: "asc"}}},
++		TrackTotalHit: &trackTotalHits,
++	}
++	body, err := json.Marshal(payload)
++	if err != nil {
++		return queryResponse{}, fmt.Errorf("encode query: %w", err)
++	}
++	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+searchPath, bytes.NewReader(body))
++	if err != nil {
++		return queryResponse{}, fmt.Errorf("create search request: %w", err)
++	}
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set("Content-Type", "application/json")
++	request.Header.Set("X-JWT-Token", c.token)
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return queryResponse{}, fmt.Errorf("execute search request: %w", err)
++	}
++	defer response.Body.Close()
++	if response.StatusCode != http.StatusOK {
++		detail, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
++		return queryResponse{}, fmt.Errorf("search returned HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(detail)))
++	}
++
++	decoder := json.NewDecoder(io.LimitReader(response.Body, 2<<20))
++	var result queryResponse
++	if err := decoder.Decode(&result); err != nil {
++		return queryResponse{}, fmt.Errorf("decode search response: %w", err)
++	}
++	var trailing any
++	if err := decoder.Decode(&trailing); err != io.EOF {
++		if err == nil {
++			return queryResponse{}, errors.New("decode search response: multiple JSON values")
++		}
++		return queryResponse{}, fmt.Errorf("decode trailing search response: %w", err)
++	}
++	if result.TimedOut {
++		return queryResponse{}, errors.New("VCF log search timed out")
++	}
++	if result.FailureReason != "" || result.FailureMessage != "" {
++		return queryResponse{}, fmt.Errorf("VCF log search failed (%s): %s", result.FailureReason, result.FailureMessage)
++	}
++	return result, nil
++}
++
++func qualifyingFailureLog(hits []logMessage, deploymentID string) (logMessage, map[string]string, bool) {
++	for _, hit := range hits {
++		fields := stringFields(hit.MsgContent.Fields)
++		if fields["deployment_id"] == deploymentID &&
++			fields["severity"] == "ERROR" &&
++			fields["error_class"] == "TLS_HANDSHAKE" {
++			return hit, fields, true
++		}
++	}
++	return logMessage{}, nil, false
++}
++
++func matchingRotationEvent(hits []logMessage, correlationID, endpoint string) (logMessage, bool) {
++	for _, hit := range hits {
++		fields := stringFields(hit.MsgContent.Fields)
++		if fields["correlation_id"] == correlationID &&
++			fields["event_type"] == "VCENTER_CERTIFICATE_REPLACED" &&
++			fields["endpoint"] == endpoint {
++			return hit, true
++		}
++	}
++	return logMessage{}, false
++}
++
++func stringFields(fields []field) map[string]string {
++	result := make(map[string]string, len(fields))
++	for _, field := range fields {
++		if value, ok := field.Value.(string); ok && field.InternalName != "" {
++			result[field.InternalName] = value
++		}
++	}
++	return result
+ }

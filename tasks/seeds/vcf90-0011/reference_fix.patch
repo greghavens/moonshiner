@@ -1,0 +1,293 @@
+diff --git a/vcfcreds/__init__.py b/vcfcreds/__init__.py
+new file mode 100644
+index 0000000..05289d0
+--- /dev/null
++++ b/vcfcreds/__init__.py
+@@ -0,0 +1,21 @@
++"""Credential inventory client for the VCF 9.0.0.0 SDDC Manager API.
++
++The wire contract is `docs/contract.json`, a projection of the SDDC Manager
++OpenAPI file pinned in `docs/official_sources.json`.
++"""
++
++from .client import (
++    CONTRACT_PATH,
++    SddcManagerClient,
++    SddcManagerError,
++    documented_resource_types,
++    project_credential,
++)
++
++__all__ = [
++    "CONTRACT_PATH",
++    "SddcManagerClient",
++    "SddcManagerError",
++    "documented_resource_types",
++    "project_credential",
++]
+diff --git a/vcfcreds/__main__.py b/vcfcreds/__main__.py
+new file mode 100644
+index 0000000..731ddef
+--- /dev/null
++++ b/vcfcreds/__main__.py
+@@ -0,0 +1,67 @@
++"""`python3 -m vcfcreds` — emit the SDDC Manager credential inventory."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++
++from .client import SddcManagerClient, SddcManagerError, documented_resource_types, project_credential
++
++
++def build_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(
++        prog="vcfcreds",
++        description="Retrieve every SDDC Manager credential and emit it in a stable order.",
++    )
++    parser.add_argument("--base-url", required=True,
++                        help="SDDC Manager base URL, e.g. https://sddc-manager.vcf.local")
++    parser.add_argument("--username", required=True)
++    parser.add_argument("--password", required=True)
++    parser.add_argument("--page-size", required=True, type=int,
++                        help="number of elements to request per page (positive)")
++    parser.add_argument("--resource-type", default=None,
++                        help="optional resourceType filter; omitted entirely when unset")
++    return parser
++
++
++def sort_key(record: dict) -> tuple[str, str, str]:
++    return (record.get("resourceName") or "",
++            record.get("username") or "",
++            record.get("id") or "")
++
++
++def main(argv: list[str] | None = None) -> int:
++    args = build_parser().parse_args(argv)
++
++    if args.page_size < 1:
++        print(f"error: --page-size must be a positive integer, got {args.page_size}",
++              file=sys.stderr)
++        return 2
++    if args.resource_type is not None:
++        documented = documented_resource_types()
++        if args.resource_type not in documented:
++            # Rejected here, before anything is sent, so an unsupported value
++            # never reaches the service.
++            print(f"error: --resource-type {args.resource_type!r} is not one of "
++                  f"{list(documented)}", file=sys.stderr)
++            return 2
++
++    client = SddcManagerClient(args.base_url)
++    try:
++        client.create_token(args.username, args.password)
++        records = [project_credential(element)
++                   for element in client.iter_credentials(args.page_size, args.resource_type)]
++    except SddcManagerError as error:
++        print(f"error: {error}", file=sys.stderr)
++        return 1
++
++    records.sort(key=sort_key)
++    json.dump({"count": len(records), "credentials": records},
++              sys.stdout, indent=2, sort_keys=True)
++    sys.stdout.write("\n")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/vcfcreds/client.py b/vcfcreds/client.py
+new file mode 100644
+index 0000000..7b4cfe9
+--- /dev/null
++++ b/vcfcreds/client.py
+@@ -0,0 +1,185 @@
++"""HTTP client for the two SDDC Manager operations the contract names."""
++
++from __future__ import annotations
++
++import json
++import urllib.error
++import urllib.request
++from functools import lru_cache
++from pathlib import Path
++from typing import Iterator
++from urllib.parse import urlencode
++
++CONTRACT_PATH = Path(__file__).resolve().parent.parent / "docs" / "contract.json"
++
++#: Fields of the emitted credential record, flattened out of Credential and its
++#: nested AuthenticatedResource. `password` is deliberately not among them.
++RECORD_FIELDS = (
++    "id",
++    "username",
++    "accountType",
++    "credentialType",
++    "resourceId",
++    "resourceName",
++    "resourceType",
++)
++
++
++class SddcManagerError(RuntimeError):
++    """A request did not satisfy the contract, or the service refused it."""
++
++
++@lru_cache(maxsize=None)
++def _contract() -> dict:
++    return json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
++
++
++def _operation(operation_id: str) -> dict:
++    for operation in _contract()["operations"]:
++        if operation["operationId"] == operation_id:
++            return operation
++    raise SddcManagerError(f"the contract does not name operation {operation_id!r}")
++
++
++def _query_parameters(operation_id: str) -> dict[str, dict]:
++    """Return the operation's query parameters, keyed by their contract names."""
++    parameters: dict[str, dict] = {}
++    for parameter in _operation(operation_id).get("parameters", []):
++        if parameter.get("in") == "query":
++            parameters[parameter["name"]] = parameter
++    return parameters
++
++
++def documented_resource_types() -> tuple[str, ...]:
++    """The resourceType values this API version accepts, straight from the contract."""
++    parameter = _query_parameters("getCredentials").get("resourceType")
++    if parameter is None:
++        raise SddcManagerError("getCredentials declares no resourceType parameter")
++    return tuple(parameter["documentedValues"])
++
++
++def project_credential(element: dict) -> dict:
++    """Flatten a Credential into the emitted record, dropping the password."""
++    resource = element.get("resource") or {}
++    return {
++        "id": element.get("id"),
++        "username": element.get("username"),
++        "accountType": element.get("accountType"),
++        "credentialType": element.get("credentialType"),
++        "resourceId": resource.get("resourceId"),
++        "resourceName": resource.get("resourceName"),
++        "resourceType": resource.get("resourceType"),
++    }
++
++
++class SddcManagerClient:
++    """Talks to exactly the operations `docs/contract.json` names."""
++
++    def __init__(self, base_url: str, timeout: float = 30.0):
++        self._base_url = base_url.rstrip("/")
++        self._timeout = timeout
++        self._access_token: str | None = None
++
++    # -- transport --------------------------------------------------------
++
++    def _request(self, operation_id: str, *, query: dict | None = None,
++                 body: dict | None = None, authenticated: bool = True) -> tuple[int, object]:
++        operation = _operation(operation_id)
++        url = self._base_url + operation["path"]
++        if query:
++            declared = _query_parameters(operation_id)
++            unknown = sorted(set(query) - set(declared))
++            if unknown:
++                raise SddcManagerError(
++                    f"{operation_id} does not declare query parameters {unknown}")
++            # Only the parameters the caller actually supplied reach the URL.
++            url += "?" + urlencode(query)
++
++        data = None
++        headers: dict[str, str] = {"Accept": "application/json"}
++        if body is not None:
++            data = json.dumps(body).encode("utf-8")
++            headers["Content-Type"] = "application/json"
++        if authenticated:
++            if self._access_token is None:
++                raise SddcManagerError(f"{operation_id} requires an access token")
++            headers["Authorization"] = f"Bearer {self._access_token}"
++
++        request = urllib.request.Request(
++            url, data=data, headers=headers, method=operation["method"])
++        try:
++            with urllib.request.urlopen(request, timeout=self._timeout) as response:
++                payload = response.read()
++                status = response.status
++        except urllib.error.HTTPError as error:
++            with error:
++                # Drain the response without relaying arbitrary service text:
++                # it may echo the supplied password or bearer token.
++                error.read()
++            raise SddcManagerError(
++                f"{operation_id} failed with HTTP {error.code}") from None
++        except urllib.error.URLError as error:
++            raise SddcManagerError(f"{operation_id} could not reach the service: "
++                                   f"{error.reason}") from None
++
++        if status not in {int(code) for code in operation["responses"] if code.startswith("2")}:
++            raise SddcManagerError(
++                f"{operation_id} returned HTTP {status}, which the contract does not "
++                "declare as a success")
++        if not payload:
++            return status, None
++        try:
++            return status, json.loads(payload.decode("utf-8"))
++        except (UnicodeDecodeError, json.JSONDecodeError) as error:
++            raise SddcManagerError(f"{operation_id} returned malformed JSON: {error}") from None
++
++    # -- operations -------------------------------------------------------
++
++    def create_token(self, username: str, password: str) -> None:
++        """createToken. Unauthenticated; unset TokenCreationSpec fields are omitted."""
++        _, payload = self._request(
++            "createToken",
++            body={"username": username, "password": password},
++            authenticated=False,
++        )
++        if not isinstance(payload, dict) or not payload.get("accessToken"):
++            raise SddcManagerError("createToken returned no accessToken")
++        self._access_token = payload["accessToken"]
++
++    def iter_credentials(self, page_size: int,
++                         resource_type: str | None = None) -> Iterator[dict]:
++        """getCredentials, walked from page 0 until totalPages is exhausted."""
++        if page_size < 1:
++            raise SddcManagerError("page size must be a positive integer")
++        if resource_type is not None:
++            documented = documented_resource_types()
++            if resource_type not in documented:
++                raise SddcManagerError(
++                    f"resourceType {resource_type!r} is not one of {list(documented)} "
++                    f"in API version {_contract()['api_version']}")
++
++        parameters = _query_parameters("getCredentials")
++        page_number_name = parameters["pageNumber"]["name"]
++        page_size_name = parameters["pageSize"]["name"]
++        resource_type_name = parameters["resourceType"]["name"]
++        page_number = 0
++        while True:
++            query = {page_number_name: str(page_number), page_size_name: str(page_size)}
++            if resource_type is not None:
++                query[resource_type_name] = resource_type
++
++            _, payload = self._request("getCredentials", query=query)
++            if not isinstance(payload, dict):
++                raise SddcManagerError("getCredentials did not return a PageOfCredential")
++
++            # `elements` is absent on an empty page; PageOfCredential requires neither.
++            yield from payload.get("elements") or []
++
++            metadata = payload.get("pageMetadata") or {}
++            total_pages = metadata.get("totalPages")
++            if not isinstance(total_pages, int):
++                raise SddcManagerError(
++                    "getCredentials returned no pageMetadata.totalPages, so the "
++                    "collection cannot be walked to the end")
++
++            page_number += 1
++            if page_number >= total_pages:
++                return

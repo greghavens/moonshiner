@@ -1,0 +1,366 @@
+diff --git a/logsapi/client.go b/logsapi/client.go
+new file mode 100644
+index 0000000..e17eaa0
+--- /dev/null
++++ b/logsapi/client.go
+@@ -0,0 +1,235 @@
++package logsapi
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strconv"
++	"strings"
++	"sync"
++)
++
++// Credentials are sent to POST_sessions when a session is needed.
++type Credentials struct {
++	Username string `json:"username"`
++	Password string `json:"password"`
++	Provider string `json:"provider"`
++}
++
++// SessionResponse is the response body of POST_sessions.
++type SessionResponse struct {
++	UserID    string `json:"userId"`
++	SessionID string `json:"sessionId"`
++	TTL       int    `json:"ttl"`
++}
++
++// EventQuery describes one GET_events-+path request. Pointer fields distinguish
++// explicit zero values from options that must be omitted from the wire.
++type EventQuery struct {
++	Path              string
++	Limit             *int
++	Timeout           *int
++	View              *string
++	ContentPackFields []string
++	OrderByDirection  *string
++}
++
++// EventField is a field attached to a DEFAULT-view event.
++type EventField struct {
++	Name          string `json:"name,omitempty"`
++	Content       string `json:"content,omitempty"`
++	StartPosition *int   `json:"startPosition,omitempty"`
++	Length        *int   `json:"length,omitempty"`
++}
++
++// Event is an event returned by the DEFAULT view.
++type Event struct {
++	Text            string       `json:"text,omitempty"`
++	Timestamp       int64        `json:"timestamp,omitempty"`
++	TimestampString string       `json:"timestampString,omitempty"`
++	Fields          []EventField `json:"fields,omitempty"`
++}
++
++// Warning describes a partial-query warning.
++type Warning struct {
++	ID       float64  `json:"id,omitempty"`
++	Details  string   `json:"details,omitempty"`
++	Progress *float64 `json:"progress,omitempty"`
++}
++
++// EventsResponse is the response body of GET_events-+path.
++type EventsResponse struct {
++	Events   []Event          `json:"events,omitempty"`
++	Results  []map[string]any `json:"results,omitempty"`
++	Complete bool             `json:"complete"`
++	Duration float64          `json:"duration,omitempty"`
++	Warnings []Warning        `json:"warnings,omitempty"`
++}
++
++// Client calls the two operations in the pinned VCF Operations for Logs
++// contract. sessionMu protects the token and prevents concurrent refreshes from
++// racing with one another.
++type Client struct {
++	baseURL     *url.URL
++	credentials Credentials
++	httpClient  *http.Client
++
++	sessionMu sync.Mutex
++	sessionID string
++}
++
++// NewClient constructs a client rooted at a VCF Operations for Logs appliance.
++func NewClient(baseURL string, credentials Credentials, httpClient *http.Client) (*Client, error) {
++	u, err := url.Parse(baseURL)
++	if err != nil {
++		return nil, fmt.Errorf("parse base URL: %w", err)
++	}
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++	return &Client{
++		baseURL:     u,
++		credentials: credentials,
++		httpClient:  httpClient,
++	}, nil
++}
++
++// QueryEvents runs queries in order. A 440 response refreshes the session and
++// retries the query that observed the expiry; responses already collected stay
++// in the output slice.
++func (c *Client) QueryEvents(ctx context.Context, queries []EventQuery) ([]EventsResponse, error) {
++	results := make([]EventsResponse, 0, len(queries))
++	for _, query := range queries {
++		for {
++			token, err := c.session(ctx, "")
++			if err != nil {
++				return nil, err
++			}
++
++			response, expired, err := c.query(ctx, token, query)
++			if err != nil {
++				return nil, err
++			}
++			if expired {
++				if _, err := c.session(ctx, token); err != nil {
++					return nil, err
++				}
++				continue
++			}
++			results = append(results, response)
++			break
++		}
++	}
++	return results, nil
++}
++
++// session returns the current session. When expired is non-empty it obtains a
++// replacement only if that expired token is still current.
++func (c *Client) session(ctx context.Context, expired string) (string, error) {
++	c.sessionMu.Lock()
++	defer c.sessionMu.Unlock()
++
++	if c.sessionID != "" && (expired == "" || c.sessionID != expired) {
++		return c.sessionID, nil
++	}
++
++	body, err := json.Marshal(c.credentials)
++	if err != nil {
++		return "", fmt.Errorf("encode POST_sessions request: %w", err)
++	}
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint("/api/v2/sessions"), bytes.NewReader(body))
++	if err != nil {
++		return "", fmt.Errorf("create POST_sessions request: %w", err)
++	}
++	req.Header.Set("Content-Type", "application/json")
++
++	resp, err := c.httpClient.Do(req)
++	if err != nil {
++		return "", fmt.Errorf("POST_sessions: %w", err)
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
++		return "", responseError("POST_sessions", resp)
++	}
++
++	var session SessionResponse
++	if err := json.NewDecoder(resp.Body).Decode(&session); err != nil {
++		return "", fmt.Errorf("decode POST_sessions response: %w", err)
++	}
++	c.sessionID = session.SessionID
++	return c.sessionID, nil
++}
++
++func (c *Client) query(ctx context.Context, token string, query EventQuery) (EventsResponse, bool, error) {
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.queryURL(query), nil)
++	if err != nil {
++		return EventsResponse{}, false, fmt.Errorf("create GET_events-+path request: %w", err)
++	}
++	req.Header.Set("Authorization", "Bearer "+token)
++
++	resp, err := c.httpClient.Do(req)
++	if err != nil {
++		return EventsResponse{}, false, fmt.Errorf("GET_events-+path: %w", err)
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode == 440 {
++		_, _ = io.Copy(io.Discard, resp.Body)
++		return EventsResponse{}, true, nil
++	}
++	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
++		return EventsResponse{}, false, responseError("GET_events-+path", resp)
++	}
++
++	var result EventsResponse
++	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
++		return EventsResponse{}, false, fmt.Errorf("decode GET_events-+path response: %w", err)
++	}
++	return result, false, nil
++}
++
++func (c *Client) queryURL(query EventQuery) string {
++	segments := strings.Split(strings.TrimPrefix(query.Path, "/"), "/")
++	for i := range segments {
++		segments[i] = url.PathEscape(segments[i])
++	}
++
++	values := make(url.Values)
++	if query.Limit != nil {
++		values.Set("limit", strconv.Itoa(*query.Limit))
++	}
++	if query.Timeout != nil {
++		values.Set("timeout", strconv.Itoa(*query.Timeout))
++	}
++	if query.View != nil {
++		values.Set("view", *query.View)
++	}
++	for _, field := range query.ContentPackFields {
++		values.Add("content-pack-fields", field)
++	}
++	if query.OrderByDirection != nil {
++		values.Set("order-by-direction", *query.OrderByDirection)
++	}
++
++	u := c.endpoint("/api/v2/events/" + strings.Join(segments, "/"))
++	if encoded := values.Encode(); encoded != "" {
++		u += "?" + encoded
++	}
++	return u
++}
++
++func (c *Client) endpoint(path string) string {
++	return strings.TrimRight(c.baseURL.String(), "/") + path
++}
++
++func responseError(operation string, resp *http.Response) error {
++	body, _ := io.ReadAll(resp.Body)
++	detail := strings.TrimSpace(string(body))
++	if detail == "" {
++		return fmt.Errorf("%s returned HTTP %d", operation, resp.StatusCode)
++	}
++	return fmt.Errorf("%s returned HTTP %d: %s", operation, resp.StatusCode, detail)
++}
+diff --git a/mocklogs/server.go b/mocklogs/server.go
+new file mode 100644
+index 0000000..9c21972
+--- /dev/null
++++ b/mocklogs/server.go
+@@ -0,0 +1,119 @@
++// Package mocklogs provides a loopback server for the two operations in the
++// pinned VCF Operations for Logs contract.
++package mocklogs
++
++import (
++	"encoding/json"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++)
++
++const (
++	OperationPostSessions  = "POST_sessions"
++	OperationGetEventsPath = "GET_events-+path"
++)
++
++// Step is one scripted response for a named contract operation.
++type Step struct {
++	OperationID string
++	StatusCode  int
++	Body        any
++}
++
++// Request records the observable request wire.
++type Request struct {
++	Method     string
++	RequestURI string
++	Header     http.Header
++	Body       string
++}
++
++// Server is a loopback-only scripted VCF Operations for Logs server.
++type Server struct {
++	server *httptest.Server
++
++	mu       sync.Mutex
++	steps    []Step
++	nextStep int
++	requests []Request
++}
++
++// New starts a loopback server with the supplied response script.
++func New(steps []Step) *Server {
++	s := &Server{steps: append([]Step(nil), steps...)}
++	s.server = httptest.NewServer(http.HandlerFunc(s.serveHTTP))
++	return s
++}
++
++// URL returns the loopback appliance root URL.
++func (s *Server) URL() string { return s.server.URL }
++
++// Client returns the HTTP client associated with the test server.
++func (s *Server) Client() *http.Client { return s.server.Client() }
++
++// Close stops the loopback server.
++func (s *Server) Close() { s.server.Close() }
++
++// Requests returns a deep copy of the request log.
++func (s *Server) Requests() []Request {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	requests := make([]Request, len(s.requests))
++	for i, request := range s.requests {
++		requests[i] = request
++		requests[i].Header = request.Header.Clone()
++	}
++	return requests
++}
++
++func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
++	body, _ := io.ReadAll(r.Body)
++	record := Request{
++		Method:     r.Method,
++		RequestURI: r.RequestURI,
++		Header:     r.Header.Clone(),
++		Body:       string(body),
++	}
++
++	s.mu.Lock()
++	s.requests = append(s.requests, record)
++	operationID, ok := contractOperation(r)
++	if !ok {
++		s.mu.Unlock()
++		http.NotFound(w, r)
++		return
++	}
++	if s.nextStep >= len(s.steps) || s.steps[s.nextStep].OperationID != operationID {
++		s.mu.Unlock()
++		http.Error(w, "unexpected contract operation", http.StatusInternalServerError)
++		return
++	}
++	step := s.steps[s.nextStep]
++	s.nextStep++
++	s.mu.Unlock()
++
++	status := step.StatusCode
++	if status == 0 {
++		status = http.StatusOK
++	}
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(status)
++	if step.Body != nil {
++		_ = json.NewEncoder(w).Encode(step.Body)
++	}
++}
++
++func contractOperation(r *http.Request) (string, bool) {
++	switch {
++	case r.Method == http.MethodPost && r.URL.Path == "/api/v2/sessions":
++		return OperationPostSessions, true
++	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v2/events/") && strings.TrimPrefix(r.URL.Path, "/api/v2/events/") != "":
++		return OperationGetEventsPath, true
++	default:
++		return "", false
++	}
++}

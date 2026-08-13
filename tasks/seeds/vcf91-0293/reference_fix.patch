@@ -1,0 +1,230 @@
+--- a/src/vcfon_syslog/client.py
++++ b/src/vcfon_syslog/client.py
+@@ -9,9 +9,44 @@
+ 
+ from __future__ import annotations
+ 
++from urllib.parse import quote
++
+ from .errors import VcfOnApiError
+ from .transport import send
+ 
++SERVER_BASE_PATH = "/api/ni"
++
++
++def _credentials_body(credentials):
++    """UserCredential.
++
++    ``domain`` is absent unless the operator set one, and ``value`` is absent
++    unless that domain carries one -- the spec notes it is not required for a
++    LOCAL domain.
++    """
++    body = {"username": credentials.username, "password": credentials.password}
++    domain = credentials.domain
++    if domain is not None:
++        encoded = {"domain_type": domain.domain_type}
++        if domain.value is not None:
++            encoded["value"] = domain.value
++        body["domain"] = encoded
++    return body
++
++
++def _target_body(target):
++    """SyslogTarget. Optional fields the operator left unset stay off the wire."""
++    body = {
++        "ip_or_fqdn": target.ip_or_fqdn,
++        "port": target.port,
++        "protocol": target.protocol,
++    }
++    if target.nick_name is not None:
++        body["nick_name"] = target.nick_name
++    if target.collector_id is not None:
++        body["collector_id"] = target.collector_id
++    return body
++
+ 
+ class SyslogSettingsClient:
+     """Talks to one appliance.
+@@ -26,18 +61,48 @@
+         self.timeout = timeout
+         self.token = None
+ 
++    # -- helpers -------------------------------------------------------------
++    def _url(self, path):
++        return self.base_url + SERVER_BASE_PATH + path
++
++    def _auth_headers(self):
++        if self.token is None:
++            raise RuntimeError("no auth token; call create_auth_token first")
++        return {"Authorization": "NetworkInsight " + self.token}
++
++    @staticmethod
++    def _expect(response, status):
++        if response.status != status:
++            raise VcfOnApiError.from_response(response)
++        return response
++
+     # -- operationId: create -------------------------------------------------
+     def create_auth_token(self, credentials):
+         """POST /api/ni/auth/token, store and return the issued token.
+ 
+         Carries no Authorization header. Returns the token string.
+         """
+-        raise NotImplementedError
++        response = send(
++            "POST",
++            self._url("/auth/token"),
++            json_body=_credentials_body(credentials),
++            timeout=self.timeout,
++        )
++        self._expect(response, 200)
++        self.token = (response.json() or {})["token"]
++        return self.token
+ 
+     # -- operationId: delete -------------------------------------------------
+     def delete_auth_token(self):
+         """DELETE /api/ni/auth/token, then forget the token."""
+-        raise NotImplementedError
++        response = send(
++            "DELETE",
++            self._url("/auth/token"),
++            headers=self._auth_headers(),
++            timeout=self.timeout,
++        )
++        self._expect(response, 204)
++        self.token = None
+ 
+     # -- operationId: getSyslogTargetList ------------------------------------
+     def list_syslog_targets(self):
+@@ -46,17 +111,39 @@
+         Returns the list of SyslogTarget objects from the response's ``data``
+         array, in the order the appliance returned them.
+         """
+-        raise NotImplementedError
++        response = send(
++            "GET",
++            self._url("/settings/syslog"),
++            headers=self._auth_headers(),
++            timeout=self.timeout,
++        )
++        self._expect(response, 200)
++        payload = response.json() or {}
++        return list(payload.get("data") or [])
+ 
+     # -- operationId: addSyslogTarget ----------------------------------------
+     def add_syslog_target(self, target):
+         """POST /api/ni/settings/syslog for a SyslogTargetSpec."""
+-        raise NotImplementedError
++        response = send(
++            "POST",
++            self._url("/settings/syslog"),
++            headers=self._auth_headers(),
++            json_body=_target_body(target),
++            timeout=self.timeout,
++        )
++        self._expect(response, 201)
+ 
+     # -- operationId: updateSyslogTarget -------------------------------------
+     def update_syslog_target(self, target):
+         """PUT /api/ni/settings/syslog/{ip-or-fqdn} for a SyslogTargetSpec."""
+-        raise NotImplementedError
++        response = send(
++            "PUT",
++            self._url("/settings/syslog/" + quote(target.ip_or_fqdn, safe="")),
++            headers=self._auth_headers(),
++            json_body=_target_body(target),
++            timeout=self.timeout,
++        )
++        self._expect(response, 200)
+ 
+     # -- operationId: sendSyslogTestMessage ----------------------------------
+     def send_syslog_test_message(self, target):
+@@ -64,4 +151,12 @@
+ 
+         Returns the decoded StatusResponse body.
+         """
+-        raise NotImplementedError
++        response = send(
++            "POST",
++            self._url("/settings/syslog/send-test-log"),
++            headers=self._auth_headers(),
++            json_body=_target_body(target),
++            timeout=self.timeout,
++        )
++        self._expect(response, 200)
++        return response.json() or {}
+--- a/src/vcfon_syslog/rollout.py
++++ b/src/vcfon_syslog/rollout.py
+@@ -6,6 +6,7 @@
+ from __future__ import annotations
+ 
+ from .client import SyslogSettingsClient
++from .errors import VcfOnApiError
+ 
+ 
+ def apply_syslog_plan(plan, base_url, timeout=10.0):
+@@ -13,4 +14,63 @@
+ 
+     See README.md for the required run order and the exact report shape.
+     """
+-    raise NotImplementedError
++    client = SyslogSettingsClient(base_url, timeout=timeout)
++    entries = []
++    applied = []
++    failed_index = None
++    existing_names = []
++    token_released = False
++
++    client.create_auth_token(plan.credentials)
++    try:
++        existing_names = [
++            target.get("ip_or_fqdn") for target in client.list_syslog_targets()
++        ]
++        # Decided once, before anything is written, so a skipped target still
++        # reports the action it would have taken.
++        known = set(existing_names)
++        actions = ["update" if t.ip_or_fqdn in known else "add" for t in plan.targets]
++
++        for index, target in enumerate(plan.targets):
++            action = actions[index]
++            entry = {"ip_or_fqdn": target.ip_or_fqdn, "action": action}
++            if failed_index is not None:
++                entry["status"] = "skipped"
++                entries.append(entry)
++                continue
++            try:
++                if action == "add":
++                    client.add_syslog_target(target)
++                else:
++                    client.update_syslog_target(target)
++            except VcfOnApiError as error:
++                failed_index = index
++                entry["status"] = "failed"
++                entry["http_status"] = error.http_status
++                entry["error"] = {"code": error.code, "message": error.message}
++                entries.append(entry)
++                continue
++            entry["status"] = "applied"
++            entry["verified"] = False
++            entries.append(entry)
++            applied.append((index, target))
++
++        # What actually landed gets probed, including after a partial failure.
++        for index, target in applied:
++            status_response = client.send_syslog_test_message(target)
++            entries[index]["verified"] = bool(status_response.get("status", False))
++    finally:
++        try:
++            client.delete_auth_token()
++            token_released = True
++        except (VcfOnApiError, OSError):
++            token_released = False
++
++    return {
++        "outcome": "partial_failure" if failed_index is not None else "applied",
++        "existing_targets": existing_names,
++        "targets": entries,
++        "applied_count": len(applied),
++        "failed_index": failed_index,
++        "token_released": token_released,
++    }

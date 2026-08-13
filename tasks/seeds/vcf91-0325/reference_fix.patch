@@ -1,0 +1,189 @@
+--- a/vcfautomation/client.go
++++ b/vcfautomation/client.go
+@@ -2,10 +2,20 @@
+ 
+ import (
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
++	"sort"
++	"strconv"
++	"strings"
+ )
+ 
++// deploymentsPath is the Get Deployments path recorded in docs/contract.json.
++const deploymentsPath = "/deployment/api/deployments"
++
+ // Deployment is the focused Get Deployments representation used by this
+ // package. Pointer fields are optional in the response.
+ type Deployment struct {
+@@ -54,15 +64,159 @@
+ func (e *ProtocolError) Error() string { return "VCF Automation protocol error: " + e.Reason }
+ 
+ // Client calls the VCF Automation API.
+-type Client struct{}
++type Client struct {
++	baseURL     *url.URL
++	accessToken string
++	httpClient  *http.Client
++}
+ 
+-// NewClient constructs a client. It is intentionally incomplete.
++// NewClient constructs a client for the VCF Automation appliance at baseURL,
++// authenticating with the bearerAuth access token. A nil httpClient selects
++// http.DefaultClient.
+ func NewClient(baseURL, accessToken string, httpClient *http.Client) (*Client, error) {
+-	return nil, errors.New("TODO: implement NewClient")
++	if strings.TrimSpace(baseURL) == "" {
++		return nil, errors.New("vcfautomation: baseURL is required")
++	}
++	if strings.TrimSpace(accessToken) == "" {
++		return nil, errors.New("vcfautomation: accessToken is required")
++	}
++	parsed, err := url.Parse(baseURL)
++	if err != nil {
++		return nil, fmt.Errorf("vcfautomation: baseURL is not a URL: %w", err)
++	}
++	if parsed.Scheme != "http" && parsed.Scheme != "https" {
++		return nil, fmt.Errorf("vcfautomation: baseURL scheme %q must be http or https", parsed.Scheme)
++	}
++	if parsed.Hostname() == "" {
++		return nil, errors.New("vcfautomation: baseURL has no host")
++	}
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++	return &Client{baseURL: parsed, accessToken: accessToken, httpClient: httpClient}, nil
++}
++
++// pageDeployment is the subset of the PageDeployment envelope this package
++// reads.
++type pageDeployment struct {
++	Content          []Deployment `json:"content"`
++	Last             bool         `json:"last"`
++	Number           int          `json:"number"`
++	NumberOfElements int          `json:"numberOfElements"`
++	TotalElements    int          `json:"totalElements"`
++	TotalPages       int          `json:"totalPages"`
++	Size             int          `json:"size"`
+ }
+ 
+-// ListAllDeployments retrieves the complete deployment collection and returns
+-// it in a deterministic order. It is intentionally incomplete.
++// ListAllDeployments walks Get Deployments from page zero until the page
++// flagged last, collapses ids that repeat across pages, and returns the
++// collection ordered by createdAt descending with ties broken by id ascending.
+ func (c *Client) ListAllDeployments(ctx context.Context, options ListDeploymentsOptions) ([]Deployment, error) {
+-	return nil, errors.New("TODO: implement ListAllDeployments")
++	if options.PageSize < 1 {
++		return nil, fmt.Errorf("vcfautomation: PageSize is %d, but the contract records a minimum of 1 for size", options.PageSize)
++	}
++
++	var collected []Deployment
++	seen := make(map[string]struct{})
++
++	for page := 0; ; page++ {
++		envelope, err := c.getDeploymentsPage(ctx, page, options)
++		if err != nil {
++			return nil, err
++		}
++		if envelope.Number != page {
++			return nil, &ProtocolError{Reason: fmt.Sprintf("requested page %d but the response reports number %d", page, envelope.Number)}
++		}
++		if envelope.NumberOfElements != len(envelope.Content) {
++			return nil, &ProtocolError{Reason: fmt.Sprintf("page %d reports numberOfElements %d but carries %d entries", page, envelope.NumberOfElements, len(envelope.Content))}
++		}
++		if !envelope.Last && envelope.Number+1 >= envelope.TotalPages {
++			return nil, &ProtocolError{Reason: fmt.Sprintf("page %d is not flagged last but totalPages is %d", page, envelope.TotalPages)}
++		}
++		for _, deployment := range envelope.Content {
++			if _, duplicate := seen[deployment.ID]; duplicate {
++				continue
++			}
++			seen[deployment.ID] = struct{}{}
++			collected = append(collected, deployment)
++		}
++		if envelope.Last {
++			break
++		}
++	}
++
++	sort.SliceStable(collected, func(i, j int) bool {
++		if collected[i].CreatedAt != collected[j].CreatedAt {
++			return collected[i].CreatedAt > collected[j].CreatedAt
++		}
++		return collected[i].ID < collected[j].ID
++	})
++	return collected, nil
++}
++
++func (c *Client) getDeploymentsPage(ctx context.Context, page int, options ListDeploymentsOptions) (*pageDeployment, error) {
++	endpoint := *c.baseURL
++	endpoint.Path = strings.TrimSuffix(endpoint.Path, "/") + deploymentsPath
++	endpoint.RawQuery = buildQuery(page, options).Encode()
++
++	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
++	if err != nil {
++		return nil, fmt.Errorf("vcfautomation: build Get Deployments request: %w", err)
++	}
++	request.Header.Set("Accept", "application/json")
++	request.Header.Set("Authorization", "Bearer "+c.accessToken)
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return nil, fmt.Errorf("vcfautomation: Get Deployments page %d: %w", page, err)
++	}
++	defer response.Body.Close()
++
++	body, err := io.ReadAll(response.Body)
++	if err != nil {
++		return nil, fmt.Errorf("vcfautomation: read Get Deployments page %d: %w", page, err)
++	}
++	if response.StatusCode != http.StatusOK {
++		return nil, &APIError{StatusCode: response.StatusCode, Body: string(body)}
++	}
++
++	var envelope pageDeployment
++	if err := json.Unmarshal(body, &envelope); err != nil {
++		return nil, &ProtocolError{Reason: fmt.Sprintf("page %d body is not a PageDeployment document: %v", page, err)}
++	}
++	return &envelope, nil
++}
++
++// buildQuery renders the wire query for one page. Every optional parameter the
++// caller left unset is absent from the result rather than present and empty.
++func buildQuery(page int, options ListDeploymentsOptions) url.Values {
++	query := url.Values{}
++	query.Set("page", strconv.Itoa(page))
++	query.Set("size", strconv.Itoa(options.PageSize))
++
++	setText := func(name string, value *string) {
++		if value == nil || *value == "" {
++			return
++		}
++		query.Set(name, *value)
++	}
++	setList := func(name string, values []string) {
++		joined := strings.Join(values, ",")
++		if joined == "" {
++			return
++		}
++		query.Set(name, joined)
++	}
++
++	setText("sort", options.Sort)
++	setText("search", options.Search)
++	setText("name", options.Name)
++	setList("status", options.Status)
++	setList("projects", options.Projects)
++	setList("resourceTypes", options.ResourceTypes)
++	setList("ownedBy", options.OwnedBy)
++	if options.Deleted != nil {
++		query.Set("deleted", strconv.FormatBool(*options.Deleted))
++	}
++	return query
+ }

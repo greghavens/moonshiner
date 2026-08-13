@@ -1,0 +1,271 @@
+diff --git a/VcfCredentialRotation.psm1 b/VcfCredentialRotation.psm1
+index f8cda5e..3545bb0 100644
+--- a/VcfCredentialRotation.psm1
++++ b/VcfCredentialRotation.psm1
+@@ -3,11 +3,167 @@
+     VcfCredentialRotation - rotate SDDC Manager managed credentials on
+     VMware Cloud Foundation 9.0.
+ 
+-    Nothing here is implemented yet. The exported surface below is the shape
+-    the acceptance harness drives; fill it in against docs/contract.json.
++    Every request body is built with the genuine VMware.Sdk.Vcf.SddcManager
++    model initializers, so optional members the caller never set are absent from
++    the wire rather than sent null or empty. The module owns the token
++    lifecycle: when SDDC Manager rejects a call with 401 because the access
++    token expired mid-run, the refresh token mints a new access token and the
++    rejected request is replayed. A rejected request never reached the
++    inventory, so replaying it neither loses nor duplicates work.
+ #>
+ Set-StrictMode -Version Latest
+ 
++Import-Module VMware.Sdk.Vcf.SddcManager -ErrorAction Stop -WarningAction SilentlyContinue
++
++$script:TerminalTaskStates = @('SUCCESSFUL', 'FAILED', 'USER_CANCELLED',
++                               'INCONSISTENT')
++
++function Test-VcfMember {
++    param($InputObject, [string]$Name)
++    if ($null -eq $InputObject) { return $false }
++    return [bool]($InputObject.PSObject.Properties.Name -contains $Name)
++}
++
++function New-VcfQueryString {
++    <# Render only the parameters that were actually set. #>
++    param([System.Collections.IDictionary]$Query)
++    if ($null -eq $Query -or $Query.Count -eq 0) { return '' }
++    $pairs = foreach ($name in $Query.Keys) {
++        $value = $Query[$name]
++        if ($null -eq $value -or [string]::IsNullOrWhiteSpace([string]$value)) { continue }
++        '{0}={1}' -f [uri]::EscapeDataString([string]$name),
++                     [uri]::EscapeDataString([string]$value)
++    }
++    $rendered = @($pairs) -join '&'
++    if ($rendered) { return '?' + $rendered }
++    return ''
++}
++
++function Update-VcfAccessToken {
++    <# Exchange the refresh token id for a fresh access token (PATCH, bare string body). #>
++    param([Parameter(Mandatory)][hashtable]$Session)
++
++    $body = ConvertTo-Json -InputObject $Session.RefreshTokenId
++    $response = Invoke-WebRequest `
++        -Uri ($Session.BaseUri + '/v1/tokens/access-token/refresh') `
++        -Method 'PATCH' -Headers @{ 'Accept' = 'application/json' } `
++        -Body $body -ContentType 'application/json' -SkipHttpErrorCheck
++    if ([int]$response.StatusCode -ne 200) {
++        throw "Refreshing the SDDC Manager access token failed with HTTP $([int]$response.StatusCode)."
++    }
++    $Session.AccessToken = [string]($response.Content | ConvertFrom-Json)
++    $Session.TokenRefreshed = $true
++}
++
++function Invoke-VcfSddcRequest {
++    <#
++        Issue one SDDC Manager request. A single 401 triggers a token refresh
++        and an identical replay of the same request.
++    #>
++    param(
++        [Parameter(Mandatory)][hashtable]$Session,
++        [Parameter(Mandatory)][string]$Method,
++        [Parameter(Mandatory)][string]$Path,
++        [System.Collections.IDictionary]$Query,
++        [string]$Body,
++        [switch]$Anonymous
++    )
++
++    $uri = $Session.BaseUri + $Path + (New-VcfQueryString -Query $Query)
++    for ($attempt = 0; $attempt -lt 2; $attempt++) {
++        $headers = @{ 'Accept' = 'application/json' }
++        if (-not $Anonymous) {
++            $headers['Authorization'] = 'Bearer ' + $Session.AccessToken
++        }
++        $arguments = @{
++            Uri                = $uri
++            Method             = $Method
++            Headers            = $headers
++            SkipHttpErrorCheck = $true
++        }
++        if ($PSBoundParameters.ContainsKey('Body') -and -not [string]::IsNullOrEmpty($Body)) {
++            $arguments['Body'] = $Body
++            $arguments['ContentType'] = 'application/json'
++        }
++
++        $response = Invoke-WebRequest @arguments
++        $status = [int]$response.StatusCode
++
++        if ($status -eq 401 -and -not $Anonymous -and $attempt -eq 0) {
++            Update-VcfAccessToken -Session $Session
++            continue
++        }
++        if ($status -ge 400) {
++            throw "SDDC Manager returned HTTP $status for $Method $Path."
++        }
++        if ([string]::IsNullOrWhiteSpace([string]$response.Content)) { return $null }
++        return ($response.Content | ConvertFrom-Json)
++    }
++}
++
++function Get-VcfCredentialPage {
++    <# Page through every credential of one resource type. #>
++    param(
++        [Parameter(Mandatory)][hashtable]$Session,
++        [Parameter(Mandatory)][string]$ResourceType,
++        [Parameter(Mandatory)][int]$PageSize
++    )
++
++    $collected = [System.Collections.Generic.List[object]]::new()
++    $pageNumber = 0
++    while ($true) {
++        $query = [ordered]@{
++            resourceType = $ResourceType
++            pageNumber   = [string]$pageNumber
++            pageSize     = [string]$PageSize
++        }
++        $page = Invoke-VcfSddcRequest -Session $Session -Method 'GET' `
++            -Path '/v1/credentials' -Query $query
++
++        if ((Test-VcfMember $page 'elements') -and $null -ne $page.elements) {
++            foreach ($element in @($page.elements)) { $collected.Add($element) | Out-Null }
++        }
++
++        $totalPages = 1
++        if ((Test-VcfMember $page 'pageMetadata') -and $null -ne $page.pageMetadata -and
++            (Test-VcfMember $page.pageMetadata 'totalPages')) {
++            $totalPages = [int]$page.pageMetadata.totalPages
++        }
++        $pageNumber++
++        if ($pageNumber -ge $totalPages) { break }
++    }
++    return $collected
++}
++
++function Wait-VcfCredentialsTask {
++    param(
++        [Parameter(Mandatory)][hashtable]$Session,
++        [Parameter(Mandatory)][string]$TaskId,
++        [Parameter(Mandatory)][int]$MaxPolls,
++        [scriptblock]$SleepAction
++    )
++
++    for ($poll = 1; $poll -le $MaxPolls; $poll++) {
++        $task = Invoke-VcfSddcRequest -Session $Session -Method 'GET' `
++            -Path ('/v1/credentials/tasks/' + [uri]::EscapeDataString($TaskId))
++
++        $status = ''
++        if (Test-VcfMember $task 'status') {
++            $status = ([string]$task.status).Trim().ToUpperInvariant() -replace ' ', '_'
++        }
++        if ($script:TerminalTaskStates -contains $status) {
++            if ($status -ne 'SUCCESSFUL') {
++                throw "Credential rotation task '$TaskId' finished with status $status."
++            }
++            return $status
++        }
++        if ($poll -lt $MaxPolls) {
++            if ($null -ne $SleepAction) { & $SleepAction 5 } else { Start-Sleep -Seconds 5 }
++        }
++    }
++    throw "Credential rotation task '$TaskId' did not reach a terminal state within $MaxPolls polls."
++}
++
+ function Invoke-VcfCredentialRotation {
+     [CmdletBinding()]
+     param(
+@@ -33,8 +189,94 @@ function Invoke-VcfCredentialRotation {
+         [scriptblock]$SleepAction
+     )
+ 
+-    throw [System.NotImplementedException]::new(
+-        'Invoke-VcfCredentialRotation has not been implemented yet.')
++    $session = @{
++        BaseUri        = $Server.TrimEnd('/')
++        AccessToken    = $null
++        RefreshTokenId = $null
++        TokenRefreshed = $false
++    }
++
++    # 1. Mint the token pair. apiKey and idToken stay unset, so the initializer
++    #    leaves them off the wire entirely.
++    $tokenSpec = Initialize-VcfTokenCreationSpec `
++        -Username $Credential.UserName `
++        -Password $Credential.GetNetworkCredential().Password
++    $tokenPair = Invoke-VcfSddcRequest -Session $session -Method 'POST' `
++        -Path '/v1/tokens' -Body $tokenSpec.ToJson() -Anonymous
++
++    if (-not (Test-VcfMember $tokenPair 'accessToken') -or
++        [string]::IsNullOrWhiteSpace([string]$tokenPair.accessToken)) {
++        throw 'SDDC Manager did not return an access token.'
++    }
++    $session.AccessToken = [string]$tokenPair.accessToken
++    if ((Test-VcfMember $tokenPair 'refreshToken') -and $null -ne $tokenPair.refreshToken -and
++        (Test-VcfMember $tokenPair.refreshToken 'id')) {
++        $session.RefreshTokenId = [string]$tokenPair.refreshToken.id
++    }
++    if ([string]::IsNullOrWhiteSpace($session.RefreshTokenId)) {
++        throw 'SDDC Manager did not return a refresh token id.'
++    }
++
++    # 2. Collect every in-scope credential, then keep only the requested type.
++    $credentials = Get-VcfCredentialPage -Session $session `
++        -ResourceType $ResourceType -PageSize $PageSize
++
++    $targets = [ordered]@{}
++    foreach ($entry in $credentials) {
++        if (-not (Test-VcfMember $entry 'credentialType') -or
++            $entry.credentialType -ne $CredentialType) { continue }
++        if (-not (Test-VcfMember $entry 'resource') -or $null -eq $entry.resource) { continue }
++        $resourceId = [string]$entry.resource.resourceId
++        if ([string]::IsNullOrWhiteSpace($resourceId)) { continue }
++        if (-not $targets.Contains($resourceId)) {
++            $targets[$resourceId] = [ordered]@{
++                ResourceType = [string]$entry.resource.resourceType
++                Usernames    = [System.Collections.Generic.List[string]]::new()
++            }
++        }
++        $targets[$resourceId].Usernames.Add([string]$entry.username) | Out-Null
++    }
++
++    # 3. Rotate each host exactly once and watch its task to completion. A
++    #    token expiry part way through is absorbed by Invoke-VcfSddcRequest.
++    $rotatedResourceIds = [System.Collections.Generic.List[string]]::new()
++    $taskIds = [System.Collections.Generic.List[string]]::new()
++
++    foreach ($resourceId in @($targets.Keys)) {
++        $target = $targets[$resourceId]
++
++        $baseCredentials = foreach ($username in $target.Usernames) {
++            # password stays unset: ROTATE asks SDDC Manager to generate it.
++            Initialize-VcfBaseCredential -Username $username -CredentialType $CredentialType
++        }
++        $element = Initialize-VcfResourceCredentials `
++            -ResourceType $target.ResourceType `
++            -ResourceId $resourceId `
++            -Credentials @($baseCredentials)
++        # autoRotatePolicy stays unset and is therefore absent from the body.
++        $updateSpec = Initialize-VcfCredentialsUpdateSpec `
++            -OperationType 'ROTATE' -Elements @($element)
++
++        $task = Invoke-VcfSddcRequest -Session $session -Method 'PATCH' `
++            -Path '/v1/credentials' -Body $updateSpec.ToJson()
++
++        if (-not (Test-VcfMember $task 'id') -or [string]::IsNullOrWhiteSpace([string]$task.id)) {
++            throw "SDDC Manager accepted the rotation for '$resourceId' without returning a task id."
++        }
++        $taskId = [string]$task.id
++
++        Wait-VcfCredentialsTask -Session $session -TaskId $taskId `
++            -MaxPolls $MaxPolls -SleepAction $SleepAction | Out-Null
++
++        $rotatedResourceIds.Add($resourceId) | Out-Null
++        $taskIds.Add($taskId) | Out-Null
++    }
++
++    return [pscustomobject][ordered]@{
++        ResourceIds    = @($rotatedResourceIds)
++        TaskIds        = @($taskIds)
++        TokenRefreshed = [bool]$session.TokenRefreshed
++    }
+ }
+ 
+ Export-ModuleMember -Function 'Invoke-VcfCredentialRotation'
