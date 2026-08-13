@@ -11,7 +11,6 @@ surfaced as ``safeguard_refusal`` for the caller to defer. Multi-turn seeds use
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
 import time
@@ -20,7 +19,8 @@ from pathlib import Path
 from common import scrub_text
 from runtimes import availability
 from runtimes.base import (ReviewResult, Runtime, TraceResult,
-                           run_with_inactivity_timeout)
+                           run_with_inactivity_timeout,
+                           workspace_only_command)
 
 REFUSAL_MARKERS = ("model_refusal_no_fallback", "model_refusal")
 READ_ONLY_DISALLOW = "Edit Write NotebookEdit Bash MultiEdit"
@@ -68,6 +68,10 @@ class ClaudeCodeRuntime(Runtime):
         stdin_text, streaming = self._teacher_input(prompt, interaction)
         if streaming:
             cmd += ["--input-format", "stream-json", "--replay-user-messages"]
+        environment = self.teacher_environment(workspace)
+        cmd = workspace_only_command(
+            cmd, workspace,
+            read_only_binds=self._auth_bindings(environment))
 
         events_path = out_dir / f"{seed['id']}.jsonl"
         stderr_path = out_dir / f"{seed['id']}.stderr"
@@ -80,7 +84,7 @@ class ClaudeCodeRuntime(Runtime):
                                   cmd, cwd=workspace, input=stdin_text,
                                   capture_output=True, text=True,
                                   inactivity_timeout=timeout,
-                                  env=self.teacher_environment(workspace))
+                                  env=environment)
             return_code, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
         except subprocess.TimeoutExpired as exc:
             timed_out, return_code = True, None
@@ -126,6 +130,15 @@ class ClaudeCodeRuntime(Runtime):
             }))
         return "\n".join(lines) + "\n", True
 
+    @staticmethod
+    def _auth_bindings(environment: dict[str, str]
+                       ) -> tuple[tuple[Path, Path], ...]:
+        source = Path.home() / ".claude" / ".credentials.json"
+        if not source.is_file():
+            return ()
+        destination = Path(environment["CLAUDE_CONFIG_DIR"]) / ".credentials.json"
+        return ((source, destination),)
+
     def _result_meta(self, stdout: str, stderr: str) -> dict:
         observed_model = None
         session_id = None
@@ -169,16 +182,17 @@ class ClaudeCodeRuntime(Runtime):
         if schema is not None:
             prompt += ("\n\nReturn ONLY a single JSON object matching this schema, "
                        "with no prose:\n" + json.dumps(schema))
+        environment = self.teacher_environment(workspace)
+        cmd = workspace_only_command(
+            cmd, workspace,
+            read_only_binds=self._auth_bindings(environment))
         started = time.monotonic()
         timed_out = False
         try:
             proc = run_with_inactivity_timeout(cmd, cwd=workspace, input=prompt,
                                   capture_output=True, text=True,
                                   inactivity_timeout=int(self.role.get("timeout_s", 1800)),
-                                  env={k: os.environ[k]
-                                       for k in ("PATH", "HOME", "LANG",
-                                                 "LC_ALL", "TERM")
-                                       if k in os.environ})
+                                  env=environment)
             return_code, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
         except subprocess.TimeoutExpired as exc:
             timed_out, return_code = True, None

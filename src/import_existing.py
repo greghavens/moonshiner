@@ -182,7 +182,10 @@ def main(argv=None) -> int:
             from huggingface_hub import snapshot_download
         except ImportError as exc:
             raise SystemExit("HF import requires: pip install 'moonshiner[huggingface]'") from exc
-        with tempfile.TemporaryDirectory(prefix="moonshiner-hf-import-") as temporary:
+        temporary_root = STORAGE_ROOT / ".staging"
+        temporary_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+                prefix="moonshiner-hf-import-", dir=temporary_root) as temporary:
             local = snapshot_download(repo_id=args.hf, repo_type="dataset",
                                       revision=args.revision, local_dir=temporary)
             identity = f"hf:{args.hf}@{args.revision or 'latest'}"

@@ -20,8 +20,8 @@ FORMULAS = {
     "javac": "openjdk",
     "pwsh": "powershell",
 }
-POWERSHELL_RUNTIME_MOUNT = "/tmp/moonshiner-powershell"
-POWERSHELL_MODULES_MOUNT = "/tmp/moonshiner-powershell-modules"
+POWERSHELL_RUNTIME_MOUNT = "/srv/.sandbox-home/toolchains/powershell"
+POWERSHELL_MODULES_MOUNT = "/srv/.sandbox-home/toolchains/powershell-modules"
 MISSING_EXECUTABLES = (
     re.compile(r"(?:bwrap:\s*)?execvp\s+([^:\s]+):\s+No such file or directory",
                re.IGNORECASE),

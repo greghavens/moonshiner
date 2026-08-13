@@ -212,7 +212,10 @@ def _versions() -> list[str]:
 def _install(version: str, source: str | None, checksum: str | None) -> None:
     source = source or ("https://github.com/greghavens/moonshiner/releases/download/"
                         f"seeds-{version}/moonshiner-seeds-{version}.tar.gz")
-    with tempfile.TemporaryDirectory(prefix="moonshiner-seeds-") as temp_name:
+    temporary_root = CORPORA / ".staging"
+    temporary_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+            prefix="moonshiner-seeds-", dir=temporary_root) as temp_name:
         temp = Path(temp_name)
         archive = temp / source.rsplit("/", 1)[-1]
         _download(source, archive) if source.startswith(("https://", "http://")) else \

@@ -10,7 +10,6 @@ when no rollout is found. The judge runs the same CLI read-only with an
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
 import time
@@ -19,9 +18,8 @@ from pathlib import Path
 from common import SECRET_RE, scrub_text
 from runtimes import availability
 from runtimes.base import (ReviewResult, Runtime, TraceResult,
-                           run_with_inactivity_timeout)
-
-CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
+                           run_with_inactivity_timeout,
+                           workspace_only_command)
 
 
 class CodexRuntime(Runtime):
@@ -81,6 +79,10 @@ class CodexRuntime(Runtime):
             # --model has no value.
             cmd += ["-c", 'web_search="live"']
         cmd += ["-C", str(workspace), "-"]
+        environment = self.teacher_environment(workspace)
+        cmd = workspace_only_command(
+            cmd, workspace,
+            read_only_binds=self._auth_bindings(environment))
 
         full_prompt = f"{system_prompt}\n\n{prompt}"
         events_path = out_dir / f"{seed['id']}.events.jsonl"
@@ -93,7 +95,7 @@ class CodexRuntime(Runtime):
             proc = run_with_inactivity_timeout(
                 cmd, cwd=workspace, input=full_prompt, capture_output=True,
                 text=True, inactivity_timeout=timeout,
-                env=self.teacher_environment(workspace))
+                env=environment)
             return_code = proc.returncode
             stdout, stderr = proc.stdout, proc.stderr
         except subprocess.TimeoutExpired as exc:
@@ -111,7 +113,8 @@ class CodexRuntime(Runtime):
 
         raw_path = out_dir / f"{seed['id']}.jsonl"
         trace_format = "codex-exec-events"
-        rollout = self._find_rollout(thread_id) if thread_id else None
+        sessions = Path(environment["CODEX_HOME"]) / "sessions"
+        rollout = self._find_rollout(thread_id, sessions) if thread_id else None
         if rollout is not None:
             shutil.copyfile(rollout, raw_path)
             trace_format = "codex-rollout"
@@ -167,15 +170,24 @@ class CodexRuntime(Runtime):
                     messages.append(item.get("text", ""))
         return thread_id, usage, error, messages
 
-    def _find_rollout(self, thread_id: str) -> Path | None:
-        if not CODEX_SESSIONS.is_dir():
+    def _find_rollout(self, thread_id: str, sessions: Path) -> Path | None:
+        if not sessions.is_dir():
             return None
-        matches = [p for p in CODEX_SESSIONS.rglob("rollout-*.jsonl")
+        matches = [p for p in sessions.rglob("rollout-*.jsonl")
                    if thread_id in p.name]
         if not matches:
-            matches = [p for p in CODEX_SESSIONS.rglob("*.jsonl")
+            matches = [p for p in sessions.rglob("*.jsonl")
                        if thread_id in p.read_text(errors="ignore")[:4000]]
         return max(matches, key=lambda p: p.stat().st_mtime) if matches else None
+
+    @staticmethod
+    def _auth_bindings(environment: dict[str, str]
+                       ) -> tuple[tuple[Path, Path], ...]:
+        source = Path.home() / ".codex" / "auth.json"
+        if not source.is_file():
+            return ()
+        destination = Path(environment["CODEX_HOME"]) / "auth.json"
+        return ((source, destination),)
 
     # -- judge -------------------------------------------------------------- #
     def run_review(self, instruction: str, workspace: Path, *, out_dir: Path,
@@ -184,11 +196,16 @@ class CodexRuntime(Runtime):
         workspace = self.require_persistent_workspace(workspace)
         schema_path = None
         if schema is not None:
-            schema_path = out_dir / "review.schema.json"
+            schema_path = workspace / ".sandbox-home" / "review.schema.json"
+            schema_path.parent.mkdir(parents=True, exist_ok=True)
             schema_path.write_text(json.dumps(schema))
         sandbox = "read-only" if read_only else "workspace-write"
         cmd = self._base_cmd(sandbox=sandbox, schema_path=schema_path)
         cmd += ["-C", str(workspace), "-"]
+        environment = self.teacher_environment(workspace)
+        cmd = workspace_only_command(
+            cmd, workspace,
+            read_only_binds=self._auth_bindings(environment))
 
         started = time.monotonic()
         timed_out = False
@@ -196,9 +213,7 @@ class CodexRuntime(Runtime):
             proc = run_with_inactivity_timeout(
                 cmd, cwd=workspace, input=instruction, capture_output=True,
                 text=True, inactivity_timeout=int(self.role.get("timeout_s", 1800)),
-                env={k: os.environ[k]
-                     for k in ("PATH", "HOME", "LANG", "LC_ALL", "TERM")
-                     if k in os.environ})
+                env=environment)
             return_code, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
         except subprocess.TimeoutExpired as exc:
             timed_out, return_code = True, None
@@ -216,7 +231,8 @@ class CodexRuntime(Runtime):
         verdict = _parse_json_object(last_message)
         thread_id, _, event_error, _ = self._scan_events(stdout)
         observed_models = _observed_models(stdout)
-        rollout = self._find_rollout(thread_id) if thread_id else None
+        sessions = Path(environment["CODEX_HOME"]) / "sessions"
+        rollout = self._find_rollout(thread_id, sessions) if thread_id else None
         if rollout:
             observed_models += [model for model in _observed_models(
                 rollout.read_text(errors="replace")) if model not in observed_models]

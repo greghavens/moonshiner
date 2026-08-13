@@ -11,11 +11,87 @@ from __future__ import annotations
 import abc
 import os
 import signal
+import shutil
 import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+
+def workspace_only_command(
+        command: list[str], workspace: Path, *,
+        read_only_binds: tuple[tuple[Path, Path], ...] = (),
+        unshare_network: bool = False) -> list[str]:
+    """Wrap a command so its only persistent writable storage is *workspace*.
+
+    The root filesystem remains visible but read-only.  Both conventional
+    temporary locations are aliases of one real directory below the workspace;
+    this preserves tools which insist on ``/tmp`` without allowing a byte to be
+    created in the host temporary filesystem.  Additional credential or
+    toolchain mounts are always read-only.
+    """
+    bwrap = shutil.which("bwrap")
+    if bwrap is None:
+        raise RuntimeError(
+            "bubblewrap is required to enforce workspace-only writes")
+    workspace = Path(workspace).resolve()
+    scratch = workspace / ".sandbox-home" / "tmp"
+    shared_memory = workspace / ".sandbox-home" / "shm"
+    masks = workspace / ".sandbox-home" / "masks"
+    empty_directory = masks / "empty-directory"
+    empty_file = masks / "empty-file"
+    scratch.mkdir(parents=True, exist_ok=True)
+    shared_memory.mkdir(parents=True, exist_ok=True)
+    empty_directory.mkdir(parents=True, exist_ok=True)
+    empty_file.parent.mkdir(parents=True, exist_ok=True)
+    empty_file.touch(exist_ok=True)
+    argv = [
+        bwrap, "--die-with-parent", "--unshare-pid", "--unshare-ipc",
+        "--unshare-uts", "--unshare-cgroup-try",
+    ]
+    if unshare_network:
+        argv.append("--unshare-net")
+    argv += [
+        "--ro-bind", "/", "/",
+        "--dev-bind", "/dev", "/dev",
+        "--proc", "/proc",
+        "--bind", str(workspace), str(workspace),
+        "--bind", str(scratch), "/tmp",
+        "--bind", str(scratch), "/var/tmp",
+        "--bind", str(shared_memory), "/dev/shm",
+    ]
+    for source, destination in read_only_binds:
+        source = Path(source).resolve()
+        destination = Path(destination).resolve()
+        if not source.exists():
+            raise FileNotFoundError(source)
+        if not destination.is_relative_to(workspace):
+            raise RuntimeError(
+                f"read-only mount target is outside workspace: {destination}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            destination.mkdir(parents=True, exist_ok=True)
+        else:
+            destination.touch(exist_ok=True)
+        argv += ["--ro-bind", str(source), str(destination)]
+    from configuration import PROJECT_ROOT
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    private_paths = (
+        Path.home() / ".codex", Path.home() / ".claude",
+        Path.home() / ".ssh", Path.home() / ".gnupg",
+        Path.home() / ".aws", Path.home() / ".config" / "gh",
+        Path.home() / ".config" / "moonshiner",
+        Path.home() / ".netrc", Path.home() / ".npmrc",
+        runtime, PROJECT_ROOT.resolve(),
+    )
+    for target in dict.fromkeys(path for path in private_paths if path.exists()):
+        resolved = target.resolve()
+        if resolved == workspace or resolved in workspace.parents:
+            continue
+        source = empty_directory if target.is_dir() else empty_file
+        argv += ["--ro-bind", str(source), str(target)]
+    return argv + ["--chdir", str(workspace), "--", *command]
 
 
 def _process_tree_snapshot(root_pid: int) -> tuple[tuple[int, ...], int, int]:
@@ -281,9 +357,13 @@ class Runtime(abc.ABC):
                 "XDG_CONFIG_HOME": ".config", "XDG_DATA_HOME": ".local/share",
                 "DOTNET_CLI_HOME": ".dotnet", "NUGET_PACKAGES": ".nuget/packages",
                 "GOCACHE": ".cache/go-build", "GOMODCACHE": "go/pkg/mod",
-                "GOPATH": "go"}.items()})
-        environment["CODEX_HOME"] = str(Path.home() / ".codex")
-        environment["CLAUDE_CONFIG_DIR"] = str(Path.home() / ".claude")
+                "GOPATH": "go", "TMPDIR": "tmp", "TMP": "tmp",
+                "TEMP": "tmp", "CODEX_HOME": "codex",
+                "CLAUDE_CONFIG_DIR": "claude"}.items()})
+        for value in environment.values():
+            path = Path(value)
+            if path.is_relative_to(home):
+                path.mkdir(parents=True, exist_ok=True)
         return environment
 
     # -- lifecycle ---------------------------------------------------------- #

@@ -52,8 +52,9 @@ class WorkspaceLocation(unittest.TestCase):
             (root / "AGENTS.md").write_text("instructions for the coding agent\n")
             workspace = root / "workspaces" / "candidate"
             workspace.mkdir(parents=True)
-            with self.assertRaisesRegex(RuntimeError, "contains AGENTS.md"):
-                CodexRuntime.require_persistent_workspace(workspace)
+            with mock.patch.object(configuration, "PROJECT_ROOT", root / "project"):
+                with self.assertRaisesRegex(RuntimeError, "contains AGENTS.md"):
+                    CodexRuntime.require_persistent_workspace(workspace)
 
     def test_repository_descendant_blocks_launch_even_without_scanning_rules(self):
         workspace = configuration.PROJECT_ROOT / ".moonshiner" / "workspaces" / "x"
@@ -123,8 +124,9 @@ class EveryModelEntryPointUsesTheBoundary(unittest.TestCase):
                                return_value="/usr/bin/bwrap"):
             command = security_runtime._outer_sandbox(
                 inner, host_workspace, host_codex_home)
-        hidden = [command[index + 1] for index, value in enumerate(command)
-                  if value == "--tmpfs"]
+        hidden = [command[index + 2] for index, value in enumerate(command)
+                  if value == "--ro-bind"
+                  and pathlib.Path(command[index + 1]).name == "hidden"]
         self.assertTrue(any(pathlib.Path(path) == project
                             or pathlib.Path(path) in project.parents
                             for path in hidden))

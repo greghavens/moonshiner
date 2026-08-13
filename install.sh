@@ -24,7 +24,9 @@ if [ "$version" = latest ]; then
   esac
 fi
 base="https://github.com/$repo/releases/download/v$version"
-tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+staging_root="$PWD/.moonshiner/install-tmp"
+mkdir -p "$staging_root"
+tmp="$(mktemp -d "$staging_root/install.XXXXXX")"; trap 'rm -rf "$tmp"' EXIT
 wheel="moonshiner-$version-py3-none-any.whl"
 curl -fsSL "$base/$wheel" -o "$tmp/$wheel"
 curl -fsSL "$base/SHA256SUMS" -o "$tmp/SHA256SUMS"

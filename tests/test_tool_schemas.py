@@ -51,12 +51,10 @@ class SharedTeacherEnvironment(unittest.TestCase):
                                 "GOPATH"):
                         self.assertTrue(
                             pathlib.Path(environment[key]).is_relative_to(root))
-                    self.assertEqual(
-                        pathlib.Path(environment["CODEX_HOME"]),
-                        pathlib.Path.home() / ".codex")
-                    self.assertEqual(
-                        pathlib.Path(environment["CLAUDE_CONFIG_DIR"]),
-                        pathlib.Path.home() / ".claude")
+                    self.assertTrue(pathlib.Path(
+                        environment["CODEX_HOME"]).is_relative_to(root))
+                    self.assertTrue(pathlib.Path(
+                        environment["CLAUDE_CONFIG_DIR"]).is_relative_to(root))
 
 
 if __name__ == "__main__":

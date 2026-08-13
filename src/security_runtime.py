@@ -24,7 +24,7 @@ import threading
 import time
 from pathlib import Path
 
-from common import RUNS, jsonl_lines
+from common import jsonl_lines
 from runtimes.base import wait_with_inactivity_timeout
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -73,9 +73,9 @@ def _outer_sandbox(inner: list[str], cwd: Path, codex_home: Path) -> list[str]:
     bwrap = shutil.which("bwrap")
     if not bwrap:
         raise RuntimeError("bubblewrap is required for security traces; refusing a host run")
-    # / is read-only for normal binaries/libraries. Private homes and the user runtime
-    # are replaced with empty tmpfs mounts. Only the disposable repo and ephemeral
-    # CODEX_HOME are writable/readable host binds.
+    # / is read-only for normal binaries/libraries. Private paths are replaced
+    # by one read-only, physically workspace-owned empty directory. Every
+    # writable compatibility mount is also backed by the retained workspace.
     from configuration import PROJECT_ROOT
     hidden_mounts = {str(Path.home()), str(Path.home().resolve()),
                      str(PROJECT_ROOT), str(PROJECT_ROOT.resolve())}
@@ -84,11 +84,23 @@ def _outer_sandbox(inner: list[str], cwd: Path, codex_home: Path) -> list[str]:
     user_runtime = Path(f"/run/user/{os.getuid()}")
     if user_runtime.exists():
         hidden_mounts.add(str(user_runtime))
+    mount_root = cwd / ".sandbox-home" / "security-runtime" / "mounts"
+    hidden = mount_root / "hidden"
+    temporary = mount_root / "tmp"
+    shared_memory = mount_root / "shm"
+    sandbox_workspace = mount_root / SANDBOX_WORKSPACE.name
+    sandbox_codex_home = mount_root / SANDBOX_CODEX_HOME.name
+    for directory in (hidden, temporary, shared_memory, sandbox_workspace,
+                      sandbox_codex_home):
+        directory.mkdir(parents=True, exist_ok=True)
     argv = [
         bwrap,
         "--die-with-parent",
         "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try",
         "--ro-bind", "/", "/",
+        "--bind", str(mount_root), "/mnt",
+        "--bind", str(cwd), str(SANDBOX_WORKSPACE),
+        "--bind", str(codex_home), str(SANDBOX_CODEX_HOME),
     ]
     for mount in sorted(hidden_mounts, key=lambda value: (value.count("/"), value)):
         # Once an ancestor is hidden, mounting a second tmpfs below it is both
@@ -97,16 +109,13 @@ def _outer_sandbox(inner: list[str], cwd: Path, codex_home: Path) -> list[str]:
         if any(Path(parent) != path and Path(parent) in path.parents
                for parent in hidden_mounts):
             continue
-        argv += ["--tmpfs", mount]
+        argv += ["--ro-bind", str(hidden), mount]
     argv += [
-        "--tmpfs", "/tmp",
-        "--tmpfs", "/mnt",
+        "--bind", str(temporary), "/tmp",
+        "--bind", str(temporary), "/var/tmp",
         "--dev-bind", "/dev", "/dev",
+        "--bind", str(shared_memory), "/dev/shm",
         "--proc", "/proc",
-        "--dir", str(SANDBOX_WORKSPACE),
-        "--dir", str(SANDBOX_CODEX_HOME),
-        "--bind", str(cwd), str(SANDBOX_WORKSPACE),
-        "--bind", str(codex_home), str(SANDBOX_CODEX_HOME),
         "--setenv", "HOME", str(SANDBOX_CODEX_HOME),
         "--setenv", "CODEX_HOME", str(SANDBOX_CODEX_HOME),
         "--setenv", "USER", "codex",
@@ -155,10 +164,7 @@ def run_codex(
     if rollout_path:
         rollout_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # This must live outside the hidden real home so it can be rebound into bwrap.
-    homes = Path(os.environ.get(
-        "MOONSHINER_SECURITY_RUNTIME_ROOT", str(RUNS / "security-runtime")
-    )) / "codex-homes"
+    homes = cwd / ".sandbox-home" / "security-runtime" / "codex-homes"
     homes.mkdir(parents=True, exist_ok=True)
     codex_home = Path(tempfile.mkdtemp(prefix="run-", dir=homes))
     auth_src = _real_codex_home() / "auth.json"

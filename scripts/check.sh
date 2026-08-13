@@ -7,6 +7,7 @@
 # Exits non-zero on the first failure so it can gate a commit or a pipeline run.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+repo_root="$PWD"
 
 echo "== byte-compile (src, moonshiner.py$( [ -d tests ] && echo ', tests')) =="
 python3 -m compileall -q src moonshiner.py $( [ -d tests ] && echo tests )
@@ -17,10 +18,15 @@ echo "== unit tests =="
 # pointed at real traces, ledgers and workspaces. Isolating it means no test can
 # reach them whatever it does.
 if [ -d tests ] && ls tests/test_*.py >/dev/null 2>&1; then
-  test_home=$(mktemp -d -t moonshiner-check-XXXXXX)
+  mkdir -p .moonshiner/test-tmp
+  test_home=$(mktemp -d "$PWD/.moonshiner/test-tmp/check.XXXXXX")
+  mkdir -p "$test_home/tmp" "$test_home/project"
   trap 'rm -rf "$test_home"' EXIT
-  MOONSHINER_HOME="$test_home" XDG_DATA_HOME="$test_home/model-data" \
-    python3 -m unittest discover -s tests -v
+  (cd "$test_home/project" && \
+    TMPDIR="$test_home/tmp" MOONSHINER_HOME="$test_home/state" \
+    XDG_DATA_HOME="$test_home/model-data" \
+    PYTHONPATH="$repo_root/src:$repo_root${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m unittest discover -s "$repo_root/tests" -v)
 else
   echo "(no tests yet)"
 fi

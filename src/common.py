@@ -511,6 +511,18 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int):
     from toolchains import (POWERSHELL_MODULES_MOUNT, POWERSHELL_RUNTIME_MOUNT,
                             effective_path, powershell_module_root,
                             powershell_runtime)
+    workspace = workspace.resolve()
+    sandbox_workspace = Path("/srv")
+    sandbox_home = sandbox_workspace / ".sandbox-home"
+    scratch = workspace / ".sandbox-home"
+    temporary = scratch / "tmp"
+    shared_memory = scratch / "shm"
+    hidden_home = scratch / "hidden-home"
+    toolchain_mounts = scratch / "toolchains"
+    for directory in (temporary, shared_memory, hidden_home,
+                      toolchain_mounts / "powershell",
+                      toolchain_mounts / "powershell-modules"):
+        directory.mkdir(parents=True, exist_ok=True)
     sandbox_path = effective_path()
     cmd = ["bwrap", "--die-with-parent", "--unshare-net", "--unshare-pid",
            "--ro-bind", "/", "/"]
@@ -525,7 +537,10 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int):
         # home tmpfs preserves access to the host sources without exposing home.
         cmd += ["--ro-bind", str(cargo_bin), "/mnt",
                 "--ro-bind", str(rustup_home), "/media"]
-    cmd += ["--tmpfs", str(Path.home()), "--tmpfs", "/tmp"]
+    cmd += ["--bind", str(workspace), str(sandbox_workspace),
+            "--ro-bind", str(hidden_home), str(Path.home()),
+            "--bind", str(temporary), "/tmp",
+            "--bind", str(temporary), "/var/tmp"]
     pwsh = powershell_runtime()
     if pwsh is not None:
         cmd += ["--ro-bind", str(pwsh.parent), POWERSHELL_RUNTIME_MOUNT]
@@ -534,10 +549,14 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int):
     if module_root.is_dir():
         cmd += ["--ro-bind", str(module_root), POWERSHELL_MODULES_MOUNT]
     cmd += ["--dev-bind", "/dev", "/dev",
-            "--proc", "/proc", "--bind", str(workspace), str(workspace),
+            "--bind", str(shared_memory), "/dev/shm",
+            "--proc", "/proc",
             "--clearenv", "--setenv", "PATH", sandbox_path,
-            "--setenv", "HOME", str(workspace / ".sandbox-home"),
-            "--chdir", str(workspace)]
+            "--setenv", "HOME", str(sandbox_home),
+            "--setenv", "TMPDIR", str(sandbox_home / "tmp"),
+            "--setenv", "TMP", str(sandbox_home / "tmp"),
+            "--setenv", "TEMP", str(sandbox_home / "tmp"),
+            "--chdir", str(sandbox_workspace)]
     if module_root.is_dir():
         builtin_modules = POWERSHELL_RUNTIME_MOUNT + "/Modules"
         cmd += ["--setenv", "PSModulePath",
@@ -546,7 +565,7 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int):
         cmd += [
                 "--setenv", "PATH", "/mnt:" + sandbox_path,
                 "--setenv", "RUSTUP_HOME", "/media",
-                "--setenv", "CARGO_HOME", str(workspace / ".sandbox-home" / ".cargo")]
+                "--setenv", "CARGO_HOME", str(sandbox_home / ".cargo")]
     cmd += ["--", *command]
     from runtimes.base import run_with_inactivity_timeout
     return run_with_inactivity_timeout(

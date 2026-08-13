@@ -19,11 +19,12 @@ import subprocess
 import time
 from pathlib import Path
 
-from common import ROOT, scrub_text
+from common import scrub_text
 from runtimes import availability
 from runtimes.auth import load_provider_key
 from runtimes.base import (ReviewResult, Runtime, TraceResult,
-                           run_with_inactivity_timeout)
+                           run_with_inactivity_timeout,
+                           workspace_only_command)
 from runtimes.credential_proxy import DUMMY_TOKEN, ProxySession
 
 DEFAULT_TIMEOUT_SECONDS = 300
@@ -48,16 +49,6 @@ def run_streamed(command: list[str], *, workspace: Path, turn: str,
                               activity_probe=lambda: (
                                   stdout_path.stat().st_size,
                                   stderr_path.stat().st_size))
-
-def _hidden_mounts() -> list[str]:
-    hidden = [str(Path.home())]
-    if Path("/root").exists():
-        hidden.append("/root")
-    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
-    if Path(runtime).exists():
-        hidden.append(runtime)
-    return hidden
-
 
 class PiRuntime(Runtime):
     name = "pi"
@@ -155,37 +146,12 @@ class PiRuntime(Runtime):
             "defaultProjectTrust": "never",
         }, indent=2))
 
-    def _sandbox_cmd(self, inner: list[str], workspace: Path,
-                     runtime_dir: Path) -> list[str]:
-        cmd = ["bwrap", "--die-with-parent", "--unshare-pid", "--unshare-ipc",
-               "--unshare-uts", "--unshare-cgroup-try", "--ro-bind", "/", "/"]
-        for mount in _hidden_mounts():
-            cmd += ["--tmpfs", mount]
-        cmd += ["--tmpfs", "/tmp", "--dev-bind", "/dev", "/dev", "--proc", "/proc",
-                "--bind", str(workspace), str(workspace),
-                "--bind", str(runtime_dir), str(runtime_dir)]
-        managed = self._managed_node_modules()
-        if managed is not None:
-            cmd += ["--ro-bind", str(managed), str(runtime_dir / "node_modules")]
-        environment = self.teacher_environment(workspace)
-        for name in ("HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME",
-                     "XDG_DATA_HOME", "DOTNET_CLI_HOME", "NUGET_PACKAGES",
-                     "GOCACHE", "GOMODCACHE", "GOPATH"):
-            cmd += ["--setenv", name, environment[name]]
-        cmd += [
-                "--setenv", "USER", "moonshiner-agent",
-                "--setenv", "LOGNAME", "moonshiner-agent",
-                "--setenv", "XDG_RUNTIME_DIR", str(runtime_dir / "run"),
-                "--setenv", "PI_CODING_AGENT_DIR", str(runtime_dir / "config"),
-                "--chdir", str(workspace), "--"]
-        return cmd + inner
-
     def _pi_cmd(self, runtime_dir: Path, *, system_prompt: str,
                 tools: list[str] | None, read_only: bool,
                 continue_session: bool = False,
                 append_system_prompt: str | None = None) -> list[str]:
         # pi 0.80.7: the agent config dir (models.json/settings.json) is
-        # selected via the PI_CODING_AGENT_DIR env var set in _sandbox_cmd —
+        # selected via the PI_CODING_AGENT_DIR environment variable —
         # there is no --config-dir flag, and no --output-schema (a judge
         # verdict is parsed from the last assistant message instead).
         # --print is required for non-interactive mode; the prompt arrives on
@@ -253,13 +219,25 @@ class PiRuntime(Runtime):
                                      tools=tools, read_only=read_only,
                                      continue_session=turn_index > 0,
                                      append_system_prompt=append_system_prompt)
-                cmd = self._sandbox_cmd(inner, workspace, runtime_dir)
+                bindings: tuple[tuple[Path, Path], ...] = ()
+                managed = self._managed_node_modules()
+                if managed is not None:
+                    bindings = ((managed, runtime_dir / "node_modules"),)
+                cmd = workspace_only_command(
+                    inner, workspace, read_only_binds=bindings)
+                environment = self.teacher_environment(workspace)
+                environment.update({
+                    "USER": "moonshiner-agent",
+                    "LOGNAME": "moonshiner-agent",
+                    "XDG_RUNTIME_DIR": str(runtime_dir / "run"),
+                    "PI_CODING_AGENT_DIR": str(runtime_dir / "config"),
+                })
                 try:
                     proc = run_streamed(
                         cmd, workspace=workspace, turn=turn,
                         stdout_path=events_path, stderr_path=stderr_path,
                         timeout=int(self.role.get("timeout_s", 3600)),
-                        environment=self.teacher_environment(workspace))
+                        environment=environment)
                     return_code = proc.returncode
                     compact_events_file(events_path)
                     if return_code != 0:
