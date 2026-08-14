@@ -1,0 +1,198 @@
+diff --git a/client.go b/client.go
+index fcb07fb..0dd5500 100644
+--- a/client.go
++++ b/client.go
+@@ -1,9 +1,16 @@
+ package vcfautomation
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
++	"strings"
++	"sync"
+ )
+ 
+ // Config contains the connection and OAuth values needed by VCF Automation.
+@@ -36,7 +43,11 @@ type Deployment struct {
+ 
+ // Client invokes the small VCF Automation contract shipped with this package.
+ type Client struct {
+-	config Config
++	baseURL      string
++	clientID     string
++	clientSecret string
++	httpClient   *http.Client
++	tokens       tokenState
+ }
+ 
+ // NewClient validates configuration without performing network IO.
+@@ -53,11 +64,160 @@ func NewClient(config Config) (*Client, error) {
+ 	if config.HTTPClient == nil {
+ 		config.HTTPClient = http.DefaultClient
+ 	}
+-	return &Client{config: config}, nil
++	return &Client{
++		baseURL:      strings.TrimRight(config.BaseURL, "/"),
++		clientID:     config.ClientID,
++		clientSecret: config.ClientSecret,
++		httpClient:   config.HTTPClient,
++		tokens: tokenState{
++			access:  config.AccessToken,
++			refresh: config.RefreshToken,
++		},
++	}, nil
+ }
+ 
+ // Provision creates a deployment and retrieves it, refreshing authorization if
+ // the lookup observes an expired access token.
+-func (c *Client) Provision(context.Context, string, CatalogItemRequest) (Deployment, error) {
+-	return Deployment{}, errors.New("VCF Automation Provision is not implemented")
++func (c *Client) Provision(ctx context.Context, itemID string, input CatalogItemRequest) (Deployment, error) {
++	body, err := json.Marshal(input)
++	if err != nil {
++		return Deployment{}, fmt.Errorf("encode catalog item request: %w", err)
++	}
++	createPath := "/catalog/api/items/" + url.PathEscape(itemID) + "/request"
++	request, err := c.newRequest(ctx, http.MethodPost, createPath, bytes.NewReader(body))
++	if err != nil {
++		return Deployment{}, err
++	}
++	request.Header.Set("Content-Type", "application/json")
++	access := c.tokens.accessToken()
++	request.Header.Set("Authorization", "Bearer "+access)
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return Deployment{}, fmt.Errorf("submit catalog item request: %w", err)
++	}
++	var created []struct {
++		DeploymentID string `json:"deploymentId"`
++	}
++	if err := decodeResponse(response, &created); err != nil {
++		return Deployment{}, fmt.Errorf("submit catalog item request: %w", err)
++	}
++	if len(created) == 0 || created[0].DeploymentID == "" {
++		return Deployment{}, errors.New("submit catalog item request: response has no deployment ID")
++	}
++
++	deploymentPath := "/deployment/api/deployments/" + url.PathEscape(created[0].DeploymentID)
++	deployment, status, usedAccess, err := c.getDeployment(ctx, deploymentPath)
++	if err != nil {
++		return Deployment{}, err
++	}
++	if status != http.StatusUnauthorized {
++		return deployment, nil
++	}
++	if err := c.tokens.refreshTokens(ctx, c, usedAccess); err != nil {
++		return Deployment{}, fmt.Errorf("refresh access token: %w", err)
++	}
++	deployment, status, _, err = c.getDeployment(ctx, deploymentPath)
++	if err != nil {
++		return Deployment{}, err
++	}
++	if status == http.StatusUnauthorized {
++		return Deployment{}, errors.New("get deployment: unauthorized after token refresh")
++	}
++	return deployment, nil
++}
++
++func (c *Client) getDeployment(ctx context.Context, path string) (Deployment, int, string, error) {
++	request, err := c.newRequest(ctx, http.MethodGet, path, nil)
++	if err != nil {
++		return Deployment{}, 0, "", err
++	}
++	access := c.tokens.accessToken()
++	request.Header.Set("Authorization", "Bearer "+access)
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return Deployment{}, 0, access, fmt.Errorf("get deployment: %w", err)
++	}
++	if response.StatusCode == http.StatusUnauthorized {
++		_, _ = io.Copy(io.Discard, response.Body)
++		response.Body.Close()
++		return Deployment{}, response.StatusCode, access, nil
++	}
++	var deployment Deployment
++	if err := decodeResponse(response, &deployment); err != nil {
++		return Deployment{}, response.StatusCode, access, fmt.Errorf("get deployment: %w", err)
++	}
++	if deployment.ID == "" {
++		return Deployment{}, response.StatusCode, access, errors.New("get deployment: response has no deployment ID")
++	}
++	return deployment, response.StatusCode, access, nil
++}
++
++func (c *Client) newRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
++	request, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
++	if err != nil {
++		return nil, fmt.Errorf("build %s %s request: %w", method, path, err)
++	}
++	return request, nil
++}
++
++func decodeResponse(response *http.Response, target any) error {
++	defer response.Body.Close()
++	if response.StatusCode < 200 || response.StatusCode >= 300 {
++		message, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
++		return fmt.Errorf("HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(message)))
++	}
++	if err := json.NewDecoder(response.Body).Decode(target); err != nil {
++		return fmt.Errorf("decode HTTP %d response: %w", response.StatusCode, err)
++	}
++	return nil
++}
++
++type tokenState struct {
++	mu      sync.RWMutex
++	access  string
++	refresh string
++}
++
++func (s *tokenState) accessToken() string {
++	s.mu.RLock()
++	defer s.mu.RUnlock()
++	return s.access
++}
++
++func (s *tokenState) refreshTokens(ctx context.Context, c *Client, expiredAccess string) error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.access != expiredAccess {
++		return nil
++	}
++	form := url.Values{
++		"grant_type":    {"refresh_token"},
++		"refresh_token": {s.refresh},
++	}
++	request, err := c.newRequest(ctx, http.MethodPost, "/oidc/oauth2/token", strings.NewReader(form.Encode()))
++	if err != nil {
++		return err
++	}
++	request.SetBasicAuth(c.clientID, c.clientSecret)
++	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return err
++	}
++	var token struct {
++		AccessToken  string `json:"access_token"`
++		RefreshToken string `json:"refresh_token"`
++	}
++	if err := decodeResponse(response, &token); err != nil {
++		return err
++	}
++	if token.AccessToken == "" {
++		return errors.New("response has no access_token")
++	}
++	s.access = token.AccessToken
++	if token.RefreshToken != "" {
++		s.refresh = token.RefreshToken
++	}
++	return nil
+ }

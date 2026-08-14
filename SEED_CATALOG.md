@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3557 seeds grouped into 427 categories. This file is generated; edit each seed's source, then regenerate it.
+3559 seeds grouped into 427 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -17,9 +17,9 @@
 | **Refactoring & performance** | 29 | Restructure safely and improve measured performance without behavior drift. |
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
-| **Uncategorized** | 83 | Catalog program awaiting description. |
+| **Uncategorized** | 84 | Catalog program awaiting description. |
 | **VMware Cloud Foundation 9.1** | 313 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.0** | 120 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.0** | 121 | Catalog program awaiting description. |
 | **instruction-following** | 1 | Catalog program awaiting description. |
 | **VMware Cloud Foundation Automation 9.0** | 3 | Catalog program awaiting description. |
 
@@ -3869,6 +3869,8 @@
 - **vcf90-0154** (`python`) `#vcf-9-0` `#vcf-automation` `#python` `#rest-contract` `#reference-derived` — Implement `src/vcf_automation/client.py` as a Python 3.11+ standard-library-only client for the focused VMware Cloud Foundation Automation 9.0 deployment contract. Do not add dependencies or edit a…
 - **vcf90-0156** (`python`) `#vcf-9-0` `#vcf-automation` `#python` `#rest-contract` `#reference-derived` — Finish the stdlib-only Python implementation under `src/vcf_automation` using the reference-derived VCF Automation 9.0 contract in `docs/contract.json`. Keep the supplied public API and signatures.…
 - **vcf90-0157** (`python`) `#vcf-9-0` `#vcf-automation` `#python` `#rest-contract` `#reference-derived` — Complete the stdlib-only `vcf_automation` package so it safely modifies a VCF Automation 9.0 project through the protected reference-derived contract in `docs/contract.json`. Keep the public API al…
+- **vcf90-0159** (`go`) `#vcf-9-0` `#vcf-automation` `#go` `#rest-contract` `#reference-derived` — Our VCF Automation deployment helper loses track of work when its bearer token expires after a catalog request has already created a deployment. Implement the Go package in this repository so Provi…
+- **vcf90-0160** (`go`) `#vcf-9-0` `#vcf-automation` `#go` `#rest-contract` `#reference-derived` — Implement the VCF Automation 9.0 deployment collection client in this repository using only the Go standard library. VCF Automation is the VCF 9.0 successor to vRealize Automation and Aria Automati…
 - **vcf91-0001** (`powershell`) `#vcf-9-1` `#sddc-manager` `#powershell` `#rest-contract` `#spec-derived` — Platform automation ticket for our VMware Cloud Foundation 9.1 estate. Build `VcfHostCommission.psm1` at the workspace root. It must submit one ESXi host for SDDC Manager commissioning and wait for…
 - **vcf91-0002** (`powershell`) `#vcf-9-1` `#sddc-manager` `#powershell` `#rest-contract` `#spec-derived` — Complete `VcfResilientDomains/VcfResilientDomains.psm1` as a PowerShell 7 module for a long-running VMware Cloud Foundation 9.1 SDDC Manager inventory export. The supplied scenario expires the acce…
 - **vcf91-0003** (`powershell`) `#vcf-9-1` `#sddc-manager` `#powershell` `#rest-contract` `#spec-derived` — Platform engineering needs a byte-stable VMware Cloud Foundation 9.1 ESXi host inventory for a Git-tracked daily report. Finish the existing `VcfHostInventory` PowerShell module so it retrieves the…
