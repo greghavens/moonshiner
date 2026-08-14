@@ -24,8 +24,11 @@ from pathlib import Path
 
 from common import TRACES, load_seeds
 from generate_traces import trace_task
-from runtimes import get_judge, get_teacher
-from runtimes.availability import ModelUnavailable
+from runtimes import (NoCompatibleTraceHarness,
+                      TraceHarnessInfrastructureFailure, get_judge,
+                      get_teacher, resolve_trace_harness)
+from runtimes.availability import (INFRASTRUCTURE_EXIT, USAGE_LIMIT_EXIT,
+                                   ModelUnavailable)
 from screen_traces import feedback_from_review, screen
 from review_contract import is_accepted
 
@@ -85,9 +88,14 @@ def retry(seed: dict, teacher, judge, max_attempts: int) -> bool:
         feedback = feedback_from_review(review) if review else None
         print(f"[retry] {task_id}: attempt {attempt}/{max_attempts}", flush=True)
         try:
-            trace_task(seed, teacher, force=True, feedback=feedback)
+            selected, resolution = resolve_trace_harness(
+                seed, configured_teacher=teacher)
+            judge.preflight(require_auth=True)
+            trace_task(seed, selected, force=True, feedback=feedback,
+                       capability_resolution=resolution)
             decision = screen(seed, judge)
-        except ModelUnavailable:
+        except (ModelUnavailable, NoCompatibleTraceHarness,
+                TraceHarnessInfrastructureFailure):
             raise
         except Exception as error:  # noqa: BLE001 - isolate one seed's failure
             print(f"[retry ERR] {task_id}: {type(error).__name__}: {error}",
@@ -118,16 +126,22 @@ def main(argv: list[str] | None = None) -> int:
 
     teacher = get_teacher()
     judge = get_judge()
-    teacher.preflight(require_auth=True)
-    judge.preflight(require_auth=True)
 
     rejected = rejected_seeds(load_seeds(include_holdout=False), args.limit)
     if not rejected:
         print("quality retry: no current rejected traces")
         return 0
     print(f"quality retry: {len(rejected)} rejected trace(s)")
-    unresolved = [seed["id"] for seed in rejected
-                  if not retry(seed, teacher, judge, args.max_attempts)]
+    try:
+        unresolved = [seed["id"] for seed in rejected
+                      if not retry(seed, teacher, judge, args.max_attempts)]
+    except ModelUnavailable as error:
+        print(f"stopping: {error}", file=sys.stderr)
+        return USAGE_LIMIT_EXIT
+    except (NoCompatibleTraceHarness,
+            TraceHarnessInfrastructureFailure) as error:
+        print(f"stopping: infrastructure failure: {error}", file=sys.stderr)
+        return INFRASTRUCTURE_EXIT
     if unresolved:
         raise SystemExit("quality retry exhausted for: " + ", ".join(unresolved))
     print(f"quality retry: accepted {len(rejected)}/{len(rejected)}")

@@ -21,7 +21,9 @@ from generate_traces import trace_task
 from run_state import (connect, create_run, finish_attempt, set_job,
                        set_run_status, start_attempt, run_row, job_rows,
                        abandon_claim, claim_job, renew_lease, record_model_call)
-from runtimes import get_judge, get_teacher
+from runtimes import (NoCompatibleTraceHarness,
+                      TraceHarnessInfrastructureFailure, get_judge,
+                      get_teacher, resolve_trace_harness)
 from runtimes.availability import (INFRASTRUCTURE_EXIT, USAGE_LIMIT_EXIT,
                                    ModelUnavailable)
 from screen_traces import feedback_from_review, screen
@@ -176,6 +178,8 @@ def _run_individual_trace_jobs(seeds: list[dict], args, workers: int) -> int:
 
     failures = 0
     completed = 0
+    exit_code = 0
+    stop_dispatch = False
     supervised = os.environ.get("MOONSHINER_SUPERVISED") == "1"
     pending = list(seeds)
 
@@ -193,20 +197,22 @@ def _run_individual_trace_jobs(seeds: list[dict], args, workers: int) -> int:
     # not pool capacity, enforces the live configured worker count.
     with ThreadPoolExecutor(max_workers=64, thread_name_prefix="trace-job") as pool:
         futures: dict = {}
-        while pending or futures or supervised:
+        while pending or futures or (supervised and not stop_dispatch):
             active_ids = {seed_id for seed_id in futures.values()}
-            if supervised:
+            if supervised and not stop_dispatch:
                 pending_ids = {seed["id"] for seed in pending}
                 for seed in _selected(args):
                     if seed["id"] not in active_ids and seed["id"] not in pending_ids:
                         pending.append(seed)
                         pending_ids.add(seed["id"])
             target = configured_workers()
-            while pending and len(futures) < target:
+            while pending and not stop_dispatch and len(futures) < target:
                 seed = pending.pop(0)
                 future = pool.submit(run_one, seed)
                 futures[future] = seed["id"]
             if not futures:
+                if stop_dispatch:
+                    break
                 time.sleep(2)
                 continue
             done, _ = wait(set(futures), timeout=2, return_when=FIRST_COMPLETED)
@@ -216,12 +222,20 @@ def _run_individual_trace_jobs(seeds: list[dict], args, workers: int) -> int:
                 completed += 1
                 if code:
                     failures += 1
-                    print(f"[trace process failed] {seed_id}", flush=True)
+                    mapped = code if code in {USAGE_LIMIT_EXIT,
+                                              INFRASTRUCTURE_EXIT} \
+                        else INFRASTRUCTURE_EXIT
+                    if exit_code == 0 or mapped == USAGE_LIMIT_EXIT:
+                        exit_code = mapped
+                    stop_dispatch = True
+                    pending.clear()
+                    print(f"[trace process failed: exit {mapped}] {seed_id}",
+                          flush=True)
                 else:
                     print(f"[trace complete: accepted] {seed_id}", flush=True)
     print(f"trace queue pass complete: {completed - failures} accepted, "
           f"{failures} failed processes, {completed} individual trace jobs", flush=True)
-    return 1 if failures else 0
+    return exit_code
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -335,8 +349,6 @@ def main(argv: list[str] | None = None) -> int:
     if sync.get("status") not in {"unconfigured", "local_append"}:
         print(f"HF local dataset: {sync.get('status')} ({sync.get('origin', 'existing')})")
 
-    teacher.preflight(require_auth=True)
-    judge.preflight(require_auth=True)
     ensure_publish_queue()
     limits = {"seeds": len(seeds), "max_attempts": args.max_attempts}
     limits["step_down_reasoning_on_failure"] = stepdown_enabled
@@ -377,8 +389,11 @@ def main(argv: list[str] | None = None) -> int:
 
     def process_claim(worker_db, owner: str, claim: dict, worker_teacher, worker_judge):
         seed = seed_by_id[claim["seed_id"]]
+        selected_teacher, capability_resolution = resolve_trace_harness(
+            seed, configured_teacher=worker_teacher)
+        worker_judge.preflight(require_auth=True)
         number = claim["attempts"] + 1
-        configured_effort = str(worker_teacher.role.get("reasoning") or "max")
+        configured_effort = str(selected_teacher.role.get("reasoning") or "max")
         required_stages = reasoning_schedule(args.max_attempts, stepdown_enabled,
                                              configured_effort)
         from run_state import trace_reasoning_efforts_for_current_seed_revision
@@ -390,9 +405,9 @@ def main(argv: list[str] | None = None) -> int:
             set_job(worker_db, run_id, seed["id"], "exhausted", claim["attempts"],
                     claim.get("last_error") or "attempt ceiling reached")
             return
-        effort = native_effort(worker_teacher.name, stage)
-        attempt_teacher = (runtime_for_stage(worker_teacher, stage)
-                           if stepdown_enabled else worker_teacher)
+        effort = native_effort(selected_teacher.name, stage)
+        attempt_teacher = (runtime_for_stage(selected_teacher, stage)
+                           if stepdown_enabled else selected_teacher)
         has_more = next_reasoning_stage(required_stages,
                                         [*completed_stages, stage]) is not None
         from common import preflight_seed_environment, synthetic_tool_contract
@@ -434,7 +449,8 @@ def main(argv: list[str] | None = None) -> int:
                           reasoning_stage=stage, reasoning_effort=effort)
             print(f"[{seed['id']}] attempt {number} ({stage}): author", flush=True)
             record = trace_task(seed, attempt_teacher, force=True,
-                                reasoning_stage=stage)
+                                reasoning_stage=stage,
+                                capability_resolution=capability_resolution)
         usage = (record.get("teacher") or {}).get("usage") or {}
         # Candidate checks are evidence for the trace judge, never a separate
         # rejection gate. Every completed candidate proceeds to judgment.
@@ -478,6 +494,15 @@ def main(argv: list[str] | None = None) -> int:
                 if claim is None:
                     return
                 process_claim(worker_db, owner, claim, worker_teacher, worker_judge)
+        except NoCompatibleTraceHarness as error:
+            if claim is not None:
+                reason = f"{type(error).__name__}: {error}"
+                set_job(worker_db, run_id, claim["seed_id"], "pending",
+                        claim["attempts"], reason)
+                alert_infrastructure_failure(claim["seed_id"], reason)
+            with error_lock:
+                worker_errors.append(error)
+            stop_claiming.set()
         except BaseException as error:
             if claim is not None:
                 reason = f"{type(error).__name__}: {error}"
@@ -517,7 +542,8 @@ def main(argv: list[str] | None = None) -> int:
         for thread in threads.values(): thread.join()
         set_run_status(db, run_id, "interrupted", "keyboard interrupt")
         return 130
-    except InfrastructureFailure as broken:
+    except (InfrastructureFailure, NoCompatibleTraceHarness,
+            TraceHarnessInfrastructureFailure) as broken:
         stop_claiming.set()
         for thread in threads.values(): thread.join()
         set_run_status(db, run_id, "stopped", str(broken))

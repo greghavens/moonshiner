@@ -30,6 +30,17 @@ class ClaudeCodeRuntime(Runtime):
     name = "claude-code"
     trace_formats = ("claude-stream-json",)
 
+    def trace_capabilities(self) -> frozenset[str]:
+        capabilities = {"workspace_write", "multi_turn", "seed_scoped_mcp"}
+        disallowed = self.runtime_config.get("disallowed_tools") or ""
+        if isinstance(disallowed, str):
+            disallowed_names = set(disallowed.split())
+        else:
+            disallowed_names = {str(name) for name in disallowed}
+        if not {"WebSearch", "WebFetch"} & disallowed_names:
+            capabilities.add("live_web_research")
+        return frozenset(capabilities)
+
     # -- lifecycle ---------------------------------------------------------- #
     def preflight(self, *, require_auth: bool = False) -> None:
         cli = self.runtime_config.get("cli", "claude")

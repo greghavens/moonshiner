@@ -54,6 +54,8 @@ PILOT_EXEMPT = {"py-lru-eviction", "py-config-merge", "go-worker-pool",
                 "ts-pagination"}
 PATCH_EXEMPT = PILOT_EXEMPT | set(CONFIG.get("holdout_tasks", []))
 SEED_ENTRIES = {"task.json", "files", "reference_fix.patch"}
+CAPABILITY_FIELDS = ("required_harness_capabilities",
+                     "preferred_harness_capabilities")
 
 
 def check(directory: Path, worlds: dict | None = None) -> str | None:
@@ -72,6 +74,14 @@ def check(directory: Path, worlds: dict | None = None) -> str | None:
         return f"task.json invalid: {error}"
     if FORBIDDEN_BENCHMARK in serialized.casefold():
         return "contains a forbidden benchmark name"
+    for field in CAPABILITY_FIELDS:
+        if field not in task:
+            continue
+        value = task[field]
+        if (not isinstance(value, list)
+                or any(not isinstance(item, str) or not item.strip()
+                       for item in value)):
+            return f"task.json {field} must be a list of nonempty strings"
     missing = [key for key in REQUIRED if not task.get(key)]
     if missing:
         return f"task.json missing {missing}"

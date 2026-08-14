@@ -23,8 +23,11 @@ from pathlib import Path
 from common import (TRACES, clear_runtime_caches, git_diff,
                     load_seeds, materialize, protected_hashes, quarantined_tasks,
                     run_verify, scrub_text, seed_fingerprint)
-from runtimes import get_teacher
-from runtimes.availability import ModelUnavailable
+from runtimes import (NoCompatibleTraceHarness,
+                      TraceHarnessInfrastructureFailure, get_teacher,
+                      resolve_trace_harness)
+from runtimes.availability import (INFRASTRUCTURE_EXIT, USAGE_LIMIT_EXIT,
+                                   ModelUnavailable)
 
 RAW = TRACES / "raw"
 META = TRACES / "meta"
@@ -51,7 +54,8 @@ def _trace_turns(seed: dict) -> tuple[str, list[str] | None]:
 def trace_task(seed: dict, teacher=None, *, force: bool = False,
                attempts: int = 1, feedback: str | None = None,
                reasoning_stage: str | None = None,
-               traces_root: Path | None = None) -> dict:
+               traces_root: Path | None = None,
+               capability_resolution: dict | None = None) -> dict:
     """Generate (and verify) one trace for ``seed``; return its meta record."""
     traces_root = traces_root or TRACES
     raw_dir = traces_root / "raw"
@@ -66,16 +70,26 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
             return existing
 
     teacher = teacher or get_teacher()
+    if capability_resolution is None:
+        teacher, capability_resolution = resolve_trace_harness(
+            seed, configured_teacher=teacher)
     prompt, interaction = _trace_turns(seed)
 
     best: dict | None = None
     for attempt in range(1, max(1, attempts) + 1):
         workspace = materialize(seed)
         protected_before = protected_hashes(seed, workspace)
-        result = teacher.run_trace(
-            seed, workspace, out_dir=raw_dir, system_prompt="",
-            prompt=prompt, interaction=interaction,
-            security=False, tools=None)
+        try:
+            result = teacher.run_trace(
+                seed, workspace, out_dir=raw_dir, system_prompt="",
+                prompt=prompt, interaction=interaction,
+                security=False, tools=None)
+        except ModelUnavailable:
+            raise
+        except (SystemExit, Exception) as error:
+            raise TraceHarnessInfrastructureFailure(
+                f"selected trace harness {teacher.name!r} raised "
+                f"{type(error).__name__}: {error}") from error
 
         # Out of quota is not this seed's problem: deferring it would march
         # through the corpus marking every remaining seed deferred. Stop, and
@@ -84,10 +98,23 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
             raise ModelUnavailable(f"{teacher.name}: {result.unavailable}")
         if result.safeguard_refusal:
             record = _deferral(seed, prompt, teacher, "safeguard_refusal",
-                               "teacher issued a safeguard refusal")
+                               "teacher issued a safeguard refusal",
+                               capability_resolution)
             _write_meta(meta_path, record)
             record["_workspace_path"] = str(workspace)
             return record
+        if (result.timed_out or result.return_code != 0
+                or not result.stream_success or result.error):
+            if result.error:
+                detail = result.error
+            elif result.timed_out:
+                detail = "trace harness timed out"
+            elif result.return_code != 0:
+                detail = f"trace harness exited {result.return_code}"
+            else:
+                detail = "trace harness stream did not complete successfully"
+            raise TraceHarnessInfrastructureFailure(
+                f"selected trace harness {teacher.name!r} failed: {detail}")
 
         clear_runtime_caches(workspace)
         passed, verify_output = run_verify(seed, workspace)
@@ -138,7 +165,10 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
                 "safeguard_refusal": result.safeguard_refusal,
                 "usage": result.usage,
                 "error": result.error,
-                "provenance": result.provenance,
+                "provenance": {
+                    **result.provenance,
+                    "capability_resolution": capability_resolution,
+                },
             },
         }
         _write_meta(meta_path, record)
@@ -151,7 +181,8 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
     return best or {}
 
 
-def _deferral(seed: dict, prompt: str, teacher, kind: str, detail: str) -> dict:
+def _deferral(seed: dict, prompt: str, teacher, kind: str, detail: str,
+              capability_resolution: dict) -> dict:
     return {
         "id": seed["id"],
         "passed": None,
@@ -161,7 +192,9 @@ def _deferral(seed: dict, prompt: str, teacher, kind: str, detail: str) -> dict:
         f"deferred_{kind}": True,
         "deferral_reason": detail,
         "teacher": {"runtime": teacher.name, "model": teacher.role["model"],
-                    "reasoning": teacher.role.get("reasoning")},
+                    "reasoning": teacher.role.get("reasoning"),
+                    "provenance": {
+                        "capability_resolution": capability_resolution}},
     }
 
 
@@ -197,8 +230,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"teacher OK: runtime={teacher.name} model={teacher.role['model']} "
               f"reasoning={teacher.role.get('reasoning')}")
         return 0
-    teacher.preflight(require_auth=True)
-
     only = None
     if args.only:
         only = {value.strip() for value in args.only.split(",") if value.strip()}
@@ -220,7 +251,16 @@ def main(argv: list[str] | None = None) -> int:
 
     passed = failed = deferred = 0
     for seed in seeds:
-        record = trace_task(seed, teacher, force=args.force, attempts=args.attempts)
+        try:
+            record = trace_task(
+                seed, teacher, force=args.force, attempts=args.attempts)
+        except ModelUnavailable as error:
+            print(f"stopping: {error}", file=sys.stderr)
+            return USAGE_LIMIT_EXIT
+        except (NoCompatibleTraceHarness,
+                TraceHarnessInfrastructureFailure) as error:
+            print(f"stopping: infrastructure failure: {error}", file=sys.stderr)
+            return INFRASTRUCTURE_EXIT
         status = ("passed" if record.get("passed")
                   else "deferred" if record.get("passed") is None else "failed")
         passed += status == "passed"

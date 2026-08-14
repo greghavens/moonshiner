@@ -26,6 +26,12 @@ class CodexRuntime(Runtime):
     name = "codex"
     trace_formats = ("codex-rollout", "codex-exec-events")
 
+    def trace_capabilities(self) -> frozenset[str]:
+        capabilities = {"workspace_write"}
+        if self.runtime_config.get("web_search") == "live":
+            capabilities.add("live_web_research")
+        return frozenset(capabilities)
+
     # -- lifecycle ---------------------------------------------------------- #
     def preflight(self, *, require_auth: bool = False) -> None:
         cli = self.runtime_config.get("cli", "codex")

@@ -54,6 +54,9 @@ class PiRuntime(Runtime):
     name = "pi"
     trace_formats = ("pi-coding-agent-json-v3",)
 
+    def trace_capabilities(self) -> frozenset[str]:
+        return frozenset({"workspace_write", "multi_turn"})
+
     @staticmethod
     def _managed_cli() -> Path:
         base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))

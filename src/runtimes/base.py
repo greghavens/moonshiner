@@ -329,6 +329,10 @@ class Runtime(abc.ABC):
                    if profile.get("id") == self.role.get("model") else [])
         return matches(str(self.role.get("model") or ""), observed, aliases)
 
+    def trace_capabilities(self) -> frozenset[str]:
+        """Capabilities genuinely provided by this native trace adapter."""
+        return frozenset()
+
     @staticmethod
     def require_persistent_workspace(workspace: Path) -> Path:
         """Refuse model contexts that are ephemeral or inherit AGENTS.md."""
