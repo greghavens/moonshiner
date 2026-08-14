@@ -124,13 +124,13 @@ class ASeedIsNeverDiscarded(unittest.TestCase):
     def test_the_candidate_is_promoted_whatever_the_verdict(self):
         source = (ROOT / "src" / "seed_pipeline.py").read_text()
         body = source[source.index("if not accepted:"):]
-        body = body[:body.index("shutil.copytree(candidate, destination)")]
+        body = body[:body.index("_promote_candidate(candidate, destination)")]
         self.assertNotIn("return 1", body,
                          "an unresolved seed must not abandon the paid work")
 
     def test_the_promotion_is_unconditional(self):
         source = (ROOT / "src" / "seed_pipeline.py").read_text()
-        promote = source.index("shutil.copytree(candidate, destination)")
+        promote = source.index("_promote_candidate(candidate, destination)")
         guard_before = source[:promote].rstrip().splitlines()[-1]
         self.assertNotIn("if ", guard_before,
                          "promotion must not sit behind an acceptance test")
@@ -151,6 +151,45 @@ class ASeedIsNeverDiscarded(unittest.TestCase):
             common.remove_workspace(retained)
             common.remove_workspace(incomplete)
         self.assertEqual(retained, selected)
+
+    def test_real_promotion_excludes_runtime_state_and_keeps_seed_artifacts(self):
+        root = seed_pipeline.WORKSPACES / f"promotion-{uuid.uuid4().hex}"
+        candidate = root / "candidate"
+        destination = root / "promoted"
+        try:
+            (candidate / "files").mkdir(parents=True)
+            task = b'{"id":"promotion-contract","prompt":"implement"}\n'
+            payload = b"seed payload\n"
+            patch = b"--- /dev/null\n+++ answer.txt\n@@ -0,0 +1 @@\n+answer\n"
+            (candidate / "task.json").write_bytes(task)
+            (candidate / "files" / "answer.txt").write_bytes(payload)
+            (candidate / "reference_fix.patch").write_bytes(patch)
+            runtime_skill = (candidate / ".sandbox-home" / "codex" /
+                             "skills" / ".system" / "openai-docs")
+            runtime_skill.mkdir(parents=True)
+            (runtime_skill / "SKILL.md").write_text("runtime state\n")
+            for name in (".git", ".codex", ".agents", ".toolchain",
+                         "__pycache__"):
+                (candidate / name).mkdir()
+                (candidate / name / "runtime-state").write_text(
+                    "runtime state\n")
+            (candidate / "task.json.authored").write_text("runtime state\n")
+
+            seed_pipeline._promote_candidate(candidate, destination)
+
+            self.assertEqual(task, (destination / "task.json").read_bytes())
+            self.assertEqual(
+                payload, (destination / "files" / "answer.txt").read_bytes())
+            self.assertEqual(
+                patch, (destination / "reference_fix.patch").read_bytes())
+            self.assertEqual(
+                {"task.json", "files", "reference_fix.patch"},
+                {path.name for path in destination.iterdir()})
+            self.assertEqual([], [
+                path for path in destination.rglob("SKILL.md")
+                if not path.is_relative_to(destination / "files")])
+        finally:
+            common.remove_workspace(root)
 
 
 class InfrastructureFailuresReachTheJudge(unittest.TestCase):

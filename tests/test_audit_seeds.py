@@ -48,6 +48,16 @@ class Check(unittest.TestCase):
         (directory / "task.json").unlink()
         self.assertIsNotNone(aud.check(directory))
 
+    def test_runtime_home_makes_a_real_seed_fail_the_corpus_audit(self):
+        directory = make_complete(self.root, "z-seed")
+        skill = (directory / ".sandbox-home" / "codex" / "skills" /
+                 ".system" / "openai-docs")
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("runtime state\n")
+        self.assertEqual(
+            "contains forbidden non-seed state: ['.sandbox-home']",
+            aud.check(directory))
+
     def test_holdouts_are_patch_exempt(self):
         self.assertTrue(set(aud.PATCH_EXEMPT) >= set(aud.PILOT_EXEMPT))
 

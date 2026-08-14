@@ -139,6 +139,19 @@ def _latest_preserved_candidate(seed_id: str) -> Path | None:
     return max(candidates, default=(0, None))[1]
 
 
+def _promote_candidate(candidate: Path, destination: Path) -> None:
+    """Copy only durable seed content across the final promotion boundary."""
+    destination.mkdir(parents=True)
+    for name in ("task.json", "files", "reference_fix.patch"):
+        source = candidate / name
+        if not source.exists():
+            continue
+        if source.is_dir():
+            shutil.copytree(source, destination / name)
+        else:
+            shutil.copy2(source, destination / name)
+
+
 def _review_prompt(seed: dict, report: dict) -> str:
     return f"""Review and, when possible, FIX this authored Moonshiner seed in place.
 You are the final seed judge and are authorized to make every necessary in-scope repair without asking for human approval. You may edit task.json, files/, tests, and reference_fix.patch. Preserve the core objective; repair prompt/test mismatches, weak tests, unrelated baseline bugs, broken patches, and nondeterminism. Do not reject or defer a seed merely because it requires edits you can make. After edits, return only the required JSON verdict. Use verdict=accept only if the resulting on-disk seed is ready. Use needs_human only when the objective is genuinely ambiguous or fixing it would redefine the objective.
@@ -296,7 +309,7 @@ def main(argv: list[str] | None = None) -> int:
             set_run_status(db, run_id, "complete_with_rejections")
             print(f"[promoted unresolved] {args.id}: judge did not clear it; "
                   "promoted anyway so the work is kept")
-        shutil.copytree(candidate, destination)
+        _promote_candidate(candidate, destination)
         if legacy_path is not None:
             archive = STORAGE_ROOT / "tasks" / "replaced-synthetic-seeds"
             archive.mkdir(parents=True, exist_ok=True)

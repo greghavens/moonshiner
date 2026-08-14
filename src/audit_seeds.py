@@ -53,10 +53,15 @@ REQUIRED = ("id", "category", "prompt")
 PILOT_EXEMPT = {"py-lru-eviction", "py-config-merge", "go-worker-pool",
                 "ts-pagination"}
 PATCH_EXEMPT = PILOT_EXEMPT | set(CONFIG.get("holdout_tasks", []))
+SEED_ENTRIES = {"task.json", "files", "reference_fix.patch"}
 
 
 def check(directory: Path, worlds: dict | None = None) -> str | None:
     """Return a reason string if the seed is partial, else None."""
+    extra = sorted(path.name for path in directory.iterdir()
+                   if path.name not in SEED_ENTRIES)
+    if extra:
+        return f"contains forbidden non-seed state: {extra}"
     task_path = directory / "task.json"
     if not task_path.exists():
         return "no task.json"
