@@ -1,0 +1,224 @@
+diff --git a/client.go b/client.go
+index 2f2b55d..e5798b4 100644
+--- a/client.go
++++ b/client.go
+@@ -1,9 +1,15 @@
+ package installer
+ 
+ import (
++	"bytes"
+ 	"context"
+-	"errors"
++	"encoding/json"
++	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
++	"strconv"
++	"strings"
+ 	"sync"
+ 	"time"
+ )
+@@ -73,8 +79,6 @@ type DeployOptions struct {
+ 	SkipValidations *bool
+ }
+ 
+-var ErrNotImplemented = errors.New("vcf installer client is not implemented")
+-
+ type Client struct {
+ 	baseURL      string
+ 	httpClient   *http.Client
+@@ -84,9 +88,191 @@ type Client struct {
+ }
+ 
+ func NewClient(baseURL, accessToken, refreshToken string, httpClient *http.Client) (*Client, error) {
+-	return nil, ErrNotImplemented
++	parsed, err := url.Parse(baseURL)
++	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
++		return nil, fmt.Errorf("invalid VCF Installer base URL %q", baseURL)
++	}
++	if accessToken == "" {
++		return nil, fmt.Errorf("access token is empty")
++	}
++	if refreshToken == "" {
++		return nil, fmt.Errorf("refresh token is empty")
++	}
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++	return &Client{
++		baseURL:      strings.TrimRight(baseURL, "/"),
++		httpClient:   httpClient,
++		refreshToken: refreshToken,
++		accessToken:  accessToken,
++	}, nil
+ }
+ 
+ func (c *Client) ValidateAndDeploy(ctx context.Context, spec SddcSpec, options DeployOptions, pollInterval time.Duration) (SddcTask, error) {
+-	return SddcTask{}, ErrNotImplemented
++	specBody, err := json.Marshal(spec)
++	if err != nil {
++		return SddcTask{}, fmt.Errorf("encode SDDC specification: %w", err)
++	}
++
++	response, err := c.doAuthenticated(ctx, http.MethodPost, "/v1/sddcs/validations", nil, specBody)
++	if err != nil {
++		return SddcTask{}, fmt.Errorf("validateSddcSpec: %w", err)
++	}
++	var validation Validation
++	if err := decodeJSON(response, "validateSddcSpec", &validation, http.StatusOK, http.StatusAccepted); err != nil {
++		return SddcTask{}, err
++	}
++
++	for validation.ExecutionStatus == "IN_PROGRESS" {
++		if err := waitForPoll(ctx, pollInterval); err != nil {
++			return SddcTask{}, err
++		}
++		path := "/v1/sddcs/validations/" + url.PathEscape(validation.ID)
++		response, err = c.doAuthenticated(ctx, http.MethodGet, path, nil, nil)
++		if err != nil {
++			return SddcTask{}, fmt.Errorf("getSddcSpecValidation: %w", err)
++		}
++		if err := decodeJSON(response, "getSddcSpecValidation", &validation, http.StatusOK); err != nil {
++			return SddcTask{}, err
++		}
++	}
++	if validation.ExecutionStatus != "COMPLETED" || validation.ResultStatus != "SUCCEEDED" {
++		return SddcTask{}, fmt.Errorf("validation %q finished with execution status %q and result status %q",
++			validation.ID, validation.ExecutionStatus, validation.ResultStatus)
++	}
++
++	query := make(url.Values)
++	if options.SkipValidations != nil {
++		query.Set("skipValidations", strconv.FormatBool(*options.SkipValidations))
++	}
++	response, err = c.doAuthenticated(ctx, http.MethodPost, "/v1/sddcs", query, specBody)
++	if err != nil {
++		return SddcTask{}, fmt.Errorf("deploySddc: %w", err)
++	}
++	var task SddcTask
++	if err := decodeJSON(response, "deploySddc", &task, http.StatusAccepted); err != nil {
++		return SddcTask{}, err
++	}
++	return task, nil
++}
++
++func (c *Client) doAuthenticated(ctx context.Context, method, path string, query url.Values, body []byte) (*http.Response, error) {
++	token := c.currentAccessToken()
++	response, err := c.do(ctx, method, path, query, body, token)
++	if err != nil {
++		return nil, err
++	}
++	if response.StatusCode != http.StatusUnauthorized {
++		return response, nil
++	}
++	response.Body.Close()
++
++	if err := c.refreshAccessToken(ctx, token); err != nil {
++		return nil, err
++	}
++	return c.do(ctx, method, path, query, body, c.currentAccessToken())
++}
++
++func (c *Client) currentAccessToken() string {
++	c.mu.RLock()
++	defer c.mu.RUnlock()
++	return c.accessToken
++}
++
++func (c *Client) refreshAccessToken(ctx context.Context, expiredToken string) error {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	if c.accessToken != expiredToken {
++		return nil
++	}
++	body, err := json.Marshal(c.refreshToken)
++	if err != nil {
++		return fmt.Errorf("refreshAccessToken: encode refresh token: %w", err)
++	}
++	response, err := c.do(ctx, http.MethodPatch, "/v1/tokens/access-token/refresh", nil, body, "")
++	if err != nil {
++		return fmt.Errorf("refreshAccessToken: %w", err)
++	}
++	var accessToken string
++	if err := decodeJSON(response, "refreshAccessToken", &accessToken, http.StatusOK); err != nil {
++		return err
++	}
++	if accessToken == "" {
++		return fmt.Errorf("refreshAccessToken: response contained an empty access token")
++	}
++	c.accessToken = accessToken
++	return nil
++}
++
++func (c *Client) do(ctx context.Context, method, path string, query url.Values, body []byte, accessToken string) (*http.Response, error) {
++	endpoint, err := url.Parse(c.baseURL + path)
++	if err != nil {
++		return nil, fmt.Errorf("build request URL: %w", err)
++	}
++	if len(query) != 0 {
++		endpoint.RawQuery = query.Encode()
++	}
++
++	var requestBody io.Reader
++	if body != nil {
++		requestBody = bytes.NewReader(body)
++	}
++	request, err := http.NewRequestWithContext(ctx, method, endpoint.String(), requestBody)
++	if err != nil {
++		return nil, fmt.Errorf("build request: %w", err)
++	}
++	request.Header.Set("Accept", "application/json")
++	if body != nil {
++		request.Header.Set("Content-Type", "application/json")
++	}
++	if accessToken != "" {
++		request.Header.Set("Authorization", "Bearer "+accessToken)
++	}
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return nil, fmt.Errorf("send request: %w", err)
++	}
++	return response, nil
++}
++
++func decodeJSON(response *http.Response, operation string, destination any, successStatuses ...int) error {
++	defer response.Body.Close()
++	body, err := io.ReadAll(response.Body)
++	if err != nil {
++		return fmt.Errorf("%s: read response: %w", operation, err)
++	}
++	for _, status := range successStatuses {
++		if response.StatusCode == status {
++			if err := json.Unmarshal(body, destination); err != nil {
++				return fmt.Errorf("%s: decode response: %w", operation, err)
++			}
++			return nil
++		}
++	}
++	message := strings.TrimSpace(string(body))
++	if message == "" {
++		message = http.StatusText(response.StatusCode)
++	}
++	return fmt.Errorf("%s: HTTP %d: %s", operation, response.StatusCode, message)
++}
++
++func waitForPoll(ctx context.Context, interval time.Duration) error {
++	if interval <= 0 {
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		default:
++			return nil
++		}
++	}
++	timer := time.NewTimer(interval)
++	defer timer.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-timer.C:
++		return nil
++	}
+ }

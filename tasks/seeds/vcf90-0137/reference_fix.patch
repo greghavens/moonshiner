@@ -1,0 +1,261 @@
+diff --git a/incidents/client.go b/incidents/client.go
+--- a/incidents/client.go
++++ b/incidents/client.go
+@@ -79,17 +79,19 @@ type Client struct {
+ 
+ // New validates cfg and returns a client. It performs no network I/O.
+ func New(cfg Config) (*Client, error) {
+-	panic("TODO: implement New")
++	return newClient(cfg)
+ }
+ 
+ // ListAll obtains an access token and follows every response cursor. If an
+ // authenticated page returns 401, it refreshes and retries that same page.
+ func (c *Client) ListAll(ctx context.Context, opts ListOptions) (*Result, error) {
+-	panic("TODO: implement ListAll")
++	return c.listAll(ctx, opts)
+ }
+ 
+ // TokenCreates returns the number of successful create responses accepted by
+ // this client. It is safe to call concurrently with ListAll.
+ func (c *Client) TokenCreates() int {
+-	panic("TODO: implement TokenCreates")
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return c.creates
+ }
+diff --git a/incidents/implementation.go b/incidents/implementation.go
+new file mode 100644
+--- /dev/null
++++ b/incidents/implementation.go
+@@ -0,0 +1,230 @@
++package incidents
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"strconv"
++	"strings"
++)
++
++func newClient(cfg Config) (*Client, error) {
++	baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
++	if baseURL == "" {
++		return nil, errors.New("incidents: BaseURL is required")
++	}
++	parsed, err := url.Parse(baseURL)
++	if err != nil {
++		return nil, fmt.Errorf("incidents: parse BaseURL: %w", err)
++	}
++	if parsed.Scheme == "" || parsed.Host == "" {
++		return nil, errors.New("incidents: BaseURL must be an absolute URL")
++	}
++	if parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
++		return nil, errors.New("incidents: BaseURL must be an origin without a path, query, or fragment")
++	}
++	if cfg.Credentials.Username == "" || cfg.Credentials.Password == "" {
++		return nil, errors.New("incidents: username and password are required")
++	}
++	switch cfg.Credentials.DomainType {
++	case "", DomainLDAP, DomainLocal:
++	default:
++		return nil, fmt.Errorf("incidents: unsupported domain type %q", cfg.Credentials.DomainType)
++	}
++	if cfg.Credentials.DomainType == "" && cfg.Credentials.DomainValue != "" {
++		return nil, errors.New("incidents: DomainValue requires DomainType")
++	}
++
++	cfg.BaseURL = baseURL
++	httpClient := cfg.HTTPClient
++	if httpClient == nil {
++		httpClient = http.DefaultClient
++	}
++	return &Client{cfg: cfg, http: httpClient}, nil
++}
++
++func (c *Client) listAll(ctx context.Context, opts ListOptions) (*Result, error) {
++	if opts.PageSize < 0 {
++		return nil, errors.New("incidents: PageSize must not be negative")
++	}
++	result := &Result{}
++	cursor := ""
++	for {
++		query := url.Values{}
++		if opts.PageSize > 0 {
++			query.Set("size", strconv.Itoa(opts.PageSize))
++		}
++		if opts.StartEntityID != "" {
++			query.Set("start_entity_id", opts.StartEntityID)
++		}
++		if cursor != "" {
++			query.Set("cursor", cursor)
++		}
++
++		page, err := c.getPage(ctx, query)
++		if err != nil {
++			return nil, err
++		}
++		result.Pages++
++		result.TotalCount = page.TotalCount
++		result.Incidents = append(result.Incidents, page.Results...)
++		if page.Cursor == "" {
++			return result, nil
++		}
++		cursor = page.Cursor
++	}
++}
++
++type pageResponse struct {
++	Results    []Incident `json:"results"`
++	TotalCount int        `json:"total_count"`
++	Cursor     string     `json:"cursor"`
++}
++
++func (c *Client) getPage(ctx context.Context, query url.Values) (*pageResponse, error) {
++	token, err := c.currentToken(ctx)
++	if err != nil {
++		return nil, err
++	}
++	for {
++		endpoint := c.cfg.BaseURL + SpecBasePath + "/gnt/troubleshoot/incidents"
++		if encoded := query.Encode(); encoded != "" {
++			endpoint += "?" + encoded
++		}
++		request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
++		if err != nil {
++			return nil, fmt.Errorf("incidents: build listTroubleshootingIncidents request: %w", err)
++		}
++		request.Header.Set("Authorization", AuthHeaderPrefix+token)
++
++		response, err := c.http.Do(request)
++		if err != nil {
++			return nil, fmt.Errorf("incidents: listTroubleshootingIncidents: %w", err)
++		}
++		if response.StatusCode == http.StatusUnauthorized {
++			_, _ = io.Copy(io.Discard, response.Body)
++			_ = response.Body.Close()
++			token, err = c.replaceToken(ctx, token)
++			if err != nil {
++				return nil, err
++			}
++			continue
++		}
++		if response.StatusCode != http.StatusOK {
++			return nil, responseError("listTroubleshootingIncidents", response)
++		}
++
++		var page pageResponse
++		err = json.NewDecoder(response.Body).Decode(&page)
++		closeErr := response.Body.Close()
++		if err != nil {
++			return nil, fmt.Errorf("incidents: decode listTroubleshootingIncidents response: %w", err)
++		}
++		if closeErr != nil {
++			return nil, fmt.Errorf("incidents: close listTroubleshootingIncidents response: %w", closeErr)
++		}
++		return &page, nil
++	}
++}
++
++func (c *Client) currentToken(ctx context.Context) (string, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.token != "" {
++		return c.token, nil
++	}
++	return c.createTokenLocked(ctx)
++}
++
++func (c *Client) replaceToken(ctx context.Context, stale string) (string, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.token != "" && c.token != stale {
++		return c.token, nil
++	}
++	return c.createTokenLocked(ctx)
++}
++
++type domainRequest struct {
++	DomainType string `json:"domain_type"`
++	Value      string `json:"value,omitempty"`
++}
++
++type credentialRequest struct {
++	Username string         `json:"username"`
++	Password string         `json:"password"`
++	Domain   *domainRequest `json:"domain,omitempty"`
++}
++
++type tokenResponse struct {
++	Token  string `json:"token"`
++	Expiry int64  `json:"expiry"`
++}
++
++func (c *Client) createTokenLocked(ctx context.Context) (string, error) {
++	payload := credentialRequest{
++		Username: c.cfg.Credentials.Username,
++		Password: c.cfg.Credentials.Password,
++	}
++	if c.cfg.Credentials.DomainType != "" {
++		payload.Domain = &domainRequest{
++			DomainType: c.cfg.Credentials.DomainType,
++			Value:      c.cfg.Credentials.DomainValue,
++		}
++	}
++	body, err := json.Marshal(payload)
++	if err != nil {
++		return "", fmt.Errorf("incidents: encode UserCredential: %w", err)
++	}
++	request, err := http.NewRequestWithContext(
++		ctx,
++		http.MethodPost,
++		c.cfg.BaseURL+SpecBasePath+"/auth/token",
++		bytes.NewReader(body),
++	)
++	if err != nil {
++		return "", fmt.Errorf("incidents: build create request: %w", err)
++	}
++	request.Header.Set("Content-Type", "application/json")
++
++	response, err := c.http.Do(request)
++	if err != nil {
++		return "", fmt.Errorf("incidents: create: %w", err)
++	}
++	if response.StatusCode != http.StatusOK {
++		return "", responseError("create", response)
++	}
++	var token tokenResponse
++	err = json.NewDecoder(response.Body).Decode(&token)
++	closeErr := response.Body.Close()
++	if err != nil {
++		return "", fmt.Errorf("incidents: decode create response: %w", err)
++	}
++	if closeErr != nil {
++		return "", fmt.Errorf("incidents: close create response: %w", closeErr)
++	}
++	if token.Token == "" {
++		return "", errors.New("incidents: create response omitted token")
++	}
++	c.token = token.Token
++	c.creates++
++	return token.Token, nil
++}
++
++func responseError(operation string, response *http.Response) error {
++	body, readErr := io.ReadAll(response.Body)
++	_ = response.Body.Close()
++	if readErr != nil {
++		return fmt.Errorf("incidents: %s: HTTP %d (read response: %v)", operation, response.StatusCode, readErr)
++	}
++	detail := strings.TrimSpace(string(body))
++	if detail == "" {
++		return fmt.Errorf("incidents: %s: HTTP %d", operation, response.StatusCode)
++	}
++	return fmt.Errorf("incidents: %s: HTTP %d: %s", operation, response.StatusCode, detail)
++}

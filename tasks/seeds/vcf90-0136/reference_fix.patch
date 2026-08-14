@@ -1,0 +1,437 @@
+diff --git a/networks/client.go b/networks/client.go
+index c5f4f67..bd62a27 100644
+--- a/networks/client.go
++++ b/networks/client.go
+@@ -2,7 +2,12 @@ package networks
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"fmt"
++	"io"
+ 	"net/http"
++	"net/url"
++	"strings"
+ 	"time"
+ )
+@@ -74,6 +79,88 @@ func NewClient(baseURL, token string, httpClient *http.Client, pollInterval time
+ }
+ 
+ // UpdateCertificateAndWait submits an update and waits for its terminal status.
+-func (c *Client) UpdateCertificateAndWait(ctx context.Context, certificateID string, request CertificateUpdateRequest) (CertificateUpdateStatus, error) {
+-	return CertificateUpdateStatus{}, fmt.Errorf("not implemented")
++func (c *Client) UpdateCertificateAndWait(ctx context.Context, certificateID string, update CertificateUpdateRequest) (CertificateUpdateStatus, error) {
++	payload, err := json.Marshal(update)
++	if err != nil {
++		return CertificateUpdateStatus{}, fmt.Errorf("encode certificate update: %w", err)
++	}
++
++	var status CertificateUpdateStatus
++	path := "/api/ni/settings/certificates/" + url.PathEscape(certificateID)
++	if err := c.doJSON(ctx, http.MethodPut, path, payload, http.StatusAccepted, &status); err != nil {
++		return CertificateUpdateStatus{}, fmt.Errorf("submit certificate update: %w", err)
++	}
++	updateID := status.ID
++	if updateID == "" {
++		return status, fmt.Errorf("submit certificate update: response did not contain an update id")
++	}
++
++	pollPath := "/api/ni/settings/certificates/status/" + url.PathEscape(updateID)
++	for {
++		if err := waitForPoll(ctx, c.pollInterval); err != nil {
++			return status, err
++		}
++		if err := c.doJSON(ctx, http.MethodGet, pollPath, nil, http.StatusOK, &status); err != nil {
++			return status, fmt.Errorf("poll certificate update %s: %w", updateID, err)
++		}
++		switch status.Status {
++		case StatusSuccess:
++			return status, nil
++		case StatusFailed:
++			return status, &OperationError{UpdateID: updateID, Message: status.ErrorMessage}
++		case StatusSubmitted, StatusInProgress:
++			// Poll again below.
++		default:
++			return status, fmt.Errorf("certificate update %s returned unknown status %q", updateID, status.Status)
++		}
++	}
++}
++
++func waitForPoll(ctx context.Context, interval time.Duration) error {
++	if interval <= 0 {
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		default:
++			return nil
++		}
++	}
++	timer := time.NewTimer(interval)
++	defer timer.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-timer.C:
++		return nil
++	}
++}
++
++func (c *Client) doJSON(ctx context.Context, method, path string, body []byte, wantStatus int, target any) error {
++	endpoint := strings.TrimRight(c.baseURL, "/") + path
++	request, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(body))
++	if err != nil {
++		return err
++	}
++	request.Header.Set("Authorization", "NetworkInsight "+c.token)
++	request.Header.Set("Accept", "application/json")
++	if body != nil {
++		request.Header.Set("Content-Type", "application/json")
++	}
++
++	response, err := c.httpClient.Do(request)
++	if err != nil {
++		return err
++	}
++	defer response.Body.Close()
++	responseBody, err := io.ReadAll(response.Body)
++	if err != nil {
++		return err
++	}
++	if response.StatusCode != wantStatus {
++		return fmt.Errorf("unexpected HTTP status %d: %s", response.StatusCode, strings.TrimSpace(string(responseBody)))
++	}
++	if err := json.Unmarshal(responseBody, target); err != nil {
++		return fmt.Errorf("decode response: %w", err)
++	}
++	return nil
+ }
+diff --git a/mockvcf/server.go b/mockvcf/server.go
+index 25c342c..eec3f59 100644
+--- a/mockvcf/server.go
++++ b/mockvcf/server.go
+@@ -2,8 +2,11 @@
+ package mockvcf
+ 
+ import (
++	"encoding/json"
++	"io"
+ 	"net/http"
+ 	"net/http/httptest"
++	"strings"
+ 	"sync"
+ 
+ 	"vcfnetworks/networks"
+@@ -26,6 +29,8 @@ type Request struct {
+ // Server is a loopback HTTP server with a concurrency-safe request log.
+ type Server struct {
+ 	server *httptest.Server
++	script Script
++	poll   int
+ 	mu     sync.RWMutex
+ 	log    []Request
+ }
+@@ -33,6 +38,8 @@ type Server struct {
+ // New starts the loopback server.
+ func New(script Script) *Server {
+-	s := &Server{}
+-	s.server = httptest.NewServer(http.NotFoundHandler())
++	cloned := Script{Initial: script.Initial, Polls: append([]networks.CertificateUpdateStatus(nil), script.Polls...)}
++	s := &Server{script: cloned}
++	// The two routes below correspond exactly to the operations in docs/contract.json.
++	s.server = httptest.NewServer(http.HandlerFunc(s.serveHTTP))
+ 	return s
+ }
+@@ -51,6 +58,67 @@ func (s *Server) Requests() []Request {
+ 	s.mu.RLock()
+ 	defer s.mu.RUnlock()
+ 	requests := make([]Request, len(s.log))
+-	copy(requests, s.log)
++	for index, request := range s.log {
++		requests[index] = Request{
++			Method:     request.Method,
++			RequestURI: request.RequestURI,
++			Header:     request.Header.Clone(),
++			Body:       append([]byte(nil), request.Body...),
++		}
++	}
+ 	return requests
+ }
++
++func (s *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
++	body, err := io.ReadAll(request.Body)
++	if err != nil {
++		http.Error(writer, "read request", http.StatusBadRequest)
++		return
++	}
++	s.mu.Lock()
++	s.log = append(s.log, Request{
++		Method:     request.Method,
++		RequestURI: request.URL.RequestURI(),
++		Header:     request.Header.Clone(),
++		Body:       append([]byte(nil), body...),
++	})
++	s.mu.Unlock()
++
++	escapedPath := request.URL.EscapedPath()
++	if request.URL.RawQuery == "" && request.Method == http.MethodPut && matchesOneID(escapedPath, "/api/ni/settings/certificates/") {
++		writeJSON(writer, http.StatusAccepted, s.script.Initial)
++		return
++	}
++	if request.URL.RawQuery == "" && request.Method == http.MethodGet && matchesOneID(escapedPath, "/api/ni/settings/certificates/status/") {
++		s.servePoll(writer)
++		return
++	}
++	http.NotFound(writer, request)
++}
++
++func matchesOneID(path, prefix string) bool {
++	if !strings.HasPrefix(path, prefix) {
++		return false
++	}
++	id := strings.TrimPrefix(path, prefix)
++	return id != "" && !strings.Contains(id, "/")
++}
++
++func (s *Server) servePoll(writer http.ResponseWriter) {
++	s.mu.Lock()
++	if s.poll >= len(s.script.Polls) {
++		s.mu.Unlock()
++		http.Error(writer, "poll script exhausted", http.StatusInternalServerError)
++		return
++	}
++	status := s.script.Polls[s.poll]
++	s.poll++
++	s.mu.Unlock()
++	writeJSON(writer, http.StatusOK, status)
++}
++
++func writeJSON(writer http.ResponseWriter, status int, value any) {
++	writer.Header().Set("Content-Type", "application/json")
++	writer.WriteHeader(status)
++	_ = json.NewEncoder(writer).Encode(value)
++}
+diff --git a/docs/contract.json b/docs/contract.json
+new file mode 100644
+index 0000000..3977c9b
+--- /dev/null
++++ b/docs/contract.json
+@@ -0,0 +1,128 @@
++{
++  "source": {
++    "repository": "https://github.com/vmware/vcf-api-specs",
++    "tag": "9.0.0.0",
++    "commit_sha": "85151f6b1bb58f13b6ac0304bfec53904bea085f",
++    "spec_path": "specifications/vcf-operations/vcf-operations-for-networks-openapi.yaml",
++    "license": "Apache-2.0"
++  },
++  "server_base_path": "/api/ni",
++  "authentication": {
++    "type": "apiKey",
++    "in": "header",
++    "name": "Authorization",
++    "format": "NetworkInsight {token}"
++  },
++  "operations": [
++    {
++      "operation_id": "updateCertificate",
++      "method": "PUT",
++      "path": "/settings/certificates/{id}",
++      "path_parameters": [
++        {
++          "name": "id",
++          "in": "path",
++          "required": true,
++          "type": "string"
++        }
++      ],
++      "request": {
++        "required": true,
++        "content_type": "application/json",
++        "schema": "CertificateUpdateRequest"
++      },
++      "success_response": {
++        "status": 202,
++        "content_type": "application/json",
++        "schema": "CertificateUpdateStatus"
++      }
++    },
++    {
++      "operation_id": "fetchCertificateUpdateStatusForUpdateId",
++      "method": "GET",
++      "path": "/settings/certificates/status/{id}",
++      "path_parameters": [
++        {
++          "name": "id",
++          "in": "path",
++          "required": true,
++          "type": "string"
++        }
++      ],
++      "success_response": {
++        "status": 200,
++        "content_type": "application/json",
++        "schema": "CertificateUpdateStatus"
++      }
++    }
++  ],
++  "schemas": {
++    "CertificateUpdateRequest": {
++      "type": "object",
++      "required": [],
++      "properties": {
++        "certificate": {
++          "type": "string"
++        },
++        "private_key": {
++          "type": "string"
++        },
++        "chain": {
++          "type": "string",
++          "default": ""
++        }
++      }
++    },
++    "CertificateUpdateStatus": {
++      "type": "object",
++      "required": [],
++      "properties": {
++        "id": {
++          "type": "string"
++        },
++        "name": {
++          "type": "string"
++        },
++        "status": {
++          "type": "string",
++          "enum": [
++            "SUBMITTED",
++            "IN_PROGRESS",
++            "SUCCESS",
++            "FAILED"
++          ]
++        },
++        "error_message": {
++          "type": "string"
++        },
++        "failed_nodes": {
++          "type": "array",
++          "items": "Node"
++        },
++        "updated_nodes": {
++          "type": "array",
++          "items": "Node"
++        },
++        "last_modified_by_user": {
++          "type": "string"
++        },
++        "last_modified_time": {
++          "type": "integer",
++          "format": "int64"
++        }
++      }
++    },
++    "Node": {
++      "type": "object",
++      "required": [],
++      "properties": {
++        "id": {
++          "type": "string"
++        },
++        "name": {
++          "type": "string"
++        }
++      }
++    }
++  }
++}
+diff --git a/docs/official_sources.json b/docs/official_sources.json
+new file mode 100644
+index 0000000..1af7122
+--- /dev/null
++++ b/docs/official_sources.json
+@@ -0,0 +1,19 @@
++{
++  "repository": "https://github.com/vmware/vcf-api-specs",
++  "tag": "9.0.0.0",
++  "commit_sha": "85151f6b1bb58f13b6ac0304bfec53904bea085f",
++  "spec_path": "specifications/vcf-operations/vcf-operations-for-networks-openapi.yaml",
++  "license": "Apache-2.0",
++  "operation_ids": [
++    {
++      "operation_id": "updateCertificate",
++      "method": "PUT",
++      "path": "/settings/certificates/{id}"
++    },
++    {
++      "operation_id": "fetchCertificateUpdateStatusForUpdateId",
++      "method": "GET",
++      "path": "/settings/certificates/status/{id}"
++    }
++  ]
++}
+diff --git a/networks/client_test.go b/networks/client_test.go
+new file mode 100644
+index 0000000..df5a4df
+--- /dev/null
++++ b/networks/client_test.go
+@@ -0,0 +1,59 @@
++package networks_test
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	"vcfnetworks/mockvcf"
++	"vcfnetworks/networks"
++)
++
++func TestUpdateCertificateAndWaitTerminalOutcomes(t *testing.T) {
++	tests := []struct {
++		name      string
++		terminal  networks.CertificateUpdateStatus
++		wantError bool
++	}{
++		{
++			name:     "success",
++			terminal: networks.CertificateUpdateStatus{ID: "job-7", Status: networks.StatusSuccess},
++		},
++		{
++			name:      "failure",
++			terminal:  networks.CertificateUpdateStatus{ID: "job-7", Status: networks.StatusFailed, ErrorMessage: "node rejected certificate"},
++			wantError: true,
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			server := mockvcf.New(mockvcf.Script{
++				Initial: networks.CertificateUpdateStatus{ID: "job-7", Status: networks.StatusSubmitted},
++				Polls:   []networks.CertificateUpdateStatus{test.terminal},
++			})
++			defer server.Close()
++
++			client := networks.NewClient(server.URL(), "token", server.Client(), 0)
++			status, err := client.UpdateCertificateAndWait(context.Background(), "proxy_register.crt", networks.CertificateUpdateRequest{
++				Certificate: "certificate",
++				PrivateKey:  "private-key",
++			})
++			if status.Status != test.terminal.Status {
++				t.Errorf("status = %q, want %q", status.Status, test.terminal.Status)
++			}
++			if !test.wantError && err != nil {
++				t.Fatalf("unexpected error: %v", err)
++			}
++			if test.wantError {
++				var operationError *networks.OperationError
++				if !errors.As(err, &operationError) {
++					t.Fatalf("error = %v, want OperationError", err)
++				}
++			}
++			if got := len(server.Requests()); got != 2 {
++				t.Errorf("request count = %d, want submit plus one poll", got)
++			}
++		})
++	}
++}
