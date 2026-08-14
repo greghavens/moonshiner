@@ -168,6 +168,9 @@ class ASeedIsNeverDiscarded(unittest.TestCase):
                              "skills" / ".system" / "openai-docs")
             runtime_skill.mkdir(parents=True)
             (runtime_skill / "SKILL.md").write_text("runtime state\n")
+            volatile = candidate / ".sandbox-home" / "tmp" / "vanished-module"
+            volatile.parent.mkdir(parents=True, exist_ok=True)
+            volatile.symlink_to(candidate / "module-that-no-longer-exists")
             for name in (".git", ".codex", ".agents", ".toolchain",
                          "__pycache__"):
                 (candidate / name).mkdir()
@@ -190,6 +193,13 @@ class ASeedIsNeverDiscarded(unittest.TestCase):
                 if not path.is_relative_to(destination / "files")])
         finally:
             common.remove_workspace(root)
+
+    def test_fresh_author_workspace_uses_the_durable_promotion_boundary(self):
+        source = (ROOT / "src" / "seed_pipeline.py").read_text()
+        fresh_author = source[source.index("authored = author.run_trace("):]
+        fresh_author = fresh_author[:fresh_author.index("_normalise_task(candidate)")]
+        self.assertIn("_promote_candidate(workspace, candidate)", fresh_author)
+        self.assertNotIn("shutil.copytree(workspace", fresh_author)
 
 
 class InfrastructureFailuresReachTheJudge(unittest.TestCase):

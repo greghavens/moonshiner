@@ -237,8 +237,7 @@ def main(argv: list[str] | None = None) -> int:
                     or authored.return_code not in (0, None)):
                 raise RuntimeError(authored.error
                                    or "seed author failed to complete")
-            shutil.copytree(workspace, candidate,
-                            ignore=shutil.ignore_patterns(".git"))
+            _promote_candidate(workspace, candidate)
         _normalise_task(candidate)
         seed = _load_candidate(candidate, args.id)
         environment_ok, environment_detail = preflight_seed_environment(seed)
