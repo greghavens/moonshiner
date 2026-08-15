@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3824 seeds grouped into 429 categories. This file is generated; edit each seed's source, then regenerate it.
+3825 seeds grouped into 429 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -17,7 +17,7 @@
 | **Refactoring & performance** | 29 | Restructure safely and improve measured performance without behavior drift. |
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
-| **Uncategorized** | 217 | Catalog program awaiting description. |
+| **Uncategorized** | 218 | Catalog program awaiting description. |
 | **VMware Cloud Foundation 9.1** | 317 | Catalog program awaiting description. |
 | **VMware Cloud Foundation 9.0** | 124 | Catalog program awaiting description. |
 | **instruction-following** | 11 | Catalog program awaiting description. |
@@ -2976,6 +2976,7 @@
 - **instruction-following-r3-0056** (`python`) `#multi-turn` `#correction-handling` `#constraint-retention` — We have been working through a vendor-renewal outreach request. Here are my messages in order. Initial request: Please prepare renewal outreach for the vendors due for review in the supplied CSV fi…
 - **instruction-following-r3-0057** (`python`) `#multi-turn` `#correction-handling` `#constraint-retention` — Please finish the health-information research task from our conversation. Here is my message history, in order from oldest to newest. Initial request: My 74-year-old father has had trouble falling…
 - **instruction-following-r3-0058** (`python`) `#multi-turn` `#correction-handling` `#constraint-retention` — I need the finished education plan from this planning thread. Treat my messages as ordered turns: a later message changes only what it explicitly conflicts with, and everything else continues to ap…
+- **instruction-following-r3-0059** (`markdown`) `#multi-turn` `#correction-handling` `#constraint-retention` — I'm moving near Lakeview Medical Center and want you to research every rental in the source materials in this workspace. My starting hard requirements are exactly two bedrooms, cats allowed, and av…
 - **instruction-following-r3-0081** (`English`) `#multi-turn` `#correction-handling` `#constraint-retention` — I’m planning a Harborport trip for two adults from 2026-09-18 through 2026-09-21. Use only `travel_options.csv` and `trip_costs.csv` in this workspace as the source of venue, price, and transit fac…
 - **instruction-following-r3-0082** (`unknown`) `#multi-turn` `#correction-handling` `#constraint-retention` — We are preparing a policy recommendation for the Riverton City Council Transportation Committee about late-shift mobility. Read all three documents under `evidence/` and use only that packet; do no…
 - **instruction-following-r3-0083** (`unknown`) `#multi-turn` `#correction-handling` `#constraint-retention` — Please finish my countertop air-fryer comparison. Read the four messages in `conversation/` in filename order, treating them as successive turns in our conversation, and use `product_catalog.csv` a…
