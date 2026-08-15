@@ -1,0 +1,588 @@
+diff --git a/src/VcfBrownfieldPlanner/VcfBrownfieldPlanner.psm1 b/src/VcfBrownfieldPlanner/VcfBrownfieldPlanner.psm1
+new file mode 100644
+index 0000000..54dda75
+--- /dev/null
++++ b/src/VcfBrownfieldPlanner/VcfBrownfieldPlanner.psm1
+@@ -0,0 +1,241 @@
++Set-StrictMode -Version Latest
++
++function Read-VcfPlannerJson {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [string] $LiteralPath
++    )
++
++    $resolved = (Resolve-Path -LiteralPath $LiteralPath -ErrorAction Stop).Path
++    Get-Content -Raw -LiteralPath $resolved | ConvertFrom-Json -Depth 100
++}
++
++function Get-VcfSdkEstateInventory {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [string] $Server,
++
++        [Parameter(Mandatory)]
++        [pscredential] $Credential,
++
++        [switch] $IgnoreInvalidCertificate
++    )
++
++    $connectParameters = @{
++        Server = $Server
++        Credential = $Credential
++        NotDefault = $true
++        ErrorAction = 'Stop'
++    }
++    if ($IgnoreInvalidCertificate) {
++        $connectParameters.IgnoreInvalidCertificate = $true
++    }
++
++    $connection = VMware.Sdk.Vcf.SddcManager\Connect-VcfSddcManagerServer @connectParameters
++    try {
++        $domains = @(VMware.Sdk.Vcf.SddcManager\Invoke-VcfGetDomains -Server $connection -ErrorAction Stop)
++        $clusters = @(VMware.Sdk.Vcf.SddcManager\Invoke-VcfGetClusters -Server $connection -ErrorAction Stop)
++        $hosts = @(VMware.Sdk.Vcf.SddcManager\Invoke-VcfGetHosts -Server $connection -ErrorAction Stop)
++
++        [pscustomobject][ordered]@{
++            server = $Server
++            collectedAt = [DateTimeOffset]::UtcNow.ToString('o')
++            domains = $domains
++            clusters = $clusters
++            hosts = $hosts
++        }
++    }
++    finally {
++        VMware.Sdk.Vcf.SddcManager\Disconnect-VcfSddcManagerServer -Server $connection -Force -ErrorAction SilentlyContinue | Out-Null
++    }
++}
++
++function New-VcfMigrationPlan {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [string] $InventoryPath,
++
++        [Parameter(Mandatory)]
++        [string] $CompatibilityPath
++    )
++
++    $resolvedInventoryPath = (Resolve-Path -LiteralPath $InventoryPath -ErrorAction Stop).Path
++    $inventory = Read-VcfPlannerJson -LiteralPath $resolvedInventoryPath
++    $compatibility = Read-VcfPlannerJson -LiteralPath $CompatibilityPath
++
++    if ($inventory.vcfVersion -cne $compatibility.sourceVcfVersion) {
++        throw "Inventory VCF version '$($inventory.vcfVersion)' does not match snapshot source '$($compatibility.sourceVcfVersion)'."
++    }
++    if ($inventory.targetVcfVersion -cne $compatibility.targetVcfVersion) {
++        throw "Inventory target '$($inventory.targetVcfVersion)' does not match snapshot target '$($compatibility.targetVcfVersion)'."
++    }
++    if ([bool]$compatibility.directInPlaceAllowed) {
++        throw 'This planner requires a snapshot that blocks direct in-place transition.'
++    }
++
++    $managementIds = @($inventory.components | Where-Object domain -CEQ 'management-domain' | ForEach-Object id)
++    $workloadIds = @($inventory.components | Where-Object domain -CNE 'management-domain' | ForEach-Object id)
++    $allIds = @($inventory.components | ForEach-Object id)
++
++    $gates = @(
++        [pscustomobject][ordered]@{
++            id = 'compat-back-in-time'
++            kind = 'COMPATIBILITY'
++            condition = 'The direct transition remains classified BACK_IN_TIME and all target components are deployed as new instances.'
++            evidence = 'Pinned compatibility snapshot plus successful target-installer validation.'
++        },
++        [pscustomobject][ordered]@{
++            id = 'target-management-healthy'
++            kind = 'TARGET_HEALTH'
++            condition = 'The parallel VCF 9.1 management domain reports healthy before creating the VI workload domain.'
++            evidence = 'VCF Installer completion record and management-domain health output.'
++        },
++        [pscustomobject][ordered]@{
++            id = 'target-workload-domain-healthy'
++            kind = 'TARGET_HEALTH'
++            condition = 'The target VI workload domain and its vCenter, NSX, and hosts report healthy before workload movement.'
++            evidence = 'Workload-domain inventory and health-check output.'
++        },
++        [pscustomobject][ordered]@{
++            id = 'workloads-validated'
++            kind = 'MIGRATION_VALIDATION'
++            condition = 'Migrated workloads pass application, storage, and network validation while the source remains available.'
++            evidence = 'Recorded workload validation results and migration reconciliation.'
++        },
++        [pscustomobject][ordered]@{
++            id = 'cutover-validated'
++            kind = 'CUTOVER_VALIDATION'
++            condition = 'Production service endpoints resolve to the target and post-cutover checks pass before source retirement.'
++            evidence = 'Post-cutover service checks and target inventory reconciliation.'
++        }
++    )
++
++    $stages = @(
++        [pscustomobject][ordered]@{
++            sequence = 10
++            id = 'deploy-target-management'
++            action = 'DEPLOY_TARGET_MANAGEMENT'
++            requires = @('compat-back-in-time')
++            components = $managementIds
++            completionEvidence = 'Parallel VCF 9.1 management domain installation completes and exposes health evidence.'
++        },
++        [pscustomobject][ordered]@{
++            sequence = 20
++            id = 'deploy-target-workload-domain'
++            action = 'DEPLOY_TARGET_WORKLOAD_DOMAIN'
++            requires = @('target-management-healthy')
++            components = $workloadIds
++            completionEvidence = 'Parallel VI workload domain installation completes with target vCenter, NSX, and hosts.'
++        },
++        [pscustomobject][ordered]@{
++            sequence = 30
++            id = 'migrate-workloads'
++            action = 'MIGRATE_WORKLOADS'
++            requires = @('target-workload-domain-healthy')
++            components = $workloadIds
++            completionEvidence = 'All workload waves are reconciled on the target while source rollback remains available.'
++        },
++        [pscustomobject][ordered]@{
++            sequence = 40
++            id = 'cutover-services'
++            action = 'CUTOVER_SERVICES'
++            requires = @('workloads-validated')
++            components = $allIds
++            completionEvidence = 'Service endpoints are cut over and validation records identify the target estate.'
++        },
++        [pscustomobject][ordered]@{
++            sequence = 50
++            id = 'decommission-source'
++            action = 'DECOMMISSION_SOURCE'
++            requires = @('cutover-validated')
++            components = $allIds
++            completionEvidence = 'Every source component is retired only after target cutover validation is complete.'
++        }
++    )
++
++    $components = foreach ($source in $inventory.components) {
++        $targetVersion = $compatibility.targetBom.($source.type)
++        if ([string]::IsNullOrWhiteSpace([string]$targetVersion)) {
++            throw "No target BOM version exists for component type '$($source.type)'."
++        }
++
++        $targetStage = if ($source.domain -ceq 'management-domain') {
++            'deploy-target-management'
++        }
++        else {
++            'deploy-target-workload-domain'
++        }
++
++        $componentGates = [System.Collections.Generic.List[string]]::new()
++        $componentGates.Add('compat-back-in-time')
++        if ($targetStage -ceq 'deploy-target-workload-domain') {
++            $componentGates.Add('target-management-healthy')
++        }
++        $componentGates.Add('cutover-validated')
++
++        [pscustomobject][ordered]@{
++            id = $source.id
++            type = $source.type
++            name = $source.name
++            domain = $source.domain
++            currentVersion = $source.version
++            targetVersion = $targetVersion
++            disposition = 'REPLACE_AND_RETIRE_SOURCE'
++            targetStage = $targetStage
++            decommissionStage = 'decommission-source'
++            gatedBy = @($componentGates)
++        }
++    }
++
++    [pscustomobject][ordered]@{
++        schemaVersion = '1.0.0'
++        planId = "$($inventory.estateId)-to-vcf-9-1"
++        estateId = $inventory.estateId
++        sourceVcfVersion = $inventory.vcfVersion
++        targetVcfVersion = $compatibility.targetVcfVersion
++        inventoryDigest = (Get-FileHash -Algorithm SHA256 -LiteralPath $resolvedInventoryPath).Hash.ToLowerInvariant()
++        compatibilitySnapshot = $compatibility.snapshotVersion
++        strategy = $compatibility.requiredStrategy
++        directInPlaceUpgrade = $false
++        architecture = [pscustomobject][ordered]@{
++            sourceDisposition = $compatibility.architecture.sourceDisposition
++            targetTopology = $compatibility.architecture.targetTopology
++            migrationBoundary = 'Workloads cross from the retained VCF 5.2.2 source into newly installed VCF 9.1 domains; installed source components are never downgraded.'
++            rollbackBoundary = 'Rollback remains at the source estate until service cutover validation succeeds; source retirement is irreversible.'
++        }
++        gates = $gates
++        stages = $stages
++        components = @($components)
++    }
++}
++
++function Export-VcfMigrationPlan {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [string] $InventoryPath,
++
++        [Parameter(Mandatory)]
++        [string] $CompatibilityPath,
++
++        [Parameter(Mandatory)]
++        [string] $Path
++    )
++
++    $plan = New-VcfMigrationPlan -InventoryPath $InventoryPath -CompatibilityPath $CompatibilityPath
++    $parent = Split-Path -Parent $Path
++    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
++        [void](New-Item -ItemType Directory -Path $parent -Force)
++    }
++    $plan | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $Path -Encoding utf8NoBOM
++    (Resolve-Path -LiteralPath $Path).Path
++}
++
++Export-ModuleMember -Function @(
++    'Get-VcfSdkEstateInventory',
++    'New-VcfMigrationPlan',
++    'Export-VcfMigrationPlan'
++)
+diff --git a/output/migration-plan.json b/output/migration-plan.json
+new file mode 100644
+index 0000000..71184b5
+--- /dev/null
++++ b/output/migration-plan.json
+@@ -0,0 +1,316 @@
++{
++  "schemaVersion": "1.0.0",
++  "planId": "rainpole-vcf-prod-to-vcf-9-1",
++  "estateId": "rainpole-vcf-prod",
++  "sourceVcfVersion": "5.2.2.0",
++  "targetVcfVersion": "9.1.0.0",
++  "inventoryDigest": "864bbcbbbd43519d3575b7c753c7d20416e78d169975b69d7b308b079ab7073d",
++  "compatibilitySnapshot": "2026-08-14",
++  "strategy": "SIDE_BY_SIDE_MIGRATION",
++  "directInPlaceUpgrade": false,
++  "architecture": {
++    "sourceDisposition": "RETAIN_UNTIL_CUTOVER",
++    "targetTopology": "PARALLEL_MANAGEMENT_AND_VI_DOMAIN",
++    "migrationBoundary": "Workloads cross from the retained VCF 5.2.2 source into newly installed VCF 9.1 domains; installed source components are never downgraded.",
++    "rollbackBoundary": "Rollback remains at the source estate until service cutover validation succeeds; source retirement is irreversible."
++  },
++  "gates": [
++    {
++      "id": "compat-back-in-time",
++      "kind": "COMPATIBILITY",
++      "condition": "The direct transition remains classified BACK_IN_TIME and all target components are deployed as new instances.",
++      "evidence": "Pinned compatibility snapshot plus successful target-installer validation."
++    },
++    {
++      "id": "target-management-healthy",
++      "kind": "TARGET_HEALTH",
++      "condition": "The parallel VCF 9.1 management domain reports healthy before creating the VI workload domain.",
++      "evidence": "VCF Installer completion record and management-domain health output."
++    },
++    {
++      "id": "target-workload-domain-healthy",
++      "kind": "TARGET_HEALTH",
++      "condition": "The target VI workload domain and its vCenter, NSX, and hosts report healthy before workload movement.",
++      "evidence": "Workload-domain inventory and health-check output."
++    },
++    {
++      "id": "workloads-validated",
++      "kind": "MIGRATION_VALIDATION",
++      "condition": "Migrated workloads pass application, storage, and network validation while the source remains available.",
++      "evidence": "Recorded workload validation results and migration reconciliation."
++    },
++    {
++      "id": "cutover-validated",
++      "kind": "CUTOVER_VALIDATION",
++      "condition": "Production service endpoints resolve to the target and post-cutover checks pass before source retirement.",
++      "evidence": "Post-cutover service checks and target inventory reconciliation."
++    }
++  ],
++  "stages": [
++    {
++      "sequence": 10,
++      "id": "deploy-target-management",
++      "action": "DEPLOY_TARGET_MANAGEMENT",
++      "requires": [
++        "compat-back-in-time"
++      ],
++      "components": [
++        "sddc-m01",
++        "vc-m01",
++        "nsx-m01",
++        "esx-m01",
++        "esx-m02",
++        "esx-m03"
++      ],
++      "completionEvidence": "Parallel VCF 9.1 management domain installation completes and exposes health evidence."
++    },
++    {
++      "sequence": 20,
++      "id": "deploy-target-workload-domain",
++      "action": "DEPLOY_TARGET_WORKLOAD_DOMAIN",
++      "requires": [
++        "target-management-healthy"
++      ],
++      "components": [
++        "vc-w01",
++        "nsx-w01",
++        "esx-w01",
++        "esx-w02",
++        "esx-w03"
++      ],
++      "completionEvidence": "Parallel VI workload domain installation completes with target vCenter, NSX, and hosts."
++    },
++    {
++      "sequence": 30,
++      "id": "migrate-workloads",
++      "action": "MIGRATE_WORKLOADS",
++      "requires": [
++        "target-workload-domain-healthy"
++      ],
++      "components": [
++        "vc-w01",
++        "nsx-w01",
++        "esx-w01",
++        "esx-w02",
++        "esx-w03"
++      ],
++      "completionEvidence": "All workload waves are reconciled on the target while source rollback remains available."
++    },
++    {
++      "sequence": 40,
++      "id": "cutover-services",
++      "action": "CUTOVER_SERVICES",
++      "requires": [
++        "workloads-validated"
++      ],
++      "components": [
++        "sddc-m01",
++        "vc-m01",
++        "nsx-m01",
++        "esx-m01",
++        "esx-m02",
++        "esx-m03",
++        "vc-w01",
++        "nsx-w01",
++        "esx-w01",
++        "esx-w02",
++        "esx-w03"
++      ],
++      "completionEvidence": "Service endpoints are cut over and validation records identify the target estate."
++    },
++    {
++      "sequence": 50,
++      "id": "decommission-source",
++      "action": "DECOMMISSION_SOURCE",
++      "requires": [
++        "cutover-validated"
++      ],
++      "components": [
++        "sddc-m01",
++        "vc-m01",
++        "nsx-m01",
++        "esx-m01",
++        "esx-m02",
++        "esx-m03",
++        "vc-w01",
++        "nsx-w01",
++        "esx-w01",
++        "esx-w02",
++        "esx-w03"
++      ],
++      "completionEvidence": "Every source component is retired only after target cutover validation is complete."
++    }
++  ],
++  "components": [
++    {
++      "id": "sddc-m01",
++      "type": "SDDC_MANAGER",
++      "name": "sddc-m01.rainpole.example",
++      "domain": "management-domain",
++      "currentVersion": "5.2.2.0",
++      "targetVersion": "9.1.0.0",
++      "disposition": "REPLACE_AND_RETIRE_SOURCE",
++      "targetStage": "deploy-target-management",
++      "decommissionStage": "decommission-source",
++      "gatedBy": [
++        "compat-back-in-time",
++        "cutover-validated"
++      ]
++    },
++    {
++      "id": "vc-m01",
++      "type": "VCENTER",
++      "name": "vc-m01.rainpole.example",
++      "domain": "management-domain",
++      "currentVersion": "8.0.3.00900-25413364",
++      "targetVersion": "9.1.0.0.25370922",
++      "disposition": "REPLACE_AND_RETIRE_SOURCE",
++      "targetStage": "deploy-target-management",
++      "decommissionStage": "decommission-source",
++      "gatedBy": [
++        "compat-back-in-time",
++        "cutover-validated"
++      ]
++    },
++    {
++      "id": "nsx-m01",
++      "type": "NSX_T_MANAGER",
++      "name": "nsx-m01.rainpole.example",
++      "domain": "management-domain",
++      "currentVersion": "4.2.4.0.0.25410638",
++      "targetVersion": "9.1.0.0.25318225",
++      "disposition": "REPLACE_AND_RETIRE_SOURCE",
++      "targetStage": "deploy-target-management",
++      "decommissionStage": "decommission-source",
++      "gatedBy": [
++        "compat-back-in-time",
++        "cutover-validated"
++      ]
++    },
++    {
++      "id": "esx-m01",
++      "type": "ESX_HOST",
++      "name": "esx-m01.rainpole.example",
++      "domain": "management-domain",
++      "currentVersion": "8.0.3-25429389",
++      "targetVersion": "9.1.0.0.25370933",
++      "disposition": "REPLACE_AND_RETIRE_SOURCE",
++      "targetStage": "deploy-target-management",
++      "decommissionStage": "decommission-source",
++      "gatedBy": [
++        "compat-back-in-time",
++        "cutover-validated"
++      ]
++    },
++    {
++      "id": "esx-m02",
++      "type": "ESX_HOST",
++      "name": "esx-m02.rainpole.example",
++      "domain": "management-domain",
++      "currentVersion": "8.0.3-25429389",
++      "targetVersion": "9.1.0.0.25370933",
++      "disposition": "REPLACE_AND_RETIRE_SOURCE",
++      "targetStage": "deploy-target-management",
++      "decommissionStage": "decommission-source",
++      "gatedBy": [
++        "compat-back-in-time",
++        "cutover-validated"
++      ]
++    },
++    {
++      "id": "esx-m03",
++      "type": "ESX_HOST",
++      "name": "esx-m03.rainpole.example",
++      "domain": "management-domain",
++      "currentVersion": "8.0.3-25429389",
++      "targetVersion": "9.1.0.0.25370933",
++      "disposition": "REPLACE_AND_RETIRE_SOURCE",
++      "targetStage": "deploy-target-management",
++      "decommissionStage": "decommission-source",
++      "gatedBy": [
++        "compat-back-in-time",
++        "cutover-validated"
++      ]
++    },
++    {
++      "id": "vc-w01",
++      "type": "VCENTER",
++      "name": "vc-w01.rainpole.example",
++      "domain": "vi-domain-01",
++      "currentVersion": "8.0.3.00900-25413364",
++      "targetVersion": "9.1.0.0.25370922",
++      "disposition": "REPLACE_AND_RETIRE_SOURCE",
++      "targetStage": "deploy-target-workload-domain",
++      "decommissionStage": "decommission-source",
++      "gatedBy": [
++        "compat-back-in-time",
++        "target-management-healthy",
++        "cutover-validated"
++      ]
++    },
++    {
++      "id": "nsx-w01",
++      "type": "NSX_T_MANAGER",
++      "name": "nsx-w01.rainpole.example",
++      "domain": "vi-domain-01",
++      "currentVersion": "4.2.4.0.0.25410638",
++      "targetVersion": "9.1.0.0.25318225",
++      "disposition": "REPLACE_AND_RETIRE_SOURCE",
++      "targetStage": "deploy-target-workload-domain",
++      "decommissionStage": "decommission-source",
++      "gatedBy": [
++        "compat-back-in-time",
++        "target-management-healthy",
++        "cutover-validated"
++      ]
++    },
++    {
++      "id": "esx-w01",
++      "type": "ESX_HOST",
++      "name": "esx-w01.rainpole.example",
++      "domain": "vi-domain-01",
++      "currentVersion": "8.0.3-25429389",
++      "targetVersion": "9.1.0.0.25370933",
++      "disposition": "REPLACE_AND_RETIRE_SOURCE",
++      "targetStage": "deploy-target-workload-domain",
++      "decommissionStage": "decommission-source",
++      "gatedBy": [
++        "compat-back-in-time",
++        "target-management-healthy",
++        "cutover-validated"
++      ]
++    },
++    {
++      "id": "esx-w02",
++      "type": "ESX_HOST",
++      "name": "esx-w02.rainpole.example",
++      "domain": "vi-domain-01",
++      "currentVersion": "8.0.3-25429389",
++      "targetVersion": "9.1.0.0.25370933",
++      "disposition": "REPLACE_AND_RETIRE_SOURCE",
++      "targetStage": "deploy-target-workload-domain",
++      "decommissionStage": "decommission-source",
++      "gatedBy": [
++        "compat-back-in-time",
++        "target-management-healthy",
++        "cutover-validated"
++      ]
++    },
++    {
++      "id": "esx-w03",
++      "type": "ESX_HOST",
++      "name": "esx-w03.rainpole.example",
++      "domain": "vi-domain-01",
++      "currentVersion": "8.0.3-25429389",
++      "targetVersion": "9.1.0.0.25370933",
++      "disposition": "REPLACE_AND_RETIRE_SOURCE",
++      "targetStage": "deploy-target-workload-domain",
++      "decommissionStage": "decommission-source",
++      "gatedBy": [
++        "compat-back-in-time",
++        "target-management-healthy",
++        "cutover-validated"
++      ]
++    }
++  ]
++}
+diff --git a/research/sources.md b/research/sources.md
+new file mode 100644
+index 0000000..a141377
+--- /dev/null
++++ b/research/sources.md
+@@ -0,0 +1,13 @@
++# Sources consulted
++
++- Title: Upgrade failure for vCenter 8.0 U3j, ESXi 8.0 U3j and NSX 4.2.4 during upgrade to VCF 9.1.0.x
++  Publisher: Broadcom
++  Accessed: 2026-08-14
++  URL: https://knowledge.broadcom.com/external/article/448135/upgrade-failure-for-vcenter-80-u3j-esxi.html
++  Conclusion used: the listed source builds are chronologically later than the VCF 9.1.0 baseline builds, so lifecycle management blocks their direct transition as a back-in-time upgrade.
++
++- Title: Upgrade sequence and related issues for VMware Cloud Foundation 9.1
++  Publisher: Broadcom
++  Accessed: 2026-08-14
++  URL: https://knowledge.broadcom.com/external/article/440630/upgrade-sequence-and-related-issues-for.html
++  Conclusion used: VCF 9.1 brownfield adoption is topology-sensitive and uses VCF Installer workflows; independent component upgrades are not a supported substitute when NSX is present.

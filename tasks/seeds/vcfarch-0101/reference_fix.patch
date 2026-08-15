@@ -1,0 +1,1402 @@
+diff --git a/VcfFleetArchitecture/VcfFleetArchitecture.psd1 b/VcfFleetArchitecture/VcfFleetArchitecture.psd1
+new file mode 100644
+index 0000000..4f0230f
+--- /dev/null
++++ b/VcfFleetArchitecture/VcfFleetArchitecture.psd1
+@@ -0,0 +1,18 @@
++@{
++    RootModule = 'VcfFleetArchitecture.psm1'
++    ModuleVersion = '1.0.0'
++    GUID = '23029126-6343-47c7-989b-6f9417522824'
++    Author = 'Northstar Platform Architecture'
++    Description = 'Generates the Northstar VCF 9.1 fleet architecture from protected inventory and compatibility inputs.'
++    PowerShellVersion = '7.4'
++    RequiredModules = @(
++        @{
++            ModuleName = 'VMware.Sdk.Vcf.Installer'
++            RequiredVersion = '13.5.0.25380678'
++        }
++    )
++    FunctionsToExport = @('New-VcfFleetArchitecture')
++    CmdletsToExport = @()
++    VariablesToExport = @()
++    AliasesToExport = @()
++}
+diff --git a/VcfFleetArchitecture/VcfFleetArchitecture.psm1 b/VcfFleetArchitecture/VcfFleetArchitecture.psm1
+new file mode 100644
+index 0000000..a63ea86
+--- /dev/null
++++ b/VcfFleetArchitecture/VcfFleetArchitecture.psm1
+@@ -0,0 +1,380 @@
++Set-StrictMode -Version Latest
++Import-Module VMware.Sdk.Vcf.Installer -RequiredVersion 13.5.0.25380678 -ErrorAction Stop
++
++function Read-ArchitectureJson {
++    param([Parameter(Mandatory)][string]$Path)
++
++    if (-not [System.IO.File]::Exists($Path)) {
++        throw [System.IO.FileNotFoundException]::new("Architecture input was not found: $Path", $Path)
++    }
++    $text = [System.IO.File]::ReadAllText([System.IO.Path]::GetFullPath($Path))
++    $text | ConvertFrom-Json -AsHashtable -Depth 100
++}
++
++function Write-ArchitectureJson {
++    param(
++        [Parameter(Mandatory)]$Value,
++        [Parameter(Mandatory)][string]$Path
++    )
++
++    $json = ConvertTo-Json -InputObject $Value -Depth 100
++    [System.IO.File]::WriteAllText(
++        $Path,
++        $json + "`n",
++        [System.Text.UTF8Encoding]::new($false)
++    )
++}
++
++function Get-CompatibilityRule {
++    param(
++        [Parameter(Mandatory)]$Component,
++        [Parameter(Mandatory)]$Snapshot
++    )
++
++    $matches = @(
++        $Snapshot.rules | Where-Object {
++            $_.componentType -ceq $Component.type -and
++            $_.sourceVersion -ceq $Component.currentVersion
++        }
++    )
++    if ($matches.Count -ne 1) {
++        throw "Expected one compatibility rule for $($Component.type) $($Component.currentVersion); found $($matches.Count)."
++    }
++    $matches[0]
++}
++
++function Get-Dependencies {
++    param(
++        [Parameter(Mandatory)]$Component,
++        [Parameter(Mandatory)]$Rule,
++        [Parameter(Mandatory)]$Components
++    )
++
++    $ids = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
++    foreach ($selector in @($Rule.dependencySelectors)) {
++        if ($selector.scope -cnotin @('global', 'same-site')) {
++            throw "Unknown dependency selector scope: $($selector.scope)"
++        }
++        foreach ($candidate in @($Components)) {
++            if ($candidate.type -cne $selector.componentType) {
++                continue
++            }
++            if ($selector.scope -ceq 'same-site' -and $candidate.siteId -cne $Component.siteId) {
++                continue
++            }
++            $null = $ids.Add([string]$candidate.id)
++        }
++    }
++    @($ids | Sort-Object)
++}
++
++function New-InstallerSddcSpecDocument {
++    param([Parameter(Mandatory)]$Estate)
++
++    $design = $Estate.greenfield
++    $hostComponents = @(
++        $Estate.components |
++            Where-Object { $_.type -ceq 'ESXI' } |
++            Sort-Object -Property @{ Expression = { $_.siteId } }, @{ Expression = { $_.id } }
++    )
++
++    $hostModels = @(
++        foreach ($hostComponent in $hostComponents) {
++            Initialize-VcfInstallerSddcHostSpec -Hostname $hostComponent.hostname
++        }
++    )
++    $vcenterModel = Initialize-VcfInstallerSddcVcenterSpec `
++        -VcenterHostname $design.vcenterHostname `
++        -RootVcenterPassword $design.vcenterPasswordReference `
++        -VmSize $design.vcenterVmSize `
++        -StorageSize $design.vcenterStorageSize
++    $networkModels = @(
++        foreach ($network in @($design.networks)) {
++            Initialize-VcfInstallerSddcNetworkSpec `
++                -NetworkType $network.networkType `
++                -VlanId ([int]$network.vlanId) `
++                -Mtu ([int]$network.mtu) `
++                -Subnet $network.subnet `
++                -Gateway $network.gateway `
++                -SubnetMask $network.subnetMask
++        }
++    )
++    $dnsModel = Initialize-VcfInstallerDnsSpec `
++        -Subdomain $design.dnsSubdomain `
++        -Nameservers @($design.nameServers)
++    $clusterModel = Initialize-VcfInstallerSddcClusterSpec `
++        -DatacenterName $design.datacenterName `
++        -ClusterName $design.clusterName
++    $esaModel = Initialize-VcfInstallerVsanEsaConfig -Enabled ([bool]$design.vsanEsaEnabled)
++    $vsanModel = Initialize-VcfInstallerVsanSpec `
++        -DatastoreName $design.vsanDatastoreName `
++        -EsaConfig $esaModel `
++        -FailuresToTolerate ([int]$design.vsanFailuresToTolerate)
++    $datastoreModel = Initialize-VcfInstallerSddcDatastoreSpec -VsanSpec $vsanModel
++    $nsxManagerModels = @(
++        foreach ($hostname in @($design.nsxManagerHostnames)) {
++            Initialize-VcfInstallerNsxtManagerSpec -Hostname $hostname
++        }
++    )
++    $nsxModel = Initialize-VcfInstallerSddcNsxtSpec `
++        -NsxtManagers $nsxManagerModels `
++        -NsxtManagerSize $design.nsxManagerSize `
++        -VipFqdn $design.nsxVipFqdn `
++        -TransportVlanId ([int]$design.nsxTransportVlanId)
++
++    # Construct the real generated top-level type. The JSON projection below is
++    # intentionally sparse so unset SDK properties stay absent from the artifact.
++    $sddcModel = Initialize-VcfInstallerSddcSpec `
++        -SddcId $design.sddcId `
++        -WorkflowType $design.workflowType `
++        -HostSpecs $hostModels `
++        -Version $Estate.targetFleet.version `
++        -VcenterSpec $vcenterModel `
++        -ClusterSpec $clusterModel `
++        -NsxtSpec $nsxModel `
++        -NetworkSpecs $networkModels `
++        -DnsSpec $dnsModel `
++        -NtpServers @($design.ntpServers) `
++        -DatastoreSpec $datastoreModel
++    if ($null -eq $sddcModel) {
++        throw 'The VMware SDK did not construct an SddcSpec model.'
++    }
++
++    $hostSpecs = @(
++        foreach ($hostComponent in $hostComponents) {
++            [ordered]@{ hostname = [string]$hostComponent.hostname }
++        }
++    )
++    $networkSpecs = @(
++        foreach ($network in @($design.networks)) {
++            [ordered]@{
++                networkType = [string]$network.networkType
++                vlanId = [int]$network.vlanId
++                mtu = [int]$network.mtu
++                subnet = [string]$network.subnet
++                gateway = [string]$network.gateway
++                subnetMask = [string]$network.subnetMask
++            }
++        }
++    )
++    $nsxtManagers = @(
++        foreach ($hostname in @($design.nsxManagerHostnames)) {
++            [ordered]@{ hostname = [string]$hostname }
++        }
++    )
++
++    [ordered]@{
++        sddcId = [string]$design.sddcId
++        workflowType = [string]$design.workflowType
++        hostSpecs = $hostSpecs
++        version = [string]$Estate.targetFleet.version
++        vcenterSpec = [ordered]@{
++            vcenterHostname = [string]$design.vcenterHostname
++            rootVcenterPassword = [string]$design.vcenterPasswordReference
++            vmSize = [string]$design.vcenterVmSize
++            storageSize = [string]$design.vcenterStorageSize
++        }
++        clusterSpec = [ordered]@{
++            datacenterName = [string]$design.datacenterName
++            clusterName = [string]$design.clusterName
++        }
++        nsxtSpec = [ordered]@{
++            nsxtManagers = $nsxtManagers
++            nsxtManagerSize = [string]$design.nsxManagerSize
++            vipFqdn = [string]$design.nsxVipFqdn
++            transportVlanId = [int]$design.nsxTransportVlanId
++        }
++        networkSpecs = $networkSpecs
++        dnsSpec = [ordered]@{
++            subdomain = [string]$design.dnsSubdomain
++            nameservers = @($design.nameServers)
++        }
++        ntpServers = @($design.ntpServers)
++        datastoreSpec = [ordered]@{
++            vsanSpec = [ordered]@{
++                datastoreName = [string]$design.vsanDatastoreName
++                esaConfig = [ordered]@{ enabled = [bool]$design.vsanEsaEnabled }
++                failuresToTolerate = [int]$design.vsanFailuresToTolerate
++            }
++        }
++    }
++}
++
++function New-SiteTopologyDocument {
++    param([Parameter(Mandatory)]$Estate)
++
++    $sitesById = @{}
++    foreach ($site in @($Estate.sites)) {
++        $sitesById[[string]$site.id] = $site
++    }
++    $componentsById = @{}
++    foreach ($component in @($Estate.components)) {
++        $componentsById[[string]$component.id] = $component
++    }
++    $dataSites = @(
++        foreach ($siteId in @($Estate.managementDomain.dataSiteIds)) {
++            $site = $sitesById[[string]$siteId]
++            [ordered]@{
++                siteId = [string]$site.id
++                role = [string]$site.role
++                failureDomain = [string]$site.failureDomain
++            }
++        }
++    )
++    $hostPlacement = @(
++        foreach ($component in @(
++            $Estate.components |
++                Where-Object { $_.type -ceq 'ESXI' } |
++                Sort-Object -Property @{ Expression = { $_.siteId } }, @{ Expression = { $_.id } }
++        )) {
++            [ordered]@{
++                componentId = [string]$component.id
++                hostname = [string]$component.hostname
++                siteId = [string]$component.siteId
++            }
++        }
++    )
++    $witness = $componentsById[[string]$Estate.managementDomain.witnessComponentId]
++    $witnessSite = $sitesById[[string]$witness.siteId]
++    $appliances = @(
++        foreach ($siteId in @($Estate.recoveryPair.siteIds)) {
++            [ordered]@{
++                resourceId = "${siteId}-vpr"
++                siteId = [string]$siteId
++            }
++        }
++    )
++
++    [ordered]@{
++        schemaVersion = '1.0.0'
++        designType = 'TWO_SITE_STRETCHED_MANAGEMENT_DOMAIN'
++        targetFleet = [ordered]@{
++            id = [string]$Estate.targetFleet.id
++            version = [string]$Estate.targetFleet.version
++        }
++        managementDomain = [ordered]@{
++            id = [string]$Estate.managementDomain.id
++            stretched = $true
++            dataSites = $dataSites
++            hostPlacement = $hostPlacement
++            storage = [ordered]@{
++                type = 'VSAN_STRETCHED_CLUSTER'
++                witness = [ordered]@{
++                    componentId = [string]$witness.id
++                    hostname = [string]$witness.hostname
++                    siteId = [string]$witness.siteId
++                    failureDomain = [string]$witnessSite.failureDomain
++                    runsOnManagementDomain = $false
++                }
++            }
++        }
++        protection = [ordered]@{
++            pairId = [string]$Estate.recoveryPair.id
++            targetProduct = 'VCF_PROTECTION_AND_RECOVERY'
++            targetVersion = [string]$Estate.targetFleet.version
++            appliances = $appliances
++        }
++    }
++}
++
++function New-MigrationPlanDocument {
++    param(
++        [Parameter(Mandatory)]$Estate,
++        [Parameter(Mandatory)]$Snapshot
++    )
++
++    if ($Snapshot.targetFleetVersion -cne $Estate.targetFleet.version) {
++        throw 'The compatibility snapshot does not target the estate fleet version.'
++    }
++    $gateConditions = @{}
++    foreach ($gate in @($Snapshot.gateDefinitions)) {
++        $gateConditions[[string]$gate.id] = [string]$gate.condition
++    }
++
++    $work = @(
++        foreach ($component in @($Estate.components)) {
++            $rule = Get-CompatibilityRule -Component $component -Snapshot $Snapshot
++            [pscustomobject]@{ Component = $component; Rule = $rule }
++        }
++    ) | Sort-Object -Property `
++        @{ Expression = { [int]$_.Rule.phase } }, `
++        @{ Expression = { $_.Component.siteId } }, `
++        @{ Expression = { $_.Component.id } }
++
++    $steps = [System.Collections.Generic.List[object]]::new()
++    $order = 0
++    foreach ($item in $work) {
++        $order++
++        $component = $item.Component
++        $rule = $item.Rule
++        $resourceId = ([string]$rule.targetResourceTemplate).
++            Replace('{componentId}', [string]$component.id).
++            Replace('{siteId}', [string]$component.siteId)
++        $gates = @(
++            foreach ($gateId in @($rule.gateIds)) {
++                if (-not $gateConditions.ContainsKey([string]$gateId)) {
++                    throw "Compatibility rule names unknown gate: $gateId"
++                }
++                [ordered]@{
++                    id = [string]$gateId
++                    condition = [string]$gateConditions[[string]$gateId]
++                }
++            }
++        )
++        $dependencies = @(
++            Get-Dependencies `
++                -Component $component `
++                -Rule $rule `
++                -Components @($Estate.components)
++        )
++        $steps.Add([ordered]@{
++            order = $order
++            phase = [int]$rule.phase
++            componentId = [string]$component.id
++            componentType = [string]$component.type
++            siteId = [string]$component.siteId
++            currentVersion = [string]$component.currentVersion
++            target = [ordered]@{
++                product = [string]$rule.targetProduct
++                version = [string]$rule.targetVersion
++                resourceId = $resourceId
++            }
++            upgradePath = @($rule.upgradePath)
++            action = [string]$rule.action
++            gates = $gates
++            dependsOn = $dependencies
++        })
++    }
++
++    [ordered]@{
++        schemaVersion = '1.0.0'
++        estateId = [string]$Estate.estateId
++        targetFleetId = [string]$Estate.targetFleet.id
++        targetFleetVersion = [string]$Estate.targetFleet.version
++        steps = $steps.ToArray()
++    }
++}
++
++function New-VcfFleetArchitecture {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$EstatePath,
++        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$CompatibilitySnapshotPath,
++        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$OutputDirectory
++    )
++
++    $estate = Read-ArchitectureJson -Path $EstatePath
++    $snapshot = Read-ArchitectureJson -Path $CompatibilitySnapshotPath
++    $output = [System.IO.Path]::GetFullPath($OutputDirectory)
++    $null = [System.IO.Directory]::CreateDirectory($output)
++
++    $sddcSpec = New-InstallerSddcSpecDocument -Estate $estate
++    $topology = New-SiteTopologyDocument -Estate $estate
++    $migrationPlan = New-MigrationPlanDocument -Estate $estate -Snapshot $snapshot
++
++    Write-ArchitectureJson -Value $sddcSpec -Path ([System.IO.Path]::Combine($output, 'greenfield-sddc-spec.json'))
++    Write-ArchitectureJson -Value $topology -Path ([System.IO.Path]::Combine($output, 'site-topology.json'))
++    Write-ArchitectureJson -Value $migrationPlan -Path ([System.IO.Path]::Combine($output, 'migration-plan.json'))
++}
++
++Export-ModuleMember -Function New-VcfFleetArchitecture
+diff --git a/architecture/greenfield-sddc-spec.json b/architecture/greenfield-sddc-spec.json
+new file mode 100644
+index 0000000..3b16dd3
+--- /dev/null
++++ b/architecture/greenfield-sddc-spec.json
+@@ -0,0 +1,103 @@
++{
++  "sddcId": "nstar-m01",
++  "workflowType": "VCF",
++  "hostSpecs": [
++    {
++      "hostname": "esxi-a01"
++    },
++    {
++      "hostname": "esxi-a02"
++    },
++    {
++      "hostname": "esxi-a03"
++    },
++    {
++      "hostname": "esxi-a04"
++    },
++    {
++      "hostname": "esxi-b01"
++    },
++    {
++      "hostname": "esxi-b02"
++    },
++    {
++      "hostname": "esxi-b03"
++    },
++    {
++      "hostname": "esxi-b04"
++    }
++  ],
++  "version": "9.1.0.0",
++  "vcenterSpec": {
++    "vcenterHostname": "vc-mgmt.northstar.example",
++    "rootVcenterPassword": "${VC_ROOT_PW}",
++    "vmSize": "medium",
++    "storageSize": "lstorage"
++  },
++  "clusterSpec": {
++    "datacenterName": "nstar-mgmt-dc",
++    "clusterName": "nstar-mgmt-stretched"
++  },
++  "nsxtSpec": {
++    "nsxtManagers": [
++      {
++        "hostname": "nsx-mgr-01"
++      },
++      {
++        "hostname": "nsx-mgr-02"
++      },
++      {
++        "hostname": "nsx-mgr-03"
++      }
++    ],
++    "nsxtManagerSize": "medium",
++    "vipFqdn": "nsx-mgmt.northstar.example",
++    "transportVlanId": 140
++  },
++  "networkSpecs": [
++    {
++      "networkType": "MANAGEMENT",
++      "vlanId": 110,
++      "mtu": 9000,
++      "subnet": "10.110.0.0/24",
++      "gateway": "10.110.0.1",
++      "subnetMask": "255.255.255.0"
++    },
++    {
++      "networkType": "VMOTION",
++      "vlanId": 120,
++      "mtu": 9000,
++      "subnet": "10.120.0.0/24",
++      "gateway": "10.120.0.1",
++      "subnetMask": "255.255.255.0"
++    },
++    {
++      "networkType": "VSAN",
++      "vlanId": 130,
++      "mtu": 9000,
++      "subnet": "10.130.0.0/24",
++      "gateway": "10.130.0.1",
++      "subnetMask": "255.255.255.0"
++    }
++  ],
++  "dnsSpec": {
++    "subdomain": "northstar.example",
++    "nameservers": [
++      "192.0.2.53",
++      "192.0.2.54"
++    ]
++  },
++  "ntpServers": [
++    "192.0.2.123",
++    "192.0.2.124"
++  ],
++  "datastoreSpec": {
++    "vsanSpec": {
++      "datastoreName": "nstar-mgmt-vsan",
++      "esaConfig": {
++        "enabled": true
++      },
++      "failuresToTolerate": 1
++    }
++  }
++}
+diff --git a/architecture/site-topology.json b/architecture/site-topology.json
+new file mode 100644
+index 0000000..79247ec
+--- /dev/null
++++ b/architecture/site-topology.json
+@@ -0,0 +1,91 @@
++{
++  "schemaVersion": "1.0.0",
++  "designType": "TWO_SITE_STRETCHED_MANAGEMENT_DOMAIN",
++  "targetFleet": {
++    "id": "northstar-fleet",
++    "version": "9.1.0.0"
++  },
++  "managementDomain": {
++    "id": "nstar-m01",
++    "stretched": true,
++    "dataSites": [
++      {
++        "siteId": "site-a",
++        "role": "preferred",
++        "failureDomain": "metro-a"
++      },
++      {
++        "siteId": "site-b",
++        "role": "secondary",
++        "failureDomain": "metro-b"
++      }
++    ],
++    "hostPlacement": [
++      {
++        "componentId": "esxi-a01",
++        "hostname": "esxi-a01",
++        "siteId": "site-a"
++      },
++      {
++        "componentId": "esxi-a02",
++        "hostname": "esxi-a02",
++        "siteId": "site-a"
++      },
++      {
++        "componentId": "esxi-a03",
++        "hostname": "esxi-a03",
++        "siteId": "site-a"
++      },
++      {
++        "componentId": "esxi-a04",
++        "hostname": "esxi-a04",
++        "siteId": "site-a"
++      },
++      {
++        "componentId": "esxi-b01",
++        "hostname": "esxi-b01",
++        "siteId": "site-b"
++      },
++      {
++        "componentId": "esxi-b02",
++        "hostname": "esxi-b02",
++        "siteId": "site-b"
++      },
++      {
++        "componentId": "esxi-b03",
++        "hostname": "esxi-b03",
++        "siteId": "site-b"
++      },
++      {
++        "componentId": "esxi-b04",
++        "hostname": "esxi-b04",
++        "siteId": "site-b"
++      }
++    ],
++    "storage": {
++      "type": "VSAN_STRETCHED_CLUSTER",
++      "witness": {
++        "componentId": "witness-01",
++        "hostname": "witness-01",
++        "siteId": "site-w",
++        "failureDomain": "metro-witness",
++        "runsOnManagementDomain": false
++      }
++    }
++  },
++  "protection": {
++    "pairId": "northstar-recovery-pair",
++    "targetProduct": "VCF_PROTECTION_AND_RECOVERY",
++    "targetVersion": "9.1.0.0",
++    "appliances": [
++      {
++        "resourceId": "site-a-vpr",
++        "siteId": "site-a"
++      },
++      {
++        "resourceId": "site-b-vpr",
++        "siteId": "site-b"
++      }
++    ]
++  }
++}
+diff --git a/architecture/migration-plan.json b/architecture/migration-plan.json
+new file mode 100644
+index 0000000..d3aa648
+--- /dev/null
++++ b/architecture/migration-plan.json
+@@ -0,0 +1,747 @@
++{
++  "schemaVersion": "1.0.0",
++  "estateId": "northstar-estate",
++  "targetFleetId": "northstar-fleet",
++  "targetFleetVersion": "9.1.0.0",
++  "steps": [
++    {
++      "order": 1,
++      "phase": 10,
++      "componentId": "vcf-ops-01",
++      "componentType": "VCF_OPERATIONS",
++      "siteId": "site-a",
++      "currentVersion": "NOT_INSTALLED",
++      "target": {
++        "product": "VCF_OPERATIONS",
++        "version": "9.1.0.0",
++        "resourceId": "vcf-ops-01"
++      },
++      "upgradePath": [
++        "NOT_INSTALLED",
++        "9.1.0.0"
++      ],
++      "action": "DEPLOY",
++      "gates": [
++        {
++          "id": "FLEET-MGMT-FIRST",
++          "condition": "VCF Operations 9.1 is deployed before any point-solution convergence into the fleet."
++        },
++        {
++          "id": "SUPPORTED-UPGRADE-PATH",
++          "condition": "Every adjacent version hop is present in this pinned snapshot's rule for the component type and source version."
++        }
++      ],
++      "dependsOn": []
++    },
++    {
++      "order": 2,
++      "phase": 20,
++      "componentId": "vr-a",
++      "componentType": "VSPHERE_REPLICATION",
++      "siteId": "site-a",
++      "currentVersion": "8.8.0.3",
++      "target": {
++        "product": "VCF_PROTECTION_AND_RECOVERY",
++        "version": "9.1.0.0",
++        "resourceId": "site-a-vpr"
++      },
++      "upgradePath": [
++        "8.8.0.3",
++        "9.0.2.2",
++        "9.0.4",
++        "9.1.0.0"
++      ],
++      "action": "CONVERGE",
++      "gates": [
++        {
++          "id": "SUPPORTED-UPGRADE-PATH",
++          "condition": "Every adjacent version hop is present in this pinned snapshot's rule for the component type and source version."
++        },
++        {
++          "id": "PROTECTION-PAIR-ALIGNED",
++          "condition": "Both recovery sites reach the listed paired transition level and are re-paired before vCenter is moved to 9.1."
++        }
++      ],
++      "dependsOn": [
++        "vcf-ops-01"
++      ]
++    },
++    {
++      "order": 3,
++      "phase": 20,
++      "componentId": "vr-b",
++      "componentType": "VSPHERE_REPLICATION",
++      "siteId": "site-b",
++      "currentVersion": "9.0.2.2",
++      "target": {
++        "product": "VCF_PROTECTION_AND_RECOVERY",
++        "version": "9.1.0.0",
++        "resourceId": "site-b-vpr"
++      },
++      "upgradePath": [
++        "9.0.2.2",
++        "9.0.4",
++        "9.1.0.0"
++      ],
++      "action": "CONVERGE",
++      "gates": [
++        {
++          "id": "SUPPORTED-UPGRADE-PATH",
++          "condition": "Every adjacent version hop is present in this pinned snapshot's rule for the component type and source version."
++        },
++        {
++          "id": "PROTECTION-PAIR-ALIGNED",
++          "condition": "Both recovery sites reach the listed paired transition level and are re-paired before vCenter is moved to 9.1."
++        }
++      ],
++      "dependsOn": [
++        "vcf-ops-01"
++      ]
++    },
++    {
++      "order": 4,
++      "phase": 30,
++      "componentId": "lsr-a",
++      "componentType": "LIVE_SITE_RECOVERY",
++      "siteId": "site-a",
++      "currentVersion": "8.8.0.3",
++      "target": {
++        "product": "VCF_PROTECTION_AND_RECOVERY",
++        "version": "9.1.0.0",
++        "resourceId": "site-a-vpr"
++      },
++      "upgradePath": [
++        "8.8.0.3",
++        "9.0.2.2",
++        "9.0.4",
++        "9.1.0.0"
++      ],
++      "action": "CONVERGE",
++      "gates": [
++        {
++          "id": "SUPPORTED-UPGRADE-PATH",
++          "condition": "Every adjacent version hop is present in this pinned snapshot's rule for the component type and source version."
++        },
++        {
++          "id": "PROTECTION-PAIR-ALIGNED",
++          "condition": "Both recovery sites reach the listed paired transition level and are re-paired before vCenter is moved to 9.1."
++        }
++      ],
++      "dependsOn": [
++        "vcf-ops-01",
++        "vr-a"
++      ]
++    },
++    {
++      "order": 5,
++      "phase": 30,
++      "componentId": "lsr-b",
++      "componentType": "LIVE_SITE_RECOVERY",
++      "siteId": "site-b",
++      "currentVersion": "9.0.2.2",
++      "target": {
++        "product": "VCF_PROTECTION_AND_RECOVERY",
++        "version": "9.1.0.0",
++        "resourceId": "site-b-vpr"
++      },
++      "upgradePath": [
++        "9.0.2.2",
++        "9.0.4",
++        "9.1.0.0"
++      ],
++      "action": "CONVERGE",
++      "gates": [
++        {
++          "id": "SUPPORTED-UPGRADE-PATH",
++          "condition": "Every adjacent version hop is present in this pinned snapshot's rule for the component type and source version."
++        },
++        {
++          "id": "PROTECTION-PAIR-ALIGNED",
++          "condition": "Both recovery sites reach the listed paired transition level and are re-paired before vCenter is moved to 9.1."
++        }
++      ],
++      "dependsOn": [
++        "vcf-ops-01",
++        "vr-b"
++      ]
++    },
++    {
++      "order": 6,
++      "phase": 40,
++      "componentId": "nsx-a",
++      "componentType": "NSX",
++      "siteId": "site-a",
++      "currentVersion": "4.1.2.3",
++      "target": {
++        "product": "NSX",
++        "version": "9.1.0.0",
++        "resourceId": "nsx-a"
++      },
++      "upgradePath": [
++        "4.1.2.3",
++        "4.2.3.1",
++        "9.1.0.0"
++      ],
++      "action": "CONVERGE",
++      "gates": [
++        {
++          "id": "SUPPORTED-UPGRADE-PATH",
++          "condition": "Every adjacent version hop is present in this pinned snapshot's rule for the component type and source version."
++        },
++        {
++          "id": "VCF-INSTALLER-CONVERGE",
++          "condition": "Brownfield vSphere with NSX uses the VCF Installer converge and convert/import workflow rather than independent core-component upgrades."
++        }
++      ],
++      "dependsOn": [
++        "lsr-a",
++        "lsr-b",
++        "vcf-ops-01"
++      ]
++    },
++    {
++      "order": 7,
++      "phase": 40,
++      "componentId": "nsx-b",
++      "componentType": "NSX",
++      "siteId": "site-b",
++      "currentVersion": "4.2.3.1",
++      "target": {
++        "product": "NSX",
++        "version": "9.1.0.0",
++        "resourceId": "nsx-b"
++      },
++      "upgradePath": [
++        "4.2.3.1",
++        "9.1.0.0"
++      ],
++      "action": "CONVERGE",
++      "gates": [
++        {
++          "id": "SUPPORTED-UPGRADE-PATH",
++          "condition": "Every adjacent version hop is present in this pinned snapshot's rule for the component type and source version."
++        },
++        {
++          "id": "VCF-INSTALLER-CONVERGE",
++          "condition": "Brownfield vSphere with NSX uses the VCF Installer converge and convert/import workflow rather than independent core-component upgrades."
++        }
++      ],
++      "dependsOn": [
++        "lsr-a",
++        "lsr-b",
++        "vcf-ops-01"
++      ]
++    },
++    {
++      "order": 8,
++      "phase": 50,
++      "componentId": "vc-a",
++      "componentType": "VCENTER",
++      "siteId": "site-a",
++      "currentVersion": "8.0 U2d",
++      "target": {
++        "product": "VCENTER",
++        "version": "9.1.0.0",
++        "resourceId": "vc-a"
++      },
++      "upgradePath": [
++        "8.0 U2d",
++        "8.0 U3e",
++        "9.1.0.0"
++      ],
++      "action": "CONVERGE",
++      "gates": [
++        {
++          "id": "SUPPORTED-UPGRADE-PATH",
++          "condition": "Every adjacent version hop is present in this pinned snapshot's rule for the component type and source version."
++        },
++        {
++          "id": "VCF-INSTALLER-CONVERGE",
++          "condition": "Brownfield vSphere with NSX uses the VCF Installer converge and convert/import workflow rather than independent core-component upgrades."
++        },
++        {
++          "id": "PROTECTION-PAIR-ALIGNED",
++          "condition": "Both recovery sites reach the listed paired transition level and are re-paired before vCenter is moved to 9.1."
++        }
++      ],
++      "dependsOn": [
++        "lsr-a",
++        "lsr-b",
++        "nsx-a",
++        "vcf-ops-01"
++      ]
++    },
++    {
++      "order": 9,
++      "phase": 50,
++      "componentId": "vc-b",
++      "componentType": "VCENTER",
++      "siteId": "site-b",
++      "currentVersion": "8.0 U3e",
++      "target": {
++        "product": "VCENTER",
++        "version": "9.1.0.0",
++        "resourceId": "vc-b"
++      },
++      "upgradePath": [
++        "8.0 U3e",
++        "9.1.0.0"
++      ],
++      "action": "CONVERGE",
++      "gates": [
++        {
++          "id": "SUPPORTED-UPGRADE-PATH",
++          "condition": "Every adjacent version hop is present in this pinned snapshot's rule for the component type and source version."
++        },
++        {
++          "id": "VCF-INSTALLER-CONVERGE",
++          "condition": "Brownfield vSphere with NSX uses the VCF Installer converge and convert/import workflow rather than independent core-component upgrades."
++        },
++        {
++          "id": "PROTECTION-PAIR-ALIGNED",
++          "condition": "Both recovery sites reach the listed paired transition level and are re-paired before vCenter is moved to 9.1."
++        }
++      ],
++      "dependsOn": [
++        "lsr-a",
++        "lsr-b",
++        "nsx-b",
++        "vcf-ops-01"
++      ]
++    },
++    {
++      "order": 10,
++      "phase": 60,
++      "componentId": "witness-01",
++      "componentType": "VSAN_WITNESS",
++      "siteId": "site-w",
++      "currentVersion": "8.0 U2d",
++      "target": {
++        "product": "VSAN_WITNESS",
++        "version": "9.1.0.0",
++        "resourceId": "witness-01"
++      },
++      "upgradePath": [
++        "8.0 U2d",
++        "8.0 U3e",
++        "9.1.0.0"
++      ],
++      "action": "UPGRADE",
++      "gates": [
++        {
++          "id": "SUPPORTED-UPGRADE-PATH",
++          "condition": "Every adjacent version hop is present in this pinned snapshot's rule for the component type and source version."
++        },
++        {
++          "id": "WITNESS-THIRD-FAULT-DOMAIN",
++          "condition": "The vSAN witness is upgraded before data hosts and remains outside both data sites and outside the stretched management domain."
++        }
++      ],
++      "dependsOn": [
++        "vc-a",
++        "vc-b"
++      ]
++    },
++    {
++      "order": 11,
++      "phase": 70,
++      "componentId": "esxi-a01",
++      "componentType": "ESXI",
++      "siteId": "site-a",
++      "currentVersion": "8.0 U2d",
++      "target": {
++        "product": "ESXI",
++        "version": "9.1.0.0",
++        "resourceId": "esxi-a01"
++      },
++      "upgradePath": [
++        "8.0 U2d",
++        "8.0 U3e",
++        "9.1.0.0"
++      ],
++      "action": "CONVERGE",
++      "gates": [
++        {
++          "id": "SUPPORTED-UPGRADE-PATH",
++          "condition": "Every adjacent version hop is present in this pinned snapshot's rule for the component type and source version."
++        },
++        {
++          "id": "VCF-INSTALLER-CONVERGE",
++          "condition": "Brownfield vSphere with NSX uses the VCF Installer converge and convert/import workflow rather than independent core-component upgrades."
++        },
++        {
++          "id": "VCENTER-BEFORE-ESXI",
++          "condition": "The site's vCenter reaches its target before any managed ESXi host at that site."
++        },
++        {
++          "id": "WITNESS-THIRD-FAULT-DOMAIN",
++          "condition": "The vSAN witness is upgraded before data hosts and remains outside both data sites and outside the stretched management domain."
++        }
++      ],
++      "dependsOn": [
++        "nsx-a",
++        "vc-a",
++        "witness-01"
++      ]
++    },
++    {
++      "order": 12,
++      "phase": 70,
++      "componentId": "esxi-a02",
++      "componentType": "ESXI",
++      "siteId": "site-a",
++      "currentVersion": "8.0 U2d",
++      "target": {
++        "product": "ESXI",
++        "version": "9.1.0.0",
++        "resourceId": "esxi-a02"
++      },
++      "upgradePath": [
++        "8.0 U2d",
++        "8.0 U3e",
++        "9.1.0.0"
++      ],
++      "action": "CONVERGE",
++      "gates": [
++        {
++          "id": "SUPPORTED-UPGRADE-PATH",
++          "condition": "Every adjacent version hop is present in this pinned snapshot's rule for the component type and source version."
++        },
++        {
++          "id": "VCF-INSTALLER-CONVERGE",
++          "condition": "Brownfield vSphere with NSX uses the VCF Installer converge and convert/import workflow rather than independent core-component upgrades."
++        },
++        {
++          "id": "VCENTER-BEFORE-ESXI",
++          "condition": "The site's vCenter reaches its target before any managed ESXi host at that site."
++        },
++        {
++          "id": "WITNESS-THIRD-FAULT-DOMAIN",
++          "condition": "The vSAN witness is upgraded before data hosts and remains outside both data sites and outside the stretched management domain."
++        }
++      ],
++      "dependsOn": [
++        "nsx-a",
++        "vc-a",
++        "witness-01"
++      ]
++    },
++    {
++      "order": 13,
++      "phase": 70,
++      "componentId": "esxi-a03",
++      "componentType": "ESXI",
++      "siteId": "site-a",
++      "currentVersion": "8.0 U2d",
++      "target": {
++        "product": "ESXI",
++        "version": "9.1.0.0",
++        "resourceId": "esxi-a03"
++      },
++      "upgradePath": [
++        "8.0 U2d",
++        "8.0 U3e",
++        "9.1.0.0"
++      ],
++      "action": "CONVERGE",
++      "gates": [
++        {
++          "id": "SUPPORTED-UPGRADE-PATH",
++          "condition": "Every adjacent version hop is present in this pinned snapshot's rule for the component type and source version."
++        },
++        {
++          "id": "VCF-INSTALLER-CONVERGE",
++          "condition": "Brownfield vSphere with NSX uses the VCF Installer converge and convert/import workflow rather than independent core-component upgrades."
++        },
++        {
++          "id": "VCENTER-BEFORE-ESXI",
++          "condition": "The site's vCenter reaches its target before any managed ESXi host at that site."
++        },
++        {
++          "id": "WITNESS-THIRD-FAULT-DOMAIN",
++          "condition": "The vSAN witness is upgraded before data hosts and remains outside both data sites and outside the stretched management domain."
++        }
++      ],
++      "dependsOn": [
++        "nsx-a",
++        "vc-a",
++        "witness-01"
++      ]
++    },
++    {
++      "order": 14,
++      "phase": 70,
++      "componentId": "esxi-a04",
++      "componentType": "ESXI",
++      "siteId": "site-a",
++      "currentVersion": "8.0 U2d",
++      "target": {
++        "product": "ESXI",
++        "version": "9.1.0.0",
++        "resourceId": "esxi-a04"
++      },
++      "upgradePath": [
++        "8.0 U2d",
++        "8.0 U3e",
++        "9.1.0.0"
++      ],
++      "action": "CONVERGE",
++      "gates": [
++        {
++          "id": "SUPPORTED-UPGRADE-PATH",
++          "condition": "Every adjacent version hop is present in this pinned snapshot's rule for the component type and source version."
++        },
++        {
++          "id": "VCF-INSTALLER-CONVERGE",
++          "condition": "Brownfield vSphere with NSX uses the VCF Installer converge and convert/import workflow rather than independent core-component upgrades."
++        },
++        {
++          "id": "VCENTER-BEFORE-ESXI",
++          "condition": "The site's vCenter reaches its target before any managed ESXi host at that site."
++        },
++        {
++          "id": "WITNESS-THIRD-FAULT-DOMAIN",
++          "condition": "The vSAN witness is upgraded before data hosts and remains outside both data sites and outside the stretched management domain."
++        }
++      ],
++      "dependsOn": [
++        "nsx-a",
++        "vc-a",
++        "witness-01"
++      ]
++    },
++    {
++      "order": 15,
++      "phase": 70,
++      "componentId": "esxi-b01",
++      "componentType": "ESXI",
++      "siteId": "site-b",
++      "currentVersion": "8.0 U3e",
++      "target": {
++        "product": "ESXI",
++        "version": "9.1.0.0",
++        "resourceId": "esxi-b01"
++      },
++      "upgradePath": [
++        "8.0 U3e",
++        "9.1.0.0"
++      ],
++      "action": "CONVERGE",
++      "gates": [
++        {
++          "id": "SUPPORTED-UPGRADE-PATH",
++          "condition": "Every adjacent version hop is present in this pinned snapshot's rule for the component type and source version."
++        },
++        {
++          "id": "VCF-INSTALLER-CONVERGE",
++          "condition": "Brownfield vSphere with NSX uses the VCF Installer converge and convert/import workflow rather than independent core-component upgrades."
++        },
++        {
++          "id": "VCENTER-BEFORE-ESXI",
++          "condition": "The site's vCenter reaches its target before any managed ESXi host at that site."
++        },
++        {
++          "id": "WITNESS-THIRD-FAULT-DOMAIN",
++          "condition": "The vSAN witness is upgraded before data hosts and remains outside both data sites and outside the stretched management domain."
++        }
++      ],
++      "dependsOn": [
++        "nsx-b",
++        "vc-b",
++        "witness-01"
++      ]
++    },
++    {
++      "order": 16,
++      "phase": 70,
++      "componentId": "esxi-b02",
++      "componentType": "ESXI",
++      "siteId": "site-b",
++      "currentVersion": "8.0 U3e",
++      "target": {
++        "product": "ESXI",
++        "version": "9.1.0.0",
++        "resourceId": "esxi-b02"
++      },
++      "upgradePath": [
++        "8.0 U3e",
++        "9.1.0.0"
++      ],
++      "action": "CONVERGE",
++      "gates": [
++        {
++          "id": "SUPPORTED-UPGRADE-PATH",
++          "condition": "Every adjacent version hop is present in this pinned snapshot's rule for the component type and source version."
++        },
++        {
++          "id": "VCF-INSTALLER-CONVERGE",
++          "condition": "Brownfield vSphere with NSX uses the VCF Installer converge and convert/import workflow rather than independent core-component upgrades."
++        },
++        {
++          "id": "VCENTER-BEFORE-ESXI",
++          "condition": "The site's vCenter reaches its target before any managed ESXi host at that site."
++        },
++        {
++          "id": "WITNESS-THIRD-FAULT-DOMAIN",
++          "condition": "The vSAN witness is upgraded before data hosts and remains outside both data sites and outside the stretched management domain."
++        }
++      ],
++      "dependsOn": [
++        "nsx-b",
++        "vc-b",
++        "witness-01"
++      ]
++    },
++    {
++      "order": 17,
++      "phase": 70,
++      "componentId": "esxi-b03",
++      "componentType": "ESXI",
++      "siteId": "site-b",
++      "currentVersion": "8.0 U3e",
++      "target": {
++        "product": "ESXI",
++        "version": "9.1.0.0",
++        "resourceId": "esxi-b03"
++      },
++      "upgradePath": [
++        "8.0 U3e",
++        "9.1.0.0"
++      ],
++      "action": "CONVERGE",
++      "gates": [
++        {
++          "id": "SUPPORTED-UPGRADE-PATH",
++          "condition": "Every adjacent version hop is present in this pinned snapshot's rule for the component type and source version."
++        },
++        {
++          "id": "VCF-INSTALLER-CONVERGE",
++          "condition": "Brownfield vSphere with NSX uses the VCF Installer converge and convert/import workflow rather than independent core-component upgrades."
++        },
++        {
++          "id": "VCENTER-BEFORE-ESXI",
++          "condition": "The site's vCenter reaches its target before any managed ESXi host at that site."
++        },
++        {
++          "id": "WITNESS-THIRD-FAULT-DOMAIN",
++          "condition": "The vSAN witness is upgraded before data hosts and remains outside both data sites and outside the stretched management domain."
++        }
++      ],
++      "dependsOn": [
++        "nsx-b",
++        "vc-b",
++        "witness-01"
++      ]
++    },
++    {
++      "order": 18,
++      "phase": 70,
++      "componentId": "esxi-b04",
++      "componentType": "ESXI",
++      "siteId": "site-b",
++      "currentVersion": "8.0 U3e",
++      "target": {
++        "product": "ESXI",
++        "version": "9.1.0.0",
++        "resourceId": "esxi-b04"
++      },
++      "upgradePath": [
++        "8.0 U3e",
++        "9.1.0.0"
++      ],
++      "action": "CONVERGE",
++      "gates": [
++        {
++          "id": "SUPPORTED-UPGRADE-PATH",
++          "condition": "Every adjacent version hop is present in this pinned snapshot's rule for the component type and source version."
++        },
++        {
++          "id": "VCF-INSTALLER-CONVERGE",
++          "condition": "Brownfield vSphere with NSX uses the VCF Installer converge and convert/import workflow rather than independent core-component upgrades."
++        },
++        {
++          "id": "VCENTER-BEFORE-ESXI",
++          "condition": "The site's vCenter reaches its target before any managed ESXi host at that site."
++        },
++        {
++          "id": "WITNESS-THIRD-FAULT-DOMAIN",
++          "condition": "The vSAN witness is upgraded before data hosts and remains outside both data sites and outside the stretched management domain."
++        }
++      ],
++      "dependsOn": [
++        "nsx-b",
++        "vc-b",
++        "witness-01"
++      ]
++    },
++    {
++      "order": 19,
++      "phase": 80,
++      "componentId": "vsan-a",
++      "componentType": "VSAN",
++      "siteId": "site-a",
++      "currentVersion": "8.0 U2d",
++      "target": {
++        "product": "VSAN",
++        "version": "9.1.0.0",
++        "resourceId": "vsan-a"
++      },
++      "upgradePath": [
++        "8.0 U2d",
++        "8.0 U3e",
++        "9.1.0.0"
++      ],
++      "action": "UPGRADE",
++      "gates": [
++        {
++          "id": "SUPPORTED-UPGRADE-PATH",
++          "condition": "Every adjacent version hop is present in this pinned snapshot's rule for the component type and source version."
++        },
++        {
++          "id": "VSAN-AFTER-HOSTS",
++          "condition": "The site's ESXi hosts reach target before the vSAN target and on-disk-format step."
++        }
++      ],
++      "dependsOn": [
++        "esxi-a01",
++        "esxi-a02",
++        "esxi-a03",
++        "esxi-a04"
++      ]
++    },
++    {
++      "order": 20,
++      "phase": 80,
++      "componentId": "vsan-b",
++      "componentType": "VSAN",
++      "siteId": "site-b",
++      "currentVersion": "8.0 U3e",
++      "target": {
++        "product": "VSAN",
++        "version": "9.1.0.0",
++        "resourceId": "vsan-b"
++      },
++      "upgradePath": [
++        "8.0 U3e",
++        "9.1.0.0"
++      ],
++      "action": "UPGRADE",
++      "gates": [
++        {
++          "id": "SUPPORTED-UPGRADE-PATH",
++          "condition": "Every adjacent version hop is present in this pinned snapshot's rule for the component type and source version."
++        },
++        {
++          "id": "VSAN-AFTER-HOSTS",
++          "condition": "The site's ESXi hosts reach target before the vSAN target and on-disk-format step."
++        }
++      ],
++      "dependsOn": [
++        "esxi-b01",
++        "esxi-b02",
++        "esxi-b03",
++        "esxi-b04"
++      ]
++    }
++  ]
++}
+diff --git a/research.md b/research.md
+new file mode 100644
+index 0000000..78ff3f8
+--- /dev/null
++++ b/research.md
+@@ -0,0 +1,27 @@
++# Broadcom compatibility research record
++
++The pinned local snapshot remains the reproducible implementation authority.
++
++| Published source | URL | Date consulted | Decision informed |
++|---|---|---|---|
++| Upgrade Sequence and Related Issues for VMware Cloud Foundation and vSphere Foundation 9.1 (Broadcom KB 440630) | https://knowledge.broadcom.com/external/article/440630/upgrade-sequence-and-related-issues-for.html | 2026-08-14 | A standalone vSphere estate with NSX must use VCF Installer converge/convert-import workflows; VCF Operations precedes the convergence. |
++| Update Sequence for VCF 9.0 and Compatible VMware Products (Broadcom KB 390634) | https://knowledge.broadcom.com/external/article/390634/update-sequence-for-vcf-90-and-compatibl.html | 2026-08-14 | Recovery products precede core SDDC components; core ordering places NSX and vCenter before the witness and ESXi, with the vSAN format step later. |
++| Site Recovery Manager Appliance Upgrade Best Practices (Broadcom KB 385248) | https://knowledge.broadcom.com/external/article/385248/vlsr-site-recovery-manager-appliance-up.html | 2026-08-14 | Site Recovery Manager 8.8 can move directly into the 9.0 release line, and both sites must be checked for vCenter, ESXi, and vSphere Replication interoperability. |
++| Steps to Converge to VMware Live Recovery Appliance 9.0.4 or newer (Broadcom KB 408127) | https://knowledge.broadcom.com/external/article/408127 | 2026-08-14 | The unified 9.0.4 appliance requires Live Site Recovery and vSphere Replication 9.0.2.2 or later before convergence. |
++| VCF Protection and Recovery 9.1: Transition from standalone SRM and VR 9.0.2 (Broadcom KB 444864) | https://knowledge.broadcom.com/external/article/444864/vcf-protection-and-recovery-91-transitio.html | 2026-08-14 | vCenter 9.1 requires transition from standalone SRM/VR to unified VCF Protection and Recovery 9.1; standalone appliances are not an in-place 9.1 target. |
++| VMware Product Interoperability Matrix — Interoperability and Upgrade Path | https://interopmatrix.broadcom.com/ | 2026-08-14 | Cross-checked the exact source families and adjacent upgrade hops represented in the pinned snapshot. |
++
++## Inventory decisions
++
++| Component type | Exact source version(s) | Target | Decision |
++|---|---|---|---|
++| VCF_OPERATIONS | NOT_INSTALLED | VCF_OPERATIONS 9.1.0.0 | Deploy fleet management first. |
++| VSPHERE_REPLICATION | 8.8.0.3; 9.0.2.2 | VCF_PROTECTION_AND_RECOVERY 9.1.0.0 | Reach 9.0.4 and converge each site into its paired appliance. |
++| LIVE_SITE_RECOVERY | 8.8.0.3; 9.0.2.2 | VCF_PROTECTION_AND_RECOVERY 9.1.0.0 | Align with replication at 9.0.4 before convergence. |
++| NSX | 4.1.2.3; 4.2.3.1 | NSX 9.1.0.0 | Use the VCF Installer converge workflow, not an independent upgrade. |
++| VCENTER | 8.0 U2d; 8.0 U3e | VCENTER 9.1.0.0 | Converge after recovery alignment and same-site NSX. |
++| VSAN_WITNESS | 8.0 U2d | VSAN_WITNESS 9.1.0.0 | Upgrade before data hosts and retain the third failure domain. |
++| ESXI | 8.0 U2d; 8.0 U3e | ESXI 9.1.0.0 | Converge after same-site vCenter/NSX and the witness. |
++| VSAN | 8.0 U2d; 8.0 U3e | VSAN 9.1.0.0 | Upgrade the on-disk format after the site's hosts. |
++
++No live-source conflict affecting the fixture was found. The local snapshot deliberately fixes exact intermediate releases and dependency phases so later matrix edits cannot change verification.

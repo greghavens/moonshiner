@@ -1,0 +1,724 @@
+diff --git a/architecture/build.go b/architecture/build.go
+index 87e7865..adf18a8 100644
+--- a/architecture/build.go
++++ b/architecture/build.go
+@@ -1,9 +1,303 @@
+ package architecture
+ 
+-import "fmt"
++import (
++	"encoding/json"
++	"fmt"
++	"os"
++	"sort"
++)
+ 
+ // Build creates the deterministic architecture artifact from the supplied
+ // scenario and pinned compatibility authority.
+ func Build(scenarioPath, snapshotPath string) (Artifact, error) {
+-	return Artifact{}, fmt.Errorf("architecture.Build is not implemented")
++	var scenario Scenario
++	if err := readJSON(scenarioPath, &scenario); err != nil {
++		return Artifact{}, err
++	}
++	var snapshot CompatibilitySnapshot
++	if err := readJSON(snapshotPath, &snapshot); err != nil {
++		return Artifact{}, err
++	}
++	if scenario.TargetRelease != snapshot.TargetRelease || scenario.TargetRelease != scenario.Entitlement.EligibleTargetRelease {
++		return Artifact{}, fmt.Errorf("target release is not covered by the fixture entitlement and snapshot")
++	}
++
++	dataSites, witnessSites := sitesByRole(scenario.Sites)
++	var selected *SupportedTopology
++	var excluded []ExcludedTopology
++	for i := range snapshot.Topologies {
++		topology := &snapshot.Topologies[i]
++		if !technicallyFits(*topology, scenario, dataSites, witnessSites) {
++			continue
++		}
++		if topology.VCFInstances > scenario.Entitlement.MaxVCFInstances {
++			excluded = append(excluded, ExcludedTopology{
++				ID: topology.ID, ReasonCode: "ENTITLEMENT_MAX_VCF_INSTANCES", ConstraintID: scenario.Entitlement.ConstraintID,
++			})
++			continue
++		}
++		if topology.RequiresVSANStretchEntitlement && !scenario.Entitlement.VSANStretchedClusters {
++			continue
++		}
++		if len(scenario.Hosts) > scenario.Entitlement.MaxLicensedHosts {
++			continue
++		}
++		if selected == nil || topology.VCFInstances < selected.VCFInstances {
++			selected = topology
++		}
++	}
++	if selected == nil {
++		return Artifact{}, fmt.Errorf("no supported topology satisfies the scenario and entitlement")
++	}
++	sort.Slice(excluded, func(i, j int) bool { return excluded[i].ID < excluded[j].ID })
++
++	placement := make(map[string][]string, len(dataSites))
++	minCores, minMemory := int(^uint(0)>>1), int(^uint(0)>>1)
++	for _, site := range dataSites {
++		cores, memory := 0, 0
++		for _, host := range scenario.Hosts {
++			if host.Site == site {
++				placement[site] = append(placement[site], host.Hostname)
++				cores += host.Cores
++				memory += host.MemoryGiB
++			}
++		}
++		sort.Strings(placement[site])
++		if cores < minCores {
++			minCores = cores
++		}
++		if memory < minMemory {
++			minMemory = memory
++		}
++	}
++
++	sddcSpec, err := makeSddcSpec(scenario, snapshot.InstallerProfile)
++	if err != nil {
++		return Artifact{}, err
++	}
++	migration, err := makeMigration(scenario, snapshot)
++	if err != nil {
++		return Artifact{}, err
++	}
++
++	var dayNHosts []string
++	for _, site := range dataSites {
++		if site != scenario.InstallerInputs.InitialSite {
++			dayNHosts = append(dayNHosts, placement[site]...)
++		}
++	}
++	sort.Strings(dayNHosts)
++	witnessHost := ""
++	for _, site := range scenario.Sites {
++		if site.Role == "witness" {
++			witnessHost = site.WitnessHost
++		}
++	}
++
++	return Artifact{
++		SchemaVersion:      "1.0",
++		ScenarioID:         scenario.ScenarioID,
++		ExcludedTopologies: excluded,
++		SelectedTopology: TopologyDecision{
++			ID: selected.ID, VCFInstances: selected.VCFInstances, ManagementDomains: selected.ManagementDomains,
++			DataSites: dataSites, WitnessSite: witnessSites[0], HostPlacement: placement,
++			CapacityAfterSiteLoss: Capacity{PhysicalCores: minCores, MemoryGiB: minMemory, UsableStorageTiB: selected.UsableStorageTiB},
++		},
++		SddcSpec:      sddcSpec,
++		DayN:          DayNPlan{Action: "stretch-management-domain", AddHosts: dayNHosts, WitnessHost: witnessHost},
++		MigrationPlan: migration,
++	}, nil
++}
++
++func readJSON(path string, dst any) error {
++	b, err := os.ReadFile(path)
++	if err != nil {
++		return fmt.Errorf("read %s: %w", path, err)
++	}
++	if err := json.Unmarshal(b, dst); err != nil {
++		return fmt.Errorf("decode %s: %w", path, err)
++	}
++	return nil
++}
++
++func sitesByRole(sites []Site) (data, witness []string) {
++	for _, site := range sites {
++		switch site.Role {
++		case "data":
++			data = append(data, site.ID)
++		case "witness":
++			witness = append(witness, site.ID)
++		}
++	}
++	return data, witness
++}
++
++func technicallyFits(topology SupportedTopology, scenario Scenario, dataSites, witnessSites []string) bool {
++	if len(dataSites) != topology.DataSites || len(witnessSites) < topology.WitnessSites ||
++		topology.SurvivesCompleteDataSiteLoss != scenario.AvailabilityRequirements.SurviveCompleteDataSiteLoss ||
++		topology.RPOMinutes > scenario.AvailabilityRequirements.MaxRPOMinutes ||
++		topology.ManagementRecoveryMinutes > scenario.AvailabilityRequirements.MaxManagementRecoveryMinutes ||
++		topology.UsableStorageTiB < scenario.CapacityRequirements.UsableStorageTiB {
++		return false
++	}
++	minCores, minMemory := int(^uint(0)>>1), int(^uint(0)>>1)
++	for _, site := range dataSites {
++		hosts, cores, memory := 0, 0, 0
++		for _, host := range scenario.Hosts {
++			if host.Site == site {
++				hosts++
++				cores += host.Cores
++				memory += host.MemoryGiB
++			}
++		}
++		if hosts < topology.MinHostsPerDataSite {
++			return false
++		}
++		if cores < minCores {
++			minCores = cores
++		}
++		if memory < minMemory {
++			minMemory = memory
++		}
++	}
++	if minCores < scenario.CapacityRequirements.PhysicalCores || minMemory < scenario.CapacityRequirements.MemoryGiB {
++		return false
++	}
++	for _, link := range scenario.Links {
++		fromData, toData := containsString(dataSites, link.From), containsString(dataSites, link.To)
++		if fromData && toData && link.RTTMillis > topology.MaxDataSiteRTTMillis {
++			return false
++		}
++		if topology.WitnessSites > 0 && (containsString(witnessSites, link.From) || containsString(witnessSites, link.To)) && link.RTTMillis > topology.MaxWitnessRTTMillis {
++			return false
++		}
++	}
++	return true
++}
++
++func makeSddcSpec(scenario Scenario, profile InstallerProfile) (json.RawMessage, error) {
++	input := scenario.InstallerInputs
++	var hosts []any
++	for _, host := range scenario.Hosts {
++		if host.Site == input.InitialSite {
++			hosts = append(hosts, map[string]any{"hostname": host.Hostname})
++		}
++	}
++	if len(hosts) != profile.InitialHostCount {
++		return nil, fmt.Errorf("initial site has %d hosts, want %d", len(hosts), profile.InitialHostCount)
++	}
++
++	var networks []any
++	var networkTypes []string
++	for _, network := range input.Networks {
++		ranges := make([]any, len(network.IPRanges))
++		for i, r := range network.IPRanges {
++			ranges[i] = map[string]any{"startIpAddress": r.Start, "endIpAddress": r.End}
++		}
++		networks = append(networks, map[string]any{
++			"networkType": network.Type, "vlanId": network.VLAN, "subnet": network.CIDR,
++			"gateway": network.Gateway, "subnetMask": network.SubnetMask, "mtu": network.MTU,
++			"includeIpAddressRanges": ranges, "ipAddressVersion": "IPv4", "ipAddressAssignmentMode": "STATIC",
++		})
++		networkTypes = append(networkTypes, network.Type)
++	}
++
++	nsxManagers := make([]any, len(input.NSXManagerHostnames))
++	for i, hostname := range input.NSXManagerHostnames {
++		nsxManagers[i] = map[string]any{"hostname": hostname}
++	}
++	operationsNodes := make([]any, profile.VCFOperationsNodeCount)
++	for i := range operationsNodes {
++		operationsNodes[i] = map[string]any{
++			"hostname": fmt.Sprintf("ops%02d.%s", i+1, input.Subdomain),
++			"type":     []string{"master", "replica", "data"}[i],
++		}
++	}
++
++	service := func() map[string]any { return map[string]any{"version": scenario.TargetRelease, "size": "small"} }
++	spec := map[string]any{
++		"sddcId": input.SddcID, "workflowType": profile.WorkflowType, "version": scenario.TargetRelease,
++		"vcfInstanceName": input.VCFInstanceName, "hostSpecs": hosts,
++		"vcenterSpec": map[string]any{
++			"vcenterHostname": input.VCenterHostname, "rootVcenterPassword": "${VC_ROOT_PASS}",
++			"vmSize": "medium", "storageSize": "lstorage", "ssoDomain": "vsphere.local", "useExistingDeployment": false,
++		},
++		"clusterSpec": map[string]any{
++			"datacenterName": input.DatacenterName, "clusterName": input.ClusterName, "clusterEvcMode": "INTEL_SAPPHIRERAPIDS",
++		},
++		"dvsSpecs": []any{map[string]any{
++			"dvsName": "vds-mgmt", "networks": networkTypes, "mtu": 9000,
++			"vmnicsToUplinks": []any{
++				map[string]any{"id": "vmnic0", "uplink": "uplink1"},
++				map[string]any{"id": "vmnic1", "uplink": "uplink2"},
++			},
++		}},
++		"nsxtSpec": map[string]any{
++			"nsxtManagers": nsxManagers, "nsxtManagerSize": "medium", "vipFqdn": input.NSXVIPFQDN,
++			"transportVlanId": networkVLAN(input.Networks, "VM_MANAGEMENT"), "useExistingDeployment": false,
++		},
++		"networkSpecs":       networks,
++		"dnsSpec":            map[string]any{"subdomain": input.Subdomain, "nameservers": input.NameServers},
++		"ntpServers":         input.NTPServers,
++		"sddcManagerSpec":    map[string]any{"hostname": input.SDDCManagerHostname, "useExistingDeployment": false},
++		"managementPoolName": input.ManagementPoolName,
++		"ceipEnabled":        false, "skipEsxThumbprintValidation": false, "skipGatewayPingValidation": false,
++		"securitySpec": map[string]any{"esxiCertsMode": "VMCA"},
++		"datastoreSpec": map[string]any{"vsanSpec": map[string]any{
++			"datastoreName": "vsan-mgmt", "esaConfig": map[string]any{"enabled": true}, "failuresToTolerate": profile.VSANFailuresToTolerate,
++		}},
++		"vspClusterSpec": map[string]any{
++			"platformFqdn": input.VSPPlatformFQDN, "instanceFqdn": input.VSPInstanceFQDN, "fleetFqdn": input.VSPFleetFQDN,
++			"ipv4Pool": map[string]any{"addresses": input.ManagementServiceIPs}, "size": "small", "version": scenario.TargetRelease,
++		},
++		"fleetLcmSpec": service(), "sddcLcmSpec": service(), "fleetDepotSpec": service(), "telemetryAcceptorSpec": service(),
++		"saltSpec": service(), "saltRaasSpec": service(),
++		"vcfOperationsSpec": map[string]any{
++			"nodes": operationsNodes, "applianceSize": "medium", "useExistingDeployment": false, "version": scenario.TargetRelease,
++		},
++		"licenseServerSpec": map[string]any{"hostname": input.LicenseServerHostname, "version": scenario.TargetRelease, "useExistingDeployment": false},
++	}
++	b, err := json.Marshal(spec)
++	return json.RawMessage(b), err
++}
++
++func makeMigration(scenario Scenario, snapshot CompatibilitySnapshot) (MigrationPlan, error) {
++	inventory := make(map[string]ExistingComponent, len(scenario.ExistingEstate.Components))
++	for _, component := range scenario.ExistingEstate.Components {
++		inventory[component.ID] = component
++	}
++	steps := make([]MigrationStep, len(snapshot.Migration.Steps))
++	for i, pinned := range snapshot.Migration.Steps {
++		component, ok := inventory[pinned.ComponentID]
++		if !ok {
++			return MigrationPlan{}, fmt.Errorf("migration component %s is absent from inventory", pinned.ComponentID)
++		}
++		steps[i] = MigrationStep{
++			Order: pinned.Order, ComponentID: component.ID, ComponentName: component.Name,
++			FromVersion: component.Version, Action: pinned.Action, TargetVersion: pinned.TargetVersion,
++			Gates: append([]string(nil), pinned.Gates...),
++		}
++	}
++	if len(steps) != len(inventory) {
++		return MigrationPlan{}, fmt.Errorf("migration snapshot and inventory component counts differ")
++	}
++	return MigrationPlan{SchemaVersion: "1.0", EstateID: scenario.ExistingEstate.EstateID, TargetVCFVersion: snapshot.Migration.TargetVCFVersion, Steps: steps}, nil
++}
++
++func networkVLAN(networks []Network, networkType string) int {
++	for _, network := range networks {
++		if network.Type == networkType {
++			return network.VLAN
++		}
++	}
++	return 0
++}
++
++func containsString(values []string, wanted string) bool {
++	for _, value := range values {
++		if value == wanted {
++			return true
++		}
++	}
++	return false
+ }
+diff --git a/architecture.json b/architecture.json
+new file mode 100644
+index 0000000..8269c74
+--- /dev/null
++++ b/architecture.json
+@@ -0,0 +1,394 @@
++{
++  "schemaVersion": "1.0",
++  "scenarioId": "dal-metro-private-cloud",
++  "selectedTopology": {
++    "id": "single-vcf-instance-stretched-management-domain",
++    "vcfInstances": 1,
++    "managementDomains": 1,
++    "dataSites": [
++      "dal-a",
++      "dal-b"
++    ],
++    "witnessSite": "dal-w",
++    "hostPlacement": {
++      "dal-a": [
++        "dal-a-esx01",
++        "dal-a-esx02",
++        "dal-a-esx03",
++        "dal-a-esx04"
++      ],
++      "dal-b": [
++        "dal-b-esx01",
++        "dal-b-esx02",
++        "dal-b-esx03",
++        "dal-b-esx04"
++      ]
++    },
++    "capacityAfterSiteLoss": {
++      "physicalCores": 256,
++      "memoryGiB": 4096,
++      "usableStorageTiB": 48
++    }
++  },
++  "excludedTopologies": [
++    {
++      "id": "dual-vcf-independent-instances",
++      "reasonCode": "ENTITLEMENT_MAX_VCF_INSTANCES",
++      "constraintId": "ent-vcf91-instance-count"
++    }
++  ],
++  "sddcSpec": {
++    "ceipEnabled": false,
++    "clusterSpec": {
++      "clusterEvcMode": "INTEL_SAPPHIRERAPIDS",
++      "clusterName": "DAL-MGMT-CL01",
++      "datacenterName": "DAL-MGMT"
++    },
++    "datastoreSpec": {
++      "vsanSpec": {
++        "datastoreName": "vsan-mgmt",
++        "esaConfig": {
++          "enabled": true
++        },
++        "failuresToTolerate": 1
++      }
++    },
++    "dnsSpec": {
++      "nameservers": [
++        "10.10.110.10",
++        "10.10.110.11"
++      ],
++      "subdomain": "vcf.example.com"
++    },
++    "dvsSpecs": [
++      {
++        "dvsName": "vds-mgmt",
++        "mtu": 9000,
++        "networks": [
++          "MANAGEMENT",
++          "VSAN",
++          "VMOTION",
++          "VM_MANAGEMENT"
++        ],
++        "vmnicsToUplinks": [
++          {
++            "id": "vmnic0",
++            "uplink": "uplink1"
++          },
++          {
++            "id": "vmnic1",
++            "uplink": "uplink2"
++          }
++        ]
++      }
++    ],
++    "fleetDepotSpec": {
++      "size": "small",
++      "version": "9.1.0.0"
++    },
++    "fleetLcmSpec": {
++      "size": "small",
++      "version": "9.1.0.0"
++    },
++    "hostSpecs": [
++      {
++        "hostname": "dal-a-esx01"
++      },
++      {
++        "hostname": "dal-a-esx02"
++      },
++      {
++        "hostname": "dal-a-esx03"
++      },
++      {
++        "hostname": "dal-a-esx04"
++      }
++    ],
++    "licenseServerSpec": {
++      "hostname": "license01.vcf.example.com",
++      "useExistingDeployment": false,
++      "version": "9.1.0.0"
++    },
++    "managementPoolName": "dal-mgmt-pool",
++    "networkSpecs": [
++      {
++        "gateway": "10.10.110.1",
++        "includeIpAddressRanges": [
++          {
++            "endIpAddress": "10.10.110.99",
++            "startIpAddress": "10.10.110.20"
++          }
++        ],
++        "ipAddressAssignmentMode": "STATIC",
++        "ipAddressVersion": "IPv4",
++        "mtu": 9000,
++        "networkType": "MANAGEMENT",
++        "subnet": "10.10.110.0/24",
++        "subnetMask": "255.255.255.0",
++        "vlanId": 110
++      },
++      {
++        "gateway": "10.10.120.1",
++        "includeIpAddressRanges": [
++          {
++            "endIpAddress": "10.10.120.39",
++            "startIpAddress": "10.10.120.20"
++          }
++        ],
++        "ipAddressAssignmentMode": "STATIC",
++        "ipAddressVersion": "IPv4",
++        "mtu": 9000,
++        "networkType": "VSAN",
++        "subnet": "10.10.120.0/24",
++        "subnetMask": "255.255.255.0",
++        "vlanId": 120
++      },
++      {
++        "gateway": "10.10.130.1",
++        "includeIpAddressRanges": [
++          {
++            "endIpAddress": "10.10.130.39",
++            "startIpAddress": "10.10.130.20"
++          }
++        ],
++        "ipAddressAssignmentMode": "STATIC",
++        "ipAddressVersion": "IPv4",
++        "mtu": 9000,
++        "networkType": "VMOTION",
++        "subnet": "10.10.130.0/24",
++        "subnetMask": "255.255.255.0",
++        "vlanId": 130
++      },
++      {
++        "gateway": "10.10.140.1",
++        "includeIpAddressRanges": [
++          {
++            "endIpAddress": "10.10.140.99",
++            "startIpAddress": "10.10.140.20"
++          }
++        ],
++        "ipAddressAssignmentMode": "STATIC",
++        "ipAddressVersion": "IPv4",
++        "mtu": 9000,
++        "networkType": "VM_MANAGEMENT",
++        "subnet": "10.10.140.0/24",
++        "subnetMask": "255.255.255.0",
++        "vlanId": 140
++      }
++    ],
++    "nsxtSpec": {
++      "nsxtManagerSize": "medium",
++      "nsxtManagers": [
++        {
++          "hostname": "nsx01.vcf.example.com"
++        },
++        {
++          "hostname": "nsx02.vcf.example.com"
++        },
++        {
++          "hostname": "nsx03.vcf.example.com"
++        }
++      ],
++      "transportVlanId": 140,
++      "useExistingDeployment": false,
++      "vipFqdn": "nsx-vip.vcf.example.com"
++    },
++    "ntpServers": [
++      "10.10.110.12",
++      "10.10.110.13"
++    ],
++    "saltRaasSpec": {
++      "size": "small",
++      "version": "9.1.0.0"
++    },
++    "saltSpec": {
++      "size": "small",
++      "version": "9.1.0.0"
++    },
++    "sddcId": "dal01-m01",
++    "sddcLcmSpec": {
++      "size": "small",
++      "version": "9.1.0.0"
++    },
++    "sddcManagerSpec": {
++      "hostname": "sddc01.vcf.example.com",
++      "useExistingDeployment": false
++    },
++    "securitySpec": {
++      "esxiCertsMode": "VMCA"
++    },
++    "skipEsxThumbprintValidation": false,
++    "skipGatewayPingValidation": false,
++    "telemetryAcceptorSpec": {
++      "size": "small",
++      "version": "9.1.0.0"
++    },
++    "vcenterSpec": {
++      "rootVcenterPassword": "${VC_ROOT_PASS}",
++      "ssoDomain": "vsphere.local",
++      "storageSize": "lstorage",
++      "useExistingDeployment": false,
++      "vcenterHostname": "vc01-mgmt.vcf.example.com",
++      "vmSize": "medium"
++    },
++    "vcfInstanceName": "dal-metro-01",
++    "vcfOperationsSpec": {
++      "applianceSize": "medium",
++      "nodes": [
++        {
++          "hostname": "ops01.vcf.example.com",
++          "type": "master"
++        },
++        {
++          "hostname": "ops02.vcf.example.com",
++          "type": "replica"
++        },
++        {
++          "hostname": "ops03.vcf.example.com",
++          "type": "data"
++        }
++      ],
++      "useExistingDeployment": false,
++      "version": "9.1.0.0"
++    },
++    "version": "9.1.0.0",
++    "vspClusterSpec": {
++      "fleetFqdn": "vsp-fleet.vcf.example.com",
++      "instanceFqdn": "vsp-instance.vcf.example.com",
++      "ipv4Pool": {
++        "addresses": [
++          "10.10.110.50",
++          "10.10.110.51",
++          "10.10.110.52",
++          "10.10.110.53",
++          "10.10.110.54",
++          "10.10.110.55",
++          "10.10.110.56",
++          "10.10.110.57",
++          "10.10.110.58",
++          "10.10.110.59",
++          "10.10.110.60",
++          "10.10.110.61"
++        ]
++      },
++      "platformFqdn": "vsp-platform.vcf.example.com",
++      "size": "small",
++      "version": "9.1.0.0"
++    },
++    "workflowType": "VCF"
++  },
++  "dayN": {
++    "action": "stretch-management-domain",
++    "addHosts": [
++      "dal-b-esx01",
++      "dal-b-esx02",
++      "dal-b-esx03",
++      "dal-b-esx04"
++    ],
++    "witnessHost": "dal-w-witness01"
++  },
++  "migrationPlan": {
++    "schemaVersion": "1.0",
++    "estateId": "dal-legacy-vcf",
++    "targetVcfVersion": "9.1.0.0",
++    "steps": [
++      {
++        "order": 1,
++        "componentId": "vcf-operations",
++        "componentName": "VMware Cloud Foundation Operations",
++        "fromVersion": "9.0.2.0",
++        "action": "upgrade",
++        "targetVersion": "9.1.0.0",
++        "gates": [
++          "v9-entitlement-present",
++          "vcf-operations-precheck-green"
++        ]
++      },
++      {
++        "order": 2,
++        "componentId": "vcf-license-server",
++        "componentName": "VMware Cloud Foundation License Server",
++        "fromVersion": "not-installed",
++        "action": "install",
++        "targetVersion": "9.1.0.0",
++        "gates": [
++          "vcf-operations@9.1.0.0",
++          "forward-reverse-dns-ready"
++        ]
++      },
++      {
++        "order": 3,
++        "componentId": "vcf-management-services",
++        "componentName": "VMware Cloud Foundation Management Services",
++        "fromVersion": "not-installed",
++        "action": "install",
++        "targetVersion": "9.1.0.0",
++        "gates": [
++          "vcf-license-server@9.1.0.0",
++          "management-ip-pool-12-free"
++        ]
++      },
++      {
++        "order": 4,
++        "componentId": "sddc-manager",
++        "componentName": "VMware SDDC Manager",
++        "fromVersion": "5.2.2-24936865",
++        "action": "upgrade",
++        "targetVersion": "9.1.0.0",
++        "gates": [
++          "vcf-operations@9.1.0.0",
++          "vcf-management-services@9.1.0.0",
++          "lcm-precheck-green"
++        ]
++      },
++      {
++        "order": 5,
++        "componentId": "nsx",
++        "componentName": "VMware NSX",
++        "fromVersion": "4.2.3-24866349",
++        "action": "upgrade",
++        "targetVersion": "9.1.0.0",
++        "gates": [
++          "sddc-manager@9.1.0.0",
++          "nsx-precheck-green"
++        ]
++      },
++      {
++        "order": 6,
++        "componentId": "vcenter-server",
++        "componentName": "VMware vCenter Server",
++        "fromVersion": "8.0.3.00600-24853646",
++        "action": "upgrade",
++        "targetVersion": "9.1.0.0",
++        "gates": [
++          "nsx@9.1.0.0",
++          "vcenter-backup-complete"
++        ]
++      },
++      {
++        "order": 7,
++        "componentId": "esxi",
++        "componentName": "VMware ESXi",
++        "fromVersion": "8.0.3-24859861",
++        "action": "upgrade",
++        "targetVersion": "9.1.0.0",
++        "gates": [
++          "vcenter-server@9.1.0.0",
++          "cluster-remediation-precheck-green"
++        ]
++      },
++      {
++        "order": 8,
++        "componentId": "vsan-witness",
++        "componentName": "VMware vSAN Witness Appliance",
++        "fromVersion": "8.0.3-24022510",
++        "action": "upgrade",
++        "targetVersion": "9.1.0.0",
++        "gates": [
++          "esxi@9.1.0.0",
++          "vsan-health-green"
++        ]
++      }
++    ]
++  }
++}
+diff --git a/research.md b/research.md
+new file mode 100644
+index 0000000..78de576
+--- /dev/null
++++ b/research.md
+@@ -0,0 +1,8 @@
++# Sources consulted
++
++- **vSAN Cluster Deployment Options** — Broadcom Support, consulted 2026-08-14, https://knowledge.broadcom.com/external/article/326549/vsan-cluster-deployment-options.html — used to confirm that a stretched vSAN cluster distributes hosts across two data sites, survives the loss of a site, uses a witness at a third site, and requires no more than 5 ms between data sites.
++- **vSAN Health Test 'Site latency health' status changed from 'green' to 'yellow'** — Broadcom Support, consulted 2026-08-14, https://knowledge.broadcom.com/external/article/412056/vsan-health-test-site-latency-health-sta.html — used to confirm the 5 ms data-site and 200 ms witness latency limits for stretched vSAN.
++- **Upgrade Sequence and Related Issues for VMware Cloud Foundation and vSphere Foundation 9.1** — Broadcom Support, consulted 2026-08-14, https://knowledge.broadcom.com/external/article/440630/upgrade-sequence-and-related-issues-for.html — used for the mandatory VCF Operations-first sequence, VCF Management Services, centralized license server, management-service IP requirement, and 5.2.x-to-9.1 LCM path.
++- **Correlating VMware Cloud Foundation version with the versions of its constituent products** — Broadcom Support, consulted 2026-08-14, https://knowledge.broadcom.com/external/article/314608/correlating-vmware-cloud-foundation-vers.html — used to confirm the pinned VCF 5.2.2 constituent versions for SDDC Manager, vCenter Server, ESXi, vSAN Witness, and NSX.
++- **Update path from VMware Cloud Foundation or VMware vSphere Foundation V8 to V9** — Broadcom Support, consulted 2026-08-14, https://knowledge.broadcom.com/external/article/437250/update-path-from-vmware-cloud-foundation.html — used to confirm that a V9-eligible subscription entitlement and VCF Operations are prerequisites for V9 licensing.
++- **VMware Cloud Foundation Installer API Reference Guide 9.1.0.0** — VMware by Broadcom, consulted 2026-08-14, https://github.com/vmware/vcf-api-specs/blob/9.1.0.0/specifications/vcf-installer/vcf-installer-openapi.json — used for the installer `SddcSpec` fields and constraints.

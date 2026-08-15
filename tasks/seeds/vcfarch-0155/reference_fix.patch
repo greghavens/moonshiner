@@ -1,0 +1,813 @@
+diff --git a/VcfAriaMigration/VcfAriaMigration.psd1 b/VcfAriaMigration/VcfAriaMigration.psd1
+new file mode 100644
+index 0000000..a4defff
+--- /dev/null
++++ b/VcfAriaMigration/VcfAriaMigration.psd1
+@@ -0,0 +1,20 @@
++@{
++    RootModule = 'VcfAriaMigration.psm1'
++    ModuleVersion = '1.0.0'
++    GUID = '68195732-9e42-4983-94a5-f67f0187bcd7'
++    Author = 'VCF Platform Architecture'
++    CompanyName = 'Example'
++    Copyright = '(c) VCF Platform Architecture'
++    Description = 'Generates the pinned Aria-to-VCF migration architecture.'
++    PowerShellVersion = '7.2'
++    RequiredModules = @(
++        @{
++            ModuleName = 'VMware.Sdk.Vcf.SddcManager'
++            RequiredVersion = '13.5.0.25380678'
++        }
++    )
++    FunctionsToExport = @('New-VcfAriaMigrationPlan')
++    CmdletsToExport = @()
++    VariablesToExport = @()
++    AliasesToExport = @()
++}
+diff --git a/VcfAriaMigration/VcfAriaMigration.psm1 b/VcfAriaMigration/VcfAriaMigration.psm1
+new file mode 100644
+index 0000000..8e66ca3
+--- /dev/null
++++ b/VcfAriaMigration/VcfAriaMigration.psm1
+@@ -0,0 +1,302 @@
++Set-StrictMode -Version Latest
++
++function Read-JsonDocument {
++    param([Parameter(Mandatory)][string]$Path)
++
++    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
++        throw "Required JSON document was not found: $Path"
++    }
++    Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 100
++}
++
++function Select-PlacementProfile {
++    param(
++        [Parameter(Mandatory)][string]$Component,
++        [Parameter(Mandatory)]$Rules,
++        [Parameter(Mandatory)]$Inputs
++    )
++
++    foreach ($profile in $Rules.profiles) {
++        $fits = switch ($Component) {
++            'VCF Operations' {
++                $Inputs.operations.object_count -le $profile.max_objects -and
++                $Inputs.operations.metric_count -le $profile.max_metrics
++            }
++            'VCF Automation' {
++                $Inputs.automation.maximum_concurrent_deployments -le $profile.max_concurrent_deployments
++            }
++            'VCF Operations for Logs' {
++                $required = $Inputs.logs.daily_ingest_gib * $Inputs.logs.retention_days * $Rules.storage_headroom_factor
++                $usable = $profile.node_count * $profile.storage_gib_per_node * $Rules.usable_storage_fraction
++                $usable -ge $required
++            }
++            default { throw "Unknown placement component: $Component" }
++        }
++        if ($fits) { return $profile }
++    }
++    throw "No installed sizing profile covers $Component"
++}
++
++function New-GateRecord {
++    param([Parameter(Mandatory)][string]$GateId)
++
++    $records = @{
++        lcm_patch2 = @('pre', 'Aria Suite Lifecycle is at 8.18 Patch 2 before the fleet transition begins.', 'Lifecycle appliance version and patch inventory')
++        ops_health_backup = @('pre', 'The Operations cluster is online, balanced, and has a successful supported backup.', 'Cluster health export and backup job result')
++        management_pack_compatibility = @('pre', 'Every installed management pack has an explicit target disposition and supported packs have target binaries.', 'Signed management-pack compatibility inventory')
++        cloud_proxy_capacity = @('pre', 'Replacement Cloud Proxies are sized, deployed, and mapped for both legacy Remote Collectors.', 'Cloud Proxy health and collector-group mapping')
++        ops_post_upgrade_validation = @('post', 'VCF Operations collection, retained history, dashboards, alerts, policies, and reports pass validation.', 'Post-upgrade functional validation record')
++        fleet_ops_ready = @('pre', 'VCF Operations Fleet Management is healthy and connected to the management domain.', 'Fleet Management health and domain connection status')
++        automation_backup_health = @('pre', 'Aria Automation services are healthy and a supported backup has completed.', 'Service health and backup job result')
++        identity_broker_mapping = @('pre', 'Identity sources, groups, tenant names, and deployment owners have a tested VCF Identity Broker mapping.', 'Identity mapping and representative login tests')
++        automation_post_upgrade_validation = @('post', 'Projects, templates, catalog requests, deployments, subscriptions, ABX actions, and Orchestrator workflows pass tests.', 'Automation regression and ownership validation record')
++        fresh_logs_cluster_ready = @('pre', 'The new VCF Operations for Logs cluster is deployed, sized, licensed, and healthy in parallel.', 'Target cluster health and capacity report')
++        integrations_recreated = @('pre', 'Every source, archive, forwarder, and product integration is configured on the new cluster.', 'Source-to-target integration reconciliation')
++        content_import_validated = @('pre', 'Custom content packs, alerts, saved queries, and dashboards are imported and return expected results.', 'Content inventory and functional test results')
++        ninety_day_transfer_complete = @('pre', 'The supported 90-day data transfer is complete and the transferred time range is searchable.', 'Data-transfer completion and oldest/newest event timestamps')
++        dual_ingest_cutover_validated = @('post', 'New ingestion is stable through both fabrics and the legacy cluster remains available for older retained data.', 'Ingestion-rate, loss, query, and legacy-access checks')
++    }
++    if (-not $records.ContainsKey($GateId)) { throw "No gate definition is installed for $GateId" }
++    $record = $records[$GateId]
++    [pscustomobject][ordered]@{
++        gate_id = $GateId
++        phase = $record[0]
++        condition = $record[1]
++        evidence = $record[2]
++    }
++}
++
++function New-VcfAriaMigrationPlan {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)][string]$InventoryPath,
++        [Parameter(Mandatory)][string]$CompatibilityPath,
++        [Parameter(Mandatory)][string]$InstallerSpecificationPath,
++        [Parameter(Mandatory)][string]$OutputPath
++    )
++
++    $inventory = Read-JsonDocument -Path $InventoryPath
++    $snapshot = Read-JsonDocument -Path $CompatibilityPath
++    $installer = Read-JsonDocument -Path $InstallerSpecificationPath
++
++    if ($installer.module_contract.required_sdk_module -ne 'VMware.Sdk.Vcf.SddcManager') {
++        throw 'The installer does not declare the expected VMware SDDC Manager SDK module.'
++    }
++    $operationCatalog = @(Get-VcfSddcManagerOperation)
++    if ($operationCatalog.Count -eq 0) {
++        throw 'The VMware SDDC Manager SDK operation catalog is empty.'
++    }
++
++    $vcf = $inventory.vcf_inventory
++    $common = $snapshot.placement_rules.common
++    $components = @('VCF Operations', 'VCF Automation', 'VCF Operations for Logs')
++    $placements = foreach ($component in $components) {
++        $rules = $snapshot.placement_rules.$component
++        $profile = Select-PlacementProfile -Component $component -Rules $rules -Inputs $inventory.design_inputs
++        $basis = switch ($component) {
++            'VCF Operations' {
++                @(
++                    "objects=$($inventory.design_inputs.operations.object_count)",
++                    "metrics=$($inventory.design_inputs.operations.metric_count)",
++                    "ha=$($inventory.design_inputs.operations.ha_required.ToString().ToLowerInvariant())"
++                )
++            }
++            'VCF Automation' {
++                @(
++                    "maximum_concurrent_deployments=$($inventory.design_inputs.automation.maximum_concurrent_deployments)",
++                    "ha=$($inventory.design_inputs.automation.ha_required.ToString().ToLowerInvariant())"
++                )
++            }
++            'VCF Operations for Logs' {
++                $required = $inventory.design_inputs.logs.daily_ingest_gib * $inventory.design_inputs.logs.retention_days * $rules.storage_headroom_factor
++                @(
++                    "daily_ingest_gib=$($inventory.design_inputs.logs.daily_ingest_gib)",
++                    "retention_days=$($inventory.design_inputs.logs.retention_days)",
++                    "required_usable_storage_gib=$required",
++                    "ha=$($inventory.design_inputs.logs.ha_required.ToString().ToLowerInvariant())"
++                )
++            }
++        }
++        [pscustomobject][ordered]@{
++            component = $component
++            version = $snapshot.target_release
++            domain = $vcf.($common.domain_inventory_key)
++            cluster = $vcf.($common.cluster_inventory_key)
++            resource_pool = $vcf.($common.resource_pool_inventory_key)
++            network = $vcf.($common.network_inventory_key)
++            profile = $profile.name
++            node_count = $profile.node_count
++            vcpu_per_node = $profile.vcpu_per_node
++            memory_gib_per_node = $profile.memory_gib_per_node
++            storage_gib_per_node = $profile.storage_gib_per_node
++            sizing_basis = $basis
++        }
++    }
++
++    $requiredThroughput = $inventory.design_inputs.north_south.failure_survivable_peak_gbps
++    $edgeProfile = $null
++    foreach ($candidate in $snapshot.edge_rules.profiles) {
++        if ($candidate.production_allowed -and $candidate.max_validated_throughput_gbps -ge $requiredThroughput) {
++            $edgeProfile = $candidate
++            break
++        }
++    }
++    if ($null -eq $edgeProfile) { throw 'No production Edge profile covers the failure-survivable peak.' }
++
++    $edgeVnics = foreach ($layout in $snapshot.edge_rules.edge_vnic_layout) {
++        if ($layout.role -eq 'overlay') {
++            $network = $vcf.($layout.network_inventory_key)
++            [pscustomobject][ordered]@{
++                vnic = $layout.vnic
++                role = $layout.role
++                network = $network.name
++                vlan = $network.vlan
++                fabric = $layout.fabric
++                peer_ip = $null
++            }
++        }
++        else {
++            $uplink = $vcf.northbound_uplinks[$layout.uplink_index]
++            [pscustomobject][ordered]@{
++                vnic = $layout.vnic
++                role = $layout.role
++                network = $uplink.name
++                vlan = $uplink.vlan
++                fabric = $uplink.fabric
++                peer_ip = $uplink.peer_ip
++            }
++        }
++    }
++    $peers = foreach ($uplink in $vcf.northbound_uplinks) {
++        [pscustomobject][ordered]@{
++            name = $uplink.name
++            peer_ip = $uplink.peer_ip
++            peer_asn = $uplink.peer_asn
++            vlan = $uplink.vlan
++            fabric = $uplink.fabric
++        }
++    }
++    $nicSpeeds = @($vcf.edge_host_nics | ForEach-Object { [double]$_.speed_gbps })
++    $edgePlacementKeys = $snapshot.edge_rules.placement_keys
++    $edgeDesign = [pscustomobject][ordered]@{
++        placement = [pscustomobject][ordered]@{
++            domain = $vcf.($edgePlacementKeys.domain)
++            cluster = $vcf.($edgePlacementKeys.cluster)
++            resource_pool = $vcf.($edgePlacementKeys.resource_pool)
++            management_network = $vcf.($edgePlacementKeys.management_network)
++        }
++        form_factor = $edgeProfile.name
++        node_count = $snapshot.edge_rules.node_count
++        ha_mode = $snapshot.edge_rules.ha_mode
++        vcpu_per_node = $edgeProfile.vcpu_per_node
++        memory_gib_per_node = $edgeProfile.memory_gib_per_node
++        throughput = [pscustomobject][ordered]@{
++            sustained_gbps = $inventory.design_inputs.north_south.sustained_gbps
++            peak_gbps = $inventory.design_inputs.north_south.peak_gbps
++            failure_survivable_peak_gbps = $requiredThroughput
++            profile_limit_gbps = $edgeProfile.max_validated_throughput_gbps
++        }
++        host_pnics = @($vcf.edge_host_nics)
++        edge_vnics = @($edgeVnics)
++        routing = [pscustomobject][ordered]@{
++            local_asn = $vcf.edge_local_asn
++            peers = @($peers)
++        }
++        mtu = $vcf.transport_mtu
++        aggregate_physical_capacity_gbps = ($nicSpeeds | Measure-Object -Sum).Sum
++        single_fabric_capacity_gbps = ($nicSpeeds | Measure-Object -Minimum).Minimum
++    }
++
++    $sourcesById = @{}
++    foreach ($source in $inventory.source_products) { $sourcesById[$source.id] = $source }
++    $migrationSteps = for ($index = 0; $index -lt $snapshot.migration_order.Count; $index++) {
++        $sourceId = $snapshot.migration_order[$index]
++        $source = $sourcesById[$sourceId]
++        $productRule = $snapshot.products.$sourceId
++        $carry = [System.Collections.Generic.List[object]]::new()
++        $abandoned = [System.Collections.Generic.List[object]]::new()
++        foreach ($content in $source.content) {
++            $rule = $productRule.content_rules.($content.kind)
++            if ($rule.disposition -eq 'carry') {
++                $carry.Add([pscustomobject][ordered]@{
++                    content_id = $content.id
++                    method = $rule.method
++                    target_state = $rule.target_state
++                })
++            }
++            else {
++                $abandoned.Add([pscustomobject][ordered]@{
++                    content_id = $content.id
++                    reason = $rule.reason
++                })
++            }
++        }
++        $gates = foreach ($gateId in $productRule.required_gate_ids) { New-GateRecord -GateId $gateId }
++        [pscustomobject][ordered]@{
++            order = $index + 1
++            id = "migrate-$sourceId"
++            source = [pscustomobject][ordered]@{
++                id = $source.id
++                product = $source.product
++                version = $source.version
++            }
++            target = [pscustomobject][ordered]@{
++                component = $productRule.target_component
++                version = $productRule.target_version
++            }
++            migration_mode = $productRule.migration_mode
++            placement_ref = $productRule.placement_component
++            carries_forward = @($carry)
++            abandoned = @($abandoned)
++            gates = @($gates)
++        }
++    }
++
++    $boundaries = foreach ($sourceId in $snapshot.migration_order) {
++        $source = $sourcesById[$sourceId]
++        $productRule = $snapshot.products.$sourceId
++        $implication = switch ($productRule.migration_mode) {
++            'fleet_managed_in_place_upgrade' {
++                "Complete the supported in-place fleet upgrade before $($productRule.end_of_general_support) and validate retained analytics and content."
++            }
++            'fleet_import_then_in_place_upgrade' {
++                "Import and upgrade the existing integrated instance before $($productRule.end_of_general_support) while replacing legacy identity dependencies."
++            }
++            'parallel_fresh_deployment' {
++                "Run the fresh target in parallel and transfer the supported data window before $($productRule.end_of_general_support)."
++            }
++            default { throw "Unknown migration mode: $($productRule.migration_mode)" }
++        }
++        [pscustomobject][ordered]@{
++            source_id = $sourceId
++            product = $source.product
++            version = $source.version
++            end_of_general_support = $productRule.end_of_general_support
++            status_at_snapshot = $productRule.support_status_at_snapshot
++            plan_implication = $implication
++        }
++    }
++
++    $plan = [pscustomobject][ordered]@{
++        schema_version = $installer.specification_version
++        plan_id = "$($inventory.estate_id)-aria-to-vcf"
++        estate_id = $inventory.estate_id
++        compatibility_snapshot = $snapshot.snapshot_id
++        design_basis_date = $snapshot.as_of
++        target_release = $snapshot.target_release
++        placements = @($placements)
++        edge_design = $edgeDesign
++        migration_steps = @($migrationSteps)
++        lifecycle_boundaries = @($boundaries)
++    }
++
++    $parent = Split-Path -Parent $OutputPath
++    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
++        New-Item -ItemType Directory -Path $parent -Force | Out-Null
++    }
++    $json = $plan | ConvertTo-Json -Depth 30
++    [System.IO.File]::WriteAllText($OutputPath, $json + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
++    $plan
++}
++
++Export-ModuleMember -Function New-VcfAriaMigrationPlan
+diff --git a/architecture/migration-plan.json b/architecture/migration-plan.json
+new file mode 100644
+index 0000000..f0533fa
+--- /dev/null
++++ b/architecture/migration-plan.json
+@@ -0,0 +1,453 @@
++{
++  "schema_version": "1.0.0",
++  "plan_id": "chi-private-cloud-01-aria-to-vcf",
++  "estate_id": "chi-private-cloud-01",
++  "compatibility_snapshot": "broadcom-vcf-aria-2026-02-20",
++  "design_basis_date": "2026-02-20",
++  "target_release": "9.0.1",
++  "placements": [
++    {
++      "component": "VCF Operations",
++      "version": "9.0.1",
++      "domain": "mgmt-domain-01",
++      "cluster": "cluster-mgmt-01",
++      "resource_pool": "rp-vcf-management",
++      "network": "dvpg-vcf-management",
++      "profile": "medium-ha",
++      "node_count": 3,
++      "vcpu_per_node": 8,
++      "memory_gib_per_node": 32,
++      "storage_gib_per_node": 1024,
++      "sizing_basis": [
++        "objects=48000",
++        "metrics=9500000",
++        "ha=true"
++      ]
++    },
++    {
++      "component": "VCF Automation",
++      "version": "9.0.1",
++      "domain": "mgmt-domain-01",
++      "cluster": "cluster-mgmt-01",
++      "resource_pool": "rp-vcf-management",
++      "network": "dvpg-vcf-management",
++      "profile": "standard-ha",
++      "node_count": 3,
++      "vcpu_per_node": 12,
++      "memory_gib_per_node": 42,
++      "storage_gib_per_node": 250,
++      "sizing_basis": [
++        "maximum_concurrent_deployments=35",
++        "ha=true"
++      ]
++    },
++    {
++      "component": "VCF Operations for Logs",
++      "version": "9.0.1",
++      "domain": "mgmt-domain-01",
++      "cluster": "cluster-mgmt-01",
++      "resource_pool": "rp-vcf-management",
++      "network": "dvpg-vcf-management",
++      "profile": "large-ha",
++      "node_count": 3,
++      "vcpu_per_node": 16,
++      "memory_gib_per_node": 32,
++      "storage_gib_per_node": 6144,
++      "sizing_basis": [
++        "daily_ingest_gib=350",
++        "retention_days=30",
++        "required_usable_storage_gib=13125",
++        "ha=true"
++      ]
++    }
++  ],
++  "edge_design": {
++    "placement": {
++      "domain": "prod-domain-01",
++      "cluster": "cluster-edge-01",
++      "resource_pool": "rp-nsx-edge",
++      "management_network": "dvpg-edge-management"
++    },
++    "form_factor": "xlarge",
++    "node_count": 2,
++    "ha_mode": "active_active_ecmp",
++    "vcpu_per_node": 16,
++    "memory_gib_per_node": 64,
++    "throughput": {
++      "sustained_gbps": 12,
++      "peak_gbps": 18,
++      "failure_survivable_peak_gbps": 18,
++      "profile_limit_gbps": 20
++    },
++    "host_pnics": [
++      {
++        "pnic": "vmnic0",
++        "speed_gbps": 25,
++        "fabric": "leaf-a",
++        "vds_uplink": "uplink-1"
++      },
++      {
++        "pnic": "vmnic1",
++        "speed_gbps": 25,
++        "fabric": "leaf-b",
++        "vds_uplink": "uplink-2"
++      }
++    ],
++    "edge_vnics": [
++      {
++        "vnic": "fp-eth0",
++        "role": "overlay",
++        "network": "edge-tep",
++        "vlan": 2710,
++        "fabric": "leaf-a",
++        "peer_ip": null
++      },
++      {
++        "vnic": "fp-eth1",
++        "role": "overlay",
++        "network": "edge-tep",
++        "vlan": 2710,
++        "fabric": "leaf-b",
++        "peer_ip": null
++      },
++      {
++        "vnic": "fp-eth2",
++        "role": "tier0-uplink",
++        "network": "uplink-a",
++        "vlan": 2711,
++        "fabric": "leaf-a",
++        "peer_ip": "10.27.11.1"
++      },
++      {
++        "vnic": "fp-eth3",
++        "role": "tier0-uplink",
++        "network": "uplink-b",
++        "vlan": 2712,
++        "fabric": "leaf-b",
++        "peer_ip": "10.27.12.1"
++      }
++    ],
++    "routing": {
++      "local_asn": 65051,
++      "peers": [
++        {
++          "name": "uplink-a",
++          "peer_ip": "10.27.11.1",
++          "peer_asn": 65101,
++          "vlan": 2711,
++          "fabric": "leaf-a"
++        },
++        {
++          "name": "uplink-b",
++          "peer_ip": "10.27.12.1",
++          "peer_asn": 65102,
++          "vlan": 2712,
++          "fabric": "leaf-b"
++        }
++      ]
++    },
++    "mtu": 9000,
++    "aggregate_physical_capacity_gbps": 50.0,
++    "single_fabric_capacity_gbps": 25.0
++  },
++  "migration_steps": [
++    {
++      "order": 1,
++      "id": "migrate-ops-01",
++      "source": {
++        "id": "ops-01",
++        "product": "VMware Aria Operations",
++        "version": "8.18.5"
++      },
++      "target": {
++        "component": "VCF Operations",
++        "version": "9.0.1"
++      },
++      "migration_mode": "fleet_managed_in_place_upgrade",
++      "placement_ref": "VCF Operations",
++      "carries_forward": [
++        {
++          "content_id": "ops.dashboard.capacity-executive",
++          "method": "preserve_in_place_upgrade",
++          "target_state": "Dashboard remains in the upgraded VCF Operations cluster."
++        },
++        {
++          "content_id": "ops.report.monthly-capacity",
++          "method": "preserve_in_place_upgrade",
++          "target_state": "Views and reports remain in the upgraded VCF Operations cluster."
++        },
++        {
++          "content_id": "ops.alert.datastore-latency",
++          "method": "preserve_in_place_upgrade",
++          "target_state": "Custom alert and symptom definitions remain available after validation."
++        },
++        {
++          "content_id": "ops.policy.gold-tier",
++          "method": "preserve_in_place_upgrade",
++          "target_state": "Policies and super metrics remain assigned after validation."
++        },
++        {
++          "content_id": "ops.mp.aws-818",
++          "method": "upgrade_to_vcf_compatible_pack",
++          "target_state": "The compatible management pack is installed and its adapter is collecting."
++        },
++        {
++          "content_id": "ops.data.analytics-history",
++          "method": "preserve_in_place_upgrade",
++          "target_state": "Historical metrics, properties, events, and capacity data stay in the upgraded cluster."
++        }
++      ],
++      "abandoned": [
++        {
++          "content_id": "ops.collector.rc-east-west",
++          "reason": "Legacy Remote Collector and Lite Cloud Proxy appliance forms are not carried into the target; redeploy supported Cloud Proxies and remap collector groups."
++        },
++        {
++          "content_id": "ops.mp.azure-native",
++          "reason": "The Microsoft Azure management pack reached end of general support on 2025-09-30; replace its collection with Management Pack Builder content."
++        }
++      ],
++      "gates": [
++        {
++          "gate_id": "lcm_patch2",
++          "phase": "pre",
++          "condition": "Aria Suite Lifecycle is at 8.18 Patch 2 before the fleet transition begins.",
++          "evidence": "Lifecycle appliance version and patch inventory"
++        },
++        {
++          "gate_id": "ops_health_backup",
++          "phase": "pre",
++          "condition": "The Operations cluster is online, balanced, and has a successful supported backup.",
++          "evidence": "Cluster health export and backup job result"
++        },
++        {
++          "gate_id": "management_pack_compatibility",
++          "phase": "pre",
++          "condition": "Every installed management pack has an explicit target disposition and supported packs have target binaries.",
++          "evidence": "Signed management-pack compatibility inventory"
++        },
++        {
++          "gate_id": "cloud_proxy_capacity",
++          "phase": "pre",
++          "condition": "Replacement Cloud Proxies are sized, deployed, and mapped for both legacy Remote Collectors.",
++          "evidence": "Cloud Proxy health and collector-group mapping"
++        },
++        {
++          "gate_id": "ops_post_upgrade_validation",
++          "phase": "post",
++          "condition": "VCF Operations collection, retained history, dashboards, alerts, policies, and reports pass validation.",
++          "evidence": "Post-upgrade functional validation record"
++        }
++      ]
++    },
++    {
++      "order": 2,
++      "id": "migrate-auto-01",
++      "source": {
++        "id": "auto-01",
++        "product": "VMware Aria Automation",
++        "version": "8.18.1"
++      },
++      "target": {
++        "component": "VCF Automation",
++        "version": "9.0.1"
++      },
++      "migration_mode": "fleet_import_then_in_place_upgrade",
++      "placement_ref": "VCF Automation",
++      "carries_forward": [
++        {
++          "content_id": "auto.projects.tenant-projects",
++          "method": "fleet_import_and_upgrade",
++          "target_state": "Organizations, projects, users, and role assignments are present in VCF Automation."
++        },
++        {
++          "content_id": "auto.infrastructure.accounts-zones",
++          "method": "fleet_import_and_upgrade",
++          "target_state": "Cloud accounts, zones, mappings, network profiles, and storage profiles retain their relationships."
++        },
++        {
++          "content_id": "auto.templates.catalog",
++          "method": "fleet_import_and_upgrade",
++          "target_state": "Cloud templates and catalog content retain versions and can be published and requested."
++        },
++        {
++          "content_id": "auto.deployments.existing",
++          "method": "fleet_import_and_upgrade",
++          "target_state": "Existing deployments and request history remain visible with validated ownership."
++        },
++        {
++          "content_id": "auto.extensibility.events",
++          "method": "fleet_import_and_upgrade",
++          "target_state": "Subscriptions and ABX actions remain enabled after endpoint and secret validation."
++        },
++        {
++          "content_id": "auto.orchestrator.custom-package",
++          "method": "fleet_import_and_upgrade",
++          "target_state": "Embedded Orchestrator workflows, actions, and configuration elements remain available and are smoke-tested."
++        }
++      ],
++      "abandoned": [
++        {
++          "content_id": "auto.identity.vidm-337",
++          "reason": "VMware Identity Manager 3.3.x is not the VCF 9 identity plane; map identity sources and access to VCF Identity Broker."
++        },
++        {
++          "content_id": "auto.access.csp-portal-url",
++          "reason": "The legacy CSP portal path is replaced by the VCF Identity Broker tenant login entry point."
++        }
++      ],
++      "gates": [
++        {
++          "gate_id": "fleet_ops_ready",
++          "phase": "pre",
++          "condition": "VCF Operations Fleet Management is healthy and connected to the management domain.",
++          "evidence": "Fleet Management health and domain connection status"
++        },
++        {
++          "gate_id": "lcm_patch2",
++          "phase": "pre",
++          "condition": "Aria Suite Lifecycle is at 8.18 Patch 2 before the fleet transition begins.",
++          "evidence": "Lifecycle appliance version and patch inventory"
++        },
++        {
++          "gate_id": "automation_backup_health",
++          "phase": "pre",
++          "condition": "Aria Automation services are healthy and a supported backup has completed.",
++          "evidence": "Service health and backup job result"
++        },
++        {
++          "gate_id": "identity_broker_mapping",
++          "phase": "pre",
++          "condition": "Identity sources, groups, tenant names, and deployment owners have a tested VCF Identity Broker mapping.",
++          "evidence": "Identity mapping and representative login tests"
++        },
++        {
++          "gate_id": "automation_post_upgrade_validation",
++          "phase": "post",
++          "condition": "Projects, templates, catalog requests, deployments, subscriptions, ABX actions, and Orchestrator workflows pass tests.",
++          "evidence": "Automation regression and ownership validation record"
++        }
++      ]
++    },
++    {
++      "order": 3,
++      "id": "migrate-logs-01",
++      "source": {
++        "id": "logs-01",
++        "product": "VMware Aria Operations for Logs",
++        "version": "8.18.3"
++      },
++      "target": {
++        "component": "VCF Operations for Logs",
++        "version": "9.0.1"
++      },
++      "migration_mode": "parallel_fresh_deployment",
++      "placement_ref": "VCF Operations for Logs",
++      "carries_forward": [
++        {
++          "content_id": "logs.data.latest-90-days",
++          "method": "supported_90_day_data_transfer",
++          "target_state": "The most recent 90 days of historical events are searchable in the target."
++        },
++        {
++          "content_id": "logs.content.security-pack",
++          "method": "manual_export_import",
++          "target_state": "The custom content pack is imported and its parsers and dashboards are validated."
++        },
++        {
++          "content_id": "logs.content.alerts-queries",
++          "method": "manual_export_import",
++          "target_state": "Custom alerts, saved queries, and dashboards are recreated or imported and tested."
++        },
++        {
++          "content_id": "logs.config.sources-forwarders",
++          "method": "manual_reconfigure",
++          "target_state": "Sources, archives, forwarders, and product integrations send to the new cluster."
++        },
++        {
++          "content_id": "logs.agents.windows-linux",
++          "method": "retain_agent_and_configure_trust",
++          "target_state": "The compatible 8.18 agents remain deployed and trust the VCF Operations for Logs certificate."
++        }
++      ],
++      "abandoned": [
++        {
++          "content_id": "logs.data.older-than-90-days",
++          "reason": "The supported transfer window carries at most 90 days; older events stay only in the parallel legacy cluster until its retention obligation expires."
++        },
++        {
++          "content_id": "logs.cluster.legacy-identity",
++          "reason": "There is no in-place 8.18-to-9.0 cluster upgrade; the target is a fresh cluster with new node identities and membership."
++        },
++        {
++          "content_id": "logs.agents.v9-binary-download",
++          "reason": "VCF Operations for Logs 9.0 does not provide new MSI/BIN agent installers; continue with compatible 8.18 agents."
++        }
++      ],
++      "gates": [
++        {
++          "gate_id": "fleet_ops_ready",
++          "phase": "pre",
++          "condition": "VCF Operations Fleet Management is healthy and connected to the management domain.",
++          "evidence": "Fleet Management health and domain connection status"
++        },
++        {
++          "gate_id": "fresh_logs_cluster_ready",
++          "phase": "pre",
++          "condition": "The new VCF Operations for Logs cluster is deployed, sized, licensed, and healthy in parallel.",
++          "evidence": "Target cluster health and capacity report"
++        },
++        {
++          "gate_id": "integrations_recreated",
++          "phase": "pre",
++          "condition": "Every source, archive, forwarder, and product integration is configured on the new cluster.",
++          "evidence": "Source-to-target integration reconciliation"
++        },
++        {
++          "gate_id": "content_import_validated",
++          "phase": "pre",
++          "condition": "Custom content packs, alerts, saved queries, and dashboards are imported and return expected results.",
++          "evidence": "Content inventory and functional test results"
++        },
++        {
++          "gate_id": "ninety_day_transfer_complete",
++          "phase": "pre",
++          "condition": "The supported 90-day data transfer is complete and the transferred time range is searchable.",
++          "evidence": "Data-transfer completion and oldest/newest event timestamps"
++        },
++        {
++          "gate_id": "dual_ingest_cutover_validated",
++          "phase": "post",
++          "condition": "New ingestion is stable through both fabrics and the legacy cluster remains available for older retained data.",
++          "evidence": "Ingestion-rate, loss, query, and legacy-access checks"
++        }
++      ]
++    }
++  ],
++  "lifecycle_boundaries": [
++    {
++      "source_id": "ops-01",
++      "product": "VMware Aria Operations",
++      "version": "8.18.5",
++      "end_of_general_support": "2027-10-11",
++      "status_at_snapshot": "supported",
++      "plan_implication": "Complete the supported in-place fleet upgrade before 2027-10-11 and validate retained analytics and content."
++    },
++    {
++      "source_id": "auto-01",
++      "product": "VMware Aria Automation",
++      "version": "8.18.1",
++      "end_of_general_support": "2027-10-11",
++      "status_at_snapshot": "supported",
++      "plan_implication": "Import and upgrade the existing integrated instance before 2027-10-11 while replacing legacy identity dependencies."
++    },
++    {
++      "source_id": "logs-01",
++      "product": "VMware Aria Operations for Logs",
++      "version": "8.18.3",
++      "end_of_general_support": "2027-10-11",
++      "status_at_snapshot": "supported",
++      "plan_implication": "Run the fresh target in parallel and transfer the supported data window before 2027-10-11."
++    }
++  ]
++}
+diff --git a/research/consulted-sources.md b/research/consulted-sources.md
+new file mode 100644
+index 0000000..696f6e2
+--- /dev/null
++++ b/research/consulted-sources.md
+@@ -0,0 +1,14 @@
++# Consulted Broadcom sources
++
++| Title | URL | Access date | Decision informed |
++|---|---|---|---|
++| Update Sequence for VCF 9.0 and Compatible VMware Products | https://knowledge.broadcom.com/external/article/390634 | 2026-08-15 | Confirmed Aria Suite Lifecycle Patch 2, Operations-before-Automation ordering, and fresh deployment for Logs. |
++| Import and upgrade VMware Aria Automation 8.x to VCF Automation 9.0 | https://knowledge.broadcom.com/external/article/433806 | 2026-08-15 | Confirmed Fleet Management import of the existing Automation instance before upgrade. |
++| Upgrade Guidance for Aria Operations for Logs 8.18.x to VCF Operations for Logs 9.0.x | https://knowledge.broadcom.com/external/article/402314 | 2026-08-15 | Confirmed parallel fresh deployment, manual integration reconfiguration, and the supported 90-day data-transfer window. |
++| End of General Support for VMware Aria Operations 8.18 | https://knowledge.broadcom.com/external/article/422643 | 2026-08-15 | Confirmed the 2027-10-11 Operations support boundary. |
++| Build numbers and versions for VMware Aria Automation (formerly vRealize Automation) | https://knowledge.broadcom.com/external/article/318130 | 2026-08-15 | Confirmed Automation 8.18.1 and its 2027-10-11 end-of-general-support boundary. |
++| The Windows agent is not available to download from within VCF Operations for Logs 9.0.x | https://knowledge.broadcom.com/external/article/402647 | 2026-08-15 | Confirmed compatibility of retained 8.18 agents, manual certificate trust, and the absence of new MSI/BIN installers. |
++| Configuration Maximums for NSX | https://knowledge.broadcom.com/external/article/421526 | 2026-08-15 | Cross-checked the current supported-limits authority relevant to selecting the NSX Edge production form factor. |
++| VCF Virtual Networking Technical Reference | https://community.broadcom.com/blogs/luca-camarda/2025/06/23/vcf-virtual-networking-technical-reference | 2026-08-15 | Cross-checked current NSX Edge performance, high-availability, uplink, BGP, MTU, and failure-domain design guidance. |
++
++The live VCF documentation now also covers later 9.x releases. That does not change this plan's 9.0.1 target or its pinned 2026-02-20 compatibility decisions.

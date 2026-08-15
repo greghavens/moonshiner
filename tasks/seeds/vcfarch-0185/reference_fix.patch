@@ -1,0 +1,453 @@
+diff --git a/architecture/plan.go b/architecture/plan.go
+new file mode 100644
+index 0000000..a415e44
+--- /dev/null
++++ b/architecture/plan.go
+@@ -0,0 +1,262 @@
++package architecture
++
++import (
++	"encoding/json"
++	"fmt"
++	"io"
++	"reflect"
++	"sort"
++	"strconv"
++)
++
++func LoadEstate(r io.Reader) (Estate, error) {
++	var estate Estate
++	if err := decodeStrict(r, &estate); err != nil {
++		return Estate{}, fmt.Errorf("decode estate: %w", err)
++	}
++	if estate.EstateID == "" || estate.Site == "" || estate.Cluster == "" {
++		return Estate{}, fmt.Errorf("estate identity and placement fields are required")
++	}
++	if len(estate.Hosts) == 0 || len(estate.Products) == 0 {
++		return Estate{}, fmt.Errorf("estate hosts and products are required")
++	}
++	return estate, nil
++}
++
++func LoadCompatibilitySnapshot(r io.Reader) (CompatibilitySnapshot, error) {
++	var snapshot CompatibilitySnapshot
++	if err := decodeStrict(r, &snapshot); err != nil {
++		return CompatibilitySnapshot{}, fmt.Errorf("decode compatibility snapshot: %w", err)
++	}
++	if snapshot.SnapshotID == "" || snapshot.TargetFoundationVersion == "" {
++		return CompatibilitySnapshot{}, fmt.Errorf("snapshot identity and target version are required")
++	}
++	if len(snapshot.Products) == 0 || len(snapshot.Sizing) == 0 {
++		return CompatibilitySnapshot{}, fmt.Errorf("snapshot product and sizing rules are required")
++	}
++	return snapshot, nil
++}
++
++func decodeStrict(r io.Reader, value any) error {
++	decoder := json.NewDecoder(r)
++	decoder.DisallowUnknownFields()
++	if err := decoder.Decode(value); err != nil {
++		return err
++	}
++	var trailing any
++	if err := decoder.Decode(&trailing); err != io.EOF {
++		if err == nil {
++			return fmt.Errorf("multiple JSON values")
++		}
++		return fmt.Errorf("trailing JSON: %w", err)
++	}
++	return nil
++}
++
++func BuildPlan(estate Estate, snapshot CompatibilitySnapshot) (Plan, error) {
++	if err := validateAuthorities(estate, snapshot); err != nil {
++		return Plan{}, err
++	}
++
++	plan := Plan{
++		SchemaVersion: "vcf-migration-plan/v1",
++		SnapshotID:    snapshot.SnapshotID,
++		EstateID:      estate.EstateID,
++		Architecture: TargetArchitecture{
++			Site:               estate.Site,
++			DeploymentModel:    snapshot.Architecture.DeploymentModel,
++			FoundationVersion:  snapshot.TargetFoundationVersion,
++			Cluster:            snapshot.Architecture.PlacementCluster,
++			HostCount:          len(estate.Hosts),
++			FailuresToTolerate: estate.Storage.FailuresToTolerate,
++			StoragePolicy:      snapshot.Architecture.RequiredStorage,
++		},
++	}
++
++	for _, sizing := range snapshot.Sizing {
++		hostIDs := make([]string, sizing.NodeCount)
++		for i := range hostIDs {
++			hostIDs[i] = estate.Hosts[i].ID
++		}
++		plan.Architecture.Placements = append(plan.Architecture.Placements, Placement{
++			Component:        sizing.Component,
++			Version:          sizing.Version,
++			Profile:          sizing.Profile,
++			Cluster:          estate.Cluster,
++			NodeCount:        sizing.NodeCount,
++			VCPUPerNode:      sizing.VCPUPerNode,
++			MemoryGiBPerNode: sizing.MemoryGiBPerNode,
++			HostIDs:          hostIDs,
++			AntiAffinity:     true,
++			Capacity:         sizing.Capacity,
++		})
++	}
++
++	rules := append([]ProductRule(nil), snapshot.Products...)
++	sort.Slice(rules, func(i, j int) bool { return rules[i].Order < rules[j].Order })
++	for _, rule := range rules {
++		plan.Migrations = append(plan.Migrations, Migration{
++			Order: rule.Order,
++			Source: ProductRef{
++				InventoryID: rule.InventoryID,
++				Name:        rule.SourceName,
++				Version:     rule.SourceVersion,
++			},
++			Target: ProductRef{
++				Name:    rule.TargetComponent,
++				Version: rule.TargetVersion,
++			},
++			Method: rule.MigrationMethod,
++			Path:   append([]string(nil), rule.SupportedPath...),
++			Content: ContentDecision{
++				Carries:  append([]string(nil), rule.Content.Carries...),
++				Abandons: append([]string(nil), rule.Content.Abandons...),
++			},
++			Gates:   append([]string(nil), rule.RequiredGates...),
++			Support: rule.Support,
++		})
++	}
++	if err := ValidatePlan(plan, estate, snapshot); err != nil {
++		return Plan{}, err
++	}
++	return plan, nil
++}
++
++func ValidatePlan(plan Plan, estate Estate, snapshot CompatibilitySnapshot) error {
++	if err := validateAuthorities(estate, snapshot); err != nil {
++		return err
++	}
++	if plan.SchemaVersion != "vcf-migration-plan/v1" || plan.SnapshotID != snapshot.SnapshotID || plan.EstateID != estate.EstateID {
++		return fmt.Errorf("plan authority identifiers are invalid")
++	}
++	if plan.Architecture.HostCount != len(estate.Hosts) || plan.Architecture.FailuresToTolerate != estate.Storage.FailuresToTolerate {
++		return fmt.Errorf("plan host count or FTT contradicts the estate")
++	}
++	required := snapshot.Architecture.MinimumHostsByFTT[strconv.Itoa(plan.Architecture.FailuresToTolerate)]
++	if plan.Architecture.HostCount < required {
++		return fmt.Errorf("FTT %d requires at least %d hosts", plan.Architecture.FailuresToTolerate, required)
++	}
++
++	expected := planFromAuthorities(estate, snapshot)
++	if len(plan.Architecture.Placements) != len(expected.Architecture.Placements) {
++		return fmt.Errorf("plan differs from the pinned compatibility and sizing authority")
++	}
++	knownHosts := make(map[string]Host, len(estate.Hosts))
++	usedCPU := make(map[string]int, len(estate.Hosts))
++	usedMemory := make(map[string]int, len(estate.Hosts))
++	for _, host := range estate.Hosts {
++		knownHosts[host.ID] = host
++	}
++	for i, placement := range plan.Architecture.Placements {
++		if len(placement.HostIDs) != placement.NodeCount {
++			return fmt.Errorf("placement for %s has the wrong host count", placement.Component)
++		}
++		seen := make(map[string]bool, len(placement.HostIDs))
++		for _, hostID := range placement.HostIDs {
++			host, ok := knownHosts[hostID]
++			if !ok || seen[hostID] {
++				return fmt.Errorf("placement for %s has an invalid or repeated host", placement.Component)
++			}
++			seen[hostID] = true
++			usedCPU[hostID] += placement.VCPUPerNode
++			usedMemory[hostID] += placement.MemoryGiBPerNode
++			if usedCPU[hostID] > host.CPUCores || usedMemory[hostID] > host.MemoryGiB {
++				return fmt.Errorf("placement exceeds capacity of host %s", hostID)
++			}
++		}
++		expected.Architecture.Placements[i].HostIDs = append([]string(nil), placement.HostIDs...)
++	}
++	if !reflect.DeepEqual(plan, expected) {
++		return fmt.Errorf("plan differs from the pinned compatibility and sizing authority")
++	}
++	return nil
++}
++
++func validateAuthorities(estate Estate, snapshot CompatibilitySnapshot) error {
++	if estate.DeploymentModel != snapshot.Architecture.DeploymentModel || estate.Cluster != snapshot.Architecture.PlacementCluster {
++		return fmt.Errorf("estate topology conflicts with snapshot")
++	}
++	if len(estate.Hosts) < snapshot.Architecture.MinimumHostCount {
++		return fmt.Errorf("minimum host count is %d, got %d", snapshot.Architecture.MinimumHostCount, len(estate.Hosts))
++	}
++	required, ok := snapshot.Architecture.MinimumHostsByFTT[strconv.Itoa(estate.Storage.FailuresToTolerate)]
++	if !ok {
++		return fmt.Errorf("no host rule for FTT %d", estate.Storage.FailuresToTolerate)
++	}
++	if len(estate.Hosts) < required {
++		return fmt.Errorf("FTT %d requires at least %d hosts, got %d", estate.Storage.FailuresToTolerate, required, len(estate.Hosts))
++	}
++	if estate.Storage.Policy != snapshot.Architecture.RequiredStorage {
++		return fmt.Errorf("estate storage policy conflicts with snapshot")
++	}
++	if len(estate.Products) != len(snapshot.Products) {
++		return fmt.Errorf("fixture and snapshot product counts differ")
++	}
++	byID := make(map[string]EstateProduct, len(estate.Products))
++	for _, product := range estate.Products {
++		byID[product.InventoryID] = product
++	}
++	for _, rule := range snapshot.Products {
++		product, ok := byID[rule.InventoryID]
++		if !ok || product.Name != rule.SourceName || product.Version != rule.SourceVersion {
++			return fmt.Errorf("fixture and snapshot disagree for %s", rule.InventoryID)
++		}
++	}
++	for _, sizing := range snapshot.Sizing {
++		if sizing.NodeCount > len(estate.Hosts) {
++			return fmt.Errorf("%s needs %d distinct hosts", sizing.Component, sizing.NodeCount)
++		}
++	}
++	return nil
++}
++
++func planFromAuthorities(estate Estate, snapshot CompatibilitySnapshot) Plan {
++	plan := Plan{
++		SchemaVersion: "vcf-migration-plan/v1",
++		SnapshotID:    snapshot.SnapshotID,
++		EstateID:      estate.EstateID,
++		Architecture: TargetArchitecture{
++			Site:               estate.Site,
++			DeploymentModel:    snapshot.Architecture.DeploymentModel,
++			FoundationVersion:  snapshot.TargetFoundationVersion,
++			Cluster:            snapshot.Architecture.PlacementCluster,
++			HostCount:          len(estate.Hosts),
++			FailuresToTolerate: estate.Storage.FailuresToTolerate,
++			StoragePolicy:      snapshot.Architecture.RequiredStorage,
++		},
++	}
++	for _, sizing := range snapshot.Sizing {
++		hostIDs := make([]string, sizing.NodeCount)
++		for i := range hostIDs {
++			hostIDs[i] = estate.Hosts[i].ID
++		}
++		plan.Architecture.Placements = append(plan.Architecture.Placements, Placement{
++			Component: sizing.Component, Version: sizing.Version, Profile: sizing.Profile,
++			Cluster: estate.Cluster, NodeCount: sizing.NodeCount, VCPUPerNode: sizing.VCPUPerNode,
++			MemoryGiBPerNode: sizing.MemoryGiBPerNode, HostIDs: hostIDs, AntiAffinity: true, Capacity: sizing.Capacity,
++		})
++	}
++	rules := append([]ProductRule(nil), snapshot.Products...)
++	sort.Slice(rules, func(i, j int) bool { return rules[i].Order < rules[j].Order })
++	for _, rule := range rules {
++		plan.Migrations = append(plan.Migrations, Migration{
++			Order:  rule.Order,
++			Source: ProductRef{InventoryID: rule.InventoryID, Name: rule.SourceName, Version: rule.SourceVersion},
++			Target: ProductRef{Name: rule.TargetComponent, Version: rule.TargetVersion}, Method: rule.MigrationMethod,
++			Path:    append([]string(nil), rule.SupportedPath...),
++			Content: ContentDecision{Carries: append([]string(nil), rule.Content.Carries...), Abandons: append([]string(nil), rule.Content.Abandons...)},
++			Gates:   append([]string(nil), rule.RequiredGates...), Support: rule.Support,
++		})
++	}
++	return plan
++}
++
++func WritePlan(w io.Writer, plan Plan) error {
++	encoder := json.NewEncoder(w)
++	encoder.SetEscapeHTML(false)
++	encoder.SetIndent("", "  ")
++	if err := encoder.Encode(plan); err != nil {
++		return fmt.Errorf("encode plan: %w", err)
++	}
++	return nil
++}
+diff --git a/migration-plan.json b/migration-plan.json
+new file mode 100644
+index 0000000..eccf6d1
+--- /dev/null
++++ b/migration-plan.json
+@@ -0,0 +1,179 @@
++{
++  "schemaVersion": "vcf-migration-plan/v1",
++  "snapshotId": "broadcom-vcf-2026-08-15",
++  "estateId": "chi-consolidated-01",
++  "architecture": {
++    "site": "CHI01",
++    "deploymentModel": "single-site-consolidated",
++    "foundationVersion": "9.0.2",
++    "cluster": "mgmt-cluster-01",
++    "hostCount": 4,
++    "failuresToTolerate": 1,
++    "storagePolicy": "vSAN-ESA-RAID1",
++    "placements": [
++      {
++        "component": "VCF Operations",
++        "version": "9.0.2",
++        "profile": "small-ha",
++        "cluster": "mgmt-cluster-01",
++        "nodeCount": 2,
++        "vCpuPerNode": 4,
++        "memoryGiBPerNode": 16,
++        "hostIds": ["esx-m01", "esx-m02"],
++        "antiAffinity": true,
++        "capacity": {
++          "objects": 12000,
++          "metrics": 2800000
++        }
++      },
++      {
++        "component": "VCF Automation",
++        "version": "9.0.2",
++        "profile": "medium-ha",
++        "cluster": "mgmt-cluster-01",
++        "nodeCount": 3,
++        "vCpuPerNode": 24,
++        "memoryGiBPerNode": 96,
++        "hostIds": ["esx-m01", "esx-m02", "esx-m03"],
++        "antiAffinity": true,
++        "capacity": {
++          "automationConcurrentRequests": 100
++        }
++      },
++      {
++        "component": "VCF Operations for Logs",
++        "version": "9.0.2",
++        "profile": "medium-ha",
++        "cluster": "mgmt-cluster-01",
++        "nodeCount": 3,
++        "vCpuPerNode": 8,
++        "memoryGiBPerNode": 16,
++        "hostIds": ["esx-m01", "esx-m02", "esx-m03"],
++        "antiAffinity": true,
++        "capacity": {
++          "ingestGiBPerDay": 225
++        }
++      }
++    ]
++  },
++  "migrations": [
++    {
++      "order": 1,
++      "source": {
++        "inventoryId": "ops-01",
++        "name": "VMware vRealize Operations Manager",
++        "version": "8.14.1"
++      },
++      "target": {
++        "name": "VCF Operations",
++        "version": "9.0.2"
++      },
++      "method": "staged-in-place-upgrade",
++      "path": ["8.14.1", "8.18.3", "9.0.2"],
++      "content": {
++        "carries": [
++          "dashboards",
++          "super metrics",
++          "views",
++          "reports",
++          "alert definitions",
++          "management packs",
++          "historical time-series metrics"
++        ],
++        "abandons": ["legacy remote collector appliances"]
++      },
++      "gates": [
++        "offline backup verified",
++        "legacy remote collectors replaced by cloud proxies",
++        "Aria Suite Lifecycle 8.18 Patch 2 installed",
++        "8.18.3 cluster health and upgrade prechecks pass",
++        "management-pack interoperability verified"
++      ],
++      "support": {
++        "endOfGeneralSupport": "2024-10-11",
++        "statusAtSnapshot": "past-eogs"
++      }
++    },
++    {
++      "order": 2,
++      "source": {
++        "inventoryId": "auto-01",
++        "name": "VMware Aria Automation",
++        "version": "8.18.1"
++      },
++      "target": {
++        "name": "VCF Automation",
++        "version": "9.0.2"
++      },
++      "method": "fleet-import-and-upgrade",
++      "path": ["8.18.1", "9.0.2"],
++      "content": {
++        "carries": [
++          "projects",
++          "cloud templates and version history",
++          "deployments and resource state",
++          "subscriptions",
++          "embedded Aria Orchestrator workflows and actions",
++          "policies and custom forms"
++        ],
++        "abandons": [
++          "Avi Load Balancer cloud account avi-prod",
++          "VMware Identity Manager portal URLs and bookmarks"
++        ]
++      },
++      "gates": [
++        "offline backup verified",
++        "Aria Suite Lifecycle 8.18 Patch 2 installed",
++        "avi-prod cloud account removed",
++        "source imported into VCF Fleet Management",
++        "network properties populated for all three nodes",
++        "mixed-case deployment ownership reconciliation passes"
++      ],
++      "support": {
++        "endOfGeneralSupport": "2027-10-11",
++        "statusAtSnapshot": "supported"
++      }
++    },
++    {
++      "order": 3,
++      "source": {
++        "inventoryId": "logs-01",
++        "name": "VMware vRealize Log Insight",
++        "version": "8.12.0"
++      },
++      "target": {
++        "name": "VCF Operations for Logs",
++        "version": "9.0.2"
++      },
++      "method": "staged-upgrades-then-parallel-greenfield",
++      "path": ["8.12.0", "8.14.1", "8.16.2", "8.18.3", "9.0.2"],
++      "content": {
++        "carries": [
++          "custom dashboards",
++          "alert definitions",
++          "content packs",
++          "archive configuration",
++          "vSphere NSX and syslog integration definitions re-created on 9.0.2",
++          "historical logs up to 90 days",
++          "8.18 Windows log agents with 9.0.2 trust configured"
++        ],
++        "abandons": [
++          "historical logs older than 90 days",
++          "in-place upgrade of the 8.18.3 appliance"
++        ]
++      },
++      "gates": [
++        "offline backup verified",
++        "legacy 8.14.1 binary checksum verified",
++        "health checks pass after each 8.x hop",
++        "new three-node 9.0.2 cluster healthy",
++        "8.18.3 integrations unconfigured before 9.0.2 reconfiguration",
++        "90-day log transfer completes before source retirement"
++      ],
++      "support": {
++        "endOfGeneralSupport": "2024-10-11",
++        "statusAtSnapshot": "past-eogs"
++      }
++    }
++  ]
++}

@@ -1,0 +1,1113 @@
+diff --git a/VcfMigration/VcfMigration.psd1 b/VcfMigration/VcfMigration.psd1
+new file mode 100644
+index 0000000..24fb940
+--- /dev/null
++++ b/VcfMigration/VcfMigration.psd1
+@@ -0,0 +1,13 @@
++@{
++    RootModule = 'VcfMigration.psm1'
++    ModuleVersion = '1.0.0'
++    GUID = '995011a1-0c5e-4dc2-9e5c-f28ecb6a26b7'
++    Author = 'VCF Architecture Team'
++    Description = 'SDK-backed inventory collection and deterministic VCF brownfield migration architecture generation.'
++    PowerShellVersion = '7.4'
++    RequiredModules = @('VMware.Sdk.Vcf.SddcManager')
++    FunctionsToExport = @('Get-VcfEstateInventory', 'New-VcfMigrationPlan')
++    CmdletsToExport = @()
++    VariablesToExport = @()
++    AliasesToExport = @()
++}
+diff --git a/VcfMigration/VcfMigration.psm1 b/VcfMigration/VcfMigration.psm1
+new file mode 100644
+index 0000000..079597b
+--- /dev/null
++++ b/VcfMigration/VcfMigration.psm1
+@@ -0,0 +1,302 @@
++Set-StrictMode -Version Latest
++
++function Get-VcfEstateInventory {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [string] $Server,
++
++        [Parameter(Mandatory)]
++        [pscredential] $Credential
++    )
++
++    Import-Module VMware.Sdk.Vcf.SddcManager -ErrorAction Stop
++    $connection = Connect-VcfSddcManagerServer -Server $Server -Credential $Credential
++    try {
++        $domains = @(Get-SddcDomain -Server $connection)
++        $vcenters = @(Get-SddcVcenter -Server $connection)
++        $domainInventory = foreach ($domain in $domains) {
++            $clusters = @(Get-SddcCluster -Domain $domain -Server $connection)
++            $hosts = @(Get-SddcHost -Domain $domain -Server $connection)
++            [ordered]@{
++                id       = [string] $domain.Id
++                name     = [string] $domain.Name
++                type     = [string] $domain.Type
++                clusters = @($clusters | ForEach-Object {
++                    [ordered]@{ id = [string] $_.Id; name = [string] $_.Name }
++                })
++                hosts    = @($hosts | ForEach-Object {
++                    [ordered]@{ id = [string] $_.Id; name = [string] $_.Name; status = [string] $_.Status }
++                })
++            }
++        }
++
++        [pscustomobject] [ordered]@{
++            collectedFrom = $Server
++            domains       = @($domainInventory)
++            vcenters      = @($vcenters | ForEach-Object {
++                [ordered]@{ id = [string] $_.Id; name = [string] $_.Name; version = [string] $_.Version }
++            })
++        }
++    }
++    finally {
++        Disconnect-VcfSddcManagerServer -Server $connection -Force -ErrorAction SilentlyContinue
++    }
++}
++
++function Get-SupportedHopPath {
++    param(
++        [Parameter(Mandatory)] $Snapshot,
++        [Parameter(Mandatory)] [string] $Source,
++        [Parameter(Mandatory)] [string] $Target
++    )
++
++    $queue = [System.Collections.Generic.Queue[object]]::new()
++    $queue.Enqueue([pscustomobject]@{ Node = $Source; Versions = @($Source) })
++    $visited = @{$Source = $true}
++
++    while ($queue.Count -gt 0) {
++        $item = $queue.Dequeue()
++        if ($item.Node -eq $Target) {
++            $result = [System.Collections.Generic.List[object]]::new()
++            for ($index = 0; $index -lt $item.Versions.Count - 1; $index++) {
++                $result.Add([pscustomobject] [ordered]@{
++                    from = [string] $item.Versions[$index]
++                    to   = [string] $item.Versions[$index + 1]
++                })
++            }
++            return @($result)
++        }
++
++        foreach ($hop in $Snapshot.supportedHops) {
++            if ($hop.from -eq $item.Node -and -not $visited.ContainsKey([string] $hop.to)) {
++                $visited[[string] $hop.to] = $true
++                $queue.Enqueue([pscustomobject]@{
++                    Node     = [string] $hop.to
++                    Versions = @($item.Versions) + @([string] $hop.to)
++                })
++            }
++        }
++    }
++
++    throw "No supported VCF upgrade path exists from $Source to $Target in snapshot $($Snapshot.snapshotId)."
++}
++
++function Get-EdgeFormFactor {
++    param(
++        [Parameter(Mandatory)] $Snapshot,
++        [Parameter(Mandatory)] [double] $ThroughputGbps
++    )
++
++    foreach ($tier in $Snapshot.edgeSizing) {
++        $minInclusive = $tier.PSObject.Properties['minInclusiveGbps']
++        $minExclusive = $tier.PSObject.Properties['minExclusiveGbps']
++        $maxInclusive = $tier.PSObject.Properties['maxInclusiveGbps']
++        if ($null -ne $minInclusive -and $ThroughputGbps -lt [double] $minInclusive.Value) { continue }
++        if ($null -ne $minExclusive -and $ThroughputGbps -le [double] $minExclusive.Value) { continue }
++        if ($null -ne $maxInclusive -and $ThroughputGbps -gt [double] $maxInclusive.Value) { continue }
++        return [string] $tier.formFactor
++    }
++    throw "No Edge form factor covers $ThroughputGbps Gbps."
++}
++
++function Get-GateDefinition {
++    param([Parameter(Mandatory)] [string] $GateId)
++
++    $conditions = @{
++        'source-health-clean' = 'All VCF-managed components report healthy before the first bundle is applied.'
++        'backups-complete' = 'File-based backups of SDDC Manager, vCenter, and NSX are restorable.'
++        'hcl-5.2.1-compatible' = 'Management and workload hosts are compatible with the VCF 5.2.1 BOM.'
++        'lcm-precheck-5.2.1-clean' = 'SDDC Manager lifecycle prechecks for VCF 5.2.1 have no blocking findings.'
++        'sddc-manager-5.2.1-ready' = 'SDDC Manager reports version 5.2.1.0 and lifecycle services are healthy.'
++        'nsx-manager-5.2.1-ready' = 'Every NSX Manager cluster reports version 4.2.1.0.0 and stable status.'
++        'nsx-edge-5.2.1-ready' = 'Both NSX Edge nodes report version 4.2.1.0.0 and normal datapath status.'
++        'vcenter-5.2.1-ready' = 'The vCenter for the domain reports version 8.0.3.00100 and healthy services.'
++        'management-domain-5.2.1-converged' = 'Every management-domain component is converged on the VCF 5.2.1 BOM.'
++        'estate-5.2.1-converged' = 'Every inventoried component is converged on the VCF 5.2.1 BOM.'
++        'hcl-9.1-compatible' = 'Management and workload hosts are compatible with the VCF 9.1 hardware baseline.'
++        'operations-deployment-precheck-clean' = 'VCF Operations deployment prerequisites and endpoint checks are clean.'
++        'vcf-operations-9.1-ready' = 'VCF Operations 9.1 is deployed and collecting from the VCF instance.'
++        'license-server-deployment-precheck-clean' = 'VCF License Server deployment prerequisites, DNS, and endpoint checks are clean.'
++        'license-server-9.1-ready' = 'VCF License Server 9.1 is deployed, reachable, and ready to license upgraded components.'
++        'lcm-precheck-9.1-clean' = 'SDDC Manager lifecycle prechecks for VCF 9.1 have no blocking findings.'
++        'sddc-manager-9.1-ready' = 'SDDC Manager reports version 9.1.0.0 and lifecycle services are healthy.'
++        'management-services-9.1-ready' = 'VCF Management Services 9.1 lifecycle, depot, and licensing services are healthy.'
++        'nsx-manager-9.1-ready' = 'Every NSX Manager cluster reports version 9.1.0.0 and stable status.'
++        'reduced-downtime-network-ready' = 'The temporary network required by reduced-downtime vCenter upgrade is reachable.'
++        'vcenter-9.1-ready' = 'The vCenter for the domain reports version 9.1.0.0 and healthy services.'
++        'vlcm-image-ready' = 'A compliant vSphere Lifecycle Manager image for ESX 9.1 is assigned to the cluster.'
++        'esxi-9.1-ready' = 'Every ESX host reports version 9.1.0.0 and its cluster is healthy.'
++        'edge-capacity-ready' = 'XLARGE Edge resources and redundant 25 Gbps uplinks are available on both ToRs.'
++        'management-services-network-ready' = 'Management Services DNS, NTP, routing, and reserved network addresses are reachable.'
++        'management-domain-9.1-converged' = 'Every management-domain component is converged on the VCF 9.1 BOM.'
++    }
++    if (-not $conditions.ContainsKey($GateId)) {
++        throw "No definition is available for technical gate $GateId."
++    }
++    [pscustomobject] [ordered]@{
++        id        = $GateId
++        condition = $conditions[$GateId]
++        evidence  = 'Lifecycle precheck or component health output'
++    }
++}
++
++function New-TargetSddcSpec {
++    param(
++        [Parameter(Mandatory)] $Inventory,
++        [Parameter(Mandatory)] [string] $TargetVersion
++    )
++
++    $managementVcenter = @($Inventory.components | Where-Object {
++        $_.type -eq 'VCENTER' -and $_.domain -eq 'management'
++    })[0]
++
++    $networkSpecs = foreach ($networkName in @('management', 'vmotion', 'vsan')) {
++        $network = $Inventory.network.$networkName
++        [pscustomobject] [ordered]@{
++            networkType = $networkName.ToUpperInvariant()
++            subnet      = [string] $network.subnet
++            gateway     = [string] $network.gateway
++            vlanId      = [int] $network.vlanId
++            mtu         = [int] $network.mtu
++        }
++    }
++
++    [pscustomobject] [ordered]@{
++        sddcId         = [string] $Inventory.sddcId
++        workflowType   = 'VCF'
++        version        = $TargetVersion
++        vcfInstanceName = [string] $Inventory.vcfInstanceName
++        vcenterSpec    = [pscustomobject] [ordered]@{
++            vcenterHostname       = [string] $managementVcenter.name
++            rootVcenterPassword   = '${VC_ROOT_PASS}'
++            version               = $TargetVersion
++            useExistingDeployment = $true
++        }
++        networkSpecs   = @($networkSpecs)
++        dnsSpec        = [pscustomobject] [ordered]@{
++            subdomain  = [string] $Inventory.network.dnsDomain
++            nameservers = @($Inventory.network.dnsServers)
++        }
++        ntpServers     = @($Inventory.network.ntpServers)
++    }
++}
++
++function New-VcfMigrationPlan {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [string] $InventoryPath,
++
++        [Parameter(Mandatory)]
++        [string] $CompatibilitySnapshotPath,
++
++        [Parameter(Mandatory)]
++        [string] $OutputPath
++    )
++
++    $inventory = Get-Content -LiteralPath $InventoryPath -Raw | ConvertFrom-Json -Depth 100
++    $snapshot = Get-Content -LiteralPath $CompatibilitySnapshotPath -Raw | ConvertFrom-Json -Depth 100
++    $hops = @(Get-SupportedHopPath -Snapshot $snapshot -Source $inventory.vcfVersion -Target $inventory.targetVcfVersion)
++    $known = [ordered]@{}
++    $currentVersions = @{}
++    foreach ($component in $inventory.components) {
++        $known[[string] $component.id] = [pscustomobject] [ordered]@{
++            id     = [string] $component.id
++            name   = [string] $component.name
++            type   = [string] $component.type
++            domain = [string] $component.domain
++        }
++        $currentVersions[[string] $component.id] = [string] $component.version
++    }
++
++    $steps = [System.Collections.Generic.List[object]]::new()
++    $gateDefinitions = [ordered]@{}
++    $order = 0
++    foreach ($hop in $hops) {
++        $hopKey = "$($hop.from)->$($hop.to)"
++        $newComponents = @()
++        $newComponentProperty = $snapshot.newComponentsByHop.PSObject.Properties[$hopKey]
++        if ($null -ne $newComponentProperty) {
++            $newComponents = @($newComponentProperty.Value)
++        }
++        foreach ($component in $newComponents) {
++            $known[[string] $component.id] = [pscustomobject] [ordered]@{
++                id     = [string] $component.id
++                name   = [string] $component.name
++                type   = [string] $component.type
++                domain = [string] $component.domain
++            }
++            $currentVersions[[string] $component.id] = 'NOT_PRESENT'
++        }
++
++        $phases = @($snapshot.phaseSequenceByHop.$hopKey)
++        foreach ($phase in $phases) {
++            foreach ($componentType in $phase.types) {
++                $batch = @($known.Values | Where-Object {
++                    $scope = if ($_.domain -in @('fleet', 'management')) { $_.domain } else { 'workload' }
++                    $_.type -eq $componentType -and $scope -eq $phase.scope
++                } | Sort-Object domain, id)
++                foreach ($component in $batch) {
++                    $gateIds = @($snapshot.requiredGatesByHopAndType.$hopKey.$componentType)
++                    $scopeGateProperty = $snapshot.requiredGatesByHopAndScope.$hopKey.PSObject.Properties[[string] $phase.scope]
++                    if ($null -ne $scopeGateProperty) {
++                        $gateIds += @($scopeGateProperty.Value)
++                    }
++                    foreach ($gateId in $gateIds) {
++                        if (-not $gateDefinitions.Contains([string] $gateId)) {
++                            $gateDefinitions[[string] $gateId] = Get-GateDefinition -GateId $gateId
++                        }
++                    }
++                    $order++
++                    $steps.Add([pscustomobject] [ordered]@{
++                        order         = $order
++                        hopFrom       = [string] $hop.from
++                        hopTo         = [string] $hop.to
++                        componentId   = [string] $component.id
++                        componentName = [string] $component.name
++                        componentType = [string] $component.type
++                        domain        = [string] $component.domain
++                        fromVersion   = [string] $currentVersions[$component.id]
++                        toVersion     = [string] $snapshot.bomByVcfVersion.($hop.to).($component.type)
++                        gates         = @($gateIds)
++                    })
++                }
++            }
++        }
++
++        foreach ($component in $known.Values) {
++            $currentVersions[$component.id] = [string] $snapshot.bomByVcfVersion.($hop.to).($component.type)
++        }
++    }
++
++    $throughput = [double] $inventory.edgeRequirement.northSouthThroughputGbps
++    $plan = [pscustomobject] [ordered]@{
++        '$schema'        = 'specifications/migration-plan-schema.json'
++        estateId         = [string] $inventory.estateId
++        sourceVcfVersion = [string] $inventory.vcfVersion
++        targetVcfVersion = [string] $inventory.targetVcfVersion
++        targetSddcSpec   = New-TargetSddcSpec -Inventory $inventory -TargetVersion $inventory.targetVcfVersion
++        architecture     = [pscustomobject] [ordered]@{
++            requiredNorthSouthThroughputGbps = $throughput
++            edge = [pscustomobject] [ordered]@{
++                formFactor = Get-EdgeFormFactor -Snapshot $snapshot -ThroughputGbps $throughput
++                nodeCount  = [int] $inventory.edgeRequirement.nodeCount
++                tier0Mode  = [string] $snapshot.edgeUplinkRule.tier0Mode
++                routing    = [string] $snapshot.edgeUplinkRule.routing
++                uplinks    = @($inventory.edgeRequirement.availableUplinks)
++            }
++        }
++        hops             = @($hops)
++        gates            = @($gateDefinitions.Values)
++        steps            = @($steps)
++    }
++
++    $outputDirectory = Split-Path -Parent $OutputPath
++    if ($outputDirectory -and -not (Test-Path -LiteralPath $outputDirectory)) {
++        New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
++    }
++    $plan | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $OutputPath -Encoding utf8NoBOM
++}
++
++Export-ModuleMember -Function Get-VcfEstateInventory, New-VcfMigrationPlan
+diff --git a/migration-plan.json b/migration-plan.json
+new file mode 100644
+index 0000000..0de596c
+--- /dev/null
++++ b/migration-plan.json
+@@ -0,0 +1,732 @@
++{
++  "$schema": "specifications/migration-plan-schema.json",
++  "estateId": "dal01-vcf",
++  "sourceVcfVersion": "4.5.1",
++  "targetVcfVersion": "9.1.0.0",
++  "targetSddcSpec": {
++    "sddcId": "dal01-m01",
++    "workflowType": "VCF",
++    "version": "9.1.0.0",
++    "vcfInstanceName": "DAL01 Private Cloud",
++    "vcenterSpec": {
++      "vcenterHostname": "vc-mgmt.dal01.corp.example",
++      "rootVcenterPassword": "${VC_ROOT_PASS}",
++      "version": "9.1.0.0",
++      "useExistingDeployment": true
++    },
++    "networkSpecs": [
++      {
++        "networkType": "MANAGEMENT",
++        "subnet": "10.20.10.0/24",
++        "gateway": "10.20.10.1",
++        "vlanId": 110,
++        "mtu": 9000
++      },
++      {
++        "networkType": "VMOTION",
++        "subnet": "10.20.20.0/24",
++        "gateway": "10.20.20.1",
++        "vlanId": 120,
++        "mtu": 9000
++      },
++      {
++        "networkType": "VSAN",
++        "subnet": "10.20.30.0/24",
++        "gateway": "10.20.30.1",
++        "vlanId": 130,
++        "mtu": 9000
++      }
++    ],
++    "dnsSpec": {
++      "subdomain": "dal01.corp.example",
++      "nameservers": [
++        "10.20.0.10",
++        "10.20.0.11"
++      ]
++    },
++    "ntpServers": [
++      "10.20.0.20",
++      "10.20.0.21"
++    ]
++  },
++  "architecture": {
++    "requiredNorthSouthThroughputGbps": 18.0,
++    "edge": {
++      "formFactor": "XLARGE",
++      "nodeCount": 2,
++      "tier0Mode": "ACTIVE_ACTIVE",
++      "routing": "EBGP_ECMP",
++      "uplinks": [
++        {
++          "edgeNodeId": "nsx-edge-wld-01",
++          "logicalUplink": "uplink-1",
++          "vlanId": 1701,
++          "tor": "TOR-A",
++          "hostPnic": "vmnic2",
++          "speedGbps": 25
++        },
++        {
++          "edgeNodeId": "nsx-edge-wld-01",
++          "logicalUplink": "uplink-2",
++          "vlanId": 1702,
++          "tor": "TOR-B",
++          "hostPnic": "vmnic3",
++          "speedGbps": 25
++        },
++        {
++          "edgeNodeId": "nsx-edge-wld-02",
++          "logicalUplink": "uplink-1",
++          "vlanId": 1701,
++          "tor": "TOR-A",
++          "hostPnic": "vmnic2",
++          "speedGbps": 25
++        },
++        {
++          "edgeNodeId": "nsx-edge-wld-02",
++          "logicalUplink": "uplink-2",
++          "vlanId": 1702,
++          "tor": "TOR-B",
++          "hostPnic": "vmnic3",
++          "speedGbps": 25
++        }
++      ]
++    }
++  },
++  "hops": [
++    {
++      "from": "4.5.1",
++      "to": "5.2.1"
++    },
++    {
++      "from": "5.2.1",
++      "to": "9.1.0.0"
++    }
++  ],
++  "gates": [
++    {
++      "id": "source-health-clean",
++      "condition": "All VCF-managed components report healthy before the first bundle is applied.",
++      "evidence": "Lifecycle precheck or component health output"
++    },
++    {
++      "id": "backups-complete",
++      "condition": "File-based backups of SDDC Manager, vCenter, and NSX are restorable.",
++      "evidence": "Lifecycle precheck or component health output"
++    },
++    {
++      "id": "hcl-5.2.1-compatible",
++      "condition": "Management and workload hosts are compatible with the VCF 5.2.1 BOM.",
++      "evidence": "Lifecycle precheck or component health output"
++    },
++    {
++      "id": "lcm-precheck-5.2.1-clean",
++      "condition": "SDDC Manager lifecycle prechecks for VCF 5.2.1 have no blocking findings.",
++      "evidence": "Lifecycle precheck or component health output"
++    },
++    {
++      "id": "sddc-manager-5.2.1-ready",
++      "condition": "SDDC Manager reports version 5.2.1.0 and lifecycle services are healthy.",
++      "evidence": "Lifecycle precheck or component health output"
++    },
++    {
++      "id": "nsx-manager-5.2.1-ready",
++      "condition": "Every NSX Manager cluster reports version 4.2.1.0.0 and stable status.",
++      "evidence": "Lifecycle precheck or component health output"
++    },
++    {
++      "id": "vcenter-5.2.1-ready",
++      "condition": "The vCenter for the domain reports version 8.0.3.00100 and healthy services.",
++      "evidence": "Lifecycle precheck or component health output"
++    },
++    {
++      "id": "management-domain-5.2.1-converged",
++      "condition": "Every management-domain component is converged on the VCF 5.2.1 BOM.",
++      "evidence": "Lifecycle precheck or component health output"
++    },
++    {
++      "id": "estate-5.2.1-converged",
++      "condition": "Every inventoried component is converged on the VCF 5.2.1 BOM.",
++      "evidence": "Lifecycle precheck or component health output"
++    },
++    {
++      "id": "hcl-9.1-compatible",
++      "condition": "Management and workload hosts are compatible with the VCF 9.1 hardware baseline.",
++      "evidence": "Lifecycle precheck or component health output"
++    },
++    {
++      "id": "operations-deployment-precheck-clean",
++      "condition": "VCF Operations deployment prerequisites and endpoint checks are clean.",
++      "evidence": "Lifecycle precheck or component health output"
++    },
++    {
++      "id": "vcf-operations-9.1-ready",
++      "condition": "VCF Operations 9.1 is deployed and collecting from the VCF instance.",
++      "evidence": "Lifecycle precheck or component health output"
++    },
++    {
++      "id": "license-server-deployment-precheck-clean",
++      "condition": "VCF License Server deployment prerequisites, DNS, and endpoint checks are clean.",
++      "evidence": "Lifecycle precheck or component health output"
++    },
++    {
++      "id": "license-server-9.1-ready",
++      "condition": "VCF License Server 9.1 is deployed, reachable, and ready to license upgraded components.",
++      "evidence": "Lifecycle precheck or component health output"
++    },
++    {
++      "id": "lcm-precheck-9.1-clean",
++      "condition": "SDDC Manager lifecycle prechecks for VCF 9.1 have no blocking findings.",
++      "evidence": "Lifecycle precheck or component health output"
++    },
++    {
++      "id": "sddc-manager-9.1-ready",
++      "condition": "SDDC Manager reports version 9.1.0.0 and lifecycle services are healthy.",
++      "evidence": "Lifecycle precheck or component health output"
++    },
++    {
++      "id": "management-services-network-ready",
++      "condition": "Management Services DNS, NTP, routing, and reserved network addresses are reachable.",
++      "evidence": "Lifecycle precheck or component health output"
++    },
++    {
++      "id": "management-services-9.1-ready",
++      "condition": "VCF Management Services 9.1 lifecycle, depot, and licensing services are healthy.",
++      "evidence": "Lifecycle precheck or component health output"
++    },
++    {
++      "id": "nsx-manager-9.1-ready",
++      "condition": "Every NSX Manager cluster reports version 9.1.0.0 and stable status.",
++      "evidence": "Lifecycle precheck or component health output"
++    },
++    {
++      "id": "reduced-downtime-network-ready",
++      "condition": "The temporary network required by reduced-downtime vCenter upgrade is reachable.",
++      "evidence": "Lifecycle precheck or component health output"
++    },
++    {
++      "id": "vcenter-9.1-ready",
++      "condition": "The vCenter for the domain reports version 9.1.0.0 and healthy services.",
++      "evidence": "Lifecycle precheck or component health output"
++    },
++    {
++      "id": "vlcm-image-ready",
++      "condition": "A compliant vSphere Lifecycle Manager image for ESX 9.1 is assigned to the cluster.",
++      "evidence": "Lifecycle precheck or component health output"
++    },
++    {
++      "id": "management-domain-9.1-converged",
++      "condition": "Every management-domain component is converged on the VCF 9.1 BOM.",
++      "evidence": "Lifecycle precheck or component health output"
++    },
++    {
++      "id": "esxi-9.1-ready",
++      "condition": "Every ESX host reports version 9.1.0.0 and its cluster is healthy.",
++      "evidence": "Lifecycle precheck or component health output"
++    },
++    {
++      "id": "edge-capacity-ready",
++      "condition": "XLARGE Edge resources and redundant 25 Gbps uplinks are available on both ToRs.",
++      "evidence": "Lifecycle precheck or component health output"
++    }
++  ],
++  "steps": [
++    {
++      "order": 1,
++      "hopFrom": "4.5.1",
++      "hopTo": "5.2.1",
++      "componentId": "sddc-manager-01",
++      "componentName": "sddc-manager.dal01.corp.example",
++      "componentType": "SDDC_MANAGER",
++      "domain": "management",
++      "fromVersion": "4.5.1.0",
++      "toVersion": "5.2.1.0",
++      "gates": [
++        "source-health-clean",
++        "backups-complete",
++        "hcl-5.2.1-compatible",
++        "lcm-precheck-5.2.1-clean"
++      ]
++    },
++    {
++      "order": 2,
++      "hopFrom": "4.5.1",
++      "hopTo": "5.2.1",
++      "componentId": "nsx-manager-mgmt-01",
++      "componentName": "nsx-mgmt.dal01.corp.example",
++      "componentType": "NSX_MANAGER",
++      "domain": "management",
++      "fromVersion": "3.2.2.1.0",
++      "toVersion": "4.2.1.0.0",
++      "gates": [
++        "sddc-manager-5.2.1-ready"
++      ]
++    },
++    {
++      "order": 3,
++      "hopFrom": "4.5.1",
++      "hopTo": "5.2.1",
++      "componentId": "vcenter-mgmt-01",
++      "componentName": "vc-mgmt.dal01.corp.example",
++      "componentType": "VCENTER",
++      "domain": "management",
++      "fromVersion": "7.0.3.01400",
++      "toVersion": "8.0.3.00100",
++      "gates": [
++        "nsx-manager-5.2.1-ready"
++      ]
++    },
++    {
++      "order": 4,
++      "hopFrom": "4.5.1",
++      "hopTo": "5.2.1",
++      "componentId": "esxi-mgmt-01",
++      "componentName": "esx-m01.dal01.corp.example",
++      "componentType": "ESXI",
++      "domain": "management",
++      "fromVersion": "7.0.3",
++      "toVersion": "8.0.3",
++      "gates": [
++        "vcenter-5.2.1-ready"
++      ]
++    },
++    {
++      "order": 5,
++      "hopFrom": "4.5.1",
++      "hopTo": "5.2.1",
++      "componentId": "esxi-mgmt-02",
++      "componentName": "esx-m02.dal01.corp.example",
++      "componentType": "ESXI",
++      "domain": "management",
++      "fromVersion": "7.0.3",
++      "toVersion": "8.0.3",
++      "gates": [
++        "vcenter-5.2.1-ready"
++      ]
++    },
++    {
++      "order": 6,
++      "hopFrom": "4.5.1",
++      "hopTo": "5.2.1",
++      "componentId": "esxi-mgmt-03",
++      "componentName": "esx-m03.dal01.corp.example",
++      "componentType": "ESXI",
++      "domain": "management",
++      "fromVersion": "7.0.3",
++      "toVersion": "8.0.3",
++      "gates": [
++        "vcenter-5.2.1-ready"
++      ]
++    },
++    {
++      "order": 7,
++      "hopFrom": "4.5.1",
++      "hopTo": "5.2.1",
++      "componentId": "esxi-mgmt-04",
++      "componentName": "esx-m04.dal01.corp.example",
++      "componentType": "ESXI",
++      "domain": "management",
++      "fromVersion": "7.0.3",
++      "toVersion": "8.0.3",
++      "gates": [
++        "vcenter-5.2.1-ready"
++      ]
++    },
++    {
++      "order": 8,
++      "hopFrom": "4.5.1",
++      "hopTo": "5.2.1",
++      "componentId": "nsx-manager-wld-01",
++      "componentName": "nsx-wld.dal01.corp.example",
++      "componentType": "NSX_MANAGER",
++      "domain": "wld01",
++      "fromVersion": "3.2.2.1.0",
++      "toVersion": "4.2.1.0.0",
++      "gates": [
++        "sddc-manager-5.2.1-ready",
++        "management-domain-5.2.1-converged"
++      ]
++    },
++    {
++      "order": 9,
++      "hopFrom": "4.5.1",
++      "hopTo": "5.2.1",
++      "componentId": "nsx-edge-wld-01",
++      "componentName": "edge-w01.dal01.corp.example",
++      "componentType": "NSX_EDGE",
++      "domain": "wld01",
++      "fromVersion": "3.2.2.1.0",
++      "toVersion": "4.2.1.0.0",
++      "gates": [
++        "nsx-manager-5.2.1-ready",
++        "management-domain-5.2.1-converged"
++      ]
++    },
++    {
++      "order": 10,
++      "hopFrom": "4.5.1",
++      "hopTo": "5.2.1",
++      "componentId": "nsx-edge-wld-02",
++      "componentName": "edge-w02.dal01.corp.example",
++      "componentType": "NSX_EDGE",
++      "domain": "wld01",
++      "fromVersion": "3.2.2.1.0",
++      "toVersion": "4.2.1.0.0",
++      "gates": [
++        "nsx-manager-5.2.1-ready",
++        "management-domain-5.2.1-converged"
++      ]
++    },
++    {
++      "order": 11,
++      "hopFrom": "4.5.1",
++      "hopTo": "5.2.1",
++      "componentId": "vcenter-wld-01",
++      "componentName": "vc-wld01.dal01.corp.example",
++      "componentType": "VCENTER",
++      "domain": "wld01",
++      "fromVersion": "7.0.3.01400",
++      "toVersion": "8.0.3.00100",
++      "gates": [
++        "nsx-manager-5.2.1-ready",
++        "management-domain-5.2.1-converged"
++      ]
++    },
++    {
++      "order": 12,
++      "hopFrom": "4.5.1",
++      "hopTo": "5.2.1",
++      "componentId": "esxi-wld-01",
++      "componentName": "esx-w01.dal01.corp.example",
++      "componentType": "ESXI",
++      "domain": "wld01",
++      "fromVersion": "7.0.3",
++      "toVersion": "8.0.3",
++      "gates": [
++        "vcenter-5.2.1-ready",
++        "management-domain-5.2.1-converged"
++      ]
++    },
++    {
++      "order": 13,
++      "hopFrom": "4.5.1",
++      "hopTo": "5.2.1",
++      "componentId": "esxi-wld-02",
++      "componentName": "esx-w02.dal01.corp.example",
++      "componentType": "ESXI",
++      "domain": "wld01",
++      "fromVersion": "7.0.3",
++      "toVersion": "8.0.3",
++      "gates": [
++        "vcenter-5.2.1-ready",
++        "management-domain-5.2.1-converged"
++      ]
++    },
++    {
++      "order": 14,
++      "hopFrom": "4.5.1",
++      "hopTo": "5.2.1",
++      "componentId": "esxi-wld-03",
++      "componentName": "esx-w03.dal01.corp.example",
++      "componentType": "ESXI",
++      "domain": "wld01",
++      "fromVersion": "7.0.3",
++      "toVersion": "8.0.3",
++      "gates": [
++        "vcenter-5.2.1-ready",
++        "management-domain-5.2.1-converged"
++      ]
++    },
++    {
++      "order": 15,
++      "hopFrom": "4.5.1",
++      "hopTo": "5.2.1",
++      "componentId": "esxi-wld-04",
++      "componentName": "esx-w04.dal01.corp.example",
++      "componentType": "ESXI",
++      "domain": "wld01",
++      "fromVersion": "7.0.3",
++      "toVersion": "8.0.3",
++      "gates": [
++        "vcenter-5.2.1-ready",
++        "management-domain-5.2.1-converged"
++      ]
++    },
++    {
++      "order": 16,
++      "hopFrom": "5.2.1",
++      "hopTo": "9.1.0.0",
++      "componentId": "vcf-operations-01",
++      "componentName": "VCF Operations",
++      "componentType": "VCF_OPERATIONS",
++      "domain": "fleet",
++      "fromVersion": "NOT_PRESENT",
++      "toVersion": "9.1.0.0",
++      "gates": [
++        "estate-5.2.1-converged",
++        "hcl-9.1-compatible",
++        "operations-deployment-precheck-clean"
++      ]
++    },
++    {
++      "order": 17,
++      "hopFrom": "5.2.1",
++      "hopTo": "9.1.0.0",
++      "componentId": "vcf-license-server-01",
++      "componentName": "VCF License Server",
++      "componentType": "VCF_LICENSE_SERVER",
++      "domain": "fleet",
++      "fromVersion": "NOT_PRESENT",
++      "toVersion": "9.1.0.0",
++      "gates": [
++        "vcf-operations-9.1-ready",
++        "license-server-deployment-precheck-clean"
++      ]
++    },
++    {
++      "order": 18,
++      "hopFrom": "5.2.1",
++      "hopTo": "9.1.0.0",
++      "componentId": "sddc-manager-01",
++      "componentName": "sddc-manager.dal01.corp.example",
++      "componentType": "SDDC_MANAGER",
++      "domain": "management",
++      "fromVersion": "5.2.1.0",
++      "toVersion": "9.1.0.0",
++      "gates": [
++        "license-server-9.1-ready",
++        "lcm-precheck-9.1-clean"
++      ]
++    },
++    {
++      "order": 19,
++      "hopFrom": "5.2.1",
++      "hopTo": "9.1.0.0",
++      "componentId": "vcf-management-services-01",
++      "componentName": "VCF Management Services",
++      "componentType": "VCF_MANAGEMENT_SERVICES",
++      "domain": "management",
++      "fromVersion": "NOT_PRESENT",
++      "toVersion": "9.1.0.0",
++      "gates": [
++        "sddc-manager-9.1-ready",
++        "management-services-network-ready"
++      ]
++    },
++    {
++      "order": 20,
++      "hopFrom": "5.2.1",
++      "hopTo": "9.1.0.0",
++      "componentId": "nsx-manager-mgmt-01",
++      "componentName": "nsx-mgmt.dal01.corp.example",
++      "componentType": "NSX_MANAGER",
++      "domain": "management",
++      "fromVersion": "4.2.1.0.0",
++      "toVersion": "9.1.0.0",
++      "gates": [
++        "management-services-9.1-ready"
++      ]
++    },
++    {
++      "order": 21,
++      "hopFrom": "5.2.1",
++      "hopTo": "9.1.0.0",
++      "componentId": "vcenter-mgmt-01",
++      "componentName": "vc-mgmt.dal01.corp.example",
++      "componentType": "VCENTER",
++      "domain": "management",
++      "fromVersion": "8.0.3.00100",
++      "toVersion": "9.1.0.0",
++      "gates": [
++        "nsx-manager-9.1-ready",
++        "reduced-downtime-network-ready"
++      ]
++    },
++    {
++      "order": 22,
++      "hopFrom": "5.2.1",
++      "hopTo": "9.1.0.0",
++      "componentId": "esxi-mgmt-01",
++      "componentName": "esx-m01.dal01.corp.example",
++      "componentType": "ESXI",
++      "domain": "management",
++      "fromVersion": "8.0.3",
++      "toVersion": "9.1.0.0",
++      "gates": [
++        "vcenter-9.1-ready",
++        "vlcm-image-ready"
++      ]
++    },
++    {
++      "order": 23,
++      "hopFrom": "5.2.1",
++      "hopTo": "9.1.0.0",
++      "componentId": "esxi-mgmt-02",
++      "componentName": "esx-m02.dal01.corp.example",
++      "componentType": "ESXI",
++      "domain": "management",
++      "fromVersion": "8.0.3",
++      "toVersion": "9.1.0.0",
++      "gates": [
++        "vcenter-9.1-ready",
++        "vlcm-image-ready"
++      ]
++    },
++    {
++      "order": 24,
++      "hopFrom": "5.2.1",
++      "hopTo": "9.1.0.0",
++      "componentId": "esxi-mgmt-03",
++      "componentName": "esx-m03.dal01.corp.example",
++      "componentType": "ESXI",
++      "domain": "management",
++      "fromVersion": "8.0.3",
++      "toVersion": "9.1.0.0",
++      "gates": [
++        "vcenter-9.1-ready",
++        "vlcm-image-ready"
++      ]
++    },
++    {
++      "order": 25,
++      "hopFrom": "5.2.1",
++      "hopTo": "9.1.0.0",
++      "componentId": "esxi-mgmt-04",
++      "componentName": "esx-m04.dal01.corp.example",
++      "componentType": "ESXI",
++      "domain": "management",
++      "fromVersion": "8.0.3",
++      "toVersion": "9.1.0.0",
++      "gates": [
++        "vcenter-9.1-ready",
++        "vlcm-image-ready"
++      ]
++    },
++    {
++      "order": 26,
++      "hopFrom": "5.2.1",
++      "hopTo": "9.1.0.0",
++      "componentId": "nsx-manager-wld-01",
++      "componentName": "nsx-wld.dal01.corp.example",
++      "componentType": "NSX_MANAGER",
++      "domain": "wld01",
++      "fromVersion": "4.2.1.0.0",
++      "toVersion": "9.1.0.0",
++      "gates": [
++        "management-services-9.1-ready",
++        "management-domain-9.1-converged"
++      ]
++    },
++    {
++      "order": 27,
++      "hopFrom": "5.2.1",
++      "hopTo": "9.1.0.0",
++      "componentId": "vcenter-wld-01",
++      "componentName": "vc-wld01.dal01.corp.example",
++      "componentType": "VCENTER",
++      "domain": "wld01",
++      "fromVersion": "8.0.3.00100",
++      "toVersion": "9.1.0.0",
++      "gates": [
++        "nsx-manager-9.1-ready",
++        "reduced-downtime-network-ready",
++        "management-domain-9.1-converged"
++      ]
++    },
++    {
++      "order": 28,
++      "hopFrom": "5.2.1",
++      "hopTo": "9.1.0.0",
++      "componentId": "esxi-wld-01",
++      "componentName": "esx-w01.dal01.corp.example",
++      "componentType": "ESXI",
++      "domain": "wld01",
++      "fromVersion": "8.0.3",
++      "toVersion": "9.1.0.0",
++      "gates": [
++        "vcenter-9.1-ready",
++        "vlcm-image-ready",
++        "management-domain-9.1-converged"
++      ]
++    },
++    {
++      "order": 29,
++      "hopFrom": "5.2.1",
++      "hopTo": "9.1.0.0",
++      "componentId": "esxi-wld-02",
++      "componentName": "esx-w02.dal01.corp.example",
++      "componentType": "ESXI",
++      "domain": "wld01",
++      "fromVersion": "8.0.3",
++      "toVersion": "9.1.0.0",
++      "gates": [
++        "vcenter-9.1-ready",
++        "vlcm-image-ready",
++        "management-domain-9.1-converged"
++      ]
++    },
++    {
++      "order": 30,
++      "hopFrom": "5.2.1",
++      "hopTo": "9.1.0.0",
++      "componentId": "esxi-wld-03",
++      "componentName": "esx-w03.dal01.corp.example",
++      "componentType": "ESXI",
++      "domain": "wld01",
++      "fromVersion": "8.0.3",
++      "toVersion": "9.1.0.0",
++      "gates": [
++        "vcenter-9.1-ready",
++        "vlcm-image-ready",
++        "management-domain-9.1-converged"
++      ]
++    },
++    {
++      "order": 31,
++      "hopFrom": "5.2.1",
++      "hopTo": "9.1.0.0",
++      "componentId": "esxi-wld-04",
++      "componentName": "esx-w04.dal01.corp.example",
++      "componentType": "ESXI",
++      "domain": "wld01",
++      "fromVersion": "8.0.3",
++      "toVersion": "9.1.0.0",
++      "gates": [
++        "vcenter-9.1-ready",
++        "vlcm-image-ready",
++        "management-domain-9.1-converged"
++      ]
++    },
++    {
++      "order": 32,
++      "hopFrom": "5.2.1",
++      "hopTo": "9.1.0.0",
++      "componentId": "nsx-edge-wld-01",
++      "componentName": "edge-w01.dal01.corp.example",
++      "componentType": "NSX_EDGE",
++      "domain": "wld01",
++      "fromVersion": "4.2.1.0.0",
++      "toVersion": "9.1.0.0",
++      "gates": [
++        "esxi-9.1-ready",
++        "edge-capacity-ready",
++        "management-domain-9.1-converged"
++      ]
++    },
++    {
++      "order": 33,
++      "hopFrom": "5.2.1",
++      "hopTo": "9.1.0.0",
++      "componentId": "nsx-edge-wld-02",
++      "componentName": "edge-w02.dal01.corp.example",
++      "componentType": "NSX_EDGE",
++      "domain": "wld01",
++      "fromVersion": "4.2.1.0.0",
++      "toVersion": "9.1.0.0",
++      "gates": [
++        "esxi-9.1-ready",
++        "edge-capacity-ready",
++        "management-domain-9.1-converged"
++      ]
++    }
++  ]
++}
+diff --git a/research-sources.json b/research-sources.json
+new file mode 100644
+index 0000000..9d6d2c1
+--- /dev/null
++++ b/research-sources.json
+@@ -0,0 +1,42 @@
++[
++  {
++    "title": "Broadcom KB 405275: Upgrade VMware Cloud Foundation (VCF) 4.x and 5.x",
++    "url": "https://knowledge.broadcom.com/external/article/405275/upgrade-vmware-cloud-foundation-vcf-4x-a.html",
++    "decision": "Established the core SDDC Manager, NSX, vCenter, and ESX lifecycle ordering and required health, backup, HCL, and precheck gates."
++  },
++  {
++    "title": "Broadcom KB 418641: Upgrade Sequence from VCF 4.5.1.0 to 5.2.1.0 reports a red exclamation point on the NSX_T_MANAGER 4.2.1.0.0 step",
++    "url": "https://knowledge.broadcom.com/external/article/418641/upgrade-sequence-from-vcf-4510-to-5210-r.html",
++    "decision": "Confirmed the documented 4.5.1-to-5.2.1 upgrade context, the NSX 4.2.1 bundle transition, and its NSX upgrade-evaluation precheck."
++  },
++  {
++    "title": "Broadcom Compatibility Guide",
++    "url": "https://compatibilityguide.broadcom.com/",
++    "decision": "Provided the live Product Interoperability and Upgrade Path matrix entry points used to cross-check the pinned supported combinations and release path."
++  },
++  {
++    "title": "Broadcom KB 314608: Correlating VCF versions with constituent products",
++    "url": "https://knowledge.broadcom.com/external/article/314608/correlating-vmware-cloud-foundation-vers.html",
++    "decision": "Confirmed the source 4.5.1 and intermediate 5.2.1 component BOM versions."
++  },
++  {
++    "title": "Broadcom KB 440630: Upgrade sequence and related issues for VCF 9.1",
++    "url": "https://knowledge.broadcom.com/external/article/440630/upgrade-sequence-and-related-issues-for.html",
++    "decision": "Confirmed that VCF 5.2.x can enter the 9.1 lifecycle workflow, that VCF Operations precedes the 9.1 core upgrade, and that the centralized VCF License Server is mandatory."
++  },
++  {
++    "title": "VMware Cloud Foundation 5.2.x to 9.1 upgrade guide",
++    "url": "https://blogs.vmware.com/cloud-foundation/2026/06/05/modernizing-infrastructure-vmware-cloud-foundation-5-2-x-to-9-1-upgrade-guide/",
++    "decision": "Confirmed the brownfield target component set, including VCF Operations, Management Services, and NSX Edge nodes."
++  },
++  {
++    "title": "Broadcom VCF API Specification 9.1",
++    "url": "https://developer.broadcom.com/sdks/vcf-api-specification/latest/",
++    "decision": "Confirmed the VCF Installer OpenAPI release and SddcSpec contract used for the embedded target specification."
++  },
++  {
++    "title": "Broadcom KB 423167: NSX Edge throughput and sizing remediation",
++    "url": "https://knowledge.broadcom.com/external/article/423167/alarms-in-an-nsx-environment-report-snat.html",
++    "decision": "Supported increasing Edge form factor and link capacity for throughput-driven sizing; 18 Gbps selects XLARGE under the pinned sizing matrix."
++  }
++]

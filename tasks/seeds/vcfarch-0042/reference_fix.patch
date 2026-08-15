@@ -1,0 +1,761 @@
+diff --git a/VcfArchitecture/VcfArchitecture.psd1 b/VcfArchitecture/VcfArchitecture.psd1
+new file mode 100644
+index 0000000..b3a9836
+--- /dev/null
++++ b/VcfArchitecture/VcfArchitecture.psd1
+@@ -0,0 +1,21 @@
++@{
++    RootModule = 'VcfArchitecture.psm1'
++    ModuleVersion = '1.0.0'
++    GUID = '9d3fb726-37aa-4ead-8d7d-06193b84399d'
++    Author = 'VCF Architecture Engineering'
++    Description = 'Builds deterministic VCF 9.0 installer and estate migration architecture artifacts.'
++    PowerShellVersion = '7.2'
++    RequiredModules = @(
++        @{
++            ModuleName = 'VMware.Sdk.Vcf.Installer'
++            RequiredVersion = '13.4.0.24798382'
++        }
++    )
++    FunctionsToExport = @(
++        'New-VcfGreenfieldSddcSpec'
++        'New-VcfEstateMigrationPlan'
++    )
++    CmdletsToExport = @()
++    VariablesToExport = @()
++    AliasesToExport = @()
++}
+diff --git a/VcfArchitecture/VcfArchitecture.psm1 b/VcfArchitecture/VcfArchitecture.psm1
+new file mode 100644
+index 0000000..5520627
+--- /dev/null
++++ b/VcfArchitecture/VcfArchitecture.psm1
+@@ -0,0 +1,322 @@
++Set-StrictMode -Version Latest
++
++function Read-VcfJson {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [string] $Path
++    )
++
++    $resolved = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path
++    return Get-Content -LiteralPath $resolved -Raw -Encoding utf8 | ConvertFrom-Json -Depth 100
++}
++
++function ConvertTo-VcfCanonicalValue {
++    [CmdletBinding()]
++    param(
++        [Parameter(ValueFromPipeline)]
++        [AllowNull()]
++        [object] $InputObject
++    )
++
++    process {
++        if ($null -eq $InputObject) {
++            return $null
++        }
++        if ($InputObject -is [System.Enum]) {
++            return $InputObject.ToString().ToLowerInvariant()
++        }
++        if (
++            $InputObject -is [string] -or
++            $InputObject -is [decimal] -or
++            $InputObject.GetType().IsPrimitive
++        ) {
++            return $InputObject
++        }
++        if ($InputObject -is [System.Collections.IDictionary]) {
++            $dictionary = [ordered] @{}
++            foreach ($key in $InputObject.Keys) {
++                $dictionary[$key] = ConvertTo-VcfCanonicalValue -InputObject $InputObject[$key]
++            }
++            return [pscustomobject] $dictionary
++        }
++        if ($InputObject -is [System.Collections.IEnumerable]) {
++            $items = @()
++            foreach ($item in $InputObject) {
++                $items += ,(ConvertTo-VcfCanonicalValue -InputObject $item)
++            }
++            return ,$items
++        }
++
++        $result = [ordered] @{}
++        foreach ($property in $InputObject.PSObject.Properties) {
++            if ($property.Name -eq 'AdditionalProperties' -or $null -eq $property.Value) {
++                continue
++            }
++            $jsonName = $property.Name.Substring(0, 1).ToLowerInvariant() + $property.Name.Substring(1)
++            $result[$jsonName] = ConvertTo-VcfCanonicalValue -InputObject $property.Value
++        }
++        return [pscustomobject] $result
++    }
++}
++
++function Write-VcfJson {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [object] $Value,
++
++        [Parameter(Mandatory)]
++        [string] $Path
++    )
++
++    $fullPath = [System.IO.Path]::GetFullPath($Path)
++    $parent = Split-Path -Parent $fullPath
++    if (-not [string]::IsNullOrEmpty($parent)) {
++        [void] (New-Item -ItemType Directory -Path $parent -Force)
++    }
++    $json = $Value | ConvertTo-Json -Depth 100
++    [System.IO.File]::WriteAllText($fullPath, $json + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
++    return $fullPath
++}
++
++function Assert-VcfDesignCapacity {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [object] $Requirements,
++
++        [Parameter(Mandatory)]
++        [object] $SupportedDesign
++    )
++
++    $hosts = @($Requirements.hosts)
++    if ($hosts.Count -ne [int] $SupportedDesign.hostCount) {
++        throw "The design requires exactly $($SupportedDesign.hostCount) hosts."
++    }
++    if ([int] $SupportedDesign.hostCount -ne [int] $SupportedDesign.minimumSupportedHostCount) {
++        throw 'The pinned design is not at the minimum supported host count.'
++    }
++    if ([int] $Requirements.deployment.siteCount -ne [int] $SupportedDesign.siteCount) {
++        throw 'The requested site count is not supported by the pinned design.'
++    }
++    if ([string] $Requirements.deployment.topology -ne [string] $SupportedDesign.topology) {
++        throw 'The requested topology is not supported by the pinned design.'
++    }
++
++    $survivorCount = $hosts.Count - [int] $Requirements.availability.maintenanceReserveHosts
++    $cores = @($hosts.physicalCores | Sort-Object | Select-Object -First $survivorCount | Measure-Object -Sum).Sum
++    $memory = @($hosts.memoryGiB | Sort-Object | Select-Object -First $survivorCount | Measure-Object -Sum).Sum
++    $storage = @($hosts.rawStorageTiB | Sort-Object | Select-Object -First $survivorCount | Measure-Object -Sum).Sum
++    $usableVcpu = [double] $cores * [double] $Requirements.capacityFactors.vcpuPerPhysicalCore
++    $usableMemory = [double] $memory * [double] $Requirements.capacityFactors.memoryUsableFraction
++    $usableStorage = [double] $storage * [double] $Requirements.capacityFactors.storageUsableFraction
++    if (
++        $usableVcpu -lt [double] $Requirements.demand.workloadVcpu -or
++        $usableMemory -lt [double] $Requirements.demand.workloadMemoryGiB -or
++        $usableStorage -lt [double] $Requirements.demand.workloadUsableStorageTiB
++    ) {
++        throw 'The requested workload does not fit after reserving one host for failure or maintenance.'
++    }
++}
++
++function New-VcfGreenfieldSddcSpec {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [string] $RequirementsPath,
++
++        [Parameter(Mandatory)]
++        [string] $CompatibilityPath,
++
++        [Parameter(Mandatory)]
++        [string] $OutputPath
++    )
++
++    $requirements = Read-VcfJson -Path $RequirementsPath
++    $compatibility = Read-VcfJson -Path $CompatibilityPath
++    $authority = $compatibility.greenfield
++    $supportedDesign = $authority.supportedDesign
++    $bom = $authority.billOfMaterials
++
++    if ([string] $requirements.deployment.targetVcfVersion -ne [string] $authority.targetVcfVersion) {
++        throw 'The requested VCF release does not match the pinned compatibility release.'
++    }
++    Assert-VcfDesignCapacity -Requirements $requirements -SupportedDesign $supportedDesign
++
++    $hostSpecs = @()
++    foreach ($hostEntry in $requirements.hosts) {
++        $credential = Initialize-VcfInstallerSddcCredentials `
++            -Username 'root' `
++            -Password ([string] $requirements.secretPlaceholders.esxiRootPassword)
++        $hostSpecs += Initialize-VcfInstallerSddcHostSpec `
++            -Hostname ([string] $hostEntry.hostname) `
++            -Credentials $credential
++    }
++
++    $networkSpecs = @()
++    foreach ($network in $requirements.networks) {
++        $networkSpecs += Initialize-VcfInstallerSddcNetworkSpec `
++            -NetworkType ([string] $network.networkType) `
++            -Subnet ([string] $network.subnet) `
++            -Gateway ([string] $network.gateway) `
++            -SubnetMask ([string] $network.subnetMask) `
++            -IncludeIpAddress @($network.includeIpAddress) `
++            -VlanId ([uint32] $network.vlanId) `
++            -Mtu ([int] $network.mtu)
++    }
++
++    $dnsSpec = Initialize-VcfInstallerDnsSpec `
++        -Subdomain ([string] $requirements.dns.subdomain) `
++        -Nameservers @($requirements.dns.nameservers)
++
++    $vcenterSpec = Initialize-VcfInstallerSddcVcenterSpec `
++        -VcenterHostname ([string] $requirements.names.vcenterFqdn) `
++        -RootVcenterPassword ([string] $requirements.secretPlaceholders.vcenterRootPassword) `
++        -VmSize 'small' `
++        -StorageSize 'lstorage' `
++        -SsoDomain 'vsphere.local' `
++        -UseExistingDeployment $false `
++        -Version ([string] $bom.VCENTER)
++
++    $resourcePools = @()
++    foreach ($pool in $requirements.resourcePools) {
++        $resourcePools += Initialize-VcfInstallerResourcePoolSpec `
++            -Name ([string] $pool.name) `
++            -Type ([string] $pool.type) `
++            -CpuReservationPercentage ([uint32] $pool.cpuReservationPercentage) `
++            -MemoryReservationPercentage ([uint32] $pool.memoryReservationPercentage)
++    }
++    $clusterSpec = Initialize-VcfInstallerSddcClusterSpec `
++        -DatacenterName ([string] $requirements.names.datacenter) `
++        -ClusterName ([string] $requirements.names.cluster) `
++        -ResourcePoolSpecs $resourcePools
++
++    $uplinks = @()
++    foreach ($uplink in $supportedDesign.uplinks) {
++        $uplinks += Initialize-VcfInstallerVmnicToUplink `
++            -Id ([string] $uplink.id) `
++            -Uplink ([string] $uplink.uplink)
++    }
++    $dvsSpec = Initialize-VcfInstallerDvsSpec `
++        -DvsName ([string] $requirements.names.distributedSwitch) `
++        -Networks @($supportedDesign.requiredNetworkTypes) `
++        -Mtu 9000 `
++        -VmnicsToUplinks $uplinks
++
++    $nsxManagers = @()
++    foreach ($hostname in $requirements.names.nsxManagerFqdns) {
++        $nsxManagers += Initialize-VcfInstallerNsxtManagerSpec -Hostname ([string] $hostname)
++    }
++    $nsxtSpec = Initialize-VcfInstallerSddcNsxtSpec `
++        -NsxtManagers $nsxManagers `
++        -NsxtManagerSize ([string] $requirements.nsx.managerSize) `
++        -VipFqdn ([string] $requirements.names.nsxVipFqdn) `
++        -RootNsxtManagerPassword ([string] $requirements.secretPlaceholders.nsxRootPassword) `
++        -NsxtAdminPassword ([string] $requirements.secretPlaceholders.nsxAdminPassword) `
++        -NsxtAuditPassword ([string] $requirements.secretPlaceholders.nsxAuditPassword) `
++        -TransportVlanId ([int] $requirements.nsx.transportVlanId) `
++        -UseExistingDeployment $false `
++        -Version ([string] $bom.NSX_T_MANAGER)
++
++    $esaConfig = Initialize-VcfInstallerVsanEsaConfig -Enabled $true
++    $vsanSpec = Initialize-VcfInstallerVsanSpec `
++        -DatastoreName ([string] $requirements.names.datastore) `
++        -VsanDedup $false `
++        -EsaConfig $esaConfig `
++        -FailuresToTolerate ([uint32] $requirements.storage.failuresToTolerate)
++    $datastoreSpec = Initialize-VcfInstallerSddcDatastoreSpec -VsanSpec $vsanSpec
++
++    $sddcManagerSpec = Initialize-VcfInstallerSddcManagerSpec `
++        -Hostname ([string] $requirements.names.sddcManagerFqdn) `
++        -RootPassword ([string] $requirements.secretPlaceholders.sddcManagerRootPassword) `
++        -SshPassword ([string] $requirements.secretPlaceholders.sddcManagerSshPassword) `
++        -LocalUserPassword ([string] $requirements.secretPlaceholders.sddcManagerLocalPassword) `
++        -UseExistingDeployment $false `
++        -Version ([string] $bom.SDDC_MANAGER_VCF)
++
++    $sdkSpec = Initialize-VcfInstallerSddcSpec `
++        -SddcId ([string] $requirements.deployment.sddcId) `
++        -WorkflowType ([string] $requirements.deployment.workflowType) `
++        -HostSpecs $hostSpecs `
++        -Version ([string] $authority.targetVcfVersion) `
++        -VcenterSpec $vcenterSpec `
++        -ClusterSpec $clusterSpec `
++        -DvsSpecs @($dvsSpec) `
++        -NsxtSpec $nsxtSpec `
++        -NetworkSpecs $networkSpecs `
++        -DnsSpec $dnsSpec `
++        -NtpServers @($requirements.ntpServers) `
++        -SddcManagerSpec $sddcManagerSpec `
++        -ManagementPoolName ([string] $requirements.deployment.managementPoolName) `
++        -SkipEsxThumbprintValidation $false `
++        -SkipGatewayPingValidation $false `
++        -DatastoreSpec $datastoreSpec `
++        -VcfInstanceName ([string] $requirements.deployment.vcfInstanceName)
++
++    $payload = ConvertTo-VcfCanonicalValue -InputObject $sdkSpec
++    return Write-VcfJson -Value $payload -Path $OutputPath
++}
++
++function New-VcfEstateMigrationPlan {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [string] $InventoryPath,
++
++        [Parameter(Mandatory)]
++        [string] $CompatibilityPath,
++
++        [Parameter(Mandatory)]
++        [string] $OutputPath
++    )
++
++    $inventory = Read-VcfJson -Path $InventoryPath
++    $compatibility = Read-VcfJson -Path $CompatibilityPath
++    $authority = $compatibility.migration
++    if ([string] $inventory.inventoryId -ne [string] $authority.inventoryId) {
++        throw 'The inventory does not match the pinned migration authority.'
++    }
++
++    $inventoryById = @{}
++    foreach ($component in $inventory.components) {
++        if ($inventoryById.ContainsKey([string] $component.id)) {
++            throw "Duplicate inventory component: $($component.id)"
++        }
++        $inventoryById[[string] $component.id] = $component
++    }
++
++    $steps = @()
++    $order = 0
++    foreach ($componentIdValue in $authority.orderedComponentIds) {
++        $componentId = [string] $componentIdValue
++        if (-not $inventoryById.ContainsKey($componentId)) {
++            throw "The migration authority names an absent component: $componentId"
++        }
++        $order++
++        $component = $inventoryById[$componentId]
++        $steps += [ordered] @{
++            order = $order
++            componentId = $componentId
++            component = [string] $component.name
++            componentType = [string] $component.type
++            fromVersion = [string] $component.version
++            targetVersion = [string] $authority.targets.$componentId
++            gates = ConvertTo-VcfCanonicalValue -InputObject $authority.gates.$componentId
++        }
++    }
++    if ($steps.Count -ne $inventory.components.Count) {
++        throw 'Every inventory component must appear exactly once in the migration authority.'
++    }
++
++    $plan = [ordered] @{
++        schemaVersion = '1.0'
++        inventoryId = [string] $inventory.inventoryId
++        sourceVcfVersion = [string] $inventory.sourceVcfVersion
++        targetVcfVersion = [string] $authority.targetVcfVersion
++        steps = $steps
++    }
++    return Write-VcfJson -Value $plan -Path $OutputPath
++}
++
++Export-ModuleMember -Function New-VcfGreenfieldSddcSpec, New-VcfEstateMigrationPlan
+diff --git a/output/migration-plan.json b/output/migration-plan.json
+new file mode 100644
+index 0000000..1d26313
+--- /dev/null
++++ b/output/migration-plan.json
+@@ -0,0 +1,150 @@
++{
++  "schemaVersion": "1.0",
++  "inventoryId": "aus01-estate-2025q2",
++  "sourceVcfVersion": "5.2.1.0",
++  "targetVcfVersion": "9.0.0.0",
++  "steps": [
++    {
++      "order": 1,
++      "componentId": "aria-lifecycle",
++      "component": "VMware Aria Suite Lifecycle",
++      "componentType": "ARIA_SUITE_LIFECYCLE",
++      "fromVersion": "8.18.0.0",
++      "targetVersion": "8.18.0.0 Patch 3",
++      "gates": [
++        {
++          "id": "lifecycle-precheck",
++          "description": "Aria Suite Lifecycle patch precheck passes before management product lifecycle begins.",
++          "requiresCompleted": []
++        }
++      ]
++    },
++    {
++      "order": 2,
++      "componentId": "vcf-operations",
++      "component": "VMware Aria Operations",
++      "componentType": "VCF_OPERATIONS",
++      "fromVersion": "8.18.3",
++      "targetVersion": "9.0.0.0",
++      "gates": [
++        {
++          "id": "aria-lifecycle-complete",
++          "description": "The Aria Suite Lifecycle patch step is complete.",
++          "requiresCompleted": [
++            "aria-lifecycle"
++          ]
++        },
++        {
++          "id": "operations-precheck",
++          "description": "VCF Operations 9.0 upgrade assessment and appliance prechecks pass.",
++          "requiresCompleted": [
++            "aria-lifecycle"
++          ]
++        }
++      ]
++    },
++    {
++      "order": 3,
++      "componentId": "sddc-manager",
++      "component": "SDDC Manager",
++      "componentType": "SDDC_MANAGER_VCF",
++      "fromVersion": "5.2.1.0-24307856",
++      "targetVersion": "9.0.0.0-24703748",
++      "gates": [
++        {
++          "id": "vcf-operations-complete",
++          "description": "VCF Operations is at 9.0.0.0 and registered before core BOM lifecycle begins.",
++          "requiresCompleted": [
++            "vcf-operations"
++          ]
++        },
++        {
++          "id": "sddc-precheck",
++          "description": "SDDC Manager upgrade and bundle availability prechecks pass.",
++          "requiresCompleted": [
++            "vcf-operations"
++          ]
++        }
++      ]
++    },
++    {
++      "order": 4,
++      "componentId": "nsx",
++      "component": "VMware NSX",
++      "componentType": "NSX_T_MANAGER",
++      "fromVersion": "4.2.1.3.0-24533884",
++      "targetVersion": "9.0.0.0.24733063",
++      "gates": [
++        {
++          "id": "sddc-manager-complete",
++          "description": "SDDC Manager is at its VCF 9.0 target before NSX lifecycle starts.",
++          "requiresCompleted": [
++            "sddc-manager"
++          ]
++        },
++        {
++          "id": "nsx-precheck",
++          "description": "NSX upgrade readiness and interoperability prechecks pass.",
++          "requiresCompleted": [
++            "sddc-manager"
++          ]
++        }
++      ]
++    },
++    {
++      "order": 5,
++      "componentId": "vcenter",
++      "component": "VMware vCenter Server",
++      "componentType": "VCENTER",
++      "fromVersion": "8.0.3.00400-24322831",
++      "targetVersion": "9.0.0.0.24755230",
++      "gates": [
++        {
++          "id": "nsx-complete",
++          "description": "NSX is at its compatible VCF 9.0 target before vCenter lifecycle starts.",
++          "requiresCompleted": [
++            "nsx"
++          ]
++        },
++        {
++          "id": "vcenter-precheck",
++          "description": "vCenter upgrade readiness and solution interoperability prechecks pass.",
++          "requiresCompleted": [
++            "nsx"
++          ]
++        }
++      ]
++    },
++    {
++      "order": 6,
++      "componentId": "esx-cluster",
++      "component": "VMware ESX management cluster",
++      "componentType": "ESX_HOST",
++      "fromVersion": "8.0.3-24280767",
++      "targetVersion": "9.0.0.0.24755229",
++      "gates": [
++        {
++          "id": "vcenter-complete",
++          "description": "vCenter is at its compatible VCF 9.0 target before host lifecycle starts.",
++          "requiresCompleted": [
++            "vcenter"
++          ]
++        },
++        {
++          "id": "hardware-compatibility",
++          "description": "Every host, I/O device, driver, firmware, and vSAN device is supported for the target ESX release.",
++          "requiresCompleted": [
++            "vcenter"
++          ]
++        },
++        {
++          "id": "n-plus-one-capacity",
++          "description": "The four-host cluster retains workload capacity while one host is in maintenance mode.",
++          "requiresCompleted": [
++            "vcenter"
++          ]
++        }
++      ]
++    }
++  ]
++}
+diff --git a/output/research-sources.json b/output/research-sources.json
+new file mode 100644
+index 0000000..017ffb3
+--- /dev/null
++++ b/output/research-sources.json
+@@ -0,0 +1,42 @@
++{
++  "researchedAt": "2026-08-14T10:20:46Z",
++  "targetVcfVersion": "9.0.0.0",
++  "sources": [
++    {
++      "title": "Deployment Pathways for VMware Cloud Foundation 9",
++      "url": "https://blogs.vmware.com/cloud-foundation/2025/07/03/vcf-9-0-deployment-pathways/",
++      "publisher": "Broadcom VMware Cloud Foundation Blog",
++      "claimUsed": "A new VCF 9 deployment requires at least four management-cluster hosts and supports vSAN for the new management cluster."
++    },
++    {
++      "title": "Update sequence for VCF 9.0 and compatible VMware products",
++      "url": "https://knowledge.broadcom.com/external/article/390634/update-sequence-for-vcf-90-and-compatibl.html",
++      "publisher": "Broadcom Support",
++      "claimUsed": "Core lifecycle order places SDDC Manager before NSX, NSX before vCenter, and vCenter before ESX, with management products upgraded first."
++    },
++    {
++      "title": "Correlating VMware Cloud Foundation version with the versions of its constituent products",
++      "url": "https://knowledge.broadcom.com/external/article/314608/correlating-vmware-cloud-foundation-vers.html",
++      "publisher": "Broadcom Support",
++      "claimUsed": "VCF release versions are tied to supported component bill-of-material combinations rather than arbitrary independent targets."
++    },
++    {
++      "title": "VMware Cloud Foundation Installer API Reference Guide",
++      "url": "https://developer.broadcom.com/xapis/vcf-installer-api/latest/",
++      "publisher": "Broadcom Developer Portal",
++      "claimUsed": "VCF Installer accepts an SddcSpec for validating and starting greenfield VCF installation."
++    },
++    {
++      "title": "Product Interoperability Matrix",
++      "url": "https://interopmatrix.broadcom.com/Interoperability",
++      "publisher": "Broadcom",
++      "claimUsed": "The VCF 9.0 source and target components must be evaluated as an interoperable product combination."
++    },
++    {
++      "title": "vcf-api-specs: VCF Installer OpenAPI at tag 9.0.0.0",
++      "url": "https://github.com/vmware/vcf-api-specs/blob/9.0.0.0/specifications/vcf-installer/vcf-installer-openapi.json",
++      "publisher": "VMware GitHub organization",
++      "claimUsed": "The tagged installer contract defines the exact SddcSpec properties used by the generated architecture artifact."
++    }
++  ]
++}
+diff --git a/output/sddc-spec.json b/output/sddc-spec.json
+new file mode 100644
+index 0000000..93f54f9
+--- /dev/null
++++ b/output/sddc-spec.json
+@@ -0,0 +1,196 @@
++{
++  "sddcId": "aus01-m01",
++  "workflowType": "VCF",
++  "hostSpecs": [
++    {
++      "hostname": "esx01",
++      "credentials": {
++        "username": "root",
++        "password": "${Esx_secret!01}"
++      }
++    },
++    {
++      "hostname": "esx02",
++      "credentials": {
++        "username": "root",
++        "password": "${Esx_secret!01}"
++      }
++    },
++    {
++      "hostname": "esx03",
++      "credentials": {
++        "username": "root",
++        "password": "${Esx_secret!01}"
++      }
++    },
++    {
++      "hostname": "esx04",
++      "credentials": {
++        "username": "root",
++        "password": "${Esx_secret!01}"
++      }
++    }
++  ],
++  "version": "9.0.0.0",
++  "vcenterSpec": {
++    "vcenterHostname": "vc01.aus01.example.com",
++    "rootVcenterPassword": "${Vc_secret!0001}",
++    "vmSize": "small",
++    "storageSize": "lstorage",
++    "ssoDomain": "vsphere.local",
++    "useExistingDeployment": false,
++    "version": "9.0.0.0.24755230"
++  },
++  "clusterSpec": {
++    "datacenterName": "aus01-dc01",
++    "clusterName": "aus01-cl01",
++    "resourcePoolSpecs": [
++      {
++        "type": "management",
++        "name": "aus01-management",
++        "cpuReservationPercentage": 20,
++        "memoryReservationPercentage": 20
++      },
++      {
++        "type": "compute",
++        "name": "aus01-compute",
++        "cpuReservationPercentage": 0,
++        "memoryReservationPercentage": 0
++      }
++    ]
++  },
++  "dvsSpecs": [
++    {
++      "dvsName": "aus01-vds01",
++      "networks": [
++        "MANAGEMENT",
++        "VMOTION",
++        "VSAN",
++        "VM_MANAGEMENT"
++      ],
++      "mtu": 9000,
++      "vmnicsToUplinks": [
++        {
++          "id": "vmnic0",
++          "uplink": "uplink1"
++        },
++        {
++          "id": "vmnic1",
++          "uplink": "uplink2"
++        }
++      ]
++    }
++  ],
++  "nsxtSpec": {
++    "nsxtManagers": [
++      {
++        "hostname": "nsx01.aus01.example.com"
++      },
++      {
++        "hostname": "nsx02.aus01.example.com"
++      },
++      {
++        "hostname": "nsx03.aus01.example.com"
++      }
++    ],
++    "nsxtManagerSize": "medium",
++    "vipFqdn": "nsx.aus01.example.com",
++    "rootNsxtManagerPassword": "${NsxR_secret!01}",
++    "nsxtAdminPassword": "${NsxA_secret!01}",
++    "nsxtAuditPassword": "${NsxU_secret!01}",
++    "transportVlanId": 150,
++    "useExistingDeployment": false,
++    "version": "9.0.0.0.24733063"
++  },
++  "networkSpecs": [
++    {
++      "networkType": "MANAGEMENT",
++      "subnet": "10.42.0.0/24",
++      "gateway": "10.42.0.1",
++      "subnetMask": "255.255.255.0",
++      "includeIpAddress": [
++        "10.42.0.21",
++        "10.42.0.22",
++        "10.42.0.23",
++        "10.42.0.24"
++      ],
++      "vlanId": 110,
++      "mtu": 9000
++    },
++    {
++      "networkType": "VMOTION",
++      "subnet": "10.42.1.0/24",
++      "gateway": "10.42.1.1",
++      "subnetMask": "255.255.255.0",
++      "includeIpAddress": [
++        "10.42.1.21",
++        "10.42.1.22",
++        "10.42.1.23",
++        "10.42.1.24"
++      ],
++      "vlanId": 120,
++      "mtu": 9000
++    },
++    {
++      "networkType": "VSAN",
++      "subnet": "10.42.2.0/24",
++      "gateway": "10.42.2.1",
++      "subnetMask": "255.255.255.0",
++      "includeIpAddress": [
++        "10.42.2.21",
++        "10.42.2.22",
++        "10.42.2.23",
++        "10.42.2.24"
++      ],
++      "vlanId": 130,
++      "mtu": 9000
++    },
++    {
++      "networkType": "VM_MANAGEMENT",
++      "subnet": "10.42.3.0/24",
++      "gateway": "10.42.3.1",
++      "subnetMask": "255.255.255.0",
++      "includeIpAddress": [
++        "10.42.3.21",
++        "10.42.3.22",
++        "10.42.3.23",
++        "10.42.3.24"
++      ],
++      "vlanId": 140,
++      "mtu": 9000
++    }
++  ],
++  "dnsSpec": {
++    "subdomain": "aus01.example.com",
++    "nameservers": [
++      "10.42.0.10",
++      "10.42.0.11"
++    ]
++  },
++  "ntpServers": [
++    "10.42.0.12",
++    "10.42.0.13"
++  ],
++  "sddcManagerSpec": {
++    "rootPassword": "${SddcR_secret!01}",
++    "hostname": "sddc01.aus01.example.com",
++    "sshPassword": "${SddcS_secret!01}",
++    "localUserPassword": "${SddcL_secret!01}",
++    "useExistingDeployment": false,
++    "version": "9.0.0.0-24703748"
++  },
++  "managementPoolName": "aus01-mgmt-pool",
++  "skipEsxThumbprintValidation": false,
++  "skipGatewayPingValidation": false,
++  "datastoreSpec": {
++    "vsanSpec": {
++      "datastoreName": "aus01-vsan01",
++      "vsanDedup": false,
++      "esaConfig": {
++        "enabled": true
++      },
++      "failuresToTolerate": 1
++    }
++  },
++  "vcfInstanceName": "aus01-vcf"
++}

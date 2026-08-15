@@ -1,0 +1,2 @@
+"""VCF architecture artifact generator."""
+

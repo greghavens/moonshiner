@@ -1,0 +1,574 @@
+diff --git a/vcfarch/__init__.py b/vcfarch/__init__.py
+new file mode 100644
+index 0000000..0989a6d
+--- /dev/null
++++ b/vcfarch/__init__.py
+@@ -0,0 +1,5 @@
++"""Generate a pinned VCF workload-domain migration architecture."""
++
++from .planner import ArchitectureError, build_plan
++
++__all__ = ["ArchitectureError", "build_plan"]
+diff --git a/vcfarch/planner.py b/vcfarch/planner.py
+new file mode 100644
+index 0000000..9c65126
+--- /dev/null
++++ b/vcfarch/planner.py
+@@ -0,0 +1,152 @@
++"""Planner for an existing VCF workload domain using protected local facts."""
++
++from __future__ import annotations
++
++import hashlib
++
++
++class ArchitectureError(ValueError):
++    """The supplied estate has no supported plan in the pinned authority."""
++
++
++def _one_domain(inventory, domain_id):
++    matches = [domain for domain in inventory.get("domains", []) if domain.get("domainId") == domain_id]
++    if len(matches) != 1:
++        raise ArchitectureError(f"domain {domain_id!r} must occur exactly once")
++    return matches[0]
++
++
++def _supported_path(workload, target, compatibility):
++    matches = [
++        path
++        for path in compatibility.get("domainUpgradePaths", [])
++        if path.get("from") == workload.get("vcfVersion")
++        and path.get("to") == target
++        and path.get("supported") is True
++    ]
++    if len(matches) != 1:
++        raise ArchitectureError(
++            f"unsupported workload-domain path {workload.get('vcfVersion')} -> {target}"
++        )
++    return matches[0]
++
++
++def _transition_for(component, compatibility):
++    unsupported = [
++        item
++        for item in compatibility.get("unsupportedTransitions", [])
++        if item.get("componentType") == component.get("type")
++        and item.get("from") == component.get("version")
++    ]
++    if unsupported:
++        raise ArchitectureError(
++            f"{unsupported[0].get('reason', 'unsupported')} transition for {component.get('id')}"
++        )
++    matches = [
++        item
++        for item in compatibility.get("componentTransitions", [])
++        if item.get("componentType") == component.get("type")
++        and item.get("from") == component.get("version")
++        and item.get("supported") is True
++    ]
++    if len(matches) != 1:
++        raise ArchitectureError(
++            f"unsupported component transition for {component.get('id')} at {component.get('version')}"
++        )
++    return matches[0]
++
++
++def build_plan(inventory, compatibility, inventory_bytes):
++    target = inventory.get("targetVcfVersion")
++    if target != compatibility.get("targetVcfVersion"):
++        raise ArchitectureError("inventory and compatibility target versions differ")
++    prerequisites = compatibility.get("managementPrerequisites", {})
++    if inventory.get("fleetVersion") != prerequisites.get("fleetVersion"):
++        raise ArchitectureError("fleet lifecycle is not at the required target")
++
++    management = _one_domain(inventory, inventory.get("managementDomainId"))
++    workload = _one_domain(inventory, inventory.get("targetWorkloadDomainId"))
++    if management.get("changeAllowed") is not False:
++        raise ArchitectureError("management domain is not frozen")
++    if workload.get("changeAllowed") is not True or workload.get("onboardingState") != "ADDED":
++        raise ArchitectureError("target workload domain is not an added mutable domain")
++    management_types = {component.get("type") for component in management.get("components", [])}
++    missing = set(prerequisites.get("requiredAtTarget", [])) - management_types
++    if missing:
++        raise ArchitectureError(f"management prerequisites missing: {', '.join(sorted(missing))}")
++
++    path = _supported_path(workload, target, compatibility)
++    rank = {component_type: index for index, component_type in enumerate(path["componentOrder"])}
++    indexed_workload = list(enumerate(workload.get("components", [])))
++    try:
++        indexed_workload.sort(key=lambda pair: (rank[pair[1]["type"]], pair[0]))
++    except KeyError as exc:
++        raise ArchitectureError(f"component type absent from pinned order: {exc.args[0]}") from exc
++
++    component_plans = []
++    for component in management.get("components", []):
++        component_plans.append(
++            {
++                "order": len(component_plans) + 1,
++                "componentId": component["id"],
++                "domainId": management["domainId"],
++                "componentType": component["type"],
++                "currentVersion": component["version"],
++                "targetVersion": component["version"],
++                "action": "preserve",
++                "blockedBy": [],
++                "gateIds": ["management-domain-frozen"],
++            }
++        )
++
++    nsx_id = None
++    vcenter_id = None
++    previous_esx = None
++    for _, component in indexed_workload:
++        transition = _transition_for(component, compatibility)
++        if component["type"] == "NSX_T_MANAGER":
++            blockers = []
++            nsx_id = component["id"]
++        elif component["type"] == "VCENTER":
++            if nsx_id is None:
++                raise ArchitectureError("vCenter has no preceding NSX target")
++            blockers = [nsx_id]
++            vcenter_id = component["id"]
++        elif component["type"] == "ESX_HOST":
++            if vcenter_id is None:
++                raise ArchitectureError("ESX has no preceding vCenter target")
++            blockers = [previous_esx or vcenter_id]
++            previous_esx = component["id"]
++        else:
++            raise ArchitectureError(f"unsupported workload component type {component['type']}")
++        component_plans.append(
++            {
++                "order": len(component_plans) + 1,
++                "componentId": component["id"],
++                "domainId": workload["domainId"],
++                "componentType": component["type"],
++                "currentVersion": component["version"],
++                "targetVersion": transition["to"],
++                "action": "upgrade",
++                "blockedBy": blockers,
++                "gateIds": list(transition["requiredGateIds"]),
++            }
++        )
++
++    envelope = inventory.get("installerEnvelope")
++    if not isinstance(envelope, dict):
++        raise ArchitectureError("installer envelope is missing")
++    return {
++        **envelope,
++        "schemaVersion": "1.0",
++        "architectureKind": "existing-estate-workload-domain-migration",
++        "estateId": inventory["estateId"],
++        "managementDomainId": management["domainId"],
++        "workloadDomainId": workload["domainId"],
++        "targetVcfVersion": target,
++        "inventorySha256": hashlib.sha256(inventory_bytes).hexdigest(),
++        "managementDomainMode": "preserve",
++        "upgradePath": list(path["hops"]),
++        "gates": [dict(gate) for gate in compatibility["gateDefinitions"]],
++        "componentPlans": component_plans,
++    }
+diff --git a/vcfarch/__main__.py b/vcfarch/__main__.py
+new file mode 100644
+index 0000000..a7da595
+--- /dev/null
++++ b/vcfarch/__main__.py
+@@ -0,0 +1,37 @@
++"""Command-line entry point for vcfarch."""
++
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++import sys
++
++from .planner import ArchitectureError, build_plan
++
++
++def parse_args(argv=None):
++    parser = argparse.ArgumentParser(description="Generate a pinned VCF migration architecture")
++    parser.add_argument("--inventory", required=True, type=Path)
++    parser.add_argument("--compatibility", required=True, type=Path)
++    parser.add_argument("--output", required=True, type=Path)
++    return parser.parse_args(argv)
++
++
++def main(argv=None):
++    args = parse_args(argv)
++    try:
++        inventory_bytes = args.inventory.read_bytes()
++        inventory = json.loads(inventory_bytes)
++        compatibility = json.loads(args.compatibility.read_bytes())
++        plan = build_plan(inventory, compatibility, inventory_bytes)
++    except (ArchitectureError, OSError, json.JSONDecodeError) as exc:
++        print(f"vcfarch: {exc}", file=sys.stderr)
++        return 2
++    args.output.parent.mkdir(parents=True, exist_ok=True)
++    args.output.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/architecture/migration_plan.json b/architecture/migration_plan.json
+new file mode 100644
+index 0000000..2087cfb
+--- /dev/null
++++ b/architecture/migration_plan.json
+@@ -0,0 +1,312 @@
++{
++  "sddcId": "chi-analytics-01",
++  "version": "9.1.0.0",
++  "vcenterSpec": {
++    "vcenterHostname": "vc-analytics-01.corp.example.com",
++    "rootVcenterPassword": "REDACTED!",
++    "version": "9.1.0.0.25370922",
++    "useExistingDeployment": true
++  },
++  "networkSpecs": [
++    {
++      "networkType": "MANAGEMENT",
++      "subnet": "10.42.10.0/24",
++      "gateway": "10.42.10.1",
++      "subnetMask": "255.255.255.0",
++      "vlanId": 210,
++      "mtu": 9000,
++      "ipAddressVersion": "IPv4",
++      "ipAddressAssignmentMode": "STATIC"
++    },
++    {
++      "networkType": "VMOTION",
++      "subnet": "10.42.20.0/24",
++      "gateway": "10.42.20.1",
++      "subnetMask": "255.255.255.0",
++      "vlanId": 220,
++      "mtu": 9000,
++      "ipAddressVersion": "IPv4",
++      "ipAddressAssignmentMode": "STATIC"
++    },
++    {
++      "networkType": "VSAN",
++      "subnet": "10.42.30.0/24",
++      "gateway": "10.42.30.1",
++      "subnetMask": "255.255.255.0",
++      "vlanId": 230,
++      "mtu": 9000,
++      "ipAddressVersion": "IPv4",
++      "ipAddressAssignmentMode": "STATIC"
++    }
++  ],
++  "dnsSpec": {
++    "subdomain": "corp.example.com",
++    "nameservers": [
++      "10.42.1.10",
++      "10.42.1.11"
++    ]
++  },
++  "schemaVersion": "1.0",
++  "architectureKind": "existing-estate-workload-domain-migration",
++  "estateId": "chi-private-cloud-01",
++  "managementDomainId": "chi-mgmt-01",
++  "workloadDomainId": "chi-analytics-01",
++  "targetVcfVersion": "9.1.0.0",
++  "inventorySha256": "4af007f536d61937656fd71eb51e4e68c268c60fccbbc56ecea9eb9f94467910",
++  "managementDomainMode": "preserve",
++  "upgradePath": [
++    "5.2.2.0",
++    "9.1.0.0"
++  ],
++  "gates": [
++    {
++      "id": "management-domain-frozen",
++      "kind": "scope-invariant"
++    },
++    {
++      "id": "fleet-lifecycle-at-target",
++      "kind": "fleet-state"
++    },
++    {
++      "id": "supported-direct-domain-path",
++      "kind": "upgrade-path"
++    },
++    {
++      "id": "forward-build",
++      "kind": "component-compatibility"
++    },
++    {
++      "id": "nsx-target-complete",
++      "kind": "component-state"
++    },
++    {
++      "id": "vcenter-target-complete",
++      "kind": "component-state"
++    },
++    {
++      "id": "rolling-host-capacity",
++      "kind": "cluster-capacity"
++    }
++  ],
++  "componentPlans": [
++    {
++      "order": 1,
++      "componentId": "mgmt-sddc-01",
++      "domainId": "chi-mgmt-01",
++      "componentType": "SDDC_MANAGER_VCF",
++      "currentVersion": "9.1.0.0.25371088",
++      "targetVersion": "9.1.0.0.25371088",
++      "action": "preserve",
++      "blockedBy": [],
++      "gateIds": [
++        "management-domain-frozen"
++      ]
++    },
++    {
++      "order": 2,
++      "componentId": "mgmt-ops-01",
++      "domainId": "chi-mgmt-01",
++      "componentType": "VROPS",
++      "currentVersion": "9.1.0.0",
++      "targetVersion": "9.1.0.0",
++      "action": "preserve",
++      "blockedBy": [],
++      "gateIds": [
++        "management-domain-frozen"
++      ]
++    },
++    {
++      "order": 3,
++      "componentId": "mgmt-vcenter-01",
++      "domainId": "chi-mgmt-01",
++      "componentType": "VCENTER",
++      "currentVersion": "9.1.0.0.25370922",
++      "targetVersion": "9.1.0.0.25370922",
++      "action": "preserve",
++      "blockedBy": [],
++      "gateIds": [
++        "management-domain-frozen"
++      ]
++    },
++    {
++      "order": 4,
++      "componentId": "mgmt-nsx-01",
++      "domainId": "chi-mgmt-01",
++      "componentType": "NSX_T_MANAGER",
++      "currentVersion": "9.1.0.0.25318225",
++      "targetVersion": "9.1.0.0.25318225",
++      "action": "preserve",
++      "blockedBy": [],
++      "gateIds": [
++        "management-domain-frozen"
++      ]
++    },
++    {
++      "order": 5,
++      "componentId": "mgmt-esx-01",
++      "domainId": "chi-mgmt-01",
++      "componentType": "ESX_HOST",
++      "currentVersion": "9.1.0.0.25370933",
++      "targetVersion": "9.1.0.0.25370933",
++      "action": "preserve",
++      "blockedBy": [],
++      "gateIds": [
++        "management-domain-frozen"
++      ]
++    },
++    {
++      "order": 6,
++      "componentId": "mgmt-esx-02",
++      "domainId": "chi-mgmt-01",
++      "componentType": "ESX_HOST",
++      "currentVersion": "9.1.0.0.25370933",
++      "targetVersion": "9.1.0.0.25370933",
++      "action": "preserve",
++      "blockedBy": [],
++      "gateIds": [
++        "management-domain-frozen"
++      ]
++    },
++    {
++      "order": 7,
++      "componentId": "mgmt-esx-03",
++      "domainId": "chi-mgmt-01",
++      "componentType": "ESX_HOST",
++      "currentVersion": "9.1.0.0.25370933",
++      "targetVersion": "9.1.0.0.25370933",
++      "action": "preserve",
++      "blockedBy": [],
++      "gateIds": [
++        "management-domain-frozen"
++      ]
++    },
++    {
++      "order": 8,
++      "componentId": "mgmt-esx-04",
++      "domainId": "chi-mgmt-01",
++      "componentType": "ESX_HOST",
++      "currentVersion": "9.1.0.0.25370933",
++      "targetVersion": "9.1.0.0.25370933",
++      "action": "preserve",
++      "blockedBy": [],
++      "gateIds": [
++        "management-domain-frozen"
++      ]
++    },
++    {
++      "order": 9,
++      "componentId": "analytics-nsx-01",
++      "domainId": "chi-analytics-01",
++      "componentType": "NSX_T_MANAGER",
++      "currentVersion": "4.2.3.0.0-24866349",
++      "targetVersion": "9.1.0.0.25318225",
++      "action": "upgrade",
++      "blockedBy": [],
++      "gateIds": [
++        "management-domain-frozen",
++        "fleet-lifecycle-at-target",
++        "supported-direct-domain-path",
++        "forward-build"
++      ]
++    },
++    {
++      "order": 10,
++      "componentId": "analytics-vcenter-01",
++      "domainId": "chi-analytics-01",
++      "componentType": "VCENTER",
++      "currentVersion": "8.0.3.00600-24853646",
++      "targetVersion": "9.1.0.0.25370922",
++      "action": "upgrade",
++      "blockedBy": [
++        "analytics-nsx-01"
++      ],
++      "gateIds": [
++        "management-domain-frozen",
++        "fleet-lifecycle-at-target",
++        "supported-direct-domain-path",
++        "forward-build",
++        "nsx-target-complete"
++      ]
++    },
++    {
++      "order": 11,
++      "componentId": "analytics-esx-01",
++      "domainId": "chi-analytics-01",
++      "componentType": "ESX_HOST",
++      "currentVersion": "8.0.3-24859861",
++      "targetVersion": "9.1.0.0.25370933",
++      "action": "upgrade",
++      "blockedBy": [
++        "analytics-vcenter-01"
++      ],
++      "gateIds": [
++        "management-domain-frozen",
++        "fleet-lifecycle-at-target",
++        "supported-direct-domain-path",
++        "forward-build",
++        "vcenter-target-complete",
++        "rolling-host-capacity"
++      ]
++    },
++    {
++      "order": 12,
++      "componentId": "analytics-esx-02",
++      "domainId": "chi-analytics-01",
++      "componentType": "ESX_HOST",
++      "currentVersion": "8.0.3-24859861",
++      "targetVersion": "9.1.0.0.25370933",
++      "action": "upgrade",
++      "blockedBy": [
++        "analytics-esx-01"
++      ],
++      "gateIds": [
++        "management-domain-frozen",
++        "fleet-lifecycle-at-target",
++        "supported-direct-domain-path",
++        "forward-build",
++        "vcenter-target-complete",
++        "rolling-host-capacity"
++      ]
++    },
++    {
++      "order": 13,
++      "componentId": "analytics-esx-03",
++      "domainId": "chi-analytics-01",
++      "componentType": "ESX_HOST",
++      "currentVersion": "8.0.3-24859861",
++      "targetVersion": "9.1.0.0.25370933",
++      "action": "upgrade",
++      "blockedBy": [
++        "analytics-esx-02"
++      ],
++      "gateIds": [
++        "management-domain-frozen",
++        "fleet-lifecycle-at-target",
++        "supported-direct-domain-path",
++        "forward-build",
++        "vcenter-target-complete",
++        "rolling-host-capacity"
++      ]
++    },
++    {
++      "order": 14,
++      "componentId": "analytics-esx-04",
++      "domainId": "chi-analytics-01",
++      "componentType": "ESX_HOST",
++      "currentVersion": "8.0.3-24859861",
++      "targetVersion": "9.1.0.0.25370933",
++      "action": "upgrade",
++      "blockedBy": [
++        "analytics-esx-03"
++      ],
++      "gateIds": [
++        "management-domain-frozen",
++        "fleet-lifecycle-at-target",
++        "supported-direct-domain-path",
++        "forward-build",
++        "vcenter-target-complete",
++        "rolling-host-capacity"
++      ]
++    }
++  ]
++}
+diff --git a/architecture/research_sources.json b/architecture/research_sources.json
+new file mode 100644
+index 0000000..e0913db
+--- /dev/null
++++ b/architecture/research_sources.json
+@@ -0,0 +1,38 @@
++{
++  "consulted": [
++    {
++      "title": "Upgrade Sequence and Related Issues for VMware Cloud Foundation and vSphere Foundation 9.1",
++      "url": "https://knowledge.broadcom.com/external/article/440630/upgrade-sequence-and-related-issues-for.html",
++      "accessed": "2026-08-14",
++      "usedFor": [
++        "supported 5.2.x to 9.1 path",
++        "workload domains as a later Day-N procedure"
++      ]
++    },
++    {
++      "title": "Correlating VMware Cloud Foundation version with the versions of its constituent products",
++      "url": "https://knowledge.broadcom.com/external/article/314608/correlating-vmware-cloud-foundation-vers.html",
++      "accessed": "2026-08-14",
++      "usedFor": [
++        "VCF 5.2.2 component bill of materials"
++      ]
++    },
++    {
++      "title": "Upgrade failure for vCenter 8.0 U3j, ESXi 8.0 U3j, and NSX 4.2.4 due to back-in-time restriction",
++      "url": "https://knowledge.broadcom.com/external/article/448135/upgrade-failure-for-vcenter-80-u3j-esxi.html",
++      "accessed": "2026-08-14",
++      "usedFor": [
++        "VCF 9.1 target component builds",
++        "back-in-time exclusion"
++      ]
++    },
++    {
++      "title": "Modernizing Infrastructure: VMware Cloud Foundation 5.2.x to 9.1 Upgrade Guide",
++      "url": "https://blogs.vmware.com/cloud-foundation/2026/06/05/modernizing-infrastructure-vmware-cloud-foundation-5-2-x-to-9-1-upgrade-guide/",
++      "accessed": "2026-08-14",
++      "usedFor": [
++        "NSX then vCenter then ESX workload component sequence"
++      ]
++    }
++  ]
++}

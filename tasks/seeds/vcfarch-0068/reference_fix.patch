@@ -1,0 +1,1005 @@
+diff --git a/VcfBrownfieldArchitecture/VcfBrownfieldArchitecture.psd1 b/VcfBrownfieldArchitecture/VcfBrownfieldArchitecture.psd1
+new file mode 100644
+index 0000000..17cecb1
+--- /dev/null
++++ b/VcfBrownfieldArchitecture/VcfBrownfieldArchitecture.psd1
+@@ -0,0 +1,23 @@
++@{
++    RootModule = 'VcfBrownfieldArchitecture.psm1'
++    ModuleVersion = '1.0.0'
++    GUID = '5b488332-2af1-4a24-888d-0ba046a739e7'
++    Author = 'VCF Architecture Team'
++    Description = 'Builds deterministic brownfield workload-domain migration plans from VCF inventory and compatibility data.'
++    PowerShellVersion = '7.4'
++    RequiredModules = @(
++        @{ ModuleName = 'VMware.Sdk.Vcf.SddcManager' }
++    )
++    FunctionsToExport = @(
++        'Get-VcfWorkloadDomainInventory',
++        'New-VcfWorkloadDomainMigrationPlan'
++    )
++    CmdletsToExport = @()
++    VariablesToExport = @()
++    AliasesToExport = @()
++    PrivateData = @{
++        PSData = @{
++            Tags = @('VCF', 'Brownfield', 'Architecture')
++        }
++    }
++}
+diff --git a/VcfBrownfieldArchitecture/VcfBrownfieldArchitecture.psm1 b/VcfBrownfieldArchitecture/VcfBrownfieldArchitecture.psm1
+new file mode 100644
+index 0000000..822dc1a
+--- /dev/null
++++ b/VcfBrownfieldArchitecture/VcfBrownfieldArchitecture.psm1
+@@ -0,0 +1,472 @@
++Set-StrictMode -Version Latest
++
++function Get-VcfResponseItems {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [AllowNull()]
++        [object] $Response
++    )
++
++    if ($null -eq $Response) {
++        return @()
++    }
++    if ($Response.PSObject.Properties['elements']) {
++        return @($Response.elements)
++    }
++    if ($Response.PSObject.Properties['Elements']) {
++        return @($Response.Elements)
++    }
++    return @($Response)
++}
++
++function Get-VcfWorkloadDomainInventory {
++    <#
++    .SYNOPSIS
++    Reads the SDDC Manager inventory through the generated VMware SDK cmdlets.
++    #>
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [string] $Server,
++
++        [Parameter(Mandatory)]
++        [pscredential] $Credential,
++
++        [Parameter(Mandatory)]
++        [string] $WorkloadDomainName
++    )
++
++    Import-Module VMware.Sdk.Vcf.SddcManager -ErrorAction Stop
++    $connection = Connect-VcfSddcManagerServer -Server $Server -Credential $Credential -ErrorAction Stop
++    try {
++        $domainItems = Get-VcfResponseItems -Response (
++            Invoke-VcfGetDomains -Server $connection -Name $WorkloadDomainName -ErrorAction Stop
++        )
++        $domain = @($domainItems | Where-Object {
++                ($_.PSObject.Properties['name'] -and $_.name -eq $WorkloadDomainName) -or
++                ($_.PSObject.Properties['Name'] -and $_.Name -eq $WorkloadDomainName)
++            })
++        if ($domain.Count -ne 1) {
++            throw "Expected one workload domain named '$WorkloadDomainName'; found $($domain.Count)."
++        }
++        $domainId = if ($domain[0].PSObject.Properties['id']) {
++            [string]$domain[0].id
++        }
++        elseif ($domain[0].PSObject.Properties['Id']) {
++            [string]$domain[0].Id
++        }
++        else {
++            throw "Workload domain '$WorkloadDomainName' has no ID."
++        }
++
++        [pscustomobject][ordered]@{
++            collectedFrom = $Server
++            workloadDomain = $domain[0]
++            sddcManagers = @(
++                Get-VcfResponseItems -Response (
++                    Invoke-VcfGetSddcManagers -Server $connection -ErrorAction Stop
++                )
++            )
++            vcenters = @(
++                Get-VcfResponseItems -Response (
++                    Invoke-VcfGetVcenters -Server $connection -DomainId $domainId -ErrorAction Stop
++                )
++            )
++            nsxManagers = @(
++                Get-VcfResponseItems -Response (
++                    Invoke-VcfGetNsxClusters -Server $connection -DomainId $domainId -ErrorAction Stop
++                )
++            )
++            esxiHosts = @(
++                Get-VcfResponseItems -Response (
++                    Invoke-VcfGetHosts -Server $connection -DomainId $domainId -ErrorAction Stop
++                )
++            )
++        }
++    }
++    finally {
++        Disconnect-VcfSddcManagerServer -Server $connection -Force -ErrorAction SilentlyContinue
++    }
++}
++
++function Read-VcfJsonFile {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [string] $LiteralPath
++    )
++
++    $resolved = Resolve-Path -LiteralPath $LiteralPath -ErrorAction Stop
++    return Get-Content -LiteralPath $resolved -Raw -Encoding utf8 | ConvertFrom-Json -Depth 100
++}
++
++function Get-VcfBomVersion {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [object] $Compatibility,
++
++        [Parameter(Mandatory)]
++        [string] $Release,
++
++        [Parameter(Mandatory)]
++        [string] $ComponentType
++    )
++
++    $releaseProperty = $Compatibility.boms.PSObject.Properties[$Release]
++    if ($null -eq $releaseProperty) {
++        throw "Compatibility snapshot has no BOM for release '$Release'."
++    }
++    $componentProperty = $releaseProperty.Value.PSObject.Properties[$ComponentType]
++    if ($null -eq $componentProperty) {
++        throw "Compatibility snapshot has no $ComponentType BOM entry for release '$Release'."
++    }
++    return [string]$componentProperty.Value
++}
++
++function Get-VcfSupportedReleasePath {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [object] $Compatibility,
++
++        [Parameter(Mandatory)]
++        [string] $Source,
++
++        [Parameter(Mandatory)]
++        [string] $Target
++    )
++
++    $queue = [System.Collections.Generic.Queue[object]]::new()
++    $queue.Enqueue([pscustomobject]@{ Node = $Source; Path = @($Source) })
++    $visited = @{ $Source = $true }
++
++    while ($queue.Count -gt 0) {
++        $state = $queue.Dequeue()
++        if ($state.Node -eq $Target) {
++            return @($state.Path)
++        }
++        $destinations = @(
++            $Compatibility.supportedReleaseHops |
++                Where-Object { $_.from -eq $state.Node } |
++                ForEach-Object { [string]$_.to } |
++                Sort-Object
++        )
++        foreach ($destination in $destinations) {
++            if (-not $visited.ContainsKey($destination)) {
++                $visited[$destination] = $true
++                $queue.Enqueue([pscustomobject]@{
++                        Node = $destination
++                        Path = @($state.Path) + $destination
++                    })
++            }
++        }
++    }
++    throw "No supported release path from '$Source' to '$Target'."
++}
++
++function Get-VcfUniqueStrings {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [object[]] $Values
++    )
++
++    $seen = @{}
++    $result = [System.Collections.Generic.List[string]]::new()
++    foreach ($value in $Values) {
++        $text = [string]$value
++        if (-not $seen.ContainsKey($text)) {
++            $seen[$text] = $true
++            $result.Add($text)
++        }
++    }
++    return @($result)
++}
++
++function Get-VcfComponentGates {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [string] $ComponentType,
++
++        [Parameter(Mandatory)]
++        [string] $Role,
++
++        [Parameter(Mandatory)]
++        [string[]] $ReleasePath,
++
++        [Parameter(Mandatory)]
++        [object] $Compatibility
++    )
++
++    if ($Role -eq 'management') {
++        return @('management-domain-unchanged')
++    }
++
++    $gates = [System.Collections.Generic.List[string]]::new()
++    foreach ($gate in $Compatibility.requiredBaseGates) {
++        $gates.Add([string]$gate)
++    }
++    if ($ComponentType -eq 'ESXI_HOST') {
++        $gates.Add([string]$Compatibility.hardwareGate)
++    }
++    for ($hopIndex = 0; $hopIndex -lt $ReleasePath.Count - 1; $hopIndex++) {
++        $release = $ReleasePath[$hopIndex + 1]
++        if ($hopIndex -gt 0) {
++            $gates.Add("esxi-complete-$($ReleasePath[$hopIndex])")
++        }
++        $gates.Add("bundles-staged-$release")
++        $gates.Add("upgrade-precheck-$release")
++        if ($ComponentType -eq 'VCENTER') {
++            $gates.Add("nsx-complete-$release")
++        }
++        elseif ($ComponentType -eq 'ESXI_HOST') {
++            $gates.Add("vcenter-complete-$release")
++        }
++    }
++    return @(Get-VcfUniqueStrings -Values @($gates))
++}
++
++function Get-VcfStepGates {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [string] $ComponentType,
++
++        [Parameter(Mandatory)]
++        [int] $HopIndex,
++
++        [Parameter(Mandatory)]
++        [string[]] $ReleasePath,
++
++        [Parameter(Mandatory)]
++        [object] $Compatibility
++    )
++
++    $release = $ReleasePath[$HopIndex + 1]
++    $gates = [System.Collections.Generic.List[string]]::new()
++    foreach ($gate in $Compatibility.requiredBaseGates) {
++        $gates.Add([string]$gate)
++    }
++    if ($ComponentType -eq 'ESXI_HOST') {
++        $gates.Add([string]$Compatibility.hardwareGate)
++    }
++    if ($HopIndex -gt 0) {
++        $gates.Add("esxi-complete-$($ReleasePath[$HopIndex])")
++    }
++    $gates.Add("bundles-staged-$release")
++    $gates.Add("upgrade-precheck-$release")
++    if ($ComponentType -eq 'VCENTER') {
++        $gates.Add("nsx-complete-$release")
++    }
++    elseif ($ComponentType -eq 'ESXI_HOST') {
++        $gates.Add("vcenter-complete-$release")
++    }
++    return @(Get-VcfUniqueStrings -Values @($gates))
++}
++
++function New-VcfWorkloadDomainMigrationPlan {
++    <#
++    .SYNOPSIS
++    Creates the ordered, schema-shaped plan from pinned local inputs.
++    #>
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [string] $InventoryPath,
++
++        [Parameter(Mandatory)]
++        [string] $CompatibilityPath,
++
++        [Parameter(Mandatory)]
++        [string] $OutputPath
++    )
++
++    $inventory = Read-VcfJsonFile -LiteralPath $InventoryPath
++    $compatibility = Read-VcfJsonFile -LiteralPath $CompatibilityPath
++    $management = @($inventory.domains | Where-Object { $_.role -eq 'management' })
++    $workload = @($inventory.domains | Where-Object { $_.role -eq 'workload' })
++    if ($management.Count -ne 1 -or $workload.Count -ne 1) {
++        throw 'Inventory must contain exactly one management and one workload domain.'
++    }
++    $management = $management[0]
++    $workload = $workload[0]
++    if ($inventory.targetRelease -ne $compatibility.targetRelease) {
++        throw 'Inventory and compatibility snapshot target releases differ.'
++    }
++
++    $releasePath = @(
++        Get-VcfSupportedReleasePath -Compatibility $compatibility `
++            -Source ([string]$workload.release) -Target ([string]$inventory.targetRelease)
++    )
++    $workloadVcenter = @($workload.components | Where-Object { $_.type -eq 'VCENTER' })
++    if ($workloadVcenter.Count -ne 1) {
++        throw 'Workload domain must contain exactly one vCenter component.'
++    }
++
++    $components = [System.Collections.Generic.List[object]]::new()
++    foreach ($domain in $inventory.domains) {
++        foreach ($component in $domain.components) {
++            $isManagement = $domain.role -eq 'management'
++            $targetVersion = if ($isManagement) {
++                [string]$component.version
++            }
++            else {
++                Get-VcfBomVersion -Compatibility $compatibility `
++                    -Release ([string]$inventory.targetRelease) -ComponentType ([string]$component.type
++                )
++            }
++            $components.Add([pscustomobject][ordered]@{
++                    id = [string]$component.id
++                    domainId = [string]$domain.id
++                    role = [string]$domain.role
++                    type = [string]$component.type
++                    fqdn = [string]$component.fqdn
++                    currentVersion = [string]$component.version
++                    targetVersion = $targetVersion
++                    disposition = if ($isManagement) { 'PRESERVE' } else { 'UPGRADE' }
++                    gates = @(Get-VcfComponentGates -ComponentType ([string]$component.type) `
++                            -Role ([string]$domain.role) -ReleasePath $releasePath `
++                            -Compatibility $compatibility)
++                })
++        }
++    }
++
++    $managementIds = @($management.components | ForEach-Object { [string]$_.id })
++    $workloadIdsByType = @{}
++    foreach ($componentType in $compatibility.componentOrder) {
++        $workloadIdsByType[[string]$componentType] = @(
++            $workload.components |
++                Where-Object { $_.type -eq $componentType } |
++                ForEach-Object { [string]$_.id }
++        )
++    }
++
++    $gates = [System.Collections.Generic.List[object]]::new()
++    $gates.Add([pscustomobject][ordered]@{
++            id = 'management-domain-unchanged'
++            type = 'INVARIANT'
++            subjectIds = $managementIds
++            expectedStatus = 'UNCHANGED'
++        })
++    $gates.Add([pscustomobject][ordered]@{
++            id = 'source-health-green'
++            type = 'HEALTH'
++            subjectIds = @([string]$workload.id)
++            expectedStatus = 'GREEN'
++        })
++    $gates.Add([pscustomobject][ordered]@{
++            id = [string]$compatibility.hardwareGate
++            type = 'COMPATIBILITY'
++            subjectIds = @($workloadIdsByType['ESXI_HOST'])
++            expectedStatus = 'SUPPORTED'
++        })
++
++    for ($hopIndex = 0; $hopIndex -lt $releasePath.Count - 1; $hopIndex++) {
++        $release = $releasePath[$hopIndex + 1]
++        $releaseBundles = $compatibility.bundleIds.PSObject.Properties[$release].Value
++        $bundleIds = @(
++            foreach ($componentType in $compatibility.componentOrder) {
++                [string]$releaseBundles.PSObject.Properties[[string]$componentType].Value
++            }
++        )
++        $gates.Add([pscustomobject][ordered]@{
++                id = "bundles-staged-$release"
++                type = 'BUNDLE'
++                subjectIds = @([string]$workload.id)
++                expectedStatus = 'AVAILABLE'
++                bundleIds = $bundleIds
++            })
++        $gates.Add([pscustomobject][ordered]@{
++                id = "upgrade-precheck-$release"
++                type = 'PRECHECK'
++                subjectIds = @([string]$workload.id)
++                expectedStatus = 'SUCCEEDED'
++            })
++        $gates.Add([pscustomobject][ordered]@{
++                id = "nsx-complete-$release"
++                type = 'DEPENDENCY'
++                subjectIds = @($workloadIdsByType['NSX_MANAGER'])
++                expectedStatus = 'COMPLETED'
++            })
++        $gates.Add([pscustomobject][ordered]@{
++                id = "vcenter-complete-$release"
++                type = 'DEPENDENCY'
++                subjectIds = @($workloadIdsByType['VCENTER'])
++                expectedStatus = 'COMPLETED'
++            })
++        $gates.Add([pscustomobject][ordered]@{
++                id = "esxi-complete-$release"
++                type = 'DEPENDENCY'
++                subjectIds = @($workloadIdsByType['ESXI_HOST'])
++                expectedStatus = 'COMPLETED'
++            })
++    }
++
++    $steps = [System.Collections.Generic.List[object]]::new()
++    $sequence = 1
++    for ($hopIndex = 0; $hopIndex -lt $releasePath.Count - 1; $hopIndex++) {
++        $releaseFrom = $releasePath[$hopIndex]
++        $releaseTo = $releasePath[$hopIndex + 1]
++        foreach ($componentTypeValue in $compatibility.componentOrder) {
++            $componentType = [string]$componentTypeValue
++            $completionPrefix = switch ($componentType) {
++                'NSX_MANAGER' { 'nsx' }
++                'VCENTER' { 'vcenter' }
++                'ESXI_HOST' { 'esxi' }
++                default { throw "Unsupported component order entry '$componentType'." }
++            }
++            $steps.Add([pscustomobject][ordered]@{
++                    sequence = $sequence
++                    releaseFrom = $releaseFrom
++                    releaseTo = $releaseTo
++                    componentType = $componentType
++                    componentIds = @($workloadIdsByType[$componentType])
++                    fromVersion = Get-VcfBomVersion -Compatibility $compatibility `
++                        -Release $releaseFrom -ComponentType $componentType
++                    toVersion = Get-VcfBomVersion -Compatibility $compatibility `
++                        -Release $releaseTo -ComponentType $componentType
++                    gates = @(Get-VcfStepGates -ComponentType $componentType -HopIndex $hopIndex `
++                            -ReleasePath $releasePath -Compatibility $compatibility)
++                    completionGate = "$completionPrefix-complete-$releaseTo"
++                })
++            $sequence++
++        }
++    }
++
++    $plan = [pscustomobject][ordered]@{
++        sddcId = [string]$inventory.integrationEnvelope.sddcId
++        workflowType = [string]$inventory.integrationEnvelope.workflowType
++        version = [string]$inventory.targetRelease
++        vcenterSpec = [pscustomobject][ordered]@{
++            vcenterHostname = [string]$workloadVcenter[0].fqdn
++            rootVcenterPassword = 'REDACTED!'
++            version = Get-VcfBomVersion -Compatibility $compatibility `
++                -Release ([string]$inventory.targetRelease) -ComponentType 'VCENTER'
++            useExistingDeployment = $true
++        }
++        networkSpecs = @($inventory.integrationEnvelope.networkSpecs)
++        dnsSpec = $inventory.integrationEnvelope.dnsSpec
++        schemaVersion = 1
++        estateId = [string]$inventory.estateId
++        workloadDomainId = [string]$workload.id
++        sourceRelease = [string]$workload.release
++        targetRelease = [string]$inventory.targetRelease
++        managementDomainPolicy = 'PRESERVE'
++        releasePath = $releasePath
++        components = @($components)
++        gates = @($gates)
++        steps = @($steps)
++    }
++
++    $parent = Split-Path -Parent $OutputPath
++    if ($parent) {
++        [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetFullPath($parent)) | Out-Null
++    }
++    $plan | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $OutputPath -Encoding utf8
++    return $plan
++}
++
++Export-ModuleMember -Function Get-VcfWorkloadDomainInventory, New-VcfWorkloadDomainMigrationPlan
+diff --git a/architecture/migration-plan.json b/architecture/migration-plan.json
+new file mode 100644
+index 0000000..58ce0ea
+--- /dev/null
++++ b/architecture/migration-plan.json
+@@ -0,0 +1,477 @@
++{
++  "sddcId": "chi-wld01",
++  "workflowType": "VCF_EXTEND",
++  "version": "5.2.2.0",
++  "vcenterSpec": {
++    "vcenterHostname": "vc-apps01.corp.example",
++    "rootVcenterPassword": "REDACTED!",
++    "version": "8.0.3.00600-24853646",
++    "useExistingDeployment": true
++  },
++  "networkSpecs": [
++    {
++      "networkType": "MANAGEMENT",
++      "vlanId": 1610,
++      "subnet": "10.61.10.0/24",
++      "gateway": "10.61.10.1",
++      "subnetMask": "255.255.255.0",
++      "mtu": 1500,
++      "ipAddressVersion": "IPv4",
++      "ipAddressAssignmentMode": "STATIC"
++    }
++  ],
++  "dnsSpec": {
++    "subdomain": "corp.example",
++    "nameservers": [
++      "10.60.0.10",
++      "10.60.0.11"
++    ]
++  },
++  "schemaVersion": 1,
++  "estateId": "corp-chi-vcf",
++  "workloadDomainId": "chi-wld01",
++  "sourceRelease": "4.5.1.0",
++  "targetRelease": "5.2.2.0",
++  "managementDomainPolicy": "PRESERVE",
++  "releasePath": [
++    "4.5.1.0",
++    "5.2.1.0",
++    "5.2.2.0"
++  ],
++  "components": [
++    {
++      "id": "mgmt-sddc-01",
++      "domainId": "chi-mgmt01",
++      "role": "management",
++      "type": "SDDC_MANAGER",
++      "fqdn": "sddc-mgr01.corp.example",
++      "currentVersion": "5.2.2.0-24936865",
++      "targetVersion": "5.2.2.0-24936865",
++      "disposition": "PRESERVE",
++      "gates": [
++        "management-domain-unchanged"
++      ]
++    },
++    {
++      "id": "mgmt-vc-01",
++      "domainId": "chi-mgmt01",
++      "role": "management",
++      "type": "VCENTER",
++      "fqdn": "vc-mgmt01.corp.example",
++      "currentVersion": "8.0.3.00600-24853646",
++      "targetVersion": "8.0.3.00600-24853646",
++      "disposition": "PRESERVE",
++      "gates": [
++        "management-domain-unchanged"
++      ]
++    },
++    {
++      "id": "mgmt-nsx-01",
++      "domainId": "chi-mgmt01",
++      "role": "management",
++      "type": "NSX_MANAGER",
++      "fqdn": "nsx-mgmt01.corp.example",
++      "currentVersion": "4.2.3.0.0-24866349",
++      "targetVersion": "4.2.3.0.0-24866349",
++      "disposition": "PRESERVE",
++      "gates": [
++        "management-domain-unchanged"
++      ]
++    },
++    {
++      "id": "mgmt-esx-01",
++      "domainId": "chi-mgmt01",
++      "role": "management",
++      "type": "ESXI_HOST",
++      "fqdn": "esx-mgmt01.corp.example",
++      "currentVersion": "8.0.3-24859861",
++      "targetVersion": "8.0.3-24859861",
++      "disposition": "PRESERVE",
++      "gates": [
++        "management-domain-unchanged"
++      ]
++    },
++    {
++      "id": "mgmt-esx-02",
++      "domainId": "chi-mgmt01",
++      "role": "management",
++      "type": "ESXI_HOST",
++      "fqdn": "esx-mgmt02.corp.example",
++      "currentVersion": "8.0.3-24859861",
++      "targetVersion": "8.0.3-24859861",
++      "disposition": "PRESERVE",
++      "gates": [
++        "management-domain-unchanged"
++      ]
++    },
++    {
++      "id": "mgmt-esx-03",
++      "domainId": "chi-mgmt01",
++      "role": "management",
++      "type": "ESXI_HOST",
++      "fqdn": "esx-mgmt03.corp.example",
++      "currentVersion": "8.0.3-24859861",
++      "targetVersion": "8.0.3-24859861",
++      "disposition": "PRESERVE",
++      "gates": [
++        "management-domain-unchanged"
++      ]
++    },
++    {
++      "id": "wld-vc-01",
++      "domainId": "chi-wld01",
++      "role": "workload",
++      "type": "VCENTER",
++      "fqdn": "vc-apps01.corp.example",
++      "currentVersion": "7.0.3.01400-21477706",
++      "targetVersion": "8.0.3.00600-24853646",
++      "disposition": "UPGRADE",
++      "gates": [
++        "management-domain-unchanged",
++        "source-health-green",
++        "bundles-staged-5.2.1.0",
++        "upgrade-precheck-5.2.1.0",
++        "nsx-complete-5.2.1.0",
++        "esxi-complete-5.2.1.0",
++        "bundles-staged-5.2.2.0",
++        "upgrade-precheck-5.2.2.0",
++        "nsx-complete-5.2.2.0"
++      ]
++    },
++    {
++      "id": "wld-nsx-01",
++      "domainId": "chi-wld01",
++      "role": "workload",
++      "type": "NSX_MANAGER",
++      "fqdn": "nsx-apps01.corp.example",
++      "currentVersion": "3.2.2.1.0-21487560",
++      "targetVersion": "4.2.3.0.0-24866349",
++      "disposition": "UPGRADE",
++      "gates": [
++        "management-domain-unchanged",
++        "source-health-green",
++        "bundles-staged-5.2.1.0",
++        "upgrade-precheck-5.2.1.0",
++        "esxi-complete-5.2.1.0",
++        "bundles-staged-5.2.2.0",
++        "upgrade-precheck-5.2.2.0"
++      ]
++    },
++    {
++      "id": "wld-esx-01",
++      "domainId": "chi-wld01",
++      "role": "workload",
++      "type": "ESXI_HOST",
++      "fqdn": "esx-apps01.corp.example",
++      "currentVersion": "7.0.3-21424296",
++      "targetVersion": "8.0.3-24859861",
++      "disposition": "UPGRADE",
++      "gates": [
++        "management-domain-unchanged",
++        "source-health-green",
++        "hardware-compatible-esxi-8.0u3",
++        "bundles-staged-5.2.1.0",
++        "upgrade-precheck-5.2.1.0",
++        "vcenter-complete-5.2.1.0",
++        "esxi-complete-5.2.1.0",
++        "bundles-staged-5.2.2.0",
++        "upgrade-precheck-5.2.2.0",
++        "vcenter-complete-5.2.2.0"
++      ]
++    },
++    {
++      "id": "wld-esx-02",
++      "domainId": "chi-wld01",
++      "role": "workload",
++      "type": "ESXI_HOST",
++      "fqdn": "esx-apps02.corp.example",
++      "currentVersion": "7.0.3-21424296",
++      "targetVersion": "8.0.3-24859861",
++      "disposition": "UPGRADE",
++      "gates": [
++        "management-domain-unchanged",
++        "source-health-green",
++        "hardware-compatible-esxi-8.0u3",
++        "bundles-staged-5.2.1.0",
++        "upgrade-precheck-5.2.1.0",
++        "vcenter-complete-5.2.1.0",
++        "esxi-complete-5.2.1.0",
++        "bundles-staged-5.2.2.0",
++        "upgrade-precheck-5.2.2.0",
++        "vcenter-complete-5.2.2.0"
++      ]
++    },
++    {
++      "id": "wld-esx-03",
++      "domainId": "chi-wld01",
++      "role": "workload",
++      "type": "ESXI_HOST",
++      "fqdn": "esx-apps03.corp.example",
++      "currentVersion": "7.0.3-21424296",
++      "targetVersion": "8.0.3-24859861",
++      "disposition": "UPGRADE",
++      "gates": [
++        "management-domain-unchanged",
++        "source-health-green",
++        "hardware-compatible-esxi-8.0u3",
++        "bundles-staged-5.2.1.0",
++        "upgrade-precheck-5.2.1.0",
++        "vcenter-complete-5.2.1.0",
++        "esxi-complete-5.2.1.0",
++        "bundles-staged-5.2.2.0",
++        "upgrade-precheck-5.2.2.0",
++        "vcenter-complete-5.2.2.0"
++      ]
++    }
++  ],
++  "gates": [
++    {
++      "id": "management-domain-unchanged",
++      "type": "INVARIANT",
++      "subjectIds": [
++        "mgmt-sddc-01",
++        "mgmt-vc-01",
++        "mgmt-nsx-01",
++        "mgmt-esx-01",
++        "mgmt-esx-02",
++        "mgmt-esx-03"
++      ],
++      "expectedStatus": "UNCHANGED"
++    },
++    {
++      "id": "source-health-green",
++      "type": "HEALTH",
++      "subjectIds": [
++        "chi-wld01"
++      ],
++      "expectedStatus": "GREEN"
++    },
++    {
++      "id": "hardware-compatible-esxi-8.0u3",
++      "type": "COMPATIBILITY",
++      "subjectIds": [
++        "wld-esx-01",
++        "wld-esx-02",
++        "wld-esx-03"
++      ],
++      "expectedStatus": "SUPPORTED"
++    },
++    {
++      "id": "bundles-staged-5.2.1.0",
++      "type": "BUNDLE",
++      "subjectIds": [
++        "chi-wld01"
++      ],
++      "expectedStatus": "AVAILABLE",
++      "bundleIds": [
++        "1c145a20-1f19-4393-bec3-b424d12245b5",
++        "4aac682c-ecf1-4828-acf8-1ceb466c2f9f",
++        "7a70a555-74ec-4849-89d4-3e45b551c8d8"
++      ]
++    },
++    {
++      "id": "upgrade-precheck-5.2.1.0",
++      "type": "PRECHECK",
++      "subjectIds": [
++        "chi-wld01"
++      ],
++      "expectedStatus": "SUCCEEDED"
++    },
++    {
++      "id": "nsx-complete-5.2.1.0",
++      "type": "DEPENDENCY",
++      "subjectIds": [
++        "wld-nsx-01"
++      ],
++      "expectedStatus": "COMPLETED"
++    },
++    {
++      "id": "vcenter-complete-5.2.1.0",
++      "type": "DEPENDENCY",
++      "subjectIds": [
++        "wld-vc-01"
++      ],
++      "expectedStatus": "COMPLETED"
++    },
++    {
++      "id": "esxi-complete-5.2.1.0",
++      "type": "DEPENDENCY",
++      "subjectIds": [
++        "wld-esx-01",
++        "wld-esx-02",
++        "wld-esx-03"
++      ],
++      "expectedStatus": "COMPLETED"
++    },
++    {
++      "id": "bundles-staged-5.2.2.0",
++      "type": "BUNDLE",
++      "subjectIds": [
++        "chi-wld01"
++      ],
++      "expectedStatus": "AVAILABLE",
++      "bundleIds": [
++        "6e1a10ca-d587-40ee-908e-06d263ca6315",
++        "bb0ff1fa-057a-44ef-8c18-896ee24d508c",
++        "d5e588e7-25e5-47ae-b9bc-49c1e80b9354"
++      ]
++    },
++    {
++      "id": "upgrade-precheck-5.2.2.0",
++      "type": "PRECHECK",
++      "subjectIds": [
++        "chi-wld01"
++      ],
++      "expectedStatus": "SUCCEEDED"
++    },
++    {
++      "id": "nsx-complete-5.2.2.0",
++      "type": "DEPENDENCY",
++      "subjectIds": [
++        "wld-nsx-01"
++      ],
++      "expectedStatus": "COMPLETED"
++    },
++    {
++      "id": "vcenter-complete-5.2.2.0",
++      "type": "DEPENDENCY",
++      "subjectIds": [
++        "wld-vc-01"
++      ],
++      "expectedStatus": "COMPLETED"
++    },
++    {
++      "id": "esxi-complete-5.2.2.0",
++      "type": "DEPENDENCY",
++      "subjectIds": [
++        "wld-esx-01",
++        "wld-esx-02",
++        "wld-esx-03"
++      ],
++      "expectedStatus": "COMPLETED"
++    }
++  ],
++  "steps": [
++    {
++      "sequence": 1,
++      "releaseFrom": "4.5.1.0",
++      "releaseTo": "5.2.1.0",
++      "componentType": "NSX_MANAGER",
++      "componentIds": [
++        "wld-nsx-01"
++      ],
++      "fromVersion": "3.2.2.1.0-21487560",
++      "toVersion": "4.2.1.0.0-24304122",
++      "gates": [
++        "management-domain-unchanged",
++        "source-health-green",
++        "bundles-staged-5.2.1.0",
++        "upgrade-precheck-5.2.1.0"
++      ],
++      "completionGate": "nsx-complete-5.2.1.0"
++    },
++    {
++      "sequence": 2,
++      "releaseFrom": "4.5.1.0",
++      "releaseTo": "5.2.1.0",
++      "componentType": "VCENTER",
++      "componentIds": [
++        "wld-vc-01"
++      ],
++      "fromVersion": "7.0.3.01400-21477706",
++      "toVersion": "8.0.3.00300-24305161",
++      "gates": [
++        "management-domain-unchanged",
++        "source-health-green",
++        "bundles-staged-5.2.1.0",
++        "upgrade-precheck-5.2.1.0",
++        "nsx-complete-5.2.1.0"
++      ],
++      "completionGate": "vcenter-complete-5.2.1.0"
++    },
++    {
++      "sequence": 3,
++      "releaseFrom": "4.5.1.0",
++      "releaseTo": "5.2.1.0",
++      "componentType": "ESXI_HOST",
++      "componentIds": [
++        "wld-esx-01",
++        "wld-esx-02",
++        "wld-esx-03"
++      ],
++      "fromVersion": "7.0.3-21424296",
++      "toVersion": "8.0.3-24280767",
++      "gates": [
++        "management-domain-unchanged",
++        "source-health-green",
++        "hardware-compatible-esxi-8.0u3",
++        "bundles-staged-5.2.1.0",
++        "upgrade-precheck-5.2.1.0",
++        "vcenter-complete-5.2.1.0"
++      ],
++      "completionGate": "esxi-complete-5.2.1.0"
++    },
++    {
++      "sequence": 4,
++      "releaseFrom": "5.2.1.0",
++      "releaseTo": "5.2.2.0",
++      "componentType": "NSX_MANAGER",
++      "componentIds": [
++        "wld-nsx-01"
++      ],
++      "fromVersion": "4.2.1.0.0-24304122",
++      "toVersion": "4.2.3.0.0-24866349",
++      "gates": [
++        "management-domain-unchanged",
++        "source-health-green",
++        "esxi-complete-5.2.1.0",
++        "bundles-staged-5.2.2.0",
++        "upgrade-precheck-5.2.2.0"
++      ],
++      "completionGate": "nsx-complete-5.2.2.0"
++    },
++    {
++      "sequence": 5,
++      "releaseFrom": "5.2.1.0",
++      "releaseTo": "5.2.2.0",
++      "componentType": "VCENTER",
++      "componentIds": [
++        "wld-vc-01"
++      ],
++      "fromVersion": "8.0.3.00300-24305161",
++      "toVersion": "8.0.3.00600-24853646",
++      "gates": [
++        "management-domain-unchanged",
++        "source-health-green",
++        "esxi-complete-5.2.1.0",
++        "bundles-staged-5.2.2.0",
++        "upgrade-precheck-5.2.2.0",
++        "nsx-complete-5.2.2.0"
++      ],
++      "completionGate": "vcenter-complete-5.2.2.0"
++    },
++    {
++      "sequence": 6,
++      "releaseFrom": "5.2.1.0",
++      "releaseTo": "5.2.2.0",
++      "componentType": "ESXI_HOST",
++      "componentIds": [
++        "wld-esx-01",
++        "wld-esx-02",
++        "wld-esx-03"
++      ],
++      "fromVersion": "8.0.3-24280767",
++      "toVersion": "8.0.3-24859861",
++      "gates": [
++        "management-domain-unchanged",
++        "source-health-green",
++        "hardware-compatible-esxi-8.0u3",
++        "esxi-complete-5.2.1.0",
++        "bundles-staged-5.2.2.0",
++        "upgrade-precheck-5.2.2.0",
++        "vcenter-complete-5.2.2.0"
++      ],
++      "completionGate": "esxi-complete-5.2.2.0"
++    }
++  ]
++}
+diff --git a/research-sources.md b/research-sources.md
+new file mode 100644
+index 0000000..ba2e63a
+--- /dev/null
++++ b/research-sources.md
+@@ -0,0 +1,9 @@
++# Broadcom compatibility research
++
++Accessed 2026-08-14.
++
++- [VMware Cloud Foundation - Upgrade Bundle Details](https://knowledge.broadcom.com/external/article/327207/vmware-cloud-foundation-upgrade-bundle.html) — supplied the published 4.5.1.0, 5.2.1.0, and 5.2.2.0 component builds and bundle identifiers used to compare the live BOM with the pinned snapshot.
++- [Upgrade VMware Cloud Foundation (VCF) 4.x and 5.x](https://knowledge.broadcom.com/external/article/405275/upgrade-vmware-cloud-foundation-vcf-4x-a.html) — confirmed the core sequence and the prerequisite roles: health/backups/bundles/prechecks, followed by SDDC Manager, NSX, vCenter, and ESXi; this workload-domain-only plan starts at NSX because the fleet management domain and SDDC Manager are already at target.
++- [Product Interoperability Matrix](https://interopmatrix.broadcom.com/Interoperability?col=285%2C&row=0%2C) — consulted for the vCenter, ESXi, and NSX target interoperability decision represented by the release gates.
++- [Broadcom Compatibility Guide](https://compatibilityguide.broadcom.com/search?program=software) — consulted for the ESXi 8.0 Update 3 hardware-compatibility gate that applies to all three workload hosts.
++- [Upgrade Sequence from VCF 4.5.1.0 to 5.2.1.0](https://knowledge.broadcom.com/external/article/418641/upgrade-sequence-from-vcf-4510-to-5210-r.html) — confirmed 5.2.1 as the supported first target from 4.5.1 and the NSX 4.2.1 evaluation/precheck dependency represented in the first hop.

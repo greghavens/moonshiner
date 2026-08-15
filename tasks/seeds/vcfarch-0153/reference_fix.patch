@@ -1,0 +1,903 @@
+diff --git a/VcfAriaMigration/VcfAriaMigration.psd1 b/VcfAriaMigration/VcfAriaMigration.psd1
+new file mode 100644
+index 0000000..4b97c3a
+--- /dev/null
++++ b/VcfAriaMigration/VcfAriaMigration.psd1
+@@ -0,0 +1,16 @@
++@{
++    RootModule        = 'VcfAriaMigration.psm1'
++    ModuleVersion     = '1.0.0'
++    GUID              = '8864c42c-49f2-4f5f-a519-da8473b8f2b0'
++    Author            = 'Northstar Platform Engineering'
++    Description       = 'Builds a deterministic VCF Aria migration installer specification.'
++    PowerShellVersion = '7.4'
++    RequiredModules   = @(
++        @{ ModuleName = 'VMware.Sdk.Vcf.Installer'; ModuleVersion = '13.5.0.25380678' }
++        @{ ModuleName = 'VMware.Sdk.Vcf.SddcManager'; ModuleVersion = '13.5.0.25380678' }
++    )
++    FunctionsToExport = @('Get-VcfMigrationPlacement', 'New-VcfAriaMigrationPlan')
++    CmdletsToExport   = @()
++    VariablesToExport = @()
++    AliasesToExport   = @()
++}
+diff --git a/VcfAriaMigration/VcfAriaMigration.psm1 b/VcfAriaMigration/VcfAriaMigration.psm1
+new file mode 100644
+index 0000000..1144df8
+--- /dev/null
++++ b/VcfAriaMigration/VcfAriaMigration.psm1
+@@ -0,0 +1,265 @@
++Set-StrictMode -Version Latest
++$ErrorActionPreference = 'Stop'
++
++Import-Module VMware.Sdk.Vcf.Installer -MinimumVersion 13.5.0.25380678 -ErrorAction Stop
++Import-Module VMware.Sdk.Vcf.SddcManager -MinimumVersion 13.5.0.25380678 -ErrorAction Stop
++
++function Get-VcfMigrationPlacement {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)][string]$Server,
++        [Parameter(Mandatory)][pscredential]$Credential,
++        [Parameter(Mandatory)][string]$TargetDomainId,
++        [Parameter(Mandatory)][string]$TargetClusterId
++    )
++
++    $connection = Connect-VcfSddcManagerServer -Server $Server -Credential $Credential
++    $domainResponse = Invoke-VcfGetDomains -PageNumber 0 -PageSize 100
++    $clusterResponse = Invoke-VcfGetClusters -DomainId $TargetDomainId -PageNumber 0 -PageSize 100
++    $domains = if ($null -ne $domainResponse.Elements) { @($domainResponse.Elements) } else { @($domainResponse) }
++    $clusters = if ($null -ne $clusterResponse.Elements) { @($clusterResponse.Elements) } else { @($clusterResponse) }
++    $domain = @($domains | Where-Object { $_.Id -ceq $TargetDomainId })
++    $cluster = @($clusters | Where-Object { $_.Id -ceq $TargetClusterId })
++    if ($domain.Count -ne 1 -or $cluster.Count -ne 1) {
++        throw "Target workload placement '$TargetDomainId/$TargetClusterId' was not discovered."
++    }
++    [pscustomobject][ordered]@{
++        Connection = $connection
++        Domain     = $domain[0]
++        Cluster    = $cluster[0]
++    }
++}
++
++function Get-PlacementRationale {
++    param([Parameter(Mandatory)][string]$Component)
++    switch ($Component) {
++        'VCF Operations Fleet Management' {
++            'A small fleet-management node provides lifecycle control inside the new workload domain without placing a write target in the management domain.'
++        }
++        'VCF Operations' {
++            'Two medium analytics nodes provide HA and cover 18,400 objects and 2,900,000 metrics while remaining inside the pinned sizing limits.'
++        }
++        'VCF Operations Collector' {
++            'One standard unified cloud proxy separates collection from analytics and has ample object and metric headroom for this workload domain.'
++        }
++        'VCF Automation' {
++            'Three medium nodes preserve the source clustered availability model and place Automation beside its workload-domain endpoints.'
++        }
++        'VCF Operations for Logs' {
++            'Three medium nodes meet the production cluster minimum and provide 225 GiB/day ingestion capacity for the measured 170 GiB/day load.'
++        }
++        default { throw "No placement rationale is defined for '$Component'." }
++    }
++}
++
++function Get-StepDescription {
++    param([Parameter(Mandatory)][string]$StepId)
++    switch ($StepId) {
++        'confirm-workload-domain-readiness' {
++            'Discover the new workload domain and prove that its cluster, network, datastore, and free capacity can host every target component.'
++        }
++        'patch-aria-suite-lifecycle' {
++            'Back up Aria Suite Lifecycle and move 8.18.0 from Patch 1 to Patch 2 so the supported VCF 9 migration workflows are available.'
++        }
++        'upgrade-vcf-operations' {
++            'Upgrade Aria Operations 8.18.3 in place to VCF Operations 9.0.2 and enroll its newly deployed Fleet Management capability.'
++        }
++        'upgrade-vcf-automation' {
++            'Import Aria Automation 8.18.1 from Aria Suite Lifecycle into Fleet Management and run the supported VCF Automation 9.0.2 upgrade.'
++        }
++        'deploy-vcf-operations-for-logs' {
++            'Fresh-deploy the three-node VCF Operations for Logs 9.0.2 target while the 8.18.4 source continues to ingest.'
++        }
++        'migrate-logs-content-and-configuration' {
++            'Export and import compatible custom log content, recreate integrations, and redirect a test slice of ingestion to the parallel target.'
++        }
++        'transfer-logs-90-day-data' {
++            'Run the supported Day-N transfer for zero-to-90-day history after connectivity, time, and vCenter licensing checks pass.'
++        }
++        'cutover-and-retire-legacy-logs' {
++            'Cut all live log sources to the validated target and retire only the legacy Logs cluster after ingestion and content remain stable.'
++        }
++        default { throw "No step description is defined for '$StepId'." }
++    }
++}
++
++function Assert-VcfInstallerBindings {
++    param($Inventory, $Snapshot)
++
++    foreach ($commandName in $Snapshot.requiredSdkCommands) {
++        if ($null -eq (Get-Command -Name $commandName -ErrorAction SilentlyContinue)) {
++            throw "Required VCF PowerCLI command '$commandName' is unavailable."
++        }
++    }
++
++    $opsPlacement = @($Snapshot.placements | Where-Object component -ceq 'VCF Operations')[0]
++    $opsNodes = for ($index = 1; $index -le [int]$opsPlacement.nodeCount; $index++) {
++        $nodeType = if ($index -eq 1) { 'master' } else { 'replica' }
++        Initialize-VcfInstallerVcfOperationsNode `
++            -Hostname ("vcfops-{0:d2}.apps-02.internal" -f $index) `
++            -Type $nodeType
++    }
++    $operationsSpec = Initialize-VcfInstallerVcfOperationsSpec `
++        -Nodes $opsNodes `
++        -ApplianceSize $opsPlacement.size `
++        -UseExistingDeployment $true `
++        -Version $Snapshot.targetVersion
++
++    $collectorPlacement = @($Snapshot.placements | Where-Object component -ceq 'VCF Operations Collector')[0]
++    $collectorSpec = Initialize-VcfInstallerVcfOperationsCollectorSpec `
++        -Hostname 'vcfops-collector-01.apps-02.internal' `
++        -ApplianceSize $collectorPlacement.size `
++        -UseExistingDeployment $false `
++        -Version $Snapshot.targetVersion
++
++    $automationPlacement = @($Snapshot.placements | Where-Object component -ceq 'VCF Automation')[0]
++    $automationSpec = Initialize-VcfInstallerVcfAutomationSpec `
++        -Hostname 'vcfauto.apps-02.internal' `
++        -InternalClusterCidr $Inventory.fleet.workloadDomain.cluster.automationInternalClusterCidr `
++        -Size $automationPlacement.size `
++        -UseExistingDeployment $true `
++        -Version $Snapshot.targetVersion
++
++    if ($null -eq $operationsSpec -or $null -eq $collectorSpec -or $null -eq $automationSpec) {
++        throw 'The VCF Installer SDK did not construct every required component specification.'
++    }
++}
++
++function New-VcfAriaMigrationPlan {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)][string]$InventoryPath,
++        [Parameter(Mandatory)][string]$CompatibilitySnapshotPath,
++        [Parameter(Mandatory)][string]$OutputPath
++    )
++
++    $inventory = Get-Content -LiteralPath $InventoryPath -Raw | ConvertFrom-Json -Depth 100
++    $snapshot = Get-Content -LiteralPath $CompatibilitySnapshotPath -Raw | ConvertFrom-Json -Depth 100
++    Assert-VcfInstallerBindings -Inventory $inventory -Snapshot $snapshot
++
++    $placements = foreach ($sourcePlacement in $snapshot.placements) {
++        $placement = [ordered]@{
++            component        = $sourcePlacement.component
++            version          = $sourcePlacement.version
++            domainId         = $snapshot.placementAuthority.targetDomainId
++            clusterId        = $snapshot.placementAuthority.targetClusterId
++            networkId        = $snapshot.placementAuthority.targetNetworkId
++            datastoreId      = $snapshot.placementAuthority.targetDatastoreId
++            topology         = $sourcePlacement.topology
++            nodeCount        = [int]$sourcePlacement.nodeCount
++            size             = $sourcePlacement.size
++            availabilityMode = $sourcePlacement.availabilityMode
++            resourcesPerNode = [ordered]@{
++                vCpu       = [int]$sourcePlacement.resourcesPerNode.vCpu
++                memoryGiB  = [int]$sourcePlacement.resourcesPerNode.memoryGiB
++                storageGiB = [int]$sourcePlacement.resourcesPerNode.storageGiB
++            }
++            capacity         = [ordered]@{}
++            rationale        = Get-PlacementRationale -Component $sourcePlacement.component
++        }
++        foreach ($property in $sourcePlacement.capacity.PSObject.Properties) {
++            $placement.capacity[$property.Name] = [int]$property.Value
++        }
++        $placement
++    }
++
++    $requiredVcpu = 0
++    $requiredMemory = 0
++    $requiredStorage = 0
++    foreach ($placement in $placements) {
++        $requiredVcpu += $placement.nodeCount * $placement.resourcesPerNode.vCpu
++        $requiredMemory += $placement.nodeCount * $placement.resourcesPerNode.memoryGiB
++        $requiredStorage += $placement.nodeCount * $placement.resourcesPerNode.storageGiB
++    }
++    $available = $inventory.fleet.workloadDomain.cluster.availableCapacity
++
++    $migrations = foreach ($authority in $snapshot.migrations) {
++        $sources = @($inventory.sourceProducts | Where-Object inventoryId -ceq $authority.sourceInventoryId)
++        if ($sources.Count -ne 1) {
++            throw "Inventory source '$($authority.sourceInventoryId)' is not unique."
++        }
++        $source = $sources[0]
++        $typeById = @{}
++        foreach ($item in @($source.content) + @($source.configuration)) {
++            $typeById[$item.id] = $item.type
++        }
++        $carry = foreach ($item in $authority.carryForward) {
++            [ordered]@{ id = $item.id; type = $typeById[$item.id]; method = $item.method }
++        }
++        $abandon = foreach ($item in $authority.abandon) {
++            [ordered]@{ id = $item.id; type = $typeById[$item.id]; reason = $item.reason }
++        }
++        [ordered]@{
++            sourceInventoryId = $authority.sourceInventoryId
++            sourceProduct     = $authority.sourceProduct
++            sourceVersion     = $authority.sourceVersion
++            sourceSupportEnds = $authority.sourceSupportEnds
++            targetComponent   = $authority.targetComponent
++            targetVersion     = $authority.targetVersion
++            path              = $authority.path
++            carryForward      = @($carry)
++            abandon           = @($abandon)
++        }
++    }
++
++    $steps = foreach ($authorityStep in $snapshot.steps) {
++        $gates = foreach ($gateId in $authorityStep.requiredGateIds) {
++            $gate = $snapshot.gateCatalog.PSObject.Properties[$gateId].Value
++            [ordered]@{ id = $gateId; condition = $gate.condition; evidence = $gate.evidence }
++        }
++        [ordered]@{
++            order             = [int]$authorityStep.order
++            id                = $authorityStep.id
++            action            = $authorityStep.action
++            sourceInventoryId = $authorityStep.sourceInventoryId
++            targetComponent   = $authorityStep.targetComponent
++            description       = Get-StepDescription -StepId $authorityStep.id
++            gates             = @($gates)
++        }
++    }
++
++    $document = [ordered]@{
++        '$schema'          = './specs/installer-spec.schema.json'
++        schemaVersion      = '1.0'
++        planId             = "$($inventory.estateId)-aria-to-vcf-$($snapshot.targetVersion)"
++        authoritySnapshot  = [ordered]@{ id = $snapshot.snapshotId; asOf = $snapshot.asOf }
++        estateId           = $inventory.estateId
++        fleetId            = $inventory.fleet.id
++        scope              = [ordered]@{
++            managementDomainId         = $snapshot.placementAuthority.managementDomainId
++            managementDomainChangeMode = $snapshot.placementAuthority.managementDomainChangeMode
++            targetDomainId              = $snapshot.placementAuthority.targetDomainId
++            targetClusterId             = $snapshot.placementAuthority.targetClusterId
++            targetNetworkId             = $snapshot.placementAuthority.targetNetworkId
++            targetDatastoreId           = $snapshot.placementAuthority.targetDatastoreId
++        }
++        sdk                = [ordered]@{
++            requiredModules = @($snapshot.moduleRequirements | ForEach-Object {
++                [ordered]@{ name = $_.name; minimumVersion = $_.minimumVersion }
++            })
++            commandsUsed    = @($snapshot.requiredSdkCommands)
++        }
++        placements         = @($placements)
++        capacitySummary    = [ordered]@{
++            required                = [ordered]@{
++                vCpu = $requiredVcpu; memoryGiB = $requiredMemory; storageGiB = $requiredStorage
++            }
++            available               = [ordered]@{
++                vCpu = [int]$available.vCpu
++                memoryGiB = [int]$available.memoryGiB
++                storageGiB = [int]$available.storageGiB
++            }
++            withinAvailableCapacity = $requiredVcpu -le [int]$available.vCpu -and
++                $requiredMemory -le [int]$available.memoryGiB -and
++                $requiredStorage -le [int]$available.storageGiB
++        }
++        migrations         = @($migrations)
++        steps              = @($steps)
++    }
++
++    $json = ConvertTo-Json -InputObject $document -Depth 100
++    $resolvedOutput = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
++    [System.IO.File]::WriteAllText($resolvedOutput, $json, [System.Text.UTF8Encoding]::new($false))
++}
++
++Export-ModuleMember -Function Get-VcfMigrationPlacement, New-VcfAriaMigrationPlan
+diff --git a/migration-installer-spec.json b/migration-installer-spec.json
+new file mode 100644
+index 0000000..e925f1a
+--- /dev/null
++++ b/migration-installer-spec.json
+@@ -0,0 +1,577 @@
++{
++  "$schema": "./specs/installer-spec.schema.json",
++  "schemaVersion": "1.0",
++  "planId": "northstar-central-aria-to-vcf-9.0.2",
++  "authoritySnapshot": {
++    "id": "broadcom-vcf-9.0.2-2026-06-30",
++    "asOf": "2026-06-30"
++  },
++  "estateId": "northstar-central",
++  "fleetId": "fleet-central-01",
++  "scope": {
++    "managementDomainId": "mgmt-domain-01",
++    "managementDomainChangeMode": "observe-only",
++    "targetDomainId": "wld-apps-02",
++    "targetClusterId": "cluster-platform-services-02",
++    "targetNetworkId": "segment-platform-services-02",
++    "targetDatastoreId": "vsan-platform-services-02"
++  },
++  "sdk": {
++    "requiredModules": [
++      {
++        "name": "VMware.Sdk.Vcf.Installer",
++        "minimumVersion": "13.5.0.25380678"
++      },
++      {
++        "name": "VMware.Sdk.Vcf.SddcManager",
++        "minimumVersion": "13.5.0.25380678"
++      }
++    ],
++    "commandsUsed": [
++      "Connect-VcfSddcManagerServer",
++      "Invoke-VcfGetDomains",
++      "Invoke-VcfGetClusters",
++      "Initialize-VcfInstallerVcfOperationsNode",
++      "Initialize-VcfInstallerVcfOperationsSpec",
++      "Initialize-VcfInstallerVcfOperationsCollectorSpec",
++      "Initialize-VcfInstallerVcfAutomationSpec"
++    ]
++  },
++  "placements": [
++    {
++      "component": "VCF Operations Fleet Management",
++      "version": "9.0.2",
++      "domainId": "wld-apps-02",
++      "clusterId": "cluster-platform-services-02",
++      "networkId": "segment-platform-services-02",
++      "datastoreId": "vsan-platform-services-02",
++      "topology": "single-node",
++      "nodeCount": 1,
++      "size": "small",
++      "availabilityMode": "platform-managed",
++      "resourcesPerNode": {
++        "vCpu": 4,
++        "memoryGiB": 16,
++        "storageGiB": 274
++      },
++      "capacity": {},
++      "rationale": "A small fleet-management node provides lifecycle control inside the new workload domain without placing a write target in the management domain."
++    },
++    {
++      "component": "VCF Operations",
++      "version": "9.0.2",
++      "domainId": "wld-apps-02",
++      "clusterId": "cluster-platform-services-02",
++      "networkId": "segment-platform-services-02",
++      "datastoreId": "vsan-platform-services-02",
++      "topology": "two-node-analytics-ha",
++      "nodeCount": 2,
++      "size": "medium",
++      "availabilityMode": "ha",
++      "resourcesPerNode": {
++        "vCpu": 8,
++        "memoryGiB": 32,
++        "storageGiB": 500
++      },
++      "capacity": {
++        "objects": 30000,
++        "metrics": 5000000
++      },
++      "rationale": "Two medium analytics nodes provide HA and cover 18,400 objects and 2,900,000 metrics while remaining inside the pinned sizing limits."
++    },
++    {
++      "component": "VCF Operations Collector",
++      "version": "9.0.2",
++      "domainId": "wld-apps-02",
++      "clusterId": "cluster-platform-services-02",
++      "networkId": "segment-platform-services-02",
++      "datastoreId": "vsan-platform-services-02",
++      "topology": "unified-cloud-proxy",
++      "nodeCount": 1,
++      "size": "standard",
++      "availabilityMode": "n-plus-one-by-analytics-failover",
++      "resourcesPerNode": {
++        "vCpu": 8,
++        "memoryGiB": 48,
++        "storageGiB": 200
++      },
++      "capacity": {
++        "objects": 80000,
++        "metrics": 12000000
++      },
++      "rationale": "One standard unified cloud proxy separates collection from analytics and has ample object and metric headroom for this workload domain."
++    },
++    {
++      "component": "VCF Automation",
++      "version": "9.0.2",
++      "domainId": "wld-apps-02",
++      "clusterId": "cluster-platform-services-02",
++      "networkId": "segment-platform-services-02",
++      "datastoreId": "vsan-platform-services-02",
++      "topology": "three-node-cluster",
++      "nodeCount": 3,
++      "size": "medium",
++      "availabilityMode": "clustered",
++      "resourcesPerNode": {
++        "vCpu": 12,
++        "memoryGiB": 42,
++        "storageGiB": 300
++      },
++      "capacity": {},
++      "rationale": "Three medium nodes preserve the source clustered availability model and place Automation beside its workload-domain endpoints."
++    },
++    {
++      "component": "VCF Operations for Logs",
++      "version": "9.0.2",
++      "domainId": "wld-apps-02",
++      "clusterId": "cluster-platform-services-02",
++      "networkId": "segment-platform-services-02",
++      "datastoreId": "vsan-platform-services-02",
++      "topology": "three-node-cluster",
++      "nodeCount": 3,
++      "size": "medium",
++      "availabilityMode": "clustered",
++      "resourcesPerNode": {
++        "vCpu": 8,
++        "memoryGiB": 16,
++        "storageGiB": 2048
++      },
++      "capacity": {
++        "ingestGiBPerDay": 225,
++        "activeSyslogConnections": 750
++      },
++      "rationale": "Three medium nodes meet the production cluster minimum and provide 225 GiB/day ingestion capacity for the measured 170 GiB/day load."
++    }
++  ],
++  "capacitySummary": {
++    "required": {
++      "vCpu": 88,
++      "memoryGiB": 302,
++      "storageGiB": 8518
++    },
++    "available": {
++      "vCpu": 160,
++      "memoryGiB": 640,
++      "storageGiB": 18432
++    },
++    "withinAvailableCapacity": true
++  },
++  "migrations": [
++    {
++      "sourceInventoryId": "aria-ops-central",
++      "sourceProduct": "VMware Aria Operations",
++      "sourceVersion": "8.18.3",
++      "sourceSupportEnds": "2027-10-11",
++      "targetComponent": "VCF Operations",
++      "targetVersion": "9.0.2",
++      "path": "in-place-upgrade-via-aria-suite-lifecycle",
++      "carryForward": [
++        {
++          "id": "ops-dashboard-capacity",
++          "type": "dashboard",
++          "method": "in-place-upgrade"
++        },
++        {
++          "id": "ops-dashboard-app-slo",
++          "type": "dashboard",
++          "method": "in-place-upgrade"
++        },
++        {
++          "id": "ops-supermetric-headroom",
++          "type": "super-metric",
++          "method": "in-place-upgrade"
++        },
++        {
++          "id": "ops-view-chargeback",
++          "type": "view",
++          "method": "in-place-upgrade"
++        },
++        {
++          "id": "ops-report-monthly",
++          "type": "report",
++          "method": "in-place-upgrade"
++        },
++        {
++          "id": "ops-alert-app-latency",
++          "type": "alert-definition",
++          "method": "in-place-upgrade"
++        },
++        {
++          "id": "ops-policy-production",
++          "type": "policy",
++          "method": "in-place-upgrade"
++        },
++        {
++          "id": "ops-history-metrics-365d",
++          "type": "historical-data",
++          "method": "in-place-upgrade"
++        },
++        {
++          "id": "ops-vcenter-adapter-apps-02",
++          "type": "adapter-instance",
++          "method": "in-place-upgrade-and-validate"
++        },
++        {
++          "id": "ops-email-notification",
++          "type": "outbound-notification",
++          "method": "in-place-upgrade-and-test"
++        }
++      ],
++      "abandon": [
++        {
++          "id": "ops-mp-storage-devices",
++          "type": "management-pack",
++          "reason": "management pack support ended with Aria Operations 8.18.3 and the pack is not available for the target"
++        },
++        {
++          "id": "ops-vidm-auth-source",
++          "type": "identity-integration",
++          "reason": "legacy VMware Identity Manager integration is replaced by the already-enabled VCF Identity Broker"
++        }
++      ]
++    },
++    {
++      "sourceInventoryId": "aria-auto-central",
++      "sourceProduct": "VMware Aria Automation",
++      "sourceVersion": "8.18.1",
++      "sourceSupportEnds": "2027-10-11",
++      "targetComponent": "VCF Automation",
++      "targetVersion": "9.0.2",
++      "path": "fleet-management-import-and-upgrade",
++      "carryForward": [
++        {
++          "id": "auto-project-app-platform",
++          "type": "project",
++          "method": "fleet-management-import-and-upgrade"
++        },
++        {
++          "id": "auto-cloud-account-vsphere-apps-02",
++          "type": "cloud-account",
++          "method": "fleet-management-import-and-upgrade-and-validate"
++        },
++        {
++          "id": "auto-template-linux-service",
++          "type": "cloud-template",
++          "method": "fleet-management-import-and-upgrade"
++        },
++        {
++          "id": "auto-custom-form-linux-service",
++          "type": "custom-form",
++          "method": "fleet-management-import-and-upgrade"
++        },
++        {
++          "id": "auto-abx-ipam-registration",
++          "type": "abx-action",
++          "method": "fleet-management-import-and-upgrade-and-test"
++        },
++        {
++          "id": "auto-subscription-cost-tag",
++          "type": "subscription",
++          "method": "fleet-management-import-and-upgrade-and-test"
++        },
++        {
++          "id": "auto-vro-workflow-backup",
++          "type": "orchestrator-workflow",
++          "method": "embedded-orchestrator-upgrade-and-test"
++        },
++        {
++          "id": "auto-deployments-1260",
++          "type": "deployment-data",
++          "method": "fleet-management-import-and-upgrade"
++        },
++        {
++          "id": "auto-lease-policy-production",
++          "type": "lease-policy",
++          "method": "fleet-management-import-and-upgrade"
++        }
++      ],
++      "abandon": [
++        {
++          "id": "auto-vidm-integration",
++          "type": "identity-integration",
++          "reason": "VCF Automation 9 uses the already-enabled VCF Identity Broker instead of legacy VMware Identity Manager"
++        },
++        {
++          "id": "auto-csp-login-bookmarks",
++          "type": "client-configuration",
++          "reason": "the VCF Identity Broker login route replaces the legacy CSP portal URL"
++        }
++      ]
++    },
++    {
++      "sourceInventoryId": "aria-logs-central",
++      "sourceProduct": "VMware Aria Operations for Logs",
++      "sourceVersion": "8.18.4",
++      "sourceSupportEnds": "2027-10-11",
++      "targetComponent": "VCF Operations for Logs",
++      "targetVersion": "9.0.2",
++      "path": "fresh-deployment-parallel-cutover",
++      "carryForward": [
++        {
++          "id": "logs-contentpack-payments",
++          "type": "custom-content-pack",
++          "method": "manual-export-import"
++        },
++        {
++          "id": "logs-dashboard-security",
++          "type": "dashboard",
++          "method": "manual-export-import"
++        },
++        {
++          "id": "logs-alert-auth-failure",
++          "type": "alert",
++          "method": "manual-export-import-and-test"
++        },
++        {
++          "id": "logs-extractedfield-correlation",
++          "type": "extracted-field",
++          "method": "manual-export-import-and-test"
++        },
++        {
++          "id": "logs-history-0-90d",
++          "type": "historical-data",
++          "method": "day-n-log-data-transfer"
++        },
++        {
++          "id": "logs-vcenter-integration-apps-02",
++          "type": "vcenter-integration",
++          "method": "manual-reconfiguration"
++        },
++        {
++          "id": "logs-operations-integration",
++          "type": "operations-integration",
++          "method": "manual-reconfiguration"
++        },
++        {
++          "id": "logs-syslog-sources",
++          "type": "ingestion-endpoints",
++          "method": "endpoint-cutover"
++        },
++        {
++          "id": "logs-windows-agents-8.18",
++          "type": "agent-fleet",
++          "method": "retain-8.18-agents-and-configure-target-trust"
++        }
++      ],
++      "abandon": [
++        {
++          "id": "logs-history-91-365d",
++          "type": "historical-data",
++          "reason": "the supported Aria Operations for Logs 8.18 to VCF Operations for Logs 9.0 data transfer is limited to 90 days"
++        }
++      ]
++    }
++  ],
++  "steps": [
++    {
++      "order": 1,
++      "id": "confirm-workload-domain-readiness",
++      "action": "validate-placement",
++      "sourceInventoryId": null,
++      "targetComponent": "VCF Operations Fleet Management",
++      "description": "Discover the new workload domain and prove that its cluster, network, datastore, and free capacity can host every target component.",
++      "gates": [
++        {
++          "id": "management-domain-observe-only",
++          "condition": "The management domain remains discovery-only and has no target placement or migration action.",
++          "evidence": "Scope and SDK inventory diff contain no management-domain write target."
++        },
++        {
++          "id": "target-capacity-sufficient",
++          "condition": "Aggregate target vCPU, memory, and storage requirements fit the available workload-cluster capacity.",
++          "evidence": "Artifact capacitySummary calculation against the estate inventory."
++        },
++        {
++          "id": "target-network-ready",
++          "condition": "The target network and datastore identifiers resolve on cluster-platform-services-02.",
++          "evidence": "SDDC Manager workload-domain and cluster discovery output."
++        }
++      ]
++    },
++    {
++      "order": 2,
++      "id": "patch-aria-suite-lifecycle",
++      "action": "patch-lifecycle-manager",
++      "sourceInventoryId": null,
++      "targetComponent": "VCF Operations Fleet Management",
++      "description": "Back up Aria Suite Lifecycle and move 8.18.0 from Patch 1 to Patch 2 so the supported VCF 9 migration workflows are available.",
++      "gates": [
++        {
++          "id": "aria-suite-lifecycle-backup-current",
++          "condition": "A restorable Aria Suite Lifecycle backup exists before its patch is applied.",
++          "evidence": "Successful backup job on sftp-backup-central and restore-point inventory."
++        },
++        {
++          "id": "aria-suite-lifecycle-patch2-installed",
++          "condition": "Aria Suite Lifecycle 8.18 Patch 2 is installed before a VCF 9 migration workflow starts.",
++          "evidence": "Lifecycle appliance patch inventory reports 8.18 Patch 2."
++        }
++      ]
++    },
++    {
++      "order": 3,
++      "id": "upgrade-vcf-operations",
++      "action": "in-place-upgrade-and-enroll-fleet-management",
++      "sourceInventoryId": "aria-ops-central",
++      "targetComponent": "VCF Operations",
++      "description": "Upgrade Aria Operations 8.18.3 in place to VCF Operations 9.0.2 and enroll its newly deployed Fleet Management capability.",
++      "gates": [
++        {
++          "id": "operations-cluster-healthy",
++          "condition": "Every Aria Operations analytics node is online and the cluster reports healthy.",
++          "evidence": "Pre-upgrade cluster-status export for aria-ops-central."
++        },
++        {
++          "id": "operations-backup-current",
++          "condition": "A current supported backup of aria-ops-central is restorable before upgrade.",
++          "evidence": "Successful backup job and restore-point inventory on sftp-backup-central."
++        },
++        {
++          "id": "operations-preupgrade-assessment-clean",
++          "condition": "The Operations pre-upgrade assessment has no unresolved blocking findings.",
++          "evidence": "Saved pre-upgrade assessment report for source version 8.18.3."
++        },
++        {
++          "id": "operations-source-supported",
++          "condition": "The source is exactly Aria Operations 8.18.3 and is admitted by the pinned 9.0.2 path.",
++          "evidence": "Inventory version match against the pinned compatibility snapshot."
++        }
++      ]
++    },
++    {
++      "order": 4,
++      "id": "upgrade-vcf-automation",
++      "action": "import-and-upgrade",
++      "sourceInventoryId": "aria-auto-central",
++      "targetComponent": "VCF Automation",
++      "description": "Import Aria Automation 8.18.1 from Aria Suite Lifecycle into Fleet Management and run the supported VCF Automation 9.0.2 upgrade.",
++      "gates": [
++        {
++          "id": "automation-backup-current",
++          "condition": "A current supported backup of aria-auto-central is restorable before import and upgrade.",
++          "evidence": "Successful Automation backup job and restore-point inventory."
++        },
++        {
++          "id": "identity-broker-enabled",
++          "condition": "VCF Identity Broker 9.0.2 is enabled before Automation identity cutover.",
++          "evidence": "Fleet dependency inventory reports VCF Identity Broker status enabled."
++        },
++        {
++          "id": "automation-import-discovered",
++          "condition": "Fleet Management discovers aria-auto-central from Aria Suite Lifecycle as an import candidate.",
++          "evidence": "Fleet Management discovery result names aria-auto-central and version 8.18.1."
++        },
++        {
++          "id": "automation-source-supported",
++          "condition": "The source is exactly Aria Automation 8.18.1 and is admitted by the pinned 9.0.2 path.",
++          "evidence": "Inventory version match against the pinned compatibility snapshot."
++        }
++      ]
++    },
++    {
++      "order": 5,
++      "id": "deploy-vcf-operations-for-logs",
++      "action": "fresh-deploy-in-parallel",
++      "sourceInventoryId": "aria-logs-central",
++      "targetComponent": "VCF Operations for Logs",
++      "description": "Fresh-deploy the three-node VCF Operations for Logs 9.0.2 target while the 8.18.4 source continues to ingest.",
++      "gates": [
++        {
++          "id": "logs-target-sizing-validated",
++          "condition": "The three medium log nodes cover 170 GiB/day and 260 active connections.",
++          "evidence": "Placement capacity comparison against serviceDemand.logs."
++        },
++        {
++          "id": "logs-parallel-dns-and-ip-ready",
++          "condition": "Distinct target addresses on the workload-domain segment are ready for parallel log deployment.",
++          "evidence": "Forward and reverse DNS, address reservation, and reachability checks."
++        },
++        {
++          "id": "logs-source-remains-online",
++          "condition": "The Aria Operations for Logs 8.18.4 cluster remains online during target deployment.",
++          "evidence": "Source cluster status captured immediately after target deployment."
++        }
++      ]
++    },
++    {
++      "order": 6,
++      "id": "migrate-logs-content-and-configuration",
++      "action": "export-import-and-reconfigure",
++      "sourceInventoryId": "aria-logs-central",
++      "targetComponent": "VCF Operations for Logs",
++      "description": "Export and import compatible custom log content, recreate integrations, and redirect a test slice of ingestion to the parallel target.",
++      "gates": [
++        {
++          "id": "logs-custom-content-exported",
++          "condition": "Every custom Logs content ID in the carry-forward set has an export artifact.",
++          "evidence": "Export manifest keyed by the fixture content IDs."
++        },
++        {
++          "id": "logs-integrations-inventory-complete",
++          "condition": "Every inventoried Logs integration, endpoint, and agent fleet has a target disposition.",
++          "evidence": "Artifact content disposition covers every fixture configuration ID."
++        },
++        {
++          "id": "logs-target-ingestion-validated",
++          "condition": "Test events arrive on the new cluster and populate the migrated fields, alerts, and dashboards.",
++          "evidence": "Target ingestion smoke-test results for each migrated content type."
++        }
++      ]
++    },
++    {
++      "order": 7,
++      "id": "transfer-logs-90-day-data",
++      "action": "day-n-log-data-transfer",
++      "sourceInventoryId": "aria-logs-central",
++      "targetComponent": "VCF Operations for Logs",
++      "description": "Run the supported Day-N transfer for zero-to-90-day history after connectivity, time, and vCenter licensing checks pass.",
++      "gates": [
++        {
++          "id": "logs-transfer-ports-ready",
++          "condition": "Required transfer connectivity, including Cassandra inter-node ports, succeeds end to end.",
++          "evidence": "Recorded source-to-target connectivity tests for the transfer path."
++        },
++        {
++          "id": "logs-time-sync-aligned",
++          "condition": "Source and target log clusters report synchronized time from the same NTP service.",
++          "evidence": "NTP status and offset capture from every source and target node."
++        },
++        {
++          "id": "logs-vcenter-license-valid",
++          "condition": "The associated vCenter has a current license that permits the log-data transfer workflow.",
++          "evidence": "vCenter licensing inventory captured before transfer."
++        },
++        {
++          "id": "logs-90-day-transfer-complete",
++          "condition": "The supported zero-to-90-day historical log transfer reaches 100 percent.",
++          "evidence": "Completed Day-N transfer report and target time-range query."
++        }
++      ]
++    },
++    {
++      "order": 8,
++      "id": "cutover-and-retire-legacy-logs",
++      "action": "cutover-and-retire-source",
++      "sourceInventoryId": "aria-logs-central",
++      "targetComponent": "VCF Operations for Logs",
++      "description": "Cut all live log sources to the validated target and retire only the legacy Logs cluster after ingestion and content remain stable.",
++      "gates": [
++        {
++          "id": "logs-live-ingestion-stable",
++          "condition": "All live log sources remain on the target with stable ingestion after cutover.",
++          "evidence": "Per-source ingestion comparison captured after the cutover window."
++        },
++        {
++          "id": "logs-content-validation-complete",
++          "condition": "Migrated Logs dashboards, alerts, extracted fields, and custom content pass validation.",
++          "evidence": "Post-cutover validation results keyed by every carried content ID."
++        },
++        {
++          "id": "management-domain-unchanged",
++          "condition": "Final discovery shows no configuration or placement change in mgmt-domain-01.",
++          "evidence": "Before-and-after management-domain SDK inventory diff."
++        }
++      ]
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/research-sources.md b/research-sources.md
+new file mode 100644
+index 0000000..c7ac6ff
+--- /dev/null
++++ b/research-sources.md
+@@ -0,0 +1,20 @@
++# Broadcom research record
++
++Accessed 2026-08-15. These were the live Broadcom pages consulted for this design.
++
++| Page | Decision informed |
++|---|---|
++| [Update Sequence for VCF 9.0 and Compatible VMware Products](https://knowledge.broadcom.com/external/article/390634/) | Aria Suite Lifecycle must reach 8.18 Patch 2; Operations precedes Automation; Logs 9.0 is a fresh deployment and allows a Day-N transfer of up to 90 days. |
++| [Upgrading VMware Aria Operations 8.x to VCF Operations 9.0 using VMware Aria Suite Lifecycle](https://knowledge.broadcom.com/external/article/433805/) | Use the supported in-place Operations upgrade workflow and deploy Fleet Management as part of it. |
++| [Import and upgrade VMware Aria Automation 8.x to VCF Automation 9.0](https://knowledge.broadcom.com/external/article/433806/) | Import the existing Automation instance from legacy Aria Suite Lifecycle into Fleet Management before triggering the 9.0 upgrade. |
++| [Upgrade Guidance for Aria Operations for Logs 8.18.x to VCF Operations for Logs 9.0.x](https://knowledge.broadcom.com/external/article/402314/) | Run source and target Logs clusters in parallel, recreate integrations on the new deployment, and limit historical transfer to 90 days. |
++| [VCF Operations 9.0 Sizing Guidelines](https://knowledge.broadcom.com/external/article/397782/) | Select medium Operations analytics nodes, a standard unified cloud proxy, and a production Logs cluster of at least three medium nodes. |
++| [End of General Support for VMware Aria Operations 8.18](https://knowledge.broadcom.com/external/article/422643/) | Confirm that the exact inventoried VMware Aria Operations 8.18.3 release is governed by the 8.18 end-of-general-support boundary of 2027-10-11. |
++| [Build numbers and versions for VMware Aria Automation](https://knowledge.broadcom.com/external/article/318130/) | Confirm that the exact inventoried Automation 8.18.1 release has an end-of-general-support boundary of 2027-10-11. |
++| [Product Lifecycle matrix for Aria Suite](https://knowledge.broadcom.com/external/article/381187/) | Check the exact inventoried VMware Aria Operations for Logs 8.18.4 release under the 8.18 lifecycle entry and record its 2027-10-11 end-of-general-support boundary. |
++| [After upgrading Aria Automation 8.18 to VCF Automation 9.0.0.0](https://knowledge.broadcom.com/external/article/422762/) | Abandon legacy CSP login bookmarks and the vIDM login integration in favor of VCF Identity Broker routing. |
++| [Aria Operations Management Pack for Storage Devices unavailable from Broadcom Marketplace](https://knowledge.broadcom.com/external/article/429591/) | Abandon the inventoried Storage Devices management pack because support concluded with Aria Operations 8.18.3 and VCF Operations 9 uses integrated Storage Operations instead. |
++| [The Windows agent is not available when trying to download the client from within VMware Cloud Foundation Operations for Logs](https://knowledge.broadcom.com/external/article/402647/) | Retain compatible Logs 8.18 Windows agents and explicitly configure trust for the 9.0 target. |
++| [Upgrade of Aria Operations 8.18.6 or 8.18.7 to VCF Operations 9.0.x is Unsupported](https://knowledge.broadcom.com/external/article/438994/) | Confirm the newly published exclusion concerns 8.18.6/8.18.7, not the inventoried 8.18.3 source; never generalize 8.18.x compatibility without checking the exact patch version. |
++
++No consulted live source contradicted the pinned decisions for the exact inventoried versions. The pinned snapshot remains the deterministic artifact authority.

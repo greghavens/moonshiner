@@ -1,0 +1,288 @@
+diff --git a/vcf_architecture/__init__.py b/vcf_architecture/__init__.py
+new file mode 100644
+index 0000000..8f8e743
+--- /dev/null
++++ b/vcf_architecture/__init__.py
+@@ -0,0 +1,5 @@
++"""Generate machine-readable VMware Cloud Foundation architecture artifacts."""
++
++from .planner import build_migration_plan, build_sddc_spec
++
++__all__ = ["build_migration_plan", "build_sddc_spec"]
+diff --git a/vcf_architecture/__main__.py b/vcf_architecture/__main__.py
+new file mode 100644
+index 0000000..dac8013
+--- /dev/null
++++ b/vcf_architecture/__main__.py
+@@ -0,0 +1,60 @@
++from __future__ import annotations
++
++import argparse
++import json
++import os
++from pathlib import Path
++import tempfile
++from typing import Any
++
++from .planner import build_migration_plan, build_sddc_spec
++
++
++def load_json(path: Path) -> dict[str, Any]:
++    with path.open("r", encoding="utf-8") as handle:
++        value = json.load(handle)
++    if not isinstance(value, dict):
++        raise ValueError(f"{path} must contain a JSON object")
++    return value
++
++
++def write_json(path: Path, value: dict[str, Any]) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    payload = json.dumps(value, indent=2, sort_keys=True) + "\n"
++    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent, text=True)
++    try:
++        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
++            handle.write(payload)
++        os.replace(temporary_name, path)
++    except BaseException:
++        try:
++            os.unlink(temporary_name)
++        except FileNotFoundError:
++            pass
++        raise
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description="Build VCF architecture JSON artifacts")
++    parser.add_argument("--requirements", type=Path, required=True)
++    parser.add_argument("--inventory", type=Path, required=True)
++    parser.add_argument("--compatibility", type=Path, required=True)
++    parser.add_argument("--output-dir", type=Path, required=True)
++    return parser.parse_args()
++
++
++def main() -> int:
++    args = parse_args()
++    requirements = load_json(args.requirements)
++    inventory = load_json(args.inventory)
++    compatibility = load_json(args.compatibility)
++    write_json(args.output_dir / "sddc-spec.json", build_sddc_spec(requirements, compatibility))
++    write_json(
++        args.output_dir / "migration-plan.json",
++        build_migration_plan(inventory, compatibility),
++    )
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/vcf_architecture/planner.py b/vcf_architecture/planner.py
+new file mode 100644
+index 0000000..924d4b3
+--- /dev/null
++++ b/vcf_architecture/planner.py
+@@ -0,0 +1,180 @@
++from __future__ import annotations
++
++from copy import deepcopy
++import math
++from typing import Any
++
++
++def balanced_distribution(total: int, sites: list[str]) -> dict[str, int]:
++    quotient, remainder = divmod(total, len(sites))
++    return {site: quotient + (1 if index < remainder else 0) for index, site in enumerate(sites)}
++
++
++def capacity_result(requirements: dict[str, Any], compatibility: dict[str, Any]) -> dict[str, Any]:
++    demand = requirements["capacity"]["workloadDemand"]
++    host = requirements["capacity"]["workloadHostProfile"]
++    policy = compatibility["capacityPolicy"]
++    reserve = requirements["availability"]["workloadHostFailures"]
++    by_resource = {
++        "cpu": math.ceil(demand["vCpu"] / (host["physicalCores"] * policy["cpuUtilizationLimit"]))
++        + reserve,
++        "memory": math.ceil(demand["memoryGiB"] / (host["memoryGiB"] * policy["memoryUtilizationLimit"]))
++        + reserve,
++        "storage": math.ceil(
++            demand["usableStorageTiB"]
++            / (
++                host["rawStorageTiB"]
++                * policy["storageUtilizationLimit"]
++                * policy["storageProtectionCapacityFactor"]
++            )
++        )
++        + reserve,
++    }
++    return {
++        "workloadDemand": deepcopy(demand),
++        "workloadHostProfile": deepcopy(host),
++        "policy": deepcopy(policy),
++        "failureReserveHosts": reserve,
++        "requiredHostsByResource": by_resource,
++        "selectedWorkloadHostCount": max(by_resource.values()),
++    }
++
++
++def edge_result(requirements: dict[str, Any], compatibility: dict[str, Any]) -> dict[str, Any]:
++    edge_input = requirements["edge"]
++    peak = edge_input["peakNorthSouthGbps"]
++    candidates = sorted(
++        (
++            form
++            for form in compatibility["edge"]["formFactors"]
++            if form["validatedThroughputGbps"] >= peak
++        ),
++        key=lambda form: (form["validatedThroughputGbps"], form["name"]),
++    )
++    if not candidates:
++        raise ValueError(f"no supported Edge form factor can carry {peak} Gbps")
++    selected = candidates[0]
++    failures = requirements["availability"]["edgeNodeFailures"]
++    survivors = edge_input["nodeCount"] - failures
++    if survivors < 1:
++        raise ValueError("Edge failure requirement leaves no surviving node")
++    sites = edge_input["placementSites"]
++    if len(sites) != edge_input["nodeCount"]:
++        raise ValueError("this design requires one Edge node per placement site")
++    nodes = [
++        {
++            "name": f"{site}-edge01",
++            "site": site,
++            "formFactor": selected["name"],
++        }
++        for site in sites
++    ]
++    return {
++        "peakNorthSouthGbps": peak,
++        "formFactor": selected["name"],
++        "perNodeValidatedThroughputGbps": selected["validatedThroughputGbps"],
++        "nodeCount": edge_input["nodeCount"],
++        "survivingNodesAfterFailure": survivors,
++        "postFailureCapacityGbps": survivors * selected["validatedThroughputGbps"],
++        "headroomGbps": selected["validatedThroughputGbps"] - peak,
++        "haMode": edge_input["haMode"],
++        "nodes": nodes,
++        "uplinkLayout": selected["uplinkLayout"],
++        "uplinks": deepcopy(compatibility["edge"]["uplinkLayouts"][selected["uplinkLayout"]]),
++    }
++
++
++def build_sddc_spec(requirements: dict[str, Any], compatibility: dict[str, Any]) -> dict[str, Any]:
++    installer = requirements["installer"]
++    capacity = capacity_result(requirements, compatibility)
++    management_sites = requirements["availability"]["managementAvailabilityZones"]
++    management_distribution = {site: 0 for site in management_sites}
++    for host in installer["managementHosts"]:
++        management_distribution[host["site"]] += 1
++    workload_sites = requirements["availability"]["workloadAvailabilityZones"]
++    clusters = [
++        {
++            "id": installer["sddcId"],
++            "kind": "MANAGEMENT",
++            "hostCount": len(installer["managementHosts"]),
++            "siteDistribution": management_distribution,
++            "witnessSite": requirements["availability"]["witnessSite"],
++        },
++        {
++            "id": requirements["capacity"]["workloadClusterId"],
++            "kind": "VI_WORKLOAD",
++            "hostCount": capacity["selectedWorkloadHostCount"],
++            "siteDistribution": balanced_distribution(
++                capacity["selectedWorkloadHostCount"], workload_sites
++            ),
++            "witnessSite": requirements["availability"]["witnessSite"],
++        },
++    ]
++    dvs = deepcopy(installer["dvs"])
++    dvs["networks"] = [network["networkType"] for network in installer["networks"]]
++    return {
++        "sddcId": installer["sddcId"],
++        "workflowType": requirements["workflowType"],
++        "version": requirements["targetVcfVersion"],
++        "vcfInstanceName": requirements["vcfInstanceName"],
++        "hostSpecs": [{"hostname": host["hostname"]} for host in installer["managementHosts"]],
++        "vcenterSpec": deepcopy(installer["vcenterSpec"]),
++        "dvsSpecs": [dvs],
++        "networkSpecs": deepcopy(installer["networks"]),
++        "dnsSpec": deepcopy(installer["dnsSpec"]),
++        "ntpServers": list(installer["ntpServers"]),
++        "managementPoolName": installer["managementPoolName"],
++        "x-vcfArchitecture": {
++            "architectureId": requirements["architectureId"],
++            "sites": deepcopy(requirements["sites"]),
++            "availability": deepcopy(requirements["availability"]),
++            "clusters": clusters,
++            "capacity": capacity,
++            "edge": edge_result(requirements, compatibility),
++        },
++    }
++
++
++def build_migration_plan(inventory: dict[str, Any], compatibility: dict[str, Any]) -> dict[str, Any]:
++    available = {
++        gate
++        for gate in compatibility["externalGates"]
++        if inventory.get("externalGates", {}).get(gate) is True
++    }
++    remaining = list(inventory["components"])
++    steps: list[dict[str, Any]] = []
++    while remaining:
++        selected_index = None
++        selected_transition = None
++        for index, component in enumerate(remaining):
++            options = [
++                transition
++                for transition in compatibility["transitions"].get(component["id"], [])
++                if transition["from"] == component["version"]
++                and set(transition["requires"]).issubset(available)
++            ]
++            if options:
++                selected_index = index
++                selected_transition = options[0]
++                break
++        if selected_index is None or selected_transition is None:
++            blocked = ", ".join(component["id"] for component in remaining)
++            raise ValueError(f"no supported ordered migration remains for: {blocked}")
++        component = remaining.pop(selected_index)
++        steps.append(
++            {
++                "order": len(steps) + 1,
++                "componentId": component["id"],
++                "componentName": component["name"],
++                "currentVersion": component["version"],
++                "action": selected_transition["action"],
++                "target": deepcopy(selected_transition["target"]),
++                "gates": list(selected_transition["requires"]),
++            }
++        )
++        available.update(selected_transition["provides"])
++    return {
++        "estateId": inventory["estateId"],
++        "targetVcfVersion": inventory["targetVcfVersion"],
++        "steps": steps,
++    }
+diff --git a/research-consulted.json b/research-consulted.json
+new file mode 100644
+--- /dev/null
++++ b/research-consulted.json
+@@ -0,0 +1,20 @@
++[
++  {
++    "note": "Checked the current Broadcom compatibility listings and the 9.1 support notice before applying the pinned scenario data.",
++    "retrievalDate": "2026-08-14",
++    "title": "Broadcom VMware Hardware Compatibility Guide",
++    "url": "https://compatibilityguide.broadcom.com/search?persona=live&productId=47995&program=server"
++  },
++  {
++    "note": "Checked the required 9.0.x to 9.1 upgrade sequence, Management Services migration, Identity Broker migration, and Fleet Management Appliance retirement guidance.",
++    "retrievalDate": "2026-08-14",
++    "title": "Upgrade Sequence and Related Issues for VMware Cloud Foundation and vSphere Foundation 9.1",
++    "url": "https://knowledge.broadcom.com/external/article/440630/upgrade-sequence-and-related-issues-for.html"
++  },
++  {
++    "note": "Checked the supported VCF 9.x Edge form factors and the availability implications of resizing one Edge node at a time.",
++    "retrievalDate": "2026-08-14",
++    "title": "VMware Cloud Foundation NSX-T Edge Node Virtual Machine Resizing Tool",
++    "url": "https://knowledge.broadcom.com/external/article/312196/vmware-cloud-foundation-nsxt-edge-node-v.html"
++  }
++]

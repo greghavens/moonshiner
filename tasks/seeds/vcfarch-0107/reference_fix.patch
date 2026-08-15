@@ -1,0 +1,797 @@
+diff --git a/VcfFleetArchitecture/VcfFleetArchitecture.psm1 b/VcfFleetArchitecture/VcfFleetArchitecture.psm1
+index 8428e858fc05e4a85b5cbdb953149380406d888a..07c023f090aabde28af9644667471b104aa6d8bb 100644
+--- a/VcfFleetArchitecture/VcfFleetArchitecture.psm1
++++ b/VcfFleetArchitecture/VcfFleetArchitecture.psm1
+@@ -1,5 +1,78 @@
+ Set-StrictMode -Version Latest
+ 
++function Read-JsonDocument {
++    param(
++        [Parameter(Mandatory)]
++        [string] $Path
++    )
++
++    $resolved = Resolve-Path -LiteralPath $Path -ErrorAction Stop
++    return Get-Content -LiteralPath $resolved -Raw -Encoding utf8 | ConvertFrom-Json -Depth 100
++}
++
++function ConvertTo-LowerCamelJsonShape {
++    param(
++        [Parameter(Mandatory, ValueFromPipeline)]
++        [AllowNull()]
++        [object] $InputObject
++    )
++
++    if ($null -eq $InputObject) {
++        return $null
++    }
++
++    if ($InputObject -is [System.Collections.IDictionary]) {
++        $converted = [ordered] @{}
++        foreach ($entry in $InputObject.GetEnumerator()) {
++            if ($null -eq $entry.Value -or $entry.Key -eq 'AdditionalProperties') {
++                continue
++            }
++            $name = [string] $entry.Key
++            $lowerName = $name.Substring(0, 1).ToLowerInvariant() + $name.Substring(1)
++            $converted[$lowerName] = ConvertTo-LowerCamelJsonShape -InputObject $entry.Value
++        }
++        return $converted
++    }
++
++    if ($InputObject -is [System.Collections.IEnumerable] -and $InputObject -isnot [string]) {
++        $items = [System.Collections.Generic.List[object]]::new()
++        foreach ($item in $InputObject) {
++            $items.Add((ConvertTo-LowerCamelJsonShape -InputObject $item))
++        }
++        return ,$items.ToArray()
++    }
++
++    return $InputObject
++}
++
++function ConvertFrom-VcfSdkObject {
++    param(
++        [Parameter(Mandatory)]
++        [object] $InputObject
++    )
++
++    $sdkJson = $InputObject | ConvertTo-Json -Depth 100
++    $sdkHashtable = $sdkJson | ConvertFrom-Json -AsHashtable -Depth 100
++    return ConvertTo-LowerCamelJsonShape -InputObject $sdkHashtable
++}
++
++function Write-JsonDocument {
++    param(
++        [Parameter(Mandatory)]
++        [object] $InputObject,
++
++        [Parameter(Mandatory)]
++        [string] $Path
++    )
++
++    $json = $InputObject | ConvertTo-Json -Depth 100
++    [System.IO.File]::WriteAllText(
++        $Path,
++        $json + [Environment]::NewLine,
++        [System.Text.UTF8Encoding]::new($false)
++    )
++}
++
+ function New-VcfFleetArchitecture {
+     [CmdletBinding()]
+     param(
+@@ -17,7 +90,183 @@ function New-VcfFleetArchitecture {
+         [string] $OutputDirectory
+     )
+ 
+-    throw 'Implement the architecture generator.'
++    $inventory = Read-JsonDocument -Path $InventoryPath
++    $snapshot = Read-JsonDocument -Path $CompatibilitySnapshotPath
++    $profile = $snapshot.storageProfiles.PSObject.Properties[$StorageArchitecture].Value
++    if ($null -eq $profile) {
++        throw "The compatibility snapshot has no $StorageArchitecture profile."
++    }
++    if ($inventory.targetVcfVersion -ne $snapshot.targetFleet.version) {
++        throw 'The estate target does not match the compatibility snapshot target.'
++    }
++    if ($inventory.greenfield.hostPool.Count -lt $profile.hostCount) {
++        throw "The greenfield host pool cannot satisfy the $StorageArchitecture host count."
++    }
++
++    $greenfield = $inventory.greenfield
++    $design = $greenfield.design
++    $targetVersion = [string] $snapshot.targetFleet.version
++
++    $dnsSpec = Initialize-VcfInstallerDnsSpec `
++        -Subdomain $greenfield.dnsSubdomain `
++        -Nameservers @($greenfield.dnsServers)
++
++    $vcenterSpec = Initialize-VcfInstallerSddcVcenterSpec `
++        -VcenterHostname $greenfield.vcenterHostname `
++        -RootVcenterPassword $greenfield.vcenterRootPassword `
++        -VmSize $design.vcenterVmSize `
++        -StorageSize $design.vcenterStorageSize `
++        -SsoDomain $design.ssoDomain `
++        -Version $targetVersion `
++        -UseExistingDeployment:$design.useExistingDeployment
++
++    $clusterSpec = Initialize-VcfInstallerSddcClusterSpec `
++        -DatacenterName $design.datacenterName `
++        -ClusterName $design.clusterName
++
++    $hostSpecs = @(
++        $greenfield.hostPool |
++            Select-Object -First $profile.hostCount |
++            ForEach-Object {
++                Initialize-VcfInstallerSddcHostSpec -Hostname $_
++            }
++    )
++
++    $networkSpecs = @(
++        foreach ($network in $greenfield.networks) {
++            Initialize-VcfInstallerSddcNetworkSpec `
++                -NetworkType $network.networkType `
++                -VlanId $network.vlanId `
++                -Subnet $network.subnet `
++                -Gateway $network.gateway `
++                -SubnetMask $network.subnetMask `
++                -Mtu $network.mtu `
++                -IpAddressVersion $design.ipAddressVersion `
++                -IpAddressAssignmentMode $design.ipAddressAssignmentMode
++        }
++    )
++
++    $dvsSpecs = @(
++        foreach ($dvs in $profile.dvs) {
++            $uplinkNumber = 0
++            $mappings = @(
++                foreach ($vmnic in $dvs.vmnics) {
++                    $uplinkNumber += 1
++                    Initialize-VcfInstallerVmnicToUplink `
++                        -Id $vmnic `
++                        -Uplink "uplink$uplinkNumber"
++                }
++            )
++            Initialize-VcfInstallerDvsSpec `
++                -DvsName $dvs.name `
++                -Networks @($dvs.networks) `
++                -Mtu $design.dvsMtu `
++                -VmnicsToUplinks $mappings
++        }
++    )
++
++    $esaConfig = Initialize-VcfInstallerVsanEsaConfig -Enabled:$profile.vsanEsaEnabled
++    $vsanSpec = Initialize-VcfInstallerVsanSpec `
++        -DatastoreName $design.datastoreName `
++        -VsanDedup:$design.vsanDedup `
++        -EsaConfig $esaConfig `
++        -FailuresToTolerate $design.failuresToTolerate
++    $datastoreSpec = Initialize-VcfInstallerSddcDatastoreSpec -VsanSpec $vsanSpec
++
++    $nsxManagers = @(
++        foreach ($hostname in $greenfield.nsxManagerHostnames) {
++            Initialize-VcfInstallerNsxtManagerSpec -Hostname $hostname
++        }
++    )
++    $nsxtSpec = Initialize-VcfInstallerSddcNsxtSpec `
++        -NsxtManagers $nsxManagers `
++        -NsxtManagerSize $design.nsxtManagerSize `
++        -VipFqdn $greenfield.nsxVipFqdn `
++        -TransportVlanId $greenfield.nsxTransportVlanId `
++        -Version $targetVersion `
++        -UseExistingDeployment:$design.useExistingDeployment
++    $sddcManagerSpec = Initialize-VcfInstallerSddcManagerSpec `
++        -Hostname $greenfield.sddcManagerHostname `
++        -Version $targetVersion `
++        -UseExistingDeployment:$design.useExistingDeployment
++
++    $sddcParameters = @{
++        SddcId = $greenfield.sddcId
++        WorkflowType = $design.workflowType
++        HostSpecs = $hostSpecs
++        Version = $targetVersion
++        VcenterSpec = $vcenterSpec
++        ClusterSpec = $clusterSpec
++        DvsSpecs = $dvsSpecs
++        NsxtSpec = $nsxtSpec
++        NetworkSpecs = $networkSpecs
++        DnsSpec = $dnsSpec
++        NtpServers = @($greenfield.ntpServers)
++        SddcManagerSpec = $sddcManagerSpec
++        ManagementPoolName = $design.managementPoolName
++        CeipEnabled = $design.ceipEnabled
++        SkipEsxThumbprintValidation = $design.skipEsxThumbprintValidation
++        SkipGatewayPingValidation = $design.skipGatewayPingValidation
++        DatastoreSpec = $datastoreSpec
++        VcfInstanceName = $greenfield.vcfInstanceName
++    }
++    $sdkSddcSpec = Initialize-VcfInstallerSddcSpec @sddcParameters
++    $sddcSpec = ConvertFrom-VcfSdkObject -InputObject $sdkSddcSpec
++
++    $manifest = [ordered] @{
++        schemaVersion = '1.0'
++        inventoryId = $inventory.inventoryId
++        targetVcfVersion = $targetVersion
++        storageArchitecture = $StorageArchitecture
++        hostCount = [int] $profile.hostCount
++        physicalNicsPerHost = [int] $profile.physicalNicsPerHost
++        physicalNicSpeedGbps = [int] $profile.physicalNicSpeedGbps
++        networkTopology = $profile.networkTopology
++        sddcSpecPath = 'sddc-spec.json'
++        migrationPlanPath = 'migration-plan.json'
++    }
++
++    $steps = @(
++        foreach ($component in $inventory.components) {
++            $rule = $snapshot.componentRules.PSObject.Properties[$component.id].Value
++            if ($null -eq $rule) {
++                throw "The compatibility snapshot has no rule for component $($component.id)."
++            }
++            [ordered] @{
++                order = [int] $rule.order
++                componentId = $component.id
++                componentName = $component.name
++                componentType = $component.type
++                currentVersion = $component.version
++                targetProduct = $rule.targetProduct
++                targetVersion = $rule.targetVersion
++                upgradePath = @($rule.upgradePath)
++                action = $rule.action
++                gates = @($rule.requiredGates)
++                after = @($rule.after)
++                outcome = "$($component.name) is managed as $($rule.targetProduct) $($rule.targetVersion) in $($inventory.fleetName)."
++            }
++        }
++    ) | Sort-Object -Property order
++
++    $migrationPlan = [ordered] @{
++        schemaVersion = '1.0'
++        inventoryId = $inventory.inventoryId
++        targetFleet = [ordered] @{
++            name = $inventory.fleetName
++            product = $snapshot.targetFleet.product
++            version = $targetVersion
++            onboardingMode = $snapshot.targetFleet.onboardingMode
++        }
++        gates = @($snapshot.gateCatalog)
++        steps = @($steps)
++    }
++
++    $null = New-Item -ItemType Directory -Path $OutputDirectory -Force
++    $resolvedOutput = (Resolve-Path -LiteralPath $OutputDirectory).Path
++    Write-JsonDocument -InputObject $sddcSpec -Path (Join-Path $resolvedOutput 'sddc-spec.json')
++    Write-JsonDocument -InputObject $manifest -Path (Join-Path $resolvedOutput 'architecture-manifest.json')
++    Write-JsonDocument -InputObject $migrationPlan -Path (Join-Path $resolvedOutput 'migration-plan.json')
+ }
+ 
+ Export-ModuleMember -Function New-VcfFleetArchitecture
+diff --git a/artifacts/architecture-manifest.json b/artifacts/architecture-manifest.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..82d3a6578391812db567324e31ef388e0725d160
+--- /dev/null
++++ b/artifacts/architecture-manifest.json
+@@ -0,0 +1,12 @@
++{
++  "schemaVersion": "1.0",
++  "inventoryId": "northwind-chicago-estate",
++  "targetVcfVersion": "9.1.0.0",
++  "storageArchitecture": "ESA",
++  "hostCount": 4,
++  "physicalNicsPerHost": 4,
++  "physicalNicSpeedGbps": 25,
++  "networkTopology": "DEDICATED_VSAN_UPLINKS",
++  "sddcSpecPath": "sddc-spec.json",
++  "migrationPlanPath": "migration-plan.json"
++}
+diff --git a/artifacts/migration-plan.json b/artifacts/migration-plan.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..224da0851d7190eb40189444d93d5a695905dd17
+--- /dev/null
++++ b/artifacts/migration-plan.json
+@@ -0,0 +1,274 @@
++{
++  "schemaVersion": "1.0",
++  "inventoryId": "northwind-chicago-estate",
++  "targetFleet": {
++    "name": "northwind-vcf-fleet",
++    "product": "VMware Cloud Foundation",
++    "version": "9.1.0.0",
++    "onboardingMode": "VCF_INSTALLER_CONVERGE"
++  },
++  "gates": [
++    {
++      "id": "dr-recovery-state-exported",
++      "description": "Export the existing recovery configuration before convergence.",
++      "satisfiedBy": "A restorable export of protection groups, recovery plans, pairings, and replication state is recorded."
++    },
++    {
++      "id": "dr-lsr-vr-converged",
++      "description": "Converge standalone Live Site Recovery and vSphere Replication before vCenter 9.1.",
++      "satisfiedBy": "Both standalone appliances have completed the supported 9.0.4 convergence path."
++    },
++    {
++      "id": "installer-convergence-precheck",
++      "description": "Run the VCF Installer convergence precheck for the vCenter, vSAN, and NSX estate.",
++      "satisfiedBy": "The VCF Installer returns a successful convergence validation."
++    },
++    {
++      "id": "nsx-backup-current",
++      "description": "Protect NSX state before its convergence transition.",
++      "satisfiedBy": "A current NSX Manager backup has completed and restore settings have been checked."
++    },
++    {
++      "id": "nsx-upgrade-path-supported",
++      "description": "Confirm that NSX 4.2.3.3 can follow the pinned direct path to NSX 9.1.",
++      "satisfiedBy": "The VCF Installer interoperability precheck accepts NSX 4.2.3.3 to 9.1.0.0."
++    },
++    {
++      "id": "vcf-management-services-ready",
++      "description": "Prepare the VCF 9.1 fleet management services used by the convergence workflow.",
++      "satisfiedBy": "VCF Management Services and the fleet lifecycle services report ready."
++    },
++    {
++      "id": "vcf-license-ready",
++      "description": "Prepare VCF 9.1 license service integration before vCenter convergence.",
++      "satisfiedBy": "The VCF license server is reachable and the target fleet entitlement is available."
++    },
++    {
++      "id": "dr-convergence-complete",
++      "description": "Finish the recovery-appliance convergence before changing vCenter major version.",
++      "satisfiedBy": "The Live Site Recovery and vSphere Replication transition steps are complete."
++    },
++    {
++      "id": "vcenter-at-target",
++      "description": "Upgrade hosts only after the managing vCenter reaches the target version.",
++      "satisfiedBy": "vCenter reports version 9.1.0.0 and healthy services."
++    },
++    {
++      "id": "cluster-vlcm-image-compliant",
++      "description": "Use a compatible vSphere Lifecycle Manager image for the host transition.",
++      "satisfiedBy": "The cluster image precheck is clean for the target ESXi image."
++    },
++    {
++      "id": "all-esxi-at-target",
++      "description": "Complete every ESXi transition before closing the vSAN lifecycle step.",
++      "satisfiedBy": "All four inventory hosts report ESXi 9.1.0.0."
++    },
++    {
++      "id": "vsan-health-green",
++      "description": "Require a healthy vSAN OSA cluster around the lifecycle transition.",
++      "satisfiedBy": "vSAN health and object resynchronization checks are green."
++    }
++  ],
++  "steps": [
++    {
++      "order": 10,
++      "componentId": "lsr-dr01",
++      "componentName": "chi01 Live Site Recovery",
++      "componentType": "LIVE_SITE_RECOVERY",
++      "currentVersion": "9.0.2",
++      "targetProduct": "VCF Protection and Recovery",
++      "targetVersion": "9.1.0.0",
++      "upgradePath": [
++        "9.0.2",
++        "9.0.4",
++        "9.1.0.0"
++      ],
++      "action": "CONVERGE",
++      "gates": [
++        "dr-recovery-state-exported"
++      ],
++      "after": [],
++      "outcome": "chi01 Live Site Recovery is managed as VCF Protection and Recovery 9.1.0.0 in northwind-vcf-fleet."
++    },
++    {
++      "order": 20,
++      "componentId": "vr-dr01",
++      "componentName": "chi01 vSphere Replication",
++      "componentType": "VSPHERE_REPLICATION",
++      "currentVersion": "9.0.2",
++      "targetProduct": "VCF Protection and Recovery",
++      "targetVersion": "9.1.0.0",
++      "upgradePath": [
++        "9.0.2",
++        "9.0.4",
++        "9.1.0.0"
++      ],
++      "action": "CONVERGE",
++      "gates": [
++        "dr-recovery-state-exported",
++        "dr-lsr-vr-converged"
++      ],
++      "after": [
++        "lsr-dr01"
++      ],
++      "outcome": "chi01 vSphere Replication is managed as VCF Protection and Recovery 9.1.0.0 in northwind-vcf-fleet."
++    },
++    {
++      "order": 30,
++      "componentId": "nsx-m01",
++      "componentName": "chi01 NSX Manager cluster",
++      "componentType": "NSX",
++      "currentVersion": "4.2.3.3",
++      "targetProduct": "VMware NSX",
++      "targetVersion": "9.1.0.0",
++      "upgradePath": [
++        "4.2.3.3",
++        "9.1.0.0"
++      ],
++      "action": "CONVERGE",
++      "gates": [
++        "installer-convergence-precheck",
++        "nsx-backup-current",
++        "nsx-upgrade-path-supported",
++        "vcf-management-services-ready"
++      ],
++      "after": [
++        "vr-dr01"
++      ],
++      "outcome": "chi01 NSX Manager cluster is managed as VMware NSX 9.1.0.0 in northwind-vcf-fleet."
++    },
++    {
++      "order": 40,
++      "componentId": "vc-m01",
++      "componentName": "chi01-m01-vc01.corp.northwind.example",
++      "componentType": "VCENTER",
++      "currentVersion": "8.0 U3e",
++      "targetProduct": "VMware vCenter Server",
++      "targetVersion": "9.1.0.0",
++      "upgradePath": [
++        "8.0 U3e",
++        "9.1.0.0"
++      ],
++      "action": "CONVERGE",
++      "gates": [
++        "dr-convergence-complete",
++        "installer-convergence-precheck",
++        "vcf-license-ready"
++      ],
++      "after": [
++        "nsx-m01"
++      ],
++      "outcome": "chi01-m01-vc01.corp.northwind.example is managed as VMware vCenter Server 9.1.0.0 in northwind-vcf-fleet."
++    },
++    {
++      "order": 50,
++      "componentId": "esx-m01-01",
++      "componentName": "chi01-m01-esx01.corp.northwind.example",
++      "componentType": "ESXI",
++      "currentVersion": "8.0 U3e",
++      "targetProduct": "VMware ESXi",
++      "targetVersion": "9.1.0.0",
++      "upgradePath": [
++        "8.0 U3e",
++        "9.1.0.0"
++      ],
++      "action": "UPGRADE",
++      "gates": [
++        "vcenter-at-target",
++        "cluster-vlcm-image-compliant"
++      ],
++      "after": [
++        "vc-m01"
++      ],
++      "outcome": "chi01-m01-esx01.corp.northwind.example is managed as VMware ESXi 9.1.0.0 in northwind-vcf-fleet."
++    },
++    {
++      "order": 60,
++      "componentId": "esx-m01-02",
++      "componentName": "chi01-m01-esx02.corp.northwind.example",
++      "componentType": "ESXI",
++      "currentVersion": "8.0 U3e",
++      "targetProduct": "VMware ESXi",
++      "targetVersion": "9.1.0.0",
++      "upgradePath": [
++        "8.0 U3e",
++        "9.1.0.0"
++      ],
++      "action": "UPGRADE",
++      "gates": [
++        "vcenter-at-target",
++        "cluster-vlcm-image-compliant"
++      ],
++      "after": [
++        "esx-m01-01"
++      ],
++      "outcome": "chi01-m01-esx02.corp.northwind.example is managed as VMware ESXi 9.1.0.0 in northwind-vcf-fleet."
++    },
++    {
++      "order": 70,
++      "componentId": "esx-m01-03",
++      "componentName": "chi01-m01-esx03.corp.northwind.example",
++      "componentType": "ESXI",
++      "currentVersion": "8.0 U3d",
++      "targetProduct": "VMware ESXi",
++      "targetVersion": "9.1.0.0",
++      "upgradePath": [
++        "8.0 U3d",
++        "9.1.0.0"
++      ],
++      "action": "UPGRADE",
++      "gates": [
++        "vcenter-at-target",
++        "cluster-vlcm-image-compliant"
++      ],
++      "after": [
++        "esx-m01-02"
++      ],
++      "outcome": "chi01-m01-esx03.corp.northwind.example is managed as VMware ESXi 9.1.0.0 in northwind-vcf-fleet."
++    },
++    {
++      "order": 80,
++      "componentId": "esx-m01-04",
++      "componentName": "chi01-m01-esx04.corp.northwind.example",
++      "componentType": "ESXI",
++      "currentVersion": "8.0 U3d",
++      "targetProduct": "VMware ESXi",
++      "targetVersion": "9.1.0.0",
++      "upgradePath": [
++        "8.0 U3d",
++        "9.1.0.0"
++      ],
++      "action": "UPGRADE",
++      "gates": [
++        "vcenter-at-target",
++        "cluster-vlcm-image-compliant"
++      ],
++      "after": [
++        "esx-m01-03"
++      ],
++      "outcome": "chi01-m01-esx04.corp.northwind.example is managed as VMware ESXi 9.1.0.0 in northwind-vcf-fleet."
++    },
++    {
++      "order": 90,
++      "componentId": "vsan-m01",
++      "componentName": "chi01 management vSAN OSA datastore",
++      "componentType": "VSAN",
++      "currentVersion": "8.0 U3 OSA",
++      "targetProduct": "VMware vSAN OSA",
++      "targetVersion": "9.1.0.0",
++      "upgradePath": [
++        "8.0 U3 OSA",
++        "9.1.0.0"
++      ],
++      "action": "UPGRADE",
++      "gates": [
++        "all-esxi-at-target",
++        "vsan-health-green"
++      ],
++      "after": [
++        "esx-m01-04"
++      ],
++      "outcome": "chi01 management vSAN OSA datastore is managed as VMware vSAN OSA 9.1.0.0 in northwind-vcf-fleet."
++    }
++  ]
++}
+diff --git a/artifacts/sddc-spec.json b/artifacts/sddc-spec.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..ab60cdc2ec4b6fefa754fb779087fa7bb53195f8
+--- /dev/null
++++ b/artifacts/sddc-spec.json
+@@ -0,0 +1,172 @@
++{
++  "sddcId": "chi01-m01",
++  "workflowType": "VCF",
++  "hostSpecs": [
++    {
++      "hostname": "chi01-m01-esx01"
++    },
++    {
++      "hostname": "chi01-m01-esx02"
++    },
++    {
++      "hostname": "chi01-m01-esx03"
++    },
++    {
++      "hostname": "chi01-m01-esx04"
++    }
++  ],
++  "version": "9.1.0.0",
++  "vcenterSpec": {
++    "vcenterHostname": "chi01-m01-vc01",
++    "rootVcenterPassword": "Replace-Vc9!Pass",
++    "vmSize": "medium",
++    "storageSize": "lstorage",
++    "ssoDomain": "vsphere.local",
++    "version": "9.1.0.0",
++    "useExistingDeployment": false
++  },
++  "clusterSpec": {
++    "datacenterName": "chi01-m01-dc",
++    "clusterName": "chi01-m01-cl01"
++  },
++  "dvsSpecs": [
++    {
++      "dvsName": "chi01-m01-vds01",
++      "networks": [
++        "MANAGEMENT",
++        "VMOTION",
++        "VM_MANAGEMENT",
++        "FLEET_MANAGEMENT"
++      ],
++      "mtu": 9000,
++      "vmnicsToUplinks": [
++        {
++          "id": "vmnic0",
++          "uplink": "uplink1"
++        },
++        {
++          "id": "vmnic1",
++          "uplink": "uplink2"
++        }
++      ]
++    },
++    {
++      "dvsName": "chi01-m01-vds02-vsan",
++      "networks": [
++        "VSAN"
++      ],
++      "mtu": 9000,
++      "vmnicsToUplinks": [
++        {
++          "id": "vmnic2",
++          "uplink": "uplink1"
++        },
++        {
++          "id": "vmnic3",
++          "uplink": "uplink2"
++        }
++      ]
++    }
++  ],
++  "nsxtSpec": {
++    "nsxtManagers": [
++      {
++        "hostname": "chi01-m01-nsx01"
++      },
++      {
++        "hostname": "chi01-m01-nsx02"
++      },
++      {
++        "hostname": "chi01-m01-nsx03"
++      }
++    ],
++    "nsxtManagerSize": "medium",
++    "vipFqdn": "chi01-m01-nsx.corp.northwind.example",
++    "transportVlanId": 160,
++    "version": "9.1.0.0",
++    "useExistingDeployment": false
++  },
++  "networkSpecs": [
++    {
++      "networkType": "MANAGEMENT",
++      "subnet": "10.20.110.0/24",
++      "gateway": "10.20.110.1",
++      "subnetMask": "255.255.255.0",
++      "vlanId": 110,
++      "mtu": 9000,
++      "ipAddressVersion": "IPv4",
++      "ipAddressAssignmentMode": "STATIC"
++    },
++    {
++      "networkType": "VSAN",
++      "subnet": "10.20.120.0/24",
++      "gateway": "10.20.120.1",
++      "subnetMask": "255.255.255.0",
++      "vlanId": 120,
++      "mtu": 9000,
++      "ipAddressVersion": "IPv4",
++      "ipAddressAssignmentMode": "STATIC"
++    },
++    {
++      "networkType": "VMOTION",
++      "subnet": "10.20.130.0/24",
++      "gateway": "10.20.130.1",
++      "subnetMask": "255.255.255.0",
++      "vlanId": 130,
++      "mtu": 9000,
++      "ipAddressVersion": "IPv4",
++      "ipAddressAssignmentMode": "STATIC"
++    },
++    {
++      "networkType": "VM_MANAGEMENT",
++      "subnet": "10.20.140.0/24",
++      "gateway": "10.20.140.1",
++      "subnetMask": "255.255.255.0",
++      "vlanId": 140,
++      "mtu": 9000,
++      "ipAddressVersion": "IPv4",
++      "ipAddressAssignmentMode": "STATIC"
++    },
++    {
++      "networkType": "FLEET_MANAGEMENT",
++      "subnet": "10.20.150.0/24",
++      "gateway": "10.20.150.1",
++      "subnetMask": "255.255.255.0",
++      "vlanId": 150,
++      "mtu": 9000,
++      "ipAddressVersion": "IPv4",
++      "ipAddressAssignmentMode": "STATIC"
++    }
++  ],
++  "dnsSpec": {
++    "subdomain": "corp.northwind.example",
++    "nameservers": [
++      "10.20.0.10",
++      "10.20.0.11"
++    ]
++  },
++  "ntpServers": [
++    "10.20.0.20",
++    "10.20.0.21"
++  ],
++  "sddcManagerSpec": {
++    "hostname": "chi01-m01-sddc01",
++    "version": "9.1.0.0",
++    "useExistingDeployment": false
++  },
++  "managementPoolName": "chi01-management-pool",
++  "ceipEnabled": false,
++  "skipEsxThumbprintValidation": false,
++  "skipGatewayPingValidation": false,
++  "datastoreSpec": {
++    "vsanSpec": {
++      "datastoreName": "chi01-m01-vsan01",
++      "vsanDedup": false,
++      "esaConfig": {
++        "enabled": true
++      },
++      "failuresToTolerate": 1
++    }
++  },
++  "vcfInstanceName": "northwind-chi01"
++}
+diff --git a/research/consulted-sources.json b/research/consulted-sources.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..acd8ae992339845630876afc221677bf098f5c96
+--- /dev/null
++++ b/research/consulted-sources.json
+@@ -0,0 +1,47 @@
++{
++  "researchedAt": "2026-08-14T22:30:00Z",
++  "sources": [
++    {
++      "title": "Product Interoperability Matrix",
++      "publisher": "Broadcom",
++      "url": "https://interopmatrix.broadcom.com/Interoperability",
++      "accessedAt": "2026-08-14T22:18:00Z",
++      "finding": "Checked the target product interoperability combinations for vCenter, ESXi, vSAN, NSX, and the recovery products before fixing the 9.1 targets."
++    },
++    {
++      "title": "Upgrade Sequence and Related Issues for VMware Cloud Foundation and vSphere Foundation 9.1",
++      "publisher": "Broadcom Knowledge Base",
++      "url": "https://knowledge.broadcom.com/external/article/440630/upgrade-sequence-and-related-issues-for.html",
++      "accessedAt": "2026-08-14T22:20:00Z",
++      "finding": "A standalone vSphere 8 estate that already has NSX 4.x must use VCF Installer converge and convert/import workflows instead of independently upgrading the components; VCF Management Services and centralized licensing are part of the 9.1 target."
++    },
++    {
++      "title": "VCF Protection and Recovery 9.1: Transition from standalone SRM and VR 9.0.2",
++      "publisher": "Broadcom Knowledge Base",
++      "url": "https://knowledge.broadcom.com/external/article/444864/vcf-protection-and-recovery-91-transitio.html",
++      "accessedAt": "2026-08-14T22:22:00Z",
++      "finding": "Standalone Live Site Recovery and vSphere Replication 9.0.2 must transition to the unified recovery appliance for vCenter 9.1; the normal convergence path passes through 9.0.4 and must precede the vCenter major-version change."
++    },
++    {
++      "title": "Supported Hardware Changes: vSAN ESA and vSAN Storage Clusters ReadyNodes",
++      "publisher": "Broadcom Knowledge Base",
++      "url": "https://knowledge.broadcom.com/external/article/326717/what-you-can-and-cannot-change-in-a-vsan.html",
++      "accessedAt": "2026-08-14T22:24:00Z",
++      "finding": "ESA is the recommended architecture for new vSAN deployments, requires a certified ESA ReadyNode design, and has a 10 GbE hardware minimum; the selected dedicated 25 GbE vSAN uplink design exceeds that minimum."
++    },
++    {
++      "title": "Deployment Pathways for VMware Cloud Foundation 9",
++      "publisher": "VMware Cloud Foundation Blog by Broadcom",
++      "url": "https://blogs.vmware.com/cloud-foundation/2025/07/03/vcf-9-0-deployment-pathways/",
++      "accessedAt": "2026-08-14T22:26:00Z",
++      "finding": "A new VCF management cluster requires at least four hosts, while existing vCenter estates can be imported and estates with NSX can be brought in as workload domains."
++    },
++    {
++      "title": "VCF API Specification",
++      "publisher": "Broadcom Developer Portal",
++      "url": "https://developer.broadcom.com/sdks/vcf-api-specification/latest/",
++      "accessedAt": "2026-08-14T22:28:00Z",
++      "finding": "Confirmed that the 9.1 API specification download includes the VCF Installer OpenAPI definition used for the generated SddcSpec."
++    }
++  ]
++}

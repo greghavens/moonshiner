@@ -1,0 +1,581 @@
+diff --git a/architecture.go b/architecture.go
+index cea7d72..886957b 100644
+--- a/architecture.go
++++ b/architecture.go
+@@ -1,16 +1,261 @@
+ package vcfarch
+ 
+ import (
+-	"errors"
++	"encoding/json"
++	"fmt"
+ 	"io"
++	"sort"
+ )
+ 
+-var ErrNotImplemented = errors.New("architecture builder not implemented")
++func BuildArchitecture(req Requirements, estate Estate, snapshot CompatibilitySnapshot) (Artifact, error) {
++	if req.DesignID == "" || req.TargetVersion == "" || estate.EstateID == "" {
++		return Artifact{}, fmt.Errorf("design, target version, and estate identifiers are required")
++	}
++	if req.TargetVersion != snapshot.TargetVersion {
++		return Artifact{}, fmt.Errorf("requested target %q does not match compatibility snapshot target %q", req.TargetVersion, snapshot.TargetVersion)
++	}
++	if len(req.Sites) != snapshot.Architecture.RequiredDataSiteCount {
++		return Artifact{}, fmt.Errorf("got %d data sites, compatibility snapshot requires %d", len(req.Sites), snapshot.Architecture.RequiredDataSiteCount)
++	}
++	if req.Availability.SiteFailuresToTolerate != 1 {
++		return Artifact{}, fmt.Errorf("two-site stretched design requires siteFailuresToTolerate=1")
++	}
++	if req.Availability.HostFailuresToToleratePerSite < 0 {
++		return Artifact{}, fmt.Errorf("host failures to tolerate cannot be negative")
++	}
+ 
+-func BuildArchitecture(Requirements, Estate, CompatibilitySnapshot) (Artifact, error) {
+-	return Artifact{}, ErrNotImplemented
++	minimumHosts := snapshot.Architecture.Raid1HostsPerSiteBase +
++		snapshot.Architecture.Raid1HostsPerAdditionalFTT*req.Availability.HostFailuresToToleratePerSite
++	if minimumHosts < snapshot.Architecture.MinimumManagementHostsPerSite {
++		minimumHosts = snapshot.Architecture.MinimumManagementHostsPerSite
++	}
++	seenSites := make(map[string]bool, len(req.Sites))
++	seenHosts := make(map[string]bool)
++	topology := Topology{
++		DataSites: make([]DataSitePlacement, 0, len(req.Sites)),
++		Witness: WitnessPlacement{
++			FQDN:                    req.Witness.FQDN,
++			FailureDomain:           req.Witness.FailureDomain,
++			RunsOnManagementCluster: false,
++		},
++	}
++	hostSpecs := make([]map[string]any, 0)
++	worstCPU, worstMemory, worstStorage := int(^uint(0)>>1), int(^uint(0)>>1), int(^uint(0)>>1)
++	for _, site := range req.Sites {
++		if site.Name == "" || site.HostPrefix == "" || seenSites[site.Name] {
++			return Artifact{}, fmt.Errorf("data site names and host prefixes must be non-empty and site names unique")
++		}
++		seenSites[site.Name] = true
++		if site.HostCount < minimumHosts {
++			return Artifact{}, fmt.Errorf("site %s host count %d contradicts FTT=%d; at least %d hosts are required", site.Name, site.HostCount, req.Availability.HostFailuresToToleratePerSite, minimumHosts)
++		}
++		if site.CoresPerHost <= 0 || site.MemoryGiBPerHost <= 0 || site.UsableTiBPerHost <= 0 {
++			return Artifact{}, fmt.Errorf("site %s has non-positive host capacity", site.Name)
++		}
++		survivingHosts := site.HostCount - req.Availability.HostFailuresToToleratePerSite
++		if survivingHosts <= 0 {
++			return Artifact{}, fmt.Errorf("site %s has no hosts after tolerated failures", site.Name)
++		}
++		worstCPU = smaller(worstCPU, survivingHosts*site.CoresPerHost)
++		worstMemory = smaller(worstMemory, survivingHosts*site.MemoryGiBPerHost)
++		worstStorage = smaller(worstStorage, survivingHosts*site.UsableTiBPerHost)
++
++		placement := DataSitePlacement{Name: site.Name, Hosts: make([]string, 0, site.HostCount)}
++		for index := 1; index <= site.HostCount; index++ {
++			hostname := fmt.Sprintf("%s%02d", site.HostPrefix, index)
++			if seenHosts[hostname] {
++				return Artifact{}, fmt.Errorf("duplicate generated hostname %q", hostname)
++			}
++			seenHosts[hostname] = true
++			placement.Hosts = append(placement.Hosts, hostname)
++			hostSpecs = append(hostSpecs, map[string]any{"hostname": hostname})
++		}
++		topology.DataSites = append(topology.DataSites, placement)
++	}
++	if req.Witness.FailureDomain == "" || req.Witness.FQDN == "" {
++		return Artifact{}, fmt.Errorf("witness FQDN and failure domain are required")
++	}
++	if seenSites[req.Witness.FailureDomain] {
++		return Artifact{}, fmt.Errorf("witness failure domain %q is one of the data sites", req.Witness.FailureDomain)
++	}
++	if seenHosts[req.Witness.FQDN] {
++		return Artifact{}, fmt.Errorf("witness %q cannot be a management data host", req.Witness.FQDN)
++	}
++
++	capacity := CapacityAssessment{
++		SurvivingSiteCPUCores:  worstCPU,
++		SurvivingSiteMemoryGiB: worstMemory,
++		SurvivingSiteUsableTiB: worstStorage,
++		RequiredCPUCores:       req.Demand.CPUCores,
++		RequiredMemoryGiB:      req.Demand.MemoryGiB,
++		RequiredUsableTiB:      req.Demand.UsableTiB,
++	}
++	capacity.MeetsFailoverDemand = worstCPU >= req.Demand.CPUCores &&
++		worstMemory >= req.Demand.MemoryGiB && worstStorage >= req.Demand.UsableTiB
++	if !capacity.MeetsFailoverDemand {
++		return Artifact{}, fmt.Errorf("surviving-site capacity %d cores/%d GiB/%d TiB does not meet demand %d/%d/%d", worstCPU, worstMemory, worstStorage, req.Demand.CPUCores, req.Demand.MemoryGiB, req.Demand.UsableTiB)
++	}
++
++	sddcSpec, err := buildSddcSpec(req, hostSpecs)
++	if err != nil {
++		return Artifact{}, err
++	}
++	migration, err := buildMigrationPlan(estate, snapshot)
++	if err != nil {
++		return Artifact{}, err
++	}
++	return Artifact{
++		DesignID: req.DesignID,
++		Greenfield: GreenfieldDesign{
++			SddcSpec:     sddcSpec,
++			Topology:     topology,
++			Availability: req.Availability,
++			Capacity:     capacity,
++		},
++		ExistingEstateMigration: migration,
++	}, nil
++}
++
++func buildSddcSpec(req Requirements, hosts []map[string]any) (json.RawMessage, error) {
++	spec := map[string]any{
++		"sddcId":       req.DesignID,
++		"workflowType": "VCF",
++		"version":      req.TargetVersion,
++		"hostSpecs":    hosts,
++		"vcenterSpec": map[string]any{
++			"vcenterHostname":     "chi-vc01." + req.Network.DNSDomain,
++			"rootVcenterPassword": "Replace!Passw0rd1",
++			"vmSize":              "medium",
++			"ssoDomain":           "vsphere.local",
++		},
++		"clusterSpec": map[string]any{
++			"datacenterName": "chi-vcf-dc01",
++			"clusterName":    "chi-mgmt-stretched01",
++		},
++		"datastoreSpec": map[string]any{
++			"vsanSpec": map[string]any{
++				"datastoreName":      "chi-mgmt-vsan01",
++				"failuresToTolerate": req.Availability.HostFailuresToToleratePerSite,
++				"esaConfig":          map[string]any{"enabled": true},
++			},
++		},
++		"networkSpecs": []map[string]any{
++			{"networkType": "MANAGEMENT", "vlanId": req.Network.ManagementVLAN, "mtu": 1500},
++			{"networkType": "VSAN", "vlanId": req.Network.VsanVLAN, "mtu": 9000},
++			{"networkType": "VMOTION", "vlanId": req.Network.VmotionVLAN, "mtu": 9000},
++		},
++		"dnsSpec": map[string]any{
++			"subdomain":   req.Network.DNSDomain,
++			"nameservers": append([]string(nil), req.Network.NameServers...),
++		},
++		"ntpServers":                  append([]string(nil), req.Network.NTPServers...),
++		"managementPoolName":          "chi-management-pool",
++		"ceipEnabled":                 false,
++		"skipEsxThumbprintValidation": false,
++		"skipGatewayPingValidation":   false,
++	}
++	b, err := json.Marshal(spec)
++	if err != nil {
++		return nil, fmt.Errorf("marshal SddcSpec: %w", err)
++	}
++	return json.RawMessage(b), nil
++}
++
++func buildMigrationPlan(estate Estate, snapshot CompatibilitySnapshot) (MigrationPlan, error) {
++	inventory := make(map[string]InventoryComponent, len(estate.Components))
++	for _, component := range estate.Components {
++		if component.ID == "" || component.Name == "" || component.Version == "" {
++			return MigrationPlan{}, fmt.Errorf("estate component id, name, and version are required")
++		}
++		if _, exists := inventory[component.ID]; exists {
++			return MigrationPlan{}, fmt.Errorf("duplicate estate component %q", component.ID)
++		}
++		inventory[component.ID] = component
++	}
++	rules := append([]MigrationRule(nil), snapshot.Migration...)
++	sort.Slice(rules, func(i, j int) bool { return rules[i].Order < rules[j].Order })
++	if len(rules) != len(inventory) {
++		return MigrationPlan{}, fmt.Errorf("compatibility snapshot has %d migration rules for %d components", len(rules), len(inventory))
++	}
++	steps := make([]MigrationStep, 0, len(rules))
++	completed := make(map[string]bool, len(rules))
++	seenRules := make(map[string]bool, len(rules))
++	for index, rule := range rules {
++		if rule.Order != index+1 {
++			return MigrationPlan{}, fmt.Errorf("migration order is not contiguous at rule %q", rule.ComponentID)
++		}
++		component, ok := inventory[rule.ComponentID]
++		if !ok {
++			return MigrationPlan{}, fmt.Errorf("migration rule %q has no estate component", rule.ComponentID)
++		}
++		if seenRules[rule.ComponentID] {
++			return MigrationPlan{}, fmt.Errorf("duplicate migration rule for component %q", rule.ComponentID)
++		}
++		seenRules[rule.ComponentID] = true
++		if !stringIn(rule.SupportedSources, component.Version) {
++			return MigrationPlan{}, fmt.Errorf("component %s source %s has no supported path to %s", component.ID, component.Version, rule.TargetVersion)
++		}
++		if len(rule.Gates) == 0 {
++			return MigrationPlan{}, fmt.Errorf("component %s has no migration gate", component.ID)
++		}
++		for _, gate := range rule.Gates {
++			if gate.ID == "" || gate.Condition == "" {
++				return MigrationPlan{}, fmt.Errorf("component %s has an incomplete gate", component.ID)
++			}
++			for _, dependency := range gate.RequiresComponentIDs {
++				if !completed[dependency] {
++					return MigrationPlan{}, fmt.Errorf("component %s gate %s depends on %s before it is complete", component.ID, gate.ID, dependency)
++				}
++			}
++		}
++		steps = append(steps, MigrationStep{
++			Order:         rule.Order,
++			ComponentID:   component.ID,
++			Component:     component.Name,
++			SourceVersion: component.Version,
++			TargetVersion: rule.TargetVersion,
++			Gates:         cloneGates(rule.Gates),
++		})
++		completed[component.ID] = true
++	}
++	return MigrationPlan{
++		SchemaVersion:    "1.0",
++		EstateID:         estate.EstateID,
++		TargetVCFVersion: snapshot.TargetVersion,
++		Steps:            steps,
++	}, nil
++}
++
++func cloneGates(gates []Gate) []Gate {
++	result := make([]Gate, len(gates))
++	for index, gate := range gates {
++		result[index] = gate
++		result[index].RequiresComponentIDs = append([]string{}, gate.RequiresComponentIDs...)
++	}
++	return result
++}
++
++func stringIn(values []string, want string) bool {
++	for _, value := range values {
++		if value == want {
++			return true
++		}
++	}
++	return false
++}
++
++func smaller(a, b int) int {
++	if a < b {
++		return a
++	}
++	return b
+ }
+ 
+-func WriteArtifact(io.Writer, Artifact) error {
+-	return ErrNotImplemented
++func WriteArtifact(w io.Writer, artifact Artifact) error {
++	encoder := json.NewEncoder(w)
++	encoder.SetIndent("", "  ")
++	if err := encoder.Encode(artifact); err != nil {
++		return fmt.Errorf("encode architecture artifact: %w", err)
++	}
++	return nil
+ }
+diff --git a/architecture.json b/architecture.json
+new file mode 100644
+index 0000000..5e2f848
+--- /dev/null
++++ b/architecture.json
+@@ -0,0 +1,259 @@
++{
++  "designId": "chi-vcf01",
++  "greenfield": {
++    "sddcSpec": {
++      "ceipEnabled": false,
++      "clusterSpec": {
++        "clusterName": "chi-mgmt-stretched01",
++        "datacenterName": "chi-vcf-dc01"
++      },
++      "datastoreSpec": {
++        "vsanSpec": {
++          "datastoreName": "chi-mgmt-vsan01",
++          "esaConfig": {
++            "enabled": true
++          },
++          "failuresToTolerate": 1
++        }
++      },
++      "dnsSpec": {
++        "nameservers": [
++          "10.20.0.10",
++          "10.20.0.11"
++        ],
++        "subdomain": "chi.example.com"
++      },
++      "hostSpecs": [
++        {
++          "hostname": "chi-a-esx01"
++        },
++        {
++          "hostname": "chi-a-esx02"
++        },
++        {
++          "hostname": "chi-a-esx03"
++        },
++        {
++          "hostname": "chi-a-esx04"
++        },
++        {
++          "hostname": "chi-b-esx01"
++        },
++        {
++          "hostname": "chi-b-esx02"
++        },
++        {
++          "hostname": "chi-b-esx03"
++        },
++        {
++          "hostname": "chi-b-esx04"
++        }
++      ],
++      "managementPoolName": "chi-management-pool",
++      "networkSpecs": [
++        {
++          "mtu": 1500,
++          "networkType": "MANAGEMENT",
++          "vlanId": 1100
++        },
++        {
++          "mtu": 9000,
++          "networkType": "VSAN",
++          "vlanId": 1200
++        },
++        {
++          "mtu": 9000,
++          "networkType": "VMOTION",
++          "vlanId": 1300
++        }
++      ],
++      "ntpServers": [
++        "10.20.0.20",
++        "10.20.0.21"
++      ],
++      "sddcId": "chi-vcf01",
++      "skipEsxThumbprintValidation": false,
++      "skipGatewayPingValidation": false,
++      "vcenterSpec": {
++        "rootVcenterPassword": "Replace!Passw0rd1",
++        "ssoDomain": "vsphere.local",
++        "vcenterHostname": "chi-vc01.chi.example.com",
++        "vmSize": "medium"
++      },
++      "version": "9.1.0.0",
++      "workflowType": "VCF"
++    },
++    "topology": {
++      "dataSites": [
++        {
++          "name": "chi-a",
++          "hosts": [
++            "chi-a-esx01",
++            "chi-a-esx02",
++            "chi-a-esx03",
++            "chi-a-esx04"
++          ]
++        },
++        {
++          "name": "chi-b",
++          "hosts": [
++            "chi-b-esx01",
++            "chi-b-esx02",
++            "chi-b-esx03",
++            "chi-b-esx04"
++          ]
++        }
++      ],
++      "witness": {
++        "fqdn": "chi-vsan-witness01.mil.example.com",
++        "failureDomain": "mil-witness-01",
++        "runsOnManagementCluster": false
++      }
++    },
++    "availability": {
++      "siteFailuresToTolerate": 1,
++      "hostFailuresToToleratePerSite": 1
++    },
++    "capacity": {
++      "survivingSiteCpuCores": 192,
++      "survivingSiteMemoryGiB": 3072,
++      "survivingSiteUsableTiB": 60,
++      "requiredCpuCores": 192,
++      "requiredMemoryGiB": 3072,
++      "requiredUsableTiB": 60,
++      "meetsFailoverDemand": true
++    }
++  },
++  "existingEstateMigration": {
++    "schemaVersion": "1.0",
++    "estateId": "chi-vcf-existing",
++    "targetVcfVersion": "9.1.0.0",
++    "steps": [
++      {
++        "order": 1,
++        "componentId": "vcf-operations",
++        "component": "VMware Cloud Foundation Operations",
++        "sourceVersion": "9.0.2",
++        "targetVersion": "9.1.0",
++        "gates": [
++          {
++            "id": "operations-source-supported",
++            "requiresComponentIds": [],
++            "condition": "source version is 9.0.2"
++          }
++        ]
++      },
++      {
++        "order": 2,
++        "componentId": "operations-networks",
++        "component": "VMware Cloud Foundation Operations for Networks",
++        "sourceVersion": "6.14.0",
++        "targetVersion": "9.1.0",
++        "gates": [
++          {
++            "id": "operations-at-9.1",
++            "requiresComponentIds": [
++              "vcf-operations"
++            ],
++            "condition": "VMware Cloud Foundation Operations is at 9.1.0"
++          },
++          {
++            "id": "network-operations-certificate-san",
++            "requiresComponentIds": [],
++            "condition": "every platform and collector certificate SAN contains its FQDN and IP address"
++          }
++        ]
++      },
++      {
++        "order": 3,
++        "componentId": "sddc-manager",
++        "component": "VMware SDDC Manager",
++        "sourceVersion": "9.0.1.0",
++        "targetVersion": "9.1.0.0",
++        "gates": [
++          {
++            "id": "operations-components-at-9.1",
++            "requiresComponentIds": [
++              "vcf-operations",
++              "operations-networks"
++            ],
++            "condition": "VCF Operations components are at their pinned targets"
++          }
++        ]
++      },
++      {
++        "order": 4,
++        "componentId": "nsx",
++        "component": "VMware NSX",
++        "sourceVersion": "9.0.1.0",
++        "targetVersion": "9.1.0.0",
++        "gates": [
++          {
++            "id": "sddc-manager-at-9.1",
++            "requiresComponentIds": [
++              "sddc-manager"
++            ],
++            "condition": "SDDC Manager is at 9.1.0.0"
++          }
++        ]
++      },
++      {
++        "order": 5,
++        "componentId": "vcenter",
++        "component": "VMware vCenter Server",
++        "sourceVersion": "9.0.1.0",
++        "targetVersion": "9.1.0.0",
++        "gates": [
++          {
++            "id": "nsx-at-9.1",
++            "requiresComponentIds": [
++              "nsx"
++            ],
++            "condition": "NSX is at 9.1.0.0"
++          }
++        ]
++      },
++      {
++        "order": 6,
++        "componentId": "vsan-witness",
++        "component": "VMware vSAN Witness Appliance",
++        "sourceVersion": "9.0.1.0",
++        "targetVersion": "9.1.0.0",
++        "gates": [
++          {
++            "id": "witness-ready",
++            "requiresComponentIds": [
++              "vcenter"
++            ],
++            "condition": "the dedicated witness is connected and Ready before cluster remediation"
++          }
++        ]
++      },
++      {
++        "order": 7,
++        "componentId": "esxi",
++        "component": "VMware ESXi management-cluster hosts",
++        "sourceVersion": "9.0.1.0",
++        "targetVersion": "9.1.0.0",
++        "gates": [
++          {
++            "id": "management-stack-at-target",
++            "requiresComponentIds": [
++              "sddc-manager",
++              "vcenter",
++              "nsx"
++            ],
++            "condition": "SDDC Manager, vCenter Server, and NSX are at their pinned targets"
++          },
++          {
++            "id": "witness-version-aligned",
++            "requiresComponentIds": [
++              "vsan-witness"
++            ],
++            "condition": "the witness appliance is at the target ESXi version before data-host remediation"
++          }
++        ]
++      }
++    ]
++  }
++}
+diff --git a/research.md b/research.md
+new file mode 100644
+index 0000000..098c6cd
+--- /dev/null
++++ b/research.md
+@@ -0,0 +1,38 @@
++# VCF 9.1 architecture research record
++
++Accessed 2026-08-14.
++
++- **Product Interoperability Matrix — Broadcom**
++  https://interopmatrix.broadcom.com/Interoperability?col=1
++  Consulted the live selector for VMware product interoperability and upgrade
++  paths. The pinned snapshot remains the deterministic authority for the exact
++  source and target strings in `architecture.json`.
++
++- **Using the VMware Product Interoperability Matrixes — Broadcom Knowledge Base**
++  https://knowledge.broadcom.com/external/article/343230
++  Confirmed that interoperability and upgrade paths are separate matrix views
++  and that patch releases must be shown when evaluating exact source versions.
++
++- **Upgrade Sequence and Related Issues for VMware Cloud Foundation and vSphere Foundation 9.1 — Broadcom Knowledge Base**
++  https://knowledge.broadcom.com/external/article/440630
++  Confirmed the VCF 9.0.x-to-9.1 path starts by upgrading VCF Operations and
++  then uses lifecycle workflows, and that the 9.0 Fleet Management Appliance
++  is replaced by VCF Management Services in 9.1.
++
++- **VCF 9.1 upgrade binaries do not show up in VCF Operations 9.0 — Broadcom Knowledge Base**
++  https://knowledge.broadcom.com/external/article/440282
++  Confirmed VCF Operations 9.1 precedes SDDC Manager and the remaining core
++  components.
++
++- **Update Sequence for VCF 9.0 and Compatible VMware Products — Broadcom Knowledge Base**
++  https://knowledge.broadcom.com/external/article/390634/update-sequence-for-vcf-90-and-compatibl.html
++  Confirmed the core order SDDC Manager, NSX, vCenter, vSAN witness, then ESXi
++  data hosts used by the pinned plan.
++
++- **Certificate Requirements for VCF Operations for Networks in VCF 9.1 — Broadcom Knowledge Base**
++  https://knowledge.broadcom.com/external/article/424807
++  Confirmed the pre-upgrade gate that platform and collector certificates have
++  both FQDN and IP address SAN entries.
++
++No consulted source contradicted the compatibility combinations, order, or
++gates pinned in `fixtures/compatibility-snapshot.json`.

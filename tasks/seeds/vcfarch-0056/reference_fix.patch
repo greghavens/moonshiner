@@ -1,0 +1,1265 @@
+diff --git a/architecture.go b/architecture.go
+index cd50cc1..5b0a753 100644
+--- a/architecture.go
++++ b/architecture.go
+@@ -2,8 +2,17 @@
+ package vcfarch
+ 
+ import (
++	"bytes"
++	"encoding/json"
+ 	"errors"
++	"fmt"
++	"io"
+ 	"io/fs"
++	"net"
++	"os"
++	"path/filepath"
++	"sort"
++	"strings"
+ )
+ 
+ // Requirements is the protected greenfield design input.
+@@ -146,24 +155,288 @@ type MigrationStep struct {
+ var ErrNotImplemented = errors.New("vcfarch: not implemented")
+ 
+ func LoadInputs(requirementsPath, estatePath, compatibilityPath string) (Inputs, error) {
+-	return Inputs{}, ErrNotImplemented
++	var inputs Inputs
++	for _, item := range []struct {
++		path string
++		out  any
++	}{
++		{requirementsPath, &inputs.Requirements},
++		{estatePath, &inputs.Estate},
++		{compatibilityPath, &inputs.Compatibility},
++	} {
++		if err := decodeFile(item.path, item.out); err != nil {
++			return Inputs{}, err
++		}
++	}
++	if err := validateRequirements(inputs.Requirements); err != nil {
++		return Inputs{}, err
++	}
++	if err := validateEstate(inputs.Estate); err != nil {
++		return Inputs{}, err
++	}
++	if err := validateSnapshot(inputs.Compatibility); err != nil {
++		return Inputs{}, err
++	}
++	return inputs, nil
+ }
+ 
+ func BuildSddcSpec(req Requirements) (SddcSpec, error) {
+-	return nil, ErrNotImplemented
++	if err := validateRequirements(req); err != nil {
++		return nil, err
++	}
++
++	selected, err := selectHosts(req)
++	if err != nil {
++		return nil, err
++	}
++	if err := checkCapacity(req, selected); err != nil {
++		return nil, err
++	}
++
++	hostSpecs := make([]any, 0, len(selected))
++	for _, host := range selected {
++		hostSpecs = append(hostSpecs, map[string]any{
++			"hostname": host.Hostname,
++			"credentials": map[string]any{
++				"username": "root",
++				"password": "${VCF_ESXI_ROOT_PASSWORD}",
++			},
++		})
++	}
++
++	networkSpecs := make([]any, 0, len(req.Networks))
++	networksBySwitch := map[string][]string{"system": {}, "overlay": {}}
++	var tep NetworkRequirement
++	for _, network := range req.Networks {
++		networkSpecs = append(networkSpecs, map[string]any{
++			"networkType": network.Type,
++			"vlanId":      network.VLANID,
++			"subnet":      network.Subnet,
++			"gateway":     network.Gateway,
++			"mtu":         network.MTU,
++			"includeIpAddressRanges": []any{map[string]any{
++				"startIpAddress": network.Start,
++				"endIpAddress":   network.End,
++			}},
++		})
++		networksBySwitch[network.Switch] = append(networksBySwitch[network.Switch], network.Type)
++		if network.Type == "NSX_TEP" {
++			tep = network
++		}
++	}
++
++	dvsSpecs := []any{
++		buildDVS(req.Names.SystemDVS, networksBySwitch["system"], []string{"vmnic0", "vmnic1"}, "fin-wld-vlan-tz", "VLAN"),
++		buildDVS(req.Names.OverlayDVS, networksBySwitch["overlay"], []string{"vmnic2", "vmnic3"}, "fin-wld-overlay-tz", "OVERLAY"),
++	}
++
++	managers := make([]any, 0, len(req.Names.NSXManagers))
++	for _, hostname := range req.Names.NSXManagers {
++		managers = append(managers, map[string]any{"hostname": hostname})
++	}
++
++	spec := SddcSpec{
++		"sddcId":       req.DesignID,
++		"workflowType": req.WorkflowType,
++		"version":      req.TargetVersion,
++		"hostSpecs":    hostSpecs,
++		"vcenterSpec": map[string]any{
++			"vcenterHostname":     req.Names.VCenter,
++			"rootVcenterPassword": "${VCF_VCENTER_ROOT_PASSWORD}",
++			"vmSize":              "medium",
++			"storageSize":         "lstorage",
++			"ssoDomain":           "vsphere.local",
++		},
++		"clusterSpec": map[string]any{
++			"datacenterName": req.Names.Datacenter,
++			"clusterName":    req.Names.Cluster,
++		},
++		"dvsSpecs":     dvsSpecs,
++		"networkSpecs": networkSpecs,
++		"dnsSpec": map[string]any{
++			"subdomain":   req.DomainSuffix,
++			"nameservers": stringValues(req.DNS),
++		},
++		"ntpServers":                  stringValues(req.NTP),
++		"managementPoolName":          "fin-wld-management-pool",
++		"ceipEnabled":                 false,
++		"skipEsxThumbprintValidation": false,
++		"skipGatewayPingValidation":   false,
++		"sddcManagerSpec": map[string]any{
++			"hostname":          req.Names.SDDCManager,
++			"rootPassword":      "${VCF_SDDC_ROOT_PASSWORD}",
++			"sshPassword":       "${VCF_SDDC_SSH_PASSWORD}",
++			"localUserPassword": "${VCF_SDDC_LOCAL_PASSWORD}",
++		},
++		"nsxtSpec": map[string]any{
++			"nsxtManagers":            managers,
++			"nsxtManagerSize":         "medium",
++			"vipFqdn":                 req.Names.NSXVIP,
++			"rootNsxtManagerPassword": "${VCF_NSX_ROOT_PASSWORD}",
++			"nsxtAdminPassword":       "${VCF_NSX_ADMIN_PASSWORD}",
++			"nsxtAuditPassword":       "${VCF_NSX_AUDIT_PASSWORD}",
++			"transportVlanId":         tep.VLANID,
++			"ipAddressPoolSpec": map[string]any{
++				"name": req.Names.NSXTEPPoolName,
++				"subnets": []any{map[string]any{
++					"cidr":    tep.Subnet,
++					"gateway": tep.Gateway,
++					"ipAddressPoolRanges": []any{map[string]any{
++						"start": tep.Start,
++						"end":   tep.End,
++					}},
++				}},
++			},
++		},
++		"datastoreSpec": map[string]any{
++			"vsanSpec": map[string]any{
++				"datastoreName":      req.Names.VSANDatastore,
++				"failuresToTolerate": req.Availability.FailuresToTolerate,
++				"esaConfig":          map[string]any{"enabled": true},
++			},
++		},
++		"securitySpec":    map[string]any{"esxiCertsMode": "VMCA"},
++		"vcfInstanceName": req.WorkloadDomain,
++	}
++	return spec, nil
+ }
+ 
+ func BuildMigrationPlan(estate Estate, snapshot CompatibilitySnapshot) (MigrationPlan, error) {
+-	return MigrationPlan{}, ErrNotImplemented
++	if err := validateEstate(estate); err != nil {
++		return MigrationPlan{}, err
++	}
++	if err := validateSnapshot(snapshot); err != nil {
++		return MigrationPlan{}, err
++	}
++	if estate.ManagementDomain == estate.WorkloadDomain {
++		return MigrationPlan{}, errors.New("vcfarch: workload domain cannot be the protected management domain")
++	}
++
++	transitions := make(map[string]Transition, len(snapshot.Transitions))
++	for _, transition := range snapshot.Transitions {
++		transitions[componentKey(transition.Component, transition.FromVersion)] = transition
++	}
++
++	steps := make([]MigrationStep, 0, len(estate.Components))
++	for _, component := range estate.Components {
++		transition, ok := transitions[componentKey(component.Name, component.Version)]
++		if !ok {
++			return MigrationPlan{}, fmt.Errorf("vcfarch: no supported transition for %s %s", component.Name, component.Version)
++		}
++		for _, protected := range estate.ProtectedSystems {
++			if strings.EqualFold(transition.Target.Component, protected) {
++				return MigrationPlan{}, fmt.Errorf("vcfarch: transition for %s targets protected management system %s", component.Name, protected)
++			}
++		}
++		steps = append(steps, MigrationStep{
++			Order:          transition.Order,
++			Component:      component.Name,
++			CurrentVersion: component.Version,
++			Target:         transition.Target,
++			Action:         transition.Action,
++			Gates:          append([]string(nil), transition.Gates...),
++		})
++	}
++	sort.Slice(steps, func(i, j int) bool { return steps[i].Order < steps[j].Order })
++	for i := 1; i < len(steps); i++ {
++		if steps[i-1].Order >= steps[i].Order {
++			return MigrationPlan{}, fmt.Errorf("vcfarch: migration order %d is not unique and increasing", steps[i].Order)
++		}
++	}
++
++	return MigrationPlan{
++		SchemaVersion: "1.0",
++		EstateID:      estate.EstateID,
++		Scope: MigrationScope{
++			Fleet:                  estate.Fleet,
++			WorkloadDomain:         estate.WorkloadDomain,
++			ManagementDomain:       estate.ManagementDomain,
++			ManagementDomainAction: "none",
++		},
++		Steps: steps,
++	}, nil
+ }
+ 
+ // WriteArtifacts writes sddc-spec.json and migration-plan.json.
+ func WriteArtifacts(dir string, spec SddcSpec, plan MigrationPlan) error {
+-	return ErrNotImplemented
++	if strings.TrimSpace(dir) == "" {
++		return errors.New("vcfarch: output directory is required")
++	}
++	specJSON, err := marshalArtifact(spec)
++	if err != nil {
++		return fmt.Errorf("vcfarch: encode SddcSpec: %w", err)
++	}
++	planJSON, err := marshalArtifact(plan)
++	if err != nil {
++		return fmt.Errorf("vcfarch: encode migration plan: %w", err)
++	}
++	if err := os.MkdirAll(dir, 0o755); err != nil {
++		return fmt.Errorf("vcfarch: create output directory: %w", err)
++	}
++
++	items := []publishItem{
++		{name: "sddc-spec.json", data: specJSON},
++		{name: "migration-plan.json", data: planJSON},
++	}
++	for i := range items {
++		items[i].target = filepath.Join(dir, items[i].name)
++		items[i].staged, err = stageFile(dir, items[i].name, items[i].data)
++		if err != nil {
++			cleanupPublish(items)
++			return err
++		}
++	}
++
++	// Move old outputs aside only after both replacements are fully staged.
++	for i := range items {
++		if _, statErr := os.Lstat(items[i].target); statErr == nil {
++			backup, backupErr := reservePath(dir, ".vcfarch-backup-")
++			if backupErr != nil {
++				restorePublish(items)
++				return backupErr
++			}
++			if renameErr := os.Rename(items[i].target, backup); renameErr != nil {
++				_ = os.Remove(backup)
++				restorePublish(items)
++				return fmt.Errorf("vcfarch: back up %s: %w", items[i].name, renameErr)
++			}
++			items[i].backup = backup
++		} else if !errors.Is(statErr, os.ErrNotExist) {
++			restorePublish(items)
++			return fmt.Errorf("vcfarch: inspect %s: %w", items[i].name, statErr)
++		}
++	}
++
++	for i := range items {
++		if err := os.Rename(items[i].staged, items[i].target); err != nil {
++			restorePublish(items)
++			return fmt.Errorf("vcfarch: publish %s: %w", items[i].name, err)
++		}
++		items[i].staged = ""
++		items[i].installed = true
++	}
++	for _, item := range items {
++		if item.backup != "" {
++			_ = os.RemoveAll(item.backup)
++		}
++	}
++	return nil
+ }
+ 
+ func GenerateFromFiles(requirementsPath, estatePath, compatibilityPath, outputDir string) error {
+-	return ErrNotImplemented
++	inputs, err := LoadInputs(requirementsPath, estatePath, compatibilityPath)
++	if err != nil {
++		return err
++	}
++	spec, err := BuildSddcSpec(inputs.Requirements)
++	if err != nil {
++		return err
++	}
++	plan, err := BuildMigrationPlan(inputs.Estate, inputs.Compatibility)
++	if err != nil {
++		return err
++	}
++	return WriteArtifacts(outputDir, spec, plan)
+ }
+ 
+ // RenameFS captures the filesystem operations WriteArtifacts needs. It is kept
+@@ -174,3 +447,329 @@ type renameFS interface {
+ 	Rename(string, string) error
+ 	Remove(string) error
+ }
++
++func decodeFile(path string, out any) error {
++	f, err := os.Open(path)
++	if err != nil {
++		return fmt.Errorf("vcfarch: open %s: %w", path, err)
++	}
++	defer f.Close()
++	dec := json.NewDecoder(f)
++	dec.DisallowUnknownFields()
++	if err := dec.Decode(out); err != nil {
++		return fmt.Errorf("vcfarch: decode %s: %w", path, err)
++	}
++	var trailing any
++	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
++		if err == nil {
++			return fmt.Errorf("vcfarch: decode %s: trailing JSON value", path)
++		}
++		return fmt.Errorf("vcfarch: decode %s: %w", path, err)
++	}
++	return nil
++}
++
++func validateRequirements(req Requirements) error {
++	for name, value := range map[string]string{
++		"designId": req.DesignID, "fleet": req.Fleet, "workloadDomain": req.WorkloadDomain,
++		"managementDomain": req.ManagementDomain, "targetVersion": req.TargetVersion,
++		"workflowType": req.WorkflowType, "domainSuffix": req.DomainSuffix,
++	} {
++		if strings.TrimSpace(value) == "" {
++			return fmt.Errorf("vcfarch: requirements %s is required", name)
++		}
++	}
++	if req.ManagementDomain == req.WorkloadDomain {
++		return errors.New("vcfarch: workload domain cannot be the protected management domain")
++	}
++	if req.TargetVersion != "9.0.0.0" || req.WorkflowType != "VCF_EXTEND" {
++		return fmt.Errorf("vcfarch: unsupported target/workflow %s %s", req.TargetVersion, req.WorkflowType)
++	}
++	if len(req.DNS) == 0 || len(req.NTP) == 0 {
++		return errors.New("vcfarch: DNS and NTP inputs are required")
++	}
++	if len(req.Availability.Sites) < 2 || req.Availability.HostsPerSite < 1 || !req.Availability.SurviveSiteFailure {
++		return errors.New("vcfarch: a site-survivable multi-site requirement is required")
++	}
++	if req.Availability.NSXManagerCount != len(req.Names.NSXManagers) || req.Availability.NSXManagerCount < 3 {
++		return errors.New("vcfarch: NSX manager names do not satisfy the HA count")
++	}
++	if req.Capacity.UsableCores <= 0 || req.Capacity.UsableMemoryGiB <= 0 || req.Capacity.UsableStorageTiB <= 0 || req.Capacity.StorageCopies < 1 || req.Capacity.FreeSpacePercent < 0 || req.Capacity.FreeSpacePercent >= 100 {
++		return errors.New("vcfarch: invalid capacity requirement")
++	}
++
++	hosts := map[string]bool{}
++	for _, host := range req.Hosts {
++		if host.Hostname == "" || host.Site == "" || host.Cores <= 0 || host.MemoryGiB <= 0 || host.RawStorageTiB <= 0 {
++			return fmt.Errorf("vcfarch: invalid host candidate %q", host.Hostname)
++		}
++		if hosts[host.Hostname] {
++			return fmt.Errorf("vcfarch: duplicate hostname %q", host.Hostname)
++		}
++		hosts[host.Hostname] = true
++	}
++
++	networkTypes := map[string]bool{}
++	for _, network := range req.Networks {
++		if networkTypes[network.Type] {
++			return fmt.Errorf("vcfarch: duplicate network type %q", network.Type)
++		}
++		networkTypes[network.Type] = true
++		if network.Switch != "system" && network.Switch != "overlay" {
++			return fmt.Errorf("vcfarch: network %s names unknown switch %q", network.Type, network.Switch)
++		}
++		if network.VLANID < 0 || network.VLANID > 4094 || network.MTU < 1280 || network.MTU > 9190 {
++			return fmt.Errorf("vcfarch: network %s has invalid VLAN or MTU", network.Type)
++		}
++		_, subnet, err := net.ParseCIDR(network.Subnet)
++		if err != nil {
++			return fmt.Errorf("vcfarch: network %s subnet: %w", network.Type, err)
++		}
++		for label, address := range map[string]string{"gateway": network.Gateway, "start": network.Start, "end": network.End} {
++			ip := net.ParseIP(address)
++			if ip == nil || !subnet.Contains(ip) {
++				return fmt.Errorf("vcfarch: network %s %s is outside its subnet", network.Type, label)
++			}
++		}
++	}
++	for _, required := range []string{"MANAGEMENT", "VMOTION", "VSAN", "VM_MANAGEMENT", "NSX_TEP"} {
++		if !networkTypes[required] {
++			return fmt.Errorf("vcfarch: required network %s is missing", required)
++		}
++	}
++	return nil
++}
++
++func validateEstate(estate Estate) error {
++	if estate.EstateID == "" || estate.Fleet == "" || estate.WorkloadDomain == "" || estate.ManagementDomain == "" {
++		return errors.New("vcfarch: estate identity and scope fields are required")
++	}
++	if estate.WorkloadDomain == estate.ManagementDomain {
++		return errors.New("vcfarch: estate workload domain is the protected management domain")
++	}
++	seen := map[string]bool{}
++	for _, component := range estate.Components {
++		if component.Name == "" || component.Version == "" {
++			return errors.New("vcfarch: estate component name and version are required")
++		}
++		key := componentKey(component.Name, component.Version)
++		if seen[key] {
++			return fmt.Errorf("vcfarch: duplicate estate component %s %s", component.Name, component.Version)
++		}
++		seen[key] = true
++	}
++	if len(estate.Components) == 0 {
++		return errors.New("vcfarch: estate has no components")
++	}
++	return nil
++}
++
++func validateSnapshot(snapshot CompatibilitySnapshot) error {
++	if snapshot.SchemaVersion == "" || snapshot.SnapshotID == "" || snapshot.TargetRelease == "" {
++		return errors.New("vcfarch: compatibility snapshot identity is incomplete")
++	}
++	seen := map[string]bool{}
++	orders := map[int]bool{}
++	for _, transition := range snapshot.Transitions {
++		key := componentKey(transition.Component, transition.FromVersion)
++		if transition.Component == "" || transition.FromVersion == "" || transition.Target.Component == "" || transition.Target.Version == "" || transition.Action == "" || transition.Order <= 0 || len(transition.Gates) == 0 {
++			return fmt.Errorf("vcfarch: incomplete compatibility transition %q", transition.Component)
++		}
++		if transition.Target.Version != snapshot.TargetRelease {
++			return fmt.Errorf("vcfarch: transition %s targets %s, not snapshot release %s", transition.Component, transition.Target.Version, snapshot.TargetRelease)
++		}
++		if seen[key] {
++			return fmt.Errorf("vcfarch: duplicate compatibility transition %s %s", transition.Component, transition.FromVersion)
++		}
++		if orders[transition.Order] {
++			return fmt.Errorf("vcfarch: duplicate compatibility order %d", transition.Order)
++		}
++		seen[key] = true
++		orders[transition.Order] = true
++		gateSeen := map[string]bool{}
++		for _, gate := range transition.Gates {
++			if gate == "" || gateSeen[gate] {
++				return fmt.Errorf("vcfarch: invalid or duplicate gate for %s", transition.Component)
++			}
++			gateSeen[gate] = true
++		}
++	}
++	if len(snapshot.Transitions) == 0 {
++		return errors.New("vcfarch: compatibility snapshot has no transitions")
++	}
++	return nil
++}
++
++func selectHosts(req Requirements) ([]HostCandidate, error) {
++	selected := make([]HostCandidate, 0, len(req.Availability.Sites)*req.Availability.HostsPerSite)
++	seenSites := map[string]bool{}
++	for _, site := range req.Availability.Sites {
++		if site == "" || seenSites[site] {
++			return nil, fmt.Errorf("vcfarch: invalid or duplicate required site %q", site)
++		}
++		seenSites[site] = true
++		candidates := make([]HostCandidate, 0)
++		for _, host := range req.Hosts {
++			if host.Site == site {
++				candidates = append(candidates, host)
++			}
++		}
++		sort.Slice(candidates, func(i, j int) bool { return candidates[i].Hostname < candidates[j].Hostname })
++		if len(candidates) < req.Availability.HostsPerSite {
++			return nil, fmt.Errorf("vcfarch: site %s has %d hosts, needs %d", site, len(candidates), req.Availability.HostsPerSite)
++		}
++		selected = append(selected, candidates[:req.Availability.HostsPerSite]...)
++	}
++	return selected, nil
++}
++
++func checkCapacity(req Requirements, hosts []HostCandidate) error {
++	siteCores := map[string]int{}
++	siteMemory := map[string]int{}
++	siteStorage := map[string]float64{}
++	seen := map[string]bool{}
++	for _, host := range hosts {
++		if seen[host.Hostname] {
++			return fmt.Errorf("vcfarch: selected host %s twice", host.Hostname)
++		}
++		seen[host.Hostname] = true
++		siteCores[host.Site] += host.Cores
++		siteMemory[host.Site] += host.MemoryGiB
++		siteStorage[host.Site] += host.RawStorageTiB
++	}
++	for _, site := range req.Availability.Sites {
++		usableStorage := siteStorage[site] * float64(100-req.Capacity.FreeSpacePercent) / 100
++		if siteCores[site] < req.Capacity.UsableCores || siteMemory[site] < req.Capacity.UsableMemoryGiB || usableStorage+1e-9 < req.Capacity.UsableStorageTiB {
++			return fmt.Errorf("vcfarch: site %s cannot carry required workload after peer-site failure", site)
++		}
++	}
++	totalStorage := 0.0
++	for _, raw := range siteStorage {
++		totalStorage += raw
++	}
++	usableStorage := totalStorage / float64(req.Capacity.StorageCopies) * float64(100-req.Capacity.FreeSpacePercent) / 100
++	if usableStorage+1e-9 < req.Capacity.UsableStorageTiB {
++		return fmt.Errorf("vcfarch: %.2f TiB usable storage does not meet %.2f TiB", usableStorage, req.Capacity.UsableStorageTiB)
++	}
++	return nil
++}
++
++func buildDVS(name string, networks, vmnics []string, transportZone, transportType string) map[string]any {
++	mappings := make([]any, 0, len(vmnics))
++	uplinks := make([]any, 0, len(vmnics))
++	for i, vmnic := range vmnics {
++		uplink := fmt.Sprintf("uplink%d", i+1)
++		mappings = append(mappings, map[string]any{"id": vmnic, "uplink": uplink})
++		uplinks = append(uplinks, uplink)
++	}
++	return map[string]any{
++		"dvsName":         name,
++		"networks":        stringValues(networks),
++		"mtu":             9000,
++		"vmnicsToUplinks": mappings,
++		"nsxtSwitchConfig": map[string]any{
++			"transportZones":            []any{map[string]any{"name": transportZone, "transportType": transportType}},
++			"hostSwitchOperationalMode": "STANDARD",
++			"ipAssignmentType":          "STATIC",
++		},
++		"nsxTeamings": []any{map[string]any{
++			"policy":        "LOADBALANCE_SRCID",
++			"activeUplinks": uplinks,
++		}},
++	}
++}
++
++func stringValues(values []string) []any {
++	out := make([]any, len(values))
++	for i, value := range values {
++		out[i] = value
++	}
++	return out
++}
++
++func componentKey(component, version string) string { return component + "\x00" + version }
++
++func marshalArtifact(value any) ([]byte, error) {
++	data, err := json.MarshalIndent(value, "", "  ")
++	if err != nil {
++		return nil, err
++	}
++	return append(data, '\n'), nil
++}
++
++type publishItem struct {
++	name      string
++	target    string
++	staged    string
++	backup    string
++	data      []byte
++	installed bool
++}
++
++func stageFile(dir, name string, data []byte) (string, error) {
++	f, err := os.CreateTemp(dir, ".vcfarch-stage-")
++	if err != nil {
++		return "", fmt.Errorf("vcfarch: stage %s: %w", name, err)
++	}
++	path := f.Name()
++	ok := false
++	defer func() {
++		_ = f.Close()
++		if !ok {
++			_ = os.Remove(path)
++		}
++	}()
++	if err := f.Chmod(0o644); err != nil {
++		return "", fmt.Errorf("vcfarch: chmod staged %s: %w", name, err)
++	}
++	if _, err := io.Copy(f, bytes.NewReader(data)); err != nil {
++		return "", fmt.Errorf("vcfarch: write staged %s: %w", name, err)
++	}
++	if err := f.Sync(); err != nil {
++		return "", fmt.Errorf("vcfarch: sync staged %s: %w", name, err)
++	}
++	if err := f.Close(); err != nil {
++		return "", fmt.Errorf("vcfarch: close staged %s: %w", name, err)
++	}
++	ok = true
++	return path, nil
++}
++
++func reservePath(dir, pattern string) (string, error) {
++	f, err := os.CreateTemp(dir, pattern)
++	if err != nil {
++		return "", fmt.Errorf("vcfarch: reserve backup path: %w", err)
++	}
++	path := f.Name()
++	if err := f.Close(); err != nil {
++		return "", err
++	}
++	if err := os.Remove(path); err != nil {
++		return "", err
++	}
++	return path, nil
++}
++
++func cleanupPublish(items []publishItem) {
++	for _, item := range items {
++		if item.staged != "" {
++			_ = os.Remove(item.staged)
++		}
++	}
++}
++
++func restorePublish(items []publishItem) {
++	for _, item := range items {
++		if item.installed {
++			_ = os.RemoveAll(item.target)
++		}
++	}
++	for _, item := range items {
++		if item.backup != "" {
++			_ = os.Rename(item.backup, item.target)
++		}
++		if item.staged != "" {
++			_ = os.Remove(item.staged)
++		}
++	}
++}
+diff --git a/architecture/migration-plan.json b/architecture/migration-plan.json
+new file mode 100644
+index 0000000..ee846e1
+--- /dev/null
++++ b/architecture/migration-plan.json
+@@ -0,0 +1,74 @@
++{
++  "schemaVersion": "1.0",
++  "estateId": "fin-legacy-01",
++  "scope": {
++    "fleet": "central-fleet",
++    "workloadDomain": "finance-wld",
++    "managementDomain": "central-m01",
++    "managementDomainAction": "none"
++  },
++  "steps": [
++    {
++      "order": 10,
++      "component": "NSX",
++      "currentVersion": "4.2.0.1",
++      "target": {
++        "component": "NSX",
++        "version": "9.0.0.0"
++      },
++      "action": "upgrade",
++      "gates": [
++        "estate-backup-verified",
++        "vcf-import-precheck-passed",
++        "nsx-4.2.0.1-to-9.0.0.0-supported"
++      ]
++    },
++    {
++      "order": 20,
++      "component": "vCenter Server",
++      "currentVersion": "8.0 U3e",
++      "target": {
++        "component": "vCenter Server",
++        "version": "9.0.0.0"
++      },
++      "action": "upgrade",
++      "gates": [
++        "nsx-upgrade-complete",
++        "vcenter-8.0-u3e-to-9.0.0.0-supported",
++        "target-vcenter-nsx-combination-supported"
++      ]
++    },
++    {
++      "order": 30,
++      "component": "ESXi",
++      "currentVersion": "8.0 U3e",
++      "target": {
++        "component": "ESXi",
++        "version": "9.0.0.0"
++      },
++      "action": "upgrade",
++      "gates": [
++        "vcenter-upgrade-complete",
++        "cluster-uses-vlcm-image",
++        "hardware-certified-for-esxi-9.0",
++        "host-evacuation-capacity-verified"
++      ]
++    },
++    {
++      "order": 40,
++      "component": "vSAN",
++      "currentVersion": "8.0 U3",
++      "target": {
++        "component": "vSAN",
++        "version": "9.0.0.0"
++      },
++      "action": "upgrade-on-disk-format",
++      "gates": [
++        "all-esxi-hosts-upgraded",
++        "vsan-health-green",
++        "vsan-resync-zero",
++        "vsan-disk-format-precheck-passed"
++      ]
++    }
++  ]
++}
+diff --git a/architecture/research.md b/architecture/research.md
+new file mode 100644
+index 0000000..ff0b696
+--- /dev/null
++++ b/architecture/research.md
+@@ -0,0 +1,12 @@
++# Research consulted
++
++Accessed 2026-08-14.
++
++- [VMware Product Interoperability Matrix](https://interopmatrix.broadcom.com/Interoperability) — checked the live product-combination authority used to confirm that target component pairs must be evaluated together, rather than treating each product upgrade independently.
++- [VMware Product Upgrade Path](https://interopmatrix.broadcom.com/Upgrade) — checked the live upgrade-path authority for source-to-target support before normalizing the frozen transitions used by this package.
++- [Update Sequence for VCF 9.0 and Compatible VMware Products](https://knowledge.broadcom.com/external/article/390634/update-sequence-for-vcf-90-and-compatibl.html) — established the documented core ordering of SDDC Manager, NSX, vCenter, ESXi, and the later vSAN step, plus the special handling of Operations for Logs.
++- [Applying individual product updates to a VCF environment](https://knowledge.broadcom.com/external/article/344935/applying-individual-product-updates-to-v.html) — checked the live tables that tie specific 8.x/4.x component updates to minimum future VCF targets and warn when an update has no 9.0 path.
++- [Upgrading to VCF 9.0 requires Distributed Switch](https://knowledge.broadcom.com/external/article/430625/upgrading-to-vcf-90-requires-distributed.html) — established the VCF 9.0 vSphere Distributed Switch prerequisite used by the design.
++- [Converging VMware vSphere to VMware Cloud Foundation 9.0: The Top 10 Questions Answered](https://blogs.vmware.com/cloud-foundation/2026/04/16/converging-vmware-vsphere-to-vmware-cloud-foundation-9-0-the-top-10-questions-answered/) — established that VCF 9 does not support vSphere Lifecycle Manager baselines and requires the cluster to transition to image management.
++- [SddcSpec — VCF Installer API](https://developer.broadcom.com/xapis/vcf-installer-api/latest/data-structures/SddcSpec/) — cross-checked the live field descriptions, including `VCF_EXTEND` for connecting a secondary VCF instance to an existing fleet; the implementation remains pinned to the repository's vendored 9.0.0.0 schema.
++- [Deployment Pathways for VMware Cloud Foundation 9](https://blogs.vmware.com/cloud-foundation/2025/07/03/vcf-9-0-deployment-pathways/) — established the separation between adding capacity to an existing fleet and importing an existing vCenter deployment as a workload domain through VCF Operations.
+diff --git a/architecture/sddc-spec.json b/architecture/sddc-spec.json
+new file mode 100644
+index 0000000..d1c3d9c
+--- /dev/null
++++ b/architecture/sddc-spec.json
+@@ -0,0 +1,286 @@
++{
++  "ceipEnabled": false,
++  "clusterSpec": {
++    "clusterName": "fin-wld-cl01",
++    "datacenterName": "fin-dc01"
++  },
++  "datastoreSpec": {
++    "vsanSpec": {
++      "datastoreName": "fin-wld-vsan-esa",
++      "esaConfig": {
++        "enabled": true
++      },
++      "failuresToTolerate": 1
++    }
++  },
++  "dnsSpec": {
++    "nameservers": [
++      "10.60.0.10",
++      "10.60.0.11"
++    ],
++    "subdomain": "corp.example.com"
++  },
++  "dvsSpecs": [
++    {
++      "dvsName": "fin-wld-vds-system",
++      "mtu": 9000,
++      "networks": [
++        "MANAGEMENT",
++        "VMOTION",
++        "VSAN"
++      ],
++      "nsxTeamings": [
++        {
++          "activeUplinks": [
++            "uplink1",
++            "uplink2"
++          ],
++          "policy": "LOADBALANCE_SRCID"
++        }
++      ],
++      "nsxtSwitchConfig": {
++        "hostSwitchOperationalMode": "STANDARD",
++        "ipAssignmentType": "STATIC",
++        "transportZones": [
++          {
++            "name": "fin-wld-vlan-tz",
++            "transportType": "VLAN"
++          }
++        ]
++      },
++      "vmnicsToUplinks": [
++        {
++          "id": "vmnic0",
++          "uplink": "uplink1"
++        },
++        {
++          "id": "vmnic1",
++          "uplink": "uplink2"
++        }
++      ]
++    },
++    {
++      "dvsName": "fin-wld-vds-overlay",
++      "mtu": 9000,
++      "networks": [
++        "VM_MANAGEMENT",
++        "NSX_TEP"
++      ],
++      "nsxTeamings": [
++        {
++          "activeUplinks": [
++            "uplink1",
++            "uplink2"
++          ],
++          "policy": "LOADBALANCE_SRCID"
++        }
++      ],
++      "nsxtSwitchConfig": {
++        "hostSwitchOperationalMode": "STANDARD",
++        "ipAssignmentType": "STATIC",
++        "transportZones": [
++          {
++            "name": "fin-wld-overlay-tz",
++            "transportType": "OVERLAY"
++          }
++        ]
++      },
++      "vmnicsToUplinks": [
++        {
++          "id": "vmnic2",
++          "uplink": "uplink1"
++        },
++        {
++          "id": "vmnic3",
++          "uplink": "uplink2"
++        }
++      ]
++    }
++  ],
++  "hostSpecs": [
++    {
++      "credentials": {
++        "password": "${VCF_ESXI_ROOT_PASSWORD}",
++        "username": "root"
++      },
++      "hostname": "fin-a-esx01"
++    },
++    {
++      "credentials": {
++        "password": "${VCF_ESXI_ROOT_PASSWORD}",
++        "username": "root"
++      },
++      "hostname": "fin-a-esx02"
++    },
++    {
++      "credentials": {
++        "password": "${VCF_ESXI_ROOT_PASSWORD}",
++        "username": "root"
++      },
++      "hostname": "fin-a-esx03"
++    },
++    {
++      "credentials": {
++        "password": "${VCF_ESXI_ROOT_PASSWORD}",
++        "username": "root"
++      },
++      "hostname": "fin-a-esx04"
++    },
++    {
++      "credentials": {
++        "password": "${VCF_ESXI_ROOT_PASSWORD}",
++        "username": "root"
++      },
++      "hostname": "fin-b-esx01"
++    },
++    {
++      "credentials": {
++        "password": "${VCF_ESXI_ROOT_PASSWORD}",
++        "username": "root"
++      },
++      "hostname": "fin-b-esx02"
++    },
++    {
++      "credentials": {
++        "password": "${VCF_ESXI_ROOT_PASSWORD}",
++        "username": "root"
++      },
++      "hostname": "fin-b-esx03"
++    },
++    {
++      "credentials": {
++        "password": "${VCF_ESXI_ROOT_PASSWORD}",
++        "username": "root"
++      },
++      "hostname": "fin-b-esx04"
++    }
++  ],
++  "managementPoolName": "fin-wld-management-pool",
++  "networkSpecs": [
++    {
++      "gateway": "10.61.10.1",
++      "includeIpAddressRanges": [
++        {
++          "endIpAddress": "10.61.10.79",
++          "startIpAddress": "10.61.10.40"
++        }
++      ],
++      "mtu": 9000,
++      "networkType": "MANAGEMENT",
++      "subnet": "10.61.10.0/24",
++      "vlanId": 2110
++    },
++    {
++      "gateway": "10.61.20.1",
++      "includeIpAddressRanges": [
++        {
++          "endIpAddress": "10.61.20.79",
++          "startIpAddress": "10.61.20.40"
++        }
++      ],
++      "mtu": 9000,
++      "networkType": "VMOTION",
++      "subnet": "10.61.20.0/24",
++      "vlanId": 2120
++    },
++    {
++      "gateway": "10.61.30.1",
++      "includeIpAddressRanges": [
++        {
++          "endIpAddress": "10.61.30.79",
++          "startIpAddress": "10.61.30.40"
++        }
++      ],
++      "mtu": 9000,
++      "networkType": "VSAN",
++      "subnet": "10.61.30.0/24",
++      "vlanId": 2130
++    },
++    {
++      "gateway": "10.61.40.1",
++      "includeIpAddressRanges": [
++        {
++          "endIpAddress": "10.61.40.79",
++          "startIpAddress": "10.61.40.40"
++        }
++      ],
++      "mtu": 9000,
++      "networkType": "VM_MANAGEMENT",
++      "subnet": "10.61.40.0/24",
++      "vlanId": 2140
++    },
++    {
++      "gateway": "10.61.50.1",
++      "includeIpAddressRanges": [
++        {
++          "endIpAddress": "10.61.50.79",
++          "startIpAddress": "10.61.50.20"
++        }
++      ],
++      "mtu": 9000,
++      "networkType": "NSX_TEP",
++      "subnet": "10.61.50.0/24",
++      "vlanId": 2150
++    }
++  ],
++  "nsxtSpec": {
++    "ipAddressPoolSpec": {
++      "name": "fin-wld-tep-pool",
++      "subnets": [
++        {
++          "cidr": "10.61.50.0/24",
++          "gateway": "10.61.50.1",
++          "ipAddressPoolRanges": [
++            {
++              "end": "10.61.50.79",
++              "start": "10.61.50.20"
++            }
++          ]
++        }
++      ]
++    },
++    "nsxtAdminPassword": "${VCF_NSX_ADMIN_PASSWORD}",
++    "nsxtAuditPassword": "${VCF_NSX_AUDIT_PASSWORD}",
++    "nsxtManagerSize": "medium",
++    "nsxtManagers": [
++      {
++        "hostname": "fin-nsx01.corp.example.com"
++      },
++      {
++        "hostname": "fin-nsx02.corp.example.com"
++      },
++      {
++        "hostname": "fin-nsx03.corp.example.com"
++      }
++    ],
++    "rootNsxtManagerPassword": "${VCF_NSX_ROOT_PASSWORD}",
++    "transportVlanId": 2150,
++    "vipFqdn": "fin-nsx.corp.example.com"
++  },
++  "ntpServers": [
++    "10.60.0.20",
++    "10.60.0.21"
++  ],
++  "sddcId": "fin-wld-01",
++  "sddcManagerSpec": {
++    "hostname": "fin-sddc01.corp.example.com",
++    "localUserPassword": "${VCF_SDDC_LOCAL_PASSWORD}",
++    "rootPassword": "${VCF_SDDC_ROOT_PASSWORD}",
++    "sshPassword": "${VCF_SDDC_SSH_PASSWORD}"
++  },
++  "securitySpec": {
++    "esxiCertsMode": "VMCA"
++  },
++  "skipEsxThumbprintValidation": false,
++  "skipGatewayPingValidation": false,
++  "vcenterSpec": {
++    "rootVcenterPassword": "${VCF_VCENTER_ROOT_PASSWORD}",
++    "ssoDomain": "vsphere.local",
++    "storageSize": "lstorage",
++    "vcenterHostname": "fin-wld-vc01.corp.example.com",
++    "vmSize": "medium"
++  },
++  "vcfInstanceName": "finance-wld",
++  "version": "9.0.0.0",
++  "workflowType": "VCF_EXTEND"
++}
+diff --git a/architecture_test.go b/architecture_test.go
+new file mode 100644
+index 0000000..afffe1b
+--- /dev/null
++++ b/architecture_test.go
+@@ -0,0 +1,223 @@
++package vcfarch
++
++import (
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"reflect"
++	"strings"
++	"testing"
++)
++
++func loadFixtureInputs(t *testing.T) Inputs {
++	t.Helper()
++	inputs, err := LoadInputs("fixtures/requirements.json", "fixtures/estate.json", "pinned/compatibility.json")
++	if err != nil {
++		t.Fatalf("LoadInputs: %v", err)
++	}
++	return inputs
++}
++
++func TestLoadInputs(t *testing.T) {
++	base := loadFixtureInputs(t)
++	tests := []struct {
++		name   string
++		mutate func(*Inputs)
++		want   string
++	}{
++		{"valid", func(*Inputs) {}, ""},
++		{"duplicate host", func(in *Inputs) { in.Requirements.Hosts = append(in.Requirements.Hosts, in.Requirements.Hosts[0]) }, "duplicate hostname"},
++		{"duplicate estate component", func(in *Inputs) { in.Estate.Components = append(in.Estate.Components, in.Estate.Components[0]) }, "duplicate estate component"},
++		{"duplicate transition", func(in *Inputs) {
++			in.Compatibility.Transitions = append(in.Compatibility.Transitions, in.Compatibility.Transitions[0])
++		}, "duplicate compatibility transition"},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			in := deepCopy(t, base)
++			tc.mutate(&in)
++			dir := t.TempDir()
++			paths := []string{filepath.Join(dir, "requirements.json"), filepath.Join(dir, "estate.json"), filepath.Join(dir, "compatibility.json")}
++			writeJSON(t, paths[0], in.Requirements)
++			writeJSON(t, paths[1], in.Estate)
++			writeJSON(t, paths[2], in.Compatibility)
++			_, err := LoadInputs(paths[0], paths[1], paths[2])
++			if tc.want == "" {
++				if err != nil {
++					t.Fatalf("LoadInputs: %v", err)
++				}
++				return
++			}
++			if err == nil || !strings.Contains(err.Error(), tc.want) {
++				t.Fatalf("error = %v, want text %q", err, tc.want)
++			}
++		})
++	}
++}
++
++func TestBuildSddcSpec(t *testing.T) {
++	base := loadFixtureInputs(t).Requirements
++	tests := []struct {
++		name   string
++		mutate func(*Requirements)
++		want   string
++	}{
++		{"valid", func(*Requirements) {}, ""},
++		{"site lacks candidates", func(req *Requirements) { req.Availability.HostsPerSite = 6 }, "needs 6"},
++		{"cpu capacity", func(req *Requirements) { req.Capacity.UsableCores = 300 }, "cannot carry"},
++		{"memory capacity", func(req *Requirements) { req.Capacity.UsableMemoryGiB = 5000 }, "cannot carry"},
++		{"storage capacity", func(req *Requirements) { req.Capacity.UsableStorageTiB = 50 }, "cannot carry"},
++		{"management collision", func(req *Requirements) { req.WorkloadDomain = req.ManagementDomain }, "protected management domain"},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			req := deepCopy(t, base)
++			tc.mutate(&req)
++			spec, err := BuildSddcSpec(req)
++			if tc.want != "" {
++				if err == nil || !strings.Contains(err.Error(), tc.want) {
++					t.Fatalf("error = %v, want text %q", err, tc.want)
++				}
++				return
++			}
++			if err != nil {
++				t.Fatalf("BuildSddcSpec: %v", err)
++			}
++			if spec["workflowType"] != "VCF_EXTEND" || spec["version"] != "9.0.0.0" {
++				t.Fatalf("unexpected identity: %#v", spec)
++			}
++		})
++	}
++}
++
++func TestBuildMigrationPlan(t *testing.T) {
++	inputs := loadFixtureInputs(t)
++	tests := []struct {
++		name     string
++		estate   Estate
++		snapshot CompatibilitySnapshot
++		want     string
++	}{
++		{"valid", inputs.Estate, inputs.Compatibility, ""},
++		{"unsupported component", withComponentVersion(t, inputs.Estate, "NSX", "4.2.3.3"), inputs.Compatibility, "no supported transition"},
++		{"management collision", withManagementCollision(inputs.Estate), inputs.Compatibility, "protected management domain"},
++		{"duplicate order", inputs.Estate, withDuplicateOrder(t, inputs.Compatibility), "duplicate compatibility order"},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			plan, err := BuildMigrationPlan(tc.estate, tc.snapshot)
++			if tc.want != "" {
++				if err == nil || !strings.Contains(err.Error(), tc.want) {
++					t.Fatalf("error = %v, want text %q", err, tc.want)
++				}
++				return
++			}
++			if err != nil {
++				t.Fatalf("BuildMigrationPlan: %v", err)
++			}
++			if len(plan.Steps) != len(tc.estate.Components) {
++				t.Fatalf("got %d steps, want %d", len(plan.Steps), len(tc.estate.Components))
++			}
++			for i := 1; i < len(plan.Steps); i++ {
++				if plan.Steps[i-1].Order >= plan.Steps[i].Order {
++					t.Fatal("steps are not strictly ordered")
++				}
++			}
++		})
++	}
++}
++
++func TestWriteArtifacts(t *testing.T) {
++	inputs := loadFixtureInputs(t)
++	spec, err := BuildSddcSpec(inputs.Requirements)
++	if err != nil {
++		t.Fatal(err)
++	}
++	plan, err := BuildMigrationPlan(inputs.Estate, inputs.Compatibility)
++	if err != nil {
++		t.Fatal(err)
++	}
++	tests := []struct {
++		name string
++		spec SddcSpec
++		ok   bool
++	}{
++		{"valid", spec, true},
++		{"encoding failure changes nothing", SddcSpec{"unsupported": func() {}}, false},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			dir := t.TempDir()
++			oldSpec := []byte("old spec\n")
++			oldPlan := []byte("old plan\n")
++			if err := os.WriteFile(filepath.Join(dir, "sddc-spec.json"), oldSpec, 0o644); err != nil {
++				t.Fatal(err)
++			}
++			if err := os.WriteFile(filepath.Join(dir, "migration-plan.json"), oldPlan, 0o644); err != nil {
++				t.Fatal(err)
++			}
++			err := WriteArtifacts(dir, tc.spec, plan)
++			if tc.ok {
++				if err != nil {
++					t.Fatalf("WriteArtifacts: %v", err)
++				}
++				return
++			}
++			if err == nil {
++				t.Fatal("WriteArtifacts returned nil error")
++			}
++			gotSpec, _ := os.ReadFile(filepath.Join(dir, "sddc-spec.json"))
++			gotPlan, _ := os.ReadFile(filepath.Join(dir, "migration-plan.json"))
++			if !reflect.DeepEqual(gotSpec, oldSpec) || !reflect.DeepEqual(gotPlan, oldPlan) {
++				t.Fatal("failed publication changed one or both existing artifacts")
++			}
++		})
++	}
++}
++
++func deepCopy[T any](t *testing.T, in T) T {
++	t.Helper()
++	raw, err := json.Marshal(in)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var out T
++	if err := json.Unmarshal(raw, &out); err != nil {
++		t.Fatal(err)
++	}
++	return out
++}
++
++func writeJSON(t *testing.T, path string, value any) {
++	t.Helper()
++	raw, err := json.Marshal(value)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(path, raw, 0o644); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func withComponentVersion(t *testing.T, estate Estate, component, version string) Estate {
++	t.Helper()
++	out := deepCopy(t, estate)
++	for i := range out.Components {
++		if out.Components[i].Name == component {
++			out.Components[i].Version = version
++		}
++	}
++	return out
++}
++
++func withManagementCollision(estate Estate) Estate {
++	estate.WorkloadDomain = estate.ManagementDomain
++	return estate
++}
++
++func withDuplicateOrder(t *testing.T, snapshot CompatibilitySnapshot) CompatibilitySnapshot {
++	t.Helper()
++	out := deepCopy(t, snapshot)
++	out.Transitions[1].Order = out.Transitions[0].Order
++	return out
++}

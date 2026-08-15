@@ -1,0 +1,712 @@
+diff --git a/files/architecture.go b/files/architecture.go
+index 9f3d6d957e281559b4874ca236c0ad98c489f652..8f4b042f8d187da0fcc3d42985dc37610ba6e371 100644
+--- a/files/architecture.go
++++ b/files/architecture.go
+@@ -2,6 +2,8 @@ package vcfarch
+ 
+ import (
+ 	"errors"
++	"fmt"
++	"sort"
+ )
+ 
+ // Inventory is the separately managed estate and the physical placement input.
+@@ -101,6 +103,277 @@ type MigrationStep struct {
+ }
+ 
+ // BuildArchitecture returns the complete greenfield and brownfield architecture.
+-func BuildArchitecture(_ Inventory, _ CompatibilitySnapshot) (Architecture, error) {
+-	return Architecture{}, errors.New("BuildArchitecture is not implemented")
++func BuildArchitecture(inventory Inventory, snapshot CompatibilitySnapshot) (Architecture, error) {
++	if inventory.EstateID == "" {
++		return Architecture{}, errors.New("estate ID is required")
++	}
++	if inventory.TargetVCFVersion == "" || inventory.TargetVCFVersion != snapshot.TargetVCFVersion {
++		return Architecture{}, errors.New("inventory and compatibility target versions differ")
++	}
++
++	rules := make(map[string]ProductRule, len(snapshot.ProductRules))
++	for _, rule := range snapshot.ProductRules {
++		if rule.ComponentType == "" || len(rule.AllowedActions) == 0 {
++			return Architecture{}, errors.New("compatibility snapshot has an incomplete product rule")
++		}
++		if _, duplicate := rules[rule.ComponentType]; duplicate {
++			return Architecture{}, fmt.Errorf("duplicate product rule for %s", rule.ComponentType)
++		}
++		rules[rule.ComponentType] = rule
++	}
++	gates := make(map[string]GateRule, len(snapshot.Gates))
++	for _, gate := range snapshot.Gates {
++		if gate.ID == "" {
++			return Architecture{}, errors.New("compatibility snapshot has a gate without an ID")
++		}
++		gates[gate.ID] = gate
++	}
++
++	componentByID := make(map[string]EstateComponent, len(inventory.Components))
++	for _, component := range inventory.Components {
++		if component.ID == "" {
++			return Architecture{}, errors.New("inventory has a component without an ID")
++		}
++		if _, duplicate := componentByID[component.ID]; duplicate {
++			return Architecture{}, fmt.Errorf("duplicate inventory component %s", component.ID)
++		}
++		rule, supported := rules[component.Type]
++		if !supported {
++			return Architecture{}, fmt.Errorf("no compatibility rule for component type %s", component.Type)
++		}
++		if !contains(rule.AllowedFromVersions, component.Version) {
++			return Architecture{}, fmt.Errorf("no path from %s %s", component.Type, component.Version)
++		}
++		for _, gateID := range rule.RequiredGateIDs {
++			if _, exists := gates[gateID]; !exists {
++				return Architecture{}, fmt.Errorf("product rule %s refers to unknown gate %s", component.Type, gateID)
++			}
++		}
++		componentByID[component.ID] = component
++	}
++
++	dataSites, witnessSite, err := classifySites(inventory.Sites)
++	if err != nil {
++		return Architecture{}, err
++	}
++	orderedComponents, err := orderComponents(inventory.Components, rules, gates)
++	if err != nil {
++		return Architecture{}, err
++	}
++
++	steps := make([]MigrationStep, 0, len(orderedComponents))
++	for index, component := range orderedComponents {
++		rule := rules[component.Type]
++		steps = append(steps, MigrationStep{
++			Order:         index + 1,
++			ComponentID:   component.ID,
++			ComponentType: component.Type,
++			Site:          component.Site,
++			FromVersion:   component.Version,
++			TargetProduct: rule.TargetProduct,
++			TargetVersion: rule.TargetVersion,
++			Action:        rule.AllowedActions[0],
++			Gates:         append([]string(nil), rule.RequiredGateIDs...),
++		})
++	}
++
++	return Architecture{
++		GreenfieldSddcSpec: buildSddcSpec(inventory.TargetVCFVersion, dataSites),
++		Topology: Topology{ManagementDomain: ManagementDomain{
++			Name:      "vcf-mgmt-stretched",
++			Stretched: true,
++			DataSites: []DataSite{
++				{
++					SiteID:        dataSites[0].ID,
++					FailureDomain: dataSites[0].FailureDomain,
++					Hosts:         append([]string(nil), dataSites[0].ManagementHosts...),
++				},
++				{
++					SiteID:        dataSites[1].ID,
++					FailureDomain: dataSites[1].FailureDomain,
++					Hosts:         append([]string(nil), dataSites[1].ManagementHosts...),
++				},
++			},
++			Witness: Witness{
++				SiteID:                   witnessSite.ID,
++				FailureDomain:            witnessSite.FailureDomain,
++				Appliance:                witnessSite.WitnessAppliance,
++				IndependentFailureDomain: true,
++			},
++		}},
++		MigrationPlan: MigrationPlan{
++			EstateID:         inventory.EstateID,
++			TargetVCFVersion: inventory.TargetVCFVersion,
++			Steps:            steps,
++		},
++	}, nil
++}
++
++func classifySites(sites []Site) ([]Site, Site, error) {
++	dataSites := make([]Site, 0, 2)
++	var witness Site
++	witnesses := 0
++	for _, site := range sites {
++		switch site.Role {
++		case "data":
++			if len(site.ManagementHosts) == 0 {
++				return nil, Site{}, fmt.Errorf("data site %s has no management hosts", site.ID)
++			}
++			dataSites = append(dataSites, site)
++		case "witness":
++			witness = site
++			witnesses++
++		}
++	}
++	if len(dataSites) != 2 {
++		return nil, Site{}, fmt.Errorf("got %d data sites, want two", len(dataSites))
++	}
++	if witnesses != 1 || witness.WitnessAppliance == "" {
++		return nil, Site{}, errors.New("exactly one witness site with an appliance is required")
++	}
++	if witness.FailureDomain == dataSites[0].FailureDomain || witness.FailureDomain == dataSites[1].FailureDomain {
++		return nil, Site{}, errors.New("witness failure domain must be independent")
++	}
++	return dataSites, witness, nil
++}
++
++func orderComponents(components []EstateComponent, rules map[string]ProductRule, gates map[string]GateRule) ([]EstateComponent, error) {
++	dependencies := make(map[string]map[string]bool, len(components))
++	for _, component := range components {
++		dependencies[component.ID] = map[string]bool{}
++		for _, gateID := range rules[component.Type].RequiredGateIDs {
++			gate := gates[gateID]
++			for _, predecessor := range components {
++				if !contains(gate.PredecessorTypes, predecessor.Type) {
++					continue
++				}
++				if gate.Scope == "same-site" && predecessor.Site != component.Site {
++					continue
++				}
++				dependencies[component.ID][predecessor.ID] = true
++			}
++		}
++	}
++
++	remaining := make(map[string]EstateComponent, len(components))
++	for _, component := range components {
++		remaining[component.ID] = component
++	}
++	done := map[string]bool{}
++	ordered := make([]EstateComponent, 0, len(components))
++	for len(remaining) > 0 {
++		ready := make([]string, 0, len(remaining))
++		for id := range remaining {
++			allDone := true
++			for dependency := range dependencies[id] {
++				if !done[dependency] {
++					allDone = false
++					break
++				}
++			}
++			if allDone {
++				ready = append(ready, id)
++			}
++		}
++		if len(ready) == 0 {
++			return nil, errors.New("compatibility gates contain a dependency cycle")
++		}
++		sort.Strings(ready)
++		next := ready[0]
++		ordered = append(ordered, remaining[next])
++		delete(remaining, next)
++		done[next] = true
++	}
++	return ordered, nil
++}
++
++func buildSddcSpec(version string, dataSites []Site) map[string]any {
++	hostSpecs := make([]any, 0, len(dataSites[0].ManagementHosts)+len(dataSites[1].ManagementHosts))
++	for _, site := range dataSites {
++		for _, hostname := range site.ManagementHosts {
++			hostSpecs = append(hostSpecs, map[string]any{"hostname": hostname})
++		}
++	}
++	return map[string]any{
++		"sddcId":       "vcf-mgmt-stretched",
++		"workflowType": "VCF",
++		"version":      version,
++		"hostSpecs":    hostSpecs,
++		"vcenterSpec": map[string]any{
++			"vcenterHostname":     "vc-mgmt.vcf.example",
++			"rootVcenterPassword": "SeedOnly!VcPass1",
++			"vmSize":              "medium",
++			"ssoDomain":           "vsphere.local",
++		},
++		"clusterSpec": map[string]any{
++			"datacenterName": "vcf-management",
++			"clusterName":    "vcf-mgmt-stretched",
++		},
++		"dvsSpecs": []any{
++			map[string]any{
++				"dvsName":  "vds-mgmt",
++				"networks": []any{"MANAGEMENT", "VMOTION", "VSAN", "VM_MANAGEMENT"},
++				"mtu":      9000,
++				"vmnicsToUplinks": []any{
++					map[string]any{"id": "vmnic0", "uplink": "uplink1"},
++					map[string]any{"id": "vmnic1", "uplink": "uplink2"},
++				},
++			},
++		},
++		"nsxtSpec": map[string]any{
++			"nsxtManagers": []any{
++				map[string]any{"hostname": "nsx-mgr-01.vcf.example"},
++				map[string]any{"hostname": "nsx-mgr-02.vcf.example"},
++				map[string]any{"hostname": "nsx-mgr-03.vcf.example"},
++			},
++			"nsxtManagerSize": "medium",
++			"vipFqdn":         "nsx-mgmt.vcf.example",
++			"transportVlanId": 1700,
++		},
++		"networkSpecs": []any{
++			managementNetwork("MANAGEMENT", "10.10.10.0/24", "10.10.10.1", 1610, "10.10.10.20", "10.10.10.39"),
++			managementNetwork("VMOTION", "10.10.20.0/24", "10.10.20.1", 1620, "10.10.20.20", "10.10.20.39"),
++			managementNetwork("VSAN", "10.10.30.0/24", "10.10.30.1", 1630, "10.10.30.20", "10.10.30.39"),
++			managementNetwork("VM_MANAGEMENT", "10.10.40.0/24", "10.10.40.1", 1640, "10.10.40.20", "10.10.40.39"),
++		},
++		"dnsSpec": map[string]any{
++			"subdomain":   "vcf.example",
++			"nameservers": []any{"10.10.10.10", "10.10.10.11"},
++		},
++		"ntpServers": []any{"10.10.10.12", "10.10.10.13"},
++		"sddcManagerSpec": map[string]any{
++			"hostname": "sddc-manager.vcf.example",
++		},
++		"managementPoolName": "mgmt-network-pool",
++		"ceipEnabled":        false,
++		"datastoreSpec": map[string]any{
++			"vsanSpec": map[string]any{
++				"datastoreName":      "vsan-mgmt-stretched",
++				"failuresToTolerate": 1,
++			},
++		},
++	}
++}
++
++func managementNetwork(networkType, subnet, gateway string, vlan int, start, end string) map[string]any {
++	return map[string]any{
++		"networkType": networkType,
++		"subnet":      subnet,
++		"gateway":     gateway,
++		"subnetMask":  "255.255.255.0",
++		"vlanId":      vlan,
++		"mtu":         9000,
++		"includeIpAddressRanges": []any{
++			map[string]any{"startIpAddress": start, "endIpAddress": end},
++		},
++	}
++}
++
++func contains(values []string, target string) bool {
++	for _, value := range values {
++		if value == target {
++			return true
++		}
++	}
++	return false
+ }
+diff --git a/files/architecture.json b/files/architecture.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..f106c02c793582f5cecfa1dfa5b92a4c99bfb153
+--- /dev/null
++++ b/files/architecture.json
+@@ -0,0 +1,359 @@
++{
++  "greenfieldSddcSpec": {
++    "ceipEnabled": false,
++    "clusterSpec": {
++      "clusterName": "vcf-mgmt-stretched",
++      "datacenterName": "vcf-management"
++    },
++    "datastoreSpec": {
++      "vsanSpec": {
++        "datastoreName": "vsan-mgmt-stretched",
++        "failuresToTolerate": 1
++      }
++    },
++    "dnsSpec": {
++      "nameservers": [
++        "10.10.10.10",
++        "10.10.10.11"
++      ],
++      "subdomain": "vcf.example"
++    },
++    "dvsSpecs": [
++      {
++        "dvsName": "vds-mgmt",
++        "mtu": 9000,
++        "networks": [
++          "MANAGEMENT",
++          "VMOTION",
++          "VSAN",
++          "VM_MANAGEMENT"
++        ],
++        "vmnicsToUplinks": [
++          {
++            "id": "vmnic0",
++            "uplink": "uplink1"
++          },
++          {
++            "id": "vmnic1",
++            "uplink": "uplink2"
++          }
++        ]
++      }
++    ],
++    "hostSpecs": [
++      {
++        "hostname": "a-esx-01"
++      },
++      {
++        "hostname": "a-esx-02"
++      },
++      {
++        "hostname": "a-esx-03"
++      },
++      {
++        "hostname": "a-esx-04"
++      },
++      {
++        "hostname": "b-esx-01"
++      },
++      {
++        "hostname": "b-esx-02"
++      },
++      {
++        "hostname": "b-esx-03"
++      },
++      {
++        "hostname": "b-esx-04"
++      }
++    ],
++    "managementPoolName": "mgmt-network-pool",
++    "networkSpecs": [
++      {
++        "gateway": "10.10.10.1",
++        "includeIpAddressRanges": [
++          {
++            "endIpAddress": "10.10.10.39",
++            "startIpAddress": "10.10.10.20"
++          }
++        ],
++        "mtu": 9000,
++        "networkType": "MANAGEMENT",
++        "subnet": "10.10.10.0/24",
++        "subnetMask": "255.255.255.0",
++        "vlanId": 1610
++      },
++      {
++        "gateway": "10.10.20.1",
++        "includeIpAddressRanges": [
++          {
++            "endIpAddress": "10.10.20.39",
++            "startIpAddress": "10.10.20.20"
++          }
++        ],
++        "mtu": 9000,
++        "networkType": "VMOTION",
++        "subnet": "10.10.20.0/24",
++        "subnetMask": "255.255.255.0",
++        "vlanId": 1620
++      },
++      {
++        "gateway": "10.10.30.1",
++        "includeIpAddressRanges": [
++          {
++            "endIpAddress": "10.10.30.39",
++            "startIpAddress": "10.10.30.20"
++          }
++        ],
++        "mtu": 9000,
++        "networkType": "VSAN",
++        "subnet": "10.10.30.0/24",
++        "subnetMask": "255.255.255.0",
++        "vlanId": 1630
++      },
++      {
++        "gateway": "10.10.40.1",
++        "includeIpAddressRanges": [
++          {
++            "endIpAddress": "10.10.40.39",
++            "startIpAddress": "10.10.40.20"
++          }
++        ],
++        "mtu": 9000,
++        "networkType": "VM_MANAGEMENT",
++        "subnet": "10.10.40.0/24",
++        "subnetMask": "255.255.255.0",
++        "vlanId": 1640
++      }
++    ],
++    "nsxtSpec": {
++      "nsxtManagerSize": "medium",
++      "nsxtManagers": [
++        {
++          "hostname": "nsx-mgr-01.vcf.example"
++        },
++        {
++          "hostname": "nsx-mgr-02.vcf.example"
++        },
++        {
++          "hostname": "nsx-mgr-03.vcf.example"
++        }
++      ],
++      "transportVlanId": 1700,
++      "vipFqdn": "nsx-mgmt.vcf.example"
++    },
++    "ntpServers": [
++      "10.10.10.12",
++      "10.10.10.13"
++    ],
++    "sddcId": "vcf-mgmt-stretched",
++    "sddcManagerSpec": {
++      "hostname": "sddc-manager.vcf.example"
++    },
++    "vcenterSpec": {
++      "rootVcenterPassword": "SeedOnly!VcPass1",
++      "ssoDomain": "vsphere.local",
++      "vcenterHostname": "vc-mgmt.vcf.example",
++      "vmSize": "medium"
++    },
++    "version": "9.1.0.0",
++    "workflowType": "VCF"
++  },
++  "topology": {
++    "managementDomain": {
++      "name": "vcf-mgmt-stretched",
++      "stretched": true,
++      "dataSites": [
++        {
++          "siteId": "site-a",
++          "failureDomain": "metro-a",
++          "hosts": [
++            "a-esx-01",
++            "a-esx-02",
++            "a-esx-03",
++            "a-esx-04"
++          ]
++        },
++        {
++          "siteId": "site-b",
++          "failureDomain": "metro-b",
++          "hosts": [
++            "b-esx-01",
++            "b-esx-02",
++            "b-esx-03",
++            "b-esx-04"
++          ]
++        }
++      ],
++      "witness": {
++        "siteId": "witness-site",
++        "failureDomain": "regional-witness",
++        "appliance": "witness-01.witness.vcf.example",
++        "independentFailureDomain": true
++      }
++    }
++  },
++  "migrationPlan": {
++    "estateId": "northwind-two-site",
++    "targetVcfVersion": "9.1.0.0",
++    "steps": [
++      {
++        "order": 1,
++        "componentId": "lsr-a",
++        "componentType": "live-site-recovery",
++        "site": "site-a",
++        "fromVersion": "9.0.2.0",
++        "targetProduct": "protection-and-recovery",
++        "targetVersion": "9.1.0.0",
++        "action": "replace",
++        "gates": [
++          "vcf-91-bom-target",
++          "paired-recovery-compatibility"
++        ]
++      },
++      {
++        "order": 2,
++        "componentId": "lsr-b",
++        "componentType": "live-site-recovery",
++        "site": "site-b",
++        "fromVersion": "9.0.1.0",
++        "targetProduct": "protection-and-recovery",
++        "targetVersion": "9.1.0.0",
++        "action": "replace",
++        "gates": [
++          "vcf-91-bom-target",
++          "paired-recovery-compatibility"
++        ]
++      },
++      {
++        "order": 3,
++        "componentId": "nsx-a",
++        "componentType": "nsx",
++        "site": "site-a",
++        "fromVersion": "4.2.1.0",
++        "targetProduct": "nsx",
++        "targetVersion": "9.1.0.0",
++        "action": "upgrade",
++        "gates": [
++          "vcf-91-bom-target"
++        ]
++      },
++      {
++        "order": 4,
++        "componentId": "nsx-b",
++        "componentType": "nsx",
++        "site": "site-b",
++        "fromVersion": "4.2.2.0",
++        "targetProduct": "nsx",
++        "targetVersion": "9.1.0.0",
++        "action": "upgrade",
++        "gates": [
++          "vcf-91-bom-target"
++        ]
++      },
++      {
++        "order": 5,
++        "componentId": "vc-a",
++        "componentType": "vcenter",
++        "site": "site-a",
++        "fromVersion": "8.0.3.0",
++        "targetProduct": "vcenter",
++        "targetVersion": "9.1.0.0",
++        "action": "upgrade",
++        "gates": [
++          "vcf-91-bom-target",
++          "lsr-before-vcenter",
++          "nsx-before-vcenter"
++        ]
++      },
++      {
++        "order": 6,
++        "componentId": "esxi-a",
++        "componentType": "esxi",
++        "site": "site-a",
++        "fromVersion": "8.0.3.0",
++        "targetProduct": "esxi",
++        "targetVersion": "9.1.0.0",
++        "action": "upgrade",
++        "gates": [
++          "vcf-91-bom-target",
++          "vcenter-before-esxi",
++          "nsx-before-esxi"
++        ]
++      },
++      {
++        "order": 7,
++        "componentId": "vc-b",
++        "componentType": "vcenter",
++        "site": "site-b",
++        "fromVersion": "8.0.2.0",
++        "targetProduct": "vcenter",
++        "targetVersion": "9.1.0.0",
++        "action": "upgrade",
++        "gates": [
++          "vcf-91-bom-target",
++          "lsr-before-vcenter",
++          "nsx-before-vcenter"
++        ]
++      },
++      {
++        "order": 8,
++        "componentId": "esxi-b",
++        "componentType": "esxi",
++        "site": "site-b",
++        "fromVersion": "8.0.2.0",
++        "targetProduct": "esxi",
++        "targetVersion": "9.1.0.0",
++        "action": "upgrade",
++        "gates": [
++          "vcf-91-bom-target",
++          "vcenter-before-esxi",
++          "nsx-before-esxi"
++        ]
++      },
++      {
++        "order": 9,
++        "componentId": "vsan-witness",
++        "componentType": "vsan-witness",
++        "site": "witness-site",
++        "fromVersion": "8.0.3.0",
++        "targetProduct": "vsan-witness",
++        "targetVersion": "9.1.0.0",
++        "action": "upgrade",
++        "gates": [
++          "vcf-91-bom-target",
++          "vcenter-before-witness"
++        ]
++      },
++      {
++        "order": 10,
++        "componentId": "vsan-a",
++        "componentType": "vsan",
++        "site": "site-a",
++        "fromVersion": "8.0.3.0",
++        "targetProduct": "vsan",
++        "targetVersion": "9.1.0.0",
++        "action": "upgrade",
++        "gates": [
++          "vcf-91-bom-target",
++          "esxi-before-vsan",
++          "witness-before-data-vsan"
++        ]
++      },
++      {
++        "order": 11,
++        "componentId": "vsan-b",
++        "componentType": "vsan",
++        "site": "site-b",
++        "fromVersion": "8.0.2.0",
++        "targetProduct": "vsan",
++        "targetVersion": "9.1.0.0",
++        "action": "upgrade",
++        "gates": [
++          "vcf-91-bom-target",
++          "esxi-before-vsan",
++          "witness-before-data-vsan"
++        ]
++      }
++    ]
++  }
++}
+diff --git a/files/architecture_unit_test.go b/files/architecture_unit_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..709f0f3dbf3387beb7157a17fa1daf104610714d
+--- /dev/null
++++ b/files/architecture_unit_test.go
+@@ -0,0 +1,35 @@
++package vcfarch
++
++import "testing"
++
++func TestBuildArchitectureRejectsInvalidInputs(t *testing.T) {
++	validInventory := Inventory{
++		EstateID:         "estate",
++		TargetVCFVersion: "9.1.0.0",
++		Sites: []Site{
++			{ID: "a", Role: "data", FailureDomain: "a-fd", ManagementHosts: []string{"a1"}},
++			{ID: "b", Role: "data", FailureDomain: "b-fd", ManagementHosts: []string{"b1"}},
++			{ID: "w", Role: "witness", FailureDomain: "w-fd", WitnessAppliance: "witness.example"},
++		},
++	}
++	validSnapshot := CompatibilitySnapshot{TargetVCFVersion: "9.1.0.0"}
++
++	tests := []struct {
++		name      string
++		inventory Inventory
++		snapshot  CompatibilitySnapshot
++	}{
++		{name: "missing estate ID", inventory: func() Inventory { value := validInventory; value.EstateID = ""; return value }(), snapshot: validSnapshot},
++		{name: "target mismatch", inventory: validInventory, snapshot: CompatibilitySnapshot{TargetVCFVersion: "9.0.0.0"}},
++		{name: "missing witness", inventory: func() Inventory { value := validInventory; value.Sites = value.Sites[:2]; return value }(), snapshot: validSnapshot},
++		{name: "one data site", inventory: func() Inventory { value := validInventory; value.Sites = value.Sites[1:]; return value }(), snapshot: validSnapshot},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			if _, err := BuildArchitecture(test.inventory, test.snapshot); err == nil {
++				t.Fatal("BuildArchitecture returned no error")
++			}
++		})
++	}
++}
+diff --git a/files/research.md b/files/research.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..33265bc592ef5e70af58a0c20ed2864fe7587b67
+--- /dev/null
++++ b/files/research.md
+@@ -0,0 +1,7 @@
++# Sources consulted
++
++- **Broadcom, “Upgrade Sequence and Related Issues for VMware Cloud Foundation and vSphere Foundation 9.1.”** https://knowledge.broadcom.com/external/article/440630/upgrade-sequence-and-related-issues-for.html — accessed 2026-08-14. Confirmed the supported VCF 9.1 convergence path for a vSphere 8 estate containing vCenter, ESX, vSAN, and NSX; the pinned snapshot supplies this deliverable's deterministic component gates.
++- **Broadcom, “Product Interoperability Matrix.”** https://interopmatrix.broadcom.com/Interoperability — accessed 2026-08-14. Checked compatibility and interoperability for the estate's vCenter, ESX, vSAN, NSX, and Live Site Recovery pairs before applying the pinned target contract.
++- **Broadcom, “Build numbers and versions of VMware NSX/NSX-T Data Center.”** https://knowledge.broadcom.com/external/article/317797/build-numbers-and-versions-of-vmware-nsx.html — accessed 2026-08-14. Confirmed from the linked release history that the two NSX 4.2 source lines and the NSX 9.1 target are published releases.
++- **Broadcom, “Build numbers and versions of VCF Protection and Recovery (formally VMware Live Recovery).”** https://knowledge.broadcom.com/external/article/426655/build-numbers-and-versions-of-vmware-liv.html — accessed 2026-08-14. Confirmed the Protection and Recovery 9.1 target release and the product transition from the separately managed recovery line.
++- **Broadcom, “VCF Protection and Recovery 9.1: Transition from standalone SRM and VR 9.0.2.”** https://knowledge.broadcom.com/external/article/444864/vcf-protection-and-recovery-91-transitio.html — accessed 2026-08-14. Confirmed that standalone Live Site Recovery is replaced by Protection and Recovery rather than upgraded in place; where live sequencing differs, the pinned snapshot remains the requested ordering authority.

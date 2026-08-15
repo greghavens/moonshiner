@@ -1,0 +1,657 @@
+diff --git a/architecture/planner.go b/architecture/planner.go
+index aaa7fe5..555e9b8 100644
+--- a/architecture/planner.go
++++ b/architecture/planner.go
+@@ -1,11 +1,194 @@
+ package architecture
+ 
+-import "errors"
+-
+-var ErrNotImplemented = errors.New("architecture planner is not implemented")
++import (
++	"encoding/json"
++	"fmt"
++	"sort"
++)
+ 
+ // Build derives a complete architecture from an inventory and a pinned
+ // compatibility snapshot.
+-func Build(Inventory, CompatibilitySnapshot) (Architecture, error) {
+-	return Architecture{}, ErrNotImplemented
++func Build(inventory Inventory, snapshot CompatibilitySnapshot) (Architecture, error) {
++	if inventory.FleetTarget == "" || inventory.FleetTarget != snapshot.FleetTarget ||
++		inventory.Greenfield.Version != snapshot.FleetTarget {
++		return Architecture{}, fmt.Errorf("inventory, greenfield, and snapshot fleet targets must match")
++	}
++	if inventory.Greenfield.Optimization != "fewest-hosts" {
++		return Architecture{}, fmt.Errorf("unsupported storage optimization %q", inventory.Greenfield.Optimization)
++	}
++
++	allowed := make(map[string]bool)
++	for _, name := range inventory.Greenfield.AllowedStorageArchitectures {
++		if allowed[name] {
++			return Architecture{}, fmt.Errorf("duplicate allowed storage architecture %q", name)
++		}
++		allowed[name] = true
++	}
++	var alternatives []StorageAlternative
++	var selected *StorageOption
++	for i := range snapshot.StorageOptions {
++		option := &snapshot.StorageOptions[i]
++		if !allowed[option.Architecture] {
++			continue
++		}
++		uplinkGbps, ok := option.UplinkGbpsByProfile[inventory.Greenfield.PerformanceProfile]
++		if !ok {
++			return Architecture{}, fmt.Errorf("storage %s has no network rule for performance profile %q", option.Architecture, inventory.Greenfield.PerformanceProfile)
++		}
++		hostCount := option.PolicyMinimumHosts + inventory.Greenfield.ReserveHosts
++		alternatives = append(alternatives, StorageAlternative{
++			Architecture:        option.Architecture,
++			Policy:              option.Policy,
++			HostCount:           hostCount,
++			UplinksPerHost:      option.UplinksPerHost,
++			UplinkGbps:          uplinkGbps,
++			VsanMTU:             option.VsanMTU,
++			ESAEnabled:          option.ESAEnabled,
++			HardwareRequirement: option.HardwareRequirement,
++		})
++		if selected == nil {
++			selected = option
++			continue
++		}
++		selectedHosts := selected.PolicyMinimumHosts + inventory.Greenfield.ReserveHosts
++		if hostCount < selectedHosts || (hostCount == selectedHosts && option.PreferenceRank < selected.PreferenceRank) {
++			selected = option
++		}
++	}
++	if selected == nil || len(alternatives) != len(allowed) {
++		return Architecture{}, fmt.Errorf("one or more allowed storage architectures are absent from the compatibility snapshot")
++	}
++	selectedHosts := selected.PolicyMinimumHosts + inventory.Greenfield.ReserveHosts
++	if len(inventory.Greenfield.Hostnames) < selectedHosts {
++		return Architecture{}, fmt.Errorf("selected %s design needs %d hosts, but only %d hostnames are supplied", selected.Architecture, selectedHosts, len(inventory.Greenfield.Hostnames))
++	}
++
++	sddcSpec := map[string]any{
++		"sddcId":       inventory.Greenfield.SDDCID,
++		"version":      inventory.Greenfield.Version,
++		"workflowType": inventory.Greenfield.WorkflowType,
++		"dnsSpec":      copyJSON(inventory.Greenfield.DNSSpec),
++		"vcenterSpec":  copyJSON(inventory.Greenfield.VcenterSpec),
++		"networkSpecs": copyJSON(inventory.Greenfield.NetworkSpecs),
++		"dvsSpecs":     []any{copyJSON(inventory.Greenfield.DvsSpec)},
++		"nsxtSpec":     copyJSON(inventory.Greenfield.NsxtSpec),
++		"datastoreSpec": map[string]any{
++			"vsanSpec": map[string]any{
++				"datastoreName":      "vsan-" + inventory.Greenfield.SDDCID,
++				"failuresToTolerate": selected.FailuresToTolerate,
++				"esaConfig":          map[string]any{"enabled": selected.ESAEnabled},
++			},
++		},
++	}
++	hostSpecs := make([]any, 0, selectedHosts)
++	for _, hostname := range inventory.Greenfield.Hostnames[:selectedHosts] {
++		hostSpecs = append(hostSpecs, map[string]any{"hostname": hostname})
++	}
++	sddcSpec["hostSpecs"] = hostSpecs
++
++	steps, err := planMigration(inventory.Components, snapshot)
++	if err != nil {
++		return Architecture{}, err
++	}
++	selectedUplink := selected.UplinkGbpsByProfile[inventory.Greenfield.PerformanceProfile]
++	return Architecture{
++		SchemaVersion: "1.0",
++		FleetTarget:   inventory.FleetTarget,
++		Greenfield: GreenfieldDesign{
++			StorageDecision: StorageDecision{
++				SelectedArchitecture: selected.Architecture,
++				SelectionCriterion:   inventory.Greenfield.Optimization,
++				HostCount:            selectedHosts,
++				Policy:               selected.Policy,
++				Network: StorageNetwork{
++					UplinksPerHost: selected.UplinksPerHost,
++					UplinkGbps:     selectedUplink,
++					VsanMTU:        selected.VsanMTU,
++				},
++				Alternatives: alternatives,
++			},
++			SDDCSpec: sddcSpec,
++		},
++		Migration: MigrationPlan{Estate: inventory.EstateName, OrderedSteps: steps},
++	}, nil
++}
++
++type transition struct {
++	component Component
++	rule      MigrationRule
++}
++
++func planMigration(components []Component, snapshot CompatibilitySnapshot) ([]MigrationStep, error) {
++	transitions := make([]transition, 0, len(components))
++	ids := make(map[string]bool)
++	for _, component := range components {
++		if component.ID == "" || ids[component.ID] {
++			return nil, fmt.Errorf("component ID %q is empty or duplicated", component.ID)
++		}
++		ids[component.ID] = true
++		rule, ok := findRule(snapshot.MigrationRules, component)
++		if !ok {
++			return nil, fmt.Errorf("unsupported transition for %s %s %s", component.Type, component.Version, component.Architecture)
++		}
++		transitions = append(transitions, transition{component: component, rule: rule})
++	}
++	sort.Slice(transitions, func(i, j int) bool {
++		if transitions[i].rule.Sequence == transitions[j].rule.Sequence {
++			return transitions[i].component.ID < transitions[j].component.ID
++		}
++		return transitions[i].rule.Sequence < transitions[j].rule.Sequence
++	})
++
++	steps := make([]MigrationStep, 0, len(transitions))
++	completedTypes := make(map[string]bool)
++	for i, item := range transitions {
++		for _, predecessor := range item.rule.AfterComponentTypes {
++			if !completedTypes[predecessor] {
++				return nil, fmt.Errorf("component type %s must follow %s", item.component.Type, predecessor)
++			}
++		}
++		for _, gate := range item.rule.Gates {
++			if _, ok := snapshot.GateCatalog[gate]; !ok {
++				return nil, fmt.Errorf("transition for %s references unknown gate %q", item.component.ID, gate)
++			}
++		}
++		steps = append(steps, MigrationStep{
++			Order: i + 1,
++			Component: PlannedComponent{
++				ID: item.component.ID, Type: item.component.Type, Product: item.component.Product,
++				Version: item.component.Version, Architecture: item.component.Architecture,
++			},
++			Target: PlannedTarget{
++				Product: item.rule.TargetProduct, Version: item.rule.TargetVersion,
++				Architecture: item.rule.TargetArchitecture,
++			},
++			Action:      item.rule.Action,
++			UpgradePath: append([]string(nil), item.rule.UpgradePath...),
++			Gates:       append([]string(nil), item.rule.Gates...),
++		})
++		completedTypes[item.component.Type] = true
++	}
++	return steps, nil
++}
++
++func findRule(rules []MigrationRule, component Component) (MigrationRule, bool) {
++	for _, rule := range rules {
++		if rule.ComponentType == component.Type && rule.FromVersion == component.Version &&
++			(rule.FromArchitecture == "" || rule.FromArchitecture == component.Architecture) {
++			return rule, true
++		}
++	}
++	return MigrationRule{}, false
++}
++
++func copyJSON[T any](value T) T {
++	data, err := json.Marshal(value)
++	if err != nil {
++		panic(err)
++	}
++	var copied T
++	if err := json.Unmarshal(data, &copied); err != nil {
++		panic(err)
++	}
++	return copied
+ }
+diff --git a/cmd/vcfarch/main.go b/cmd/vcfarch/main.go
+index 3b83a7c..e8745ec 100644
+--- a/cmd/vcfarch/main.go
++++ b/cmd/vcfarch/main.go
+@@ -1,11 +1,62 @@
+ package main
+ 
+ import (
++	"encoding/json"
++	"flag"
+ 	"fmt"
+ 	"os"
++	"path/filepath"
++
++	arch "vcfarch-0125/architecture"
+ )
+ 
+ func main() {
+-	fmt.Fprintln(os.Stderr, "vcf architecture generator is not implemented")
+-	os.Exit(1)
++	if err := run(); err != nil {
++		fmt.Fprintln(os.Stderr, "vcfarch:", err)
++		os.Exit(1)
++	}
++}
++
++func run() error {
++	inventoryPath := flag.String("inventory", "fixtures/estate.json", "estate inventory JSON")
++	compatibilityPath := flag.String("compatibility", "compatibility/vcf-9.1-snapshot.json", "pinned compatibility snapshot JSON")
++	outPath := flag.String("out", "out/architecture.json", "output architecture JSON")
++	flag.Parse()
++
++	inventoryFile, err := os.Open(*inventoryPath)
++	if err != nil {
++		return fmt.Errorf("open inventory: %w", err)
++	}
++	defer inventoryFile.Close()
++	inventory, err := arch.LoadInventory(inventoryFile)
++	if err != nil {
++		return err
++	}
++
++	compatibilityFile, err := os.Open(*compatibilityPath)
++	if err != nil {
++		return fmt.Errorf("open compatibility snapshot: %w", err)
++	}
++	defer compatibilityFile.Close()
++	snapshot, err := arch.LoadCompatibilitySnapshot(compatibilityFile)
++	if err != nil {
++		return err
++	}
++
++	design, err := arch.Build(inventory, snapshot)
++	if err != nil {
++		return err
++	}
++	encoded, err := json.MarshalIndent(design, "", "  ")
++	if err != nil {
++		return fmt.Errorf("encode architecture: %w", err)
++	}
++	encoded = append(encoded, '\n')
++	if err := os.MkdirAll(filepath.Dir(*outPath), 0o755); err != nil {
++		return fmt.Errorf("create output directory: %w", err)
++	}
++	if err := os.WriteFile(*outPath, encoded, 0o644); err != nil {
++		return fmt.Errorf("write architecture: %w", err)
++	}
++	return nil
+ }
+diff --git a/out/architecture.json b/out/architecture.json
+new file mode 100644
+index 0000000..182cd5a
+--- /dev/null
++++ b/out/architecture.json
+@@ -0,0 +1,306 @@
++{
++  "schemaVersion": "1.0",
++  "fleetTarget": "9.1.0.0",
++  "greenfield": {
++    "storageDecision": {
++      "selectedArchitecture": "ESA",
++      "selectionCriterion": "fewest-hosts",
++      "hostCount": 4,
++      "policy": "Adaptive RAID-5 2+1 FTT=1 plus one rebuild-reserve host",
++      "network": {
++        "uplinksPerHost": 2,
++        "uplinkGbps": 25,
++        "vsanMtu": 9000
++      },
++      "alternatives": [
++        {
++          "architecture": "OSA",
++          "policy": "RAID-5 FTT=1 plus one rebuild-reserve host",
++          "hostCount": 5,
++          "uplinksPerHost": 2,
++          "uplinkGbps": 10,
++          "vsanMtu": 9000,
++          "esaEnabled": false,
++          "hardwareRequirement": "vSAN OSA all-flash ReadyNode"
++        },
++        {
++          "architecture": "ESA",
++          "policy": "Adaptive RAID-5 2+1 FTT=1 plus one rebuild-reserve host",
++          "hostCount": 4,
++          "uplinksPerHost": 2,
++          "uplinkGbps": 25,
++          "vsanMtu": 9000,
++          "esaEnabled": true,
++          "hardwareRequirement": "vSAN ESA ReadyNode with supported NVMe devices"
++        }
++      ]
++    },
++    "sddcSpec": {
++      "datastoreSpec": {
++        "vsanSpec": {
++          "datastoreName": "vsan-chi01-m01",
++          "esaConfig": {
++            "enabled": true
++          },
++          "failuresToTolerate": 1
++        }
++      },
++      "dnsSpec": {
++        "nameservers": [
++          "192.0.2.10",
++          "192.0.2.11"
++        ],
++        "subdomain": "vcf.example.test"
++      },
++      "dvsSpecs": [
++        {
++          "dvsName": "vds-m01",
++          "mtu": 9000,
++          "networks": [
++            "MANAGEMENT",
++            "VMOTION",
++            "VSAN"
++          ],
++          "vmnicsToUplinks": [
++            {
++              "id": "vmnic0",
++              "uplink": "uplink1"
++            },
++            {
++              "id": "vmnic1",
++              "uplink": "uplink2"
++            }
++          ]
++        }
++      ],
++      "hostSpecs": [
++        {
++          "hostname": "esx-m01"
++        },
++        {
++          "hostname": "esx-m02"
++        },
++        {
++          "hostname": "esx-m03"
++        },
++        {
++          "hostname": "esx-m04"
++        }
++      ],
++      "networkSpecs": [
++        {
++          "gateway": "192.0.2.1",
++          "includeIpAddressRanges": [
++            {
++              "endIpAddress": "192.0.2.39",
++              "startIpAddress": "192.0.2.31"
++            }
++          ],
++          "mtu": 1500,
++          "networkType": "MANAGEMENT",
++          "subnet": "192.0.2.0/24",
++          "vlanId": 110
++        },
++        {
++          "gateway": "198.51.100.1",
++          "includeIpAddressRanges": [
++            {
++              "endIpAddress": "198.51.100.39",
++              "startIpAddress": "198.51.100.31"
++            }
++          ],
++          "mtu": 9000,
++          "networkType": "VMOTION",
++          "subnet": "198.51.100.0/24",
++          "vlanId": 120
++        },
++        {
++          "gateway": "203.0.113.1",
++          "includeIpAddressRanges": [
++            {
++              "endIpAddress": "203.0.113.39",
++              "startIpAddress": "203.0.113.31"
++            }
++          ],
++          "mtu": 9000,
++          "networkType": "VSAN",
++          "subnet": "203.0.113.0/24",
++          "vlanId": 130
++        }
++      ],
++      "nsxtSpec": {
++        "nsxtManagerSize": "medium",
++        "nsxtManagers": [
++          {
++            "hostname": "nsx-m01.vcf.example.test"
++          },
++          {
++            "hostname": "nsx-m02.vcf.example.test"
++          },
++          {
++            "hostname": "nsx-m03.vcf.example.test"
++          }
++        ],
++        "transportVlanId": 140,
++        "vipFqdn": "nsx-m-vip.vcf.example.test"
++      },
++      "sddcId": "chi01-m01",
++      "vcenterSpec": {
++        "rootVcenterPassword": "ReplaceMe9!Alpha",
++        "ssoDomain": "vsphere.local",
++        "storageSize": "lstorage",
++        "vcenterHostname": "vc-m01.vcf.example.test",
++        "vmSize": "medium"
++      },
++      "version": "9.1.0.0",
++      "workflowType": "VCF"
++    }
++  },
++  "migration": {
++    "estate": "northstar-production",
++    "orderedSteps": [
++      {
++        "order": 1,
++        "component": {
++          "id": "vr-w01",
++          "type": "vsphere-replication",
++          "product": "VMware vSphere Replication",
++          "version": "9.0.2.2"
++        },
++        "target": {
++          "product": "VCF Protection and Recovery",
++          "version": "9.1.0.0"
++        },
++        "action": "stage-replication-for-unified-migration",
++        "upgradePath": [
++          "9.0.2.2",
++          "9.1.0.0"
++        ],
++        "gates": [
++          "paired-recovery-sites-version-aligned",
++          "enhanced-replication-confirmed",
++          "replication-health-clean"
++        ]
++      },
++      {
++        "order": 2,
++        "component": {
++          "id": "lsr-w01",
++          "type": "live-site-recovery",
++          "product": "VMware Live Site Recovery",
++          "version": "9.0.2.2"
++        },
++        "target": {
++          "product": "VCF Protection and Recovery",
++          "version": "9.1.0.0"
++        },
++        "action": "fresh-deploy-and-converge-to-unified-appliance",
++        "upgradePath": [
++          "9.0.2.2",
++          "9.1.0.0"
++        ],
++        "gates": [
++          "legacy-recovery-at-9.0.2.2",
++          "unified-appliance-fresh-deployed",
++          "recovery-plan-test-passed"
++        ]
++      },
++      {
++        "order": 3,
++        "component": {
++          "id": "nsx-w01",
++          "type": "nsx",
++          "product": "VMware NSX",
++          "version": "4.2.1.4"
++        },
++        "target": {
++          "product": "VMware NSX",
++          "version": "9.1.0.0"
++        },
++        "action": "installer-import-then-fleet-lcm-upgrade",
++        "upgradePath": [
++          "4.2.1.4",
++          "import-into-vcf",
++          "9.1.0.0"
++        ],
++        "gates": [
++          "installer-converge-workflow-selected",
++          "nsx-imported-before-9x-upgrade",
++          "nsx-backup-complete"
++        ]
++      },
++      {
++        "order": 4,
++        "component": {
++          "id": "vcsa-w01",
++          "type": "vcenter",
++          "product": "VMware vCenter Server",
++          "version": "8.0.3e"
++        },
++        "target": {
++          "product": "VMware vCenter Server",
++          "version": "9.1.0.0"
++        },
++        "action": "installer-converge-upgrade",
++        "upgradePath": [
++          "8.0.3e",
++          "9.1.0.0"
++        ],
++        "gates": [
++          "recovery-stack-9.1-compatible",
++          "nsx-under-fleet-management",
++          "vcenter-file-backup-complete"
++        ]
++      },
++      {
++        "order": 5,
++        "component": {
++          "id": "esxi-w01-cluster",
++          "type": "esxi",
++          "product": "VMware ESXi",
++          "version": "8.0.3e"
++        },
++        "target": {
++          "product": "VMware ESXi",
++          "version": "9.1.0.0"
++        },
++        "action": "fleet-lcm-cluster-upgrade",
++        "upgradePath": [
++          "8.0.3e",
++          "9.1.0.0"
++        ],
++        "gates": [
++          "vcenter-target-active",
++          "hardware-compatibility-validated",
++          "evacuation-capacity-confirmed"
++        ]
++      },
++      {
++        "order": 6,
++        "component": {
++          "id": "vsan-w01",
++          "type": "vsan",
++          "product": "VMware vSAN",
++          "version": "8.0.3",
++          "architecture": "OSA"
++        },
++        "target": {
++          "product": "VMware vSAN",
++          "version": "9.1.0.0",
++          "architecture": "OSA"
++        },
++        "action": "upgrade-on-disk-format-and-keep-osa",
++        "upgradePath": [
++          "8.0.3 OSA",
++          "9.1.0.0 OSA"
++        ],
++        "gates": [
++          "all-esxi-target-active",
++          "vsan-health-green",
++          "no-resync-active",
++          "no-in-place-osa-to-esa"
++        ]
++      }
++    ]
++  }
++}
+diff --git a/research/consulted.json b/research/consulted.json
+new file mode 100644
+index 0000000..5353a4c
+--- /dev/null
++++ b/research/consulted.json
+@@ -0,0 +1,66 @@
++{
++  "accessedOn": "2026-08-14",
++  "sources": [
++    {
++      "title": "Upgrade sequence and related issues for VCF/VVF 9.1",
++      "url": "https://knowledge.broadcom.com/external/article/440630/upgrade-sequence-and-related-issues-for.html",
++      "accessedOn": "2026-08-14",
++      "usedFor": "VCF Installer convergence is the supported path for a standalone vSphere estate that includes NSX, and vCenter precedes ESXi in the managed upgrade flow."
++    },
++    {
++      "title": "NSX 9.x is only supported as part of a VCF 9.x environment",
++      "url": "https://knowledge.broadcom.com/external/article/401775/nsx-9x-is-only-supported-as-part-of-a-vc.html",
++      "accessedOn": "2026-08-14",
++      "usedFor": "Standalone NSX 4.x must be imported into VCF before NSX 9.x lifecycle management."
++    },
++    {
++      "title": "VCF Protection and Recovery 9.1: Transition from standalone SRM and VR 9.0.2",
++      "url": "https://knowledge.broadcom.com/external/article/444864/vcf-protection-and-recovery-91-transitio.html",
++      "accessedOn": "2026-08-14",
++      "usedFor": "Standalone Live Site Recovery and vSphere Replication transition to the unified VCF Protection and Recovery 9.1 appliance before vCenter 9.1."
++    },
++    {
++      "title": "Steps to Converge to VMware Live Recovery Appliance 9.0.4 (or newer)",
++      "url": "https://knowledge.broadcom.com/external/article/408127/steps-to-converge-to-vmware-live.html",
++      "accessedOn": "2026-08-14",
++      "usedFor": "Legacy recovery appliances require supported prerequisite versions, Enhanced Replication, aligned sites, and a fresh unified-appliance convergence workflow."
++    },
++    {
++      "title": "Interoperability and Upgrade Sequence for vSAN File Services 8.x with vCenter Server 9.x",
++      "url": "https://knowledge.broadcom.com/external/article/419684/interoperability-and-upgrade-sequence-fo.html",
++      "accessedOn": "2026-08-14",
++      "usedFor": "Infrastructure sequencing keeps vCenter before ESXi and the vSAN on-disk format operation after all hosts reach the target."
++    },
++    {
++      "title": "Supported Hardware Changes vSAN ESA and vSAN Storage Clusters",
++      "url": "https://knowledge.broadcom.com/external/article/326717/supported-hardware-changes-vsan-esa-and.html",
++      "accessedOn": "2026-08-14",
++      "usedFor": "ESA requires qualified hardware and NVMe storage; its platform networking minimum is 10 GbE."
++    },
++    {
++      "title": "System performance may degrade when cluster capacity utilization exceeds 75% and vSAN ESA is configured with 10Gb networking",
++      "url": "https://knowledge.broadcom.com/external/article/372311/system-performance-may-degrade-when-clus.html",
++      "accessedOn": "2026-08-14",
++      "usedFor": "The sustained-write ESA design uses 25 GbE rather than the 10 GbE platform floor."
++    },
++    {
++      "title": "How to convert a vSAN OSA cluster to a vSAN ESA cluster",
++      "url": "https://knowledge.broadcom.com/external/article/432894/how-to-convert-a-vsan-osa-original-stora.html",
++      "accessedOn": "2026-08-14",
++      "usedFor": "OSA and ESA have different data paths and on-disk formats, so the brownfield OSA cluster cannot be converted in place."
++    },
++    {
++      "title": "Adaptive RAID-5 Erasure Coding with the Express Storage Architecture in vSAN 8",
++      "url": "https://blogs.vmware.com/cloud-foundation/2022/09/08/adaptive-raid-5-erasure-coding-with-the-express-storage-architecture-in-vsan-8/",
++      "accessedOn": "2026-08-14",
++      "usedFor": "ESA RAID-5 can use a 2+1 layout on three hosts; the design adds one rebuild-reserve host."
++    },
++    {
++      "title": "Supportability of RAID-5 Erasure Coding on Hybrid Disk Groups for vSAN OSA Cluster",
++      "url": "https://knowledge.broadcom.com/external/article/424165/supportability-of-raid-5-erasure-coding.html",
++      "accessedOn": "2026-08-14",
++      "usedFor": "OSA RAID-5 requires an all-flash configuration and at least four hosts; the design adds one rebuild-reserve host."
++    }
++  ],
++  "discrepancies": []
++}

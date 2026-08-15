@@ -1,0 +1,565 @@
+diff --git a/architecture/plan.go b/architecture/plan.go
+new file mode 100644
+index 0000000..bd1717e
+--- /dev/null
++++ b/architecture/plan.go
+@@ -0,0 +1,159 @@
++// Package architecture models the ordered transition of a brownfield VMware
++// estate into a single VCF fleet.
++package architecture
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++)
++
++// Plan is the machine-readable migration architecture.
++type Plan struct {
++	SchemaVersion    string          `json:"schemaVersion"`
++	EstateID         string          `json:"estateId"`
++	TargetVCFVersion string          `json:"targetVcfVersion"`
++	TargetSddcSpec   json.RawMessage `json:"targetSddcSpec"`
++	Components       []Component     `json:"components"`
++	Gates            []Gate          `json:"gates"`
++	Steps            []Step          `json:"steps"`
++}
++
++// Component records one inventory item and its complete version route.
++type Component struct {
++	ID             string   `json:"id"`
++	Kind           string   `json:"kind"`
++	CurrentVersion string   `json:"currentVersion"`
++	TargetProduct  string   `json:"targetProduct"`
++	TargetVersion  string   `json:"targetVersion"`
++	UpgradePath    []string `json:"upgradePath"`
++	GateIDs        []string `json:"gateIds"`
++}
++
++// Gate names a compatibility condition used by components and steps.
++type Gate struct {
++	ID        string `json:"id"`
++	Condition string `json:"condition"`
++}
++
++// Step is one supported edge in the globally ordered migration.
++type Step struct {
++	Order       int      `json:"order"`
++	ComponentID string   `json:"componentId"`
++	FromVersion string   `json:"fromVersion"`
++	ToVersion   string   `json:"toVersion"`
++	Operation   string   `json:"operation"`
++	GateIDs     []string `json:"gateIds"`
++}
++
++// Load decodes one plan and rejects unknown fields or trailing JSON.
++func Load(reader io.Reader) (Plan, error) {
++	decoder := json.NewDecoder(reader)
++	decoder.DisallowUnknownFields()
++	var plan Plan
++	if err := decoder.Decode(&plan); err != nil {
++		return Plan{}, err
++	}
++	var trailing any
++	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
++		if err == nil {
++			return Plan{}, errors.New("trailing JSON value")
++		}
++		return Plan{}, err
++	}
++	return plan, nil
++}
++
++// Validate checks the plan's internal graph. Compatibility is intentionally
++// checked separately against the pinned authority by the acceptance verifier.
++func Validate(plan Plan) error {
++	if plan.SchemaVersion != "1.0" {
++		return fmt.Errorf("unsupported schema version %q", plan.SchemaVersion)
++	}
++	if plan.EstateID == "" || plan.TargetVCFVersion == "" || len(plan.TargetSddcSpec) == 0 {
++		return errors.New("estate, target VCF version, and target SddcSpec are required")
++	}
++
++	gates := make(map[string]bool, len(plan.Gates))
++	for _, gate := range plan.Gates {
++		if gate.ID == "" || gate.Condition == "" {
++			return errors.New("gate id and condition are required")
++		}
++		if gates[gate.ID] {
++			return fmt.Errorf("duplicate gate %q", gate.ID)
++		}
++		gates[gate.ID] = true
++	}
++
++	components := make(map[string]Component, len(plan.Components))
++	for _, component := range plan.Components {
++		if component.ID == "" {
++			return errors.New("component id is required")
++		}
++		if _, exists := components[component.ID]; exists {
++			return fmt.Errorf("duplicate component %q", component.ID)
++		}
++		if len(component.UpgradePath) < 2 || component.UpgradePath[0] != component.CurrentVersion || component.UpgradePath[len(component.UpgradePath)-1] != component.TargetVersion {
++			return fmt.Errorf("component %q has an invalid upgrade path", component.ID)
++		}
++		if err := checkGateReferences(component.GateIDs, gates); err != nil {
++			return fmt.Errorf("component %q: %w", component.ID, err)
++		}
++		components[component.ID] = component
++	}
++
++	edges := make(map[string]bool)
++	for _, component := range plan.Components {
++		for index := 0; index+1 < len(component.UpgradePath); index++ {
++			edges[edgeKey(component.ID, component.UpgradePath[index], component.UpgradePath[index+1])] = false
++		}
++	}
++	for index, step := range plan.Steps {
++		if step.Order != index+1 {
++			return fmt.Errorf("step at index %d has order %d", index, step.Order)
++		}
++		if _, exists := components[step.ComponentID]; !exists {
++			return fmt.Errorf("step %d references unknown component %q", step.Order, step.ComponentID)
++		}
++		key := edgeKey(step.ComponentID, step.FromVersion, step.ToVersion)
++		seen, exists := edges[key]
++		if !exists {
++			return fmt.Errorf("step %d is not an upgrade-path edge", step.Order)
++		}
++		if seen {
++			return fmt.Errorf("step %d repeats an upgrade-path edge", step.Order)
++		}
++		if err := checkGateReferences(step.GateIDs, gates); err != nil {
++			return fmt.Errorf("step %d: %w", step.Order, err)
++		}
++		edges[key] = true
++	}
++	for key, seen := range edges {
++		if !seen {
++			return fmt.Errorf("missing upgrade-path edge %q", key)
++		}
++	}
++	return nil
++}
++
++func checkGateReferences(ids []string, gates map[string]bool) error {
++	if len(ids) == 0 {
++		return errors.New("at least one gate is required")
++	}
++	seen := make(map[string]bool)
++	for _, id := range ids {
++		if !gates[id] {
++			return fmt.Errorf("unknown gate %q", id)
++		}
++		if seen[id] {
++			return fmt.Errorf("duplicate gate reference %q", id)
++		}
++		seen[id] = true
++	}
++	return nil
++}
++
++func edgeKey(componentID, from, to string) string {
++	return componentID + "\x00" + from + "\x00" + to
++}
+diff --git a/architecture/plan_test.go b/architecture/plan_test.go
+new file mode 100644
+index 0000000..609c58a
+--- /dev/null
++++ b/architecture/plan_test.go
+@@ -0,0 +1,133 @@
++package architecture
++
++import (
++	"encoding/json"
++	"strings"
++	"testing"
++)
++
++func TestValidate(t *testing.T) {
++	tests := []struct {
++		name    string
++		mutate  func(*Plan)
++		wantErr string
++	}{
++		{name: "valid"},
++		{
++			name: "duplicate component",
++			mutate: func(plan *Plan) {
++				plan.Components = append(plan.Components, plan.Components[0])
++			},
++			wantErr: "duplicate component",
++		},
++		{
++			name: "path does not start at current version",
++			mutate: func(plan *Plan) {
++				plan.Components[0].UpgradePath[0] = "7.0"
++			},
++			wantErr: "invalid upgrade path",
++		},
++		{
++			name: "non-contiguous order",
++			mutate: func(plan *Plan) {
++				plan.Steps[0].Order = 2
++			},
++			wantErr: "has order",
++		},
++		{
++			name: "unknown gate",
++			mutate: func(plan *Plan) {
++				plan.Steps[0].GateIDs = []string{"missing"}
++			},
++			wantErr: "unknown gate",
++		},
++		{
++			name: "missing route edge",
++			mutate: func(plan *Plan) {
++				plan.Steps = nil
++			},
++			wantErr: "missing upgrade-path edge",
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			plan := validPlan()
++			if test.mutate != nil {
++				test.mutate(&plan)
++			}
++			err := Validate(plan)
++			if test.wantErr == "" {
++				if err != nil {
++					t.Fatalf("Validate() error = %v", err)
++				}
++				return
++			}
++			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
++				t.Fatalf("Validate() error = %v, want substring %q", err, test.wantErr)
++			}
++		})
++	}
++}
++
++func TestLoad(t *testing.T) {
++	tests := []struct {
++		name    string
++		input   string
++		wantErr bool
++	}{
++		{name: "one plan", input: mustJSON(t, validPlan())},
++		{name: "unknown field", input: `{"schemaVersion":"1.0","unknown":true}`, wantErr: true},
++		{name: "trailing value", input: mustJSON(t, validPlan()) + ` {}`, wantErr: true},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			_, err := Load(strings.NewReader(test.input))
++			if (err != nil) != test.wantErr {
++				t.Fatalf("Load() error = %v, wantErr %v", err, test.wantErr)
++			}
++		})
++	}
++}
++
++func validPlan() Plan {
++	return Plan{
++		SchemaVersion:    "1.0",
++		EstateID:         "estate",
++		TargetVCFVersion: "9.1.0.0",
++		TargetSddcSpec:   json.RawMessage(`{}`),
++		Gates: []Gate{
++			{ID: "compatibility", Condition: "supported edge"},
++		},
++		Components: []Component{
++			{
++				ID:             "vc",
++				Kind:           "vcenter",
++				CurrentVersion: "8.0",
++				TargetProduct:  "VMware vCenter Server",
++				TargetVersion:  "9.1",
++				UpgradePath:    []string{"8.0", "9.1"},
++				GateIDs:        []string{"compatibility"},
++			},
++		},
++		Steps: []Step{
++			{
++				Order:       1,
++				ComponentID: "vc",
++				FromVersion: "8.0",
++				ToVersion:   "9.1",
++				Operation:   "upgrade",
++				GateIDs:     []string{"compatibility"},
++			},
++		},
++	}
++}
++
++func mustJSON(t *testing.T, value any) string {
++	t.Helper()
++	encoded, err := json.Marshal(value)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return string(encoded)
++}
+diff --git a/migration-plan.json b/migration-plan.json
+new file mode 100644
+index 0000000..d0cbfbb
+--- /dev/null
++++ b/migration-plan.json
+@@ -0,0 +1,215 @@
++{
++  "schemaVersion": "1.0",
++  "estateId": "chi01-brownfield",
++  "targetVcfVersion": "9.1.0.0",
++  "targetSddcSpec": {
++    "sddcId": "chi01-m01",
++    "workflowType": "VCF_EXTEND",
++    "version": "9.1.0.0",
++    "vcenterSpec": {
++      "vcenterHostname": "vc-chi01.example.test",
++      "rootVcenterPassword": "Fixture1!",
++      "version": "9.1.0.0",
++      "useExistingDeployment": true
++    },
++    "networkSpecs": [
++      {
++        "networkType": "MANAGEMENT",
++        "vlanId": 110
++      }
++    ],
++    "dnsSpec": {
++      "subdomain": "chi01.example.test",
++      "nameservers": [
++        "192.0.2.53",
++        "192.0.2.54"
++      ]
++    }
++  },
++  "components": [
++    {
++      "id": "vc-chi01",
++      "kind": "vcenter",
++      "currentVersion": "8.0.3.00500",
++      "targetProduct": "VMware vCenter Server",
++      "targetVersion": "9.1.0.0",
++      "upgradePath": [
++        "8.0.3.00500",
++        "9.1.0.0"
++      ],
++      "gateIds": [
++        "vcenter-upgrade-window"
++      ]
++    },
++    {
++      "id": "esx-chi01-01",
++      "kind": "esxi",
++      "currentVersion": "8.0.3",
++      "targetProduct": "VMware ESXi",
++      "targetVersion": "9.1.0.0",
++      "upgradePath": [
++        "8.0.3",
++        "9.1.0.0"
++      ],
++      "gateIds": [
++        "esxi-upgrade-window"
++      ]
++    },
++    {
++      "id": "esx-chi01-02",
++      "kind": "esxi",
++      "currentVersion": "8.0.3",
++      "targetProduct": "VMware ESXi",
++      "targetVersion": "9.1.0.0",
++      "upgradePath": [
++        "8.0.3",
++        "9.1.0.0"
++      ],
++      "gateIds": [
++        "esxi-upgrade-window"
++      ]
++    },
++    {
++      "id": "vsan-chi01",
++      "kind": "vsan",
++      "currentVersion": "8.0.3",
++      "targetProduct": "VMware vSAN",
++      "targetVersion": "9.1.0.0",
++      "upgradePath": [
++        "8.0.3",
++        "9.1.0.0"
++      ],
++      "gateIds": [
++        "vsan-finalization-window"
++      ]
++    },
++    {
++      "id": "nsx-chi01",
++      "kind": "nsx",
++      "currentVersion": "4.2.1.0",
++      "targetProduct": "VMware NSX",
++      "targetVersion": "9.1.0.0",
++      "upgradePath": [
++        "4.2.1.0",
++        "9.1.0.0"
++      ],
++      "gateIds": [
++        "nsx-upgrade-precheck"
++      ]
++    },
++    {
++      "id": "lsr-chi01",
++      "kind": "live-site-recovery",
++      "currentVersion": "9.0.2.2",
++      "targetProduct": "VCF Protection and Recovery",
++      "targetVersion": "9.1.0.0",
++      "upgradePath": [
++        "9.0.2.2",
++        "9.0.4",
++        "9.1.0.0"
++      ],
++      "gateIds": [
++        "lsr-convergence-904",
++        "lsr-cutover-91"
++      ]
++    }
++  ],
++  "gates": [
++    {
++      "id": "lsr-convergence-904",
++      "condition": "Existing replications pass the 9.0.4 convergence precheck before the legacy 9.0.2.2 appliance is converged."
++    },
++    {
++      "id": "lsr-cutover-91",
++      "condition": "vCenter is at 9.1.0.0 before the converged 9.0.4 appliance is upgraded to VCF Protection and Recovery 9.1."
++    },
++    {
++      "id": "nsx-upgrade-precheck",
++      "condition": "NSX upgrade and interoperability prechecks pass for the 4.2.1.0 to 9.1.0.0 edge."
++    },
++    {
++      "id": "vcenter-upgrade-window",
++      "condition": "NSX is at 9.1.0.0 and Live Site Recovery is converged at the 9.0.4 bridge before vCenter crosses from 8.0.3 to 9.1.0.0."
++    },
++    {
++      "id": "esxi-upgrade-window",
++      "condition": "vCenter is at 9.1.0.0 before either ESXi host is upgraded to 9.1.0.0."
++    },
++    {
++      "id": "vsan-finalization-window",
++      "condition": "Every ESXi host is at 9.1.0.0 before the vSAN 9.1.0.0 transition is finalized."
++    }
++  ],
++  "steps": [
++    {
++      "order": 1,
++      "componentId": "lsr-chi01",
++      "fromVersion": "9.0.2.2",
++      "toVersion": "9.0.4",
++      "operation": "converge",
++      "gateIds": [
++        "lsr-convergence-904"
++      ]
++    },
++    {
++      "order": 2,
++      "componentId": "nsx-chi01",
++      "fromVersion": "4.2.1.0",
++      "toVersion": "9.1.0.0",
++      "operation": "upgrade",
++      "gateIds": [
++        "nsx-upgrade-precheck"
++      ]
++    },
++    {
++      "order": 3,
++      "componentId": "vc-chi01",
++      "fromVersion": "8.0.3.00500",
++      "toVersion": "9.1.0.0",
++      "operation": "upgrade",
++      "gateIds": [
++        "vcenter-upgrade-window"
++      ]
++    },
++    {
++      "order": 4,
++      "componentId": "lsr-chi01",
++      "fromVersion": "9.0.4",
++      "toVersion": "9.1.0.0",
++      "operation": "upgrade",
++      "gateIds": [
++        "lsr-cutover-91"
++      ]
++    },
++    {
++      "order": 5,
++      "componentId": "esx-chi01-01",
++      "fromVersion": "8.0.3",
++      "toVersion": "9.1.0.0",
++      "operation": "upgrade",
++      "gateIds": [
++        "esxi-upgrade-window"
++      ]
++    },
++    {
++      "order": 6,
++      "componentId": "esx-chi01-02",
++      "fromVersion": "8.0.3",
++      "toVersion": "9.1.0.0",
++      "operation": "upgrade",
++      "gateIds": [
++        "esxi-upgrade-window"
++      ]
++    },
++    {
++      "order": 7,
++      "componentId": "vsan-chi01",
++      "fromVersion": "8.0.3",
++      "toVersion": "9.1.0.0",
++      "operation": "finalize",
++      "gateIds": [
++        "vsan-finalization-window"
++      ]
++    }
++  ]
++}
+diff --git a/research/consulted.json b/research/consulted.json
+new file mode 100644
+index 0000000..e207bfb
+--- /dev/null
++++ b/research/consulted.json
+@@ -0,0 +1,34 @@
++{
++  "sources": [
++    {
++      "title": "Broadcom Product Interoperability Matrix",
++      "url": "https://interopmatrix.broadcom.com/",
++      "accessedAt": "2026-08-14",
++      "usedFor": "Current interoperability and upgrade-path checks across vCenter, ESXi, NSX, vSAN, and Live Site Recovery."
++    },
++    {
++      "title": "Using the VMware Product Interoperability Matrixes",
++      "url": "https://knowledge.broadcom.com/external/article/343230",
++      "accessedAt": "2026-08-14",
++      "usedFor": "Broadcom's published method for checking interoperability and supported upgrade paths."
++    },
++    {
++      "title": "VMware Cloud Foundation 9.1.0.0 Release Notes",
++      "url": "https://techdocs.broadcom.com/us/en/vmware-cis/vcf/vcf-9-0-and-later/9-1/release-notes/vmware-cloud-foundation-9-1-0-0-release-notes/what-s-new.html",
++      "accessedAt": "2026-08-14",
++      "usedFor": "VCF 9.1 release contents and the target fleet's component context."
++    },
++    {
++      "title": "Steps to Converge to VMware Live Recovery Appliance 9.0.4 (or newer) and Common Issues During Convergence",
++      "url": "https://knowledge.broadcom.com/external/article/408127",
++      "accessedAt": "2026-08-14",
++      "usedFor": "The 9.0.4 convergence bridge and its prerequisites."
++    },
++    {
++      "title": "VCF Protection and Recovery 9.1: Transition from standalone SRM and VR 9.0.2",
++      "url": "https://knowledge.broadcom.com/external/article/444864",
++      "accessedAt": "2026-08-14",
++      "usedFor": "The support boundary at vCenter 9.1 and transition to the unified 9.1 appliance."
++    }
++  ]
++}

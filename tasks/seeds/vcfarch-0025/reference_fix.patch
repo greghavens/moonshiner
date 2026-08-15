@@ -1,0 +1,860 @@
+diff --git a/architecture/build.go b/architecture/build.go
+index d61b99e..24f835b 100644
+--- a/architecture/build.go
++++ b/architecture/build.go
+@@ -1,9 +1,329 @@
+ package architecture
+ 
+-import "errors"
++import (
++	"encoding/json"
++	"fmt"
++	"sort"
++)
+ 
+-var ErrNotImplemented = errors.New("architecture generator is not implemented")
++func Build(estate Estate, snapshot CompatibilitySnapshot) (Design, error) {
++	if estate.Greenfield.TargetVCFVersion == "" || estate.Existing.TargetVCFVersion == "" {
++		return Design{}, fmt.Errorf("target VCF versions are required")
++	}
++	if estate.Greenfield.TargetVCFVersion != estate.Existing.TargetVCFVersion {
++		return Design{}, fmt.Errorf("greenfield target %s and migration target %s must match", estate.Greenfield.TargetVCFVersion, estate.Existing.TargetVCFVersion)
++	}
++	if estate.Greenfield.TargetVCFVersion != snapshot.TargetCombination["VCF"] {
++		return Design{}, fmt.Errorf("greenfield target %s is outside snapshot %s", estate.Greenfield.TargetVCFVersion, snapshot.SnapshotID)
++	}
++	sddc, err := buildSddcSpec(estate.Greenfield)
++	if err != nil {
++		return Design{}, err
++	}
++	edge, err := buildEdgeDesign(estate.Greenfield, snapshot)
++	if err != nil {
++		return Design{}, err
++	}
++	migration, err := buildMigrationPlan(estate, snapshot)
++	if err != nil {
++		return Design{}, err
++	}
++	return Design{SddcSpec: sddc, EdgeDesign: edge, MigrationPlan: migration}, nil
++}
++
++func buildSddcSpec(green Greenfield) (json.RawMessage, error) {
++	hosts := make([]any, 0, len(green.Management.Hosts))
++	for _, hostname := range green.Management.Hosts {
++		hosts = append(hosts, map[string]any{"hostname": hostname})
++	}
++	networks := make([]any, 0, len(green.Networks))
++	networkTypes := make([]string, 0, len(green.Networks))
++	for _, network := range green.Networks {
++		ranges := make([]any, 0, len(network.IPRanges))
++		for _, ipRange := range network.IPRanges {
++			ranges = append(ranges, map[string]any{
++				"startIpAddress": ipRange.Start,
++				"endIpAddress":   ipRange.End,
++			})
++		}
++		networks = append(networks, map[string]any{
++			"networkType":             network.Type,
++			"vlanId":                  network.VLAN,
++			"subnet":                  network.CIDR,
++			"gateway":                 network.Gateway,
++			"mtu":                     network.MTU,
++			"includeIpAddressRanges":  ranges,
++			"ipAddressVersion":        "IPv4",
++			"ipAddressAssignmentMode": "STATIC",
++		})
++		networkTypes = append(networkTypes, network.Type)
++	}
++	mappings := make([]any, 0, len(green.Management.DVSUplinks))
++	for _, uplink := range green.Management.DVSUplinks {
++		mappings = append(mappings, map[string]any{"id": uplink.PhysicalNIC, "uplink": uplink.Name})
++	}
++	managers := make([]any, 0, len(green.NSXManagerFQDNs))
++	for _, hostname := range green.NSXManagerFQDNs {
++		managers = append(managers, map[string]any{"hostname": hostname})
++	}
++	if len(managers) == 0 {
++		return nil, fmt.Errorf("at least one NSX manager is required")
++	}
++	spec := map[string]any{
++		"sddcId":          green.SDDCID,
++		"workflowType":    "VCF",
++		"version":         green.TargetVCFVersion,
++		"vcfInstanceName": green.VCFInstanceName,
++		"hostSpecs":       hosts,
++		"vcenterSpec": map[string]any{
++			"vcenterHostname":       green.VCenterFQDN,
++			"rootVcenterPassword":   "${VC_ROOT_PASS}",
++			"ssoDomain":             "vsphere.local",
++			"vmSize":                "medium",
++			"storageSize":           "lstorage",
++			"version":               green.TargetVCFVersion,
++			"useExistingDeployment": false,
++		},
++		"clusterSpec": map[string]any{
++			"datacenterName": green.Management.DatacenterName,
++			"clusterName":    green.Management.ClusterName,
++		},
++		"dvsSpecs": []any{map[string]any{
++			"dvsName":         green.Management.DVSName,
++			"networks":        networkTypes,
++			"mtu":             9000,
++			"vmnicsToUplinks": mappings,
++		}},
++		"nsxtSpec": map[string]any{
++			"nsxtManagers":          managers,
++			"nsxtManagerSize":       "large",
++			"vipFqdn":               "nsx-vip." + green.Domain,
++			"version":               green.TargetVCFVersion,
++			"useExistingDeployment": false,
++		},
++		"networkSpecs": networks,
++		"dnsSpec": map[string]any{
++			"subdomain":   green.Domain,
++			"nameservers": green.DNS,
++		},
++		"ntpServers": green.NTP,
++		"sddcManagerSpec": map[string]any{
++			"hostname":              green.SDDCManagerFQDN,
++			"version":               green.TargetVCFVersion,
++			"useExistingDeployment": false,
++		},
++		"managementPoolName":          green.SDDCID + "-network-pool",
++		"ceipEnabled":                 false,
++		"skipEsxThumbprintValidation": false,
++		"skipGatewayPingValidation":   false,
++		"datastoreSpec": map[string]any{
++			"vsanSpec": map[string]any{
++				"datastoreName":      green.SDDCID + "-vsan",
++				"failuresToTolerate": green.Management.FailuresToTolerate,
++				"esaConfig": map[string]any{
++					"enabled": green.Management.VsanArchitecture == "ESA",
++				},
++			},
++		},
++	}
++	encoded, err := json.Marshal(spec)
++	if err != nil {
++		return nil, fmt.Errorf("marshal SddcSpec: %w", err)
++	}
++	return encoded, nil
++}
++
++func buildEdgeDesign(green Greenfield, snapshot CompatibilitySnapshot) (EdgeDesign, error) {
++	demand := green.Edge
++	if demand.NodeCount < 1 {
++		return EdgeDesign{}, fmt.Errorf("edge node count must be positive")
++	}
++	perNode := demand.NorthSouthGbps
++	if !demand.SurviveSingleNodeFailure {
++		perNode /= float64(demand.NodeCount)
++	}
++	factors := append([]EdgeFormFactor(nil), snapshot.EdgeFormFactors...)
++	sort.Slice(factors, func(i, j int) bool { return factors[i].MaximumInclusive < factors[j].MaximumInclusive })
++	var selected *EdgeFormFactor
++	for index := range factors {
++		if perNode > factors[index].MinimumExclusive && perNode <= factors[index].MaximumInclusive {
++			selected = &factors[index]
++			break
++		}
++	}
++	if selected == nil {
++		return EdgeDesign{}, fmt.Errorf("no supported Edge form factor for %.1f Gbps", perNode)
++	}
++	var profile *UplinkProfile
++	for index := range snapshot.UplinkProfiles {
++		candidate := &snapshot.UplinkProfiles[index]
++		if candidate.ID == demand.UplinkProfileID {
++			profile = candidate
++			break
++		}
++	}
++	if profile == nil {
++		return EdgeDesign{}, fmt.Errorf("uplink profile %s is not in the snapshot", demand.UplinkProfileID)
++	}
++	if !(perNode > profile.MinimumDemandExclusive && perNode <= profile.MaximumDemandInclusive) {
++		return EdgeDesign{}, fmt.Errorf("uplink profile %s does not support %.1f Gbps", profile.ID, perNode)
++	}
++	if len(demand.PhysicalUplinks) < profile.MinimumUplinksPerNode {
++		return EdgeDesign{}, fmt.Errorf("uplink profile %s requires %d uplinks", profile.ID, profile.MinimumUplinksPerNode)
++	}
++	tors, vlans := map[string]bool{}, map[int]bool{}
++	for _, uplink := range demand.PhysicalUplinks {
++		if uplink.SpeedGbps < profile.MinimumLinkSpeedGbps {
++			return EdgeDesign{}, fmt.Errorf("uplink %s is below %.0f Gbps", uplink.Name, profile.MinimumLinkSpeedGbps)
++		}
++		tors[uplink.TOR], vlans[uplink.VLAN] = true, true
++	}
++	if profile.RequireDistinctTORs && len(tors) != len(demand.PhysicalUplinks) {
++		return EdgeDesign{}, fmt.Errorf("uplinks must terminate on distinct TORs")
++	}
++	if profile.RequireDistinctVLANs && len(vlans) != len(demand.PhysicalUplinks) {
++		return EdgeDesign{}, fmt.Errorf("uplinks must use distinct VLANs")
++	}
++	if demand.NodeCount != len(demand.PlacementZones) {
++		return EdgeDesign{}, fmt.Errorf("each Edge node needs an availability-zone placement")
++	}
++	nodes := make([]EdgeNode, 0, demand.NodeCount)
++	for index := 0; index < demand.NodeCount; index++ {
++		uplinks := append([]Uplink(nil), demand.PhysicalUplinks...)
++		nodes = append(nodes, EdgeNode{
++			Name:             fmt.Sprintf("%s-edge%02d", demand.SiteID, index+1),
++			AvailabilityZone: demand.PlacementZones[index],
++			Uplinks:          uplinks,
++		})
++	}
++	return EdgeDesign{
++		SiteID:               demand.SiteID,
++		Sites:                append([]Site(nil), green.Sites...),
++		FormFactor:           selected.Name,
++		VCPUPerNode:          selected.VCPU,
++		MemoryGiBPerNode:     selected.MemoryGiB,
++		NodeCount:            demand.NodeCount,
++		HAMode:               demand.HAMode,
++		NorthSouthGbps:       demand.NorthSouthGbps,
++		PerSurvivingNodeGbps: perNode,
++		UplinkProfileID:      profile.ID,
++		Nodes:                nodes,
++		TEP: TEPDesign{
++			VLAN:          demand.TEPVLAN,
++			MTU:           demand.TEPMTU,
++			TeamingPolicy: "LOADBALANCE_SRCID",
++		},
++	}, nil
++}
++
++func buildMigrationPlan(estate Estate, snapshot CompatibilitySnapshot) (MigrationPlan, error) {
++	current := map[string]string{}
++	target := map[string]string{}
++	ranks := map[string]map[string]int{}
++	for _, component := range estate.Existing.Components {
++		current[component.Name] = component.CurrentVersion
++		target[component.Name] = component.TargetVersion
++		if snapshot.TargetCombination[component.Name] != component.TargetVersion {
++			return MigrationPlan{}, fmt.Errorf("component %s target %s is outside the pinned combination", component.Name, component.TargetVersion)
++		}
++		ranks[component.Name] = rankVersions(component, snapshot.SupportedUpgradeHops)
++	}
++	remaining := append([]UpgradeHop(nil), snapshot.SupportedUpgradeHops...)
++	steps := make([]MigrationStep, 0, len(remaining))
++	for len(remaining) > 0 {
++		progressed := false
++		for componentIndex := range estate.Existing.Components {
++			name := estate.Existing.Components[componentIndex].Name
++			for hopIndex, hop := range remaining {
++				if hop.Component != name || current[name] != hop.FromVersion || !dependenciesMet(hop, current, ranks, snapshot.UpgradeDependencies) {
++					continue
++				}
++				gates := make([]MigrationGate, 0, len(hop.RequiredGates))
++				for _, gateID := range hop.RequiredGates {
++					condition, ok := gateConditions[gateID]
++					if !ok || condition == "" {
++						return MigrationPlan{}, fmt.Errorf("gate %s has no defined condition", gateID)
++					}
++					gates = append(gates, MigrationGate{ID: gateID, Condition: condition})
++				}
++				steps = append(steps, MigrationStep{
++					Order:         len(steps) + 1,
++					Component:     hop.Component,
++					FromVersion:   hop.FromVersion,
++					TargetVersion: hop.ToVersion,
++					Gates:         gates,
++				})
++				current[name] = hop.ToVersion
++				remaining = append(remaining[:hopIndex], remaining[hopIndex+1:]...)
++				progressed = true
++				break
++			}
++			if progressed {
++				break
++			}
++		}
++		if !progressed {
++			return MigrationPlan{}, fmt.Errorf("supported hops and dependencies do not yield a complete migration")
++		}
++	}
++	for name, wanted := range target {
++		if current[name] != wanted {
++			return MigrationPlan{}, fmt.Errorf("migration leaves %s at %s instead of %s", name, current[name], wanted)
++		}
++	}
++	return MigrationPlan{EstateID: estate.EstateID, TargetVCFVersion: estate.Existing.TargetVCFVersion, Steps: steps}, nil
++}
++
++func dependenciesMet(hop UpgradeHop, current map[string]string, ranks map[string]map[string]int, dependencies []UpgradeDependency) bool {
++	for _, dependency := range dependencies {
++		if dependency.Component != hop.Component || dependency.ToVersion != hop.ToVersion {
++			continue
++		}
++		actualRank, actualOK := ranks[dependency.RequiresComponent][current[dependency.RequiresComponent]]
++		minimumRank, minimumOK := ranks[dependency.RequiresComponent][dependency.MinimumVersion]
++		if !actualOK || !minimumOK || actualRank < minimumRank {
++			return false
++		}
++	}
++	return true
++}
++
++func rankVersions(component Component, hops []UpgradeHop) map[string]int {
++	ranks := map[string]int{component.CurrentVersion: 0}
++	current := component.CurrentVersion
++	for rank := 1; rank <= len(hops); rank++ {
++		advanced := false
++		for _, hop := range hops {
++			if hop.Component == component.Name && hop.FromVersion == current {
++				ranks[hop.ToVersion] = rank
++				current = hop.ToVersion
++				advanced = true
++				break
++			}
++		}
++		if !advanced {
++			break
++		}
++	}
++	return ranks
++}
+ 
+-func Build(Estate, CompatibilitySnapshot) (Design, error) {
+-	return Design{}, ErrNotImplemented
++var gateConditions = map[string]string{
++	"ADAPTERS_HEALTHY":               "All VCF Operations adapters report healthy collection before the upgrade.",
++	"DISK_FORMAT_PRECHECK_GREEN":     "The vSAN disk-format precheck completes without blocking findings.",
++	"EDGE_CLUSTER_HEALTHY":           "Every NSX Edge transport node is registered, connected, and healthy.",
++	"HARDWARE_COMPATIBILITY_GREEN":   "All hosts, devices, firmware, and drivers are supported for the target ESXi release.",
++	"HOST_EVACUATION_CAPACITY_READY": "The cluster can evacuate one host while retaining required workload and storage availability.",
++	"MANAGEMENT_HEALTH_GREEN":        "SDDC Manager reports all managed management-domain components healthy.",
++	"NSX_BACKUP_COMPLETE":            "A current, restorable NSX configuration backup is confirmed.",
++	"NSX_PRECHECK_GREEN":             "The NSX upgrade precheck completes without blocking findings.",
++	"OPERATIONS_BACKUP_COMPLETE":     "A current, restorable VCF Operations backup is confirmed.",
++	"SDDC_BACKUP_COMPLETE":           "A current, restorable SDDC Manager backup is confirmed.",
++	"TIER0_FAILOVER_TESTED":          "Tier-0 gateway failover succeeds before Edge nodes are changed.",
++	"TRANSPORT_NODES_HEALTHY":        "All NSX host and Edge transport nodes report healthy realization.",
++	"VCENTER_BACKUP_COMPLETE":        "A current, restorable file-based vCenter backup is confirmed.",
++	"VCENTER_PRECHECK_GREEN":         "The vCenter upgrade precheck completes without blocking findings.",
++	"VCF_9_LICENSE_READY":            "The VCF 9 license entitlement and license server are ready.",
++	"VSAN_HEALTH_GREEN":              "The vSAN health service reports no blocking findings.",
++	"VSAN_RESYNC_COMPLETE":           "No vSAN objects are resynchronizing before the component change.",
+ }
+diff --git a/architecture/build_test.go b/architecture/build_test.go
+index a9c2265..c8f1c48 100644
+--- a/architecture/build_test.go
++++ b/architecture/build_test.go
+@@ -1,7 +1,82 @@
+ package architecture
+ 
+-import "testing"
++import (
++	"encoding/json"
++	"os"
++	"testing"
++)
+ 
+-func TestBuildPending(t *testing.T) {
+-	t.Skip("replace with table-driven design tests")
++func TestBuild(t *testing.T) {
++	estate := loadJSON[Estate](t, "../fixtures/estate.json")
++	snapshot := loadJSON[CompatibilitySnapshot](t, "../authority/compatibility-snapshot.json")
++
++	tests := []struct {
++		name       string
++		mutate     func(*Estate, *CompatibilitySnapshot)
++		wantFactor string
++		wantSteps  int
++		wantError  bool
++	}{
++		{name: "pinned architecture", wantFactor: "XLARGE", wantSteps: 7},
++		{name: "unsupported throughput", mutate: func(e *Estate, _ *CompatibilitySnapshot) {
++			e.Greenfield.Edge.NorthSouthGbps = 30
++		}, wantError: true},
++		{name: "unknown uplink profile", mutate: func(e *Estate, _ *CompatibilitySnapshot) {
++			e.Greenfield.Edge.UplinkProfileID = "UNKNOWN"
++		}, wantError: true},
++		{name: "broken migration path", mutate: func(e *Estate, _ *CompatibilitySnapshot) {
++			e.Existing.Components[0].CurrentVersion = "5.1.0.0"
++		}, wantError: true},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			candidateEstate := clone(t, estate)
++			candidateSnapshot := clone(t, snapshot)
++			if test.mutate != nil {
++				test.mutate(&candidateEstate, &candidateSnapshot)
++			}
++			design, err := Build(candidateEstate, candidateSnapshot)
++			if test.wantError {
++				if err == nil {
++					t.Fatal("Build succeeded, want error")
++				}
++				return
++			}
++			if err != nil {
++				t.Fatalf("Build failed: %v", err)
++			}
++			if design.EdgeDesign.FormFactor != test.wantFactor {
++				t.Errorf("form factor = %s, want %s", design.EdgeDesign.FormFactor, test.wantFactor)
++			}
++			if len(design.MigrationPlan.Steps) != test.wantSteps {
++				t.Errorf("migration steps = %d, want %d", len(design.MigrationPlan.Steps), test.wantSteps)
++			}
++		})
++	}
++}
++
++func loadJSON[T any](t *testing.T, path string) T {
++	t.Helper()
++	data, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var value T
++	if err := json.Unmarshal(data, &value); err != nil {
++		t.Fatal(err)
++	}
++	return value
++}
++
++func clone[T any](t *testing.T, value T) T {
++	t.Helper()
++	data, err := json.Marshal(value)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var result T
++	if err := json.Unmarshal(data, &result); err != nil {
++		t.Fatal(err)
++	}
++	return result
+ }
+diff --git a/out/edge-design.json b/out/edge-design.json
+index 0967ef4..b65e178 100644
+--- a/out/edge-design.json
++++ b/out/edge-design.json
+@@ -1 +1,76 @@
+-{}
++{
++  "siteId": "AUS01",
++  "sites": [
++    {
++      "id": "AUS01",
++      "role": "PRIMARY",
++      "availabilityZones": 2,
++      "managementHostCount": 6,
++      "workloadHostCount": 12,
++      "protectedVmCapacity": 1200
++    },
++    {
++      "id": "DFW01",
++      "role": "RECOVERY",
++      "availabilityZones": 1,
++      "managementHostCount": 0,
++      "workloadHostCount": 8,
++      "protectedVmCapacity": 600
++    }
++  ],
++  "formFactor": "XLARGE",
++  "vCpuPerNode": 16,
++  "memoryGiBPerNode": 64,
++  "nodeCount": 2,
++  "haMode": "ACTIVE_ACTIVE",
++  "northSouthGbps": 18,
++  "perSurvivingNodeGbps": 18,
++  "uplinkProfileId": "DUAL_25G_DISTINCT_TOR",
++  "nodes": [
++    {
++      "name": "AUS01-edge01",
++      "availabilityZone": "AUS01-AZ1",
++      "uplinks": [
++        {
++          "name": "uplink1",
++          "physicalNic": "vmnic4",
++          "speedGbps": 25,
++          "tor": "AUS01-TOR-A",
++          "vlan": 2711
++        },
++        {
++          "name": "uplink2",
++          "physicalNic": "vmnic5",
++          "speedGbps": 25,
++          "tor": "AUS01-TOR-B",
++          "vlan": 2712
++        }
++      ]
++    },
++    {
++      "name": "AUS01-edge02",
++      "availabilityZone": "AUS01-AZ2",
++      "uplinks": [
++        {
++          "name": "uplink1",
++          "physicalNic": "vmnic4",
++          "speedGbps": 25,
++          "tor": "AUS01-TOR-A",
++          "vlan": 2711
++        },
++        {
++          "name": "uplink2",
++          "physicalNic": "vmnic5",
++          "speedGbps": 25,
++          "tor": "AUS01-TOR-B",
++          "vlan": 2712
++        }
++      ]
++    }
++  ],
++  "tep": {
++    "vlan": 2710,
++    "mtu": 9000,
++    "teamingPolicy": "LOADBALANCE_SRCID"
++  }
++}
+diff --git a/out/migration-plan.json b/out/migration-plan.json
+index 0967ef4..002e200 100644
+--- a/out/migration-plan.json
++++ b/out/migration-plan.json
+@@ -1 +1,134 @@
+-{}
++{
++  "estateId": "texas-production",
++  "targetVcfVersion": "9.1.0.0",
++  "steps": [
++    {
++      "order": 1,
++      "component": "VCF_OPERATIONS",
++      "fromVersion": "8.18.3",
++      "targetVersion": "9.1.0.0",
++      "gates": [
++        {
++          "id": "OPERATIONS_BACKUP_COMPLETE",
++          "condition": "A current, restorable VCF Operations backup is confirmed."
++        },
++        {
++          "id": "ADAPTERS_HEALTHY",
++          "condition": "All VCF Operations adapters report healthy collection before the upgrade."
++        }
++      ]
++    },
++    {
++      "order": 2,
++      "component": "VCF_SDDC_MANAGER",
++      "fromVersion": "5.2.1.0",
++      "targetVersion": "9.1.0.0",
++      "gates": [
++        {
++          "id": "SDDC_BACKUP_COMPLETE",
++          "condition": "A current, restorable SDDC Manager backup is confirmed."
++        },
++        {
++          "id": "MANAGEMENT_HEALTH_GREEN",
++          "condition": "SDDC Manager reports all managed management-domain components healthy."
++        },
++        {
++          "id": "VCF_9_LICENSE_READY",
++          "condition": "The VCF 9 license entitlement and license server are ready."
++        }
++      ]
++    },
++    {
++      "order": 3,
++      "component": "VMWARE_NSX",
++      "fromVersion": "4.2.1.3",
++      "targetVersion": "9.1.0.0",
++      "gates": [
++        {
++          "id": "NSX_BACKUP_COMPLETE",
++          "condition": "A current, restorable NSX configuration backup is confirmed."
++        },
++        {
++          "id": "NSX_PRECHECK_GREEN",
++          "condition": "The NSX upgrade precheck completes without blocking findings."
++        },
++        {
++          "id": "TRANSPORT_NODES_HEALTHY",
++          "condition": "All NSX host and Edge transport nodes report healthy realization."
++        }
++      ]
++    },
++    {
++      "order": 4,
++      "component": "NSX_EDGE_CLUSTER",
++      "fromVersion": "4.2.1.3",
++      "targetVersion": "9.1.0.0",
++      "gates": [
++        {
++          "id": "EDGE_CLUSTER_HEALTHY",
++          "condition": "Every NSX Edge transport node is registered, connected, and healthy."
++        },
++        {
++          "id": "TIER0_FAILOVER_TESTED",
++          "condition": "Tier-0 gateway failover succeeds before Edge nodes are changed."
++        }
++      ]
++    },
++    {
++      "order": 5,
++      "component": "VSPHERE_VCENTER",
++      "fromVersion": "8.0.3.00400",
++      "targetVersion": "9.1.0.0",
++      "gates": [
++        {
++          "id": "VCENTER_BACKUP_COMPLETE",
++          "condition": "A current, restorable file-based vCenter backup is confirmed."
++        },
++        {
++          "id": "VCENTER_PRECHECK_GREEN",
++          "condition": "The vCenter upgrade precheck completes without blocking findings."
++        }
++      ]
++    },
++    {
++      "order": 6,
++      "component": "ESXI",
++      "fromVersion": "8.0.3-24674464",
++      "targetVersion": "9.1.0.0",
++      "gates": [
++        {
++          "id": "HARDWARE_COMPATIBILITY_GREEN",
++          "condition": "All hosts, devices, firmware, and drivers are supported for the target ESXi release."
++        },
++        {
++          "id": "VSAN_RESYNC_COMPLETE",
++          "condition": "No vSAN objects are resynchronizing before the component change."
++        },
++        {
++          "id": "HOST_EVACUATION_CAPACITY_READY",
++          "condition": "The cluster can evacuate one host while retaining required workload and storage availability."
++        }
++      ]
++    },
++    {
++      "order": 7,
++      "component": "VSAN",
++      "fromVersion": "8.0.3",
++      "targetVersion": "9.1.0.0",
++      "gates": [
++        {
++          "id": "VSAN_HEALTH_GREEN",
++          "condition": "The vSAN health service reports no blocking findings."
++        },
++        {
++          "id": "VSAN_RESYNC_COMPLETE",
++          "condition": "No vSAN objects are resynchronizing before the component change."
++        },
++        {
++          "id": "DISK_FORMAT_PRECHECK_GREEN",
++          "condition": "The vSAN disk-format precheck completes without blocking findings."
++        }
++      ]
++    }
++  ]
++}
+diff --git a/out/sddc-spec.json b/out/sddc-spec.json
+index 0967ef4..9531a49 100644
+--- a/out/sddc-spec.json
++++ b/out/sddc-spec.json
+@@ -1 +1,185 @@
+-{}
++{
++  "ceipEnabled": false,
++  "clusterSpec": {
++    "clusterName": "AUS01-MGMT-CL01",
++    "datacenterName": "AUS01-DC"
++  },
++  "datastoreSpec": {
++    "vsanSpec": {
++      "datastoreName": "aus01-m01-vsan",
++      "esaConfig": {
++        "enabled": true
++      },
++      "failuresToTolerate": 2
++    }
++  },
++  "dnsSpec": {
++    "nameservers": [
++      "10.10.10.10",
++      "10.10.10.11"
++    ],
++    "subdomain": "vcf.example.com"
++  },
++  "dvsSpecs": [
++    {
++      "dvsName": "AUS01-MGMT-VDS01",
++      "mtu": 9000,
++      "networks": [
++        "MANAGEMENT",
++        "VMOTION",
++        "VSAN",
++        "VM_MANAGEMENT",
++        "FLEET_MANAGEMENT"
++      ],
++      "vmnicsToUplinks": [
++        {
++          "id": "vmnic0",
++          "uplink": "uplink1"
++        },
++        {
++          "id": "vmnic1",
++          "uplink": "uplink2"
++        }
++      ]
++    }
++  ],
++  "hostSpecs": [
++    {
++      "hostname": "aus01-esx01"
++    },
++    {
++      "hostname": "aus01-esx02"
++    },
++    {
++      "hostname": "aus01-esx03"
++    },
++    {
++      "hostname": "aus01-esx04"
++    },
++    {
++      "hostname": "aus01-esx05"
++    },
++    {
++      "hostname": "aus01-esx06"
++    }
++  ],
++  "managementPoolName": "aus01-m01-network-pool",
++  "networkSpecs": [
++    {
++      "gateway": "10.61.11.1",
++      "includeIpAddressRanges": [
++        {
++          "endIpAddress": "10.61.11.90",
++          "startIpAddress": "10.61.11.31"
++        }
++      ],
++      "ipAddressAssignmentMode": "STATIC",
++      "ipAddressVersion": "IPv4",
++      "mtu": 9000,
++      "networkType": "MANAGEMENT",
++      "subnet": "10.61.11.0/24",
++      "vlanId": 1611
++    },
++    {
++      "gateway": "10.61.12.1",
++      "includeIpAddressRanges": [
++        {
++          "endIpAddress": "10.61.12.90",
++          "startIpAddress": "10.61.12.31"
++        }
++      ],
++      "ipAddressAssignmentMode": "STATIC",
++      "ipAddressVersion": "IPv4",
++      "mtu": 9000,
++      "networkType": "VMOTION",
++      "subnet": "10.61.12.0/24",
++      "vlanId": 1612
++    },
++    {
++      "gateway": "10.61.13.1",
++      "includeIpAddressRanges": [
++        {
++          "endIpAddress": "10.61.13.90",
++          "startIpAddress": "10.61.13.31"
++        }
++      ],
++      "ipAddressAssignmentMode": "STATIC",
++      "ipAddressVersion": "IPv4",
++      "mtu": 9000,
++      "networkType": "VSAN",
++      "subnet": "10.61.13.0/24",
++      "vlanId": 1613
++    },
++    {
++      "gateway": "10.61.14.1",
++      "includeIpAddressRanges": [
++        {
++          "endIpAddress": "10.61.14.150",
++          "startIpAddress": "10.61.14.31"
++        }
++      ],
++      "ipAddressAssignmentMode": "STATIC",
++      "ipAddressVersion": "IPv4",
++      "mtu": 9000,
++      "networkType": "VM_MANAGEMENT",
++      "subnet": "10.61.14.0/24",
++      "vlanId": 1614
++    },
++    {
++      "gateway": "10.61.15.1",
++      "includeIpAddressRanges": [
++        {
++          "endIpAddress": "10.61.15.90",
++          "startIpAddress": "10.61.15.31"
++        }
++      ],
++      "ipAddressAssignmentMode": "STATIC",
++      "ipAddressVersion": "IPv4",
++      "mtu": 9000,
++      "networkType": "FLEET_MANAGEMENT",
++      "subnet": "10.61.15.0/24",
++      "vlanId": 1615
++    }
++  ],
++  "nsxtSpec": {
++    "nsxtManagerSize": "large",
++    "nsxtManagers": [
++      {
++        "hostname": "aus01-nsx01.vcf.example.com"
++      },
++      {
++        "hostname": "aus01-nsx02.vcf.example.com"
++      },
++      {
++        "hostname": "aus01-nsx03.vcf.example.com"
++      }
++    ],
++    "useExistingDeployment": false,
++    "version": "9.1.0.0",
++    "vipFqdn": "nsx-vip.vcf.example.com"
++  },
++  "ntpServers": [
++    "10.10.10.20",
++    "10.10.10.21"
++  ],
++  "sddcId": "aus01-m01",
++  "sddcManagerSpec": {
++    "hostname": "aus01-sddc01.vcf.example.com",
++    "useExistingDeployment": false,
++    "version": "9.1.0.0"
++  },
++  "skipEsxThumbprintValidation": false,
++  "skipGatewayPingValidation": false,
++  "vcenterSpec": {
++    "rootVcenterPassword": "${VC_ROOT_PASS}",
++    "ssoDomain": "vsphere.local",
++    "storageSize": "lstorage",
++    "useExistingDeployment": false,
++    "vcenterHostname": "aus01-vc01.vcf.example.com",
++    "version": "9.1.0.0",
++    "vmSize": "medium"
++  },
++  "vcfInstanceName": "Texas Production",
++  "version": "9.1.0.0",
++  "workflowType": "VCF"
++}
+diff --git a/research.md b/research.md
+index 3141e7a..283b72a 100644
+--- a/research.md
++++ b/research.md
+@@ -1,3 +1,13 @@
+ # Research record
+ 
+-Replace this placeholder with the Broadcom sources consulted and the decisions they informed.
++Retrieved 2026-08-14 using live network access.
++
++| Publication consulted | Source location | Decision informed |
++|---|---|---|
++| Broadcom Product Interoperability Matrix | https://interopmatrix.broadcom.com/Solution | Consulted the live interoperability authority for the VCF 9.1 target combination. Because matrix results are mutable and selected interactively, the generated component versions remain pinned to the supplied compatibility snapshot. |
++| “Upgrade Sequence and Related Issues for VMware Cloud Foundation and vSphere Foundation 9.1” (Broadcom KB 440630) | https://knowledge.broadcom.com/external/article/440630/upgrade-sequence-and-related-issues-for.html | Confirmed that VCF 5.2.x estates use the VCF 9.1 lifecycle path, that VCF Operations precedes the core lifecycle workflow, and that license readiness is a migration gate. |
++| “Update Sequence for VCF 9.0 and Compatible VMware Products” (Broadcom KB 390634) | https://knowledge.broadcom.com/external/article/390634/update-sequence-for-vcf-90-and-compatibl.html | Confirmed the core dependency direction: management services/SDDC Manager, NSX, vCenter, ESXi, then vSAN disk-format work. This informed the dependency-valid ordering in the plan. |
++| “vCenter and vRNI Report 100% NSX-T Edge CPU Utilization but Edge vCPUs are not fully utilized” (Broadcom KB 329045) | https://knowledge.broadcom.com/external/article/329045/vcenter-and-vrni-report-100-nsxt-edge-cp.html | Confirmed the 4/8/16-vCPU Medium/Large/XL Edge resource progression. The pinned throughput bands select XLARGE for the required 18 Gbps on the sole surviving Edge. |
++| “Unable to change MTU on Edge fp-eth interfaces in VCF 9” (Broadcom KB 422523) | https://knowledge.broadcom.com/external/article/422523/unable-to-change-mtu-on-edge-fpeth-inter.html | Confirmed that VCF 9 Edge deployment uses the multiple-TEP uplink profile and the global fabric MTU, supporting the dual-uplink, 9000-MTU TEP design. |
++
++No live source consulted exposed a value that conflicted with `authority/compatibility-snapshot.json`; generated artifacts therefore retain every pinned value.

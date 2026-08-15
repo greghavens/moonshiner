@@ -1,0 +1,541 @@
+diff --git a/architecture/planner.go b/architecture/planner.go
+index 9a5673a..0e197d2 100644
+--- a/architecture/planner.go
++++ b/architecture/planner.go
+@@ -1,15 +1,325 @@
+ package architecture
+ 
+-import "errors"
++import (
++	"encoding/json"
++	"fmt"
++	"reflect"
++	"unicode/utf8"
++)
+ 
+ // Build creates the deterministic ordered migration architecture described by
+ // the inventory and compatibility snapshot.
+-func Build(Inventory, CompatibilitySnapshot) (Plan, error) {
+-	return Plan{}, errors.New("migration architecture is not implemented")
++func Build(inventory Inventory, snapshot CompatibilitySnapshot) (Plan, error) {
++	contracts := make(map[string]ComponentContract, len(snapshot.Components))
++	for _, contract := range snapshot.Components {
++		if _, exists := contracts[contract.ID]; exists {
++			return Plan{}, fmt.Errorf("duplicate snapshot component %q", contract.ID)
++		}
++		contracts[contract.ID] = contract
++	}
++
++	components := make([]ComponentPlan, 0, len(inventory.Components))
++	for _, item := range inventory.Components {
++		contract, ok := contracts[item.ID]
++		if !ok {
++			return Plan{}, fmt.Errorf("snapshot has no component %q", item.ID)
++		}
++		components = append(components, ComponentPlan{
++			ID:             item.ID,
++			Name:           item.Name,
++			CurrentVersion: item.Version,
++			TargetVersion:  contract.TargetVersion,
++			GatedBy:        []string{contract.FinalGate},
++		})
++	}
++
++	rationales := map[string]string{
++		"capture-identifiers":   "Preserve the domain, host, vCenter, and NSX identities needed by detach and re-import operations.",
++		"unprepare-nsx":         "Remove NSX from every cluster so the newer build is not presented as an in-place upgrade source.",
++		"detach-domain":         "Clear the unprepared hosts, NSX cluster, domain inventory, and stale vCenter registration before re-import.",
++		"deploy-compatible-nsx": "Deploy the pinned compatible NSX build as a fresh instance, avoiding the blocked back-in-time edge.",
++		"reimport-domain":       "Import the existing vCenter and its hosts with the compatible replacement NSX instance attached.",
++		"upgrade-sddc-manager":  "Move lifecycle orchestration to the target release before upgrading workload-domain components.",
++		"upgrade-nsx":           "Upgrade replacement NSX over its supported edge before the dependent vCenter and ESXi transitions.",
++		"upgrade-vcenter":       "Upgrade vCenter only after NSX reaches its target, preserving the pinned core component order.",
++		"upgrade-esxi":          "Remediate the cluster last so every core management component is already at its target state.",
++	}
++	steps := make([]Step, 0, len(snapshot.Gates))
++	for index, gate := range snapshot.Gates {
++		rationale, ok := rationales[gate.ID]
++		if !ok {
++			return Plan{}, fmt.Errorf("no architecture rationale for gate %q", gate.ID)
++		}
++		steps = append(steps, Step{
++			Order:       index + 1,
++			ID:          gate.ID,
++			Action:      gate.Action,
++			ComponentID: gate.ComponentID,
++			FromVersion: gate.FromVersion,
++			ToVersion:   gate.ToVersion,
++			Requires:    append([]string{}, gate.Requires...),
++			Produces:    gate.Produces,
++			Rationale:   rationale,
++		})
++	}
++
++	targetSpec, err := json.Marshal(struct {
++		SddcID       string `json:"sddcId"`
++		WorkflowType string `json:"workflowType"`
++		Version      string `json:"version"`
++		VcenterSpec  struct {
++			VcenterHostname     string `json:"vcenterHostname"`
++			RootVcenterPassword string `json:"rootVcenterPassword"`
++			Version             string `json:"version"`
++			UseExisting         bool   `json:"useExistingDeployment"`
++		} `json:"vcenterSpec"`
++		NetworkSpecs []struct {
++			NetworkType string `json:"networkType"`
++			VLANID      int    `json:"vlanId"`
++		} `json:"networkSpecs"`
++		DNSSpec struct {
++			Subdomain   string   `json:"subdomain"`
++			Nameservers []string `json:"nameservers"`
++		} `json:"dnsSpec"`
++	}{
++		SddcID:       inventory.InstallerInputs.SddcID,
++		WorkflowType: "VCF",
++		Version:      inventory.TargetRelease,
++		VcenterSpec: struct {
++			VcenterHostname     string `json:"vcenterHostname"`
++			RootVcenterPassword string `json:"rootVcenterPassword"`
++			Version             string `json:"version"`
++			UseExisting         bool   `json:"useExistingDeployment"`
++		}{
++			VcenterHostname:     inventory.InstallerInputs.VcenterHostname,
++			RootVcenterPassword: inventory.InstallerInputs.RootVcenterPassword,
++			Version:             componentVersion(inventory.Components, "vcenter"),
++			UseExisting:         true,
++		},
++		NetworkSpecs: []struct {
++			NetworkType string `json:"networkType"`
++			VLANID      int    `json:"vlanId"`
++		}{
++			{NetworkType: "MANAGEMENT", VLANID: inventory.InstallerInputs.ManagementVLAN},
++		},
++		DNSSpec: struct {
++			Subdomain   string   `json:"subdomain"`
++			Nameservers []string `json:"nameservers"`
++		}{
++			Subdomain:   inventory.InstallerInputs.Subdomain,
++			Nameservers: append([]string(nil), inventory.InstallerInputs.Nameservers...),
++		},
++	})
++	if err != nil {
++		return Plan{}, fmt.Errorf("encode target SddcSpec: %w", err)
++	}
++
++	plan := Plan{
++		SchemaVersion:  "1.0",
++		EstateID:       inventory.EstateID,
++		SourceRelease:  inventory.SourceRelease,
++		TargetRelease:  inventory.TargetRelease,
++		SnapshotID:     snapshot.SnapshotID,
++		TargetSddcSpec: targetSpec,
++		Components:     components,
++		Steps:          steps,
++	}
++	if err := Validate(plan, inventory, snapshot); err != nil {
++		return Plan{}, err
++	}
++	return plan, nil
+ }
+ 
+ // Validate checks a plan against the inventory and pinned compatibility
+ // snapshot. JSON-schema and installer-schema validation are verifier concerns.
+-func Validate(Plan, Inventory, CompatibilitySnapshot) error {
+-	return errors.New("migration architecture validation is not implemented")
++func Validate(plan Plan, inventory Inventory, snapshot CompatibilitySnapshot) error {
++	if plan.SchemaVersion != "1.0" || plan.EstateID != inventory.EstateID {
++		return fmt.Errorf("plan identity does not match inventory")
++	}
++	if plan.SourceRelease != inventory.SourceRelease || plan.TargetRelease != inventory.TargetRelease {
++		return fmt.Errorf("plan releases do not match inventory")
++	}
++	if snapshot.SourceRelease != inventory.SourceRelease || snapshot.TargetRelease != inventory.TargetRelease {
++		return fmt.Errorf("inventory and compatibility snapshot releases disagree")
++	}
++	if plan.SnapshotID != snapshot.SnapshotID {
++		return fmt.Errorf("plan references snapshot %q, want %q", plan.SnapshotID, snapshot.SnapshotID)
++	}
++	if err := validateTargetSpec(plan.TargetSddcSpec, inventory); err != nil {
++		return err
++	}
++
++	inventoryByID := make(map[string]InventoryItem, len(inventory.Components))
++	for _, item := range inventory.Components {
++		if _, exists := inventoryByID[item.ID]; exists {
++			return fmt.Errorf("duplicate inventory component %q", item.ID)
++		}
++		inventoryByID[item.ID] = item
++	}
++	contractByID := make(map[string]ComponentContract, len(snapshot.Components))
++	for _, contract := range snapshot.Components {
++		if _, exists := contractByID[contract.ID]; exists {
++			return fmt.Errorf("duplicate snapshot component %q", contract.ID)
++		}
++		contractByID[contract.ID] = contract
++	}
++	if len(plan.Components) != len(inventoryByID) || len(contractByID) != len(inventoryByID) {
++		return fmt.Errorf("component coverage is incomplete")
++	}
++	seenComponents := map[string]bool{}
++	for _, component := range plan.Components {
++		if seenComponents[component.ID] {
++			return fmt.Errorf("duplicate plan component %q", component.ID)
++		}
++		seenComponents[component.ID] = true
++		item, ok := inventoryByID[component.ID]
++		if !ok {
++			return fmt.Errorf("unknown plan component %q", component.ID)
++		}
++		contract, ok := contractByID[component.ID]
++		if !ok {
++			return fmt.Errorf("snapshot has no contract for %q", component.ID)
++		}
++		if component.Name != item.Name || component.CurrentVersion != item.Version {
++			return fmt.Errorf("component %q does not match current inventory", component.ID)
++		}
++		if component.CurrentVersion != contract.CurrentVersion || component.TargetVersion != contract.TargetVersion {
++			return fmt.Errorf("component %q versions violate compatibility snapshot", component.ID)
++		}
++		if !reflect.DeepEqual(component.GatedBy, []string{contract.FinalGate}) {
++			return fmt.Errorf("component %q must be gated by %q", component.ID, contract.FinalGate)
++		}
++	}
++
++	gateByID := make(map[string]GateContract, len(snapshot.Gates))
++	for _, gate := range snapshot.Gates {
++		if _, exists := gateByID[gate.ID]; exists {
++			return fmt.Errorf("duplicate snapshot gate %q", gate.ID)
++		}
++		gateByID[gate.ID] = gate
++	}
++	if len(plan.Steps) != len(gateByID) {
++		return fmt.Errorf("plan has %d steps, want %d", len(plan.Steps), len(gateByID))
++	}
++	state := make(map[string]string, len(inventory.Components))
++	for _, item := range inventory.Components {
++		state[item.ID] = item.Version
++	}
++	produced := map[string]bool{}
++	seenSteps := map[string]bool{}
++	for index, step := range plan.Steps {
++		if step.Order != index+1 {
++			return fmt.Errorf("step %q order is %d, want %d", step.ID, step.Order, index+1)
++		}
++		if seenSteps[step.ID] {
++			return fmt.Errorf("duplicate step %q", step.ID)
++		}
++		seenSteps[step.ID] = true
++		gate, ok := gateByID[step.ID]
++		if !ok {
++			return fmt.Errorf("step %q is not in the compatibility snapshot", step.ID)
++		}
++		if step.Action != gate.Action || step.ComponentID != gate.ComponentID || step.FromVersion != gate.FromVersion || step.ToVersion != gate.ToVersion {
++			return fmt.Errorf("step %q action or transition drifts from snapshot", step.ID)
++		}
++		if !reflect.DeepEqual(step.Requires, gate.Requires) || step.Produces != gate.Produces {
++			return fmt.Errorf("step %q gate contract drifts from snapshot", step.ID)
++		}
++		if utf8.RuneCountInString(step.Rationale) < gate.MinimumRationale {
++			return fmt.Errorf("step %q rationale is too short", step.ID)
++		}
++		for _, requirement := range step.Requires {
++			if !produced[requirement] {
++				return fmt.Errorf("step %q requires unavailable gate %q", step.ID, requirement)
++			}
++		}
++		if produced[step.Produces] {
++			return fmt.Errorf("gate %q is produced more than once", step.Produces)
++		}
++		if step.ComponentID != "" {
++			current, ok := state[step.ComponentID]
++			if !ok {
++				return fmt.Errorf("step %q names unknown component %q", step.ID, step.ComponentID)
++			}
++			if current != step.FromVersion {
++				return fmt.Errorf("step %q starts %q at %q, current state is %q", step.ID, step.ComponentID, step.FromVersion, current)
++			}
++			contract := contractByID[step.ComponentID]
++			transition := Transition{From: step.FromVersion, To: step.ToVersion, Operation: step.Action}
++			if contains(contract.BlockedTransitions, transition) {
++				return fmt.Errorf("step %q uses a blocked transition", step.ID)
++			}
++			if !contains(contract.AllowedTransitions, transition) {
++				return fmt.Errorf("step %q transition is not supported", step.ID)
++			}
++			state[step.ComponentID] = step.ToVersion
++		}
++		produced[step.Produces] = true
++	}
++	for _, contract := range snapshot.Components {
++		if state[contract.ID] != contract.TargetVersion {
++			return fmt.Errorf("component %q finishes at %q, want %q", contract.ID, state[contract.ID], contract.TargetVersion)
++		}
++		if !produced[contract.FinalGate] {
++			return fmt.Errorf("component %q final gate %q was not produced", contract.ID, contract.FinalGate)
++		}
++	}
++	return nil
++}
++
++func componentVersion(components []InventoryItem, id string) string {
++	for _, component := range components {
++		if component.ID == id {
++			return component.Version
++		}
++	}
++	return ""
++}
++
++func contains(transitions []Transition, candidate Transition) bool {
++	for _, transition := range transitions {
++		if transition == candidate {
++			return true
++		}
++	}
++	return false
++}
++
++func validateTargetSpec(raw json.RawMessage, inventory Inventory) error {
++	var spec struct {
++		SddcID       string `json:"sddcId"`
++		WorkflowType string `json:"workflowType"`
++		Version      string `json:"version"`
++		VcenterSpec  struct {
++			Hostname    string `json:"vcenterHostname"`
++			Password    string `json:"rootVcenterPassword"`
++			Version     string `json:"version"`
++			UseExisting bool   `json:"useExistingDeployment"`
++		} `json:"vcenterSpec"`
++		NetworkSpecs []struct {
++			Type   string `json:"networkType"`
++			VLANID int    `json:"vlanId"`
++		} `json:"networkSpecs"`
++		DNSSpec struct {
++			Subdomain   string   `json:"subdomain"`
++			Nameservers []string `json:"nameservers"`
++		} `json:"dnsSpec"`
++	}
++	if err := json.Unmarshal(raw, &spec); err != nil {
++		return fmt.Errorf("decode targetSddcSpec: %w", err)
++	}
++	inputs := inventory.InstallerInputs
++	if spec.SddcID != inputs.SddcID || spec.WorkflowType != "VCF" || spec.Version != inventory.TargetRelease {
++		return fmt.Errorf("targetSddcSpec identity or release does not match inventory")
++	}
++	if spec.VcenterSpec.Hostname != inputs.VcenterHostname || spec.VcenterSpec.Password != inputs.RootVcenterPassword || spec.VcenterSpec.Version != componentVersion(inventory.Components, "vcenter") || !spec.VcenterSpec.UseExisting {
++		return fmt.Errorf("targetSddcSpec does not identify the existing vCenter")
++	}
++	if spec.DNSSpec.Subdomain != inputs.Subdomain || !reflect.DeepEqual(spec.DNSSpec.Nameservers, inputs.Nameservers) {
++		return fmt.Errorf("targetSddcSpec DNS does not match inventory")
++	}
++	if len(spec.NetworkSpecs) != 1 || spec.NetworkSpecs[0].Type != "MANAGEMENT" || spec.NetworkSpecs[0].VLANID != inputs.ManagementVLAN {
++		return fmt.Errorf("targetSddcSpec management network does not match inventory")
++	}
++	return nil
+ }
+diff --git a/migration-plan.json b/migration-plan.json
+new file mode 100644
+index 0000000..2c74986
+--- /dev/null
++++ b/migration-plan.json
+@@ -0,0 +1,177 @@
++{
++  "schemaVersion": "1.0",
++  "estateId": "chi-analytics",
++  "sourceRelease": "5.2.2.0",
++  "targetRelease": "9.0.2.0",
++  "snapshotId": "broadcom-vcf-5.2.2-to-9.0.2-2026-07-01",
++  "targetSddcSpec": {
++    "sddcId": "chi01-w01",
++    "workflowType": "VCF",
++    "version": "9.0.2.0",
++    "vcenterSpec": {
++      "vcenterHostname": "vcsa-analytics.example.net",
++      "rootVcenterPassword": "FixtureOnly1!",
++      "version": "8.0.3.00600-24853646",
++      "useExistingDeployment": true
++    },
++    "networkSpecs": [
++      {
++        "networkType": "MANAGEMENT",
++        "vlanId": 101
++      }
++    ],
++    "dnsSpec": {
++      "subdomain": "example.net",
++      "nameservers": [
++        "192.0.2.53",
++        "192.0.2.54"
++      ]
++    }
++  },
++  "components": [
++    {
++      "id": "sddc-manager",
++      "name": "VMware SDDC Manager",
++      "currentVersion": "5.2.2.0-24936865",
++      "targetVersion": "9.0.2.0-25151285",
++      "gatedBy": [
++        "sddc-manager-at-target"
++      ]
++    },
++    {
++      "id": "nsx-manager",
++      "name": "VMware NSX",
++      "currentVersion": "4.2.3.3.0-25171318",
++      "targetVersion": "9.0.2.0-25150386",
++      "gatedBy": [
++        "nsx-at-target"
++      ]
++    },
++    {
++      "id": "vcenter",
++      "name": "VMware vCenter Server",
++      "currentVersion": "8.0.3.00600-24853646",
++      "targetVersion": "9.0.2.0-25148086",
++      "gatedBy": [
++        "vcenter-at-target"
++      ]
++    },
++    {
++      "id": "esxi-cluster",
++      "name": "VMware ESXi cluster",
++      "currentVersion": "8.0.3-24859861",
++      "targetVersion": "9.0.2.0-25148076",
++      "gatedBy": [
++        "esxi-at-target"
++      ]
++    }
++  ],
++  "steps": [
++    {
++      "order": 1,
++      "id": "capture-identifiers",
++      "action": "capture-identifiers",
++      "requires": [],
++      "produces": "identifiers-captured",
++      "rationale": "Preserve the domain, host, vCenter, and NSX identities needed by detach and re-import operations."
++    },
++    {
++      "order": 2,
++      "id": "unprepare-nsx",
++      "action": "remove",
++      "componentId": "nsx-manager",
++      "fromVersion": "4.2.3.3.0-25171318",
++      "toVersion": "absent",
++      "requires": [
++        "identifiers-captured"
++      ],
++      "produces": "nsx-unprepared",
++      "rationale": "Remove NSX from every cluster so the newer build is not presented as an in-place upgrade source."
++    },
++    {
++      "order": 3,
++      "id": "detach-domain",
++      "action": "detach-domain",
++      "requires": [
++        "nsx-unprepared"
++      ],
++      "produces": "domain-detached",
++      "rationale": "Clear the unprepared hosts, NSX cluster, domain inventory, and stale vCenter registration before re-import."
++    },
++    {
++      "order": 4,
++      "id": "deploy-compatible-nsx",
++      "action": "deploy",
++      "componentId": "nsx-manager",
++      "fromVersion": "absent",
++      "toVersion": "4.2.3.1.0-24954727",
++      "requires": [
++        "domain-detached"
++      ],
++      "produces": "compatible-nsx-deployed",
++      "rationale": "Deploy the pinned compatible NSX build as a fresh instance, avoiding the blocked back-in-time edge."
++    },
++    {
++      "order": 5,
++      "id": "reimport-domain",
++      "action": "reimport-domain",
++      "requires": [
++        "compatible-nsx-deployed"
++      ],
++      "produces": "domain-reimported",
++      "rationale": "Import the existing vCenter and its hosts with the compatible replacement NSX instance attached."
++    },
++    {
++      "order": 6,
++      "id": "upgrade-sddc-manager",
++      "action": "upgrade",
++      "componentId": "sddc-manager",
++      "fromVersion": "5.2.2.0-24936865",
++      "toVersion": "9.0.2.0-25151285",
++      "requires": [
++        "domain-reimported"
++      ],
++      "produces": "sddc-manager-at-target",
++      "rationale": "Move lifecycle orchestration to the target release before upgrading workload-domain components."
++    },
++    {
++      "order": 7,
++      "id": "upgrade-nsx",
++      "action": "upgrade",
++      "componentId": "nsx-manager",
++      "fromVersion": "4.2.3.1.0-24954727",
++      "toVersion": "9.0.2.0-25150386",
++      "requires": [
++        "sddc-manager-at-target"
++      ],
++      "produces": "nsx-at-target",
++      "rationale": "Upgrade replacement NSX over its supported edge before the dependent vCenter and ESXi transitions."
++    },
++    {
++      "order": 8,
++      "id": "upgrade-vcenter",
++      "action": "upgrade",
++      "componentId": "vcenter",
++      "fromVersion": "8.0.3.00600-24853646",
++      "toVersion": "9.0.2.0-25148086",
++      "requires": [
++        "nsx-at-target"
++      ],
++      "produces": "vcenter-at-target",
++      "rationale": "Upgrade vCenter only after NSX reaches its target, preserving the pinned core component order."
++    },
++    {
++      "order": 9,
++      "id": "upgrade-esxi",
++      "action": "upgrade",
++      "componentId": "esxi-cluster",
++      "fromVersion": "8.0.3-24859861",
++      "toVersion": "9.0.2.0-25148076",
++      "requires": [
++        "vcenter-at-target"
++      ],
++      "produces": "esxi-at-target",
++      "rationale": "Remediate the cluster last so every core management component is already at its target state."
++    }
++  ]
++}
+diff --git a/research.md b/research.md
+new file mode 100644
+index 0000000..453330e
+--- /dev/null
++++ b/research.md
+@@ -0,0 +1,17 @@
++# Live compatibility research record
++
++These live sources informed the architecture; the local snapshot remains the
++reproducible implementation authority.
++
++| Source title | URL | Access date | Decision informed |
++| --- | --- | --- | --- |
++| Broadcom KB 430825, “VCF Upgrade Failure: Cannot Upgrade VCF 5.2.2 to 9.0.1 or 9.0.2 Due to NSX Back-in-Time Error (NSX 4.2.3.3)” | https://knowledge.broadcom.com/external/article/430825 | 2026-08-14 | Confirmed that NSX 4.2.3.3 build 25171318 cannot be upgraded in place to the older-dated 9.0.2 bundle build, and that the immediate-target path is unprepare, remove the domain, and re-import with a compatible NSX version. |
++| Broadcom KB 429205, “Overriding version of NSX Manager while converging or importing an existing vCenter instance with new NSX Manager deployment” | https://knowledge.broadcom.com/external/article/429205 | 2026-08-14 | Confirmed the custom-NSX import mechanism and the published NSX 4.2.3.1.0-24954727 / vCenter 8.0.3.00600-24853646 compatibility example used for the fresh intermediate deployment. |
++| Broadcom KB 390634, “Update Sequence for VCF 9.0 and Compatible VMware Products” | https://knowledge.broadcom.com/external/article/390634/update-sequence-for-vcf-90-and-compatibl.html | 2026-08-14 | Confirmed the core component order: SDDC Manager, NSX, vCenter, then ESXi. |
++| Broadcom KB 314608, “Correlating VMware Cloud Foundation version with the versions of its constituent products” | https://knowledge.broadcom.com/external/article/314608 | 2026-08-14 | Cross-checked the VCF 5.2.2 source BOM component versions and the target-release component family. |
++| Broadcom Product Interoperability Matrix | https://interopmatrix.broadcom.com/Interoperability | 2026-08-14 | Cross-checked component interoperability separately from whether a particular source-to-target transition is supported. |
++| Broadcom Upgrade Path matrix for VMware NSX | https://interopmatrix.broadcom.com/Upgrade?productId=912 | 2026-08-14 | Cross-checked the replacement NSX upgrade path instead of encoding the blocked direct edge. |
++
++The plan intentionally does not model 4.2.3.3 → 9.0.2 as an upgrade. Removing
++the newer NSX instance ends that lineage; the compatible 4.2.3.1 instance is a
++fresh deployment during re-import and has its own supported forward edge.

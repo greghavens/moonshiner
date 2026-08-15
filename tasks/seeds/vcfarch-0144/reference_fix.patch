@@ -1,0 +1,280 @@
+diff --git a/architecture.go b/architecture.go
+--- a/architecture.go
++++ b/architecture.go
+@@ -2,6 +2,8 @@
+ 
+ import (
+ 	"encoding/json"
++	"fmt"
++	"sort"
+ )
+ 
+ // Inventory is the existing estate supplied to Build.
+@@ -147,6 +149,230 @@
+ 
+ // Build creates the target architecture from the supplied immutable inputs.
+ func Build(inventory Inventory, compatibility CompatibilitySnapshot) (Architecture, error) {
+-	// TODO: implement the architecture.
+-	return Architecture{}, nil
++	transitionByKey := make(map[string]TransitionRule, len(compatibility.Transitions))
++	for _, transition := range compatibility.Transitions {
++		transitionByKey[transition.ComponentType+"\x00"+transition.FromVersion] = transition
++	}
++	dependencyByID := make(map[string][]string, len(compatibility.Dependencies))
++	for _, dependency := range compatibility.Dependencies {
++		dependencyByID[dependency.ComponentID] = append([]string{}, dependency.DependsOn...)
++	}
++	componentByID := make(map[string]InventoryComponent, len(inventory.Components))
++	for _, component := range inventory.Components {
++		componentByID[component.ID] = component
++	}
++
++	orderedIDs, err := dependencyOrder(componentByID, dependencyByID)
++	if err != nil {
++		return Architecture{}, err
++	}
++	steps := make([]MigrationStep, 0, len(orderedIDs))
++	for index, id := range orderedIDs {
++		component := componentByID[id]
++		transition, exists := transitionByKey[component.Type+"\x00"+component.Version]
++		if !exists {
++			return Architecture{}, fmt.Errorf("no pinned transition for %s at %s", component.Type, component.Version)
++		}
++		target, exists := compatibility.TargetVersions[component.Type]
++		if !exists || target != transition.ToVersion {
++			return Architecture{}, fmt.Errorf("inconsistent target for component type %s", component.Type)
++		}
++		steps = append(steps, MigrationStep{
++			Order:         index + 1,
++			ComponentID:   component.ID,
++			ComponentName: component.Name,
++			ComponentType: component.Type,
++			FromVersion:   component.Version,
++			TargetVersion: target,
++			Action:        transition.AllowedAction,
++			Gates:         append([]string{}, transition.RequiredGates...),
++			DependsOn:     append([]string{}, dependencyByID[id]...),
++		})
++	}
++
++	topology, err := managementTopology(inventory, compatibility)
++	if err != nil {
++		return Architecture{}, err
++	}
++	sddcSpec, err := installerSpec(inventory, compatibility)
++	if err != nil {
++		return Architecture{}, err
++	}
++	return Architecture{
++		Greenfield: GreenfieldDesign{SddcSpec: sddcSpec, Topology: topology},
++		MigrationPlan: MigrationPlan{
++			SchemaVersion: "1.0",
++			EstateID:      inventory.EstateID,
++			TargetRelease: compatibility.TargetRelease,
++			Strategy:      "parallel-target-and-swing",
++			Steps:         steps,
++		},
++	}, nil
++}
++
++func dependencyOrder(components map[string]InventoryComponent, dependencies map[string][]string) ([]string, error) {
++	remaining := make(map[string]bool, len(components))
++	for id := range components {
++		remaining[id] = true
++	}
++	ordered := make([]string, 0, len(components))
++	completed := map[string]bool{}
++	for len(remaining) > 0 {
++		var ready []string
++		for id := range remaining {
++			allReady := true
++			for _, predecessor := range dependencies[id] {
++				if _, exists := components[predecessor]; !exists {
++					return nil, fmt.Errorf("component %s depends on unknown component %s", id, predecessor)
++				}
++				if !completed[predecessor] {
++					allReady = false
++				}
++			}
++			if allReady {
++				ready = append(ready, id)
++			}
++		}
++		if len(ready) == 0 {
++			return nil, fmt.Errorf("component dependencies contain a cycle")
++		}
++		sort.Strings(ready)
++		for _, id := range ready {
++			ordered = append(ordered, id)
++			completed[id] = true
++			delete(remaining, id)
++		}
++	}
++	return ordered, nil
++}
++
++func managementTopology(inventory Inventory, compatibility CompatibilitySnapshot) (ManagementTopology, error) {
++	var dataSites []DataSitePlacement
++	for _, site := range inventory.Sites {
++		if site.Role != "data" {
++			continue
++		}
++		placement := DataSitePlacement{SiteID: site.ID, FailureDomain: site.FailureDomain}
++		for _, component := range inventory.Components {
++			if component.Type == "esxi" && component.Site == site.ID {
++				placement.Hosts = append(placement.Hosts, component.Members...)
++			}
++		}
++		dataSites = append(dataSites, placement)
++	}
++	for _, component := range inventory.Components {
++		if component.Type != "vsan-witness" {
++			continue
++		}
++		if len(component.Members) != 1 {
++			return ManagementTopology{}, fmt.Errorf("witness must have exactly one hostname")
++		}
++		for _, site := range inventory.Sites {
++			if site.ID == component.Site && site.Role == "witness" {
++				return ManagementTopology{
++					Stretched: true,
++					DataSites: dataSites,
++					Witness: WitnessPlacement{
++						ComponentID:            component.ID,
++						SiteID:                 site.ID,
++						FailureDomain:          site.FailureDomain,
++						Hostname:               component.Members[0],
++						Version:                compatibility.TargetVersions[component.Type],
++						PlacementType:          "dedicated-virtual-appliance",
++						Dedicated:              true,
++						RunsOnManagementDomain: false,
++					},
++				}, nil
++			}
++		}
++	}
++	return ManagementTopology{}, fmt.Errorf("inventory has no witness in a witness site")
++}
++
++func installerSpec(inventory Inventory, compatibility CompatibilitySnapshot) (json.RawMessage, error) {
++	hosts := make([]any, 0, inventory.Greenfield.ExpectedManagementHosts)
++	for _, component := range inventory.Components {
++		if component.Type == "esxi" {
++			for _, hostname := range component.Members {
++				hosts = append(hosts, map[string]any{"hostname": hostname})
++			}
++		}
++	}
++	networks := make([]any, 0, len(inventory.Networks))
++	networkTypes := make([]string, 0, len(inventory.Networks))
++	for _, network := range inventory.Networks {
++		networks = append(networks, map[string]any{
++			"networkType": network.Type,
++			"vlanId":      network.VLAN,
++			"subnet":      network.CIDR,
++			"gateway":     network.Gateway,
++			"mtu":         network.MTU,
++		})
++		networkTypes = append(networkTypes, network.Type)
++	}
++	nsxManagers := make([]any, 0, len(inventory.Greenfield.NSXManagerHostnames))
++	for _, hostname := range inventory.Greenfield.NSXManagerHostnames {
++		nsxManagers = append(nsxManagers, map[string]any{"hostname": hostname})
++	}
++	spec := map[string]any{
++		"sddcId":       inventory.Greenfield.SddcID,
++		"workflowType": "VCF",
++		"version":      compatibility.TargetRelease,
++		"hostSpecs":    hosts,
++		"vcenterSpec": map[string]any{
++			"vcenterHostname":       inventory.Greenfield.VcenterHostname,
++			"rootVcenterPassword":   inventory.Greenfield.VcenterRootPasswordRef,
++			"version":               compatibility.TargetVersions["vcenter"],
++			"useExistingDeployment": false,
++		},
++		"clusterSpec": map[string]any{
++			"clusterName":    inventory.Greenfield.ClusterName,
++			"datacenterName": inventory.Greenfield.DatacenterName,
++		},
++		"dvsSpecs": []any{map[string]any{
++			"dvsName":  inventory.Greenfield.DVSName,
++			"networks": networkTypes,
++			"mtu":      9000,
++			"vmnicsToUplinks": []any{
++				map[string]any{"id": "vmnic0", "uplink": "uplink1"},
++				map[string]any{"id": "vmnic1", "uplink": "uplink2"},
++			},
++		}},
++		"nsxtSpec": map[string]any{
++			"nsxtManagers":            nsxManagers,
++			"nsxtManagerSize":         "medium",
++			"vipFqdn":                 inventory.Greenfield.NSXVIP,
++			"rootNsxtManagerPassword": inventory.Greenfield.NSXManagerPasswordRef,
++			"nsxtAdminPassword":       inventory.Greenfield.NSXManagerPasswordRef,
++			"nsxtAuditPassword":       inventory.Greenfield.NSXManagerPasswordRef,
++			"version":                 compatibility.TargetVersions["nsx"],
++			"useExistingDeployment":   false,
++		},
++		"networkSpecs": networks,
++		"dnsSpec": map[string]any{
++			"subdomain":   inventory.Greenfield.Subdomain,
++			"nameservers": inventory.Greenfield.NameServers,
++		},
++		"ntpServers": inventory.Greenfield.NTPServers,
++		"sddcManagerSpec": map[string]any{
++			"hostname":              inventory.Greenfield.SddcManagerHostname,
++			"rootPassword":          inventory.Greenfield.SddcManagerPasswordRef,
++			"localUserPassword":     inventory.Greenfield.SddcManagerLocalUserRef,
++			"version":               compatibility.TargetVersions["sddc-manager"],
++			"useExistingDeployment": false,
++		},
++		"managementPoolName": inventory.Greenfield.ManagementPoolName,
++		"datastoreSpec": map[string]any{
++			"vsanSpec": map[string]any{
++				"datastoreName":      inventory.Greenfield.DatastoreName,
++				"failuresToTolerate": 1,
++				"esaConfig":          map[string]any{"enabled": true},
++			},
++		},
++	}
++	encoded, err := json.Marshal(spec)
++	if err != nil {
++		return nil, fmt.Errorf("marshal SddcSpec: %w", err)
++	}
++	return encoded, nil
+ }
+diff --git a/research/consulted.json b/research/consulted.json
+new file mode 100644
+--- /dev/null
++++ b/research/consulted.json
+@@ -0,0 +1,30 @@
++{
++  "accessedAt": "2026-08-15T00:00:00-05:00",
++  "sources": [
++    {
++      "title": "Broadcom KB 448135: Upgrade failure for vCenter 8.0 U3j, ESXi 8.0 U3j, and NSX 4.2.4 due to back-in-time restriction",
++      "url": "https://knowledge.broadcom.com/external/article/448135/upgrade-failure-for-vcenter-80-u3j-esxi.html",
++      "finding": "The inventory's exact vCenter, ESXi, and NSX builds have no direct path to the VCF 9.1.0.x component baseline because the installed builds are chronologically newer; the plan must avoid an in-place core transition."
++    },
++    {
++      "title": "Broadcom Product Interoperability Matrix",
++      "url": "https://interopmatrix.broadcom.com/Interoperability",
++      "finding": "Broadcom publishes interoperability and per-product upgrade-path views here; those live views are the current cross-check for supported source and target combinations."
++    },
++    {
++      "title": "Broadcom KB 390634: Update Sequence for VCF 9.0 and Compatible VMware Products",
++      "url": "https://knowledge.broadcom.com/external/article/390634/update-sequence-for-vcf-90-and-compatibl.html",
++      "finding": "The documented core order places management lifecycle components ahead of NSX, vCenter, the vSAN witness, and ESXi; the parallel-target plan preserves those readiness relationships without attempting the blocked in-place transitions."
++    },
++    {
++      "title": "Broadcom KB 384420: vSAN Stretch Clusters - How to Replace the Witness Appliance/Host",
++      "url": "https://knowledge.broadcom.com/external/article/384420/vsan-stretch-clusters-how-to-replace-th.html",
++      "finding": "A replacement witness must align with the data-node ESXi build and cannot run on the stretched vSAN cluster it witnesses, which drives the dedicated site-c placement and witness-before-host gates."
++    },
++    {
++      "title": "vmware/vcf-api-specs VCF Installer specification at tag 9.1.0.0",
++      "url": "https://github.com/vmware/vcf-api-specs/blob/9.1.0.0/specifications/vcf-installer/vcf-installer-openapi.json",
++      "finding": "The tagged OpenAPI document identifies version 9.1.0.0 and defines components.schemas.SddcSpec used for installer-payload validation."
++    }
++  ]
++}

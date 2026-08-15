@@ -1,0 +1,786 @@
+diff --git a/architecture.go b/architecture.go
+index e541c24..7cb615d 100644
+--- a/architecture.go
++++ b/architecture.go
+@@ -2,9 +2,11 @@ package vcfdesign
+ 
+ import (
+ 	"encoding/json"
+-	"errors"
++	"fmt"
++	"math"
+ 	"os"
+ 	"path/filepath"
++	"sort"
+ )
+ 
+ // Artifact is the machine-readable architecture emitted by this package.
+@@ -99,11 +101,332 @@ type MigrationStep struct {
+ 	Gates          []string `json:"gates"`
+ }
+ 
++type designRequirements struct {
++	TargetRelease string `json:"targetRelease"`
++	SddcID        string `json:"sddcId"`
++	DNS           struct {
++		Subdomain   string   `json:"subdomain"`
++		Nameservers []string `json:"nameservers"`
++		NTPServers  []string `json:"ntpServers"`
++	} `json:"dns"`
++	DataSites []struct {
++		ID        string `json:"id"`
++		Role      string `json:"role"`
++		HostCount int    `json:"hostCount"`
++	} `json:"dataSites"`
++	HostProfile     HostProfile `json:"hostProfile"`
++	FailureEnvelope struct {
++		ReservePercent   int      `json:"reservePercent"`
++		RequiredCapacity Capacity `json:"requiredCapacity"`
++	} `json:"failureEnvelope"`
++	Availability struct {
++		ManagementDomainStretched bool   `json:"managementDomainStretched"`
++		RPOSeconds                int    `json:"rpoSeconds"`
++		SiteDisasterTolerance     string `json:"siteDisasterTolerance"`
++		FailuresToTolerate        int    `json:"failuresToTolerate"`
++		Witness                   struct {
++			Site          string `json:"site"`
++			FailureDomain string `json:"failureDomain"`
++			Hostname      string `json:"hostname"`
++			Kind          string `json:"kind"`
++		} `json:"witness"`
++	} `json:"availability"`
++	Network struct {
++		MTU      int `json:"mtu"`
++		Networks []struct {
++			NetworkType string `json:"networkType"`
++			VlanID      int    `json:"vlanId"`
++			Subnet      string `json:"subnet"`
++			Gateway     string `json:"gateway"`
++			RangeStart  string `json:"rangeStart"`
++			RangeEnd    string `json:"rangeEnd"`
++		} `json:"networks"`
++	} `json:"network"`
++	ManagementServices ManagementServices `json:"managementServices"`
++}
++
++type estateInput struct {
++	EstateID   string `json:"estateId"`
++	VCFRelease string `json:"vcfRelease"`
++	Components []struct {
++		Name    string `json:"name"`
++		Version string `json:"version"`
++	} `json:"components"`
++}
++
++type compatibilityInput struct {
++	TargetRelease         string `json:"targetRelease"`
++	SupportedReleasePaths []struct {
++		From string `json:"from"`
++		To   string `json:"to"`
++	} `json:"supportedReleasePaths"`
++	GreenfieldBillOfMaterials map[string]string `json:"greenfieldBillOfMaterials"`
++	ComponentPolicies         []struct {
++		Component     string   `json:"component"`
++		SupportedFrom []string `json:"supportedFrom"`
++		Target        string   `json:"target"`
++		Action        string   `json:"action"`
++		Order         int      `json:"order"`
++		RequiredGates []string `json:"requiredGates"`
++	} `json:"componentPolicies"`
++}
++
+ // Build reads the immutable scenario inputs and returns the complete architecture.
+ func Build(requirementsPath, estatePath, compatibilityPath string) (Artifact, error) {
+-	return Artifact{}, errors.New("architecture design not implemented")
++	var req designRequirements
++	if err := readJSON(requirementsPath, &req); err != nil {
++		return Artifact{}, err
++	}
++	var estate estateInput
++	if err := readJSON(estatePath, &estate); err != nil {
++		return Artifact{}, err
++	}
++	var compatibility compatibilityInput
++	if err := readJSON(compatibilityPath, &compatibility); err != nil {
++		return Artifact{}, err
++	}
++	if req.TargetRelease != compatibility.TargetRelease {
++		return Artifact{}, fmt.Errorf("requirements target %s is absent from compatibility snapshot", req.TargetRelease)
++	}
++	pathSupported := false
++	for _, path := range compatibility.SupportedReleasePaths {
++		pathSupported = pathSupported || (path.From == estate.VCFRelease && path.To == req.TargetRelease)
++	}
++	if !pathSupported {
++		return Artifact{}, fmt.Errorf("unsupported estate path %s -> %s", estate.VCFRelease, req.TargetRelease)
++	}
++
++	var sites []SitePlacement
++	var hostSpecs []any
++	minSiteHosts := int(^uint(0) >> 1)
++	for _, site := range req.DataSites {
++		placement := SitePlacement{ID: site.ID, Role: site.Role}
++		for index := 1; index <= site.HostCount; index++ {
++			hostname := fmt.Sprintf("%s-esx%02d", site.ID, index)
++			placement.Hostnames = append(placement.Hostnames, hostname)
++			hostSpecs = append(hostSpecs, map[string]any{"hostname": hostname})
++		}
++		if site.HostCount < minSiteHosts {
++			minSiteHosts = site.HostCount
++		}
++		sites = append(sites, placement)
++	}
++	if len(sites) != 2 || minSiteHosts < 1 {
++		return Artifact{}, fmt.Errorf("stretched design requires two populated data sites")
++	}
++
++	var networkSpecs []any
++	var networkTypes []any
++	transportVLAN := 0
++	for _, network := range req.Network.Networks {
++		networkTypes = append(networkTypes, network.NetworkType)
++		networkSpecs = append(networkSpecs, map[string]any{
++			"networkType": network.NetworkType,
++			"vlanId":      network.VlanID,
++			"subnet":      network.Subnet,
++			"gateway":     network.Gateway,
++			"mtu":         req.Network.MTU,
++			"includeIpAddressRanges": []any{map[string]any{
++				"startIpAddress": network.RangeStart,
++				"endIpAddress":   network.RangeEnd,
++			}},
++		})
++		if network.NetworkType == "HOST_OVERLAY" {
++			transportVLAN = network.VlanID
++		}
++	}
++	if transportVLAN == 0 {
++		return Artifact{}, fmt.Errorf("HOST_OVERLAY network is required")
++	}
++
++	bom := make(map[string]string, len(compatibility.GreenfieldBillOfMaterials))
++	for component, version := range compatibility.GreenfieldBillOfMaterials {
++		bom[component] = version
++	}
++	domainPrefix := req.SddcID
++	domainSuffix := req.DNS.Subdomain
++	sddcSpec := map[string]any{
++		"sddcId":       req.SddcID,
++		"workflowType": "VCF",
++		"version":      req.TargetRelease,
++		"hostSpecs":    hostSpecs,
++		"vcenterSpec": map[string]any{
++			"vcenterHostname":       domainPrefix + "-vc01." + domainSuffix,
++			"rootVcenterPassword":   "ReplaceMe9!AaBb",
++			"vmSize":                "medium",
++			"storageSize":           "lstorage",
++			"ssoDomain":             "vsphere.local",
++			"version":               bom["vcenter"],
++			"useExistingDeployment": false,
++		},
++		"clusterSpec": map[string]any{
++			"datacenterName": "chi01-m01-dc",
++			"clusterName":    "chi01-m01-cl01",
++		},
++		"dvsSpecs": []any{map[string]any{
++			"dvsName":  "chi01-m01-vds01",
++			"networks": networkTypes,
++			"mtu":      req.Network.MTU,
++			"vmnicsToUplinks": []any{
++				map[string]any{"id": "vmnic0", "uplink": "uplink1"},
++				map[string]any{"id": "vmnic1", "uplink": "uplink2"},
++			},
++		}},
++		"nsxtSpec": map[string]any{
++			"nsxtManagers": []any{
++				map[string]any{"hostname": domainPrefix + "-nsx01." + domainSuffix},
++				map[string]any{"hostname": domainPrefix + "-nsx02." + domainSuffix},
++				map[string]any{"hostname": domainPrefix + "-nsx03." + domainSuffix},
++			},
++			"nsxtManagerSize":       "medium",
++			"vipFqdn":               domainPrefix + "-nsx." + domainSuffix,
++			"transportVlanId":       transportVLAN,
++			"version":               bom["nsx"],
++			"useExistingDeployment": false,
++		},
++		"networkSpecs": networkSpecs,
++		"dnsSpec": map[string]any{
++			"subdomain":   domainSuffix,
++			"nameservers": stringSliceToAny(req.DNS.Nameservers),
++		},
++		"ntpServers": stringSliceToAny(req.DNS.NTPServers),
++		"sddcManagerSpec": map[string]any{
++			"hostname":              domainPrefix + "-sddc01." + domainSuffix,
++			"version":               bom["sddc-manager"],
++			"useExistingDeployment": false,
++		},
++		"managementPoolName":          domainPrefix + "-network-pool",
++		"ceipEnabled":                 false,
++		"skipEsxThumbprintValidation": false,
++		"skipGatewayPingValidation":   false,
++		"datastoreSpec": map[string]any{
++			"vsanSpec": map[string]any{
++				"datastoreName":      domainPrefix + "-vsan01",
++				"vsanDedup":          false,
++				"failuresToTolerate": req.Availability.FailuresToTolerate,
++			},
++		},
++		"vcfInstanceName": "Chicago Metro VCF",
++	}
++
++	policyByComponent := make(map[string]struct {
++		SupportedFrom []string
++		Target        string
++		Action        string
++		Order         int
++		RequiredGates []string
++	}, len(compatibility.ComponentPolicies))
++	for _, policy := range compatibility.ComponentPolicies {
++		policyByComponent[policy.Component] = struct {
++			SupportedFrom []string
++			Target        string
++			Action        string
++			Order         int
++			RequiredGates []string
++		}{policy.SupportedFrom, policy.Target, policy.Action, policy.Order, policy.RequiredGates}
++	}
++	steps := make([]MigrationStep, 0, len(estate.Components))
++	for _, component := range estate.Components {
++		policy, ok := policyByComponent[component.Name]
++		if !ok || !stringIn(policy.SupportedFrom, component.Version) {
++			return Artifact{}, fmt.Errorf("no compatible policy for %s %s", component.Name, component.Version)
++		}
++		steps = append(steps, MigrationStep{
++			Order:          policy.Order,
++			Component:      component.Name,
++			CurrentVersion: component.Version,
++			Target:         policy.Target,
++			Action:         policy.Action,
++			Gates:          append([]string(nil), policy.RequiredGates...),
++		})
++	}
++	sort.Slice(steps, func(i, j int) bool { return steps[i].Order < steps[j].Order })
++
++	reserveFactor := 1 - float64(req.FailureEnvelope.ReservePercent)/100
++	usable := Capacity{
++		CPUCores:   roundCapacity(float64(minSiteHosts*req.HostProfile.CoresPerHost) * reserveFactor),
++		MemoryGiB:  roundCapacity(float64(minSiteHosts*req.HostProfile.MemoryGiBPerHost) * reserveFactor),
++		StorageTiB: roundCapacity(float64(minSiteHosts) * req.HostProfile.RawStorageTiBPerHost * reserveFactor),
++	}
++	if usable.CPUCores < req.FailureEnvelope.RequiredCapacity.CPUCores ||
++		usable.MemoryGiB < req.FailureEnvelope.RequiredCapacity.MemoryGiB ||
++		usable.StorageTiB < req.FailureEnvelope.RequiredCapacity.StorageTiB {
++		return Artifact{}, fmt.Errorf("surviving-site capacity misses the required reserve")
++	}
++
++	return Artifact{
++		SchemaVersion: "1.0",
++		Greenfield: Greenfield{
++			TargetRelease: req.TargetRelease,
++			SddcSpec:      sddcSpec,
++			Topology: Topology{
++				Sites:       sites,
++				HostProfile: req.HostProfile,
++				StretchedManagementDomain: StretchedManagementDomain{
++					Enabled:    req.Availability.ManagementDomainStretched,
++					RPOSeconds: req.Availability.RPOSeconds,
++					VsanPolicy: VsanPolicy{
++						FailuresToTolerate:    req.Availability.FailuresToTolerate,
++						SiteDisasterTolerance: req.Availability.SiteDisasterTolerance,
++						PreferredSite:         req.DataSites[0].ID,
++					},
++					Witness: Witness{
++						Hostname:               req.Availability.Witness.Hostname,
++						Site:                   req.Availability.Witness.Site,
++						FailureDomain:          req.Availability.Witness.FailureDomain,
++						Kind:                   req.Availability.Witness.Kind,
++						RunsOnManagementDomain: false,
++					},
++				},
++			},
++			Capacity: CapacityDecision{
++				ReservePercent:            req.FailureEnvelope.ReservePercent,
++				SiteFailureSurvivingHosts: minSiteHosts,
++				UsableAfterReserve:        usable,
++				Required:                  req.FailureEnvelope.RequiredCapacity,
++			},
++			ManagementServices: req.ManagementServices,
++			BillOfMaterials:    bom,
++		},
++		MigrationPlan: MigrationPlan{
++			SchemaVersion: "1.0",
++			EstateID:      estate.EstateID,
++			TargetRelease: req.TargetRelease,
++			Steps:         steps,
++		},
++	}, nil
+ }
+ 
++func readJSON(path string, target any) error {
++	b, err := os.ReadFile(path)
++	if err != nil {
++		return fmt.Errorf("read %s: %w", path, err)
++	}
++	if err := json.Unmarshal(b, target); err != nil {
++		return fmt.Errorf("decode %s: %w", path, err)
++	}
++	return nil
++}
++
++func stringSliceToAny(values []string) []any {
++	result := make([]any, len(values))
++	for index, value := range values {
++		result[index] = value
++	}
++	return result
++}
++
++func stringIn(values []string, want string) bool {
++	for _, value := range values {
++		if value == want {
++			return true
++		}
++	}
++	return false
++}
++
++func roundCapacity(value float64) float64 { return math.Round(value*1000) / 1000 }
++
+ // WriteArtifact writes an Artifact as stable, indented JSON.
+ func WriteArtifact(path string, artifact Artifact) error {
+ 	b, err := json.MarshalIndent(artifact, "", "  ")
+diff --git a/architecture.json b/architecture.json
+new file mode 100644
+index 0000000..fe18457
+--- /dev/null
++++ b/architecture.json
+@@ -0,0 +1,356 @@
++{
++  "schemaVersion": "1.0",
++  "greenfield": {
++    "targetRelease": "9.1.0.0",
++    "sddcSpec": {
++      "ceipEnabled": false,
++      "clusterSpec": {
++        "clusterName": "chi01-m01-cl01",
++        "datacenterName": "chi01-m01-dc"
++      },
++      "datastoreSpec": {
++        "vsanSpec": {
++          "datastoreName": "chi01-m01-vsan01",
++          "failuresToTolerate": 1,
++          "vsanDedup": false
++        }
++      },
++      "dnsSpec": {
++        "nameservers": [
++          "10.10.10.10",
++          "10.10.10.11"
++        ],
++        "subdomain": "vcf.example.com"
++      },
++      "dvsSpecs": [
++        {
++          "dvsName": "chi01-m01-vds01",
++          "mtu": 9000,
++          "networks": [
++            "MANAGEMENT",
++            "VMOTION",
++            "VSAN",
++            "FLEET_MANAGEMENT",
++            "HOST_OVERLAY"
++          ],
++          "vmnicsToUplinks": [
++            {
++              "id": "vmnic0",
++              "uplink": "uplink1"
++            },
++            {
++              "id": "vmnic1",
++              "uplink": "uplink2"
++            }
++          ]
++        }
++      ],
++      "hostSpecs": [
++        {
++          "hostname": "chi-a-esx01"
++        },
++        {
++          "hostname": "chi-a-esx02"
++        },
++        {
++          "hostname": "chi-a-esx03"
++        },
++        {
++          "hostname": "chi-a-esx04"
++        },
++        {
++          "hostname": "chi-b-esx01"
++        },
++        {
++          "hostname": "chi-b-esx02"
++        },
++        {
++          "hostname": "chi-b-esx03"
++        },
++        {
++          "hostname": "chi-b-esx04"
++        }
++      ],
++      "managementPoolName": "chi01-m01-network-pool",
++      "networkSpecs": [
++        {
++          "gateway": "10.10.10.1",
++          "includeIpAddressRanges": [
++            {
++              "endIpAddress": "10.10.10.79",
++              "startIpAddress": "10.10.10.40"
++            }
++          ],
++          "mtu": 9000,
++          "networkType": "MANAGEMENT",
++          "subnet": "10.10.10.0/24",
++          "vlanId": 110
++        },
++        {
++          "gateway": "10.10.20.1",
++          "includeIpAddressRanges": [
++            {
++              "endIpAddress": "10.10.20.79",
++              "startIpAddress": "10.10.20.40"
++            }
++          ],
++          "mtu": 9000,
++          "networkType": "VMOTION",
++          "subnet": "10.10.20.0/24",
++          "vlanId": 120
++        },
++        {
++          "gateway": "10.10.30.1",
++          "includeIpAddressRanges": [
++            {
++              "endIpAddress": "10.10.30.79",
++              "startIpAddress": "10.10.30.40"
++            }
++          ],
++          "mtu": 9000,
++          "networkType": "VSAN",
++          "subnet": "10.10.30.0/24",
++          "vlanId": 130
++        },
++        {
++          "gateway": "10.10.40.1",
++          "includeIpAddressRanges": [
++            {
++              "endIpAddress": "10.10.40.49",
++              "startIpAddress": "10.10.40.20"
++            }
++          ],
++          "mtu": 9000,
++          "networkType": "FLEET_MANAGEMENT",
++          "subnet": "10.10.40.0/24",
++          "vlanId": 140
++        },
++        {
++          "gateway": "10.10.50.1",
++          "includeIpAddressRanges": [
++            {
++              "endIpAddress": "10.10.50.79",
++              "startIpAddress": "10.10.50.40"
++            }
++          ],
++          "mtu": 9000,
++          "networkType": "HOST_OVERLAY",
++          "subnet": "10.10.50.0/24",
++          "vlanId": 150
++        }
++      ],
++      "nsxtSpec": {
++        "nsxtManagerSize": "medium",
++        "nsxtManagers": [
++          {
++            "hostname": "chi01-m01-nsx01.vcf.example.com"
++          },
++          {
++            "hostname": "chi01-m01-nsx02.vcf.example.com"
++          },
++          {
++            "hostname": "chi01-m01-nsx03.vcf.example.com"
++          }
++        ],
++        "transportVlanId": 150,
++        "useExistingDeployment": false,
++        "version": "9.1.0.0",
++        "vipFqdn": "chi01-m01-nsx.vcf.example.com"
++      },
++      "ntpServers": [
++        "10.10.10.12",
++        "10.10.10.13"
++      ],
++      "sddcId": "chi01-m01",
++      "sddcManagerSpec": {
++        "hostname": "chi01-m01-sddc01.vcf.example.com",
++        "useExistingDeployment": false,
++        "version": "9.1.0.0"
++      },
++      "skipEsxThumbprintValidation": false,
++      "skipGatewayPingValidation": false,
++      "vcenterSpec": {
++        "rootVcenterPassword": "ReplaceMe9!AaBb",
++        "ssoDomain": "vsphere.local",
++        "storageSize": "lstorage",
++        "useExistingDeployment": false,
++        "vcenterHostname": "chi01-m01-vc01.vcf.example.com",
++        "version": "9.1.0.0",
++        "vmSize": "medium"
++      },
++      "vcfInstanceName": "Chicago Metro VCF",
++      "version": "9.1.0.0",
++      "workflowType": "VCF"
++    },
++    "topology": {
++      "sites": [
++        {
++          "id": "chi-a",
++          "role": "preferred",
++          "hostnames": [
++            "chi-a-esx01",
++            "chi-a-esx02",
++            "chi-a-esx03",
++            "chi-a-esx04"
++          ]
++        },
++        {
++          "id": "chi-b",
++          "role": "secondary",
++          "hostnames": [
++            "chi-b-esx01",
++            "chi-b-esx02",
++            "chi-b-esx03",
++            "chi-b-esx04"
++          ]
++        }
++      ],
++      "hostProfile": {
++        "coresPerHost": 64,
++        "memoryGiBPerHost": 1536,
++        "rawStorageTiBPerHost": 30.72
++      },
++      "stretchedManagementDomain": {
++        "enabled": true,
++        "rpoSeconds": 0,
++        "vsanPolicy": {
++          "failuresToTolerate": 1,
++          "siteDisasterTolerance": "dual-site-mirroring",
++          "preferredSite": "chi-a"
++        },
++        "witness": {
++          "hostname": "chi-wit01.vcf.example.com",
++          "site": "chi-witness",
++          "failureDomain": "metro-third-fd",
++          "kind": "vsan-witness-appliance",
++          "runsOnManagementDomain": false
++        }
++      }
++    },
++    "capacity": {
++      "reservePercent": 30,
++      "siteFailureSurvivingHosts": 4,
++      "usableAfterReserve": {
++        "cpuCores": 179.2,
++        "memoryGiB": 4300.8,
++        "storageTiB": 86.016
++      },
++      "required": {
++        "cpuCores": 160,
++        "memoryGiB": 3072,
++        "storageTiB": 48
++      }
++    },
++    "managementServices": {
++      "minimumAddresses": 12,
++      "poolStart": "10.10.40.20",
++      "poolEnd": "10.10.40.31",
++      "networkType": "FLEET_MANAGEMENT",
++      "internalCidr": "198.18.0.0/15"
++    },
++    "billOfMaterials": {
++      "esx": "9.1.0.0",
++      "nsx": "9.1.0.0",
++      "sddc-manager": "9.1.0.0",
++      "vcenter": "9.1.0.0",
++      "vcf-installer": "9.1.0.0",
++      "vcf-operations": "9.1.0.0",
++      "vsan-witness": "9.1.0.0"
++    }
++  },
++  "migrationPlan": {
++    "schemaVersion": "1.0",
++    "estateId": "chi-vcf-estate-01",
++    "targetRelease": "9.1.0.0",
++    "steps": [
++      {
++        "order": 1,
++        "component": "vcf-operations",
++        "currentVersion": "9.0.2.0",
++        "target": "9.1.0.0",
++        "action": "upgrade",
++        "gates": [
++          "ops-health-green",
++          "ops-backup-complete"
++        ]
++      },
++      {
++        "order": 2,
++        "component": "sddc-manager",
++        "currentVersion": "9.0.2.0",
++        "target": "9.1.0.0",
++        "action": "upgrade",
++        "gates": [
++          "vcf-operations-at-9.1",
++          "management-ip-pool-ready"
++        ]
++      },
++      {
++        "order": 3,
++        "component": "vcf-identity-broker",
++        "currentVersion": "9.0.2.0",
++        "target": "embedded-in-vcf-management-services-9.1.0.0",
++        "action": "migrate-and-decommission",
++        "gates": [
++          "management-services-ready",
++          "identity-migration-precheck-green"
++        ]
++      },
++      {
++        "order": 4,
++        "component": "nsx",
++        "currentVersion": "9.0.2.0",
++        "target": "9.1.0.0",
++        "action": "upgrade",
++        "gates": [
++          "sddc-manager-at-9.1",
++          "nsx-precheck-green"
++        ]
++      },
++      {
++        "order": 5,
++        "component": "vcenter",
++        "currentVersion": "9.0.2.0",
++        "target": "9.1.0.0",
++        "action": "upgrade",
++        "gates": [
++          "nsx-at-9.1",
++          "vcenter-backup-complete"
++        ]
++      },
++      {
++        "order": 6,
++        "component": "vsan-witness",
++        "currentVersion": "9.0.2.0",
++        "target": "9.1.0.0",
++        "action": "upgrade",
++        "gates": [
++          "vcenter-at-9.1",
++          "stretched-cluster-healthy"
++        ]
++      },
++      {
++        "order": 7,
++        "component": "esx",
++        "currentVersion": "9.0.2.0",
++        "target": "9.1.0.0",
++        "action": "upgrade",
++        "gates": [
++          "vsan-witness-at-9.1",
++          "stretched-cluster-healthy"
++        ]
++      },
++      {
++        "order": 8,
++        "component": "fleet-management-appliance",
++        "currentVersion": "9.0.2.0",
++        "target": "decommissioned",
++        "action": "decommission",
++        "gates": [
++          "all-domains-at-9.1",
++          "fleet-lifecycle-imported"
++        ]
++      }
++    ]
++  }
++}
+diff --git a/architecture_test.go b/architecture_test.go
+new file mode 100644
+index 0000000..73679d6
+--- /dev/null
++++ b/architecture_test.go
+@@ -0,0 +1,49 @@
++package vcfdesign
++
++import "testing"
++
++func TestBuildDesignDecisions(t *testing.T) {
++	artifact, err := Build(
++		"testdata/design-requirements.json",
++		"testdata/estate.json",
++		"testdata/compatibility-snapshot.json",
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	tests := []struct {
++		name  string
++		check func() bool
++	}{
++		{"two data sites", func() bool { return len(artifact.Greenfield.Topology.Sites) == 2 }},
++		{"four hosts survive site loss", func() bool { return artifact.Greenfield.Capacity.SiteFailureSurvivingHosts == 4 }},
++		{"external witness", func() bool {
++			return !artifact.Greenfield.Topology.StretchedManagementDomain.Witness.RunsOnManagementDomain
++		}},
++		{"all estate components planned", func() bool { return len(artifact.MigrationPlan.Steps) == 8 }},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			if !test.check() {
++				t.Fatalf("design assertion failed")
++			}
++		})
++	}
++}
++
++func TestMigrationOrderIsContiguous(t *testing.T) {
++	artifact, err := Build(
++		"testdata/design-requirements.json",
++		"testdata/estate.json",
++		"testdata/compatibility-snapshot.json",
++	)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for index, step := range artifact.MigrationPlan.Steps { // table supplied by the pinned policies
++		if step.Order != index+1 {
++			t.Fatalf("step %s has order %d, want %d", step.Component, step.Order, index+1)
++		}
++	}
++}
+diff --git a/research.md b/research.md
+new file mode 100644
+index 0000000..f8e239a
+--- /dev/null
++++ b/research.md
+@@ -0,0 +1,12 @@
++# VCF 9.1 architecture research record
++
++Accessed 2026-08-14. These live sources were consulted independently of the checked-in grading snapshot.
++
++| Published source | URL | Decision informed |
++| --- | --- | --- |
++| Broadcom Product Interoperability Matrix | https://interopmatrix.broadcom.com/Interoperability | Cross-checked the VCF 9.1 family selection and the need to treat the VCF bill of materials as one compatible component combination. |
++| Broadcom Compatibility Guide | https://compatibilityguide.broadcom.com/ | Cross-checked that host hardware, I/O devices, and vSAN witness deployment compatibility are separate production readiness checks from product interoperability. |
++| Broadcom KB 440630, “Upgrade Sequence and Related Issues for VMware Cloud Foundation and vSphere Foundation 9.1” | https://knowledge.broadcom.com/external/article/440630/upgrade-sequence-and-related-issues-for.html | Informed the 9.0.2-to-9.1 path, Operations-first gate, mandatory Management Services address reservation, vIDB consolidation, and Fleet Management Appliance retirement. |
++| Broadcom KB 390634, “Update Sequence for VCF 9.0 and Compatible VMware Products” | https://knowledge.broadcom.com/external/article/390634/update-sequence-for-vcf-90-and-compatibl.html | Informed the core SDDC ordering constraints: SDDC Manager, NSX, vCenter, vSAN witness, then ESX. |
++
++The live pages can change. `testdata/compatibility-snapshot.json` remains the reproducible implementation authority for this repository, while this record preserves the live research provenance used for the design.

@@ -1,0 +1,1259 @@
+diff --git a/VcfAriaMigration/VcfAriaMigration.psd1 b/VcfAriaMigration/VcfAriaMigration.psd1
+new file mode 100644
+index 0000000..b37b9a8
+--- /dev/null
++++ b/VcfAriaMigration/VcfAriaMigration.psd1
+@@ -0,0 +1,17 @@
++@{
++    RootModule = 'VcfAriaMigration.psm1'
++    ModuleVersion = '1.0.0'
++    GUID = 'a54f8082-d09a-44d7-9ae8-4063cd0178de'
++    Author = 'Northstar Platform Architecture'
++    Description = 'Generates a VCF 9 management-component migration architecture from protected inventory and compatibility inputs.'
++    PowerShellVersion = '7.4'
++    RequiredModules = @(
++        'VMware.Sdk.Vcf.Installer'
++        'VMware.Sdk.Vcf.SddcManager'
++        'VMware.Sdk.Vcf.Ops'
++    )
++    FunctionsToExport = @('New-VcfAriaMigrationPlan')
++    CmdletsToExport = @()
++    VariablesToExport = @()
++    AliasesToExport = @()
++}
+diff --git a/VcfAriaMigration/VcfAriaMigration.psm1 b/VcfAriaMigration/VcfAriaMigration.psm1
+new file mode 100644
+index 0000000..fad0107
+--- /dev/null
++++ b/VcfAriaMigration/VcfAriaMigration.psm1
+@@ -0,0 +1,474 @@
++Set-StrictMode -Version Latest
++
++$script:RequiredSdkModules = @(
++    'VMware.Sdk.Vcf.Installer'
++    'VMware.Sdk.Vcf.SddcManager'
++    'VMware.Sdk.Vcf.Ops'
++)
++
++function Import-VcfSdkPrerequisites {
++    [CmdletBinding()]
++    param()
++
++    foreach ($moduleName in $script:RequiredSdkModules) {
++        if (-not (Get-Module -ListAvailable -Name $moduleName)) {
++            throw "Required environment prerequisite '$moduleName' is not installed."
++        }
++        Import-Module -Name $moduleName -ErrorAction Stop
++    }
++}
++
++function Get-MinimumProfile {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [hashtable]$Constraint,
++
++        [Parameter(Mandatory)]
++        [hashtable]$Inventory
++    )
++
++    $componentId = [string]$Constraint.component_id
++    $availability = [string]$Inventory.service_requirements.availability
++    foreach ($profile in @($Constraint.profiles | Sort-Object -Property rank)) {
++        if ($componentId -notin @('tgt-fleet', 'tgt-identity') -and $profile.availability -ne $availability) {
++            continue
++        }
++
++        $fits = $true
++        switch ($componentId) {
++            'tgt-ops' {
++                foreach ($entry in $Inventory.service_requirements.operations.GetEnumerator()) {
++                    if (-not $profile.capacity.ContainsKey($entry.Key) -or [int64]$profile.capacity[$entry.Key] -lt [int64]$entry.Value) {
++                        $fits = $false
++                    }
++                }
++            }
++            'tgt-automation' {
++                foreach ($entry in $Inventory.service_requirements.automation.GetEnumerator()) {
++                    if (-not $profile.capacity.ContainsKey($entry.Key) -or [int64]$profile.capacity[$entry.Key] -lt [int64]$entry.Value) {
++                        $fits = $false
++                    }
++                }
++            }
++            'tgt-logs' {
++                $mapping = @{
++                    ingestion_gb_per_day = 'ingestion_gb_per_day'
++                    events_per_second = 'events_per_second'
++                    active_syslog_connections = 'active_syslog_connections'
++                    target_retention_days = 'retention_days'
++                }
++                foreach ($entry in $Inventory.service_requirements.logs.GetEnumerator()) {
++                    $capacityKey = $mapping[$entry.Key]
++                    if (-not $profile.capacity.ContainsKey($capacityKey) -or [int64]$profile.capacity[$capacityKey] -lt [int64]$entry.Value) {
++                        $fits = $false
++                    }
++                }
++            }
++        }
++        if ($fits) {
++            return $profile
++        }
++    }
++    throw "No pinned sizing profile satisfies $componentId."
++}
++
++function New-CarryAction {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [hashtable]$Item,
++
++        [Parameter(Mandatory)]
++        [hashtable]$Rule
++    )
++
++    $actionByMode = @{
++        'export-import' = "Export '$($Item.item_id)' from the source and import it into the target, then validate its references."
++        'reconfigure' = "Re-create the configuration for '$($Item.item_id)' on the target and validate connectivity."
++        're-enter-secret' = "Re-enter the secret binding for '$($Item.item_id)' on the target without exporting secret material."
++        'database-migration' = "Carry '$($Item.item_id)' in the Fleet-managed database migration and reconcile it after upgrade."
++        'data-transfer-90-days' = "Transfer '$($Item.item_id)' with the supported 90-day log-data transfer operation."
++        'recreate' = "Re-create '$($Item.item_id)' on the target and compare its resulting behavior with the source."
++        'retain-compatible-agent' = "Retain '$($Item.item_id)', update its trust for the target, and verify ingestion."
++    }
++    return [ordered]@{
++        item_id = $Item.item_id
++        kind = $Item.kind
++        mode = $Rule.mode
++        target_action = $actionByMode[$Rule.mode]
++    }
++}
++
++function New-AbandonAction {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [hashtable]$Item,
++
++        [Parameter(Mandatory)]
++        [hashtable]$Rule
++    )
++
++    $reasonByCode = @{
++        'replace-with-9.0-management-pack' = 'The 8.18 management-pack binary is not reused; install its VCF 9.0 counterpart after target deployment.'
++        'greenfield-does-not-transfer-time-series' = 'The supported greenfield Operations path cannot migrate historical time-series metrics.'
++        'vcf-identity-broker-login-url-replaces-csp-path' = 'VCF Identity Broker replaces the legacy CSP portal path, so these bookmarks must be retired.'
++        'vidm-has-no-vcf-9-in-place-upgrade' = 'VMware Identity Manager has no in-place transition into the VCF 9 identity architecture.'
++        'transfer-window-limited-to-90-days' = 'The supported log-data transfer is limited to the newest 90 days.'
++        'vcf-entitlement-replaces-legacy-license' = 'VCF entitlement replaces the legacy standalone product license at cutover.'
++    }
++    return [ordered]@{
++        item_id = $Item.item_id
++        kind = $Item.kind
++        reason_code = $Rule.reason_code
++        reason = $reasonByCode[$Rule.reason_code]
++    }
++}
++
++function New-SourceMigration {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [hashtable]$Source,
++
++        [Parameter(Mandatory)]
++        [hashtable]$Rule
++    )
++
++    $rulesByKind = @{}
++    foreach ($contentRule in $Rule.content_rules) {
++        $rulesByKind[$contentRule.kind] = $contentRule
++    }
++    $carry = @()
++    $abandon = @()
++    foreach ($item in $Source.content) {
++        $contentRule = $rulesByKind[$item.kind]
++        if (-not $contentRule) {
++            throw "No compatibility rule exists for content kind '$($item.kind)'."
++        }
++        if ($contentRule.disposition -eq 'carry') {
++            $carry += New-CarryAction -Item $item -Rule $contentRule
++        } else {
++            $abandon += New-AbandonAction -Item $item -Rule $contentRule
++        }
++    }
++
++    return [ordered]@{
++        inventory_id = $Source.inventory_id
++        product_name = $Source.product_name
++        version = $Source.version
++        target_component_id = $Rule.target_component_id
++        target_component = $Rule.target_component
++        target_version = $Rule.target_version
++        migration_method = $Rule.migration_method
++        support_boundary = $Rule.support_boundary
++        carry_forward = $carry
++        abandon = $abandon
++    }
++}
++
++function New-TargetComponent {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [hashtable]$Constraint,
++
++        [Parameter(Mandatory)]
++        [hashtable]$Inventory
++    )
++
++    $profile = Get-MinimumProfile -Constraint $Constraint -Inventory $Inventory
++    $componentId = $Constraint.component_id
++    $fqdnKey = @{
++        'tgt-fleet' = 'fleet'
++        'tgt-ops' = 'operations'
++        'tgt-automation' = 'automation'
++        'tgt-logs' = 'logs'
++        'tgt-identity' = 'identity'
++    }[$componentId]
++
++    if ($profile.availability -eq 'production-ha') {
++        $faultCount = [Math]::Min([int]$profile.node_count, $Inventory.target_placement.fault_domains.Count)
++        $faultDomains = @($Inventory.target_placement.fault_domains[0..($faultCount - 1)])
++        $antiAffinity = $true
++    } else {
++        $faultDomains = @($Inventory.target_placement.fault_domains[0])
++        $antiAffinity = $false
++    }
++
++    $basis = @(switch ($componentId) {
++        'tgt-fleet' { @('VCF entitlement requires Fleet-managed lifecycle in the primary VCF instance.') }
++        'tgt-ops' { @("24000 monitored objects require more than small-ha capacity.", "4200000 collected metrics fit the medium-ha profile.") }
++        'tgt-automation' { @("120 concurrent deployments and production-ha availability select medium-ha.") }
++        'tgt-logs' { @("70 GB/day and 9000 EPS fit medium-ha.", "500 active connections and 90 retention days fit medium-ha.") }
++        'tgt-identity' { @('VCF Identity Broker is a required greenfield identity component after the core upgrade.') }
++    })
++
++    return [ordered]@{
++        component_id = $componentId
++        name = $Constraint.name
++        version = $Constraint.version
++        role = $Constraint.role
++        fqdn = $Inventory.target_placement.reserved_fqdns[$fqdnKey]
++        placement = [ordered]@{
++            vcf_instance = $Inventory.vcf.primary_instance
++            domain = $Inventory.target_placement.domain
++            cluster = $Inventory.target_placement.cluster
++            datastore = $Inventory.target_placement.datastore
++            network = $Inventory.target_placement.network
++            fault_domains = $faultDomains
++            anti_affinity = $antiAffinity
++        }
++        sizing = [ordered]@{
++            profile = $profile.name
++            availability = $profile.availability
++            node_count = $profile.node_count
++            vcpu_per_node = $profile.vcpu_per_node
++            memory_gb_per_node = $profile.memory_gb_per_node
++            disk_gb_per_node = $profile.disk_gb_per_node
++            capacity = $profile.capacity
++            basis = $basis
++        }
++    }
++}
++
++function New-VcfAriaMigrationPlan {
++    [CmdletBinding()]
++    param(
++        [Parameter(Mandatory)]
++        [string]$InventoryPath,
++
++        [Parameter(Mandatory)]
++        [string]$CompatibilityPath,
++
++        [Parameter(Mandatory)]
++        [string]$InstallerSpecPath,
++
++        [Parameter(Mandatory)]
++        [string]$OutputPath
++    )
++
++    Import-VcfSdkPrerequisites
++    $inventory = Get-Content -Raw -LiteralPath $InventoryPath | ConvertFrom-Json -AsHashtable
++    $compatibility = Get-Content -Raw -LiteralPath $CompatibilityPath | ConvertFrom-Json -AsHashtable
++    $installer = Get-Content -Raw -LiteralPath $InstallerSpecPath | ConvertFrom-Json -AsHashtable
++
++    if ($inventory.estate_id -ne 'northstar-prod') {
++        throw 'The inventory does not identify the expected estate.'
++    }
++    if ($compatibility.snapshot_id -ne 'broadcom-vcf-9.0.2-2026-08-01') {
++        throw 'The compatibility input is not the pinned snapshot.'
++    }
++
++    $constraintById = @{}
++    foreach ($constraint in $compatibility.target_component_constraints) {
++        $constraintById[$constraint.component_id] = $constraint
++    }
++    $opsProfile = Get-MinimumProfile -Constraint $constraintById['tgt-ops'] -Inventory $inventory
++    $automationProfile = Get-MinimumProfile -Constraint $constraintById['tgt-automation'] -Inventory $inventory
++
++    # Build an SDK-backed projection of the selected installer design. These are
++    # model constructors only; the architecture generator performs no connection
++    # or Invoke operation against a live VCF endpoint.
++    $networkProjection = Initialize-VcfInstallerVcfManagementComponentsNetworkSpec `
++        -NetworkName $inventory.target_placement.network `
++        -SubnetMask $inventory.target_placement.network_subnet_mask `
++        -Gateway $inventory.target_placement.network_gateway
++    $null = Initialize-VcfInstallerVcfManagementComponentsInfrastructureSpec -LocalRegionNetwork $networkProjection
++    $opsNodes = @(
++        Initialize-VcfInstallerVcfOperationsNode -Hostname 'ops-a.northstar.example.com'
++        Initialize-VcfInstallerVcfOperationsNode -Hostname 'ops-b.northstar.example.com'
++    )
++    $null = Initialize-VcfInstallerVcfOperationsSpec `
++        -Nodes $opsNodes `
++        -ApplianceSize ($opsProfile.name -replace '-ha$', '') `
++        -LoadBalancerFqdn $inventory.target_placement.reserved_fqdns.operations `
++        -UseExistingDeployment $false `
++        -Version $compatibility.target_release
++    $null = Initialize-VcfInstallerVcfAutomationSpec `
++        -Hostname $inventory.target_placement.reserved_fqdns.automation `
++        -PlatformFqdn $inventory.target_placement.reserved_fqdns.platform `
++        -InternalClusterCidr $inventory.target_placement.automation_internal_cidr `
++        -Size ($automationProfile.name -replace '-ha$', '') `
++        -Version $compatibility.target_release `
++        -UseExistingDeployment $true
++
++    $ruleBySource = @{}
++    foreach ($rule in $compatibility.product_rules) {
++        $ruleBySource[$rule.source_inventory_id] = $rule
++    }
++    $sources = @(
++        foreach ($source in $inventory.source_products) {
++            New-SourceMigration -Source $source -Rule $ruleBySource[$source.inventory_id]
++        }
++    )
++    $targets = @(
++        foreach ($constraint in $compatibility.target_component_constraints) {
++            if ($constraint.required) {
++                New-TargetComponent -Constraint $constraint -Inventory $inventory
++            }
++        }
++    )
++
++    $ops = $sources | Where-Object inventory_id -eq 'ops-01'
++    $automation = $sources | Where-Object inventory_id -eq 'automation-01'
++    $logs = $sources | Where-Object inventory_id -eq 'logs-01'
++    $steps = @(
++        [ordered]@{
++            order = 10
++            step_id = 'bootstrap-fleet-management'
++            phase = 'prepare'
++            title = 'Patch lifecycle and bootstrap Fleet Management'
++            source_inventory_ids = @()
++            target_component_id = 'tgt-fleet'
++            depends_on = @()
++            action = 'Patch legacy lifecycle, select VCF entitlement, reserve placement, and deploy Fleet Management in the primary instance.'
++            gates = @(
++                [ordered]@{ gate_id = 'fleet-entitlement-vcf'; kind = 'entitlement'; condition = 'The entitlement branch is explicitly set to VCF, not Others.'; success_evidence = 'The lifecycle request records entitlement selection VCF.' }
++                [ordered]@{ gate_id = 'fleet-lifecycle-patch2'; kind = 'lifecycle'; condition = 'VMware Aria Suite Lifecycle 8.18 Patch 2 is installed before bootstrap.'; success_evidence = 'Lifecycle About reports 8.18 Patch 2.' }
++                [ordered]@{ gate_id = 'fleet-placement-capacity'; kind = 'capacity'; condition = 'Reserved management-domain compute, storage, DNS, and network capacity is available.'; success_evidence = 'Placement precheck returns success.' }
++            )
++            carry_item_ids = @()
++            abandon_item_ids = @()
++        }
++        [ordered]@{
++            order = 20
++            step_id = 'deploy-greenfield-operations'
++            phase = 'deploy'
++            title = 'Deploy greenfield VCF Operations 9.0.2'
++            source_inventory_ids = @('ops-01')
++            target_component_id = 'tgt-ops'
++            depends_on = @('bootstrap-fleet-management')
++            action = 'Deploy a new medium-ha VCF Operations cluster through Fleet Management and leave the 8.18.6 cluster unchanged for export.'
++            gates = @(
++                [ordered]@{ gate_id = 'ops-method-compatible'; kind = 'compatibility'; condition = 'The selected path is greenfield and no 9.0.x PAK is staged on 8.18.6.'; success_evidence = 'Deployment plan reports new-cluster mode.' }
++                [ordered]@{ gate_id = 'ops-entitlement-bound'; kind = 'entitlement'; condition = 'The target is registered under the fleet VCF entitlement.'; success_evidence = 'Target subscription state is VCF-entitled.' }
++                [ordered]@{ gate_id = 'ops-offline-backup'; kind = 'backup'; condition = 'A restorable offline backup of every 8.18.6 node exists.'; success_evidence = 'Backup restore validation is successful.' }
++                [ordered]@{ gate_id = 'ops-size-capacity'; kind = 'capacity'; condition = 'The medium-ha sizing covers 24000 objects and 4200000 collected metrics.'; success_evidence = 'Sizing precheck accepts the selected profile.' }
++                [ordered]@{ gate_id = 'ops-target-health'; kind = 'health'; condition = 'Both target analytics nodes are online and the cluster is healthy.'; success_evidence = 'Fleet health reports all target nodes healthy.' }
++            )
++            carry_item_ids = @()
++            abandon_item_ids = @()
++        }
++        [ordered]@{
++            order = 30
++            step_id = 'transfer-operations-content'
++            phase = 'content-transfer'
++            title = 'Transfer supported Operations content'
++            source_inventory_ids = @('ops-01')
++            target_component_id = 'tgt-ops'
++            depends_on = @('deploy-greenfield-operations')
++            action = 'Export and import compatible custom content, rebuild integrations and secrets, and record non-transferable history and binaries.'
++            gates = @(
++                [ordered]@{ gate_id = 'ops-content-export'; kind = 'content'; condition = 'Every carried Operations item has an export or reconfiguration record.'; success_evidence = 'Content reconciliation has no missing carried IDs.' }
++                [ordered]@{ gate_id = 'ops-post-import-health'; kind = 'health'; condition = 'Imported dashboards, metrics, views, reports, and integrations validate on target.'; success_evidence = 'Target content validation is successful.' }
++            )
++            carry_item_ids = @($ops.carry_forward.item_id)
++            abandon_item_ids = @($ops.abandon.item_id)
++        }
++        [ordered]@{
++            order = 40
++            step_id = 'import-upgrade-automation'
++            phase = 'upgrade'
++            title = 'Import and upgrade Aria Automation through Fleet'
++            source_inventory_ids = @('automation-01')
++            target_component_id = 'tgt-automation'
++            depends_on = @('transfer-operations-content')
++            action = 'Import the 8.18.1 three-node environment into Fleet Management, run prechecks, upgrade it to 9.0.2, and reconcile migrated content.'
++            gates = @(
++                [ordered]@{ gate_id = 'automation-fleet-lifecycle'; kind = 'lifecycle'; condition = 'Automation is inventoried and synchronized in Fleet Management before upgrade.'; success_evidence = 'Fleet inventory shows automation-01 synchronized.' }
++                [ordered]@{ gate_id = 'automation-path-compatible'; kind = 'compatibility'; condition = 'The workflow uses Fleet import followed by upgrade from 8.18.1.'; success_evidence = 'Upgrade plan reports import-existing mode.' }
++                [ordered]@{ gate_id = 'automation-backup'; kind = 'backup'; condition = 'A current supported backup of the Automation cluster is restorable.'; success_evidence = 'Backup validation completes successfully.' }
++                [ordered]@{ gate_id = 'automation-size-capacity'; kind = 'capacity'; condition = 'The medium-ha target supports 120 concurrent deployments.'; success_evidence = 'Fleet sizing precheck accepts medium-ha.' }
++                [ordered]@{ gate_id = 'automation-precheck-health'; kind = 'health'; condition = 'Upgrade prechecks pass and the embedded Orchestrator is healthy.'; success_evidence = 'All Fleet upgrade prechecks are green.' }
++                [ordered]@{ gate_id = 'automation-content-reconciled'; kind = 'content'; condition = 'All carried records are present and abandoned identity artifacts are documented.'; success_evidence = 'Automation content reconciliation is complete.' }
++            )
++            carry_item_ids = @($automation.carry_forward.item_id)
++            abandon_item_ids = @($automation.abandon.item_id)
++        }
++        [ordered]@{
++            order = 50
++            step_id = 'deploy-fresh-logs'
++            phase = 'deploy'
++            title = 'Deploy fresh VCF Operations for Logs'
++            source_inventory_ids = @('logs-01')
++            target_component_id = 'tgt-logs'
++            depends_on = @('import-upgrade-automation')
++            action = 'Deploy a new three-node medium-ha Logs cluster in parallel with 8.18.3 and prepare it for configuration and data transfer.'
++            gates = @(
++                [ordered]@{ gate_id = 'logs-fresh-path'; kind = 'compatibility'; condition = 'The target is a fresh deployment; no in-place or rolling upgrade is attempted.'; success_evidence = 'Fleet deployment mode is new installation.' }
++                [ordered]@{ gate_id = 'logs-source-backup'; kind = 'backup'; condition = 'The 8.18.3 configuration and retained log archive have a current backup.'; success_evidence = 'Backup job and restore check succeed.' }
++                [ordered]@{ gate_id = 'logs-size-capacity'; kind = 'capacity'; condition = 'Medium-ha covers 70 GB/day, 9000 EPS, 500 connections, and 90 retention days.'; success_evidence = 'Logs sizing calculation has positive headroom.' }
++                [ordered]@{ gate_id = 'logs-target-health'; kind = 'health'; condition = 'All three target nodes and the target VIP are healthy.'; success_evidence = 'Cluster health and VIP checks pass.' }
++                [ordered]@{ gate_id = 'logs-parallel-integrations'; kind = 'integration'; condition = 'Integration cutover order prevents duplicate forwarding during parallel operation.'; success_evidence = 'A source-to-target integration cutover list exists.' }
++            )
++            carry_item_ids = @()
++            abandon_item_ids = @()
++        }
++        [ordered]@{
++            order = 60
++            step_id = 'transfer-logs-content-and-data'
++            phase = 'content-transfer'
++            title = 'Transfer supported Logs data and configuration'
++            source_inventory_ids = @('logs-01')
++            target_component_id = 'tgt-logs'
++            depends_on = @('deploy-fresh-logs')
++            action = 'Unconfigure source integrations, configure the target, transfer the newest 90 days, and reconcile recreated content and retained agents.'
++            gates = @(
++                [ordered]@{ gate_id = 'logs-window-content'; kind = 'content'; condition = 'Only the supported newest 90-day data window is selected for transfer.'; success_evidence = 'Transfer manifest spans no more than 90 days.' }
++                [ordered]@{ gate_id = 'logs-integrations-cutover'; kind = 'integration'; condition = 'Source integrations are disabled before their target equivalents are enabled.'; success_evidence = 'Each integration has one active destination.' }
++                [ordered]@{ gate_id = 'logs-post-transfer-health'; kind = 'health'; condition = 'Target ingestion, queries, alerts, dashboards, packs, and agents validate.'; success_evidence = 'Post-transfer validation has no failed checks.' }
++            )
++            carry_item_ids = @($logs.carry_forward.item_id)
++            abandon_item_ids = @($logs.abandon.item_id)
++        }
++        [ordered]@{
++            order = 70
++            step_id = 'cutover-vcf-identity-broker'
++            phase = 'identity-cutover'
++            title = 'Install and cut over VCF Identity Broker'
++            source_inventory_ids = @()
++            target_component_id = 'tgt-identity'
++            depends_on = @('transfer-logs-content-and-data')
++            action = 'After the VCF core reaches version 9, deploy Identity Broker, configure the identity source, and repoint the migrated management components.'
++            gates = @(
++                [ordered]@{ gate_id = 'identity-core9-ready'; kind = 'identity'; condition = 'VCF Operations, SDDC Manager, and management-domain VCF core components are on version 9.'; success_evidence = 'Core 9 prerequisite validation is successful.' }
++                [ordered]@{ gate_id = 'identity-greenfield-compatible'; kind = 'compatibility'; condition = 'Identity Broker is deployed greenfield rather than upgrading VMware Identity Manager.'; success_evidence = 'Identity deployment request is new-install mode.' }
++                [ordered]@{ gate_id = 'identity-auth-health'; kind = 'health'; condition = 'Authentication and authorization work in all three migrated target products.'; success_evidence = 'Target login and role tests pass.' }
++            )
++            carry_item_ids = @()
++            abandon_item_ids = @()
++        }
++    )
++
++    $entitlement = $compatibility.entitlement_rule
++    $plan = [ordered]@{
++        schema_version = '1.0'
++        estate_id = $inventory.estate_id
++        compatibility_snapshot_id = $compatibility.snapshot_id
++        sdk_driver = [ordered]@{
++            modules = @($installer.module.required_sdk_modules)
++            installer_constructors = @($installer.module.required_installer_constructors)
++        }
++        entitlement_decision = [ordered]@{
++            source_entitlement = $entitlement.source_entitlement
++            target_selection = $entitlement.required_selection
++            selected_topology = $entitlement.required_topology
++            excluded_topology = $entitlement.excluded_topology
++            reason = $entitlement.reason
++        }
++        sources = $sources
++        target_components = $targets
++        steps = $steps
++    }
++
++    $outputParent = Split-Path -Parent $OutputPath
++    if ($outputParent -and -not (Test-Path -LiteralPath $outputParent)) {
++        New-Item -ItemType Directory -Path $outputParent -Force | Out-Null
++    }
++    $plan | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $OutputPath -Encoding utf8NoBOM
++    return $plan
++}
++
++Export-ModuleMember -Function New-VcfAriaMigrationPlan
+diff --git a/migration-plan.json b/migration-plan.json
+new file mode 100644
+index 0000000..2e52197
+--- /dev/null
++++ b/migration-plan.json
+@@ -0,0 +1,730 @@
++{
++  "schema_version": "1.0",
++  "estate_id": "northstar-prod",
++  "compatibility_snapshot_id": "broadcom-vcf-9.0.2-2026-08-01",
++  "sdk_driver": {
++    "modules": [
++      "VMware.Sdk.Vcf.Installer",
++      "VMware.Sdk.Vcf.SddcManager",
++      "VMware.Sdk.Vcf.Ops"
++    ],
++    "installer_constructors": [
++      "Initialize-VcfInstallerVcfOperationsNode",
++      "Initialize-VcfInstallerVcfOperationsSpec",
++      "Initialize-VcfInstallerVcfAutomationSpec",
++      "Initialize-VcfInstallerVcfManagementComponentsNetworkSpec",
++      "Initialize-VcfInstallerVcfManagementComponentsInfrastructureSpec"
++    ]
++  },
++  "entitlement_decision": {
++    "source_entitlement": "VCF",
++    "target_selection": "VCF",
++    "selected_topology": "vcf-fleet-managed-primary-instance",
++    "excluded_topology": "others-standalone",
++    "reason": "The estate has VCF entitlement and no standalone Aria entitlement after cutover, so the Others branch cannot license the required targets."
++  },
++  "sources": [
++    {
++      "inventory_id": "ops-01",
++      "product_name": "VMware Aria Operations",
++      "version": "8.18.6",
++      "target_component_id": "tgt-ops",
++      "target_component": "VCF Operations",
++      "target_version": "9.0.2.0",
++      "migration_method": "greenfield-content-export-import",
++      "support_boundary": {
++        "release_family": "8.18",
++        "end_of_general_support": "2027-10-11",
++        "status_at_snapshot": "supported"
++      },
++      "carry_forward": [
++        {
++          "item_id": "ops-dashboard-capacity",
++          "kind": "dashboard",
++          "mode": "export-import",
++          "target_action": "Export 'ops-dashboard-capacity' from the source and import it into the target, then validate its references."
++        },
++        {
++          "item_id": "ops-supermetric-app-health",
++          "kind": "super-metric",
++          "mode": "export-import",
++          "target_action": "Export 'ops-supermetric-app-health' from the source and import it into the target, then validate its references."
++        },
++        {
++          "item_id": "ops-view-chargeback",
++          "kind": "view",
++          "mode": "export-import",
++          "target_action": "Export 'ops-view-chargeback' from the source and import it into the target, then validate its references."
++        },
++        {
++          "item_id": "ops-report-monthly-sla",
++          "kind": "report",
++          "mode": "export-import",
++          "target_action": "Export 'ops-report-monthly-sla' from the source and import it into the target, then validate its references."
++        },
++        {
++          "item_id": "ops-integration-vcenter",
++          "kind": "integration",
++          "mode": "reconfigure",
++          "target_action": "Re-create the configuration for 'ops-integration-vcenter' on the target and validate connectivity."
++        },
++        {
++          "item_id": "ops-credential-vcenter",
++          "kind": "credential",
++          "mode": "re-enter-secret",
++          "target_action": "Re-enter the secret binding for 'ops-credential-vcenter' on the target without exporting secret material."
++        }
++      ],
++      "abandon": [
++        {
++          "item_id": "ops-mp-cis-818",
++          "kind": "management-pack-8.18",
++          "reason_code": "replace-with-9.0-management-pack",
++          "reason": "The 8.18 management-pack binary is not reused; install its VCF 9.0 counterpart after target deployment."
++        },
++        {
++          "item_id": "ops-history-metrics-730d",
++          "kind": "historical-metrics",
++          "reason_code": "greenfield-does-not-transfer-time-series",
++          "reason": "The supported greenfield Operations path cannot migrate historical time-series metrics."
++        }
++      ]
++    },
++    {
++      "inventory_id": "automation-01",
++      "product_name": "VMware Aria Automation",
++      "version": "8.18.1",
++      "target_component_id": "tgt-automation",
++      "target_component": "VCF Automation",
++      "target_version": "9.0.2.0",
++      "migration_method": "fleet-import-upgrade",
++      "support_boundary": {
++        "release_family": "8.18",
++        "end_of_general_support": "2027-10-11",
++        "status_at_snapshot": "supported"
++      },
++      "carry_forward": [
++        {
++          "item_id": "auto-cloudtemplate-three-tier",
++          "kind": "cloud-template",
++          "mode": "database-migration",
++          "target_action": "Carry 'auto-cloudtemplate-three-tier' in the Fleet-managed database migration and reconcile it after upgrade."
++        },
++        {
++          "item_id": "auto-customform-three-tier",
++          "kind": "custom-form",
++          "mode": "database-migration",
++          "target_action": "Carry 'auto-customform-three-tier' in the Fleet-managed database migration and reconcile it after upgrade."
++        },
++        {
++          "item_id": "auto-project-prod",
++          "kind": "project",
++          "mode": "database-migration",
++          "target_action": "Carry 'auto-project-prod' in the Fleet-managed database migration and reconcile it after upgrade."
++        },
++        {
++          "item_id": "auto-cloudaccount-vcenter",
++          "kind": "cloud-account",
++          "mode": "database-migration",
++          "target_action": "Carry 'auto-cloudaccount-vcenter' in the Fleet-managed database migration and reconcile it after upgrade."
++        },
++        {
++          "item_id": "auto-vro-workflow-ipam",
++          "kind": "orchestrator-content",
++          "mode": "database-migration",
++          "target_action": "Carry 'auto-vro-workflow-ipam' in the Fleet-managed database migration and reconcile it after upgrade."
++        },
++        {
++          "item_id": "auto-abx-tagging",
++          "kind": "abx-action",
++          "mode": "database-migration",
++          "target_action": "Carry 'auto-abx-tagging' in the Fleet-managed database migration and reconcile it after upgrade."
++        },
++        {
++          "item_id": "auto-subscription-cmdb",
++          "kind": "subscription",
++          "mode": "database-migration",
++          "target_action": "Carry 'auto-subscription-cmdb' in the Fleet-managed database migration and reconcile it after upgrade."
++        },
++        {
++          "item_id": "auto-deployments-312",
++          "kind": "deployment-records",
++          "mode": "database-migration",
++          "target_action": "Carry 'auto-deployments-312' in the Fleet-managed database migration and reconcile it after upgrade."
++        }
++      ],
++      "abandon": [
++        {
++          "item_id": "auto-login-bookmarks",
++          "kind": "legacy-login-bookmarks",
++          "reason_code": "vcf-identity-broker-login-url-replaces-csp-path",
++          "reason": "VCF Identity Broker replaces the legacy CSP portal path, so these bookmarks must be retired."
++        },
++        {
++          "item_id": "auto-identity-vidm",
++          "kind": "legacy-identity-provider",
++          "reason_code": "vidm-has-no-vcf-9-in-place-upgrade",
++          "reason": "VMware Identity Manager has no in-place transition into the VCF 9 identity architecture."
++        }
++      ]
++    },
++    {
++      "inventory_id": "logs-01",
++      "product_name": "VMware Aria Operations for Logs",
++      "version": "8.18.3",
++      "target_component_id": "tgt-logs",
++      "target_component": "VCF Operations for Logs",
++      "target_version": "9.0.2.0",
++      "migration_method": "fresh-deploy-log-data-transfer",
++      "support_boundary": {
++        "release_family": "8.18",
++        "end_of_general_support": "2027-10-11",
++        "status_at_snapshot": "supported"
++      },
++      "carry_forward": [
++        {
++          "item_id": "logs-data-0-90d",
++          "kind": "log-data-current-window",
++          "mode": "data-transfer-90-days",
++          "target_action": "Transfer 'logs-data-0-90d' with the supported 90-day log-data transfer operation."
++        },
++        {
++          "item_id": "logs-integration-vcenter",
++          "kind": "integration",
++          "mode": "reconfigure",
++          "target_action": "Re-create the configuration for 'logs-integration-vcenter' on the target and validate connectivity."
++        },
++        {
++          "item_id": "logs-integration-nsx",
++          "kind": "integration",
++          "mode": "reconfigure",
++          "target_action": "Re-create the configuration for 'logs-integration-nsx' on the target and validate connectivity."
++        },
++        {
++          "item_id": "logs-alert-auth-failures",
++          "kind": "alert",
++          "mode": "recreate",
++          "target_action": "Re-create 'logs-alert-auth-failures' on the target and compare its resulting behavior with the source."
++        },
++        {
++          "item_id": "logs-dashboard-platform",
++          "kind": "dashboard",
++          "mode": "recreate",
++          "target_action": "Re-create 'logs-dashboard-platform' on the target and compare its resulting behavior with the source."
++        },
++        {
++          "item_id": "logs-contentpack-custom-app",
++          "kind": "content-pack",
++          "mode": "export-import",
++          "target_action": "Export 'logs-contentpack-custom-app' from the source and import it into the target, then validate its references."
++        },
++        {
++          "item_id": "logs-agent-windows-818",
++          "kind": "agent-8.18",
++          "mode": "retain-compatible-agent",
++          "target_action": "Retain 'logs-agent-windows-818', update its trust for the target, and verify ingestion."
++        }
++      ],
++      "abandon": [
++        {
++          "item_id": "logs-data-91-180d",
++          "kind": "log-data-expired-window",
++          "reason_code": "transfer-window-limited-to-90-days",
++          "reason": "The supported log-data transfer is limited to the newest 90 days."
++        },
++        {
++          "item_id": "logs-license-legacy",
++          "kind": "legacy-license",
++          "reason_code": "vcf-entitlement-replaces-legacy-license",
++          "reason": "VCF entitlement replaces the legacy standalone product license at cutover."
++        }
++      ]
++    }
++  ],
++  "target_components": [
++    {
++      "component_id": "tgt-fleet",
++      "name": "VCF Operations Fleet Management",
++      "version": "9.0.2.0",
++      "role": "fleet-lifecycle",
++      "fqdn": "fleet.northstar.example.com",
++      "placement": {
++        "vcf_instance": "vcf-primary-01",
++        "domain": "management-domain",
++        "cluster": "mgmt-cluster-01",
++        "datastore": "vsan-mgmt-01",
++        "network": "pg-vcf-management",
++        "fault_domains": [
++          "rack-a"
++        ],
++        "anti_affinity": false
++      },
++      "sizing": {
++        "profile": "standard",
++        "availability": "single",
++        "node_count": 1,
++        "vcpu_per_node": 4,
++        "memory_gb_per_node": 16,
++        "disk_gb_per_node": 300,
++        "capacity": {},
++        "basis": [
++          "VCF entitlement requires Fleet-managed lifecycle in the primary VCF instance."
++        ]
++      }
++    },
++    {
++      "component_id": "tgt-ops",
++      "name": "VCF Operations",
++      "version": "9.0.2.0",
++      "role": "operations-analytics",
++      "fqdn": "ops.northstar.example.com",
++      "placement": {
++        "vcf_instance": "vcf-primary-01",
++        "domain": "management-domain",
++        "cluster": "mgmt-cluster-01",
++        "datastore": "vsan-mgmt-01",
++        "network": "pg-vcf-management",
++        "fault_domains": [
++          "rack-a",
++          "rack-b"
++        ],
++        "anti_affinity": true
++      },
++      "sizing": {
++        "profile": "medium-ha",
++        "availability": "production-ha",
++        "node_count": 2,
++        "vcpu_per_node": 8,
++        "memory_gb_per_node": 32,
++        "disk_gb_per_node": 2000,
++        "capacity": {
++          "objects": 34000,
++          "collected_metrics": 8000000
++        },
++        "basis": [
++          "24000 monitored objects require more than small-ha capacity.",
++          "4200000 collected metrics fit the medium-ha profile."
++        ]
++      }
++    },
++    {
++      "component_id": "tgt-automation",
++      "name": "VCF Automation",
++      "version": "9.0.2.0",
++      "role": "cloud-automation",
++      "fqdn": "automation.northstar.example.com",
++      "placement": {
++        "vcf_instance": "vcf-primary-01",
++        "domain": "management-domain",
++        "cluster": "mgmt-cluster-01",
++        "datastore": "vsan-mgmt-01",
++        "network": "pg-vcf-management",
++        "fault_domains": [
++          "rack-a",
++          "rack-b",
++          "rack-c"
++        ],
++        "anti_affinity": true
++      },
++      "sizing": {
++        "profile": "medium-ha",
++        "availability": "production-ha",
++        "node_count": 3,
++        "vcpu_per_node": 24,
++        "memory_gb_per_node": 96,
++        "disk_gb_per_node": 334,
++        "capacity": {
++          "concurrent_deployments": 150
++        },
++        "basis": [
++          "120 concurrent deployments and production-ha availability select medium-ha."
++        ]
++      }
++    },
++    {
++      "component_id": "tgt-logs",
++      "name": "VCF Operations for Logs",
++      "version": "9.0.2.0",
++      "role": "log-analytics",
++      "fqdn": "logs.northstar.example.com",
++      "placement": {
++        "vcf_instance": "vcf-primary-01",
++        "domain": "management-domain",
++        "cluster": "mgmt-cluster-01",
++        "datastore": "vsan-mgmt-01",
++        "network": "pg-vcf-management",
++        "fault_domains": [
++          "rack-a",
++          "rack-b",
++          "rack-c"
++        ],
++        "anti_affinity": true
++      },
++      "sizing": {
++        "profile": "medium-ha",
++        "availability": "production-ha",
++        "node_count": 3,
++        "vcpu_per_node": 8,
++        "memory_gb_per_node": 16,
++        "disk_gb_per_node": 3072,
++        "capacity": {
++          "ingestion_gb_per_day": 225,
++          "events_per_second": 15000,
++          "active_syslog_connections": 750,
++          "retention_days": 90
++        },
++        "basis": [
++          "70 GB/day and 9000 EPS fit medium-ha.",
++          "500 active connections and 90 retention days fit medium-ha."
++        ]
++      }
++    },
++    {
++      "component_id": "tgt-identity",
++      "name": "VCF Identity Broker",
++      "version": "9.0.2.0",
++      "role": "identity-broker",
++      "fqdn": "identity.northstar.example.com",
++      "placement": {
++        "vcf_instance": "vcf-primary-01",
++        "domain": "management-domain",
++        "cluster": "mgmt-cluster-01",
++        "datastore": "vsan-mgmt-01",
++        "network": "pg-vcf-management",
++        "fault_domains": [
++          "rack-a"
++        ],
++        "anti_affinity": false
++      },
++      "sizing": {
++        "profile": "standard",
++        "availability": "single",
++        "node_count": 1,
++        "vcpu_per_node": 4,
++        "memory_gb_per_node": 16,
++        "disk_gb_per_node": 100,
++        "capacity": {},
++        "basis": [
++          "VCF Identity Broker is a required greenfield identity component after the core upgrade."
++        ]
++      }
++    }
++  ],
++  "steps": [
++    {
++      "order": 10,
++      "step_id": "bootstrap-fleet-management",
++      "phase": "prepare",
++      "title": "Patch lifecycle and bootstrap Fleet Management",
++      "source_inventory_ids": [],
++      "target_component_id": "tgt-fleet",
++      "depends_on": [],
++      "action": "Patch legacy lifecycle, select VCF entitlement, reserve placement, and deploy Fleet Management in the primary instance.",
++      "gates": [
++        {
++          "gate_id": "fleet-entitlement-vcf",
++          "kind": "entitlement",
++          "condition": "The entitlement branch is explicitly set to VCF, not Others.",
++          "success_evidence": "The lifecycle request records entitlement selection VCF."
++        },
++        {
++          "gate_id": "fleet-lifecycle-patch2",
++          "kind": "lifecycle",
++          "condition": "VMware Aria Suite Lifecycle 8.18 Patch 2 is installed before bootstrap.",
++          "success_evidence": "Lifecycle About reports 8.18 Patch 2."
++        },
++        {
++          "gate_id": "fleet-placement-capacity",
++          "kind": "capacity",
++          "condition": "Reserved management-domain compute, storage, DNS, and network capacity is available.",
++          "success_evidence": "Placement precheck returns success."
++        }
++      ],
++      "carry_item_ids": [],
++      "abandon_item_ids": []
++    },
++    {
++      "order": 20,
++      "step_id": "deploy-greenfield-operations",
++      "phase": "deploy",
++      "title": "Deploy greenfield VCF Operations 9.0.2",
++      "source_inventory_ids": [
++        "ops-01"
++      ],
++      "target_component_id": "tgt-ops",
++      "depends_on": [
++        "bootstrap-fleet-management"
++      ],
++      "action": "Deploy a new medium-ha VCF Operations cluster through Fleet Management and leave the 8.18.6 cluster unchanged for export.",
++      "gates": [
++        {
++          "gate_id": "ops-method-compatible",
++          "kind": "compatibility",
++          "condition": "The selected path is greenfield and no 9.0.x PAK is staged on 8.18.6.",
++          "success_evidence": "Deployment plan reports new-cluster mode."
++        },
++        {
++          "gate_id": "ops-entitlement-bound",
++          "kind": "entitlement",
++          "condition": "The target is registered under the fleet VCF entitlement.",
++          "success_evidence": "Target subscription state is VCF-entitled."
++        },
++        {
++          "gate_id": "ops-offline-backup",
++          "kind": "backup",
++          "condition": "A restorable offline backup of every 8.18.6 node exists.",
++          "success_evidence": "Backup restore validation is successful."
++        },
++        {
++          "gate_id": "ops-size-capacity",
++          "kind": "capacity",
++          "condition": "The medium-ha sizing covers 24000 objects and 4200000 collected metrics.",
++          "success_evidence": "Sizing precheck accepts the selected profile."
++        },
++        {
++          "gate_id": "ops-target-health",
++          "kind": "health",
++          "condition": "Both target analytics nodes are online and the cluster is healthy.",
++          "success_evidence": "Fleet health reports all target nodes healthy."
++        }
++      ],
++      "carry_item_ids": [],
++      "abandon_item_ids": []
++    },
++    {
++      "order": 30,
++      "step_id": "transfer-operations-content",
++      "phase": "content-transfer",
++      "title": "Transfer supported Operations content",
++      "source_inventory_ids": [
++        "ops-01"
++      ],
++      "target_component_id": "tgt-ops",
++      "depends_on": [
++        "deploy-greenfield-operations"
++      ],
++      "action": "Export and import compatible custom content, rebuild integrations and secrets, and record non-transferable history and binaries.",
++      "gates": [
++        {
++          "gate_id": "ops-content-export",
++          "kind": "content",
++          "condition": "Every carried Operations item has an export or reconfiguration record.",
++          "success_evidence": "Content reconciliation has no missing carried IDs."
++        },
++        {
++          "gate_id": "ops-post-import-health",
++          "kind": "health",
++          "condition": "Imported dashboards, metrics, views, reports, and integrations validate on target.",
++          "success_evidence": "Target content validation is successful."
++        }
++      ],
++      "carry_item_ids": [
++        "ops-dashboard-capacity",
++        "ops-supermetric-app-health",
++        "ops-view-chargeback",
++        "ops-report-monthly-sla",
++        "ops-integration-vcenter",
++        "ops-credential-vcenter"
++      ],
++      "abandon_item_ids": [
++        "ops-mp-cis-818",
++        "ops-history-metrics-730d"
++      ]
++    },
++    {
++      "order": 40,
++      "step_id": "import-upgrade-automation",
++      "phase": "upgrade",
++      "title": "Import and upgrade Aria Automation through Fleet",
++      "source_inventory_ids": [
++        "automation-01"
++      ],
++      "target_component_id": "tgt-automation",
++      "depends_on": [
++        "transfer-operations-content"
++      ],
++      "action": "Import the 8.18.1 three-node environment into Fleet Management, run prechecks, upgrade it to 9.0.2, and reconcile migrated content.",
++      "gates": [
++        {
++          "gate_id": "automation-fleet-lifecycle",
++          "kind": "lifecycle",
++          "condition": "Automation is inventoried and synchronized in Fleet Management before upgrade.",
++          "success_evidence": "Fleet inventory shows automation-01 synchronized."
++        },
++        {
++          "gate_id": "automation-path-compatible",
++          "kind": "compatibility",
++          "condition": "The workflow uses Fleet import followed by upgrade from 8.18.1.",
++          "success_evidence": "Upgrade plan reports import-existing mode."
++        },
++        {
++          "gate_id": "automation-backup",
++          "kind": "backup",
++          "condition": "A current supported backup of the Automation cluster is restorable.",
++          "success_evidence": "Backup validation completes successfully."
++        },
++        {
++          "gate_id": "automation-size-capacity",
++          "kind": "capacity",
++          "condition": "The medium-ha target supports 120 concurrent deployments.",
++          "success_evidence": "Fleet sizing precheck accepts medium-ha."
++        },
++        {
++          "gate_id": "automation-precheck-health",
++          "kind": "health",
++          "condition": "Upgrade prechecks pass and the embedded Orchestrator is healthy.",
++          "success_evidence": "All Fleet upgrade prechecks are green."
++        },
++        {
++          "gate_id": "automation-content-reconciled",
++          "kind": "content",
++          "condition": "All carried records are present and abandoned identity artifacts are documented.",
++          "success_evidence": "Automation content reconciliation is complete."
++        }
++      ],
++      "carry_item_ids": [
++        "auto-cloudtemplate-three-tier",
++        "auto-customform-three-tier",
++        "auto-project-prod",
++        "auto-cloudaccount-vcenter",
++        "auto-vro-workflow-ipam",
++        "auto-abx-tagging",
++        "auto-subscription-cmdb",
++        "auto-deployments-312"
++      ],
++      "abandon_item_ids": [
++        "auto-login-bookmarks",
++        "auto-identity-vidm"
++      ]
++    },
++    {
++      "order": 50,
++      "step_id": "deploy-fresh-logs",
++      "phase": "deploy",
++      "title": "Deploy fresh VCF Operations for Logs",
++      "source_inventory_ids": [
++        "logs-01"
++      ],
++      "target_component_id": "tgt-logs",
++      "depends_on": [
++        "import-upgrade-automation"
++      ],
++      "action": "Deploy a new three-node medium-ha Logs cluster in parallel with 8.18.3 and prepare it for configuration and data transfer.",
++      "gates": [
++        {
++          "gate_id": "logs-fresh-path",
++          "kind": "compatibility",
++          "condition": "The target is a fresh deployment; no in-place or rolling upgrade is attempted.",
++          "success_evidence": "Fleet deployment mode is new installation."
++        },
++        {
++          "gate_id": "logs-source-backup",
++          "kind": "backup",
++          "condition": "The 8.18.3 configuration and retained log archive have a current backup.",
++          "success_evidence": "Backup job and restore check succeed."
++        },
++        {
++          "gate_id": "logs-size-capacity",
++          "kind": "capacity",
++          "condition": "Medium-ha covers 70 GB/day, 9000 EPS, 500 connections, and 90 retention days.",
++          "success_evidence": "Logs sizing calculation has positive headroom."
++        },
++        {
++          "gate_id": "logs-target-health",
++          "kind": "health",
++          "condition": "All three target nodes and the target VIP are healthy.",
++          "success_evidence": "Cluster health and VIP checks pass."
++        },
++        {
++          "gate_id": "logs-parallel-integrations",
++          "kind": "integration",
++          "condition": "Integration cutover order prevents duplicate forwarding during parallel operation.",
++          "success_evidence": "A source-to-target integration cutover list exists."
++        }
++      ],
++      "carry_item_ids": [],
++      "abandon_item_ids": []
++    },
++    {
++      "order": 60,
++      "step_id": "transfer-logs-content-and-data",
++      "phase": "content-transfer",
++      "title": "Transfer supported Logs data and configuration",
++      "source_inventory_ids": [
++        "logs-01"
++      ],
++      "target_component_id": "tgt-logs",
++      "depends_on": [
++        "deploy-fresh-logs"
++      ],
++      "action": "Unconfigure source integrations, configure the target, transfer the newest 90 days, and reconcile recreated content and retained agents.",
++      "gates": [
++        {
++          "gate_id": "logs-window-content",
++          "kind": "content",
++          "condition": "Only the supported newest 90-day data window is selected for transfer.",
++          "success_evidence": "Transfer manifest spans no more than 90 days."
++        },
++        {
++          "gate_id": "logs-integrations-cutover",
++          "kind": "integration",
++          "condition": "Source integrations are disabled before their target equivalents are enabled.",
++          "success_evidence": "Each integration has one active destination."
++        },
++        {
++          "gate_id": "logs-post-transfer-health",
++          "kind": "health",
++          "condition": "Target ingestion, queries, alerts, dashboards, packs, and agents validate.",
++          "success_evidence": "Post-transfer validation has no failed checks."
++        }
++      ],
++      "carry_item_ids": [
++        "logs-data-0-90d",
++        "logs-integration-vcenter",
++        "logs-integration-nsx",
++        "logs-alert-auth-failures",
++        "logs-dashboard-platform",
++        "logs-contentpack-custom-app",
++        "logs-agent-windows-818"
++      ],
++      "abandon_item_ids": [
++        "logs-data-91-180d",
++        "logs-license-legacy"
++      ]
++    },
++    {
++      "order": 70,
++      "step_id": "cutover-vcf-identity-broker",
++      "phase": "identity-cutover",
++      "title": "Install and cut over VCF Identity Broker",
++      "source_inventory_ids": [],
++      "target_component_id": "tgt-identity",
++      "depends_on": [
++        "transfer-logs-content-and-data"
++      ],
++      "action": "After the VCF core reaches version 9, deploy Identity Broker, configure the identity source, and repoint the migrated management components.",
++      "gates": [
++        {
++          "gate_id": "identity-core9-ready",
++          "kind": "identity",
++          "condition": "VCF Operations, SDDC Manager, and management-domain VCF core components are on version 9.",
++          "success_evidence": "Core 9 prerequisite validation is successful."
++        },
++        {
++          "gate_id": "identity-greenfield-compatible",
++          "kind": "compatibility",
++          "condition": "Identity Broker is deployed greenfield rather than upgrading VMware Identity Manager.",
++          "success_evidence": "Identity deployment request is new-install mode."
++        },
++        {
++          "gate_id": "identity-auth-health",
++          "kind": "health",
++          "condition": "Authentication and authorization work in all three migrated target products.",
++          "success_evidence": "Target login and role tests pass."
++        }
++      ],
++      "carry_item_ids": [],
++      "abandon_item_ids": []
++    }
++  ]
++}
+diff --git a/research.md b/research.md
+new file mode 100644
+index 0000000..60d5208
+--- /dev/null
++++ b/research.md
+@@ -0,0 +1,14 @@
++# Broadcom research record
++
++These were live Broadcom pages consulted while preparing the architecture; the pinned local snapshot remains the implementation authority for this exercise.
++
++| Access date | Broadcom page title | Reachable URL | Architecture conclusion recorded |
++|---|---|---|---|
++| Accessed 2026-08-15 | Upgrading VMware Aria Operations 8.x to VCF Operations 9.0 using VMware Aria Suite Lifecycle (KB 433805) | https://knowledge.broadcom.com/external/article/433805 | The workflow branches on entitlement. Selecting VCF deploys Fleet Management and its integrations, so the estate's VCF-only entitlement eliminates the Others/standalone branch. |
++| Accessed 2026-08-15 | Upgrade of Aria Operations 8.18.6 or 8.18.7 to VCF Operations 9.0.x is Unsupported (KB 438994) | https://knowledge.broadcom.com/external/article/438994 | An 8.18.6 to 9.0.x in-place PAK upgrade is unsupported. The supported alternative is greenfield VCF Operations 9.0.2 with export/import of dashboards, super metrics, views, and reports; historical time-series data does not migrate. |
++| Accessed 2026-08-15 | How to re-trigger VCF Automation 9.0 failed upgrade workflow (KB 398777) | https://knowledge.broadcom.com/external/article/398777 | Aria Automation 8.18.x is first imported into VCF Operations Fleet Management and then upgraded using an upgrade plan. |
++| Accessed 2026-08-15 | Upgrade Guidance for Aria Operations for Logs 8.18.x to VCF Operations for Logs 9.0.x (KB 402314) | https://knowledge.broadcom.com/external/article/402314 | Logs 8.18.x has no in-place 9.0.x upgrade. Deploy fresh, run both versions in parallel, unconfigure old integrations, reconfigure them on target, and transfer no more than 90 days of log data. |
++| Accessed 2026-08-15 | Update Sequence for VCF 9.0 and Compatible VMware Products (KB 390634) | https://knowledge.broadcom.com/external/article/390634 | Patch Aria Suite Lifecycle first, then establish Operations/Fleet, migrate Automation, deploy Logs fresh, and install Identity Broker only after its VCF core prerequisites. |
++| Accessed 2026-08-15 | VCF Operations 9.0 Sizing Guidelines (KB 397782) | https://knowledge.broadcom.com/external/article/397782 | Operations profiles are constrained by object/metric counts; production Logs clusters use at least three medium-or-larger nodes and per-node ingestion, EPS, connection, and storage limits must be aggregated. |
++| Accessed 2026-08-15 | End of General Support for VMware Aria Operations 8.18 (KB 422643) | https://knowledge.broadcom.com/external/article/422643 | The 8.18 family remains in General Support through 2027-10-11, but entitlement and supported-path constraints still require this migration design. |
++| Accessed 2026-08-15 | PowerCLI Installation Guide | https://developer.broadcom.com/powercli/installation-guide | VCF PowerCLI is composed of product modules. The architecture module consumes the environment-provided VMware.Sdk.Vcf modules and does not bundle them. |

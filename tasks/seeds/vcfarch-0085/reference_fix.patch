@@ -1,0 +1,688 @@
+diff --git a/architecture/plan.go b/architecture/plan.go
+index 9ea11a1..e20d26a 100644
+--- a/architecture/plan.go
++++ b/architecture/plan.go
+@@ -1,9 +1,262 @@
+ package vcfarchitecture
+ 
+-import "errors"
++import "fmt"
+ 
+ // BuildPlan constructs the ordered migration architecture for inventory using
+ // only combinations and gates present in the pinned compatibility snapshot.
+ func BuildPlan(inventory Inventory, compatibility CompatibilitySnapshot) (MigrationPlan, error) {
+-	return MigrationPlan{}, errors.New("BuildPlan is not implemented")
++	if inventory.Site.SiteCount != 1 {
++		return MigrationPlan{}, fmt.Errorf("site count must be one, got %d", inventory.Site.SiteCount)
++	}
++	if inventory.Site.DesignModel != "consolidated" {
++		return MigrationPlan{}, fmt.Errorf("design model must be consolidated, got %q", inventory.Site.DesignModel)
++	}
++	if inventory.Site.AvailabilityZoneMode != "single" {
++		return MigrationPlan{}, fmt.Errorf("availability-zone mode must be single, got %q", inventory.Site.AvailabilityZoneMode)
++	}
++
++	minimumHosts, found := minimumHostsFor(inventory, compatibility)
++	if !found {
++		return MigrationPlan{}, fmt.Errorf("no minimum-host constraint matches the inventory topology")
++	}
++	if len(inventory.Hosts) < minimumHosts {
++		return MigrationPlan{}, fmt.Errorf("inventory has %d hosts; matching constraint requires at least %d", len(inventory.Hosts), minimumHosts)
++	}
++
++	releasePath, err := supportedPath(inventory.SourceRelease, inventory.TargetRelease, compatibility.ReleaseHops)
++	if err != nil {
++		return MigrationPlan{}, err
++	}
++
++	gateCatalog := make(map[string]GateDefinition, len(compatibility.GateCatalog))
++	for _, gate := range compatibility.GateCatalog {
++		if gate.ID == "" || gate.Condition == "" {
++			return MigrationPlan{}, fmt.Errorf("gate catalog contains an empty id or condition")
++		}
++		if _, duplicate := gateCatalog[gate.ID]; duplicate {
++			return MigrationPlan{}, fmt.Errorf("gate %q appears more than once in the catalog", gate.ID)
++		}
++		gateCatalog[gate.ID] = gate
++	}
++
++	inventoryComponents := make(map[string]InventoryComponent, len(inventory.Components))
++	for _, component := range inventory.Components {
++		if component.ID == "" {
++			return MigrationPlan{}, fmt.Errorf("inventory contains a component without an id")
++		}
++		if _, duplicate := inventoryComponents[component.ID]; duplicate {
++			return MigrationPlan{}, fmt.Errorf("inventory component %q appears more than once", component.ID)
++		}
++		inventoryComponents[component.ID] = component
++	}
++
++	seenComponents := make(map[string]bool, len(inventory.Components))
++	stages := make([]MigrationStage, 0, len(compatibility.Stages))
++	for stageIndex, sourceStage := range compatibility.Stages {
++		if sourceStage.Sequence != stageIndex+1 {
++			return MigrationPlan{}, fmt.Errorf("stage sequence is not contiguous at index %d", stageIndex)
++		}
++		if sourceStage.ID == "" || sourceStage.Mechanism == "" || len(sourceStage.Changes) == 0 {
++			return MigrationPlan{}, fmt.Errorf("stage %d has an empty id, mechanism, or change list", sourceStage.Sequence)
++		}
++		stage := MigrationStage{
++			Sequence:  sourceStage.Sequence,
++			ID:        sourceStage.ID,
++			Mechanism: sourceStage.Mechanism,
++			Changes:   make([]ComponentChange, 0, len(sourceStage.Changes)),
++		}
++		for _, sourceChange := range sourceStage.Changes {
++			component, exists := inventoryComponents[sourceChange.ComponentID]
++			if !exists {
++				return MigrationPlan{}, fmt.Errorf("stage %d names component %q absent from inventory", sourceStage.Sequence, sourceChange.ComponentID)
++			}
++			if seenComponents[sourceChange.ComponentID] {
++				return MigrationPlan{}, fmt.Errorf("component %q appears in more than one change", sourceChange.ComponentID)
++			}
++			if component.CurrentVersion != sourceChange.FromVersion || component.CurrentState != sourceChange.FromState {
++				return MigrationPlan{}, fmt.Errorf("component %q source version/state does not match inventory", sourceChange.ComponentID)
++			}
++			if sourceChange.TargetVersion == "" || sourceChange.TargetState == "" || len(sourceChange.Gates) == 0 {
++				return MigrationPlan{}, fmt.Errorf("component %q has an incomplete target or gate set", sourceChange.ComponentID)
++			}
++			seenGates := map[string]bool{}
++			for _, gateID := range sourceChange.Gates {
++				if _, exists := gateCatalog[gateID]; !exists {
++					return MigrationPlan{}, fmt.Errorf("component %q references unknown gate %q", sourceChange.ComponentID, gateID)
++				}
++				if seenGates[gateID] {
++					return MigrationPlan{}, fmt.Errorf("component %q repeats gate %q", sourceChange.ComponentID, gateID)
++				}
++				seenGates[gateID] = true
++			}
++			seenComponents[sourceChange.ComponentID] = true
++			stage.Changes = append(stage.Changes, ComponentChange{
++				ComponentID:   sourceChange.ComponentID,
++				FromVersion:   sourceChange.FromVersion,
++				FromState:     sourceChange.FromState,
++				TargetVersion: sourceChange.TargetVersion,
++				TargetState:   sourceChange.TargetState,
++				Gates:         append([]string(nil), sourceChange.Gates...),
++			})
++		}
++		stages = append(stages, stage)
++	}
++	if len(seenComponents) != len(inventoryComponents) {
++		for componentID := range inventoryComponents {
++			if !seenComponents[componentID] {
++				return MigrationPlan{}, fmt.Errorf("inventory component %q is missing from compatibility stages", componentID)
++			}
++		}
++		return MigrationPlan{}, fmt.Errorf("component coverage does not match inventory")
++	}
++
++	targetSpec, err := retainedSddcSpec(inventory)
++	if err != nil {
++		return MigrationPlan{}, err
++	}
++	return MigrationPlan{
++		SchemaVersion: "1.0.0",
++		EstateID:      inventory.EstateID,
++		SourceRelease: inventory.SourceRelease,
++		TargetRelease: inventory.TargetRelease,
++		Topology: PlanTopology{
++			SiteCount:            inventory.Site.SiteCount,
++			AvailabilityZoneMode: inventory.Site.AvailabilityZoneMode,
++			DesignModel:          inventory.Site.DesignModel,
++			StorageType:          inventory.Cluster.StorageType,
++			HostCount:            len(inventory.Hosts),
++		},
++		ReleaseHops:     releasePath,
++		GateDefinitions: append([]GateDefinition(nil), compatibility.GateCatalog...),
++		Stages:          stages,
++		TargetSddcSpec:  targetSpec,
++	}, nil
++}
++
++func minimumHostsFor(inventory Inventory, compatibility CompatibilitySnapshot) (int, bool) {
++	for _, constraint := range compatibility.MinimumHostConstraints {
++		if constraint.DesignModel == inventory.Site.DesignModel &&
++			constraint.SiteCount == inventory.Site.SiteCount &&
++			constraint.AvailabilityZoneMode == inventory.Site.AvailabilityZoneMode &&
++			constraint.StorageType == inventory.Cluster.StorageType {
++			return constraint.MinimumHosts, true
++		}
++	}
++	return 0, false
++}
++
++func supportedPath(source, target string, hops []ReleaseHop) ([]ReleaseHop, error) {
++	type candidate struct {
++		version string
++		path    []ReleaseHop
++	}
++	queue := []candidate{{version: source}}
++	visited := map[string]bool{source: true}
++	for len(queue) > 0 {
++		current := queue[0]
++		queue = queue[1:]
++		if current.version == target {
++			if len(current.path) == 0 {
++				return nil, fmt.Errorf("source and target release must differ")
++			}
++			return current.path, nil
++		}
++		for _, hop := range hops {
++			if !hop.Supported || hop.From != current.version || visited[hop.To] {
++				continue
++			}
++			nextPath := append(append([]ReleaseHop(nil), current.path...), hop)
++			visited[hop.To] = true
++			queue = append(queue, candidate{version: hop.To, path: nextPath})
++		}
++	}
++	return nil, fmt.Errorf("no supported release path from %s to %s", source, target)
++}
++
++func retainedSddcSpec(inventory Inventory) (map[string]any, error) {
++	vcenter, found := componentByID(inventory.Components, "VCENTER")
++	if !found || len(vcenter.Endpoints) != 1 {
++		return nil, fmt.Errorf("inventory must contain exactly one vCenter endpoint")
++	}
++	nsx, found := componentByID(inventory.Components, "NSX_MANAGER")
++	if !found || len(nsx.Endpoints) == 0 || nsx.VIPFQDN == "" {
++		return nil, fmt.Errorf("inventory must contain NSX manager endpoints and a VIP FQDN")
++	}
++	if inventory.FixtureSecrets.VCenterRootPassword == "" {
++		return nil, fmt.Errorf("fixture vCenter credential is empty")
++	}
++
++	hostSpecs := make([]any, 0, len(inventory.Hosts))
++	for _, host := range inventory.Hosts {
++		if host.ShortHostname == "" {
++			return nil, fmt.Errorf("host %q has no short hostname", host.ID)
++		}
++		hostSpecs = append(hostSpecs, map[string]any{"hostname": host.ShortHostname})
++	}
++	networkSpecs := make([]any, 0, len(inventory.Networks))
++	for _, network := range inventory.Networks {
++		entry := map[string]any{
++			"networkType": network.NetworkType,
++			"vlanId":      network.VLANID,
++			"mtu":         network.MTU,
++			"subnet":      network.Subnet,
++			"gateway":     network.Gateway,
++		}
++		if len(network.IncludeIPAddressRanges) != 0 {
++			ranges := make([]any, 0, len(network.IncludeIPAddressRanges))
++			for _, ipRange := range network.IncludeIPAddressRanges {
++				ranges = append(ranges, map[string]any{
++					"startIpAddress": ipRange.StartIPAddress,
++					"endIpAddress":   ipRange.EndIPAddress,
++				})
++			}
++			entry["includeIpAddressRanges"] = ranges
++		}
++		networkSpecs = append(networkSpecs, entry)
++	}
++	nsxManagers := make([]any, 0, len(nsx.Endpoints))
++	for _, endpoint := range nsx.Endpoints {
++		nsxManagers = append(nsxManagers, map[string]any{"hostname": endpoint})
++	}
++
++	return map[string]any{
++		"sddcId":       inventory.SDDCID,
++		"workflowType": "VCF_COMPLETE",
++		"version":      inventory.TargetRelease,
++		"hostSpecs":    hostSpecs,
++		"vcenterSpec": map[string]any{
++			"vcenterHostname":       vcenter.Endpoints[0],
++			"rootVcenterPassword":   inventory.FixtureSecrets.VCenterRootPassword,
++			"version":               inventory.TargetRelease,
++			"useExistingDeployment": true,
++		},
++		"clusterSpec": map[string]any{
++			"datacenterName": inventory.Cluster.DatacenterName,
++			"clusterName":    inventory.Cluster.ClusterName,
++		},
++		"datastoreSpec": map[string]any{
++			"existingDatastoreName": inventory.Cluster.DatastoreName,
++		},
++		"nsxtSpec": map[string]any{
++			"nsxtManagers":          nsxManagers,
++			"vipFqdn":               nsx.VIPFQDN,
++			"version":               inventory.TargetRelease,
++			"useExistingDeployment": true,
++		},
++		"networkSpecs": networkSpecs,
++		"dnsSpec": map[string]any{
++			"subdomain":   inventory.DNS.Subdomain,
++			"nameservers": append([]string(nil), inventory.DNS.Nameservers...),
++		},
++		"ntpServers": append([]string(nil), inventory.NTPServers...),
++	}, nil
++}
++
++func componentByID(components []InventoryComponent, id string) (InventoryComponent, bool) {
++	for _, component := range components {
++		if component.ID == id {
++			return component, true
++		}
++	}
++	return InventoryComponent{}, false
+ }
+diff --git a/architecture/plan_test.go b/architecture/plan_test.go
+new file mode 100644
+index 0000000..83f9ae6
+--- /dev/null
++++ b/architecture/plan_test.go
+@@ -0,0 +1,72 @@
++package vcfarchitecture
++
++import (
++	"encoding/json"
++	"os"
++	"testing"
++)
++
++func TestBuildPlanTable(t *testing.T) {
++	baseInventory := readFixture[Inventory](t, "../fixtures/estate.json")
++	baseCompatibility := readFixture[CompatibilitySnapshot](t, "../grader/compatibility-snapshot.json")
++
++	tests := []struct {
++		name    string
++		mutate  func(*Inventory, *CompatibilitySnapshot)
++		wantErr bool
++	}{
++		{name: "supported minimum-host estate"},
++		{name: "too few hosts", wantErr: true, mutate: func(inventory *Inventory, _ *CompatibilitySnapshot) {
++			inventory.Hosts = inventory.Hosts[:3]
++		}},
++		{name: "unsupported target", wantErr: true, mutate: func(inventory *Inventory, _ *CompatibilitySnapshot) {
++			inventory.TargetRelease = "9.0.1.0"
++		}},
++		{name: "unknown gate", wantErr: true, mutate: func(_ *Inventory, compatibility *CompatibilitySnapshot) {
++			compatibility.Stages[0].Changes[0].Gates = append(compatibility.Stages[0].Changes[0].Gates, "not-in-catalog")
++		}},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			inventory := jsonClone(t, baseInventory)
++			compatibility := jsonClone(t, baseCompatibility)
++			if test.mutate != nil {
++				test.mutate(&inventory, &compatibility)
++			}
++			plan, err := BuildPlan(inventory, compatibility)
++			if (err != nil) != test.wantErr {
++				t.Fatalf("BuildPlan() error = %v, wantErr %v", err, test.wantErr)
++			}
++			if !test.wantErr && (len(plan.Stages) != 6 || plan.Topology.HostCount != 4 || plan.TargetRelease != "9.1.0.0") {
++				t.Fatalf("BuildPlan() returned incomplete canonical plan: %+v", plan)
++			}
++		})
++	}
++}
++
++func readFixture[T any](t *testing.T, path string) T {
++	t.Helper()
++	raw, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var value T
++	if err := json.Unmarshal(raw, &value); err != nil {
++		t.Fatal(err)
++	}
++	return value
++}
++
++func jsonClone[T any](t *testing.T, value T) T {
++	t.Helper()
++	raw, err := json.Marshal(value)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var clone T
++	if err := json.Unmarshal(raw, &clone); err != nil {
++		t.Fatal(err)
++	}
++	return clone
++}
+diff --git a/migration-plan.json b/migration-plan.json
+new file mode 100644
+index 0000000..fadd798
+--- /dev/null
++++ b/migration-plan.json
+@@ -0,0 +1,319 @@
++{
++  "schemaVersion": "1.0.0",
++  "estateId": "chi-consolidated-01",
++  "sourceRelease": "5.2.2.0",
++  "targetRelease": "9.1.0.0",
++  "topology": {
++    "siteCount": 1,
++    "availabilityZoneMode": "single",
++    "designModel": "consolidated",
++    "storageType": "vSAN-OSA",
++    "hostCount": 4
++  },
++  "releaseHops": [
++    {
++      "from": "5.2.2.0",
++      "to": "9.1.0.0",
++      "supported": true,
++      "rationale": "VCF 5.2.x with SDDC Manager can move to 9.1 after VCF Operations is upgraded, using the supported LCM workflows."
++    }
++  ],
++  "gateDefinitions": [
++    {
++      "id": "operations-health",
++      "condition": "The existing Operations analytics cluster passes its health and capacity prechecks."
++    },
++    {
++      "id": "operations-backup",
++      "condition": "A restorable backup of the existing Operations deployment is verified."
++    },
++    {
++      "id": "operations-at-target",
++      "condition": "VCF Operations reports version 9.1.0.0 and healthy before dependent stages start."
++    },
++    {
++      "id": "dns-forward-reverse",
++      "condition": "Forward and reverse DNS resolve for the VCF License Server and management components."
++    },
++    {
++      "id": "license-entitlement",
++      "condition": "The 9.1 entitlement is available to the VCF License Server."
++    },
++    {
++      "id": "license-server-ready",
++      "condition": "VCF Operations reports the 9.1 License Server registered and healthy."
++    },
++    {
++      "id": "sddc-manager-backup",
++      "condition": "A successful SDDC Manager backup is verified before its upgrade."
++    },
++    {
++      "id": "lcm-precheck",
++      "condition": "The applicable SDDC Manager lifecycle precheck completes without blocking findings."
++    },
++    {
++      "id": "sddc-manager-at-target",
++      "condition": "SDDC Manager reports version 9.1.0.0 and healthy before domain component upgrades."
++    },
++    {
++      "id": "nsx-backup",
++      "condition": "A successful NSX configuration backup is verified before the NSX upgrade."
++    },
++    {
++      "id": "interop-precheck",
++      "condition": "The pinned source and target NSX combination passes the lifecycle interoperability precheck."
++    },
++    {
++      "id": "nsx-at-target",
++      "condition": "The NSX management cluster reports version 9.1.0.0 and healthy."
++    },
++    {
++      "id": "vcenter-backup",
++      "condition": "A restorable file-based vCenter backup is verified before the vCenter upgrade."
++    },
++    {
++      "id": "vcenter-at-target",
++      "condition": "vCenter reports version 9.1.0.0 and all four management hosts connected."
++    },
++    {
++      "id": "cluster-health",
++      "condition": "vSAN health, object compliance, DRS, and HA checks are green before each host evacuation."
++    },
++    {
++      "id": "sequential-evacuation-capacity",
++      "condition": "The four-host consolidated cluster can evacuate one host at a time while the other three carry management workloads and satisfy storage policy."
++    }
++  ],
++  "stages": [
++    {
++      "sequence": 1,
++      "id": "upgrade-vcf-operations",
++      "mechanism": "VCF Operations in-place upgrade",
++      "changes": [
++        {
++          "componentId": "VCF_OPERATIONS",
++          "fromVersion": "8.18.0",
++          "fromState": "present",
++          "targetVersion": "9.1.0.0",
++          "targetState": "present",
++          "gates": [
++            "operations-health",
++            "operations-backup"
++          ]
++        }
++      ]
++    },
++    {
++      "sequence": 2,
++      "id": "deploy-license-server",
++      "mechanism": "VCF Operations workflow",
++      "changes": [
++        {
++          "componentId": "VCF_LICENSE_SERVER",
++          "fromVersion": "not-installed",
++          "fromState": "absent",
++          "targetVersion": "9.1.0.0",
++          "targetState": "present",
++          "gates": [
++            "operations-at-target",
++            "dns-forward-reverse",
++            "license-entitlement"
++          ]
++        }
++      ]
++    },
++    {
++      "sequence": 3,
++      "id": "upgrade-sddc-manager",
++      "mechanism": "SDDC Manager lifecycle workflow",
++      "changes": [
++        {
++          "componentId": "SDDC_MANAGER",
++          "fromVersion": "5.2.2.0-24936865",
++          "fromState": "present",
++          "targetVersion": "9.1.0.0",
++          "targetState": "present",
++          "gates": [
++            "operations-at-target",
++            "license-server-ready",
++            "sddc-manager-backup",
++            "lcm-precheck"
++          ]
++        }
++      ]
++    },
++    {
++      "sequence": 4,
++      "id": "upgrade-nsx",
++      "mechanism": "SDDC Manager lifecycle workflow",
++      "changes": [
++        {
++          "componentId": "NSX_MANAGER",
++          "fromVersion": "4.2.3.0.0-24866349",
++          "fromState": "present",
++          "targetVersion": "9.1.0.0",
++          "targetState": "present",
++          "gates": [
++            "sddc-manager-at-target",
++            "nsx-backup",
++            "interop-precheck"
++          ]
++        }
++      ]
++    },
++    {
++      "sequence": 5,
++      "id": "upgrade-vcenter",
++      "mechanism": "SDDC Manager lifecycle workflow",
++      "changes": [
++        {
++          "componentId": "VCENTER",
++          "fromVersion": "8.0.3.00600-24853646",
++          "fromState": "present",
++          "targetVersion": "9.1.0.0",
++          "targetState": "present",
++          "gates": [
++            "sddc-manager-at-target",
++            "nsx-at-target",
++            "vcenter-backup",
++            "lcm-precheck"
++          ]
++        }
++      ]
++    },
++    {
++      "sequence": 6,
++      "id": "upgrade-hosts-and-vsan",
++      "mechanism": "SDDC Manager sequential host lifecycle workflow",
++      "changes": [
++        {
++          "componentId": "ESXI",
++          "fromVersion": "8.0.3-24859861",
++          "fromState": "present",
++          "targetVersion": "9.1.0.0",
++          "targetState": "present",
++          "gates": [
++            "vcenter-at-target",
++            "nsx-at-target",
++            "cluster-health",
++            "lcm-precheck",
++            "sequential-evacuation-capacity"
++          ]
++        },
++        {
++          "componentId": "VSAN",
++          "fromVersion": "8.0.3-24022510",
++          "fromState": "present",
++          "targetVersion": "9.1.0.0",
++          "targetState": "present",
++          "gates": [
++            "vcenter-at-target",
++            "cluster-health",
++            "sequential-evacuation-capacity"
++          ]
++        }
++      ]
++    }
++  ],
++  "targetSddcSpec": {
++    "clusterSpec": {
++      "clusterName": "CHI01-MGMT01",
++      "datacenterName": "CHI01-DC01"
++    },
++    "datastoreSpec": {
++      "existingDatastoreName": "vsanDatastore"
++    },
++    "dnsSpec": {
++      "nameservers": [
++        "10.20.0.10",
++        "10.20.0.11"
++      ],
++      "subdomain": "mgmt.chi.example.com"
++    },
++    "hostSpecs": [
++      {
++        "hostname": "esx01"
++      },
++      {
++        "hostname": "esx02"
++      },
++      {
++        "hostname": "esx03"
++      },
++      {
++        "hostname": "esx04"
++      }
++    ],
++    "networkSpecs": [
++      {
++        "gateway": "10.20.0.1",
++        "mtu": 1500,
++        "networkType": "MANAGEMENT",
++        "subnet": "10.20.0.0/24",
++        "vlanId": 1100
++      },
++      {
++        "gateway": "10.20.1.1",
++        "includeIpAddressRanges": [
++          {
++            "endIpAddress": "10.20.1.104",
++            "startIpAddress": "10.20.1.101"
++          }
++        ],
++        "mtu": 9000,
++        "networkType": "VMOTION",
++        "subnet": "10.20.1.0/24",
++        "vlanId": 1101
++      },
++      {
++        "gateway": "10.20.2.1",
++        "includeIpAddressRanges": [
++          {
++            "endIpAddress": "10.20.2.104",
++            "startIpAddress": "10.20.2.101"
++          }
++        ],
++        "mtu": 9000,
++        "networkType": "VSAN",
++        "subnet": "10.20.2.0/24",
++        "vlanId": 1102
++      },
++      {
++        "gateway": "10.20.3.1",
++        "mtu": 1500,
++        "networkType": "VM_MANAGEMENT",
++        "subnet": "10.20.3.0/24",
++        "vlanId": 1103
++      }
++    ],
++    "nsxtSpec": {
++      "nsxtManagers": [
++        {
++          "hostname": "nsx01.mgmt.chi.example.com"
++        },
++        {
++          "hostname": "nsx02.mgmt.chi.example.com"
++        },
++        {
++          "hostname": "nsx03.mgmt.chi.example.com"
++        }
++      ],
++      "useExistingDeployment": true,
++      "version": "9.1.0.0",
++      "vipFqdn": "nsx-vip.mgmt.chi.example.com"
++    },
++    "ntpServers": [
++      "10.20.0.20",
++      "10.20.0.21"
++    ],
++    "sddcId": "chi01-m01",
++    "vcenterSpec": {
++      "rootVcenterPassword": "FixtureOnly!2345",
++      "useExistingDeployment": true,
++      "vcenterHostname": "vc01.mgmt.chi.example.com",
++      "version": "9.1.0.0"
++    },
++    "version": "9.1.0.0",
++    "workflowType": "VCF_COMPLETE"
++  }
++}
+diff --git a/research.md b/research.md
+new file mode 100644
+index 0000000..d8a8db0
+--- /dev/null
++++ b/research.md
+@@ -0,0 +1,10 @@
++# Research consulted
++
++Accessed 2026-08-14 against live, published sources:
++
++- [Broadcom KB 440630: Upgrade sequence and related issues for VCF 9.1](https://knowledge.broadcom.com/external/article/440630/upgrade-sequence-and-related-issues-for.html) — confirmed that VCF 5.2.x with SDDC Manager can move to 9.1 after VCF Operations, using lifecycle workflows.
++- [Broadcom KB 314608: Correlating VCF versions with component versions](https://knowledge.broadcom.com/external/article/314608/correlating-vmware-cloud-foundation-vers.html) — checked the VCF 5.2.2 source bill of materials used by the inventory.
++- [Broadcom KB 392993: Minimum ESXi hosts for a VCF management domain](https://knowledge.broadcom.com/external/article/392993/minimum-number-of-esxi-hosts-required-on.html) — confirmed four ESXi hosts for a single-AZ standard vSAN management cluster.
++- [Broadcom KB 430524: Brownfield imported-domain unsupported NSX path](https://knowledge.broadcom.com/external/article/430524/upgrading-a-brownfieldimported-domain-fa.html) — confirmed the documented unsupported NSX 4.2.3-to-9.0.1 brownfield example and the recommendation to wait for 9.1.
++- [Broadcom KB 410435: Unified VCF product release versioning](https://knowledge.broadcom.com/external/article/410435/unified-vcf-product-releases-versioning.html) — confirmed the unified 9.1.0.0 component-version convention used for target declarations.
++- [vmware/vcf-api-specs tag 9.1.0.0](https://github.com/vmware/vcf-api-specs/tree/9.1.0.0/specifications/vcf-installer) — checked the Apache-2.0 VCF Installer OpenAPI source and its `SddcSpec` definition.

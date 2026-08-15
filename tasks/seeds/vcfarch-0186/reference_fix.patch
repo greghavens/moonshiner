@@ -1,0 +1,1318 @@
+diff --git a/architecture/implementation.go b/architecture/implementation.go
+new file mode 100644
+index 0000000..b44952d
+--- /dev/null
++++ b/architecture/implementation.go
+@@ -0,0 +1,607 @@
++package architecture
++
++import (
++	"fmt"
++	"net/url"
++	"sort"
++	"strings"
++	"time"
++)
++
++func buildPlan(inv Inventory, snap CompatibilitySnapshot, research []ResearchReference) (Plan, error) {
++	target, ok := domainByID(inv.Domains, snap.TargetDomainID)
++	if !ok {
++		return Plan{}, fmt.Errorf("target domain %q is not inventoried", snap.TargetDomainID)
++	}
++
++	plan := Plan{
++		SchemaVersion: SchemaVersion,
++		EstateID:      inv.EstateID,
++		SnapshotID:    snap.SnapshotID,
++		Research:      research,
++		Placement: PlacementPlan{
++			DomainID:               target.ID,
++			HostCount:              target.HostCount,
++			FailuresToTolerate:     target.FailuresToTolerate,
++			ManagementDomainImpact: snap.Topology.ManagementDomainImpact,
++			PreservedDomains:       protectedDomainIDs(inv.Domains),
++		},
++	}
++	for _, profile := range snap.PlacementProfiles {
++		plan.Placement.Components = append(plan.Placement.Components, ComponentPlacement{
++			Component:        profile.Component,
++			Version:          profile.Version,
++			Nodes:            profile.Nodes,
++			VCPUPerNode:      profile.VCPUPerNode,
++			MemoryGiBPerNode: profile.MemoryGiBPerNode,
++			DiskGiBPerNode:   profile.DiskGiBPerNode,
++			AntiAffinity:     snap.Topology.RequireAntiAffinity,
++			Purpose:          profile.Purpose,
++		})
++	}
++
++	plan.Steps = append(plan.Steps,
++		Step{
++			Order:      1,
++			ID:         "protect-management-domain",
++			Kind:       "protect-management",
++			Actions:    []string{"Capture the management-domain health and inventory baseline; make no placement, lifecycle, network, or storage changes there."},
++			EntryGates: gates(snap.Foundation.ManagementEntryGates),
++			ExitGates:  gates(snap.Foundation.ManagementExitGates),
++		},
++		Step{
++			Order:      2,
++			ID:         "place-vcf-operations-stack",
++			Kind:       "place-targets",
++			Actions:    []string{"Deploy every sized target component on ops-wld01 and apply VM anti-affinity across its six hosts and fault domains."},
++			EntryGates: gates(snap.Foundation.PlacementEntryGates),
++			ExitGates:  gates(snap.Foundation.PlacementExitGates),
++		},
++	)
++
++	for _, source := range inv.Sources {
++		rule, ok := ruleForSource(source, snap.MigrationRules)
++		if !ok {
++			return Plan{}, fmt.Errorf("no compatibility rule for %s %s", source.Product, source.Version)
++		}
++		content, err := deriveContent(source, rule)
++		if err != nil {
++			return Plan{}, err
++		}
++		plan.Steps = append(plan.Steps, Step{
++			Order:           len(plan.Steps) + 1,
++			ID:              "migrate-" + source.ID,
++			Kind:            "migrate-product",
++			SourceID:        source.ID,
++			TargetComponent: rule.TargetComponent,
++			Actions:         migrationActions(source.ID),
++			EntryGates:      gates(rule.RequiredEntryGates),
++			ExitGates:       gates(rule.RequiredExitGates),
++			Migration: &MigrationPlan{
++				SourceProduct:   source.Product,
++				SourceVersion:   source.Version,
++				TargetComponent: rule.TargetComponent,
++				TargetVersion:   rule.TargetVersion,
++				Method:          rule.Method,
++				SourceEOGS:      rule.SourceEOGS,
++				SupportBoundary: rule.SupportBoundary,
++				Content:         content,
++				Rollback:        rollbackAction(source.ID),
++			},
++		})
++	}
++
++	plan.Steps = append(plan.Steps, Step{
++		Order:      len(plan.Steps) + 1,
++		ID:         "cut-over-integrated-services",
++		Kind:       "cutover",
++		Actions:    []string{"Switch collection, catalog access, API clients, integrations, and log senders to the validated VCF targets while preserving tested routes back to the sources."},
++		EntryGates: gates(snap.CutoverGates),
++		ExitGates:  gates([]string{"production-traffic-on-targets"}),
++	})
++	for _, source := range inv.Sources {
++		rule, _ := ruleForSource(source, snap.MigrationRules)
++		plan.Steps = append(plan.Steps, Step{
++			Order:           len(plan.Steps) + 1,
++			ID:              "retire-" + source.ID,
++			Kind:            "retire-source",
++			SourceID:        source.ID,
++			TargetComponent: rule.TargetComponent,
++			Actions:         []string{"After its rollback and retained-history window, remove the source registration and power off the source while retaining verified backups under the estate retention practice."},
++			EntryGates:      gates(snap.RetirementGates),
++			ExitGates:       gates([]string{"source-powered-off-and-registration-removed"}),
++		})
++	}
++
++	if err := validatePlan(plan, inv, snap); err != nil {
++		return Plan{}, err
++	}
++	return plan, nil
++}
++
++func validatePlan(plan Plan, inv Inventory, snap CompatibilitySnapshot) error {
++	if plan.SchemaVersion != SchemaVersion {
++		return fmt.Errorf("schema_version is %q, want %q", plan.SchemaVersion, SchemaVersion)
++	}
++	if plan.EstateID != inv.EstateID || plan.SnapshotID != snap.SnapshotID {
++		return fmt.Errorf("plan does not identify the fixture and pinned snapshot")
++	}
++	if err := validateResearch(plan.Research, inv, snap); err != nil {
++		return err
++	}
++	if snap.Topology.MinimumHostsRule != "2*ftt+1" {
++		return fmt.Errorf("unsupported topology rule %q", snap.Topology.MinimumHostsRule)
++	}
++	if plan.Placement.FailuresToTolerate < 0 {
++		return fmt.Errorf("failures_to_tolerate cannot be negative")
++	}
++	minimumHosts := 2*plan.Placement.FailuresToTolerate + 1
++	if plan.Placement.HostCount < minimumHosts {
++		return fmt.Errorf("failures_to_tolerate=%d requires at least %d hosts, got %d", plan.Placement.FailuresToTolerate, minimumHosts, plan.Placement.HostCount)
++	}
++	target, ok := domainByID(inv.Domains, snap.TargetDomainID)
++	if !ok || !target.AvailableForTargets || target.Role != "workload" {
++		return fmt.Errorf("snapshot target is not an available workload domain")
++	}
++	if plan.Placement.DomainID != target.ID {
++		return fmt.Errorf("targets must be placed on %s", target.ID)
++	}
++	if plan.Placement.HostCount != target.HostCount || plan.Placement.FailuresToTolerate != target.FailuresToTolerate {
++		return fmt.Errorf("plan topology does not match the target-domain inventory")
++	}
++	if plan.Placement.ManagementDomainImpact != snap.Topology.ManagementDomainImpact {
++		return fmt.Errorf("management domain impact must be %q", snap.Topology.ManagementDomainImpact)
++	}
++	if !sameStringSet(plan.Placement.PreservedDomains, protectedDomainIDs(inv.Domains)) {
++		return fmt.Errorf("all protected domains must be preserved")
++	}
++	if err := validatePlacements(plan.Placement.Components, snap); err != nil {
++		return err
++	}
++	return validateSteps(plan.Steps, inv, snap)
++}
++
++func validateResearch(research []ResearchReference, inv Inventory, snap CompatibilitySnapshot) error {
++	if len(research) == 0 {
++		return fmt.Errorf("research must include at least one Broadcom source")
++	}
++	for i, reference := range research {
++		if strings.TrimSpace(reference.Title) == "" || strings.TrimSpace(reference.URL) == "" || strings.TrimSpace(reference.AccessedAt) == "" {
++			return fmt.Errorf("research reference %d has incomplete metadata", i+1)
++		}
++		parsed, err := url.Parse(reference.URL)
++		if err != nil || (!strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https")) || parsed.User != nil || parsed.Hostname() == "" {
++			return fmt.Errorf("research reference %d must use an absolute Broadcom HTTP(S) URL", i+1)
++		}
++		host := strings.ToLower(parsed.Hostname())
++		if host != "broadcom.com" && !strings.HasSuffix(host, ".broadcom.com") {
++			return fmt.Errorf("research reference %d is not Broadcom-published", i+1)
++		}
++		accessed, err := time.Parse("2006-01-02", reference.AccessedAt)
++		if err != nil || accessed.Format("2006-01-02") != reference.AccessedAt || reference.AccessedAt < snap.AsOf {
++			return fmt.Errorf("research reference %d has an invalid or stale access date", i+1)
++		}
++		if len(reference.Claims) == 0 || hasBlank(reference.Claims) {
++			return fmt.Errorf("research reference %d must record nonblank claims", i+1)
++		}
++	}
++	for _, source := range inv.Sources {
++		rule, ok := ruleForSource(source, snap.MigrationRules)
++		if !ok {
++			return fmt.Errorf("no compatibility rule for %s %s", source.Product, source.Version)
++		}
++		versionCovered, lifecycleCovered := false, false
++		for _, reference := range research {
++			text := reference.Title + " " + strings.Join(reference.Claims, " ")
++			if strings.Contains(text, source.Version) {
++				versionCovered = true
++				if strings.Contains(text, rule.SourceEOGS) {
++					lifecycleCovered = true
++				}
++			}
++		}
++		if !versionCovered || !lifecycleCovered {
++			return fmt.Errorf("research does not cover exact source version and lifecycle boundary for %s %s", source.Product, source.Version)
++		}
++	}
++	return nil
++}
++
++func validatePlacements(actual []ComponentPlacement, snap CompatibilitySnapshot) error {
++	if len(actual) != len(snap.PlacementProfiles) {
++		return fmt.Errorf("placement has %d components, want %d", len(actual), len(snap.PlacementProfiles))
++	}
++	byComponent := make(map[string]ComponentPlacement, len(actual))
++	for _, placement := range actual {
++		if _, duplicate := byComponent[placement.Component]; duplicate {
++			return fmt.Errorf("duplicate placement for %s", placement.Component)
++		}
++		byComponent[placement.Component] = placement
++	}
++	for _, profile := range snap.PlacementProfiles {
++		got, ok := byComponent[profile.Component]
++		if !ok {
++			return fmt.Errorf("missing placement for %s", profile.Component)
++		}
++		if got.Version != profile.Version || got.Nodes != profile.Nodes || got.VCPUPerNode != profile.VCPUPerNode || got.MemoryGiBPerNode != profile.MemoryGiBPerNode || got.DiskGiBPerNode != profile.DiskGiBPerNode || got.Purpose != profile.Purpose {
++			return fmt.Errorf("placement for %s does not match its pinned sizing profile", profile.Component)
++		}
++		if got.AntiAffinity != snap.Topology.RequireAntiAffinity {
++			return fmt.Errorf("placement for %s has the wrong anti-affinity setting", profile.Component)
++		}
++	}
++	return nil
++}
++
++func validateSteps(steps []Step, inv Inventory, snap CompatibilitySnapshot) error {
++	seenIDs := map[string]bool{}
++	migrationOrder := map[string]int{}
++	retirementOrder := map[string]int{}
++	guardOrder, placementOrder, cutoverOrder := 0, 0, 0
++	for i, step := range steps {
++		if step.Order != i+1 {
++			return fmt.Errorf("step order must be contiguous at position %d", i+1)
++		}
++		if step.ID == "" || seenIDs[step.ID] {
++			return fmt.Errorf("step IDs must be nonempty and unique")
++		}
++		seenIDs[step.ID] = true
++		if len(step.Actions) == 0 || hasBlank(step.Actions) {
++			return fmt.Errorf("step %s must contain concrete actions", step.ID)
++		}
++		if err := validateRequiredGates(step.EntryGates, nil, step.ID+" entry"); err != nil {
++			return err
++		}
++		if err := validateRequiredGates(step.ExitGates, nil, step.ID+" exit"); err != nil {
++			return err
++		}
++		switch step.Kind {
++		case "protect-management":
++			if guardOrder != 0 {
++				return fmt.Errorf("multiple management protection steps")
++			}
++			guardOrder = step.Order
++			if err := validateRequiredGates(step.EntryGates, snap.Foundation.ManagementEntryGates, step.ID); err != nil {
++				return err
++			}
++			if err := validateRequiredGates(step.ExitGates, snap.Foundation.ManagementExitGates, step.ID); err != nil {
++				return err
++			}
++		case "place-targets":
++			if placementOrder != 0 {
++				return fmt.Errorf("multiple target placement steps")
++			}
++			placementOrder = step.Order
++			if err := validateRequiredGates(step.EntryGates, snap.Foundation.PlacementEntryGates, step.ID); err != nil {
++				return err
++			}
++			if err := validateRequiredGates(step.ExitGates, snap.Foundation.PlacementExitGates, step.ID); err != nil {
++				return err
++			}
++		case "migrate-product":
++			if migrationOrder[step.SourceID] != 0 {
++				return fmt.Errorf("duplicate migration for %s", step.SourceID)
++			}
++			migrationOrder[step.SourceID] = step.Order
++			if err := validateMigrationStep(step, inv, snap); err != nil {
++				return err
++			}
++		case "cutover":
++			if cutoverOrder != 0 {
++				return fmt.Errorf("multiple cutover steps")
++			}
++			cutoverOrder = step.Order
++			if err := validateRequiredGates(step.EntryGates, snap.CutoverGates, step.ID); err != nil {
++				return err
++			}
++		case "retire-source":
++			if retirementOrder[step.SourceID] != 0 {
++				return fmt.Errorf("duplicate retirement for %s", step.SourceID)
++			}
++			retirementOrder[step.SourceID] = step.Order
++			if step.Migration != nil {
++				return fmt.Errorf("retirement %s must not embed a migration", step.ID)
++			}
++			if err := validateRequiredGates(step.EntryGates, snap.RetirementGates, step.ID); err != nil {
++				return err
++			}
++		default:
++			return fmt.Errorf("step %s has unsupported kind %q", step.ID, step.Kind)
++		}
++	}
++	if guardOrder == 0 || placementOrder == 0 || cutoverOrder == 0 || !(guardOrder < placementOrder) {
++		return fmt.Errorf("management protection, placement, and cutover steps are required in order")
++	}
++	for _, source := range inv.Sources {
++		migration := migrationOrder[source.ID]
++		retirement := retirementOrder[source.ID]
++		if migration == 0 || retirement == 0 {
++			return fmt.Errorf("%s requires one migration and one retirement step", source.ID)
++		}
++		if migration <= placementOrder || migration >= cutoverOrder || retirement <= cutoverOrder {
++			return fmt.Errorf("%s has an invalid placement/migration/cutover/retirement sequence", source.ID)
++		}
++		rule, _ := ruleForSource(source, snap.MigrationRules)
++		retireStep := steps[retirement-1]
++		if retireStep.TargetComponent != rule.TargetComponent {
++			return fmt.Errorf("retirement for %s names the wrong target", source.ID)
++		}
++	}
++	for _, dependency := range snap.Dependencies {
++		before, beforeOK := migrationOrder[dependency.BeforeSourceID]
++		after, afterOK := migrationOrder[dependency.AfterSourceID]
++		if !beforeOK || !afterOK || before >= after {
++			return fmt.Errorf("migration dependency %s before %s is not satisfied", dependency.BeforeSourceID, dependency.AfterSourceID)
++		}
++	}
++	return nil
++}
++
++func validateMigrationStep(step Step, inv Inventory, snap CompatibilitySnapshot) error {
++	source, ok := sourceByID(inv.Sources, step.SourceID)
++	if !ok {
++		return fmt.Errorf("migration %s names an unknown source", step.ID)
++	}
++	rule, ok := ruleForSource(source, snap.MigrationRules)
++	if !ok {
++		return fmt.Errorf("migration %s has no pinned rule", step.ID)
++	}
++	if step.Migration == nil {
++		return fmt.Errorf("migration %s has no migration detail", step.ID)
++	}
++	m := step.Migration
++	if step.TargetComponent != rule.TargetComponent || m.SourceProduct != source.Product || m.SourceVersion != source.Version || m.TargetComponent != rule.TargetComponent || m.TargetVersion != rule.TargetVersion || m.Method != rule.Method || m.SourceEOGS != rule.SourceEOGS || m.SupportBoundary != rule.SupportBoundary {
++		return fmt.Errorf("migration %s contradicts its pinned product, version, method, target, or support boundary", step.ID)
++	}
++	if strings.TrimSpace(m.Rollback) == "" {
++		return fmt.Errorf("migration %s has no rollback preservation", step.ID)
++	}
++	if err := validateRequiredGates(step.EntryGates, rule.RequiredEntryGates, step.ID); err != nil {
++		return err
++	}
++	if err := validateRequiredGates(step.ExitGates, rule.RequiredExitGates, step.ID); err != nil {
++		return err
++	}
++	return validateContent(m.Content, source, rule)
++}
++
++func validateContent(actual []ContentDecision, source SourceSystem, rule MigrationRule) error {
++	if len(actual) != len(source.Content) || len(rule.ContentRules) != len(source.Content) {
++		return fmt.Errorf("content coverage for %s is incomplete", source.ID)
++	}
++	rules := make(map[string]ContentRule, len(rule.ContentRules))
++	for _, contentRule := range rule.ContentRules {
++		rules[contentRule.Category] = contentRule
++	}
++	seen := map[string]bool{}
++	for _, decision := range actual {
++		quantity, ok := source.Content[decision.Category]
++		contentRule, hasRule := rules[decision.Category]
++		if !ok || !hasRule || seen[decision.Category] {
++			return fmt.Errorf("content category %q is unexpected or duplicated for %s", decision.Category, source.ID)
++		}
++		seen[decision.Category] = true
++		if decision.SourceQuantity != quantity || decision.CarryQuantity+decision.AbandonQuantity != quantity {
++			return fmt.Errorf("content quantities for %s/%s do not reconcile", source.ID, decision.Category)
++		}
++		wantCarry, wantAbandon := expectedDisposition(quantity, contentRule)
++		if decision.CarryQuantity != wantCarry || decision.AbandonQuantity != wantAbandon || decision.CarryMethod != contentRule.CarryMethod || decision.AbandonReason != contentRule.AbandonReason {
++			return fmt.Errorf("content disposition for %s/%s contradicts the pinned snapshot", source.ID, decision.Category)
++		}
++	}
++	return nil
++}
++
++func deriveContent(source SourceSystem, rule MigrationRule) ([]ContentDecision, error) {
++	rules := make(map[string]ContentRule, len(rule.ContentRules))
++	for _, contentRule := range rule.ContentRules {
++		rules[contentRule.Category] = contentRule
++	}
++	categories := make([]string, 0, len(source.Content))
++	for category := range source.Content {
++		categories = append(categories, category)
++	}
++	sort.Strings(categories)
++	decisions := make([]ContentDecision, 0, len(categories))
++	for _, category := range categories {
++		contentRule, ok := rules[category]
++		if !ok {
++			return nil, fmt.Errorf("no content rule for %s/%s", source.ID, category)
++		}
++		quantity := source.Content[category]
++		carry, abandon := expectedDisposition(quantity, contentRule)
++		decisions = append(decisions, ContentDecision{
++			Category:        category,
++			SourceQuantity:  quantity,
++			CarryQuantity:   carry,
++			AbandonQuantity: abandon,
++			CarryMethod:     contentRule.CarryMethod,
++			AbandonReason:   contentRule.AbandonReason,
++		})
++	}
++	return decisions, nil
++}
++
++func expectedDisposition(quantity int, rule ContentRule) (carry, abandon int) {
++	switch rule.Disposition {
++	case "carry":
++		return quantity, 0
++	case "abandon":
++		return 0, quantity
++	case "split":
++		carry = quantity
++		if carry > rule.MaxCarry {
++			carry = rule.MaxCarry
++		}
++		return carry, quantity - carry
++	default:
++		return -1, quantity + 1
++	}
++}
++
++func validateRequiredGates(actual []Gate, required []string, context string) error {
++	if len(actual) == 0 {
++		return fmt.Errorf("%s must have at least one technical gate", context)
++	}
++	names := make(map[string]bool, len(actual))
++	for _, gate := range actual {
++		if strings.TrimSpace(gate.Name) == "" || strings.TrimSpace(gate.Evidence) == "" || names[gate.Name] {
++			return fmt.Errorf("%s has a blank or duplicate gate without evidence", context)
++		}
++		names[gate.Name] = true
++	}
++	for _, name := range required {
++		if !names[name] {
++			return fmt.Errorf("%s is missing required gate %q", context, name)
++		}
++	}
++	return nil
++}
++
++func gates(names []string) []Gate {
++	result := make([]Gate, 0, len(names))
++	for _, name := range names {
++		result = append(result, Gate{Name: name, Evidence: gateEvidence(name)})
++	}
++	return result
++}
++
++func gateEvidence(name string) string {
++	evidence := map[string]string{
++		"management-domain-health-baselined":          "SDDC Manager, vCenter, NSX, vSAN, alarms, tasks, and all four management hosts are healthy in the recorded baseline.",
++		"management-domain-inventory-unchanged":       "A post-placement inventory diff shows no management-domain VM, host, network, storage, or lifecycle change.",
++		"ops-wld01-capacity-network-dns-ntp-ready":    "Six healthy hosts, FTT=2 storage capacity, routable VLANs, forward/reverse DNS, NTP, certificates, and VIPs pass preflight.",
++		"all-target-nodes-anti-affinity-compliant":    "Every multi-node component is spread across distinct ops-wld01 hosts and available fault domains.",
++		"offline-backup-restorable":                   "An offline source backup is checksum-verified and a restore rehearsal reaches product health checks.",
++		"content-export-checksummed":                  "All export bundles are inventoried and their stored checksums match a second calculation.",
++		"target-management-packs-compatible":          "Each required adapter or management pack is present at a version supported by VCF Operations 9.0.2.",
++		"adapter-collection-green":                    "All nine recreated adapter instances collect successfully through both cloud proxies for two collection cycles.",
++		"content-counts-reconciled":                   "Target counts and export manifests reconcile for every carried content category.",
++		"source-metrics-read-only":                    "The 8.18.6 source is isolated from collection changes and remains read-only for its 400-day metric history.",
++		"fleet-management-online":                     "VCF Operations Fleet Management 9.0.2 reports healthy lifecycle connectivity to all target components.",
++		"source-services-healthy":                     "All Aria Automation 8.18.1 Kubernetes services and embedded Orchestrator services are healthy before import.",
++		"identity-broker-ready":                       "Three VCF Identity Broker nodes authenticate test users and groups with redundant directory connectivity.",
++		"leaf-certificate-only":                       "The Automation web certificate import contains the leaf certificate only and its trust chain validates separately.",
++		"deployments-reconciled":                      "All 280 active deployments retain ownership, resources, state, and Day-2 action availability.",
++		"catalog-smoke-tests-pass":                    "Representative templates and custom forms request, provision, lease, and destroy a canary workload.",
++		"identity-login-pass":                         "Administrator and consumer test identities log in through VCF Identity Broker with expected roles.",
++		"orchestrator-workflows-pass":                 "The five carried Orchestrator packages validate and representative workflows complete against nonproduction inputs.",
++		"parallel-cluster-healthy":                    "The three-node VCF Operations for Logs 9.0.2 cluster is healthy in parallel without changing source ingestion.",
++		"source-backup-restorable":                    "The Logs source configuration and data backup is checksum-verified and passes a restore rehearsal.",
++		"ninety-day-transfer-window-confirmed":        "A dry-run inventory limits the supported historical transfer to the newest 90 of 365 days.",
++		"tls-trust-ready":                             "VIP, node, syslog, API, and 8.18 agent TLS chains validate from representative senders.",
++		"ingest-rate-sustained":                       "The target sustains at least 420 GiB/day with balanced nodes and no ingestion backlog for 72 hours.",
++		"agents-reporting":                            "All 630 repointed 8.18 agents report through the new trusted endpoint.",
++		"older-history-read-only":                     "The source remains read-only and queryable for the 275 days outside the transfer window.",
++		"all-target-service-checks-pass":              "Operations collection, Automation provisioning, identity, and Logs ingestion acceptance suites all pass.",
++		"management-domain-baseline-unchanged":        "The final management-domain inventory and health diff matches the initial baseline.",
++		"rollback-routes-tested":                      "DNS, VIP, integration, agent, and client rollback routes to each preserved source are rehearsed.",
++		"production-traffic-on-targets":               "Monitoring shows production collection, requests, API traffic, and log ingestion arriving only at intended targets.",
++		"target-slos-sustained":                       "Target health, capacity, latency, collection, provisioning, and ingestion SLOs remain green for the retention window.",
++		"exports-and-backups-verified":                "Final export manifests and backups retain matching checksums in the recovery store.",
++		"source-retention-window-expired":             "The documented rollback and read-only history retention period has elapsed with no unresolved target defect.",
++		"source-powered-off-and-registration-removed": "Fleet and integration inventories omit the source, the source is powered off, and its recoverable backup remains cataloged.",
++	}
++	if value, ok := evidence[name]; ok {
++		return value
++	}
++	return "Recorded technical evidence demonstrates that " + name + " is satisfied."
++}
++
++func migrationActions(sourceID string) []string {
++	switch sourceID {
++	case "aria-operations-prod":
++		return []string{
++			"Deploy VCF Operations 9.0.2 greenfield because 8.18.6 is excluded from the in-place 9.0.0-9.0.2 path.",
++			"Export and import supported custom content, recreate the nine adapters through redundant cloud proxies, and retain 8.18.6 read-only for historical metrics.",
++		}
++	case "aria-automation-prod":
++		return []string{
++			"Enable VCF Identity Broker, import the healthy Aria Automation 8.18.1 instance from Aria Suite Lifecycle into Fleet Management, and trigger the 9.0.2 upgrade.",
++			"Reconcile carried deployments and content, replace legacy vIDM configuration, and exercise catalog, identity, and Orchestrator canaries.",
++		}
++	case "aria-logs-prod":
++		return []string{
++			"Run the new VCF Operations for Logs 9.0.2 cluster beside 8.18.3; export/import content and reconfigure all integrations on the target.",
++			"Transfer the newest 90 days, retain the older 275 days read-only, and repoint the 630 compatible 8.18 agents with explicit TLS trust.",
++		}
++	default:
++		return []string{"Execute the pinned migration method and reconcile all carried and abandoned content."}
++	}
++}
++
++func rollbackAction(sourceID string) string {
++	switch sourceID {
++	case "aria-operations-prod":
++		return "Keep 8.18.6 powered, isolated from new writes, and queryable; restore original adapter routes if target collection or content validation fails."
++	case "aria-automation-prod":
++		return "Keep the offline 8.18.1 backup and original VIP/DNS values; on failed import, restore source services and route users and API clients back before retrying Fleet import."
++	case "aria-logs-prod":
++		return "Keep 8.18.3 ingesting until target acceptance; restore integration endpoints and agent destinations to the source VIP if target ingestion, content, or history checks fail."
++	default:
++		return "Preserve the source and its verified backup until target acceptance and the rollback window complete."
++	}
++}
++
++func domainByID(domains []Domain, id string) (Domain, bool) {
++	for _, domain := range domains {
++		if domain.ID == id {
++			return domain, true
++		}
++	}
++	return Domain{}, false
++}
++
++func sourceByID(sources []SourceSystem, id string) (SourceSystem, bool) {
++	for _, source := range sources {
++		if source.ID == id {
++			return source, true
++		}
++	}
++	return SourceSystem{}, false
++}
++
++func ruleForSource(source SourceSystem, rules []MigrationRule) (MigrationRule, bool) {
++	for _, rule := range rules {
++		if rule.SourceProduct == source.Product && rule.SourceVersion == source.Version {
++			return rule, true
++		}
++	}
++	return MigrationRule{}, false
++}
++
++func protectedDomainIDs(domains []Domain) []string {
++	var result []string
++	for _, domain := range domains {
++		if domain.Protected {
++			result = append(result, domain.ID)
++		}
++	}
++	sort.Strings(result)
++	return result
++}
++
++func sameStringSet(left, right []string) bool {
++	if len(left) != len(right) {
++		return false
++	}
++	leftCopy := append([]string(nil), left...)
++	rightCopy := append([]string(nil), right...)
++	sort.Strings(leftCopy)
++	sort.Strings(rightCopy)
++	for i := range leftCopy {
++		if leftCopy[i] != rightCopy[i] {
++			return false
++		}
++	}
++	return true
++}
++
++func hasBlank(values []string) bool {
++	for _, value := range values {
++		if strings.TrimSpace(value) == "" {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/architecture/migration_plan.json b/architecture/migration_plan.json
+new file mode 100644
+index 0000000..79d4cf6
+--- /dev/null
++++ b/architecture/migration_plan.json
+@@ -0,0 +1,638 @@
++{
++  "schema_version": "vcf-migration-plan/v1",
++  "estate_id": "northstar-vcf-fleet",
++  "snapshot_id": "broadcom-vcf-9.0.2-2026-05-14",
++  "research": [
++    {
++      "title": "Upgrade of Aria Operations 8.18.6 or 8.18.7 to VCF Operations 9.0.x is Unsupported",
++      "url": "https://knowledge.broadcom.com/external/article/438994",
++      "accessed_at": "2026-08-15",
++      "claims": [
++        "Direct PAK or Suite Lifecycle upgrades from 8.18.6 to 9.0.0-9.0.2 are unsupported; greenfield export/import carries custom content but not historical time-series metrics."
++      ]
++    },
++    {
++      "title": "Import and upgrade VMware Aria Automation 8.x to VCF Automation 9.0",
++      "url": "https://knowledge.broadcom.com/external/article/433806",
++      "accessed_at": "2026-08-15",
++      "claims": [
++        "The article's 8.x scope includes the inventoried Aria Automation 8.18.1 instance: import it from Aria Suite Lifecycle into VCF Operations Fleet Management before triggering the VCF Automation upgrade."
++      ]
++    },
++    {
++      "title": "Upgrade Guidance for Aria Operations for Logs 8.18.x to VCF Operations for Logs 9.0.x",
++      "url": "https://knowledge.broadcom.com/external/article/402314",
++      "accessed_at": "2026-08-15",
++      "claims": [
++        "The article's 8.18.x scope includes the inventoried Aria Operations for Logs 8.18.3 source: use a fresh parallel 9.0.x deployment, reconfigure integrations, and transfer no more than 90 days of log data."
++      ]
++    },
++    {
++      "title": "End of General Support for VMware Aria Operations 8.18",
++      "url": "https://knowledge.broadcom.com/external/article/422643",
++      "accessed_at": "2026-08-15",
++      "claims": [
++        "Broadcom lists 2027-10-11 as the Aria Operations 8.18 end-of-general-support boundary, which covers the exact inventoried 8.18.6 source."
++      ]
++    },
++    {
++      "title": "Build numbers and versions for VMware Aria Automation",
++      "url": "https://knowledge.broadcom.com/external/article/318130",
++      "accessed_at": "2026-08-15",
++      "claims": [
++        "Broadcom lists 2027-10-11 as the exact Aria Automation 8.18.1 end-of-general-support boundary."
++      ]
++    },
++    {
++      "title": "Build numbers and versions of VMware Aria Operations for Logs",
++      "url": "https://knowledge.broadcom.com/external/article?legacyId=89907",
++      "accessed_at": "2026-08-15",
++      "claims": [
++        "Broadcom's version table identifies the exact Aria Operations for Logs 8.18.3 release and build 24515748."
++      ]
++    },
++    {
++      "title": "Product Lifecycle matrix for Aria Suite",
++      "url": "https://knowledge.broadcom.com/external/article/381187/product-lifecycle-matrix-for-aria-suite.html",
++      "accessed_at": "2026-08-15",
++      "claims": [
++        "Broadcom directs lifecycle research for Aria Operations for Logs to the Aria Suite matrix as a distinct product description. The static article does not expose an 8.18.3 date, so the plan preserves the pinned 2027-10-11 boundary for the exact Logs 8.18.3 source instead of inferring it from another suite component."
++      ]
++    },
++    {
++      "title": "Set up VCF Identity Broker and VCF Logs in VMware Cloud Foundation 9.0",
++      "url": "https://knowledge.broadcom.com/external/article/433807/set-up-vcf-identity-broker-and-vcf-logs.html",
++      "accessed_at": "2026-08-15",
++      "claims": [
++        "Broadcom says legacy VMware Identity Manager from the Aria 8.x architecture is unsupported in VCF 9.x and must be replaced with VCF Identity Broker; it also independently confirms that Logs 8.x needs a fresh 9.0 installation."
++      ]
++    },
++    {
++      "title": "The Windows agent is not available to download from within VCF Operations for Logs 9.0.x",
++      "url": "https://knowledge.broadcom.com/external/article/402647/the-windows-agent-is-not-available-when.html",
++      "accessed_at": "2026-08-15",
++      "claims": [
++        "Broadcom documents that 8.18.x Logs agents remain compatible with VCF Operations for Logs 9.0.x but do not automatically trust the new endpoint, supporting explicit TLS trust configuration when repointing the inventoried agents."
++      ]
++    }
++  ],
++  "placement": {
++    "domain_id": "ops-wld01",
++    "host_count": 6,
++    "failures_to_tolerate": 2,
++    "management_domain_impact": "none",
++    "preserved_domains": [
++      "management-domain"
++    ],
++    "components": [
++      {
++        "component": "VCF Operations Fleet Management",
++        "version": "9.0.2",
++        "nodes": 1,
++        "vcpu_per_node": 4,
++        "memory_gib_per_node": 16,
++        "disk_gib_per_node": 274,
++        "anti_affinity": true,
++        "purpose": "fleet lifecycle control plane"
++      },
++      {
++        "component": "VCF Operations",
++        "version": "9.0.2",
++        "nodes": 3,
++        "vcpu_per_node": 16,
++        "memory_gib_per_node": 64,
++        "disk_gib_per_node": 1200,
++        "anti_affinity": true,
++        "purpose": "analytics cluster for 52000 managed objects"
++      },
++      {
++        "component": "VCF Operations Cloud Proxy",
++        "version": "9.0.2",
++        "nodes": 2,
++        "vcpu_per_node": 4,
++        "memory_gib_per_node": 16,
++        "disk_gib_per_node": 100,
++        "anti_affinity": true,
++        "purpose": "redundant collection from fleet workload domains"
++      },
++      {
++        "component": "VCF Identity Broker",
++        "version": "9.0.2",
++        "nodes": 3,
++        "vcpu_per_node": 8,
++        "memory_gib_per_node": 16,
++        "disk_gib_per_node": 100,
++        "anti_affinity": true,
++        "purpose": "replacement identity source for VCF Automation"
++      },
++      {
++        "component": "VCF Automation",
++        "version": "9.0.2",
++        "nodes": 3,
++        "vcpu_per_node": 12,
++        "memory_gib_per_node": 48,
++        "disk_gib_per_node": 245,
++        "anti_affinity": true,
++        "purpose": "automation cluster for 45 concurrent jobs"
++      },
++      {
++        "component": "VCF Operations for Logs",
++        "version": "9.0.2",
++        "nodes": 3,
++        "vcpu_per_node": 16,
++        "memory_gib_per_node": 32,
++        "disk_gib_per_node": 2048,
++        "anti_affinity": true,
++        "purpose": "log cluster for 420 GiB daily ingest"
++      }
++    ]
++  },
++  "steps": [
++    {
++      "order": 1,
++      "id": "protect-management-domain",
++      "kind": "protect-management",
++      "actions": [
++        "Capture the management-domain health and inventory baseline; make no placement, lifecycle, network, or storage changes there."
++      ],
++      "entry_gates": [
++        {
++          "name": "management-domain-health-baselined",
++          "evidence": "SDDC Manager, vCenter, NSX, vSAN, alarms, tasks, and all four management hosts are healthy in the recorded baseline."
++        }
++      ],
++      "exit_gates": [
++        {
++          "name": "management-domain-inventory-unchanged",
++          "evidence": "A post-placement inventory diff shows no management-domain VM, host, network, storage, or lifecycle change."
++        }
++      ]
++    },
++    {
++      "order": 2,
++      "id": "place-vcf-operations-stack",
++      "kind": "place-targets",
++      "actions": [
++        "Deploy every sized target component on ops-wld01 and apply VM anti-affinity across its six hosts and fault domains."
++      ],
++      "entry_gates": [
++        {
++          "name": "ops-wld01-capacity-network-dns-ntp-ready",
++          "evidence": "Six healthy hosts, FTT=2 storage capacity, routable VLANs, forward/reverse DNS, NTP, certificates, and VIPs pass preflight."
++        }
++      ],
++      "exit_gates": [
++        {
++          "name": "all-target-nodes-anti-affinity-compliant",
++          "evidence": "Every multi-node component is spread across distinct ops-wld01 hosts and available fault domains."
++        }
++      ]
++    },
++    {
++      "order": 3,
++      "id": "migrate-aria-operations-prod",
++      "kind": "migrate-product",
++      "source_id": "aria-operations-prod",
++      "target_component": "VCF Operations",
++      "actions": [
++        "Deploy VCF Operations 9.0.2 greenfield because 8.18.6 is excluded from the in-place 9.0.0-9.0.2 path.",
++        "Export and import supported custom content, recreate the nine adapters through redundant cloud proxies, and retain 8.18.6 read-only for historical metrics."
++      ],
++      "entry_gates": [
++        {
++          "name": "offline-backup-restorable",
++          "evidence": "An offline source backup is checksum-verified and a restore rehearsal reaches product health checks."
++        },
++        {
++          "name": "content-export-checksummed",
++          "evidence": "All export bundles are inventoried and their stored checksums match a second calculation."
++        },
++        {
++          "name": "target-management-packs-compatible",
++          "evidence": "Each required adapter or management pack is present at a version supported by VCF Operations 9.0.2."
++        }
++      ],
++      "exit_gates": [
++        {
++          "name": "adapter-collection-green",
++          "evidence": "All nine recreated adapter instances collect successfully through both cloud proxies for two collection cycles."
++        },
++        {
++          "name": "content-counts-reconciled",
++          "evidence": "Target counts and export manifests reconcile for every carried content category."
++        },
++        {
++          "name": "source-metrics-read-only",
++          "evidence": "The 8.18.6 source is isolated from collection changes and remains read-only for its 400-day metric history."
++        }
++      ],
++      "migration": {
++        "source_product": "VMware Aria Operations",
++        "source_version": "8.18.6",
++        "target_component": "VCF Operations",
++        "target_version": "9.0.2",
++        "method": "greenfield-export-import",
++        "source_eogs": "2027-10-11",
++        "support_boundary": "8.18.6 and 8.18.7 cannot be upgraded in place to VCF Operations 9.0.0 through 9.0.2; use a greenfield 9.0.2 cluster and content export/import",
++        "content": [
++          {
++            "category": "adapter_instances",
++            "source_quantity": 9,
++            "carry_quantity": 9,
++            "abandon_quantity": 0,
++            "carry_method": "recreate-and-validate"
++          },
++          {
++            "category": "custom_dashboards",
++            "source_quantity": 42,
++            "carry_quantity": 42,
++            "abandon_quantity": 0,
++            "carry_method": "export-import"
++          },
++          {
++            "category": "custom_policies",
++            "source_quantity": 6,
++            "carry_quantity": 6,
++            "abandon_quantity": 0,
++            "carry_method": "export-import"
++          },
++          {
++            "category": "custom_reports",
++            "source_quantity": 11,
++            "carry_quantity": 11,
++            "abandon_quantity": 0,
++            "carry_method": "export-import"
++          },
++          {
++            "category": "custom_views",
++            "source_quantity": 18,
++            "carry_quantity": 18,
++            "abandon_quantity": 0,
++            "carry_method": "export-import"
++          },
++          {
++            "category": "historical_metrics_days",
++            "source_quantity": 400,
++            "carry_quantity": 0,
++            "abandon_quantity": 400,
++            "abandon_reason": "historical time-series metrics cannot be imported into a greenfield cluster; retain the source read-only for the required history window"
++          },
++          {
++            "category": "super_metrics",
++            "source_quantity": 27,
++            "carry_quantity": 27,
++            "abandon_quantity": 0,
++            "carry_method": "export-import"
++          }
++        ],
++        "rollback": "Keep 8.18.6 powered, isolated from new writes, and queryable; restore original adapter routes if target collection or content validation fails."
++      }
++    },
++    {
++      "order": 4,
++      "id": "migrate-aria-automation-prod",
++      "kind": "migrate-product",
++      "source_id": "aria-automation-prod",
++      "target_component": "VCF Automation",
++      "actions": [
++        "Enable VCF Identity Broker, import the healthy Aria Automation 8.18.1 instance from Aria Suite Lifecycle into Fleet Management, and trigger the 9.0.2 upgrade.",
++        "Reconcile carried deployments and content, replace legacy vIDM configuration, and exercise catalog, identity, and Orchestrator canaries."
++      ],
++      "entry_gates": [
++        {
++          "name": "fleet-management-online",
++          "evidence": "VCF Operations Fleet Management 9.0.2 reports healthy lifecycle connectivity to all target components."
++        },
++        {
++          "name": "source-services-healthy",
++          "evidence": "All Aria Automation 8.18.1 Kubernetes services and embedded Orchestrator services are healthy before import."
++        },
++        {
++          "name": "offline-backup-restorable",
++          "evidence": "An offline source backup is checksum-verified and a restore rehearsal reaches product health checks."
++        },
++        {
++          "name": "identity-broker-ready",
++          "evidence": "Three VCF Identity Broker nodes authenticate test users and groups with redundant directory connectivity."
++        },
++        {
++          "name": "leaf-certificate-only",
++          "evidence": "The Automation web certificate import contains the leaf certificate only and its trust chain validates separately."
++        }
++      ],
++      "exit_gates": [
++        {
++          "name": "deployments-reconciled",
++          "evidence": "All 280 active deployments retain ownership, resources, state, and Day-2 action availability."
++        },
++        {
++          "name": "catalog-smoke-tests-pass",
++          "evidence": "Representative templates and custom forms request, provision, lease, and destroy a canary workload."
++        },
++        {
++          "name": "identity-login-pass",
++          "evidence": "Administrator and consumer test identities log in through VCF Identity Broker with expected roles."
++        },
++        {
++          "name": "orchestrator-workflows-pass",
++          "evidence": "The five carried Orchestrator packages validate and representative workflows complete against nonproduction inputs."
++        }
++      ],
++      "migration": {
++        "source_product": "VMware Aria Automation",
++        "source_version": "8.18.1",
++        "target_component": "VCF Automation",
++        "target_version": "9.0.2",
++        "method": "fleet-import-upgrade",
++        "source_eogs": "2027-10-11",
++        "support_boundary": "import the 8.18.1 instance from Aria Suite Lifecycle into VCF Operations Fleet Management before triggering the VCF Automation 9.0.2 upgrade; legacy vIDM is replaced",
++        "content": [
++          {
++            "category": "active_deployments",
++            "source_quantity": 280,
++            "carry_quantity": 280,
++            "abandon_quantity": 0,
++            "carry_method": "fleet-import-upgrade"
++          },
++          {
++            "category": "cloud_accounts",
++            "source_quantity": 4,
++            "carry_quantity": 4,
++            "abandon_quantity": 0,
++            "carry_method": "fleet-import-upgrade"
++          },
++          {
++            "category": "cloud_templates",
++            "source_quantity": 36,
++            "carry_quantity": 36,
++            "abandon_quantity": 0,
++            "carry_method": "fleet-import-upgrade"
++          },
++          {
++            "category": "cloud_zones",
++            "source_quantity": 7,
++            "carry_quantity": 7,
++            "abandon_quantity": 0,
++            "carry_method": "fleet-import-upgrade"
++          },
++          {
++            "category": "custom_forms",
++            "source_quantity": 14,
++            "carry_quantity": 14,
++            "abandon_quantity": 0,
++            "carry_method": "fleet-import-upgrade"
++          },
++          {
++            "category": "identity_provider_configuration",
++            "source_quantity": 1,
++            "carry_quantity": 0,
++            "abandon_quantity": 1,
++            "abandon_reason": "legacy VMware Identity Manager is unsupported in the VCF 9 architecture and is replaced by VCF Identity Broker"
++          },
++          {
++            "category": "projects",
++            "source_quantity": 12,
++            "carry_quantity": 12,
++            "abandon_quantity": 0,
++            "carry_method": "fleet-import-upgrade"
++          },
++          {
++            "category": "subscriptions",
++            "source_quantity": 9,
++            "carry_quantity": 9,
++            "abandon_quantity": 0,
++            "carry_method": "fleet-import-upgrade"
++          },
++          {
++            "category": "vro_packages",
++            "source_quantity": 5,
++            "carry_quantity": 5,
++            "abandon_quantity": 0,
++            "carry_method": "fleet-import-upgrade"
++          }
++        ],
++        "rollback": "Keep the offline 8.18.1 backup and original VIP/DNS values; on failed import, restore source services and route users and API clients back before retrying Fleet import."
++      }
++    },
++    {
++      "order": 5,
++      "id": "migrate-aria-logs-prod",
++      "kind": "migrate-product",
++      "source_id": "aria-logs-prod",
++      "target_component": "VCF Operations for Logs",
++      "actions": [
++        "Run the new VCF Operations for Logs 9.0.2 cluster beside 8.18.3; export/import content and reconfigure all integrations on the target.",
++        "Transfer the newest 90 days, retain the older 275 days read-only, and repoint the 630 compatible 8.18 agents with explicit TLS trust."
++      ],
++      "entry_gates": [
++        {
++          "name": "parallel-cluster-healthy",
++          "evidence": "The three-node VCF Operations for Logs 9.0.2 cluster is healthy in parallel without changing source ingestion."
++        },
++        {
++          "name": "source-backup-restorable",
++          "evidence": "The Logs source configuration and data backup is checksum-verified and passes a restore rehearsal."
++        },
++        {
++          "name": "ninety-day-transfer-window-confirmed",
++          "evidence": "A dry-run inventory limits the supported historical transfer to the newest 90 of 365 days."
++        },
++        {
++          "name": "tls-trust-ready",
++          "evidence": "VIP, node, syslog, API, and 8.18 agent TLS chains validate from representative senders."
++        }
++      ],
++      "exit_gates": [
++        {
++          "name": "ingest-rate-sustained",
++          "evidence": "The target sustains at least 420 GiB/day with balanced nodes and no ingestion backlog for 72 hours."
++        },
++        {
++          "name": "content-counts-reconciled",
++          "evidence": "Target counts and export manifests reconcile for every carried content category."
++        },
++        {
++          "name": "agents-reporting",
++          "evidence": "All 630 repointed 8.18 agents report through the new trusted endpoint."
++        },
++        {
++          "name": "older-history-read-only",
++          "evidence": "The source remains read-only and queryable for the 275 days outside the transfer window."
++        }
++      ],
++      "migration": {
++        "source_product": "VMware Aria Operations for Logs",
++        "source_version": "8.18.3",
++        "target_component": "VCF Operations for Logs",
++        "target_version": "9.0.2",
++        "method": "parallel-greenfield",
++        "source_eogs": "2027-10-11",
++        "support_boundary": "8.18.x has no in-place path to VCF Operations for Logs 9.0.x; deploy in parallel and transfer no more than 90 days of historical log data",
++        "content": [
++          {
++            "category": "agent_configurations",
++            "source_quantity": 630,
++            "carry_quantity": 630,
++            "abandon_quantity": 0,
++            "carry_method": "repoint-8.18-agents-and-configure-trust"
++          },
++          {
++            "category": "alerts",
++            "source_quantity": 31,
++            "carry_quantity": 31,
++            "abandon_quantity": 0,
++            "carry_method": "export-import"
++          },
++          {
++            "category": "content_packs",
++            "source_quantity": 7,
++            "carry_quantity": 7,
++            "abandon_quantity": 0,
++            "carry_method": "export-import"
++          },
++          {
++            "category": "custom_dashboards",
++            "source_quantity": 23,
++            "carry_quantity": 23,
++            "abandon_quantity": 0,
++            "carry_method": "export-import"
++          },
++          {
++            "category": "historical_logs_days",
++            "source_quantity": 365,
++            "carry_quantity": 90,
++            "abandon_quantity": 275,
++            "carry_method": "supported-log-data-transfer",
++            "abandon_reason": "history older than the supported 90-day transfer window remains only on the read-only source"
++          },
++          {
++            "category": "integrations",
++            "source_quantity": 16,
++            "carry_quantity": 16,
++            "abandon_quantity": 0,
++            "carry_method": "unconfigure-and-reconfigure"
++          }
++        ],
++        "rollback": "Keep 8.18.3 ingesting until target acceptance; restore integration endpoints and agent destinations to the source VIP if target ingestion, content, or history checks fail."
++      }
++    },
++    {
++      "order": 6,
++      "id": "cut-over-integrated-services",
++      "kind": "cutover",
++      "actions": [
++        "Switch collection, catalog access, API clients, integrations, and log senders to the validated VCF targets while preserving tested routes back to the sources."
++      ],
++      "entry_gates": [
++        {
++          "name": "all-target-service-checks-pass",
++          "evidence": "Operations collection, Automation provisioning, identity, and Logs ingestion acceptance suites all pass."
++        },
++        {
++          "name": "management-domain-baseline-unchanged",
++          "evidence": "The final management-domain inventory and health diff matches the initial baseline."
++        },
++        {
++          "name": "rollback-routes-tested",
++          "evidence": "DNS, VIP, integration, agent, and client rollback routes to each preserved source are rehearsed."
++        }
++      ],
++      "exit_gates": [
++        {
++          "name": "production-traffic-on-targets",
++          "evidence": "Monitoring shows production collection, requests, API traffic, and log ingestion arriving only at intended targets."
++        }
++      ]
++    },
++    {
++      "order": 7,
++      "id": "retire-aria-operations-prod",
++      "kind": "retire-source",
++      "source_id": "aria-operations-prod",
++      "target_component": "VCF Operations",
++      "actions": [
++        "After its rollback and retained-history window, remove the source registration and power off the source while retaining verified backups under the estate retention practice."
++      ],
++      "entry_gates": [
++        {
++          "name": "target-slos-sustained",
++          "evidence": "Target health, capacity, latency, collection, provisioning, and ingestion SLOs remain green for the retention window."
++        },
++        {
++          "name": "exports-and-backups-verified",
++          "evidence": "Final export manifests and backups retain matching checksums in the recovery store."
++        },
++        {
++          "name": "source-retention-window-expired",
++          "evidence": "The documented rollback and read-only history retention period has elapsed with no unresolved target defect."
++        }
++      ],
++      "exit_gates": [
++        {
++          "name": "source-powered-off-and-registration-removed",
++          "evidence": "Fleet and integration inventories omit the source, the source is powered off, and its recoverable backup remains cataloged."
++        }
++      ]
++    },
++    {
++      "order": 8,
++      "id": "retire-aria-automation-prod",
++      "kind": "retire-source",
++      "source_id": "aria-automation-prod",
++      "target_component": "VCF Automation",
++      "actions": [
++        "After its rollback and retained-history window, remove the source registration and power off the source while retaining verified backups under the estate retention practice."
++      ],
++      "entry_gates": [
++        {
++          "name": "target-slos-sustained",
++          "evidence": "Target health, capacity, latency, collection, provisioning, and ingestion SLOs remain green for the retention window."
++        },
++        {
++          "name": "exports-and-backups-verified",
++          "evidence": "Final export manifests and backups retain matching checksums in the recovery store."
++        },
++        {
++          "name": "source-retention-window-expired",
++          "evidence": "The documented rollback and read-only history retention period has elapsed with no unresolved target defect."
++        }
++      ],
++      "exit_gates": [
++        {
++          "name": "source-powered-off-and-registration-removed",
++          "evidence": "Fleet and integration inventories omit the source, the source is powered off, and its recoverable backup remains cataloged."
++        }
++      ]
++    },
++    {
++      "order": 9,
++      "id": "retire-aria-logs-prod",
++      "kind": "retire-source",
++      "source_id": "aria-logs-prod",
++      "target_component": "VCF Operations for Logs",
++      "actions": [
++        "After its rollback and retained-history window, remove the source registration and power off the source while retaining verified backups under the estate retention practice."
++      ],
++      "entry_gates": [
++        {
++          "name": "target-slos-sustained",
++          "evidence": "Target health, capacity, latency, collection, provisioning, and ingestion SLOs remain green for the retention window."
++        },
++        {
++          "name": "exports-and-backups-verified",
++          "evidence": "Final export manifests and backups retain matching checksums in the recovery store."
++        },
++        {
++          "name": "source-retention-window-expired",
++          "evidence": "The documented rollback and read-only history retention period has elapsed with no unresolved target defect."
++        }
++      ],
++      "exit_gates": [
++        {
++          "name": "source-powered-off-and-registration-removed",
++          "evidence": "Fleet and integration inventories omit the source, the source is powered off, and its recoverable backup remains cataloged."
++        }
++      ]
++    }
++  ]
++}
+diff --git a/architecture/plan_test.go b/architecture/plan_test.go
+new file mode 100644
+index 0000000..a9eba9f
+--- /dev/null
++++ b/architecture/plan_test.go
+@@ -0,0 +1,38 @@
++package architecture
++
++import "testing"
++
++func TestPinnedContentDisposition(t *testing.T) {
++	inv, snap := loadInputs(t)
++	artifact := loadArtifact(t)
++	plan, err := BuildPlan(inv, snap, artifact.Research)
++	if err != nil {
++		t.Fatal(err)
++	}
++	tests := []struct {
++		sourceID string
++		category string
++		carry    int
++		abandon  int
++	}{
++		{sourceID: "aria-operations-prod", category: "custom_dashboards", carry: 42},
++		{sourceID: "aria-operations-prod", category: "historical_metrics_days", abandon: 400},
++		{sourceID: "aria-automation-prod", category: "active_deployments", carry: 280},
++		{sourceID: "aria-automation-prod", category: "identity_provider_configuration", abandon: 1},
++		{sourceID: "aria-logs-prod", category: "historical_logs_days", carry: 90, abandon: 275},
++	}
++	for _, tc := range tests {
++		t.Run(tc.sourceID+"/"+tc.category, func(t *testing.T) {
++			step := migrationStep(&plan, tc.sourceID)
++			for _, decision := range step.Migration.Content {
++				if decision.Category == tc.category {
++					if decision.CarryQuantity != tc.carry || decision.AbandonQuantity != tc.abandon {
++						t.Fatalf("got carry=%d abandon=%d, want carry=%d abandon=%d", decision.CarryQuantity, decision.AbandonQuantity, tc.carry, tc.abandon)
++					}
++					return
++				}
++			}
++			t.Fatal("content decision not found")
++		})
++	}
++}
+diff --git a/architecture/schema.go b/architecture/schema.go
+index 8576d58..76fb693 100644
+--- a/architecture/schema.go
++++ b/architecture/schema.go
+@@ -209,10 +209,10 @@ func WritePlan(path string, plan Plan) error {
+ // BuildPlan returns the deterministic architecture derived from the immutable
+ // inventory and compatibility snapshot. Research is passed through unchanged.
+ func BuildPlan(inv Inventory, snap CompatibilitySnapshot, research []ResearchReference) (Plan, error) {
+-	return Plan{}, errors.New("BuildPlan not implemented")
++	return buildPlan(inv, snap, research)
+ }
+ 
+ // ValidatePlan verifies the architecture without network access.
+ func ValidatePlan(plan Plan, inv Inventory, snap CompatibilitySnapshot) error {
+-	return errors.New("ValidatePlan not implemented")
++	return validatePlan(plan, inv, snap)
+ }
