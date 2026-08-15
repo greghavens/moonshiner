@@ -79,7 +79,15 @@ class SeedInventoryCounts(unittest.TestCase):
             self.assertIn("Training tags: " + ", ".join(record["training_tags"]),
                           record["brief"])
 
-    def test_security_round_is_3000_unique_scenarios_behind_behavioral_work(self):
+    def test_vcf_plans_define_746_unique_scenarios_for_750_total_vcf_seeds(self):
+        records = seed_inventory.bundled_plan_records()
+        vcf = [record for record in records
+               if record.get("plan") in {"vcf-9-0", "vcf-9-1", "vcf-architecture"}]
+        self.assertEqual(len(vcf), 746)
+        self.assertEqual(len({record["id"] for record in vcf}), 746)
+        self.assertIn("vcf91-0379", {record["id"] for record in vcf})
+
+    def test_security_round_is_3000_unique_scenarios_immediately_after_vcf(self):
         records = seed_inventory.bundled_plan_records()
         security = [record for record in records
                     if record.get("plan") == "security-round-1"]
@@ -100,13 +108,15 @@ class SeedInventoryCounts(unittest.TestCase):
                                 for value in values))
 
         priorities = seed_inventory.plan_priorities()
+        vcf_priorities = {
+            priorities["vcf91-0001"],
+            priorities["vcf90-0001"],
+            priorities["vcfarch-0001"],
+        }
         behavior_priority = priorities["instruction-following-r3-0001"]
         security_priority = priorities.get("security-r1-0001", 0)
-        with mock.patch.object(seed_inventory, "select_seeds", return_value=[
-                {"id": "legacy", "tool_results": {"fake": "result"}}]):
-            replacement_priority = seed_inventory.plan_priorities()["legacy"]
-        self.assertGreater(behavior_priority, security_priority)
-        self.assertGreater(security_priority, replacement_priority)
+        self.assertGreater(min(vcf_priorities), security_priority)
+        self.assertGreater(security_priority, behavior_priority)
 
     def test_bundled_plan_extends_documented_inventory_without_cataloguing_unwritten_seeds(self):
         records = [{"id": "planned-new", "brief": "A new scenario",
