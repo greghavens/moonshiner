@@ -201,12 +201,18 @@ index 0000000..d2b98ef
                 "pi": {"cli": "node_modules/.bin/pi"},
             },
         }
-        adapters = (
-            CodexRuntime(config, {"runtime": "codex", "model": "probe"}),
-            ClaudeCodeRuntime(
-                config, {"runtime": "claude-code", "model": "probe"}),
-            PiRuntime(config, {"runtime": "pi", "model": "probe"}),
-        )
+        adapters = []
+        if shutil.which("codex"):
+            adapters.append(CodexRuntime(
+                config, {"runtime": "codex", "model": "probe"}))
+        if shutil.which("claude"):
+            adapters.append(ClaudeCodeRuntime(
+                config, {"runtime": "claude-code", "model": "probe"}))
+        if shutil.which("node") and (ROOT / "node_modules/.bin/pi").exists():
+            adapters.append(PiRuntime(
+                config, {"runtime": "pi", "model": "probe"}))
+        if not adapters:
+            self.skipTest("no native harness CLI is installed")
         environment = Runtime.teacher_environment(workspace)
         for adapter in adapters:
             with self.subTest(adapter=adapter.name):
