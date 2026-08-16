@@ -44,6 +44,37 @@ _ISOLATION_FLAGS = {
 }
 
 
+def _snapshot_excludes(workspace: Path) -> Path:
+    """Keep the sandbox HOME out of OpenCode's snapshot, and return the config.
+
+    OpenCode snapshots a turn by running ``git add`` with ``--git-dir`` set to
+    ``<data>/snapshot/...`` and ``--work-tree`` set to the workspace. The
+    sandbox points every writable cache at ``<workspace>/.sandbox-home``, so
+    that object store sits *inside* the tree it snapshots. Git only excludes
+    ``.git`` automatically, never a nested git dir at some other path, so each
+    snapshot committed the previous snapshot's objects and the next one
+    committed those: 2.8 GB and 141,884 objects in eight minutes, with the file
+    scanner walking the growth until the job hit its memory ceiling and died.
+
+    Ignoring the sandbox HOME breaks the loop at the source and keeps the
+    snapshot to the agent's actual work. It belongs in a global excludes file
+    rather than a ``.gitignore`` in the workspace, which would be copied into
+    the authored seed. The advice message is silenced because OpenCode reads a
+    non-zero ``git add`` as a failed snapshot and logs it every turn.
+    """
+    home = Path(workspace) / ".sandbox-home" / "git"
+    home.mkdir(parents=True, exist_ok=True)
+    excludes = home / "ignore"
+    excludes.write_text(".sandbox-home/\n")
+    config = home / "config"
+    config.write_text(
+        "[core]\n"
+        f"\texcludesFile = {excludes}\n"
+        "[advice]\n"
+        "\taddIgnoredFile = false\n")
+    return config
+
+
 def prompt_payload(prompt: str, provider: str, model: str) -> dict:
     """Build OpenCode's one-part user message without touching *prompt*."""
     return {
@@ -494,6 +525,7 @@ class OpenCodeRuntime(Runtime):
             "LOGNAME": "moonshiner-agent",
             "OPENCODE_CONFIG_CONTENT": json.dumps(config, separators=(",", ":")),
             str(self.runtime_config["key_env"]): DUMMY_TOKEN,
+            "GIT_CONFIG_GLOBAL": str(_snapshot_excludes(workspace)),
         })
         return environment
 
