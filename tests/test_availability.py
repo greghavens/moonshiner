@@ -94,6 +94,30 @@ class CreditExhaustion(unittest.TestCase):
         self.assertTrue(av.is_usage_limit(message))
         self.assertEqual(message, av.find_usage_limit(None, message))
 
+    def test_zenmux_402_is_a_usage_limit(self):
+        """Verbatim payload that stopped the seed queue on 2026-08-16.
+
+        Unrecognised, this does not merely go unreported. The author session
+        dies mid-turn, so no task.json is ever written, and the queue reports
+        "author did not create task.json" -- a phantom authoring bug -- then
+        exits INFRASTRUCTURE, which the supervisor will not restart. A quota
+        that refills by itself then stays down until a human intervenes.
+        """
+        message = str({"name": "APIError", "data": {
+            "message": "You have reached your subscription quota limit. Please "
+                       "wait for automatic quota refresh in the rolling time "
+                       "window, upgrade to a higher plan, or use a "
+                       "Pay-As-You-Go API Key for unlimited access.",
+            "statusCode": 402, "isRetryable": False,
+            "responseBody": '{"error":{"code":"402","type":"quote_exceeded"}}'}})
+        self.assertTrue(av.is_usage_limit(message))
+        self.assertEqual(message, av.find_usage_limit(None, message))
+
+    def test_the_provider_spelling_the_error_code_correctly_still_matches(self):
+        """``quote_exceeded`` is ZenMux's own typo; assume it gets fixed."""
+        self.assertTrue(av.is_usage_limit(
+            '{"error":{"code":"402","type":"quota_exceeded"}}'))
+
     def test_an_ordinary_failure_is_not_a_usage_limit(self):
         self.assertFalse(av.is_usage_limit("connection reset by peer"))
         self.assertFalse(av.is_usage_limit(None))

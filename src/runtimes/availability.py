@@ -25,6 +25,19 @@ LIMIT_PHRASES = (
     # every seed in the queue while never reaching the model at all.
     "requires more credits",
     "insufficient credits",
+    # ZenMux answers 402 the same way once a subscription's rolling window is
+    # spent. Both spellings are carried because the wire payload says
+    # ``quote_exceeded`` -- the provider's own typo, which a later release may
+    # well correct -- while the prose says "subscription quota limit". Matching
+    # either means one of them fixing the code does not silently reopen this.
+    #
+    # Unrecognised here, the block does not merely go unreported: it is read as
+    # the author never having written its task.json, and the queue stops at
+    # INFRASTRUCTURE_EXIT, which the supervisor refuses to restart. A quota that
+    # refills on its own then needs a human to notice and clear it by hand.
+    "subscription quota limit",
+    "quote_exceeded",
+    "quota_exceeded",
 )
 
 # Exit status used when a queue stops because its runtime is out of quota. The

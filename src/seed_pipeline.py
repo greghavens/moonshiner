@@ -10,7 +10,7 @@ import uuid
 from pathlib import Path
 
 from common import (CONFIG, ROOT, SEEDS_DIR, STORAGE_ROOT, TRACES, WORKSPACES,
-                    preflight_seed_environment)
+                    clear_runtime_caches, preflight_seed_environment)
 from run_state import (connect, create_run, finish_attempt, set_run_status,
                        start_attempt)
 from runtimes import get_seed_author, get_seed_judge
@@ -261,6 +261,14 @@ def main(argv: list[str] | None = None) -> int:
                     "passed": False,
                     "failures": ["environment preflight: " + environment_detail],
                 }
+            # The judge sandboxes itself with the candidate as its workspace, so
+            # its throwaway HOME lands *inside* the directory audited on the very
+            # next line, and validation leaves __pycache__ beside it. Both are
+            # runtime scratch, but the audit is right to call .sandbox-home
+            # forbidden -- in a corpus seed it is committed leakage. Clear it
+            # here, as every other stage that inspects an agent-touched
+            # workspace already does, so the audit judges authored content only.
+            clear_runtime_caches(candidate)
             structural_error = audit_seed(candidate)
             if structural_error:
                 final_report["passed"] = False

@@ -356,5 +356,44 @@ class AnAlternateTaskSchemaIsTranslated(unittest.TestCase):
                              json.loads((directory / "task.json").read_text()))
 
 
+class TheJudgeDoesNotAuditItsOwnScratch(unittest.TestCase):
+    """The judge's workspace *is* the candidate it is about to be audited on.
+
+    ``run_review`` sandboxes the judge with ``candidate`` as its workspace, so
+    the throwaway HOME lands inside that directory and validation leaves
+    ``__pycache__`` beside it. The audit is right to call ``.sandbox-home``
+    forbidden -- in a corpus seed it is committed runtime leakage -- so the
+    scratch has to be gone before the audit runs, not excused by it. Left in,
+    it failed and retired seeds the judge had already accepted.
+    """
+
+    def test_runtime_scratch_is_cleared_before_the_audit_reads_the_candidate(self):
+        source = (ROOT / "src" / "seed_pipeline.py").read_text()
+        body = source[source.index("review = judge.run_review("):]
+        self.assertLess(body.index("clear_runtime_caches(candidate)"),
+                        body.index("audit_seed(candidate)"),
+                        "the judge's own scratch must not reach the audit")
+
+    def test_a_candidate_carrying_judge_scratch_passes_once_cleared(self):
+        import audit_seeds
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate = pathlib.Path(tmp) / "vcf91-0359"
+            (candidate / "files").mkdir(parents=True)
+            (candidate / "files" / "t.py").write_text("x")
+            (candidate / "task.json").write_text(json.dumps({
+                "id": "vcf91-0359", "category": "impl", "prompt": "p",
+                "verify_cmd": "v", "test_files": ["t.py"]}))
+            (candidate / "reference_fix.patch").write_text("diff --git a/x b/x\n")
+            (candidate / ".sandbox-home" / ".config").mkdir(parents=True)
+            (candidate / "files" / "__pycache__").mkdir()
+
+            self.assertEqual("contains forbidden non-seed state: "
+                             "['.sandbox-home']", audit_seeds.check(candidate))
+            common.clear_runtime_caches(candidate)
+            self.assertIsNone(audit_seeds.check(candidate))
+            self.assertTrue((candidate / "files" / "t.py").exists(),
+                            "clearing scratch must not touch authored content")
+
+
 if __name__ == "__main__":
     unittest.main()
