@@ -1,6 +1,6 @@
 # Moonshiner Seed Recipe Book
 
-3832 seeds grouped into 429 categories. This file is generated; edit each seed's source, then regenerate it.
+3833 seeds grouped into 429 categories. This file is generated; edit each seed's source, then regenerate it.
 
 ## High-level overview
 
@@ -18,7 +18,7 @@
 | **Other verified work** | 8 | Verified work not yet assigned to one of the primary programs. |
 | **Security** | 6 | Enforce authorization, resource, path, boundary, and adversarial-input safety in defensive systems and repairs. |
 | **Uncategorized** | 221 | Catalog program awaiting description. |
-| **VMware Cloud Foundation 9.1** | 321 | Catalog program awaiting description. |
+| **VMware Cloud Foundation 9.1** | 322 | Catalog program awaiting description. |
 | **VMware Cloud Foundation 9.0** | 124 | Catalog program awaiting description. |
 | **instruction-following** | 11 | Catalog program awaiting description. |
 | **VMware Cloud Foundation Automation 9.0** | 3 | Catalog program awaiting description. |
@@ -4204,6 +4204,7 @@
 - **vcf91-0342** (`java`) `#vcf-9-1` `#vcf-automation` `#java` `#rest-contract` `#reference-derived` — Platform-automation ticket. We are standardizing on VCF Automation 9.1, the successor to vRealize Automation and Aria Automation, and need a tiny dependency-free Java client for project bootstrap.…
 - **vcf91-0343** (`java`) — Implement `AutomationClient.java`, a single-file Java client for the VCF Automation 9.1 project-change scenario described by `docs/contract.json`. The local contract is derived from Broadcom's offi…
 - **vcf91-0344** (`java`) `#vcf-9-1` `#vcf-automation` `#java` `#rest-contract` `#reference-derived` — Implement `VcfAutomationClient.java` as the dependency-free, single-file Java 17 client exercised by the fixed `TestMain.java` harness. Follow the focused VCF Automation 9.1 contract in `docs/contr…
+- **vcf91-0345** (`java`) `#vcf-9-1` `#vcf-automation` `#java` `#rest-contract` `#reference-derived` — Implement the single-file `VcfAutomationClient.java` client against the protected VCF Automation 9.1 wire contract in `docs/contract.json`. The contract was derived from the Broadcom xAPIs referenc…
 - **vcfarch-0001** (`powershell`) — Create the machine-readable architecture for the VMware Cloud Foundation scenario in `inputs/design-requirements.json`, and create an ordered 9.1 migration plan for every component in `fixtures/est…
 - **vcfarch-0002** (`powershell`) `#vcf-architecture` `#greenfield-9-1` `#powershell` `#compatibility-research` `#spec-derived` `#web-research` — Build the deployable architecture artifacts for the Chicago VCF scenario in `scenario.json` and the upgrade plan for the estate in `estate-inventory.json`. This is a single-site, consolidated VMwar…
 - **vcfarch-0003** (`powershell`) — Build the deployable architecture package for `atl01-w01`, a greenfield ATL workload domain delivered as a workload-focused VMware Cloud Foundation 9.1 secondary instance and added to the existing…
