@@ -51,6 +51,19 @@ class ClaudeCodeRuntime(Runtime):
         except (subprocess.CalledProcessError, FileNotFoundError) as error:
             raise SystemExit(f"claude CLI unusable: {error}") from error
 
+    def trace_probe_command(self) -> list[str]:
+        return [str(self.runtime_config.get("cli", "claude")), "--version"]
+
+    def oci_runtime_command(
+            self, command: list[str], workspace: Path
+            ) -> tuple[list[str], tuple[tuple[Path, Path], ...]]:
+        cli = shutil.which(command[0])
+        if cli is None:
+            raise FileNotFoundError(command[0])
+        source = Path(cli).resolve()
+        destination = workspace / ".sandbox-home" / "native-runtime" / "claude"
+        return [str(destination), *command[1:]], ((source, destination),)
+
     # -- command construction ---------------------------------------------- #
     def _base_cmd(self, *, disallowed: str | None = None) -> list[str]:
         cli = self.runtime_config.get("cli", "claude")
@@ -82,8 +95,8 @@ class ClaudeCodeRuntime(Runtime):
             cmd += ["--input-format", "stream-json", "--replay-user-messages"]
         environment = self.teacher_environment(workspace)
         self._add_host_auth(environment)
-        cmd = workspace_only_command(
-            cmd, workspace,
+        cmd = self.prepare_trace_command(
+            seed, cmd, workspace, environment=environment,
             read_only_binds=self._auth_bindings(environment))
 
         events_path = out_dir / f"{seed['id']}.jsonl"

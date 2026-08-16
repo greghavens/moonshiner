@@ -333,6 +333,34 @@ class Runtime(abc.ABC):
         """Capabilities genuinely provided by this native trace adapter."""
         return frozenset()
 
+    def trace_probe_command(self) -> list[str]:
+        """Return the native executable probe used before an OCI paid call."""
+        return [str(self.runtime_config.get("cli") or self.name), "--version"]
+
+    def oci_runtime_command(
+            self, command: list[str], workspace: Path
+            ) -> tuple[list[str], tuple[tuple[Path, Path], ...]]:
+        """Expose a native command inside an OCI image at the adapter boundary.
+
+        Test and third-party runtimes whose command is already supplied by the
+        task image need no mounts. Native Moonshiner adapters override this to
+        mount their genuine installed CLI read-only.
+        """
+        return list(command), ()
+
+    def prepare_trace_command(
+            self, seed: dict, command: list[str], workspace: Path, *,
+            environment: dict[str, str],
+            read_only_binds: tuple[tuple[Path, Path], ...] = ()) -> list[str]:
+        """Use the one local boundary or the explicit OCI environment boundary."""
+        from task_environment import environment_spec, environment_trace_command
+        if environment_spec(seed) is not None:
+            return environment_trace_command(
+                seed, self, command, workspace, environment=environment,
+                read_only_binds=read_only_binds)
+        return workspace_only_command(
+            command, workspace, read_only_binds=read_only_binds)
+
     @staticmethod
     def require_persistent_workspace(workspace: Path) -> Path:
         """Refuse model contexts that are ephemeral or inherit AGENTS.md."""

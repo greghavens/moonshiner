@@ -86,6 +86,53 @@ class PiRuntime(Runtime):
         cli = self._cli_path()
         return cli.parent.parent if cli.parent.name == ".bin" else None
 
+    def trace_probe_command(self) -> list[str]:
+        return [str(self._cli_path()), "--version"]
+
+    def oci_runtime_command(
+            self, command: list[str], workspace: Path
+            ) -> tuple[list[str], tuple[tuple[Path, Path], ...]]:
+        node = shutil.which("node")
+        if node is None:
+            raise FileNotFoundError("node")
+        node_path = Path(node)
+        bindings: list[tuple[Path, Path]] = []
+        linuxbrew = Path("/home/linuxbrew/.linuxbrew")
+        if node_path.is_relative_to(linuxbrew) or node_path.resolve().is_relative_to(
+                linuxbrew.resolve()):
+            bindings.append((linuxbrew, linuxbrew))
+            dependencies = subprocess.run(
+                ["ldd", str(node_path)], capture_output=True, text=True,
+                check=True)
+            for line in dependencies.stdout.splitlines():
+                paths = [Path(token) for token in line.replace("=>", " ").split()
+                         if token.startswith("/")]
+                if not paths:
+                    continue
+                destination = paths[0]
+                dependency = destination.resolve()
+                if not dependency.is_relative_to(linuxbrew.resolve()):
+                    bindings.append((dependency, destination))
+        else:
+            node_target = workspace / ".sandbox-home" / "native-runtime" / "node"
+            bindings.append((node_path.resolve(), node_target))
+            node_path = node_target
+        cli = Path(command[0])
+        if not cli.is_relative_to(workspace):
+            managed = self._managed_node_modules()
+            if managed is not None and cli.resolve().is_relative_to(
+                    managed.resolve()):
+                target = (workspace / ".sandbox-home" / "native-runtime" /
+                          "pi-node-modules")
+                bindings.append((managed, target))
+                cli = target / cli.relative_to(managed)
+            else:
+                source = cli.resolve()
+                target = workspace / ".sandbox-home" / "native-runtime" / "pi"
+                bindings.append((source, target))
+                cli = target
+        return [str(node_path), str(cli), *command[1:]], tuple(bindings)
+
     # -- lifecycle ---------------------------------------------------------- #
     def preflight(self, *, require_auth: bool = False) -> None:
         cli = self._cli_path()
@@ -194,13 +241,14 @@ class PiRuntime(Runtime):
                          system_prompt=system_prompt, tools=tools,
                          schema=None, read_only=False, artifact_id=seed["id"],
                          interaction=interaction,
-                         append_system_prompt=self._coding_guidance(seed))
+                         append_system_prompt=self._coding_guidance(seed), seed=seed)
 
     def _run(self, *, prompt: str, workspace: Path, out_dir: Path,
              system_prompt: str, tools: list[str] | None, schema: dict | None,
              read_only: bool, artifact_id: str,
              interaction: list[str] | None = None,
-             append_system_prompt: str | None = None) -> TraceResult:
+             append_system_prompt: str | None = None,
+             seed: dict | None = None) -> TraceResult:
         real_key = load_provider_key(self.runtime_config)
         runtime_dir = workspace / ".sandbox-home" / "pi-runtime"
         runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -226,8 +274,6 @@ class PiRuntime(Runtime):
                 managed = self._managed_node_modules()
                 if managed is not None:
                     bindings = ((managed, runtime_dir / "node_modules"),)
-                cmd = workspace_only_command(
-                    inner, workspace, read_only_binds=bindings)
                 environment = self.teacher_environment(workspace)
                 environment.update({
                     "USER": "moonshiner-agent",
@@ -235,6 +281,11 @@ class PiRuntime(Runtime):
                     "XDG_RUNTIME_DIR": str(runtime_dir / "run"),
                     "PI_CODING_AGENT_DIR": str(runtime_dir / "config"),
                 })
+                cmd = (self.prepare_trace_command(
+                    seed, inner, workspace, environment=environment,
+                    read_only_binds=bindings) if seed is not None else
+                    workspace_only_command(
+                        inner, workspace, read_only_binds=bindings))
                 try:
                     proc = run_streamed(
                         cmd, workspace=workspace, turn=turn,

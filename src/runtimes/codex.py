@@ -44,6 +44,26 @@ class CodexRuntime(Runtime):
         if require_auth and not (Path.home() / ".codex" / "auth.json").exists():
             raise SystemExit("codex not authenticated (~/.codex/auth.json missing)")
 
+    def trace_probe_command(self) -> list[str]:
+        return [str(self.runtime_config.get("cli", "codex")), "--version"]
+
+    def oci_runtime_command(
+            self, command: list[str], workspace: Path
+            ) -> tuple[list[str], tuple[tuple[Path, Path], ...]]:
+        cli = shutil.which(command[0])
+        if cli is None:
+            raise FileNotFoundError(command[0])
+        source = Path(cli).resolve()
+        if source.suffix == ".js":
+            package = source.parent.parent
+            candidates = sorted(package.glob(
+                "node_modules/@openai/codex-*/vendor/*/bin/codex"))
+            if not candidates:
+                raise FileNotFoundError("installed native Codex executable")
+            source = candidates[0].resolve()
+        destination = workspace / ".sandbox-home" / "native-runtime" / "codex"
+        return [str(destination), *command[1:]], ((source, destination),)
+
     # -- command construction ---------------------------------------------- #
     def _base_cmd(self, *, sandbox: str, schema_path: Path | None = None) -> list[str]:
         cli = self.runtime_config.get("cli", "codex")
@@ -87,8 +107,8 @@ class CodexRuntime(Runtime):
             cmd += ["-c", 'web_search="live"']
         cmd += ["-C", str(workspace), "-"]
         environment = self.teacher_environment(workspace)
-        cmd = workspace_only_command(
-            cmd, workspace,
+        cmd = self.prepare_trace_command(
+            seed, cmd, workspace, environment=environment,
             read_only_binds=self._auth_bindings(environment))
 
         full_prompt = f"{system_prompt}\n\n{prompt}"

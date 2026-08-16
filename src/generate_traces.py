@@ -125,6 +125,8 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
 
         raw_text = result.raw_path.read_text(errors="replace") \
             if result.raw_path.exists() else ""
+        from task_environment import environment_provenance
+        task_environment_provenance = environment_provenance(seed)
         record = {
             "id": seed["id"],
             "lang": seed.get("lang"),
@@ -168,6 +170,7 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
                 "provenance": {
                     **result.provenance,
                     "capability_resolution": capability_resolution,
+                    "task_environment": task_environment_provenance,
                 },
             },
         }

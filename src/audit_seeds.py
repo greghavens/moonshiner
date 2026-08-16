@@ -82,9 +82,19 @@ def check(directory: Path, worlds: dict | None = None) -> str | None:
                 or any(not isinstance(item, str) or not item.strip()
                        for item in value)):
             return f"task.json {field} must be a list of nonempty strings"
-    missing = [key for key in REQUIRED if not task.get(key)]
+    from task_environment import (environment_spec,
+                                  validate_environment_spec)
+    task["_dir"] = directory
+    oci_environment = environment_spec(task) is not None
+    missing = [key for key in ("id", "category") if not task.get(key)]
+    if ("prompt" not in task or not isinstance(task.get("prompt"), str)
+            or (not oci_environment and not task.get("prompt"))):
+        missing.append("prompt")
     if missing:
         return f"task.json missing {missing}"
+    environment_failure = validate_environment_spec(task)
+    if environment_failure:
+        return environment_failure
     if task["id"] != directory.name:
         return f"id {task['id']!r} != dir name"
     if task.get("test_files"):
@@ -94,7 +104,8 @@ def check(directory: Path, worlds: dict | None = None) -> str | None:
         absent = [name for name in task["test_files"] if not (files / name).exists()]
         if absent:
             return f"test files absent: {absent}"
-    if task.get("verify_cmd") and directory.name not in PATCH_EXEMPT:
+    if (task.get("verify_cmd") and not oci_environment
+            and directory.name not in PATCH_EXEMPT):
         patch = directory / "reference_fix.patch"
         if not patch.exists() or patch.stat().st_size == 0:
             return "reference_fix.patch missing/empty"

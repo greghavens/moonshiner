@@ -444,7 +444,12 @@ def materialize(seed: dict, name: str | None = None) -> Path:
     if workspace.exists():
         workspace = WORKSPACES / f"{workspace.name}-{uuid.uuid4().hex[:10]}"
     workspace.mkdir(parents=True)
-    source = _seed_files(seed)
+    from task_environment import environment_spec, materialize_environment
+    if environment_spec(seed) is not None:
+        materialize_environment(seed, workspace)
+        source = None
+    else:
+        source = _seed_files(seed)
     if source is not None and source.exists():
         links = [path for path in source.rglob("*") if path.is_symlink()]
         if links:
@@ -491,10 +496,13 @@ def run_verify(seed: dict, workspace: Path, timeout: int | None = None
     ``verify_timeout`` may raise the default 180s for install-heavy seeds, but
     is capped at 360s per the sanctioned spec.
     """
-    if not seed.get("verify_cmd"):
-        return None, "(no verify_cmd)"
     if timeout is None:
         timeout = min(int(seed.get("verify_timeout") or 180), 360)
+    from task_environment import environment_spec, verify_environment
+    if environment_spec(seed) is not None:
+        return verify_environment(seed, workspace, timeout)
+    if not seed.get("verify_cmd"):
+        return None, "(no verify_cmd)"
     try:
         proc = _sandboxed_command(shlex.split(seed["verify_cmd"]), workspace, timeout)
         return proc.returncode == 0, (proc.stdout + "\n" + proc.stderr).strip()
@@ -573,13 +581,26 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int):
         inactivity_timeout=timeout)
 
 
-def preflight_seed_environment(seed: dict) -> tuple[bool, str]:
+def preflight_seed_environment(seed: dict, runtime=None) -> tuple[bool, str]:
     """Validate the baseline toolchain in the verifier sandbox before model spend.
 
     ``reference_setup`` belongs to post-patch reference validation. It may
     legitimately invoke a file created by ``reference_fix.patch`` and must
     never run against the intentionally broken baseline used for tracing.
     """
+    from task_environment import (environment_spec, prepare_environment,
+                                  probe_runtime)
+    if environment_spec(seed) is not None:
+        provenance = prepare_environment(seed, runtime)
+        workspace = materialize(seed, name=f"environment-{seed['id']}")
+        environment = (runtime.teacher_environment(workspace)
+                       if runtime is not None else {})
+        probe_runtime(seed, runtime, workspace, environment)
+        _, detail = run_verify(seed, workspace)
+        remove_workspace(workspace)
+        identity = provenance.get("image_digest") or provenance.get("image_id")
+        return True, f"OCI task environment ready ({identity}); baseline: {detail}"
+
     from toolchains import (declared_commands, declared_powershell_modules,
                             missing_executables, provision,
                             provision_powershell_modules)
@@ -634,6 +655,8 @@ def protected_hashes(seed: dict, workspace: Path) -> dict[str, str | None]:
         path = workspace / relative
         hashes[relative] = (hashlib.sha256(path.read_bytes()).hexdigest()
                             if path.exists() else None)
+    from task_environment import environment_control_hashes
+    hashes.update(environment_control_hashes(seed))
     return hashes
 
 

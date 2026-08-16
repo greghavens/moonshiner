@@ -79,12 +79,15 @@ class KernelEnforcedWriteBoundary(unittest.TestCase):
         self.assertFalse(sibling.exists())
 
     def test_every_model_runtime_launches_through_the_boundary(self):
-        for operation in (
-                CodexRuntime.run_trace, CodexRuntime.run_review,
-                ClaudeCodeRuntime.run_trace, ClaudeCodeRuntime.run_review,
-                PiRuntime._run):
+        for operation in (CodexRuntime.run_trace, ClaudeCodeRuntime.run_trace):
+            with self.subTest(operation=operation.__qualname__):
+                self.assertIn("prepare_trace_command(", inspect.getsource(operation))
+        for operation in (CodexRuntime.run_review, ClaudeCodeRuntime.run_review):
             with self.subTest(operation=operation.__qualname__):
                 self.assertIn("workspace_only_command(", inspect.getsource(operation))
+        pi_source = inspect.getsource(PiRuntime._run)
+        self.assertIn("prepare_trace_command(", pi_source)
+        self.assertIn("workspace_only_command(", pi_source)
 
     def test_seed_commands_use_only_workspace_backed_writable_storage(self):
         workspace = common.WORKSPACES / f"confinement-verify-{uuid.uuid4().hex}"

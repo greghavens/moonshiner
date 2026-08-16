@@ -39,6 +39,29 @@ class Check(unittest.TestCase):
         why = aud.check(make_complete(self.root, "z-seed", patch=False))
         self.assertIn("reference_fix.patch", why)
 
+    def test_complete_oci_environment_uses_held_out_test_patch(self):
+        directory = self.root / "oci-seed"
+        patch = directory / "files" / ".moonshiner" / "test.patch"
+        patch.parent.mkdir(parents=True)
+        patch.write_text("diff --git a/test.py b/test.py\n")
+        (directory / "task.json").write_text(json.dumps({
+            "id": "oci-seed", "lang": "python", "category": "bug-fix",
+            "prompt": "original prompt", "verify_cmd": "python3 -m unittest",
+            "environment": {
+                "type": "oci", "image": "registry.example/task@sha256:abc",
+                "repository": "owner/repo", "base_commit": "a" * 40,
+                "workspace": "/testbed",
+                "test_patch": "files/.moonshiner/test.patch",
+                "fail_to_pass": ["test_fix"], "pass_to_pass": [],
+                "install_config": {
+                    "base_image_name": "python", "docker_specs": None,
+                    "install": [], "log_parser": "parse_log_pytest",
+                    "test_cmd": "python3 -m unittest",
+                },
+            },
+        }))
+        self.assertIsNone(aud.check(directory))
+
     def test_pilot_seed_is_patch_exempt(self):
         exempt_id = sorted(aud.PILOT_EXEMPT)[0]
         self.assertIsNone(aud.check(make_complete(self.root, exempt_id, patch=False)))

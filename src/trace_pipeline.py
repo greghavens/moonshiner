@@ -417,7 +417,8 @@ def main(argv: list[str] | None = None) -> int:
                     claim["attempts"], synthetic)
             alert_infrastructure_failure(seed["id"], synthetic)
             return
-        environment_ok, environment_detail = preflight_seed_environment(seed)
+        environment_ok, environment_detail = preflight_seed_environment(
+            seed, runtime=attempt_teacher)
         if not environment_ok:
             set_job(worker_db, run_id, seed["id"], "infrastructure_blocked",
                     claim["attempts"], environment_detail)
