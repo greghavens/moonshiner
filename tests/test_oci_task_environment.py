@@ -75,6 +75,45 @@ class ExecutableOciRuntime(Runtime):
         return [{"role": "assistant", "content": "completed"}], {}
 
 
+class AnOciContainerMustCarryTheQueueCeiling(unittest.TestCase):
+    """Rootless Podman runs each container in its own scope under app.slice,
+    a sibling of the queue unit rather than a child, so the unit's MemoryMax
+    never reaches it. An OCI seed was the one path with no ceiling at all: a
+    runaway there took the host down instead of failing alone.
+    """
+
+    def ceiling(self, configured):
+        original = dict(common.CONFIG)
+        pipeline = dict(common.CONFIG.get("pipeline") or {})
+        pipeline["memory_max"] = configured
+        common.CONFIG["pipeline"] = pipeline
+        self.addCleanup(common.CONFIG.update, original)
+        return task_environment.container_memory_ceiling()
+
+    def test_the_configured_ceiling_bounds_the_container(self):
+        self.assertEqual(self.ceiling("12G"), ["--memory", "12G"])
+
+    def test_one_knob_governs_the_unit_and_its_containers(self):
+        # pipeline.memory_max is the queue unit's ceiling too; a second knob
+        # would let the two drift apart silently.
+        self.assertEqual(self.ceiling("32G"), ["--memory", "32G"])
+
+    def test_the_ceiling_stays_removable(self):
+        for configured in ("", "infinity", "Infinity"):
+            with self.subTest(configured=configured):
+                self.assertEqual(self.ceiling(configured), [])
+
+    def test_every_container_that_runs_seed_code_is_bounded(self):
+        # Each of these executes code or tests the seed supplies. One
+        # unbounded run site is the whole hole reopened.
+        source = pathlib.Path(task_environment.__file__).read_text()
+        run_sites = [block for block in source.split('"run",')[1:]]
+        self.assertEqual(len(run_sites), 4, "run site count changed")
+        for index, block in enumerate(run_sites):
+            with self.subTest(run_site=index):
+                self.assertIn("container_memory_ceiling()", block[:400])
+
+
 @unittest.skipUnless(shutil.which("podman"), "Podman is required")
 class RealOciTaskEnvironment(unittest.TestCase):
     @classmethod

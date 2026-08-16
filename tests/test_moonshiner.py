@@ -504,8 +504,14 @@ class ARunawayJobMustNotKillItsQueue(unittest.TestCase):
     """
 
     def test_a_ceiling_is_applied_by_default(self):
-        self.assertEqual(["--property=MemoryMax=8G", "--property=MemorySwapMax=8G"],
-                         m._memory_ceiling())
+        # Pinned to an unconfigured pipeline: the claim is "nothing set still
+        # gets a ceiling", not "this operator happens to have left the default
+        # alone". Reading the live config made a local memory_max fail this.
+        import common
+        with mock.patch.dict(common.CONFIG, {"pipeline": {}}):
+            self.assertEqual(
+                ["--property=MemoryMax=8G", "--property=MemorySwapMax=8G"],
+                m._memory_ceiling())
 
     def test_it_can_be_removed_deliberately(self):
         import common

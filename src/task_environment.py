@@ -98,6 +98,27 @@ def podman_command(*arguments: str) -> list[str]:
             *map(str, arguments)]
 
 
+def container_memory_ceiling() -> list[str]:
+    """Bound a container's memory with the queue's own ceiling.
+
+    Rootless Podman runs each container in its own transient ``libpod-*.scope``
+    under ``app.slice`` -- a sibling of the queue unit, not a child -- so the
+    unit's ``MemoryMax`` never reaches it. Without this an OCI seed is the one
+    path with no ceiling at all, and a runaway there takes the host down
+    instead of failing alone.
+
+    ``pipeline.memory_max`` is the single knob, same as the queue unit. Podman
+    defaults ``--memory-swap`` to twice ``--memory``, which matches the unit's
+    ``MemoryMax`` plus an equal ``MemorySwapMax``. Set the config to "" or
+    "infinity" to remove the ceiling.
+    """
+    from common import CONFIG
+    value = str((CONFIG.get("pipeline") or {}).get("memory_max", "8G")).strip()
+    if not value or value.lower() == "infinity":
+        return []
+    return ["--memory", value]
+
+
 def _completed(*arguments: str, input: str | bytes | None = None,
                inactivity_timeout: int = 600,
                binary: bool = False) -> subprocess.CompletedProcess:
@@ -148,6 +169,7 @@ def prepare_environment(seed: dict, runtime=None) -> dict:
         f"test \"$(git -C {shlex.quote(spec['workspace'])} rev-parse HEAD)\" = "
         f"{shlex.quote(spec['base_commit'])}")
     _checked("run", "--rm", "--network", "none",
+             *container_memory_ceiling(),
              "--security-opt", "label=disable", "--entrypoint", "/bin/sh",
              image, "-lc", probe)
     return environment_provenance(seed)
@@ -193,6 +215,7 @@ def materialize_environment(seed: dict, workspace: Path) -> None:
         f"git -C {shlex.quote(spec['workspace'])} archive --format=tar "
         f"{shlex.quote(spec['base_commit'])}")
     result = _checked("run", "--rm", "--network", "none",
+                      *container_memory_ceiling(),
                       "--security-opt", "label=disable",
                       "--entrypoint", "/bin/sh", spec["image"], "-lc", command,
                       binary=True)
@@ -237,6 +260,7 @@ def environment_trace_command(seed: dict, runtime, command: list[str],
         f"{shlex.quote(str(exchange))}; fi\n"
         "exit \"$status\"\n")
     arguments = ["run", "--rm", "--interactive", "--network", "host",
+                 *container_memory_ceiling(),
                  "--userns", "keep-id:uid=0,gid=0",
                  "--security-opt", "label=disable",
                  *_mount(workspace, str(workspace), read_only=False),
@@ -301,7 +325,8 @@ def verify_environment(seed: dict, workspace: Path,
         spec["install_config"]["test_cmd"],
     ))
     result = _completed(
-        "run", "--rm", "--network", "none", "--security-opt", "label=disable",
+        "run", "--rm", "--network", "none", *container_memory_ceiling(),
+        "--security-opt", "label=disable",
         *_mount(candidate, "/opt/moonshiner/candidate.patch"),
         *_mount(test_patch, "/opt/moonshiner/test.patch"),
         "--entrypoint", "/bin/sh", spec["image"], "-lc", script,
