@@ -19,14 +19,14 @@ from runtimes.pi import (PiRuntime, _parse_pi_stream, compact_events_file,
                          run_streamed)  # noqa: E402
 
 
-def _provider_entry(runtime_config: dict) -> dict:
-    config = {"runtimes": {"pi": dict(runtime_config, provider="openrouter")}}
+def _provider_entry(runtime_config: dict, provider: str = "openrouter") -> dict:
+    config = {"runtimes": {"pi": dict(runtime_config, provider=provider)}}
     runtime = PiRuntime(config, {"model": "moonshotai/kimi-k3"})
     with tempfile.TemporaryDirectory() as tmp:
         runtime._prepare_runtime(pathlib.Path(tmp), "http://127.0.0.1:1")
         models = json.loads(
             (pathlib.Path(tmp) / "config" / "models.json").read_text())
-    return models["providers"]["openrouter"]
+    return models["providers"][provider]
 
 
 class ModelsJson(unittest.TestCase):
@@ -119,6 +119,14 @@ class ModelsJson(unittest.TestCase):
     def test_sandbox_only_ever_sees_dummy_credentials(self):
         provider = _provider_entry({})
         self.assertEqual(provider["baseUrl"], "http://127.0.0.1:1")
+        self.assertEqual(provider["apiKey"], DUMMY_TOKEN)
+
+    def test_zenmux_uses_the_existing_openai_compatible_pi_path(self):
+        provider = _provider_entry(
+            {"api": "openai-completions",
+             "base_url": "https://zenmux.ai/api/v1"},
+            provider="zenmux")
+        self.assertEqual(provider["api"], "openai-completions")
         self.assertEqual(provider["apiKey"], DUMMY_TOKEN)
 
     def test_follow_up_turn_resumes_the_same_pi_session(self):

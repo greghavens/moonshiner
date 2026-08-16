@@ -33,6 +33,8 @@ MODELS = {
         "MOONSHINER_LIVE_CLAUDE_MODEL", "claude-opus-5"),
     "pi": os.environ.get(
         "MOONSHINER_LIVE_PI_MODEL", "moonshotai/kimi-k3"),
+    "opencode": os.environ.get(
+        "MOONSHINER_LIVE_OPENCODE_MODEL", "moonshotai/kimi-k3"),
 }
 
 

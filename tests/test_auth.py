@@ -11,6 +11,7 @@ sys.path.insert(0, str(_ROOT / "src"))
 sys.path.insert(0, str(_ROOT))
 
 import common  # noqa: E402
+import control_cli  # noqa: E402
 from runtimes import auth  # noqa: E402
 
 OPENROUTER = {"provider": "openrouter"}
@@ -18,6 +19,12 @@ ZAI = {"provider": "zai"}
 
 
 class KeyDerivation(unittest.TestCase):
+    def test_zenmux_is_a_first_class_credential_target(self):
+        provider, config = control_cli._credential_target("zenmux")
+        self.assertEqual(provider, "zenmux")
+        self.assertEqual(config["key_env"], "ZENMUX_API_KEY")
+        self.assertEqual(config["base_url"], "https://zenmux.ai/api/v1")
+
     def test_env_name_derives_from_provider(self):
         self.assertEqual(auth.key_env_name(OPENROUTER), "OPENROUTER_API_KEY")
         self.assertEqual(auth.key_env_name(ZAI), "ZAI_API_KEY")

@@ -303,6 +303,8 @@ PROVIDER_PRESETS = {
     "openrouter": {"display_provider": "OpenRouter", "base_url": "https://openrouter.ai/api/v1",
                    "api": "openai-completions", "thinking_format": "openrouter",
                    "key_env": "OPENROUTER_API_KEY"},
+    "zenmux": {"display_provider": "ZenMux", "base_url": "https://zenmux.ai/api/v1",
+               "api": "openai-completions", "key_env": "ZENMUX_API_KEY"},
     "openai": {"display_provider": "OpenAI", "base_url": "https://api.openai.com/v1",
                "api": "openai-completions", "key_env": "OPENAI_API_KEY"},
     "anthropic": {"display_provider": "Anthropic", "base_url": "https://api.anthropic.com",
@@ -342,6 +344,28 @@ def _configure_pi_provider(config: dict, current_runtime: str) -> tuple[str, dic
     return "pi", runtime_config
 
 
+def _configure_opencode_provider(config: dict) -> tuple[str, dict]:
+    existing = config["runtimes"]["opencode"]
+    provider = _ask(
+        "OpenCode API provider (openrouter or zenmux)",
+        str(existing.get("provider") or "openrouter")).lower()
+    if provider not in {"openrouter", "zenmux"}:
+        raise SystemExit("OpenCode provider must be openrouter or zenmux")
+    preset = PROVIDER_PRESETS[provider]
+    runtime_config = {
+        **existing,
+        "provider": provider,
+        "display_provider": preset["display_provider"],
+        "base_url": preset["base_url"],
+        "key_env": preset["key_env"],
+    }
+    from configuration import update_local
+    for key, value in runtime_config.items():
+        update_local(f"runtimes.opencode.{key}", value)
+    config["runtimes"]["opencode"] = runtime_config
+    return "opencode", runtime_config
+
+
 def _setup(argv: list[str] | None = None) -> int:
     """First-run wizard. Ask for configuration instead of exposing internals."""
     parser = argparse.ArgumentParser(
@@ -373,6 +397,8 @@ def _setup(argv: list[str] | None = None) -> int:
         runtime = harness
         if harness == "pi":
             runtime, _ = _configure_pi_provider(config, current_runtime)
+        elif harness == "opencode":
+            runtime, _ = _configure_opencode_provider(config)
         model = _ask(f"{label} model ID", str(current.get("model") or ""))
         if not model:
             raise SystemExit("A model ID is required")

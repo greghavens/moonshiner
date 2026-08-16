@@ -28,8 +28,10 @@ class TraceHarnessInfrastructureFailure(RuntimeError):
 def _build_registry() -> dict[str, type[Runtime]]:
     from runtimes.claude_code import ClaudeCodeRuntime
     from runtimes.codex import CodexRuntime
+    from runtimes.opencode import OpenCodeRuntime
     from runtimes.pi import PiRuntime
-    return {cls.name: cls for cls in (CodexRuntime, ClaudeCodeRuntime, PiRuntime)}
+    return {cls.name: cls for cls in (
+        CodexRuntime, ClaudeCodeRuntime, PiRuntime, OpenCodeRuntime)}
 
 
 REGISTRY = _build_registry()

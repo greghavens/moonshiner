@@ -11,10 +11,11 @@ from pathlib import Path
 
 from runtimes.claude_code import ClaudeCodeRuntime
 from runtimes.codex import CodexRuntime
+from runtimes.opencode import OpenCodeRuntime
 from runtimes.pi import PiRuntime
 from runtimes.synthetic_correction import SyntheticCorrectionAdapter
 _RUNTIME_CLASSES = (CodexRuntime, PiRuntime, ClaudeCodeRuntime,
-                    SyntheticCorrectionAdapter)
+                    OpenCodeRuntime, SyntheticCorrectionAdapter)
 _BY_FORMAT: dict[str, type] = {}
 for _cls in _RUNTIME_CLASSES:
     for _fmt in _cls.trace_formats:

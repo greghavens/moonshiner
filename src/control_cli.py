@@ -16,6 +16,7 @@ from runtimes import (get_judge, get_seed_author, get_seed_judge,
 def _provider_label(value: str) -> str:
     return {"openrouter": "OpenRouter", "openai": "OpenAI",
             "anthropic": "Anthropic", "zai": "Z.ai",
+            "zenmux": "ZenMux",
             "huggingface": "Hugging Face"}.get(
                 value.lower(), value.replace("-", " ").title())
 
@@ -27,6 +28,14 @@ def _credential_target(name: str) -> tuple[str, dict] | None:
     if needle in {"huggingface", "hugging-face", "hf"}:
         return "huggingface", {"provider": "huggingface", "key_env": "HF_TOKEN",
                                "key_file_name": "moonshiner-huggingface-key"}
+    if needle == "zenmux":
+        return "zenmux", {
+            "provider": "zenmux",
+            "display_provider": "ZenMux",
+            "base_url": "https://zenmux.ai/api/v1",
+            "api": "openai-completions",
+            "key_env": "ZENMUX_API_KEY",
+        }
     for runtime in runtimes.values():
         provider = str(runtime.get("provider") or "").lower()
         display = str(runtime.get("display_provider") or "").lower()
@@ -50,6 +59,9 @@ def auth_main(argv: list[str] | None = None) -> int:
         providers = sorted({str(value.get("provider")) for value in
                             (CONFIG.get("runtimes") or {}).values()
                             if value.get("provider")})
+        if "zenmux" not in providers:
+            providers.append("zenmux")
+            providers.sort()
         print(f"unknown credential provider: {args.provider}; choose: "
               f"{', '.join(providers) or 'none configured'}", file=sys.stderr); return 2
     provider, runtime = target

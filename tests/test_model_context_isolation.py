@@ -16,6 +16,7 @@ import seed_pipeline  # noqa: E402
 import security_runtime  # noqa: E402
 from runtimes.claude_code import ClaudeCodeRuntime  # noqa: E402
 from runtimes.codex import CodexRuntime  # noqa: E402
+from runtimes.opencode import OpenCodeRuntime  # noqa: E402
 from runtimes.pi import PiRuntime  # noqa: E402
 
 
@@ -101,13 +102,17 @@ class EveryModelEntryPointUsesTheBoundary(unittest.TestCase):
             (ClaudeCodeRuntime, lambda runtime: runtime.run_trace(
                 {"id": "seed"}, pathlib.Path("workspace"),
                 out_dir=pathlib.Path("out"), system_prompt="system", prompt="prompt")),
+            (OpenCodeRuntime, lambda runtime: runtime.run_trace(
+                {"id": "seed"}, pathlib.Path("workspace"),
+                out_dir=pathlib.Path("out"), system_prompt="system", prompt="prompt")),
         )
         for runtime_class, call in calls:
             with self.subTest(runtime=runtime_class.name):
                 self._assert_blocked(self._runtime(runtime_class), call)
 
     def test_every_judge_adapter_checks_before_launch(self):
-        for runtime_class in (CodexRuntime, PiRuntime, ClaudeCodeRuntime):
+        for runtime_class in (CodexRuntime, PiRuntime, ClaudeCodeRuntime,
+                              OpenCodeRuntime):
             with self.subTest(runtime=runtime_class.name):
                 self._assert_blocked(
                     self._runtime(runtime_class),

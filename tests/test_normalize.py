@@ -10,7 +10,7 @@ sys.path.insert(0, str(_ROOT))
 import normalize  # noqa: E402
 
 KNOWN = ("claude-stream-json", "codex-exec-events", "codex-rollout",
-         "pi-coding-agent-json-v3")
+         "opencode-session-v1", "pi-coding-agent-json-v3")
 
 
 class Routing(unittest.TestCase):

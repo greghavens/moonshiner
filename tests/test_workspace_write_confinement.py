@@ -18,6 +18,7 @@ import security_runtime  # noqa: E402
 from runtimes.base import Runtime  # noqa: E402
 from runtimes.claude_code import ClaudeCodeRuntime  # noqa: E402
 from runtimes.codex import CodexRuntime  # noqa: E402
+from runtimes.opencode import OpenCodeRuntime  # noqa: E402
 from runtimes.pi import PiRuntime  # noqa: E402
 
 
@@ -79,7 +80,8 @@ class KernelEnforcedWriteBoundary(unittest.TestCase):
         self.assertFalse(sibling.exists())
 
     def test_every_model_runtime_launches_through_the_boundary(self):
-        for operation in (CodexRuntime.run_trace, ClaudeCodeRuntime.run_trace):
+        for operation in (CodexRuntime.run_trace, ClaudeCodeRuntime.run_trace,
+                          OpenCodeRuntime.run_trace):
             with self.subTest(operation=operation.__qualname__):
                 self.assertIn("prepare_trace_command(", inspect.getsource(operation))
         for operation in (CodexRuntime.run_review, ClaudeCodeRuntime.run_review):

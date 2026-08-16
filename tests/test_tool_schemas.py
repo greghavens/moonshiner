@@ -10,6 +10,7 @@ sys.path.insert(0, str(_ROOT / "src"))
 
 from runtimes.claude_code import ClaudeCodeRuntime  # noqa: E402
 from runtimes.codex import CodexRuntime  # noqa: E402
+from runtimes.opencode import OpenCodeRuntime  # noqa: E402
 from runtimes.pi import PiRuntime  # noqa: E402
 from runtimes.synthetic_correction import SyntheticCorrectionAdapter  # noqa: E402
 
@@ -21,6 +22,7 @@ class NoReconstructedSurface(unittest.TestCase):
                 SyntheticCorrectionAdapter):
             with self.subTest(adapter=adapter.__name__):
                 self.assertFalse(hasattr(adapter, "tool_schemas"))
+        self.assertFalse(hasattr(OpenCodeRuntime, "tool_schemas"))
 
     def test_reconstruction_symbols_are_absent_from_runtime_sources(self):
         for path in (_ROOT / "src" / "runtimes").glob("*.py"):
@@ -37,9 +39,12 @@ class SharedTeacherEnvironment(unittest.TestCase):
                       inspect.getsource(CodexRuntime.run_trace))
         self.assertIn("self.teacher_environment(workspace)",
                       inspect.getsource(PiRuntime._run))
+        self.assertIn("self.teacher_environment(workspace)",
+                      inspect.getsource(OpenCodeRuntime.run_trace))
         with tempfile.TemporaryDirectory() as directory:
             workspace = pathlib.Path(directory)
-            for adapter in (ClaudeCodeRuntime, CodexRuntime, PiRuntime):
+            for adapter in (ClaudeCodeRuntime, CodexRuntime, PiRuntime,
+                            OpenCodeRuntime):
                 with self.subTest(adapter=adapter.__name__):
                     self.assertIs(adapter.teacher_environment,
                                   adapter.__mro__[1].teacher_environment)

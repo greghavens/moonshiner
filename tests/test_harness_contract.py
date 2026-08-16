@@ -20,7 +20,8 @@ from runtimes import (REGISTRY, get_judge, get_seed_author, get_teacher,
 
 class HarnessContract(unittest.TestCase):
     def test_current_supported_trace_harnesses_are_explicit(self):
-        self.assertEqual(set(runtime_names()), {"claude-code", "codex", "pi"})
+        self.assertEqual(set(runtime_names()),
+                         {"claude-code", "codex", "opencode", "pi"})
         self.assertEqual(set(source_runtime_names()), set(runtime_names()))
 
     def test_claude_code_can_fill_every_runtime_role(self):
