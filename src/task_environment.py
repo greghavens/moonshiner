@@ -107,16 +107,18 @@ def container_memory_ceiling() -> list[str]:
     path with no ceiling at all, and a runaway there takes the host down
     instead of failing alone.
 
-    ``pipeline.memory_max`` is the single knob, same as the queue unit. Podman
-    defaults ``--memory-swap`` to twice ``--memory``, which matches the unit's
-    ``MemoryMax`` plus an equal ``MemorySwapMax``. Set the config to "" or
-    "infinity" to remove the ceiling.
+    ``pipeline.memory_max`` is the single knob, same as the queue unit.
+    ``--memory-swap`` is pinned to ``--memory`` -- Podman reads it as the
+    combined memory+swap total, so equal values mean no swap at all. Left
+    alone it defaults to twice ``--memory``, and swap here is zram: a runaway
+    would grind compressed pages through the CPU and stall the host instead of
+    dying at its ceiling. Set the config to "" or "infinity" to remove it.
     """
     from common import CONFIG
     value = str((CONFIG.get("pipeline") or {}).get("memory_max", "8G")).strip()
     if not value or value.lower() == "infinity":
         return []
-    return ["--memory", value]
+    return ["--memory", value, "--memory-swap", value]
 
 
 def _completed(*arguments: str, input: str | bytes | None = None,

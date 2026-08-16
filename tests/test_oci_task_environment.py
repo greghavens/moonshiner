@@ -91,12 +91,23 @@ class AnOciContainerMustCarryTheQueueCeiling(unittest.TestCase):
         return task_environment.container_memory_ceiling()
 
     def test_the_configured_ceiling_bounds_the_container(self):
-        self.assertEqual(self.ceiling("12G"), ["--memory", "12G"])
+        self.assertEqual(self.ceiling("12G"),
+                         ["--memory", "12G", "--memory-swap", "12G"])
 
     def test_one_knob_governs_the_unit_and_its_containers(self):
         # pipeline.memory_max is the queue unit's ceiling too; a second knob
         # would let the two drift apart silently.
-        self.assertEqual(self.ceiling("32G"), ["--memory", "32G"])
+        self.assertEqual(self.ceiling("32G"),
+                         ["--memory", "32G", "--memory-swap", "32G"])
+
+    def test_the_ceiling_is_not_quietly_doubled_by_swap(self):
+        # Podman reads --memory-swap as the combined memory+swap total, so
+        # equal values mean no swap. Left alone it defaults to twice --memory,
+        # and swap here is zram: a runaway grinds compressed pages through the
+        # CPU and stalls the host rather than dying at its ceiling.
+        memory = self.ceiling("12G")
+        self.assertEqual(memory[memory.index("--memory") + 1],
+                         memory[memory.index("--memory-swap") + 1])
 
     def test_the_ceiling_stays_removable(self):
         for configured in ("", "infinity", "Infinity"):

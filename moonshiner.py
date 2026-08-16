@@ -843,12 +843,17 @@ def _memory_ceiling() -> list[str]:
     grew to 18 GB. The kernel killed the whole unit, so a single bad artifact
     took the queue down and every job in it with it. A ceiling turns that into
     one failed job. Set pipeline.memory_max to "" or "infinity" to remove it.
+
+    Swap is denied outright rather than granted to match. It is a separate
+    allowance on top of MemoryMax, and on a zram system it is compressed RAM:
+    a job allowed to fill it stalls the whole host on compression instead of
+    being killed at its ceiling, which is the failure this exists to prevent.
     """
     from common import CONFIG
     value = str((CONFIG.get("pipeline") or {}).get("memory_max", "8G")).strip()
     if not value or value.lower() == "infinity":
         return []
-    return [f"--property=MemoryMax={value}", f"--property=MemorySwapMax={value}"]
+    return [f"--property=MemoryMax={value}", "--property=MemorySwapMax=0"]
 
 
 MOONSHINER_UNIT = re.compile(r"^moonshiner-[a-z-]+-[0-9a-f]{12}\.service$")

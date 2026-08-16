@@ -510,8 +510,19 @@ class ARunawayJobMustNotKillItsQueue(unittest.TestCase):
         import common
         with mock.patch.dict(common.CONFIG, {"pipeline": {}}):
             self.assertEqual(
-                ["--property=MemoryMax=8G", "--property=MemorySwapMax=8G"],
+                ["--property=MemoryMax=8G", "--property=MemorySwapMax=0"],
                 m._memory_ceiling())
+
+    def test_the_ceiling_is_not_quietly_doubled_by_swap(self):
+        # Swap is a separate allowance on top of MemoryMax, and here it is
+        # zram -- compressed RAM. Granting it froze the host: the job ground
+        # pages through the CPU instead of dying at its ceiling.
+        import common
+        with mock.patch.dict(common.CONFIG,
+                             {"pipeline": {"memory_max": "12G"}}):
+            self.assertEqual(["--property=MemoryMax=12G",
+                              "--property=MemorySwapMax=0"],
+                             m._memory_ceiling())
 
     def test_it_can_be_removed_deliberately(self):
         import common
