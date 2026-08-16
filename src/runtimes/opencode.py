@@ -470,8 +470,12 @@ class OpenCodeRuntime(Runtime):
                             *, read_only: bool,
                             base_environment: dict[str, str] | None = None
                             ) -> dict[str, str]:
-        provider, _ = _provider_and_model(self)
+        provider, model = _provider_and_model(self)
         environment = dict(base_environment or self.teacher_environment(workspace))
+        # Declare the configured model outright. OpenCode otherwise resolves
+        # model IDs through the third-party models.dev catalog, which lags the
+        # provider's live catalog and rejects a model the provider already
+        # serves. The configured model is the authority here, not the catalog.
         config = {
             "$schema": "https://opencode.ai/config.json",
             "share": "disabled",
@@ -479,7 +483,8 @@ class OpenCodeRuntime(Runtime):
             "plugin": [],
             "instructions": [],
             "provider": {
-                provider: {"options": {"baseURL": proxy_base_url}},
+                provider: {"options": {"baseURL": proxy_base_url},
+                           "models": {model: {}}},
             },
             "permission": {"external_directory": "deny"},
         }
