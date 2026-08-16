@@ -19,6 +19,37 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+def _peer_workspace_mask(workspace: Path, masks: Path) -> list[str]:
+    """Hide every other workspace from this one.
+
+    ``--ro-bind / /`` leaves the whole host readable, and every workspace this
+    project has ever created sits under one root. A seed-authoring agent used
+    that to enumerate its neighbours and read their ``task.json``, then copied a
+    sibling's ``verify.py`` into its scratch and ran it. The result is a seed
+    shaped by whatever else happened to be in flight -- including candidates
+    still awaiting judgment, and ones that will be rejected -- rather than by
+    its own brief. Only writes were ever bounded here; reads were not.
+
+    The replacement carries a skeleton of this workspace's own path, because
+    the bind that restores the workspace needs a mount point to land on: a
+    directory cannot be *created* inside a read-only mount, but mounting over
+    one that already exists is fine. Replacing the whole root this way also
+    covers workspaces that appear after the sandbox starts, which masking each
+    neighbour in turn would miss -- jobs run concurrently, so they do.
+
+    Emitted before the workspace is bound so that bind lands on top. That
+    ordering is why this cannot join the private-path loop below, which runs
+    after the bind and so has to skip anything the workspace lives inside.
+    """
+    from common import WORKSPACES
+    root = Path(WORKSPACES).resolve()
+    if root == workspace or not workspace.is_relative_to(root):
+        return []
+    skeleton = masks / "workspace-root"
+    (skeleton / workspace.relative_to(root)).mkdir(parents=True, exist_ok=True)
+    return ["--ro-bind", str(skeleton), str(root)]
+
+
 def workspace_only_command(
         command: list[str], workspace: Path, *,
         read_only_binds: tuple[tuple[Path, Path], ...] = (),
@@ -58,6 +89,7 @@ def workspace_only_command(
         "--ro-bind", "/", "/",
         "--dev-bind", "/dev", "/dev",
         "--proc", "/proc",
+        *_peer_workspace_mask(workspace, masks),
         "--bind" if workspace_writable else "--ro-bind",
         str(workspace), str(workspace),
         # A read-only review still needs isolated CLI/session/cache state. This

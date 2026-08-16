@@ -4,8 +4,10 @@ from __future__ import annotations
 import ast
 import inspect
 import pathlib
+import shutil
 import subprocess
 import sys
+import tempfile
 import uuid
 import unittest
 
@@ -36,6 +38,70 @@ class WorkspaceOwnedEnvironment(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertTrue(pathlib.Path(environment[name]).resolve().is_relative_to(
                     workspace.resolve()))
+
+
+class PeerWorkspacesAreInvisible(unittest.TestCase):
+    """Every job workspace shares one root, and the sandbox bounded only
+    writes. A seed-authoring agent walked that root, read two neighbours'
+    task.json, copied a third's verify.py into its scratch and ran it -- so a
+    candidate was being shaped by other in-flight, unjudged seeds.
+    """
+
+    def sandbox(self, workspace: pathlib.Path, script: str):
+        from runtimes.base import workspace_only_command
+        return subprocess.run(
+            workspace_only_command([sys.executable, "-c", script], workspace),
+            cwd=workspace, env=Runtime.teacher_environment(workspace),
+            capture_output=True, text=True)
+
+    def pair(self) -> tuple[pathlib.Path, pathlib.Path]:
+        workspace = common.WORKSPACES / f"confinement-own-{uuid.uuid4().hex}"
+        workspace.mkdir(parents=True)
+        self.addCleanup(common.remove_workspace, workspace)
+        peer = common.WORKSPACES / f"confinement-peer-{uuid.uuid4().hex}"
+        (peer / "seed").mkdir(parents=True)
+        self.addCleanup(common.remove_workspace, peer)
+        (peer / "seed" / "task.json").write_text('{"id":"neighbour"}')
+        return workspace, peer
+
+    def test_a_neighbouring_workspace_cannot_be_read(self):
+        workspace, peer = self.pair()
+        result = self.sandbox(workspace, (
+            "import pathlib\n"
+            f"try: pathlib.Path({str(peer / 'seed' / 'task.json')!r}).read_text()\n"
+            "except OSError: pass\n"
+            "else: raise SystemExit('a peer workspace leaked into the agent')\n"))
+        self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_the_shared_root_lists_nothing_but_this_workspace(self):
+        # Reading a named neighbour is the symptom; enumerating the root is how
+        # the agent found them in the first place.
+        workspace, _ = self.pair()
+        result = self.sandbox(workspace, (
+            "import pathlib\n"
+            f"visible = sorted(entry.name for entry in "
+            f"pathlib.Path({str(common.WORKSPACES)!r}).iterdir())\n"
+            f"assert visible == [{workspace.name!r}], visible\n"))
+        self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_the_agent_still_owns_its_own_workspace(self):
+        workspace, _ = self.pair()
+        (workspace / "brief.txt").write_text("mine")
+        result = self.sandbox(workspace, (
+            "import pathlib\n"
+            f"root = pathlib.Path({str(workspace)!r})\n"
+            "assert (root / 'brief.txt').read_text() == 'mine'\n"
+            "(root / 'authored.txt').write_text('work')\n"))
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("work", (workspace / "authored.txt").read_text())
+
+    def test_a_workspace_outside_the_shared_root_is_left_alone(self):
+        # Tests and one-off runs build workspaces elsewhere; masking a root
+        # they do not live under would hide the tree they are running in.
+        from runtimes.base import _peer_workspace_mask
+        outside = pathlib.Path(tempfile.mkdtemp(dir=ROOT))
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        self.assertEqual([], _peer_workspace_mask(outside, outside / "masks"))
 
 
 class KernelEnforcedWriteBoundary(unittest.TestCase):

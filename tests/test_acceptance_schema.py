@@ -43,6 +43,33 @@ class AcceptanceSchemaTests(unittest.TestCase):
             {"accepted": True, "status": "deterministic_pass"}))
         self.assertTrue(verdict_accepts({"accepted": True, "reason": "ok"}))
 
+    def test_a_judge_artifact_in_the_reviews_directory_is_not_a_verdict(self):
+        # accepted_ids reads every .json in the reviews directory, which also
+        # holds judge artifacts: the schema file, and the OpenCode judge's raw
+        # session, which is a JSON array. Calling .get on that raised out of
+        # seed selection, so one artifact stopped the trace queue picking any
+        # seed at all. Shape is the guard; these must be inert, not fatal.
+        session = [{"info": {"id": "msg_1", "role": "assistant"}, "parts": []}]
+        for artifact in (session, [], "accepted", 7, None):
+            with self.subTest(artifact=type(artifact).__name__):
+                self.assertFalse(is_accepted(artifact))
+                self.assertFalse(is_judge_error(artifact))
+
+    def test_seed_selection_survives_a_raw_session_among_the_reviews(self):
+        directory = pathlib.Path(tempfile.mkdtemp(dir=ROOT))
+        self.addCleanup(lambda: __import__("shutil").rmtree(
+            directory, ignore_errors=True))
+        (directory / "reviews").mkdir()
+        (directory / "reviews" / "judge.session.json").write_text(
+            json.dumps([{"info": {"id": "msg_1"}, "parts": []}]))
+        (directory / "reviews" / "real-seed.json").write_text(json.dumps(
+            {"accepted": True, "judge": {"runtime": "opencode"}}))
+        with mock.patch.object(seed_inventory, "TRACES", directory), \
+             mock.patch("import_existing.imported_task_ids", return_value=set()):
+            accepted = seed_inventory.accepted_ids(mock.MagicMock())
+        self.assertIn("real-seed", accepted)
+        self.assertNotIn("judge.session", accepted)
+
     def test_setup_failure_is_infrastructure_not_a_judge_rejection(self):
         review = {
             "status": "review_reject",
