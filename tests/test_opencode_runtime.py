@@ -15,7 +15,10 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from runtimes.opencode import (  # noqa: E402
     OPENCODE_RUNTIME_VERSION,
+    ContentFiltered,
     OpenCodeRuntime,
+    _completed_session_evidence,
+    _is_content_filter,
     _snapshot_excludes,
     prompt_payload,
     validate_tool_schemas,
@@ -235,6 +238,45 @@ class OpenCodeStructuredSession(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "tool schema"):
             validate_tool_schemas([{"id": "read", "description": "Read",
                                     "parameters": "invented"}])
+
+
+class AContentFilterBlockIsOneSeedsProblem(unittest.TestCase):
+    """A filtered response must defer that seed, not stop the whole queue."""
+
+    def _blocked(self, error) -> list[dict]:
+        session = _completed_session()
+        session[-1]["info"]["error"] = error
+        return session
+
+    def test_a_filtered_response_raises_its_own_type(self):
+        session = self._blocked({
+            "name": "ContentFilterError",
+            "data": {"message":
+                     "The response was blocked by the provider's content filter"}})
+        with self.assertRaises(ContentFiltered) as caught:
+            _completed_session_evidence(session)
+        self.assertIn("content filter", str(caught.exception))
+
+    def test_a_genuine_harness_error_still_stops_the_run(self):
+        session = self._blocked({"name": "ProviderTransportError",
+                                 "data": {"message": "socket hang up"}})
+        with self.assertRaises(ValueError) as caught:
+            _completed_session_evidence(session)
+        self.assertNotIsInstance(caught.exception, ContentFiltered)
+
+    def test_a_renamed_filter_error_degrades_to_a_deferral(self):
+        # Falling back to the text keeps a provider rename from turning a
+        # per-seed block back into a queue-stopping failure.
+        self.assertTrue(_is_content_filter(
+            {"name": "SafetyBlock",
+             "data": {"message": "blocked by the content filter"}}))
+        self.assertTrue(_is_content_filter("upstream content_filter triggered"))
+        self.assertFalse(_is_content_filter(
+            {"name": "RateLimitError", "data": {"message": "slow down"}}))
+
+    def test_a_clean_session_raises_nothing(self):
+        evidence = _completed_session_evidence(_completed_session())
+        self.assertEqual(evidence["observed_models"], ["model-a"])
 
 
 if __name__ == "__main__":

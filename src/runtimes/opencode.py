@@ -5,6 +5,9 @@ workspace boundary.  Its live event stream is activity evidence only; after
 each turn Moonshiner retrieves the completed native session and persists that
 session as the authoritative trace.  Provider credentials remain host-side in
 the existing loopback proxy, while OpenCode receives only a fixed dummy token.
+
+A provider content-filter block is not a harness failure: it is surfaced as
+``safeguard_refusal`` so the caller defers that one seed and keeps going.
 """
 from __future__ import annotations
 
@@ -42,6 +45,35 @@ _ISOLATION_FLAGS = {
     "OPENCODE_DISABLE_DEFAULT_PLUGINS": "true",
     "OPENCODE_PURE": "true",
 }
+CONTENT_FILTER_NAMES = ("ContentFilterError",)
+CONTENT_FILTER_PHRASES = ("content filter", "content_filter")
+
+
+class ContentFiltered(Exception):
+    """The provider's safety filter blocked the response.
+
+    This is one seed's problem, not the harness's. Left as a generic session
+    error it becomes a ``TraceHarnessInfrastructureFailure``, which stops the
+    queue and refuses to restart — so a single seed the filter dislikes halts
+    the whole corpus. Raised as its own type it reaches ``safeguard_refusal``,
+    the deferral path that already exists for exactly this, and the run
+    continues with the next seed.
+    """
+
+
+def _is_content_filter(error) -> bool:
+    """Whether a native OpenCode assistant error is a safety-filter block.
+
+    Prefers the structured ``name`` the provider sends; falls back to the text
+    so a renamed error class degrades to a deferral rather than to a
+    queue-stopping failure.
+    """
+    if isinstance(error, dict):
+        name = error.get("name")
+        if isinstance(name, str) and name in CONTENT_FILTER_NAMES:
+            return True
+    text = str(error).lower()
+    return any(phrase in text for phrase in CONTENT_FILTER_PHRASES)
 
 
 def _snapshot_excludes(workspace: Path) -> Path:
@@ -212,6 +244,7 @@ def _completed_session_evidence(session, *, expected_prompt: str | None = None,
     tool_calls = tool_results = 0
     terminal_assistant = False
     errors: list[str] = []
+    filtered = False
     for item in session:
         if not isinstance(item, dict):
             raise ValueError("OpenCode completed session message is malformed")
@@ -235,6 +268,8 @@ def _completed_session_evidence(session, *, expected_prompt: str | None = None,
             raise ValueError("OpenCode assistant message is not completed")
         if info.get("error"):
             errors.append(str(info["error"]))
+            if _is_content_filter(info["error"]):
+                filtered = True
         if info.get("finish"):
             terminal_assistant = True
         for part in parts:
@@ -261,7 +296,10 @@ def _completed_session_evidence(session, *, expected_prompt: str | None = None,
             raise ValueError(
                 f"OpenCode session did not attest model {expected_model!r}")
     if errors:
-        raise ValueError("OpenCode assistant error: " + "; ".join(errors))
+        detail = "OpenCode assistant error: " + "; ".join(errors)
+        if filtered:
+            raise ContentFiltered(detail)
+        raise ValueError(detail)
     if not terminal_assistant:
         raise ValueError("OpenCode completed session has no terminal finish reason")
     return {
@@ -691,6 +729,7 @@ class OpenCodeRuntime(Runtime):
         events = None
         timed_out = False
         error = None
+        safeguard_refusal = False
         session: list[dict] = []
         session_id = None
         schemas = None
@@ -777,6 +816,9 @@ class OpenCodeRuntime(Runtime):
         except subprocess.TimeoutExpired:
             timed_out = True
             error = "OpenCode became inactive during a model call"
+        except ContentFiltered as blocked:
+            safeguard_refusal = True
+            error = scrub_text(str(blocked))
         except BaseException as failure:
             error = scrub_text(str(failure))
         finally:
@@ -811,9 +853,11 @@ class OpenCodeRuntime(Runtime):
             observed_model=observed_model,
             observed_models=observed_models,
             model_attested=bool(observed_model and self.model_matches(observed_model)
-                                and audit.get("had_success")),
+                                and audit.get("had_success")
+                                and not safeguard_refusal),
             usage=usage,
             error=error,
+            safeguard_refusal=safeguard_refusal,
             unavailable=availability.find_usage_limit(error),
             provenance={
                 "session_id": session_id,

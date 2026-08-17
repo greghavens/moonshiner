@@ -98,7 +98,8 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
             raise ModelUnavailable(f"{teacher.name}: {result.unavailable}")
         if result.safeguard_refusal:
             record = _deferral(seed, prompt, teacher, "safeguard_refusal",
-                               "teacher issued a safeguard refusal",
+                               result.error
+                               or "teacher issued a safeguard refusal",
                                capability_resolution)
             _write_meta(meta_path, record)
             record["_workspace_path"] = str(workspace)

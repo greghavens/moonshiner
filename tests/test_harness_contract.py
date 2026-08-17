@@ -117,6 +117,43 @@ class HarnessContract(unittest.TestCase):
         self.assertEqual(record["raw_sha256"],
                          generate_traces._sha256('{"fresh":true}\n'))
 
+    def test_a_safeguard_refusal_defers_the_seed_and_records_why(self):
+        # The queue must survive a seed the provider's filter dislikes: this
+        # returns a deferral record rather than raising the infrastructure
+        # failure that stops tracing and blocks the supervisor from restarting.
+        teacher = mock.Mock()
+        teacher.name = "native-harness"
+        teacher.role = {"model": "model", "reasoning": "xhigh"}
+        blocked = ("OpenCode assistant error: {'name': 'ContentFilterError'}")
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            traces = root / "traces"
+            (traces / "meta").mkdir(parents=True)
+            (traces / "raw").mkdir()
+            seed_dir = root / "seed"
+            seed_dir.mkdir()
+            (seed_dir / "task.json").write_text("{}\n")
+            seed = {"id": "seed", "prompt": "Do the task.", "_dir": seed_dir}
+            workspace = root / "workspace"
+            workspace.mkdir()
+            raw = traces / "raw" / "seed.events.jsonl"
+            raw.write_text("{}\n")
+            teacher.run_trace.return_value = SimpleNamespace(
+                unavailable=None, safeguard_refusal=True, return_code=1,
+                timed_out=False, stream_success=False, error=blocked,
+                raw_path=raw, trace_format="native-v1", duration_s=1,
+                observed_model=None, observed_models=[], model_attested=False,
+                model_fallback=False, usage={}, provenance={})
+            with mock.patch.object(generate_traces, "materialize",
+                                   return_value=workspace), \
+                 mock.patch.object(generate_traces, "protected_hashes",
+                                   return_value={}):
+                record = generate_traces.trace_task(
+                    seed, teacher, force=True, traces_root=traces)
+        self.assertTrue(record["deferred_safeguard_refusal"])
+        self.assertEqual(record["deferral_reason"], blocked)
+        self.assertIsNone(record["passed"])
+
     def test_generic_pipeline_has_no_runtime_specific_dispatch(self):
         source = inspect.getsource(trace_pipeline)
         self.assertNotIn("behavior_trace", source)
