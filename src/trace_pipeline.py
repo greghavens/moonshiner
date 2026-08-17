@@ -472,14 +472,16 @@ def main(argv: list[str] | None = None) -> int:
         # judge to read: `screen` would go looking for a raw trace that was
         # never written and raise, which lands back here as an infrastructure
         # failure and stops the queue — the outcome deferring exists to avoid.
-        if record.get("deferred_safeguard_refusal"):
-            reason = str(record.get("deferral_reason") or "safeguard refusal")
+        deferred = any(key.startswith("deferred_") and value
+                       for key, value in record.items())
+        if deferred:
+            reason = str(record.get("deferral_reason") or "deferred")
             status = "retry" if has_more else "exhausted"
             finish_attempt(worker_db, run_id, seed["id"], number, status,
                            usage, None, reason)
             remove_completed_workspace(record)
             # Always to the tail, whatever retry_order says: an immediate retry
-            # walks the same prompt back into the same filter.
+            # walks the same prompt back into whatever stopped it.
             if status == "retry":
                 set_job(worker_db, run_id, seed["id"], "deferred", number, reason)
                 status = "deferred"

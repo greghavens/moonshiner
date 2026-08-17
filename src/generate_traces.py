@@ -96,11 +96,18 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
         # let the next start discover whether quota has returned.
         if result.unavailable:
             raise ModelUnavailable(f"{teacher.name}: {result.unavailable}")
-        if result.safeguard_refusal:
-            record = _deferral(seed, prompt, teacher, "safeguard_refusal",
-                               result.error
-                               or "teacher issued a safeguard refusal",
-                               capability_resolution)
+        # Two different conditions, kept apart in provenance: a provider that
+        # refused to answer, and an agent that stopped to ask a question no one
+        # is there to answer. Both defer this seed and leave the run alone.
+        for blocked, kind, fallback in (
+                (result.safeguard_refusal, "safeguard_refusal",
+                 "teacher issued a safeguard refusal"),
+                (result.blocked_on_question, "interactive_question",
+                 "teacher asked a question a headless trace cannot answer")):
+            if not blocked:
+                continue
+            record = _deferral(seed, prompt, teacher, kind,
+                               result.error or fallback, capability_resolution)
             _write_meta(meta_path, record)
             record["_workspace_path"] = str(workspace)
             return record

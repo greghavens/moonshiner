@@ -113,10 +113,19 @@ class TraceConcurrency(unittest.TestCase):
         # infrastructure failure that deferring exists to avoid.
         source = inspect.getsource(trace_pipeline.main)
         generated = source[source.index("record = trace_task("):]
-        deferral = generated.index('record.get("deferred_safeguard_refusal")')
+        deferral = generated.index('key.startswith("deferred_")')
         self.assertLess(deferral, generated.index("screen(seed, worker_judge)"))
         self.assertIn("return", generated[deferral:generated.index(
             "screen(seed, worker_judge)")])
+
+    def test_no_single_kind_of_deferral_is_singled_out(self):
+        # Matching one kind's key means the next kind added upstream walks into
+        # the judge instead — this branch defeated by an omission rather than a
+        # change, which is how the interactive-question deferral would have
+        # arrived if the test only knew about safeguard refusals.
+        source = inspect.getsource(trace_pipeline.main)
+        generated = source[source.index("record = trace_task("):]
+        self.assertNotIn('record.get("deferred_safeguard_refusal")', generated)
 
     def test_infrastructure_failure_alert_is_immediate_and_high_visibility(self):
         output = io.StringIO()

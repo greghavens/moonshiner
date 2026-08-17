@@ -93,6 +93,7 @@ class HarnessContract(unittest.TestCase):
             raw.write_text('{"fresh":true}\n')
             teacher.run_trace.return_value = SimpleNamespace(
                 unavailable=None, safeguard_refusal=False, return_code=0,
+                blocked_on_question=False,
                 timed_out=False, stream_success=True, error=None,
                 raw_path=raw, trace_format="native-v1", duration_s=1,
                 observed_model="model", observed_models=["model"],
@@ -117,14 +118,11 @@ class HarnessContract(unittest.TestCase):
         self.assertEqual(record["raw_sha256"],
                          generate_traces._sha256('{"fresh":true}\n'))
 
-    def test_a_safeguard_refusal_defers_the_seed_and_records_why(self):
-        # The queue must survive a seed the provider's filter dislikes: this
-        # returns a deferral record rather than raising the infrastructure
-        # failure that stops tracing and blocks the supervisor from restarting.
+    def _blocked_trace(self, error: str, **flags) -> dict:
+        """Trace one seed against a teacher that stopped for ``error``."""
         teacher = mock.Mock()
         teacher.name = "native-harness"
         teacher.role = {"model": "model", "reasoning": "xhigh"}
-        blocked = ("OpenCode assistant error: {'name': 'ContentFilterError'}")
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             traces = root / "traces"
@@ -138,21 +136,45 @@ class HarnessContract(unittest.TestCase):
             workspace.mkdir()
             raw = traces / "raw" / "seed.events.jsonl"
             raw.write_text("{}\n")
-            teacher.run_trace.return_value = SimpleNamespace(
-                unavailable=None, safeguard_refusal=True, return_code=1,
-                timed_out=False, stream_success=False, error=blocked,
-                raw_path=raw, trace_format="native-v1", duration_s=1,
-                observed_model=None, observed_models=[], model_attested=False,
-                model_fallback=False, usage={}, provenance={})
+            result = {"unavailable": None, "safeguard_refusal": False,
+                      "blocked_on_question": False, "return_code": 1,
+                      "timed_out": False, "stream_success": False,
+                      "error": error, "raw_path": raw,
+                      "trace_format": "native-v1", "duration_s": 1,
+                      "observed_model": None, "observed_models": [],
+                      "model_attested": False, "model_fallback": False,
+                      "usage": {}, "provenance": {}}
+            result.update(flags)
+            teacher.run_trace.return_value = SimpleNamespace(**result)
             with mock.patch.object(generate_traces, "materialize",
                                    return_value=workspace), \
                  mock.patch.object(generate_traces, "protected_hashes",
                                    return_value={}):
-                record = generate_traces.trace_task(
+                return generate_traces.trace_task(
                     seed, teacher, force=True, traces_root=traces)
+
+    def test_a_safeguard_refusal_defers_the_seed_and_records_why(self):
+        # The queue must survive a seed the provider's filter dislikes: this
+        # returns a deferral record rather than raising the infrastructure
+        # failure that stops tracing and blocks the supervisor from restarting.
+        blocked = "OpenCode assistant error: {'name': 'ContentFilterError'}"
+        record = self._blocked_trace(blocked, safeguard_refusal=True)
         self.assertTrue(record["deferred_safeguard_refusal"])
         self.assertEqual(record["deferral_reason"], blocked)
         self.assertIsNone(record["passed"])
+
+    def test_a_question_no_one_can_answer_defers_the_seed_too(self):
+        # An agent that stops to ask the operator something is not a broken
+        # harness — it is one seed whose prompt invites a question. Raising
+        # here would stop the queue over a seed the next pass may well pass.
+        asked = ("OpenCode teacher asked the operator a question and a "
+                 "headless trace cannot answer it: Which archive?")
+        record = self._blocked_trace(asked, blocked_on_question=True)
+        self.assertTrue(record["deferred_interactive_question"])
+        self.assertEqual(record["deferral_reason"], asked)
+        self.assertIsNone(record["passed"])
+        # Kept apart from a refusal so provenance says which one happened.
+        self.assertNotIn("deferred_safeguard_refusal", record)
 
     def test_generic_pipeline_has_no_runtime_specific_dispatch(self):
         source = inspect.getsource(trace_pipeline)

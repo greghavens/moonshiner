@@ -318,6 +318,10 @@ class TraceResult:
     model_attested: bool = True
     model_fallback: bool = False
     safeguard_refusal: bool = False
+    # Set when the teacher asked the operator a question. A trace runs
+    # headless, so the reply never comes and the session is over; the caller
+    # defers this seed rather than treating a stopped agent as a broken harness.
+    blocked_on_question: bool = False
     usage: dict = field(default_factory=dict)
     error: str | None = None
     # Set (to a human-readable reason) when a metered account hit a usage limit

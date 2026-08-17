@@ -8,17 +8,23 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from runtimes.opencode import (  # noqa: E402
     OPENCODE_RUNTIME_VERSION,
+    BlockedOnQuestion,
     ContentFiltered,
     OpenCodeRuntime,
+    _EventStream,
     _completed_session_evidence,
     _is_content_filter,
+    _is_heartbeat,
     _snapshot_excludes,
     prompt_payload,
     validate_tool_schemas,
@@ -291,6 +297,105 @@ class AContentFilterBlockIsOneSeedsProblem(unittest.TestCase):
     def test_a_clean_session_raises_nothing(self):
         evidence = _completed_session_evidence(_completed_session())
         self.assertEqual(evidence["observed_models"], ["model-a"])
+
+
+class AQuestionEndsTheSessionRatherThanStallingIt(unittest.TestCase):
+    """OpenCode's question tool waits for a human a trace does not have."""
+
+    SESSION = "ses_a"
+
+    def _stream(self, *events) -> _EventStream:
+        stream = _EventStream("http://127.0.0.1:1",
+                              pathlib.Path("events.jsonl"))
+        stream.events = list(events)
+        return stream
+
+    def _question(self, session_id=SESSION, text="Which archive should I use?"):
+        return {"type": "question.asked",
+                "properties": {"id": "que_a", "sessionID": session_id,
+                               "questions": [{"question": text}]}}
+
+    def test_a_pending_question_is_reported_with_its_text(self):
+        stream = self._stream(self._question())
+        self.assertEqual(stream.pending_question(self.SESSION),
+                         "Which archive should I use?")
+
+    def test_another_sessions_question_is_not_this_sessions_problem(self):
+        stream = self._stream(self._question(session_id="ses_b"))
+        self.assertIsNone(stream.pending_question(self.SESSION))
+
+    def test_a_working_session_has_no_pending_question(self):
+        stream = self._stream({"type": "message.part.updated", "properties": {}})
+        self.assertIsNone(stream.pending_question(self.SESSION))
+
+    def test_the_block_is_caught_by_the_value_error_handlers(self):
+        # Same trap as ContentFiltered: the handlers that know this condition
+        # are the ones already catching ValueError.
+        self.assertTrue(issubclass(BlockedOnQuestion, ValueError))
+
+
+class _Events(BaseHTTPRequestHandler):
+    """A one-shot SSE endpoint that replays whatever the test hands it."""
+
+    payload: list[dict] = []
+
+    def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler's spelling
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        for event in self.payload:
+            self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+        self.wfile.flush()
+
+    def log_message(self, *_args):
+        pass
+
+
+class AHeartbeatIsNotProgress(unittest.TestCase):
+    """The inactivity timeout asks whether the session moved, not the server."""
+
+    def _drain(self, events) -> tuple[_EventStream, pathlib.Path]:
+        handler = type("_Handler", (_Events,), {"payload": events})
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        directory = tempfile.mkdtemp(dir=ROOT)
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = pathlib.Path(directory) / "events.jsonl"
+        host, port = server.server_address[:2]
+        stream = _EventStream(f"http://{host}:{port}", path).start()
+        deadline = time.monotonic() + 10
+        while len(stream.events) < len(events) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(stream.events), len(events), stream.error)
+        return stream, path
+
+    def test_a_heartbeat_is_recognised(self):
+        self.assertTrue(_is_heartbeat({"type": "server.heartbeat"}))
+        self.assertTrue(_is_heartbeat({"payload": {"type": "server.heartbeat"}}))
+        self.assertFalse(_is_heartbeat({"type": "message.part.updated"}))
+
+    def test_a_server_that_only_heartbeats_reads_as_idle(self):
+        # The failure this prevents: a session blocked on a question tool sat
+        # under a heartbeating server, the activity reading climbed every few
+        # seconds, and the inactivity timeout could never fire. The trace ran
+        # until the queue was killed.
+        stream, path = self._drain([{"type": "server.heartbeat"}] * 20)
+        self.assertEqual(stream.activity(), (0, 0))
+        # The transcript still records them, which is why its size was the
+        # wrong thing to measure.
+        self.assertGreater(path.stat().st_size, 0)
+
+    def test_real_session_events_still_count_as_progress(self):
+        stream, _ = self._drain([
+            {"type": "server.heartbeat"},
+            {"type": "message.part.updated", "properties": {"id": "part_a"}},
+            {"type": "server.heartbeat"},
+        ])
+        count, size = stream.activity()
+        self.assertEqual(count, 1)
+        self.assertGreater(size, 0)
 
 
 if __name__ == "__main__":

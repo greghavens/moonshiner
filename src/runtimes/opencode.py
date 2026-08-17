@@ -316,6 +316,39 @@ def _completed_session_evidence(session, *, expected_prompt: str | None = None,
     }
 
 
+HEARTBEAT_EVENT_TYPES = ("server.heartbeat",)
+QUESTION_EVENT_TYPES = ("question.asked",)
+
+
+class BlockedOnQuestion(ValueError):
+    """The teacher asked the operator a question, and a trace has no operator.
+
+    OpenCode's ``question`` tool suspends the session until someone answers.
+    Headless there is no one, and the server keeps heartbeating, so nothing
+    downstream can tell the difference between deliberating and stopped: the
+    attempt runs until the queue does. Treated as its own condition it becomes
+    a deferral — this seed's problem, not the harness's — and the run goes on.
+
+    It subclasses ``ValueError`` for the same reason as ``ContentFiltered``:
+    the handlers that know what this is are the ones that already catch
+    ``ValueError``, and a broader base walks straight past them.
+    """
+
+
+def _event_type(event) -> str:
+    payload = event.get("payload", event) if isinstance(event, dict) else {}
+    return str((payload or {}).get("type") or "")
+
+
+def _is_heartbeat(event) -> bool:
+    """Whether an event proves only that the server is alive.
+
+    OpenCode emits ``server.heartbeat`` every few seconds for as long as the
+    process lives, entirely independently of the session.
+    """
+    return _event_type(event) in HEARTBEAT_EVENT_TYPES
+
+
 class _EventStream:
     """Read OpenCode's native event stream solely as activity evidence."""
 
@@ -323,6 +356,14 @@ class _EventStream:
         self.base_url = base_url
         self.path = path
         self.events: list[dict] = []
+        # Counted separately from `events` because the inactivity timeout asks
+        # whether the *session* moved, and a heartbeat only says the server is
+        # up. Counting heartbeats as progress means an agent that stops for
+        # good — one blocked on a question tool with no human to answer it —
+        # resets the clock every few seconds and the trace hangs for the life
+        # of the queue instead of timing out.
+        self.progress = 0
+        self.progress_bytes = 0
         self.error: str | None = None
         self._stop = threading.Event()
         self._connected = threading.Event()
@@ -351,7 +392,11 @@ class _EventStream:
                     except json.JSONDecodeError:
                         continue
                     self.events.append(event)
-                    output.write(json.dumps(event, separators=(",", ":")) + "\n")
+                    record = json.dumps(event, separators=(",", ":"))
+                    if not _is_heartbeat(event):
+                        self.progress += 1
+                        self.progress_bytes += len(record)
+                    output.write(record + "\n")
                     output.flush()
         except BaseException as error:
             if not self._stop.is_set():
@@ -360,14 +405,32 @@ class _EventStream:
             self._connected.set()
 
     def activity(self) -> tuple[int, int]:
-        try:
-            size = self.path.stat().st_size
-        except OSError:
-            size = 0
-        return len(self.events), size
+        """Session progress, which the file on disk no longer measures.
+
+        The transcript keeps every event, heartbeats included, so its size
+        grows on a dead session. Only the progress counters answer the
+        question the inactivity timeout is actually asking.
+        """
+        return self.progress, self.progress_bytes
 
     def connected(self) -> bool:
         return self._connected.is_set() and self.error is None
+
+    def pending_question(self, session_id: str) -> str | None:
+        """The first question this session is waiting on, if any."""
+        for raw in self.events:
+            event = raw.get("payload", raw) if isinstance(raw, dict) else {}
+            if _event_type(raw) not in QUESTION_EVENT_TYPES:
+                continue
+            properties = event.get("properties") or {}
+            if properties.get("sessionID") != session_id:
+                continue
+            asked = properties.get("questions") or []
+            first = asked[0] if isinstance(asked, list) and asked else {}
+            text = (first.get("question") or first.get("header")
+                    if isinstance(first, dict) else None)
+            return str(text or "question text unavailable")
+        return None
 
     def terminal_count(self, session_id: str) -> int:
         count = 0
@@ -634,6 +697,15 @@ class OpenCodeRuntime(Runtime):
         last_activity = time.monotonic()
         interval = max(0.05, min(1.0, inactivity_timeout / 4))
         while events.terminal_count(session_id) <= previous_count:
+            # Checked before liveness, because the session is not slow — it is
+            # finished. Waiting for the inactivity timeout would never work:
+            # heartbeats keep both the event stream and the server's CPU and
+            # I/O counters moving, so every liveness signal reads as healthy.
+            question = events.pending_question(session_id)
+            if question is not None:
+                raise BlockedOnQuestion(
+                    "OpenCode teacher asked the operator a question and a "
+                    f"headless trace cannot answer it: {question}")
             if events.error:
                 raise RuntimeError(f"OpenCode event stream failed: {events.error}")
             if process.poll() is not None:
@@ -736,6 +808,7 @@ class OpenCodeRuntime(Runtime):
         timed_out = False
         error = None
         safeguard_refusal = False
+        blocked_on_question = False
         session: list[dict] = []
         session_id = None
         schemas = None
@@ -822,6 +895,9 @@ class OpenCodeRuntime(Runtime):
         except subprocess.TimeoutExpired:
             timed_out = True
             error = "OpenCode became inactive during a model call"
+        except BlockedOnQuestion as asked:
+            blocked_on_question = True
+            error = scrub_text(str(asked))
         except ContentFiltered as blocked:
             safeguard_refusal = True
             error = scrub_text(str(blocked))
@@ -846,6 +922,8 @@ class OpenCodeRuntime(Runtime):
             except ValueError as parse_error:
                 if isinstance(parse_error, ContentFiltered):
                     safeguard_refusal = True
+                if isinstance(parse_error, BlockedOnQuestion):
+                    blocked_on_question = True
                 error = error or scrub_text(str(parse_error))
         observed_models = evidence.get("observed_models") or []
         observed_model = observed_models[0] if observed_models else None
@@ -862,10 +940,12 @@ class OpenCodeRuntime(Runtime):
             observed_models=observed_models,
             model_attested=bool(observed_model and self.model_matches(observed_model)
                                 and audit.get("had_success")
-                                and not safeguard_refusal),
+                                and not safeguard_refusal
+                                and not blocked_on_question),
             usage=usage,
             error=error,
             safeguard_refusal=safeguard_refusal,
+            blocked_on_question=blocked_on_question,
             unavailable=availability.find_usage_limit(error),
             provenance={
                 "session_id": session_id,
