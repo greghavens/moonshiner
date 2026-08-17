@@ -1,7 +1,9 @@
 """Transactional trace claiming and paid-call accounting."""
 from __future__ import annotations
 
+import contextlib
 import pathlib
+import subprocess
 import sys
 import tempfile
 import threading
@@ -316,6 +318,51 @@ class TraceConcurrency(unittest.TestCase):
         self.assertEqual(
             trace_attempt_counts_for_current_seed_revision(db).get("seed-revised", 0), 0)
         db.close()
+
+
+class PublishingNeverStopsTracing(unittest.TestCase):
+    """Every trace process starts the publisher before it traces anything."""
+
+    def _ensure(self, active_code, start_code, stderr=""):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            if command[:3] == ["systemctl", "--user", "is-active"]:
+                return subprocess.CompletedProcess(command, active_code)
+            return subprocess.CompletedProcess(command, start_code, "", stderr)
+
+        with mock.patch.dict(trace_pipeline.CONFIG,
+                             {"publish": {"hf_dataset": "example/dataset"}}), \
+             mock.patch.object(trace_pipeline, "_moonshiner_executable",
+                               lambda: "/usr/bin/moonshiner"), \
+             mock.patch.object(trace_pipeline.subprocess, "run", fake_run), \
+             contextlib.redirect_stdout(io.StringIO()) as printed:
+            trace_pipeline.ensure_publish_queue()
+        return calls, printed.getvalue()
+
+    def test_losing_the_race_to_start_the_publisher_does_not_raise(self):
+        # Two trace processes reach this at once on any multi-worker pass, and
+        # is-active is still false for a unit that is only deactivating. The
+        # loser is told the name is taken, which reports a publisher that is
+        # already running — not a reason to stop tracing.
+        calls, printed = self._ensure(1, 1, "Failed to start transient service "
+                                      "unit: Unit m-publish.service was "
+                                      "already loaded or has a fragment file.")
+        self.assertEqual(len(calls), 2)
+        self.assertIn("tracing continues", printed)
+        self.assertIn("already loaded", printed)
+
+    def test_an_absent_publisher_is_started(self):
+        calls, printed = self._ensure(1, 0)
+        self.assertEqual(calls[1][0], "systemd-run")
+        self.assertEqual(calls[1][-1], "publish-queue-worker")
+        self.assertEqual(printed, "")
+
+    def test_a_running_publisher_is_left_alone(self):
+        calls, printed = self._ensure(0, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(printed, "")
 
 
 if __name__ == "__main__":

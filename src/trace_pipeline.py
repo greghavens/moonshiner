@@ -60,8 +60,23 @@ def ensure_publish_queue() -> None:
                _moonshiner_executable(), "publish-queue-worker"]
     status = subprocess.run(["systemctl", "--user", "is-active", "--quiet",
                              f"{unit}.service"])
-    if status.returncode != 0:
-        subprocess.run(command, check=True)
+    if status.returncode == 0:
+        return
+    # Two trace processes reach this at once on any multi-worker pass, and
+    # `is-active` is still false for a unit that is merely deactivating, so
+    # the loser of the race gets "unit was already loaded" — a report that the
+    # publisher is running, not that anything is wrong. Under `check=True`
+    # that raised out of `main`, and every non-zero trace exit is mapped to
+    # INFRASTRUCTURE_EXIT, which clears the pending queue and is one of the
+    # codes `RestartPreventExitStatus` refuses to restart: losing a race to
+    # start the publisher permanently stopped tracing. Publishing is
+    # downstream of tracing and does not get to halt it. The next pass calls
+    # this again, and accepted traces wait in the ledger meanwhile.
+    started = subprocess.run(command, capture_output=True, text=True)
+    if started.returncode != 0:
+        detail = (started.stderr or started.stdout or "").strip().splitlines()
+        print(f"publish queue not started ({unit}), tracing continues: "
+              f"{detail[-1] if detail else 'no detail reported'}", flush=True)
 
 
 def remove_completed_workspace(record: dict) -> None:
