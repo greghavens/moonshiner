@@ -6,6 +6,7 @@ regression where the relay buffered the whole upstream body: the client must
 see the first SSE chunk while the upstream is still holding the connection
 open, or long teacher turns die on the client's idle timeout.
 """
+import gzip
 import http.client
 import json
 import pathlib
@@ -24,6 +25,13 @@ REAL_KEY = "unit-test-real-key-not-a-secret"
 SSE_FIRST = (b'data: {"id":"1","model":"moonshotai/kimi-k3",'
              b'"choices":[{"delta":{"content":"a"}}]}\n\n')
 SSE_LAST = b"data: [DONE]\n\n"
+# The Anthropic Messages format names the model one level down, in the
+# message_start event that opens the stream.
+SSE_ANTHROPIC = (b'event: message_start\n'
+                 b'data: {"type":"message_start","message":'
+                 b'{"model":"moonshotai/kimi-k3","id":"1","role":"assistant"}}\n\n'
+                 b'event: content_block_delta\n'
+                 b'data: {"type":"content_block_delta","index":0}\n\n')
 
 
 class _Upstream(BaseHTTPRequestHandler):
@@ -31,6 +39,7 @@ class _Upstream(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     seen_auth: list[str] = []
     seen_x_api_key: list[str] = []
+    seen_accept_encoding: list[str] = []
     chunk_delay_s = 0.0
 
     def log_message(self, *_args):
@@ -40,6 +49,25 @@ class _Upstream(BaseHTTPRequestHandler):
         self.rfile.read(int(self.headers.get("Content-Length") or 0))
         type(self).seen_auth.append(self.headers.get("Authorization", ""))
         type(self).seen_x_api_key.append(self.headers.get("x-api-key", ""))
+        type(self).seen_accept_encoding.append(
+            self.headers.get("Accept-Encoding", ""))
+        if self.path == "/gzip":
+            # An upstream that compresses regardless of what was negotiated.
+            body = gzip.compress(SSE_FIRST + SSE_LAST)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path == "/messages":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(SSE_ANTHROPIC)))
+            self.end_headers()
+            self.wfile.write(SSE_ANTHROPIC)
+            return
         if self.path == "/error":
             body = json.dumps({"error": "bad key"}).encode()
             self.send_response(401)
@@ -62,6 +90,7 @@ class ProxyRelay(unittest.TestCase):
     def setUp(self):
         _Upstream.seen_auth = []
         _Upstream.seen_x_api_key = []
+        _Upstream.seen_accept_encoding = []
         _Upstream.chunk_delay_s = 0.0
         self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Upstream)
         threading.Thread(target=self.upstream.serve_forever,
@@ -71,13 +100,15 @@ class ProxyRelay(unittest.TestCase):
             f"http://127.0.0.1:{self.upstream.server_port}", REAL_KEY).start()
         self.addCleanup(self.session.stop)
 
-    def _post(self, path="/v1/chat/completions"):
+    def _post(self, path="/v1/chat/completions", accept_encoding=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.session.port,
                                           timeout=10)
         self.addCleanup(conn.close)
-        conn.request("POST", path, body=b"{}",
-                     headers={"Authorization": f"Bearer {DUMMY_TOKEN}",
-                              "Content-Type": "application/json"})
+        headers = {"Authorization": f"Bearer {DUMMY_TOKEN}",
+                   "Content-Type": "application/json"}
+        if accept_encoding:
+            headers["Accept-Encoding"] = accept_encoding
+        conn.request("POST", path, body=b"{}", headers=headers)
         return conn.getresponse()
 
     def _wait_models(self, timeout=2.0):
@@ -132,6 +163,37 @@ class ProxyRelay(unittest.TestCase):
                         "first chunk waited for the full upstream body")
         rest = response.read()
         self.assertIn(b"[DONE]", rest)
+
+    def test_a_client_negotiating_compression_still_attests(self):
+        """A compressed body is unreadable to the audit, so never ask for one.
+
+        Agent SDKs send ``Accept-Encoding: gzip, deflate, br, zstd`` without
+        being asked. Relayed as-is, upstream answers compressed, the captured
+        bytes decode to noise, and a genuine model call is reported as one
+        the provider never attested — which halts the whole trace queue as an
+        infrastructure failure.
+        """
+        response = self._post(accept_encoding="gzip, deflate, br, zstd")
+        self.assertIn(b"kimi-k3", response.read())
+        self.assertEqual(_Upstream.seen_accept_encoding, ["identity"])
+        self.assertEqual(self._wait_models(), ["moonshotai/kimi-k3"])
+
+    def test_an_anthropic_message_start_attests(self):
+        """OpenCode's teacher turn speaks the Messages format, not OpenAI's.
+
+        Its opening event nests the identity under ``message``, so a reader
+        that only knows the top-level field sees a real Fable 5 turn as a
+        model the provider never attested.
+        """
+        response = self._post("/messages")
+        self.assertIn(b"message_start", response.read())
+        self.assertEqual(self._wait_models(), ["moonshotai/kimi-k3"])
+
+    def test_an_upstream_that_compresses_anyway_still_attests(self):
+        response = self._post("/gzip")
+        self.assertEqual(response.getheader("Content-Encoding"), "gzip")
+        self.assertIn(b"kimi-k3", gzip.decompress(response.read()))
+        self.assertEqual(self._wait_models(), ["moonshotai/kimi-k3"])
 
     def test_upstream_http_error_is_relayed_and_audited(self):
         response = self._post("/error")

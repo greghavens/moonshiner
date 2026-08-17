@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import zlib
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -53,13 +54,56 @@ class Audit:
         }
 
 
-def _extract_model(body: bytes) -> str | None:
-    """Pull a ``model`` field from a JSON or SSE (streamed) response body."""
-    text = body.decode("utf-8", "replace")
+def _plaintext(body: bytes, encoding: str | None) -> bytes:
+    """Undo a content coding the upstream applied despite being asked not to.
+
+    ``_relay`` asks for ``identity``, so this is the second line of defence:
+    a proxy or provider that compresses anyway would otherwise hand the audit
+    bytes it cannot read, and attestation would fail with the model right
+    there in the body. A capture is usually a truncated prefix of a stream,
+    so decompression is incremental and keeps whatever it managed to decode.
+    """
+    name = (encoding or "").strip().lower()
+    if not body or name in {"", "identity"}:
+        return body
+    windows = {"gzip": 16 + zlib.MAX_WBITS, "deflate": zlib.MAX_WBITS}
+    if name not in windows:
+        return b""
     try:
-        return json.loads(text).get("model")
-    except (json.JSONDecodeError, AttributeError):
-        pass
+        return zlib.decompressobj(windows[name]).decompress(body)
+    except zlib.error:
+        return b""
+
+
+def _model_of(payload: object) -> str | None:
+    """The model a provider names, in either wire format's place for it.
+
+    OpenAI-shaped bodies put it at the top level. The Anthropic Messages
+    format opens its stream with ``message_start`` and nests the identity one
+    level down, under ``message``. Reading only the top level there finds
+    nothing, and a genuine call by the configured model is recorded as
+    unattested — which the trace queue treats as an infrastructure failure
+    and stops on.
+    """
+    if not isinstance(payload, dict):
+        return None
+    for candidate in (payload.get("model"),
+                      (payload.get("message") or {}).get("model")
+                      if isinstance(payload.get("message"), dict) else None):
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return None
+
+
+def _extract_model(body: bytes, encoding: str | None = None) -> str | None:
+    """Pull a ``model`` field from a JSON or SSE (streamed) response body."""
+    text = _plaintext(body, encoding).decode("utf-8", "replace")
+    try:
+        model = _model_of(json.loads(text))
+    except json.JSONDecodeError:
+        model = None
+    if model:
+        return model
     for line in text.splitlines():
         line = line.strip()
         if not line.startswith("data:"):
@@ -68,8 +112,8 @@ def _extract_model(body: bytes) -> str | None:
         if not payload or payload == "[DONE]":
             continue
         try:
-            model = json.loads(payload).get("model")
-        except (json.JSONDecodeError, AttributeError):
+            model = _model_of(json.loads(payload))
+        except json.JSONDecodeError:
             continue
         if model:
             return model
@@ -92,8 +136,15 @@ def _make_handler(upstream: str, real_key: str, audit: Audit,
             target = upstream_base + self.path
             headers = {key: value for key, value in self.headers.items()
                        if key.lower() not in {"host", "authorization",
-                                              "x-api-key",
+                                              "x-api-key", "accept-encoding",
                                               "content-length", "connection"}}
+            # Attestation is read out of the response body, so the audit must
+            # never be handed a stream it cannot parse. Agent SDKs negotiate
+            # gzip/br/zstd by default; upstream then answers compressed, the
+            # captured bytes decode to noise, and a genuine model call looks
+            # unattested. Ask for plaintext rather than carry a codec for
+            # every encoding a client might one day offer.
+            headers["Accept-Encoding"] = "identity"
             if auth_style == "x-api-key":
                 headers["x-api-key"] = real_key
             else:
@@ -144,7 +195,8 @@ def _make_handler(upstream: str, real_key: str, audit: Audit,
                         self.wfile.write(b"%X\r\n%s\r\n" % (len(chunk), chunk))
                         self.wfile.flush()
                 finally:
-                    exchange["response_model"] = _extract_model(captured)
+                    exchange["response_model"] = _extract_model(
+                        captured, response.headers.get("Content-Encoding"))
 
         def do_POST(self):  # noqa: N802 (http.server API)
             self._relay("POST")
