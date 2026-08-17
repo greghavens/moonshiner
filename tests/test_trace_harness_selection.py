@@ -236,6 +236,37 @@ class CapabilityResolverContract(unittest.TestCase):
         self.assertTrue(
             {"workspace_write"} <= set(selected.trace_capabilities()))
 
+    def test_an_alternative_harness_uses_the_model_its_own_provider_names(self):
+        config = self.config([HarnessB.name, HarnessA.name])
+        config["runtimes"][HarnessB.name]["trace_model"] = "vendor/same-model"
+        config["runtimes"][HarnessB.name]["trace_reasoning"] = "high"
+        selected, resolution = self.resolve({
+            "id": "alternative",
+            "required_harness_capabilities": ["live_web_research"],
+        }, config)
+        self.assertEqual(selected.name, HarnessB.name)
+        self.assertEqual(selected.role["model"], "vendor/same-model")
+        self.assertEqual(selected.role["reasoning"], "high")
+        self.assertEqual(resolution["model"], "vendor/same-model")
+
+    def test_a_harness_without_its_own_model_still_inherits_the_teachers(self):
+        selected, resolution = self.resolve({
+            "id": "inherited",
+            "required_harness_capabilities": ["live_web_research"],
+        }, self.config([HarnessB.name, HarnessA.name]))
+        self.assertEqual(selected.name, HarnessB.name)
+        self.assertEqual(resolution["model"], "same-model")
+
+    def test_the_configured_teacher_keeps_the_model_it_was_configured_with(self):
+        config = self.config([HarnessA.name, HarnessB.name])
+        config["runtimes"][HarnessA.name]["trace_model"] = "never-substituted"
+        selected, resolution = self.resolve({
+            "id": "configured", "required_harness_capabilities": ["alpha"],
+        }, config)
+        self.assertEqual(selected.name, HarnessA.name)
+        self.assertEqual(selected.role["model"], "same-model")
+        self.assertEqual(resolution["model"], "same-model")
+
     def test_non_capability_identity_never_changes_selection(self):
         config = self.config([HarnessC.name, HarnessB.name])
         base = {
@@ -535,6 +566,34 @@ class CatalogAndConfigurationContract(unittest.TestCase):
     def test_shipped_harness_order_defaults_to_empty_list(self):
         config = json.loads((ROOT / "config.json").read_text())
         self.assertEqual(config["pipeline"]["trace"]["harness_order"], [])
+
+    def test_no_shipped_seed_requires_a_capability_no_harness_provides(self):
+        """A capability nothing provides stops the queue, not just the seed.
+
+        ``resolve_trace_harness`` raises ``NoCompatibleTraceHarness`` for such a
+        seed, and the trace queue treats that as infrastructure: it exits 78,
+        which the supervisor refuses to restart. One seed spelling a capability
+        a way no adapter answers to therefore takes the whole corpus down, so
+        the vocabulary is checked here rather than discovered in production.
+        """
+        config = json.loads((ROOT / "config.json").read_text())
+        provided: set[str] = set()
+        for name, cls in runtimes.REGISTRY.items():
+            runtime = cls(config, {**config["teacher"], "runtime": name})
+            runtime.runtime_config = (config.get("runtimes") or {}).get(name, {})
+            provided |= set(runtime.trace_capabilities())
+        unprovidable: dict[str, list[str]] = {}
+        for task_path in sorted((ROOT / "tasks" / "seeds").glob("*/task.json")):
+            task = json.loads(task_path.read_text())
+            for field in ("required_harness_capabilities",
+                          "preferred_harness_capabilities"):
+                for capability in task.get(field) or []:
+                    if capability not in provided:
+                        unprovidable.setdefault(capability, []).append(task["id"])
+        self.assertEqual(
+            unprovidable, {},
+            f"capabilities no registered harness provides; provided: "
+            f"{sorted(provided)}")
 
 
 if __name__ == "__main__":

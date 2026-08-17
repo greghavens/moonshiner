@@ -89,6 +89,24 @@ def _capability_list(seed: dict, field: str) -> list[str]:
     return list(dict.fromkeys(value))
 
 
+def _alternative_role(role: dict, name: str, runtime_config: dict) -> dict:
+    """The teacher role as the named *alternative* harness has to run it.
+
+    Model identifiers are provider-scoped: one model is ``claude-fable-5`` to
+    Claude Code and ``anthropic/claude-fable-5`` to ZenMux. Handing an
+    alternative harness the configured teacher's spelling asks it for a model
+    its provider has never heard of, so a harness eligible for capability
+    selection names its own model in its own runtime block.
+    """
+    alternative = {**role, "runtime": name}
+    for field, override in (("model", "trace_model"),
+                            ("reasoning", "trace_reasoning")):
+        value = runtime_config.get(override)
+        if value:
+            alternative[field] = str(value)
+    return alternative
+
+
 def _provided_capabilities(runtime: Runtime) -> frozenset[str]:
     try:
         return frozenset(runtime.trace_capabilities())
@@ -149,10 +167,12 @@ def resolve_trace_harness(seed: dict, configured_teacher: Runtime | None = None,
     for position, name in enumerate(order):
         if name not in configured_runtimes:
             continue
-        candidate_config = {
-            **config,
-            "teacher": {**configured_teacher.role, "runtime": name},
-        }
+        # The configured teacher already states its own model; only a harness
+        # standing in for it needs the per-runtime spelling.
+        role = ({**configured_teacher.role} if name == configured_teacher.name
+                else _alternative_role(configured_teacher.role, name,
+                                       configured_runtimes[name] or {}))
+        candidate_config = {**config, "teacher": {**role, "runtime": name}}
         try:
             candidate = get_runtime("teacher", candidate_config)
             candidate.preflight(require_auth=False)
