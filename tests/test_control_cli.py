@@ -50,6 +50,8 @@ class DoctorCoversSeedAuthoring(unittest.TestCase):
              mock.patch.object(control_cli, "get_judge", return_value=ready), \
              mock.patch.object(control_cli, "get_seed_author", return_value=ready) as author, \
              mock.patch.object(control_cli, "get_seed_judge", return_value=ready) as judge, \
+             mock.patch.object(control_cli, "trace_harness_alternatives",
+                               return_value=[]), \
              mock.patch("builtins.print"):
             control_cli.doctor_main([])
         return author, judge
@@ -63,3 +65,48 @@ class DoctorCoversSeedAuthoring(unittest.TestCase):
         author, judge = self._run(False)
         author.assert_not_called()
         judge.assert_not_called()
+
+
+class DoctorCoversAlternativeTraceHarnesses(unittest.TestCase):
+    """A harness in ``harness_order`` is only authenticated once chosen.
+
+    That happens mid-run with a seed already claimed, where the failure is
+    terminal and stops the queue. Doctor has to ask the question earlier.
+    """
+
+    def _run(self, alternative):
+        import control_cli
+        ready = mock.Mock(name="ready")
+        ready.name = "opencode"
+        ready.role = {"model": "anthropic/claude-fable-5"}
+        config = {"pipeline": {"queues": {"seed_authoring": False}}}
+        with mock.patch.dict(control_cli.CONFIG, config, clear=False), \
+             mock.patch.object(control_cli, "get_teacher", return_value=ready), \
+             mock.patch.object(control_cli, "get_judge", return_value=ready), \
+             mock.patch.object(control_cli, "trace_harness_alternatives",
+                               return_value=[alternative]), \
+             mock.patch("builtins.print") as printed:
+            code = control_cli.doctor_main([])
+        return code, "\n".join(str(call.args[0]) for call in
+                               printed.call_args_list if call.args)
+
+    @staticmethod
+    def _alternative(error=None):
+        runtime = mock.Mock(name="alternative")
+        runtime.name = "claude-code"
+        runtime.role = {"model": "claude-fable-5"}
+        runtime.preflight.side_effect = error
+        return runtime
+
+    def test_an_unauthenticated_alternative_fails_the_check(self):
+        alternative = self._alternative(SystemExit("claude-code not authenticated"))
+        code, output = self._run(alternative)
+        alternative.preflight.assert_called_once_with(require_auth=True)
+        self.assertEqual(code, 1)
+        self.assertIn("trace harness claude-code", output)
+        self.assertIn("not authenticated", output)
+
+    def test_a_healthy_alternative_passes(self):
+        code, output = self._run(self._alternative())
+        self.assertEqual(code, 0)
+        self.assertIn("trace harness claude-code", output)

@@ -6,11 +6,12 @@ import getpass
 import os
 import shutil
 import sys
+from pathlib import Path
 
 from common import (CONFIG, SEEDS_DIR, STORAGE_ROOT, key_env_name, key_file_path,
                     key_persist_path)
 from runtimes import (get_judge, get_seed_author, get_seed_judge,
-                      get_teacher)
+                      get_teacher, trace_harness_alternatives)
 
 
 def _provider_label(value: str) -> str:
@@ -36,6 +37,8 @@ def _credential_target(name: str) -> tuple[str, dict] | None:
             "api": "openai-completions",
             "key_env": "ZENMUX_API_KEY",
         }
+    if needle in {"claude-code", "claude_code", "claude"}:
+        return "claude-code", dict(runtimes.get("claude-code") or {"cli": "claude"})
     for runtime in runtimes.values():
         provider = str(runtime.get("provider") or "").lower()
         display = str(runtime.get("display_provider") or "").lower()
@@ -47,12 +50,72 @@ def _credential_target(name: str) -> tuple[str, dict] | None:
     return None
 
 
+def _account_auth(action: str, source: str | None) -> int:
+    """``auth`` for a harness that logs in through its own CLI, not a key.
+
+    There is no key to prompt for, but there is very much a repair to perform:
+    a login that still works can be invisible to both the CLI and the sandbox
+    simply because its config directory was renamed. Doing that repair here
+    keeps it inside the tool, where ``doctor`` can point at it.
+    """
+    from runtimes.claude_code import (CREDENTIAL_NAME, account_credential,
+                                      adopt_credential, credential_home,
+                                      displaced_credentials)
+    active, displaced = account_credential(), displaced_credentials()
+    if action == "remove":
+        print("Claude Code authenticates through its own CLI; "
+              "sign out with: claude /logout", file=sys.stderr)
+        return 2
+    if action == "status":
+        if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+            print("Claude Code: configured via environment "
+                  "$CLAUDE_CODE_OAUTH_TOKEN")
+            return 0
+        if active is not None:
+            print(f"Claude Code: configured via {active}")
+            return 0
+        print(f"Claude Code: missing ({credential_home() / CREDENTIAL_NAME})")
+        for path in displaced:
+            print(f"  a login is sitting at {path}")
+        print("  repair with: moonshiner auth set claude-code" if displaced
+              else "  log in with: claude /login")
+        return 1
+    if source:
+        chosen = Path(source).expanduser()
+        if not chosen.is_file():
+            print(f"no login file at {chosen}", file=sys.stderr)
+            return 2
+    elif active is not None:
+        print(f"Claude Code: already configured via {active}")
+        return 0
+    elif not displaced:
+        print("no Claude Code login found to adopt; log in with: claude /login",
+              file=sys.stderr)
+        return 2
+    elif len(displaced) > 1:
+        print("several logins found; choose one with --from:", file=sys.stderr)
+        for path in displaced:
+            print(f"  {path}", file=sys.stderr)
+        return 2
+    else:
+        chosen = displaced[0]
+    destination = adopt_credential(chosen)
+    print(f"adopted Claude Code login from {chosen} into {destination} "
+          "(mode 0600)")
+    return 0
+
+
 def auth_main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="moonshiner auth")
     sub = parser.add_subparsers(dest="action", required=True)
     for action in ("set", "status", "remove"):
         child = sub.add_parser(action)
         child.add_argument("provider", help="Credential provider, e.g. openrouter")
+        if action == "set":
+            child.add_argument(
+                "--from", dest="source", metavar="PATH",
+                help="adopt an existing login file, for harnesses that "
+                     "authenticate through their own CLI (claude-code)")
     args = parser.parse_args(argv)
     target = _credential_target(args.provider)
     if target is None:
@@ -65,6 +128,8 @@ def auth_main(argv: list[str] | None = None) -> int:
         print(f"unknown credential provider: {args.provider}; choose: "
               f"{', '.join(providers) or 'none configured'}", file=sys.stderr); return 2
     provider, runtime = target
+    if provider == "claude-code":
+        return _account_auth(args.action, getattr(args, "source", None))
     label = _provider_label(provider)
     try:
         env_name = key_env_name(runtime)
@@ -119,6 +184,18 @@ def doctor_main(argv: list[str] | None = None) -> int:
                            "detail": f"{runtime.name}/{runtime.role['model']} ready"})
         except BaseException as error:  # adapters commonly raise SystemExit
             checks.append({"check": role, "ok": False, "detail": str(error)})
+    # A seed declaring capabilities can be routed to a harness that is neither
+    # the author nor the judge. Those are authenticated only once selected,
+    # mid-run, where the failure is terminal and stops the queue — so check
+    # them here too, while nothing is at stake.
+    for runtime in trace_harness_alternatives():
+        check = f"trace harness {runtime.name}"
+        try:
+            runtime.preflight(require_auth=True)
+            checks.append({"check": check, "ok": True,
+                           "detail": f"{runtime.name}/{runtime.role['model']} ready"})
+        except BaseException as error:
+            checks.append({"check": check, "ok": False, "detail": str(error)})
     checks.extend([
         {"check": "git", "ok": shutil.which("git") is not None,
          "detail": shutil.which("git") or "not found"},

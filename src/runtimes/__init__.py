@@ -13,8 +13,8 @@ from runtimes.base import ReviewResult, Runtime, TraceResult
 __all__ = ["Runtime", "TraceResult", "ReviewResult", "REGISTRY",
            "get_runtime", "get_teacher", "get_judge", "get_seed_author",
            "get_seed_judge", "runtime_names", "source_runtime_names",
-           "resolve_trace_harness", "NoCompatibleTraceHarness",
-           "TraceHarnessInfrastructureFailure"]
+           "resolve_trace_harness", "trace_harness_alternatives",
+           "NoCompatibleTraceHarness", "TraceHarnessInfrastructureFailure"]
 
 
 class NoCompatibleTraceHarness(RuntimeError):
@@ -105,6 +105,38 @@ def _alternative_role(role: dict, name: str, runtime_config: dict) -> dict:
         if value:
             alternative[field] = str(value)
     return alternative
+
+
+def trace_harness_alternatives(config: dict | None = None) -> list[Runtime]:
+    """Harnesses ``pipeline.trace.harness_order`` may route a seed to.
+
+    Capability selection deliberately authenticates a harness only after
+    choosing it, where a failure is terminal and stops the run. That leaves no
+    earlier moment to notice an alternative harness has no credential, so
+    ``doctor`` walks this list to raise the alarm before a seed is at stake.
+    """
+    config = config or CONFIG
+    runtimes = config.get("runtimes") or {}
+    order = (((config.get("pipeline") or {}).get("trace") or {})
+             .get("harness_order") or [])
+    if not isinstance(order, list):
+        return []
+    try:
+        configured = get_teacher(config)
+    except (SystemExit, Exception):
+        return []
+    found: list[Runtime] = []
+    for name in dict.fromkeys(order):
+        if not isinstance(name, str) or name == configured.name \
+                or name not in runtimes:
+            continue
+        role = _alternative_role(configured.role, name, runtimes[name] or {})
+        try:
+            found.append(get_runtime(
+                "teacher", {**config, "teacher": {**role, "runtime": name}}))
+        except (SystemExit, Exception):
+            continue
+    return found
 
 
 def _provided_capabilities(runtime: Runtime) -> frozenset[str]:

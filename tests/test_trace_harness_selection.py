@@ -596,5 +596,41 @@ class CatalogAndConfigurationContract(unittest.TestCase):
             f"{sorted(provided)}")
 
 
+class AlternativeHarnessDiscovery(unittest.TestCase):
+    """Doctor needs the same harness list capability selection will build.
+
+    Selection authenticates a harness only after choosing it, mid-run, where
+    the failure stops the queue. Enumerating the alternatives up front is what
+    lets that failure be reported while nothing is at stake.
+    """
+
+    CONFIG = {
+        "teacher": {"runtime": "opencode", "model": "anthropic/claude-fable-5",
+                    "reasoning": "default"},
+        "runtimes": {
+            "opencode": {"cli": "opencode", "provider": "zenmux"},
+            "claude-code": {"cli": "claude", "trace_model": "claude-fable-5"},
+        },
+        "pipeline": {"trace": {"harness_order": ["opencode", "claude-code"]}},
+    }
+
+    def test_the_configured_teacher_is_not_its_own_alternative(self):
+        found = runtimes.trace_harness_alternatives(self.CONFIG)
+        self.assertEqual([runtime.name for runtime in found], ["claude-code"])
+
+    def test_an_alternative_carries_its_own_model_spelling(self):
+        alternative, = runtimes.trace_harness_alternatives(self.CONFIG)
+        self.assertEqual(alternative.role["model"], "claude-fable-5")
+
+    def test_an_unset_order_yields_nothing(self):
+        config = {**self.CONFIG, "pipeline": {"trace": {}}}
+        self.assertEqual(runtimes.trace_harness_alternatives(config), [])
+
+    def test_a_name_with_no_runtime_block_is_skipped(self):
+        config = {**self.CONFIG,
+                  "pipeline": {"trace": {"harness_order": ["opencode", "nope"]}}}
+        self.assertEqual(runtimes.trace_harness_alternatives(config), [])
+
+
 if __name__ == "__main__":
     unittest.main()

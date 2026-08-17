@@ -25,6 +25,53 @@ from runtimes.base import (ReviewResult, Runtime, TraceResult,
 
 REFUSAL_MARKERS = ("model_refusal_no_fallback", "model_refusal")
 READ_ONLY_DISALLOW = "Edit Write NotebookEdit Bash MultiEdit"
+CREDENTIAL_NAME = ".credentials.json"
+
+
+def credential_home() -> Path:
+    """The directory Claude Code reads its login from on this host."""
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(configured) if configured else Path.home() / ".claude"
+
+
+def account_credential() -> Path | None:
+    """The login file Claude Code will actually read, if there is one.
+
+    Shared by ``preflight`` and ``_auth_bindings`` on purpose: a check that
+    resolves a different path than the bind is worse than no check at all,
+    because it reports health for a file the sandbox never receives.
+    """
+    candidate = credential_home() / CREDENTIAL_NAME
+    return candidate if candidate.is_file() else None
+
+
+def displaced_credentials() -> list[Path]:
+    """Logins sitting beside the config directory rather than inside it.
+
+    Renaming ``~/.claude`` (to ``.claude-broken``, ``.claude.bak``, …) leaves a
+    perfectly good login intact but invisible: the CLI answers "Not logged in",
+    and the trace queue only finds out mid-run, as an infrastructure failure
+    that stops everything. Naming the file that does exist turns an archaeology
+    session into a one-line repair.
+    """
+    home, active = Path.home(), credential_home().resolve()
+    found = []
+    for root in sorted(home.glob(".claude*")):
+        if not root.is_dir() or root.resolve() == active:
+            continue
+        candidate = root / CREDENTIAL_NAME
+        if candidate.is_file():
+            found.append(candidate)
+    return found
+
+
+def adopt_credential(source: Path) -> Path:
+    """Install a login where both the CLI and the sandbox bind will find it."""
+    destination = credential_home() / CREDENTIAL_NAME
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    destination.write_bytes(source.read_bytes())
+    destination.chmod(0o600)
+    return destination
 
 class ClaudeCodeRuntime(Runtime):
     name = "claude-code"
@@ -50,6 +97,19 @@ class ClaudeCodeRuntime(Runtime):
             subprocess.run([cli, "--version"], capture_output=True, check=True)
         except (subprocess.CalledProcessError, FileNotFoundError) as error:
             raise SystemExit(f"claude CLI unusable: {error}") from error
+        # Every other adapter fails preflight when its credential is absent;
+        # this one used to accept require_auth and ignore it, so `doctor`
+        # reported a ready harness and the queue discovered the truth only
+        # after claiming a seed — where it counts as an infrastructure failure
+        # and stops the run.
+        if require_auth and account_credential() is None \
+                and not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+            lines = ["claude-code not authenticated "
+                     f"({credential_home() / CREDENTIAL_NAME} missing)"]
+            lines += [f"  a login is sitting at {path}"
+                      for path in displaced_credentials()]
+            lines.append("  repair with: moonshiner auth set claude-code")
+            raise SystemExit("\n".join(lines))
 
     def trace_probe_command(self) -> list[str]:
         return [str(self.runtime_config.get("cli", "claude")), "--version"]
@@ -159,10 +219,12 @@ class ClaudeCodeRuntime(Runtime):
     @staticmethod
     def _auth_bindings(environment: dict[str, str]
                        ) -> tuple[tuple[Path, Path], ...]:
-        source = Path.home() / ".claude" / ".credentials.json"
-        if not source.is_file():
+        source = account_credential()
+        if source is None:
             return ()
-        destination = Path(environment["CLAUDE_CONFIG_DIR"]) / ".credentials.json"
+        # The source is resolved against the host; the destination against the
+        # sandbox's own CLAUDE_CONFIG_DIR, which points inside the workspace.
+        destination = Path(environment["CLAUDE_CONFIG_DIR"]) / CREDENTIAL_NAME
         return ((source, destination),)
 
     @staticmethod
