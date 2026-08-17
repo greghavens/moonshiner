@@ -349,6 +349,21 @@ def _is_heartbeat(event) -> bool:
     return _event_type(event) in HEARTBEAT_EVENT_TYPES
 
 
+def _question_block(events: "_EventStream", session_id: str):
+    """The block to raise if this session is waiting on an operator, else None.
+
+    Shared by both waits because the question can arrive during either: the
+    turn request blocks until the assistant finishes, and an assistant waiting
+    on an answer never does.
+    """
+    question = events.pending_question(session_id)
+    if question is None:
+        return None
+    return BlockedOnQuestion(
+        "OpenCode teacher asked the operator a question and a headless "
+        f"trace cannot answer it: {question}")
+
+
 class _EventStream:
     """Read OpenCode's native event stream solely as activity evidence."""
 
@@ -701,11 +716,9 @@ class OpenCodeRuntime(Runtime):
             # finished. Waiting for the inactivity timeout would never work:
             # heartbeats keep both the event stream and the server's CPU and
             # I/O counters moving, so every liveness signal reads as healthy.
-            question = events.pending_question(session_id)
-            if question is not None:
-                raise BlockedOnQuestion(
-                    "OpenCode teacher asked the operator a question and a "
-                    f"headless trace cannot answer it: {question}")
+            blocked = _question_block(events, session_id)
+            if blocked is not None:
+                raise blocked
             if events.error:
                 raise RuntimeError(f"OpenCode event stream failed: {events.error}")
             if process.poll() is not None:
@@ -723,7 +736,8 @@ class OpenCodeRuntime(Runtime):
 
     @staticmethod
     def _send_with_activity(process: subprocess.Popen, request, *,
-                            inactivity_timeout: float, activity_probe):
+                            inactivity_timeout: float, activity_probe,
+                            abort_check=None):
         completed = threading.Event()
         outcome: dict[str, object] = {}
 
@@ -742,6 +756,17 @@ class OpenCodeRuntime(Runtime):
         external = activity_probe()
         last_activity = time.monotonic()
         while not completed.wait(interval):
+            # Before liveness, because a request can be outstanding for a
+            # reason no amount of waiting resolves. A turn request returns
+            # when the assistant finishes its turn, and an assistant waiting
+            # on an operator's answer never finishes; the server goes on
+            # heartbeating and burning ticks, so every liveness signal below
+            # reads healthy and the timeout never fires.
+            abort = abort_check() if abort_check is not None else None
+            if abort is not None:
+                _kill_process_tree(process)
+                process.wait()
+                raise abort
             if process.poll() is not None:
                 raise RuntimeError(
                     f"OpenCode server exited {process.returncode} during request")
@@ -866,6 +891,7 @@ class OpenCodeRuntime(Runtime):
                             len(proxy.snapshot().get("exchanges") or []),
                             stdout_path.stat().st_size,
                             stderr_path.stat().st_size),
+                        abort_check=lambda: _question_block(events, session_id),
                     )
                     if events.error:
                         raise RuntimeError(

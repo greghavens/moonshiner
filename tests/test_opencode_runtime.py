@@ -1,6 +1,7 @@
 """Native OpenCode session, reasoning, tool, and schema contracts."""
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import pathlib
@@ -12,10 +13,13 @@ import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from runtimes import opencode  # noqa: E402
 from runtimes.opencode import (  # noqa: E402
     OPENCODE_RUNTIME_VERSION,
     BlockedOnQuestion,
@@ -332,6 +336,49 @@ class AQuestionEndsTheSessionRatherThanStallingIt(unittest.TestCase):
         # Same trap as ContentFiltered: the handlers that know this condition
         # are the ones already catching ValueError.
         self.assertTrue(issubclass(BlockedOnQuestion, ValueError))
+
+    def test_a_request_that_will_never_return_is_abandoned(self):
+        # Where the hang actually lived. The turn request returns when the
+        # assistant finishes its turn, and one waiting on an operator's answer
+        # never does — so the check that runs *after* the request comes back is
+        # unreachable, and the timeout inside it cannot fire either: the server
+        # keeps heartbeating and burning ticks, so it reads as busy forever.
+        stream = self._stream(self._question())
+        never = threading.Event()
+        self.addCleanup(never.set)
+        process = SimpleNamespace(pid=os.getpid(), args=["opencode"],
+                                  poll=lambda: None, wait=lambda: 0)
+        with mock.patch.object(opencode, "_kill_process_tree") as killed:
+            with self.assertRaises(BlockedOnQuestion) as caught:
+                OpenCodeRuntime._send_with_activity(
+                    process, never.wait,
+                    inactivity_timeout=3600,
+                    activity_probe=lambda: 0,
+                    abort_check=lambda: opencode._question_block(
+                        stream, self.SESSION))
+        self.assertIn("Which archive", str(caught.exception))
+        # The socket the request is blocked on has to go, or the send thread
+        # outlives the attempt still holding it.
+        killed.assert_called_once_with(process)
+
+    def test_the_turn_request_is_the_one_wired_to_abort(self):
+        # Having the guard and not reaching it is the bug this shipped with:
+        # the check sat after the turn request, which a pending question stops
+        # from ever returning.
+        source = inspect.getsource(OpenCodeRuntime._run_server_session)
+        turn = source.index('f"/session/{session_id}/message"')
+        following = source.index("_wait_for_terminal_event", turn)
+        self.assertIn("abort_check", source[turn:following])
+
+    def test_a_request_still_in_flight_is_left_alone(self):
+        stream = self._stream({"type": "server.heartbeat"})
+        process = SimpleNamespace(pid=os.getpid(), args=["opencode"],
+                                  poll=lambda: None, wait=lambda: 0)
+        answered = OpenCodeRuntime._send_with_activity(
+            process, lambda: "session",
+            inactivity_timeout=3600, activity_probe=lambda: 0,
+            abort_check=lambda: opencode._question_block(stream, self.SESSION))
+        self.assertEqual(answered, "session")
 
 
 class _Events(BaseHTTPRequestHandler):
