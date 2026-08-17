@@ -453,6 +453,23 @@ def main(argv: list[str] | None = None) -> int:
                                 reasoning_stage=stage,
                                 capability_resolution=capability_resolution)
         usage = (record.get("teacher") or {}).get("usage") or {}
+        # A deferral produced no candidate at all, so there is nothing for the
+        # judge to read: `screen` would go looking for a raw trace that was
+        # never written and raise, which lands back here as an infrastructure
+        # failure and stops the queue — the outcome deferring exists to avoid.
+        if record.get("deferred_safeguard_refusal"):
+            reason = str(record.get("deferral_reason") or "safeguard refusal")
+            status = "retry" if has_more else "exhausted"
+            finish_attempt(worker_db, run_id, seed["id"], number, status,
+                           usage, None, reason)
+            remove_completed_workspace(record)
+            # Always to the tail, whatever retry_order says: an immediate retry
+            # walks the same prompt back into the same filter.
+            if status == "retry":
+                set_job(worker_db, run_id, seed["id"], "deferred", number, reason)
+                status = "deferred"
+            print(f"[{status}] {seed['id']}: {reason}", flush=True)
+            return
         # Candidate checks are evidence for the trace judge, never a separate
         # rejection gate. Every completed candidate proceeds to judgment.
         record_model_call(worker_db, run_id)

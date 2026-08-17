@@ -99,9 +99,22 @@ class TraceConcurrency(unittest.TestCase):
             self.assertTrue(outside.exists())
 
     def test_every_completed_generated_attempt_path_removes_its_workspace(self):
+        # Three ways an attempt finishes: accepted, judged and not accepted,
+        # and deferred before judgment. Each leaves a workspace behind.
         source = inspect.getsource(trace_pipeline.main)
         generated = source[source.index("record = trace_task("):]
-        self.assertEqual(generated.count("remove_completed_workspace(record)"), 2)
+        self.assertEqual(generated.count("remove_completed_workspace(record)"), 3)
+
+    def test_a_deferred_attempt_returns_before_the_judge_is_called(self):
+        # There is no candidate to read, so screen() would hunt for a raw trace
+        # that was never written and raise — arriving back here as the
+        # infrastructure failure that deferring exists to avoid.
+        source = inspect.getsource(trace_pipeline.main)
+        generated = source[source.index("record = trace_task("):]
+        deferral = generated.index('record.get("deferred_safeguard_refusal")')
+        self.assertLess(deferral, generated.index("screen(seed, worker_judge)"))
+        self.assertIn("return", generated[deferral:generated.index(
+            "screen(seed, worker_judge)")])
 
     def test_infrastructure_failure_alert_is_immediate_and_high_visibility(self):
         output = io.StringIO()
