@@ -274,6 +274,20 @@ class AContentFilterBlockIsOneSeedsProblem(unittest.TestCase):
         self.assertFalse(_is_content_filter(
             {"name": "RateLimitError", "data": {"message": "slow down"}}))
 
+    def test_the_block_is_caught_twice_so_it_must_stay_a_value_error(self):
+        # A blocked session raises once in the evidence check and again in the
+        # re-parse that follows. Only the first has a handler that knows this
+        # type; the second is guarded by `except ValueError`. Break that and
+        # the escape becomes the infrastructure failure the first catch just
+        # prevented — which is exactly how this shipped broken once.
+        self.assertTrue(issubclass(ContentFiltered, ValueError))
+        session = self._blocked({"name": "ContentFilterError", "data": {}})
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            path = pathlib.Path(directory) / "session.json"
+            path.write_text(json.dumps(session))
+            with self.assertRaises(ValueError):
+                OpenCodeRuntime.parse_stream(path, None)
+
     def test_a_clean_session_raises_nothing(self):
         evidence = _completed_session_evidence(_completed_session())
         self.assertEqual(evidence["observed_models"], ["model-a"])

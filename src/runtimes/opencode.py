@@ -49,7 +49,7 @@ CONTENT_FILTER_NAMES = ("ContentFilterError",)
 CONTENT_FILTER_PHRASES = ("content filter", "content_filter")
 
 
-class ContentFiltered(Exception):
+class ContentFiltered(ValueError):
     """The provider's safety filter blocked the response.
 
     This is one seed's problem, not the harness's. Left as a generic session
@@ -58,6 +58,12 @@ class ContentFiltered(Exception):
     the whole corpus. Raised as its own type it reaches ``safeguard_refusal``,
     the deferral path that already exists for exactly this, and the run
     continues with the next seed.
+
+    It subclasses ``ValueError`` because a blocked session fails the evidence
+    check *and* the re-parse that follows, and only the first of those has a
+    handler that knows this type. Narrowing the base to ``Exception`` lets the
+    second raise walk straight out of ``run_trace`` and become the very
+    infrastructure failure the first catch just prevented.
     """
 
 
@@ -838,6 +844,8 @@ class OpenCodeRuntime(Runtime):
             try:
                 messages, stats = self.parse_stream(raw_path, str(workspace))
             except ValueError as parse_error:
+                if isinstance(parse_error, ContentFiltered):
+                    safeguard_refusal = True
                 error = error or scrub_text(str(parse_error))
         observed_models = evidence.get("observed_models") or []
         observed_model = observed_models[0] if observed_models else None
