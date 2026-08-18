@@ -263,6 +263,7 @@ def deterministic_screen(seed: dict, meta: dict,
 
     # 3. patch replay + double verify (only if fresh so far)
     runtime_caches_removed: list[str] = []
+    verify_replay: dict | None = None
     if gates["diff_fresh"]:
         workspace = materialize(seed, name=f"screen-{seed['id']}")
         gates["setup_ok"] = True
@@ -274,9 +275,21 @@ def deterministic_screen(seed: dict, meta: dict,
         else:
             runtime_caches_removed = clear_runtime_caches(workspace)
             first, first_out = run_verify(seed, workspace)
-            second, _ = run_verify(seed, workspace)
+            second, second_out = run_verify(seed, workspace)
             gates["verify_double_pass"] = bool(first) and bool(second)
             if not gates["verify_double_pass"]:
+                # This gate rejects more traces than any other, and the two
+                # runs fail for different reasons: a candidate that never
+                # passes is a wrong answer, while one that passes and then
+                # fails is state the verifier left behind or an environment
+                # that faltered under it. Discarding what the verifier printed
+                # left the most expensive rejection in the pipeline with no
+                # evidence at all — three exhausted attempts on a seed whose
+                # solutions the judge read as correct, and nothing to say why.
+                verify_replay = {
+                    "failed_run": "first" if not first else "second",
+                    "output": (first_out if not first else second_out)[-4000:],
+                }
                 failures.append("candidate replay verification did not pass twice")
             protected_after = protected_hashes(seed, workspace)
             gates["protected_intact"] = protected_before == protected_after
@@ -302,6 +315,7 @@ def deterministic_screen(seed: dict, meta: dict,
         "gates": gates,
         "failures": failures,
         "runtime_caches_removed": runtime_caches_removed,
+        "verify_replay": verify_replay,
         "static_findings": static_findings,
     }
 

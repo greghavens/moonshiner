@@ -258,8 +258,13 @@ def _run_individual_trace_jobs(seeds: list[dict], args, workers: int) -> int:
                     unaccepted += 1
                     print(f"[trace complete: not accepted] {seed_id}", flush=True)
                 else:
-                    print(f"[trace complete: accepted] {seed_id}", flush=True)
-    print(f"trace queue pass complete: {completed - failures - unaccepted} accepted, "
+                    # Exit 0 covers both accepted and deferred, so the
+                    # coordinator cannot claim acceptance here: the child
+                    # already printed [accepted] or [deferred] with the reason.
+                    print(f"[trace complete: accepted or deferred] {seed_id}",
+                          flush=True)
+    print(f"trace queue pass complete: "
+          f"{completed - failures - unaccepted} accepted or deferred, "
           f"{unaccepted} not accepted, {failures} failed processes, "
           f"{completed} individual trace jobs", flush=True)
     return exit_code

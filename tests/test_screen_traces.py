@@ -104,6 +104,54 @@ class PatchReplay(unittest.TestCase):
         self.assertTrue(result["gates"]["patch_applies"], result["failures"])
         self.assertTrue(result["gates"]["verify_double_pass"])
 
+    def _screen_with_verify(self, outcomes):
+        """Screen one throwaway trace whose two verify runs are scripted."""
+        workspace = self._workspace()
+        subprocess.run(["git", "-c", "user.email=test@example.com", "-c",
+                        "user.name=test", "commit", "-qm", "baseline"],
+                       cwd=workspace, check=True)
+        patch = ("diff --git a/hello.txt b/hello.txt\n"
+                 "--- a/hello.txt\n+++ b/hello.txt\n"
+                 "@@ -1 +1 @@\n-one\n+new\n")
+        traces = pathlib.Path(tempfile.mkdtemp(prefix="moonshiner-traces-test-"))
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(traces)]))
+        for directory in ("raw", "diffs"):
+            (traces / directory).mkdir(parents=True)
+        (traces / "raw" / "replay-evidence.jsonl").write_text("{}\n")
+        (traces / "diffs" / "replay-evidence.patch").write_text(patch)
+        meta = {
+            "raw_path": "raw/replay-evidence.jsonl",
+            "raw_sha256": scr._sha256_text("{}\n"),
+            "diff_sha256": scr._sha256_text(patch),
+            "teacher": {"model_attested": True},
+        }
+        with mock.patch.object(scr, "materialize", return_value=workspace), \
+             mock.patch.object(scr, "run_verify", side_effect=outcomes), \
+             mock.patch.object(scr, "protected_hashes", return_value={}), \
+             mock.patch.object(scr, "parse_trace", return_value=([], {})):
+            return scr.deterministic_screen({"id": "replay-evidence"}, meta,
+                                            traces)
+
+    def test_a_replay_that_passes_then_fails_keeps_the_second_run(self):
+        # Passing once and failing once is state the verifier left behind or an
+        # environment that faltered — a different problem from a wrong answer,
+        # and indistinguishable from it unless the record says which run failed.
+        result = self._screen_with_verify([(True, "clean"), (False, "boom")])
+        self.assertFalse(result["gates"]["verify_double_pass"])
+        self.assertEqual(result["verify_replay"]["failed_run"], "second")
+        self.assertIn("boom", result["verify_replay"]["output"])
+
+    def test_a_replay_that_never_passes_keeps_the_first_run(self):
+        result = self._screen_with_verify([(False, "wrong answer"),
+                                           (False, "wrong again")])
+        self.assertEqual(result["verify_replay"]["failed_run"], "first")
+        self.assertIn("wrong answer", result["verify_replay"]["output"])
+
+    def test_a_passing_replay_records_no_failure_evidence(self):
+        result = self._screen_with_verify([(True, "clean"), (True, "clean")])
+        self.assertTrue(result["gates"]["verify_double_pass"])
+        self.assertIsNone(result["verify_replay"])
+
 
 class Feedback(unittest.TestCase):
     def test_deterministic_failures_become_bullets(self):
