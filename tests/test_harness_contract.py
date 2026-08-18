@@ -294,5 +294,44 @@ class EveryJudgeIsShownTheSchemaItMustMatch(unittest.TestCase):
         self.assertEqual(set(JUDGE_LAUNCH), set(REGISTRY))
 
 
+class TheAgentSeesThePrerequisitesItIsPromised(unittest.TestCase):
+    """A seed says a module is provided; the agent must be able to find it.
+
+    Seeds declare PowerShell modules ``provided_by_environment`` and Moonshiner
+    provisions those exact versions, but the path was handed only to the
+    verifier sandbox. The agent, told the module was already installed and
+    finding none, installed it from the gallery -- which the same seeds forbid,
+    so the judge rejected a correct solution and every retry did it again.
+    """
+
+    def _environment(self, root):
+        import runtimes.base as base
+        with mock.patch("toolchains.powershell_module_root", return_value=root), \
+             mock.patch("toolchains.powershell_runtime", return_value=None), \
+             tempfile.TemporaryDirectory() as workspace:
+            return base.Runtime.teacher_environment(pathlib.Path(workspace))
+
+    def test_provisioned_modules_are_on_the_agents_module_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "Modules"
+            (root / "VMware.Sdk.Vcf.SddcManager").mkdir(parents=True)
+            self.assertIn(str(root),
+                          self._environment(root).get("PSModulePath", ""))
+
+    def test_nothing_is_claimed_when_nothing_was_provisioned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            absent = pathlib.Path(directory) / "never-provisioned"
+            self.assertNotIn("PSModulePath", self._environment(absent))
+
+    def test_every_harness_inherits_it_rather_than_reimplementing_it(self):
+        # One staticmethod serves all four adapters; an adapter that overrode
+        # it would silently reopen the gap for its own traces only.
+        import runtimes.base as base
+        for name, runtime in REGISTRY.items():
+            with self.subTest(harness=name):
+                self.assertIs(runtime.teacher_environment,
+                              base.Runtime.teacher_environment)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -398,6 +398,29 @@ class ReviewResult:
     error: str | None = None
 
 
+def provisioned_powershell_modules() -> str:
+    """``PSModulePath`` for the PowerShell modules a seed's prerequisites promise.
+
+    Seeds mark modules ``provided_by_environment`` and Moonshiner provisions
+    exactly those versions, but only the verifier sandbox was ever told where
+    they live. The agent was not, so it saw a promised prerequisite missing and
+    did the reasonable thing: installed it from the gallery. The same seeds
+    forbid installing, so the judge rejected -- correctly -- for an absence that
+    was the harness's to fix, and every retry reproduced it.
+
+    Imported lazily: ``toolchains`` imports this module.
+    """
+    from toolchains import powershell_module_root, powershell_runtime
+    root = powershell_module_root()
+    if not root.is_dir():
+        return ""
+    entries = [str(root)]
+    pwsh = powershell_runtime()
+    if pwsh is not None:
+        entries.append(str(pwsh.parent / "Modules"))
+    return os.pathsep.join(entries)
+
+
 class Runtime(abc.ABC):
     """One agentic CLI usable as teacher and/or judge."""
 
@@ -491,6 +514,9 @@ class Runtime(abc.ABC):
             path = Path(value)
             if path.is_relative_to(home):
                 path.mkdir(parents=True, exist_ok=True)
+        modules = provisioned_powershell_modules()
+        if modules:
+            environment["PSModulePath"] = modules
         return environment
 
     # -- lifecycle ---------------------------------------------------------- #
