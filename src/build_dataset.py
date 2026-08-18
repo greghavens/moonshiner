@@ -84,8 +84,27 @@ def redact_secret_matches(value):
 
 
 def scrub_session(session: list[dict]) -> list[dict]:
-    """Strip host-specific paths from every string in the assembled session."""
-    return json.loads(scrub_text(json.dumps(session, ensure_ascii=False)))
+    """Strip host-specific paths from every string in the assembled session.
+
+    Every string, one at a time — never the serialized session. A credential
+    pattern ends at the first quote, and in JSON text the quote that ends a
+    string arrives as `\\"`, so redacting over the serialization eats the
+    backslash and leaves a bare quote that closes the string early. That
+    turned a trace quoting `"Authorization: Bearer ..."` into a document
+    json.loads could not read, and the raised error stopped the whole build.
+    """
+    return _scrub_value(session)
+
+
+def _scrub_value(value):
+    if isinstance(value, str):
+        return scrub_text(value, strip=False)
+    if isinstance(value, list):
+        return [_scrub_value(item) for item in value]
+    if isinstance(value, dict):
+        return {(scrub_text(key, strip=False) if isinstance(key, str) else key):
+                _scrub_value(item) for key, item in value.items()}
+    return value
 
 
 def has_internal_content(session: list[dict]) -> bool:
@@ -271,7 +290,18 @@ def main() -> None:
         if not accepted:
             dropped.append((info["id"], screening_error))
             continue
-        row, error = build_row(seed, info)
+        try:
+            row, error = build_row(seed, info)
+        except Exception as failure:  # one trace must not stop the build
+            # Every other way a row is unusable is a reason string, and the
+            # publisher goes on to the next trace. A raise instead took the
+            # build down, and with it the publish queue, which systemd then
+            # restarted into the same trace: one bad row and nothing at all
+            # reaches the dataset. Dropping is the safe direction — the row
+            # never gets published — and the reason prints with the rest.
+            dropped.append((info["id"],
+                            f"row build raised {type(failure).__name__}: {failure}"))
+            continue
         if error:
             dropped.append((info["id"], error))
             continue

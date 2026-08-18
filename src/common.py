@@ -742,8 +742,13 @@ def clear_runtime_caches(workspace: Path) -> list[str]:
     return sorted(removed)
 
 
-def scrub_text(value: str, workspace: str | None = None) -> str:
-    """Rewrite machine paths to portable placeholders and redact secrets."""
+def scrub_text(value: str, workspace: str | None = None, *,
+               strip: bool = True) -> str:
+    """Rewrite machine paths to portable placeholders and redact secrets.
+
+    Give a caller `strip=False` when the value is message content rather than
+    a captured block of output: trailing whitespace belongs to the trace.
+    """
     value = value.replace("\x00", "")
     if workspace:
         value = value.replace(workspace + "/", "").replace(workspace, ".")
@@ -766,4 +771,5 @@ def scrub_text(value: str, workspace: str | None = None) -> str:
     for secret in _staged_secret_values():
         value = value.replace(secret, "[REDACTED_SECRET]")
     from privacy import redact
-    return redact(value, exact_secrets=_staged_secret_values())[0].strip()
+    scrubbed = redact(value, exact_secrets=_staged_secret_values())[0]
+    return scrubbed.strip() if strip else scrubbed

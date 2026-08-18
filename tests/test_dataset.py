@@ -3,7 +3,9 @@ expansion into cumulative prefixes. All transforms are pure and model-free."""
 import json
 import pathlib
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "src"))
@@ -35,6 +37,77 @@ class Redaction(unittest.TestCase):
         out = bd.scrub_session(session)
         self.assertNotIn("moonshiner-pi-runtime", json.dumps(out))
         self.assertEqual(out[0]["role"], "user")
+
+    def test_a_quoted_credential_survives_redaction_as_json(self):
+        # A credential pattern ends at the first quote. Scrubbed over the
+        # serialized session, the quote it stopped at was an escaped one, so
+        # the redaction ate the backslash and left a quote that closed the
+        # string early — an unreadable document that stopped the whole build.
+        session = [{"role": "user",
+                    "content": 'Token string // sent as '
+                               '"Authorization: Bearer abc123def456xyz"'}]
+        out = bd.scrub_session(session)
+        content = out[0]["content"]
+        self.assertNotIn("abc123def456xyz", content)
+        self.assertIn("[REDACTED_SECRET]", content)
+        self.assertEqual(json.loads(json.dumps(out)), out)
+        self.assertTrue(content.endswith('"'))
+
+    def test_json_escaping_does_not_invent_a_credential(self):
+        # `seed[\"` is six characters only because the serialization escaped
+        # the quote, and six characters is what the password pattern wants.
+        # Scrubbing the real string redacts nothing, which is correct: this
+        # is code, not a credential.
+        session = [{"role": "assistant",
+                    "content": 'self.password = seed["credentials"]["password"]'}]
+        self.assertEqual(bd.scrub_session(session), session)
+
+    def test_scrubbing_leaves_message_whitespace_alone(self):
+        # Message content is the trace, not a captured block to tidy: the
+        # trailing newline an assistant wrote is part of what it wrote.
+        session = [{"role": "assistant", "content": "done\n"}]
+        self.assertEqual(bd.scrub_session(session)[0]["content"], "done\n")
+
+
+class BuildLoopResilience(unittest.TestCase):
+    def test_one_unbuildable_trace_does_not_stop_the_build(self):
+        # Every other unusable row is a reason string the build walks past. A
+        # raise instead took the build down, and with it the publish queue,
+        # which systemd restarted straight back into the same trace: one bad
+        # row and nothing at all reached the dataset.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            meta = root / "meta"
+            meta.mkdir()
+            for task in ("bad-task", "good-task"):
+                (meta / f"{task}.json").write_text(json.dumps({"id": task}))
+
+            def build_row(seed, info, traces_root=None):
+                if info["id"] == "bad-task":
+                    raise json.JSONDecodeError("Expecting ',' delimiter", "{}", 1)
+                return {"messages": [{"role": "assistant", "content": "hi"}],
+                        "meta": {"task": info["id"]}}, None
+
+            with mock.patch.object(bd, "META", meta), \
+                 mock.patch.object(bd, "DATA", root / "data"), \
+                 mock.patch.object(bd, "load_seeds", return_value=[
+                     {"id": "bad-task"}, {"id": "good-task"}]), \
+                 mock.patch.object(bd, "screening_acceptance",
+                                   return_value=(True, None)), \
+                 mock.patch.object(bd, "build_row", side_effect=build_row), \
+                 mock.patch.object(bd, "accepted_author_rows",
+                                   return_value=([], [])), \
+                 mock.patch.object(sys, "argv", ["build_dataset.py", "--quiet"]), \
+                 mock.patch("builtins.print") as printed:
+                bd.main()
+            written = [json.loads(line)
+                       for path in sorted((root / "data" / "full").glob("*.jsonl"))
+                       for line in path.read_text().splitlines() if line.strip()]
+            self.assertEqual([row["meta"]["task"] for row in written],
+                             ["good-task"])
+        reported = " ".join(str(call) for call in printed.call_args_list)
+        self.assertIn("bad-task", reported)
+        self.assertIn("JSONDecodeError", reported)
 
 
 class Tokens(unittest.TestCase):
