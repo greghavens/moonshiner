@@ -99,14 +99,18 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
         # Two different conditions, kept apart in provenance: a provider that
         # refused to answer, and an agent that stopped to ask a question no one
         # is there to answer. Both defer this seed and leave the run alone.
-        for blocked, kind, fallback in (
-                (result.safeguard_refusal, "safeguard_refusal",
+        # A kind is terminal when another attempt cannot change the answer. A
+        # provider refuses the same prompt every time and bills a full prompt
+        # cache write for each refusal, so retrying buys nothing; an agent that
+        # asked a question may well not ask it again.
+        for blocked, kind, terminal, fallback in (
+                (result.safeguard_refusal, "safeguard_refusal", True,
                  "teacher issued a safeguard refusal"),
-                (result.blocked_on_question, "interactive_question",
+                (result.blocked_on_question, "interactive_question", False,
                  "teacher asked a question a headless trace cannot answer")):
             if not blocked:
                 continue
-            record = _deferral(seed, prompt, teacher, kind,
+            record = _deferral(seed, prompt, teacher, kind, terminal,
                                result.error or fallback, capability_resolution)
             _write_meta(meta_path, record)
             record["_workspace_path"] = str(workspace)
@@ -192,8 +196,8 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
     return best or {}
 
 
-def _deferral(seed: dict, prompt: str, teacher, kind: str, detail: str,
-              capability_resolution: dict) -> dict:
+def _deferral(seed: dict, prompt: str, teacher, kind: str, terminal: bool,
+              detail: str, capability_resolution: dict) -> dict:
     return {
         "id": seed["id"],
         "passed": None,
@@ -202,6 +206,7 @@ def _deferral(seed: dict, prompt: str, teacher, kind: str, detail: str,
         "seed_fingerprint": seed_fingerprint(seed),
         f"deferred_{kind}": True,
         "deferral_reason": detail,
+        "deferral_terminal": terminal,
         "teacher": {"runtime": teacher.name, "model": teacher.role["model"],
                     "reasoning": teacher.role.get("reasoning"),
                     "provenance": {

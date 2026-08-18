@@ -122,6 +122,32 @@ def trace_attempt_counts_for_current_seed_revision(
         GROUP BY a.seed_id""")}
 
 
+def halted_seed_ids(db: sqlite3.Connection,
+                    statuses: tuple[str, ...]) -> set[str]:
+    """Seeds whose latest trace job ended in a status that stops further work.
+
+    Two conditions halt a seed short of its attempt ceiling: an environment
+    that could not run it, and a provider that refused the prompt. Neither is
+    worth re-dispatching as-is, and both become eligible again the moment the
+    seed itself is reauthored — the one change that can alter the outcome.
+    """
+    if not statuses:
+        return set()
+    placeholders = ",".join("?" for _ in statuses)
+    return {str(row[0]) for row in db.execute(f"""
+        SELECT latest.seed_id FROM (
+          SELECT j.seed_id,j.status,
+                 j.updated_at,
+                 ROW_NUMBER() OVER (PARTITION BY j.seed_id
+                                   ORDER BY j.updated_at DESC,r.created_at DESC) AS rank
+          FROM jobs j JOIN runs r ON r.id=j.run_id WHERE r.kind='trace'
+        ) AS latest WHERE latest.rank=1 AND latest.status IN ({placeholders})
+          AND NOT EXISTS (SELECT 1 FROM attempts sa
+            JOIN runs sr ON sr.id=sa.run_id WHERE sr.kind='seed'
+            AND sa.status='accepted' AND sa.seed_id=latest.seed_id
+            AND sa.finished_at>=latest.updated_at)""", statuses)}
+
+
 def live_trace_run_ids(db: sqlite3.Connection) -> set[str]:
     """Return trace runs that currently own at least one unexpired job lease."""
     timestamp = now()
@@ -309,7 +335,8 @@ def summaries(db, run_id: str | None = None, *,
         where, args = "", ()
     rows = db.execute(f"""SELECT r.*, COUNT(j.seed_id) jobs,
       SUM(CASE WHEN j.status='accepted' THEN 1 ELSE 0 END) accepted,
-      SUM(CASE WHEN j.status IN ('exhausted','failed') THEN 1 ELSE 0 END) failed,
+      SUM(CASE WHEN j.status IN ('exhausted','failed','content_filtered')
+           THEN 1 ELSE 0 END) failed,
       SUM(CASE WHEN j.status IN ('pending','running','retry') THEN 1 ELSE 0 END) pending
       FROM runs r LEFT JOIN jobs j ON j.run_id=r.id {where}
       GROUP BY r.id ORDER BY r.created_at DESC""", args).fetchall()

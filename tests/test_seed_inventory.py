@@ -152,6 +152,29 @@ class SeedInventoryCounts(unittest.TestCase):
             self.assertEqual(seed_inventory.retired_seed_ids(db), {"retired-seed"})
             db.close()
 
+    def test_a_content_filtered_seed_is_counted_apart_from_waiting(self):
+        # `waiting` is a promise that a worker will get to it. A seed the
+        # provider refused has already had its last attempt, and burying it in
+        # that number reads as work in progress forever.
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            database = pathlib.Path(directory) / "ledger.sqlite3"
+            real_connect = run_state.connect
+            db = real_connect(database)
+            run_id = run_state.create_run(db, "trace", {}, {"max_attempts": 3},
+                                          ["filtered", "fresh"])
+            run_state.set_job(db, run_id, "filtered", "content_filtered", 1,
+                              "teacher issued a safeguard refusal")
+            db.close()
+            with mock.patch("run_state.connect",
+                            side_effect=lambda: real_connect(database)):
+                state = seed_inventory.trace_state(
+                    3, target={"filtered", "fresh"},
+                    ready={"filtered", "fresh"}, accepted=set())
+            self.assertEqual(state["content_filtered"], {"filtered"})
+            self.assertEqual(state["waiting"], {"fresh"})
+            self.assertEqual(state["exhausted"], set())
+
     def test_newer_accepted_seed_revision_clears_prior_retirement(self):
         import tempfile
         with tempfile.TemporaryDirectory() as directory:

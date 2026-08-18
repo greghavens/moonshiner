@@ -251,8 +251,13 @@ def trace_state(max_attempts: int, *, target: set[str] | None = None,
         "SELECT DISTINCT j.seed_id FROM jobs j JOIN runs r ON r.id=j.run_id "
         "WHERE r.kind='trace' AND r.status='running' AND j.status='running' "
         "AND j.lease_expires_at IS NOT NULL AND j.lease_expires_at>?", (now(),))}
-    from run_state import (trace_attempt_counts_for_current_seed_revision,
+    from run_state import (halted_seed_ids,
+                           trace_attempt_counts_for_current_seed_revision,
                            trace_reasoning_efforts_for_current_seed_revisions)
+    # A seed the provider refused is not waiting for a worker: the queue will
+    # never dispatch it again. Counting it as waiting hides a seed that will
+    # never be traced inside a number that says work is coming.
+    content_filtered = halted_seed_ids(db, ("content_filtered",)) & ready
     attempts = trace_attempt_counts_for_current_seed_revision(db)
     from common import CONFIG
     trace_config = ((CONFIG.get("pipeline") or {}).get("trace") or {})
@@ -277,7 +282,10 @@ def trace_state(max_attempts: int, *, target: set[str] | None = None,
                      if attempts.get(seed_id, 0) >= max_attempts}
     else:
         exhausted = ready - accepted - active - remaining
-    waiting = ready - accepted - active - exhausted
+    content_filtered -= accepted | active
+    exhausted -= content_filtered
+    waiting = ready - accepted - active - exhausted - content_filtered
     return {"target": target, "accepted": accepted, "active": active,
             "exhausted": exhausted, "waiting": waiting,
+            "content_filtered": content_filtered,
             "needs_reauthoring": needs_reauthoring}

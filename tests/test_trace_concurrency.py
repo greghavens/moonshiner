@@ -18,8 +18,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from run_state import (abandon_claim, claim_job, connect, create_run, finish_attempt,
-                       enqueue_traces, live_trace_run_ids, pending_trace_queue_entries,
-                       set_job, start_attempt,
+                       enqueue_traces, halted_seed_ids, live_trace_run_ids,
+                       pending_trace_queue_entries, set_job, start_attempt,
                        trace_attempt_counts_for_current_seed_revision,
                        trace_reasoning_efforts_for_current_seed_revision)  # noqa: E402
 import trace_pipeline  # noqa: E402
@@ -101,12 +101,12 @@ class TraceConcurrency(unittest.TestCase):
             self.assertTrue(outside.exists())
 
     def test_every_completed_generated_attempt_path_removes_its_workspace(self):
-        # Four ways an attempt finishes: accepted, judged and not accepted,
-        # deferred before judgment, and accepted unjudged when judging is
-        # bypassed. Each leaves a workspace behind.
+        # Five ways an attempt finishes: accepted, judged and not accepted,
+        # deferred before judgment, deferred for good, and accepted unjudged
+        # when judging is bypassed. Each leaves a workspace behind.
         source = inspect.getsource(trace_pipeline.main)
         generated = source[source.index("record = trace_task("):]
-        self.assertEqual(generated.count("remove_completed_workspace(record)"), 4)
+        self.assertEqual(generated.count("remove_completed_workspace(record)"), 5)
 
     def test_a_deferred_attempt_returns_before_the_judge_is_called(self):
         # There is no candidate to read, so screen() would hunt for a raw trace
@@ -118,6 +118,44 @@ class TraceConcurrency(unittest.TestCase):
         self.assertLess(deferral, generated.index("screen(seed, worker_judge)"))
         self.assertIn("return", generated[deferral:generated.index(
             "screen(seed, worker_judge)")])
+
+    def test_a_terminal_deferral_never_reaches_the_retry_decision(self):
+        # `retry` and `exhausted` both leave the seed in the pool the next
+        # pass draws from. A deferral the author marked terminal has to finish
+        # its job before that line, or the money the mark exists to save gets
+        # spent anyway.
+        source = inspect.getsource(trace_pipeline.main)
+        generated = source[source.index("record = trace_task("):]
+        terminal = generated.index('record.get("deferral_terminal")')
+        retry = generated.index('status = "retry" if has_more')
+        self.assertLess(terminal, retry)
+        self.assertIn("return", generated[terminal:retry])
+        self.assertNotIn("retry", generated[terminal:retry])
+
+    def test_a_content_filtered_job_is_left_alone_by_later_workers(self):
+        # Terminal means terminal inside the run too: a worker that picks the
+        # seed back up walks the same prompt into the same filter.
+        db = connect(self.path)
+        claim = claim_job(db, self.run_id, "worker")
+        set_job(db, self.run_id, claim["seed_id"], "content_filtered", 1,
+                "teacher issued a safeguard refusal")
+        while nxt := claim_job(db, self.run_id, "worker"):
+            self.assertNotEqual(nxt["seed_id"], claim["seed_id"])
+            set_job(db, self.run_id, nxt["seed_id"], "accepted", 1)
+        db.close()
+
+    def test_reauthoring_a_seed_lifts_its_content_filter_block(self):
+        # Rewording the prompt is the one change that can get a different
+        # answer out of the filter, so an accepted seed revision has to put
+        # the seed back in the pool.
+        db = connect(self.path)
+        set_job(db, self.run_id, "seed-00", "content_filtered", 1, "refused")
+        self.assertEqual(halted_seed_ids(db, ("content_filtered",)), {"seed-00"})
+        seed_run = create_run(db, "seed", {}, {}, ["seed-00"])
+        start_attempt(db, seed_run, "seed-00", 1)
+        finish_attempt(db, seed_run, "seed-00", 1, "accepted")
+        self.assertEqual(halted_seed_ids(db, ("content_filtered",)), set())
+        db.close()
 
     def test_no_single_kind_of_deferral_is_singled_out(self):
         # Matching one kind's key means the next kind added upstream walks into

@@ -253,7 +253,7 @@ class FrontDoor(unittest.TestCase):
              mock.patch("seed_inventory.trace_state", return_value={
                  "target": set(), "accepted": set(), "active": set(),
                  "waiting": set(), "exhausted": set(),
-                 "needs_reauthoring": set()}), \
+                 "content_filtered": set(), "needs_reauthoring": set()}), \
              mock.patch("run_state.live_trace_run_ids", return_value=set()), \
              mock.patch("seed_queue.active_claim_ids", return_value=set()), \
              mock.patch("publish_queue.accepted_tasks", return_value=[]), \

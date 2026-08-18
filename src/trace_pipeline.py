@@ -122,18 +122,9 @@ def _selected(args) -> list[dict]:
     accepted = accepted_ids(ledger)
     from run_state import trace_attempt_counts_for_current_seed_revision
     attempts = trace_attempt_counts_for_current_seed_revision(ledger)
-    blocked = {str(row[0]) for row in ledger.execute("""
-        SELECT latest.seed_id FROM (
-          SELECT j.seed_id,j.status,
-                 j.updated_at,
-                 ROW_NUMBER() OVER (PARTITION BY j.seed_id
-                                   ORDER BY j.updated_at DESC,r.created_at DESC) AS rank
-          FROM jobs j JOIN runs r ON r.id=j.run_id WHERE r.kind='trace'
-        ) AS latest WHERE latest.rank=1 AND latest.status='infrastructure_blocked'
-          AND NOT EXISTS (SELECT 1 FROM attempts sa
-            JOIN runs sr ON sr.id=sa.run_id WHERE sr.kind='seed'
-            AND sa.status='accepted' AND sa.seed_id=latest.seed_id
-            AND sa.finished_at>=latest.updated_at)""")}
+    from run_state import halted_seed_ids
+    blocked = halted_seed_ids(ledger, ("infrastructure_blocked",
+                                       "content_filtered"))
     maximum = int(getattr(args, "max_attempts", 3))
     trace_config = (CONFIG.get("pipeline", {}).get("trace") or {})
     stepdown = bool(trace_config.get("step_down_reasoning_on_failure", True))
@@ -503,6 +494,21 @@ def main(argv: list[str] | None = None) -> int:
                        for key, value in record.items())
         if deferred:
             reason = str(record.get("deferral_reason") or "deferred")
+            # Some deferrals cannot come out differently a second time — the
+            # author marks those terminal. The provider's content filter is
+            # today's only one: it lands on the first assistant turn, before a
+            # tool has run or a reasoning token exists, and is still billed as
+            # a full prompt cache write, so each retry buys another refusal at
+            # the same price. A terminal deferral stops here and stays out of
+            # later passes until the seed itself is reauthored.
+            if record.get("deferral_terminal"):
+                finish_attempt(worker_db, run_id, seed["id"], number,
+                               "content_filtered", usage, None, reason)
+                remove_completed_workspace(record)
+                set_job(worker_db, run_id, seed["id"], "content_filtered",
+                        number, reason)
+                print(f"[blocked] {seed['id']}: {reason}", flush=True)
+                return
             status = "retry" if has_more else "exhausted"
             finish_attempt(worker_db, run_id, seed["id"], number, status,
                            usage, None, reason)
@@ -627,7 +633,8 @@ def main(argv: list[str] | None = None) -> int:
             thread.join()
         rows = job_rows(db, run_id)
         accepted = sum(row["status"] == "accepted" for row in rows)
-        failed = sum(row["status"] in {"exhausted", "failed"} for row in rows)
+        failed = sum(row["status"] in {"exhausted", "failed", "content_filtered"}
+                     for row in rows)
         set_run_status(db, run_id, "complete" if not failed else "complete_with_rejections")
     except KeyboardInterrupt:
         stop_claiming.set()

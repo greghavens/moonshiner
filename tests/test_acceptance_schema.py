@@ -301,6 +301,29 @@ class AcceptanceSchemaTests(unittest.TestCase):
                             return_value=set()):
                 self.assertEqual(trace_pipeline._selected(args), [])
 
+    def test_a_content_filtered_seed_is_not_dispatched_again(self):
+        # The provider's filter reads the prompt, not the attempt, so every
+        # later pass buys the same refusal at the same price. Only reauthoring
+        # the seed can change the answer, and that clears the block by itself.
+        with tempfile.TemporaryDirectory() as directory:
+            database = pathlib.Path(directory) / "runs.sqlite3"
+            real_connect = run_state.connect
+            db = real_connect(database)
+            run_id = run_state.create_run(db, "trace", {}, {}, ["filtered-seed"])
+            run_state.set_job(db, run_id, "filtered-seed", "content_filtered",
+                              1, "teacher issued a safeguard refusal")
+            db.close()
+            args = SimpleNamespace(only=None, category=None, tag=None,
+                                   kind="all", name=None, max_attempts=3,
+                                   limit=0, all=True)
+            with mock.patch.object(trace_pipeline, "connect",
+                                   side_effect=lambda: real_connect(database)), \
+                 mock.patch.object(trace_pipeline, "select_seeds",
+                                   return_value=[{"id": "filtered-seed"}]), \
+                 mock.patch("import_existing.imported_task_ids",
+                            return_value=set()):
+                self.assertEqual(trace_pipeline._selected(args), [])
+
     def test_contaminated_seed_never_enters_trace_queue(self):
         with tempfile.TemporaryDirectory() as directory:
             database = pathlib.Path(directory) / "runs.sqlite3"

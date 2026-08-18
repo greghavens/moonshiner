@@ -1243,6 +1243,7 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
                         "waiting_for_judgment": 0,
                         "needs_seed_reauthoring": len(traced["needs_reauthoring"]),
                         "exhausted": len(traced["exhausted"]),
+                        "content_filtered": len(traced["content_filtered"]),
                         "waiting": len(traced["waiting"]), "active_runs": active},
             "publishing": {"dataset": (config.get("publish") or {}).get("hf_dataset"),
                            "batch_size": int((config.get("publish") or {}).get("batch_size", 1)),
@@ -1264,7 +1265,10 @@ def _status(argv: list[str], *, inspect: bool = False) -> int:
         print(f"Authoring: {len(active_author_ids)} seed job(s) in progress")
         print(f"Traces: {len(traced['accepted'])}/{len(traced['target'])} accepted; "
               f"{len(traced['active'])} active; {len(traced['waiting'])} waiting; "
-              f"{len(traced['exhausted'])} exhausted; {workers} workers configured")
+              f"{len(traced['exhausted'])} exhausted; "
+              + (f"{len(traced['content_filtered'])} content-filtered; "
+                 if traced.get("content_filtered") else "")
+              + f"{workers} workers configured")
         print(f"  needs seed reauthoring: {len(traced['needs_reauthoring'])}")
         print("  waiting for judgment: 0 (judgment runs inline in each trace worker)")
         for row in active:

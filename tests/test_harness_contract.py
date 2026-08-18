@@ -176,6 +176,17 @@ class HarnessContract(unittest.TestCase):
         # Kept apart from a refusal so provenance says which one happened.
         self.assertNotIn("deferred_safeguard_refusal", record)
 
+    def test_a_refusal_is_terminal_and_a_question_is_not(self):
+        # The record carries whether another attempt could come out
+        # differently, because the answer belongs where the kinds are declared
+        # rather than in the queue. A content filter refuses the same prompt
+        # every time and bills a full prompt cache write for each refusal, so
+        # retrying one costs real money to learn nothing.
+        refused = self._blocked_trace("filtered", safeguard_refusal=True)
+        asked = self._blocked_trace("asked", blocked_on_question=True)
+        self.assertIs(refused["deferral_terminal"], True)
+        self.assertIs(asked["deferral_terminal"], False)
+
     def test_generic_pipeline_has_no_runtime_specific_dispatch(self):
         source = inspect.getsource(trace_pipeline)
         self.assertNotIn("behavior_trace", source)
