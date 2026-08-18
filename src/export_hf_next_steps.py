@@ -17,10 +17,11 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from common import DATA, RUNS, jsonl_lines
+from common import DATA, RUNS, STORAGE_ROOT, jsonl_lines
 from canonical_dataset import (MESSAGE_KEY_ORDER, PUBLISH_KEY_ORDER,
                                canonical_category, normalize_messages)
 from expand_next_steps import DERIVATION
+from logprobs_sidecar import file_sha256, manifest_entry, write_manifest
 from hf_sync import ensure_local_dataset
 from trace_provenance import value as provenance
 
@@ -28,6 +29,9 @@ DEFAULT_INPUT = DATA / "next_step"
 DEFAULT_SOURCE = DATA / "full"
 DEFAULT_OUTPUT = DATA / "hf-publish" / "traces.jsonl"
 SPLITS = ("train", "val")
+#: Sidecars publish under this directory, linked to rows by the manifest.
+LOGPROBS_DIR = "logprobs"
+LOGPROBS_MANIFEST = f"{LOGPROBS_DIR}/MANIFEST.json"
 
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -185,6 +189,80 @@ def upsert_journal(output: Path, journal: Path) -> tuple[int, int, dict]:
     return len(journal_lines), replaced_rows, validation
 
 
+def _sidecar_filename(trajectory_id: str) -> str:
+    return trajectory_id.replace(":", "__").replace("/", "__") + ".parquet"
+
+
+def sidecar_references(input_dir: Path) -> dict[str, dict]:
+    """Map each derived trajectory to the sidecar its rows were built with."""
+    references: dict[str, dict] = {}
+    for split in SPLITS:
+        source = input_dir / f"{split}.jsonl"
+        if not source.exists():
+            continue
+        with source.open() as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                meta = (json.loads(line).get("meta") or {})
+                sidecar = meta.get("logprobs")
+                identifier = meta.get("source_trajectory_id")
+                if sidecar and identifier:
+                    references[identifier] = sidecar
+    return references
+
+
+def stage_sidecars(input_dir: Path, output: Path) -> dict:
+    """Publish token distributions beside the rows they belong to.
+
+    The rows themselves gain no column. ``source_trajectory_id`` and
+    ``assistant_step`` are already published on every row and are exactly the
+    key the sidecars are written under, so the link costs no schema change to
+    a dataset that has already shipped -- and a consumer that does not want
+    the distributions simply never downloads this directory.
+    """
+    directory = output.parent / LOGPROBS_DIR
+    references = sidecar_references(input_dir)
+    published = {json.loads(line).get("source_trajectory_id")
+                 for line in jsonl_lines(output)} if output.exists() else set()
+    entries, stale = [], []
+    for identifier in sorted(published & set(references)):
+        reference = references[identifier]
+        source = STORAGE_ROOT / str(reference.get("path") or "")
+        if not source.is_file():
+            stale.append(f"{identifier}: sidecar is missing at {source}")
+            continue
+        digest = file_sha256(source)
+        # A sidecar whose bytes no longer match the trace it was captured with
+        # describes some other generation. Publishing it would align cleanly
+        # and mean nothing, so it is dropped and reported.
+        if reference.get("sha256") and digest != reference["sha256"]:
+            stale.append(f"{identifier}: sidecar hash does not match the trace")
+            continue
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / _sidecar_filename(identifier)
+        target.write_bytes(source.read_bytes())
+        entries.append(manifest_entry(identifier, f"{LOGPROBS_DIR}/{target.name}",
+                                      {**reference, "sha256": digest,
+                                       "bytes": target.stat().st_size}))
+    if not entries:
+        # Leave nothing half-published: a manifest with no sidecars beside it
+        # would advertise distributions that are not there.
+        if directory.exists():
+            for path in directory.iterdir():
+                path.unlink()
+            directory.rmdir()
+        return {"trajectories": 0, "tokens": 0, "bytes": 0, "stale": stale}
+    active = {entry["path"].split("/", 1)[1] for entry in entries}
+    for path in directory.iterdir():
+        if path.name != "MANIFEST.json" and path.name not in active:
+            path.unlink()
+    document = write_manifest(directory / "MANIFEST.json", entries)
+    return {"trajectories": document["trajectories"],
+            "tokens": document["tokens"], "bytes": document["bytes"],
+            "stale": stale}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
@@ -227,6 +305,13 @@ def main() -> None:
           f"candidate rows={sum(counts.values())} "
           f"({', '.join(f'{key}={value}' for key, value in counts.items())}); "
           f"validated {validation['trajectories']} cumulative trajectories")
+    sidecars = stage_sidecars(args.input, args.output)
+    for problem in sidecars["stale"]:
+        print(f"logprob sidecar skipped -- {problem}")
+    if sidecars["trajectories"]:
+        print(f"logprob sidecars: {sidecars['trajectories']} trajectories, "
+              f"{sidecars['tokens']} tokens, "
+              f"{sidecars['bytes'] / 1e6:.1f} MB")
 
 
 if __name__ == "__main__":

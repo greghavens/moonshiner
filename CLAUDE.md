@@ -6,7 +6,8 @@ Seed authoring, trace distillation, and training dataset preparation for coding-
 
 - `moonshiner.py` — CLI entry point and pipeline orchestrator
 - `src/` — all pipeline modules (import_seeds, generate_traces, screen_traces, build_dataset, etc.)
-- `src/runtimes/` — harness adapters: `pi.py`, `claude_code.py`, `codex.py`, `base.py`
+- `src/runtimes/` — harness adapters: `pi.py`, `claude_code.py`, `codex.py`, `opencode.py`, `vllm.py`, `base.py`
+- `src/logprobs_sidecar.py` — per-trajectory Parquet token-distribution sidecars
 - `src/moonshiner_app/` — installed package (`cli.py`, `__init__.py`)
 - `src/configuration.py` — config loading; `config.json` (defaults), `config.local.json` (overrides)
 - `schemas/` — JSON schemas
@@ -59,9 +60,10 @@ Three queues run as systemd user services:
 
 - Seed prompts reach the harness byte-for-byte unchanged — no wrapping, annotation, or enrichment.
 - Every trace is a native trace from the configured harness with genuine tool execution.
-- Only the configured trace judge may reject a trace.
+- Only the configured trace judge may reject a trace. `pipeline.trace.skip_judging` may skip judging entirely (opt-in, for self-distillation); an unjudged trace records `judge.bypassed`, screens as `unjudged-distillation-v1`, and drops `independent-review` from its verifier.
 - A trace gets at most its configured per-seed maximum attempts (default 3) across all resumptions.
-- Reasoning step-down cycle: xhigh → medium → low, repeating if max_attempts > 3.
+- Reasoning step-down cycle: xhigh → medium → low, repeating if max_attempts > 3; `pipeline.trace.step_down_reasoning_on_failure false` holds the configured effort.
+- Logprob capture is opt-in and never degrades: a server that cannot deliver the requested top-K fails the attempt instead of capturing fewer alternatives.
 - Production runs use only published, versioned releases via the `moonshiner` command.
 - Web research traces use real searches and real fetches — never simulated.
 
@@ -73,6 +75,10 @@ Three queues run as systemd user services:
 - `judge.runtime` / `judge.model` — trace judge
 - `pipeline.trace.workers` — parallel trace workers (1–64)
 - `pipeline.trace.max_attempts` — per-seed attempt limit
+- `pipeline.trace.skip_judging` — accept traces without a judge (default false)
+- `pipeline.trace.step_down_reasoning_on_failure` — step effort down on retry (default true)
+- `runtimes.vllm.base_url` / `runtimes.vllm.sampling` — local OpenAI-compatible server
+- `runtimes.vllm.logprobs.enabled` / `runtimes.vllm.logprobs.top_k` — token-distribution capture
 - `pipeline.queues.seed_authoring` — enable seed queue
 - `pipeline.queues.tracing` — enable trace queue
 - `synthetic_corrections.enabled` — enable correction companion

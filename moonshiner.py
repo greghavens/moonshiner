@@ -265,6 +265,7 @@ def _config(argv: list[str]) -> int:
     bounded = {"pipeline.trace.workers": (1, 64),
                "pipeline.seed.workers": (1, 64),
                "pipeline.trace.max_attempts": (1, 1000),
+               "runtimes.vllm.logprobs.top_k": (1, 1000),
                "publish.batch_size": (1, 1000)}
     if args.key in bounded:
         low, high = bounded[args.key]
@@ -272,8 +273,12 @@ def _config(argv: list[str]) -> int:
             parser.error(f"{args.key} must be an integer from {low} through {high}")
     if args.key == "pipeline.trace.retry_order" and value not in {"immediate", "tail"}:
         parser.error("pipeline.trace.retry_order must be immediate or tail")
-    if args.key == "pipeline.trace.step_down_reasoning_on_failure" and not isinstance(value, bool):
-        parser.error("pipeline.trace.step_down_reasoning_on_failure must be true or false")
+    booleans = {"pipeline.trace.step_down_reasoning_on_failure",
+                "pipeline.trace.skip_judging",
+                "runtimes.vllm.logprobs.enabled",
+                "runtimes.vllm.stream"}
+    if args.key in booleans and not isinstance(value, bool):
+        parser.error(f"{args.key} must be true or false")
     if args.key == "synthetic_corrections.max_attempts" and (
             isinstance(value, bool) or not isinstance(value, int) or value < 1):
         parser.error("synthetic_corrections.max_attempts must be a positive integer")

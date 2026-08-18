@@ -51,6 +51,15 @@ def runtime_for_stage(runtime, stage: str):
         raise ValueError(
             "claude-code does not expose a documented reasoning-effort CLI flag; "
             "disable pipeline.trace.step_down_reasoning_on_failure")
+    if runtime.name == "vllm":
+        # A raw chat-completions server has no reasoning-effort control to
+        # step down. Silently reusing one effort for every attempt would make
+        # the ledger's recorded stages fiction, and for the distillation this
+        # backend exists to serve, a stepped-down retry is the wrong sample
+        # anyway -- it is not the model being reproduced.
+        raise ValueError(
+            "vllm serves chat completions and has no reasoning-effort control; "
+            "set pipeline.trace.step_down_reasoning_on_failure to false")
     adjusted = copy.copy(runtime)
     adjusted.role = dict(runtime.role)
     adjusted.role["reasoning"] = native_effort(runtime.name, stage)

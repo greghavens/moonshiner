@@ -35,6 +35,11 @@ def inactive_remote_paths(mode: str, remote: set[str],
             deleted.add("dataset-manifest.json")
         deleted.update(path for path in remote
                        if path.startswith("data/") or path.startswith("viewer/"))
+    # Sidecars belong to no format, so this rule sits outside the branch. A
+    # stale one is worse than a missing one: it aligns cleanly against rows it
+    # was never captured from.
+    deleted.update(path for path in remote
+                   if path.startswith("logprobs/") and path not in active)
     return sorted(deleted)
 
 
@@ -106,10 +111,26 @@ def publication_files(directory: Path, mode: str | None = None, *,
             raise ValueError("Parquet publication manifest is missing")
         manifest = json.loads(manifest_path.read_text())
         required.extend(directory / path for path in manifest["active_shards"])
+    required.extend(logprob_sidecar_files(directory))
     missing = [path for path in required if not path.is_file()]
     if missing:
         raise ValueError(f"required publication artifact is missing: {missing[0]}")
     return required + [path for path in optional if path.is_file()]
+
+
+def logprob_sidecar_files(directory: Path) -> list[Path]:
+    """The token-distribution sidecars, when this export produced any.
+
+    Required rather than optional once the manifest exists: a manifest that
+    names a sidecar which was not uploaded describes distributions a consumer
+    cannot fetch, and the failure would only appear in their loader.
+    """
+    manifest_path = directory / "logprobs" / "MANIFEST.json"
+    if not manifest_path.is_file():
+        return []
+    manifest = json.loads(manifest_path.read_text())
+    return [manifest_path] + [directory / entry["path"]
+                              for entry in manifest.get("sidecars") or []]
 
 
 def privacy_scan_files(directory: Path) -> list[Path]:

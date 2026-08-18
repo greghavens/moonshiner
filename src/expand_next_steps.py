@@ -52,6 +52,18 @@ def expand_record(record: dict) -> list[dict]:
     task = (record.get("meta") or {}).get("task", "unknown")
     source_id = f"{task}:{fingerprint[:20]}"
     base_meta = dict(record.get("meta") or {})
+    # A logprob sidecar is keyed by assistant turn, and ``assistant_step`` is
+    # that same number. If the two ever disagree the rows still load and still
+    # train -- against the wrong distributions -- so the count is checked here,
+    # where both halves are in hand, rather than trusted downstream.
+    sidecar = base_meta.get("logprobs")
+    if sidecar:
+        captured = int(sidecar.get("assistant_turns") or 0)
+        if captured != len(positions):
+            raise ValueError(
+                f"{task}: logprob sidecar covers {captured} assistant turns "
+                f"but the trajectory expands to {len(positions)} steps; the "
+                f"distributions would be misaligned against their targets")
     expanded = []
     for step, target_index in enumerate(positions, 1):
         meta = {

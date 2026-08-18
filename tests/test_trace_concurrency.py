@@ -101,11 +101,12 @@ class TraceConcurrency(unittest.TestCase):
             self.assertTrue(outside.exists())
 
     def test_every_completed_generated_attempt_path_removes_its_workspace(self):
-        # Three ways an attempt finishes: accepted, judged and not accepted,
-        # and deferred before judgment. Each leaves a workspace behind.
+        # Four ways an attempt finishes: accepted, judged and not accepted,
+        # deferred before judgment, and accepted unjudged when judging is
+        # bypassed. Each leaves a workspace behind.
         source = inspect.getsource(trace_pipeline.main)
         generated = source[source.index("record = trace_task("):]
-        self.assertEqual(generated.count("remove_completed_workspace(record)"), 3)
+        self.assertEqual(generated.count("remove_completed_workspace(record)"), 4)
 
     def test_a_deferred_attempt_returns_before_the_judge_is_called(self):
         # There is no candidate to read, so screen() would hunt for a raw trace

@@ -30,8 +30,10 @@ def _build_registry() -> dict[str, type[Runtime]]:
     from runtimes.codex import CodexRuntime
     from runtimes.opencode import OpenCodeRuntime
     from runtimes.pi import PiRuntime
+    from runtimes.vllm import VLLMRuntime
     return {cls.name: cls for cls in (
-        CodexRuntime, ClaudeCodeRuntime, PiRuntime, OpenCodeRuntime)}
+        CodexRuntime, ClaudeCodeRuntime, PiRuntime, OpenCodeRuntime,
+        VLLMRuntime)}
 
 
 REGISTRY = _build_registry()

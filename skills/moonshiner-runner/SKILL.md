@@ -31,6 +31,31 @@ The command generates, deterministically verifies, judges, and retraces substant
 
 Inspect with `moonshiner status` and `moonshiner inspect <run-id>`. Prefer `--json` when another program or agent consumes the result.
 
+## Local model traces with distribution capture
+
+The `vllm` runtime traces against a local OpenAI-compatible server:
+
+```bash
+moonshiner config role trace-author vllm <model>
+moonshiner config set runtimes.vllm.base_url http://127.0.0.1:8000/v1
+```
+
+For self-distillation, capture the teacher's token distributions. Capture is opt-in and never degrades silently: if the server's `--max-logprobs` is below the configured `top_k`, the attempt fails and names the flag. Start vLLM with `--max-logprobs` at least as large as `top_k` before enabling it:
+
+```bash
+moonshiner config set runtimes.vllm.logprobs.enabled true
+moonshiner config set runtimes.vllm.logprobs.top_k 100
+```
+
+Distributions are written as one Parquet sidecar per trajectory, joined to published rows by `source_trajectory_id` and `assistant_step`, and published under `logprobs/` with `logprobs/MANIFEST.json`. `moonshiner dataset analyze` counts their bytes, so expect storage totals well above the row text alone.
+
+A distillation run may also want the teacher's failures and its unchanged reasoning effort. Both settings default to normal behavior. Confirm with the user before changing either: with judging skipped, a trace is accepted with no independent review behind it.
+
+```bash
+moonshiner config set pipeline.trace.skip_judging true
+moonshiner config set pipeline.trace.step_down_reasoning_on_failure false
+```
+
 ## Seed workflow
 
 Author one new seed with an explicit unique id and brief:

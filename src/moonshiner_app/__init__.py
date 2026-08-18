@@ -1,2 +1,2 @@
 """Installed Moonshiner application."""
-__version__ = "0.7.65"
+__version__ = "0.8.0"

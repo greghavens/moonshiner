@@ -18,7 +18,7 @@ from pathlib import Path
 from common import CONFIG, DATA, _staged_secret_values
 from privacy import findings, sanitize_object
 
-ANALYSIS_VERSION = 1
+ANALYSIS_VERSION = 2
 DEFAULT_CONTEXTS = (8192, 16384, 32768, 65536)
 
 
@@ -260,7 +260,16 @@ def row_metrics(row: dict, counter: TokenCounter) -> dict:
     calls = _tool_calls(row)
     reasoning_tokens = sum(counter.text(m.get("reasoning_content", ""))
                            for m in assistants if m.get("reasoning_content"))
+    sidecar = row["meta"].get("logprobs") or {}
     return {
+        "row_bytes": len(json.dumps(row, ensure_ascii=False).encode()),
+        # Per trajectory, not per row: every next-step row derived from one
+        # trajectory points at the same sidecar file. Summed per row this
+        # would report the corpus as many times larger than it is, which is
+        # the same class of error as omitting it entirely.
+        "sidecar_bytes": int(sidecar.get("bytes") or 0),
+        "sidecar_tokens": int(sidecar.get("tokens") or 0),
+        "sidecar_top_k": int(sidecar.get("top_k") or 0),
         "total_tokens": sum(message_tokens) + tools_tokens,
         "target_tokens": counter.message(target) if target else 0,
         "prompt_tokens": sum(message_tokens) - (counter.message(target) if target else 0) + tools_tokens,
@@ -315,6 +324,14 @@ def _mix(rows: list[dict], metrics: list[dict], key) -> dict:
 def analyze_rows(rows: list[dict], counter: TokenCounter) -> dict:
     metrics = [row_metrics(row, counter) for row in rows]
     trajectory_rows = Counter(_trajectory_id(row) for row in rows)
+    # Keyed by the published trajectory id, which is also the key a sidecar
+    # manifest uses, so the two accountings can be reconciled without a
+    # translation step.
+    sidecars = {(row["meta"].get("source_trajectory_id")
+                 or _trajectory_id(row)): metric
+                for row, metric in zip(rows, metrics) if metric["sidecar_bytes"]}
+    rows_bytes = sum(metric["row_bytes"] for metric in metrics)
+    sidecar_bytes = sum(metric["sidecar_bytes"] for metric in sidecars.values())
     behavior = Counter()
     privacy = Counter(finding for row in rows
                       for finding in row["meta"].get("privacy_findings", []))
@@ -334,6 +351,24 @@ def analyze_rows(rows: list[dict], counter: TokenCounter) -> dict:
             "tool_calls": sum(m["tool_calls"] for m in metrics),
             "privacy_findings": sum(privacy.values()),
         },
+        # Token counts describe what a model reads; this describes what has to
+        # be stored and moved. At the top-K this corpus can carry, the
+        # distributions outweigh the text they annotate by two orders of
+        # magnitude, so a size report that counted only rows would be wrong by
+        # about that much.
+        "storage": {
+            "rows_bytes": rows_bytes,
+            "logprob_sidecar_bytes": sidecar_bytes,
+            "logprob_sidecar_tokens": sum(metric["sidecar_tokens"]
+                                          for metric in sidecars.values()),
+            "logprob_trajectories": len(sidecars),
+            "logprob_top_k": sorted({metric["sidecar_top_k"]
+                                     for metric in sidecars.values()}),
+            "total_bytes": rows_bytes + sidecar_bytes,
+            # Consumed and removed by ``analyze_sources`` once it has folded
+            # in the manifests; present so it can tell what is already counted.
+            "counted_trajectories": list(sidecars),
+        },
         "lengths": {
             "total_tokens": _percentiles([m["total_tokens"] for m in metrics]),
             "target_tokens": _percentiles([m["target_tokens"] for m in metrics]),
@@ -349,10 +384,57 @@ def analyze_rows(rows: list[dict], counter: TokenCounter) -> dict:
     }
 
 
+def sidecar_manifest(spec: str) -> dict | None:
+    """Find a source's published logprob manifest, if it has one.
+
+    A published row deliberately carries no sidecar column -- the join key was
+    already there -- so for a published dataset the distributions are invisible
+    to row-level accounting. The manifest beside the rows is where their size
+    is recorded, and reporting a corpus as its text alone would understate it
+    by the ratio that made sidecars necessary in the first place.
+    """
+    if spec.startswith(("https://huggingface.co/datasets/", "hf-file:")):
+        url = _hf_file_url(spec)
+        base, _, _ = url.rpartition("/")
+        try:
+            with urllib.request.urlopen(
+                    f"{base}/logprobs/MANIFEST.json", timeout=30) as response:
+                return json.loads(response.read().decode())
+        except Exception:
+            return None
+    if spec.startswith("hf:"):
+        return None
+    path = Path(spec.removeprefix("local:")).expanduser()
+    manifest = (path if path.is_dir() else path.parent) / "logprobs" / "MANIFEST.json"
+    try:
+        return json.loads(manifest.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def analyze_sources(sources: list[str], tokenizer: str | None = None) -> dict:
     rows = [row for source in sources for row in load_source(source, privacy_mode="report")]
     result = analyze_rows(rows, TokenCounter(tokenizer))
     result["sources"] = [_source_record(source) for source in sources]
+    storage = result["storage"]
+    counted = storage["counted_trajectories"]
+    for spec in sources:
+        manifest = sidecar_manifest(spec)
+        for entry in (manifest or {}).get("sidecars") or []:
+            # Rows that carried the reference themselves are already counted;
+            # this adds only what the manifest knows and the rows do not.
+            if entry.get("trajectory_id") in counted:
+                continue
+            counted.append(entry.get("trajectory_id"))
+            storage["logprob_sidecar_bytes"] += int(entry.get("bytes") or 0)
+            storage["logprob_sidecar_tokens"] += int(entry.get("tokens") or 0)
+            storage["logprob_trajectories"] += 1
+            if entry.get("top_k") and entry["top_k"] not in storage["logprob_top_k"]:
+                storage["logprob_top_k"].append(entry["top_k"])
+    storage["logprob_top_k"].sort()
+    storage["total_bytes"] = (storage["rows_bytes"]
+                              + storage["logprob_sidecar_bytes"])
+    del storage["counted_trajectories"]
     return result
 
 

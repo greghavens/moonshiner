@@ -539,6 +539,50 @@ def screen(seed: dict, judge=None, *, traces_root: Path | None = None) -> dict:
     return review
 
 
+UNJUDGED_STATUS = "unjudged"
+UNJUDGED_SCREENING = "unjudged-distillation-v1"
+
+
+def unjudged_review(seed: dict, *, traces_root: Path | None = None) -> dict:
+    """Accept a trace without a judge, and say so in the record.
+
+    Self-distillation wants the teacher's real output distribution, failures
+    included. Publishing only judge-accepted traces selects for the traces the
+    teacher got right, which is a different distribution from the one the
+    student is being trained to reproduce -- so the judge can be turned off.
+
+    What must not happen is an unjudged trace that is indistinguishable from a
+    judged one. This still runs the deterministic screen, because that is
+    evidence rather than a gate and costs no model call, and it records
+    ``judge.bypassed`` so every downstream consumer can tell that no
+    independent review stands behind this acceptance.
+    """
+    traces_root = traces_root or TRACES
+    reviews_dir = traces_root / "reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    meta = json.loads((traces_root / "meta" / f"{seed['id']}.json").read_text())
+    deterministic = deterministic_screen(seed, meta, traces_root)
+    review = {
+        "id": seed["id"],
+        "raw_sha256": meta.get("raw_sha256"),
+        "diff_sha256": meta.get("diff_sha256"),
+        "deterministic": deterministic,
+        "status": UNJUDGED_STATUS,
+        "accepted": True,
+        "reason": ("judging bypassed by pipeline.trace.skip_judging; "
+                   "no independent review was performed"),
+        "verdict": None,
+        "screening": UNJUDGED_SCREENING,
+        # ``is_accepted`` requires a judge mapping, so this cannot be omitted;
+        # it is filled with the truth instead.
+        "judge": {"bypassed": True, "runtime": None, "model": None,
+                  "reasoning": None, "observed_model": None,
+                  "model_attested": False, "timed_out": False},
+    }
+    _write_review(seed["id"], review, reviews_dir)
+    return review
+
+
 def _prior_judge_errors(seed_id: str, meta: dict,
                         reviews_dir: Path | None = None) -> int:
     """Malformed-verdict count already recorded for exactly this trace."""

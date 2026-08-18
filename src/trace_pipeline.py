@@ -26,7 +26,8 @@ from runtimes import (NoCompatibleTraceHarness,
                       get_teacher, resolve_trace_harness)
 from runtimes.availability import (INFRASTRUCTURE_EXIT, USAGE_LIMIT_EXIT,
                                    ModelUnavailable)
-from screen_traces import JUDGE_ERROR_LIMIT, feedback_from_review, screen
+from screen_traces import (JUDGE_ERROR_LIMIT, feedback_from_review, screen,
+                           unjudged_review)
 from reasoning_stepdown import (native_effort, next_reasoning_stage,
                                 reasoning_schedule, runtime_for_stage)
 
@@ -257,6 +258,7 @@ def main(argv: list[str] | None = None) -> int:
     original_argv = list(argv or [])
     defaults = CONFIG.get("pipeline", {}).get("trace", {})
     stepdown_enabled = bool(defaults.get("step_down_reasoning_on_failure", True))
+    skip_judging = bool(defaults.get("skip_judging", False))
     parser = argparse.ArgumentParser(
         prog="moonshiner run",
         description="Run the bounded trace quality loop with a durable ledger.")
@@ -306,6 +308,7 @@ def main(argv: list[str] | None = None) -> int:
         seeds=select_seeds(only=ids); args.max_attempts=prior_limits["max_attempts"]
         stepdown_enabled = bool(prior_limits.get(
             "step_down_reasoning_on_failure", stepdown_enabled))
+        skip_judging = bool(prior_limits.get("skip_judging", skip_judging))
     else:
         seeds = _selected(args)
     if not seeds:
@@ -321,8 +324,14 @@ def main(argv: list[str] | None = None) -> int:
           f"each; no run-wide model-call ceiling")
     print(f"  author: {teacher.name}/{teacher.role['model']} "
           f"({teacher.role.get('reasoning', 'default')})")
-    print(f"  judge:  {judge.name}/{judge.role['model']} "
-          f"({judge.role.get('reasoning', 'default')})")
+    if skip_judging:
+        # Loud, because every trace this run publishes will carry an
+        # acceptance that no judge stands behind.
+        print("  judge:  BYPASSED (pipeline.trace.skip_judging); every "
+              "completed trace is accepted unjudged")
+    else:
+        print(f"  judge:  {judge.name}/{judge.role['model']} "
+              f"({judge.role.get('reasoning', 'default')})")
     configured_workers = args.workers or int(defaults.get("workers", 1))
     print(f"  trace workers: {configured_workers}"
           + (" (fixed for this run)" if args.workers else " (live-configurable)"))
@@ -367,6 +376,7 @@ def main(argv: list[str] | None = None) -> int:
     ensure_publish_queue()
     limits = {"seeds": len(seeds), "max_attempts": args.max_attempts}
     limits["step_down_reasoning_on_failure"] = stepdown_enabled
+    limits["skip_judging"] = skip_judging
     retry_order = str(defaults.get("retry_order", "immediate"))
     if retry_order not in {"immediate", "tail"}:
         raise ValueError("pipeline.trace.retry_order must be immediate or tail")
@@ -406,7 +416,8 @@ def main(argv: list[str] | None = None) -> int:
         seed = seed_by_id[claim["seed_id"]]
         selected_teacher, capability_resolution = resolve_trace_harness(
             seed, configured_teacher=worker_teacher)
-        worker_judge.preflight(require_auth=True)
+        if not skip_judging:
+            worker_judge.preflight(require_auth=True)
         number = claim["attempts"] + 1
         configured_effort = str(selected_teacher.role.get("reasoning") or "max")
         required_stages = reasoning_schedule(args.max_attempts, stepdown_enabled,
@@ -486,6 +497,21 @@ def main(argv: list[str] | None = None) -> int:
                 set_job(worker_db, run_id, seed["id"], "deferred", number, reason)
                 status = "deferred"
             print(f"[{status}] {seed['id']}: {reason}", flush=True)
+            return
+        if skip_judging:
+            # Deliberately outside the judge-error loop below: there is no
+            # judge to have erred, and routing an unjudged review through
+            # `is_judge_error` would let a failed deterministic setup re-enter
+            # a re-review that can never happen.
+            print(f"[{seed['id']}] attempt {number} ({stage}): unjudged",
+                  flush=True)
+            with lease_heartbeat():
+                review = unjudged_review(seed)
+            artifact = _archive_attempt(run_id, seed["id"], number)
+            finish_attempt(worker_db, run_id, seed["id"], number, "accepted",
+                           usage, review, artifact_path=artifact)
+            remove_completed_workspace(record)
+            print(f"[accepted:unjudged] {seed['id']}", flush=True)
             return
         # Candidate checks are evidence for the trace judge, never a separate
         # rejection gate. Every completed candidate proceeds to judgment.

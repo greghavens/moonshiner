@@ -14,8 +14,9 @@ from runtimes.codex import CodexRuntime
 from runtimes.opencode import OpenCodeRuntime
 from runtimes.pi import PiRuntime
 from runtimes.synthetic_correction import SyntheticCorrectionAdapter
+from runtimes.vllm import VLLMRuntime
 _RUNTIME_CLASSES = (CodexRuntime, PiRuntime, ClaudeCodeRuntime,
-                    OpenCodeRuntime, SyntheticCorrectionAdapter)
+                    OpenCodeRuntime, VLLMRuntime, SyntheticCorrectionAdapter)
 _BY_FORMAT: dict[str, type] = {}
 for _cls in _RUNTIME_CLASSES:
     for _fmt in _cls.trace_formats:

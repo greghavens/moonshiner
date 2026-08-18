@@ -23,7 +23,7 @@ from common import (CONFIG, DATA, SECRET_RE, TRACES, load_seeds,
                     scrub_text, jsonl_lines)
 from canonical_dataset import INTERNAL_CONTENT_MARKERS
 from normalize import parse_trace
-from screen_traces import validate_reviewer_verdict
+from screen_traces import UNJUDGED_SCREENING, validate_reviewer_verdict
 from privacy import sanitize_object
 from review_contract import is_accepted
 
@@ -34,6 +34,10 @@ REVIEWS = TRACES / "reviews"
 
 VERIFIER = "acceptance-tests+protected-file-hash+independent-review"
 SCREENING = "deterministic-plus-independent-review-v1"
+# A bypassed judge removes exactly one of the three things the verifier string
+# claims. It is dropped rather than left standing, so a published unjudged row
+# never advertises a review that did not happen.
+UNJUDGED_VERIFIER = "acceptance-tests+protected-file-hash"
 
 
 def _provider(runtime_name: str) -> str:
@@ -42,6 +46,17 @@ def _provider(runtime_name: str) -> str:
         return runtime_config["display_provider"]
     return {"codex": "openai", "claude-code": "anthropic"}.get(runtime_name,
                                                                runtime_name)
+
+
+def _review(task_id: str, traces_root: Path) -> dict | None:
+    path = traces_root / "reviews" / f"{task_id}.json"
+    if not path.exists():
+        return None
+    try:
+        review = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return None
+    return review if isinstance(review, dict) else None
 
 
 def screening_acceptance(task_id: str, info: dict,
@@ -172,6 +187,8 @@ def build_row(seed: dict, info: dict,
     teacher = info.get("teacher") or {}
     observed = teacher.get("observed_models") or (
         [teacher["observed_model"]] if teacher.get("observed_model") else [])
+    review = _review(seed["id"], traces_root) or {}
+    bypassed = bool((review.get("judge") or {}).get("bypassed"))
     meta = {
         "task": seed["id"],
         "lang": seed.get("lang"),
@@ -187,11 +204,27 @@ def build_row(seed: dict, info: dict,
         "model_attested": bool(teacher.get("model_attested")),
         "provider": _provider(teacher.get("runtime", "")),
         "trace_format": trace_format,
-        "verifier": VERIFIER,
-        "screening": SCREENING,
+        "verifier": UNJUDGED_VERIFIER if bypassed else VERIFIER,
+        "screening": (review.get("screening") or UNJUDGED_SCREENING)
+                     if bypassed else SCREENING,
     }
     if secret_redactions:
         meta["secret_redactions"] = secret_redactions
+    sidecar = (teacher.get("provenance") or {}).get("logprobs") or {}
+    if sidecar.get("path") and sidecar.get("tokens"):
+        # Carried as a reference, never inlined: at the K this backend exists
+        # to capture, one trajectory's distributions dwarf the trace that
+        # produced them. ``expand_next_steps`` propagates this to every derived
+        # row, and the alignment key it joins on is already published.
+        meta["logprobs"] = {
+            "path": sidecar["path"],
+            "sha256": sidecar.get("sha256"),
+            "tokens": int(sidecar.get("tokens") or 0),
+            "bytes": int(sidecar.get("bytes") or 0),
+            "top_k": int(sidecar.get("top_k") or 0),
+            "assistant_turns": int(sidecar.get("assistant_turns") or 0),
+            "renormalized": False,
+        }
     return {"messages": session, "meta": meta}, None
 
 
