@@ -242,3 +242,35 @@ class PowerShellSandboxMounts(unittest.TestCase):
         module_index = command.index("PSModulePath")
         self.assertTrue(command[module_index + 1].startswith(
             toolchains.POWERSHELL_MODULES_MOUNT + ":"))
+
+
+class VerifyCommandExecution(unittest.TestCase):
+    """A seed's acceptance line is a shell line when it uses shell syntax."""
+
+    def test_a_plain_command_runs_as_argv(self):
+        self.assertEqual(common.verify_argv("python3 -B .protected/verify.py"),
+                         ["python3", "-B", ".protected/verify.py"])
+
+    def test_a_quoted_pattern_keeps_its_single_argument(self):
+        self.assertEqual(
+            common.verify_argv("python3 -m unittest discover -p 'test_*.py'"),
+            ["python3", "-m", "unittest", "discover", "-p", "test_*.py"])
+
+    def test_a_chained_command_gets_a_shell(self):
+        # Executed as argv, `&&` reaches go as an import path and the seed can
+        # never pass: `malformed import path "&&": invalid char '&'`.
+        command = "go vet ./... && go test -race ./..."
+        self.assertEqual(common.verify_argv(command), ["/bin/sh", "-c", command])
+
+    def test_a_leading_assignment_gets_a_shell(self):
+        command = "cache=$(mktemp -d) && go test ./..."
+        self.assertEqual(common.verify_argv(command), ["/bin/sh", "-c", command])
+
+    def test_a_pipeline_gets_a_shell(self):
+        command = "printf '%s' abc | sha256sum -c"
+        self.assertEqual(common.verify_argv(command), ["/bin/sh", "-c", command])
+
+    def test_unbalanced_quoting_is_left_for_the_shell_to_report(self):
+        self.assertEqual(common.verify_argv('echo "unclosed'),
+                         ["/bin/sh", "-c", 'echo "unclosed'])
+

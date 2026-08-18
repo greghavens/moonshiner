@@ -489,6 +489,31 @@ def run_setup(seed: dict, workspace: Path) -> tuple[bool, str]:
         return False, str(exc)
 
 
+# A seed's acceptance line is a shell line: it is written in the task prompt as
+# something an operator would type, and the agent runs it in a shell. Splitting
+# it into an argv and executing that directly hands `&&` to the program as an
+# argument, so `go vet ./... && go test ./...` reports `malformed import path
+# "&&"` and the seed can never pass however good the answer is. Seventeen seeds
+# in the corpus are written that way; each burned every attempt it had. Only a
+# command that actually needs a shell gets one, so nothing else changes.
+SHELL_OPERATORS = frozenset({"&&", "||", ";", "|", "&", ">", ">>", "<", "<<"})
+
+
+def verify_argv(verify_cmd: str) -> list[str]:
+    """Argv for a seed's verify command, through a shell only when it needs one."""
+    try:
+        argv = shlex.split(verify_cmd)
+    except ValueError:  # unbalanced quoting: the shell's problem to report
+        argv = []
+    needs_shell = (
+        not argv
+        or any(token in SHELL_OPERATORS for token in argv)
+        # A leading assignment (`cache=$(mktemp -d) && ...`) is shell syntax,
+        # not a program name.
+        or ("=" in argv[0] and not argv[0].startswith("/")))
+    return ["/bin/sh", "-c", verify_cmd] if needs_shell else argv
+
+
 def run_verify(seed: dict, workspace: Path, timeout: int | None = None
                ) -> tuple[bool | None, str]:
     """Run a seed's verification command; return (passed|None, output).
@@ -504,7 +529,8 @@ def run_verify(seed: dict, workspace: Path, timeout: int | None = None
     if not seed.get("verify_cmd"):
         return None, "(no verify_cmd)"
     try:
-        proc = _sandboxed_command(shlex.split(seed["verify_cmd"]), workspace, timeout)
+        proc = _sandboxed_command(verify_argv(seed["verify_cmd"]), workspace,
+                                  timeout)
         return proc.returncode == 0, (proc.stdout + "\n" + proc.stderr).strip()
     except subprocess.TimeoutExpired:
         return False, f"(verify timed out after {timeout}s)"
