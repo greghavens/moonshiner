@@ -67,10 +67,10 @@ def ensure_publish_queue() -> None:
     # `is-active` is still false for a unit that is merely deactivating, so
     # the loser of the race gets "unit was already loaded" — a report that the
     # publisher is running, not that anything is wrong. Under `check=True`
-    # that raised out of `main`, and every non-zero trace exit is mapped to
-    # INFRASTRUCTURE_EXIT, which clears the pending queue and is one of the
-    # codes `RestartPreventExitStatus` refuses to restart: losing a race to
-    # start the publisher permanently stopped tracing. Publishing is
+    # that raised out of `main` as INFRASTRUCTURE_EXIT, which clears the
+    # pending queue and is one of the codes `RestartPreventExitStatus`
+    # refuses to restart: losing a race to start the publisher permanently
+    # stopped tracing. Publishing is
     # downstream of tracing and does not get to halt it. The next pass calls
     # this again, and accepted traces wait in the ledger meanwhile.
     started = subprocess.run(command, capture_output=True, text=True)
@@ -193,6 +193,7 @@ def _run_individual_trace_jobs(seeds: list[dict], args, workers: int) -> int:
         return seed["id"], subprocess.run(command, cwd=project, env=environment).returncode
 
     failures = 0
+    unaccepted = 0
     completed = 0
     exit_code = 0
     stop_dispatch = False
@@ -236,21 +237,31 @@ def _run_individual_trace_jobs(seeds: list[dict], args, workers: int) -> int:
                 futures.pop(future, None)
                 seed_id, code = future.result()
                 completed += 1
-                if code:
+                # A seed whose attempts all end in rejection exits 1: the
+                # quality loop working as designed, not the environment
+                # breaking. Treating that as an infrastructure failure cleared
+                # every other seed of the pass and ended the coordinator with a
+                # code `RestartPreventExitStatus` refuses to restart, so two
+                # exhausted seeds could stop a 1063-seed queue and leave it
+                # stopped until someone noticed. Only the codes that mean the
+                # environment itself is unusable stop dispatch; any other
+                # non-zero exit is one seed's outcome, and the queue moves on.
+                if code in {USAGE_LIMIT_EXIT, INFRASTRUCTURE_EXIT}:
                     failures += 1
-                    mapped = code if code in {USAGE_LIMIT_EXIT,
-                                              INFRASTRUCTURE_EXIT} \
-                        else INFRASTRUCTURE_EXIT
-                    if exit_code == 0 or mapped == USAGE_LIMIT_EXIT:
-                        exit_code = mapped
+                    if exit_code == 0 or code == USAGE_LIMIT_EXIT:
+                        exit_code = code
                     stop_dispatch = True
                     pending.clear()
-                    print(f"[trace process failed: exit {mapped}] {seed_id}",
+                    print(f"[trace process failed: exit {code}] {seed_id}",
                           flush=True)
+                elif code:
+                    unaccepted += 1
+                    print(f"[trace complete: not accepted] {seed_id}", flush=True)
                 else:
                     print(f"[trace complete: accepted] {seed_id}", flush=True)
-    print(f"trace queue pass complete: {completed - failures} accepted, "
-          f"{failures} failed processes, {completed} individual trace jobs", flush=True)
+    print(f"trace queue pass complete: {completed - failures - unaccepted} accepted, "
+          f"{unaccepted} not accepted, {failures} failed processes, "
+          f"{completed} individual trace jobs", flush=True)
     return exit_code
 
 

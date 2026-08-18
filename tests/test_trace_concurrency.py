@@ -276,6 +276,43 @@ class TraceConcurrency(unittest.TestCase):
             self.assertEqual(trace_pipeline._run_individual_trace_jobs(seeds, args, 2), 0)
         self.assertEqual(peak, 2)
 
+    def test_a_seed_that_never_passes_does_not_stop_the_queue(self):
+        """A seed exhausting its attempts is a verdict, not an outage.
+
+        The trace process exits 1 when the judge refused every attempt. That
+        exit once mapped to INFRASTRUCTURE_EXIT, which cleared the pending
+        queue and stopped the coordinator with a code the supervisor will not
+        restart, so one hopeless seed took the whole pass down with it.
+        """
+        args = type("Args", (), {"max_attempts": 3, "workers": 2})()
+        seeds = [{"id": f"seed-{index}"} for index in range(6)]
+
+        def run(command, **_kwargs):
+            seed_id = command[command.index("--only") + 1]
+            return mock.Mock(returncode=1 if seed_id == "seed-0" else 0)
+
+        with mock.patch.object(trace_pipeline, "_moonshiner_executable",
+                               return_value="/installed/bin/moonshiner"), \
+             mock.patch.object(trace_pipeline.subprocess, "run",
+                               side_effect=run) as runs:
+            self.assertEqual(trace_pipeline._run_individual_trace_jobs(seeds, args, 2), 0)
+        traced = {call.args[0][call.args[0].index("--only") + 1]
+                  for call in runs.call_args_list}
+        self.assertEqual(traced, {seed["id"] for seed in seeds})
+
+    def test_an_exhausted_quota_still_stops_the_pass(self):
+        """The environment being unusable is the case that must stop dispatch."""
+        args = type("Args", (), {"max_attempts": 3, "workers": 1})()
+        seeds = [{"id": "seed-a"}, {"id": "seed-b"}]
+        with mock.patch.object(trace_pipeline, "_moonshiner_executable",
+                               return_value="/installed/bin/moonshiner"), \
+             mock.patch.object(trace_pipeline.subprocess, "run",
+                               return_value=mock.Mock(
+                                   returncode=trace_pipeline.USAGE_LIMIT_EXIT)) as runs:
+            self.assertEqual(trace_pipeline._run_individual_trace_jobs(seeds, args, 1),
+                             trace_pipeline.USAGE_LIMIT_EXIT)
+        self.assertEqual(len(runs.call_args_list), 1)
+
     def test_expired_claim_is_recovered_once(self):
         db = connect(self.path)
         first = claim_job(db, self.run_id, "dead-worker", lease_seconds=-1)
