@@ -18,7 +18,7 @@ from pathlib import Path
 from common import SECRET_RE, scrub_text
 from runtimes import availability
 from runtimes.base import (ReviewResult, Runtime, TraceResult,
-                           run_with_inactivity_timeout,
+                           parse_json_verdict, run_with_inactivity_timeout,
                            workspace_only_command)
 
 
@@ -302,29 +302,7 @@ class CodexRuntime(Runtime):
 # --------------------------------------------------------------------------- #
 # Rollout / event-stream normalizers                                          #
 # --------------------------------------------------------------------------- #
-def _parse_json_object(text: str) -> dict | None:
-    text = (text or "").strip()
-    if not text:
-        return None
-    try:
-        value = json.loads(text)
-        return value if isinstance(value, dict) else None
-    except json.JSONDecodeError:
-        pass
-    start, depth = None, 0
-    for index, char in enumerate(text):
-        if char == "{":
-            if depth == 0:
-                start = index
-            depth += 1
-        elif char == "}" and depth:
-            depth -= 1
-            if depth == 0 and start is not None:
-                try:
-                    return json.loads(text[start:index + 1])
-                except json.JSONDecodeError:
-                    start = None
-    return None
+_parse_json_object = parse_json_verdict
 
 
 def _observed_models(text: str) -> list[str]:

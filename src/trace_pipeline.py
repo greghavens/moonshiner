@@ -26,7 +26,7 @@ from runtimes import (NoCompatibleTraceHarness,
                       get_teacher, resolve_trace_harness)
 from runtimes.availability import (INFRASTRUCTURE_EXIT, USAGE_LIMIT_EXIT,
                                    ModelUnavailable)
-from screen_traces import feedback_from_review, screen
+from screen_traces import JUDGE_ERROR_LIMIT, feedback_from_review, screen
 from reasoning_stepdown import (native_effort, next_reasoning_stage,
                                 reasoning_schedule, runtime_for_stage)
 
@@ -493,6 +493,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[{seed['id']}] attempt {number} ({stage}): judge", flush=True)
         with lease_heartbeat():
             review = screen(seed, worker_judge)
+        # A judge that returns no usable verdict has said nothing about this
+        # trace, and `screen` budgets that: it reports which re-review this is
+        # and stops counting the fault at JUDGE_ERROR_LIMIT, after which a
+        # still-malformed verdict is a rejection and a still-broken judge is
+        # the infrastructure failure below. Acting on the first one instead
+        # stopped the whole queue over a single garbled reply — and re-tracing
+        # would have been worse, re-billing a teacher generation to fix
+        # something the teacher did not do.
+        while (is_judge_error(review)
+               and int(review.get("judge_errors") or 0) < JUDGE_ERROR_LIMIT):
+            print(f"[{seed['id']}] attempt {number} ({stage}): re-judge "
+                  f"({review.get('reason')})", flush=True)
+            record_model_call(worker_db, run_id)
+            with lease_heartbeat():
+                review = screen(seed, worker_judge)
         if is_judge_error(review):
             artifact = _archive_attempt(run_id, seed["id"], number)
             finish_infrastructure_failure(worker_db, run_id, seed["id"], number,

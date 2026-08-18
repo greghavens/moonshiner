@@ -9,6 +9,7 @@ name from ``config.json`` so a full distill can be run against any model.
 from __future__ import annotations
 
 import abc
+import json
 import os
 import signal
 import shutil
@@ -297,6 +298,58 @@ def run_with_inactivity_timeout(
         raise subprocess.TimeoutExpired(
             command, inactivity_timeout, output=output, stderr=errors)
     return subprocess.CompletedProcess(command, process.returncode, output, errors)
+
+
+def with_verdict_schema(instruction: str, schema: dict | None) -> str:
+    """State the verdict's required shape to a judge that must produce it.
+
+    ``run_review`` takes the schema so the harness can hold the judge to it.
+    An adapter that accepts the argument and drops it asks for "the JSON
+    verdict object required by the schema" without ever showing the schema,
+    and the judge answers in a shape of its own: the review is thrown away as
+    malformed, and every judged trace fails the same way.
+    """
+    if schema is None:
+        return instruction
+    return (instruction + "\n\nReturn ONLY a single JSON object matching this "
+            "schema, with no prose:\n" + json.dumps(schema))
+
+
+def parse_json_verdict(text: str) -> dict | None:
+    """Extract the judge's JSON verdict from its final text.
+
+    Judges wrap the verdict in prose or code fences, and sometimes emit a
+    preliminary object before the definitive one — a first-{-to-last-}
+    substring spans both and parses as nothing, rejecting a good trace.
+    Scan top-level objects with ``raw_decode`` (string-aware) and keep the
+    last one that parses: the final answer.
+
+    Every harness needs this and each one had its own version, so the same
+    bug had to be found once per adapter. It cost a complete Opus 5 review
+    whose only fault was quoting a request body in its own findings: the
+    first ``{`` in the reply belonged to the prose, and the span from there
+    to the verdict's closing brace was not JSON.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        value = json.loads(text)
+        return value if isinstance(value, dict) else None
+    except json.JSONDecodeError:
+        pass
+    decoder = json.JSONDecoder()
+    result = None
+    index = text.find("{")
+    while index != -1:
+        try:
+            value, end = decoder.raw_decode(text, index)
+            if isinstance(value, dict):
+                result = value
+            index = text.find("{", max(end, index + 1))
+        except json.JSONDecodeError:
+            index = text.find("{", index + 1)
+    return result
 
 
 @dataclass

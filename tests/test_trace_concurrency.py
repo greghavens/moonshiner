@@ -127,6 +127,29 @@ class TraceConcurrency(unittest.TestCase):
         generated = source[source.index("record = trace_task("):]
         self.assertNotIn('record.get("deferred_safeguard_refusal")', generated)
 
+    def test_a_garbled_verdict_is_re_judged_before_it_stops_the_queue(self):
+        # `screen` budgets judge output faults — it says "will re-review
+        # (attempt 1/3)" and only stops counting at the limit — but that budget
+        # is only spent by whoever calls it again. The continuous queue never
+        # returns to `needs_first_pass`, so escalating the first judge_error
+        # straight to an infrastructure failure stopped the whole run on one
+        # garbled reply, with the re-review it had just promised never made.
+        source = inspect.getsource(trace_pipeline.main)
+        generated = source[source.index("record = trace_task("):]
+        loop = generated.index("while (is_judge_error(review)")
+        self.assertIn("JUDGE_ERROR_LIMIT", generated[loop:])
+        self.assertLess(loop, generated.index("finish_infrastructure_failure"))
+        self.assertEqual(generated[loop:].count("screen(seed, worker_judge)"), 1)
+
+    def test_a_re_judge_is_a_metered_call_like_any_other(self):
+        # Every judge run bills the judge model. Re-reviewing without counting
+        # it puts the run over its model-call budget without ever showing why.
+        source = inspect.getsource(trace_pipeline.main)
+        generated = source[source.index("record = trace_task("):]
+        loop = generated[generated.index("while (is_judge_error(review)"):]
+        rejudge = loop[:loop.index("screen(seed, worker_judge)")]
+        self.assertIn("record_model_call(worker_db, run_id)", rejudge)
+
     def test_infrastructure_failure_alert_is_immediate_and_high_visibility(self):
         output = io.StringIO()
         with mock.patch.object(trace_pipeline.sys, "stderr", output):

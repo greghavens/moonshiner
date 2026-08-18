@@ -24,6 +24,7 @@ from runtimes import availability
 from runtimes.auth import load_provider_key
 from runtimes.base import (ReviewResult, Runtime, TraceResult,
                            run_with_inactivity_timeout,
+                           with_verdict_schema,
                            workspace_only_command)
 from runtimes.credential_proxy import DUMMY_TOKEN, ProxySession
 
@@ -239,12 +240,12 @@ class PiRuntime(Runtime):
         workspace = self.require_persistent_workspace(workspace)
         return self._run(prompt=f"{prompt}", workspace=workspace, out_dir=out_dir,
                          system_prompt=system_prompt, tools=tools,
-                         schema=None, read_only=False, artifact_id=seed["id"],
+                         read_only=False, artifact_id=seed["id"],
                          interaction=interaction,
                          append_system_prompt=self._coding_guidance(seed), seed=seed)
 
     def _run(self, *, prompt: str, workspace: Path, out_dir: Path,
-             system_prompt: str, tools: list[str] | None, schema: dict | None,
+             system_prompt: str, tools: list[str] | None,
              read_only: bool, artifact_id: str,
              interaction: list[str] | None = None,
              append_system_prompt: str | None = None,
@@ -346,11 +347,16 @@ class PiRuntime(Runtime):
         workspace = self.require_persistent_workspace(workspace)
         review_tools = (["read", "grep", "find", "ls"] if read_only else
                         ["read", "write", "edit", "bash", "grep", "find", "ls"])
-        result = self._run(prompt=instruction, workspace=workspace, out_dir=out_dir,
+        # pi has no --output-schema, so the shape has to be stated in the
+        # prompt. It used to be passed to ``_run``, which took the argument and
+        # never used it: the judge was told to match "the schema" it was never
+        # shown, and answered in a shape of its own.
+        result = self._run(prompt=with_verdict_schema(instruction, schema),
+                           workspace=workspace, out_dir=out_dir,
                            system_prompt=("You are an independent read-only reviewer."
                                           if read_only else
                                           "You are an independent reviewer allowed to repair this workspace."),
-                           tools=review_tools, schema=schema,
+                           tools=review_tools,
                            read_only=read_only, artifact_id="judge",
                            interaction=None)
         last = _last_message(result.raw_path.read_text())

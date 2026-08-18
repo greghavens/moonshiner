@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -499,7 +500,12 @@ class SharedPipelineContract(CapabilityResolverContract):
             [card, export])
         source = pathlib.Path(trace_pipeline.__file__).read_text()
         self.assertEqual(source.count("record = trace_task("), 1)
-        self.assertEqual(source.count("review = screen("), 1)
+        # A garbled verdict is re-reviewed by calling the same screen() again,
+        # so count spellings rather than calls: what has to stay singular is
+        # the screening path every harness goes down, not how many times the
+        # queue is allowed to walk it.
+        self.assertEqual(set(re.findall(r"screen\([^)]*\)", source)),
+                         {"screen(seed, worker_judge)"})
         for module in (screen_traces, build_dataset, export_hf_next_steps,
                        validate_hf_export, publish, export_hf_card):
             text = pathlib.Path(module.__file__).read_text()

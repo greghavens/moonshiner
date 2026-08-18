@@ -201,5 +201,98 @@ class HarnessContract(unittest.TestCase):
         self.assertIn("record = trace_task(seed, attempt_teacher, force=True", source)
 
 
+class _Captured(Exception):
+    """Stop an adapter at its launch boundary, holding the judge's input."""
+
+
+# Where each adapter hands the review off, and whether that is a module
+# function or a method on the runtime. Everything passed at this point — argv,
+# stdin, keyword arguments — plus every file the adapter wrote into the
+# workspace is what the judge gets to read.
+JUDGE_LAUNCH = {
+    "claude-code": ("runtimes.claude_code.run_with_inactivity_timeout", False),
+    "codex": ("runtimes.codex.run_with_inactivity_timeout", False),
+    "opencode": ("_run_server_session", True),
+    "pi": ("_run", True),
+}
+
+
+class EveryJudgeIsShownTheSchemaItMustMatch(unittest.TestCase):
+    """``run_review`` takes a schema so the harness can hold the judge to it.
+
+    The reviewer prompt ends by asking for "the JSON verdict object required by
+    the schema" and never states the schema, because stating it is the
+    adapter's job — natively where the harness supports it, in the prompt where
+    it does not. An adapter that accepts ``schema`` and drops it leaves the
+    judge guessing: OpenCode and Pi both did, silently. The judge answers in a
+    shape of its own, ``validate_reviewer_verdict`` finds none of the five
+    categories, and every reviewed trace fails as malformed three re-reviews
+    deep before the queue stops on an infrastructure failure the judge did not
+    cause.
+    """
+
+    SCHEMA = {"type": "object",
+              "required": ["verdict", "added_scope"],
+              "properties": {"verdict": {"enum": ["accept", "reject"]},
+                             "added_scope": {"type": "array"}}}
+    INSTRUCTION = "Review this workspace and return a verdict."
+
+    def _judge_input(self, name: str, runtime) -> str:
+        """Everything the judge can read when *runtime* reviews with a schema."""
+        seen: list[str] = []
+
+        def capture(*args, **kwargs):
+            seen.extend(str(value) for value in args)
+            seen.extend(str(value) for value in kwargs.values())
+            raise _Captured
+
+        target, is_method = JUDGE_LAUNCH[name]
+        launch = (mock.patch.object(runtime, target, capture) if is_method
+                  else mock.patch(target, capture))
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = pathlib.Path(directory) / "workspace"
+            out_dir = pathlib.Path(directory) / "review"
+            workspace.mkdir(); out_dir.mkdir()
+            with mock.patch.object(runtime, "require_persistent_workspace",
+                                   return_value=workspace), launch:
+                with self.assertRaises(_Captured):
+                    runtime.run_review(self.INSTRUCTION, workspace,
+                                       out_dir=out_dir, schema=self.SCHEMA)
+            # Codex states the shape natively, by writing it out and pointing
+            # --output-schema at the file; that counts, so read what was left.
+            seen += [path.read_text(errors="replace")
+                     for path in sorted(workspace.rglob("*")) if path.is_file()]
+        return "\n".join(seen)
+
+    def _runtime(self, name: str):
+        role = {"model": "model", "reasoning": "xhigh", "timeout_s": 60}
+        config = {"judge": dict(role, runtime=name),
+                  "runtimes": {name: {"provider": "provider",
+                                      "base_url": "http://127.0.0.1:1",
+                                      "api_key_env": "MOONSHINER_TEST_KEY"}}}
+        return REGISTRY[name](config, config["judge"])
+
+    def test_no_adapter_accepts_a_schema_and_drops_it(self):
+        for name in sorted(REGISTRY):
+            with self.subTest(runtime=name):
+                shown = self._judge_input(name, self._runtime(name))
+                self.assertIn("added_scope", shown)
+                self.assertIn(self.INSTRUCTION, shown)
+
+    def test_a_review_without_a_schema_is_left_alone(self):
+        # Not every caller has a schema, and inventing one for them would put
+        # words in the judge's mouth that the reviewer prompt never asked for.
+        runtime = self._runtime("claude-code")
+        with mock.patch.object(self, "SCHEMA", None):
+            shown = self._judge_input("claude-code", runtime)
+        self.assertIn(self.INSTRUCTION, shown)
+        self.assertNotIn("added_scope", shown)
+
+    def test_every_registered_harness_is_covered(self):
+        # A new adapter with no entry here is an untested judge, which is how
+        # both silent droppers survived: nothing walked the whole registry.
+        self.assertEqual(set(JUDGE_LAUNCH), set(REGISTRY))
+
+
 if __name__ == "__main__":
     unittest.main()

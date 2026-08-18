@@ -20,7 +20,8 @@ from pathlib import Path
 from common import scrub_text
 from runtimes import availability
 from runtimes.base import (ReviewResult, Runtime, TraceResult,
-                           run_with_inactivity_timeout,
+                           parse_json_verdict, run_with_inactivity_timeout,
+                           with_verdict_schema,
                            workspace_only_command)
 
 REFUSAL_MARKERS = ("model_refusal_no_fallback", "model_refusal")
@@ -279,10 +280,7 @@ class ClaudeCodeRuntime(Runtime):
                    read_only: bool = True) -> ReviewResult:
         workspace = self.require_persistent_workspace(workspace)
         cmd = self._base_cmd(disallowed=READ_ONLY_DISALLOW if read_only else None)
-        prompt = instruction
-        if schema is not None:
-            prompt += ("\n\nReturn ONLY a single JSON object matching this schema, "
-                       "with no prose:\n" + json.dumps(schema))
+        prompt = with_verdict_schema(instruction, schema)
         environment = self.teacher_environment(workspace)
         self._add_host_auth(environment)
         cmd = workspace_only_command(
@@ -397,32 +395,4 @@ class ClaudeCodeRuntime(Runtime):
                                          "content": scrub_text(block, workspace)})
         return messages, stats
 
-def _parse_json(text: str) -> dict | None:
-    """Extract the judge's JSON verdict from its final text.
-
-    Judges wrap the verdict in prose or code fences, and sometimes emit a
-    preliminary object before the definitive one — a first-{-to-last-}
-    substring spans both and parses as nothing, rejecting a good trace.
-    Scan top-level objects with ``raw_decode`` (string-aware) and keep the
-    last one that parses: the final answer.
-    """
-    text = (text or "").strip()
-    if not text:
-        return None
-    try:
-        value = json.loads(text)
-        return value if isinstance(value, dict) else None
-    except json.JSONDecodeError:
-        pass
-    decoder = json.JSONDecoder()
-    result = None
-    index = text.find("{")
-    while index != -1:
-        try:
-            value, end = decoder.raw_decode(text, index)
-            if isinstance(value, dict):
-                result = value
-            index = text.find("{", max(end, index + 1))
-        except json.JSONDecodeError:
-            index = text.find("{", index + 1)
-    return result
+_parse_json = parse_json_verdict

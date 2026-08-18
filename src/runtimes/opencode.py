@@ -29,7 +29,8 @@ from runtimes import availability
 from runtimes.auth import load_provider_key
 from runtimes.base import (ReviewResult, Runtime, TraceResult,
                            _kill_process_tree, _process_tree_snapshot,
-                           run_with_inactivity_timeout,
+                           parse_json_verdict, run_with_inactivity_timeout,
+                           with_verdict_schema,
                            wait_with_inactivity_timeout,
                            workspace_only_command)
 from runtimes.credential_proxy import DUMMY_TOKEN, ProxySession
@@ -191,22 +192,7 @@ def _provider_and_model(runtime: "OpenCodeRuntime") -> tuple[str, str]:
     return provider, model
 
 
-def _parse_json_object(text: str) -> dict | None:
-    text = (text or "").strip()
-    if not text:
-        return None
-    try:
-        value = json.loads(text)
-        return value if isinstance(value, dict) else None
-    except json.JSONDecodeError:
-        start, end = text.find("{"), text.rfind("}")
-        if 0 <= start < end:
-            try:
-                value = json.loads(text[start:end + 1])
-                return value if isinstance(value, dict) else None
-            except json.JSONDecodeError:
-                pass
-    return None
+_parse_json_object = parse_json_verdict
 
 
 def _tool_state(part: dict) -> tuple[str, dict, str]:
@@ -1022,7 +1008,8 @@ class OpenCodeRuntime(Runtime):
                 [str(self._cli_path())], workspace,
                 workspace_writable=not read_only),
             workspace=workspace,
-            out_dir=out_dir, artifact_id="judge", prompt=instruction,
+            out_dir=out_dir, artifact_id="judge",
+            prompt=with_verdict_schema(instruction, schema),
             interaction=None, read_only=read_only,
             base_environment=environment)
         messages, _ = self.parse_stream(result.raw_path, str(workspace))
