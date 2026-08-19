@@ -62,6 +62,55 @@ class CorpusDelivery(unittest.TestCase):
                            release="0.6.7")
             self.assertEqual("corrected", protected.read_text())
 
+    def test_a_seed_whose_files_moved_does_not_arrive_twice(self):
+        """A release may move a seed's payload; the old paths must not linger.
+
+        Copying over what is already there left both layouts in place, so the
+        seed materialized with two copies of itself and its verifier read the
+        stale one.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            active = root / "active"
+            install_corpus(_bundle(root, "old"), active, release="0.6.6")
+
+            moved = _bundle(root / "next", "corrected")
+            seed = moved / "tasks" / "seeds" / "go-csvlimits"
+            (seed / "verify.py").unlink()
+            (seed / "files").mkdir()
+            (seed / "files" / "verify.py").write_text("corrected")
+            install_corpus(moved, active, release="0.6.7")
+
+            installed = active / "tasks" / "seeds" / "go-csvlimits"
+            self.assertEqual("corrected", (installed / "files"
+                                           / "verify.py").read_text())
+            self.assertFalse((installed / "verify.py").exists(),
+                             "the layout the release replaced must be gone")
+
+    def test_the_bytecode_installing_the_package_made_is_not_delivered(self):
+        """`pip install` byte-compiles the corpus riding along as package data.
+
+        None of it is seed content: delivered, it is materialized into every
+        workspace and fingerprinted as part of the seed it sits in.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            bundle = _bundle(root, "shipped")
+            cache = bundle / "tasks" / "seeds" / "go-csvlimits" / "__pycache__"
+            cache.mkdir()
+            (cache / "verify.cpython-313.pyc").write_bytes(b"\x00compiled")
+
+            active = root / "active"
+            install_corpus(bundle, active, release="0.6.6")
+            installed = active / "tasks" / "seeds" / "go-csvlimits"
+            self.assertTrue((installed / "verify.py").is_file())
+            self.assertFalse((installed / "__pycache__").exists())
+
+            install_corpus(_bundle(root / "next", "shipped"), active,
+                           release="0.6.7")
+            self.assertFalse((installed / "__pycache__").exists(),
+                             "nor may an update bring it in")
+
     def test_the_same_release_leaves_the_corpus_alone(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)

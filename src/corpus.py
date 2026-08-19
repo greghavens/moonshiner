@@ -116,6 +116,15 @@ def write_catalog(seed_dir: Path = SEEDS_DIR, directory: Path | None = None) -> 
     return markdown_path, json_path
 
 
+# Installing the package byte-compiles every `.py` it carries, and the corpus
+# rides along as package data -- so the same seed fingerprints one way read from
+# a checkout and another read from a wheel. A `.pyc` is never seed content; it
+# is not part of what a release promises and must not describe one.
+def _is_seed_content(path: Path, directory: Path) -> bool:
+    relative = path.relative_to(directory).parts
+    return "__pycache__" not in relative and path.suffix not in (".pyc", ".pyo")
+
+
 def manifest(seed_dir: Path = SEEDS_DIR, *, version: str | None = None) -> dict:
     version_path = ROOT / "corpus-version.json"
     header = json.loads(version_path.read_text()) if version_path.exists() else {
@@ -138,7 +147,7 @@ def manifest(seed_dir: Path = SEEDS_DIR, *, version: str | None = None) -> dict:
         for path in sorted(directory.rglob("*")):
             if path.is_symlink():
                 raise ValueError(f"corpus symlink prohibited: {path}")
-            if path.is_file():
+            if path.is_file() and _is_seed_content(path, directory):
                 files[path.relative_to(directory).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
         digest = hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
         entries.append({"id": directory.name, "lang": spec.get("lang"),
@@ -248,6 +257,12 @@ def _install(version: str, source: str | None, checksum: str | None) -> None:
         shutil.copytree(destination, active)
 
 
+# A release must describe the tree it is packaging. Corpus resolution answers a
+# different question -- which seeds should this project run -- and in a release
+# job it picks the installed package's copy, not the checkout being released.
+_SEEDS_HELP = "Seed directory to read, instead of the corpus this project runs"
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="moonshiner seeds")
     sub = parser.add_subparsers(dest="action", required=True)
@@ -255,7 +270,9 @@ def main(argv=None) -> int:
     cat = sub.add_parser("catalog"); cat.add_argument("--output", type=Path); cat.add_argument("--json", action="store_true")
     cat.add_argument("--category", action="append"); cat.add_argument("--tag", action="append")
     cat.add_argument("--name", help="Match seed ID, prompt summary, or tag")
+    cat.add_argument("--seeds", type=Path, help=_SEEDS_HELP)
     man = sub.add_parser("manifest"); man.add_argument("--output", type=Path); man.add_argument("--version")
+    man.add_argument("--seeds", type=Path, help=_SEEDS_HELP)
     for action in ("install", "update"):
         command = sub.add_parser(action)
         command.add_argument("version", nargs="?" if action == "update" else None)
@@ -264,12 +281,13 @@ def main(argv=None) -> int:
     if args.action == "status":
         data = manifest(); print(f"{data['name']} {data['version']} ({data['seed_count']} seeds) at {SEEDS_DIR}"); return 0
     if args.action == "manifest":
-        data = manifest(version=args.version); output = json.dumps(data, indent=2) + "\n"
+        data = manifest(args.seeds or SEEDS_DIR, version=args.version)
+        output = json.dumps(data, indent=2) + "\n"
         if args.output: args.output.parent.mkdir(parents=True, exist_ok=True); args.output.write_text(output)
         else: print(output, end="")
         return 0
     if args.action == "catalog":
-        markdown, data = catalog()
+        markdown, data = catalog(args.seeds or SEEDS_DIR)
         categories = set(args.category or []); tags = set(args.tag or [])
         needle=(args.name or "").casefold(); filtered={}
         for category,items in data["categories"].items():

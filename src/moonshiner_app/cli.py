@@ -45,6 +45,42 @@ def _stamp(path: Path, release: str) -> None:
         pass
 
 
+# Installing the package byte-compiles the corpus it carries. That bytecode is
+# not seed content and must not be copied into a project's corpus, where it
+# would be materialized into workspaces and fingerprinted as part of a seed.
+_NOT_SEED_CONTENT = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
+
+
+def _force_writable(function, path, _exception) -> None:
+    """Let removal past a seed's read-only fixture, then try once more."""
+    try:
+        os.chmod(path, os.stat(path).st_mode | stat.S_IWUSR)
+    except OSError:
+        return
+    function(path)
+
+
+def _merge_seeds(source: Path, destination: Path) -> None:
+    """Bring every released seed up to date without disturbing local ones.
+
+    Each released seed is replaced whole rather than copied over in place. A
+    release may move a seed's files -- the VCF seeds whose payload moved under
+    `files/` did -- and copying onto what is already there leaves the old paths
+    beside the new ones, so the seed materializes with two copies of itself and
+    a verifier reads the stale one. Seeds the release does not contain are
+    authored here and not released yet; they are left exactly as they are.
+    """
+    destination.mkdir(parents=True, exist_ok=True)
+    for seed in sorted(source.iterdir()):
+        if not seed.is_dir():
+            continue
+        target = destination / seed.name
+        if target.exists():
+            shutil.rmtree(target, onexc=_force_writable)
+        shutil.copytree(seed, target, copy_function=_replace_file,
+                        ignore=_NOT_SEED_CONTENT)
+
+
 def install_corpus(bundle: Path, active: Path, release: str = __version__) -> None:
     """Put this release's seed corpus in place for the project to use.
 
@@ -58,7 +94,8 @@ def install_corpus(bundle: Path, active: Path, release: str = __version__) -> No
         active.parent.mkdir(parents=True, exist_ok=True)
         staging = active.with_name(f".active-staging-{uuid.uuid4().hex}")
         (staging / "tasks").mkdir(parents=True)
-        shutil.copytree(bundle / "tasks" / "seeds", staging / "tasks" / "seeds")
+        shutil.copytree(bundle / "tasks" / "seeds", staging / "tasks" / "seeds",
+                        ignore=_NOT_SEED_CONTENT)
         if (bundle / "tasks" / "behavior-worlds.json").is_file():
             shutil.copy2(bundle / "tasks" / "behavior-worlds.json",
                          staging / "tasks" / "behavior-worlds.json")
@@ -69,10 +106,11 @@ def install_corpus(bundle: Path, active: Path, release: str = __version__) -> No
     elif _read_stamp(stamp) == release:
         return
     else:
-        shutil.copytree(bundle / "tasks" / "seeds", active / "tasks" / "seeds",
-                        dirs_exist_ok=True, copy_function=_replace_file)
+        _merge_seeds(bundle / "tasks" / "seeds", active / "tasks" / "seeds")
         for name in ("corpus-version.json", "SEED_CATALOG.md", "SEED_CATALOG.json"):
             if (bundle / name).is_file(): shutil.copy2(bundle / name, active / name)
+        worlds = bundle / "tasks" / "behavior-worlds.json"
+        if worlds.is_file(): shutil.copy2(worlds, active / "tasks" / worlds.name)
     _stamp(stamp, release)
 
 
