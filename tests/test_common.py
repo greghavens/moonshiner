@@ -228,20 +228,29 @@ class PowerShellSandboxMounts(unittest.TestCase):
                             return_value=completed) as run:
                 common._sandboxed_command(["pwsh", "-Version"], workspace, 10)
         command = run.call_args.args[0]
-        self.assertIn(["--ro-bind", str(runtime),
-                       toolchains.POWERSHELL_RUNTIME_MOUNT],
-                      [command[index:index + 3]
-                       for index in range(len(command) - 2)])
-        self.assertIn(["--ro-bind", str(modules),
-                       toolchains.POWERSHELL_MODULES_MOUNT],
-                      [command[index:index + 3]
-                       for index in range(len(command) - 2)])
+        runtime_mount = toolchains.powershell_runtime_mount()
+        modules_mount = toolchains.powershell_modules_mount()
+        triples = [command[index:index + 3]
+                   for index in range(len(command) - 2)]
+        self.assertIn(["--ro-bind", str(runtime), runtime_mount], triples)
+        self.assertIn(["--ro-bind", str(modules), modules_mount], triples)
         path_index = command.index("PATH")
-        self.assertTrue(command[path_index + 1].startswith(
-            toolchains.POWERSHELL_RUNTIME_MOUNT + ":"))
+        self.assertTrue(command[path_index + 1].startswith(runtime_mount + ":"))
         module_index = command.index("PSModulePath")
         self.assertTrue(command[module_index + 1].startswith(
-            toolchains.POWERSHELL_MODULES_MOUNT + ":"))
+            modules_mount + ":"))
+
+    def test_what_the_harness_provides_is_mounted_outside_the_workspace(self):
+        """A seed's verifier walks its project directory and judges what is there.
+
+        The VMware SDK used to be mounted inside that directory, so every seed
+        forbidding a vendored SDK found the harness's own copy, failed, and
+        spent its whole attempt budget on a patch that could not have passed.
+        """
+        import toolchains
+        for mount in (toolchains.powershell_runtime_mount(),
+                      toolchains.powershell_modules_mount()):
+            self.assertFalse(pathlib.Path(mount).is_relative_to("/srv"), mount)
 
 
 class VerifyCommandExecution(unittest.TestCase):

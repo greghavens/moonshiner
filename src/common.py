@@ -542,9 +542,9 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int):
     """Run seed-controlled commands offline with no home or inherited secrets."""
     if shutil.which("bwrap") is None:
         raise RuntimeError("bubblewrap is required to execute seed commands safely")
-    from toolchains import (POWERSHELL_MODULES_MOUNT, POWERSHELL_RUNTIME_MOUNT,
-                            effective_path, powershell_module_root,
-                            powershell_runtime)
+    from toolchains import (effective_path, powershell_module_root,
+                            powershell_modules_mount, powershell_runtime,
+                            powershell_runtime_mount, sandbox_toolchain_root)
     workspace = workspace.resolve()
     sandbox_workspace = Path("/srv")
     sandbox_home = sandbox_workspace / ".sandbox-home"
@@ -552,7 +552,14 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int):
     temporary = scratch / "tmp"
     shared_memory = scratch / "shm"
     hidden_home = scratch / "hidden-home"
-    toolchain_mounts = scratch / "toolchains"
+    # Mount points for what the harness provides, placed under the hidden home
+    # rather than in the workspace: a verifier walks its project directory to
+    # judge what the agent left there, and must not find the SDK this harness
+    # supplies and read it as the agent having vendored one. The sandbox sees
+    # `hidden_home` at the real home path, so a directory made here is the one
+    # the toolchain mount paths name.
+    toolchain_mounts = hidden_home / sandbox_toolchain_root().relative_to(
+        Path.home())
     for directory in (temporary, shared_memory, hidden_home,
                       toolchain_mounts / "powershell",
                       toolchain_mounts / "powershell-modules"):
@@ -577,11 +584,11 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int):
             "--bind", str(temporary), "/var/tmp"]
     pwsh = powershell_runtime()
     if pwsh is not None:
-        cmd += ["--ro-bind", str(pwsh.parent), POWERSHELL_RUNTIME_MOUNT]
-        sandbox_path = POWERSHELL_RUNTIME_MOUNT + ":" + sandbox_path
+        cmd += ["--ro-bind", str(pwsh.parent), powershell_runtime_mount()]
+        sandbox_path = powershell_runtime_mount() + ":" + sandbox_path
     module_root = powershell_module_root()
     if module_root.is_dir():
-        cmd += ["--ro-bind", str(module_root), POWERSHELL_MODULES_MOUNT]
+        cmd += ["--ro-bind", str(module_root), powershell_modules_mount()]
     cmd += ["--dev-bind", "/dev", "/dev",
             "--bind", str(shared_memory), "/dev/shm",
             "--proc", "/proc",
@@ -592,9 +599,9 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int):
             "--setenv", "TEMP", str(sandbox_home / "tmp"),
             "--chdir", str(sandbox_workspace)]
     if module_root.is_dir():
-        builtin_modules = POWERSHELL_RUNTIME_MOUNT + "/Modules"
+        builtin_modules = powershell_runtime_mount() + "/Modules"
         cmd += ["--setenv", "PSModulePath",
-                POWERSHELL_MODULES_MOUNT + os.pathsep + builtin_modules]
+                powershell_modules_mount() + os.pathsep + builtin_modules]
     if cargo_bin.is_dir() and rustup_home.is_dir():
         cmd += [
                 "--setenv", "PATH", "/mnt:" + sandbox_path,

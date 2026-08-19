@@ -20,8 +20,6 @@ FORMULAS = {
     "javac": "openjdk",
     "pwsh": "powershell",
 }
-POWERSHELL_RUNTIME_MOUNT = "/srv/.sandbox-home/toolchains/powershell"
-POWERSHELL_MODULES_MOUNT = "/srv/.sandbox-home/toolchains/powershell-modules"
 MISSING_EXECUTABLES = (
     re.compile(r"(?:bwrap:\s*)?execvp\s+([^:\s]+):\s+No such file or directory",
                re.IGNORECASE),
@@ -65,6 +63,31 @@ def powershell_module_root() -> Path:
     """Project-managed modules exposed read-only to verifier sandboxes."""
     from configuration import PROJECT_STATE
     return PROJECT_STATE / "toolchains" / "powershell" / "Modules"
+
+
+def sandbox_toolchain_root() -> Path:
+    """Where a verifier sandbox sees the toolchains this harness provides.
+
+    Deliberately outside the workspace. The workspace is the task's own project
+    directory, and a seed's verifier walks it to judge what the agent left
+    behind. With the VMware SDK mounted inside it, every seed that forbids
+    vendoring that SDK found the harness's own copy and failed on it -- no
+    patch could have passed, and each seed spent its full attempt budget
+    proving it. The hidden home is bound read-only for exactly this kind of
+    thing, the sandbox's HOME points elsewhere, and nothing in the task's tree
+    can reach it.
+    """
+    return Path.home() / ".moonshiner-toolchains"
+
+
+def powershell_runtime_mount() -> str:
+    """Sandbox path of the complete PowerShell runtime directory."""
+    return str(sandbox_toolchain_root() / "powershell")
+
+
+def powershell_modules_mount() -> str:
+    """Sandbox path of the project-managed PowerShell modules."""
+    return str(sandbox_toolchain_root() / "powershell-modules")
 
 
 def declared_commands(seed: dict) -> list[str]:
