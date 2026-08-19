@@ -21,7 +21,7 @@ from pathlib import Path
 
 from common import (CONFIG, DATA, SECRET_RE, TRACES, load_seeds,
                     scrub_text, jsonl_lines)
-from canonical_dataset import INTERNAL_CONTENT_MARKERS
+from canonical_dataset import INTERNAL_CONTENT_MARKERS, canonical_category
 from normalize import parse_trace
 from screen_traces import UNJUDGED_SCREENING, validate_reviewer_verdict
 from privacy import sanitize_object
@@ -38,6 +38,14 @@ SCREENING = "deterministic-plus-independent-review-v1"
 # claims. It is dropped rather than left standing, so a published unjudged row
 # never advertises a review that did not happen.
 UNJUDGED_VERIFIER = "acceptance-tests+protected-file-hash"
+
+# Language names a seed may use as one of its own training tags. Only names
+# that identify a language on sight — a tag is the seed author writing the
+# fact down, not this module guessing at it.
+LANGUAGE_TAGS = frozenset((
+    "asm", "bash", "c", "cpp", "csharp", "go", "java", "javascript", "js",
+    "kotlin", "lua", "perl", "php", "powershell", "py", "python", "ruby",
+    "rust", "scala", "sql", "swift", "ts", "typescript", "zsh"))
 
 
 def _provider(runtime_name: str) -> str:
@@ -176,6 +184,35 @@ def recorded_reasoning_effort(info: dict) -> str | None:
     return teacher.get("reasoning_stage") or teacher.get("reasoning")
 
 
+def seed_language(seed: dict) -> str | None:
+    """Return the language this seed declares, or None if it declares none.
+
+    One fact under three spellings: ``lang`` is Moonshiner's key, ``language``
+    is the one the source manifests use (``import_seeds`` maps that to this),
+    and a language name among the seed's own training tags is its author
+    writing the same fact a third way. A behavior seed that names none is
+    English by convention — the corpus index has read them that way since
+    these tasks arrived.
+
+    Nothing here reads the seed's files. An instruction-following task ships a
+    verifier written in Python and is not a Python task; guessing from file
+    extensions would publish that mislabelled, which is worse than publishing
+    nothing.
+    """
+    for key in ("lang", "language"):
+        declared = str(seed.get(key) or "").strip()
+        if declared:
+            return declared
+    if seed.get("kind") == "tool_behavior":
+        return "English"
+    tags = seed.get("training_tags") or seed.get("tags") or []
+    if isinstance(tags, (list, tuple)):
+        for tag in tags:
+            if str(tag).casefold() in LANGUAGE_TAGS:
+                return str(tag).casefold()
+    return None
+
+
 def build_row(seed: dict, info: dict,
               traces_root: Path | None = None) -> tuple[dict | None, str | None]:
     traces_root = traces_root or TRACES
@@ -206,12 +243,23 @@ def build_row(seed: dict, info: dict,
     teacher = info.get("teacher") or {}
     observed = teacher.get("observed_models") or (
         [teacher["observed_model"]] if teacher.get("observed_model") else [])
+    # The export contract rejects a row whose lang or category is empty, and it
+    # rejects it by raising — one such row stopped `publish` outright, systemd
+    # restarted the queue into the same batch, and nothing at all reached the
+    # dataset. What the contract will refuse, the build refuses first: this
+    # trace is dropped with a reason and every other trace still ships.
+    language = seed_language(seed)
+    if not language:
+        return None, "seed declares no lang, which the published contract requires"
+    category = canonical_category(seed["id"], seed.get("category"))
+    if not str(category or "").strip():
+        return None, "seed declares no category, which the published contract requires"
     review = _review(seed["id"], traces_root) or {}
     bypassed = bool((review.get("judge") or {}).get("bypassed"))
     meta = {
         "task": seed["id"],
-        "lang": seed.get("lang"),
-        "category": seed.get("category"),
+        "lang": language,
+        "category": category,
         "domain": seed.get("domain") or "agent",
         "passed": info.get("passed"),
         "tools_used": used,

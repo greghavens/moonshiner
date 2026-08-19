@@ -69,6 +69,65 @@ class Redaction(unittest.TestCase):
         self.assertEqual(bd.scrub_session(session)[0]["content"], "done\n")
 
 
+class DeclaredLanguage(unittest.TestCase):
+    def test_the_source_manifest_spelling_counts_as_declared(self):
+        # `language` is the key the source manifests use and `lang` is the one
+        # Moonshiner reads; import_seeds maps one to the other, so a seed that
+        # arrived with the source spelling has declared its language already.
+        self.assertEqual(bd.seed_language({"language": "powershell"}),
+                         "powershell")
+        self.assertEqual(bd.seed_language({"lang": "go", "language": "java"}),
+                         "go")
+
+    def test_a_behavior_seed_without_one_is_english(self):
+        self.assertEqual(bd.seed_language({"kind": "tool_behavior"}), "English")
+
+    def test_a_language_among_the_seeds_own_tags_counts(self):
+        self.assertEqual(
+            bd.seed_language({"training_tags": ["vcf-9-0", "java", "spec"]}),
+            "java")
+        self.assertIsNone(
+            bd.seed_language({"training_tags": ["multi-turn", "planning"]}))
+
+    def test_files_are_never_read_for_a_language(self):
+        # An instruction-following task ships a Python verifier and is not a
+        # Python task. Guessing from what is on disk would publish it
+        # mislabelled, which is worse than publishing nothing.
+        self.assertIsNone(bd.seed_language(
+            {"verify_cmd": "python3 -B .protected/verify.py",
+             "test_files": [".protected/verify.py"]}))
+
+    def _build(self, seed):
+        """Run build_row over a trace that is fine, so only the seed is judged."""
+        turns = [{"role": "user", "content": "do it"},
+                 {"role": "assistant", "content": "done"}]
+        with tempfile.TemporaryDirectory() as directory:
+            raw = pathlib.Path(directory) / "raw.jsonl"
+            raw.write_text("{}\n")
+            with mock.patch.object(bd, "raw_trace_path", return_value=raw), \
+                 mock.patch.object(bd, "parse_trace", return_value=(turns, {})), \
+                 mock.patch.object(bd, "_review", return_value={}):
+                return bd.build_row(seed, {"trace_format": "codex-jsonl-v1"})
+
+    def test_a_row_the_contract_would_refuse_is_never_built(self):
+        # The export contract rejects an empty lang or category by raising, and
+        # one such row stopped `publish` outright — systemd restarted the queue
+        # into the same batch and nothing at all reached the dataset. The build
+        # refuses first, with a reason, so every other trace still ships.
+        row, reason = self._build({"id": "undeclared", "category": "Building"})
+        self.assertIsNone(row)
+        self.assertIn("lang", reason)
+        row, reason = self._build({"id": "undeclared", "lang": "go"})
+        self.assertIsNone(row)
+        self.assertIn("category", reason)
+
+    def test_a_declared_language_reaches_the_row(self):
+        row, reason = self._build({"id": "declared", "language": "powershell",
+                                   "category": "project-integration"})
+        self.assertIsNone(reason)
+        self.assertEqual(row["meta"]["lang"], "powershell")
+
+
 class BuildLoopResilience(unittest.TestCase):
     def test_one_unbuildable_trace_does_not_stop_the_build(self):
         # Every other unusable row is a reason string the build walks past. A
