@@ -158,7 +158,7 @@ class CondaSurvivesTheHiddenHome(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.root = pathlib.Path(self.tmp.name)
+        self.root = pathlib.Path(self.tmp.name).resolve()
         self.home = self.root / "home"
         self.conda = self.home / "miniconda3"
         (self.conda / "conda-meta").mkdir(parents=True)
@@ -168,6 +168,11 @@ class CondaSurvivesTheHiddenHome(unittest.TestCase):
         (terms / "accepted.json").write_text('{"tos_accepted": true}')
         self.workspaces = self.root / "workspaces"
         self.workspaces.mkdir()
+        # The host reaches its home through one: `/home` is a symlink to
+        # `/var/home` on an ostree system, so PATH and the resolved
+        # installation disagree on spelling for the same directory.
+        self.linked_home = self.root / "linked-home"
+        self.linked_home.symlink_to(self.home)
         patches = [
             mock.patch.object(common.Path, "home", classmethod(
                 lambda cls, home=self.home: home)),
@@ -214,6 +219,21 @@ class CondaSurvivesTheHiddenHome(unittest.TestCase):
         writable, _, cached = value.partition(",")
         self.assertTrue(writable.startswith("/tmp/.sandbox-home"), value)
         self.assertEqual(cached, str(self.conda / "pkgs"))
+
+    def test_conda_never_gets_to_decide_what_python3_means(self):
+        # Named through the symlink, the way the host's own PATH names it.
+        # Compared as text this does not look like the installation at all,
+        # so the reordering matched nothing and Anaconda's python -- which
+        # has no `os.pidfd_open` -- went on answering `python3` and broke a
+        # seed that has nothing to do with conda.
+        advertised = f"{self.linked_home}/miniconda3/bin"
+        with mock.patch("toolchains.effective_path",
+                        return_value=f"{advertised}:/usr/bin:/bin"):
+            command = self.sandbox_command()
+        entries = command[command.index("PATH") + 1].split(":")
+        self.assertLess(entries.index("/usr/bin"),
+                        entries.index(advertised), entries)
+        self.assertIn(advertised, entries)
 
     def test_a_host_without_conda_is_left_exactly_as_it_was(self):
         command = self.sandbox_command(installed=False)

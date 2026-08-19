@@ -744,6 +744,23 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int, *,
                         temporary / sandbox_home.name / ".conda" / "tos",
                         dirs_exist_ok=True)
     sandbox_path = effective_path()
+    if conda is not None:
+        # Behind the system directories, never in front of them. This PATH is
+        # inherited from a shell with conda activated, so conda's `bin` led it
+        # -- and the moment conda was genuinely reachable there, `python3`
+        # started meaning Anaconda's build, which has no `os.pidfd_open` and
+        # broke a seed with nothing to do with conda. `condabin/conda` carries
+        # an absolute shebang, so conda still resolves from the back.
+        # Resolved before comparing, and the original spelling kept in the
+        # result: `is_relative_to` compares text, and PATH says
+        # `/home/venom/miniconda3/bin` where the installation resolves to
+        # `/var/home/...`. Matched lexically, nothing moved and Anaconda's
+        # python went on winning.
+        entries = sandbox_path.split(":")
+        inside = [entry for entry in entries
+                  if Path(entry).resolve().is_relative_to(conda)]
+        sandbox_path = ":".join([entry for entry in entries
+                                 if entry not in inside] + inside)
     cmd = ["bwrap", "--die-with-parent", "--unshare-pid", "--ro-bind", "/", "/"]
     if not network:
         cmd.insert(2, "--unshare-net")
