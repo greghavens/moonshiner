@@ -240,3 +240,29 @@ class PublishingNeverShrinksTheCorpus(unittest.TestCase):
                         source.index("api.create_commit("),
                         "the check must precede the commit that would delete rows")
         self.assertIn("--allow-shrink", source)
+
+
+class RemoteVerification(unittest.TestCase):
+    """The check that confirms a commit landed must be able to read the repo."""
+
+    def _verify(self):
+        import publish_queue
+        captured = {}
+
+        def urlopen(request, *_args, **_kwargs):
+            captured["request"] = request
+            return _Response(json.dumps([{"title": "Add trajectory demo"}]))
+
+        with patch.dict("os.environ", {"HF_TOKEN": "hf-test-token"}), \
+             patch("urllib.request.urlopen", urlopen):
+            publish_queue.verify_remote("owner/private-dataset",
+                                        "Add trajectory demo")
+        return captured["request"]
+
+    def test_the_commit_check_carries_the_upload_credentials(self):
+        # A private dataset answers an unauthenticated read with 401, so this
+        # check failed on every batch of a private run — after the upload had
+        # already succeeded, which made a finished publish look like a failure
+        # and restarted the queue into a full rebuild.
+        self.assertEqual(self._verify().get_header("Authorization"),
+                         "Bearer hf-test-token")

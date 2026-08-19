@@ -24,7 +24,7 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _headers() -> dict:
+def request_headers() -> dict:
     headers = {"User-Agent": "moonshiner/0.2"}
     token = os.environ.get("HF_TOKEN", "").strip()
     if not token:
@@ -46,7 +46,7 @@ def _headers() -> dict:
 def _dataset_info(dataset: str) -> dict | None:
     url = "https://huggingface.co/api/datasets/" + urllib.parse.quote(dataset, safe="/")
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers=_headers()),
+        with urllib.request.urlopen(urllib.request.Request(url, headers=request_headers()),
                                     timeout=60) as response:
             return json.load(response)
     except urllib.error.HTTPError as error:
@@ -66,7 +66,7 @@ def _download(dataset: str, revision: str, filename: str, destination: Path) -> 
     destination.parent.mkdir(parents=True, exist_ok=True)
     source = hf_hub_download(
         repo_id=dataset, filename=filename, repo_type="dataset",
-        revision=revision, token=_headers().get("Authorization", "").removeprefix("Bearer "),
+        revision=revision, token=request_headers().get("Authorization", "").removeprefix("Bearer "),
         force_download=True)
     shutil.copy2(source, destination)
 

@@ -163,8 +163,14 @@ def run(*args: str) -> None:
 
 
 def verify_remote(dataset: str, title: str) -> None:
+    # The same credentials the upload used. A private dataset answers an
+    # unauthenticated read with 401, so the check that confirms the commit
+    # landed failed on every batch of a private run — after the upload had
+    # already succeeded.
+    from hf_sync import request_headers
     url = f"https://huggingface.co/api/datasets/{dataset}/commits/main"
-    with urllib.request.urlopen(url) as response:
+    request = urllib.request.Request(url, headers=request_headers())
+    with urllib.request.urlopen(request) as response:
         commits = json.load(response)
     if not any(commit.get("title") == title for commit in commits[:20]):
         raise RuntimeError(f"remote commit verification failed: {title}")

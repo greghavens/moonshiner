@@ -49,7 +49,7 @@ class LocalFirstBootstrap(unittest.TestCase):
         with mock.patch.dict(hf_sync.os.environ, {}, clear=True), \
              mock.patch("huggingface_hub.get_token", return_value="cli-token"):
             self.assertEqual(
-                hf_sync._headers()["Authorization"], "Bearer cli-token")
+                hf_sync.request_headers()["Authorization"], "Bearer cli-token")
 
     def test_download_uses_official_hugging_face_file_transport(self):
         with tempfile.TemporaryDirectory() as name:
