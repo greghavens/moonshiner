@@ -404,15 +404,41 @@ def remove_workspace(path: Path, *, workspaces: Path | None = None) -> None:
         raise ValueError(f"refusing to remove a symlinked workspace: {target}")
     if not resolved.exists():
         return
-    # Verifier toolchains write read-only trees (Go's module cache); clear the
-    # bit and retry rather than abandoning the removal half-done.
+    # Verifier toolchains write read-only trees (Go's module cache) and a
+    # sandboxed agent can leave behind a directory it made unreadable to
+    # itself -- OpenCode leaves `tmp/opencode/hide` at mode 111. `rmtree`
+    # cannot open such a directory to walk it, and the handler below is then
+    # called with `os.open`, which takes flags it was not given: the removal
+    # died on a TypeError that hid the permission error underneath. So clear
+    # the bits on the way down, before anything tries to read them. Symlinks
+    # are stepped over rather than followed -- a chmod through one would land
+    # outside the workspace.
+    stack = [resolved]
+    while stack:
+        entry = stack.pop()
+        if entry.is_symlink() or not entry.is_dir():
+            continue
+        try:
+            entry.chmod(0o700)
+        except OSError:
+            pass
+        try:
+            stack.extend(entry.iterdir())
+        except OSError:
+            continue
+
     def force_writable(function, failed, _excinfo):
         for item in (Path(failed).parent, Path(failed)):
             try:
                 item.chmod(0o700)
             except OSError:
                 pass
-        function(failed)
+        try:
+            function(failed)
+        except TypeError:
+            # `os.open` cannot be retried with a path alone. Say nothing and
+            # let the real failure surface, rather than replacing it.
+            pass
 
     shutil.rmtree(resolved, onexc=force_writable)
 

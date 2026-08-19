@@ -29,6 +29,8 @@ Add `--detach` for a long run that must survive the current agent or terminal se
 
 The command generates, deterministically verifies, judges, and retraces substantive rejections. It re-judges malformed verdicts without buying a replacement trace. Candidate rejection is ordinary run state; infrastructure failure is not.
 
+A seed blocked on infrastructure stops being selected and keeps its workspace, so it waits for the cause to be repaired instead of burning its attempts. `moonshiner trace repair-infrastructure` sorts the blocked seeds by cause — a missing tool, exhausted provider credit, an unreadable workspace, a runtime that will not start — proves each cause repaired before it touches anything, and requeues only what it proved. Run it without `--yes` first: it names every class and what it found. Content-filtered seeds are never requeued; a refusal is a property of the prompt, so a rerun only buys another one at full price.
+
 Inspect with `moonshiner status` and `moonshiner inspect <run-id>`. Prefer `--json` when another program or agent consumes the result.
 
 ## Local model traces with distribution capture

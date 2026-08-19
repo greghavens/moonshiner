@@ -92,6 +92,43 @@ class RemovalGuard(unittest.TestCase):
                 common.remove_workspace(ws)
             self.assertFalse(ws.exists())
 
+    def test_a_directory_the_agent_made_unreadable_is_still_removed(self):
+        """OpenCode leaves `tmp/opencode/hide` at mode 111.
+
+        ``rmtree`` cannot open such a directory to walk it, and the error
+        handler is then called with ``os.open`` -- which needs flags it was
+        never given, so the removal died on a ``TypeError`` that hid the
+        permission error underneath. Two seeds sat blocked behind that.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp); ws = root / "seed-hidden"
+            hidden = ws / "tmp" / "opencode" / "hide"
+            hidden.mkdir(parents=True)
+            (hidden / "secret").write_text("x")
+            hidden.chmod(0o111)
+            (ws / ".sandbox-home" / "psstore").mkdir(parents=True)
+            (ws / ".sandbox-home" / "psstore").chmod(0o111)
+            with self._workspaces(root):
+                common.remove_workspace(ws)
+            self.assertFalse(ws.exists())
+
+    def test_removal_never_chmods_through_an_escaping_symlink(self):
+        """Clearing permission bits must not reach outside the workspace."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "workspaces"; root.mkdir()
+            outside = pathlib.Path(tmp) / "precious"; outside.mkdir()
+            (outside / "keep").write_text("keep")
+            (outside / "keep").chmod(0o400)
+            ws = root / "seed-link"; ws.mkdir()
+            (ws / "escape").symlink_to(outside, target_is_directory=True)
+            before = outside.stat().st_mode & 0o777
+            with self._workspaces(root):
+                common.remove_workspace(ws)
+            self.assertFalse(ws.exists())
+            self.assertTrue((outside / "keep").exists())
+            self.assertEqual((outside / "keep").stat().st_mode & 0o777, 0o400)
+            self.assertEqual(outside.stat().st_mode & 0o777, before)
+
 
 class PreflightNeverDeletesOutsideWorkspaces(unittest.TestCase):
     def test_a_materialize_double_returning_the_repo_root_deletes_nothing(self):
