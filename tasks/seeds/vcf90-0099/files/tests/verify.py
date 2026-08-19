@@ -67,7 +67,11 @@ def run_case(classes, temporary_path, contract, case):
     )
     try:
         startup = server.stdout.readline()
-        require(startup != "", "mock server did not report a port: " + server.stderr.read())
+        if startup == "":
+            # Read stderr only when there is a failure to explain: the mock
+            # server outlives this call, so an eager read never returns.
+            require(False, "mock server did not report a port: "
+                    + server.stderr.read())
         port = json.loads(startup)["port"]
         base_uri = f"http://127.0.0.1:{port}"
         if case["trailing_slash"]:
