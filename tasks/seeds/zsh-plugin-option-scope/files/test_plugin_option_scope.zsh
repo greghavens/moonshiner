@@ -41,7 +41,11 @@ check '(( ${fpath[(I)${script_dir}/functions]} > 0 ))' \
   "loader keeps the autoload directory on fpath"
 
 workspace_roots "$script_dir/fixture_root"
-eq "${(j:,:)${reply:t}}" "alpha,beta" \
+# `(@)`, because zsh flattens a nested expansion to a scalar before the
+# modifier runs: `${reply:t}` inside the join sees one joined string and
+# returns one basename, so this read "beta" while the scan itself had
+# always returned both roots.
+eq "${(j:,:)${(@)reply:t}}" "alpha,beta" \
   "autoloaded scan uses exclusion and directory qualifiers"
 typeset options_after_direct="${options[extendedglob]}:${options[nullglob]}:${options[nomatch]}"
 eq "$options_after_direct" "$options_before" \

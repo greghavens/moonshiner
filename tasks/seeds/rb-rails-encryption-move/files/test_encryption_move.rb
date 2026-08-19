@@ -71,8 +71,12 @@ class EncryptionMoveTest < Minitest::Test
     repo, source = repository("nonce-must-remain")
     invalid = Customer.new(id: "C-BAD", name: "", contact_code: "not a customer code")
     error = assert_raises(CustomerRepository::ValidationError) { repo.save(invalid) }
-    assert_includes error.message, ":name=>[\"can't be blank\"]"
-    assert_includes error.message, ":contact_code=>[\"has invalid format\"]"
+    # Either rendering: Ruby 3.4 inspects a symbol-keyed hash as `name:`
+    # where earlier versions wrote `:name=>`. What the message has to
+    # carry is the field and its reason, not the interpreter's syntax.
+    assert_match(/(?::name=>|name: )\["can't be blank"\]/, error.message)
+    assert_match(/(?::contact_code=>|contact_code: )\["has invalid format"\]/,
+                 error.message)
     assert_equal 0, repo.write_count
     assert_equal 0, source.calls
 

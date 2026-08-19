@@ -6,9 +6,13 @@ accept_dir="$root_dir/_accept"
 rm -rf "$accept_dir"
 mkdir -p "$accept_dir"
 
+# `lib`, not whatever GNUInstallDirs picks: this host installs to
+# `lib64` and every path checked below names `lib`. Pinning the layout
+# the harness is about to inspect is what makes the check portable.
 cmake -S "$root_dir" -B "$accept_dir/static-build" \
   -DBUILD_SHARED_LIBS=OFF \
   -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_LIBDIR=lib \
   -DCMAKE_INSTALL_PREFIX="$accept_dir/static-install"
 cmake --build "$accept_dir/static-build"
 cmake --install "$accept_dir/static-build"
@@ -28,6 +32,7 @@ test "$static_output" = "7=120;9=-4;12=88"
 cmake -S "$root_dir" -B "$accept_dir/shared-build" \
   -DBUILD_SHARED_LIBS=ON \
   -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_LIBDIR=lib \
   -DCMAKE_INSTALL_PREFIX="$accept_dir/shared-install"
 cmake --build "$accept_dir/shared-build"
 cmake --install "$accept_dir/shared-build"
