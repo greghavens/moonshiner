@@ -590,21 +590,57 @@ DEPENDENCY_WARMUPS = (
     ("dotnet", ("*.sln", "*.slnx", "*.csproj", "*.fsproj", "*.vbproj"),
      ["dotnet", "restore"]),
     ("go", ("go.mod",), ["go", "mod", "download"]),
+    # Maven's own `dependency:go-offline` is not enough: surefire picks its
+    # provider jar when it runs, and that download is the one the offline
+    # verify then fails on. Running the phase the seed will run is what
+    # actually fetches what the seed will need.
+    ("mvn", ("pom.xml",), ["mvn", "-B", "-q", "test"]),
 )
 
 
+def _declared_dependencies(workspace: Path) -> tuple[list, str]:
+    """The warmable projects on disk, and a digest of what they declare."""
+    found, digest = [], hashlib.sha256()
+    for tool, patterns, command in DEPENDENCY_WARMUPS:
+        manifests = sorted(path for pattern in patterns
+                           for path in workspace.rglob(pattern) if path.is_file())
+        if not manifests or shutil.which(tool) is None:
+            continue
+        found.append((tool, command))
+        for path in manifests:
+            digest.update(path.relative_to(workspace).as_posix().encode())
+            digest.update(path.read_bytes())
+    return found, digest.hexdigest()
+
+
 def warm_dependency_cache(workspace: Path) -> str:
-    """Populate the verify sandbox's package cache while the network is up."""
+    """Populate the verify sandbox's package cache while the network is up.
+
+    Re-warmed whenever what the project declares changes, not once per
+    workspace: a seed's `reference_fix.patch` may be the thing that introduces
+    the build file at all -- `java-bakeplan` has no `pom.xml` until it is
+    applied -- so a single warm at baseline would leave the run that matters
+    with a cold cache and no network to fill it.
+    """
     marker = verify_scratch(workspace) / "dependencies-warmed"
-    if marker.exists():
+    warmups, declared = _declared_dependencies(workspace)
+    try:
+        head, *notes = marker.read_text().splitlines()
+    except (OSError, ValueError):
+        head, notes = "", []
+    state, _, counted = head.partition(" ")
+    attempts = int(counted) if counted.isdigit() else 0
+    # A warm-up against a deliberately broken baseline stops where the build
+    # does, so what a build needs only once it compiles stays unfetched. Try
+    # again the next time round -- by then the reference fix is in -- but only
+    # once, so a project that simply cannot build does not re-fetch forever.
+    if state == declared and (attempts >= 2
+                              or all(note.endswith(": ok") for note in notes)):
         return "(already warmed)"
+    attempts = attempts + 1 if state == declared else 1
     marker.parent.mkdir(parents=True, exist_ok=True)
     notes = []
-    for tool, patterns, command in DEPENDENCY_WARMUPS:
-        if shutil.which(tool) is None:
-            continue
-        if not any(next(workspace.rglob(pattern), None) for pattern in patterns):
-            continue
+    for tool, command in warmups:
         try:
             proc = _sandboxed_command(command, workspace, 600, network=True)
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
@@ -613,7 +649,7 @@ def warm_dependency_cache(workspace: Path) -> str:
         # A baseline is broken on purpose and its restore may legitimately
         # fail. Record it and let the verify command report what that means.
         notes.append(f"{tool}: {'ok' if proc.returncode == 0 else 'failed'}")
-    marker.write_text("\n".join(notes) + "\n")
+    marker.write_text("\n".join([f"{declared} {attempts}", *notes]) + "\n")
     return ", ".join(notes) or "(nothing to warm)"
 
 
@@ -655,7 +691,13 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int, *,
                             powershell_modules_mount, powershell_runtime,
                             powershell_runtime_mount, sandbox_toolchain_root)
     workspace = workspace.resolve()
-    sandbox_workspace = Path("/srv")
+    # Resolved, because on an ostree host `/srv` is a symlink to `var/srv` and
+    # bubblewrap binds through it: the workspace lands at the real directory
+    # while the name handed back to the seed stays a symlink. `find "$(dirname
+    # -- "$0")"` -- how a shell verifier names its own directory -- then walks
+    # the symlink itself and stops, so `javac` was handed an empty source list
+    # and every seed built that way failed with "error: no source files".
+    sandbox_workspace = Path("/srv").resolve()
     # Everything writable this sandbox needs sits outside the workspace, because
     # the workspace is exactly what a verifier judges. It used to sit inside, as
     # `.sandbox-home`, and the many seeds whose acceptance check is "the working
@@ -696,8 +738,14 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int, *,
         # home tmpfs preserves access to the host sources without exposing home.
         cmd += ["--ro-bind", str(cargo_bin), "/mnt",
                 "--ro-bind", str(rustup_home), "/media"]
+    # The hidden home is writable. A JVM does not read `$HOME`: it resolves
+    # `user.home` from the passwd database, so Maven and Gradle look for their
+    # caches at the real home path whatever the environment says, and a
+    # read-only mount there failed every Maven seed with
+    # `LocalRepositoryNotAccessibleException`. Nothing of the real home is
+    # here -- it is a fresh directory beside the workspace, removed with it.
     cmd += ["--bind", str(workspace), str(sandbox_workspace),
-            "--ro-bind", str(hidden_home), str(Path.home()),
+            "--bind", str(hidden_home), str(Path.home()),
             "--bind", str(temporary), "/tmp",
             "--bind", str(temporary), "/var/tmp"]
     pwsh = powershell_runtime()
