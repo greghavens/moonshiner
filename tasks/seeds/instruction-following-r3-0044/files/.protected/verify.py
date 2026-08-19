@@ -136,7 +136,9 @@ def main() -> None:
         path.relative_to(ROOT).as_posix()
         for path in ROOT.rglob("*")
         if (path.is_file() or path.is_symlink())
-        and path.relative_to(ROOT).parts[0] != ".sandbox-home"
+        # `.git` is the project's own version control, present in any
+        # checkout; it is not an artifact the assistant created.
+        and path.relative_to(ROOT).parts[0] not in {".sandbox-home", ".git"}
     }
     unexpected_files = sorted(actual_files - allowed_files)
     if unexpected_files:

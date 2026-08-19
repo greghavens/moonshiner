@@ -58,7 +58,7 @@ def government_flood_url(url: str) -> bool:
 
 def main() -> int:
     errors: list[str] = []
-    extra_entries = sorted(path.name for path in ROOT.iterdir() if path.name not in {".protected", "housing_shortlist.md"})
+    extra_entries = sorted(path.name for path in ROOT.iterdir() if path.name not in {".protected", ".git", "housing_shortlist.md"})
     if extra_entries:
         errors.append(f"no files other than housing_shortlist.md may be created; found: {', '.join(extra_entries)}")
     if not DELIVERABLE.is_file():

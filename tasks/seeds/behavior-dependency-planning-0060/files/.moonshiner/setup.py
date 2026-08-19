@@ -19,6 +19,22 @@ RUNTIME_PATH = ROOT / ".fleet-audit"
 DELIVERABLE_PATH = ROOT / "audit.md"
 
 
+def _usable(path: Path) -> bool:
+    """Whether the registry already on disk can be read and is intact."""
+    if not path.is_file():
+        return False
+    try:
+        connection = sqlite3.connect(path)
+    except sqlite3.Error:
+        return False
+    try:
+        return connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+    except sqlite3.Error:
+        return False
+    finally:
+        connection.close()
+
+
 def main() -> int:
     temporary = ROOT / f".fleet-setup-{os.getpid()}.db"
     temporary.unlink(missing_ok=True)
@@ -31,7 +47,15 @@ def main() -> int:
         connection.commit()
     finally:
         connection.close()
-    os.replace(temporary, DATABASE_PATH)
+    # Only when there is nothing usable there already. SQLite does not write
+    # the same bytes twice for the same statements, so replacing a database
+    # that was already correct left the workspace differing from the one the
+    # seed ships -- and the workspace is what the agent is handed, because
+    # this setup runs for reference validation and never for a trace.
+    if _usable(DATABASE_PATH):
+        temporary.unlink(missing_ok=True)
+    else:
+        os.replace(temporary, DATABASE_PATH)
     shutil.rmtree(RUNTIME_PATH, ignore_errors=True)
     DELIVERABLE_PATH.unlink(missing_ok=True)
     CLIENT_PATH.chmod(0o755)

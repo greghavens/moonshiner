@@ -237,7 +237,11 @@ def main() -> None:
     unexpected_files = sorted(
         str(path.relative_to(ROOT))
         for path in ROOT.rglob("*")
-        if (path.is_file() or path.is_symlink()) and str(path.relative_to(ROOT)) not in allowed_files
+        if (path.is_file() or path.is_symlink())
+        and str(path.relative_to(ROOT)) not in allowed_files
+        # `.git` is the project's own version control, present in any
+        # checkout; it is not an artifact the assistant created.
+        and path.relative_to(ROOT).parts[0] != ".git"
     )
     require(
         not unexpected_files,

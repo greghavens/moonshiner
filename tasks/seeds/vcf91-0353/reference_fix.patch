@@ -1,0 +1,538 @@
+diff --git a/src/VcfAutomationCredentialRotator.java b/src/VcfAutomationCredentialRotator.java
+index b47a878..88f8d3b 100644
+--- a/src/VcfAutomationCredentialRotator.java
++++ b/src/VcfAutomationCredentialRotator.java
+@@ -1,16 +1,32 @@
+ import java.io.IOException;
+ import java.net.URI;
++import java.net.http.HttpClient;
++import java.net.http.HttpRequest;
++import java.net.http.HttpResponse;
++import java.nio.charset.StandardCharsets;
+ import java.time.Duration;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
+ import java.util.List;
++import java.util.Map;
++import java.util.Set;
+ 
+ /**
+  * Rotates the password of a named VCF Automation vSphere cloud account after draining requests
+  * that were already in progress.
+  */
+ public final class VcfAutomationCredentialRotator {
++    private static final String ACCEPT = "application/json";
++
++    private final URI origin;
++    private final String bearerToken;
++    private final String apiVersion;
++    private final Duration pollInterval;
++    private final HttpClient http;
+ 
+     /**
+-     * Creates a client. Construction must not perform network traffic.
++     * Creates a client. Construction does not perform network traffic.
+      *
+      * @param origin VCF Automation HTTP(S) origin, with no path other than an optional slash
+      * @param bearerToken bearer token used for all four contract operations
+@@ -19,7 +35,29 @@ public final class VcfAutomationCredentialRotator {
+      */
+     public VcfAutomationCredentialRotator(URI origin, String bearerToken, String apiVersion,
+                                            Duration pollInterval) {
+-        throw new UnsupportedOperationException("not implemented");
++        if (origin == null || !origin.isAbsolute()
++                || !("http".equalsIgnoreCase(origin.getScheme())
++                || "https".equalsIgnoreCase(origin.getScheme()))
++                || origin.getHost() == null || origin.getUserInfo() != null
++                || origin.getQuery() != null || origin.getFragment() != null
++                || !(origin.getPath().isEmpty() || "/".equals(origin.getPath()))) {
++            throw new IllegalArgumentException("origin must be an HTTP(S) origin");
++        }
++        this.bearerToken = headerValue(bearerToken, "bearerToken");
++        if (apiVersion == null || !apiVersion.matches("\\d{4}-\\d{2}-\\d{2}")) {
++            throw new IllegalArgumentException("apiVersion must use yyyy-MM-dd");
++        }
++        if (pollInterval == null || pollInterval.isNegative()) {
++            throw new IllegalArgumentException("pollInterval must be non-negative");
++        }
++        String text = origin.toString();
++        this.origin = URI.create(text.endsWith("/") ? text.substring(0, text.length() - 1) : text);
++        this.apiVersion = apiVersion;
++        this.pollInterval = pollInterval;
++        this.http = HttpClient.newBuilder()
++                .version(HttpClient.Version.HTTP_1_1)
++                .followRedirects(HttpClient.Redirect.NEVER)
++                .build();
+     }
+ 
+     /**
+@@ -28,12 +66,255 @@ public final class VcfAutomationCredentialRotator {
+      */
+     public RotationResult rotate(String accountName, String newPassword)
+             throws IOException, InterruptedException, RotationFailedException {
+-        throw new UnsupportedOperationException("not implemented");
++        String wantedName = nonblank(accountName, "accountName");
++        String replacement = nonblank(newPassword, "newPassword");
++
++        List<Tracker> initial = trackerPage(get("listRequestTrackers", "/iaas/api/request-tracker"),
++                "listRequestTrackers");
++        Set<String> trackerIds = new LinkedHashSet<>();
++        ArrayList<String> drained = new ArrayList<>();
++        for (Tracker tracker : initial) {
++            if (!trackerIds.add(tracker.id)) {
++                throw protocol("listRequestTrackers", "duplicate tracker id");
++            }
++            if (tracker.status == Status.INPROGRESS) drained.add(tracker.id);
++        }
++        for (String id : drained) {
++            Tracker terminal = poll(id);
++            if (terminal.status == Status.FAILED) throw new RotationFailedException(id);
++        }
++
++        Account account = selectAccount(wantedName,
++                get("listVSphereCloudAccounts", "/iaas/api/cloud-accounts-vsphere"));
++        byte[] updateBody = Json.stringify(updateBody(account, replacement))
++                .getBytes(StandardCharsets.UTF_8);
++        Tracker accepted = tracker(patch(account.id, updateBody), "updateVSphereCloudAccountAsync");
++        Tracker terminal = poll(accepted.id);
++        if (terminal.status == Status.FAILED) throw new RotationFailedException(terminal.id);
++
++        return new RotationResult(account.id, List.copyOf(drained), terminal.id, terminal.status.name());
++    }
++
++    private Tracker poll(String id) throws IOException, InterruptedException {
++        Tracker current;
++        do {
++            current = tracker(get("getRequestTracker",
++                    "/iaas/api/request-tracker/" + pathSegment(id)), "getRequestTracker");
++            if (!id.equals(current.id)) throw protocol("getRequestTracker", "tracker identity mismatch");
++            if (current.status == Status.INPROGRESS) pause();
++        } while (current.status == Status.INPROGRESS);
++        return current;
++    }
++
++    private void pause() throws InterruptedException {
++        if (pollInterval.isZero()) return;
++        try {
++            long millis = pollInterval.toMillis();
++            int nanos = pollInterval.minusMillis(millis).getNano();
++            Thread.sleep(millis, nanos);
++        } catch (InterruptedException interrupted) {
++            Thread.currentThread().interrupt();
++            throw interrupted;
++        }
++    }
++
++    private Account selectAccount(String wantedName, Object response) throws IOException {
++        Map<String, Object> page = object(response, "listVSphereCloudAccounts");
++        List<Object> content = optionalArray(page, "content", "listVSphereCloudAccounts");
++        Set<String> ids = new LinkedHashSet<>();
++        Set<String> names = new LinkedHashSet<>();
++        Account selected = null;
++        for (Object value : content) {
++            Map<String, Object> item = object(value, "listVSphereCloudAccounts");
++            String id = requiredString(item, "id", "listVSphereCloudAccounts");
++            String name = requiredString(item, "name", "listVSphereCloudAccounts");
++            if (!ids.add(id)) throw protocol("listVSphereCloudAccounts", "duplicate account id");
++            if (!names.add(name)) throw protocol("listVSphereCloudAccounts", "duplicate account name");
++            if (!name.equals(wantedName)) continue;
++
++            String hostName = requiredString(item, "hostName", "listVSphereCloudAccounts");
++            String description = optionalString(item, "description", "listVSphereCloudAccounts");
++            String dcid = optionalString(item, "dcid", "listVSphereCloudAccounts");
++            String username = optionalString(item, "username", "listVSphereCloudAccounts");
++            if (!item.containsKey("enabledRegions")) {
++                throw protocol("listVSphereCloudAccounts", "enabledRegions is missing");
++            }
++            List<Object> readRegions = array(item.get("enabledRegions"), "listVSphereCloudAccounts");
++            ArrayList<Map<String, Object>> regions = new ArrayList<>();
++            for (Object regionValue : readRegions) {
++                Map<String, Object> region = object(regionValue, "listVSphereCloudAccounts");
++                LinkedHashMap<String, Object> projected = new LinkedHashMap<>();
++                projected.put("name", requiredString(region, "name", "listVSphereCloudAccounts"));
++                projected.put("externalRegionId",
++                        requiredString(region, "externalRegionId", "listVSphereCloudAccounts"));
++                regions.add(projected);
++            }
++            selected = new Account(id, name, description, hostName, dcid, username, List.copyOf(regions));
++        }
++        if (selected == null) throw protocol("listVSphereCloudAccounts", "account name not found");
++        return selected;
++    }
++
++    private static Map<String, Object> updateBody(Account account, String newPassword) {
++        LinkedHashMap<String, Object> body = new LinkedHashMap<>();
++        body.put("name", account.name);
++        if (account.description != null) body.put("description", account.description);
++        body.put("hostName", account.hostName);
++        if (account.dcid != null) body.put("dcid", account.dcid);
++        if (account.username != null) body.put("username", account.username);
++        body.put("password", newPassword);
++        body.put("regions", account.regions);
++        return body;
++    }
++
++    private Object get(String operation, String path) throws IOException, InterruptedException {
++        HttpRequest request = baseRequest(path).GET().build();
++        return send(operation, request, 200);
++    }
++
++    private Object patch(String id, byte[] body) throws IOException, InterruptedException {
++        HttpRequest request = baseRequest("/iaas/api/cloud-accounts-vsphere/" + pathSegment(id))
++                .header("Content-Type", "application/json")
++                .method("PATCH", HttpRequest.BodyPublishers.ofByteArray(body))
++                .build();
++        return send("updateVSphereCloudAccountAsync", request, 202);
++    }
++
++    private HttpRequest.Builder baseRequest(String path) {
++        URI target = URI.create(origin + path + "?apiVersion=" + queryComponent(apiVersion));
++        return HttpRequest.newBuilder(target)
++                .header("Accept", ACCEPT)
++                .header("Authorization", "Bearer " + bearerToken);
++    }
++
++    private Object send(String operation, HttpRequest request, int expectedStatus)
++            throws IOException, InterruptedException {
++        HttpResponse<byte[]> response;
++        try {
++            response = http.send(request, HttpResponse.BodyHandlers.ofByteArray());
++        } catch (InterruptedException interrupted) {
++            Thread.currentThread().interrupt();
++            throw interrupted;
++        } catch (IOException failure) {
++            throw new IOException("VCF Automation transport failure for " + operation);
++        }
++        if (response.statusCode() != expectedStatus) {
++            throw new IOException(operation + " returned HTTP " + response.statusCode());
++        }
++        try {
++            return Json.parse(new String(response.body(), StandardCharsets.UTF_8));
++        } catch (RuntimeException malformed) {
++            throw protocol(operation, "malformed JSON success body");
++        }
++    }
++
++    private static List<Tracker> trackerPage(Object response, String operation) throws IOException {
++        Map<String, Object> page = object(response, operation);
++        List<Object> content = optionalArray(page, "content", operation);
++        ArrayList<Tracker> trackers = new ArrayList<>();
++        for (Object value : content) trackers.add(tracker(value, operation));
++        return trackers;
++    }
++
++    private static Tracker tracker(Object value, String operation) throws IOException {
++        Map<String, Object> item = object(value, operation);
++        String id = requiredString(item, "id", operation);
++        requiredString(item, "selfLink", operation);
++        Object progress = item.get("progress");
++        if (!(progress instanceof Number)) throw protocol(operation, "tracker progress is missing");
++        String rawStatus = requiredString(item, "status", operation);
++        Status status;
++        try {
++            status = Status.valueOf(rawStatus);
++        } catch (IllegalArgumentException unknown) {
++            throw protocol(operation, "unknown tracker status");
++        }
++        return new Tracker(id, status);
++    }
++
++    @SuppressWarnings("unchecked")
++    private static Map<String, Object> object(Object value, String operation) throws IOException {
++        if (!(value instanceof Map<?, ?>)) throw protocol(operation, "expected JSON object");
++        return (Map<String, Object>) value;
++    }
++
++    @SuppressWarnings("unchecked")
++    private static List<Object> array(Object value, String operation) throws IOException {
++        if (!(value instanceof List<?>)) throw protocol(operation, "expected JSON array");
++        return (List<Object>) value;
++    }
++
++    private static List<Object> optionalArray(Map<String, Object> object, String key, String operation)
++            throws IOException {
++        return object.containsKey(key) ? array(object.get(key), operation) : List.of();
++    }
++
++    private static String requiredString(Map<String, Object> object, String key, String operation)
++            throws IOException {
++        Object value = object.get(key);
++        if (!(value instanceof String text) || text.isBlank()) {
++            throw protocol(operation, "required string is missing");
++        }
++        return text;
++    }
++
++    private static String optionalString(Map<String, Object> object, String key, String operation)
++            throws IOException {
++        if (!object.containsKey(key)) return null;
++        Object value = object.get(key);
++        if (!(value instanceof String text)) {
++            throw protocol(operation, "optional string is invalid");
++        }
++        return text;
++    }
++
++    private static IOException protocol(String operation, String reason) {
++        return new IOException("Invalid " + operation + " response: " + reason);
++    }
++
++    private static String nonblank(String value, String name) {
++        if (value == null || value.isBlank()) throw new IllegalArgumentException(name + " is blank");
++        return value;
++    }
++
++    private static String headerValue(String value, String name) {
++        String checked = nonblank(value, name);
++        if (checked.indexOf('\r') >= 0 || checked.indexOf('\n') >= 0) {
++            throw new IllegalArgumentException(name + " is not header-safe");
++        }
++        return checked;
++    }
++
++    private static String pathSegment(String value) {
++        return percentEncode(value);
++    }
++
++    private static String queryComponent(String value) {
++        return percentEncode(value);
++    }
++
++    private static String percentEncode(String value) {
++        StringBuilder encoded = new StringBuilder();
++        for (byte octet : value.getBytes(StandardCharsets.UTF_8)) {
++            int b = octet & 0xff;
++            if ((b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
++                    || (b >= '0' && b <= '9') || b == '-' || b == '.' || b == '_' || b == '~') {
++                encoded.append((char) b);
++            } else {
++                encoded.append('%');
++                encoded.append(Character.toUpperCase(Character.forDigit((b >>> 4) & 0xf, 16)));
++                encoded.append(Character.toUpperCase(Character.forDigit(b & 0xf, 16)));
++            }
++        }
++        return encoded.toString();
+     }
+ 
+     /** Successful terminal result. */
+     public record RotationResult(String cloudAccountId, List<String> drainedRequestIds,
+                                  String updateRequestId, String status) {
++        public RotationResult {
++            drainedRequestIds = List.copyOf(drainedRequestIds);
++        }
+     }
+ 
+     /** A drain or update tracker reached FAILED. */
+@@ -49,4 +330,211 @@ public final class VcfAutomationCredentialRotator {
+             return requestId;
+         }
+     }
++
++    private enum Status { FINISHED, INPROGRESS, FAILED }
++
++    private record Tracker(String id, Status status) {
++    }
++
++    private record Account(String id, String name, String description, String hostName, String dcid,
++                           String username, List<Map<String, Object>> regions) {
++    }
++
++    private static final class Json {
++        static Object parse(String text) {
++            Parser parser = new Parser(text);
++            Object value = parser.value();
++            parser.ws();
++            if (parser.pos != text.length()) throw new IllegalArgumentException("trailing JSON");
++            return value;
++        }
++
++        static String stringify(Object value) {
++            StringBuilder output = new StringBuilder();
++            write(value, output);
++            return output.toString();
++        }
++
++        private static void write(Object value, StringBuilder output) {
++            if (value == null) {
++                output.append("null");
++            } else if (value instanceof String text) {
++                quote(text, output);
++            } else if (value instanceof Boolean || value instanceof Number) {
++                output.append(value);
++            } else if (value instanceof Map<?, ?> map) {
++                output.append('{');
++                boolean first = true;
++                for (Map.Entry<?, ?> entry : map.entrySet()) {
++                    if (!first) output.append(',');
++                    first = false;
++                    quote((String) entry.getKey(), output);
++                    output.append(':');
++                    write(entry.getValue(), output);
++                }
++                output.append('}');
++            } else if (value instanceof Iterable<?> iterable) {
++                output.append('[');
++                boolean first = true;
++                for (Object item : iterable) {
++                    if (!first) output.append(',');
++                    first = false;
++                    write(item, output);
++                }
++                output.append(']');
++            } else {
++                throw new IllegalArgumentException("unsupported JSON value");
++            }
++        }
++
++        private static void quote(String text, StringBuilder output) {
++            output.append('"');
++            for (int i = 0; i < text.length(); i++) {
++                char c = text.charAt(i);
++                switch (c) {
++                    case '"' -> output.append("\\\"");
++                    case '\\' -> output.append("\\\\");
++                    case '\b' -> output.append("\\b");
++                    case '\f' -> output.append("\\f");
++                    case '\n' -> output.append("\\n");
++                    case '\r' -> output.append("\\r");
++                    case '\t' -> output.append("\\t");
++                    default -> {
++                        if (c < 0x20) output.append(String.format("\\u%04x", (int) c));
++                        else output.append(c);
++                    }
++                }
++            }
++            output.append('"');
++        }
++
++        private static final class Parser {
++            private final String text;
++            private int pos;
++
++            private Parser(String text) {
++                this.text = text;
++            }
++
++            private Object value() {
++                ws();
++                if (pos >= text.length()) throw fail();
++                return switch (text.charAt(pos)) {
++                    case '{' -> object();
++                    case '[' -> array();
++                    case '"' -> string();
++                    case 't' -> literal("true", Boolean.TRUE);
++                    case 'f' -> literal("false", Boolean.FALSE);
++                    case 'n' -> literal("null", null);
++                    default -> number();
++                };
++            }
++
++            private Map<String, Object> object() {
++                pos++;
++                LinkedHashMap<String, Object> result = new LinkedHashMap<>();
++                ws();
++                if (take('}')) return result;
++                while (true) {
++                    ws();
++                    String key = string();
++                    ws();
++                    require(':');
++                    if (result.containsKey(key)) throw fail();
++                    result.put(key, value());
++                    ws();
++                    if (take('}')) return result;
++                    require(',');
++                }
++            }
++
++            private List<Object> array() {
++                pos++;
++                ArrayList<Object> result = new ArrayList<>();
++                ws();
++                if (take(']')) return result;
++                while (true) {
++                    result.add(value());
++                    ws();
++                    if (take(']')) return result;
++                    require(',');
++                }
++            }
++
++            private String string() {
++                require('"');
++                StringBuilder output = new StringBuilder();
++                while (pos < text.length()) {
++                    char c = text.charAt(pos++);
++                    if (c == '"') return output.toString();
++                    if (c != '\\') {
++                        if (c < 0x20) throw fail();
++                        output.append(c);
++                        continue;
++                    }
++                    if (pos >= text.length()) throw fail();
++                    char escaped = text.charAt(pos++);
++                    switch (escaped) {
++                        case '"', '\\', '/' -> output.append(escaped);
++                        case 'b' -> output.append('\b');
++                        case 'f' -> output.append('\f');
++                        case 'n' -> output.append('\n');
++                        case 'r' -> output.append('\r');
++                        case 't' -> output.append('\t');
++                        case 'u' -> {
++                            if (pos + 4 > text.length()) throw fail();
++                            output.append((char) Integer.parseInt(text.substring(pos, pos + 4), 16));
++                            pos += 4;
++                        }
++                        default -> throw fail();
++                    }
++                }
++                throw fail();
++            }
++
++            private Object number() {
++                int start = pos;
++                if (take('-')) {
++                    // sign consumed
++                }
++                while (pos < text.length() && Character.isDigit(text.charAt(pos))) pos++;
++                if (take('.')) while (pos < text.length() && Character.isDigit(text.charAt(pos))) pos++;
++                if (pos < text.length() && (text.charAt(pos) == 'e' || text.charAt(pos) == 'E')) {
++                    pos++;
++                    if (pos < text.length() && (text.charAt(pos) == '+' || text.charAt(pos) == '-')) pos++;
++                    while (pos < text.length() && Character.isDigit(text.charAt(pos))) pos++;
++                }
++                if (start == pos) throw fail();
++                String raw = text.substring(start, pos);
++                return raw.indexOf('.') >= 0 || raw.indexOf('e') >= 0 || raw.indexOf('E') >= 0
++                        ? Double.valueOf(raw) : Long.valueOf(raw);
++            }
++
++            private Object literal(String expected, Object value) {
++                if (!text.startsWith(expected, pos)) throw fail();
++                pos += expected.length();
++                return value;
++            }
++
++            private void ws() {
++                while (pos < text.length() && " \t\r\n".indexOf(text.charAt(pos)) >= 0) pos++;
++            }
++
++            private boolean take(char c) {
++                if (pos < text.length() && text.charAt(pos) == c) {
++                    pos++;
++                    return true;
++                }
++                return false;
++            }
++
++            private void require(char c) {
++                if (!take(c)) throw fail();
++            }
++
++            private IllegalArgumentException fail() {
++                return new IllegalArgumentException("invalid JSON");
++            }
++        }
++    }
+ }
