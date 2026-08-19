@@ -763,6 +763,18 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int, *,
         shutil.copytree(accepted_terms,
                         temporary / sandbox_home.name / ".conda" / "tos",
                         dirs_exist_ok=True)
+    # PowerCLI asks, on every import into a home that holds no answer, whether
+    # you would like to join its telemetry programme -- and asks in nine lines
+    # that land in whatever the seed's verifier captured. `vcfarch-0073` reads
+    # the JSON its module prints and got the invitation in front of it. This
+    # sandbox has no network at all, so there is no participation to decline
+    # here beyond the question itself; recording the answer is what stops it
+    # being asked.
+    settings = (temporary / sandbox_home.name / ".local" / "share" / "VMware"
+                / "PowerCLI")
+    settings.mkdir(parents=True, exist_ok=True)
+    (settings / "PowerCLI_Settings.xml").write_text(
+        '<Settings><Setting Name="ParticipateInCEIP" Value="False" /></Settings>')
     sandbox_path = effective_path()
     if conda is not None:
         # Behind the system directories, never in front of them. This PATH is

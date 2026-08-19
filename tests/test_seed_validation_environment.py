@@ -242,6 +242,27 @@ class CondaSurvivesTheHiddenHome(unittest.TestCase):
         self.assertNotIn(str(self.conda), command)
 
 
+class TheTelemetryInvitationIsNotSeedOutput(unittest.TestCase):
+    """PowerCLI's CEIP banner landed in the middle of `vcfarch-0073`'s JSON."""
+
+    def test_the_answer_is_already_in_the_home_the_sandbox_gets(self):
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        workspaces = pathlib.Path(root.name).resolve() / "workspaces"
+        workspace = workspaces / "work"
+        workspace.mkdir(parents=True)
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(common, "WORKSPACES", workspaces), \
+                mock.patch("runtimes.base.run_with_inactivity_timeout",
+                           return_value=completed):
+            common._sandboxed_command(["true"], workspace, 10)
+            scratch = common.verify_scratch(workspace)
+        settings = (scratch / "tmp" / ".sandbox-home" / ".local" / "share"
+                    / "VMware" / "PowerCLI" / "PowerCLI_Settings.xml")
+        self.assertIn('Name="ParticipateInCEIP" Value="False"',
+                      settings.read_text())
+
+
 TRAP_HUP = """\
 trap 'exit 42' HUP
 kill -HUP $$
