@@ -133,6 +133,7 @@ def workspace_only_command(
         else:
             destination.touch(exist_ok=True)
         argv += ["--ro-bind", str(source), str(destination)]
+    from common import VERIFY_HOMES
     from configuration import PROJECT_ROOT
     runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
     private_paths = (
@@ -142,6 +143,9 @@ def workspace_only_command(
         Path.home() / ".config" / "moonshiner",
         Path.home() / ".netrc", Path.home() / ".npmrc",
         runtime, PROJECT_ROOT.resolve(),
+        # Peer workspaces are masked wholesale by `_peer_workspace_mask`; the
+        # verify sandbox's state is their sibling and must go the same way.
+        VERIFY_HOMES.resolve(),
     )
     from toolchains import powershell_module_root
     module_root = powershell_module_root().resolve()

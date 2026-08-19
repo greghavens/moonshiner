@@ -199,6 +199,34 @@ class TheSandboxHomeIsNeverSeedContent(unittest.TestCase):
             self.assertTrue((workspace / "keep.ps1").exists(),
                             "seed content must survive the sweep")
 
+    def test_compiled_output_a_verifier_made_is_not_the_agents_litter(self):
+        """`javac` runs as part of a Java seed's verify command.
+
+        The class files it drops beside the sources then failed the seed's own
+        "the tree is clean" check -- sixteen seeds at once -- for build output
+        the harness had just produced itself.
+        """
+        import subprocess
+        from common import clear_runtime_caches
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = pathlib.Path(directory)
+            (workspace / "Main.java").write_text("class Main {}\n")
+            (workspace / "fixture.class").write_bytes(b"\xca\xfe\xba\xbe")
+            for argv in (["git", "init", "-q"],
+                         ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                          "add", "-A"],
+                         ["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                          "commit", "-qm", "baseline"]):
+                subprocess.run(argv, cwd=workspace, check=True)
+            (workspace / "Main.class").write_bytes(b"\xca\xfe\xba\xbe")
+            (workspace / "Main$Inner.class").write_bytes(b"\xca\xfe\xba\xbe")
+            removed = clear_runtime_caches(workspace)
+            self.assertIn("Main.class", removed)
+            self.assertIn("Main$Inner.class", removed)
+            self.assertTrue((workspace / "fixture.class").exists(),
+                            "a compiled file the seed ships is seed content")
+            self.assertTrue((workspace / "Main.java").exists())
+
     def test_every_runtime_home_is_excluded_from_captured_diffs(self):
         """A 254 MB patch of base85 cargo cache OOM-killed a whole queue."""
         from common import DIFF_EXCLUDE_PATTERNS, RUNTIME_CACHE_DIR_NAMES

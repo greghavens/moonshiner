@@ -232,7 +232,7 @@ class KernelEnforcedWriteBoundary(unittest.TestCase):
         self.assertIn("prepare_trace_command(", pi_source)
         self.assertIn("workspace_only_command(", pi_source)
 
-    def test_seed_commands_use_only_workspace_backed_writable_storage(self):
+    def test_seed_commands_use_only_moonshiner_owned_writable_storage(self):
         workspace = common.WORKSPACES / f"confinement-verify-{uuid.uuid4().hex}"
         workspace.mkdir(parents=True)
         self.addCleanup(common.remove_workspace, workspace)
@@ -245,11 +245,47 @@ class KernelEnforcedWriteBoundary(unittest.TestCase):
         result = common._sandboxed_command(
             ["/usr/bin/python3", "-c", script], workspace, 30)
         self.assertEqual(0, result.returncode, result.stderr)
-        home = workspace / ".sandbox-home"
+        scratch = common.verify_scratch(workspace)
+        home = scratch / "tmp" / ".sandbox-home"
         self.assertEqual("home", (home / "home-write").read_text())
-        self.assertEqual("tmp", (home / "tmp" / "tmp-write").read_text())
-        self.assertEqual("var-tmp", (home / "tmp" / "var-tmp-write").read_text())
-        self.assertEqual("shm", (home / "shm" / "shm-write").read_text())
+        self.assertEqual("tmp", (scratch / "tmp" / "tmp-write").read_text())
+        self.assertEqual("var-tmp",
+                         (scratch / "tmp" / "var-tmp-write").read_text())
+        self.assertEqual("shm", (scratch / "shm" / "shm-write").read_text())
+        self.assertTrue(scratch.resolve().is_relative_to(
+            common.VERIFY_HOMES.resolve()))
+
+    def test_a_verify_command_sees_nothing_of_the_harness_in_its_workspace(self):
+        """A seed's verifier judges the working tree; ours must not be in it.
+
+        Many seeds accept only a tree holding their own files and nothing else.
+        The verify sandbox used to make its HOME at `<workspace>/.sandbox-home`,
+        so those seeds read the harness's scratch directory as the agent's
+        litter and failed however good the patch was -- 152 of them at once.
+        """
+        workspace = common.WORKSPACES / f"confinement-clean-{uuid.uuid4().hex}"
+        workspace.mkdir(parents=True)
+        self.addCleanup(common.remove_workspace, workspace)
+        (workspace / "seed-file.txt").write_text("mine\n")
+        script = ("import os,pathlib\n"
+                  "pathlib.Path(os.environ['HOME'],'noise').write_text('x')\n"
+                  "print('\\n'.join(sorted(os.listdir('/srv'))))\n")
+        result = common._sandboxed_command(
+            ["/usr/bin/python3", "-c", script], workspace, 30)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(["seed-file.txt"], result.stdout.split())
+        self.assertEqual(["seed-file.txt"],
+                         sorted(path.name for path in workspace.iterdir()))
+
+    def test_a_removed_workspace_takes_its_verify_state_with_it(self):
+        workspace = common.WORKSPACES / f"confinement-paired-{uuid.uuid4().hex}"
+        workspace.mkdir(parents=True)
+        scratch = common.verify_scratch(workspace)
+        (scratch / "tmp").mkdir(parents=True)
+        (scratch / "tmp" / "cached").write_text("package\n")
+        common.remove_workspace(workspace)
+        self.assertFalse(workspace.exists())
+        self.assertFalse(scratch.exists())
 
     def test_security_runtime_uses_the_same_physical_write_boundary(self):
         workspace = common.WORKSPACES / f"confinement-security-{uuid.uuid4().hex}"

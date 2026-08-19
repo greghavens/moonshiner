@@ -100,6 +100,15 @@ BEHAVIOR_WORLDS = (SEEDS_DIR.parent / "behavior-worlds.json"
                    if (SEEDS_DIR.parent / "behavior-worlds.json").is_file()
                    else ROOT / "tasks" / "behavior-worlds.json")
 WORKSPACES = model_workspace_root()
+# The verify sandbox needs writable state -- a HOME, a temporary directory,
+# shared memory, and the mount points for what the harness provides. None of it
+# may live in the workspace: a seed's verifier walks its project directory to
+# judge what the agent left there, and 152 seeds in this corpus fail outright
+# on finding `.sandbox-home` beside their own files. Kept a sibling of the
+# workspace root so it is still moonshiner-owned state, removed with the
+# workspace it belongs to, and masked out of the model sandbox like any other
+# peer state.
+VERIFY_HOMES = WORKSPACES.parent / "verify-homes"
 TRACES = STORAGE_ROOT / "traces"
 DATA = STORAGE_ROOT / "data"
 RUNS = STORAGE_ROOT / "runs"
@@ -217,7 +226,11 @@ _staged_secret_values.cache_clear = lambda: None
 RUNTIME_CACHE_DIR_NAMES = {"__pycache__", ".pytest_cache", ".mypy_cache",
                           ".ruff_cache", "node_modules", ".sandbox-home",
                           ".toolchain"}
-RUNTIME_CACHE_SUFFIXES = {".pyc", ".pyo"}
+# `.class` is here for the same reason as `.pyc`: `javac` is how a Java seed's
+# verify command runs at all, and the class files it drops beside the sources
+# then read as the agent having left build output behind. Sixteen seeds failed
+# their post-reversal cleanliness check on artifacts the verifier itself made.
+RUNTIME_CACHE_SUFFIXES = {".pyc", ".pyo", ".class"}
 DIFF_EXCLUDE_PATTERNS = (
     "**/.sandbox-home/**", "**/.toolchain/**",
     "**/__pycache__/**", "**/*.pyc", "**/*.pyo", "**/.pytest_cache/**",
@@ -381,6 +394,17 @@ def jsonl_lines(path: Path, *, errors: str | None = None) -> list[str]:
     return [line for line in text.split("\n") if line.strip()]
 
 
+def verify_scratch(workspace: Path, *, workspaces: Path | None = None) -> Path:
+    """The writable state a workspace's verify sandbox runs against.
+
+    Paired with the workspace by name -- ``materialize`` already makes those
+    unique -- so a seed's ``reference_setup`` and its verify command share one
+    HOME and a package one installs is there for the other to use.
+    """
+    root = (workspaces if workspaces is not None else WORKSPACES).resolve()
+    return root.parent / "verify-homes" / Path(workspace).resolve().name
+
+
 def remove_workspace(path: Path, *, workspaces: Path | None = None) -> None:
     """Delete a materialized workspace. Refuse anything that is not one.
 
@@ -441,6 +465,11 @@ def remove_workspace(path: Path, *, workspaces: Path | None = None) -> None:
             pass
 
     shutil.rmtree(resolved, onexc=force_writable)
+    # The verify sandbox's state lives outside the workspace so a verifier
+    # never sees it; it still belongs to the workspace and goes with it.
+    scratch = verify_scratch(resolved, workspaces=workspaces)
+    if scratch.is_dir() and not scratch.is_symlink():
+        shutil.rmtree(scratch, onexc=force_writable)
 
 
 def stage_workspace(source: Path, name: str) -> Path:
@@ -504,12 +533,21 @@ def materialize(seed: dict, name: str | None = None) -> Path:
 
 
 def run_setup(seed: dict, workspace: Path) -> tuple[bool, str]:
-    """Run a seed's declared dependency/setup preparation (if any)."""
+    """Run a seed's declared dependency/setup preparation (if any).
+
+    This is the step that fetches what the task needs -- `go mod download`,
+    `pip install -r requirements.txt` -- so it is the one step that gets the
+    network. It ran offline until now, which made twenty seeds unsolvable by
+    construction: the preparation their own reference solution depends on could
+    not complete, and the failure read as a broken seed. Verification stays
+    offline; it shares this HOME, so what is fetched here is there for it.
+    """
     command = seed.get("reference_setup")
     if not command:
         return True, "(no reference_setup)"
     try:
-        proc = _sandboxed_command(shlex.split(command), workspace, 600)
+        proc = _sandboxed_command(shlex.split(command), workspace, 600,
+                                  network=True)
         return proc.returncode == 0, (proc.stdout + "\n" + proc.stderr).strip()[-2000:]
     except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
         return False, str(exc)
@@ -540,6 +578,45 @@ def verify_argv(verify_cmd: str) -> list[str]:
     return ["/bin/sh", "-c", verify_cmd] if needs_shell else argv
 
 
+# A verify command is model-authored code, so it runs with no network at all.
+# But `dotnet test` and `go test` restore their own dependencies, and the HOME
+# they restore into is created empty for every workspace -- so 49 C# seeds
+# failed on `NU1301: Network is unreachable` whatever the patch said, and their
+# baseline check "failed" for the wrong reason as well. Fetch what the project
+# on disk declares once, with the network up, into the same HOME the offline
+# verify will then use. Nothing here reads seed-authored commands: the trigger
+# is a project file and the command is this harness's own.
+DEPENDENCY_WARMUPS = (
+    ("dotnet", ("*.sln", "*.slnx", "*.csproj", "*.fsproj", "*.vbproj"),
+     ["dotnet", "restore"]),
+    ("go", ("go.mod",), ["go", "mod", "download"]),
+)
+
+
+def warm_dependency_cache(workspace: Path) -> str:
+    """Populate the verify sandbox's package cache while the network is up."""
+    marker = verify_scratch(workspace) / "dependencies-warmed"
+    if marker.exists():
+        return "(already warmed)"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    notes = []
+    for tool, patterns, command in DEPENDENCY_WARMUPS:
+        if shutil.which(tool) is None:
+            continue
+        if not any(next(workspace.rglob(pattern), None) for pattern in patterns):
+            continue
+        try:
+            proc = _sandboxed_command(command, workspace, 600, network=True)
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+            notes.append(f"{tool}: {exc}")
+            continue
+        # A baseline is broken on purpose and its restore may legitimately
+        # fail. Record it and let the verify command report what that means.
+        notes.append(f"{tool}: {'ok' if proc.returncode == 0 else 'failed'}")
+    marker.write_text("\n".join(notes) + "\n")
+    return ", ".join(notes) or "(nothing to warm)"
+
+
 def run_verify(seed: dict, workspace: Path, timeout: int | None = None
                ) -> tuple[bool | None, str]:
     """Run a seed's verification command; return (passed|None, output).
@@ -554,6 +631,7 @@ def run_verify(seed: dict, workspace: Path, timeout: int | None = None
         return verify_environment(seed, workspace, timeout)
     if not seed.get("verify_cmd"):
         return None, "(no verify_cmd)"
+    warm_dependency_cache(workspace)
     try:
         proc = _sandboxed_command(verify_argv(seed["verify_cmd"]), workspace,
                                   timeout)
@@ -564,8 +642,13 @@ def run_verify(seed: dict, workspace: Path, timeout: int | None = None
         return False, f"(verify toolchain missing: {exc})"
 
 
-def _sandboxed_command(command: list[str], workspace: Path, timeout: int):
-    """Run seed-controlled commands offline with no home or inherited secrets."""
+def _sandboxed_command(command: list[str], workspace: Path, timeout: int, *,
+                       network: bool = False):
+    """Run seed-controlled commands offline with no home or inherited secrets.
+
+    ``network`` is for the harness's own preparation steps only -- fetching a
+    task's declared dependencies -- never for a verify command.
+    """
     if shutil.which("bwrap") is None:
         raise RuntimeError("bubblewrap is required to execute seed commands safely")
     from toolchains import (effective_path, powershell_module_root,
@@ -573,11 +656,18 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int):
                             powershell_runtime_mount, sandbox_toolchain_root)
     workspace = workspace.resolve()
     sandbox_workspace = Path("/srv")
-    sandbox_home = sandbox_workspace / ".sandbox-home"
-    scratch = workspace / ".sandbox-home"
+    # Everything writable this sandbox needs sits outside the workspace, because
+    # the workspace is exactly what a verifier judges. It used to sit inside, as
+    # `.sandbox-home`, and the many seeds whose acceptance check is "the working
+    # tree holds nothing but my files" failed on the harness's own scratch
+    # directory -- a verdict no patch could change. HOME is a dotted name below
+    # the sandbox's own temporary directory so it needs no extra mount point and
+    # survives a verify command that sweeps `/tmp/*`.
+    scratch = verify_scratch(workspace)
     temporary = scratch / "tmp"
     shared_memory = scratch / "shm"
     hidden_home = scratch / "hidden-home"
+    sandbox_home = Path("/tmp/.sandbox-home")
     # Mount points for what the harness provides, placed under the hidden home
     # rather than in the workspace: a verifier walks its project directory to
     # judge what the agent left there, and must not find the SDK this harness
@@ -586,13 +676,15 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int):
     # the toolchain mount paths name.
     toolchain_mounts = hidden_home / sandbox_toolchain_root().relative_to(
         Path.home())
-    for directory in (temporary, shared_memory, hidden_home,
+    for directory in (temporary, temporary / sandbox_home.name, shared_memory,
+                      hidden_home,
                       toolchain_mounts / "powershell",
                       toolchain_mounts / "powershell-modules"):
         directory.mkdir(parents=True, exist_ok=True)
     sandbox_path = effective_path()
-    cmd = ["bwrap", "--die-with-parent", "--unshare-net", "--unshare-pid",
-           "--ro-bind", "/", "/"]
+    cmd = ["bwrap", "--die-with-parent", "--unshare-pid", "--ro-bind", "/", "/"]
+    if not network:
+        cmd.insert(2, "--unshare-net")
     # Rustup installs its executable shims and toolchains below the user's
     # home. The home itself stays hidden because it may contain credentials;
     # expose only the executable shims and compiler toolchains at neutral,
@@ -620,9 +712,9 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int):
             "--proc", "/proc",
             "--clearenv", "--setenv", "PATH", sandbox_path,
             "--setenv", "HOME", str(sandbox_home),
-            "--setenv", "TMPDIR", str(sandbox_home / "tmp"),
-            "--setenv", "TMP", str(sandbox_home / "tmp"),
-            "--setenv", "TEMP", str(sandbox_home / "tmp"),
+            "--setenv", "TMPDIR", "/tmp",
+            "--setenv", "TMP", "/tmp",
+            "--setenv", "TEMP", "/tmp",
             "--chdir", str(sandbox_workspace)]
     if module_root.is_dir():
         builtin_modules = powershell_runtime_mount() + "/Modules"
@@ -739,12 +831,14 @@ def clear_runtime_caches(workspace: Path) -> list[str]:
     and known runtime suffixes are removed.
     """
     tracked_directories: set[str] = set()
+    tracked_files: set[str] = set()
     tracked = subprocess.run(["git", "ls-files", "-z"], cwd=workspace,
                              capture_output=True)
     if tracked.returncode == 0:
         for value in tracked.stdout.decode(errors="surrogateescape").split("\0"):
             if not value:
                 continue
+            tracked_files.add(value)
             parent = Path(value).parent
             while parent != Path("."):
                 tracked_directories.add(parent.as_posix())
@@ -770,8 +864,14 @@ def clear_runtime_caches(workspace: Path) -> list[str]:
             path = directory / name
             if path.suffix not in RUNTIME_CACHE_SUFFIXES:
                 continue
+            relative = path.relative_to(workspace).as_posix()
+            # A seed may ship a compiled file as a fixture. Only what the run
+            # itself produced -- what the baseline commit does not have -- is
+            # a cache.
+            if relative in tracked_files:
+                continue
             path.unlink()
-            removed.append(path.relative_to(workspace).as_posix())
+            removed.append(relative)
     return sorted(removed)
 
 

@@ -87,6 +87,12 @@ def _normalise_task(directory: Path) -> None:
     the difference is translated rather than treated as a defect: discarding
     the candidate is never an option, and promoting it unrepaired puts a seed
     in the corpus that the audit reports as partial.
+
+    The two halves are translated independently. An author who writes the
+    prompt under its own name and the verification under the other one used to
+    fall through the ``prompt``-shaped guard untouched, and the seed reached
+    the corpus with no ``verify_cmd`` at all -- which no patch can satisfy,
+    because verification then answers "(no verify_cmd)" before it runs.
     """
     task = directory / "task.json"
     if not task.exists():
@@ -95,11 +101,16 @@ def _normalise_task(directory: Path) -> None:
         data = json.loads(task.read_text())
     except json.JSONDecodeError:
         return
-    if "prompt" in data or "instruction" not in data:
+    renaming = "instruction" in data and "prompt" not in data
+    if not renaming and not data.get("verification"):
         return
     verification = data.pop("verification", None) or {}
-    data["prompt"] = data.pop("instruction")
-    data.setdefault("verify_cmd", verification.get("command", ""))
+    if renaming:
+        data["prompt"] = data.pop("instruction")
+    if verification.get("command"):
+        data.setdefault("verify_cmd", verification["command"])
+    elif renaming:
+        data.setdefault("verify_cmd", "")
     if verification.get("timeout_seconds"):
         data.setdefault("verify_timeout", int(verification["timeout_seconds"]))
     protected = list(verification.get("protected_paths") or [])
