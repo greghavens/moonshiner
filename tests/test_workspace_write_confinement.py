@@ -10,6 +10,7 @@ import sys
 import tempfile
 import uuid
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -17,6 +18,7 @@ sys.path.insert(0, str(ROOT / "src"))
 import common  # noqa: E402
 import configuration  # noqa: E402
 import security_runtime  # noqa: E402
+import toolchains  # noqa: E402
 from runtimes.base import Runtime  # noqa: E402
 from runtimes.claude_code import ClaudeCodeRuntime  # noqa: E402
 from runtimes.codex import CodexRuntime  # noqa: E402
@@ -102,6 +104,77 @@ class PeerWorkspacesAreInvisible(unittest.TestCase):
         outside = pathlib.Path(tempfile.mkdtemp(dir=ROOT))
         self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
         self.assertEqual([], _peer_workspace_mask(outside, outside / "masks"))
+
+
+class ProvisionedModulesSurviveTheProjectMask(unittest.TestCase):
+    """A seed promises modules as already installed; the agent must see them.
+
+    They are provisioned under the project directory, which this sandbox
+    blanks so no agent can read the corpus, the ledger or another job's
+    traces. The agent was therefore handed a ``PSModulePath`` naming a
+    directory its own sandbox had just emptied: it looked for a prerequisite
+    the seed promised, found nothing, and installed from the gallery -- which
+    those same seeds forbid. Every attempt was rejected for an absence that
+    was the harness's to fix.
+    """
+
+    def sandbox(self, workspace: pathlib.Path, script: str):
+        from runtimes.base import workspace_only_command
+        return subprocess.run(
+            workspace_only_command([sys.executable, "-c", script], workspace),
+            cwd=workspace, env=Runtime.teacher_environment(workspace),
+            capture_output=True, text=True)
+
+    def project(self) -> tuple[pathlib.Path, pathlib.Path]:
+        project = pathlib.Path(tempfile.mkdtemp(dir=ROOT))
+        self.addCleanup(shutil.rmtree, project, ignore_errors=True)
+        module_root = (project / ".moonshiner" / "toolchains" / "powershell"
+                       / "Modules")
+        version = module_root / "Promised.Module" / "1.2.3"
+        version.mkdir(parents=True)
+        (version / "Promised.Module.psd1").write_text("provisioned")
+        (project / ".moonshiner" / "traces").mkdir(parents=True)
+        (project / ".moonshiner" / "traces" / "candidate.json").write_text("{}")
+        return project, module_root
+
+    def test_the_modules_stay_readable_and_the_rest_of_the_project_does_not(self):
+        project, module_root = self.project()
+        workspace = common.WORKSPACES / f"confinement-modules-{uuid.uuid4().hex}"
+        workspace.mkdir(parents=True)
+        self.addCleanup(common.remove_workspace, workspace)
+        promised = module_root / "Promised.Module" / "1.2.3" / "Promised.Module.psd1"
+        script = (
+            "import pathlib\n"
+            f"promised = pathlib.Path({str(promised)!r})\n"
+            "assert promised.is_file(), 'a promised module was masked away'\n"
+            "assert promised.read_text() == 'provisioned'\n"
+            f"hidden = pathlib.Path({str(project / '.moonshiner' / 'traces')!r})\n"
+            "assert not hidden.exists(), 'project state leaked into the agent'\n"
+            f"root = pathlib.Path({str(project)!r})\n"
+            "assert [e.name for e in root.iterdir()] == ['.moonshiner'], "
+            "[e.name for e in root.iterdir()]\n")
+        with mock.patch.object(configuration, "PROJECT_ROOT", project), \
+             mock.patch.object(toolchains, "powershell_module_root",
+                               lambda: module_root):
+            result = self.sandbox(workspace, script)
+        self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_a_module_root_no_mask_covers_is_left_unmounted(self):
+        # The restoring bind exists only to undo a mask. Emitting it anyway
+        # would mount a host directory into every sandbox for no reason.
+        from runtimes.base import workspace_only_command
+        project, _ = self.project()
+        elsewhere = pathlib.Path(tempfile.mkdtemp(dir=ROOT)) / "Modules"
+        elsewhere.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, elsewhere.parent, ignore_errors=True)
+        workspace = common.WORKSPACES / f"confinement-unmasked-{uuid.uuid4().hex}"
+        workspace.mkdir(parents=True)
+        self.addCleanup(common.remove_workspace, workspace)
+        with mock.patch.object(configuration, "PROJECT_ROOT", project), \
+             mock.patch.object(toolchains, "powershell_module_root",
+                               lambda: elsewhere):
+            argv = workspace_only_command(["true"], workspace)
+        self.assertNotIn(str(elsewhere), argv)
 
 
 class KernelEnforcedWriteBoundary(unittest.TestCase):

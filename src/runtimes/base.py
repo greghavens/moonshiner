@@ -51,6 +51,25 @@ def _peer_workspace_mask(workspace: Path, masks: Path) -> list[str]:
     return ["--ro-bind", str(skeleton), str(root)]
 
 
+def _provisioned_modules_skeleton(masked: Path, module_root: Path,
+                                 masks: Path) -> Path:
+    """A mask with room left for the modules a seed's prerequisites promise.
+
+    The private-path loop blanks the project directory, and the PowerShell
+    modules Moonshiner provisions live inside it. So the agent was handed a
+    ``PSModulePath`` naming a directory its own sandbox had just emptied: a
+    module the seed promises as already installed looked absent, and the agent
+    did the reasonable thing and installed it from the gallery -- which those
+    same seeds forbid. Same trick as :func:`_peer_workspace_mask`: the mask
+    carries the module path, so the bind that restores it has a mount point to
+    land on rather than needing to create one inside a read-only mount.
+    """
+    skeleton = masks / "private-root" / masked.relative_to(masked.anchor)
+    (skeleton / module_root.relative_to(masked)).mkdir(parents=True,
+                                                       exist_ok=True)
+    return skeleton
+
+
 def workspace_only_command(
         command: list[str], workspace: Path, *,
         read_only_binds: tuple[tuple[Path, Path], ...] = (),
@@ -124,12 +143,22 @@ def workspace_only_command(
         Path.home() / ".netrc", Path.home() / ".npmrc",
         runtime, PROJECT_ROOT.resolve(),
     )
+    from toolchains import powershell_module_root
+    module_root = powershell_module_root().resolve()
+    restore_modules = False
     for target in dict.fromkeys(path for path in private_paths if path.exists()):
         resolved = target.resolve()
         if resolved == workspace or resolved in workspace.parents:
             continue
         source = empty_directory if target.is_dir() else empty_file
+        if (target.is_dir() and module_root.is_dir()
+                and module_root.is_relative_to(resolved)):
+            source = _provisioned_modules_skeleton(resolved, module_root, masks)
+            restore_modules = True
         argv += ["--ro-bind", str(source), str(target)]
+    if restore_modules:
+        # After the masks, so it lands on top of the skeleton they carry.
+        argv += ["--ro-bind", str(module_root), str(module_root)]
     return argv + ["--chdir", str(workspace), "--", *command]
 
 
