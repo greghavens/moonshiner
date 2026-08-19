@@ -14,6 +14,7 @@ from pathlib import Path
 from common import ROOT, SEEDS_DIR, STORAGE_ROOT
 
 CORPORA = STORAGE_ROOT / "corpora"
+_NOT_SEED_CONTENT = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
 RELEASES_API = "https://api.github.com/repos/greghavens/moonshiner/releases"
 
 
@@ -250,7 +251,10 @@ def _install(version: str, source: str | None, checksum: str | None) -> None:
         if destination.exists():
             raise ValueError(f"corpus version already installed: {version}")
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(corpus_root, destination)
+        # An archive cut before bytecode was excluded still carries some, and it
+        # is no more seed content here than anywhere else: delivered, it is
+        # materialized into every workspace the seed opens.
+        shutil.copytree(corpus_root, destination, ignore=_NOT_SEED_CONTENT)
         active = CORPORA / "active"
         if active.exists():
             shutil.rmtree(active)
