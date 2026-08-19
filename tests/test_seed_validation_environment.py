@@ -16,6 +16,52 @@ sys.path.insert(0, str(_ROOT / "src"))
 sys.path.insert(0, str(_ROOT))
 
 import common  # noqa: E402
+import validate_seeds  # noqa: E402
+
+STALE_HEADER_PATCH = """\
+diff --git a/value.txt b/value.txt
+--- a/value.txt
++++ b/value.txt
+@@ -1,4 +1,4 @@
+ first
+-second
++SECOND
+ third
+"""
+
+
+class AHandWrittenPatchIsReadByItsBody(unittest.TestCase):
+    """A hunk header's arithmetic is not part of what a seed promises."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        (self.root / "value.txt").write_text("first\nsecond\nthird\n")
+        subprocess.run(["git", "init", "-q", "."], cwd=self.root, check=True)
+        self.patch = self.root / "fix.patch"
+        self.patch.write_text(STALE_HEADER_PATCH)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def apply(self, *flags):
+        return subprocess.run([*flags, str(self.patch)], cwd=self.root,
+                              capture_output=True, text=True)
+
+    def test_the_counted_header_alone_would_reject_it(self):
+        rejected = self.apply("git", "apply")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("corrupt patch", rejected.stderr)
+
+    def test_validation_applies_it_and_can_take_it_back(self):
+        self.assertEqual(self.apply(*validate_seeds.PATCH_APPLY).returncode, 0)
+        self.assertEqual((self.root / "value.txt").read_text(),
+                         "first\nSECOND\nthird\n")
+        self.assertEqual(
+            self.apply(*validate_seeds.PATCH_APPLY, "-R").returncode, 0)
+        self.assertEqual((self.root / "value.txt").read_text(),
+                         "first\nsecond\nthird\n")
+
 
 class TheWorkspaceIsMountedWhereItSaysItIs(unittest.TestCase):
     """`find "$(dirname -- "$0")"` is how a shell verifier names its own tree.

@@ -5,7 +5,7 @@ Completeness (``audit_seeds``) is not proof of validity: an authoring agent can
 die between finishing a seed and running its own self-check. This proves each
 complete seed is actually solvable, with no model calls, in a fresh workspace —
   1. verify FAILS at baseline (the task really starts broken/unbuilt)
-  2. ``reference_fix.patch`` applies cleanly (git apply)
+  2. ``reference_fix.patch`` applies cleanly (git apply --recount)
   3. protected test files are byte-identical after the patch
   4. ``reference_setup`` succeeds and leaves protected tests unchanged
   5. verify PASSES twice after the patch (the task is genuinely solvable)
@@ -32,6 +32,14 @@ from pathlib import Path
 from common import (TRACES, clear_runtime_caches, load_seeds, materialize,
                     run_setup, run_verify, test_file_hashes)
 from runtimes.base import run_with_inactivity_timeout
+
+# `--recount` because a reference patch is written by hand, and the arithmetic
+# in a hunk header is the part a hand gets wrong: seven seeds shipped bodies
+# that apply perfectly under headers off by a line. What the header claims is
+# not what the seed promises, so it is inferred from the body rather than
+# trusted. A body that really is truncated still applies something wrong, and
+# the verification after it is what says so.
+PATCH_APPLY = ("git", "apply", "--recount")
 
 
 def run_runtime_build(seed: dict, workspace: Path) -> str | None:
@@ -101,7 +109,7 @@ def validate_report(seed: dict) -> dict:
             return fail(f"verify did not fail twice at baseline (got {observed})")
 
         before = test_file_hashes(seed, workspace)
-        applied = subprocess.run(["git", "apply", str(patch)], cwd=workspace,
+        applied = subprocess.run([*PATCH_APPLY, str(patch)], cwd=workspace,
                                  capture_output=True, text=True)
         if applied.returncode != 0:
             return fail(f"patch failed to apply: {applied.stderr.strip()[:200]}")
@@ -128,7 +136,7 @@ def validate_report(seed: dict) -> dict:
             return fail("verification modifies protected test files")
 
         report["runtime_caches_removed"] = clear_runtime_caches(workspace)
-        reverse = subprocess.run(["git", "apply", "-R", str(patch)], cwd=workspace,
+        reverse = subprocess.run([*PATCH_APPLY, "-R", str(patch)], cwd=workspace,
                                  capture_output=True, text=True)
         if reverse.returncode != 0:
             return fail(f"patch failed to reverse: {reverse.stderr.strip()[:200]}")
