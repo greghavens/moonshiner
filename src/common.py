@@ -678,6 +678,26 @@ def run_verify(seed: dict, workspace: Path, timeout: int | None = None
         return False, f"(verify toolchain missing: {exc})"
 
 
+def default_signal_dispositions() -> list[str]:
+    """A prefix that hands the sandbox signals nobody outside it has decided on.
+
+    A signal set to ``SIG_IGN`` survives every ``fork`` and every ``exec``
+    below it, and a shell refuses to install a trap for a signal that was
+    already ignored when it started. Launch the pipeline under ``nohup`` and
+    ``bash-background-cleanup`` -- whose whole subject is HUP, INT and TERM
+    handling -- fails inside the sandbox while passing everywhere else. Whether
+    a verifier passes must not depend on how the operator started moonshiner,
+    so the dispositions are reset on the way in. Absent GNU coreutils there is
+    no prefix and the behaviour is exactly what it was before.
+    """
+    executable = shutil.which("env")
+    if executable is None:
+        return []
+    supported = subprocess.run([executable, "--default-signal", "true"],
+                               capture_output=True)
+    return [executable, "--default-signal"] if supported.returncode == 0 else []
+
+
 def _sandboxed_command(command: list[str], workspace: Path, timeout: int, *,
                        network: bool = False):
     """Run seed-controlled commands offline with no home or inherited secrets.
@@ -824,6 +844,7 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int, *,
         cmd += ["--setenv", "CONDA_PKGS_DIRS",
                 f"{sandbox_home / 'conda-pkgs'},{conda / 'pkgs'}"]
     cmd += ["--", *command]
+    cmd = default_signal_dispositions() + cmd
     from runtimes.base import run_with_inactivity_timeout
     return run_with_inactivity_timeout(
         cmd, cwd=workspace, capture_output=True, text=True,

@@ -5,6 +5,7 @@ patch could ever have rescued it and its whole attempt budget was spent
 proving that.
 """
 import pathlib
+import signal
 import subprocess
 import sys
 import tempfile
@@ -239,6 +240,52 @@ class CondaSurvivesTheHiddenHome(unittest.TestCase):
         command = self.sandbox_command(installed=False)
         self.assertNotIn("CONDA_PKGS_DIRS", command)
         self.assertNotIn(str(self.conda), command)
+
+
+TRAP_HUP = """\
+trap 'exit 42' HUP
+kill -HUP $$
+sleep 1
+exit 7
+"""
+
+
+class NohupMustNotDecideWhetherASeedPasses(unittest.TestCase):
+    """`bash-background-cleanup` reported invalid because of how I ran it.
+
+    `SIG_IGN` is inherited through every fork and every exec below it, and a
+    shell will not install a trap for a signal that arrived already ignored.
+    Started under `nohup`, the pipeline handed the sandbox an ignored SIGHUP,
+    and the one seed whose subject is signal handling could not trap it.
+    """
+
+    def test_an_ignored_signal_does_not_reach_the_sandbox(self):
+        previous = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        self.addCleanup(signal.signal, signal.SIGHUP, previous)
+        inherited = subprocess.run(["bash", "-c", TRAP_HUP])
+        self.assertEqual(inherited.returncode, 7,
+                         "an ignored SIGHUP should not be trappable")
+        reset = subprocess.run(
+            [*common.default_signal_dispositions(), "bash", "-c", TRAP_HUP])
+        self.assertEqual(reset.returncode, 42, "the trap should have run")
+
+    def test_the_reset_happens_before_the_sandbox_is_entered(self):
+        prefix = common.default_signal_dispositions()
+        if not prefix:
+            self.skipTest("GNU coreutils env is not installed")
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        workspaces = pathlib.Path(root.name).resolve() / "workspaces"
+        workspace = workspaces / "work"
+        workspace.mkdir(parents=True)
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(common, "WORKSPACES", workspaces), \
+                mock.patch("runtimes.base.run_with_inactivity_timeout",
+                           return_value=completed) as run:
+            common._sandboxed_command(["true"], workspace, 10)
+        command = run.call_args.args[0]
+        self.assertEqual(command[:len(prefix)], prefix)
+        self.assertEqual(command[len(prefix)], "bwrap")
 
 
 TRAILING_BLANK_PATCH = """\
