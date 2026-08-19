@@ -112,10 +112,12 @@ class ProvisionedModulesSurviveTheProjectMask(unittest.TestCase):
     They are provisioned under the project directory, which this sandbox
     blanks so no agent can read the corpus, the ledger or another job's
     traces. The agent was therefore handed a ``PSModulePath`` naming a
-    directory its own sandbox had just emptied: it looked for a prerequisite
-    the seed promised, found nothing, and installed from the gallery -- which
-    those same seeds forbid. Every attempt was rejected for an absence that
-    was the harness's to fix.
+    directory its own sandbox had just emptied. 111 seeds declare a module
+    this way, and most only ask for a script the verifier runs later, so the
+    absence stayed hidden behind them. It surfaces on the ones whose work
+    needs the module loaded: one asked the operator how to proceed, which a
+    headless trace cannot answer, and one spent itself installing from the
+    gallery -- which those same seeds forbid.
     """
 
     def sandbox(self, workspace: pathlib.Path, script: str):
