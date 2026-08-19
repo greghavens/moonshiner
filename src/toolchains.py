@@ -84,6 +84,46 @@ def sandbox_toolchain_root() -> Path:
     return Path.home() / ".moonshiner-toolchains"
 
 
+def powershell_module_binds(
+        modules: list[tuple[str, str]]) -> list[tuple[Path, str]]:
+    """Which module versions a seed gets to see, given the ones it declared.
+
+    Save-Module keeps every version side by side, and PowerShell resolves a
+    dependency written as a minimum -- which is how the VMware SDK writes its
+    own -- to the newest one present. So the day 13.5 arrived for one seed, a
+    seed pinned to 13.4 still loaded 13.4's module and 13.5's bindings
+    assembly, and the type it needs had been renamed out of it. Its manifest
+    said the right thing and there was nothing a patch could do.
+
+    A seed that declares a version therefore sees only the versions of that
+    build, across every module that has one: these SDKs ship a whole family
+    stamped with a single build number, and pinning one member while its
+    siblings float pins nothing. Anything the seed did not pin, and anything
+    with only one version, is left alone. An empty result means the shared
+    root can be mounted whole, exactly as before.
+    """
+    root = powershell_module_root()
+    stamps = {version.rsplit(".", 1)[-1] for _, version in modules}
+    if not stamps or not root.is_dir():
+        return []
+    mount = powershell_modules_mount()
+    binds: list[tuple[Path, str]] = []
+    restricted = False
+    for module in sorted(root.iterdir()):
+        if not module.is_dir():
+            continue
+        versions = sorted(entry for entry in module.iterdir() if entry.is_dir())
+        wanted = [entry for entry in versions
+                  if entry.name.rsplit(".", 1)[-1] in stamps]
+        if len(versions) < 2 or not wanted or len(wanted) == len(versions):
+            binds.append((module, f"{mount}/{module.name}"))
+            continue
+        restricted = True
+        binds.extend((entry, f"{mount}/{module.name}/{entry.name}")
+                     for entry in wanted)
+    return binds if restricted else []
+
+
 def powershell_runtime_mount() -> str:
     """Sandbox path of the complete PowerShell runtime directory."""
     return str(sandbox_toolchain_root() / "powershell")

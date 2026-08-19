@@ -546,8 +546,10 @@ def run_setup(seed: dict, workspace: Path) -> tuple[bool, str]:
     if not command:
         return True, "(no reference_setup)"
     try:
+        from toolchains import declared_powershell_modules
         proc = _sandboxed_command(shlex.split(command), workspace, 600,
-                                  network=True)
+                                  network=True,
+                                  powershell_modules=declared_powershell_modules(seed))
         return proc.returncode == 0, (proc.stdout + "\n" + proc.stderr).strip()[-2000:]
     except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
         return False, str(exc)
@@ -669,8 +671,10 @@ def run_verify(seed: dict, workspace: Path, timeout: int | None = None
         return None, "(no verify_cmd)"
     warm_dependency_cache(workspace)
     try:
+        from toolchains import declared_powershell_modules
         proc = _sandboxed_command(verify_argv(seed["verify_cmd"]), workspace,
-                                  timeout)
+                                  timeout,
+                                  powershell_modules=declared_powershell_modules(seed))
         return proc.returncode == 0, (proc.stdout + "\n" + proc.stderr).strip()
     except subprocess.TimeoutExpired:
         return False, f"(verify timed out after {timeout}s)"
@@ -699,17 +703,21 @@ def default_signal_dispositions() -> list[str]:
 
 
 def _sandboxed_command(command: list[str], workspace: Path, timeout: int, *,
-                       network: bool = False):
+                       network: bool = False,
+                       powershell_modules: list[tuple[str, str]] | None = None):
     """Run seed-controlled commands offline with no home or inherited secrets.
 
     ``network`` is for the harness's own preparation steps only -- fetching a
     task's declared dependencies -- never for a verify command.
+    ``powershell_modules`` are the seed's own declared module versions, which
+    decide which of the provisioned versions it is shown.
     """
     if shutil.which("bwrap") is None:
         raise RuntimeError("bubblewrap is required to execute seed commands safely")
-    from toolchains import (effective_path, powershell_module_root,
-                            powershell_modules_mount, powershell_runtime,
-                            powershell_runtime_mount, sandbox_toolchain_root)
+    from toolchains import (effective_path, powershell_module_binds,
+                            powershell_module_root, powershell_modules_mount,
+                            powershell_runtime, powershell_runtime_mount,
+                            sandbox_toolchain_root)
     workspace = workspace.resolve()
     # Resolved, because on an ostree host `/srv` is a symlink to `var/srv` and
     # bubblewrap binds through it: the workspace lands at the real directory
@@ -830,7 +838,12 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int, *,
         sandbox_path = powershell_runtime_mount() + ":" + sandbox_path
     module_root = powershell_module_root()
     if module_root.is_dir():
-        cmd += ["--ro-bind", str(module_root), powershell_modules_mount()]
+        pinned = powershell_module_binds(powershell_modules or [])
+        if pinned:
+            for source, destination in pinned:
+                cmd += ["--ro-bind", str(source), destination]
+        else:
+            cmd += ["--ro-bind", str(module_root), powershell_modules_mount()]
     cmd += ["--dev-bind", "/dev", "/dev",
             "--bind", str(shared_memory), "/dev/shm",
             "--proc", "/proc",

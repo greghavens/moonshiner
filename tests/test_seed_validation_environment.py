@@ -17,6 +17,7 @@ sys.path.insert(0, str(_ROOT / "src"))
 sys.path.insert(0, str(_ROOT))
 
 import common  # noqa: E402
+import toolchains  # noqa: E402
 import validate_seeds  # noqa: E402
 
 STALE_HEADER_PATCH = """\
@@ -240,6 +241,68 @@ class CondaSurvivesTheHiddenHome(unittest.TestCase):
         command = self.sandbox_command(installed=False)
         self.assertNotIn("CONDA_PKGS_DIRS", command)
         self.assertNotIn(str(self.conda), command)
+
+
+class ANewerSdkMustNotAnswerForAPinnedOne(unittest.TestCase):
+    """`vcfarch-0042` and `-0045` pinned 13.4 and got 13.5's bindings.
+
+    Save-Module keeps versions side by side and the SDK declares its own
+    dependencies as minimums, so the newest present wins. The type the seeds
+    need was renamed out of 13.5 and no patch could have brought it back.
+    """
+
+    FAMILY = ("13.4.0.24798382", "13.5.0.25380678")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name).resolve() / "Modules"
+        for module in ("VMware.Sdk.Vcf.Installer", "VMware.OpenAPI"):
+            for version in self.FAMILY:
+                (self.root / module / version).mkdir(parents=True)
+        (self.root / "VMware.Vim" / "9.1.0.25380678").mkdir(parents=True)
+        patch = mock.patch.object(toolchains, "powershell_module_root",
+                                  return_value=self.root)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.mount = toolchains.powershell_modules_mount()
+
+    def test_a_seed_that_pins_nothing_still_sees_the_whole_root(self):
+        self.assertEqual(toolchains.powershell_module_binds([]), [])
+
+    def test_pinning_one_member_pins_the_whole_build(self):
+        binds = dict((destination, source) for source, destination
+                     in toolchains.powershell_module_binds(
+                         [("VMware.Sdk.Vcf.Installer", "13.4.0.24798382")]))
+        for module in ("VMware.Sdk.Vcf.Installer", "VMware.OpenAPI"):
+            self.assertIn(f"{self.mount}/{module}/13.4.0.24798382", binds)
+            self.assertNotIn(f"{self.mount}/{module}/13.5.0.25380678", binds)
+        # One version, one build of its own: nothing to choose between.
+        self.assertIn(f"{self.mount}/VMware.Vim", binds)
+
+    def test_an_unknown_build_changes_nothing(self):
+        self.assertEqual(
+            toolchains.powershell_module_binds([("VMware.Vim", "9.1.0.1")]), [])
+
+    def test_the_declared_versions_reach_the_sandbox(self):
+        seed = {"id": "s", "verify_cmd": "pwsh -c exit",
+                "prerequisites": {"powershell_modules": [
+                    {"name": "VMware.Sdk.Vcf.Installer",
+                     "version": "13.4.0.24798382"}]}}
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        workspaces = pathlib.Path(root.name).resolve() / "workspaces"
+        workspace = workspaces / "work"
+        workspace.mkdir(parents=True)
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(common, "WORKSPACES", workspaces), \
+                mock.patch.object(common, "warm_dependency_cache"), \
+                mock.patch("runtimes.base.run_with_inactivity_timeout",
+                           return_value=completed) as run:
+            common.run_verify(seed, workspace)
+        command = run.call_args.args[0]
+        self.assertIn(f"{self.mount}/VMware.OpenAPI/13.4.0.24798382", command)
+        self.assertNotIn(f"{self.mount}/VMware.OpenAPI/13.5.0.25380678", command)
 
 
 class TheTelemetryInvitationIsNotSeedOutput(unittest.TestCase):
