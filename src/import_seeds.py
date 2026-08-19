@@ -18,8 +18,10 @@ protected ``test_files`` entry is present. A seed that is incomplete in BOTH
 sources is reported invalid and never half-copied. Seeds already present here
 are left untouched unless ``--force``.
 
-Copies are atomic (stage into a sibling temp dir, then swap) and skip installed
-``node_modules``/cache trees so a dependency install never bloats the corpus.
+Copies are atomic (stage into a sibling temp dir, then swap) and skip cache
+trees and the ``node_modules`` a package manager installed beside its manifest,
+so a dependency install never bloats the corpus. A ``node_modules`` the seed
+vendored somewhere else is a fixture and is kept.
 
 Model-free and idempotent — safe to re-run.
   python3 src/import_seeds.py            # canonical + fallback per config
@@ -89,13 +91,27 @@ def seed_complete(directory: Path) -> str | None:
     return None
 
 
+def _skip_installed_trees(directory: str, names: list[str]) -> set[str]:
+    """Drop install output, but never a dependency the seed vendored itself.
+
+    ``node_modules`` is skipped only where a package manager puts it -- beside
+    the manifest it installed from. Four TypeScript seeds vendored React under
+    ``files/vendor/node_modules`` and said so in their protected harness; the
+    blanket pattern deleted it on import and left each one describing a
+    directory that was not there, unsolvable and unfixable by any patch.
+    """
+    skipped = {name for name in names
+               if name == "__pycache__" or name.endswith((".pyc", ".pyo"))}
+    if "node_modules" in names and (Path(directory) / "package.json").is_file():
+        skipped.add("node_modules")
+    return skipped
+
+
 def copy_seed(source_dir: Path, dest_dir: Path) -> None:
     """Copy one seed atomically: stage into a sibling temp dir, then swap in."""
     staging = dest_dir.with_name(dest_dir.name + ".importing")
     shutil.rmtree(staging, ignore_errors=True)
-    shutil.copytree(
-        source_dir, staging,
-        ignore=shutil.ignore_patterns("node_modules", "__pycache__", "*.pyc"))
+    shutil.copytree(source_dir, staging, ignore=_skip_installed_trees)
     shutil.rmtree(dest_dir, ignore_errors=True)
     staging.replace(dest_dir)
 

@@ -92,3 +92,45 @@ class Resolve(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VendoredDependenciesSurviveImport(unittest.TestCase):
+    """A seed may vendor a dependency; only install output is skipped."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_vendored_tree_is_part_of_the_seed(self):
+        seed = make_seed(self.root / "src")
+        vendored = seed / "files" / "vendor" / "node_modules" / "react"
+        vendored.mkdir(parents=True)
+        (vendored / "index.js").write_text("module.exports = {}\n")
+        imp.copy_seed(seed, self.root / "out" / "s1")
+        self.assertTrue((self.root / "out" / "s1" / "files" / "vendor"
+                         / "node_modules" / "react" / "index.js").is_file())
+
+    def test_what_a_package_manager_installed_is_not(self):
+        seed = make_seed(self.root / "src")
+        (seed / "files" / "package.json").write_text('{"name": "s1"}\n')
+        installed = seed / "files" / "node_modules" / "left-pad"
+        installed.mkdir(parents=True)
+        (installed / "index.js").write_text("module.exports = {}\n")
+        imp.copy_seed(seed, self.root / "out" / "s1")
+        self.assertFalse((self.root / "out" / "s1" / "files"
+                          / "node_modules").exists())
+
+    def test_bytecode_is_never_imported(self):
+        seed = make_seed(self.root / "src")
+        cache = seed / "files" / "__pycache__"
+        cache.mkdir(parents=True)
+        (cache / "t.cpython-313.pyc").write_bytes(b"\x00")
+        (seed / "files" / "loose.pyc").write_bytes(b"\x00")
+        imp.copy_seed(seed, self.root / "out" / "s1")
+        self.assertFalse((self.root / "out" / "s1" / "files"
+                          / "__pycache__").exists())
+        self.assertFalse((self.root / "out" / "s1" / "files"
+                          / "loose.pyc").exists())
