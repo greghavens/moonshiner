@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shlex
 import shutil
 import subprocess
@@ -40,6 +41,22 @@ from runtimes.base import run_with_inactivity_timeout
 # trusted. A body that really is truncated still applies something wrong, and
 # the verification after it is what says so.
 PATCH_APPLY = ("git", "apply", "--recount")
+
+
+def apply_patch(patch: Path, workspace: Path, *extra: str):
+    """Apply a hand-written reference patch, ignoring what a hand left at the end.
+
+    A patch whose last line is blank asks for a file whose last line is blank.
+    `git diff` never writes that line; an editor adds it without being asked,
+    and `vcf91-0220` failed to apply over exactly one such byte. A trailing
+    empty line is context, so dropping it can only relax what the patch has to
+    match -- it never changes a line the patch writes, and the verification
+    afterwards still says whether the result is right.
+    """
+    body = re.sub(r"\n\n+\Z", "\n",
+                  patch.read_text(errors="surrogateescape"))
+    return subprocess.run([*PATCH_APPLY, *extra, "-"], cwd=workspace,
+                          input=body, capture_output=True, text=True)
 
 
 def run_runtime_build(seed: dict, workspace: Path) -> str | None:
@@ -109,8 +126,7 @@ def validate_report(seed: dict) -> dict:
             return fail(f"verify did not fail twice at baseline (got {observed})")
 
         before = test_file_hashes(seed, workspace)
-        applied = subprocess.run([*PATCH_APPLY, str(patch)], cwd=workspace,
-                                 capture_output=True, text=True)
+        applied = apply_patch(patch, workspace)
         if applied.returncode != 0:
             return fail(f"patch failed to apply: {applied.stderr.strip()[:200]}")
         if test_file_hashes(seed, workspace) != before:
@@ -136,8 +152,7 @@ def validate_report(seed: dict) -> dict:
             return fail("verification modifies protected test files")
 
         report["runtime_caches_removed"] = clear_runtime_caches(workspace)
-        reverse = subprocess.run([*PATCH_APPLY, "-R", str(patch)], cwd=workspace,
-                                 capture_output=True, text=True)
+        reverse = apply_patch(patch, workspace, "-R")
         if reverse.returncode != 0:
             return fail(f"patch failed to reverse: {reverse.stderr.strip()[:200]}")
         if test_file_hashes(seed, workspace) != initial_tests:

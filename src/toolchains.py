@@ -13,6 +13,10 @@ from runtimes.base import run_with_inactivity_timeout
 
 
 FORMULAS = {
+    # `cmake` is here because a seed asked for it: cpp-cmake-policy-upgrade
+    # builds with it and there was no mapping, so provisioning refused the seed
+    # rather than installing the one package it needed.
+    "cmake": "cmake",
     "go": "go",
     "dotnet": "dotnet",
     "ruby": "ruby",

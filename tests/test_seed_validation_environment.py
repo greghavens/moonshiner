@@ -145,3 +145,126 @@ class AWarmUpTriesAgainWhenTheBuildWasBroken(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CondaSurvivesTheHiddenHome(unittest.TestCase):
+    """The sandbox hides the home conda is installed in, PATH notwithstanding.
+
+    `effective_path()` advertises conda's `bin` because it is genuinely on the
+    host, but the mount that hides the user's home hides conda with it. Four
+    seeds whose setup is `conda env create -p ./env` failed with
+    `bwrap: execvp conda: No such file or directory`.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.home = self.root / "home"
+        self.conda = self.home / "miniconda3"
+        (self.conda / "conda-meta").mkdir(parents=True)
+        (self.conda / "pkgs").mkdir()
+        terms = self.home / ".conda" / "tos" / "channel"
+        terms.mkdir(parents=True)
+        (terms / "accepted.json").write_text('{"tos_accepted": true}')
+        self.workspaces = self.root / "workspaces"
+        self.workspaces.mkdir()
+        patches = [
+            mock.patch.object(common.Path, "home", classmethod(
+                lambda cls, home=self.home: home)),
+            mock.patch.object(common, "WORKSPACES", self.workspaces),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def sandbox_command(self, installed=True):
+        workspace = self.workspaces / "work"
+        workspace.mkdir(exist_ok=True)
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(common, "conda_installation",
+                               return_value=self.conda if installed else None):
+            with mock.patch("runtimes.base.run_with_inactivity_timeout",
+                            return_value=completed) as run:
+                common._sandboxed_command(["true"], workspace, 10)
+        return run.call_args.args[0]
+
+    def test_conda_is_bound_back_after_the_mount_that_hides_it(self):
+        command = self.sandbox_command()
+        hides_home = next(index for index in range(len(command) - 2)
+                          if command[index] == "--bind"
+                          and command[index + 2] == str(self.home))
+        exposes_conda = next(index for index in range(len(command) - 2)
+                             if command[index] == "--ro-bind"
+                             and command[index + 1] == str(self.conda)
+                             and command[index + 2] == str(self.conda))
+        self.assertGreater(exposes_conda, hides_home, command)
+
+    def test_the_acceptance_the_user_already_made_is_carried_in(self):
+        self.sandbox_command()
+        scratch = common.verify_scratch(self.workspaces / "work")
+        carried = scratch / "tmp" / ".sandbox-home" / ".conda" / "tos"
+        self.assertTrue((carried / "channel" / "accepted.json").is_file())
+        self.assertFalse((scratch / "tmp" / ".sandbox-home" / ".conda"
+                          / "aau_token").exists())
+
+    def test_extraction_has_somewhere_to_write_and_still_reads_the_cache(self):
+        command = self.sandbox_command()
+        value = command[command.index("CONDA_PKGS_DIRS") + 1]
+        writable, _, cached = value.partition(",")
+        self.assertTrue(writable.startswith("/tmp/.sandbox-home"), value)
+        self.assertEqual(cached, str(self.conda / "pkgs"))
+
+    def test_a_host_without_conda_is_left_exactly_as_it_was(self):
+        command = self.sandbox_command(installed=False)
+        self.assertNotIn("CONDA_PKGS_DIRS", command)
+        self.assertNotIn(str(self.conda), command)
+
+
+TRAILING_BLANK_PATCH = """\
+--- a/value.txt
++++ b/value.txt
+@@ -1,3 +1,3 @@
+ first
+-second
++SECOND
+ third
+
+"""
+
+
+class WhatAnEditorAddsAtTheEndIsNotPartOfThePatch(unittest.TestCase):
+    """One byte of trailing whitespace kept `vcf91-0220` from ever applying."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        (self.root / "value.txt").write_text("first\nsecond\nthird\n")
+        subprocess.run(["git", "init", "-q", "."], cwd=self.root, check=True)
+        self.patch = self.root / "fix.patch"
+        self.patch.write_text(TRAILING_BLANK_PATCH)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_git_alone_reads_the_blank_line_as_a_line_the_file_must_have(self):
+        plain = subprocess.run(["git", "apply", "--recount", str(self.patch)],
+                               cwd=self.root, capture_output=True, text=True)
+        self.assertNotEqual(plain.returncode, 0)
+        self.assertIn("does not apply", plain.stderr)
+
+    def test_validation_applies_it_and_reverses_it(self):
+        applied = validate_seeds.apply_patch(self.patch, self.root)
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertEqual((self.root / "value.txt").read_text(),
+                         "first\nSECOND\nthird\n")
+        reversed_ = validate_seeds.apply_patch(self.patch, self.root, "-R")
+        self.assertEqual(reversed_.returncode, 0, reversed_.stderr)
+        self.assertEqual((self.root / "value.txt").read_text(),
+                         "first\nsecond\nthird\n")
+
+    def test_a_blank_line_the_patch_really_adds_is_still_added(self):
+        self.patch.write_text("--- a/value.txt\n+++ b/value.txt\n"
+                              "@@ -1,3 +1,4 @@\n first\n second\n third\n+\n")
+        applied = validate_seeds.apply_patch(self.patch, self.root)
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertEqual((self.root / "value.txt").read_text(),
+                         "first\nsecond\nthird\n\n")

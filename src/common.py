@@ -718,11 +718,31 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int, *,
     # the toolchain mount paths name.
     toolchain_mounts = hidden_home / sandbox_toolchain_root().relative_to(
         Path.home())
+    # Resolved, because `/home` is itself a symlink to `/var/home` on an ostree
+    # host: `Path.home()` reports the link and a resolved conda path is not
+    # `relative_to` it, which raised before a single sandbox could be built.
+    real_home = Path.home().resolve()
+    conda = conda_installation()
+    hidden_conda = (hidden_home / conda.relative_to(real_home)
+                    if conda is not None and conda.is_relative_to(real_home)
+                    else None)
     for directory in (temporary, temporary / sandbox_home.name, shared_memory,
                       hidden_home,
                       toolchain_mounts / "powershell",
-                      toolchain_mounts / "powershell-modules"):
+                      toolchain_mounts / "powershell-modules",
+                      *([hidden_conda] if hidden_conda is not None else [])):
         directory.mkdir(parents=True, exist_ok=True)
+    accepted_terms = Path.home() / ".conda" / "tos"
+    if conda is not None and accepted_terms.is_dir():
+        # Conda records which channels' terms have been accepted in the user's
+        # home, and this sandbox replaces that home with a throwaway. Without
+        # the record conda refuses every channel in `defaults` outright. Copy
+        # the decision the user already made rather than making it again on
+        # their behalf -- and copy only `tos`, so the analytics token and
+        # environment list beside it stay in the home that is being hidden.
+        shutil.copytree(accepted_terms,
+                        temporary / sandbox_home.name / ".conda" / "tos",
+                        dirs_exist_ok=True)
     sandbox_path = effective_path()
     cmd = ["bwrap", "--die-with-parent", "--unshare-pid", "--ro-bind", "/", "/"]
     if not network:
@@ -748,6 +768,13 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int, *,
             "--bind", str(hidden_home), str(Path.home()),
             "--bind", str(temporary), "/tmp",
             "--bind", str(temporary), "/var/tmp"]
+    if hidden_conda is not None:
+        # After the home mount, not before it: conda's entry points and its own
+        # interpreter are shebang-bound to the prefix they were installed at,
+        # so it works at that path or nowhere. bubblewrap resolves bind sources
+        # against the original root, so the mount that hides the home does not
+        # take this one's source away with it.
+        cmd += ["--ro-bind", str(conda), str(conda)]
     pwsh = powershell_runtime()
     if pwsh is not None:
         cmd += ["--ro-bind", str(pwsh.parent), powershell_runtime_mount()]
@@ -773,6 +800,12 @@ def _sandboxed_command(command: list[str], workspace: Path, timeout: int, *,
                 "--setenv", "PATH", "/mnt:" + sandbox_path,
                 "--setenv", "RUSTUP_HOME", "/media",
                 "--setenv", "CARGO_HOME", str(sandbox_home / ".cargo")]
+    if conda is not None:
+        # The installation is read-only here, so extraction needs a writable
+        # directory of its own; the host cache stays second in the list, where
+        # conda still reads from it rather than downloading again.
+        cmd += ["--setenv", "CONDA_PKGS_DIRS",
+                f"{sandbox_home / 'conda-pkgs'},{conda / 'pkgs'}"]
     cmd += ["--", *command]
     from runtimes.base import run_with_inactivity_timeout
     return run_with_inactivity_timeout(
@@ -870,6 +903,23 @@ def git_diff(workspace: Path) -> str:
     command.extend(f":(exclude,glob){pattern}" for pattern in DIFF_EXCLUDE_PATTERNS)
     proc = subprocess.run(command, cwd=workspace, capture_output=True, text=True)
     return proc.stdout
+
+
+def conda_installation() -> Path | None:
+    """Where conda is installed, when it sits below the home the sandbox hides.
+
+    Four seeds build their environment with ``conda env create -p ./env``, and
+    conda is installed under the user's home -- the one directory a verifier
+    sandbox deliberately masks. ``effective_path()`` went on advertising its
+    ``bin``, so PATH named an executable that was no longer there and all four
+    failed with ``bwrap: execvp conda: No such file or directory``.
+    """
+    from toolchains import effective_path
+    executable = shutil.which("conda", path=effective_path())
+    if executable is None:
+        return None
+    root = Path(executable).resolve().parent.parent
+    return root if (root / "conda-meta").is_dir() else None
 
 
 def clear_runtime_caches(workspace: Path) -> list[str]:
