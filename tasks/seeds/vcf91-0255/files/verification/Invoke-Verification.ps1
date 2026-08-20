@@ -210,14 +210,26 @@ function Assert-AcquireTokenShape($Log, [bool] $ExpectAuthSource) {
     Assert-Equal 1 $requests.Count 'the session must issue acquireToken exactly once'
     if ($requests.Count -ne 1) { return }
 
-    $expectedKeys = @('username', 'password')
-    if ($ExpectAuthSource) { $expectedKeys += 'authSource' }
-    Assert-SetEqual $expectedKeys (Get-BodyKeys $requests[0]) (
-        'acquireToken must carry exactly username, password, and any authSource the caller supplied')
+    # The handshake body is composed by Connect-VcfOpsServer, not by the module:
+    # the SDK serializes `authSource` whether or not one was given. There is no
+    # way around that and still be using the SDK -- every request builder takes
+    # a VcfOpsServer and only that cmdlet makes one -- so what the module
+    # decides here is whether a value goes in, and that is what this asserts.
+    # The stricter rule, that an unset optional is absent rather than null,
+    # still binds every request the module composes itself.
+    $bodyKeys = @(Get-BodyKeys $requests[0])
+    $unexpected = @($bodyKeys | Where-Object { $_ -notin @('username', 'password', 'authSource') })
+    Assert-Equal 0 $unexpected.Count (
+        "acquireToken must carry nothing but username, password and authSource, got [$($bodyKeys -join ', ')]")
+    Assert-True ($bodyKeys -contains 'username' -and $bodyKeys -contains 'password') (
+        "acquireToken must carry username and password, got [$($bodyKeys -join ', ')]")
     Assert-Equal $script:Username (Get-BodyValue $requests[0] 'username') 'acquireToken username'
     Assert-Equal $script:Password (Get-BodyValue $requests[0] 'password') 'acquireToken password'
     if ($ExpectAuthSource) {
         Assert-Equal $script:AuthSource (Get-BodyValue $requests[0] 'authSource') 'acquireToken authSource'
+    } else {
+        Assert-True ($null -eq (Get-BodyValue $requests[0] 'authSource')) (
+            'acquireToken must carry no authSource value when the caller supplied none')
     }
 }
 
