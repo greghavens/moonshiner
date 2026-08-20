@@ -70,9 +70,24 @@ def _corpus_version(root: Path) -> str:
 _authoring_enabled = bool((((CONFIG.get("pipeline") or {}).get("queues") or {})
                            .get("seed_authoring")))
 _active_root = STORAGE_ROOT / "corpora" / "active"
+def _release_order(version: str) -> tuple[int, ...]:
+    """Order corpus versions by release, not by spelling.
+
+    A dated version counts up within the day -- `.1`, `.2`, and on past `.9`
+    when a day carries a lot of seed repair. Compared as text, `.10` sorts
+    below `.3`: a project holding the tenth corpus of the day would read it as
+    older than the third and quietly fall back to the seeds bundled with the
+    package.
+    """
+    return tuple(int(part) if part.isdigit() else -1
+                 for part in version.split("."))
+
+
 def prefer_active_corpus(installed: bool, authoring: bool,
                          active_version: str, bundled_version: str) -> bool:
-    return installed and (authoring or active_version >= bundled_version)
+    return installed and (authoring
+                          or _release_order(active_version)
+                          >= _release_order(bundled_version))
 
 _use_active = prefer_active_corpus(
     _installed_seeds.is_dir(), _authoring_enabled,
