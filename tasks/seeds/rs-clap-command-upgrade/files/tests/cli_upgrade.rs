@@ -63,39 +63,47 @@ fn completion_keeps_its_required_positional_grammar() {
 
 #[test]
 fn root_and_serve_help_snapshots_are_stable_and_successful() {
+    // `concat!`, not a backslash continuation: Rust strips the leading
+    // whitespace of the line after a `\`, and every line of a help listing
+    // is indented. Written that way the expected text could not match what
+    // clap prints no matter how the command was defined.
     let root_help = run(&["dockctl", "--help"]);
     assert_eq!(root_help.code, 0);
     assert_eq!(root_help.stderr, "");
     assert_eq!(
         root_help.stdout,
-        "dockctl 4.5.0\n\
-Operate the local document gateway\n\
-\n\
-Usage: dockctl [OPTIONS] <COMMAND>\n\
-\n\
-Options:\n\
-      --profile <PROFILE>     Runtime profile [default: development]\n\
-  -h, --help               Print help\n\
-\n\
-Commands:\n\
-  serve        Start the gateway\n\
-  completion   Print shell completion\n"
+        concat!(
+            "dockctl 4.5.0\n",
+            "Operate the local document gateway\n",
+            "\n",
+            "Usage: dockctl [OPTIONS] <COMMAND>\n",
+            "\n",
+            "Options:\n",
+            "      --profile <PROFILE>     Runtime profile [default: development]\n",
+            "  -h, --help               Print help\n",
+            "\n",
+            "Commands:\n",
+            "  serve        Start the gateway\n",
+            "  completion   Print shell completion\n",
+        )
     );
 
     let serve_help = run(&["dockctl", "serve", "--help"]);
     assert_eq!(serve_help.code, 0);
     assert_eq!(
         serve_help.stdout,
-        "Start the gateway\n\
-\n\
-Usage: dockctl serve [OPTIONS]\n\
-\n\
-Options:\n\
-  -b, --bind <ADDRESS>        Listen address [default: 127.0.0.1]\n\
-  -p, --port <PORT>           Listen port [default: 8080]\n\
-      --json                  Emit JSON logs\n\
-  -v, --verbose               Increase verbosity\n\
-  -h, --help               Print help\n"
+        concat!(
+            "Start the gateway\n",
+            "\n",
+            "Usage: dockctl serve [OPTIONS]\n",
+            "\n",
+            "Options:\n",
+            "  -b, --bind <ADDRESS>        Listen address [default: 127.0.0.1]\n",
+            "  -p, --port <PORT>           Listen port [default: 8080]\n",
+            "      --json                  Emit JSON logs\n",
+            "  -v, --verbose               Increase verbosity\n",
+            "  -h, --help               Print help\n",
+        )
     );
 }
 
