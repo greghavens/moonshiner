@@ -37,8 +37,15 @@ foreach ($commandName in $sdkCommands) {
     }
 }
 
+# `-Server` names an address, not a URL: the SDK builds the URL itself, so
+# a base URI handed to it whole became `https://http://127.0.0.1:<port>` and
+# could not be parsed. The fixture speaks plain HTTP on a loopback port, and
+# both of those have parameters of their own.
+$endpoint = [uri] $BaseUri
 $connection = Connect-VcfInstallerServer `
-    -Server $BaseUri `
+    -Server $endpoint.Host `
+    -Port $endpoint.Port `
+    -Protocol $endpoint.Scheme `
     -User 'admin@local' `
     -Password 'FixtureOnly-Password1!' `
     -ErrorAction Stop

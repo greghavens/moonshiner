@@ -238,6 +238,11 @@ def validate_wire(records: list[dict]) -> None:
         ("POST", "/v1/tokens", "createToken"),
         ("GET", "/v1/system/appliance-info", "getApplianceInfo"),
         ("PUT", "/v1/system/settings/depot", "updateDepotSettings"),
+        # The SDK's own connection handshake, made by Connect-VcfInstallerServer
+        # before the module under test is called at all. It is not a contract
+        # operation and the assertions below still cover every request the
+        # candidate itself makes.
+        ("GET", "/v1/sddc-manager", "sdkConnectionHandshake"),
     }
     observed = {
         (record["method"], record["path"], record["operationId"])

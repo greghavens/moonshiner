@@ -17,6 +17,14 @@ EXPECTED_OPERATIONS = {
     ("PUT", "/v1/system/settings/depot"): "updateDepotSettings",
 }
 
+# `Connect-VcfInstallerServer` posts for a token and then probes this route to
+# identify the appliance, all before any candidate code runs. That is the client
+# library talking to the appliance, not the module under test talking to the API
+# this fixture pins, so it is served here rather than added to the contract
+# excerpt -- which is a verbatim subset of the published 9.0 specification and
+# has to stay one.
+HANDSHAKE_ROUTES = {("GET", "/v1/sddc-manager"): "sdkConnectionHandshake"}
+
 
 def load_routes(contract_path: Path) -> dict[tuple[str, str], str]:
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
@@ -87,6 +95,18 @@ class Handler(BaseHTTPRequestHandler):
         route = (method, split.path)
         raw_body = self._read_body()
         headers = {name.lower(): value for name, value in self.headers.items()}
+
+        if route in HANDSHAKE_ROUTES:
+            self._respond_and_log(
+                status=200,
+                payload={"id": "fixture-installer", "version": "9.0.0.0.24703748"},
+                operation_id=HANDSHAKE_ROUTES[route],
+                query=split.query,
+                headers=headers,
+                raw_body=raw_body,
+                effect_applied=False,
+            )
+            return
 
         if route not in self.server.routes:
             self._respond_and_log(
