@@ -190,10 +190,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--only", help="Comma-separated seed ids to validate")
+    # A failure line carries 200 characters of a verifier's output, which is
+    # enough to say a seed is broken and not enough to say what broke. The
+    # report holds every run in full, so repairing a seed does not mean
+    # reproducing its whole validation by hand to read the rest of a sentence.
+    parser.add_argument("--report", type=Path,
+                        help="Write the full per-seed validation reports here")
     args = parser.parse_args(argv)
 
     only = {value.strip() for value in args.only.split(",")} if args.only else None
     valid, invalid, skipped = [], [], []
+    reports: dict[str, dict] = {}
     for seed in load_seeds(only=only):
         seed_id = seed["id"]
         if trace_passed(seed_id):
@@ -202,13 +209,18 @@ def main(argv: list[str] | None = None) -> int:
         if not (seed["_dir"] / "reference_fix.patch").exists():
             skipped.append(seed_id)  # holdout/pilot: trace- or eval-proven
             continue
-        why = validate(seed)
+        report = validate_report(seed)
+        reports[seed_id] = report
+        why = None if report["passed"] else "; ".join(report["failures"])
         if why:
             invalid.append((seed_id, why))
             print(f"[INVALID] {seed_id}: {why}")
         else:
             valid.append(seed_id)
             print(f"[valid  ] {seed_id}")
+        if args.report:
+            args.report.parent.mkdir(parents=True, exist_ok=True)
+            args.report.write_text(json.dumps(reports, indent=2) + "\n")
     print(f"\n{len(valid)} valid, {len(invalid)} invalid, "
           f"{len(skipped)} skipped (trace-proven or exempt)")
     if invalid:

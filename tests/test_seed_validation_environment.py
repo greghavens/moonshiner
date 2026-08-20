@@ -4,6 +4,7 @@ Each case here is a defect that made a solvable seed report invalid, so no
 patch could ever have rescued it and its whole attempt budget was spent
 proving that.
 """
+import json
 import pathlib
 import signal
 import subprocess
@@ -63,6 +64,52 @@ class AHandWrittenPatchIsReadByItsBody(unittest.TestCase):
             self.apply(*validate_seeds.PATCH_APPLY, "-R").returncode, 0)
         self.assertEqual((self.root / "value.txt").read_text(),
                          "first\nsecond\nthird\n")
+
+
+class AFailingSeedCanBeReadInFull(unittest.TestCase):
+    """Two hundred characters of a verifier's output is not a diagnosis."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        seed_directory = self.root / "a-seed"
+        seed_directory.mkdir()
+        (seed_directory / "reference_fix.patch").write_text("")
+        self.seed = {"id": "a-seed", "_dir": seed_directory}
+        self.report = {
+            "passed": False,
+            "failures": ["verify does not pass twice after patch"],
+            "reference_runs": [{"passed": False, "tail": "detail " * 500}]}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_validation(self, *arguments):
+        with mock.patch.object(validate_seeds, "load_seeds",
+                               return_value=[self.seed]), \
+             mock.patch.object(validate_seeds, "trace_passed",
+                               return_value=False), \
+             mock.patch.object(validate_seeds, "validate_report",
+                               return_value=self.report):
+            return validate_seeds.main(["--only", "a-seed", *arguments])
+
+    def test_the_run_is_written_whole_where_it_was_asked_for(self):
+        destination = self.root / "reports" / "validation.json"
+        self.assertEqual(self.run_validation("--report", str(destination)), 1)
+        written = json.loads(destination.read_text())
+        self.assertEqual(written["a-seed"]["reference_runs"][0]["tail"],
+                         "detail " * 500)
+
+    def test_a_seed_that_passes_is_still_reported(self):
+        self.report = {"passed": True, "failures": [], "baseline_runs": []}
+        destination = self.root / "validation.json"
+        self.assertEqual(self.run_validation("--report", str(destination)), 0)
+        self.assertEqual(json.loads(destination.read_text())["a-seed"]["passed"],
+                         True)
+
+    def test_asking_for_no_report_writes_none(self):
+        self.assertEqual(self.run_validation(), 1)
+        self.assertEqual(list(self.root.glob("*.json")), [])
 
 
 class TheWorkspaceIsMountedWhereItSaysItIs(unittest.TestCase):
