@@ -768,7 +768,7 @@ def case_validation():
 
     for value in [0, -1, "5", None, True, float("nan"), float("inf"), 10**10000]:
         _rejects(
-            "timeout=%r" % (value,),
+            "timeout=%s" % (_printable(value),),
             lambda v=value: ApplicationGroupClient("https://host", USERNAME, PASSWORD, timeout=v),
         )
 
@@ -794,6 +794,20 @@ def case_validation():
     _, log = run(state, body)
     check_equal("validation: rejected before any request", log, [])
     check_equal("validation: nothing created", state.count_named(TARGET), 0)
+
+
+def _printable(value):
+    """`repr`, for a value whose `repr` may not survive being taken.
+
+    Python caps integer-to-string conversion at 4300 digits, and an integer too
+    large to become a finite float -- which is exactly what makes it an
+    interesting timeout to reject -- is well past that. Formatting the label
+    raised before the case it labels ever ran.
+    """
+    try:
+        return repr(value)
+    except ValueError:
+        return "<unprintable %s>" % (type(value).__name__,)
 
 
 def _rejects(label, thunk):
