@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -175,9 +176,49 @@ def wait_for_ready(path: Path, process: subprocess.Popen[str]) -> dict[str, obje
     return {}
 
 
+def canonical_instant(value: object) -> object:
+    """An ISO-8601 instant reduced to the instant, not to how it was written."""
+    if not isinstance(value, str):
+        return value
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return value
+    if moment.tzinfo is None:
+        return value
+    return moment.astimezone(timezone.utc).isoformat()
+
+
+def canonical_events(events: object) -> object:
+    """The event collection, with each `timestampString` read as an instant.
+
+    PowerShell's JSON reader turns any string shaped like an ISO-8601 instant
+    into a `[datetime]` on the way in, and its writer prints one back with only
+    the precision the value needs -- a trailing `.000` cannot survive the round
+    trip, and no switch turns the conversion off. Comparing the printed forms
+    would judge the JSON reader that shipped with the shell rather than the
+    collection the module returned. Everything else, including which events are
+    present and the order they arrive in, is still compared exactly.
+    """
+    if not isinstance(events, list):
+        return events
+    canonical = []
+    for event in events:
+        if not isinstance(event, dict) or "timestampString" not in event:
+            canonical.append(event)
+            continue
+        reduced = dict(event)
+        reduced["timestampString"] = canonical_instant(event["timestampString"])
+        canonical.append(reduced)
+    return canonical
+
+
 def verify_behavior(pwsh: str) -> None:
     events = json.loads((ROOT / "mock" / "events.json").read_text(encoding="utf-8"))
-    expected_events = sorted(events, key=lambda event: (int(event["timestamp"]), event["text"]))
+    expected_events = canonical_events(
+        sorted(events, key=lambda event: (int(event["timestamp"]), event["text"]))
+    )
 
     with tempfile.TemporaryDirectory(prefix="vcf-logs-verifier-") as temp_name:
         temp = Path(temp_name)
@@ -244,13 +285,14 @@ $simpleEvents = @(Get-VcfLogEvent `
         if not output_lines:
             fail("Get-VcfLogEvent produced no JSON output")
         actual = json.loads(output_lines[-1])
-        if actual.get("events") != expected_events:
+        actual_events = canonical_events(actual.get("events"))
+        if actual_events != expected_events:
             fail(
                 "event output is incomplete or not stably ordered\n"
                 f"expected: {json.dumps(expected_events)}\n"
-                f"actual:   {json.dumps(actual.get('events'))}"
+                f"actual:   {json.dumps(actual_events)}"
             )
-        if actual.get("simpleEvents") != expected_events:
+        if canonical_events(actual.get("simpleEvents")) != expected_events:
             fail("SIMPLE view did not return the complete stable event collection")
 
         requests = [
