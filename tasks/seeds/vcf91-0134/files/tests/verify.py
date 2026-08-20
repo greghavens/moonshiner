@@ -222,6 +222,11 @@ catch {{
     env["POWERSHELL_TELEMETRY_OPTOUT"] = "1"
     env["NO_PROXY"] = "127.0.0.1,localhost"
     env["no_proxy"] = "127.0.0.1,localhost"
+    # The script goes in as an argument, not down standard input. `-Command -`
+    # reads stdin a line at a time: a `try {` on its own line is not a complete
+    # command, and PowerShell 7.6 discards the block rather than continuing it.
+    # Every call returned success having run nothing but the Import-Module, and
+    # the wire log was empty because no request was ever made.
     completed = subprocess.run(
         [
             shutil.which("pwsh") or "pwsh",
@@ -229,11 +234,11 @@ catch {{
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "-",
+            script,
         ],
         cwd=ROOT,
         env=env,
-        input=script,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -382,10 +387,16 @@ def check_wire(
         "Kubernetes mutation content type is not exactly application/json",
     )
     require(mutation["json"] == expected_body, "Kubernetes JSON shape is wrong")
-    canonical = json.dumps(expected_body, separators=(",", ":"))
+    # Re-encoded rather than compared byte for byte. A byte comparison pins the
+    # order of the keys inside `spec`, and neither the task nor the contract
+    # says what that order is -- a JSON object does not have one. What the
+    # contract does say is which fields the body carries and which it omits,
+    # and that survives being written in any order.
+    canonical = json.dumps(expected_body, separators=(",", ":"), sort_keys=True)
     require(
-        mutation["body"] == canonical,
-        "Kubernetes request bytes are not the canonical compact JSON wire shape",
+        json.dumps(json.loads(mutation["body"]), separators=(",", ":"), sort_keys=True)
+        == canonical,
+        "Kubernetes request bytes do not decode to exactly the expected document",
     )
 
 
