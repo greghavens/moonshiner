@@ -122,6 +122,33 @@ class CorpusDelivery(unittest.TestCase):
                            release="0.6.6")
             self.assertEqual("locally patched", seed.read_text())
 
+    def test_a_newer_corpus_installed_here_is_not_overwritten(self):
+        """`moonshiner seeds update` must outlast the next service start.
+
+        The corpus a project installs deliberately is newer than the one the
+        running release carries. Merging the release in would paste its older
+        seeds over the corrected ones and relabel the corpus with the older
+        version -- the repair undone, silently, on the next restart.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            active = root / "active"
+            install_corpus(_bundle(root, "shipped"), active, release="0.6.6")
+
+            seed = active / "tasks" / "seeds" / "go-csvlimits" / "verify.py"
+            seed.write_text("repaired")
+            (active / "corpus-version.json").write_text(
+                '{"version": "2026.07.21.10"}\n')
+            (active / ".installed-release").unlink()
+
+            install_corpus(_bundle(root / "same", "shipped"), active,
+                           release="0.6.6")
+            self.assertEqual("repaired", seed.read_text(),
+                             "an older bundled seed must not replace it")
+            self.assertIn("2026.07.21.10",
+                          (active / "corpus-version.json").read_text(),
+                          "nor may the corpus be relabelled with the older version")
+
 
 class ReadOnlyCommands(unittest.TestCase):
     def test_keyboard_interrupt_exits_without_traceback(self):

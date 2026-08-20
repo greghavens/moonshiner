@@ -127,7 +127,12 @@ def _is_seed_content(path: Path, directory: Path) -> bool:
 
 
 def manifest(seed_dir: Path = SEEDS_DIR, *, version: str | None = None) -> dict:
-    version_path = ROOT / "corpus-version.json"
+    # A corpus keeps its version beside its seeds, and that is the copy to read.
+    # The bundle's copy says only what the installed release shipped with, so
+    # asking it announces a freshly installed corpus under the version it just
+    # replaced -- while the same line names the directory it did not read.
+    beside = seed_dir.parent.parent / "corpus-version.json"
+    version_path = beside if beside.exists() else ROOT / "corpus-version.json"
     header = json.loads(version_path.read_text()) if version_path.exists() else {
         "name": "moonshiner-seeds", "version": "development",
         "schema_version": 1, "minimum_moonshiner": "0.1.0"}

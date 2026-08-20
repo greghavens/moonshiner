@@ -1,6 +1,6 @@
 """Installed console entry point."""
 from __future__ import annotations
-import os, shutil, stat, sys, uuid
+import json, os, shutil, stat, sys, uuid
 from pathlib import Path
 
 from . import __version__
@@ -28,6 +28,24 @@ def _replace_file(source: str, destination: str) -> None:
     except OSError:
         pass
     shutil.copy2(source, destination)
+
+
+def _corpus_version(root: Path) -> str:
+    """The corpus version a tree declares, or "0" when it declares none."""
+    try:
+        return str(json.loads((root / "corpus-version.json").read_text())["version"])
+    except (OSError, KeyError, TypeError, ValueError):
+        return "0"
+
+
+def _release_order(version: str) -> tuple[int, ...]:
+    """Order corpus versions by release rather than by spelling.
+
+    A dated version counts up within the day and goes past `.9` on a day of
+    seed repair. Compared as text, `.10` sorts below `.3`.
+    """
+    return tuple(int(part) if part.isdigit() else -1
+                 for part in version.split("."))
 
 
 def _read_stamp(path: Path) -> str:
@@ -105,6 +123,13 @@ def install_corpus(bundle: Path, active: Path, release: str = __version__) -> No
         except FileExistsError: shutil.rmtree(staging, ignore_errors=True)
     elif _read_stamp(stamp) == release:
         return
+    elif _release_order(_corpus_version(active)) > _release_order(_corpus_version(bundle)):
+        # This project holds a corpus newer than the one this release carries,
+        # put there deliberately by `moonshiner seeds update`. Merging would
+        # paste the release's older seeds over the corrected ones and relabel
+        # the result with the older version, so the repair would come undone on
+        # the next service start with nothing said about it.
+        pass
     else:
         _merge_seeds(bundle / "tasks" / "seeds", active / "tasks" / "seeds")
         for name in ("corpus-version.json", "SEED_CATALOG.md", "SEED_CATALOG.json"):
