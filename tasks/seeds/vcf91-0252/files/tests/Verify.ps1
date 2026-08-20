@@ -153,7 +153,21 @@ function Invoke-Scenario {
     }
 }
 
-function Get-Keys($Entry) { return @($Entry.bodyKeys | Sort-Object) }
+# The comma operator, for the same reason `Get-QueryKeys` below needs it: an
+# empty array returned from a function unrolls to no output, so a request with
+# no body handed `Assert-Equal` a `$null` where the empty list belonged and was
+# reported as having sent one.
+function Get-Keys($Entry) { return ,@($Entry.bodyKeys | Sort-Object) }
+
+# A media type without its parameters. `Content-Type` carries a charset when
+# whoever wrote the request did not choose the header by hand -- the SDK's own
+# cmdlets send `application/json; charset=utf-8` -- and the request is a JSON
+# request either way. Compared whole, the header rejected the SDK the prompt
+# requires the module to call.
+function Get-MediaType($Entry) {
+    if ([string]::IsNullOrWhiteSpace($Entry.contentType)) { return '' }
+    return ($Entry.contentType -split ';')[0].Trim().ToLowerInvariant()
+}
 
 # The property collection is made an array before `Name` is read off it: under
 # `Set-StrictMode -Version Latest` member enumeration over an empty collection
@@ -190,7 +204,7 @@ foreach ($a in $acquires) {
     Assert-Equal @('password', 'username') (Get-Keys $a) `
         "acquireToken body carries exactly username and password; the unset optional authSource is omitted, not sent as null or empty (seq $($a.seq))"
     Assert-Equal @() (Get-QueryKeys $a) "acquireToken sends no query parameters (seq $($a.seq))"
-    Assert-That ($a.contentType -eq 'application/json') "acquireToken sends application/json (seq $($a.seq))"
+    Assert-That ((Get-MediaType $a) -eq 'application/json') "acquireToken sends application/json (seq $($a.seq))"
     $credentials = $a.body | ConvertFrom-Json
     Assert-That ($credentials.username -eq 'svc-triage') "acquireToken uses the supplied credential username (seq $($a.seq))"
     Assert-That ($credentials.password -eq 'triage-secret') "acquireToken uses the supplied credential password (seq $($a.seq))"
@@ -252,7 +266,7 @@ foreach ($q in $queries) {
         "queryAlert sends exactly page and pageSize as query parameters (seq $($q.seq))"
     Assert-That ($q.query.PSObject.Properties.Name -contains 'pageSize' -and $q.query.pageSize -eq '3') `
         "queryAlert sends pageSize=3 as a query parameter, not in the body (seq $($q.seq))"
-    Assert-That ($q.contentType -eq 'application/json') "queryAlert sends application/json (seq $($q.seq))"
+    Assert-That ((Get-MediaType $q) -eq 'application/json') "queryAlert sends application/json (seq $($q.seq))"
 }
 $pages = @($queries | ForEach-Object { [int]$_.query.page } | Sort-Object -Unique)
 Assert-Equal @(0, 1, 2) @($pages | Where-Object { $_ -le 2 }) 'pages 0, 1 and 2 are each requested'
@@ -271,7 +285,7 @@ foreach ($m in $actions) {
     # page/pageSize were never asked for. Only the first two may appear.
     Assert-Equal @('action', 'minutes') (Get-QueryKeys $m) `
         "modifyAlerts sends exactly action and minutes; the unset userAccountID, page and pageSize are absent from the query string rather than sent empty (seq $($m.seq))"
-    Assert-That ($m.contentType -eq 'application/json') "modifyAlerts sends application/json (seq $($m.seq))"
+    Assert-That ((Get-MediaType $m) -eq 'application/json') "modifyAlerts sends application/json (seq $($m.seq))"
     Assert-That ($m.query.action -eq 'suspend') "the action sent is the one requested (seq $($m.seq))"
     Assert-That ($m.query.minutes -eq '60')     "the suspend window sent is the one requested (seq $($m.seq))"
 }
@@ -285,7 +299,11 @@ if ($releases.Count -eq 1) {
         'the token released is the one currently held, not the revoked one'
     Assert-Equal @() (Get-QueryKeys $releases[0]) 'releaseToken sends no query parameters'
     Assert-Equal @() (Get-Keys $releases[0]) 'releaseToken sends no JSON body'
-    Assert-That ([string]::IsNullOrEmpty($releases[0].contentType)) 'releaseToken sends no content type for its empty body'
+    # Not "no content type": a POST with nothing to send still gets whatever
+    # default the caller's HTTP client puts on it, and that default is not
+    # something the module states. What the assertion is for is that nothing
+    # was sent as JSON.
+    Assert-That ((Get-MediaType $releases[0]) -ne 'application/json') 'releaseToken sends no JSON content type for its empty body'
 }
 
 if ($s1.Result) {
@@ -320,7 +338,7 @@ if ($acq2.Count -ge 1) {
     Assert-That ((($acq2[0].body | ConvertFrom-Json).username) -eq 'svc-triage') 'the filtered run uses the supplied credential username'
     Assert-That ((($acq2[0].body | ConvertFrom-Json).password) -eq 'triage-secret') 'the filtered run uses the supplied credential password'
     Assert-Equal @() (Get-QueryKeys $acq2[0]) 'the filtered acquireToken request sends no query parameters'
-    Assert-That ($acq2[0].contentType -eq 'application/json') 'the filtered acquireToken request sends application/json'
+    Assert-That ((Get-MediaType $acq2[0]) -eq 'application/json') 'the filtered acquireToken request sends application/json'
 }
 
 $q2 = @($s2.Module | Where-Object { $_.operationId -eq 'queryAlert' })
@@ -333,7 +351,7 @@ foreach ($q in $q2) {
     Assert-That ($q.query.pageSize -eq '100') "the effective default pageSize=100 is sent when the caller omits PageSize (seq $($q.seq))"
     Assert-Equal @('page', 'pageSize') (Get-QueryKeys $q) `
         "the filtered queryAlert request sends exactly page and pageSize (seq $($q.seq))"
-    Assert-That ($q.contentType -eq 'application/json') "the filtered queryAlert request sends application/json (seq $($q.seq))"
+    Assert-That ((Get-MediaType $q) -eq 'application/json') "the filtered queryAlert request sends application/json (seq $($q.seq))"
 }
 
 $m2 = @($s2.Module | Where-Object { $_.operationId -eq 'modifyAlerts' -and $_.status -eq 200 })
@@ -346,7 +364,7 @@ foreach ($m in $m2) {
         "modifyAlerts sends exactly action and userAccountID; the unset minutes is absent (seq $($m.seq))"
     Assert-Equal @('uuids') (Get-Keys $m) "the filtered modifyAlerts body carries only uuids (seq $($m.seq))"
     Assert-Equal 1 @(Get-ActionedId $m).Count "the filtered modifyAlerts request acts on one alert (seq $($m.seq))"
-    Assert-That ($m.contentType -eq 'application/json') "the filtered modifyAlerts request sends application/json (seq $($m.seq))"
+    Assert-That ((Get-MediaType $m) -eq 'application/json') "the filtered modifyAlerts request sends application/json (seq $($m.seq))"
     Assert-That ($m.query.action -eq 'takeOwnership') "the action sent is the one requested (seq $($m.seq))"
     Assert-That ($m.query.userAccountID -eq $owner)   "the owner sent is the one requested (seq $($m.seq))"
 }
