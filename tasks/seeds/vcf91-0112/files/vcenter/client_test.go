@@ -911,6 +911,7 @@ func assertExactWire(
 			"accept":                true,
 			"accept-encoding":       true,
 			"client-token":          true,
+			"content-length":        true, // set by net/http for any body whose length it knows
 			"content-type":          true,
 			"user-agent":            true,
 			"vmware-api-session-id": true,

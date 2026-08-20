@@ -835,6 +835,7 @@ func checkEveryRequest(t *testing.T, e *env) {
 			"User-Agent":      true, // supplied by net/http when the client leaves it unset
 			"Accept-Encoding": true, // supplied by net/http's default compression support
 			"Connection":      true, // supplied by the test transport when keep-alives are disabled
+			"Content-Length":  true, // supplied by net/http for any body whose length it knows
 		}
 		if entry.Operation == "upsertPolicy" {
 			allowedHeaders["Content-Type"] = true
