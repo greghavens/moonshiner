@@ -469,12 +469,16 @@ def run_integration() -> None:
             }
             if any(result.get(key) != value for key, value in expected_result.items()):
                 fail(f"PowerShell result changed: {result!r}")
-            if not str(result.get("exhaustedType", "")).startswith(
-                "VMware.Binding.OpenApi.Client."
+            chain = result.get("exhaustedChain") or []
+            if isinstance(chain, str):
+                chain = [chain]
+            if not any(
+                str(name).startswith("VMware.Binding.OpenApi.Client.")
+                for name in chain
             ):
                 fail(
                     "retry exhaustion did not preserve the genuine SDK "
-                    f"exception type: {result.get('exhaustedType')!r}"
+                    f"exception: {chain!r}"
                 )
             verify_wire(read_log(log_path))
         finally:

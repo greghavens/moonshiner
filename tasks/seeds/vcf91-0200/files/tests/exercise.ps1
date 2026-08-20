@@ -225,6 +225,7 @@ foreach ($transientCase in $transientCases) {
 
 $exhaustedStatus = $null
 $exhaustedType = $null
+$exhaustedChain = @()
 try {
     $null = Set-VcfInstallerDepotToken `
         -Server $serverConnection `
@@ -235,6 +236,15 @@ try {
 }
 catch {
     $retryExhausted = $true
+    # The whole chain, not only its outermost link. The SDK cmdlet wraps what it
+    # throws in a VimException of its own, so an error rethrown exactly as the
+    # SDK raised it still arrives wearing that wrapper; the genuine transport
+    # exception is the one inside it.
+    $link = $_.Exception
+    while ($null -ne $link) {
+        $exhaustedChain += $link.GetType().FullName
+        $link = $link.InnerException
+    }
     $exception = $_.Exception
     while ($null -ne $exception) {
         if ($null -eq $exhaustedType) {
@@ -272,5 +282,6 @@ if (-not $retryExhausted -or $exhaustedStatus -ne 503) {
     transientCasesRetried = $transientCases.Count
     exhaustedStatus = $exhaustedStatus
     exhaustedType = $exhaustedType
+    exhaustedChain = @($exhaustedChain)
 } | ConvertTo-Json -Depth 4 -Compress |
     Set-Content -LiteralPath $OutputFile -Encoding utf8NoBOM
