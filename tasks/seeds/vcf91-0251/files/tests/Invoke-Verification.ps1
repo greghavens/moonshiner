@@ -198,10 +198,20 @@ try {
         ($auth.Count -eq 1) "count=$($auth.Count)"
     if ($auth.Count -eq 1) {
         $authKeys = Get-BodyKeys $auth[0].body
-        Assert-That 'A: acquireToken body contains only username and password when -AuthSource is omitted' `
-            ((Compare-Object $authKeys @('password', 'username') -SyncWindow 0 | Measure-Object).Count -eq 0) `
-            "body=$($auth[0].body)"
         $authBody = $auth[0].body | ConvertFrom-Json
+        # The handshake body is composed by Connect-VcfOpsServer, not by the
+        # module: the SDK serializes `authSource` whether or not one was given.
+        # There is no way around that and still be using the SDK -- every
+        # request builder takes a VcfOpsServer, and only that cmdlet makes one --
+        # so what the module decides here is whether a value goes in, and that
+        # is what this asserts. The stricter rule, that an unset optional is
+        # absent rather than null, still binds every request the module composes
+        # itself; the createReport assertions below hold it to exactly that.
+        $unexpected = @($authKeys | Where-Object { $_ -notin @('password', 'username', 'authSource') })
+        $sentSource = if ($authKeys -contains 'authSource') { $authBody.authSource } else { $null }
+        Assert-That 'A: acquireToken carries no authSource value when -AuthSource is omitted' `
+            ($unexpected.Count -eq 0 -and $null -eq $sentSource) `
+            "body=$($auth[0].body)"
         Assert-That 'A: acquireToken sent the supplied username and password' `
             ($authBody.username -eq 'svc-reporting' -and $authBody.password -eq 'not-a-real-secret') `
             "body=$($auth[0].body)"

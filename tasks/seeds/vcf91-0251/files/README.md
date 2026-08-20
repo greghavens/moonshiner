@@ -58,6 +58,10 @@ under `auth.taskDefined` and `taskDefined`:
 Both the mock and the verification are strict about this: a property or query parameter the
 caller did not supply must be **absent from the request**, not present as `null`, `""`, or `[]`.
 
+This is about the requests the module composes. The session handshake is composed by
+`Connect-VcfOpsServer` itself, which serializes `authSource` either way; what you decide there
+is whether a value goes into it.
+
 ```
 Start-VcfOpsReportGeneration -Session $s -ReportDefinitionId $d -ResourceId $r
   => {"reportDefinitionId":"...","resourceId":"..."}          # and nothing else
