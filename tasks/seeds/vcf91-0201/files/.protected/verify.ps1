@@ -144,7 +144,9 @@ function Assert-ProxyRequest {
         [Parameter(Mandatory)]
         [object]$Request,
         [Parameter(Mandatory)]
-        [string]$Host,
+        # Not $Host: that name belongs to the shell, which keeps it read-only,
+        # and a parameter cannot be bound to it.
+        [string]$ProxyHost,
         [Parameter(Mandatory)]
         [int]$Port,
         [Parameter(Mandatory)]
@@ -155,7 +157,7 @@ function Assert-ProxyRequest {
 
     Assert-JsonMemberSet $Request.json @('isEnabled', 'host', 'port', 'transferProtocol') "$Label JSON member set"
     Assert-Equal $Request.json.isEnabled $true "$Label enabled value"
-    Assert-Equal $Request.json.host $Host "$Label host"
+    Assert-Equal $Request.json.host $ProxyHost "$Label host"
     Assert-Equal $Request.json.port $Port "$Label port"
     Assert-Equal $Request.json.transferProtocol $Protocol "$Label transfer protocol"
 }
