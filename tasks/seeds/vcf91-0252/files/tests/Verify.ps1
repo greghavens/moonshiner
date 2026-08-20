@@ -155,7 +155,14 @@ function Invoke-Scenario {
 
 function Get-Keys($Entry) { return @($Entry.bodyKeys | Sort-Object) }
 
-function Get-QueryKeys($Entry) { return @($Entry.query.PSObject.Properties.Name | Sort-Object) }
+# The property collection is made an array before `Name` is read off it: under
+# `Set-StrictMode -Version Latest` member enumeration over an empty collection
+# throws instead of yielding nothing, and a request with no query parameters --
+# which several assertions below require -- has exactly none.
+function Get-QueryKeys($Entry) {
+    if ($null -eq $Entry.query) { return ,@() }
+    return ,@(@($Entry.query.PSObject.Properties) | ForEach-Object { $_.Name } | Sort-Object)
+}
 
 function Get-ActionedId($Entry) {
     # modifyAlerts carries the alert it acted on in the uuids array of its body.

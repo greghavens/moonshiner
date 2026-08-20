@@ -50,8 +50,15 @@ function Test-That {
 
 function Get-KeySet {
     param([object] $Obj)
-    if ($null -eq $Obj) { return @() }
-    return @($Obj.PSObject.Properties.Name | Sort-Object)
+    # Two things an empty property bag does under `Set-StrictMode -Version
+    # Latest`, and an object with no properties at all is precisely what the
+    # empty-object cases below assert about. Reading `Name` straight off the
+    # collection throws rather than yielding nothing, so it is made an array
+    # first. And an empty array returned from a function unrolls to no output,
+    # leaving `$null` where the caller asks for `.Count`, so the comma operator
+    # keeps the array itself as the one value returned.
+    if ($null -eq $Obj) { return ,@() }
+    return ,@(@($Obj.PSObject.Properties) | ForEach-Object { $_.Name } | Sort-Object)
 }
 
 function Compare-KeySet {
