@@ -527,6 +527,25 @@ def run_process(args: list[str], *, timeout: int = 30) -> subprocess.CompletedPr
     return result
 
 
+def json_output(result: subprocess.CompletedProcess[str], description: str) -> Any:
+    """The JSON document a pwsh harness printed, ignoring what preceded it.
+
+    Importing a VMware SDK module prints the CEIP participation notice, and it
+    prints it on standard output rather than to the warning stream. Every
+    harness here ends in a single compressed `ConvertTo-Json`, so the document
+    is the last line that parses -- reading the whole stream as JSON instead
+    makes the notice look like a broken implementation.
+    """
+    for line in reversed(result.stdout.splitlines()):
+        if not line.strip():
+            continue
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            continue
+    raise VerificationError(f"{description}: {result.stdout}")
+
+
 def inspect_module() -> None:
     check(MANIFEST_PATH.is_file(), "PowerShell module manifest is missing")
     check(IMPLEMENTATION_PATH.is_file(), "PowerShell module implementation is missing")
@@ -581,10 +600,7 @@ $required = @(foreach ($entry in @($manifest.RequiredModules)) { if ($entry -is 
             str(IMPLEMENTATION_PATH),
         ]
     )
-    try:
-        details = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise VerificationError(f"could not inspect PowerShell module: {result.stdout}") from exc
+    details = json_output(result, "could not inspect PowerShell module")
 
     check(details["rootModule"] == IMPLEMENTATION_PATH.name, "manifest RootModule is wrong")
     required = set(details["requiredModules"])
@@ -663,10 +679,7 @@ def invoke_planner(inventory: Path, compatibility: Path, output: Path) -> set[st
             str(output),
         ]
     )
-    try:
-        exported = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise VerificationError(f"planner harness returned invalid output: {result.stdout}") from exc
+    exported = json_output(result, "planner harness returned invalid output")
     return {exported} if isinstance(exported, str) else set(exported)
 
 
