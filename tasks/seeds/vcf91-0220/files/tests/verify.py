@@ -228,11 +228,16 @@ def assert_headers_and_body(
 def verify_success(
     log: list[dict[str, object]], expected_body: str, deploy_query: str
 ) -> None:
+    # The raw target, query and all -- which is what the mock records under
+    # `rawPath` and what `deploy_query` says this scenario asked for. Written
+    # as the bare path, the sequence could only be matched by a deployment that
+    # dropped the very parameter the scenario exists to send.
+    deploy_target = "/v1/sddcs" + (f"?{deploy_query}" if deploy_query else "")
     expected = [
         ("POST", "/v1/sddcs/validations", "validateSddcSpec"),
         ("GET", f"/v1/sddcs/validations/{SUCCESS_ID}", "getSddcSpecValidation"),
         ("GET", f"/v1/sddcs/validations/{SUCCESS_ID}", "getSddcSpecValidation"),
-        ("POST", "/v1/sddcs", "deploySddc"),
+        ("POST", deploy_target, "deploySddc"),
     ]
     actual = [(entry["method"], entry["rawPath"], entry["operationId"]) for entry in log]
     require(actual == expected, f"wrong successful request sequence: {actual!r}")
