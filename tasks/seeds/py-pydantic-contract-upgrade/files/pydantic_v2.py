@@ -78,7 +78,12 @@ class ModelMeta(type):
         for base in bases:
             inherited_fields.update(getattr(base, "__model_fields__", {}))
 
-        annotations = namespace.get("__annotations__", {})
+        # Read them off the finished class, not out of the namespace: since 3.14
+        # a class body evaluates its annotations lazily and leaves behind the
+        # function that would build the mapping rather than the mapping itself.
+        # The attribute answers with the same annotations on every version, and
+        # only with the ones this class declared -- the bases were read above.
+        annotations = model.__annotations__
         for field_name, field_type in annotations.items():
             configured = namespace.get(field_name, _MISSING)
             if isinstance(configured, FieldInfo):
