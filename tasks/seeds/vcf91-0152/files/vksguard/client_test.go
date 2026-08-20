@@ -786,8 +786,12 @@ func assertPatchWire(
 		"Accept":          {"application/json"},
 		"Accept-Encoding": {"gzip"},
 		"Authorization":   {"Bearer " + scenario.KubernetesToken},
-		"Content-Type":    {"application/merge-patch+json"},
-		"User-Agent":      {"Go-http-client/1.1"},
+		// net/http frames a body of known length itself, and the server keeps
+		// the header it sent. Left out of an exactly-this-set comparison, the
+		// only client that could match is one that never sent a body.
+		"Content-Length": {strconv.Itoa(len(wantBody))},
+		"Content-Type":   {"application/merge-patch+json"},
+		"User-Agent":     {"Go-http-client/1.1"},
 	})
 	assertAbsent(t, request.Header, "vmware-api-session-id")
 	assertNoQuery(t, request.RawTarget, []string{

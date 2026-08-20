@@ -224,7 +224,13 @@ func TestLaterSyncFailurePreservesAcceptedStepsAndExactWire(t *testing.T) {
 			if len(request.Body) != 0 || request.ContentLength != 0 || len(request.TransferEncoding) != 0 {
 				t.Errorf("sync framing body=%d contentLength=%d transferEncoding=%v", len(request.Body), request.ContentLength, request.TransferEncoding)
 			}
-			assertHeaderNames(t, request.Header, "Accept", "Accept-Encoding", "Authorization", "User-Agent")
+			// Content-Length is not the caller's to decide here: net/http sends
+			// `Content-Length: 0` on a bodiless PATCH whether the request was built
+			// from a nil body or an empty reader, and the server keeps it in the
+			// header map. The framing check above already pins the length to zero,
+			// so listing the header either way judges the standard library rather
+			// than the client.
+			assertHeaderNamesIgnoring(t, request.Header, "Content-Length", "Accept", "Accept-Encoding", "Authorization", "User-Agent")
 		}
 	}
 }
@@ -603,6 +609,18 @@ func assertSingleHeader(t *testing.T, header http.Header, name, want string) {
 	if len(values) != 1 || values[0] != want {
 		t.Errorf("%s values = %q, want exactly [%q]", name, values, want)
 	}
+}
+
+func assertHeaderNamesIgnoring(t *testing.T, header http.Header, ignore string, want ...string) {
+	t.Helper()
+	kept := make(http.Header, len(header))
+	for name, values := range header {
+		if http.CanonicalHeaderKey(name) == http.CanonicalHeaderKey(ignore) {
+			continue
+		}
+		kept[name] = values
+	}
+	assertHeaderNames(t, kept, want...)
 }
 
 func assertHeaderNames(t *testing.T, header http.Header, want ...string) {
