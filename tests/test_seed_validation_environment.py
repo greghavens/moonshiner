@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 from unittest import mock
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -31,6 +32,69 @@ diff --git a/value.txt b/value.txt
 +SECOND
  third
 """
+
+
+class AProtectedTestDirectoryIsValidated(unittest.TestCase):
+    """A protected path can name a directory, not only one file."""
+
+    def setUp(self):
+        self.seed_id = f"protected-directory-{uuid.uuid4().hex}"
+        self.seed_directory = common.WORKSPACES / f"source-{self.seed_id}"
+        self.files = self.seed_directory / "files"
+        self.protected = self.files / ".moonshiner" / "verify"
+        self.protected.mkdir(parents=True)
+        self.script = self.protected / "verify.sh"
+        self.script.write_text(
+            "#!/bin/sh\n[ \"$(cat value.txt)\" = \"fixed\" ]\n")
+        (self.files / "value.txt").write_text("broken\n")
+        (self.seed_directory / "reference_fix.patch").write_text(
+            "diff --git a/value.txt b/value.txt\n"
+            "--- a/value.txt\n"
+            "+++ b/value.txt\n"
+            "@@ -1 +1 @@\n"
+            "-broken\n"
+            "+fixed\n")
+        self.seed = {
+            "id": self.seed_id,
+            "_dir": self.seed_directory,
+            "prompt": "Fix value.txt.",
+            "verify_cmd": "bash .moonshiner/verify/verify.sh",
+            "verify_timeout": 30,
+            "test_files": [".moonshiner/verify"],
+        }
+
+    def tearDown(self):
+        common.remove_workspace(self.seed_directory)
+        for workspace in common.WORKSPACES.glob(
+                f"validate-{self.seed_id}*"):
+            common.remove_workspace(workspace)
+
+    def test_validation_hashes_the_real_directory_tree(self):
+        baseline = common.protected_hashes(self.seed, self.files)
+
+        original = self.script.read_bytes()
+        self.script.write_bytes(original + b"# changed\n")
+        self.assertNotEqual(baseline,
+                            common.protected_hashes(self.seed, self.files))
+        self.script.write_bytes(original)
+        self.assertEqual(baseline,
+                         common.protected_hashes(self.seed, self.files))
+
+        added = self.protected / "added.txt"
+        added.write_text("added\n")
+        self.assertNotEqual(baseline,
+                            common.protected_hashes(self.seed, self.files))
+        added.unlink()
+        renamed = self.script.with_name("renamed.sh")
+        self.script.rename(renamed)
+        self.assertNotEqual(baseline,
+                            common.protected_hashes(self.seed, self.files))
+        renamed.rename(self.script)
+        self.assertEqual(baseline,
+                         common.protected_hashes(self.seed, self.files))
+
+        report = validate_seeds.validate_report(self.seed)
+        self.assertTrue(report["passed"], report)
 
 
 class AHandWrittenPatchIsReadByItsBody(unittest.TestCase):

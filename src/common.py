@@ -993,8 +993,23 @@ def protected_hashes(seed: dict, workspace: Path) -> dict[str, str | None]:
     hashes = {}
     for relative in seed.get("test_files", []):
         path = workspace / relative
-        hashes[relative] = (hashlib.sha256(path.read_bytes()).hexdigest()
-                            if path.exists() else None)
+        if path.is_file():
+            hashes[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+        elif path.is_dir():
+            digest = hashlib.sha256()
+            for entry in sorted(path.rglob("*"), key=lambda item: (
+                    item.relative_to(path).as_posix())):
+                name = entry.relative_to(path).as_posix().encode()
+                digest.update(b"D" if entry.is_dir() else b"F")
+                digest.update(len(name).to_bytes(8, "big"))
+                digest.update(name)
+                if entry.is_file():
+                    contents = entry.read_bytes()
+                    digest.update(len(contents).to_bytes(8, "big"))
+                    digest.update(contents)
+            hashes[relative] = digest.hexdigest()
+        else:
+            hashes[relative] = None
     from task_environment import environment_control_hashes
     hashes.update(environment_control_hashes(seed))
     return hashes
