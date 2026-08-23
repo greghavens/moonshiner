@@ -20,6 +20,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from runtimes import opencode  # noqa: E402
+from runtimes.credential_proxy import DUMMY_TOKEN  # noqa: E402
 from runtimes.opencode import (  # noqa: E402
     OPENCODE_RUNTIME_VERSION,
     BlockedOnQuestion,
@@ -27,6 +28,7 @@ from runtimes.opencode import (  # noqa: E402
     OpenCodeRuntime,
     _EventStream,
     _completed_session_evidence,
+    _provider_and_model,
     _is_content_filter,
     _is_heartbeat,
     _snapshot_excludes,
@@ -193,6 +195,75 @@ class OpenCodeStructuredSession(unittest.TestCase):
             "providerID": "zenmux", "modelID": "model-a"})
         self.assertNotIn("system", payload)
         self.assertEqual(payload["parts"], [{"type": "text", "text": prompt}])
+
+    def test_zai_uses_the_same_provider_and_model_attestation_path(self):
+        session = _completed_session()
+        for message in session:
+            info = message["info"]
+            if info["role"] == "user":
+                info["model"] = {
+                    "providerID": "zai", "modelID": "glm-5.3"}
+            else:
+                info["providerID"] = "zai"
+                info["modelID"] = "glm-5.3"
+        evidence = _completed_session_evidence(
+            session, expected_provider="zai", expected_model="glm-5.3")
+        self.assertEqual(evidence["observed_providers"], ["zai"])
+        self.assertEqual(evidence["observed_models"], ["glm-5.3"])
+
+    def test_provider_validation_accepts_only_supported_open_code_routes(self):
+        for provider in ("openrouter", "zenmux", "zai"):
+            with self.subTest(provider=provider):
+                runtime = OpenCodeRuntime(
+                    {"runtimes": {"opencode": {"provider": provider}}},
+                    {"model": "model-a"})
+                self.assertEqual(_provider_and_model(runtime),
+                                 (provider, "model-a"))
+        unsupported = OpenCodeRuntime(
+            {"runtimes": {"opencode": {"provider": "arbitrary"}}},
+            {"model": "model-a"})
+        with self.assertRaisesRegex(RuntimeError, "openrouter, zenmux, or zai"):
+            _provider_and_model(unsupported)
+
+    def test_zai_custom_provider_receives_only_the_proxy_dummy_credential(self):
+        runtime = OpenCodeRuntime(
+            {"runtimes": {"opencode": {
+                "provider": "zai",
+                "key_env": "ZAI_API_KEY",
+                "npm": "@ai-sdk/openai-compatible",
+            }}},
+            {"model": "glm-5.3"})
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory, \
+             mock.patch.dict(os.environ, {
+                 "ZAI_API_KEY": "real-zai-secret-must-stay-host-side"}):
+            environment = runtime._server_environment(
+                pathlib.Path(directory), "http://127.0.0.1:4321",
+                read_only=False, base_environment={"PATH": "/usr/bin"})
+        config = json.loads(environment["OPENCODE_CONFIG_CONTENT"])
+        provider = config["provider"]["zai"]
+        self.assertEqual(provider["npm"], "@ai-sdk/openai-compatible")
+        self.assertEqual(provider["options"], {
+            "baseURL": "http://127.0.0.1:4321",
+            "apiKey": DUMMY_TOKEN,
+        })
+        self.assertEqual(provider["models"], {"glm-5.3": {}})
+        self.assertEqual(environment["ZAI_API_KEY"], DUMMY_TOKEN)
+        self.assertNotIn("real-zai-secret-must-stay-host-side",
+                         json.dumps(environment))
+
+    def test_builtin_provider_configuration_remains_catalog_native(self):
+        runtime = OpenCodeRuntime(
+            {"runtimes": {"opencode": {
+                "provider": "zenmux", "key_env": "ZENMUX_API_KEY"}}},
+            {"model": "model-a"})
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            environment = runtime._server_environment(
+                pathlib.Path(directory), "http://127.0.0.1:4321",
+                read_only=False, base_environment={"PATH": "/usr/bin"})
+        provider = json.loads(
+            environment["OPENCODE_CONFIG_CONTENT"])["provider"]["zenmux"]
+        self.assertNotIn("npm", provider)
+        self.assertNotIn("apiKey", provider["options"])
 
     def test_completed_session_preserves_reasoning_calls_results_and_usage(self):
         messages, stats = self._parse(_completed_session())

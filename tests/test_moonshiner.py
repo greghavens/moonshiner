@@ -84,6 +84,56 @@ class FrontDoor(unittest.TestCase):
         self.assertEqual(runtime["thinking_format"], "zai")
         self.assertFalse(any("URL" in prompt for prompt in prompts))
 
+    def test_opencode_configures_each_zai_key_type_without_custom_questions(self):
+        endpoints = {
+            "standard": "https://api.z.ai/api/paas/v4",
+            "coding-plan": "https://api.z.ai/api/coding/paas/v4",
+        }
+        for key_type, endpoint in endpoints.items():
+            with self.subTest(key_type=key_type):
+                config = json.loads((_ROOT / "config.json").read_text())
+                updates = {}
+                prompts = []
+
+                def answer(prompt, default):
+                    prompts.append(prompt)
+                    return {
+                        "OpenCode API provider (openrouter, zenmux, or zai)":
+                            "zai",
+                        "Z.AI key type (standard or coding-plan)": key_type,
+                    }[prompt]
+
+                with mock.patch.object(m, "_ask", side_effect=answer), \
+                     mock.patch.object(
+                         configuration, "update_local",
+                         side_effect=lambda key, value: updates.__setitem__(
+                             key, value)):
+                    profile, runtime = m._configure_opencode_provider(config)
+
+                self.assertEqual(profile, "opencode")
+                self.assertEqual(runtime["provider"], "zai")
+                self.assertEqual(runtime["display_provider"], "Z.AI")
+                self.assertEqual(runtime["base_url"], endpoint)
+                self.assertEqual(runtime["key_env"], "ZAI_API_KEY")
+                self.assertEqual(runtime["npm"],
+                                 "@ai-sdk/openai-compatible")
+                self.assertEqual(updates["runtimes.opencode.base_url"], endpoint)
+                self.assertFalse(any("API base URL" in prompt
+                                     for prompt in prompts))
+
+    def test_opencode_builtin_provider_clears_custom_zai_package(self):
+        config = json.loads((_ROOT / "config.json").read_text())
+        config["runtimes"]["opencode"]["npm"] = (
+            "@ai-sdk/openai-compatible")
+        updates = {}
+        with mock.patch.object(m, "_ask", return_value="openrouter"), \
+             mock.patch.object(
+                 configuration, "update_local",
+                 side_effect=lambda key, value: updates.__setitem__(key, value)):
+            _, runtime = m._configure_opencode_provider(config)
+        self.assertIsNone(runtime["npm"])
+        self.assertIsNone(updates["runtimes.opencode.npm"])
+
     def test_reconfigure_infers_model_metadata_without_advanced_prompts(self):
         config = json.loads((_ROOT / "config.json").read_text())
         updates = {}

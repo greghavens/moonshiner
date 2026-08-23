@@ -186,9 +186,10 @@ def _provider_and_model(runtime: "OpenCodeRuntime") -> tuple[str, str]:
         raise RuntimeError("runtimes.opencode.provider is not configured")
     if not model:
         raise RuntimeError("OpenCode model is not configured")
-    if provider not in {"openrouter", "zenmux"}:
+    if provider not in {"openrouter", "zenmux", "zai"}:
         raise RuntimeError(
-            "OpenCode provider must be globally configured as openrouter or zenmux")
+            "OpenCode provider must be globally configured as openrouter, "
+            "zenmux, or zai")
     return provider, model
 
 
@@ -615,6 +616,19 @@ class OpenCodeRuntime(Runtime):
         # model IDs through the third-party models.dev catalog, which lags the
         # provider's live catalog and rejects a model the provider already
         # serves. The configured model is the authority here, not the catalog.
+        provider_options = {"baseURL": proxy_base_url}
+        provider_config = {
+            "options": provider_options,
+            "models": {model: {}},
+        }
+        # OpenRouter and ZenMux are built into the pinned OpenCode catalog.
+        # Z.AI is declared as OpenAI-compatible because this pinned harness can
+        # predate the provider's catalog entry. The genuine credential remains
+        # host-side: OpenCode sees only the loopback proxy's fixed dummy token.
+        provider_package = str(self.runtime_config.get("npm") or "").strip()
+        if provider_package:
+            provider_config["npm"] = provider_package
+            provider_options["apiKey"] = DUMMY_TOKEN
         config = {
             "$schema": "https://opencode.ai/config.json",
             "share": "disabled",
@@ -622,8 +636,7 @@ class OpenCodeRuntime(Runtime):
             "plugin": [],
             "instructions": [],
             "provider": {
-                provider: {"options": {"baseURL": proxy_base_url},
-                           "models": {model: {}}},
+                provider: provider_config,
             },
             "permission": {"external_directory": "deny"},
         }

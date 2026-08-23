@@ -352,11 +352,18 @@ def _configure_pi_provider(config: dict, current_runtime: str) -> tuple[str, dic
 def _configure_opencode_provider(config: dict) -> tuple[str, dict]:
     existing = config["runtimes"]["opencode"]
     provider = _ask(
-        "OpenCode API provider (openrouter or zenmux)",
+        "OpenCode API provider (openrouter, zenmux, or zai)",
         str(existing.get("provider") or "openrouter")).lower()
-    if provider not in {"openrouter", "zenmux"}:
-        raise SystemExit("OpenCode provider must be openrouter or zenmux")
-    preset = PROVIDER_PRESETS[provider]
+    if provider not in {"openrouter", "zenmux", "zai"}:
+        raise SystemExit("OpenCode provider must be openrouter, zenmux, or zai")
+    preset = dict(PROVIDER_PRESETS[provider])
+    if provider == "zai":
+        key_type = _ask("Z.AI key type (standard or coding-plan)",
+                        "coding-plan").lower()
+        if key_type not in {"standard", "coding-plan"}:
+            raise SystemExit("Z.AI key type must be standard or coding-plan")
+        if key_type == "coding-plan":
+            preset["base_url"] = "https://api.z.ai/api/coding/paas/v4"
     runtime_config = {
         **existing,
         "provider": provider,
@@ -364,6 +371,8 @@ def _configure_opencode_provider(config: dict) -> tuple[str, dict]:
         "base_url": preset["base_url"],
         "key_env": preset["key_env"],
     }
+    runtime_config["npm"] = (
+        "@ai-sdk/openai-compatible" if provider == "zai" else None)
     from configuration import update_local
     for key, value in runtime_config.items():
         update_local(f"runtimes.opencode.{key}", value)
