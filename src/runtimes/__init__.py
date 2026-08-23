@@ -14,6 +14,7 @@ __all__ = ["Runtime", "TraceResult", "ReviewResult", "REGISTRY",
            "get_runtime", "get_teacher", "get_judge", "get_seed_author",
            "get_seed_judge", "runtime_names", "source_runtime_names",
            "resolve_trace_harness", "trace_harness_alternatives",
+           "seed_harness_is_available",
            "NoCompatibleTraceHarness", "TraceHarnessInfrastructureFailure"]
 
 
@@ -89,6 +90,50 @@ def _capability_list(seed: dict, field: str) -> list[str]:
         raise TraceHarnessInfrastructureFailure(
             f"{field} must be a list of nonempty strings")
     return list(dict.fromkeys(value))
+
+
+def _harness_identity(name: str) -> str:
+    return "pi" if name.startswith("pi-") else name
+
+
+def _declared_harness(seed: dict) -> str | None:
+    value = seed.get("harness")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise TraceHarnessInfrastructureFailure(
+            "harness must be a nonempty runtime name")
+    return _harness_identity(value.strip())
+
+
+def _configured_harness_order(config: dict) -> list[str]:
+    order = (((config.get("pipeline") or {}).get("trace") or {})
+             .get("harness_order") or [])
+    if (not isinstance(order, list)
+            or any(not isinstance(name, str) or not name.strip()
+                   for name in order)):
+        raise TraceHarnessInfrastructureFailure(
+            "pipeline.trace.harness_order must be a list of nonempty strings")
+    return list(dict.fromkeys(order))
+
+
+def _configured_harness_names(config: dict, configured_teacher: Runtime) -> list[str]:
+    return list(dict.fromkeys(
+        [configured_teacher.name, *_configured_harness_order(config)]))
+
+
+def seed_harness_is_available(seed: dict, config: dict | None = None) -> bool:
+    """Whether an explicitly harness-bound seed belongs in this trace queue."""
+    config = config or CONFIG
+    declared = _declared_harness(seed)
+    if declared is None:
+        return True
+    configured = get_teacher(config)
+    runtime_config = config.get("runtimes") or {}
+    return any(
+        _harness_identity(name) == declared
+        and (name == configured.name or name in runtime_config)
+        for name in _configured_harness_names(config, configured))
 
 
 def _alternative_role(role: dict, name: str, runtime_config: dict) -> dict:
@@ -178,6 +223,34 @@ def resolve_trace_harness(seed: dict, configured_teacher: Runtime | None = None,
     configured_teacher = configured_teacher or get_teacher(config)
     required = _capability_list(seed, "required_harness_capabilities")
     preferred = _capability_list(seed, "preferred_harness_capabilities")
+    declared = _declared_harness(seed)
+
+    if declared is not None:
+        configured_runtimes = config.get("runtimes") or {}
+        required_set = set(required)
+        for name in _configured_harness_names(config, configured_teacher):
+            if _harness_identity(name) != declared or name not in configured_runtimes:
+                continue
+            role = ({**configured_teacher.role}
+                    if name == configured_teacher.name
+                    else _alternative_role(configured_teacher.role, name,
+                                           configured_runtimes[name] or {}))
+            candidate_config = {
+                **config, "teacher": {**role, "runtime": name}}
+            try:
+                candidate = get_runtime("teacher", candidate_config)
+                candidate.preflight(require_auth=False)
+            except (SystemExit, Exception):
+                continue
+            provided = _provided_capabilities(candidate)
+            if not required_set <= provided:
+                continue
+            _authenticated_preflight(candidate)
+            return candidate, _resolution(
+                candidate, "declared_harness", required, preferred, provided)
+        raise NoCompatibleTraceHarness(
+            f"seed requires trace harness {declared!r}, but it is not an "
+            "available configured harness")
 
     if not required and not preferred:
         _authenticated_preflight(configured_teacher)
@@ -186,14 +259,8 @@ def resolve_trace_harness(seed: dict, configured_teacher: Runtime | None = None,
             configured_teacher, "configured_default", required, preferred, provided)
 
     configured_runtimes = config.get("runtimes") or {}
-    order_value = (((config.get("pipeline") or {}).get("trace") or {})
-                   .get("harness_order") or [])
-    if (not isinstance(order_value, list)
-            or any(not isinstance(name, str) or not name.strip()
-                   for name in order_value)):
-        raise TraceHarnessInfrastructureFailure(
-            "pipeline.trace.harness_order must be a list of nonempty strings")
-    order = list(dict.fromkeys(order_value)) or [configured_teacher.name]
+    order_value = _configured_harness_order(config)
+    order = order_value or [configured_teacher.name]
 
     candidates: list[tuple[int, int, Runtime, frozenset[str]]] = []
     required_set = set(required)

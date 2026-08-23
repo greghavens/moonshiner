@@ -191,7 +191,14 @@ def declared_powershell_modules(seed: dict) -> list[tuple[str, str]]:
 def missing_executables(detail: str) -> list[str]:
     found: list[str] = []
     for pattern in MISSING_EXECUTABLES:
-        found.extend(Path(value).name for value in pattern.findall(detail or ""))
+        for value in pattern.findall(detail or ""):
+            # A verifier's intentionally failing baseline often reports its
+            # absent output artifact with the same ENOENT text Python uses for
+            # a missing subprocess executable. Paths name seed data, not a
+            # host toolchain Moonshiner should try to install.
+            if "/" in value or "\\" in value:
+                continue
+            found.append(Path(value).name)
     return list(dict.fromkeys(found))
 
 

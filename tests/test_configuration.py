@@ -143,6 +143,20 @@ class SafeSelection(unittest.TestCase):
         self.assertNotIn("kind", load.call_args.kwargs)
         self.assertNotIn("require_authored", load.call_args.kwargs)
 
+    @mock.patch.object(trace_pipeline, "select_seeds")
+    @mock.patch("import_existing.imported_task_ids", return_value=set())
+    def test_queue_excludes_seeds_bound_to_an_unavailable_harness(
+            self, _imported, load):
+        load.return_value = [
+            {"id": "pi-only", "harness": "pi"},
+            {"id": "portable"},
+        ]
+        with mock.patch.object(
+                trace_pipeline, "seed_harness_is_available",
+                side_effect=lambda seed, _config: "harness" not in seed):
+            selected = trace_pipeline._selected(self._args(all=True))
+        self.assertEqual([seed["id"] for seed in selected], ["portable"])
+
 
 if __name__ == "__main__":
     unittest.main()

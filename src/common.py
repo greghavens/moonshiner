@@ -288,6 +288,46 @@ def quarantined_trajectories(directory: Path | None = None) -> set[str]:
 # --------------------------------------------------------------------------- #
 # Seeds                                                                        #
 # --------------------------------------------------------------------------- #
+def _catalog_seed_ranks(catalog: dict) -> tuple[dict[str, tuple[int, int]],
+                                                 dict[str, dict]]:
+    """Rank programs by priority while round-robining their categories.
+
+    Catalog categories are intentionally stable, but consuming one complete
+    category before the next front-loads whichever stress suite sorts first.
+    Interleaving categories keeps the declared program priority while making a
+    long-running trace queue representative from its first handful of seeds.
+    """
+    programs = catalog.get("programs") or {}
+    categories = catalog.get("categories") or {}
+    program_position = {name: position
+                        for position, name in enumerate(programs)}
+    catalog_items: dict[str, dict] = {}
+    grouped: dict[object, dict[str, list[dict]]] = {}
+    for category, items in categories.items():
+        for item in items:
+            catalog_items[item["id"]] = item
+            program = item.get("program")
+            grouped.setdefault(program, {}).setdefault(category, []).append(item)
+
+    def program_rank(name: object) -> tuple[int, int, str]:
+        metadata = programs.get(name, {}) if isinstance(name, str) else {}
+        return (int(metadata.get("priority", 1_000_000)),
+                program_position.get(name, 1_000_000), str(name))
+
+    rank: dict[str, tuple[int, int]] = {}
+    position = 0
+    for program in sorted(grouped, key=program_rank):
+        priority = program_rank(program)[0]
+        queues = list(grouped[program].values())
+        for offset in range(max((len(queue) for queue in queues), default=0)):
+            for queue in queues:
+                if offset >= len(queue):
+                    continue
+                rank[queue[offset]["id"]] = (priority, position)
+                position += 1
+    return rank, catalog_items
+
+
 def load_seeds(only: set[str] | None = None, include_holdout: bool = False) -> list[dict]:
     """Load every authored seed in catalog priority order.
 
@@ -315,17 +355,7 @@ def load_seeds(only: set[str] | None = None, include_holdout: bool = False) -> l
                     else ROOT / "SEED_CATALOG.json")
     try:
         catalog = json.loads(catalog_path.read_text())
-        programs = catalog.get("programs") or {}
-        catalog_items = {
-            item["id"]: item
-            for items in (catalog.get("categories") or {}).values()
-            for item in items
-        }
-        rank = {item["id"]: (int(programs.get(item.get("program"), {}).get(
-                    "priority", 1_000_000)), position)
-                for position, item in enumerate(
-                    entry for items in (catalog.get("categories") or {}).values()
-                    for entry in items)}
+        rank, catalog_items = _catalog_seed_ranks(catalog)
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         rank, catalog_items = {}, {}
     for seed in seeds:

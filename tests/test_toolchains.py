@@ -31,6 +31,15 @@ class DeclaredPowerShellRequirements(unittest.TestCase):
         self.assertIn("no Moonshiner toolchain package mapping", detail)
         self.assertIn("unknown-seed-tool", detail)
 
+    def test_missing_output_artifact_is_not_a_missing_executable(self):
+        detail = ("FAIL: [Errno 2] No such file or directory: "
+                  "'/workspace/lookup-call.json'")
+        self.assertEqual(toolchains.missing_executables(detail), [])
+        executable = ("[Errno 2] No such file or directory: "
+                      "'unknown-seed-tool'")
+        self.assertEqual(toolchains.missing_executables(executable),
+                         ["unknown-seed-tool"])
+
     def test_normalizes_all_seed_module_shapes_to_exact_versions(self):
         seeds = [
             {"prerequisites": {

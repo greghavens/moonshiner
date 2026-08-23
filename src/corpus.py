@@ -58,7 +58,7 @@ def catalog(seed_dir: Path = SEEDS_DIR) -> tuple[str, dict]:
                 "category": task.get("category") or "uncategorized",
                 "training_tags": task.get("training_tags") or task.get("tags") or [],
                 "summary": summary, "verify_command": task.get("verify_cmd")}
-        for field in ("required_harness_capabilities",
+        for field in ("harness", "required_harness_capabilities",
                       "preferred_harness_capabilities"):
             if field in task:
                 item[field] = task[field]

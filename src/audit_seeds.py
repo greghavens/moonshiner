@@ -56,6 +56,7 @@ PATCH_EXEMPT = PILOT_EXEMPT | set(CONFIG.get("holdout_tasks", []))
 SEED_ENTRIES = {"task.json", "files", "reference_fix.patch"}
 CAPABILITY_FIELDS = ("required_harness_capabilities",
                      "preferred_harness_capabilities")
+TRACE_HARNESSES = frozenset({"claude-code", "codex", "opencode", "pi", "vllm"})
 
 
 def check(directory: Path, worlds: dict | None = None) -> str | None:
@@ -74,6 +75,11 @@ def check(directory: Path, worlds: dict | None = None) -> str | None:
         return f"task.json invalid: {error}"
     if FORBIDDEN_BENCHMARK in serialized.casefold():
         return "contains a forbidden benchmark name"
+    if ("harness" in task
+            and (not isinstance(task["harness"], str)
+                 or task["harness"] not in TRACE_HARNESSES)):
+        return ("task.json harness must name one of: "
+                + ", ".join(sorted(TRACE_HARNESSES)))
     for field in CAPABILITY_FIELDS:
         if field not in task:
             continue

@@ -23,7 +23,8 @@ from run_state import (connect, create_run, finish_attempt, set_job,
                        abandon_claim, claim_job, renew_lease, record_model_call)
 from runtimes import (NoCompatibleTraceHarness,
                       TraceHarnessInfrastructureFailure, get_judge,
-                      get_teacher, resolve_trace_harness)
+                      get_teacher, resolve_trace_harness,
+                      seed_harness_is_available)
 from runtimes.availability import (INFRASTRUCTURE_EXIT, USAGE_LIMIT_EXIT,
                                    ModelUnavailable)
 from screen_traces import (JUDGE_ERROR_LIMIT, feedback_from_review, screen,
@@ -144,6 +145,7 @@ def _selected(args) -> list[dict]:
 
     seeds = [seed for seed in selected
              if synthetic_tool_contract(seed) is None
+             and seed_harness_is_available(seed, CONFIG)
              and seed["id"] not in accepted
              and seed["id"] not in blocked
              and has_remaining(seed["id"])]

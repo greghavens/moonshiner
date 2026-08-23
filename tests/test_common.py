@@ -92,6 +92,40 @@ class LoadSeeds(unittest.TestCase):
         self.assertEqual([seed["id"] for seed in ordered],
                          ["repo-seed", "behavior-first"])
 
+    def test_loader_interleaves_categories_within_each_program(self):
+        with tempfile.TemporaryDirectory() as directory:
+            corpus = pathlib.Path(directory) / "corpus"
+            seeds = corpus / "tasks" / "seeds"
+            for seed_id, category in (
+                    ("format-1", "format"), ("format-2", "format"),
+                    ("context-1", "context"), ("context-2", "context"),
+                    ("build-1", "build")):
+                (seeds / seed_id).mkdir(parents=True)
+                (seeds / seed_id / "task.json").write_text(json.dumps({
+                    "id": seed_id, "category": category}))
+            (corpus / "SEED_CATALOG.json").write_text(json.dumps({
+                "programs": {
+                    "Instruction": {"priority": 1},
+                    "Building": {"priority": 2},
+                },
+                "categories": {
+                    "format": [
+                        {"id": "format-1", "program": "Instruction"},
+                        {"id": "format-2", "program": "Instruction"},
+                    ],
+                    "context": [
+                        {"id": "context-1", "program": "Instruction"},
+                        {"id": "context-2", "program": "Instruction"},
+                    ],
+                    "build": [
+                        {"id": "build-1", "program": "Building"}],
+                },
+            }))
+            with mock.patch.object(common, "SEEDS_DIR", seeds):
+                ordered = common.load_seeds(include_holdout=True)
+        self.assertEqual([seed["id"] for seed in ordered], [
+            "format-1", "context-1", "format-2", "context-2", "build-1"])
+
     def test_one_loader_contains_every_seed_once_in_catalog_priority(self):
         self.assertFalse(hasattr(common, "load_behavior_seeds"))
         self.assertFalse(hasattr(common, "BEHAVIOR_SEEDS_DIR"))
@@ -316,4 +350,3 @@ class VerifyCommandExecution(unittest.TestCase):
     def test_unbalanced_quoting_is_left_for_the_shell_to_report(self):
         self.assertEqual(common.verify_argv('echo "unclosed'),
                          ["/bin/sh", "-c", 'echo "unclosed'])
-

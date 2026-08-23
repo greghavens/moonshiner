@@ -268,6 +268,30 @@ class CapabilityResolverContract(unittest.TestCase):
         self.assertEqual(selected.role["model"], "same-model")
         self.assertEqual(resolution["model"], "same-model")
 
+    def test_declared_harness_identity_routes_only_to_that_harness(self):
+        config = self.config([HarnessC.name, HarnessB.name])
+        seed = {"id": "declared", "harness": HarnessB.name,
+                "required_harness_capabilities": ["workspace_write"],
+                "preferred_harness_capabilities": ["multi_turn"]}
+        self.assertTrue(runtimes.seed_harness_is_available(seed, config))
+        selected, resolution = self.resolve(seed, config)
+        self.assertEqual(selected.name, HarnessB.name)
+        self.assertEqual(resolution["mode"], "declared_harness")
+
+    def test_unavailable_declared_harness_is_excluded_before_paid_work(self):
+        config = self.config([HarnessB.name])
+        seed = {"id": "declared", "harness": HarnessC.name}
+        self.assertFalse(runtimes.seed_harness_is_available(seed, config))
+        with self.assertRaisesRegex(
+                runtimes.NoCompatibleTraceHarness, "requires trace harness"):
+            self.resolve(seed, config)
+
+        missing_runtime = self.config([HarnessB.name])
+        del missing_runtime["runtimes"][HarnessB.name]
+        self.assertFalse(runtimes.seed_harness_is_available(
+            {"id": "missing-runtime", "harness": HarnessB.name},
+            missing_runtime))
+
     def test_non_capability_identity_never_changes_selection(self):
         config = self.config([HarnessC.name, HarnessB.name])
         base = {
@@ -530,10 +554,11 @@ class CatalogAndConfigurationContract(unittest.TestCase):
         (directory / "task.json").write_text(json.dumps(task))
         return directory
 
-    def test_catalog_preserves_only_explicit_capability_lists(self):
+    def test_catalog_preserves_explicit_harness_and_capability_metadata(self):
         seeds = self.root / "tasks" / "seeds"
         explicit = {
             "id": "explicit", "category": "Building", "prompt": "do it",
+            "harness": "pi",
             "required_harness_capabilities": ["workspace_write"],
             "preferred_harness_capabilities": ["multi_turn"],
         }
@@ -547,6 +572,8 @@ class CatalogAndConfigurationContract(unittest.TestCase):
                          ["workspace_write"])
         self.assertEqual(items["explicit"]["preferred_harness_capabilities"],
                          ["multi_turn"])
+        self.assertEqual(items["explicit"]["harness"], "pi")
+        self.assertNotIn("harness", items["legacy"])
         self.assertNotIn("required_harness_capabilities", items["legacy"])
         self.assertNotIn("preferred_harness_capabilities", items["legacy"])
 
@@ -568,6 +595,27 @@ class CatalogAndConfigurationContract(unittest.TestCase):
         })
         self.assertIn("preferred_harness_capabilities",
                       audit_seeds.check(invalid_entry))
+
+    def test_corpus_audit_rejects_invalid_harness_identity(self):
+        valid = self._complete_seed({
+            "id": "valid-harness", "category": "Building",
+            "prompt": "do it", "harness": "opencode"})
+        self.assertIsNone(audit_seeds.check(valid))
+        invalid = self._complete_seed({
+            "id": "invalid-harness", "category": "Building",
+            "prompt": "do it", "harness": "imaginary"})
+        self.assertIn("task.json harness", audit_seeds.check(invalid))
+
+    def test_shipped_pi_named_prompts_are_declared_pi_harness_seeds(self):
+        missing = []
+        for task_path in sorted((ROOT / "tasks" / "seeds").glob("*/task.json")):
+            task = json.loads(task_path.read_text())
+            if re.search(
+                    r"\bPi(?:['\u2019]s|\s+(?:shell|Bash|bash|native|executable|tool|`bash`))",
+                    str(task.get("prompt") or "")) \
+                    and task.get("harness") != "pi":
+                missing.append(task["id"])
+        self.assertEqual(missing, [])
 
     def test_shipped_harness_order_defaults_to_empty_list(self):
         config = json.loads((ROOT / "config.json").read_text())
