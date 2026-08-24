@@ -14,12 +14,12 @@ __all__ = ["Runtime", "TraceResult", "ReviewResult", "REGISTRY",
            "get_runtime", "get_teacher", "get_judge", "get_seed_author",
            "get_seed_judge", "runtime_names", "source_runtime_names",
            "resolve_trace_harness", "trace_harness_alternatives",
-           "seed_harness_is_available",
+           "seed_reasoning_is_available",
            "NoCompatibleTraceHarness", "TraceHarnessInfrastructureFailure"]
 
 
 class NoCompatibleTraceHarness(RuntimeError):
-    """No installed, configured trace harness provides required capabilities."""
+    """No installed, configured trace harness captures reasoning when required."""
 
 
 class TraceHarnessInfrastructureFailure(RuntimeError):
@@ -83,27 +83,21 @@ def get_seed_judge(config: dict | None = None) -> Runtime:
     return get_runtime("seed_judge", config)
 
 
-def _capability_list(seed: dict, field: str) -> list[str]:
-    value = seed.get(field) or []
-    if not isinstance(value, list) or any(
-            not isinstance(item, str) or not item.strip() for item in value):
+def _requires_reasoning(seed: dict) -> bool:
+    """Return whether this seed requires a trace containing reasoning."""
+    if "harness" in seed:
         raise TraceHarnessInfrastructureFailure(
-            f"{field} must be a list of nonempty strings")
-    return list(dict.fromkeys(value))
-
-
-def _harness_identity(name: str) -> str:
-    return "pi" if name.startswith("pi-") else name
-
-
-def _declared_harness(seed: dict) -> str | None:
-    value = seed.get("harness")
-    if value is None:
-        return None
-    if not isinstance(value, str) or not value.strip():
+            "seed harness bindings are forbidden; traces use the configured teacher")
+    for removed in ("required_harness_capabilities",
+                    "preferred_harness_capabilities"):
+        if removed in seed:
+            raise TraceHarnessInfrastructureFailure(
+                f"removed seed field {removed} is forbidden")
+    value = seed.get("requires_reasoning", False)
+    if not isinstance(value, bool):
         raise TraceHarnessInfrastructureFailure(
-            "harness must be a nonempty runtime name")
-    return _harness_identity(value.strip())
+            "seed requires_reasoning must be true or false")
+    return value
 
 
 def _configured_harness_order(config: dict) -> list[str]:
@@ -122,18 +116,27 @@ def _configured_harness_names(config: dict, configured_teacher: Runtime) -> list
         [configured_teacher.name, *_configured_harness_order(config)]))
 
 
-def seed_harness_is_available(seed: dict, config: dict | None = None) -> bool:
-    """Whether an explicitly harness-bound seed belongs in this trace queue."""
+def seed_reasoning_is_available(seed: dict, config: dict | None = None) -> bool:
+    """Whether this queue can satisfy a seed's captured-reasoning requirement."""
     config = config or CONFIG
-    declared = _declared_harness(seed)
-    if declared is None:
+    if not _requires_reasoning(seed):
         return True
     configured = get_teacher(config)
-    runtime_config = config.get("runtimes") or {}
-    return any(
-        _harness_identity(name) == declared
-        and (name == configured.name or name in runtime_config)
-        for name in _configured_harness_names(config, configured))
+    runtimes = config.get("runtimes") or {}
+    for name in _configured_harness_names(config, configured):
+        if name not in runtimes:
+            continue
+        role = ({**configured.role} if name == configured.name
+                else _alternative_role(configured.role, name, runtimes[name] or {}))
+        try:
+            candidate = get_runtime(
+                "teacher", {**config, "teacher": {**role, "runtime": name}})
+            candidate.preflight(require_auth=False)
+        except (SystemExit, Exception):
+            continue
+        if _captures_reasoning(candidate):
+            return True
+    return False
 
 
 def _alternative_role(role: dict, name: str, runtime_config: dict) -> dict:
@@ -142,8 +145,8 @@ def _alternative_role(role: dict, name: str, runtime_config: dict) -> dict:
     Model identifiers are provider-scoped: one model is ``claude-fable-5`` to
     Claude Code and ``anthropic/claude-fable-5`` to ZenMux. Handing an
     alternative harness the configured teacher's spelling asks it for a model
-    its provider has never heard of, so a harness eligible for capability
-    selection names its own model in its own runtime block.
+    its provider has never heard of, so a reasoning-capturing alternative names
+    its own model in its own runtime block.
     """
     alternative = {**role, "runtime": name}
     for field, override in (("model", "trace_model"),
@@ -155,12 +158,11 @@ def _alternative_role(role: dict, name: str, runtime_config: dict) -> dict:
 
 
 def trace_harness_alternatives(config: dict | None = None) -> list[Runtime]:
-    """Harnesses ``pipeline.trace.harness_order`` may route a seed to.
+    """Alternative harnesses that can capture reasoning when a seed requires it.
 
-    Capability selection deliberately authenticates a harness only after
-    choosing it, where a failure is terminal and stops the run. That leaves no
-    earlier moment to notice an alternative harness has no credential, so
-    ``doctor`` walks this list to raise the alarm before a seed is at stake.
+    Selection deliberately authenticates an alternative only after choosing
+    it, where a failure is terminal and stops the run. ``doctor`` walks this
+    list to raise the alarm before a seed is at stake.
     """
     config = config or CONFIG
     runtimes = config.get("runtimes") or {}
@@ -179,20 +181,24 @@ def trace_harness_alternatives(config: dict | None = None) -> list[Runtime]:
             continue
         role = _alternative_role(configured.role, name, runtimes[name] or {})
         try:
-            found.append(get_runtime(
-                "teacher", {**config, "teacher": {**role, "runtime": name}}))
+            candidate = get_runtime(
+                "teacher", {**config, "teacher": {**role, "runtime": name}})
         except (SystemExit, Exception):
             continue
+        if _captures_reasoning(candidate):
+            found.append(candidate)
     return found
 
 
-def _provided_capabilities(runtime: Runtime) -> frozenset[str]:
-    try:
-        return frozenset(runtime.trace_capabilities())
-    except (AttributeError, TypeError):
-        # Preserve compatibility with lightweight Runtime stand-ins used by
-        # callers that do not opt into capability-aware selection.
-        return frozenset()
+def _captures_reasoning(runtime: Runtime) -> bool:
+    method = getattr(type(runtime), "captures_reasoning", None)
+    if method is None:
+        return False
+    value = method(runtime)
+    if not isinstance(value, bool):
+        raise TraceHarnessInfrastructureFailure(
+            f"trace harness {runtime.name!r} captures_reasoning must be boolean")
+    return value
 
 
 def _authenticated_preflight(runtime: Runtime) -> None:
@@ -203,73 +209,34 @@ def _authenticated_preflight(runtime: Runtime) -> None:
             f"selected trace harness {runtime.name!r} is unavailable: {error}") from error
 
 
-def _resolution(runtime: Runtime, mode: str, required: list[str],
-                preferred: list[str], provided: frozenset[str]) -> dict:
+def _resolution(runtime: Runtime, mode: str, requires_reasoning: bool,
+                captures_reasoning: bool) -> dict:
     return {
         "mode": mode,
         "runtime": runtime.name,
         "model": runtime.role.get("model"),
-        "required": required,
-        "preferred": preferred,
-        "provided": sorted(provided),
-        "matched_preferred": [name for name in preferred if name in provided],
+        "requires_reasoning": requires_reasoning,
+        "captures_reasoning": captures_reasoning,
     }
 
 
 def resolve_trace_harness(seed: dict, configured_teacher: Runtime | None = None,
                           config: dict | None = None) -> tuple[Runtime, dict]:
-    """Resolve one installed native harness using only explicit capabilities."""
+    """Use the configured teacher unless the seed requires captured reasoning."""
     config = config or (configured_teacher.config if configured_teacher else CONFIG)
     configured_teacher = configured_teacher or get_teacher(config)
-    required = _capability_list(seed, "required_harness_capabilities")
-    preferred = _capability_list(seed, "preferred_harness_capabilities")
-    declared = _declared_harness(seed)
+    requires_reasoning = _requires_reasoning(seed)
 
-    if declared is not None:
-        configured_runtimes = config.get("runtimes") or {}
-        required_set = set(required)
-        for name in _configured_harness_names(config, configured_teacher):
-            if _harness_identity(name) != declared or name not in configured_runtimes:
-                continue
-            role = ({**configured_teacher.role}
-                    if name == configured_teacher.name
-                    else _alternative_role(configured_teacher.role, name,
-                                           configured_runtimes[name] or {}))
-            candidate_config = {
-                **config, "teacher": {**role, "runtime": name}}
-            try:
-                candidate = get_runtime("teacher", candidate_config)
-                candidate.preflight(require_auth=False)
-            except (SystemExit, Exception):
-                continue
-            provided = _provided_capabilities(candidate)
-            if not required_set <= provided:
-                continue
-            _authenticated_preflight(candidate)
-            return candidate, _resolution(
-                candidate, "declared_harness", required, preferred, provided)
-        raise NoCompatibleTraceHarness(
-            f"seed requires trace harness {declared!r}, but it is not an "
-            "available configured harness")
-
-    if not required and not preferred:
+    if not requires_reasoning:
         _authenticated_preflight(configured_teacher)
-        provided = _provided_capabilities(configured_teacher)
         return configured_teacher, _resolution(
-            configured_teacher, "configured_default", required, preferred, provided)
+            configured_teacher, "configured_default", False,
+            _captures_reasoning(configured_teacher))
 
     configured_runtimes = config.get("runtimes") or {}
-    order_value = _configured_harness_order(config)
-    order = order_value or [configured_teacher.name]
-
-    candidates: list[tuple[int, int, Runtime, frozenset[str]]] = []
-    required_set = set(required)
-    preferred_set = set(preferred)
-    for position, name in enumerate(order):
+    for name in _configured_harness_names(config, configured_teacher):
         if name not in configured_runtimes:
             continue
-        # The configured teacher already states its own model; only a harness
-        # standing in for it needs the per-runtime spelling.
         role = ({**configured_teacher.role} if name == configured_teacher.name
                 else _alternative_role(configured_teacher.role, name,
                                        configured_runtimes[name] or {}))
@@ -279,22 +246,13 @@ def resolve_trace_harness(seed: dict, configured_teacher: Runtime | None = None,
             candidate.preflight(require_auth=False)
         except (SystemExit, Exception):
             continue
-        provided = _provided_capabilities(candidate)
-        if not required_set <= provided:
+        captures_reasoning = _captures_reasoning(candidate)
+        if not captures_reasoning:
             continue
-        candidates.append((len(preferred_set & provided), position,
-                           candidate, provided))
+        _authenticated_preflight(candidate)
+        return candidate, _resolution(
+            candidate, "reasoning_required", True, captures_reasoning)
 
-    if not candidates:
-        required_text = ", ".join(required) or "(none)"
-        raise NoCompatibleTraceHarness(
-            f"no installed configured trace harness provides all required "
-            f"capabilities: {required_text}")
-
-    _, _, selected, provided = min(
-        candidates, key=lambda item: (-item[0], item[1]))
-    # Once chosen, an authentication/configuration failure is terminal. Never
-    # try another harness after selecting the paid-call path.
-    _authenticated_preflight(selected)
-    return selected, _resolution(
-        selected, "capability_match", required, preferred, provided)
+    raise NoCompatibleTraceHarness(
+        "seed requires captured reasoning, but no installed configured trace "
+        "harness provides it")

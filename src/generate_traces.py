@@ -55,7 +55,7 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
                attempts: int = 1, feedback: str | None = None,
                reasoning_stage: str | None = None,
                traces_root: Path | None = None,
-               capability_resolution: dict | None = None) -> dict:
+               reasoning_resolution: dict | None = None) -> dict:
     """Generate (and verify) one trace for ``seed``; return its meta record."""
     traces_root = traces_root or TRACES
     raw_dir = traces_root / "raw"
@@ -70,8 +70,8 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
             return existing
 
     teacher = teacher or get_teacher()
-    if capability_resolution is None:
-        teacher, capability_resolution = resolve_trace_harness(
+    if reasoning_resolution is None:
+        teacher, reasoning_resolution = resolve_trace_harness(
             seed, configured_teacher=teacher)
     prompt, interaction = _trace_turns(seed)
 
@@ -111,7 +111,7 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
             if not blocked:
                 continue
             record = _deferral(seed, prompt, teacher, kind, terminal,
-                               result.error or fallback, capability_resolution)
+                               result.error or fallback, reasoning_resolution)
             _write_meta(meta_path, record)
             record["_workspace_path"] = str(workspace)
             return record
@@ -181,7 +181,7 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
                 "error": result.error,
                 "provenance": {
                     **result.provenance,
-                    "capability_resolution": capability_resolution,
+                    "reasoning_resolution": reasoning_resolution,
                     "task_environment": task_environment_provenance,
                 },
             },
@@ -197,7 +197,7 @@ def trace_task(seed: dict, teacher=None, *, force: bool = False,
 
 
 def _deferral(seed: dict, prompt: str, teacher, kind: str, terminal: bool,
-              detail: str, capability_resolution: dict) -> dict:
+              detail: str, reasoning_resolution: dict) -> dict:
     return {
         "id": seed["id"],
         "passed": None,
@@ -210,7 +210,7 @@ def _deferral(seed: dict, prompt: str, teacher, kind: str, terminal: bool,
         "teacher": {"runtime": teacher.name, "model": teacher.role["model"],
                     "reasoning": teacher.role.get("reasoning"),
                     "provenance": {
-                        "capability_resolution": capability_resolution}},
+                        "reasoning_resolution": reasoning_resolution}},
     }
 
 

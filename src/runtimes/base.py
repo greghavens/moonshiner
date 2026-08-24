@@ -474,9 +474,9 @@ class Runtime(abc.ABC):
                    if profile.get("id") == self.role.get("model") else [])
         return matches(str(self.role.get("model") or ""), observed, aliases)
 
-    def trace_capabilities(self) -> frozenset[str]:
-        """Capabilities genuinely provided by this native trace adapter."""
-        return frozenset()
+    def captures_reasoning(self) -> bool:
+        """Whether this native adapter preserves model reasoning in traces."""
+        return False
 
     def trace_probe_command(self) -> list[str]:
         """Return the native executable probe used before an OCI paid call."""

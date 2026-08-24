@@ -55,8 +55,8 @@ class PiRuntime(Runtime):
     name = "pi"
     trace_formats = ("pi-coding-agent-json-v3",)
 
-    def trace_capabilities(self) -> frozenset[str]:
-        return frozenset({"workspace_write", "multi_turn"})
+    def captures_reasoning(self) -> bool:
+        return True
 
     @staticmethod
     def _managed_cli() -> Path:

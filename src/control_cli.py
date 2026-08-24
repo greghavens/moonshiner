@@ -184,10 +184,9 @@ def doctor_main(argv: list[str] | None = None) -> int:
                            "detail": f"{runtime.name}/{runtime.role['model']} ready"})
         except BaseException as error:  # adapters commonly raise SystemExit
             checks.append({"check": role, "ok": False, "detail": str(error)})
-    # A seed declaring capabilities can be routed to a harness that is neither
-    # the author nor the judge. Those are authenticated only once selected,
-    # mid-run, where the failure is terminal and stops the queue — so check
-    # them here too, while nothing is at stake.
+    # A reasoning-required seed can be routed to a reasoning-capturing harness
+    # that is neither the author nor the judge. Check those alternatives before
+    # a run so an authentication failure cannot stop the queue mid-seed.
     for runtime in trace_harness_alternatives():
         check = f"trace harness {runtime.name}"
         try:

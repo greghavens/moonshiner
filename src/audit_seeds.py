@@ -54,9 +54,7 @@ PILOT_EXEMPT = {"py-lru-eviction", "py-config-merge", "go-worker-pool",
                 "ts-pagination"}
 PATCH_EXEMPT = PILOT_EXEMPT | set(CONFIG.get("holdout_tasks", []))
 SEED_ENTRIES = {"task.json", "files", "reference_fix.patch"}
-CAPABILITY_FIELDS = ("required_harness_capabilities",
-                     "preferred_harness_capabilities")
-TRACE_HARNESSES = frozenset({"claude-code", "codex", "opencode", "pi", "vllm"})
+REASONING_FIELD = "requires_reasoning"
 
 
 def check(directory: Path, worlds: dict | None = None) -> str | None:
@@ -75,19 +73,14 @@ def check(directory: Path, worlds: dict | None = None) -> str | None:
         return f"task.json invalid: {error}"
     if FORBIDDEN_BENCHMARK in serialized.casefold():
         return "contains a forbidden benchmark name"
-    if ("harness" in task
-            and (not isinstance(task["harness"], str)
-                 or task["harness"] not in TRACE_HARNESSES)):
-        return ("task.json harness must name one of: "
-                + ", ".join(sorted(TRACE_HARNESSES)))
-    for field in CAPABILITY_FIELDS:
-        if field not in task:
-            continue
-        value = task[field]
-        if (not isinstance(value, list)
-                or any(not isinstance(item, str) or not item.strip()
-                       for item in value)):
-            return f"task.json {field} must be a list of nonempty strings"
+    if "harness" in task:
+        return "task.json harness is forbidden; traces use the configured teacher"
+    for removed in ("required_harness_capabilities",
+                    "preferred_harness_capabilities"):
+        if removed in task:
+            return f"task.json removed field {removed} is forbidden"
+    if REASONING_FIELD in task and not isinstance(task[REASONING_FIELD], bool):
+        return f"task.json {REASONING_FIELD} must be true or false"
     from task_environment import (environment_spec,
                                   validate_environment_spec)
     task["_dir"] = directory

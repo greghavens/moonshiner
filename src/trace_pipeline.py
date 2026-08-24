@@ -24,7 +24,7 @@ from run_state import (connect, create_run, finish_attempt, set_job,
 from runtimes import (NoCompatibleTraceHarness,
                       TraceHarnessInfrastructureFailure, get_judge,
                       get_teacher, resolve_trace_harness,
-                      seed_harness_is_available)
+                      seed_reasoning_is_available)
 from runtimes.availability import (INFRASTRUCTURE_EXIT, USAGE_LIMIT_EXIT,
                                    ModelUnavailable)
 from screen_traces import (JUDGE_ERROR_LIMIT, feedback_from_review, screen,
@@ -145,7 +145,7 @@ def _selected(args) -> list[dict]:
 
     seeds = [seed for seed in selected
              if synthetic_tool_contract(seed) is None
-             and seed_harness_is_available(seed, CONFIG)
+             and seed_reasoning_is_available(seed, CONFIG)
              and seed["id"] not in accepted
              and seed["id"] not in blocked
              and has_remaining(seed["id"])]
@@ -423,7 +423,7 @@ def main(argv: list[str] | None = None) -> int:
 
     def process_claim(worker_db, owner: str, claim: dict, worker_teacher, worker_judge):
         seed = seed_by_id[claim["seed_id"]]
-        selected_teacher, capability_resolution = resolve_trace_harness(
+        selected_teacher, reasoning_resolution = resolve_trace_harness(
             seed, configured_teacher=worker_teacher)
         if not skip_judging:
             worker_judge.preflight(require_auth=True)
@@ -486,7 +486,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[{seed['id']}] attempt {number} ({stage}): author", flush=True)
             record = trace_task(seed, attempt_teacher, force=True,
                                 reasoning_stage=stage,
-                                capability_resolution=capability_resolution)
+                                reasoning_resolution=reasoning_resolution)
         usage = (record.get("teacher") or {}).get("usage") or {}
         # A deferral produced no candidate at all, so there is nothing for the
         # judge to read: `screen` would go looking for a raw trace that was

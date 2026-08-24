@@ -178,15 +178,12 @@ class OpenCodeStructuredSession(unittest.TestCase):
             path.write_text(json.dumps(session))
             return OpenCodeRuntime.parse_stream(path, None)
 
-    def test_pinned_runtime_and_genuine_capabilities_are_explicit(self):
+    def test_pinned_runtime_and_reasoning_capture_are_explicit(self):
         self.assertEqual(OPENCODE_RUNTIME_VERSION, "1.18.18")
         runtime = OpenCodeRuntime(
             {"runtimes": {"opencode": {"runtime_version": "1.18.18"}}},
             {"model": "model-a"})
-        self.assertEqual(
-            runtime.trace_capabilities(),
-            frozenset({"workspace_write", "multi_turn",
-                       "reasoning_capture", "tool_schema_capture"}))
+        self.assertIs(runtime.captures_reasoning(), True)
 
     def test_prompt_is_one_byte_identical_text_part(self):
         prompt = "\ufeffLine one\r\nLine two\n\x00tail"

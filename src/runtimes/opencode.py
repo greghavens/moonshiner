@@ -467,9 +467,8 @@ class OpenCodeRuntime(Runtime):
     name = "opencode"
     trace_formats = (TRACE_FORMAT,)
 
-    def trace_capabilities(self) -> frozenset[str]:
-        return frozenset({"workspace_write", "multi_turn",
-                          "reasoning_capture", "tool_schema_capture"})
+    def captures_reasoning(self) -> bool:
+        return True
 
     @staticmethod
     def _managed_cli() -> Path:

@@ -145,15 +145,16 @@ class SafeSelection(unittest.TestCase):
 
     @mock.patch.object(trace_pipeline, "select_seeds")
     @mock.patch("import_existing.imported_task_ids", return_value=set())
-    def test_queue_excludes_seeds_bound_to_an_unavailable_harness(
+    def test_queue_excludes_reasoning_seeds_without_a_reasoning_harness(
             self, _imported, load):
         load.return_value = [
-            {"id": "pi-only", "harness": "pi"},
+            {"id": "reasoning", "requires_reasoning": True},
             {"id": "portable"},
         ]
         with mock.patch.object(
-                trace_pipeline, "seed_harness_is_available",
-                side_effect=lambda seed, _config: "harness" not in seed):
+                trace_pipeline, "seed_reasoning_is_available",
+                side_effect=lambda seed, _config:
+                not seed.get("requires_reasoning", False)):
             selected = trace_pipeline._selected(self._args(all=True))
         self.assertEqual([seed["id"] for seed in selected], ["portable"])
 

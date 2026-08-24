@@ -231,7 +231,7 @@ index 0000000..d2b98ef
         traces = self.root / "traces"
         record = generate_traces.trace_task(
             seed, runtime, force=True, traces_root=traces,
-            capability_resolution={"mode": "contract"})
+            reasoning_resolution={"mode": "contract"})
         workspace = pathlib.Path(record["_workspace_path"])
         self.addCleanup(common.remove_workspace, workspace)
         self.assertEqual((workspace / "prompt.bin").read_bytes(), prompt.encode())

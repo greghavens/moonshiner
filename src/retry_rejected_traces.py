@@ -92,7 +92,7 @@ def retry(seed: dict, teacher, judge, max_attempts: int) -> bool:
                 seed, configured_teacher=teacher)
             judge.preflight(require_auth=True)
             trace_task(seed, selected, force=True, feedback=feedback,
-                       capability_resolution=resolution)
+                       reasoning_resolution=resolution)
             decision = screen(seed, judge)
         except (ModelUnavailable, NoCompatibleTraceHarness,
                 TraceHarnessInfrastructureFailure):

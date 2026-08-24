@@ -193,9 +193,6 @@ class VLLMRuntime(Runtime):
             return None
         return load_provider_key(self.runtime_config)
 
-    def trace_capabilities(self) -> frozenset[str]:
-        return frozenset({"workspace_write", "multi_turn"})
-
     def trace_probe_command(self) -> list[str]:
         # There is no CLI to probe; reachability is checked in preflight
         # against the server itself.

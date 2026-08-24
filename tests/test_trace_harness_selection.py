@@ -1,4 +1,4 @@
-"""Executable contracts for capability-based native trace-harness selection.
+"""Executable contracts for reasoning-aware native trace-harness selection.
 
 The tests deliberately use real files, SQLite ledgers, subprocesses, and
 Runtime implementations.  They do not mock a harness, queue, or pipeline
@@ -10,8 +10,6 @@ import json
 import os
 import pathlib
 import re
-import shutil
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -52,11 +50,11 @@ def accepted_verdict() -> dict:
 
 class _ExecutableRuntime(Runtime):
     trace_formats = ("codex-exec-events",)
-    provided_capabilities: frozenset[str] = frozenset()
+    reasoning_capture = False
     calls: list[dict] = []
 
-    def trace_capabilities(self) -> frozenset[str]:
-        return self.provided_capabilities
+    def captures_reasoning(self) -> bool:
+        return self.reasoning_capture
 
     def preflight(self, *, require_auth: bool = False) -> None:
         cli = pathlib.Path(str(self.runtime_config.get("cli") or ""))
@@ -117,20 +115,17 @@ class _ExecutableRuntime(Runtime):
 
 class HarnessA(_ExecutableRuntime):
     name = "test-harness-a"
-    provided_capabilities = frozenset({"workspace_write", "alpha"})
     calls: list[dict] = []
 
 
 class HarnessB(_ExecutableRuntime):
     name = "test-harness-b"
-    provided_capabilities = frozenset(
-        {"workspace_write", "multi_turn", "live_web_research"})
+    reasoning_capture = True
     calls: list[dict] = []
 
 
 class HarnessC(_ExecutableRuntime):
     name = "test-harness-c"
-    provided_capabilities = frozenset({"workspace_write", "multi_turn"})
     calls: list[dict] = []
 
 
@@ -139,10 +134,10 @@ class AcceptingJudge(_ExecutableRuntime):
     calls: list[dict] = []
 
 
-class CapabilityResolverContract(unittest.TestCase):
+class ReasoningResolverContract(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(
-            prefix="capability-selection-", dir=TEST_TMP)
+            prefix="reasoning-selection-", dir=TEST_TMP)
         self.root = pathlib.Path(self.temp.name)
         self.cli = self.root / "installed-harness"
         self.cli.write_text("#!/bin/sh\nexit 0\n")
@@ -185,7 +180,7 @@ class CapabilityResolverContract(unittest.TestCase):
         return runtimes.resolve_trace_harness(
             seed, configured_teacher=configured, config=config)
 
-    def test_seed_without_capabilities_keeps_configured_teacher(self):
+    def test_seed_without_reasoning_requirement_keeps_configured_teacher(self):
         config = self.config([HarnessB.name, HarnessC.name])
         configured = runtimes.get_teacher(config)
         selected, resolution = runtimes.resolve_trace_harness(
@@ -194,48 +189,21 @@ class CapabilityResolverContract(unittest.TestCase):
         self.assertEqual(selected.name, HarnessA.name)
         self.assertEqual(resolution["mode"], "configured_default")
 
-    def test_required_capabilities_filter_incompatible_harnesses(self):
+    def test_reasoning_requirement_selects_a_reasoning_capture_harness(self):
         selected, _ = self.resolve({
             "id": "required",
-            "required_harness_capabilities": ["live_web_research"],
+            "requires_reasoning": True,
         }, self.config([HarnessA.name, HarnessC.name, HarnessB.name]))
         self.assertEqual(selected.name, HarnessB.name)
 
-    def test_preference_score_then_order_is_deterministic(self):
-        seed = {
-            "id": "preferred",
-            "required_harness_capabilities": ["workspace_write"],
-            "preferred_harness_capabilities": [
-                "multi_turn", "live_web_research"],
-        }
-        selected, resolution = self.resolve(
-            seed, self.config([HarnessC.name, HarnessB.name, HarnessA.name]))
-        self.assertEqual(selected.name, HarnessB.name)
-        self.assertEqual(resolution["matched_preferred"],
-                         ["multi_turn", "live_web_research"])
-
-        tie_seed = {
-            "id": "tie",
-            "required_harness_capabilities": ["workspace_write"],
-            "preferred_harness_capabilities": ["multi_turn"],
-        }
-        selected, _ = self.resolve(
-            tie_seed, self.config([HarnessC.name, HarnessB.name]))
-        self.assertEqual(selected.name, HarnessC.name)
-
-    def test_missing_preferred_harness_uses_only_compatible_fallback(self):
-        seed = {
-            "id": "missing",
-            "required_harness_capabilities": ["workspace_write"],
-            "preferred_harness_capabilities": ["live_web_research"],
-        }
-        selected, _ = self.resolve(
-            seed,
-            self.config([HarnessB.name, HarnessC.name, HarnessA.name],
-                        missing={HarnessB.name}))
-        self.assertEqual(selected.name, HarnessC.name)
-        self.assertTrue(
-            {"workspace_write"} <= set(selected.trace_capabilities()))
+    def test_unavailable_reasoning_harness_is_not_selected(self):
+        seed = {"id": "required", "requires_reasoning": True}
+        config = self.config(
+            [HarnessA.name, HarnessB.name], missing={HarnessB.name})
+        self.assertFalse(runtimes.seed_reasoning_is_available(seed, config))
+        with self.assertRaisesRegex(
+                runtimes.NoCompatibleTraceHarness, "requires captured reasoning"):
+            self.resolve(seed, config)
 
     def test_an_alternative_harness_uses_the_model_its_own_provider_names(self):
         config = self.config([HarnessB.name, HarnessA.name])
@@ -243,7 +211,7 @@ class CapabilityResolverContract(unittest.TestCase):
         config["runtimes"][HarnessB.name]["trace_reasoning"] = "high"
         selected, resolution = self.resolve({
             "id": "alternative",
-            "required_harness_capabilities": ["live_web_research"],
+            "requires_reasoning": True,
         }, config)
         self.assertEqual(selected.name, HarnessB.name)
         self.assertEqual(selected.role["model"], "vendor/same-model")
@@ -253,50 +221,51 @@ class CapabilityResolverContract(unittest.TestCase):
     def test_a_harness_without_its_own_model_still_inherits_the_teachers(self):
         selected, resolution = self.resolve({
             "id": "inherited",
-            "required_harness_capabilities": ["live_web_research"],
+            "requires_reasoning": True,
         }, self.config([HarnessB.name, HarnessA.name]))
         self.assertEqual(selected.name, HarnessB.name)
         self.assertEqual(resolution["model"], "same-model")
 
     def test_the_configured_teacher_keeps_the_model_it_was_configured_with(self):
-        config = self.config([HarnessA.name, HarnessB.name])
-        config["runtimes"][HarnessA.name]["trace_model"] = "never-substituted"
+        config = self.config([HarnessA.name])
+        config["teacher"]["runtime"] = HarnessB.name
+        config["runtimes"][HarnessB.name]["trace_model"] = "never-substituted"
         selected, resolution = self.resolve({
-            "id": "configured", "required_harness_capabilities": ["alpha"],
+            "id": "configured",
+            "requires_reasoning": True,
         }, config)
-        self.assertEqual(selected.name, HarnessA.name)
+        self.assertEqual(selected.name, HarnessB.name)
         self.assertEqual(selected.role["model"], "same-model")
         self.assertEqual(resolution["model"], "same-model")
 
-    def test_declared_harness_identity_routes_only_to_that_harness(self):
-        config = self.config([HarnessC.name, HarnessB.name])
-        seed = {"id": "declared", "harness": HarnessB.name,
-                "required_harness_capabilities": ["workspace_write"],
-                "preferred_harness_capabilities": ["multi_turn"]}
-        self.assertTrue(runtimes.seed_harness_is_available(seed, config))
-        selected, resolution = self.resolve(seed, config)
-        self.assertEqual(selected.name, HarnessB.name)
-        self.assertEqual(resolution["mode"], "declared_harness")
-
-    def test_unavailable_declared_harness_is_excluded_before_paid_work(self):
-        config = self.config([HarnessB.name])
-        seed = {"id": "declared", "harness": HarnessC.name}
-        self.assertFalse(runtimes.seed_harness_is_available(seed, config))
+    def test_seed_harness_identity_is_forbidden(self):
         with self.assertRaisesRegex(
-                runtimes.NoCompatibleTraceHarness, "requires trace harness"):
-            self.resolve(seed, config)
+                runtimes.TraceHarnessInfrastructureFailure,
+                "harness bindings are forbidden"):
+            self.resolve({"id": "bound", "harness": HarnessB.name},
+                         self.config([HarnessB.name]))
 
-        missing_runtime = self.config([HarnessB.name])
-        del missing_runtime["runtimes"][HarnessB.name]
-        self.assertFalse(runtimes.seed_harness_is_available(
-            {"id": "missing-runtime", "harness": HarnessB.name},
-            missing_runtime))
+    def test_removed_harness_metadata_fields_are_forbidden(self):
+        config = self.config([HarnessB.name])
+        with self.assertRaisesRegex(
+                runtimes.TraceHarnessInfrastructureFailure,
+                "removed seed field required_harness_capabilities"):
+            self.resolve({
+                "id": "wrong",
+                "required_harness_capabilities": ["live_web_research"],
+            }, config)
+        with self.assertRaisesRegex(
+                runtimes.TraceHarnessInfrastructureFailure,
+                "removed seed field preferred_harness_capabilities"):
+            self.resolve({
+                "id": "preferred", "preferred_harness_capabilities": [
+                    "reasoning_capture"],
+            }, config)
 
-    def test_non_capability_identity_never_changes_selection(self):
+    def test_unrelated_identity_never_changes_selection(self):
         config = self.config([HarnessC.name, HarnessB.name])
         base = {
-            "required_harness_capabilities": ["workspace_write"],
-            "preferred_harness_capabilities": ["multi_turn"],
+            "requires_reasoning": True,
         }
         identities = [
             {"id": "vcf90-9999", "category": "Security",
@@ -308,7 +277,7 @@ class CapabilityResolverContract(unittest.TestCase):
         ]
         selected = [self.resolve({**base, **identity}, config)[0].name
                     for identity in identities]
-        self.assertEqual(selected, [HarnessC.name, HarnessC.name])
+        self.assertEqual(selected, [HarnessB.name, HarnessB.name])
 
     def _seed(self, seed_id: str, **metadata) -> dict:
         directory = self.root / seed_id
@@ -328,8 +297,7 @@ class CapabilityResolverContract(unittest.TestCase):
     def test_trace_task_passes_prompt_byte_for_byte_to_selected_adapter(self):
         seed = self._seed(
             "prompt-exact",
-            required_harness_capabilities=["multi_turn"],
-            preferred_harness_capabilities=["live_web_research"])
+            requires_reasoning=True)
         traces = self.root / "prompt-traces"
         configured = runtimes.get_teacher(
             self.config([HarnessC.name, HarnessB.name]))
@@ -338,13 +306,11 @@ class CapabilityResolverContract(unittest.TestCase):
         self.assertEqual(HarnessB.calls[-1]["prompt"], seed["prompt"])
         self.assertEqual(record["prompt"], seed["prompt"])
         self.assertEqual(
-            record["teacher"]["provenance"]["capability_resolution"]["runtime"],
+            record["teacher"]["provenance"]["reasoning_resolution"]["runtime"],
             HarnessB.name)
 
     def test_paid_runtime_failure_never_invokes_second_harness_or_judge(self):
-        seed = self._seed(
-            "runtime-failure",
-            required_harness_capabilities=["workspace_write"])
+        seed = self._seed("runtime-failure")
         config = self.config(
             [HarnessA.name, HarnessB.name],
             failures={HarnessA.name: "nonzero"})
@@ -361,86 +327,11 @@ class CapabilityResolverContract(unittest.TestCase):
 class QueueFailClosedContract(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(
-            prefix="capability-queue-", dir=TEST_TMP)
+            prefix="reasoning-queue-", dir=TEST_TMP)
         self.root = pathlib.Path(self.temp.name)
 
     def tearDown(self):
         self.temp.cleanup()
-
-    def test_no_compatible_harness_exits_78_pending_without_attempt_or_next_claim(self):
-        bundle = self.root / "bundle"
-        project = self.root / "project"
-        state = self.root / "state"
-        model_data = self.root / "model-data"
-        for directory in (bundle / "tasks" / "seeds", bundle / "schemas",
-                          project, state, model_data, self.root / "tmp"):
-            directory.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(ROOT / "schemas" / "review_verdict.schema.json",
-                     bundle / "schemas" / "review_verdict.schema.json")
-        config = {
-            "teacher": {"runtime": "codex", "model": "not-called",
-                        "reasoning": "xhigh", "timeout_s": 30},
-            "judge": {"runtime": "codex", "model": "not-called",
-                      "reasoning": "xhigh", "timeout_s": 30},
-            "runtimes": {
-                "codex": {"cli": str(self.root / "missing-codex")},
-                "missing-runtime": {"cli": str(self.root / "missing-runtime")},
-            },
-            "pipeline": {"trace": {
-                "harness_order": ["missing-runtime"], "max_attempts": 3,
-                "workers": 1, "step_down_reasoning_on_failure": True,
-                "retry_order": "immediate"}},
-            "publish": {"hf_dataset": None}, "holdout_tasks": [],
-        }
-        (bundle / "config.json").write_text(json.dumps(config))
-        categories = {"Building": []}
-        for index, seed_id in enumerate(("capability-first", "must-stay-pending")):
-            directory = bundle / "tasks" / "seeds" / seed_id
-            (directory / "files").mkdir(parents=True)
-            task = {
-                "id": seed_id, "lang": "English", "category": "Building",
-                "prompt": "must not call a model", "verify_cmd": "true",
-            }
-            if index == 0:
-                task["required_harness_capabilities"] = ["never-provided"]
-            (directory / "task.json").write_text(json.dumps(task))
-            (directory / "reference_fix.patch").write_text("\n")
-            categories["Building"].append({
-                "id": seed_id, "program": "Test", "category": "Building"})
-        (bundle / "SEED_CATALOG.json").write_text(json.dumps({
-            "programs": {"Test": {"priority": 0}}, "categories": categories}))
-
-        environment = dict(os.environ)
-        environment.update({
-            "MOONSHINER_BUNDLE_ROOT": str(bundle),
-            "MOONSHINER_HOME": str(state),
-            "XDG_DATA_HOME": str(model_data),
-            "TMPDIR": str(self.root / "tmp"),
-            "MOONSHINER_SINGLE_TRACE": "1",
-            "PYTHONPATH": str(ROOT / "src"),
-        })
-        completed = subprocess.run(
-            [sys.executable, "-c",
-             "import trace_pipeline; raise SystemExit("
-             "trace_pipeline.main(['--all','--yes','--workers','1']))"],
-            cwd=project, env=environment, capture_output=True, text=True)
-        self.assertEqual(completed.returncode, 78, completed.stderr)
-        ledger = state / "runs" / "moonshiner.sqlite3"
-        self.assertTrue(ledger.is_file())
-        db = sqlite3.connect(ledger)
-        try:
-            self.assertEqual(db.execute(
-                "SELECT COUNT(*) FROM attempts").fetchone()[0], 0)
-            self.assertEqual(db.execute(
-                "SELECT model_calls FROM runs").fetchone()[0], 0)
-            rows = db.execute(
-                "SELECT seed_id,status,attempts FROM jobs ORDER BY seed_id").fetchall()
-        finally:
-            db.close()
-        self.assertEqual(rows, [
-            ("capability-first", "pending", 0),
-            ("must-stay-pending", "pending", 0),
-        ])
 
     def test_parent_queue_failure_does_not_launch_another_seed(self):
         fake_python = self.root / "runtime" / "bin" / "python"
@@ -475,7 +366,7 @@ class QueueFailClosedContract(unittest.TestCase):
         self.assertEqual(claims[0][claims[0].index("--only") + 1], "first")
 
 
-class SharedPipelineContract(CapabilityResolverContract):
+class SharedPipelineContract(ReasoningResolverContract):
     def test_multiple_harnesses_traverse_the_same_downstream_functions(self):
         traces = self.root / "shared-traces"
         judge_config = {
@@ -485,12 +376,12 @@ class SharedPipelineContract(CapabilityResolverContract):
         }
         judge = AcceptingJudge(judge_config, judge_config["judge"])
         published_rows = []
-        for runtime_name, requirement in (
-                (HarnessA.name, "alpha"),
-                (HarnessB.name, "live_web_research")):
-            seed = self._seed(
-                f"shared-{runtime_name}",
-                required_harness_capabilities=[requirement])
+        for runtime_name, requires_reasoning in (
+                (HarnessA.name, False),
+                (HarnessB.name, True)):
+            metadata = ({"requires_reasoning": True}
+                        if requires_reasoning else {})
+            seed = self._seed(f"shared-{runtime_name}", **metadata)
             config = self.config([HarnessA.name, HarnessB.name])
             configured = runtimes.get_teacher(config)
             info = generate_traces.trace_task(
@@ -540,7 +431,7 @@ class SharedPipelineContract(CapabilityResolverContract):
 class CatalogAndConfigurationContract(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(
-            prefix="capability-catalog-", dir=TEST_TMP)
+            prefix="reasoning-catalog-", dir=TEST_TMP)
         self.root = pathlib.Path(self.temp.name)
 
     def tearDown(self):
@@ -554,13 +445,11 @@ class CatalogAndConfigurationContract(unittest.TestCase):
         (directory / "task.json").write_text(json.dumps(task))
         return directory
 
-    def test_catalog_preserves_explicit_harness_and_capability_metadata(self):
+    def test_catalog_preserves_only_the_reasoning_requirement(self):
         seeds = self.root / "tasks" / "seeds"
         explicit = {
             "id": "explicit", "category": "Building", "prompt": "do it",
-            "harness": "pi",
-            "required_harness_capabilities": ["workspace_write"],
-            "preferred_harness_capabilities": ["multi_turn"],
+            "requires_reasoning": True,
         }
         self._complete_seed(explicit)
         self._complete_seed({
@@ -568,90 +457,91 @@ class CatalogAndConfigurationContract(unittest.TestCase):
         _, generated = corpus.catalog(seeds)
         items = {item["id"]: item
                  for values in generated["categories"].values() for item in values}
-        self.assertEqual(items["explicit"]["required_harness_capabilities"],
-                         ["workspace_write"])
-        self.assertEqual(items["explicit"]["preferred_harness_capabilities"],
-                         ["multi_turn"])
-        self.assertEqual(items["explicit"]["harness"], "pi")
+        self.assertIs(items["explicit"]["requires_reasoning"], True)
+        self.assertIs(items["legacy"]["requires_reasoning"], False)
+        self.assertNotIn("harness", items["explicit"])
+        self.assertNotIn("required_harness_capabilities", items["explicit"])
+        self.assertNotIn("preferred_harness_capabilities", items["explicit"])
         self.assertNotIn("harness", items["legacy"])
         self.assertNotIn("required_harness_capabilities", items["legacy"])
         self.assertNotIn("preferred_harness_capabilities", items["legacy"])
 
-    def test_corpus_audit_rejects_invalid_capability_metadata(self):
+    def test_corpus_audit_allows_only_the_reasoning_requirement(self):
         valid = self._complete_seed({
             "id": "valid", "category": "Building", "prompt": "do it",
-            "required_harness_capabilities": ["workspace_write"],
-            "preferred_harness_capabilities": [],
+            "requires_reasoning": True,
         })
         self.assertIsNone(audit_seeds.check(valid))
         invalid = self._complete_seed({
             "id": "invalid", "category": "Building", "prompt": "do it",
-            "required_harness_capabilities": "workspace_write",
+            "required_harness_capabilities": ["live_web_research"],
         })
         self.assertIn("required_harness_capabilities", audit_seeds.check(invalid))
         invalid_entry = self._complete_seed({
             "id": "invalid-entry", "category": "Building", "prompt": "do it",
-            "preferred_harness_capabilities": ["multi_turn", 7],
+            "preferred_harness_capabilities": ["reasoning_capture"],
         })
         self.assertIn("preferred_harness_capabilities",
                       audit_seeds.check(invalid_entry))
+        invalid_reasoning = self._complete_seed({
+            "id": "invalid-reasoning", "category": "Building",
+            "prompt": "do it", "requires_reasoning": "yes",
+        })
+        self.assertIn("requires_reasoning must be true or false",
+                      audit_seeds.check(invalid_reasoning))
 
-    def test_corpus_audit_rejects_invalid_harness_identity(self):
-        valid = self._complete_seed({
-            "id": "valid-harness", "category": "Building",
+    def test_corpus_audit_rejects_every_exact_harness_binding(self):
+        bound = self._complete_seed({
+            "id": "bound", "category": "Building",
             "prompt": "do it", "harness": "opencode"})
-        self.assertIsNone(audit_seeds.check(valid))
-        invalid = self._complete_seed({
-            "id": "invalid-harness", "category": "Building",
-            "prompt": "do it", "harness": "imaginary"})
-        self.assertIn("task.json harness", audit_seeds.check(invalid))
+        self.assertIn("harness is forbidden", audit_seeds.check(bound))
 
-    def test_shipped_pi_named_prompts_are_declared_pi_harness_seeds(self):
-        missing = []
+    def test_shipped_prompts_do_not_name_an_agent_harness(self):
+        named = []
         for task_path in sorted((ROOT / "tasks" / "seeds").glob("*/task.json")):
             task = json.loads(task_path.read_text())
-            if re.search(
-                    r"\bPi(?:['\u2019]s|\s+(?:shell|Bash|bash|native|executable|tool|`bash`))",
-                    str(task.get("prompt") or "")) \
-                    and task.get("harness") != "pi":
-                missing.append(task["id"])
-        self.assertEqual(missing, [])
+            prompt = str(task.get("prompt") or "")
+            if re.search(r"\b(?:Pi|Codex|Claude Code|OpenCode)\b", prompt,
+                         re.IGNORECASE):
+                named.append(task["id"])
+        # This seed is about a Raspberry Pi device, not an agent harness.
+        self.assertEqual(named, ["rb-hivelog"])
 
     def test_shipped_harness_order_defaults_to_empty_list(self):
         config = json.loads((ROOT / "config.json").read_text())
         self.assertEqual(config["pipeline"]["trace"]["harness_order"], [])
 
-    def test_no_shipped_seed_requires_a_capability_no_harness_provides(self):
-        """A capability nothing provides stops the queue, not just the seed.
+    def test_shipped_seed_requirements_are_boolean_and_only_twelve_are_true(self):
+        required = []
+        for task_path in sorted((ROOT / "tasks" / "seeds").glob("*/task.json")):
+            task = json.loads(task_path.read_text())
+            self.assertNotIn("harness", task)
+            self.assertNotIn("required_harness_capabilities", task)
+            self.assertNotIn("preferred_harness_capabilities", task)
+            value = task.get("requires_reasoning", False)
+            self.assertIsInstance(value, bool)
+            if value:
+                required.append(task["id"])
+        self.assertEqual(len(required), 12)
 
-        ``resolve_trace_harness`` raises ``NoCompatibleTraceHarness`` for such a
-        seed, and the trace queue treats that as infrastructure: it exits 78,
-        which the supervisor refuses to restart. One seed spelling a capability
-        a way no adapter answers to therefore takes the whole corpus down, so
-        the vocabulary is checked here rather than discovered in production.
-        """
+    def test_only_opencode_and_pi_advertise_reasoning_capture(self):
         config = json.loads((ROOT / "config.json").read_text())
-        provided: set[str] = set()
+        captures = {}
         for name, cls in runtimes.REGISTRY.items():
             runtime = cls(config, {**config["teacher"], "runtime": name})
             runtime.runtime_config = (config.get("runtimes") or {}).get(name, {})
-            provided |= set(runtime.trace_capabilities())
-        unprovidable: dict[str, list[str]] = {}
-        for task_path in sorted((ROOT / "tasks" / "seeds").glob("*/task.json")):
-            task = json.loads(task_path.read_text())
-            for field in ("required_harness_capabilities",
-                          "preferred_harness_capabilities"):
-                for capability in task.get(field) or []:
-                    if capability not in provided:
-                        unprovidable.setdefault(capability, []).append(task["id"])
-        self.assertEqual(
-            unprovidable, {},
-            f"capabilities no registered harness provides; provided: "
-            f"{sorted(provided)}")
+            captures[name] = runtime.captures_reasoning()
+        self.assertEqual(captures, {
+            "claude-code": False,
+            "codex": False,
+            "opencode": True,
+            "pi": True,
+            "vllm": False,
+        })
 
 
 class AlternativeHarnessDiscovery(unittest.TestCase):
-    """Doctor needs the same harness list capability selection will build.
+    """Doctor needs the same reasoning alternatives selection will build.
 
     Selection authenticates a harness only after choosing it, mid-run, where
     the failure stops the queue. Enumerating the alternatives up front is what
@@ -659,22 +549,22 @@ class AlternativeHarnessDiscovery(unittest.TestCase):
     """
 
     CONFIG = {
-        "teacher": {"runtime": "opencode", "model": "anthropic/claude-fable-5",
+        "teacher": {"runtime": "codex", "model": "glm-5.3",
                     "reasoning": "default"},
         "runtimes": {
-            "opencode": {"cli": "opencode", "provider": "zenmux"},
-            "claude-code": {"cli": "claude", "trace_model": "claude-fable-5"},
+            "codex": {"cli": "codex"},
+            "pi": {"cli": "pi", "trace_model": "zai/glm-5.3"},
         },
-        "pipeline": {"trace": {"harness_order": ["opencode", "claude-code"]}},
+        "pipeline": {"trace": {"harness_order": ["codex", "pi"]}},
     }
 
     def test_the_configured_teacher_is_not_its_own_alternative(self):
         found = runtimes.trace_harness_alternatives(self.CONFIG)
-        self.assertEqual([runtime.name for runtime in found], ["claude-code"])
+        self.assertEqual([runtime.name for runtime in found], ["pi"])
 
     def test_an_alternative_carries_its_own_model_spelling(self):
         alternative, = runtimes.trace_harness_alternatives(self.CONFIG)
-        self.assertEqual(alternative.role["model"], "claude-fable-5")
+        self.assertEqual(alternative.role["model"], "zai/glm-5.3")
 
     def test_an_unset_order_yields_nothing(self):
         config = {**self.CONFIG, "pipeline": {"trace": {}}}
@@ -682,7 +572,7 @@ class AlternativeHarnessDiscovery(unittest.TestCase):
 
     def test_a_name_with_no_runtime_block_is_skipped(self):
         config = {**self.CONFIG,
-                  "pipeline": {"trace": {"harness_order": ["opencode", "nope"]}}}
+                  "pipeline": {"trace": {"harness_order": ["codex", "nope"]}}}
         self.assertEqual(runtimes.trace_harness_alternatives(config), [])
 
 

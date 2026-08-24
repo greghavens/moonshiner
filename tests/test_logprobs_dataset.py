@@ -138,8 +138,8 @@ class _Distilled:
                     staticmethod(lambda path: pathlib.Path(path).resolve())):
             self.record = generate_traces.trace_task(
                 self.seed, _runtime(), force=True, traces_root=self.traces,
-                capability_resolution={"runtime": "vllm",
-                                       "reason": "configured"})
+                reasoning_resolution={"runtime": "vllm",
+                                      "reason": "configured"})
             workspace = self.record.pop("_workspace_path", None)
             if workspace:
                 common.remove_workspace(pathlib.Path(workspace))

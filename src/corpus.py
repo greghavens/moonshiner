@@ -58,10 +58,7 @@ def catalog(seed_dir: Path = SEEDS_DIR) -> tuple[str, dict]:
                 "category": task.get("category") or "uncategorized",
                 "training_tags": task.get("training_tags") or task.get("tags") or [],
                 "summary": summary, "verify_command": task.get("verify_cmd")}
-        for field in ("harness", "required_harness_capabilities",
-                      "preferred_harness_capabilities"):
-            if field in task:
-                item[field] = task[field]
+        item["requires_reasoning"] = bool(task.get("requires_reasoning", False))
         item["program"] = (program_overrides.get(item["id"])
                            or task.get("program")
                            or existing_items.get(item["id"], {}).get("program")
