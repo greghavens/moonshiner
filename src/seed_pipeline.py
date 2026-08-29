@@ -163,15 +163,18 @@ def _promote_candidate(candidate: Path, destination: Path) -> None:
             shutil.copy2(source, destination / name)
 
 
-def _review_prompt(seed: dict, report: dict) -> str:
+def _review_prompt(seed: dict, report: dict, brief: str) -> str:
     return f"""Review and, when possible, FIX this authored Moonshiner seed in place.
 You are the final seed judge and are authorized to make every necessary in-scope repair without asking for human approval. You may edit task.json, files/, tests, and reference_fix.patch. Preserve the core objective; repair prompt/test mismatches, weak tests, unrelated baseline bugs, broken patches, and nondeterminism. Do not reject or defer a seed merely because it requires edits you can make. After edits, return only the required JSON verdict. Use verdict=accept only if the resulting on-disk seed is ready. Use needs_human only when the objective is genuinely ambiguous or fixing it would redefine the objective.
 
-Judge and repair only against the requested seed objective and constraints. Do not broaden them or add a policy, approval or eligibility gate, spending or call ceiling, abstraction, or workflow requirement unless the seed explicitly requests it.
+The original authoring brief below is the authoritative statement of the requested seed objective and constraints. Compare the entire authored seed against it. Repair any missing scenario, deliverable, action, or constraint instead of inferring the objective only from the authored task.json. Do not broaden the brief or add a policy, approval or eligibility gate, spending or call ceiling, abstraction, or workflow requirement unless the brief explicitly requests it.
 
-Independently enforce the final artifact contract while repairing it. The seed must be self-contained and must not depend on absolute host paths, home directories, sibling repositories, or files outside task.json, files/, and reference_fix.patch. The task.json prompt must contain only the end-user task for the trace harness, with no authoring instructions, metadata, judge feedback, or Moonshiner control text. The selected unmodified harness must execute every tool call and produce every tool result genuinely. A simulated environment may use local fixtures, services, databases, and reversible state, but the seed must not embed or replace tool calls, tool results, expected arguments, answer-key response maps, fictional tool schemas, or initial service state. Web research must use real reachable sources, never fixtures or .invalid URLs. Verification must be deterministic and protected, grade the resulting environment or artifacts rather than expected commands or reasoning, and the reference patch must prove the requested deliverable is achievable.
+Independently enforce the final artifact contract while repairing it. The seed must be self-contained and must not depend on absolute host paths, home directories, sibling repositories, or files outside task.json, files/, and reference_fix.patch. The task.json prompt must contain only the end-user task for the trace harness, with no authoring instructions, metadata, judge feedback, or Moonshiner control text. The selected unmodified harness must execute every tool call and produce every tool result genuinely. A simulated environment may use local fixtures, services, databases, and reversible state, but the seed must not embed or replace tool calls, tool results, expected arguments, answer-key response maps, fictional tool schemas, or initial service state. Web research must use real reachable sources, never fixtures or .invalid URLs; local or protected files must not disclose the facts the research is intended to discover. Verification must be deterministic and protected, grade the resulting environment or artifacts rather than expected commands or reasoning, and the reference patch must prove the requested deliverable is achievable.
 
 SEED ID: {seed['id']}
+ORIGINAL AUTHORING BRIEF:
+{brief}
+
 DETERMINISTIC VALIDATION BEFORE YOUR REVIEW:
 {json.dumps(report, indent=2)}
 """
@@ -259,7 +262,8 @@ def main(argv: list[str] | None = None) -> int:
                 "passed": False,
                 "failures": ["environment preflight: " + environment_detail],
             })
-            review = judge.run_review(_review_prompt(seed, report), candidate,
+            review = judge.run_review(
+                _review_prompt(seed, report, args.brief), candidate,
                                       out_dir=TRACES / "reviews", schema=SCHEMA,
                                       read_only=False)
             # Reload judge edits and prove the final on-disk form independently.
@@ -313,20 +317,21 @@ def main(argv: list[str] | None = None) -> int:
             # cannot fix by editing a seed, like a runtime writing to HOME.
             accepted = verdict_clear
             status = "accepted" if accepted else ("retry" if number < args.max_attempts else "retired")
-            error = None if accepted else "; ".join(final_report.get("failures") or [verdict.get("summary", "judge rejected")])
+            error = None if accepted else "; ".join(
+                final_report.get("failures")
+                or [verdict.get("summary", "judge did not complete the repair")])
             finish_attempt(db, run_id, args.id, number, status,
                            review=verdict, error=error)
             print(f"[{status}] {args.id}{': ' + error if error else ''}")
             if accepted: break
-        # A seed is never discarded. Authoring it was paid for, the judge was
-        # paid to correct it, and throwing the result away spends both again on
-        # the next pass. Every candidate is promoted; a judge that could not
-        # clear it says so in the record, and the seed is fixed in place rather
-        # than deleted and re-bought.
+        # Never discard paid authoring work, and never promote an unresolved
+        # seed. The candidate remains in the durable candidate workspace so a
+        # later run resumes it and gives the judge another chance to repair it.
         if not accepted:
-            set_run_status(db, run_id, "complete_with_rejections")
-            print(f"[promoted unresolved] {args.id}: judge did not clear it; "
-                  "promoted anyway so the work is kept")
+            set_run_status(db, run_id, "stopped",
+                           "judge did not complete the seed repair")
+            print(f"candidate retained for repair at {candidate}")
+            return 1
         _promote_candidate(candidate, destination)
         if legacy_path is not None:
             archive = STORAGE_ROOT / "tasks" / "replaced-synthetic-seeds"

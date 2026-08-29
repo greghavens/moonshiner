@@ -82,7 +82,7 @@ class TheJudgeCorrectsAndTheSeedMovesOn(unittest.TestCase):
 
     def test_judge_is_authorized_to_repair_without_approval(self):
         prompt = seed_pipeline._review_prompt(
-            {"id": "vcf91-0004"}, {"passed": False})
+            {"id": "vcf91-0004"}, {"passed": False}, "Build a VCF task")
         self.assertIn("authorized to make every necessary in-scope repair", prompt)
         self.assertIn("without asking for human approval", prompt)
         self.assertIn("Do not reject or defer a seed merely because it requires edits", prompt)
@@ -90,21 +90,32 @@ class TheJudgeCorrectsAndTheSeedMovesOn(unittest.TestCase):
 
     def test_judge_independently_enforces_seed_artifact_integrity(self):
         prompt = seed_pipeline._review_prompt(
-            {"id": "security-r1-0001"}, {"passed": False})
+            {"id": "security-r1-0001"}, {"passed": False},
+            "Research the public specification, then implement the client")
         self.assertIn("Independently enforce the final artifact contract", prompt)
         self.assertIn("must be self-contained", prompt)
         self.assertIn("prompt must contain only the end-user task", prompt)
         self.assertIn("unmodified harness must execute every tool call", prompt)
         self.assertIn("Web research must use real reachable sources", prompt)
+        self.assertIn("local or protected files must not disclose", prompt)
         self.assertIn("grade the resulting environment or artifacts", prompt)
+        self.assertIn("ORIGINAL AUTHORING BRIEF:\nResearch the public", prompt)
+
+    def test_judge_compares_the_seed_to_the_original_authoring_brief(self):
+        prompt = seed_pipeline._review_prompt(
+            {"id": "vcf91-0123"}, {"passed": True},
+            "Research the VCF API on the web, then implement a client scenario")
+        self.assertIn("authoritative statement of the requested seed objective", prompt)
+        self.assertIn("Repair any missing scenario, deliverable, action", prompt)
+        self.assertIn("Research the VCF API on the web", prompt)
 
     def test_judge_cannot_invent_product_requirements_while_repairing(self):
         prompt = seed_pipeline._review_prompt(
-            {"id": "security-r1-0001"}, {"passed": False})
-        self.assertIn("Judge and repair only against the requested", prompt)
-        self.assertIn("Do not broaden them", prompt)
+            {"id": "security-r1-0001"}, {"passed": False}, "Fix the parser")
+        self.assertIn("authoritative statement of the requested", prompt)
+        self.assertIn("Do not broaden the brief", prompt)
         self.assertIn("approval or eligibility gate", prompt)
-        self.assertIn("unless the seed explicitly requests it", prompt)
+        self.assertIn("unless the brief explicitly requests it", prompt)
 
     def test_seed_judge_is_edit_enabled(self):
         source = (ROOT / "src" / "seed_pipeline.py").read_text()
@@ -121,19 +132,21 @@ class ASeedIsNeverDiscarded(unittest.TestCase):
     re-authored from nothing on the next pass and charged twice.
     """
 
-    def test_the_candidate_is_promoted_whatever_the_verdict(self):
+    def test_an_unresolved_candidate_is_retained_for_repair(self):
         source = (ROOT / "src" / "seed_pipeline.py").read_text()
         body = source[source.index("if not accepted:"):]
         body = body[:body.index("_promote_candidate(candidate, destination)")]
-        self.assertNotIn("return 1", body,
-                         "an unresolved seed must not abandon the paid work")
+        self.assertIn("candidate retained for repair", body)
+        self.assertIn("return 1", body)
 
-    def test_the_promotion_is_unconditional(self):
+    def test_promotion_occurs_only_after_acceptance(self):
         source = (ROOT / "src" / "seed_pipeline.py").read_text()
-        promote = source.index("_promote_candidate(candidate, destination)")
-        guard_before = source[:promote].rstrip().splitlines()[-1]
-        self.assertNotIn("if ", guard_before,
-                         "promotion must not sit behind an acceptance test")
+        unresolved = source.index("if not accepted:")
+        retained = source.index("return 1", unresolved)
+        promote = source.index("_promote_candidate(candidate, destination)",
+                               retained)
+        self.assertLess(retained, promote,
+                        "an unresolved seed must return before promotion")
 
     def test_a_completed_retained_author_workspace_is_reused(self):
         seed_id = f"unit-retained-{uuid.uuid4().hex}"
@@ -259,6 +272,7 @@ class InfrastructureFailuresReachTheJudge(unittest.TestCase):
         judge.run_review.assert_called_once()
         report = judge.run_review.call_args.args[0]
         self.assertIn("environment preflight: bad module version", report)
+        self.assertIn("ORIGINAL AUTHORING BRIEF:\nVCF seed", report)
         attempt.assert_called_once()
         status.assert_called_with(mock.ANY, "seed-run", "complete")
 
