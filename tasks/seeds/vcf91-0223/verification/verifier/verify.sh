@@ -87,12 +87,11 @@ assert sources["operations"] == [
     {"operationId": "getComponentNodes", "method": "GET",
      "path": "/v1/components/{componentId}/nodes"},
 ]
-assert sources["clientSdk"]["name"] == "VMware.Sdk.Vcf.Installer"
 print("contract and provenance: ok")
 PY
 
 # ---------------------------------------------------------------------------
-# 2. the VMware SDK is a prerequisite, never vendored into the workspace
+# 2. no unrelated VMware SDK is vendored into the workspace
 # ---------------------------------------------------------------------------
 vendored=$(find "$workspace_root" \
   \( -iname 'VMware.Sdk.Vcf*' -o -iname 'VMware.OpenAPI*' -o -iname 'VMware.Vim*' \
@@ -103,14 +102,6 @@ if [ -n "$vendored" ]; then
   exit 1
 fi
 echo "no vendored VMware SDK payload: ok"
-
-if ! pwsh -NoProfile -NonInteractive -Command \
-  'if (-not (Get-Module -ListAvailable -Name VMware.Sdk.Vcf.Installer)) { exit 1 }'; then
-  echo "verify: the prerequisite module VMware.Sdk.Vcf.Installer is not installed." >&2
-  echo "        Install it with: Install-Module VMware.Sdk.Vcf.Installer -Scope CurrentUser" >&2
-  exit 2
-fi
-echo "prerequisite module VMware.Sdk.Vcf.Installer present: ok"
 
 # ---------------------------------------------------------------------------
 # 3. behaviour and wire shape against the contract-pinned loopback mock

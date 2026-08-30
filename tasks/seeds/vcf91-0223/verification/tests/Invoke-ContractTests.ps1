@@ -2,9 +2,7 @@
 <#
     Acceptance test for VcfSddcLcm\Get-VcfSddcLcmComponentNode.
 
-    Establishes a real PowerCLI session with Connect-VcfInstallerServer from
-    VMware.Sdk.Vcf.Installer against a loopback session fixture, hands the
-    resulting connection to the module under test, and asserts the module's
+    Supplies a caller-owned SDDC LCM bearer token and asserts the module's
     behaviour plus the exact wire shape recorded by the contract-pinned mock.
 
     No VMware endpoint is contacted.
@@ -80,9 +78,7 @@ $expectedNodeVersion = "9.1.0.0-$runId"
 $expectedAuthorization = "Bearer $sessionToken"
 
 $contractLog = Join-Path $scratch 'contract-requests.jsonl'
-$sessionLog = Join-Path $scratch 'session-requests.jsonl'
 $contractReady = Join-Path $scratch 'contract-ready.json'
-$sessionReady = Join-Path $scratch 'session-ready.json'
 
 $python = if ($IsWindows) { 'python' } else { 'python3' }
 $processes = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
@@ -105,8 +101,6 @@ function Start-Fixture([string] $Script, [string] $ReadyFile, [string] $LogFile)
     }
     throw "Fixture $Script did not become ready within 20 seconds."
 }
-
-$connection = $null
 
 function Stop-Fixtures {
     foreach ($p in $processes) {
@@ -147,7 +141,7 @@ function Assert-CommonWireShape([object[]] $Entries, [string] $Label) {
         Assert-Equal 'GET' $e.method "$tag -- method is GET"
         Assert-Equal 'application/json' $e.headers.accept "$tag -- Accept: application/json"
         Assert-Equal $expectedAuthorization $e.headers.authorization `
-            "$tag -- Authorization carries the session secret from the VCF connection"
+            "$tag -- Authorization carries the caller-owned SDDC LCM token"
         Assert-Equal 0 $e.requestBodyBytes "$tag -- GET carries no request body"
         Assert-True ($null -eq $e.headers.contentType) "$tag -- no Content-Type request header"
         Assert-Equal '127.0.0.1' $e.clientAddress "$tag -- request arrived over loopback"
@@ -209,29 +203,17 @@ $expectedFilteredNodes = @(
 
 try {
     Write-Host 'Starting loopback fixtures' -ForegroundColor Cyan
-    $session = Start-Fixture 'vcf_session_fixture.py' $sessionReady $sessionLog
     $contract = Start-Fixture 'sddc_lcm_contract_mock.py' $contractReady $contractLog
 
     # The children inherited these values when Start-Process launched them.
     # Remove the fixture-only secrets from the parent before loading candidate
-    # code, so the bearer can only be obtained from the VCF connection object.
+    # code after converting the caller-owned value into a SecureString.
     Remove-Item Env:VCF_FIXTURE_SESSION_TOKEN -ErrorAction SilentlyContinue
     Remove-Item Env:VCF_FIXTURE_RUN_ID -ErrorAction SilentlyContinue
 
     $serviceUri = [uri] $contract.baseUri
-    Write-Host ("  session fixture 127.0.0.1:{0}   contract mock {1}" -f $session.port, $serviceUri)
-
-    Write-Host 'Importing VMware.Sdk.Vcf.Installer' -ForegroundColor Cyan
-    Import-Module VMware.Sdk.Vcf.Installer -WarningAction SilentlyContinue -ErrorAction Stop
-
-    Write-Host 'Connecting with Connect-VcfInstallerServer' -ForegroundColor Cyan
-    $password = ConvertTo-SecureString 'fixture-password' -AsPlainText -Force
-    $connection = Connect-VcfInstallerServer -Server '127.0.0.1' -Port $session.port `
-        -Protocol 'http' -User 'administrator@vcf.sddc.lab' -Password $password `
-        -NotDefault -WarningAction SilentlyContinue -ErrorAction Stop
-
-    Assert-Equal $sessionToken $connection.SessionSecret `
-        'the PowerCLI connection holds the session secret minted by the fixture'
+    $accessToken = ConvertTo-SecureString $sessionToken -AsPlainText -Force
+    Write-Host ("  contract mock {0}" -f $serviceUri)
 
     Write-Host 'Importing the module under test' -ForegroundColor Cyan
     Import-Module (Join-Path $WorkspaceRoot 'VcfSddcLcm/VcfSddcLcm.psd1') `
@@ -242,7 +224,7 @@ try {
 
     # ---------------------------------------------------------------- case 1
     Write-Host 'Case 1: by component id, service default page size' -ForegroundColor Cyan
-    $nodes = @(Get-VcfSddcLcmComponentNode -Server $connection -ServiceUri $serviceUri `
+    $nodes = @(Get-VcfSddcLcmComponentNode -AccessToken $accessToken -ServiceUri $serviceUri `
             -ComponentId $fleetOpsId)
     $entries = Get-NewContractRequests
 
@@ -259,7 +241,7 @@ try {
 
     # ---------------------------------------------------------------- case 2
     Write-Host 'Case 2: by component type with scope and explicit page size' -ForegroundColor Cyan
-    $nodes = @(Get-VcfSddcLcmComponentNode -Server $connection -ServiceUri $serviceUri `
+    $nodes = @(Get-VcfSddcLcmComponentNode -AccessToken $accessToken -ServiceUri $serviceUri `
             -ComponentType 'VCF_OPERATIONS' -Scope 'FLEET' -PageSize 2)
     $entries = Get-NewContractRequests
 
@@ -279,7 +261,7 @@ try {
     Write-Host 'Case 3: ambiguous component type, scope omitted entirely' -ForegroundColor Cyan
     $threw = $false
     try {
-        Get-VcfSddcLcmComponentNode -Server $connection -ServiceUri $serviceUri `
+        Get-VcfSddcLcmComponentNode -AccessToken $accessToken -ServiceUri $serviceUri `
             -ComponentType 'VCF_OPERATIONS' | Out-Null
     } catch {
         $threw = $true
@@ -292,7 +274,7 @@ try {
 
     # ---------------------------------------------------------------- case 4
     Write-Host 'Case 4: node type filter' -ForegroundColor Cyan
-    $nodes = @(Get-VcfSddcLcmComponentNode -Server $connection -ServiceUri $serviceUri `
+    $nodes = @(Get-VcfSddcLcmComponentNode -AccessToken $accessToken -ServiceUri $serviceUri `
             -ComponentId $fleetOpsId -NodeType @('control-plane', 'worker'))
     $entries = Get-NewContractRequests
 
@@ -308,7 +290,7 @@ try {
 
     # ---------------------------------------------------------------- case 5
     Write-Host 'Case 5: filter that matches nothing' -ForegroundColor Cyan
-    $nodes = @(Get-VcfSddcLcmComponentNode -Server $connection -ServiceUri $serviceUri `
+    $nodes = @(Get-VcfSddcLcmComponentNode -AccessToken $accessToken -ServiceUri $serviceUri `
             -ComponentId $fleetOpsId -NodeType @('absent-type') -PageSize 5)
     $entries = Get-NewContractRequests
 
@@ -322,7 +304,7 @@ try {
     Write-Host 'Case 6: unknown component id' -ForegroundColor Cyan
     $threw = $false
     try {
-        Get-VcfSddcLcmComponentNode -Server $connection -ServiceUri $serviceUri `
+        Get-VcfSddcLcmComponentNode -AccessToken $accessToken -ServiceUri $serviceUri `
             -ComponentId $missingId | Out-Null
     } catch {
         $threw = $true
@@ -337,7 +319,7 @@ try {
 
     # ---------------------------------------------------------------- case 7
     Write-Host 'Case 7: unique component type without a scope filter' -ForegroundColor Cyan
-    $nodes = @(Get-VcfSddcLcmComponentNode -Server $connection -ServiceUri $serviceUri `
+    $nodes = @(Get-VcfSddcLcmComponentNode -AccessToken $accessToken -ServiceUri $serviceUri `
             -ComponentType 'VCENTER')
     $entries = Get-NewContractRequests
 
@@ -353,7 +335,7 @@ try {
     Write-Host 'Case 8: ordinal component type mismatch' -ForegroundColor Cyan
     $threw = $false
     try {
-        Get-VcfSddcLcmComponentNode -Server $connection -ServiceUri $serviceUri `
+        Get-VcfSddcLcmComponentNode -AccessToken $accessToken -ServiceUri $serviceUri `
             -ComponentType 'vcenter' | Out-Null
     } catch {
         $threw = $true
@@ -370,7 +352,7 @@ try {
     $threw = $false
     $emitted = [System.Collections.Generic.List[object]]::new()
     try {
-        Get-VcfSddcLcmComponentNode -Server $connection -ServiceUri $serviceUri `
+        Get-VcfSddcLcmComponentNode -AccessToken $accessToken -ServiceUri $serviceUri `
             -ComponentId $badMetadataId |
             ForEach-Object { $emitted.Add($_) | Out-Null }
     } catch {
@@ -391,7 +373,7 @@ try {
     $threw = $false
     $emitted = [System.Collections.Generic.List[object]]::new()
     try {
-        Get-VcfSddcLcmComponentNode -Server $connection -ServiceUri $serviceUri `
+        Get-VcfSddcLcmComponentNode -AccessToken $accessToken -ServiceUri $serviceUri `
             -ComponentId $lateFailureId -PageSize 1 |
             ForEach-Object { $emitted.Add($_) | Out-Null }
     } catch {
@@ -431,26 +413,9 @@ try {
     Assert-Equal 0 @($all | Where-Object { $_.operationId -notin @('getComponents', 'getComponentNodes') }).Count `
         'every request mapped to an operationId named by the contract'
 
-    $sessionEntries = @(
-        Get-Content -LiteralPath $sessionLog |
-            Where-Object { $_.Trim().Length -gt 0 } |
-            ForEach-Object { $_ | ConvertFrom-Json }
-    )
-    Assert-True (@($sessionEntries | Where-Object {
-                $_.method -eq 'POST' -and $_.target -eq '/v1/tokens' -and $_.userAgent -match 'PowerCLI'
-            }).Count -ge 1) 'the PowerCLI SDK performed the session handshake'
-    Assert-Equal 0 @($sessionEntries | Where-Object { $_.status -eq 404 }).Count `
-        'the module under test issued no requests against the session endpoint'
-
 } catch {
     Fail ("the test run aborted: {0}`n          {1}" -f $_.Exception.Message, $_.ScriptStackTrace)
 } finally {
-    if ($null -ne $connection) {
-        try {
-            Disconnect-VcfInstallerServer -Server $connection -Confirm:$false `
-                -WarningAction SilentlyContinue -ErrorAction SilentlyContinue | Out-Null
-        } catch { }
-    }
     Stop-Fixtures
     Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
 }

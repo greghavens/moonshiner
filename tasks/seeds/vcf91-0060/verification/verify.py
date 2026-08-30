@@ -120,7 +120,7 @@ class WireAndRefreshTests(unittest.TestCase):
     def test_exact_wire_shape_refreshes_get_without_replaying_patch(self):
         expected_group = realized_group()
         with MockNsxPolicy() as server:
-            server.script("PatchGroupForDomain", [(200, {})])
+            server.script("PatchGroupForDomain", [(200, None)])
             server.script(
                 "ReadGroupForDomain",
                 [(401, unauthorized()), (200, expected_group)],
@@ -249,7 +249,7 @@ class WireAndRefreshTests(unittest.TestCase):
         from vcf_nsx_policy import NsxApiError
 
         with MockNsxPolicy() as server:
-            server.script("PatchGroupForDomain", [(200, {})])
+            server.script("PatchGroupForDomain", [(200, None)])
             server.script(
                 "ReadGroupForDomain",
                 [(401, unauthorized()), (401, unauthorized())],
@@ -305,7 +305,7 @@ class WireAndRefreshTests(unittest.TestCase):
         from vcf_nsx_policy import ProtocolError
 
         with MockNsxPolicy() as server:
-            server.script("PatchGroupForDomain", [(200, {})])
+            server.script("PatchGroupForDomain", [(200, None)])
             server.script("ReadGroupForDomain", [(200, ["not", "a", "group"])])
             provider = TokenProvider(EXPIRED_TOKEN)
             with self.assertRaises(ProtocolError):

@@ -153,12 +153,18 @@ class MockNsxPolicy:
                 else:
                     status, payload = fixture._take_response(operation_id)
 
-                response = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+                response = (
+                    b""
+                    if payload is None
+                    else json.dumps(payload, separators=(",", ":")).encode("utf-8")
+                )
                 self.send_response(status)
-                self.send_header("Content-Type", "application/json")
+                if response:
+                    self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(response)))
                 self.end_headers()
-                self.wfile.write(response)
+                if response:
+                    self.wfile.write(response)
 
             do_GET = _handle
             do_PATCH = _handle

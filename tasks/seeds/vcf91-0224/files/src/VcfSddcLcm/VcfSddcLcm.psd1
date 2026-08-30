@@ -6,11 +6,6 @@
     Description       = 'Retry-safe SDDC LCM lifecycle operations for VMware Cloud Foundation 9.1.'
     PowerShellVersion = '7.2'
 
-    # Supplied by the environment (PSGallery); never vendored into this repo.
-    RequiredModules   = @(
-        @{ ModuleName = 'VMware.Sdk.Vcf.SddcManager'; ModuleVersion = '13.5.0' }
-    )
-
     FunctionsToExport = @('New-VcfSddcLcmSession', 'Start-VcfSddcLcmSupportBundle')
     CmdletsToExport   = @()
     VariablesToExport = @()

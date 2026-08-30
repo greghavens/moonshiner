@@ -7,12 +7,6 @@
     Copyright = '(c) 2026'
     Description = 'Fleet depot registration and component resolution against VCF 9.1 SDDC LCM, with mid-run access token refresh.'
     PowerShellVersion = '7.4'
-    RequiredModules = @(
-        @{
-            ModuleName = 'VMware.Sdk.Vcf.SddcManager'
-            RequiredVersion = '13.5.0.25380678'
-        }
-    )
     FunctionsToExport = @('Invoke-VcfSddcLcmDepotSync')
     CmdletsToExport = @()
     VariablesToExport = @()

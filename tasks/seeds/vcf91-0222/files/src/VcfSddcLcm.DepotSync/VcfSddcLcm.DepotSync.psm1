@@ -3,15 +3,15 @@ Set-StrictMode -Version Latest
 function Invoke-VcfSddcLcmDepotSync {
     [CmdletBinding()]
     param(
-        # Caller-owned connected VcfSddcManagerServer. Do not connect or disconnect it.
+        # Caller-owned SDDC LCM access token.
         [Parameter(Mandatory)]
         [ValidateNotNull()]
-        [object] $Server,
+        [securestring] $AccessToken,
 
-        # Credential minted into a token pair through the genuine SDK binding.
+        # Returns the replacement SDDC LCM access token after a 401.
         [Parameter(Mandatory)]
         [ValidateNotNull()]
-        [pscredential] $Credential,
+        [scriptblock] $RefreshAccessToken,
 
         # Base URL of the SDDC LCM service, for example http://127.0.0.1:8080
         [Parameter(Mandatory)]

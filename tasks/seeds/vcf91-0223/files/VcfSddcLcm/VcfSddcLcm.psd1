@@ -5,12 +5,8 @@
     Author               = 'VCF Fleet Lifecycle Automation'
     CompanyName          = 'Unknown'
     Copyright            = '(c) VCF Fleet Lifecycle Automation. All rights reserved.'
-    Description          = 'SDDC and Fleet lifecycle helpers for VMware Cloud Foundation 9.1, layered on the VMware.Sdk.Vcf PowerCLI modules.'
+    Description          = 'SDDC and Fleet lifecycle helpers for VMware Cloud Foundation 9.1 using a caller-provided SDDC LCM service URI and bearer token.'
     PowerShellVersion    = '7.4'
-
-    # Installed by the environment from the PowerShell Gallery. Never vendored
-    # into this repository.
-    RequiredModules      = @('VMware.Sdk.Vcf.Installer')
 
     FunctionsToExport    = @('Get-VcfSddcLcmComponentNode')
     CmdletsToExport      = @()

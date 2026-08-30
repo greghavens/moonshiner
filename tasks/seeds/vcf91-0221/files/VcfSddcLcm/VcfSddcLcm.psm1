@@ -7,8 +7,7 @@ function Set-VcfSddcLcmConfiguration {
 
     .DESCRIPTION
     Implements the setConfig and getTask operations recorded in
-    docs/contract.json. VMware.Sdk.Vcf.SddcManager is a module prerequisite and
-    is provided by the execution environment.
+    the VCF SDDC LCM 9.1 wire contract. Authentication is supplied by the caller.
     #>
     [CmdletBinding()]
     param(
@@ -65,4 +64,3 @@ function Set-VcfSddcLcmConfiguration {
 }
 
 Export-ModuleMember -Function Set-VcfSddcLcmConfiguration
-

@@ -11,12 +11,10 @@ $ErrorActionPreference = 'Stop'
       getComponents      GET /v1/components
       getComponentNodes  GET /v1/components/{componentId}/nodes
 
-    The connection produced by Connect-VcfInstallerServer (VMware.Sdk.Vcf.Installer)
-    supplies the bearer token used for both operations.
+    The caller supplies the SDDC LCM bearer token used for both operations.
 
-.PARAMETER Server
-    A connected VCF server object, as returned by Connect-VcfInstallerServer. Its
-    SessionSecret is sent as 'Authorization: Bearer <SessionSecret>'.
+.PARAMETER AccessToken
+    The caller-owned SDDC LCM bearer token.
 
 .PARAMETER ServiceUri
     Base URI of the SDDC LCM service, for example https://vcf.example.com/sddc-lcm.
@@ -52,7 +50,7 @@ function Get-VcfSddcLcmComponentNode {
     param(
         [Parameter(Mandatory)]
         [ValidateNotNull()]
-        [object] $Server,
+        [securestring] $AccessToken,
 
         [Parameter(Mandatory)]
         [ValidateNotNull()]

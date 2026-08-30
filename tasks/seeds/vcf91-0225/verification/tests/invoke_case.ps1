@@ -1,10 +1,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)] [string] $ModuleManifest,
-    [Parameter(Mandatory)] [string] $MockHost,
-    [Parameter(Mandatory)] [int]    $MockPort,
-    [Parameter(Mandatory)] [string] $User,
-    [Parameter(Mandatory)] [string] $Password,
+    [Parameter(Mandatory)] [string] $ServiceUri,
+    [Parameter(Mandatory)] [string] $AccessToken,
     [Parameter(Mandatory)] [string] $DepotFqdn,
     [Parameter(Mandatory)] [string] $DepotCertificate,
     [Parameter(Mandatory)] [string] $PlanPath,
@@ -19,10 +17,6 @@ $InformationPreference = 'SilentlyContinue'
 $ProgressPreference = 'SilentlyContinue'
 $PSStyle.OutputRendering = 'PlainText'
 
-Import-Module 'VMware.Sdk.Vcf.Installer' `
-    -RequiredVersion '13.5.0.25380678' `
-    -Force `
-    -ErrorAction Stop
 Import-Module $ModuleManifest -Force -ErrorAction Stop
 
 $plan = Get-Content -LiteralPath $PlanPath -Raw | ConvertFrom-Json
@@ -30,24 +24,13 @@ $plan = Get-Content -LiteralPath $PlanPath -Raw | ConvertFrom-Json
 $options = Get-Content -LiteralPath $OptionsPath -Raw | ConvertFrom-Json
 $suppliedOptions = @(foreach ($property in $options.PSObject.Properties) { $property.Name })
 
-# The verifier owns this session. The module under test must consume it and
-# must not connect, disconnect, mutate, or dispose it.
-$server = Connect-VcfInstallerServer `
-    -Server $MockHost `
-    -Port $MockPort `
-    -Protocol 'http' `
-    -User $User `
-    -Password $Password `
-    -NotDefault `
-    -IgnoreInvalidCertificate `
-    -ErrorAction Stop
-
-$tokenBefore = [string] $server.SessionSecret
-$serviceUriBefore = [string] $server.ServiceUri
+$serviceUriValue = [uri] $ServiceUri
+$secureAccessToken = ConvertTo-SecureString $AccessToken -AsPlainText -Force
 
 try {
     $arguments = @{
-        Server              = $server
+        ServiceUri          = $serviceUriValue
+        AccessToken         = $secureAccessToken
         Component           = $plan
         DepotFqdn           = $DepotFqdn
         DepotCertificate    = $DepotCertificate
@@ -97,30 +80,6 @@ try {
         }
     )
 
-    # A look-alike session object carrying the right property names must be
-    # rejected: the function has to consume a genuine PowerCLI session type.
-    # Its ServiceUri points at the mock, so wrongly accepting it would also
-    # show up as extra traffic in the request log.
-    $impostorRejected = $false
-    try {
-        $impostor = [pscustomobject] @{
-            ServiceUri    = [string] $server.ServiceUri
-            SessionSecret = [string] $server.SessionSecret
-            IsConnected   = $true
-            User          = $User
-        }
-        $null = Invoke-VcfSddcLcmComponentUpgrade `
-            -Server $impostor `
-            -Component $plan `
-            -DepotFqdn $DepotFqdn `
-            -DepotCertificate $DepotCertificate `
-            -PollIntervalSeconds 0 `
-            -TimeoutSeconds 10 `
-            -ErrorAction Stop
-    } catch {
-        $impostorRejected = $true
-    }
-
     # Exercise every input rule that must reject before issuing a request. Any
     # implementation that validates after setDepot will leave extra traffic in
     # the mock log in addition to reporting a failed validation check here.
@@ -135,7 +94,8 @@ try {
     }
 
     $validArguments = @{
-        Server              = $server
+        ServiceUri          = $serviceUriValue
+        AccessToken         = $secureAccessToken
         Component           = $plan
         DepotFqdn           = $DepotFqdn
         DepotCertificate    = $DepotCertificate
@@ -251,11 +211,6 @@ try {
         failedStage        = [string] $report.failedStage
         errorMessage       = [string] $report.errorMessage
         notAttempted       = @([string[]] $report.notAttempted)
-        sessionType        = $server.GetType().FullName
-        sessionStillOpen   = [bool]   $server.IsConnected
-        tokenUnchanged     = ([string] $server.SessionSecret -ceq $tokenBefore)
-        serviceUriUnchanged = ([string] $server.ServiceUri -ceq $serviceUriBefore)
-        impostorRejected   = [bool]   $impostorRejected
         validationResults  = $validationResults
         pollIntervalDefault = $pollIntervalDefault
         timeoutDefault     = $timeoutDefault
@@ -263,11 +218,4 @@ try {
     }
     $json = $output | ConvertTo-Json -Depth 12 -Compress
     [IO.File]::WriteAllText($OutputPath, $json, [Text.UTF8Encoding]::new($false))
-} finally {
-    # The report has already captured the session state, so tearing the
-    # verifier-owned session down here cannot affect any assertion.
-    if ($null -ne $server -and $server.IsConnected) {
-        Disconnect-VcfInstallerServer -Server $server `
-            -ErrorAction SilentlyContinue | Out-Null
-    }
-}
+} finally { }

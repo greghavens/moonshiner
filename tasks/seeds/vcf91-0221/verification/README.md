@@ -12,11 +12,7 @@ loopback service in `tests/mock_sddc_lcm.py` serves only those operations.
 ## Prerequisites
 
 - PowerShell 7.4 or later
-- `VMware.Sdk.Vcf.SddcManager` from VCF PowerCLI 9.1
 - Python 3 (verification only)
-
-The VMware module is supplied by the environment. Do not copy, generate, stub,
-or vendor any `VMware.Sdk.Vcf*` package or assembly into this repository.
 
 ## Work to complete
 

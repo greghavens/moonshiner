@@ -192,9 +192,7 @@ func Start(
 
 		apply(st, body)
 		st.mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, "{}")
 	})
 
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")

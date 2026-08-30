@@ -2,9 +2,8 @@
 """Protected verifier for the VCF 9.1 SDDC LCM multi-step upgrade module.
 
 Starts the contract-pinned loopback mock on an ephemeral 127.0.0.1 port, runs
-the module under test twice through a genuine caller-owned PowerCLI session,
-and asserts the reported run outcome together with the exact request wire shape
-recorded by the mock. No live VMware endpoint is contacted.
+the module with caller-owned SDDC LCM authentication, and asserts the reported
+outcome together with the exact request wire shape recorded by the mock.
 """
 
 from __future__ import annotations
@@ -28,8 +27,6 @@ MODULE_DIR = ROOT / "VcfSddcLcmUpgrade"
 MANIFEST = MODULE_DIR / "VcfSddcLcmUpgrade.psd1"
 IMPLEMENTATION = MODULE_DIR / "VcfSddcLcmUpgrade.psm1"
 
-SDK_MODULE = "VMware.Sdk.Vcf.Installer"
-SDK_VERSION = "13.5.0.25380678"
 EXPECTED_OPERATION_IDS = [
     "setDepot",
     "resolveDepotComponents",
@@ -179,11 +176,8 @@ def build_scenario():
 
     return {
         "accessToken": "lcm-" + uuid.uuid4().hex,
-        "refreshTokenId": str(uuid.uuid4()),
-        "applianceId": str(uuid.uuid4()),
         "referencePrefix": "ref-" + run,
         "user": f"lcm-{run}@vcf.test",
-        "password": "Pw-" + uuid.uuid4().hex[:12] + "!aZ",
         "depot": {
             "fqdn": depot_fqdn,
             "certificate": "-----BEGIN CERTIFICATE-----\n"
@@ -358,7 +352,7 @@ def assert_common_headers(label, request, scenario, case):
     check(
         auth == ["Bearer " + scenario["accessToken"]],
         f"{label}: Authorization must appear exactly once carrying the "
-        f"caller-owned session bearer token, got {auth!r}.",
+        f"caller-owned SDDC LCM bearer token, got {auth!r}.",
     )
     accept = request.header_values("Accept")
     check(
@@ -472,10 +466,8 @@ def run_case(case, scenario, workdir, contract):
             "-File",
             str(PROTECTED / "invoke_case.ps1"),
             "-ModuleManifest", str(MANIFEST),
-            "-MockHost", "127.0.0.1",
-            "-MockPort", str(port),
-            "-User", scenario["user"],
-            "-Password", scenario["password"],
+            "-ServiceUri", f"http://127.0.0.1:{port}",
+            "-AccessToken", scenario["accessToken"],
             "-DepotFqdn", scenario["depot"]["fqdn"],
             "-DepotCertificate", scenario["depot"]["certificate"],
             "-PlanPath", str(plan_path),
@@ -587,10 +579,8 @@ def run_negative_case(kind, base_scenario, workdir):
             "-File",
             str(PROTECTED / "invoke_negative_case.ps1"),
             "-ModuleManifest", str(MANIFEST),
-            "-MockHost", "127.0.0.1",
-            "-MockPort", port_line,
-            "-User", scenario["user"],
-            "-Password", scenario["password"],
+            "-ServiceUri", f"http://127.0.0.1:{port_line}",
+            "-AccessToken", scenario["accessToken"],
             "-DepotFqdn", scenario["depot"]["fqdn"],
             "-DepotCertificate", scenario["depot"]["certificate"],
             "-PlanPath", str(plan_path),
@@ -620,13 +610,6 @@ def run_negative_case(kind, base_scenario, workdir):
 
 def assert_negative_case(kind, scenario, report, requests, contract):
     check(report["threw"] is True, f"{kind}: the contracted defect was not rejected.")
-    check(
-        report["sessionStillOpen"] is True
-        and report["tokenUnchanged"] is True
-        and report["serviceUriUnchanged"] is True,
-        f"{kind}: the caller-owned session was mutated while handling an error: "
-        f"{report!r}.",
-    )
     if kind == "timeout":
         check(
             report["exceptionType"] == "System.TimeoutException",
@@ -634,15 +617,8 @@ def assert_negative_case(kind, scenario, report, requests, contract):
             f"{report['exceptionType']!r} ({report['exceptionMessage']!r}).",
         )
 
-    bootstrap_paths = {
-        route["path"] for route in contract["sessionBootstrap"]["routes"]
-    }
     lcm = [item for item in requests if item.path.startswith("/sddc-lcm/")]
-    other = [
-        item
-        for item in requests
-        if item.path not in bootstrap_paths and item not in lcm
-    ]
+    other = [item for item in requests if item not in lcm]
     check(not other, f"{kind}: unexpected requests: {[item.describe() for item in other]}.")
     task_path = f"/sddc-lcm/v1/tasks/{scenario['tasks']['depot']}"
     if kind == "timeout":
@@ -672,10 +648,6 @@ def assert_case(case, scenario, report, requests, contract):
     name = case["name"]
     components = scenario["components"]
     tasks = scenario["tasks"]
-    bootstrap_paths = {
-        route["path"] for route in contract["sessionBootstrap"]["routes"]
-    }
-
     # ---- reported run outcome ----
     check(
         report["propertyOrder"]
@@ -710,20 +682,6 @@ def assert_case(case, scenario, report, requests, contract):
         report["depotFqdn"] == scenario["depot"]["fqdn"],
         f"{name}: depotFqdn must be {scenario['depot']['fqdn']!r}, got "
         f"{report['depotFqdn']!r}.",
-    )
-    check(
-        report["impostorRejected"] is True,
-        f"{name}: the function must consume a genuine PowerCLI session; a "
-        f"look-alike object carrying ServiceUri and SessionSecret was accepted.",
-    )
-    check(
-        report["sessionStillOpen"] is True
-        and report["tokenUnchanged"] is True
-        and report["serviceUriUnchanged"] is True,
-        f"{name}: the caller-owned PowerCLI session must be left connected and "
-        f"untouched (open={report['sessionStillOpen']}, "
-        f"tokenUnchanged={report['tokenUnchanged']}, "
-        f"serviceUriUnchanged={report['serviceUriUnchanged']}).",
     )
     expected_validation_checks = {
         "blankDepotFqdn",
@@ -846,35 +804,12 @@ def assert_case(case, scenario, report, requests, contract):
     )
 
     # ---- wire shape ----
-    bootstrap = [item for item in requests if item.path in bootstrap_paths]
     lcm = [item for item in requests if item.path.startswith("/sddc-lcm/")]
-    other = [
-        item
-        for item in requests
-        if item not in bootstrap and item not in lcm
-    ]
+    other = [item for item in requests if item not in lcm]
     check(
         not other,
         f"{name}: the module issued requests outside the contracted SDDC LCM "
         f"surface: {[item.describe() for item in other]}",
-    )
-    # The session belongs to the caller: connect happens before the run and
-    # disconnect after it, so no bootstrap route may appear in between.
-    if lcm and bootstrap:
-        first, last = lcm[0].sequence, lcm[-1].sequence
-        interleaved = [
-            item for item in bootstrap if first < item.sequence < last
-        ]
-        check(
-            not interleaved,
-            f"{name}: the module must consume the caller-owned session, not "
-            f"authenticate. These session routes were called during the run: "
-            f"{[item.describe() for item in interleaved]}",
-        )
-    check(
-        len([item for item in bootstrap if item.path == "/v1/tokens"]) == 1,
-        f"{name}: POST /v1/tokens must be issued exactly once, by the verifier's "
-        f"Connect-VcfInstallerServer.",
     )
     check(
         all(item.status < 400 for item in lcm),
@@ -1043,8 +978,9 @@ def static_checks(contract, sources):
         "Install-Module": "the module must not install anything",
         "Save-Module": "the module must not download anything",
         "Find-Module": "the module must not reach the gallery",
-        "Connect-VcfInstallerServer": "the caller owns the session",
-        "Disconnect-VcfInstallerServer": "the caller owns the session",
+        "Connect-VcfInstallerServer": "SDDC LCM authentication is caller-owned",
+        "Disconnect-VcfInstallerServer": "SDDC LCM authentication is caller-owned",
+        "VMware.Sdk.Vcf.Installer": "an Installer session is not an SDDC LCM credential",
     }
     for needle, why in banned.items():
         check(
@@ -1056,26 +992,6 @@ def static_checks(contract, sources):
 def preflight():
     if not shutil.which("pwsh"):
         fatal("pwsh is required but was not found on PATH.")
-    probe = subprocess.run(
-        [
-            "pwsh",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "$m = Get-Module -ListAvailable -Name '%s' | "
-            "Where-Object { $_.Version.ToString() -eq '%s' }; "
-            "if ($m) { 'present' } else { 'missing' }" % (SDK_MODULE, SDK_VERSION),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    if "present" not in (probe.stdout or ""):
-        fatal(
-            f"{SDK_MODULE} {SDK_VERSION} is a prerequisite that the environment "
-            f"must install; it was not found. {(probe.stdout or '').strip()} "
-            f"{(probe.stderr or '').strip()}"
-        )
 
 
 def main():

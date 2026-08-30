@@ -96,9 +96,8 @@ def verify_no_vendored_sdk() -> None:
 
     manifest_text = MANIFEST.read_text(encoding="utf-8")
     require(
-        "ModuleName = 'VMware.Sdk.Vcf.SddcManager'" in manifest_text
-        and "RequiredVersion = '13.5.0.25380678'" in manifest_text,
-        "manifest must consume the environment-provided VMware.Sdk.Vcf.SddcManager module",
+        "VMware.Sdk.Vcf" not in manifest_text,
+        "the direct SDDC LCM client must not require an unrelated VMware SDK module",
     )
 
 
@@ -120,12 +119,6 @@ def powershell_script(port: int, output_path: Path) -> str:
     return f"""
 $ErrorActionPreference = 'Stop'
 Import-Module '{manifest}' -Force
-$loadedSdk = Get-Module -Name VMware.Sdk.Vcf.SddcManager |
-    Where-Object Version -EQ ([version]'13.5.0.25380678') |
-    Select-Object -First 1
-if ($null -eq $loadedSdk) {{
-    throw 'Importing the companion module did not load the required VMware SDK module.'
-}}
 function Invoke-Case {{
     [CmdletBinding()]
     param(
@@ -206,27 +199,6 @@ ConvertTo-Json -InputObject $results -Depth 20 -Compress |
 def run_workflow() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     pwsh = shutil.which("pwsh")
     require(pwsh is not None, "PowerShell (pwsh) is required")
-    module_probe = subprocess.run(
-        [
-            pwsh,
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "$module = Get-Module -ListAvailable -Name VMware.Sdk.Vcf.SddcManager | "
-            "Where-Object Version -EQ ([version]'13.5.0.25380678') | Select-Object -First 1; "
-            "if ($null -ne $module) { exit 0 } else { exit 9 }",
-        ],
-        cwd=ROOT,
-        text=True,
-        capture_output=True,
-        timeout=20,
-    )
-    require(
-        module_probe.returncode == 0,
-        "environment prerequisite VMware.Sdk.Vcf.SddcManager is not installed",
-    )
-
     with tempfile.TemporaryDirectory(prefix="vcf-sddc-lcm-") as directory:
         temp = Path(directory)
         log_path = temp / "requests.ndjson"
@@ -420,7 +392,7 @@ def main() -> int:
     except (VerificationError, OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired) as error:
         print(f"FAIL: {error}", file=sys.stderr)
         return 1
-    print("PASS: contract provenance, SDK dependency, exact wire shape, and async terminal handling verified")
+    print("PASS: contract provenance, caller-owned authentication, exact wire shape, and async terminal handling verified")
     return 0
 
 

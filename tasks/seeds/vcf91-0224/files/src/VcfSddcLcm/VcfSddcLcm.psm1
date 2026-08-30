@@ -6,10 +6,8 @@
     specifications/sddc-lcm/sddc-lcm-openapi.yaml in vmware/vcf-api-specs.
     See docs/official_sources.json for the exact commit.
 
-    VMware.Sdk.Vcf 13.5.0 ships no cmdlet for generateComponentSupportBundle or
-    getComponentSupportBundles, so those calls must be issued directly against
-    the documented wire contract. The SDK is still required: it supplies the
-    connection/authentication context consumed by New-VcfSddcLcmSession.
+    The calls are issued directly against the documented wire contract using a
+    caller-provided service URI and SDDC LCM bearer token.
 
     TODO: implement the functions below. See README.md.
 #>
@@ -26,21 +24,15 @@ function New-VcfSddcLcmSession {
     .SYNOPSIS
         Creates a session for the SDDC LCM service on a VCF appliance.
     .DESCRIPTION
-        Either pass an existing VMware.Sdk.Vcf connection (as returned by
-        Connect-VcfSddcManagerServer) or supply -Server and -Token explicitly.
-        SDDC LCM is served from the same appliance under the /sddc-lcm base path
-        and authenticates with the same bearer token.
+        Supply the SDDC LCM service URI and its bearer token explicitly.
     #>
-    [CmdletBinding(DefaultParameterSetName = 'Explicit')]
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory, ParameterSetName = 'Explicit')]
+        [Parameter(Mandatory)]
         [uri] $Server,
 
-        [Parameter(Mandatory, ParameterSetName = 'Explicit')]
-        [string] $Token,
-
-        [Parameter(Mandatory, ParameterSetName = 'Connection')]
-        [object] $Connection
+        [Parameter(Mandatory)]
+        [string] $Token
     )
 
     throw [System.NotImplementedException]::new('New-VcfSddcLcmSession is not implemented.')

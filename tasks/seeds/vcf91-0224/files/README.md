@@ -17,11 +17,9 @@ calls them exactly as declared.
 
 ### `New-VcfSddcLcmSession`
 
-Returns a session carrying the appliance base URI and the bearer token. It
-accepts either an explicit `-Server`/`-Token` pair, or a `-Connection` object
-from `Connect-VcfSddcManagerServer`. SDDC LCM is served from the same appliance
-as SDDC Manager, under the `/sddc-lcm` base path, using the same bearer token.
-The SDK connection exposes those values as `ServiceUri` and `SessionSecret`.
+Returns a session carrying the SDDC LCM service base URI and caller-supplied
+bearer token. Pass them explicitly with `-Server` and `-Token`; tokens issued for
+SDDC Manager or VCF Installer are not SDDC LCM credentials.
 
 ### `Start-VcfSddcLcmSupportBundle`
 
@@ -67,10 +65,8 @@ omit them rather than sending them empty.
   [vmware/vcf-api-specs](https://github.com/vmware/vcf-api-specs) at the commit
   recorded in `docs/official_sources.json`. Read it. Do not edit it.
 - Only the four operations named in the contract may be called.
-- `VMware.Sdk.Vcf.SddcManager` is installed by the environment and declared in
-  the module manifest. **Never vendor it into this repository.** Note that it
-  ships no cmdlet for the support-bundle operations, which is why this module
-  speaks the documented wire contract directly.
+- The module speaks the documented SDDC LCM wire contract directly and does not
+  require an unrelated SDDC Manager or Installer SDK session.
 - `docs/`, `mock/` and `tests/` are protected. Solve the task in `src/`.
 
 ## Running the checks

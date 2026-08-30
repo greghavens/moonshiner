@@ -75,10 +75,6 @@ class Mock:
         self.routes = build_routes(contract)
         self.schemas = schema_index(contract)
         self.base = contract["service"]["basePath"]
-        self.bootstrap = {
-            (route["method"], route["path"])
-            for route in contract["sessionBootstrap"]["routes"]
-        }
         self.token = scenario["accessToken"]
         self.sequence = 0
         # taskKey -> number of getTask polls already served
@@ -218,9 +214,6 @@ class Mock:
         path = split.path
         query = parse_qs(split.query, keep_blank_values=True)
 
-        if (method, path) in self.bootstrap:
-            return self.handle_bootstrap(method, path)
-
         matched = None
         for route in self.routes:
             found = route["regex"].match(path)
@@ -245,8 +238,7 @@ class Mock:
         if auth != f"Bearer {self.token}":
             return 401, self.error_body(
                 "UNAUTHORIZED",
-                "Authorization must carry the bearer token of the caller-owned "
-                "PowerCLI session.",
+                "Authorization must carry the caller-owned SDDC LCM bearer token.",
             )
 
         body = None
@@ -294,19 +286,6 @@ class Mock:
             "getTask": self.op_get_task,
         }[route["operationId"]]
         return handler(body, path_params, query, headers)
-
-    def handle_bootstrap(self, method, path):
-        if path == "/v1/tokens":
-            return 200, {
-                "accessToken": self.token,
-                "refreshToken": {"id": self.scenario["refreshTokenId"]},
-            }
-        if path == "/v1/tokens/refresh-token":
-            return 204, {}
-        return 200, {
-            "id": self.scenario["applianceId"],
-            "version": self.contract["source"]["apiVersion"],
-        }
 
     def op_set_depot(self, body, path_params, query, headers):
         defect = self.check_required(body, "FleetDepotSpec")

@@ -1,18 +1,9 @@
 #!/usr/bin/env python3
-"""Contract-pinned loopback SDDC Manager and SDDC LCM used by protected verification.
+"""Contract-pinned loopback SDDC LCM service used by protected verification.
 
-Two independent 127.0.0.1 listeners share one ordered request log:
-
-  * the SDDC Manager listener serves only the two session operations named by the
-    contract (createToken, refreshAccessToken) plus the connection handshake that
-    Connect-VcfSddcManagerServer performs before any contract operation runs;
-  * the SDDC LCM listener serves only the three lifecycle operations named by the
-    contract (setDepot, getTask, resolveDepotComponents).
-
-Anything else answers 404 so the verifier can prove no off-contract route was used.
-The access token minted by createToken stops being accepted by the SDDC LCM
-listener after a fixed number of authenticated lifecycle requests, which is how the
-mid-run expiry is made deterministic rather than clock-dependent.
+The listener serves only setDepot, getTask, and resolveDepotComponents. The
+caller-owned access token stops being accepted after a fixed number of requests,
+making mid-run expiry deterministic rather than clock-dependent.
 """
 
 from __future__ import annotations
@@ -31,28 +22,16 @@ from urllib.parse import urlsplit
 
 PINNED_COMMIT = "3949fc33339fc5ea1b77eadb258f1cf49aa88e26"
 PINNED_LCM_SPEC_PATH = "specifications/sddc-lcm/sddc-lcm-openapi.yaml"
-PINNED_MANAGER_SPEC_PATH = "specifications/sddc-manager/sddc-manager-openapi.json"
 EXPECTED_OPERATION_IDS = [
-    "createToken",
-    "refreshAccessToken",
     "setDepot",
     "getTask",
     "resolveDepotComponents",
 ]
 EXPECTED_ROUTES = [
-    ("sddc-manager", "POST", "/v1/tokens"),
-    ("sddc-manager", "PATCH", "/v1/tokens/access-token/refresh"),
     ("sddc-lcm", "POST", "/v1/depot"),
     ("sddc-lcm", "GET", "/v1/tasks/{taskId}"),
     ("sddc-lcm", "POST", "/v1/depot/components"),
 ]
-
-# Connect-VcfSddcManagerServer probes this before any contract operation. It is not a
-# contract operation and is never counted as one; it exists only so the caller-owned
-# genuine SDK connection can be established against the loopback listener.
-HANDSHAKE_METHOD = "GET"
-HANDSHAKE_PATH = "/v1/sddc-manager"
-
 
 @dataclass(frozen=True)
 class Route:
@@ -87,15 +66,10 @@ def path_pattern(path: str) -> re.Pattern[str]:
 def load_routes(contract_path: Path) -> list[Route]:
     contract = read_json(contract_path)
     source = contract.get("source", {})
-    auth_source = contract.get("authSource", {})
     if source.get("repositoryCommitSha") != PINNED_COMMIT:
         raise RuntimeError("contract repository commit is not pinned")
-    if auth_source.get("repositoryCommitSha") != PINNED_COMMIT:
-        raise RuntimeError("contract auth repository commit is not pinned")
     if source.get("specPath") != PINNED_LCM_SPEC_PATH:
         raise RuntimeError("contract SDDC LCM specification path is not pinned")
-    if auth_source.get("specPath") != PINNED_MANAGER_SPEC_PATH:
-        raise RuntimeError("contract SDDC Manager specification path is not pinned")
 
     operations = contract.get("operations", [])
     if [item.get("operationId") for item in operations] != EXPECTED_OPERATION_IDS:
@@ -125,10 +99,7 @@ class MockState:
     ) -> None:
         self.routes = routes
         self.request_log = request_log
-        self.username = require_text(scenario, "username")
-        self.password = require_text(scenario, "password")
         self.access_token = require_text(scenario, "accessToken")
-        self.refresh_token_id = require_text(scenario, "refreshTokenId")
         self.refreshed_access_token = require_text(scenario, "refreshedAccessToken")
         self.task_id = require_text(scenario, "taskId")
         self.depot_fqdn = require_text(scenario, "depotFqdn")
@@ -218,23 +189,10 @@ class ContractHandler(BaseHTTPRequestHandler):
             body_length = 0
         body = self.rfile.read(max(body_length, 0))
 
-        handshake = (
-            service == "sddc-manager"
-            and route is None
-            and self.command == HANDSHAKE_METHOD
-            and target.path == HANDSHAKE_PATH
-        )
-
-        if handshake:
-            status, response = 200, {"id": "protected-sddc-manager", "version": "9.1.0.0"}
-        elif route is None:
+        if route is None:
             status, response = 404, error_body(
                 "NOT_IN_CONTRACT", "operation is outside the focused contract"
             )
-        elif route.operation_id == "createToken":
-            status, response = self._create_token(target.query, body)
-        elif route.operation_id == "refreshAccessToken":
-            status, response = self._refresh_access_token(target.query, body)
         elif route.operation_id == "setDepot":
             status, response = self._set_depot(target.query, body)
         elif route.operation_id == "getTask":
@@ -254,7 +212,6 @@ class ContractHandler(BaseHTTPRequestHandler):
             {
                 "service": service,
                 "operationId": route.operation_id if route else None,
-                "handshake": handshake,
                 "method": self.command,
                 "rawTarget": self.path,
                 "path": target.path,
@@ -308,41 +265,6 @@ class ContractHandler(BaseHTTPRequestHandler):
                 "TOKEN_EXPIRED", "the access token presented has expired"
             )
         return 401, error_body("UNAUTHORIZED", "a valid bearer access token is required")
-
-    # -- SDDC Manager session operations -----------------------------------
-
-    def _create_token(self, raw_query: str, body: bytes) -> tuple[int, Any]:
-        state = self.server.state
-        if raw_query:
-            return 400, error_body("WIRE_SHAPE", "query string must be absent")
-        media_error = self._json_media_type_error()
-        if media_error:
-            return media_error
-        value = self._decode(body)
-        if not isinstance(value, dict):
-            return 400, error_body("WIRE_SHAPE", "TokenCreationSpec must be a JSON object")
-        if value.get("username") != state.username or value.get("password") != state.password:
-            return 400, error_body("CREDENTIALS", "unexpected credentials")
-        return 201, {
-            "accessToken": state.access_token,
-            "refreshToken": {"id": state.refresh_token_id},
-        }
-
-    def _refresh_access_token(self, raw_query: str, body: bytes) -> tuple[int, Any]:
-        state = self.server.state
-        if raw_query:
-            return 400, error_body("WIRE_SHAPE", "query string must be absent")
-        media_error = self._json_media_type_error()
-        if media_error:
-            return media_error
-        value = self._decode(body)
-        if not isinstance(value, str):
-            return 400, error_body(
-                "WIRE_SHAPE", "the refresh request body must be a bare JSON string"
-            )
-        if value != state.refresh_token_id:
-            return 404, error_body("UNKNOWN_REFRESH_TOKEN", "refresh token is not known")
-        return 200, state.refreshed_access_token
 
     # -- SDDC LCM lifecycle operations -------------------------------------
 
@@ -464,11 +386,11 @@ def error_body(code: str, message: str) -> dict[str, Any]:
     }
 
 
-def write_ports(path: Path, manager_port: int, lcm_port: int) -> None:
+def write_ports(path: Path, lcm_port: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as stream:
         stream.write(
-            json.dumps({"sddcManagerPort": manager_port, "sddcLcmPort": lcm_port})
+            json.dumps({"sddcLcmPort": lcm_port})
         )
         stream.flush()
         os.fsync(stream.fileno())
@@ -483,20 +405,11 @@ def main(argv: list[str]) -> int:
     routes = load_routes(contract_file)
     state = MockState(routes, log_file, read_json(scenario_file))
 
-    manager = ContractServer(("127.0.0.1", 0), state, "sddc-manager")
     lcm = ContractServer(("127.0.0.1", 0), state, "sddc-lcm")
-    manager_thread = threading.Thread(
-        target=manager.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
-    )
-    manager_thread.start()
-    write_ports(
-        port_file, int(manager.server_address[1]), int(lcm.server_address[1])
-    )
+    write_ports(port_file, int(lcm.server_address[1]))
     try:
         lcm.serve_forever(poll_interval=0.05)
     finally:
-        manager.shutdown()
-        manager.server_close()
         lcm.server_close()
     return 0
 

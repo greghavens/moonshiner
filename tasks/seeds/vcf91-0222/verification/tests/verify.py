@@ -2,9 +2,9 @@
 """Deterministic protected verifier for vcf91-0222.
 
 Proves that Invoke-VcfSddcLcmDepotSync survives a mid-run access token expiry:
-the expired lifecycle request is replayed byte for byte after exactly one genuine
-SDK refresh, no already-accepted work is reissued, and every unset optional member
-stays off the wire instead of being sent empty. No live VMware endpoint is used.
+the expired request is replayed byte for byte after exactly one caller-owned token
+refresh, no already-accepted work is reissued, and unset optional members stay off
+the wire.
 """
 
 from __future__ import annotations
@@ -33,29 +33,18 @@ INVOKER_PATH = ROOT / ".protected" / "invoke_case.ps1"
 
 COMMIT = "3949fc33339fc5ea1b77eadb258f1cf49aa88e26"
 LCM_SPEC_PATH = "specifications/sddc-lcm/sddc-lcm-openapi.yaml"
-MANAGER_SPEC_PATH = "specifications/sddc-manager/sddc-manager-openapi.json"
 OPERATION_IDS = [
-    "createToken",
-    "refreshAccessToken",
     "setDepot",
     "getTask",
     "resolveDepotComponents",
 ]
-SESSION_OPERATION_IDS = ["createToken", "refreshAccessToken"]
 LIFECYCLE_OPERATION_IDS = ["setDepot", "getTask", "resolveDepotComponents"]
-
-SDK_MODULE_NAME = "VMware.Sdk.Vcf.SddcManager"
-SDK_MODULE_VERSION = "13.5.0.25380678"
-SDK_USER_AGENT_PREFIX = "VMware.Sdk.Vcf.SddcManager/"
-CONNECT_USER_AGENT = "PowerCLI"
 
 # The mock stops accepting the original access token after this many authenticated
 # SDDC LCM requests, so setDepot and getTask succeed and resolveDepotComponents expires.
 LIFECYCLE_CALLS_BEFORE_EXPIRY = 2
 
 EXPECTED_ROUTES = {
-    "createToken": ("sddc-manager", "POST", "/v1/tokens"),
-    "refreshAccessToken": ("sddc-manager", "PATCH", "/v1/tokens/access-token/refresh"),
     "setDepot": ("sddc-lcm", "POST", "/v1/depot"),
     "getTask": ("sddc-lcm", "GET", "/v1/tasks/{taskId}"),
     "resolveDepotComponents": ("sddc-lcm", "POST", "/v1/depot/components"),
@@ -84,19 +73,13 @@ def verify_contract() -> None:
     sources = load_json(SOURCES_PATH)
 
     source = contract.get("source", {})
-    auth_source = contract.get("authSource", {})
     require(
-        source.get("repositoryCommitSha") == COMMIT
-        and auth_source.get("repositoryCommitSha") == COMMIT,
+        source.get("repositoryCommitSha") == COMMIT,
         "contract must pin repository commit " + COMMIT,
     )
     require(
         source.get("specPath") == LCM_SPEC_PATH,
         f"contract primary specification must be {LCM_SPEC_PATH}",
-    )
-    require(
-        auth_source.get("specPath") == MANAGER_SPEC_PATH,
-        f"contract auth specification must be {MANAGER_SPEC_PATH}",
     )
     require(
         source.get("repository") == "vmware/vcf-api-specs"
@@ -119,14 +102,7 @@ def verify_contract() -> None:
             f"contract route for {operation_id} must be {expected}, found {actual}",
         )
 
-    # Only the two SDDC Manager session operations have a generated PowerCLI binding;
-    # VMware publishes no VMware.Sdk.Vcf module for the SDDC LCM service.
     bindings = {item["operationId"]: item.get("bindingCommand") for item in operations}
-    require(
-        bindings["createToken"] == "Invoke-VcfCreateToken"
-        and bindings["refreshAccessToken"] == "Invoke-VcfRefreshAccessToken",
-        "contract must bind the session operations to the genuine SDK commands",
-    )
     for operation_id in LIFECYCLE_OPERATION_IDS:
         require(
             bindings[operation_id] is None,
@@ -159,11 +135,6 @@ def verify_contract() -> None:
         profile.get("lifecycleCallOrder") == LIFECYCLE_OPERATION_IDS,
         "contract must pin the lifecycle call order",
     )
-    require(
-        profile.get("refreshRequestBodyIsBareJsonString") is True,
-        "contract must record that the refresh request body is a bare JSON string",
-    )
-
     # provenance
     require(
         sources.get("repositoryCommitSha") == COMMIT,
@@ -179,10 +150,7 @@ def verify_contract() -> None:
         "official_sources must record every operationId used",
     )
     spec_paths = {entry.get("specPath") for entry in sources.get("specs", [])}
-    require(
-        spec_paths == {LCM_SPEC_PATH, MANAGER_SPEC_PATH},
-        "official_sources must record both pinned specification paths",
-    )
+    require(spec_paths == {LCM_SPEC_PATH}, "official_sources must record the SDDC LCM specification")
     recorded = {entry.get("operationId"): entry for entry in sources.get("operations", [])}
     require(
         set(recorded) == set(OPERATION_IDS),
@@ -198,11 +166,7 @@ def verify_contract() -> None:
             entry.get("repositoryCommitSha") == COMMIT,
             f"official_sources must pin {operation_id} to commit {COMMIT}",
         )
-        expected_spec = LCM_SPEC_PATH if service == "sddc-lcm" else MANAGER_SPEC_PATH
-        require(
-            entry.get("specPath") == expected_spec,
-            f"official_sources must source {operation_id} from {expected_spec}",
-        )
+        require(entry.get("specPath") == LCM_SPEC_PATH, f"official_sources must source {operation_id} from {LCM_SPEC_PATH}")
     require(
         sources.get("derivation", {}).get("documentationPageUsedAsContractSource")
         is False,
@@ -233,43 +197,18 @@ def ps_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def verify_manifest_and_sdk() -> None:
+def verify_manifest() -> None:
     command = (
         f"$d=Import-PowerShellDataFile -LiteralPath {ps_quote(str(MANIFEST_PATH))};"
         "if($d.RootModule -cne 'VcfSddcLcm.DepotSync.psm1'){exit 2};"
         "if($d.PowerShellVersion -cne '7.4'){exit 3};"
         "if(($d.FunctionsToExport -join ',') -cne 'Invoke-VcfSddcLcmDepotSync'){exit 4};"
-        "if($d.RequiredModules.Count -ne 1){exit 5};"
-        "$r=$d.RequiredModules[0];"
-        f"if($r.ModuleName -cne '{SDK_MODULE_NAME}' -or "
-        f"[string]$r.RequiredVersion -cne '{SDK_MODULE_VERSION}'){{exit 6}};"
-        f"Import-Module '{SDK_MODULE_NAME}' -RequiredVersion '{SDK_MODULE_VERSION}' "
-        "-Force -ErrorAction Stop;"
-        # The genuine generated bindings must agree with the pinned specification.
-        "$expected=@{"
-        "createToken=@('POST','/v1/tokens','Invoke-VcfCreateToken');"
-        "refreshAccessToken=@('PATCH','/v1/tokens/access-token/refresh',"
-        "'Invoke-VcfRefreshAccessToken')};"
-        "foreach($id in @('createToken','refreshAccessToken')){"
-        "$o=@(Get-VcfSddcManagerOperation -Name $id);"
-        "if($o.Count -ne 1 -or $null -eq $o[0].CommandInfo){exit 7};"
-        "if($o[0].Method.ToString() -cne $expected[$id][0] "
-        "-or $o[0].Path -cne $expected[$id][1]){exit 8};"
-        "$c=Get-Command $o[0].CommandInfo.Name -ErrorAction Stop;"
-        f"if($c.Source -cne '{SDK_MODULE_NAME}' -or "
-        "$c.Name -cne $expected[$id][2]){exit 9}};"
-        # The SDDC LCM service ships no PowerCLI module: the identical operationIds that
-        # do exist in the SDDC Manager SDK denote a different wire contract and must not
-        # be mistaken for the SDDC LCM ones.
-        "$t=@(Get-VcfSddcManagerOperation -Name 'getTask');"
-        "if($t.Count -ne 1 -or $t[0].Path -cne '/v1/tasks/{id}'){exit 10};"
-        "foreach($id in @('setDepot','resolveDepotComponents')){"
-        "if(@(Get-VcfSddcManagerOperation -Name $id).Count -ne 0){exit 11}}"
+        "if($d.ContainsKey('RequiredModules') -and @($d.RequiredModules).Count -ne 0){exit 5}"
     )
     result = run_pwsh(command)
     require(
         result.returncode == 0,
-        "protected manifest or genuine SDDC Manager SDK prerequisite is invalid "
+        "protected manifest is invalid "
         f"(exit {result.returncode}): "
         + (result.stderr.strip() or result.stdout.strip()),
     )
@@ -315,18 +254,11 @@ def verify_solution_shape() -> None:
         all("has not been implemented" not in text for text in throws),
         "Invoke-VcfSddcLcmDepotSync is still the unimplemented stub",
     )
-    for command in (
-        "Initialize-VcfTokenCreationSpec",
-        "Invoke-VcfCreateToken",
-        "Invoke-VcfRefreshAccessToken",
-    ):
-        require(
-            command.casefold() in commands,
-            f"the implementation must directly invoke the genuine SDK binding {command}",
-        )
     for forbidden in (
         "Connect-VcfSddcManagerServer",
         "Disconnect-VcfSddcManagerServer",
+        "Invoke-VcfCreateToken",
+        "Invoke-VcfRefreshAccessToken",
         "Install-Module",
         "Save-Module",
     ):
@@ -334,21 +266,12 @@ def verify_solution_shape() -> None:
             forbidden.casefold() not in commands,
             f"the implementation must not invoke {forbidden}",
         )
-    for protected_name in (
-        "Initialize-VcfTokenCreationSpec",
-        "Invoke-VcfCreateToken",
-        "Invoke-VcfRefreshAccessToken",
-    ):
-        require(
-            protected_name.casefold() not in functions,
-            f"do not redefine the VMware SDK command {protected_name}",
-        )
 
 
 # ------------------------------------------------------------- runtime
 
 
-def wait_for_ports(port_file: Path, process: subprocess.Popen[str]) -> tuple[int, int]:
+def wait_for_port(port_file: Path, process: subprocess.Popen[str]) -> int:
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         if process.poll() is not None:
@@ -364,10 +287,7 @@ def wait_for_ports(port_file: Path, process: subprocess.Popen[str]) -> tuple[int
                 except json.JSONDecodeError:
                     published = None
                 if isinstance(published, dict):
-                    return (
-                        int(published["sddcManagerPort"]),
-                        int(published["sddcLcmPort"]),
-                    )
+                    return int(published["sddcLcmPort"])
         time.sleep(0.04)
     raise VerificationError("loopback mock did not publish its ports")
 
@@ -423,10 +343,7 @@ def assert_no_empty_members(value: Any, trail: str) -> None:
 def make_scenario() -> dict[str, Any]:
     suffix = secrets.token_hex(6)
     return {
-        "username": f"svc-{suffix}@vsphere.local",
-        "password": "Pw-" + secrets.token_hex(8),
         "accessToken": "acc-original-" + secrets.token_hex(10),
-        "refreshTokenId": "ref-" + secrets.token_hex(10),
         "refreshedAccessToken": "acc-refreshed-" + secrets.token_hex(10),
         "taskId": str(uuid.uuid4()),
         "depotFqdn": f"depot-{suffix}.lab.example",
@@ -451,42 +368,6 @@ def make_scenario() -> dict[str, Any]:
             },
         ],
     }
-
-
-def split_phases(log: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Separate the caller's connection handshake from the module's own requests.
-
-    Connect-VcfSddcManagerServer identifies itself as 'PowerCLI'; every request the
-    module drives through a generated binding carries the versioned SDK user agent.
-    """
-    first_module = None
-    for index, request in enumerate(log):
-        agent = (request.get("headerValues", {}).get("user-agent") or [""])[0]
-        if agent.startswith(SDK_USER_AGENT_PREFIX):
-            first_module = index
-            break
-    require(
-        first_module is not None,
-        "no request carried the genuine VMware.Sdk.Vcf.SddcManager user agent; the "
-        "session operations must go through the generated SDK bindings",
-    )
-
-    handshake = log[:first_module]
-    require(
-        len(handshake) == 2,
-        f"expected exactly 2 caller connection requests, found {len(handshake)}",
-    )
-    require(
-        handshake[0]["operationId"] == "createToken"
-        and handshake[1]["handshake"] is True,
-        "the caller connection must be a createToken followed by the SDK handshake",
-    )
-    for request in handshake:
-        require(
-            one_header(request, "User-Agent") == CONNECT_USER_AGENT,
-            "the caller connection requests must come from Connect-VcfSddcManagerServer",
-        )
-    return log[first_module:]
 
 
 def verify_runtime() -> None:
@@ -527,7 +408,7 @@ def verify_runtime() -> None:
             env=environment,
         )
         try:
-            manager_port, lcm_port = wait_for_ports(port_file, server)
+            lcm_port = wait_for_port(port_file, server)
             invocation = subprocess.run(
                 [
                     "pwsh",
@@ -537,11 +418,9 @@ def verify_runtime() -> None:
                     "-File",
                     str(INVOKER_PATH),
                     "-ModuleManifest", str(MANIFEST_PATH),
-                    "-SddcManagerHost", "127.0.0.1",
-                    "-SddcManagerPort", str(manager_port),
                     "-LcmBaseUrl", f"http://127.0.0.1:{lcm_port}",
-                    "-Username", scenario["username"],
-                    "-Password", scenario["password"],
+                    "-AccessToken", scenario["accessToken"],
+                    "-RefreshedAccessToken", scenario["refreshedAccessToken"],
                     "-DepotFqdn", scenario["depotFqdn"],
                     "-DepotCertificate", scenario["depotCertificate"],
                     "-PinnedComponent", scenario["pinnedComponent"],
@@ -579,27 +458,20 @@ def verify_runtime() -> None:
 
 
 def verify_request_log(log: list[dict[str, Any]], scenario: dict[str, Any]) -> None:
-    module_requests = split_phases(log)
+    module_requests = log
 
     require(
         all(request["responseStatus"] != 404 for request in module_requests),
         "a request reached a route the contract does not name",
     )
-    require(
-        not any(request["handshake"] for request in module_requests),
-        "the module must not repeat the caller's connection handshake",
-    )
-
     observed = [
         (request["operationId"], request["responseStatus"])
         for request in module_requests
     ]
     expected = [
-        ("createToken", 201),
         ("setDepot", 202),
         ("getTask", 200),
         ("resolveDepotComponents", 401),
-        ("refreshAccessToken", 200),
         ("resolveDepotComponents", 200),
     ]
     require(
@@ -610,30 +482,10 @@ def verify_request_log(log: list[dict[str, Any]], scenario: dict[str, Any]) -> N
         + " -> ".join(f"{name}({status})" for name, status in observed),
     )
 
-    create, set_depot, get_task, expired, refresh, retried = module_requests
+    set_depot, get_task, expired, retried = module_requests
 
     original = scenario["accessToken"]
     refreshed = scenario["refreshedAccessToken"]
-
-    # -- session bootstrap: createToken through the genuine SDK binding ----
-    require(
-        one_header(create, "User-Agent").startswith(SDK_USER_AGENT_PREFIX),
-        "createToken must be issued by the generated SDK binding",
-    )
-    require(create["rawQuery"] == "", "createToken must not carry a query string")
-    create_body = json.loads(create["body"])
-    require(
-        sorted(create_body) == ["password", "username"],
-        "TokenCreationSpec must carry exactly username and password on the wire; the "
-        "unset optional apiKey and idToken members must be omitted, found "
-        + ", ".join(sorted(create_body)),
-    )
-    require(
-        create_body["username"] == scenario["username"]
-        and create_body["password"] == scenario["password"],
-        "createToken must send the caller's credential unchanged",
-    )
-    assert_no_empty_members(create_body, "TokenCreationSpec")
 
     # -- setDepot -----------------------------------------------------------
     require(
@@ -724,32 +576,6 @@ def verify_request_log(log: list[dict[str, Any]], scenario: dict[str, Any]) -> N
     )
     assert_no_empty_members(resolve_body, "DepotComponentsSpec")
 
-    # -- exactly one genuine SDK refresh, between the two attempts -----------
-    require(
-        refresh["method"] == "PATCH",
-        "refreshAccessToken is a PATCH in the pinned specification, found "
-        + refresh["method"],
-    )
-    require(
-        refresh["rawTarget"] == "/v1/tokens/access-token/refresh",
-        "refreshAccessToken target must be /v1/tokens/access-token/refresh",
-    )
-    require(
-        one_header(refresh, "User-Agent").startswith(SDK_USER_AGENT_PREFIX),
-        "refreshAccessToken must be issued by the generated SDK binding",
-    )
-    require(
-        json.loads(refresh["body"]) == scenario["refreshTokenId"],
-        "the refresh request body must be the refresh token id as a bare JSON string",
-    )
-    require(
-        refresh["body"] == json.dumps(scenario["refreshTokenId"]),
-        "the refresh request body must be exactly the bare JSON string "
-        + json.dumps(scenario["refreshTokenId"])
-        + ", found "
-        + refresh["body"],
-    )
-
     # -- the replay: same request, new token, nothing else reissued ----------
     require(
         retried["rawTarget"] == expired["rawTarget"],
@@ -798,14 +624,6 @@ def verify_request_log(log: list[dict[str, Any]], scenario: dict[str, Any]) -> N
         f"getTask already succeeded and must not be reissued, saw {counts['getTask']}",
     )
     require(
-        counts["createToken"] == 1,
-        "the expiry must be recovered by refreshing, not by minting a second token pair",
-    )
-    require(
-        counts["refreshAccessToken"] == 1,
-        f"the access token must be refreshed exactly once, saw {counts['refreshAccessToken']}",
-    )
-    require(
         counts["resolveDepotComponents"] == 2,
         "only the unauthorized request may be replayed",
     )
@@ -840,14 +658,6 @@ def verify_result(result: dict[str, Any], scenario: dict[str, Any]) -> None:
         f"the run must report exactly one refresh, found {result.get('refreshCount')}",
     )
     require(
-        result.get("serverStillConnected") is True,
-        "the caller's connection must be left connected",
-    )
-    require(
-        result.get("serverUser") == scenario["username"],
-        "the caller's connection must be left untouched",
-    )
-    require(
         result.get("resolvedComponents") == scenario["resolvedComponentVersions"],
         "the resolved component versions must be returned exactly as the service "
         "reported them after the refresh",
@@ -856,12 +666,12 @@ def verify_result(result: dict[str, Any], scenario: dict[str, Any]) -> None:
 
 def main() -> int:
     verify_contract()
-    verify_manifest_and_sdk()
+    verify_manifest()
     verify_solution_shape()
     verify_runtime()
     print(
         "PASS: the expired SDDC LCM request was replayed byte for byte after exactly "
-        "one genuine SDK token refresh, no accepted work was reissued, and every "
+        "one caller-owned token refresh, no accepted work was reissued, and every "
         "unset optional member stayed off the wire"
     )
     return 0

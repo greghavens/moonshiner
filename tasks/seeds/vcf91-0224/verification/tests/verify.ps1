@@ -254,17 +254,14 @@ try {
             if ($_ -is [hashtable]) { $_.ModuleName } else { "$_" }
         })
     }
-    Assert-That -Name 'manifest requires VMware.Sdk.Vcf.SddcManager (SDK is a prerequisite, not vendored)' `
-        -Condition ($required -contains 'VMware.Sdk.Vcf.SddcManager') `
-        -Expected 'VMware.Sdk.Vcf.SddcManager in RequiredModules' -Actual ($required -join ', ')
+    Assert-That -Name 'manifest does not require an unrelated VMware SDK session' `
+        -Condition ($required.Count -eq 0) `
+        -Expected 'no RequiredModules' -Actual ($required -join ', ')
 
     Assert-That -Name 'no vendored copy of the VMware SDK in the repo' `
         -Condition (-not (Get-ChildItem -Path $root -Recurse -Directory -Filter 'VMware.Sdk.Vcf*' -ErrorAction SilentlyContinue))
 
-    # Import the script module directly. The manifest is inspected above, while
-    # the published SDK is an environment prerequisite rather than verifier
-    # logic; the implementation only consumes the SDK connection object's
-    # documented ServiceUri/SessionSecret surface.
+    # Import the script module directly after inspecting the manifest above.
     Import-Module $scriptModulePath -Force -ErrorAction Stop
     $exported = (Get-Module VcfSddcLcm).ExportedFunctions.Keys
     Assert-That -Name 'exports New-VcfSddcLcmSession' -Condition ($exported -contains 'New-VcfSddcLcmSession')
@@ -276,18 +273,6 @@ try {
         -Expected 'https://mock.invalid:8443' -Actual "$($session.BaseUri)"
     Assert-That -Name 'explicit session retains the bearer token' `
         -Condition ($session.Token -eq $token) -Expected $token -Actual "$($session.Token)"
-
-    $sdkConnection = [pscustomobject]@{
-        ServiceUri = [uri]'https://sdk-connection.invalid/v1/sddc-manager'
-        SessionSecret = 'sdk-session-secret'
-    }
-    $sdkSession = New-VcfSddcLcmSession -Connection $sdkConnection
-    Assert-That -Name 'SDK session reads the authority from ServiceUri' `
-        -Condition ($sdkSession.BaseUri -eq 'https://sdk-connection.invalid') `
-        -Expected 'https://sdk-connection.invalid' -Actual "$($sdkSession.BaseUri)"
-    Assert-That -Name 'SDK session reads the bearer token from SessionSecret' `
-        -Condition ($sdkSession.Token -eq 'sdk-session-secret') `
-        -Expected 'sdk-session-secret' -Actual "$($sdkSession.Token)"
 
     # =====================================================================
     # A. First submission, -LookBackWindow omitted
